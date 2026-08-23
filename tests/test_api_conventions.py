@@ -401,7 +401,9 @@ def test_public_functions_document_what_they_raise() -> None:
 
 
 @pytest.fixture
-def example_namespace(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> dict[str, object]:
+def example_namespace(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], hemisphere: tuple[tm.Trimesh, wp.Mesh]
+) -> dict[str, object]:
     """
     Bind every name the package's docstring examples use to a real object on the fixture's device.
 
@@ -412,6 +414,8 @@ def example_namespace(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> dict[str, obje
     _, mesh_wp = icosahedron
     device = mesh_wp.device
     vertices, faces = mesh_wp.points, mesh_wp.indices
+    # A second, *open* mesh: an example about boundaries has nothing to show on the closed fixture.
+    _, open_mesh_wp = hemisphere
     queries = wp.array(
         [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.5, 0.0]], dtype=wp.vec3, device=device
     )
@@ -430,6 +434,8 @@ def example_namespace(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> dict[str, obje
         "warp_mesh": mesh_wp,
         "v": vertices,
         "f": faces,
+        "open_v": open_mesh_wp.points,
+        "open_f": open_mesh_wp.indices,
         "pts": queries,
         "origins": queries,
         "directions": wp.array(

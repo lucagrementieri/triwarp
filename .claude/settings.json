@@ -13,14 +13,14 @@
             "Bash(ls:*)",
             "Bash(awk:*)",
             "Bash(sed:*)",
-            "Bash(rm -rf //**/.cache/warp/*)",
+            "Bash(rm -rf ~/.cache/warp/*)",
             "Bash(DISABLE_MKDOCS_2_WARNING=true uv run mkdocs:*)",
             "WebFetch(domain:nvidia.github.io)"
         ],
         "additionalDirectories": [
-            "//**/.cache/warp/",
-            "//**/.cache/uv/",
-            "//**/.local/share/uv/"
+            "~/.cache/warp/",
+            "~/.cache/uv/",
+            "~/.local/share/uv/"
         ]
     }
 }

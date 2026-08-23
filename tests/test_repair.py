@@ -2051,13 +2051,23 @@ def test_straighten_boundary_restores_the_grid(device: str) -> None:
         tw.repair.straighten_boundary(ragged_vertices_wp, ragged_faces_wp, iterations=-1)
 
 
-def _mesh_with_a_degree3_vertex() -> tm.Trimesh:
-    """Build an icosahedron with one face split at its centroid: one valence-3 vertex."""
+def _mesh_with_a_degree3_vertex(bump: float = 0.0) -> tm.Trimesh:
+    """
+    Build an icosahedron with one face split at its centroid: one valence-3 vertex.
+
+    ``bump`` pushes that vertex out along the split face's normal, which is what turns the fixture
+    from "one valence-3 vertex" into "one valence-3 *pimple*" -- the flattening repair has nothing
+    to do at ``0.0``, where the vertex is already at the centroid it would be moved to.
+    """
     mesh_tm = tm.creation.icosahedron()
     vertices = [list(map(float, point)) for point in mesh_tm.vertices]
     faces = mesh_tm.faces.tolist()
     split = faces.pop(0)
-    centroid_np = np.mean([vertices[index] for index in split], axis=0)
+    corners_np = np.asarray([vertices[index] for index in split])
+    centroid_np = corners_np.mean(axis=0)
+    if bump != 0.0:
+        normal_np = np.cross(corners_np[1] - corners_np[0], corners_np[2] - corners_np[0])
+        centroid_np = centroid_np + bump * normal_np / np.linalg.norm(normal_np)
     vertices.append(list(map(float, centroid_np)))
     centre = len(vertices) - 1
     faces += [
@@ -2139,6 +2149,87 @@ def test_eliminate_degree3_vertices_is_idempotent_and_area_preserving(device: st
 
     with pytest.raises(ValueError, match="max_iter must be non-negative"):
         tw.repair.eliminate_degree3_vertices(vertices_wp, faces_wp, max_iter=-1)
+
+
+@pytest.mark.parity("flatten_degree3_vertices", "meshlib")
+def test_flatten_degree3_vertices_matches_meshlib(device: str) -> None:
+    """
+    Class A against ``hardSmoothTetrahedrons``: the same vertex moved to the same place.
+
+    Both find the interior valence-3 vertices and hard-set each to the centroid of its three
+    neighbours, so this is an element-wise position comparison. The fixture is an icosahedron with
+    one face split and the new vertex pushed **0.3 out along that face's normal**, which is what
+    gives the repair something to do: at ``bump=0.0`` the vertex is already at the centroid and both
+    sides would return the input, passing vacuously.
+
+    The invariant asserted alongside says the flattening happened and no comparison implies it: the
+    moved vertex ends up **coplanar** with its three neighbours, which is the geometric claim the
+    name makes. Its distance from their plane goes from 0.3 to zero.
+
+    The control is the same mesh at ``bump=0.0``: every position comes back **identical**, so a pass
+    that nudged everything a little would fail here rather than merely look close.
+    """
+    for bump, expect_move in ((0.3, True), (0.0, False)):
+        mesh_tm = _mesh_with_a_degree3_vertex(bump)
+        vertices_wp, faces_wp = numpy_to_warp(
+            np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
+        )
+        flattened_wp = tw.repair.flatten_degree3_vertices(vertices_wp, faces_wp)
+
+        mesh_ml = trimesh_to_meshlib(mesh_tm)
+        mm.hardSmoothTetrahedrons(mesh_ml)
+        flattened_ml = mn.toNumpyArray(mesh_ml.points)
+        moved_ml = np.linalg.norm(flattened_ml - np.asarray(mesh_tm.vertices), axis=1) > 1e-6
+        assert bool(moved_ml.any()) is expect_move  # non-vacuity for the bumped case
+        assert np.allclose(flattened_wp.numpy(), flattened_ml, rtol=1e-5, atol=1e-5)
+
+        if not expect_move:
+            assert np.array_equal(flattened_wp.numpy(), vertices_wp.numpy())
+            continue
+        # The point of the name: the pimple's apex now lies in its neighbours' plane.
+        apex = int(np.flatnonzero(moved_ml)[0])
+        ring = np.unique(np.asarray(mesh_tm.faces)[(np.asarray(mesh_tm.faces) == apex).any(axis=1)])
+        ring = ring[ring != apex]
+        assert len(ring) == 3
+        corners_np = flattened_wp.numpy()[ring]
+        normal_np = np.cross(corners_np[1] - corners_np[0], corners_np[2] - corners_np[0])
+        normal_np /= np.linalg.norm(normal_np)
+        before = abs(float(np.dot(np.asarray(mesh_tm.vertices)[apex] - corners_np[0], normal_np)))
+        after = abs(float(np.dot(flattened_wp.numpy()[apex] - corners_np[0], normal_np)))
+        assert before > 0.25
+        assert after < 1e-6
+        assert int(flattened_wp.shape[0]) == int(vertices_wp.shape[0])
+
+
+def test_flatten_degree3_vertices_respects_its_region(device: str) -> None:
+    """
+    Not a library comparison: the axis meshlib carries as a params field and this takes directly.
+
+    An empty region has to be the identity and an all-true one has to reproduce the default, so
+    neither the mask nor its absence can be silently ignored. The guards are checked here too --
+    a wrong-length mask raises rather than reading past its end.
+    """
+    mesh_tm = _mesh_with_a_degree3_vertex(0.3)
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
+    )
+    n_vertices = int(vertices_wp.shape[0])
+    default_np = tw.repair.flatten_degree3_vertices(vertices_wp, faces_wp).numpy()
+    assert not np.array_equal(default_np, vertices_wp.numpy())  # non-vacuity
+
+    none_wp = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    assert np.array_equal(
+        tw.repair.flatten_degree3_vertices(vertices_wp, faces_wp, none_wp).numpy(),
+        vertices_wp.numpy(),
+    )
+    all_wp = wp.full(n_vertices, True, dtype=wp.bool, device=device)
+    assert np.array_equal(
+        tw.repair.flatten_degree3_vertices(vertices_wp, faces_wp, all_wp).numpy(), default_np
+    )
+    with pytest.raises(ValueError, match="region must be a length-"):
+        tw.repair.flatten_degree3_vertices(
+            vertices_wp, faces_wp, wp.zeros(3, dtype=wp.bool, device=device)
+        )
 
 
 def _genus(faces_wp: wp.array[wp.int32]) -> int:

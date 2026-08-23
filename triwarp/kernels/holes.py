@@ -948,15 +948,41 @@ def mark_loops_with_chords(
 def project_loop_to_plane(
     vertices: wp.array[wp.vec3],
     loop_vertices: wp.array[wp.int32],
-    plane_origin: wp.vec3,
+    loop_id: wp.array[wp.int32],
+    plane_origins: wp.array[wp.vec3],
     plane_normal: wp.vec3,
     out_positions: wp.array[wp.vec3],
 ) -> None:
-    # Each rim vertex's orthogonal projection onto the plane. The *ring* of these is what the rim is
-    # bridged to, so the extension is exactly the ruled surface between the two.
+    # Each rim vertex's orthogonal projection onto its loop's plane. The *ring* of these is what the
+    # rim is bridged to, so the extension is exactly the ruled surface between the two. The origin
+    # is per loop rather than global because a bottom plane is fitted to each rim separately.
     i = wp.int32(wp.tid())
     point = vertices[loop_vertices[i]]
-    out_positions[i] = point - plane_normal * wp.dot(point - plane_origin, plane_normal)
+    origin = plane_origins[loop_id[i]]
+    out_positions[i] = point - plane_normal * wp.dot(point - origin, plane_normal)
+
+
+@wp.kernel
+def loop_extreme_projection(
+    vertices: wp.array[wp.vec3],
+    loop_vertices: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    direction: wp.vec3,
+    out_extremes: wp.array[wp.float32],
+) -> None:
+    # The smallest ``dot(position, direction)`` over each rim, which is where that rim's bottom
+    # plane sits. ``out_extremes`` arrives pre-filled with +infinity.
+    i = wp.int32(wp.tid())
+    wp.atomic_min(out_extremes, loop_id[i], wp.dot(vertices[loop_vertices[i]], direction))
+
+
+@wp.func
+def plane_origin_from_extreme(
+    extreme: wp.float32, direction: wp.vec3, extension: wp.float32
+) -> wp.vec3:
+    # A point on the plane through the rim's extreme vertex, pushed ``extension`` further along
+    # ``-direction``. Only its component along ``direction`` matters to the projection.
+    return direction * (extreme - extension)
 
 
 @wp.kernel
@@ -988,3 +1014,20 @@ def bridge_loop_to_ring(
     out_faces[row + wp.int32(1), 0] = a
     out_faces[row + wp.int32(1), 1] = projected_a
     out_faces[row + wp.int32(1), 2] = projected_b
+
+
+@wp.kernel
+def directed_edge_opposites(
+    faces: wp.array[wp.int32], edges: wp.array2d[wp.int32], out_opposites: wp.array[wp.int32]
+) -> None:
+    # For each queried directed edge ``(u, v)``, the third corner of the one face that winds
+    # ``u -> v``. A boundary edge occurs in exactly one face, so at most one thread writes each
+    # slot and the scatter needs no atomic; ``out_opposites`` arrives filled with -1, which is what
+    # survives when the edge is not a directed edge of the mesh at all.
+    f, q = wp.tid()
+    u = edges[q, 0]
+    v = edges[q, 1]
+    corner = faces[f * 3 : (f + 1) * 3]
+    for k in range(3):
+        if corner[k] == u and corner[_wrap(k + 1, 3)] == v:
+            out_opposites[q] = corner[_wrap(k + 2, 3)]

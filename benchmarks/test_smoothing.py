@@ -100,7 +100,7 @@ from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
+from conftest import BenchCase, face_bitset_ml, mesh_ml_from_numpy, skip_larger_than
 
 _ITERATIONS = 10
 
@@ -873,3 +873,223 @@ def test_remove_spikes(bench_case: BenchCase) -> None:
     )
     assert flattened >= 0
     assert int(repaired.shape[0]) == bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="equalize_triangle_areas")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_equalize_triangle_areas(bench_case: BenchCase) -> None:
+    """
+    A 3x3 float64 solve per vertex per pass, over the incident-face CSR.
+
+    Read against ``filter_laplacian``, which is the same shape of pass over the same 1-ring and does
+    a weighted average where this solves: the gap between the two rows is what the area objective
+    costs, and it is a fixed per-vertex constant rather than anything that grows.
+
+    ``no_shrinkage`` is deliberately left off. It adds a vertex-normal pass and a 2x2 solve per
+    vertex per iteration, which is a second measurement rather than a variation of this one, and the
+    two agree with meshlib either way (``tests/test_smoothing.py``, exactly without it and to
+    3.6e-07 with).
+
+    meshlib's ``equalizeTriAreas`` is the same solve, threaded across vertices and mutating in
+    place, so its mesh is rebuilt per round -- and the positions agree **exactly**
+    (``tests/test_smoothing.py``), which is what makes the ratio below a fair one.
+
+    First measurement, medians on an RTX 5090, ten passes:
+
+    | mesh | triwarp-cuda | meshlib |
+    |---|---|---|
+    | ``bunny`` | 0.481 ms | 14.67 (30.5x) |
+    | ``bunny_decimated`` | 0.523 ms | 11.78 (22.5x) |
+    | ``dragon`` | 3.05 ms | 122.3 (40.2x) |
+    | ``happy_buddha`` | 3.70 ms | (capped) |
+    | ``lucy`` | 111.5 ms | (capped) |
+
+    ``bunny`` reads *slower* than the 12x larger ``dragon`` because it is the first mesh in the
+    selection and carries the module's compile; read the three large rows against each other, where
+    the scaling is clean (3.05 / 3.70 / 111.5 at 0.87M / 1.09M / 28M faces).
+    """
+    if bench_case.kind == "meshlib":
+
+        def equalize_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            params_ml = mm.MeshEqualizeTriAreasParams()
+            params_ml.iterations = _ITERATIONS
+            mm.equalizeTriAreas(mesh_ml, params_ml)
+            return mesh_ml.topology.numValidVerts()
+
+        assert bench_case.run(equalize_ml, rounds=3) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    relaxed = bench_case.run(
+        lambda: tw.smoothing.equalize_triangle_areas(vertices, faces, _ITERATIONS), rounds=3
+    )
+    assert relaxed.shape == (bench_case.n_vertices,)
+
+
+@pytest.mark.benchmark(group="relax_keep_volume")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_relax_keep_volume(bench_case: BenchCase) -> None:
+    """
+    Two launches per pass over the 1-ring CSR, against ``filter_laplacian``'s one.
+
+    That ratio is the whole cost model: the volume correction is a second pass over the same
+    adjacency reading a displacement field instead of positions, so this row should sit near twice
+    ``filter_laplacian``'s and anything else means the adjacency build (hoisted out of the loop
+    here, as there) has moved.
+
+    meshlib's ``relaxKeepVolume`` is the same two-pass formulation, and the positions agree to
+    1.9e-09 (``tests/test_smoothing.py``). It mutates in place, so its mesh is rebuilt per round.
+
+    First measurement, medians on an RTX 5090, ten passes:
+
+    | mesh | triwarp-cuda | meshlib |
+    |---|---|---|
+    | ``bunny`` | 1.72 ms | 14.53 (8.4x) |
+    | ``bunny_decimated`` | 1.80 ms | 12.12 (6.7x) |
+    | ``dragon`` | 3.93 ms | 130.4 (33.2x) |
+    | ``happy_buddha`` | 4.34 ms | (capped) |
+    | ``lucy`` | 119.8 ms | (capped) |
+
+    Against ``equalize_triangle_areas`` on the same passes and meshes -- 0.481 / 0.523 / 3.05 / 3.70
+    / 111.5 ms -- the two are within 30 % from ``dragon`` up. That is the cost model working out:
+    two cheap ring passes here against one ring pass with a 3x3 float64 solve there, so neither the
+    solve nor the extra launch dominates and both rows are bandwidth on the adjacency.
+    """
+    if bench_case.kind == "meshlib":
+
+        def relax_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            params_ml = mm.MeshRelaxParams()
+            params_ml.iterations = _ITERATIONS
+            mm.relaxKeepVolume(mesh_ml, params_ml)
+            return mesh_ml.topology.numValidVerts()
+
+        assert bench_case.run(relax_ml, rounds=3) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    relaxed = bench_case.run(
+        lambda: tw.smoothing.relax_keep_volume(vertices, faces, _ITERATIONS), rounds=3
+    )
+    assert relaxed.shape == (bench_case.n_vertices,)
+
+
+@pytest.mark.benchmark(group="relax_approx")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_relax_approx(bench_case: BenchCase) -> None:
+    """
+    Neighbourhood fitting, where the neighbourhood build dominates the fit.
+
+    The geodesic balls are built **once** and reused across passes, so this row is one
+    ``geodesic_ball`` plus a per-vertex plane fit per pass -- read it against
+    ``curvature.principal_curvature``, which builds the same balls and then does a strictly larger
+    5x5 solve on each. A change here that does not show there is in the fit; one that shows in both
+    is in the ball.
+
+    The radius is 3 % of the bounding-box diagonal, which is the scale at which a ball holds enough
+    vertices to fit on every mesh in the registry. It is not scale-free and there is no default:
+    meshlib's own ``surfaceDilateRadius`` default of ``0`` is a measured no-op (``tests``), so the
+    two rows would otherwise not be timing the same work at all.
+
+    ``fit="planar"`` on both sides. The quadric adds a 6x6 QR per vertex per pass and is a separate
+    measurement, not a variation of this one.
+
+    First measurement, medians on an RTX 5090, one pass:
+
+    | mesh | triwarp-cuda | meshlib |
+    |---|---|---|
+    | ``bunny`` | 6.42 ms | 39.10 (6.1x) |
+    | ``bunny_decimated`` | 2.16 ms | 12.98 (6.0x) |
+    | ``dragon`` | 202.5 ms | 4 665 (23.0x) |
+    | ``happy_buddha`` | 149.1 ms | (capped) |
+
+    **This is the only row in the module whose cost is superlinear**, and the ball is why: 202 ms on
+    ``dragon`` against 6.4 on ``bunny`` is 31x for 12x the faces, because a fixed 3 % radius holds
+    more vertices as the mesh refines. That is the thing to watch on any change here -- a regression
+    in the *fit* would move all four rows together, and one in the ball would move only these two.
+    """
+    skip_larger_than(
+        bench_case,
+        "happy_buddha",
+        "the geodesic-ball pools are sized per source chunk, and at lucy's 14M vertices the "
+        "64 MB flat-buffer allocation fails outright -- an OOM that then corrupts every later row "
+        "in the same process, so this is a hard cap rather than a slow row",
+    )
+    radius = 0.03 * float(
+        np.linalg.norm(bench_case.vertices_np.max(0) - bench_case.vertices_np.min(0))
+    )
+    if bench_case.kind == "meshlib":
+
+        def relax_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            params_ml = mm.MeshApproxRelaxParams()
+            params_ml.iterations = 1
+            params_ml.surfaceDilateRadius = radius
+            params_ml.type = mm.RelaxApproxType.Planar
+            mm.relaxApprox(mesh_ml, params_ml)
+            return mesh_ml.topology.numValidVerts()
+
+        assert bench_case.run(relax_ml, rounds=3) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    relaxed = bench_case.run(
+        lambda: tw.smoothing.relax_approx(vertices, faces, radius, 1), rounds=3
+    )
+    assert relaxed.shape == (bench_case.n_vertices,)
+
+
+@pytest.mark.benchmark(group="smooth_region_boundary")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_smooth_region_boundary(bench_case: BenchCase) -> None:
+    """
+    A harmonic solve per pass, on the same region as ``smooth_region`` -- but a *scalar* one.
+
+    Read against ``smooth_region``: same region, same cotangent operator, one right-hand side
+    instead of three, and the free set is the region's rim band rather than its whole interior. So
+    this row should be much the cheaper of the two whenever the region is fat, and the gap closing
+    would mean the band had stopped being thin.
+
+    The solve is rebuilt every pass rather than hoisted, and that is not an oversight: the cotangent
+    weights are a function of the positions the previous pass moved, so a hoisted operator would
+    solve last pass's problem.
+
+    meshlib's ``smoothRegionBoundary`` additionally flips the band's interior edges before each
+    solve, which this port does not do -- so its row carries connectivity work triwarp's does not,
+    and the two are pinned on the *moved set* and the rim length rather than element-wise
+    (``tests/test_smoothing.py``). It mutates in place, so its mesh is rebuilt per round.
+
+    First measurement, medians on an RTX 5090, four passes:
+
+    | mesh | triwarp-cuda | meshlib |
+    |---|---|---|
+    | ``bunny`` | 15.03 ms | 16.85 (1.12x) |
+    | ``bunny_decimated`` | 14.77 ms | 11.89 (**0.81x**) |
+
+    The only **loss** among this pass's new rows, and the reason is visible in the shape: triwarp is
+    flat from 16k to 69k faces while meshlib tracks the mesh, so the row is four conjugate-gradient
+    solves and their fixed per-call cost rather than anything proportional. Against
+    ``smooth_region``'s 159.7 ms on ``bunny`` over the same region it is **10.6x cheaper**, which is
+    the band being thin -- exactly what this group was written to check.
+    """
+    skip_larger_than(
+        bench_case,
+        "bunny",
+        "four harmonic solves over the region rim run into tens of seconds past bunny, the same "
+        "wall smooth_region hits on the same region",
+    )
+    region_np = np.ascontiguousarray(_free_mask_np(bench_case)[bench_case.faces_np].any(axis=1))
+    if bench_case.kind == "meshlib":
+
+        def smooth_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            region_ml = face_bitset_ml(region_np)
+            mm.smoothRegionBoundary(mesh_ml, region_ml, 4)
+            return mesh_ml.topology.numValidVerts()
+
+        assert bench_case.run(smooth_ml, rounds=3) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    region_wp = wp.array(region_np, dtype=wp.bool, device=bench_case.device)
+    smoothed = bench_case.run(
+        lambda: tw.smoothing.smooth_region_boundary(vertices, faces, region_wp, 4), rounds=3
+    )
+    assert smoothed.shape == (bench_case.n_vertices,)

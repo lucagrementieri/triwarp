@@ -18,6 +18,19 @@ face normals with a crease gate, [`filter_two_step`][triwarp.smoothing.filter_tw
 the vertices to them, and [`filter_sharpen`][triwarp.smoothing.filter_sharpen] runs the
 whole idea backwards to *sharpen*.
 
+A second group relaxes toward something *other* than a Laplacian residual, which is what lets each
+member fix a failure the filters above cannot see:
+[`equalize_triangle_areas`][triwarp.smoothing.equalize_triangle_areas] evens out triangle areas,
+[`relax_keep_volume`][triwarp.smoothing.relax_keep_volume] removes the shrinkage locally instead of
+rescaling it away at the end, [`relax_approx`][triwarp.smoothing.relax_approx] fits a plane or a
+quadric to a whole geodesic neighbourhood rather than averaging a 1-ring, and
+[`remove_spikes`][triwarp.smoothing.remove_spikes] moves only the vertices that fail an angle test.
+The first three take a vertex ``region`` and a ``max_displacement`` bound, so a relaxation can be
+confined to where it is wanted and kept within a tolerance of the surface it started from;
+``remove_spikes`` needs neither, because the set it touches is the answer to its own test.
+[`smooth_region_boundary`][triwarp.smoothing.smooth_region_boundary] completes the region trio by
+smoothing the region's *rim curve*, where the two above it smooth across the rim or inside it.
+
 [`filter_scalar_laplacian`][triwarp.smoothing.filter_scalar_laplacian] runs the same operator over a
 per-vertex **scalar** field rather than positions. Capping how fast such a field may vary along an
 edge — the other half of turning a raw scalar into a usable sizing field — is not a smoothing filter
@@ -28,7 +41,7 @@ at all but a one-sided Lipschitz projection, and lives in
 from __future__ import annotations
 
 import math
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import warp as wp
 import warp.optim.linear as wpl
@@ -42,9 +55,14 @@ from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import reduce as kernel_reduce
+from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import smoothing as kernel_smoothing
 from triwarp.triangles import face_normals_and_areas
 from triwarp.vertices import mean_vertex_normals
+
+# Fraction of the way to the level set each ``smooth_region_boundary`` pass moves. A full step
+# overshoots, because the field is rebuilt from the moved positions and the level set moves too.
+_ISOLINE_DAMPING = wp.float32(0.75)
 
 
 def filter_laplacian(
@@ -438,6 +456,362 @@ def remove_spikes(
         wp.map(kernel_smoothing.select_position, smoothed, positions, spikes, out=positions)
         flattened += n_spikes
     return positions, flattened
+
+
+def equalize_triangle_areas(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    iterations: int = 1,
+    force: float = 0.5,
+    no_shrinkage: bool = False,
+    region: wp.array[wp.bool] | None = None,
+    max_displacement: float | None = None,
+) -> wp.array[wp.vec3]:
+    """
+    Even out triangle *areas* by moving vertices, without touching the connectivity.
+
+    Every other filter in this module drives the surface toward a Laplacian residual of zero, which
+    equalizes *edge* directions and says nothing about area: a patch of long thin triangles beside a
+    patch of fat ones is already Laplacian-smooth. This one minimizes the summed squared areas of
+    each vertex's incident triangles instead, which is the objective that actually redistributes
+    them -- a vertex sitting close to one of its opposite edges is pushed away from it.
+
+    Twice a triangle's area is ``|(x - p) x (q - p)|`` for the free vertex ``x`` over its opposite
+    edge ``(p, q)``, so the per-vertex objective is a sum of quadratic forms and its minimum is one
+    3x3 solve, taken in ``float64``. Each pass steps a fraction ``force`` of the way there, from the
+    *previous* pass's positions, so the whole mesh moves at once and the result does not depend on
+    a vertex ordering.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    iterations
+        Number of passes. ``0`` returns a copy.
+    force
+        Fraction of the way to the per-vertex minimum each pass moves. ``1.0`` jumps straight there
+        and oscillates on an irregular mesh; the default is the usual under-relaxation.
+    no_shrinkage
+        Constrain each vertex to the tangent plane through its current position, so it slides
+        across the surface instead of sinking into it. The unconstrained minimum of *squared* area
+        pulls the whole 1-ring inward, so leave this on when the shape matters and off when only
+        the triangle quality does.
+    region
+        ``(n_vertices,)`` boolean mask of the vertices allowed to move. ``None`` moves every one.
+        Vertices outside it stay exactly where they are, and are still read as neighbours.
+    max_displacement
+        Clamp every vertex into a ball of this radius around its **input** position, applied after
+        each pass. ``None`` leaves the relaxation unbounded. Use it when the surface has to stay
+        within a tolerance of the scan it came from.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Relaxed ``(n_vertices,)`` positions on ``vertices.device``. Connectivity is untouched, so
+        ``faces`` stays valid.
+
+    Raises
+    ------
+    ValueError
+        If ``iterations`` is negative, if ``max_displacement`` is negative, or if ``region`` is not
+        a length-``n_vertices`` ``wp.bool`` array.
+
+    !!! note "It equalizes areas, not shapes"
+        Nothing here bounds a triangle's aspect ratio, and a long thin triangle can have exactly the
+        right area. For shape, flip the triangulation
+        ([`flip_by_objective`][triwarp.remesh.flip_by_objective]) or remesh
+        ([`isotropic_remesh`][triwarp.remesh.isotropic_remesh]); this moves vertices only.
+
+    See Also
+    --------
+    [`relax_keep_volume`][triwarp.smoothing.relax_keep_volume]
+        The other member of this group: a uniform relax that does not shrink the shape.
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
+        The plain diffusion this is the area-driven alternative to.
+    [`isotropic_remesh`][triwarp.remesh.isotropic_remesh]
+        Equalizes edge *lengths*, by changing the connectivity as well.
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    flags, limit = _relaxation_state(vertices, iterations, region, max_displacement)
+    if flags is None:
+        return wp.clone(vertices)
+
+    offsets, vertex_faces = tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
+    positions = wp.clone(vertices)
+    normals = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
+    nxt = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    for _ in range(iterations):
+        if no_shrinkage:
+            # Recomputed per pass rather than hoisted: the tangent plane the solve is confined to is
+            # the one through the vertex *now*, and after a pass that is a different plane.
+            normals = tw.vertices.area_weighted_vertex_normals(n_vertices, positions, faces)
+        wp.launch(
+            kernel_smoothing.equalize_area_step,
+            dim=n_vertices,
+            inputs=[
+                positions,
+                faces,
+                offsets,
+                vertex_faces,
+                normals,
+                flags,
+                vertices,
+                wp.float32(force),
+                no_shrinkage,
+                limit,
+                nxt,
+            ],
+            device=device,
+        )
+        positions, nxt = nxt, positions
+    return positions
+
+
+def relax_keep_volume(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    iterations: int = 1,
+    force: float = 0.5,
+    region: wp.array[wp.bool] | None = None,
+    max_displacement: float | None = None,
+) -> wp.array[wp.vec3]:
+    """
+    Uniform relaxation with the shrinkage taken out **locally**, rather than rescaled away.
+
+    A plain 1-ring average moves every vertex toward the inside of the surface it curves around,
+    so a closed shape loses volume with every pass.
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian]'s ``volume_constraint`` answers that
+    by rescaling the whole mesh at the end, which restores the total and is wrong everywhere the
+    shrinkage was not uniform. This answers it per vertex instead: the relax displacement is
+    computed as a *field*, and each vertex then has its own neighbourhood's **average
+    displacement** subtracted from its own.
+
+    That difference is the whole method. A translation shared by a neighbourhood -- which is what
+    shrinkage locally is -- cancels exactly, while the high-frequency part of the displacement,
+    which is the noise the relax was for, survives untouched. No global rescale, and a mesh with a
+    flat region and a curved one is treated correctly in both.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    iterations
+        Number of passes. ``0`` returns a copy.
+    force
+        Fraction of the way to the 1-ring average each pass moves before the correction.
+    region
+        ``(n_vertices,)`` boolean mask of the vertices allowed to move. ``None`` moves every one.
+        A neighbour outside the region contributes its position to the average but no displacement
+        to the correction, so a vertex on the region's edge is corrected by less than an interior
+        one -- which is what stops the region from tearing away from the rest.
+    max_displacement
+        Clamp every vertex into a ball of this radius around its **input** position, applied after
+        each pass. ``None`` leaves the relaxation unbounded.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Relaxed ``(n_vertices,)`` positions on ``vertices.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``iterations`` is negative, if ``max_displacement`` is negative, or if ``region`` is not
+        a length-``n_vertices`` ``wp.bool`` array.
+
+    See Also
+    --------
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
+        The plain diffusion, whose ``volume_constraint`` is the *global* rescale this replaces.
+    [`filter_taubin`][triwarp.smoothing.filter_taubin]
+        The other anti-shrinkage answer: alternate a shrinking pass with an inflating one.
+    [`equalize_triangle_areas`][triwarp.smoothing.equalize_triangle_areas]
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    flags, limit = _relaxation_state(vertices, iterations, region, max_displacement)
+    if flags is None:
+        return wp.clone(vertices)
+
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    adjacency = tw.graph.edges_to_csr(n_vertices, unique_edges)
+    offsets, columns = adjacency.offsets, adjacency.columns
+    positions = wp.clone(vertices)
+    push = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    nxt = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    for _ in range(iterations):
+        wp.launch(
+            kernel_smoothing.ring_push_forces,
+            dim=n_vertices,
+            inputs=[positions, offsets, columns, flags, wp.float32(force), push],
+            device=device,
+        )
+        wp.launch(
+            kernel_smoothing.apply_push_keeping_volume,
+            dim=n_vertices,
+            inputs=[positions, offsets, columns, flags, push, vertices, limit, nxt],
+            device=device,
+        )
+        positions, nxt = nxt, positions
+    return positions
+
+
+def relax_approx(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    dilate_radius: float,
+    iterations: int = 1,
+    force: float = 0.5,
+    fit: Literal["planar", "quadric"] = "planar",
+    region: wp.array[wp.bool] | None = None,
+    max_displacement: float | None = None,
+) -> wp.array[wp.vec3]:
+    """
+    Move each vertex onto a surface fitted to its **neighbourhood**, rather than toward its 1-ring.
+
+    Every diffusion filter here is a 1-ring operator, so the largest feature it can see is one edge
+    across and its idea of "where the surface is" is the average of six neighbours. This fits a
+    local surface -- a least-squares plane, or a quadric graph over that plane -- to every vertex
+    inside a geodesic ball of ``dilate_radius`` and moves the vertex onto it. The ball is what makes
+    it different in kind: noise smaller than the radius is averaged out in one pass instead of being
+    diffused away over many, and the fitted surface is not pulled off the shape by the vertex being
+    fitted.
+
+    ``fit="planar"`` flattens: it is the strongest of the two and will take the curvature out of a
+    genuinely curved surface if the radius is large. ``fit="quadric"`` keeps curvature, because a
+    curved surface *is* in its model space, and is the one to use on anything but a plate.
+
+    The neighbourhood is a **geodesic** ball ([`geodesic_ball`][triwarp.neighbors.geodesic_ball]),
+    not a Euclidean one, so the opposite wall of a thin tube is excluded even when it is close --
+    which is exactly the case that corrupts a fit.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    dilate_radius
+        Radius of the neighbourhood ball, in world units. It has no scale-free default: below one
+        edge length the ball is the vertex alone and the call is a no-op, and the useful range
+        starts at a small multiple of the mean edge length
+        ([`edges_unique_length`][triwarp.edges.edges_unique_length]).
+    iterations
+        Number of passes. ``0`` returns a copy. The neighbourhoods are built **once**, from the
+        input positions, and reused -- the ball's membership is a topological choice and rebuilding
+        it per pass would cost more than the fit.
+    force
+        Fraction of the way to the fitted surface each pass moves.
+    fit
+        ``"planar"`` for a least-squares plane, ``"quadric"`` for a 6-coefficient quadric graph over
+        it.
+    region
+        ``(n_vertices,)`` boolean mask of the vertices allowed to move. ``None`` moves every one.
+        Vertices outside it still populate their neighbours' balls.
+    max_displacement
+        Clamp every vertex into a ball of this radius around its **input** position, applied after
+        each pass. ``None`` leaves the relaxation unbounded.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Relaxed ``(n_vertices,)`` positions on ``vertices.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``iterations`` is negative, if ``dilate_radius`` is not positive, if
+        ``max_displacement`` is negative, if ``fit`` is not one of the two names, or if ``region``
+        is not a length-``n_vertices`` ``wp.bool`` array.
+
+    !!! note "A vertex with too small a ball does not move"
+        A plane fit needs three independent points and the quadric six, so a vertex whose ball holds
+        fewer than six vertices is left exactly where it is rather than fitted to whatever it has.
+        On a mesh whose edges are longer than ``dilate_radius`` that is *every* vertex and the call
+        returns the input -- check the result moved before concluding the parameters were right.
+
+    See Also
+    --------
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
+        The 1-ring diffusion this replaces with a neighbourhood fit.
+    [`principal_curvature`][triwarp.curvature.principal_curvature]
+        Fits a quadric over the same geodesic balls, to measure rather than to move.
+    [`geodesic_ball`][triwarp.neighbors.geodesic_ball]
+    """
+    if fit not in ("planar", "quadric"):
+        raise ValueError(f"fit must be 'planar' or 'quadric', got {fit!r}")
+    if dilate_radius <= 0.0:
+        raise ValueError(f"dilate_radius must be positive, got {dilate_radius}")
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    flags, limit = _relaxation_state(vertices, iterations, region, max_displacement)
+    if flags is None:
+        return wp.clone(vertices)
+
+    # Built once from the input positions: which vertices are in the ball is a decision about the
+    # surface's connectivity, and the relaxation moves everything by less than the radius anyway.
+    # ``min_count=1`` disables the nearest-neighbour backfill: a ball too small to fit is a
+    # documented no-op here, and backfilling would quietly fit something else instead.
+    neighbor_indices, neighbor_offsets, _ = tw.neighbors.geodesic_ball(
+        vertices, faces, dilate_radius, min_count=1
+    )
+    positions = wp.clone(vertices)
+    nxt = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    for _ in range(iterations):
+        wp.launch(
+            kernel_smoothing.relax_approx_step,
+            dim=n_vertices,
+            inputs=[
+                positions,
+                neighbor_indices,
+                neighbor_offsets,
+                flags,
+                vertices,
+                wp.float32(force),
+                fit == "quadric",
+                limit,
+                nxt,
+            ],
+            device=device,
+        )
+        positions, nxt = nxt, positions
+    return positions
+
+
+def _relaxation_state(
+    vertices: wp.array[wp.vec3],
+    iterations: int,
+    region: wp.array[wp.bool] | None,
+    max_displacement: float | None,
+) -> tuple[wp.array[wp.bool] | None, wp.float32]:
+    """
+    Validate the axes the relaxation family shares, and materialize the region mask.
+
+    Returns ``(None, ...)`` when there is nothing to do, so each caller's early return is one line.
+    The displacement limit is carried as a ``float32`` with **negative meaning unbounded**, which is
+    how ``None`` crosses into a kernel without a second launch path.
+    """
+    if iterations < 0:
+        raise ValueError(f"iterations must be non-negative, got {iterations}")
+    if max_displacement is not None and max_displacement < 0.0:
+        raise ValueError(f"max_displacement must be non-negative, got {max_displacement}")
+    n_vertices = int(vertices.shape[0])
+    limit = wp.float32(-1.0 if max_displacement is None else max_displacement)
+    if n_vertices == 0 or iterations == 0:
+        return None, limit
+    if region is None:
+        return wp.full(n_vertices, True, dtype=wp.bool, device=vertices.device), limit
+    if len(region.shape) != 1 or region.shape[0] != n_vertices or region.dtype is not wp.bool:
+        raise ValueError(
+            f"region must be a length-{n_vertices} wp.bool array, got shape {tuple(region.shape)} "
+            f"of {region.dtype}"
+        )
+    return region, limit
 
 
 def filter_taubin(
@@ -983,6 +1357,8 @@ def smooth_region_fixed_rim(
     See Also
     --------
     [`smooth_region`][triwarp.smoothing.smooth_region]
+    [`smooth_region_boundary`][triwarp.smoothing.smooth_region_boundary]
+        The third case: smooths the rim's own path rather than the surface on either side of it.
     [`fill_smooth`][triwarp.holes.fill_smooth]
 
     Notes
@@ -1094,6 +1470,8 @@ def smooth_region(
     See Also
     --------
     [`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim]
+    [`smooth_region_boundary`][triwarp.smoothing.smooth_region_boundary]
+        The third case: smooths the rim's own path rather than the surface on either side of it.
     [`fill_smooth`][triwarp.holes.fill_smooth]
     """
     device = vertices.device
@@ -1287,6 +1665,181 @@ def refine_and_smooth_region(
             vertices = smooth_region(vertices, faces, free2, edge_weights)
 
     return vertices, faces, patch_face_mask
+
+
+def smooth_region_boundary(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    region: wp.array[wp.bool],
+    iterations: int = 4,
+) -> wp.array[wp.vec3]:
+    """
+    Straighten the *rim curve* of a face region, by sliding the vertices that lie on it.
+
+    The third member of the region family, and the one whose subject is the boundary itself.
+    [`smooth_region`][triwarp.smoothing.smooth_region] smooths the surface *across* the rim and
+    [`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim] holds the rim still while
+    smoothing inside it; both leave the rim's own path through the mesh exactly where the face
+    selection put it. That path is usually ragged -- a selection by angle, by height or by a paint
+    stroke follows triangle edges and zigzags -- and this is what makes it a smooth curve, without
+    moving the surface off itself in any visible way.
+
+    The rim is smoothed as a **level set** rather than as a polyline. A field is pinned to ``-1`` on
+    the region's vertices and ``+1`` outside, its harmonic interpolation is solved over the band of
+    vertices that touch both sides, and each of those vertices is moved onto the zero level set of
+    the result. Harmonic interpolation is smooth, so its zero set is a smooth curve; the vertices
+    slide along the surface to sit on it. Repeating recomputes the field from the moved positions,
+    and the move is damped so the sequence settles rather than oscillates.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    region
+        ``(n_faces,)`` boolean mask selecting the region whose rim is smoothed. The rim is derived
+        from it; only vertices that touch both a selected and an unselected face may move.
+    iterations
+        Number of solve-and-project passes. ``0`` returns a copy.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Positions on ``vertices.device`` with the rim band slid along the surface. Connectivity and
+        the face mask are untouched, so ``region`` stays valid against the result.
+
+    Raises
+    ------
+    ValueError
+        If ``iterations`` is negative, or if ``region`` is not a length-``n_faces`` ``wp.bool``
+        array.
+
+    !!! note "It slides vertices; it does not re-cut the rim"
+        The rim can only become as smooth as the *existing* triangulation lets it: a vertex slides
+        to the level set but the rim still passes through the same vertices, so a curve that wants
+        to cross a triangle diagonally cannot. Retriangulating the band first
+        ([`flip_by_objective`][triwarp.remesh.flip_by_objective], or
+        [`split_faces_along_field`][triwarp.intersection.split_faces_along_field] to cut along the
+        level set outright) is the way to get past that, and is deliberately not folded in here --
+        it changes the face buffer, which this promises not to.
+
+    See Also
+    --------
+    [`smooth_region`][triwarp.smoothing.smooth_region]
+        Smooths the surface across the rim, leaving the rim's path alone.
+    [`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim]
+        Smooths inside the rim, holding it fixed.
+    [`region_boundary_edges`][triwarp.selection.region_boundary_edges]
+        The rim as an edge list, which is what this leaves in a better place.
+    """
+    if iterations < 0:
+        raise ValueError(f"iterations must be non-negative, got {iterations}")
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    if len(region.shape) != 1 or region.shape[0] != n_faces or region.dtype is not wp.bool:
+        raise ValueError(
+            f"region must be a length-{n_faces} wp.bool array, got shape {tuple(region.shape)} "
+            f"of {region.dtype}"
+        )
+    n_vertices = int(vertices.shape[0])
+    if n_vertices == 0 or n_faces == 0 or iterations == 0:
+        return wp.clone(vertices)
+
+    inside = _incident_vertex_mask(faces, region, n_vertices)
+    free = _region_rim_vertices(faces, region, inside)
+    fixed_mask = wp.empty(n_vertices, dtype=wp.bool, device=device)
+    wp.map(kernel_array.mask_not, free, out=fixed_mask)
+    field = wp.empty((1, n_vertices), dtype=wp.float64, device=device)
+    wp.map(kernel_smoothing.region_side_value, inside, out=field[0])
+
+    offsets, vertex_faces = tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
+    positions = wp.clone(vertices)
+    nxt = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    solved = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    for _ in range(iterations):
+        # The cotangent weights depend on the positions, so the field is re-solved every pass; the
+        # pinned +-1 entries are the same each time and only the band's values change.
+        operator = wps.bsr_scale(laplacian.cotmatrix(positions, faces, dtype=wp.float64), -1.0)
+        solution, free_map, n_free = twl.min_quad_with_fixed(
+            operator, fixed_mask, twt.as_array2d(field, wp.float64)
+        )
+        if n_free == 0:
+            break
+        wp.copy(solved, field[0])
+        wp.launch(
+            kernel_smoothing.scatter_free_scalar,
+            dim=n_vertices,
+            inputs=[fixed_mask, free_map, solution[0], solved],
+            device=device,
+        )
+        wp.launch(
+            kernel_smoothing.project_to_zero_isoline,
+            dim=n_vertices,
+            inputs=[positions, faces, offsets, vertex_faces, solved, free, _ISOLINE_DAMPING, nxt],
+            device=device,
+        )
+        positions, nxt = nxt, positions
+    return positions
+
+
+def _incident_vertex_mask(
+    faces: wp.array[wp.int32], region: wp.array[wp.bool], n_vertices: int
+) -> wp.array[wp.bool]:
+    """Mark the vertices touched by at least one selected face."""
+    mask = wp.zeros(n_vertices, dtype=wp.bool, device=faces.device)
+    wp.launch(
+        kernel_smoothing.mark_incident_vertices,
+        dim=int(faces.shape[0]) // 3,
+        inputs=[faces, region, mask],
+        device=faces.device,
+    )
+    return mask
+
+
+def _region_rim_vertices(
+    faces: wp.array[wp.int32], region: wp.array[wp.bool], inside: wp.array[wp.bool]
+) -> wp.array[wp.bool]:
+    """
+    Mark the band touching both a selected and an unselected face: the vertices free to move.
+
+    A connected component lying entirely in the band is dropped from it: with no vertex pinned, the
+    harmonic system over that component has nothing to interpolate and is singular.
+    """
+    device = faces.device
+    n_vertices = int(inside.shape[0])
+    outside_region = wp.empty(int(region.shape[0]), dtype=wp.bool, device=device)
+    wp.map(kernel_array.mask_not, region, out=outside_region)
+    outside = _incident_vertex_mask(faces, outside_region, n_vertices)
+    free = wp.empty(n_vertices, dtype=wp.bool, device=device)
+    wp.map(kernel_array.mask_and, inside, outside, out=free)
+
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    labels = tw.graph.connected_component_labels_from_edges(unique_edges, n_vertices)
+    component_size = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_scatter.count_occurrences,
+        dim=n_vertices,
+        inputs=[labels, component_size],
+        device=device,
+    )
+    free_labels = tw.array.gather(labels, tw.array.flatnonzero(free))
+    free_in_component = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    if int(free_labels.shape[0]) > 0:
+        wp.launch(
+            kernel_scatter.count_occurrences,
+            dim=int(free_labels.shape[0]),
+            inputs=[free_labels, free_in_component],
+            device=device,
+        )
+    wp.map(
+        kernel_smoothing.free_in_mixed_component,
+        free,
+        tw.array.gather(component_size, labels),
+        tw.array.gather(free_in_component, labels),
+        out=free,
+    )
+    return free
 
 
 def _boundary_verts_mask(

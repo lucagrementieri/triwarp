@@ -981,3 +981,51 @@ def test_straighten_boundary(bench_case: BenchCase) -> None:
     )
     assert added >= 0
     assert int(straightened.shape[0]) >= int(faces.shape[0])
+
+
+@pytest.mark.benchmark(group="flatten_degree3_vertices")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_flatten_degree3_vertices(bench_case: BenchCase) -> None:
+    """
+    The geometric answer to the same defect ``eliminate_degree3_vertices`` removes topologically.
+
+    Read against that group directly: both build the same ``vertex_one_rings``, and everything after
+    it differs. This one is a **single** launch over the vertices -- no independent-set pass, no
+    face rewrite, no compaction, and no loop, because two interior valence-3 vertices cannot be
+    neighbours -- so the gap between the two rows is the whole cost of removing rather than moving,
+    and this row should sit at roughly the halfedge build alone (measured at 67 % of the other
+    group's single pass).
+
+    meshlib's ``hardSmoothTetrahedrons`` is the same move on the same set, and the positions agree
+    (``tests/test_repair.py``). It mutates in place, so its mesh is rebuilt per round; the other
+    group's meshlib row times only the *mask*, which is why this one is the like-for-like pair.
+
+    First measurement, medians on an RTX 5090:
+
+    | mesh | triwarp-cuda | meshlib |
+    |---|---|---|
+    | ``bunny`` | 0.774 ms | 9.30 (12.0x) |
+    | ``dragon`` | 1.39 ms | 53.73 (38.6x) |
+    | ``happy_buddha`` | 1.47 ms | (capped) |
+
+    Against ``eliminate_degree3_vertices``' 2.47 / 4.96 / 6.64 ms on the same three meshes, this is
+    **3.2 to 4.5x cheaper** -- the ratio the docstring predicts, since that group repeats the shared
+    halfedge build once per pass and this one runs it once. ``bunny`` reads high for its size
+    because it is the first mesh in the selection and carries the module's compile.
+    """
+    if bench_case.kind == "meshlib":
+
+        def flatten_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            mm.hardSmoothTetrahedrons(mesh_ml)
+            return mesh_ml.topology.numValidVerts()
+
+        assert bench_case.run(flatten_ml, rounds=3) > 0
+        return
+    if bench_case.mesh_name in {"bunny_decimated", "lucy"}:
+        pytest.skip(f"{bench_case.mesh_name} is not edge-manifold, so it has no vertex fans")
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    flattened = bench_case.run(
+        lambda: tw.repair.flatten_degree3_vertices(vertices, faces), rounds=3
+    )
+    assert flattened.shape == (bench_case.n_vertices,)

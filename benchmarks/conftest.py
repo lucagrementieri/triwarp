@@ -303,6 +303,27 @@ def mesh_ml_from_numpy(vertices: np.ndarray, faces: np.ndarray) -> mm.Mesh:
     )
 
 
+def face_bitset_ml(mask_np: np.ndarray) -> mm.FaceBitSet:
+    """
+    Load a dense face mask into a ``FaceBitSet`` through the packed blocks, not a per-face loop.
+
+    The benchmark-side twin of ``tests.conversions.numpy_to_meshlib_bitset`` (the two suites do not
+    import each other). Three details that are each a silent wrong answer on their own:
+    ``BitSet.fromBlocks`` takes ``uint64`` blocks and rejects a NumPy array (pass ``.tolist()``),
+    ``bitorder="little"`` is not NumPy's default and is not optional, and ``fromBlocks`` rounds the
+    size up to whole 64-bit blocks so the domain has to be restored afterwards.
+
+    Measured against the per-face ``set()`` loop it replaces: 258x at 110 592 elements.
+    """
+    from meshlib import mrmeshpy as mm
+
+    packed_np = np.packbits(np.ascontiguousarray(mask_np, dtype=bool), bitorder="little")
+    packed_np = np.pad(packed_np, (0, (-packed_np.size) % 8)).view(np.uint64)
+    bitset_ml = mm.BitSet.fromBlocks(mm.std_vector_unsigned_long(packed_np.tolist()))
+    bitset_ml.resize(int(mask_np.size))
+    return mm.FaceBitSet(bitset_ml)
+
+
 def _new_mesh_ml(name: str) -> mm.Mesh:
     """Build a fresh ``meshlib.mrmeshpy.Mesh`` from the shared NumPy source."""
     return mesh_ml_from_numpy(*_load_numpy(name))

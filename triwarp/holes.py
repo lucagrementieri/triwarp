@@ -44,6 +44,16 @@ followed by a cross-boundary least-squares solve
 ([`smooth_region`][triwarp.smoothing.smooth_region]), with an optional
 ``natural_smooth`` collar that blends the patch into the neighbouring surface.
 
+Not every boundary wants closing. [`extend_hole`][triwarp.holes.extend_hole] and
+[`build_bottom`][triwarp.holes.build_bottom] *extrude* a rim -- out to a plane you place, or down
+to a base fitted under each rim's own lowest point -- which leaves the mesh open with a planar rim
+that a min-weight fill then closes without folding; that two-step is how a scanned shell becomes a
+printable solid. And [`bridge_edges`][triwarp.holes.bridge_edges] and
+[`bridge_edges_smooth`][triwarp.holes.bridge_edges_smooth] are the *local* form of stitching: they
+join one boundary edge to another with a small patch or a curved strip, leaving the rest of both
+boundaries open, which is what joins two tubes at a chosen seam or adds a handle where the rim
+family would consume the whole loop.
+
 Every filler returns a buffer **independent of** ``faces``, including on the no-op path where
 there was no hole to fill, so a caller may write into the result without disturbing its input.
 """
@@ -52,12 +62,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import numpy as np
 import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import boundary as kernel_boundary
 from triwarp.kernels import holes as kernel_holes
 
@@ -1122,10 +1134,117 @@ def extend_hole(
     --------
     [`fill_min_weight`][triwarp.holes.fill_min_weight]
         Closes the planar rim this leaves.
+    [`build_bottom`][triwarp.holes.build_bottom]
+        The same extension with the plane fitted to each rim, instead of placed by the caller.
     [`stitch_loops`][triwarp.holes.stitch_loops]
         Bridges two rims that both already exist, where this generates the second one.
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
+    packed = _packed_rims(vertices, faces, loops)
+    if packed is None:
+        return wp.clone(vertices), wp.clone(faces)
+    origins = wp.full(packed.n_loops, plane_origin, dtype=wp.vec3, device=faces.device)
+    return _extend_packed_rims(vertices, faces, packed, origins, plane_normal)
+
+
+def build_bottom(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    direction: wp.vec3,
+    hole_extension: float = 0.0,
+    loops: Sequence[wp.array[wp.int32]] | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Extend every boundary rim down to a flat base placed under its own lowest vertex.
+
+    This is [`extend_hole`][triwarp.holes.extend_hole] with the plane chosen for you: for each rim
+    separately, the plane with normal ``direction`` through that rim's most extreme vertex in the
+    ``-direction`` sense, pushed a further ``hole_extension`` past it. So the base sits flush with
+    the lowest point of the rim and nothing folds -- which is what makes this the safe form when the
+    rim is not level and a hand-placed plane would cut through it.
+
+    Each rim gets its **own** plane. A mesh with two rims at different heights therefore gets two
+    bases, not one shared one; pass a single-element ``loops`` to bottom just one of them.
+
+    The result is still open -- the base is a rim in the plane, not a cap. Follow with
+    [`fill_min_weight`][triwarp.holes.fill_min_weight] to close it.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    direction
+        The "up" direction the base is placed against: the plane's normal, and the rim is extended
+        towards ``-direction``. Assumed unit length -- ``hole_extension`` is measured in its units
+        and the projection scales with it otherwise.
+    hole_extension
+        Extra distance past the extreme vertex, along ``-direction``. ``0.0`` puts the base exactly
+        through the lowest rim vertex, which leaves that vertex unmoved.
+    loops
+        Rims to extend. ``None`` extends every one, via
+        [`boundary_loops`][triwarp.boundary.boundary_loops].
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        The input positions, unchanged and in order, with one projected vertex appended per rim
+        vertex.
+    faces : wp.array[wp.int32]
+        The input faces with the bridge triangles appended -- two per rim edge.
+
+    Raises
+    ------
+    ValueError
+        If any loop is not a rank-1 ``wp.int32`` array.
+
+    See Also
+    --------
+    [`extend_hole`][triwarp.holes.extend_hole]
+        The general form, where the plane is yours to place.
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
+        Closes the flat rim this leaves.
+    """
+    device = faces.device
+    packed = _packed_rims(vertices, faces, loops)
+    if packed is None:
+        return wp.clone(vertices), wp.clone(faces)
+
+    extremes = wp.full(packed.n_loops, wp.float32(math.inf), dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_holes.loop_extreme_projection,
+        dim=int(packed.indices.shape[0]),
+        inputs=[vertices, packed.indices, packed.loop_id, direction, extremes],
+        device=device,
+    )
+    origins = wp.empty(packed.n_loops, dtype=wp.vec3, device=device)
+    wp.map(
+        kernel_holes.plane_origin_from_extreme,
+        extremes,
+        direction,
+        wp.float32(hole_extension),
+        out=origins,
+    )
+    return _extend_packed_rims(vertices, faces, packed, origins, direction)
+
+
+class _PackedRims(NamedTuple):
+    """One flat buffer of rim vertices, with the per-loop bookkeeping the extension kernels read."""
+
+    indices: wp.array[wp.int32]
+    loop_id: wp.array[wp.int32]
+    starts: wp.array[wp.int32]
+    sizes: wp.array[wp.int32]
+    n_loops: int
+
+
+def _packed_rims(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    loops: Sequence[wp.array[wp.int32]] | None,
+) -> _PackedRims | None:
+    """Pack the rims to extend, or ``None`` when there is nothing to extend."""
     device = faces.device
     if loops is None:
         loops = tw.boundary.boundary_loops(vertices, faces)
@@ -1134,23 +1253,41 @@ def extend_hole(
         if len(loop.shape) != 1 or loop.dtype is not wp.int32:
             raise ValueError("every loop must be a rank-1 wp.int32 array of vertex indices")
     if not loops or all(int(loop.shape[0]) == 0 for loop in loops):
-        return wp.clone(vertices), wp.clone(faces)
+        return None
 
     packed, starts = tw.array.pack_1d_arrays(loops)
     sizes_np = np.array([int(loop.shape[0]) for loop in loops], dtype=np.int32)
-    total = int(packed.shape[0])
     loop_id = wp.array(
         np.repeat(np.arange(len(loops), dtype=np.int32), sizes_np), dtype=wp.int32, device=device
     )
     sizes = wp.array(sizes_np, dtype=wp.int32, device=device)
+    return _PackedRims(packed, loop_id, starts, sizes, len(loops))
 
+
+def _extend_packed_rims(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    rims: _PackedRims,
+    plane_origins: wp.array[wp.vec3],
+    plane_normal: wp.vec3,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """Project every packed rim vertex onto its loop's plane and bridge the two rings."""
+    device = faces.device
+    total = int(rims.indices.shape[0])
     n_vertices = int(vertices.shape[0])
     extended_vertices = wp.empty(n_vertices + total, dtype=wp.vec3, device=device)
     wp.copy(extended_vertices[:n_vertices], vertices)
     wp.launch(
         kernel_holes.project_loop_to_plane,
         dim=total,
-        inputs=[vertices, packed, plane_origin, plane_normal, extended_vertices[n_vertices:]],
+        inputs=[
+            vertices,
+            rims.indices,
+            rims.loop_id,
+            plane_origins,
+            plane_normal,
+            extended_vertices[n_vertices:],
+        ],
         device=device,
     )
 
@@ -1161,10 +1298,10 @@ def extend_hole(
         kernel_holes.bridge_loop_to_ring,
         dim=total,
         inputs=[
-            packed,
-            loop_id,
-            starts,
-            sizes,
+            rims.indices,
+            rims.loop_id,
+            rims.starts,
+            rims.sizes,
             wp.int32(n_vertices),
             extended_faces[3 * n_faces :].reshape((2 * total, 3)),
         ],
@@ -1957,6 +2094,386 @@ def stitch_loops_min_weight(
     )
     band_faces = wp.array(band.reshape(-1), dtype=wp.int32, device=device)
     return combined_vertices, tw.array.concatenate([combined_faces, band_faces])
+
+
+def bridge_edges(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    edge_a: tuple[int, int],
+    edge_b: tuple[int, int],
+    validate: bool = True,
+) -> wp.array[wp.int32]:
+    """
+    Join two boundary edges with a two-triangle patch, leaving the rest of both rims open.
+
+    Where [`stitch_loops`][triwarp.holes.stitch_loops] consumes two *complete* rims, this is the
+    local operation underneath it: pick one edge on each side and close only that gap. Two open
+    rims become one, so a bridge is how a tube is joined to another tube at a chosen seam, how a
+    partially torn boundary is tacked back together, and -- when both edges lie on the *same* rim --
+    how a handle is added, since bridging one loop to itself splits it into two.
+
+    The patch is the quadrilateral ``(a1, a0, b1, b0)`` split along the ``a0 - b0`` diagonal, so it
+    adds **two triangles and no vertices**. When the two edges already share a vertex -- they are
+    consecutive along one rim -- that quadrilateral is a triangle and only **one** is added.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions. Only read to validate the two edges; the patch
+        itself is purely topological, and nothing moves.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    edge_a
+        A boundary edge as ``(v0, v1)``, **directed the way its face winds it** -- a row of
+        [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges].
+    edge_b
+        The second boundary edge, in the same direction convention.
+    validate
+        Check that both edges are boundary edges of ``faces`` and that the patch would not
+        duplicate an existing edge. Costs one pass over the mesh edges and one readback; pass
+        ``False`` when the edges came from
+        [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges] and the pairing is
+        known good.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        The input faces with the patch appended, on ``faces.device``. The appended block is the
+        tail -- ``3`` entries longer than the input for the shared-vertex case, ``6`` otherwise --
+        so its size is what says which case was taken.
+
+    Raises
+    ------
+    ValueError
+        If the two edges are the same edge, if ``validate`` is set and either is not a boundary
+        edge of ``faces``, or if ``validate`` is set and the patch would create a second edge
+        between a pair of vertices that already share one (which would leave the mesh
+        non-manifold).
+
+    Examples
+    --------
+    ```python
+    edges_np = tw.boundary.oriented_boundary_edges(open_v, open_f).numpy()
+    bridged_f = tw.holes.bridge_edges(
+        open_v, open_f, tuple(edges_np[0]), tuple(edges_np[len(edges_np) // 2])
+    )
+    ```
+
+    See Also
+    --------
+    [`bridge_edges_smooth`][triwarp.holes.bridge_edges_smooth]
+        The multi-segment form, which curves the patch and adds vertices.
+    [`stitch_loops`][triwarp.holes.stitch_loops]
+        Joins two rims completely, where this joins one edge of each.
+    [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
+        Produces the edges this takes, already in the right direction.
+    """
+    edge_a = (int(edge_a[0]), int(edge_a[1]))
+    edge_b = (int(edge_b[0]), int(edge_b[1]))
+    _check_bridge_edges(
+        vertices, faces, edge_a, edge_b, _bridge_joined_pairs(edge_a, edge_b), validate
+    )
+    triangles = _bridge_triangles(edge_a, edge_b)
+    patch = wp.array(
+        np.asarray(triangles, dtype=np.int32).reshape(-1), dtype=wp.int32, device=faces.device
+    )
+    return tw.array.concatenate([faces, patch])
+
+
+def bridge_edges_smooth(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    edge_a: tuple[int, int],
+    edge_b: tuple[int, int],
+    sampling_step: float,
+    validate: bool = True,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Join two boundary edges with a curved strip that leaves both surfaces smoothly.
+
+    [`bridge_edges`][triwarp.holes.bridge_edges] spans the gap with a flat patch, which creases
+    against both surfaces as soon as the two edges are more than a triangle apart. This spans it
+    with a strip of quadrilaterals instead, following the cubic through the two edge midpoints
+    whose end tangents lie **in** the two incident triangles -- so the strip leaves each surface in
+    the direction that surface was already going, and the crease is spread over the whole strip
+    rather than concentrated at its two ends.
+
+    The strip is subdivided until its segments are no longer than ``sampling_step``, and its width
+    tapers linearly from the length of ``edge_a`` to that of ``edge_b``. Its two boundary chains
+    start at the two ends of ``edge_a`` and finish at the two ends of ``edge_b``, so the existing
+    four vertices are reused and only the interior ones are new. As in the flat form, two edges
+    that already share a vertex give a fan from that vertex rather than a strip.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    edge_a
+        A boundary edge as ``(v0, v1)``, directed the way its face winds it.
+    edge_b
+        The second boundary edge, in the same direction convention.
+    sampling_step
+        Target segment length along the strip. Smaller means more segments and a smoother patch;
+        a step at or above the span gives the single segment
+        [`bridge_edges`][triwarp.holes.bridge_edges] would have produced, on the curve rather than
+        on the chord.
+    validate
+        Check that both edges are boundary edges of ``faces`` and that the patch would not
+        duplicate an existing edge, as in [`bridge_edges`][triwarp.holes.bridge_edges].
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        The input positions, unchanged and in order, with the strip's interior vertices appended.
+    faces : wp.array[wp.int32]
+        The input faces with the strip's triangles appended.
+
+    Raises
+    ------
+    ValueError
+        If ``sampling_step`` is not positive, if either edge is not a directed edge of ``faces``
+        (checked whatever ``validate`` says, since the strip needs both incident faces), or for any
+        of the reasons [`bridge_edges`][triwarp.holes.bridge_edges] raises.
+
+    !!! note "The curve is a cubic, not an optimum"
+        The strip follows one cubic Hermite segment fitted to the two edge midpoints and the two
+        incident-face tangents. Nothing minimizes its bending energy or checks it for
+        self-intersection, so a step far smaller than the span across two nearly opposed edges can
+        fold; run [`fix_self_intersections`][triwarp.repair.fix_self_intersections] if the input
+        pairing is not yours to choose.
+
+    See Also
+    --------
+    [`bridge_edges`][triwarp.holes.bridge_edges]
+        The single-quadrilateral form, which adds no vertices.
+    [`fill_smooth`][triwarp.holes.fill_smooth]
+        The same idea for a whole rim: a patch refined and faired rather than merely spanned.
+    """
+    if sampling_step <= 0.0:
+        raise ValueError(f"sampling_step must be positive, got {sampling_step}")
+    device = faces.device
+    a0, a1 = int(edge_a[0]), int(edge_a[1])
+    b0, b1 = int(edge_b[0]), int(edge_b[1])
+    # A strip with interior samples joins nothing but its own new vertices, so it has no pair to
+    # check; the one-segment case falls through to the flat patch below, which checks its own.
+    _check_bridge_edges(vertices, faces, (a0, a1), (b0, b1), (), validate)
+
+    # One launch to find each edge's opposite corner, then one gather of the six positions the
+    # spline needs. Both are here so the host never reads back a buffer that scales with the mesh.
+    query = wp.array(np.array([[a0, a1], [b0, b1]], dtype=np.int32), dtype=wp.int32, device=device)
+    opposites = wp.full(2, wp.int32(-1), dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_holes.directed_edge_opposites,
+        dim=(int(faces.shape[0]) // 3, 2),
+        inputs=[faces, query, opposites],
+        device=device,
+    )
+    opposites_np = opposites.numpy()
+    if int(opposites_np[0]) < 0 or int(opposites_np[1]) < 0:
+        raise ValueError("both edges must be directed edges of faces, wound as their face winds")
+    corners = np.array([a0, a1, b0, b1, int(opposites_np[0]), int(opposites_np[1])], dtype=np.int32)
+    gathered = wp.empty(6, dtype=wp.vec3, device=device)
+    wp.copy(gathered, vertices[wp.array(corners, dtype=wp.int32, device=device)])
+    positions_np = gathered.numpy().astype(np.float64)
+
+    n_vertices = int(vertices.shape[0])
+    interior_np, strip_np = _bridge_strip(positions_np, corners, n_vertices, sampling_step)
+    if interior_np.shape[0] == 0:
+        # One segment: the strip *is* the flat patch, so hand it over with the caller's own
+        # ``validate`` -- that path adds edges between existing vertices and has its own check.
+        return wp.clone(vertices), bridge_edges(vertices, faces, (a0, a1), (b0, b1), validate)
+
+    bridged_vertices = wp.empty(n_vertices + interior_np.shape[0], dtype=wp.vec3, device=device)
+    wp.copy(bridged_vertices[:n_vertices], vertices)
+    wp.copy(
+        bridged_vertices[n_vertices:],
+        wp.array(interior_np.astype(np.float32), dtype=wp.vec3, device=device),
+    )
+    strip = wp.array(strip_np.reshape(-1), dtype=wp.int32, device=device)
+    return bridged_vertices, tw.array.concatenate([faces, strip])
+
+
+def _check_bridge_edges(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    edge_a: tuple[int, int],
+    edge_b: tuple[int, int],
+    joined: Sequence[tuple[int, int]],
+    validate: bool,
+) -> None:
+    """
+    Reject a bridge that is degenerate, not on the boundary, or would duplicate an edge.
+
+    Both membership tests run on device against a handful of query rows, so the only readback is
+    those few flags -- an earlier version built Python sets over every mesh edge, which is one
+    interpreter pass per edge and made ``validate=True`` unusable on a scan mesh.
+    """
+    if tuple(edge_a) == tuple(edge_b):
+        raise ValueError("edge_a and edge_b must be different edges")
+    if not validate:
+        return
+
+    on_rim = _rows_present(
+        tw.boundary.oriented_boundary_edges(vertices, faces), [edge_a, edge_b], faces.device
+    )
+    for name, edge, present in (("edge_a", edge_a, on_rim[0]), ("edge_b", edge_b, on_rim[1])):
+        if not present:
+            raise ValueError(
+                f"{name}={edge} is not a boundary edge of faces, wound as its face winds it"
+            )
+
+    if not joined:
+        return
+    # ``joined`` is what the patch adds *between vertices that already exist*; an interior vertex it
+    # invents cannot collide with anything. The lookup is over the mesh's own edges rather than the
+    # rim's, since a chord across a thin neck is usually an interior edge.
+    sorted_pairs = [(min(u, v), max(u, v)) for u, v in joined]
+    collides = _rows_present(
+        tw.edges.faces_to_edges(faces, sorted=True), sorted_pairs, faces.device
+    )
+    for (u, v), present in zip(joined, collides, strict=True):
+        if present:
+            raise ValueError(
+                f"bridging {tuple(edge_a)} to {tuple(edge_b)} would add a second edge between "
+                f"{u} and {v}, leaving the mesh non-manifold; pick a different pair"
+            )
+
+
+def _rows_present(
+    rows: twt.Array2dInt32, queries: Sequence[tuple[int, int]], device: wp.DeviceLike
+) -> list[bool]:
+    """Test a handful of index rows for membership in a table of them, on device."""
+    if int(rows.shape[0]) == 0:
+        return [False] * len(queries)
+    query_wp = wp.array(np.asarray(queries, dtype=np.int32), dtype=wp.int32, device=device)
+    present = wp.zeros(len(queries), dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_array.mark_rows_present,
+        dim=(int(rows.shape[0]), len(queries)),
+        inputs=[rows, query_wp, present],
+        device=device,
+    )
+    return present.numpy().tolist()
+
+
+def _bridge_triangles(
+    edge_a: tuple[int, int], edge_b: tuple[int, int]
+) -> list[tuple[int, int, int]]:
+    """Build the one or two triangles of the flat patch, wound against both edges' own faces."""
+    a0, a1 = edge_a
+    b0, b1 = edge_b
+    # The quadrilateral runs (a1, a0, b1, b0): each edge is traversed backwards from the way its own
+    # face winds it, which is what makes the patch's outward side agree with the mesh's. Its
+    # diagonal is a0 - b0, and a shared vertex collapses one of the two halves onto a line.
+    triangles = [(a1, a0, b0), (a0, b1, b0)]
+    return [t for t in triangles if len(set(t)) == 3]
+
+
+def _bridge_joined_pairs(edge_a: tuple[int, int], edge_b: tuple[int, int]) -> list[tuple[int, int]]:
+    """List the pairs of *existing* vertices the flat patch joins: its two sides and diagonal."""
+    a0, a1 = edge_a
+    b0, b1 = edge_b
+    incident = {(min(a0, a1), max(a0, a1)), (min(b0, b1), max(b0, b1))}
+    pairs = []
+    for triangle in _bridge_triangles(edge_a, edge_b):
+        for k in range(3):
+            u, v = triangle[k], triangle[(k + 1) % 3]
+            key = (min(u, v), max(u, v))
+            if key not in incident and key not in pairs:
+                pairs.append(key)
+    return pairs
+
+
+def _bridge_strip(
+    positions_np: np.ndarray, corners: np.ndarray, n_vertices: int, sampling_step: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Sample the bridge cubic and build the strip: interior positions, and the triangle rows.
+
+    Host-side NumPy over six positions and a handful of samples -- the strip never scales with the
+    mesh, so a kernel here would buy a launch and no parallelism.
+    """
+    a0, a1, b0, b1 = (int(corners[k]) for k in range(4))
+    pa0, pa1, pb0, pb1, pta, ptb = positions_np
+
+    center_a, center_b = 0.5 * (pa0 + pa1), 0.5 * (pb0 + pb1)
+    # The tangent lies in the incident triangle's plane, runs across its edge and points into it, so
+    # the spline's end control points sit inside the two surfaces and the curve leaves them
+    # tangentially rather than at an angle.
+    tangent_a = _unit(np.cross(_unit(np.cross(pa1 - pa0, pta - pa0)), _unit(pa1 - pa0)))
+    tangent_b = _unit(np.cross(_unit(np.cross(pb1 - pb0, ptb - pb0)), _unit(pb1 - pb0)))
+    # The cubic leaves A along -tangent_a and arrives at B along +tangent_b, so it continues each
+    # surface rather than turning off it, and both velocities are scaled by the span -- a cubic
+    # whose end velocities do not grow with the gap it crosses is a chord with a kink at each end.
+    span = float(np.linalg.norm(center_b - center_a))
+    velocity_0 = -span * tangent_a
+    velocity_1 = span * tangent_b
+
+    def hermite(u: np.ndarray) -> np.ndarray:
+        column = u[:, None]
+        squared, cubed = column * column, column * column * column
+        return (
+            (2.0 * cubed - 3.0 * squared + 1.0) * center_a
+            + (cubed - 2.0 * squared + column) * velocity_0
+            + (-2.0 * cubed + 3.0 * squared) * center_b
+            + (cubed - squared) * velocity_1
+        )
+
+    dense = hermite(np.linspace(0.0, 1.0, 64))
+    arc_length = float(np.linalg.norm(np.diff(dense, axis=0), axis=1).sum())
+    n_segments = max(1, math.ceil(arc_length / sampling_step))
+    if n_segments == 1:
+        rows = [t for t in ((a1, a0, b0), (a0, b1, b0)) if len(set(t)) == 3]
+        return np.zeros((0, 3), dtype=np.float64), np.asarray(rows, dtype=np.int32).reshape(-1, 3)
+
+    # The strip's two chains run a1 -> b0 and a0 -> b1, which are the quadrilateral's own two sides.
+    # Their width tapers from one edge's length to the other's, so both ends land on the existing
+    # four vertices exactly and only the interior samples are new.
+    width_dir_a, width_dir_b = _unit(pa0 - pa1), _unit(pb1 - pb0)
+    length_a = float(np.linalg.norm(pa1 - pa0))
+    length_b = float(np.linalg.norm(pb1 - pb0))
+    parameters = np.linspace(0.0, 1.0, n_segments + 1)
+    samples = hermite(parameters)
+    directions = (1.0 - parameters)[:, None] * width_dir_a + parameters[:, None] * width_dir_b
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    half_width = (0.5 * ((1.0 - parameters) * length_a + parameters * length_b))[:, None]
+    minus_np = samples - half_width * directions
+    plus_np = samples + half_width * directions
+
+    # A shared vertex collapses that side of the strip onto the vertex itself, turning the strip
+    # into a fan -- the multi-segment form of the flat patch's one-triangle case.
+    interior: list[np.ndarray] = []
+    minus_ids, plus_ids = [a1], [a0]
+    for i in range(1, n_segments):
+        for shared, ring, ids in ((a1 == b0, minus_np, minus_ids), (a0 == b1, plus_np, plus_ids)):
+            if shared:
+                ids.append(ids[0])
+            else:
+                ids.append(n_vertices + len(interior))
+                interior.append(ring[i])
+    minus_ids.append(b0)
+    plus_ids.append(b1)
+
+    rows = []
+    for i in range(n_segments):
+        for triangle in (
+            (minus_ids[i], plus_ids[i], minus_ids[i + 1]),
+            (plus_ids[i], plus_ids[i + 1], minus_ids[i + 1]),
+        ):
+            if len(set(triangle)) == 3:
+                rows.append(triangle)
+    return (
+        np.asarray(interior, dtype=np.float64).reshape(-1, 3),
+        np.asarray(rows, dtype=np.int32).reshape(-1, 3),
+    )
+
+
+def _unit(vector: np.ndarray) -> np.ndarray:
+    """Normalize, leaving a zero vector alone."""
+    norm = float(np.linalg.norm(vector))
+    return vector if norm == 0.0 else vector / norm
 
 
 def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tuple[int, int]:

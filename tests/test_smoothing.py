@@ -22,6 +22,7 @@ from tests.conversions import (
     meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
     numpy_to_meshlib,
+    numpy_to_meshlib_bitset,
     numpy_to_warp,
     trimesh_to_meshlib,
     trimesh_to_open3d,
@@ -161,11 +162,11 @@ def _meshlab_umbrella(mesh_tm: tm.Trimesh, device: str) -> wps.BsrMatrix[wp.floa
     )
 
 
-def _noisy_icosphere() -> tm.Trimesh:
-    """Build a closed, evenly tessellated mesh carrying 0.01 of noise for a smoother to remove."""
-    mesh_tm = tm.creation.icosphere(subdivisions=2)
-    mesh_tm.vertices = mesh_tm.vertices + np.random.default_rng(0).normal(
-        0.0, 0.01, mesh_tm.vertices.shape
+def _noisy_icosphere(subdivisions: int = 2, sigma: float = 0.01, seed: int = 0) -> tm.Trimesh:
+    """Build a closed, evenly tessellated mesh carrying noise for a smoother to remove."""
+    mesh_tm = tm.creation.icosphere(subdivisions=subdivisions)
+    mesh_tm.vertices = mesh_tm.vertices + np.random.default_rng(seed).normal(
+        0.0, sigma, mesh_tm.vertices.shape
     )
     return mesh_tm
 
@@ -1325,3 +1326,335 @@ def test_remove_spikes_leaves_a_clean_mesh_alone(
     assert tw.smoothing.remove_spikes(empty_vertices_wp, empty_faces_wp, math.pi)[0].shape == (0,)
     with pytest.raises(ValueError, match="max_iter must be non-negative"):
         tw.smoothing.remove_spikes(vertices_wp, faces_wp, math.pi, max_iter=-1)
+
+
+@pytest.mark.parity("equalize_triangle_areas", "meshlib")
+@pytest.mark.parametrize("no_shrinkage", [False, True])
+def test_equalize_triangle_areas_matches_meshlib(device: str, no_shrinkage: bool) -> None:
+    """
+    Class A against ``equalizeTriAreas``: the same positions, to ``float32``.
+
+    Both minimize the summed squared areas of each vertex's incident triangles by the same 3x3
+    solve, so this is an element-wise position comparison and not a statistic. Measured on a noisy
+    ``icosphere(3)`` at three passes and ``force=0.5``: **exactly 0.0** maximum difference without
+    the shrinkage constraint, and **3.6e-07** with it -- the residual there is the vertex normal,
+    which both sides recompute from the current positions every pass.
+
+    ``no_shrinkage`` is parametrized because it is a different linear system (a 2x2 in the tangent
+    plane rather than the full 3x3), not a flag on the same one, and the unconstrained branch would
+    pass a test that never set it.
+
+    The invariant asserted alongside is that the areas actually became more even: the standard
+    deviation of the triangle areas has to fall, which no position comparison implies -- the two
+    libraries could agree on a wrong answer.
+    """
+    mesh_tm = _noisy_icosphere(3, 0.02)
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+
+    relaxed_wp = tw.smoothing.equalize_triangle_areas(
+        vertices_wp, faces_wp, 3, 0.5, no_shrinkage=no_shrinkage
+    )
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    params_ml = mm.MeshEqualizeTriAreasParams()
+    params_ml.iterations = 3
+    params_ml.force = 0.5
+    params_ml.noShrinkage = no_shrinkage
+    mm.equalizeTriAreas(mesh_ml, params_ml)
+    relaxed_ml = mn.toNumpyArray(mesh_ml.points)
+    # Non-vacuity: the reference moved the mesh, so an identity implementation would fail below.
+    assert np.abs(relaxed_ml - np.asarray(mesh_tm.vertices)).max() > 1e-3
+    assert np.allclose(relaxed_wp.numpy(), relaxed_ml, rtol=1e-5, atol=1e-5)
+
+    before = tw.triangles.face_normals_and_areas(vertices_wp, faces_wp)[1].numpy()
+    after = tw.triangles.face_normals_and_areas(relaxed_wp, faces_wp)[1].numpy()
+    assert after.std() < before.std()
+
+
+def test_equalize_triangle_areas_respects_its_region_and_bound(device: str) -> None:
+    """
+    Not a library comparison: the two axes meshlib's parameter struct exposes but its port narrows.
+
+    ``region`` and ``max_displacement`` are asserted against the *input* rather than a reference,
+    because what they claim is exactly a statement about the input: nothing outside the region may
+    move at all, and nothing anywhere may move further than the bound. Both are parametrized over a
+    value that binds and one that does not, so neither passes vacuously -- the loose bound has to
+    reproduce the unbounded answer bit for bit, and the tight one has to actually clip.
+    """
+    mesh_wp = trimesh_to_warp(_noisy_icosphere(3, 0.02), device)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    n_vertices = int(vertices_wp.shape[0])
+    positions_np = vertices_wp.numpy()
+
+    unbounded_wp = tw.smoothing.equalize_triangle_areas(vertices_wp, faces_wp, 3, 0.5)
+    reach = np.linalg.norm(unbounded_wp.numpy() - positions_np, axis=1).max()
+    assert reach > 1e-3  # non-vacuity: there is a displacement for the bound to bite into
+
+    loose_wp = tw.smoothing.equalize_triangle_areas(
+        vertices_wp, faces_wp, 3, 0.5, max_displacement=10.0 * reach
+    )
+    assert np.array_equal(loose_wp.numpy(), unbounded_wp.numpy())
+    tight_wp = tw.smoothing.equalize_triangle_areas(
+        vertices_wp, faces_wp, 3, 0.5, max_displacement=0.2 * reach
+    )
+    assert np.linalg.norm(tight_wp.numpy() - positions_np, axis=1).max() <= 0.2 * reach + 1e-6
+
+    region_np = positions_np[:, 2] > 0.0
+    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+    assert 0 < int(region_np.sum()) < n_vertices  # non-vacuity: a real partition
+    partial_wp = tw.smoothing.equalize_triangle_areas(
+        vertices_wp, faces_wp, 3, 0.5, region=region_wp
+    )
+    assert np.array_equal(partial_wp.numpy()[~region_np], positions_np[~region_np])
+    assert not np.array_equal(partial_wp.numpy()[region_np], positions_np[region_np])
+
+    all_true_wp = wp.full(n_vertices, True, dtype=wp.bool, device=device)
+    assert np.array_equal(
+        tw.smoothing.equalize_triangle_areas(
+            vertices_wp, faces_wp, 3, 0.5, region=all_true_wp
+        ).numpy(),
+        unbounded_wp.numpy(),
+    )
+    assert np.array_equal(
+        tw.smoothing.equalize_triangle_areas(vertices_wp, faces_wp, 0).numpy(), positions_np
+    )
+    with pytest.raises(ValueError, match="iterations must be non-negative"):
+        tw.smoothing.equalize_triangle_areas(vertices_wp, faces_wp, -1)
+    with pytest.raises(ValueError, match="region must be a length-"):
+        tw.smoothing.equalize_triangle_areas(
+            vertices_wp, faces_wp, 1, region=wp.zeros(3, dtype=wp.bool, device=device)
+        )
+
+
+@pytest.mark.parity("relax_keep_volume", "meshlib")
+def test_relax_keep_volume_matches_meshlib(device: str) -> None:
+    """
+    Class A against ``relaxKeepVolume``, plus the property the name claims.
+
+    Element-wise positions agree to **1.9e-09** on a noisy ``icosphere(3)`` at three passes -- the
+    two-pass formulation (build the displacement field, then subtract its ring average) is the same
+    arithmetic on both sides.
+
+    The invariant is the point of the function and no comparison implies it: a plain
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian] over the same mesh must lose
+    noticeably more volume than this does. Asserted as a ratio rather than an absolute so it does
+    not depend on the noise amplitude.
+    """
+    mesh_tm = _noisy_icosphere(3, 0.02)
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+
+    relaxed_wp = tw.smoothing.relax_keep_volume(vertices_wp, faces_wp, 3, 0.5)
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    params_ml = mm.MeshRelaxParams()
+    params_ml.iterations = 3
+    params_ml.force = 0.5
+    mm.relaxKeepVolume(mesh_ml, params_ml)
+    relaxed_ml = mn.toNumpyArray(mesh_ml.points)
+    assert np.abs(relaxed_ml - np.asarray(mesh_tm.vertices)).max() > 1e-3  # non-vacuity
+    assert np.allclose(relaxed_wp.numpy(), relaxed_ml, rtol=1e-5, atol=1e-5)
+
+    start = abs(warp_to_trimesh(vertices_wp, faces_wp).volume)
+    kept = abs(warp_to_trimesh(relaxed_wp, faces_wp).volume)
+    plain_wp = tw.smoothing.filter_laplacian(
+        vertices_wp, faces_wp, lamb=0.5, iterations=3, volume_constraint=False
+    )
+    shrunk = abs(warp_to_trimesh(plain_wp, faces_wp).volume)
+    assert abs(kept - start) < abs(shrunk - start)
+
+
+@pytest.mark.parity("relax_approx", "meshlib")
+@pytest.mark.parametrize("fit", ["planar", "quadric"])
+def test_relax_approx_matches_meshlib(device: str, fit: str) -> None:
+    """
+    Class C against ``relaxApprox``: the surfaces agree, the neighbourhoods are not the same set.
+
+    The two differ by construction in *which* vertices each fit sees -- triwarp uses
+    [`geodesic_ball`][triwarp.neighbors.geodesic_ball]'s breadth-first ball and meshlib dilates a
+    bitset by an edge-length budget, which are the same idea and not the same set -- so an
+    element-wise comparison is not available and the displacement fields are compared instead.
+
+    Measured on a noisy ``icosphere(3)`` at ``dilate_radius=0.3``, one pass, ``force=0.5``:
+    max position difference **0.0094** planar and **0.0198** quadric, against reference
+    displacements of **0.0345** and **0.0194** -- so the two answers are within a quarter of the
+    move for planar and within one move for quadric. The bug class this excludes is a fit taken over
+    the wrong neighbourhood or in the wrong frame, which would put the vertex somewhere unrelated:
+    mutation probe, replacing the fit with the input positions (no move at all) scores **0.0345**
+    and **0.0194** against the same reference, so the bound below separates the real answer from
+    doing nothing by **3.7x** planar and **1.0x** quadric. Only the planar row therefore carries a
+    ratio bound; the quadric row is pinned by the *shared* claim instead, that both flatten the
+    noise by a similar amount.
+
+    ``fit`` is parametrized because the two are different fits, not a tuning: the quadric keeps
+    curvature the plane removes, and on a sphere that difference is the whole answer.
+    """
+    mesh_tm = _noisy_icosphere(3, 0.02)
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    positions_np = vertices_wp.numpy()
+
+    relaxed_wp = tw.smoothing.relax_approx(vertices_wp, faces_wp, 0.3, 1, 0.5, fit)
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    params_ml = mm.MeshApproxRelaxParams()
+    params_ml.iterations = 1
+    params_ml.force = 0.5
+    params_ml.surfaceDilateRadius = 0.3
+    params_ml.type = mm.RelaxApproxType.Planar if fit == "planar" else mm.RelaxApproxType.Quadric
+    mm.relaxApprox(mesh_ml, params_ml)
+    relaxed_ml = mn.toNumpyArray(mesh_ml.points)
+
+    reference_move = np.abs(relaxed_ml - np.asarray(mesh_tm.vertices)).max()
+    assert reference_move > 1e-3  # non-vacuity: the default radius is a documented no-op
+    disagreement = np.abs(relaxed_wp.numpy() - relaxed_ml).max()
+    if fit == "planar":
+        assert disagreement < reference_move / 3.0
+
+    # Both take the noise out: the deviation from the underlying unit sphere must fall, by amounts
+    # within 25% of each other. This is what the quadric row is pinned by.
+    def roughness(points_np: np.ndarray) -> float:
+        return float(np.std(np.linalg.norm(points_np, axis=1)))
+
+    before = roughness(positions_np)
+    assert roughness(relaxed_wp.numpy()) < before
+    assert roughness(relaxed_ml) < before
+    smoothed_tw = before - roughness(relaxed_wp.numpy())
+    smoothed_ml = before - roughness(relaxed_ml)
+    assert abs(smoothed_tw - smoothed_ml) < 0.25 * max(smoothed_tw, smoothed_ml)
+
+
+def test_relax_approx_needs_a_radius_that_reaches(device: str) -> None:
+    """
+    Not a library comparison: the documented silent no-op, and the argument guards.
+
+    A ball smaller than one edge holds the vertex alone, the fit is skipped, and the call returns
+    the input **exactly** -- which is worth pinning because it is the failure a caller meets first
+    and it raises nothing. meshlib's own ``surfaceDilateRadius`` default of ``0.0`` lands there
+    (measured: zero displacement on a noisy ``icosphere(3)``), which is why this port makes the
+    radius a required argument with no default rather than copying that one.
+    """
+    mesh_wp = trimesh_to_warp(_noisy_icosphere(3, 0.02), device)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    tiny_wp = tw.smoothing.relax_approx(vertices_wp, faces_wp, 1e-6, 1, 0.5)
+    assert np.array_equal(tiny_wp.numpy(), vertices_wp.numpy())
+    assert np.array_equal(
+        tw.smoothing.relax_approx(vertices_wp, faces_wp, 0.3, 0).numpy(), vertices_wp.numpy()
+    )
+    with pytest.raises(ValueError, match="dilate_radius must be positive"):
+        tw.smoothing.relax_approx(vertices_wp, faces_wp, 0.0)
+    with pytest.raises(ValueError, match="fit must be"):
+        tw.smoothing.relax_approx(vertices_wp, faces_wp, 0.3, fit="cubic")
+    with pytest.raises(ValueError, match="max_displacement must be non-negative"):
+        tw.smoothing.relax_approx(vertices_wp, faces_wp, 0.3, max_displacement=-1.0)
+
+
+@pytest.mark.parity("smooth_region_boundary", "meshlib")
+@pytest.mark.parametrize("subdivisions", [3, 4])
+def test_smooth_region_boundary_matches_meshlib(device: str, subdivisions: int) -> None:
+    """
+    Class C against ``smoothRegionBoundary``: identical moved sets, agreeing rim curves.
+
+    Class C rather than A because the two are not the same algorithm end to end. Both pin a field
+    to -1 on the region and +1 outside, solve its harmonic interpolation over the band that touches
+    both, and slide those vertices onto the zero level set -- but meshlib first **flips** the band's
+    interior edges to improve the configuration, which changes the connectivity and therefore the
+    level set. This port deliberately does not (it promises the face buffer back untouched), so the
+    positions cannot match element-wise.
+
+    What does match, and is asserted: the set of vertices that move is **exactly equal** (44 of 642
+    at ``subdivisions=3``, 112 of 2 562 at 4), the rim's total length agrees within 1 % (6.073
+    against 6.107, and 6.024 against 6.049), the per-vertex displacement magnitudes correlate at
+    **0.984-0.987**, and the largest position disagreement is **0.0052** against displacements
+    reaching 0.15 -- a 29x margin. The bug class excluded is a band that slides the wrong way or
+    off the surface: both sides keep every moved vertex within **0.0021** of the unit sphere, which
+    a projection onto the wrong level set would not.
+
+    The invariant asserted alongside is the function's actual purpose and no comparison implies it:
+    the rim gets **shorter**. Two mesh resolutions because the level set is a property of the
+    surface, not of the triangulation, so the claim has to survive refining it.
+
+    !!! note "The divergence is real on a ragged selection"
+        Where the region is speckled with isolated single-face islands on a *coarse* mesh, meshlib's
+        edge flips are doing most of the work and this port's rim can end up slightly longer than
+        the input (measured 40.32 against meshlib's 38.86 on a 15 %-speckled ``icosphere(3)``,
+        against an input of 39.46). Refining the mesh removes the gap. The fixtures here are a
+        clean threshold selection, which is the case the function is for.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=subdivisions, radius=1.0)
+    vertices_np = np.asarray(mesh_tm.vertices)
+    faces_np = np.asarray(mesh_tm.faces)
+    region_np = vertices_np[faces_np].mean(axis=1)[:, 2] > 0.3
+    assert 0 < int(region_np.sum()) < len(faces_np)  # non-vacuity: a real region with a rim
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np.ravel(), device)
+    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+
+    smoothed_wp = tw.smoothing.smooth_region_boundary(vertices_wp, faces_wp, region_wp, 4)
+    smoothed_np = smoothed_wp.numpy()
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    region_ml = mm.FaceBitSet(numpy_to_meshlib_bitset(region_np))
+    region_ml.resize(len(faces_np))
+    before_ml = mn.toNumpyArray(mesh_ml.points).copy()
+    mm.smoothRegionBoundary(mesh_ml, region_ml, 4)
+    smoothed_ml = mn.toNumpyArray(mesh_ml.points)
+
+    moved_wp = np.linalg.norm(smoothed_np - vertices_wp.numpy(), axis=1) > 1e-6
+    moved_ml = np.linalg.norm(smoothed_ml - before_ml, axis=1) > 1e-6
+    assert int(moved_ml.sum()) > 0  # non-vacuity: the reference did something
+    assert np.array_equal(moved_wp, moved_ml)
+    assert np.abs(smoothed_np - smoothed_ml).max() < 0.05
+
+    rim_np = tw.selection.region_boundary_edges(faces_wp, region_wp).numpy()
+
+    def rim_length(points_np: np.ndarray) -> float:
+        return float(
+            np.linalg.norm(points_np[rim_np[:, 0]] - points_np[rim_np[:, 1]], axis=1).sum()
+        )
+
+    start = rim_length(vertices_np)
+    assert rim_length(smoothed_np) < start
+    assert abs(rim_length(smoothed_np) - rim_length(smoothed_ml)) < 0.01 * start
+    # Neither side lifted the band off the sphere it slid along.
+    assert np.abs(np.linalg.norm(smoothed_np[moved_wp], axis=1) - 1.0).max() < 0.01
+
+
+def test_smooth_region_boundary_leaves_connectivity_and_the_rest_alone(device: str) -> None:
+    """
+    Not a library comparison: the promises the signature makes, and the degenerate regions.
+
+    Only the band may move -- neither the region's interior nor anything outside it -- and the face
+    buffer the caller passed in is still the one its ``region`` mask indexes. An empty region and a
+    full one both have no band at all, so both are the identity; that is the branch a caller hits
+    when a selection threshold misses.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    vertices_np = np.asarray(mesh_tm.vertices)
+    faces_np = np.asarray(mesh_tm.faces)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np.ravel(), device)
+    n_faces = len(faces_np)
+
+    region_np = vertices_np[faces_np].mean(axis=1)[:, 2] > 0.3
+    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+    smoothed_np = tw.smoothing.smooth_region_boundary(vertices_wp, faces_wp, region_wp, 4).numpy()
+    moved = np.linalg.norm(smoothed_np - vertices_wp.numpy(), axis=1) > 1e-6
+    # Every moved vertex belongs to both a selected and an unselected face: that is the band.
+    inside = np.zeros(len(vertices_np), dtype=bool)
+    inside[faces_np[region_np].ravel()] = True
+    outside = np.zeros(len(vertices_np), dtype=bool)
+    outside[faces_np[~region_np].ravel()] = True
+    assert not np.any(moved & ~(inside & outside))
+
+    for degenerate in (np.zeros(n_faces, dtype=bool), np.ones(n_faces, dtype=bool)):
+        identity_np = tw.smoothing.smooth_region_boundary(
+            vertices_wp, faces_wp, wp.array(degenerate, dtype=wp.bool, device=device), 4
+        ).numpy()
+        assert np.array_equal(identity_np, vertices_wp.numpy())
+    assert np.array_equal(
+        tw.smoothing.smooth_region_boundary(vertices_wp, faces_wp, region_wp, 0).numpy(),
+        vertices_wp.numpy(),
+    )
+    with pytest.raises(ValueError, match="iterations must be non-negative"):
+        tw.smoothing.smooth_region_boundary(vertices_wp, faces_wp, region_wp, -1)
+    with pytest.raises(ValueError, match="region must be a length-"):
+        tw.smoothing.smooth_region_boundary(
+            vertices_wp, faces_wp, wp.zeros(3, dtype=wp.bool, device=device), 4
+        )

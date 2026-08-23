@@ -1,8 +1,39 @@
 import warp as wp
+from warp.fem.linalg import householder_qr_decomposition, solve_triangular
 
 from triwarp.kernels.array import to_vec3d
 from triwarp.kernels.linalg import free_row
+from triwarp.kernels.points import plane_basis
+from triwarp.kernels.predicates import closest_point_on_segment
 from triwarp.kernels.triangles import corner_triple
+
+# Fixed-size float64 types for the 6-coefficient quadric fit in ``relax_approx``. The rest of the
+# kernel runs in float32; the least-squares solve is float64 for conditioning, as in
+# ``kernels/curvature.py``'s 5x5 sibling.
+# DBL_EPSILON, the relative accuracy of a float64. The area-equalizing solve compares its system's
+# determinant against this times the trace's power, which is the scale-free way to ask whether the
+# 1-ring is degenerate enough that the solution cannot be trusted.
+DOUBLE_EPSILON = wp.constant(wp.float64(2.220446049250313e-16))
+
+vec6d = wp.types.vector(length=6, dtype=wp.float64)
+mat66d = wp.types.matrix(shape=(6, 6), dtype=wp.float64)
+
+
+@wp.func
+def solve_normal_equations_6(matrix: mat66d, rhs: vec6d) -> tuple[vec6d, wp.bool]:
+    """
+    Solve the 6x6 normal equations by Householder QR, reporting failure rather than raising.
+
+    ``|R[k, k]|`` is the norm of column k after the preceding reflections, so testing it is the QR
+    analogue of a partial-pivot magnitude test and the ``1e-14`` threshold carries the same meaning
+    it has in the 5x5 quadric solve.
+    """
+    q, r = householder_qr_decomposition(matrix)
+    for k in range(6):
+        if wp.abs(r[k, k]) < wp.float64(1e-14):
+            return rhs, False
+    return solve_triangular(r, wp.transpose(q) * rhs), True
+
 
 # ---------------------------------------------------------------------------
 # Region Dirichlet / least-squares smoothing (positionVertsSmoothly, MRLaplacian.cpp)
@@ -454,3 +485,386 @@ def select_position(smoothed: wp.vec3, original: wp.vec3, replace: wp.bool) -> w
     if replace:
         return smoothed
     return original
+
+
+# ---------------------------------------------------------------------------
+# Relaxation family: area equalization, volume-preserving relax, surface-fit relax
+# ---------------------------------------------------------------------------
+
+
+@wp.func
+def limit_near_initial(target: wp.vec3, initial: wp.vec3, max_distance: wp.float32) -> wp.vec3:
+    # Clamp a proposed position into a ball around where the vertex started. A negative radius means
+    # no limit, which is how the wrapper spells ``max_displacement=None`` without a second kernel.
+    if max_distance < wp.float32(0.0):
+        return target
+    offset = target - initial
+    distance = wp.length(offset)
+    if distance <= max_distance:
+        return target
+    return initial + offset * (max_distance / distance)
+
+
+@wp.func
+def _rotate_corner_to_front(
+    first: wp.int32, second: wp.int32, third: wp.int32, vertex: wp.int32
+) -> tuple[wp.int32, wp.int32]:
+    # The face's other two corners, in winding order starting after ``vertex``. Winding order is
+    # what makes the pair an oriented opposite *edge* rather than an unordered pair.
+    if first == vertex:
+        return second, third
+    if second == vertex:
+        return third, first
+    return first, second
+
+
+@wp.func
+def equal_area_position(
+    positions: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    vertex: wp.int32,
+    normal: wp.vec3,
+    no_shrinkage: wp.bool,
+) -> wp.vec3:
+    """
+    Solve for the position minimizing the summed squared areas of the incident triangles.
+
+    Twice the area of the triangle on the opposite edge ``(p, q)`` is ``|(x - p) x (q - p)|``, so
+    the objective is a sum of quadratic forms in the free position ``x`` and its minimum is one
+    linear solve. Accumulated in ``float64``: the matrix is a sum of rank-deficient terms and a
+    near-degenerate 1-ring loses the answer entirely in ``float32``.
+
+    With ``no_shrinkage`` the solve is restricted to the tangent plane through the current position,
+    so the vertex slides across the surface instead of sinking into it -- an unconstrained minimum
+    of *squared* area pulls the whole 1-ring inward.
+    """
+    current = positions[vertex]
+    matrix = wp.mat33d()
+    rhs = wp.vec3d()
+    for slot in range(offsets[vertex], offsets[vertex + 1]):
+        first, second, third = corner_triple(faces, vertex_faces[slot])
+        opposite_start, opposite_end = _rotate_corner_to_front(first, second, third, vertex)
+        first_position = to_vec3d(positions[opposite_start])
+        edge = to_vec3d(positions[opposite_end]) - first_position
+        # ``d d^T - |d|^2 I`` maps x to d x (d x x): the quadratic form whose value at x - p is
+        # minus the squared area term.
+        term = wp.outer(edge, edge) - wp.identity(n=3, dtype=wp.float64) * wp.dot(edge, edge)
+        matrix += term
+        rhs += term * first_position
+
+    if no_shrinkage:
+        axis_x, axis_y = plane_basis(normal)
+        basis_x = to_vec3d(axis_x)
+        basis_y = to_vec3d(axis_y)
+        mapped_x = matrix * basis_x
+        mapped_y = matrix * basis_y
+        off_diagonal = wp.dot(mapped_x, basis_y)
+        planar = wp.mat22d(
+            wp.dot(mapped_x, basis_x), off_diagonal, off_diagonal, wp.dot(mapped_y, basis_y)
+        )
+        determinant = wp.determinant(planar)
+        trace = planar[0, 0] + planar[1, 1]
+        if DOUBLE_EPSILON * wp.abs(trace * trace) >= wp.abs(determinant):
+            return current
+        anchor = to_vec3d(normal) * wp.dot(to_vec3d(normal), to_vec3d(current))
+        reduced = rhs - matrix * anchor
+        solution = wp.inverse(planar) * wp.vec2d(wp.dot(reduced, basis_x), wp.dot(reduced, basis_y))
+        target = anchor + basis_x * solution[0] + basis_y * solution[1]
+        return wp.vec3(wp.float32(target[0]), wp.float32(target[1]), wp.float32(target[2]))
+
+    determinant = wp.determinant(matrix)
+    trace = matrix[0, 0] + matrix[1, 1] + matrix[2, 2]
+    if DOUBLE_EPSILON * wp.abs(trace * trace * trace) >= wp.abs(determinant):
+        return current
+    target = wp.inverse(matrix) * rhs
+    return wp.vec3(wp.float32(target[0]), wp.float32(target[1]), wp.float32(target[2]))
+
+
+@wp.kernel
+def equalize_area_step(
+    positions: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    normals: wp.array[wp.vec3],
+    region: wp.array[wp.bool],
+    initial: wp.array[wp.vec3],
+    force: wp.float32,
+    no_shrinkage: wp.bool,
+    max_displacement: wp.float32,
+    out_positions: wp.array[wp.vec3],
+) -> None:
+    # One pass of area equalization: step each in-region vertex a fraction ``force`` of the way to
+    # its own equal-area minimum, then clamp it back near where it started.
+    vertex = wp.int32(wp.tid())
+    current = positions[vertex]
+    if not region[vertex] or offsets[vertex] == offsets[vertex + 1]:
+        out_positions[vertex] = current
+        return
+    target = equal_area_position(
+        positions, faces, offsets, vertex_faces, vertex, normals[vertex], no_shrinkage
+    )
+    moved = current + (target - current) * force
+    out_positions[vertex] = limit_near_initial(moved, initial[vertex], max_displacement)
+
+
+@wp.kernel
+def ring_push_forces(
+    positions: wp.array[wp.vec3],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    region: wp.array[wp.bool],
+    force: wp.float32,
+    out_push: wp.array[wp.vec3],
+) -> None:
+    # The plain uniform-relax displacement each in-region vertex would take on its own. Kept as a
+    # field rather than applied, because the volume correction below is its ring average.
+    vertex = wp.int32(wp.tid())
+    begin = offsets[vertex]
+    end = offsets[vertex + 1]
+    if not region[vertex] or begin == end:
+        out_push[vertex] = wp.vec3(0.0, 0.0, 0.0)
+        return
+    total = wp.vec3d()
+    for slot in range(begin, end):
+        total += to_vec3d(positions[columns[slot]])
+    mean = total / wp.float64(end - begin)
+    average = wp.vec3(wp.float32(mean[0]), wp.float32(mean[1]), wp.float32(mean[2]))
+    out_push[vertex] = (average - positions[vertex]) * force
+
+
+@wp.kernel
+def apply_push_keeping_volume(
+    positions: wp.array[wp.vec3],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    region: wp.array[wp.bool],
+    push: wp.array[wp.vec3],
+    initial: wp.array[wp.vec3],
+    max_displacement: wp.float32,
+    out_positions: wp.array[wp.vec3],
+) -> None:
+    # Subtract the ring average of the displacement field from each vertex's own displacement. A
+    # translation shared by a whole neighbourhood cancels, so the surface stops drifting inward
+    # while the high-frequency part of the relax survives -- which is what preserves the volume.
+    # The divisor is the full degree while the sum runs over in-region neighbours only, so a vertex
+    # on the region's edge is corrected by less than one that is surrounded.
+    vertex = wp.int32(wp.tid())
+    current = positions[vertex]
+    begin = offsets[vertex]
+    end = offsets[vertex + 1]
+    if not region[vertex] or begin == end:
+        out_positions[vertex] = current
+        return
+    total = wp.vec3()
+    for slot in range(begin, end):
+        neighbor = columns[slot]
+        if region[neighbor]:
+            total += push[neighbor]
+    moved = current + push[vertex] - total / wp.float32(end - begin)
+    out_positions[vertex] = limit_near_initial(moved, initial[vertex], max_displacement)
+
+
+@wp.func
+def _neighborhood_frame(
+    positions: wp.array[wp.vec3], neighbors: wp.array[wp.int32], begin: wp.int32, end: wp.int32
+) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3]:
+    # Principal frame of the neighbourhood point set: its centroid, then the two directions of
+    # greatest spread and the one of least. The least-spread direction is the fitted plane's normal,
+    # so the same decomposition serves both the planar and the quadric fit.
+    count = wp.float32(end - begin)
+    centroid = wp.vec3()
+    for slot in range(begin, end):
+        centroid += positions[neighbors[slot]]
+    centroid /= count
+    covariance = wp.mat33()
+    for slot in range(begin, end):
+        offset = positions[neighbors[slot]] - centroid
+        covariance += wp.outer(offset, offset)
+    _left, _singular, basis = wp.svd3(covariance / count)
+    # ``wp.svd3`` orders the singular values descending, so the last column spans the least. Its
+    # sign is arbitrary and irrelevant: every use below is a projection along the axis, not a side.
+    axis_u = wp.vec3(basis[0, 0], basis[1, 0], basis[2, 0])
+    axis_v = wp.vec3(basis[0, 1], basis[1, 1], basis[2, 1])
+    axis_w = wp.vec3(basis[0, 2], basis[1, 2], basis[2, 2])
+    return centroid, axis_u, axis_v, axis_w
+
+
+@wp.kernel
+def relax_approx_step(
+    positions: wp.array[wp.vec3],
+    neighbor_indices: wp.array[wp.int32],
+    neighbor_offsets: wp.array[wp.int32],
+    region: wp.array[wp.bool],
+    initial: wp.array[wp.vec3],
+    force: wp.float32,
+    quadric: wp.bool,
+    max_displacement: wp.float32,
+    out_positions: wp.array[wp.vec3],
+) -> None:
+    # Fit a local surface to the vertex's neighbourhood and step toward the point of that surface
+    # above the vertex. A plane needs 3 points and the quadric 6, which is why an under-populated
+    # neighbourhood is left alone rather than fitted to whatever it has.
+    vertex = wp.int32(wp.tid())
+    current = positions[vertex]
+    begin = neighbor_offsets[vertex]
+    # ``geodesic_ball`` returns starts without a sentinel, so the last row runs to the buffer's end.
+    end = neighbor_indices.shape[0]
+    if vertex + 1 < neighbor_offsets.shape[0]:
+        end = neighbor_offsets[vertex + 1]
+    if not region[vertex] or end - begin < 6:
+        out_positions[vertex] = current
+        return
+
+    centroid, axis_u, axis_v, axis_w = _neighborhood_frame(positions, neighbor_indices, begin, end)
+    offset = current - centroid
+    # Initialized before the branch, per the kernel-scope scoping rule; the planar fit's answer is
+    # exactly this, since the plane passes through the neighbourhood centroid.
+    height = wp.float32(0.0)
+    if quadric:
+        # Least squares over ``w = a u^2 + b u v + c v^2 + d u + e v + f`` in the neighbourhood's
+        # own frame: the fit is a graph over the plane the neighbourhood already lies closest to.
+        normal_matrix = mat66d()
+        normal_rhs = vec6d()
+        for slot in range(begin, end):
+            local = positions[neighbor_indices[slot]] - centroid
+            u = wp.float64(wp.dot(local, axis_u))
+            v = wp.float64(wp.dot(local, axis_v))
+            row = vec6d(u * u, u * v, v * v, u, v, wp.float64(1.0))
+            normal_matrix += wp.outer(row, row)
+            normal_rhs += row * wp.float64(wp.dot(local, axis_w))
+        coefficients, ok = solve_normal_equations_6(normal_matrix, normal_rhs)
+        if ok:
+            u = wp.float64(wp.dot(offset, axis_u))
+            v = wp.float64(wp.dot(offset, axis_v))
+            height = wp.float32(
+                coefficients[0] * u * u
+                + coefficients[1] * u * v
+                + coefficients[2] * v * v
+                + coefficients[3] * u
+                + coefficients[4] * v
+                + coefficients[5]
+            )
+
+    target = current + axis_w * (height - wp.dot(offset, axis_w))
+    moved = current + (target - current) * force
+    out_positions[vertex] = limit_near_initial(moved, initial[vertex], max_displacement)
+
+
+@wp.kernel
+def project_to_zero_isoline(
+    positions: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    field: wp.array[wp.float64],
+    free: wp.array[wp.bool],
+    damping: wp.float32,
+    out_positions: wp.array[wp.vec3],
+) -> None:
+    # Pull each free vertex onto the field's zero level set, which is where the region's rim curve
+    # wants to be. Inside one triangle the level set is a straight segment between the crossings on
+    # the two edges out of the *apex* -- the corner whose sign differs from the other two -- so the
+    # nearest point of the whole curve to this vertex is the nearest over its incident triangles'
+    # segments. Damped rather than snapped, because the field is recomputed from the moved positions
+    # on the next pass and a full step oscillates.
+    vertex = wp.int32(wp.tid())
+    current = positions[vertex]
+    if not free[vertex]:
+        out_positions[vertex] = current
+        return
+
+    best = current
+    best_distance = wp.float32(3.4028235e38)
+    for slot in range(offsets[vertex], offsets[vertex + 1]):
+        first, second, third = corner_triple(faces, vertex_faces[slot])
+        value_first = field[first]
+        value_second = field[second]
+        value_third = field[third]
+        # The apex is the corner alone on its side of zero. When every corner shares a sign the
+        # level set misses the triangle entirely.
+        apex = first
+        left = second
+        right = third
+        if value_second * value_third > wp.float64(0.0):
+            if value_first * value_second > wp.float64(0.0):
+                continue
+        elif value_first * value_third > wp.float64(0.0):
+            apex = second
+            left = third
+            right = first
+        else:
+            apex = third
+            left = first
+            right = second
+
+        value_apex = field[apex]
+        gap_left = value_apex - field[left]
+        gap_right = value_apex - field[right]
+        if gap_left == wp.float64(0.0) or gap_right == wp.float64(0.0):
+            continue
+        apex_position = positions[apex]
+        crossing_left = apex_position + (positions[left] - apex_position) * wp.float32(
+            value_apex / gap_left
+        )
+        crossing_right = apex_position + (positions[right] - apex_position) * wp.float32(
+            value_apex / gap_right
+        )
+        candidate = closest_point_on_segment(crossing_left, crossing_right, current)
+        distance = wp.length_sq(candidate - current)
+        if distance < best_distance:
+            best_distance = distance
+            best = candidate
+
+    out_positions[vertex] = current + (best - current) * damping
+
+
+@wp.kernel
+def scatter_free_scalar(
+    fixed_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    solution: wp.array[wp.float64],
+    out_field: wp.array[wp.float64],
+) -> None:
+    # Write the reduced solve's answer back over the free entries, leaving the pinned ones as the
+    # boundary values they were set to. The scalar sibling of ``scatter_free_solution``.
+    vertex = wp.int32(wp.tid())
+    row = free_row(fixed_mask, free_map, vertex)
+    if row >= 0:
+        out_field[vertex] = solution[row]
+
+
+@wp.func
+def free_in_mixed_component(
+    free: wp.bool, component_size: wp.int32, free_in_component: wp.int32
+) -> wp.bool:
+    # Drop a vertex from the free set when its whole connected component is free: the harmonic
+    # system over such a component has no boundary values to interpolate and is singular.
+    return free and component_size != free_in_component
+
+
+@wp.kernel
+def mark_incident_vertices(
+    faces: wp.array[wp.int32], face_mask: wp.array[wp.bool], out_mask: wp.array[wp.bool]
+) -> None:
+    # Mark every corner of every selected face. Concurrent writes all store ``True``, so the race is
+    # benign and no atomic is needed.
+    face = wp.int32(wp.tid())
+    if not face_mask[face]:
+        return
+    first, second, third = corner_triple(faces, face)
+    out_mask[first] = True
+    out_mask[second] = True
+    out_mask[third] = True
+
+
+@wp.func
+def region_side_value(inside: wp.bool) -> wp.float64:
+    # The field the rim curve is the zero set of: -1 on the region, +1 outside it. Any two values of
+    # opposite sign would do; +-1 keeps the harmonic interpolant's scale comparable to nothing else,
+    # which is fine because only its zero set is read.
+    if inside:
+        return wp.float64(-1.0)
+    return wp.float64(1.0)

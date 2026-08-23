@@ -236,6 +236,11 @@ def mask_not(a: wp.bool) -> wp.bool:
 
 
 @wp.func
+def mask_and(a: wp.bool, b: wp.bool) -> wp.bool:
+    return a and b
+
+
+@wp.func
 def mask_and_not(a: wp.bool, b: wp.bool) -> wp.bool:
     return a and not b
 
@@ -372,6 +377,22 @@ def map_sorted_inverse(
 ) -> None:
     i = wp.int32(wp.tid())
     out_inverse[i] = binary_search_index(sorted_unique, data[i]) - wp.int32(1)
+
+
+@wp.kernel
+def mark_rows_present(
+    rows: wp.array2d[wp.int32], queries: wp.array2d[wp.int32], out_present: wp.array[wp.bool]
+) -> None:
+    # Which of a handful of index rows occur in a table of them, decided on device so the caller
+    # never reads back a buffer that scales with the mesh. Every thread that matches stores ``True``
+    # into its query's slot, so the race is benign and no atomic is needed; ``out_present`` arrives
+    # zeroed. Deliberately a scan rather than a hash or a sort: the query count is a handful, the
+    # table is read once, and there is nothing to amortize a structure over.
+    row, query = wp.tid()
+    for column in range(queries.shape[1]):
+        if rows[row, column] != queries[query, column]:
+            return
+    out_present[query] = True
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in

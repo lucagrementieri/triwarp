@@ -79,7 +79,7 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from conftest import BenchCase, mesh_ml_from_numpy
+from conftest import BenchCase, face_bitset_ml, mesh_ml_from_numpy
 
 if TYPE_CHECKING:
     import open3d as o3d
@@ -276,27 +276,12 @@ def test_fill_smooth(bench_case: BenchCase, triangulate_only: bool) -> None:
     assert result[1].shape[0] >= faces.shape[0]
 
 
-def _face_mask_ml(mask_np: np.ndarray) -> mm.FaceBitSet:
-    """
-    Load a dense face mask into a ``FaceBitSet`` through the packed blocks, not a per-face loop.
-
-    The benchmark-side twin of ``tests.conversions.numpy_to_meshlib_bitset``: ``BitSet.fromBlocks``
-    takes ``uint64`` blocks, ``bitorder="little"`` is not NumPy's default and is not optional, and
-    ``fromBlocks`` rounds up to whole blocks so the size is trimmed back after.
-    """
-    packed_np = np.packbits(mask_np, bitorder="little")
-    packed_np = np.pad(packed_np, (0, (-packed_np.size) % 8)).view(np.uint64)
-    bitset_ml = mm.BitSet.fromBlocks(mm.std_vector_unsigned_long(packed_np.tolist()))
-    bitset_ml.resize(int(mask_np.size))
-    return mm.FaceBitSet(bitset_ml)
-
-
 _region_cache: dict[tuple[str, str], tuple] = {}
 
 
 def _cap_region(bench_case: BenchCase) -> tuple:
     """
-    A contiguous face region -- the cap above the mesh's 80th height percentile.
+    Build a contiguous face region: the cap above the mesh's 80th height percentile.
 
     Contiguity is what makes this a region edit rather than a hole-filling benchmark: a scattered
     mask opens one rim per face, and the DP is cubic in the rim length, so the two shapes are not
@@ -324,9 +309,9 @@ def test_refill_region(bench_case: BenchCase, triangulate_only: bool) -> None:
     for the same reason -- a single refined number cannot say whether a change moved the DP or the
     smoothing.
 
-    meshlib's ``patchMesh`` is exactly this call and ``tests/test_holes.py`` pins the two to the same
-    vertex count, face count and volume in ``triangulateOnly`` mode. It mutates, so it gets a fresh
-    mesh per round, and its region bitset is built in ``setup`` -- it is the input.
+    meshlib's ``patchMesh`` is exactly this call and ``tests/test_holes.py`` pins the two to the
+    same vertex count, face count and volume in ``triangulateOnly`` mode. It mutates, so it gets a
+    fresh mesh per round, and its region bitset is built in ``setup`` -- it is the input.
 
     First measurement, medians on an RTX 5090, ``bunny`` with a fifth of its faces deleted:
     triwarp-cuda **22.0 ms** against meshlib's **18.6** for ``dp_only`` (1.19x behind) and **58.4**
@@ -341,7 +326,7 @@ def test_refill_region(bench_case: BenchCase, triangulate_only: bool) -> None:
 
         def run_ml() -> int:
             mesh_ml = bench_case.new_mesh_ml()
-            region_ml = _face_mask_ml(mask_np)
+            region_ml = face_bitset_ml(mask_np)
             mm.patchMesh(mesh_ml, region_ml, settings_ml)
             return mesh_ml.topology.numValidFaces()
 
@@ -577,3 +562,170 @@ def test_extend_hole(bench_case: BenchCase) -> None:
     )
     assert int(extended_faces.shape[0]) > int(faces.shape[0])
     assert int(extended_vertices.shape[0]) > bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="build_bottom")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_build_bottom(bench_case: BenchCase) -> None:
+    """
+    The same band as ``extend_hole``, with the plane fitted to each rim instead of given.
+
+    Read against ``extend_hole``: the difference between the two rows is exactly the plane fit --
+    one atomic-min pass over the rim and one map over the loops, both of which track the *rim* and
+    not the mesh. Everything else is shared code, so a gap here that is not small would mean the
+    fit had become the cost rather than the band.
+
+    meshlib's ``buildBottom`` takes one hole at a time and mutates, so its mesh is rebuilt per round
+    and every rim is bottomed in a loop -- which is what its row measures against triwarp's single
+    batched launch set. The two agree on the counts and on where each base plane lands
+    (``tests/test_holes.py``).
+
+    First measurement, medians on an RTX 5090:
+
+    | mesh | triwarp-cuda | meshlib |
+    |---|---|---|
+    | ``bunny`` | 0.419 ms | 12.31 (29.4x) |
+    | ``bunny_decimated`` | 0.438 ms | 11.09 (25.3x) |
+    | ``dragon`` | 1.74 ms | 67.59 (38.9x) |
+
+    Read against ``extend_hole``'s 0.254 / 0.256 / 2.34 ms on the same meshes: the plane fit adds
+    **0.16 ms** on the two bunnies and is *negative* on ``dragon`` (1.74 against 2.34), which is
+    session drift rather than a saving -- the two share every launch but the atomic-min pass and one
+    map over the loops, both of which track the rim. The fit is not the cost, which is what this row
+    was written to establish.
+    """
+    if bench_case.kind == "meshlib":
+
+        def bottom_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            for edge_ml in mesh_ml.topology.findHoleRepresentiveEdges():
+                mm.buildBottom(mesh_ml, edge_ml, mm.Vector3f(0.0, 0.0, 1.0), 0.0)
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(bottom_ml, rounds=3) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    loops = tw.boundary.boundary_loops(vertices, faces)
+    if not loops:
+        pytest.skip(f"{bench_case.mesh_name} is closed: there is no rim to bottom")
+    direction = wp.vec3(0.0, 0.0, 1.0)
+    bottomed_vertices, bottomed_faces = bench_case.run(
+        lambda: tw.holes.build_bottom(vertices, faces, direction, 0.0, loops), rounds=3
+    )
+    assert int(bottomed_faces.shape[0]) > int(faces.shape[0])
+    assert int(bottomed_vertices.shape[0]) > bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="bridge_edges")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_bridge_edges(bench_case: BenchCase) -> None:
+    """
+    Two triangles, so this times the *validation* and the buffer copy, not the patch.
+
+    Deliberately so: the patch is a fixed six integers whatever the mesh, and everything that
+    scales is the check that both edges are on the rim and that the patch would not duplicate an
+    edge -- a boundary-edge build, one membership scan and a readback of four flags. The row is
+    therefore the price of ``validate=True``, which is the only decision a caller of this function
+    has to make, and it should be read against ``boundary_edges``.
+
+    That check was host-side Python when it landed -- a ``set`` comprehension over every mesh edge
+    -- which made this row **minutes** on ``lucy`` and is what this benchmark existed to find. It is
+    a device scan now: 0.035 s on ``lucy``'s 28M faces against 0.022 on ``bunny``, i.e. the boundary
+    build rather than the query.
+
+    meshlib's ``makeBridge`` works on a halfedge structure that already knows which edges are on the
+    boundary, so its row is the patch alone and is expected to win by a wide margin at every size;
+    the comparable statement is that both produce the same two triangles
+    (``tests/test_holes.py``), and that triwarp's cost is a *choice* the ``validate`` switch turns
+    off.
+    """
+    # The rim is derived on the host so both branches see the same two edges; the meshlib branch
+    # has no device to build a triwarp buffer on.
+    corners = bench_case.faces_np.reshape(-1, 3)
+    directed = np.concatenate([corners[:, [0, 1]], corners[:, [1, 2]], corners[:, [2, 0]]], axis=0)
+    undirected = np.sort(directed, axis=1)
+    _, first, counts = np.unique(undirected, axis=0, return_index=True, return_counts=True)
+    rim_np = directed[first[counts == 1]]
+    if len(rim_np) < 16:
+        pytest.skip(f"{bench_case.mesh_name} has no rim long enough to bridge across")
+    edge_a = (int(rim_np[0][0]), int(rim_np[0][1]))
+    edge_b = (int(rim_np[len(rim_np) // 2][0]), int(rim_np[len(rim_np) // 2][1]))
+
+    if bench_case.kind == "meshlib":
+
+        def bridge_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            a_ml = mesh_ml.topology.findEdge(mm.VertId(edge_a[1]), mm.VertId(edge_a[0]))
+            b_ml = mesh_ml.topology.findEdge(mm.VertId(edge_b[1]), mm.VertId(edge_b[0]))
+            return mm.makeBridge(mesh_ml.topology, a_ml, b_ml).newFaces
+
+        assert bench_case.run(bridge_ml, rounds=3) >= 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    bridged_faces = bench_case.run(
+        lambda: tw.holes.bridge_edges(vertices, faces, edge_a, edge_b), rounds=3
+    )
+    assert int(bridged_faces.shape[0]) > int(faces.shape[0])
+
+
+@pytest.mark.benchmark(group="bridge_edges_smooth")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_bridge_edges_smooth(bench_case: BenchCase) -> None:
+    """
+    The curved strip: the same validation as ``bridge_edges``, plus a fixed-size spline.
+
+    Read against ``bridge_edges``, whose edge pair this shares. The difference between the two rows
+    is the strip -- one launch to find the two incident faces' third corners, two small readbacks
+    and a host-side sample loop whose length is the span over ``sampling_step`` and does **not**
+    grow with the mesh. So the gap should be flat across the axis; a gap that widens with the mesh
+    means something in the strip path started reading a whole buffer.
+
+    ``sampling_step`` is 5 % of the bounding-box diagonal, which puts both sides at a comparable
+    number of segments -- meshlib derives its own count from an arc-length estimate, so the two
+    never match exactly and the comparison is on the strips as surfaces
+    (``tests/test_holes.py``).
+
+    First measurement, medians on an RTX 5090:
+
+    | mesh | triwarp-cuda | meshlib |
+    |---|---|---|
+    | ``bunny`` | 1.43 ms | 13.46 (9.4x) |
+    | ``bunny_decimated`` | 1.91 ms | 8.88 (4.7x) |
+    | ``dragon`` | 2.43 ms | 69.97 (28.9x) |
+    | ``lucy`` | 21.66 ms | (no rim pair) |
+
+    Against ``bridge_edges`` on the same pairs -- 0.886 / 0.948 / 8.66 / 22.52 ms -- the strip costs
+    **0.5 to 1.0 ms** and does not track the mesh, which is the flatness this row is here to check.
+    ``dragon`` is the one to read: the strip is *cheaper* there than on ``bunny`` in absolute terms
+    while the shared validation is 8.7 ms, so the two halves are cleanly separated.
+    """
+    corners = bench_case.faces_np.reshape(-1, 3)
+    directed = np.concatenate([corners[:, [0, 1]], corners[:, [1, 2]], corners[:, [2, 0]]], axis=0)
+    _, first, counts = np.unique(
+        np.sort(directed, axis=1), axis=0, return_index=True, return_counts=True
+    )
+    rim_np = directed[first[counts == 1]]
+    if len(rim_np) < 16:
+        pytest.skip(f"{bench_case.mesh_name} has no rim long enough to bridge across")
+    edge_a = (int(rim_np[0][0]), int(rim_np[0][1]))
+    edge_b = (int(rim_np[len(rim_np) // 2][0]), int(rim_np[len(rim_np) // 2][1]))
+    extent = bench_case.vertices_np.max(0) - bench_case.vertices_np.min(0)
+    sampling_step = 0.05 * float(np.linalg.norm(extent))
+
+    if bench_case.kind == "meshlib":
+
+        def bridge_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            a_ml = mesh_ml.topology.findEdge(mm.VertId(edge_a[1]), mm.VertId(edge_a[0]))
+            b_ml = mesh_ml.topology.findEdge(mm.VertId(edge_b[1]), mm.VertId(edge_b[0]))
+            return mm.makeSmoothBridge(mesh_ml, a_ml, b_ml, sampling_step).newFaces
+
+        assert bench_case.run(bridge_ml, rounds=3) >= 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    strip_vertices, strip_faces = bench_case.run(
+        lambda: tw.holes.bridge_edges_smooth(vertices, faces, edge_a, edge_b, sampling_step),
+        rounds=3,
+    )
+    assert int(strip_faces.shape[0]) > int(faces.shape[0])
+    assert int(strip_vertices.shape[0]) >= bench_case.n_vertices

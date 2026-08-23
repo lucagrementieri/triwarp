@@ -789,6 +789,9 @@ def eliminate_degree3_vertices(
 
     See Also
     --------
+    [`flatten_degree3_vertices`][triwarp.repair.flatten_degree3_vertices]
+        The geometric answer to the same defect: move the vertex instead of deleting it, which
+        leaves the connectivity and every per-vertex attribute intact.
     [`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces]
         The other half: triangles repeated on the same three vertices.
     [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
@@ -850,6 +853,82 @@ def eliminate_degree3_vertices(
     # vertex-and-face pass to every iteration for no change in the answer.
     vertices, faces, _index = remove_unreferenced_vertices(vertices, faces)
     return vertices, faces, removed
+
+
+def flatten_degree3_vertices(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], region: wp.array[wp.bool] | None = None
+) -> wp.array[wp.vec3]:
+    """
+    Flatten each interior valence-3 vertex into the plane of its three neighbours.
+
+    A valence-3 interior vertex sits on a little tetrahedral bump: three triangles meeting at a
+    point over the triangle its neighbours form. Moving it to their centroid puts it **in** that
+    triangle's plane, so the bump disappears and the three faces become coplanar -- which is what
+    makes a subdivision, a decimation or a hole fill stop leaving visible pimples.
+
+    The gentler half of a pair.
+    [`eliminate_degree3_vertices`][triwarp.repair.eliminate_degree3_vertices]
+    answers the same defect by deleting the vertex and keeping one triangle, which changes the
+    connectivity; this keeps every vertex and every face and only moves positions, so a caller
+    holding per-vertex attributes or a face selection can use it and the other one would invalidate
+    both.
+
+    One pass is enough and there is no iteration count: two interior valence-3 vertices cannot be
+    neighbours on an edge-manifold mesh, so no move changes another's answer.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer. Must be edge-manifold, since the
+        fan around a vertex is what this reasons about.
+    region
+        ``(n_vertices,)`` boolean mask restricting which vertices may be flattened. ``None``
+        flattens every one that qualifies.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Positions on ``vertices.device``, with the qualifying vertices at their neighbours'
+        centroid. Connectivity is untouched, so ``faces`` stays valid.
+
+    Raises
+    ------
+    ValueError
+        If ``region`` is not a length-``n_vertices`` ``wp.bool`` array, or propagated from
+        [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when the mesh is not edge-manifold.
+
+    See Also
+    --------
+    [`eliminate_degree3_vertices`][triwarp.repair.eliminate_degree3_vertices]
+        The topological answer to the same defect: delete the vertex instead of moving it.
+    [`equalize_triangle_areas`][triwarp.smoothing.equalize_triangle_areas]
+        Relaxes every vertex toward an area objective, where this hard-sets only the valence-3 ones.
+    """
+    device = faces.device
+    n_vertices = int(vertices.shape[0])
+    if n_vertices == 0 or int(faces.shape[0]) == 0:
+        return wp.clone(vertices)
+    if region is None:
+        region = wp.full(n_vertices, True, dtype=wp.bool, device=device)
+    elif len(region.shape) != 1 or region.shape[0] != n_vertices or region.dtype is not wp.bool:
+        raise ValueError(
+            f"region must be a length-{n_vertices} wp.bool array, got shape {tuple(region.shape)} "
+            f"of {region.dtype}"
+        )
+
+    ring_offsets, ring_halfedges, is_boundary = tw.halfedge.vertex_one_rings(
+        faces, n_vertices=n_vertices
+    )
+    flattened = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_repair.flatten_degree3_positions,
+        dim=n_vertices,
+        inputs=[vertices, faces, ring_offsets, ring_halfedges, is_boundary, region, flattened],
+        device=device,
+    )
+    return flattened
 
 
 def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:

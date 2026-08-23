@@ -12,7 +12,12 @@ from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.comparisons import boundary_loop_sizes, canonical_winding, lexsort_rows
+from tests.comparisons import (
+    boundary_loop_sizes,
+    canonical_winding,
+    hausdorff_surface_two_sided,
+    lexsort_rows,
+)
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
@@ -1954,3 +1959,317 @@ def test_extend_hole_then_fill_is_watertight(hemisphere: tuple[tm.Trimesh, wp.Me
             wp.vec3(0.0, 0.0, 1.0),
             [wp.zeros(3, dtype=wp.float32, device=faces_wp.device)],
         )
+
+
+def _meshlib_hole_edge(mesh_ml: mm.Mesh, edge: tuple[int, int]) -> mm.EdgeId:
+    """
+    Map a triwarp boundary edge ``(v0, v1)`` to the meshlib ``EdgeId`` with the hole on its left.
+
+    triwarp reports a boundary edge wound the way its own face winds it, so the *face* traverses
+    ``v0 -> v1`` and the hole side is the reverse. meshlib's bridge and fill entry points all want
+    the edge with **no left face**, which is therefore ``v1 -> v0``. The mapping is asserted rather
+    than trusted: both ends are read back off the topology and the missing left face is checked.
+    """
+    edge_ml = mesh_ml.topology.findEdge(mm.VertId(int(edge[1])), mm.VertId(int(edge[0])))
+    assert edge_ml.valid()
+    assert mesh_ml.topology.org(edge_ml).get() == int(edge[1])
+    assert mesh_ml.topology.dest(edge_ml).get() == int(edge[0])
+    assert not mesh_ml.topology.left(edge_ml).valid()
+    return edge_ml
+
+
+@pytest.mark.parity("build_bottom", "meshlib")
+@pytest.mark.parametrize("hole_extension", [0.0, 0.3])
+def test_build_bottom_matches_meshlib(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh], hole_extension: float
+) -> None:
+    """
+    Class A against ``buildBottom``: the base plane's placement, and the band's counts.
+
+    Both sides place the plane at the rim's own extreme along ``-direction``, pushed a further
+    ``hole_extension``, and bridge to it with two triangles per rim edge -- so the counts agree
+    exactly and every appended vertex must land at the *same* height, which is the one number the
+    choice of plane decides. That height is compared against meshlib's own extreme, not against a
+    recomputation, so a disagreement about which vertex is lowest would fail here.
+
+    Element-wise position comparison is not available: the two libraries enumerate the rim in
+    different orders. The band's geometry is pinned instead by the plane residual (exact by
+    construction for an orthogonal projection) plus the face and vertex counts and
+    edge-manifoldness.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    direction = wp.vec3(0.0, 0.0, 1.0)
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+    assert len(loops_wp) == 1  # non-vacuity: one rim, so both sides bottom the same hole
+    rim_total = int(loops_wp[0].shape[0])
+
+    bottomed_vertices_wp, bottomed_faces_wp = tw.holes.build_bottom(
+        vertices_wp, faces_wp, direction, hole_extension
+    )
+    n_vertices = int(vertices_wp.shape[0])
+    assert int(bottomed_vertices_wp.shape[0]) == n_vertices + rim_total
+    assert int(bottomed_faces_wp.shape[0]) // 3 == int(faces_wp.shape[0]) // 3 + 2 * rim_total
+    assert np.array_equal(bottomed_vertices_wp.numpy()[:n_vertices], vertices_wp.numpy())
+    assert tw.validation.is_edge_manifold(bottomed_faces_wp)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    rim_ml = mesh_ml.topology.findHoleRepresentiveEdges()
+    assert rim_ml.size() == 1
+    lowest_rim = float(vertices_wp.numpy()[loops_wp[0].numpy(), 2].min())
+    mm.buildBottom(mesh_ml, rim_ml[0], mm.Vector3f(0.0, 0.0, 1.0), hole_extension)
+    bottomed_ml = meshlib_to_trimesh(mesh_ml)
+    assert len(bottomed_ml.faces) == int(bottomed_faces_wp.shape[0]) // 3
+    assert len(bottomed_ml.vertices) == int(bottomed_vertices_wp.shape[0])
+
+    appended_np = bottomed_vertices_wp.numpy()[n_vertices:]
+    expected_height = lowest_rim - hole_extension
+    assert np.allclose(appended_np[:, 2], expected_height, atol=1e-5)
+    appended_ml = np.asarray(bottomed_ml.vertices)[len(mesh_tm.vertices) :]
+    assert np.allclose(appended_ml[:, 2], expected_height, atol=1e-5)
+
+
+def test_build_bottom_fits_each_rim_separately(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: meshlib's ``buildBottom`` takes one hole, so it cannot show this.
+
+    The invariant that distinguishes this function from
+    [`extend_hole`][triwarp.holes.extend_hole] is that each rim gets its *own* plane. ``half_torus``
+    has two rims at different heights, so a shared plane would put both rings at one height and a
+    per-rim plane puts them at two -- the assert is that the appended ring heights form exactly two
+    groups, one per rim, each at that rim's own minimum.
+
+    The closed case and the empty-loop-list case are the identity, and are checked here for the
+    same reason ``extend_hole``'s are.
+    """
+    _, mesh_wp = half_torus
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+    assert len(loops_wp) == 2  # non-vacuity: two rims is what makes the per-rim plane visible
+
+    vertices_np = vertices_wp.numpy()
+    rim_minima = sorted(float(vertices_np[loop.numpy(), 2].min()) for loop in loops_wp)
+    assert rim_minima[1] - rim_minima[0] > 1e-3  # the two rims genuinely sit at different heights
+
+    bottomed_vertices_wp, _ = tw.holes.build_bottom(vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0))
+    appended_np = bottomed_vertices_wp.numpy()[int(vertices_wp.shape[0]) :]
+    heights = sorted(np.unique(np.round(appended_np[:, 2], 5)).tolist())
+    assert len(heights) == 2
+    assert np.allclose(heights, rim_minima, atol=1e-5)
+
+    same_vertices_wp, same_faces_wp = tw.holes.build_bottom(
+        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), 0.0, []
+    )
+    assert np.array_equal(same_faces_wp.numpy(), faces_wp.numpy())
+    assert np.array_equal(same_vertices_wp.numpy(), vertices_wp.numpy())
+
+
+def _rim_successors(vertices_wp: wp.array, faces_wp: wp.array) -> dict[int, int]:
+    """Map each rim vertex to the next one along the boundary, in face-winding direction."""
+    return {
+        int(u): int(v)
+        for u, v in tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp).numpy()
+    }
+
+
+@pytest.mark.parity("bridge_edges", "meshlib")
+@pytest.mark.parametrize("step", [6, 12, 5])
+def test_bridge_edges_matches_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mesh], step: int) -> None:
+    """
+    Class A against ``makeBridge``: the same two triangles, including which diagonal splits them.
+
+    The comparison is on the appended face block as a canonically wound, lexicographically sorted
+    row set -- both libraries add exactly two triangles over the same four existing vertices, so
+    there is nothing to reindex and no tolerance involved. That it agrees on the *diagonal* is the
+    substantive part: the quadrilateral admits two triangulations and only one of them matches, so
+    a patch wound the other way round would fail here rather than merely look different.
+
+    The edge pairs are taken at three different separations along one rim, because a bridge between
+    nearly opposite edges and one between near neighbours take different branches in meshlib.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    rim_np = tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp).numpy()
+    assert len(rim_np) > step  # non-vacuity: the rim is long enough for this separation
+    edge_a = (int(rim_np[0][0]), int(rim_np[0][1]))
+    edge_b = (int(rim_np[step][0]), int(rim_np[step][1]))
+
+    n_faces = int(faces_wp.shape[0]) // 3
+    bridged_faces_wp = tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_b)
+    patch_np = bridged_faces_wp.numpy().reshape(-1, 3)[n_faces:]
+    assert len(patch_np) == 2
+    assert np.array_equal(bridged_faces_wp.numpy()[: 3 * n_faces], faces_wp.numpy())
+    assert tw.validation.is_edge_manifold(bridged_faces_wp)
+    assert warp_to_trimesh(vertices_wp, bridged_faces_wp).is_winding_consistent
+    # Bridging one rim to itself splits it in two: the topological point of the operation.
+    assert len(tw.boundary.boundary_loops(vertices_wp, bridged_faces_wp)) == 2
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    result_ml = mm.makeBridge(
+        mesh_ml.topology, _meshlib_hole_edge(mesh_ml, edge_a), _meshlib_hole_edge(mesh_ml, edge_b)
+    )
+    assert result_ml.newFaces == 2  # non-vacuity: meshlib built the bridge rather than refusing
+    patch_ml = np.asarray(meshlib_to_trimesh(mesh_ml).faces)[n_faces:]
+    assert np.array_equal(
+        lexsort_rows(canonical_winding(patch_np)), lexsort_rows(canonical_winding(patch_ml))
+    )
+
+
+@pytest.mark.parity("bridge_edges", "meshlib")
+@pytest.mark.parametrize("side", ["successor", "predecessor"])
+def test_bridge_edges_shared_vertex_is_one_triangle(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh], side: str
+) -> None:
+    """
+    Class A on meshlib's other branch: two rim-consecutive edges give **one** triangle, not two.
+
+    Both orders are covered because meshlib reaches them differently -- one is the
+    ``prev(a.sym()) == b`` branch and the other swaps the two edges first -- and a port that
+    handled only one would still pass the general-case test. The rim also stays a *single* loop
+    here, where a general bridge splits it in two, so that count is asserted as well.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    rim_np = tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp).numpy()
+    successors = _rim_successors(vertices_wp, faces_wp)
+    edge_a = (int(rim_np[0][0]), int(rim_np[0][1]))
+    if side == "successor":
+        edge_b = (edge_a[1], successors[edge_a[1]])
+    else:
+        predecessors = {v: u for u, v in successors.items()}
+        edge_b = (predecessors[edge_a[0]], edge_a[0])
+    assert len(set(edge_a) | set(edge_b)) == 3  # non-vacuity: the two edges really do share one end
+
+    n_faces = int(faces_wp.shape[0]) // 3
+    bridged_faces_wp = tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_b)
+    patch_np = bridged_faces_wp.numpy().reshape(-1, 3)[n_faces:]
+    assert len(patch_np) == 1
+    assert tw.validation.is_edge_manifold(bridged_faces_wp)
+    assert warp_to_trimesh(vertices_wp, bridged_faces_wp).is_winding_consistent
+    assert len(tw.boundary.boundary_loops(vertices_wp, bridged_faces_wp)) == 1
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    result_ml = mm.makeBridge(
+        mesh_ml.topology, _meshlib_hole_edge(mesh_ml, edge_a), _meshlib_hole_edge(mesh_ml, edge_b)
+    )
+    assert result_ml.newFaces == 1
+    patch_ml = np.asarray(meshlib_to_trimesh(mesh_ml).faces)[n_faces:]
+    assert np.array_equal(
+        lexsort_rows(canonical_winding(patch_np)), lexsort_rows(canonical_winding(patch_ml))
+    )
+
+
+def test_bridge_edges_rejects_bad_pairs(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: meshlib returns a falsy result where this raises.
+
+    Three rejections, each a different failure the caller cannot see for themselves: the same edge
+    twice, an edge that is interior rather than on the rim, and a pair whose patch would give two
+    vertices a second shared edge -- the last being the one that would silently leave the mesh
+    non-manifold. ``validate=False`` is shown to skip the rim check, which is what it is for.
+    """
+    _, mesh_wp = hemisphere
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    rim_np = tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp).numpy()
+    edge_a = (int(rim_np[0][0]), int(rim_np[0][1]))
+    edge_far = (int(rim_np[len(rim_np) // 2][0]), int(rim_np[len(rim_np) // 2][1]))
+
+    with pytest.raises(ValueError, match="different edges"):
+        tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_a)
+
+    interior_np = tw.edges.faces_to_edges(faces_wp).numpy()
+    rim_set = {(int(u), int(v)) for u, v in rim_np}
+    interior = next((int(u), int(v)) for u, v in interior_np if (int(u), int(v)) not in rim_set)
+    with pytest.raises(ValueError, match="not a boundary edge"):
+        tw.holes.bridge_edges(vertices_wp, faces_wp, interior, edge_far)
+
+    # Two rim edges one apart share no vertex, but the vertex between them already joins both ends,
+    # so the patch's own side would be a second edge there.
+    successors = _rim_successors(vertices_wp, faces_wp)
+    middle = successors[edge_a[1]]
+    edge_next = (middle, successors[middle])
+    with pytest.raises(ValueError, match="non-manifold"):
+        tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_next)
+
+    # validate=False skips every one of those checks, which is the whole point of the switch.
+    assert (
+        int(tw.holes.bridge_edges(vertices_wp, faces_wp, interior, edge_far, False).shape[0])
+        == int(faces_wp.shape[0]) + 6
+    )
+
+
+@pytest.mark.parity("bridge_edges_smooth", "meshlib")
+def test_bridge_edges_smooth_matches_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class C against ``makeSmoothBridge``: the two strips as surfaces, at two-sided Hausdorff.
+
+    No correspondence exists to compare element-wise, and the two curves are not the same
+    construction: triwarp spans the gap with one cubic Hermite segment while meshlib fairs a
+    resampled control polyline with an iterative stabilized solver, so the strips carry different
+    vertex counts (measured 16 against 18 at ``sampling_step=0.25``) and no shared
+    parameterization. What *is* comparable is where the strip goes, so both are extracted as
+    surfaces and compared with
+    [`hausdorff_surface_two_sided`][tests.comparisons.hausdorff_surface_two_sided].
+
+    The bug class this excludes is a strip that spans the gap along the **chord** rather than
+    leaving both surfaces tangentially -- the whole reason the function exists over
+    [`bridge_edges`][triwarp.holes.bridge_edges]. Mutation probe: the flat two-triangle patch over
+    the same pair measures **0.4942** against the smooth strip's **0.0755** agreement with meshlib,
+    a margin of **6.5x**. The bound is set at 3x the measured agreement, which the flat patch
+    misses by 2.2x -- so a chord-spanning implementation fails here rather than passing loosely.
+
+    Measured across three edge separations and two sampling steps, the agreement ranges 0.059 to
+    0.228 and the flat-patch margin 2.8x to 8.4x; the point pinned here is the finest of them.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    rim_np = tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp).numpy()
+    edge_a = (int(rim_np[0][0]), int(rim_np[0][1]))
+    edge_b = (int(rim_np[12][0]), int(rim_np[12][1]))
+    sampling_step = 0.25
+
+    n_vertices, n_faces = int(vertices_wp.shape[0]), int(faces_wp.shape[0]) // 3
+    strip_vertices_wp, strip_faces_wp = tw.holes.bridge_edges_smooth(
+        vertices_wp, faces_wp, edge_a, edge_b, sampling_step
+    )
+    assert int(strip_vertices_wp.shape[0]) > n_vertices  # non-vacuity: it really did subdivide
+    assert tw.validation.is_edge_manifold(strip_faces_wp)
+    assert warp_to_trimesh(strip_vertices_wp, strip_faces_wp).is_winding_consistent
+    assert len(tw.boundary.boundary_loops(strip_vertices_wp, strip_faces_wp)) == 2
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    result_ml = mm.makeSmoothBridge(
+        mesh_ml,
+        _meshlib_hole_edge(mesh_ml, edge_a),
+        _meshlib_hole_edge(mesh_ml, edge_b),
+        sampling_step,
+    )
+    assert result_ml.newFaces > 2  # non-vacuity: meshlib subdivided rather than emitting one quad
+    smooth_ml = meshlib_to_trimesh(mesh_ml)
+
+    strip_tm = warp_to_trimesh(strip_vertices_wp, strip_faces_wp).submesh(
+        [np.arange(n_faces, int(strip_faces_wp.shape[0]) // 3)], append=True
+    )
+    strip_ml = smooth_ml.submesh([np.arange(n_faces, len(smooth_ml.faces))], append=True)
+    agreement = hausdorff_surface_two_sided(
+        np.asarray(strip_tm.vertices),
+        np.asarray(strip_tm.faces),
+        np.asarray(strip_ml.vertices),
+        np.asarray(strip_ml.faces),
+    )
+    assert agreement < 3.0 * 0.0755
+
+    flat_faces_wp = tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_b)
+    flat_tm = warp_to_trimesh(vertices_wp, flat_faces_wp).submesh(
+        [np.arange(n_faces, int(flat_faces_wp.shape[0]) // 3)], append=True
+    )
+    # The probe that makes the bound above mean something: a chord-spanning patch is 3x further.
+    assert (
+        hausdorff_surface_two_sided(
+            np.asarray(flat_tm.vertices),
+            np.asarray(flat_tm.faces),
+            np.asarray(strip_ml.vertices),
+            np.asarray(strip_ml.faces),
+        )
+        > 3.0 * agreement
+    )

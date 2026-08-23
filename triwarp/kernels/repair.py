@@ -393,3 +393,29 @@ def emit_straighten_faces(
     out_new_faces[slot, 0] = following
     out_new_faces[slot, 1] = v
     out_new_faces[slot, 2] = previous
+
+
+@wp.kernel
+def flatten_degree3_positions(
+    positions: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    is_boundary: wp.array[wp.bool],
+    region: wp.array[wp.bool],
+    out_positions: wp.array[wp.vec3],
+) -> None:
+    # Move each interior valence-3 vertex to the centroid of its three neighbours -- which lies in
+    # their plane, so the little tetrahedral bump flattens into it. Two such vertices cannot be
+    # neighbours on an edge-manifold mesh (each would need the other's whole ring), so every thread
+    # reads positions no other thread is writing and one pass is enough.
+    vertex = wp.int32(wp.tid())
+    begin = ring_offsets[vertex]
+    end = ring_offsets[vertex + 1]
+    if not region[vertex] or not is_interior_degree3(begin, end, is_boundary[vertex]):
+        out_positions[vertex] = positions[vertex]
+        return
+    total = wp.vec3()
+    for slot in range(begin, end):
+        total += positions[halfedge_destination(faces, ring_halfedges[slot])]
+    out_positions[vertex] = total / wp.float32(3.0)
