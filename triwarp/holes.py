@@ -422,12 +422,11 @@ def fill_min_weight(
         - ``"circumscribed"`` — summed circumcircle diameter.
         - ``"plane"`` — circumcircle diameter with a flipped-normal penalty.
         - ``"min_tri_angle"`` — maximizes the minimal triangle angle.
-        - ``"edge_length"`` — summed new-edge length (``getEdgeLengthFillMetric``).
+        - ``"edge_length"`` — summed new-edge length.
         - ``"universal"`` — circumcircle diameter plus a dihedral-smoothing edge term; the smooth,
-          general-purpose choice (``getUniversalMetric``).
-        - ``"max_dihedral"`` — minimizes the maximal dihedral angle (``getMaxDihedralAngleMetric``).
-        - ``"complex_fill"`` — area/aspect triangle term plus a strong dihedral edge term
-          (``getComplexFillMetric``).
+          general-purpose choice.
+        - ``"max_dihedral"`` — minimizes the maximal dihedral angle.
+        - ``"complex_fill"`` — area/aspect triangle term plus a strong dihedral edge term.
 
         The dihedral (edge-based) metrics — ``universal``, ``max_dihedral``, ``complex_fill``,
         ``edge_length`` — blend into the surrounding surface via ``smooth_boundary``.
@@ -772,16 +771,35 @@ def _pack_loops(loops: list[wp.array[wp.int32]]) -> _PackedLoops:
 
 
 def fill_small(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_perimeter: float
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    max_perimeter: float | None = None,
+    *,
+    max_edges: int | None = None,
 ) -> wp.array[wp.int32]:
     """
-    Fill only boundary loops whose perimeter is at most ``max_perimeter``.
+    Fill only the *small* boundary loops, sized either by perimeter or by boundary-edge count.
 
     Intended open boundaries (large loops) are left untouched; spurious small holes are sealed by
     the shared min-weight interval DP
     ([`fill_loops_min_weight`][triwarp.holes.fill_loops_min_weight]). Used by
     [`triwarp.reconstruction.triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
     to seal small gaps left by sparse or non-uniform point-cloud sampling.
+
+    Exactly one of the two thresholds is given, and they are genuinely different questions rather
+    than two spellings of one:
+
+    - ``max_perimeter`` is a **length**, so it is scale-dependent and sampling-independent -- the
+      right threshold when "small" means *small on the object*.
+    - ``max_edges`` is a **count**, so it is scale-independent and sampling-dependent -- the right
+      threshold when "small" means *few triangles to patch*, which is what bounds the ``O(B^3)``
+      interval DP behind the fill.
+
+    Neither converts into the other without knowing the rim's sampling, and the reference
+    implementations split the same way: two of the three take a boundary-edge count and only one
+    takes a length. On a mesh whose rims are sampled unevenly the two thresholds select **opposite**
+    loops -- ``tests/test_holes.py`` builds exactly that case, a 16-vertex rim of perimeter 2.41
+    beside a 5-vertex rim of perimeter 3.16.
 
     Parameters
     ----------
@@ -790,27 +808,53 @@ def fill_small(
     faces
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
     max_perimeter
-        Only boundary loops with perimeter at most this value are filled.
+        Only boundary loops with perimeter at most this value are filled. Positional for backward
+        compatibility. Mutually exclusive with ``max_edges``.
+    max_edges
+        Only boundary loops with at most this many boundary edges are filled -- **inclusive**, so a
+        24-edge rim is filled at ``max_edges=24`` and left open at 23. A closed loop has as many
+        edges as vertices, so this is also its vertex count. Mutually exclusive with
+        ``max_perimeter``.
 
     Returns
     -------
     wp.array[wp.int32]
         Flat face buffer of ``faces`` followed by the fill triangles for the small loops, on
-        ``faces.device``. A copy of ``faces`` when there is no boundary loop at or under
-        ``max_perimeter``.
+        ``faces.device``. A copy of ``faces`` when no boundary loop meets the threshold.
+
+    Raises
+    ------
+    ValueError
+        If neither ``max_perimeter`` nor ``max_edges`` is given, or if both are.
+
+    Notes
+    -----
+    ``max_edges`` costs nothing to evaluate: the loop sizes are already host-side metadata of the
+    packed loops, so that branch skips the segmented perimeter launch and its readback entirely.
+
+    The inclusive bound is stated because it is easy to get wrong from the outside -- one reference
+    whose parameter this matches documents itself as "less than" and is measurably "at most".
 
     See Also
     --------
     [`fill_min_weight`][triwarp.holes.fill_min_weight]
     [`fill_loops_min_weight`][triwarp.holes.fill_loops_min_weight]
+    [`fillable_loop_mask`][triwarp.holes.fillable_loop_mask]
+        Which loops the DP can fill at all, a separate question from which are small.
     """
+    if (max_perimeter is None) == (max_edges is None):
+        raise ValueError("pass exactly one of max_perimeter or max_edges")
+
     packed = _hole_loops(vertices, faces)
     if packed is None:
         return wp.clone(faces)
 
-    # One segmented-sum launch measures every rim, so the selection costs a single readback rather
-    # than a copy of the whole vertex buffer plus one of each loop.
-    small_np = _loop_perimeters(vertices, packed) <= max_perimeter
+    if max_edges is not None:
+        small_np = packed.sizes_np <= max_edges
+    else:
+        # One segmented-sum launch measures every rim, so the selection costs a single readback
+        # rather than a copy of the whole vertex buffer plus one of each loop.
+        small_np = _loop_perimeters(vertices, packed) <= max_perimeter
     if not small_np.any():
         return wp.clone(faces)
     if not small_np.all():
@@ -872,7 +916,7 @@ def fill_smooth(
         Target maximum patch edge length. ``None`` (default) derives it from the mean rim edge
         length of the holes being filled; a sequential budget target has no parallel analogue.
     max_edge_splits
-        Soft cap on the number of edge splits during subdivision (``maxEdgeSplits``).
+        Soft cap on the number of edge splits during subdivision.
     max_angle_change_after_flip
         Dihedral-angle-change gate for the Delaunay flip pass (default 30°).
     smooth_curvature
@@ -1336,18 +1380,19 @@ def fillable_loop_mask(
       ``fill_min_weight(resolve_multiple_edges=True)`` repairs *after* the fact, and a ``True`` here
       is exactly the case where that repair has nothing to do.
 
-    !!! note "Conservative on the chord, and not MeshLib's predicate"
+    !!! note "Conservative on the chord, and not the reference predicate"
         The chord test is **sufficient, not necessary**: a chord-free loop cannot produce a
         duplicated edge whatever the dynamic program chooses, but a loop *with* a chord may still
         fill cleanly if the program happens to avoid it. A four-vertex rim with one diagonal already
         present is the smallest example -- there are two triangulations and only one of them
         collides. So read ``False`` as "check the result", not as "cannot be filled".
 
-        It is also **not** a port of MeshLib's ``findHoleComplicatingFaces``, which measures
-        something else: on that same square it flags **no** face. And MeshLib's third predicate,
-        ``isLoopOuter``, is deliberately absent -- which boundary of an open surface is the "outer"
-        one is a property of an embedding, not of the mesh, so there is nothing intrinsic to
-        compute. The practical form of that question, *which rim is the big one*, is already
+        It is also **not** a port of the reference predicate that flags faces *complicating* a
+        hole, which measures something else: on that same square it flags **no** face. And the
+        reference's third predicate, whether a loop is the "outer" one, is deliberately absent --
+        which boundary of an open surface is outer is a property of an embedding, not of the mesh,
+        so there is nothing intrinsic to compute. The practical form of that question, *which rim
+        is the big one*, is already
         answered by ``fill_min_weight(preserve_largest_hole=True)`` and by
         [`loop_perimeters`][triwarp.boundary.loop_perimeters].
 

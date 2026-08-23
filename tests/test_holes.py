@@ -23,6 +23,7 @@ from tests.conversions import (
     meshlib_to_trimesh,
     numpy_to_meshlib,
     numpy_to_meshlib_bitset,
+    numpy_to_pymeshfix,
     numpy_to_warp,
     trimesh_to_meshlib,
     trimesh_to_open3d,
@@ -1093,6 +1094,131 @@ def test_fill_small_leaves_a_watertight_mesh_alone(icosahedron: tuple[tm.Trimesh
 
     assert np.array_equal(filled_wp.numpy(), mesh_wp.indices.numpy())
     assert filled_wp.ptr != mesh_wp.indices.ptr
+
+
+def _two_rims_of_different_edge_count(device: str):
+    """
+    Cut two well-separated caps of different size out of an icosphere, reporting the rim sizes.
+
+    Distinct from [`_two_holes_of_different_size`] in one respect that matters for a reference
+    comparison: both rims here are ordinary manifold loops, so pymeshfix's connectivity-repairing
+    loader leaves the mesh **untouched** (639 v / 1 250 f in and out, 2 boundaries). The pinhole in
+    the other fixture is two faces meeting at a vertex, which that loader cuts -- it comes back with
+    one extra vertex and the 5-edge rim has become a 6-edge one, so every count shifts by a
+    triangle and the comparison would read as a threshold disagreement.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    centers_np = sphere_tm.triangles_center
+    keep_np = np.ones(sphere_tm.faces.shape[0], dtype=bool)
+    keep_np[np.argsort(-centers_np[:, 2])[:20]] = False
+    keep_np[np.argsort(centers_np[:, 2])[:10]] = False
+    holed_tm = tm.Trimesh(sphere_tm.vertices, sphere_tm.faces[keep_np], process=False)
+    holed_tm.remove_unreferenced_vertices()
+    vertices_wp, faces_wp = numpy_to_warp(holed_tm.vertices, holed_tm.faces, device)
+    sizes = [int(loop_wp.shape[0]) for loop_wp in tw.boundary.boundary_loops(vertices_wp, faces_wp)]
+    return holed_tm, vertices_wp, faces_wp, sizes
+
+
+@pytest.mark.parity(
+    "fill_small",
+    "pymeshfix",
+    "pymeshlab",
+    benchmarked=False,
+    reason="fill_small has no benchmark group: the interval DP it drives is what costs anything "
+    "and that is already timed as fill_min_weight over the same loops, so a group here would "
+    "re-measure the DP under a second name. Neither reference could carry a row anyway -- "
+    "fill_small_boundaries is 8-10 % of a pymeshfix round (5.8 ms against 67.9 ms of load on "
+    "bunny_decimated, 51.4 against 439.6 on bunny) and a PyTMesh takes exactly one load_array, so "
+    "the build cannot leave the timed callable; meshing_close_holes sits behind pymeshlab's own "
+    "~0.47 us/vertex MeshSet build. The threshold semantics are pinned here instead.",
+)
+@pytest.mark.parametrize("max_edges", [9, 10, 15, 16, 24])
+def test_fill_small_max_edges_matches_the_edge_count_references(
+    device: str, max_edges: int
+) -> None:
+    """
+    Class B: the same loops are filled, after one named transform on pymeshlab's bound.
+
+    ``max_edges`` exists because a **length** threshold is not expressible by two of the three
+    references: pymeshfix's ``fill_small_boundaries(nbe, ...)`` and pymeshlab's
+    ``meshing_close_holes(maxholesize=...)`` both count boundary edges, and no conversion between
+    the two units exists without knowing the rim's sampling.
+
+    The transform is the off-by-one, and it is measured rather than assumed, because the two
+    references disagree with each other about it: on a 16-edge rim **pymeshfix fills at ``nbe=16``
+    and pymeshlab only at ``maxholesize=17``**. So pymeshfix's bound is inclusive, pymeshlab's is
+    exclusive, triwarp follows pymeshfix (which is also what its own docstring gets wrong -- it says
+    "less than"), and pymeshlab is called at ``max_edges + 1``.
+
+    What is compared is the added-triangle count, which is an exact oracle for *which* loops were
+    filled: an ``n``-gon patched without new vertices is ``n - 2`` triangles whatever the
+    triangulation, so 8 means the 10-edge rim alone, 22 means both, 0 means neither. The
+    triangulations themselves differ -- that is a separate, class-C claim -- and this row says
+    nothing about them.
+
+    Non-vacuous at both ends and in the middle: the parametrization straddles both rim sizes (10
+    and 16), so two thresholds fill nothing, one fills one rim and two fill both, and a threshold
+    rule that ignored its argument would fail at least one.
+    """
+    holed_tm, vertices_wp, faces_wp, sizes = _two_rims_of_different_edge_count(device)
+    n_faces = int(faces_wp.shape[0]) // 3
+    assert sorted(sizes) == [10, 16]  # the fixture, so the thresholds above straddle both rims
+    expected = sum(size - 2 for size in sizes if size <= max_edges)
+
+    filled_wp = tw.holes.fill_small(vertices_wp, faces_wp, max_edges=max_edges)
+
+    tin_pmf = numpy_to_pymeshfix(holed_tm.vertices, holed_tm.faces)
+    assert tin_pmf.n_faces == n_faces  # the loader left the mesh alone, so counts compare
+    assert tin_pmf.n_boundaries == 2
+    tin_pmf.fill_small_boundaries(nbe=max_edges, refine=False)
+    added_pmf = tin_pmf.n_faces - n_faces
+
+    meshset_pml = trimesh_to_pymeshlab(holed_tm)
+    meshset_pml.meshing_close_holes(maxholesize=max_edges + 1, selfintersection=False)
+    added_pml = meshset_pml.current_mesh().face_number() - n_faces
+
+    assert int(filled_wp.shape[0]) // 3 - n_faces == expected
+    assert added_pmf == expected
+    assert added_pml == expected
+
+
+def test_fill_small_thresholds_select_opposite_loops(device: str) -> None:
+    """
+    Not a parity assert: triwarp against triwarp, pinning the two thresholds apart.
+
+    The oracle for both branches is
+    [`test_fill_small_max_edges_matches_the_edge_count_references`] (edges) and
+    [`test_fill_small_fills_exactly_the_loops_under_the_threshold`] (perimeter); this test carries
+    neither. Its job is to show the two thresholds are not two spellings of one thing, which no
+    reference comparison can show because no reference implements both.
+
+    The fixture is the one whose orderings are **inverted**: a 16-vertex rim of perimeter 2.406
+    beside a 5-vertex rim of perimeter 3.150, so "the small loop" is the 16-gon by length and the
+    5-gon by count. A threshold in the middle of each range therefore fills a *different* loop
+    depending on which unit it is in, and the added-triangle counts (14 against 3) tell them apart.
+    """
+    vertices_wp, faces_wp, loop_sizes, perimeters = _two_holes_of_different_size(device)
+    n_faces = int(faces_wp.shape[0]) // 3
+    by_size = dict(zip(loop_sizes, perimeters, strict=True))
+    assert by_size[16] < by_size[5]  # the inversion this test turns on
+
+    by_edges_wp = tw.holes.fill_small(vertices_wp, faces_wp, max_edges=(5 + 16) // 2)
+    by_length_wp = tw.holes.fill_small(vertices_wp, faces_wp, sum(perimeters) / 2.0)
+
+    assert int(by_edges_wp.shape[0]) // 3 - n_faces == 5 - 2
+    assert int(by_length_wp.shape[0]) // 3 - n_faces == 16 - 2
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{}, {"max_perimeter": 1.0, "max_edges": 8}], ids=["neither", "both"]
+)
+def test_fill_small_requires_exactly_one_threshold(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh], kwargs: dict[str, float | int]
+) -> None:
+    """The documented ``ValueError``, in both directions: no threshold and two."""
+    _mesh_tm, mesh_wp = hemisphere
+    with pytest.raises(ValueError, match="exactly one"):
+        tw.holes.fill_small(mesh_wp.points, mesh_wp.indices, **kwargs)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
