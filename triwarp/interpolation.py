@@ -433,14 +433,14 @@ def interpolate_from_points(
     docs, and agrees to eight digits. Two conventions of the reference are deliberately not copied:
     it clamps ``sharpness`` up to ``1.0`` (so its own ``0.5`` behaves as ``1.0``), and it offers
     ``mask_points`` / ``closest_point`` fallbacks for a query with no neighbour. The mask is
-    ``counts == 0`` from [`query_bvh_ball_count`][triwarp.neighbors.query_bvh_ball_count] and the
+    ``counts == 0`` from [`query_ball_count`][triwarp.neighbors.query_ball_count] and the
     closest-point fallback is this function at ``k=1``, so neither needs a mode of its own.
 
     See Also
     --------
     [`transfer_onto_vertices`][triwarp.interpolation.transfer_onto_vertices]
-    [`query_bvh_ball_with_offsets`][triwarp.neighbors.query_bvh_ball_with_offsets]
-    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
+    [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets]
+    [`query_nearest`][triwarp.neighbors.query_nearest]
     """
     device = query_points.device
     n_source = int(source_points.shape[0])
@@ -461,14 +461,14 @@ def interpolate_from_points(
         return out_values
 
     if k is None:
-        indices, distances, offsets = tw.neighbors.query_bvh_ball_with_offsets(
-            source_points, query_points, float(radius), include_total=True
+        indices, distances, offsets = tw.neighbors.query_ball_with_offsets(
+            source_points, query_points, float(radius), include_total=True, backend="bvh"
         )
     else:
         # The padded rows carry index -1 at distance ``inf``, which the kernel skips, so a
         # fixed-width row is a CSR whose offsets are a constant stride.
-        row_indices, row_distances = tw.neighbors.query_bvh_nearest(
-            source_points, query_points, int(k)
+        row_indices, row_distances = tw.neighbors.query_nearest(
+            source_points, query_points, int(k), backend="bvh"
         )
         n_slots = n_query * int(k)
         indices = row_indices.reshape((n_slots,))

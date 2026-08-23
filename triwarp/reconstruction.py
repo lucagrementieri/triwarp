@@ -269,7 +269,7 @@ def triangulate_point_cloud(
     k = min(k, max_neighbours)
 
     # Dense (n, k+1) nearest-neighbour table; slot 0 is the point itself and is skipped in-kernel.
-    neighbor_idx, neighbor_dist = tw.neighbors.query_bvh_nearest(points, points, k=k + 1)
+    neighbor_idx, neighbor_dist = tw.neighbors.query_nearest(points, points, k=k + 1, backend="bvh")
 
     if normals is None:
         normals = tw.points.estimate_normals(points, neighbor_idx)
@@ -1205,7 +1205,7 @@ def ball_pivoting(
         return wp.clone(points), wp.empty(0, dtype=wp.int32, device=device)
 
     # Nearest-neighbour table drives both the radius auto-guess and (if needed) normal estimation.
-    neighbor_idx, neighbor_dist = tw.neighbors.query_bvh_nearest(points, points, k=7)
+    neighbor_idx, neighbor_dist = tw.neighbors.query_nearest(points, points, k=7, backend="bvh")
     if radius <= 0.0:
         # The whole table, not columns ``1:``: the self-distance in slot 0 is exactly zero and the
         # positive-finite filter drops it, so flattening costs nothing and keeps the reduction on

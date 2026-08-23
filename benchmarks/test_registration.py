@@ -60,7 +60,7 @@ on ``bunny`` (35 947 target points, 20 000 source points, 10 iterations):
 * The **mesh** target is still the faster of the two — 4.0 ms versus 7.9 ms — because it rides
   Warp's built-in ``wp.mesh_query_point_no_sign`` and never touches the k-NN path at all.
 * The **point-cloud** target used to be 48x slower than that (191 ms), because
-  [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] searched the whole cloud on every
+  [`query_nearest`][triwarp.neighbors.query_nearest] searched the whole cloud on every
   call: with ``max_radius=inf`` it clamped the query cube to the scene diagonal, so the BVH pruned
   nothing. It now deepens iteratively from a density estimate, and the target's BVH, bounds and
   radius are hoisted out of the loop, which moved point-cloud ICP from ~10x *slower* than open3d's
@@ -80,10 +80,10 @@ import pytest
 import pyvista as pv
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 _SEED = 42
 _N_POINTS = 20_000

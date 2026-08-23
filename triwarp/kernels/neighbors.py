@@ -410,7 +410,7 @@ def query_bvh_nearest_neighbors(
 # equal distance and displaces further down instead, which permutes *which* of several equidistant
 # points fills a slot and leaves every distance bit-identical (measured — deleting the flag from all
 # three carries passes the tie test at every bucket on both backends). Callers are told exactly that
-# much; ``query_bvh_nearest``'s docstring declares the identity of a tied neighbour unspecified.
+# much; ``query_nearest``'s docstring declares the identity of a tied neighbour unspecified.
 #
 # So the guard on an edit here is a *tied* fixture, not a second implementation to diff against:
 # ``tests/test_neighbors.py::test_query_nearest_ties`` runs every ``KNN_ROW_BUCKETS`` size against

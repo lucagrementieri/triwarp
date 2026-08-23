@@ -26,8 +26,8 @@ References
 ----------
 **meshlib** ``offsetMesh`` is the same algorithm: an OpenVDB level set at a given ``voxelSize``,
 marched back to a mesh. It is the fair row -- both sides sample a field on a lattice of the same
-pitch, and ``tests/test_levelset.py`` pins them to within half a cell of each other on the surface and
-to within 5 % on the vertex count.
+pitch, and ``tests/test_levelset.py`` pins them to within half a cell of each other on the surface
+and to within 5 % on the vertex count.
 
 **pymeshlab** ``generate_resampled_uniform_mesh`` is MeshLab's offset and is timed at the same cell
 size. Its ``offset`` parameter is passed as ``PureValue``, which is mandatory rather than stylistic:

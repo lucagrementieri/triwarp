@@ -519,7 +519,7 @@ def estimate_normals(
     choice, which Open3D's ``FastEigen3x3`` also makes, so the result matches the
     references up to sign. The neighbourhood is supplied by
     the caller as ``neighbor_idx``: build it with
-    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] using a plain
+    [`query_nearest`][triwarp.neighbors.query_nearest] using a plain
     ``k`` for a k-nearest (KNN) neighbourhood, or with ``max_radius`` set for a
     radius-bounded (hybrid) neighbourhood — mirroring the two neighbour modes of
     Open3D's ``estimate_normals(max_nn, radius)``.
@@ -530,7 +530,7 @@ def estimate_normals(
         ``(n,)`` point positions on the target device.
     neighbor_idx
         ``(n, k)`` int32 table of neighbour indices per point, as returned by
-        [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] (unused slots
+        [`query_nearest`][triwarp.neighbors.query_nearest] (unused slots
         marked ``-1``). A self-query table includes each point itself once, which
         is counted normally.
     orient_reference
@@ -626,7 +626,7 @@ def outlier_probability(
     ----------
     neighbor_idx
         ``(n, k)`` int32 neighbour table, as returned by
-        [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] (unused slots marked ``-1``).
+        [`query_nearest`][triwarp.neighbors.query_nearest] (unused slots marked ``-1``).
         A self-query table includes each point itself, which is counted normally — the same
         convention MeshLab's k-d tree query uses.
     neighbor_distance
@@ -650,7 +650,7 @@ def outlier_probability(
     --------
     [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask]
     [`estimate_normals`][triwarp.points.estimate_normals]
-    [`triwarp.neighbors.query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
+    [`triwarp.neighbors.query_nearest`][triwarp.neighbors.query_nearest]
     """
     twt.ensure_ndim(neighbor_idx, 2, dtype=wp.int32)
     twt.ensure_ndim(neighbor_distance, 2, dtype=wp.float32)
@@ -708,7 +708,7 @@ def statistical_outlier_mask(
     ----------
     neighbor_distance
         ``(n, k)`` float32 distances from
-        [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]; unused slots are ``inf`` and
+        [`query_nearest`][triwarp.neighbors.query_nearest]; unused slots are ``inf`` and
         are excluded from the per-point mean. A self-query table contributes one zero distance per
         row, exactly as Open3D's ``SearchKNN`` does, so pass the same ``k`` Open3D gets as
         ``nb_neighbors``.
@@ -731,7 +731,7 @@ def statistical_outlier_mask(
     See Also
     --------
     [`outlier_probability`][triwarp.points.outlier_probability]
-    [`triwarp.neighbors.query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
+    [`triwarp.neighbors.query_nearest`][triwarp.neighbors.query_nearest]
     """
     twt.ensure_ndim(neighbor_distance, 2, dtype=wp.float32)
 
@@ -848,7 +848,7 @@ def radius_outlier_mask(
     --------
     [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask]
     [`outlier_probability`][triwarp.points.outlier_probability]
-    [`triwarp.neighbors.query_hashgrid_ball_count`][triwarp.neighbors.query_hashgrid_ball_count]
+    [`triwarp.neighbors.query_ball_count`][triwarp.neighbors.query_ball_count]
     """
     if radius <= 0.0:
         raise ValueError(f"radius must be > 0, got {radius}")
@@ -863,7 +863,7 @@ def radius_outlier_mask(
 
     # A self-query counts the point itself once, at distance 0 -- which is what makes
     # ``min_neighbors`` comparable with Open3D's ``nb_points`` without an off-by-one correction.
-    counts = tw.neighbors.query_hashgrid_ball_count(points, points, radius, grid=grid)
+    counts = tw.neighbors.query_ball_count(points, points, radius, accelerator=grid)
     wp.map(kernel_array.less_equal, counts, wp.int32(min_neighbors), out=out_mask)
     return out_mask
 

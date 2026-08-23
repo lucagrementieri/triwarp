@@ -181,7 +181,7 @@ def neighbor_distance_moments(
     out_count: wp.array[wp.int32],
 ) -> None:
     # First and second moments of each point's neighbour distances, over the *filled* slots only:
-    # ``query_bvh_nearest`` leaves unused slots at ``inf`` (index -1), and a row can be short when
+    # ``query_nearest`` leaves unused slots at ``inf`` (index -1), and a row can be short when
     # ``max_radius`` bites or the cloud is smaller than ``k``. An empty row reports zeros with a
     # zero count, which is how both callers detect it.
     #

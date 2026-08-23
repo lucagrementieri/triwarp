@@ -16,7 +16,7 @@ functions here fall into two groups:
 
 * ``estimate_normals`` — the PCA kernel alone, on a cached ``(n, k)`` table. This is the
   measurement to read for a change to the covariance / SVD kernel.
-* ``estimate_normals_knn`` — [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] plus the
+* ``estimate_normals_knn`` — [`query_nearest`][triwarp.neighbors.query_nearest] plus the
   kernel, which is the whole of what open3d's ``estimate_normals`` does (it builds a ``KDTreeFlann``
   internally on every call), so it is the only fair cross-library comparison.
 
@@ -155,7 +155,7 @@ _KNN = 30
 # Neighbourhood widths to sweep: the per-point 3x3 PCA is linear in k, and the k-NN table build
 # that feeds it is not, so the pair separates the estimator's cost from its input's. The table is
 # cached (``_neighbor_table``), so this sweep times the estimator *only* — the query's own k axis is
-# ``query_bvh_nearest_k1`` / ``_k7`` / ``_k64`` in ``test_neighbors.py``.
+# ``query_nearest_bvh_k1`` / ``_k7`` / ``_k64`` in ``test_neighbors.py``.
 _KNN_SWEEP = [8, 64]
 
 # The trimesh references here are single-threaded host passes and one of them is far worse than
@@ -193,7 +193,7 @@ def _neighbor_table(bench_case: BenchCase, k: int = _KNN) -> twt.Array2dInt32:
     key = (bench_case.mesh_name, str(bench_case.device), k)
     if key not in _neighbors_cache:
         points = bench_case.vertices_wp
-        _neighbors_cache[key] = tw.neighbors.query_bvh_nearest(points, points, k=k)[0]
+        _neighbors_cache[key] = tw.neighbors.query_nearest(points, points, k=k, backend="bvh")[0]
     return _neighbors_cache[key]
 
 
@@ -570,7 +570,7 @@ def test_estimate_normals_knn(bench_case: BenchCase) -> None:
         points = bench_case.vertices_wp
         normals = bench_case.run(
             lambda: tw.points.estimate_normals(
-                points, tw.neighbors.query_bvh_nearest(points, points, k=_KNN)[0]
+                points, tw.neighbors.query_nearest(points, points, k=_KNN, backend="bvh")[0]
             )
         )
         assert normals.shape == (bench_case.n_vertices,)
@@ -602,7 +602,7 @@ def test_outlier_probability(bench_case: BenchCase) -> None:
     points = bench_case.vertices_wp
     probability = bench_case.run(
         lambda: tw.points.outlier_probability(
-            *tw.neighbors.query_bvh_nearest(points, points, k=_KNN)
+            *tw.neighbors.query_nearest(points, points, k=_KNN, backend="bvh")
         )
     )
     assert probability.shape == (bench_case.n_vertices,)
@@ -619,7 +619,7 @@ def test_statistical_outlier_mask(bench_case: BenchCase) -> None:
         points = bench_case.vertices_wp
         mask = bench_case.run(
             lambda: tw.points.statistical_outlier_mask(
-                tw.neighbors.query_bvh_nearest(points, points, k=_KNN)[1]
+                tw.neighbors.query_nearest(points, points, k=_KNN, backend="bvh")[1]
             )
         )
         assert mask.shape == (bench_case.n_vertices,)

@@ -691,7 +691,7 @@ def test_estimate_normals_matches_open3d(device: str) -> None:
 
     # triwarp: build the same k-neighbourhood (self + knn-1 = knn points total), then PCA.
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, _ = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=knn)
+    neighbor_idx_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=knn, backend="bvh")
     normals_wp = tw.estimate_normals(points_wp, neighbor_idx_wp)
 
     # Both estimators fix the smallest-eigenvalue covariance eigenvector but leave the sign
@@ -723,7 +723,9 @@ def test_estimate_normals_matches_meshlib(device: str) -> None:
     spacing = float(np.sqrt(4.0 * np.pi / points_np.shape[0]))
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, _distances_wp = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=knn)
+    neighbor_idx_wp, _distances_wp = tw_neighbors.query_nearest(
+        points_wp, points_wp, k=knn, backend="bvh"
+    )
     normals_wp = tw.estimate_normals(points_wp, neighbor_idx_wp).numpy()
 
     cloud_ml = points_to_meshlib(points_np)
@@ -746,7 +748,7 @@ def test_estimate_normals_orientation(device: str) -> None:
     points_np = _fibonacci_sphere(1000)
     centroid_np = points_np.mean(axis=0)
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, _ = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=20)
+    neighbor_idx_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=20, backend="bvh")
 
     # Default: outward from the cloud centroid (the reference vector the kernel uses).
     normals_default = tw.estimate_normals(points_wp, neighbor_idx_wp).numpy()
@@ -769,7 +771,7 @@ def test_estimate_normals_orientation(device: str) -> None:
 
 def test_estimate_normals_mutually_exclusive_orientation(device: str) -> None:
     points_wp = wp.array(_fibonacci_sphere(16).astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, _ = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=8)
+    neighbor_idx_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=8, backend="bvh")
     with pytest.raises(ValueError, match=r"at most one"):
         tw.estimate_normals(
             points_wp,
@@ -803,8 +805,8 @@ def test_outlier_probability_matches_scipy(device: str) -> None:
     probability_np = _loop_reference(points_np, k)
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_bvh_nearest(
-        points_wp, points_wp, k=k
+    neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_nearest(
+        points_wp, points_wp, k=k, backend="bvh"
     )
     probability_wp = tw.outlier_probability(neighbor_idx_wp, neighbor_distance_wp)
     assert np.allclose(probability_wp.numpy(), probability_np, rtol=1e-4, atol=1e-4)
@@ -818,8 +820,8 @@ def test_outlier_probability_ranks_the_planted_outliers(device: str) -> None:
     points_np = _cloud_with_outliers(n_inliers=n_inliers, n_outliers=n_outliers)
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_bvh_nearest(
-        points_wp, points_wp, k=k
+    neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_nearest(
+        points_wp, points_wp, k=k, backend="bvh"
     )
     probability_wp = tw.outlier_probability(neighbor_idx_wp, neighbor_distance_wp)
     ranked = np.argsort(-probability_wp.numpy())
@@ -843,8 +845,8 @@ def test_outlier_probability_is_scale_invariant(device: str) -> None:
     scores = []
     for factor in (1.0, 100.0):
         points_wp = wp.array((points_np * factor).astype(np.float32), dtype=wp.vec3, device=device)
-        neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_bvh_nearest(
-            points_wp, points_wp, k=32
+        neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_nearest(
+            points_wp, points_wp, k=32, backend="bvh"
         )
         scores.append(tw.outlier_probability(neighbor_idx_wp, neighbor_distance_wp).numpy())
     assert np.allclose(scores[0], scores[1], rtol=1e-4, atol=1e-4)
@@ -852,8 +854,8 @@ def test_outlier_probability_is_scale_invariant(device: str) -> None:
 
 def test_outlier_probability_invalid_scale(device: str) -> None:
     points_wp = wp.array(_fibonacci_sphere(16).astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_bvh_nearest(
-        points_wp, points_wp, k=4
+    neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_nearest(
+        points_wp, points_wp, k=4, backend="bvh"
     )
     with pytest.raises(ValueError, match="scale must be positive"):
         tw.outlier_probability(neighbor_idx_wp, neighbor_distance_wp, scale=0.0)
@@ -861,8 +863,8 @@ def test_outlier_probability_invalid_scale(device: str) -> None:
 
 def test_outlier_probability_shape_mismatch(device: str) -> None:
     points_wp = wp.array(_fibonacci_sphere(16).astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, _ = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=4)
-    _, neighbor_distance_wp = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=5)
+    neighbor_idx_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=4, backend="bvh")
+    _, neighbor_distance_wp = tw_neighbors.query_nearest(points_wp, points_wp, k=5, backend="bvh")
     with pytest.raises(ValueError, match="same shape"):
         tw.outlier_probability(neighbor_idx_wp, neighbor_distance_wp)
 
@@ -885,7 +887,9 @@ def test_statistical_outlier_mask_matches_open3d(device: str) -> None:
     outlier_o3d[np.asarray(keep_indices)] = False
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    _idx, neighbor_distance_wp = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=k)
+    _idx, neighbor_distance_wp = tw_neighbors.query_nearest(
+        points_wp, points_wp, k=k, backend="bvh"
+    )
     outlier_wp = tw.statistical_outlier_mask(neighbor_distance_wp, std_ratio=std_ratio)
     assert np.array_equal(outlier_wp.numpy().astype(bool), outlier_o3d)
 
@@ -931,7 +935,9 @@ def test_statistical_outlier_mask_matches_meshlib(device: str) -> None:
     planted_np[-n_outliers:] = True
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    _idx_wp, neighbor_distance_wp = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=k)
+    _idx_wp, neighbor_distance_wp = tw_neighbors.query_nearest(
+        points_wp, points_wp, k=k, backend="bvh"
+    )
     outlier_wp = tw.statistical_outlier_mask(neighbor_distance_wp, std_ratio=std_ratio).numpy()
 
     cloud_ml = points_to_meshlib(points_np)
@@ -980,7 +986,7 @@ def test_radius_outlier_mask_matches_open3d(device: str) -> None:
     )
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    count_wp = tw_neighbors.query_hashgrid_ball_count(points_wp, points_wp, radius)
+    count_wp = tw_neighbors.query_ball_count(points_wp, points_wp, radius)
     assert np.array_equal(count_wp.numpy(), count_o3d)
 
     for min_neighbors in (3, 6, 12):

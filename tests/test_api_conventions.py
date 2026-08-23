@@ -419,7 +419,9 @@ def example_namespace(
     queries = wp.array(
         [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.5, 0.0]], dtype=wp.vec3, device=device
     )
-    neighbor_idx, neighbor_distance = tw.neighbors.query_bvh_nearest(vertices, vertices, 4)
+    neighbor_idx, neighbor_distance = tw.neighbors.query_nearest(
+        vertices, vertices, 4, backend="bvh"
+    )
     # Thresholded against its own mean, not against zero: the fixture is translated to z + 2, so
     # ``> 0.0`` selects every face and leaves a region with no seam around it.
     centroids_np = tw.triangles.face_centroids(vertices, faces).numpy()

@@ -1241,7 +1241,7 @@ def test_ball_pivoting_is_reproducible(device: str):
     points_wp, normals_wp = _to_warp(torus_tm.vertices, torus_tm.vertex_normals, device)
     n_points = int(points_wp.shape[0])
     # The wrapper's own auto-radius, pinned here so the raw runs below see the identical parameter.
-    spacing = tw.neighbors.query_bvh_nearest(points_wp, points_wp, k=7)[1].numpy()[:, 1:]
+    spacing = tw.neighbors.query_nearest(points_wp, points_wp, k=7, backend="bvh")[1].numpy()[:, 1:]
     radius = 1.5 * float(spacing[np.isfinite(spacing) & (spacing > 0.0)].mean())
 
     grid = tw.neighbors.hashgrid_from_points(points_wp, radius)
@@ -1307,7 +1307,7 @@ def test_ball_pivoting_face_count_near_open3d(device: str):
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
     # Auto-guessed radius roughly matches the mean spacing; use it for open3d too.
-    _idx, dist = tw.neighbors.query_bvh_nearest(points_wp, points_wp, k=7)
+    _idx, dist = tw.neighbors.query_nearest(points_wp, points_wp, k=7, backend="bvh")
     spacing = float(np.mean(dist.numpy()[:, 1:][np.isfinite(dist.numpy()[:, 1:])]))
     radius = 1.5 * spacing
 
@@ -1355,7 +1355,7 @@ def test_ball_pivoting_matches_pymeshlab(device: str):
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
-    _index_wp, distance_wp = tw.neighbors.query_bvh_nearest(points_wp, points_wp, k=7)
+    _index_wp, distance_wp = tw.neighbors.query_nearest(points_wp, points_wp, k=7, backend="bvh")
     neighbor_distance_np = distance_wp.numpy()[:, 1:]
     spacing = float(np.mean(neighbor_distance_np[np.isfinite(neighbor_distance_np)]))
     radius = 1.5 * spacing
@@ -1393,7 +1393,7 @@ def test_ball_pivoting_small_radius_leaves_holes(device: str):
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
-    _idx, dist = tw.neighbors.query_bvh_nearest(points_wp, points_wp, k=2)
+    _idx, dist = tw.neighbors.query_nearest(points_wp, points_wp, k=2, backend="bvh")
     spacing = float(np.mean(dist.numpy()[:, 1][np.isfinite(dist.numpy()[:, 1])]))
 
     _v_small, faces_small = tw.reconstruction.ball_pivoting(

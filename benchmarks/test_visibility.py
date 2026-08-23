@@ -26,7 +26,7 @@ Five functions, three shapes of work, and the split is what the rows are for.
   ``computeRayThicknessAtVertices`` takes no query set -- it answers at every vertex, in parallel
   over all cores -- so a row against the subsampled group would price a different number of queries
   (3.6x more on ``bunny``), the reason section 6 bars ``findNClosestPointsPerPoint`` from
-  ``query_bvh_nearest_k7``. Read it against ``thickness_interior`` for the per-query cost and
+  ``query_nearest_bvh_k7``. Read it against ``thickness_interior`` for the per-query cost and
   against MeshLib for the one fair CPU-versus-GPU comparison this module has.
 
 ``volumetric_obscurance`` has **no group**. It shares ``ambient_occlusion``'s kernel and differs

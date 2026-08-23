@@ -165,7 +165,7 @@ def discrete_gaussian_curvature(
     [`discrete_mean_curvature`][triwarp.curvature.discrete_mean_curvature]
         The mean-curvature measure over the same ball.
     """
-    nearest_indices, _, nearest_offsets = tw.neighbors.query_hashgrid_ball_with_offsets(
+    nearest_indices, _, nearest_offsets = tw.neighbors.query_ball_with_offsets(
         vertices, points, radius
     )
     defects = vertex_defects(vertices.shape[0], faces, face_angles)

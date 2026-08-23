@@ -14,7 +14,7 @@ forward-plus-backward would be a misleading ratio rather than a useful baseline.
 Non-differentiable cases
 ------------------------
 ``chamfer_points_to_points`` and ``hausdorff_points_to_points`` are each **two**
-[`query_hashgrid_nearest`][triwarp.neighbors.query_hashgrid_nearest] calls at ``k=1`` plus a
+[`query_nearest`][triwarp.neighbors.query_nearest] calls at ``k=1`` plus a
 reduction, so they are the direct measurement for a change to the k-NN kernel — the same kernel
 that sits under all twelve of ``distance.py``'s nearest-neighbour call sites.
 
@@ -49,10 +49,10 @@ import open3d as o3d
 import pymeshlab as ml
 import pytest
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
 import triwarp.typing as twt
+from conftest import BenchCase, skip_larger_than
 
 _TRANSLATION_FRACTION = 0.05
 

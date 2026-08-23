@@ -42,7 +42,7 @@ from triwarp.array import arange, flatnonzero, gather
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
-from triwarp.neighbors import query_hashgrid_ball_with_offsets
+from triwarp.neighbors import query_ball_with_offsets
 from triwarp.triangles import face_normals_and_areas
 
 
@@ -344,7 +344,7 @@ def sample_surface_poisson_disk(
     r_min = wp.float32(r_max * beta * (1.0 - ratio**gamma))
 
     # 4. Neighbor lists (GPU, computed once for the full initial pool)
-    nbr_idx, nbr_dists, offsets = query_hashgrid_ball_with_offsets(
+    nbr_idx, nbr_dists, offsets = query_ball_with_offsets(
         init_points, init_points, r_max, include_total=True
     )
 

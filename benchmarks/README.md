@@ -676,7 +676,7 @@ Where the margins sit, on medians:
 | `face_angles` | 12.5 ms | 0.044 ms | **282x** |
 | `ears` | 161–399 ms | 0.72–0.84 ms | **200–500x** |
 | `bvh_from_points` | 198 ms | 0.22 ms | 896x (but see the GC hazard below) |
-| `query_bvh_nearest_k1` | 250 ms | 0.65 ms | 385x |
+| `query_nearest_bvh_k1` | 250 ms | 0.65 ms | 385x |
 | `sample_surface` (100k) | 55.2 ms | 0.25 ms | 218x |
 | `vertex_defects` | 13.9–14.7 ms | 0.19–0.22 ms | 62–78x |
 | `is_edge_manifold` | 32–53 ms | 1.15–1.18 ms | 28–48x |
@@ -736,7 +736,7 @@ both in one pass — so the `unshared` row is an upper bound rather than like-fo
   lists as a Python `list` of **151 233 nested lists** on `bunny`'s 35 947 points, so it allocates
   ~150k list objects a call: **40.6–44.6 ms with `gc` disabled against 90.6–176.9 ms with it enabled**,
   measured back to back. In-harness that shows up as a `Min` of 39 ms against a `Median` of 198 ms in
-  one ten-round row — so **quote igl's medians, never its minima**, and read `query_bvh_nearest_*`'s
+  one ten-round row — so **quote igl's medians, never its minima**, and read `query_nearest_bvh_*`'s
   build-included igl numbers as pricing the binding as much as the search. This is the `*_lists`
   hazard below, except it lands on the only structure igl exposes for k-NN, so there is no array form
   to switch to; it is also why the igl k-NN rows are capped a size below scipy's.

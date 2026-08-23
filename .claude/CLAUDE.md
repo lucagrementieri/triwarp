@@ -1651,6 +1651,34 @@ survive the next upgrade unexamined, which is exactly the failure the check exis
   `boundary.boundary_loop` and `boundary.boundary_loops` meant "the longest one" and "all of them";
   the singular is now `longest_boundary_loop`, which is what its own docstring already said. Look
   for this whenever a plural is added next to an existing singular.
+- **A tuning choice is a keyword, not a name — and if the kernel already branches on it, the
+  Python layer is the only place it doubled.** `neighbors` exposed each ball and nearest query
+  twice, once per accelerator, for eight names covering four operations: identical positional
+  arguments, identical returns, differing only in the name of the optional prebuilt structure.
+  `kernels/neighbors.py` had *already* unified them behind `ACCEL_HASHGRID` / `ACCEL_BVH` selectors
+  in one warp-uniform kernel, the benchmark groups already treated the backend as an axis, and
+  `query_bvh_nearest`'s docstring carried a note telling the caller which of the two names to type
+  — a naming scheme that needs such a note is doing the caller's dispatch for them. They are now
+  `query_ball` / `query_ball_count` / `query_ball_with_offsets` / `query_nearest` with
+  `backend="hashgrid" | "bvh"` and an `accelerator=` that infers it. Three consequences worth
+  keeping:
+    - **A default that must be distinguishable from "not passed" is spelled `None`.** `backend`
+      defaults to `None`, documented as "`hashgrid` when no `accelerator` is given", so that
+      handing over a `wp.Bvh` and nothing else does not read as contradicting a default the caller
+      never wrote. Only an *explicit* mismatch raises.
+    - **Keep the discriminator in the benchmark group name, not in the function name.** The two
+      backends are genuinely different cost rows for one function, so the groups are
+      `query_ball_bvh` / `query_ball_hashgrid` and `query_nearest_{bvh,hashgrid}_k{1,7,64}`. The
+      group name is the parity key, so all 19 markers moved in the same commit and the matrix
+      stayed at its count.
+    - **A merge like this needs a triwarp-against-triwarp test that the two paths agree**, or the
+      shared group name is an unchecked claim. `test_the_two_backends_agree` is that test; it is
+      not a parity assert, and says so.
+  What stays split: `query_bvh_aabb_with_offsets` and `query_bvh_box` are genuinely BVH-only — a
+  hash grid has no box query — so naming the structure there is informative rather than redundant.
+  And where the *pairings are different algorithms over different inputs* rather than one algorithm
+  with a tuning knob, the name should keep carrying the type: `metrics.chamfer_*` / `hausdorff_*`
+  were considered for the same treatment and declined.
 - **When a comment and the body disagree, decide which one is load-bearing before "fixing" it — the
   usual answer is the comment.** `tangent_space.any_perpendicular`'s comment claims it crosses with
   *"whichever coordinate axis the normal is least aligned with"* while the body compares only
@@ -1715,6 +1743,23 @@ survive the next upgrade unexamined, which is exactly the failure the check exis
   5. **Its docs entry** in `docs/gen_ref_pages.py` `SECTIONS`, plus every
      `[`name`][triwarp.old.path]` cross-reference — `mkdocs build --strict` is what finds the ones
      you missed.
+- **Renaming a *keyword argument* has its own artifact list, and a call-site scan sees none of it.**
+  Three sites survived a paren-aware rewrite of all 33 `neighbors` query calls in the 2026-08 pass,
+  each invisible for a different reason, and each was caught by a *runtime* check rather than a
+  static one:
+    1. **A `TypedDict` field feeding a `**splat`.** `registration._TargetIndex` declared `bvh:
+       wp.Bvh` and the call site read `query_nearest(..., **target_index)` — the keyword's name is
+       nowhere near the call. Eight tests failed with `TypeError: unexpected keyword argument
+       'bvh'`. Grep the *old keyword name on its own*, not just at call sites.
+    2. **A rename that ran after the function rename.** A bulk pass had already turned
+       `query_hashgrid_ball_count` into `query_ball_count`, so the later keyword pass no longer
+       matched it and left `grid=` behind. Sweep for "merged name still carrying the old keyword"
+       as a separate, final pass — ordering two mechanical passes wrong silently skips their
+       intersection.
+    3. **A fenced ```python docstring example.** Check 14 is what found it, which is the second
+       time that check has paid for itself; `ast.parse` and every grep were clean.
+  The general rule: after any mechanical rename, re-derive the *residual* set from the new names
+  rather than trusting that the pass which produced them was complete.
 
 ---
 

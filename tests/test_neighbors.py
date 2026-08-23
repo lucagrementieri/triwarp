@@ -10,6 +10,7 @@ import heapq
 import math
 from collections import deque
 from collections.abc import Callable
+from functools import partial
 from typing import Literal
 
 import igl
@@ -42,9 +43,7 @@ def test_query_ball_single(device: str, backend: Literal["bvh", "hashgrid"]):
 
     points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
     query_wp = wp.vec3(query[0], query[1], query[2])
-    query_ball = (
-        tw.neighbors.query_bvh_ball if backend == "bvh" else tw.neighbors.query_hashgrid_ball
-    )
+    query_ball = partial(tw.neighbors.query_ball, backend=backend)
 
     query_indices_wp, query_distances_wp = query_ball(
         points_wp, query_wp, radius, return_sorted=True
@@ -76,9 +75,7 @@ def test_query_ball_empty_ball(device: str, backend: Literal["bvh", "hashgrid"])
 
     points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
     query_wp = wp.vec3(query[0], query[1], query[2])
-    query_ball = (
-        tw.neighbors.query_bvh_ball if backend == "bvh" else tw.neighbors.query_hashgrid_ball
-    )
+    query_ball = partial(tw.neighbors.query_ball, backend=backend)
 
     query_indices_wp, query_distances_wp = query_ball(
         points_wp, query_wp, radius, return_sorted=True
@@ -88,8 +85,8 @@ def test_query_ball_empty_ball(device: str, backend: Literal["bvh", "hashgrid"])
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
-@pytest.mark.parity("query_bvh_ball", "scipy")
-@pytest.mark.parity("query_hashgrid_ball", "scipy")
+@pytest.mark.parity("query_ball_bvh", "scipy")
+@pytest.mark.parity("query_ball_hashgrid", "scipy")
 def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
     """
     Class B: per-query neighbour lists against ``KDTree.query_ball_point``, sorted by distance.
@@ -122,9 +119,7 @@ def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
 
     points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
     query_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
-    query_ball = (
-        tw.neighbors.query_bvh_ball if backend == "bvh" else tw.neighbors.query_hashgrid_ball
-    )
+    query_ball = partial(tw.neighbors.query_ball, backend=backend)
 
     query_indices_wp, query_distances_wp = query_ball(
         points_wp, query_wp, radius, return_sorted=True
@@ -181,16 +176,8 @@ def test_query_ball_count_matches_scipy_and_the_list_form(
 
     points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
     queries_wp = wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device)
-    query_ball_count = (
-        tw.neighbors.query_bvh_ball_count
-        if backend == "bvh"
-        else tw.neighbors.query_hashgrid_ball_count
-    )
-    query_ball_with_offsets = (
-        tw.neighbors.query_bvh_ball_with_offsets
-        if backend == "bvh"
-        else tw.neighbors.query_hashgrid_ball_with_offsets
-    )
+    query_ball_count = partial(tw.neighbors.query_ball_count, backend=backend)
+    query_ball_with_offsets = partial(tw.neighbors.query_ball_with_offsets, backend=backend)
 
     counts_wp = query_ball_count(points_wp, queries_wp, radius)
     counts_np = np.array(
@@ -483,9 +470,7 @@ def test_query_ball_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     query_wp = wp.vec3(points[0][0], points[0][1], points[0][2])
     queries_wp = wp.array(np.ascontiguousarray(points[-3:]), dtype=wp.vec3, device=device)
     radius = 0.5
-    query_ball = (
-        tw.neighbors.query_bvh_ball if backend == "bvh" else tw.neighbors.query_hashgrid_ball
-    )
+    query_ball = partial(tw.neighbors.query_ball, backend=backend)
 
     indices, distances = query_ball(empty_points_wp, query_wp, radius)
     assert indices.shape == (0,)
@@ -550,8 +535,8 @@ def test_knn_initial_radius_degenerate_clouds(device: str):
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 3, 40])
 @pytest.mark.parametrize("max_radius", [math.inf, 0.5, 1.0])
-@pytest.mark.parity("query_bvh_nearest_k1", "scipy")
-@pytest.mark.parity("query_hashgrid_nearest_k1", "scipy")
+@pytest.mark.parity("query_nearest_bvh_k1", "scipy")
+@pytest.mark.parity("query_nearest_hashgrid_k1", "scipy")
 @pytest.mark.parity("bvh_from_points", "scipy")
 @pytest.mark.parity("hashgrid_from_points", "scipy")
 def test_query_nearest_single(
@@ -577,9 +562,7 @@ def test_query_nearest_single(
     query_indices_np[query_indices_np == len(points)] = -1
     query_distances_np = np.atleast_1d(np.asarray(query_distances_np))
 
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     query_indices_wp, query_distances_wp = query_nearest(
         points_wp, query_wp, k=k, max_radius=max_radius
     )
@@ -591,8 +574,8 @@ def test_query_nearest_single(
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 3, 10])
 @pytest.mark.parametrize("max_radius", [math.inf, 0.5, 1.0])
-@pytest.mark.parity("query_bvh_nearest_k7", "scipy")
-@pytest.mark.parity("query_hashgrid_nearest_k7", "scipy")
+@pytest.mark.parity("query_nearest_bvh_k7", "scipy")
+@pytest.mark.parity("query_nearest_hashgrid_k7", "scipy")
 def test_query_nearest_batch(
     device: str, backend: Literal["bvh", "hashgrid"], k: int, max_radius: float
 ):
@@ -617,9 +600,7 @@ def test_query_nearest_batch(
     query_indices_np[query_indices_np == len(points)] = -1
     query_distances_np = np.asarray(query_distances_np)
 
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     query_indices_wp, query_distances_wp = query_nearest(
         points_wp, query_wp, k=k, max_radius=max_radius
     )
@@ -630,9 +611,9 @@ def test_query_nearest_batch(
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 4, 8, 9, 16, 17, 32, 33, 64, 65])
-@pytest.mark.parity("query_bvh_nearest_k7", "scipy")
-@pytest.mark.parity("query_hashgrid_nearest_k7", "scipy")
-@pytest.mark.parity("query_bvh_nearest_k64", "scipy")
+@pytest.mark.parity("query_nearest_bvh_k7", "scipy")
+@pytest.mark.parity("query_nearest_hashgrid_k7", "scipy")
+@pytest.mark.parity("query_nearest_bvh_k64", "scipy")
 def test_query_nearest_row_buckets(device: str, backend: Literal["bvh", "hashgrid"], k: int):
     """
     Class A. Every candidate-row bucket size and one ``k`` past each, against ``KDTree``.
@@ -653,9 +634,7 @@ def test_query_nearest_row_buckets(device: str, backend: Literal["bvh", "hashgri
 
     points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
     queries_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     query_indices_wp, query_distances_wp = query_nearest(points_wp, queries_wp, k=k)
     query_distances_np, query_indices_np = KDTree(points).query(queries, k=k)
 
@@ -665,11 +644,11 @@ def test_query_nearest_row_buckets(device: str, backend: Literal["bvh", "hashgri
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 7, 64])
-@pytest.mark.parity("query_bvh_nearest_k1", "igl")
-@pytest.mark.parity("query_bvh_nearest_k7", "igl")
-@pytest.mark.parity("query_bvh_nearest_k64", "igl")
-@pytest.mark.parity("query_hashgrid_nearest_k1", "igl")
-@pytest.mark.parity("query_hashgrid_nearest_k7", "igl")
+@pytest.mark.parity("query_nearest_bvh_k1", "igl")
+@pytest.mark.parity("query_nearest_bvh_k7", "igl")
+@pytest.mark.parity("query_nearest_bvh_k64", "igl")
+@pytest.mark.parity("query_nearest_hashgrid_k1", "igl")
+@pytest.mark.parity("query_nearest_hashgrid_k7", "igl")
 @pytest.mark.parity("bvh_from_points", "igl")
 @pytest.mark.parity("hashgrid_from_points", "igl")
 def test_query_nearest_matches_igl(device: str, backend: Literal["bvh", "hashgrid"], k: int):
@@ -703,9 +682,7 @@ def test_query_nearest_matches_igl(device: str, backend: Literal["bvh", "hashgri
     queries_wp = wp.array(
         np.ascontiguousarray(queries, dtype=np.float32), dtype=wp.vec3, device=device
     )
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     query_indices_wp, _distances_wp = query_nearest(points_wp, queries_wp, k=k)
     query_indices_igl = igl.knn(queries, points, k, *igl.octree(points)[:4])
 
@@ -714,11 +691,11 @@ def test_query_nearest_matches_igl(device: str, backend: Literal["bvh", "hashgri
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 7, 64])
-@pytest.mark.parity("query_bvh_nearest_k1", "open3d")
-@pytest.mark.parity("query_bvh_nearest_k7", "open3d")
-@pytest.mark.parity("query_bvh_nearest_k64", "open3d")
-@pytest.mark.parity("query_hashgrid_nearest_k1", "open3d")
-@pytest.mark.parity("query_hashgrid_nearest_k7", "open3d")
+@pytest.mark.parity("query_nearest_bvh_k1", "open3d")
+@pytest.mark.parity("query_nearest_bvh_k7", "open3d")
+@pytest.mark.parity("query_nearest_bvh_k64", "open3d")
+@pytest.mark.parity("query_nearest_hashgrid_k1", "open3d")
+@pytest.mark.parity("query_nearest_hashgrid_k7", "open3d")
 def test_query_nearest_matches_open3d(
     device: str, backend: Literal["bvh", "hashgrid"], k: int
 ) -> None:
@@ -745,9 +722,7 @@ def test_query_nearest_matches_open3d(
     queries_wp = wp.array(
         np.ascontiguousarray(queries, dtype=np.float32), dtype=wp.vec3, device=device
     )
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     query_indices_wp, query_distances_wp = query_nearest(points_wp, queries_wp, k=k)
 
     nns_o3d = o3d.core.nns.NearestNeighborSearch(o3d.core.Tensor(points))
@@ -766,8 +741,8 @@ def test_query_nearest_matches_open3d(
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
-@pytest.mark.parity("query_bvh_ball", "open3d")
-@pytest.mark.parity("query_hashgrid_ball", "open3d")
+@pytest.mark.parity("query_ball_bvh", "open3d")
+@pytest.mark.parity("query_ball_hashgrid", "open3d")
 def test_query_ball_matches_open3d(device: str, backend: Literal["bvh", "hashgrid"]) -> None:
     """
     Class A on the neighbour sets: ``fixed_radius_search`` against the ``*_with_offsets`` form.
@@ -789,11 +764,7 @@ def test_query_ball_matches_open3d(device: str, backend: Literal["bvh", "hashgri
     queries_wp = wp.array(
         np.ascontiguousarray(queries, dtype=np.float32), dtype=wp.vec3, device=device
     )
-    query_ball_with_offsets = (
-        tw.neighbors.query_bvh_ball_with_offsets
-        if backend == "bvh"
-        else tw.neighbors.query_hashgrid_ball_with_offsets
-    )
+    query_ball_with_offsets = partial(tw.neighbors.query_ball_with_offsets, backend=backend)
     neighbors_wp, _distances_wp, offsets_wp = query_ball_with_offsets(points_wp, queries_wp, radius)
 
     nns_o3d = o3d.core.nns.NearestNeighborSearch(o3d.core.Tensor(points))
@@ -831,7 +802,7 @@ def test_query_nearest_ties(device: str, backend: Literal["bvh", "hashgrid"], k:
     The ``k`` distances must match ``KDTree`` exactly and every returned index must actually sit at
     the distance reported for it; the *identity* of a tied neighbour is not compared, because both
     choices are correct answers — the same thing
-    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] tells callers.
+    [`query_nearest`][triwarp.neighbors.query_nearest] tells callers.
     """
     axis = np.arange(12, dtype=np.float32)
     lattice = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
@@ -842,9 +813,7 @@ def test_query_nearest_ties(device: str, backend: Literal["bvh", "hashgrid"], k:
 
     points_wp = wp.array(np.ascontiguousarray(lattice), dtype=wp.vec3, device=device)
     queries_wp = wp.array(queries, dtype=wp.vec3, device=device)
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     query_indices_wp, query_distances_wp = query_nearest(points_wp, queries_wp, k=k)
     # ``k == 1`` returns length-m 1D arrays on both sides; reshape so one comparison covers all k.
     rows = (queries.shape[0], k)
@@ -874,9 +843,7 @@ def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     query_wp = wp.vec3(points[0][0], points[0][1], points[0][2])
     queries_wp = wp.array(np.ascontiguousarray(points[-3:]), dtype=wp.vec3, device=device)
     k = 2
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
 
     indices, distances = query_nearest(empty_points_wp, query_wp, k=k)
     assert np.array_equal(indices.numpy(), -np.ones(k))
@@ -910,9 +877,7 @@ def test_query_nearest_initial_radius_invariance(
 
     points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
     queries_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
 
     reference_indices_wp, reference_distances_wp = query_nearest(points_wp, queries_wp, k=k)
     for initial_radius in (math.inf, 1e-6 * diagonal, 0.0):
@@ -944,9 +909,7 @@ def test_query_nearest_clustered(device: str, backend: Literal["bvh", "hashgrid"
 
     points_wp = wp.array(points, dtype=wp.vec3, device=device)
     queries_wp = wp.array(queries, dtype=wp.vec3, device=device)
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
 
     for k in (1, 5):
         indices_wp, distances_wp = query_nearest(points_wp, queries_wp, k=k)
@@ -965,9 +928,7 @@ def test_query_nearest_degenerate_clouds(device: str, backend: Literal["bvh", "h
     planar_np = rng.random((60, 3), dtype=np.float32)
     planar_np[:, 2] = 0.75
 
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     for points in (coincident_np, collinear_np, planar_np):
         # Queries on the cloud and far outside it (the latter has an unbounded complete radius).
         queries = np.ascontiguousarray(np.vstack((points[:5], points[:5] + 40.0)), dtype=np.float32)
@@ -994,17 +955,20 @@ def test_query_nearest_prebuilt_index(device: str, backend: Literal["bvh", "hash
 
     k = 4
     initial_radius = tw.neighbors.knn_initial_radius(points_wp, k)
-    if backend == "bvh":
-        query_nearest = tw.neighbors.query_bvh_nearest
-        index = {"bvh": tw.neighbors.bvh_from_points(points_wp)}
-    else:
-        query_nearest = tw.neighbors.query_hashgrid_nearest
-        index = {"grid": tw.neighbors.hashgrid_from_points(points_wp, initial_radius)}
-
-    indices_wp, distances_wp = query_nearest(
-        points_wp, queries_wp, k=k, initial_radius=initial_radius, **index
+    accelerator = (
+        tw.neighbors.bvh_from_points(points_wp)
+        if backend == "bvh"
+        else tw.neighbors.hashgrid_from_points(points_wp, initial_radius)
     )
-    built_indices_wp, built_distances_wp = query_nearest(points_wp, queries_wp, k=k)
+
+    # No ``backend=`` on this call: the prebuilt structure selects it by its own type, which is the
+    # merged API's dispatch rule.
+    indices_wp, distances_wp = tw.neighbors.query_nearest(
+        points_wp, queries_wp, k=k, initial_radius=initial_radius, accelerator=accelerator
+    )
+    built_indices_wp, built_distances_wp = tw.neighbors.query_nearest(
+        points_wp, queries_wp, k=k, backend=backend
+    )
     assert np.array_equal(indices_wp.numpy(), built_indices_wp.numpy())
     assert np.array_equal(distances_wp.numpy(), built_distances_wp.numpy())
 
@@ -1014,11 +978,74 @@ def test_query_nearest_rejects_negative_initial_radius(
     device: str, backend: Literal["bvh", "hashgrid"]
 ):
     points_wp = wp.array(np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3, device=device)
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     with pytest.raises(ValueError, match="initial_radius"):
         query_nearest(points_wp, points_wp, k=1, initial_radius=-1.0)
+
+
+def test_backend_and_accelerator_must_agree(device: str) -> None:
+    """
+    Not a library comparison: the one new failure mode the merged query API introduced.
+
+    ``backend`` and ``accelerator`` can disagree, and the answer is to be loud rather than to
+    silently prefer one -- a caller who passes a ``wp.Bvh`` and writes ``backend="hashgrid"`` has a
+    bug, not a preference. Checked on all four entry points, since each resolves the pair itself.
+
+    The two positive branches matter as much as the raise: a prebuilt structure alone must be
+    accepted (it selects the backend by its type), and a matching pair must be accepted too, or the
+    guard would be rejecting correct calls.
+    """
+    points_wp = wp.array(
+        np.ascontiguousarray(np.random.default_rng(0).random((32, 3)), dtype=np.float32),
+        dtype=wp.vec3,
+        device=device,
+    )
+    bvh = tw.neighbors.bvh_from_points(points_wp)
+    grid = tw.neighbors.hashgrid_from_points(points_wp, 0.25)
+
+    for query, extra in (
+        (tw.neighbors.query_ball, {"r": 0.25}),
+        (tw.neighbors.query_ball_count, {"r": 0.25}),
+        (tw.neighbors.query_ball_with_offsets, {"r": 0.25}),
+        (tw.neighbors.query_nearest, {"k": 2}),
+    ):
+        with pytest.raises(ValueError, match="contradicts the accelerator"):
+            query(points_wp, points_wp, accelerator=bvh, backend="hashgrid", **extra)
+        with pytest.raises(ValueError, match="contradicts the accelerator"):
+            query(points_wp, points_wp, accelerator=grid, backend="bvh", **extra)
+        with pytest.raises(ValueError, match='backend must be "hashgrid" or "bvh"'):
+            query(points_wp, points_wp, backend="kdtree", **extra)  # pyright: ignore[reportArgumentType]
+
+        # An accelerator on its own, and a matching pair, are both fine.
+        query(points_wp, points_wp, accelerator=bvh, **extra)
+        query(points_wp, points_wp, accelerator=grid, backend="hashgrid", **extra)
+
+
+def test_the_two_backends_agree(device: str) -> None:
+    """
+    Triwarp against triwarp: the two backends are one function, so they must answer identically.
+
+    Not a parity assert -- scipy carries the oracle for both, in the class-A tests above. This pins
+    the claim the merge rests on: ``backend`` is a *cost* choice, so a divergence here would mean
+    the keyword changed the answer and the shared ``query_ball_count`` group name is a lie.
+    """
+    rng = np.random.default_rng(7)
+    points_wp = wp.array(
+        np.ascontiguousarray(rng.random((400, 3)), dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    queries_wp = wp.array(
+        np.ascontiguousarray(rng.random((60, 3)), dtype=np.float32), dtype=wp.vec3, device=device
+    )
+
+    counts_bvh = tw.neighbors.query_ball_count(points_wp, queries_wp, 0.3, backend="bvh")
+    counts_grid = tw.neighbors.query_ball_count(points_wp, queries_wp, 0.3, backend="hashgrid")
+    assert int(counts_bvh.numpy().sum()) > 0  # non-vacuity: the radius finds neighbours
+    assert np.array_equal(counts_bvh.numpy(), counts_grid.numpy())
+
+    idx_bvh, dist_bvh = tw.neighbors.query_nearest(points_wp, queries_wp, k=5, backend="bvh")
+    idx_grid, dist_grid = tw.neighbors.query_nearest(points_wp, queries_wp, k=5, backend="hashgrid")
+    assert np.array_equal(idx_bvh.numpy(), idx_grid.numpy())
+    assert np.allclose(dist_bvh.numpy(), dist_grid.numpy(), rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parity(
@@ -1081,7 +1108,7 @@ def test_query_weighted_nearest_conventions(device: str) -> None:
     Not a library comparison: the ``w = 0`` identity, negative distances, and the two empty inputs.
 
     Two claims that make the function's contract legible. At zero weights it *is*
-    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] -- pinned as a
+    [`query_nearest`][triwarp.neighbors.query_nearest] -- pinned as a
     triwarp-against-triwarp check, where the oracle lives on the unweighted side (scipy, in the k-NN
     tests above). And a query inside a site's radius reports a **negative** weighted distance, which
     is the sign a caller reads to mean "covered".
@@ -1094,7 +1121,9 @@ def test_query_weighted_nearest_conventions(device: str) -> None:
 
     zero_wp = wp.zeros(300, dtype=wp.float32, device=device)
     index_wp, distance_wp = tw.neighbors.query_weighted_nearest(points_wp, zero_wp, queries_wp)
-    plain_index_wp, plain_distance_wp = tw.neighbors.query_bvh_nearest(points_wp, queries_wp, k=1)
+    plain_index_wp, plain_distance_wp = tw.neighbors.query_nearest(
+        points_wp, queries_wp, k=1, backend="bvh"
+    )
     assert np.array_equal(index_wp.numpy(), plain_index_wp.numpy())
     assert np.allclose(distance_wp.numpy(), plain_distance_wp.numpy(), rtol=1e-6, atol=1e-6)
 
@@ -1382,13 +1411,13 @@ def test_geodesic_ball_neighborhoods_overflow_warns() -> None:
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parity(
-    "query_bvh_ball",
+    "query_ball_bvh",
     "meshlib",
     benchmarked=False,
     reason="findPointsInBall reports each neighbour through a Python callback, so a benchmark row "
     "would time 20 000 queries' worth of callback dispatch rather than MeshLib's traversal -- the "
     "same reason section 6 bars a per-vertex Python loop from a benchmark row. There is no batched "
-    "radius form: PointsProjector answers k=1 only (and does carry the query_bvh_nearest_k1 row), "
+    "radius form: PointsProjector answers k=1 only (and does carry the query_nearest_bvh_k1 row), "
     "and findNClosestPointsPerPoint takes a neighbour count rather than a radius. scipy and open3d "
     "carry the timed rows for this group.",
 )
@@ -1421,9 +1450,7 @@ def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgr
     queries_wp = wp.array(
         np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec3, device=device
     )
-    query_ball = (
-        tw.neighbors.query_bvh_ball if backend == "bvh" else tw.neighbors.query_hashgrid_ball
-    )
+    query_ball = partial(tw.neighbors.query_ball, backend=backend)
     neighbours_wp, distances_wp = query_ball(points_wp, queries_wp, radius)
 
     cloud_ml = points_to_meshlib(points_np)
@@ -1475,24 +1502,24 @@ def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgr
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 7])
-@pytest.mark.parity("query_bvh_nearest_k1", "meshlib")
-@pytest.mark.parity("query_hashgrid_nearest_k1", "meshlib")
+@pytest.mark.parity("query_nearest_bvh_k1", "meshlib")
+@pytest.mark.parity("query_nearest_hashgrid_k1", "meshlib")
 @pytest.mark.parity(
-    "query_bvh_nearest_k7",
+    "query_nearest_bvh_k7",
     "meshlib",
     benchmarked=False,
     reason="findNClosestPointsPerPoint takes no query set -- it answers the cloud against itself, "
     "so at the benchmark's 20 000 displaced queries against 35 947 vertices it would be timing a "
     "different amount of work than every other row in the group. MeshLib's only batched form that "
     "accepts a query cloud is PointsProjector, which is k=1 and carries the "
-    "query_bvh_nearest_k1 row; findFewClosestPoints is per query and would time a Python loop. "
+    "query_nearest_bvh_k1 row; findFewClosestPoints is per query and would time a Python loop. "
     "scipy, igl and open3d carry the timed rows at k=7 and k=64.",
 )
 @pytest.mark.parity(
-    "query_hashgrid_nearest_k7",
+    "query_nearest_hashgrid_k7",
     "meshlib",
     benchmarked=False,
-    reason="the same k=1-only limitation the query_bvh_nearest_k7 declaration above records, and "
+    reason="the same k=1-only limitation the query_nearest_bvh_k7 declaration above records, and "
     "for the same reason: PointsProjector is meshlib's only batched query-cloud form and it "
     "answers one neighbour. The hash-grid group therefore times scipy, igl and open3d at k=7, "
     "exactly as its BVH sibling does, while this test still compares both backends here.",
@@ -1527,9 +1554,7 @@ def test_query_nearest_matches_meshlib(
     points_wp = wp.array(
         np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=device
     )
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
+    query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
 
     neighbours_ml = np.array(
         [
@@ -1549,7 +1574,7 @@ def test_query_nearest_matches_meshlib(
     if k != 1:
         return
     # The other batched form, and the only one that accepts a *query* cloud: exact at k=1, indices
-    # and distances alike, which is what the query_bvh_nearest_k1 benchmark row times. The cloud
+    # and distances alike, which is what the query_nearest_bvh_k1 benchmark row times. The cloud
     # must be held in a name -- ``setPointCloud`` stores a raw pointer, so a temporary segfaults
     # rather than raising, the same trap ``PointsToMeshProjector`` carries in test_proximity.py.
     queries_np = rng.random((40, 3)) * 5.0

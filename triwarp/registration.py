@@ -205,9 +205,9 @@ _ROBUST_KINDS: dict[str, int] = {"none": 0, "huber": 1, "tukey": 2}
 
 
 class _TargetIndex(TypedDict):
-    """Everything [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] can be told once."""
+    """Everything [`query_nearest`][triwarp.neighbors.query_nearest] can be told once."""
 
-    bvh: wp.Bvh
+    accelerator: wp.Bvh
     initial_radius: float
     bounds: tuple[wp.vec3, wp.vec3]
 
@@ -239,7 +239,7 @@ def icp(
     Warp port combining [`trimesh.registration.icp`][] and
     ``pytorch3d.ops.iterative_closest_point``. Correspondence search runs on the
     GPU via [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
-    (mesh target) or [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
+    (mesh target) or [`query_nearest`][triwarp.neighbors.query_nearest]
     (point-cloud target); the alignment is the GPU tiled SVD of
     [`procrustes`][triwarp.registration.procrustes].
 
@@ -670,7 +670,9 @@ def _correspondences(
         return distance_mesh, triangle_id_mesh
 
     assert target_index is not None
-    index, distance = tw.neighbors.query_bvh_nearest(target_vertices, current, 1, **target_index)
+    index, distance = tw.neighbors.query_nearest(
+        target_vertices, current, 1, **target_index
+    )
     # Not ``tw.array.gather``: ``closest`` is allocated once outside the ICP loop, and a gather
     # would add one allocation per iteration.
     wp.copy(closest, target_vertices[index])
@@ -777,7 +779,7 @@ def _target_index(target_vertices: wp.array[wp.vec3]) -> _TargetIndex:
     """
     bounds = tw.bounds.aabb(target_vertices)
     return {
-        "bvh": tw.neighbors.bvh_from_points(target_vertices),
+        "accelerator": tw.neighbors.bvh_from_points(target_vertices),
         "initial_radius": tw.neighbors.knn_initial_radius(target_vertices, 1, bounds=bounds),
         "bounds": bounds,
     }
