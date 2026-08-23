@@ -76,10 +76,10 @@ import numpy as np
 import pytest
 import warp as wp
 import warp.sparse as wps
-from conftest import BenchCase
 
 import triwarp as tw
 import triwarp.typing as twt
+from conftest import BenchCase
 
 # Fraction of vertices pinned as Dirichlet boundary conditions.
 _FIXED_FRACTIONS = [0.01, 0.5]

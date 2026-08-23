@@ -39,10 +39,10 @@ import igl
 import numpy as np
 import pytest
 import trimesh as tm
-from conftest import BenchCase, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 
 @pytest.mark.benchmark(group="surface_centroid")

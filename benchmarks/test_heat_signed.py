@@ -45,9 +45,9 @@ import numpy as np
 import potpourri3d as pp3d
 import pytest
 import warp as wp
-from conftest import BenchCase
 
 import triwarp as tw
+from conftest import BenchCase
 
 # Three float64 solves per case on triwarp's side; two factorizations on the reference's.
 _ROUNDS = 3

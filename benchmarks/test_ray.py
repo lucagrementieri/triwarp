@@ -50,10 +50,10 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 import warp as wp
-from conftest import BenchCase
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase
 
 # Ray count. Fixed rather than swept: the crossing axis is the interesting one and a query-count
 # sweep here would measure the same launch scaling ``test_proximity.py`` already sweeps.

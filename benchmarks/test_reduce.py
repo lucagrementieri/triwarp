@@ -119,10 +119,10 @@ import numpy as np
 import pymeshlab as ml
 import pytest
 import warp as wp
-from conftest import BenchCase
 
 import triwarp as tw
 import triwarp.typing as twt
+from conftest import BenchCase
 
 _scalar_cache: dict[tuple[str, str], wp.array[wp.float32]] = {}
 _rows_cache: dict[tuple[str, str], twt.Array2dFloat32] = {}

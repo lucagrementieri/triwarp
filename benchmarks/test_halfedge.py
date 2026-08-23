@@ -58,9 +58,9 @@ comparable.
 from __future__ import annotations
 
 import pytest
-from conftest import BenchCase
 
 import triwarp as tw
+from conftest import BenchCase
 
 
 @pytest.mark.benchmark(group="halfedge_twins")

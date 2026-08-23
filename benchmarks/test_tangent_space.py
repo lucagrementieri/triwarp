@@ -41,9 +41,9 @@ import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
-from conftest import BenchCase
 
 import triwarp as tw
+from conftest import BenchCase
 
 # Constructing potpourri3d's vector-heat solver factors two sparse systems; it runs into hundreds of
 # milliseconds on the larger meshes, so fewer rounds.

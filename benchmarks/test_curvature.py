@@ -113,10 +113,10 @@ import igl
 import numpy as np
 import pytest
 import trimesh as tm
-from conftest import BenchCase
 
 import triwarp as tw
 import triwarp.typing as twt
+from conftest import BenchCase
 
 # Sphere radius of the quadric fit, as a multiple of the average edge length. libigl defaults to 5;
 # the pair brackets it so the quadratic growth in neighborhood size is visible.

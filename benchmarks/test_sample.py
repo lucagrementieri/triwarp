@@ -65,10 +65,10 @@ import numpy as np
 import pymeshlab as ml
 import pytest
 import trimesh as tm
-from conftest import BenchCase, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 _TARGET_SAMPLES = 2_000
 _SEED = 11

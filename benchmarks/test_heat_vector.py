@@ -53,9 +53,9 @@ import numpy as np
 import potpourri3d as pp3d
 import pytest
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 # Every case is at least two float64 CG solves; the reference also factors two sparse systems.
 _ROUNDS = 3

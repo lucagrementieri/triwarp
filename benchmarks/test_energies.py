@@ -23,9 +23,9 @@ from __future__ import annotations
 import igl
 import pytest
 import warp as wp
-from conftest import BenchCase
 
 import triwarp as tw
+from conftest import BenchCase
 
 _operator_inputs_np_cache: dict[str, tuple] = {}
 _operator_inputs_wp_cache: dict[tuple[str, str], tuple] = {}

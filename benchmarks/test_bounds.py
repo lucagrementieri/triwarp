@@ -61,10 +61,10 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase
 
 # Candidate orientations scored by every ``oriented_bounding_box`` row, triwarp's and igl's alike.
 # Fixed and shared: the two libraries search the identical candidate set, so a row that let them

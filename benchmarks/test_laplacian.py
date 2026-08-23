@@ -68,10 +68,10 @@ import pytest
 import trimesh as tm
 import trimesh.smoothing as tms
 import warp as wp
-from conftest import BenchCase
 
 import triwarp as tw
 import triwarp.typing as twt
+from conftest import BenchCase
 
 _edge_lengths_np_cache: dict[str, np.ndarray] = {}
 _edge_lengths_wp_cache: dict[tuple[str, str], twt.Array2dFloat32] = {}

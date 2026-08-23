@@ -60,10 +60,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
 import triwarp.typing as twt
+from conftest import BenchCase, skip_larger_than
 
 # Texture sizes: 4x the pixels between the two points, so the rasterizers' quadratic term and the
 # remappers' independence from resolution both read directly off the pair.

@@ -111,10 +111,10 @@ import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
 
 # MeshLib expresses several gates as *absolute* lengths whose defaults assume a unit-scale mesh
 # (``SubdivideSettings.maxDeviationAfterFlip`` is 1.0). Passing this instead disables the gate

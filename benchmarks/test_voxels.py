@@ -60,10 +60,10 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, BenchLibrary, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, BenchLibrary, skip_larger_than
 
 # Cell widths as a fraction of the bounding-box diagonal. The pair is a slope check: 1/256 is 64x
 # the cells of 1/64, and the whole point of the flattened (triangle, cell) work-item design is that

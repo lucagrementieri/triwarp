@@ -46,11 +46,11 @@ import numpy as np
 import pymeshlab as ml
 import pytest
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
+from conftest import BenchCase, skip_larger_than
 
 # Crease threshold in degrees. 30 is MeshLab's own documentation default for a "hard" edge and picks
 # out a real feature set on every scan mesh rather than everything or nothing.

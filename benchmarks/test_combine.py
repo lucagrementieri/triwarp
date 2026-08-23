@@ -57,10 +57,10 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, mesh_ml_from_numpy
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, mesh_ml_from_numpy
 
 # Copies for the concatenate sweep: the function still issues one packing copy per input buffer, so
 # the input *count* is the driver and the total face count is held roughly fixed between the points.

@@ -22,9 +22,9 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 # Fraction of the rows that are distinct: everything unique, against a tenth as many distinct
 # values repeated ten times. The input length is identical, so only the collision density moves.
