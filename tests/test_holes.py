@@ -2562,3 +2562,173 @@ def test_bridge_edges_smooth_matches_meshlib(hemisphere: tuple[tm.Trimesh, wp.Me
         )
         > 3.0 * agreement
     )
+
+
+# ---------------------------------------------------------------------------
+# join_closest_components
+# ---------------------------------------------------------------------------
+
+
+def _open_shells_tm(hemisphere: tuple[tm.Trimesh, wp.Mesh], count: int, gap: float = 3.0):
+    """``count`` copies of the hemisphere fixture in a row, each ``gap`` apart along ``x``."""
+    mesh_tm, _mesh_wp = hemisphere
+    shells_tm = []
+    for index in range(count):
+        shell_tm = mesh_tm.copy()
+        shell_tm.apply_translation([gap * index, 0.0, 0.0])
+        shells_tm.append(shell_tm)
+    return tm.util.concatenate(shells_tm)
+
+
+@pytest.mark.parity(
+    "join_closest_components",
+    "pymeshfix",
+    benchmarked=False,
+    reason="0.29 ms on three shells, which is below the harness floor, and its cost driver is the "
+    "component count -- the axis the remove_small_components group already sweeps. A pymeshfix row "
+    "would price its 67.9 ms load besides. Folding it into a group would measure the labelling "
+    "twice under two names.",
+)
+@pytest.mark.parametrize("count", [2, 3, 5])
+def test_join_closest_components_matches_pymeshfix(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh], device: str, count: int
+) -> None:
+    """
+    Class B: the same joins, compared through the counts because the chosen seam is not shared.
+
+    ``join_closest_components`` picks the globally closest pair of boundary *vertices* and bridges
+    an oriented edge at each; MeshFix picks a vertex pair too but bridges its own choice of incident
+    edge, so the two patches need not be the same two triangles even when the same shells were
+    joined. What is comparable, and asserted: the face count, the boundary loop count, the component
+    count, and that no vertex was added. Measured on three shells, both sides go from
+    291 v / 504 f / 3 loops to **291 v / 508 f / 1 loop / 1 component**.
+
+    The transform is the counts, and the identity ``2 * (count - 1)`` faces added is what makes them
+    an oracle for *how many* joins happened rather than merely that something did: each bridge is
+    one quadrilateral split along a diagonal, so a filler that fanned a whole rim or added a vertex
+    would fail on the count before anything else.
+
+    The merged rim is left **open** on purpose -- one loop out, not zero -- because closing it is
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]'s job, and asserting that is what pins the
+    division of labour between the two.
+    """
+    mesh_tm = _open_shells_tm(hemisphere, count)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    n_faces = int(faces_wp.shape[0]) // 3
+    assert len(tw.boundary.boundary_loops(vertices_wp, faces_wp)) == count
+
+    joined_wp = tw.holes.join_closest_components(vertices_wp, faces_wp)
+    joined_tm = warp_to_trimesh(vertices_wp, joined_wp)
+
+    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    assert tin_pmf.n_boundaries == count  # the loader left the shells alone
+    tin_pmf.join_closest_components()
+    vertices_pmf, faces_pmf = pymeshfix_to_numpy(tin_pmf)
+    joined_pmf = tm.Trimesh(vertices_pmf, faces_pmf, process=False)
+
+    assert faces_pmf.shape[0] == n_faces + 2 * (count - 1)  # the reference really joined
+    assert tin_pmf.n_boundaries == 1
+    assert int(joined_wp.shape[0]) // 3 == faces_pmf.shape[0]
+    assert vertices_pmf.shape[0] == mesh_tm.vertices.shape[0]
+    assert len(tw.boundary.boundary_loops(vertices_wp, joined_wp)) == 1
+    assert len(joined_tm.split(only_watertight=False)) == 1
+    assert len(joined_pmf.split(only_watertight=False)) == 1
+    assert tw.validation.is_edge_manifold(joined_wp)
+    # The prefix is the input face buffer: bridge triangles are appended, never interleaved.
+    assert np.array_equal(joined_wp.numpy()[: faces_wp.shape[0]], faces_wp.numpy())
+
+
+def test_join_closest_components_joins_the_nearest_pair(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """
+    Not a library comparison: *which* shells get joined, which the count identity cannot see.
+
+    Three shells in a row are an ambiguous test of the pairing -- every greedy order ends with one
+    component -- so this places the third shell far off the line, so that the only two-join sequence
+    a nearest-link rule can produce is (near pair first, distant shell second). With ``max_joins=1``
+    the answer is visible directly: exactly the two close shells become one component and the far
+    one is still on its own.
+    """
+    mesh_tm, _mesh_wp = hemisphere
+    near_tm = mesh_tm.copy()
+    near_tm.apply_translation([2.5, 0.0, 0.0])
+    far_tm = mesh_tm.copy()
+    far_tm.apply_translation([0.0, 40.0, 0.0])
+    combined_tm = tm.util.concatenate([mesh_tm, near_tm, far_tm])
+    vertices_wp, faces_wp = numpy_to_warp(combined_tm.vertices, combined_tm.faces, device)
+    n_faces = int(faces_wp.shape[0]) // 3
+
+    once_wp = tw.holes.join_closest_components(vertices_wp, faces_wp, max_joins=1)
+    components = warp_to_trimesh(vertices_wp, once_wp).split(only_watertight=False)
+
+    assert int(once_wp.shape[0]) // 3 == n_faces + 2
+    assert len(components) == 2
+    # The joined component is the two near shells; the untouched one is the far shell alone.
+    sizes = sorted(len(component.faces) for component in components)
+    assert sizes == [n_faces // 3, 2 * (n_faces // 3) + 2]
+    assert max(component.vertices[:, 1].max() for component in components) > 39.0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_joins"),
+    [
+        ({"max_distance": 0.1}, 0),
+        ({"max_distance": 10.0}, 2),
+        ({"max_joins": 1}, 1),
+        ({"max_joins": 0}, 0),
+    ],
+)
+def test_join_closest_components_respects_its_bounds(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+    device: str,
+    kwargs: dict[str, float | int],
+    expected_joins: int,
+) -> None:
+    """
+    Not a library comparison: ``max_distance`` and ``max_joins`` have no pymeshfix counterpart.
+
+    MeshFix joins unconditionally until the mesh is connected, which on a mesh holding genuinely
+    separate objects welds them; both bounds are triwarp's addition, and their defaults reproduce
+    the reference (see [`test_join_closest_components_matches_pymeshfix`]). The shells here are 3.0
+    apart, so a 0.1 bound admits nothing and a 10.0 bound admits everything -- straddling the gap
+    rather than testing one side of it.
+    """
+    mesh_tm = _open_shells_tm(hemisphere, 3)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    n_faces = int(faces_wp.shape[0]) // 3
+
+    joined_wp = tw.holes.join_closest_components(vertices_wp, faces_wp, **kwargs)  # type: ignore[arg-type]
+
+    assert int(joined_wp.shape[0]) // 3 == n_faces + 2 * expected_joins
+
+
+def test_join_closest_components_leaves_closed_and_single_meshes_alone(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], hemisphere: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """
+    Not a library comparison: the three inputs with nothing to join, each for a different reason.
+
+    Two *closed* shells have no boundary to bridge to, one open shell has no second component, and
+    a closed mesh has neither. All three come back as a copy of the input rather than raising or
+    welding something -- which is what makes the function safe to put at a fixed point in a
+    pipeline.
+    """
+    mesh_tm, _mesh_wp = icosahedron
+    second_tm = mesh_tm.copy()
+    second_tm.apply_translation([5.0, 0.0, 0.0])
+    for source_tm in (tm.util.concatenate([mesh_tm, second_tm]), _open_shells_tm(hemisphere, 1)):
+        vertices_wp, faces_wp = numpy_to_warp(source_tm.vertices, source_tm.faces, device)
+        joined_wp = tw.holes.join_closest_components(vertices_wp, faces_wp)
+        assert np.array_equal(joined_wp.numpy(), faces_wp.numpy())
+        assert joined_wp.ptr != faces_wp.ptr
+
+
+def test_join_closest_components_rejects_a_negative_max_joins(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """The documented ``ValueError``."""
+    mesh_tm = _open_shells_tm(hemisphere, 2)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    with pytest.raises(ValueError, match="max_joins"):
+        tw.holes.join_closest_components(vertices_wp, faces_wp, max_joins=-1)

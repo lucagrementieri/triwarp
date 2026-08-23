@@ -484,6 +484,9 @@ def remove_small_components(
     --------
     [`combine.split`][triwarp.combine.split]
         The whole decomposition, when every component is wanted rather than a subset.
+    [`holes.join_closest_components`][triwarp.holes.join_closest_components]
+        The other answer to a multi-component mesh -- weld the pieces together instead of
+        discarding them.
     [`adjacency.face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels]
         The labelling this thresholds.
     [`remove_non_manifold_faces`][triwarp.repair.remove_non_manifold_faces]

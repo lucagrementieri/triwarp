@@ -4,7 +4,7 @@ import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, INT32_MAX_CONSTANT
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels.array import update_argmin
+from triwarp.kernels.array import pack_nearest_key, update_argmin
 from triwarp.kernels.array import wrap_index as _wrap
 from triwarp.kernels.predicates import (
     circumcircle_diameter,
@@ -1031,3 +1031,42 @@ def directed_edge_opposites(
     for k in range(3):
         if corner[k] == u and corner[_wrap(k + 1, 3)] == v:
             out_opposites[q] = corner[_wrap(k + 2, 3)]
+
+
+@wp.kernel
+def reduce_closest_cross_label_pair(
+    vertices: wp.array[wp.vec3],
+    members: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    max_distance_sq: wp.float32,
+    out_best: wp.array[wp.int64],
+    out_partner: wp.array[wp.int32],
+) -> None:
+    # The globally closest pair of ``members`` carrying **different** labels, reduced into one
+    # ``int64`` by ``pack_nearest_key`` -- "smallest distance, lowest index on a tie", so the answer
+    # is deterministic whatever the thread order. Thread ``i`` finds its own nearest cross-label
+    # partner and records it in ``out_partner[i]``, so the winning *pair* is recoverable from the
+    # key (whose low half is the query index) plus one lookup.
+    #
+    # The scan is exhaustive: every thread walks the whole member list. That is ``O(B^2)`` for ``B``
+    # members and it is the deliberate choice, because the members here are *boundary* vertices of a
+    # mesh with more than one component -- a single-component mesh has no cross-label pair and the
+    # caller never launches this -- so ``B`` is split across the components that exist. Accelerating
+    # it means a structure per round and a label predicate inside the query; nothing has measured a
+    # need for that yet.
+    i = wp.int32(wp.tid())
+    n = members.shape[0]
+    position = vertices[members[i]]
+    label = labels[i]
+    best_sq = FLOAT32_INF_CONSTANT
+    best = wp.int32(-1)
+    for j in range(n):
+        if labels[j] == label:
+            continue
+        distance_sq = wp.length_sq(vertices[members[j]] - position)
+        if distance_sq < best_sq:
+            best_sq = distance_sq
+            best = j
+    out_partner[i] = best
+    if best >= 0 and best_sq <= max_distance_sq:
+        wp.atomic_min(out_best, 0, pack_nearest_key(wp.sqrt(best_sq), i))

@@ -247,6 +247,21 @@ def scatter_group_bounds(
 
 
 @wp.kernel
+def scatter_face_labels_to_vertices(
+    faces: wp.array[wp.int32], labels: wp.array[wp.int32], out_vertex_label: wp.array[wp.int32]
+) -> None:
+    # Carry a per-*face* label onto the vertices its faces reference. Launch over ``3 * n_faces``
+    # corners, with ``out_vertex_label`` seeded below every real label (``-1``); an unreferenced
+    # vertex keeps the seed.
+    #
+    # ``wp.atomic_max`` rather than a plain store, so that a vertex shared by two differently
+    # labelled faces -- a bowtie between two face-connected components -- takes the **larger** label
+    # deterministically instead of whichever thread landed last.
+    c = wp.int32(wp.tid())
+    wp.atomic_max(out_vertex_label, faces[c], labels[c // 3])
+
+
+@wp.kernel
 def mark_membership_mask(
     indices: wp.array[wp.int32], n: wp.int32, out_mask: wp.array[wp.bool]
 ) -> None:

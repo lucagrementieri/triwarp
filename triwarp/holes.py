@@ -53,6 +53,9 @@ printable solid. And [`bridge_edges`][triwarp.holes.bridge_edges] and
 join one boundary edge to another with a small patch or a curved strip, leaving the rest of both
 boundaries open, which is what joins two tubes at a chosen seam or adds a handle where the rim
 family would consume the whole loop.
+[`join_closest_components`][triwarp.holes.join_closest_components] is the driver over the first of
+those: it settles *which* edges to bridge, welding several open shells into one connected surface
+with one rim, for a filler to close afterwards.
 
 The return shape follows from that: a filler that only triangulates existing rim vertices returns
 ``faces`` alone, while one that inserts a vertex -- a cone's apex, a refined patch's interior, an
@@ -73,9 +76,11 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import boundary as kernel_boundary
 from triwarp.kernels import holes as kernel_holes
+from triwarp.kernels import scatter as kernel_scatter
 
 
 class _PackedLoops:
@@ -2236,6 +2241,8 @@ def bridge_edges(
     --------
     [`bridge_edges_smooth`][triwarp.holes.bridge_edges_smooth]
         The multi-segment form, which curves the patch and adds vertices.
+    [`join_closest_components`][triwarp.holes.join_closest_components]
+        The driver over this, when the pair to bridge is not the caller's to name.
     [`stitch_loops`][triwarp.holes.stitch_loops]
         Joins two rims completely, where this joins one edge of each.
     [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
@@ -2366,6 +2373,164 @@ def bridge_edges_smooth(
     )
     strip = wp.array(strip_np.reshape(-1), dtype=wp.int32, device=device)
     return bridged_vertices, tw.array.concatenate([faces, strip])
+
+
+def join_closest_components(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    max_distance: float | None = None,
+    max_joins: int | None = None,
+) -> wp.array[wp.int32]:
+    """
+    Bridge the closest pairs of *open* components until the mesh is connected.
+
+    The driver over [`bridge_edges`][triwarp.holes.bridge_edges], and the step that turns a repair
+    pipeline's output into a **single** solid rather than several. Where ``bridge_edges`` joins two
+    edges the caller names and [`stitch_loops`][triwarp.holes.stitch_loops] consumes two complete
+    rims, this answers *"these are several open shells; make them one"* -- which no other entry
+    point here does, because the question it has to settle first is *which* pieces to join.
+
+    The rule is greedy nearest-link agglomeration, i.e. Kruskal over the components with the
+    distance between their boundary vertices as the edge weight: take the globally closest pair of
+    boundary vertices belonging to different components, bridge it, and repeat while a cross-
+    component pair remains. Each join adds exactly **two triangles and no vertices** -- the two rims
+    it touches become one open rim, left for a filler to close -- so the result grows by
+    ``2 * (k - 1)`` faces for ``k`` open components.
+
+    Ties are broken by the lower boundary-vertex index, so the answer does not depend on thread
+    order.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions. Nothing moves and nothing is added, so this is only
+        read.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    max_distance
+        Refuse a join whose two boundary vertices are further apart than this. ``None`` (default)
+        joins unconditionally, which is what the reference implementations do -- and which on a mesh
+        holding genuinely separate objects welds them together, so pass a bound when the input might
+        not be one broken surface.
+    max_joins
+        Stop after this many bridges. ``None`` (default) continues until one component remains or no
+        admissible pair is left.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        The input face buffer with the bridge triangles appended, on ``faces.device``. A copy of
+        ``faces`` when there is nothing to join -- fewer than two components, or no component with a
+        boundary.
+
+    Raises
+    ------
+    ValueError
+        If ``max_joins`` is negative, or if a chosen pair admits no valid bridge at either of its
+        two incident boundary edges.
+
+    See Also
+    --------
+    [`bridge_edges`][triwarp.holes.bridge_edges]
+        The primitive this drives, and where the two-triangle patch is defined.
+    [`stitch_loops`][triwarp.holes.stitch_loops]
+        Close two rims *completely* rather than tacking them together at one seam.
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
+        What to run afterwards: the merged rim is left open on purpose.
+    [`repair.remove_small_components`][triwarp.repair.remove_small_components]
+        The other answer to a multi-component mesh -- throw the extra pieces away instead.
+
+    Notes
+    -----
+    The loop is host-sequential over the ``k - 1`` joins and recomputes the component labelling and
+    the boundary edges from the updated face buffer each round, so the cost is ``O(k * n_faces)``.
+    That is deliberate: ``k`` is the number of *open* components, which does not grow with the mesh,
+    and recomputing makes the merge and the rim update fall out rather than needing a union-find
+    and an incremental rim edit whose correctness would be much harder to see. The pairing itself is
+    on the device.
+
+    A component with no boundary -- a closed shell -- has nothing to bridge to and is left alone, so
+    an input of closed shells comes back unchanged rather than raising.
+    """
+    if max_joins is not None and max_joins < 0:
+        raise ValueError(f"max_joins must be non-negative, got {max_joins}")
+    max_distance_sq = wp.float32(float("inf") if max_distance is None else float(max_distance) ** 2)
+
+    current = faces
+    joins = 0
+    while max_joins is None or joins < max_joins:
+        pair = _closest_cross_component_edges(vertices, current, max_distance_sq)
+        if pair is None:
+            break
+        current = bridge_edges(vertices, current, pair[0], pair[1])
+        joins += 1
+
+    return wp.clone(faces) if joins == 0 else current
+
+
+# ``pack_nearest_key`` is non-negative for any real candidate, so the largest ``int64`` is a seed no
+# pair can reach -- which is what makes "no admissible pair" a value rather than a second flag.
+_NEAREST_KEY_SEED = (1 << 63) - 1
+
+
+def _closest_cross_component_edges(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_distance_sq: wp.float32
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """
+    Pick the two oriented boundary edges to bridge next, or ``None`` when nothing is left to join.
+
+    ``None`` covers every reason at once: one component, no boundary at all, or no cross-component
+    boundary-vertex pair within ``max_distance_sq``.
+
+    The candidate set is the **first column** of the oriented boundary edges rather than a separate
+    boundary-vertex list, and that is what makes the answer an *edge* pair with no search: row ``i``
+    of that table is already a boundary edge wound the way its face winds it, i.e. exactly what
+    [`bridge_edges`][triwarp.holes.bridge_edges] takes, so the winning slots name their own edges.
+    The column is materialized with ``wp.clone`` because a column view is strided and Warp's
+    Python-scope gather silently ignores an index array's stride (CLAUDE.md section 4).
+
+    Only three scalars come back: the packed winner key and the two rows it names. The boundary
+    table itself never leaves the device.
+    """
+    device = faces.device
+    boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
+    n_boundary = int(boundary.shape[0])
+    if n_boundary == 0:
+        return None
+
+    n_faces = int(faces.shape[0]) // 3
+    face_labels = tw.adjacency.face_connected_component_labels(faces)
+    vertex_labels = wp.full(int(vertices.shape[0]), wp.int32(-1), dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_scatter.scatter_face_labels_to_vertices,
+        dim=3 * n_faces,
+        inputs=[faces, face_labels, vertex_labels],
+        device=device,
+    )
+    members = wp.clone(twt.as_array2d(boundary, wp.int32)[:, 0])
+    labels = tw.array.gather(vertex_labels, members)
+
+    best = wp.array([wp.int64(_NEAREST_KEY_SEED)], dtype=wp.int64, device=device)
+    partner = wp.empty(n_boundary, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_holes.reduce_closest_cross_label_pair,
+        dim=n_boundary,
+        inputs=[vertices, members, labels, max_distance_sq, best, partner],
+        device=device,
+    )
+    key = int(read_scalar(best, 0))
+    if key == _NEAREST_KEY_SEED:
+        return None
+
+    # The packed key's low half is the winning slot; its partner is what that thread found.
+    slot_a = key & 0xFFFFFFFF
+    slot_b = int(read_scalar(partner, slot_a))
+    rows_np = tw.array.gather(
+        boundary,
+        wp.array(np.array([slot_a, slot_b], dtype=np.int32), dtype=wp.int32, device=device),
+    ).numpy()
+    return (int(rows_np[0, 0]), int(rows_np[0, 1])), (int(rows_np[1, 0]), int(rows_np[1, 1]))
 
 
 def _check_bridge_edges(
