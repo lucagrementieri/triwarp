@@ -3,8 +3,10 @@ from __future__ import annotations
 import unittest.mock
 import warnings
 
+import igl
 import numpy as np
 import pytest
+import scipy.sparse as sp
 import trimesh as tm
 import warp as wp
 import warp.sparse as wps
@@ -82,17 +84,29 @@ def _grid_laplacian_system(device: str, k: int = 24, n_rhs: int = 3, shift: floa
     return matrix_wp, twt.as_array2d(rhs_wp, wp.float64), dense_np, rhs_np
 
 
-@pytest.mark.parity("min_quad_with_fixed", "pymeshlab")
+@pytest.mark.parity("min_quad_with_fixed", "pymeshlab", "igl")
 def test_min_quad_with_fixed_matches_pymeshlab_harmonic_field(
     device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
-    Class A: Dirichlet-constrained cotangent solve against MeshLab's Scalar Harmonic Field.
+    Class A twice: MeshLab's harmonic field, and the libigl function this one is named after.
 
-    The only external check ``min_quad_with_fixed`` has: everywhere else it is validated indirectly,
-    through ``parametrization.tutte`` against ``igl.min_quad_with_fixed``. MeshLab's harmonic field
-    pins exactly two vertices and solves the same cotangent system directly, so pinning the same two
-    to 0 and 1 makes the two answers the same field -- measured to 1.4e-8.
+    **libigl binds ``min_quad_with_fixed``**, which makes it the direct comparison and not merely a
+    library that solves a similar system: it minimizes ``0.5 x' A x + x' B`` under ``x[known] = Y``,
+    so at ``B = 0`` with no equality constraints it is this function's problem exactly. The named
+    transform is one sign -- ``igl.cotmatrix`` is negative semi-definite, so ``A`` is ``-L`` --
+    plus its ``(n_vertices, 1)`` dense return against triwarp's free-block-only one, which the
+    ``free_map`` scatter already resolves for the MeshLab half.
+
+    Two conventions worth knowing before using it: it returns a **plain array** here rather than the
+    tuple its C++ signature suggests, and ``Aeq`` / ``Beq`` are not optional -- an empty
+    ``csr_matrix((0, n))`` and an ``(0, 1)`` array are what "no equality constraints" looks like.
+    ``igl.min_quad_with_fixed_precompute`` / ``_solve`` are bound too, which is what gives the
+    benchmark group a real amortized axis on the reference side.
+
+    MeshLab's harmonic field pins exactly two vertices and solves the same cotangent system
+    directly, so pinning the same two to 0 and 1 makes the two answers the same field -- measured to
+    1.4e-8. igl is given the identical two pins, so all three agree on one field.
     """
     mesh_tm, mesh_wp = icosahedron
     vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
@@ -132,6 +146,24 @@ def test_min_quad_with_fixed_matches_pymeshlab_harmonic_field(
     assert np.allclose(
         field_wp, meshset_pml.current_mesh().vertex_scalar_array(), rtol=1e-5, atol=1e-5
     )
+
+    # igl: the same problem, with -L for the sign convention and no equality constraints.
+    faces_igl = np.ascontiguousarray(mesh_tm.faces, dtype=np.int64)
+    field_igl = np.asarray(
+        igl.min_quad_with_fixed(
+            -igl.cotmatrix(vertices_np, faces_igl),
+            np.zeros((n_vertices, 1)),
+            np.ascontiguousarray(np.array([low, high], dtype=np.int64)),
+            np.array([[0.0], [1.0]]),
+            sp.csr_matrix((0, n_vertices)),
+            np.zeros((0, 1)),
+            True,
+        )
+    ).ravel()
+    assert (
+        np.ptp(field_igl) > 0.5
+    )  # non-vacuity: the reference produced a real field, not a constant
+    assert np.allclose(field_wp, field_igl, rtol=1e-5, atol=1e-5)
 
 
 # --- free_partition / assemble_interior_system ---------------------------------------------

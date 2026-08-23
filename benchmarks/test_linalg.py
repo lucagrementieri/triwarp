@@ -72,8 +72,10 @@ factorizations, and neither trimesh nor open3d has a linear solver at all.
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pytest
+import scipy.sparse as sp
 import warp as wp
 import warp.sparse as wps
 
@@ -110,14 +112,25 @@ def _operator(bench_case: BenchCase) -> wps.BsrMatrix:
     return _operator_cache[key]
 
 
+def _fixed_mask_np(bench_case: BenchCase, fraction: float) -> np.ndarray:
+    """
+    Draw the pinned-vertex mask on the host, so a ``cpu_bound`` reference row gets the same one.
+
+    Split out of ``_fixed`` rather than duplicated: the igl row solves the identical problem and a
+    second draw from the same seed would still be a second place for the seed to drift.
+    """
+    rng = np.random.default_rng(_SEED)
+    n = bench_case.n_vertices
+    mask_np = np.zeros(n, dtype=bool)
+    mask_np[rng.choice(n, size=max(1, int(n * fraction)), replace=False)] = True
+    return mask_np
+
+
 def _fixed(bench_case: BenchCase, fraction: float) -> tuple:
     """``(fixed_mask, fixed_values)`` pinning ``fraction`` of the vertices, at a fixed seed."""
     key = (bench_case.mesh_name, str(bench_case.device), fraction)
     if key not in _fixed_cache:
-        rng = np.random.default_rng(_SEED)
-        n = bench_case.n_vertices
-        mask_np = np.zeros(n, dtype=bool)
-        mask_np[rng.choice(n, size=max(1, int(n * fraction)), replace=False)] = True
+        mask_np = _fixed_mask_np(bench_case, fraction)
         values_np = np.tile(bench_case.vertices_np[:, 2], (_N_RHS, 1))
         _fixed_cache[key] = (
             wp.array(mask_np, dtype=wp.bool, device=bench_case.device),
@@ -149,7 +162,7 @@ def _harmonic_endpoints_pml(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarr
 
 @pytest.mark.benchmark(group="min_quad_with_fixed")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "igl")
 @pytest.mark.parametrize("fixed_fraction", _FIXED_FRACTIONS, ids=["pin1pct", "pin50pct"])
 def test_min_quad_with_fixed(bench_case: BenchCase, fixed_fraction: float) -> None:
     """
@@ -162,7 +175,38 @@ def test_min_quad_with_fixed(bench_case: BenchCase, fixed_fraction: float) -> No
     The pymeshlab row is the control for exactly that cell: its direct factorization of the same
     system is flat across the mesh pair, so whatever spread triwarp shows is the CG iteration count
     and not the problem.
+
+    **libigl binds the function this one is named after**, and it is the closer control of the two:
+    ``igl.min_quad_with_fixed(A, B, known, Y, Aeq, Beq, pd)`` minimizes ``0.5 x' A x + x' B`` under
+    ``x[known] = Y``, which at ``B = 0`` and no equality constraints is exactly this problem -- so
+    unlike MeshLab it takes the *same* pinned fraction and follows the whole ``fixed_fraction``
+    axis. The named transform is one sign: ``igl.cotmatrix`` is negative semi-definite, so ``A`` is
+    ``-L``.
+
+    It is a direct factorization too, so read the two reference rows together: both should be flat
+    where triwarp's CG is not, and igl's should additionally be flat in ``fixed_fraction`` where
+    triwarp's is not -- a smaller free block is less work for CG and roughly the same amount of
+    fill-reducing ordering for a factorization.
     """
+    if bench_case.kind == "igl":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        operator_igl = -igl.cotmatrix(vertices_np, np.ascontiguousarray(faces_np, dtype=np.int64))
+        n_vertices = bench_case.n_vertices
+        known_igl = np.ascontiguousarray(
+            np.flatnonzero(_fixed_mask_np(bench_case, fixed_fraction)).astype(np.int64)
+        )
+        # The same pinned values triwarp's row is given: the z coordinate at the pinned vertices.
+        values_igl = np.ascontiguousarray(vertices_np[known_igl, 2]).reshape(-1, 1)
+        zeros_igl = np.zeros((n_vertices, 1))
+        equality_igl = sp.csr_matrix((0, n_vertices))
+        rhs_igl = np.zeros((0, 1))
+        solution_igl = bench_case.run(
+            lambda: igl.min_quad_with_fixed(
+                operator_igl, zeros_igl, known_igl, values_igl, equality_igl, rhs_igl, True
+            )
+        )
+        assert np.asarray(solution_igl).shape[0] == n_vertices
+        return
     if bench_case.kind == "pymeshlab":
         if fixed_fraction != min(_FIXED_FRACTIONS):
             pytest.skip("MeshLab's harmonic field pins exactly two vertices: no fraction axis")
