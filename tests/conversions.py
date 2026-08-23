@@ -89,6 +89,58 @@ def numpy_to_warp_uv(
     )
 
 
+def points_to_warp(points_np: np.ndarray, device: str) -> wp.array:
+    """
+    Upload an ``(n, 3)`` point cloud as ``wp.array[wp.vec3]``.
+
+    The vertices-only half of [`numpy_to_warp`][tests.conversions.numpy_to_warp], and the sibling of
+    [`points_to_open3d`][tests.conversions.points_to_open3d],
+    [`points_to_pymeshlab`][tests.conversions.points_to_pymeshlab],
+    [`points_to_pyvista`][tests.conversions.points_to_pyvista] and
+    [`points_to_meshlib`][tests.conversions.points_to_meshlib] -- every reference library had one
+    and Warp did not, so the suite hand-rolled it **403** times in four different spellings across
+    35 files, plus six one-line private copies carrying another 181 calls. Reach for this wherever
+    a bare cloud goes to a triwarp wrapper: query points, normals, ray origins and directions,
+    polyline vertices, a sampled surface.
+
+    Positions land as **float32**: that is what ``wp.vec3`` holds, and it is the reason a comparison
+    against a float64 reference bottoms out around 1e-7 rather than at machine epsilon. The
+    ``np.ascontiguousarray`` is not ceremony *here* even though Warp accepts a non-contiguous
+    payload (probed on 1.16) -- it costs nothing on an already-contiguous array and it keeps one
+    spelling where there were four. Note the contrast with section 4's *index*-array hazard, which
+    is real and unrelated: a stride is silently ignored on a gather **index**, never on a payload
+    upload.
+
+    Parameters
+    ----------
+    points_np
+        ``(n, 3)`` positions or directions, any float dtype.
+    device
+        Warp device for the result.
+
+    See Also
+    --------
+    [`points_to_warp_uv`][tests.conversions.points_to_warp_uv]
+        The ``wp.vec2`` form, for planar clouds and UV buffers.
+    [`numpy_to_warp`][tests.conversions.numpy_to_warp]
+        The ``(vertices, faces)`` form, when the cloud is a mesh.
+    """
+    return wp.array(np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=device)
+
+
+def points_to_warp_uv(points_np: np.ndarray, device: str) -> wp.array:
+    """
+    Upload an ``(n, 2)`` planar point set as ``wp.array[wp.vec2]``.
+
+    The ``wp.vec2`` counterpart of [`points_to_warp`][tests.conversions.points_to_warp], for a UV
+    atlas, a 2-D polygon ring or a planar Delaunay input. Separate rather than a ``dtype=`` switch
+    for the reason [`numpy_to_warp_uv`][tests.conversions.numpy_to_warp_uv] gives: the two are
+    never interchangeable at a call site, and a silently-wrong vector width is exactly what a shared
+    helper should make impossible.
+    """
+    return wp.array(np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device)
+
+
 def trimesh_to_pymeshlab(mesh: tm.Trimesh, scalars: np.ndarray | None = None) -> ml.MeshSet:
     """
     Wrap a ``tm.Trimesh`` in a fresh single-mesh ``pymeshlab.MeshSet``.
@@ -123,6 +175,13 @@ def warp_to_pymeshlab(vertices_wp: wp.array, faces_wp: wp.array) -> ml.MeshSet:
     The face buffer is triwarp's flat one, so it is reshaped to ``(n_faces, 3)`` here; use this when
     the mesh under test is a triwarp *output* rather than one of the ``tests/conftest.py`` fixtures
     (which already carry a ``tm.Trimesh`` for ``trimesh_to_pymeshlab``).
+
+    !!! note "Deliberately unexercised, and not dead"
+        No test calls this today, and that is a decision rather than an oversight -- section 6's
+        inventory points readers at it, so deleting it invites the next person to hand-roll the
+        wrapper and rediscover the hazards above. It also has a caller that is invisible from here:
+        ``tests/parity.py`` keys its reference detection off these converter *names*, so removing
+        one would silently narrow the parity scan.
     """
     meshset = ml.MeshSet()
     meshset.add_mesh(
@@ -398,6 +457,13 @@ def warp_to_meshlib(vertices_wp: wp.array, faces_wp: wp.array) -> mm.Mesh:
     ``tests/conftest.py`` fixtures (which already carry a ``tm.Trimesh`` for
     [`trimesh_to_meshlib`][tests.conversions.trimesh_to_meshlib]). Same freshness rule as
     [`numpy_to_meshlib`][tests.conversions.numpy_to_meshlib], which does the work.
+
+    !!! note "Deliberately unexercised, and not dead"
+        No test calls this today, and that is a decision rather than an oversight -- section 6's
+        inventory points readers at it, so deleting it invites the next person to hand-roll the
+        wrapper and rediscover the hazards above. It also has a caller that is invisible from here:
+        ``tests/parity.py`` keys its reference detection off these converter *names*, so removing
+        one would silently narrow the parity scan.
     """
     return numpy_to_meshlib(vertices_wp.numpy(), faces_wp.numpy())
 
@@ -613,6 +679,13 @@ def warp_to_pymeshfix(vertices_wp: wp.array, faces_wp: wp.array) -> _meshfix.PyT
     ``tests/conftest.py`` fixtures (which carry a ``tm.Trimesh`` for
     [`trimesh_to_pymeshfix`][tests.conversions.trimesh_to_pymeshfix]). Same renumbering and
     one-call-per-object rules as [`numpy_to_pymeshfix`][tests.conversions.numpy_to_pymeshfix].
+
+    !!! note "Deliberately unexercised, and not dead"
+        No test calls this today, and that is a decision rather than an oversight -- section 6's
+        inventory points readers at it, so deleting it invites the next person to hand-roll the
+        wrapper and rediscover the hazards above. It also has a caller that is invisible from here:
+        ``tests/parity.py`` keys its reference detection off these converter *names*, so removing
+        one would silently narrow the parity scan.
     """
     return numpy_to_pymeshfix(vertices_wp.numpy(), faces_wp.numpy())
 

@@ -19,8 +19,8 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-
-_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
+from tests.conftest import MESHES
+from tests.conversions import points_to_warp
 
 
 def _rays(mesh_tm: tm.Trimesh, n_rays: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -50,7 +50,7 @@ def _path_length(points: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_trace_from_vertex_walks_the_requested_distance(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -69,7 +69,7 @@ def test_trace_from_vertex_walks_the_requested_distance(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(start_np, dtype=wp.int32, device=mesh_wp.device),
-        wp.array(directions_np, dtype=wp.vec3, device=mesh_wp.device),
+        points_to_warp(directions_np, mesh_wp.device),
         frames=frames_wp,
     )
 
@@ -91,7 +91,7 @@ def test_trace_from_vertex_walks_the_requested_distance(
         assert np.allclose(points[0], mesh_tm.vertices[start], rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_trace_from_vertex_stays_on_the_surface(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -108,7 +108,7 @@ def test_trace_from_vertex_stays_on_the_surface(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(start_np, dtype=wp.int32, device=mesh_wp.device),
-        wp.array(directions_np, dtype=wp.vec3, device=mesh_wp.device),
+        points_to_warp(directions_np, mesh_wp.device),
     )
 
     # Every traced point must lie on a triangle: an unfolding error would drift off the surface.
@@ -146,7 +146,7 @@ def test_trace_from_vertex_matches_potpourri3d(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(start_np, dtype=wp.int32, device=mesh_wp.device),
-        wp.array(directions_np, dtype=wp.vec3, device=mesh_wp.device),
+        points_to_warp(directions_np, mesh_wp.device),
     )
     curves = tw.geodesic_walk.trace_polylines(points_wp, offsets_wp)
 
@@ -193,7 +193,7 @@ def test_trace_from_vertex_stops_at_the_boundary(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(boundary, dtype=wp.int32, device=mesh_wp.device),
-        wp.array(outward.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device),
+        points_to_warp(outward, mesh_wp.device),
     )
 
     scale = float(
@@ -248,8 +248,8 @@ def test_trace_from_face_matches_potpourri3d(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(start_faces, dtype=wp.int32, device=mesh_wp.device),
-        wp.array(barycentric.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device),
-        wp.array(directions.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device),
+        points_to_warp(barycentric, mesh_wp.device),
+        points_to_warp(directions, mesh_wp.device),
     )
     curves = tw.geodesic_walk.trace_polylines(points_wp, offsets_wp)
 

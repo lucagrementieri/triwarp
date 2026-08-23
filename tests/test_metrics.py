@@ -20,16 +20,12 @@ from scipy.spatial import KDTree
 from scipy.spatial.distance import directed_hausdorff
 
 import triwarp as tw
-from tests.conversions import points_to_open3d, points_to_pymeshlab, trimesh_to_warp
+from tests.conversions import points_to_open3d, points_to_pymeshlab, points_to_warp, trimesh_to_warp
 
 # igl requires float64 vertices / int64 faces; Warp uses float32 / int32, so mesh-surface
 # references diverge from Warp at roughly float32 precision.
 _MESH_RTOL = 1e-4
 _MESH_ATOL = 1e-5
-
-
-def _points_wp(points_np: np.ndarray, device: str) -> wp.array:
-    return wp.array(np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=device)
 
 
 def _igl_point_mesh_sqr_dist(
@@ -58,7 +54,7 @@ def test_chamfer_points_to_points_mean(device: str) -> None:
     chamfer_np = np.mean(distance_xy_np**2) + np.mean(distance_yx_np**2)
 
     chamfer_wp = tw.metrics.chamfer_points_to_points(
-        _points_wp(x_np, device), _points_wp(y_np, device)
+        points_to_warp(x_np, device), points_to_warp(y_np, device)
     )
     assert np.allclose(chamfer_wp, chamfer_np, rtol=1e-5, atol=1e-5)
 
@@ -73,7 +69,7 @@ def test_chamfer_points_to_points_sum(device: str) -> None:
     chamfer_np = np.sum(distance_xy_np**2) + np.sum(distance_yx_np**2)
 
     chamfer_wp = tw.metrics.chamfer_points_to_points(
-        _points_wp(x_np, device), _points_wp(y_np, device), point_reduction="sum"
+        points_to_warp(x_np, device), points_to_warp(y_np, device), point_reduction="sum"
     )
     assert np.allclose(chamfer_wp, chamfer_np, rtol=1e-5, atol=1e-4)
 
@@ -88,7 +84,7 @@ def test_chamfer_points_to_points_max(device: str) -> None:
     chamfer_np = max(np.max(distance_xy_np**2), np.max(distance_yx_np**2))
 
     chamfer_wp = tw.metrics.chamfer_points_to_points(
-        _points_wp(x_np, device), _points_wp(y_np, device), point_reduction="max"
+        points_to_warp(x_np, device), points_to_warp(y_np, device), point_reduction="max"
     )
     assert np.allclose(chamfer_wp, chamfer_np, rtol=1e-5, atol=1e-5)
 
@@ -101,7 +97,7 @@ def test_chamfer_points_to_points_single_directional(device: str) -> None:
     chamfer_np = np.mean(KDTree(y_np).query(x_np)[0] ** 2)
 
     chamfer_wp = tw.metrics.chamfer_points_to_points(
-        _points_wp(x_np, device), _points_wp(y_np, device), single_directional=True
+        points_to_warp(x_np, device), points_to_warp(y_np, device), single_directional=True
     )
     assert np.allclose(chamfer_wp, chamfer_np, rtol=1e-5, atol=1e-5)
 
@@ -115,7 +111,7 @@ def test_chamfer_points_to_points_unreduced(device: str) -> None:
     squared_yx_np = KDTree(x_np).query(y_np)[0] ** 2
 
     forward_wp, backward_wp = tw.metrics.chamfer_points_to_points(
-        _points_wp(x_np, device), _points_wp(y_np, device), point_reduction=None
+        points_to_warp(x_np, device), points_to_warp(y_np, device), point_reduction=None
     )
     assert np.allclose(forward_wp.numpy(), squared_xy_np, rtol=1e-5, atol=1e-5)
     assert np.allclose(backward_wp.numpy(), squared_yx_np, rtol=1e-5, atol=1e-5)
@@ -146,7 +142,9 @@ def test_chamfer_points_to_points_matches_open3d(device: str, single_directional
         ).mean()
 
     chamfer_wp = tw.metrics.chamfer_points_to_points(
-        _points_wp(x_np, device), _points_wp(y_np, device), single_directional=single_directional
+        points_to_warp(x_np, device),
+        points_to_warp(y_np, device),
+        single_directional=single_directional,
     )
     assert np.allclose(chamfer_wp, chamfer_o3d, rtol=1e-5, atol=1e-5)
 
@@ -167,7 +165,7 @@ def test_chamfer_mesh_to_mesh(request: pytest.FixtureRequest, mesh_name: str) ->
     sqr_b_to_a_np = _igl_point_mesh_sqr_dist(vertices_b_np, vertices_a_np, faces_np)
     chamfer_np = np.mean(sqr_a_to_b_np) + np.mean(sqr_b_to_a_np)
 
-    vertices_b_wp = _points_wp(vertices_b_np, mesh_wp.device)
+    vertices_b_wp = points_to_warp(vertices_b_np, mesh_wp.device)
     chamfer_wp = tw.metrics.chamfer_mesh_to_mesh(
         mesh_wp.points, mesh_wp.indices, vertices_b_wp, mesh_wp.indices
     )
@@ -215,7 +213,7 @@ def test_chamfer_points_to_mesh(request: pytest.FixtureRequest, mesh_name: str) 
     chamfer_np = np.mean(forward_sqr_igl) + np.mean(backward_sqr_np)
 
     chamfer_wp = tw.metrics.chamfer_points_to_mesh(
-        _points_wp(points_np, mesh_wp.device), mesh_wp.points, mesh_wp.indices
+        points_to_warp(points_np, mesh_wp.device), mesh_wp.points, mesh_wp.indices
     )
     assert np.allclose(chamfer_wp, chamfer_np, rtol=_MESH_RTOL, atol=_MESH_ATOL)
 
@@ -233,7 +231,7 @@ def test_hausdorff_points_to_points(device: str) -> None:
     hausdorff_np = max(directed_hausdorff(x_np, y_np)[0], directed_hausdorff(y_np, x_np)[0])
 
     hausdorff_wp = tw.metrics.hausdorff_points_to_points(
-        _points_wp(x_np, device), _points_wp(y_np, device)
+        points_to_warp(x_np, device), points_to_warp(y_np, device)
     )
     assert np.allclose(hausdorff_wp, hausdorff_np, rtol=1e-5, atol=1e-5)
 
@@ -246,7 +244,7 @@ def test_hausdorff_points_to_points_single_directional(device: str) -> None:
     hausdorff_np = directed_hausdorff(x_np, y_np)[0]
 
     hausdorff_wp = tw.metrics.hausdorff_points_to_points(
-        _points_wp(x_np, device), _points_wp(y_np, device), single_directional=True
+        points_to_warp(x_np, device), points_to_warp(y_np, device), single_directional=True
     )
     assert np.allclose(hausdorff_wp, hausdorff_np, rtol=1e-5, atol=1e-5)
 
@@ -294,7 +292,7 @@ def test_hausdorff_points_to_points_matches_open3d_and_pymeshlab(device: str) ->
     )
 
     hausdorff_wp = tw.metrics.hausdorff_points_to_points(
-        _points_wp(x_np, device), _points_wp(y_np, device)
+        points_to_warp(x_np, device), points_to_warp(y_np, device)
     )
     assert np.allclose(hausdorff_wp, hausdorff_o3d, rtol=1e-5, atol=1e-5)
     assert np.allclose(hausdorff_wp, hausdorff_pml, rtol=1e-5, atol=1e-5)
@@ -316,7 +314,7 @@ def test_hausdorff_mesh_to_mesh(request: pytest.FixtureRequest, mesh_name: str) 
     sqr_b_to_a_np = _igl_point_mesh_sqr_dist(vertices_b_np, vertices_a_np, faces_np)
     hausdorff_np = np.sqrt(max(sqr_a_to_b_np.max(), sqr_b_to_a_np.max()))
 
-    vertices_b_wp = _points_wp(vertices_b_np, mesh_wp.device)
+    vertices_b_wp = points_to_warp(vertices_b_np, mesh_wp.device)
     hausdorff_wp = tw.metrics.hausdorff_mesh_to_mesh(
         mesh_wp.points, mesh_wp.indices, vertices_b_wp, mesh_wp.indices
     )
@@ -343,7 +341,7 @@ def test_hausdorff_points_to_mesh(request: pytest.FixtureRequest, mesh_name: str
     hausdorff_np = max(forward_np, backward_np)
 
     hausdorff_wp = tw.metrics.hausdorff_points_to_mesh(
-        _points_wp(points_np, mesh_wp.device), mesh_wp.points, mesh_wp.indices
+        points_to_warp(points_np, mesh_wp.device), mesh_wp.points, mesh_wp.indices
     )
     assert np.allclose(hausdorff_wp, hausdorff_np, rtol=_MESH_RTOL, atol=_MESH_ATOL)
 
@@ -355,21 +353,21 @@ def test_hausdorff_points_to_mesh(request: pytest.FixtureRequest, mesh_name: str
 
 def test_chamfer_points_to_points_empty(device: str) -> None:
     x_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    y_wp = _points_wp(np.zeros((5, 3), dtype=np.float32), device)
+    y_wp = points_to_warp(np.zeros((5, 3), dtype=np.float32), device)
     assert tw.metrics.chamfer_points_to_points(x_wp, y_wp) == 0.0
 
 
 def test_chamfer_points_to_points_empty_unreduced(device: str) -> None:
     x_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    y_wp = _points_wp(np.zeros((5, 3), dtype=np.float32), device)
+    y_wp = points_to_warp(np.zeros((5, 3), dtype=np.float32), device)
     forward_wp, backward_wp = tw.metrics.chamfer_points_to_points(x_wp, y_wp, point_reduction=None)
     assert forward_wp.shape == (0,)
     assert backward_wp.shape == (0,)
 
 
 def test_hausdorff_points_to_mesh_empty_faces(device: str) -> None:
-    points_wp = _points_wp(np.zeros((5, 3), dtype=np.float32), device)
-    vertices_wp = _points_wp(np.zeros((3, 3), dtype=np.float32), device)
+    points_wp = points_to_warp(np.zeros((5, 3), dtype=np.float32), device)
+    vertices_wp = points_to_warp(np.zeros((3, 3), dtype=np.float32), device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
     assert tw.metrics.hausdorff_points_to_mesh(points_wp, vertices_wp, faces_wp) == 0.0
 
@@ -377,7 +375,7 @@ def test_hausdorff_points_to_mesh_empty_faces(device: str) -> None:
 def test_hausdorff_points_to_points_identical_is_zero(device: str) -> None:
     rng = np.random.default_rng(9)
     x_np = (rng.random((30, 3), dtype=np.float32) * 4.0 - 2.0).astype(np.float32)
-    x_wp = _points_wp(x_np, device)
+    x_wp = points_to_warp(x_np, device)
     assert tw.metrics.hausdorff_points_to_points(x_wp, x_wp) == 0.0
 
 
@@ -614,8 +612,8 @@ def test_chamfer_losses_match_numpy_on_both_devices(kernel_device: str) -> None:
     rng = np.random.default_rng(91)
     x_np = rng.standard_normal((500, 3))
     y_np = rng.standard_normal((300, 3)) * 0.7
-    x_wp = wp.array(np.ascontiguousarray(x_np), dtype=wp.vec3, device=kernel_device)
-    y_wp = wp.array(np.ascontiguousarray(y_np), dtype=wp.vec3, device=kernel_device)
+    x_wp = points_to_warp(x_np, kernel_device)
+    y_wp = points_to_warp(y_np, kernel_device)
 
     # Bidirectional mean-reduced squared chamfer, exactly what the default arguments compute.
     squared_np = ((x_np[:, None, :] - y_np[None, :, :]) ** 2).sum(-1)
@@ -638,8 +636,8 @@ def test_chamfer_loss_no_tape_has_value_but_no_grad(device: str) -> None:
     rng = np.random.default_rng(22)
     x_np = (rng.random((12, 3)) * 2.0 - 1.0).astype(np.float32)
     y_np = (rng.random((9, 3)) * 2.0 - 1.0).astype(np.float32)
-    x_wp = _points_wp(x_np, device)
-    y_wp = _points_wp(y_np, device)
+    x_wp = points_to_warp(x_np, device)
+    y_wp = points_to_warp(y_np, device)
 
     loss_wp = tw.metrics.chamfer_points_to_points_loss(x_wp, y_wp)
     reduced = tw.metrics.chamfer_points_to_points(x_wp, y_wp)
@@ -647,15 +645,15 @@ def test_chamfer_loss_no_tape_has_value_but_no_grad(device: str) -> None:
 
 
 def test_chamfer_loss_rejects_max_reduction(device: str) -> None:
-    x_wp = _points_wp(np.zeros((3, 3), dtype=np.float32), device)
-    y_wp = _points_wp(np.ones((3, 3), dtype=np.float32), device)
+    x_wp = points_to_warp(np.zeros((3, 3), dtype=np.float32), device)
+    y_wp = points_to_warp(np.ones((3, 3), dtype=np.float32), device)
     with pytest.raises(ValueError, match="mean"):
         tw.metrics.chamfer_points_to_points_loss(x_wp, y_wp, point_reduction="max")  # type: ignore[arg-type]
 
 
 def test_chamfer_points_to_points_loss_empty(device: str) -> None:
     x_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    y_wp = _points_wp(np.zeros((4, 3), dtype=np.float32), device)
+    y_wp = points_to_warp(np.zeros((4, 3), dtype=np.float32), device)
     loss_wp = tw.metrics.chamfer_points_to_points_loss(x_wp, y_wp)
     assert loss_wp.shape == (1,)
     assert float(loss_wp.numpy()[0]) == 0.0

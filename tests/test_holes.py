@@ -18,25 +18,25 @@ from tests.comparisons import (
     hausdorff_surface_two_sided,
     lexsort_rows,
 )
+from tests.conftest import OPEN_MESHES
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
     numpy_to_meshlib,
     numpy_to_meshlib_bitset,
-    numpy_to_pymeshfix,
     numpy_to_warp,
+    points_to_warp,
     pymeshfix_to_numpy,
     trimesh_to_meshlib,
     trimesh_to_open3d,
+    trimesh_to_pymeshfix,
     trimesh_to_pymeshlab,
     warp_to_trimesh,
 )
 from triwarp.holes import _non_increasing_indices
 
+
 # Open-surface fixtures that actually have a boundary to fill.
-OPEN_MESHES = ["hemisphere", "half_torus"]
-
-
 def _fillable_loops(vertices: wp.array, faces: wp.array) -> list[wp.array]:
     return [loop for loop in tw.boundary.boundary_loops(vertices, faces) if int(loop.shape[0]) >= 3]
 
@@ -123,7 +123,7 @@ def test_fill_fan_covers_the_same_rim_as_meshlib(
     loop_sizes = _loop_sizes(mesh_wp)
 
     fan_faces_wp = tw.holes.fill_fan(mesh_wp.points, mesh_wp.indices)
-    fan_tm = tm.Trimesh(mesh_wp.points.numpy(), fan_faces_wp.numpy().reshape(-1, 3), process=False)
+    fan_tm = warp_to_trimesh(mesh_wp.points, fan_faces_wp)
 
     mesh_ml = trimesh_to_meshlib(mesh_tm)
     apex_ids_ml = [
@@ -758,9 +758,7 @@ def test_fill_min_weight_watertight(
     assert tw.validation.is_edge_manifold(filled_faces, allow_boundary_edges=False)
     assert tw.validation.is_winding_consistent(filled_faces)
     assert len(_loop_sizes_of(mesh_wp.points, filled_faces)) == 0
-    filled_tm = tm.Trimesh(
-        vertices=mesh_wp.points.numpy(), faces=filled_faces.numpy().reshape(-1, 3), process=False
-    )
+    filled_tm = warp_to_trimesh(mesh_wp.points, filled_faces)
     assert filled_tm.is_watertight
     assert filled_tm.is_winding_consistent
 
@@ -815,11 +813,7 @@ def test_fill_min_weight_matches_open3d_and_pymeshlab(
     ``zeros_like`` and "return the input faces" fail at the face-count assert.
     """
     _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    mesh_tm = tm.Trimesh(
-        vertices=mesh_wp.points.numpy().astype(np.float64),
-        faces=mesh_wp.indices.numpy().reshape(-1, 3),
-        process=False,
-    )
+    mesh_tm = warp_to_trimesh(mesh_wp.points, mesh_wp.indices)
     vertices_np = mesh_tm.vertices
     n_original = int(mesh_wp.indices.shape[0])
 
@@ -898,9 +892,7 @@ def test_fill_min_weight_batched_equals_per_loop(device: str, metric: str) -> No
     whole batch instead of the loops that needed it.
     """
     vertices_np, faces_np = _punched_sphere(24)
-    vertices_wp = wp.array(
-        np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(
         np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
     )
@@ -963,9 +955,7 @@ def test_fill_dp_span_tiled_matches_serial(
     what verifies that: on CPU it is now a genuine tiled-vs-serial check rather than a skip.
     """
     vertices_np, faces_np = _star_tube()
-    vertices_wp = wp.array(
-        np.ascontiguousarray(vertices_np, dtype=np.float64), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(
         np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
     )
@@ -1187,7 +1177,7 @@ def test_fill_small_max_edges_matches_the_edge_count_references(
 
     filled_wp = tw.holes.fill_small(vertices_wp, faces_wp, max_edges=max_edges)
 
-    tin_pmf = numpy_to_pymeshfix(holed_tm.vertices, holed_tm.faces)
+    tin_pmf = trimesh_to_pymeshfix(holed_tm)
     assert tin_pmf.n_faces == n_faces  # the loader left the mesh alone, so counts compare
     assert tin_pmf.n_boundaries == 2
     tin_pmf.fill_small_boundaries(nbe=max_edges, refine=False)
@@ -1298,7 +1288,7 @@ def test_fill_min_weight_matches_pymeshfix(
     filled_wp = tw.holes.fill_min_weight(vertices_wp, faces_wp)
     filled_tm = warp_to_trimesh(vertices_wp, filled_wp)
 
-    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    tin_pmf = trimesh_to_pymeshfix(mesh_tm)
     assert tin_pmf.n_faces == n_faces  # the loader left the mesh alone, so the counts compare
     assert tin_pmf.n_boundaries == len(rim_sizes)
     tin_pmf.fill_small_boundaries(nbe=0, refine=False)
@@ -1373,7 +1363,7 @@ def test_fill_smooth_refinement_matches_pymeshfix(
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = int(mesh_wp.points.shape[0])
 
-    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    tin_pmf = trimesh_to_pymeshfix(mesh_tm)
     assert tin_pmf.n_points == n_vertices  # the loader left the mesh alone
     tin_pmf.fill_small_boundaries(nbe=0, refine=True)
     vertices_pmf, faces_pmf = pymeshfix_to_numpy(tin_pmf)
@@ -1600,7 +1590,7 @@ def test_fill_smooth_natural_smooth(device: str, icosphere: tuple[tm.Trimesh, wp
     hemi.merge_vertices()
     vertices_np = np.ascontiguousarray(hemi.vertices.astype(np.float64))
     faces_np = np.ascontiguousarray(hemi.faces.astype(np.int32).reshape(-1))
-    v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    v_wp = points_to_warp(vertices_np, device)
     f_wp = wp.array(faces_np, dtype=wp.int32, device=device)
     n_v0 = len(vertices_np)
 
@@ -1665,7 +1655,7 @@ def _cone(
 
 def _cone_wp(device: str, **kwargs):
     vertices_np, faces_np = _cone(**kwargs)
-    vertices_wp = wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
     return vertices_np, faces_np, vertices_wp, faces_wp
 
@@ -1888,9 +1878,7 @@ def test_stitch_min_weight_watertight(device: str, n_a: int, n_b: int, metric: s
     assert n_band == n_a + n_b
     assert int(new_vertices.shape[0]) == int(va.shape[0]) + int(vb.shape[0])
     assert tw.validation.is_winding_consistent(new_faces)
-    filled_tm = tm.Trimesh(
-        vertices=new_vertices.numpy(), faces=new_faces.numpy().reshape(-1, 3), process=False
-    )
+    filled_tm = warp_to_trimesh(new_vertices, new_faces)
     assert filled_tm.is_watertight
 
 
@@ -1952,9 +1940,7 @@ def _hemisphere_pair(device: str):
         )
         cap.merge_vertices()
         cap.apply_translation([0.0, 0.0, z_off])
-        v = wp.array(
-            np.ascontiguousarray(cap.vertices.astype(np.float64)), dtype=wp.vec3, device=device
-        )
+        v = points_to_warp(cap.vertices, device)
         f = wp.array(
             np.ascontiguousarray(cap.faces.astype(np.int32).reshape(-1)),
             dtype=wp.int32,
@@ -2019,7 +2005,7 @@ def test_stitch_smooth_statistics_vs_meshlib(device: str):
     max_edge = 0.15
 
     new_vertices, new_faces = tw.holes.stitch_smooth(va, fa, vb, fb, max_edge=max_edge)
-    mesh_tw = tm.Trimesh(new_vertices.numpy(), new_faces.numpy().reshape(-1, 3), process=False)
+    mesh_tw = warp_to_trimesh(new_vertices, new_faces)
     assert mesh_tw.is_watertight
 
     verts_ml = np.ascontiguousarray(np.vstack([va.numpy(), vb.numpy()]), dtype=np.float32)
@@ -2639,7 +2625,7 @@ def test_join_closest_components_matches_pymeshfix(
     joined_wp = tw.holes.join_closest_components(vertices_wp, faces_wp)
     joined_tm = warp_to_trimesh(vertices_wp, joined_wp)
 
-    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    tin_pmf = trimesh_to_pymeshfix(mesh_tm)
     assert tin_pmf.n_boundaries == count  # the loader left the shells alone
     tin_pmf.join_closest_components()
     vertices_pmf, faces_pmf = pymeshfix_to_numpy(tin_pmf)

@@ -16,17 +16,15 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from tests.conftest import MESHES
 from tests.conversions import (
     faces_igl,
+    points_to_warp,
     trimesh_to_meshlib,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
     trimesh_to_warp,
 )
-
-CLOSED_MESHES = ["icosahedron", "cave_cube"]
-OPEN_MESHES = ["hemisphere", "half_torus"]
-ALL_MESHES = CLOSED_MESHES + OPEN_MESHES
 
 
 @pytest.mark.parity("moments", "meshlib")
@@ -275,9 +273,7 @@ def test_moments_translation_shifts_only_the_center(device: str):
     offset_np = np.array([1.5, -2.0, 0.5])
 
     def moments_of(vertices_np: np.ndarray):
-        vertices_wp = wp.array(
-            np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
-        )
+        vertices_wp = points_to_warp(vertices_np, device)
         faces_wp = wp.array(
             np.ascontiguousarray(box_tm.faces.reshape(-1), dtype=np.int32),
             dtype=wp.int32,
@@ -308,7 +304,7 @@ def test_moments_empty(device: str):
     assert np.array_equal(np.asarray(inertia).reshape(3, 3), np.zeros((3, 3)))
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_euler_characteristic(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class A on an integer, against ``Trimesh.euler_number`` across the fixture set.

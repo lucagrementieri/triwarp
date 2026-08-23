@@ -42,8 +42,10 @@ from tests.conversions import (
     numpy_to_meshlib_bitset,
     numpy_to_warp,
     points_to_meshlib,
+    points_to_warp,
     trimesh_to_open3d,
     trimesh_to_pyvista,
+    warp_to_trimesh,
 )
 
 # A translation with no round coordinate, so no vertex of any fixture lands on a cell plane.
@@ -73,9 +75,7 @@ def sphere(
 def _cloud(mesh_tm: tm.Trimesh, device: str, n: int = 20000) -> tuple[np.ndarray, wp.array]:
     """Sample the surface of ``mesh_tm`` deterministically, as NumPy and Warp."""
     points_np = tm.sample.sample_surface(mesh_tm, n, seed=7)[0]
-    return points_np, wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    return points_np, points_to_warp(points_np, device)
 
 
 def _dense(grid: wp.Volume, origin_cell, shape) -> np.ndarray:
@@ -176,12 +176,7 @@ def test_voxelize_mesh_matches_meshlib(sphere, device: str):
     near_np = np.argwhere(field_np < 0.5)
     assert near_np.shape[0] > 100
     node_positions_np = origin_np + near_np * voxel_size
-    occupied_wp = tw.voxels.occupancy_at_points(
-        grid,
-        wp.array(
-            np.ascontiguousarray(node_positions_np, dtype=np.float32), dtype=wp.vec3, device=device
-        ),
-    )
+    occupied_wp = tw.voxels.occupancy_at_points(grid, points_to_warp(node_positions_np, device))
     assert occupied_wp.numpy().all()
 
 
@@ -302,9 +297,7 @@ def test_voxel_down_sample_matches_open3d(sphere, device: str):
     assert pooled_o3d.shape[0] > 0
     assert pooled_wp.shape[0] == pooled_o3d.shape[0]
     key_o3d = tw.voxels.cell_indices(
-        wp.array(np.ascontiguousarray(pooled_o3d, dtype=np.float32), dtype=wp.vec3, device=device),
-        voxel_size,
-        origin=origin,
+        points_to_warp(pooled_o3d, device), voxel_size, origin=origin
     ).numpy()
     key_wp = tw.voxels.cells(grid).numpy()
     order_o3d = np.lexsort(key_o3d.T[::-1])
@@ -383,7 +376,7 @@ def test_pool_by_voxel_ignores_outside_points(device: str):
         wp.array(cells_np, dtype=wp.int32, device=device), 1.0, wp.vec3(0.0, 0.0, 0.0)
     )
     points_np = np.array([[0.25, 0.25, 0.25], [0.75, 0.75, 0.75], [-9.0, -9.0, -9.0]])
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     pooled = tw.voxels.pool_by_voxel(grid, points_wp, points_wp).numpy()
 
     slot = tw.voxels.cells(grid).numpy().tolist().index([0, 0, 0])
@@ -537,9 +530,7 @@ def test_occupancy_at_points_matches_open3d(sphere, device: str):
     grid = tw.voxels.voxelize_points(points_wp, voxel_size)
 
     queries_np = np.concatenate([points_np[:400], points_np[:400] + 5.0])
-    queries_wp = wp.array(
-        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    queries_wp = points_to_warp(queries_np, device)
     cloud_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points_np))
     grid_o3d = o3d.geometry.VoxelGrid.create_from_point_cloud(cloud_o3d, voxel_size=voxel_size)
     inside_o3d = np.array(
@@ -769,7 +760,7 @@ def test_resolve_voxel_grid_defaults_are_one_percent_and_a_half_cell_below(devic
     where the arithmetic here is ``float64`` (measured gap 7e-10).
     """
     points_np = np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]], dtype=np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     diagonal = float(np.linalg.norm(points_np[1] - points_np[0]))
 
     voxel_size, origin = tw.voxels.resolve_voxel_grid(points_wp)
@@ -923,7 +914,7 @@ def test_to_boxes_matches_trimesh_multibox(sphere, device: str):
     voxel_size = 0.2
     grid = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, voxel_size)
     vertices_out, faces_out = tw.voxels.to_boxes(grid, cull_internal=False)
-    boxes_wp = tm.Trimesh(vertices_out.numpy(), faces_out.numpy().reshape(-1, 3), process=False)
+    boxes_wp = warp_to_trimesh(vertices_out, faces_out)
     boxes_tm = tm.voxel.ops.multibox(tw.voxels.cell_centers(grid).numpy(), pitch=voxel_size)
 
     assert boxes_tm.faces.shape[0] > 0
@@ -946,7 +937,7 @@ def test_to_boxes_culled_is_a_closed_outward_shell(sphere, device: str):
     voxel_size = 0.2
     solid = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, voxel_size, mode="solid")
     vertices_out, faces_out = tw.voxels.to_boxes(solid)
-    shell = tm.Trimesh(vertices_out.numpy(), faces_out.numpy().reshape(-1, 3), process=False)
+    shell = warp_to_trimesh(vertices_out, faces_out)
     shell.remove_unreferenced_vertices()
 
     n_voxels = int(tw.voxels.cells(solid).shape[0])

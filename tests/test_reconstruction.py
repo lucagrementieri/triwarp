@@ -43,6 +43,9 @@ from tests.conversions import (
     points_to_open3d,
     points_to_pymeshlab,
     points_to_pyvista,
+    points_to_warp,
+    points_to_warp_uv,
+    warp_to_trimesh,
 )
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
@@ -64,9 +67,8 @@ def _sphere_cloud(subdivisions: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _to_warp(points_np: np.ndarray, normals_np: np.ndarray, device: str):
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
-    normals_wp = wp.array(np.ascontiguousarray(normals_np), dtype=wp.vec3, device=device)
-    return points_wp, normals_wp
+    """Upload an oriented cloud as one pair, since every Poisson test needs both buffers."""
+    return points_to_warp(points_np, device), points_to_warp(normals_np, device)
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +135,7 @@ def test_delaunay_matches_scipy_random(device: str):
 
     rng = np.random.default_rng(42)
     points_np = rng.random((200, 2)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+    points_wp = points_to_warp_uv(points_np, device)
 
     faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy()
     faces_sp = Delaunay(points_np.astype(np.float64)).simplices
@@ -158,7 +160,7 @@ def test_delaunay_contains_the_pyvista_triangulation(device: str):
     """
     rng = np.random.default_rng(0)
     points_np = rng.random((200, 2))
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec2, device=device)
+    points_wp = points_to_warp_uv(points_np, device)
 
     triangulated_pv = points_to_pyvista(np.column_stack([points_np, np.zeros(len(points_np))]))
     triangulated_pv = triangulated_pv.delaunay_2d()
@@ -179,7 +181,7 @@ def test_delaunay_contains_the_pyvista_triangulation(device: str):
 def test_delaunay_no_violations(device: str):
     rng = np.random.default_rng(7)
     points_np = rng.random((150, 2)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+    points_wp = points_to_warp_uv(points_np, device)
 
     faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy().reshape(-1, 3)
 
@@ -195,7 +197,7 @@ def test_delaunay_covers_hull(device: str):
 
     rng = np.random.default_rng(3)
     points_np = rng.random((120, 2)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+    points_wp = points_to_warp_uv(points_np, device)
 
     faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy().reshape(-1, 3)
     tris = points_np.astype(np.float64)[faces_wp]
@@ -209,7 +211,7 @@ def test_delaunay_cocircular(device: str):
     angles = np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False)
     ring = np.stack([np.cos(angles), np.sin(angles)], axis=1)
     points_np = np.vstack([ring, [[0.0, 0.0]]]).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+    points_wp = points_to_warp_uv(points_np, device)
 
     faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy().reshape(-1, 3)
     assert _incircle_violations(points_np.astype(np.float64), faces_wp) == 0
@@ -227,7 +229,7 @@ def test_delaunay_grid_perturbed(device: str):
     rng = np.random.default_rng(11)
     grid = np.stack(np.meshgrid(np.arange(8.0), np.arange(8.0)), axis=-1).reshape(-1, 2)
     points_np = (grid + rng.normal(0.0, 0.05, grid.shape)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+    points_wp = points_to_warp_uv(points_np, device)
 
     faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy()
     faces_sp = Delaunay(points_np.astype(np.float64)).simplices
@@ -236,7 +238,7 @@ def test_delaunay_grid_perturbed(device: str):
 
 def test_delaunay_collinear(device: str):
     points_np = np.array([[float(i), 0.0] for i in range(5)], dtype=np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+    points_wp = points_to_warp_uv(points_np, device)
     faces_wp = tw.reconstruction.delaunay_triangulation(points_wp)
     assert int(faces_wp.shape[0]) == 0
 
@@ -403,7 +405,7 @@ def test_estimated_normals_path_runs(device: str):
     # a documented best-effort step, so we check the pipeline runs and yields an edge-manifold mesh
     # whose vertices still lie on the sphere -- not full watertightness.
     points_np, _ = _sphere_cloud(3)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
 
     vertices_wp, faces_wp = tw.reconstruction.triangulate_point_cloud(points_wp, num_neighbours=18)
     assert faces_wp.numpy().shape[0] > 0
@@ -526,14 +528,6 @@ def _torus_cloud(n_major: int = 40, n_minor: int = 20, r_major: float = 1.0, r_m
     return points.astype(np.float64), normals.astype(np.float64)
 
 
-def _mesh_trimesh(vertices_wp, faces_wp) -> tm.Trimesh:
-    return tm.Trimesh(
-        vertices=vertices_wp.numpy().astype(np.float64),
-        faces=faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
-
-
 def _points_to_surface(points_np: np.ndarray, mesh: tm.Trimesh) -> float:
     """Mean distance from a point set to the nearest point on a mesh surface."""
     return float(np.abs(tm.proximity.signed_distance(mesh, points_np)).mean())
@@ -592,7 +586,7 @@ def test_poisson_sphere_watertight_manifold(device: str):
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
         points_wp, normals_wp, depth=6, full_depth=4
     )
-    mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
+    mesh_tw = warp_to_trimesh(vertices_wp, faces_wp)
 
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
     assert mesh_tw.euler_number == 2  # closed genus-0 surface
@@ -611,7 +605,7 @@ def test_poisson_outward_orientation(device: str):
         points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4
     )
     # Outward normals => positive enclosed volume.
-    assert _mesh_trimesh(vertices_wp, faces_wp).volume > 0.0
+    assert warp_to_trimesh(vertices_wp, faces_wp).volume > 0.0
 
 
 def test_poisson_torus_genus(device: str):
@@ -621,7 +615,7 @@ def test_poisson_torus_genus(device: str):
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
         points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4
     )
-    mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
+    mesh_tw = warp_to_trimesh(vertices_wp, faces_wp)
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
     assert mesh_tw.euler_number == 0  # genus-1 torus: V - E + F = 0
 
@@ -670,7 +664,7 @@ def test_poisson_matches_open3d_metric(device: str):
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
         points_wp, normals_wp, depth=6, full_depth=4
     )
-    mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
+    mesh_tw = warp_to_trimesh(vertices_wp, faces_wp)
     # depth=5 on the reference side, not 6: on this 642-point cloud open3d returns the *same*
     # 7 976 faces at both depths (measured) for 0.28 s instead of 0.85 s, so the extra octree
     # level is cost without an answer. Only the reference drops -- triwarp stays at depth 6, pinned
@@ -691,9 +685,9 @@ def test_poisson_screening_improves_fit(device: str):
     vertices_unscreened, faces_unscreened = tw.reconstruction.screened_poisson(
         points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, point_weight=0.0
     )
-    fit_screened = _points_to_surface(points_np, _mesh_trimesh(vertices_screened, faces_screened))
+    fit_screened = _points_to_surface(points_np, warp_to_trimesh(vertices_screened, faces_screened))
     fit_unscreened = _points_to_surface(
-        points_np, _mesh_trimesh(vertices_unscreened, faces_unscreened)
+        points_np, warp_to_trimesh(vertices_unscreened, faces_unscreened)
     )
     # Screening ties the surface to the samples: the fit is at least as good.
     assert fit_screened <= fit_unscreened + 1e-4
@@ -727,7 +721,7 @@ def test_poisson_matches_pymeshlab_metric(device: str):
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
         points_wp, normals_wp, depth=6, full_depth=4
     )
-    mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
+    mesh_tw = warp_to_trimesh(vertices_wp, faces_wp)
 
     # An oriented point cloud, so this is one of the few places a MeshSet is built from vertices
     # alone rather than through ``conversions.trimesh_to_pymeshlab``.
@@ -816,7 +810,7 @@ def test_poisson_adaptive_sphere_watertight_manifold(device: str):
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
         points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, method="adaptive"
     )
-    mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
+    mesh_tw = warp_to_trimesh(vertices_wp, faces_wp)
 
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
     assert mesh_tw.euler_number == 2  # closed genus-0 surface
@@ -835,7 +829,7 @@ def test_poisson_adaptive_torus_genus(device: str):
         points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, method="adaptive"
     )
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
-    assert _mesh_trimesh(vertices_wp, faces_wp).euler_number == 0  # genus-1 torus
+    assert warp_to_trimesh(vertices_wp, faces_wp).euler_number == 0  # genus-1 torus
 
 
 def test_poisson_adaptive_matches_dense(device: str):
@@ -852,7 +846,8 @@ def test_poisson_adaptive_matches_dense(device: str):
     # Its old ``symmetric_chamfer(...) < 0.05`` sat only 1.8x above that helper's 0.028 sampling
     # floor, which is most of what it was measuring; sample-to-surface has no floor.
     mean_distance, _ = symmetric_surface_distance(
-        _mesh_trimesh(vertices_dense, faces_dense), _mesh_trimesh(vertices_adaptive, faces_adaptive)
+        warp_to_trimesh(vertices_dense, faces_dense),
+        warp_to_trimesh(vertices_adaptive, faces_adaptive),
     )
     assert mean_distance < 0.02
 
@@ -877,9 +872,9 @@ def test_poisson_adaptive_screening_improves_fit(device: str):
         point_weight=0.0,
         method="adaptive",
     )
-    fit_screened = _points_to_surface(points_np, _mesh_trimesh(vertices_screened, faces_screened))
+    fit_screened = _points_to_surface(points_np, warp_to_trimesh(vertices_screened, faces_screened))
     fit_unscreened = _points_to_surface(
-        points_np, _mesh_trimesh(vertices_unscreened, faces_unscreened)
+        points_np, warp_to_trimesh(vertices_unscreened, faces_unscreened)
     )
     assert fit_screened <= fit_unscreened + 1e-4
 
@@ -897,7 +892,7 @@ def test_poisson_adaptive_confidence_runs(device: str):
         method="adaptive",
     )
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
-    assert _mesh_trimesh(vertices_wp, faces_wp).euler_number == 2
+    assert warp_to_trimesh(vertices_wp, faces_wp).euler_number == 2
 
 
 def test_poisson_invalid_method(device: str):
@@ -934,11 +929,7 @@ def test_resample_uniform_offsets_a_sphere(
     # and 1; the offset shifts that band without widening it much.
     assert np.abs(radii_np - (1.0 + offset)).max() < 2.0 * voxel_size
 
-    out_tm = tm.Trimesh(
-        out_vertices_wp.numpy().astype(np.float64),
-        out_faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
+    out_tm = warp_to_trimesh(out_vertices_wp, out_faces_wp)
     assert out_tm.is_watertight
     assert out_tm.volume > 0.0
 
@@ -956,9 +947,7 @@ def test_resample_uniform_repairs_a_broken_mesh(
     sphere_tm, _sphere_tm_wp = icosphere
     faces_np = np.asarray(sphere_tm.faces)
     broken_np = np.vstack([faces_np, faces_np[:20], faces_np[30:40][:, ::-1]])
-    vertices_wp = wp.array(
-        np.ascontiguousarray(sphere_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(sphere_tm.vertices, device)
     faces_wp = wp.array(
         np.ascontiguousarray(broken_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
     )
@@ -968,11 +957,7 @@ def test_resample_uniform_repairs_a_broken_mesh(
         vertices_wp, faces_wp, voxel_size=0.06
     )
     assert tw.validation.is_edge_manifold(out_faces_wp, allow_boundary_edges=False)
-    out_tm = tm.Trimesh(
-        out_vertices_wp.numpy().astype(np.float64),
-        out_faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
+    out_tm = warp_to_trimesh(out_vertices_wp, out_faces_wp)
     assert out_tm.is_watertight
     assert np.isclose(np.abs(out_tm.volume), 4.0 / 3.0 * np.pi, rtol=0.1)
 
@@ -1012,11 +997,7 @@ def test_resample_uniform_matches_pymeshlab(
     out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
         vertices_wp, faces_wp, voxel_size=voxel_size
     )
-    out_tm = tm.Trimesh(
-        out_vertices_wp.numpy().astype(np.float64),
-        out_faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
+    out_tm = warp_to_trimesh(out_vertices_wp, out_faces_wp)
     assert out_tm.is_watertight
     assert np.isclose(np.abs(out_tm.volume), np.abs(pml_tm.volume), rtol=0.05)
 
@@ -1071,11 +1052,7 @@ def test_resample_uniform_matches_igl(device: str, icosphere: tuple[tm.Trimesh, 
     out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
         vertices_wp, faces_wp, voxel_size=voxel_size
     )
-    out_tm = tm.Trimesh(
-        out_vertices_wp.numpy().astype(np.float64),
-        out_faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
+    out_tm = warp_to_trimesh(out_vertices_wp, out_faces_wp)
 
     assert mesh_igl.is_watertight
     assert out_tm.is_watertight
@@ -1119,11 +1096,7 @@ def test_resample_uniform_matches_meshlib(
     out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
         vertices_wp, faces_wp, voxel_size=voxel_size
     )
-    out_tm = tm.Trimesh(
-        out_vertices_wp.numpy().astype(np.float64),
-        out_faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
+    out_tm = warp_to_trimesh(out_vertices_wp, out_faces_wp)
 
     settings_ml = mm.RebuildMeshSettings()
     settings_ml.voxelSize = voxel_size
@@ -1400,9 +1373,7 @@ def test_ball_pivoting_matches_pymeshlab(device: str):
     radius = 1.5 * spacing
 
     vertices_wp, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp, radius=radius)
-    mesh_wp = tm.Trimesh(
-        vertices_wp.numpy().astype(np.float64), faces_wp.numpy().reshape(-1, 3), process=False
-    )
+    mesh_wp = warp_to_trimesh(vertices_wp, faces_wp)
 
     meshset_pml = points_to_pymeshlab(points_np, normals_np)
     meshset_pml.generate_surface_reconstruction_ball_pivoting(
@@ -1445,7 +1416,7 @@ def test_ball_pivoting_small_radius_leaves_holes(device: str):
 
 def test_ball_pivoting_estimated_normals(device: str):
     points_np, _normals = _sphere_cloud(3)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     # normals=None triggers PCA normal estimation (valid for this star-shaped cloud).
     _vertices, faces_wp = tw.reconstruction.ball_pivoting(points_wp, None)
     assert int(faces_wp.shape[0]) > 0

@@ -11,22 +11,20 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import canonical_winding, undirected_edges
+from tests.conftest import CLOSED_MESHES, MESHES, OPEN_MESHES
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     numpy_to_meshlib,
-    numpy_to_pymeshfix,
     numpy_to_warp,
+    points_to_warp,
     pymeshfix_face_remap,
     pymeshfix_intersecting_faces,
     trimesh_to_meshlib,
     trimesh_to_open3d,
+    trimesh_to_pymeshfix,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
 )
-
-CLOSED_MESHES = ["icosahedron", "cave_cube"]
-OPEN_MESHES = ["hemisphere", "half_torus"]
-ALL_MESHES = CLOSED_MESHES + OPEN_MESHES
 
 
 def _faces_igl(mesh_tm: tm.Trimesh) -> np.ndarray:
@@ -114,7 +112,7 @@ def _mobius_strip(n: int) -> tuple[np.ndarray, np.ndarray]:
     return np.array(vertices), np.array(faces)
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("is_vertex_manifold", "pymeshlab")
 @pytest.mark.parity("is_watertight", "pymeshlab")
 @pytest.mark.parity("is_volume", "pymeshlab")
@@ -182,7 +180,7 @@ def test_topological_measures_match_pymeshlab(
     assert euler_wp == 2 * n_components - 2 * int(measures_pml["genus"]) - n_loops
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("is_edge_manifold", "igl")
 def test_is_edge_manifold_allow_boundary(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -206,7 +204,7 @@ def test_is_edge_manifold_allow_boundary(request: pytest.FixtureRequest, mesh_na
     assert manifold_wp == manifold_np
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_is_edge_manifold_no_boundary(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     manifold_wp = tw.validation.is_edge_manifold(mesh_wp.indices, allow_boundary_edges=False)
@@ -216,7 +214,7 @@ def test_is_edge_manifold_no_boundary(request: pytest.FixtureRequest, mesh_name:
     assert manifold_wp == (mesh_name in CLOSED_MESHES)
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parametrize("allow_boundary_edges", [True, False])
 @pytest.mark.parity("is_edge_manifold", "open3d")
 def test_is_edge_manifold_matches_open3d(
@@ -242,7 +240,7 @@ def test_is_edge_manifold_matches_open3d(
         assert manifold_o3d == (mesh_name in CLOSED_MESHES)
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("is_edge_manifold", "pyvista")
 def test_is_edge_manifold_matches_pyvista(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -304,7 +302,7 @@ def test_is_edge_manifold_nonmanifold_fan_matches_open3d(device: str) -> None:
         assert manifold_wp is False
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parametrize("allow_boundary_edges", [True, False])
 def test_edge_manifold_mask(
     request: pytest.FixtureRequest, mesh_name: str, allow_boundary_edges: bool
@@ -406,7 +404,7 @@ def test_is_watertight_is_volume_precomputed_shortcut(
     ) == tw.validation.is_volume(mesh_wp.points, mesh_wp.indices)
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("is_vertex_manifold", "igl")
 def test_is_vertex_manifold(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -447,7 +445,7 @@ def test_is_vertex_manifold_bowtie(device: str) -> None:
     assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=True) is True
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("is_vertex_manifold", "open3d")
 def test_is_vertex_manifold_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -493,7 +491,7 @@ def test_is_vertex_manifold_open3d_agreement_and_divergence(device: str) -> None
     assert tw.validation.is_vertex_manifold(fan_faces_wp) is False
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_vertex_manifold_mask(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class A: the per-vertex mask against ``igl.is_vertex_manifold``, which has the same shape.
@@ -578,7 +576,7 @@ def test_is_self_intersecting_separated(device: str) -> None:
     assert tw.validation.is_self_intersecting(mesh_wp) is False
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_face_self_intersecting_mask_matches_predicate(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -713,7 +711,7 @@ def test_face_self_intersecting_mask_matches_pymeshfix(device: str, kind: str) -
         mesh_tm = tm.creation.icosphere(subdivisions=2)
         n_expected = 0
 
-    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    tin_pmf = trimesh_to_pymeshfix(mesh_tm)
     assert tin_pmf.n_faces == mesh_tm.faces.shape[0]  # the remap below needs an untouched load
     faces_pmf = pymeshfix_face_remap(tin_pmf, mesh_tm.faces)[
         pymeshfix_intersecting_faces(tin_pmf, tris_per_cell=50, justproper=False)
@@ -799,7 +797,7 @@ def test_face_self_intersecting_mask_tangential_contact_divergence(
     assert int((mask_wp != mask_ml).sum()) < 0.005 * n_faces
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_is_winding_consistent(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class A on a boolean: agrees with ``Trimesh.is_winding_consistent``, and reads ``True`` here.
@@ -831,7 +829,7 @@ def test_is_winding_consistent_flipped(icosahedron: tuple[tm.Trimesh, wp.Mesh]) 
     assert winding_wp is False
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_edge_winding_consistent_mask_matches_predicate(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -854,7 +852,7 @@ def test_edge_winding_consistent_mask_flags_flipped(
     assert bool(tw.reduce.all(mask_wp)) is False
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_is_orientable_fixtures(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     orientable_wp = tw.validation.is_orientable(mesh_wp.indices)
@@ -900,7 +898,7 @@ def test_is_orientable_closed_non_orientable(boy_surface: tuple[tm.Trimesh, wp.M
     assert tw.validation.is_winding_consistent(mesh_wp.indices) is False
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_face_flip_mask_all_false_on_consistent(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -1060,7 +1058,7 @@ def test_face_orientation_bits_leave_edges_unsatisfied_only_when_non_orientable(
     assert (int(frustrated_np.sum()) == 0) is orientable
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("is_watertight", "open3d")
 def test_is_watertight_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -1097,9 +1095,7 @@ def test_is_watertight_rejects_self_intersection_like_open3d(device: str) -> Non
     tangled_tm = tm.util.concatenate([first_tm, second_tm])
     tangled_tm.merge_vertices()
 
-    vertices_wp = wp.array(
-        np.ascontiguousarray(tangled_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(tangled_tm.vertices, device)
     faces_wp = wp.array(
         np.ascontiguousarray(tangled_tm.faces.reshape(-1), dtype=np.int32),
         dtype=wp.int32,
@@ -1151,7 +1147,7 @@ def test_is_watertight_rejects_a_connected_surface_that_intersects_itself(
     )  # trimesh's weaker definition, and why open3d is the oracle
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("is_watertight", "meshlib")
 def test_is_watertight_closedness_clause_matches_meshlib(
     request: pytest.FixtureRequest, mesh_name: str
@@ -1188,7 +1184,7 @@ def test_is_watertight_closedness_clause_matches_meshlib(
     assert tw.validation.is_watertight(vertices_wp, faces_wp) is False
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("is_watertight", "trimesh")
 def test_is_watertight(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -1206,7 +1202,7 @@ def test_is_watertight(request: pytest.FixtureRequest, mesh_name: str) -> None:
     assert watertight_wp == bool(mesh_tm.is_watertight)
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_face_watertight_mask_matches_reference(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -1237,7 +1233,7 @@ def test_face_watertight_mask_broken_faces_reference(
     assert np.array_equal(np.sort(broken_ours), np.sort(broken_tm))
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("is_volume", "trimesh")
 def test_is_volume(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -1303,7 +1299,7 @@ def test_new_masks_empty_mesh(device: str) -> None:
     assert tw.validation.face_flip_mask(faces_wp).shape[0] == 0
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_supplied_mesh_gives_the_same_answer(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:

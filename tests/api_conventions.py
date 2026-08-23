@@ -1,7 +1,7 @@
 """
 Static scan of the public API's shape: names, summaries, file layout and module boundaries.
 
-Eighteen conventions the package holds to, each one a defect class that was actually found rather
+Nineteen conventions the package holds to, each one a defect class that was actually found rather
 than an aesthetic preference. They are checked by an ``ast`` scan of ``triwarp/`` (excluding
 ``kernels/``, ``__init__.py`` and private ``_*.py`` modules) plus a listing of ``tests/`` and
 ``benchmarks/``, and [`tests/test_api_conventions.py`](test_api_conventions.py) fails the default
@@ -96,6 +96,13 @@ test run on any violation:
     46 ``-> wp.bool`` plus 12 bare parameters, the newest written the day after the pass that
     converted the last batch of casts. It reads ``@wp.kernel`` / ``@wp.func`` signatures only,
     because a kernel *factory* is ordinary Python whose ``int`` parameters are correct.
+19. **A test comparing against a reference library says which class the comparison is**
+    (``.claude/CLAUDE.md`` section 6). The second check that reads ``tests/`` rather than
+    ``triwarp/``, and it is here because the convention has decayed twice: the lowercase ``class b``
+    spelling went 21 -> 0 -> 9, invisible to the grep section 6 prescribes because a human reads it
+    the same. It accepts all four label phrases the suite uses, keys on ``ast.Assert`` so a fixture
+    unpack is not a hit, and leaves ``_np`` out because it marks inputs as often as oracles. It
+    checks that a label is *present*, never that it is the right one.
 
 Why a static scan rather than importing ``triwarp``
 ---------------------------------------------------
@@ -1473,4 +1480,85 @@ def bare_annotation_problems() -> list[str]:
                     f"{path.relative_to(_REPO_ROOT)}:{annotation.lineno} {function.name} annotates "
                     f"its {where} '{annotation.id}' -- write {replacement} instead"
                 )
+    return problems
+
+
+# --- check 19 -----------------------------------------------------------------------------------
+
+# The suffixes ``.claude/CLAUDE.md`` section 6 assigns to reference libraries. ``_np`` is
+# deliberately absent: section 6 gives it to "NumPy/SciPy" and ``tests/parity.py`` counts it, which
+# is right there because a ``parity`` marker has already declared that a second implementation was
+# consulted -- but in the suite at large ``_np`` marks *inputs* at least as often as oracles.
+# Measured: adding it takes this scan from 523 comparison tests to 783 and from 0 problems to 290.
+_REFERENCE_SUFFIXES = ("_tm", "_igl", "_pp", "_pml", "_o3d", "_pv", "_ml", "_pmf")
+
+# The four phrases the suite uses to label a comparison, all four in good standing. ``Class [ABCD]``
+# and ``Not a library comparison`` are section 6's named labels; ``Not a parity assert`` and
+# ``Triwarp against triwarp`` are its triwarp-against-triwarp family. A gate accepting only the
+# first two would fail 14 correct tests and the author's fix would be to reword good docstrings.
+_COMPARISON_LABELS = re.compile(
+    r"Class [ABCD]\b|Not a library comparison|Not a parity assert|[Tt]riwarp against triwarp"
+)
+
+
+def _asserted_reference_names(function: ast.FunctionDef) -> set[str]:
+    """Reference-suffixed names read by an ``assert`` in this function."""
+    found: set[str] = set()
+    for statement in ast.walk(function):
+        if not isinstance(statement, ast.Assert):
+            continue
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and node.id.endswith(_REFERENCE_SUFFIXES):
+                found.add(node.id)
+    return found
+
+
+def comparison_label_problems() -> list[str]:
+    """
+    Check 19: a test comparing against a reference library says which class the comparison is.
+
+    ``.claude/CLAUDE.md`` section 6 asks for the label and explains what each class means; this only
+    checks that one of the four phrases is present. It cannot check that the label is the *right*
+    one -- that stays a review question, as section 14 says of every naming rule -- and it must not
+    try: a ``_tm`` name inside an ``assert`` is not proof of an oracle.
+    ``test_split_single_component`` compares ``split``'s output against ``mesh_tm.vertices``, the
+    *input* mesh, which is a round trip; and in
+    ``test_split_faces_along_field_positive_side_is_the_clip`` the ``_tm`` names are triwarp results
+    run through ``warp_to_trimesh``. Both are correctly labelled and neither is a library
+    comparison.
+
+    Two decisions make it fire only on real omissions. It keys on ``ast.Assert`` rather than on the
+    whole function body, because a fixture unpack ``mesh_tm, mesh_wp = icosphere`` names a ``_tm``
+    variable in every mesh test -- keying on the body takes this from 0 problems to 120. And it
+    accepts all four label phrases rather than section 6's two headline ones, for the reason given
+    at ``_COMPARISON_LABELS``.
+
+    It exists because the convention has decayed twice. Round 2 of the test-suite rescan took the
+    lowercase ``class b`` spelling from 21 to 0, and 9 more had accumulated by round 4 -- invisible
+    to the grep section 6 prescribes, since a human reads them the same. The other defect it closes
+    is rarer and worse: ``test_fill_min_weight_matches_meshlib`` carried a ``parity`` marker,
+    compared a class-C statistic against MeshLib, and had **no docstring at all**, which ruff cannot
+    see because ``D103`` is in the ignore list.
+    """
+    problems: list[str] = []
+    for path in sorted(_TESTS_DIR.glob("test_*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # test_package_scan_is_discoverable reports the parse failure
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef) or not function.name.startswith("test_"):
+                continue
+            names = _asserted_reference_names(function)
+            if not names:
+                continue
+            docstring = ast.get_docstring(function) or ""
+            if _COMPARISON_LABELS.search(docstring):
+                continue
+            reason = "has no docstring" if not docstring else "carries no class label"
+            problems.append(
+                f"{path.relative_to(_REPO_ROOT)}:{function.lineno} {function.name} {reason} "
+                f"but asserts on {', '.join(sorted(names)[:3])} -- write 'Class A'/'Class B'/"
+                f"'Class C'/'Class D', 'Not a library comparison' or 'Not a parity assert'"
+            )
     return problems

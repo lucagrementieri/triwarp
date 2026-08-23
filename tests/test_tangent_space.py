@@ -16,8 +16,7 @@ import pytest
 import warp as wp
 
 import triwarp as tw
-
-_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
+from tests.conftest import MESHES
 
 
 def _vector_heat_solver_pp(mesh_tm: object) -> pp3d.MeshVectorHeatSolver:
@@ -35,7 +34,7 @@ def _vector_heat_solver_pp(mesh_tm: object) -> pp3d.MeshVectorHeatSolver:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_vertex_tangent_frames_are_orthonormal(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -53,7 +52,7 @@ def test_vertex_tangent_frames_are_orthonormal(
     assert np.allclose((np.cross(basis_x, basis_y) * normal).sum(axis=1), 1.0, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("vertex_tangent_frames", "potpourri3d")
 def test_vertex_tangent_frames_match_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
@@ -109,7 +108,7 @@ def test_vertex_tangent_frames_isolated_vertex(device: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_halfedge_tangent_angles_span_the_rescaled_disk(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -194,7 +193,7 @@ def test_halfedge_transport_angle_holonomy_matches_potpourri3d(
     )
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_halfedge_transport_angles_are_antisymmetric(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:

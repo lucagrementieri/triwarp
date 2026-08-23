@@ -17,15 +17,19 @@ from scipy.spatial import KDTree
 
 import triwarp as tw
 from tests.comparisons import hausdorff_two_sided
+from tests.conftest import MESHES
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
+    points_to_warp,
     trimesh_to_meshlib,
     trimesh_to_pyvista,
     trimesh_to_warp,
     warp_to_trimesh,
 )
 from triwarp.constants import TOLERANCE_MERGE
+
+_SPLIT_MESHES = ["icosphere", "unit_box", "torus"]
 
 
 def _plane_ml(normal_np: np.ndarray, origin_np: np.ndarray) -> mm.Plane3f:
@@ -88,13 +92,13 @@ def _canonical_segments(lines_np: np.ndarray) -> np.ndarray:
 def _segments_equal(
     got_np: np.ndarray, exp_np: np.ndarray, *, rtol: float = 1e-5, atol: float = 1e-5
 ) -> bool:
-    got = _canonical_segments(got_np.reshape(-1, 2, 3))
-    exp = _canonical_segments(exp_np.reshape(-1, 2, 3))
-    if got.shape != exp.shape:
+    got_segments = _canonical_segments(got_np.reshape(-1, 2, 3))
+    expected_segments = _canonical_segments(exp_np.reshape(-1, 2, 3))
+    if got_segments.shape != expected_segments.shape:
         return False
-    if got.shape[0] == 0:
+    if got_segments.shape[0] == 0:
         return True
-    return bool(np.allclose(got, exp, rtol=rtol, atol=atol))
+    return bool(np.allclose(got_segments, expected_segments, rtol=rtol, atol=atol))
 
 
 @pytest.mark.parity("segments_with_plane", "trimesh")
@@ -121,8 +125,8 @@ def test_segments_with_plane_axis_aligned(device: str) -> None:
         plane_origin, plane_normal, endpoints_np, line_segments=True
     )
 
-    start_points_wp = wp.array(endpoints_np[0], dtype=wp.vec3, device=device)
-    end_points_wp = wp.array(endpoints_np[1], dtype=wp.vec3, device=device)
+    start_points_wp = points_to_warp(endpoints_np[0], device)
+    end_points_wp = points_to_warp(endpoints_np[1], device)
     intersections_wp, valid_wp = tw.intersection.segments_with_plane(
         start_points_wp,
         end_points_wp,
@@ -153,8 +157,8 @@ def test_segments_with_plane_parallel(device: str) -> None:
         plane_origin, plane_normal, endpoints_np, line_segments=True
     )
 
-    start_points_wp = wp.array(endpoints_np[0], dtype=wp.vec3, device=device)
-    end_points_wp = wp.array(endpoints_np[1], dtype=wp.vec3, device=device)
+    start_points_wp = points_to_warp(endpoints_np[0], device)
+    end_points_wp = points_to_warp(endpoints_np[1], device)
     _, valid_wp = tw.intersection.segments_with_plane(
         start_points_wp,
         end_points_wp,
@@ -276,6 +280,664 @@ def test_mesh_with_plane_miss_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> 
         wp.vec3(*plane_origin.tolist()),
     )
     assert lines_wp.shape == (0, 2)
+
+
+@pytest.mark.parity("mesh_with_plane", "meshlib")
+@pytest.mark.parity("mesh_with_mesh", "meshlib")
+def test_plane_and_mesh_sections_match_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B on the *curve*: both references order the contour where triwarp returns segments.
+
+    Neither pairing can be compared element-wise, and for the same reason in both directions:
+    ``extractPlaneSections`` and ``findIntersectionContours`` walk the intersection into an ordered
+    polyline, while ``mesh_with_plane`` and ``mesh_with_mesh`` emit an unordered ``(m, 2, 3)``
+    segment soup. So the comparable quantities are the curve's **total length** and the point set it
+    passes through, which is what a caller of either actually consumes.
+
+    Measured on ``icosphere(3)`` cut at ``z = 0.13``: MeshLib returns **one** closed section of 95
+    points against triwarp's 94 segments -- the same 94, with the first point repeated to close --
+    and the perimeters are **6.217219 against 6.217220**. Every decoded point sits at exactly the
+    plane's ``z``, which is the assert that catches a plane built from the wrong ``d``.
+
+    For the mesh-mesh half, two overlapping spheres give one contour of 153 points against 201
+    segments -- different counts, since neither library promises a particular sampling of the same
+    curve -- with total lengths **5.008801 against 5.008798**.
+    """
+    mesh_tm, mesh_wp = icosphere
+    normal_np = np.array([0.0, 0.0, 1.0])
+    origin_np = mesh_tm.vertices.mean(axis=0) + np.array([0.0, 0.0, 0.13])
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+
+    segments_wp = tw.intersection.mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
+    ).numpy()
+    sections_ml = mm.extractPlaneSections(mm.MeshPart(mesh_ml), _plane_ml(normal_np, origin_np))
+
+    assert len(sections_ml) == 1  # one closed rim, so the length comparison is not over fragments
+    points_ml = _section_points_ml(mesh_ml, sections_ml[0])
+    assert np.allclose(points_ml[:, 2], origin_np[2], atol=1e-5)  # the plane really is where it is
+    assert points_ml.shape[0] == segments_wp.shape[0] + 1  # closed: the first point repeats
+
+    length_wp = float(np.linalg.norm(segments_wp[:, 1] - segments_wp[:, 0], axis=1).sum())
+    length_ml = float(np.linalg.norm(np.diff(points_ml, axis=0), axis=1).sum())
+    assert np.isclose(length_wp, length_ml, rtol=1e-5)
+
+    # Mesh against mesh, on two overlapping spheres.
+    other_tm = mesh_tm.copy()
+    other_tm.apply_translation([1.2, 0.0, 0.0])
+    other_wp = trimesh_to_warp(other_tm, str(mesh_wp.points.device))
+    crossing_wp = tw.intersection.mesh_with_mesh(
+        mesh_wp.points, mesh_wp.indices, other_wp.points, other_wp.indices
+    ).numpy()
+    contours_ml = mm.findIntersectionContours(mesh_ml, trimesh_to_meshlib(other_tm))
+
+    assert len(contours_ml) == 1
+    contour_np = np.array([[point.x, point.y, point.z] for point in contours_ml[0]])
+    assert contour_np.shape[0] > 10  # non-vacuity: the two spheres really do intersect
+    assert np.isclose(
+        float(np.linalg.norm(crossing_wp[:, 1] - crossing_wp[:, 0], axis=1).sum()),
+        float(np.linalg.norm(np.diff(contour_np, axis=0), axis=1).sum()),
+        rtol=1e-4,
+    )
+
+
+def _curves_pp(
+    vertices_np: np.ndarray, faces_np: np.ndarray, values_np: np.ndarray, isovalue: float
+) -> tuple[list[np.ndarray], list[bool]]:
+    """Decode potpourri3d's barycentric contour output into point arrays and closed flags."""
+    edges_pp = np.asarray(pp3d.edges(vertices_np, faces_np))
+    curves: list[np.ndarray] = []
+    closed: list[bool] = []
+    for curve in pp3d.marching_triangles(vertices_np, faces_np, values_np, isovalue):
+        points = []
+        for element, barycentric in curve:
+            if len(barycentric) == 0:  # a vertex
+                points.append(vertices_np[element])
+            elif len(barycentric) == 1:  # a point along an edge
+                start, end = edges_pp[element]
+                points.append(
+                    (1.0 - barycentric[0]) * vertices_np[start] + barycentric[0] * vertices_np[end]
+                )
+            else:  # a point inside a face
+                weights = np.array(
+                    [barycentric[0], barycentric[1], 1.0 - barycentric[0] - barycentric[1]]
+                )
+                points.append(weights @ vertices_np[faces_np[element]])
+        is_closed = len(points) > 2 and np.allclose(points[0], points[-1])
+        curves.append(np.array(points[:-1] if is_closed else points))
+        closed.append(is_closed)
+    return curves, closed
+
+
+def _total_length(curves: list[np.ndarray], closed: list[bool]) -> float:
+    """Sum the curve lengths, counting the closing chord of every closed curve."""
+    total = 0.0
+    for points, is_closed in zip(curves, closed, strict=True):
+        total += float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+        if is_closed:
+            total += float(np.linalg.norm(points[0] - points[-1]))
+    return total
+
+
+# ---------------------------------------------------------------------------
+# marching_triangles
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parity("marching_triangles", "meshlib")
+@pytest.mark.parity("marching_triangles_curves", "meshlib")
+def test_marching_triangles_matches_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: ``extractIsolines`` returns the same level set, closed by a repeated point.
+
+    Two transforms, both named. Its ``vertValues`` is a ``VertScalars`` filled per vertex -- there
+    is no array constructor, so the fill is a Python loop over ``VertId`` keys -- and its output is
+    a list of ``EdgePoint`` contours that must go through ``Mesh.edgePoint`` to become positions.
+    Its closed contours repeat their first point where triwarp returns the cycle once and flags it
+    ``closed``, which is the same convention potpourri3d's ``marching_triangles`` uses.
+
+    Measured on the ``z`` field of ``icosphere(3)`` at 0.13: one closed curve, 94 points against 95,
+    lengths **6.217219 against 6.217220**. That is the same curve
+    [`test_plane_and_mesh_sections_match_meshlib`] gets from the plane section, which is the
+    consistency worth having -- the level set of a coordinate *is* a plane section, and the two
+    entry points reach it by different code.
+
+    The second half covers the ``marching_triangles_curves`` group, whose question is the opposite
+    one: a sinusoidal field whose level set is **many** short loops rather than one long one, where
+    the linking is the work. Both libraries return **18** closed curves totalling 52.3072 against
+    52.3072 -- agreeing to **1.0e-08** -- so the curve *count* is asserted as well as the length,
+    which is what would break if either side split or merged a loop.
+    """
+    mesh_tm, mesh_wp = icosphere
+    isovalue = float(mesh_tm.vertices[:, 2].mean() + 0.13)
+    field_np = np.ascontiguousarray(mesh_tm.vertices[:, 2], dtype=np.float32)
+    field_wp = wp.array(field_np, dtype=wp.float32, device=mesh_wp.points.device)
+
+    curves_wp, closed_wp = tw.intersection.marching_triangles(
+        mesh_wp.points, mesh_wp.indices, field_wp, isovalue
+    )
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    values_ml = mm.VertScalars()
+    values_ml.resize(mesh_ml.points.size(), 0.0)
+    for index, value in enumerate(field_np):
+        values_ml[mm.VertId(index)] = float(value)
+    isolines_ml = mm.extractIsolines(mesh_ml.topology, values_ml, isovalue)
+
+    assert len(isolines_ml) == len(curves_wp) == 1
+    assert closed_wp == [True]
+    points_ml = _section_points_ml(mesh_ml, isolines_ml[0])
+    curve_np = curves_wp[0].numpy()
+
+    assert points_ml.shape[0] == curve_np.shape[0] + 1  # its closed contour repeats the first point
+    assert np.allclose(points_ml[0], points_ml[-1], atol=1e-6)
+    length_wp = float(
+        np.linalg.norm(np.diff(np.vstack([curve_np, curve_np[:1]]), axis=0), axis=1).sum()
+    )
+    assert np.isclose(
+        length_wp, float(np.linalg.norm(np.diff(points_ml, axis=0), axis=1).sum()), rtol=1e-5
+    )
+
+    # The many-curve field: same count, same total length, and the linking is what could differ.
+    wave_np = np.ascontiguousarray(
+        np.sin(6.0 * mesh_tm.vertices[:, 0])
+        * np.cos(6.0 * mesh_tm.vertices[:, 1])
+        * np.sin(6.0 * mesh_tm.vertices[:, 2]),
+        dtype=np.float32,
+    )
+    wave_curves_wp, wave_closed_wp = tw.intersection.marching_triangles(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.array(wave_np, dtype=wp.float32, device=mesh_wp.points.device),
+        0.0,
+    )
+    wave_values_ml = mm.VertScalars()
+    wave_values_ml.resize(mesh_ml.points.size(), 0.0)
+    for index, value in enumerate(wave_np):
+        wave_values_ml[mm.VertId(index)] = float(value)
+    wave_lines_ml = mm.extractIsolines(mesh_ml.topology, wave_values_ml, 0.0)
+
+    assert len(wave_curves_wp) > 5  # non-vacuity: this field really is multi-curve
+    assert len(wave_lines_ml) == len(wave_curves_wp)
+    total_wp = sum(
+        float(
+            np.linalg.norm(
+                np.diff(
+                    np.vstack([curve.numpy(), curve.numpy()[:1]]) if is_closed else curve.numpy(),
+                    axis=0,
+                ),
+                axis=1,
+            ).sum()
+        )
+        for curve, is_closed in zip(wave_curves_wp, wave_closed_wp, strict=True)
+    )
+    total_ml = sum(
+        float(np.linalg.norm(np.diff(_section_points_ml(mesh_ml, line_ml), axis=0), axis=1).sum())
+        for line_ml in wave_lines_ml
+    )
+    assert np.isclose(total_wp, total_ml, rtol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+@pytest.mark.parametrize("axis", [0, 2])
+@pytest.mark.parity("marching_triangles", "potpourri3d")
+def test_marching_triangles_matches_potpourri3d(
+    request: pytest.FixtureRequest, mesh_name: str, axis: int, device: str
+) -> None:
+    """
+    Class B (barycentric decoding): potpourri3d reports hits in its own element numbering.
+
+    Section 6 records the decode: ``(element_index, coords)`` pairs dispatched on
+    ``len(coords)`` through ``pp3d.edges``, and its closed curves repeat their first point
+    where triwarp's do not. Both transforms are on the reference side; the positions are then
+    compared directly.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
+    # A coordinate function, contoured a little off centre so the level set misses the vertices: an
+    # exact vertex hit is a genuine convention difference (see the dedicated test below).
+    values_np = np.ascontiguousarray(vertices_np[:, axis])
+    isovalue = float(0.5137 * values_np.min() + 0.4863 * values_np.max())
+    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
+
+    curves_wp, closed_wp = tw.intersection.marching_triangles(
+        mesh_wp.points, mesh_wp.indices, values_wp, isovalue, n_vertices=len(vertices_np)
+    )
+    curves_pp, closed_pp = _curves_pp(vertices_np, faces_np, values_np, isovalue)
+
+    assert len(curves_wp) == len(curves_pp)
+    assert sorted(closed_wp) == sorted(closed_pp)
+    assert np.isclose(
+        _total_length([curve.numpy() for curve in curves_wp], closed_wp),
+        _total_length(curves_pp, closed_pp),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    # The level sets must coincide as point sets, not merely in total length.
+    bounding_diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
+    assert (
+        hausdorff_two_sided(
+            np.concatenate([curve.numpy() for curve in curves_wp]), np.concatenate(curves_pp)
+        )
+        < 1e-6 * bounding_diagonal
+    )
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+@pytest.mark.parity("marching_triangles", "igl")
+@pytest.mark.parity("marching_triangles_curves", "igl")
+def test_marching_triangles_matches_igl(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    """
+    Class B: ``igl.isolines`` returns a segment **soup**, so the linking must be undone first.
+
+    igl gives ``(points, segments, segment_values)`` with no curve structure at all -- every
+    crossing is an independent 2-point segment -- where ``marching_triangles`` returns polylines.
+    The named transform is therefore to reduce triwarp's curves to the same soup: each consecutive
+    pair of a curve is a segment, plus the closing pair for a closed curve. Two quantities are then
+    directly comparable and both are asserted: the total segment length, and the point sets through
+    a two-sided Hausdorff distance.
+
+    Segment *count* is not compared, and that is deliberate: a polyline of ``n`` points contributes
+    ``n - 1`` segments (``n`` closed), so triwarp's count is derived from its linking while igl's is
+    the raw crossing count -- they agree here but the equality is a property of this input rather
+    than of the two algorithms, and asserting it would be asserting the wrong thing.
+
+    Both this group and ``marching_triangles_curves`` are covered because the transform is the same
+    for one long contour and for a thousand short ones; the linking count is what differs, and it is
+    exactly what this comparison steps around.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int64)
+    values_np = np.ascontiguousarray(vertices_np[:, 2])
+    isovalue = float(0.5137 * values_np.min() + 0.4863 * values_np.max())
+    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
+
+    points_igl, segments_igl, _values_igl = igl.isolines(
+        vertices_np, faces_np, values_np, np.array([isovalue])
+    )
+    curves_wp, closed_wp = tw.intersection.marching_triangles(
+        mesh_wp.points, mesh_wp.indices, values_wp, isovalue, n_vertices=len(vertices_np)
+    )
+
+    assert segments_igl.shape[0] > 0
+    length_igl = float(
+        np.linalg.norm(
+            points_igl[segments_igl[:, 0]] - points_igl[segments_igl[:, 1]], axis=1
+        ).sum()
+    )
+    assert np.isclose(
+        _total_length([curve.numpy() for curve in curves_wp], closed_wp),
+        length_igl,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    bounding_diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
+    assert (
+        hausdorff_two_sided(np.concatenate([curve.numpy() for curve in curves_wp]), points_igl)
+        < 1e-5 * bounding_diagonal
+    )
+
+
+@pytest.mark.parity("marching_triangles_curves", "potpourri3d")
+def test_marching_triangles_many_components_matches_potpourri3d(device: str) -> None:
+    """
+    Class B, same decoding, on a field whose level set breaks into many small loops.
+
+    The single-contour test above exercises the per-face crossing arithmetic; this exercises
+    the segment *linking*, which is where a many-component field can drop or merge a loop while
+    every individual crossing stays right.
+    """
+    # An oscillating field breaks the level set into many small loops, which is what exercises the
+    # segment linking rather than the per-face crossing arithmetic.
+    mesh_tm = tw.creation.icosphere(subdivisions=3)
+    vertices_np = np.ascontiguousarray(mesh_tm[0].numpy(), dtype=np.float64)
+    faces_np = np.ascontiguousarray(mesh_tm[1].numpy().reshape(-1, 3), dtype=np.int32)
+    values_np = np.ascontiguousarray(
+        np.sin(8.0 * vertices_np[:, 0]) * np.cos(8.0 * vertices_np[:, 1])
+    )
+    isovalue = 0.1370
+
+    vertices_wp = points_to_warp(vertices_np, device)
+    faces_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
+    values_wp = wp.array(values_np, dtype=wp.float64, device=device)
+
+    curves_wp, closed_wp = tw.intersection.marching_triangles(
+        vertices_wp, faces_wp, values_wp, isovalue, n_vertices=len(vertices_np)
+    )
+    curves_pp, closed_pp = _curves_pp(vertices_np, faces_np, values_np, isovalue)
+
+    assert len(curves_wp) > 10
+    assert len(curves_wp) == len(curves_pp)
+    assert all(closed_wp)
+    assert np.isclose(
+        _total_length([curve.numpy() for curve in curves_wp], closed_wp),
+        _total_length(curves_pp, closed_pp),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_marching_triangles_open_curve_ends_on_the_boundary(
+    hemisphere: tuple[object, wp.Mesh], device: str
+) -> None:
+    mesh_tm, mesh_wp = hemisphere
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)  # type: ignore[attr-defined]
+    # The hemisphere's rim is a single loop, so a level set of x has to run into it.
+    values_np = np.ascontiguousarray(vertices_np[:, 0])
+    isovalue = float(values_np.mean())
+    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
+
+    curves_wp, closed_wp = tw.intersection.marching_triangles(
+        mesh_wp.points, mesh_wp.indices, values_wp, isovalue, n_vertices=len(vertices_np)
+    )
+
+    assert not all(closed_wp)
+    boundary_vertices = mesh_wp.points.numpy()[
+        tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices).numpy()
+    ]
+    for points, is_closed in zip([curve.numpy() for curve in curves_wp], closed_wp, strict=True):
+        if is_closed:
+            continue
+        # Both ends of an open curve sit on a boundary edge, hence within one edge length of a
+        # boundary vertex.
+        edge_length = tw.edges.mean_edge_length(mesh_wp.points, mesh_wp.indices)
+        for end in (points[0], points[-1]):
+            assert np.linalg.norm(boundary_vertices - end, axis=1).min() <= edge_length
+
+
+def test_marching_triangles_exact_vertex_hit_is_reported_once(device: str) -> None:
+    # Two triangles sharing edge (1, 2), with the field vanishing exactly at both shared vertices,
+    # so the level set *is* that edge. Counting a value equal to the isovalue as positive leaves the
+    # all-positive face with nothing to report and the mixed-sign face with one segment along the
+    # shared edge: the curve appears exactly once rather than twice or not at all.
+    vertices_wp = wp.array(
+        np.array([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]),
+        dtype=wp.vec3,
+        device=device,
+    )
+    faces_wp = wp.array(np.array([0, 1, 2, 3, 2, 1], dtype=np.int32), dtype=wp.int32, device=device)
+    values_wp = wp.array(np.array([-1.0, 0.0, 0.0, 1.0], dtype=np.float32), device=device)
+
+    curves_wp, closed_wp = tw.intersection.marching_triangles(
+        vertices_wp, faces_wp, values_wp, 0.0, n_vertices=4
+    )
+
+    assert len(curves_wp) == 1
+    assert closed_wp == [False]
+    assert curves_wp[0].shape == (2,)
+    # The two endpoints are the shared vertices themselves.
+    assert np.allclose(
+        np.sort(curves_wp[0].numpy(), axis=0),
+        np.array([[0.0, -1.0, 0.0], [0.0, 1.0, 0.0]]),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_marching_triangles_level_set_is_the_piecewise_linear_one(
+    icosahedron: tuple[object, wp.Mesh], device: str
+) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)  # type: ignore[attr-defined]
+    faces_np = np.asarray(mesh_tm.faces)  # type: ignore[attr-defined]
+    values_np = np.ascontiguousarray(vertices_np[:, 2])
+    isovalue = 0.1234
+    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
+
+    curves_wp, _ = tw.intersection.marching_triangles(
+        mesh_wp.points, mesh_wp.indices, values_wp, isovalue, n_vertices=len(vertices_np)
+    )
+
+    # One segment per face whose vertex values straddle the isovalue, and every segment lands in a
+    # curve: the total point count equals the cut-face count for an all-closed level set.
+    positive = values_np[faces_np] >= isovalue
+    cut_faces = int((~(positive.all(axis=1) | (~positive).all(axis=1))).sum())
+    assert sum(int(curve.shape[0]) for curve in curves_wp) == cut_faces
+
+
+def test_marching_triangles_no_crossing(icosahedron: tuple[object, wp.Mesh], device: str) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    values_wp = wp.array(
+        np.ascontiguousarray(np.asarray(mesh_tm.vertices)[:, 2]),  # type: ignore[attr-defined]
+        dtype=wp.float64,
+        device=mesh_wp.device,
+    )
+    assert tw.intersection.marching_triangles(mesh_wp.points, mesh_wp.indices, values_wp, 1e6) == (
+        [],
+        [],
+    )
+
+
+def test_marching_triangles_empty(device: str) -> None:
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+    values_wp = wp.empty(0, dtype=wp.float32, device=device)
+    assert tw.intersection.marching_triangles(vertices_wp, faces_wp, values_wp) == ([], [])
+
+
+def _pyvista_intersection_segments(mesh1_pv: pv.PolyData, mesh2_pv: pv.PolyData) -> np.ndarray:
+    intersection_pv = cast(
+        pv.PolyData, mesh1_pv.intersection(mesh2_pv, split_first=False, split_second=False)[0]
+    )
+    if intersection_pv.n_cells == 0:
+        return np.empty((0, 2, 3), dtype=np.float64)
+    pairs_np = np.reshape(intersection_pv.lines, (-1, 3))[:, 1:]
+    return intersection_pv.points[pairs_np]
+
+
+def _segment_total_length(segments_np: np.ndarray) -> float:
+    """Total length of a segment soup -- the one scalar an unordered curve comparison can share."""
+    segments_np = segments_np.reshape(-1, 2, 3)
+    return float(np.sum(np.linalg.norm(segments_np[:, 1] - segments_np[:, 0], axis=1)))
+
+
+def _intersection_curves_match(
+    got_segments_np: np.ndarray,
+    ref_segments_np: np.ndarray,
+    *,
+    ref_atol: float = 1e-5,
+    got_atol: float = 1e-5,
+) -> bool:
+    """Check both segment sets describe the same intersection curves."""
+    got_segments_np = got_segments_np.reshape(-1, 2, 3)
+    ref_segments_np = ref_segments_np.reshape(-1, 2, 3)
+    if ref_segments_np.shape[0] == 0:
+        return got_segments_np.shape[0] == 0
+    if got_segments_np.shape[0] == 0:
+        return False
+    got_pts_np = got_segments_np.reshape(-1, 3)
+    ref_pts_np = ref_segments_np.reshape(-1, 3)
+    ref_distances_np = KDTree(got_pts_np).query(ref_pts_np, distance_upper_bound=ref_atol)[0]
+    got_distances_np = KDTree(ref_pts_np).query(got_pts_np, distance_upper_bound=got_atol)[0]
+    return bool(np.all(np.isfinite(ref_distances_np)) and np.all(np.isfinite(got_distances_np)))
+
+
+def test_mesh_with_mesh_empty(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], cave_cube: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    _, ico_wp = icosahedron
+    _, cave_wp = cave_cube
+
+    lines_wp = tw.intersection.mesh_with_mesh(
+        ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices
+    )
+    assert lines_wp.shape == (0, 2)
+
+
+@pytest.mark.parity("mesh_with_mesh", "pyvista")
+def test_mesh_with_mesh_icosahedron_cave_cube(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], cave_cube: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Class B: the same crossing curve as ``vtkIntersectionPolyDataFilter``, as an unordered set.
+
+    Both sides emit a segment soup over the same crossing, so the transform is only that neither
+    ordering is meaningful -- matched by two-sided nearest-neighbour containment plus the two
+    quantities an ordering cannot affect: the segment **count** and the **total curve length**.
+    Measured on this pairing: 36 = 36 segments, length 4.195738316 against 4.195736885 (relative
+    3.4e-07) and a segment-midpoint Hausdorff of 5.96e-08 both ways. On two ``icosphere(3)``s offset
+    by 0.6 the same three numbers read 170 = 170, a **bit-identical** 5.984692574 and 2.77e-07.
+
+    MeshLib's ``findIntersectionContours`` covers the same group and does strictly more (it links
+    the crossing into ordered contours); VTK's filter returns the soup triwarp returns, which is why
+    this is Class B where that pairing is Class C.
+    """
+    ico_tm, ico_wp = icosahedron
+    cave_tm, _ = cave_cube
+    cave_at_ico_tm = cave_tm.copy()
+    cave_at_ico_tm.apply_translation(ico_tm.centroid)
+    cave_wp = trimesh_to_warp(cave_at_ico_tm, ico_wp.device)
+
+    ref_segments_np = _pyvista_intersection_segments(
+        trimesh_to_pyvista(ico_tm), trimesh_to_pyvista(cave_at_ico_tm)
+    )
+    lines_wp = tw.intersection.mesh_with_mesh(
+        ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices
+    )
+    segments_np = lines_wp.numpy().reshape(-1, 2, 3)
+
+    assert ref_segments_np.shape[0] > 0  # non-vacuity: VTK found the crossing
+    assert segments_np.shape[0] == ref_segments_np.shape[0]
+    assert _intersection_curves_match(segments_np, ref_segments_np)
+    assert np.isclose(_segment_total_length(segments_np), _segment_total_length(ref_segments_np))
+
+
+# --- marching_triangles: isocontours of a scalar field (potpourri3d reference) ---------
+@pytest.mark.parity("mesh_collision_pairs", "meshlib")
+def test_mesh_collision_pairs_matches_meshlib(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Class A: the same colliding faces as ``findCollidingTriangleBitsets``, both masks.
+
+    A sphere against a small box pushed into its side, which is also the configuration that
+    exercises the **query/target swap**: the broad phase queries the larger mesh's faces against
+    the smaller one's BVH, so the pair columns come out in face-count order and have to be put back
+    into the caller's. Both argument orders are tested for that reason -- measured (26, 8) faces
+    one way and (8, 26) the other, matching MeshLib element for element in both.
+
+    A pair list is also checked against the masks it reduces to, since the two entry points share a
+    helper and could disagree only by the reduction.
+    """
+    mesh_tm, _ = icosphere
+    box_tm = tm.creation.box(extents=[0.5, 0.5, 0.5])
+    box_tm.apply_translation([0.9, 0.0, 0.0])
+
+    sphere_wp = trimesh_to_warp(mesh_tm, device)
+    box_wp = trimesh_to_warp(box_tm, device)
+    colliding_ml = mm.findCollidingTriangleBitsets(
+        mm.MeshPart(trimesh_to_meshlib(mesh_tm)), mm.MeshPart(trimesh_to_meshlib(box_tm))
+    )
+    sphere_ml = meshlib_bitset_to_numpy(colliding_ml[0], mesh_tm.faces.shape[0])
+    box_ml = meshlib_bitset_to_numpy(colliding_ml[1], box_tm.faces.shape[0])
+    assert int(sphere_ml.sum()) > 0  # non-vacuity: the reference found the collision
+
+    sphere_mask_wp, box_mask_wp = tw.intersection.collision_masks(
+        sphere_wp.points, sphere_wp.indices, box_wp.points, box_wp.indices
+    )
+    assert np.array_equal(sphere_mask_wp.numpy(), sphere_ml)
+    assert np.array_equal(box_mask_wp.numpy(), box_ml)
+
+    # The reversed argument order, where the swap fires the other way.
+    box_first_wp, sphere_second_wp = tw.intersection.collision_masks(
+        box_wp.points, box_wp.indices, sphere_wp.points, sphere_wp.indices
+    )
+    assert np.array_equal(box_first_wp.numpy(), box_ml)
+    assert np.array_equal(sphere_second_wp.numpy(), sphere_ml)
+
+    # The pairs reduce to those masks, and every index is in range for its own mesh.
+    pairs_np = tw.intersection.mesh_collision_pairs(
+        sphere_wp.points, sphere_wp.indices, box_wp.points, box_wp.indices
+    ).numpy()
+    assert pairs_np.shape[0] > 0
+    assert pairs_np[:, 0].max() < mesh_tm.faces.shape[0]
+    assert pairs_np[:, 1].max() < box_tm.faces.shape[0]
+    assert set(pairs_np[:, 0].tolist()) == set(np.flatnonzero(sphere_ml).tolist())
+    assert set(pairs_np[:, 1].tolist()) == set(np.flatnonzero(box_ml).tolist())
+
+
+def test_mesh_collision_pairs_beats_meshlib_on_axis_aligned_boxes(device: str) -> None:
+    """
+    Not a parity assert: the input class where the two disagree, arbitrated rather than tolerated.
+
+    Two unit boxes offset by ``(0.5, 0.5, 0.5)`` interpenetrate at a corner, and every crossing
+    there is between axis-aligned triangles whose edges are parallel -- the configuration a
+    separating-axis narrow phase gets wrong and an interval test does not. An exact ``float64``
+    Moller test over all 144 face pairs says **(6, 6)**; triwarp reports (6, 6) and MeshLib says
+    **(5, 4)**, missing one face on the first mesh and two on the second.
+
+    So this is recorded as a place triwarp is *more* accurate, which is worth pinning for two
+    reasons: the equality above must not be generalized into "the two always agree", and a future
+    change that made triwarp match MeshLib here would be a regression rather than a fix.
+    """
+    first_tm = tm.creation.box()
+    second_tm = tm.creation.box()
+    second_tm.apply_translation([0.5, 0.5, 0.5])
+    first_wp = trimesh_to_warp(first_tm, device)
+    second_wp = trimesh_to_warp(second_tm, device)
+
+    first_mask_wp, second_mask_wp = tw.intersection.collision_masks(
+        first_wp.points, first_wp.indices, second_wp.points, second_wp.indices
+    )
+    assert int(first_mask_wp.numpy().sum()) == 6
+    assert int(second_mask_wp.numpy().sum()) == 6
+
+    colliding_ml = mm.findCollidingTriangleBitsets(
+        mm.MeshPart(trimesh_to_meshlib(first_tm)), mm.MeshPart(trimesh_to_meshlib(second_tm))
+    )
+    first_ml = meshlib_bitset_to_numpy(colliding_ml[0], first_tm.faces.shape[0])
+    # MeshLib finds a strict subset here, which is the divergence being pinned.
+    assert int(first_ml.sum()) < 6
+    assert np.all(first_mask_wp.numpy()[first_ml])
+
+
+def test_mesh_collision_pairs_degenerate(device: str) -> None:
+    """
+    Not a library comparison: separated meshes, an empty mesh, and the candidate-cap guard.
+
+    Two boxes three units apart must report no collision at all -- the case a broad phase that
+    forgot its narrow phase would fail -- and an empty face buffer must give empty answers rather
+    than raising, since ``collision_masks`` still owes a mask per mesh.
+    """
+    first_tm = tm.creation.box()
+    far_tm = tm.creation.box()
+    far_tm.apply_translation([3.0, 0.0, 0.0])
+    first_wp = trimesh_to_warp(first_tm, device)
+    far_wp = trimesh_to_warp(far_tm, device)
+
+    pairs_wp = tw.intersection.mesh_collision_pairs(
+        first_wp.points, first_wp.indices, far_wp.points, far_wp.indices
+    )
+    assert pairs_wp.shape == (0, 2)
+    first_mask_wp, far_mask_wp = tw.intersection.collision_masks(
+        first_wp.points, first_wp.indices, far_wp.points, far_wp.indices
+    )
+    assert not bool(first_mask_wp.numpy().any())
+    assert not bool(far_mask_wp.numpy().any())
+
+    empty_faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    empty_pairs_wp = tw.intersection.mesh_collision_pairs(
+        first_wp.points, first_wp.indices, first_wp.points, empty_faces_wp
+    )
+    assert empty_pairs_wp.shape == (0, 2)
+    _mask_wp, empty_mask_wp = tw.intersection.collision_masks(
+        first_wp.points, first_wp.indices, first_wp.points, empty_faces_wp
+    )
+    assert empty_mask_wp.shape == (0,)
+
+    with pytest.raises(ValueError, match="max_triangle_collisions"):
+        tw.intersection.mesh_collision_pairs(
+            first_wp.points,
+            first_wp.indices,
+            far_wp.points,
+            far_wp.indices,
+            max_triangle_collisions=0,
+        )
 
 
 def _sliced_meshes_equivalent(
@@ -471,6 +1133,67 @@ def test_slice_mesh_with_plane_on_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh])
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parity("slice_mesh_with_plane", "meshlib")
+@pytest.mark.parity("split_mesh_with_plane", "meshlib")
+def test_slice_and_split_with_plane_match_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B on the retriangulation: the same face counts and the same area, from two mutating calls.
+
+    ``trimWithPlane`` keeps the **positive** side, which is triwarp's convention, and
+    ``subdivideWithPlane`` inserts the section as real edges and returns the ``FaceBitSet`` of that
+    side -- exactly the ``(vertices, faces, side_mask)`` triple ``split_mesh_with_plane`` returns.
+    Both mutate the mesh they are given and return something else, so each gets its own.
+
+    Measured on ``icosphere(3)`` at ``z = 0.13``, and the agreement is stronger than the class
+    suggests: the slice is **670 faces** on both sides with an area of **5.438285** on both, and the
+    split is **1 468 faces, 736 vertices and 670 positive faces** on both, with an area of
+    **12.506493**. What is *not* shared is the vertex count of the slice -- 477 against 383 -- since
+    triwarp emits a cut vertex per crossing edge where MeshLib reuses its half-edge topology, which
+    is why this is a count-and-area comparison rather than a buffer one.
+
+    The plane's ``d`` is the transform, and the assert that catches it getting lost is the z-range:
+    both results start exactly at the cut.
+    """
+    mesh_tm, mesh_wp = icosphere
+    normal_np = np.array([0.0, 0.0, 1.0])
+    origin_np = mesh_tm.vertices.mean(axis=0) + np.array([0.0, 0.0, 0.13])
+    plane_ml = _plane_ml(normal_np, origin_np)
+
+    sliced_vertices_wp, sliced_faces_wp = tw.intersection.slice_mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
+    )
+    sliced_tm = warp_to_trimesh(sliced_vertices_wp, sliced_faces_wp)
+
+    trimmed_ml = trimesh_to_meshlib(mesh_tm)
+    trim_params_ml = mm.TrimWithPlaneParams()
+    trim_params_ml.plane = plane_ml
+    assert mm.trimWithPlane(trimmed_ml, trim_params_ml) is None  # mutates, returns nothing
+    trimmed_tm = meshlib_to_trimesh(trimmed_ml)
+
+    assert 0 < trimmed_tm.faces.shape[0] < mesh_tm.faces.shape[0]  # it really trimmed
+    assert sliced_tm.faces.shape[0] == trimmed_tm.faces.shape[0]
+    assert np.isclose(sliced_tm.area, trimmed_tm.area, rtol=1e-5)
+    assert np.isclose(sliced_tm.vertices[:, 2].min(), origin_np[2], atol=1e-5)
+    assert np.isclose(trimmed_tm.vertices[:, 2].min(), origin_np[2], atol=1e-5)
+
+    # The splitting form: the same cut, both sides kept, with the positive side as a mask.
+    split_vertices_wp, split_faces_wp, side_wp = tw.intersection.split_mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
+    )
+    split_tm = warp_to_trimesh(split_vertices_wp, split_faces_wp)
+
+    subdivided_ml = trimesh_to_meshlib(mesh_tm)
+    positive_ml = mm.subdivideWithPlane(subdivided_ml, plane_ml)
+    subdivided_tm = meshlib_to_trimesh(subdivided_ml)
+
+    assert split_tm.faces.shape[0] == subdivided_tm.faces.shape[0]
+    assert split_tm.vertices.shape[0] == subdivided_tm.vertices.shape[0]
+    assert int(side_wp.numpy().sum()) == positive_ml.count()
+    assert int(side_wp.numpy().sum()) == sliced_tm.faces.shape[0]  # and it is the sliced side
+    assert np.isclose(split_tm.area, subdivided_tm.area, rtol=1e-5)
+    assert np.isclose(split_tm.area, mesh_tm.area, rtol=1e-5)  # splitting conserves the surface
+
+
 @pytest.mark.parity("split_mesh_with_plane", "pyvista")
 def test_split_mesh_with_plane_matches_pyvista() -> None:
     """
@@ -602,13 +1325,7 @@ def test_split_mesh_with_plane_above_block_is_the_slice(
     assert int(above_f.shape[0]) > 0
     assert int(above_f.shape[0]) == int(slice_f.shape[0])
     assert np.isclose(
-        tm.Trimesh(
-            above_v.numpy().astype(np.float64), above_f.numpy().reshape(-1, 3), process=False
-        ).area,
-        tm.Trimesh(
-            slice_v.numpy().astype(np.float64), slice_f.numpy().reshape(-1, 3), process=False
-        ).area,
-        rtol=1e-6,
+        warp_to_trimesh(above_v, above_f).area, warp_to_trimesh(slice_v, slice_f).area, rtol=1e-6
     )
 
 
@@ -756,9 +1473,7 @@ def test_clip_mesh_with_field_capped_matches_pyvista_clip_closed_surface() -> No
     capped_v, capped_f = tw.intersection.clip_mesh_with_field(
         mesh_wp.points, mesh_wp.indices, _height_field(mesh_tm, "cpu"), isovalue, cap=True
     )
-    capped_tm = tm.Trimesh(
-        capped_v.numpy().astype(np.float64), capped_f.numpy().reshape(-1, 3), process=False
-    )
+    capped_tm = warp_to_trimesh(capped_v, capped_f)
     mesh_pv = trimesh_to_pyvista(mesh_tm)
     closed_pv = cast(
         pv.PolyData,
@@ -886,46 +1601,6 @@ def test_clip_mesh_with_field_accepts_a_float64_field(
     assert int(clipped_64[1].shape[0]) > 0
     assert np.array_equal(clipped_64[1].numpy(), clipped_32[1].numpy())
     assert np.allclose(clipped_64[0].numpy(), clipped_32[0].numpy(), rtol=1e-5, atol=1e-5)
-
-
-def _pyvista_intersection_segments(mesh1_pv: pv.PolyData, mesh2_pv: pv.PolyData) -> np.ndarray:
-    intersection_pv = cast(
-        pv.PolyData, mesh1_pv.intersection(mesh2_pv, split_first=False, split_second=False)[0]
-    )
-    if intersection_pv.n_cells == 0:
-        return np.empty((0, 2, 3), dtype=np.float64)
-    pairs_np = np.reshape(intersection_pv.lines, (-1, 3))[:, 1:]
-    return intersection_pv.points[pairs_np]
-
-
-def _segment_total_length(segments_np: np.ndarray) -> float:
-    """Total length of a segment soup -- the one scalar an unordered curve comparison can share."""
-    segments_np = segments_np.reshape(-1, 2, 3)
-    return float(np.sum(np.linalg.norm(segments_np[:, 1] - segments_np[:, 0], axis=1)))
-
-
-def _intersection_curves_match(
-    got_segments_np: np.ndarray,
-    ref_segments_np: np.ndarray,
-    *,
-    ref_atol: float = 1e-5,
-    got_atol: float = 1e-5,
-) -> bool:
-    """Check both segment sets describe the same intersection curves."""
-    got_segments_np = got_segments_np.reshape(-1, 2, 3)
-    ref_segments_np = ref_segments_np.reshape(-1, 2, 3)
-    if ref_segments_np.shape[0] == 0:
-        return got_segments_np.shape[0] == 0
-    if got_segments_np.shape[0] == 0:
-        return False
-    got_pts_np = got_segments_np.reshape(-1, 3)
-    ref_pts_np = ref_segments_np.reshape(-1, 3)
-    ref_distances_np = KDTree(got_pts_np).query(ref_pts_np, distance_upper_bound=ref_atol)[0]
-    got_distances_np = KDTree(ref_pts_np).query(got_pts_np, distance_upper_bound=got_atol)[0]
-    return bool(np.all(np.isfinite(ref_distances_np)) and np.all(np.isfinite(got_distances_np)))
-
-
-_SPLIT_MESHES = ["icosphere", "unit_box", "torus"]
 
 
 def _off_vertex_isovalue(mesh_tm: tm.Trimesh) -> float:
@@ -1114,696 +1789,3 @@ def test_split_faces_along_field_degenerate_level_sets(
     areas_np = areas_wp.numpy()
     assert areas_np.min() > 0.0
     assert np.isclose(areas_np.sum(), sphere_tm.area, rtol=1e-5)
-
-
-def test_mesh_with_mesh_empty(
-    icosahedron: tuple[tm.Trimesh, wp.Mesh], cave_cube: tuple[tm.Trimesh, wp.Mesh]
-) -> None:
-    _, ico_wp = icosahedron
-    _, cave_wp = cave_cube
-
-    lines_wp = tw.intersection.mesh_with_mesh(
-        ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices
-    )
-    assert lines_wp.shape == (0, 2)
-
-
-@pytest.mark.parity("mesh_collision_pairs", "meshlib")
-def test_mesh_collision_pairs_matches_meshlib(
-    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
-) -> None:
-    """
-    Class A: the same colliding faces as ``findCollidingTriangleBitsets``, both masks.
-
-    A sphere against a small box pushed into its side, which is also the configuration that
-    exercises the **query/target swap**: the broad phase queries the larger mesh's faces against
-    the smaller one's BVH, so the pair columns come out in face-count order and have to be put back
-    into the caller's. Both argument orders are tested for that reason -- measured (26, 8) faces
-    one way and (8, 26) the other, matching MeshLib element for element in both.
-
-    A pair list is also checked against the masks it reduces to, since the two entry points share a
-    helper and could disagree only by the reduction.
-    """
-    mesh_tm, _ = icosphere
-    box_tm = tm.creation.box(extents=[0.5, 0.5, 0.5])
-    box_tm.apply_translation([0.9, 0.0, 0.0])
-
-    sphere_wp = trimesh_to_warp(mesh_tm, device)
-    box_wp = trimesh_to_warp(box_tm, device)
-    colliding_ml = mm.findCollidingTriangleBitsets(
-        mm.MeshPart(trimesh_to_meshlib(mesh_tm)), mm.MeshPart(trimesh_to_meshlib(box_tm))
-    )
-    sphere_ml = meshlib_bitset_to_numpy(colliding_ml[0], mesh_tm.faces.shape[0])
-    box_ml = meshlib_bitset_to_numpy(colliding_ml[1], box_tm.faces.shape[0])
-    assert int(sphere_ml.sum()) > 0  # non-vacuity: the reference found the collision
-
-    sphere_mask_wp, box_mask_wp = tw.intersection.collision_masks(
-        sphere_wp.points, sphere_wp.indices, box_wp.points, box_wp.indices
-    )
-    assert np.array_equal(sphere_mask_wp.numpy(), sphere_ml)
-    assert np.array_equal(box_mask_wp.numpy(), box_ml)
-
-    # The reversed argument order, where the swap fires the other way.
-    box_first_wp, sphere_second_wp = tw.intersection.collision_masks(
-        box_wp.points, box_wp.indices, sphere_wp.points, sphere_wp.indices
-    )
-    assert np.array_equal(box_first_wp.numpy(), box_ml)
-    assert np.array_equal(sphere_second_wp.numpy(), sphere_ml)
-
-    # The pairs reduce to those masks, and every index is in range for its own mesh.
-    pairs_np = tw.intersection.mesh_collision_pairs(
-        sphere_wp.points, sphere_wp.indices, box_wp.points, box_wp.indices
-    ).numpy()
-    assert pairs_np.shape[0] > 0
-    assert pairs_np[:, 0].max() < mesh_tm.faces.shape[0]
-    assert pairs_np[:, 1].max() < box_tm.faces.shape[0]
-    assert set(pairs_np[:, 0].tolist()) == set(np.flatnonzero(sphere_ml).tolist())
-    assert set(pairs_np[:, 1].tolist()) == set(np.flatnonzero(box_ml).tolist())
-
-
-def test_mesh_collision_pairs_beats_meshlib_on_axis_aligned_boxes(device: str) -> None:
-    """
-    Not a parity assert: the input class where the two disagree, arbitrated rather than tolerated.
-
-    Two unit boxes offset by ``(0.5, 0.5, 0.5)`` interpenetrate at a corner, and every crossing
-    there is between axis-aligned triangles whose edges are parallel -- the configuration a
-    separating-axis narrow phase gets wrong and an interval test does not. An exact ``float64``
-    Moller test over all 144 face pairs says **(6, 6)**; triwarp reports (6, 6) and MeshLib says
-    **(5, 4)**, missing one face on the first mesh and two on the second.
-
-    So this is recorded as a place triwarp is *more* accurate, which is worth pinning for two
-    reasons: the equality above must not be generalized into "the two always agree", and a future
-    change that made triwarp match MeshLib here would be a regression rather than a fix.
-    """
-    first_tm = tm.creation.box()
-    second_tm = tm.creation.box()
-    second_tm.apply_translation([0.5, 0.5, 0.5])
-    first_wp = trimesh_to_warp(first_tm, device)
-    second_wp = trimesh_to_warp(second_tm, device)
-
-    first_mask_wp, second_mask_wp = tw.intersection.collision_masks(
-        first_wp.points, first_wp.indices, second_wp.points, second_wp.indices
-    )
-    assert int(first_mask_wp.numpy().sum()) == 6
-    assert int(second_mask_wp.numpy().sum()) == 6
-
-    colliding_ml = mm.findCollidingTriangleBitsets(
-        mm.MeshPart(trimesh_to_meshlib(first_tm)), mm.MeshPart(trimesh_to_meshlib(second_tm))
-    )
-    first_ml = meshlib_bitset_to_numpy(colliding_ml[0], first_tm.faces.shape[0])
-    # MeshLib finds a strict subset here, which is the divergence being pinned.
-    assert int(first_ml.sum()) < 6
-    assert np.all(first_mask_wp.numpy()[first_ml])
-
-
-def test_mesh_collision_pairs_degenerate(device: str) -> None:
-    """
-    Not a library comparison: separated meshes, an empty mesh, and the candidate-cap guard.
-
-    Two boxes three units apart must report no collision at all -- the case a broad phase that
-    forgot its narrow phase would fail -- and an empty face buffer must give empty answers rather
-    than raising, since ``collision_masks`` still owes a mask per mesh.
-    """
-    first_tm = tm.creation.box()
-    far_tm = tm.creation.box()
-    far_tm.apply_translation([3.0, 0.0, 0.0])
-    first_wp = trimesh_to_warp(first_tm, device)
-    far_wp = trimesh_to_warp(far_tm, device)
-
-    pairs_wp = tw.intersection.mesh_collision_pairs(
-        first_wp.points, first_wp.indices, far_wp.points, far_wp.indices
-    )
-    assert pairs_wp.shape == (0, 2)
-    first_mask_wp, far_mask_wp = tw.intersection.collision_masks(
-        first_wp.points, first_wp.indices, far_wp.points, far_wp.indices
-    )
-    assert not bool(first_mask_wp.numpy().any())
-    assert not bool(far_mask_wp.numpy().any())
-
-    empty_faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    empty_pairs_wp = tw.intersection.mesh_collision_pairs(
-        first_wp.points, first_wp.indices, first_wp.points, empty_faces_wp
-    )
-    assert empty_pairs_wp.shape == (0, 2)
-    _mask_wp, empty_mask_wp = tw.intersection.collision_masks(
-        first_wp.points, first_wp.indices, first_wp.points, empty_faces_wp
-    )
-    assert empty_mask_wp.shape == (0,)
-
-    with pytest.raises(ValueError, match="max_triangle_collisions"):
-        tw.intersection.mesh_collision_pairs(
-            first_wp.points,
-            first_wp.indices,
-            far_wp.points,
-            far_wp.indices,
-            max_triangle_collisions=0,
-        )
-
-
-@pytest.mark.parity("mesh_with_mesh", "pyvista")
-def test_mesh_with_mesh_icosahedron_cave_cube(
-    icosahedron: tuple[tm.Trimesh, wp.Mesh], cave_cube: tuple[tm.Trimesh, wp.Mesh]
-) -> None:
-    """
-    Class B: the same crossing curve as ``vtkIntersectionPolyDataFilter``, as an unordered set.
-
-    Both sides emit a segment soup over the same crossing, so the transform is only that neither
-    ordering is meaningful -- matched by two-sided nearest-neighbour containment plus the two
-    quantities an ordering cannot affect: the segment **count** and the **total curve length**.
-    Measured on this pairing: 36 = 36 segments, length 4.195738316 against 4.195736885 (relative
-    3.4e-07) and a segment-midpoint Hausdorff of 5.96e-08 both ways. On two ``icosphere(3)``s offset
-    by 0.6 the same three numbers read 170 = 170, a **bit-identical** 5.984692574 and 2.77e-07.
-
-    MeshLib's ``findIntersectionContours`` covers the same group and does strictly more (it links
-    the crossing into ordered contours); VTK's filter returns the soup triwarp returns, which is why
-    this is Class B where that pairing is Class C.
-    """
-    ico_tm, ico_wp = icosahedron
-    cave_tm, _ = cave_cube
-    cave_at_ico_tm = cave_tm.copy()
-    cave_at_ico_tm.apply_translation(ico_tm.centroid)
-    cave_wp = trimesh_to_warp(cave_at_ico_tm, ico_wp.device)
-
-    ref_segments_np = _pyvista_intersection_segments(
-        trimesh_to_pyvista(ico_tm), trimesh_to_pyvista(cave_at_ico_tm)
-    )
-    lines_wp = tw.intersection.mesh_with_mesh(
-        ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices
-    )
-    segments_np = lines_wp.numpy().reshape(-1, 2, 3)
-
-    assert ref_segments_np.shape[0] > 0  # non-vacuity: VTK found the crossing
-    assert segments_np.shape[0] == ref_segments_np.shape[0]
-    assert _intersection_curves_match(segments_np, ref_segments_np)
-    assert np.isclose(_segment_total_length(segments_np), _segment_total_length(ref_segments_np))
-
-
-# --- marching_triangles: isocontours of a scalar field (potpourri3d reference) ---------
-_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
-
-
-def _curves_pp(
-    vertices_np: np.ndarray, faces_np: np.ndarray, values_np: np.ndarray, isovalue: float
-) -> tuple[list[np.ndarray], list[bool]]:
-    """Decode potpourri3d's barycentric contour output into point arrays and closed flags."""
-    edges_pp = np.asarray(pp3d.edges(vertices_np, faces_np))
-    curves: list[np.ndarray] = []
-    closed: list[bool] = []
-    for curve in pp3d.marching_triangles(vertices_np, faces_np, values_np, isovalue):
-        points = []
-        for element, barycentric in curve:
-            if len(barycentric) == 0:  # a vertex
-                points.append(vertices_np[element])
-            elif len(barycentric) == 1:  # a point along an edge
-                start, end = edges_pp[element]
-                points.append(
-                    (1.0 - barycentric[0]) * vertices_np[start] + barycentric[0] * vertices_np[end]
-                )
-            else:  # a point inside a face
-                weights = np.array(
-                    [barycentric[0], barycentric[1], 1.0 - barycentric[0] - barycentric[1]]
-                )
-                points.append(weights @ vertices_np[faces_np[element]])
-        is_closed = len(points) > 2 and np.allclose(points[0], points[-1])
-        curves.append(np.array(points[:-1] if is_closed else points))
-        closed.append(is_closed)
-    return curves, closed
-
-
-def _total_length(curves: list[np.ndarray], closed: list[bool]) -> float:
-    """Sum the curve lengths, counting the closing chord of every closed curve."""
-    total = 0.0
-    for points, is_closed in zip(curves, closed, strict=True):
-        total += float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
-        if is_closed:
-            total += float(np.linalg.norm(points[0] - points[-1]))
-    return total
-
-
-# ---------------------------------------------------------------------------
-# marching_triangles
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parity("mesh_with_plane", "meshlib")
-@pytest.mark.parity("mesh_with_mesh", "meshlib")
-def test_plane_and_mesh_sections_match_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """
-    Class B on the *curve*: both references order the contour where triwarp returns segments.
-
-    Neither pairing can be compared element-wise, and for the same reason in both directions:
-    ``extractPlaneSections`` and ``findIntersectionContours`` walk the intersection into an ordered
-    polyline, while ``mesh_with_plane`` and ``mesh_with_mesh`` emit an unordered ``(m, 2, 3)``
-    segment soup. So the comparable quantities are the curve's **total length** and the point set it
-    passes through, which is what a caller of either actually consumes.
-
-    Measured on ``icosphere(3)`` cut at ``z = 0.13``: MeshLib returns **one** closed section of 95
-    points against triwarp's 94 segments -- the same 94, with the first point repeated to close --
-    and the perimeters are **6.217219 against 6.217220**. Every decoded point sits at exactly the
-    plane's ``z``, which is the assert that catches a plane built from the wrong ``d``.
-
-    For the mesh-mesh half, two overlapping spheres give one contour of 153 points against 201
-    segments -- different counts, since neither library promises a particular sampling of the same
-    curve -- with total lengths **5.008801 against 5.008798**.
-    """
-    mesh_tm, mesh_wp = icosphere
-    normal_np = np.array([0.0, 0.0, 1.0])
-    origin_np = mesh_tm.vertices.mean(axis=0) + np.array([0.0, 0.0, 0.13])
-    mesh_ml = trimesh_to_meshlib(mesh_tm)
-
-    segments_wp = tw.intersection.mesh_with_plane(
-        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
-    ).numpy()
-    sections_ml = mm.extractPlaneSections(mm.MeshPart(mesh_ml), _plane_ml(normal_np, origin_np))
-
-    assert len(sections_ml) == 1  # one closed rim, so the length comparison is not over fragments
-    points_ml = _section_points_ml(mesh_ml, sections_ml[0])
-    assert np.allclose(points_ml[:, 2], origin_np[2], atol=1e-5)  # the plane really is where it is
-    assert points_ml.shape[0] == segments_wp.shape[0] + 1  # closed: the first point repeats
-
-    length_wp = float(np.linalg.norm(segments_wp[:, 1] - segments_wp[:, 0], axis=1).sum())
-    length_ml = float(np.linalg.norm(np.diff(points_ml, axis=0), axis=1).sum())
-    assert np.isclose(length_wp, length_ml, rtol=1e-5)
-
-    # Mesh against mesh, on two overlapping spheres.
-    other_tm = mesh_tm.copy()
-    other_tm.apply_translation([1.2, 0.0, 0.0])
-    other_wp = trimesh_to_warp(other_tm, str(mesh_wp.points.device))
-    crossing_wp = tw.intersection.mesh_with_mesh(
-        mesh_wp.points, mesh_wp.indices, other_wp.points, other_wp.indices
-    ).numpy()
-    contours_ml = mm.findIntersectionContours(mesh_ml, trimesh_to_meshlib(other_tm))
-
-    assert len(contours_ml) == 1
-    contour_np = np.array([[point.x, point.y, point.z] for point in contours_ml[0]])
-    assert contour_np.shape[0] > 10  # non-vacuity: the two spheres really do intersect
-    assert np.isclose(
-        float(np.linalg.norm(crossing_wp[:, 1] - crossing_wp[:, 0], axis=1).sum()),
-        float(np.linalg.norm(np.diff(contour_np, axis=0), axis=1).sum()),
-        rtol=1e-4,
-    )
-
-
-@pytest.mark.parity("slice_mesh_with_plane", "meshlib")
-@pytest.mark.parity("split_mesh_with_plane", "meshlib")
-def test_slice_and_split_with_plane_match_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """
-    Class B on the retriangulation: the same face counts and the same area, from two mutating calls.
-
-    ``trimWithPlane`` keeps the **positive** side, which is triwarp's convention, and
-    ``subdivideWithPlane`` inserts the section as real edges and returns the ``FaceBitSet`` of that
-    side -- exactly the ``(vertices, faces, side_mask)`` triple ``split_mesh_with_plane`` returns.
-    Both mutate the mesh they are given and return something else, so each gets its own.
-
-    Measured on ``icosphere(3)`` at ``z = 0.13``, and the agreement is stronger than the class
-    suggests: the slice is **670 faces** on both sides with an area of **5.438285** on both, and the
-    split is **1 468 faces, 736 vertices and 670 positive faces** on both, with an area of
-    **12.506493**. What is *not* shared is the vertex count of the slice -- 477 against 383 -- since
-    triwarp emits a cut vertex per crossing edge where MeshLib reuses its half-edge topology, which
-    is why this is a count-and-area comparison rather than a buffer one.
-
-    The plane's ``d`` is the transform, and the assert that catches it getting lost is the z-range:
-    both results start exactly at the cut.
-    """
-    mesh_tm, mesh_wp = icosphere
-    normal_np = np.array([0.0, 0.0, 1.0])
-    origin_np = mesh_tm.vertices.mean(axis=0) + np.array([0.0, 0.0, 0.13])
-    plane_ml = _plane_ml(normal_np, origin_np)
-
-    sliced_vertices_wp, sliced_faces_wp = tw.intersection.slice_mesh_with_plane(
-        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
-    )
-    sliced_tm = tm.Trimesh(
-        sliced_vertices_wp.numpy().astype(np.float64),
-        sliced_faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
-
-    trimmed_ml = trimesh_to_meshlib(mesh_tm)
-    trim_params_ml = mm.TrimWithPlaneParams()
-    trim_params_ml.plane = plane_ml
-    assert mm.trimWithPlane(trimmed_ml, trim_params_ml) is None  # mutates, returns nothing
-    trimmed_tm = meshlib_to_trimesh(trimmed_ml)
-
-    assert 0 < trimmed_tm.faces.shape[0] < mesh_tm.faces.shape[0]  # it really trimmed
-    assert sliced_tm.faces.shape[0] == trimmed_tm.faces.shape[0]
-    assert np.isclose(sliced_tm.area, trimmed_tm.area, rtol=1e-5)
-    assert np.isclose(sliced_tm.vertices[:, 2].min(), origin_np[2], atol=1e-5)
-    assert np.isclose(trimmed_tm.vertices[:, 2].min(), origin_np[2], atol=1e-5)
-
-    # The splitting form: the same cut, both sides kept, with the positive side as a mask.
-    split_vertices_wp, split_faces_wp, side_wp = tw.intersection.split_mesh_with_plane(
-        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
-    )
-    split_tm = tm.Trimesh(
-        split_vertices_wp.numpy().astype(np.float64),
-        split_faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
-
-    subdivided_ml = trimesh_to_meshlib(mesh_tm)
-    positive_ml = mm.subdivideWithPlane(subdivided_ml, plane_ml)
-    subdivided_tm = meshlib_to_trimesh(subdivided_ml)
-
-    assert split_tm.faces.shape[0] == subdivided_tm.faces.shape[0]
-    assert split_tm.vertices.shape[0] == subdivided_tm.vertices.shape[0]
-    assert int(side_wp.numpy().sum()) == positive_ml.count()
-    assert int(side_wp.numpy().sum()) == sliced_tm.faces.shape[0]  # and it is the sliced side
-    assert np.isclose(split_tm.area, subdivided_tm.area, rtol=1e-5)
-    assert np.isclose(split_tm.area, mesh_tm.area, rtol=1e-5)  # splitting conserves the surface
-
-
-@pytest.mark.parity("marching_triangles", "meshlib")
-@pytest.mark.parity("marching_triangles_curves", "meshlib")
-def test_marching_triangles_matches_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """
-    Class B: ``extractIsolines`` returns the same level set, closed by a repeated point.
-
-    Two transforms, both named. Its ``vertValues`` is a ``VertScalars`` filled per vertex -- there
-    is no array constructor, so the fill is a Python loop over ``VertId`` keys -- and its output is
-    a list of ``EdgePoint`` contours that must go through ``Mesh.edgePoint`` to become positions.
-    Its closed contours repeat their first point where triwarp returns the cycle once and flags it
-    ``closed``, which is the same convention potpourri3d's ``marching_triangles`` uses.
-
-    Measured on the ``z`` field of ``icosphere(3)`` at 0.13: one closed curve, 94 points against 95,
-    lengths **6.217219 against 6.217220**. That is the same curve
-    [`test_plane_and_mesh_sections_match_meshlib`] gets from the plane section, which is the
-    consistency worth having -- the level set of a coordinate *is* a plane section, and the two
-    entry points reach it by different code.
-
-    The second half covers the ``marching_triangles_curves`` group, whose question is the opposite
-    one: a sinusoidal field whose level set is **many** short loops rather than one long one, where
-    the linking is the work. Both libraries return **18** closed curves totalling 52.3072 against
-    52.3072 -- agreeing to **1.0e-08** -- so the curve *count* is asserted as well as the length,
-    which is what would break if either side split or merged a loop.
-    """
-    mesh_tm, mesh_wp = icosphere
-    isovalue = float(mesh_tm.vertices[:, 2].mean() + 0.13)
-    field_np = np.ascontiguousarray(mesh_tm.vertices[:, 2], dtype=np.float32)
-    field_wp = wp.array(field_np, dtype=wp.float32, device=mesh_wp.points.device)
-
-    curves_wp, closed_wp = tw.intersection.marching_triangles(
-        mesh_wp.points, mesh_wp.indices, field_wp, isovalue
-    )
-
-    mesh_ml = trimesh_to_meshlib(mesh_tm)
-    values_ml = mm.VertScalars()
-    values_ml.resize(mesh_ml.points.size(), 0.0)
-    for index, value in enumerate(field_np):
-        values_ml[mm.VertId(index)] = float(value)
-    isolines_ml = mm.extractIsolines(mesh_ml.topology, values_ml, isovalue)
-
-    assert len(isolines_ml) == len(curves_wp) == 1
-    assert closed_wp == [True]
-    points_ml = _section_points_ml(mesh_ml, isolines_ml[0])
-    curve_np = curves_wp[0].numpy()
-
-    assert points_ml.shape[0] == curve_np.shape[0] + 1  # its closed contour repeats the first point
-    assert np.allclose(points_ml[0], points_ml[-1], atol=1e-6)
-    length_wp = float(
-        np.linalg.norm(np.diff(np.vstack([curve_np, curve_np[:1]]), axis=0), axis=1).sum()
-    )
-    assert np.isclose(
-        length_wp, float(np.linalg.norm(np.diff(points_ml, axis=0), axis=1).sum()), rtol=1e-5
-    )
-
-    # The many-curve field: same count, same total length, and the linking is what could differ.
-    wave_np = np.ascontiguousarray(
-        np.sin(6.0 * mesh_tm.vertices[:, 0])
-        * np.cos(6.0 * mesh_tm.vertices[:, 1])
-        * np.sin(6.0 * mesh_tm.vertices[:, 2]),
-        dtype=np.float32,
-    )
-    wave_curves_wp, wave_closed_wp = tw.intersection.marching_triangles(
-        mesh_wp.points,
-        mesh_wp.indices,
-        wp.array(wave_np, dtype=wp.float32, device=mesh_wp.points.device),
-        0.0,
-    )
-    wave_values_ml = mm.VertScalars()
-    wave_values_ml.resize(mesh_ml.points.size(), 0.0)
-    for index, value in enumerate(wave_np):
-        wave_values_ml[mm.VertId(index)] = float(value)
-    wave_lines_ml = mm.extractIsolines(mesh_ml.topology, wave_values_ml, 0.0)
-
-    assert len(wave_curves_wp) > 5  # non-vacuity: this field really is multi-curve
-    assert len(wave_lines_ml) == len(wave_curves_wp)
-    total_wp = sum(
-        float(
-            np.linalg.norm(
-                np.diff(
-                    np.vstack([curve.numpy(), curve.numpy()[:1]]) if is_closed else curve.numpy(),
-                    axis=0,
-                ),
-                axis=1,
-            ).sum()
-        )
-        for curve, is_closed in zip(wave_curves_wp, wave_closed_wp, strict=True)
-    )
-    total_ml = sum(
-        float(np.linalg.norm(np.diff(_section_points_ml(mesh_ml, line_ml), axis=0), axis=1).sum())
-        for line_ml in wave_lines_ml
-    )
-    assert np.isclose(total_wp, total_ml, rtol=1e-5)
-
-
-@pytest.mark.parametrize("mesh_name", _MESHES)
-@pytest.mark.parametrize("axis", [0, 2])
-@pytest.mark.parity("marching_triangles", "potpourri3d")
-def test_marching_triangles_matches_potpourri3d(
-    request: pytest.FixtureRequest, mesh_name: str, axis: int, device: str
-) -> None:
-    """
-    Class B (barycentric decoding): potpourri3d reports hits in its own element numbering.
-
-    Section 6 records the decode: ``(element_index, coords)`` pairs dispatched on
-    ``len(coords)`` through ``pp3d.edges``, and its closed curves repeat their first point
-    where triwarp's do not. Both transforms are on the reference side; the positions are then
-    compared directly.
-    """
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
-    faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
-    # A coordinate function, contoured a little off centre so the level set misses the vertices: an
-    # exact vertex hit is a genuine convention difference (see the dedicated test below).
-    values_np = np.ascontiguousarray(vertices_np[:, axis])
-    isovalue = float(0.5137 * values_np.min() + 0.4863 * values_np.max())
-    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
-
-    curves_wp, closed_wp = tw.intersection.marching_triangles(
-        mesh_wp.points, mesh_wp.indices, values_wp, isovalue, n_vertices=len(vertices_np)
-    )
-    curves_pp, closed_pp = _curves_pp(vertices_np, faces_np, values_np, isovalue)
-
-    assert len(curves_wp) == len(curves_pp)
-    assert sorted(closed_wp) == sorted(closed_pp)
-    assert np.isclose(
-        _total_length([curve.numpy() for curve in curves_wp], closed_wp),
-        _total_length(curves_pp, closed_pp),
-        rtol=1e-5,
-        atol=1e-5,
-    )
-    # The level sets must coincide as point sets, not merely in total length.
-    bounding_diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
-    assert (
-        hausdorff_two_sided(
-            np.concatenate([curve.numpy() for curve in curves_wp]), np.concatenate(curves_pp)
-        )
-        < 1e-6 * bounding_diagonal
-    )
-
-
-@pytest.mark.parametrize("mesh_name", _MESHES)
-@pytest.mark.parity("marching_triangles", "igl")
-@pytest.mark.parity("marching_triangles_curves", "igl")
-def test_marching_triangles_matches_igl(
-    request: pytest.FixtureRequest, mesh_name: str, device: str
-) -> None:
-    """
-    Class B: ``igl.isolines`` returns a segment **soup**, so the linking must be undone first.
-
-    igl gives ``(points, segments, segment_values)`` with no curve structure at all -- every
-    crossing is an independent 2-point segment -- where ``marching_triangles`` returns polylines.
-    The named transform is therefore to reduce triwarp's curves to the same soup: each consecutive
-    pair of a curve is a segment, plus the closing pair for a closed curve. Two quantities are then
-    directly comparable and both are asserted: the total segment length, and the point sets through
-    a two-sided Hausdorff distance.
-
-    Segment *count* is not compared, and that is deliberate: a polyline of ``n`` points contributes
-    ``n - 1`` segments (``n`` closed), so triwarp's count is derived from its linking while igl's is
-    the raw crossing count -- they agree here but the equality is a property of this input rather
-    than of the two algorithms, and asserting it would be asserting the wrong thing.
-
-    Both this group and ``marching_triangles_curves`` are covered because the transform is the same
-    for one long contour and for a thousand short ones; the linking count is what differs, and it is
-    exactly what this comparison steps around.
-    """
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
-    faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int64)
-    values_np = np.ascontiguousarray(vertices_np[:, 2])
-    isovalue = float(0.5137 * values_np.min() + 0.4863 * values_np.max())
-    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
-
-    points_igl, segments_igl, _values_igl = igl.isolines(
-        vertices_np, faces_np, values_np, np.array([isovalue])
-    )
-    curves_wp, closed_wp = tw.intersection.marching_triangles(
-        mesh_wp.points, mesh_wp.indices, values_wp, isovalue, n_vertices=len(vertices_np)
-    )
-
-    assert segments_igl.shape[0] > 0
-    length_igl = float(
-        np.linalg.norm(
-            points_igl[segments_igl[:, 0]] - points_igl[segments_igl[:, 1]], axis=1
-        ).sum()
-    )
-    assert np.isclose(
-        _total_length([curve.numpy() for curve in curves_wp], closed_wp),
-        length_igl,
-        rtol=1e-5,
-        atol=1e-5,
-    )
-
-    bounding_diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
-    assert (
-        hausdorff_two_sided(np.concatenate([curve.numpy() for curve in curves_wp]), points_igl)
-        < 1e-5 * bounding_diagonal
-    )
-
-
-@pytest.mark.parity("marching_triangles_curves", "potpourri3d")
-def test_marching_triangles_many_components_matches_potpourri3d(device: str) -> None:
-    """
-    Class B, same decoding, on a field whose level set breaks into many small loops.
-
-    The single-contour test above exercises the per-face crossing arithmetic; this exercises
-    the segment *linking*, which is where a many-component field can drop or merge a loop while
-    every individual crossing stays right.
-    """
-    # An oscillating field breaks the level set into many small loops, which is what exercises the
-    # segment linking rather than the per-face crossing arithmetic.
-    mesh_tm = tw.creation.icosphere(subdivisions=3)
-    vertices_np = np.ascontiguousarray(mesh_tm[0].numpy(), dtype=np.float64)
-    faces_np = np.ascontiguousarray(mesh_tm[1].numpy().reshape(-1, 3), dtype=np.int32)
-    values_np = np.ascontiguousarray(
-        np.sin(8.0 * vertices_np[:, 0]) * np.cos(8.0 * vertices_np[:, 1])
-    )
-    isovalue = 0.1370
-
-    vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=device)
-    faces_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
-    values_wp = wp.array(values_np, dtype=wp.float64, device=device)
-
-    curves_wp, closed_wp = tw.intersection.marching_triangles(
-        vertices_wp, faces_wp, values_wp, isovalue, n_vertices=len(vertices_np)
-    )
-    curves_pp, closed_pp = _curves_pp(vertices_np, faces_np, values_np, isovalue)
-
-    assert len(curves_wp) > 10
-    assert len(curves_wp) == len(curves_pp)
-    assert all(closed_wp)
-    assert np.isclose(
-        _total_length([curve.numpy() for curve in curves_wp], closed_wp),
-        _total_length(curves_pp, closed_pp),
-        rtol=1e-5,
-        atol=1e-5,
-    )
-
-
-def test_marching_triangles_open_curve_ends_on_the_boundary(
-    hemisphere: tuple[object, wp.Mesh], device: str
-) -> None:
-    mesh_tm, mesh_wp = hemisphere
-    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)  # type: ignore[attr-defined]
-    # The hemisphere's rim is a single loop, so a level set of x has to run into it.
-    values_np = np.ascontiguousarray(vertices_np[:, 0])
-    isovalue = float(values_np.mean())
-    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
-
-    curves_wp, closed_wp = tw.intersection.marching_triangles(
-        mesh_wp.points, mesh_wp.indices, values_wp, isovalue, n_vertices=len(vertices_np)
-    )
-
-    assert not all(closed_wp)
-    boundary_vertices = mesh_wp.points.numpy()[
-        tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices).numpy()
-    ]
-    for points, is_closed in zip([curve.numpy() for curve in curves_wp], closed_wp, strict=True):
-        if is_closed:
-            continue
-        # Both ends of an open curve sit on a boundary edge, hence within one edge length of a
-        # boundary vertex.
-        edge_length = tw.edges.mean_edge_length(mesh_wp.points, mesh_wp.indices)
-        for end in (points[0], points[-1]):
-            assert np.linalg.norm(boundary_vertices - end, axis=1).min() <= edge_length
-
-
-def test_marching_triangles_exact_vertex_hit_is_reported_once(device: str) -> None:
-    # Two triangles sharing edge (1, 2), with the field vanishing exactly at both shared vertices,
-    # so the level set *is* that edge. Counting a value equal to the isovalue as positive leaves the
-    # all-positive face with nothing to report and the mixed-sign face with one segment along the
-    # shared edge: the curve appears exactly once rather than twice or not at all.
-    vertices_wp = wp.array(
-        np.array([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]),
-        dtype=wp.vec3,
-        device=device,
-    )
-    faces_wp = wp.array(np.array([0, 1, 2, 3, 2, 1], dtype=np.int32), dtype=wp.int32, device=device)
-    values_wp = wp.array(np.array([-1.0, 0.0, 0.0, 1.0], dtype=np.float32), device=device)
-
-    curves_wp, closed_wp = tw.intersection.marching_triangles(
-        vertices_wp, faces_wp, values_wp, 0.0, n_vertices=4
-    )
-
-    assert len(curves_wp) == 1
-    assert closed_wp == [False]
-    assert curves_wp[0].shape == (2,)
-    # The two endpoints are the shared vertices themselves.
-    assert np.allclose(
-        np.sort(curves_wp[0].numpy(), axis=0),
-        np.array([[0.0, -1.0, 0.0], [0.0, 1.0, 0.0]]),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-
-
-def test_marching_triangles_level_set_is_the_piecewise_linear_one(
-    icosahedron: tuple[object, wp.Mesh], device: str
-) -> None:
-    mesh_tm, mesh_wp = icosahedron
-    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)  # type: ignore[attr-defined]
-    faces_np = np.asarray(mesh_tm.faces)  # type: ignore[attr-defined]
-    values_np = np.ascontiguousarray(vertices_np[:, 2])
-    isovalue = 0.1234
-    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
-
-    curves_wp, _ = tw.intersection.marching_triangles(
-        mesh_wp.points, mesh_wp.indices, values_wp, isovalue, n_vertices=len(vertices_np)
-    )
-
-    # One segment per face whose vertex values straddle the isovalue, and every segment lands in a
-    # curve: the total point count equals the cut-face count for an all-closed level set.
-    positive = values_np[faces_np] >= isovalue
-    cut_faces = int((~(positive.all(axis=1) | (~positive).all(axis=1))).sum())
-    assert sum(int(curve.shape[0]) for curve in curves_wp) == cut_faces
-
-
-def test_marching_triangles_no_crossing(icosahedron: tuple[object, wp.Mesh], device: str) -> None:
-    mesh_tm, mesh_wp = icosahedron
-    values_wp = wp.array(
-        np.ascontiguousarray(np.asarray(mesh_tm.vertices)[:, 2]),  # type: ignore[attr-defined]
-        dtype=wp.float64,
-        device=mesh_wp.device,
-    )
-    assert tw.intersection.marching_triangles(mesh_wp.points, mesh_wp.indices, values_wp, 1e6) == (
-        [],
-        [],
-    )
-
-
-def test_marching_triangles_empty(device: str) -> None:
-    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
-    values_wp = wp.empty(0, dtype=wp.float32, device=device)
-    assert tw.intersection.marching_triangles(vertices_wp, faces_wp, values_wp) == ([], [])

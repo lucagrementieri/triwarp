@@ -153,6 +153,7 @@ import numpy as np
 import pymeshlab as ml
 import pytest
 import pyvista as pv
+import shapely.geometry as sg
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -646,13 +647,12 @@ def test_revolve(bench_lib: BenchLibrary, sections: int) -> None:
 def test_extrude_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
     # Dominated by the ear-clipping triangulation of the ring, which is the interesting part: a
     # convex ring takes triwarp's single-fan fast path. No open3d counterpart.
-    shapely = pytest.importorskip("shapely.geometry")
     if bench_lib.kind == "triwarp":
         ring_wp = _ring_wp(ring_size, str(bench_lib.device))
         _, faces_wp = bench_lib.run(lambda: tw.creation.extrude_polygon(ring_wp, 1.0))
         assert int(faces_wp.shape[0]) // 3 == 2 * (ring_size - 2) + 2 * ring_size
     else:
-        polygon = shapely.Polygon(_ring_np(ring_size))
+        polygon = sg.Polygon(_ring_np(ring_size))
         mesh_tm = bench_lib.run(lambda: tm.creation.extrude_polygon(polygon, 1.0))
         assert len(mesh_tm.faces) > 0
 
@@ -662,7 +662,6 @@ def test_extrude_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
 def test_sweep_polygon(bench_lib: BenchLibrary) -> None:
     # A long helix so the per-slice frame construction and wall emission dominate the one-off
     # triangulation. No open3d counterpart.
-    shapely = pytest.importorskip("shapely.geometry")
     path_np = _helix_np(_SWEEP_PATH)
     if bench_lib.kind == "triwarp":
         device = str(bench_lib.device)
@@ -673,7 +672,7 @@ def test_sweep_polygon(bench_lib: BenchLibrary) -> None:
         _, faces_wp = bench_lib.run(lambda: tw.creation.sweep_polygon(ring_wp, path_wp))
         assert int(faces_wp.shape[0]) // 3 > 0
     else:
-        polygon = shapely.Polygon(_ring_np(_SWEEP_RING))
+        polygon = sg.Polygon(_ring_np(_SWEEP_RING))
         mesh_tm = bench_lib.run(lambda: tm.creation.sweep_polygon(polygon, path_np))
         assert len(mesh_tm.faces) > 0
 

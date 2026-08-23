@@ -23,7 +23,12 @@ from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
-from tests.conversions import meshlib_indices_to_numpy, points_to_meshlib, points_to_open3d
+from tests.conversions import (
+    meshlib_indices_to_numpy,
+    points_to_meshlib,
+    points_to_open3d,
+    points_to_warp,
+)
 from triwarp.kernels import neighbors as kernel_neighbors
 
 
@@ -41,7 +46,7 @@ def test_query_ball_single(device: str, backend: Literal["bvh", "hashgrid"]):
     query_indices_np = query_indices_np[order]
     query_distances_np = query_distances_np[order]
 
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
     query_wp = wp.vec3(query[0], query[1], query[2])
     query_ball = partial(tw.neighbors.query_ball, backend=backend)
 
@@ -73,7 +78,7 @@ def test_query_ball_empty_ball(device: str, backend: Literal["bvh", "hashgrid"])
     query = np.array([10.0, 10.0, 10.0], dtype=np.float32)
     radius = 0.5
 
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
     query_wp = wp.vec3(query[0], query[1], query[2])
     query_ball = partial(tw.neighbors.query_ball, backend=backend)
 
@@ -117,8 +122,8 @@ def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
         distances[order] for distances, order in zip(query_distances_np, orders, strict=False)
     ]
 
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
-    query_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
+    query_wp = points_to_warp(queries, device)
     query_ball = partial(tw.neighbors.query_ball, backend=backend)
 
     query_indices_wp, query_distances_wp = query_ball(
@@ -174,8 +179,8 @@ def test_query_ball_count_matches_scipy_and_the_list_form(
     queries_np = points_np[[10, 20, 30, 55, 120]].copy()
     radius = 0.5
 
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
-    queries_wp = wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
+    queries_wp = points_to_warp(queries_np, device)
     query_ball_count = partial(tw.neighbors.query_ball_count, backend=backend)
     query_ball_with_offsets = partial(tw.neighbors.query_ball_with_offsets, backend=backend)
 
@@ -219,10 +224,9 @@ def test_query_bvh_aabb_with_offsets_matches_a_brute_force_box_overlap(
     n_queries = queries_np.shape[0]
 
     bvh = tw.neighbors.bvh_from_bounds(
-        wp.array(np.ascontiguousarray(lower_np), dtype=wp.vec3, device=device),
-        wp.array(np.ascontiguousarray(upper_np), dtype=wp.vec3, device=device),
+        points_to_warp(lower_np, device), points_to_warp(upper_np, device)
     )
-    queries_wp = wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device)
+    queries_wp = points_to_warp(queries_np, device)
     indices_wp, offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
         bvh, queries_wp, half_extent, include_total=include_total
     )
@@ -268,8 +272,7 @@ def test_query_bvh_aabb_with_offsets_degenerate_inputs(device: str, include_tota
     lower_np = np.zeros((4, 3), dtype=np.float32)
     upper_np = np.full((4, 3), 0.1, dtype=np.float32)
     bvh = tw.neighbors.bvh_from_bounds(
-        wp.array(lower_np, dtype=wp.vec3, device=device),
-        wp.array(upper_np, dtype=wp.vec3, device=device),
+        points_to_warp(lower_np, device), points_to_warp(upper_np, device)
     )
 
     empty_indices_wp, empty_offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
@@ -312,13 +315,10 @@ def test_query_bvh_box_matches_exact_containment(device: str) -> None:
     upper_np = np.ascontiguousarray(centers_np + 0.18, dtype=np.float32)
     n_queries = centers_np.shape[0]
 
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     bvh = tw.neighbors.bvh_from_points(points_wp)
     indices_wp, offsets_wp = tw.neighbors.query_bvh_box(
-        bvh,
-        wp.array(lower_np, dtype=wp.vec3, device=device),
-        wp.array(upper_np, dtype=wp.vec3, device=device),
-        include_total=True,
+        bvh, points_to_warp(lower_np, device), points_to_warp(upper_np, device), include_total=True
     )
     indices_np = indices_wp.numpy()
     offsets_np = offsets_wp.numpy()
@@ -349,15 +349,13 @@ def test_query_bvh_box_matches_exact_containment(device: str) -> None:
 
     # The length-``m`` form is the same scan buffer's prefix, not a separately computed answer.
     _short_indices_wp, short_offsets_wp = tw.neighbors.query_bvh_box(
-        bvh,
-        wp.array(lower_np, dtype=wp.vec3, device=device),
-        wp.array(upper_np, dtype=wp.vec3, device=device),
+        bvh, points_to_warp(lower_np, device), points_to_warp(upper_np, device)
     )
     assert np.array_equal(short_offsets_wp.numpy(), offsets_np[:-1])
 
     # Inclusive on both faces, and an inverted box selects nothing.
     face_np = np.array([[0.0, 0.5, 0.5], [1.0, 0.5, 0.5], [0.5, 0.5, 0.5]], dtype=np.float32)
-    face_bvh = tw.neighbors.bvh_from_points(wp.array(face_np, dtype=wp.vec3, device=device))
+    face_bvh = tw.neighbors.bvh_from_points(points_to_warp(face_np, device))
     face_indices_wp, face_offsets_wp = tw.neighbors.query_bvh_box(
         face_bvh,
         wp.array(np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], np.float32), wp.vec3, device=device),
@@ -390,14 +388,9 @@ def test_query_bvh_box_matches_meshlib(device: str) -> None:
     lower_np = np.array([[0.2, 0.2, 0.2], [0.0, 0.0, 0.0]], dtype=np.float32)
     upper_np = np.array([[0.6, 0.7, 0.55], [1.0, 1.0, 1.0]], dtype=np.float32)
 
-    bvh = tw.neighbors.bvh_from_points(
-        wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
-    )
+    bvh = tw.neighbors.bvh_from_points(points_to_warp(points_np, device))
     indices_wp, offsets_wp = tw.neighbors.query_bvh_box(
-        bvh,
-        wp.array(lower_np, dtype=wp.vec3, device=device),
-        wp.array(upper_np, dtype=wp.vec3, device=device),
-        include_total=True,
+        bvh, points_to_warp(lower_np, device), points_to_warp(upper_np, device), include_total=True
     )
     indices_np, offsets_np = indices_wp.numpy(), offsets_wp.numpy()
 
@@ -464,11 +457,11 @@ def test_query_ball_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     rng = np.random.default_rng(0)
     points = rng.random((10, 3), dtype=np.float32)
 
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
     empty_points_wp = wp.empty(0, dtype=wp.vec3, device=device)
     empty_queries_wp = wp.empty(0, dtype=wp.vec3, device=device)
     query_wp = wp.vec3(points[0][0], points[0][1], points[0][2])
-    queries_wp = wp.array(np.ascontiguousarray(points[-3:]), dtype=wp.vec3, device=device)
+    queries_wp = points_to_warp(points[-3:], device)
     radius = 0.5
     query_ball = partial(tw.neighbors.query_ball, backend=backend)
 
@@ -491,7 +484,7 @@ def test_query_ball_empty(device: str, backend: Literal["bvh", "hashgrid"]):
 def test_knn_initial_radius_matches_uniform_density(device: str):
     rng = np.random.default_rng(3)
     points = rng.random((4000, 3), dtype=np.float32)
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
 
     for k in (1, 8):
         radius_wp = tw.neighbors.knn_initial_radius(points_wp, k)
@@ -517,9 +510,7 @@ def test_knn_initial_radius_degenerate_clouds(device: str):
     coincident_np = np.zeros((10, 3), dtype=np.float32)
 
     def radius_of(points_np: np.ndarray, k: int = 4) -> float:
-        return tw.neighbors.knn_initial_radius(
-            wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device), k
-        )
+        return tw.neighbors.knn_initial_radius(points_to_warp(points_np, device), k)
 
     # d = 2: pi r^2 = (k / n) * area
     area_np = float(np.prod(planar_np[:, :2].max(axis=0) - planar_np[:, :2].min(axis=0)))
@@ -555,7 +546,7 @@ def test_query_nearest_single(
     kdtree = KDTree(points)
     query = points[0].copy()
 
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
     query_wp = wp.vec3(query[0], query[1], query[2])
     query_distances_np, query_indices_np = kdtree.query(query, k=k, distance_upper_bound=max_radius)
     query_indices_np = np.atleast_1d(np.asarray(query_indices_np))
@@ -590,8 +581,8 @@ def test_query_nearest_batch(
     kdtree = KDTree(points)
     queries = points[[10, 20, 30]] + 0.5
 
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
-    query_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
+    query_wp = points_to_warp(queries, device)
 
     query_distances_np, query_indices_np = kdtree.query(
         queries, k=k, distance_upper_bound=max_radius
@@ -632,8 +623,8 @@ def test_query_nearest_row_buckets(device: str, backend: Literal["bvh", "hashgri
     points = rng.random((300, 3), dtype=np.float32) * 5.0
     queries = rng.random((40, 3), dtype=np.float32) * 5.0
 
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
-    queries_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
+    queries_wp = points_to_warp(queries, device)
     query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     query_indices_wp, query_distances_wp = query_nearest(points_wp, queries_wp, k=k)
     query_distances_np, query_indices_np = KDTree(points).query(queries, k=k)
@@ -676,12 +667,8 @@ def test_query_nearest_matches_igl(device: str, backend: Literal["bvh", "hashgri
     points = rng.random((300, 3)) * 5.0
     queries = rng.random((40, 3)) * 5.0
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3, device=device
-    )
-    queries_wp = wp.array(
-        np.ascontiguousarray(queries, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    points_wp = points_to_warp(points, device)
+    queries_wp = points_to_warp(queries, device)
     query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     query_indices_wp, _distances_wp = query_nearest(points_wp, queries_wp, k=k)
     query_indices_igl = igl.knn(queries, points, k, *igl.octree(points)[:4])
@@ -716,12 +703,8 @@ def test_query_nearest_matches_open3d(
     points = rng.random((300, 3)) * 5.0
     queries = rng.random((40, 3)) * 5.0
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3, device=device
-    )
-    queries_wp = wp.array(
-        np.ascontiguousarray(queries, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    points_wp = points_to_warp(points, device)
+    queries_wp = points_to_warp(queries, device)
     query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     query_indices_wp, query_distances_wp = query_nearest(points_wp, queries_wp, k=k)
 
@@ -758,12 +741,8 @@ def test_query_ball_matches_open3d(device: str, backend: Literal["bvh", "hashgri
     queries = rng.random((60, 3)) * 3.0
     radius = 0.4
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3, device=device
-    )
-    queries_wp = wp.array(
-        np.ascontiguousarray(queries, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    points_wp = points_to_warp(points, device)
+    queries_wp = points_to_warp(queries, device)
     query_ball_with_offsets = partial(tw.neighbors.query_ball_with_offsets, backend=backend)
     neighbors_wp, _distances_wp, offsets_wp = query_ball_with_offsets(points_wp, queries_wp, radius)
 
@@ -811,8 +790,8 @@ def test_query_nearest_ties(device: str, backend: Literal["bvh", "hashgrid"], k:
     at_centers = lattice[rng.choice(lattice.shape[0], size=30, replace=False)] + 0.5
     queries = np.ascontiguousarray(np.vstack([on_lattice, at_centers]), dtype=np.float32)
 
-    points_wp = wp.array(np.ascontiguousarray(lattice), dtype=wp.vec3, device=device)
-    queries_wp = wp.array(queries, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(lattice, device)
+    queries_wp = points_to_warp(queries, device)
     query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
     query_indices_wp, query_distances_wp = query_nearest(points_wp, queries_wp, k=k)
     # ``k == 1`` returns length-m 1D arrays on both sides; reshape so one comparison covers all k.
@@ -837,11 +816,11 @@ def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     rng = np.random.default_rng(0)
     points = rng.random((10, 3), dtype=np.float32)
 
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
     empty_points_wp = wp.empty(0, dtype=wp.vec3, device=device)
     empty_queries_wp = wp.empty(0, dtype=wp.vec3, device=device)
     query_wp = wp.vec3(points[0][0], points[0][1], points[0][2])
-    queries_wp = wp.array(np.ascontiguousarray(points[-3:]), dtype=wp.vec3, device=device)
+    queries_wp = points_to_warp(points[-3:], device)
     k = 2
     query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
 
@@ -875,8 +854,8 @@ def test_query_nearest_initial_radius_invariance(
     queries = rng.random((60, 3), dtype=np.float32) * 3.0
     diagonal = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
 
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
-    queries_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
+    queries_wp = points_to_warp(queries, device)
     query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
 
     reference_indices_wp, reference_distances_wp = query_nearest(points_wp, queries_wp, k=k)
@@ -907,8 +886,8 @@ def test_query_nearest_clustered(device: str, backend: Literal["bvh", "hashgrid"
     points = np.ascontiguousarray(points, dtype=np.float32)
     queries = np.ascontiguousarray(rng.random((80, 3)) * 100.0, dtype=np.float32)
 
-    points_wp = wp.array(points, dtype=wp.vec3, device=device)
-    queries_wp = wp.array(queries, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
+    queries_wp = points_to_warp(queries, device)
     query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
 
     for k in (1, 5):
@@ -932,8 +911,8 @@ def test_query_nearest_degenerate_clouds(device: str, backend: Literal["bvh", "h
     for points in (coincident_np, collinear_np, planar_np):
         # Queries on the cloud and far outside it (the latter has an unbounded complete radius).
         queries = np.ascontiguousarray(np.vstack((points[:5], points[:5] + 40.0)), dtype=np.float32)
-        points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
-        queries_wp = wp.array(queries, dtype=wp.vec3, device=device)
+        points_wp = points_to_warp(points, device)
+        queries_wp = points_to_warp(queries, device)
 
         indices_wp, distances_wp = query_nearest(points_wp, queries_wp, k=3)
         query_distances_np, _query_indices_np = KDTree(points).query(queries, k=3)
@@ -950,8 +929,8 @@ def test_query_nearest_prebuilt_index(device: str, backend: Literal["bvh", "hash
     rng = np.random.default_rng(8)
     points = rng.random((300, 3), dtype=np.float32) * 2.0
     queries = rng.random((40, 3), dtype=np.float32) * 2.0
-    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
-    queries_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points, device)
+    queries_wp = points_to_warp(queries, device)
 
     k = 4
     initial_radius = tw.neighbors.knn_initial_radius(points_wp, k)
@@ -995,11 +974,7 @@ def test_backend_and_accelerator_must_agree(device: str) -> None:
     accepted (it selects the backend by its type), and a matching pair must be accepted too, or the
     guard would be rejecting correct calls.
     """
-    points_wp = wp.array(
-        np.ascontiguousarray(np.random.default_rng(0).random((32, 3)), dtype=np.float32),
-        dtype=wp.vec3,
-        device=device,
-    )
+    points_wp = points_to_warp(np.random.default_rng(0).random((32, 3)), device)
     bvh = tw.neighbors.bvh_from_points(points_wp)
     grid = tw.neighbors.hashgrid_from_points(points_wp, 0.25)
 
@@ -1030,12 +1005,8 @@ def test_the_two_backends_agree(device: str) -> None:
     the keyword changed the answer and the shared ``query_ball_count`` group name is a lie.
     """
     rng = np.random.default_rng(7)
-    points_wp = wp.array(
-        np.ascontiguousarray(rng.random((400, 3)), dtype=np.float32), dtype=wp.vec3, device=device
-    )
-    queries_wp = wp.array(
-        np.ascontiguousarray(rng.random((60, 3)), dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    points_wp = points_to_warp(rng.random((400, 3)), device)
+    queries_wp = points_to_warp(rng.random((60, 3)), device)
 
     counts_bvh = tw.neighbors.query_ball_count(points_wp, queries_wp, 0.3, backend="bvh")
     counts_grid = tw.neighbors.query_ball_count(points_wp, queries_wp, 0.3, backend="hashgrid")
@@ -1083,9 +1054,9 @@ def test_query_weighted_nearest_matches_meshlib(device: str) -> None:
     assert (nearest_np != plain_np).mean() > 0.5  # the weights decide most queries, so not vacuous
 
     index_wp, distance_wp = tw.neighbors.query_weighted_nearest(
-        wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device),
+        points_to_warp(points_np, device),
         wp.array(weights_np, dtype=wp.float32, device=device),
-        wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device),
+        points_to_warp(queries_np, device),
     )
     assert np.array_equal(index_wp.numpy(), nearest_np)
     assert np.allclose(distance_wp.numpy(), weighted_np, rtol=1e-5, atol=1e-5)
@@ -1116,8 +1087,8 @@ def test_query_weighted_nearest_conventions(device: str) -> None:
     rng = np.random.default_rng(8)
     points_np = rng.random((300, 3)).astype(np.float32)
     queries_np = rng.random((50, 3)).astype(np.float32)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
-    queries_wp = wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
+    queries_wp = points_to_warp(queries_np, device)
 
     zero_wp = wp.zeros(300, dtype=wp.float32, device=device)
     index_wp, distance_wp = tw.neighbors.query_weighted_nearest(points_wp, zero_wp, queries_wp)
@@ -1173,13 +1144,13 @@ def test_nearest_neighbor_distance_matches_open3d(device: str) -> None:
 
     distance_o3d = np.asarray(points_to_open3d(points_np).compute_nearest_neighbor_distance())
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     distance_wp = tw.neighbors.nearest_neighbor_distance(points_wp)
 
     assert distance_o3d.min() > 0.0  # non-vacuity: a random cloud has no coincident points
     assert np.allclose(distance_wp.numpy(), distance_o3d, rtol=1e-5, atol=1e-5)
 
-    scaled_wp = wp.array((3.0 * points_np).astype(np.float32), dtype=wp.vec3, device=device)
+    scaled_wp = points_to_warp(3.0 * points_np, device)
     scaled_distance_wp = tw.neighbors.nearest_neighbor_distance(scaled_wp)
     assert np.allclose(scaled_distance_wp.numpy(), 3.0 * distance_wp.numpy(), rtol=1e-5, atol=1e-5)
 
@@ -1211,7 +1182,7 @@ def test_nearest_neighbor_distance_matches_meshlib(device: str) -> None:
     assert np.all(nearest_ml != np.arange(points_np.shape[0]))  # the closest *other* point
     distance_ml = np.linalg.norm(points_np[nearest_ml] - points_np, axis=1)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     distance_wp = tw.neighbors.nearest_neighbor_distance(points_wp)
 
     assert distance_ml.min() > 0.0  # non-vacuity: a random cloud has no coincident points
@@ -1228,7 +1199,7 @@ def test_nearest_neighbor_distance_coincident_and_degenerate(device: str) -> Non
     documented rather than papered over, so it is pinned here rather than in the parity test.
     """
     coincident_np = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], dtype=np.float32)
-    coincident_wp = wp.array(coincident_np, dtype=wp.vec3, device=device)
+    coincident_wp = points_to_warp(coincident_np, device)
     distance_wp = tw.neighbors.nearest_neighbor_distance(coincident_wp).numpy()
     assert np.array_equal(distance_wp, np.array([0.0, 0.0, 5.0], dtype=np.float32))
 
@@ -1264,7 +1235,7 @@ def test_closest_pair_matches_meshlib(device: str) -> None:
     np.fill_diagonal(distance_np, np.inf)
     index_a_np, index_b_np = np.unravel_index(np.argmin(distance_np), distance_np.shape)
 
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     index_a_wp, index_b_wp, distance_wp = tw.neighbors.closest_pair(points_wp)
     assert {index_a_wp, index_b_wp} == {int(index_a_np), int(index_b_np)}
     assert np.isclose(distance_wp, distance_np[index_a_np, index_b_np], rtol=1e-5, atol=1e-5)
@@ -1289,7 +1260,7 @@ def test_closest_pair_ties_and_degenerate(device: str) -> None:
     duplicated_np = np.array(
         [[0.0, 0.0, 0.0], [9.0, 0.0, 0.0], [0.0, 0.0, 0.0], [4.0, 4.0, 4.0]], dtype=np.float32
     )
-    duplicated_wp = wp.array(duplicated_np, dtype=wp.vec3, device=device)
+    duplicated_wp = points_to_warp(duplicated_np, device)
     index_a_wp, index_b_wp, distance_wp = tw.neighbors.closest_pair(duplicated_wp)
     assert (index_a_wp, index_b_wp) == (0, 2)
     assert distance_wp == 0.0
@@ -1363,7 +1334,7 @@ def test_geodesic_ball_neighborhoods(mesh_name: str, request: pytest.FixtureRequ
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int32)
 
-    vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
 
     radius = 3.0 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
@@ -1444,12 +1415,8 @@ def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgr
     queries_np = rng.random((60, 3)) * 3.0
     radius = 0.4
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
-    queries_wp = wp.array(
-        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    points_wp = points_to_warp(points_np, device)
+    queries_wp = points_to_warp(queries_np, device)
     query_ball = partial(tw.neighbors.query_ball, backend=backend)
     neighbours_wp, distances_wp = query_ball(points_wp, queries_wp, radius)
 
@@ -1484,7 +1451,7 @@ def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgr
 
     # The boundary rule, which the random cloud cannot reach: both are inclusive at exactly r.
     tie_np = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.5, 0.0, 0.0]])
-    tie_wp = wp.array(np.ascontiguousarray(tie_np, dtype=np.float32), dtype=wp.vec3, device=device)
+    tie_wp = points_to_warp(tie_np, device)
     tie_indices_wp, _tie_distances_wp = query_ball(tie_wp, wp.vec3(0.0, 0.0, 0.0), 1.0)
     tie_found: list[int] = []
 
@@ -1551,9 +1518,7 @@ def test_query_nearest_matches_meshlib(
     """
     rng = np.random.default_rng(11)
     points_np = rng.random((300, 3)) * 5.0
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    points_wp = points_to_warp(points_np, device)
     query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
 
     neighbours_ml = np.array(
@@ -1578,9 +1543,7 @@ def test_query_nearest_matches_meshlib(
     # must be held in a name -- ``setPointCloud`` stores a raw pointer, so a temporary segfaults
     # rather than raising, the same trap ``PointsToMeshProjector`` carries in test_proximity.py.
     queries_np = rng.random((40, 3)) * 5.0
-    queries_wp = wp.array(
-        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    queries_wp = points_to_warp(queries_np, device)
     queries_ml = mm.std_vector_Vector3_float()
     for query_np in queries_np:
         queries_ml.append(mm.Vector3f(*query_np.tolist()))

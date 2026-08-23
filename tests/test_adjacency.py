@@ -19,7 +19,9 @@ from tests.conversions import (
     trimesh_to_pyvista,
 )
 
-_MESHES = ["icosahedron", "half_torus", "hemisphere"]
+# Not ``conftest.MESHES``: ``cave_cube`` is dropped because its coplanar box faces make every
+# adjacency angle exactly 0 or pi/2, so the three curved fixtures carry the coverage here.
+_ADJACENCY_MESHES = ["icosahedron", "half_torus", "hemisphere"]
 
 
 def _adjacency_order(adjacency_np: np.ndarray) -> np.ndarray:
@@ -27,7 +29,7 @@ def _adjacency_order(adjacency_np: np.ndarray) -> np.ndarray:
     return np.lexsort((adjacency_np[:, 1], adjacency_np[:, 0]))
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
 @pytest.mark.parity("face_adjacency", "trimesh")
 def test_face_adjacency(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """Class A: face pairs and their shared edges, elementwise after a canonical row sort."""
@@ -44,7 +46,7 @@ def test_face_adjacency(request: pytest.FixtureRequest, mesh_name: str) -> None:
     assert np.array_equal(adjacency_edges_wp.numpy()[order_wp], adjacency_edges_tm[order_tm])
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
 def test_face_adjacency_n_vertices_matches_inferred(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -57,7 +59,7 @@ def test_face_adjacency_n_vertices_matches_inferred(
     assert np.array_equal(inferred_wp.numpy(), supplied_wp.numpy())
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
 def test_face_adjacency_radix_is_invariant_to_an_oversized_base(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -93,7 +95,7 @@ def test_face_adjacency_empty(device: str) -> None:
     assert adjacency_edges_wp.shape == (0, 2)
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
 def test_resolve_face_adjacency_derives_and_forwards(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -126,7 +128,98 @@ def test_resolve_face_adjacency_derives_and_forwards(
         assert np.array_equal(got_edges_wp.numpy(), edges_wp.numpy())
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
+@pytest.mark.parity("vertex_face_adjacency", "igl")
+def test_vertex_face_adjacency_matches_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (row order): the same ``(offsets, vertex_faces)`` CSR, arbitrary within a row.
+
+    ``igl.vertex_triangle_adjacency(F, n)`` returns ``(VF, NI)`` -- the payload and the offsets, in
+    that order, exactly triwarp's pair reversed -- so the only transform is the unpacking plus
+    sorting each row. Both give ``n_vertices + 1`` offsets, so no sentinel has to be appended.
+
+    Row order is genuinely undefined in triwarp's version (a counting-sort scatter, so it is thread
+    order) and the docstring says so, which is why the rows are compared as **sets**. The offsets
+    are compared exactly: those are not order-dependent, and an off-by-one there is the failure
+    mode this function's consumers -- the decimator's normal-flip guard -- see as silent corruption.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp = mesh_wp.indices
+    n_vertices = int(mesh_wp.points.shape[0])
+    faces_np = faces_wp.numpy().reshape(-1, 3).astype(np.int64)
+
+    payload_igl, offsets_igl = igl.vertex_triangle_adjacency(faces_np, n_vertices)
+    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=n_vertices)
+
+    assert np.array_equal(offsets_wp.numpy(), np.asarray(offsets_igl).ravel())
+    bounds_np = offsets_wp.numpy()
+    for vertex in range(n_vertices):
+        row_wp = payload_wp.numpy()[bounds_np[vertex] : bounds_np[vertex + 1]]
+        row_igl = np.asarray(payload_igl).ravel()[bounds_np[vertex] : bounds_np[vertex + 1]]
+        assert np.array_equal(np.sort(row_wp), np.sort(row_igl))
+
+
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
+def test_vertex_face_adjacency_infers_n_vertices(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Omitting ``n_vertices`` costs a readback and must not change the *rows*.
+
+    The **offsets** are compared exactly and the rows only as sets, because the payload order is
+    genuinely nondeterministic: the scatter picks each slot with a ``wp.atomic_add`` on a per-vertex
+    cursor, so two runs on CUDA order a row differently. Asserting ``array_equal`` on the payload
+    would assert something the function does not promise -- it passes on cpu and fails on cuda,
+    which is how this test found its own bug.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    inferred_offsets, inferred_faces = tw.adjacency.vertex_face_adjacency(mesh_wp.indices)
+    supplied_offsets, supplied_faces = tw.adjacency.vertex_face_adjacency(
+        mesh_wp.indices, n_vertices=int(mesh_wp.points.shape[0])
+    )
+
+    assert np.array_equal(inferred_offsets.numpy(), supplied_offsets.numpy())
+    bounds_np = inferred_offsets.numpy()
+    for vertex in range(bounds_np.shape[0] - 1):
+        row = slice(int(bounds_np[vertex]), int(bounds_np[vertex + 1]))
+        assert np.array_equal(
+            np.sort(inferred_faces.numpy()[row]), np.sort(supplied_faces.numpy()[row])
+        )
+
+
+def test_vertex_face_adjacency_unreferenced_vertex(device: str) -> None:
+    """
+    A vertex no face touches gets an **empty row**, not a missing one.
+
+    That is the property the offsets encode and the reason ``n_vertices`` is a parameter rather than
+    inferred unconditionally: with two trailing unreferenced vertices the payload is unchanged and
+    only the offsets grow, repeating the final value.
+    """
+    faces_np = np.array([0, 1, 2], dtype=np.int32)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+
+    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=5)
+
+    assert np.array_equal(offsets_wp.numpy(), np.array([0, 1, 2, 3, 3, 3], dtype=np.int32))
+    assert np.array_equal(np.sort(payload_wp.numpy()), np.zeros(3, dtype=np.int32))
+
+
+def test_vertex_face_adjacency_empty(device: str) -> None:
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
+    assert offsets_wp.shape == (1,)
+    assert payload_wp.shape == (0,)
+
+
+def test_vertex_face_adjacency_zero_rows_with_faces(device: str) -> None:
+    """``n_vertices=0`` on a non-empty mesh returns zeros, not an unwritten buffer."""
+    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
+    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
+    assert offsets_wp.shape == (1,)
+    assert np.array_equal(payload_wp.numpy(), np.zeros(3, dtype=np.int32))
+
+
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
 @pytest.mark.parity("face_adjacency_unshared", "trimesh")
 def test_face_adjacency_unshared(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """Class A: the off-edge corner of each adjacent face, elementwise after a row sort."""
@@ -151,7 +244,7 @@ def test_face_adjacency_unshared(request: pytest.FixtureRequest, mesh_name: str)
     assert np.array_equal(unshared_wp.numpy(), unshared_precomputed_wp.numpy())
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
 @pytest.mark.parity("face_adjacency", "igl")
 @pytest.mark.parity("face_adjacency_unshared", "igl")
 def test_face_adjacency_and_unshared_match_igl(
@@ -222,189 +315,6 @@ def test_face_adjacency_and_unshared_match_igl(
     assert np.array_equal(corners_igl[has_neighbour] >= 0, np.ones(has_neighbour.sum(), dtype=bool))
 
 
-def _face_labels_np(faces_np: np.ndarray) -> np.ndarray:
-    """
-    Label the face dual graph with scipy: shared edges become entries, then a component pass.
-
-    Written out rather than taken from a library because no reference builds the dual *and* labels
-    it in one call except igl's ``facet_components`` -- which is the other half of the comparison
-    below, so reusing it would be comparing igl with itself. This is the same two-phase shape
-    triwarp's function has and the same one ``benchmarks/test_graph.py`` times on the scipy row.
-    """
-    edges_np = np.sort(
-        np.concatenate((faces_np[:, [0, 1]], faces_np[:, [1, 2]], faces_np[:, [2, 0]])), axis=1
-    )
-    owner_np = np.tile(np.arange(faces_np.shape[0]), 3)
-    order_np = np.lexsort((edges_np[:, 1], edges_np[:, 0]))
-    edges_np, owner_np = edges_np[order_np], owner_np[order_np]
-    shared_np = np.flatnonzero(np.all(edges_np[1:] == edges_np[:-1], axis=1))
-    dual_np = sp.coo_matrix(
-        (np.ones(shared_np.size, dtype=np.int8), (owner_np[shared_np], owner_np[shared_np + 1])),
-        shape=(faces_np.shape[0], faces_np.shape[0]),
-    ).tocsr()
-    return sp.csgraph.connected_components(dual_np)[1]
-
-
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
-@pytest.mark.parity("face_connected_component_labels", "igl")
-@pytest.mark.parity("face_connected_component_labels_depth", "igl", "scipy")
-def test_face_connected_component_labels_matches_igl(
-    request: pytest.FixtureRequest, mesh_name: str
-) -> None:
-    """
-    Class B: the same partition under different label *names*, against igl and scipy.
-
-    ``igl.facet_components`` numbers components ``0..k-1`` in its own traversal order and returns
-    ``(n_components, labels)`` -- the count **first**, which is the unpacking trap here. triwarp's
-    label propagation names each component after a representative face instead, so on a
-    two-component mesh it returns e.g. ``{0, 12}`` where igl returns ``{0, 1}``. The transform is
-    [`canonical_labels`][tests.comparisons.canonical_labels]: relabel by first appearance, which is
-    what [`same_partition`][tests.comparisons.same_partition] applies.
-
-    scipy is the second reference and is a genuinely different decomposition of the work: it builds
-    the dual graph explicitly (see [`_face_labels_np`]) and then labels it, where igl does both
-    internally and triwarp does both on the device. That is why the ``*_depth`` group -- whose
-    benchmark rows are all build-included -- claims both libraries here.
-
-    Both a single-component fixture and a two-component union are checked, because a labelling that
-    collapsed everything into one component would pass on the first alone.
-    """
-    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    faces_wp = mesh_wp.indices
-    faces_np = faces_wp.numpy().reshape(-1, 3).astype(np.int64)
-
-    n_components_igl, labels_igl = igl.facet_components(faces_np)
-    labels_wp = tw.adjacency.face_connected_component_labels(faces_wp)
-
-    assert n_components_igl == np.unique(labels_wp.numpy()).shape[0]
-    assert same_partition(labels_wp.numpy(), np.asarray(labels_igl).ravel())
-    assert same_partition(labels_wp.numpy(), _face_labels_np(faces_np))
-
-    # Two disjoint copies: the labelling must split them, which a constant output would not.
-    doubled_np = np.concatenate([faces_np, faces_np + faces_np.max() + 1])
-    doubled_wp = wp.array(
-        np.ascontiguousarray(doubled_np.reshape(-1), dtype=np.int32),
-        dtype=wp.int32,
-        device=faces_wp.device,
-    )
-    n_doubled_igl, labels_doubled_igl = igl.facet_components(doubled_np)
-    labels_doubled_wp = tw.adjacency.face_connected_component_labels(doubled_wp)
-
-    assert n_doubled_igl == 2 * n_components_igl
-    assert same_partition(labels_doubled_wp.numpy(), np.asarray(labels_doubled_igl).ravel())
-    assert same_partition(labels_doubled_wp.numpy(), _face_labels_np(doubled_np))
-
-
-def _face_labels_ml(components_ml: object, n_faces: int) -> np.ndarray:
-    """Decode MeshLib's vector of ``FaceBitSet`` components into a per-face label array."""
-    labels_np = np.full(n_faces, -1, dtype=np.int64)
-    for label, component_ml in enumerate(components_ml):  # type: ignore[call-overload]
-        labels_np[meshlib_bitset_to_numpy(component_ml, n_faces)] = label
-    return labels_np
-
-
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
-@pytest.mark.parity("face_connected_component_labels", "meshlib")
-def test_face_connected_component_labels_matches_meshlib(
-    request: pytest.FixtureRequest, mesh_name: str
-) -> None:
-    """
-    Class B, and the pair that pins *which* incidence rule triwarp implements.
-
-    ``getAllComponents`` takes a ``FaceIncidence`` and the two settings are different operations,
-    not two tunings: ``PerEdge`` connects faces sharing an edge, which is triwarp's rule, and
-    ``PerVertex`` connects faces sharing a single vertex. On a bowtie -- two triangles meeting at
-    one vertex -- they read **2** components and **1**, and triwarp reads 2. No other reference in
-    this module exposes that choice, so this is the only test that can fail if the convention ever
-    drifts.
-
-    The decode is the usual one: a vector of ``FaceBitSet`` in MeshLib's own traversal order, each
-    padded to the face domain, its index taken as the label, compared as a *partition*. Note the
-    overload set -- a second form takes ``maxComponentCount`` and returns a ``(components, count)``
-    **tuple**, so the result's type is asserted by unpacking it as a plain sequence here.
-    """
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    faces_wp = mesh_wp.indices
-    n_faces = mesh_tm.faces.shape[0]
-
-    components_ml = mm.getAllComponents(
-        mm.MeshPart(trimesh_to_meshlib(mesh_tm)), mm.MeshComponents.FaceIncidence.PerEdge
-    )
-    labels_wp = tw.adjacency.face_connected_component_labels(faces_wp)
-    assert len(components_ml) == np.unique(labels_wp.numpy()).shape[0]
-    assert same_partition(labels_wp.numpy(), _face_labels_ml(components_ml, n_faces))
-
-    # Two disjoint copies, the case a constant labelling would pass.
-    doubled_tm = tm.util.concatenate([mesh_tm, mesh_tm.copy().apply_translation([10.0, 0.0, 0.0])])
-    doubled_wp = wp.array(
-        np.ascontiguousarray(doubled_tm.faces.reshape(-1), dtype=np.int32),
-        dtype=wp.int32,
-        device=faces_wp.device,
-    )
-    doubled_ml = mm.getAllComponents(
-        mm.MeshPart(trimesh_to_meshlib(doubled_tm)), mm.MeshComponents.FaceIncidence.PerEdge
-    )
-    assert len(doubled_ml) == 2 * len(components_ml)
-    assert same_partition(
-        tw.adjacency.face_connected_component_labels(doubled_wp).numpy(),
-        _face_labels_ml(doubled_ml, doubled_tm.faces.shape[0]),
-    )
-
-    # The convention, on the input that separates the two rules.
-    bowtie_vertices_np = np.array(
-        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
-    )
-    bowtie_faces_np = np.array([[0, 1, 2], [0, 3, 4]], dtype=np.int32)
-    bowtie_ml = mm.MeshPart(numpy_to_meshlib(bowtie_vertices_np, bowtie_faces_np))
-    bowtie_wp = wp.array(
-        np.ascontiguousarray(bowtie_faces_np.reshape(-1)), dtype=wp.int32, device=faces_wp.device
-    )
-    per_edge_ml = mm.getAllComponents(bowtie_ml, mm.MeshComponents.FaceIncidence.PerEdge)
-    per_vertex_ml = mm.getAllComponents(bowtie_ml, mm.MeshComponents.FaceIncidence.PerVertex)
-    assert (len(per_edge_ml), len(per_vertex_ml)) == (2, 1)
-    assert np.unique(tw.adjacency.face_connected_component_labels(bowtie_wp).numpy()).shape[0] == 2
-
-
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
-@pytest.mark.parity("face_connected_component_labels", "pyvista")
-def test_face_connected_component_labels_matches_pyvista(
-    request: pytest.FixtureRequest, mesh_name: str
-) -> None:
-    """
-    Class B, the same relabelling as the igl row: VTK's ``RegionId`` names the components its way.
-
-    ``connectivity('all')`` writes a ``RegionId`` **cell** array numbered ``0..k-1``, and the
-    numbering is neither triwarp's representative-face id nor igl's traversal order -- measured on
-    two disjoint spheres it labels the *first* component ``1``, so even a pack-by-first-appearance
-    comparison fails and only the partition is shared. That is what
-    [`same_partition`][tests.comparisons.same_partition] compares; pyvista ships its own
-    ``pack_labels`` for the same reason.
-
-    The two-copy case is the non-vacuous half: on a single-component fixture any labelling at all
-    induces the same trivial partition.
-    """
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    faces_wp = mesh_wp.indices
-
-    labels_pv = np.asarray(trimesh_to_pyvista(mesh_tm).connectivity("all").cell_data["RegionId"])
-    labels_wp = tw.adjacency.face_connected_component_labels(faces_wp)
-    assert same_partition(labels_wp.numpy(), labels_pv)
-
-    doubled_tm = tm.util.concatenate([mesh_tm, mesh_tm.copy().apply_translation([10.0, 0.0, 0.0])])
-    doubled_wp = wp.array(
-        np.ascontiguousarray(doubled_tm.faces.reshape(-1), dtype=np.int32),
-        dtype=wp.int32,
-        device=faces_wp.device,
-    )
-    labels_doubled_pv = np.asarray(
-        trimesh_to_pyvista(doubled_tm).connectivity("all").cell_data["RegionId"]
-    )
-    labels_doubled_wp = tw.adjacency.face_connected_component_labels(doubled_wp)
-
-    assert np.unique(labels_doubled_pv).shape[0] == 2
-    assert same_partition(labels_doubled_wp.numpy(), labels_doubled_pv)
-
-
 def test_face_adjacency_unshared_duplicate_faces(device: str) -> None:
     """
     Two coincident triangles: the answer follows the *recorded shared edge*, not a set difference.
@@ -443,7 +353,7 @@ def test_face_adjacency_unshared_empty(device: str) -> None:
     assert unshared_wp.shape == (0, 2)
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
 @pytest.mark.parity("face_adjacency_angles", "trimesh")
 def test_face_adjacency_angles(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -581,97 +491,6 @@ def test_face_adjacency_angles_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     angles_wp = tw.adjacency.face_adjacency_angles(vertices_wp, faces_wp)
     assert angles_wp.shape == (0,)
-
-
-@pytest.mark.parametrize("mesh_name", _MESHES)
-@pytest.mark.parity("vertex_face_adjacency", "igl")
-def test_vertex_face_adjacency_matches_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
-    """
-    Class B (row order): the same ``(offsets, vertex_faces)`` CSR, arbitrary within a row.
-
-    ``igl.vertex_triangle_adjacency(F, n)`` returns ``(VF, NI)`` -- the payload and the offsets, in
-    that order, exactly triwarp's pair reversed -- so the only transform is the unpacking plus
-    sorting each row. Both give ``n_vertices + 1`` offsets, so no sentinel has to be appended.
-
-    Row order is genuinely undefined in triwarp's version (a counting-sort scatter, so it is thread
-    order) and the docstring says so, which is why the rows are compared as **sets**. The offsets
-    are compared exactly: those are not order-dependent, and an off-by-one there is the failure
-    mode this function's consumers -- the decimator's normal-flip guard -- see as silent corruption.
-    """
-    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    faces_wp = mesh_wp.indices
-    n_vertices = int(mesh_wp.points.shape[0])
-    faces_np = faces_wp.numpy().reshape(-1, 3).astype(np.int64)
-
-    payload_igl, offsets_igl = igl.vertex_triangle_adjacency(faces_np, n_vertices)
-    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=n_vertices)
-
-    assert np.array_equal(offsets_wp.numpy(), np.asarray(offsets_igl).ravel())
-    bounds_np = offsets_wp.numpy()
-    for vertex in range(n_vertices):
-        row_wp = payload_wp.numpy()[bounds_np[vertex] : bounds_np[vertex + 1]]
-        row_igl = np.asarray(payload_igl).ravel()[bounds_np[vertex] : bounds_np[vertex + 1]]
-        assert np.array_equal(np.sort(row_wp), np.sort(row_igl))
-
-
-@pytest.mark.parametrize("mesh_name", _MESHES)
-def test_vertex_face_adjacency_infers_n_vertices(
-    request: pytest.FixtureRequest, mesh_name: str
-) -> None:
-    """
-    Omitting ``n_vertices`` costs a readback and must not change the *rows*.
-
-    The **offsets** are compared exactly and the rows only as sets, because the payload order is
-    genuinely nondeterministic: the scatter picks each slot with a ``wp.atomic_add`` on a per-vertex
-    cursor, so two runs on CUDA order a row differently. Asserting ``array_equal`` on the payload
-    would assert something the function does not promise -- it passes on cpu and fails on cuda,
-    which is how this test found its own bug.
-    """
-    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    inferred_offsets, inferred_faces = tw.adjacency.vertex_face_adjacency(mesh_wp.indices)
-    supplied_offsets, supplied_faces = tw.adjacency.vertex_face_adjacency(
-        mesh_wp.indices, n_vertices=int(mesh_wp.points.shape[0])
-    )
-
-    assert np.array_equal(inferred_offsets.numpy(), supplied_offsets.numpy())
-    bounds_np = inferred_offsets.numpy()
-    for vertex in range(bounds_np.shape[0] - 1):
-        row = slice(int(bounds_np[vertex]), int(bounds_np[vertex + 1]))
-        assert np.array_equal(
-            np.sort(inferred_faces.numpy()[row]), np.sort(supplied_faces.numpy()[row])
-        )
-
-
-def test_vertex_face_adjacency_unreferenced_vertex(device: str) -> None:
-    """
-    A vertex no face touches gets an **empty row**, not a missing one.
-
-    That is the property the offsets encode and the reason ``n_vertices`` is a parameter rather than
-    inferred unconditionally: with two trailing unreferenced vertices the payload is unchanged and
-    only the offsets grow, repeating the final value.
-    """
-    faces_np = np.array([0, 1, 2], dtype=np.int32)
-    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
-
-    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=5)
-
-    assert np.array_equal(offsets_wp.numpy(), np.array([0, 1, 2, 3, 3, 3], dtype=np.int32))
-    assert np.array_equal(np.sort(payload_wp.numpy()), np.zeros(3, dtype=np.int32))
-
-
-def test_vertex_face_adjacency_empty(device: str) -> None:
-    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
-    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
-    assert offsets_wp.shape == (1,)
-    assert payload_wp.shape == (0,)
-
-
-def test_vertex_face_adjacency_zero_rows_with_faces(device: str) -> None:
-    """``n_vertices=0`` on a non-empty mesh returns zeros, not an unwritten buffer."""
-    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
-    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
-    assert offsets_wp.shape == (1,)
-    assert np.array_equal(payload_wp.numpy(), np.zeros(3, dtype=np.int32))
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
@@ -865,3 +684,186 @@ def test_face_adjacency_convex_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     convex_wp = tw.adjacency.face_adjacency_convex(vertices_wp, faces_wp)
     assert convex_wp.shape == (0,)
+
+
+def _face_labels_np(faces_np: np.ndarray) -> np.ndarray:
+    """
+    Label the face dual graph with scipy: shared edges become entries, then a component pass.
+
+    Written out rather than taken from a library because no reference builds the dual *and* labels
+    it in one call except igl's ``facet_components`` -- which is the other half of the comparison
+    below, so reusing it would be comparing igl with itself. This is the same two-phase shape
+    triwarp's function has and the same one ``benchmarks/test_graph.py`` times on the scipy row.
+    """
+    edges_np = np.sort(
+        np.concatenate((faces_np[:, [0, 1]], faces_np[:, [1, 2]], faces_np[:, [2, 0]])), axis=1
+    )
+    owner_np = np.tile(np.arange(faces_np.shape[0]), 3)
+    order_np = np.lexsort((edges_np[:, 1], edges_np[:, 0]))
+    edges_np, owner_np = edges_np[order_np], owner_np[order_np]
+    shared_np = np.flatnonzero(np.all(edges_np[1:] == edges_np[:-1], axis=1))
+    dual_np = sp.coo_matrix(
+        (np.ones(shared_np.size, dtype=np.int8), (owner_np[shared_np], owner_np[shared_np + 1])),
+        shape=(faces_np.shape[0], faces_np.shape[0]),
+    ).tocsr()
+    return sp.csgraph.connected_components(dual_np)[1]
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+@pytest.mark.parity("face_connected_component_labels", "igl")
+@pytest.mark.parity("face_connected_component_labels_depth", "igl", "scipy")
+def test_face_connected_component_labels_matches_igl(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B: the same partition under different label *names*, against igl and scipy.
+
+    ``igl.facet_components`` numbers components ``0..k-1`` in its own traversal order and returns
+    ``(n_components, labels)`` -- the count **first**, which is the unpacking trap here. triwarp's
+    label propagation names each component after a representative face instead, so on a
+    two-component mesh it returns e.g. ``{0, 12}`` where igl returns ``{0, 1}``. The transform is
+    [`canonical_labels`][tests.comparisons.canonical_labels]: relabel by first appearance, which is
+    what [`same_partition`][tests.comparisons.same_partition] applies.
+
+    scipy is the second reference and is a genuinely different decomposition of the work: it builds
+    the dual graph explicitly (see [`_face_labels_np`]) and then labels it, where igl does both
+    internally and triwarp does both on the device. That is why the ``*_depth`` group -- whose
+    benchmark rows are all build-included -- claims both libraries here.
+
+    Both a single-component fixture and a two-component union are checked, because a labelling that
+    collapsed everything into one component would pass on the first alone.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp = mesh_wp.indices
+    faces_np = faces_wp.numpy().reshape(-1, 3).astype(np.int64)
+
+    n_components_igl, labels_igl = igl.facet_components(faces_np)
+    labels_wp = tw.adjacency.face_connected_component_labels(faces_wp)
+
+    assert n_components_igl == np.unique(labels_wp.numpy()).shape[0]
+    assert same_partition(labels_wp.numpy(), np.asarray(labels_igl).ravel())
+    assert same_partition(labels_wp.numpy(), _face_labels_np(faces_np))
+
+    # Two disjoint copies: the labelling must split them, which a constant output would not.
+    doubled_np = np.concatenate([faces_np, faces_np + faces_np.max() + 1])
+    doubled_wp = wp.array(
+        np.ascontiguousarray(doubled_np.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=faces_wp.device,
+    )
+    n_doubled_igl, labels_doubled_igl = igl.facet_components(doubled_np)
+    labels_doubled_wp = tw.adjacency.face_connected_component_labels(doubled_wp)
+
+    assert n_doubled_igl == 2 * n_components_igl
+    assert same_partition(labels_doubled_wp.numpy(), np.asarray(labels_doubled_igl).ravel())
+    assert same_partition(labels_doubled_wp.numpy(), _face_labels_np(doubled_np))
+
+
+def _face_labels_ml(components_ml: object, n_faces: int) -> np.ndarray:
+    """Decode MeshLib's vector of ``FaceBitSet`` components into a per-face label array."""
+    labels_np = np.full(n_faces, -1, dtype=np.int64)
+    for label, component_ml in enumerate(components_ml):  # type: ignore[call-overload]
+        labels_np[meshlib_bitset_to_numpy(component_ml, n_faces)] = label
+    return labels_np
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+@pytest.mark.parity("face_connected_component_labels", "meshlib")
+def test_face_connected_component_labels_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B, and the pair that pins *which* incidence rule triwarp implements.
+
+    ``getAllComponents`` takes a ``FaceIncidence`` and the two settings are different operations,
+    not two tunings: ``PerEdge`` connects faces sharing an edge, which is triwarp's rule, and
+    ``PerVertex`` connects faces sharing a single vertex. On a bowtie -- two triangles meeting at
+    one vertex -- they read **2** components and **1**, and triwarp reads 2. No other reference in
+    this module exposes that choice, so this is the only test that can fail if the convention ever
+    drifts.
+
+    The decode is the usual one: a vector of ``FaceBitSet`` in MeshLib's own traversal order, each
+    padded to the face domain, its index taken as the label, compared as a *partition*. Note the
+    overload set -- a second form takes ``maxComponentCount`` and returns a ``(components, count)``
+    **tuple**, so the result's type is asserted by unpacking it as a plain sequence here.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp = mesh_wp.indices
+    n_faces = mesh_tm.faces.shape[0]
+
+    components_ml = mm.getAllComponents(
+        mm.MeshPart(trimesh_to_meshlib(mesh_tm)), mm.MeshComponents.FaceIncidence.PerEdge
+    )
+    labels_wp = tw.adjacency.face_connected_component_labels(faces_wp)
+    assert len(components_ml) == np.unique(labels_wp.numpy()).shape[0]
+    assert same_partition(labels_wp.numpy(), _face_labels_ml(components_ml, n_faces))
+
+    # Two disjoint copies, the case a constant labelling would pass.
+    doubled_tm = tm.util.concatenate([mesh_tm, mesh_tm.copy().apply_translation([10.0, 0.0, 0.0])])
+    doubled_wp = wp.array(
+        np.ascontiguousarray(doubled_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=faces_wp.device,
+    )
+    doubled_ml = mm.getAllComponents(
+        mm.MeshPart(trimesh_to_meshlib(doubled_tm)), mm.MeshComponents.FaceIncidence.PerEdge
+    )
+    assert len(doubled_ml) == 2 * len(components_ml)
+    assert same_partition(
+        tw.adjacency.face_connected_component_labels(doubled_wp).numpy(),
+        _face_labels_ml(doubled_ml, doubled_tm.faces.shape[0]),
+    )
+
+    # The convention, on the input that separates the two rules.
+    bowtie_vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
+    )
+    bowtie_faces_np = np.array([[0, 1, 2], [0, 3, 4]], dtype=np.int32)
+    bowtie_ml = mm.MeshPart(numpy_to_meshlib(bowtie_vertices_np, bowtie_faces_np))
+    bowtie_wp = wp.array(
+        np.ascontiguousarray(bowtie_faces_np.reshape(-1)), dtype=wp.int32, device=faces_wp.device
+    )
+    per_edge_ml = mm.getAllComponents(bowtie_ml, mm.MeshComponents.FaceIncidence.PerEdge)
+    per_vertex_ml = mm.getAllComponents(bowtie_ml, mm.MeshComponents.FaceIncidence.PerVertex)
+    assert (len(per_edge_ml), len(per_vertex_ml)) == (2, 1)
+    assert np.unique(tw.adjacency.face_connected_component_labels(bowtie_wp).numpy()).shape[0] == 2
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+@pytest.mark.parity("face_connected_component_labels", "pyvista")
+def test_face_connected_component_labels_matches_pyvista(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B, the same relabelling as the igl row: VTK's ``RegionId`` names the components its way.
+
+    ``connectivity('all')`` writes a ``RegionId`` **cell** array numbered ``0..k-1``, and the
+    numbering is neither triwarp's representative-face id nor igl's traversal order -- measured on
+    two disjoint spheres it labels the *first* component ``1``, so even a pack-by-first-appearance
+    comparison fails and only the partition is shared. That is what
+    [`same_partition`][tests.comparisons.same_partition] compares; pyvista ships its own
+    ``pack_labels`` for the same reason.
+
+    The two-copy case is the non-vacuous half: on a single-component fixture any labelling at all
+    induces the same trivial partition.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp = mesh_wp.indices
+
+    labels_pv = np.asarray(trimesh_to_pyvista(mesh_tm).connectivity("all").cell_data["RegionId"])
+    labels_wp = tw.adjacency.face_connected_component_labels(faces_wp)
+    assert same_partition(labels_wp.numpy(), labels_pv)
+
+    doubled_tm = tm.util.concatenate([mesh_tm, mesh_tm.copy().apply_translation([10.0, 0.0, 0.0])])
+    doubled_wp = wp.array(
+        np.ascontiguousarray(doubled_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=faces_wp.device,
+    )
+    labels_doubled_pv = np.asarray(
+        trimesh_to_pyvista(doubled_tm).connectivity("all").cell_data["RegionId"]
+    )
+    labels_doubled_wp = tw.adjacency.face_connected_component_labels(doubled_wp)
+
+    assert np.unique(labels_doubled_pv).shape[0] == 2
+    assert same_partition(labels_doubled_wp.numpy(), labels_doubled_pv)

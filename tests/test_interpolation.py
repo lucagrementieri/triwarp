@@ -8,7 +8,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import points_to_pyvista, trimesh_to_pyvista
+from tests.conversions import points_to_pyvista, points_to_warp, trimesh_to_pyvista
 
 
 @pytest.mark.parity("average_onto_faces", "igl", "pyvista")
@@ -155,17 +155,13 @@ def test_transfer_onto_vertices_matches_pymeshlab(device: str):
     meshset_pml.set_current_mesh(1)
     transferred_pml = meshset_pml.current_mesh().vertex_scalar_array()
 
-    source_vertices_wp = wp.array(
-        np.ascontiguousarray(source_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    source_vertices_wp = points_to_warp(source_tm.vertices, device)
     source_faces_wp = wp.array(
         np.ascontiguousarray(source_tm.faces.reshape(-1), dtype=np.int32),
         dtype=wp.int32,
         device=device,
     )
-    target_vertices_wp = wp.array(
-        np.ascontiguousarray(target_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    target_vertices_wp = points_to_warp(target_tm.vertices, device)
     values_wp = wp.array(values_np.astype(np.float32), dtype=wp.float32, device=device)
     transferred_wp, distance_wp = tw.interpolation.transfer_onto_vertices(
         source_vertices_wp, source_faces_wp, values_wp, target_vertices_wp
@@ -180,9 +176,7 @@ def test_transfer_onto_vertices_reproduces_a_linear_field(device: str):
     direction_np = np.array([0.3, -0.6, 0.74])
     values_np = source_tm.vertices @ direction_np
 
-    source_vertices_wp = wp.array(
-        np.ascontiguousarray(source_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    source_vertices_wp = points_to_warp(source_tm.vertices, device)
     source_faces_wp = wp.array(
         np.ascontiguousarray(source_tm.faces.reshape(-1), dtype=np.int32),
         dtype=wp.int32,
@@ -191,11 +185,7 @@ def test_transfer_onto_vertices_reproduces_a_linear_field(device: str):
     # Target vertices projected onto the source surface first, so "linear on the source" holds
     # exactly rather than up to the two spheres' radial gap.
     projected_wp, _distance, _face = tw.proximity.closest_point_on_mesh(
-        source_vertices_wp,
-        source_faces_wp,
-        wp.array(
-            np.ascontiguousarray(target_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-        ),
+        source_vertices_wp, source_faces_wp, points_to_warp(target_tm.vertices, device)
     )
     values_wp = wp.array(values_np.astype(np.float32), dtype=wp.float32, device=device)
     transferred_wp, _distance = tw.interpolation.transfer_onto_vertices(
@@ -209,17 +199,13 @@ def test_transfer_onto_vertices_reproduces_a_linear_field(device: str):
 def test_transfer_onto_vertices_vec3_field(device: str):
     """The transfer is dtype-generic: a ``wp.vec3`` field (a normal, a colour) works unchanged."""
     source_tm, target_tm = _transfer_meshes(device)
-    source_vertices_wp = wp.array(
-        np.ascontiguousarray(source_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    source_vertices_wp = points_to_warp(source_tm.vertices, device)
     source_faces_wp = wp.array(
         np.ascontiguousarray(source_tm.faces.reshape(-1), dtype=np.int32),
         dtype=wp.int32,
         device=device,
     )
-    target_vertices_wp = wp.array(
-        np.ascontiguousarray(target_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    target_vertices_wp = points_to_warp(target_tm.vertices, device)
     # Transferring the source *positions* must reproduce each target vertex's closest point.
     transferred_wp, _distance = tw.interpolation.transfer_onto_vertices(
         source_vertices_wp, source_faces_wp, source_vertices_wp, target_vertices_wp
@@ -233,9 +219,7 @@ def test_transfer_onto_vertices_vec3_field(device: str):
 def test_transfer_onto_vertices_misses_stay_zero(device: str):
     """A target beyond ``max_dist`` keeps the zero fill and reports ``inf``."""
     source_tm, _target_tm = _transfer_meshes(device)
-    source_vertices_wp = wp.array(
-        np.ascontiguousarray(source_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    source_vertices_wp = points_to_warp(source_tm.vertices, device)
     source_faces_wp = wp.array(
         np.ascontiguousarray(source_tm.faces.reshape(-1), dtype=np.int32),
         dtype=wp.int32,
@@ -316,11 +300,11 @@ def _interpolate_wp(
     k: int | None = None,
 ) -> np.ndarray:
     return tw.interpolation.interpolate_from_points(
-        wp.array(np.ascontiguousarray(source_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        points_to_warp(source_np, device),
         wp.array(
             np.ascontiguousarray(values_np, dtype=np.float32), dtype=wp.float32, device=device
         ),
-        wp.array(np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        points_to_warp(query_np, device),
         radius,
         k=k,
         sharpness=sharpness,
@@ -398,11 +382,11 @@ def test_interpolate_from_points_unreached_queries_get_the_null_value(device: st
     # The null value is the caller's, and it is what an unreached query gets.
     far_np = np.array([[100.0, 100.0, 100.0]])
     filled_wp = tw.interpolation.interpolate_from_points(
-        wp.array(np.ascontiguousarray(source_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        points_to_warp(source_np, device),
         wp.array(
             np.ascontiguousarray(values_np, dtype=np.float32), dtype=wp.float32, device=device
         ),
-        wp.array(np.ascontiguousarray(far_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        points_to_warp(far_np, device),
         0.2,
         null_value=-7.0,
     )
@@ -414,9 +398,9 @@ def test_interpolate_from_points_vec3_field(device: str):
     source_np, values_np, query_np = _scattered_cloud(device)
     vectors_np = np.column_stack((values_np, 2.0 * values_np, -values_np))
     interpolated_wp = tw.interpolation.interpolate_from_points(
-        wp.array(np.ascontiguousarray(source_np, dtype=np.float32), dtype=wp.vec3, device=device),
-        wp.array(np.ascontiguousarray(vectors_np, dtype=np.float32), dtype=wp.vec3, device=device),
-        wp.array(np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        points_to_warp(source_np, device),
+        points_to_warp(vectors_np, device),
+        points_to_warp(query_np, device),
         0.2,
     ).numpy()
     scalar_wp = _interpolate_wp(source_np, values_np, query_np, 0.2, 2.0, device=device)
@@ -427,15 +411,11 @@ def test_interpolate_from_points_vec3_field(device: str):
 
 def test_interpolate_from_points_invalid(device: str):
     source_np, values_np, query_np = _scattered_cloud(device)
-    source_wp = wp.array(
-        np.ascontiguousarray(source_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    source_wp = points_to_warp(source_np, device)
     values_wp = wp.array(
         np.ascontiguousarray(values_np, dtype=np.float32), dtype=wp.float32, device=device
     )
-    query_wp = wp.array(
-        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    query_wp = points_to_warp(query_np, device)
     with pytest.raises(ValueError, match="one entry per source point"):
         tw.interpolation.interpolate_from_points(source_wp, values_wp[:10], query_wp, 0.2)
     with pytest.raises(ValueError, match="radius must be positive"):

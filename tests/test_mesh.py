@@ -9,12 +9,9 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import assert_same_loop_set, lexsort_rows, trimesh_outline_loops
+from tests.conftest import CLOSED_MESHES, MESHES, OPEN_MESHES
+from tests.conversions import points_to_warp
 from triwarp.mesh import _TOPOLOGY_KEYS
-
-CLOSED_MESHES = ["icosahedron", "cave_cube"]
-OPEN_MESHES = ["hemisphere", "half_torus"]
-ALL_MESHES = CLOSED_MESHES + OPEN_MESHES
-
 
 # ---------------------------------------------------------------------------
 # construction
@@ -81,7 +78,7 @@ def test_mesh_from_numpy_round_trip(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> 
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("mesh_vertex_normals", "trimesh")
 def test_geometry_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -110,7 +107,7 @@ def test_geometry_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_edges_match_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class A, and the row *order* is part of the claim -- ``array_equal``, not a lexsort.
@@ -128,7 +125,7 @@ def test_edges_match_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> 
     assert np.array_equal(mesh.edges_face.numpy(), mesh_tm.edges_face)
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_edges_unique_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class B (row-set canonicalization): the unique edge *set* matches after a shared lexsort.
@@ -150,7 +147,7 @@ def test_edges_unique_matches_trimesh(request: pytest.FixtureRequest, mesh_name:
     assert np.array_equal(reconstructed, mesh.edges_sorted.numpy())
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("mesh_face_adjacency", "trimesh")
 def test_face_adjacency_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -226,7 +223,7 @@ def test_boundary_loops_empty_for_closed_mesh(icosahedron: tuple[tm.Trimesh, wp.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_euler_characteristic_matches_trimesh(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -242,7 +239,7 @@ def test_euler_characteristic_matches_trimesh(
     assert mesh.euler_characteristic == int(mesh_tm.euler_number)
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_is_winding_consistent_matches_trimesh(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -257,7 +254,7 @@ def test_is_winding_consistent_matches_trimesh(
     assert mesh.is_winding_consistent == bool(mesh_tm.is_winding_consistent)
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_is_volume_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class A on a boolean: the conjunction trimesh calls ``is_volume``, over both answers.
@@ -269,7 +266,7 @@ def test_is_volume_matches_trimesh(request: pytest.FixtureRequest, mesh_name: st
     assert mesh.is_volume == bool(mesh_tm.is_volume)
 
 
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_is_watertight_matches_free_function(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -283,7 +280,7 @@ def test_is_watertight_matches_free_function(
     assert mesh.is_watertight == expected
 
 
-@pytest.mark.parametrize("mesh_name", [*ALL_MESHES, "bohemian_dome"])
+@pytest.mark.parametrize("mesh_name", [*MESHES, "bohemian_dome"])
 @pytest.mark.parity("mesh_is_watertight", "trimesh")
 def test_is_watertight_decomposes_into_trimesh_clause(
     request: pytest.FixtureRequest, mesh_name: str
@@ -392,7 +389,7 @@ def test_with_vertices_keeps_topology_drops_geometry(
     _ = mesh.warp_mesh
 
     translated_np = mesh.vertices.numpy() + np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    new_vertices = wp.array(translated_np, dtype=wp.vec3, device=mesh.device)
+    new_vertices = points_to_warp(translated_np, mesh.device)
 
     moved = mesh.with_vertices(new_vertices)
     assert moved.edges is edges_before
@@ -412,7 +409,7 @@ def test_with_vertices_carries_every_topology_key(
     assert key in mesh._cache
 
     translated_np = mesh.vertices.numpy() + np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    moved = mesh.with_vertices(wp.array(translated_np, dtype=wp.vec3, device=mesh.device))
+    moved = mesh.with_vertices(points_to_warp(translated_np, mesh.device))
 
     assert key in moved._cache, f"{key} was recomputed instead of carried forward"
     assert moved._cache[key] is before
@@ -427,7 +424,7 @@ def test_face_adjacency_angles_is_not_a_topology_key(
     _ = mesh.face_adjacency_angles
 
     translated_np = mesh.vertices.numpy() + np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    moved = mesh.with_vertices(wp.array(translated_np, dtype=wp.vec3, device=mesh.device))
+    moved = mesh.with_vertices(points_to_warp(translated_np, mesh.device))
 
     assert "face_adjacency_angles" not in moved._cache
 
@@ -435,7 +432,7 @@ def test_face_adjacency_angles_is_not_a_topology_key(
 def test_with_vertices_wrong_count_raises(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _mesh_tm, mesh_wp = icosahedron
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
-    too_few = wp.array(mesh.vertices.numpy()[:-1], dtype=wp.vec3, device=mesh.device)
+    too_few = points_to_warp(mesh.vertices.numpy()[:-1], mesh.device)
     with pytest.raises(ValueError, match="vertex count"):
         mesh.with_vertices(too_few)
 

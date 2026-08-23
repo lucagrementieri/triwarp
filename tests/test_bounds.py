@@ -14,9 +14,13 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import trimesh_to_meshlib, trimesh_to_open3d, trimesh_to_pyvista
-
-_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
+from tests.conftest import MESHES
+from tests.conversions import (
+    points_to_warp,
+    trimesh_to_meshlib,
+    trimesh_to_open3d,
+    trimesh_to_pyvista,
+)
 
 _Objective = Literal["volume", "surface_area", "diagonal"]
 _OBJECTIVES: list[_Objective] = ["volume", "surface_area", "diagonal"]
@@ -32,7 +36,7 @@ def _bounds_np(lower_wp: wp.vec3, upper_wp: wp.vec3) -> np.ndarray:
     )
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("aabb", "trimesh", "open3d", "igl", "meshlib")
 def test_aabb_matches_trimesh_open3d_and_igl(
     request: pytest.FixtureRequest, mesh_name: str
@@ -84,7 +88,7 @@ def test_aabb_matches_trimesh_open3d_and_igl(
     assert np.allclose(bounds_wp, bounds_ml, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("aabb", "pyvista")
 @pytest.mark.parity("enclosing_diagonal", "pyvista")
 def test_aabb_and_diagonal_match_pyvista(request: pytest.FixtureRequest, mesh_name: str) -> None:
@@ -114,7 +118,7 @@ def test_aabb_and_diagonal_match_pyvista(request: pytest.FixtureRequest, mesh_na
     assert np.allclose(np.asarray(mesh_pv.center), bounds_pv.mean(axis=0), rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("enclosing_diagonal", "igl")
 def test_enclosing_diagonal_single_cloud_matches_igl(
     request: pytest.FixtureRequest, mesh_name: str
@@ -180,19 +184,14 @@ def test_aabb_union_matches_a_pooled_reduction(device: str) -> None:
     cloud_a = rng.normal(size=(200, 3)).astype(np.float32) + 4.0
     cloud_b = rng.normal(size=(300, 3)).astype(np.float32) - 2.0
 
-    boxes = [
-        tw.bounds.aabb(wp.array(np.ascontiguousarray(cloud), dtype=wp.vec3, device=device))
-        for cloud in (cloud_a, cloud_b)
-    ]
+    boxes = [tw.bounds.aabb(points_to_warp(cloud, device)) for cloud in (cloud_a, cloud_b)]
     union_min, union_max = tw.bounds.aabb_union(*boxes[0], *boxes[1])
 
-    pooled_min, pooled_max = tw.bounds.aabb(
-        wp.array(np.ascontiguousarray(np.vstack([cloud_a, cloud_b])), dtype=wp.vec3, device=device)
-    )
+    pooled_min, pooled_max = tw.bounds.aabb(points_to_warp(np.vstack([cloud_a, cloud_b]), device))
     assert np.allclose(_bounds_np(union_min, union_max), _bounds_np(pooled_min, pooled_max))
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("enclosing_diagonal", "igl")
 def test_enclosing_diagonal_matches_igl_on_the_pooled_cloud(
     request: pytest.FixtureRequest, mesh_name: str
@@ -213,9 +212,7 @@ def test_enclosing_diagonal_matches_igl_on_the_pooled_cloud(
     extent_np = vertices_np.max(axis=0) - vertices_np.min(axis=0)
     queries_np = rng.random((64, 3)) * extent_np + vertices_np.max(axis=0)
 
-    queries_wp = wp.array(
-        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    queries_wp = points_to_warp(queries_np, mesh_wp.device)
     diagonal_wp = tw.bounds.enclosing_diagonal(mesh_wp.points, queries_wp)
     diagonal_igl = igl.bounding_box_diagonal(np.vstack([vertices_np, queries_np]))
 
@@ -229,11 +226,7 @@ def test_enclosing_diagonal_matches_igl_on_the_pooled_cloud(
 def test_enclosing_diagonal_ignores_an_empty_second_set(device: str) -> None:
     """``other=None`` and ``other=<empty>`` both measure ``points`` alone."""
     rng = np.random.default_rng(12)
-    cloud_wp = wp.array(
-        np.ascontiguousarray(rng.normal(size=(128, 3)), dtype=np.float32),
-        dtype=wp.vec3,
-        device=device,
-    )
+    cloud_wp = points_to_warp(rng.normal(size=(128, 3)), device)
     empty_wp = wp.empty(0, dtype=wp.vec3, device=device)
 
     alone = tw.bounds.enclosing_diagonal(cloud_wp)
@@ -254,7 +247,7 @@ def _tilted_cloud(mesh_tm: tm.Trimesh, device: str) -> tuple[np.ndarray, wp.arra
     """
     tilt_np = tm.transformations.random_rotation_matrix(np.random.default_rng(7).random(3))[:3, :3]
     points_np = np.ascontiguousarray(mesh_tm.vertices * np.array([1.0, 2.0, 3.0]) @ tilt_np.T)
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     return points_np, points_wp
 
 
@@ -280,7 +273,7 @@ def _achieved_loss(
     return float(np.square(sides_np).sum())
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parametrize("objective", _OBJECTIVES)
 @pytest.mark.parity("oriented_bounding_box", "igl")
 def test_oriented_bounding_box_matches_igl(
@@ -335,7 +328,7 @@ def test_oriented_bounding_box_matches_igl(
     )
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("oriented_bounding_box", "igl")
 def test_oriented_bounding_box_frame_matches_igl_transposed(
     request: pytest.FixtureRequest, mesh_name: str
@@ -362,7 +355,7 @@ def test_oriented_bounding_box_frame_matches_igl_transposed(
     assert np.isclose(np.linalg.det(frame_np), 1.0, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("oriented_bounding_box", "trimesh")
 def test_oriented_bounding_box_agrees_with_trimesh_hull_search(
     request: pytest.FixtureRequest, mesh_name: str
@@ -410,7 +403,7 @@ def test_oriented_bounding_box_agrees_with_trimesh_hull_search(
     )
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("oriented_bounding_box", "pyvista")
 def test_oriented_bounding_box_beats_the_pyvista_pca_box(
     request: pytest.FixtureRequest, mesh_name: str
@@ -451,7 +444,7 @@ def test_oriented_bounding_box_beats_the_pyvista_pca_box(
     assert float(np.prod(np.ptp(_bounds_np(lower_np, upper_np), axis=0))) > volume_pv * 1.02
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("oriented_bounding_box", "open3d")
 def test_oriented_bounding_box_agrees_with_open3d_minimal_box(
     request: pytest.FixtureRequest, mesh_name: str
@@ -504,7 +497,7 @@ def test_oriented_bounding_box_prefilter_returns_the_identical_box(device: str) 
     rng = np.random.default_rng(23)
     n = tw.bounds.CONVEX_PREFILTER_MIN_POINTS + 10_000
     cloud_np = (rng.standard_normal((n, 3)) @ np.diag([3.0, 1.0, 0.5])).astype(np.float32)
-    cloud_wp = wp.array(cloud_np, dtype=wp.vec3, device=device)
+    cloud_wp = points_to_warp(cloud_np, device)
 
     kept_wp = tw.array.gather(
         cloud_wp, tw.array.flatnonzero(tw.points.convex_superset_mask(cloud_wp))
@@ -578,7 +571,7 @@ def test_oriented_bounding_box_never_loses_to_the_aabb(
     )
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_oriented_bounding_box_refinement_is_monotone(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:

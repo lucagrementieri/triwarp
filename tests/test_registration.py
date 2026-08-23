@@ -13,7 +13,7 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import points_to_meshlib, points_to_open3d
+from tests.conversions import points_to_meshlib, points_to_open3d, points_to_warp
 
 
 def _make_point_clouds(rng: np.random.Generator, n: int = 200) -> tuple[np.ndarray, np.ndarray]:
@@ -21,10 +21,6 @@ def _make_point_clouds(rng: np.random.Generator, n: int = 200) -> tuple[np.ndarr
     # b is a mildly rotated/translated version of a to keep correspondence meaningful
     b_np = rng.standard_normal((n, 3)).astype(np.float64)
     return a_np, b_np
-
-
-def _to_wp(arr_np: np.ndarray, device: str) -> wp.array:
-    return wp.array(arr_np.astype(np.float32), dtype=wp.vec3, device=device)
 
 
 def _run_both(
@@ -41,8 +37,8 @@ def _run_both(
 
     matrix_tm, transformed_tm, cost_tm = tm_reg.procrustes(a_np, b_np, weights=weights_np, **kwargs)
 
-    a_wp = _to_wp(a_np, device)
-    b_wp = _to_wp(b_np, device)
+    a_wp = points_to_warp(a_np, device)
+    b_wp = points_to_warp(b_np, device)
     weights_wp = (
         wp.array(weights_np.astype(np.float32), dtype=wp.float32, device=device)
         if weights_np is not None
@@ -98,7 +94,10 @@ def test_procrustes_matches_meshlib(device: str) -> None:
     target_np = source_np @ rotation_np.T + translation_np
 
     matrix_wp, _transformed_wp, cost_wp = tw.registration.procrustes(
-        _to_wp(source_np, device), _to_wp(target_np, device), reflection=False, scale=False
+        points_to_warp(source_np, device),
+        points_to_warp(target_np, device),
+        reflection=False,
+        scale=False,
     )
     matrix_np = matrix_wp.numpy()[0]
 
@@ -135,7 +134,7 @@ def test_procrustes_return_cost_arity(device: str) -> None:
     """
     rng = np.random.default_rng(7)
     a_np, b_np = _make_point_clouds(rng)
-    a_wp, b_wp = _to_wp(a_np, device), _to_wp(b_np, device)
+    a_wp, b_wp = points_to_warp(a_np, device), points_to_warp(b_np, device)
 
     defaulted = tw.registration.procrustes(a_wp, b_wp)
     assert isinstance(defaulted, tuple)
@@ -298,8 +297,8 @@ def test_procrustes_return_matrix_only(device: str) -> None:
     """
     rng = np.random.default_rng(6)
     a_np, b_np = _make_point_clouds(rng)
-    a_wp = _to_wp(a_np, device)
-    b_wp = _to_wp(b_np, device)
+    a_wp = points_to_warp(a_np, device)
+    b_wp = points_to_warp(b_np, device)
 
     result = tw.registration.procrustes(a_wp, b_wp, return_cost=False)
     assert isinstance(result, wp.array)
@@ -347,7 +346,10 @@ def test_procrustes_matches_open3d(device: str) -> None:
     source_np = (target_np @ rotation_np.T + translation_np).astype(np.float32)
 
     matrix_wp, _transformed_wp, _cost = tw.registration.procrustes(
-        _to_wp(source_np, device), _to_wp(target_np, device), reflection=False, scale=False
+        points_to_warp(source_np, device),
+        points_to_warp(target_np, device),
+        reflection=False,
+        scale=False,
     )
 
     correspondence = o3d.utility.Vector2iVector(np.stack([np.arange(300), np.arange(300)], axis=1))
@@ -386,8 +388,8 @@ def test_icp_point_to_point_matches_open3d_and_trimesh(device: str) -> None:
     source_np = (target_np @ rotation_np.T + translation_np).astype(np.float32)
 
     _matrix_wp, transformed_wp, _cost_wp = tw.registration.icp(
-        _to_wp(source_np, device),
-        _to_wp(target_np, device),
+        points_to_warp(source_np, device),
+        points_to_warp(target_np, device),
         None,
         max_iterations=100,
         reflection=False,
@@ -452,8 +454,8 @@ def test_icp_point_to_point_matches_meshlib(device: str) -> None:
     source_np = np.ascontiguousarray(target_np @ rotation_np.T + translation_np)
 
     matrix_wp, transformed_wp, _cost_wp = tw.registration.icp(
-        _to_wp(source_np, device),
-        _to_wp(target_np, device),
+        points_to_warp(source_np, device),
+        points_to_warp(target_np, device),
         None,
         max_iterations=30,
         reflection=False,
@@ -522,9 +524,9 @@ def test_icp_point_to_plane_matches_open3d(
     scale = 0.1
 
     _matrix_wp, transformed_wp, _cost_wp = tw.registration.icp_point_to_plane(
-        _to_wp(source_np, device),
-        _to_wp(target_np, device),
-        target_normals=_to_wp(normals_np, device),
+        points_to_warp(source_np, device),
+        points_to_warp(target_np, device),
+        target_normals=points_to_warp(normals_np, device),
         max_iterations=50,
         threshold=-np.inf,
         robust_kernel=robust_kernel,
@@ -581,9 +583,9 @@ def test_icp_point_to_plane_matches_meshlib(
     source_np = np.ascontiguousarray(target_np @ rotation_np.T + translation_np)
 
     matrix_wp, transformed_wp, _cost_wp = tw.registration.icp_point_to_plane(
-        _to_wp(source_np, device),
-        _to_wp(target_np, device),
-        target_normals=_to_wp(normals_np, device),
+        points_to_warp(source_np, device),
+        points_to_warp(target_np, device),
+        target_normals=points_to_warp(normals_np, device),
         max_iterations=50,
         threshold=-np.inf,
     )
@@ -633,8 +635,8 @@ def test_icp_point_to_point_cloud(device: str) -> None:
     rotation_np, translation_np = _rigid_transform(0.15, [0.2, 0.7, 0.1], [0.05, -0.03, 0.04])
     source_np = (target_np @ rotation_np.T + translation_np).astype(np.float32)
 
-    source_wp = _to_wp(source_np, device)
-    target_wp = _to_wp(target_np, device)
+    source_wp = points_to_warp(source_np, device)
+    target_wp = points_to_warp(target_np, device)
 
     _, transformed_wp, cost_tw = tw.registration.icp(
         source_wp, target_wp, None, max_iterations=100, reflection=False, scale=False
@@ -655,8 +657,8 @@ def test_icp_point_to_point_mesh(half_torus: tuple[tm.Trimesh, wp.Mesh], device:
     rotation_np, translation_np = _rigid_transform(0.1, [0.2, 0.6, 0.3], [0.03, -0.02, 0.04])
     source_np = (vertices_np @ rotation_np.T + translation_np).astype(np.float32)
 
-    source_wp = _to_wp(source_np, mesh_wp.device)
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=mesh_wp.device)
+    source_wp = points_to_warp(source_np, mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=mesh_wp.device)
 
     _, transformed_wp, cost_tw = tw.registration.icp(
@@ -721,8 +723,8 @@ def test_icp_mesh_matches_pymeshlab(device: str, angle: float) -> None:
     )
 
     _matrix_wp, transformed_wp, _cost_wp = tw.registration.icp(
-        _to_wp(source_np, device),
-        _to_wp(vertices_np, device),
+        points_to_warp(source_np, device),
+        points_to_warp(vertices_np, device),
         wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device),
         max_iterations=100,
         threshold=-np.inf,
@@ -774,8 +776,8 @@ def test_icp_mesh_matches_pyvista(device: str, angle: float) -> None:
     assert np.isclose(np.linalg.det(np.asarray(matrix_pv)[:3, :3]), 1.0, atol=1e-4)
 
     _matrix_wp, transformed_wp, _cost_wp = tw.registration.icp(
-        _to_wp(source_np, device),
-        _to_wp(vertices_np, device),
+        points_to_warp(source_np, device),
+        points_to_warp(vertices_np, device),
         wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device),
         max_iterations=100,
         threshold=-np.inf,
@@ -797,8 +799,8 @@ def test_icp_point_to_plane_mesh(half_torus: tuple[tm.Trimesh, wp.Mesh], device:
     rotation_np, translation_np = _rigid_transform(0.1, [0.2, 0.6, 0.3], [0.03, -0.02, 0.04])
     source_np = (vertices_np @ rotation_np.T + translation_np).astype(np.float32)
 
-    source_wp = _to_wp(source_np, mesh_wp.device)
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=mesh_wp.device)
+    source_wp = points_to_warp(source_np, mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=mesh_wp.device)
 
     _, transformed_wp, cost_tw = tw.registration.icp_point_to_plane(
@@ -822,8 +824,8 @@ def test_icp_point_to_plane_robust_outliers(
     source_np[outlier_idx] += rng.standard_normal((len(outlier_idx), 3)).astype(np.float32) * 2.0
     inlier_idx = np.setdiff1d(np.arange(len(source_np)), outlier_idx)
 
-    source_wp = _to_wp(source_np, mesh_wp.device)
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=mesh_wp.device)
+    source_wp = points_to_warp(source_np, mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=mesh_wp.device)
 
     _, transformed_none, _ = tw.registration.icp_point_to_plane(
@@ -846,9 +848,9 @@ def test_icp_point_to_plane_cloud_with_normals(device: str) -> None:
     rotation_np, translation_np = _rigid_transform(0.1, [0.3, 0.4, 0.5], [0.03, -0.02, 0.02])
     source_np = (target_np @ rotation_np.T + translation_np).astype(np.float32)
 
-    source_wp = _to_wp(source_np, device)
-    target_wp = _to_wp(target_np, device)
-    normals_wp = _to_wp(normals_np, device)
+    source_wp = points_to_warp(source_np, device)
+    target_wp = points_to_warp(target_np, device)
+    normals_wp = points_to_warp(normals_np, device)
 
     _, transformed_wp, cost_tw = tw.registration.icp_point_to_plane(
         source_wp, target_wp, None, target_normals=normals_wp, max_iterations=100
@@ -858,7 +860,7 @@ def test_icp_point_to_plane_cloud_with_normals(device: str) -> None:
 
 
 def test_icp_empty_source(device: str) -> None:
-    target_wp = _to_wp(np.random.default_rng(13).standard_normal((50, 3)), device)
+    target_wp = points_to_warp(np.random.default_rng(13).standard_normal((50, 3)), device)
     empty_wp = wp.zeros(0, dtype=wp.vec3, device=device)
 
     matrix_wp, transformed_wp, cost_tw = tw.registration.icp(empty_wp, target_wp, None)
@@ -871,8 +873,8 @@ def test_icp_empty_source(device: str) -> None:
 
 def test_icp_point_to_plane_requires_normals(device: str) -> None:
     rng = np.random.default_rng(14)
-    target_wp = _to_wp(rng.standard_normal((50, 3)), device)
-    source_wp = _to_wp(rng.standard_normal((50, 3)), device)
+    target_wp = points_to_warp(rng.standard_normal((50, 3)), device)
+    source_wp = points_to_warp(rng.standard_normal((50, 3)), device)
     with pytest.raises(ValueError, match="target_normals"):
         tw.registration.icp_point_to_plane(source_wp, target_wp, None)
 
@@ -881,8 +883,8 @@ def test_icp_max_distance_all_rejected(device: str) -> None:
     rng = np.random.default_rng(15)
     target_np = rng.standard_normal((100, 3)).astype(np.float32)
     source_np = (target_np + np.array([5.0, 5.0, 5.0], dtype=np.float32)).astype(np.float32)
-    source_wp = _to_wp(source_np, device)
-    target_wp = _to_wp(target_np, device)
+    source_wp = points_to_warp(source_np, device)
+    target_wp = points_to_warp(target_np, device)
 
     # Every correspondence is beyond max_distance -> no fit, identity returned, no crash.
     matrix_wp, _, _ = tw.registration.icp(

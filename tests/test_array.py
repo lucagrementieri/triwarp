@@ -9,6 +9,7 @@ import warp as wp
 import warp.sparse as wps
 
 import triwarp as tw
+from tests.conversions import points_to_warp
 
 
 def test_arange(device: str) -> None:
@@ -213,9 +214,9 @@ def test_pack_1d_wp_arrays_vec3(device: str):
         wp.array([wp.vec3(2.0, 2.0, 2.0)], dtype=wp.vec3, device=device),
     ]
     flat, offsets = tw.array.pack_1d_arrays(parts)
-    exp = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 2.0, 2.0]], dtype=np.float32)
-    got = flat.numpy().reshape(-1, 3)
-    assert np.allclose(got, exp, rtol=1e-5, atol=1e-5)
+    expected_np = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 2.0, 2.0]], dtype=np.float32)
+    flat_wp_np = flat.numpy().reshape(-1, 3)
+    assert np.allclose(flat_wp_np, expected_np, rtol=1e-5, atol=1e-5)
     assert np.array_equal(offsets.numpy(), np.array([0, 2], dtype=np.int32))
 
 
@@ -626,7 +627,7 @@ def test_gather_vec3(device: str) -> None:
     points_np = rng.standard_normal((16, 3)).astype(np.float32)
     indices_np = rng.integers(0, 16, size=5, dtype=np.int32)
 
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     indices_wp = wp.array(indices_np, dtype=wp.int32, device=device)
     gathered_wp = tw.array.gather(points_wp, indices_wp)
 
@@ -792,7 +793,7 @@ def test_trim_to_count_keeps_the_written_prefix_of_every_buffer(device: str) -> 
     n_out, (scalars_wp, vectors_wp) = tw.array.trim_to_count(
         counter_wp,
         wp.array(scalars_np, dtype=wp.int32, device=device),
-        wp.array(np.ascontiguousarray(vectors_np), dtype=wp.vec3, device=device),
+        points_to_warp(vectors_np, device),
     )
 
     assert n_out == n_written

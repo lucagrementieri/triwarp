@@ -11,6 +11,7 @@ from meshlib import mrmeshpy as mm
 import triwarp as tw
 from tests.conversions import (
     faces_igl,
+    points_to_warp,
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
@@ -114,7 +115,7 @@ def test_mean_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     face_normals_tm = mesh_tm.face_normals
     vertex_normals_tm = tm.geometry.mean_vertex_normals(n_vertices, mesh_tm.faces, face_normals_tm)
 
-    face_normals_wp = wp.array(face_normals_tm, dtype=wp.vec3, device=mesh_wp.device)
+    face_normals_wp = points_to_warp(face_normals_tm, mesh_wp.device)
     vertex_normals_wp = tw.vertices.mean_vertex_normals(
         n_vertices, mesh_wp.indices, face_normals_wp
     )
@@ -138,7 +139,7 @@ def test_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
         n_vertices, mesh_tm.faces, face_normals_tm, face_angles_tm
     )
 
-    face_normals_wp = wp.array(face_normals_tm, dtype=wp.vec3, device=mesh_wp.device)
+    face_normals_wp = points_to_warp(face_normals_tm, mesh_wp.device)
     face_weights_wp = wp.array(face_angles_tm, dtype=wp.float32, device=mesh_wp.device)
     vertex_normals_wp = tw.vertices.weighted_vertex_normals(
         n_vertices, mesh_wp.indices, face_normals_wp, face_weights_wp
@@ -161,7 +162,7 @@ def test_vertex_normals_area(half_torus: tuple[tm.Trimesh, wp.Mesh]):
         vertices_np, faces_np, igl.PER_VERTEX_NORMALS_WEIGHTING_TYPE_AREA
     )
 
-    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
     vertex_normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices)
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_igl, rtol=1e-5, atol=1e-5)
 
@@ -184,7 +185,7 @@ def test_vertex_normal_weightings_match_meshlib(half_torus: tuple[tm.Trimesh, wp
     """
     mesh_tm, mesh_wp = half_torus
     n_vertices = mesh_tm.vertices.shape[0]
-    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
 
     mesh_ml = trimesh_to_meshlib(mesh_tm)
     area_ml = mn.toNumpyArray(mm.computePerVertNormals(mesh_ml))
@@ -208,7 +209,7 @@ def test_vertex_normal_weightings_match_meshlib(half_torus: tuple[tm.Trimesh, wp
 def test_vertex_normals_area_precomputed(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = half_torus
 
-    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
 
     face_normals_wp, face_areas_wp = tw.triangles.face_normals_and_areas(
         vertices_wp, mesh_wp.indices
@@ -236,7 +237,7 @@ def test_vertex_normals_angle(half_torus: tuple[tm.Trimesh, wp.Mesh]):
         n_vertices, mesh_tm.faces, mesh_tm.face_normals, mesh_tm.face_angles
     )
 
-    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
     vertex_normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices, weighting="angle")
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_tm, rtol=1e-5, atol=1e-5)
 
@@ -244,7 +245,7 @@ def test_vertex_normals_angle(half_torus: tuple[tm.Trimesh, wp.Mesh]):
 def test_vertex_normals_angle_precomputed(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = half_torus
 
-    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
 
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(vertices_wp, mesh_wp.indices)
     face_angles_wp = tw.triangles.face_angles(vertices_wp, mesh_wp.indices)
@@ -286,11 +287,11 @@ def test_vertex_normals_mwselr(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     faces_np = np.array(mesh_tm.faces, dtype=np.int32)
     vertex_normals_np = _compute_max_vertex_normals_np(vertices_np, faces_np)
 
-    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
     vertex_normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices, weighting="mwselr")
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_np, rtol=1e-5, atol=1e-5)
 
-    face_normals_wp = wp.array(mesh_tm.face_normals, dtype=wp.vec3, device=mesh_wp.device)
+    face_normals_wp = points_to_warp(mesh_tm.face_normals, mesh_wp.device)
     vertex_normals_explicit_wp = tw.vertices.vertex_normals(
         vertices_wp, mesh_wp.indices, weighting="mwselr", face_normals=face_normals_wp
     )
@@ -423,7 +424,7 @@ def test_scatter_wrappers_ignore_the_current_device(half_torus: tuple[tm.Trimesh
     mesh_tm, mesh_wp = half_torus
     n_vertices = mesh_tm.vertices.shape[0]
 
-    face_normals_wp = wp.array(mesh_tm.face_normals, dtype=wp.vec3, device=mesh_wp.device)
+    face_normals_wp = points_to_warp(mesh_tm.face_normals, mesh_wp.device)
     face_angles_wp = wp.array(mesh_tm.face_angles, dtype=wp.float32, device=mesh_wp.device)
 
     mean_normals_tm = tm.geometry.mean_vertex_normals(

@@ -26,6 +26,7 @@ import triwarp as tw
 from tests.api_conventions import (
     DocstringExample,
     _annotation_nodes,
+    _asserted_reference_names,
     _int_module_constants,
     _int_typed_names,
     _is_int_expression,
@@ -34,6 +35,7 @@ from tests.api_conventions import (
     array_annotation_style_problems,
     bare_annotation_problems,
     builtin_cast_problems,
+    comparison_label_problems,
     coverage_location_problems,
     docstring_examples,
     duplicate_name_problems,
@@ -535,3 +537,51 @@ def test_docstring_examples_run(
             f"{type(error).__name__}: {error}\n{example.code}",
             pytrace=False,
         )
+
+
+def test_reference_comparisons_carry_a_class_label() -> None:
+    """
+    A test asserting against a reference library says which class the comparison is.
+
+    ``.claude/CLAUDE.md`` section 6, and it is a gate rather than a convention because the
+    convention has decayed twice: the lowercase ``class b`` spelling went from 21 occurrences to 0
+    in one pass and back to 9 in the next, invisible to the grep section 6 prescribes because a
+    human reads ``class B`` and ``Class B`` the same. It also closes a rarer and worse case --
+    ``test_fill_min_weight_matches_meshlib`` carried a ``parity`` marker, compared a class-C
+    statistic against MeshLib and had no docstring at all, which ruff cannot see because ``D103``
+    is in the ignore list.
+
+    It checks that a label is *present*, never that it is the right one. Choosing between A, B, C
+    and D is a judgement about what transform the comparison needs, and section 14's rule holds
+    here as everywhere: a scan can tell that a convention was not broken, not that a new name is a
+    good one.
+    """
+    _fail("reference comparison(s) with no class label:", comparison_label_problems())
+
+
+def test_comparison_label_scan_keys_on_asserts_not_on_fixture_unpacking() -> None:
+    """
+    Check 19 reads ``assert`` statements only -- unpacking a mesh fixture is not a comparison.
+
+    Pinned because it is the difference between a gate that fires 0 times and one that fires 120:
+    every mesh test in the suite writes ``mesh_tm, mesh_wp = icosphere``, so a scan keyed on the
+    function body would demand a class label from every one of them and would be switched off by
+    the first person it annoyed. The ``_np`` suffix is left out of
+    ``api_conventions._REFERENCE_SUFFIXES`` for the same reason, measured at 290 hits.
+    """
+    source = textwrap.dedent(
+        """
+        def test_unpacks_a_fixture_only(icosphere) -> None:
+            mesh_tm, mesh_wp = icosphere
+            answer_wp = tw.measures.volume(mesh_wp.points, mesh_wp.indices)
+            assert float(answer_wp) > 0.0
+
+        def test_compares_against_the_reference(icosphere) -> None:
+            mesh_tm, mesh_wp = icosphere
+            volume_tm = mesh_tm.volume
+            assert np.isclose(float(tw.measures.volume(mesh_wp.points, mesh_wp.indices)), volume_tm)
+        """
+    )
+    functions = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)]
+    assert _asserted_reference_names(functions[0]) == set()
+    assert _asserted_reference_names(functions[1]) == {"volume_tm"}

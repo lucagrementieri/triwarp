@@ -23,8 +23,6 @@ import warp as wp
 import triwarp as tw
 from tests.conversions import bsr_to_csr, mesh_igl
 
-_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
-
 
 def _upload_bsr_float64(
     matrix_sp: sp.spmatrix, device: str | wp.context.Device

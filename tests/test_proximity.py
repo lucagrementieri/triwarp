@@ -28,6 +28,8 @@ from tests.conversions import (
     meshlib_scalars_to_numpy,
     numpy_to_warp,
     points_to_pyvista,
+    points_to_warp,
+    points_to_warp_uv,
     trimesh_to_meshlib,
     trimesh_to_open3d_t,
     trimesh_to_pymeshlab,
@@ -68,11 +70,11 @@ def test_query_mesh_aabb_with_offsets(device: str) -> None:
     query_lower_np = lower_np[:4].copy()
     query_upper_np = upper_np[:4].copy()
 
-    vertices_wp = wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(np.ascontiguousarray(faces_np.reshape(-1)), dtype=wp.int32, device=device)
     mesh = wp.Mesh(points=vertices_wp, indices=faces_wp)
-    query_lower_wp = wp.array(np.ascontiguousarray(query_lower_np), dtype=wp.vec3, device=device)
-    query_upper_wp = wp.array(np.ascontiguousarray(query_upper_np), dtype=wp.vec3, device=device)
+    query_lower_wp = points_to_warp(query_lower_np, device)
+    query_upper_wp = points_to_warp(query_upper_np, device)
 
     indices_wp, offsets_wp, hit_counts_wp = tw.proximity.query_mesh_aabb_with_offsets(
         mesh, query_lower_wp, query_upper_wp, max_hits=16
@@ -109,9 +111,7 @@ def test_closest_point_on_mesh_random(request: pytest.FixtureRequest, mesh_name:
 
     closest_tm, distance_tm, _triangle_id_tm = tm.proximity.closest_point(mesh_tm, points_np)
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
     closest_wp, distance_wp, _triangle_id_wp = tw.proximity.closest_point_on_mesh(
         mesh_wp.points, mesh_wp.indices, points_wp
     )
@@ -147,9 +147,7 @@ def test_closest_point_on_mesh_matches_meshlib(
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(42)
     points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
 
     mesh_part_ml = mm.MeshPart(trimesh_to_meshlib(mesh_tm))
     projections_ml = [
@@ -217,9 +215,7 @@ def test_closest_point_on_mesh_matches_pyvista(
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(42)
     points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
 
     _cells_pv, closest_pv = trimesh_to_pyvista(mesh_tm).find_closest_cell(
         points_np, return_closest_point=True
@@ -264,9 +260,7 @@ def test_closest_point_on_mesh_ambiguous_edge(device: str) -> None:
     _closest_tm, distance_tm, _triangle_id_tm = tm.proximity.closest_point(mesh_tm, query_np)
 
     vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
-    query_wp = wp.array(
-        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    query_wp = points_to_warp(query_np, device)
     closest_wp, distance_wp, _triangle_id_wp = tw.proximity.closest_point_on_mesh(
         vertices_wp, faces_wp, query_wp
     )
@@ -293,15 +287,11 @@ def test_closest_point_on_mesh_unreferenced_vertex(device: str) -> None:
     )
     closest_tm, distance_tm, triangle_id_tm = tm.proximity.closest_point(mesh_tm, query_np)
 
-    vertices_wp = wp.array(
-        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(mesh_tm.vertices, device)
     faces_wp = wp.array(
         np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32), device=device
     )
-    query_wp = wp.array(
-        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    query_wp = points_to_warp(query_np, device)
     closest_wp, distance_wp, triangle_id_wp = tw.proximity.closest_point_on_mesh(
         vertices_wp, faces_wp, query_wp
     )
@@ -544,10 +534,8 @@ def test_closest_point_on_edges_matches_pyvista(
 
     rng = np.random.default_rng(21)
     queries_np = (rng.random((200, 3)) * 1.6 - 0.3).astype(np.float32)
-    queries_wp = wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device)
-    vertices_wp = wp.array(
-        np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    queries_wp = points_to_warp(queries_np, device)
+    vertices_wp = points_to_warp(vertices_np, device)
 
     closest_wp, distance_wp, edge_id_wp = tw.proximity.closest_point_on_edges(
         vertices_wp, edges_wp, queries_wp
@@ -627,9 +615,7 @@ def test_closest_point_on_edges_matches_meshlib(
     minimum_np = _all_distance_np[np.arange(queries_np.shape[0]), nearest_np]
 
     _closest_wp, distance_wp, _edge_wp = tw.proximity.closest_point_on_edges(
-        wp.array(np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device),
-        edges_wp,
-        wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device),
+        points_to_warp(vertices_np, device), edges_wp, points_to_warp(queries_np, device)
     )
 
     mesh_ml = trimesh_to_meshlib(mesh_tm)
@@ -671,13 +657,13 @@ def test_closest_point_on_edges_max_dist_and_degenerate(device: str) -> None:
     """
     vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 5.0, 0.0]], dtype=np.float32)
     edges_np = np.array([[0, 1], [0, 2]], dtype=np.int32)
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     edges_wp = twt.as_array2d(wp.array(edges_np, dtype=wp.int32, device=device), wp.int32)
     # The second query is 0.9 from the y-axis edge and 3.0 from the x-axis one, so a 0.5 cutoff
     # rejects both. (At x = 0.5 it would sit at *exactly* 0.5 and be accepted -- the test is
     # inclusive, like every other distance bound here.)
     queries_np = np.array([[0.5, 0.1, 0.0], [0.9, 3.0, 0.0]], dtype=np.float32)
-    queries_wp = wp.array(queries_np, dtype=wp.vec3, device=device)
+    queries_wp = points_to_warp(queries_np, device)
 
     closest_wp, distance_wp, edge_id_wp = tw.proximity.closest_point_on_edges(
         vertices_wp, edges_wp, queries_wp, max_dist=0.5
@@ -714,9 +700,7 @@ def test_normals_at_closest_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> No
     rng = np.random.default_rng(19)
     query_np = rng.random((32, 3)).astype(np.float64)
 
-    query_wp = wp.array(
-        np.ascontiguousarray(query_np.astype(np.float32)), dtype=wp.vec3, device=mesh_wp.device
-    )
+    query_wp = points_to_warp(query_np, mesh_wp.device)
     normals_wp = tw.proximity.normals_at_closest_faces(mesh_wp, query_wp).numpy()
 
     _, _, triangle_id_wp = tw.proximity.closest_point_on_mesh(
@@ -732,9 +716,7 @@ def test_normals_at_closest_faces_surface(icosahedron: tuple[tm.Trimesh, wp.Mesh
     points_np, face_ids_np = tm.sample.sample_surface(mesh_tm, 24, seed=3)
     expected_normals_np = mesh_tm.face_normals[face_ids_np].astype(np.float32)
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np.astype(np.float32)), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
     normals_wp = tw.proximity.normals_at_closest_faces(mesh_wp, points_wp).numpy()
     assert np.allclose(normals_wp, expected_normals_np, rtol=1e-5, atol=1e-5)
 
@@ -753,9 +735,7 @@ def test_signed_distance_on_mesh_random(request: pytest.FixtureRequest, mesh_nam
     points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
 
     expected_np = -tm_proximity.signed_distance(mesh_tm, points_np)
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
     signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
     assert np.allclose(signed_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
 
@@ -796,9 +776,7 @@ def test_signed_distance_on_mesh_matches_pymeshlab(
     )
     signed_pml = np.asarray(meshset_pml.current_mesh().vertex_scalar_array())
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
     signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
 
     assert np.array_equal(np.sign(signed_wp.numpy()), np.sign(signed_pml))
@@ -830,9 +808,7 @@ def test_signed_distance_on_mesh_matches_meshlib(
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     points_np = _queries_in_bounds_np(mesh_tm, 200, seed=42)
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
 
     cloud_ml = mn.pointCloudFromPoints(np.ascontiguousarray(points_np))
     distances_ml = meshlib_scalars_to_numpy(
@@ -883,9 +859,7 @@ def test_signed_distance_on_mesh_matches_igl(
         igl.SIGNED_DISTANCE_TYPE_PSEUDONORMAL,
     )
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
     signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
 
     assert np.array_equal(np.sign(signed_wp.numpy()), np.sign(signed_igl))
@@ -918,9 +892,7 @@ def test_signed_distance_on_mesh_matches_open3d(
         o3d.core.Tensor(np.ascontiguousarray(points_np, dtype=np.float32))
     ).numpy()
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
     signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
 
     assert np.array_equal(np.sign(signed_wp.numpy()), np.sign(signed_o3d))
@@ -962,9 +934,7 @@ def test_signed_distance_on_mesh_matches_pyvista(
     assert (signed_pv < 0).any()
     assert (signed_pv > 0).any()
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
     signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
 
     assert np.array_equal(np.sign(signed_wp.numpy()), np.sign(signed_pv))
@@ -981,9 +951,7 @@ def test_signed_distance_on_mesh_winding_matches_trimesh(
     points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
 
     distance_tm = -tm_proximity.signed_distance(mesh_tm, points_np)
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
     distance_wp = tw.proximity.signed_distance_on_mesh(
         mesh_wp.points, mesh_wp.indices, points_wp, sign_mode="winding"
     )
@@ -1004,9 +972,7 @@ def test_signed_distance_on_mesh_winding_sign_matches_exact_winding_number(
     rng = np.random.default_rng(7)
     lower_np, upper_np = mesh_tm.bounds
     points_np = rng.uniform(lower_np, upper_np, size=(500, 3))
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
 
     inside_wp = (
         tw.proximity.signed_distance_on_mesh(
@@ -1026,11 +992,7 @@ def test_signed_distance_on_mesh_winding_unsigned_matches_parity(
     """Only the sign may differ between the two modes; the unsigned distance is the same query."""
     _, mesh_wp = icosahedron
     rng = np.random.default_rng(11)
-    points_wp = wp.array(
-        np.ascontiguousarray(rng.uniform(-2.0, 2.0, size=(200, 3)), dtype=np.float32),
-        dtype=wp.vec3,
-        device=mesh_wp.device,
-    )
+    points_wp = points_to_warp(rng.uniform(-2.0, 2.0, size=(200, 3)), mesh_wp.device)
     parity_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
     winding_wp = tw.proximity.signed_distance_on_mesh(
         mesh_wp.points, mesh_wp.indices, points_wp, sign_mode="winding"
@@ -1066,11 +1028,7 @@ def test_supplied_mesh_gives_the_same_answer(
     """
     _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(21)
-    points_wp = wp.array(
-        np.ascontiguousarray(rng.normal(scale=1.5, size=(256, 3)), dtype=np.float32),
-        dtype=wp.vec3,
-        device=mesh_wp.device,
-    )
+    points_wp = points_to_warp(rng.normal(scale=1.5, size=(256, 3)), mesh_wp.device)
     prebuilt_wp = wp.Mesh(points=wp.clone(mesh_wp.points), indices=wp.clone(mesh_wp.indices))
 
     rebuilt = tw.proximity.closest_point_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
@@ -1116,8 +1074,8 @@ def test_signed_distance_on_mesh_sign_direction(icosahedron: tuple[tm.Trimesh, w
     mesh_tm, mesh_wp = icosahedron
     outside_np = np.asarray([mesh_tm.bounds[0] + [100.0, 100.0, 100.0]], dtype=np.float32)
     inside_np = np.asarray([mesh_tm.center_mass], dtype=np.float32)
-    outside_wp = wp.array(outside_np, dtype=wp.vec3, device=mesh_wp.device)
-    inside_wp = wp.array(inside_np, dtype=wp.vec3, device=mesh_wp.device)
+    outside_wp = points_to_warp(outside_np, mesh_wp.device)
+    inside_wp = points_to_warp(inside_np, mesh_wp.device)
     outside_signed_wp = tw.proximity.signed_distance_on_mesh(
         mesh_wp.points, mesh_wp.indices, outside_wp
     )
@@ -1132,7 +1090,7 @@ def test_signed_distance_on_mesh_sign_direction(icosahedron: tuple[tm.Trimesh, w
 def test_signed_distance_on_mesh_coplanar(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     outside_np = np.asarray([mesh_tm.bounds[0] + [100.0, 0.0, 0.0]], dtype=np.float32)
-    outside_wp = wp.array(outside_np, dtype=wp.vec3, device=mesh_wp.device)
+    outside_wp = points_to_warp(outside_np, mesh_wp.device)
     outside_signed_wp = tw.proximity.signed_distance_on_mesh(
         mesh_wp.points, mesh_wp.indices, outside_wp
     )
@@ -1142,9 +1100,7 @@ def test_signed_distance_on_mesh_coplanar(request: pytest.FixtureRequest, mesh_n
 def test_signed_distance_on_mesh_on_surface(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
     surface_np, _face_idx = tm.sample.sample_surface(mesh_tm, 50)
-    surface_wp = wp.array(
-        np.ascontiguousarray(surface_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    surface_wp = points_to_warp(surface_np, mesh_wp.device)
     signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, surface_wp)
     signed_np = signed_wp.numpy()
     assert (np.abs(signed_np) <= max(TOLERANCE_MERGE, 1e-4)).all()
@@ -1156,9 +1112,7 @@ def test_signed_distance_contains_points_consistency(
     mesh_tm, mesh_wp = icosahedron
     rng = np.random.default_rng(9)
     inside_np = mesh_tm.center_mass + rng.normal(scale=0.05, size=(50, 3))
-    points_wp = wp.array(
-        np.ascontiguousarray(inside_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(inside_np, mesh_wp.device)
     signed_np = tw.proximity.signed_distance_on_mesh(
         mesh_wp.points, mesh_wp.indices, points_wp
     ).numpy()
@@ -1290,9 +1244,7 @@ def test_winding_number_random(request: pytest.FixtureRequest, mesh_name: str, t
     faces_np = np.array(mesh_tm.faces, dtype=np.int64)
 
     winding_igl = igl.winding_number(vertices_np, faces_np, query_np)
-    query_wp = wp.array(
-        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    query_wp = points_to_warp(query_np, mesh_wp.device)
     winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=tiled)
     assert np.allclose(winding_wp.numpy(), winding_igl.ravel(), rtol=1e-5, atol=1e-5)
 
@@ -1323,9 +1275,7 @@ def test_winding_number_matches_meshlib(request: pytest.FixtureRequest, mesh_nam
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     query_np = _queries_in_bounds_np(mesh_tm, 200, seed=42)
-    query_wp = wp.array(
-        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    query_wp = points_to_warp(query_np, mesh_wp.device)
 
     mesh_ml = trimesh_to_meshlib(mesh_tm)
     tree_ml = mesh_ml.getAABBTree()
@@ -1349,9 +1299,7 @@ def test_winding_number_tiled_matches_exact(icosahedron: tuple[tm.Trimesh, wp.Me
     _mesh_tm, mesh_wp = icosahedron
     rng = np.random.default_rng(17)
     query_np = rng.random((100, 3), dtype=np.float32) * 2.0 - 1.0
-    query_wp = wp.array(
-        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    query_wp = points_to_warp(query_np, mesh_wp.device)
     exact_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=False)
     tiled_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=True)
     assert np.allclose(tiled_wp.numpy(), exact_wp.numpy(), rtol=1e-6, atol=1e-6)
@@ -1380,9 +1328,7 @@ def test_winding_number_tiled_matches_igl_on_both_devices(kernel_device: str) ->
         np.array(mesh_tm.faces, dtype=np.int64),
         query_np,
     )
-    query_wp = wp.array(
-        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=kernel_device
-    )
+    query_wp = points_to_warp(query_np, kernel_device)
     winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=True)
     assert np.allclose(winding_wp.numpy(), winding_igl.ravel(), rtol=1e-5, atol=1e-5)
 
@@ -1391,8 +1337,8 @@ def test_winding_number_inside_outside(icosahedron: tuple[tm.Trimesh, wp.Mesh]) 
     mesh_tm, mesh_wp = icosahedron
     outside_np = np.asarray([mesh_tm.bounds[0] + [100.0, 100.0, 100.0]], dtype=np.float32)
     inside_np = np.asarray([mesh_tm.center_mass], dtype=np.float32)
-    outside_wp = wp.array(outside_np, dtype=wp.vec3, device=mesh_wp.device)
-    inside_wp = wp.array(inside_np, dtype=wp.vec3, device=mesh_wp.device)
+    outside_wp = points_to_warp(outside_np, mesh_wp.device)
+    inside_wp = points_to_warp(inside_np, mesh_wp.device)
     outside_winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, outside_wp)
     inside_winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, inside_wp)
     assert np.allclose(outside_winding_wp.numpy(), 0.0, atol=1e-3)
@@ -1402,7 +1348,7 @@ def test_winding_number_inside_outside(icosahedron: tuple[tm.Trimesh, wp.Mesh]) 
 def test_winding_number_cave_cube_origin(cave_cube: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = cave_cube
     origin_np = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
-    origin_wp = wp.array(origin_np, dtype=wp.vec3, device=mesh_wp.device)
+    origin_wp = points_to_warp(origin_np, mesh_wp.device)
     winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, origin_wp)
     assert np.allclose(winding_wp.numpy(), 0.0, atol=1e-3)
 
@@ -1467,13 +1413,9 @@ def test_containing_faces_2d_matches_scipy(device: str) -> None:
     rng = np.random.default_rng(11)
     queries_np = rng.random((40_000, 2)) * np.array([34.0, 26.0]) - 2.0
 
-    vertices_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
+    vertices_wp = points_to_warp_uv(points_np, device)
     faces_wp = wp.array(faces_np.ravel(), dtype=wp.int32, device=device)
-    queries_wp = wp.array(
-        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
+    queries_wp = points_to_warp_uv(queries_np, device)
 
     faces_wp_np = tw.proximity.containing_faces_2d(vertices_wp, faces_wp, queries_wp).numpy()
 
@@ -1505,13 +1447,9 @@ def test_containing_faces_2d_matches_pyvista(device: str) -> None:
     rng = np.random.default_rng(11)
     queries_np = rng.random((10_000, 2)) * np.array([34.0, 26.0]) - 2.0
 
-    vertices_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
+    vertices_wp = points_to_warp_uv(points_np, device)
     faces_wp = wp.array(faces_np.ravel(), dtype=wp.int32, device=device)
-    queries_wp = wp.array(
-        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
+    queries_wp = points_to_warp_uv(queries_np, device)
     located_wp = tw.proximity.containing_faces_2d(vertices_wp, faces_wp, queries_wp).numpy()
 
     mesh_pv = pv.PolyData.from_regular_faces(
@@ -1537,13 +1475,9 @@ def test_containing_faces_2d_locates_every_triangle_from_its_centroid(device: st
     faces_np = np.ascontiguousarray(Delaunay(points_np).simplices, dtype=np.int32)
     centroids_np = points_np[faces_np].mean(axis=1)
 
-    vertices_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
+    vertices_wp = points_to_warp_uv(points_np, device)
     faces_wp = wp.array(faces_np.ravel(), dtype=wp.int32, device=device)
-    centroids_wp = wp.array(
-        np.ascontiguousarray(centroids_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
+    centroids_wp = points_to_warp_uv(centroids_np, device)
 
     located_np = tw.proximity.containing_faces_2d(vertices_wp, faces_wp, centroids_wp).numpy()
 
@@ -1569,13 +1503,9 @@ def test_containing_faces_2d_degrades_only_on_needle_triangles(device: str) -> N
     faces_np = np.ascontiguousarray(triangulation_sp.simplices, dtype=np.int32)
     queries_np = rng.random((20_000, 2)) * 5.0 - 2.5
 
-    vertices_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
+    vertices_wp = points_to_warp_uv(points_np, device)
     faces_wp = wp.array(faces_np.ravel(), dtype=wp.int32, device=device)
-    queries_wp = wp.array(
-        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
+    queries_wp = points_to_warp_uv(queries_np, device)
 
     faces_wp_np = tw.proximity.containing_faces_2d(vertices_wp, faces_wp, queries_wp).numpy()
 

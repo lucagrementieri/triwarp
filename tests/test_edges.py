@@ -13,15 +13,15 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import assert_unordered_rows_equal, lexsort_rows
+from tests.conftest import MESHES
 from tests.conversions import (
     meshlib_scalars_to_numpy,
+    points_to_warp,
     pyvista_edges_to_indices,
     trimesh_to_meshlib,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
 )
-
-_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -30,12 +30,6 @@ _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
 def _faces_np_to_wp(faces_np: np.ndarray, device: str) -> wp.array:
     return wp.array(faces_np.flatten().astype(np.int32), dtype=wp.int32, device=device)
-
-
-def _vertices_np_to_wp(vertices_np: np.ndarray, device: str) -> wp.array:
-    return wp.array(
-        np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +391,7 @@ def test_edges_unique_length(request: pytest.FixtureRequest, mesh_name: str) -> 
         verts_np[unique_edges_tm[:, 1]] - verts_np[unique_edges_tm[:, 0]], axis=1
     )
 
-    vertices_wp = _vertices_np_to_wp(mesh_tm.vertices, mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
     lengths_wp = tw.edges.edges_unique_length(vertices_wp, mesh_wp.indices)
     lengths_wp_np = lengths_wp.numpy()
 
@@ -415,7 +409,7 @@ def test_edges_unique_length_precomputed(device: str) -> None:
     verts_np = rng.random((30, 3), dtype=np.float32)
     faces_np = rng.integers(0, 30, size=(10, 3), dtype=np.int32)
     faces_wp = _faces_np_to_wp(faces_np, device)
-    vertices_wp = _vertices_np_to_wp(verts_np, device)
+    vertices_wp = points_to_warp(verts_np, device)
 
     unique_edges_wp, _ = tw.edges.edges_unique(faces_wp)
     lengths_via_precomputed = tw.edges.edges_unique_length(
@@ -446,7 +440,7 @@ def test_edges_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
     verts_np = mesh_tm.vertices.astype(np.float32)
     lengths_tm = np.linalg.norm(verts_np[edges_np[:, 1]] - verts_np[edges_np[:, 0]], axis=1)
 
-    vertices_wp = _vertices_np_to_wp(mesh_tm.vertices, mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
     lengths_wp = tw.edges.edges_length(vertices_wp, mesh_wp.indices)
 
     assert np.allclose(np.sort(lengths_wp.numpy()), np.sort(lengths_tm), rtol=1e-4, atol=1e-4)
@@ -457,7 +451,7 @@ def test_edges_length_precomputed(device: str) -> None:
     verts_np = rng.random((30, 3), dtype=np.float32)
     faces_np = rng.integers(0, 30, size=(10, 3), dtype=np.int32)
     faces_wp = _faces_np_to_wp(faces_np, device)
-    vertices_wp = _vertices_np_to_wp(verts_np, device)
+    vertices_wp = points_to_warp(verts_np, device)
 
     edges_in_wp = tw.edges.faces_to_edges(faces_wp)
     lengths_via_precomputed = tw.edges.edges_length(vertices_wp, faces_wp, edges_in=edges_in_wp)
@@ -488,7 +482,7 @@ def test_mean_edge_length(request: pytest.FixtureRequest, mesh_name: str) -> Non
     triangles_np = verts_np[mesh_tm.faces]
     per_face_np = float(np.linalg.norm(triangles_np - triangles_np[:, [1, 2, 0]], axis=2).mean())
 
-    vertices_wp = _vertices_np_to_wp(mesh_tm.vertices, mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
     assert np.allclose(
         tw.edges.mean_edge_length(vertices_wp, mesh_wp.indices), per_face_np, rtol=1e-4, atol=1e-4
     )
@@ -576,7 +570,7 @@ def test_mean_edge_length_empty(device: str) -> None:
 
 
 # --- face_edge_lengths ----------------------------------------------------------------
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("face_edge_lengths", "igl")
 def test_face_edge_lengths_are_the_opposite_edges(
     request: pytest.FixtureRequest, mesh_name: str, device: str

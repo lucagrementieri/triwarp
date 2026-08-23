@@ -767,7 +767,7 @@ def test_bfs_multi_source_large_component(device: str) -> None:
 def _scipy_bfs(
     edges_np: np.ndarray, node_count: int, source: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build reference ``(order, parents, distances)`` for :func:`triwarp.graph.bfs` semantics."""
+    """Build reference ``(order, parents, distances)`` for [`triwarp.graph.bfs`][]'s semantics."""
     if len(edges_np) == 0:
         matrix = sp.csr_matrix((node_count, node_count), dtype=np.int8)
     else:

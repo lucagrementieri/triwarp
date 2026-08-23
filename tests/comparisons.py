@@ -197,6 +197,11 @@ def canonical_labels(labels_np: np.ndarray) -> np.ndarray:
     ``igl.facet_components`` returns ``0..k-1`` in its own. Renaming each label to the position of
     its first appearance is the transform that makes the three comparable without hiding a genuine
     disagreement about *which* elements share a component.
+
+    Every current caller reaches this through
+    [`same_partition`][tests.comparisons.same_partition], which is the boolean a component test
+    actually asserts; this is the transform underneath it, kept public because a test that wants to
+    *print* the packed labelling on a failure needs it directly.
     """
     labels_np = np.asarray(labels_np).ravel()
     _first, inverse = np.unique(labels_np, return_inverse=True)
@@ -266,6 +271,12 @@ def assert_cyclic_permutation_equal(loop_a: np.ndarray, loop_b: np.ndarray) -> N
     A boundary loop is a cyclic sequence; where it starts and which way it runs are conventions, not
     results. Comparing after canonicalising both is the only way to test the part that matters (the
     adjacency order) without testing the part that does not.
+
+    Every current caller reaches this through
+    [`assert_same_loop_set`][tests.comparisons.assert_same_loop_set], which pairs the loops up first
+    -- this is the single-loop form, kept public because a test comparing *one* named rim should not
+    have to wrap it in a list. It is the inner half of that function, not a second way to do the
+    same job.
     """
     a, b = np.asarray(loop_a).ravel(), np.asarray(loop_b).ravel()
     assert a.shape == b.shape, f"loop lengths differ: {a.shape[0]} vs {b.shape[0]}"

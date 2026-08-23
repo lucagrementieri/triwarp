@@ -89,6 +89,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import pyvista as pv
+import shapely.geometry as sg
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -497,12 +498,11 @@ def test_triangulate_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
     and the flat plane-fitting prologue is 1.05 -- so read the small point as a floor row and the
     large one as a rounds ratio. No open3d counterpart.
     """
-    shapely = pytest.importorskip("shapely.geometry")
     if bench_lib.kind == "triwarp":
         ring_wp = _star_wp(ring_size, str(bench_lib.device))
         _vertices, faces_wp = bench_lib.run(lambda: tw.polyline.triangulate_polygon(ring_wp))
         assert int(faces_wp.shape[0]) // 3 == ring_size - 2
     else:
-        polygon = shapely.Polygon(_star_np(ring_size))
+        polygon = sg.Polygon(_star_np(ring_size))
         _vertices, faces_tm = bench_lib.run(lambda: tm.creation.triangulate_polygon(polygon))
         assert faces_tm.shape[0] > 0

@@ -12,10 +12,14 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import bsr_to_csr, bsr_to_dense, trimesh_to_meshlib, trimesh_to_pyvista
-
-_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
-
+from tests.conftest import MESHES
+from tests.conversions import (
+    bsr_to_csr,
+    bsr_to_dense,
+    points_to_warp,
+    trimesh_to_meshlib,
+    trimesh_to_pyvista,
+)
 
 # -----------------------------------------------------------------------------------------
 # face_gradients (libigl `grad`, pyvista `compute_derivative`)
@@ -463,7 +467,7 @@ def test_cotmatrix_empty_mesh(device: str) -> None:
     faces_np = np.empty((0, 3), dtype=np.int64)
 
     laplacian_igl = igl.cotmatrix(vertices_np, faces_np).tocsr()
-    vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
     laplacian_wp = bsr_to_csr(tw.laplacian.cotmatrix(vertices_wp, faces_wp))
 
@@ -481,7 +485,7 @@ def test_cotmatrix_empty_mesh(device: str) -> None:
 
 
 # --- robust_laplacian / mollify_intrinsic (libigl reference) ---------------------------
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_robust_laplacian_is_unchanged_on_a_clean_mesh(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -722,6 +726,15 @@ def test_connection_laplacian_is_symmetric_psd_and_a_rotation_per_block(
     orthogonal, so ``‖block‖`` must be the cotangent weight itself, whatever frame it maps between.
     Measured on ``icosphere_coarse``: agreement with ``|cotmatrix|`` to 5.7e-07, exact symmetry, a
     minimum diagonal of 3.43 and a minimum eigenvalue of 7.6e-02.
+
+    The PSD clause is a dense ``np.linalg.eigvalsh`` on a ``2n x 2n`` matrix, and replacing it with
+    a Cholesky of ``A + eps*I`` was measured and declined. It reports the *margin* (7.6e-02 above),
+    which a factorization does not, and it is no longer expensive: with ``conftest.py`` capping
+    OpenBLAS to 8 threads the three parametrizations cost **0.43 / 0.06 / 0.01 s**, where at the
+    uncapped 48 this was the most expensive non-Poisson test in the suite on both devices (12.37 s
+    on CUDA, 32.56 s on CPU). The 1 284-square ``eigvalsh`` behind ``half_torus`` alone measured
+    2 897.9 ms at 48 threads against 59.7 ms at 8 -- the cost was the thread count, not the
+    algorithm.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = int(mesh_tm.vertices.shape[0])

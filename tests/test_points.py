@@ -21,6 +21,7 @@ from tests.conversions import (
     points_to_meshlib,
     points_to_open3d,
     points_to_pymeshlab,
+    points_to_warp,
 )
 
 
@@ -49,7 +50,7 @@ def test_point_plane_distance(device: str) -> None:
 
     distances_tm = tm.point_plane_distance(points_np, plane_normal_np, plane_origin_np)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     distances_wp = tw.point_plane_distance(
         points_wp, wp.vec3(*plane_normal_np.tolist()), wp.vec3(*plane_origin_np.tolist())
     )
@@ -85,7 +86,7 @@ def test_half_space_mask_matches_meshlib(device: str) -> None:
         mm.findHalfSpacePoints(points_to_meshlib(points_np), plane_ml), points_np.shape[0]
     )
 
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     normal_wp = wp.vec3(*plane_normal_np.tolist())
     origin_wp = wp.vec3(*plane_origin_np.tolist())
     mask_wp = tw.half_space_mask(points_wp, normal_wp, origin_wp)
@@ -100,7 +101,7 @@ def test_half_space_mask_matches_meshlib(device: str) -> None:
 
     # A point exactly on the plane is in neither half, for both libraries and both normals.
     on_plane_np = np.ascontiguousarray(plane_origin_np[None, :], dtype=np.float32)
-    on_plane_wp = wp.array(on_plane_np, dtype=wp.vec3, device=device)
+    on_plane_wp = points_to_warp(on_plane_np, device)
     assert not bool(tw.half_space_mask(on_plane_wp, normal_wp, origin_wp).numpy()[0])
     assert not bool(
         tw.half_space_mask(on_plane_wp, wp.vec3(*(-plane_normal_np).tolist()), origin_wp).numpy()[0]
@@ -121,7 +122,7 @@ def test_half_space_mask_defaults_to_the_origin(device: str) -> None:
     ``dot(n, p)`` alone.
     """
     points_np = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0], [0.0, 0.0, 0.0]], dtype=np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     assert np.array_equal(
         tw.half_space_mask(points_wp, wp.vec3(0.0, 0.0, 1.0)).numpy(),
         np.array([True, False, False]),
@@ -135,7 +136,7 @@ def test_half_space_mask_defaults_to_the_origin(device: str) -> None:
 def test_centroid(device: str) -> None:
     rng = np.random.default_rng(14)
     points_np = rng.standard_normal((128, 3)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     centroid_wp = tw.centroid(points_wp)
     assert np.allclose(centroid_wp.numpy()[0], points_np.mean(axis=0), rtol=1e-5, atol=1e-5)
 
@@ -144,7 +145,7 @@ def test_gram_matrix(device: str) -> None:
     # 200 = 3 * 64 + 8 exercises the multi-tile reduction and remainder path.
     rng = np.random.default_rng(10)
     points_np = rng.standard_normal((200, 3)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     gram_np = points_np.T @ points_np
     assert np.allclose(tw.gram_matrix(points_wp).numpy()[0], gram_np, rtol=1e-4, atol=1e-4)
 
@@ -173,7 +174,7 @@ def test_fit_line(device: str) -> None:
 
     axis_tm = tm.major_axis(points_np)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     axis_wp = tw.fit_line(points_wp)
 
     # axis is direction-only: compare up to sign against trimesh and the
@@ -185,7 +186,7 @@ def test_fit_line(device: str) -> None:
 def test_centered_covariance(device: str) -> None:
     rng = np.random.default_rng(11)
     points_np = rng.standard_normal((200, 3)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     centered_np = points_np - points_np.mean(axis=0)
     scatter_np = centered_np.T @ centered_np
     cov_wp = tw.centered_covariance(points_wp)
@@ -195,9 +196,9 @@ def test_centered_covariance(device: str) -> None:
 def test_centered_covariance_precomputed_center(device: str) -> None:
     rng = np.random.default_rng(12)
     points_np = rng.standard_normal((150, 3)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     mean_np = points_np.mean(axis=0)
-    center_wp = wp.array(mean_np.reshape(1, 3).astype(np.float32), dtype=wp.vec3, device=device)
+    center_wp = points_to_warp(mean_np.reshape(1, 3), device)
     centered_np = points_np - mean_np
     scatter_np = centered_np.T @ centered_np
     cov_wp = tw.centered_covariance(points_wp, center=center_wp)
@@ -211,7 +212,7 @@ def test_principal_axes(device: str) -> None:
     # A well-separated spectrum, so every axis is individually determined. Offset from the origin
     # too, which is what separates a centred fit from fit_line's uncentred one.
     points_np = (rng.standard_normal((500, 3)) @ np.diag([3.0, 1.0, 0.2])) + 5.0
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
 
     rotation_wp, eigenvalues_wp, centroid_wp = tw.principal_axes(points_wp)
     rotation_np = np.array(rotation_wp).reshape(3, 3)
@@ -267,7 +268,7 @@ def test_fit_plane_matches_meshlib(device: str) -> None:
     points_np = (rng.standard_normal((500, 3)) @ np.diag([3.0, 1.0, 0.2])) + np.array(
         [2.0, -1.0, 0.5]
     )
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     normal_wp, centroid_wp = tw.fit_plane(points_wp)
 
     plane_ml = _point_accumulator_ml(points_np).getBestPlanef()
@@ -300,7 +301,7 @@ def test_principal_axes_matches_meshlib(device: str) -> None:
     points_np = (rng.standard_normal((500, 3)) @ np.diag([3.0, 1.0, 0.2])) + np.array(
         [2.0, -1.0, 0.5]
     )
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     rotation_wp, eigenvalues_wp, centroid_wp = tw.principal_axes(points_wp)
 
     centroid_ml = mm.Vector3d()
@@ -345,7 +346,7 @@ def test_principal_axes_is_not_fit_line(device: str) -> None:
     """
     rng = np.random.default_rng(3)
     moderate_np = rng.standard_normal((500, 3)) @ np.diag([3.0, 1.0, 0.2])
-    moderate_wp = wp.array(moderate_np.astype(np.float32), dtype=wp.vec3, device=device)
+    moderate_wp = points_to_warp(moderate_np, device)
 
     leading_np = np.linalg.eigh(np.cov(moderate_np.T))[1][:, -1]
     first_axis_np = np.array(tw.principal_axes(moderate_wp)[0]).reshape(3, 3)[0]
@@ -360,7 +361,7 @@ def test_principal_axes_is_not_fit_line(device: str) -> None:
     needle_np = (rng.uniform(-10.0, 10.0, 200)[:, None] * np.array([0.3, 0.5, 0.8])) + (
         0.01 * rng.standard_normal((200, 3))
     )
-    needle_wp = wp.array(needle_np.astype(np.float32), dtype=wp.vec3, device=device)
+    needle_wp = points_to_warp(needle_np, device)
     needle_first_np = np.array(tw.principal_axes(needle_wp)[0]).reshape(3, 3)[0]
     assert np.isclose(abs(float(np.dot(needle_first_np, tm.major_axis(needle_np)))), 1.0, atol=1e-3)
     assert np.isclose(
@@ -377,7 +378,7 @@ def test_principal_axes_degenerate_spectrum(device: str) -> None:
     points_np = (rng.uniform(-10.0, 10.0, 200)[:, None] * np.array([0.3, 0.5, 0.8])) + (
         0.01 * rng.standard_normal((200, 3))
     )
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     rotation_np = np.array(tw.principal_axes(points_wp)[0]).reshape(3, 3)
     axes_pv = pv.principal_axes(points_np)
 
@@ -434,7 +435,7 @@ def test_fit_plane(device: str) -> None:
     )
     normal_pml /= np.linalg.norm(normal_pml)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     normal_wp, centroid_wp = tw.fit_plane(points_wp)
 
     assert np.allclose(np.array(centroid_wp), centroid_tm, rtol=1e-4, atol=1e-4)
@@ -464,7 +465,7 @@ def test_fit_plane_normal_matches_pyvista(device: str) -> None:
 
     _plane_pv, centre_pv, normal_pv = pv.fit_plane_to_points(points_np, return_meta=True)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     normal_wp, centroid_wp = tw.fit_plane(points_wp)
 
     assert np.isclose(
@@ -503,7 +504,7 @@ def test_plane_basis_is_right_handed_and_orthonormal(normal: tuple[float, float,
 def test_covariance(device: str) -> None:
     rng = np.random.default_rng(13)
     points_np = rng.standard_normal((200, 3)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     cov_np = np.cov(points_np.T, ddof=1)
     assert np.allclose(tw.covariance(points_wp).numpy()[0], cov_np, rtol=1e-4, atol=1e-4)
 
@@ -531,7 +532,7 @@ def test_fit_line_large(device: str) -> None:
 
     axis_tm = tm.major_axis(points_np)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     axis_wp = tw.fit_line(points_wp)
 
     assert np.isclose(np.abs(np.dot(np.array(axis_wp), axis_tm)), 1.0, atol=1e-4)
@@ -551,7 +552,7 @@ def test_fit_plane_large(device: str) -> None:
 
     centroid_tm, normal_tm = tm.plane_fit(points_np)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     normal_wp, centroid_wp = tw.fit_plane(points_wp)
 
     assert np.allclose(np.array(centroid_wp), centroid_tm, rtol=1e-4, atol=1e-4)
@@ -572,7 +573,7 @@ def test_point_plane_distance_no_origin(device: str) -> None:
 
     distances_tm = tm.point_plane_distance(points_np, plane_normal_np)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     distances_wp = tw.point_plane_distance(points_wp, wp.vec3(*plane_normal_np.tolist()))
 
     assert np.allclose(distances_wp.numpy(), distances_tm, rtol=1e-5, atol=1e-5)
@@ -602,7 +603,7 @@ def test_radial_sort(device: str) -> None:
 
     ordered_tm = tm.radial_sort(points_np, origin=origin_np, normal=normal_np)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     ordered_wp = tw.radial_sort(
         points_wp, wp.vec3(*origin_np.tolist()), wp.vec3(*normal_np.tolist())
     )
@@ -631,7 +632,7 @@ def test_radial_sort_with_start(device: str) -> None:
 
     ordered_tm = tm.radial_sort(points_np, origin=origin_np, normal=normal_np, start=start_np)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     ordered_wp = tw.radial_sort(
         points_wp,
         wp.vec3(*origin_np.tolist()),
@@ -652,7 +653,7 @@ def test_radial_sort_parallel_start_raises(device: str) -> None:
     with pytest.raises(ValueError, match=r"must not.*parallel"):
         tm.radial_sort(points_np, origin=origin_np, normal=normal_np, start=start_np)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     with pytest.raises(ValueError, match=r"must not.*parallel"):
         tw.radial_sort(
             points_wp,
@@ -690,7 +691,7 @@ def test_estimate_normals_matches_open3d(device: str) -> None:
     normals_pml = np.asarray(meshset_pml.current_mesh().vertex_normal_matrix())
 
     # triwarp: build the same k-neighbourhood (self + knn-1 = knn points total), then PCA.
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     neighbor_idx_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=knn, backend="bvh")
     normals_wp = tw.estimate_normals(points_wp, neighbor_idx_wp)
 
@@ -722,7 +723,7 @@ def test_estimate_normals_matches_meshlib(device: str) -> None:
     points_np = _fibonacci_sphere(2000)
     spacing = float(np.sqrt(4.0 * np.pi / points_np.shape[0]))
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     neighbor_idx_wp, _distances_wp = tw_neighbors.query_nearest(
         points_wp, points_wp, k=knn, backend="bvh"
     )
@@ -747,7 +748,7 @@ def test_estimate_normals_orientation(device: str) -> None:
     tol = 1e-5
     points_np = _fibonacci_sphere(1000)
     centroid_np = points_np.mean(axis=0)
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     neighbor_idx_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=20, backend="bvh")
 
     # Default: outward from the cloud centroid (the reference vector the kernel uses).
@@ -770,7 +771,7 @@ def test_estimate_normals_orientation(device: str) -> None:
 
 
 def test_estimate_normals_mutually_exclusive_orientation(device: str) -> None:
-    points_wp = wp.array(_fibonacci_sphere(16).astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(_fibonacci_sphere(16), device)
     neighbor_idx_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=8, backend="bvh")
     with pytest.raises(ValueError, match=r"at most one"):
         tw.estimate_normals(
@@ -804,7 +805,7 @@ def test_outlier_probability_matches_scipy(device: str) -> None:
     points_np = _cloud_with_outliers()
     probability_np = _loop_reference(points_np, k)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_nearest(
         points_wp, points_wp, k=k, backend="bvh"
     )
@@ -819,7 +820,7 @@ def test_outlier_probability_ranks_the_planted_outliers(device: str) -> None:
     n_inliers, n_outliers = 400, 15
     points_np = _cloud_with_outliers(n_inliers=n_inliers, n_outliers=n_outliers)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_nearest(
         points_wp, points_wp, k=k, backend="bvh"
     )
@@ -844,7 +845,7 @@ def test_outlier_probability_is_scale_invariant(device: str) -> None:
     points_np = _cloud_with_outliers()
     scores = []
     for factor in (1.0, 100.0):
-        points_wp = wp.array((points_np * factor).astype(np.float32), dtype=wp.vec3, device=device)
+        points_wp = points_to_warp(points_np * factor, device)
         neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_nearest(
             points_wp, points_wp, k=32, backend="bvh"
         )
@@ -853,7 +854,7 @@ def test_outlier_probability_is_scale_invariant(device: str) -> None:
 
 
 def test_outlier_probability_invalid_scale(device: str) -> None:
-    points_wp = wp.array(_fibonacci_sphere(16).astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(_fibonacci_sphere(16), device)
     neighbor_idx_wp, neighbor_distance_wp = tw_neighbors.query_nearest(
         points_wp, points_wp, k=4, backend="bvh"
     )
@@ -862,7 +863,7 @@ def test_outlier_probability_invalid_scale(device: str) -> None:
 
 
 def test_outlier_probability_shape_mismatch(device: str) -> None:
-    points_wp = wp.array(_fibonacci_sphere(16).astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(_fibonacci_sphere(16), device)
     neighbor_idx_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=4, backend="bvh")
     _, neighbor_distance_wp = tw_neighbors.query_nearest(points_wp, points_wp, k=5, backend="bvh")
     with pytest.raises(ValueError, match="same shape"):
@@ -886,7 +887,7 @@ def test_statistical_outlier_mask_matches_open3d(device: str) -> None:
     outlier_o3d = np.ones(points_np.shape[0], dtype=bool)
     outlier_o3d[np.asarray(keep_indices)] = False
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     _idx, neighbor_distance_wp = tw_neighbors.query_nearest(
         points_wp, points_wp, k=k, backend="bvh"
     )
@@ -934,7 +935,7 @@ def test_statistical_outlier_mask_matches_meshlib(device: str) -> None:
     planted_np = np.zeros(points_np.shape[0], dtype=bool)
     planted_np[-n_outliers:] = True
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     _idx_wp, neighbor_distance_wp = tw_neighbors.query_nearest(
         points_wp, points_wp, k=k, backend="bvh"
     )
@@ -985,7 +986,7 @@ def test_radius_outlier_mask_matches_open3d(device: str) -> None:
         [tree_o3d.search_radius_vector_3d(cloud_o3d.points[i], radius)[0] for i in range(500)]
     )
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     count_wp = tw_neighbors.query_ball_count(points_wp, points_wp, radius)
     assert np.array_equal(count_wp.numpy(), count_o3d)
 
@@ -1035,7 +1036,7 @@ def test_point_finite_mask_matches_open3d(device: str) -> None:
 
     kept_o3d = np.asarray(points_to_open3d(points_np).remove_non_finite_points().points)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     finite_wp = tw.point_finite_mask(points_wp).numpy().astype(bool)
 
     assert kept_o3d.shape[0] == 36  # non-vacuity: the reference dropped exactly the four planted
@@ -1072,7 +1073,7 @@ def test_point_duplicate_mask_matches_open3d(device: str) -> None:
         points_to_open3d(points_np).remove_duplicated_points().points, dtype=np.float32
     )
 
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     duplicate_wp = tw.point_duplicate_mask(points_wp).numpy().astype(bool)
 
     # non-vacuity: 10 repeats plus the second zero row, so both the mask and its complement matter
@@ -1119,7 +1120,7 @@ def test_point_duplicate_mask_matches_meshlib(device: str) -> None:
     )
     duplicate_ml = representative_ml != np.arange(points_np.shape[0])
 
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     duplicate_wp = tw.point_duplicate_mask(points_wp).numpy().astype(bool)
 
     assert duplicate_ml.sum() == 11  # non-vacuity: the mask and its complement both matter
@@ -1141,7 +1142,7 @@ def test_point_duplicate_mask_separates_one_ulp(device: str) -> None:
     assert one != next_one
     points_np = np.array([[one, 0.0, 0.0], [next_one, 0.0, 0.0], [one, 0.0, 0.0]], dtype=np.float32)
 
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     duplicate_wp = tw.point_duplicate_mask(points_wp).numpy().astype(bool)
 
     # row 1 is one ULP away and is its own position; row 2 repeats row 0 exactly
@@ -1164,7 +1165,7 @@ def test_farthest_point_sample_matches_open3d(device: str) -> None:
     points_np = rng.random((500, 3)).astype(np.float32).astype(np.float64)
     cloud_o3d = points_to_open3d(points_np)
 
-    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     for count in (1, 4, 32, 64):
         selected_o3d = np.asarray(cloud_o3d.farthest_point_down_sample(count).points)
         index_o3d = {
@@ -1207,7 +1208,7 @@ def test_farthest_point_sample_sequence_and_coverage(device: str, start: int) ->
     """
     rng = np.random.default_rng(2)
     points_np = rng.random((400, 3)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
 
     index_wp = tw.farthest_point_sample(points_wp, 40, start=start).numpy()
     assert np.array_equal(
@@ -1257,8 +1258,8 @@ def test_vector_angle(device: str) -> None:
     pairs_np = np.stack([vecs_a_np, vecs_b_np], axis=1)
     angles_tm = tm_geometry.vector_angle(pairs_np)
 
-    vecs_a_wp = wp.array(vecs_a_np.astype(np.float32), dtype=wp.vec3, device=device)
-    vecs_b_wp = wp.array(vecs_b_np.astype(np.float32), dtype=wp.vec3, device=device)
+    vecs_a_wp = points_to_warp(vecs_a_np, device)
+    vecs_b_wp = points_to_warp(vecs_b_np, device)
     angles_wp = tw.vector_angle(vecs_a_wp, vecs_b_wp)
     assert np.allclose(angles_wp.numpy(), angles_tm, rtol=1e-5, atol=1e-5)
 
@@ -1309,7 +1310,7 @@ def test_convex_subset_mask_against_the_three_qhull_backends(device: str) -> Non
     """
     rng = np.random.default_rng(0)
     points_np = rng.standard_normal((500, 3)).astype(np.float64)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
 
     selected = set(
         np.flatnonzero(tw.convex_subset_mask(points_wp, n_directions=256).numpy()).tolist()
@@ -1347,7 +1348,7 @@ def test_convex_subset_mask_against_the_three_qhull_backends(device: str) -> Non
 def test_convex_subset_mask_sound(device: str) -> None:
     rng = np.random.default_rng(0)
     points_np = rng.standard_normal((500, 3)).astype(np.float64)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
 
     mask_wp = tw.convex_subset_mask(points_wp, n_directions=256)
     selected = np.flatnonzero(mask_wp.numpy())
@@ -1361,8 +1362,8 @@ def test_convex_subset_mask_scale_invariant(device: str) -> None:
     points_np = rng.standard_normal((500, 3)).astype(np.float64)
     scaled_np = points_np * 1e4
 
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
-    scaled_wp = wp.array(np.ascontiguousarray(scaled_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
+    scaled_wp = points_to_warp(scaled_np, device)
 
     mask_wp = tw.convex_subset_mask(points_wp, n_directions=256)
     mask_scaled_wp = tw.convex_subset_mask(scaled_wp, n_directions=256)
@@ -1376,7 +1377,7 @@ def test_convex_subset_mask_scale_invariant(device: str) -> None:
 def test_convex_subset_recall(device: str) -> None:
     rng = np.random.default_rng(2)
     points_np = rng.standard_normal((200, 3)).astype(np.float64)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
 
     mask_wp = tw.convex_subset_mask(points_wp, n_directions=4096)
     selected = set(np.flatnonzero(mask_wp.numpy()).tolist())
@@ -1388,7 +1389,7 @@ def test_convex_subset_recall(device: str) -> None:
 def test_convex_subset_points(device: str) -> None:
     rng = np.random.default_rng(4)
     points_np = rng.standard_normal((300, 3)).astype(np.float64)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
 
     mask_wp = tw.convex_subset_mask(points_wp, n_directions=256)
     subset_wp = tw.convex_subset(points_wp, n_directions=256)
@@ -1445,7 +1446,7 @@ def test_convex_superset_mask_contains_the_exact_hull(device: str, kind: str) ->
     on the others.
     """
     points_np = _cloud(kind, 20_000, seed=11)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
 
     mask_np = tw.convex_superset_mask(points_wp, subdivisions=3).numpy()
     kept = set(np.flatnonzero(mask_np).tolist())
@@ -1459,7 +1460,7 @@ def test_convex_superset_mask_contains_the_exact_hull(device: str, kind: str) ->
 def test_convex_superset_mask_tightens_with_subdivisions(device: str, kind: str) -> None:
     """More directions wrap the hull more closely, and the guarantee holds at every level."""
     points_np = _cloud(kind, 5_000, seed=12)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     hull_scipy = set(scipy.spatial.ConvexHull(points_np).vertices.tolist())
 
     counts = []
@@ -1476,7 +1477,7 @@ def test_convex_superset_mask_tightens_with_subdivisions(device: str, kind: str)
 def test_convex_superset_mask_contains_the_subset_mask(device: str) -> None:
     """The two one-sided filters bracket the hull: subset ``<=`` hull vertices ``<=`` superset."""
     points_np = _cloud("gaussian", 5_000, seed=13)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
 
     subset_np = tw.convex_subset_mask(points_wp, n_directions=256).numpy()
     superset_np = tw.convex_superset_mask(points_wp, subdivisions=3).numpy()
@@ -1490,8 +1491,8 @@ def test_convex_superset_mask_contains_the_subset_mask(device: str) -> None:
 def test_convex_superset_mask_scale_invariant(device: str) -> None:
     """The flatness and margin tests are relative, so scaling the cloud cannot change the mask."""
     points_np = _cloud("gaussian", 5_000, seed=14)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
-    scaled_wp = wp.array(np.ascontiguousarray(points_np * 1e4), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
+    scaled_wp = points_to_warp(points_np * 10000.0, device)
 
     assert np.array_equal(
         tw.convex_superset_mask(points_wp).numpy(), tw.convex_superset_mask(scaled_wp).numpy()
@@ -1517,7 +1518,7 @@ def test_convex_superset_mask_degenerate_keeps_everything(device: str, kind: str
     else:
         points_np = rng.standard_normal((3, 3))
 
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(points_np, device)
     assert tw.convex_superset_mask(points_wp).numpy().all()
 
 
@@ -1544,7 +1545,7 @@ def test_support_sweep_agrees_across_devices(mask_device: str) -> None:
         pytest.skip("no CUDA device")
 
     points_np = _cloud("gaussian", 5_000, seed=16)
-    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=mask_device)
+    points_wp = points_to_warp(points_np, mask_device)
     hull_scipy = set(scipy.spatial.ConvexHull(points_np).vertices.tolist())
 
     subset_np = tw.convex_subset_mask(points_wp, n_directions=128).numpy()

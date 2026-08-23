@@ -10,16 +10,14 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-
-_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
-
+from tests.conftest import MESHES
 
 # ---------------------------------------------------------------------------
 # halfedge_twins
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_halfedge_twins_are_a_symmetric_pairing(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -92,7 +90,7 @@ def test_halfedge_twins_empty(device: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_vertex_one_ring_sizes_match_incident_face_counts(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -113,7 +111,7 @@ def test_vertex_one_ring_sizes_match_incident_face_counts(
     assert np.array_equal(np.sort(ring_wp.numpy()), np.arange(3 * len(mesh_tm.faces)))
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_vertex_one_ring_neighbor_counts_match_trimesh(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -138,7 +136,7 @@ def test_vertex_one_ring_neighbor_counts_match_trimesh(
     assert np.array_equal(ring_sizes + is_boundary_wp.numpy().astype(np.int32), neighbors_tm)
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_vertex_one_rings_are_rotationally_ordered(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:

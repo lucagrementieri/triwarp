@@ -16,6 +16,7 @@ from scipy.spatial import KDTree
 
 import triwarp as tw
 from tests.comparisons import hausdorff_surface_two_sided, lexsort_rows, undirected_edges
+from tests.conftest import CLOSED_MESHES, MESHES
 from tests.conversions import (
     bsr_to_csr,
     bsr_to_dense,
@@ -24,6 +25,8 @@ from tests.conversions import (
     numpy_to_meshlib,
     numpy_to_warp,
     open3d_to_trimesh,
+    points_to_warp,
+    points_to_warp_uv,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
@@ -78,15 +81,16 @@ def _region_max_edge(vertices_np, faces_np, region_np):
 
 
 def _icosphere_wp(device: str, subdivisions: int = 3):
+    """
+    Build an icosphere at a caller-chosen subdivision: ``(trimesh, vertices_wp, faces_wp)``.
+
+    Parametrized over ``subdivisions``, which is exactly what a fixture cannot be -- ``icosphere``
+    and ``icosphere_coarse`` in ``conftest.py`` pin 3 and 2, and this file's decimation tests sweep
+    2 through 4. So it stays a builder, and its job is only to pair the trimesh with the buffers
+    ``numpy_to_warp`` uploads.
+    """
     sphere = tm.creation.icosphere(subdivisions=subdivisions, radius=1.0)
-    vertices = wp.array(
-        np.ascontiguousarray(sphere.vertices, dtype=np.float64), dtype=wp.vec3, device=device
-    )
-    faces = wp.array(
-        np.ascontiguousarray(sphere.faces.reshape(-1), dtype=np.int32),
-        dtype=wp.int32,
-        device=device,
-    )
+    vertices, faces = numpy_to_warp(sphere.vertices, sphere.faces, device)
     return sphere, vertices, faces
 
 
@@ -209,9 +213,7 @@ def test_remesh_emits_no_degenerate_faces(device: str) -> None:
         ("icosphere", _icosphere_arrays()),
         ("graded_patch", _graded_patch()),
     ):
-        vertices_wp = wp.array(
-            np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
-        )
+        vertices_wp = points_to_warp(vertices_np, device)
         faces_wp = wp.array(
             np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32),
             dtype=wp.int32,
@@ -274,7 +276,7 @@ def test_remesh_watertight_genus_preserved(device: str) -> None:
     out_vertices, out_faces = tw.remesh.isotropic_remesh(
         vertices_wp, faces_wp, target_length=target, iterations=10
     )
-    mesh_out = tm.Trimesh(out_vertices.numpy(), out_faces.numpy().reshape(-1, 3), process=False)
+    mesh_out = warp_to_trimesh(out_vertices, out_faces)
     assert tw.validation.is_watertight(out_vertices, out_faces)
     assert mesh_out.euler_number == 2  # genus 0
     # Volume of the unit sphere is preserved to a few percent.
@@ -328,7 +330,7 @@ def test_remesh_cave_cube_manifold(cave_cube: tuple[tm.Trimesh, wp.Mesh]) -> Non
     out_vertices, out_faces = tw.remesh.isotropic_remesh(
         vertices_wp, faces_wp, target_length=target, iterations=8
     )
-    mesh_out = tm.Trimesh(out_vertices.numpy(), out_faces.numpy().reshape(-1, 3), process=False)
+    mesh_out = warp_to_trimesh(out_vertices, out_faces)
     assert tw.validation.is_watertight(out_vertices, out_faces)
     # Two nested cubes: Euler characteristic 4 (two genus-0 shells) is preserved.
     assert mesh_out.euler_number == mesh_tm.euler_number
@@ -362,7 +364,7 @@ def test_remesh_boundary_preservation(hemisphere: tuple[tm.Trimesh, wp.Mesh]) ->
     out_vertices, out_faces = tw.remesh.isotropic_remesh(
         vertices_wp, faces_wp, target_length=target, iterations=8
     )
-    mesh_out = tm.Trimesh(out_vertices.numpy(), out_faces.numpy().reshape(-1, 3), process=False)
+    mesh_out = warp_to_trimesh(out_vertices, out_faces)
     # The open boundary is still a single closed loop (the disk boundary is preserved).
     assert len(mesh_out.outline().entities) == n_loops_before
 
@@ -557,11 +559,7 @@ def test_subdivide_to_size_matches_meshlib(device: str) -> None:
     max_edge = 0.5 * float(tw.edges.mean_edge_length(vertices_wp, faces_wp))
 
     out_vertices_wp, out_faces_wp = tw.remesh.subdivide_to_size(vertices_wp, faces_wp, max_edge)
-    out_tm = tm.Trimesh(
-        out_vertices_wp.numpy().astype(np.float64),
-        out_faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
+    out_tm = warp_to_trimesh(out_vertices_wp, out_faces_wp)
 
     mesh_ml = numpy_to_meshlib(sphere_tm.vertices, sphere_tm.faces)
     settings_ml = mm.SubdivideSettings()
@@ -760,12 +758,11 @@ def test_quadric_decimate_beats_igl_and_open3d_on_deviation(device: str, target_
     The assertion is one-sided with slack, not an equality — the point is that the parallel method
     is competitive, not that this exact ratio is a contract.
     """
-    igl_module = pytest.importorskip("igl")
     sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
     vertices_np = np.ascontiguousarray(sphere_tm.vertices, dtype=np.float64)
     faces_np = np.ascontiguousarray(sphere_tm.faces, dtype=np.int64)
 
-    decimated_igl = igl_module.decimate(vertices_np, faces_np, target_faces)
+    decimated_igl = igl.decimate(vertices_np, faces_np, target_faces)
     igl_tm = tm.Trimesh(np.asarray(decimated_igl[0]), np.asarray(decimated_igl[1]), process=False)
     mesh_o3d = trimesh_to_open3d(sphere_tm).simplify_quadric_decimation(
         target_number_of_triangles=target_faces
@@ -812,11 +809,7 @@ def test_quadric_decimate_preserves_the_topology(device: str) -> None:
     decimated_vertices_wp, decimated_faces_wp = tw.remesh.quadric_decimate(
         vertices_wp, faces_wp, target_ratio=0.2
     )
-    decimated_tm = tm.Trimesh(
-        decimated_vertices_wp.numpy().astype(np.float64),
-        decimated_faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
+    decimated_tm = warp_to_trimesh(decimated_vertices_wp, decimated_faces_wp)
     assert decimated_tm.is_watertight
     assert decimated_tm.euler_number == 2
     assert np.isclose(decimated_tm.volume, sphere_tm.volume, rtol=0.02)
@@ -838,11 +831,7 @@ def test_quadric_decimate_keeps_the_features_of_a_cube(device: str) -> None:
     decimated_vertices_wp, decimated_faces_wp = tw.remesh.quadric_decimate(
         vertices_wp, faces_wp, target_ratio=0.1
     )
-    decimated_tm = tm.Trimesh(
-        decimated_vertices_wp.numpy().astype(np.float64),
-        decimated_faces_wp.numpy().reshape(-1, 3),
-        process=False,
-    )
+    decimated_tm = warp_to_trimesh(decimated_vertices_wp, decimated_faces_wp)
     # Still a box: the same eight corners, the same volume, and 90-degree edges intact.
     assert np.allclose(decimated_tm.bounds, box_tm.bounds, atol=1e-4)
     assert np.isclose(decimated_tm.volume, box_tm.volume, rtol=0.02)
@@ -1193,7 +1182,7 @@ def test_quadric_decimate_provenance_on_degenerate_inputs(device: str) -> None:
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [9.0, 9.0, 9.0]], dtype=np.float32
     )
     faces_np = np.array([0, 1, 2], dtype=np.int32)
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
 
     kept_vertices_wp, kept_faces_wp, vertex_index_wp, face_index_wp = tw.remesh.quadric_decimate(
@@ -1822,8 +1811,6 @@ def test_subdivide_edge_lengths(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None
 # subdivide_loop
 # --------------------------------------------------------------------------------------
 
-_LOOP_FIXTURES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
-
 
 def _loop_odd_correspondence(
     faces_wp_np: np.ndarray, faces_igl: np.ndarray, n_new: int, n_original: int
@@ -1845,7 +1832,7 @@ def _loop_odd_correspondence(
     return perm
 
 
-@pytest.mark.parametrize("mesh_name", _LOOP_FIXTURES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("subdivide_loop", "igl")
 def test_subdivide_loop_matches_igl(mesh_name: str, request: pytest.FixtureRequest) -> None:
     """
@@ -1898,7 +1885,7 @@ def test_subdivide_loop_matches_igl(mesh_name: str, request: pytest.FixtureReque
     )
 
 
-@pytest.mark.parametrize("mesh_name", _LOOP_FIXTURES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("subdivide_loop", "open3d")
 def test_subdivide_loop_matches_open3d(mesh_name: str, request: pytest.FixtureRequest) -> None:
     """
@@ -2010,7 +1997,7 @@ def test_subdivide_loop_leaves_a_nonmanifold_edge_at_its_midpoint(device: str) -
     )
     # Edge (0, 1) is shared by all three faces.
     faces_np = np.array([[0, 1, 2], [0, 1, 3], [0, 1, 4]], dtype=np.int32).ravel()
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
 
     vertices_new_wp, faces_new_wp = tw.remesh.subdivide_loop(vertices_wp, faces_wp)
@@ -2031,7 +2018,7 @@ def test_subdivide_loop_empty(device: str) -> None:
     assert int(faces_new_wp.shape[0]) == 0
 
 
-@pytest.mark.parametrize("mesh_name", _LOOP_FIXTURES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_subdivide_loop_operator_reproduces_its_own_positions(
     mesh_name: str, request: pytest.FixtureRequest
 ) -> None:
@@ -2123,7 +2110,7 @@ def test_subdivide_loop_operator_carries_a_field(
         dtype=np.float32,
     )
     carried_uv_np = tw.interpolation.transfer_through_operator(
-        wp.array(uv_np, dtype=wp.vec2, device=device), operator
+        points_to_warp_uv(uv_np, device), operator
     ).numpy()
     assert carried_uv_np.shape == (n_out, 2)
     assert np.allclose(carried_uv_np.sum(axis=1), 1.0, rtol=1e-6, atol=1e-6)
@@ -2165,9 +2152,6 @@ def test_transfer_through_operator_guards_and_empty_inputs(device: str) -> None:
 # --------------------------------------------------------------------------------------
 # subdivide_to_size
 # --------------------------------------------------------------------------------------
-
-_MESH_FIXTURES = ["icosahedron", "half_torus", "cave_cube", "hemisphere"]
-_CLOSED_FIXTURES = ["icosahedron", "cave_cube"]
 
 
 @pytest.mark.parity("subdivide_to_size", "trimesh")
@@ -2299,7 +2283,7 @@ def test_subdivide_to_size_reference_mixed(device: str) -> None:
     assert np.array_equal(hist_wp, hist_ref)
 
 
-@pytest.mark.parametrize("mesh_name", _MESH_FIXTURES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parametrize("frac", [0.75, 0.5, 0.3])
 def test_subdivide_to_size_max_edge(
     mesh_name: str, frac: float, request: pytest.FixtureRequest
@@ -2314,7 +2298,7 @@ def test_subdivide_to_size_max_edge(
     assert result_max_edge <= max_edge + 1e-4
 
 
-@pytest.mark.parametrize("mesh_name", _MESH_FIXTURES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_subdivide_to_size_noop(mesh_name: str, request: pytest.FixtureRequest) -> None:
     """A threshold above the longest edge returns the mesh unchanged."""
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
@@ -2327,7 +2311,7 @@ def test_subdivide_to_size_noop(mesh_name: str, request: pytest.FixtureRequest) 
     assert np.array_equal(new_f_wp.numpy().reshape(-1, 3), faces_np)
 
 
-@pytest.mark.parametrize("mesh_name", _CLOSED_FIXTURES)
+@pytest.mark.parametrize("mesh_name", CLOSED_MESHES)
 @pytest.mark.parametrize("frac", [0.5, 0.3])
 def test_subdivide_to_size_crack_free(
     mesh_name: str, frac: float, request: pytest.FixtureRequest
@@ -2349,7 +2333,7 @@ def test_subdivide_to_size_crack_free(
     assert n_v - n_e + n_f == mesh_tm.euler_number
 
 
-@pytest.mark.parametrize("mesh_name", _MESH_FIXTURES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_subdivide_to_size_preserves_surface(
     mesh_name: str, request: pytest.FixtureRequest
 ) -> None:
@@ -2372,7 +2356,7 @@ def test_subdivide_to_size_preserves_surface(
         )
 
 
-@pytest.mark.parametrize("mesh_name", _MESH_FIXTURES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_subdivide_to_size_return_index(mesh_name: str, request: pytest.FixtureRequest) -> None:
     """Each output face carries a valid source id and lies inside that source triangle."""
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
@@ -2433,7 +2417,7 @@ def test_subdivide_to_size_single_triangle(device: str) -> None:
     # base edge is over-long, so it splits once into two faces.
     vertices_np = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 0.3, 0.0]], dtype=np.float32)
     faces_np = np.array([0, 1, 2], dtype=np.int32)
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
 
     new_v_wp, new_f_wp = tw.remesh.subdivide_to_size(vertices_wp, faces_wp, 1.5)
@@ -2502,8 +2486,8 @@ def test_subdivide_region_max_edge(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     v, f, region = _filled_hemisphere(hemisphere)
     max_edge = 0.2 * _region_max_edge(v.numpy(), f.numpy().reshape(-1, 3), region.numpy())
     nv, nf, nr = tw.remesh.subdivide_region_to_size(v, f, region, max_edge=max_edge, delaunay=False)
-    got = _region_max_edge(nv.numpy(), nf.numpy().reshape(-1, 3), nr.numpy())
-    assert got <= max_edge + 1e-4
+    max_edge_np = _region_max_edge(nv.numpy(), nf.numpy().reshape(-1, 3), nr.numpy())
+    assert max_edge_np <= max_edge + 1e-4
 
 
 def test_subdivide_region_crack_free(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
@@ -2897,7 +2881,7 @@ def test_split_edges_honours_caller_supplied_positions(
     mask_np[chosen] = True
     quarter_np = 0.75 * points_np[edges_np[chosen, 0]] + 0.25 * points_np[edges_np[chosen, 1]]
     mask_wp = wp.array(np.ascontiguousarray(mask_np), dtype=wp.bool, device=device)
-    positions_wp = wp.array(np.ascontiguousarray(quarter_np), dtype=wp.vec3, device=device)
+    positions_wp = points_to_warp(quarter_np, device)
 
     split_v, split_f = tw.remesh.split_edges(
         mesh_wp.points,
@@ -2933,13 +2917,7 @@ def test_split_edges_is_crack_free_for_an_arbitrary_mask(
     assert int(mask_np.sum()) > 0  # anti-vacuity
     assert int(split_v.shape[0]) == int(mesh_wp.points.shape[0]) + int(mask_np.sum())
     assert tw.validation.is_edge_manifold(split_f, allow_boundary_edges=False)
-    assert np.isclose(
-        tm.Trimesh(
-            split_v.numpy().astype(np.float64), split_f.numpy().reshape(-1, 3), process=False
-        ).area,
-        mesh_tm.area,
-        rtol=1e-5,
-    )
+    assert np.isclose(warp_to_trimesh(split_v, split_f).area, mesh_tm.area, rtol=1e-5)
 
 
 def test_split_edges_carries_a_per_face_index(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

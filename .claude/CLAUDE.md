@@ -583,7 +583,15 @@ grid split by a diagonal — `cave_cube`, `half_torus`) erases that edge's phase
 
 **pymeshlab** (pybind11 over MeshLab / VCGlib, mirrored under `reference/PyMeshLab/`) is the
 broadest reference of the three — 281 filters — and a hard test dependency like `igl`, so
-`import pymeshlab as ml` plainly, never through `pytest.importorskip`. Reference variables take a
+`import pymeshlab as ml` plainly, never through `pytest.importorskip`. **That rule covers every
+package in `[dependency-groups] test`, not only the six reference libraries** — `libigl`, `shapely`
+and `moderngl` are in the same list and were guarded by eight `importorskip` calls, which is a
+latent hole rather than a safety net: if the import breaks the tests *vanish* instead of failing, and
+one of those eight sat under a `parity` marker that `tests/test_parity.py` would have kept passing
+because the marker is static and the skip is not. Where a *runtime* precondition genuinely cannot be
+declared as a dependency — an EGL driver for `moderngl`'s OpenGL reference — keep a skip, but make it
+name the driver and put it in the fixture that needs the context, never at module scope over the
+import. Reference variables take a
 **`_pml`** suffix. Build the MeshSet with `tests.conversions.trimesh_to_pymeshlab(mesh_tm)` (or
 `warp_to_pymeshlab(vertices_wp, faces_wp)` for a triwarp output) rather than hand-rolling
 `ml.MeshSet()`. Use it where it is a *better* oracle than the incumbent, not everywhere — trimesh /
@@ -936,8 +944,15 @@ all measured:
   in `findProjections` — measured as a hard `SIGSEGV` (no exception, no traceback) at 10 000 queries
   against `bunny_decimated` and at 40 queries against a 300-point cloud. Bind the mesh or cloud to a
   name that outlives every query, which is Open3D's `from_legacy` hazard in a second library.
-  `MeshPart` has the same rule and cannot even be given a Python attribute to hold the reference —
-  the pybind11 object has no `__dict__`, so the owner has to be a variable or a cache.
+  **`mm.MeshPart` does *not* share the rule — it keeps a real Python reference, and
+  `mm.MeshPart(trimesh_to_meshlib(mesh_tm))` over a temporary is safe.** Measured:
+  `sys.getrefcount(mesh_ml)` goes 2 → 3 across the constructor and `part.mesh is mesh_ml`, where the
+  two setters above leave it at 2. That is the whole test, and it is the one to run on the next
+  binding of this shape rather than reasoning from a sibling: **probe the refcount, do not infer the
+  lifetime.** (An earlier version of this block said `MeshPart` had the same rule and could not even
+  hold the reference in an attribute; the attribute part is true — the pybind11 object has no
+  `__dict__` — but it is irrelevant, because nothing needs to hold it. The wrong half made 28 correct
+  call sites across 13 test files read as latent use-after-frees.)
   `findProjections`'s `upDistLimitSq` is a second crash of the same shape: pass MeshLib's own
   `FLT_MAX`, since `math.inf` segfaults rather than raising.
 - **The AABB tree is lazily built and cached on the `Mesh`, and the ratio depends on whether the
@@ -1292,7 +1307,14 @@ Classify every comparison, and say which class it is in the docstring:
 
 Write the label as **`Class A`** (capital, the word before the letter). A lowercase `class b` reads
 the same to a human and is invisible to a grep for the convention — 21 of them had accumulated
-before anyone looked.
+before anyone looked, then 9 more after that count was taken to 0, which is why
+`test_api_conventions.py` now gates it rather than trusting the convention.
+
+**Four phrases carry a label, not two**, and a scan or a review that knows only the first two
+misreads 14 correct tests as unlabelled. Measured over the 523 tests whose `assert` reads a
+reference-suffixed variable: `Class [ABCD]` (464), `Not a library comparison` (48), `Triwarp against
+triwarp` (9), `Not a parity assert` (5). The last two are the triwarp-against-triwarp family below,
+and they are labels in good standing — do not reword them to fit a narrower grep.
 
 Never a parity assert: shape-only or `isfinite`-only (that is the *benchmark's* assert, and this
 gate exists to stop it migrating inward); triwarp compared with itself; a threshold a constant
@@ -1312,13 +1334,27 @@ local edge differently, `triwarp_opp == (igl_opp + 1) % 3`). So: assert the refe
 non-empty answer, or assert its expected count, before comparing to it — and treat "this function is
 already the oracle in tests/" as no evidence at all that the comparison is live.
 
+**And a constant answer is as vacuous as an empty one — the sweep must look for both.** Two measured
+cases, each of which had a docstring *asserting the non-vacuity that was absent*, and in both the
+sentence is what stopped anyone re-checking. `test_connected_component_labels_random` said "200
+random edges over 64 nodes gives several components rather than one" and produced **1** component
+holding all 64 nodes, so the class-B label-packing transform it exists for was the identity (its
+`_matches_igl` sibling said the same false sentence and was single-component on *both* of its
+shapes — one because 200 edges is past the giant-component threshold, the other because its
+`n_edges == node_count - 1` branch builds a path). `test_discrete_mean_curvature` said "over every
+vertex" and ran on a *regular* icosahedron, where trimesh's answer is **one value at spread 0.0**, so
+a permuted result, an off-by-one in the gather and a query/vertex index swap all pass. The rule that
+follows: **a claim about the input's shape is a claim an assert can carry cheaply, so make it an
+assert and not a sentence** — `assert np.unique(labels_np).shape[0] > 1`,
+`assert np.ptp(reference) > 1e-3`.
+
 Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `undirected_edges`,
 `edge_multiplicity`, `euler_characteristic`, `open_edge_count`, `canonical_labels`,
 `same_partition`, `canonical_winding`, `assert_same_up_to_sign`, `assert_cyclic_permutation_equal`,
 `assert_same_loop_set`, `trimesh_outline_loops`, `fraction_within`, `symmetric_chamfer`,
 `symmetric_surface_distance`, `hausdorff_two_sided`,
 `hausdorff_surface_two_sided`) and `tests/conversions.py` (`numpy_to_warp`, `numpy_to_warp_uv`,
-`trimesh_to_warp`, `warp_to_trimesh`, `trimesh_to_open3d`, `points_to_open3d`, `open3d_to_trimesh`,
+`points_to_warp`, `points_to_warp_uv`, `trimesh_to_warp`, `warp_to_trimesh`, `trimesh_to_open3d`, `points_to_open3d`, `open3d_to_trimesh`,
 `trimesh_to_open3d_t`, `trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`,
 `trimesh_to_pyvista`, `points_to_pyvista`, `pyvista_edges_to_indices`, `numpy_to_meshlib`,
 `trimesh_to_meshlib`, `warp_to_meshlib`, `points_to_meshlib`, `meshlib_to_trimesh`,
@@ -1328,6 +1364,23 @@ Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `un
 rather than re-rolling either. **Check both modules before writing a private helper in a test
 file** — every one of the six consolidated in 2026-08 was written by someone who did not, and
 `undirected_edges` alone had been spelled three different ways across six files.
+
+**`points_to_warp` and `warp_to_trimesh` are the two most-reached-for, and both were re-rolled for a
+long time before they existed or were adopted.** The bare-cloud upload — query points, normals, ray
+origins and directions, a sampled surface — had been written out **403** times in four equivalent
+spellings across 35 files *plus* six one-line private copies carrying 181 more calls, because every
+reference library had a `points_to_*` and Warp did not; it is now one helper at 532 call sites. The
+readback direction is the mirror image and the asymmetry is worth knowing about yourself: a test
+author reaches for the shared helper when *building* the reference and writes the readback by hand,
+every time, so `warp_to_trimesh` sat at 4 mentions in 2 files while 38 sites inlined
+`tm.Trimesh(x.numpy(), f.numpy().reshape(-1, 3), process=False)`.
+
+**And the fixture *sets* are shared too**: `CLOSED_MESHES`, `OPEN_MESHES` and
+`MESHES = CLOSED_MESHES + OPEN_MESHES` live in `tests/conftest.py`. "The four that span closed/open
+and convex/non-convex" is a decision about coverage, and it had been restated in ten files under
+three names, which meant a fixture added to the set reached exactly one of them. Import them; keep a
+local list only where it is genuinely a different set, and say in a comment why (`test_adjacency.py`
+drops `cave_cube` because its coplanar box faces make every adjacency angle 0 or pi/2).
 
 `canonical_labels` is the label-packing transform every component comparison
 needs — triwarp names a component after a representative element, igl and scipy number `0..k-1` in
@@ -1761,7 +1814,7 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ## 14. Evolving the Public API
 
 **`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
-`pytest` run. Eighteen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
+`pytest` run. Nineteen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
 summary line naming a reference library (§10); a `*_mask` producer that does not return
 `wp.array[wp.bool]`; a module summary advertising Warp; a module without a `tests/` **and** a
 `benchmarks/` file named for it; a private name reached across a module boundary; one public name
@@ -1779,7 +1832,7 @@ integer division, **check 17**, no `/` between two operands that are integers *b
 spellings are *legal* and generate identical code, so the defect is invisible to the compiler and to
 the suite, and nothing but a scan holds the line. Check 18 reads kernel-scope signatures **only** —
 a kernel *factory* is ordinary Python and its `row_size: int` / `name: str` parameters are correct,
-which is why `str` is not in its table. The last five are newer and each exists because the same
+which is why `str` is not in its table. The last six are newer and each exists because the same
 defect was found twice:
 
 - **A `wp.launch` / `wp.launch_tiled` with no `device=`.** Check 15, and it is a memory-safety guard
@@ -1814,6 +1867,19 @@ defect was found twice:
   `ast.parse` sees nothing wrong with either. Blocks holding a bare `...` are deliberate outlines
   and skip. A new example that needs a name the fixture does not bind fails with `NameError` —
   extend `example_namespace`, do not weaken the test.
+- **A test comparing against a reference library with no class label.** Check 19, the second one
+  that reads `tests/` rather than `triwarp/`, and it exists because the convention has decayed
+  **twice**: the lowercase `class b` spelling went 21 → 0 → 9, invisible to §6's own prescribed grep
+  because a human reads `class B` and `Class B` the same. Four decisions keep it from misfiring, each
+  of which cost a wrong count while it was being built. It keys on `ast.Assert`, not on the function
+  body — a fixture unpack `mesh_tm, mesh_wp = icosphere` names a `_tm` variable in every mesh test,
+  and keying on the body takes it from 0 hits to 120. It accepts **all four** label phrases (§6), not
+  the two headline ones, or it would fail 14 correct tests and the author's fix would be to reword
+  good docstrings. It leaves `_np` out of its suffix list, measured at 290 false positives. And it
+  checks only that a label is *present*, never that it is the right one: a `_tm` name in an assert is
+  not proof of an oracle — `test_split_single_component` compares `split`'s output against the
+  *input* mesh's vertices, which is a round trip. The rarer defect it also closes is a comparison
+  with **no docstring at all**, which ruff cannot see because `D103` is in the ignore list.
 
 Each check carries a written allowlist — read the reason before adding an entry, and prefer fixing
 the code. It does not replace review: it cannot tell whether a *new* name is a good one, only that

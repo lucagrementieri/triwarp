@@ -8,6 +8,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import lexsort_rows, same_partition
+from tests.conversions import points_to_warp
 from triwarp.kernels.grouping import VEC3_PACK_PRECISION, VEC3_PACK_SHIFT
 
 # Host data, uploaded per test onto the fixture's device -- not ``wp.array`` at module scope. A
@@ -149,7 +150,7 @@ def test_unique_rows_matches_trimesh(
 
 def test_unique_rows_vec3(device: str):
     data_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32)
-    data_wp = wp.array(data_np, dtype=wp.vec3, device=device)
+    data_wp = points_to_warp(data_np, device)
     unique_wp, inverse_wp = tw.grouping.unique_rows(data_wp, return_inverse=True)
     assert unique_wp.shape[0] == 2
     for i in range(data_np.shape[0]):
@@ -253,7 +254,7 @@ def test_hash_rows_dispatches_to_the_typed_hashers(device: str, kind: str) -> No
     """Class A: the dispatcher returns exactly what the function it forwards to returns."""
     positions_np = np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [0.0, 1.0, 2.0]], dtype=np.float32)
     if kind == "vec3":
-        data_wp = wp.array(np.ascontiguousarray(positions_np), dtype=wp.vec3, device=device)
+        data_wp = points_to_warp(positions_np, device)
         expected_wp = tw.grouping.hash_vector_rows(data_wp)
     elif kind == "int32_rows":
         rows_np = np.array([[1, 2], [3, 4], [1, 2]], dtype=np.int32)
@@ -261,9 +262,7 @@ def test_hash_rows_dispatches_to_the_typed_hashers(device: str, kind: str) -> No
         expected_wp = tw.grouping.hash_indices_rows(data_wp)
     else:
         data_wp = wp.array(np.ascontiguousarray(positions_np), dtype=wp.float32, device=device)
-        expected_wp = tw.grouping.hash_vector_rows(
-            wp.array(np.ascontiguousarray(positions_np), dtype=wp.vec3, device=device)
-        )
+        expected_wp = tw.grouping.hash_vector_rows(points_to_warp(positions_np, device))
 
     keys_np = tw.grouping.hash_rows(data_wp).numpy()
 
@@ -287,7 +286,7 @@ def test_hash_vector_rows(device: str) -> None:
     vectors_np = rng.standard_normal((n, 3), dtype=np.float64)
     packed_np = _pack_vec3_np(vectors_np)
 
-    vectors_wp = wp.array(vectors_np, dtype=wp.vec3, device=device)
+    vectors_wp = points_to_warp(vectors_np, device)
     packed_wp = tw.grouping.hash_vector_rows(vectors_wp)
     packed = packed_wp.numpy()
 
@@ -318,14 +317,14 @@ def test_hash_vector_rows_epsilon_allows_negative_coordinates(device: str) -> No
         [[-1.0, -2.0, -3.0], [-1.0 + 1e-9, -2.0, -3.0], [4.0, 5.0, 6.0], [4.0, 5.0 + 1e-9, 6.0]],
         dtype=np.float32,
     )
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     keys_np = tw.grouping.hash_vector_rows(vertices_wp, epsilon=1e-6).numpy()
     assert keys_np[0] == keys_np[1]
     assert keys_np[2] == keys_np[3]
     assert keys_np[0] != keys_np[2]
 
     # Translating the input must not change how the rows group, only the keys themselves.
-    shifted_wp = wp.array(vertices_np + np.float32(100.0), dtype=wp.vec3, device=device)
+    shifted_wp = points_to_warp(vertices_np + np.float32(100.0), device)
     shifted_np = tw.grouping.hash_vector_rows(shifted_wp, epsilon=1e-6).numpy()
     assert shifted_np[0] == shifted_np[1]
     assert shifted_np[2] == shifted_np[3]
@@ -341,7 +340,7 @@ def test_hash_vector_rows_epsilon_far_from_origin(device: str) -> None:
     rng = np.random.default_rng(5)
     sites_np = (rng.random((64, 3)).astype(np.float32) + offset_np).astype(np.float32)
     # Each site duplicated exactly, so the 128 rows must collapse to 64 distinct keys.
-    vertices_wp = wp.array(np.vstack((sites_np, sites_np)), dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(np.vstack((sites_np, sites_np)), device)
     keys_np = tw.grouping.hash_vector_rows(vertices_wp, epsilon=1e-6).numpy()
     assert np.array_equal(keys_np[:64], keys_np[64:])
     assert len(set(keys_np.tolist())) == 64

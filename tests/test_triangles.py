@@ -18,6 +18,7 @@ from tests.conversions import (
     meshlib_corner_normals_to_numpy,
     numpy_to_meshlib_undirected_edges,
     numpy_to_warp,
+    points_to_warp,
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
@@ -522,7 +523,7 @@ def test_face_quality_radius_ratio_equilateral(device: str):
     side = np.array(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, np.sqrt(3.0) / 2.0, 0.0]], dtype=np.float32
     )
-    vertices_wp = wp.array(side, dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(side, device)
     faces_wp = wp.array([0, 1, 2], dtype=wp.int32, device=device)
     assert np.allclose(
         tw.triangles.face_quality(vertices_wp, faces_wp, metric="radius_ratio").numpy(), 1.0
@@ -579,7 +580,7 @@ def test_barycentric_to_points(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     barycentric_np = np.random.default_rng(31).random((mesh_tm.triangles.shape[0], 3))
     points_tm = tm.triangles.barycentric_to_points(mesh_tm.triangles, barycentric_np)
 
-    barycentric_wp = wp.array(barycentric_np, dtype=wp.vec3, device=mesh_wp.points.device)
+    barycentric_wp = points_to_warp(barycentric_np, mesh_wp.points.device)
     points_wp = tw.triangles.barycentric_to_points(mesh_wp.points, mesh_wp.indices, barycentric_wp)
     assert np.allclose(points_wp.numpy(), points_tm, rtol=1e-5, atol=1e-5)
 
@@ -611,7 +612,7 @@ def test_points_to_barycentric(hemisphere: tuple[tm.Trimesh, wp.Mesh], method: s
         np.ascontiguousarray(mesh_tm.triangles[:, 2]),
     )
 
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=mesh_wp.points.device)
+    points_wp = points_to_warp(points_np, mesh_wp.points.device)
     barycentric_wp = tw.triangles.points_to_barycentric(
         mesh_wp.points, mesh_wp.indices, points_wp, method=method
     )
@@ -631,7 +632,7 @@ def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     points_np = np.random.default_rng(33).random((mesh_tm.triangles.shape[0], 3))
     closest_points_tm = tm.triangles.closest_point(mesh_tm.triangles, points_np)
 
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=mesh_wp.points.device)
+    points_wp = points_to_warp(points_np, mesh_wp.points.device)
     closest_points_wp = tw.triangles.closest_point(mesh_wp.points, mesh_wp.indices, points_wp)
     assert np.allclose(closest_points_wp.numpy(), closest_points_tm, rtol=1e-5, atol=1e-5)
 
@@ -689,7 +690,7 @@ def test_soup_quantities_match_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     queries_np = np.ascontiguousarray(
         mesh_tm.triangles.mean(axis=1) + rng.standard_normal((n_faces, 3)) * 0.35, dtype=np.float32
     )
-    queries_wp = wp.array(queries_np, dtype=wp.vec3, device=mesh_wp.points.device)
+    queries_wp = points_to_warp(queries_np, mesh_wp.points.device)
     closest_wp = tw.triangles.closest_point(mesh_wp.points, mesh_wp.indices, queries_wp)
     closest_ml = np.array(
         [
@@ -711,11 +712,7 @@ def test_soup_quantities_match_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     # barycentric_to_points: MeshLib's edge-relative convention, permuted per face.
     barycentric_np = rng.random((n_faces, 3)) + 0.05
     barycentric_np /= barycentric_np.sum(axis=1, keepdims=True)
-    barycentric_wp = wp.array(
-        np.ascontiguousarray(barycentric_np, dtype=np.float32),
-        dtype=wp.vec3,
-        device=mesh_wp.points.device,
-    )
+    barycentric_wp = points_to_warp(barycentric_np, mesh_wp.points.device)
     points_wp = tw.triangles.barycentric_to_points(mesh_wp.points, mesh_wp.indices, barycentric_wp)
     interpolated_ml = np.empty((n_faces, 3))
     for f in range(n_faces):
@@ -801,9 +798,7 @@ def test_face_signed_volumes_apex_shifts_each_face_but_not_the_sum(
     it fans from the surface centroid precisely so that no entry comes out negative.
     """
     mesh_tm, _mesh_tm_wp = icosphere_coarse
-    vertices_wp = wp.array(
-        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(mesh_tm.vertices, device)
     faces_wp = wp.array(
         np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32),
         dtype=wp.int32,
@@ -832,9 +827,7 @@ def test_face_signed_volumes_follows_the_input_dtype(
     vertices_f64_wp = wp.array(
         np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64), dtype=wp.vec3d, device=device
     )
-    vertices_f32_wp = wp.array(
-        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    vertices_f32_wp = points_to_warp(mesh_tm.vertices, device)
 
     volumes_f64_wp = tw.triangles.face_signed_volumes(vertices_f64_wp, faces_wp)
     volumes_f32_wp = tw.triangles.face_signed_volumes(vertices_f32_wp, faces_wp)

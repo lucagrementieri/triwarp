@@ -8,7 +8,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import fraction_within
-from tests.conversions import trimesh_to_pymeshlab
+from tests.conversions import points_to_warp, trimesh_to_pymeshlab
 
 
 @pytest.mark.parity("principal_curvature", "igl")
@@ -20,7 +20,7 @@ def test_principal_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     faces_np = np.array(mesh_tm.faces, dtype=np.int32)
     _, _, pv1_igl, pv2_igl, _ = igl.principal_curvature(vertices_np, faces_np, useKring=False)
 
-    vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
     # frame_independent=False reproduces igl::principal_curvature's symmetrized shape operator.
     _, _, pv1_wp, pv2_wp = tw.curvature.principal_curvature(
@@ -41,7 +41,7 @@ def test_principal_curvature_half_torus(half_torus: tuple[tm.Trimesh, wp.Mesh]) 
         vertices_np, faces_np, useKring=False
     )
 
-    vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
     # frame_independent=False reproduces igl::principal_curvature's symmetrized shape operator.
     pd1_wp, pd2_wp, pv1_wp, pv2_wp = tw.curvature.principal_curvature(
@@ -83,7 +83,7 @@ def test_principal_curvature_frame_independent(half_torus: tuple[tm.Trimesh, wp.
     faces_np = np.array(mesh_tm.faces, dtype=np.int32)
     _, _, pv1_igl, pv2_igl, bad_igl = igl.principal_curvature(vertices_np, faces_np, useKring=False)
 
-    vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
     # Default (frame_independent=True): true Weingarten map, independent of the tangent frame.
     _, _, pv1_wp, pv2_wp = tw.curvature.principal_curvature(vertices_wp, faces_wp)
@@ -188,8 +188,8 @@ def test_discrete_gaussian_curvature(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
         mesh_tm, points_tm, radius
     )
 
-    points_wp = wp.array(points_tm, dtype=wp.vec3, device=mesh_wp.device)
-    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+    points_wp = points_to_warp(points_tm, mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
     face_angles_wp = wp.array(face_angles_tm, dtype=wp.float32, device=mesh_wp.device)
     gauss_curvature_wp = tw.curvature.discrete_gaussian_curvature(
@@ -222,10 +222,8 @@ def test_discrete_mean_curvature(
     points_tm = mesh_tm.vertices
     mean_curvature_tm = tm.curvature.discrete_mean_curvature_measure(mesh_tm, points_tm, radius)
 
-    points_wp = wp.array(points_tm.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device)
-    vertices_wp = wp.array(
-        mesh_tm.vertices.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_tm, mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
     mean_curvature_wp = tw.curvature.discrete_mean_curvature(
         points_wp, vertices_wp, faces_wp, radius
@@ -257,8 +255,8 @@ def test_discrete_gaussian_curvature_ignores_the_current_device(
         mesh_tm, points_tm, radius
     )
 
-    points_wp = wp.array(points_tm, dtype=wp.vec3, device=mesh_wp.device)
-    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+    points_wp = points_to_warp(points_tm, mesh_wp.device)
+    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
     face_angles_wp = wp.array(face_angles_tm, dtype=wp.float32, device=mesh_wp.device)
 

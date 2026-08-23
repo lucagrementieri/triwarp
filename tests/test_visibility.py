@@ -15,6 +15,7 @@ import triwarp as tw
 from tests.conversions import (
     meshlib_scalars_to_numpy,
     numpy_to_warp,
+    points_to_warp,
     trimesh_to_meshlib,
     trimesh_to_pymeshlab,
     trimesh_to_warp,
@@ -174,7 +175,7 @@ def test_ambient_occlusion_matches_meshlib_sky_view_factor(device: str) -> None:
 
     vertices_wp, faces_wp = numpy_to_warp(terrain_tm.vertices, terrain_tm.faces.reshape(-1), device)
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
-    samples_wp = wp.array(samples_np, dtype=wp.vec3, device=device)
+    samples_wp = points_to_warp(samples_np, device)
     normals_wp = wp.array(
         np.tile(np.array([[0.0, 0.0, 1.0]], dtype=np.float32), (len(samples_np), 1)),
         dtype=wp.vec3,
@@ -324,15 +325,14 @@ def test_volumetric_obscurance_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) 
 
 
 def _sphere_wp(device: str, radius: float, subdivisions: int = 3):
+    """
+    Build an icosphere at a caller-chosen radius: ``(trimesh, wp.Mesh, vertex normals)``.
+
+    Parametrized over ``radius`` -- which is the axis every occlusion test here needs and no fixture
+    can carry -- so it stays a builder over ``numpy_to_warp`` rather than becoming one.
+    """
     sphere_tm = tm.creation.icosphere(subdivisions=subdivisions, radius=radius)
-    vertices_wp = wp.array(
-        np.ascontiguousarray(sphere_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
-    faces_wp = wp.array(
-        np.ascontiguousarray(sphere_tm.faces.reshape(-1), dtype=np.int32),
-        dtype=wp.int32,
-        device=device,
-    )
+    vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
     normals_wp = tw.vertices.vertex_normals(vertices_wp, faces_wp)
     return sphere_tm, mesh_wp, normals_wp
@@ -373,9 +373,7 @@ def test_shape_diameter_reduces_to_thickness(device: str) -> None:
 def test_shape_diameter_measures_a_slab(device: str) -> None:
     """On a 1 x 1 x 4 box the large faces are 1 apart, and the cone must say so."""
     box_tm = tm.creation.box(extents=[1.0, 1.0, 4.0]).subdivide().subdivide().subdivide()
-    vertices_wp = wp.array(
-        np.ascontiguousarray(box_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(box_tm.vertices, device)
     faces_wp = wp.array(
         np.ascontiguousarray(box_tm.faces.reshape(-1), dtype=np.int32),
         dtype=wp.int32,
@@ -410,9 +408,7 @@ def test_shape_diameter_trimming_rejects_the_escaping_rays(device: str) -> None:
     inner_tm = tm.creation.icosphere(subdivisions=3, radius=0.8)
     inner_tm.invert()
     shell_tm = tm.util.concatenate([outer_tm, inner_tm])
-    vertices_wp = wp.array(
-        np.ascontiguousarray(shell_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(shell_tm.vertices, device)
     faces_wp = wp.array(
         np.ascontiguousarray(shell_tm.faces.reshape(-1), dtype=np.int32),
         dtype=wp.int32,
@@ -469,9 +465,7 @@ def test_shape_diameter_agrees_with_pymeshlab_on_which_part_is_thinner(device: s
     meshset_pml.compute_scalar_by_shape_diameter_function_per_vertex(rays=256)
     diameter_pml = meshset_pml.current_mesh().vertex_scalar_array()
 
-    vertices_wp = wp.array(
-        np.ascontiguousarray(dumbbell_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(dumbbell_tm.vertices, device)
     faces_wp = wp.array(
         np.ascontiguousarray(dumbbell_tm.faces.reshape(-1), dtype=np.int32),
         dtype=wp.int32,
@@ -589,12 +583,8 @@ def test_thickness_max_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=7)
     normals_np = mesh_tm.face_normals[face_ids]
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
-    normals_wp = wp.array(
-        np.ascontiguousarray(normals_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
+    normals_wp = points_to_warp(normals_np, mesh_wp.device)
 
     thickness_wp = tw.visibility.thickness(mesh_wp, points_wp, normals=normals_wp).numpy()
     thickness_tm = tm_proximity.thickness(mesh_tm, points_np, normals=normals_np)
@@ -621,12 +611,8 @@ def test_thickness_ray(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=13)
     normals_np = mesh_tm.face_normals[face_ids]
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
-    normals_wp = wp.array(
-        np.ascontiguousarray(normals_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
+    normals_wp = points_to_warp(normals_np, mesh_wp.device)
 
     thickness_wp = tw.visibility.thickness(
         mesh_wp, points_wp, normals=normals_wp, method="ray"
@@ -724,12 +710,8 @@ def test_max_tangent_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=42)
     normals_np = mesh_tm.face_normals[face_ids]
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
-    normals_wp = wp.array(
-        np.ascontiguousarray(normals_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
+    normals_wp = points_to_warp(normals_np, mesh_wp.device)
 
     centers_wp, radii_wp = tw.visibility.max_tangent_sphere(mesh_wp, points_wp, normals=normals_wp)
     centers_tm, radii_tm = tm_proximity.max_tangent_sphere(mesh_tm, points_np, normals=normals_np)
@@ -780,12 +762,8 @@ def test_max_tangent_sphere_reach_matches_trimesh(cave_cube: tuple[tm.Trimesh, w
     points_np, face_ids = tm.sample.sample_surface(mesh_tm, 1024, seed=42)
     normals_np = mesh_tm.face_normals[face_ids]
 
-    points_wp = wp.array(
-        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
-    normals_wp = wp.array(
-        np.ascontiguousarray(normals_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
-    )
+    points_wp = points_to_warp(points_np, mesh_wp.device)
+    normals_wp = points_to_warp(normals_np, mesh_wp.device)
 
     centers_wp, radii_wp = tw.visibility.max_tangent_sphere(
         mesh_wp, points_wp, normals=normals_wp, inwards=False
@@ -861,7 +839,7 @@ def test_max_tangent_sphere_matches_meshlib(device: str) -> None:
     inside_np = np.ascontiguousarray(
         mesh_tm.vertices - offset * normals_wp.numpy(), dtype=np.float32
     )
-    inside_wp = wp.array(inside_np, dtype=wp.vec3, device=device)
+    inside_wp = points_to_warp(inside_np, device)
     _centers_wp, radii_wp = tw.visibility.max_tangent_sphere(
         mesh_wp, inside_wp, inwards=True, normals=normals_wp
     )
@@ -897,14 +875,8 @@ def test_max_tangent_sphere_agrees_across_devices(kernel_device: str) -> None:
     mesh_tm = tm.creation.icosphere(subdivisions=2)
     mesh_wp = trimesh_to_warp(mesh_tm, kernel_device)
     vertices_np = np.asarray(mesh_tm.vertices)
-    points_wp = wp.array(
-        np.ascontiguousarray(vertices_np * 0.95), dtype=wp.vec3, device=kernel_device
-    )
-    normals_wp = wp.array(
-        np.ascontiguousarray(np.asarray(mesh_tm.vertex_normals)),
-        dtype=wp.vec3,
-        device=kernel_device,
-    )
+    points_wp = points_to_warp(vertices_np * 0.95, kernel_device)
+    normals_wp = points_to_warp(np.asarray(mesh_tm.vertex_normals), kernel_device)
     _centers_wp, radii_wp = tw.visibility.max_tangent_sphere(mesh_wp, points_wp, normals=normals_wp)
     # The inscribed tangent sphere of a unit sphere, from just inside it, is the sphere itself.
     assert np.allclose(radii_wp.numpy(), 0.95, rtol=0.1, atol=0.1)

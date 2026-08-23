@@ -20,8 +20,8 @@ import warp as wp
 import warp.sparse as wps
 
 import triwarp as tw
-
-_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
+from tests.conftest import MESHES
+from tests.conversions import points_to_warp, points_to_warp_uv
 
 
 def _solver_pp(mesh_tm: object) -> pp3d.MeshVectorHeatSolver:
@@ -48,7 +48,7 @@ def _to_world(tangent: np.ndarray, basis_x: np.ndarray, basis_y: np.ndarray) -> 
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("extend_scalar", "potpourri3d")
 def test_extend_scalar_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
@@ -139,7 +139,7 @@ def test_transport_on_a_flat_patch_is_constant(device: str) -> None:
         ],
         dtype=np.int32,
     )
-    vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
 
     transported, _ = tw.heat.vector.transport_tangent_vectors(
@@ -202,7 +202,7 @@ def test_transport_tangent_vectors_matches_potpourri3d(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(np.array([source], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device),
-        wp.array(vector, dtype=wp.vec2, device=mesh_wp.device),
+        points_to_warp_uv(vector, mesh_wp.device),
     )
     transported_pp = np.asarray(solver_pp.transport_tangent_vectors([source], vector_pp))
 
@@ -310,10 +310,7 @@ def test_transport_cancels_at_a_symmetric_cut_locus_point(
 
     def _directions(points_np: np.ndarray) -> np.ndarray:
         transported, _ = tw.heat.vector.transport_tangent_vectors(
-            wp.array(points_np, dtype=wp.vec3, device=mesh_wp.device),
-            mesh_wp.indices,
-            sources_wp,
-            vectors_wp,
+            points_to_warp(points_np, mesh_wp.device), mesh_wp.indices, sources_wp, vectors_wp
         )
         norm = np.linalg.norm(transported.numpy(), axis=1, keepdims=True)
         return transported.numpy() / np.where(norm > 0.0, norm, 1.0)
@@ -351,7 +348,7 @@ def test_transport_is_invariant_to_mesh_scale(
         mesh_wp.points, mesh_wp.indices, sources_wp, vectors_wp
     )
     rescaled, _ = tw.heat.vector.transport_tangent_vectors(
-        wp.array(mesh_wp.points.numpy() * scale, dtype=wp.vec3, device=mesh_wp.device),
+        points_to_warp(mesh_wp.points.numpy() * scale, mesh_wp.device),
         mesh_wp.indices,
         sources_wp,
         vectors_wp,
@@ -427,7 +424,7 @@ def test_transport_validity_mask_separates_the_cut_locus_from_the_unreached(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("mesh_name", MESHES)
 def test_log_map_radius_is_the_geodesic_distance(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:

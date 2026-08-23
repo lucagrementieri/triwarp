@@ -10,6 +10,7 @@ import open3d as o3d
 import pymeshlab as ml
 import pytest
 import pyvista as pv
+import shapely.geometry as sg
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -17,14 +18,13 @@ from scipy.spatial import cKDTree
 
 import triwarp as tw
 from tests.comparisons import euler_characteristic, open_edge_count
-from tests.conversions import meshlib_to_trimesh, open3d_to_trimesh
-
-
-def _mesh(vertices_wp: wp.array[wp.vec3], faces_wp: wp.array[wp.int32]) -> tm.Trimesh:
-    """Wrap a triwarp result as a `trimesh.Trimesh` for its measures, without reprocessing it."""
-    return tm.Trimesh(
-        vertices_wp.numpy().astype(np.float64), faces_wp.numpy().reshape(-1, 3), process=False
-    )
+from tests.conversions import (
+    meshlib_to_trimesh,
+    open3d_to_trimesh,
+    points_to_warp,
+    points_to_warp_uv,
+    warp_to_trimesh,
+)
 
 
 def _assert_same_faces(
@@ -65,8 +65,10 @@ def _assert_same_solid(
     """
     assert int(vertices_wp.shape[0]) == mesh_tm.vertices.shape[0]
     assert int(faces_wp.shape[0]) // 3 == mesh_tm.faces.shape[0]
-    assert np.isclose(_mesh(vertices_wp, faces_wp).volume, mesh_tm.volume, rtol=1e-4)
-    assert np.allclose(_mesh(vertices_wp, faces_wp).bounds, mesh_tm.bounds, rtol=1e-5, atol=1e-5)
+    assert np.isclose(warp_to_trimesh(vertices_wp, faces_wp).volume, mesh_tm.volume, rtol=1e-4)
+    assert np.allclose(
+        warp_to_trimesh(vertices_wp, faces_wp).bounds, mesh_tm.bounds, rtol=1e-5, atol=1e-5
+    )
 
 
 def _assert_closed(vertices_wp: wp.array[wp.vec3], faces_wp: wp.array[wp.int32]) -> None:
@@ -80,7 +82,7 @@ def _assert_closed(vertices_wp: wp.array[wp.vec3], faces_wp: wp.array[wp.int32])
     """
     assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False)
     assert tw.validation.is_winding_consistent(faces_wp)
-    assert _mesh(vertices_wp, faces_wp).volume > 0.0
+    assert warp_to_trimesh(vertices_wp, faces_wp).volume > 0.0
 
 
 def _assert_same_vertices_and_faces(
@@ -95,10 +97,6 @@ def _assert_same_vertices_and_faces(
     assert np.array_equal(
         mapped_np[np.lexsort(mapped_np.T[::-1])], reference_np[np.lexsort(reference_np.T[::-1])]
     )
-
-
-def _ring(points_np: np.ndarray, device: str) -> wp.array[wp.vec2]:
-    return wp.array(np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device)
 
 
 def _mat44(matrix_np: np.ndarray) -> wp.mat44:
@@ -225,7 +223,7 @@ def test_primitives_match_open3d(device: str) -> None:
         mesh_ref = open3d_to_trimesh(mesh_o3d)
         assert int(vertices_wp.shape[0]) == len(mesh_ref.vertices), name
         assert int(faces_wp.shape[0]) // 3 == len(mesh_ref.faces), name
-        mesh_wp = _mesh(vertices_wp, faces_wp)
+        mesh_wp = warp_to_trimesh(vertices_wp, faces_wp)
         assert np.isclose(mesh_wp.volume, mesh_ref.volume, rtol=1e-4), name
         assert np.isclose(mesh_wp.area, mesh_ref.area, rtol=1e-4), name
 
@@ -284,7 +282,7 @@ def test_primitives_match_meshlib(device: str) -> None:
         ),
     ):
         mesh_ref = meshlib_to_trimesh(mesh_ml)
-        mesh_wp = _mesh(vertices_wp, faces_wp)
+        mesh_wp = warp_to_trimesh(vertices_wp, faces_wp)
         assert mesh_ref.faces.shape[0] > 0, name  # non-vacuity: the reference built something
         assert int(vertices_wp.shape[0]) == mesh_ref.vertices.shape[0], name
         assert int(faces_wp.shape[0]) // 3 == mesh_ref.faces.shape[0], name
@@ -333,7 +331,7 @@ def test_uv_sphere_matches_meshlib(device: str, sections: int) -> None:
     assert int(vertices_wp.shape[0]) == len(mesh_ref.vertices)
     assert int(faces_wp.shape[0]) // 3 == len(mesh_ref.faces)
 
-    mesh_wp = _mesh(vertices_wp, faces_wp)
+    mesh_wp = warp_to_trimesh(vertices_wp, faces_wp)
     assert np.isclose(mesh_wp.area, mesh_ref.area, rtol=1e-6)
     assert np.isclose(mesh_wp.volume, mesh_ref.volume, rtol=1e-6)
 
@@ -359,11 +357,9 @@ def test_revolve_matches_meshlib(device: str) -> None:
     merely self-consistent.
     """
     profile_np = np.array([[0.5, 0.0], [0.5, 1.0], [0.3, 1.5], [0.0, 2.0]])
-    profile_wp = wp.array(
-        np.ascontiguousarray(profile_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
+    profile_wp = points_to_warp_uv(profile_np, device)
     vertices_wp, faces_wp = tw.creation.revolve(profile_wp, sections=16)
-    mesh_wp = _mesh(vertices_wp, faces_wp)
+    mesh_wp = warp_to_trimesh(vertices_wp, faces_wp)
 
     profile_ml = mm.std_vector_Vector2_float()
     for point_np in profile_np:
@@ -412,7 +408,7 @@ def test_uv_sphere_matches_open3d(device: str, sections: int) -> None:
     # Both inscribe the true sphere and converge on it; the tolerance tracks the tessellation.
     exact_volume = 4.0 / 3.0 * np.pi
     tolerance = {16: 0.03, 32: 0.01, 64: 0.005}[sections]
-    mesh_wp = _mesh(vertices_wp, faces_wp)
+    mesh_wp = warp_to_trimesh(vertices_wp, faces_wp)
     for volume in (mesh_wp.volume, mesh_ref.volume):
         assert volume < exact_volume
         assert abs(volume - exact_volume) / exact_volume < tolerance
@@ -497,7 +493,7 @@ def test_primitives_match_pymeshlab(device: str) -> None:
         mesh_pml = _pymeshlab_mesh(mesh_ref)
         if name == "cone":  # MeshLab centres the cone on the origin; triwarp bases it at z = 0.
             mesh_pml.vertices = mesh_pml.vertices + np.array([0.0, 0.0, 1.0])
-        mesh_wp = _mesh(vertices_wp, faces_wp)
+        mesh_wp = warp_to_trimesh(vertices_wp, faces_wp)
 
         assert int(vertices_wp.shape[0]) == mesh_pml.vertices.shape[0], name
         assert int(faces_wp.shape[0]) // 3 == mesh_pml.faces.shape[0], name
@@ -535,7 +531,9 @@ def test_box_bounds(device: str) -> None:
     bounds_np = np.array([[-1.0, 0.0, 2.0], [3.0, 1.0, 5.0]])
     vertices_wp, faces_wp = tw.creation.box(bounds=bounds_np, device=device)
     _assert_same_vertices_and_faces(vertices_wp, faces_wp, tm.creation.box(bounds=bounds_np))
-    assert np.allclose(_mesh(vertices_wp, faces_wp).bounds, bounds_np, rtol=1e-5, atol=1e-5)
+    assert np.allclose(
+        warp_to_trimesh(vertices_wp, faces_wp).bounds, bounds_np, rtol=1e-5, atol=1e-5
+    )
 
 
 def test_box_transform(device: str) -> None:
@@ -554,7 +552,7 @@ def test_box_mirror_transform_keeps_outward_winding(device: str) -> None:
         extents=(1.0, 2.0, 3.0), transform=_mat44(mirror_np), device=device
     )
     # A negative-determinant transform reverses winding, so the faces have to be flipped back.
-    assert _mesh(vertices_wp, faces_wp).volume > 0.0
+    assert warp_to_trimesh(vertices_wp, faces_wp).volume > 0.0
     assert tw.validation.is_volume(vertices_wp, faces_wp)
 
 
@@ -589,7 +587,7 @@ def test_icosahedron(device: str) -> None:
 
     vertices_igl, faces_igl = igl.icosahedron()
     mesh_igl = tm.Trimesh(vertices_igl, faces_igl, process=False)
-    mesh_wp = _mesh(vertices_wp, faces_wp)
+    mesh_wp = warp_to_trimesh(vertices_wp, faces_wp)
 
     assert vertices_igl.shape == (12, 3)
     assert faces_igl.shape == (20, 3)
@@ -664,7 +662,7 @@ def test_platonic_solids_match_open3d(device: str, builder: str, creator_name: s
     is why the parametrization stops at three where the pymeshlab test above has four.
     """
     vertices_wp, faces_wp = getattr(tw.creation, builder)(device=device)
-    mesh_wp = _mesh(vertices_wp, faces_wp)
+    mesh_wp = warp_to_trimesh(vertices_wp, faces_wp)
 
     mesh_o3d = getattr(o3d.geometry.TriangleMesh, creator_name)()
     vertices_o3d = np.asarray(mesh_o3d.vertices)
@@ -701,7 +699,7 @@ def test_grid(device: str, count: tuple[int, int]) -> None:
     assert int(vertices_wp.shape[0]) == count[0] * count[1]
     assert int(faces_wp.shape[0]) // 3 == 2 * (count[0] - 1) * (count[1] - 1)
 
-    mesh_tm = _mesh(vertices_wp, faces_wp)
+    mesh_tm = warp_to_trimesh(vertices_wp, faces_wp)
     assert np.allclose(mesh_tm.bounds, [[-1.0, -1.5, 0.0], [1.0, 1.5, 0.0]], rtol=1e-5, atol=1e-5)
     assert np.isclose(mesh_tm.area, 6.0, rtol=1e-5)
     # Flat, wound outward along +Z, and one boundary loop around the rim.
@@ -743,7 +741,7 @@ def test_grid_matches_igl(device: str) -> None:
 
     # The diagonals differ, so compare what both triangulations must satisfy.
     mesh_wp, mesh_igl = (
-        _mesh(vertices_wp, faces_wp),
+        warp_to_trimesh(vertices_wp, faces_wp),
         tm.Trimesh(padded_igl, faces_igl, process=False),
     )
     assert np.isclose(mesh_wp.area, 1.0, rtol=1e-5)
@@ -814,9 +812,9 @@ def test_sphere_cap(device: str, subdivisions: int) -> None:
 
     # Area of a spherical cap of half-angle ``angle``, approached from below by the inscribed mesh.
     exact_area = 2.0 * np.pi * radius**2 * (1.0 - np.cos(angle))
-    assert _mesh(vertices_wp, faces_wp).area <= exact_area * (1.0 + 1e-6)
+    assert warp_to_trimesh(vertices_wp, faces_wp).area <= exact_area * (1.0 + 1e-6)
     if subdivisions >= 3:
-        assert _mesh(vertices_wp, faces_wp).area > exact_area * 0.99
+        assert warp_to_trimesh(vertices_wp, faces_wp).area > exact_area * 0.99
 
 
 @pytest.mark.parity("sphere_cap", "pymeshlab")
@@ -884,7 +882,7 @@ def test_icosphere_radius(device: str) -> None:
     vertices_wp, faces_wp = tw.creation.icosphere(subdivisions=3, radius=2.5, device=device)
     assert np.allclose(np.linalg.norm(vertices_wp.numpy(), axis=1), 2.5, rtol=1e-5, atol=1e-5)
     exact_volume = 4.0 / 3.0 * np.pi * 2.5**3
-    assert abs(_mesh(vertices_wp, faces_wp).volume - exact_volume) / exact_volume < 0.01
+    assert abs(warp_to_trimesh(vertices_wp, faces_wp).volume - exact_volume) / exact_volume < 0.01
 
 
 # --- revolution primitives --------------------------------------------------------------
@@ -916,7 +914,9 @@ def test_capsule(device: str) -> None:
     mesh_tm = tm.creation.capsule(height=2.0, radius=0.5)
     _assert_same_faces(vertices_wp, faces_wp, mesh_tm)
     # Centered on the origin, spanning +-(height / 2 + radius) along Z.
-    assert np.allclose(_mesh(vertices_wp, faces_wp).bounds[:, 2], [-1.5, 1.5], rtol=1e-5, atol=1e-4)
+    assert np.allclose(
+        warp_to_trimesh(vertices_wp, faces_wp).bounds[:, 2], [-1.5, 1.5], rtol=1e-5, atol=1e-4
+    )
 
 
 @pytest.mark.parity("cylinder", "trimesh")
@@ -932,7 +932,7 @@ def test_cylinder(device: str) -> None:
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.cylinder(radius=1.0, height=2.0))
     # 32 sections truncate the circle, so the volume is the inscribed prism's, not pi * r^2 * h.
     inscribed = 0.5 * 32 * np.sin(2.0 * np.pi / 32) * 2.0
-    assert np.isclose(_mesh(vertices_wp, faces_wp).volume, inscribed, rtol=1e-4)
+    assert np.isclose(warp_to_trimesh(vertices_wp, faces_wp).volume, inscribed, rtol=1e-4)
 
 
 def test_cylinder_segment(device: str) -> None:
@@ -946,7 +946,9 @@ def test_cylinder_segment(device: str) -> None:
     vertices_wp, faces_wp = tw.creation.cylinder(radius=0.5, segment=segment_np, device=device)
     mesh_tm = tm.creation.cylinder(radius=0.5, segment=segment_np)
     _assert_same_faces(vertices_wp, faces_wp, mesh_tm)
-    assert np.allclose(_mesh(vertices_wp, faces_wp).bounds, mesh_tm.bounds, rtol=1e-5, atol=1e-5)
+    assert np.allclose(
+        warp_to_trimesh(vertices_wp, faces_wp).bounds, mesh_tm.bounds, rtol=1e-5, atol=1e-5
+    )
 
 
 def test_cylinder_requires_height_or_segment(device: str) -> None:
@@ -1013,7 +1015,7 @@ def test_torus(device: str) -> None:
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.torus(1.0, 0.25))
     assert int(faces_wp.shape[0]) // 3 == 2 * 32 * 32
     exact_volume = 2.0 * np.pi**2 * 1.0 * 0.25**2
-    assert abs(_mesh(vertices_wp, faces_wp).volume - exact_volume) / exact_volume < 0.02
+    assert abs(warp_to_trimesh(vertices_wp, faces_wp).volume - exact_volume) / exact_volume < 0.02
 
 
 _CLOSED_BUILDERS = {
@@ -1055,7 +1057,7 @@ def test_revolve_matches_trimesh(device: str) -> None:
     """
     profile_np = np.array([[0.25, 0.0], [1.0, 0.0], [1.0, 1.0], [0.25, 1.0], [0.25, 0.0]])
     _assert_same_faces(
-        *tw.creation.revolve(_ring(profile_np, device), sections=24),
+        *tw.creation.revolve(points_to_warp_uv(profile_np, device), sections=24),
         tm.creation.revolve(profile_np, sections=24),
     )
 
@@ -1064,7 +1066,7 @@ def test_revolve_matches_trimesh(device: str) -> None:
 def test_revolve_partial_revolution(device: str, cap: bool) -> None:
     profile_np = np.array([[0.5, 0.0], [1.0, 0.0], [1.0, 1.0], [0.5, 1.0], [0.5, 0.0]])
     vertices_wp, faces_wp = tw.creation.revolve(
-        _ring(profile_np, device), angle=np.pi, cap=cap, sections=16
+        points_to_warp_uv(profile_np, device), angle=np.pi, cap=cap, sections=16
     )
     mesh_tm = tm.creation.revolve(profile_np, angle=np.pi, cap=cap, sections=16)
     closed = tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False)
@@ -1080,9 +1082,9 @@ def test_revolve_partial_revolution(device: str, cap: bool) -> None:
 
 def test_revolve_invalid(device: str) -> None:
     with pytest.raises(ValueError, match="at least 2 points"):
-        tw.creation.revolve(_ring(np.zeros((1, 2)), device))
+        tw.creation.revolve(points_to_warp_uv(np.zeros((1, 2)), device))
     with pytest.raises(ValueError, match="sections must be at least 1"):
-        tw.creation.revolve(_ring(_SQUARE_RING, device), sections=0)
+        tw.creation.revolve(points_to_warp_uv(_SQUARE_RING, device), sections=0)
 
 
 def test_revolve_absolute_tolerance_is_scale_dependent(device: str) -> None:
@@ -1110,10 +1112,9 @@ def test_extrude_polygon(device: str, ring_name: str, height: float) -> None:
     orientation rather than the face table -- an L-shaped ring admits several valid cap
     triangulations, so equality is not available.
     """
-    shapely = pytest.importorskip("shapely.geometry")
     ring_np = _SQUARE_RING if ring_name == "square" else _L_RING
-    vertices_wp, faces_wp = tw.creation.extrude_polygon(_ring(ring_np, device), height)
-    mesh_tm = tm.creation.extrude_polygon(shapely.Polygon(ring_np), height)
+    vertices_wp, faces_wp = tw.creation.extrude_polygon(points_to_warp_uv(ring_np, device), height)
+    mesh_tm = tm.creation.extrude_polygon(sg.Polygon(ring_np), height)
     assert int(vertices_wp.shape[0]) == 2 * ring_np.shape[0]
     # Both signs of height must give an outward-facing solid of the same volume.
     _assert_same_solid(vertices_wp, faces_wp, mesh_tm)
@@ -1122,24 +1123,24 @@ def test_extrude_polygon(device: str, ring_name: str, height: float) -> None:
 
 def test_extrude_polygon_mid_plane(device: str) -> None:
     vertices_wp, faces_wp = tw.creation.extrude_polygon(
-        _ring(_SQUARE_RING, device), 1.0, mid_plane=True
+        points_to_warp_uv(_SQUARE_RING, device), 1.0, mid_plane=True
     )
-    assert np.allclose(_mesh(vertices_wp, faces_wp).bounds[:, 2], [-0.5, 0.5], atol=1e-5)
+    assert np.allclose(warp_to_trimesh(vertices_wp, faces_wp).bounds[:, 2], [-0.5, 0.5], atol=1e-5)
 
 
 def test_extrude_triangulation_recovers_subdivided_boundary(device: str) -> None:
     # A boundary edge split by an extra collinear vertex still has to become two wall quads, which
     # is why the boundary is recovered from the triangulation rather than taken from the input ring.
     ring_np = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]])
-    vertices_wp, faces_wp = tw.polyline.triangulate_polygon(_ring(ring_np, device))
+    vertices_wp, faces_wp = tw.polyline.triangulate_polygon(points_to_warp_uv(ring_np, device))
     solid_v, solid_f = tw.creation.extrude_triangulation(vertices_wp, faces_wp, 0.5)
     _assert_closed(solid_v, solid_f)
     assert int(solid_f.shape[0]) // 3 == 2 * 3 + 2 * 5
-    assert np.isclose(_mesh(solid_v, solid_f).volume, 1.0, rtol=1e-4)
+    assert np.isclose(warp_to_trimesh(solid_v, solid_f).volume, 1.0, rtol=1e-4)
 
 
 def test_extrude_triangulation_invalid(device: str) -> None:
-    ring_wp, faces_wp = tw.polyline.triangulate_polygon(_ring(_SQUARE_RING, device))
+    ring_wp, faces_wp = tw.polyline.triangulate_polygon(points_to_warp_uv(_SQUARE_RING, device))
     with pytest.raises(ValueError, match="height must be nonzero"):
         tw.creation.extrude_triangulation(ring_wp, faces_wp, 0.0)
     with pytest.raises(ValueError, match="multiple of 3"):
@@ -1170,30 +1171,28 @@ def test_sweep_polygon(device: str, path_name: str) -> None:
     the same solid, so the volume and the closure are what compare; the profile is square,
     which makes a twist difference invisible in the volume by construction.
     """
-    shapely = pytest.importorskip("shapely.geometry")
     ring_np = np.array([[-0.25, -0.25], [0.25, -0.25], [0.25, 0.25], [-0.25, 0.25]])
     path_np = _SWEEP_PATHS[path_name]
     vertices_wp, faces_wp = tw.creation.sweep_polygon(
-        _ring(ring_np, device), wp.array(path_np.astype(np.float32), dtype=wp.vec3, device=device)
+        points_to_warp_uv(ring_np, device), points_to_warp(path_np, device)
     )
-    mesh_tm = tm.creation.sweep_polygon(shapely.Polygon(ring_np), path_np)
+    mesh_tm = tm.creation.sweep_polygon(sg.Polygon(ring_np), path_np)
     _assert_same_solid(vertices_wp, faces_wp, mesh_tm)
     _assert_closed(vertices_wp, faces_wp)
-    assert _mesh(vertices_wp, faces_wp).body_count == 1
+    assert warp_to_trimesh(vertices_wp, faces_wp).body_count == 1
 
 
 def test_sweep_polygon_angles_roll_the_profile(device: str) -> None:
-    shapely = pytest.importorskip("shapely.geometry")
     ring_np = np.array([[-0.5, -0.1], [0.5, -0.1], [0.5, 0.1], [-0.5, 0.1]])
     # A quarter turn spread over four segments. Concentrating the same twist in a single segment
     # sweeps the profile through itself, and both libraries then report a negative volume for the
     # self-intersecting result — so the roll is kept gentle enough for the solid to stay valid.
     path_np = np.column_stack((np.zeros(5), np.zeros(5), np.linspace(0.0, 1.0, 5)))
-    path_wp = wp.array(path_np.astype(np.float32), dtype=wp.vec3, device=device)
+    path_wp = points_to_warp(path_np, device)
     angles_np = np.linspace(0.0, np.pi / 2.0, 5)
-    straight_v, _ = tw.creation.sweep_polygon(_ring(ring_np, device), path_wp)
+    straight_v, _ = tw.creation.sweep_polygon(points_to_warp_uv(ring_np, device), path_wp)
     twisted_v, twisted_f = tw.creation.sweep_polygon(
-        _ring(ring_np, device),
+        points_to_warp_uv(ring_np, device),
         path_wp,
         angles=wp.array(angles_np.astype(np.float32), device=device),
     )
@@ -1202,24 +1201,24 @@ def test_sweep_polygon_angles_roll_the_profile(device: str) -> None:
     _assert_same_solid(
         twisted_v,
         twisted_f,
-        tm.creation.sweep_polygon(shapely.Polygon(ring_np), path_np, angles=angles_np),
+        tm.creation.sweep_polygon(sg.Polygon(ring_np), path_np, angles=angles_np),
     )
 
 
 def test_sweep_polygon_open_path_without_caps(device: str) -> None:
     ring_np = np.array([[-0.25, -0.25], [0.25, -0.25], [0.25, 0.25], [-0.25, 0.25]])
-    path_wp = wp.array(_SWEEP_PATHS["straight"].astype(np.float32), dtype=wp.vec3, device=device)
-    _, faces_wp = tw.creation.sweep_polygon(_ring(ring_np, device), path_wp, cap=False)
+    path_wp = points_to_warp(_SWEEP_PATHS["straight"], device)
+    _, faces_wp = tw.creation.sweep_polygon(points_to_warp_uv(ring_np, device), path_wp, cap=False)
     assert not tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False)
     assert int(faces_wp.shape[0]) // 3 == 2 * 2 * 4
 
 
 def test_sweep_polygon_invalid(device: str) -> None:
-    ring_wp = _ring(_SQUARE_RING, device)
+    ring_wp = points_to_warp_uv(_SQUARE_RING, device)
     single_wp = wp.array(np.zeros((1, 3), dtype=np.float32), dtype=wp.vec3, device=device)
     with pytest.raises(ValueError, match="at least 2 points"):
         tw.creation.sweep_polygon(ring_wp, single_wp)
-    path_wp = wp.array(_SWEEP_PATHS["straight"].astype(np.float32), dtype=wp.vec3, device=device)
+    path_wp = points_to_warp(_SWEEP_PATHS["straight"], device)
     with pytest.raises(ValueError, match="one entry per path point"):
         tw.creation.sweep_polygon(
             ring_wp, path_wp, angles=wp.zeros(2, dtype=wp.float32, device=device)
@@ -1231,11 +1230,7 @@ def test_sweep_polygon_invalid(device: str) -> None:
 
 def _triangle_soup(device: str, seed: int = 7) -> tuple[np.ndarray, wp.array, wp.array]:
     triangles_np = np.random.default_rng(seed).random((5, 3, 3)) + np.array([0.0, 0.0, 1.0])
-    vertices_wp = wp.array(
-        np.ascontiguousarray(triangles_np.reshape(-1, 3), dtype=np.float32),
-        dtype=wp.vec3,
-        device=device,
-    )
+    vertices_wp = points_to_warp(triangles_np.reshape(-1, 3), device)
     faces_wp = wp.array(np.arange(15, dtype=np.int32), dtype=wp.int32, device=device)
     return triangles_np, vertices_wp, faces_wp
 
@@ -1254,8 +1249,8 @@ def test_truncated_prisms(device: str) -> None:
     mesh_tm = tm.creation.truncated_prisms(triangles_np)
     assert int(prism_v.shape[0]) == 6 * 5
     assert int(prism_f.shape[0]) // 3 == 8 * 5
-    assert np.isclose(_mesh(prism_v, prism_f).volume, mesh_tm.volume, rtol=1e-4)
-    assert _mesh(prism_v, prism_f).body_count == 5
+    assert np.isclose(warp_to_trimesh(prism_v, prism_f).volume, mesh_tm.volume, rtol=1e-4)
+    assert warp_to_trimesh(prism_v, prism_f).body_count == 5
 
 
 def test_truncated_prisms_plane(device: str) -> None:
@@ -1274,7 +1269,7 @@ def test_truncated_prisms_plane(device: str) -> None:
         normal=wp.vec3(*normal_np.tolist()),
     )
     mesh_tm = tm.creation.truncated_prisms(triangles_np, origin=origin_np, normal=normal_np)
-    assert np.isclose(_mesh(prism_v, prism_f).volume, mesh_tm.volume, rtol=1e-4)
+    assert np.isclose(warp_to_trimesh(prism_v, prism_f).volume, mesh_tm.volume, rtol=1e-4)
 
 
 def test_truncated_prisms_reversed_winding(device: str) -> None:
@@ -1282,15 +1277,13 @@ def test_truncated_prisms_reversed_winding(device: str) -> None:
     # inside-out with negative volume.
     triangles_np, _, faces_wp = _triangle_soup(device)
     flipped_np = np.ascontiguousarray(triangles_np[:, ::-1, :])
-    vertices_wp = wp.array(
-        np.ascontiguousarray(flipped_np.reshape(-1, 3), dtype=np.float32),
-        dtype=wp.vec3,
-        device=device,
-    )
+    vertices_wp = points_to_warp(flipped_np.reshape(-1, 3), device)
     prism_v, prism_f = tw.creation.truncated_prisms(vertices_wp, faces_wp)
-    assert _mesh(prism_v, prism_f).volume > 0.0
+    assert warp_to_trimesh(prism_v, prism_f).volume > 0.0
     assert np.isclose(
-        _mesh(prism_v, prism_f).volume, tm.creation.truncated_prisms(flipped_np).volume, rtol=1e-4
+        warp_to_trimesh(prism_v, prism_f).volume,
+        tm.creation.truncated_prisms(flipped_np).volume,
+        rtol=1e-4,
     )
 
 
@@ -1307,8 +1300,10 @@ def test_axis(device: str) -> None:
     assert int(vertices_wp.shape[0]) == int(ball_v.shape[0]) + 3 * int(shaft_v.shape[0])
     assert int(faces_wp.shape[0]) == int(ball_f.shape[0]) + 3 * int(shaft_f.shape[0])
     # One shaft runs out to axis_length along each of X, Y and Z.
-    assert np.allclose(_mesh(vertices_wp, faces_wp).bounds[1], 0.4, rtol=1e-3, atol=1e-3)
-    assert np.allclose(_mesh(vertices_wp, faces_wp).bounds[0], -0.04, rtol=1e-3, atol=1e-3)
+    assert np.allclose(warp_to_trimesh(vertices_wp, faces_wp).bounds[1], 0.4, rtol=1e-3, atol=1e-3)
+    assert np.allclose(
+        warp_to_trimesh(vertices_wp, faces_wp).bounds[0], -0.04, rtol=1e-3, atol=1e-3
+    )
 
 
 def test_axis_transform(device: str) -> None:
@@ -1388,7 +1383,7 @@ def test_parametric_surface_topology(device: str, surface: str) -> None:
     """
     vertices_wp, faces_wp = _build_parametric(surface, 40, device)
     faces_np = faces_wp.numpy().reshape(-1, 3)
-    mesh_tm = _mesh(vertices_wp, faces_wp)
+    mesh_tm = warp_to_trimesh(vertices_wp, faces_wp)
     expected = _PARAMETRIC_TABLE[surface]
 
     mesh_o3d = o3d.geometry.TriangleMesh(

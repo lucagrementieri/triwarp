@@ -20,18 +20,18 @@ from tests.comparisons import (
     lexsort_rows,
     trimesh_outline_loops,
 )
+from tests.conftest import OPEN_MESHES
 from tests.conversions import (
-    numpy_to_pymeshfix,
+    points_to_warp,
     pyvista_edges_to_indices,
     trimesh_to_meshlib,
+    trimesh_to_pymeshfix,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
 )
 
+
 # Open-surface fixtures that actually have a boundary (watertight solids do not).
-OPEN_MESHES = ["hemisphere", "half_torus"]
-
-
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 @pytest.mark.parity("boundary_edges", "trimesh")
 def test_boundary_edges(request: pytest.FixtureRequest, mesh_name: str) -> None:
@@ -289,7 +289,7 @@ def test_boundary_loops_count_matches_pymeshfix(
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
-    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    tin_pmf = trimesh_to_pymeshfix(mesh_tm)
     loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
 
     assert tin_pmf.n_points == mesh_tm.vertices.shape[0]  # the loader left the mesh alone
@@ -790,10 +790,8 @@ def test_loop_measures_agree_with_the_single_loop_forms(
         direction_np = areas_np[index] / np.linalg.norm(areas_np[index])
         assert np.allclose(direction_np, np.array(list(normal_wp)), rtol=1e-4, atol=1e-4)
 
-    shifted_wp = wp.array(
-        vertices_wp.numpy() + np.array([3.0, -7.0, 11.0], dtype=np.float32),
-        dtype=wp.vec3,
-        device=vertices_wp.device,
+    shifted_wp = points_to_warp(
+        vertices_wp.numpy() + np.array([3.0, -7.0, 11.0], dtype=np.float32), vertices_wp.device
     )
     assert np.allclose(
         tw.boundary.loop_directed_areas(shifted_wp, loops_wp).numpy(),

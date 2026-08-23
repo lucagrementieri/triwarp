@@ -7,7 +7,7 @@ import scipy.sparse
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import mesh_igl, numpy_to_warp_uv
+from tests.conversions import mesh_igl, numpy_to_warp_uv, points_to_warp_uv
 
 
 def _face_flipped_indices_np(vertices_np: np.ndarray, faces_np: np.ndarray) -> np.ndarray:
@@ -212,6 +212,33 @@ def test_biharmonic_is_deterministic(device, hemisphere):
         assert np.allclose(again, first, rtol=1e-5, atol=1e-5)
 
 
+def test_harmonic_cpu_matches_cuda():
+    """Class A: the CPU interior solve is the CUDA one (two-triangle quad, three pinned corners)."""
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to compare them")
+
+    uv = {}
+    for device in ("cpu", "cuda:0"):
+        vertices = wp.array(
+            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
+            dtype=wp.vec3,
+            device=device,
+        )
+        faces = wp.array(
+            np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device=device
+        )
+        boundary = wp.array(np.array([0, 1, 3], dtype=np.int32), dtype=wp.int32, device=device)
+        boundary_uv = wp.array(
+            np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32),
+            dtype=wp.vec2,
+            device=device,
+        )
+        uv[device] = tw.parametrization.harmonic(vertices, faces, boundary, boundary_uv).numpy()
+
+    assert np.isfinite(uv["cpu"]).all()
+    assert np.allclose(uv["cpu"], uv["cuda:0"], rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 def test_tutte_matches_igl_reference(request, device, mesh_name):
     """
@@ -257,147 +284,6 @@ def test_tutte_disk_is_fold_free(device, hemisphere):
     boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
     uv_wp = tw.parametrization.tutte(mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp)
     assert tw.parametrization.face_flipped_indices(uv_wp, mesh_wp.indices).numpy().size == 0
-
-
-@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
-@pytest.mark.parity("lscm", "igl")
-def test_lscm_matches_igl(request, device, mesh_name):
-    """
-    Class A against ``igl.lscm`` with the same two pins, the libigl tutorial-502 convention.
-
-    LSCM is defined only up to the pins, so pinning both sides identically is what makes an
-    elementwise comparison meaningful at all -- with a free gauge there would be nothing to compare.
-    """
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np, faces_np = mesh_igl(mesh_tm)
-
-    # Pin two boundary vertices to (0, 0) and (1, 0), the libigl tutorial-502 convention.
-    loop_np = tw.boundary.longest_boundary_loop(mesh_wp.points, mesh_wp.indices).numpy()
-    pins_np = np.array([loop_np[0], loop_np[len(loop_np) // 2]], dtype=np.int32)
-    pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
-    pins_wp = wp.array(pins_np, dtype=wp.int32, device=mesh_wp.device)
-    pins_uv_wp = wp.array(pins_uv_np, dtype=wp.vec2, device=mesh_wp.device)
-
-    uv_wp = tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
-    uv_igl, _ = igl.lscm(
-        vertices_np, faces_np, pins_np.astype(np.int64), pins_uv_np.astype(np.float64)
-    )
-
-    assert np.allclose(uv_wp.numpy(), uv_igl, rtol=1e-4, atol=1e-4)
-
-
-def test_lscm_closed_mesh_matches_igl(device, icosahedron):
-    """
-    Class A on the degenerate closed-mesh branch, where the area term vanishes.
-
-    With no boundary, ``A = 0`` and the system reduces to ``-repdiag(L, 2)``; igl accepts that
-    input, so the branch has a real oracle rather than only an invariant. It is its own test
-    because the boundary fixtures never exercise it.
-    """
-    # Closed mesh: A = 0, Q = -repdiag(L, 2). igl.lscm accepts closed input.
-    mesh_tm, mesh_wp = icosahedron
-    vertices_np, faces_np = mesh_igl(mesh_tm)
-
-    pins_np = np.array([0, 7], dtype=np.int32)
-    pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
-    pins_wp = wp.array(pins_np, dtype=wp.int32, device=mesh_wp.device)
-    pins_uv_wp = wp.array(pins_uv_np, dtype=wp.vec2, device=mesh_wp.device)
-
-    uv_wp = tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
-    uv_igl, _ = igl.lscm(
-        vertices_np, faces_np, pins_np.astype(np.int64), pins_uv_np.astype(np.float64)
-    )
-
-    assert np.allclose(uv_wp.numpy(), uv_igl, rtol=1e-4, atol=1e-4)
-
-
-def test_lscm_is_fold_free(device, hemisphere):
-    # LSCM of a disk-topology open surface with two pins is conformal and fold-free.
-    _, mesh_wp = hemisphere
-    loop_np = tw.boundary.longest_boundary_loop(mesh_wp.points, mesh_wp.indices).numpy()
-    pins_wp = wp.array(
-        np.array([loop_np[0], loop_np[len(loop_np) // 2]], dtype=np.int32),
-        dtype=wp.int32,
-        device=mesh_wp.device,
-    )
-    pins_uv_wp = wp.array(
-        np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
-    )
-    uv_wp = tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
-    assert tw.parametrization.face_flipped_indices(uv_wp, mesh_wp.indices).numpy().size == 0
-
-
-@pytest.mark.parametrize("n_pins", [0, 1])
-def test_lscm_too_few_pins_raises(device, hemisphere, n_pins):
-    # Fewer than two pins leaves the similarity-transform null space; raised pre-solve (CPU-safe).
-    _, mesh_wp = hemisphere
-    pins_wp = wp.array(np.arange(n_pins, dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
-    pins_uv_wp = wp.array(
-        np.zeros((n_pins, 2), dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
-    )
-    with pytest.raises(ValueError, match="at least two pinned vertices"):
-        tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
-
-
-def test_lscm_cpu_matches_cuda():
-    """Class A: the CPU free-vertex solve is the CUDA one (two-triangle quad, two pins)."""
-    if not wp.is_cuda_available():
-        pytest.skip("needs both devices to compare them")
-
-    uv = {}
-    for device in ("cpu", "cuda:0"):
-        vertices = wp.array(
-            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
-            dtype=wp.vec3,
-            device=device,
-        )
-        faces = wp.array(
-            np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device=device
-        )
-        pins = wp.array(np.array([0, 3], dtype=np.int32), dtype=wp.int32, device=device)
-        pins_uv = wp.array(
-            np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32), dtype=wp.vec2, device=device
-        )
-        uv[device] = tw.parametrization.lscm(vertices, faces, pins, pins_uv).numpy()
-
-    assert np.isfinite(uv["cpu"]).all()
-    assert np.allclose(uv["cpu"], uv["cuda:0"], rtol=1e-5, atol=1e-5)
-
-
-def test_lscm_empty_mesh(device):
-    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    pins_wp = wp.empty(0, dtype=wp.int32, device=device)
-    pins_uv_wp = wp.empty(0, dtype=wp.vec2, device=device)
-    uv_wp = tw.parametrization.lscm(vertices_wp, faces_wp, pins_wp, pins_uv_wp)
-    assert uv_wp.numpy().size == 0
-
-
-def test_harmonic_cpu_matches_cuda():
-    """Class A: the CPU interior solve is the CUDA one (two-triangle quad, three pinned corners)."""
-    if not wp.is_cuda_available():
-        pytest.skip("needs both devices to compare them")
-
-    uv = {}
-    for device in ("cpu", "cuda:0"):
-        vertices = wp.array(
-            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
-            dtype=wp.vec3,
-            device=device,
-        )
-        faces = wp.array(
-            np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device=device
-        )
-        boundary = wp.array(np.array([0, 1, 3], dtype=np.int32), dtype=wp.int32, device=device)
-        boundary_uv = wp.array(
-            np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32),
-            dtype=wp.vec2,
-            device=device,
-        )
-        uv[device] = tw.parametrization.harmonic(vertices, faces, boundary, boundary_uv).numpy()
-
-    assert np.isfinite(uv["cpu"]).all()
-    assert np.allclose(uv["cpu"], uv["cuda:0"], rtol=1e-5, atol=1e-5)
 
 
 def _arap_igl(vertices_np, faces_np, fixed_np, fixed_uv_np, uv_init_np, max_iterations):
@@ -463,7 +349,7 @@ def test_arap_free_boundary_matches_igl(device, hemisphere):
     fixed_np = np.array([loop_np[0], loop_np[len(loop_np) // 2]], dtype=np.int32)
     fixed_uv_np = uv_init_np[fixed_np]
     fixed_wp = wp.array(fixed_np, dtype=wp.int32, device=mesh_wp.device)
-    fixed_uv_wp = wp.array(fixed_uv_np.astype(np.float32), dtype=wp.vec2, device=mesh_wp.device)
+    fixed_uv_wp = points_to_warp_uv(fixed_uv_np, mesh_wp.device)
 
     uv_wp = tw.parametrization.arap(
         mesh_wp.points, mesh_wp.indices, fixed_wp, fixed_uv_wp, uv_init_wp, max_iterations=4
@@ -536,7 +422,7 @@ def test_arap_all_vertices_fixed(device, hemisphere):
     fixed_uv_np = rng.standard_normal((n_vertices, 2)).astype(np.float32)
     all_indices_np = np.arange(n_vertices, dtype=np.int32)
     fixed_wp = wp.array(all_indices_np, dtype=wp.int32, device=mesh_wp.device)
-    fixed_uv_wp = wp.array(fixed_uv_np, dtype=wp.vec2, device=mesh_wp.device)
+    fixed_uv_wp = points_to_warp_uv(fixed_uv_np, mesh_wp.device)
     uv_init_wp = wp.zeros(n_vertices, dtype=wp.vec2, device=mesh_wp.device)
 
     uv_wp = tw.parametrization.arap(
@@ -612,4 +498,118 @@ def test_arap_empty_mesh(device):
     fixed_uv_wp = wp.empty(0, dtype=wp.vec2, device=device)
     uv_init_wp = wp.empty(0, dtype=wp.vec2, device=device)
     uv_wp = tw.parametrization.arap(vertices_wp, faces_wp, fixed_wp, fixed_uv_wp, uv_init_wp)
+    assert uv_wp.numpy().size == 0
+
+
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+@pytest.mark.parity("lscm", "igl")
+def test_lscm_matches_igl(request, device, mesh_name):
+    """
+    Class A against ``igl.lscm`` with the same two pins, the libigl tutorial-502 convention.
+
+    LSCM is defined only up to the pins, so pinning both sides identically is what makes an
+    elementwise comparison meaningful at all -- with a free gauge there would be nothing to compare.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np, faces_np = mesh_igl(mesh_tm)
+
+    # Pin two boundary vertices to (0, 0) and (1, 0), the libigl tutorial-502 convention.
+    loop_np = tw.boundary.longest_boundary_loop(mesh_wp.points, mesh_wp.indices).numpy()
+    pins_np = np.array([loop_np[0], loop_np[len(loop_np) // 2]], dtype=np.int32)
+    pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+    pins_wp = wp.array(pins_np, dtype=wp.int32, device=mesh_wp.device)
+    pins_uv_wp = points_to_warp_uv(pins_uv_np, mesh_wp.device)
+
+    uv_wp = tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
+    uv_igl, _ = igl.lscm(
+        vertices_np, faces_np, pins_np.astype(np.int64), pins_uv_np.astype(np.float64)
+    )
+
+    assert np.allclose(uv_wp.numpy(), uv_igl, rtol=1e-4, atol=1e-4)
+
+
+def test_lscm_closed_mesh_matches_igl(device, icosahedron):
+    """
+    Class A on the degenerate closed-mesh branch, where the area term vanishes.
+
+    With no boundary, ``A = 0`` and the system reduces to ``-repdiag(L, 2)``; igl accepts that
+    input, so the branch has a real oracle rather than only an invariant. It is its own test
+    because the boundary fixtures never exercise it.
+    """
+    # Closed mesh: A = 0, Q = -repdiag(L, 2). igl.lscm accepts closed input.
+    mesh_tm, mesh_wp = icosahedron
+    vertices_np, faces_np = mesh_igl(mesh_tm)
+
+    pins_np = np.array([0, 7], dtype=np.int32)
+    pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+    pins_wp = wp.array(pins_np, dtype=wp.int32, device=mesh_wp.device)
+    pins_uv_wp = points_to_warp_uv(pins_uv_np, mesh_wp.device)
+
+    uv_wp = tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
+    uv_igl, _ = igl.lscm(
+        vertices_np, faces_np, pins_np.astype(np.int64), pins_uv_np.astype(np.float64)
+    )
+
+    assert np.allclose(uv_wp.numpy(), uv_igl, rtol=1e-4, atol=1e-4)
+
+
+def test_lscm_is_fold_free(device, hemisphere):
+    # LSCM of a disk-topology open surface with two pins is conformal and fold-free.
+    _, mesh_wp = hemisphere
+    loop_np = tw.boundary.longest_boundary_loop(mesh_wp.points, mesh_wp.indices).numpy()
+    pins_wp = wp.array(
+        np.array([loop_np[0], loop_np[len(loop_np) // 2]], dtype=np.int32),
+        dtype=wp.int32,
+        device=mesh_wp.device,
+    )
+    pins_uv_wp = wp.array(
+        np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
+    )
+    uv_wp = tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
+    assert tw.parametrization.face_flipped_indices(uv_wp, mesh_wp.indices).numpy().size == 0
+
+
+@pytest.mark.parametrize("n_pins", [0, 1])
+def test_lscm_too_few_pins_raises(device, hemisphere, n_pins):
+    # Fewer than two pins leaves the similarity-transform null space; raised pre-solve (CPU-safe).
+    _, mesh_wp = hemisphere
+    pins_wp = wp.array(np.arange(n_pins, dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
+    pins_uv_wp = wp.array(
+        np.zeros((n_pins, 2), dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
+    )
+    with pytest.raises(ValueError, match="at least two pinned vertices"):
+        tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
+
+
+def test_lscm_cpu_matches_cuda():
+    """Class A: the CPU free-vertex solve is the CUDA one (two-triangle quad, two pins)."""
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to compare them")
+
+    uv = {}
+    for device in ("cpu", "cuda:0"):
+        vertices = wp.array(
+            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
+            dtype=wp.vec3,
+            device=device,
+        )
+        faces = wp.array(
+            np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device=device
+        )
+        pins = wp.array(np.array([0, 3], dtype=np.int32), dtype=wp.int32, device=device)
+        pins_uv = wp.array(
+            np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32), dtype=wp.vec2, device=device
+        )
+        uv[device] = tw.parametrization.lscm(vertices, faces, pins, pins_uv).numpy()
+
+    assert np.isfinite(uv["cpu"]).all()
+    assert np.allclose(uv["cpu"], uv["cuda:0"], rtol=1e-5, atol=1e-5)
+
+
+def test_lscm_empty_mesh(device):
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    pins_wp = wp.empty(0, dtype=wp.int32, device=device)
+    pins_uv_wp = wp.empty(0, dtype=wp.vec2, device=device)
+    uv_wp = tw.parametrization.lscm(vertices_wp, faces_wp, pins_wp, pins_uv_wp)
     assert uv_wp.numpy().size == 0

@@ -176,6 +176,23 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         )
 
 
+# The fixture sets tests parametrize over, shared because they are a decision about *coverage* and
+# not a local convenience: "the four that span closed/open and convex/non-convex" was restated in
+# ten separate test files under three different names (``_MESHES``, ``_MESH_FIXTURES``,
+# ``_LOOP_FIXTURES``), plus ``OPEN_MESHES`` in five and ``CLOSED_MESHES`` in four, which meant a
+# fixture added to the set reached exactly one file. Import them as
+# ``from tests.conftest import MESHES``; keep a local list only where it is genuinely a different
+# set, and say in a comment why.
+CLOSED_MESHES = ["icosahedron", "cave_cube"]
+"""Watertight, and one convex and one not -- ``cave_cube`` is a hollow non-convex shell."""
+
+OPEN_MESHES = ["hemisphere", "half_torus"]
+"""Curved with a boundary: one rim on ``hemisphere``, two on ``half_torus``."""
+
+MESHES = CLOSED_MESHES + OPEN_MESHES
+"""The default four-fixture sweep: closed and open, convex and not, in that order."""
+
+
 @pytest.fixture
 def device(request: pytest.FixtureRequest) -> str:
     """
@@ -223,7 +240,17 @@ def icosphere(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     it itself, and several of the callers this replaced depend on the sphere being centred.
 
     Function-scoped like every fixture here, so mutating ``mesh_tm.vertices`` in a test is safe --
-    see the note on session scoping in ``plans/better-tests.md`` for why it stays that way.
+    see the note on session scoping in ``plans/better-tests.md`` for why it stays that way. Session
+    scoping was re-measured and declined: this fixture costs **1.15 ms** (0.97 ms of trimesh build
+    plus 0.18 ms of ``wp.Mesh``), so all of the suite's fixture construction is ~3 s of a 67 s run.
+
+    **The 41 remaining inline ``tm.creation.icosphere`` sites are not migration debt**, which was
+    checked rather than assumed: a classifier over all of them found **0** a fixture could take
+    over. Every one either deforms the mesh (scales an axis, punches a hole, translates a copy),
+    builds two or three of them, sits inside a private builder that has no fixture access, or pins
+    ``trimesh_to_warp(mesh_tm, "cpu")`` deliberately because its reference has no device axis. So
+    a call to ``tm.creation.icosphere`` in a test is not by itself a defect -- check what the test
+    does with it before proposing the fixture.
 
     See Also
     --------

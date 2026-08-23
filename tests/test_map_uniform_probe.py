@@ -24,6 +24,7 @@ import numpy as np
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import points_to_warp
 
 
 @wp.func
@@ -48,7 +49,7 @@ def _classify(count: wp.int32) -> wp.int32:
 
 def test_map_accepts_a_float_scalar_uniform(device: str) -> None:
     """The documented baseline: a plain float scalar mixed with an array input."""
-    points_wp = wp.array(np.arange(9, dtype=np.float32).reshape(3, 3), dtype=wp.vec3, device=device)
+    points_wp = points_to_warp(np.arange(9, dtype=np.float32).reshape(3, 3), device)
     out_wp = wp.empty(3, dtype=wp.vec3, device=device)
     wp.map(_scale_by, points_wp, wp.float32(2.0), out=out_wp)
     assert np.allclose(out_wp.numpy(), np.arange(9, dtype=np.float32).reshape(3, 3) * 2.0)
@@ -70,7 +71,7 @@ def test_map_accepts_a_uint64_mesh_id_and_queries_inside_the_func(
     device = mesh_wp.device
     # Push every vertex outward, then snap back: the result must return to the surface.
     original_np = mesh_wp.points.numpy()
-    pushed_wp = wp.array(original_np * 1.10, dtype=wp.vec3, device=device)
+    pushed_wp = points_to_warp(original_np * 1.1, device)
     snapped_wp = wp.empty(int(pushed_wp.shape[0]), dtype=wp.vec3, device=device)
 
     wp.map(_snap_to_mesh, pushed_wp, wp.uint64(mesh_wp.id), wp.float32(1.0), out=snapped_wp)

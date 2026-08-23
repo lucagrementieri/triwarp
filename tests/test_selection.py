@@ -17,10 +17,338 @@ from tests.conversions import (
     meshlib_bitset_to_numpy,
     numpy_to_meshlib,
     numpy_to_meshlib_bitset,
+    points_to_warp,
     pyvista_edges_to_indices,
     trimesh_to_meshlib,
     trimesh_to_pymeshlab,
 )
+
+
+def _grid_mesh(n: int = 5):
+    xs, ys = np.meshgrid(np.arange(float(n)), np.arange(float(n)))
+    vertices = np.stack([xs.ravel(), ys.ravel(), np.zeros(n * n)], axis=1).astype(np.float64)
+    faces = []
+    for r in range(n - 1):
+        for c in range(n - 1):
+            a = r * n + c
+            faces += [a, a + 1, a + n + 1, a, a + n + 1, a + n]
+    return vertices, np.array(faces, dtype=np.int32)
+
+
+def _graph_distance(faces_np: np.ndarray, n: int, seed: np.ndarray) -> np.ndarray:
+    """BFS graph distance from the seed set over the undirected mesh edges (NumPy oracle)."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
+
+    edges = undirected_edges(faces_np.reshape(-1, 3))
+    rows = np.concatenate([edges[:, 0], edges[:, 1]])
+    cols = np.concatenate([edges[:, 1], edges[:, 0]])
+    graph = csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
+    return dijkstra(graph, indices=np.flatnonzero(seed), unweighted=True).min(axis=0)
+
+
+@pytest.mark.parity("region_boundary_edges", "meshlib")
+def test_region_boundary_edges(device: str):
+    """
+    Class A against the function this one ports, plus the hand-written rule it is meant to encode.
+
+    ``findRegionBoundaryUndirectedEdgesInsideMesh`` is the operation
+    [`region_boundary_edges`][triwarp.selection.region_boundary_edges] is named after, and the
+    "InsideMesh" half of that name is the whole content: it returns the edges separating the region
+    from the rest of the *interior*, excluding the mesh's own boundary. Handed an all-``True``
+    region it therefore returns **zero** edges, which is why it is not an oracle for
+    [`boundary_edges`][triwarp.boundary.boundary_edges] however much the name suggests otherwise.
+
+    The named transform is only the decoding: MeshLib answers with an ``UndirectedEdgeBitSet``, so
+    each set bit becomes an ``EdgeId`` and then an ``(org, dest)`` pair. The set-based oracle below
+    is kept alongside rather than replaced -- it states the rule in one line where the reference
+    only agrees with it, which is what catches the two of them sharing a misreading.
+    """
+    vertices_np, faces_np = _grid_mesh(5)
+    n_faces = len(faces_np) // 3
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    region = np.zeros(n_faces, dtype=bool)
+    region[:6] = True  # a contiguous block of faces
+    region_wp = wp.array(region, dtype=wp.bool, device=device)
+
+    edges_wp_np = tw.selection.region_boundary_edges(faces_wp, region_wp).numpy()
+    edges_wp_set = {tuple(sorted(int(x) for x in e)) for e in edges_wp_np}
+
+    # Oracle: undirected edges with exactly two incident faces, exactly one in the region.
+    faces = faces_np.reshape(-1, 3)
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    for fi, t in enumerate(faces):
+        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+            edge_faces.setdefault((int(min(a, b)), int(max(a, b))), []).append(fi)
+    expected = {
+        e for e, fs in edge_faces.items() if len(fs) == 2 and (region[fs[0]] ^ region[fs[1]])
+    }
+    assert len(expected) > 0  # non-vacuity: an empty seam would pass every assert below
+    assert edges_wp_set == expected
+
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
+    bits_ml = mn.getNumpyBitSet(
+        mm.findRegionBoundaryUndirectedEdgesInsideMesh(
+            mesh_ml.topology, mn.faceBitSetFromBools(region)
+        )
+    )
+    edges_ml = {
+        tuple(sorted((mesh_ml.topology.org(edge).get(), mesh_ml.topology.dest(edge).get())))
+        for edge in (mm.EdgeId(mm.UndirectedEdgeId(int(i))) for i in np.flatnonzero(bits_ml))
+    }
+    assert edges_ml == expected
+
+    # The name's "InsideMesh" is the content: over the whole mesh it excludes the rim entirely.
+    all_faces_ml = mn.faceBitSetFromBools(np.ones(n_faces, dtype=bool))
+    assert (
+        mm.findRegionBoundaryUndirectedEdgesInsideMesh(mesh_ml.topology, all_faces_ml).count() == 0
+    )
+
+
+@pytest.mark.parity("region_boundary_edges", "pyvista")
+def test_region_boundary_edges_matches_pyvista(device: str) -> None:
+    """
+    Class B: VTK reaches the same seam by construction, minus the mesh's own boundary.
+
+    pyvista has no seam filter. The route is ``extract_cells(region).extract_surface()`` followed by
+    that surface's ``extract_feature_edges(boundary_edges=True)`` -- and the sub-surface's boundary
+    is the seam **plus** whatever part of the mesh rim the region contains, where
+    ``region_boundary_edges`` keeps only the interior half ("InsideMesh", as the MeshLib pairing
+    above spells out). So the named transform is subtracting
+    [`boundary_edges`][triwarp.boundary.boundary_edges], and at that it is exact. On this 6x6 grid:
+    an interior region gives **12 = 12** edges with nothing on the rim, and the corner region gives
+    4 against pyvista's 8, where the 4 extra are exactly the rim edges it contains. The same pair on
+    a curved patch cut out of ``icosphere(3)`` reads 48 = 48 and 26 against 54 (28 on the rim), and
+    on the closed sphere 44 = 44.
+
+    Both regions are asserted here because only the second exercises the transform and only the
+    first shows the two agree without it -- and the pair is what rules out the subtraction hiding a
+    real disagreement.
+
+    The remap is not optional: ``extract_feature_edges`` returns a new ``PolyData`` carrying only
+    the points its lines touch, renumbered, so
+    [`pyvista_edges_to_indices`][tests.conversions.pyvista_edges_to_indices] keys them back by
+    position. And the fixture must not come from ``trimesh.slice_plane``: on a hemisphere built that
+    way the same comparison leaves 21 edges unexplained by the transform, all of it the fragmented
+    rim that converter is known for.
+    """
+    vertices_np, faces_np = _grid_mesh(6)
+    n_faces = len(faces_np) // 3
+    vertices_wp = points_to_warp(vertices_np, device)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    mesh_pv = pv.PolyData.from_regular_faces(
+        vertices_np, np.ascontiguousarray(faces_np.reshape(-1, 3), dtype=np.int32)
+    )
+    rim = {
+        tuple(sorted(int(x) for x in edge))
+        for edge in tw.boundary.boundary_edges(vertices_wp, faces_wp).numpy()
+    }
+    assert len(rim) == 20  # the 6x6 grid's own boundary, which pyvista's route picks up
+
+    centroids_np = vertices_np[faces_np.reshape(-1, 3)].mean(axis=1)
+    interior_np = (np.abs(centroids_np[:, 0] - 2.5) < 1.2) & (
+        np.abs(centroids_np[:, 1] - 2.5) < 1.2
+    )
+    corner_np = np.zeros(n_faces, dtype=bool)
+    corner_np[:6] = True  # a contiguous block against the grid's rim
+
+    for name, region_np, touches_rim in (
+        ("interior", interior_np, False),
+        ("corner", corner_np, True),
+    ):
+        region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+        edges_wp = {
+            tuple(sorted(int(x) for x in edge))
+            for edge in tw.selection.region_boundary_edges(faces_wp, region_wp).numpy()
+        }
+
+        surface_pv = mesh_pv.extract_cells(np.flatnonzero(region_np)).extract_surface(
+            algorithm="dataset_surface"
+        )
+        edges_pv = {
+            tuple(sorted(int(x) for x in edge))
+            for edge in pyvista_edges_to_indices(
+                surface_pv.extract_feature_edges(
+                    boundary_edges=True,
+                    feature_edges=False,
+                    non_manifold_edges=False,
+                    manifold_edges=False,
+                ),
+                vertices_np,
+            )
+        }
+
+        assert len(edges_wp) > 0, name  # non-vacuity on both sides
+        assert len(edges_pv) > 0, name
+        assert (edges_pv & rim != set()) is touches_rim, name  # the transform is exercised once
+        assert edges_pv - rim == edges_wp, name
+
+
+@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "unit_box", "hemisphere"])
+def test_region_boundary_edges_oriented_round_trips_through_the_fill(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Not a library comparison: this pins two triwarp entry points to each other as an inverse pair.
+
+    ``region_boundary_edges(oriented=True)`` and ``faces_left_of_contour`` are dual, so the round
+    trip must be the identity on the mask -- **exactly**, not approximately, since both sides
+    are combinatorial. The oracle for the pair lives on the fill side
+    (``test_faces_left_of_contour_matches_meshlib``); this test exists because the *orientation* is
+    the part no reference pins, and because getting it wrong is invisible.
+
+    That last point is the reason for the second half. With the default unoriented rows, each row's
+    direction is whichever way makes it ascending, so seeds land on **both** sides and the fill
+    returns the whole mesh -- a plausible-looking answer that no assertion on the fill alone would
+    catch. It is asserted here so the documented ``oriented=`` requirement has a test behind it.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp = mesh_wp.indices
+    device = faces_wp.device
+    n_faces = int(faces_wp.shape[0]) // 3
+
+    centroids_np = tw.triangles.face_centroids(mesh_wp.points, faces_wp).numpy()
+    region_np = centroids_np[:, 2] > centroids_np[:, 2].mean()
+    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+
+    oriented_wp = tw.selection.region_boundary_edges(faces_wp, region_wp, oriented=True)
+    assert np.array_equal(
+        tw.selection.faces_left_of_contour(faces_wp, oriented_wp).numpy(), region_np
+    )
+    # The oriented rows are the same undirected set as the default ones, only directed.
+    unoriented_wp = tw.selection.region_boundary_edges(faces_wp, region_wp)
+    assert np.array_equal(
+        np.sort(oriented_wp.numpy(), axis=1), np.sort(unoriented_wp.numpy(), axis=1)
+    )
+    assert int(tw.selection.faces_left_of_contour(faces_wp, unoriented_wp).numpy().sum()) == n_faces
+
+
+def _meshlib_contour(topology_ml: mm.MeshTopology, contour_np: np.ndarray) -> object:
+    """Directed vertex pairs as MeshLib's ``EdgeId`` vector, as ``fillContourLeft`` takes it."""
+    contour_ml = mm.std_vector_Id_EdgeTag()
+    for start, end in contour_np.tolist():
+        contour_ml.append(topology_ml.findEdge(mm.VertId(int(start)), mm.VertId(int(end))))
+    return contour_ml
+
+
+@pytest.mark.parity("faces_left_of_contour", "meshlib")
+@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "torus", "unit_box"])
+def test_faces_left_of_contour_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: identical masks, and identical *left* conventions, with no transform at all.
+
+    ``fillContourLeft`` takes a vector of directed ``EdgeId`` and returns the ``FaceBitSet`` on the
+    left of that walk. The convention agreement is the part worth pinning: a winding disagreement
+    would show up as the exact complement, which is why the reversed contour is checked in the same
+    test -- MeshLib's answer for the reversed rows is triwarp's complement, not its own answer, so
+    the two libraries agree about which side "left" is rather than merely partitioning the mesh the
+    same way.
+
+    Also asserted: the two sides are disjoint and cover the mesh. A contour built by
+    [`region_boundary_edges`][triwarp.selection.region_boundary_edges] with ``oriented=True``
+    separates by construction, so anything else would be a fill leaking across the cut.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp = mesh_wp.indices
+    device = faces_wp.device
+    n_faces = int(faces_wp.shape[0]) // 3
+
+    centroids_np = tw.triangles.face_centroids(mesh_wp.points, faces_wp).numpy()
+    region_np = centroids_np[:, 2] > centroids_np[:, 2].mean()
+    assert 0 < int(region_np.sum()) < n_faces  # non-vacuity: both sides have faces
+    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+    contour_wp = tw.selection.region_boundary_edges(faces_wp, region_wp, oriented=True)
+    assert int(contour_wp.shape[0]) > 0  # and the seam between them is not empty
+
+    topology_ml = trimesh_to_meshlib(mesh_tm).topology
+    contour_np = contour_wp.numpy()
+    left_ml = meshlib_bitset_to_numpy(
+        mm.fillContourLeft(topology_ml, _meshlib_contour(topology_ml, contour_np)), n_faces
+    )
+    left_wp = tw.selection.faces_left_of_contour(faces_wp, contour_wp)
+    assert np.array_equal(left_wp.numpy(), left_ml)
+
+    reversed_wp = twt.as_array2d(
+        wp.array(np.ascontiguousarray(contour_np[:, ::-1]), dtype=wp.int32, device=device), wp.int32
+    )
+    right_ml = meshlib_bitset_to_numpy(
+        mm.fillContourLeft(topology_ml, _meshlib_contour(topology_ml, contour_np[:, ::-1])), n_faces
+    )
+    right_wp = tw.selection.faces_left_of_contour(faces_wp, reversed_wp)
+    assert np.array_equal(right_wp.numpy(), right_ml)
+    assert np.array_equal(right_ml, ~left_ml)
+    assert not np.any(left_wp.numpy() & right_wp.numpy())
+    assert np.all(left_wp.numpy() | right_wp.numpy())
+
+
+def test_faces_left_of_contour_edge_cases(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: the three degenerate contours, each with a different right answer.
+
+    An **empty** contour blocks nothing and seeds nothing, so the answer is all-``False`` rather
+    than all-``True`` -- the fill is seeded by the contour, and no contour means no seed. A contour
+    of rows that are **not mesh edges** is the same case reached differently. And a
+    **non-separating** contour -- a homology generator on a torus, which by definition does not
+    bound -- returns the *whole* mesh, because the flood fill genuinely reaches everywhere. That
+    is the honest answer, and the docstring says to check the count when a contour means to close.
+    """
+    _, mesh_wp = torus
+    faces_wp = mesh_wp.indices
+    device = faces_wp.device
+    n_faces = int(faces_wp.shape[0]) // 3
+
+    empty_wp = twt.empty_2d((0, 2), wp.int32, device=device)
+    assert not np.any(tw.selection.faces_left_of_contour(faces_wp, empty_wp).numpy())
+
+    absent_wp = twt.as_array2d(
+        wp.array(np.array([[0, 0], [1, 1]], dtype=np.int32), dtype=wp.int32, device=device),
+        wp.int32,
+    )
+    assert not np.any(tw.selection.faces_left_of_contour(faces_wp, absent_wp).numpy())
+
+    loops_wp = tw.homology.homology_generators(mesh_wp.points, faces_wp)
+    assert len(loops_wp) == 2  # non-vacuity: genus 1, so a non-bounding cycle exists
+    loop_np = loops_wp[0].numpy()
+    cycle_wp = twt.as_array2d(
+        wp.array(
+            np.stack([loop_np, np.roll(loop_np, -1)], axis=1).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        ),
+        wp.int32,
+    )
+    assert int(tw.selection.faces_left_of_contour(faces_wp, cycle_wp).numpy().sum()) == n_faces
+
+    with pytest.raises(ValueError, match=r"shape \(k, 2\)"):
+        tw.selection.faces_left_of_contour(
+            faces_wp, twt.as_array2d(wp.zeros((2, 3), dtype=wp.int32, device=device), wp.int32)
+        )
+
+
+def test_exclude_fully_selected_components(device: str):
+    ico = tm.creation.icosahedron()
+    hemi = tm.creation.icosphere(subdivisions=1)
+    v_ico = ico.vertices.astype(np.float64)
+    v_hemi = hemi.vertices.astype(np.float64) + np.array([5.0, 0.0, 0.0])
+    v_wp_ico = points_to_warp(v_ico, device)
+    f_wp_ico = wp.array(ico.faces.astype(np.int32).reshape(-1), dtype=wp.int32, device=device)
+    v_wp_hemi = points_to_warp(v_hemi, device)
+    f_wp_hemi = wp.array(hemi.faces.astype(np.int32).reshape(-1), dtype=wp.int32, device=device)
+    verts, faces = tw.combine.concatenate([(v_wp_ico, f_wp_ico), (v_wp_hemi, f_wp_hemi)])
+
+    n = int(verts.shape[0])
+    n_ico = len(v_ico)
+    mask = np.zeros(n, dtype=bool)
+    mask[:n_ico] = True  # whole icosahedron component
+    mask[n_ico : n_ico + 3] = True  # partial hemisphere component
+    mask_wp = wp.array(mask, dtype=wp.bool, device=device)
+
+    result = tw.selection.exclude_fully_selected_components(faces, mask_wp, n).numpy()
+    # The fully-selected icosahedron component is dropped; the partial hemisphere subset stays.
+    assert not result[:n_ico].any()
+    assert np.array_equal(result[n_ico : n_ico + 3], np.ones(3, dtype=bool))
 
 
 def test_submesh_from_face_indices_empty(device: str) -> None:
@@ -182,7 +510,7 @@ def test_submeshes_from_face_groups_shared_vertex(device: str) -> None:
         [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 2, 0], [-1, 1, 0]], dtype=np.float32
     )
     faces_np = np.array([0, 1, 2, 2, 3, 4], dtype=np.int32)
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
 
     vertices_all_wp, vertex_offsets_wp, faces_all_wp = tw.selection.submeshes_from_face_groups(
@@ -205,7 +533,7 @@ def test_submeshes_from_face_groups_unreferenced_vertices(device: str) -> None:
         [[0, 0, 0], [9, 9, 9], [1, 0, 0], [0, 1, 0], [8, 8, 8]], dtype=np.float32
     )
     faces_np = np.array([0, 2, 3], dtype=np.int32)
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
 
     vertices_all_wp, vertex_offsets_wp, faces_all_wp = tw.selection.submeshes_from_face_groups(
@@ -275,6 +603,39 @@ def test_submesh_return_index_carries_an_attribute(
     )
     assert np.array_equal(index_map_wp.numpy(), vertex_index_np)
     assert int(sub_faces_wp.shape[0]) > 0
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+def test_submesh_from_face_mask(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A against trimesh *and* against the index form, which are different claims.
+
+    The trimesh comparison says the submesh is right; the index-form comparison says the mask entry
+    point agrees with the one that already has an oracle. A mask built from a coin flip is forced to
+    select at least one face, so neither comparison can be satisfied by an empty answer.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(7)
+    n_faces = mesh_tm.faces.shape[0]
+    face_mask_np = rng.choice([False, True], size=n_faces, replace=True)
+    face_mask_np[rng.integers(0, n_faces)] = True
+    face_indices_np = np.flatnonzero(face_mask_np).astype(np.int32)
+
+    submesh_tm = tm.util.submesh(mesh_tm, [face_indices_np], repair=False, append=False)[0]
+    face_mask = wp.array(face_mask_np, dtype=wp.bool, device=mesh_wp.points.device)
+    got_vertices_wp, got_faces_wp = tw.selection.submesh_from_face_mask(
+        mesh_wp.points, mesh_wp.indices, face_mask
+    )
+    exp_vertices_wp, exp_faces_wp = tw.selection.submesh_from_face_indices(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.array(face_indices_np, dtype=wp.int32, device=mesh_wp.points.device),
+        unique_indices=True,
+    )
+    assert np.allclose(got_vertices_wp.numpy(), exp_vertices_wp.numpy())
+    assert np.array_equal(got_faces_wp.numpy(), exp_faces_wp.numpy())
+    assert np.allclose(got_vertices_wp.numpy(), submesh_tm.vertices)
+    assert np.array_equal(got_faces_wp.numpy(), submesh_tm.faces.reshape(-1))
 
 
 @pytest.mark.parity("delete_region_keep_boundary", "meshlib")
@@ -359,62 +720,37 @@ def test_delete_region_keep_boundary_reports_only_new_rims(
     assert int(edge_loops[0].shape[0]) > rim_vertices_np.size  # the rim grew rather than vanished
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
-def test_submesh_from_face_mask(request: pytest.FixtureRequest, mesh_name: str) -> None:
+def _vertex_selection(mesh_tm: tm.Trimesh, seed: int, fraction: int) -> np.ndarray:
     """
-    Class A against trimesh *and* against the index form, which are different claims.
+    Draw a random vertex selection that is guaranteed to contain at least one *whole* face.
 
-    The trimesh comparison says the submesh is right; the index-form comparison says the mask entry
-    point agrees with the one that already has an oracle. A mask built from a coin flip is forced to
-    select at least one face, so neither comparison can be satisfied by an empty answer.
+    ``face_mode="all"`` keeps a face only when all three of its corners are selected, which a
+    sparse random draw essentially never produces: at ``n // 4`` of the icosahedron's 12 vertices
+    and ``n // 5`` of the hemisphere's 97, the measured answer was **0 faces**, so both sides of
+    the comparison were empty and the ``all`` half of the parametrisation asserted nothing. Seeding
+    the draw with the corners of every fourth face fixes that without giving up the random part.
     """
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    rng = np.random.default_rng(7)
-    n_faces = mesh_tm.faces.shape[0]
-    face_mask_np = rng.choice([False, True], size=n_faces, replace=True)
-    face_mask_np[rng.integers(0, n_faces)] = True
-    face_indices_np = np.flatnonzero(face_mask_np).astype(np.int32)
-
-    submesh_tm = tm.util.submesh(mesh_tm, [face_indices_np], repair=False, append=False)[0]
-    face_mask = wp.array(face_mask_np, dtype=wp.bool, device=mesh_wp.points.device)
-    got_vertices_wp, got_faces_wp = tw.selection.submesh_from_face_mask(
-        mesh_wp.points, mesh_wp.indices, face_mask
-    )
-    exp_vertices_wp, exp_faces_wp = tw.selection.submesh_from_face_indices(
-        mesh_wp.points,
-        mesh_wp.indices,
-        wp.array(face_indices_np, dtype=wp.int32, device=mesh_wp.points.device),
-        unique_indices=True,
-    )
-    assert np.allclose(got_vertices_wp.numpy(), exp_vertices_wp.numpy())
-    assert np.array_equal(got_faces_wp.numpy(), exp_faces_wp.numpy())
-    assert np.allclose(got_vertices_wp.numpy(), submesh_tm.vertices)
-    assert np.array_equal(got_faces_wp.numpy(), submesh_tm.faces.reshape(-1))
+    rng = np.random.default_rng(seed)
+    n_vertices = mesh_tm.vertices.shape[0]
+    random_np = rng.choice(n_vertices, size=max(3, n_vertices // fraction), replace=False)
+    whole_faces_np = mesh_tm.faces[:: max(1, mesh_tm.faces.shape[0] // 4)].reshape(-1)
+    return np.union1d(random_np, whole_faces_np).astype(np.int32)
 
 
-@pytest.mark.parametrize("face_mode", ["all", "any"])
-def test_face_indices_from_vertex_indices(request: pytest.FixtureRequest, face_mode: str) -> None:
-    """Class A: both ``face_mode`` branches equal the numpy predicate, face index for face index."""
-    mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
-    vertex_indices_np = _vertex_selection(mesh_tm, seed=11, fraction=4)
-    vertex_indices = wp.array(vertex_indices_np, dtype=wp.int32, device=mesh_wp.points.device)
-
-    face_indices_wp = tw.selection.face_indices_from_vertex_indices(
-        mesh_wp.indices, vertex_indices, face_mode=face_mode
-    )
-    face_indices_ref_np = _face_indices_from_vertex_indices_np(
-        mesh_tm.faces, vertex_indices_np, face_mode=face_mode
-    )
-    # Two empty face lists compare equal, which is what the "all" branch used to do.
-    assert face_indices_ref_np.size > 0
-    assert np.array_equal(face_indices_wp.numpy(), face_indices_ref_np)
+def _face_indices_from_vertex_indices_np(
+    faces_np: np.ndarray, vertex_indices_np: np.ndarray, *, face_mode: str
+) -> np.ndarray:
+    vertex_hit = np.isin(faces_np, vertex_indices_np)
+    if face_mode == "all":
+        face_hit = np.all(vertex_hit, axis=1)
+    else:
+        face_hit = np.any(vertex_hit, axis=1)
+    return np.flatnonzero(face_hit).astype(np.int32)
 
 
-def test_face_indices_from_vertex_indices_empty() -> None:
-    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device="cpu")
-    vertex_indices_wp = wp.empty(0, dtype=wp.int32, device="cpu")
-    face_indices_wp = tw.selection.face_indices_from_vertex_indices(faces_wp, vertex_indices_wp)
-    assert face_indices_wp.shape == (0,)
+# ---------------------------------------------------------------------------
+# Vertex-selection morphology + region utilities
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("face_mode", ["all", "any"])
@@ -476,62 +812,6 @@ def test_submesh_from_vertex_mask(request: pytest.FixtureRequest, face_mode: str
     assert np.array_equal(got_faces_wp.numpy(), exp_faces_wp.numpy())
 
 
-def _vertex_selection(mesh_tm: tm.Trimesh, seed: int, fraction: int) -> np.ndarray:
-    """
-    Draw a random vertex selection that is guaranteed to contain at least one *whole* face.
-
-    ``face_mode="all"`` keeps a face only when all three of its corners are selected, which a
-    sparse random draw essentially never produces: at ``n // 4`` of the icosahedron's 12 vertices
-    and ``n // 5`` of the hemisphere's 97, the measured answer was **0 faces**, so both sides of
-    the comparison were empty and the ``all`` half of the parametrisation asserted nothing. Seeding
-    the draw with the corners of every fourth face fixes that without giving up the random part.
-    """
-    rng = np.random.default_rng(seed)
-    n_vertices = mesh_tm.vertices.shape[0]
-    random_np = rng.choice(n_vertices, size=max(3, n_vertices // fraction), replace=False)
-    whole_faces_np = mesh_tm.faces[:: max(1, mesh_tm.faces.shape[0] // 4)].reshape(-1)
-    return np.union1d(random_np, whole_faces_np).astype(np.int32)
-
-
-def _face_indices_from_vertex_indices_np(
-    faces_np: np.ndarray, vertex_indices_np: np.ndarray, *, face_mode: str
-) -> np.ndarray:
-    vertex_hit = np.isin(faces_np, vertex_indices_np)
-    if face_mode == "all":
-        face_hit = np.all(vertex_hit, axis=1)
-    else:
-        face_hit = np.any(vertex_hit, axis=1)
-    return np.flatnonzero(face_hit).astype(np.int32)
-
-
-# ---------------------------------------------------------------------------
-# Vertex-selection morphology + region utilities
-# ---------------------------------------------------------------------------
-
-
-def _grid_mesh(n: int = 5):
-    xs, ys = np.meshgrid(np.arange(float(n)), np.arange(float(n)))
-    vertices = np.stack([xs.ravel(), ys.ravel(), np.zeros(n * n)], axis=1).astype(np.float64)
-    faces = []
-    for r in range(n - 1):
-        for c in range(n - 1):
-            a = r * n + c
-            faces += [a, a + 1, a + n + 1, a, a + n + 1, a + n]
-    return vertices, np.array(faces, dtype=np.int32)
-
-
-def _graph_distance(faces_np: np.ndarray, n: int, seed: np.ndarray) -> np.ndarray:
-    """BFS graph distance from the seed set over the undirected mesh edges (NumPy oracle)."""
-    from scipy.sparse import csr_matrix
-    from scipy.sparse.csgraph import dijkstra
-
-    edges = undirected_edges(faces_np.reshape(-1, 3))
-    rows = np.concatenate([edges[:, 0], edges[:, 1]])
-    cols = np.concatenate([edges[:, 1], edges[:, 0]])
-    graph = csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
-    return dijkstra(graph, indices=np.flatnonzero(seed), unweighted=True).min(axis=0)
-
-
 def test_expand_vertex_mask(device: str):
     vertices_np, faces_np = _grid_mesh(6)
     n = len(vertices_np)
@@ -540,9 +820,9 @@ def test_expand_vertex_mask(device: str):
     seed[len(vertices_np) // 2] = True
     seed_wp = wp.array(seed, dtype=wp.bool, device=device)
     for hops in (1, 2, 3):
-        got = tw.selection.expand_vertex_mask(faces_wp, seed_wp, hops).numpy()
+        edges_wp_np = tw.selection.expand_vertex_mask(faces_wp, seed_wp, hops).numpy()
         expected = _graph_distance(faces_np, n, seed) <= hops
-        assert np.array_equal(got, expected)
+        assert np.array_equal(edges_wp_np, expected)
 
 
 @pytest.mark.parity("expand_vertex_mask", "pymeshlab")
@@ -659,305 +939,26 @@ def test_shrink_vertex_mask(device: str):
     assert np.array_equal(shrunk, expected)
 
 
-@pytest.mark.parity("region_boundary_edges", "meshlib")
-def test_region_boundary_edges(device: str):
-    """
-    Class A against the function this one ports, plus the hand-written rule it is meant to encode.
+@pytest.mark.parametrize("face_mode", ["all", "any"])
+def test_face_indices_from_vertex_indices(request: pytest.FixtureRequest, face_mode: str) -> None:
+    """Class A: both ``face_mode`` branches equal the numpy predicate, face index for face index."""
+    mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
+    vertex_indices_np = _vertex_selection(mesh_tm, seed=11, fraction=4)
+    vertex_indices = wp.array(vertex_indices_np, dtype=wp.int32, device=mesh_wp.points.device)
 
-    ``findRegionBoundaryUndirectedEdgesInsideMesh`` is the operation
-    [`region_boundary_edges`][triwarp.selection.region_boundary_edges] is named after, and the
-    "InsideMesh" half of that name is the whole content: it returns the edges separating the region
-    from the rest of the *interior*, excluding the mesh's own boundary. Handed an all-``True``
-    region it therefore returns **zero** edges, which is why it is not an oracle for
-    [`boundary_edges`][triwarp.boundary.boundary_edges] however much the name suggests otherwise.
-
-    The named transform is only the decoding: MeshLib answers with an ``UndirectedEdgeBitSet``, so
-    each set bit becomes an ``EdgeId`` and then an ``(org, dest)`` pair. The set-based oracle below
-    is kept alongside rather than replaced -- it states the rule in one line where the reference
-    only agrees with it, which is what catches the two of them sharing a misreading.
-    """
-    vertices_np, faces_np = _grid_mesh(5)
-    n_faces = len(faces_np) // 3
-    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
-    region = np.zeros(n_faces, dtype=bool)
-    region[:6] = True  # a contiguous block of faces
-    region_wp = wp.array(region, dtype=wp.bool, device=device)
-
-    got = tw.selection.region_boundary_edges(faces_wp, region_wp).numpy()
-    got_set = {tuple(sorted(int(x) for x in e)) for e in got}
-
-    # Oracle: undirected edges with exactly two incident faces, exactly one in the region.
-    faces = faces_np.reshape(-1, 3)
-    edge_faces: dict[tuple[int, int], list[int]] = {}
-    for fi, t in enumerate(faces):
-        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
-            edge_faces.setdefault((int(min(a, b)), int(max(a, b))), []).append(fi)
-    expected = {
-        e for e, fs in edge_faces.items() if len(fs) == 2 and (region[fs[0]] ^ region[fs[1]])
-    }
-    assert len(expected) > 0  # non-vacuity: an empty seam would pass every assert below
-    assert got_set == expected
-
-    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
-    bits_ml = mn.getNumpyBitSet(
-        mm.findRegionBoundaryUndirectedEdgesInsideMesh(
-            mesh_ml.topology, mn.faceBitSetFromBools(region)
-        )
+    face_indices_wp = tw.selection.face_indices_from_vertex_indices(
+        mesh_wp.indices, vertex_indices, face_mode=face_mode
     )
-    edges_ml = {
-        tuple(sorted((mesh_ml.topology.org(edge).get(), mesh_ml.topology.dest(edge).get())))
-        for edge in (mm.EdgeId(mm.UndirectedEdgeId(int(i))) for i in np.flatnonzero(bits_ml))
-    }
-    assert edges_ml == expected
-
-    # The name's "InsideMesh" is the content: over the whole mesh it excludes the rim entirely.
-    all_faces_ml = mn.faceBitSetFromBools(np.ones(n_faces, dtype=bool))
-    assert (
-        mm.findRegionBoundaryUndirectedEdgesInsideMesh(mesh_ml.topology, all_faces_ml).count() == 0
+    face_indices_ref_np = _face_indices_from_vertex_indices_np(
+        mesh_tm.faces, vertex_indices_np, face_mode=face_mode
     )
+    # Two empty face lists compare equal, which is what the "all" branch used to do.
+    assert face_indices_ref_np.size > 0
+    assert np.array_equal(face_indices_wp.numpy(), face_indices_ref_np)
 
 
-@pytest.mark.parity("region_boundary_edges", "pyvista")
-def test_region_boundary_edges_matches_pyvista(device: str) -> None:
-    """
-    Class B: VTK reaches the same seam by construction, minus the mesh's own boundary.
-
-    pyvista has no seam filter. The route is ``extract_cells(region).extract_surface()`` followed by
-    that surface's ``extract_feature_edges(boundary_edges=True)`` -- and the sub-surface's boundary
-    is the seam **plus** whatever part of the mesh rim the region contains, where
-    ``region_boundary_edges`` keeps only the interior half ("InsideMesh", as the MeshLib pairing
-    above spells out). So the named transform is subtracting
-    [`boundary_edges`][triwarp.boundary.boundary_edges], and at that it is exact. On this 6x6 grid:
-    an interior region gives **12 = 12** edges with nothing on the rim, and the corner region gives
-    4 against pyvista's 8, where the 4 extra are exactly the rim edges it contains. The same pair on
-    a curved patch cut out of ``icosphere(3)`` reads 48 = 48 and 26 against 54 (28 on the rim), and
-    on the closed sphere 44 = 44.
-
-    Both regions are asserted here because only the second exercises the transform and only the
-    first shows the two agree without it -- and the pair is what rules out the subtraction hiding a
-    real disagreement.
-
-    The remap is not optional: ``extract_feature_edges`` returns a new ``PolyData`` carrying only
-    the points its lines touch, renumbered, so
-    [`pyvista_edges_to_indices`][tests.conversions.pyvista_edges_to_indices] keys them back by
-    position. And the fixture must not come from ``trimesh.slice_plane``: on a hemisphere built that
-    way the same comparison leaves 21 edges unexplained by the transform, all of it the fragmented
-    rim that converter is known for.
-    """
-    vertices_np, faces_np = _grid_mesh(6)
-    n_faces = len(faces_np) // 3
-    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
-    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
-    mesh_pv = pv.PolyData.from_regular_faces(
-        vertices_np, np.ascontiguousarray(faces_np.reshape(-1, 3), dtype=np.int32)
-    )
-    rim = {
-        tuple(sorted(int(x) for x in edge))
-        for edge in tw.boundary.boundary_edges(vertices_wp, faces_wp).numpy()
-    }
-    assert len(rim) == 20  # the 6x6 grid's own boundary, which pyvista's route picks up
-
-    centroids_np = vertices_np[faces_np.reshape(-1, 3)].mean(axis=1)
-    interior_np = (np.abs(centroids_np[:, 0] - 2.5) < 1.2) & (
-        np.abs(centroids_np[:, 1] - 2.5) < 1.2
-    )
-    corner_np = np.zeros(n_faces, dtype=bool)
-    corner_np[:6] = True  # a contiguous block against the grid's rim
-
-    for name, region_np, touches_rim in (
-        ("interior", interior_np, False),
-        ("corner", corner_np, True),
-    ):
-        region_wp = wp.array(region_np, dtype=wp.bool, device=device)
-        edges_wp = {
-            tuple(sorted(int(x) for x in edge))
-            for edge in tw.selection.region_boundary_edges(faces_wp, region_wp).numpy()
-        }
-
-        surface_pv = mesh_pv.extract_cells(np.flatnonzero(region_np)).extract_surface(
-            algorithm="dataset_surface"
-        )
-        edges_pv = {
-            tuple(sorted(int(x) for x in edge))
-            for edge in pyvista_edges_to_indices(
-                surface_pv.extract_feature_edges(
-                    boundary_edges=True,
-                    feature_edges=False,
-                    non_manifold_edges=False,
-                    manifold_edges=False,
-                ),
-                vertices_np,
-            )
-        }
-
-        assert len(edges_wp) > 0, name  # non-vacuity on both sides
-        assert len(edges_pv) > 0, name
-        assert (edges_pv & rim != set()) is touches_rim, name  # the transform is exercised once
-        assert edges_pv - rim == edges_wp, name
-
-
-def _meshlib_contour(topology_ml: mm.MeshTopology, contour_np: np.ndarray) -> object:
-    """Directed vertex pairs as MeshLib's ``EdgeId`` vector, as ``fillContourLeft`` takes it."""
-    contour_ml = mm.std_vector_Id_EdgeTag()
-    for start, end in contour_np.tolist():
-        contour_ml.append(topology_ml.findEdge(mm.VertId(int(start)), mm.VertId(int(end))))
-    return contour_ml
-
-
-@pytest.mark.parity("faces_left_of_contour", "meshlib")
-@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "torus", "unit_box"])
-def test_faces_left_of_contour_matches_meshlib(
-    request: pytest.FixtureRequest, mesh_name: str
-) -> None:
-    """
-    Class A: identical masks, and identical *left* conventions, with no transform at all.
-
-    ``fillContourLeft`` takes a vector of directed ``EdgeId`` and returns the ``FaceBitSet`` on the
-    left of that walk. The convention agreement is the part worth pinning: a winding disagreement
-    would show up as the exact complement, which is why the reversed contour is checked in the same
-    test -- MeshLib's answer for the reversed rows is triwarp's complement, not its own answer, so
-    the two libraries agree about which side "left" is rather than merely partitioning the mesh the
-    same way.
-
-    Also asserted: the two sides are disjoint and cover the mesh. A contour built by
-    [`region_boundary_edges`][triwarp.selection.region_boundary_edges] with ``oriented=True``
-    separates by construction, so anything else would be a fill leaking across the cut.
-    """
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    faces_wp = mesh_wp.indices
-    device = faces_wp.device
-    n_faces = int(faces_wp.shape[0]) // 3
-
-    centroids_np = tw.triangles.face_centroids(mesh_wp.points, faces_wp).numpy()
-    region_np = centroids_np[:, 2] > centroids_np[:, 2].mean()
-    assert 0 < int(region_np.sum()) < n_faces  # non-vacuity: both sides have faces
-    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
-    contour_wp = tw.selection.region_boundary_edges(faces_wp, region_wp, oriented=True)
-    assert int(contour_wp.shape[0]) > 0  # and the seam between them is not empty
-
-    topology_ml = trimesh_to_meshlib(mesh_tm).topology
-    contour_np = contour_wp.numpy()
-    left_ml = meshlib_bitset_to_numpy(
-        mm.fillContourLeft(topology_ml, _meshlib_contour(topology_ml, contour_np)), n_faces
-    )
-    left_wp = tw.selection.faces_left_of_contour(faces_wp, contour_wp)
-    assert np.array_equal(left_wp.numpy(), left_ml)
-
-    reversed_wp = twt.as_array2d(
-        wp.array(np.ascontiguousarray(contour_np[:, ::-1]), dtype=wp.int32, device=device), wp.int32
-    )
-    right_ml = meshlib_bitset_to_numpy(
-        mm.fillContourLeft(topology_ml, _meshlib_contour(topology_ml, contour_np[:, ::-1])), n_faces
-    )
-    right_wp = tw.selection.faces_left_of_contour(faces_wp, reversed_wp)
-    assert np.array_equal(right_wp.numpy(), right_ml)
-    assert np.array_equal(right_ml, ~left_ml)
-    assert not np.any(left_wp.numpy() & right_wp.numpy())
-    assert np.all(left_wp.numpy() | right_wp.numpy())
-
-
-@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "unit_box", "hemisphere"])
-def test_region_boundary_edges_oriented_round_trips_through_the_fill(
-    request: pytest.FixtureRequest, mesh_name: str
-) -> None:
-    """
-    Not a library comparison: this pins two triwarp entry points to each other as an inverse pair.
-
-    ``region_boundary_edges(oriented=True)`` and ``faces_left_of_contour`` are dual, so the round
-    trip must be the identity on the mask -- **exactly**, not approximately, since both sides
-    are combinatorial. The oracle for the pair lives on the fill side
-    (``test_faces_left_of_contour_matches_meshlib``); this test exists because the *orientation* is
-    the part no reference pins, and because getting it wrong is invisible.
-
-    That last point is the reason for the second half. With the default unoriented rows, each row's
-    direction is whichever way makes it ascending, so seeds land on **both** sides and the fill
-    returns the whole mesh -- a plausible-looking answer that no assertion on the fill alone would
-    catch. It is asserted here so the documented ``oriented=`` requirement has a test behind it.
-    """
-    _, mesh_wp = request.getfixturevalue(mesh_name)
-    faces_wp = mesh_wp.indices
-    device = faces_wp.device
-    n_faces = int(faces_wp.shape[0]) // 3
-
-    centroids_np = tw.triangles.face_centroids(mesh_wp.points, faces_wp).numpy()
-    region_np = centroids_np[:, 2] > centroids_np[:, 2].mean()
-    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
-
-    oriented_wp = tw.selection.region_boundary_edges(faces_wp, region_wp, oriented=True)
-    assert np.array_equal(
-        tw.selection.faces_left_of_contour(faces_wp, oriented_wp).numpy(), region_np
-    )
-    # The oriented rows are the same undirected set as the default ones, only directed.
-    unoriented_wp = tw.selection.region_boundary_edges(faces_wp, region_wp)
-    assert np.array_equal(
-        np.sort(oriented_wp.numpy(), axis=1), np.sort(unoriented_wp.numpy(), axis=1)
-    )
-    assert int(tw.selection.faces_left_of_contour(faces_wp, unoriented_wp).numpy().sum()) == n_faces
-
-
-def test_faces_left_of_contour_edge_cases(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """
-    Not a library comparison: the three degenerate contours, each with a different right answer.
-
-    An **empty** contour blocks nothing and seeds nothing, so the answer is all-``False`` rather
-    than all-``True`` -- the fill is seeded by the contour, and no contour means no seed. A contour
-    of rows that are **not mesh edges** is the same case reached differently. And a
-    **non-separating** contour -- a homology generator on a torus, which by definition does not
-    bound -- returns the *whole* mesh, because the flood fill genuinely reaches everywhere. That
-    is the honest answer, and the docstring says to check the count when a contour means to close.
-    """
-    _, mesh_wp = torus
-    faces_wp = mesh_wp.indices
-    device = faces_wp.device
-    n_faces = int(faces_wp.shape[0]) // 3
-
-    empty_wp = twt.empty_2d((0, 2), wp.int32, device=device)
-    assert not np.any(tw.selection.faces_left_of_contour(faces_wp, empty_wp).numpy())
-
-    absent_wp = twt.as_array2d(
-        wp.array(np.array([[0, 0], [1, 1]], dtype=np.int32), dtype=wp.int32, device=device),
-        wp.int32,
-    )
-    assert not np.any(tw.selection.faces_left_of_contour(faces_wp, absent_wp).numpy())
-
-    loops_wp = tw.homology.homology_generators(mesh_wp.points, faces_wp)
-    assert len(loops_wp) == 2  # non-vacuity: genus 1, so a non-bounding cycle exists
-    loop_np = loops_wp[0].numpy()
-    cycle_wp = twt.as_array2d(
-        wp.array(
-            np.stack([loop_np, np.roll(loop_np, -1)], axis=1).astype(np.int32),
-            dtype=wp.int32,
-            device=device,
-        ),
-        wp.int32,
-    )
-    assert int(tw.selection.faces_left_of_contour(faces_wp, cycle_wp).numpy().sum()) == n_faces
-
-    with pytest.raises(ValueError, match=r"shape \(k, 2\)"):
-        tw.selection.faces_left_of_contour(
-            faces_wp, twt.as_array2d(wp.zeros((2, 3), dtype=wp.int32, device=device), wp.int32)
-        )
-
-
-def test_exclude_fully_selected_components(device: str):
-    ico = tm.creation.icosahedron()
-    hemi = tm.creation.icosphere(subdivisions=1)
-    v_ico = ico.vertices.astype(np.float64)
-    v_hemi = hemi.vertices.astype(np.float64) + np.array([5.0, 0.0, 0.0])
-    v_wp_ico = wp.array(v_ico, dtype=wp.vec3, device=device)
-    f_wp_ico = wp.array(ico.faces.astype(np.int32).reshape(-1), dtype=wp.int32, device=device)
-    v_wp_hemi = wp.array(v_hemi, dtype=wp.vec3, device=device)
-    f_wp_hemi = wp.array(hemi.faces.astype(np.int32).reshape(-1), dtype=wp.int32, device=device)
-    verts, faces = tw.combine.concatenate([(v_wp_ico, f_wp_ico), (v_wp_hemi, f_wp_hemi)])
-
-    n = int(verts.shape[0])
-    n_ico = len(v_ico)
-    mask = np.zeros(n, dtype=bool)
-    mask[:n_ico] = True  # whole icosahedron component
-    mask[n_ico : n_ico + 3] = True  # partial hemisphere component
-    mask_wp = wp.array(mask, dtype=wp.bool, device=device)
-
-    result = tw.selection.exclude_fully_selected_components(faces, mask_wp, n).numpy()
-    # The fully-selected icosahedron component is dropped; the partial hemisphere subset stays.
-    assert not result[:n_ico].any()
-    assert np.array_equal(result[n_ico : n_ico + 3], np.ones(3, dtype=bool))
+def test_face_indices_from_vertex_indices_empty() -> None:
+    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device="cpu")
+    vertex_indices_wp = wp.empty(0, dtype=wp.int32, device="cpu")
+    face_indices_wp = tw.selection.face_indices_from_vertex_indices(faces_wp, vertex_indices_wp)
+    assert face_indices_wp.shape == (0,)

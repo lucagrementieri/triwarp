@@ -29,9 +29,11 @@ from tests.conversions import (
     numpy_to_meshlib,
     numpy_to_pymeshfix,
     numpy_to_warp,
+    points_to_warp,
     pymeshfix_to_numpy,
     trimesh_to_meshlib,
     trimesh_to_open3d,
+    trimesh_to_pymeshfix,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
     warp_to_trimesh,
@@ -541,9 +543,7 @@ def test_remove_duplicate_vertices_exact(device: str):
     vertices_np = np.array(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64
     )
-    vertices_wp = wp.array(
-        np.ascontiguousarray(vertices_np.astype(np.float32)), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(vertices_np, device)
 
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
     sv_wp, _, svj_wp, _ = tw.repair.remove_duplicated_vertices(vertices_wp, faces_wp, epsilon=0.0)
@@ -555,9 +555,7 @@ def test_remove_duplicate_vertices_epsilon(device: str):
         [[0.0, 0.0, 0.0], [1e-9, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1e-9, 0.0]], dtype=np.float64
     )
     epsilon = 1e-8
-    vertices_wp = wp.array(
-        np.ascontiguousarray(vertices_np.astype(np.float32)), dtype=wp.vec3, device=device
-    )
+    vertices_wp = points_to_warp(vertices_np, device)
 
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
     sv_wp, _, svj_wp, _ = tw.repair.remove_duplicated_vertices(
@@ -625,7 +623,7 @@ def test_duplicate_vertex_inverse_matches_the_documented_quantization(
     positions_np = rng.integers(0, 4, size=(60, 3)).astype(np.float32) * 0.25
     # Jitter well inside one cell, so a correct implementation merges exactly the seeded collisions.
     positions_np += rng.normal(scale=1e-5, size=positions_np.shape).astype(np.float32)
-    positions_wp = wp.array(np.ascontiguousarray(positions_np), dtype=wp.vec3, device=device)
+    positions_wp = points_to_warp(positions_np, device)
 
     inverse_np = tw.repair.duplicate_vertex_inverse(positions_wp, epsilon).numpy()
 
@@ -650,7 +648,7 @@ def test_duplicate_vertex_inverse_at_zero_epsilon_collapses_bitwise_equal_positi
         [[0.0, 0.0, 0.0], [-0.0, -0.0, -0.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [5.0, 5.0, 5.0]],
         dtype=np.float32,
     )
-    positions_wp = wp.array(np.ascontiguousarray(positions_np), dtype=wp.vec3, device=device)
+    positions_wp = points_to_warp(positions_np, device)
 
     inverse_np = tw.repair.duplicate_vertex_inverse(positions_wp, 0.0).numpy()
 
@@ -772,7 +770,7 @@ def test_remove_duplicated_vertices_matches_open3d_and_pymeshlab(
     soup_np = np.ascontiguousarray(mesh_tm.vertices[mesh_tm.faces].reshape(-1, 3))
     faces_np = np.arange(soup_np.shape[0], dtype=np.int32).reshape(-1, 3)
 
-    vertices_wp = wp.array(soup_np.astype(np.float32), dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(soup_np, device)
     faces_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
     unique_wp, _indices_wp, _inverse_wp, _faces_wp = tw.repair.remove_duplicated_vertices(
         vertices_wp, faces_wp, epsilon
@@ -1417,7 +1415,7 @@ def test_remove_non_manifold_faces_matches_a_numpy_oracle(
     assert not tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=True)
 
     new_vertices_wp, new_faces_wp = tw.repair.remove_non_manifold_faces(
-        wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device), faces_wp
+        points_to_warp(vertices_np, device), faces_wp
     )
     new_faces_np = new_faces_wp.numpy().reshape(-1, 3)
     expected_vertices_np, expected_faces_np = _remove_non_manifold_faces_np(vertices_np, faces_np)
@@ -1524,7 +1522,7 @@ def test_remove_small_components_keep_largest_matches_pymeshfix(device: str) -> 
         vertices_wp, faces_wp, keep_largest=True
     )
 
-    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    tin_pmf = trimesh_to_pymeshfix(mesh_tm)
     assert tin_pmf.n_faces == mesh_tm.faces.shape[0]  # the loader left the mesh alone
     assert tin_pmf.remove_smallest_components() == 2  # non-vacuity: it really removed two
     vertices_pmf, faces_pmf = pymeshfix_to_numpy(tin_pmf)
@@ -1677,7 +1675,7 @@ def _split_nonmanifold_wp(
     vertices_np: np.ndarray, faces_np: np.ndarray, device: str
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run ``split_non_manifold_vertices`` on NumPy input and bring all three results back."""
-    vertices_wp = wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     faces_wp = wp.array(np.ascontiguousarray(faces_np).ravel(), dtype=wp.int32, device=device)
     new_vertices_wp, new_faces_wp, source_wp = tw.repair.split_non_manifold_vertices(
         vertices_wp, faces_wp
@@ -1822,7 +1820,7 @@ def test_split_nonmanifold_leaves_a_manifold_mesh(
             faces_np = np.vstack([faces_np, faces_np[:1]])
 
     faces_wp = wp.array(np.ascontiguousarray(faces_np).ravel(), dtype=wp.int32, device=device)
-    vertices_wp = wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     # Each input violates a *different* precondition, and the guards say which -- a bowtie is
     # edge-manifold with a non-manifold vertex, and a flipped face is manifold but not orientable.
     if mesh_kind in ("three_faces_on_one_edge", "duplicated_face"):
@@ -1877,7 +1875,7 @@ def test_split_nonmanifold_splits_a_duplicated_face_further_than_igl(
     # Both answers are legal repairs of the same input: manifold, with every face kept.
     assert _new_faces_np.shape[0] == faces_np.shape[0] == np.asarray(_faces_igl).shape[0]
     faces_wp = wp.array(np.ascontiguousarray(faces_np).ravel(), dtype=wp.int32, device=device)
-    vertices_wp = wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device)
+    vertices_wp = points_to_warp(vertices_np, device)
     assert tw.validation.is_edge_manifold(
         tw.repair.split_non_manifold_vertices(vertices_wp, faces_wp)[1]
     )
@@ -2160,10 +2158,10 @@ def test_collapse_small_triangles_removes_sliver(icosahedron: tuple[tm.Trimesh, 
     assert (2.0 * areas_wp.numpy()).min() >= epsilon * bbd * bbd * (1.0 - 1e-3)
     # Surviving triangle geometry matches the CPU reference.
     ref = _collapse_small_triangles_ref(vertices_np.astype(np.float64), faces_np, epsilon)
-    got = _sorted_triangle_positions(
+    collapsed_np = _sorted_triangle_positions(
         out_vertices_wp.numpy().astype(np.float64), out_faces_wp.numpy().reshape(-1, 3)
     )
-    assert _triangle_set_close(got, ref, atol=1e-4)
+    assert _triangle_set_close(collapsed_np, ref, atol=1e-4)
 
 
 def test_collapse_small_triangles_fan_chain(device: str) -> None:
@@ -2195,10 +2193,10 @@ def test_collapse_small_triangles_fan_chain(device: str) -> None:
     _, areas_wp = tw.triangles.face_normals_and_areas(out_vertices_wp, out_faces_wp)
     assert (2.0 * areas_wp.numpy()).min() >= epsilon * bbd * bbd * (1.0 - 1e-3)
     ref = _collapse_small_triangles_ref(vertices_np.astype(np.float64), faces_np, epsilon)
-    got = _sorted_triangle_positions(
+    collapsed_np = _sorted_triangle_positions(
         out_vertices_wp.numpy().astype(np.float64), out_faces_wp.numpy().reshape(-1, 3)
     )
-    assert _triangle_set_close(got, ref, atol=1e-3)
+    assert _triangle_set_close(collapsed_np, ref, atol=1e-3)
 
 
 @pytest.mark.parity("collapse_small_triangles", "meshlib")
