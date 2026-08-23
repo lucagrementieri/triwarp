@@ -25,7 +25,9 @@ from tests.conversions import (
     meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
     numpy_to_meshlib,
+    numpy_to_pymeshfix,
     numpy_to_warp,
+    pymeshfix_to_numpy,
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
@@ -250,6 +252,71 @@ def test_remove_unreferenced_vertices_matches_meshlib_pack(
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+@pytest.mark.parity(
+    "remove_unreferenced_vertices",
+    "pymeshfix",
+    benchmarked=False,
+    reason="load_array *is* the operation here -- it drops unreferenced vertices as part of the "
+    "connectivity repair it runs before returning -- so there is nothing separable to time and a "
+    "row would price the 67.9 ms load on bunny_decimated under this group's name. The answer is "
+    "the loaded mesh, which is exactly what this test reads.",
+)
+@pytest.mark.parametrize("placement", ["trailing", "interior", "spread"])
+def test_remove_unreferenced_vertices_matches_pymeshfix(device: str, placement: str) -> None:
+    """
+    Class A on the compacted buffer, positions equal **in order** -- the strongest form available.
+
+    Unusual among the pymeshfix comparisons in that the reference is the *loader*: ``load_array``
+    runs a connectivity fix before it returns anything, and dropping unreferenced vertices is part
+    of it. So there is no call to make -- the mesh that comes back is the answer -- and unlike
+    MeshLib's ``pack()`` (which renumbers in its own order and forces a lexsort) it preserves the
+    survivors' relative order, so the two buffers compare element for element with no
+    canonicalization at all.
+
+    Three placements, because the two references that size their vertex buffer by ``F.max() + 1``
+    behave *differently* by position and this one does not: a **trailing** spare, an **interior**
+    one, and three spread through the buffer all come back as the same 162 positions in the same
+    order. That is what makes the class-A claim safe here where
+    [`test_remove_unreferenced_vertices_matches_meshlib_pack`] has to lexsort.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    vertices_np, faces_np = np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces)
+    if placement == "trailing":
+        padded_np = np.vstack([vertices_np, [[5.0, 5.0, 5.0]]])
+        shifted_np = faces_np
+    elif placement == "interior":
+        padded_np = np.vstack([vertices_np[:5], [[5.0, 5.0, 5.0]], vertices_np[5:]])
+        shifted_np = np.where(faces_np >= 5, faces_np + 1, faces_np)
+    else:
+        padded_np = np.vstack(
+            [
+                vertices_np[:3],
+                [[9.0, 0.0, 0.0]],
+                vertices_np[3:20],
+                [[9.0, 1.0, 0.0]],
+                vertices_np[20:],
+                [[9.0, 2.0, 0.0]],
+            ]
+        )
+        shifted_np = np.where(
+            faces_np >= 20, faces_np + 2, np.where(faces_np >= 3, faces_np + 1, faces_np)
+        )
+
+    vertices_wp, faces_wp = numpy_to_warp(padded_np, shifted_np, device)
+    kept_wp, kept_faces_wp, _remap_wp = tw.repair.remove_unreferenced_vertices(
+        vertices_wp, faces_wp
+    )
+
+    kept_pmf, kept_faces_pmf = pymeshfix_to_numpy(numpy_to_pymeshfix(padded_np, shifted_np))
+
+    # Non-vacuity: the reference really dropped the spares rather than passing the buffer through.
+    assert kept_pmf.shape[0] == vertices_np.shape[0] < padded_np.shape[0]
+    assert kept_faces_pmf.shape[0] == faces_np.shape[0]
+    assert int(kept_wp.shape[0]) == kept_pmf.shape[0]
+    assert int(kept_faces_wp.shape[0]) // 3 == kept_faces_pmf.shape[0]
+    assert np.allclose(kept_wp.numpy().astype(np.float64), kept_pmf, rtol=1e-5, atol=1e-5)
 
 
 def test_remove_duplicate_vertices_exact(device: str):
@@ -763,6 +830,60 @@ def test_make_winding_consistent_on_a_non_orientable_mesh(
     assert np.array_equal(after[:, 0], before[:, 0])
     assert np.array_equal(np.sort(after, axis=1), np.sort(before, axis=1))
     assert len(mesh_tm.faces) == after.shape[0]
+
+
+@pytest.mark.parity(
+    "make_winding_consistent",
+    "pymeshfix",
+    benchmarked=False,
+    reason="rewinding happens inside load_array, so as with remove_unreferenced_vertices there is "
+    "no separable call to time and a row would price the load. Measured on bunny that load is "
+    "439.6 ms; the operation inside it cannot be isolated at all.",
+)
+@pytest.mark.parametrize("n_flipped", [1, 10, 40])
+def test_make_winding_consistent_matches_pymeshfix(device: str, n_flipped: int) -> None:
+    """
+    Class B: both reach a consistent winding, equal **up to the global sign**, which is free.
+
+    The buffer cannot be compared -- ``return_arrays`` reorders the faces and starts each row at a
+    different corner even when nothing was repaired -- so the transform is to compare the *property*
+    the operation exists to establish plus the enclosed volume, which is what says the two chose the
+    same surface rather than merely each choosing something self-consistent. That is more than a
+    tautology: ``is_winding_consistent`` alone would pass for a mesh wound entirely inward, and only
+    the magnitude match rules out one side having rewound a subset the other left alone.
+
+    The **sign** is compared with ``abs`` deliberately, because it is a genuine free choice and the
+    two do disagree. Neither algorithm prefers outward -- pymeshfix leaves an *all*-backwards
+    icosphere at volume -3.6587 rather than fixing it -- and each propagates from its own seed face,
+    so which of the two orientation classes wins depends on the input. Measured across 1 / 10 / 40 /
+    160 / 300 of 320 faces flipped: they agree at +4.0470 for 1 and 10, at **-4.0470** for 160 and
+    300, and **split** at 40, where triwarp reads +4.0470 and pymeshfix -4.0470. Turning the surface
+    inside out is [`make_normals_outward`][triwarp.repair.make_normals_outward]'s job, not this
+    one's, and asserting a sign here would pin an arbitrary tie-break.
+
+    Parametrized over 1, 10 and 40 flipped faces, which spans both the agreeing and the diverging
+    cases.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    vertices_np, faces_np = np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).copy()
+    flipped_np = np.random.default_rng(7).choice(faces_np.shape[0], n_flipped, replace=False)
+    faces_np[flipped_np] = faces_np[flipped_np][:, ::-1]
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    assert not tw.validation.is_winding_consistent(faces_wp)  # non-vacuity: input really is broken
+    fixed_wp = tw.repair.make_winding_consistent(faces_wp)
+
+    tin_pmf = numpy_to_pymeshfix(vertices_np, faces_np)
+    assert tin_pmf.n_faces == faces_np.shape[0]  # the loader rewound rather than cutting
+    assert tin_pmf.n_points == vertices_np.shape[0]
+    vertices_pmf, faces_pmf = pymeshfix_to_numpy(tin_pmf)
+
+    assert tw.validation.is_winding_consistent(fixed_wp)
+    assert tw.validation.is_winding_consistent(numpy_to_warp(vertices_pmf, faces_pmf, device)[1])
+    volume_wp = warp_to_trimesh(vertices_wp, fixed_wp).volume
+    volume_pmf = tm.Trimesh(vertices_pmf, faces_pmf, process=False).volume
+    assert np.isclose(abs(volume_wp), abs(volume_pmf), rtol=1e-5, atol=1e-5)
+    assert np.isclose(abs(volume_wp), mesh_tm.volume, rtol=1e-5, atol=1e-5)
 
 
 def test_make_winding_consistent_idempotent(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
@@ -1335,6 +1456,47 @@ def test_split_nonmanifold_empty(device: str) -> None:
     assert int(new_vertices_wp.shape[0]) == 0
     assert int(new_faces_wp.shape[0]) == 0
     assert int(source_wp.shape[0]) == 0
+
+
+@pytest.mark.parity(
+    "split_non_manifold_vertices",
+    "pymeshfix",
+    benchmarked=False,
+    reason="the cut happens inside load_array, which also drops unreferenced vertices and rewinds, "
+    "so a row would price the whole loader (67.9 ms on bunny_decimated) under this group's name "
+    "and would be timing three operations at once. The cut itself is what this test compares.",
+)
+def test_split_non_manifold_vertices_matches_pymeshfix(device: str) -> None:
+    """
+    Class B on the one input where the minimal cut is **unique**: the bowtie.
+
+    Two triangles meeting at a single vertex have exactly one way to be pulled apart -- duplicate
+    that vertex -- so both sides go from 5 vertices to 6 with all 2 faces kept, and the counts
+    compare directly. The transform is that pymeshfix's cut arrives through ``load_array`` rather
+    than through a call of its own.
+
+    The three-faces-on-one-edge input is deliberately **not** compared, and the numbers say why:
+    pymeshfix cuts 5 vertices to **7** and triwarp to **9**, both edge-manifold afterwards. Neither
+    is wrong -- an edge with three faces can be separated into three boundary edges (triwarp, which
+    keeps two corners together only across a manifold consistently-oriented edge) or into a
+    manifold pair plus one loose sheet (pymeshfix) -- and there is no canonical answer to compare
+    against, so a count assert there would be pinning an arbitrary choice.
+    """
+    vertices_np, faces_np = _bowtie_np()
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    assert not tw.validation.is_vertex_manifold(faces_wp)  # non-vacuity: there is a cut to make
+
+    split_wp, split_faces_wp, _source_wp = tw.repair.split_non_manifold_vertices(
+        vertices_wp, faces_wp
+    )
+    vertices_pmf, faces_pmf = pymeshfix_to_numpy(numpy_to_pymeshfix(vertices_np, faces_np))
+
+    assert vertices_pmf.shape[0] == vertices_np.shape[0] + 1  # the reference really cut
+    assert faces_pmf.shape[0] == faces_np.shape[0]
+    assert int(split_wp.shape[0]) == vertices_pmf.shape[0]
+    assert int(split_faces_wp.shape[0]) // 3 == faces_pmf.shape[0]
+    assert tw.validation.is_vertex_manifold(split_faces_wp)
+    assert tw.validation.is_vertex_manifold(numpy_to_warp(vertices_pmf, faces_pmf, device)[1])
 
 
 def test_remove_degenerate_faces_matches_trimesh(device: str) -> None:

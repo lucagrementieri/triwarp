@@ -25,6 +25,7 @@ from tests.conversions import (
     numpy_to_meshlib_bitset,
     numpy_to_pymeshfix,
     numpy_to_warp,
+    pymeshfix_to_numpy,
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
@@ -1219,6 +1220,157 @@ def test_fill_small_requires_exactly_one_threshold(
     _mesh_tm, mesh_wp = hemisphere
     with pytest.raises(ValueError, match="exactly one"):
         tw.holes.fill_small(mesh_wp.points, mesh_wp.indices, **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parity(
+    "fill_min_weight",
+    "pymeshfix",
+    benchmarked=False,
+    reason="fill_small_boundaries is 8-10 % of a pymeshfix round -- 5.8 ms against 67.9 ms of load "
+    "on bunny_decimated, 51.4 against 439.6 on bunny -- and a PyTMesh accepts exactly one "
+    "load_array, so the build cannot leave the timed callable. A row would report a 90 % load as a "
+    "hole fill, which is the failure mode the stitch/meshlib exemption already describes.",
+)
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus", "two_rims"])
+def test_fill_min_weight_matches_pymeshfix(
+    request: pytest.FixtureRequest, device: str, mesh_name: str
+) -> None:
+    """
+    Class C (a surface distance): the same patch *surface*, from a genuinely different algorithm.
+
+    It cannot be better than C, and the reason is the algorithm rather than a tolerance. MeshFix
+    patches a hole by clipping ears smallest-angle-first -- a greedy in the Barequet-Sharir family
+    -- where this runs the minimum-weight interval DP to optimality. Measured on the two-rim
+    fixture: both produce 22 triangles and **0 of the 22 are shared**, so no relabelling makes the
+    triangulations equal. What *is* comparable is everything else, and all of it is asserted:
+
+    - the patch triangle count is exactly ``B - 2`` per rim on both sides, with no new vertices,
+      which excludes a filler that fans through an added apex, that misses a rim, or that patches
+      one twice;
+    - both results are watertight with Euler characteristic 2, which excludes a self-intersecting
+      or non-manifold patch;
+    - the two surfaces agree to under 5 % of the mean edge length.
+
+    That last bound is where the numbers matter. On ``hemisphere`` and ``half_torus`` the rim is a
+    planar section, so *every* new-vertex-free triangulation of it spans the identical surface and
+    the measurement is float noise (3.1e-08 and 4.3e-08) -- true, and weak. The ``two_rims`` case is
+    the live one: its rims are non-planar, the two triangulations genuinely differ in space, and the
+    distance reads **0.00165**, 1.1 % of the 0.1508 mean edge. Mutation probes on that same input,
+    replacing the DP with a different filler: [`fill_fan`][triwarp.holes.fill_fan] measures 0.0309
+    (20.5 % of the mean edge) and [`fill_cone`][triwarp.holes.fill_cone] 0.0257 (17.1 %), so the 5 %
+    threshold sits 4.5x above the agreement and 4x below the nearest wrong answer.
+    """
+    if mesh_name == "two_rims":
+        mesh_tm, vertices_wp, faces_wp, _sizes = _two_rims_of_different_edge_count(device)
+    else:
+        mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+        vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    n_faces = int(faces_wp.shape[0]) // 3
+    rim_sizes = [int(loop.shape[0]) for loop in tw.boundary.boundary_loops(vertices_wp, faces_wp)]
+    expected = sum(size - 2 for size in rim_sizes)
+    mean_edge = float(
+        np.linalg.norm(
+            mesh_tm.vertices[mesh_tm.edges_unique[:, 0]]
+            - mesh_tm.vertices[mesh_tm.edges_unique[:, 1]],
+            axis=1,
+        ).mean()
+    )
+
+    filled_wp = tw.holes.fill_min_weight(vertices_wp, faces_wp)
+    filled_tm = warp_to_trimesh(vertices_wp, filled_wp)
+
+    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    assert tin_pmf.n_faces == n_faces  # the loader left the mesh alone, so the counts compare
+    assert tin_pmf.n_boundaries == len(rim_sizes)
+    tin_pmf.fill_small_boundaries(nbe=0, refine=False)
+    vertices_pmf, faces_pmf = pymeshfix_to_numpy(tin_pmf)
+    filled_pmf = tm.Trimesh(vertices_pmf, faces_pmf, process=False)
+
+    assert expected > 0  # non-vacuity: there was a hole to fill
+    assert faces_pmf.shape[0] - n_faces == expected
+    assert vertices_pmf.shape[0] == mesh_tm.vertices.shape[0]
+    assert int(filled_wp.shape[0]) // 3 - n_faces == expected
+    assert filled_tm.is_watertight
+    assert filled_pmf.is_watertight
+    assert filled_tm.euler_number == 2
+    assert filled_pmf.euler_number == 2
+    distance = hausdorff_surface_two_sided(
+        np.asarray(filled_tm.vertices), filled_tm.faces, vertices_pmf, faces_pmf
+    )
+    assert distance < 0.05 * mean_edge
+
+
+@pytest.mark.parity(
+    "fill_smooth",
+    "pymeshfix",
+    benchmarked=False,
+    reason="the refinement is 8-10 % of a pymeshfix round behind a load that cannot leave the "
+    "timed callable (5.8 ms against 67.9 ms on bunny_decimated, 51.4 against 439.6 on bunny), so a "
+    "row would price the load. The comparison is a density criterion rather than a cost anyway, "
+    "which "
+    "is what this test records.",
+)
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+def test_fill_smooth_refinement_matches_pymeshfix(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class C: the refined patches occupy the same surface, and insert different numbers of vertices.
+
+    This is the row that isolates the *refinement* stage, so triwarp runs with
+    ``smooth_curvature=False``: pymeshfix's ``refine=True`` densifies and Delaunay-flips the patch
+    but never moves it off the triangulation it filled, and comparing against triwarp's default --
+    which additionally smooths the patch into the surrounding curvature -- would confound two
+    stages. The flag is named for the same reason potpourri3d's solvers are constructed with
+    ``use_robust=False``: both sides must be discretizing the same thing.
+
+    With it off the two surfaces are **identical to float noise** -- 3.1e-08 on ``hemisphere`` and
+    6.1e-08 on ``half_torus`` -- both watertight with Euler characteristic 2. That the numbers are
+    that small rather than merely small is itself the finding: these rims are planar sections, so
+    every unmoved refinement of the patch stays in the rim plane. The assert therefore excludes a
+    refinement that leaves the plane, folds, or breaks watertightness, and nothing about the
+    sampling.
+
+    The sampling is where they genuinely differ, and it is recorded rather than asserted equal:
+    pymeshfix inserts **47** vertices on ``hemisphere`` and **16** on ``half_torus``, triwarp 201
+    and 192. That is a criterion difference, not a tuning one -- MeshFix carries Liepa's per-vertex
+    scale attribute and splits a patch triangle at its centroid while the local sampling is coarser
+    than its neighbourhood, where ``subdivide_region_to_size`` bisects edges against a single
+    global target length. Both refine to a well-graded patch; only one of them is
+    *density*-driven. Closing that gap is a density-refinement pass this comparison is the
+    motivation for.
+
+    Mutation probe for the surface bound, and it is a large one: triwarp's own default
+    (``smooth_curvature=True``) moves the patch to **123 %** of the mean edge on ``hemisphere`` and
+    60 % on ``half_torus``, seven orders of magnitude past the 1e-6 threshold. So the assert is not
+    something any patch of roughly the right shape would pass.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_wp.points.shape[0])
+
+    refined_wp, refined_faces_wp = tw.holes.fill_smooth(
+        mesh_wp.points, mesh_wp.indices, smooth_curvature=False
+    )
+    refined_tm = warp_to_trimesh(refined_wp, refined_faces_wp)
+
+    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    assert tin_pmf.n_points == n_vertices  # the loader left the mesh alone
+    tin_pmf.fill_small_boundaries(nbe=0, refine=True)
+    vertices_pmf, faces_pmf = pymeshfix_to_numpy(tin_pmf)
+    refined_pmf = tm.Trimesh(vertices_pmf, faces_pmf, process=False)
+
+    assert vertices_pmf.shape[0] > n_vertices  # non-vacuity: the reference really refined
+    assert int(refined_wp.shape[0]) > n_vertices
+    assert refined_tm.is_watertight
+    assert refined_pmf.is_watertight
+    assert refined_tm.euler_number == 2
+    assert refined_pmf.euler_number == 2
+    assert (
+        hausdorff_surface_two_sided(
+            np.asarray(refined_tm.vertices), refined_tm.faces, vertices_pmf, faces_pmf
+        )
+        < 1e-6
+    )
 
 
 # ---------------------------------------------------------------------------
