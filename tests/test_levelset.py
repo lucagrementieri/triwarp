@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import math
 
+import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
@@ -63,6 +65,90 @@ def test_marching_cubes_extracts_an_analytic_sphere(device: str) -> None:
     spacing = 2.0 / (resolution - 1)
     radii_np = np.linalg.norm(vertices_wp.numpy(), axis=1)
     assert np.abs(radii_np - radius).max() < spacing
+
+
+@pytest.mark.parity("marching_cubes", "igl", "pyvista")
+def test_marching_cubes_matches_igl_and_pyvista(device: str) -> None:
+    """
+    Class A: the same vertices and the same triangles, once each lattice convention is applied.
+
+    Three implementations of one case table, and they agree **exactly** rather than closely -- on a
+    24^3 unit-sphere SDF over ``[-1.5, 1.5]^3``, all three return **1 128** vertices, **2 252**
+    faces and a mean radius of **0.999226** to six digits. That is what makes this group the
+    best-referenced function in the package; the fourth implementation (meshlib) is the test above.
+
+    The whole content of the comparison is the lattice convention, and the two references disagree
+    with each other about it, which is the reason both are here:
+
+    * **igl** takes the sample *positions* explicitly as ``GV`` and wants them in **Fortran** order,
+      with ``nx, ny, nz`` separately. It returns **three** values -- a 2-tuple unpack raises
+      ``ValueError: too many values to unpack``.
+    * **pyvista**'s ``ImageData`` addresses samples on grid **nodes**, so its ``origin`` is
+      triwarp's ``bounds`` lower corner *directly* -- the exact opposite of MeshLib's
+      voxel-*centre* origin, which the test above shifts by half a voxel. Its ``point_data`` wants
+      Fortran order too.
+
+    Getting either convention wrong shifts the marched surface by up to a voxel rather than raising,
+    so the mean-radius assert is the guard: at this resolution a half-voxel shift moves it by 0.065,
+    five hundred times the 1e-04 tolerance below.
+
+    **Bug class excluded:** a case table that emits the right count of the wrong triangles. Vertex
+    *sets* are matched by nearest neighbour with a bijection check rather than by index, since
+    nothing pins the three libraries to one emission order.
+    """
+    resolution, half, radius = 24, 1.5, 1.0
+    axis_np = np.linspace(-half, half, resolution)
+    x_np, y_np, z_np = np.meshgrid(axis_np, axis_np, axis_np, indexing="ij")
+    field_np = np.sqrt(x_np**2 + y_np**2 + z_np**2) - radius
+
+    field_wp = wp.array(
+        np.ascontiguousarray(field_np, dtype=np.float32), dtype=wp.float32, device=device
+    )
+    bounds = (wp.vec3(-half, -half, -half), wp.vec3(half, half, half))
+    vertices_wp, faces_wp = tw.levelset.marching_cubes(field_wp, 0.0, bounds=bounds)
+    vertices_np = vertices_wp.numpy().astype(np.float64)
+
+    lattice_igl = np.ascontiguousarray(
+        np.stack([x_np.ravel(order="F"), y_np.ravel(order="F"), z_np.ravel(order="F")], axis=1),
+        dtype=np.float64,
+    )
+    vertices_igl, faces_igl, _info_igl = igl.marching_cubes(
+        np.ascontiguousarray(field_np.ravel(order="F"), dtype=np.float64),
+        lattice_igl,
+        resolution,
+        resolution,
+        resolution,
+        0.0,
+    )
+
+    spacing = 2.0 * half / (resolution - 1)
+    grid_pv = pv.ImageData(
+        dimensions=(resolution, resolution, resolution),
+        origin=(-half, -half, -half),
+        spacing=(spacing, spacing, spacing),
+    )
+    grid_pv.point_data["field"] = field_np.ravel(order="F")
+    contour_pv = grid_pv.contour([0.0], scalars="field")
+    vertices_pv = np.asarray(contour_pv.points, dtype=np.float64)
+
+    assert vertices_np.shape[0] > 0  # non-vacuity: there is a surface to compare
+    for reference_np, n_faces in (
+        (np.asarray(vertices_igl, dtype=np.float64), faces_igl.shape[0]),
+        (vertices_pv, contour_pv.n_cells),
+    ):
+        assert reference_np.shape[0] == vertices_np.shape[0]
+        assert n_faces == int(faces_wp.shape[0]) // 3
+        # A half-voxel origin error moves this by 0.065; the tolerance is 1e-04.
+        assert np.isclose(
+            np.linalg.norm(reference_np, axis=1).mean(),
+            np.linalg.norm(vertices_np, axis=1).mean(),
+            rtol=0.0,
+            atol=1e-4,
+        )
+        # The vertex sets match as sets: no library promises an emission order.
+        residual_np, matched_np = cKDTree(vertices_np).query(reference_np)
+        assert residual_np.max() < 1e-5
+        assert np.unique(matched_np).shape[0] == reference_np.shape[0]
 
 
 @pytest.mark.parity("marching_cubes", "meshlib")

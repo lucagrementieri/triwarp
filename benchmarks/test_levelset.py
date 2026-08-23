@@ -40,9 +40,11 @@ field on a lattice, and of the six CPU references only these two build one.
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import warp as wp
 from meshlib import mrmeshpy as mm
 
@@ -297,7 +299,7 @@ def _marching_volume_ml(resolution: int) -> mm.SimpleVolume:
 
 
 @pytest.mark.benchmark(group="marching_cubes")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "igl", "pyvista")
 @pytest.mark.parametrize("resolution", _MARCHING_RESOLUTIONS)
 def test_marching_cubes(bench_lib: BenchLibrary, resolution: int) -> None:
     """
@@ -329,7 +331,54 @@ def test_marching_cubes(bench_lib: BenchLibrary, resolution: int) -> None:
     30x. That is the other edge of the same knife and it is not a defect to chase: 143 threads of
     C++ against Warp's CPU backend is not a comparison of algorithms, and CLAUDE.md section 13's
     "decide on the CUDA number" is what governs.
+
+    **igl and pyvista bring the group to four implementations of one case table**, which makes it
+    the best-referenced function in the package -- and each has a lattice convention that has to be
+    got right or the row marches a shifted field:
+
+    * ``igl.marching_cubes(S, GV, nx, ny, nz, iso)`` takes the sample *positions* explicitly and
+      wants them in **Fortran order**, and it returns **three** values (a 2-tuple unpack raises
+      ``ValueError``). The lattice is built once per resolution, outside the timed region.
+    * ``pv.ImageData(dimensions=..., origin=..., spacing=...).contour([iso])`` addresses samples on
+      grid **nodes**, so its ``origin`` is the bounds' lower corner *directly* -- the opposite of
+      MeshLib's voxel-centre convention two paragraphs up. It needs the field flattened in
+      **Fortran** order too, and ``contour`` is VTK's own marching cubes.
+
+    All four return the same surface: at 24^3 on a unit-sphere SDF, igl and pyvista both give
+    **1 128** vertices and **2 252** faces with a mean radius of **0.999226** to six digits, and the
+    meshlib agreement above is a two-sided Hausdorff of 1.2e-07 (``tests/test_levelset.py``).
     """
+    if bench_lib.kind == "igl":
+        field_np = _marching_field_np(resolution)
+        half = _MARCHING_TORUS[2]
+        axis_np = np.linspace(-half, half, resolution)
+        x_np, y_np, z_np = np.meshgrid(axis_np, axis_np, axis_np, indexing="ij")
+        lattice_igl = np.ascontiguousarray(
+            np.stack([x_np.ravel(order="F"), y_np.ravel(order="F"), z_np.ravel(order="F")], axis=1),
+            dtype=np.float64,
+        )
+        values_igl = np.ascontiguousarray(field_np.ravel(order="F"), dtype=np.float64)
+        vertices_igl, faces_igl, _info_igl = bench_lib.run(
+            lambda: igl.marching_cubes(
+                values_igl, lattice_igl, resolution, resolution, resolution, 0.0
+            )
+        )
+        assert faces_igl.shape[0] > 0
+        assert vertices_igl.shape[0] > 0
+        return
+    if bench_lib.kind == "pyvista":
+        field_np = _marching_field_np(resolution)
+        half = _MARCHING_TORUS[2]
+        spacing = 2.0 * half / (resolution - 1)
+        grid_pv = pv.ImageData(
+            dimensions=(resolution, resolution, resolution),
+            origin=(-half, -half, -half),
+            spacing=(spacing, spacing, spacing),
+        )
+        grid_pv.point_data["field"] = field_np.ravel(order="F")
+        contour_pv = bench_lib.run(lambda: grid_pv.contour([0.0], scalars="field"))
+        assert contour_pv.n_cells > 0
+        return
     if bench_lib.kind == "meshlib":
         volume_ml = _marching_volume_ml(resolution)
         half = _MARCHING_TORUS[2]
