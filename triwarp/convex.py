@@ -114,7 +114,7 @@ def face_adjacency_projections(
     if n_faces == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
 
-    face_adjacency, face_adjacency_edges = tw.adjacency.resolved_face_adjacency(
+    face_adjacency, face_adjacency_edges = tw.adjacency.resolve_face_adjacency(
         faces, face_adjacency, face_adjacency_edges, n_vertices=int(vertices.shape[0])
     )
 
@@ -197,7 +197,7 @@ def face_adjacency_convex(
     if n_faces == 0:
         return wp.empty(0, dtype=wp.bool, device=device)
 
-    face_adjacency, face_adjacency_edges = tw.adjacency.resolved_face_adjacency(
+    face_adjacency, face_adjacency_edges = tw.adjacency.resolve_face_adjacency(
         faces, face_adjacency, face_adjacency_edges, n_vertices=int(vertices.shape[0])
     )
 

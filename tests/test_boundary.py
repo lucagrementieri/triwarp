@@ -500,7 +500,7 @@ def test_boundary_loop(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     loop_igl = igl.boundary_loop(mesh_tm.faces.astype(np.int64))
-    loop_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
+    loop_wp = tw.boundary.longest_boundary_loop(mesh_wp.points, mesh_wp.indices)
 
     assert np.array_equal(loop_wp.numpy(), loop_igl)
 
@@ -508,7 +508,7 @@ def test_boundary_loop(request: pytest.FixtureRequest, mesh_name: str) -> None:
 def test_boundary_loops_watertight(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = icosahedron
     assert tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices) == []
-    assert tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices).shape == (0,)
+    assert tw.boundary.longest_boundary_loop(mesh_wp.points, mesh_wp.indices).shape == (0,)
 
 
 def test_boundary_loops_empty(device: str) -> None:
@@ -516,7 +516,7 @@ def test_boundary_loops_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
 
     assert tw.boundary.boundary_loops(vertices_wp, faces_wp) == []
-    assert tw.boundary.boundary_loop(vertices_wp, faces_wp).shape == (0,)
+    assert tw.boundary.longest_boundary_loop(vertices_wp, faces_wp).shape == (0,)
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)

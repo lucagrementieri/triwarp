@@ -1485,7 +1485,7 @@ def closest_pair(points: wp.array[wp.vec3]) -> tuple[int, int, float]:
     recovered -- so it is the same ``k=2`` self-query, reduced instead of returned.
     Answers "does this cloud contain a near-duplicate, and where" in one call, which is the question
     a tolerance for
-    [`triwarp.points.duplicate_point_mask`][triwarp.points.duplicate_point_mask] is normally chosen
+    [`triwarp.points.point_duplicate_mask`][triwarp.points.point_duplicate_mask] is normally chosen
     from.
 
     Parameters
@@ -1519,7 +1519,7 @@ def closest_pair(points: wp.array[wp.vec3]) -> tuple[int, int, float]:
     --------
     [`nearest_neighbor_distance`][triwarp.neighbors.nearest_neighbor_distance]
         The per-point form, when every distance is wanted rather than the smallest.
-    [`triwarp.points.duplicate_point_mask`][triwarp.points.duplicate_point_mask]
+    [`triwarp.points.point_duplicate_mask`][triwarp.points.point_duplicate_mask]
         Exact coincidence rather than proximity, and a mask rather than one pair.
     """
     n = int(points.shape[0])

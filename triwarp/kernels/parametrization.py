@@ -12,7 +12,7 @@ EPSILON_ARAP_EDGE_SQ = wp.constant(wp.float64(1.0e-20))
 
 
 @wp.kernel
-def flipped_faces_mask(
+def face_flipped_mask(
     vertices: wp.array[wp.vec2], faces: wp.array[wp.int32], out_mask: wp.array[wp.bool]
 ) -> None:
     fi = wp.int32(wp.tid())

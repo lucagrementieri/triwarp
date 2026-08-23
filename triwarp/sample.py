@@ -769,10 +769,20 @@ def resolve_seed(seed: int | None) -> int:
     int
         ``seed`` unchanged when provided, otherwise a random value in ``[0, 2**31)``.
 
+    !!! note "The ``resolve_*`` pattern"
+        Three modules carry one of these -- turn an optional argument into the concrete value the
+        wrapper would have derived, so a caller who wants two functions to share the derived thing
+        can resolve it once and pass it to both. Each default is domain knowledge, so they cannot
+        share a module: [`sample.resolve_seed`][triwarp.sample.resolve_seed],
+        [`adjacency.resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency] and
+        [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid].
+
     See Also
     --------
     [`sample_surface`][triwarp.sample.sample_surface]
     [`random_soup`][triwarp.creation.random_soup]
+    [`adjacency.resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency]
+    [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid]
     """
     if seed is None:
         return secrets.randbelow(2**31)

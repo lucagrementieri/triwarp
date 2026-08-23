@@ -126,7 +126,7 @@ def face_adjacency(
     return twt.as_array2d(adjacency, wp.int32)
 
 
-def resolved_face_adjacency(
+def resolve_face_adjacency(
     faces: wp.array[wp.int32],
     face_adjacency: twt.Array2dInt32 | None = None,
     face_adjacency_edges: twt.Array2dInt32 | None = None,
@@ -167,10 +167,20 @@ def resolved_face_adjacency(
     ValueError
         If exactly one of the two is provided.
 
+    !!! note "The ``resolve_*`` pattern"
+        Three modules carry one of these -- turn an optional argument into the concrete value the
+        wrapper would have derived, so a caller who wants two functions to share the derived thing
+        can resolve it once and pass it to both. Each default is domain knowledge, so they cannot
+        share a module: [`sample.resolve_seed`][triwarp.sample.resolve_seed],
+        [`adjacency.resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency] and
+        [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid].
+
     See Also
     --------
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
         The function this calls when nothing was supplied.
+    [`sample.resolve_seed`][triwarp.sample.resolve_seed]
+    [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid]
     """
     _require_paired_adjacency(face_adjacency, face_adjacency_edges)
     if face_adjacency is None:
@@ -376,7 +386,7 @@ def face_adjacency_unshared(
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
     [`trimesh.graph.face_adjacency_unshared`][]
     """
-    # Not resolved_face_adjacency: the None branch below deliberately does *not* call
+    # Not resolve_face_adjacency: the None branch below deliberately does *not* call
     # face_adjacency, recovering both owning faces and the shared edge from the grouped edge
     # indices instead. Only the pairing rule is shared.
     _require_paired_adjacency(face_adjacency, face_adjacency_edges)
@@ -471,7 +481,7 @@ def face_adjacency_angles(
 
     if face_adjacency is None:
         # Through the package namespace because the parameter shadows the module-level function,
-        # which is also how ``resolved_face_adjacency`` reaches it. ``vertices`` already bounds the
+        # which is also how ``resolve_face_adjacency`` reaches it. ``vertices`` already bounds the
         # face indices, so the radix needs no inference.
         face_adjacency = tw.adjacency.face_adjacency(faces, n_vertices=int(vertices.shape[0]))
     if face_normals is None:

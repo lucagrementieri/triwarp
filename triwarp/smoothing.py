@@ -24,10 +24,10 @@ member fix a failure the filters above cannot see:
 [`relax_keep_volume`][triwarp.smoothing.relax_keep_volume] removes the shrinkage locally instead of
 rescaling it away at the end, [`relax_approx`][triwarp.smoothing.relax_approx] fits a plane or a
 quadric to a whole geodesic neighbourhood rather than averaging a 1-ring, and
-[`remove_spikes`][triwarp.smoothing.remove_spikes] moves only the vertices that fail an angle test.
+[`filter_spikes`][triwarp.smoothing.filter_spikes] moves only the vertices that fail an angle test.
 The first three take a vertex ``region`` and a ``max_displacement`` bound, so a relaxation can be
 confined to where it is wanted and kept within a tolerance of the surface it started from;
-``remove_spikes`` needs neither, because the set it touches is the answer to its own test.
+``filter_spikes`` needs neither, because the set it touches is the answer to its own test.
 [`smooth_region_boundary`][triwarp.smoothing.smooth_region_boundary] completes the region trio by
 smoothing the region's *rim curve*, where the two above it smooth across the rim or inside it.
 
@@ -370,13 +370,14 @@ def filter_humphrey(
     return _as_vec3(positions)
 
 
-def remove_spikes(
+def filter_spikes(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     min_angle_sum: float,
     *,
     max_iter: int = 10,
-) -> tuple[wp.array[wp.vec3], int]:
+    return_count: bool = False,
+) -> wp.array[wp.vec3] | tuple[wp.array[wp.vec3], int]:
     """
     Pull needle-like vertices back onto the surface, leaving every other vertex untouched.
 
@@ -403,15 +404,20 @@ def remove_spikes(
         Compare against ``2 * pi``, the flat value.
     max_iter
         Cap on the number of passes.
+    return_count
+        If ``True``, also return ``flattened``.
 
     Returns
     -------
     vertices : wp.array[wp.vec3]
         Repaired positions on ``vertices.device``. Connectivity is untouched, so ``faces`` stays
         valid.
-    flattened : int
-        How many vertex moves were made, summed over the passes -- so a vertex fixed twice counts
-        twice. Zero means nothing was flagged and the buffer is the input's.
+    flattened : int, optional
+        Present when ``return_count=True``. How many vertex moves were made, summed over the passes
+        -- so a vertex fixed twice counts twice, which makes it a report rather than a count of
+        anything in the output. Zero means nothing was flagged and the buffer is the input's. The
+        pass loop stops itself as soon as a pass finds no spike, so the default return is a bare
+        position buffer that drops into a filter chain like every other function here.
 
     Raises
     ------
@@ -424,7 +430,7 @@ def remove_spikes(
         The unrestricted version of the move this makes, over every vertex.
     [`vertex_defects`][triwarp.vertices.vertex_defects]
         ``2 * pi`` minus the same angle sum, which is what the threshold is read against.
-    [`bad_face_mask`][triwarp.repair.bad_face_mask]
+    [`validation.face_defective_mask`][triwarp.validation.face_defective_mask]
         Flags the *faces* a spike produces, where this flags the vertex itself.
     """
     if max_iter < 0:
@@ -432,7 +438,8 @@ def remove_spikes(
     device = faces.device
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0 or max_iter == 0:
-        return wp.clone(vertices), 0
+        cloned = wp.clone(vertices)
+        return (cloned, 0) if return_count else cloned
 
     positions = wp.clone(vertices)
     flattened = 0
@@ -455,7 +462,7 @@ def remove_spikes(
         smoothed = filter_neighborhood_average(positions, faces, iterations=1)
         wp.map(kernel_smoothing.select_position, smoothed, positions, spikes, out=positions)
         flattened += n_spikes
-    return positions, flattened
+    return (positions, flattened) if return_count else positions
 
 
 def equalize_triangle_areas(

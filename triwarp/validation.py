@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import cast
 
 import warp as wp
@@ -200,7 +201,7 @@ def is_vertex_manifold(
     """
     # Resolved before the empty-mesh guard so a caller passing only one half of the pair is told
     # about it whatever the mesh is; on an empty buffer the resolve itself is two empty arrays.
-    adjacency, adjacency_edges = tw.adjacency.resolved_face_adjacency(
+    adjacency, adjacency_edges = tw.adjacency.resolve_face_adjacency(
         faces, face_adjacency, face_adjacency_edges
     )
     if int(faces.shape[0]) // 3 == 0:
@@ -775,7 +776,7 @@ def face_flip_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
     [`is_orientable`][triwarp.validation.is_orientable]
     [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
-    [`flipped_faces_mask`][triwarp.parametrization.flipped_faces_mask]
+    [`face_flipped_mask`][triwarp.parametrization.face_flipped_mask]
 
     Notes
     -----
@@ -783,7 +784,7 @@ def face_flip_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
     mask is still a best-effort flood-fill (matching ``trimesh.repair.fix_winding``).
 
     This is a different flip from
-    [`flipped_faces_mask`][triwarp.parametrization.flipped_faces_mask], which is about the *UV
+    [`face_flipped_mask`][triwarp.parametrization.face_flipped_mask], which is about the *UV
     domain*: this mask flags a triangle whose index order must be reversed to agree with its patch,
     a property of the 3D connectivity that ignores geometry entirely, while that one flags a
     triangle whose UV image has negative signed area. Neither implies the other.
@@ -989,3 +990,125 @@ def is_volume(
         return False
 
     return tw.reduce.sum(tw.triangles.face_signed_volumes(vertices, faces)) > 0.0
+
+
+def face_defective_mask(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    min_quality: float | None = 0.02,
+    max_normal_angle: float | None = None,
+    max_fold_angle: float | None = None,
+) -> wp.array[wp.bool]:
+    """
+    Flag faces that are thin, misoriented relative to their neighbourhood, or folded over it.
+
+    The three criteria are independent and a face is flagged if *any* enabled one fires; each is
+    disabled by passing ``None``. This is the detector behind
+    [`repair.remove_folded_faces`][triwarp.repair.remove_folded_faces] -- unlike the rest of this
+    module it needs geometry rather than topology, which is why it takes ``vertices`` and has no
+    ``is_*`` counterpart: "defective" is a threshold question, not a property of the mesh.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    min_quality
+        Flag a face whose ``radius_ratio``
+        ([`face_quality`][triwarp.triangles.face_quality]) is below this. ``0`` is fully degenerate
+        and ``1`` is equilateral, so this is a *thinness* gate; MeshLab's ``aratio``, whose default
+        of ``0.02`` is this one. ``None`` disables it.
+    max_normal_angle
+        Flag a face whose normal is more than this many **degrees** from the direction of the sum of
+        its edge-neighbours' normals — the local consensus. This catches a single face inserted the
+        wrong way round in an otherwise consistent patch. MeshLab's ``nfratio`` (default ``60``,
+        off by default). ``None`` disables it.
+    max_fold_angle
+        Flag a face that meets *some* neighbour at more than this many **degrees** — a fold, where
+        the two triangles lie almost on top of each other with opposing normals. Of the two faces at
+        such an edge only the one facing *against* its own wider neighbourhood is flagged, since
+        only one of them is the mistake; a face whose neighbours give it no consensus (an isolated
+        face, or a strip of exactly three) is therefore never flagged on this criterion alone.
+        MeshLab's ``folded_faces_angle_threshold`` (default ``160``, off by default). Must be in
+        ``(0, 180]``. ``None`` disables it.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n_faces`` mask on ``faces.device``; ``True`` marks a defective face. All-``False``
+        when every criterion is disabled.
+
+    Raises
+    ------
+    ValueError
+        If ``max_normal_angle`` or ``max_fold_angle`` is outside ``(0, 180]``.
+
+    Notes
+    -----
+    Matches MeshLab's ``compute_selection_bad_faces``; the three parameters are its ``aratio``,
+    ``nfratio`` and ``folded_faces_angle_threshold``.
+
+    See Also
+    --------
+    [`repair.remove_folded_faces`][triwarp.repair.remove_folded_faces]
+        Deletes the folded ones.
+    [`repair.remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
+        Deletes the fully degenerate ones, on an exact test rather than a threshold.
+    [`triwarp.triangles.face_quality`][triwarp.triangles.face_quality]
+        The thinness measure ``min_quality`` gates on.
+    """
+    for name, angle in (("max_normal_angle", max_normal_angle), ("max_fold_angle", max_fold_angle)):
+        if angle is not None and not 0.0 < angle <= 180.0:
+            raise ValueError(f"{name} must be in (0, 180] degrees, got {angle}")
+
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    out_bad = wp.zeros(n_faces, dtype=wp.bool, device=device)
+    if n_faces == 0:
+        return out_bad
+
+    quality = (
+        tw.triangles.face_quality(vertices, faces, metric="radius_ratio")
+        if min_quality is not None
+        else wp.full(n_faces, 1.0, dtype=wp.float32, device=device)
+    )
+    face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
+    neighbor_sum = wp.zeros(n_faces, dtype=wp.vec3, device=device)
+    max_angle = wp.zeros(n_faces, dtype=wp.float32, device=device)
+    if max_normal_angle is not None or max_fold_angle is not None:
+        adjacency = tw.adjacency.face_adjacency(faces, n_vertices=int(vertices.shape[0]))
+        if int(adjacency.shape[0]) > 0:
+            angles = tw.adjacency.face_adjacency_angles(
+                vertices, faces, face_adjacency=adjacency, face_normals=face_normals
+            )
+            wp.launch(
+                kernel_validation.accumulate_neighbor_normals,
+                dim=int(adjacency.shape[0]),
+                inputs=[face_normals, adjacency, angles, neighbor_sum, max_angle],
+                device=device,
+            )
+
+    # -2 is unreachable for a cosine and -1 for the normalized quality, so a disabled criterion
+    # simply never fires and the kernel needs no per-criterion flag.
+    wp.launch(
+        kernel_validation.face_defective_mask,
+        dim=n_faces,
+        inputs=[
+            quality,
+            face_normals,
+            neighbor_sum,
+            max_angle,
+            wp.float32(min_quality if min_quality is not None else -1.0),
+            wp.float32(
+                math.cos(math.radians(max_normal_angle)) if max_normal_angle is not None else -2.0
+            ),
+            wp.float32(
+                math.cos(math.radians(max_fold_angle)) if max_fold_angle is not None else -2.0
+            ),
+            out_bad,
+        ],
+        device=device,
+    )
+    return out_bad

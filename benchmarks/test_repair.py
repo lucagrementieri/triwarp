@@ -32,11 +32,13 @@ expensive for this problem; it was expensive only for the level-propagating form
 used to have.
 
 The two *geometric* defect groups sit on the **quality** axis instead of a defect sweep, because
-their defects are not injectable: ``bad_face_mask`` and ``remove_t_vertices`` look for thin and
+their defects are not injectable: ``face_defective_mask`` and ``flip_t_vertices`` look for thin and
 folded triangles, and ``saddle_graded`` already has them by construction (worst aspect ratio 4 719
-against ``saddle``'s 1.6). ``bad_face_mask`` is a fixed number of passes over the adjacency whatever
-it finds, so it should be flat across that axis; ``remove_t_vertices`` is a flip loop and should
-*not* be, since only the graded mesh gives it work to do. That contrast is the point of the pair.
+against ``saddle``'s 1.6). ``face_defective_mask`` is a fixed number of passes over the adjacency
+whatever it finds, so it should be flat across that axis; ``flip_t_vertices`` is a flip loop and
+should *not* be, since only the graded mesh gives it work to do. That contrast is the point of the
+pair -- and it is now split across two files: the mask moved to ``triwarp.validation`` with the
+other per-element detectors, so its row lives in ``benchmarks/test_validation.py``.
 
 References
 ----------
@@ -275,7 +277,7 @@ def test_remove_non_manifold_faces(bench_case: BenchCase, extra: int) -> None:
     assert int(kept_faces.shape[0]) > 0
 
 
-@pytest.mark.benchmark(group="split_nonmanifold")
+@pytest.mark.benchmark(group="split_non_manifold_vertices")
 @pytest.mark.benchmeshes("sphere_med")
 @pytest.mark.benchlibs("triwarp", "igl", "meshlib")
 @pytest.mark.parametrize("extra", _NON_MANIFOLD_COUNTS, ids=["clean", "nm1024"])
@@ -332,7 +334,7 @@ def test_split_nonmanifold(bench_case: BenchCase, extra: int) -> None:
     vertices = bench_case.vertices_wp
     faces = _faces_with_non_manifold_wp(bench_case, extra)
     split_vertices, split_faces, _source = bench_case.run(
-        lambda: tw.repair.split_nonmanifold(vertices, faces)
+        lambda: tw.repair.split_non_manifold_vertices(vertices, faces)
     )
     assert int(split_faces.shape[0]) == int(faces.shape[0])
     assert int(split_vertices.shape[0]) >= bench_case.n_vertices
@@ -597,55 +599,7 @@ def test_make_volume(bench_case: BenchCase) -> None:
         assert len(bench_case.run(fix_inversion_tm).faces) == bench_case.n_faces
 
 
-@pytest.mark.benchmark(group="bad_face_mask")
-@pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "pymeshlab", "meshlib")
-def test_bad_face_mask(bench_case: BenchCase) -> None:
-    """
-    All three defect criteria at once: face quality, adjacency scatter, per-face gate.
-
-    meshlib's ``findOverlappingTris`` covers the **fold** criterion alone -- it is a proximity
-    search over the AABB tree for near-coincident triangles with near-antiparallel normals, where
-    the other two rows read the dihedral off the face adjacency -- so it is a lower bound on this
-    group and a different algorithm for the one clause it shares. ``maxNormalDot`` is the dihedral
-    threshold in dot-product form (``cos(radians(160))``); the equality of the two answers, and the
-    input class where they part, are in ``tests/test_repair.py``. The tree is lazily built, so the
-    mesh is constructed and pre-warmed outside the timed callable.
-    """
-    n_faces = bench_case.n_faces
-    if bench_case.kind == "meshlib":
-        settings_ml = mm.FindOverlappingSettings()
-        settings_ml.maxNormalDot = float(np.cos(np.radians(160.0)))
-        mesh_part_ml = mm.MeshPart(bench_case.new_mesh_ml())
-        mm.findOverlappingTris(mesh_part_ml, settings_ml)
-        folded_ml = bench_case.run(lambda: mm.findOverlappingTris(mesh_part_ml, settings_ml))
-        assert folded_ml.size() <= n_faces
-        return
-    if bench_case.kind == "pymeshlab":
-        # Selection-only, so the geometry survives and the MeshSet is shared.
-        meshset_pml = bench_case.meshset_pml
-        bench_case.run(
-            lambda: meshset_pml.compute_selection_bad_faces(
-                usear=True,
-                aratio=0.02,
-                usenf=True,
-                nfratio=60.0,
-                select_folded_faces=True,
-                folded_faces_angle_threshold=160.0,
-            )
-        )
-        assert meshset_pml.current_mesh().face_selection_array().shape == (n_faces,)
-        return
-    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    bad = bench_case.run(
-        lambda: tw.repair.bad_face_mask(
-            vertices, faces, min_quality=0.02, max_normal_angle=60.0, max_fold_angle=160.0
-        )
-    )
-    assert bad.shape == (n_faces,)
-
-
-@pytest.mark.benchmark(group="remove_t_vertices")
+@pytest.mark.benchmark(group="flip_t_vertices")
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp", "pymeshlab")
 def test_remove_t_vertices(bench_case: BenchCase) -> None:
@@ -664,7 +618,7 @@ def test_remove_t_vertices(bench_case: BenchCase) -> None:
         assert bench_case.run(repair_pml, rounds=3) > 0
         return
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    flipped = bench_case.run(lambda: tw.repair.remove_t_vertices(vertices, faces), rounds=3)
+    flipped = bench_case.run(lambda: tw.repair.flip_t_vertices(vertices, faces), rounds=3)
     assert int(flipped.shape[0]) == int(faces.shape[0])
 
 
@@ -675,7 +629,7 @@ def test_remove_degenerate_faces(bench_case: BenchCase) -> None:
     """
     Find the zero-area triangles and compact them away: an altitude test, a scan and a gather.
 
-    On the ``quality`` axis rather than a defect sweep for the reason ``bad_face_mask`` is: a
+    On the ``quality`` axis rather than a defect sweep for the reason ``face_defective_mask`` is: a
     degenerate face cannot be injected without changing what the other rows measure, and
     ``saddle_graded``'s worst aspect ratio of 4 719 is the closest a registry mesh comes to one.
     Both sides should be flat across the axis -- neither's cost depends on how many it finds -- and
@@ -935,7 +889,7 @@ def test_eliminate_degree3_vertices(bench_case: BenchCase) -> None:
         pytest.skip(f"{bench_case.mesh_name} is not edge-manifold, so it has no vertex fans")
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     out_vertices, out_faces, removed = bench_case.run(
-        lambda: tw.repair.eliminate_degree3_vertices(vertices, faces), rounds=3
+        lambda: tw.repair.eliminate_degree3_vertices(vertices, faces, return_count=True), rounds=3
     )
     assert removed >= 0
     assert int(out_faces.shape[0]) <= int(faces.shape[0])
@@ -978,7 +932,7 @@ def test_straighten_boundary(bench_case: BenchCase) -> None:
         pytest.skip(f"{bench_case.mesh_name} is not edge-manifold, so the rim cannot be walked")
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     straightened, added = bench_case.run(
-        lambda: tw.repair.straighten_boundary(vertices, faces), rounds=3
+        lambda: tw.repair.straighten_boundary(vertices, faces, return_count=True), rounds=3
     )
     assert added >= 0
     assert int(straightened.shape[0]) >= int(faces.shape[0])

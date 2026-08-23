@@ -658,11 +658,21 @@ def resolve_voxel_grid(
     ValueError
         If ``voxel_size`` is not positive.
 
+    !!! note "The ``resolve_*`` pattern"
+        Three modules carry one of these -- turn an optional argument into the concrete value the
+        wrapper would have derived, so a caller who wants two functions to share the derived thing
+        can resolve it once and pass it to both. Each default is domain knowledge, so they cannot
+        share a module: [`sample.resolve_seed`][triwarp.sample.resolve_seed],
+        [`adjacency.resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency] and
+        [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid].
+
     See Also
     --------
     [`voxelize_points`][triwarp.voxels.voxelize_points]
     [`cell_indices`][triwarp.voxels.cell_indices]
     [`cluster_decimate`][triwarp.remesh.cluster_decimate]
+    [`sample.resolve_seed`][triwarp.sample.resolve_seed]
+    [`adjacency.resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency]
     """
     if voxel_size is None or origin is None:
         if int(points.shape[0]) == 0:

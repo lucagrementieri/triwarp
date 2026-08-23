@@ -15,8 +15,8 @@ nothing about it depends on an inside/outside test.
 Curves are given as **vertex paths** — the form
 [`homology_generators`][triwarp.homology.homology_generators],
 [`boundary_loops`][triwarp.boundary.boundary_loops] and
-[`boundary_loop`][triwarp.boundary.boundary_loop] all produce — packed into one flat buffer with CSR
-offsets. Curves at arbitrary barycentric points are not accepted yet.
+[`longest_boundary_loop`][triwarp.boundary.longest_boundary_loop] all produce — packed into one
+flat buffer with CSR offsets. Curves at arbitrary barycentric points are not accepted yet.
 
 Like the rest of the heat-method family, every stage is a conjugate-gradient solve.
 """

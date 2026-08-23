@@ -2074,7 +2074,7 @@ def flip_by_objective(
           ``aspect_threshold``; the diagonal is then flipped if that improves the worse of the two.
           A T-vertex — a vertex sitting in the interior of a neighbouring edge — is exactly what
           produces such a sliver, which is why this is the repair for one; see
-          [`remove_t_vertices`][triwarp.repair.remove_t_vertices] for the wrapper that says so.
+          [`flip_t_vertices`][triwarp.repair.flip_t_vertices] for the wrapper that says so.
           ``planar_angle`` and ``metric`` are ignored.
     region
         Optional length-``n_faces`` ``wp.bool`` mask; only edges interior to the ``True`` faces are

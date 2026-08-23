@@ -512,7 +512,7 @@ the pymeshlab filter is the thing being caught up with, and in every case the po
 | `cluster_decimate` | `test_remesh` | `meshing_decimation_clustering` | exact agreement with `open3d.simplify_vertex_clustering` on face *and* vertex count |
 | `ambient_occlusion`, `shape_diameter` | `test_visibility` | `compute_scalar_ambient_occlusion`, `..._shape_diameter_function_per_vertex` | **9.3 ms against 662 ms** on `bunny` at 64 rays — the largest ratio in the suite |
 | `flip_by_objective` | `test_remesh` | `meshing_edge_flip_by_planar_optimization` | 2.0 ms against 28.6 ms on `saddle_graded` |
-| `bad_face_mask`, `remove_t_vertices` | `test_repair` | `compute_selection_bad_faces`, `meshing_remove_t_vertices` | 8.9 ms against 24.2 ms on `saddle_graded` |
+| `face_defective_mask`, `flip_t_vertices` | `test_validation`, `test_repair` | `compute_selection_bad_faces`, `meshing_remove_t_vertices` | 8.9 ms against 24.2 ms on `saddle_graded` |
 | `crease_edges`, `cut_along_edges` | `test_seams` | `compute_selection_crease_per_edge`, `meshing_cut_along_crease_edges` | 1.3 ms against 51.6 ms on `sphere_med`, and **24 output vertices against 32** on a cut cube |
 | `uv_seam_edges` | `test_seams` | `compute_selection_by_texture_seams_per_vertex` | **0.94 ms against 300 ms** on `sphere_large`; the filter returns only the seam *vertex set*, unioned with the boundary, so it does strictly less than the triwarp row (which also splits boundaries out and finds foldovers) |
 | `filter_normals`, `filter_two_step`, `filter_sharpen` | `test_smoothing` | `apply_normal_smoothing_per_face`, `apply_coord_two_steps_smoothing`, `apply_coord_unsharp_mask` | 8.3 ms against 124 ms; 0.34 ms against 51.8 ms |
@@ -983,7 +983,7 @@ section), `test_texture` (stores UVs but has no bake or resample), `test_polylin
 unordered segments with no length/resample/simplify), `test_heat_distance` (no geodesic distance),
 `test_selection` (no selection morphology), `test_mesh` (no caching container), `test_graph` (no
 traversal over an abstract CSR), plus the individual functions noted inline. One function is *tested*
-against open3d and deliberately **not** benchmarked: `points.finite_point_mask` is a single `wp.map`
+against open3d and deliberately **not** benchmarked: `points.point_finite_mask` is a single `wp.map`
 over a three-component `isfinite`, so a group would report the ~11 us launch floor and nothing else,
 while `remove_non_finite_points` would be timing its copy of the surviving cloud. Two rows were
 *rejected on measurement* rather than absence and carry the numbers in their module docstrings:

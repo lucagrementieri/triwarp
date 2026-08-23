@@ -48,13 +48,13 @@ both of which additionally *copy* the surviving points into a new cloud -- triwa
 so those rows are upper bounds.
 
 Three groups have no triwarp-side neighbour table to hoist, because they take the cloud directly:
-``radius_outlier_mask``, ``duplicate_point_mask`` and ``farthest_point_sample``. Medians on
+``radius_outlier_mask``, ``point_duplicate_mask`` and ``farthest_point_sample``. Medians on
 ``sphere_med`` (40 962 points, RTX 5090, CUDA against open3d's one core):
 
 | group | triwarp | open3d | ratio |
 |---|---|---|---|
 | ``radius_outlier_mask`` at 2 / 4 mean edges | 0.233 / 0.361 ms | 14.6 / 19.2 ms | 63x / 53x |
-| ``duplicate_point_mask`` | 1.40 ms | 6.18 ms | 4.4x (15x on ``sphere_large``) |
+| ``point_duplicate_mask`` | 1.40 ms | 6.18 ms | 4.4x (15x on ``sphere_large``) |
 | ``farthest_point_sample`` at 64 / 1024 | 1.92 / 32.3 ms | 2.94 / 41.9 ms | 1.5x / 1.3x |
 
 The last row is the one to read carefully: the greedy loop is ``Theta(count)`` launches over the
@@ -619,10 +619,10 @@ def test_radius_outlier_mask(bench_case: BenchCase, radius_scale: float) -> None
         assert len(keep_indices) <= bench_case.n_vertices
 
 
-@pytest.mark.benchmark(group="duplicate_point_mask")
+@pytest.mark.benchmark(group="point_duplicate_mask")
 @pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp", "open3d", "meshlib")
-def test_duplicate_point_mask(bench_case: BenchCase) -> None:
+def test_point_duplicate_mask(bench_case: BenchCase) -> None:
     """
     Exact positional dedup: two ``unique_1d`` rounds over 64-bit keys, then a first-occurrence pass.
 
@@ -669,7 +669,7 @@ def test_duplicate_point_mask(bench_case: BenchCase) -> None:
         assert len(deduplicated_o3d.points) <= bench_case.n_vertices
         return
     points = bench_case.vertices_wp
-    mask = bench_case.run(lambda: tw.points.duplicate_point_mask(points))
+    mask = bench_case.run(lambda: tw.points.point_duplicate_mask(points))
     assert mask.shape == (bench_case.n_vertices,)
 
 

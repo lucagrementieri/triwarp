@@ -1243,9 +1243,9 @@ def test_inflate_deflates_and_handles_edge_cases(device: str) -> None:
         tw.smoothing.inflate(vertices_wp, faces_wp, 0.1, iterations=-1)
 
 
-@pytest.mark.parity("remove_spikes", "meshlib")
+@pytest.mark.parity("filter_spikes", "meshlib")
 @pytest.mark.parametrize("threshold_turns", [0.5, 0.75])
-def test_remove_spikes_matches_meshlib(
+def test_filter_spikes_matches_meshlib(
     torus_spikes: tuple[tm.Trimesh, wp.Mesh], threshold_turns: float
 ) -> None:
     """
@@ -1282,7 +1282,9 @@ def test_remove_spikes_matches_meshlib(
     )
     assert np.array_equal(spikes_np, spikes_ml)
 
-    repaired_wp, flattened = tw.smoothing.remove_spikes(vertices_wp, faces_wp, min_angle_sum)
+    repaired_wp, flattened = tw.smoothing.filter_spikes(
+        vertices_wp, faces_wp, min_angle_sum, return_count=True
+    )
     moved_np = np.abs(repaired_wp.numpy() - vertices_wp.numpy()).max(axis=1) > 1e-7
     assert flattened == int(spikes_np.sum())
     assert int(moved_np.sum()) == int(spikes_np.sum())
@@ -1305,7 +1307,28 @@ def test_remove_spikes_matches_meshlib(
     assert not np.any((2.0 * np.pi - after_np) < min_angle_sum)
 
 
-def test_remove_spikes_leaves_a_clean_mesh_alone(
+def test_filter_spikes_return_count_shapes(torus_spikes: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: the two return shapes of the ``return_count`` keyword.
+
+    The default is the bare position buffer, which is what makes this composable with every other
+    filter in this module -- it was the one member whose return was not a ``wp.array[wp.vec3]``.
+    Both forms must describe the same call, so the positions are compared as well as the shapes.
+    """
+    _mesh_tm, mesh_wp = torus_spikes
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+
+    positions_only_wp = tw.smoothing.filter_spikes(vertices_wp, faces_wp, math.pi)
+    assert isinstance(positions_only_wp, wp.array)
+
+    positions_wp, flattened = tw.smoothing.filter_spikes(
+        vertices_wp, faces_wp, math.pi, return_count=True
+    )
+    assert flattened > 0  # non-vacuity: the fixture really has spikes
+    assert np.array_equal(positions_only_wp.numpy(), positions_wp.numpy())
+
+
+def test_filter_spikes_leaves_a_clean_mesh_alone(
     icosphere: tuple[tm.Trimesh, wp.Mesh], device: str
 ) -> None:
     """
@@ -1317,15 +1340,17 @@ def test_remove_spikes_leaves_a_clean_mesh_alone(
     """
     _, mesh_wp = icosphere
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
-    repaired_wp, flattened = tw.smoothing.remove_spikes(vertices_wp, faces_wp, math.pi)
+    repaired_wp, flattened = tw.smoothing.filter_spikes(
+        vertices_wp, faces_wp, math.pi, return_count=True
+    )
     assert flattened == 0
     assert np.array_equal(repaired_wp.numpy(), vertices_wp.numpy())
 
     empty_vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
     empty_faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    assert tw.smoothing.remove_spikes(empty_vertices_wp, empty_faces_wp, math.pi)[0].shape == (0,)
+    assert tw.smoothing.filter_spikes(empty_vertices_wp, empty_faces_wp, math.pi).shape == (0,)
     with pytest.raises(ValueError, match="max_iter must be non-negative"):
-        tw.smoothing.remove_spikes(vertices_wp, faces_wp, math.pi, max_iter=-1)
+        tw.smoothing.filter_spikes(vertices_wp, faces_wp, math.pi, max_iter=-1)
 
 
 @pytest.mark.parity("equalize_triangle_areas", "meshlib")

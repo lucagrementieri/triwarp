@@ -833,9 +833,9 @@ def test_inflate(bench_case: BenchCase) -> None:
     assert int(inflated.shape[0]) == bench_case.n_vertices
 
 
-@pytest.mark.benchmark(group="remove_spikes")
+@pytest.mark.benchmark(group="filter_spikes")
 @pytest.mark.benchlibs("triwarp", "meshlib")
-def test_remove_spikes(bench_case: BenchCase) -> None:
+def test_filter_spikes(bench_case: BenchCase) -> None:
     """
     Detect and flatten needle vertices: per pass, the corner angles, a defect scatter and one map.
 
@@ -869,7 +869,7 @@ def test_remove_spikes(bench_case: BenchCase) -> None:
         return
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     repaired, flattened = bench_case.run(
-        lambda: tw.smoothing.remove_spikes(vertices, faces, threshold), rounds=3
+        lambda: tw.smoothing.filter_spikes(vertices, faces, threshold, return_count=True), rounds=3
     )
     assert flattened >= 0
     assert int(repaired.shape[0]) == bench_case.n_vertices

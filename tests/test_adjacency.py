@@ -94,7 +94,7 @@ def test_face_adjacency_empty(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)
-def test_resolved_face_adjacency_derives_and_forwards(
+def test_resolve_face_adjacency_derives_and_forwards(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
@@ -108,11 +108,11 @@ def test_resolved_face_adjacency_derives_and_forwards(
     n_vertices = int(mesh_wp.points.shape[0])
     adjacency_wp, edges_wp = tw.adjacency.face_adjacency(mesh_wp.indices, return_edges=True)
 
-    derived_wp, derived_edges_wp = tw.adjacency.resolved_face_adjacency(mesh_wp.indices)
-    supplied_wp, supplied_edges_wp = tw.adjacency.resolved_face_adjacency(
+    derived_wp, derived_edges_wp = tw.adjacency.resolve_face_adjacency(mesh_wp.indices)
+    supplied_wp, supplied_edges_wp = tw.adjacency.resolve_face_adjacency(
         mesh_wp.indices, n_vertices=n_vertices
     )
-    passed_wp, passed_edges_wp = tw.adjacency.resolved_face_adjacency(
+    passed_wp, passed_edges_wp = tw.adjacency.resolve_face_adjacency(
         mesh_wp.indices, adjacency_wp, edges_wp, n_vertices=n_vertices
     )
 
@@ -508,7 +508,7 @@ def test_face_adjacency_angles_matches_meshlib(
     what makes a missed pair a failure rather than a silently smaller comparison.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    adjacency_wp, adjacency_edges_wp = tw.adjacency.resolved_face_adjacency(
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.resolve_face_adjacency(
         mesh_wp.indices, n_vertices=int(mesh_wp.points.shape[0])
     )
     angles_wp = tw.adjacency.face_adjacency_angles(

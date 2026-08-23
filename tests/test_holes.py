@@ -1841,8 +1841,8 @@ def test_stitch_loops_matches_numpy(
     va_np, fa_np, va, fa = bottom
     vb_np, fb_np, vb, fb = top
 
-    loop_a = tw.boundary.boundary_loop(va, fa)
-    loop_b = tw.boundary.boundary_loop(vb, fb)
+    loop_a = tw.boundary.longest_boundary_loop(va, fa)
+    loop_b = tw.boundary.longest_boundary_loop(vb, fb)
 
     _, faces_wp = tw.holes.stitch_loops(va, fa, loop_a, vb, fb, loop_b)
     faces_np = _stitch_loops_np(va_np, fa_np, loop_a.numpy(), vb_np, fb_np, loop_b.numpy())
@@ -1857,7 +1857,7 @@ def test_stitch_loops_rejects_small_loop(device: str) -> None:
     _, _, va, fa = _cone_wp(device=device, n=8, apex_z=-1.0, rim_z=0.0)
     _, _, vb, fb = _cone_wp(device=device, n=8, apex_z=1.0, rim_z=0.5)
 
-    loop_a = tw.boundary.boundary_loop(va, fa)
+    loop_a = tw.boundary.longest_boundary_loop(va, fa)
     tiny_loop = wp.array(np.array([0, 1], dtype=np.int32), dtype=wp.int32, device=device)
     with pytest.raises(ValueError, match="at least 3 vertices"):
         tw.holes.stitch_loops(va, fa, loop_a, vb, fb, tiny_loop)

@@ -399,3 +399,54 @@ def sliver_patch(device: str) -> tuple[np.ndarray, np.ndarray, wp.array, wp.arra
         wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=device),
         wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device),
     )
+
+
+@pytest.fixture
+def t_vertex_patch() -> tuple[np.ndarray, np.ndarray]:
+    """
+    Two quads stitched at different resolutions, so the left one carries a T-vertex.
+
+    Vertex 4 sits on the interior of the edge ``(1, 2)`` of the right quad's triangulation, which is
+    exactly a T-junction: the triangle ``(1, 2, 4)`` is a sliver whose apex is on its own long edge.
+    Flipping ``(1, 2)`` to ``(3, 4)`` removes it without moving a vertex.
+    """
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],  # 0
+            [1.0, 0.0, 0.0],  # 1
+            [1.0, 2.0, 0.0],  # 2
+            [0.0, 2.0, 0.0],  # 3
+            [1.0, 1.0, 0.02],  # 4 -- barely off the (1, 2) edge, and off-plane so a flip is legal
+            [2.0, 0.0, 0.0],  # 5
+            [2.0, 2.0, 0.0],  # 6
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array(
+        [[0, 1, 3], [1, 2, 3], [1, 5, 4], [4, 5, 6], [4, 6, 2], [1, 4, 2]], dtype=np.int32
+    )
+    return vertices, faces
+
+
+@pytest.fixture
+def folded_patch() -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build a flat two-triangle quad plus a third triangle folded back on top of it.
+
+    Face 2 shares edge ``(1, 3)`` with face 1 and lies almost in the same plane with the *opposite*
+    normal, so the dihedral there is ~179 degrees. Every edge still has at most two faces — a third
+    face on the folded edge would make it non-manifold, which ``face_adjacency`` drops entirely and
+    which would make this fixture measure nothing.
+    """
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.1, 0.9, 0.02],  # the folded apex: back over the quad
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array([[0, 1, 2], [1, 3, 2], [3, 1, 4]], dtype=np.int32)
+    return vertices, faces

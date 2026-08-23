@@ -311,7 +311,7 @@ def uv_seam_edges(
     [`uv_seam_vertex_mask`][triwarp.seams.uv_seam_vertex_mask]
     [`crease_edges`][triwarp.seams.crease_edges]
     [`cut_along_edges`][triwarp.seams.cut_along_edges]
-    [`triwarp.parametrization.flipped_face_indices`][triwarp.parametrization.flipped_face_indices]
+    [`triwarp.parametrization.face_flipped_indices`][triwarp.parametrization.face_flipped_indices]
 
     Notes
     -----

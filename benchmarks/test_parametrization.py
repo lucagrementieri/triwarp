@@ -77,9 +77,9 @@ import igl
 import numpy as np
 import pytest
 import warp as wp
-from conftest import BenchCase
 
 import triwarp as tw
+from conftest import BenchCase
 
 # Local/global alternations for ARAP. The pair brackets "converged early" against "ran the full
 # schedule": each iteration is a per-face SVD pass plus a CG solve, so the slope is the per-
@@ -100,7 +100,7 @@ def _boundary(bench_case: BenchCase) -> tuple[wp.array[wp.int32], wp.array[wp.ve
     key = (bench_case.mesh_name, str(bench_case.device))
     if key not in _boundary_cache:
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-        loop = tw.boundary.boundary_loop(vertices, faces)
+        loop = tw.boundary.longest_boundary_loop(vertices, faces)
         _boundary_cache[key] = (loop, tw.parametrization.map_vertices_to_circle(vertices, loop))
     return _boundary_cache[key]
 

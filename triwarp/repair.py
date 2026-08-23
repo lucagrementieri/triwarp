@@ -8,17 +8,29 @@ Five defects are visible in the index buffer alone, and each has a remover:
 [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces], and
 [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles].
 
-Two further defects need geometry rather than topology to detect, so they have their own detector:
-[`bad_face_mask`][triwarp.repair.bad_face_mask] flags faces that are too thin, misoriented against
-their neighbourhood, or folded back over it.
-[`remove_folded_faces`][triwarp.repair.remove_folded_faces] deletes the folded ones and
-[`remove_t_vertices`][triwarp.repair.remove_t_vertices] flips away the slivers a T-junction leaves
-behind.
+Two further defects need geometry rather than topology to detect, so they are found by a threshold
+rather than a rule: [`validation.face_defective_mask`][triwarp.validation.face_defective_mask] flags
+faces that are too thin, misoriented against their neighbourhood, or folded back over it -- it lives
+with the other per-element detectors. [`remove_folded_faces`][triwarp.repair.remove_folded_faces]
+deletes the folded ones and [`flip_t_vertices`][triwarp.repair.flip_t_vertices] flips away the
+slivers a T-junction leaves behind.
+
+The verb predicts the return shape, and that is a rule rather than a coincidence:
+
+- **``remove_*`` / ``collapse_*``** change the element count, so they return ``(vertices, faces)``
+  or more -- there is a new position buffer because vertices went away or moved.
+- **``make_*``** preserve positions and counts and rewrite only the index buffer, so they return
+  ``faces`` alone.
+- **``*_mask``** are detectors: they return a ``wp.array[wp.bool]`` and mutate nothing. The one this
+  module used to hold now lives in [`triwarp.validation`][triwarp.validation].
+
+[`flip_t_vertices`][triwarp.repair.flip_t_vertices] is named for the third pattern rather than the
+first because it removes nothing: it flips the long edge of each sliver a T-junction leaves, so the
+face count is unchanged and only ``faces`` comes back.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Literal
 
 import numpy as np
@@ -165,6 +177,13 @@ def duplicate_vertex_inverse(vertices: wp.array[wp.vec3], epsilon: float) -> wp.
     attributes (colors, UVs, ...) to match a [`remove_duplicated_vertices`]
     [triwarp.repair.remove_duplicated_vertices] call made with the same ``epsilon``.
 
+    This is the shared equivalence map the dedup remaps by, not a remover -- which is why it lives
+    here rather than in [`triwarp.grouping`][triwarp.grouping] beside
+    [`first_occurrence_indices`][triwarp.grouping.first_occurrence_indices], whose shape it has. Its
+    key is a *tolerance-quantized position*, and choosing that tolerance is mesh-repair policy;
+    ``grouping`` is deliberately dtype-generic and geometry-free, so an ``epsilon`` there would be
+    the first crack in that contract.
+
     Parameters
     ----------
     vertices
@@ -183,7 +202,10 @@ def duplicate_vertex_inverse(vertices: wp.array[wp.vec3], epsilon: float) -> wp.
     See Also
     --------
     [`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices]
+        The remover this map is the shared half of.
     [`hash_vector_rows`][triwarp.grouping.hash_vector_rows]
+    [`grouping.first_occurrence_indices`][triwarp.grouping.first_occurrence_indices]
+        The geometry-free counterpart: the same class-to-representative reduction over any key.
     """
     device = vertices.device
     n = int(vertices.shape[0])
@@ -387,7 +409,7 @@ def remove_non_manifold_faces(
     return vertices, faces
 
 
-def split_nonmanifold(
+def split_non_manifold_vertices(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
     """
@@ -622,7 +644,8 @@ def straighten_boundary(
     min_normal_dot: float = 0.9,
     max_aspect_ratio: float = 10.0,
     iterations: int = 1,
-) -> tuple[wp.array[wp.int32], int]:
+    return_count: bool = False,
+) -> wp.array[wp.int32] | tuple[wp.array[wp.int32], int]:
     """
     Close concave notches in the mesh's rim, one triangle at a time.
 
@@ -657,15 +680,19 @@ def straighten_boundary(
         [`face_quality`][triwarp.triangles.face_quality] measures it.
     iterations
         Number of independent-set passes.
+    return_count
+        If ``True``, also return ``added``.
 
     Returns
     -------
     faces : wp.array[wp.int32]
         Flat triangle index buffer with the new triangles appended. The vertex buffer is unchanged
         and is not returned.
-    added : int
-        How many triangles were added. Zero means no notch passed both gates, and the buffer is the
-        input's.
+    added : int, optional
+        Present when ``return_count=True``. How many triangles were added, summed over the passes.
+        Zero means no notch passed both gates, and the buffer is the input's. A diagnostic: the
+        pass loop already stops itself when a pass closes nothing, so a caller needs this only to
+        report what happened.
 
     Raises
     ------
@@ -687,7 +714,7 @@ def straighten_boundary(
     device = faces.device
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0 or iterations == 0:
-        return faces, 0
+        return (faces, 0) if return_count else faces
 
     added = 0
     for _ in range(iterations):
@@ -735,12 +762,18 @@ def straighten_boundary(
             break
         faces = tw.array.concatenate([faces, accepted.reshape(3 * n_added)])
         added += n_added
-    return faces, added
+    return (faces, added) if return_count else faces
 
 
 def eliminate_degree3_vertices(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, max_iter: int = 8
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], int]:
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    max_iter: int = 8,
+    return_count: bool = False,
+) -> (
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]] | tuple[wp.array[wp.vec3], wp.array[wp.int32], int]
+):
     """
     Remove interior vertices with exactly three incident faces, collapsing each fan to one triangle.
 
@@ -752,7 +785,7 @@ def eliminate_degree3_vertices(
     Adjacent candidates share faces, so a pass removes a maximal **independent** set -- the
     lowest-indexed of any two neighbouring candidates wins, deterministically -- and the loop
     repeats until none is left or ``max_iter`` passes have run. Removing one vertex can create
-    another, which is why the count is a return value rather than a promise.
+    another, which is why ``return_count`` reports what happened rather than promising it.
 
     !!! note "The other half of a double-face pass already exists"
         A pair of triangles on the same three vertices is
@@ -771,6 +804,8 @@ def eliminate_degree3_vertices(
     max_iter
         Cap on the number of passes. Each pass removes an independent set, so a chain of adjacent
         candidates needs one pass per link; the default covers any chain this has been measured on.
+    return_count
+        If ``True``, also return ``removed``.
 
     Returns
     -------
@@ -778,8 +813,10 @@ def eliminate_degree3_vertices(
         Positions of the result, with the removed vertices compacted away. No position moves.
     faces : wp.array[wp.int32]
         Flat triangle index buffer, three faces shorter per removed vertex plus one longer.
-    removed : int
-        How many vertices were eliminated. Zero means the input had none and the buffers are it.
+    removed : int, optional
+        Present when ``return_count=True``. How many vertices were eliminated. Zero means the input
+        had none and the buffers are it. A diagnostic: the pass loop stops itself when a pass finds
+        no candidate, so nothing about calling this correctly depends on reading the count.
 
     Raises
     ------
@@ -847,12 +884,12 @@ def eliminate_degree3_vertices(
         faces = tw.array.concatenate([kept.reshape(-1), new_faces.reshape(3 * n_selected)])
         removed += n_selected
     if removed == 0:
-        return vertices, faces, 0
+        return (vertices, faces, 0) if return_count else (vertices, faces)
     # Compacted **once**, after the loop rather than inside it. A dead vertex has an empty ring and
     # so is never a candidate, which is what makes deferring safe; doing it per pass added a full
     # vertex-and-face pass to every iteration for no change in the answer.
     vertices, faces, _index = remove_unreferenced_vertices(vertices, faces)
-    return vertices, faces, removed
+    return (vertices, faces, removed) if return_count else (vertices, faces)
 
 
 def flatten_degree3_vertices(
@@ -1123,118 +1160,6 @@ def make_normals_outward(
     return make_volume(vertices, wound, multibody=multibody)
 
 
-def bad_face_mask(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    *,
-    min_quality: float | None = 0.02,
-    max_normal_angle: float | None = None,
-    max_fold_angle: float | None = None,
-) -> wp.array[wp.bool]:
-    """
-    Flag faces that are thin, misoriented relative to their neighbourhood, or folded over it.
-
-    MeshLab's ``compute_selection_bad_faces``, and the detector behind
-    [`remove_folded_faces`][triwarp.repair.remove_folded_faces]. The three criteria are independent
-    and a face is bad if *any* enabled one fires; each is disabled by passing ``None``.
-
-    Parameters
-    ----------
-    vertices
-        ``(n_vertices,)`` mesh vertex positions.
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
-    min_quality
-        Flag a face whose ``radius_ratio``
-        ([`face_quality`][triwarp.triangles.face_quality]) is below this. ``0`` is fully degenerate
-        and ``1`` is equilateral, so this is a *thinness* gate; MeshLab's ``aratio``, whose default
-        of ``0.02`` is this one. ``None`` disables it.
-    max_normal_angle
-        Flag a face whose normal is more than this many **degrees** from the direction of the sum of
-        its edge-neighbours' normals — the local consensus. This catches a single face inserted the
-        wrong way round in an otherwise consistent patch. MeshLab's ``nfratio`` (default ``60``,
-        off by default). ``None`` disables it.
-    max_fold_angle
-        Flag a face that meets *some* neighbour at more than this many **degrees** — a fold, where
-        the two triangles lie almost on top of each other with opposing normals. Of the two faces at
-        such an edge only the one facing *against* its own wider neighbourhood is flagged, since
-        only one of them is the mistake; a face whose neighbours give it no consensus (an isolated
-        face, or a strip of exactly three) is therefore never flagged on this criterion alone.
-        MeshLab's ``folded_faces_angle_threshold`` (default ``160``, off by default). Must be in
-        ``(0, 180]``. ``None`` disables it.
-
-    Returns
-    -------
-    wp.array[wp.bool]
-        Length-``n_faces`` mask on ``faces.device``; ``True`` marks a bad face. All-``False`` when
-        every criterion is disabled.
-
-    Raises
-    ------
-    ValueError
-        If ``max_normal_angle`` or ``max_fold_angle`` is outside ``(0, 180]``.
-
-    See Also
-    --------
-    [`remove_folded_faces`][triwarp.repair.remove_folded_faces]
-    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
-    [`triwarp.triangles.face_quality`][triwarp.triangles.face_quality]
-    """
-    for name, angle in (("max_normal_angle", max_normal_angle), ("max_fold_angle", max_fold_angle)):
-        if angle is not None and not 0.0 < angle <= 180.0:
-            raise ValueError(f"{name} must be in (0, 180] degrees, got {angle}")
-
-    device = faces.device
-    n_faces = int(faces.shape[0]) // 3
-    out_bad = wp.zeros(n_faces, dtype=wp.bool, device=device)
-    if n_faces == 0:
-        return out_bad
-
-    quality = (
-        tw.triangles.face_quality(vertices, faces, metric="radius_ratio")
-        if min_quality is not None
-        else wp.full(n_faces, 1.0, dtype=wp.float32, device=device)
-    )
-    face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
-    neighbor_sum = wp.zeros(n_faces, dtype=wp.vec3, device=device)
-    max_angle = wp.zeros(n_faces, dtype=wp.float32, device=device)
-    if max_normal_angle is not None or max_fold_angle is not None:
-        adjacency = tw.adjacency.face_adjacency(faces, n_vertices=int(vertices.shape[0]))
-        if int(adjacency.shape[0]) > 0:
-            angles = tw.adjacency.face_adjacency_angles(
-                vertices, faces, face_adjacency=adjacency, face_normals=face_normals
-            )
-            wp.launch(
-                kernel_repair.accumulate_neighbor_normals,
-                dim=int(adjacency.shape[0]),
-                inputs=[face_normals, adjacency, angles, neighbor_sum, max_angle],
-                device=device,
-            )
-
-    # -2 is unreachable for a cosine and -1 for the normalized quality, so a disabled criterion
-    # simply never fires and the kernel needs no per-criterion flag.
-    wp.launch(
-        kernel_repair.bad_face_mask,
-        dim=n_faces,
-        inputs=[
-            quality,
-            face_normals,
-            neighbor_sum,
-            max_angle,
-            wp.float32(min_quality if min_quality is not None else -1.0),
-            wp.float32(
-                math.cos(math.radians(max_normal_angle)) if max_normal_angle is not None else -2.0
-            ),
-            wp.float32(
-                math.cos(math.radians(max_fold_angle)) if max_fold_angle is not None else -2.0
-            ),
-            out_bad,
-        ],
-        device=device,
-    )
-    return out_bad
-
-
 def remove_folded_faces(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, angle: float = 160.0
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
@@ -1266,8 +1191,8 @@ def remove_folded_faces(
 
     See Also
     --------
-    [`bad_face_mask`][triwarp.repair.bad_face_mask]
-    [`remove_t_vertices`][triwarp.repair.remove_t_vertices]
+    [`validation.face_defective_mask`][triwarp.validation.face_defective_mask]
+    [`flip_t_vertices`][triwarp.repair.flip_t_vertices]
     [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
 
     Notes
@@ -1282,7 +1207,9 @@ def remove_folded_faces(
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.clone(vertices), wp.clone(faces)
-    folded = bad_face_mask(vertices, faces, min_quality=None, max_fold_angle=angle)
+    folded = tw.validation.face_defective_mask(
+        vertices, faces, min_quality=None, max_fold_angle=angle
+    )
     keep = wp.empty(n_faces, dtype=wp.bool, device=faces.device)
     wp.map(kernel_array.mask_not, folded, out=keep)
     return tw.selection.submesh_from_face_mask(vertices, faces, keep)
@@ -1533,6 +1460,15 @@ def eliminate_tunnels(
         How many loops were cut. Zero means nothing was short enough, and the buffers are the
         input's.
 
+        Returned **unconditionally**, unlike the diagnostic counts on
+        [`straighten_boundary`][triwarp.repair.straighten_boundary] and
+        [`eliminate_degree3_vertices`][triwarp.repair.eliminate_degree3_vertices], which sit behind
+        a ``return_count`` keyword. This one is part of the answer rather than a report on it: one
+        call eliminates at most one tunnel per disjoint family, so the documented usage is to loop
+        until it reads zero, and a caller who cannot see it cannot use the function correctly.
+        [`remesh.intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay]'s iteration count is
+        unconditional for the same reason.
+
     Raises
     ------
     ValueError
@@ -1611,7 +1547,7 @@ def _cycle_edges(loop: wp.array[wp.int32]) -> np.ndarray:
     return np.sort(np.stack([loop_np, np.roll(loop_np, -1)], axis=1), axis=1).astype(np.int32)
 
 
-def remove_t_vertices(
+def flip_t_vertices(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     *,

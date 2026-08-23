@@ -168,7 +168,7 @@ def boundary_loops(
     See Also
     --------
     [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]
-    [`boundary_loop`][triwarp.boundary.boundary_loop]
+    [`longest_boundary_loop`][triwarp.boundary.longest_boundary_loop]
     [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
     ``igl.boundary_loop_all``
     """
@@ -222,7 +222,7 @@ def boundary_loops_batched(
     See Also
     --------
     [`boundary_loops`][triwarp.boundary.boundary_loops]
-    [`boundary_loop`][triwarp.boundary.boundary_loop]
+    [`longest_boundary_loop`][triwarp.boundary.longest_boundary_loop]
     [`successor_cycles`][triwarp.graph.successor_cycles]
     """
     n_faces = int(faces.shape[0]) // 3
@@ -326,9 +326,9 @@ def _unoriented_boundary_cycles(
     boundary vertices have boundary-degree 2, and the walk closes with every consecutive pair a
     real boundary edge. Two references get it wrong in different ways and neither is worth
     matching -- ``igl.boundary_loop_all`` cuts that cycle into ``1 + 39 + 38`` open chains (each
-    has exactly one consecutive pair that is *not* a boundary edge) and ``boundary_loop`` reports
-    the longest of them as 39, while a half-edge hole ring walks the band's *double* cover and reads
-    156.
+    has exactly one consecutive pair that is *not* a boundary edge) and
+    ``longest_boundary_loop`` reports the longest of them as 39, while a half-edge hole ring walks
+    the band's *double* cover and reads 156.
 
     The mirror filter and the re-pack run on the host, over a buffer bounded by the **boundary**
     rather than by the mesh, and only ever on a non-orientable surface.
@@ -518,7 +518,7 @@ def _pack_loop_segments(
     return flat_loops, loop_id, starts, sizes, len(loops)
 
 
-def boundary_loop(
+def longest_boundary_loop(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     edges_sorted: twt.Array2dInt32 | None = None,
@@ -526,6 +526,10 @@ def boundary_loop(
 ) -> wp.array[wp.int32]:
     """
     Ordered vertex-index loop along the longest mesh boundary.
+
+    The name carries the *longest*, because the plural
+    [`boundary_loops`][triwarp.boundary.boundary_loops] returns every one and the two used to differ
+    by a single character.
 
     Parameters
     ----------
@@ -542,6 +546,7 @@ def boundary_loop(
     See Also
     --------
     [`boundary_loops`][triwarp.boundary.boundary_loops]
+        Every loop, not only the longest.
     [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]
     ``igl.boundary_loop``
     """

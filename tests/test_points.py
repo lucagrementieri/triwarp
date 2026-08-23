@@ -1001,7 +1001,7 @@ def test_radius_outlier_mask_invalid_arguments(device: str) -> None:
 
 
 @pytest.mark.parity(
-    "finite_point_mask",
+    "point_finite_mask",
     "open3d",
     benchmarked=False,
     reason="one wp.map over a three-component isfinite predicate, so a group would measure the "
@@ -1010,7 +1010,7 @@ def test_radius_outlier_mask_invalid_arguments(device: str) -> None:
     "additionally copies the surviving cloud out, so its side would be timing the copy. The "
     "comparison is what open3d can still say about the answer, and it is exact.",
 )
-def test_finite_point_mask_matches_open3d(device: str) -> None:
+def test_point_finite_mask_matches_open3d(device: str) -> None:
     """
     Class B (mask against a kept subset): ``remove_non_finite_points`` returns the surviving cloud.
 
@@ -1029,18 +1029,18 @@ def test_finite_point_mask_matches_open3d(device: str) -> None:
     kept_o3d = np.asarray(points_to_open3d(points_np).remove_non_finite_points().points)
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    finite_wp = tw.finite_point_mask(points_wp).numpy().astype(bool)
+    finite_wp = tw.point_finite_mask(points_wp).numpy().astype(bool)
 
     assert kept_o3d.shape[0] == 36  # non-vacuity: the reference dropped exactly the four planted
     assert np.array_equal(np.flatnonzero(~finite_wp), np.array([3, 7, 11, 19]))
     assert np.allclose(points_np[finite_wp], kept_o3d, rtol=1e-5, atol=1e-5)
 
     empty_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
-    assert tw.finite_point_mask(empty_wp).shape == (0,)
+    assert tw.point_finite_mask(empty_wp).shape == (0,)
 
 
-@pytest.mark.parity("duplicate_point_mask", "open3d")
-def test_duplicate_point_mask_matches_open3d(device: str) -> None:
+@pytest.mark.parity("point_duplicate_mask", "open3d")
+def test_point_duplicate_mask_matches_open3d(device: str) -> None:
     """
     Class B (mask against a kept subset): ``remove_duplicated_points``'s survivors, in order.
 
@@ -1066,7 +1066,7 @@ def test_duplicate_point_mask_matches_open3d(device: str) -> None:
     )
 
     points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
-    duplicate_wp = tw.duplicate_point_mask(points_wp).numpy().astype(bool)
+    duplicate_wp = tw.point_duplicate_mask(points_wp).numpy().astype(bool)
 
     # non-vacuity: 10 repeats plus the second zero row, so both the mask and its complement matter
     assert duplicate_wp.sum() == 11
@@ -1074,11 +1074,11 @@ def test_duplicate_point_mask_matches_open3d(device: str) -> None:
     assert np.array_equal(points_np[~duplicate_wp], kept_o3d)
 
     empty_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
-    assert tw.duplicate_point_mask(empty_wp).shape == (0,)
+    assert tw.point_duplicate_mask(empty_wp).shape == (0,)
 
 
-@pytest.mark.parity("duplicate_point_mask", "meshlib")
-def test_duplicate_point_mask_matches_meshlib(device: str) -> None:
+@pytest.mark.parity("point_duplicate_mask", "meshlib")
+def test_point_duplicate_mask_matches_meshlib(device: str) -> None:
     """
     Class B (a representative map against a mask): ``map != index`` is exactly this mask.
 
@@ -1113,13 +1113,13 @@ def test_duplicate_point_mask_matches_meshlib(device: str) -> None:
     duplicate_ml = representative_ml != np.arange(points_np.shape[0])
 
     points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
-    duplicate_wp = tw.duplicate_point_mask(points_wp).numpy().astype(bool)
+    duplicate_wp = tw.point_duplicate_mask(points_wp).numpy().astype(bool)
 
     assert duplicate_ml.sum() == 11  # non-vacuity: the mask and its complement both matter
     assert np.array_equal(duplicate_wp, duplicate_ml)
 
 
-def test_duplicate_point_mask_separates_one_ulp(device: str) -> None:
+def test_point_duplicate_mask_separates_one_ulp(device: str) -> None:
     """
     Not a library comparison: the guard on the *load-bearing* trick, which no reference can see.
 
@@ -1135,7 +1135,7 @@ def test_duplicate_point_mask_separates_one_ulp(device: str) -> None:
     points_np = np.array([[one, 0.0, 0.0], [next_one, 0.0, 0.0], [one, 0.0, 0.0]], dtype=np.float32)
 
     points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
-    duplicate_wp = tw.duplicate_point_mask(points_wp).numpy().astype(bool)
+    duplicate_wp = tw.point_duplicate_mask(points_wp).numpy().astype(bool)
 
     # row 1 is one ULP away and is its own position; row 2 repeats row 0 exactly
     assert np.array_equal(duplicate_wp, np.array([False, False, True]))

@@ -265,7 +265,7 @@ def is_statistical_outlier(
 
 @wp.func
 def is_finite_point(point: wp.vec3) -> wp.bool:
-    # All three coordinates finite -- the row predicate behind ``finite_point_mask``. Any one NaN
+    # All three coordinates finite -- the row predicate behind ``point_finite_mask``. Any one NaN
     # or infinity condemns the point, which is what a downstream tree build or covariance fit
     # needs: a single non-finite coordinate poisons every reduction the point enters.
     return wp.isfinite(point[0]) and wp.isfinite(point[1]) and wp.isfinite(point[2])

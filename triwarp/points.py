@@ -19,8 +19,8 @@ No connectivity here -- everything takes a bare ``(n,)`` array of positions. Two
   defines.
 - **Cleanup and subsampling.** Four masks and one selector, all returning indices or
   ``wp.array[wp.bool]`` rather than a copied cloud, so a caller pays for the gather only if it
-  wants one: [`finite_point_mask`][triwarp.points.finite_point_mask] and
-  [`duplicate_point_mask`][triwarp.points.duplicate_point_mask] are the two exact predicates,
+  wants one: [`point_finite_mask`][triwarp.points.point_finite_mask] and
+  [`point_duplicate_mask`][triwarp.points.point_duplicate_mask] are the two exact predicates,
   [`radius_outlier_mask`][triwarp.points.radius_outlier_mask] and
   [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask] the two density ones (an
   absolute floor and a cloud-relative threshold), and
@@ -103,7 +103,7 @@ def half_space_mask(
     -------
     wp.array[wp.bool]
         Length-``n`` mask on ``points.device``. ``True`` marks a point to **keep**, the same sense
-        as [`finite_point_mask`][triwarp.points.finite_point_mask].
+        as [`point_finite_mask`][triwarp.points.point_finite_mask].
 
     Examples
     --------
@@ -828,7 +828,7 @@ def radius_outlier_mask(
     return out_mask
 
 
-def finite_point_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
+def point_finite_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
     """
     Flag points whose three coordinates are all finite.
 
@@ -851,13 +851,13 @@ def finite_point_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
     Examples
     --------
     ```python
-    finite = tw.points.finite_point_mask(v)
+    finite = tw.points.point_finite_mask(v)
     cleaned = tw.array.gather(v, tw.array.flatnonzero(finite))
     ```
 
     See Also
     --------
-    [`duplicate_point_mask`][triwarp.points.duplicate_point_mask]
+    [`point_duplicate_mask`][triwarp.points.point_duplicate_mask]
         The other exact-predicate cleanup pass; run this one first, since a ``NaN`` position is
         never equal to itself under Open3D's rule.
     [`triwarp.array.flatnonzero`][triwarp.array.flatnonzero]
@@ -872,7 +872,7 @@ def finite_point_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
     return out_mask
 
 
-def duplicate_point_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
+def point_duplicate_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
     """
     Flag every point that repeats an **exactly** equal position seen earlier in the cloud.
 
@@ -904,20 +904,20 @@ def duplicate_point_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
     compares with ``==``; the packing folds the two bit patterns together to reproduce that.
     ``NaN`` is the one case that does **not** match the reference: ``NaN != NaN`` makes every
     ``NaN`` row its own class for Open3D, where a bit pattern is a bit pattern here and identical
-    ``NaN`` rows merge. Run [`finite_point_mask`][triwarp.points.finite_point_mask] first and the
+    ``NaN`` rows merge. Run [`point_finite_mask`][triwarp.points.point_finite_mask] first and the
     question does not arise. Positions are compared at ``float32``, so two points that differ only
     below ``float32`` resolution are one position here and two for a ``float64`` reference.
 
     Examples
     --------
     ```python
-    duplicates = tw.points.duplicate_point_mask(v)
+    duplicates = tw.points.point_duplicate_mask(v)
     n_distinct = int(v.shape[0]) - int(tw.reduce.sum(duplicates))
     ```
 
     See Also
     --------
-    [`finite_point_mask`][triwarp.points.finite_point_mask]
+    [`point_finite_mask`][triwarp.points.point_finite_mask]
     [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows]
         The tolerance-bucketed sibling, and the right choice when exact equality is too strict.
     [`triwarp.grouping.first_occurrence_indices`][triwarp.grouping.first_occurrence_indices]

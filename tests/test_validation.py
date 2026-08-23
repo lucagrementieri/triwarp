@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import igl
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import trimesh.repair as tm_repair
@@ -12,6 +13,7 @@ import triwarp as tw
 from tests.comparisons import canonical_winding, undirected_edges
 from tests.conversions import (
     meshlib_bitset_to_numpy,
+    numpy_to_meshlib,
     numpy_to_warp,
     trimesh_to_meshlib,
     trimesh_to_open3d,
@@ -381,7 +383,7 @@ def test_is_vertex_manifold_precomputed_shortcut(icosahedron: tuple[tm.Trimesh, 
     assert tw.validation.is_vertex_manifold(
         mesh_wp.indices, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges
     ) == tw.validation.is_vertex_manifold(mesh_wp.indices)
-    # The half-pair raise now comes from the shared ``adjacency.resolved_face_adjacency``, so the
+    # The half-pair raise now comes from the shared ``adjacency.resolve_face_adjacency``, so the
     # message is the one every caller of that resolver reports rather than this module's own.
     with pytest.raises(ValueError, match="both be provided or both omitted"):
         tw.validation.is_vertex_manifold(mesh_wp.indices, face_adjacency=adjacency)
@@ -1252,3 +1254,184 @@ def test_supplied_mesh_gives_the_same_answer(
     assert tw.validation.is_watertight(
         mesh_wp.points, mesh_wp.indices
     ) == tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices, mesh=prebuilt_wp)
+
+
+def test_face_defective_mask_flags_the_thin_face(
+    device: str, t_vertex_patch: tuple[np.ndarray, np.ndarray]
+) -> None:
+    vertices_np, faces_np = t_vertex_patch
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    bad_np = tw.validation.face_defective_mask(vertices_wp, faces_wp, min_quality=0.2).numpy()
+    # The sliver (1, 4, 2) is the last face, and it is the only thin one.
+    assert bad_np[-1]
+    assert bad_np.sum() == 1
+
+
+def test_face_defective_mask_flags_the_fold(
+    device: str, folded_patch: tuple[np.ndarray, np.ndarray]
+) -> None:
+    """Only the *culprit* of a fold is flagged, not the good face on the other side of the edge."""
+    vertices_np, faces_np = folded_patch
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    folded_np = tw.validation.face_defective_mask(
+        vertices_wp, faces_wp, min_quality=None, max_fold_angle=160.0
+    ).numpy()
+    assert np.array_equal(folded_np.astype(bool), np.array([False, False, True]))
+
+
+def test_face_defective_mask_flags_the_misoriented_face(device: str) -> None:
+    """One face wound the wrong way in a consistent patch reads 180 degrees off the consensus."""
+    n = 5
+    i_grid, j_grid = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+    vertices_np = np.column_stack(
+        [i_grid.ravel().astype(np.float64), j_grid.ravel().astype(np.float64), np.zeros(n * n)]
+    )
+    faces = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a = i * n + j
+            faces += [[a, a + 1, a + n + 1], [a, a + n + 1, a + n]]
+    faces_np = np.ascontiguousarray(faces, dtype=np.int32)
+    # A grid rather than a three-triangle strip: the criterion compares a face against the *sum* of
+    # its neighbours' normals, and on a strip the flipped face's own neighbours have only it to
+    # agree with, so they would be flagged too.
+    target = faces_np.shape[0] // 2
+    faces_np[target] = faces_np[target][::-1]
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    bad_np = tw.validation.face_defective_mask(
+        vertices_wp, faces_wp, min_quality=None, max_normal_angle=60.0
+    ).numpy()
+    assert np.array_equal(np.flatnonzero(bad_np), np.array([target]))
+
+
+def test_face_defective_mask_all_criteria_disabled(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _mesh_tm, mesh_wp = icosahedron
+    bad_np = tw.validation.face_defective_mask(
+        mesh_wp.points, mesh_wp.indices, min_quality=None, max_normal_angle=None
+    ).numpy()
+    assert not bad_np.any()
+
+
+def test_face_defective_mask_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _mesh_tm, mesh_wp = icosahedron
+    with pytest.raises(ValueError, match="max_fold_angle must be in"):
+        tw.validation.face_defective_mask(mesh_wp.points, mesh_wp.indices, max_fold_angle=200.0)
+    with pytest.raises(ValueError, match="max_normal_angle must be in"):
+        tw.validation.face_defective_mask(mesh_wp.points, mesh_wp.indices, max_normal_angle=0.0)
+
+
+def test_face_defective_mask_empty(device: str) -> None:
+    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert tw.validation.face_defective_mask(vertices_wp, faces_wp).shape == (0,)
+
+
+@pytest.mark.parity("face_defective_mask", "pymeshlab")
+def test_face_defective_mask_matches_pymeshlab_on_folds(
+    device: str, folded_patch: tuple[np.ndarray, np.ndarray]
+) -> None:
+    """
+    Class B (compare detection): MeshLab flips the fold where this deletes it.
+
+    ``compute_selection_bad_faces(select_folded_faces=True)`` is the same dihedral criterion at the
+    same threshold, and it reports a selection rather than editing the mesh — which makes it the
+    oracle for ``face_defective_mask``'s fold gate even though ``meshing_remove_folded_faces`` and
+    ``remove_folded_faces`` then do different things with the answer.
+    """
+    vertices_np, faces_np = folded_patch
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(ml.Mesh(vertices_np, np.ascontiguousarray(faces_np, dtype=np.int32)))
+    meshset_pml.compute_selection_bad_faces(
+        usear=False, usenf=False, select_folded_faces=True, folded_faces_angle_threshold=160.0
+    )
+    selected_pml = meshset_pml.current_mesh().face_selection_array()
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    folded_np = tw.validation.face_defective_mask(
+        vertices_wp, faces_wp, min_quality=None, max_fold_angle=160.0
+    ).numpy()
+    assert np.array_equal(folded_np.astype(bool), selected_pml.astype(bool))
+
+
+def _hinge_fan_np(angles_deg: tuple[float, ...]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build one independent hinged triangle pair per requested dihedral angle, spaced 3 units apart.
+
+    Each pair shares one edge and nothing else, so the fold angle is prescribed exactly and no pair
+    can be confused with another -- which is what separates a dihedral criterion from a proximity
+    one (see [`test_remove_folded_faces_matches_meshlib`]).
+    """
+    vertices, faces = [], []
+    for index, angle in enumerate(angles_deg):
+        origin = np.array([3.0 * index, 0.0, 0.0])
+        tilt = np.radians(180.0 - angle)
+        base = len(vertices)
+        vertices += [
+            origin,
+            origin + np.array([0.0, 1.0, 0.0]),
+            origin + np.array([1.0, 0.0, 0.0]),
+            origin + np.array([np.cos(tilt), 0.0, np.sin(tilt)]),
+        ]
+        faces += [[base, base + 2, base + 1], [base, base + 1, base + 3]]
+    return np.array(vertices, dtype=np.float64), np.array(faces, dtype=np.int32)
+
+
+@pytest.mark.parametrize("threshold", [160.0, 120.0])
+@pytest.mark.parity("face_defective_mask", "meshlib")
+def test_face_defective_mask_matches_meshlib(
+    device: str, threshold: float, folded_patch: tuple[np.ndarray, np.ndarray]
+) -> None:
+    """
+    Class B (compare detection): ``findOverlappingTris`` under the named angle-to-dot transform.
+
+    MeshLib parameterizes a fold by the **dot product** of the two normals where triwarp takes the
+    dihedral angle in degrees, so the transform is ``maxNormalDot = cos(radians(angle))``: its own
+    default of ``-0.99`` is 171.9 degrees, not triwarp's 160. Fed that, the two agree face for face
+    on a fan of seven independently hinged pairs spanning 10 to 175 degrees, at both thresholds.
+
+    ``findNotSmoothFaces`` is **not** the pairing, and that was measured: it reports **zero** faces
+    on this fan at every ``minAngle`` from 0.1 to 3.0 radians, so a comparison built on it would
+    pass vacuously against any implementation.
+
+    Two conventions the fan is shaped around. MeshLib is **inclusive at the threshold** where
+    triwarp is exclusive -- a pair at exactly 140 degrees is flagged by MeshLib and not by triwarp
+    at ``angle=140`` -- so no fixture angle sits on a threshold used here. And MeshLib's criterion
+    is *proximity plus antiparallel normals*, not adjacency: on the three-face
+    ``folded_patch`` it flags all three faces because the folded apex triangle lies over both quad
+    halves, where triwarp flags only the one face whose dihedral exceeds the threshold. That
+    divergence is asserted below rather than avoided, since it is the reason the fan exists.
+    """
+    fan_angles = (10.0, 60.0, 100.0, 140.0, 150.0, 165.0, 175.0)
+    vertices_np, faces_np = _hinge_fan_np(fan_angles)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+
+    folded_wp = tw.validation.face_defective_mask(
+        vertices_wp, faces_wp, min_quality=None, max_fold_angle=threshold
+    ).numpy()
+
+    settings_ml = mm.FindOverlappingSettings()
+    settings_ml.maxNormalDot = float(np.cos(np.radians(threshold)))
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
+    folded_ml = meshlib_bitset_to_numpy(
+        mm.findOverlappingTris(mm.MeshPart(mesh_ml), settings_ml), faces_np.shape[0]
+    )
+
+    n_folded = 2 * sum(angle > threshold for angle in fan_angles)
+    assert int(folded_ml.sum()) == n_folded  # non-vacuity: neither empty nor everything
+    assert np.array_equal(folded_wp, folded_ml)
+
+    # The divergence the fan avoids: proximity, not adjacency, so an apex over two faces flags both.
+    patch_vertices_np, patch_faces_np = folded_patch
+    patch_vertices_wp, patch_faces_wp = numpy_to_warp(patch_vertices_np, patch_faces_np, device)
+    patch_wp = tw.validation.face_defective_mask(
+        patch_vertices_wp, patch_faces_wp, min_quality=None, max_fold_angle=threshold
+    ).numpy()
+    patch_ml = meshlib_bitset_to_numpy(
+        mm.findOverlappingTris(
+            mm.MeshPart(numpy_to_meshlib(patch_vertices_np, patch_faces_np)), settings_ml
+        ),
+        patch_faces_np.shape[0],
+    )
+    assert int(patch_wp.sum()) == 1
+    assert int(patch_ml.sum()) == 3

@@ -94,10 +94,10 @@ import igl
 import numpy as np
 import pytest
 import trimesh as tm
-from conftest import BenchCase
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase
 
 # open3d's is_watertight runs into seconds (see the module docstring); one round is enough to
 # record the magnitude without letting it dominate the suite.
@@ -315,3 +315,51 @@ def test_face_self_intersecting_mask(bench_case: BenchCase) -> None:
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     mask = bench_case.run(lambda: tw.validation.face_self_intersecting_mask(vertices, faces))
     assert int(mask.shape[0]) == bench_case.n_faces
+
+
+@pytest.mark.benchmark(group="face_defective_mask")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "meshlib")
+def test_face_defective_mask(bench_case: BenchCase) -> None:
+    """
+    All three defect criteria at once: face quality, adjacency scatter, per-face gate.
+
+    meshlib's ``findOverlappingTris`` covers the **fold** criterion alone -- it is a proximity
+    search over the AABB tree for near-coincident triangles with near-antiparallel normals, where
+    the other two rows read the dihedral off the face adjacency -- so it is a lower bound on this
+    group and a different algorithm for the one clause it shares. ``maxNormalDot`` is the dihedral
+    threshold in dot-product form (``cos(radians(160))``); the equality of the two answers, and the
+    input class where they part, are in ``tests/test_validation.py``. The tree is lazily built, so
+    the mesh is constructed and pre-warmed outside the timed callable.
+    """
+    n_faces = bench_case.n_faces
+    if bench_case.kind == "meshlib":
+        settings_ml = mm.FindOverlappingSettings()
+        settings_ml.maxNormalDot = float(np.cos(np.radians(160.0)))
+        mesh_part_ml = mm.MeshPart(bench_case.new_mesh_ml())
+        mm.findOverlappingTris(mesh_part_ml, settings_ml)
+        folded_ml = bench_case.run(lambda: mm.findOverlappingTris(mesh_part_ml, settings_ml))
+        assert folded_ml.size() <= n_faces
+        return
+    if bench_case.kind == "pymeshlab":
+        # Selection-only, so the geometry survives and the MeshSet is shared.
+        meshset_pml = bench_case.meshset_pml
+        bench_case.run(
+            lambda: meshset_pml.compute_selection_bad_faces(
+                usear=True,
+                aratio=0.02,
+                usenf=True,
+                nfratio=60.0,
+                select_folded_faces=True,
+                folded_faces_angle_threshold=160.0,
+            )
+        )
+        assert meshset_pml.current_mesh().face_selection_array().shape == (n_faces,)
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    bad = bench_case.run(
+        lambda: tw.validation.face_defective_mask(
+            vertices, faces, min_quality=0.02, max_normal_angle=60.0, max_fold_angle=160.0
+        )
+    )
+    assert bad.shape == (n_faces,)

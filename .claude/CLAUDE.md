@@ -1632,6 +1632,25 @@ survive the next upgrade unexamined, which is exactly the failure the check exis
 - **Name a function after what it returns, in NumPy vocabulary — never after the Warp call it
   wraps.** `sort_pairs` named `warp.utils.radix_sort_pairs`'s key/value mechanism rather than its
   result (a sort *and* an argsort), which is why it became `sort_and_argsort`.
+- **A mask is named `<element>_<property>_mask`, element first.** Element-first sorts and
+  completes: type `tw.validation.face_` and every per-face predicate appears, which is exactly what
+  the property-first spellings did not do — `bad_face_mask` and `flipped_faces_mask` were the two
+  nobody could find. The 2026-08 pass converted five (`repair.bad_face_mask` →
+  `validation.face_defective_mask`, `parametrization.flipped_faces_mask` / `flipped_face_indices` →
+  `face_flipped_*`, `points.finite_point_mask` / `duplicate_point_mask` → `point_finite_mask` /
+  `point_duplicate_mask`) and deliberately left five alone, because **a convention followed
+  everywhere regardless of fit is not worth having**: `radius_outlier_mask` /
+  `statistical_outlier_mask` (the property *is* the name, and `point_radius_outlier_mask` is worse),
+  `half_space_mask` (the element is implicit and the geometry is the point), `fillable_loop_mask`
+  (already element-first — "loop" is the element), `uv_seam_vertex_mask` (element-final, and the
+  qualifier is a namespace) and `convex_subset_mask` / `convex_superset_mask` (the module docstring
+  turns on the subset/superset opposition and the names carry it). Check 2 already scans these
+  names for their dtype, so it is where the spelling rule belongs too — but note nothing enforces
+  the *order*, which is a review question.
+- **Two public names that differ by one character are a defect even when both are correct.**
+  `boundary.boundary_loop` and `boundary.boundary_loops` meant "the longest one" and "all of them";
+  the singular is now `longest_boundary_loop`, which is what its own docstring already said. Look
+  for this whenever a plural is added next to an existing singular.
 - **When a comment and the body disagree, decide which one is load-bearing before "fixing" it — the
   usual answer is the comment.** `tangent_space.any_perpendicular`'s comment claims it crosses with
   *"whichever coordinate axis the normal is least aligned with"* while the body compares only

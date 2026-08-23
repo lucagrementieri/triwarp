@@ -1,4 +1,13 @@
-"""Private device-capability guards and host-readback helpers shared across wrapper modules."""
+"""
+Private device-capability guards and host-readback helpers shared across wrapper modules.
+
+Two of the five members are not about devices, and the name is a historical accident rather than a
+claim: ``read_scalar`` is a host-readback helper (which is at least device-adjacent -- it is the
+sync) and ``require_nonempty_mesh`` is a plain validation guard, with 19 internal uses between
+them. They live here because this is the module wrapper code already imports for shared internals,
+not because either consults the device. Noted so a reader grepping for the guard is not surprised
+to find it under this name.
+"""
 
 from __future__ import annotations
 

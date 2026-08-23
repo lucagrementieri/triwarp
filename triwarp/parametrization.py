@@ -12,7 +12,7 @@ own shape, minimizing conformal rather than Dirichlet energy.
 
 [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle] supplies the boundary
 condition the fixed-boundary three need, and
-[`flipped_face_indices`][triwarp.parametrization.flipped_face_indices] is the diagnostic that
+[`face_flipped_indices`][triwarp.parametrization.face_flipped_indices] is the diagnostic that
 says whether a result is actually injective. Ports of the corresponding ``igl::`` routines; every
 solve is conjugate-gradient.
 """
@@ -31,7 +31,7 @@ from triwarp.laplacian import cotmatrix, cotmatrix_entries, graph_laplacian, mas
 _CG_TOLERANCE = 1e-8
 
 
-def flipped_faces_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
+def face_flipped_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
     """
     Per-face flag: whether a triangle is inverted (negative 2D signed area) in the parametrization.
 
@@ -40,7 +40,7 @@ def flipped_faces_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -
     orientation) in the 2D domain. Mirrors libigl's ``flipped_triangles`` per-triangle test
     (determinant of the homogeneous ``3 x 3`` vertex matrix ``< 0``). Degenerate (zero-area)
     triangles are **not** flagged, matching the strict ``< 0`` comparison.
-    [`flipped_face_indices`][triwarp.parametrization.flipped_face_indices] is the index form of
+    [`face_flipped_indices`][triwarp.parametrization.face_flipped_indices] is the index form of
     this mask.
 
     Parameters
@@ -57,7 +57,7 @@ def flipped_faces_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -
 
     See Also
     --------
-    [`flipped_face_indices`][triwarp.parametrization.flipped_face_indices]
+    [`face_flipped_indices`][triwarp.parametrization.face_flipped_indices]
     [`face_flip_mask`][triwarp.validation.face_flip_mask]
 
     Notes
@@ -80,7 +80,7 @@ def flipped_faces_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -
 
     out_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_parametrization.flipped_faces_mask,
+        kernel_parametrization.face_flipped_mask,
         dim=n_faces,
         inputs=[vertices, faces, out_mask],
         device=device,
@@ -88,14 +88,14 @@ def flipped_faces_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -
     return out_mask
 
 
-def flipped_face_indices(
+def face_flipped_indices(
     vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]
 ) -> wp.array[wp.int32]:
     """
     Return the indices of triangles inverted (negative 2D signed area) in the parametrization.
 
     Convenience wrapper returning ``flatnonzero`` of
-    [`flipped_faces_mask`][triwarp.parametrization.flipped_faces_mask]: the indices into ``faces``
+    [`face_flipped_mask`][triwarp.parametrization.face_flipped_mask]: the indices into ``faces``
     of triangles whose 2D signed area is strictly negative (folded over in the UV domain). Matches
     libigl's ``flipped_triangles``, which returns the same list of flipped-triangle indices.
 
@@ -114,10 +114,10 @@ def flipped_face_indices(
 
     See Also
     --------
-    [`flipped_faces_mask`][triwarp.parametrization.flipped_faces_mask]
+    [`face_flipped_mask`][triwarp.parametrization.face_flipped_mask]
     [`flatnonzero`][triwarp.array.flatnonzero]
     """
-    return tw.array.flatnonzero(flipped_faces_mask(vertices, faces))
+    return tw.array.flatnonzero(face_flipped_mask(vertices, faces))
 
 
 def map_vertices_to_circle(
@@ -139,7 +139,7 @@ def map_vertices_to_circle(
         ``(n_vertices,)`` mesh vertex positions.
     boundary
         Ordered boundary-loop vertex indices, e.g. from
-        [`boundary_loop`][triwarp.boundary.boundary_loop].
+        [`longest_boundary_loop`][triwarp.boundary.longest_boundary_loop].
 
     Returns
     -------
@@ -152,7 +152,7 @@ def map_vertices_to_circle(
 
     See Also
     --------
-    [`boundary_loop`][triwarp.boundary.boundary_loop]
+    [`longest_boundary_loop`][triwarp.boundary.longest_boundary_loop]
     [`tutte`][triwarp.parametrization.tutte]
     [`harmonic`][triwarp.parametrization.harmonic]
     """
@@ -410,7 +410,7 @@ def arap(
     the boundary placed by
     [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]. Inspect the result
     for inverted triangles with
-    [`flipped_face_indices`][triwarp.parametrization.flipped_face_indices].
+    [`face_flipped_indices`][triwarp.parametrization.face_flipped_indices].
 
     Parameters
     ----------
@@ -454,7 +454,7 @@ def arap(
     [`harmonic`][triwarp.parametrization.harmonic]
     [`tutte`][triwarp.parametrization.tutte]
     [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]
-    [`flipped_face_indices`][triwarp.parametrization.flipped_face_indices]
+    [`face_flipped_indices`][triwarp.parametrization.face_flipped_indices]
     [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]
 
     Notes
@@ -694,7 +694,7 @@ def lscm(
     [`lscm_hessian`][triwarp.energies.lscm_hessian]
     [`vector_area_matrix`][triwarp.energies.vector_area_matrix]
     [`harmonic`][triwarp.parametrization.harmonic]
-    [`flipped_face_indices`][triwarp.parametrization.flipped_face_indices]
+    [`face_flipped_indices`][triwarp.parametrization.face_flipped_indices]
 
     Notes
     -----
