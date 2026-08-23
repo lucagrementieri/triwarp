@@ -1956,7 +1956,10 @@ def test_split_nonmanifold_empty(device: str) -> None:
     benchmarked=False,
     reason="the cut happens inside load_array, which also drops unreferenced vertices and rewinds, "
     "so a row would price the whole loader (67.9 ms on bunny_decimated) under this group's name "
-    "and would be timing three operations at once. The cut itself is what this test compares.",
+    "and would be timing three operations at once. Nor does the standalone fix_connectivity help: "
+    "measured at 57.3 % of a round on bunny_decimated and provably a no-op, leaving 8 372 V / "
+    "16 220 F / 86 boundaries unchanged because load_array already ran it. The cut itself is what "
+    "this test compares.",
 )
 def test_split_non_manifold_vertices_matches_pymeshfix(device: str) -> None:
     """

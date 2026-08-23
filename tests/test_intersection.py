@@ -21,7 +21,10 @@ from tests.conftest import MESHES
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
+    numpy_to_pymeshfix,
     points_to_warp,
+    pymeshfix_face_remap,
+    pymeshfix_intersecting_faces,
     trimesh_to_meshlib,
     trimesh_to_pyvista,
     trimesh_to_warp,
@@ -859,6 +862,81 @@ def test_mesh_collision_pairs_matches_meshlib(
     assert pairs_np[:, 1].max() < box_tm.faces.shape[0]
     assert set(pairs_np[:, 0].tolist()) == set(np.flatnonzero(sphere_ml).tolist())
     assert set(pairs_np[:, 1].tolist()) == set(np.flatnonzero(box_ml).tolist())
+
+
+@pytest.mark.parity(
+    "mesh_collision_pairs",
+    "pymeshfix",
+    benchmarked=False,
+    reason="pymeshfix has no two-mesh collision entry point at all -- the answer comes from "
+    "running its single-mesh select_intersecting_triangles over the concatenation, so a row "
+    "would time the wrong operation on the wrong input shape, behind a load that is 49-50 % of "
+    "the round. "
+    "meshlib's findCollidingTriangleBitsets is the two-mesh call and carries the timed row.",
+)
+@pytest.mark.parametrize("kind", ["sphere_and_box", "two_spheres"])
+def test_mesh_collision_pairs_matches_pymeshfix(device: str, kind: str) -> None:
+    """
+    Class B: the two masks, unioned into one face set over the concatenated buffer.
+
+    pymeshfix answers a *self*-intersection question, so the transform is to concatenate the two
+    meshes and offset the second mesh's face indices -- which is only equivalent because neither
+    input self-intersects, asserted here by checking each mesh alone flags nothing. The second half
+    of the transform is [`pymeshfix_face_remap`][tests.conversions.pymeshfix_face_remap]:
+    ``load_array`` returns a *reordering* of the face buffer even when it repairs nothing, so a raw
+    index comparison fails on a mesh whose counts match. Measured on the sphere pair, that failure
+    looks like a real disagreement rather than a plumbing one -- 42 faces on each side both ways,
+    with only **7 of 42** indices in common. Through the remap the sets are **equal**.
+
+    Both fixtures agree exactly, on both devices: (26, 8) faces for the sphere against the box and
+    (42, 42) for the two spheres, i.e. 34 and 84 faces of the concatenation.
+
+    Worth knowing if this ever fails alone: pymeshfix counts a *touching* pair where triwarp and
+    MeshLib (at ``touchIsIntersection=False``) do not, so its answer is a superset in general and
+    equal here only because both configurations interpenetrate cleanly. ``tests/test_repair.py``
+    carries a measured case where the two conventions differ by 97 faces.
+    """
+    if kind == "sphere_and_box":
+        first_tm = tm.creation.icosphere(subdivisions=3)
+        second_tm = tm.creation.box(extents=[0.5, 0.5, 0.5])
+        second_tm.apply_translation([0.9, 0.0, 0.0])
+        n_expected = (26, 8)
+    else:
+        first_tm = tm.creation.icosphere(subdivisions=2)
+        second_tm = tm.creation.icosphere(subdivisions=2)
+        second_tm.apply_translation([0.7, 0.0, 0.0])
+        n_expected = (42, 42)
+
+    first_wp = trimesh_to_warp(first_tm, device)
+    second_wp = trimesh_to_warp(second_tm, device)
+    first_mask_np, second_mask_np = (
+        mask_wp.numpy()
+        for mask_wp in tw.intersection.collision_masks(
+            first_wp.points, first_wp.indices, second_wp.points, second_wp.indices
+        )
+    )
+    assert (int(first_mask_np.sum()), int(second_mask_np.sum())) == n_expected
+
+    # The transform is only valid because neither input crosses itself.
+    for mesh_tm in (first_tm, second_tm):
+        alone_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+        assert pymeshfix_intersecting_faces(alone_pmf, tris_per_cell=50, justproper=False).size == 0
+
+    n_first = first_tm.faces.shape[0]
+    vertices_np = np.vstack([first_tm.vertices, second_tm.vertices])
+    faces_np = np.vstack(
+        [np.asarray(first_tm.faces), np.asarray(second_tm.faces) + first_tm.vertices.shape[0]]
+    )
+    tin_pmf = numpy_to_pymeshfix(vertices_np, faces_np)
+    assert tin_pmf.n_faces == faces_np.shape[0]  # the remap below needs an untouched load
+    faces_pmf = pymeshfix_face_remap(tin_pmf, faces_np)[
+        pymeshfix_intersecting_faces(tin_pmf, tris_per_cell=50, justproper=False)
+    ]
+
+    expected = set(np.flatnonzero(first_mask_np).tolist()) | set(
+        (np.flatnonzero(second_mask_np) + n_first).tolist()
+    )
+    assert set(faces_pmf.tolist()) == expected
 
 
 def test_mesh_collision_pairs_beats_meshlib_on_axis_aligned_boxes(device: str) -> None:

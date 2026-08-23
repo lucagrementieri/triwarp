@@ -161,6 +161,19 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 # states its measured share in its docstring, and rows are capped at ``bunny``: ``dragon`` is
 # seconds of load plus seconds of query per round.
 #
+# The shares for the three algorithms *not* timed above, so the next author does not re-measure them
+# (same mesh, ``bunny_decimated``, best of 3, load 53.1 ms in that session):
+# ``join_closest_components`` 900.7 ms round / 847.6 ms operation = **94.1 %**, ``clean`` 225.9 /
+# 172.8 = **76.5 %**, ``strong_intersection_removal`` 174.4 / 121.3 = **69.5 %**,
+# ``fix_connectivity`` 124.4 / 71.3 = **57.3 %**, ``strong_degeneracy_removal`` 65.4 / 12.3 =
+# 18.8 %. Four of five clear the bar on cost -- and **a share is necessary, not sufficient.**
+# ``fix_connectivity`` is the counter-example: 57.3 % of a round doing provably nothing, since
+# ``load_array`` already ran it (measured, 8 372 V / 16 220 F / 86 boundaries in and out,
+# unchanged). A row for it would price a no-op. ``clean`` and ``strong_intersection_removal`` are
+# real work whose *result* is not comparable with any single triwarp function -- ``clean`` is
+# ``strongDegeneracyRemoval`` + ``strongIntersectionRemoval`` iterated to a fixpoint and nothing
+# else, where ``clean_from_arrays`` wraps it in component removal and two hole-filling passes.
+#
 # ``numpy`` is the narrowest baseline of all: it is only a reference for the *array primitives*
 # (``triwarp.reduce``), where a host reduction over an already-resident NumPy buffer is the honest
 # CPU floor. It is deliberately not a geometry reference — every other CPU baseline is already

@@ -1318,6 +1318,15 @@ def test_fill_min_weight_matches_pymeshfix(
     "row would price the load. The comparison is a density criterion rather than a cost anyway, "
     "which is what this test records.",
 )
+@pytest.mark.parity(
+    "refine_region_to_density",
+    "pymeshfix",
+    benchmarked=False,
+    reason="pymeshfix performs this refinement only as a stage inside fill_small_boundaries, "
+    "behind a load that is ~90 % of the round and cannot be hoisted out of it, so a row would "
+    "price the load. The criterion is what is comparable and the refine='density' arm below is "
+    "where it lands -- fill_smooth dispatches that arm straight to refine_region_to_density.",
+)
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 def test_fill_smooth_refinement_matches_pymeshfix(
     request: pytest.FixtureRequest, mesh_name: str
