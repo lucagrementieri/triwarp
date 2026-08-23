@@ -446,6 +446,23 @@ def pack_farthest_key(distance_sq: wp.float32, index: wp.int32) -> wp.int64:
 
 
 @wp.func
+def pack_ranked_key(value: wp.int32, index: wp.int32) -> wp.int64:
+    # The integer sibling of ``pack_farthest_key``: one int64 whose ``wp.atomic_max`` is "largest
+    # value, lowest index on a tie". ``value`` must be non-negative (a count, a size, a degree), so
+    # the high half orders by it directly with no bit trick; the low half stores ``index``
+    # complemented within int32 so that a *smaller* index compares *larger*. Both halves are
+    # non-negative, so ``-1`` is a sentinel below every real candidate.
+    #
+    # Comparing this key is also how a caller applies the result without a readback: recomputing
+    # ``pack_ranked_key(value, index)`` in a second kernel and testing it against the reduced
+    # maximum identifies the winner on the device.
+    return wp.int64(
+        (wp.uint64(wp.uint32(value)) << wp.uint64(32))
+        | wp.uint64(wp.uint32(wp.int32(2147483647) - index))
+    )
+
+
+@wp.func
 def pack_nearest_key(distance: wp.float32, index: wp.int32) -> wp.int64:
     # The ``min``-ordered twin of ``pack_farthest_key``: one int64 whose minimum is "smallest
     # distance, lowest index on a tie". Same monotone IEEE-754 high half (valid because a distance

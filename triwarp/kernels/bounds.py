@@ -142,3 +142,27 @@ def oriented_box_extents(
         for c in range(3):
             wp.atomic_min(out_corners, base + c, lower[c])
             wp.atomic_min(out_corners, base + 3 + c, -upper[c])
+
+
+@wp.kernel
+def packed_box_diagonals(corners: wp.array[wp.float32], out_diagonal: wp.array[wp.float32]) -> None:
+    # Decode one axis-aligned box per six ``[min_x, min_y, min_z, -max_x, -max_y, -max_z]`` slots
+    # into its diagonal length. The shared reader for that packing, which
+    # [`oriented_box_extents`][triwarp.kernels.bounds.oriented_box_extents] and
+    # [`scatter_group_bounds`][triwarp.kernels.scatter.scatter_group_bounds] both write; launch over
+    # the box count.
+    #
+    # A box nothing accumulated into still holds the ``+inf`` seed in both halves, so its extent
+    # comes out negative. That reads as **zero** rather than as ``nan``, which is what lets a caller
+    # threshold the whole array uniformly instead of masking the empty slots first.
+    box = wp.int32(wp.tid())
+    base = box * 6
+    extent = wp.vec3(
+        -corners[base + 3] - corners[base],
+        -corners[base + 4] - corners[base + 1],
+        -corners[base + 5] - corners[base + 2],
+    )
+    if extent[0] < wp.float32(0.0):
+        out_diagonal[box] = wp.float32(0.0)
+    else:
+        out_diagonal[box] = wp.length(extent)

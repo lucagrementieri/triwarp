@@ -8,6 +8,12 @@ Five defects are visible in the index buffer alone, and each has a remover:
 [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces], and
 [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles].
 
+A sixth remover answers a different question -- not *which elements are wrong* but *which parts of
+the mesh are not the mesh*: [`remove_small_components`][triwarp.repair.remove_small_components]
+drops face-connected components that are too small, by face count, area or bounding-box diameter.
+It is the first step of every repair pipeline, and the debris it removes is not defective in
+itself.
+
 Two further defects need geometry rather than topology to detect, so they are found by a threshold
 rather than a rule: [`validation.face_defective_mask`][triwarp.validation.face_defective_mask] flags
 faces that are too thin, misoriented against their neighbourhood, or folded back over it -- it lives
@@ -31,6 +37,7 @@ face count is unchanged and only ``faces`` comes back.
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 import numpy as np
@@ -41,6 +48,7 @@ import triwarp.typing as twt
 from triwarp._device import read_scalar
 from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces, unique_rows
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import bounds as kernel_bounds
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import selection as kernel_selection
@@ -407,6 +415,178 @@ def remove_non_manifold_faces(
             break  # already edge-manifold
         vertices, faces = tw.selection.submesh_from_face_mask(vertices, faces, keep)
     return vertices, faces
+
+
+def remove_small_components(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    keep_largest: bool = False,
+    min_faces: int | None = None,
+    min_area: float | None = None,
+    min_diameter: float | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Drop face-connected components that are too small, by one of four measures of "small".
+
+    Debris -- a stray shell from a scan, a sliver left by a boolean, a component a decimation
+    stranded -- is what every repair pipeline removes first, and until now
+    [`combine.split`][triwarp.combine.split] handed back *every* component and left the caller to
+    write the argmax. This is that step, and it stays on the device: the per-component statistic is
+    accumulated by one scatter and thresholded by one kernel, so nothing is read back and no
+    component is ever materialized as its own mesh.
+
+    Exactly one criterion may be given, because they are four different questions rather than four
+    spellings of one and combining them would hide which one rejected a component:
+
+    - ``keep_largest`` keeps the single component with the **most faces** and drops every other, so
+      the result always has exactly one component. Face count, not area or diameter: a small dense
+      shell outranks a large coarse one. A tie goes to the component whose lowest face index is
+      smallest, which makes the choice deterministic rather than dependent on thread order.
+    - ``min_faces`` keeps components with at least that many faces -- scale-free, and the measure
+      that tracks *how much data* a component carries.
+    - ``min_area`` keeps components whose summed triangle area reaches it.
+    - ``min_diameter`` keeps components whose axis-aligned bounding-box diagonal reaches it, which
+      is the measure that survives a component being a thin sheet of many tiny triangles.
+
+    All three ``min_*`` bounds are **inclusive**, which is what the reference implementations do
+    (measured: a component of exactly the threshold face count, or of exactly the threshold
+    diagonal, survives).
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    keep_largest
+        Keep only the component with the most faces.
+    min_faces
+        Minimum face count for a component to be kept.
+    min_area
+        Minimum summed triangle area for a component to be kept.
+    min_diameter
+        Minimum bounding-box diagonal for a component to be kept.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Vertices of the surviving components, compacted from index zero.
+    new_faces : wp.array[wp.int32]
+        Flat buffer of the surviving faces, in their input order.
+
+    Raises
+    ------
+    ValueError
+        If no criterion is given, or if more than one is.
+
+    See Also
+    --------
+    [`combine.split`][triwarp.combine.split]
+        The whole decomposition, when every component is wanted rather than a subset.
+    [`adjacency.face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels]
+        The labelling this thresholds.
+    [`remove_non_manifold_faces`][triwarp.repair.remove_non_manifold_faces]
+
+    Notes
+    -----
+    A component's label is a representative *face* index rather than a dense ``0..k-1`` id, so the
+    per-component statistic is an ``n_faces``-long array of which only ``k`` slots are ever written.
+    That is deliberate: densifying the labels first would cost a sort and a search per face to save
+    an allocation, and it is the allocation that is cheap.
+    """
+    given = (keep_largest, min_faces is not None, min_area is not None, min_diameter is not None)
+    if sum(given) != 1:
+        raise ValueError(
+            "pass exactly one of keep_largest, min_faces, min_area or min_diameter, "
+            f"got {sum(given)}"
+        )
+
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return vertices, faces
+
+    labels = tw.adjacency.face_connected_component_labels(faces)
+    keep = wp.empty(n_faces, dtype=wp.bool, device=device)
+
+    if min_area is not None:
+        areas = tw.triangles.face_quality(vertices, faces, metric="area")
+        statistic = wp.zeros(n_faces, dtype=wp.float32, device=device)
+        wp.launch(
+            kernel_scatter.scatter_add,
+            dim=n_faces,
+            inputs=[areas, labels, statistic],
+            device=device,
+        )
+        _mark_components_above(labels, statistic, wp.float32(min_area), keep)
+    elif min_diameter is not None:
+        _mark_components_above(
+            labels, _component_diagonals(vertices, faces, labels), wp.float32(min_diameter), keep
+        )
+    else:
+        counts = wp.zeros(n_faces, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_scatter.count_occurrences, dim=n_faces, inputs=[labels, counts], device=device
+        )
+        if min_faces is not None:
+            _mark_components_above(labels, counts, wp.int32(min_faces), keep)
+        else:
+            # ``-1`` is below every packed key, so the reduction needs no separate seeding pass and
+            # the winning label never reaches the host -- the mask kernel recomputes its key.
+            best = wp.array([wp.int64(-1)], dtype=wp.int64, device=device)
+            wp.launch(
+                kernel_repair.reduce_largest_group,
+                dim=n_faces,
+                inputs=[counts, best],
+                device=device,
+            )
+            wp.launch(
+                kernel_repair.mark_largest_group_mask,
+                dim=n_faces,
+                inputs=[labels, counts, best, keep],
+                device=device,
+            )
+
+    return tw.selection.submesh_from_face_mask(vertices, faces, keep)
+
+
+def _mark_components_above(
+    labels: wp.array[wp.int32],
+    statistic: twt.ScalarArray,
+    threshold: object,
+    out_keep: wp.array[wp.bool],
+) -> None:
+    """Flag every face whose component statistic reaches ``threshold`` (inclusive)."""
+    wp.launch(
+        kernel_repair.mark_group_statistic_mask,
+        dim=int(labels.shape[0]),
+        inputs=[labels, statistic, threshold, out_keep],
+        device=labels.device,
+    )
+
+
+def _component_diagonals(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], labels: wp.array[wp.int32]
+) -> wp.array[wp.float32]:
+    """Bounding-box diagonal per component, indexed by the component's label."""
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    # ``+inf`` in all six slots seeds both ends at once: the packing stores the upper corner negated
+    # so every update is a ``wp.atomic_min``, and a component no face names stays at the seed, which
+    # ``packed_box_diagonals`` reports as a zero diagonal rather than as ``nan``.
+    corners = wp.full(6 * n_faces, value=math.inf, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_scatter.scatter_group_bounds,
+        dim=n_faces,
+        inputs=[vertices, faces, labels, corners],
+        device=device,
+    )
+    diagonals = wp.empty(n_faces, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_bounds.packed_box_diagonals, dim=n_faces, inputs=[corners, diagonals], device=device
+    )
+    return diagonals
 
 
 def split_non_manifold_vertices(

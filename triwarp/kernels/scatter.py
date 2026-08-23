@@ -191,6 +191,29 @@ def scatter_edge_incidence(
 
 
 @wp.kernel
+def scatter_group_bounds(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    groups: wp.array[wp.int32],
+    out_corners: wp.array[wp.float32],
+) -> None:
+    # Axis-aligned bounds of every face group, six ``float32`` slots per group packed
+    # ``[min_x, min_y, min_z, -max_x, -max_y, -max_z]`` -- the ``kernels/bounds.py`` convention, so
+    # one ``wp.full(inf)`` seeds both ends and every update is a single ``wp.atomic_min``. Launch
+    # over ``n_faces`` with ``out_corners`` sized ``6 * n_groups``; ``groups[f]`` is the group index
+    # of face ``f``, which for a connected-component label is a representative face index and so
+    # needs ``n_groups == n_faces``. A group no face names keeps its ``inf`` seed, which
+    # [`packed_box_diagonals`][triwarp.kernels.bounds.packed_box_diagonals] reads as empty.
+    f = wp.int32(wp.tid())
+    base = groups[f] * 6
+    for c in range(3):
+        position = vertices[faces[f * 3 + c]]
+        for k in range(3):
+            wp.atomic_min(out_corners, base + k, position[k])
+            wp.atomic_min(out_corners, base + 3 + k, -position[k])
+
+
+@wp.kernel
 def mark_membership_mask(
     indices: wp.array[wp.int32], n: wp.int32, out_mask: wp.array[wp.bool]
 ) -> None:

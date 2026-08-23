@@ -17,6 +17,7 @@ from tests.comparisons import (
     assert_unordered_rows_equal,
     canonical_winding,
     hausdorff_surface_two_sided,
+    hausdorff_two_sided,
     lexsort_rows,
     same_partition,
     undirected_edges,
@@ -1225,6 +1226,229 @@ def test_remove_non_manifold_faces_leaves_an_edge_manifold_mesh_alone(
     assert new_faces_wp.shape[0] == mesh_tm.faces.size
     # Nothing was rebuilt: the early break hands back the caller's own buffers.
     assert new_vertices_wp.ptr == mesh_wp.points.ptr
+
+
+# --------------------------------------------------------------------------------------
+# remove_small_components
+# --------------------------------------------------------------------------------------
+
+
+def _three_shells_tm() -> tm.Trimesh:
+    """
+    Three disjoint spheres whose face-count, area and diameter rankings all **disagree**.
+
+    80 faces / area 11.666 / diagonal 3.464, then 320 / 12.330 / 3.464, then 80 / 1166.593 / 34.641
+    at radius 10. So the component with the most *faces* is neither the largest by area nor the
+    largest by diameter, which is what makes each of the four criteria testable against the others
+    -- a fixture whose rankings agreed would pass for any of them.
+    """
+    small_tm = tm.creation.icosphere(subdivisions=1)
+    dense_tm = tm.creation.icosphere(subdivisions=2)
+    dense_tm.apply_translation([5.0, 0.0, 0.0])
+    wide_tm = tm.creation.icosphere(subdivisions=1, radius=10.0)
+    wide_tm.apply_translation([0.0, 40.0, 0.0])
+    return tm.util.concatenate([small_tm, dense_tm, wide_tm])
+
+
+def _assert_same_surviving_mesh(
+    kept_wp: wp.array, kept_faces_wp: wp.array, vertices_ref: np.ndarray, faces_ref: np.ndarray
+) -> None:
+    """
+    Assert two survivor meshes are the same surface, both sides having renumbered independently.
+
+    Every reference here compacts its vertex buffer after deleting, in its own order, so the index
+    buffers are incomparable by construction. What is comparable exactly is the *set* of surviving
+    positions -- a two-sided Hausdorff distance of zero says each side's vertices are the other's --
+    together with the counts and the total area, which together pin *which* components survived
+    rather than merely how many.
+
+    The distance bound is **scale-relative**, at ``1e-5`` of the scene's bounding-box diagonal,
+    because the floor is triwarp's ``float32`` vertex buffer rather than any disagreement: measured
+    on the three-shell fixture, whose furthest vertex is 43 units out and whose diagonal is 58.3,
+    the two sides differ by **1.87e-06** -- exactly float32 quantization there, and a bound of
+    ``1e-6`` absolute would fail on an answer that is correct to the last bit.
+    """
+    kept_tm = warp_to_trimesh(kept_wp, kept_faces_wp)
+    reference_tm = tm.Trimesh(vertices_ref, faces_ref, process=False)
+    scale = float(np.linalg.norm(vertices_ref.max(axis=0) - vertices_ref.min(axis=0)))
+    assert int(kept_faces_wp.shape[0]) // 3 == faces_ref.shape[0]
+    assert int(kept_wp.shape[0]) == vertices_ref.shape[0]
+    assert hausdorff_two_sided(kept_wp.numpy().astype(np.float64), vertices_ref) < 1e-5 * scale
+    assert np.isclose(kept_tm.area, reference_tm.area, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity(
+    "remove_small_components",
+    "pymeshfix",
+    benchmarked=False,
+    reason="remove_smallest_components is 9-12 % of a pymeshfix round -- 6.7 ms against 67.9 ms of "
+    "load on bunny_decimated, 60.5 against 439.6 on bunny -- and a PyTMesh accepts exactly one "
+    "load_array, so the build cannot leave the timed callable and a row would report the load as a "
+    "component filter. pymeshlab and open3d carry the timed rows.",
+)
+def test_remove_small_components_keep_largest_matches_pymeshfix(device: str) -> None:
+    """
+    Class B (both sides renumber): ``keep_largest`` is exactly ``remove_smallest_components``.
+
+    The rule is measured, not read off a docstring, and it is the reason ``keep_largest`` ranks by
+    face count: handed 80 / 320 / 80 faces where the third shell is by far the largest in area
+    (1166.593 against 12.330) and in diameter (34.641 against 3.464), pymeshfix removes **2** and
+    keeps the **320-face** one. So "largest" there means most triangles, and a fixture whose three
+    rankings agreed could not have told the three apart.
+
+    Both sides reduce to exactly one component, which is asserted as an invariant rather than
+    inferred: nothing in the surface comparison would notice two survivors that happened to sum to
+    the right area.
+    """
+    mesh_tm = _three_shells_tm()
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+
+    kept_wp, kept_faces_wp = tw.repair.remove_small_components(
+        vertices_wp, faces_wp, keep_largest=True
+    )
+
+    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    assert tin_pmf.n_faces == mesh_tm.faces.shape[0]  # the loader left the mesh alone
+    assert tin_pmf.remove_smallest_components() == 2  # non-vacuity: it really removed two
+    vertices_pmf, faces_pmf = pymeshfix_to_numpy(tin_pmf)
+
+    assert faces_pmf.shape[0] == 320  # face count, not area or diameter
+    _assert_same_surviving_mesh(kept_wp, kept_faces_wp, vertices_pmf, faces_pmf)
+    assert len(warp_to_trimesh(kept_wp, kept_faces_wp).split(only_watertight=False)) == 1
+
+
+@pytest.mark.parity("remove_small_components", "pymeshlab")
+@pytest.mark.parametrize(("criterion", "threshold"), [("min_faces", 81), ("min_diameter", 3.4651)])
+def test_remove_small_components_matches_pymeshlab(
+    device: str, criterion: str, threshold: float
+) -> None:
+    """
+    Class B (both sides renumber): the face-count and diameter criteria, thresholds included.
+
+    ``min_faces`` is ``meshing_remove_connected_component_by_face_number(mincomponentsize=...)`` and
+    ``min_diameter`` is ``meshing_remove_connected_component_by_diameter(mincomponentdiag=...)``,
+    both keeping a component whose measure **reaches** the threshold. That inclusivity is measured
+    rather than assumed, at both bounds: with the fixture's 80-face shells,
+    ``mincomponentsize=80`` keeps all 480 faces and 81 keeps 320; with its 3.4641016-diagonal
+    shells, ``mincomponentdiag`` at exactly that value keeps all 480 and a hair above it keeps 80.
+    The thresholds parametrized here sit on the far side of each boundary, so the two criteria
+    select *different* components -- 320 faces against 80 -- which is what makes the pair
+    non-vacuous.
+
+    ``mincomponentdiag`` is passed as a ``PureValue``: its own default is a ``PercentageValue`` of
+    the bounding-box diagonal, and the fixture's shells are 3.464 across in a scene 58.3 across, so
+    a percentage would silently be measuring something else.
+
+    ``removeunref=True`` matches triwarp, which compacts the vertex buffer of any submesh it
+    extracts; at ``False`` the reference would keep the deleted components' vertices and the
+    position-set comparison would fail on the vertex count alone.
+    """
+    mesh_tm = _three_shells_tm()
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+
+    kept_wp, kept_faces_wp = tw.repair.remove_small_components(
+        vertices_wp, faces_wp, **{criterion: threshold}
+    )
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    if criterion == "min_faces":
+        meshset_pml.meshing_remove_connected_component_by_face_number(
+            mincomponentsize=int(threshold), removeunref=True
+        )
+    else:
+        meshset_pml.meshing_remove_connected_component_by_diameter(
+            mincomponentdiag=ml.PureValue(float(threshold)), removeunref=True
+        )
+    vertices_pml = meshset_pml.current_mesh().vertex_matrix()
+    faces_pml = meshset_pml.current_mesh().face_matrix()
+
+    # Non-vacuity in both directions: something survived, and something was removed.
+    assert 0 < faces_pml.shape[0] < mesh_tm.faces.shape[0]
+    _assert_same_surviving_mesh(kept_wp, kept_faces_wp, vertices_pml, faces_pml)
+
+
+@pytest.mark.parity("remove_small_components", "open3d")
+def test_remove_small_components_min_area_matches_open3d(device: str) -> None:
+    """
+    Class B (both sides renumber): the area criterion, against open3d's per-cluster areas.
+
+    open3d has no component *filter* -- ``cluster_connected_triangles`` returns the per-triangle
+    cluster id together with each cluster's triangle count and its **area**, and the caller builds
+    the mask -- so this is the reference for ``min_area`` and the transform is that mask
+    construction. Its areas match trimesh's per-shell areas exactly (11.6659 / 12.3298 / 1166.5931),
+    which is what makes the comparison a comparison rather than two independent thresholdings.
+
+    The threshold sits between the fixture's two small shells, so the answer is two components of
+    three: the shell with the most *faces* survives here alongside the one with the largest area,
+    and the one with the fewest of both is dropped. A threshold outside that range would agree with
+    ``keep_largest`` or with the identity and test nothing new.
+    """
+    mesh_tm = _three_shells_tm()
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    min_area = 12.0
+
+    kept_wp, kept_faces_wp = tw.repair.remove_small_components(
+        vertices_wp, faces_wp, min_area=min_area
+    )
+
+    mesh_o3d = trimesh_to_open3d(mesh_tm)
+    clusters_o3d, _counts_o3d, areas_o3d = mesh_o3d.cluster_connected_triangles()
+    areas_np = np.asarray(areas_o3d)
+    assert areas_np.shape[0] == 3  # non-vacuity: the reference found the three shells
+    mesh_o3d.remove_triangles_by_mask(areas_np[np.asarray(clusters_o3d)] < min_area)
+    mesh_o3d.remove_unreferenced_vertices()
+    vertices_o3d = np.asarray(mesh_o3d.vertices)
+    faces_o3d = np.asarray(mesh_o3d.triangles)
+
+    assert faces_o3d.shape[0] == 400  # the two shells above the threshold, 320 + 80
+    _assert_same_surviving_mesh(kept_wp, kept_faces_wp, vertices_o3d, faces_o3d)
+
+
+def test_remove_small_components_invariants(device: str) -> None:
+    """
+    Not a library comparison: the three properties the criteria share, on the same fixture.
+
+    ``min_faces=1`` is the identity (every component has at least one face), the survivors are
+    always a subset of the input triangles as unordered vertex-position rows, and a threshold above
+    everything empties the mesh rather than raising. None of the three is visible in a reference
+    comparison, which asserts only that two implementations agree on one threshold.
+    """
+    mesh_tm = _three_shells_tm()
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    n_faces = mesh_tm.faces.shape[0]
+
+    identity_wp, identity_faces_wp = tw.repair.remove_small_components(
+        vertices_wp, faces_wp, min_faces=1
+    )
+    assert int(identity_faces_wp.shape[0]) // 3 == n_faces
+    assert int(identity_wp.shape[0]) == mesh_tm.vertices.shape[0]
+
+    kept_wp, kept_faces_wp = tw.repair.remove_small_components(
+        vertices_wp, faces_wp, keep_largest=True
+    )
+    kept_rows = np.round(warp_to_trimesh(kept_wp, kept_faces_wp).triangles, 5).reshape(-1, 9)
+    input_rows = np.round(mesh_tm.triangles, 5).reshape(-1, 9)
+    assert {tuple(row) for row in kept_rows} <= {tuple(row) for row in input_rows}
+
+    _empty_wp, empty_faces_wp = tw.repair.remove_small_components(
+        vertices_wp, faces_wp, min_faces=n_faces + 1
+    )
+    assert int(empty_faces_wp.shape[0]) == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"keep_largest": True, "min_faces": 3}, {"min_area": 1.0, "min_diameter": 1.0}],
+    ids=["none", "two", "two-mins"],
+)
+def test_remove_small_components_requires_exactly_one_criterion(
+    device: str, kwargs: dict[str, object]
+) -> None:
+    """The documented ``ValueError``: no criterion, and two different pairs of them."""
+    mesh_tm = _three_shells_tm()
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    with pytest.raises(ValueError, match="exactly one"):
+        tw.repair.remove_small_components(vertices_wp, faces_wp, **kwargs)  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------------------

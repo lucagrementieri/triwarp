@@ -243,6 +243,76 @@ def _faces_with_non_manifold_wp(bench_case: BenchCase, extra: int) -> wp.array[w
     return _nonmanifold_cache[key]
 
 
+@pytest.mark.benchmark(group="remove_small_components")
+@pytest.mark.benchaxis("components")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "open3d")
+def test_remove_small_components(bench_case: BenchCase) -> None:
+    """
+    Label the components, threshold them, re-extract: the first step of every repair pipeline.
+
+    The axis is the component count -- 1, 64 then 1 024 at a fixed 81 920 faces -- which is this
+    function's only cost driver: the labelling is a connected-components pass over the face
+    adjacency and the extraction is one compaction, and neither cares how the faces are distributed
+    between components. The mesh size is pinned across the three points so the row reads as the
+    component count alone.
+
+    **The threshold keeps everything**, deliberately: ``min_faces=2`` passes every component of
+    every one of these meshes. A threshold that dropped components would make the extraction
+    cheaper on exactly the meshes that have more of them, so the axis would be measuring the
+    selection rather than the labelling, and the three points would stop being comparable. All the
+    cost is in the labelling and the compaction, and this is what prices them.
+
+    pymeshlab's ``meshing_remove_connected_component_by_face_number`` is the same operation with
+    the same inclusive bound (``tests/test_repair.py`` compares the answers at 80 and 81 on a
+    fixture built to straddle it); it mutates ``current_mesh()``, so the MeshSet is built inside the
+    timed callable and the row carries the ~0.47 us/vertex build. open3d has no filter -- its
+    ``cluster_connected_triangles`` returns the per-triangle cluster id plus each cluster's triangle
+    count and area, and the mask and the removal are the caller's, which is what the row times; it
+    also mutates, so its mesh is rebuilt per round too.
+
+    pymeshfix is **not** a row here: ``remove_smallest_components`` is 9-12 % of a round behind a
+    load that cannot be hoisted out of it (6.7 ms against 67.9 ms on ``bunny_decimated``, 60.5
+    against 439.6 on ``bunny``), so the number would be the load. Its rule is nonetheless what
+    ``keep_largest`` defaults to, and ``tests/test_repair.py`` pins that.
+    """
+    min_faces = 2
+    if bench_case.kind == "pymeshlab":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+        def run_pml() -> ml.MeshSet:
+            meshset_pml = _new_meshset_pml(vertices_np, faces_np)
+            meshset_pml.meshing_remove_connected_component_by_face_number(
+                mincomponentsize=min_faces, removeunref=True
+            )
+            return meshset_pml
+
+        kept_pml = bench_case.run(run_pml)
+        assert kept_pml.current_mesh().face_number() == bench_case.n_faces
+        return
+    if bench_case.kind == "open3d":
+        import open3d as o3d
+
+        vertices_o3d = o3d.utility.Vector3dVector(bench_case.vertices_np)
+        faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int32)
+
+        def run_o3d() -> o3d.geometry.TriangleMesh:
+            mesh_o3d = o3d.geometry.TriangleMesh(vertices_o3d, o3d.utility.Vector3iVector(faces_np))
+            clusters_o3d, counts_o3d, _areas_o3d = mesh_o3d.cluster_connected_triangles()
+            small_np = np.asarray(counts_o3d)[np.asarray(clusters_o3d)] < min_faces
+            mesh_o3d.remove_triangles_by_mask(small_np)
+            mesh_o3d.remove_unreferenced_vertices()
+            return mesh_o3d
+
+        kept_o3d = bench_case.run(run_o3d)
+        assert len(kept_o3d.triangles) == bench_case.n_faces
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    _kept_vertices, kept_faces = bench_case.run(
+        lambda: tw.repair.remove_small_components(vertices, faces, min_faces=min_faces)
+    )
+    assert int(kept_faces.shape[0]) // 3 == bench_case.n_faces
+
+
 @pytest.mark.noparity(
     "pymeshlab",
     reason="D2 the same idea, greedier: for each non-manifold edge MeshLab iteratively deletes the "

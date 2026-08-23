@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.array import update_argmin_pair
+from triwarp.kernels.array import pack_ranked_key, update_argmin_pair
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_normal
 from triwarp.kernels.triangles import corner_triple, triangle_cross
@@ -77,6 +77,51 @@ def resolve_duplicate_groups(
         out_keep[ui] = wp.int32(-1)
         if count != 0:
             wp.atomic_min(out_error_group, 0, ui)
+
+
+@wp.kernel
+def reduce_largest_group(counts: wp.array[wp.int32], out_best: wp.array[wp.int64]) -> None:
+    # The group with the most members, ties going to the lowest group index, reduced into one
+    # ``int64`` by ``pack_ranked_key`` so the whole answer is a single ``wp.atomic_max``. Launch
+    # over the group domain; ``out_best`` is one element seeded to ``-1``, which every real key
+    # exceeds.
+    #
+    # An empty group contributes nothing, which matters because the group domain here is the *face*
+    # domain -- a connected-component label is a representative face index, so most slots are empty.
+    group = wp.int32(wp.tid())
+    if counts[group] > 0:
+        wp.atomic_max(out_best, 0, pack_ranked_key(counts[group], group))
+
+
+@wp.kernel
+def mark_largest_group_mask(
+    groups: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+    best: wp.array[wp.int64],
+    out_mask: wp.array[wp.bool],
+) -> None:
+    # Flag every member of the group ``reduce_largest_group`` chose. Recomputing the key and testing
+    # it against the reduced maximum is what keeps this readback-free: the winning group index is
+    # never brought to the host, and the ``-1`` seed marks nothing when there are no groups at all.
+    f = wp.int32(wp.tid())
+    group = groups[f]
+    out_mask[f] = pack_ranked_key(counts[group], group) == best[0]
+
+
+@wp.kernel
+def mark_group_statistic_mask(
+    groups: wp.array[wp.int32],
+    statistic: wp.array[wp.Scalar],
+    threshold: wp.Scalar,
+    out_mask: wp.array[wp.bool],
+) -> None:
+    # Flag every member of a group whose statistic reaches ``threshold``, inclusive -- the bound
+    # every reference that thresholds a component uses (measured: a component of exactly
+    # ``mincomponentsize`` faces, or of exactly ``mincomponentdiag`` diagonal, survives). Generic
+    # over the statistic's dtype so the face-count, area and diameter criteria share one kernel
+    # rather than differing only in a comparison.
+    f = wp.int32(wp.tid())
+    out_mask[f] = statistic[groups[f]] >= threshold
 
 
 @wp.kernel(enable_backward=False)
@@ -362,3 +407,20 @@ def flatten_degree3_positions(
     for slot in range(begin, end):
         total += positions[halfedge_destination(faces, ring_halfedges[slot])]
     out_positions[vertex] = total / wp.float32(3.0)
+
+
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. ``mark_group_statistic_mask`` is this module's only generic kernel and its
+# wrapper's dispatch reaches exactly two dtypes: ``wp.int32`` for the face-count criterion and
+# ``wp.float32`` for the area and bounding-box-diagonal ones. There is no float64 path -- the
+# statistics are all derived from a ``wp.vec3`` (float32) vertex buffer.
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in (wp.int32, wp.float32):
+        wp.overload(
+            mark_group_statistic_mask,
+            [wp.array[wp.int32], wp.array[dtype], dtype, wp.array[wp.bool]],
+        )
+
+
+_register_overloads()

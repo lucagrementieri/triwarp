@@ -132,6 +132,8 @@ def split(
     [`split_batched`][triwarp.combine.split_batched]
     [`concatenate`][triwarp.combine.concatenate]
     [`face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels]
+    [`repair.remove_small_components`][triwarp.repair.remove_small_components]
+        Keep a *subset* of the components in one mesh, rather than taking them all apart.
     [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]
     [`trimesh.graph.split`][]
     """
