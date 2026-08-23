@@ -810,16 +810,6 @@ def _tangled(bench_case: BenchCase) -> tuple:
     return _tangled_cache[key]
 
 
-@pytest.mark.noparity(
-    "meshlib",
-    reason="D2 a different algorithm with a measured disagreement: localFixSelfIntersections "
-    "subdivides the affected region and relaxes it, where fix_self_intersections cuts the region "
-    "out and refills the rim. On the shared 16x16 self-intersecting torus MeshLib's leaves 281 "
-    "intersecting faces and triwarp's leaves 0, so the outputs are not comparable and neither "
-    "is a reference for the other. No library does the cut-and-refill repair, so the "
-    "correctness claim is the contract itself, in "
-    "tests/test_repair.py::test_fix_self_intersections_local_clears_them.",
-)
 @pytest.mark.benchmark(group="fix_self_intersections")
 @pytest.mark.benchmeshes("sphere_med")
 @pytest.mark.benchlibs("triwarp", "meshlib")
@@ -840,9 +830,15 @@ def test_fix_self_intersections(bench_case: BenchCase, method: str) -> None:
     progress and a non-empty answer, not convergence: asserting zero would be asserting
     something the method does not promise on this input class.
 
-    meshlib's two fixers are timed beside it for scale, and the noparity entry says why they are not
-    a reference: its local one subdivides and relaxes instead of cutting, and on the shared torus
-    fixture the two answers differ by 281 faces to 0.
+    **Read the meshlib rows as scale, not as a like-for-like race.** Its local fixer subdivides the
+    affected region and relaxes it where this cuts the region out and refills the rim, and on the
+    shared 16x16 self-intersecting torus MeshLib's leaves **281** intersecting faces where triwarp's
+    leaves **0** -- so the two outputs are not comparable and neither is a reference for the other
+    repair. What *is* comparable, and what the parity claim on
+    ``tests/test_repair.py::test_fix_self_intersections_local_clears_them`` rests on, is the
+    post-condition: MeshLib's ``findSelfCollidingTrianglesBS`` counts the same 64 intersecting faces
+    on that fixture before the repair and the same 0 after it, at both dilation budgets. That is the
+    detector agreeing, not the fixer.
 
     First measurement, medians on an RTX 5090 at ``sphere_med`` doubled to 163 840 faces:
 

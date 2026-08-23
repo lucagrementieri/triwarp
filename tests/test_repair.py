@@ -30,12 +30,15 @@ from tests.conversions import (
     numpy_to_pymeshfix,
     numpy_to_warp,
     points_to_warp,
+    pymeshfix_intersecting_faces,
     pymeshfix_to_numpy,
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshfix,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
+    warp_to_meshlib,
+    warp_to_pymeshfix,
     warp_to_trimesh,
 )
 
@@ -1389,6 +1392,36 @@ def _icosahedron_plus_a_face_on_an_existing_edge_np() -> tuple[np.ndarray, np.nd
     return vertices_np, np.vstack((mesh_tm.faces, extra_np)).astype(np.int32)
 
 
+def _edge_manifold_igl(faces_np: np.ndarray) -> bool:
+    """
+    ``igl.is_edge_manifold``'s verdict, which is the ``allow_boundary_edges=True`` form.
+
+    It returns a **5-tuple** ``(verdict, BF, E, EMAP, BE)``, so ``bool(igl.is_edge_manifold(F))`` is
+    ``bool`` of a non-empty tuple and reads ``True`` for every input ever passed to it. Only ``[0]``
+    is the answer.
+    """
+    return bool(igl.is_edge_manifold(np.ascontiguousarray(faces_np, dtype=np.int64))[0])
+
+
+def _edge_manifold_o3d(vertices_np: np.ndarray, faces_np: np.ndarray) -> bool:
+    """Open3D's verdict, which shares triwarp's ``allow_boundary_edges`` switch exactly."""
+    mesh_tm = tm.Trimesh(
+        np.asarray(vertices_np, dtype=np.float64), np.asarray(faces_np), process=False
+    )
+    return bool(trimesh_to_open3d(mesh_tm).is_edge_manifold(allow_boundary_edges=True))
+
+
+@pytest.mark.parity(
+    "remove_non_manifold_faces",
+    "igl",
+    "open3d",
+    benchmarked=False,
+    reason="both are used here as the post-condition detector rather than as the repair. libigl "
+    "binds no non-manifold face remover at all, so there is nothing on its side to time; Open3D's "
+    "remove_non_manifold_edges is a comparable repair and would be its own row. What this claims "
+    "is is_edge_manifold(allow_boundary_edges=True), which both answer identically to triwarp and "
+    "which is timed in the is_edge_manifold group.",
+)
 @pytest.mark.parametrize(
     ("mesh_kind", "n_surviving"),
     [("three_faces_on_one_edge", 0), ("cascading", 1), ("icosahedron_plus_a_face", 18)],
@@ -1397,13 +1430,25 @@ def test_remove_non_manifold_faces_matches_a_numpy_oracle(
     device: str, mesh_kind: str, n_surviving: int
 ) -> None:
     """
-    Class A: the surviving faces and compacted vertices equal the same iteration run in numpy.
+    Class A twice: the numpy oracle pins which faces go, two other libraries pin the result.
 
-    The expected count is pinned per input because the interesting property is *which* faces go:
-    the three-face fan loses all three (every one of them carries the 3-incident edge), the
-    cascading input needs a second pass to reach the single survivor a one-pass implementation
-    would miss, and the icosahedron keeps 18 of its 21 faces -- the substantive case, since two
-    empty answers would compare equal.
+    The expected count is pinned per input because the interesting property is *which* faces go: the
+    three-face fan loses all three (every one of them carries the 3-incident edge), the cascading
+    input needs a second pass to reach the single survivor a one-pass implementation would miss, and
+    the icosahedron keeps 18 of its 21 faces -- the substantive case, since two empty answers would
+    compare equal.
+
+    The numpy oracle pins *which* faces survive; it says nothing about whether the result is
+    actually edge-manifold, because it runs the same rule triwarp does. So that half was asserted
+    with [`is_edge_manifold`][triwarp.validation.is_edge_manifold] -- triwarp's repair checked by
+    triwarp's detector, where a shared bug in the detector passes both sides. igl and open3d both
+    answer the identical question and both flip with triwarp: measured False -> True on all three
+    inputs here, and on an ``icosphere(2)`` carrying one extra face (163 V / 321 F -> 162 / 318).
+
+    **pyvista is deliberately absent.** Its ``is_manifold`` is ``n_open_edges == 0``, i.e. the
+    ``allow_boundary_edges=False`` form, and removing the faces on an over-incident edge *opens* the
+    surface -- measured False both before and after on that same icosphere, so it cannot see this
+    post-condition at all.
     """
     builders = {
         "three_faces_on_one_edge": _three_faces_on_one_edge_np,
@@ -1412,7 +1457,11 @@ def test_remove_non_manifold_faces_matches_a_numpy_oracle(
     }
     vertices_np, faces_np = builders[mesh_kind]()
     faces_wp = wp.array(np.ascontiguousarray(faces_np).ravel(), dtype=wp.int32, device=device)
+    manifold_igl = _edge_manifold_igl(faces_np)
+    manifold_o3d = _edge_manifold_o3d(vertices_np, faces_np)
     assert not tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=True)
+    assert not manifold_igl
+    assert not manifold_o3d
 
     new_vertices_wp, new_faces_wp = tw.repair.remove_non_manifold_faces(
         points_to_warp(vertices_np, device), faces_wp
@@ -1424,7 +1473,11 @@ def test_remove_non_manifold_faces_matches_a_numpy_oracle(
     assert np.array_equal(new_faces_np, expected_faces_np)
     assert np.allclose(new_vertices_wp.numpy(), expected_vertices_np, rtol=1e-5, atol=1e-5)
     if n_surviving > 0:
+        fixed_igl = _edge_manifold_igl(new_faces_np)
+        fixed_o3d = _edge_manifold_o3d(new_vertices_wp.numpy(), new_faces_np)
         assert tw.validation.is_edge_manifold(new_faces_wp, allow_boundary_edges=True)
+        assert fixed_igl
+        assert fixed_o3d
 
 
 def test_remove_non_manifold_faces_leaves_an_edge_manifold_mesh_alone(
@@ -2318,23 +2371,67 @@ def test_remove_folded_faces_empty(device: str) -> None:
     assert int(out_faces_wp.shape[0]) == 0
 
 
+def _self_intersecting_count_ml(vertices_wp: wp.array, faces_wp: wp.array) -> int:
+    """Count self-intersecting faces with MeshLib, on exactly the buffer it is handed."""
+    mesh_ml = warp_to_meshlib(vertices_wp, faces_wp)
+    colliding_ml = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh_ml), touchIsIntersection=False)
+    return int(meshlib_bitset_to_numpy(colliding_ml, int(faces_wp.shape[0]) // 3).sum())
+
+
+def _self_intersecting_count_pmf(vertices_wp: wp.array, faces_wp: wp.array) -> int:
+    """
+    Count self-intersecting faces with pymeshfix.
+
+    No remap and no ``n_faces`` guard, deliberately: only the **count** is read, and
+    ``load_array``'s connectivity repair neither creates nor removes a crossing -- it duplicates
+    vertices along non-manifold edges and rewinds faces, both of which leave the point set of every
+    triangle alone. Measured on every mesh this helper is called with, the load is in fact a no-op
+    on the face count (512 in and out on the fixture, 26 688 on the voxel rebuild), so a remap would
+    succeed; it is skipped because the face *identities* are not what is being compared.
+    """
+    tin_pmf = warp_to_pymeshfix(vertices_wp, faces_wp)
+    return int(pymeshfix_intersecting_faces(tin_pmf, tris_per_cell=50, justproper=False).shape[0])
+
+
+@pytest.mark.parity("fix_self_intersections", "meshlib")
 @pytest.mark.parametrize("max_expand", [1, 2])
 def test_fix_self_intersections_local_clears_them(
     torus_self_intersecting: tuple[tm.Trimesh, wp.Mesh], max_expand: int
 ) -> None:
     """
-    Not a library comparison: the function's own contract, on the fixture that violates it.
+    Class A on the *post-condition*, through two detectors that are not triwarp's.
 
-    No reference does this operation the way this does -- MeshLib's ``localFixSelfIntersections``
+    No reference does this **repair** the way this does -- MeshLib's ``localFixSelfIntersections``
     subdivides and relaxes rather than cutting and refilling, and on this very input it leaves
-    **281** intersecting faces where this leaves **0** (the benchmark carries that as a measured
-    exemption). So the claim is the contract rather than an agreement: the intersecting faces are
-    gone, the result is watertight, and the surface did not run away from the input.
+    **281** intersecting faces where this leaves **0** (the benchmark's docstring carries that
+    measurement, and says to read its meshlib rows as scale). So the *outputs* are not comparable,
+    and the claim about them is the contract: the intersecting faces are gone, the result is
+    watertight, and the surface did not run away from the input.
 
-    The last of those is the one that stops a trivial pass: deleting the whole mesh also has no
-    self-intersections. It is bounded with a two-sided surface Hausdorff against the input, which
-    must stay within a fraction of the bounding-box diagonal -- the repair cuts a band out and
-    refills it, so it moves the surface locally and nowhere else.
+    What *is* a library comparison is the contract's own predicate. Asserting it with
+    [`face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask] alone would
+    check triwarp's repair against triwarp's detector, so a shared bug in the detector passes both
+    sides -- and that detector is exactly the one MeshLib and pymeshfix are already the oracles for
+    one group over. Both are therefore counted here, before and after: measured **64 / 64 / 64**
+    intersecting faces on the input and **0 / 0 / 0** after the repair, at both dilation budgets.
+    Agreement on the *input* is what makes the assertion non-vacuous -- the fixture's 64 is
+    confirmed by two independent implementations rather than asserted against itself.
+
+    Only meshlib is *claimed* here, because it is the pair this group times and a test may name a
+    group once; pymeshfix's claim sits on ``test_fix_self_intersections_voxel_rebuilds``, which
+    consults it on the other method. Its assert runs on both regardless.
+
+    The two detectors are asked with the conventions they have, which makes them unequally strict
+    and is worth knowing if one of them ever fails alone. MeshLib is passed
+    ``touchIsIntersection=False``, triwarp's convention; pymeshfix has no such switch and counts a
+    *touching* pair, so its zero is the **stronger** statement -- and where the two conventions
+    diverge they differ by a lot rather than a little (measured elsewhere in this file: 97 of 1 054
+    faces against 0). The cut-and-refill leaves no touching pair, so they coincide here.
+
+    The Hausdorff bound is the one that stops a trivial pass: deleting the whole mesh also has no
+    self-intersections. It is two-sided against the input and must stay within a fraction of the
+    bounding-box diagonal -- the repair cuts a band out and refills it, so it moves the surface
+    locally and nowhere else.
 
     Both dilation budgets are run because they take different amounts of surface with them (measured
     1 036 faces at ``max_expand=1`` and 588 at 2, from 512) and both must land clean.
@@ -2343,13 +2440,23 @@ def test_fix_self_intersections_local_clears_them(
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
     before_np = tw.validation.face_self_intersecting_mask(vertices_wp, faces_wp).numpy()
     assert int(before_np.sum()) > 0  # non-vacuity: the fixture really does intersect itself
+    # Two independent detectors confirm the input's count, so "0 after" is a repair and not a
+    # detector that stopped answering.
+    before_ml = _self_intersecting_count_ml(vertices_wp, faces_wp)
+    before_pmf = _self_intersecting_count_pmf(vertices_wp, faces_wp)
+    assert before_ml == int(before_np.sum())
+    assert before_pmf == int(before_np.sum())
 
     fixed_vertices_wp, fixed_faces_wp = tw.repair.fix_self_intersections(
         vertices_wp, faces_wp, max_expand=max_expand
     )
     assert int(fixed_faces_wp.shape[0]) > 0
     after_np = tw.validation.face_self_intersecting_mask(fixed_vertices_wp, fixed_faces_wp).numpy()
+    after_ml = _self_intersecting_count_ml(fixed_vertices_wp, fixed_faces_wp)
+    after_pmf = _self_intersecting_count_pmf(fixed_vertices_wp, fixed_faces_wp)
     assert int(after_np.sum()) == 0
+    assert after_ml == 0
+    assert after_pmf == 0
     assert tw.validation.is_watertight(fixed_vertices_wp, fixed_faces_wp)
 
     diagonal = float(np.linalg.norm(mesh_tm.vertices.max(axis=0) - mesh_tm.vertices.min(axis=0)))
@@ -2362,11 +2469,23 @@ def test_fix_self_intersections_local_clears_them(
     assert deviation < 0.35 * diagonal  # it patched a band, it did not rebuild the object
 
 
+@pytest.mark.parity(
+    "fix_self_intersections",
+    "pymeshfix",
+    benchmarked=False,
+    reason="select_intersecting_triangles verifies the post-condition; a timed row would have "
+    "to be "
+    "strong_intersection_removal, which is 69.5 % of a round on bunny_decimated and is a different "
+    "algorithm -- it ends with one component where this ends with two (chi 2 against 4, volume "
+    "-6.53 against -10.42 on this fixture's shape), so the outputs are not comparable. The "
+    "detector "
+    "is timed in the face_self_intersecting_mask group.",
+)
 def test_fix_self_intersections_voxel_rebuilds(
     torus_self_intersecting: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
     """
-    Not a library comparison: the level-set method, and the qualification its docstring carries.
+    Class A on the residual count, through two detectors that are not triwarp's.
 
     A level set cannot self-intersect, so this always terminates -- but the *triangulation* of one
     can still carry a touching pair at an ambiguous marching-cubes cell, and that is
@@ -2374,12 +2493,20 @@ def test_fix_self_intersections_voxel_rebuilds(
     **2 of 26 688** at 1/128. The assertion is therefore "almost none, and far fewer than the input
     had" rather than zero, which is what the function promises.
 
+    Because the answer is only *promised* to be small rather than zero, both references are asserted
+    to **agree with triwarp's count** rather than to read zero -- the stronger claim, and the
+    resolution-independent one. Measured on this fixture at the default lattice, on both devices: 26
+    688 faces out, all three detectors reading **0**, and pymeshfix's ``load_array`` leaving the
+    face count untouched at 26 688, so its answer is about this mesh and not about a repaired copy
+    of it.
+
     Also asserts the rebuild is a rebuild: the face count grows by more than an order of magnitude,
     because every part of the surface is resampled and not just the damaged band.
     """
     mesh_tm, mesh_wp = torus_self_intersecting
     n_faces = mesh_tm.faces.shape[0]
     before_np = tw.validation.face_self_intersecting_mask(mesh_wp.points, mesh_wp.indices).numpy()
+    assert int(before_np.sum()) > 0  # non-vacuity: "fewer than before" has to mean something
 
     rebuilt_vertices_wp, rebuilt_faces_wp = tw.repair.fix_self_intersections(
         mesh_wp.points, mesh_wp.indices, method="voxel"
@@ -2389,8 +2516,12 @@ def test_fix_self_intersections_voxel_rebuilds(
     after_np = tw.validation.face_self_intersecting_mask(
         rebuilt_vertices_wp, rebuilt_faces_wp
     ).numpy()
+    after_ml = _self_intersecting_count_ml(rebuilt_vertices_wp, rebuilt_faces_wp)
+    after_pmf = _self_intersecting_count_pmf(rebuilt_vertices_wp, rebuilt_faces_wp)
     assert int(after_np.sum()) < 0.001 * int(rebuilt_faces_wp.shape[0]) // 3
     assert int(after_np.sum()) < int(before_np.sum())
+    assert after_ml == int(after_np.sum())
+    assert after_pmf == int(after_np.sum())
 
 
 def test_fix_self_intersections_leaves_a_clean_mesh_alone(
@@ -2802,34 +2933,65 @@ def _genus(faces_wp: wp.array[wp.int32]) -> int:
     return (2 - tw.measures.euler_characteristic(faces_wp)) // 2
 
 
+@pytest.mark.parity(
+    "eliminate_tunnels",
+    "trimesh",
+    "open3d",
+    benchmarked=False,
+    reason="neither binds a tunnel eliminator, so there is no repair on either side to time -- and "
+    "MeshLib, which does bind one, is a no-op on every input probed. What they contribute is the "
+    "predicates the claim rests on: Trimesh.euler_number is an independent chi, so the genus "
+    "drop is "
+    "not measured by the code that performs it, and Open3D's is_edge_manifold / is_vertex_manifold "
+    "are the two post-conditions that stop a shattering cut. All three are timed in their own "
+    "groups.",
+)
 @pytest.mark.parametrize("mesh_name", ["torus", "genus_two"])
 def test_eliminate_tunnels_drops_the_genus_by_the_count_it_reports(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    Not a library comparison: MeshLib's ``eliminateTunnels`` is a **no-op** on every input probed.
+    Class A on the topology, through chi and the manifold predicates as other libraries read them.
 
-    It is the only reference that binds this operation, and it changes nothing -- measured on a
-    2 048-face torus and a genus-2 union, at ``maxTunnelLength`` of 4.0 and of 1e9, at ``maxIters``
-    1 / 2 / 5 / 100, at all three ``TunnelLoopType`` values, with ``buildCoLoops`` off, and through
-    the ``FillHoleNicelySettings`` overload: identical face count and identical Euler characteristic
-    every time. Its detector *does* fire on the same mesh (``detectTunnelFaces`` returns 128 faces,
-    ``detectBasisTunnels`` two loops), so this is the "a reference's zero is not always off" case,
-    not a wiring mistake. There is nothing to compare a value against.
+    **No library performs this repair.** MeshLib's ``eliminateTunnels`` is the only binding and it
+    is a **no-op** on every input probed -- measured on a 2 048-face torus and a genus-2 union, at
+    ``maxTunnelLength`` of 4.0 and of 1e9, at ``maxIters`` 1 / 2 / 5 / 100, at all three
+    ``TunnelLoopType`` values, with ``buildCoLoops`` off, and through the ``FillHoleNicelySettings``
+    overload: identical face count and identical Euler characteristic every time. Its detector
+    *does* fire on the same mesh (``detectTunnelFaces`` returns 128 faces, ``detectBasisTunnels``
+    two loops), so this is the "a reference's zero is not always off" case, not a wiring mistake.
 
-    The invariant carries the whole claim instead, and it is exact rather than approximate: cutting
+    So the *output* has nothing to be compared against, and the invariant carries the claim: cutting
     a surface along a non-separating cycle and sealing the two rims drops the genus by **one**, so
-    ``euler_characteristic`` must rise by exactly ``2 * eliminated``. That is what makes the return
-    value a measurement. Three more properties come with it -- the result stays connected,
-    watertight and edge-manifold -- and together they exclude the failure this function's shape
-    invites: a cut along loops that cross, which shatters the surface into pieces while every
-    individual step still looks correct (measured, before the disjointness rule: four spheres from
-    a genus-2 union, and ``euler_characteristic`` 8).
+    chi must rise by exactly ``2 * eliminated``. What the invariant must not do is measure itself.
+    Read only through [`euler_characteristic`][triwarp.measures.euler_characteristic], the assertion
+    is triwarp's cut checked by triwarp's chi, and this group has no other oracle at all -- so chi
+    is read a second time off ``trimesh.Trimesh.euler_number``, and the manifold post-conditions off
+    Open3D. Both are independent implementations of the predicates, not of the repair.
+
+    Three more properties come with it -- the result stays connected, closed and edge-manifold --
+    and together they exclude the failure this function's shape invites: a cut along loops that
+    cross, which shatters the surface into pieces while every individual step still looks correct
+    (measured, before the disjointness rule: four spheres from a genus-2 union, and chi 8).
+
+    Open3D's ``is_watertight`` is **not** among them, and the reason is a measured convention rather
+    than a defect on either side. It is the composition ``is_edge_manifold && is_vertex_manifold &&
+    !is_self_intersecting``, and its last clause counts a *touching* pair as an intersection.
+    Sealing two rims over their own vertices produces exactly that: on the torus, **97 of 1 054**
+    output faces touch without crossing -- reported by ``findSelfCollidingTrianglesBS`` at
+    ``touchIsIntersection=True`` and by pymeshfix's ``select_intersecting_triangles``, and reported
+    as **0** by the same MeshLib call at ``touchIsIntersection=False`` and by
+    [`face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask]. So the two
+    manifold clauses are asserted directly, where the two libraries agree exactly, and the third is
+    left to the group that owns it.
     """
     _, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
     genus_before = _genus(faces_wp)
     assert genus_before >= 1  # non-vacuity: there has to be a tunnel to eliminate
+    assert warp_to_trimesh(vertices_wp, faces_wp).euler_number == (
+        tw.measures.euler_characteristic(faces_wp)
+    )
 
     cut_vertices_wp, cut_faces_wp, eliminated = tw.repair.eliminate_tunnels(
         vertices_wp, faces_wp, 1e9
@@ -2845,6 +3007,13 @@ def test_eliminate_tunnels_drops_the_genus_by_the_count_it_reports(
     assert np.unique(labels_np).shape[0] == 1
     # Every output position is an input position: the rims are filled over their own vertices.
     assert int(cut_vertices_wp.shape[0]) >= int(vertices_wp.shape[0])
+
+    # The genus drop, and the two properties that stop a shattering cut, read by other libraries.
+    cut_tm = warp_to_trimesh(cut_vertices_wp, cut_faces_wp)
+    assert cut_tm.euler_number == tw.measures.euler_characteristic(faces_wp) + 2 * eliminated
+    mesh_o3d = trimesh_to_open3d(cut_tm)
+    assert mesh_o3d.is_edge_manifold(allow_boundary_edges=False)
+    assert mesh_o3d.is_vertex_manifold()
 
 
 def test_eliminate_tunnels_iterates_to_a_sphere(genus_two: tuple[tm.Trimesh, wp.Mesh]) -> None:
