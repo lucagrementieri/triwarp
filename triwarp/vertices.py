@@ -1,15 +1,19 @@
 """
-Per-vertex quantities: normals under five averaging rules, and the angle defect.
+Per-vertex quantities: normals under three weighting rules, and the angle defect.
 
 A vertex has no normal of its own -- only the faces around it do -- so a vertex normal is always a
 weighted average of incident face normals, and the weight is a modelling choice rather than a
-detail. The five here differ only in that weight: unweighted
-([`mean_vertex_normals`][triwarp.vertices.mean_vertex_normals]), caller-supplied
-([`weighted_vertex_normals`][triwarp.vertices.weighted_vertex_normals]), by face area
-([`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals]), by incident angle
-([`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals], the one that is
-invariant to how a neighbour is triangulated), and by sine times edge length
-([`sine_and_edge_length_weighted_vertex_normals`][triwarp.vertices.sine_and_edge_length_weighted_vertex_normals]).
+detail. [`vertex_normals`][triwarp.vertices.vertex_normals] is the entry point, and its
+``weighting=`` keyword *is* that choice: by face area, by incident angle (the one invariant to how a
+neighbouring polygon happened to be triangulated), or by Nelson Max's sine-and-edge-length
+reciprocals.
+
+Two **accumulators** sit underneath it and are public in their own right:
+[`weighted_vertex_normals`][triwarp.vertices.weighted_vertex_normals] takes a caller-supplied
+per-corner weight table and [`mean_vertex_normals`][triwarp.vertices.mean_vertex_normals] is the
+same thing with unit weights. They know no geometry -- they take no ``vertices`` at all, which is
+why they keep an explicit ``n_vertices`` argument where ``vertex_normals`` derives it. That
+asymmetry is the visible marker of which of the two layers you are in.
 
 [`vertex_defects`][triwarp.vertices.vertex_defects] is the odd one out and not a normal at all:
 ``2 * pi`` minus the incident angle sum, which is the intrinsic curvature concentrated at that
@@ -19,6 +23,8 @@ vertex and the quantity
 
 from __future__ import annotations
 
+from typing import Literal
+
 import warp as wp
 
 import triwarp as tw
@@ -26,31 +32,6 @@ import triwarp.typing as twt
 from triwarp.kernels import predicates as kernel_predicates
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import vertices as kernel_vertices
-
-
-def n_vertices(indices: twt.IntArray) -> int:
-    """
-    Vertex count inferred from an index buffer as ``max(indices) + 1``.
-
-    Follows libigl's ``F.maxCoeff() + 1`` convention: the vertex count is one past the largest
-    referenced index. Accepts any ``wp.int32`` index buffer — a length-``3 * n_faces`` flat
-    triangle buffer, an ``(n, 2)`` edge array, etc. — reading its maximum on the host.
-
-    Parameters
-    ----------
-    indices
-        A ``wp.int32`` index buffer of any shape (e.g. a flat ``faces`` array or a ``(n, 2)``
-        edge array).
-
-    Returns
-    -------
-    int
-        ``max(indices) + 1``, or ``0`` when ``indices`` is empty.
-    """
-    if int(indices.size) == 0:
-        return 0
-    # Device-side tiled max: only the 4-byte result crosses to the host, not the whole buffer.
-    return int(tw.reduce.max(indices)) + 1
 
 
 def mean_vertex_normals(
@@ -79,6 +60,13 @@ def mean_vertex_normals(
     wp.array[wp.vec3]
         Length-``n_vertices`` device array of unit normals where the accumulated vector was
         non-zero; otherwise the corresponding entry is zero.
+
+    See Also
+    --------
+    [`weighted_vertex_normals`][triwarp.vertices.weighted_vertex_normals]
+        The same accumulator with a per-corner weight table; this is that with unit weights.
+    [`vertex_normals`][triwarp.vertices.vertex_normals]
+        The geometry-aware entry point, which derives a weight table and calls one of these two.
     """
     return _accumulate_and_normalize(
         n_vertices, faces, kernel_scatter.scatter_sum_vec, face_normals
@@ -115,6 +103,13 @@ def weighted_vertex_normals(
     wp.array[wp.vec3]
         Length-``n_vertices`` device array of unit normals where the accumulated vector was
         non-zero; otherwise the corresponding entry is zero.
+
+    See Also
+    --------
+    [`mean_vertex_normals`][triwarp.vertices.mean_vertex_normals]
+        This with unit weights.
+    [`vertex_normals`][triwarp.vertices.vertex_normals]
+        The geometry-aware entry point, which derives a weight table and calls this.
     """
     return _accumulate_and_normalize(
         n_vertices, faces, kernel_scatter.scatter_weighted_sum_vec, face_normals, face_weights
@@ -171,150 +166,134 @@ def _accumulate_and_normalize(
     return vec_normals
 
 
-def area_weighted_vertex_normals(
-    n_vertices: int,
+def vertex_normals(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
+    *,
+    weighting: Literal["area", "angle", "mwselr"] = "area",
     face_normals: wp.array[wp.vec3] | None = None,
-    face_areas: wp.array[wp.float32] | None = None,
+    face_weights: wp.array[wp.float32] | twt.Array2dFloat32 | None = None,
 ) -> wp.array[wp.vec3]:
     """
-    Area-weighted vertex normals.
+    Per-vertex unit normals, as a weighted average of the incident face normals.
 
-    Each face contributes its normal scaled by the triangle area at all three corners;
-    contributions are summed per vertex and L2-normalized. This matches libigl's default
-    ``per_vertex_normals`` weighting (up to the constant ``2`` factor from ``doublearea``,
-    which cancels during normalization).
+    A vertex has no normal of its own -- only the faces around it do -- so the weight is the whole
+    content of the choice, and ``weighting`` selects it. Contributions are summed per vertex and
+    L2-normalized, so any constant factor in the weights cancels.
+
+    Which weighting to want is a measurable question, not a preference: MeshLib's
+    ``computePerVertNormals`` reproduces ``"area"`` to **1.19e-07** and its
+    ``computePerVertPseudoNormals`` reproduces ``"angle"`` to **1.19e-07**, while each sits
+    **6.8e-03** from the other's partner. Reach for ``"angle"`` when the answer must not depend on
+    how a neighbouring polygon happened to be triangulated -- it is the only one of the three that
+    is invariant to that -- and for ``"area"`` otherwise, since it is what libigl and most of the
+    field default to.
 
     Parameters
     ----------
-    n_vertices
-        Number of vertices indexed by ``faces`` (output length).
     vertices
-        Mesh vertex positions as ``wp.vec3``, length ``n_vertices``.
+        ``(n_vertices,)`` mesh vertex positions. The output length is ``vertices.shape[0]``.
     faces
-        Triangle indices as ``wp.int32``; interpreted as ``(f, 3)`` via ``reshape((-1, 3))``.
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    weighting
+        Which average to take.
+
+        - ``"area"`` (default) weights each face by its area, matching libigl's default
+          ``per_vertex_normals`` (up to the constant ``2`` from ``doublearea``, which normalization
+          cancels).
+        - ``"angle"`` weights each face by its interior angle at the corner vertex -- the
+          Thuerrner/Wuethrich recipe (*Computing Vertex Normals from Polygonal Facets*, Journal of
+          Graphics Tools 3:1, 43-46, 1998) and
+          ``igl::PER_VERTEX_NORMALS_WEIGHTING_TYPE_ANGLE``. The triangulation-invariant one.
+        - ``"mwselr"`` weights each corner by ``sin(angle) / (||E_i|| ||E_{i+1}||)``, which reduces
+          to ``(e1 x e2) / (||e1||^2 ||e2||^2)`` for the two outgoing edges -- Nelson Max's Mean
+          Weighted by Sine and Edge Length Reciprocals, optimized for smooth surface reconstruction
+          (Jin et al., 2005).
     face_normals
-        One normal per triangle, length ``f`` as ``wp.vec3``. When ``None``, computed from
-        ``vertices`` and ``faces``.
-    face_areas
-        Scalar area per triangle, length ``f`` as ``wp.float32``. When ``None``, computed
-        from ``vertices`` and ``faces``.
+        Precomputed ``(n_faces,)`` face normals, to skip deriving them. Under ``"mwselr"``, passing
+        them asserts they are *unit* length; omitting them lets the unnormalized cross product be
+        used instead, which is cheaper and gives the same answer after normalization.
+    face_weights
+        Precomputed weights, to skip deriving them. The expected shape follows ``weighting``:
+        ``(n_faces,)`` per-face areas for ``"area"``, and ``(n_faces, 3)`` per-corner angles for
+        ``"angle"``. Not accepted under ``"mwselr"``, whose weights are a joint function of the
+        corner positions rather than a table a caller would hold.
 
     Returns
     -------
     wp.array[wp.vec3]
-        Length-``n_vertices`` device array of unit normals where the accumulated vector was
-        non-zero; otherwise the corresponding entry is zero.
+        Length-``n_vertices`` unit normals on ``vertices.device``, zero wherever the accumulated
+        vector was zero (an unreferenced vertex, or a cancelling fan).
+
+    Raises
+    ------
+    ValueError
+        If ``weighting`` is not one of the three names, or if ``face_weights`` is passed with
+        ``weighting="mwselr"``.
+
+    See Also
+    --------
+    [`weighted_vertex_normals`][triwarp.vertices.weighted_vertex_normals]
+        The accumulator underneath: a caller-supplied per-corner weight table, no geometry.
+    [`mean_vertex_normals`][triwarp.vertices.mean_vertex_normals]
+        The same accumulator with unit weights.
+    [`triwarp.triangles.face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
+        Produces the ``face_normals`` / ``face_weights`` the ``"area"`` path derives.
+    [`triwarp.triangles.face_angles`][triwarp.triangles.face_angles]
+        Produces the ``"angle"`` path's weight table.
     """
-    if face_normals is None or face_areas is None:
+    if weighting not in ("area", "angle", "mwselr"):
+        raise ValueError(f'weighting must be "area", "angle" or "mwselr", got {weighting!r}')
+    if weighting == "mwselr" and face_weights is not None:
+        raise ValueError('face_weights is not accepted with weighting="mwselr"')
+
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+
+    if weighting == "mwselr":
+        if n_faces == 0:
+            return wp.zeros(n_vertices, dtype=wp.vec3, device=device)
+        # A supplied ``face_normals`` is unit length; a derived one is the raw cross product, and
+        # the weight kernel needs to know which, because the sine it divides out is already in the
+        # cross product's magnitude.
+        unit_face_normals = face_normals is not None
+        if face_normals is None:
+            face_normals = wp.empty(n_faces, dtype=wp.vec3, device=device)
+            wp.launch(
+                kernel_vertices.face_crosses,
+                dim=n_faces,
+                inputs=[vertices, faces, face_normals],
+                device=device,
+            )
+        corner_weights = twt.empty_2d((n_faces, 3), wp.float32, device=device)
+        wp.launch(
+            kernel_vertices.max_vertex_normal_weights,
+            dim=n_faces,
+            inputs=[vertices, faces, unit_face_normals, corner_weights],
+            device=device,
+        )
+        return weighted_vertex_normals(n_vertices, faces, face_normals, corner_weights)
+
+    if weighting == "angle":
+        if face_normals is None:
+            face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
+        angles = tw.triangles.face_angles(vertices, faces) if face_weights is None else face_weights
+        return weighted_vertex_normals(
+            n_vertices, faces, face_normals, twt.as_array2d(angles, wp.float32)
+        )
+
+    # "area": scale each face normal by its area once, then accumulate with unit weights -- the
+    # weight is per *face* here rather than per corner, so this is the cheaper of the two paths.
+    if face_normals is None or face_weights is None:
         computed_normals, computed_areas = tw.triangles.face_normals_and_areas(vertices, faces)
         if face_normals is None:
             face_normals = computed_normals
-        if face_areas is None:
-            face_areas = computed_areas
-    n_faces = int(face_areas.shape[0])
-    scaled_normals = wp.empty(n_faces, dtype=wp.vec3, device=faces.device)
-    wp.map(wp.mul, face_normals, face_areas, out=scaled_normals)
+        if face_weights is None:
+            face_weights = computed_areas
+    scaled_normals = wp.empty(int(face_weights.shape[0]), dtype=wp.vec3, device=device)
+    wp.map(wp.mul, face_normals, face_weights, out=scaled_normals)
     return mean_vertex_normals(n_vertices, faces, scaled_normals)
-
-
-def angle_weighted_vertex_normals(
-    n_vertices: int,
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    face_normals: wp.array[wp.vec3] | None = None,
-    face_angles: twt.Array2dFloat32 | None = None,
-) -> wp.array[wp.vec3]:
-    """
-    Angle-weighted vertex normals (Thuerrner & Wuethrich, 1998).
-
-    Each face contributes its normal scaled by the interior angle at the corner vertex;
-    contributions are summed per vertex and L2-normalized. This matches the "polygonal
-    facets" recipe in *Computing Vertex Normals from Polygonal Facets*, Journal of
-    Graphics Tools 3:1, 43-46 (1998), and ``igl::PER_VERTEX_NORMALS_WEIGHTING_TYPE_ANGLE``.
-
-    Parameters
-    ----------
-    n_vertices
-        Number of vertices indexed by ``faces`` (output length).
-    vertices
-        Mesh vertex positions as ``wp.vec3``, length ``n_vertices``.
-    faces
-        Triangle indices as ``wp.int32``; interpreted as ``(f, 3)`` via ``reshape((-1, 3))``.
-    face_normals
-        One normal per triangle, length ``f`` as ``wp.vec3``. When ``None``, computed from
-        ``vertices`` and ``faces``.
-    face_angles
-        Interior angles at the three corners of each triangle, shape ``(f, 3)`` as
-        ``twt.Array2dFloat32``. When ``None``, computed from ``vertices`` and ``faces``.
-
-    Returns
-    -------
-    wp.array[wp.vec3]
-        Length-``n_vertices`` device array of unit normals where the accumulated vector was
-        non-zero; otherwise the corresponding entry is zero.
-    """
-    if face_normals is None:
-        face_normals, _ = tw.triangles.face_normals_and_areas(vertices, faces)
-    if face_angles is None:
-        face_angles = tw.triangles.face_angles(vertices, faces)
-    return weighted_vertex_normals(n_vertices, faces, face_normals, face_angles)
-
-
-def sine_and_edge_length_weighted_vertex_normals(
-    n_vertices: int,
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    face_normals: wp.array[wp.vec3] | None = None,
-) -> wp.array[wp.vec3]:
-    """
-    Nelson Max MWSELR vertex normals (sine and edge-length reciprocal weighting).
-
-    At each corner, the incident face contributes ``sin(angle) / (||E_i|| ||E_{i+1}||) * N_i``,
-    which simplifies to ``(e1 x e2) / (||e1||^2 * ||e2||^2)`` for the two outgoing edges at that
-    vertex. Contributions are summed per vertex and L2-normalized. This matches the
-    Mean Weighted by Sine and Edge Length Reciprocals recipe optimized by Max for smooth
-    surface reconstruction (Jin et al., 2005).
-
-    Parameters
-    ----------
-    n_vertices
-        Number of vertices indexed by ``faces`` (output length).
-    vertices
-        Mesh vertex positions as ``wp.vec3``, length ``n_vertices``.
-    faces
-        Triangle indices as ``wp.int32``; interpreted as ``(f, 3)`` via ``reshape((-1, 3))``.
-    face_normals
-        One normal per triangle, length ``f`` as ``wp.vec3``, aligned with ``faces``. When
-        ``None``, the unnormalized triangle cross product is used instead.
-
-    Returns
-    -------
-    wp.array[wp.vec3]
-        Length-``n_vertices`` device array of unit normals where the accumulated vector was
-        non-zero; otherwise the corresponding entry is zero.
-    """
-    n_faces = faces.shape[0] // 3
-    if n_faces == 0:
-        return wp.zeros(n_vertices, dtype=wp.vec3, device=vertices.device)
-    unit_face_normals = face_normals is not None
-    if face_normals is None:
-        face_normals = wp.empty(n_faces, dtype=wp.vec3, device=vertices.device)
-        wp.launch(
-            kernel_vertices.face_crosses,
-            dim=n_faces,
-            inputs=[vertices, faces, face_normals],
-            device=vertices.device,
-        )
-    face_weights = twt.empty_2d((n_faces, 3), wp.float32, device=vertices.device)
-    wp.launch(
-        kernel_vertices.max_vertex_normal_weights,
-        dim=n_faces,
-        inputs=[vertices, faces, unit_face_normals, face_weights],
-        device=vertices.device,
-    )
-    return weighted_vertex_normals(n_vertices, faces, face_normals, face_weights)
 
 
 def vertex_defects(

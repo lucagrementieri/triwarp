@@ -32,7 +32,7 @@ from triwarp.kernels import bounds as kernel_bounds
 ITEMS_PER_CANDIDATE_SLICE = 256
 
 # Cloud size at which [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box] first runs
-# [`convex_superset_mask`][triwarp.convex.convex_superset_mask] and searches only the survivors.
+# [`convex_superset_mask`][triwarp.points.convex_superset_mask] and searches only the survivors.
 # The mask keeps every convex-hull vertex and the extent reduction is decided by hull vertices
 # alone, so the box is *identical* (min/max are order-independent; measured dVol == 0 on every
 # probe) — the threshold trades only time. Measured interleaved on anisotropic normal clouds
@@ -165,7 +165,7 @@ def oriented_bounding_box(
     Cost is ``rotations * len(points)`` point transforms for the global phase plus
     ``refine_iterations * 512 * len(points)`` for refinement — but past
     ``CONVEX_PREFILTER_MIN_POINTS`` a
-    [`convex_superset_mask`][triwarp.convex.convex_superset_mask] prefilter first drops every
+    [`convex_superset_mask`][triwarp.points.convex_superset_mask] prefilter first drops every
     point that provably cannot touch the box, so both phases run on the few hull-candidate
     survivors and the cost stops growing with the cloud (the box is identical: the mask keeps
     every hull vertex and the extents are order-independent reductions over them).
@@ -270,7 +270,7 @@ def oriented_bounding_box(
         # Identical box, decided at the threshold above: only hull vertices can touch an
         # enclosing box, the mask keeps all of them, and min/max extents do not care about the
         # discarded interior points.
-        mask = tw.convex.convex_superset_mask(points)
+        mask = tw.points.convex_superset_mask(points)
         points = tw.array.gather(points, tw.array.flatnonzero(mask))
         n = int(points.shape[0])
 

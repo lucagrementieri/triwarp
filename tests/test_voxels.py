@@ -575,7 +575,7 @@ def test_grid_points_matches_igl(device: str):
 
 
 def test_grid_points_defaults_to_index_space(device: str):
-    """``bounds=None`` gives lattice indices, matching ``reconstruction.marching_cubes``."""
+    """``bounds=None`` gives lattice indices, matching ``levelset.marching_cubes``."""
     lattice = tw.voxels.grid_points((2, 3, 4), device=device).numpy()
     expected = np.stack(np.meshgrid(*(np.arange(n) for n in (2, 3, 4)), indexing="ij"), -1)
     assert np.array_equal(lattice, expected.reshape(-1, 3).astype(np.float32))
@@ -859,7 +859,7 @@ def test_to_field_round_trips_through_marching_cubes(sphere, cave_cube, device: 
     voxel_size = 0.1
     solid = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, voxel_size, mode="solid")
     field, bounds = tw.voxels.to_field(solid)
-    vertices_out, faces_out = tw.reconstruction.marching_cubes(field, 0.5, bounds=bounds)
+    vertices_out, faces_out = tw.levelset.marching_cubes(field, 0.5, bounds=bounds)
     surface = tm.Trimesh(vertices_out.numpy(), faces_out.numpy().reshape(-1, 3), process=True)
     tm.repair.fix_normals(surface)
 
@@ -877,7 +877,7 @@ def test_to_field_round_trips_through_marching_cubes(sphere, cave_cube, device: 
     voxel_size = 0.03
     shell = tw.voxels.voxelize_mesh(mesh_wp.points, mesh_wp.indices, voxel_size)
     field, bounds = tw.voxels.to_field(shell)
-    vertices_out, faces_out = tw.reconstruction.marching_cubes(field, 0.5, bounds=bounds)
+    vertices_out, faces_out = tw.levelset.marching_cubes(field, 0.5, bounds=bounds)
     shell_out = tm.Trimesh(vertices_out.numpy(), faces_out.numpy().reshape(-1, 3), process=True)
     assert shell_out.faces.shape[0] > 0
     _assert_surfaces_within(shell_out, mesh_tm, 2.0 * voxel_size)
@@ -897,7 +897,7 @@ def test_grid_points_round_trips_through_marching_cubes(icosahedron, device: str
     distance = tw.proximity.signed_distance_on_mesh(
         mesh_wp.points, mesh_wp.indices, samples, sign_mode="winding"
     )
-    vertices_out, faces_out = tw.reconstruction.marching_cubes(
+    vertices_out, faces_out = tw.levelset.marching_cubes(
         distance.reshape(shape), 0.0, bounds=bounds
     )
     surface = tm.Trimesh(vertices_out.numpy(), faces_out.numpy().reshape(-1, 3), process=True)

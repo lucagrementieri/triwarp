@@ -952,6 +952,36 @@ def astype(values: twt.ArrayNd, dtype: type) -> wp.array:
     return out
 
 
+def index_domain_size(indices: twt.IntArray) -> int:
+    """
+    Size of the domain an index buffer addresses, as ``max(indices) + 1``.
+
+    For a face or edge buffer this is the vertex count, and it follows libigl's
+    ``F.maxCoeff() + 1`` convention: one past the largest referenced index, so a mesh with trailing
+    unreferenced vertices reports fewer than it has. Accepts any ``wp.int32`` index buffer of any
+    shape -- a length-``3 * n_faces`` flat triangle buffer, an ``(n, 2)`` edge array -- and reads
+    only the 4-byte maximum back to the host.
+
+    Named for the index buffer rather than for vertices because that is all it sees: it is
+    index arithmetic, and nothing about it is geometric.
+
+    Parameters
+    ----------
+    indices
+        A ``wp.int32`` index buffer of any shape (e.g. a flat ``faces`` array or a ``(n, 2)``
+        edge array).
+
+    Returns
+    -------
+    int
+        ``max(indices) + 1``, or ``0`` when ``indices`` is empty.
+    """
+    if int(indices.size) == 0:
+        return 0
+    # Device-side tiled max: only the 4-byte result crosses to the host, not the whole buffer.
+    return int(tw.reduce.max(indices)) + 1
+
+
 def indices_to_mask(
     indices: wp.array[wp.int32], n: int, *, device: wp.DeviceLike = None
 ) -> wp.array[wp.bool]:

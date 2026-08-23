@@ -94,7 +94,7 @@ def ambient_occlusion(
         ([`normals_at_closest_faces`][triwarp.proximity.normals_at_closest_faces]), which is right
         for points on the surface and meaningless for points far off it — pass them explicitly in
         that case. For a smooth result on the mesh's own vertices, pass
-        [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] instead:
+        [`vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="area"`` instead:
         face normals make the field piecewise constant across each vertex's ring.
     n_rays
         Directions per point. Error falls as ``1 / sqrt(n_rays)``; MeshLab's default is ``64``,
@@ -281,7 +281,7 @@ def shape_diameter(
     normals
         ``(m,)`` **outward** unit normals; the cone opens along ``-normals``. When ``None`` they are
         taken from the closest face of ``mesh``. Pass
-        [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] for a smooth
+        [`vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="area"`` for a smooth
         field over a mesh's own vertices.
     n_rays
         Rays per point. MeshLab's default is ``64``, which is this one. Note that the single ray of

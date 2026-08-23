@@ -297,7 +297,7 @@ class _EdgeTable:
     ) -> None:
         device = faces.device
         n_rows = int(edges_sorted.shape[0])
-        n_vertices = tw.vertices.n_vertices(edges_sorted)
+        n_vertices = tw.array.index_domain_size(edges_sorted)
         self.vertices = vertices
         self.edges_sorted = edges_sorted
         self.max_index = wp.uint64(n_vertices)
@@ -1392,7 +1392,7 @@ def fillable_loop_mask(
     if not loops:
         return wp.empty(0, dtype=wp.bool, device=device)
 
-    n_vertices = tw.vertices.n_vertices(faces)
+    n_vertices = tw.array.index_domain_size(faces)
     # **One** readback for all the loops, not one each: they are concatenated on the device first,
     # and the sizes are already on the host. A scan mesh carries dozens of rims, so the per-loop
     # spelling cost a sync apiece and was measured at 16x behind the reference before this.

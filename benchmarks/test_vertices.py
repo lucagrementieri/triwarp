@@ -15,7 +15,7 @@ Two axes, because the module has two different kinds of function:
 [`test_interpolation.py`](test_interpolation.py), where ``triwarp.interpolation`` does; their group
 names are unchanged, since the group name is the cross-suite key every ``parity`` marker cites.
 
-Measured medians (RTX 5090, ``--device=cuda``): ``area_weighted_vertex_normals`` 0.22 ms against
+Measured medians (RTX 5090, ``--device=cuda``): ``vertex_normals`` 0.22 ms against
 0.39 ms, ``average_onto_vertices`` 0.1 ms against 0.2 ms. **Under 2x** -- which is the useful
 result. Two vertices absorbing 40 960 atomics each cost less than doubling, so CUDA's atomic
 aggregation is doing its job and contention is not a hot spot worth engineering around. The axis
@@ -37,7 +37,7 @@ libraries.
 **pymeshlab**'s ``weightmode`` enum is what makes it useful here: ``compute_normal_per_vertex``
 implements four weighting schemes behind one filter, two of which are exactly triwarp's --
 ``'Simple Average'`` is ``mean_vertex_normals`` and ``'By Area'`` is
-``area_weighted_vertex_normals``, so the pair also isolates what the area weight costs on the
+``vertex_normals``, so the pair also isolates what the area weight costs on the
 reference's side (1.15 -> 1.34 ms). Both write only the vertex-normal attribute and are idempotent,
 so they run against the shared MeshSet with no build inside the timed region.
 
@@ -53,19 +53,16 @@ is not a cost driver here is a stronger statement than triwarp's own under-2x sp
 
 from __future__ import annotations
 
-from typing import cast
-
 import igl
 import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-import triwarp.typing as twt
+from conftest import BenchCase
 
 _face_data_cache: dict[tuple[str, str], tuple[wp.array[wp.vec3], wp.array[wp.float32]]] = {}
 
@@ -80,27 +77,6 @@ def _face_normals_and_areas(
             bench_case.vertices_wp, bench_case.faces_wp
         )
     return _face_data_cache[key]
-
-
-@pytest.mark.benchmark(group="n_vertices")
-@pytest.mark.benchlibs("triwarp", "trimesh")
-def test_n_vertices(bench_case: BenchCase) -> None:
-    """
-    A max-reduce over ``3F`` indices; the scan sweep is here for ``lucy``'s 84M of them.
-
-    Below roughly ``10 ** 3`` indices this row reports the ~340 µs wrapper floor and nothing else
-    (see ``test_creation::test_box``), so the small end of the axis loses to ``faces.max()`` by up
-    to two orders of magnitude while ``lucy`` wins by 259x. Read the whole axis, not one point: the
-    crossover, not either endpoint, is what this group establishes.
-    """
-    if bench_case.kind == "triwarp":
-        faces = cast(twt.Array1dInt32, bench_case.faces_wp)
-        result = bench_case.run(lambda: tw.vertices.n_vertices(faces))
-        assert result == bench_case.n_vertices
-    else:  # numpy reference: what trimesh-style code does on host arrays
-        faces = bench_case.faces_np
-        result = bench_case.run(lambda: int(faces.max()) + 1)
-        assert result == bench_case.n_vertices
 
 
 @pytest.mark.benchmark(group="mean_vertex_normals")
@@ -145,17 +121,21 @@ def test_mean_vertex_normals(bench_case: BenchCase) -> None:
     "trimesh",
     oracle="open3d",
     reason="D2 a different weighting: Trimesh.vertex_normals is *angle*-weighted, not "
-    "area-weighted -- it matches triwarp's angle_weighted_vertex_normals to 4.3e-7 and "
+    "area-weighted -- it matches triwarp's vertex_normals(weighting='angle') to 4.3e-7 and "
     "differs from the area-weighted answer by up to 0.072 on half_torus. trimesh has no "
     "area-weighted vertex "
     "normal, so this row prices 'compute vertex normals' generally; open3d and pymeshlab compute "
     "the same scheme and are the oracles, in tests/test_vertices.py::"
-    "test_vertex_normal_weightings_match_open3d_and_pymeshlab.",
+    "test_vertex_normal_weightings_match_open3d_and_pymeshlab. Now that the weighting is a "
+    "parameter of one function rather than three names, this row could be made comparable by "
+    "timing weighting='angle' -- but that would move the group off the weighting two of its three "
+    "references compute, so the row stays where the majority is and the angle comparison lives in "
+    "test_vertex_normals_angle.",
 )
-@pytest.mark.benchmark(group="area_weighted_vertex_normals")
+@pytest.mark.benchmark(group="vertex_normals")
 @pytest.mark.benchaxis("valence")
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
-def test_area_weighted_vertex_normals(bench_case: BenchCase) -> None:
+def test_vertex_normals(bench_case: BenchCase) -> None:
     """
     Area-weighted scatter, uniform valence 6 against two 40 960-valence hubs.
 
@@ -178,9 +158,7 @@ def test_area_weighted_vertex_normals(bench_case: BenchCase) -> None:
         return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-        result = bench_case.run(
-            lambda: tw.vertices.area_weighted_vertex_normals(n_vertices, vertices, faces)
-        )
+        result = bench_case.run(lambda: tw.vertices.vertex_normals(vertices, faces))
         assert result.shape == (n_vertices,)
     elif bench_case.kind == "trimesh":
         # trimesh vertex_normals are area-weighted; rebuild inside (cached property)
@@ -257,10 +235,10 @@ def test_vertex_defects(bench_case: BenchCase) -> None:
         assert defects_tm.shape == (n_vertices,)
 
 
-@pytest.mark.benchmark(group="area_weighted_vertex_normals_precomputed")
+@pytest.mark.benchmark(group="vertex_normals_precomputed")
 @pytest.mark.benchaxis("valence")
 @pytest.mark.benchlibs("triwarp")
-def test_area_weighted_vertex_normals_precomputed(bench_case: BenchCase) -> None:
+def test_vertex_normals_precomputed(bench_case: BenchCase) -> None:
     """
     The same scatter with ``face_normals`` / ``face_areas`` supplied: the warm half of the cost.
 
@@ -272,8 +250,8 @@ def test_area_weighted_vertex_normals_precomputed(bench_case: BenchCase) -> None
     n_vertices = bench_case.n_vertices
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     result = bench_case.run(
-        lambda: tw.vertices.area_weighted_vertex_normals(
-            n_vertices, vertices, faces, face_normals=face_normals, face_areas=face_areas
+        lambda: tw.vertices.vertex_normals(
+            vertices, faces, face_normals=face_normals, face_weights=face_areas
         )
     )
     assert result.shape == (n_vertices,)

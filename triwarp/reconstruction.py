@@ -1,5 +1,5 @@
 """
-Building a triangle mesh out of something that is not one: a point cloud, or a scalar field.
+Building a triangle mesh whose triangulation is the method's own, not any input's.
 
 - **From an oriented point cloud.**
   [`screened_poisson`][triwarp.reconstruction.screened_poisson] fits an implicit indicator function
@@ -7,13 +7,19 @@ Building a triangle mesh out of something that is not one: a point cloud, or a s
   any input point; [`ball_pivoting`][triwarp.reconstruction.ball_pivoting] instead *interpolates*
   the points, rolling a ball over them, and leaves a hole wherever the ball falls through.
   [`triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud] picks between them.
-- **From a scalar field.** [`marching_cubes`][triwarp.reconstruction.marching_cubes] extracts an
-  iso-level set of a dense lattice.
 - **From a mesh.** [`resample_uniform`][triwarp.reconstruction.resample_uniform] samples an
   existing mesh's signed distance field on a uniform grid and re-extracts it, which is the way to
-  get a clean, uniformly-sampled surface out of a self-intersecting or badly-triangulated one.
+  get a clean, uniformly-sampled surface out of a self-intersecting or badly-triangulated one. It
+  is shelved with the reconstructors rather than with the mesh edits because it shares their
+  defining property: the output's triangulation comes from the grid, not from the input, so no
+  vertex, edge or face survives the call.
 - **In the plane.** [`delaunay_triangulation`][triwarp.reconstruction.delaunay_triangulation]
   triangulates a 2D point set.
+
+Extracting a level set of a field you already hold is
+[`levelset.marching_cubes`][triwarp.levelset.marching_cubes], not a reconstruction: it lives with
+its consumers in [`triwarp.levelset`][triwarp.levelset], and ``screened_poisson`` and
+``resample_uniform`` both end in it.
 """
 
 from __future__ import annotations
@@ -588,10 +594,12 @@ def _extract_poisson_surface(
     ([`_extract_poisson_surface_fem`][triwarp.reconstruction._extract_poisson_surface_fem]). The
     result is un-oriented; [`screened_poisson`][triwarp.reconstruction.screened_poisson] orients it.
 
-    All this adds over [`marching_cubes`][triwarp.reconstruction.marching_cubes] is the reshape:
+    All this adds over [`marching_cubes`][triwarp.levelset.marching_cubes] is the reshape:
     the solvers carry their lattice flat, because that is the shape the linear solve wants.
     """
-    return marching_cubes(field.reshape((res, res, res)), iso, bounds=(cube_lower, cube_upper))
+    return tw.levelset.marching_cubes(
+        field.reshape((res, res, res)), iso, bounds=(cube_lower, cube_upper)
+    )
 
 
 def _poisson_dense_solve(
@@ -972,74 +980,6 @@ def _extract_poisson_surface_fem(
     return _extract_poisson_surface(values, res, iso, cube_lower, cube_upper)
 
 
-def marching_cubes(
-    field: twt.Array3dFloat32, iso: float = 0.0, *, bounds: tuple[wp.vec3, wp.vec3] | None = None
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """
-    Extract the ``iso`` level set of a dense scalar lattice as a triangle mesh.
-
-    The extraction tail of every implicit-surface pipeline, exposed on its own so a caller with a
-    field of their own — an SDF, an occupancy volume, a simulation state — does not have to route it
-    through [`screened_poisson`][triwarp.reconstruction.screened_poisson] to get a surface out. It
-    is what [`resample_uniform`][triwarp.reconstruction.resample_uniform] is built from.
-
-    Parameters
-    ----------
-    field
-        ``(nx, ny, nz)`` ``wp.float32`` lattice of scalar values, with ``x`` the slowest axis. The
-        surface is extracted where the field crosses ``iso``; the sign convention is the caller's,
-        and the winding follows it (with triwarp's outside-positive
-        [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh] convention the
-        normals come out pointing outward).
-    iso
-        Level to extract. Defaults to ``0``, which is the zero level set of a signed distance field.
-    bounds
-        ``(lower, upper)`` world-space corners the lattice spans, so ``field[0, 0, 0]`` sits at
-        ``lower`` and ``field[nx - 1, ny - 1, nz - 1]`` at ``upper``. When ``None`` the result is in
-        *index* space: vertex coordinates are lattice indices.
-
-    Returns
-    -------
-    vertices : wp.array[wp.vec3]
-        Level-set vertices on ``field.device``. Empty when the field does not cross ``iso``.
-    faces : wp.array[wp.int32]
-        Flat ``3 * n_faces`` triangle index buffer.
-
-    Raises
-    ------
-    ValueError
-        If ``field`` is not a rank-3 ``wp.float32`` array, or any of its dimensions is below 2.
-
-    See Also
-    --------
-    [`resample_uniform`][triwarp.reconstruction.resample_uniform]
-    [`screened_poisson`][triwarp.reconstruction.screened_poisson]
-    [`triwarp.proximity.signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
-    [`triwarp.voxels.to_field`][triwarp.voxels.to_field]
-    [`triwarp.voxels.grid_points`][triwarp.voxels.grid_points]
-
-    Notes
-    -----
-    A thin wrapper over Warp's own ``warp.MarchingCubes``, so the triangulation, its vertex
-    deduplication and its handling of the ambiguous cube cases are Warp's rather than triwarp's. The
-    consequence worth knowing is that the result is **not guaranteed manifold** at an ambiguous
-    cell, and can carry duplicate vertices where two cells agree on a crossing —
-    [`resample_uniform`][triwarp.reconstruction.resample_uniform] runs
-    [`triwarp.repair`][triwarp.repair] over it for exactly that reason.
-    """
-    field = twt.as_array3d(field, wp.float32)
-    shape = tuple(int(dim) for dim in field.shape)
-    if min(shape) < 2:
-        raise ValueError(f"field must be at least 2 wide along every axis, got {shape}")
-
-    if bounds is None:
-        lower = wp.vec3(0.0, 0.0, 0.0)
-        upper = wp.vec3(float(shape[0] - 1), float(shape[1] - 1), float(shape[2] - 1))
-    else:
-        lower, upper = bounds
-    return wp.MarchingCubes.extract_surface_marching_cubes(field, wp.float32(iso), lower, upper)
-
-
 def resample_uniform(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -1095,7 +1035,7 @@ def resample_uniform(
 
     See Also
     --------
-    [`marching_cubes`][triwarp.reconstruction.marching_cubes]
+    [`marching_cubes`][triwarp.levelset.marching_cubes]
     [`triwarp.proximity.signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
     [`triwarp.remesh.cluster_decimate`][triwarp.remesh.cluster_decimate]
     [`triwarp.voxels.voxelize_mesh`][triwarp.voxels.voxelize_mesh]
@@ -1142,7 +1082,7 @@ def resample_uniform(
         device=device,
     )
     field = tw.proximity.signed_distance_on_mesh(vertices, faces, points, sign_mode=sign_mode)
-    out_vertices, out_faces = marching_cubes(
+    out_vertices, out_faces = tw.levelset.marching_cubes(
         twt.as_array3d(
             field.reshape((int(resolution[0]), int(resolution[1]), int(resolution[2]))), wp.float32
         ),

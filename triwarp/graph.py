@@ -1014,7 +1014,7 @@ def _validate_edge_list(edges: twt.Array2dInt32, node_count: int | None, *, vali
         raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
 
     if node_count is None:
-        return int(tw.vertices.n_vertices(edges))
+        return int(tw.array.index_domain_size(edges))
     if node_count < 0:
         raise ValueError(f"node_count must be non-negative, got {node_count}")
     if validate and int(edges.shape[0]) > 0:

@@ -1187,9 +1187,7 @@ def test_inflate_grows_the_volume_along_the_normals(icosphere: tuple[tm.Trimesh,
             mesh_tm.vertices[mesh_tm.edges[:, 0]] - mesh_tm.vertices[mesh_tm.edges[:, 1]], axis=1
         ).mean()
     )
-    normals_np = tw.vertices.area_weighted_vertex_normals(
-        int(vertices_wp.shape[0]), vertices_wp, faces_wp
-    ).numpy()
+    normals_np = tw.vertices.vertex_normals(vertices_wp, faces_wp).numpy()
 
     volumes = []
     for scale in (0.0, 0.1, 0.5):
@@ -1313,7 +1311,9 @@ def test_filter_spikes_return_count_shapes(torus_spikes: tuple[tm.Trimesh, wp.Me
 
     The default is the bare position buffer, which is what makes this composable with every other
     filter in this module -- it was the one member whose return was not a ``wp.array[wp.vec3]``.
-    Both forms must describe the same call, so the positions are compared as well as the shapes.
+    Both forms must describe the same call, so the positions are compared as well as the shapes --
+    at a tolerance rather than exactly, because the 1-ring average is accumulated with atomic adds
+    and its float32 summation order varies between launches.
     """
     _mesh_tm, mesh_wp = torus_spikes
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
@@ -1325,7 +1325,7 @@ def test_filter_spikes_return_count_shapes(torus_spikes: tuple[tm.Trimesh, wp.Me
         vertices_wp, faces_wp, math.pi, return_count=True
     )
     assert flattened > 0  # non-vacuity: the fixture really has spikes
-    assert np.array_equal(positions_only_wp.numpy(), positions_wp.numpy())
+    assert np.allclose(positions_only_wp.numpy(), positions_wp.numpy(), rtol=1e-5, atol=1e-5)
 
 
 def test_filter_spikes_leaves_a_clean_mesh_alone(

@@ -13,20 +13,30 @@ only the scatter's output size moves.
 module (``grouping.group``, ``adjacency.face_adjacency``, every submesh extraction), so they are
 timed on mesh-derived buffers at whatever size the suite is running.
 
-There is no reference library in this file. These are array primitives, not mesh operations:
+There is no reference *library* in this file. These are array primitives, not mesh operations:
 trimesh, igl, open3d and pymeshlab all operate a level above and expose nothing comparable, and
-timing NumPy would compare a host implementation against a device one. ``benchmarks/test_reduce.py``
-and ``benchmarks/test_grouping.py`` are triwarp-only for the same reason.
+timing NumPy would generally compare a host implementation against a device one.
+``benchmarks/test_reduce.py`` and ``benchmarks/test_grouping.py`` are triwarp-only for the same
+reason.
+
+The one exception is ``index_domain_size``, whose "trimesh" row is a NumPy stand-in
+(``int(faces.max()) + 1``) rather than a library call, because trimesh has no *uncached* equivalent
+-- its vertex count comes from the array it was built with. That row exists precisely because the
+host/device comparison is the question there: the crossover between a 4-byte device reduction and a
+host max is what the group establishes, and it lands inside the registry's size range.
 """
 
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 import pytest
 import warp as wp
-from conftest import BenchCase
 
 import triwarp as tw
+import triwarp.typing as twt
+from conftest import BenchCase
 
 # Segment counts at a fixed total length: few large pieces against many small ones. The element
 # count copied is identical, so only the per-segment cost moves.
@@ -164,3 +174,24 @@ def test_gather(bench_case: BenchCase) -> None:
     src, indices = _gather_inputs(bench_case)
     out = bench_case.run(lambda: tw.array.gather(src, indices))
     assert int(out.shape[0]) == int(indices.shape[0])
+
+
+@pytest.mark.benchmark(group="index_domain_size")
+@pytest.mark.benchlibs("triwarp", "trimesh")
+def test_index_domain_size(bench_case: BenchCase) -> None:
+    """
+    A max-reduce over ``3F`` indices; the scan sweep is here for ``lucy``'s 84M of them.
+
+    Below roughly ``10 ** 3`` indices this row reports the ~340 µs wrapper floor and nothing else
+    (see ``test_creation::test_box``), so the small end of the axis loses to ``faces.max()`` by up
+    to two orders of magnitude while ``lucy`` wins by 259x. Read the whole axis, not one point: the
+    crossover, not either endpoint, is what this group establishes.
+    """
+    if bench_case.kind == "triwarp":
+        faces = cast(twt.Array1dInt32, bench_case.faces_wp)
+        result = bench_case.run(lambda: tw.array.index_domain_size(faces))
+        assert result == bench_case.n_vertices
+    else:  # numpy reference: what trimesh-style code does on host arrays
+        faces_np = bench_case.faces_np
+        result = bench_case.run(lambda: int(faces_np.max()) + 1)
+        assert result == bench_case.n_vertices

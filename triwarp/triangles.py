@@ -126,8 +126,8 @@ def corner_normals(
     how it is tested:
 
     * with **no** creases, every corner of a vertex gets that vertex's normal under the matching
-      weighting -- [`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals]
-      or [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals];
+      weighting -- [`vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="angle"``
+      or [`vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="area"``;
     * with **every** edge a crease, every corner gets its own face's normal, whatever the weighting.
 
     Parameters
@@ -150,7 +150,7 @@ def corner_normals(
         Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins].
     n_vertices
         Total vertex count. When ``None`` it is inferred with
-        [`n_vertices`][triwarp.vertices.n_vertices], which costs a host readback.
+        [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
 
     Returns
     -------
@@ -180,7 +180,7 @@ def corner_normals(
     --------
     [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
         The flat weighting: one normal per face.
-    [`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals]
+    [`vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="angle"``
         The smooth weighting this reduces to when there are no creases.
     [`crease_edges`][triwarp.seams.crease_edges]
         Produces the hard-edge set.
@@ -190,7 +190,7 @@ def corner_normals(
     if n_faces == 0:
         return twt.as_array2d(twt.empty_2d((0, 3), wp.vec3, device=device), wp.vec3)
     if n_vertices is None:
-        n_vertices = tw.vertices.n_vertices(faces)
+        n_vertices = tw.array.index_domain_size(faces)
     if twins is None:
         twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
 

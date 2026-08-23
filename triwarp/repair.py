@@ -1306,7 +1306,7 @@ def fix_self_intersections(
         The detector, and what to check the result with.
     [`triwarp.holes.refill_region`][triwarp.holes.refill_region]
         The cut-and-refill step each ``"local"`` pass runs.
-    [`triwarp.offset.offset_mesh`][triwarp.offset.offset_mesh]
+    [`triwarp.levelset.offset_mesh`][triwarp.levelset.offset_mesh]
         The same level-set machinery at a non-zero distance.
     """
     if method not in ("local", "voxel"):
@@ -1326,7 +1326,7 @@ def fix_self_intersections(
         field, box = tw.proximity.signed_distance_grid(
             vertices, faces, spacing, pad=2, sign_mode="winding"
         )
-        return tw.reconstruction.marching_cubes(field, 0.0, bounds=box)
+        return tw.levelset.marching_cubes(field, 0.0, bounds=box)
 
     current_vertices, current_faces = wp.clone(vertices), wp.clone(faces)
     for _ in range(max_iter):

@@ -69,7 +69,7 @@ Two registries, in [`meshes.py`](meshes.py), for two different questions.
 
 Real scan meshes, read once with `meshio` (the same loader `triwarp.io` uses). Place the files in
 `benchmarks/data/` (gitignored, local-only). Used **only** by the throughput groups: `triangles`,
-`edges`, `reduce`, `grouping`, the `laplacian` entry kernels, `vertices.n_vertices` /
+`edges`, `reduce`, `grouping`, the `laplacian` entry kernels, `array.index_domain_size` /
 `mean_vertex_normals`, and the parts of `remesh` / `proximity` / `texture` / `neighbors` that
 genuinely scale with size.
 
@@ -280,7 +280,7 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
   **A full-suite ratio matrix (605 comparisons) found 24 rows that are entirely this floor**, and
   each now says so in its own docstring rather than reading as a defect: the `creation` revolution
   primitives and Platonic tables (`creation`'s module docstring covers them collectively),
-  `icosphere` since its connectivity became closed-form, `vertices.n_vertices`,
+  `icosphere` since its connectivity became closed-form, `array.index_domain_size`,
   `bounds.aabb`, `points.point_plane_distance` and `remesh.cluster_decimate` at
   `bunny_decimated`. **Every one of them inverts further along its own axis** — `cluster_decimate`
   wins 76x at `dragon`, `n_vertices` 259x at `lucy` — so a floor row is a statement about the input

@@ -67,7 +67,7 @@ def region_boundary_edges(
     if n_faces == 0:
         return twt.empty_2d((0, 2), wp.int32, device=device)
     if n_vertices is None:
-        n_vertices = tw.vertices.n_vertices(faces)
+        n_vertices = tw.array.index_domain_size(faces)
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
     m = int(unique_edges.shape[0])
     count = wp.zeros(m, dtype=wp.int32, device=device)
@@ -134,7 +134,7 @@ def faces_left_of_contour(
         mesh edge blocks nothing and seeds nothing.
     n_vertices
         Total vertex count, used as the key radix. When ``None`` it is inferred with
-        [`n_vertices`][triwarp.vertices.n_vertices], which costs a host readback.
+        [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
     twins
         Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins]. Building it is the
         single largest cost here, so pass it when several contours are filled on one mesh.
@@ -178,7 +178,7 @@ def faces_left_of_contour(
     if n_faces == 0 or n_contour == 0:
         return left
     if n_vertices is None:
-        n_vertices = tw.vertices.n_vertices(faces)
+        n_vertices = tw.array.index_domain_size(faces)
     if twins is None:
         twins = halfedge_twins(faces, n_vertices=n_vertices)
     base = wp.uint64(n_vertices)

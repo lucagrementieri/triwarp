@@ -133,8 +133,8 @@ def _vertex_normals_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
     """Smooth outward normals over the mesh's own vertices -- an *input* of the bundle queries."""
     key = (bench_case.mesh_name, str(bench_case.device))
     if key not in _normals_cache:
-        _normals_cache[key] = tw.vertices.area_weighted_vertex_normals(
-            bench_case.n_vertices, bench_case.vertices_wp, bench_case.faces_wp
+        _normals_cache[key] = tw.vertices.vertex_normals(
+            bench_case.vertices_wp, bench_case.faces_wp
         )
     return _normals_cache[key]
 
@@ -288,8 +288,8 @@ def test_thickness_at_vertices(bench_case: BenchCase) -> None:
         assert thickness_ml is not None
         return
     mesh, points = _mesh_wp(bench_case), bench_case.vertices_wp
-    normals = tw.vertices.angle_weighted_vertex_normals(
-        bench_case.n_vertices, bench_case.vertices_wp, bench_case.faces_wp
+    normals = tw.vertices.vertex_normals(
+        bench_case.vertices_wp, bench_case.faces_wp, weighting="angle"
     )
     thickness = bench_case.run(
         lambda: tw.visibility.thickness(mesh, points, method="ray", normals=normals)

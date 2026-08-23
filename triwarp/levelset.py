@@ -1,23 +1,35 @@
 """
-Grow, shrink and thicken a surface: the operations whose answer is a *different* surface.
+Surfaces from scalar fields, and the surface operations whose answer is a *different* surface.
 
-[`offset_mesh`][triwarp.offset.offset_mesh] moves a closed surface a fixed distance along its own
+[`marching_cubes`][triwarp.levelset.marching_cubes] is the primitive: the ``iso`` level set of a
+dense lattice, as a triangle mesh. It is the extraction tail of every implicit-surface pipeline in
+the package -- [`proximity.signed_distance_grid`][triwarp.proximity.signed_distance_grid],
+[`voxels.to_field`][triwarp.voxels.to_field],
+[`reconstruction.screened_poisson`][triwarp.reconstruction.screened_poisson] and
+[`reconstruction.resample_uniform`][triwarp.reconstruction.resample_uniform] all end in it -- which
+is why it lives here with its consumers rather than with the point-cloud reconstructors: none of
+those callers is reconstructing from a cloud, they are extracting a level set.
+
+[`offset_mesh`][triwarp.levelset.offset_mesh] moves a closed surface a fixed distance along its own
 normal direction, in the only way that stays well defined where the surface curves back on itself:
 through the signed distance field, whose level set at ``d`` is exactly the set of points at distance
-``d``. That is why an offset lives here rather than in [`triwarp.remesh`][triwarp.remesh] -- it is
-not a vertex displacement, and its output topology is not the input's. A sphere offset inward past
-its radius vanishes; a thin plate offset outward merges into one shell. Both are correct, and no
-per-vertex method produces either.
+``d`` -- so it is ``marching_cubes`` over a shifted SDF. That is why an offset lives here rather
+than in [`triwarp.remesh`][triwarp.remesh] -- it is not a vertex displacement, and its output
+topology is not the input's. A sphere offset inward past its radius vanishes; a thin plate offset
+outward merges into one shell. Both are correct, and no per-vertex method produces either.
 
-[`thicken_mesh`][triwarp.offset.thicken_mesh] is the *topology-preserving* counterpart, for the
-common case where an open surface has to become a solid of known thickness and the input's own
-triangulation should survive: it extrudes along the vertex normals and closes the rim, so the output
-is the input plus a copy plus a band. It can self-intersect where the thickness exceeds the local
-radius of curvature, and it does not guard against that --
+[`thicken_mesh`][triwarp.levelset.thicken_mesh] is the *topology-preserving* counterpart and the one
+member here that is **not** a level-set operation -- it earns its place by being the contrast. For
+the common case where an open surface has to become a solid of known thickness and the input's own
+triangulation should survive, it extrudes along the vertex normals and closes the rim, so the output
+is the input plus a copy plus a band. Nothing is resampled and no field is built, which is exactly
+what ``offset_mesh`` cannot promise and exactly why the two are shelved together: the choice between
+them is the choice between keeping the triangulation and keeping the distance. It can self-intersect
+where the thickness exceeds the local radius of curvature, and it does not guard against that --
 [`triwarp.validation.face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask]
 names the condition exactly, and repairing it is a separate operation.
 
-For the field itself, see
+For the fields these consume, see
 [`triwarp.proximity.signed_distance_grid`][triwarp.proximity.signed_distance_grid]; for the binary
 occupancy lattice, [`triwarp.voxels`][triwarp.voxels].
 """
@@ -30,7 +42,8 @@ from typing import Literal
 import warp as wp
 
 import triwarp as tw
-from triwarp.kernels import offset as kernel_offset
+import triwarp.typing as twt
+from triwarp.kernels import levelset as kernel_levelset
 
 # Bounds on the automatic ``voxel_size``, both expressed as samples across the mesh's bounding-box
 # diagonal, and both load-bearing rather than defensive.
@@ -50,6 +63,75 @@ _MIN_AUTO_RESOLUTION = 64
 # that puts a lattice cell strictly inside the offset band, which is what marching cubes needs to
 # find the level set at all.
 _SAMPLES_PER_DISTANCE = 3
+
+
+def marching_cubes(
+    field: twt.Array3dFloat32, iso: float = 0.0, *, bounds: tuple[wp.vec3, wp.vec3] | None = None
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Extract the ``iso`` level set of a dense scalar lattice as a triangle mesh.
+
+    The extraction tail of every implicit-surface pipeline, exposed on its own so a caller with a
+    field of their own — an SDF, an occupancy volume, a simulation state — does not have to route it
+    through [`reconstruction.screened_poisson`][triwarp.reconstruction.screened_poisson] to get a
+    surface out. It is what
+    [`reconstruction.resample_uniform`][triwarp.reconstruction.resample_uniform] is built from.
+
+    Parameters
+    ----------
+    field
+        ``(nx, ny, nz)`` ``wp.float32`` lattice of scalar values, with ``x`` the slowest axis. The
+        surface is extracted where the field crosses ``iso``; the sign convention is the caller's,
+        and the winding follows it (with triwarp's outside-positive
+        [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh] convention the
+        normals come out pointing outward).
+    iso
+        Level to extract. Defaults to ``0``, which is the zero level set of a signed distance field.
+    bounds
+        ``(lower, upper)`` world-space corners the lattice spans, so ``field[0, 0, 0]`` sits at
+        ``lower`` and ``field[nx - 1, ny - 1, nz - 1]`` at ``upper``. When ``None`` the result is in
+        *index* space: vertex coordinates are lattice indices.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        Level-set vertices on ``field.device``. Empty when the field does not cross ``iso``.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer.
+
+    Raises
+    ------
+    ValueError
+        If ``field`` is not a rank-3 ``wp.float32`` array, or any of its dimensions is below 2.
+
+    See Also
+    --------
+    [`reconstruction.resample_uniform`][triwarp.reconstruction.resample_uniform]
+    [`reconstruction.screened_poisson`][triwarp.reconstruction.screened_poisson]
+    [`triwarp.proximity.signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
+    [`triwarp.voxels.to_field`][triwarp.voxels.to_field]
+    [`triwarp.voxels.grid_points`][triwarp.voxels.grid_points]
+
+    Notes
+    -----
+    A thin wrapper over Warp's own ``warp.MarchingCubes``, so the triangulation, its vertex
+    deduplication and its handling of the ambiguous cube cases are Warp's rather than triwarp's. The
+    consequence worth knowing is that the result is **not guaranteed manifold** at an ambiguous
+    cell, and can carry duplicate vertices where two cells agree on a crossing —
+    [`reconstruction.resample_uniform`][triwarp.reconstruction.resample_uniform] runs
+    [`triwarp.repair`][triwarp.repair] over it for exactly that reason.
+    """
+    field = twt.as_array3d(field, wp.float32)
+    shape = tuple(int(dim) for dim in field.shape)
+    if min(shape) < 2:
+        raise ValueError(f"field must be at least 2 wide along every axis, got {shape}")
+
+    if bounds is None:
+        lower = wp.vec3(0.0, 0.0, 0.0)
+        upper = wp.vec3(float(shape[0] - 1), float(shape[1] - 1), float(shape[2] - 1))
+    else:
+        lower, upper = bounds
+    return wp.MarchingCubes.extract_surface_marching_cubes(field, wp.float32(iso), lower, upper)
 
 
 def offset_mesh(
@@ -110,7 +192,7 @@ def offset_mesh(
     Examples
     --------
     ```python
-    grown_v, grown_f = tw.offset.offset_mesh(v, f, 0.1)
+    grown_v, grown_f = tw.levelset.offset_mesh(v, f, 0.1)
     ```
 
     Notes
@@ -125,17 +207,17 @@ def offset_mesh(
     The output is a resampled surface: its triangulation is the marching-cubes lattice's, not the
     input's, and its vertex count is set by ``voxel_size`` rather than by the input's. Where the
     input's own triangulation must survive, the operation wanted is
-    [`thicken_mesh`][triwarp.offset.thicken_mesh], not this.
+    [`thicken_mesh`][triwarp.levelset.thicken_mesh], not this.
 
     Accuracy is the lattice's, improved by marching cubes' linear interpolation across a cell.
 
     See Also
     --------
-    [`thicken_mesh`][triwarp.offset.thicken_mesh]
+    [`thicken_mesh`][triwarp.levelset.thicken_mesh]
         The topology-preserving shell, when the input triangulation should survive.
     [`triwarp.proximity.signed_distance_grid`][triwarp.proximity.signed_distance_grid]
         The field this extracts a level set from, when the field itself is wanted.
-    [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]
+    [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes]
         The extraction, and where the triangulation's own caveats live.
     """
     if distance == 0.0:
@@ -161,7 +243,7 @@ def offset_mesh(
     field, box = tw.proximity.signed_distance_grid(
         vertices, faces, spacing, bounds=bounds, pad=pad, sign_mode=sign_mode
     )
-    return tw.reconstruction.marching_cubes(field, distance, bounds=box)
+    return tw.levelset.marching_cubes(field, distance, bounds=box)
 
 
 def thicken_mesh(
@@ -174,7 +256,7 @@ def thicken_mesh(
     """
     Turn a surface into a solid shell of given thickness, keeping the input's triangulation.
 
-    The counterpart of [`offset_mesh`][triwarp.offset.offset_mesh] for the case where the answer
+    The counterpart of [`offset_mesh`][triwarp.levelset.offset_mesh] for the case where the answer
     should still be *this* mesh: every vertex is displaced along its own angle-weighted normal, a
     reversed copy of the surface becomes the shell's other side, and the two are joined along every
     boundary edge by a quad band. So the output is the input's connectivity twice over plus the band
@@ -214,7 +296,7 @@ def thicken_mesh(
     Examples
     --------
     ```python
-    shell_v, shell_f = tw.offset.thicken_mesh(v, f, 0.05)
+    shell_v, shell_f = tw.levelset.thicken_mesh(v, f, 0.05)
     ```
 
     Notes
@@ -226,7 +308,7 @@ def thicken_mesh(
     The condition is exactly
     [`triwarp.validation.face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask],
     so it is detectable in one call; where it happens, the operation wanted is a level-set
-    [`offset_mesh`][triwarp.offset.offset_mesh], which cannot self-intersect by construction. Not
+    [`offset_mesh`][triwarp.levelset.offset_mesh], which cannot self-intersect by construction. Not
     guarding is deliberate: the guard would be a whole-mesh intersection test on every call, and the
     caller who needs it can run the one that names the faces.
 
@@ -236,9 +318,9 @@ def thicken_mesh(
 
     See Also
     --------
-    [`offset_mesh`][triwarp.offset.offset_mesh]
+    [`offset_mesh`][triwarp.levelset.offset_mesh]
         The resampling offset, for a shell that must not self-intersect.
-    [`triwarp.vertices.angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals]
+    [`vertices.vertex_normals`][triwarp.vertices.vertex_normals] at `weighting="angle"`
         The displacement direction.
     [`triwarp.boundary.oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
         Where the band's orientation comes from.
@@ -253,13 +335,13 @@ def thicken_mesh(
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
-    normals = tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices, faces)
+    normals = tw.vertices.vertex_normals(vertices, faces, weighting="angle")
     rim = tw.boundary.oriented_boundary_edges(vertices, faces)
     n_rim = int(rim.shape[0])
 
     out_vertices = wp.empty(2 * n_vertices, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_offset.shell_vertices,
+        kernel_levelset.shell_vertices,
         dim=n_vertices,
         inputs=[vertices, normals, wp.float32(outside), wp.float32(thickness), out_vertices],
         device=device,
@@ -267,14 +349,14 @@ def thicken_mesh(
 
     out_faces = wp.empty(3 * (2 * n_faces + 2 * n_rim), dtype=wp.int32, device=device)
     wp.launch(
-        kernel_offset.shell_faces,
+        kernel_levelset.shell_faces,
         dim=n_faces,
         inputs=[faces, wp.int32(n_vertices), out_faces],
         device=device,
     )
     if n_rim > 0:
         wp.launch(
-            kernel_offset.shell_band_faces,
+            kernel_levelset.shell_band_faces,
             dim=n_rim,
             inputs=[rim, wp.int32(n_vertices), wp.int32(6 * n_faces), out_faces],
             device=device,

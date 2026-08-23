@@ -18,7 +18,7 @@ from tests.conversions import (
 )
 
 
-@pytest.mark.parity("area_weighted_vertex_normals", "open3d", "pymeshlab")
+@pytest.mark.parity("vertex_normals", "open3d", "pymeshlab")
 @pytest.mark.parity("mean_vertex_normals", "pymeshlab")
 def test_vertex_normal_weightings_match_open3d_and_pymeshlab(
     half_torus: tuple[tm.Trimesh, wp.Mesh],
@@ -32,15 +32,15 @@ def test_vertex_normal_weightings_match_open3d_and_pymeshlab(
 
     **trimesh is deliberately absent**, and that is the finding worth recording:
     ``Trimesh.vertex_normals`` is *angle*-weighted, not area-weighted. It matches
-    ``angle_weighted_vertex_normals`` to 4.3e-7 (see ``test_angle_weighted_vertex_normals``) and
-    differs from the area-weighted answer by up to **0.072** on this fixture. The
-    ``area_weighted_vertex_normals`` benchmark group timed it as though it were the same quantity;
-    it is now exempted there with a redirect to open3d.
+    ``vertex_normals`` at ``weighting="angle"`` to 4.3e-7 (see ``test_vertex_normals_angle``)
+    and differs from the area-weighted answer by up to **0.072** on this fixture. The
+    ``vertex_normals`` benchmark group timed it as though it were the same quantity; it is now
+    exempted there with a redirect to open3d.
     """
     mesh_tm, mesh_wp = half_torus
     n_vertices = int(mesh_wp.points.shape[0])
 
-    area_wp = tw.vertices.area_weighted_vertex_normals(n_vertices, mesh_wp.points, mesh_wp.indices)
+    area_wp = tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices)
 
     mesh_o3d = trimesh_to_open3d(mesh_tm)
     mesh_o3d.compute_vertex_normals()
@@ -71,10 +71,10 @@ def test_mean_vertex_normals_match_pyvista(half_torus: tuple[tm.Trimesh, wp.Mesh
     Class A, and the row names ``mean_vertex_normals`` for a measured reason.
 
     ``compute_normals``' point ``Normals`` is the *unweighted* sum of incident face normals, so it
-    is this function and not one of its three weighted siblings: measured 5.1e-07 here against
-    4.5e-03 (area), 6.8e-03 (angle) on the same mesh. A row pointed at
-    ``area_weighted_vertex_normals`` would therefore fail at ``1e-5`` rather than merely be loose,
-    and the last assert keeps that separation live.
+    is this function and not one of ``vertex_normals``' three weightings: measured 5.1e-07 here
+    against 4.5e-03 (area), 6.8e-03 (angle) on the same mesh. A row pointed at
+    ``vertex_normals`` would therefore fail at ``1e-5`` rather than merely be loose, and the last
+    assert keeps that separation live.
 
     The flags are the ones ``tests/test_triangles.py`` explains: no re-winding, no vertex splitting.
     The array comes back **float32**, which is the tolerance floor on VTK's side rather than
@@ -97,28 +97,8 @@ def test_mean_vertex_normals_match_pyvista(half_torus: tuple[tm.Trimesh, wp.Mesh
     normals_pv_np = np.asarray(normals_pv.point_data["Normals"])
     assert np.allclose(mean_wp.numpy(), normals_pv_np, rtol=1e-5, atol=1e-5)
 
-    area_wp = tw.vertices.area_weighted_vertex_normals(n_vertices, mesh_wp.points, mesh_wp.indices)
+    area_wp = tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices)
     assert not np.allclose(area_wp.numpy(), normals_pv_np, atol=1e-4)
-
-
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
-@pytest.mark.parity("n_vertices", "trimesh")
-def test_n_vertices_matches_the_index_maximum(
-    request: pytest.FixtureRequest, mesh_name: str
-) -> None:
-    """
-    Class A: the count inferred from the face buffer, against the numpy formula.
-
-    ``Trimesh`` has no uncached equivalent -- its vertex count comes from the array it was built
-    with -- so the benchmark's "trimesh" row is the stand-in formula ``int(faces.max()) + 1``, and
-    that is the reference here. The value is checked against the fixture's actual vertex count too,
-    which is the part that would catch an off-by-one that the formula shares.
-    """
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    faces_np = mesh_tm.faces
-
-    assert tw.vertices.n_vertices(mesh_wp.indices) == int(faces_np.max()) + 1
-    assert tw.vertices.n_vertices(mesh_wp.indices) == len(mesh_tm.vertices)
 
 
 def test_mean_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
@@ -166,16 +146,15 @@ def test_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_tm, rtol=1e-5, atol=1e-5)
 
 
-def test_area_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+def test_vertex_normals_area(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     """
     Class A: area weighting against ``igl.per_vertex_normals``' area-weighted mode.
 
     igl is the reference here rather than trimesh, because trimesh has no area-weighted mode --
-    the angle-weighted one is [`test_angle_weighted_vertex_normals`].
+    the angle-weighted one is [`test_vertex_normals_angle`].
     """
     mesh_tm, mesh_wp = half_torus
 
-    n_vertices = mesh_tm.vertices.shape[0]
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int32)
     vertex_normals_igl = igl.per_vertex_normals(
@@ -183,23 +162,11 @@ def test_area_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     )
 
     vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
-    vertex_normals_wp = tw.vertices.area_weighted_vertex_normals(
-        n_vertices, vertices_wp, mesh_wp.indices
-    )
+    vertex_normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices)
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_igl, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parity("area_weighted_vertex_normals", "meshlib")
-@pytest.mark.parity(
-    "angle_weighted_vertex_normals",
-    "meshlib",
-    benchmarked=False,
-    reason="angle_weighted_vertex_normals has no benchmark group of its own -- the vertices module "
-    "times mean_vertex_normals and area_weighted_vertex_normals, and a third row would price the "
-    "same scatter under a third weight. computePerVertPseudoNormals is nonetheless the only "
-    "reference in the suite that pins this weighting exactly (1.19e-07, against 6.8e-03 for the "
-    "area-weighted one), so the comparison belongs here.",
-)
+@pytest.mark.parity("vertex_normals", "meshlib")
 def test_vertex_normal_weightings_match_meshlib(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     """
     Class A, and the reason to have it: MeshLib pins *which* weighting each name means.
@@ -223,8 +190,8 @@ def test_vertex_normal_weightings_match_meshlib(half_torus: tuple[tm.Trimesh, wp
     area_ml = mn.toNumpyArray(mm.computePerVertNormals(mesh_ml))
     angle_ml = mn.toNumpyArray(mm.computePerVertPseudoNormals(mesh_ml))
 
-    area_wp = tw.vertices.area_weighted_vertex_normals(n_vertices, vertices_wp, mesh_wp.indices)
-    angle_wp = tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices_wp, mesh_wp.indices)
+    area_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices)
+    angle_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices, weighting="angle")
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(vertices_wp, mesh_wp.indices)
     mean_wp = tw.vertices.mean_vertex_normals(n_vertices, mesh_wp.indices, face_normals_wp)
 
@@ -238,31 +205,24 @@ def test_vertex_normal_weightings_match_meshlib(half_torus: tuple[tm.Trimesh, wp
     assert not np.allclose(mean_wp.numpy(), area_ml, atol=1e-4)
 
 
-def test_area_weighted_vertex_normals_precomputed(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+def test_vertex_normals_area_precomputed(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = half_torus
 
-    n_vertices = mesh_tm.vertices.shape[0]
     vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
 
     face_normals_wp, face_areas_wp = tw.triangles.face_normals_and_areas(
         vertices_wp, mesh_wp.indices
     )
-    vertex_normals_precomputed_wp = tw.vertices.area_weighted_vertex_normals(
-        n_vertices,
-        vertices_wp,
-        mesh_wp.indices,
-        face_normals=face_normals_wp,
-        face_areas=face_areas_wp,
+    vertex_normals_precomputed_wp = tw.vertices.vertex_normals(
+        vertices_wp, mesh_wp.indices, face_normals=face_normals_wp, face_weights=face_areas_wp
     )
-    vertex_normals_wp = tw.vertices.area_weighted_vertex_normals(
-        n_vertices, vertices_wp, mesh_wp.indices
-    )
+    vertex_normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices)
     assert np.allclose(
         vertex_normals_precomputed_wp.numpy(), vertex_normals_wp.numpy(), rtol=1e-5, atol=1e-5
     )
 
 
-def test_angle_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+def test_vertex_normals_angle(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     """
     Class A: angle weighting against trimesh's, which is the same rule under a different name.
 
@@ -277,30 +237,25 @@ def test_angle_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     )
 
     vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
-    vertex_normals_wp = tw.vertices.angle_weighted_vertex_normals(
-        n_vertices, vertices_wp, mesh_wp.indices
-    )
+    vertex_normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices, weighting="angle")
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_tm, rtol=1e-5, atol=1e-5)
 
 
-def test_angle_weighted_vertex_normals_precomputed(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+def test_vertex_normals_angle_precomputed(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = half_torus
 
-    n_vertices = mesh_tm.vertices.shape[0]
     vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
 
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(vertices_wp, mesh_wp.indices)
     face_angles_wp = tw.triangles.face_angles(vertices_wp, mesh_wp.indices)
-    vertex_normals_precomputed_wp = tw.vertices.angle_weighted_vertex_normals(
-        n_vertices,
+    vertex_normals_precomputed_wp = tw.vertices.vertex_normals(
         vertices_wp,
         mesh_wp.indices,
+        weighting="angle",
         face_normals=face_normals_wp,
-        face_angles=face_angles_wp,
+        face_weights=face_angles_wp,
     )
-    vertex_normals_wp = tw.vertices.angle_weighted_vertex_normals(
-        n_vertices, vertices_wp, mesh_wp.indices
-    )
+    vertex_normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices, weighting="angle")
     assert np.allclose(
         vertex_normals_precomputed_wp.numpy(), vertex_normals_wp.numpy(), rtol=1e-5, atol=1e-5
     )
@@ -324,23 +279,20 @@ def _compute_max_vertex_normals_np(vertices: np.ndarray, faces: np.ndarray) -> n
     return vertex_normals_np / norms
 
 
-def test_sine_and_edge_length_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+def test_vertex_normals_mwselr(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = half_torus
 
-    n_vertices = mesh_tm.vertices.shape[0]
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int32)
     vertex_normals_np = _compute_max_vertex_normals_np(vertices_np, faces_np)
 
     vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
-    vertex_normals_wp = tw.vertices.sine_and_edge_length_weighted_vertex_normals(
-        n_vertices, vertices_wp, mesh_wp.indices
-    )
+    vertex_normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices, weighting="mwselr")
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_np, rtol=1e-5, atol=1e-5)
 
     face_normals_wp = wp.array(mesh_tm.face_normals, dtype=wp.vec3, device=mesh_wp.device)
-    vertex_normals_explicit_wp = tw.vertices.sine_and_edge_length_weighted_vertex_normals(
-        n_vertices, vertices_wp, mesh_wp.indices, face_normals=face_normals_wp
+    vertex_normals_explicit_wp = tw.vertices.vertex_normals(
+        vertices_wp, mesh_wp.indices, weighting="mwselr", face_normals=face_normals_wp
     )
     assert np.allclose(vertex_normals_explicit_wp.numpy(), vertex_normals_np, rtol=1e-5, atol=1e-5)
 

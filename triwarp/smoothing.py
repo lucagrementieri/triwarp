@@ -194,7 +194,7 @@ def inflate(
     Inflate a surface under uniform pressure: normal displacement alternating with smoothing.
 
     The "balloon" flow. Each pass moves every vertex along its own
-    [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] and then relaxes
+    [`vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="area"`` and then relaxes
     with one Laplacian pass, which is what keeps the triangles from shearing as the surface grows.
     Uses of it: puffing a thin shell out to a printable thickness, opening a collapsed scan, and
     supplying a starting surface a fitting loop can shrink back onto data.
@@ -245,12 +245,12 @@ def inflate(
 
     See Also
     --------
-    [`offset_mesh`][triwarp.offset.offset_mesh]
+    [`offset_mesh`][triwarp.levelset.offset_mesh]
         The *exact* outward offset, through a signed distance field -- it changes the connectivity
         and cannot self-intersect, where this keeps the mesh and can.
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
         The relaxation half of each pass.
-    [`thicken_mesh`][triwarp.offset.thicken_mesh]
+    [`thicken_mesh`][triwarp.levelset.thicken_mesh]
         Turns a surface into a solid shell, which is the other way to give it thickness.
     """
     if iterations < 0:
@@ -275,7 +275,7 @@ def inflate(
     )
     for step in range(iterations):
         amount = pressure * (step + 1) / iterations if gradual else pressure
-        normals = tw.vertices.area_weighted_vertex_normals(n_vertices, positions, faces)
+        normals = tw.vertices.vertex_normals(positions, faces)
         displaced = wp.empty(n_vertices, dtype=wp.vec3, device=device)
         wp.launch(
             step_kernel,
@@ -554,7 +554,7 @@ def equalize_triangle_areas(
         if no_shrinkage:
             # Recomputed per pass rather than hoisted: the tangent plane the solve is confined to is
             # the one through the vertex *now*, and after a pass that is a different plane.
-            normals = tw.vertices.area_weighted_vertex_normals(n_vertices, positions, faces)
+            normals = tw.vertices.vertex_normals(positions, faces)
         wp.launch(
             kernel_smoothing.equalize_area_step,
             dim=n_vertices,

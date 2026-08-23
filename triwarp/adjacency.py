@@ -1,4 +1,23 @@
-"""Mesh face-adjacency graph: which faces share an edge, and face-level connected components."""
+"""
+Mesh face-adjacency graph: which faces share an edge, and what each adjacent pair looks like.
+
+[`face_adjacency`][triwarp.adjacency.face_adjacency] is the table every other function here reads:
+one row per edge-adjacent face pair. The rest are per-adjacency-row quantities over that table, all
+row-aligned with it, so a caller derives the pairs once and passes them in --
+[`resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency] is the helper that makes that
+optional argument concrete.
+
+- [`face_adjacency_unshared`][triwarp.adjacency.face_adjacency_unshared] gives the two opposite
+  corners of each pair, and [`face_adjacency_angles`][triwarp.adjacency.face_adjacency_angles] the
+  dihedral between the two faces.
+- [`face_adjacency_convex`][triwarp.adjacency.face_adjacency_convex] answers whether a pair is
+  *convex* -- each face's third vertex on the inner side of the other's plane -- and
+  [`face_adjacency_projections`][triwarp.adjacency.face_adjacency_projections] returns the signed
+  distances it thresholds, for callers that want the margin rather than the verdict.
+
+[`face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels] is the one
+whole-graph answer: face-level connected components over the same adjacency.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +27,9 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT
 from triwarp.kernels import adjacency as kernel_adjacency
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import scatter as kernel_scatter
 
 
@@ -276,9 +297,9 @@ def vertex_face_adjacency(
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
     n_vertices
         Number of vertices, i.e. the number of CSR rows. When ``None`` it is inferred from
-        ``faces`` with [`n_vertices`][triwarp.vertices.n_vertices], which costs one host readback;
-        pass it when the caller already knows it. Rows for vertices no face references come out
-        empty.
+        ``faces`` with [`array.index_domain_size`][triwarp.array.index_domain_size], which costs one
+        host readback; pass it when the caller already knows it. Rows for vertices no face
+        references come out empty.
 
     Returns
     -------
@@ -295,7 +316,7 @@ def vertex_face_adjacency(
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
-    row_count = tw.vertices.n_vertices(faces) if n_vertices is None else int(n_vertices)
+    row_count = tw.array.index_domain_size(faces) if n_vertices is None else int(n_vertices)
 
     offsets = wp.zeros(row_count + 1, dtype=wp.int32, device=device)
     if n_faces == 0 or row_count == 0:
@@ -440,7 +461,7 @@ def face_adjacency_angles(
 
     For each row of ``face_adjacency``, the angle is computed from the two
     corresponding face normals (unit vectors). Pair it with
-    [`face_adjacency_convex`][triwarp.convex.face_adjacency_convex] for the sign: that function
+    [`face_adjacency_convex`][triwarp.adjacency.face_adjacency_convex] for the sign: that function
     reports which side of each shared edge the pair folds towards, which is exactly the sign this
     unsigned magnitude is missing.
 
@@ -469,7 +490,7 @@ def face_adjacency_angles(
     See Also
     --------
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
-    [`face_adjacency_convex`][triwarp.convex.face_adjacency_convex]
+    [`face_adjacency_convex`][triwarp.adjacency.face_adjacency_convex]
         The sign this magnitude omits: convex or concave, per adjacency row.
     [`vector_angle`][triwarp.points.vector_angle]
     [`trimesh.Trimesh.face_adjacency_angles`][]
@@ -499,6 +520,170 @@ def face_adjacency_angles(
         device=device,
     )
     return out_angles
+
+
+def face_adjacency_projections(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_adjacency: twt.Array2dInt32 | None = None,
+    face_adjacency_edges: twt.Array2dInt32 | None = None,
+    face_adjacency_unshared: twt.Array2dInt32 | None = None,
+    face_normals: wp.array[wp.vec3] | None = None,
+) -> wp.array[wp.float32]:
+    """
+    Project each adjacent face pair's non-shared vertex onto the first face plane.
+
+    For each row of ``face_adjacency``, the dot product is taken between the
+    normal of face ``face_adjacency[k, 0]`` and the vector from one endpoint of
+    the shared edge to the unshared vertex on ``face_adjacency[k, 1]``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer (same layout as
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]).
+    face_adjacency
+        Optional ``(m, 2)`` face index pairs from
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]. When ``None``, adjacency and
+        shared edges are computed from ``faces``.
+    face_adjacency_edges
+        Optional ``(m, 2)`` sorted shared vertex pairs (as from
+        [`face_adjacency`][triwarp.adjacency.face_adjacency] with ``return_edges=True``).
+        Must be supplied together with ``face_adjacency`` or omitted with it.
+    face_adjacency_unshared
+        Optional ``(m, 2)`` unshared vertex indices per face pair from
+        [`face_adjacency_unshared`][triwarp.adjacency.face_adjacency_unshared]. When ``None``,
+        computed from ``faces`` and the adjacency data.
+    face_normals
+        Optional length-``n_faces`` unit face normals. When ``None``, normals
+        are computed from ``vertices`` and ``faces`` via
+        [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas].
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length ``m`` projections on ``faces.device``, one per ``face_adjacency``
+        row. Empty when there are no faces or no adjacency pairs.
+
+    Raises
+    ------
+    ValueError
+        If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided.
+
+    See Also
+    --------
+    [`face_adjacency_convex`][triwarp.adjacency.face_adjacency_convex]
+    [`trimesh.Trimesh.face_adjacency_projections`][]
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
+
+    face_adjacency, face_adjacency_edges = tw.adjacency.resolve_face_adjacency(
+        faces, face_adjacency, face_adjacency_edges, n_vertices=int(vertices.shape[0])
+    )
+
+    if face_adjacency_unshared is None:
+        face_adjacency_unshared = tw.adjacency.face_adjacency_unshared(
+            faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
+        )
+    if face_normals is None:
+        face_normals, _ = tw.triangles.face_normals_and_areas(vertices, faces)
+
+    m = int(face_adjacency.shape[0])
+    if m == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
+
+    out_projections = wp.empty(m, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_adjacency.face_adjacency_projections,
+        dim=m,
+        inputs=[
+            vertices,
+            face_normals,
+            face_adjacency,
+            face_adjacency_edges,
+            face_adjacency_unshared,
+            out_projections,
+        ],
+        device=device,
+    )
+    return out_projections
+
+
+def face_adjacency_convex(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_adjacency: twt.Array2dInt32 | None = None,
+    face_adjacency_edges: twt.Array2dInt32 | None = None,
+    face_adjacency_unshared: twt.Array2dInt32 | None = None,
+    face_normals: wp.array[wp.vec3] | None = None,
+) -> wp.array[wp.bool]:
+    """
+    Return face pairs that are adjacent and locally convex.
+
+    A pair is locally convex when the unshared vertex of the second face,
+    projected onto the plane of the first face, has a projection less than
+    [`TOLERANCE_MERGE`][triwarp.constants.TOLERANCE_MERGE].
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer (same layout as
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]).
+    face_adjacency
+        Optional ``(m, 2)`` face index pairs from
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]. When ``None``, adjacency and
+        shared edges are computed from ``faces``.
+    face_adjacency_edges
+        Optional ``(m, 2)`` sorted shared vertex pairs. Must be supplied
+        together with ``face_adjacency`` or omitted with it.
+    face_adjacency_unshared
+        Optional ``(m, 2)`` unshared vertex indices per face pair.
+    face_normals
+        Optional length-``n_faces`` unit face normals.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length ``m`` boolean mask on ``faces.device``, one per
+        ``face_adjacency`` row. Empty when there are no faces or no adjacency
+        pairs.
+
+    See Also
+    --------
+    [`face_adjacency_projections`][triwarp.adjacency.face_adjacency_projections]
+    [`trimesh.Trimesh.face_adjacency_convex`][]
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return wp.empty(0, dtype=wp.bool, device=device)
+
+    face_adjacency, face_adjacency_edges = tw.adjacency.resolve_face_adjacency(
+        faces, face_adjacency, face_adjacency_edges, n_vertices=int(vertices.shape[0])
+    )
+
+    m = int(face_adjacency.shape[0])
+    if m == 0:
+        return wp.empty(0, dtype=wp.bool, device=device)
+
+    projections = face_adjacency_projections(
+        vertices,
+        faces,
+        face_adjacency=face_adjacency,
+        face_adjacency_edges=face_adjacency_edges,
+        face_adjacency_unshared=face_adjacency_unshared,
+        face_normals=face_normals,
+    )
+    out_convex = wp.empty(m, dtype=wp.bool, device=device)
+    wp.map(kernel_array.less, projections, TOLERANCE_MERGE_CONSTANT, out=out_convex)
+    return out_convex
 
 
 def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:

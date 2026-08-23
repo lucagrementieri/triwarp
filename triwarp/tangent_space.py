@@ -43,7 +43,7 @@ def vertex_tangent_frames(
     Orthonormal tangent frame at every vertex as ``(basis_x, basis_y, normal)``.
 
     ``normal`` is the angle-weighted vertex normal
-    ([`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals]);
+    ([`vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="angle"``);
     ``basis_x`` is the first halfedge of the vertex's counter-clockwise ring, projected into the
     tangent plane and normalized; ``basis_y = normal x basis_x`` completes a right-handed frame. A
     tangent vector ``(a, b)`` in these coordinates is ``a * basis_x + b * basis_y`` in world space.
@@ -77,7 +77,7 @@ def vertex_tangent_frames(
     See Also
     --------
     [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]
-    [`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals]
+    [`vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="angle"``
     [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]
     """
     device = vertices.device
@@ -85,7 +85,7 @@ def vertex_tangent_frames(
     basis_x = wp.empty(n, dtype=wp.vec3, device=device)
     basis_y = wp.empty(n, dtype=wp.vec3, device=device)
     if normals is None:
-        normals = tw.vertices.angle_weighted_vertex_normals(n, vertices, faces)
+        normals = tw.vertices.vertex_normals(vertices, faces, weighting="angle")
     if n == 0:
         return basis_x, basis_y, normals
 

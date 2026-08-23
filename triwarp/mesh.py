@@ -306,15 +306,15 @@ class Trimesh:
 
         See Also
         --------
-        [`triwarp.vertices.angle_weighted_vertex_normals`][]
+        [`vertices.vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="angle"``
         [`trimesh.Trimesh.vertex_normals`][]
         """
-        return tw.vertices.angle_weighted_vertex_normals(
-            self.n_vertices,
+        return tw.vertices.vertex_normals(
             self._vertices,
             self._faces,
+            weighting="angle",
             face_normals=self.face_normals,
-            face_angles=self.face_angles,
+            face_weights=self.face_angles,
         )
 
     @_CachedProperty

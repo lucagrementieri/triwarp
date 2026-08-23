@@ -71,7 +71,7 @@ def is_edge_manifold(
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     if n_vertices is None:
-        n_vertices = tw.vertices.n_vertices(faces)
+        n_vertices = tw.array.index_domain_size(faces)
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
     _, counts = tw.grouping.unique_1d(keys, return_counts=True)
 
@@ -125,7 +125,7 @@ def edge_manifold_mask(
 
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=tw.vertices.n_vertices(faces))
+    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=tw.array.index_domain_size(faces))
     _, inverse, counts = tw.grouping.unique_1d(keys, return_inverse=True, return_counts=True)
 
     n_unique = int(counts.shape[0])
@@ -207,7 +207,7 @@ def is_vertex_manifold(
     if int(faces.shape[0]) // 3 == 0:
         return True
     manifold = _vertex_manifold_flags(
-        faces, tw.vertices.n_vertices(faces), adjacency, adjacency_edges
+        faces, tw.array.index_domain_size(faces), adjacency, adjacency_edges
     )
     return bool(tw.reduce.all(manifold))
 

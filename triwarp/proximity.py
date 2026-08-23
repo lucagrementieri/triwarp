@@ -648,11 +648,12 @@ def signed_distance_grid(
 
     The bridge from a surface to a **level set**, and the missing half of the implicit round trip:
     [`triwarp.voxels.to_field`][triwarp.voxels.to_field] already gives
-    [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes] an
+    [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes] an
     *occupancy* lattice, but occupancy is ``0`` or ``1`` and thresholding it at anything other than
     ``0.5`` does not move the surface anywhere. A distance field does, which is what makes
     ``marching_cubes(*signed_distance_grid(...), iso=d)`` an offset surface at distance ``d`` --
-    see [`triwarp.offset.offset_mesh`][triwarp.offset.offset_mesh], the named entry point for it.
+    see [`triwarp.levelset.offset_mesh`][triwarp.levelset.offset_mesh], the named entry point for
+    it.
 
     Parameters
     ----------
@@ -687,7 +688,7 @@ def signed_distance_grid(
     -------
     field : twt.Array3dFloat32
         ``(nx, ny, nz)`` signed distances, negative inside. Exactly the first argument
-        [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes] takes.
+        [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes] takes.
     bounds : tuple[wp.vec3, wp.vec3]
         The ``(lower, upper)`` corners the lattice actually spans, padded and snapped so the spacing
         is exactly ``voxel_size`` on every axis. Pass it straight through as that function's
@@ -702,7 +703,7 @@ def signed_distance_grid(
     --------
     ```python
     field, box = tw.proximity.signed_distance_grid(v, f, voxel_size=0.05, pad=4)
-    shell_v, shell_f = tw.reconstruction.marching_cubes(field, 0.1, bounds=box)
+    shell_v, shell_f = tw.levelset.marching_cubes(field, 0.1, bounds=box)
     ```
 
     Notes
@@ -723,7 +724,7 @@ def signed_distance_grid(
     --------
     [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
         The per-query form this samples, and where the sign conventions are documented.
-    [`triwarp.offset.offset_mesh`][triwarp.offset.offset_mesh]
+    [`triwarp.levelset.offset_mesh`][triwarp.levelset.offset_mesh]
         What to call instead when the answer wanted is the offset surface rather than the field.
     [`triwarp.voxels.to_field`][triwarp.voxels.to_field]
         The occupancy lattice, when a binary inside test is all that is needed.

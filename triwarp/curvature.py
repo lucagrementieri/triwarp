@@ -23,7 +23,8 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import curvature as kernel_curvature
 from triwarp.kernels import scatter as kernel_scatter
-from triwarp.vertices import area_weighted_vertex_normals, vertex_defects
+from triwarp.vertices import vertex_defects
+from triwarp.vertices import vertex_normals as _vertex_normals
 
 
 def principal_curvature(
@@ -76,8 +77,8 @@ def principal_curvature(
 
     # Compute vertex normals via face normals
     face_normals, face_areas = tw.triangles.face_normals_and_areas(vertices, faces)
-    vertex_normals = area_weighted_vertex_normals(
-        n_vertices, vertices, faces, face_normals, face_areas
+    vertex_normals = _vertex_normals(
+        vertices, faces, face_normals=face_normals, face_weights=face_areas
     )
 
     # ``mean_edge_length`` is the per-face average, matching libigl's
@@ -239,7 +240,7 @@ def discrete_mean_curvature(
         return wp.zeros(n_points, dtype=wp.float32, device=device)
 
     angles = tw.adjacency.face_adjacency_angles(vertices, faces, face_adjacency=face_adjacency)
-    convex = tw.convex.face_adjacency_convex(
+    convex = tw.adjacency.face_adjacency_convex(
         vertices, faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
     )
 

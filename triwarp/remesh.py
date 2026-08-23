@@ -619,7 +619,7 @@ def _smooth_pass(
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
-    normals = tw.vertices.area_weighted_vertex_normals(n_vertices, vertices, faces)
+    normals = tw.vertices.vertex_normals(vertices, faces)
     unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
 
     ring_sum = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
@@ -2215,7 +2215,7 @@ def _flip_setup(
         region_flags = wp.full(n_faces, wp.int32(1), dtype=wp.int32, device=device)
     else:
         region_flags = tw.array.astype(region, wp.int32)
-    return wp.clone(faces), tw.vertices.n_vertices(faces), region_flags
+    return wp.clone(faces), tw.array.index_domain_size(faces), region_flags
 
 
 def intrinsic_delaunay(

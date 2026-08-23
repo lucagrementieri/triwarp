@@ -269,6 +269,6 @@ def euler_characteristic(faces: wp.array[wp.int32]) -> int:
         return 0
 
     n_referenced = int(tw.grouping.unique_1d(faces).shape[0])
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=tw.vertices.n_vertices(faces))
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=tw.array.index_domain_size(faces))
     n_edges = int(unique_edges.shape[0])
     return n_referenced - n_edges + n_faces

@@ -35,7 +35,7 @@ hand it straight to ``warp.fem``'s nanogrid geometries. There is deliberately no
     - **Implicit CSG**: [`grid_points`][triwarp.voxels.grid_points] →
       [`triwarp.proximity.signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh] per
       solid → ``wp.map(wp.min, ...)`` for a union →
-      [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes].
+      [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes].
     - **A full dense box**: ``from_dense(wp.full(shape, True), s, o)``.
 
 Notes
@@ -82,7 +82,7 @@ uses it.
 
 See Also
 --------
-[`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]
+[`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes]
 [`triwarp.remesh.cluster_decimate`][triwarp.remesh.cluster_decimate]
 """
 
@@ -875,7 +875,7 @@ def grid_points(
 
     ``igl.grid``, and the producer side of the implicit-surface round trip: it takes the same
     ``(lower, upper)`` corner-mapping tuple
-    [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes] takes, so a
+    [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes] takes, so a
     per-point scalar answer ``.reshape(shape)``s straight back into a field that function accepts.
     This is a **corner lattice**, not a voxel grid: it has nothing to do with the rest of the module
     except that both speak the same ``bounds`` convention.
@@ -888,7 +888,7 @@ def grid_points(
         ``(lower, upper)`` world corners the lattice spans, so sample ``(0, 0, 0)`` sits at
         ``lower`` and sample ``(nx-1, ny-1, nz-1)`` at ``upper``. ``None`` (the default) gives index
         space: the coordinates are the lattice indices, matching
-        [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]'s own
+        [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes]'s own
         default.
     device
         Target Warp device.
@@ -905,7 +905,7 @@ def grid_points(
 
     See Also
     --------
-    [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]
+    [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes]
     [`to_field`][triwarp.voxels.to_field]
 
     Notes
@@ -1363,7 +1363,7 @@ def to_field(
     """
     Occupancy as a padded ``float32`` lattice on the cell centres, with the box it spans.
 
-    The bridge to [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]:
+    The bridge to [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes]:
     ``marching_cubes(*to_field(grid), 0.5)`` reproduces trimesh's ``ops.matrix_to_marching_cubes``,
     ``VoxelGrid.marching_cubes`` and ``ops.points_to_marching_cubes``, which are all the same recipe
     (pad by one, threshold at ``0.5``). The padding is what closes the surface: without it a voxel
@@ -1383,7 +1383,7 @@ def to_field(
     bounds : tuple[wp.vec3, wp.vec3]
         ``(lower, upper)`` world corners the lattice spans, i.e. the centres of its first and last
         cells — exactly the tuple
-        [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes] takes.
+        [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes] takes.
 
     Raises
     ------
@@ -1394,7 +1394,7 @@ def to_field(
 
     See Also
     --------
-    [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]
+    [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes]
     [`to_dense`][triwarp.voxels.to_dense]
     [`to_boxes`][triwarp.voxels.to_boxes]
 

@@ -36,9 +36,7 @@ def _ellipsoid() -> tm.Trimesh:
 
 def _vertex_normals_wp(mesh_wp: wp.Mesh) -> wp.array[wp.vec3]:
     """Smooth outward normals; face normals would make the field piecewise constant per ring."""
-    return tw.vertices.area_weighted_vertex_normals(
-        int(mesh_wp.points.shape[0]), mesh_wp.points, mesh_wp.indices
-    )
+    return tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices)
 
 
 @pytest.mark.parametrize("weight", ["cosine", "uniform"])
@@ -336,9 +334,7 @@ def _sphere_wp(device: str, radius: float, subdivisions: int = 3):
         device=device,
     )
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
-    normals_wp = tw.vertices.area_weighted_vertex_normals(
-        int(vertices_wp.shape[0]), vertices_wp, faces_wp
-    )
+    normals_wp = tw.vertices.vertex_normals(vertices_wp, faces_wp)
     return sphere_tm, mesh_wp, normals_wp
 
 
@@ -386,9 +382,7 @@ def test_shape_diameter_measures_a_slab(device: str) -> None:
         device=device,
     )
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
-    normals_wp = tw.vertices.area_weighted_vertex_normals(
-        int(vertices_wp.shape[0]), vertices_wp, faces_wp
-    )
+    normals_wp = tw.vertices.vertex_normals(vertices_wp, faces_wp)
     diameter_np = tw.visibility.shape_diameter(
         mesh_wp, mesh_wp.points, normals=normals_wp, n_rays=128, cone_angle=np.deg2rad(10.0)
     ).numpy()
@@ -425,9 +419,7 @@ def test_shape_diameter_trimming_rejects_the_escaping_rays(device: str) -> None:
         device=device,
     )
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
-    normals_wp = tw.vertices.area_weighted_vertex_normals(
-        int(vertices_wp.shape[0]), vertices_wp, faces_wp
-    )
+    normals_wp = tw.vertices.vertex_normals(vertices_wp, faces_wp)
     trimmed_np = tw.visibility.shape_diameter(
         mesh_wp, mesh_wp.points, normals=normals_wp, n_rays=128, trim=1.0
     ).numpy()
@@ -486,9 +478,7 @@ def test_shape_diameter_agrees_with_pymeshlab_on_which_part_is_thinner(device: s
         device=device,
     )
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
-    normals_wp = tw.vertices.area_weighted_vertex_normals(
-        int(vertices_wp.shape[0]), vertices_wp, faces_wp
-    )
+    normals_wp = tw.vertices.vertex_normals(vertices_wp, faces_wp)
     diameter_np = tw.visibility.shape_diameter(
         mesh_wp, mesh_wp.points, normals=normals_wp, n_rays=256
     ).numpy()
@@ -538,8 +528,7 @@ def test_shape_diameter_collapses_onto_meshlibs_single_ray(device: str) -> None:
     mesh_tm = _ellipsoid()
     vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces.reshape(-1), device)
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
-    n_vertices = int(vertices_wp.shape[0])
-    normals_wp = tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+    normals_wp = tw.vertices.vertex_normals(vertices_wp, faces_wp, weighting="angle")
 
     thickness_ml = meshlib_scalars_to_numpy(
         mm.computeRayThicknessAtVertices(trimesh_to_meshlib(mesh_tm))
@@ -663,7 +652,7 @@ def test_thickness_at_vertices_matches_meshlib(device: str) -> None:
     The pairing is exact only with the right normals, and that is the substance of this test rather
     than an incidental detail. MeshLib's ``MeshPoint::set`` takes the direction from the
     *pseudonormal*, which section 6 records as the match for
-    [`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals] (1.19e-07).
+    [`vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="angle"`` (1.19e-07).
     Measured on the ellipsoid: **5.96e-07** absolute and 3.48e-07 relative with those normals,
     against **0.031** -- five orders worse -- with the area-weighted ones. So the second assert is
     what makes the first one a claim about the ray rather than about the tolerance.
@@ -690,7 +679,7 @@ def test_thickness_at_vertices_matches_meshlib(device: str) -> None:
     assert (thickness_ml < 1e30).all()  # every vertex found an opposite surface
     assert np.ptp(thickness_ml) > 1.0  # non-vacuity: on a sphere every ray would read 2 * radius
 
-    angle_normals_wp = tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+    angle_normals_wp = tw.vertices.vertex_normals(vertices_wp, faces_wp, weighting="angle")
     thickness_wp = tw.visibility.thickness(
         mesh_wp, vertices_wp, method="ray", normals=angle_normals_wp
     ).numpy()
@@ -698,7 +687,7 @@ def test_thickness_at_vertices_matches_meshlib(device: str) -> None:
     assert np.allclose(thickness_wp, thickness_ml, rtol=1e-5, atol=1e-5)
 
     # The other weighting is not the pairing, and the gap is five orders of magnitude.
-    area_normals_wp = tw.vertices.area_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+    area_normals_wp = tw.vertices.vertex_normals(vertices_wp, faces_wp)
     thickness_area_np = tw.visibility.thickness(
         mesh_wp, vertices_wp, method="ray", normals=area_normals_wp
     ).numpy()
@@ -856,8 +845,7 @@ def test_max_tangent_sphere_matches_meshlib(device: str) -> None:
     mesh_tm = _ellipsoid()
     vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces.reshape(-1), device)
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
-    n_vertices = int(vertices_wp.shape[0])
-    normals_wp = tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+    normals_wp = tw.vertices.vertex_normals(vertices_wp, faces_wp, weighting="angle")
     extent_np = mesh_tm.bounds[1] - mesh_tm.bounds[0]
 
     settings_ml = mm.InSphereSearchSettings()

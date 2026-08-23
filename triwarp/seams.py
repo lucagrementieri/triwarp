@@ -278,7 +278,7 @@ def uv_seam_edges(
         is exact comparison, which is what MeshLab does. Ignored under ``match="index"``.
     n_vertices
         Total vertex count, used as the edge-pairing radix. When ``None`` it is inferred with
-        [`n_vertices`][triwarp.vertices.n_vertices], which costs a host readback.
+        [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
 
     Returns
     -------
@@ -487,7 +487,7 @@ def uv_seam_vertex_mask(
         Coordinate tolerance under ``match="uv"``.
     n_vertices
         Total vertex count. When ``None`` it is inferred with
-        [`n_vertices`][triwarp.vertices.n_vertices], which costs a host readback.
+        [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
 
     Returns
     -------
@@ -501,7 +501,7 @@ def uv_seam_vertex_mask(
     [`triwarp.array.indices_to_mask`][triwarp.array.indices_to_mask]
     """
     if n_vertices is None:
-        n_vertices = tw.vertices.n_vertices(faces)
+        n_vertices = tw.array.index_domain_size(faces)
     seams, boundaries, _foldovers = uv_seam_edges(
         faces, texcoords, face_texcoords, match=match, tolerance=tolerance, n_vertices=n_vertices
     )

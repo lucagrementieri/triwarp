@@ -131,7 +131,7 @@ def edges_unique(
         edges_sorted = faces_to_edges(faces, sorted=True)
 
     if n_vertices is None:
-        n_vertices = tw.vertices.n_vertices(edges_sorted)
+        n_vertices = tw.array.index_domain_size(edges_sorted)
 
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
     unique_keys, inverse = tw.grouping.unique_1d(keys, return_inverse=True)

@@ -314,7 +314,7 @@ def transfer_through_operator(
     Examples
     --------
     ```python
-    field = tw.vertices.area_weighted_vertex_normals(int(v.shape[0]), v, f)  # per-vertex field
+    field = tw.vertices.vertex_normals(v, f)  # per-vertex field
     fine_v, fine_f, prolongation = tw.remesh.subdivide_loop(v, f, return_operator=True)
     fine_field = tw.interpolation.transfer_through_operator(field, prolongation)
     ```

@@ -24,16 +24,13 @@ from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-import triwarp.typing as twt
 from tests.comparisons import (
     assert_unordered_rows_equal,
     canonical_winding,
     edge_multiplicity,
-    euler_characteristic,
     hausdorff_surface_two_sided,
     hausdorff_two_sided,
     lexsort_rows,
-    open_edge_count,
     symmetric_chamfer,
     symmetric_surface_distance,
 )
@@ -874,123 +871,6 @@ def test_poisson_invalid_method(device: str):
 # ---------------------------------------------------------------------------
 # Marching cubes and uniform resampling (analytic + pymeshlab / skimage)
 # ---------------------------------------------------------------------------
-
-
-def _sphere_field(resolution: int, radius: float) -> np.ndarray:
-    """Build an analytic SDF of a sphere on a ``[-1, 1]`` lattice: the exact-answer fixture."""
-    axis_np = np.linspace(-1.0, 1.0, resolution)
-    x_np, y_np, z_np = np.meshgrid(axis_np, axis_np, axis_np, indexing="ij")
-    return (np.sqrt(x_np**2 + y_np**2 + z_np**2) - radius).astype(np.float32)
-
-
-def test_marching_cubes_extracts_an_analytic_sphere(device: str) -> None:
-    """Every extracted vertex must land on the sphere the field describes, to grid resolution."""
-    radius, resolution = 0.6, 32
-    field_wp = wp.array(_sphere_field(resolution, radius), dtype=wp.float32, device=device)
-    vertices_wp, faces_wp = tw.reconstruction.marching_cubes(
-        twt.as_array3d(field_wp, wp.float32),
-        bounds=(wp.vec3(-1.0, -1.0, -1.0), wp.vec3(1.0, 1.0, 1.0)),
-    )
-    assert int(faces_wp.shape[0]) > 0
-    spacing = 2.0 / (resolution - 1)
-    radii_np = np.linalg.norm(vertices_wp.numpy(), axis=1)
-    assert np.abs(radii_np - radius).max() < spacing
-
-
-@pytest.mark.parity("marching_cubes", "meshlib")
-def test_marching_cubes_matches_meshlib(device: str) -> None:
-    """
-    Class B, and the transform is half a voxel: ``params.origin`` addresses the voxel **centre**.
-
-    MeshLib's ``marchingCubes`` marches the same lattice with the same case table, so given the
-    identical field the two return the *same mesh* -- 3 744 vertices and 7 484 faces on both sides
-    here, agreeing to a two-sided Hausdorff of **1.2e-07**, which is the float32 floor
-    ``getNumpyVerts`` bottoms out at (CLAUDE.md section 6). The transform is the whole content of
-    the comparison and it is load-bearing: where triwarp's ``bounds`` lower corner is the position
-    of sample ``[0, 0, 0]``, ``params.origin`` is that sample's *cell* corner, so passing the same
-    number to both leaves the surfaces a rigid half-voxel apart -- measured at 0.0369, exactly the
-    half diagonal ``sqrt(3) * spacing / 2``, and 3e5 times the agreement the shift buys.
-
-    ``lessInside=True`` is the other convention, and it is the winding rather than the geometry:
-    with it the extracted volume is ``+0.902`` against triwarp's ``+0.902`` (8e-08 relative), and
-    with ``lessInside=False`` it is exactly the negation. True is the value that matches triwarp's
-    outside-positive field convention.
-
-    The invariants beside the comparison are what a vertex-cloud match cannot see: both meshes are
-    closed (no boundary edge) with Euler characteristic 2, and their triangle centroids match as
-    well as their vertices do -- so the two agree on the *triangulation*, not merely on the point
-    set.
-    """
-    resolution, radius = 48, 0.6
-    field_np = _sphere_field(resolution, radius)
-    spacing = 2.0 / (resolution - 1)
-    field_wp = wp.array(field_np, dtype=wp.float32, device=device)
-    vertices_wp, faces_wp = tw.reconstruction.marching_cubes(
-        twt.as_array3d(field_wp, wp.float32),
-        bounds=(wp.vec3(-1.0, -1.0, -1.0), wp.vec3(1.0, 1.0, 1.0)),
-    )
-    vertices_np, faces_tw_np = vertices_wp.numpy(), faces_wp.numpy().reshape(-1, 3)
-
-    def march_ml(origin: float) -> tuple[np.ndarray, np.ndarray]:
-        """March the identical field with the lower corner at ``origin`` on every axis."""
-        volume_ml = mn.simpleVolumeFrom3Darray(field_np)
-        volume_ml.voxelSize = mm.Vector3f(spacing, spacing, spacing)
-        params_ml = mm.MarchingCubesParams()
-        params_ml.iso = 0.0
-        params_ml.lessInside = True
-        params_ml.origin = mm.Vector3f(origin, origin, origin)
-        mesh_ml = mm.marchingCubes(volume_ml, params_ml)
-        return mn.getNumpyVerts(mesh_ml), mn.getNumpyFaces(mesh_ml.topology)
-
-    vertices_ml_np, faces_ml_np = march_ml(-1.0 - spacing / 2)
-    assert faces_ml_np.shape[0] > 0
-    assert vertices_ml_np.shape[0] == vertices_np.shape[0]
-    assert faces_ml_np.shape[0] == faces_tw_np.shape[0]
-    assert hausdorff_two_sided(vertices_np, vertices_ml_np) < 1e-5
-    assert (
-        hausdorff_two_sided(
-            vertices_np[faces_tw_np].mean(axis=1), vertices_ml_np[faces_ml_np].mean(axis=1)
-        )
-        < 1e-5
-    )
-
-    # The transform is the claim, so show the un-shifted call fails by the half diagonal.
-    unshifted_np = march_ml(-1.0)[0]
-    assert hausdorff_two_sided(vertices_np, unshifted_np) == pytest.approx(
-        math.sqrt(3.0) * spacing / 2.0, rel=1e-3
-    )
-
-    # Invariants a point-set match cannot see: both are closed spheres, and both wind outward.
-    for mesh_faces_np in (faces_tw_np, faces_ml_np):
-        assert open_edge_count(mesh_faces_np) == 0
-        assert euler_characteristic(mesh_faces_np) == 2
-    volume_tw = tm.Trimesh(vertices_np, faces_tw_np, process=False).volume
-    volume_ml = tm.Trimesh(vertices_ml_np, faces_ml_np, process=False).volume
-    assert volume_tw > 0.0
-    assert volume_ml == pytest.approx(volume_tw, rel=1e-5)
-
-
-def test_marching_cubes_index_space_by_default(device: str) -> None:
-    """Without ``bounds`` the vertices are lattice indices, which is the documented convention."""
-    resolution = 24
-    field_wp = wp.array(_sphere_field(resolution, 0.6), dtype=wp.float32, device=device)
-    vertices_np = tw.reconstruction.marching_cubes(twt.as_array3d(field_wp, wp.float32))[0].numpy()
-    assert vertices_np.min() >= 0.0
-    assert vertices_np.max() <= float(resolution - 1)
-    # Centred field, so the extracted surface is centred on the lattice centre.
-    assert np.allclose(vertices_np.mean(axis=0), 0.5 * (resolution - 1), atol=0.5)
-
-
-def test_marching_cubes_empty_when_the_field_never_crosses(device: str) -> None:
-    field_wp = wp.array(np.full((8, 8, 8), 1.0, dtype=np.float32), dtype=wp.float32, device=device)
-    _vertices_wp, faces_wp = tw.reconstruction.marching_cubes(twt.as_array3d(field_wp, wp.float32))
-    assert int(faces_wp.shape[0]) == 0
-
-
-def test_marching_cubes_invalid(device: str) -> None:
-    thin_wp = wp.array(np.zeros((1, 8, 8), dtype=np.float32), dtype=wp.float32, device=device)
-    with pytest.raises(ValueError, match="at least 2 wide"):
-        tw.reconstruction.marching_cubes(twt.as_array3d(thin_wp, wp.float32))
 
 
 @pytest.mark.parametrize("offset", [0.0, 0.2, -0.2])

@@ -669,7 +669,7 @@ def ears(
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
 
     if n_vertices is None:
-        n_vertices = tw.vertices.n_vertices(edges_sorted)
+        n_vertices = tw.array.index_domain_size(edges_sorted)
 
     boundary_rows = tw.grouping.group_int_rows(
         edges_sorted, 1, n_vertices, validate=False

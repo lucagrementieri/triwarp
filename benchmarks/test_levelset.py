@@ -1,8 +1,21 @@
 """
-Benchmarks for ``triwarp.offset``.
+Benchmarks for ``triwarp.levelset``.
 
-One group, and its axis is the **lattice**, not the mesh. A level-set offset samples a signed
-distance at every point of a regular grid and marches it, so its cost is
+Two groups, and both are sized by the **lattice** rather than by a mesh, which is what the module
+has in common: ``marching_cubes`` takes a field and no mesh at all, and ``offset_mesh`` turns its
+input into a field before doing anything.
+
+``marching_cubes`` is the primitive the other rows here end in, so it is timed on its own first
+-- against ``meshlib``'s ``marchingCubes``, the same algorithm on the same case table, which makes
+it
+one of the suite's cleanest comparisons. Its resolution pair is a slope check rather than a size
+sweep; read a regression as the slope steepening, not the absolute number moving. ``thicken_mesh``
+has no group: it is a per-vertex extrusion plus a rim band, so it belongs to the mesh-edit cost
+family and not to this file's axis -- which is the same reason it is the one member of the module
+that is not a level-set operation.
+
+The offset group's axis is likewise the **lattice**, not the mesh. A level-set offset samples a
+signed distance at every point of a regular grid and marches it, so its cost is
 ``resolution ** 3`` closest-point queries plus one marching-cubes pass -- the input's face count
 enters only through the BVH descent each query pays. That is why the cell width is the parametrized
 axis here and the mesh sweep is along for the ride: doubling the resolution is 8x the queries
@@ -13,7 +26,7 @@ References
 ----------
 **meshlib** ``offsetMesh`` is the same algorithm: an OpenVDB level set at a given ``voxelSize``,
 marched back to a mesh. It is the fair row -- both sides sample a field on a lattice of the same
-pitch, and ``tests/test_offset.py`` pins them to within half a cell of each other on the surface and
+pitch, and ``tests/test_levelset.py`` pins them to within half a cell of each other on the surface and
 to within 5 % on the vertex count.
 
 **pymeshlab** ``generate_resampled_uniform_mesh`` is MeshLab's offset and is timed at the same cell
@@ -34,7 +47,7 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, BenchLibrary, skip_larger_than
 
 # Cell widths as a fraction of the bounding-box diagonal, and the offset distance as a multiple of
 # the cell. The pair is a slope check: 1/64 to 1/128 is 8x the samples, and an offset of four cells
@@ -109,7 +122,7 @@ def test_offset_mesh(bench_case: BenchCase, divisor: int) -> None:
 
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     offset_vertices, offset_faces = bench_case.run(
-        lambda: tw.offset.offset_mesh(vertices, faces, distance, cell)
+        lambda: tw.levelset.offset_mesh(vertices, faces, distance, cell)
     )
     assert int(offset_faces.shape[0]) > 0
     assert int(offset_vertices.shape[0]) > 0
@@ -167,7 +180,7 @@ def test_thicken_mesh(bench_case: BenchCase) -> None:
 
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     shell_vertices, shell_faces = bench_case.run(
-        lambda: tw.offset.thicken_mesh(vertices, faces, thickness)
+        lambda: tw.levelset.thicken_mesh(vertices, faces, thickness)
     )
     assert int(shell_vertices.shape[0]) == 2 * bench_case.n_vertices
     assert int(shell_faces.shape[0]) >= 6 * bench_case.n_faces
@@ -231,3 +244,114 @@ def test_signed_distance_grid(bench_case: BenchCase, divisor: int) -> None:
     field, box = bench_case.run(lambda: tw.proximity.signed_distance_grid(vertices, faces, cell))
     assert field.shape[0] >= 2
     assert float(box[1][0]) > float(box[0][0])
+
+
+# Lattice resolutions for the marching-cubes group. The axis is the lattice rather than a mesh, and
+# the pair is a slope check: 64 -> 128 is 8x the cells (262 144 -> 2 097 152).
+_MARCHING_RESOLUTIONS = [64, 128]
+
+# Major radius, minor radius and the lattice's half-extent for the marched field. A torus rather
+# than a sphere because a genus-1 surface crosses roughly twice the cells at the same resolution, so
+# the row measures the marching rather than the scan over empty ones.
+_MARCHING_TORUS = (0.65, 0.28, 1.1)
+
+_marching_field_cache: dict[int, np.ndarray] = {}
+_marching_field_wp_cache: dict[tuple[int, str], wp.array] = {}
+_marching_volume_ml_cache: dict[int, mm.SimpleVolume] = {}
+
+
+def _marching_field_np(resolution: int) -> np.ndarray:
+    """Analytic torus SDF on a ``resolution ** 3`` lattice, cached -- the input, not the work."""
+    if resolution not in _marching_field_cache:
+        major, minor, half = _MARCHING_TORUS
+        axis_np = np.linspace(-half, half, resolution)
+        x_np, y_np, z_np = np.meshgrid(axis_np, axis_np, axis_np, indexing="ij")
+        radial_np = np.sqrt(x_np**2 + y_np**2) - major
+        field_np = np.sqrt(radial_np**2 + z_np**2) - minor
+        _marching_field_cache[resolution] = np.ascontiguousarray(field_np, dtype=np.float32)
+    return _marching_field_cache[resolution]
+
+
+def _marching_volume_ml(resolution: int) -> mm.SimpleVolume:
+    """
+    Build the same lattice as a ``meshlib.SimpleVolume``, cached per resolution.
+
+    ``marchingCubes`` reads the volume and returns a new ``Mesh``, so unlike almost every other free
+    function in the library this one does *not* mutate its input -- measured, two calls on one
+    volume return the identical face count and leave ``dims`` intact -- which is what makes the
+    cache legal here where ``new_mesh_ml`` is required elsewhere.
+
+    ``simpleVolumeFrom3Darray`` returns ``voxelSize = (1, 1, 1)`` whatever the array it was handed,
+    so the spacing is assigned afterwards; both are outside the timed region, matching triwarp's
+    row, whose field is likewise a device array in hand before the clock starts.
+    """
+    if resolution not in _marching_volume_ml_cache:
+        from meshlib import mrmeshnumpy as mn
+
+        half = _MARCHING_TORUS[2]
+        spacing = 2.0 * half / (resolution - 1)
+        volume_ml = mn.simpleVolumeFrom3Darray(_marching_field_np(resolution))
+        volume_ml.voxelSize = mm.Vector3f(spacing, spacing, spacing)
+        _marching_volume_ml_cache[resolution] = volume_ml
+    return _marching_volume_ml_cache[resolution]
+
+
+@pytest.mark.benchmark(group="marching_cubes")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.parametrize("resolution", _MARCHING_RESOLUTIONS)
+def test_marching_cubes(bench_lib: BenchLibrary, resolution: int) -> None:
+    """
+    Extract one iso-surface from a dense lattice: the module's second **mesh-free** group.
+
+    It takes ``bench_lib`` rather than ``bench_case`` for the reason ``delaunay_triangulation``
+    does -- the input is a field, not a mesh, so the work is sized by a plain ``parametrize`` and
+    the registry's ``--size`` axis has nothing to act on. Both rows march the identical analytic
+    torus SDF, built once per resolution outside the timed region.
+
+    **MeshLib's ``marchingCubes`` is the same algorithm on the same case table**, and the parity
+    test in ``tests/test_levelset.py`` pins that hard: at 48^3 the two return the same vertex
+    and face *counts* and agree to a two-sided Hausdorff of 1.2e-07, on the vertices and on the
+    triangle centroids alike. So this is one of the suite's cleanest comparisons -- two
+    implementations of one function, not two algorithms answering one question. The named transform
+    the test carries is a convention rather than a cost: ``params.origin`` addresses the voxel
+    *centre*, so it is handed ``lower - spacing / 2``, and ``lessInside=True`` is what makes its
+    winding match triwarp's outside-positive field convention.
+
+    It is also the fairest CPU-versus-GPU row this module has, for the reason MeshLib was given a
+    seat in the first place: it is the suite's only **multi-threaded** CPU reference, so a
+    ``triwarp-cuda`` ratio against it is a real one. First measurement, in-harness medians on an
+    RTX 5090 -- triwarp-cuda **0.420 / 0.762 ms** over the resolution pair against meshlib's
+    **2.60 / 7.36 ms**, i.e. **6.2x** at 64^3 widening to **9.7x** at 128^3. Both are far sublinear
+    in the lattice (1.8x and 2.8x for 8x the cells), which is the shape to watch: read a regression
+    here as the *slope* steepening rather than the absolute number moving.
+
+    ``triwarp-cpu`` reads **23.9 / 221 ms** on the same pair and so loses to meshlib by 9.1x and
+    30x. That is the other edge of the same knife and it is not a defect to chase: 143 threads of
+    C++ against Warp's CPU backend is not a comparison of algorithms, and CLAUDE.md section 13's
+    "decide on the CUDA number" is what governs.
+    """
+    if bench_lib.kind == "meshlib":
+        volume_ml = _marching_volume_ml(resolution)
+        half = _MARCHING_TORUS[2]
+        spacing = 2.0 * half / (resolution - 1)
+        corner = -half - spacing / 2.0
+        params_ml = mm.MarchingCubesParams()
+        params_ml.iso = 0.0
+        params_ml.lessInside = True
+        params_ml.origin = mm.Vector3f(corner, corner, corner)
+        mesh_ml = bench_lib.run(lambda: mm.marchingCubes(volume_ml, params_ml))
+        assert mesh_ml.topology.numValidFaces() > 0
+        return
+    device = bench_lib.device
+    key = (resolution, str(device))
+    if key not in _marching_field_wp_cache:
+        _marching_field_wp_cache[key] = wp.array(
+            _marching_field_np(resolution), dtype=wp.float32, device=device
+        )
+    field_wp = _marching_field_wp_cache[key]
+    half = _MARCHING_TORUS[2]
+    bounds = (wp.vec3(-half, -half, -half), wp.vec3(half, half, half))
+    _vertices_wp, faces_wp = bench_lib.run(
+        lambda: tw.levelset.marching_cubes(field_wp, 0.0, bounds=bounds)
+    )
+    assert int(faces_wp.shape[0]) > 0

@@ -810,3 +810,23 @@ def test_trim_to_count_zero(device: str) -> None:
     )
     assert n_out == 0
     assert trimmed_wp.shape == (0,)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("index_domain_size", "trimesh")
+def test_index_domain_size_matches_the_index_maximum(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: the count inferred from the face buffer, against the numpy formula.
+
+    ``Trimesh`` has no uncached equivalent -- its vertex count comes from the array it was built
+    with -- so the benchmark's "trimesh" row is the stand-in formula ``int(faces.max()) + 1``, and
+    that is the reference here. The value is checked against the fixture's actual vertex count too,
+    which is the part that would catch an off-by-one that the formula shares.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_np = mesh_tm.faces
+
+    assert tw.array.index_domain_size(mesh_wp.indices) == int(faces_np.max()) + 1
+    assert tw.array.index_domain_size(mesh_wp.indices) == len(mesh_tm.vertices)

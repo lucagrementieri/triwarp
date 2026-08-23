@@ -159,14 +159,13 @@ def test_corner_normals_degenerate_crease_sets_are_exact(
     """
     _, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
-    n_vertices = int(vertices_wp.shape[0])
     faces_np = faces_wp.numpy().reshape(-1, 3)
 
     smooth_np = tw.triangles.corner_normals(vertices_wp, faces_wp, weighting=weighting).numpy()
     vertex_normals_wp = (
-        tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+        tw.vertices.vertex_normals(vertices_wp, faces_wp, weighting="angle")
         if weighting == "angle"
-        else tw.vertices.area_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+        else tw.vertices.vertex_normals(vertices_wp, faces_wp)
     )
     assert np.allclose(smooth_np, vertex_normals_wp.numpy()[faces_np], rtol=1e-5, atol=1e-5)
 

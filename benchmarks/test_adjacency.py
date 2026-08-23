@@ -23,6 +23,26 @@ layout. Both rows therefore time the *same* igl call -- that is not double-count
 honest statement that igl does not separate them, and it makes ``face_adjacency_unshared``'s igl row
 an upper bound rather than a like-for-like. ``face_adjacency_angles`` has no igl equivalent
 (``igl.dihedral_angles`` is per-tet, on a tetrahedral mesh, not a surface).
+
+Local convexity
+---------------
+``face_adjacency_projections`` and ``face_adjacency_convex`` (moved here with the ``convex``
+module's adjacency half) are one thread per adjacent face pair projecting the neighbour's unshared
+vertex onto the first face's plane. The arithmetic is trivial; the cost is almost entirely the
+*adjacency
+construction* that precedes it when the optional ``face_adjacency`` arguments are not supplied. Both
+are timed the way a caller who has nothing precomputed would call them, so these numbers are
+"adjacency + projection" and it is the adjacency that dominates -- which is also why they sit in
+this file rather than with the precomputed-table groups above. ``face_adjacency_convex`` is
+``face_adjacency_projections`` plus a threshold, so the delta between the two groups is the
+comparison pass alone.
+
+**trimesh** is a genuine baseline for ``face_adjacency_convex``: ``Trimesh.face_adjacency_convex``
+computes the same predicate. It is a *cached property*, so the ``Trimesh`` is rebuilt inside the
+timed callable -- otherwise rounds 2..n would return a memoized array and measure nothing. That
+rebuild also pays trimesh's own ``face_adjacency`` construction, which is the honest comparison
+since the triwarp side builds its adjacency inside the timed region too. **libigl** has no
+local-convexity binding, so igl is absent from these two.
 """
 
 from __future__ import annotations
@@ -31,10 +51,10 @@ import igl
 import numpy as np
 import pytest
 import trimesh as tm
-from conftest import BenchCase
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase
 
 _adjacency_cache: dict[tuple[str, str], tuple] = {}
 
@@ -249,3 +269,28 @@ def test_vertex_face_adjacency(bench_case: BenchCase, known_nv: bool) -> None:
     )
     assert int(offsets.shape[0]) == n_vertices + 1
     assert int(vertex_faces.shape[0]) == 3 * bench_case.n_faces
+
+
+@pytest.mark.benchmark(group="face_adjacency_projections")
+@pytest.mark.benchlibs("triwarp")
+def test_face_adjacency_projections(bench_case: BenchCase) -> None:
+    """Unshared-vertex plane projections per adjacent face pair, adjacency built inside."""
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    projections = bench_case.run(lambda: tw.adjacency.face_adjacency_projections(vertices, faces))
+    assert projections.shape[0] >= 0
+
+
+@pytest.mark.benchmark(group="face_adjacency_convex")
+@pytest.mark.benchlibs("triwarp", "trimesh")
+def test_face_adjacency_convex(bench_case: BenchCase) -> None:
+    """Locally-convex adjacent face pairs: the projection plus a tolerance threshold."""
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        convex = bench_case.run(lambda: tw.adjacency.face_adjacency_convex(vertices, faces))
+        assert convex.shape[0] >= 0
+    else:  # rebuild inside: face_adjacency_convex is a cached Trimesh property
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        convex_tm = bench_case.run(
+            lambda: tm.Trimesh(vertices_np, faces_np, process=False).face_adjacency_convex
+        )
+        assert convex_tm.dtype == bool

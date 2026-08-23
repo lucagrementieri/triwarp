@@ -1852,8 +1852,13 @@ def test_straighten_boundary_return_count_shapes(device: str) -> None:
 
     The default is the bare face buffer, so this drops into a chain like the other ``make_*`` /
     face-returning repairs; ``return_count=True`` appends the diagnostic. Both must describe the
-    same call, which is what the equality of the buffers asserts -- a keyword that changed the
-    answer as well as its shape would pass a shape-only check.
+    same call, which is what the face-set comparison asserts -- a keyword that changed the answer
+    as well as its shape would pass a shape-only check.
+
+    Compared as an unordered set rather than byte for byte: ``emit_straighten_faces`` appends
+    through an atomic cursor, so the order of the new triangles differs run to run and is not part
+    of the contract. An ``array_equal`` here fails on an unchanged build, which is how this test
+    found out.
     """
     ragged_vertices_wp, ragged_faces_wp, _grid_faces_wp = _ragged_grid(device)
 
@@ -1866,15 +1871,20 @@ def test_straighten_boundary_return_count_shapes(device: str) -> None:
         ragged_vertices_wp, ragged_faces_wp, min_normal_dot=0.99, iterations=6, return_count=True
     )
     assert added > 0  # non-vacuity: the rim really was straightened
-    assert np.array_equal(faces_only_wp.numpy(), faces_wp.numpy())
+    assert int(faces_only_wp.shape[0]) == int(faces_wp.shape[0])
+    assert_unordered_rows_equal(
+        canonical_winding(faces_only_wp.numpy().reshape(-1, 3)),
+        canonical_winding(faces_wp.numpy().reshape(-1, 3)),
+    )
 
 
 def test_eliminate_degree3_vertices_return_count_shapes(device: str) -> None:
     """
     Not a library comparison: the two return shapes of the ``return_count`` keyword.
 
-    Two elements by default, three with the count, and the two buffers must agree -- see
-    ``test_straighten_boundary_return_count_shapes`` for why a shape-only assert is not enough.
+    Two elements by default, three with the count, and the two answers must agree -- see
+    ``test_straighten_boundary_return_count_shapes`` for why a shape-only assert is not enough, and
+    for why the faces are compared as an unordered set.
     """
     mesh_tm = _mesh_with_a_degree3_vertex()
     vertices_wp, faces_wp = numpy_to_warp(
@@ -1887,8 +1897,11 @@ def test_eliminate_degree3_vertices_return_count_shapes(device: str) -> None:
     triple = tw.repair.eliminate_degree3_vertices(vertices_wp, faces_wp, return_count=True)
     assert len(triple) == 3
     assert triple[2] == 1  # non-vacuity: the fixture really has one valence-3 vertex
-    assert np.array_equal(pair[0].numpy(), triple[0].numpy())
-    assert np.array_equal(pair[1].numpy(), triple[1].numpy())
+    assert np.allclose(pair[0].numpy(), triple[0].numpy(), rtol=1e-5, atol=1e-5)
+    assert_unordered_rows_equal(
+        canonical_winding(pair[1].numpy().reshape(-1, 3)),
+        canonical_winding(triple[1].numpy().reshape(-1, 3)),
+    )
 
 
 def test_eliminate_tunnels_count_is_unconditional(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:

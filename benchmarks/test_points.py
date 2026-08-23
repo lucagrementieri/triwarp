@@ -85,6 +85,52 @@ so it runs the full registry. ``fit_plane`` needs no such cap — ``trimesh.poin
 not take the full-matrices path.
 
 Everything else in the module runs the full registry.
+
+Approximate hull
+----------------
+``convex_subset_mask`` / ``convex_subset`` / ``convex_superset_mask`` moved here with the ``convex``
+module's point-cloud half. For each of ``n_directions`` Fibonacci hemisphere directions, one thread
+per strided slice of the cloud reduces the support function and one atomic per thread combines the
+slices, then a second pass marks the extrema. Cost is ``n_points * n_directions``, so this is the
+compute-bound case in the file. ``convex_subset`` is the mask plus a ``flatnonzero`` and a gather,
+so its delta over the mask is the compaction cost. (This sweep used to be a ``TILE_1D``-wide
+``wp.tile_max`` / ``wp.tile_min`` block reduction. It is lane-free now because ``wp.launch_tiled``
+runs exactly one lane per block on Warp 1.16's CPU backend, which made every tiled formulation
+silently wrong there; the replacement also measured 1.0-2.7x *faster* on CUDA, the gap widening
+with ``n_points * n_directions``.) ``convex_superset_mask`` adds a second cost shape: after the same
+support sweep over an icosphere's directions, one pass tests every point against the
+``20 * 4 ** subdivisions`` tetrahedra spanned by the resulting shell, and there every thread reads
+the same tetrahedron's face planes at the same time, so the plane table is broadcast out of cache
+and the arithmetic dominates.
+
+**The baselines compute a different (and stronger) result**, and that is the point of the comparison
+rather than a flaw in it. ``trimesh.Trimesh.convex_hull`` and
+``open3d.geometry.TriangleMesh.compute_convex_hull`` both run **qhull**, producing the exact hull as
+a *mesh* -- full connectivity, exact vertex set. ``convex_subset`` produces only an approximate
+*vertex subset* (a support sweep over finitely many directions, which misses hull vertices whose
+normal cone no sampled direction enters). So this is not a parity comparison: it is the
+quantification of what the approximation buys, which is the reason the function exists.
+``convex_subset_mask``'s own docstring documents the accuracy side of that trade -- including the
+measured recall per ``n_directions`` and the normal-cone sizes that explain it; this is the cost
+side. The argument is about the *operation*, so ``convex_subset`` and ``convex_subset_mask`` take
+the same three qhull rows.
+
+**scipy** is registered for ``convex_superset_mask`` only, and there it is a genuine parity row
+rather than a bar. That filter exists to run *before* an exact hull, so ``scipy.spatial.ConvexHull``
+on the same cloud is exactly the cost it has to be cheap against, and its output provably contains
+that hull's vertex set (asserted in ``tests/test_points.py``). The ratio is the number that decides
+whether the prefilter is worth running: on ``dragon`` it measured 2.4 ms at ``subdivisions=1`` and
+7.6 ms at 3, against 145 ms for the hull itself -- 60x and 19x -- and the gap widens with the point
+count, because the filter is linear where qhull is not. For the two approximate-hull groups scipy
+would only be a third timing of the qhull already covered by trimesh and Open3D, so it stays out of
+those. **pymeshlab**'s ``generate_convex_hull`` is qhull a third time, so it adds no new algorithm
+-- what it adds is a *second* wrapper cost around the same computation, which is the only way to
+tell whether trimesh's number is qhull or trimesh. **libigl** has no convex-hull binding in the
+Python package, so igl is absent from all three.
+
+The hull cases take the mesh's own vertices as the point cloud, so they scale with the registry mesh
+sizes. ``n_directions`` and ``subdivisions`` are each swept over two values spanning their useful
+range; both costs are close to linear in the direction count, so two points fix the line.
 """
 
 from __future__ import annotations
@@ -94,6 +140,7 @@ import open3d as o3d
 import pymeshlab as ml
 import pytest
 import pyvista as pv
+import scipy.spatial
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -155,9 +202,7 @@ def _unit_normals_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
     key = (bench_case.mesh_name, str(bench_case.device))
     if key not in _normals_wp_cache:
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-        _normals_wp_cache[key] = tw.vertices.area_weighted_vertex_normals(
-            bench_case.n_vertices, vertices, faces
-        )
+        _normals_wp_cache[key] = tw.vertices.vertex_normals(vertices, faces)
     return _normals_wp_cache[key]
 
 
@@ -700,3 +745,110 @@ def test_farthest_point_sample(bench_case: BenchCase, count: int) -> None:
         cloud = _pcd(bench_case)
         sampled_o3d = bench_case.run(lambda: cloud.farthest_point_down_sample(count))
         assert len(sampled_o3d.points) == count
+
+
+# Direction counts for the support sweep. Cost is exactly ``points x n_directions`` -- the only
+# knob in the module, and the accuracy/speed trade against exact qhull.
+_N_DIRECTIONS = [32, 256]
+
+# Icosphere refinement levels for the conservative filter: 42 directions / 80 tetrahedra at 1, and
+# 642 / 1280 at 3. Both halves of its cost scale with this, so it spans the useful range.
+_SUBDIVISIONS = [1, 3]
+
+
+@pytest.mark.benchmark(group="convex_subset_mask")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
+@pytest.mark.parametrize("n_directions", _N_DIRECTIONS)
+def test_convex_subset_mask(bench_case: BenchCase, n_directions: int) -> None:
+    """
+    Tiled support sweep vs exact qhull (see the module docstring).
+
+    Cost is ``points x n_directions`` with no topology involved, so the direction count is the
+    axis. The references are exact and take no such parameter, so their two rows are identical by
+    construction -- they are there as the fixed bar the approximation is trading accuracy against.
+    """
+    if bench_case.kind == "pymeshlab":  # qhull again, through MeshLab's own wrapper
+        skip_larger_than(bench_case, "dragon", "qhull is single-threaded on the host")
+        bench_case.run(lambda: bench_case.new_meshset_pml().generate_convex_hull())
+        return
+    if bench_case.kind == "triwarp":
+        points = bench_case.vertices_wp
+        mask = bench_case.run(
+            lambda: tw.points.convex_subset_mask(points, n_directions=n_directions)
+        )
+        assert mask.shape[0] == bench_case.n_vertices
+    elif bench_case.kind == "trimesh":
+        skip_larger_than(bench_case, "dragon", "qhull is single-threaded on the host")
+        points_np = bench_case.vertices_np
+        hull_tm = bench_case.run(lambda: tm.points.PointCloud(points_np).convex_hull)
+        assert hull_tm.vertices.shape[1] == 3
+    else:
+        skip_larger_than(bench_case, "dragon", "qhull is single-threaded on the host")
+        mesh_o3d = bench_case.mesh_o3d
+        hull_o3d, _indices = bench_case.run(lambda: mesh_o3d.compute_convex_hull())
+        assert np.asarray(hull_o3d.vertices).shape[1] == 3
+
+
+@pytest.mark.benchmark(group="convex_subset")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
+def test_convex_subset(bench_case: BenchCase) -> None:
+    """
+    The mask plus ``flatnonzero`` and a gather: isolates the compaction cost.
+
+    The same three qhull wrappers ``convex_subset_mask`` times, because the module docstring's
+    argument -- that the exact hull is the accuracy bar the approximation trades against -- is about
+    the *operation*, not about which of its two entry points is called. Both return the hull's
+    vertices; only the container differs, and a qhull wrapper returns positions rather than a mask,
+    so if anything this is the closer shape of the two. The rows carried only on the mask group for
+    as long as they did because that group was written first.
+
+    No ``n_directions`` axis here (unlike the mask group): the compaction this group isolates does
+    not scale with the direction count, so one row per library is the whole comparison.
+    """
+    if bench_case.kind == "triwarp":
+        points = bench_case.vertices_wp
+        selected = bench_case.run(lambda: tw.points.convex_subset(points))
+        assert selected.shape[0] <= bench_case.n_vertices
+        return
+    skip_larger_than(bench_case, "dragon", "qhull is single-threaded on the host")
+    if bench_case.kind == "pymeshlab":  # qhull again, through MeshLab's own wrapper
+        bench_case.run(lambda: bench_case.new_meshset_pml().generate_convex_hull())
+    elif bench_case.kind == "trimesh":
+        points_np = bench_case.vertices_np
+        hull_tm = bench_case.run(lambda: tm.points.PointCloud(points_np).convex_hull)
+        assert hull_tm.vertices.shape[1] == 3
+    else:
+        mesh_o3d = bench_case.mesh_o3d
+        hull_o3d, _indices = bench_case.run(lambda: mesh_o3d.compute_convex_hull())
+        assert np.asarray(hull_o3d.vertices).shape[1] == 3
+
+
+@pytest.mark.benchmark(group="convex_superset_mask")
+@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.parametrize("subdivisions", _SUBDIVISIONS)
+def test_convex_superset_mask(bench_case: BenchCase, subdivisions: int) -> None:
+    """
+    The conservative prefilter against the exact hull it prefilters for.
+
+    ``scipy`` is the right row here, unlike in the two groups above where the qhull wrappers are
+    only a fixed accuracy bar: this filter's *purpose* is to run before an exact hull, so the
+    question the benchmark has to answer is whether it is cheap relative to the hull it feeds. Both
+    rows are timed on the same cloud and produce comparable results (the filter's output contains
+    the hull's vertex set, which ``tests/test_convex.py`` asserts), so this one *is* a parity
+    comparison.
+
+    ``subdivisions`` is the axis because it drives both halves of the cost -- the direction count of
+    the support sweep and the tetrahedron count of the interior test -- and is the knob that trades
+    selectivity for time.
+    """
+    if bench_case.kind == "triwarp":
+        points = bench_case.vertices_wp
+        mask = bench_case.run(
+            lambda: tw.points.convex_superset_mask(points, subdivisions=subdivisions)
+        )
+        assert mask.shape[0] == bench_case.n_vertices
+    else:
+        skip_larger_than(bench_case, "dragon", "qhull is single-threaded on the host")
+        points_np = bench_case.vertices_np
+        hull_np = bench_case.run(lambda: scipy.spatial.ConvexHull(points_np))
+        assert hull_np.vertices.shape[0] >= 4

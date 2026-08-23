@@ -71,7 +71,7 @@ def test_face_adjacency_radix_is_invariant_to_an_oversized_base(
     edge rows.
     """
     _, mesh_wp = request.getfixturevalue(mesh_name)
-    tight = tw.vertices.n_vertices(mesh_wp.indices)
+    tight = tw.array.index_domain_size(mesh_wp.indices)
     edges_sorted = tw.edges.faces_to_edges(mesh_wp.indices, sorted=True)
 
     baseline_wp = tw.adjacency.face_adjacency(mesh_wp.indices, n_vertices=tight)
@@ -493,8 +493,9 @@ def test_face_adjacency_angles_matches_meshlib(
 
     ``dihedralAngle`` is **signed** -- negative where the two faces form a concave surface -- where
     triwarp splits the quantity in two: ``face_adjacency_angles`` is the unsigned magnitude and
-    [`face_adjacency_convex`][triwarp.convex.face_adjacency_convex] carries the side. So the named
-    transform is ``abs``, and the test then spends MeshLib's extra information on the *other* half
+    [`face_adjacency_convex`][triwarp.adjacency.face_adjacency_convex] carries the side. So the
+    named transform is ``abs``, and the test then spends MeshLib's extra information on the *other*
+    half
     of the pair, which trimesh cannot check: positive must mean convex, edge for edge.
 
     Measured on ``cave_cube``, whose 48 adjacency rows split 20 convex / 4 concave / 24 flat: the
@@ -514,7 +515,7 @@ def test_face_adjacency_angles_matches_meshlib(
     angles_wp = tw.adjacency.face_adjacency_angles(
         mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp
     ).numpy()
-    convex_wp = tw.convex.face_adjacency_convex(
+    convex_wp = tw.adjacency.face_adjacency_convex(
         mesh_wp.points, mesh_wp.indices, adjacency_wp, adjacency_edges_wp
     ).numpy()
 
@@ -669,3 +670,194 @@ def test_vertex_face_adjacency_zero_rows_with_faces(device: str) -> None:
     offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
     assert offsets_wp.shape == (1,)
     assert np.array_equal(payload_wp.numpy(), np.zeros(3, dtype=np.int32))
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def test_face_adjacency_projections(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (dict index): the projection is keyed by its adjacency *pair*, not by row position.
+
+    triwarp and trimesh both return one projection per adjacent face pair, but in different row
+    orders, and the value only means anything paired with its own row -- so both sides are
+    indexed into a dict by ``(face_a, face_b)`` before comparing. The key-set assert is what
+    makes that sound: it fails if the two disagree about *which* pairs are adjacent, which a
+    value comparison over a shared key subset would hide.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    adjacency_tm = mesh_tm.face_adjacency
+    projections_tm = mesh_tm.face_adjacency_projections
+
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True
+    )
+    projections_wp = tw.adjacency.face_adjacency_projections(
+        mesh_wp.points,
+        mesh_wp.indices,
+        face_adjacency=adjacency_wp,
+        face_adjacency_edges=adjacency_edges_wp,
+    )
+
+    adjacency_wp_np = adjacency_wp.numpy()
+    projections_wp_np = projections_wp.numpy()
+    projections_wp_lookup = {
+        (int(row[0]), int(row[1])): float(projections_wp_np[i])
+        for i, row in enumerate(adjacency_wp_np)
+    }
+    projections_tm_lookup = {
+        (int(row[0]), int(row[1])): float(projections_tm[i]) for i, row in enumerate(adjacency_tm)
+    }
+    assert projections_wp_lookup.keys() == projections_tm_lookup.keys()
+    for key, projection_tm in projections_tm_lookup.items():
+        projection_wp = projections_wp_lookup[key]
+        assert np.isclose(projection_wp, projection_tm, rtol=1e-4, atol=5e-4)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+def test_face_adjacency_projections_precomputed(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Triwarp against triwarp: the precomputed-normals path must give the same projections.
+
+    The oracle for the values is [`test_face_adjacency_projections`] above, against trimesh;
+    this pins only that supplying ``face_adjacency_unshared`` and ``face_normals`` takes the
+    same route as deriving them.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True
+    )
+    unshared_wp = tw.adjacency.face_adjacency_unshared(
+        mesh_wp.indices, face_adjacency=adjacency_wp, face_adjacency_edges=adjacency_edges_wp
+    )
+    face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
+
+    projections_all_wp = tw.adjacency.face_adjacency_projections(
+        mesh_wp.points,
+        mesh_wp.indices,
+        face_adjacency=adjacency_wp,
+        face_adjacency_edges=adjacency_edges_wp,
+    )
+    projections_precomputed_wp = tw.adjacency.face_adjacency_projections(
+        mesh_wp.points,
+        mesh_wp.indices,
+        face_adjacency=adjacency_wp,
+        face_adjacency_edges=adjacency_edges_wp,
+        face_adjacency_unshared=unshared_wp,
+        face_normals=face_normals_wp,
+    )
+    assert np.allclose(
+        projections_all_wp.numpy(), projections_precomputed_wp.numpy(), rtol=1e-5, atol=1e-5
+    )
+
+    adjacency_tm = mesh_tm.face_adjacency
+    projections_tm = mesh_tm.face_adjacency_projections
+    adjacency_wp_np = adjacency_wp.numpy()
+    projections_precomputed_np = projections_precomputed_wp.numpy()
+    projections_tm_lookup = {
+        (int(row[0]), int(row[1])): float(projections_tm[i]) for i, row in enumerate(adjacency_tm)
+    }
+    projections_precomputed_lookup = {
+        (int(row[0]), int(row[1])): float(projections_precomputed_np[i])
+        for i, row in enumerate(adjacency_wp_np)
+    }
+    for key, projection_tm in projections_tm_lookup.items():
+        assert np.isclose(projections_precomputed_lookup[key], projection_tm, rtol=1e-4, atol=5e-4)
+
+
+def test_face_adjacency_projections_empty(device: str) -> None:
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    projections_wp = tw.adjacency.face_adjacency_projections(vertices_wp, faces_wp)
+    assert projections_wp.shape == (0,)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("face_adjacency_convex", "trimesh")
+def test_face_adjacency_convex(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (dict index): the per-pair convexity flag, keyed like the projections above.
+
+    Same transform and the same reason as [`test_face_adjacency_projections`]. Non-vacuous by
+    fixture choice rather than by an assert: ``icosahedron`` is convex at every edge and
+    ``half_torus`` is not, so the boolean is exercised both ways across the parametrisation.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    adjacency_tm = mesh_tm.face_adjacency
+    convex_tm = mesh_tm.face_adjacency_convex
+
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True
+    )
+    convex_wp = tw.adjacency.face_adjacency_convex(
+        mesh_wp.points,
+        mesh_wp.indices,
+        face_adjacency=adjacency_wp,
+        face_adjacency_edges=adjacency_edges_wp,
+    )
+
+    adjacency_wp_np = adjacency_wp.numpy()
+    convex_wp_np = convex_wp.numpy()
+    convex_wp_lookup = {
+        (int(row[0]), int(row[1])): bool(convex_wp_np[i]) for i, row in enumerate(adjacency_wp_np)
+    }
+    convex_tm_lookup = {
+        (int(row[0]), int(row[1])): bool(convex_tm[i]) for i, row in enumerate(adjacency_tm)
+    }
+    assert convex_wp_lookup.keys() == convex_tm_lookup.keys()
+    for key, is_convex_tm in convex_tm_lookup.items():
+        assert convex_wp_lookup[key] == is_convex_tm
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+def test_face_adjacency_convex_precomputed(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Triwarp against triwarp: the precomputed path must give the same convexity flags.
+
+    Oracle is [`test_face_adjacency_convex`]; this pins the precomputed-argument route only.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True
+    )
+    unshared_wp = tw.adjacency.face_adjacency_unshared(
+        mesh_wp.indices, face_adjacency=adjacency_wp, face_adjacency_edges=adjacency_edges_wp
+    )
+    face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
+
+    convex_all_wp = tw.adjacency.face_adjacency_convex(
+        mesh_wp.points,
+        mesh_wp.indices,
+        face_adjacency=adjacency_wp,
+        face_adjacency_edges=adjacency_edges_wp,
+    )
+    convex_precomputed_wp = tw.adjacency.face_adjacency_convex(
+        mesh_wp.points,
+        mesh_wp.indices,
+        face_adjacency=adjacency_wp,
+        face_adjacency_edges=adjacency_edges_wp,
+        face_adjacency_unshared=unshared_wp,
+        face_normals=face_normals_wp,
+    )
+    assert np.array_equal(convex_all_wp.numpy(), convex_precomputed_wp.numpy())
+
+    adjacency_tm = mesh_tm.face_adjacency
+    convex_tm = mesh_tm.face_adjacency_convex
+    adjacency_wp_np = adjacency_wp.numpy()
+    convex_precomputed_np = convex_precomputed_wp.numpy()
+    convex_tm_lookup = {
+        (int(row[0]), int(row[1])): bool(convex_tm[i]) for i, row in enumerate(adjacency_tm)
+    }
+    convex_precomputed_lookup = {
+        (int(row[0]), int(row[1])): bool(convex_precomputed_np[i])
+        for i, row in enumerate(adjacency_wp_np)
+    }
+    for key, is_convex_tm in convex_tm_lookup.items():
+        assert convex_precomputed_lookup[key] == is_convex_tm
+
+
+def test_face_adjacency_convex_empty(device: str) -> None:
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    convex_wp = tw.adjacency.face_adjacency_convex(vertices_wp, faces_wp)
+    assert convex_wp.shape == (0,)

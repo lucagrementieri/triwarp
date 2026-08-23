@@ -507,7 +507,7 @@ def test_oriented_bounding_box_prefilter_returns_the_identical_box(device: str) 
     cloud_wp = wp.array(cloud_np, dtype=wp.vec3, device=device)
 
     kept_wp = tw.array.gather(
-        cloud_wp, tw.array.flatnonzero(tw.convex.convex_superset_mask(cloud_wp))
+        cloud_wp, tw.array.flatnonzero(tw.points.convex_superset_mask(cloud_wp))
     )
     assert int(kept_wp.shape[0]) < n // 10, "the prefilter must actually discard interior points"
 
