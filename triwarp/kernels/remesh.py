@@ -514,6 +514,129 @@ def long_region_edge(length: wp.float32, max_edge: wp.float32, in_region: wp.boo
 
 
 # ---------------------------------------------------------------------------
+# Region-restricted density refinement (Liepa 2003, section 3)
+# ---------------------------------------------------------------------------
+
+
+@wp.func
+def density_split_wanted(
+    a: wp.vec3,
+    b: wp.vec3,
+    c: wp.vec3,
+    scale_a: wp.float32,
+    scale_b: wp.float32,
+    scale_c: wp.float32,
+    alpha: wp.float32,
+) -> bool:
+    # Liepa's density criterion for splitting a patch triangle at its centroid. Each vertex carries
+    # a *scale attribute* -- the average length of the edges incident to it in the surrounding mesh
+    # -- and the centroid inherits the mean of its three. The triangle is split when, for **every**
+    # corner ``m``, the centroid is far from ``m`` relative to the centroid's own scale *and* the
+    # centroid's scale is coarse relative to ``m``'s:
+    #
+    #     alpha * |centroid - v_m| > scale(centroid)   and   alpha * scale(centroid) > scale(v_m)
+    #
+    # The first clause is what refines; the second is what stops the recursion at the surrounding
+    # sampling instead of running to the tolerance. Both must hold at all three corners, so a
+    # triangle already matching its neighbourhood's density is left alone and the pass converges.
+    #
+    # ``alpha`` is the paper's ``sqrt(2)``, exposed because it is the one real knob: raising it
+    # refines further, lowering it stops sooner.
+    centroid = (a + b + c) / wp.float32(3.0)
+    scale = (scale_a + scale_b + scale_c) / wp.float32(3.0)
+    if alpha * scale <= wp.max(scale_a, wp.max(scale_b, scale_c)):
+        return False
+    return (
+        alpha * wp.length(centroid - a) > scale
+        and alpha * wp.length(centroid - b) > scale
+        and alpha * wp.length(centroid - c) > scale
+    )
+
+
+@wp.kernel
+def mark_density_splits(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    region: wp.array[wp.bool],
+    scale: wp.array[wp.float32],
+    alpha: wp.float32,
+    out_split: wp.array[wp.int32],
+) -> None:
+    # Which region faces want a centroid split this pass, as 0/1 so the result scans directly into
+    # the two offset tables ``emit_density_splits`` needs. A face outside the region never splits,
+    # which is what keeps the refinement inside the patch.
+    f = wp.int32(wp.tid())
+    if not region[f]:
+        out_split[f] = wp.int32(0)
+        return
+    i, j, k = corner_triple(faces, f)
+    wanted = density_split_wanted(
+        vertices[i], vertices[j], vertices[k], scale[i], scale[j], scale[k], alpha
+    )
+    out_split[f] = wp.int32(1) if wanted else wp.int32(0)
+
+
+@wp.kernel
+def emit_density_splits(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    region: wp.array[wp.bool],
+    scale: wp.array[wp.float32],
+    split: wp.array[wp.int32],
+    split_offsets: wp.array[wp.int32],
+    face_offsets: wp.array[wp.int32],
+    n_vertices: wp.int32,
+    out_positions: wp.array[wp.vec3],
+    out_scale: wp.array[wp.float32],
+    out_faces: wp.array[wp.int32],
+    out_region: wp.array[wp.bool],
+) -> None:
+    # One pass of the 1 -> 3 centroid split, faces and new vertices in the same launch.
+    #
+    # A centroid split is **per-triangle independent** -- the new vertex is interior to the triangle
+    # and no edge is divided -- so unlike edge bisection it needs none of ``subdivide_to_size``'s
+    # crack-free 1/2/3 templates and no agreement with the neighbours. That is the whole reason this
+    # criterion suits a parallel refinement: one scan for the new-vertex slots, one for the face
+    # slots, and one kernel.
+    #
+    # Child faces inherit their parent's region membership, matching
+    # ``subdivide_region_to_size``, so a caller's patch mask survives the pass.
+    f = wp.int32(wp.tid())
+    i, j, k = corner_triple(faces, f)
+    base = face_offsets[f] * 3
+    if split[f] == wp.int32(0):
+        out_faces[base + 0] = i
+        out_faces[base + 1] = j
+        out_faces[base + 2] = k
+        out_region[face_offsets[f]] = region[f]
+        return
+
+    slot = split_offsets[f]
+    center = n_vertices + slot
+    out_positions[slot] = (vertices[i] + vertices[j] + vertices[k]) / wp.float32(3.0)
+    out_scale[slot] = (scale[i] + scale[j] + scale[k]) / wp.float32(3.0)
+    out_faces[base + 0] = i
+    out_faces[base + 1] = j
+    out_faces[base + 2] = center
+    out_faces[base + 3] = j
+    out_faces[base + 4] = k
+    out_faces[base + 5] = center
+    out_faces[base + 6] = k
+    out_faces[base + 7] = i
+    out_faces[base + 8] = center
+    for child in range(3):
+        out_region[face_offsets[f] + child] = region[f]
+
+
+@wp.kernel
+def face_split_counts(split: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
+    # A split face becomes three, an unsplit one stays one -- the counts whose exclusive scan gives
+    # ``emit_density_splits`` its output face slots.
+    f = wp.int32(wp.tid())
+    out_counts[f] = wp.int32(1) + wp.int32(2) * split[f]
+
+
+# ---------------------------------------------------------------------------
 # Float64 Delone edge-flip predicate. Computed in double precision for the reason the constants
 # above give.
 # ---------------------------------------------------------------------------

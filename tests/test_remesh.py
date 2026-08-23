@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import igl
 import numpy as np
 import pymeshlab as ml
@@ -2611,6 +2613,235 @@ def test_subdivide_region_empty_mesh(device: str):
     region = wp.zeros(0, dtype=wp.bool, device=device)
     _, nf, _ = tw.remesh.subdivide_region_to_size(v, f, region, max_edge=0.1)
     assert int(nf.shape[0]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Region-restricted density refinement (refine_region_to_density)
+# ---------------------------------------------------------------------------
+
+
+def _graded_patch_with_hole(device: str, n: int = 17):
+    """
+    Build a flat grid whose spacing grows 8x across it, with a hole punched in the middle.
+
+    The input the two refiners differ on, and the reason it has to be built rather than taken from
+    ``tests/conftest.py``: on a *uniformly* sampled patch a target edge length and a local density
+    are the same instruction, so a comparison there is vacuous whatever it asserts. Here the rim
+    edges span an order of magnitude, so "match the surroundings" and "be shorter than L" pull the
+    patch in different directions.
+
+    Returns ``(vertices_wp, faces_wp, region_wp)`` with the region covering the fill patch, plus the
+    original face count.
+    """
+    xs = np.linspace(0.0, 1.0, n) ** 2 * 4.0
+    ys = np.linspace(0.0, 1.0, n) * 2.0
+    grid_x, grid_y = np.meshgrid(xs, ys, indexing="ij")
+    vertices_np = np.stack([grid_x.ravel(), grid_y.ravel(), np.zeros(n * n)], axis=1)
+    quads = [
+        [
+            [i * n + j, i * n + j + n, i * n + j + 1],
+            [i * n + j + 1, i * n + j + n, i * n + j + n + 1],
+        ]
+        for i in range(n - 1)
+        for j in range(n - 1)
+    ]
+    faces_np = np.asarray(quads).reshape(-1, 3)
+    centers_np = vertices_np[faces_np].mean(axis=1)
+    hole_np = (
+        (centers_np[:, 0] > xs[6])
+        & (centers_np[:, 0] < xs[11])
+        & (centers_np[:, 1] > ys[6])
+        & (centers_np[:, 1] < ys[11])
+    )
+    holed_tm = tm.Trimesh(vertices_np, faces_np[~hole_np], process=False)
+    holed_tm.remove_unreferenced_vertices()
+
+    vertices_wp, faces_wp = numpy_to_warp(holed_tm.vertices, holed_tm.faces, device)
+    n_faces = int(faces_wp.shape[0]) // 3
+    # ``preserve_largest_hole`` leaves the grid's own outer boundary open and fills only the punch.
+    filled_wp = tw.holes.fill_min_weight(vertices_wp, faces_wp, preserve_largest_hole=True)
+    region_np = np.zeros(int(filled_wp.shape[0]) // 3, dtype=bool)
+    region_np[n_faces:] = True
+    return vertices_wp, filled_wp, wp.array(region_np, dtype=wp.bool, device=device), n_faces
+
+
+def _patch_scale_ratios(
+    vertices_wp: wp.array,
+    faces_wp: wp.array,
+    region_wp: wp.array,
+    original_vertices_wp: wp.array,
+    original_faces_wp: wp.array,
+) -> np.ndarray:
+    """
+    Per patch triangle, its mean edge length over the *local* surrounding scale.
+
+    The surrounding scale is Liepa's attribute -- the mean incident edge length in the original
+    mesh -- read at the original vertex nearest the triangle's centroid. A refinement that matched
+    its neighbourhood everywhere would return all ones; the spread of these ratios across the patch
+    is what separates a density criterion from a single global target.
+    """
+    original_tm = warp_to_trimesh(original_vertices_wp, original_faces_wp)
+    edges_np = original_tm.edges_unique
+    lengths_np = np.linalg.norm(
+        original_tm.vertices[edges_np[:, 0]] - original_tm.vertices[edges_np[:, 1]], axis=1
+    )
+    totals_np = np.zeros(original_tm.vertices.shape[0])
+    counts_np = np.zeros(original_tm.vertices.shape[0])
+    for column in (0, 1):
+        np.add.at(totals_np, edges_np[:, column], lengths_np)
+        np.add.at(counts_np, edges_np[:, column], 1.0)
+    referenced_np = np.flatnonzero(counts_np > 0)
+    scale_np = totals_np[referenced_np] / counts_np[referenced_np]
+    tree = KDTree(original_tm.vertices[referenced_np])
+
+    triangles_np = vertices_wp.numpy().astype(np.float64)[
+        faces_wp.numpy().reshape(-1, 3)[region_wp.numpy()]
+    ]
+    mean_edge_np = np.linalg.norm(triangles_np - np.roll(triangles_np, 1, axis=1), axis=2).mean(
+        axis=1
+    )
+    return mean_edge_np / scale_np[tree.query(triangles_np.mean(axis=1))[1]]
+
+
+def test_refine_region_to_density_matches_the_surroundings_better_than_a_target_length(
+    device: str,
+) -> None:
+    """
+    Not a library comparison: the two triwarp refiners against each other on a graded patch.
+
+    No reference computes this in isolation -- pymeshfix performs exactly this refinement but only
+    inside ``fill_small_boundaries``, where ``tests/test_holes.py`` compares it -- so the claim here
+    is the one the criterion was added for: on a **graded** neighbourhood, Liepa's density rule puts
+    the patch at its surroundings' sampling where a single target edge length cannot.
+
+    Measured on a patch whose surrounding edge lengths span 8x, as the ratio of each patch
+    triangle's mean edge to the local surrounding scale: ``"density"`` gives a max/min spread of
+    **1.90** with a mean of **1.09**, and ``subdivide_region_to_size`` at the mesh's mean edge gives
+    a spread of **3.58** with a mean of **0.59** -- so it is not merely less even, it is uniformly
+    over-refining by about 1.7x because one length is too fine at the coarse end. The asserted
+    bounds sit between the two measurements on both statistics.
+
+    The fixture is graded on purpose: on a uniform patch the two criteria coincide and any assert
+    here would pass for either.
+    """
+    vertices_wp, faces_wp, region_wp, n_faces = _graded_patch_with_hole(device)
+    original_faces_wp = wp.clone(faces_wp[: 3 * n_faces])
+
+    density_v, density_f, density_r = tw.remesh.refine_region_to_density(
+        vertices_wp, faces_wp, region_wp
+    )
+    length_v, length_f, length_r = tw.remesh.subdivide_region_to_size(
+        vertices_wp,
+        faces_wp,
+        region_wp,
+        max_edge=float(tw.edges.mean_edge_length(vertices_wp, original_faces_wp)),
+        max_splits=100_000,
+    )
+
+    density_np = _patch_scale_ratios(
+        density_v, density_f, density_r, vertices_wp, original_faces_wp
+    )
+    length_np = _patch_scale_ratios(length_v, length_f, length_r, vertices_wp, original_faces_wp)
+
+    assert int(density_v.shape[0]) > int(vertices_wp.shape[0])  # non-vacuity: it refined
+    assert int(length_v.shape[0]) > int(vertices_wp.shape[0])
+    density_spread = density_np.max() / density_np.min()
+    length_spread = length_np.max() / length_np.min()
+    assert density_spread < 2.5 < length_spread
+    assert abs(density_np.mean() - 1.0) < 0.3
+    assert abs(length_np.mean() - 1.0) > 0.3
+
+
+def test_refine_region_to_density_leaves_the_mesh_closed_and_the_outside_alone(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: the invariants a 1-to-3 centroid split gives for free.
+
+    Every new vertex is interior to a triangle and no edge is divided, so unlike edge bisection
+    there is nothing for a neighbouring face to agree to -- which means the mesh stays closed with
+    **no** crack-free template at all, non-region faces come back byte-identical, and the face count
+    grows by exactly twice the number of inserted vertices. Asserting all three is what says the
+    split really is independent rather than accidentally consistent on this input.
+    """
+    vertices_wp, faces_wp, region_wp = _filled_hemisphere(hemisphere)
+    n_vertices = int(vertices_wp.shape[0])
+    outside_np = {
+        tuple(sorted(row)) for row in faces_wp.numpy().reshape(-1, 3)[~region_wp.numpy()].tolist()
+    }
+
+    new_v, new_f, new_r = tw.remesh.refine_region_to_density(vertices_wp, faces_wp, region_wp)
+
+    assert int(new_v.shape[0]) > n_vertices  # non-vacuity: it refined
+    assert int(new_f.shape[0]) // 3 == int(faces_wp.shape[0]) // 3 + 2 * (
+        int(new_v.shape[0]) - n_vertices
+    )
+    assert int(new_r.shape[0]) == int(new_f.shape[0]) // 3
+    refined_tm = warp_to_trimesh(new_v, new_f)
+    assert refined_tm.is_watertight
+    assert refined_tm.euler_number == 2
+    kept_np = {tuple(sorted(row)) for row in new_f.numpy().reshape(-1, 3)[~new_r.numpy()].tolist()}
+    assert kept_np == outside_np
+    # The originals are a prefix: new vertices are appended, so the caller's index range holds.
+    assert np.array_equal(new_v.numpy()[:n_vertices], vertices_wp.numpy())
+
+
+def test_refine_region_to_density_alpha_monotone(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: ``alpha`` is the criterion's one knob and it has to act like one.
+
+    Raising it loosens both clauses of the test, so the patch can only get finer -- measured on the
+    filled hemisphere: 0 vertices inserted at ``alpha = 1``, 58 at ``sqrt(2)`` (the paper's value)
+    and 97 at 2. The assert is the ordering rather than the numbers, since the counts depend on the
+    patch the minimum-weight fill happened to choose.
+    """
+    vertices_wp, faces_wp, region_wp = _filled_hemisphere(hemisphere)
+    n_vertices = int(vertices_wp.shape[0])
+    inserted = [
+        int(
+            tw.remesh.refine_region_to_density(vertices_wp, faces_wp, region_wp, alpha=alpha)[
+                0
+            ].shape[0]
+        )
+        - n_vertices
+        for alpha in (1.0, math.sqrt(2.0), 2.0)
+    ]
+    assert inserted[0] == 0
+    assert inserted[0] < inserted[1] < inserted[2]
+
+
+def test_refine_region_to_density_empty_region(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """An empty region is the identity, and the whole mesh as the region still terminates."""
+    vertices_wp, faces_wp, region_wp = _filled_hemisphere(hemisphere)
+    empty_wp = wp.zeros(int(region_wp.shape[0]), dtype=wp.bool, device=region_wp.device)
+    same_v, same_f, _same_r = tw.remesh.refine_region_to_density(vertices_wp, faces_wp, empty_wp)
+    assert np.array_equal(same_v.numpy(), vertices_wp.numpy())
+    assert np.array_equal(same_f.numpy(), faces_wp.numpy())
+
+    # No surrounding mesh at all: the scale attribute falls back to the whole mesh's edges, which
+    # must still converge rather than divide by a zero scale for ever.
+    all_wp = wp.ones(int(region_wp.shape[0]), dtype=wp.bool, device=region_wp.device)
+    _whole_v, whole_f, _whole_r = tw.remesh.refine_region_to_density(vertices_wp, faces_wp, all_wp)
+    assert int(whole_f.shape[0]) >= int(faces_wp.shape[0])
+
+
+def test_refine_region_to_density_empty_mesh(device: str) -> None:
+    """An empty mesh comes back unchanged rather than raising."""
+    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.zeros(0, dtype=wp.int32, device=device)
+    region_wp = wp.zeros(0, dtype=wp.bool, device=device)
+    _new_v, new_f, _new_r = tw.remesh.refine_region_to_density(vertices_wp, faces_wp, region_wp)
+    assert int(new_f.shape[0]) == 0
+
+
+def test_refine_region_to_density_rejects_a_mismatched_region(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """The documented ``ValueError`` on a region whose length is not the face count."""
+    vertices_wp, faces_wp, region_wp = _filled_hemisphere(hemisphere)
+    short_wp = wp.zeros(int(region_wp.shape[0]) - 1, dtype=wp.bool, device=region_wp.device)
+    with pytest.raises(ValueError, match="region must have length"):
+        tw.remesh.refine_region_to_density(vertices_wp, faces_wp, short_wp)
 
 
 # ---------------------------------------------------------------------------

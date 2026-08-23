@@ -124,6 +124,25 @@ def scatter_face_values_sum_and_valence(
         wp.atomic_add(out_valence, vertex_index, wp.float32(1.0))
 
 
+@wp.func
+def accumulate_endpoint_value(
+    vi: wp.int32,
+    vj: wp.int32,
+    value: wp.float32,
+    out_sum: wp.array[wp.float32],
+    out_valence: wp.array[wp.float32],
+) -> None:
+    # Add one edge's value to both of its endpoints and count it at each -- the shared body of the
+    # two "average an edge field onto the vertices" scatters below. They compute the same quantity
+    # and differ only in where they find the endpoints and the value: one walks the *half*-edges of
+    # each face (the ``igl::orient_halfedges`` convention, skipping the negatively oriented copy so
+    # an interior edge is counted once), the other walks the unique-edge list directly.
+    wp.atomic_add(out_sum, vi, value)
+    wp.atomic_add(out_sum, vj, value)
+    wp.atomic_add(out_valence, vi, wp.float32(1.0))
+    wp.atomic_add(out_valence, vj, wp.float32(1.0))
+
+
 @wp.kernel
 def scatter_edges_sum_and_valence(
     faces: wp.array[wp.int32],
@@ -133,18 +152,32 @@ def scatter_edges_sum_and_valence(
     out_sum: wp.array[wp.float32],
     out_valence: wp.array[wp.float32],
 ) -> None:
+    # Half-edge form: launch over faces, skip the negatively oriented copy of each interior edge.
     f = wp.int32(wp.tid())
     for j in range(3):
         if edges_orientation[f, j] < 0:
             continue
-        e = edges[f, j]
-        vi = faces[f * 3 + (j + 1) % 3]
-        vj = faces[f * 3 + (j + 2) % 3]
-        value = edge_values[e]
-        wp.atomic_add(out_sum, vi, value)
-        wp.atomic_add(out_sum, vj, value)
-        wp.atomic_add(out_valence, vi, wp.float32(1.0))
-        wp.atomic_add(out_valence, vj, wp.float32(1.0))
+        accumulate_endpoint_value(
+            faces[f * 3 + (j + 1) % 3],
+            faces[f * 3 + (j + 2) % 3],
+            edge_values[edges[f, j]],
+            out_sum,
+            out_valence,
+        )
+
+
+@wp.kernel
+def scatter_unique_edges_sum_and_valence(
+    edges: wp.array2d[wp.int32],
+    edge_values: wp.array[wp.float32],
+    out_sum: wp.array[wp.float32],
+    out_valence: wp.array[wp.float32],
+) -> None:
+    # Unique-edge form: launch over the ``(m, 2)`` unique-edge list, which already holds each edge
+    # once, so there is no orientation to skip and no face buffer to read. Use this when the caller
+    # holds ``edges_unique`` output rather than an oriented half-edge table.
+    e = wp.int32(wp.tid())
+    accumulate_endpoint_value(edges[e, 0], edges[e, 1], edge_values[e], out_sum, out_valence)
 
 
 @wp.kernel

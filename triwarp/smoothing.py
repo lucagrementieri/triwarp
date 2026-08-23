@@ -1621,22 +1621,45 @@ def refine_and_smooth_region(
     smooth_boundary: bool,
     natural_smooth: bool,
     edge_weights: str,
+    *,
+    refine: Literal["max_edge", "density"] = "max_edge",
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]:
     """
     Subdivide the patch and smooth its new vertices.
 
     Shared finisher of [`fill_smooth`][triwarp.holes.fill_smooth] and
     [`stitch_smooth`][triwarp.holes.stitch_smooth].
+
+    ``refine`` selects the subdivision criterion, and the two are genuinely different questions
+    rather than two tunings of one: ``"max_edge"`` bisects region edges longer than ``max_edge``
+    ([`remesh.subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]), and
+    ``"density"`` splits region triangles at their centroid while their sampling is coarser than
+    the surrounding mesh's -- Liepa's criterion, in
+    [`remesh.refine_region_to_density`][triwarp.remesh.refine_region_to_density]. ``max_edge`` and
+    ``max_edge_splits`` are ignored under ``"density"``, which takes its target from the mesh
+    instead of from an argument.
+
+    Raises
+    ------
+    ValueError
+        If ``refine`` is neither ``"max_edge"`` nor ``"density"``.
     """
     device = faces.device
-    vertices, faces, patch_face_mask = tw.remesh.subdivide_region_to_size(
-        vertices,
-        faces,
-        patch_face_mask,
-        max_edge=max_edge,
-        max_splits=max_edge_splits,
-        max_angle_change=max_angle_change_after_flip,
-    )
+    if refine == "density":
+        vertices, faces, patch_face_mask = tw.remesh.refine_region_to_density(
+            vertices, faces, patch_face_mask, max_angle_change=max_angle_change_after_flip
+        )
+    elif refine == "max_edge":
+        vertices, faces, patch_face_mask = tw.remesh.subdivide_region_to_size(
+            vertices,
+            faces,
+            patch_face_mask,
+            max_edge=max_edge,
+            max_splits=max_edge_splits,
+            max_angle_change=max_angle_change_after_flip,
+        )
+    else:
+        raise ValueError(f"unknown refine {refine!r}, expected 'max_edge' or 'density'")
     if not smooth_curvature:
         return vertices, faces, patch_face_mask
 

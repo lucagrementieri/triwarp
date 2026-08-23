@@ -66,7 +66,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import numpy as np
 import warp as wp
@@ -883,6 +883,7 @@ def fill_smooth(
     preserve_largest_hole: bool = False,
     resolve_multiple_edges: bool = True,
     smooth_boundary: bool = True,
+    refine: Literal["max_edge", "density"] = "max_edge",
     return_patch: bool = False,
 ) -> (
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
@@ -934,6 +935,16 @@ def fill_smooth(
     smooth_boundary
         When ``True`` (default), also run the cross-boundary smooth solve so the patch is C¹ across
         its rim. Also tunes the fill metric's rim edge terms.
+    refine
+        Which subdivision criterion the refinement stage uses. ``"max_edge"`` (default) bisects
+        patch edges longer than ``max_edge``; ``"density"`` splits patch triangles at their centroid
+        while their sampling is coarser than the surrounding mesh's, which is Liepa's criterion and
+        what the reference hole fillers do. The two differ only on a **graded** neighbourhood, where
+        a single target length cannot be right at both ends of the grading: measured on a patch
+        whose surroundings vary 8x in edge length, the ratio of patch triangle size to local
+        surrounding scale spreads **1.90x** under ``"density"`` against **3.58x** under
+        ``"max_edge"``, and its mean sits at 1.09 rather than 0.59. ``max_edge`` and
+        ``max_edge_splits`` are ignored under ``"density"``.
     return_patch
         When ``True``, also return a length-``n_out_faces`` ``wp.bool`` mask of the patch faces.
 
@@ -949,7 +960,7 @@ def fill_smooth(
     Raises
     ------
     ValueError
-        If ``metric`` or ``edge_weights`` is unknown.
+        If ``metric``, ``edge_weights`` or ``refine`` is unknown.
 
     See Also
     --------
@@ -1002,6 +1013,7 @@ def fill_smooth(
         smooth_boundary,
         natural_smooth,
         edge_weights,
+        refine=refine,
     )
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
 
@@ -1015,6 +1027,7 @@ def refill_region(
     triangulate_only: bool = False,
     max_edge: float | None = None,
     smooth_curvature: bool = True,
+    refine: Literal["max_edge", "density"] = "max_edge",
     return_patch: bool = False,
 ) -> (
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
@@ -1053,6 +1066,9 @@ def refill_region(
     smooth_curvature
         Minimize curvature rather than area when smoothing the patch, as in
         [`fill_smooth`][triwarp.holes.fill_smooth].
+    refine
+        Subdivision criterion for the refinement stage; see
+        [`fill_smooth`][triwarp.holes.fill_smooth].
     return_patch
         Also return the per-face mask of the new patch, for a caller that wants to keep working on
         it.
@@ -1067,8 +1083,8 @@ def refill_region(
     Raises
     ------
     ValueError
-        If ``metric`` is not one of the supported metric names, or ``face_mask`` does not have one
-        entry per face.
+        If ``metric`` or ``refine`` is not one of the supported names, or ``face_mask`` does not
+        have one entry per face.
 
     Examples
     --------
@@ -1121,6 +1137,7 @@ def refill_region(
         True,
         False,
         "cotan",
+        refine=refine,
     )
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
 
@@ -1597,6 +1614,7 @@ def stitch_smooth(
     smooth_curvature: bool = True,
     natural_smooth: bool = False,
     edge_weights: str = "cotan",
+    refine: Literal["max_edge", "density"] = "max_edge",
     return_patch: bool = False,
 ) -> (
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
@@ -1635,6 +1653,8 @@ def stitch_smooth(
         See [`fill_smooth`][triwarp.holes.fill_smooth].
     edge_weights
         See [`fill_smooth`][triwarp.holes.fill_smooth].
+    refine
+        See [`fill_smooth`][triwarp.holes.fill_smooth].
     return_patch
         See [`fill_smooth`][triwarp.holes.fill_smooth].
 
@@ -1650,7 +1670,8 @@ def stitch_smooth(
     Raises
     ------
     ValueError
-        If either mesh lacks exactly one boundary loop, or ``metric`` / ``edge_weights`` is unknown.
+        If either mesh lacks exactly one boundary loop, or ``metric`` / ``edge_weights`` /
+        ``refine`` is unknown.
 
     See Also
     --------
@@ -1703,9 +1724,10 @@ def stitch_smooth(
         max_edge_splits,
         max_angle_change_after_flip,
         smooth_curvature,
-        True,  # stitchHolesNicely forces smoothBd
+        True,  # the reference pipeline forces the cross-boundary smooth here
         natural_smooth,
         edge_weights,
+        refine=refine,
     )
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
 

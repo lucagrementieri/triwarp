@@ -3043,6 +3043,221 @@ def subdivide_region_to_size(
     return current_vertices, current_faces, new_region
 
 
+def refine_region_to_density(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    region: wp.array[wp.bool],
+    *,
+    max_iter: int = 10,
+    alpha: float = math.sqrt(2.0),
+    delaunay: bool = True,
+    max_angle_change: float | None = math.radians(30.0),
+    max_deviation: float | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]:
+    """
+    Refine a face region until its sampling matches the surrounding mesh's, not a target length.
+
+    The density-driven sibling of
+    [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size], and the difference is the
+    criterion rather than the mechanism. That one bisects every region edge longer than a single
+    global ``max_edge``; this one gives each vertex a **scale attribute** -- the average length of
+    the edges incident to it -- and splits a region triangle only while its own scale is coarse
+    relative to its corners'. On a uniformly sampled neighbourhood the two agree; on a *graded* one
+    they do not, because a single length cannot be right at both ends of the grading.
+
+    The rule is Liepa's (see Notes). Writing ``sigma(v)`` for the scale attribute, ``c`` for a
+    triangle's centroid and ``sigma(c)`` for the mean of its three corners' attributes, the triangle
+    is split at ``c`` when
+
+        ``alpha * |c - v_m| > sigma(c)``  and  ``alpha * sigma(c) > sigma(v_m)``
+
+    holds for every corner ``m``. The first clause refines; the second is what makes the process
+    *terminate at the surrounding sampling* rather than at a tolerance. A pass that splits nothing
+    ends the loop.
+
+    The split is a **1 -> 3 centroid split**, which is what makes this cheap in parallel: the new
+    vertex is interior to the triangle and no edge is divided, so there is nothing to agree with the
+    neighbours about and no crack-free template is needed -- unlike edge bisection, which is why
+    ``subdivide_region_to_size`` carries the 1/2/3 split families. One pass is two prefix scans and
+    one kernel.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    region
+        Length-``n_faces`` ``wp.bool`` mask; only ``True`` faces are refined. Child faces inherit
+        their parent's membership.
+    max_iter
+        Cap on refinement passes. Unlike ``subdivide_region_to_size`` this does **not** raise when
+        the cap is reached: the criterion is a density match rather than a hard bound, so stopping
+        early leaves a coarser patch and not a wrong one.
+    alpha
+        The criterion's constant, ``sqrt(2)`` in the paper. Larger refines further, smaller stops
+        sooner; it is the only real tuning knob here.
+    delaunay
+        When ``True`` (default), run the parallel Delone edge-flip pass over the region after each
+        split pass, which is the relaxation step the paper pairs with the criterion.
+    max_angle_change
+        Dihedral-angle-change gate for that flip pass (default 30 degrees). ``None`` disables the
+        gate.
+    max_deviation
+        Surface-deviation gate for the flip pass. ``None`` disables it.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Positions with the centroid vertices appended after the originals, so the caller derives the
+        new-vertex set as the index range ``[len(vertices), len(new_vertices))``.
+    new_faces : wp.array[wp.int32]
+        Flat buffer of the refined faces.
+    new_region : wp.array[wp.bool]
+        Length ``n_out_faces`` region mask.
+
+    Raises
+    ------
+    ValueError
+        If ``region`` length does not match the face count.
+
+    See Also
+    --------
+    [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]
+        The same operation driven by a target edge length instead.
+    [`smoothing.refine_and_smooth_region`][triwarp.smoothing.refine_and_smooth_region]
+        Where the two criteria are selected between, and what the hole fillers reach through.
+    [`holes.fill_smooth`][triwarp.holes.fill_smooth]
+
+    Notes
+    -----
+    The criterion is section 3 of P. Liepa, *"Filling holes in meshes"*, Eurographics/ACM SIGGRAPH
+    Symposium on Geometry Processing (2003).
+
+    The scale attribute is computed **once**, from the mesh as given, and only *extended* as
+    vertices are added -- a centroid inherits the mean of its parents'. That is the point of it: it
+    carries the surrounding sampling inward across the patch instead of being re-measured from the
+    increasingly fine triangles it is producing, which would never converge.
+    """
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    if int(region.shape[0]) != n_faces:
+        raise ValueError(f"region must have length n_faces={n_faces}, got {int(region.shape[0])}")
+    if n_faces == 0:
+        return vertices, faces, region
+
+    alpha_f = wp.float32(alpha)
+    current_vertices = vertices
+    current_faces = faces
+    current_region = region
+    scale = _vertex_scale_attribute(vertices, faces, region)
+
+    for _ in range(max_iter):
+        n_faces = int(current_faces.shape[0]) // 3
+        split = wp.empty(n_faces, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.mark_density_splits,
+            dim=n_faces,
+            inputs=[current_vertices, current_faces, current_region, scale, alpha_f, split],
+            device=device,
+        )
+        split_offsets, n_split = tw.array.counts_to_offsets(split)
+        if n_split == 0:
+            break
+
+        counts = wp.empty(n_faces, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.face_split_counts, dim=n_faces, inputs=[split, counts], device=device
+        )
+        face_offsets, n_out_faces = tw.array.counts_to_offsets(counts)
+
+        positions = wp.empty(n_split, dtype=wp.vec3, device=device)
+        new_scale = wp.empty(n_split, dtype=wp.float32, device=device)
+        out_faces = wp.empty(3 * n_out_faces, dtype=wp.int32, device=device)
+        out_region = wp.empty(n_out_faces, dtype=wp.bool, device=device)
+        wp.launch(
+            kernel_remesh.emit_density_splits,
+            dim=n_faces,
+            inputs=[
+                current_vertices,
+                current_faces,
+                current_region,
+                scale,
+                split,
+                split_offsets,
+                face_offsets,
+                wp.int32(int(current_vertices.shape[0])),
+                positions,
+                new_scale,
+                out_faces,
+                out_region,
+            ],
+            device=device,
+        )
+        current_vertices, _ = tw.array.pack_1d_arrays([current_vertices, positions])
+        scale, _ = tw.array.pack_1d_arrays([scale, new_scale])
+        current_faces = out_faces
+        current_region = out_region
+
+        if delaunay:
+            _flip_region_faces(
+                current_vertices,
+                current_faces,
+                tw.array.astype(current_region, wp.int32),
+                max_angle_change,
+                max_deviation,
+                8,
+            )
+
+    return current_vertices, current_faces, current_region
+
+
+def _vertex_scale_attribute(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], region: wp.array[wp.bool]
+) -> wp.array[wp.float32]:
+    """
+    Liepa's per-vertex scale attribute: the mean incident edge length in the *surrounding* mesh.
+
+    "Surrounding" is load-bearing, not a synonym for "whole": the edges counted are those of the
+    faces **outside** ``region``. Including the region's own edges is the natural-looking mistake
+    and it defeats the criterion -- a minimum-weight patch spans its rim with long chords, so a rim
+    vertex that happens to carry two of them reads a scale several times its neighbourhood's, the
+    ``alpha * sigma(c) > sigma(v_m)`` clause fails there, and the patch is left unrefined. Measured
+    on a 24-edge rim: counting the patch chords splits **nothing** at ``alpha = sqrt(2)`` where
+    excluding them inserts the expected vertices.
+
+    Over the **unique** edge list, so an interior edge counts once at each endpoint rather than
+    twice -- which is why this goes through ``scatter_unique_edges_sum_and_valence`` rather than the
+    half-edge form beside it. A vertex with no surrounding edge at all keeps ``0`` (the guarded
+    division rather than ``nan``), which makes its clause fail and leaves its triangles alone; when
+    the region is the *whole* mesh there is no surrounding mesh to measure and every edge is
+    counted instead, so the criterion degrades to the mesh's own average rather than to zero.
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    complement = wp.empty(int(region.shape[0]), dtype=wp.bool, device=device)
+    wp.map(kernel_array.mask_not, region, out=complement)
+    outside = tw.array.flatnonzero(complement)
+    surrounding = (
+        faces
+        if int(outside.shape[0]) == 0
+        else tw.array.gather(faces.reshape((-1, 3)), outside).reshape(-1)
+    )
+    unique_edges, _inverse = tw.edges.edges_unique(surrounding, n_vertices=n_vertices)
+    lengths = tw.edges.edges_unique_length(vertices, surrounding, unique_edges=unique_edges)
+
+    total = wp.zeros(n_vertices, dtype=wp.float32, device=device)
+    valence = wp.zeros(n_vertices, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_scatter.scatter_unique_edges_sum_and_valence,
+        dim=int(unique_edges.shape[0]),
+        inputs=[unique_edges, lengths, total, valence],
+        device=device,
+    )
+    wp.map(kernel_array.divide_if_positive, total, valence, out=total)
+    return total
+
+
 @overload
 def split_edges(
     vertices: wp.array[wp.vec3],

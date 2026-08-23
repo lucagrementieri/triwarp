@@ -407,6 +407,40 @@ def test_subdivide_region_to_size(bench_case: BenchCase, split_budget: float | N
     assert int(new_region.shape[0]) == int(new_faces.shape[0]) // 3
 
 
+@pytest.mark.benchmark(group="refine_region_to_density")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp")
+def test_refine_region_to_density(bench_case: BenchCase) -> None:
+    """
+    Liepa's density criterion instead of a target edge length, on the axis it exists for.
+
+    The ``quality`` axis is the one that separates the two refiners: ``saddle`` and
+    ``saddle_graded`` have identical vertex counts, face counts and connectivity, and differ only in
+    how unevenly the triangles are sized. A target-length refiner does the same work on both -- it
+    compares every edge against one number -- where this one compares each triangle against its
+    *own* neighbourhood, so the graded row is where its per-vertex scale attribute earns its keep
+    and the uniform row is the control.
+
+    The cost is one scan pair plus one kernel per pass, and the split is 1 -> 3 at the centroid, so
+    unlike edge bisection there is no crack-free template and no agreement with the neighbours --
+    which is what makes the criterion cheap in parallel rather than merely correct.
+
+    There is no reference row. pymeshfix performs this refinement (measured: 47 vertices inserted
+    into a 24-edge rim's patch) but only as a stage inside ``fill_small_boundaries``, behind a load
+    that is 90 % of the round and cannot be hoisted out of it, so a row would price the load;
+    ``tests/test_holes.py`` compares the answers instead. pymeshlab's ``refineholeedgelen`` is a
+    target *length*, i.e. the other criterion.
+    """
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    region = _region_half(bench_case)
+
+    _new_vertices, new_faces, new_region = bench_case.run(
+        lambda: tw.remesh.refine_region_to_density(vertices, faces, region), rounds=_ROUNDS
+    )
+    assert int(new_faces.shape[0]) >= int(faces.shape[0])
+    assert int(new_region.shape[0]) == int(new_faces.shape[0]) // 3
+
+
 @pytest.mark.benchmark(group="flip_to_delaunay")
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp", "meshlib")
