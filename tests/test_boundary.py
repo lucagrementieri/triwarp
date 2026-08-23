@@ -21,6 +21,7 @@ from tests.comparisons import (
     trimesh_outline_loops,
 )
 from tests.conversions import (
+    numpy_to_pymeshfix,
     pyvista_edges_to_indices,
     trimesh_to_meshlib,
     trimesh_to_pymeshlab,
@@ -253,6 +254,48 @@ def test_boundary_loops_matches_trimesh_outline(
 
     assert len(loops_tm) > 0  # non-vacuous: these fixtures have rims
     assert_same_loop_set([loop.numpy() for loop in loops_wp], loops_tm)
+
+
+@pytest.mark.parity(
+    "boundary_loops",
+    "pymeshfix",
+    benchmarked=False,
+    reason="n_boundaries is a property computed by load_array itself, so there is no separable "
+    "operation to time -- a row would price the 67.9 ms load on bunny_decimated and report it as "
+    "a loop count. The count is the whole answer, so it is asserted here instead.",
+)
+@pytest.mark.parametrize(
+    ("mesh_name", "n_loops"), [("icosahedron", 0), ("hemisphere", 1), ("half_torus", 2)]
+)
+def test_boundary_loops_count_matches_pymeshfix(
+    request: pytest.FixtureRequest, mesh_name: str, n_loops: int
+) -> None:
+    """
+    Class A on the count: integer equality against ``PyTMesh.n_boundaries``.
+
+    pymeshfix has no vertex-loop entry point -- it reports only how many rims there are -- so this
+    is the whole of what it can say about this group, and it says it exactly: 0 / 1 / 2 across the
+    three fixtures.
+
+    Two things make the assert meaningful rather than incidental. The expected count is
+    parametrized *in* rather than read off either library, so a pair of implementations that agreed
+    on a wrong answer would still fail; and it spans a closed mesh, so one of the three cases is a
+    genuine zero rather than the vacuous ``[] == []`` that comparing two open meshes would give.
+
+    The load is asserted to have changed nothing first, which is not a formality here: the same
+    call cuts connectivity before counting, and a hemisphere sliced without ``merge_vertices()``
+    loads as 137 vertices from 121 and reports **17** rims where the surface has one. The
+    ``tests/conftest.py`` fixtures merge, so they come back untouched.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
+
+    assert tin_pmf.n_points == mesh_tm.vertices.shape[0]  # the loader left the mesh alone
+    assert tin_pmf.n_faces == mesh_tm.faces.shape[0]
+    assert tin_pmf.n_boundaries == n_loops
+    assert len(loops_wp) == n_loops
 
 
 def _meshlib_hole_rings(mesh_ml: mm.Mesh) -> list[list[tuple[int, int]]]:
