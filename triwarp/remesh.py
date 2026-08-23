@@ -1968,14 +1968,12 @@ def flip_to_delaunay(
         Optional length-``n_faces`` ``wp.bool`` mask; only edges interior to the ``True`` faces
         are flippable. ``None`` treats the whole mesh as flippable.
     max_angle_change
-        Maximum dihedral-angle change (radians) a flip may introduce
-        (``maxAngleChangeAfterFlip``). ``None`` disables the gate.
+        Maximum dihedral-angle change (radians) a flip may introduce. ``None`` disables the gate.
     max_deviation
-        Maximum surface deviation a flip may introduce (``maxDeviationAfterFlip``). ``None``
-        disables the gate.
+        Maximum surface deviation a flip may introduce. ``None`` disables the gate.
     critical_aspect_ratio
-        Triangle aspect ratio above which the dihedral-angle gate is lifted (so degenerate
-        triangles can still be repaired), matching ``criticalAspectRatioFlip``.
+        Triangle aspect ratio above which the dihedral-angle gate is lifted, so degenerate
+        triangles can still be repaired.
     max_iter
         Maximum number of parallel flip passes.
 
@@ -2909,13 +2907,13 @@ def subdivide_region_to_size(
     max_iter
         Maximum number of subdivision passes.
     max_splits
-        Optional soft cap on the total number of edge splits (``maxEdgeSplits``). ``None`` keeps
+        Optional soft cap on the total number of edge splits. ``None`` keeps
         splitting until convergence and raises if ``max_iter`` is exhausted first.
     delaunay
         When ``True`` (default), interleave and finish with the Delaunay flip pass.
     max_angle_change
-        Dihedral-angle-change gate (radians) for the flip pass
-        (``maxAngleChangeAfterFlip``; default 30°). ``None`` disables the gate.
+        Dihedral-angle-change gate (radians) for the flip pass (default 30°). ``None`` disables
+        the gate.
     max_deviation
         Surface-deviation gate for the flip pass. ``None`` disables it.
 

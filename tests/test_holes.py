@@ -659,17 +659,17 @@ def test_fill_min_weight_matches_meshlib(
     _, mesh_wp = request.getfixturevalue(mesh_name)
     n_orig = int(mesh_wp.indices.shape[0])
 
-    tw_fill = tw.holes.fill_min_weight(mesh_wp.points, mesh_wp.indices, metric=metric).numpy()[
+    fill_wp = tw.holes.fill_min_weight(mesh_wp.points, mesh_wp.indices, metric=metric).numpy()[
         n_orig:
     ]
-    ml_fill = _meshlib_fill_triangles(mesh_wp.points, mesh_wp.indices, metric)
+    fill_ml = _meshlib_fill_triangles(mesh_wp.points, mesh_wp.indices, metric)
 
     # Same triangle count and same achieved optimum as MeshLib's exhaustive fillHole (the exact
     # triangulation can differ under ties / MeshLib's tie-breaking, so compare the cost).
-    assert len(tw_fill) // 3 == len(ml_fill) // 3
-    tw_total = _total_fill_metric(mesh_wp.points, mesh_wp.indices, tw_fill, metric)
-    ml_total = _total_fill_metric(mesh_wp.points, mesh_wp.indices, ml_fill, metric)
-    assert np.isclose(tw_total, ml_total, rtol=2e-3, atol=1e-3)
+    assert len(fill_wp) // 3 == len(fill_ml) // 3
+    total_wp = _total_fill_metric(mesh_wp.points, mesh_wp.indices, fill_wp, metric)
+    total_ml = _total_fill_metric(mesh_wp.points, mesh_wp.indices, fill_ml, metric)
+    assert np.isclose(total_wp, total_ml, rtol=2e-3, atol=1e-3)
 
 
 def test_fill_metric_scorer_matches_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:

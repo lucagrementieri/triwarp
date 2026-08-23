@@ -14,7 +14,10 @@ from tests.comparisons import canonical_winding, undirected_edges
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     numpy_to_meshlib,
+    numpy_to_pymeshfix,
     numpy_to_warp,
+    pymeshfix_face_remap,
+    pymeshfix_intersecting_faces,
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
@@ -653,6 +656,76 @@ def test_face_self_intersecting_mask_two_boxes_matches_meshlib(device: str) -> N
 
     assert int(mask_ml.sum()) == 12  # non-vacuity: the reference found the crossing
     assert np.array_equal(mask_wp.numpy(), mask_ml)
+
+
+@pytest.mark.parity("face_self_intersecting_mask", "pymeshfix")
+@pytest.mark.parity(
+    "is_self_intersecting",
+    "pymeshfix",
+    benchmarked=False,
+    reason="is_self_intersecting has no benchmark group of its own -- it is the "
+    "any() of this mask and is timed as part of is_watertight -- so the "
+    "predicate is asserted here alongside the mask it reduces.",
+)
+@pytest.mark.parametrize("kind", ["boxes", "spheres", "clean"])
+def test_face_self_intersecting_mask_matches_pymeshfix(device: str, kind: str) -> None:
+    """
+    Class B, face for face: ``select_intersecting_triangles`` remapped to the input face order.
+
+    The transform is the remap and nothing else, and it has to be there twice over. The call writes
+    its ``n`` face indices into the **flat** prefix of an ``(n, 3)`` buffer and leaves ``2n``
+    entries of heap garbage behind them -- measured ``arr.max()`` of 30 751 against 640 faces, a
+    value that varies between processes -- so the read goes through
+    [`pymeshfix_intersecting_faces`][tests.conversions.pymeshfix_intersecting_faces]. And those
+    indices address the buffer ``return_arrays`` gives back, which is a reordering of the input's
+    even when nothing was repaired, so they go through
+    [`pymeshfix_face_remap`][tests.conversions.pymeshfix_face_remap], which refuses outright if the
+    load changed the mesh.
+
+    Where both libraries analyse the mesh they were handed, they agree **exactly**: 12 of 24 faces
+    on two interpenetrating boxes, 72 of 640 on two icospheres translated 1.2 apart, and 0 of 320
+    on a clean one. That makes this the strongest pymeshfix pair in the suite and the reason it is
+    the anchor -- it exercises the converter, the tail drop, the remap and the mask in one assert,
+    so a plumbing error here is unambiguous where a derived-scalar comparison would absorb it.
+
+    Non-vacuous in both directions by construction: two of the three inputs intersect and the third
+    does not, and the intersecting counts are asserted rather than merely compared, so a reference
+    that silently returned nothing would fail.
+
+    ``tris_per_cell`` and ``justproper`` are passed explicitly at values measured to be no-ops
+    (10 / 50 / 200 crossed with False / True all return 72 on the sphere pair) rather than left to
+    default, so a future wheel that starts honouring either one fails here instead of drifting.
+    """
+    if kind == "boxes":
+        first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+        second_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+        second_tm.apply_translation([0.5, 0.5, 0.5])
+        mesh_tm = tm.util.concatenate([first_tm, second_tm])
+        mesh_tm.merge_vertices()
+        n_expected = 12
+    elif kind == "spheres":
+        first_tm = tm.creation.icosphere(subdivisions=2)
+        second_tm = tm.creation.icosphere(subdivisions=2)
+        second_tm.apply_translation([1.2, 0.0, 0.0])
+        mesh_tm = tm.util.concatenate([first_tm, second_tm])
+        n_expected = 72
+    else:
+        mesh_tm = tm.creation.icosphere(subdivisions=2)
+        n_expected = 0
+
+    tin_pmf = numpy_to_pymeshfix(mesh_tm.vertices, mesh_tm.faces)
+    assert tin_pmf.n_faces == mesh_tm.faces.shape[0]  # the remap below needs an untouched load
+    faces_pmf = pymeshfix_face_remap(tin_pmf, mesh_tm.faces)[
+        pymeshfix_intersecting_faces(tin_pmf, tris_per_cell=50, justproper=False)
+    ]
+
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    mask_wp = tw.validation.face_self_intersecting_mask(vertices_wp, faces_wp)
+
+    assert faces_pmf.shape[0] == n_expected  # non-vacuity: the reference answered this input
+    assert np.array_equal(np.flatnonzero(mask_wp.numpy()), np.sort(faces_pmf))
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    assert tw.validation.is_self_intersecting(mesh_wp) is (n_expected > 0)
 
 
 @pytest.mark.parity("face_self_intersecting_mask", "meshlib")

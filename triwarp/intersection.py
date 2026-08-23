@@ -646,8 +646,8 @@ def collision_masks(
     Which faces of each mesh are involved in a collision with the other, as one mask per mesh.
 
     [`mesh_collision_pairs`][triwarp.intersection.mesh_collision_pairs] reduced to the two questions
-    a repair or a selection actually asks -- *which of my faces are in trouble* -- and the form
-    MeshLib's ``findCollidingTriangleBitsets`` returns. It exists as its own entry point because
+    a repair or a selection actually asks -- *which of my faces are in trouble* -- and the form a
+    per-mesh collision bitset takes. It exists as its own entry point because
     deriving it from the pairs means scattering a **column** of a rank-2 array, and a column is a
     strided view that Warp's Python-scope gather silently misreads (CLAUDE.md section 4).
 

@@ -205,11 +205,11 @@ def inflate(
     gentler on a mesh with fine triangles: the early passes let the relaxation redistribute
     before the later ones push hard.
 
-    !!! note "Not MeshLib's solver"
-        ``inflate`` there displaces and then solves an *implicit* Laplacian system, where this
-        runs one explicit pass -- so the two produce different surfaces from the same ``pressure``,
-        and the tests compare the properties an inflation must have (volume grows, the displacement
-        is normal-aligned) rather than positions. Pass the result through
+    !!! note "Not the implicit formulation"
+        The reference inflations displace and then solve an *implicit* Laplacian system, where
+        this runs one explicit pass -- so the two produce different surfaces from the same
+        ``pressure``, and the tests compare the properties an inflation must have (volume grows,
+        the displacement is normal-aligned) rather than positions. Pass the result through
         [`filter_implicit_fairing`][triwarp.smoothing.filter_implicit_fairing] if you want that
         formulation; it is CUDA-only, which is why it is not the default here.
 

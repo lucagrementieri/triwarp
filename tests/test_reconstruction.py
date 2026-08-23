@@ -51,11 +51,11 @@ def _meshlib_triangulate(
     points_np: np.ndarray, normals_np: np.ndarray, num_neighbours: int
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reconstruct a reference mesh via MeshLib, returning ``(vertices, faces)`` numpy arrays."""
-    cloud_mm = points_to_meshlib(points_np, normals_np)
-    params_mm = mm.TriangulationParameters()
-    params_mm.numNeighbours = num_neighbours
-    mesh_mm = mm.triangulatePointCloud(cloud_mm, params_mm)
-    return mn.getNumpyVerts(mesh_mm), mn.getNumpyFaces(mesh_mm.topology)
+    cloud_ml = points_to_meshlib(points_np, normals_np)
+    params_ml = mm.TriangulationParameters()
+    params_ml.numNeighbours = num_neighbours
+    mesh_ml = mm.triangulatePointCloud(cloud_ml, params_ml)
+    return mn.getNumpyVerts(mesh_ml), mn.getNumpyFaces(mesh_ml.topology)
 
 
 def _sphere_cloud(subdivisions: int) -> tuple[np.ndarray, np.ndarray]:
@@ -314,20 +314,20 @@ def test_matches_meshlib_reference(device: str, subdivisions: int):
     points_np, normals_np = _sphere_cloud(subdivisions)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
-    vertices_mm, faces_mm = _meshlib_triangulate(points_np, normals_np, 18)
+    vertices_ml, faces_ml = _meshlib_triangulate(points_np, normals_np, 18)
     vertices_wp, faces_wp = tw.reconstruction.triangulate_point_cloud(
         points_wp, normals_wp, num_neighbours=18
     )
     faces_wp_np = faces_wp.numpy().reshape(-1, 3).astype(np.int64)
-    faces_mm_np = np.asarray(faces_mm, dtype=np.int64)
+    faces_ml_np = np.asarray(faces_ml, dtype=np.int64)
 
-    assert faces_mm_np.shape[0] > 0  # non-vacuity: the reference reconstructed something
-    assert abs(faces_wp_np.shape[0] - faces_mm_np.shape[0]) <= max(2, faces_mm_np.shape[0] // 100)
+    assert faces_ml_np.shape[0] > 0  # non-vacuity: the reference reconstructed something
+    assert abs(faces_wp_np.shape[0] - faces_ml_np.shape[0]) <= max(2, faces_ml_np.shape[0] // 100)
     # Both index the input cloud, so the face sets are comparable without a vertex remap.
-    assert np.allclose(vertices_mm, points_np, rtol=1e-5, atol=1e-5)
+    assert np.allclose(vertices_ml, points_np, rtol=1e-5, atol=1e-5)
     assert np.allclose(vertices_wp.numpy(), points_np, rtol=1e-5, atol=1e-5)
     assert np.array_equal(
-        lexsort_rows(canonical_winding(faces_wp_np)), lexsort_rows(canonical_winding(faces_mm_np))
+        lexsort_rows(canonical_winding(faces_wp_np)), lexsort_rows(canonical_winding(faces_ml_np))
     )
 
 
@@ -362,21 +362,21 @@ def test_torus_matches_meshlib_reference(device: str):
         ).mean()
     )
 
-    vertices_mm, faces_mm = _meshlib_triangulate(points_np, normals_np, 16)
+    vertices_ml, faces_ml = _meshlib_triangulate(points_np, normals_np, 16)
     vertices_wp, faces_wp = tw.reconstruction.triangulate_point_cloud(
         points_wp, normals_wp, num_neighbours=16
     )
     faces_wp_np = faces_wp.numpy().reshape(-1, 3).astype(np.int64)
-    faces_mm_np = np.asarray(faces_mm, dtype=np.int64)
+    faces_ml_np = np.asarray(faces_ml, dtype=np.int64)
 
-    assert faces_mm_np.shape[0] > 0  # non-vacuity
-    assert abs(faces_wp_np.shape[0] - faces_mm_np.shape[0]) <= max(2, faces_mm_np.shape[0] // 100)
+    assert faces_ml_np.shape[0] > 0  # non-vacuity
+    assert abs(faces_wp_np.shape[0] - faces_ml_np.shape[0]) <= max(2, faces_ml_np.shape[0] // 100)
     assert (
         hausdorff_surface_two_sided(
             vertices_wp.numpy().astype(np.float64),
             faces_wp_np,
-            np.asarray(vertices_mm, dtype=np.float64),
-            faces_mm_np,
+            np.asarray(vertices_ml, dtype=np.float64),
+            faces_ml_np,
         )
         < 0.01 * mean_edge
     )

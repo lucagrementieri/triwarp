@@ -76,6 +76,7 @@ test = [
     "numpy>=2.4.4",
     "open3d>=0.18",
     "potpourri3d>=1.4",
+    "pymeshfix>=0.18.1",
     "pymeshlab>=2023.12",
     "pytest>=9.0",
     "pyvista>=0.48",

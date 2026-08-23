@@ -670,9 +670,7 @@ def _correspondences(
         return distance_mesh, triangle_id_mesh
 
     assert target_index is not None
-    index, distance = tw.neighbors.query_nearest(
-        target_vertices, current, 1, **target_index
-    )
+    index, distance = tw.neighbors.query_nearest(target_vertices, current, 1, **target_index)
     # Not ``tw.array.gather``: ``closest`` is allocated once outside the ICP loop, and a gather
     # would add one allocation per iteration.
     wp.copy(closest, target_vertices[index])

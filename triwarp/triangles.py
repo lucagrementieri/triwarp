@@ -145,7 +145,7 @@ def corner_normals(
         [`triwarp.vertices`][triwarp.vertices]' four vertex-normal functions: ``"angle"`` is the
         corner angle (Thuerrner & Wuethrich) and ``"area"`` is the face's own area, constant across
         its three corners. Both are offered because the two reference implementations disagree --
-        MeshLib's ``computePerCornerNormals`` is the **area** one.
+        the one that computes per-corner normals directly is the **area** one.
     twins
         Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins].
     n_vertices

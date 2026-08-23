@@ -181,10 +181,11 @@ def vertex_normals(
     content of the choice, and ``weighting`` selects it. Contributions are summed per vertex and
     L2-normalized, so any constant factor in the weights cancels.
 
-    Which weighting to want is a measurable question, not a preference: MeshLib's
-    ``computePerVertNormals`` reproduces ``"area"`` to **1.19e-07** and its
-    ``computePerVertPseudoNormals`` reproduces ``"angle"`` to **1.19e-07**, while each sits
-    **6.8e-03** from the other's partner. Reach for ``"angle"`` when the answer must not depend on
+    Which weighting to want is a measurable question, not a preference: one reference library
+    ships both conventions as separate entry points, and its plain per-vertex normals reproduce
+    ``"area"`` to **1.19e-07** while its pseudo-normals reproduce ``"angle"`` to **1.19e-07** --
+    each sitting **6.8e-03** from the other's partner, so the two are distinguishable well above
+    float32 noise. Reach for ``"angle"`` when the answer must not depend on
     how a neighbouring polygon happened to be triangulated -- it is the only one of the three that
     is invariant to that -- and for ``"area"`` otherwise, since it is what libigl and most of the
     field default to.

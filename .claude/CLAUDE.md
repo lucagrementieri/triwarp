@@ -1024,6 +1024,143 @@ where the surface has one rim; a properly built open mesh reports the correct co
 `tests/conftest.py` fixtures (`hemisphere`, `half_torus`), and **assert the hole count** before
 comparing a per-hole answer.
 
+**pymeshfix** (nanobind over Marco Attene's MeshFix / the TMesh kernel, mirrored under
+`reference/pymeshfix`) is a hard test dependency like the five above — `import pymeshfix` plainly and
+reach the low-level class as `from pymeshfix import _meshfix`, never through
+`pytest.importorskip`; reference variables take a **`_pmf`** suffix. Build every `PyTMesh` through
+`tests.conversions.numpy_to_pymeshfix` / `trimesh_to_pymeshfix` / `warp_to_pymeshfix` and read one
+back with `pymeshfix_to_numpy`, `pymeshfix_intersecting_faces` or `pymeshfix_face_remap` — the
+converters exist because the raw calls are unsafe in three separate ways listed below. It is the
+**narrowest deep** reference here: `dir(PyTMesh)` is 19 members, of which **nine are algorithms**
+(`fill_small_boundaries`, `select_intersecting_triangles`, `strong_degeneracy_removal`,
+`strong_intersection_removal`, `clean`, `remove_smallest_components`, `join_closest_components`,
+`fix_connectivity`, plus the module-level `clean_from_arrays`) against MeshLib's 246 — and all nine
+are *repair*, which is where triwarp has 20 public functions and, before this, only trimesh's
+`repair` module and MeshLib as oracles. It performs one operation no other reference here does end to
+end: arrays of a broken digitised surface in, a single watertight solid out. Do **not** plan a
+comparison for anything else: there is no curvature, geodesic, parametrization, registration,
+reconstruction, decimation, remeshing, point-cloud, boolean, proximity or signed-distance entry
+point, and the C++ names for several of those (`cutAndStitch`, `iterativeEdgeSwaps`,
+`loopSubdivision`, `isInnerPoint`, `openToDisk`, `marchIntersections.cpp`) are in the headers and
+**unbound** — the libigl lesson, one notch worse, since here only nine algorithms of a ~120-method
+class are reachable. Ten hazards, all measured:
+
+- **`load_array` is not a load; it is already a repair, and it renumbers.** It runs the kernel's
+  connectivity fix and Euler update before returning. Measured on `icosphere(1)` (42 v / 80 f): a
+  trailing *or* interior unreferenced vertex is dropped (43 → 42, surviving positions and their
+  relative order intact); an exactly duplicated face is **kept** and the non-manifold edges it
+  creates are cut instead (80 → **81 f**, 42 → **45 v**), while a *reversed* duplicate is refused
+  and the vertices are still cut; two coincident *referenced* vertices are **not** merged; one
+  backwards face is rewound and *every* face backwards is left alone (volume −3.6587 in and out),
+  because consistent is not outward. On the scan meshes `bunny_decimated` loads as
+  **8 372 v / 16 220 f** from 8 171 / 16 301 and `bunny` as **34 834 v / 69 451 f** (its 1 113
+  unreferenced vertices); `dragon` is unchanged. On a non-orientable closed surface it cuts the
+  orientation-reversing seam — `boy` 1 483 → **1 559 v** at an unchanged 2 964 faces — leaving two
+  coincident sheets where the surface had one, which is why `select_intersecting_triangles` reads
+  436 there against triwarp's 177 and the number is not a disagreement. So **every comparison must
+  be index-free** (positions, canonically sorted rows, sets, counts); where a face index is
+  unavoidable, go through `pymeshfix_face_remap`, which checks the load first and refuses rather
+  than guessing. The flip side is that `load_array` is itself an oracle — for
+  `remove_unreferenced_vertices`, for `make_winding_consistent`, and partly for
+  `split_non_manifold_vertices`.
+- **One `PyTMesh` serves one load and one mutating call.** A second `load_array` raises
+  `RuntimeError: Cannot load arrays after arrays have already been loaded`, and every algorithm
+  mutates in place and returns a status, a count or an array — never the mesh. So build a fresh
+  object per comparison and per benchmark round: the `new_mesh_ml` shape, and here there is no
+  cached alternative at all.
+- **`select_intersecting_triangles` returns a mostly-uninitialised array.** It allocates `(n, 3)`
+  `int32` and writes the `n` face indices into the **flat** prefix, leaving `2n` entries of heap
+  garbage. Measured on two `icosphere(2)`s translated 1.2 apart: shape `(72, 3)`, a flat prefix of
+  72 ascending indices all below 640, and `arr.max()` reading **30 751** — a value that varies
+  between processes. `out.ravel()[: out.shape[0]]` is the only defined read; go through
+  `pymeshfix_intersecting_faces`. The prefix *is* deterministic (identical across repeat calls and
+  across a fresh object), so a naive `np.array_equal(out1, out2)` reports nondeterminism that is not
+  there.
+- **`tris_per_cell` and `justproper` are no-ops on ordinary input.** Measured on that same pair,
+  `tris_per_cell` ∈ {10, 50, 200} crossed with `justproper` ∈ {False, True} all return **72**.
+  `tris_per_cell` tunes the broad phase and should not change the answer; `justproper` should, and
+  does not on any fixture probed. Pass both explicitly at those values so a wheel that starts
+  honouring either one fails a test rather than drifting, and do **not** build a triwarp flag around
+  `justproper` until a fixture is found where its two settings differ.
+- **`nbe` is inclusive, and both docstrings say otherwise.** `fill_small_boundaries(nbe, …)` fills
+  loops of **at most** `nbe` boundary edges where the C++ comment and the Python docstring say "less
+  than". Measured on a 24-edge rim: `nbe` 23 → **0** patched, 24 → **1**, 25 → 1. `nbe = 0` means
+  all.
+- **The "MeshFix could not fix everything" line on stderr is printed when it *succeeded*.** The
+  wrapper does `if (result) cerr << …` where `result` is *true only if the mesh was completely
+  cleaned*. Measured: `clean_from_arrays` printed it for both `bunny_decimated` and `bunny` and both
+  outputs are watertight with χ = 2, while `clean()` on a clean `icosphere(3)` returns **True**. The
+  message is inverted, `set_quiet` does not suppress it, and **nothing about it may be used as a
+  signal** — read the boolean, or read the mesh. Every builder sets `set_quiet(True)` so a benchmark
+  round does not print it once per repetition.
+- **`remove_smallest_components` ranks by face count, not area or diameter, and returns the number
+  removed.** Measured on three disjoint spheres — 80 f, 320 f, and 80 f at radius 10, much the
+  largest by area and diameter — it removed **2** and kept the **320-face** one (extent
+  `[2, 2, 2]`). It always reduces to exactly one component. That is the rule
+  `repair.remove_small_components(keep_largest=True)` defaults to.
+- **The output face buffer is a reordering, even when nothing was repaired.** `icosphere(2)` round
+  trips with **byte-identical float64 vertices** (max abs difference `0.0`) and an identical
+  triangle *set* under `np.sort(rows, axis=1)` plus a lexsort, but the rows come back in a different
+  order and each starts at a different corner. Never compare face buffers positionally.
+- **`n_boundaries` is a property in 0.18.1, and `boundaries()` raises.** The older Cython wheel
+  exposed `boundaries()`; the nanobind one keeps the name bound only to raise `"boundaries() is
+  deprecated. Use n_boundaries instead."`, and `n_points` / `n_faces` became properties in the same
+  change. Code written against an example older than 0.17 fails with
+  `TypeError: 'int' object is not callable`.
+- **`trimesh.slice_plane`'s output is a poor input**, the same hazard the MeshLib block records and
+  worse here: a hemisphere sliced from `icosphere(2)` without `merge_vertices()` loads as
+  121 → **137 v** and reports **17** boundary loops where the surface has one; after
+  `merge_vertices()` it loads unchanged at 97 v and reports **1**. Use the `tests/conftest.py`
+  fixtures, and **assert `n_boundaries`** before comparing a per-hole answer.
+
+**It is single-threaded**, which makes its ratios easy to read: measured on `bunny`,
+`select_intersecting_triangles` runs 435 ms of wall clock against 435 ms of `process_time`, a ratio
+of **1.00**. So it belongs with trimesh / igl / pymeshlab / pyvista rather than with `meshlib`.
+
+**Benchmark rule: on most rows the load *is* the row.** Because a `PyTMesh` takes exactly one load,
+the build has to sit inside the timed callable (`BenchCase.new_tmesh_pmf()`), so every pymeshfix row
+prices the load — measured 67.9 ms on `bunny_decimated` and 439.6 ms on `bunny`, against 64.2 /
+435.3 ms for `select_intersecting_triangles`, 5.8 / 51.4 ms for `fill_small_boundaries` and
+6.7 / 60.5 ms for `remove_smallest_components`. **Create a `pymeshfix` row only where the operation
+is at least ~30 % of the round, and state the measured share in the group docstring.** By that rule
+the intersection family (49–50 %) and `clean_from_arrays` (68–73 %) are timed, and the hole-fill
+(8–10 %) and component-removal (9–12 %) comparisons carry
+`pytest.mark.parity(<group>, "pymeshfix", benchmarked=False, reason=…)` with the ratio in the reason.
+Cap it at `bunny`; `dragon` is seconds of load plus seconds of query per round.
+
+**Licensing: pymeshfix is GPL-3.0**, and the TMesh headers under `reference/pymeshfix/src/` carry
+Attene's dual licence — GPLv3 *or* a commercial agreement with IMATI-GE/CNR. triwarp ships
+`MIT OR Apache-2.0`. This is a **different** constraint from MeshLib's and conflating the two
+over- or under-restricts:
+
+| | MeshLib | pymeshfix |
+|---|---|---|
+| May `triwarp/` name it? | **No** | **Yes**, in `Notes` / `See Also` — pymeshlab is GPL and is named throughout |
+| May `triwarp/` be derived from its source? | No | **No** |
+| May `tests/` and `benchmarks/` import it? | Yes | Yes |
+| Why | proprietary, restricts *use* | copyleft, restricts *distribution of derivatives* |
+
+So: read `reference/pymeshfix/src/` for the interface and the parameters, never for the body; cite
+the **paper** rather than the file when porting — Attene, *"A lightweight approach to repairing
+digitized polygon meshes"* (The Visual Computer 26, 2010) for the repair pipeline and the
+component-joining rule, Liepa, *"Filling holes in meshes"* (SGP 2003) §3 for the density refinement,
+Barequet & Sharir (1995) for the loop pairing — and keep
+`grep -rnE 'MeshFix|Basic_TMesh|TMesh|_meshfix' triwarp/` empty. Prose mentions of `pymeshfix`
+itself are allowed there; C++ symbols are not.
+
+**And the precedence rule, which is the part a future author most needs and would never guess:**
+
+> **Where pymeshfix and MeshLib both answer a question and their answers differ, triwarp's default
+> is pymeshfix's answer and MeshLib's is reachable by a flag** — not the reverse. Where only MeshLib
+> answers it, nothing changes.
+
+The reason is not preference. A function whose *behaviour* was pinned against MeshLib alone is a
+function whose specification lives in a proprietary binary nobody may read; pymeshfix's source is
+mirrored and readable by anyone. The one place this currently bites is `holes.fill_small`, which
+takes a **perimeter** threshold because MeshLib's `fillHoles` does, where pymeshfix and pymeshlab
+both take a **boundary-edge count** — two of three references cannot express the incumbent
+signature.
+
 ### Mesh fixtures (prefer over inline construction)
 
 Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes in each test. Fixtures return `(mesh_tm: tm.Trimesh, mesh_wp: wp.Mesh)` via `tests.conversions.trimesh_to_warp`.
@@ -1147,8 +1284,9 @@ Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `un
 `trimesh_to_open3d_t`, `trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`,
 `trimesh_to_pyvista`, `points_to_pyvista`, `pyvista_edges_to_indices`, `numpy_to_meshlib`,
 `trimesh_to_meshlib`, `warp_to_meshlib`, `points_to_meshlib`, `meshlib_to_trimesh`,
-`numpy_to_meshlib_bitset`, `meshlib_scalars_to_numpy`, `meshlib_bitset_to_numpy`, `faces_igl`,
-`mesh_igl`)
+`numpy_to_meshlib_bitset`, `meshlib_scalars_to_numpy`, `meshlib_bitset_to_numpy`,
+`numpy_to_pymeshfix`, `trimesh_to_pymeshfix`, `warp_to_pymeshfix`, `pymeshfix_to_numpy`,
+`pymeshfix_intersecting_faces`, `pymeshfix_face_remap`, `faces_igl`, `mesh_igl`)
 rather than re-rolling either. **Check both modules before writing a private helper in a test
 file** — every one of the six consolidated in 2026-08 was written by someone who did not, and
 `undirected_edges` alone had been spelled three different ways across six files.

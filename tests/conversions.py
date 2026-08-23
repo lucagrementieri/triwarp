@@ -11,6 +11,7 @@ import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
+from pymeshfix import _meshfix
 from scipy.spatial import cKDTree
 
 
@@ -534,6 +535,169 @@ def meshlib_bitset_to_numpy(bitset_ml: object, size: int) -> np.ndarray:
     if flags_np.shape[0] > size:
         raise ValueError(f"bitset holds {flags_np.shape[0]} bits, more than the {size} elements")
     return np.pad(flags_np, (0, size - flags_np.shape[0]))
+
+
+def numpy_to_pymeshfix(vertices_np: np.ndarray, faces_np: np.ndarray) -> _meshfix.PyTMesh:
+    """
+    Build a ``pymeshfix._meshfix.PyTMesh`` from a NumPy ``(vertices, faces)`` pair.
+
+    **Vertices first**, like every other builder here, and quiet by default -- ``set_quiet(True)``
+    goes in before the load because the kernel narrates to stderr and one of its messages is
+    reported *inverted* (see below).
+
+    !!! warning "``load_array`` is not a load; it is already a repair, and it renumbers"
+        It runs the kernel's connectivity fix and Euler update before returning, so the mesh that
+        comes back is not the mesh that went in. Measured on a 42-vertex / 80-face icosphere: a
+        trailing *or* interior unreferenced vertex is dropped (43 -> 42, surviving positions and
+        their relative order intact); an exactly duplicated face is **kept** and the non-manifold
+        edges it creates are cut instead (80 f -> 81 f, 42 v -> **45 v**), while a *reversed*
+        duplicate is refused and the vertices are still cut; two coincident referenced vertices are
+        **not** merged; one backwards face is rewound, and *every* face backwards is left alone,
+        because consistent is not the same as outward (volume -3.6587 in and out).
+
+        On the scan meshes: ``bunny_decimated`` 8 171 v / 16 301 f loads as **8 372 v / 16 220 f**
+        and ``bunny`` 35 947 v / 69 451 f as **34 834 v / 69 451 f** (its 1 113 unreferenced
+        vertices). On a non-orientable closed surface it cuts the orientation-reversing seam --
+        ``boy`` 1 483 v -> 1 559 v at an unchanged 2 964 faces -- which leaves two coincident sheets
+        where the surface had one.
+
+        So **every comparison against this reference must be index-free**: positions, canonically
+        sorted face rows, sets and counts. Where a face index is unavoidable, assert the load
+        changed nothing first (``n_points == len(v) and n_faces == len(f)``) and build the map from
+        the *returned* buffer -- which is what
+        [`pymeshfix_intersecting_faces`][tests.conversions.pymeshfix_intersecting_faces] does.
+
+    One ``PyTMesh`` serves **one load and one mutating call**: a second ``load_array`` raises
+    ``RuntimeError``, and every algorithm mutates in place and returns a status, a count or an
+    array rather than the mesh. So this returns a fresh object every call and there is no cached
+    form -- the ``numpy_to_meshlib`` rule, not the ``trimesh_to_open3d`` one.
+
+    See Also
+    --------
+    [`pymeshfix_to_numpy`][tests.conversions.pymeshfix_to_numpy]
+        The inverse, whose face buffer is a reordering even when nothing was repaired.
+    [`trimesh_to_pymeshfix`][tests.conversions.trimesh_to_pymeshfix]
+    [`warp_to_pymeshfix`][tests.conversions.warp_to_pymeshfix]
+    """
+    tin_pmf = _meshfix.PyTMesh()
+    tin_pmf.set_quiet(True)
+    tin_pmf.load_array(
+        np.ascontiguousarray(vertices_np, dtype=np.float64),
+        np.ascontiguousarray(np.asarray(faces_np).reshape(-1, 3), dtype=np.int32),
+    )
+    return tin_pmf
+
+
+def trimesh_to_pymeshfix(mesh: tm.Trimesh) -> _meshfix.PyTMesh:
+    """
+    Wrap a ``tm.Trimesh`` in a fresh ``pymeshfix._meshfix.PyTMesh``.
+
+    Thin front end on [`numpy_to_pymeshfix`][tests.conversions.numpy_to_pymeshfix]; its renumbering
+    and one-call-per-object notes both apply.
+
+    !!! warning "A ``trimesh.slice_plane`` output is a poor input"
+        The same hazard the MeshLib converters carry, and worse here. A hemisphere sliced from
+        ``icosphere(2)`` without ``merge_vertices()`` loads as 121 v -> **137 v** and reports **17**
+        boundary loops where the surface has one; after ``merge_vertices()`` it loads unchanged at
+        97 v and reports **1**. Use the ``tests/conftest.py`` fixtures, which already merge, and
+        assert ``n_boundaries`` before comparing a per-hole answer.
+    """
+    return numpy_to_pymeshfix(mesh.vertices, mesh.faces)
+
+
+def warp_to_pymeshfix(vertices_wp: wp.array, faces_wp: wp.array) -> _meshfix.PyTMesh:
+    """
+    Read triwarp's ``(vertices, flat faces)`` pair into a fresh ``pymeshfix._meshfix.PyTMesh``.
+
+    Use this when the mesh under test is a triwarp *output* rather than one of the
+    ``tests/conftest.py`` fixtures (which carry a ``tm.Trimesh`` for
+    [`trimesh_to_pymeshfix`][tests.conversions.trimesh_to_pymeshfix]). Same renumbering and
+    one-call-per-object rules as [`numpy_to_pymeshfix`][tests.conversions.numpy_to_pymeshfix].
+    """
+    return numpy_to_pymeshfix(vertices_wp.numpy(), faces_wp.numpy())
+
+
+def pymeshfix_to_numpy(tin_pmf: _meshfix.PyTMesh) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Read a ``PyTMesh`` back as ``(vertices, faces)``, and say why the buffers may not line up.
+
+    ``return_arrays()`` unchanged -- this exists so the warning has one home rather than being
+    restated at every call site.
+
+    !!! warning "The face buffer is a reordering, even when nothing was repaired"
+        ``icosphere(2)`` round trips with **byte-identical float64 vertices** (max abs difference
+        ``0.0``) and an identical *triangle set* under ``np.sort(rows, axis=1)`` plus a lexsort, but
+        the rows come back in a different order and each row starts at a different corner. Never
+        compare face buffers positionally; and remember the vertex buffer itself may be a different
+        length than the input's -- see
+        [`numpy_to_pymeshfix`][tests.conversions.numpy_to_pymeshfix].
+    """
+    return tin_pmf.return_arrays()
+
+
+def pymeshfix_intersecting_faces(tin_pmf: _meshfix.PyTMesh, **kwargs: object) -> np.ndarray:
+    """
+    Face indices from ``select_intersecting_triangles``, with the uninitialised tail dropped.
+
+    The call allocates an ``(n, 3)`` ``int32`` array and writes its ``n`` face indices into the
+    **flat** prefix, leaving ``2n`` entries of heap garbage. Measured on two ``icosphere(2)``s
+    translated 1.2 apart (640 faces): shape ``(72, 3)``, a flat prefix of 72 ascending indices all
+    below 640, and ``arr.max()`` reading **30 751** -- a value that varies between processes. So
+    ``out.ravel()[: out.shape[0]]`` is the only defined read, and a naive
+    ``np.array_equal(out1, out2)`` over two calls reports nondeterminism that is not there: the
+    prefix is identical across repeat calls and across a fresh object, only the tail is not.
+
+    Indices address the **returned** face buffer, which is a reordering of the input's
+    ([`pymeshfix_to_numpy`][tests.conversions.pymeshfix_to_numpy]), so a comparison against a
+    triwarp per-face mask has to remap through the canonical sorted rows. The result is sorted, so
+    it compares directly against ``np.flatnonzero`` of a mask once remapped.
+    """
+    out_pmf = tin_pmf.select_intersecting_triangles(**kwargs)
+    return np.sort(out_pmf.ravel()[: out_pmf.shape[0]])
+
+
+def pymeshfix_face_remap(tin_pmf: _meshfix.PyTMesh, faces_np: np.ndarray) -> np.ndarray:
+    """
+    Map each *returned* face of a ``PyTMesh`` back to its index in ``faces_np``.
+
+    The one sanctioned way to compare a pymeshfix per-face answer against a triwarp mask, and it
+    raises rather than guessing when that is not possible. Two things stand between the two index
+    spaces: ``load_array`` may add or drop faces and vertices before anything else runs, and even
+    when it does not, the buffer that comes back is a *reordering* whose rows also start at
+    different corners ([`pymeshfix_to_numpy`][tests.conversions.pymeshfix_to_numpy]).
+
+    So this checks the face count first, then keys both buffers by their canonically sorted rows --
+    which also catches a load that renumbered the *vertices* at an unchanged face count, since the
+    keys then match nothing (``boy`` loads as 1 559 vertices from 1 483 with all 2 964 faces
+    intact). A caller does ``remap[pymeshfix_intersecting_faces(tin_pmf, ...)]`` and compares that
+    against ``np.flatnonzero(mask_wp.numpy())``.
+
+    Raises
+    ------
+    ValueError
+        If the load changed the face count, if the input faces are not distinct as unordered rows,
+        or if a returned face is not one of the input's.
+
+    See Also
+    --------
+    [`pymeshfix_intersecting_faces`][tests.conversions.pymeshfix_intersecting_faces]
+    """
+    faces_in = np.ascontiguousarray(np.asarray(faces_np).reshape(-1, 3))
+    _, faces_out = tin_pmf.return_arrays()
+    if len(faces_out) != len(faces_in):
+        raise ValueError(
+            f"load_array changed the mesh ({len(faces_in)} faces in, {len(faces_out)} back); "
+            "no face-index remap exists -- compare counts, sets or positions instead"
+        )
+    index_of = {tuple(sorted(row)): i for i, row in enumerate(faces_in.tolist())}
+    if len(index_of) != len(faces_in):
+        raise ValueError("input faces are not distinct as unordered rows; no remap exists")
+    try:
+        return np.array(
+            [index_of[tuple(sorted(row))] for row in faces_out.tolist()], dtype=np.int64
+        )
+    except KeyError as error:
+        raise ValueError(f"returned face {error.args[0]} is not an input face") from error
 
 
 def warp_to_trimesh(vertices_wp: wp.array, faces_wp: wp.array) -> tm.Trimesh:

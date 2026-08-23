@@ -90,6 +90,8 @@ _LIBRARY_SUFFIXES: dict[str, frozenset[str]] = {
     "potpourri3d": frozenset({"_pp"}),
     "pymeshlab": frozenset({"_pml"}),
     "pyvista": frozenset({"_pv"}),
+    "meshlib": frozenset({"_ml"}),
+    "pymeshfix": frozenset({"_pmf"}),
 }
 
 # The second half of the anti-vacuity signal: a test may consult a reference without ever naming
@@ -126,6 +128,28 @@ _LIBRARY_ROOTS: dict[str, frozenset[str]] = {
         {"ml", "trimesh_to_pymeshlab", "warp_to_pymeshlab", "points_to_pymeshlab"}
     ),
     "pyvista": frozenset({"pv", "trimesh_to_pyvista", "points_to_pyvista"}),
+    "meshlib": frozenset(
+        {
+            "mm",
+            "mn",
+            "numpy_to_meshlib",
+            "trimesh_to_meshlib",
+            "warp_to_meshlib",
+            "points_to_meshlib",
+            "meshlib_to_trimesh",
+        }
+    ),
+    "pymeshfix": frozenset(
+        {
+            "pymeshfix",
+            "_meshfix",
+            "numpy_to_pymeshfix",
+            "trimesh_to_pymeshfix",
+            "warp_to_pymeshfix",
+            "pymeshfix_to_numpy",
+            "pymeshfix_intersecting_faces",
+        }
+    ),
 }
 
 

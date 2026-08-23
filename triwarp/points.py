@@ -155,9 +155,10 @@ def half_space_mask(
     Notes
     -----
     The test is **strict**, so a point exactly on the plane is excluded and the two masks for
-    opposite normals are disjoint rather than overlapping. That is the convention MeshLib's
-    ``findHalfSpacePoints`` uses (measured: with the plane ``z = 1``, a point at ``z = 1`` is in
-    neither half), and it makes the pair of masks a partition of the points off the plane.
+    opposite normals are disjoint rather than overlapping. That is the convention a reference
+    half-space split also takes (measured against one: with the plane ``z = 1``, a point at
+    ``z = 1`` is in neither half), and it makes the pair of masks a partition of the points off
+    the plane.
 
     See Also
     --------

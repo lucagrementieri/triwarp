@@ -323,7 +323,7 @@ def is_self_intersecting(mesh: wp.Mesh, *, max_triangle_collisions: int = 32) ->
     narrow phase runs Moller's interval test on each candidate pair, skipping pairs that share a
     vertex. Mirrors Open3D's ``IsSelfIntersecting`` (AABB pre-test followed by a triangle-triangle
     test on non-neighbouring faces). Coplanar and merely touching pairs are **not** intersections
-    -- MeshLib's ``touchIsIntersection=False`` convention.
+    -- contact alone does not count.
 
     Parameters
     ----------
@@ -383,21 +383,31 @@ def face_self_intersecting_mask(
     the six self-intersecting parametric surfaces plus a self-intersecting torus, at a
     scale-relative tolerance of ``1e-9``:
 
-    | input | reference | this | MeshLib |
-    |---|---|---|---|
-    | ``boy`` | 177 | **177** | 177 |
-    | ``klein`` | 203 | **203** | 203 |
-    | ``bohemian_dome`` | 161 | **161** | 161, 1 wrong either way |
-    | ``figure8_klein`` | 174 | **174** | 190, 16 wrong |
-    | ``torus`` (16x16) | 64 | **64** | 64 |
-    | ``cross_cap`` | 73 | 74 | 74 |
-    | ``roman`` | 154 | 158 | 158 |
+    | input | reference | this | second library | pymeshfix |
+    |---|---|---|---|---|
+    | ``boy`` | 177 | **177** | 177 | 436 (cut) |
+    | ``klein`` | 203 | **203** | 203 | **203** |
+    | ``bohemian_dome`` | 161 | **161** | 161, 1 wrong either way | 168 |
+    | ``figure8_klein`` | 174 | **174** | 190, 16 wrong | 336 (cut) |
+    | ``torus`` (16x16) | 64 | **64** | 64 | **64** |
+    | ``cross_cap`` | 73 | 74 | 74 | 336 (cut) |
+    | ``roman`` | 154 | 158 | 158 | 514 (cut) |
 
-    Exact on five of seven, and identical to MeshLib on the other two -- where both differ from the
-    reference by 4 faces or fewer, all of them a vertex lying *on* the other triangle's plane, which
-    is a tolerance choice rather than a fact. In ``float32`` the same audit read 20 false positives
-    and 88 false negatives on ``roman`` alone, 2 and 4 on the torus, and 1 false negative on the
-    dome. The cost is ~4 % of this call (the narrow phase is 6-8 % of it and doubles).
+    Exact on five of seven, and identical to the second library on the other two -- where both
+    differ from the reference by 4 faces or fewer, all of them a vertex lying *on* the other
+    triangle's plane, which is a tolerance choice rather than a fact. In ``float32`` the same audit
+    read 20 false positives and 88 false negatives on ``roman`` alone, 2 and 4 on the torus, and 1
+    false negative on the dome. The cost is ~4 % of this call (the narrow phase is 6-8 % of it and
+    doubles).
+
+    The pymeshfix column is the newest and it reads two ways at once. Where it analyses the mesh it
+    was handed, it agrees **exactly** -- 203 on ``klein``, 64 on the torus -- and on the tangency
+    class it lands 7 faces away, the same order as every other implementation. The four rows marked
+    *(cut)* are not disagreements: its loader repairs connectivity before anything else and cuts the
+    orientation-reversing seam of a non-orientable surface, taking ``boy`` from 1 483 to 1 559
+    vertices at an unchanged 2 964 faces. That leaves two coincident sheets where the surface had
+    one, and every face along the cut then genuinely does intersect. So a comparison against it has
+    to establish that the load changed nothing before it means anything.
 
     Where a comparison against another library is wanted on the singular-curve class (``roman``,
     ``cross_cap``), compare **counts, not sets**: which faces sit exactly on a tangency is the part

@@ -385,7 +385,7 @@ def triangles_intersect(
     # Do two triangles cross transversally? Moller's interval test: each triangle is cut by the
     # other's plane into an interval along the planes' intersection line, and they intersect exactly
     # when those two intervals overlap. Coplanar and merely touching configurations are **not**
-    # intersections here, which is MeshLib's ``touchIsIntersection=False`` convention and the one
+    # intersections here, which is the "contact is not intersection" convention and the one
     # ``validation.face_self_intersecting_mask`` documents.
     #
     # This replaced an 11-axis separating-axis test, and the reason is exactness rather than speed.
@@ -394,8 +394,9 @@ def triangles_intersect(
     # projected onto the zero axis anyway, where every interval collapses to ``[0, 0]`` and the test
     # reads "overlapping", so a pair separated only along such an axis was reported as intersecting.
     # Measured against an exact float64 arbiter: **64 false positives of 128 flagged faces** on a
-    # 16x16 self-intersecting torus (where MeshLib and the arbiter agree exactly on 64), and **42 of
-    # the 45** faces the old code flagged on ``bohemian_dome`` that MeshLib did not. Both were
+    # 16x16 self-intersecting torus (where the reference and the arbiter agree exactly on 64), and
+    # **42 of the 45** faces the old code flagged on ``bohemian_dome`` that the reference did not.
+    # Both were
     # previously recorded as a "tangential contact divergence"; most of it was this.
     #
     # It is **0.86x** the SAT's speed, measured interleaved on an RTX 5090 over three

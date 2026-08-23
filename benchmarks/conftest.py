@@ -23,13 +23,13 @@ Flags
     Which ``triwarp`` targets to time. ``auto`` (default) uses cuda when CUDA is available,
     else falls back to cpu — ``triwarp-cpu`` is not timed alongside cuda by default. Pass
     ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl`` /
-    ``open3d`` / ``scipy`` / ``potpourri3d`` / ``pymeshlab`` / ``pyvista`` / ``meshlib`` CPU
-    baselines are always included.
+    ``open3d`` / ``scipy`` / ``potpourri3d`` / ``pymeshlab`` / ``pyvista`` / ``meshlib`` /
+    ``pymeshfix`` CPU baselines are always included.
 ``--size=<comma list | all>``
     Restrict meshes to these size categories (``small,medium,large,extralarge,huge``).
 ``--cpu-max-size=<category>``
     CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``, ``scipy``,
-    ``potpourri3d``, ``pymeshlab``, ``pyvista``, ``meshlib``) skip meshes
+    ``potpourri3d``, ``pymeshlab``, ``pyvista``, ``meshlib``, ``pymeshfix``) skip meshes
     larger than this unless the size was named explicitly in ``--size``. Default ``large`` — so
     ``happy_buddha`` and ``lucy`` run GPU-only by default while
     ``bunny_decimated``/``bunny``/``dragon`` run on CPU.
@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     import pymeshlab as ml
     import pyvista as pv
     from meshlib import mrmeshpy as mm
+    from pymeshfix._meshfix import PyTMesh
     from pytest_benchmark.fixture import BenchmarkFixture
 
 # Number of timed rounds and untimed warm-up rounds. The warm-up covers Warp kernel JIT
@@ -140,6 +141,26 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 # place, so the accessor is ``BenchCase.new_mesh_ml()`` (the ``new_meshset_pml`` shape) and there is
 # no cached property.
 #
+# ``pymeshfix`` (nanobind bindings over MeshFix / the TMesh kernel) is CPU-only and
+# **single-threaded** -- measured on ``bunny``, ``select_intersecting_triangles`` runs 435 ms of
+# wall clock against 435 ms of ``process_time``, a ratio of 1.00 -- so it belongs with trimesh /
+# igl / pymeshlab / pyvista rather than with meshlib. It is also the *narrowest deep* reference
+# here: nine bound algorithms, all of them repair, against MeshLib's 246.
+#
+# One measured fact decides every row: **the load is a large and often dominant share of it.**
+# ``load_array`` is not a load but a connectivity repair, and a ``PyTMesh`` accepts exactly one load
+# and one mutating call (a second ``load_array`` raises), so the build has to go inside the timed
+# callable via ``BenchCase.new_tmesh_pmf()`` -- there is no cached form and no choice about it.
+# Measured, load / operation: ``bunny_decimated`` 67.9 / 64.2 ms for
+# ``select_intersecting_triangles``, 67.9 / 5.8 ms for ``fill_small_boundaries``, 67.9 / 6.7 ms for
+# ``remove_smallest_components``; ``bunny`` 439.6 / 435.3, 439.6 / 51.4, 439.6 / 60.5. So a
+# pymeshfix row is **only created where the operation is at least ~30 % of the round** -- the
+# intersection family (49-50 %) and ``clean_from_arrays`` (68-73 %) qualify, the hole-fill (8-10 %)
+# and component-removal (9-12 %) rows do not and carry
+# ``pytest.mark.parity(..., benchmarked=False)`` with the ratio in the reason instead. Every row
+# states its measured share in its docstring, and rows are capped at ``bunny``: ``dragon`` is
+# seconds of load plus seconds of query per round.
+#
 # ``numpy`` is the narrowest baseline of all: it is only a reference for the *array primitives*
 # (``triwarp.reduce``), where a host reduction over an already-resident NumPy buffer is the honest
 # CPU floor. It is deliberately not a geometry reference — every other CPU baseline is already
@@ -156,6 +177,7 @@ LIBRARIES: list[LibrarySpec] = [
     {"id": "pymeshlab", "kind": "pymeshlab", "device": None, "cpu_bound": True},
     {"id": "pyvista", "kind": "pyvista", "device": None, "cpu_bound": True},
     {"id": "meshlib", "kind": "meshlib", "device": None, "cpu_bound": True},
+    {"id": "pymeshfix", "kind": "pymeshfix", "device": None, "cpu_bound": True},
 ]
 LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
 
@@ -327,6 +349,38 @@ def face_bitset_ml(mask_np: np.ndarray) -> mm.FaceBitSet:
 def _new_mesh_ml(name: str) -> mm.Mesh:
     """Build a fresh ``meshlib.mrmeshpy.Mesh`` from the shared NumPy source."""
     return mesh_ml_from_numpy(*_load_numpy(name))
+
+
+def tmesh_pmf_from_numpy(vertices: np.ndarray, faces: np.ndarray) -> PyTMesh:
+    """
+    Build a ``pymeshfix._meshfix.PyTMesh`` from a NumPy pair, **vertices first** and quiet.
+
+    The benchmark-side twin of ``tests.conversions.numpy_to_pymeshfix`` (the two suites do not
+    import each other). ``set_quiet(True)`` is not cosmetic: the kernel narrates to stderr and one
+    of its messages is reported inverted, so a row that left it on would print
+    "MeshFix could not fix everything" once per round on meshes it repaired successfully.
+
+    ``load_array`` is itself a connectivity repair -- it renumbers and may change both counts -- so
+    a row asserting anything about the result reads the counts off the ``PyTMesh``, never off the
+    input arrays.
+
+    Imported lazily (like ``meshio``, ``open3d``, ``pymeshlab``, ``pyvista`` and ``meshlib`` above)
+    so the pymeshfix import is only paid by runs that include a pymeshfix case.
+    """
+    from pymeshfix import _meshfix
+
+    tin_pmf = _meshfix.PyTMesh()
+    tin_pmf.set_quiet(True)
+    tin_pmf.load_array(
+        np.ascontiguousarray(vertices, dtype=np.float64),
+        np.ascontiguousarray(np.asarray(faces).reshape(-1, 3), dtype=np.int32),
+    )
+    return tin_pmf
+
+
+def _new_tmesh_pmf(name: str) -> PyTMesh:
+    """Build a fresh ``PyTMesh`` from the shared NumPy source."""
+    return tmesh_pmf_from_numpy(*_load_numpy(name))
 
 
 def _vertices_wp(name: str, device: str) -> wp.array[wp.vec3]:
@@ -516,7 +570,8 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "benchlibs(*kinds): library kinds "
-        "(triwarp/trimesh/igl/open3d/scipy/numpy/potpourri3d/pymeshlab/pyvista/meshlib) a "
+        "(triwarp/trimesh/igl/open3d/scipy/numpy/potpourri3d/pymeshlab/pyvista/meshlib/"
+        "pymeshfix) a "
         "benchmark supports.",
     )
     config.addinivalue_line(
@@ -815,6 +870,25 @@ class BenchCase(BenchLibrary):
         - A mutating call **invalidates** that tree, so the two decisions are not independent.
         """
         return _new_mesh_ml(self.mesh_name)
+
+    def new_tmesh_pmf(self) -> PyTMesh:
+        """
+        Build a **fresh** ``pymeshfix._meshfix.PyTMesh``; call this *inside* the timed callable.
+
+        A method rather than a cached property, and unlike ``new_mesh_ml`` there is no alternative:
+        a ``PyTMesh`` accepts exactly **one** ``load_array`` (a second raises ``RuntimeError``) and
+        every one of its nine algorithms mutates in place and returns a status, a count or an array
+        rather than the mesh. So a shared object could not even be reloaded, let alone reused.
+
+        The consequence is that **every pymeshfix row prices the load**, and the load is not small:
+        67.9 ms on ``bunny_decimated`` and 439.6 ms on ``bunny``, against 64.2 / 435.3 ms for
+        ``select_intersecting_triangles``, 5.8 / 51.4 ms for ``fill_small_boundaries`` and
+        6.7 / 60.5 ms for ``remove_smallest_components``. A row whose operation is a small share of
+        that total reports the load and reads as pymeshfix being an order of magnitude slower at
+        the operation than it is -- so rows exist only above ~30 %, and each states its share. See
+        the ``pymeshfix`` paragraph in the LIBRARIES comment block for the full rule.
+        """
+        return _new_tmesh_pmf(self.mesh_name)
 
 
 @pytest.fixture

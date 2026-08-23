@@ -289,7 +289,7 @@ def test_is_volume(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="face_self_intersecting_mask")
 @pytest.mark.benchaxis("overlap")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pymeshfix")
 def test_face_self_intersecting_mask(bench_case: BenchCase) -> None:
     """
     The per-face self-intersection flags, which ``is_watertight`` reduces to a single bool.
@@ -304,7 +304,26 @@ def test_face_self_intersecting_mask(bench_case: BenchCase) -> None:
     against ``triwarp-cuda``. ``touchIsIntersection=False`` is the setting that matches triwarp and
     is passed explicitly; the tree is built lazily on first use, so the mesh is constructed outside
     the timed callable and the row prices the query.
+
+    pymeshfix's ``select_intersecting_triangles`` returns the same set exactly -- 12 of 24 faces on
+    two interpenetrating boxes, 72 of 640 on two translated icospheres, 0 on a clean one, all
+    asserted in ``tests/test_validation.py`` -- from a uniform grid broad phase rather than a tree,
+    single-threaded. It is the one pymeshfix row in this file, because it is the one where the
+    operation clears the 30 % share the load leaves: measured **49 %** on ``bunny_decimated``
+    (64.2 ms of query against 67.9 ms of load) and **50 %** on ``bunny`` (435.3 against 439.6). The
+    load is inside the timed callable and cannot be moved out -- a ``PyTMesh`` takes exactly one
+    ``load_array`` -- so read this row as query-plus-load and halve it for the query alone.
+    ``tris_per_cell`` is its broad-phase bucket size and was measured not to change the answer at
+    10 / 50 / 200.
     """
+    if bench_case.kind == "pymeshfix":
+        faces_pmf = bench_case.run(
+            lambda: bench_case.new_tmesh_pmf().select_intersecting_triangles(
+                tris_per_cell=50, justproper=False
+            )
+        )
+        assert faces_pmf.shape[0] <= bench_case.n_faces
+        return
     if bench_case.kind == "meshlib":
         mesh_part_ml = mm.MeshPart(bench_case.new_mesh_ml())
         colliding_ml = bench_case.run(
