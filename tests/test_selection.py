@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import numpy as np
+import open3d as o3d
 import pytest
 import pyvista as pv
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
+from scipy.spatial import KDTree
 
 import triwarp as tw
 import triwarp.typing as twt
-from tests.comparisons import undirected_edges
+from tests.comparisons import lexsort_rows, undirected_edges
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     numpy_to_meshlib,
@@ -20,7 +22,9 @@ from tests.conversions import (
     points_to_warp,
     pyvista_edges_to_indices,
     trimesh_to_meshlib,
+    trimesh_to_open3d,
     trimesh_to_pymeshlab,
+    trimesh_to_pyvista,
 )
 
 
@@ -360,6 +364,97 @@ def test_submesh_from_face_indices_empty(device: str) -> None:
     )
     assert submesh_vertices_wp.shape == (0,)
     assert submesh_faces_wp.shape == (0,)
+
+
+@pytest.mark.parity("submesh_from_face_indices", "open3d", "pyvista")
+def test_submesh_from_face_indices_matches_open3d_and_pyvista(
+    request: pytest.FixtureRequest,
+) -> None:
+    """
+    Class B: the same triangles, once all three answers are lifted into the input's numbering.
+
+    All three libraries compact the vertex buffer -- measured on ``icosphere(2)``'s upper half,
+    152 of 320 faces referencing **89** of 162 vertices, and all three return 89. What differs is
+    how each one tells you the mapping back:
+
+    | | vertices returned | how the input's numbering is recovered |
+    |---|---|---|
+    | triwarp | 89 | ``return_index=True`` returns the map |
+    | pyvista ``extract_cells`` | 89 | ``vtkOriginalPointIds`` on the result's point data |
+    | open3d ``select_faces_by_mask`` | 89 | **no map at all** -- matched by position |
+
+    open3d's row is the one that needs care. With no map returned, its positions are matched against
+    the input's vertex table by nearest neighbour, which is sound only because every kept position
+    is a *copy* of an input position rather than a recomputation -- asserted as a residual below
+    1e-06
+    plus a bijection check. An exact key lookup would raise, since its tensor API stores ``float32``
+    where the input is ``float64``.
+
+    **The plan this came from recorded that open3d and pyvista "keep every vertex", and both
+    halves were wrong** -- measured on a selection that happened to reference all of them. An
+    interleaved face set does exactly that, which is why the fixture here is a **spatial** half:
+    with every vertex still referenced, all three compactions are no-ops and the whole transform
+    goes untested.
+
+    **pymeshlab cannot be compared here at all, and the reason is its interface.** It has no
+    array-valued face-selection setter -- a selection comes from a
+    ``compute_selection_by_condition_per_face`` *expression* over face attributes, which can
+    express a contiguous range (``fi<80``) and not an arbitrary index set. Asserted on the range
+    form, so the limitation is pinned and the filter is exercised on the one shape it accepts.
+
+    Non-vacuous: a strict face subset that leaves 73 vertices unreferenced, so neither an empty nor
+    a whole-mesh answer would pass and every compaction is real.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue("icosphere_coarse")
+    n_faces = mesh_tm.faces.shape[0]
+    # A spatial half rather than every other face: an interleaved set still references every
+    # vertex, so triwarp's compaction would be a no-op and the transform would go untested.
+    upper_np = np.asarray(mesh_tm.vertices)[np.asarray(mesh_tm.faces)].mean(axis=1)[:, 2] > 0.0
+    indices_np = np.flatnonzero(upper_np).astype(np.int32)
+    assert 0 < indices_np.shape[0] < n_faces  # non-vacuity: a strict subset
+    indices_wp = wp.array(indices_np, dtype=wp.int32, device=mesh_wp.points.device)
+
+    sub_vertices_wp, sub_faces_wp, vertex_map_wp = tw.selection.submesh_from_face_indices(
+        mesh_wp.points, mesh_wp.indices, indices_wp, unique_indices=True, return_index=True
+    )
+    # triwarp's faces, lifted back into the input's vertex numbering.
+    faces_wp = vertex_map_wp.numpy()[sub_faces_wp.numpy().reshape(-1, 3)]
+    assert int(sub_vertices_wp.shape[0]) < mesh_tm.vertices.shape[0]  # it really compacted
+
+    mask_np = np.zeros(n_faces, dtype=bool)
+    mask_np[indices_np] = True
+    mesh_o3d = o3d.t.geometry.TriangleMesh.from_legacy(trimesh_to_open3d(mesh_tm))
+    selected_o3d = mesh_o3d.select_faces_by_mask(
+        o3d.core.Tensor(mask_np, dtype=o3d.core.Dtype.Bool)
+    )
+    # open3d compacts and returns no vertex map, so its positions are matched to the input's by
+    # nearest neighbour -- its tensor API stores float32, so an exact key lookup raises KeyError.
+    positions_o3d = selected_o3d.vertex.positions.numpy().astype(np.float64)
+    residual_o3d, original_o3d = KDTree(np.asarray(mesh_tm.vertices)).query(positions_o3d)
+    assert residual_o3d.max() < 1e-6  # every kept position is a copy, not a recomputation
+    assert np.unique(original_o3d).shape[0] == original_o3d.shape[0]  # and the match is a bijection
+    faces_o3d = original_o3d[selected_o3d.triangle.indices.numpy().astype(np.int64)]
+
+    extracted_pv = trimesh_to_pyvista(mesh_tm).extract_cells(indices_np)
+    original_pv = np.asarray(extracted_pv.point_data["vtkOriginalPointIds"])
+    faces_pv = original_pv[np.asarray(extracted_pv.cells_dict[5])]
+
+    # All three compact to the same vertex count, which is the referenced set.
+    assert positions_o3d.shape[0] == int(sub_vertices_wp.shape[0])
+    assert extracted_pv.n_points == int(sub_vertices_wp.shape[0])
+    for reference_faces in (faces_o3d, faces_pv):
+        assert reference_faces.shape[0] == indices_np.shape[0]
+        assert np.array_equal(
+            lexsort_rows(np.sort(reference_faces, axis=1)),
+            lexsort_rows(np.sort(faces_wp.astype(np.int64), axis=1)),
+        )
+
+    # pymeshlab's selection is an expression, so only a contiguous range can be handed to it.
+    half = n_faces // 2
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.compute_selection_by_condition_per_face(condselect=f"fi<{half}")
+    meshset_pml.generate_from_selected_faces()
+    assert int(meshset_pml.current_mesh().face_number()) == half
 
 
 @pytest.mark.parity("submesh_from_face_indices", "trimesh")

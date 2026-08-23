@@ -420,6 +420,16 @@ def test_sample_surface_blue_noise_empty_faces(icosahedron: tuple[tm.Trimesh, wp
     assert face_indices.shape == (0,)
 
 
+@pytest.mark.parity(
+    "sample_volume",
+    "trimesh",
+    benchmarked=False,
+    reason="trimesh.sample.volume_mesh is rejection sampling against a ray-parity containment "
+    "test, so it returns a variable number of points for a requested count and its cost is the "
+    "mesh's fill ratio rather than the count -- timing it against an exact fan decomposition "
+    "would compare a stochastic method with a deterministic one. What is comparable is its "
+    "containment predicate, which is what this test uses it for.",
+)
 def test_sample_volume_containment(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     """
     Class C (containment): every sample must be inside, with trimesh as the inside/outside oracle.

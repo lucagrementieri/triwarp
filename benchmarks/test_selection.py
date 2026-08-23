@@ -244,7 +244,7 @@ def _face_indices(bench_case: BenchCase) -> tuple:
 
 @pytest.mark.benchmark(group="submesh_from_face_indices")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pyvista")
 @pytest.mark.parametrize("unique_indices", [False, True], ids=["dedup", "presorted"])
 def test_submesh_from_face_indices(bench_case: BenchCase, unique_indices: bool) -> None:
     """
@@ -253,7 +253,50 @@ def test_submesh_from_face_indices(bench_case: BenchCase, unique_indices: bool) 
     ``unique_indices=True`` is the promise ``combine.split`` makes on every component, so the gap
     between these two rows is what the fast path buys there -- and ``split``'s per-component host
     sequence is the largest single slowness path the axis set has surfaced.
+
+    Three references, and all three do the same two things triwarp does -- gather the faces and
+    **compact** the vertex buffer (measured: 89 of 162 vertices on a spatial half of
+    ``icosphere(2)``, from all three). So the rows are like-for-like on the work; what differs is
+    the interface, in two ways that both cost something. open3d takes a *mask* rather than an index
+    list, so building one is part of its row -- an ``O(n_faces)`` scatter against triwarp's
+    ``O(len(indices))`` gather. And open3d returns **no vertex map**, where triwarp's
+    ``return_index`` and pyvista's ``vtkOriginalPointIds`` both do, which is why the correctness
+    comparison has to match its positions instead (``tests/test_selection.py``).
+
+    **pymeshlab is absent for an interface reason rather than a cost one.** It has no array-valued
+    face-selection setter: a selection has to be produced by a
+    ``compute_selection_by_condition_per_face`` *expression* over face attributes, so it can express
+    a contiguous range (``fi<80``) and not an arbitrary index list. This group's input is a random
+    index set, which that filter cannot be handed at all.
     """
+    if bench_case.kind == "open3d":
+        import open3d as o3d
+
+        if unique_indices:
+            pytest.skip("open3d takes a mask, so it has no presorted fast path to compare against")
+        _indices_wp, indices_np = _face_indices(bench_case)
+        mesh_o3d = o3d.t.geometry.TriangleMesh.from_legacy(bench_case.mesh_o3d)
+        n_faces = bench_case.n_faces
+
+        def select_faces_o3d() -> int:
+            mask_np = np.zeros(n_faces, dtype=bool)
+            mask_np[indices_np] = True
+            return int(
+                mesh_o3d.select_faces_by_mask(
+                    o3d.core.Tensor(mask_np, dtype=o3d.core.Dtype.Bool)
+                ).triangle.indices.shape[0]
+            )
+
+        assert bench_case.run(select_faces_o3d) <= indices_np.shape[0]
+        return
+    if bench_case.kind == "pyvista":
+        if unique_indices:
+            pytest.skip("pyvista has no presorted fast path to compare against")
+        _indices_wp, indices_np = _face_indices(bench_case)
+        mesh_pv = bench_case.mesh_pv
+        extracted_pv = bench_case.run(lambda: mesh_pv.extract_cells(indices_np))
+        assert extracted_pv.n_cells == indices_np.shape[0]
+        return
     if bench_case.kind == "triwarp":
         indices_wp, _indices_np = _face_indices(bench_case)
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
