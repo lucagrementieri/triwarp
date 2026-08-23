@@ -159,19 +159,26 @@ def test_unique_rows_vec3(device: str):
         )
 
 
-@pytest.mark.parity("unique_faces", "igl")
+@pytest.mark.parity("unique_faces", "igl", "trimesh")
 def test_unique_faces(device: str):
     """
-    Class B (rows sorted): ``igl.unique_simplices`` returns the sorted rows, triwarp the winding.
+    Class B twice: igl returns the sorted rows and trimesh returns a mask; triwarp the winding.
 
     Both dedup faces up to vertex permutation and both return the inverse map. The difference is the
     *representative*: igl documents ``FF == sort(F(IA, :), 2)``, so its rows come out ascending,
     while triwarp keeps the first occurrence's original winding -- the property the last two asserts
     below pin, and the reason the igl comparison sorts triwarp's rows first.
 
+    ``Trimesh.unique_faces`` is the third implementation and does strictly less: it returns a
+    per-face **bool mask** marking the survivors rather than rebuilding the buffer, so its transform
+    is a ``flatnonzero`` and the comparison is on the surviving *set*. It is also
+    orientation-agnostic, which is the property this group turns on and the reason it belongs here
+    rather than beside ``unique_rows`` -- measured on a sphere plus a flipped copy of 20 of its
+    faces, 320 kept of 340.
+
     The input deliberately contains both a rotation (``[2, 0, 1]``) and a reflection (``[2, 1, 0]``)
     of face 0, so a dedup that collapsed only rotations -- i.e. an orientation-*sensitive* one --
-    would report four unique faces instead of three and fail against both references.
+    would report four unique faces instead of three and fail against all three references.
     """
     # Faces sharing the same three vertices (any orientation) collapse to one representative.
     faces_np = np.array(
@@ -198,6 +205,16 @@ def test_unique_faces(device: str):
         np.ascontiguousarray(faces_np, dtype=np.int64)
     )[:3]
     assert np.array_equal(lexsort_rows(np.sort(unique_faces_np, axis=1)), lexsort_rows(unique_igl))
+
+    # trimesh returns a survivor *mask* over the input faces, so compare the sets it selects.
+    vertices_np = np.zeros((int(faces_np.max()) + 1, 3), dtype=np.float64)
+    vertices_np[:, 0] = np.arange(vertices_np.shape[0])
+    mask_tm = tm.Trimesh(vertices_np, faces_np, process=False).unique_faces()
+    assert int(np.count_nonzero(mask_tm)) == n_unique_np
+    assert np.array_equal(
+        lexsort_rows(np.sort(faces_np[mask_tm], axis=1)),
+        lexsort_rows(np.sort(unique_faces_np, axis=1)),
+    )
     # The two inverse maps agree as *partitions* of the input, whatever the slot numbering.
     assert same_partition(inverse, np.asarray(inverse_igl).ravel())
 

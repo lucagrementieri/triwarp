@@ -714,7 +714,7 @@ def test_query_geodesic_ball(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="closest_pair")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "scipy")
 def test_closest_pair(bench_case: BenchCase) -> None:
     """
     The cloud's *minimum* spacing: the same ``k=2`` self-query, reduced to one pair.
@@ -729,12 +729,29 @@ def test_closest_pair(bench_case: BenchCase) -> None:
     ``nearest_neighbor_distance`` row does -- otherwise the second round onward would time a query
     against a warm tree while triwarp rebuilds its BVH inside every call.
 
+    scipy reaches the same answer through the ``k=2`` self-query its sibling
+    ``nearest_neighbor_distance`` row already times, plus an ``argmin`` over the second column. So
+    the two groups share a reference *and* an input, and the difference between their scipy rows is
+    exactly that reduction -- which is the same thing the triwarp pair measures, on the other side
+    of the host/device line. Its ``KDTree`` build is inside the timed callable, like triwarp's BVH.
+
     First measurement, medians on an RTX 5090: triwarp-cuda **1.34 ms** against meshlib's **8.44**
     at ``sphere_large``, **0.74** against **5.37** at ``sphere_med`` and **0.54** against **6.01**
     at ``sphere_small`` -- so unlike most reductions in this suite the GPU row wins at every size,
     and the reason is that the query dominates rather than the reduce. Read meshlib's *medians*:
     dropping the cached tree per round leaves it with a 2-20 ms spread where triwarp's is under 5%.
     """
+    if bench_case.kind == "scipy":
+        points_np = bench_case.vertices_np
+
+        def closest_pair_np() -> tuple[int, int, float]:
+            distances, indices = KDTree(points_np).query(points_np, k=2)
+            nearest = int(np.argmin(distances[:, 1]))
+            return nearest, int(indices[nearest, 1]), float(distances[nearest, 1])
+
+        _first, _second, spacing = bench_case.run(closest_pair_np)
+        assert spacing >= 0.0
+        return
     if bench_case.kind == "meshlib":
         cloud_ml = _cloud_ml(bench_case)  # held in a name: the tree is a raw pointer into it
 

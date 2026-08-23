@@ -1215,12 +1215,17 @@ def test_nearest_neighbor_distance_coincident_and_degenerate(device: str) -> Non
         assert np.all(np.isinf(answer_wp))
 
 
-@pytest.mark.parity("closest_pair", "meshlib")
+@pytest.mark.parity("closest_pair", "meshlib", "scipy")
 def test_closest_pair_matches_meshlib(device: str) -> None:
     """
-    Class A: the same pair and the same distance as ``findTwoClosestPoints``, plus brute force.
+    Class A against ``findTwoClosestPoints``, Class B against scipy, plus an exhaustive oracle.
 
-    Three answers compared, two of them independent implementations and one exhaustive: the
+    scipy's transform is the one its benchmark row runs: ``KDTree.query(points, k=2)`` gives every
+    point's nearest *other* point, and an ``argmin`` over the second column reduces that to this
+    function's answer -- the same reduction the sibling ``nearest_neighbor_distance`` group leaves
+    out, which is what makes the two scipy rows differ by exactly it.
+
+    Four answers compared, three of them independent implementations and one exhaustive: the
     ``O(n^2)`` NumPy distance matrix settles what the answer *is*, so the meshlib row proves the
     reference agrees rather than defining the truth. The cloud is random and therefore tie-free,
     which is what makes the *pair* comparable at all -- ties are a real possibility on a lattice and
@@ -1249,6 +1254,13 @@ def test_closest_pair_matches_meshlib(device: str) -> None:
     per_point_wp = tw.neighbors.nearest_neighbor_distance(points_wp).numpy()
     assert int(np.argmin(per_point_wp)) == index_a_wp
     assert np.isclose(float(per_point_wp.min()), distance_wp, rtol=1e-6, atol=1e-6)
+
+    # scipy, through the k=2 self-query its benchmark row times, reduced by an argmin.
+    distances_np, indices_np = KDTree(points_np).query(points_np, k=2)
+    nearest_np = int(np.argmin(distances_np[:, 1]))
+    assert nearest_np == index_a_np
+    assert int(indices_np[nearest_np, 1]) == index_b_np
+    assert np.isclose(float(distances_np[nearest_np, 1]), distance_wp, rtol=1e-6, atol=1e-6)
 
 
 def test_closest_pair_ties_and_degenerate(device: str) -> None:

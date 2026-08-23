@@ -708,6 +708,64 @@ def test_bfs_on_mesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
         assert np.array_equal(distances_wp.numpy(), distances_np)
 
 
+@pytest.mark.parity("bfs_multi_source", "scipy")
+def test_bfs_multi_source_matches_scipy_min_only(request: pytest.FixtureRequest) -> None:
+    """
+    Class B (a reduction): scipy's min-only distance *field* against triwarp's reachable *sets*.
+
+    ``csgraph.dijkstra(unweighted=True, indices=sources, min_only=True)`` is the multi-source
+    reduction in one call, and it is the call the benchmark row times -- so this is the comparison
+    that row rests on rather than the per-source loop ``test_bfs_multi_source_matches_single`` runs.
+    The two answers have different *shapes*, which is the whole of the transform: scipy returns one
+    distance per vertex over the entire vertex set, finite exactly where some source reaches it, and
+    triwarp returns the packed reachable set per source. So the union of triwarp's sets is scipy's
+    finite set, and that equality is asserted both ways.
+
+    Run on two topologies because the shapes only diverge on one of them. On a connected mesh every
+    source reaches everything and the union is trivially the whole vertex set -- which would pass
+    for a function that ignored ``sources`` entirely. The disconnected graph is the one that bites:
+    three sources in two of four components leave 2 of 12 vertices unreachable, so scipy reports two
+    infinities and triwarp's union must miss exactly those.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
+    unique_edges_wp, n_mesh = _mesh_vertex_edges(mesh_wp)
+    device = mesh_wp.device
+
+    disjoint_np = np.array(
+        [[0, 1], [1, 2], [3, 4], [4, 5], [6, 7], [7, 8], [9, 10], [10, 11]], dtype=np.int32
+    )
+    cases = (
+        (unique_edges_wp, n_mesh, [0, n_mesh // 3, n_mesh - 1], 0),
+        (wp.array(disjoint_np, dtype=wp.int32, device=device), 12, [0, 4, 5], 6),
+    )
+    for edges_wp, n_nodes, sources, n_unreachable in cases:
+        sources_np = np.array(sources, dtype=np.int32)
+        sources_wp = wp.array(sources_np, dtype=wp.int32, device=device)
+        adjacency = tw.graph.edges_to_csr(n_nodes, edges_wp)
+        neighbors_wp, offsets_wp = tw.graph.bfs_multi_source(adjacency, sources_wp)
+
+        graph_np = sp.coo_matrix(
+            (
+                np.ones(edges_wp.shape[0] * 2, dtype=np.float64),
+                (
+                    np.concatenate([edges_wp.numpy()[:, 0], edges_wp.numpy()[:, 1]]),
+                    np.concatenate([edges_wp.numpy()[:, 1], edges_wp.numpy()[:, 0]]),
+                ),
+            ),
+            shape=(n_nodes, n_nodes),
+        ).tocsr()
+        distances_np = csgraph.dijkstra(
+            graph_np, unweighted=True, indices=sources_np, min_only=True
+        )
+
+        reachable_np = set(np.flatnonzero(np.isfinite(distances_np)).tolist())
+        reachable_wp = set(neighbors_wp.numpy().tolist())
+        # Non-vacuity: on the disjoint graph the sources must leave something out.
+        assert n_nodes - len(reachable_np) == n_unreachable
+        assert reachable_wp == reachable_np
+        assert int(offsets_wp.shape[0]) == len(sources)
+
+
 def test_bfs_multi_source_matches_single(request: pytest.FixtureRequest) -> None:
     _mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
     unique_edges_wp, n = _mesh_vertex_edges(mesh_wp)

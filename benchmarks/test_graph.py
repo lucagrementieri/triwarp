@@ -86,7 +86,7 @@ import scipy.sparse as sp
 import warp as wp
 import warp.sparse as wps
 from meshlib import mrmeshpy as mm
-from scipy.sparse.csgraph import breadth_first_order
+from scipy.sparse.csgraph import breadth_first_order, dijkstra
 
 import triwarp as tw
 from conftest import BenchCase, skip_larger_than
@@ -305,7 +305,7 @@ def test_bfs(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="bfs_multi_source")
 @pytest.mark.benchaxis("components")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "scipy")
 @pytest.mark.parametrize("n_sources", _N_SOURCES)
 def test_bfs_multi_source(bench_case: BenchCase, n_sources: int) -> None:
     """
@@ -315,7 +315,25 @@ def test_bfs_multi_source(bench_case: BenchCase, n_sources: int) -> None:
     source reaches all 40 962 vertices, so the output is ``sources x V``, while on ``parts_1024``
     each source is trapped in its own 42-vertex sphere. Same call, output sizes three orders of
     magnitude apart.
+
+    scipy's ``csgraph.dijkstra(unweighted=True, min_only=True)`` is the multi-source reduction in
+    one call, and it is the reference the sibling ``bfs`` group's ``breadth_first_order`` cannot
+    be: that one takes a single source, so ``k`` of them would be ``k`` calls. Read the two rows as
+    different answers to the same question -- scipy returns one distance *field* over the whole
+    vertex set where triwarp returns the packed reachable *sets*, so at ``parts_1024`` triwarp's
+    output is three orders of magnitude smaller and scipy's is unchanged.
     """
+    if bench_case.kind == "scipy":
+        graph_np = _scipy_graph(bench_case)
+        rng = np.random.default_rng(_SOURCE_SEED)
+        sources_np = rng.integers(0, bench_case.n_vertices, size=n_sources).astype(np.int32)
+        distances_np = bench_case.run(
+            lambda: dijkstra(graph_np, unweighted=True, indices=sources_np, min_only=True),
+            rounds=_ROUNDS,
+        )
+        assert distances_np.shape == (bench_case.n_vertices,)
+        return
+
     adjacency = _adjacency(bench_case)
     rng = np.random.default_rng(_SOURCE_SEED)
     sources = wp.array(
