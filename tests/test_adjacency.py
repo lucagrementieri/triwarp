@@ -5,6 +5,7 @@ from __future__ import annotations
 import igl
 import numpy as np
 import pytest
+import scipy.sparse as sp
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -221,19 +222,49 @@ def test_face_adjacency_and_unshared_match_igl(
     assert np.array_equal(corners_igl[has_neighbour] >= 0, np.ones(has_neighbour.sum(), dtype=bool))
 
 
+def _face_labels_np(faces_np: np.ndarray) -> np.ndarray:
+    """
+    Label the face dual graph with scipy: shared edges become entries, then a component pass.
+
+    Written out rather than taken from a library because no reference builds the dual *and* labels
+    it in one call except igl's ``facet_components`` -- which is the other half of the comparison
+    below, so reusing it would be comparing igl with itself. This is the same two-phase shape
+    triwarp's function has and the same one ``benchmarks/test_graph.py`` times on the scipy row.
+    """
+    edges_np = np.sort(
+        np.concatenate((faces_np[:, [0, 1]], faces_np[:, [1, 2]], faces_np[:, [2, 0]])), axis=1
+    )
+    owner_np = np.tile(np.arange(faces_np.shape[0]), 3)
+    order_np = np.lexsort((edges_np[:, 1], edges_np[:, 0]))
+    edges_np, owner_np = edges_np[order_np], owner_np[order_np]
+    shared_np = np.flatnonzero(np.all(edges_np[1:] == edges_np[:-1], axis=1))
+    dual_np = sp.coo_matrix(
+        (np.ones(shared_np.size, dtype=np.int8), (owner_np[shared_np], owner_np[shared_np + 1])),
+        shape=(faces_np.shape[0], faces_np.shape[0]),
+    ).tocsr()
+    return sp.csgraph.connected_components(dual_np)[1]
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 @pytest.mark.parity("face_connected_component_labels", "igl")
+@pytest.mark.parity("face_connected_component_labels_depth", "igl", "scipy")
 def test_face_connected_component_labels_matches_igl(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    Class B: the same partition under different label *names*.
+    Class B: the same partition under different label *names*, against igl and scipy.
 
     ``igl.facet_components`` numbers components ``0..k-1`` in its own traversal order and returns
     ``(n_components, labels)`` -- the count **first**, which is the unpacking trap here. triwarp's
     label propagation names each component after a representative face instead, so on a
     two-component mesh it returns e.g. ``{0, 12}`` where igl returns ``{0, 1}``. The transform is
-    [`canonical_labels`][tests.comparisons.canonical_labels]: relabel by first appearance.
+    [`canonical_labels`][tests.comparisons.canonical_labels]: relabel by first appearance, which is
+    what [`same_partition`][tests.comparisons.same_partition] applies.
+
+    scipy is the second reference and is a genuinely different decomposition of the work: it builds
+    the dual graph explicitly (see [`_face_labels_np`]) and then labels it, where igl does both
+    internally and triwarp does both on the device. That is why the ``*_depth`` group -- whose
+    benchmark rows are all build-included -- claims both libraries here.
 
     Both a single-component fixture and a two-component union are checked, because a labelling that
     collapsed everything into one component would pass on the first alone.
@@ -247,6 +278,7 @@ def test_face_connected_component_labels_matches_igl(
 
     assert n_components_igl == np.unique(labels_wp.numpy()).shape[0]
     assert same_partition(labels_wp.numpy(), np.asarray(labels_igl).ravel())
+    assert same_partition(labels_wp.numpy(), _face_labels_np(faces_np))
 
     # Two disjoint copies: the labelling must split them, which a constant output would not.
     doubled_np = np.concatenate([faces_np, faces_np + faces_np.max() + 1])
@@ -260,6 +292,7 @@ def test_face_connected_component_labels_matches_igl(
 
     assert n_doubled_igl == 2 * n_components_igl
     assert same_partition(labels_doubled_wp.numpy(), np.asarray(labels_doubled_igl).ravel())
+    assert same_partition(labels_doubled_wp.numpy(), _face_labels_np(doubled_np))
 
 
 def _face_labels_ml(components_ml: object, n_faces: int) -> np.ndarray:

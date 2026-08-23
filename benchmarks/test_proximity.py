@@ -328,7 +328,7 @@ _crease_wp_cache: dict[tuple[str, str], twt.Array2dInt32] = {}
 
 def _crease_edges_np(bench_case: BenchCase) -> np.ndarray:
     """
-    The mesh's sharp edges at 30 degrees, built on the host once per mesh.
+    Build the mesh's sharp edges at 30 degrees on the host, cached once per mesh.
 
     Built with trimesh rather than with ``tw.seams.crease_edges`` so that **both** rows of the edge
     query get the identical edge set: ``vertices_wp`` is triwarp-only, so a triwarp-built set could
@@ -347,7 +347,7 @@ def _crease_edges_np(bench_case: BenchCase) -> np.ndarray:
 
 
 def _crease_edges_wp(bench_case: BenchCase) -> twt.Array2dInt32:
-    """The same edge set on the case's device, cached: it is an input, not part of the measurement."""
+    """Upload that edge set to the case's device, cached: an input, not part of the measure."""
     key = (bench_case.mesh_name, str(bench_case.device))
     if key not in _crease_wp_cache:
         _crease_wp_cache[key] = twt.as_array2d(
@@ -382,9 +382,10 @@ def test_closest_point_on_edges(bench_case: BenchCase) -> None:
 
     First measurement, medians on an RTX 5090 at 10 000 queries: triwarp-cuda **2.94 ms** on
     ``bunny`` against pyvista's **68.3** (23x), and 12.1 / 32.2 / 89.9 ms at ``dragon`` /
-    ``happy_buddha`` / ``lucy`` -- the slope is the crease *count*, not the face count. The number to
-    read it against is ``closest_point_on_mesh``'s **2.21 ms** on the same queries and the same mesh:
-    this query is **1.33x slower over a set ~30x smaller**, so the hand-written deepening loop is
+    ``happy_buddha`` / ``lucy`` -- the slope is the crease *count*, not the face count. The
+    number to read it against is ``closest_point_on_mesh``'s **2.21 ms** on the same queries and
+    the same mesh: this query is **1.33x slower over a set ~30x smaller**, so the hand-written
+    deepening loop is
     losing to Warp's built-in mesh traversal rather than to the geometry. A query far from every
     crease pays several empty scans before the radius reaches anything, which is where that gap
     lives and what a future ``initial_radius`` estimate (the k-NN path already has one) would close.
@@ -642,7 +643,7 @@ _clearance_cache: dict[tuple[str, str, float], wp.array[wp.vec3]] = {}
 
 
 def _separated_vertices_wp(bench_case: BenchCase, offset: float) -> wp.array[wp.vec3]:
-    """A translated self-copy, far enough away to be disjoint -- the second mesh of the pair."""
+    """Translate a self-copy far enough away to be disjoint: the second mesh of the pair."""
     key = (bench_case.mesh_name, str(bench_case.device), offset)
     if key not in _clearance_cache:
         vertices_np = bench_case.vertices_np
@@ -665,8 +666,9 @@ def test_mesh_to_mesh_distance(bench_case: BenchCase, offset: float) -> None:
 
     The **separation is the axis**, and the direction it runs in was a surprise worth recording.
     The bound derived from the vertex query grows with the gap, so each face's query box grows with
-    it -- which predicts that a distant pair is the expensive one. Measured, it is the **cheap** one:
-    8.78 ms against 12.89 on ``bunny``, and 5.32 against 11.46 on ``dragon``. Once the running
+    it -- which predicts that a distant pair is the expensive one. Measured, it is the **cheap**
+    one: 8.78 ms against 12.89 on ``bunny``, and 5.32 against 11.46 on ``dragon``. Once the
+    running
     minimum prunes by box-to-box gap, a large true clearance means almost every candidate is
     rejected on that lower bound immediately, while a tight clearance leaves many pairs genuinely
     close and each one has to be measured.
@@ -687,8 +689,9 @@ def test_mesh_to_mesh_distance(bench_case: BenchCase, offset: float) -> None:
     | ``happy_buddha`` | 1 087 716 | 7.90 / 7.25 ms | (capped) |
     | ``lucy`` | | 882.8 / 795.9 ms | (capped) |
 
-    Two things that table says. It is **nearly flat in the face count** -- 40k costs more than 871k --
-    so the cost is the candidate count, not the mesh; ``bunny_decimated`` is the slowest per face
+    Two things that table says. It is **nearly flat in the face count** -- 40k costs more than
+    871k -- so the cost is the candidate count, not the mesh; ``bunny_decimated`` is the slowest
+    per face
     because its 87 duplicated faces manufacture near-zero-gap candidates that no bound can prune.
     And the two prunes inside the kernel are what make the numbers reportable at all: without them
     the same rows read 144.6 / 252.3 ms on ``bunny``, so they are worth **11.2x** near and **29.1x**

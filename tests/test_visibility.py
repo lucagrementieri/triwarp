@@ -586,6 +586,7 @@ def test_shape_diameter_empty(device: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parity("thickness_interior", "trimesh")
 def test_thickness_max_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Class A against ``trimesh.proximity.thickness``, including *which* points are infinite.
@@ -615,12 +616,17 @@ def test_thickness_max_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
         assert np.allclose(thickness_wp[finite_tm], thickness_tm[finite_tm], rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity("thickness_interior", "trimesh")
 def test_thickness_ray(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Class A on the ``method="ray"`` branch, at ``allclose``'s default tolerance.
 
     A separate algorithm from ``max_sphere`` rather than a tuning of it, so it needs its own
     comparison; 20 of 20 points finite here too.
+
+    Carries the ``thickness_interior`` marker alongside [`test_thickness_max_sphere`] because that
+    benchmark group is parametrized over both ``method`` values and trimesh is timed for both -- one
+    test per branch, so neither row rests on the other branch's comparison.
     """
     mesh_tm, mesh_wp = icosahedron
     points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=13)
@@ -644,7 +650,7 @@ def test_thickness_ray(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
         assert np.allclose(thickness_wp[finite_tm], thickness_tm[finite_tm])
 
 
-@pytest.mark.parity("thickness_at_vertices", "meshlib")
+@pytest.mark.parity("thickness_at_vertices", "meshlib", "trimesh")
 def test_thickness_at_vertices_matches_meshlib(device: str) -> None:
     """
     Class A, and it pins the normal convention: **angle-weighted**, not area-weighted.
@@ -665,6 +671,12 @@ def test_thickness_at_vertices_matches_meshlib(device: str) -> None:
     MeshLib reports ``FLT_MAX`` where no opposite surface is found and triwarp reports ``inf``; the
     fixture is closed, so all 642 vertices are finite here and the mask is asserted rather than
     used to skip elements.
+
+    **trimesh is checked here too**, on the same whole-vertex-buffer call, because that group times
+    both references. It takes a query set, so unlike MeshLib it can be asked at exactly these
+    vertices with exactly these normals -- which makes it the arm that rules out the two libraries
+    agreeing on a shared convention mistake, since it derives its ray direction from its own
+    ``vertex_normals`` rather than from a pseudonormal.
     """
     mesh_tm = _ellipsoid()
     vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces.reshape(-1), device)
@@ -691,6 +703,17 @@ def test_thickness_at_vertices_matches_meshlib(device: str) -> None:
         mesh_wp, vertices_wp, method="ray", normals=area_normals_wp
     ).numpy()
     assert np.abs(thickness_area_np - thickness_ml).max() > 1e-3
+
+    # The third implementation, on the identical query set and normals: trimesh takes both as
+    # arguments, so this arm is not sharing a normal convention with either of the other two.
+    thickness_tm = tm_proximity.thickness(
+        mesh_tm,
+        np.ascontiguousarray(vertices_wp.numpy(), dtype=np.float64),
+        normals=np.ascontiguousarray(angle_normals_wp.numpy(), dtype=np.float64),
+        method="ray",
+    )
+    assert np.isfinite(thickness_tm).all()
+    assert np.allclose(thickness_wp, thickness_tm, rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +754,66 @@ def test_max_tangent_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
         )
 
 
+@pytest.mark.parity("max_tangent_sphere_reach", "trimesh")
+def test_max_tangent_sphere_reach_matches_trimesh(cave_cube: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A on both returns and on which queries are unbounded, for the **exterior** branch.
+
+    ``trimesh.proximity.max_tangent_sphere(inwards=False)`` is the only exterior tangent sphere in
+    any installed library, so this closes the gap the group's meshlib exemption describes: that
+    exemption says *MeshLib* has no exterior form, not that nothing does.
+
+    Two things about the setup, both measured, and each of which makes the test either vacuous or
+    ill-conditioned if got wrong:
+
+    - **The fixture must be non-convex.** The exterior tangent sphere of a convex body is unbounded,
+      so on ``icosahedron`` both libraries correctly return ``inf`` at every query (measured 0 of 24
+      finite) and an ``isfinite``-guarded ``allclose`` would compare nothing while reading as
+      coverage.
+    - **The sample count has to reach the concavity.** ``cave_cube`` is a unit cube minus a
+      0.1 interior cube, so the cavity is ~0.6% of the surface area: at 24 samples 0 land on it and
+      at 1 024 between 8 and 12 do (measured over four seeds). The bounded spheres are the ones
+      spanning that cavity's opposing walls.
+
+    Flat opposing walls are also why this fixture is the right one rather than ``half_torus``, which
+    has far more finite queries (147 of 256) but whose smoothly curved, exponentially scaled surface
+    is ill-conditioned: a float32 difference in the tangent direction moves the radius by up to 0.12
+    relative there, against **4.9e-07** here. That is conditioning, not a disagreement about the
+    definition -- radius grows without bound as the surface turns locally convex.
+
+    Measured over seeds 42 / 7 / 13 / 0: the ``isfinite`` masks are equal element for element every
+    time, and on the finite subset the radii agree to at most 5.7e-07 relative and the centres to
+    4.3e-09 absolute. The ``1e-5`` tolerance is ~18x above that. Both returns are compared, as in
+    [`test_max_tangent_sphere`]: the centre slides along the normal with the radius, so a centre off
+    the normal is a distinct failure from a wrong radius.
+    """
+    mesh_tm, mesh_wp = cave_cube
+    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 1024, seed=42)
+    normals_np = mesh_tm.face_normals[face_ids]
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    normals_wp = wp.array(
+        np.ascontiguousarray(normals_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+
+    centers_wp, radii_wp = tw.visibility.max_tangent_sphere(
+        mesh_wp, points_wp, normals=normals_wp, inwards=False
+    )
+    centers_tm, radii_tm = tm_proximity.max_tangent_sphere(
+        mesh_tm, points_np, normals=normals_np, inwards=False
+    )
+
+    finite_tm = np.isfinite(radii_tm)
+    # Non-vacuous in both directions: a convex fixture would leave every radius infinite, and an
+    # implementation that never escaped the surface would leave none of them.
+    assert 5 <= finite_tm.sum() < radii_tm.shape[0]
+    assert np.array_equal(np.isfinite(radii_wp.numpy()), finite_tm)
+    assert np.allclose(radii_wp.numpy()[finite_tm], radii_tm[finite_tm], rtol=1e-5, atol=1e-5)
+    assert np.allclose(centers_wp.numpy()[finite_tm], centers_tm[finite_tm], rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parity(
     "max_tangent_sphere_reach",
     "meshlib",
@@ -740,7 +823,9 @@ def test_max_tangent_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     "with a sign rather than the outside one. Its interior form also takes no query set -- it "
     "answers at every vertex, where triwarp's iteration is ill-conditioned (measured 0.0018 radius "
     "on a unit sphere, see test_max_tangent_sphere_agrees_across_devices) -- so it cannot be asked "
-    "about the interior points this test uses. trimesh carries the oracle for the values.",
+    "about the interior points this test uses. trimesh has an exterior form, carries the oracle "
+    "for the values and is now the group's timed reference; this declaration is about MeshLib "
+    "alone.",
 )
 def test_max_tangent_sphere_matches_meshlib(device: str) -> None:
     """

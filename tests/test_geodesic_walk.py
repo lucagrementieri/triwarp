@@ -121,6 +121,7 @@ def test_trace_from_vertex_stays_on_the_surface(
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
 @pytest.mark.parity("trace_rays", "potpourri3d")
+@pytest.mark.parity("trace_locality", "potpourri3d")
 def test_trace_from_vertex_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -132,6 +133,9 @@ def test_trace_from_vertex_matches_potpourri3d(
     path accumulates that choice at every crossing, so it is bounded by half a mean edge length
     instead. Asserting the endpoint at ``allclose`` would be asserting a tie-break neither library
     documents; asserting only the length would miss a path that wandered.
+
+    Carries the ``trace_locality`` marker as well: that group is this same call on a second axis
+    (mesh diameter at pinned vertex count), so one comparison answers for both rows.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
@@ -208,6 +212,7 @@ def test_trace_from_vertex_stops_at_the_boundary(
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+@pytest.mark.parity("trace_from_face", "potpourri3d")
 def test_trace_from_face_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -217,7 +222,12 @@ def test_trace_from_face_matches_potpourri3d(
     Same split as [`test_trace_from_vertex_matches_potpourri3d`] and for the same reason -- the
     endpoint depends on a vertex-crossing tie-break -- but the *start* is exactly specified by the
     barycentric coordinates, so unlike the vertex form it is asserted at ``1e-4`` rather than
-    bounded. No ``parity`` marker: ``trace_from_face`` is not separately benchmarked.
+    bounded.
+
+    ``trace_geodesic_from_face`` is the reference, the barycentric twin of the vertex entry point on
+    the same ``GeodesicTracer``. This docstring used to add "no ``parity`` marker:
+    ``trace_from_face`` is not separately benchmarked" -- the group existed and simply had no
+    reference row, which is the gap rather than a reason, and it has one now.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)

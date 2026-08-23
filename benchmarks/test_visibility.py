@@ -40,6 +40,15 @@ is the most expensive per-vertex filter MeshLab ships (674 ms on ``bunny``) and 
 ``cone_amplitude`` parameter is a **no-op** in the 2025.07 build -- byte-identical output at 90 and
 120 degrees -- so its cone is whatever it is. Both filters write only the vertex scalar attribute,
 so the MeshSet is shared rather than rebuilt per call. Open3D has no equivalent for anything here.
+
+**trimesh is the oracle for two of these five functions and is now timed for both.**
+``trimesh.proximity.thickness`` and ``max_tangent_sphere`` have been the correctness references in
+``tests/test_visibility.py`` since those functions landed, which this docstring did not say -- it
+recorded only that Open3D has nothing, leaving ``thickness_interior`` reading as unreferenced and
+``max_tangent_sphere_reach``'s exemption reading as "no library has an exterior form". Both take a
+**query set** and their own normals, so unlike MeshLib they fit the subsampled groups directly.
+They are single-threaded Python over embree and the ``max_sphere`` branch iterates in Python, so
+their rows run at ``_N_QUERIES_TM`` queries rather than 10 000 and must be read per query.
 """
 
 from __future__ import annotations
@@ -48,11 +57,13 @@ from typing import Literal
 
 import numpy as np
 import pytest
+import trimesh as tm
+import trimesh.proximity as tm_proximity
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 _QUERY_SEED = 42
 _N_QUERIES = 10_000
@@ -87,6 +98,35 @@ def _surface_points_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
 # Rays per point for the bundle groups. MeshLab's default is 64; 256 shows the cost is exactly
 # linear in it on both sides, which is the whole shape of these two groups.
 _N_RAYS_SWEEP = [64, 256]
+
+# Queries for the trimesh rows. ``trimesh.proximity`` takes a query set and its own normals, and
+# both are single-threaded Python-plus-embree, so the subsample is cut hard: the rows below run at
+# ``_N_QUERIES_TM`` where triwarp runs at 10 000, and the per-query cost is what to compare, not
+# the row totals. 256 keeps every trimesh row inside a couple of seconds on ``bunny``.
+_N_QUERIES_TM = 256
+
+_surface_np_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _surface_points_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ``(points, normals)`` for the trimesh rows: a vertex subsample with angle-weighted normals.
+
+    Vertices rather than ``sample_surface`` points so the query set is the same *kind* of input
+    triwarp's rows use, and angle-weighted normals because that is the convention section 6 records
+    as the one the ray methods pair on. Cached per mesh, since building it is not what is timed.
+    """
+    if bench_case.mesh_name not in _surface_np_cache:
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        mesh_tm = tm.Trimesh(vertices_np, faces_np, process=False)
+        rng = np.random.default_rng(_QUERY_SEED)
+        count = min(_N_QUERIES_TM, vertices_np.shape[0])
+        chosen = rng.choice(vertices_np.shape[0], size=count, replace=False)
+        _surface_np_cache[bench_case.mesh_name] = (
+            np.ascontiguousarray(vertices_np[chosen]),
+            np.ascontiguousarray(mesh_tm.vertex_normals[chosen]),
+        )
+    return _surface_np_cache[bench_case.mesh_name]
 
 
 def _vertex_normals_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
@@ -150,7 +190,7 @@ def test_shape_diameter(bench_case: BenchCase, n_rays: int) -> None:
 
 @pytest.mark.benchmark(group="thickness_interior")
 @pytest.mark.benchaxis("depth")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "trimesh")
 @pytest.mark.parametrize("method", ["ray", "max_sphere"])
 def test_thickness_interior(bench_case: BenchCase, method: Literal["ray", "max_sphere"]) -> None:
     """
@@ -161,7 +201,27 @@ def test_thickness_interior(bench_case: BenchCase, method: Literal["ray", "max_s
     depends on local thickness, which nested shells make small. The two rows are roughly two
     orders of magnitude apart by construction -- the point is whether that ratio holds when the
     geometry stops being convex.
+
+    ``trimesh.proximity.thickness`` is the reference, and it is the one that fits *this* group
+    rather than ``thickness_at_vertices``: it takes a **query set** and a ``method=`` switch with
+    the same two values, which is exactly what MeshLib's whole-vertex-buffer form cannot do and why
+    that second group had to exist. ``tests/test_visibility.py`` already carried the Class-A
+    comparison for both branches -- the module docstring used to say Open3D had no equivalent and
+    then never mention that trimesh is the oracle for two of the five functions here.
+
+    **Read the per-query cost, not the row.** trimesh runs at ``_N_QUERIES_TM`` queries against
+    triwarp's 10 000, because its ``max_sphere`` branch is a Python loop over closest-point queries;
+    dividing each row by its own query count is the only fair reading.
     """
+    if bench_case.kind == "trimesh":
+        mesh_tm = tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False)
+        points_np, normals_np = _surface_points_np(bench_case)
+        thickness_tm = bench_case.run(
+            lambda: tm_proximity.thickness(mesh_tm, points_np, normals=normals_np, method=method),
+            rounds=3,
+        )
+        assert thickness_tm.shape == (points_np.shape[0],)
+        return
     mesh = _mesh_wp(bench_case)
     points = _surface_points_wp(bench_case)
     result = bench_case.run(lambda: tw.visibility.thickness(mesh, points, method=method))
@@ -187,7 +247,7 @@ def _mesh_ml(bench_case: BenchCase) -> mm.Mesh:
 
 
 @pytest.mark.benchmark(group="thickness_at_vertices")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "trimesh")
 def test_thickness_at_vertices(bench_case: BenchCase) -> None:
     """
     Interior thickness at **every** vertex by one inward ray: the module's fair MeshLib row.
@@ -202,7 +262,26 @@ def test_thickness_at_vertices(bench_case: BenchCase) -> None:
     MeshLib is the only multi-threaded CPU reference in the suite (section 6), so this is a fair
     fight rather than a GPU against one core -- and the ``triwarp-cpu`` row will lose to it for that
     reason regardless of algorithm, which is section 13's "decide on the CUDA number".
+
+    **trimesh is the third row, and unlike the other two it is timed on both groups.** It takes a
+    query set, so it can be asked at every vertex here *and* at the subsample in
+    ``thickness_interior`` -- which makes the pair of groups readable as one query-count axis with
+    the same reference on both ends, the thing MeshLib's no-query-set form cannot provide. Its
+    normals are its own ``vertex_normals``, the angle-weighted convention both other rows use.
+    Single-threaded over embree at ~5 us/vertex (measured 15.2 ms at 2 562 vertices and 52.4 ms at
+    10 242), so it is capped at ``bunny``.
     """
+    if bench_case.kind == "trimesh":
+        skip_larger_than(bench_case, "bunny", "trimesh casts one ray per vertex on one core")
+        mesh_tm = tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False)
+        vertices_np = np.ascontiguousarray(mesh_tm.vertices)
+        normals_np = np.ascontiguousarray(mesh_tm.vertex_normals)
+        thickness_tm = bench_case.run(
+            lambda: tm_proximity.thickness(mesh_tm, vertices_np, normals=normals_np, method="ray"),
+            rounds=3,
+        )
+        assert thickness_tm.shape == (bench_case.n_vertices,)
+        return
     if bench_case.kind == "meshlib":
         mesh_ml = _mesh_ml(bench_case)
         thickness_ml = bench_case.run(lambda: mm.computeRayThicknessAtVertices(mesh_ml))
@@ -219,10 +298,38 @@ def test_thickness_at_vertices(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="max_tangent_sphere_reach")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "trimesh")
 def test_max_tangent_sphere_reach(bench_case: BenchCase) -> None:
-    """Exterior tangent spheres: exercises the ``init_sphere_radii`` inf-distance branch."""
+    """
+    Exterior tangent spheres: exercises the ``init_sphere_radii`` inf-distance branch.
+
+    ``trimesh.proximity.max_tangent_sphere(inwards=False)`` is the exterior branch, and it is the
+    only one in any installed library -- MeshLib's ``insideAndOutside`` returns the *smaller* of the
+    two spheres with a sign rather than the outer one, which is why that reference is declared
+    untimed here rather than timed. So this group's ``noparity`` reason should not be read as "no
+    library has an exterior form"; trimesh does.
+
+    The comparison needs a **non-convex** input to say anything: the exterior tangent sphere of a
+    convex body is unbounded, so on a sphere both libraries correctly return ``inf`` everywhere
+    (measured 0 of 24 finite). The scan meshes are non-convex, and
+    ``tests/test_visibility.py::test_max_tangent_sphere_reach_matches_trimesh`` draws the assertion
+    on ``cave_cube`` for the same reason.
+
+    Per-query, like the ``thickness_interior`` trimesh row: trimesh runs at ``_N_QUERIES_TM``
+    queries against triwarp's 10 000, since its iteration is a Python loop.
+    """
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "trimesh":
+        mesh_tm = tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False)
+        points_np, normals_np = _surface_points_np(bench_case)
+        _centers_tm, radii_tm = bench_case.run(
+            lambda: tm_proximity.max_tangent_sphere(
+                mesh_tm, points_np, normals=normals_np, inwards=False
+            ),
+            rounds=3,
+        )
+        assert radii_tm.shape == (points_np.shape[0],)
+        return
     mesh = _mesh_wp(bench_case)
     points = _surface_points_wp(bench_case)
     _, radii = bench_case.run(lambda: tw.visibility.max_tangent_sphere(mesh, points, inwards=False))

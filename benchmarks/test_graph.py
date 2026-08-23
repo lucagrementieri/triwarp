@@ -53,6 +53,13 @@ Neither **trimesh** nor **open3d** appears: both functions take an abstract CSR 
 and open3d exposes no graph-traversal API over one -- its connectivity work is mesh-bound
 (``cluster_connected_triangles``), which is what ``split`` uses over in ``test_combine``.
 
+**libigl does take that argument**, which the paragraph above used to be read as ruling out.
+``igl.connected_components`` accepts a ``scipy.sparse`` adjacency matrix directly -- the same
+argument ``connected_component_labels`` takes -- and ``igl.facet_components(F)`` is the dual-graph
+labelling ``face_connected_component_labels`` computes. So both labellings have a second
+implementation and the face one, which had none at all, now has two. igl has no BFS that returns a
+visit *order*, so it stays out of the ``bfs`` groups where scipy is the exact-order oracle.
+
 **pymeshlab** answers two groups. ``shortest_path_envelope``'s reference is
 ``apply_scalar_saturation_per_vertex``, which is the same relaxation read as a Lipschitz cap on a
 per-vertex scalar (VCG ``UpdateQuality::VertexSaturate``); its ``gradientthr`` divides the edge
@@ -71,17 +78,18 @@ appear in the ``bfs`` groups at all; the labelling is the only graph work MeshLa
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
 import scipy.sparse as sp
 import warp as wp
 import warp.sparse as wps
-from conftest import BenchCase, skip_larger_than
 from meshlib import mrmeshpy as mm
 from scipy.sparse.csgraph import breadth_first_order
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 # Source counts for the multi-source traversal. The output is a packed CSR of every reachable set,
 # so on a single-component mesh its size is sources x V and the pair shows that directly.
@@ -120,7 +128,7 @@ def _scipy_graph(bench_case: BenchCase) -> sp.csr_matrix:
 
 @pytest.mark.benchmark(group="connected_component_labels")
 @pytest.mark.benchaxis("components")
-@pytest.mark.benchlibs("triwarp", "scipy", "pymeshlab", "meshlib")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "pymeshlab", "meshlib")
 def test_connected_component_labels(bench_case: BenchCase) -> None:
     """
     ECL-CC hook and flatten, over 1 / 64 / 1024 components at a fixed face count.
@@ -130,8 +138,24 @@ def test_connected_component_labels(bench_case: BenchCase) -> None:
     or a derived selection, so its cost includes materializing ``k`` bitsets and should be the row
     that moves most across this axis. It reads the topology rather than an assembled adjacency, so
     the mesh is built outside the timed callable exactly as triwarp's CSR is.
+
+    ``igl.connected_components`` is the other label-array reference and the closest match to
+    triwarp's signature -- a ``scipy.sparse`` adjacency in, labels out. It builds that adjacency
+    inside the timed callable (``igl.adjacency_matrix`` is the only form it takes), so on this axis
+    its row carries the build where scipy's does not; the two are read against triwarp separately
+    rather than against each other. Note it counts every *isolated vertex* as its own component, so
+    its component count differs from the others on a mesh with unreferenced vertices while the
+    partition it induces on the referenced ones does not.
     """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "igl":
+        faces_np = bench_case.faces_np
+        n_labelled_igl, labels_igl, _sizes_igl = bench_case.run(
+            lambda: igl.connected_components(igl.adjacency_matrix(faces_np))
+        )
+        assert int(n_labelled_igl) >= 1
+        assert np.asarray(labels_igl).shape[0] <= n_vertices
+        return
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()
         components_ml = bench_case.run(lambda: mm.getAllComponentsVerts(mesh_ml, None))
@@ -164,7 +188,7 @@ def test_connected_component_labels(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="connected_component_labels_depth")
 @pytest.mark.benchaxis("diameter")
-@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl")
 def test_connected_component_labels_depth(bench_case: BenchCase) -> None:
     """
     The depth-robustness gate: ECL-CC on a graph of diameter 130 against one of diameter 20 481.
@@ -174,12 +198,26 @@ def test_connected_component_labels_depth(bench_case: BenchCase) -> None:
     fails it, which is what the ``bfs`` group below shows), and it is the premise the parity
     union-find in ``validation.face_orientation_bits`` rests on. A slope appearing here is the
     regression that would invalidate it.
+
+    ``igl.connected_components`` takes a ``scipy.sparse`` adjacency matrix -- the same argument
+    triwarp's function takes -- so it is a genuine third labelling here rather than a mesh-bound
+    stand-in. Its adjacency comes from ``igl.adjacency_matrix(F)`` and is built inside the timed
+    callable, because that is the only form it accepts; the scipy row reuses this module's cached
+    CSR, so read the two reference rows as build-included and build-excluded rather than against
+    each other.
     """
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "triwarp":
         adjacency = _adjacency(bench_case)
         labels = bench_case.run(lambda: tw.graph.connected_component_labels(adjacency))
         assert labels.shape == (n_vertices,)
+    elif bench_case.kind == "igl":
+        faces_np = bench_case.faces_np
+        n_labelled_igl, labels_igl, _sizes_igl = bench_case.run(
+            lambda: igl.connected_components(igl.adjacency_matrix(faces_np))
+        )
+        assert int(n_labelled_igl) == 1
+        assert np.asarray(labels_igl).shape[0] == n_vertices
     else:
         graph = _scipy_graph(bench_case)
         n_labelled, labels_np = bench_case.run(lambda: sp.csgraph.connected_components(graph))
@@ -189,7 +227,7 @@ def test_connected_component_labels_depth(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="face_connected_component_labels_depth")
 @pytest.mark.benchaxis("diameter")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl")
 def test_face_connected_component_labels_depth(bench_case: BenchCase) -> None:
     """
     Same gate one level up, over the face-adjacency graph.
@@ -197,13 +235,54 @@ def test_face_connected_component_labels_depth(bench_case: BenchCase) -> None:
     This is the build-plus-ECL-CC pair ``validation.face_orientation_bits`` actually calls.
 
     Measured at 1.33 ms (sphere) against 1.26 ms (ribbon) -- the edge sort dominates and neither
-    half of it is depth-sensitive. No scipy counterpart: the comparison there would be against a
-    face-adjacency matrix triwarp has to build anyway, which is the part being measured.
+    half of it is depth-sensitive.
+
+    Both references are **build-included**, which is what makes them fair here: triwarp's row times
+    the dual-graph construction *and* the labelling, so a reference handed a prebuilt matrix would
+    be pricing half the work. An earlier version of this docstring read that as "no scipy
+    counterpart", which was an argument about the timed region rather than about the comparison --
+    the answer is to put the reference's build inside its own callable, not to leave the group
+    unreferenced.
+
+    - **igl** ``facet_components(F)`` is the direct counterpart: faces in, per-face labels out, dual
+      graph built internally.
+    - **scipy** builds the dual explicitly -- each edge shared by two faces contributes one entry --
+      and then runs ``connected_components``, so its row is the same two phases triwarp's is.
     """
+    n_faces = bench_case.n_faces
+    if bench_case.kind == "igl":
+        faces_np = bench_case.faces_np
+        n_labelled_igl, labels_igl = bench_case.run(lambda: igl.facet_components(faces_np))
+        assert int(n_labelled_igl) >= 1
+        assert np.asarray(labels_igl).shape[0] == n_faces
+        return
+    if bench_case.kind == "scipy":
+        faces_np = bench_case.faces_np
+
+        def face_components_np() -> tuple[int, np.ndarray]:
+            """Build the dual graph from shared edges, then label it -- both phases timed."""
+            edges = np.sort(
+                np.concatenate((faces_np[:, [0, 1]], faces_np[:, [1, 2]], faces_np[:, [2, 0]])),
+                axis=1,
+            )
+            owner = np.tile(np.arange(faces_np.shape[0]), 3)
+            order = np.lexsort((edges[:, 1], edges[:, 0]))
+            edges, owner = edges[order], owner[order]
+            shared = np.flatnonzero(np.all(edges[1:] == edges[:-1], axis=1))
+            dual = sp.coo_matrix(
+                (np.ones(shared.size, dtype=np.int8), (owner[shared], owner[shared + 1])),
+                shape=(faces_np.shape[0], faces_np.shape[0]),
+            ).tocsr()
+            return sp.csgraph.connected_components(dual)
+
+        n_labelled_np, labels_np = bench_case.run(face_components_np)
+        assert n_labelled_np >= 1
+        assert labels_np.shape == (n_faces,)
+        return
     labels = bench_case.run(
         lambda: tw.adjacency.face_connected_component_labels(bench_case.faces_wp)
     )
-    assert labels.shape == (bench_case.n_faces,)
+    assert labels.shape == (n_faces,)
 
 
 @pytest.mark.benchmark(group="bfs")

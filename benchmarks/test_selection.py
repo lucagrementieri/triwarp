@@ -277,10 +277,10 @@ _region_cache: dict[tuple[str, str], tuple] = {}
 
 def _cap_region(bench_case: BenchCase) -> tuple:
     """
-    A **contiguous** face region -- the cap above the mesh's 80th height percentile.
+    Select a **contiguous** face region: the cap above the mesh's 80th height percentile.
 
-    Contiguity is the point: a scattered mask opens one rim per face and turns a region deletion into
-    a hole-filling benchmark. One cap opens one rim, which is the shape a real region edit has.
+    Contiguity is the point: a scattered mask opens one rim per face and turns a region deletion
+    into a hole-filling benchmark. One cap opens one rim, the shape a real region edit has.
     """
     key = (bench_case.mesh_name, str(bench_case.device))
     if key not in _region_cache:
@@ -490,7 +490,7 @@ def test_faces_left_of_contour(bench_case: BenchCase) -> None:
 
 
 def _oriented_seam_np(bench_case: BenchCase, region_np: np.ndarray) -> np.ndarray:
-    """The region's oriented seam as host rows, for a reference that wants vertex pairs."""
+    """Return the region's oriented seam as host rows, for a reference wanting vertex pairs."""
     faces = _faces_for_reference(bench_case)
     return tw.selection.region_boundary_edges(
         faces,
@@ -501,7 +501,7 @@ def _oriented_seam_np(bench_case: BenchCase, region_np: np.ndarray) -> np.ndarra
 
 
 def _faces_for_reference(bench_case: BenchCase) -> wp.array:
-    """A host face buffer: a reference case has no device, so ``faces_wp`` is unavailable."""
+    """Build a host face buffer: a reference case has no device, so ``faces_wp`` is absent."""
     return wp.array(
         np.ascontiguousarray(bench_case.faces_np.ravel(), dtype=np.int32),
         dtype=wp.int32,

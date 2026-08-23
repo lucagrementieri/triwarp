@@ -146,6 +146,7 @@ def test_edges_face_empty(device: str) -> None:
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("edges_unique", "trimesh")
+@pytest.mark.parity("edges_unique_auto_nv", "trimesh")
 def test_edges_unique(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class B (row-set canonicalization): the unique undirected edge set, both sides lexsorted.
@@ -154,6 +155,11 @@ def test_edges_unique(request: pytest.FixtureRequest, mesh_name: str) -> None:
     is defined; the rows are already min-first on both sides. The inverse that pairs with this
     set is checked by [`test_edges_unique_inverse`], which this sort would otherwise
     invalidate.
+
+    The call omits ``n_vertices=``, so this is the *inferred* radix base -- the path the
+    ``edges_unique_auto_nv`` benchmark group times, which is why that group's marker rides here.
+    The hint is triwarp's own parameter and no reference has one, so both groups compare against
+    the identical trimesh answer.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
@@ -222,6 +228,7 @@ def test_edges_unique_matches_potpourri3d(request: pytest.FixtureRequest, mesh_n
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("edges_unique", "igl")
+@pytest.mark.parity("edges_unique_auto_nv", "igl")
 @pytest.mark.parity("edges_unique_manifold", "igl")
 @pytest.mark.parity("edges_unique_inverse", "igl")
 def test_edges_unique_and_inverse_match_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
@@ -247,6 +254,11 @@ def test_edges_unique_and_inverse_match_igl(request: pytest.FixtureRequest, mesh
 
     ``edges_unique_manifold`` is the same call on the clean synthetic meshes, which is where the
     benchmark draws it so potpourri3d can run alongside; the fixtures here are all manifold.
+
+    ``edges_unique_auto_nv`` rides here too, and unlike the trimesh and pyvista comparisons this one
+    passes ``n_vertices=`` explicitly -- so the hinted and inferred calls are asserted equal below
+    rather than the marker resting on the hint being irrelevant. That equality is the whole content
+    of the inferred-base group: the hint only chooses the radix width.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = int(mesh_wp.points.shape[0])
@@ -266,6 +278,13 @@ def test_edges_unique_and_inverse_match_igl(request: pytest.FixtureRequest, mesh
 
     assert_unordered_rows_equal(np.sort(unique_edges_np, axis=1), np.sort(unique_edges_igl, axis=1))
 
+    # The inferred-base call (the ``edges_unique_auto_nv`` group) must return the same set, so
+    # igl's answer covers both groups: the hint only picks the radix width.
+    auto_edges_wp, _auto_inverse_wp = tw.edges.edges_unique(mesh_wp.indices)
+    assert_unordered_rows_equal(
+        np.sort(auto_edges_wp.numpy(), axis=1), np.sort(unique_edges_igl, axis=1)
+    )
+
     # Compose each inverse map with its own table, then reorder igl's directed edges into triwarp's
     # per-face interleaving (see the docstring) so the two are indexed the same way.
     n_faces = len(faces_np)
@@ -281,6 +300,7 @@ def test_edges_unique_and_inverse_match_igl(request: pytest.FixtureRequest, mesh
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("edges_unique", "pyvista")
+@pytest.mark.parity("edges_unique_auto_nv", "pyvista")
 def test_edges_unique_matches_pyvista(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class B: ``extract_all_edges`` returns the same set as a line-cell ``PolyData``.
@@ -290,6 +310,9 @@ def test_edges_unique_matches_pyvista(request: pytest.FixtureRequest, mesh_name:
     genuinely the *unique* undirected set on VTK's side too, not the ``3 * n_faces`` directed one:
     measured 30 = 30 on the icosahedron, 264 = 264 on the hemisphere, 18 = 18 on a box, with the
     sets equal element for element in each case.
+
+    Like the trimesh comparison above, this omits ``n_vertices=`` and so covers the inferred-base
+    group as well.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     edges_pv = pyvista_edges_to_indices(
@@ -554,9 +577,23 @@ def test_mean_edge_length_empty(device: str) -> None:
 
 # --- face_edge_lengths ----------------------------------------------------------------
 @pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parity("face_edge_lengths", "igl")
 def test_face_edge_lengths_are_the_opposite_edges(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class A against ``igl.edge_lengths``, plus the explicit opposite-edge construction.
+
+    Both are kept because they answer different questions. igl is the library reference and returns
+    the identical ``(n_faces, 3)`` table in the same column order (measured 3.7e-08 apart on
+    icosphere(2), triwarp's float32 vertex buffer being the floor); the hand-rolled stack *names*
+    the convention -- corner ``k`` holds the length of the edge opposite vertex ``k`` -- which is
+    the part a reader needs and which a second library agreeing cannot state.
+
+    The column order is load-bearing and this checks it: every non-identity permutation of igl's
+    columns differs from triwarp's answer by 0.045 on icosphere(2), so an order mistake fails rather
+    than passing on symmetry.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     lengths = tw.edges.face_edge_lengths(mesh_wp.points, mesh_wp.indices).numpy()
 
@@ -570,3 +607,8 @@ def test_face_edge_lengths_are_the_opposite_edges(
         axis=1,
     )
     assert np.allclose(lengths, expected, rtol=1e-5, atol=1e-5)
+
+    lengths_igl = igl.edge_lengths(
+        np.ascontiguousarray(mesh_tm.vertices), np.ascontiguousarray(mesh_tm.faces.astype(np.int64))
+    )
+    assert np.allclose(lengths, lengths_igl, rtol=1e-5, atol=1e-5)

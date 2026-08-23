@@ -50,6 +50,16 @@ isolate the piece they name.
 
 Reference
 ---------
+**Every reference here is index-agnostic, so the BVH and hash-grid groups carry the same rows.**
+None of the four exposes a spatial-structure choice: ``KDTree``, ``igl.octree``,
+``o3d.core.nns`` and ``PointsProjector`` each build whatever they build, and the cloud, the 20 000
+displaced queries and ``k`` are identical between the two group families. So a ``query_bvh_*`` /
+``query_hashgrid_*`` pair reads as **one** comparison with triwarp's own index as the axis, and
+``tests/test_neighbors.py`` asserts exactly that by parametrizing every k-NN and ball comparison
+over ``backend``. The hash-grid groups carried one reference each for a while purely because they
+were written after their BVH siblings -- there was never a reason, which is why this paragraph
+exists rather than an exemption.
+
 **scipy** ``spatial.KDTree`` — the same reference ``tests/test_neighbors.py`` validates against, and
 the only exact k-NN in the test group with a matching signature (``query(x, k=k)`` returns distances
 and indices in the same layout). ``KDTree`` construction is inside the timed region for the same
@@ -261,6 +271,33 @@ def _run_o3d_nns_knn(bench_case: BenchCase, k: int) -> None:
     assert indices_o3d.shape == (queries_np.shape[0], k)
 
 
+def _run_meshlib_projector(bench_case: BenchCase) -> None:
+    """
+    ``PointsProjector`` over the query cloud: meshlib's only batched ``k=1``, tree pre-warmed.
+
+    Shared by both ``k=1`` groups because meshlib has no spatial-index choice to make -- the
+    reference call is identical whichever structure triwarp uses on its side, which is the whole
+    reason the BVH and hash-grid groups are comparable at all.
+
+    The point cloud is held in a name because ``setPointCloud`` stores a raw pointer and a temporary
+    segfaults; the projector and its lazily built tree are outside the timed callable, so the row
+    prices the queries rather than the build.
+    """
+    cloud_ml = _cloud_ml(bench_case)  # cached: the projector does not own it
+    queries_ml = _queries_ml(bench_case)
+    projector_ml = mm.PointsProjector()
+    projector_ml.setPointCloud(cloud_ml)
+    settings_ml = mm.FindProjectionOnPointsSettings()
+
+    def nearest_ml() -> mm.std_vector_PointsProjectionResult:
+        results_ml = mm.std_vector_PointsProjectionResult()
+        projector_ml.findProjections(results_ml, queries_ml, settings_ml)
+        return results_ml
+
+    nearest_ml()  # pre-warm the lazily built tree
+    assert len(bench_case.run(nearest_ml)) == _queries_np(bench_case).shape[0]
+
+
 @pytest.mark.benchmark(group="query_bvh_nearest_k1")
 @pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d", "meshlib")
 def test_query_bvh_nearest_k1(bench_case: BenchCase) -> None:
@@ -270,25 +307,11 @@ def test_query_bvh_nearest_k1(bench_case: BenchCase) -> None:
     meshlib's ``PointsProjector`` is the only batched form it has that takes a *query* cloud, and
     it answers ``k=1`` only -- which is why meshlib appears in this group and not in the ``k7`` or
     ``k64`` ones (``tests/test_neighbors.py`` records that as a ``benchmarked=False`` claim). It is
-    exact against triwarp on both indices and distances. The projector and its tree are built
-    outside the timed callable, so the row prices the queries; the point cloud is held in a name
-    because ``setPointCloud`` stores a raw pointer and a temporary segfaults.
+    exact against triwarp on both indices and distances.
     """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "meshlib":
-        cloud_ml = _cloud_ml(bench_case)  # cached: the projector does not own it
-        queries_ml = _queries_ml(bench_case)
-        projector_ml = mm.PointsProjector()
-        projector_ml.setPointCloud(cloud_ml)
-        settings_ml = mm.FindProjectionOnPointsSettings()
-
-        def nearest_ml() -> mm.std_vector_PointsProjectionResult:
-            results_ml = mm.std_vector_PointsProjectionResult()
-            projector_ml.findProjections(results_ml, queries_ml, settings_ml)
-            return results_ml
-
-        nearest_ml()  # pre-warm the lazily built tree
-        assert len(bench_case.run(nearest_ml)) == _queries_np(bench_case).shape[0]
+        _run_meshlib_projector(bench_case)
         return
     if bench_case.kind == "triwarp":
         points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
@@ -305,16 +328,31 @@ def test_query_bvh_nearest_k1(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="query_hashgrid_nearest_k1")
-@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d", "meshlib")
 def test_query_hashgrid_nearest_k1(bench_case: BenchCase) -> None:
-    """``k=1`` hash-grid k-NN — the backend ``distance.py`` picks."""
+    """
+    ``k=1`` hash-grid k-NN — the backend ``distance.py`` picks.
+
+    The reference rows are the *same four calls* ``query_bvh_nearest_k1`` times, because none of the
+    four references has a spatial-index choice to expose: the cloud, the 20 000 displaced queries
+    and ``k`` are identical between the two groups and only triwarp's structure differs. So the pair
+    of groups reads as one comparison with triwarp's index as the axis, which is what
+    ``tests/test_neighbors.py`` asserts by parametrizing every k-NN comparison over both backends.
+    """
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "meshlib":
+        _run_meshlib_projector(bench_case)
+        return
     if bench_case.kind == "triwarp":
         points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
         indices, _distances = bench_case.run(
             lambda: tw.neighbors.query_hashgrid_nearest(points, queries, k=1)
         )
         assert indices.shape == (queries.shape[0],)
+    elif bench_case.kind == "igl":
+        _run_igl_knn(bench_case, 1)
+    elif bench_case.kind == "open3d":
+        _run_o3d_nns_knn(bench_case, 1)
     else:
         _run_scipy(bench_case, 1)
 
@@ -365,9 +403,15 @@ def test_query_bvh_nearest_k64(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="query_hashgrid_nearest_k7")
-@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d")
 def test_query_hashgrid_nearest_k7(bench_case: BenchCase) -> None:
-    """``k=7`` hash-grid k-NN."""
+    """
+    ``k=7`` hash-grid k-NN.
+
+    Same three references as ``query_bvh_nearest_k7``, and for the reason given on the ``k1`` group:
+    the reference call does not change with triwarp's index. meshlib is absent here rather than
+    exempt -- its only batched query-cloud form is ``k=1`` (see ``query_bvh_nearest_k1``).
+    """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "triwarp":
         points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
@@ -375,6 +419,10 @@ def test_query_hashgrid_nearest_k7(bench_case: BenchCase) -> None:
             lambda: tw.neighbors.query_hashgrid_nearest(points, queries, k=7)
         )
         assert indices.shape == (queries.shape[0], 7)
+    elif bench_case.kind == "igl":
+        _run_igl_knn(bench_case, 7)
+    elif bench_case.kind == "open3d":
+        _run_o3d_nns_knn(bench_case, 7)
     else:
         _run_scipy(bench_case, 7)
 
@@ -398,11 +446,11 @@ def test_query_weighted_nearest(bench_case: BenchCase, weight_spread: float) -> 
     group against ``query_bvh_nearest_k1`` instead, which is the same traversal with the weight
     term dropped.
 
-    First measurement, medians on an RTX 5090 at 20 000 queries, 0.5 / 4.0 spread: **0.57 / 1.92 ms**
-    on ``bunny``, **0.44 / 1.64** on ``bunny_decimated``, **1.52 / 2.90** on ``dragon`` -- so an 8x
-    weight spread costs 1.9-3.7x, and the axis is doing what it was chosen for. Read each mesh's row
-    in isolation: measured back to back, ``bunny_decimated`` reported a 4.8 ms median for the 0.5
-    row when it followed another case in the same process against 0.44 ms alone.
+    First measurement, medians on an RTX 5090 at 20 000 queries, 0.5 / 4.0 spread: **0.57 / 1.92
+    ms** on ``bunny``, **0.44 / 1.64** on ``bunny_decimated``, **1.52 / 2.90** on ``dragon`` -- so
+    an 8x weight spread costs 1.9-3.7x, and the axis is doing what it was chosen for. Read each
+    mesh's row in isolation: measured back to back, ``bunny_decimated`` reported a 4.8 ms median for
+    the 0.5 row when it followed another case in the same process against 0.44 ms alone.
 
     That dragon number was **258 ms** before a float32 stall in the deepening loop was fixed (see
     ``kernels/neighbors.query_weighted_nearest_neighbors``): 0.1% of queries never certified, burned
@@ -462,11 +510,30 @@ def test_bvh_from_points(bench_case: BenchCase, leaf_size: int) -> None:
 
 
 @pytest.mark.benchmark(group="hashgrid_from_points")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl")
 @pytest.mark.parametrize("grid_bins", _GRID_BINS)
 def test_hashgrid_from_points(bench_case: BenchCase, grid_bins: int) -> None:
-    """The hash-grid build, swept over its bin count: the other structure's amortization floor."""
-    skip_larger_than(bench_case, "dragon")
+    """
+    The hash-grid build, swept over its bin count: the other structure's amortization floor.
+
+    The same two reference structures ``bvh_from_points`` times, and for the same reason: each is
+    the index its library's k-NN query consumes, so subtracting this group from
+    ``query_hashgrid_nearest_k1`` isolates the query on both sides of the ratio. Neither reference
+    has a bin-count parameter, so each one's two rows are identical by construction and stand as
+    fixed bars against triwarp's slope -- the convention ``bvh_from_points`` already uses for
+    ``leaf_size``.
+    """
+    skip_larger_than(bench_case, "dragon", "the scipy reference builds single-threaded")
+    if bench_case.kind == "igl":
+        skip_larger_than(bench_case, "bunny", "igl.octree is superlinear in the point count")
+        points_np = bench_case.vertices_np
+        point_indices_igl, _, _, _ = bench_case.run(lambda: igl.octree(points_np))[:4]
+        assert len(point_indices_igl) > 0
+        return
+    if bench_case.kind == "scipy":
+        points_np = bench_case.vertices_np
+        assert bench_case.run(lambda: KDTree(points_np)) is not None
+        return
     points = bench_case.vertices_wp
     radius = _RADIUS_SCALES[0] * bench_case.mean_edge
     grid = bench_case.run(
@@ -570,7 +637,7 @@ def test_query_bvh_box(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="query_hashgrid_ball")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "scipy", "open3d")
 @pytest.mark.parametrize("grid_bins", _GRID_BINS)
 def test_query_hashgrid_ball(bench_case: BenchCase, grid_bins: int) -> None:
     """
@@ -579,9 +646,30 @@ def test_query_hashgrid_ball(bench_case: BenchCase, grid_bins: int) -> None:
     Too few bins and each cell holds enough points that the query degenerates into a linear scan;
     too many and the build pays for cells nothing lands in. Where the optimum sits depends on the
     cloud's density, so this pair is the cheapest way to see which side of it the default is on.
+
+    Both references are the ones ``query_bvh_ball`` times, at the same radius over the same cloud --
+    scipy's cached ``KDTree`` and open3d's ``fixed_radius_index``, each prebuilt so no row pays for
+    a structure. Neither has a bin count, so their two rows per mesh are identical bars and only
+    triwarp's move; that is the axis this group exists for.
     """
-    skip_larger_than(bench_case, "bunny")
+    skip_larger_than(bench_case, "bunny", "the neighbour count grows cubically with the radius")
     radius = _RADIUS_SCALES[0] * bench_case.mean_edge
+    if bench_case.kind == "open3d":
+        import open3d as o3d
+
+        queries_t = o3d.core.Tensor(_queries_np(bench_case))
+        nns = o3d.core.nns.NearestNeighborSearch(o3d.core.Tensor(bench_case.vertices_np))
+        assert nns.fixed_radius_index(radius)
+        _indices_o3d, _squared_o3d, offsets_o3d = bench_case.run(
+            lambda: nns.fixed_radius_search(queries_t, radius)
+        )
+        assert offsets_o3d.shape[0] == queries_t.shape[0] + 1
+        return
+    if bench_case.kind == "scipy":
+        tree, queries_np = _kdtree(bench_case), _queries_np(bench_case)
+        found = bench_case.run(lambda: tree.query_ball_point(queries_np, radius))
+        assert len(found) == queries_np.shape[0]
+        return
     points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
     grid = tw.neighbors.hashgrid_from_points(points, radius, grid_bins=grid_bins)
     neighbors, _distances, offsets = bench_case.run(
@@ -623,16 +711,16 @@ def test_closest_pair(bench_case: BenchCase) -> None:
     single-element readbacks, so the pair prices what reducing on the device costs against handing
     the array back.
 
-    meshlib's ``findTwoClosestPoints`` is the same answer and is batched and callback-free. Its point
-    tree is cached on the cloud, so the row drops it per round exactly as the
+    meshlib's ``findTwoClosestPoints`` is the same answer and is batched and callback-free. Its
+    point tree is cached on the cloud, so the row drops it per round exactly as the
     ``nearest_neighbor_distance`` row does -- otherwise the second round onward would time a query
     against a warm tree while triwarp rebuilds its BVH inside every call.
 
     First measurement, medians on an RTX 5090: triwarp-cuda **1.34 ms** against meshlib's **8.44**
-    at ``sphere_large``, **0.74** against **5.37** at ``sphere_med`` and **0.54** against **6.01** at
-    ``sphere_small`` -- so unlike most reductions in this suite the GPU row wins at every size, and
-    the reason is that the query dominates rather than the reduce. Read meshlib's *medians*: dropping
-    the cached tree per round leaves it with a 2-20 ms spread where triwarp's is under 5%.
+    at ``sphere_large``, **0.74** against **5.37** at ``sphere_med`` and **0.54** against **6.01**
+    at ``sphere_small`` -- so unlike most reductions in this suite the GPU row wins at every size,
+    and the reason is that the query dominates rather than the reduce. Read meshlib's *medians*:
+    dropping the cached tree per round leaves it with a 2-20 ms spread where triwarp's is under 5%.
     """
     if bench_case.kind == "meshlib":
         cloud_ml = _cloud_ml(bench_case)  # held in a name: the tree is a raw pointer into it

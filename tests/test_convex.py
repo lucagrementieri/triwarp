@@ -204,6 +204,7 @@ def test_face_adjacency_convex_empty(device: str) -> None:
 
 
 @pytest.mark.parity("convex_subset_mask", "trimesh", "open3d", "pymeshlab")
+@pytest.mark.parity("convex_subset", "trimesh", "open3d", "pymeshlab")
 def test_convex_subset_mask_against_the_three_qhull_backends(device: str) -> None:
     """
     Class C (soundness plus a recall bound), against exact qhull.
@@ -232,6 +233,12 @@ def test_convex_subset_mask_against_the_three_qhull_backends(device: str) -> Non
     Marked for all three libraries deliberately: they compute the identical answer here, so one
     assertion covers all three rows, and confirming they agree is itself worth a line -- it says the
     benchmark's three qhull rows are pricing wrappers around one algorithm, not three algorithms.
+
+    Both hull entry points are checked against the references here, which is why the marker names
+    ``convex_subset`` as well as ``convex_subset_mask``: the two benchmark groups time the same
+    approximation against the same qhull bar, so one comparison is the honest place for both claims.
+    The *mask against subset* equality below is triwarp-against-triwarp -- the mask is the entry
+    point carrying the oracle, and ``test_convex_subset_points`` pins the same pair on positions.
     """
     rng = np.random.default_rng(0)
     points_np = rng.standard_normal((500, 3)).astype(np.float64)
@@ -241,10 +248,20 @@ def test_convex_subset_mask_against_the_three_qhull_backends(device: str) -> Non
         np.flatnonzero(tw.convex.convex_subset_mask(points_wp, n_directions=256).numpy()).tolist()
     )
 
-    def hull_indices(hull_vertices: np.ndarray) -> set[int]:
+    def hull_indices(hull_vertices: np.ndarray, tolerance: float = 1e-9) -> set[int]:
         """Map a hull's vertex positions back onto indices into the input cloud."""
         distance_np, index_np = scipy.spatial.cKDTree(points_np).query(np.asarray(hull_vertices))
-        return set(index_np[distance_np < 1e-9].tolist())
+        assert distance_np.max() < tolerance  # every returned position is one of the inputs
+        return set(index_np[distance_np < tolerance].tolist())
+
+    # The compacted entry point resolves back to the identical index set, so the assertions below
+    # speak for both benchmark groups rather than only the mask one. Its positions come back
+    # ``float32`` where the three references hand back the ``float64`` inputs verbatim, so the
+    # lookup needs a float32-scale tolerance: measured 1.2e-07 of round-trip error against a
+    # minimum inter-point spacing of 0.046 in this cloud, so 1e-5 is unambiguous by ~4 600x.
+    assert (
+        hull_indices(tw.convex.convex_subset(points_wp, n_directions=256).numpy(), 1e-5) == selected
+    )
 
     hull_tm = hull_indices(tm.points.PointCloud(points_np).convex_hull.vertices)
     mesh_o3d, _kept = points_to_open3d(points_np).compute_convex_hull()

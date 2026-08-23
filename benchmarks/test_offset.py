@@ -128,12 +128,12 @@ def test_thicken_mesh(bench_case: BenchCase) -> None:
     produces whatever the marching finds. So the interesting number is the ratio, and it is the
     argument for having both.
 
-    meshlib's ``makeThickMesh`` is the same construction, and ``tests/test_offset.py`` shows just how
-    same: identical counts, volumes equal to five decimals, and identical face sets under a vertex
-    bijection. That makes this the cleanest row in the module -- two implementations of one
+    meshlib's ``makeThickMesh`` is the same construction, and ``tests/test_offset.py`` shows just
+    how same: identical counts, volumes equal to five decimals, and identical face sets under a
+    vertex bijection. That makes this the cleanest row in the module -- two implementations of one
     algorithm, no parameter mapping in between. Its ``ThickenParams`` is built outside the timed
-    callable and its mesh is fresh per round, since the call mutates nothing but the params object is
-    an input.
+    callable and its mesh is fresh per round, since the call mutates nothing but the params
+    object is an input.
 
     The thickness is 1 % of the bounding-box diagonal, which is small enough that neither side folds
     (the shell would self-intersect past the local curvature radius, and a shell that folds is not
@@ -143,10 +143,10 @@ def test_thicken_mesh(bench_case: BenchCase) -> None:
     because of what it shows: triwarp-cuda **0.78 / 0.70 / 1.03 ms** at ``sphere_small`` /
     ``sphere_med`` / ``sphere_large`` -- flat, because at these sizes it is three launches against
     the launch floor -- against meshlib's **6.5 ms / 266 ms / 4.21 s**. That is 8x, 382x and 4 000x,
-    and the slope is the story rather than any single ratio: the reference is superlinear where this
-    is flat, which for two implementations of the same construction means the cost is not the
-    construction. Whatever else ``makeThickMesh`` does at 1 M faces, it is not what its own 6.5 ms at
-    2 562 predicts.
+    and the slope is the story rather than any single ratio: the reference is superlinear where
+    this is flat, which for two implementations of the same construction means the cost is not
+    the construction. Whatever else ``makeThickMesh`` does at 1 M faces, it is not what its own
+    6.5 ms at 2 562 predicts.
     """
     thickness = 0.01 * float(
         np.linalg.norm(bench_case.vertices_np.max(axis=0) - bench_case.vertices_np.min(axis=0))

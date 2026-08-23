@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pytest
 import scipy.sparse as sp
@@ -61,6 +62,50 @@ def test_connected_component_labels_random(device: str) -> None:
     labels_np = _scipy_component_labels(edges_np, node_count)
 
     assert same_partition(labels_wp.numpy(), labels_np)
+
+
+@pytest.mark.parametrize(("node_count", "n_edges"), [(64, 200), (2048, 2047)])
+@pytest.mark.parity("connected_component_labels", "igl")
+@pytest.mark.parity("connected_component_labels_depth", "igl")
+def test_connected_component_labels_matches_igl(device: str, node_count: int, n_edges: int) -> None:
+    """
+    Class B (label packing): the partition against ``igl.connected_components``.
+
+    The reference worth having here because it takes the *same argument* triwarp does -- a
+    ``scipy.sparse`` adjacency matrix -- rather than a mesh, which is why
+    ``benchmarks/test_graph.py`` used to say no second implementation existed for these two groups.
+    It returns ``(n_components, labels, sizes)``, three values, and numbers components ``0..k-1`` in
+    its own traversal order where triwarp names each after a representative node, so
+    [`same_partition`][tests.comparisons.same_partition] is the transform exactly as it is for the
+    scipy comparison above.
+
+    Two shapes, and the second is the point: 200 random edges over 64 nodes gives a handful of
+    shallow components, while the 2 048-node path is diameter-equal-to-node-count and is what the
+    ``*_depth`` group exists to gate -- an implementation that stopped propagating early would pass
+    the first and fail the second.
+    """
+    if n_edges == node_count - 1:  # the path graph
+        edges_np = np.stack(
+            [np.arange(node_count - 1, dtype=np.int32), np.arange(1, node_count, dtype=np.int32)],
+            axis=1,
+        )
+    else:
+        rng = np.random.default_rng(7)
+        edges_np = rng.integers(0, node_count, size=(n_edges, 2), dtype=np.int32)
+
+    adjacency_np = sp.coo_matrix(
+        (np.ones(len(edges_np), dtype=np.int8), (edges_np[:, 0], edges_np[:, 1])),
+        shape=(node_count, node_count),
+    ).tocsr()
+    adjacency_np = adjacency_np + adjacency_np.T
+
+    n_components_igl, labels_igl, sizes_igl = igl.connected_components(adjacency_np)
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=node_count)
+
+    assert int(n_components_igl) == np.unique(labels_wp.numpy()).shape[0]
+    assert int(np.asarray(sizes_igl).sum()) == node_count  # every node landed in a component
+    assert same_partition(labels_wp.numpy(), np.asarray(labels_igl).ravel())
 
 
 @pytest.mark.parametrize("face_ratio", [0.0, 0.1, 0.5])

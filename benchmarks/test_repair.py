@@ -733,9 +733,10 @@ def _tangled(bench_case: BenchCase) -> tuple:
     reason="D2 a different algorithm with a measured disagreement: localFixSelfIntersections "
     "subdivides the affected region and relaxes it, where fix_self_intersections cuts the region "
     "out and refills the rim. On the shared 16x16 self-intersecting torus MeshLib's leaves 281 "
-    "intersecting faces and triwarp's leaves 0, so the outputs are not comparable and neither is a "
-    "reference for the other. No library does the cut-and-refill repair, so the correctness claim "
-    "is the contract itself, in tests/test_repair.py::test_fix_self_intersections_local_clears_them.",
+    "intersecting faces and triwarp's leaves 0, so the outputs are not comparable and neither "
+    "is a reference for the other. No library does the cut-and-refill repair, so the "
+    "correctness claim is the contract itself, in "
+    "tests/test_repair.py::test_fix_self_intersections_local_clears_them.",
 )
 @pytest.mark.benchmark(group="fix_self_intersections")
 @pytest.mark.benchmeshes("sphere_med")
@@ -751,11 +752,11 @@ def test_fix_self_intersections(bench_case: BenchCase, method: str) -> None:
     rather than the face count. ``voxel`` is a signed distance field plus a marching pass, so its
     cost is the *lattice* and it does not care what was wrong.
 
-    The input is one mesh overlapping a shifted copy of itself -- a deep interpenetration, which is
-    the case the local method only *reduces* rather than clears (152 intersecting faces to 34 on a
-    small instance; the function's docstring measures this). The row therefore asserts progress and a
-    non-empty answer, not convergence: asserting zero would be asserting something the method does
-    not promise on this input class.
+    The input is one mesh overlapping a shifted copy of itself -- a deep interpenetration, which
+    is the case the local method only *reduces* rather than clears (152 intersecting faces to 34
+    on a small instance; the function's docstring measures this). The row therefore asserts
+    progress and a non-empty answer, not convergence: asserting zero would be asserting
+    something the method does not promise on this input class.
 
     meshlib's two fixers are timed beside it for scale, and the noparity entry says why they are not
     a reference: its local one subdivides and relaxes instead of cutting, and on the shared torus

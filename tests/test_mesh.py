@@ -8,7 +8,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import lexsort_rows
+from tests.comparisons import assert_same_loop_set, lexsort_rows, trimesh_outline_loops
 from triwarp.mesh import _TOPOLOGY_KEYS
 
 CLOSED_MESHES = ["icosahedron", "cave_cube"]
@@ -188,6 +188,32 @@ def test_boundary_matches_free_functions(request: pytest.FixtureRequest, mesh_na
     assert len(mesh.boundary_loops) > 0
 
 
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity("mesh_boundary_loops", "trimesh")
+def test_boundary_loops_matches_trimesh_outline(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B: the cached property against ``Trimesh.outline()``, the property trimesh caches.
+
+    The container-level twin of
+    [`tests.test_boundary.test_boundary_loops_matches_trimesh_outline`][], and it exists separately
+    because ``benchmarks/test_mesh.py`` times the two as separate groups -- the free function on the
+    ``loops`` axis, this one warm against cold. Both named transforms live in
+    [`tests.comparisons.trimesh_outline_loops`][]: the entities index the mesh's own vertex array,
+    and a closed entity repeats its first point as its last.
+
+    The loop *set* is the claim, not the order: triwarp ranks loops by length and trimesh by
+    traversal, and neither fixes a starting point within a loop.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+
+    loops_tm = trimesh_outline_loops(mesh_tm)
+    assert len(loops_tm) > 0  # non-vacuous: these fixtures have rims
+    assert_same_loop_set([loop.numpy() for loop in mesh.boundary_loops], loops_tm)
+
+
 def test_boundary_loops_empty_for_closed_mesh(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _mesh_tm, mesh_wp = icosahedron
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
@@ -249,11 +275,43 @@ def test_is_watertight_matches_free_function(
 ) -> None:
     # triwarp.is_watertight follows Open3D semantics (manifold-closed + no self-intersections),
     # not trimesh's "every edge shared by exactly two faces" — compare against the free
-    # function, not mesh_tm.is_watertight.
+    # function, not mesh_tm.is_watertight. The trimesh comparison is the test below, which
+    # decomposes triwarp's answer into trimesh's clause and the one trimesh does not have.
     _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
     expected = tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices)
     assert mesh.is_watertight == expected
+
+
+@pytest.mark.parametrize("mesh_name", [*ALL_MESHES, "bohemian_dome"])
+@pytest.mark.parity("mesh_is_watertight", "trimesh")
+def test_is_watertight_decomposes_into_trimesh_clause(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B: ``Trimesh.is_watertight`` is exactly one of the two conjuncts this property tests.
+
+    The named transform is the conjunction itself. trimesh answers "every edge is shared by exactly
+    two faces"; triwarp follows Open3D and requires that **and** no self-intersection, so the two
+    disagree by construction on a closed surface that passes through itself and comparing them
+    directly would look like a bug in triwarp. Supplying the missing conjunct makes it an equality:
+    ``mesh.is_watertight == mesh_tm.is_watertight and not is_self_intersecting(...)``, measured
+    exact on all eight surfaces probed (the four fixtures here plus ``roman``, ``klein``,
+    ``cross_cap`` and ``mobius``).
+
+    That is a stronger claim than an implication, and it is the one worth making: an implication
+    (triwarp ⟹ trimesh) would also pass for a property that always answered ``False``.
+
+    Non-vacuous in both directions on this parametrisation -- ``icosahedron`` and ``cave_cube`` are
+    watertight both ways, the two open fixtures fail trimesh's clause, and ``bohemian_dome`` is the
+    input that separates the two definitions: trimesh ``True``, triwarp ``False``.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+
+    edge_manifold_closed_tm = bool(mesh_tm.is_watertight)
+    self_intersecting = tw.validation.is_self_intersecting(mesh_wp)
+    assert mesh.is_watertight == (edge_manifold_closed_tm and not self_intersecting)
 
 
 @pytest.mark.parametrize("mesh_name", CLOSED_MESHES)

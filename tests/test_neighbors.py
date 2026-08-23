@@ -89,6 +89,7 @@ def test_query_ball_empty_ball(device: str, backend: Literal["bvh", "hashgrid"])
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parity("query_bvh_ball", "scipy")
+@pytest.mark.parity("query_hashgrid_ball", "scipy")
 def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
     """
     Class B: per-query neighbour lists against ``KDTree.query_ball_point``, sorted by distance.
@@ -552,6 +553,7 @@ def test_knn_initial_radius_degenerate_clouds(device: str):
 @pytest.mark.parity("query_bvh_nearest_k1", "scipy")
 @pytest.mark.parity("query_hashgrid_nearest_k1", "scipy")
 @pytest.mark.parity("bvh_from_points", "scipy")
+@pytest.mark.parity("hashgrid_from_points", "scipy")
 def test_query_nearest_single(
     device: str, backend: Literal["bvh", "hashgrid"], k: int, max_radius: float
 ):
@@ -666,7 +668,10 @@ def test_query_nearest_row_buckets(device: str, backend: Literal["bvh", "hashgri
 @pytest.mark.parity("query_bvh_nearest_k1", "igl")
 @pytest.mark.parity("query_bvh_nearest_k7", "igl")
 @pytest.mark.parity("query_bvh_nearest_k64", "igl")
+@pytest.mark.parity("query_hashgrid_nearest_k1", "igl")
+@pytest.mark.parity("query_hashgrid_nearest_k7", "igl")
 @pytest.mark.parity("bvh_from_points", "igl")
+@pytest.mark.parity("hashgrid_from_points", "igl")
 def test_query_nearest_matches_igl(device: str, backend: Literal["bvh", "hashgrid"], k: int):
     """
     Class A, against the second exact k-NN. Indices, element-wise, at the three benchmarked ``k``.
@@ -676,7 +681,11 @@ def test_query_nearest_matches_igl(device: str, backend: Literal["bvh", "hashgri
     one. It is a genuinely independent implementation: an octree walk against triwarp's BVH / hash
     grid and scipy's k-d tree, three different structures for one answer.
 
-    The ``bvh_from_points`` marker rides here for the reason the scipy one does: a structure build
+    The ``backend`` axis is what carries the four hash-grid markers alongside the four BVH ones:
+    igl's answer does not depend on which structure triwarp asks, so one comparison covers both
+    groups and the benchmark pair reads as triwarp's index being the only difference.
+
+    The two ``*_from_points`` markers ride here for the reason the scipy ones do: a structure build
     has no output to compare, so it is validated through the query that consumes it -- and on the
     igl side the octree is quite literally an argument to ``igl.knn``, passed as
     ``*igl.octree(points)[:4]``.
@@ -708,6 +717,8 @@ def test_query_nearest_matches_igl(device: str, backend: Literal["bvh", "hashgri
 @pytest.mark.parity("query_bvh_nearest_k1", "open3d")
 @pytest.mark.parity("query_bvh_nearest_k7", "open3d")
 @pytest.mark.parity("query_bvh_nearest_k64", "open3d")
+@pytest.mark.parity("query_hashgrid_nearest_k1", "open3d")
+@pytest.mark.parity("query_hashgrid_nearest_k7", "open3d")
 def test_query_nearest_matches_open3d(
     device: str, backend: Literal["bvh", "hashgrid"], k: int
 ) -> None:
@@ -719,6 +730,10 @@ def test_query_nearest_matches_open3d(
     distances -- the square root is the named transform that makes the distance half class B on
     its own; the index half needs none. The cloud is random in a box, so no two points tie in
     ``float32`` distance from a query and the index comparison is exact.
+
+    The ``backend`` axis covers the hash-grid groups as well as the BVH ones: open3d's answer is
+    the same whichever structure triwarp asks, which is why the two benchmark groups carry the
+    identical reference row.
     """
     rng = np.random.default_rng(11)
     points = rng.random((300, 3)) * 5.0
@@ -752,6 +767,7 @@ def test_query_nearest_matches_open3d(
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parity("query_bvh_ball", "open3d")
+@pytest.mark.parity("query_hashgrid_ball", "open3d")
 def test_query_ball_matches_open3d(device: str, backend: Literal["bvh", "hashgrid"]) -> None:
     """
     Class A on the neighbour sets: ``fixed_radius_search`` against the ``*_with_offsets`` form.
@@ -1457,8 +1473,10 @@ def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgr
     assert sorted(tie_indices_wp.numpy().tolist()) == [0, 1, 2, 3]
 
 
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 7])
 @pytest.mark.parity("query_bvh_nearest_k1", "meshlib")
+@pytest.mark.parity("query_hashgrid_nearest_k1", "meshlib")
 @pytest.mark.parity(
     "query_bvh_nearest_k7",
     "meshlib",
@@ -1470,7 +1488,18 @@ def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgr
     "query_bvh_nearest_k1 row; findFewClosestPoints is per query and would time a Python loop. "
     "scipy, igl and open3d carry the timed rows at k=7 and k=64.",
 )
-def test_query_nearest_matches_meshlib(device: str, k: int) -> None:
+@pytest.mark.parity(
+    "query_hashgrid_nearest_k7",
+    "meshlib",
+    benchmarked=False,
+    reason="the same k=1-only limitation the query_bvh_nearest_k7 declaration above records, and "
+    "for the same reason: PointsProjector is meshlib's only batched query-cloud form and it "
+    "answers one neighbour. The hash-grid group therefore times scipy, igl and open3d at k=7, "
+    "exactly as its BVH sibling does, while this test still compares both backends here.",
+)
+def test_query_nearest_matches_meshlib(
+    device: str, backend: Literal["bvh", "hashgrid"], k: int
+) -> None:
     """
     Class B: ``findNClosestPointsPerPoint`` is self-excluding, unordered, and cloud-against-itself.
 
@@ -1485,6 +1514,10 @@ def test_query_nearest_matches_meshlib(device: str, k: int) -> None:
     plausible-looking answer. The self-column assert is what pins that: triwarp's own first column
     must be the identity before anything is dropped.
 
+    Both backends, as every other k-NN comparison in this file: meshlib's answer does not depend on
+    which structure triwarp asks, so the ``k=1`` markers cover the hash-grid group as well as the
+    BVH one.
+
     This is the batched form deliberately. ``findFewClosestPoints`` is per query and a Python loop
     over it would time the loop, which is the same reason section 6 prefers ``mrmeshnumpy``'s
     batched curvature calls.
@@ -1494,6 +1527,9 @@ def test_query_nearest_matches_meshlib(device: str, k: int) -> None:
     points_wp = wp.array(
         np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=device
     )
+    query_nearest = (
+        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
+    )
 
     neighbours_ml = np.array(
         [
@@ -1502,7 +1538,7 @@ def test_query_nearest_matches_meshlib(device: str, k: int) -> None:
         ]
     ).reshape(points_np.shape[0], k)
 
-    indices_wp, _distances_wp = tw.neighbors.query_bvh_nearest(points_wp, points_wp, k=k + 1)
+    indices_wp, _distances_wp = query_nearest(points_wp, points_wp, k=k + 1)
     indices_np = indices_wp.numpy().reshape(points_np.shape[0], k + 1)
 
     assert np.array_equal(indices_np[:, 0], np.arange(points_np.shape[0]))  # the self column
@@ -1529,7 +1565,7 @@ def test_query_nearest_matches_meshlib(device: str, k: int) -> None:
     projections_ml = mm.std_vector_PointsProjectionResult()
     projector_ml.findProjections(projections_ml, queries_ml, mm.FindProjectionOnPointsSettings())
 
-    nearest_wp, distances_wp = tw.neighbors.query_bvh_nearest(points_wp, queries_wp, k=1)
+    nearest_wp, distances_wp = query_nearest(points_wp, queries_wp, k=1)
     assert np.array_equal(
         nearest_wp.numpy(), np.array([int(result.vId) for result in projections_ml])
     )

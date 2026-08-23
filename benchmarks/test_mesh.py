@@ -45,9 +45,9 @@ from __future__ import annotations
 
 import pytest
 import trimesh as tm
-from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 # ``is_watertight`` composes a self-intersection pass over a fresh BVH; a few rounds is enough.
 _ROUNDS = 3
@@ -128,9 +128,43 @@ def test_face_adjacency(bench_case: BenchCase, warm: bool) -> None:
         )
 
 
+def _time_trimesh_property(
+    bench_case: BenchCase, name: str, *, warm: bool, rounds: int = 10
+) -> None:
+    """
+    Time the matching ``tm.Trimesh`` cached property or method, cold or warm.
+
+    The trimesh side caches exactly the way this container does, which is what makes the cold rows
+    comparable and the warm rows meaningful on both sides: cold rebuilds the ``Trimesh`` inside the
+    timed callable so every round pays the computation, warm forces the attribute once outside it
+    and then measures the memoized access.
+
+    ``getattr`` covers both shapes because ``outline`` is a method and ``is_watertight`` a property
+    -- calling the result when it is callable is what lets one helper serve both, and trimesh caches
+    the method's internals either way (see ``benchmarks/test_boundary.py``).
+    """
+    vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+    def force(mesh_tm: tm.Trimesh) -> object:
+        attribute = getattr(mesh_tm, name)
+        return attribute() if callable(attribute) else attribute
+
+    if warm:
+        mesh_tm = tm.Trimesh(vertices_np, faces_np, process=False)
+        assert force(mesh_tm) is not None
+        assert bench_case.run(lambda: force(mesh_tm), rounds=rounds) is not None
+    else:
+        assert (
+            bench_case.run(
+                lambda: force(tm.Trimesh(vertices_np, faces_np, process=False)), rounds=rounds
+            )
+            is not None
+        )
+
+
 @pytest.mark.benchmark(group="mesh_boundary_loops")
 @pytest.mark.benchaxis("loops")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "trimesh")
 @pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
 def test_boundary_loops(bench_case: BenchCase, warm: bool) -> None:
     """
@@ -139,16 +173,38 @@ def test_boundary_loops(bench_case: BenchCase, warm: bool) -> None:
     The one property whose cold cost depends on something other than size, so it gets the ``loops``
     axis rather than the scan sweep -- six rows that show the caching gap and the loop-count gap at
     once. [`test_boundary.py`](test_boundary.py) measures the underlying function.
+
+    ``Trimesh.outline()`` is the reference, the same call that module's ``boundary_loops`` group
+    times -- and it belongs here for the reason the whole module exists: it is a *cached* entry
+    point on the class this one mirrors, so the warm/cold pair is a like-for-like comparison of two
+    containers rather than of two loop extractors. Its answer is a ``Path3D`` of the same loops,
+    which ``tests/test_boundary.py`` compares as ordered vertex lists.
     """
+    if bench_case.kind == "trimesh":
+        _time_trimesh_property(bench_case, "outline", warm=warm)
+        return
     _time_property(bench_case, "boundary_loops", warm=warm)
 
 
 @pytest.mark.benchmark(group="mesh_is_watertight")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "trimesh")
 @pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
 def test_is_watertight(bench_case: BenchCase, warm: bool) -> None:
-    """``is_watertight``: the priciest property, since it builds a BVH for self-intersection."""
+    """
+    ``is_watertight``: the priciest property, since it builds a BVH for self-intersection.
+
+    ``Trimesh.is_watertight`` is the reference and carries the caveat its own group in
+    ``benchmarks/test_validation.py`` records: trimesh answers the *edge-manifold* clause alone,
+    where triwarp's property composes that with a self-intersection pass over a fresh BVH. So the
+    trimesh row is a **lower bound** on this group's work rather than the same computation, and the
+    cold ratio should be read as "what the self-intersection half costs" -- which is the number the
+    property's docstring is really about. The two agree on edge-manifold input, which is what
+    ``tests/test_validation.py`` pins.
+    """
     skip_larger_than(bench_case, "dragon", "the self-intersection pass dominates beyond dragon")
+    if bench_case.kind == "trimesh":
+        _time_trimesh_property(bench_case, "is_watertight", warm=warm, rounds=_ROUNDS)
+        return
     _time_property(bench_case, "is_watertight", warm=warm, rounds=_ROUNDS)
 
 

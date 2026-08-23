@@ -492,9 +492,10 @@ def test_mesh_with_mesh(bench_case: BenchCase, offset_fraction: float) -> None:
 @pytest.mark.noparity(
     "pyvista",
     oracle="meshlib",
-    reason="D2 a different quantity with a measured disagreement: PolyData.collision counts contact "
-    "pairs from VTK's OBB tree rather than the set of crossing triangles, and it reports 2 600 hits "
-    "for a 320-cell mesh against its own copy where 0 triangles cross. Its row is a cost "
+    reason="D2 a different quantity with a measured disagreement: PolyData.collision counts "
+    "contact pairs from VTK's OBB tree rather than the set of crossing triangles, and it "
+    "reports 2 600 hits for a 320-cell mesh against its own copy where 0 triangles cross. "
+    "Its row is a cost "
     "comparison; meshlib's findCollidingTriangleBitsets is the oracle, in "
     "tests/test_intersection.py::test_mesh_collision_pairs_matches_meshlib.",
 )

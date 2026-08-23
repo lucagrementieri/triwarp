@@ -14,7 +14,12 @@ from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.comparisons import assert_cyclic_permutation_equal, boundary_loop_sizes, lexsort_rows
+from tests.comparisons import (
+    assert_same_loop_set,
+    boundary_loop_sizes,
+    lexsort_rows,
+    trimesh_outline_loops,
+)
 from tests.conversions import (
     pyvista_edges_to_indices,
     trimesh_to_meshlib,
@@ -233,33 +238,21 @@ def test_boundary_loops_matches_trimesh_outline(
     """
     Class B: ``Trimesh.outline()`` returns the same loops as ``Path3D`` entities.
 
-    Three named transforms, all conventions rather than results. The entities index into
-    ``Path3D.vertices``, which is the mesh's own vertex array unchanged, so no remapping is needed.
-    A closed entity **repeats its first point** as the last one, so that trailing duplicate is
-    dropped. And neither the loop *order* within the list (triwarp ranks by length, trimesh by
-    traversal) nor the starting point and direction *within* a loop are defined by either library,
-    so the lists are paired by lowest vertex index and compared with
-    [`tests.comparisons.assert_cyclic_permutation_equal`][].
+    Three named transforms, all conventions rather than results, and all three live in
+    [`tests.comparisons.trimesh_outline_loops`][] and
+    [`tests.comparisons.assert_same_loop_set`][] because
+    ``tests/test_mesh.py`` needs the identical pair for the ``Trimesh`` container property: the
+    entities index the mesh's own vertex array, a closed entity repeats its first point as its last,
+    and neither the order between loops nor the starting point within one is defined by either
+    library.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
-    outline_tm = mesh_tm.outline()
-    assert np.allclose(outline_tm.vertices, mesh_tm.vertices)
-    loops_tm = []
-    for entity in outline_tm.entities:
-        assert bool(entity.closed), "an open outline entity means the fixture is not a clean rim"
-        points = np.asarray(entity.points)
-        assert points[0] == points[-1]
-        loops_tm.append(points[:-1])
+    loops_tm = trimesh_outline_loops(mesh_tm)
     loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
 
-    assert len(loops_wp) == len(loops_tm)
-    for loop_wp, loop_tm in zip(
-        sorted((loop.numpy() for loop in loops_wp), key=lambda loop: int(loop.min())),
-        sorted(loops_tm, key=lambda loop: int(loop.min())),
-        strict=True,
-    ):
-        assert_cyclic_permutation_equal(loop_wp, loop_tm)
+    assert len(loops_tm) > 0  # non-vacuous: these fixtures have rims
+    assert_same_loop_set([loop.numpy() for loop in loops_wp], loops_tm)
 
 
 def _meshlib_hole_rings(mesh_ml: mm.Mesh) -> list[list[tuple[int, int]]]:

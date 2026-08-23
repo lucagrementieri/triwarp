@@ -842,8 +842,8 @@ def test_remove_spikes(bench_case: BenchCase) -> None:
     On a clean mesh this is a *detector* -- one pass finds nothing and the loop stops -- so the row
     is really the cost of asking, which is what a caller pays unconditionally in a repair pipeline.
     That makes it comparable with meshlib's ``removeSpikes`` on the same input, since that also
-    finds nothing to do; and it means the row is dominated by ``face_angles`` plus the scatter rather
-    than by any displacement.
+    finds nothing to do; and it means the row is dominated by ``face_angles`` plus the scatter
+    rather than by any displacement.
 
     meshlib mutates in place, so its mesh is rebuilt per round the way the other ``repair`` rows do.
     Both sides are pinned against each other on a genuinely spiky mesh in

@@ -23,6 +23,13 @@ unusable as an oracle -- sorting dissolves it, and
 ``tests/test_edges.py::test_edges_unique_matches_potpourri3d`` asserts the two edge sets are equal.
 It has no counterpart for the directed, per-corner or length variants.
 
+**libigl does have a length variant**, which this paragraph used to omit while making the claim
+above about potpourri3d: ``igl.edge_lengths(V, F)`` is the same ``(n_faces, 3)`` per-corner table
+``face_edge_lengths`` returns, in the same column order, so that group is a direct comparison rather
+than an unreferenced one. (``igl.squared_edge_lengths`` is bound as well and would pair with a
+squared entry point; triwarp has none, so there is no row for it.) igl still has no *unique*-edge
+length list, which is why ``edges_unique_length`` and ``edges_length`` stay triwarp-only.
+
 **pymeshlab** appears in ``mean_unique_edge_length`` alone. ``get_geometric_measures`` returns
 ``avg_edge_length`` in a dict alongside the area, volume, barycentre and inertia tensor, so it is an
 *upper* bound on the mean edge length taken by itself; the same call is the ``centroid`` reference
@@ -39,10 +46,10 @@ import numpy as np
 import potpourri3d as pp3d
 import pytest
 import trimesh as tm
-from conftest import BenchCase, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 
 @pytest.mark.benchmark(group="faces_to_edges")
@@ -95,20 +102,20 @@ def test_edges_face(bench_case) -> None:
         assert result.shape == (n_faces * 3,)
 
 
-@pytest.mark.benchmark(group="edges_unique")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista")
-def test_edges_unique(bench_case) -> None:
+def _run_edges_unique_reference(bench_case) -> None:
+    """
+    Time whichever unique-undirected-edge reference this case names.
+
+    Shared by the two ``edges_unique`` groups because the ``n_vertices=`` hint is triwarp's own
+    parameter: no reference takes a vertex-count hint, so each one runs the identical call in both
+    groups and its two rows are a fixed bar against triwarp's with/without pair.
+    """
     if bench_case.kind == "pyvista":
         # ``extract_all_edges`` returns the same unique undirected set, wrapped in a line-cell
         # PolyData -- so its row carries the container build as well as the grouping.
         mesh_pv = bench_case.mesh_pv
         edges_pv = bench_case.run(mesh_pv.extract_all_edges)
         assert edges_pv.n_cells > 0
-        return
-    if bench_case.kind == "triwarp":
-        faces, nv = bench_case.faces_wp, bench_case.n_vertices
-        unique_edges, _ = bench_case.run(lambda: tw.edges.edges_unique(faces, n_vertices=nv))
-        assert unique_edges.shape[1] == 2
     elif bench_case.kind == "trimesh":
         faces = bench_case.faces_np
 
@@ -125,15 +132,34 @@ def test_edges_unique(bench_case) -> None:
         assert result.shape[1] == 2
 
 
+@pytest.mark.benchmark(group="edges_unique")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista")
+def test_edges_unique(bench_case) -> None:
+    if bench_case.kind != "triwarp":
+        _run_edges_unique_reference(bench_case)
+        return
+    faces, nv = bench_case.faces_wp, bench_case.n_vertices
+    unique_edges, _ = bench_case.run(lambda: tw.edges.edges_unique(faces, n_vertices=nv))
+    assert unique_edges.shape[1] == 2
+
+
 @pytest.mark.benchmark(group="edges_unique_auto_nv")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista")
 def test_edges_unique_auto_n_vertices(bench_case) -> None:
     """
     Time ``edges_unique`` without the ``n_vertices=`` shortcut.
 
     Exercises the internal vertex-count inference (a full-array host max before the
     ``n_vertices`` device-reduce fix).
+
+    The same three references ``edges_unique`` times, because the hint is triwarp's parameter and
+    none of them has one: they compute the identical unique edge list either way, so their rows are
+    the fixed bar and the difference between the two groups is entirely triwarp's inference. Read
+    the pair, not this row alone -- on its own it prices a reference that never changes.
     """
+    if bench_case.kind != "triwarp":
+        _run_edges_unique_reference(bench_case)
+        return
     faces = bench_case.faces_wp
     unique_edges, _ = bench_case.run(lambda: tw.edges.edges_unique(faces))
     assert unique_edges.shape[1] == 2
@@ -333,9 +359,22 @@ def test_mean_unique_edge_length(bench_case) -> None:
 
 
 @pytest.mark.benchmark(group="face_edge_lengths")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "igl")
 def test_face_edge_lengths(bench_case: BenchCase) -> None:
-    """The table alone: one pass, three lengths per face, no reduction."""
+    """
+    The table alone: one pass, three lengths per face, no reduction.
+
+    ``igl.edge_lengths(V, F)`` returns the identical ``(n_faces, 3)`` per-corner table in the same
+    column order -- measured agreeing to 3.7e-08 (triwarp's float32 vertex buffer) on icosphere(2),
+    where every column permutation differs by 0.045, so the match is the convention and not a
+    coincidence. The one row in this module where igl has a *length* entry point; the module
+    docstring used to say no reference did.
+    """
+    if bench_case.kind == "igl":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        lengths_igl = bench_case.run(lambda: igl.edge_lengths(vertices_np, faces_np))
+        assert lengths_igl.shape == (bench_case.n_faces, 3)
+        return
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     lengths = bench_case.run(lambda: tw.edges.face_edge_lengths(vertices, faces))
     assert lengths.shape == (bench_case.n_faces, 3)

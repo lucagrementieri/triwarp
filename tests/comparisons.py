@@ -280,6 +280,52 @@ def assert_cyclic_permutation_equal(loop_a: np.ndarray, loop_b: np.ndarray) -> N
     )
 
 
+def trimesh_outline_loops(mesh_tm: tm.Trimesh) -> list[np.ndarray]:
+    """
+    Decode ``Trimesh.outline()`` into one vertex-index array per closed boundary loop.
+
+    Two conventions, and neither is visible from the returned object's type. The ``Path3D``
+    entities index into ``Path3D.vertices``, which is the mesh's own vertex array unchanged -- so no
+    remapping is needed, and this asserts that rather than assuming it. And a **closed entity
+    repeats its first point as its last**, so the trailing duplicate is dropped; leaving it in makes
+    every loop one longer than triwarp's and reads as an off-by-one in triwarp.
+
+    Neither the loop order within the list nor the starting point and direction within a loop is
+    defined by either library, so pair the results by lowest vertex index and compare with
+    [`assert_cyclic_permutation_equal`][tests.comparisons.assert_cyclic_permutation_equal].
+
+    Shared by the free-function comparison in ``tests/test_boundary.py`` and the ``Trimesh``
+    container one in ``tests/test_mesh.py``, which time as separate benchmark groups.
+    """
+    outline_tm = mesh_tm.outline()
+    assert np.allclose(outline_tm.vertices, mesh_tm.vertices)  # entities index the mesh's own array
+    loops_tm = []
+    for entity in outline_tm.entities:
+        assert bool(entity.closed), "an open outline entity means the fixture is not a clean rim"
+        points = np.asarray(entity.points)
+        assert points[0] == points[-1]
+        loops_tm.append(points[:-1])
+    return loops_tm
+
+
+def assert_same_loop_set(loops_a: list[np.ndarray], loops_b: list[np.ndarray]) -> None:
+    """
+    Assert two unordered collections of closed loops describe the same cycles.
+
+    The list-level counterpart of
+    [`assert_cyclic_permutation_equal`][tests.comparisons.assert_cyclic_permutation_equal]: pairs
+    the loops by lowest vertex index (no library defines the order between loops -- triwarp ranks by
+    length, trimesh by traversal) and then compares each pair up to starting point and direction.
+    """
+    assert len(loops_a) == len(loops_b), f"loop counts differ: {len(loops_a)} vs {len(loops_b)}"
+    for loop_a, loop_b in zip(
+        sorted((np.asarray(loop).ravel() for loop in loops_a), key=lambda loop: int(loop.min())),
+        sorted((np.asarray(loop).ravel() for loop in loops_b), key=lambda loop: int(loop.min())),
+        strict=True,
+    ):
+        assert_cyclic_permutation_equal(loop_a, loop_b)
+
+
 def fraction_within(
     values_a: np.ndarray, values_b: np.ndarray, rtol: float = 5e-2, atol: float = 5e-2
 ) -> float:
