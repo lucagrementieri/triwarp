@@ -302,10 +302,12 @@ def face_edge_lengths(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) ->
 
 def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
     """
-    Mean length of the ``3 * n_faces`` **per-face** edges (``CurvatureCalculator::getAverageEdge``).
+    Mean length of the ``3 * n_faces`` per-face edges, counting a shared edge once per face.
 
     Every face contributes all three of its edges, so an edge shared by two faces is counted twice
-    and a boundary edge once. That weighting is deliberate, not an oversight: it is the average
+    and a boundary edge once -- which is what separates this from
+    [`mean_unique_edge_length`][triwarp.edges.mean_unique_edge_length], the same average over each
+    edge once. That weighting is deliberate, not an oversight: it is the average
     libigl's ``CurvatureCalculator::getAverageEdge`` computes, which is what
     ``igl::principal_curvature`` calls to set its sphere-search radius, and what
     [`principal_curvature`][triwarp.curvature.principal_curvature] therefore uses here.

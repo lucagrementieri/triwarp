@@ -1,4 +1,31 @@
-"""Surface and volume sampling for triangular meshes."""
+"""
+Generative sampling: new points on a mesh surface, inside its volume, or over a sphere.
+
+Everything here *creates* points -- uniformly over the faces
+([`sample_surface`][triwarp.sample.sample_surface]), spaced at least ``radius`` apart
+([`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk],
+[`sample_surface_blue_noise`][triwarp.sample.sample_surface_blue_noise]), inside a watertight solid
+([`sample_volume`][triwarp.sample.sample_volume]), or over a sphere, hemisphere or cone as a
+low-discrepancy Fibonacci lattice (the ``sample_fibonacci_*`` family, which take a count and no
+mesh at all).
+
+*Subsampling* an existing cloud is the other question and lives with the data structures that
+answer it: [`points.farthest_point_sample`][triwarp.points.farthest_point_sample] for an exact
+count, and [`voxels.voxel_down_sample`][triwarp.voxels.voxel_down_sample] for one representative
+per occupied cell. Neither belongs here -- each is a reduction of points a caller already has.
+
+The one function here that reads like a subsampler and is not is
+[`sample_surface_blue_noise`][triwarp.sample.sample_surface_blue_noise]: it draws its own dense pool
+from the surface and thins *that*, so its input is a mesh and its output is new points, never a
+subset of anything the caller passed.
+
+See Also
+--------
+[`points.farthest_point_sample`][triwarp.points.farthest_point_sample]
+    Subsample an existing cloud to an exact count.
+[`voxels.voxel_down_sample`][triwarp.voxels.voxel_down_sample]
+    Subsample an existing cloud to one point per occupied voxel.
+"""
 
 from __future__ import annotations
 

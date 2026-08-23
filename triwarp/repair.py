@@ -991,7 +991,7 @@ def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
 
 
 def make_volume(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], multibody: bool = False
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, multibody: bool = False
 ) -> wp.array[wp.int32]:
     """
     Orient faces so the mesh encloses a positive signed volume (normals point outward).
@@ -1086,7 +1086,7 @@ def make_volume(
 
 
 def make_normals_outward(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], multibody: bool = False
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, multibody: bool = False
 ) -> wp.array[wp.int32]:
     """
     Make winding consistent and orient normals outward (winding fix followed by inversion fix).

@@ -886,9 +886,9 @@ def test_fill_min_weight_batched_equals_per_loop(device: str, metric: str) -> No
     loops = _fillable_loops(vertices_wp, faces_wp)
     assert len(loops) >= 8
 
-    batched_np = tw.holes.fill_loops(vertices_wp, faces_wp, loops, metric, True).numpy()
+    batched_np = tw.holes.fill_loops_min_weight(vertices_wp, faces_wp, loops, metric, True).numpy()
     per_loop = [
-        tw.holes.fill_loops(vertices_wp, faces_wp, [loop], metric, True).numpy()[
+        tw.holes.fill_loops_min_weight(vertices_wp, faces_wp, [loop], metric, True).numpy()[
             int(faces_wp.shape[0]) :
         ]
         for loop in loops

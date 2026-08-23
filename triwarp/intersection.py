@@ -955,7 +955,8 @@ def clip_mesh_with_field(
         [`fill_min_weight`][triwarp.holes.fill_min_weight] — so a closed input gives a closed
         output, and the returned vertices are the welded ones. On an input that already had a
         boundary, that boundary is sealed too; clip first and cap yourself with
-        [`fill_loops`][triwarp.holes.fill_loops] if only the section should close.
+        [`fill_loops_min_weight`][triwarp.holes.fill_loops_min_weight] if only the section should
+        close.
 
     Returns
     -------

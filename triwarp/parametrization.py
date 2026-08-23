@@ -124,7 +124,7 @@ def map_vertices_to_circle(
     vertices: wp.array[wp.vec3], boundary: wp.array[wp.int32]
 ) -> wp.array[wp.vec2]:
     """
-    Map an ordered boundary loop onto the unit circle by arc length (``map_vertices_to_circle``).
+    Map an ordered boundary loop onto the unit circle by arc length.
 
     Places boundary vertex ``i`` at angle ``2*pi * len[i] / total``, where ``len[i]`` is the
     cumulative edge length from ``boundary[0]`` to ``boundary[i]`` along the loop and ``total`` is
@@ -145,6 +145,10 @@ def map_vertices_to_circle(
     -------
     wp.array[wp.vec2]
         ``(n_boundary,)`` unit-circle positions on ``vertices.device``, aligned with ``boundary``.
+
+    Notes
+    -----
+    The name and the arc-length placement follow ``igl::map_vertices_to_circle``.
 
     See Also
     --------

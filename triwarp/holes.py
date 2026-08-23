@@ -54,6 +54,10 @@ join one boundary edge to another with a small patch or a curved strip, leaving 
 boundaries open, which is what joins two tubes at a chosen seam or adds a handle where the rim
 family would consume the whole loop.
 
+The return shape follows from that: a filler that only triangulates existing rim vertices returns
+``faces`` alone, while one that inserts a vertex -- a cone's apex, a refined patch's interior, an
+extrusion's projected ring -- returns ``(vertices, faces)``, because the position buffer grew too.
+
 Every filler returns a buffer **independent of** ``faces``, including on the no-op path where
 there was no hole to fill, so a caller may write into the result without disturbing its input.
 """
@@ -477,7 +481,7 @@ def fill_min_weight(
     )
 
 
-def fill_loops(
+def fill_loops_min_weight(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     loops: list[wp.array[wp.int32]],
@@ -542,9 +546,10 @@ def _fill_packed_loops(
     """
     Min-weight-triangulate every packed loop **together** and append the fill faces.
 
-    The engine behind [`fill_loops`][triwarp.holes.fill_loops]. Everything before the
-    traceback is batched across loops — one Newell-normal and longest-edge pass, one chord pass over
-    the mesh, one ragged ``dp`` / ``prev`` pair, one launch per span rather than per (loop, span),
+    The engine behind [`fill_loops_min_weight`][triwarp.holes.fill_loops_min_weight]. Everything
+    before the traceback is batched across loops — one Newell-normal and longest-edge pass, one
+    chord pass over the mesh, one ragged ``dp`` / ``prev`` pair, one launch per span rather than
+    per (loop, span),
     and a device-side min-area retry mask instead of a host branch per loop. What is left on the
     host is the ``O(B)`` traceback, which reads *one* packed predecessor table.
     """
@@ -773,7 +778,8 @@ def fill_small(
     Fill only boundary loops whose perimeter is at most ``max_perimeter``.
 
     Intended open boundaries (large loops) are left untouched; spurious small holes are sealed by
-    the shared min-weight interval DP ([`fill_loops`][triwarp.holes.fill_loops]). Used by
+    the shared min-weight interval DP
+    ([`fill_loops_min_weight`][triwarp.holes.fill_loops_min_weight]). Used by
     [`triwarp.reconstruction.triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
     to seal small gaps left by sparse or non-uniform point-cloud sampling.
 
@@ -796,7 +802,7 @@ def fill_small(
     See Also
     --------
     [`fill_min_weight`][triwarp.holes.fill_min_weight]
-    [`fill_loops`][triwarp.holes.fill_loops]
+    [`fill_loops_min_weight`][triwarp.holes.fill_loops_min_weight]
     """
     packed = _hole_loops(vertices, faces)
     if packed is None:
