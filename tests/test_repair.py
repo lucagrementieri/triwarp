@@ -2111,19 +2111,29 @@ def test_remove_degenerate_faces_matches_trimesh(device: str) -> None:
     assert _triangle_set_close(kept_wp, kept_ref, atol=1e-5)
 
 
-@pytest.mark.parity("remove_degenerate_faces", "meshlib")
+@pytest.mark.parity("remove_degenerate_faces", "meshlib", "trimesh", "pymeshlab")
 def test_remove_degenerate_faces_matches_meshlib(device: str) -> None:
     """
-    Class B (compare detection): ``findDegenerateFaces`` reports the faces this function drops.
+    Class B (compare detection): three references report the faces this function drops.
 
-    MeshLib has no remover, so the transform is the same one the pymeshlab fold comparison makes --
-    compare the *mask* rather than the output mesh, then check the removal against it. Its
-    ``criticalAspectRatio`` selects additional near-degenerate slivers above the truly degenerate
-    ones; at its ``FLT_MAX`` default only the zero-area faces are reported, which is triwarp's
-    criterion, so the default is the setting compared here and is asserted to be insensitive over
-    three orders of magnitude on this input.
+    MeshLib and trimesh have no remover, so the transform is the same one the pymeshlab fold
+    comparison makes -- compare the *mask* rather than the output mesh, then check the removal
+    against it. MeshLib's ``criticalAspectRatio`` selects additional near-degenerate slivers above
+    the truly degenerate ones; at its ``FLT_MAX`` default only the zero-area faces are reported,
+    which is triwarp's criterion, so the default is the setting compared here and is asserted to be
+    insensitive over three orders of magnitude on this input. trimesh's ``nondegenerate_faces``
+    returns the mask directly at a ``height`` of 1e-08, the same order as triwarp's own
+    ``TOLERANCE_ZERO``; pymeshlab's ``meshing_remove_null_faces`` rebuilds, so its answer is a face
+    *count* and the comparison is on that.
 
-    Non-vacuous by construction: one collinear triangle among two good ones, so both sides return a
+    **open3d is deliberately absent, and the divergence is pinned here rather than assumed.**
+    ``remove_degenerate_triangles`` removes a triangle that references a vertex **twice**, not one
+    of zero area: on this very input it removes **nothing** where the other three all find the
+    collinear face. On a repeated-index face it agrees with them, which is asserted too -- so this
+    is a narrower predicate rather than a broken one, and a probe built on ``[0, 0, 1]`` would have
+    read it as agreement.
+
+    Non-vacuous by construction: one collinear triangle among two good ones, so every side returns a
     mixed answer and neither an empty nor a full mask would pass.
     """
     vertices_np = np.array(
@@ -2141,8 +2151,31 @@ def test_remove_degenerate_faces_matches_meshlib(device: str) -> None:
         mm.findDegenerateFaces(mm.MeshPart(mesh_ml)), faces_np.shape[0]
     )
 
+    mesh_tm = tm.Trimesh(vertices_np, faces_np, process=False)
+    keep_tm = np.asarray(mesh_tm.nondegenerate_faces(height=1e-8))
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.meshing_remove_null_faces()
+    n_kept_pml = int(meshset_pml.current_mesh().face_number())
+
     assert degenerate_ml.sum() == 1  # non-vacuity: the reference found exactly the collinear face
+    assert int((~keep_tm).sum()) == 1
+    assert n_kept_pml == 2
     assert np.array_equal(~keep_wp.numpy(), degenerate_ml)
+    assert np.array_equal(keep_wp.numpy(), keep_tm)
+    assert int(keep_wp.numpy().sum()) == n_kept_pml
+
+    # open3d's criterion is repeated *indices*, not zero area -- it sees nothing here...
+    mesh_o3d = trimesh_to_open3d(mesh_tm)
+    mesh_o3d.remove_degenerate_triangles()
+    assert len(mesh_o3d.triangles) == faces_np.shape[0]
+    # ...and agrees with the other three on a face that names a vertex twice.
+    repeated_np = np.array([[0, 1, 2], [1, 3, 2], [0, 1, 1]], dtype=np.int32)
+    repeated_tm = tm.Trimesh(vertices_np, repeated_np, process=False)
+    repeated_o3d = trimesh_to_open3d(repeated_tm)
+    repeated_o3d.remove_degenerate_triangles()
+    assert len(repeated_o3d.triangles) == 2
+    assert int((~np.asarray(repeated_tm.nondegenerate_faces(height=1e-8))).sum()) == 1
     assert int(kept_faces_wp.shape[0]) // 3 == int((~degenerate_ml).sum())
     assert int(kept_vertices_wp.shape[0]) == 4  # the collinear apex is now unreferenced
 

@@ -656,6 +656,88 @@ def test_face_self_intersecting_mask_two_boxes_matches_meshlib(device: str) -> N
     assert np.array_equal(mask_wp.numpy(), mask_ml)
 
 
+@pytest.mark.parity("face_self_intersecting_mask", "open3d", "pymeshlab")
+@pytest.mark.parametrize("kind", ["boxes", "spheres", "clean"])
+def test_face_self_intersecting_mask_matches_open3d_and_pymeshlab(device: str, kind: str) -> None:
+    """
+    Class A for pymeshlab (a per-face bool array), Class B for open3d (pairs reduced to a set).
+
+    These are the fourth and fifth implementations of the predicate, and five is worth having on
+    this one because it is the clause ``is_watertight`` reduces and the post-condition
+    ``fix_self_intersections`` is verified by -- so a shared bug here would pass three tests in two
+    files.
+
+    ``compute_selection_by_self_intersections_per_face`` writes the selection onto
+    ``current_mesh()`` and ``face_selection_array()`` reads it back as a bool array, which needs no
+    transform at all and matches triwarp's mask **exactly on all three inputs**.
+    ``get_self_intersecting_triangles`` returns colliding **pairs**, so ``np.unique`` over them is
+    the named transform.
+
+    Measured, faces flagged of the input's total:
+
+    | input | triwarp | meshlib | pymeshlab | open3d |
+    |---|---|---|---|---|
+    | two boxes offset (0.5, 0.5, 0.5), 24 faces | 12 | 12 | 12 | **11** |
+    | two icosphere(2) offset 0.7, 640 faces | 84 | 84 | 84 | 84 |
+    | one icosphere(2), 320 faces | 0 | 0 | 0 | 0 |
+
+    **open3d is one short on the boxes, and that is pinned rather than tolerated.** It is the same
+    configuration ``tests/test_intersection.py``'s
+    ``test_mesh_collision_pairs_beats_meshlib_on_axis_aligned_boxes`` records: every crossing there
+    is between axis-aligned triangles with parallel edges, which a separating-axis narrow phase gets
+    wrong and an interval test does not. So open3d's answer is asserted as a strict **subset** on
+    that input and as an equality on the other two -- and a future open3d that found all 12 would
+    fail here, which is the point of pinning it.
+
+    Worth knowing before generalising: **MeshLib gets these boxes right** (12) although its
+    *two-mesh* entry point gets the equivalent pair wrong (5 and 4 of 6 and 6). The single-mesh and
+    two-mesh paths are different code, so a divergence measured on one says nothing about the other.
+
+    Non-vacuous in both directions by construction, and the counts are asserted rather than merely
+    compared: two of the three inputs intersect and the third does not, so a reference that silently
+    returned nothing would fail rather than agree.
+    """
+    if kind == "boxes":
+        first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+        second_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+        second_tm.apply_translation([0.5, 0.5, 0.5])
+        mesh_tm = tm.util.concatenate([first_tm, second_tm])
+        mesh_tm.merge_vertices()
+        n_expected = 12
+    elif kind == "spheres":
+        first_tm = tm.creation.icosphere(subdivisions=2)
+        second_tm = tm.creation.icosphere(subdivisions=2)
+        second_tm.apply_translation([0.7, 0.0, 0.0])
+        mesh_tm = tm.util.concatenate([first_tm, second_tm])
+        n_expected = 84
+    else:
+        mesh_tm = tm.creation.icosphere(subdivisions=2)
+        n_expected = 0
+
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    mask_np = tw.validation.face_self_intersecting_mask(vertices_wp, faces_wp).numpy()
+
+    pairs_o3d = np.asarray(trimesh_to_open3d(mesh_tm).get_self_intersecting_triangles())
+    faces_o3d = np.unique(pairs_o3d) if pairs_o3d.size else np.empty(0, dtype=np.int64)
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.compute_selection_by_self_intersections_per_face()
+    mask_pml = np.asarray(meshset_pml.current_mesh().face_selection_array())
+
+    assert int(mask_np.sum()) == n_expected  # non-vacuity, and it pins the fixture
+    assert int(mask_pml.sum()) == n_expected
+    assert np.array_equal(mask_np, mask_pml)
+
+    triwarp_faces = np.flatnonzero(mask_np).astype(np.int64)
+    if kind == "boxes":
+        # The parallel-edge configuration open3d's narrow phase misses one of.
+        assert faces_o3d.shape[0] == n_expected - 1
+        assert set(faces_o3d.tolist()) < set(triwarp_faces.tolist())
+    else:
+        assert faces_o3d.shape[0] == n_expected
+        assert np.array_equal(faces_o3d.astype(np.int64), triwarp_faces)
+
+
 @pytest.mark.parity("face_self_intersecting_mask", "pymeshfix")
 @pytest.mark.parity(
     "is_self_intersecting",

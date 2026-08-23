@@ -752,7 +752,7 @@ def test_remove_t_vertices(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="remove_degenerate_faces")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "trimesh", "pymeshlab")
 def test_remove_degenerate_faces(bench_case: BenchCase) -> None:
     """
     Find the zero-area triangles and compact them away: an altitude test, a scan and a gather.
@@ -763,11 +763,37 @@ def test_remove_degenerate_faces(bench_case: BenchCase) -> None:
     Both sides should be flat across the axis -- neither's cost depends on how many it finds -- and
     a row that is not is the finding.
 
-    meshlib's ``findDegenerateFaces`` returns the same face set (asserted in
-    ``tests/test_repair.py``) and stops there, so it does strictly less than triwarp's row, which
-    also rebuilds the mesh without those faces. Its ``criticalAspectRatio`` is left at its
-    ``FLT_MAX`` default, the setting under which its criterion is triwarp's.
+    Three references, and the split between them is *detect* against *rebuild* -- which is what the
+    rows have to be read through, because triwarp does both:
+
+    * **meshlib** ``findDegenerateFaces`` and **trimesh** ``Trimesh.nondegenerate_faces`` stop at
+      the face set, so they do strictly less. MeshLib's ``criticalAspectRatio`` is left at its
+      ``FLT_MAX`` default, the setting under which its criterion is triwarp's; trimesh's ``height``
+      is left at its ``1e-08`` default, the same order as triwarp's own ``TOLERANCE_ZERO``, which
+      triwarp does not expose as a parameter.
+    * **pymeshlab** ``meshing_remove_null_faces`` rebuilds, which is triwarp's whole operation. It
+      mutates, so its MeshSet is rebuilt per round.
+
+    All three find the same faces (``tests/test_repair.py``).
+
+    **open3d is deliberately absent, and the reason is a measured criterion difference rather than a
+    cost.** ``remove_degenerate_triangles`` removes triangles that *reference a vertex twice*, not
+    triangles of zero area: on an exactly collinear face -- (0,0,0), (0.5,0,0), (1,0,0), degenerate
+    in float64 -- it removes **nothing** (3 faces in, 3 out) where trimesh flags it and pymeshlab
+    drops it. On a repeated-index face all three agree, which is why an injected-degeneracy probe
+    using ``[0, 0, 1]`` reads as agreement and hides this. Timing it here would price a
+    strictly narrower predicate under this group's name.
     """
+    if bench_case.kind == "trimesh":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        mesh_tm = tm.Trimesh(vertices_np, faces_np, process=False)
+        kept_tm = bench_case.run(lambda: mesh_tm.nondegenerate_faces(height=1e-8))
+        assert np.asarray(kept_tm).shape[0] == bench_case.n_faces
+        return
+    if bench_case.kind == "pymeshlab":
+        meshset_pml = bench_case.new_meshset_pml
+        bench_case.run(lambda: meshset_pml().meshing_remove_null_faces())
+        return
     if bench_case.kind == "meshlib":
         mesh_part_ml = mm.MeshPart(bench_case.new_mesh_ml())
         degenerate_ml = bench_case.run(lambda: mm.findDegenerateFaces(mesh_part_ml))

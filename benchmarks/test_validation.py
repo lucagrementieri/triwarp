@@ -289,7 +289,7 @@ def test_is_volume(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="face_self_intersecting_mask")
 @pytest.mark.benchaxis("overlap")
-@pytest.mark.benchlibs("triwarp", "meshlib", "pymeshfix")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pymeshfix", "open3d", "pymeshlab")
 def test_face_self_intersecting_mask(bench_case: BenchCase) -> None:
     """
     The per-face self-intersection flags, which ``is_watertight`` reduces to a single bool.
@@ -315,7 +315,25 @@ def test_face_self_intersecting_mask(bench_case: BenchCase) -> None:
     ``load_array`` -- so read this row as query-plus-load and halve it for the query alone.
     ``tris_per_cell`` is its broad-phase bucket size and was measured not to change the answer at
     10 / 50 / 200.
+
+    open3d and pymeshlab are the fourth and fifth implementations of the same predicate, and having
+    five is worth the rows because this is the clause ``is_watertight`` reduces and the
+    post-condition ``fix_self_intersections`` is verified by. Both agree on the face *set*: measured
+    84 distinct faces on two icospheres offset 0.7, from open3d's ``(103, 2)`` colliding **pairs**
+    and from MeshLab's per-face bool selection. Two shape differences to read the rows through --
+    open3d returns pairs, so its output is larger than a mask and ``np.unique`` is the reduction
+    (that reduction is *outside* the timed callable, as triwarp's mask needs none); and MeshLab
+    mutates ``current_mesh()``, so its MeshSet is rebuilt per round.
     """
+    if bench_case.kind == "open3d":
+        mesh_o3d = bench_case.mesh_o3d
+        pairs_o3d = bench_case.run(mesh_o3d.get_self_intersecting_triangles)
+        assert np.asarray(pairs_o3d).shape[0] <= bench_case.n_faces
+        return
+    if bench_case.kind == "pymeshlab":
+        meshset_pml = bench_case.new_meshset_pml
+        bench_case.run(lambda: meshset_pml().compute_selection_by_self_intersections_per_face())
+        return
     if bench_case.kind == "pymeshfix":
         faces_pmf = bench_case.run(
             lambda: bench_case.new_tmesh_pmf().select_intersecting_triangles(
