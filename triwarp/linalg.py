@@ -1545,7 +1545,7 @@ def _multigrid_prune(matrix: wps.BsrMatrix[wp.float64]) -> wps.BsrMatrix[wp.floa
     It has to be a rebuild rather than ``bsr_compress``, which is the API for exactly this and
     **hard-faults**: compressing a ``bsr_mm`` result makes the *next* ``bsr_mm`` die with
     ``CUDA error 700: an illegal memory access`` inside ``wp_free_device_async`` on Warp 1.16.0,
-    which is the signature ``reference/warp_api/sparse.md`` already records as NVIDIA/warp#1769.
+    which is the signature reported as NVIDIA/warp#1769.
 
     !!! note "Re-probe both halves on the Warp 1.17 upgrade"
         NVIDIA/warp#1769 (*CUDA ``bsr_compress(inplace=True)`` treats trailing capacity as active*)

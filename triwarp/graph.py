@@ -464,8 +464,7 @@ def bfs(
     The discovery order, parent tree, and distances match
     [`scipy.sparse.csgraph.breadth_first_order`][] exactly when the adjacency columns are sorted
     ascending per row (as produced by [`edges_to_csr`][triwarp.graph.edges_to_csr]). This mirrors
-    ``igl::bfs`` (`reference/libigl/include/igl/bfs.cpp`), additionally returning the BFS level of
-    each node.
+    ``igl::bfs``, additionally returning the BFS level of each node.
 
     Two engines, chosen by the *observed frontier width* rather than by any property of the graph
     known up front. The traversal starts level-synchronous and parallel, and hands over to a single

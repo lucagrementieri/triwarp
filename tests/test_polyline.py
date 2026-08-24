@@ -1124,7 +1124,7 @@ def test_triangulate_too_few_points(device: str) -> None:
 
 
 def _simplify_np(pts_np: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray]:
-    # Mirrors reference/libigl/include/igl/ramer_douglas_peucker.cpp; returns (S, J).
+    # Mirrors ``igl::ramer_douglas_peucker``; returns (S, J).
     n = len(pts_np)
     keep = np.ones(n, dtype=bool)
     stol = tol * tol

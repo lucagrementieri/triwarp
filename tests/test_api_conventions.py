@@ -171,9 +171,9 @@ def test_warp_version_claims_are_not_stale() -> None:
     """
     No comment or docstring blames a Warp version older than the installed ``warp-lang``.
 
-    The defect this exists for: the 1.16 upgrade re-stamped all five ``reference/warp_api/``
-    mirrors -- ``warp_version.py`` makes that checkable -- and left twelve *code* justifications
-    citing bugs in 1.13-1.15, none re-probed. Six of those bugs were still real and one was not,
+    The defect this exists for: the 1.16 upgrade re-stamped all five local Warp API mirrors --
+    their version stamps make that checkable -- and left twelve *code* justifications citing
+    bugs in 1.13-1.15, none re-probed. Six of those bugs were still real and one was not,
     and nothing in the tree could tell them apart. Unlike the other eight checks this one scans
     ``kernels/`` too, since five of the twelve lived there.
 

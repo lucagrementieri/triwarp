@@ -239,10 +239,10 @@ def icosphere(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     Untranslated, unlike ``icosahedron``: a test that wants the origin off the centroid should move
     it itself, and several of the callers this replaced depend on the sphere being centred.
 
-    Function-scoped like every fixture here, so mutating ``mesh_tm.vertices`` in a test is safe --
-    see the note on session scoping in ``plans/better-tests.md`` for why it stays that way. Session
-    scoping was re-measured and declined: this fixture costs **1.15 ms** (0.97 ms of trimesh build
-    plus 0.18 ms of ``wp.Mesh``), so all of the suite's fixture construction is ~3 s of a 67 s run.
+    Function-scoped like every fixture here, so mutating ``mesh_tm.vertices`` in a test is safe.
+    Session scoping was re-measured and declined: this fixture costs **1.15 ms** (0.97 ms of
+    trimesh build plus 0.18 ms of ``wp.Mesh``), so all of the suite's fixture construction is
+    ~3 s of a 67 s run.
 
     **The 41 remaining inline ``tm.creation.icosphere`` sites are not migration debt**, which was
     checked rather than assumed: a classifier over all of them found **0** a fixture could take

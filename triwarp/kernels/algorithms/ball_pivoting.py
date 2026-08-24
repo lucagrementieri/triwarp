@@ -265,7 +265,8 @@ def push_front_edge(
     # This is hardening, **not** a fix for the intermittent ``CUDA error 700`` that
     # ``ball_pivoting`` still shows on a multi-cloud run: instrumenting ``CNT_OVERFLOW`` measured it
     # at **0**, with the front peaking near 0.1 % of capacity, so these scatters were cleared as the
-    # cause. See ``plans/benchmark-improve.md`` C0 for what is still open.
+    # cause. That fault's cause is still unidentified -- it needs the CUDA memory pool, and is
+    # invisible to both ``compute-sanitizer`` and Warp's debug mode.
     position = wp.atomic_add(counters, CNT_NEXT_FRONT, 1)
     if position < capacity:
         out_front[position] = slot

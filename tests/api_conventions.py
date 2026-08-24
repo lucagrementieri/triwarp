@@ -30,8 +30,9 @@ test run on any violation:
    entry is a permanent exemption, a helper called at module scope to build a constant.
 9. **A Warp-version claim names a version at least as new as the installed ``warp-lang``.** This is
    the one check that reads outside ``triwarp/``, and it exists because an upgrade left twelve
-   workarounds citing Warp 1.13-1.15 for a year: ``reference/warp_api/warp_version.py`` catches a
-   stale API *mirror*, and nothing caught a stale *justification*. Unlike checks 1-8 this one also
+   workarounds citing Warp 1.13-1.15 for a year. The local API mirrors carry a version stamp, so a
+   stale *mirror* is catchable; nothing caught a stale *justification*. Unlike checks 1-8 this one
+   also
    scans ``kernels/``, where five of those twelve lived -- and ``tests/`` and ``benchmarks/``, which
    is where the rot ran deepest. It scanned neither until eleven ``warp.optim.linear.cg`` skips had
    survived the 1.16 fix that made CPU ``cg`` converge, two of them naming versions 1.14-1.15 in

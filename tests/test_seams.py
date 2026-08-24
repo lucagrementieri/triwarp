@@ -535,7 +535,7 @@ def _seam_edges_np(
     match: str = "index",
     tolerance: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """CPU port of ``igl::seam_edges`` (``reference/libigl/include/igl/seam_edges.cpp``)."""
+    """CPU port of ``igl::seam_edges``."""
     directed = {
         (int(faces_np[f, i]), int(faces_np[f, (i + 1) % 3])): (f, i)
         for f in range(faces_np.shape[0])

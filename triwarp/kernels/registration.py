@@ -394,12 +394,11 @@ def solve_spd6(a: wp.spatial_matrix, b: wp.spatial_vector) -> wp.spatial_vector:
 
     Hand-written rather than routed through ``wp.dense_chol`` / ``wp.dense_subs`` /
     ``wp.dense_solve``, which look like exactly this function and are not usable here. Three
-    independent reasons, any one sufficient: they are ``hidden=True`` with ``doc="WIP"``, which is
-    why they appear in none of the mirrors under ``reference/warp_api/`` even though those track the
-    installed Warp faithfully; they take ``wp.array[wp.float32]`` rather than a register value, so
-    adopting them means per-thread global scratch for ``A``, ``L``, ``b`` and ``x``, which is the
-    shape measured at a 2x loss against registers; and they are ``float32``-only, so ``linalg``'s
-    ``float64`` systems could not use them either.
+    independent reasons, any one sufficient: they are ``hidden=True`` with ``doc="WIP"``, so they
+    are undocumented and unannounced in the installed Warp; they take ``wp.array[wp.float32]``
+    rather than a register value, so adopting them means per-thread global scratch for ``A``,
+    ``L``, ``b`` and ``x``, which is the shape measured at a 2x loss against registers; and they
+    are ``float32``-only, so ``linalg``'s ``float64`` systems could not use them either.
 
     The two zero ``wp.spatial_vector``s below are written out longhand although the
     ``wp.spatial_matrix`` one line up is the broadcast ``wp.spatial_matrix(wp.float32(0.0))``. That

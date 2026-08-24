@@ -650,10 +650,9 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
 # It measured 80 s of nvcc per block_dim variant, paid once and then cached
 # (a warm cached load is 59-75 ms). That is the cost of editing this file, not of
 # using it -- and against 66 forks of 14.2 s it is not close. If it ever does
-# become the bottleneck, the escape is ``plans/fast-test.md`` section 3.2: give
-# each generated kernel its own module with ``@wp.kernel(module="unique")``, the
-# way ``warp.sparse`` does, so a rebuild touches one kernel instead of all of
-# them.
+# become the bottleneck, the escape is to give each generated kernel its own
+# module with ``@wp.kernel(module="unique")``, the way ``warp.sparse`` does, so
+# a rebuild touches one kernel instead of all of them.
 #
 # Two rules for keeping it that way:
 #

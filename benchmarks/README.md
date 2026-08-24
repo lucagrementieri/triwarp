@@ -497,9 +497,9 @@ The rest are second or third independent implementations:
 
 #### Ported gaps: rows where pymeshlab is the *source*, not the reference
 
-The 24 filters MeshLab exposed that triwarp did not have were ported (bucket B of
-`plans/make-pymeshlab-a-first-class-reference.md`). Their benchmark rows read the other way round —
-the pymeshlab filter is the thing being caught up with, and in every case the port is the newer code:
+The 24 filters MeshLab exposed that triwarp did not have were ported. Their benchmark rows read
+the other way round — the pymeshlab filter is the thing being caught up with, and in every case
+the port is the newer code:
 
 | group | module | pymeshlab source filter | measured |
 |---|---|---|---|
@@ -654,7 +654,7 @@ wheel before planning a row around it. Two that do not, and will be looked for b
 
 igl reaches **74** of the matrix's 273 `(group, library)` pairs — **the most-covered reference in
 the suite** (trimesh and pymeshlab are next at 71 each), up from 27 before the coverage pass and 53
-before the twelve `plans/igl-first-class.md` ports landed. Nine of its groups did not exist before
+before the twelve igl-parity ports landed. Nine of its groups did not exist before
 the coverage pass: `sample_surface`, `face_angles`, `vertex_defects`,
 `face_connected_component_labels`, `ears`, `is_edge_manifold`, `remove_unreferenced_vertices`,
 `unique_faces`, plus the `icosahedron` case of `platonic_solids` — and the port pass added the
@@ -749,7 +749,7 @@ both in one pass — so the `unshared` row is an upper bound rather than like-fo
 | `knn` | Seven positional arguments; the octree is built over the *data* cloud, not the queries | `igl.knn(queries, points, k, *igl.octree(points)[:4])` |
 | `in_element` | Takes a live `igl.AABB`; there is no 3-argument overload | `aabb = igl.AABB(); aabb.init(V, Ele); igl.in_element(V, Ele, Q, aabb)` |
 | `crouzeix_raviart_cotmatrix` / `..._massmatrix` | Need `(V, F, E, EMAP)`, not `(V, F)` | `uem = igl.unique_edge_map(F)`, then `uem[1]` as `E` and `uem[2].ravel()` as `EMAP` |
-| `slim_precompute` | **Returns** the `SLIMData` rather than taking one, and demands Fortran order with **int32** faces, unlike every other binding | see `plans/igl-first-class.md` §2.3 |
+| `slim_precompute` | **Returns** the `SLIMData` rather than taking one, and demands Fortran order with **int32** faces, unlike every other binding | `data = igl.slim_precompute(np.asfortranarray(V), F.astype(np.int32), V_init, ...)` |
 | `isolines_intrinsic` | Takes `(F, S, vals)`; the `uE/EMAP/uEC/uEE` quintet the C++ header shows is not in the binding | `igl.isolines_intrinsic(F, S, vals)` |
 | `average_onto_vertices` | Its `S` is a per-face **scalar** `(n_faces,)`, not a per-face vector | `igl.average_onto_vertices(V, F, face_scalars)` |
 | `cut_mesh` | `C` is a **bool** `(n_faces, 3)` per-corner cut mask, not an edge list | `igl.cut_mesh(V, F, cuts_bool)` |

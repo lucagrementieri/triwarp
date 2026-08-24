@@ -118,7 +118,7 @@ def boundary_loops(
     grouped via connected-component labeling, then each vertex's ordinal position within its
     loop is ranked by following the successor chain from itself to its loop's canonical start
     (the smallest vertex index in the loop) — entirely GPU-parallel, mirroring
-    ``igl::boundary_loop`` (`reference/libigl/include/igl/boundary_loop.cpp`, first overload).
+    ``igl::boundary_loop`` (its first overload).
 
     All loops are found in one batched pass
     ([`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]); this is
