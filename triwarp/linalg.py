@@ -105,20 +105,36 @@ today is ``smooth_region``.
 **The rest of that family never sees a preconditioner choice at all**, which is the finding worth
 carrying forward: [`min_quad_with_fixed`][triwarp.linalg.min_quad_with_fixed] takes the default
 ``preconditioner="diag"``, so ``harmonic`` / ``tutte`` / ``lscm`` run Jacobi whatever the operator's
-conditioning and no threshold can reach them. Measured on the harmonic interior systems (iterations
-and solve time, ``theta`` at the value that wins each):
+conditioning and no threshold can reach them.
 
-| system | Jacobi | V-cycle | |
+**Routing them through ``"auto"`` was measured and is refuted.** End to end on the whole
+``harmonic`` call, five reps interleaved, medians:
+
+| system | ``"diag"`` | ``"auto"`` | |
 |---|---|---|---|
-| ``k=2`` saddle, 17 161 unknowns | 7 561 it / 214.2 ms | 426 it / 110.3 ms | **1.94x** |
-| ``k=1`` saddle_graded | 2 856 it / 71.4 | 48 it / 58.6 | 1.22x |
-| ``k=2`` saddle_small, 4 356 | 1 976 it / 56.3 | 268 it / 44.0 | 1.28x |
-| ``k=1`` saddle | 459 it / 32.4 | 16 it / 29.0 | 1.12x |
-| ``k=1`` saddle_small | 233 it / 6.9 | 14 it / 23.5 | **0.29x** |
+| ``k=2`` saddle, 17 161 unknowns | 199.1 ms | 119.6 ms | **1.66x** |
+| ``k=1`` saddle_small, 4 356 | 8.0 | 7.2 | 1.11x |
+| ``k=2`` saddle_small | 53.4 | 53.4 | 1.00x, converges inside the probe |
+| ``k=1`` saddle | 11.3 | 11.4 | 0.99x |
+| ``k=1`` saddle_graded | 58.5 | 78.9 | **0.74x** |
 
-That last row is why routing them is an ``"auto"`` question and not a ``"multigrid"`` one: a
-233-iteration solve cannot repay a 12-17 ms setup, and the capped probe is exactly the guard that
-keeps it on Jacobi.
+The graded ``k=1`` row is the refutation: it converges under *both* preconditioners, and ``"auto"``
+still loses, because the probe spends its 2 000 Jacobi iterations and then pays the hierarchy setup
+on top. One 1.66x win does not buy a 0.74x loss on the row the threshold was supposed to be for, and
+nothing cheap separates them -- which is ``CG_PROBE_ITERATIONS``' own conclusion reappearing one
+level up.
+
+!!! warning "``harmonic`` at ``k=2`` on a graded patch does not converge, and the fast number is the
+    non-answer"
+    That sweep's sixth cell reads as a catastrophic 0.12x (4.19 s against 33.8 s) and is the
+    opposite. Instrumented on ``saddle_graded`` at ``k=2``, 17 161 unknowns: **``"diag"`` runs
+    171 610 iterations, hits its cap and returns a residual of 9.74e+03 against an absolute
+    tolerance of 3.72e-01** -- four orders of magnitude out, with nothing but a ``UserWarning`` to
+    say so -- while ``"auto"`` converges in 83 408 iterations at 3.707e-01. The two UV maps
+    differ by **0.71** on a unit disk. So the pair is not a solver comparison at all: it prices
+    a failure against a solve, and the ``k=2`` biharmonic operator on a strongly graded patch
+    is outside what Jacobi-preconditioned conjugate gradient reaches in ``float64``. A caller
+    who needs that combination should pass a stronger preconditioner and check the warning.
 
 The *target* was sound even though the tool is not: on an RTX 5090
 [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] with cached operators measures 8.1, 12.6 and
