@@ -732,6 +732,12 @@ def test_smooth_region(bench_case: BenchCase) -> None:
     before the hierarchy existed**; ``bunny_decimated`` needs 1 784, converges inside the cap and is
     unchanged. So a change on one row and not the other is more likely to be the cap than the solver
     -- see ``linalg.CG_PROBE_ITERATIONS``.
+
+    That asymmetry is now confirmed from the other direction, which makes this pair the cheapest
+    available check on any aggregation change: sweeping ``linalg._MULTIGRID_THETA`` over
+    ``0 - 0.15`` moves **``bunny`` 161.7 -> 153.4 ms** and leaves ``bunny_decimated`` at
+    69.5-70.6 ms, *flat to three digits*, because the aggregation never runs there at all. A theta
+    sweep that appeared to move both rows would mean the cap had changed, not the coarsening.
     """
     skip_larger_than(
         bench_case,

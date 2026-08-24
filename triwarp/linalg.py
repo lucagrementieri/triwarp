@@ -93,12 +93,32 @@ a capped probe and not a heuristic; see
 [`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS] for the two predictors that were built
 and refuted (size, and extrapolating the probe's own convergence rate).
 
-One lead is left open. ``harmonic`` at ``k=2`` is a **2.25x** win on the uniform saddle and a
-**0.23x** loss on the graded one, at identical connectivity -- so anisotropy, not size, is what
-defeats the hierarchy there. The aggregation keeps *every* off-diagonal (``theta = 0``), which on a
-graded patch means aggregating across the weak direction; a strength-of-connection threshold
-``|A_ij| >= theta sqrt(A_ii A_jj)`` is the textbook fix and is the next thing to measure if that row
-matters.
+That lead about anisotropy is now measured rather than open, and the answer split in two. The
+aggregation used to keep *every* off-diagonal, which on a graded patch means aggregating across the
+weak direction; the strength-of-connection threshold ``|A_ij| >= theta sqrt(A_ii A_jj)`` is now in
+(``_MULTIGRID_THETA``, and its comment carries the sweep). It **is** the mechanism the diagnosis
+predicted -- on the graded saddle's harmonic system it takes the V-cycle from 349 iterations to
+**58** at ``theta = 0.02``, and on the graded ``k=2`` system from *not converging in 20 000* to
+7 760 -- but it buys **1.05x** end to end, because the only call site that reaches the hierarchy
+today is ``smooth_region``.
+
+**The rest of that family never sees a preconditioner choice at all**, which is the finding worth
+carrying forward: [`min_quad_with_fixed`][triwarp.linalg.min_quad_with_fixed] takes the default
+``preconditioner="diag"``, so ``harmonic`` / ``tutte`` / ``lscm`` run Jacobi whatever the operator's
+conditioning and no threshold can reach them. Measured on the harmonic interior systems (iterations
+and solve time, ``theta`` at the value that wins each):
+
+| system | Jacobi | V-cycle | |
+|---|---|---|---|
+| ``k=2`` saddle, 17 161 unknowns | 7 561 it / 214.2 ms | 426 it / 110.3 ms | **1.94x** |
+| ``k=1`` saddle_graded | 2 856 it / 71.4 | 48 it / 58.6 | 1.22x |
+| ``k=2`` saddle_small, 4 356 | 1 976 it / 56.3 | 268 it / 44.0 | 1.28x |
+| ``k=1`` saddle | 459 it / 32.4 | 16 it / 29.0 | 1.12x |
+| ``k=1`` saddle_small | 233 it / 6.9 | 14 it / 23.5 | **0.29x** |
+
+That last row is why routing them is an ``"auto"`` question and not a ``"multigrid"`` one: a
+233-iteration solve cannot repay a 12-17 ms setup, and the capped probe is exactly the guard that
+keeps it on Jacobi.
 
 The *target* was sound even though the tool is not: on an RTX 5090
 [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] with cached operators measures 8.1, 12.6 and
@@ -1239,6 +1259,14 @@ def multigrid_preconditioner(
     ``warp.optim.linear.preconditioner(matrix, "diag")`` rather than a cycle whose coarse solve is a
     guess -- so a caller never has to branch on the operator's shape.
 
+    !!! warning "That fallback is silent, and the strength threshold can trigger it"
+        A stalled hierarchy is indistinguishable from a weak one at the call site: the solve simply
+        runs at its Jacobi iteration count. ``_MULTIGRID_THETA`` is what decides how easily it
+        happens -- raising it makes more off-diagonals weak, and measured at ``0.25`` several of the
+        harmonic operators stop coarsening entirely and come back at *exactly* the Jacobi count. So
+        an aggregation change that "did nothing" should be checked against the level count before it
+        is read as a change that did not help.
+
     See Also
     --------
     [`solve_spd`][triwarp.linalg.solve_spd]
@@ -1297,6 +1325,35 @@ _MULTIGRID_JACOBI_FACTOR = 4.0 / 3.0
 # 1.5-2 ms of setup, which at these sizes is 2 % of the whole solve.
 _MULTIGRID_POWER_STEPS = 8
 _MULTIGRID_MIS_ROUNDS = 32
+
+# Strength-of-connection threshold for the aggregation: an off-diagonal counts as an edge only when
+# ``|A_ij| >= theta sqrt(A_ii A_jj)``. ``0.0`` keeps every off-diagonal, which is the aggregation
+# this package shipped first and is bit-exactly what a zero threshold reduces to.
+#
+# ``0.05`` is the measured minimum on the one row that reaches the hierarchy today,
+# ``smoothing.smooth_region`` on ``bunny`` (8 987 unknowns, 163 588 nnz). Swept on that system's
+# solve alone, interleaved, five reps, RTX 5090:
+#
+#     theta  levels  coarse n  iterations   min ms   median ms
+#     0.0         3       310         524    91.10       91.51
+#     0.02        4       302         400    89.86       93.41
+#     0.05        4       306         344    81.77       82.71
+#     0.08        4       320         299    82.71       84.09
+#     0.15        5       323         233    94.62       95.85
+#     0.25        6       400         177   191.80      202.95
+#
+# The iteration count falls monotonically and the *clock* is a U: every extra level adds setup and
+# makes a cycle more expensive, so the two cross at 0.05-0.08. ``0.08`` is statistically tied on
+# time with 15 % fewer iterations, which is the value to try first if a caller ever puts a harder
+# operator on the hierarchy -- iterations are the quantity that transfers, the clock is not.
+#
+# Two things to know before moving it. **A large threshold stalls the coarsening silently**: at
+# ``0.25`` several operators leave ``_multigrid_hierarchy`` with nothing usable and
+# ``multigrid_preconditioner`` hands back Jacobi, which reads as "multigrid did not help" rather
+# than as "there was no multigrid". And ``0.0`` keeps every off-diagonal, which is the aggregation
+# this package shipped first and is bit-exactly what a zero threshold reduces to -- so the
+# unfiltered form is a special case of this one and not a separate path.
+_MULTIGRID_THETA = 0.05
 
 
 class _MultigridLevel:
@@ -1384,10 +1441,26 @@ def _multigrid_aggregate(
     distance 2 by propagating the packed ``(state, priority, index)`` maximum over one-hop
     neighbours *twice* per round -- so no squared graph is built. Roots then spread their label two
     hops, which tiles the graph because the MIS keeps them at least three hops apart.
+
+    Both walks are over the operator's **strong** off-diagonal graph
+    (``|A_ij| >= _MULTIGRID_THETA sqrt(A_ii A_jj)``), tested per edge rather than materialized, so
+    that a level pays no extra allocation for the filter and ``theta = 0`` is bit-exactly the
+    unfiltered aggregation.
     """
     device = matrix.device
     n = int(matrix.nrow)
-    offsets, columns = matrix.offsets, matrix.columns
+    offsets, columns, values = matrix.offsets, matrix.columns, matrix.values
+    theta = wp.float64(_MULTIGRID_THETA)
+    # ``sqrt(|A_ii|)`` per row, so the strength test below is a product rather than a square
+    # root per edge. One ``(n,)`` buffer and two launches per level, read by both walks.
+    scaled_diagonal = wp.empty(n, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_mg.mg_scaled_diagonal,
+        dim=n,
+        inputs=[wps.bsr_get_diag(matrix)],
+        outputs=[scaled_diagonal],
+        device=device,
+    )
 
     priority = wp.empty(n, dtype=wp.uint32, device=device)
     wp.launch(
@@ -1404,7 +1477,7 @@ def _multigrid_aggregate(
             wp.launch(
                 kernel_mg.mis_propagate,
                 dim=n,
-                inputs=[key, offsets, columns, next_key],
+                inputs=[key, offsets, columns, values, scaled_diagonal, theta, next_key],
                 device=device,
             )
             key, next_key = next_key, key
@@ -1436,7 +1509,7 @@ def _multigrid_aggregate(
         wp.launch(
             kernel_mg.spread_aggregate_labels,
             dim=n,
-            inputs=[label, offsets, columns, next_label],
+            inputs=[label, offsets, columns, values, scaled_diagonal, theta, next_label],
             device=device,
         )
         label, next_label = next_label, label

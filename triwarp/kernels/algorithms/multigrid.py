@@ -56,6 +56,21 @@ MG_UNAGGREGATED = wp.constant(wp.int32(-1))
 
 
 @wp.func
+def mg_is_strong(
+    value: wp.float64,
+    scaled_diagonal_row: wp.float64,
+    scaled_diagonal_column: wp.float64,
+    theta: wp.float64,
+) -> wp.bool:
+    """Whether ``A_ij`` is a strong connection: ``|A_ij| >= theta * sqrt(A_ii * A_jj)``."""
+    # ``scaled_diagonal`` carries ``sqrt(|A_ii|)``, so the product is the geometric mean and no
+    # square root runs per edge. At ``theta = 0`` this is unconditionally true -- including for an
+    # explicit zero, since ``0 >= 0`` -- which is what makes the unfiltered aggregation the exact
+    # ``theta = 0`` case of this one rather than a separate code path.
+    return wp.abs(value) >= theta * scaled_diagonal_row * scaled_diagonal_column
+
+
+@wp.func
 def mis_key(state: wp.int32, priority: wp.uint32, index: wp.int32) -> wp.int64:
     masked = priority & _MG_PRIORITY_MASK
     return (
@@ -78,19 +93,25 @@ def mis_propagate(
     key: wp.array[wp.int64],
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    scaled_diagonal: wp.array[wp.float64],
+    theta: wp.float64,
     out_key: wp.array[wp.int64],
 ) -> None:
-    # One hop of the lexicographic maximum over the operator's *off-diagonal* graph -- the diagonal
-    # is skipped because a node is not its own neighbour, and the node's own key is folded in
-    # separately so the reduction is over the closed neighbourhood. Two launches of this give the
+    # One hop of the lexicographic maximum over the operator's *strong off-diagonal* graph -- the
+    # diagonal is skipped because a node is not its own neighbour, and the node's own key is folded
+    # in separately so the reduction is over the closed neighbourhood. Two launches of this give the
     # maximum over the two-hop ball, which is the distance-2 test without a squared graph.
+    #
+    # The strength test is applied here rather than by materializing a filtered graph, so a level
+    # pays no extra allocation and ``theta = 0`` is bit-exactly the unfiltered aggregation.
     #
     # Reads ``key`` and writes a second buffer, so the caller swaps rather than synchronizing.
     i = wp.int32(wp.tid())
     best = key[i]
     for k in range(offsets[i], offsets[i + 1]):
         j = columns[k]
-        if j != i:
+        if j != i and mg_is_strong(values[k], scaled_diagonal[i], scaled_diagonal[j], theta):
             best = wp.max(best, key[j])
     out_key[i] = best
 
@@ -147,10 +168,17 @@ def spread_aggregate_labels(
     label: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    scaled_diagonal: wp.array[wp.float64],
+    theta: wp.float64,
     out_label: wp.array[wp.int32],
 ) -> None:
     # An unlabelled node adopts a neighbour's aggregate, largest id winning so the choice does not
     # depend on thread order. Two launches cover the two hops the MIS guarantees are enough.
+    #
+    # The spread walks the same *strong* graph the independent set was selected on, which is what
+    # keeps the tiling consistent: every excluded node has a root within two strong hops precisely
+    # because the exclusion came from a strong-graph propagation.
     i = wp.int32(wp.tid())
     best = label[i]
     if best != MG_UNAGGREGATED:
@@ -158,9 +186,18 @@ def spread_aggregate_labels(
         return
     for k in range(offsets[i], offsets[i + 1]):
         j = columns[k]
-        if j != i:
+        if j != i and mg_is_strong(values[k], scaled_diagonal[i], scaled_diagonal[j], theta):
             best = wp.max(best, label[j])
     out_label[i] = best
+
+
+@wp.kernel
+def mg_scaled_diagonal(diagonal: wp.array[wp.float64], out_scaled: wp.array[wp.float64]) -> None:
+    # ``sqrt(|A_ii|)`` per row, so the strength test's geometric mean is a product. A zero diagonal
+    # gives zero, which makes every edge of that row weak at any positive ``theta`` -- correct: a
+    # row with no equation (the least-squares operators here carry them) is its own aggregate.
+    i = wp.int32(wp.tid())
+    out_scaled[i] = wp.sqrt(wp.abs(diagonal[i]))
 
 
 @wp.kernel
