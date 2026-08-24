@@ -261,8 +261,15 @@ def inflate(
         return wp.clone(vertices)
 
     positions = wp.clone(vertices)
+    # The relaxation operator is hoisted for the same reason the step kernel below is, and it is the
+    # larger of the two: ``filter_laplacian`` builds the uniform operator per call, and at
+    # ``equal_weight=True`` that operator is the mesh's topology, which no pass changes. Same
+    # finding as ``filter_spikes``, which is where it was measured.
+    operator = laplacian.laplacian(vertices, faces)
     if pre_smooth:
-        positions = filter_laplacian(positions, faces, lamb, iterations=1)
+        positions = filter_laplacian(
+            positions, faces, lamb, iterations=1, laplacian_operator=operator
+        )
     # Hoisted once: the displacement is the same map every pass, and section 4 records that a
     # per-iteration wrapper loop should not re-derive it.
     step_kernel = wp.map(
@@ -284,7 +291,9 @@ def inflate(
             outputs=[displaced],
             device=device,
         )
-        positions = filter_laplacian(displaced, faces, lamb, iterations=1)
+        positions = filter_laplacian(
+            displaced, faces, lamb, iterations=1, laplacian_operator=operator
+        )
     return positions
 
 
@@ -444,6 +453,14 @@ def filter_spikes(
     positions = wp.clone(vertices)
     flattened = 0
     spikes = wp.empty(n_vertices, dtype=wp.bool, device=device)
+    # Built once and handed to every pass. ``filter_neighborhood_average`` would build it per call,
+    # and at ``equal_weight=True`` -- its default, and what ``_resolved_operator`` asks for -- the
+    # operator reads no positions at all: every off-diagonal weight is ``1`` before the row
+    # normalization, so it is the mesh's *topology*, which no pass changes. Hoisting it is therefore
+    # exactly equivalent, and it is where this row's cost was: 10 builds at 1.27 ms is **13.0 of the
+    # call's 19.6 ms** on ``bunny_decimated`` (RTX 5090), and a build is flat in the mesh, which is
+    # what made the whole row flat in the mesh -- 15.65 ms at 16 301 faces against 15.16 at 69 630.
+    operator = laplacian.laplacian(vertices, faces, symmetric=True)
     for _ in range(max_iter):
         defects = tw.vertices.vertex_defects(
             n_vertices, faces, tw.triangles.face_angles(positions, faces)
@@ -458,7 +475,9 @@ def filter_spikes(
         n_spikes = int(tw.reduce.sum(tw.array.astype(spikes, wp.int32)))
         if n_spikes == 0:
             break
-        smoothed = filter_neighborhood_average(positions, faces, iterations=1)
+        smoothed = filter_neighborhood_average(
+            positions, faces, iterations=1, laplacian_operator=operator
+        )
         wp.map(kernel_smoothing.select_position, smoothed, positions, spikes, out=positions)
         flattened += n_spikes
     return (positions, flattened) if return_count else positions

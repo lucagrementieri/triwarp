@@ -847,23 +847,37 @@ def test_filter_spikes(bench_case: BenchCase) -> None:
     """
     Detect and flatten needle vertices: per pass, the corner angles, a defect scatter and one map.
 
-    On a clean mesh this is a *detector* -- one pass finds nothing and the loop stops -- so the row
-    is really the cost of asking, which is what a caller pays unconditionally in a repair pipeline.
-    That makes it comparable with meshlib's ``removeSpikes`` on the same input, since that also
-    finds nothing to do; and it means the row is dominated by ``face_angles`` plus the scatter
-    rather than by any displacement.
+    This docstring used to open *"on a clean mesh this is a detector -- one pass finds nothing and
+    the loop stops"*, and conclude from it that the row was ``face_angles`` plus the scatter. Both
+    halves were wrong, and the second one hid a 2.6x, so the correction is worth keeping:
+
+    * **The loop runs its full ten passes on both ``bunny`` meshes, and it is their *unreferenced*
+      vertices that do it.** A vertex with no incident face has an angle sum of ``0``, so it is a
+      spike under any threshold, and averaging its (empty) 1-ring never moves it -- measured spikes
+      per pass on ``bunny``: ``1116, 1114, 1113, 1113, ...`` against exactly **1 113** unreferenced
+      vertices, and on ``bunny_decimated`` ``26, 25, 25, ...`` against 25. ``dragon`` has none and
+      does not converge either, honestly: ``789 -> 407`` over the ten. So the row is a *ten-pass*
+      row everywhere in this registry, and ``flattened`` over-reports by ten times the unreferenced
+      count.
+    * **Two thirds of it was rebuilding an operator that never changes.** Each pass called
+      ``filter_neighborhood_average``, which builds the uniform 1-ring operator per call -- and at
+      ``equal_weight=True`` that operator reads no positions, so ten builds produced ten
+      byte-identical matrices. Attributed on ``bunny_decimated`` (RTX 5090, medians): the whole call
+      19.6 ms, of which the ten builds are **13.0** at 1.27 ms each, against ``face_angles`` 0.04,
+      ``vertex_defects`` 0.11, the count-plus-readback 0.16 and the averaging step itself 0.24, all
+      per pass. A build being flat in the mesh is what made the *row* flat in the mesh -- 15.65 ms
+      at 16 301 faces against 15.16 at 69 630, which is the signature that named this a work item.
+
+    Hoisting the build turned both small rows from losses into wins: ``bunny`` **15.16 -> 6.68 ms**
+    against meshlib's 9.65 (2.09x behind -> **1.44x ahead**), ``bunny_decimated`` 7.13 against 9.79,
+    ``dragon`` 8.81 against 61.67 (**7.0x**), with ``happy_buddha`` 9.26 and ``lucy`` 100.8. The
+    residual is still nearly flat below a million faces, which is the ten passes' remaining fixed
+    cost -- read it as floor now rather than as an algorithm.
 
     meshlib mutates in place, so its mesh is rebuilt per round the way the other ``repair`` rows do.
     Both sides are pinned against each other on a genuinely spiky mesh in
     ``tests/test_smoothing.py``; no scan mesh in this registry has a spike, which is why that test
     needs a generated fixture and this row does not.
-
-    First measurement, medians on an RTX 5090: **15.68 ms** on ``bunny`` against meshlib's 9.62
-    (1.63x behind) and **20.87 ms** on ``dragon`` against 60.73 (**2.9x ahead**), with
-    ``happy_buddha`` at 22.84 and ``lucy`` at 100.5. The crossover is between 70k and 871k faces,
-    which is where a per-vertex angle scatter starts beating a threaded serial pass -- and note
-    meshlib's row carries its mesh build while triwarp's carries none, so the small-mesh figure is
-    if anything generous to triwarp.
     """
     threshold = 0.5 * math.pi
     if bench_case.kind == "meshlib":
