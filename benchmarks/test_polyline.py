@@ -21,9 +21,9 @@ because within a class the kernels differ only in the per-segment expression:
   deliberate serial outlier — a single-thread stack-based kernel, since Warp forbids recursion —
   and *that* framing is what kept it there. Warp cannot express the recursion, but it can express
   the recursion's **levels**, and the two accept the same points, because breadth-first and
-  depth-first evaluation of one split tree differ only in order. Measured 84.06 -> 1.08 ms on
-  ``rim_long``, **78x**, byte-identical accepted set; ``polyline_simplify``'s Notes carry the full
-  table and the two rows that lose.
+  depth-first evaluation of one split tree differ only in order. Measured 80.47 -> 1.11 ms on
+  ``rim_long``, **72x**, with the accepted set identical; ``polyline_simplify``'s Notes carry the
+  full table, the two rows that lose, and why the depth is bounded by the accepted count.
 
 ``polyline_point_distance`` is timed separately from the rest because it is the only function whose
 cost is the product of two sizes (query points x segments) rather than a function of the polyline
@@ -463,8 +463,8 @@ def test_simplify_polyline(bench_case: BenchCase, tolerance_fraction: float) -> 
     to lose"*, and it is worth leaving a marker where that was: the expectation was load-bearing,
     not descriptive. It rested on Warp forbidding recursion, which is true, and on the conclusion
     that the split is therefore serial, which is not -- a level-synchronous evaluation accepts the
-    same points and turned the ``rim_long`` rows from 84.06 ms into 1.08. Read the two ``saddle``
-    rows as floor rows now (the graph capture is ~0.12 ms of a ~0.5 ms call), not as the outlier.
+    same points and turned the ``rim_long`` rows from 80.47 ms into 1.11. Read the two ``saddle``
+    rows as floor rows now (the graph capture is ~0.16 ms of a ~0.6 ms call), not as the outlier.
 
     Neither reference is Ramer-Douglas-Peucker, and **neither is driven by triwarp's tolerance**,
     which is the thing to know before reading the ratio: both are given the *reduction* triwarp's

@@ -375,9 +375,18 @@ def rdp_split_spans(
         return
     hi = span_hi[i]
     split = span_argmax[lo]
-    # An unresolved argmax (``split`` still at its sentinel) means no point held the span's maximum,
-    # which only a non-finite coordinate can produce -- ``NaN >= NaN`` is false. Settling it keeps
-    # the kernel total instead of indexing past the end of the polyline on the next round.
+    # ``split <= lo or split >= hi`` catches an unresolved argmax -- ``split`` still at the sentinel
+    # ``rdp_begin_round`` armed -- and settling the span turns what would be a read past the end of
+    # the polyline on the next round into a dropped interior.
+    #
+    # It is **defensive and measured to be unreachable**, which is worth saying because the obvious
+    # reason to expect otherwise is wrong: a non-finite coordinate does *not* produce it, because
+    # ``wp.atomic_max`` does not propagate ``NaN`` (measured ``atomic_max(-1, NaN, 25) == 25.0`` on
+    # both devices). So either some point wrote a real maximum, and that same point then satisfies
+    # the ``>=`` in ``rdp_span_argmax`` and resolves the index; or every interior distance was
+    # ``NaN``, the accumulator keeps the ``-1.0`` it was armed with, and the tolerance test above
+    # settles the span first. Seven non-finite shapes -- interior, endpoint, all-``NaN``, ``inf`` --
+    # give byte-identical answers with the two comparisons deleted.
     if span_max[lo] <= squared_tolerance or split <= lo or split >= hi:
         span_lo[i] = RDP_SETTLED  # the whole span is within tolerance, so its interior drops
         return

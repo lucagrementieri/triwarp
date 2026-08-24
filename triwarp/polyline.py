@@ -563,30 +563,37 @@ def polyline_simplify(
     [`polyline_triangulate`][triwarp.polyline.polyline_triangulate]'s ear rounds are, so the whole
     simplification costs one graph launch and no readback at all. Measured interleaved on an RTX
     5090 against the single-thread recursive kernel this replaces, with the accepted index set
-    asserted byte-identical in every cell (median of 20, or 3 above 20 000 points):
+    asserted identical in every cell (median of 40, or 12 above 20 000 points):
 
-    | polyline | n | recursive | level-synchronous | |
-    |---|---|---|---|---|
-    | ``rim_long`` | 65 536 | 84.06 ms | **1.08 ms** | **78x** |
-    | ``rim_long``, coarse ``tol`` | 65 536 | 60.24 | **1.03** | 59x |
-    | a 10-turn spiral | 4 096 | 6.97 | **0.84** | 8.3x |
-    | ``saddle`` | 528 | 0.63 | 0.55 | 1.16x |
-    | ``saddle_small`` | 268 | 0.38 | 0.49 | **0.76x** |
+    | polyline | n | kept | recursive | level-synchronous | |
+    |---|---|---|---|---|---|
+    | ``rim_long`` | 65 536 | 14 249 | 80.47 ms | **1.11 ms** | **72x** |
+    | ``rim_long``, coarse ``tol`` | 65 536 | 1 025 | 53.22 | **0.90** | 59x |
+    | a 100-turn spiral | 4 096 | 3 856 | 27.64 | **2.69** | 10.3x |
+    | ``saddle`` | 528 | 528 | 0.60 | 0.57 | 1.05x |
+    | ``saddle_small`` | 268 | 268 | 0.40 | 0.56 | **0.72x** |
 
-    Two things that table settles. The **spiral** is the adversarial input for this formulation --
-    its farthest point sits next to an endpoint at every level, so the depth is ``O(n)`` rather than
-    ``log2(n)`` and the level-synchronous form pays 4``n`` rounds where the balanced case pays
-    ``4 log2(n)``. It still wins 8.3x, because the recursion's *own* cost is ``O(n^2)`` on the same
-    input, so there is no round cap and no serial fallback here: the crossover the shape of the
-    algorithm suggests does not exist. And the two smallest rows lose ~0.12 ms, which is the
-    one-off graph capture; that is the floor of the call rather than a size effect, and it is the
-    same trade the ear clipper's single-contour rows took.
+    **The depth is bounded by the accepted count, not by ``n``, and that is why there is no round
+    cap and no serial fallback here.** Every root-to-leaf path of the split tree accepts one point
+    per level, so ``rounds <= kept + 1`` -- a deep tree is precisely an input that accepts most of
+    its points, which is also the input the recursion does the most work on. Seven shapes were
+    constructed looking for an ``O(n)`` case and none was found: a spiral's depth tracks its *turn
+    count* rather than ``n`` (25 rounds at 10 turns, **204** at 100, both at ``n = 4096``, so 5.0 %
+    of ``n`` at worst), while a power curve, a geometric staircase and a decaying sawtooth are all
+    *shallower* than a boundary loop at 1-11 rounds. The deepest of them still wins 10.3x, because
+    the recursion's own cost grows on exactly the same axis. Do not read the spiral row as a
+    near-crossover.
 
-    On **cpu** the change is a uniform 4-6x loss (``rim_long`` 5.02 -> 20.22 ms), because Warp's cpu
-    backend runs a ``dim=n`` launch as one lane, so a round costs ``4n`` sequential iterations
-    whatever it settles -- against the recursion's ``O(n log n)`` total. The device is the target
-    (``.claude/CLAUDE.md`` section 13) and the absolute cpu cost stays in the tens of milliseconds,
-    so this is recorded rather than branched on: one algorithm, one accepted set, on both devices.
+    The two smallest rows lose ~0.16 ms, which is the one-off graph capture rather than a size
+    effect -- the same trade the ear clipper's single-contour rows took.
+
+    On **cpu** the change is a 3.7-5.6x loss on these boundary loops (``rim_long`` 5.90 -> 24.28 ms)
+    and 11x on the 100-turn spiral, because Warp's cpu backend runs a ``dim=n`` launch as one lane,
+    so a round costs ``4n`` sequential iterations whatever it settles -- against the recursion's
+    ``O(n log n)`` total, and the gap therefore widens with the depth rather than staying uniform.
+    The device is the target (``.claude/CLAUDE.md`` section 13) and the absolute cpu cost stays in
+    the tens of milliseconds, so this is recorded rather than branched on: one algorithm, one
+    accepted set, on both devices.
 
     See Also
     --------

@@ -1169,6 +1169,62 @@ def test_simplify_matches_reference(device: str, tol: float, seed: int) -> None:
     )
 
 
+def test_simplify_deep_split_tree_matches_reference(device: str) -> None:
+    """
+    A 20-turn spiral, whose split tree is 43 levels deep rather than the ~10 of a boundary loop.
+
+    The level-synchronous evaluation re-arms its per-span accumulators once per round and reuses a
+    span's slot for its own left child, so a bug in that bookkeeping is invisible on a shallow
+    input: every other simplify test here runs 40 points and a handful of levels. This one runs
+    43 rounds, which is what makes it the test of the round loop rather than of the distance rule.
+    """
+    angle = np.linspace(0.0, 20.0 * 2.0 * np.pi, 512)
+    radius = np.linspace(0.05, 1.0, 512)
+    pts_np = np.stack(
+        [radius * np.cos(angle), radius * np.sin(angle), np.zeros_like(angle)], axis=1
+    )
+    tol = 1e-2 * float(np.ptp(pts_np, axis=0).max())
+    _, indices_wp = tw.polyline.polyline_simplify(points_to_warp(pts_np, device), tol)
+    _, indices_np = _simplify_np(pts_np, tol)
+    # Non-vacuous in both directions: a spiral that kept everything, or collapsed to its endpoints,
+    # would pass the equality below while testing nothing about the recursion.
+    assert 2 < indices_np.size < pts_np.shape[0]
+    assert np.array_equal(indices_wp.numpy(), indices_np.astype(np.int32))
+
+
+@pytest.mark.parametrize(
+    ("name", "builder"),
+    [
+        ("nan_interior", lambda: [[0.0, 0.0, 0.0], [1.0, np.nan, 0.0], [2.0, 0.0, 0.0]]),
+        ("nan_endpoint", lambda: [[np.nan, 0.0, 0.0], [1.0, 5.0, 0.0], [2.0, 0.0, 0.0]]),
+        ("inf_interior", lambda: [[0.0, 0.0, 0.0], [1.0, np.inf, 0.0], [2.0, 0.0, 0.0]]),
+        ("all_nan", lambda: np.full((5, 3), np.nan).tolist()),
+    ],
+)
+def test_simplify_non_finite_terminates(device: str, name: str, builder) -> None:
+    """
+    A non-finite coordinate leaves the round loop terminating and the answer well-formed.
+
+    Not a library comparison: no reference simplifier defines an answer here. What is asserted is
+    that the loop ends and the result is still a sorted index set keeping both endpoints -- the
+    round loop is driven by a device-side condition, so a span that never settles would hang rather
+    than return a wrong answer.
+
+    The mechanism is worth recording because it is not the obvious one: ``wp.atomic_max`` does
+    **not** propagate ``NaN`` (measured ``atomic_max(-1, NaN, 25) == 25.0`` on both devices), so a
+    ``NaN`` distance simply loses its span's reduction. Either a finite point wrote the maximum and
+    resolves the argmax, or every interior distance was ``NaN``, the accumulator keeps its armed
+    ``-1.0``, and the span settles as within tolerance. That is why ``rdp_split_spans``'
+    unresolved-argmax guard is unreachable rather than load-bearing here.
+    """
+    pts_np = np.array(builder(), dtype=np.float64)
+    _, indices_wp = tw.polyline.polyline_simplify(points_to_warp(pts_np, device), 0.1)
+    kept = indices_wp.numpy()
+    assert kept[0] == 0
+    assert kept[-1] == pts_np.shape[0] - 1
+    assert np.all(np.diff(kept) > 0)  # still a sorted index set into the input
+
+
 def test_simplify_collinear_collapses_to_endpoints(device: str) -> None:
     pts_np = np.stack([np.linspace(0.0, 1.0, 11), np.zeros(11), np.zeros(11)], axis=1)
     simplified_wp, indices_wp = tw.polyline.polyline_simplify(points_to_warp(pts_np, device), 1e-3)
