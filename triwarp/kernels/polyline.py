@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.array import binary_search_index, cross2, lowbias32, update_argmax, wrap_index
+from triwarp.kernels.array import binary_search_index, cross2, lowbias32, wrap_index
 from triwarp.kernels.points import plane_basis
 from triwarp.kernels.predicates import (
     closest_point_on_segment,
@@ -253,57 +253,143 @@ def greedy_downsample_mask(
 
 
 RDP_LINE_EPS = wp.constant(wp.float32(1.0e-7))  # libigl FLOAT_EPS: degenerate-segment threshold
+RDP_SETTLED = wp.constant(wp.int32(-1))  # ``span_lo`` sentinel: this point's fate is decided
 
 
-@wp.kernel(enable_backward=False)
-def rdp_keep_mask(
+@wp.func
+def rdp_chord_squared_distance(
+    polyline: wp.array[wp.vec3], i: wp.int32, lo: wp.int32, hi: wp.int32
+) -> wp.float32:
+    """Squared distance from ``polyline[i]`` to the chord ``polyline[lo] -> polyline[hi]``."""
+    start = polyline[lo]
+    end = polyline[hi]
+    seg_sq_len = wp.length_sq(end - start)
+    if seg_sq_len <= RDP_LINE_EPS:
+        return wp.length_sq(polyline[i] - start)  # degenerate chord: distance to the shared point
+    return line_squared_distance(polyline[i], start, end, seg_sq_len)
+
+
+@wp.kernel
+def rdp_seed_spans(
+    out_span_lo: wp.array[wp.int32], out_span_hi: wp.array[wp.int32], out_keep: wp.array[wp.bool]
+) -> None:
+    # Ramer-Douglas-Peucker, level-synchronous: one round per level of the recursion tree instead
+    # of one thread walking the whole tree. Round 0 puts every interior point in the single span
+    # ``(0, n - 1)``; the two endpoints are kept unconditionally and never belong to a span.
+    #
+    # A span is identified by its **left endpoint**, and that is the whole reason there is no span
+    # list to build or compact: the open spans at any level partition the polyline, so their left
+    # endpoints are distinct and index a plain ``(n,)`` accumulator directly.
+    i = wp.int32(wp.tid())
+    n = out_span_lo.shape[0]
+    if i == 0 or i == n - 1:
+        out_span_lo[i] = RDP_SETTLED
+        out_span_hi[i] = RDP_SETTLED
+        out_keep[i] = True
+    else:
+        out_span_lo[i] = 0
+        out_span_hi[i] = n - 1
+        out_keep[i] = False
+
+
+@wp.kernel
+def rdp_begin_round(
+    out_state: wp.array[wp.int32],
+    out_span_max: wp.array[wp.float32],
+    out_span_argmax: wp.array[wp.int32],
+) -> None:
+    # Round, pass 1 of 4: arm the per-span accumulators and clear the loop condition. Kept as its
+    # own launch rather than folded into the split kernel (which knows each child span's slot)
+    # because a ping-ponged pair of accumulators cannot be swapped inside a captured graph -- the
+    # buffers are baked in at capture time. One extra ``dim=n`` launch per round buys the readback.
+    i = wp.int32(wp.tid())
+    if i == 0:
+        out_state[0] = out_state[0] + 1
+        out_state[1] = 0
+    out_span_max[i] = -1.0
+    out_span_argmax[i] = out_span_max.shape[0]  # past every valid index, so atomic_min always wins
+
+
+@wp.kernel
+def rdp_span_max(
     polyline: wp.array[wp.vec3],
-    stol: wp.float32,
-    stack: wp.array[wp.int32],
+    span_lo: wp.array[wp.int32],
+    span_hi: wp.array[wp.int32],
+    out_squared_distances: wp.array[wp.float32],
+    out_span_max: wp.array[wp.float32],
+) -> None:
+    # Round, pass 2 of 4: every unsettled point measures itself against its span's chord and
+    # max-reduces into the span's slot. One thread per *point* rather than per span, so a round
+    # costs the same whatever shape the level has -- which is what makes the depth, and not the
+    # span sizes, the cost model.
+    i = wp.int32(wp.tid())
+    lo = span_lo[i]
+    if lo >= 0:
+        squared_distance = rdp_chord_squared_distance(polyline, i, lo, span_hi[i])
+        out_squared_distances[i] = squared_distance
+        wp.atomic_max(out_span_max, lo, squared_distance)
+
+
+@wp.kernel
+def rdp_span_argmax(
+    span_lo: wp.array[wp.int32],
+    squared_distances: wp.array[wp.float32],
+    span_max: wp.array[wp.float32],
+    out_span_argmax: wp.array[wp.int32],
+) -> None:
+    # Round, pass 3 of 4: recover *which* point won. Reducing the index with ``atomic_min`` over
+    # every point holding the span's maximum keeps the lowest such index, which is exactly what the
+    # strict '>' argmax of the recursive form kept (Eigen maxCoeff, and libigl's tie convention).
+    #
+    # A packed ``(bits, ~index)`` int64 key would fold this into pass 2 -- ``wp.atomic_max`` on
+    # ``wp.int64`` works on both devices -- and is not used, because the float comparison here is
+    # against a value this same expression produced, so it is exact without reinterpreting bits.
+    i = wp.int32(wp.tid())
+    lo = span_lo[i]
+    if lo >= 0 and squared_distances[i] >= span_max[lo]:
+        wp.atomic_min(out_span_argmax, lo, i)
+
+
+@wp.kernel
+def rdp_split_spans(
+    squared_tolerance: wp.float32,
+    span_max: wp.array[wp.float32],
+    span_argmax: wp.array[wp.int32],
+    span_lo: wp.array[wp.int32],
+    span_hi: wp.array[wp.int32],
+    state: wp.array[wp.int32],
     out_keep: wp.array[wp.bool],
 ) -> None:
-    # Single thread (dim == 1): iterative Ramer-Douglas-Peucker over an explicit stack of
-    # (ixs, ixe) index ranges, since Warp forbids recursion. ``stack`` is scratch holding the
-    # ranges interleaved; its size must be >= max(2 * n, 2). The first and last vertices are
-    # always kept; interior vertices closer than sqrt(stol) to their bracketing chord are dropped.
+    # Round, pass 4 of 4: split or settle. ``span_lo`` / ``span_hi`` are the point's span and are
+    # rewritten in place to its child span, so they are neither an input nor the answer; ``state``
+    # is the round loop's own condition, raised whenever a point survives into the next level.
     #
-    # ``out_keep`` arrives pre-filled with ``True``: the caller does that with a parallel
-    # ``fill_``, because doing it here put an ``O(n)`` serial memset on thread 0 in front of an
-    # algorithm that is only serial because the *recursion* is.
-    n = polyline.shape[0]
-    stack[0] = 0
-    stack[1] = n - 1
-    # ``wp.int32(...)`` / ``wp.float32(...)`` declare mutable Warp dynamic variables; a bare literal
-    # is a compile-time constant and gets folded, which would freeze this loop.
-    top = wp.int32(1)
-    while top > 0:
-        top -= 1
-        ixs = stack[2 * top + 0]
-        ixe = stack[2 * top + 1]
-        sdmax = wp.float32(0.0)
-        ixc = wp.int32(-1)
-        if ixe - ixs > 1:
-            seg = polyline[ixe] - polyline[ixs]
-            sdes = wp.length_sq(seg)
-            for k in range(ixs + 1, ixe):
-                sd = wp.float32(0.0)
-                if sdes <= RDP_LINE_EPS:
-                    dvec = polyline[k] - polyline[ixs]
-                    sd = wp.length_sq(dvec)
-                else:
-                    sd = line_squared_distance(polyline[k], polyline[ixs], polyline[ixe], sdes)
-                # strict '>' inside update_argmax keeps the first argmax (Eigen maxCoeff)
-                update_argmax(sdmax, ixc, sd, k)
-        if sdmax <= stol:
-            for k in range(ixs + 1, ixe):  # empty range when there are no interior points
-                out_keep[k] = False
-        else:
-            stack[2 * top + 0] = ixs
-            stack[2 * top + 1] = ixc
-            top += 1
-            stack[2 * top + 0] = ixc
-            stack[2 * top + 1] = ixe
-            top += 1
+    # The keep set is identical to the recursive form's by construction: there, everything starts
+    # kept and a span within tolerance drops its interior; here, nothing starts kept and every
+    # split point is kept. Both leave exactly the endpoints and the split points, because the
+    # terminal spans partition the polyline. The loop terminates because a child span is strictly
+    # narrower than its parent and a span two wide holds a single point, which settles either way.
+    i = wp.int32(wp.tid())
+    lo = span_lo[i]
+    if lo < 0:
+        return
+    hi = span_hi[i]
+    split = span_argmax[lo]
+    # An unresolved argmax (``split`` still at its sentinel) means no point held the span's maximum,
+    # which only a non-finite coordinate can produce -- ``NaN >= NaN`` is false. Settling it keeps
+    # the kernel total instead of indexing past the end of the polyline on the next round.
+    if span_max[lo] <= squared_tolerance or split <= lo or split >= hi:
+        span_lo[i] = RDP_SETTLED  # the whole span is within tolerance, so its interior drops
+        return
+    if i == split:
+        out_keep[i] = True
+        span_lo[i] = RDP_SETTLED
+        return
+    if i < split:
+        span_hi[i] = split  # ``lo < i < split``, so the child span is never degenerate
+    else:
+        span_lo[i] = split
+    state[1] = 1  # a plain store, not an atomic: one address, one value, nothing to serialize
 
 
 @wp.kernel

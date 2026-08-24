@@ -14,14 +14,16 @@ because within a class the kernels differ only in the per-segment expression:
 * **Resampling** (``polyline_upsample``, ``polyline_resample``, ``polyline_downsample``) — an
   output whose length is data-dependent, so these pay a scan plus a host readback of the output
   size before the write pass. The interpolation itself is the ``wp.lerp`` inner loop.
-* **Simplification** (``polyline_simplify``) — Ramer-Douglas-Peucker, which Warp cannot express in
-  parallel (it is a recursive split, and Warp forbids recursion), so it runs as a *single-thread*
-  stack-based kernel. This is the deliberate outlier of the module and the only case here whose
-  cost is O(n) serial work on one GPU thread; expect it to be slower than everything else by
-  orders of magnitude and to be the one function where the CPU would win. Only the *recursion* has
-  to be serial, though: the keep-mask initialization was moved out to a parallel ``fill_``, which
-  this group measured as neutral (25.59 -> 25.53 ms on ``rim_long``) and so is a structural
-  cleanup rather than a win — the recursion dominates by two orders of magnitude.
+* **Simplification** (``polyline_simplify``) — Ramer-Douglas-Peucker, evaluated
+  **level-synchronously**: one round of four ``dim=n`` launches per level of the split tree, driven
+  by ``wp.capture_while`` so no round costs a readback. The cost is therefore the tree's *depth*,
+  about ``log2(n)`` on a mesh boundary loop. This group is why: it used to be the module's
+  deliberate serial outlier — a single-thread stack-based kernel, since Warp forbids recursion —
+  and *that* framing is what kept it there. Warp cannot express the recursion, but it can express
+  the recursion's **levels**, and the two accept the same points, because breadth-first and
+  depth-first evaluation of one split tree differ only in order. Measured 84.06 -> 1.08 ms on
+  ``rim_long``, **78x**, byte-identical accepted set; ``polyline_simplify``'s Notes carry the full
+  table and the two rows that lose.
 
 ``polyline_point_distance`` is timed separately from the rest because it is the only function whose
 cost is the product of two sizes (query points x segments) rather than a function of the polyline
@@ -61,7 +63,8 @@ The longest loop of each mesh is gathered into a dense ``wp.vec3`` buffer once p
 and reused across rounds, so the timed region contains only the polyline function itself.
 
 Two groups carry a second sweep, on the parameter that drives them rather than on length:
-``polyline_simplify`` on its tolerance (which sets the recursion depth of a serial algorithm) and
+``polyline_simplify`` on its tolerance (which sets the depth of its split tree, and so its round
+count) and
 ``polyline_point_distance`` on the query count (the other half of its two-size product).
 
 References
@@ -454,13 +457,18 @@ def test_downsample_polyline(bench_case: BenchCase) -> None:
 @pytest.mark.parametrize("tolerance_fraction", _SIMPLIFY_FRACTIONS)
 def test_simplify_polyline(bench_case: BenchCase, tolerance_fraction: float) -> None:
     """
-    Ramer-Douglas-Peucker on a *single* GPU thread — the module's deliberate serial outlier.
+    Ramer-Douglas-Peucker, one round of four ``dim=n`` launches per level of the split tree.
 
-    This is the one group in the package where triwarp is *expected* to lose, so it is also the one
-    where a reference is worth the most -- until now there was nothing to lose to. Neither reference
-    is Ramer-Douglas-Peucker, and **neither is driven by triwarp's tolerance**, which is the thing
-    to know before reading the ratio: both are given the *reduction* triwarp's tolerance produces,
-    so the rows price three ways of removing the same number of points.
+    This group used to carry the sentence *"the one group in the package where triwarp is expected
+    to lose"*, and it is worth leaving a marker where that was: the expectation was load-bearing,
+    not descriptive. It rested on Warp forbidding recursion, which is true, and on the conclusion
+    that the split is therefore serial, which is not -- a level-synchronous evaluation accepts the
+    same points and turned the ``rim_long`` rows from 84.06 ms into 1.08. Read the two ``saddle``
+    rows as floor rows now (the graph capture is ~0.12 ms of a ~0.5 ms call), not as the outlier.
+
+    Neither reference is Ramer-Douglas-Peucker, and **neither is driven by triwarp's tolerance**,
+    which is the thing to know before reading the ratio: both are given the *reduction* triwarp's
+    tolerance produces, so the rows price three ways of removing the same number of points.
 
     Driving them by their own error parameter was tried and rejected on a measurement.
     ``decimatePolyline``'s ``maxError`` is a collapse cost, **not** a deviation bound: on a 40-point

@@ -411,7 +411,12 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ("algorithms.multigrid", "scale_rows"): frozenset({"values"}),
     ("polyline", "clip_selected"): frozenset({"active", "left", "right"}),
     ("polyline", "init_ring"): frozenset({"active", "left", "right"}),
-    ("polyline", "rdp_keep_mask"): frozenset({"stack"}),
+    # The level-synchronous Ramer-Douglas-Peucker round. ``span_lo`` / ``span_hi`` are each point's
+    # current span, rewritten in place to the child span it belongs to at the next level;
+    # ``state`` is the ``wp.capture_while`` loop's own [levels run, condition] pair, which is the
+    # ``ear_loop_continue`` case in the same module. Neither is an input and neither is the answer
+    # -- that is ``out_keep``.
+    ("polyline", "rdp_split_spans"): frozenset({"span_lo", "span_hi", "state"}),
     ("sample", "subtract_deleted_contributions"): frozenset({"weights"}),
     ("visibility", "shape_diameter"): frozenset({"scratch"}),
 }

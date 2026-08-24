@@ -529,10 +529,13 @@ def polyline_simplify(
     """
     Simplify a polyline with the Ramer-Douglas-Peucker algorithm.
 
-    Recursively drops interior vertices whose perpendicular distance to the chord spanning a
-    kept sub-range is at most ``tol``; the first and last vertices are always retained. This is
-    a Warp port of ``ramer_douglas_peucker`` from libigl, evaluated on-device by a single-thread
-    stack-based kernel (Warp forbids recursion).
+    Drops interior vertices whose perpendicular distance to the chord spanning a kept sub-range is
+    at most ``tol``; the first and last vertices are always retained. The recursion is evaluated
+    **level-synchronously** rather than depth-first -- one round of four ``dim=n`` launches per
+    level of the split tree, so the cost is the tree's *depth* (about ``log2(n)`` on a mesh
+    boundary loop) rather than one thread's walk of the whole tree. The accepted set is identical
+    either way, since breadth-first and depth-first evaluation of the same recursion accept the
+    same points.
 
     Parameters
     ----------
@@ -554,27 +557,107 @@ def polyline_simplify(
         empty input yields two empty arrays; a single point is returned unchanged with
         ``indices == [0]``.
 
+    Notes
+    -----
+    The round loop runs **on device**, driven by ``wp.capture_while`` exactly as
+    [`polyline_triangulate`][triwarp.polyline.polyline_triangulate]'s ear rounds are, so the whole
+    simplification costs one graph launch and no readback at all. Measured interleaved on an RTX
+    5090 against the single-thread recursive kernel this replaces, with the accepted index set
+    asserted byte-identical in every cell (median of 20, or 3 above 20 000 points):
+
+    | polyline | n | recursive | level-synchronous | |
+    |---|---|---|---|---|
+    | ``rim_long`` | 65 536 | 84.06 ms | **1.08 ms** | **78x** |
+    | ``rim_long``, coarse ``tol`` | 65 536 | 60.24 | **1.03** | 59x |
+    | a 10-turn spiral | 4 096 | 6.97 | **0.84** | 8.3x |
+    | ``saddle`` | 528 | 0.63 | 0.55 | 1.16x |
+    | ``saddle_small`` | 268 | 0.38 | 0.49 | **0.76x** |
+
+    Two things that table settles. The **spiral** is the adversarial input for this formulation --
+    its farthest point sits next to an endpoint at every level, so the depth is ``O(n)`` rather than
+    ``log2(n)`` and the level-synchronous form pays 4``n`` rounds where the balanced case pays
+    ``4 log2(n)``. It still wins 8.3x, because the recursion's *own* cost is ``O(n^2)`` on the same
+    input, so there is no round cap and no serial fallback here: the crossover the shape of the
+    algorithm suggests does not exist. And the two smallest rows lose ~0.12 ms, which is the
+    one-off graph capture; that is the floor of the call rather than a size effect, and it is the
+    same trade the ear clipper's single-contour rows took.
+
+    On **cpu** the change is a uniform 4-6x loss (``rim_long`` 5.02 -> 20.22 ms), because Warp's cpu
+    backend runs a ``dim=n`` launch as one lane, so a round costs ``4n`` sequential iterations
+    whatever it settles -- against the recursion's ``O(n log n)`` total. The device is the target
+    (``.claude/CLAUDE.md`` section 13) and the absolute cpu cost stays in the tens of milliseconds,
+    so this is recorded rather than branched on: one algorithm, one accepted set, on both devices.
+
     See Also
     --------
     [`polyline_downsample`][triwarp.polyline.polyline_downsample]
         Drops points by *spacing* rather than by shape error.
-    [`polyline_downsample`][triwarp.polyline.polyline_downsample]
     """
     if closed:
         polyline = polyline_close(polyline)
     device = polyline.device
     n = int(polyline.shape[0])
-    # Everything is kept until the recursion drops it, and filling that in parallel here keeps the
-    # serial kernel's only serial work the part that has to be.
-    keep_mask = wp.full(n, True, dtype=wp.bool, device=device)
-    # Scratch stack of interleaved (ixs, ixe) ranges; max(2 * n, 2) keeps n == 0 in bounds.
-    stack = wp.empty(max(2 * n, 2), dtype=wp.int32, device=device)
+    span_lo = wp.empty(n, dtype=wp.int32, device=device)
+    span_hi = wp.empty(n, dtype=wp.int32, device=device)
+    keep_mask = wp.empty(n, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_polyline.rdp_keep_mask,
-        dim=1,
-        inputs=[polyline, wp.float32(tol * tol), stack, keep_mask],
-        device=device,
+        kernel_polyline.rdp_seed_spans, dim=n, inputs=[span_lo, span_hi, keep_mask], device=device
     )
+    if n > 2:  # fewer than three points have no interior to drop, and no thread 0 to clear `state`
+        span_max = wp.empty(n, dtype=wp.float32, device=device)
+        span_argmax = wp.empty(n, dtype=wp.int32, device=device)
+        squared_distances = wp.empty(n, dtype=wp.float32, device=device)
+        # state = [levels run, loop condition], both written on device so the round loop needs no
+        # readback -- ``polyline_triangulate``'s ear rounds are driven the same way and measured a
+        # replayed conditional-graph iteration of a four-launch body at 14 us against 86-93 us for
+        # the same body issued from the host with its convergence readback.
+        state = wp.array([0, 1], dtype=wp.int32, device=device)
+        squared_tolerance = wp.float32(tol * tol)
+
+        def split_round() -> None:
+            wp.launch(
+                kernel_polyline.rdp_begin_round,
+                dim=n,
+                inputs=[state, span_max, span_argmax],
+                device=device,
+            )
+            wp.launch(
+                kernel_polyline.rdp_span_max,
+                dim=n,
+                inputs=[polyline, span_lo, span_hi, squared_distances, span_max],
+                device=device,
+            )
+            wp.launch(
+                kernel_polyline.rdp_span_argmax,
+                dim=n,
+                inputs=[span_lo, squared_distances, span_max, span_argmax],
+                device=device,
+            )
+            wp.launch(
+                kernel_polyline.rdp_split_spans,
+                dim=n,
+                inputs=[
+                    squared_tolerance,
+                    span_max,
+                    span_argmax,
+                    span_lo,
+                    span_hi,
+                    state,
+                    keep_mask,
+                ],
+                device=device,
+            )
+
+        condition = state[1:2]
+        # Graph capture needs a CUDA stream, so the CPU device takes the direct-execution branch
+        # even when the driver supports conditional nodes.
+        if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():
+            with wp.ScopedCapture(device) as capture:
+                wp.capture_while(condition, split_round)
+            wp.capture_launch(capture.graph)
+        else:
+            wp.capture_while(condition, split_round)
+
     indices = tw.array.flatnonzero(keep_mask)
     return tw.array.gather(polyline, indices), indices
 
