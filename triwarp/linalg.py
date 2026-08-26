@@ -192,11 +192,61 @@ CG_CHECK_EVERY_FALLBACK = 10
 # iteration count and that is not knowable without building the hierarchy.
 #
 # So the rule is the conservative one: a system that converges inside the cap never pays for a
-# hierarchy and runs at exactly Jacobi's speed. 2 000 sits above every system measured here that a
-# hierarchy would *not* have helped (521, 1 558) and below every one it would (1 784, 6 447, 6 541,
-# 24 092). What that costs is the upside on the systems just past the cap -- the escalated solve
-# warm-starts from the probe's iterate, so those iterations are not wasted, but they are not free
-# either. Lower it only against a re-measurement of the whole table.
+# hierarchy and runs at exactly Jacobi's speed. What that costs is the upside on every system that
+# converges *just* inside it, and that is a large number rather than a rounding error. The clearest
+# case is ``smooth_region`` on ``bunny_decimated``, the 1 784-iteration row in the table below:
+# it converges under 2 000, therefore never escalates, and therefore forgoes the 2.29x a V-cycle
+# measures on it. That is deliberate rather than an oversight -- the table says what moving the cap
+# would cost instead.
+#
+# **Re-measured on the whole population, and the conclusion holds.** ``smooth_region`` is this
+# package's *only* ``"auto"`` caller, in two shapes -- a mesh region and a hole patch -- so 17
+# systems spanning both, plus ``fill_smooth`` on three hole meshes, is the whole table rather than a
+# sample of it. Whole solve including setup, interleaved, ``min`` of 5, RTX 5090:
+#
+#     system                n   jac it    cap 2000    1000     500     300     150
+#     region icos4 q25     641     151        6.38    6.23    6.25    6.26   17.93
+#     region icos5 q25   2 561     521       18.46   18.46   37.23   35.69   31.33
+#     region icos5 q50   5 057     997       34.93   34.47   61.70   55.11   50.69
+#     region icos6 q25  10 239   1 946       68.54   87.39   72.14   65.48   61.04
+#     region icos6 q50  20 353   3 827      170.73  132.32  114.34  108.61  103.69
+#     region bunny_dec   2 043   1 784       65.32   63.54   48.04   40.52   36.24
+#     region bunny       8 987   6 541      135.61  107.30   93.20   86.82   82.45
+#     patch bunny_dec      787     425       15.95   22.38   35.45   31.49   27.27
+#     patch bunny 4000   3 970   3 145      131.36   83.44   67.24   60.68   56.06
+#     fill_smooth[rim_short]                 73.92   74.26   74.48   93.45   87.10
+#     fill_smooth[holes_many]                19.84   20.76   19.54   19.06   19.76
+#     TOTAL (all 17)                         848.1   739.0   716.6   653.0   634.5
+#
+# Three things that table says, none of them guessable:
+#
+# **Escalate early or not at all.** A mid-range cap is worse than both ends, because it pays the
+# probe *and* the hierarchy: ``icos6 q25`` reads 68.54 at 2 000, **87.39** at 1 000 and 61.04 at
+# 150. So 1 000 or 1 500 is never the answer -- it is the worst of both.
+#
+# **Nothing separates the two classes, on any axis tried.** Iteration count interleaves (a
+# 244-iteration system wins 1.51x while a 997-iteration one loses 0.79x) and so does Jacobi
+# wall-clock (wins from 2.7 ms, losses up to 35.0). A cap *proportional to* ``n`` is refuted
+# outright and backwards: a larger system gets a larger cap and therefore escalates **later**,
+# taking ``region bunny`` from 136.8 ms to 216.9 at ``alpha = 0.5``.
+#
+# **The escalated solve does not really reuse the probe's work.** ``region bunny`` measures 135.61
+# escalating at 2 000 against 67.29 for multigrid from the start, and 2 000 Jacobi iterations cost
+# ~64 ms -- so the probe's iterates carry over close to nothing and its cost is very nearly
+# additive. The warm start is real (``solution`` is threaded through) but Jacobi leaves a residual
+# a V-cycle has to work down anyway.
+#
+# 2 000 is kept because it is the only value that regresses **nothing**, which is the property this
+# setting was introduced to have. Lowering it to 150 is the best *total* (848 -> 634 ms, 1.34x) and
+# would take ``smooth_region[bunny_decimated]`` from 5.5x behind to roughly 3x -- at the price of
+# up to 2.8x on small well-conditioned solves, each bounded by one hierarchy setup (+4 to +16 ms).
+# That is a policy choice and not a measurement question; the numbers for it are above.
+#
+# One thing the table retires: the 0.21x ``fill_smooth[holes_many]`` disaster that motivated the cap
+# is **not** a cap-value problem. That mesh is flat at 19.0-20.8 ms for every cap from 100 to 2 000
+# and only collapses (77.4 ms, 0.26x) under *unconditional* multigrid, because its 3-vertex patches
+# converge in far fewer iterations than any cap considered. The row that actually constrains a low
+# cap is ``fill_smooth[rim_short]``, whose two 512-vertex rims put it just past 500.
 CG_PROBE_ITERATIONS = 2000
 
 
@@ -783,9 +833,14 @@ def _cg_columns_auto(
 
     A system that finishes inside the probe pays nothing at all for the option -- the probe *is* the
     solve. One that does not is the ill-conditioned kind
-    [`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner] is for, and the escalated
-    solve warm-starts from the iterate the probe left in ``solution``, so its iterations carry over;
-    the continuation does restart the Krylov space, which costs a few more.
+    [`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner] is for.
+
+    The escalated solve does warm-start from the iterate the probe left in ``solution``, but **do
+    not read that as the probe being cheap**: measured on ``smooth_region``'s ``bunny`` system,
+    escalating at 2 000 costs 135.6 ms against 67.3 for a V-cycle from the start, and 2 000 Jacobi
+    iterations are ~64 ms of that -- so the probe is very nearly additive and its iterates carry
+    over close to nothing. Jacobi leaves a residual whose low-frequency part is exactly what the
+    V-cycle then has to work down.
 
     See [`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS] for why this is a cap rather
     than the rate prediction it started out as.
@@ -1268,6 +1323,16 @@ def multigrid_preconditioner(
     loop rather than rebuilding it -- [`solve_spd`][triwarp.linalg.solve_spd]'s ``preconditioner``
     parameter exists for exactly that.
 
+    **The setup is host cost and it is per *level*, not per unknown, so it cannot be cut by making
+    the operator smaller.** Measured on ``smooth_region``'s systems: 83-84 % host across 284-468
+    launches, and a level costs the same wherever it sits in the hierarchy -- 5.70 ms at n = 8 987
+    against 5.71 ms at n = 879. The reason is underneath triwarp: ``warp.sparse.bsr_mm`` measures
+    **~0.6 ms at every size probed**, n = 128 through n = 65 536 (0.573 / 0.603 / 0.614 / 0.696 ms),
+    at 88-91 % host in only 12 launches, because it makes three device-to-host readbacks to size its
+    output. That is Warp's, not this package's, so "make the hierarchy cheap enough to run
+    unconditionally" is not a lever available here; the reachable version is to build **fewer
+    levels**, which is what this module's ``_MULTIGRID_MAX_COARSE`` is set for.
+
     Coarsening stops at 128 rows, or earlier if a level fails to shrink; the coarsest operator is
     then inverted densely on the host, which is exact and is a single launch inside the cycle where
     an iterative coarse solve would be a data-dependent loop. When coarsening stalls while the level
@@ -1315,7 +1380,31 @@ def multigrid_preconditioner(
 
 # Rows below which a level is solved exactly instead of coarsened further. The coarse solve is a
 # dense pseudo-inverse factored on the host, so this is also the size of that factorization.
-_MULTIGRID_MAX_COARSE = 128
+#
+# **384 rather than a smaller cap because the last level is the expensive one twice over**: it costs
+# a level's setup (one aggregation, one power iteration, a prolongator, a transpose and two
+# ``bsr_mm``, all of which are fixed host cost -- ``bsr_mm`` measures ~0.6 ms at *every* size from
+# n=128 to n=65 536, 88-91 % host) and then a smoothing sweep, a restriction and a prolongation in
+# **every cycle**. Solving that level densely instead is one matvec. Swept over every system that
+# reaches a hierarchy -- ``smooth_region`` is the package's only ``"auto"`` caller, in its two
+# shapes, a mesh region and a hole patch -- interleaved, ``min`` of 5, whole solve including setup:
+#
+#     system                  n    128 rows    384 rows          levels 128 -> 384
+#     region[bunny]        8 987    84.94 ms    73.98  1.15x    [8987,879,360,306] -> [8987,879,360]
+#     region[bunny_dec]    2 043    36.49       28.75  1.27x    [2043,158,27]      -> [2043,158]
+#     region[icosphere5]   2 561    29.56       24.68  1.20x    [2561,205,27]      -> [2561,205]
+#     region[icosphere4]     641    15.61       15.34  1.02x    [641,59]           -> [641,59]
+#     patch[bunny]           994    31.48       22.14  1.42x    [994,165,66]       -> [994,165]
+#
+# Every system improves or is flat and none regresses, and the gain is mostly in the *solve* rather
+# than the setup -- ``bunny_decimated`` moves 10.86 -> 10.35 ms of setup against 25.6 -> 18.4 of
+# solve -- which is the per-cycle half above. Tightening ``_MULTIGRID_MIN_COARSENING`` instead was
+# measured and is strictly weaker: it drops ``bunny``'s 360 -> 306 level (that one barely shrinks)
+# and nothing else, because 158 -> 27 passes any stall test while still costing a cycle.
+#
+# Values from 384 to 512 measure identically here; 384 keeps headroom under
+# ``_MULTIGRID_MAX_DENSE`` and the host ``pinv`` that guard sizes, which is ~4.9 ms at 587 rows.
+_MULTIGRID_MAX_COARSE = 384
 
 # Hard cap on the hierarchy depth, and on the dense coarse solve. Coarsening stops early whenever a
 # level fails to shrink by ``1 - _MULTIGRID_MIN_COARSENING``, which is what happens once a level is

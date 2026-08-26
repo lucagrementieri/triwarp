@@ -738,6 +738,20 @@ def test_smooth_region(bench_case: BenchCase) -> None:
     ``0 - 0.15`` moves **``bunny`` 161.7 -> 153.4 ms** and leaves ``bunny_decimated`` at
     69.5-70.6 ms, *flat to three digits*, because the aggregation never runs there at all. A theta
     sweep that appeared to move both rows would mean the cap had changed, not the coarsening.
+
+    The same asymmetry explains the two rows' latest move, and is the reason only one of them
+    moved. Raising ``linalg._MULTIGRID_MAX_COARSE`` to 384 drops a hierarchy level whose setup and
+    per-cycle cost bought almost nothing, which is worth 1.15x on ``bunny``'s escalated solve --
+    **147.8 -> 139.2 ms**, 2.31x behind meshlib where round 7 measured 3.12x -- and *exactly*
+    nothing on ``bunny_decimated`` (68.6 -> 68.9), which never reaches a hierarchy to improve.
+    Seeding the solve from the current positions rather than ``wp.zeros`` moved both by 1.04-1.06x
+    before that.
+
+    **``bunny_decimated``'s 5.5x is a policy choice and not an unsolved problem.** It converges in
+    1 784 Jacobi iterations against the 2 000-iteration cap, so it stays on Jacobi although a
+    V-cycle measures **2.29x** on its system. Lowering the cap would collect that and regress small
+    well-conditioned solves by up to 2.8x; ``linalg.CG_PROBE_ITERATIONS`` carries the whole
+    17-system table behind that decision. Do not read this row as a slow solver.
     """
     skip_larger_than(
         bench_case,
