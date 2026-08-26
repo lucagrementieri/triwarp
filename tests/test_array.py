@@ -140,6 +140,66 @@ def test_the_packing_family_matches_numpy(device: str, copy: bool) -> None:
         assert np.array_equal(segment_wp.numpy(), part_np)
 
 
+def test_pack_1d_arrays_reuses_what_split_produced(device: str) -> None:
+    """
+    Triwarp against triwarp: ``pack_1d_arrays(split(flat), copy=False)`` hands ``flat`` back.
+
+    The oracle for the *values* is the ``copy=True`` default, which every other test in this file
+    exercises; what only this can check is that the free path is taken at all and that it is taken
+    **only** where the segments really tile one buffer -- an adjacency test would also fire on two
+    separate allocations the memory pool happened to place end to end, and would then silently turn
+    a caller's copy into an alias.
+    """
+    flat_wp = wp.array(np.arange(12, dtype=np.int32), dtype=wp.int32, device=device)
+    offsets_wp = wp.array(np.array([0, 3, 8], dtype=np.int32), dtype=wp.int32, device=device)
+    segments_wp = tw.array.split(flat_wp, offsets_wp)
+
+    packed_wp, packed_offsets_wp = tw.array.pack_1d_arrays(segments_wp, copy=False)
+    assert packed_wp.ptr == flat_wp.ptr
+    assert np.array_equal(packed_wp.numpy(), flat_wp.numpy())
+    assert np.array_equal(packed_offsets_wp.numpy(), offsets_wp.numpy())
+    assert tw.array.concatenate(segments_wp, copy=False).ptr == flat_wp.ptr
+    # The default still copies, so a caller that writes into the result is unaffected.
+    assert tw.array.pack_1d_arrays(segments_wp)[0].ptr != flat_wp.ptr
+
+    for label, sequence in (
+        ("out of order", segments_wp[::-1]),
+        ("a gap between them", [segments_wp[0], segments_wp[2]]),
+        ("separate allocations", [wp.clone(segment) for segment in segments_wp]),
+    ):
+        rebuilt_wp, _ = tw.array.pack_1d_arrays(sequence, copy=False)
+        assert rebuilt_wp.ptr != sequence[0].ptr, label
+        assert np.array_equal(
+            rebuilt_wp.numpy(), np.concatenate([piece.numpy() for piece in sequence])
+        ), label
+
+
+def test_pack_1d_arrays_copy_false_aliases_a_boundary_loop_pack(
+    half_torus: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Triwarp against triwarp: the round trip the flag exists for, on a real mesh.
+
+    ``boundary_loops`` slices one packed buffer into per-rim views and both loop measures pack them
+    straight back, which on ``dragon``'s 407 rims was 407 ``warp.copy`` calls rebuilding a buffer
+    that already existed. The oracle for the values is the copying default; what this adds is that
+    the free path fires on loops nobody constructed by hand, which the synthetic case above cannot
+    show. That the measures themselves are unaffected is
+    [`test_loop_measures_agree_with_the_single_loop_forms`]'s job.
+    """
+    _mesh_tm, mesh_wp = half_torus
+    loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
+    assert len(loops_wp) > 1
+
+    packed_wp, offsets_wp = tw.array.pack_1d_arrays(loops_wp, copy=False)
+    assert packed_wp.ptr == loops_wp[0].ptr
+    assert np.array_equal(packed_wp.numpy(), tw.array.pack_1d_arrays(loops_wp)[0].numpy())
+    assert np.array_equal(
+        packed_wp.numpy(), np.concatenate([loop_wp.numpy() for loop_wp in loops_wp])
+    )
+    assert offsets_wp.numpy()[0] == 0
+
+
 def test_split_views_share_storage_and_copies_do_not(device: str) -> None:
     """Default segments alias the packed buffer; ``copy=True`` detaches them."""
     flat_wp = wp.array(np.arange(6, dtype=np.int32), dtype=wp.int32, device=device)

@@ -501,6 +501,12 @@ def _pack_loop_segments(
     ``loop_id`` inverts ``starts`` so a ``dim=total`` launch finds its own loop without a search,
     which is what lets both measures above run in one launch over every loop at once. ``None`` when
     there is nothing to measure.
+
+    Building ``loop_id`` on the device instead -- ``kernels/array.py``'s ``segment_owner_labels``,
+    one launch -- was measured and **declined**: 0.078 -> 0.029 ms on ``dragon``'s 407 rims and
+    0.051 -> 0.029 on ``bunny``'s five, so at most **0.05 ms** of a 0.36 ms call, and the kernel
+    wants total-terminated offsets, whose extra allocation and copy is most of that back. The
+    ``numpy.repeat`` stays.
     """
     device = vertices.device
     loops = list(loops)
@@ -509,7 +515,11 @@ def _pack_loop_segments(
             raise ValueError(f"{caller}: every loop must be a rank-1 wp.int32 array")
     if not loops or all(int(loop.shape[0]) == 0 for loop in loops):
         return None
-    flat_loops, starts = tw.array.pack_1d_arrays(loops)
+    # ``copy=False``: nothing below writes into ``flat_loops``, and a caller's loops usually
+    # come straight from ``boundary_loops``, which already sliced them out of one packed
+    # buffer -- so the pack is free instead of one ``wp.copy`` per rim (2.594 -> 0.336 ms on
+    # ``dragon``'s 407 rims, whose measurement launch is 0.023 ms of that).
+    flat_loops, starts = tw.array.pack_1d_arrays(loops, copy=False)
     sizes_np = np.array([int(loop.shape[0]) for loop in loops], dtype=np.int32)
     loop_id = wp.array(
         np.repeat(np.arange(len(loops), dtype=np.int32), sizes_np), dtype=wp.int32, device=device

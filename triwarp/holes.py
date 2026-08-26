@@ -763,7 +763,8 @@ def _run_hole_dp(
 
 def _pack_loops(loops: list[wp.array[wp.int32]]) -> _PackedLoops:
     """Concatenate a caller's per-loop arrays into the packed form the fill engine consumes."""
-    flat_loops, _offsets = tw.array.pack_1d_arrays(loops)
+    # ``copy=False``: every kernel below takes ``flat_loops`` as an input and none writes it.
+    flat_loops, _offsets = tw.array.pack_1d_arrays(loops, copy=False)
     sizes_np = np.asarray([int(loop.shape[0]) for loop in loops], dtype=np.int64)
     return _PackedLoops(flat_loops, sizes_np)
 
@@ -1320,7 +1321,9 @@ def _packed_rims(
     if not loops or all(int(loop.shape[0]) == 0 for loop in loops):
         return None
 
-    packed, starts = tw.array.pack_1d_arrays(loops)
+    # ``copy=False``: the extension kernels only read the rim indices, so loops that came from
+    # ``boundary_loops`` are re-used in place rather than re-packed rim by rim.
+    packed, starts = tw.array.pack_1d_arrays(loops, copy=False)
     sizes_np = np.array([int(loop.shape[0]) for loop in loops], dtype=np.int32)
     loop_id = wp.array(
         np.repeat(np.arange(len(loops), dtype=np.int32), sizes_np), dtype=wp.int32, device=device
@@ -1452,7 +1455,10 @@ def fillable_loop_mask(
     if not loops:
         return wp.empty(0, dtype=wp.bool, device=device)
 
-    n_vertices = tw.array.index_domain_size(faces)
+    # ``vertices`` is the domain, so its length is the bound ``index_domain_size`` would go to the
+    # device to re-derive -- 0.096 ms, flat in the mesh, so 8 % of a 1.12 ms call on ``bunny``.
+    # An unreferenced vertex only widens the two tables below, which are indexed by vertex id.
+    n_vertices = int(vertices.shape[0])
     # **One** readback for all the loops, not one each: they are concatenated on the device first,
     # and the sizes are already on the host. A scan mesh carries dozens of rims, so the per-loop
     # spelling cost a sync apiece and was measured at 16x behind the reference before this.
@@ -1461,7 +1467,7 @@ def fillable_loop_mask(
     # wants two entries for one vertex, and the pinch is what disqualifies it. Its size is bounded
     # by the *boundary* rather than by the mesh.
     sizes = [int(loop.shape[0]) for loop in loops]
-    flat_np = tw.array.concatenate(list(loops)).numpy()
+    flat_np = tw.array.concatenate(list(loops), copy=False).numpy()
     bounds = np.cumsum([0, *sizes])
     loops_np = [flat_np[bounds[index] : bounds[index + 1]] for index in range(len(sizes))]
     fillable_np = np.ones(len(loops_np), dtype=bool)

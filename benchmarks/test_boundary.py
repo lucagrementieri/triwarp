@@ -194,6 +194,23 @@ def test_loop_perimeters(bench_case: BenchCase) -> None:
 
     The loops are produced **outside** the timed callable on both sides: ``boundary_loops`` has its
     own group and would otherwise dominate this one.
+
+    **And the packing was 95 % of it, re-packing a buffer that was already packed.** Attributed on
+    ``dragon`` (407 rims, 4 270 entries): 2.505 ms of the row's 2.633 went to ``pack_1d_arrays``,
+    one ``warp.copy`` per rim to move 17 kB, against **0.023 ms** for the launch the function exists
+    for -- 412 launches, 51 % host. But ``boundary_loops`` produced those rims by *slicing* one
+    packed buffer, so the pack rebuilt what the caller already held. ``pack_1d_arrays(copy=False)``
+    now recognises segments that tile one allocation and hands that allocation's span back:
+
+    | row | before | after | |
+    |---|---|---|---|
+    | ``dragon`` | 2.511 ms | **0.355** | 7.08x, and 2.60x behind meshlib becomes **2.67x ahead** |
+    | ``lucy`` (GPU-only) | 0.280 | 0.172 | 1.63x |
+    | ``bunny`` / ``bunny_decimated`` | 0.161 / 0.163 | 0.155 / 0.166 | flat: 5 rims, floor |
+
+    The two small rows are the honest limit of it: at five rims the pack was never the cost, and
+    what is left is ~0.15 ms of launch marshalling and allocation against meshlib's 0.033 ms of
+    cached-topology arithmetic. They are floor rows and should not be optimized further.
     """
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()
@@ -225,6 +242,11 @@ def test_loop_directed_areas(bench_case: BenchCase) -> None:
     Same packing, same launch shape, one cross product per segment instead of one length -- so the
     gap between the two groups is what the extra arithmetic costs and nothing else. meshlib's
     ``holeDirArea`` is again per hole.
+
+    That shared packing is why this row moved with its sibling and by the same factor when
+    ``pack_1d_arrays`` learned to reuse an already-packed buffer: ``dragon`` 2.488 -> **0.391 ms**
+    (6.37x), ``lucy`` 0.340 -> 0.186. Read the measurement in ``test_loop_perimeters`` above; there
+    is nothing separate to say about this one, which is the point of the pair.
     """
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()

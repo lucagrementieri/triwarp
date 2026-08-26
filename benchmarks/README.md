@@ -287,6 +287,29 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
   size, not about the code, and optimizing one would mean removing allocations from correct code for
   microseconds nobody experiences. Below roughly 10³ elements, prefer to fix the *input size* of the
   benchmark over the function it measures.
+
+  **A second population sits at 2-10x that floor and says the same thing, which is why a loss table
+  sorted by gap keeps promoting it.** Round 7 carried **96 loss rows between 0.3 and 5.0 ms**, 95.9
+  ms between them, and attributing them one at a time -- wall / device / launch count at the
+  benchmark's own operating point, `pytest -p attrib_plugin` -- found a launch count in the tens and
+  a host share of 77-91 %, i.e. the floor above multiplied by a small integer:
+
+  | row | wall | device | host | kernels |
+  |---|---|---|---|---|
+  | `boundary_edges[sphere_med]` | 0.404 ms | 0.038 | 91 % | 7 |
+  | `loop_perimeters[bunny]` | 0.196 | 0.034 | 82 % | 10 |
+  | `triangulate_polyline[sphere_small, 64]` | 1.176 | 0.271 | 77 % | 22 |
+  | `fillable_loop_mask[bunny]` | 1.287 | 0.217 | 83 % | 35 |
+  | `eliminate_degree3_vertices[bunny]` | 2.545 | 0.333 | 87 % | 75 |
+
+  So the rule for this band is **attribute before optimizing, and expect a floor row**. The
+  exception is worth knowing because it is what the attribution is *for*: the same sweep found one
+  row whose 51 % host share hid an algorithm rather than a floor -- `loop_perimeters[dragon]` at
+  **412** launches, 2.505 ms of its 2.633 spent re-packing a buffer that was already packed -- and
+  nothing about its ratio, its size or its host share distinguished it from the five above. The
+  launch count did. See `test_boundary.py::test_loop_perimeters` for the fix and
+  `test_holes.py::test_fillable_loop_mask` for a row where the same stage was measured and was
+  **not** the cost.
 - **A CPU reference can be the whole cost of a module.** Two were, before being capped: trimesh's
   `discrete_mean_curvature_measure` (one `cKDTree` ball query per point) took **40 s a call** on
   `sphere_med` and was 95% of `test_curvature`, and `tm.points.fit_line` took **22 s a call** on

@@ -508,7 +508,9 @@ def shorten_loop(
         faces, twins=twins, n_vertices=n_vertices
     )
 
-    packed, starts = tw.array.pack_1d_arrays(loops)
+    # ``copy=False``: each sweep reads ``packed`` and writes a freshly sized buffer, so the
+    # first pack can alias the caller's loops. A sweep that accepts nothing leaves them alone.
+    packed, starts = tw.array.pack_1d_arrays(loops, copy=False)
     # The offsets `pack_1d_arrays` returns are not total-terminated, and every kernel below reads
     # `loop_offsets[l + 1]`, so terminate them once here rather than special-casing the last loop.
     loop_offsets = tw.array.concatenate(

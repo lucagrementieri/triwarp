@@ -531,6 +531,28 @@ def test_fillable_loop_mask(bench_case: BenchCase) -> None:
     rims are concatenated on the device now and read in one transfer, which was **1.97x**. What is
     left is the chord sweep, which is a pass over every unique edge and so tracks the mesh -- there
     is no smaller correct version of that test, and it is the half meshlib does not do at all.
+
+    **Attributed per stage, which says the two benchmarked rows are floor rows and ``dragon`` is
+    not.** Medians on an RTX 5090:
+
+    | stage | ``bunny_decimated`` | ``bunny`` | ``dragon`` |
+    |---|---|---|---|
+    | whole call | 1.061 ms | 1.120 | 5.385 |
+    | ``edges_unique`` (the chord sweep) | **0.703 (66 %)** | **0.690 (62 %)** | 2.094 (39 %) |
+    | the per-rim host tables | 0.033 | 0.046 | **2.180 (40 %)** |
+    | concatenating the rims | 0.043 | 0.046 | 0.199 |
+
+    So the two benchmarked rows are **``edges_unique``** -- the shared unique/group stack, which has
+    its own group and its own floor, and which is flat here across a 4.3x face range, so it is that
+    stack's fixed cost rather than this function's. Nothing local can move them: even deleting the
+    chord test outright leaves ~0.4 ms against meshlib's 0.03-0.19 ms of cached-topology
+    arithmetic. Two things were taken because they were free rather than because they showed up:
+    the rim concatenation now re-uses the buffer ``boundary_loops`` already packed (``copy=False``,
+    see ``benchmarks/test_boundary.py::test_loop_perimeters``), worth **1.39x on ``dragon``**, and
+    an ``index_domain_size`` readback is gone because ``vertices`` already states the bound -- 0.096
+    ms, flat in the mesh, so 8 % of the small rows. ``dragon``'s remaining 40 % is a **Python loop
+    over 407 rims** building two vertex-indexed tables, which is the one stage here with an
+    algorithm left in it and the reason that row is not a floor row.
     """
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()

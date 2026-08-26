@@ -204,7 +204,7 @@ def repeat_range(
 
 
 def pack_1d_arrays(
-    arrays: Sequence[wp.array[wp.Scalar]],
+    arrays: Sequence[wp.array[wp.Scalar]], *, copy: bool = True
 ) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
     """
     Concatenate several 1-D ``warp.array`` instances into one buffer plus per-segment offsets.
@@ -217,6 +217,13 @@ def pack_1d_arrays(
     ----------
     arrays
         Non-empty sequence of 1-D arrays sharing the same ``dtype`` and ``device``.
+    copy
+        Keep ``False`` for a read-only result. ``arrays`` that are already consecutive non-empty
+        views of one buffer -- what [`split`][triwarp.array.split] returns with ``copy=False`` --
+        are then handed back as that buffer's span instead of being copied into a new one, so the
+        ``split`` round trip costs nothing at all: measured at **2.505 ms of ``loop_perimeters``'
+        2.633 ms on ``dragon``**, 407 ``warp.copy`` launches to move 17 kB. The default copies, so
+        writing into ``flat`` is safe; with ``copy=False`` such a write reaches the segments.
 
     Returns
     -------
@@ -241,11 +248,11 @@ def pack_1d_arrays(
         The inverse: recovers the per-segment arrays from ``(flat, offsets)``.
     [`concatenate`][triwarp.array.concatenate]
     """
-    flat, offsets = _pack_segments(arrays, caller="pack_1d_arrays")
+    flat, offsets = _pack_segments(arrays, caller="pack_1d_arrays", copy=copy)
     return flat, wp.array(offsets, dtype=wp.int32, device=flat.device)
 
 
-def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
+def concatenate(arrays: Sequence[wp.array[DType]], *, copy: bool = True) -> wp.array[DType]:
     """
     Concatenate 1-D ``warp.array`` instances in order (``numpy.concatenate``).
 
@@ -254,13 +261,16 @@ def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
     arrays
         Non-empty sequence of rank-1 arrays sharing the same ``dtype`` and ``device``.
         Empty segments are allowed.
+    copy
+        Keep ``False`` for a read-only result, which then costs nothing when the segments already
+        tile one buffer -- see [`pack_1d_arrays`][triwarp.array.pack_1d_arrays].
 
     Returns
     -------
     wp.array
         Contiguous 1-D array of length ``sum(a.size for a in arrays)`` on the input
         device. When ``arrays`` has a single element, that array is returned without
-        copying.
+        copying whatever ``copy`` says, since there is nothing to concatenate it with.
 
     Raises
     ------
@@ -283,7 +293,7 @@ def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
         if int(arr.ndim) != 1:
             raise ValueError(f"concatenate requires rank-1 arrays, got ndim={arr.ndim}")
         return arr
-    return _pack_segments(arrays, caller="concatenate")[0]
+    return _pack_segments(arrays, caller="concatenate", copy=copy)[0]
 
 
 def split(
@@ -356,7 +366,7 @@ def split(
 
 
 def _pack_segments(
-    arrays: Sequence[wp.array[DType]], *, caller: str
+    arrays: Sequence[wp.array[DType]], *, caller: str, copy: bool = True
 ) -> tuple[wp.array[DType], list[int]]:
     """
     Validate rank-1 segments and copy them into one contiguous buffer.
@@ -365,6 +375,10 @@ def _pack_segments(
     [`concatenate`][triwarp.array.concatenate], which differ only in whether the caller wants the
     segment offsets back as a device array. Returns them as a Python list so ``concatenate`` pays
     nothing for the offsets it discards.
+
+    With ``copy=False`` the result may be one of the inputs' own storage rather than a fresh
+    buffer -- see [`_tiled_span`][triwarp.array._tiled_span] for when, and for why the choice
+    cannot be made here.
     """
     if len(arrays) == 0:
         raise ValueError("arrays must be non-empty")
@@ -382,11 +396,76 @@ def _pack_segments(
         sizes.append(int(arr.shape[0]))
 
     offsets = list(itertools.accumulate(sizes[:-1], initial=0))
-    flat = wp.empty(offsets[-1] + sizes[-1], dtype=dtype, device=device)
+    total = offsets[-1] + sizes[-1]
+    if not copy:
+        already_packed = _tiled_span(arrays, sizes, total)
+        if already_packed is not None:
+            return already_packed, offsets
+
+    flat = wp.empty(total, dtype=dtype, device=device)
     for arr, offset, n in zip(arrays, offsets, sizes, strict=True):
         if n > 0:
             wp.copy(flat, arr, dest_offset=offset, count=n)
     return flat, offsets
+
+
+def _tiled_span(
+    arrays: Sequence[wp.array[DType]], sizes: Sequence[int], total: int
+) -> wp.array[DType] | None:
+    """
+    Return the span these segments already occupy, when they are consecutive views of one buffer.
+
+    ``split`` and [`pack_1d_arrays`][triwarp.array.pack_1d_arrays] are documented inverses, and the
+    round trip is common: [`boundary_loops`][triwarp.boundary.boundary_loops] slices one packed
+    buffer into per-loop views and every batched consumer of those loops packs them straight back.
+    Copying there rebuilds a buffer that already exists, one ``wp.copy`` per segment -- measured at
+    **2.505 ms of ``loop_perimeters``' 2.633 ms on ``dragon``**, 407 launches to move 17 kB, against
+    0.023 ms for the launch the function exists for.
+
+    It runs only for a caller that asked (``copy=False``), because a packer that *sometimes* aliases
+    is a trap and this one was caught by the suite on its first run: ``combine.concatenate`` adds
+    each piece's vertex offset into the packed face buffer **in place**, so a view handed to it
+    rewrites the caller's own faces. Which callers write is not inferable from here, so the choice
+    stays theirs.
+
+    The gate is *identity* on the base rather than adjacency of the pointers. Two separately
+    allocated buffers can land adjacent in Warp's memory pool by luck, and an adjacency test would
+    then alias or copy depending on the allocator. Requiring a common base restricts the fast path
+    to callers already holding aliases of one allocation -- exactly the ``split`` round trip.
+
+    ``_ref`` is Warp's own back-reference from a slice to the array it keeps alive (Warp 1.16); it
+    is read through ``getattr`` and every conclusion drawn from it is re-checked against the public
+    ``ptr`` / ``shape`` / ``strides`` / ``dtype`` / ``device``, so a release that drops the
+    attribute loses the fast path rather than the correctness. ``None`` when the segments are not
+    one buffer's, which is the ordinary case.
+    """
+    if any(n <= 0 for n in sizes):
+        return None  # a zero-length segment has no address to chain through
+    base = _view_base(arrays[0])
+    if int(base.ndim) != 1 or not base.is_contiguous or base.dtype != arrays[0].dtype:
+        return None
+    stride = int(base.strides[0])
+    cursor = int(arrays[0].ptr)
+    for arr, n in zip(arrays, sizes, strict=True):
+        if (
+            _view_base(arr) is not base
+            or not arr.is_contiguous
+            or int(arr.strides[0]) != stride
+            or int(arr.ptr) != cursor
+        ):
+            return None
+        cursor += n * stride
+    start, remainder = divmod(int(arrays[0].ptr) - int(base.ptr), stride)
+    if remainder or start < 0 or start + total > int(base.shape[0]):
+        return None
+    return base[start : start + total]
+
+
+def _view_base(arr: wp.array[DType]) -> wp.array[DType]:
+    """Resolve a slice view to the allocation it reads, or return an owning array unchanged."""
+    while (parent := getattr(arr, "_ref", None)) is not None:
+        arr = parent
+    return arr
 
 
 def allclose(
