@@ -829,6 +829,20 @@ class _FlipTopology:
 
         Every public attribute is rewritten; the returned row count is also the launch dimension
         for the candidate, claim and commit kernels.
+
+        **It is launch-bound, not data-bound, and that is why the region flip pass does not scope
+        it to the region.** Measured on icospheres, one rebuild, ``min`` of 7 on an RTX 5090: 0.161
+        ms at 320 faces, 0.204 at 5 120, 0.248 at 81 920 and 0.316 at 327 680 -- a **1 024x** range
+        of input for **1.96x** of cost, because the eight launches' marshalling dominates the radix
+        sort. So the reading that suggests itself from ``_flip_region_faces``, where the sort covers
+        the whole mesh while only edges with *both* faces in the region are flippable, is a much
+        smaller number than it looks: on ``refill_region``'s ``dragon`` row the pass rebuilds 1 050
+        555 interior-edge rows to serve a 4 314-face region (0.61 %), and scoping it to that region
+        would save the difference between 0.454 ms per round and the ~0.16 ms floor -- about 0.15
+        ms x 13 rounds on the largest mesh in the suite, and nothing at all on ``bunny`` (0.252 ms
+        per round already). Restricting the *duplicate-edge* table would also need the region's
+        vertex one-ring closure to stay exact, since a flip's new edge may already exist outside the
+        region. Not worth it at that price; measure again if the floor moves.
         """
         n = self._n_corners
         wp.launch(

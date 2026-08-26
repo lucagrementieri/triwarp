@@ -920,6 +920,18 @@ def test_fix_self_intersections(bench_case: BenchCase, method: str) -> None:
     margin the ``offset`` groups show; the local path is a host-side loop of detect, dilate, delete,
     DP, refine -- five wrapper chains per pass, three passes -- and loses to a single C++ traversal.
     Anything spent here belongs in the refill chain, not in the detector.
+
+    **The ``local`` row is a fair loss and must not be discounted as "triwarp does strictly more
+    work".** That discount is available on the *torus* fixture two paragraphs up, where triwarp
+    reaches 0 and MeshLib leaves 281; it is not available here. Measured on this row's own input,
+    one call per fresh process: 1 176 intersecting faces in, **158-365** out at the default
+    ``max_iter=3`` -- both libraries reduce, and neither clears. Raising ``max_iter`` does not close
+    it either (the function's Notes carry the table). So the 4.3x is a cost comparison between two
+    incomplete repairs, not the price of a better answer.
+
+    Its 3 419 launches are three ``holes.refill_region`` chains -- the ``max_iter`` loop -- and not
+    per-component work; ``benchmarks/test_holes.py``'s ``refill_region`` group carries the per-stage
+    attribution and the measurements that refuted capturing the chain.
     """
     if bench_case.kind == "meshlib":
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np

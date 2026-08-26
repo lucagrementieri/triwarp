@@ -1600,7 +1600,8 @@ def fix_self_intersections(
         Rings of faces added around each intersecting face before deleting, in the ``"local"``
         method. Larger takes more surface with it and is likelier to succeed in one pass.
     max_iter
-        Cap on cut-and-refill passes. The loop also stops as soon as nothing intersects.
+        Cap on cut-and-refill passes. The loop also stops as soon as nothing intersects. Raising it
+        does **not** help a deep interpenetration and inflates the mesh; see the Notes.
     voxel_size
         Lattice spacing for the ``"voxel"`` method. ``None`` uses 1/128 of the bounding-box
         diagonal.
@@ -1643,6 +1644,23 @@ def fix_self_intersections(
     rim whose minimum-weight patch runs back through the other shell, so the pass converges only
     where the damage is a band. Reach for ``"voxel"`` when two closed pieces genuinely
     interpenetrate: a level set has no notion of two shells.
+
+    **On that input class the result is nondeterministic and ``max_iter`` is not a quality knob**,
+    which "only reduces" does not by itself tell you. Measured one call per fresh process on the
+    benchmark's own fixture -- ``sphere_med`` doubled and offset by 0.35 of its diagonal, 163 840
+    faces and 1 176 intersecting:
+
+    | ``max_iter`` | intersecting after | faces after |
+    |---|---|---|
+    | 3 | 158, 158, 365 | 161 167 - 161 693 |
+    | 6 | 156, 392 | 170 791 - 178 923 |
+    | 10 | 381, 550 | 185 087 - **245 552** |
+
+    The residual does not fall with more passes while the face count climbs past the input's, so
+    each pass is refilling a rim that the next one cuts out again. The spread within a row is the
+    refill chain's own nondeterminism (atomic ordering, as in
+    [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]), so a repeat run is not a
+    regression. Do not raise ``max_iter`` hoping for convergence here; the answer is ``"voxel"``.
 
     The two methods differ in what they preserve, not in quality. ``"local"`` keeps the input's
     triangulation everywhere it did not cut, so a per-vertex attribute survives outside the patch;

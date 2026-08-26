@@ -184,6 +184,29 @@ def laplacian_ls_triplets(
 
 
 @wp.kernel
+def gather_free_positions(
+    free_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    points: wp.array[wp.vec3],
+    out_sol_x: wp.array[wp.float64],
+    out_sol_y: wp.array[wp.float64],
+    out_sol_z: wp.array[wp.float64],
+) -> None:
+    # The inverse of ``scatter_free_solution``. Both region solves ask CG for the free vertices'
+    # *new* positions, whose best available initial guess is their current ones -- and for a vertex
+    # no face refers to it is the only one, because such a vertex contributes no row and CG never
+    # writes its entry. Seeding from zeros leaves it at the origin; ``smoothing._free_positions``
+    # carries the counts. The speed is the smaller half of why this exists.
+    v = wp.int32(wp.tid())
+    if free_mask[v]:
+        i = free_map[v]
+        p = points[v]
+        out_sol_x[i] = wp.float64(p[0])
+        out_sol_y[i] = wp.float64(p[1])
+        out_sol_z[i] = wp.float64(p[2])
+
+
+@wp.kernel
 def scatter_free_solution(
     free_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],

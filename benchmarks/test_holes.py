@@ -318,6 +318,32 @@ def test_refill_region(bench_case: BenchCase, triangulate_only: bool) -> None:
     against **30.9** refined (1.9x). Both sides are dominated by the rim DP and the refinement here,
     which is why this row is close where ``delete_region_keep_boundary``'s is 8x -- that group
     isolates the extraction, and the extraction is the part triwarp does slowly.
+
+    **The launch count grows with the longest rim, not per rim and not per component**, and the
+    reading that it does is what a capture of this chain was once proposed on. Attributed per stage
+    at this row's own operating point (CUDA, wall / launches):
+
+    | stage | ``bunny_decimated`` | ``bunny`` | ``dragon`` |
+    |---|---|---|---|
+    | ``delete_region_keep_boundary`` | 5.4 ms / 108 | 5.2 / 109 | 22.0 / 378 |
+    | the min-weight DP | 11.1 / 426 | 19.8 / 792 | 30.3 / 1 212 |
+    | ``subdivide_region_to_size`` | 15.3 / 429 | 11.5 / 315 | 13.2 / 240 |
+    | ``smooth_region_fixed_rim`` | 5.5 / 77 | 5.0 / 77 | 5.1 / 77 |
+    | ``smooth_region`` | 17.0 / 133 | 17.1 / 133 | 15.3 / 133 |
+
+    The DP's count is ``2 * (max_rim - 2)`` -- one launch per triangulation span across *all* loops
+    (``holes._run_hole_dp`` batches them) and a second sweep for the ``min_area`` retry -- so it
+    tracks the longest rim: 197, 380 and 590 vertices on the three meshes. The two smoothing rows
+    are flat at 77 and 133 launches because their systems are the patch's, not the mesh's.
+
+    **A capture is refuted for all three stages that could take one, each for its own reason.** The
+    DP sweep is device-bound at a large rim; ``smooth_region``'s solve is *already* one captured CG
+    graph (11.9 of its 12.1 ms on ``bunny``, ~1 100 Jacobi iterations on the normal equations, where
+    the V-cycle measures 19.2 against 15.3 and ``"auto"`` correctly declines it); and the flip and
+    subdivision loops have data-dependent trip counts with a host readback each round and run
+    **once** per call, which is round 6's measured 0.84x for recording-and-replaying-once rather
+    than its 4.29x for a replay. ``repair.fix_self_intersections[local]``'s 3 419 launches are three
+    of these chains -- its ``max_iter=3`` loop -- and not per-component work.
     """
     if bench_case.kind == "meshlib":
         _mask_wp, mask_np = _cap_region(bench_case)

@@ -1390,6 +1390,10 @@ def smooth_region_fixed_rim(
     -----
     The system is SPD only when no free connected component is entirely free (or ``stabilizer >
     0``); the hole-filling pipeline guarantees this because the patch rim is always fixed.
+
+    A free vertex that no face refers to contributes no row, so the solve does not constrain it
+    and it is returned where it was. That is what the ``solution`` seed decides rather than the
+    system: it is seeded with the current positions, not with zeros.
     """
     device = vertices.device
     n = int(vertices.shape[0])
@@ -1439,7 +1443,7 @@ def smooth_region_fixed_rim(
     system = wps.bsr_from_triplets(
         n_free, n_free, out_rows, out_cols, out_vals, prune_numerical_zeros=False
     )
-    sol = wp.zeros((3, n_free), dtype=wp.float64, device=device)
+    sol = _free_positions(vertices, free_mask, free_map, n_free)
     twl.solve_spd_columns(
         system,
         twt.as_array2d(rhs, wp.float64),
@@ -1498,6 +1502,12 @@ def smooth_region(
     [`smooth_region_boundary`][triwarp.smoothing.smooth_region_boundary]
         The third case: smooths the rim's own path rather than the surface on either side of it.
     [`fill_smooth`][triwarp.holes.fill_smooth]
+
+    Notes
+    -----
+    A free vertex that no face refers to contributes no row, so the least-squares system does not
+    constrain it and it is returned where it was. That is what the ``solution`` seed decides rather
+    than the system: it is seeded with the current positions, not with zeros.
     """
     device = vertices.device
     n = int(vertices.shape[0])
@@ -1559,7 +1569,7 @@ def smooth_region(
     atb = wp.zeros((3, n_free), dtype=wp.float64, device=device)
     for column, component in enumerate((rhs_x, rhs_y, rhs_z)):
         wps.bsr_mv(mt_matrix, component, atb[column], alpha=1.0, beta=0.0)
-    sol = wp.zeros((3, n_free), dtype=wp.float64, device=device)
+    sol = _free_positions(vertices, free_mask, free_map, n_free)
     # The normal equations are the worst-conditioned system this package solves -- Jacobi-
     # preconditioned conjugate gradient takes 6 541 iterations on ``bunny``'s benchmarked free
     # region -- and the solve is 99 % of the call, so a multigrid hierarchy is worth its setup
@@ -1594,6 +1604,47 @@ def smooth_region(
 # ---------------------------------------------------------------------------
 # Region smoothing solves (positionVertsSmoothly / positionVertsSmoothlySharpBd)
 # ---------------------------------------------------------------------------
+
+
+def _free_positions(
+    vertices: wp.array[wp.vec3],
+    free_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    n_free: int,
+) -> wp.array[wp.float64]:
+    """
+    Gather the free vertices' current positions as a ``(3, n_free)`` float64 initial guess.
+
+    Both region solves ask conjugate gradient for the free vertices' *new* positions, and
+    [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] takes its ``solution`` argument as the
+    initial guess, so this is what the solver starts from.
+
+    It is a **correctness** requirement before it is a warm start. A vertex no face refers to
+    contributes no row to either system, so CG never writes its entry and it keeps whatever the
+    seed held: from ``wp.zeros`` such a vertex is silently moved to the origin -- 7 of
+    ``bunny_decimated``'s free vertices and 297 of ``bunny``'s 1 113 unreferenced ones, up to 60 %
+    of the bounding-box diagonal. Seeded from the current positions it stays put, which is the only
+    defensible answer for an unknown the system does not constrain.
+
+    The speed is the smaller half and is worth stating so nobody expects more of it: the stopping
+    test is relative to the right-hand side's norm rather than to the initial residual, so the seed
+    cannot change which answers count as converged, only how far CG has to travel. Measured
+    interleaved, ``min`` of 5 -- iterations 1 784 -> 1 708 on ``bunny_decimated``'s benchmarked
+    region, 6 541 -> 6 167 on ``bunny``'s under Jacobi and 310 -> 263 under the V-cycle, which is
+    **1.04-1.06x** on the whole ``smooth_region`` / ``smooth_region_fixed_rim`` call, reproduced
+    across two sessions. On the hole-filling chains it is **flat**: two sessions measured
+    ``refill_region`` at 1.02x and 0.94x on the same row, which is that chain's own run-to-run
+    spread rather than a gain or a regression, so do not attribute either to this.
+    """
+    device = vertices.device
+    guess = wp.empty((3, n_free), dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_smoothing.gather_free_positions,
+        dim=int(vertices.shape[0]),
+        inputs=[free_mask, free_map, vertices, guess[0], guess[1], guess[2]],
+        device=device,
+    )
+    return guess
 
 
 def _edge_weight_matrix(

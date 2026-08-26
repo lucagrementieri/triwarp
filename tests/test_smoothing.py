@@ -1091,6 +1091,45 @@ def test_smooth_region_empty_region(device: str):
     assert np.array_equal(result.numpy(), v_wp.numpy())
 
 
+@pytest.mark.parametrize(
+    "smoother", [tw.smoothing.smooth_region, tw.smoothing.smooth_region_fixed_rim]
+)
+def test_region_smoothers_leave_an_unreferenced_free_vertex_where_it_is(
+    device: str, smoother
+) -> None:
+    """
+    An unreferenced vertex has no smoothing equation, so it must not move.
+
+    Not a library comparison: every reference here drops unreferenced vertices on import
+    (``meshFromFacesVerts`` sizes by ``F.max() + 1``, ``load_array`` deletes them), so none can be
+    asked what happens to one -- which is exactly why this went unnoticed. The invariant is the
+    contract instead, and it excludes the failure mode it was written for: both solvers take the
+    free vertices' *new* positions as unknowns, and a vertex touched by no face contributes no row
+    to the system, so conjugate gradient never writes its entry. Seeded from ``wp.zeros`` that
+    entry stays zero and the vertex is silently teleported to the origin -- measured at 7 of
+    ``bunny_decimated``'s free vertices and **297 of ``bunny``'s 1 113**, up to 60 % of the
+    bounding-box diagonal away. Seeding from the current positions leaves it alone.
+
+    The referenced vertices are asserted to have *moved*, so a smoother that returned its input
+    unchanged could not pass this.
+    """
+    vertices_np, faces_np, free_np = _sphere_region()
+    # One vertex no face refers to, placed inside the free region and well away from the origin.
+    stray_np = np.array([[3.0, 4.0, 5.0]])
+    vertices_np = np.vstack([vertices_np, stray_np])
+    free_np = np.append(free_np, True)
+    stray = len(vertices_np) - 1
+
+    v_wp = points_to_warp(vertices_np, device)
+    f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
+    free_wp = wp.array(free_np, dtype=wp.bool, device=device)
+    smoothed_np = smoother(v_wp, f_wp, free_wp).numpy()
+
+    assert np.allclose(smoothed_np[stray], stray_np[0], rtol=1e-5, atol=1e-5)
+    moved_np = np.linalg.norm(smoothed_np[:stray] - vertices_np[:stray], axis=1)
+    assert moved_np[free_np[:stray]].max() > 1e-4
+
+
 def _patch_to_refine(device: str):
     """Hole an icosphere, fill it, and mark the fill as the patch, with the pre-fill counts."""
     sphere_tm = tm.creation.icosphere(subdivisions=2, radius=1.0)
