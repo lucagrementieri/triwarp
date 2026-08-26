@@ -1081,7 +1081,16 @@ def test_eliminate_degree3_vertices(bench_case: BenchCase) -> None:
     one pass**, of which ``vertex_one_rings`` is 0.56 (67 %) and the vertex-count readback 0.09. So
     the floor is the halfedge build, and a scan mesh's several milliseconds are that floor times the
     number of passes -- removing one valence-3 vertex can expose another, so the loop runs until it
-    finds none. Moving the vertex compaction out of the loop was tried and is **flat** (2.47 against
+    finds none.
+
+    **The asymmetry with meshlib's prebuilt ``MeshTopology`` is not a hoist waiting to happen**,
+    which is worth saying because it reads like one. ``vertex_one_rings`` takes an optional
+    ``twins=``, so the build *could* be lifted out of the loop -- except that each pass deletes
+    faces, so the next pass's halfedge structure is over a different mesh and has to be rebuilt.
+    The only genuinely wasted build is the last pass's, which finds nothing, and knowing that in
+    advance is the question the pass exists to answer.
+
+    Moving the vertex compaction out of the loop was tried and is **flat** (2.47 against
     2.36 ms, within noise at three passes); it is kept because it is strictly less work, not because
     it showed up.
     """

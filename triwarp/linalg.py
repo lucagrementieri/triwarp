@@ -63,7 +63,9 @@ Jacobi at ``tol=1e-8``, on ``-L`` with one degree of freedom pinned:
 - natural-ordering level sets are not viable at all: 8 levels on an icosphere against 157 on a
   torus, so throughput would swing with the input's vertex numbering;
 - Chebyshev — pure mat-vecs, trivially graph-capturable, no factorization — runs **0.60x to 0.92x**
-  at degrees 2, 4 and 8.
+  at degrees 2, 4 and 8. This is Chebyshev as the *preconditioner*; Chebyshev as the multigrid
+  V-cycle's **smoother** is a separate question, was built, and is separately refuted for the same
+  underlying reason — see ``_MULTIGRID_SWEEPS``. Do not read either decline as covering the other.
 
 Two further obstacles are specific to this repository. Obtuse triangles give negative cotangent
 weights (``triwarp/kernels/laplacian.py``), so a noisy sphere carries 16.75 % positive
@@ -1613,6 +1615,47 @@ _MULTIGRID_MAX_DENSE = 512
 # Two sweeps, measured on ``smooth_region``'s batched three-column solve at 8 987 unknowns: 1 / 2 /
 # 3 / 4 sweeps take 735 / 524 / 445 / 400 iterations and 104.0 / 90.8 / 90.6 / 93.1 ms, so the curve
 # is flat from 2 to 3 and turns at 4. One is the cheapest cycle and not the cheapest solve.
+#
+# **Re-measured across every system that reaches a hierarchy, and the flatness is the finding.**
+# Clock in ms against conjugate-gradient iterations, ``min`` of 3, RTX 5090:
+#
+#     system                            1 sweep      2         3         4
+#     smooth_region[bunny_decimated]   36.0/218  34.2/164  34.5/142  35.5/131
+#     smooth_region[bunny]             78.8/409  76.5/317  79.7/283  83.7/262
+#     smooth_region[icos6 q25]         50.2/241  52.5/200  54.2/174  58.1/165
+#     harmonic[saddle] k=2             73.4/480  72.9/380  77.6/339  83.4/317
+#     harmonic[hemisphere] k=2         60.0/321  62.6/265  67.7/245  73.3/233
+#
+# Iterations fall 1.4-1.7x from one sweep to four while the clock is flat to *rising*, so an extra
+# sweep buys almost exactly what it costs. 2 is at the optimum on three systems and within 4 % on
+# the other two.
+#
+# **A Chebyshev smoother was built to exploit that and is refuted -- do not rebuild it.** The
+# reasoning was that a flat clock against falling iterations means the damping per *mat-vec* is the
+# binding constraint, which is precisely what a better polynomial of the same degree improves. On a
+# 576-unknown grid Laplacian it looked spectacular: degree 2 over ``[rho/3, rho]`` converged in
+# **12** iterations against Jacobi's 87. It does not transfer. Interleaved in one process against
+# damped Jacobi at its own optimum, three configurations of degree and interval:
+#
+#     system                          jacobi d2   cheb d2 lo1/3   cheb d1 lo1/3   cheb d1 lo1/2
+#     smooth_region[bunny_decimated]   36.5/164     35.4/152        39.1/212        38.5/218
+#     smooth_region[bunny]             77.9/317     82.6/315        87.8/433        84.3/409
+#     smooth_region[icos6 q25]         53.1/200     56.1/192        53.3/235        54.7/241
+#     harmonic[saddle] k=2             73.5/380    152.5/882       152.0/1174       75.2/480
+#     harmonic[hemisphere] k=2         63.0/265     67.0/258        64.8/323        64.4/321
+#
+# **Jacobi wins four of five and the one loss is 1.03x**, while the worst Chebyshev cell is a 2.07x
+# regression -- and no single ``(degree, interval)`` is even the best Chebyshev everywhere. The
+# mechanism is memory record ``warp-cg-iteration-launch-floor``: a cycle here is **launch**-bound,
+# not flop-bound, and a Chebyshev step costs three launches where a Jacobi sweep costs two. So it
+# trades a 1.5x launch increase for a ~1.03x iteration decrease, which is the wrong side of this
+# machine's cost model. That is also why the sweep table above is flat: *any* smoother that buys
+# iterations with launches loses here.
+#
+# One method note, because it nearly went the other way. Comparing Chebyshev's numbers against a
+# Jacobi table measured in an *earlier process* read as a 1.09x win on ``bunny`` (71.3 against
+# 76.5); interleaved in one process the same pair is 82.6 against 77.9, a loss. The interval below
+# the winning one (``rho/5``) is also a cliff of up to 17x, so the parameter has no safe default.
 _MULTIGRID_SWEEPS = 2
 _MULTIGRID_JACOBI_FACTOR = 4.0 / 3.0
 
