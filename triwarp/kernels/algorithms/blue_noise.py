@@ -43,6 +43,24 @@ determined, so the accepted set is identical by construction rather than by tole
 the radii ``benchmarks/test_sample.py`` scores: the covering summary alone is **1.51x / 2.06x**, the
 selection summary alone 1.06-1.08x, and the two together **1.70x / 1.72x / 2.33x**, with a
 byte-identical ``state`` array in all four combinations.
+
+**And those summaries are why the obvious next step is not one.** The membership lists are built
+once over the whole pool and never compacted, so as rounds retire points the sweeps walk lists that
+are mostly dead: measured over the benchmarked runs, the entries scanned exceed the live ones by
+**1.89-2.97x**. Compacting the covered entries out is provably answer-preserving -- the selection
+sweep skips a ``DART_COVERED`` vetoer explicitly and the covering sweep only ever matches
+``DART_ACCEPTED``, so the dropped entries are exactly the ones both already walked past -- and it
+was built, byte-gated and **refuted**: 0.91-0.94x on all four rows, with identical points and face
+indices.
+
+The reason is the summaries above, and it is worth stating because the 2.97x looks compelling from
+the alive counts alone. A per-cell summary skips a cell *without loading a point from it*, so the
+inner loop only ever runs on cells that genuinely hold a smaller-priority alive point or a fresh
+acceptance -- and those cells are mostly live, so there is little dead weight left to remove.
+Measured on ``bunny`` at half the radius, rebuilding on halving: ``dart_select_minima`` 31.94 ->
+30.97 ms (**3 %**), ``dart_cover_neighbors`` 10.46 -> 9.33 (11 %), device total 45.87 -> 44.53 --
+against **+185 launches and +74 readbacks** of host cost, which is the whole loss. Occupancy stopped
+being the cost when the summaries landed; do not re-derive this from the alive counts.
 """
 
 import warp as wp

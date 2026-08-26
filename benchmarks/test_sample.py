@@ -162,11 +162,35 @@ def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -
     Maximal Poisson-disk selection from a dense pool, on a background grid sized by the radius.
 
     Halving the radius is 8x the cells and 4x the output, so the pair should show a large,
-    superlinear step -- and it is now a *flat* one (24.6 -> 25.1 ms on ``bunny_decimated``), because
-    the round count no longer grows with it and the per-cell summaries that prune each round's shell
-    sweep prune hardest exactly where the cells are most numerous (2.30x at half the radius on
+    superlinear step -- and on ``bunny_decimated`` it is now a *flat* one (24.6 -> 25.1 ms), because
+    the round count does not grow with it there and the per-cell summaries that prune each round's
+    shell sweep prune hardest exactly where the cells are most numerous (2.30x at half the radius on
     ``bunny`` against 1.71x at the full one). open3d is parametrized by *count* rather than radius,
     so its two rows are matched to the sample count each radius implies rather than to the radius.
+
+    **The flatness is ``bunny_decimated``'s alone, and the variable is the round count.**
+    Re-profiled at both radii after the summaries landed:
+
+    | row | rounds | whole call | ``dart_select_minima`` | ``dart_cover_neighbors`` |
+    |---|---|---|---|---|
+    | ``bunny_decimated`` r1 | 46 | 25.6 ms | 11.8 (46 %) | 4.3 |
+    | ``bunny_decimated`` rhalf | 39 | 25.8 | 12.0 (47 %) | 5.4 |
+    | ``bunny`` r1 | 51 | 28.2 | 13.5 (48 %) | 4.9 |
+    | ``bunny`` rhalf | **88** | **58.4** | 32.1 (55 %) | 10.7 |
+
+    The pool build is 1 % of every row, so this group times the selection almost alone. What sets a
+    row apart is how fast the work list decays, and ``bunny`` at half the radius *stalls*: its alive
+    count runs 1 073 115 -> 754 036 -> 577 814 -> ... -> 285 941 by round 10 and is still 187 240 at
+    round 20, where ``bunny_decimated`` at the same pool size is down to 54 385 and 11 061. The cost
+    is spread across those mid-size rounds and **not** in a tail -- rounds with fewer than 1 000
+    alive points are 1.6-6.7 % of the selection time on every row -- so a tail-specific engine has
+    nothing to collect.
+
+    Two mechanisms are already refuted here and must not be re-proposed: inverting the covering
+    sweep to a scatter (built, byte-gated, 1.71x dense and **0.88x** at the radius the row is
+    scored at) and compacting the dead entries out of the per-cell membership lists (built,
+    byte-gated, **0.91-0.94x** -- the summaries had already removed the work it targets; see
+    ``kernels/algorithms/blue_noise.py`` for both numbers and the reason).
 
     **libigl is the reference this port was written from** -- ``sample_surface_blue_noise`` still
     sizes its pool at the ``30x`` oversampling factor ``igl::blue_noise`` uses -- and it takes the
