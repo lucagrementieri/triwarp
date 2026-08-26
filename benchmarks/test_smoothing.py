@@ -1111,6 +1111,39 @@ def test_smooth_region_boundary(bench_case: BenchCase) -> None:
     solves and their fixed per-call cost rather than anything proportional. Against
     ``smooth_region``'s 159.7 ms on ``bunny`` over the same region it is **10.6x cheaper**, which is
     the band being thin -- exactly what this group was written to check.
+
+    **Round 7's T4 paired this row with ``filter_spikes`` on that flatness and asked for it to be
+    read once that one landed. It was, and the signature is the same while the mechanism is not.**
+    ``filter_spikes`` turned out to be one *topology* operator built ten times, and hoisting it was
+    2.6x. Here the rebuild is neither hoistable nor the cost. Attributed per pass on an RTX 5090:
+
+    | | ``bunny_decimated`` | ``bunny`` |
+    |---|---|---|
+    | whole call, 4 passes | 14.77 ms | 14.89 |
+    | one pass | 2.81 | 3.06 |
+    | ...``cotmatrix`` + ``bsr_scale`` | 0.455 (**16 %**) | 0.570 (**19 %**) |
+    | ...``min_quad_with_fixed`` | 2.18 (**78 %**) | 2.24 (**73 %**) |
+
+    The rebuild really is unhoistable, which is now measured rather than trusted: the sparsity
+    pattern is the topology and does not move, but between the input positions and the output ones
+    the cotangent weights differ by up to **105.5** and **353.1** in absolute value, because a pass
+    moves the rim band the weights are computed from. So the paragraph above stands.
+
+    **What the row actually prices is the conjugate-gradient launch floor on a tiny system.** The
+    free set is the band, 182 of 8 171 vertices and 390 of 35 947 -- 1.1-2.2 % -- so the reduced
+    system is **182 x 182 with 562 nonzeros** and **390 x 390 with 1 174**, and solving it takes
+    **24 and 26 iterations at ~48-52 µs each**. That is per-iteration launch cost, not arithmetic
+    (see the memory of a CG iteration as 9 kernels and ~23 µs whatever the ``nnz``), and it is why
+    the row is flat in a mesh 4.3x larger: the band barely grows. The remaining ~20 % of the call is
+    the prologue -- the two masks, ``vertex_face_adjacency`` and the clone -- which is likewise
+    band-sized or built once.
+
+    So T4's residual 3.3 ms here is **not** ``filter_spikes``' item and does not yield to its fix.
+    Nor does the preconditioner work: ``linalg``'s hierarchy setup alone is 12-17 ms, ten times this
+    entire solve, and ``"auto"``'s probe would spend its Jacobi iterations before paying it (see
+    ``linalg.py``, where routing the fixed-boundary solves that way is refuted at systems two orders
+    larger than this one). Anything that moves this row has to remove *launches per iteration* or
+    iterations, not operator builds.
     """
     skip_larger_than(
         bench_case,
