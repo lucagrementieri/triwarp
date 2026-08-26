@@ -358,6 +358,24 @@ def split(
         )
     # Warp rejects a zero-length slice at the very end of a buffer (``arr[n:n]``) while accepting
     # an interior one, so an empty trailing segment needs its own allocation.
+    #
+    # Both loops below are per-segment host constants, measured on an RTX 5090 at 256 segments and
+    # flat from 48 903 to 2 614 242 elements: **3.63 us** to build one ``wp.array`` view and
+    # **15.06 us** for one ``wp.clone`` (a 10 us allocation plus a 6 us copy). The offsets readback
+    # above is 0.026 ms *once*, so it is 2.6 % of the view path rather than its cost. Two levers
+    # were measured and declined:
+    #
+    # - Constructing the views with ``wp.array(ptr=..., shape=..., strides=...)`` and a ``_ref``
+    #   back-reference instead of ``array[begin:end]`` is **1.57-1.69x** (3.71 -> 2.19 us each).
+    #   Declined: it re-implements ``wp.array.__getitem__``'s contract, which a probe found to be
+    #   20 attributes -- and the raw form already gets one of them wrong, dropping the ``grad``
+    #   view a slice of a ``requires_grad`` array carries. The reward is ~1.0 ms across a benchmark
+    #   group whose rows stay losses either way, against a permanent liability to a Warp field
+    #   nobody re-checks.
+    # - Allocating **one** buffer for ``copy=True``, filling it with a single ``wp.copy`` and
+    #   returning disjoint views of that is **3.93-4.02x**. Declined: it would keep the promise
+    #   that a write cannot reach ``array`` while quietly dropping the other half of what
+    #   ``copy=True`` is for -- holding one segment would again pin the whole allocation.
     segments = [
         array[begin:end] if end > begin else wp.empty(0, dtype=array.dtype, device=array.device)
         for begin, end in itertools.pairwise(bounds)
@@ -402,6 +420,14 @@ def _pack_segments(
         if already_packed is not None:
             return already_packed, offsets
 
+    # One ``wp.copy`` per segment at **6.02 us** of host time each, and that is the whole cost: the
+    # same 2 614 242 elements moved in a *single* ``wp.copy`` measure 0.015 ms, so 99 % of a
+    # 256-segment pack is per-call overhead and the row is flat from 0.07 MB to 268 MB. There is no
+    # segmented alternative -- Warp has no array-of-arrays and a kernel cannot dereference a raw
+    # pointer -- and **graph capture is refuted**: recording this loop and replaying it once is
+    # 0.84-0.88x at 256, 1 024 and 4 096 segments, because the segment pointers change per call so
+    # the recording is never reused. (Replaying an *already recorded* graph is 7.7-8.5x, which is
+    # the number that makes capture look attractive and is unreachable from here.)
     flat = wp.empty(total, dtype=dtype, device=device)
     for arr, offset, n in zip(arrays, offsets, sizes, strict=True):
         if n > 0:
