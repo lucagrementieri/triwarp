@@ -56,6 +56,12 @@ ITEMS_PER_QUERY_SLICE = 128
 # the first scan then enumerates the whole edge set.
 _EDGE_INITIAL_RADIUS_SCALE = 0.01
 
+# Smallest positive normal float32, used as the floor on
+# [`mesh_to_mesh_distance`][triwarp.proximity.mesh_to_mesh_distance]'s seeded running minimum: two
+# touching meshes give an ``upper_bound`` of ``0``, and a limit of ``0`` would prune every candidate
+# including the zero-gap pair that achieves the answer.
+_MIN_POSITIVE_FLOAT32 = 1.1754943508222875e-38
+
 # Ray-origin offset *below* the surface along the inward normal, as a fraction of the query AABB
 # diagonal: without it the cone's own starting triangle is the nearest hit for every ray.
 _SDF_SURFACE_OFFSET = 1e-4
@@ -388,10 +394,27 @@ def mesh_to_mesh_distance(
             upper,
             bvh.id,
             wp.float32(upper_bound),
-            # Seeded at infinity, **not** at ``upper_bound ** 2``: when the bound *is* the answer
-            # -- two spheres whose closest points are vertices -- seeding it there prunes the very
-            # pair that achieves it and the result comes back ``inf``.
-            wp.full(1, math.inf, dtype=wp.float32, device=device),
+            # Seeded at the bound the vertex query already paid for, so every thread prunes against
+            # it from its first candidate instead of waiting for some other thread to publish one.
+            # Worth 1.05-1.64x on this launch, measured interleaved with byte-identical distances
+            # (``bunny_decimated`` 6.93 -> 5.25 ms near and 2.92 -> 1.98 far, ``bunny`` 8.66 -> 7.69
+            # and 7.29 -> 6.91, ``dragon`` 5.59 -> 5.17 and 1.67 -> 1.02).
+            #
+            # Seeded at *exactly* ``upper_bound ** 2`` this is wrong, and that is why it used to be
+            # ``inf``: the prune skips a candidate whose box gap is ``>=`` the limit, so when the
+            # bound *is* the answer -- two spheres whose closest points are vertices -- the very
+            # pair achieving it is skipped and the result comes back ``inf``. The relative bump is
+            # what keeps that pair, and ``1e-4`` rather than an ulp because ``upper_bound`` comes
+            # from ``mesh_query_point_no_sign``, which is documented off by up to 2.1e-5; the
+            # margin is ~5x that and ~800 float32 ulps, and it weakens the prune by nothing
+            # measurable. ``max`` covers touching meshes, where the bound is ``0`` and any positive
+            # limit keeps the exactly-zero-gap pair.
+            wp.full(
+                1,
+                max(upper_bound * upper_bound * (1.0 + 1e-4), _MIN_POSITIVE_FLOAT32),
+                dtype=wp.float32,
+                device=device,
+            ),
             distance_sq,
             witness,
         ],

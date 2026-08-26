@@ -465,6 +465,51 @@ def test_mesh_to_mesh_distance_gap_overlap_and_contact(device: str) -> None:
         assert np.isclose(distance, float(np.sqrt(result_ml.distSq)), rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parity("mesh_to_mesh_distance", "meshlib")
+def test_mesh_to_mesh_distance_when_the_vertex_bound_is_the_answer(device: str) -> None:
+    """
+    Class A on the regime that the kernel's seeded running minimum could silently break.
+
+    Two icospheres separated along an axis touch closest at a *vertex* of each, so the upper bound
+    the vertex query derives is exactly the answer rather than a strict over-estimate. That matters
+    because the broad phase seeds its global running minimum with that bound: seeded at exactly
+    ``upper_bound ** 2`` the ``>=`` prune discards the very pair achieving it and the call returns
+    ``inf``, which is why the seed carries a relative bump. Swept across a gap that closes to zero
+    and then reverses into an overlap, so the bump is exercised at, above and below the boundary.
+
+    ``findDistance`` is the oracle for the value; the ``isfinite`` and ``face >= 0`` assertions are
+    what catch the pruning failure, since that mode returns ``inf`` rather than a wrong number.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    for gap in (0.5, 0.1, 0.01, 0.0, -0.05):
+        shifted_tm = tm.creation.icosphere(subdivisions=2, radius=1.0)
+        shifted_tm.apply_translation([2.0 + gap, 0.0, 0.0])
+        a_vertices_wp, a_faces_wp = numpy_to_warp(
+            np.asarray(sphere_tm.vertices),
+            np.asarray(sphere_tm.faces).ravel().astype(np.int32),
+            device,
+        )
+        b_vertices_wp, b_faces_wp = numpy_to_warp(
+            np.asarray(shifted_tm.vertices),
+            np.asarray(shifted_tm.faces).ravel().astype(np.int32),
+            device,
+        )
+        distance, face_a, face_b = tw.proximity.mesh_to_mesh_distance(
+            a_vertices_wp, a_faces_wp, b_vertices_wp, b_faces_wp
+        )
+        result_ml = mm.findDistance(
+            mm.MeshPart(trimesh_to_meshlib(sphere_tm)),
+            mm.MeshPart(trimesh_to_meshlib(shifted_tm)),
+            None,
+            float(np.finfo(np.float32).max),
+        )
+        assert np.isfinite(distance), f"gap {gap} pruned the pair achieving the bound"
+        assert face_a >= 0
+        assert face_b >= 0
+        assert np.isclose(distance, max(gap, 0.0), rtol=1e-5, atol=1e-6)
+        assert np.isclose(distance, float(np.sqrt(result_ml.distSq)), rtol=1e-5, atol=1e-6)
+
+
 def test_mesh_to_mesh_distance_upper_bound_and_edge_cases(device: str) -> None:
     """
     Not a library comparison: what ``upper_bound`` does, including when it is wrong.

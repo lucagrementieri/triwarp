@@ -283,6 +283,16 @@ def test_closest_point_on_mesh(bench_case: BenchCase) -> None:
     wider than what it is timed against and the subtraction stays out of the timed callable. Its
     locator is built lazily and cached on the ``PolyData``, so it is pre-warmed here rather than
     timed, the same rule MeshLib's AABB tree gets above.
+
+    **The per-query cost is not flat in the mesh, and the knee is between 1 M and 28 M faces.**
+    This group holds its query count fixed, so the effect shows up in a *caller* instead --
+    ``mesh_to_mesh_distance``, which derives its bound by querying at every vertex of one mesh.
+    Measured there, with the ``wp.Mesh`` build separated out: **26.5 ns** per query at 36k queries
+    against ``bunny``, **5.4** at 438k / ``dragon``, **10.2** at 544k / ``happy_buddha`` and
+    **58.3** at 14 M / ``lucy`` -- while the build itself stays linear (0.26 / 0.97 / 1.05 /
+    31.61 ms). The first number is launch overhead at a small dim; the last is a cache cliff, the
+    BVH having stopped fitting. It is worth knowing before reading any large-mesh row that ends in a
+    closest-point query as an algorithm result.
     """
     if bench_case.kind == "pyvista":
         # 160 / 376 / 906 ms per 10 000-query call on bunny_decimated / bunny / dragon: VTK's
@@ -689,13 +699,39 @@ def test_mesh_to_mesh_distance(bench_case: BenchCase, offset: float) -> None:
     | ``happy_buddha`` | 1 087 716 | 7.90 / 7.25 ms | (capped) |
     | ``lucy`` | | 882.8 / 795.9 ms | (capped) |
 
-    Two things that table says. It is **nearly flat in the face count** -- 40k costs more than
-    871k -- so the cost is the candidate count, not the mesh; ``bunny_decimated`` is the slowest
-    per face
-    because its 87 duplicated faces manufacture near-zero-gap candidates that no bound can prune.
-    And the two prunes inside the kernel are what make the numbers reportable at all: without them
-    the same rows read 144.6 / 252.3 ms on ``bunny``, so they are worth **11.2x** near and **29.1x**
-    far.
+    Two things that table says. It is **nearly flat in the face count up to ~1 M** -- 40k costs more
+    than 871k -- so over that range the cost is the candidate count, not the mesh;
+    ``bunny_decimated`` is the slowest per face because its 87 duplicated faces manufacture
+    near-zero-gap candidates that no bound can prune. And the two prunes inside the kernel are what
+    make the numbers reportable at all: without them the same rows read 144.6 / 252.3 ms on
+    ``bunny``, so they are worth **11.2x** near and **29.1x** far.
+
+    **``lucy`` is not flat and the reason is a different function.** 26x ``happy_buddha``'s faces
+    costs 114x the time, and attributed per stage that is almost entirely the *bound*, not this
+    group's own query:
+
+    | stage | ``bunny`` near | ``happy_buddha`` near | ``lucy`` near |
+    |---|---|---|---|
+    | ``closest_point_on_mesh`` (the bound) | 1.19 ms | **6.50** | **840.22** |
+    | ``face_aabb_bounds`` | 0.03 | 0.03 | 0.83 |
+    | ``bvh_from_bounds`` | 0.23 | 1.04 | 30.77 |
+    | ``face_to_mesh_distance`` (the query) | **8.29** | 0.40 | 94.57 |
+
+    Inside that bound the ``wp.Mesh`` build is linear (0.26 / 0.97 / 1.05 / 31.61 ms across
+    ``bunny`` / ``dragon`` / ``happy_buddha`` / ``lucy``) and the **queries** are the cliff: 26.5 ns
+    each at 36k queries, 5.4 at 438k, 10.2 at 544k and **58.3 at 14 M**, a 5.7x rise per query once
+    the BVH stops fitting in cache. So the superlinearity belongs to ``closest_point_on_mesh``, is a
+    memory-hierarchy effect rather than an algorithm defect, and is *not* the thing a
+    BVH-versus-BVH rewrite of this function would fix.
+
+    **The stage split inverts with size, which is where any future work has to be aimed.** The query
+    dominates exactly where the gap is -- the ``bunny_decimated`` and ``bunny`` rows, the only ones
+    meshlib is not capped out of -- and by ``happy_buddha`` the bound is 74 % of the call and the
+    query is 0.40 ms. So a cheaper bound (a subsampled vertex query is still sound: the minimum over
+    any *subset* of A's vertices is still an upper bound on the surface distance) would only move
+    rows that contribute no gap, and a faster query would only move the small ones. A BVH-pair
+    wavefront is the one change that addresses both, since it needs no separate bound phase at all;
+    it is also the largest, and nothing here has measured it.
     """
     if bench_case.kind == "meshlib":
         skip_larger_than(bench_case, "bunny", "findDistance is a serial descent per pair")
