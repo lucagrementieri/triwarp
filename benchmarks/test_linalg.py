@@ -272,6 +272,15 @@ def test_multigrid_preconditioner(bench_case: BenchCase) -> None:
     Read against the ``solve_spd_columns`` group above, whose two rows are the *same* operator's
     solve. A setup that grew with the mesh rather than sitting near-flat would change the decision
     at every call site, so the shape of this row across the quality axis is the thing to watch.
+
+    **This group gets worse as the aggregation gets better, so never read a loss here alone.** It
+    times the setup and nothing else, and ``linalg._MULTIGRID_THETA`` trades setup for iterations:
+    raising it removes weak edges, which makes aggregates smaller and can add a level, and a level
+    is 5-8 ms whatever its size. Measured at the shipped 0.05 against 0.0, ``saddle_graded``'s
+    setup is **17.9 -> 25.4 ms** (1.42x, one extra level) while the same operator's
+    ``smooth_region`` solve is **91.4 -> 76.6**, so the 7.5 ms is bought twice over. That constant's
+    comment carries the whole setup-plus-solve table; a round that reads this row's regression
+    without it will re-propose lowering theta, which was measured and is a 1.12x total loss.
     """
     operator = _operator(bench_case)
     preconditioner = bench_case.run(lambda: tw.linalg.multigrid_preconditioner(operator))

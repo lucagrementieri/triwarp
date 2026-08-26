@@ -469,6 +469,88 @@ def test_multigrid_preconditioner_auto_converges_past_the_probe(device: str) -> 
     )
 
 
+def test_offdiagonal_dominance_matches_a_numpy_reduction(device: str) -> None:
+    """
+    Not a library comparison: no reference exposes a Gershgorin ratio, so the oracle is the formula.
+
+    ``linalg._offdiagonal_dominance`` is what ``preconditioner="auto"`` gates on, so a wrong answer
+    here does not fail anything -- it silently picks the other preconditioner and costs time. The
+    row with a **zero** diagonal is the case worth pinning: it is a free vertex no face refers to,
+    and it must contribute ``0`` rather than an infinity, or every scan mesh reads ``inf`` and the
+    gate degenerates to "always multigrid".
+    """
+    rows_np = np.array([0, 0, 0, 1, 1, 2, 3, 3], dtype=np.int32)
+    columns_np = np.array([0, 1, 2, 1, 0, 2, 0, 2], dtype=np.int32)
+    values_np = np.array([2.0, -1.0, -3.0, 4.0, 1.0, 0.5, -1.0, -2.0], dtype=np.float64)
+    matrix_wp = wps.bsr_from_triplets(
+        4,
+        4,
+        wp.array(rows_np, dtype=wp.int32, device=device),
+        wp.array(columns_np, dtype=wp.int32, device=device),
+        wp.array(values_np, dtype=wp.float64, device=device),
+    )
+    dense_np = np.zeros((4, 4))
+    np.add.at(dense_np, (rows_np, columns_np), values_np)
+    diagonal_np = np.diag(dense_np)
+    off_np = np.abs(dense_np).sum(axis=1) - np.abs(diagonal_np)
+    # Row 3 has no diagonal entry at all, so it is excluded rather than divided by zero.
+    ratios_np = np.where(
+        diagonal_np > 0.0, off_np / np.where(diagonal_np > 0.0, diagonal_np, 1.0), 0.0
+    )
+    assert diagonal_np[3] == 0.0, "the zero-diagonal row is the point of this fixture"
+    assert np.allclose(tw.linalg._offdiagonal_dominance(matrix_wp), ratios_np.max(), rtol=1e-12)
+
+
+def test_multigrid_preconditioner_auto_gate_takes_both_branches(device: str) -> None:
+    """
+    Triwarp against triwarp: ``"auto"``'s gate against the forced modes it chooses between.
+
+    The oracle is ``numpy.linalg.solve`` on the small system and forced ``"multigrid"`` on the
+    large one, which is too big to densify. What this pins is that the gate is *answer-neutral*:
+    it only decides which preconditioner runs, and a converged solve is a converged solve either
+    way.
+
+    It also runs every branch of the gate, which no other ``"auto"`` test does. All three matter and
+    the middle one is the subtle one:
+
+    * **too small** -- the ``k = 24`` grid Laplacian falls under ``CG_MULTIGRID_MIN_UNKNOWNS`` and
+      goes to the probe.
+    * **large but not dominant enough** -- at ``k = 90`` it is over
+      ``CG_MULTIGRID_LARGE_UNKNOWNS`` and still declined, because a five-point Laplacian's rows
+      nearly sum to zero (dominance ~1.0, under ``CG_MULTIGRID_SIZE_FLOOR``). That floor exists
+      because the size branch was measured **0.41x** on exactly this shape of operator.
+    * **dominant** -- squaring that Laplacian squares its condition number and lifts the dominance
+      past ``CG_MULTIGRID_DOMINANCE``, which is the ``harmonic`` at ``k = 2`` case the branch is
+      for.
+    """
+    small_wp, rhs_wp, dense_np, rhs_np = _grid_laplacian_system(device, k=24)
+    assert not tw.linalg._wants_multigrid(small_wp), "576 unknowns must fall through to the probe"
+    solution_wp = wp.zeros_like(rhs_wp)
+    tw.linalg.solve_spd_columns(
+        small_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), preconditioner="auto"
+    )
+    assert np.allclose(
+        solution_wp.numpy(), np.linalg.solve(dense_np, rhs_np.T).T, rtol=1e-5, atol=1e-5
+    )
+
+    large_wp, large_rhs_wp, _dense, _rhs = _grid_laplacian_system(device, k=90, n_rhs=1)
+    assert tw.linalg._offdiagonal_dominance(large_wp) < tw.linalg.CG_MULTIGRID_SIZE_FLOOR
+    assert not tw.linalg._wants_multigrid(large_wp), (
+        "a large but weakly-dominant operator must still be declined"
+    )
+
+    squared_wp = wps.bsr_mm(large_wp, large_wp)
+    assert tw.linalg._offdiagonal_dominance(squared_wp) > tw.linalg.CG_MULTIGRID_DOMINANCE
+    assert tw.linalg._wants_multigrid(squared_wp), "the squared operator must clear the gate"
+    answers = {}
+    for mode in ("auto", "multigrid"):
+        answers[mode] = wp.zeros_like(large_rhs_wp)
+        tw.linalg.solve_spd_columns(
+            squared_wp, large_rhs_wp, twt.as_array2d(answers[mode], wp.float64), preconditioner=mode
+        )
+    assert np.allclose(answers["auto"].numpy(), answers["multigrid"].numpy(), rtol=1e-5, atol=1e-5)
+
+
 def test_spd_column_solver_rejects_the_auto_preconditioner(device: str) -> None:
     # A hoisted state is built to be driven many times, and the probe decides on the first solve --
     # so "auto" has no meaning there and says so rather than quietly picking one of the two.

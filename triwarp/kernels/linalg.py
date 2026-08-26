@@ -171,3 +171,42 @@ def interior_system_csr(
             out_columns[slot] = free_map[j]
             out_values[slot] = values[e]
             slot += 1
+
+
+@wp.kernel
+def offdiagonal_dominance_rows(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    out_ratio: wp.array[wp.float64],
+) -> None:
+    # One thread per row of a CSR operator, writing that row's Gershgorin ratio
+    # ``sum_{j != i} |A_ij| / A_ii``. The maximum over the rows is what
+    # ``linalg._offdiagonal_dominance`` reduces to, and what decides whether a system reaches a
+    # multigrid hierarchy -- see ``linalg.CG_PROBE_ITERATIONS`` for the 29 systems behind that gate.
+    #
+    # A row whose diagonal is *absent or zero* is a free vertex no face refers to: the least-squares
+    # system does not constrain it, so it contributes no row to the operator's *conditioning* and
+    # ratio 0 keeps it out of the maximum. Dividing by it instead would make the reduction read
+    # ``inf`` on every scan mesh, which is what a first version of this did.
+    #
+    # The magnitude is taken on **both** sides, which is not cosmetic: a Laplacian written in the
+    # negative-semi-definite convention has a negative diagonal, and a second version of this
+    # rejected every such row as "zero or negative" and reduced to a flat **0.000** -- a number
+    # that reads like a well-conditioned operator and silently declines the gate. Caught on
+    # ``min_quad_with_fixed`` driven with a raw ``cotmatrix``.
+    i = wp.int32(wp.tid())
+    start = offsets[i]
+    end = offsets[i + 1]
+    diagonal = wp.float64(0.0)
+    off_sum = wp.float64(0.0)
+    for e in range(start, end):
+        if columns[e] == i:
+            diagonal += values[e]
+        else:
+            off_sum += wp.abs(values[e])
+    magnitude = wp.abs(diagonal)
+    if magnitude == wp.float64(0.0):
+        out_ratio[i] = wp.float64(0.0)
+        return
+    out_ratio[i] = off_sum / magnitude

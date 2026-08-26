@@ -248,10 +248,16 @@ def harmonic(
         observation.
 
         So this is a **deliberate trade, not an open defect**: triwarp pays on the solve and wins
-        ~13x on setup, because it factors nothing. Closing the rest needs a preconditioner stronger
-        than Jacobi (incomplete Cholesky, or an algebraic-multigrid V-cycle) — a substantial
-        subsystem that no in-repo caller has asked for, and not obviously a win at these sizes.
+        ~13x on setup, because it factors nothing.
         **Do not re-open this as an assembly problem; that has now measured flat three times.**
+
+        Part of the rest has since been closed, at ``k >= 2`` only. The V-cycle
+        [`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner] builds is worth
+        **1.42x / 2.92x / 2.75x** on ``saddle_small`` / ``saddle`` / ``hemisphere`` at ``k = 2``,
+        because squaring the operator squares its condition number and that is what a hierarchy is
+        for. At ``k = 1`` it is worth nothing (0.97-1.00x) and on a large well-conditioned Laplacian
+        it is an outright **0.41x**, so the switch is on ``k``. ``lscm`` and ``tutte`` measured
+        0.58-1.01x and keep Jacobi; ``linalg.CG_MULTIGRID_SIZE_FLOOR`` carries that table.
         [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] reaches the same conclusion from its
         own measurements.
 
@@ -372,8 +378,20 @@ def _solve_fixed_boundary(
         n_vertices, boundary_indices, boundary_uv, device
     )
 
+    # ``k >= 2`` squares the Laplacian's condition number, and that is the one thing on this side of
+    # the package worth a multigrid hierarchy. Routed through ``"auto"`` rather than forced, so the
+    # gate's own size floor still declines a system too small to repay a setup -- measured
+    # **1.52x / 2.90x / 2.73x** on ``saddle_small`` / ``saddle`` / ``hemisphere`` at ``k = 2``,
+    # against **0.97x / 0.41x / 0.97x** at ``k = 1``, which is why the switch is on ``k`` and not on
+    # the gate alone. ``linalg.CG_MULTIGRID_SIZE_FLOOR`` carries the operator-class table behind
+    # that; the short version is that a plain Laplacian's rows nearly sum to zero and a large one of
+    # those wants iterations, not levels.
     sol, free_map, _ = twl.min_quad_with_fixed(
-        q, fixed_mask, twt.as_array2d(fixed_values, wp.float64), tol=_CG_TOLERANCE
+        q,
+        fixed_mask,
+        twt.as_array2d(fixed_values, wp.float64),
+        tol=_CG_TOLERANCE,
+        preconditioner="auto" if k >= 2 else "diag",
     )
 
     out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)

@@ -725,33 +725,31 @@ def test_smooth_region(bench_case: BenchCase) -> None:
     agree to 1e-4 (``tests/test_smoothing.py``). It mutates the mesh in place and returns nothing,
     so its mesh is rebuilt inside the timed callable and the row carries the build.
 
-    **The two rows land on opposite sides of a solver switch**, which is the thing to know before
-    reading a change in either. ``smooth_region`` asks for ``preconditioner="auto"``: Jacobi under a
-    2 000-iteration cap, escalating to a multigrid V-cycle only if that has not converged. ``bunny``
-    needs 6 541 Jacobi iterations, so it escalates and the row measures **159.7 ms against 225.7
-    before the hierarchy existed**; ``bunny_decimated`` needs 1 784, converges inside the cap and is
-    unchanged. So a change on one row and not the other is more likely to be the cap than the solver
-    -- see ``linalg.CG_PROBE_ITERATIONS``.
+    **Both rows now reach a multigrid V-cycle, and they did not always**, which is the thing to
+    know before reading a change in either. ``smooth_region`` asks for ``preconditioner="auto"``,
+    and ``"auto"`` gates on the assembled operator's off-diagonal dominance crossed with a size
+    floor: these two systems read 3.00 and 2.51 against a 2.15 threshold, so both build a hierarchy
+    outright and neither runs a Jacobi probe. Measured when that gate landed, whole call,
+    interleaved: **``bunny_decimated`` 70.1 -> 34.7 ms (2.02x)** and **``bunny`` 137.1 -> 76.2
+    (1.80x)**. See ``linalg.CG_MULTIGRID_DOMINANCE`` for the 29 systems behind the threshold.
 
-    That asymmetry is now confirmed from the other direction, which makes this pair the cheapest
-    available check on any aggregation change: sweeping ``linalg._MULTIGRID_THETA`` over
-    ``0 - 0.15`` moves **``bunny`` 161.7 -> 153.4 ms** and leaves ``bunny_decimated`` at
-    69.5-70.6 ms, *flat to three digits*, because the aggregation never runs there at all. A theta
-    sweep that appeared to move both rows would mean the cap had changed, not the coarsening.
+    **The history matters because this pair used to be the asymmetry check and is not any more.**
+    Before the gate, ``bunny`` escalated (6 541 Jacobi iterations, past the 2 000 cap) and
+    ``bunny_decimated`` did not (1 784, inside it), so a change that moved one row and not the other
+    was diagnostic: sweeping ``linalg._MULTIGRID_THETA`` over ``0 - 0.15`` moved ``bunny`` 161.7 ->
+    153.4 ms and left ``bunny_decimated`` flat to three digits, because the aggregation never ran
+    there. That reading is now **stale in both directions** -- theta moves both rows, and a row that
+    stops moving means the *gate* changed rather than the coarsening. ``linalg.CG_PROBE_ITERATIONS``
+    still describes the probe, which is what a system the gate declines falls through to.
 
-    The same asymmetry explains the two rows' latest move, and is the reason only one of them
-    moved. Raising ``linalg._MULTIGRID_MAX_COARSE`` to 384 drops a hierarchy level whose setup and
-    per-cycle cost bought almost nothing, which is worth 1.15x on ``bunny``'s escalated solve --
-    **147.8 -> 139.2 ms**, 2.31x behind meshlib where round 7 measured 3.12x -- and *exactly*
-    nothing on ``bunny_decimated`` (68.6 -> 68.9), which never reaches a hierarchy to improve.
-    Seeding the solve from the current positions rather than ``wp.zeros`` moved both by 1.04-1.06x
-    before that.
-
-    **``bunny_decimated``'s 5.5x is a policy choice and not an unsolved problem.** It converges in
-    1 784 Jacobi iterations against the 2 000-iteration cap, so it stays on Jacobi although a
-    V-cycle measures **2.29x** on its system. Lowering the cap would collect that and regress small
-    well-conditioned solves by up to 2.8x; ``linalg.CG_PROBE_ITERATIONS`` carries the whole
-    17-system table behind that decision. Do not read this row as a slow solver.
+    ``bunny_decimated`` was 5.5x behind for as long as it stayed on Jacobi, and that was a
+    documented policy choice rather than a slow solver: it converged inside the cap although a
+    V-cycle measured
+    2.29x on its system, and lowering the cap to collect that would have regressed small
+    well-conditioned solves by up to 2.8x. The gate collects it without the trade, because it asks
+    the operator instead of the iteration count. Raising ``linalg._MULTIGRID_MAX_COARSE`` to 384 was
+    worth 1.15x on ``bunny``'s solve before that (147.8 -> 139.2 ms), and seeding from the current
+    positions rather than ``wp.zeros`` 1.04-1.06x before that again.
     """
     skip_larger_than(
         bench_case,

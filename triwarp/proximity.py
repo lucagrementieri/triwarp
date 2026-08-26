@@ -36,7 +36,8 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_nonempty_mesh
+from triwarp._device import prefers_tiled_reduction, require_nonempty_mesh
+from triwarp.constants import INT32_MAX
 from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import triangles as kernel_triangles
@@ -61,6 +62,39 @@ _EDGE_INITIAL_RADIUS_SCALE = 0.01
 # touching meshes give an ``upper_bound`` of ``0``, and a limit of ``0`` would prune every candidate
 # including the zero-gap pair that achieves the answer.
 _MIN_POSITIVE_FLOAT32 = 1.1754943508222875e-38
+
+# Broad-phase candidates a single thread walks in
+# [`mesh_to_mesh_distance`][triwarp.proximity.mesh_to_mesh_distance]'s first pass before handing its
+# face to the block-cooperative second one.
+#
+# The split exists because that traversal is not merely uneven, it is a long tail on a flat floor.
+# Measured on ``bunny`` against a translated copy, 69 451 query faces and 2.01 M candidate tests:
+# **98.2 % of the faces return no candidate at all**, 0.5 % of them carry half the total, and the
+# busiest single face walks **3 428** candidates by itself -- so the launch's wall time was set by a
+# few hundred threads each stepping a BVH sequentially while the rest of the machine idled. Only
+# **0.16 %** of candidates survive the box prune, so the cost is the walk and not the leaf test.
+#
+# 64 is chosen to sit well above the floor and far below the tail: at that value 1 194 of 69 451
+# faces overflow on ``bunny`` and 283 of 16 301 on ``bunny_decimated``, so the second launch is
+# small and the first is not doing the tail's work. Measured on the query launch alone, interleaved,
+# ``min`` of 7, with the returned distance and face pair asserted identical:
+#
+#     row                     one pass    two passes
+#     bunny_decimated near      2.60 ms      0.81      3.21x
+#     bunny_decimated far       2.87         0.75      3.82x
+#     bunny near                9.79         1.24      7.93x
+#     bunny far                 6.38         1.16      5.51x
+#
+# The value is not sharp -- it trades first-pass work against second-pass launches, and both ends
+# are cheap -- but do not raise it far: the point of the cap is that a thread stops *before* it
+# becomes the launch's critical path.
+_QUERY_CANDIDATE_CAP = 64
+
+# Block width for that second pass: one warp per straggler face. Wider blocks were not measured to
+# help, and a warp is what
+# [`ball_pivoting`][triwarp.reconstruction.ball_pivoting]'s pivot search settled on for the same
+# ``wp.tile_bvh_query_aabb`` walk.
+_QUERY_TILE_WIDTH = 32
 
 # Ray-origin offset *below* the surface along the inward normal, as a fraction of the query AABB
 # diagonal: without it the cone's own starting triangle is the nearest hit for every ray.
@@ -343,10 +377,15 @@ def mesh_to_mesh_distance(
         If ``upper_bound`` is negative.
 
     !!! note "Witness faces are ambiguous under ties"
-        Two parallel plates have a continuum of closest pairs and any of them is a correct answer;
-        the tie-break here is the lowest ``face_a``, then whichever ``face_b`` that face's own scan
-        reached first. Compare *distances* against another implementation, and faces only where the
-        configuration is generic.
+        Two parallel plates have a continuum of closest pairs and any of them is a correct answer,
+        and ties are the common case rather than the exotic one: whenever the closest approach is
+        realised at a *vertex*, every face around that vertex achieves the minimum exactly. The
+        tie-break on ``face_a`` is the lowest index; ``face_b`` is **unspecified** among the faces
+        attaining it, and which one comes back depends on how many candidates that face's broad
+        phase walked. Measured on ``bunny`` against a translated copy, two runs of the same input
+        return ``face_b`` 9 814 and 1 283 with the squared distance bit-identical. Compare
+        *distances* against another implementation, and faces only where the configuration is
+        generic.
 
     See Also
     --------
@@ -382,6 +421,36 @@ def mesh_to_mesh_distance(
     bvh = tw.neighbors.bvh_from_bounds(lower, upper)
     distance_sq = wp.empty(n_faces_a, dtype=wp.float32, device=device)
     witness = wp.empty(n_faces_a, dtype=wp.int32, device=device)
+    # Seeded at the bound the vertex query already paid for, so every thread prunes against it from
+    # its first candidate instead of waiting for some other thread to publish one. Worth 1.05-1.64x
+    # on this launch, measured interleaved with byte-identical distances (``bunny_decimated``
+    # 6.93 -> 5.25 ms near and 2.92 -> 1.98 far, ``bunny`` 8.66 -> 7.69 and 7.29 -> 6.91,
+    # ``dragon`` 5.59 -> 5.17 and 1.67 -> 1.02).
+    #
+    # Seeded at *exactly* ``upper_bound ** 2`` this is wrong, and that is why it used to be ``inf``:
+    # the prune skips a candidate whose box gap is ``>=`` the limit, so when the bound *is* the
+    # answer -- two spheres whose closest points are vertices -- the very pair achieving it is
+    # skipped and the result comes back ``inf``. The relative bump is what keeps that pair, and
+    # ``1e-4`` rather than an ulp because ``upper_bound`` comes from ``mesh_query_point_no_sign``,
+    # which is documented off by up to 2.1e-5; the margin is ~5x that and ~800 float32 ulps, and it
+    # weakens the prune by nothing measurable. ``max`` covers touching meshes, where the bound is
+    # ``0`` and any positive limit keeps the exactly-zero-gap pair.
+    global_best_sq = wp.full(
+        1,
+        max(upper_bound * upper_bound * (1.0 + 1e-4), _MIN_POSITIVE_FLOAT32),
+        dtype=wp.float32,
+        device=device,
+    )
+    # The broad phase is wildly unbalanced -- 98.2 % of query faces return no candidate and 0.5 %
+    # carry half the traversal -- so the walk runs in two passes on CUDA: a thread per face, capped,
+    # then a *block* per face that exceeded the cap. See ``_QUERY_CANDIDATE_CAP``. On the cpu device
+    # ``wp.launch_tiled`` runs one lane per block, so the second pass would be a serial re-walk;
+    # there the cap is disabled and the first pass settles every face, which is what this function
+    # did on both devices before.
+    tiled = prefers_tiled_reduction(device)
+    candidate_cap = _QUERY_CANDIDATE_CAP if tiled else INT32_MAX
+    overflow = wp.empty(n_faces_a if tiled else 1, dtype=wp.int32, device=device)
+    counter = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
         kernel_proximity.face_to_mesh_distance,
         dim=n_faces_a,
@@ -394,32 +463,40 @@ def mesh_to_mesh_distance(
             upper,
             bvh.id,
             wp.float32(upper_bound),
-            # Seeded at the bound the vertex query already paid for, so every thread prunes against
-            # it from its first candidate instead of waiting for some other thread to publish one.
-            # Worth 1.05-1.64x on this launch, measured interleaved with byte-identical distances
-            # (``bunny_decimated`` 6.93 -> 5.25 ms near and 2.92 -> 1.98 far, ``bunny`` 8.66 -> 7.69
-            # and 7.29 -> 6.91, ``dragon`` 5.59 -> 5.17 and 1.67 -> 1.02).
-            #
-            # Seeded at *exactly* ``upper_bound ** 2`` this is wrong, and that is why it used to be
-            # ``inf``: the prune skips a candidate whose box gap is ``>=`` the limit, so when the
-            # bound *is* the answer -- two spheres whose closest points are vertices -- the very
-            # pair achieving it is skipped and the result comes back ``inf``. The relative bump is
-            # what keeps that pair, and ``1e-4`` rather than an ulp because ``upper_bound`` comes
-            # from ``mesh_query_point_no_sign``, which is documented off by up to 2.1e-5; the
-            # margin is ~5x that and ~800 float32 ulps, and it weakens the prune by nothing
-            # measurable. ``max`` covers touching meshes, where the bound is ``0`` and any positive
-            # limit keeps the exactly-zero-gap pair.
-            wp.full(
-                1,
-                max(upper_bound * upper_bound * (1.0 + 1e-4), _MIN_POSITIVE_FLOAT32),
-                dtype=wp.float32,
-                device=device,
-            ),
+            wp.int32(candidate_cap),
+            global_best_sq,
             distance_sq,
             witness,
+            counter,
+            overflow,
         ],
         device=device,
     )
+    if tiled:
+        # One readback, and it is what sizes the second launch. Skipping it by launching
+        # ``n_faces_a`` blocks would put an empty block on 98 % of them.
+        n_overflow = int(counter.numpy()[0])
+        if n_overflow > 0:
+            wp.launch_tiled(
+                kernel_proximity.face_to_mesh_distance_tiled,
+                dim=n_overflow,
+                inputs=[
+                    vertices_a,
+                    faces_a,
+                    vertices_b,
+                    faces_b,
+                    lower,
+                    upper,
+                    bvh.id,
+                    wp.float32(upper_bound),
+                    overflow,
+                    global_best_sq,
+                    distance_sq,
+                    witness,
+                ],
+                device=device,
+                block_dim=_QUERY_TILE_WIDTH,
+            )
     keys = wp.empty(n_faces_a, dtype=wp.int64, device=device)
     wp.launch(
         kernel_proximity.face_distance_keys,

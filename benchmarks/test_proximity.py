@@ -728,10 +728,25 @@ def test_mesh_to_mesh_distance(bench_case: BenchCase, offset: float) -> None:
     dominates exactly where the gap is -- the ``bunny_decimated`` and ``bunny`` rows, the only ones
     meshlib is not capped out of -- and by ``happy_buddha`` the bound is 74 % of the call and the
     query is 0.40 ms. So a cheaper bound (a subsampled vertex query is still sound: the minimum over
-    any *subset* of A's vertices is still an upper bound on the surface distance) would only move
-    rows that contribute no gap, and a faster query would only move the small ones. A BVH-pair
-    wavefront is the one change that addresses both, since it needs no separate bound phase at all;
-    it is also the largest, and nothing here has measured it.
+    any *subset* of A's vertices is still an upper bound on the surface distance) only moves rows
+    that contribute no gap, and a faster query only moves the small ones.
+
+    **The query half has since been done, and it was a load-balancing problem rather than the
+    pruning problem it read as.** Counted on ``bunny``: the broad phase makes 2.01 M candidate
+    tests of which **0.16 %** survive the box prune, so the leaf test is not the cost -- but
+    **98.2 %** of query faces return no candidate at all, 0.5 % carry half the traversal, and the
+    busiest face walks **3 428** candidates alone. The walk now runs as a capped thread pass plus a
+    warp per straggler (``proximity._QUERY_CANDIDATE_CAP``), worth **3.1-10.2x** end to end on the
+    four rows here with the distance and ``face_a`` identical. Two levers were measured and
+    declined on the way: ``block_dim`` (256, the default, wins at every value from 32) and
+    tightening the query margin -- the vertex bound *is* the answer to all 16 digits on all four
+    rows, so there is nothing to tighten and the query is confirming a distance the bound already
+    found.
+
+    A BVH-pair wavefront remains the one change that would also delete the bound phase, and it is
+    **larger than it looks**: Warp exposes ``bvh_query_aabb`` / ``bvh_query_ray`` and no
+    node-by-node traversal, so a pair descent means building our own hierarchy rather than
+    reusing ``wp.Bvh``.
     """
     if bench_case.kind == "meshlib":
         skip_larger_than(bench_case, "bunny", "findDistance is a serial descent per pair")

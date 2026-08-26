@@ -1,6 +1,11 @@
 import warp as wp
 
-from triwarp.constants import FLOAT32_INF_CONSTANT, TOLERANCE_MERGE_CONSTANT, TWO_PI
+from triwarp.constants import (
+    FLOAT32_INF_CONSTANT,
+    INT32_MAX_CONSTANT,
+    TOLERANCE_MERGE_CONSTANT,
+    TWO_PI,
+)
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.array import pack_nearest_key
 from triwarp.kernels.neighbors import MAX_SEARCH_ATTEMPTS, complete_radius, deepen_radius
@@ -390,6 +395,33 @@ def aabb_distance_sq(
     return wp.length_sq(gap)
 
 
+@wp.func
+def face_pair_distance_sq(
+    a0: wp.vec3,
+    a1: wp.vec3,
+    a2: wp.vec3,
+    lower: wp.vec3,
+    upper: wp.vec3,
+    target_vertices: wp.array[wp.vec3],
+    target_faces: wp.array[wp.int32],
+    target_lower: wp.array[wp.vec3],
+    target_upper: wp.array[wp.vec3],
+    candidate: wp.int32,
+    limit: wp.float32,
+) -> wp.float32:
+    # One broad-phase candidate, tested: the exact triangle-triangle distance, or ``inf`` when the
+    # box gap alone already rules the pair out. A box-to-box gap is a lower bound on the triangle
+    # distance, so a candidate whose boxes are farther apart than ``limit`` cannot win and never
+    # reaches the fifteen-case leaf test.
+    #
+    # Shared by the two kernels below, which differ only in *who walks the candidates*: a thread
+    # each in ``face_to_mesh_distance``, a whole block in ``face_to_mesh_distance_tiled``.
+    if aabb_distance_sq(lower, upper, target_lower[candidate], target_upper[candidate]) >= limit:
+        return FLOAT32_INF_CONSTANT
+    b0, b1, b2 = kernel_triangles.face_vertices(target_vertices, target_faces, candidate)
+    return triangle_triangle_distance_sq(a0, a1, a2, b0, b1, b2)
+
+
 @wp.kernel
 def face_to_mesh_distance(
     query_vertices: wp.array[wp.vec3],
@@ -400,22 +432,32 @@ def face_to_mesh_distance(
     target_upper: wp.array[wp.vec3],
     target_bvh: wp.uint64,
     upper_bound: wp.float32,
+    candidate_cap: wp.int32,
     global_best_sq: wp.array[wp.float32],
     out_distance_sq: wp.array[wp.float32],
     out_witness: wp.array[wp.int32],
+    counter: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
 ) -> None:
     # One thread per face of the query mesh: expand its own AABB by ``upper_bound`` and test every
     # target face whose AABB it then meets. That bound is what makes the broad phase sound -- the
     # true minimum is at most ``upper_bound``, so the pair achieving it has AABBs within that
     # distance and cannot be missed.
     #
-    # Two prunes stand between a candidate and the fifteen-case leaf test, and both matter because
-    # for *well-separated* meshes the bound is roughly the answer, so every face's grown box meets a
-    # large part of the other mesh. The first is local and exact: a box-to-box gap is a lower bound
-    # on the triangle distance, so a candidate whose boxes are already farther than this thread's
-    # best cannot win. The second reads a **global** running minimum other threads have published --
-    # which makes the amount of work nondeterministic but not the answer, since it only ever skips
-    # pairs that cannot beat a distance already achieved.
+    # Two prunes stand between a candidate and the fifteen-case leaf test, both inside
+    # ``face_pair_distance_sq``'s ``limit``, and both matter because for *well-separated* meshes the
+    # bound is roughly the answer, so every face's grown box meets a large part of the other mesh.
+    # The first is local and exact: this thread's own best. The second reads a **global** running
+    # minimum other threads have published -- which makes the amount of work nondeterministic but
+    # not the answer, since it only ever skips pairs that cannot beat a distance already achieved.
+    #
+    # **``candidate_cap`` is what makes this the first of two passes.** The traversal is wildly
+    # unbalanced: measured on ``bunny`` against a translated copy, **98.2 %** of query faces have no
+    # candidate at all and **0.5 %** carry half of the 2.0 M candidate tests, the busiest walking
+    # **3 428** of them alone. So a thread that is still going after ``candidate_cap`` candidates
+    # stops, appends its face to ``overflow``, and lets ``face_to_mesh_distance_tiled`` re-walk it
+    # with a whole block. Pass a cap of ``INT32_MAX`` to disable the split and settle every face
+    # here, which is what the CPU device does -- ``wp.launch_tiled`` runs one lane per block there.
     f = wp.int32(wp.tid())
     a0, a1, a2 = kernel_triangles.face_vertices(query_vertices, query_faces, f)
     lower, upper = triangle_aabb(a0, a1, a2)
@@ -423,23 +465,109 @@ def face_to_mesh_distance(
 
     best = FLOAT32_INF_CONSTANT
     witness = wp.int32(-1)
+    seen = wp.int32(0)
+    overflowed = wp.int32(0)
     query = wp.bvh_query_aabb(target_bvh, lower - margin, upper + margin)
     candidate = wp.int32(0)
     while wp.bvh_query_next(query, candidate):
-        limit = wp.min(best, global_best_sq[0])
-        if (
-            aabb_distance_sq(lower, upper, target_lower[candidate], target_upper[candidate])
-            >= limit
-        ):
-            continue
-        b0, b1, b2 = kernel_triangles.face_vertices(target_vertices, target_faces, candidate)
-        distance_sq = triangle_triangle_distance_sq(a0, a1, a2, b0, b1, b2)
+        seen += 1
+        if seen > candidate_cap:
+            overflowed = 1
+            break
+        distance_sq = face_pair_distance_sq(
+            a0,
+            a1,
+            a2,
+            lower,
+            upper,
+            target_vertices,
+            target_faces,
+            target_lower,
+            target_upper,
+            candidate,
+            wp.min(best, global_best_sq[0]),
+        )
         if distance_sq < best:
             best = distance_sq
             witness = candidate
             wp.atomic_min(global_best_sq, 0, best)
     out_distance_sq[f] = best
     out_witness[f] = witness
+    if overflowed == 1:
+        # The face is *not* settled: whatever it wrote above is a partial answer over the first
+        # ``candidate_cap`` candidates, and the tiled pass overwrites both entries. Publishing it
+        # anyway is what keeps the global minimum tight while that pass runs.
+        overflow[wp.atomic_add(counter, 0, 1)] = f
+
+
+@wp.kernel(enable_backward=False)
+def face_to_mesh_distance_tiled(
+    query_vertices: wp.array[wp.vec3],
+    query_faces: wp.array[wp.int32],
+    target_vertices: wp.array[wp.vec3],
+    target_faces: wp.array[wp.int32],
+    target_lower: wp.array[wp.vec3],
+    target_upper: wp.array[wp.vec3],
+    target_bvh: wp.uint64,
+    upper_bound: wp.float32,
+    overflow: wp.array[wp.int32],
+    global_best_sq: wp.array[wp.float32],
+    out_distance_sq: wp.array[wp.float32],
+    out_witness: wp.array[wp.int32],
+) -> None:
+    # **One block per straggler face**, re-walking the query the thread pass gave up on with
+    # ``wp.tile_bvh_query_aabb``, which hands one candidate per lane per step. Same candidate set,
+    # same ``face_pair_distance_sq`` test; only the walk's *depth* changes, from one thread's
+    # thousands of sequential steps to that over the block width. This is the identical trick
+    # ``kernels/algorithms/ball_pivoting.py`` uses on its pivot search, and for the identical
+    # reason -- see its comment for why a *serial* BVH walk is not the win.
+    #
+    # Each lane keeps its own running best, so a lane cannot prune against its siblings' minima and
+    # slightly more candidates reach the leaf test. The answer is unchanged: the minimum over the
+    # block is the minimum of the per-lane minima, and the global atomic is still read every step.
+    slot = wp.int32(wp.tid())
+    f = overflow[slot]
+    a0, a1, a2 = kernel_triangles.face_vertices(query_vertices, query_faces, f)
+    lower, upper = triangle_aabb(a0, a1, a2)
+    margin = wp.vec3(upper_bound, upper_bound, upper_bound)
+
+    best = FLOAT32_INF_CONSTANT
+    witness = wp.int32(-1)
+    query = wp.tile_bvh_query_aabb(target_bvh, lower - margin, upper + margin)
+    while wp.tile_query_valid(query):
+        candidate = wp.untile(wp.tile_bvh_query_next(query))
+        # A lane with no candidate this step gets -1; the tile is block-wide, so it cannot simply
+        # leave the loop.
+        if candidate >= 0:
+            distance_sq = face_pair_distance_sq(
+                a0,
+                a1,
+                a2,
+                lower,
+                upper,
+                target_vertices,
+                target_faces,
+                target_lower,
+                target_upper,
+                candidate,
+                wp.min(best, global_best_sq[0]),
+            )
+            if distance_sq < best:
+                best = distance_sq
+                witness = candidate
+                wp.atomic_min(global_best_sq, 0, best)
+    # Two-stage reduction, so the witness does not depend on which lane happened to see it: the
+    # smallest distance, then the smallest face index among the lanes attaining it. Every lane
+    # holds the same pair afterwards and every lane stores it, as the pivot search does.
+    block_best = wp.tile_min(wp.tile(best))[0]
+    mine = witness
+    if best != block_best:
+        mine = INT32_MAX_CONSTANT
+    block_witness = wp.tile_min(wp.tile(mine))[0]
+    if block_witness == INT32_MAX_CONSTANT:
+        block_witness = wp.int32(-1)
+    out_distance_sq[f] = block_best
+    out_witness[f] = block_witness
 
 
 @wp.kernel

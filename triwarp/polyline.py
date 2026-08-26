@@ -584,8 +584,34 @@ def polyline_simplify(
     the recursion's own cost grows on exactly the same axis. Do not read the spiral row as a
     near-crossover.
 
-    The two smallest rows lose ~0.16 ms, which is the one-off graph capture rather than a size
-    effect -- the same trade the ear clipper's single-contour rows took.
+    **The two smallest rows are a machinery floor, and a serial fallback for them is measured and
+    declined.** They were read once as measuring the level count; they do not. At ``n = 268`` the
+    whole call is flat at **0.427-0.473 ms** across tolerances spanning ``1e-3`` to ``1e3`` -- a
+    10^6 range that moves the accepted set from 65 points to 2 -- and flat again between 268 and
+    528 points. Decomposed at ``n = 268``, min of 60 on an RTX 5090:
+
+    | | ms | share |
+    |---|---|---|
+    | graph capture (recorded, replayed with the condition false) | 0.185 | 40 % |
+    | ``flatnonzero`` + ``gather`` on the keep mask | 0.166 | 36 % |
+    | allocations and the seed launch | ~0.07 | 15 % |
+    | **the split rounds themselves** | **~0.04** | **9 %** |
+
+    So three quarters of the row is machinery every implementation of this signature pays, and the
+    rounds -- the only part a different algorithm could change -- are a twentieth of it. The
+    benchmark's two operating points settle in **7 and 4** rounds, and 3 extra rounds cost 0.017 ms.
+
+    A serial fallback below a point count would therefore recover the capture alone, still pay the
+    0.166 ms tail and the allocations, and land near **0.24 ms** against meshlib's 0.14-0.25 -- so
+    it would not reliably win the row, and it would cost a second Ramer-Douglas-Peucker (a
+    stack-based single-thread kernel, since Warp forbids recursion) plus the test that its accepted
+    set matches this one's. Declined on those numbers rather than on the "one algorithm" preference
+    below.
+
+    Host-driving the loop instead of capturing it is declined by the same measurement and more
+    clearly: at the measured 90 us per host-issued round against 14 us replayed, 7 rounds is
+    0.630 ms host-driven against 0.283 captured, and the gap only widens with depth. The capture is
+    right at every operating point in the suite, including the smallest.
 
     On **cpu** the change is a 3.7-5.6x loss on these boundary loops (``rim_long`` 5.90 -> 24.28 ms)
     and 11x on the 100-turn spiral, because Warp's cpu backend runs a ``dim=n`` launch as one lane,

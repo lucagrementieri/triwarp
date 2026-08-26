@@ -102,27 +102,30 @@ predicted -- on the graded saddle's harmonic system it takes the V-cycle from 34
 7 760 -- but it buys **1.05x** end to end, because the only call site that reaches the hierarchy
 today is ``smooth_region``.
 
-**The rest of that family never sees a preconditioner choice at all**, which is the finding worth
-carrying forward: [`min_quad_with_fixed`][triwarp.linalg.min_quad_with_fixed] takes the default
-``preconditioner="diag"``, so ``harmonic`` / ``tutte`` / ``lscm`` run Jacobi whatever the operator's
-conditioning and no threshold can reach them.
+**Routing that family through ``"auto"`` was once refuted and is now half true**, and the half that
+changed is worth reading before touching either side. The refutation was measured when ``"auto"``
+meant *probe first*: on ``k=1 saddle_graded`` it lost **0.74x** because the probe spent its 2 000
+Jacobi iterations and then paid the hierarchy setup on top, and one 1.66x win elsewhere did not buy
+that. ``"auto"`` now decides from the **operator** before running anything
+(``CG_MULTIGRID_DOMINANCE``), so that row is **1.50x**.
 
-**Routing them through ``"auto"`` was measured and is refuted.** End to end on the whole
-``harmonic`` call, five reps interleaved, medians:
+But the axis that made it work is conditioning, not the caller, and it splits this family in two
+rather than lifting it. Measured end to end, interleaved, ``min`` of 3:
 
-| system | ``"diag"`` | ``"auto"`` | |
-|---|---|---|---|
-| ``k=2`` saddle, 17 161 unknowns | 199.1 ms | 119.6 ms | **1.66x** |
-| ``k=1`` saddle_small, 4 356 | 8.0 | 7.2 | 1.11x |
-| ``k=2`` saddle_small | 53.4 | 53.4 | 1.00x, converges inside the probe |
-| ``k=1`` saddle | 11.3 | 11.4 | 0.99x |
-| ``k=1`` saddle_graded | 58.5 | 78.9 | **0.74x** |
+| system | dominance | ``"diag"`` -> ``"auto"`` |
+|---|---|---|
+| ``harmonic k=2``, saddle / saddle_small / hemisphere | 1.94-2.66 | **1.42-2.92x** |
+| ``harmonic k=1``, the same three | 1.00-1.19 | 0.97-1.00x |
+| ``tutte``, uniform weights | 1.000 | 0.94-1.01x |
+| ``lscm``, the coupled u/v system | 1.55-1.80 | **0.58-0.67x**, a loss |
+| ``min_quad_with_fixed`` on a raw ``cotmatrix``, 8 cells | 1.00-1.20 | 0.90-1.09x |
 
-The graded ``k=1`` row is the refutation: it converges under *both* preconditioners, and ``"auto"``
-still loses, because the probe spends its 2 000 Jacobi iterations and then pays the hierarchy setup
-on top. One 1.66x win does not buy a 0.74x loss on the row the threshold was supposed to be for, and
-nothing cheap separates them -- which is ``CG_PROBE_ITERATIONS``' own conclusion reappearing one
-level up.
+So **only the squared operator wants a hierarchy**, which is why
+[`harmonic`][triwarp.parametrization.harmonic] passes ``"auto"`` at ``k >= 2`` and ``"diag"``
+below, and why [`min_quad_with_fixed`][triwarp.linalg.min_quad_with_fixed] keeps ``"diag"`` as its
+default rather than becoming a second ``"auto"`` caller. ``lscm`` is the row that decides the shape:
+its 1.55-1.80 dominance clears any floor low enough to admit a Laplacian, so a blanket routing
+regresses it by a third.
 
 !!! warning "``harmonic`` at ``k=2`` on a graded patch does not converge, and the fast number is the
     non-answer"
@@ -180,10 +183,15 @@ CG_CHECK_EVERY = 0
 # default, and what this module shipped before the device-side check became the default.
 CG_CHECK_EVERY_FALLBACK = 10
 
-# Jacobi iterations ``preconditioner="auto"`` runs before it escalates to a multigrid hierarchy.
+# Jacobi iterations ``preconditioner="auto"`` runs before it escalates to a multigrid hierarchy,
+# on the systems its gate did not already send straight to one -- see
+# ``CG_MULTIGRID_DOMINANCE`` below, which is what decides that and is the newer half of ``"auto"``.
+# This cap is the *fallback* branch: everything below still describes it exactly, and it still runs
+# unchanged on every system the gate declines.
 #
 # It is a *cap*, not a predictor, and that is a measured retreat rather than a first choice. Nothing
-# cheap tells the two cases apart. Size does not: at ~2 000 free unknowns ``smooth_region`` on
+# cheap tells the two cases apart **on the axes tried when it was written**. Size does not: at
+# ~2 000 free unknowns ``smooth_region`` on
 # ``bunny_decimated`` takes 1 784 Jacobi iterations and a V-cycle wins 1.88x, while the same
 # free-set size on an ``icosphere`` takes 521 and loses 0.69x. Extrapolating the probe's own
 # convergence rate does not either -- tried at probe lengths 200, 400 and 600, the estimated
@@ -224,9 +232,12 @@ CG_CHECK_EVERY_FALLBACK = 10
 # probe *and* the hierarchy: ``icos6 q25`` reads 68.54 at 2 000, **87.39** at 1 000 and 61.04 at
 # 150. So 1 000 or 1 500 is never the answer -- it is the worst of both.
 #
-# **Nothing separates the two classes, on any axis tried.** Iteration count interleaves (a
+# **Nothing separates the two classes, on any axis tried here.** Iteration count interleaves (a
 # 244-iteration system wins 1.51x while a 997-iteration one loses 0.79x) and so does Jacobi
-# wall-clock (wins from 2.7 ms, losses up to 35.0). A cap *proportional to* ``n`` is refuted
+# wall-clock (wins from 2.7 ms, losses up to 35.0). The axis that *does* separate them was not one
+# of these and is a property of the operator rather than of the solve -- ``CG_MULTIGRID_DOMINANCE``
+# carries it. Read that constant before concluding from this paragraph that the question is
+# closed. A cap *proportional to* ``n`` is refuted
 # outright and backwards: a larger system gets a larger cap and therefore escalates **later**,
 # taking ``region bunny`` from 136.8 ms to 216.9 at ``alpha = 0.5``.
 #
@@ -249,6 +260,115 @@ CG_CHECK_EVERY_FALLBACK = 10
 # cap is ``fill_smooth[rim_short]``, whose two 512-vertex rims put it just past 500.
 CG_PROBE_ITERATIONS = 2000
 
+# The gate ``preconditioner="auto"`` applies *before* the probe above: a system that clears it goes
+# straight to a multigrid hierarchy and never runs a Jacobi iteration, and one that does not falls
+# through to ``CG_PROBE_ITERATIONS`` unchanged. So the gate can only ever *remove* a probe, which is
+# what makes it safe: on a system it declines, ``"auto"`` behaves exactly as it did before it
+# existed.
+#
+# **The axis is the operator's off-diagonal dominance, not its size.** ``max_i sum_{j != i} |A_ij| /
+# A_ii``, one kernel and one max-reduction over the assembled system (``_offdiagonal_dominance``).
+# Smoothed aggregation's advantage over Jacobi grows with how much weight a row carries off its
+# diagonal, so this is the operator property the V-cycle is actually paid for -- which is why it
+# separates systems that size, iteration count and rate extrapolation all failed to (see the
+# paragraph above, which tried those three and concluded nothing separates them).
+#
+# Measured on an RTX 5090, ``smooth_region`` end to end under a forced ``"diag"`` against a forced
+# ``"multigrid"``, interleaved, ``min`` of 3. **29 systems: 25 mesh regions spanning four mesh
+# classes and five free fractions, plus the four hole-patch chains.** The rule predicts the winner
+# on every one of them, with a single conservative miss noted below and no regression anywhere:
+#
+#     system                 n_free   gersh   gate   diag/mg   verdict
+#     region icos4 q10          257   1.895   diag      0.68   declined, correctly
+#     region icos4 q25          641   2.033   diag      0.52   declined, correctly
+#     region icos4 q50        1 249   2.033   diag      0.65   declined, correctly
+#     region icos4 q75        1 921   2.033   diag      0.75   declined, correctly
+#     region icos5 q10        1 025   2.035   diag      0.56   declined, correctly
+#     region icos5 q25        2 561   2.035   diag      0.67   declined, correctly
+#     region icos5 q50        5 057   2.035   diag      0.96   flat
+#     region icos5 q75        7 681   2.035     mg      1.15   size branch
+#     region icos6 q10        4 097   2.036   diag      0.90   declined, correctly
+#     region icos6 q25       10 239   2.036     mg      1.51   size branch
+#     region icos6 q50       20 353   2.036     mg      1.61   size branch
+#     region icos6 q75       30 719   2.036     mg      2.27   size branch
+#     region icos7 q25       40 961   2.036     mg      2.53   size branch
+#     region bunny_dec q10      817   3.001   diag      1.26   **the miss**: 1.26x forgone
+#     region bunny_dec q25    2 043   3.001     mg      2.23   dominance branch
+#     region bunny_dec q50    4 085   3.409     mg      2.99   dominance branch
+#     region bunny q10        3 595   2.505     mg      2.36   dominance branch
+#     region bunny q25        8 987   2.505     mg      3.01   dominance branch
+#     region bunny q50       17 973   2.734     mg      3.59   dominance branch
+#     region saddle q25       4 421   2.638     mg      1.09   flat
+#     region saddle q50       8 844   2.671     mg      3.62   dominance branch
+#     region saddle_grd q25   4 422   2.219     mg      2.51   dominance branch
+#     region saddle_grd q50   8 841   2.254     mg      2.59   dominance branch
+#     region hemisphere q25   5 183   2.036   diag      1.09   flat
+#     region hemisphere q50  10 367   2.036     mg      1.56   size branch
+#     patch fill_smooth[rim_short]   1 000  2.82  diag   0.91   declined, correctly
+#     patch fill_smooth[holes_many]    778  0.38  diag   0.27   declined, correctly
+#     patch refill_region[bunny_dec]   879  4.02  diag   0.86   declined, correctly
+#     patch refill_region[bunny]     1 000  2.69  diag   0.85   declined, correctly
+#
+# **The size floor is what keeps the hole patches out, and it is the reason the dominance axis alone
+# is not enough.** The four patch solves carry a dominance of 2.69-4.02 -- a freshly triangulated
+# patch has worse triangles than any scan -- and every one of them *loses* under a forced hierarchy,
+# because a 17-25 ms setup is most of a patch solve. They sit at ``n <= 1 000`` and the smallest
+# region win the dominance branch needs is ``bunny_dec q25`` at 2 043, so the floor goes between
+# them. That gap is real and not an artifact of where these fixtures fell: the patch solves and
+# ``region bunny_dec q10`` (817 unknowns, dominance 3.00) are indistinguishable on **both** axes and
+# their answers differ, so the floor buys the patches at the price of that one 1.26x. Forgoing a
+# small win to avoid four regressions is the trade this whole setting exists to make.
+#
+# **Three fitted numbers, and say so.** 1 500, 7 000 and 2.15 were each placed in a measured gap
+# after seeing the population, so this is a fit and not a derivation -- but it is a fit whose
+# held-out half was measured separately: 11 systems chose the thresholds and the other 14 (the q10 /
+# q50 / q75 fractions and ``icos7``) were run afterwards against the frozen rule, 14 for 14. Before
+# moving any of the three, re-run the whole table rather than the half that motivated the move; the
+# ``"auto"`` cap above is what a previous author got wrong by tuning against one operating point.
+#
+# The end-to-end effect, which is what the benchmark rows see: ``smooth_region[bunny_decimated]``
+# 70.1 -> 31.5 ms (**2.22x**, and it never escalated before -- it converged inside the cap) and
+# ``smooth_region[bunny]`` 136.8 -> 76.3 (**1.79x**, of which the probe it no longer runs is
+# ~60 ms).
+# ``fill_smooth`` and ``refill_region`` are untouched, by construction.
+
+# Free unknowns below which ``"auto"`` never skips its probe, whatever the dominance: the hole
+# patches live here and a hierarchy setup is most of their solve.
+CG_MULTIGRID_MIN_UNKNOWNS = 1500
+
+# Free unknowns above which a merely *moderate* dominance is enough to skip the probe -- the
+# well-shaped regular meshes, where conjugate gradient's growth in the mesh size is the whole
+# problem. Paired with ``CG_MULTIGRID_SIZE_FLOOR`` below, which is what keeps this branch from
+# firing on an operator it was not calibrated on.
+CG_MULTIGRID_LARGE_UNKNOWNS = 7000
+
+# Dominance floor under which the size branch above does **not** fire, however large the system.
+#
+# **The size branch is the operator-class-specific half of the gate**, and it was caught being wrong
+# on two further classes once anything but ``smooth_region`` was put through it. The dominance
+# branch transfers; this one does not, and without a floor it fires on any large system at all.
+#
+# Measured, and this is the whole reason for the number:
+#
+#     operator                                  n        dominance   forced V-cycle
+#     smooth_region umbrella normal equations   7 681-40 961   2.035-2.036   1.15-2.53x  wins
+#     parametrization.lscm, coupled u/v         35 374-41 470  1.547-1.798   0.58-0.67x  LOSES
+#     parametrization.harmonic, k = 1           17 161         1.190         0.41x       LOSES
+#     linalg.min_quad_with_fixed, cotmatrix     8 845-20 530   1.000-1.197   0.90-1.09x  flat
+#     parametrization.tutte, uniform weights    4 356-20 353   1.000         0.94-0.98x  flat
+#
+# A plain Laplacian's rows nearly sum to zero, so it sits at 1.0-1.2 and a large one of those does
+# not need a hierarchy -- it needs iterations. ``lscm``'s coupled system is the constraining row at
+# **1.798**, and the lowest system the branch must keep is ``smooth_region``'s at **2.035**, so 1.9
+# sits between them with ~6 % of margin on the tighter side. That is thinner than the other three
+# thresholds' gaps and is the one to re-measure first if a new caller reaches ``"auto"``.
+CG_MULTIGRID_SIZE_FLOOR = 1.9
+
+# Off-diagonal dominance above which ``"auto"`` skips its probe, given at least
+# ``CG_MULTIGRID_MIN_UNKNOWNS`` unknowns. The regular meshes sit at 1.90-2.04 and every irregular
+# one at 2.22 or above, so this sits in a wide measured gap rather than on a boundary.
+CG_MULTIGRID_DOMINANCE = 2.15
+
 
 def min_quad_with_fixed(
     q: wps.BsrMatrix[wp.float64],
@@ -257,6 +377,7 @@ def min_quad_with_fixed(
     *,
     tol: float = CG_TOLERANCE,
     check_every: int = CG_CHECK_EVERY,
+    preconditioner: str = "diag",
 ) -> tuple[twt.Array2dFloat, wp.array[wp.int32], int]:
     """
     Minimize a quadratic form with pinned degrees of freedom.
@@ -283,6 +404,14 @@ def min_quad_with_fixed(
         [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]. The default tests on device every
         iteration; see there for the measured tradeoff. This entry point's own return type does not
         depend on it — the solver's ``(iterations, residual, atol)`` triple is not surfaced here.
+    preconditioner
+        Forwarded to [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]. ``"diag"`` (the
+        default) because the eliminated operator is usually a plain Laplacian, whose rows nearly sum
+        to zero and which a V-cycle does not help: measured 0.90-1.09x over eight
+        ``(mesh, pin fraction)`` cells, and 0.94-0.98x through ``tutte``. The exception is a caller
+        that squares the operator, and
+        [`harmonic`][triwarp.parametrization.harmonic] passes ``"auto"`` at ``k >= 2`` for exactly
+        that reason.
 
     Returns
     -------
@@ -318,7 +447,12 @@ def min_quad_with_fixed(
 
     q_uu, rhs = assemble_interior_system(q, fixed_mask, free_map, fixed_values, n_free)
     solve_spd_columns(
-        q_uu, rhs, twt.as_array2d(solution, wp.float64), tol=tol, check_every=check_every
+        q_uu,
+        rhs,
+        twt.as_array2d(solution, wp.float64),
+        tol=tol,
+        check_every=check_every,
+        preconditioner=preconditioner,
     )
     return twt.as_array2d(solution, wp.float64), free_map, n_free
 
@@ -582,12 +716,15 @@ def solve_spd_columns(
     preconditioner
         ``"diag"`` (the default) for the Jacobi preconditioner, ``"multigrid"`` for the
         smoothed-aggregation V-cycle [`multigrid_preconditioner`]
-        [triwarp.linalg.multigrid_preconditioner] builds, or ``"auto"`` to run Jacobi under
-        [`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS] and escalate to the V-cycle only
-        if that has not converged. The V-cycle costs a setup pass and pays for itself only where the
+        [triwarp.linalg.multigrid_preconditioner] builds, or ``"auto"`` to let the operator decide.
+        ``"auto"`` first tests the assembled system against
+        [`CG_MULTIGRID_DOMINANCE`][triwarp.linalg.CG_MULTIGRID_DOMINANCE] and its size floor: a
+        system that clears the gate builds the V-cycle outright, and one that does not runs Jacobi
+        under [`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS] and escalates only if
+        that has not converged. The V-cycle costs a setup pass and pays for itself only where the
         solve dominates the call, so ``"auto"`` is the setting for a caller whose systems vary --
-        it cannot regress a solve that was already short, and gives up the upside on one that is
-        only just long enough. See that function's Notes and ``CG_PROBE_ITERATIONS``.
+        it cannot regress a solve that was already short, and its one measured cost is a 1.26x it
+        forgoes on a small ill-conditioned region. See that function's Notes, and both constants.
 
     Returns
     -------
@@ -712,8 +849,9 @@ def spd_column_solver(
         ``"diag"`` or ``"multigrid"``, as in
         [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]. Built once here and reused by every
         call against this state, which is the shape the V-cycle's setup cost wants. ``"auto"`` is
-        **not** accepted: its probe decides on the first solve, and a hoisted state exists to be
-        driven many times.
+        **not** accepted: it decides on the first solve -- from that system's operator, and from
+        the probe when the operator does not settle it -- and a hoisted state exists to be driven
+        many times.
 
     Returns
     -------
@@ -774,8 +912,8 @@ def _cg_columns(
     if preconditioner == "auto":
         if not run:
             raise ValueError(
-                f'{caller} cannot take preconditioner="auto": the probe decides on the *first* '
-                'solve, and a hoisted state is built to be driven many times. Pass "diag" or '
+                f'{caller} cannot take preconditioner="auto": it decides on the *first* solve, '
+                'and a hoisted state is built to be driven many times. Pass "diag" or '
                 '"multigrid".'
             )
         return _cg_columns_auto(
@@ -843,8 +981,22 @@ def _cg_columns_auto(
     V-cycle then has to work down.
 
     See [`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS] for why this is a cap rather
-    than the rate prediction it started out as.
+    than the rate prediction it started out as, and
+    [`CG_MULTIGRID_DOMINANCE`][triwarp.linalg.CG_MULTIGRID_DOMINANCE] for the gate that runs first
+    and decides, on the operator alone, whether to skip the probe entirely.
     """
+    if _wants_multigrid(matrix):
+        return _cg_columns(
+            matrix,
+            rhs,
+            solution,
+            tol=tol,
+            maxiter=cap,
+            check_every=check_every,
+            preconditioner="multigrid",
+            run=True,
+            caller=caller,
+        )
     if cap <= CG_PROBE_ITERATIONS:
         return _cg_columns(
             matrix,
@@ -882,6 +1034,47 @@ def _cg_columns_auto(
         run=True,
         caller=caller,
     )
+
+
+def _wants_multigrid(matrix: wps.BsrMatrix[wp.float64]) -> bool:
+    """
+    Whether ``preconditioner="auto"`` should skip its probe and build a hierarchy outright.
+
+    The gate is a size floor crossed with the operator's off-diagonal dominance -- see
+    [`CG_MULTIGRID_DOMINANCE`][triwarp.linalg.CG_MULTIGRID_DOMINANCE] for the 29 systems it was
+    measured on and for the one win it forgoes. Declining is always safe: the caller then runs the
+    Jacobi probe it would have run anyway.
+    """
+    n_rows = int(matrix.nrow)
+    if n_rows < CG_MULTIGRID_MIN_UNKNOWNS:
+        return False
+    dominance = _offdiagonal_dominance(matrix)
+    if dominance > CG_MULTIGRID_DOMINANCE:
+        return True
+    return n_rows >= CG_MULTIGRID_LARGE_UNKNOWNS and dominance > CG_MULTIGRID_SIZE_FLOOR
+
+
+def _offdiagonal_dominance(matrix: wps.BsrMatrix[wp.float64]) -> float:
+    """
+    ``max_i sum_{j != i} |A_ij| / A_ii`` over the rows of a scalar-block CSR operator.
+
+    One launch and one max-reduction, so the whole thing is launch-bound and *flat*: measured
+    0.129 / 0.124 / 0.123 ms at 4 624 / 17 689 / 40 962 rows, against the tens of milliseconds of
+    solve it is deciding about. The only host readback is the reduced scalar. Rows with a
+    non-positive diagonal contribute 0 rather than an infinity -- see the kernel.
+    """
+    n_rows = int(matrix.nrow)
+    device = matrix.values.device
+    ratios = wp.empty(n_rows, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_linalg.offdiagonal_dominance_rows,
+        dim=n_rows,
+        # ``nnz`` is a stale capacity, but ``offsets``/``columns``/``values`` are indexed through
+        # the row offsets here rather than sliced by it, so no count is read off the matrix.
+        inputs=[matrix.offsets, matrix.columns, matrix.values, ratios],
+        device=device,
+    )
+    return float(tw.reduce.max(ratios))
 
 
 def _cg_residual_and_tolerance(result: tuple) -> tuple[float, float]:
@@ -1451,6 +1644,34 @@ _MULTIGRID_MIS_ROUNDS = 32
 # makes a cycle more expensive, so the two cross at 0.05-0.08. ``0.08`` is statistically tied on
 # time with 15 % fewer iterations, which is the value to try first if a caller ever puts a harder
 # operator on the hierarchy -- iterations are the quantity that transfers, the clock is not.
+#
+# **Re-measured against setup *and* solve, and 0.05 survives.** The table above sweeps the solve on
+# one system, which prices only half of what the threshold moves: a larger theta removes weak edges
+# from the strength graph, so aggregates are smaller and more numerous, so a level coarsens less and
+# the hierarchy grows a level -- and a level is 5-8 ms of setup whatever its size. Measured with
+# ``"auto"``'s operator gate in place, so every row here really does build a hierarchy; interleaved,
+# ``min`` of 3, RTX 5090:
+#
+#     row                                 0.0     0.02     0.05     0.08
+#     setup cotmatrix[saddle]           17.51    19.05    20.13    23.15
+#     setup cotmatrix[saddle_graded]    17.86    24.61    25.35    26.97
+#     smooth_region[bunny_decimated]    41.57    36.84    35.15    35.95
+#     smooth_region[bunny]              92.67    77.51    76.33    95.75
+#     smooth_region[icos6 q25]          59.34    61.90    52.29    51.61
+#     smooth_region[saddle]             54.26    50.38    49.23    53.19
+#     smooth_region[saddle_graded]      91.43    68.75    76.62    73.27
+#     TOTAL                             374.6    339.0    335.1    359.9
+#
+# So the setup regression is **real and bought**. ``saddle_graded``'s hierarchy costs 17.86 -> 25.35
+# ms at 0.05, one extra level and 1.42x -- and the same operator's *solve* goes 91.43 -> 76.62, so
+# the 7.5 ms of setup buys 14.8 ms back. Reading the setup group alone says "regression"; reading
+# the solve alone says "free"; only the sum decides, and it picks 0.05 by 1.12x over ``0.0``.
+#
+# Two cautions on that number. The optimum is **flat**: 0.02 and 0.05 are 1.2 % apart, so this
+# chooses a basin and not a point, and a re-tune should move the value only on evidence bigger than
+# that. And ``benchmarks/test_linalg.py``'s ``multigrid_preconditioner`` group times the setup rows
+# *alone*, which makes it the one group in the suite that gets monotonically worse as this constant
+# improves -- do not read a loss there as a regression without the solve rows beside it.
 #
 # Two things to know before moving it. **A large threshold stalls the coarsening silently**: at
 # ``0.25`` several operators leave ``_multigrid_hierarchy`` with nothing usable and

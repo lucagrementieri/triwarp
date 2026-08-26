@@ -1576,14 +1576,20 @@ def smooth_region(
     # there: the *solve* alone measures 2.46x, and 2.55x on the CPU device.
     #
     # ``"auto"`` rather than ``"multigrid"`` because *this same function* is also called on hole
-    # patches by ``refine_and_smooth_region``, whose systems are small and well conditioned. Asking
-    # for the hierarchy unconditionally took ``holes.fill_smooth`` to **0.21x** on ``holes_many``:
-    # every patch paid a 15 ms setup to save nothing. Neither a size threshold nor an extrapolation
-    # of the probe's convergence rate separates the two cases -- see
-    # ``linalg.CG_PROBE_ITERATIONS`` for both attempts and their numbers -- so the escalation is
-    # capped instead, which costs the upside and cannot regress. End to end, against forcing Jacobi:
-    # **1.47x** on ``bunny``'s benchmarked region and 2.59x on three quarters of it, 0.98-1.01x on
-    # every system the hierarchy would not have helped, and ``fill_smooth`` unchanged at 0.98x.
+    # patches by ``refine_and_smooth_region``, whose systems are small. Asking for the hierarchy
+    # unconditionally took ``holes.fill_smooth`` to **0.21x** on ``holes_many``: every patch paid a
+    # 15 ms setup to save nothing.
+    #
+    # What separates a patch from a region is *not* what three earlier attempts looked for. Size,
+    # Jacobi iteration count and probe-rate extrapolation all interleave the two classes, and a
+    # size threshold on its own is refuted outright by this function's own population: a patch of
+    # 1 000 unknowns loses under a forced hierarchy while ``bunny_decimated``'s 2 043-unknown
+    # region wins 2.23x. The axis that does separate them is the operator's off-diagonal dominance
+    # crossed with a size floor, which is what ``"auto"`` now gates on -- ``linalg``'s
+    # ``CG_MULTIGRID_DOMINANCE`` carries all 29 systems and the one 1.26x it forgoes. End to end
+    # against forcing Jacobi: **2.02x** on ``bunny_decimated``'s benchmarked region, 1.80x on
+    # ``bunny``'s and 1.58x on a 10 239-unknown icosphere, with all four hole-patch chains flat at
+    # 0.98-1.04x.
     twl.solve_spd_columns(
         system,
         twt.as_array2d(atb, wp.float64),

@@ -8,6 +8,7 @@ Mesh AABB queries against a brute-force reference; closest-on-mesh tests compare
 from __future__ import annotations
 
 import math
+import unittest.mock
 
 import igl
 import numpy as np
@@ -37,6 +38,7 @@ from tests.conversions import (
     trimesh_to_warp,
 )
 from triwarp.constants import TOLERANCE_MERGE
+from triwarp.kernels import proximity as kernel_proximity
 
 
 def _queries_in_bounds_np(mesh_tm: tm.Trimesh, n: int, seed: int) -> np.ndarray:
@@ -508,6 +510,69 @@ def test_mesh_to_mesh_distance_when_the_vertex_bound_is_the_answer(device: str) 
         assert face_b >= 0
         assert np.isclose(distance, max(gap, 0.0), rtol=1e-5, atol=1e-6)
         assert np.isclose(distance, float(np.sqrt(result_ml.distSq)), rtol=1e-5, atol=1e-6)
+
+
+def test_mesh_to_mesh_distance_tiled_pass_agrees_with_the_capped_one(device: str) -> None:
+    """
+    Triwarp against triwarp: the block-cooperative second pass against the thread pass alone.
+
+    ``mesh_to_mesh_distance`` splits its broad phase in two on CUDA -- a thread per query face,
+    capped at ``_QUERY_CANDIDATE_CAP`` candidates, then a whole block per face that exceeded the
+    cap -- because the traversal is a long tail on a flat floor (98 % of faces return no candidate,
+    0.5 % carry half the work). The oracle for the *value* is
+    ``test_mesh_to_mesh_distance_when_the_vertex_bound_is_the_answer`` above, which compares against
+    MeshLib; what this pins is that routing a face through the tiled walk instead of the serial one
+    does not change the answer.
+
+    The cap is driven to ``1`` so that every face with any candidate at all overflows, which is the
+    configuration that exercises the tiled kernel hardest; the reference run raises it past any
+    possible candidate count so the tiled pass never launches. On the cpu device the split is
+    disabled outright (``wp.launch_tiled`` runs one lane per block there) and both runs take the
+    same path, which makes this a no-op rather than a skip.
+
+    The witness ``face_b`` is deliberately **not** compared: the two walks tie-break differently and
+    the ties are real, which the function's own note measures.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    shifted_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    shifted_tm.apply_translation([2.05, 0.3, 0.0])
+    a_vertices_wp, a_faces_wp = numpy_to_warp(
+        np.asarray(sphere_tm.vertices), np.asarray(sphere_tm.faces).ravel().astype(np.int32), device
+    )
+    b_vertices_wp, b_faces_wp = numpy_to_warp(
+        np.asarray(shifted_tm.vertices),
+        np.asarray(shifted_tm.faces).ravel().astype(np.int32),
+        device,
+    )
+    tiled_launches = []
+    real_launch_tiled = wp.launch_tiled
+    tiled_kernel = kernel_proximity.face_to_mesh_distance_tiled
+
+    def counting_launch_tiled(*args, **kwargs):
+        # Keyed on the kernel, not on the call: ``tw.reduce.min`` derives this function's upper
+        # bound through a tiled launch of its own, so counting every ``launch_tiled`` would make
+        # the non-vacuity assertion below pass with the split disabled -- measured, it did.
+        if kwargs.get("kernel", args[0] if args else None) is tiled_kernel:
+            tiled_launches.append(kwargs.get("dim", None))
+        return real_launch_tiled(*args, **kwargs)
+
+    with unittest.mock.patch.object(tw.proximity, "_QUERY_CANDIDATE_CAP", 1):
+        with unittest.mock.patch.object(wp, "launch_tiled", counting_launch_tiled):
+            split = tw.proximity.mesh_to_mesh_distance(
+                a_vertices_wp, a_faces_wp, b_vertices_wp, b_faces_wp
+            )
+    with unittest.mock.patch.object(tw.proximity, "_QUERY_CANDIDATE_CAP", 1 << 30):
+        whole = tw.proximity.mesh_to_mesh_distance(
+            a_vertices_wp, a_faces_wp, b_vertices_wp, b_faces_wp
+        )
+
+    if wp.get_device(device).is_cuda:
+        # Non-vacuity: without this the test passes when the tiled pass never runs at all.
+        assert tiled_launches, "a cap of 1 must reach the tiled pass at all"
+        assert tiled_launches[0], "the tiled pass must be handed a non-empty overflow list"
+    assert np.isclose(split[0], whole[0], rtol=1e-6, atol=1e-9)
+    assert split[1] == whole[1]
+    assert split[0] > 0.0
 
 
 def test_mesh_to_mesh_distance_upper_bound_and_edge_cases(device: str) -> None:
