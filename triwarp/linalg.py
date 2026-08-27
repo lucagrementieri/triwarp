@@ -90,6 +90,34 @@ Dirichlet system converges in a tenth the iterations, runs **0.48-0.53x**, and `
 ``k=1`` runs **0.43-1.13x**. Cutting that setup is the lever that would make it unconditional, and
 the term to cut is ``bsr_mm``'s ~0.84 ms per call.
 
+**A GPU sparse direct solver was measured and declined for the same reason the multilevel one is
+gated.** The references this family loses to factor (``Eigen::SimplicialLDLT``), and the obvious
+untried lever was a GPU factorization: cuDSS 0.8 through ``nvmath-python`` 1.0 and CuPy, on the
+*real* ``(Q_uu, rhs)`` systems captured from ``solve_spd_columns``, substituted for the CG and timed
+end to end, interleaved, ``min`` of 3 (RTX 5090, 2026-08-27):
+
+| call | warp CG | cuDSS | dominance |
+|---|---|---|---|
+| ``smooth_region`` bunny_decimated | 32.2 ms | **22.2** (1.45x) | 3.00 |
+| ``smooth_region`` bunny | 72.0 | **44.8** (1.61x) | 2.50 |
+| ``harmonic k=2`` saddle_small | 36.7 | **26.3** (1.40x) | 2.63 |
+| ``harmonic k=2`` saddle | 68.0 | **60.4** (1.13x) | 2.66 |
+| ``harmonic k=2`` hemisphere | 58.6 | 85.5 (**0.68x**) | 1.94 |
+| ``harmonic k=1``, the same three | 7.0-11.5 | 22.2-74.4 (**0.12-0.31x**) | 1.00-1.19 |
+
+Its cost is the host-side symbolic plan (30-160 ms; AMD reordering is 1.7-2x faster than cuDSS's
+default, and its threading layer buys nothing reliable), against 0.8-4.4 ms to factor and 0.3-0.6 ms
+to solve. That cost is flat in conditioning, so it wins exactly on the systems
+``CG_MULTIGRID_DOMINANCE`` already routes to a hierarchy and loses 3-8x everywhere CG converges
+quickly -- the same split as the table below, with a worse losing side. It would also be an
+optional CUDA-only dependency (a 143 MB ``libcudss`` plus ~275 MB of CuPy, not on the loader path by
+default), and a direct solver is singular on the empty rows CG tolerates (unreferenced free vertices
+-- 7 on ``bunny_decimated``, 297 on ``bunny`` -- which a caller would have to pin and restore).
+Declined as a one-shot backend. The one number worth keeping from it: a **plan reused** across
+solves of one sparsity pattern costs **0.95-4.2 ms** to refactor and solve, so a factor-once,
+solve-many object would be the shape if a caller with that loop ever loses a row (``arap`` has the
+loop and wins 3-14x already).
+
 **Nothing cheap predicts which side of that line a system falls on**, which is why the third mode is
 a capped probe and not a heuristic; see
 [`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS] for the two predictors that were built

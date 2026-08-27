@@ -707,6 +707,22 @@ def _run_hole_dp(
     One launch per triangulation span **across all loops**, so the launch count is
     ``max(B) - 1`` for the whole mesh rather than ``B - 1`` per hole.
 
+    **That launch count is the floor on this stack, and folding the spans into one persistent
+    block per loop was built and is refuted.** Each span launch costs ~25 us with the GPU mostly
+    idle, so a ``wp.launch_tiled(dim=(n_loops,))`` kernel that loops over the spans internally --
+    lanes striding the ``(interval, apex)`` pairs, ``wp.atomic_min`` on the cost, a second pass for
+    the smallest attaining apex, ``wp.tile_sum`` as the level barrier -- looked like the obvious
+    lever. It reproduces this engine's ``dp`` / ``prev`` **byte for byte** and loses at every size
+    that matters, measured under ``fill_min_weight`` on two rims of ``B`` (RTX 5090, Warp 1.16,
+    interleaved, ``min`` of 3): ``B = 128`` 5.13 -> 5.75 ms (0.89x), ``B = 512`` 12.93 -> **106.8**
+    (0.12x), ``B = 2048`` 124.4 -> **4 914** (0.03x). The barriers are ~1.5 ms of the 107; the rest
+    is the ``B^3 / 6`` apex evaluations (22 M at ``B = 512``) running on **one SM** of ~170, where
+    510 launches at the floor still spread them over the whole device. Beating both needs
+    whole-GPU work between cheap level barriers -- a grid-wide barrier, which Warp does not expose
+    (no cooperative groups, no fence). Do not re-propose "one block per loop"; the remaining levers
+    are a different algorithm for long rims or a captured graph where an identical span sequence
+    genuinely repeats.
+
     ``tiled`` selects the per-span engine: a block per interval with its lanes striding the apex
     loop, or one thread per interval. Both produce byte-identical ``dp`` / ``prev`` on **both**
     devices, so this is a pure cost knob and ``None`` picks whichever is faster on the device at
