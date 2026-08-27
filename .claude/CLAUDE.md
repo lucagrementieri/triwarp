@@ -101,10 +101,25 @@ kernel is not available.
 
 Read `kernels/visibility.py::obscurance` (one block per point, lanes over its ray bundle, measured
 3.2-11.8x against one thread per point) for the first form and `kernels/measures.py::centroid_tiled`
-for the second. A kernel with an **outer per-item dimension** and an inner sequence — one query, one
-face, one direction, one candidate frame — is always eligible for the first, and four in this tree
-still run the arg-strided form on CUDA because they were written while the rule was believed to be a
-blanket prohibition.
+for the second.
+
+**Eligibility is an occupancy question, not a shape question, and getting that backwards costs 2-8x.**
+Having an outer per-item dimension is necessary and not sufficient: the block-per-item form pays
+exactly when that outer dimension *alone* would starve the device. `obscurance` qualified because it
+launched `dim = n_points` — 8 171 threads, under 3 % of an RTX 5090 — with no second dimension at
+all. A kernel that already carries a **slice dimension** does not qualify, because that dimension is
+what fills the device and collapsing it into `block_dim` lanes throws the occupancy away. Measured on
+`points.hull_support_extremes`, converting it both ways:
+
+| points | grid today | block-per-direction |
+|---|---|---|
+| 5 000 | 13 x 40 threads | **2.3x faster** (the grid was starved) |
+| 200 000 | 13 x 1 563 threads | **0.12-0.60x — a 2-8x loss** (13 blocks on 170 SMs) |
+
+`proximity.winding_number_tiled` shows the same trend from the other end: 2.16x at 1 280 faces and
+4 096 queries, 1.19x at 5 120 faces, **1.01x** at 65 536 queries — a gain that shrinks to nothing as
+the grid fills, which section 13 calls a decline rather than a small win. So four kernels in this tree
+keep the arg-strided form deliberately, and each says so with its number.
 
 ### Fusing a kernel: extract the shared part as a `@wp.func` in the same commit
 

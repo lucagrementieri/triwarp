@@ -406,9 +406,21 @@ def hull_support_extremes(
     # `farthest_point_sample_block` below is the other side of the rule, and reduces with
     # `wp.tile_max` on both devices because its stride *is* `wp.block_dim()`.
     #
-    # Converting this kernel to one block per direction is open and unmeasured -- the analogous
-    # rewrite of `kernels/visibility.py::obscurance` measured 3.2-11.8x -- and needs the
-    # `convex_subset` benchmark group's A/B before it lands.
+    # **Converting this to one block per direction was measured and refuted**, which is worth
+    # recording because the analogous rewrite of `kernels/visibility.py::obscurance` measured
+    # 3.2-11.8x and the shapes look alike. They are not: `obscurance` launched `dim = n_points` with
+    # no second dimension, so the outer dimension alone was starving the device (8 171 threads),
+    # while this kernel's *slice* dimension is what fills it. Collapsing that into `block_dim` lanes
+    # leaves one block per direction. Measured on an RTX 5090, interleaved, `min` of 11, answers
+    # bit-identical:
+    #
+    # | points  | grid here      | block per direction        |
+    # |---------|----------------|----------------------------|
+    # |   5 000 | 13 x 40        | 2.3x faster                |
+    # | 200 000 | 13 x 1 563     | **0.12-0.60x -- a 2-8x loss** |
+    #
+    # The win is at the size where the call is already 0.056 ms and the loss where it matters, which
+    # is section 13's decline shape exactly. Do not re-propose it from the comment above.
     local_max = wp.float32(-FLOAT32_INF_CONSTANT)
     local_min = wp.float32(FLOAT32_INF_CONSTANT)
     for i in range(j, n_p, n_slices):

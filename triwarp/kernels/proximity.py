@@ -328,10 +328,18 @@ def winding_number_tiled(
     # `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 3, and
     # `face_to_mesh_distance_tiled` below for the other side of the rule.
     #
-    # This is the strongest candidate in the tree for the block-per-query rewrite, and it is open:
-    # the query dimension is already the outer one, the walk is over every face, and converting
-    # would also retire `winding_number` above -- the CPU-only serial sibling this kernel exists to
-    # avoid. The `winding_number` benchmark group is where its A/B belongs.
+    # **The block-per-query rewrite was measured here and declined.** It looked like the strongest
+    # candidate in the tree -- the query dimension is already the outer one and the walk covers
+    # every face -- and the gain evaporates as the grid fills. Measured on an RTX 5090,
+    # interleaved, `min` of 9, agreeing to 6e-07 (a different summation order, not a different
+    # answer): **2.16x** at 1 280 faces and 4 096 queries, **1.19x** at 5 120 faces, **1.01x** at
+    # 5 120 faces and 65 536 queries. A gain that shrinks with the input is a decline (CLAUDE.md
+    # section 13), and the reason is that this grid is `n_queries x n_face_slices` and already
+    # wide; see `kernels/points.py::hull_support_extremes` for the same trade measured to an
+    # outright 2-8x loss.
+    #
+    # Note this is *not* why `winding_number` above exists -- that is the public `tiled=False`
+    # exact-sum reference, with its own benchmark group, and no conversion here would retire it.
     q, j = wp.tid()
     p = query_points[q]
     total = wp.float32(0.0)

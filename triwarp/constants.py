@@ -77,6 +77,12 @@ TILES_PER_BLOCK_1D = 16
 # ``kernels/visibility.py::obscurance`` for a lane-parallel kernel that is correct on both devices
 # because it strides by ``wp.block_dim()``.
 #
+# **And converting the four consumers of this constant to that form is measured and declined**, so
+# the constant stays: the block-per-item shape pays only where the *outer* dimension alone starves
+# the device, and the whole point of a slice dimension is that it does not. Measured on
+# ``hull_support_extremes``, 2.3x faster at 5 000 points and **0.12-0.60x at 200 000** -- the
+# numbers are on that kernel.
+#
 # The optimum splits by device, so there are two values and
 # [`items_per_slice`][triwarp._device.items_per_slice] picks between them; do not read either
 # directly. Swept over 8-256 on a 5k and a 200k point cloud (hull support extremes) plus the

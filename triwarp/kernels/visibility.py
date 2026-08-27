@@ -231,9 +231,11 @@ def support_argmax_tiled(
     # other side of the rule -- one block per point, striding by `wp.block_dim()`, `wp.tile_sum` on
     # both devices.
     #
-    # Converting this to one block per deferred query is open and unmeasured; `obscurance`'s own
-    # conversion measured 3.2-11.8x, and the `max_tangent_sphere_reach` benchmark group is where
-    # this one's A/B belongs.
+    # Converting this to one block per deferred query is the same trade
+    # `kernels/points.py::hull_support_extremes` records and it is **declined for the same measured
+    # reason**: the slice dimension is what fills the device here, so the block form leaves one
+    # block per query and loses 2-8x once the cloud is large. `obscurance` above qualified because
+    # it had no slice dimension at all.
     q, j = wp.tid()
     normal = normals[support_indices[q]]
     best = wp.float32(-wp.inf)
