@@ -8,6 +8,26 @@ from triwarp.kernels.tangent_space import any_perpendicular
 WEIGHT_COSINE = wp.constant(wp.int32(0))  # Lambert's cosine law: the physical ambient integral
 WEIGHT_UNIFORM = wp.constant(wp.int32(1))  # every direction counts once (libigl's convention)
 
+# Lanes per point for the bundle kernels below, which are launched with ``wp.launch_tiled`` -- one
+# *block* per point, its lanes striding the ray bundle. One *thread* per point was the natural
+# spelling and it starves the device: ``dim = n_points`` is 8 171 threads on ``bunny_decimated``,
+# under 3 % of what an RTX 5090 can hold, each walking 64-256 BVH queries in sequence. Measured on
+# ``ambient_occlusion`` (RTX 5090, Warp 1.16, interleaved, ``min`` of 3, results bit-identical):
+#
+# | points          | rays | thread per point | block per point (64 lanes) |         |
+# |-----------------|------|------------------|----------------------------|---------|
+# | bunny_decimated |   64 |          6.35 ms |                    1.14 ms |  5.6x   |
+# | bunny_decimated |  256 |         23.15    |                    1.96    | 11.8x   |
+# | bunny           |   64 |          7.75    |                    2.43    |  3.2x   |
+# | bunny           |  256 |         28.83    |                    6.47    |  4.5x   |
+#
+# 32 lanes measures the same as 64 to within noise; 256 loses 2.3x on ``bunny`` at 64 rays, where
+# most lanes then sit idle. The stride below is ``wp.block_dim()``, not this constant, so the same
+# kernel is correct on the CPU device, where ``wp.launch_tiled`` runs one lane per block and
+# ``wp.block_dim()`` reads 1: that lane covers every ray and the tile reductions return its own sum
+# (the ``kernels/holes.py::fill_dp_span_tiled`` convention).
+BUNDLE_BLOCK = 64
+
 
 @wp.func
 def bundle_direction(
@@ -62,13 +82,16 @@ def obscurance(
     # ``tau`` gives Iones et al.'s volumetric obscurance, where an occluder at distance ``t``
     # contributes ``exp(-tau t)`` so a distant wall barely darkens the point. Binary occlusion is
     # the ``tau -> 0`` limit of that, since a ray that escapes contributes nothing either way.
-    i = wp.int32(wp.tid())
+    #
+    # One block per point, lanes striding the bundle (see ``BUNDLE_BLOCK``); each lane accumulates
+    # its rays and the two block sums below combine them.
+    i, t = wp.tid()
     axis, basis_x, basis_y, origin = hemisphere_frame(points, normals, i, offset, wp.float32(1.0))
 
     n_rays = directions.shape[0]
     total_weight = wp.float32(0.0)
     total_blocked = wp.float32(0.0)
-    for r in range(n_rays):
+    for r in range(t, n_rays, wp.block_dim()):
         local = directions[r]
         # A hemisphere lattice has ``local[2] == dot(direction, normal)`` by construction, so the
         # cosine weight is already there and needs no dot product.
@@ -85,10 +108,12 @@ def obscurance(
             else:
                 total_blocked += weight
 
-    if total_weight <= 0.0:
-        out_occlusion[i] = 0.0
-        return
-    out_occlusion[i] = total_blocked / total_weight
+    block_weight = wp.tile_sum(wp.tile(total_weight))[0]
+    block_blocked = wp.tile_sum(wp.tile(total_blocked))[0]
+    if t == 0:
+        out_occlusion[i] = wp.where(
+            block_weight <= 0.0, wp.float32(0.0), block_blocked / block_weight
+        )
 
 
 @wp.kernel
@@ -111,7 +136,10 @@ def shape_diameter(
     # average. The pass structure is dictated by that -- distances go into ``scratch`` first,
     # because the second pass must revisit them against a mean and deviation the first pass had not
     # finished computing yet, and re-casting the rays instead would double the only expensive part.
-    i = wp.int32(wp.tid())
+    #
+    # One block per point, lanes striding the bundle in both passes (see ``BUNDLE_BLOCK``); the
+    # per-lane sums are combined block-wide, so every lane holds the same mean and deviation.
+    i, t = wp.tid()
     # Inward, so the bundle's axis is ``-normal`` and the origin steps *below* the surface.
     axis, basis_x, basis_y, origin = hemisphere_frame(points, normals, i, offset, wp.float32(-1.0))
 
@@ -119,7 +147,7 @@ def shape_diameter(
     total = wp.float32(0.0)
     total_sq = wp.float32(0.0)
     hits = wp.float32(0.0)
-    for r in range(n_rays):
+    for r in range(t, n_rays, wp.block_dim()):
         local = directions[r]
         query = wp.mesh_query_ray(
             mesh_id, origin, bundle_direction(local, axis, basis_x, basis_y), max_t
@@ -131,25 +159,31 @@ def shape_diameter(
             total_sq += distance * distance
             hits += 1.0
         scratch[i, r] = distance
+    # The three reductions are also the barrier the second pass needs before reading ``scratch``.
+    total = wp.tile_sum(wp.tile(total))[0]
+    total_sq = wp.tile_sum(wp.tile(total_sq))[0]
+    hits = wp.tile_sum(wp.tile(hits))[0]
 
     if hits == 0.0:
-        out_diameter[i] = wp.inf  # an open surface with nothing on the other side
+        if t == 0:
+            out_diameter[i] = wp.inf  # an open surface with nothing on the other side
         return
     mean = total / hits
     deviation = wp.sqrt(wp.max(0.0, total_sq / hits - mean * mean))
 
     kept = wp.float32(0.0)
     weighted = wp.float32(0.0)
-    for r in range(n_rays):
+    for r in range(t, n_rays, wp.block_dim()):
         distance = scratch[i, r]
         if not wp.isinf(distance) and wp.abs(distance - mean) <= trim * deviation:
             weight = directions[r][2]  # cosine of the angle from the cone axis
             kept += weight
             weighted += weight * distance
-    if kept <= 0.0:
-        out_diameter[i] = mean  # every ray trimmed away (only possible at trim = 0)
-        return
-    out_diameter[i] = weighted / kept
+    kept = wp.tile_sum(wp.tile(kept))[0]
+    weighted = wp.tile_sum(wp.tile(weighted))[0]
+    if t == 0:
+        # ``kept <= 0``: every ray trimmed away (only possible at trim = 0), fall back to the mean.
+        out_diameter[i] = wp.where(kept <= 0.0, mean, weighted / kept)
 
 
 @wp.func

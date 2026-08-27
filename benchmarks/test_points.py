@@ -57,11 +57,15 @@ Three groups have no triwarp-side neighbour table to hoist, because they take th
 | ``point_duplicate_mask`` | 1.40 ms | 6.18 ms | 4.4x (15x on ``sphere_large``) |
 | ``farthest_point_sample`` at 64 / 1024 | 1.92 / 32.3 ms | 2.94 / 41.9 ms | 1.5x / 1.3x |
 
-The last row is the one to read carefully: the greedy loop is ``Theta(count)`` launches over the
-whole cloud, so at ``count = 1024`` its 32 ms is ~2 000 launches of marshalling and essentially no
-kernel time. That is why it barely beats a serial C++ loop, and why the count -- not the mesh -- is
-its axis. On ``sphere_small`` (2 562 points) every one of the three *loses*, by 4x to 10x, for the
-same reason in miniature: the launch floor does not shrink with the cloud.
+The last row is the one to read carefully, and it is stale by two rewrites. Those numbers are from
+when the greedy loop was ``Theta(count)`` *launches* over the whole cloud -- ~2 000 launches of
+marshalling and essentially no kernel time at ``count = 1024``. Capturing one round and replaying it
+took the row to 21.1 / 4.32 ms (``sphere_med`` / ``sphere_small``), and the whole sweep is now **one
+persistent block** (``kernels/points.py::farthest_point_sample_block``): 9.5-10.1 / 1.11 ms, so
+``sphere_small`` at ``count = 1024`` reads 1.11 against open3d's 2.28 and wins where the
+launch-bound
+form lost 4x. The count is still the axis -- it is the number of dependent rounds -- but a round now
+costs about a microsecond of block time rather than a launch.
 
 MeshLab has nothing for ``fit_line`` / ``major_axis``, ``point_plane_distance``, ``vector_angle`` or
 ``radial_sort``: those are array primitives rather than filters.
@@ -175,8 +179,8 @@ _RADIUS_SCALES = [2.0, 4.0]
 # itself included.
 _MIN_NEIGHBORS = 6
 
-# Sample counts for ``farthest_point_sample``. The greedy loop is Theta(count) launches over the
-# whole cloud, so this axis is the launch count and the step between the two is 16x.
+# Sample counts for ``farthest_point_sample``. The greedy sweep is Theta(count) dependent rounds of
+# one persistent block, so this axis is the round count and the step between the two is 16x.
 _SAMPLE_COUNTS = [64, 1024]
 
 # Fixed plane / sort axis, deliberately not axis-aligned so no branch is skipped.
@@ -765,11 +769,12 @@ def test_point_duplicate_mask(bench_case: BenchCase) -> None:
 @pytest.mark.parametrize("count", _SAMPLE_COUNTS)
 def test_farthest_point_sample(bench_case: BenchCase, count: int) -> None:
     """
-    The greedy maximin subsample, swept over the sample count -- which is the launch count.
+    The greedy maximin subsample, swept over the sample count -- which is the round count.
 
-    Inherently sequential in ``count``: each iteration folds one selected point into the running
-    distances and takes a global arg-max, so the work is ``Theta(count)`` launches over the whole
-    cloud however small the sample is. That makes this the one group in the module whose slope is
+    Inherently sequential in ``count``: each round folds one selected point into the running
+    distances and takes a global arg-max, so the work is ``Theta(count)`` rounds over the whole
+    cloud however small the sample is -- run as one persistent block with a ``wp.tile_max`` per
+    round, not as one launch per round. That makes this the one group in the module whose slope is
     set by a *parameter* rather than by the mesh, and the two counts here are a 16x step in it.
 
     open3d's ``FarthestPointDownSample`` runs the identical loop serially in C++ on one core, so

@@ -994,9 +994,9 @@ def farthest_point_sample(
     output over the cloud's *support* rather than its density — so unlike
     [`triwarp.voxels.voxel_down_sample`][triwarp.voxels.voxel_down_sample] it returns an exact
     count, and unlike a random subsample it cannot leave a hole. The greedy choice makes it
-    inherently sequential in ``count``: each iteration is one pass over the cloud, fused so that
-    the distance update and the global arg-max share a launch and nothing is read back to the host
-    in between.
+    inherently sequential in ``count``, and the whole sweep runs as **one persistent block** on the
+    device: each round folds the newest sample into every point's running distance and takes the
+    global arg-max as a block reduction, so nothing is launched or read back per round.
 
     Parameters
     ----------
@@ -1058,54 +1058,23 @@ def farthest_point_sample(
     if not 0 <= start < n:
         raise ValueError(f"start must be in [0, {n}), got {start}")
 
-    cursor = wp.empty(1, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_points.seed_farthest_point,
-        dim=1,
-        inputs=[wp.int32(start), out_selected, cursor],
+    # Scratch for the running squared distance to the chosen set; the kernel initializes it.
+    min_distance_sq = wp.empty(n, dtype=wp.float32, device=device)
+    block_dim = (
+        kernel_points.FARTHEST_BLOCK_LARGE
+        if n >= kernel_points.FARTHEST_BLOCK_LARGE_FROM
+        else kernel_points.FARTHEST_BLOCK_SMALL
+    )
+    # The whole greedy sweep is one persistent block -- see the kernel for why that wins here and
+    # the constants for the measured widths. It replaced a captured two-kernel round replayed
+    # ``count - 1`` times: 4.32 -> 1.20 ms at ``count=1024`` on 2 562 points, 21.1 -> 9.5 on 40 962.
+    wp.launch_tiled(
+        kernel_points.farthest_point_sample_block,
+        dim=(1,),
+        inputs=[points, wp.int32(start), wp.int32(count), min_distance_sq, out_selected],
+        block_dim=block_dim,
         device=device,
     )
-    if count == 1:
-        return out_selected
-
-    min_distance_sq = wp.full(n, wp.float32(math.inf), dtype=wp.float32, device=device)
-    # One int64 accumulator, re-armed by ``commit_farthest_point`` so the loop is two launches per
-    # iteration rather than three -- and so the selected index never crosses to the host, which is
-    # what keeps a ``count``-long loop off the ~0.1 ms-per-readback budget.
-    best = wp.array([wp.int64(-1)], dtype=wp.int64, device=device)
-
-    def iteration() -> None:
-        wp.launch(
-            kernel_points.advance_farthest_point,
-            dim=n,
-            inputs=[points, out_selected, cursor, min_distance_sq, best],
-            device=device,
-        )
-        wp.launch(
-            kernel_points.commit_farthest_point,
-            dim=1,
-            inputs=[best, out_selected, cursor],
-            device=device,
-        )
-
-    # The greedy sweep is inherently sequential -- ``count - 1`` rounds of two dependent launches --
-    # so its host cost is the whole story on a small cloud: measured 2 049 launches and **79 %
-    # host** for ``count=1024`` on 2 562 points, against 34 % on 40 962 points where the distance
-    # update is real work. With the step counter on the device every round issues the identical
-    # pair, so one round is captured and every round is a replay: ~1.17 us against ~13.4 us issued.
-    # Capturing costs about what issuing costs, so capturing the *whole* loop would buy nothing --
-    # the win is that one captured round is replayed ``count - 1`` times. Measured at
-    # ``count=1024``: 28.75 -> 4.34 ms (6.6x) on 2 562 points, and 28.85 -> 21.12 ms (1.37x) on
-    # 40 962, where the per-round device work is real and the host was never the limit.
-    if not wp.get_device(device).is_cuda:
-        for _ in range(count - 1):
-            iteration()
-        return out_selected
-    with wp.ScopedCapture(device) as capture:
-        iteration()
-    # Capture *records* the round without executing it, so all ``count - 1`` rounds are replays.
-    for _ in range(count - 1):
-        wp.capture_launch(capture.graph)
     return out_selected
 
 

@@ -226,9 +226,11 @@ def _occlusion_bundle(
 
     normals, diagonal = _resolve_normals_and_radius(mesh, points, normals, name)
     directions = tw.sample.sample_fibonacci_hemisphere(n_rays, device=device)
-    wp.launch(
+    # One block per point, lanes over the bundle -- see ``kernel_visibility.BUNDLE_BLOCK`` for the
+    # 3-12x this is worth over a thread per point, and why the width is 64.
+    wp.launch_tiled(
         kernel_visibility.obscurance,
-        dim=m,
+        dim=(m,),
         inputs=[
             mesh.id,
             points,
@@ -240,6 +242,7 @@ def _occlusion_bundle(
             wp.float32(_SURFACE_OFFSET * max(diagonal, 1e-12)),
             out_occlusion,
         ],
+        block_dim=kernel_visibility.BUNDLE_BLOCK,
         device=device,
     )
     return out_occlusion
@@ -346,9 +349,9 @@ def shape_diameter(
     # finished computing; re-tracing instead would double the only expensive part of the kernel.
     scratch = twt.empty_2d((m, n_rays), wp.float32, device=device)
     out_diameter = wp.empty(m, dtype=wp.float32, device=device)
-    wp.launch(
+    wp.launch_tiled(
         kernel_visibility.shape_diameter,
-        dim=m,
+        dim=(m,),
         inputs=[
             mesh.id,
             points,
@@ -360,6 +363,7 @@ def shape_diameter(
             scratch,
             out_diameter,
         ],
+        block_dim=kernel_visibility.BUNDLE_BLOCK,
         device=device,
     )
     return out_diameter

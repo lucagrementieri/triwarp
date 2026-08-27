@@ -312,49 +312,63 @@ def nearest_pair_keys(
     out_keys[i] = pack_nearest_key(nearest_distances[i, 1], i)
 
 
-@wp.kernel
-def seed_farthest_point(
-    start: wp.int32, out_selected: wp.array[wp.int32], out_cursor: wp.array[wp.int32]
-) -> None:
-    # ``out_cursor`` is the loop's step counter, kept on the device so the iteration's two launches
-    # take the same arguments every time and the body can be captured once and replayed.
-    out_selected[0] = start
-    out_cursor[0] = 0
+# Lanes per block for ``farthest_point_sample_block``, keyed on the cloud size. Measured on an RTX
+# 5090, Warp 1.16, ``count = 1024``, against the capture-and-replay loop it replaced (two replayed
+# kernels per sample, ~2 us each): 2 562 points 4.32 -> 1.20 ms at 256 lanes (1.37 at 1024);
+# 10 242 points 8.51 -> 3.51 at 1024 (8.43 at 256, 4.82 at 512); 40 962 points 21.1 -> 9.5 at 1024
+# (30.5 at 256). The crossover is somewhere in (2 562, 10 242) and 4 096 splits the bracket.
+FARTHEST_BLOCK_SMALL = 256
+FARTHEST_BLOCK_LARGE = 1024
+FARTHEST_BLOCK_LARGE_FROM = 4096
 
 
 @wp.kernel
-def advance_farthest_point(
+def farthest_point_sample_block(
     points: wp.array[wp.vec3],
-    selected: wp.array[wp.int32],
-    cursor: wp.array[wp.int32],
+    start: wp.int32,
+    count: wp.int32,
     min_distance_sq: wp.array[wp.float32],
-    best: wp.array[wp.int64],
+    out_selected: wp.array[wp.int32],
 ) -> None:
-    # One greedy iteration, fused: fold the point just selected into each point's running distance
-    # to the chosen set, then have the same thread contribute its own updated value to the global
-    # argmax. No cross-thread dependency to synchronize -- thread ``i`` reads and writes only
-    # ``min_distance_sq[i]`` -- which is what lets the update and the reduction share a launch.
+    # The whole greedy sweep in one persistent block: ``count - 1`` rounds, each folding the point
+    # just selected into every point's running distance to the chosen set and taking the global
+    # arg-max, with ``wp.tile_max`` as both the reduction and the round barrier. Lane ``t`` owns
+    # the points ``t, t + block_dim, ...`` throughout, so no other synchronization is needed --
+    # including none between the initialization below and the first round.
     #
-    # The step comes from ``cursor`` rather than from a kernel argument, so every iteration issues
-    # the identical launch and the wrapper can capture one iteration and replay it.
-    i = wp.int32(wp.tid())
-    chosen = points[selected[cursor[0]]]
-    distance_sq = wp.length_sq(points[i] - chosen)
-    if distance_sq < min_distance_sq[i]:
-        min_distance_sq[i] = distance_sq
-    wp.atomic_max(best, 0, pack_farthest_key(min_distance_sq[i], i))
-
-
-@wp.kernel
-def commit_farthest_point(
-    best: wp.array[wp.int64], out_selected: wp.array[wp.int32], out_cursor: wp.array[wp.int32]
-) -> None:
-    # Decode the winning key into the next sample, advance the step and re-arm the accumulator, so
-    # the loop needs no separate reset launch, no host readback and no per-iteration argument.
-    step = out_cursor[0] + 1
-    out_selected[step] = unpack_ranked_index(best[0])
-    out_cursor[0] = step
-    best[0] = wp.int64(-1)
+    # Why a single block wins here where it loses elsewhere (``kernels/holes.py::
+    # fill_dp_span_tiled`` measured the opposite): a round is ``n`` distance updates, which one SM
+    # finishes in about a
+    # microsecond, and the alternative -- one launch per round, even replayed from a captured graph
+    # -- paid ~2 us of launch per kernel with the device idle. So the per-round cost is what moved,
+    # 3.6x on 2 562 points and 2.2-2.5x on 10k-41k (see ``FARTHEST_BLOCK_SMALL``). The tie-break is
+    # the shipped one: ``pack_farthest_key`` orders equal distances towards the lower index, and the
+    # block max over those keys is the same maximum whatever lane holds it, so the selection is
+    # reproducible and matches the reference's strict ``>`` arg-max.
+    #
+    # ``min_distance_sq`` is caller-allocated scratch, initialized here rather than by ``wp.full``
+    # so the wrapper is one launch. The stride is ``wp.block_dim()`` rather than the constant so the
+    # kernel is also correct on the CPU device, where ``wp.launch_tiled`` runs one lane per block
+    # and ``wp.block_dim()`` reads 1: that lane walks the whole cloud each round and the tile max
+    # returns its own key.
+    _block, t = wp.tid()
+    n = points.shape[0]
+    stride = wp.block_dim()
+    for i in range(t, n, stride):
+        min_distance_sq[i] = wp.inf
+    chosen_index = start
+    if t == 0:
+        out_selected[0] = start
+    for step in range(1, count):
+        chosen = points[chosen_index]
+        best = wp.int64(-1)
+        for i in range(t, n, stride):
+            distance_sq = wp.min(min_distance_sq[i], wp.length_sq(points[i] - chosen))
+            min_distance_sq[i] = distance_sq
+            best = wp.max(best, pack_farthest_key(distance_sq, i))
+        chosen_index = unpack_ranked_index(wp.tile_max(wp.tile(best))[0])
+        if t == 0:
+            out_selected[step] = chosen_index
 
 
 @wp.func
