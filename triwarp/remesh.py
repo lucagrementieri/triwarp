@@ -1794,8 +1794,9 @@ def _run_collapse_rounds(
     Commit independent sets of collapses against one scoring, until a round finds nothing new.
 
     Everything the loop decides with lives in two small device arrays -- ``budget``, and
-    ``round_state`` = [round index, commits as of the previous round, loop condition] -- so the body
-    holds no host readback and the whole loop is a single ``wp.capture_while`` graph.
+    ``round_state``, the shared round-loop state (``kernels/array.py``'s ``LOOP_ROUND`` /
+    ``LOOP_CONDITION``) with a third slot appended for the previous round's commit count -- so
+    the body holds no host readback and the whole loop is a single ``wp.capture_while`` graph.
 
     That is the point of the shape. A round is ~12 launches over an ``m`` that is tens of
     thousands wide, and it commits only ~65 collapses (measured on ``saddle_graded`` at
@@ -1826,7 +1827,7 @@ def _run_collapse_rounds(
         is defensive rather than known to be required.
     """
     budget = wp.zeros(1, dtype=wp.int32, device=device)
-    round_state = wp.zeros(3, dtype=wp.int32, device=device)
+    round_state = wp.zeros(kernel_remesh.COLLAPSE_STATE_SIZE, dtype=wp.int32, device=device)
     wp.launch(kernel_remesh.reset_collapse_rounds, dim=1, inputs=[round_state], device=device)
     # Sort scratch, allocated here rather than inside the body: ``radix_sort_pairs`` wants
     # double-width key and payload buffers, and a captured graph replays the *same* pointers, so the
@@ -1912,7 +1913,7 @@ def _run_collapse_rounds(
             device=device,
         )
 
-    condition = round_state[2:3]
+    condition = round_state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
     if capture and device.is_cuda and wp.is_conditional_graph_supported():
         with wp.ScopedCapture(device) as capture_scope:
             wp.capture_while(condition, round_body)

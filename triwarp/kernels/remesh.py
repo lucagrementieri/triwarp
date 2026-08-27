@@ -5,6 +5,8 @@ import warp as wp
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.adjacency import edge_endpoints, edge_pair_topology, write_face_edge_keys
 from triwarp.kernels.array import (
+    LOOP_CONDITION,
+    LOOP_ROUND,
     binary_search_sorted_contains,
     lowbias32,
     pack_edge_key,
@@ -33,6 +35,12 @@ from triwarp.kernels.triangles import (
     triangle_quality,
 )
 from triwarp.kernels.voxels import voxel_cell
+
+# The collapse round loop's third state slot, **appended** after ``array.LOOP_ROUND`` and
+# ``LOOP_CONDITION`` so the shared two keep their numbers: the total commits as of the end of
+# the previous round, which is how ``end_collapse_round`` decides whether a round progressed.
+COLLAPSE_COMMITS = wp.constant(wp.int32(2))
+COLLAPSE_STATE_SIZE = 3
 
 # Delaunay / Delone edge-flip constants. The flip predicate runs in float64 deliberately:
 # circumcircle diameters of near-degenerate triangles have too large a rounding error in float32,
@@ -1994,13 +2002,17 @@ def pad_unique_edge_tail(
 
 @wp.kernel
 def reset_collapse_rounds(out_state: wp.array[wp.int32]) -> None:
-    # dim=1. ``[round index, commits as of the previous round, loop condition]`` at the start of a
-    # pass. A kernel rather than ``array.assign``, because that is a host-to-device copy and the
-    # pass this runs inside is captured as a graph.
+    # dim=1. The round-loop state array at the start of a pass: ``array.LOOP_ROUND`` /
+    # ``LOOP_CONDITION`` in the shared first two slots, with this loop's own third appended (see
+    # ``COLLAPSE_COMMITS``). The condition starts at 1 because ``wp.capture_while`` reads it before
+    # the first round.
+    #
+    # A kernel rather than ``array.assign``, because that is a host-to-device copy and the pass this
+    # runs inside is captured as a graph.
     _ = wp.int32(wp.tid())
-    out_state[0] = 0
-    out_state[1] = 0
-    out_state[2] = 1
+    out_state[LOOP_ROUND] = 0
+    out_state[LOOP_CONDITION] = 1
+    out_state[COLLAPSE_COMMITS] = 0
 
 
 @wp.kernel
@@ -2255,17 +2267,17 @@ def end_collapse_round(
     max_rounds: wp.int32, count: wp.array[wp.int32], out_state: wp.array[wp.int32]
 ) -> None:
     # dim=1, last op of a round: decide whether another round against this same scoring is worth
-    # running. ``out_state`` is [round index, commits as of the previous round, loop condition].
+    # running. See ``reset_collapse_rounds`` for the slot table.
     #
     # It stops when the round committed nothing -- a further round cannot, since the state it
     # reads is then unchanged -- or at the round cap. A budget-exhausted pass stops through that
     # same test: ``begin_collapse_round`` writes a zero budget, so nothing commits.
     _ = wp.int32(wp.tid())
-    out_state[0] = out_state[0] + wp.int32(1)
-    progressed = count[0] > out_state[1]
-    out_state[1] = count[0]
-    keep_going = progressed and out_state[0] < max_rounds
-    out_state[2] = wp.where(keep_going, wp.int32(1), wp.int32(0))
+    out_state[LOOP_ROUND] = out_state[LOOP_ROUND] + wp.int32(1)
+    progressed = count[0] > out_state[COLLAPSE_COMMITS]
+    out_state[COLLAPSE_COMMITS] = count[0]
+    keep_going = progressed and out_state[LOOP_ROUND] < max_rounds
+    out_state[LOOP_CONDITION] = wp.where(keep_going, wp.int32(1), wp.int32(0))
 
 
 @wp.func

@@ -1362,8 +1362,10 @@ def _support_extremes(
     Each thread reduces a strided slice of the cloud, so the launch is sized by
     [`items_per_slice`][triwarp._device.items_per_slice] points per thread rather than by the point
     count -- enough parallelism to fill the device while keeping the number of atomics into the
-    ``n_directions`` accumulator slots low. This is the only reduction of this shape that still runs
-    the strided form on CUDA, which is why the slice length is chosen per device.
+    ``n_directions`` accumulator slots low. Four reductions still run the strided form on CUDA --
+    this one, ``visibility``'s support arg-max, ``proximity``'s winding-number sum and ``bounds``'
+    oriented-box extents -- and the slice length is chosen per device because this is the one they
+    were swept on.
     """
     device = points.device
     n_points = int(points.shape[0])

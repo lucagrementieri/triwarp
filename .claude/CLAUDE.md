@@ -67,6 +67,45 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
   compile. Widening or narrowing a scalar is the **constructor**: `wp.float32(x)`, `wp.float64(i)`.
 - Prepend output argument names with out_ and put them at the end of the kernel signature after all the input arguments. Two exemption classes, both carried as `_KERNEL_OUTPUT_ALLOWLIST` in `tests/api_conventions.py` (check 13): **in-place** arguments, where the same buffer is input and result (`sort_rows_insertion(data)`, the hole-filling DP tables) — an `out_` prefix would misread as write-only; and **scratch / persistent-state** buffers, caller-allocated working memory carried across launches (cursors, stacks, open-addressing tables, `ball_pivoting`'s front) — neither an input nor the answer, so name them for what they hold (`cursor`, `front_out`, `new_src`). A read-only input must never wear the `out_` prefix, even when the buffer was a *producer* kernel's output — parameter names describe the argument's role in *this* kernel.
 
+### A lane-parallel kernel strides by `wp.block_dim()`, or it stays lane-free
+
+A kernel whose lanes cooperate — a `wp.tile_sum` / `tile_min` / `tile_max` over one value per lane,
+a `wp.tile_bvh_query_aabb` walk — is correct on **both** devices exactly when its lanes partition a
+sequence **the block already owns**, with the stride taken from `wp.block_dim()`. Never from a
+kernel argument, never from a module constant.
+
+The reason is that `wp.launch_tiled` runs exactly **one lane per block on the CPU device** through
+Warp 1.16 whatever `block_dim=` is passed, and `wp.block_dim()` reads `1` there — so that single
+lane walks the whole sequence and the one-element tile it reduces holds the right answer. **A
+one-element tile is not the bug.** Measured on one 1 000-element sum whose stride came from an
+`n_slices` argument instead:
+
+| device | `n_slices` | `block_dim` | result | expected |
+|---|---|---|---|---|
+| cpu | 64 | 64 or 256 | **16.0** | 1000.0 (short by exactly the stride — one lane walked 1/64) |
+| cuda:0 | 64 | 64 | 1000.0 | 1000.0 |
+| cuda:0 | 64 | 256 | **3616.0** | 1000.0 (lanes 64-255 re-walk what 0-63 counted) |
+
+So the arg-strided form is wrong on **both** devices, and its correctness on CUDA silently depends
+on a *wrapper* passing `n_slices == block_dim`, which no signature expresses. Do not read a CPU
+failure of a tiled kernel as "tiles do not work on the CPU backend" — that reading cost this package
+four kernels that were converted *away* from tile reductions and four comments stating the
+prohibition in general terms, all of which the block-per-item kernels then contradicted correctly.
+
+Where the lanes would partition the **outer** work the grid is over — a whole-array reduction with
+no per-item dimension, `measures.centroid_tiled`, `metrics.chamfer_*_tiled` — there is no
+block-owned sequence and no `wp.block_dim()` to take. Those kernels must either keep a *constant*
+stride and be launched on CUDA only, with a lane-free `_sliced` sibling for the CPU (the
+`_device.prefers_tiled_reduction` pair), or stay lane-free on both. Both are correct; a single
+kernel is not available.
+
+Read `kernels/visibility.py::obscurance` (one block per point, lanes over its ray bundle, measured
+3.2-11.8x against one thread per point) for the first form and `kernels/measures.py::centroid_tiled`
+for the second. A kernel with an **outer per-item dimension** and an inner sequence — one query, one
+face, one direction, one candidate frame — is always eligible for the first, and four in this tree
+still run the arg-strided form on CUDA because they were written while the rule was believed to be a
+blanket prohibition.
+
 ### Fusing a kernel: extract the shared part as a `@wp.func` in the same commit
 
 Fusing two launches into one is a standard and welcome optimization here — it removes a launch, a

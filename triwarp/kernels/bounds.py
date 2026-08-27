@@ -122,9 +122,12 @@ def oriented_box_extents(
     # and every update is an ``atomic_min``.
     #
     # Strided slice rather than a contiguous chunk, and lane-free, for the same two reasons as
-    # ``kernels/convex.hull_support_extremes``: consecutive threads read consecutive points so the
-    # loads coalesce, and ``wp.launch_tiled`` runs one lane per block on the CPU device through
-    # Warp 1.16, so a ``wp.tile(...)`` of per-lane values reduces a single point per tile.
+    # ``kernels/points.py::hull_support_extremes``: consecutive threads read consecutive points so
+    # the loads coalesce, and the threads partition the **outer** work -- the cloud -- rather than a
+    # sequence one block owns, so there is no ``wp.block_dim()`` to stride by and a
+    # ``wp.tile(...)`` reduction cannot be reached without changing the launch. See
+    # ``.claude/CLAUDE.md`` section 3 for the rule and ``kernels/visibility.py::obscurance`` for a
+    # lane-parallel kernel on the other side of it.
     k, j = wp.tid()
     n_points = points.shape[0]
     frame = axes[k]

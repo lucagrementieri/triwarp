@@ -20,6 +20,8 @@ iteration between the ``p`` update that last read ``rz_old`` and the x/r update 
 
 import warp as wp
 
+from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND
+
 # Lanes per block for both stages of the conjugate-gradient dot product. The partial stage gets one
 # block per ``CG_TILE`` entries *of each column*, which is what makes its grid grow with the system
 # instead of its serial depth; the finalize stage folds that column's partials with one more tile.
@@ -268,14 +270,15 @@ def cg_advance_condition(
     atol_sq: wp.array[wp.float64],
     out_state: wp.array[wp.int32],
 ) -> None:
-    # ``out_state`` is ``[iterations, condition]``. The loop runs while *any* column is still above
-    # its own tolerance -- the worst-case rule the batching exists for -- and stops at ``maxiter``.
+    # ``out_state`` is the round-loop state array (``array.LOOP_ROUND`` / ``LOOP_CONDITION``), the
+    # iteration count in the first slot. The loop runs while *any* column is still above its own
+    # tolerance -- the worst-case rule the batching exists for -- and stops at ``maxiter``.
     # Launch with ``dim=1``: the column count is the right-hand-side count, a handful.
-    out_state[0] = out_state[0] + 1
+    out_state[LOOP_ROUND] = out_state[LOOP_ROUND] + 1
     keep = wp.int32(0)
     for c in range(n_columns):
         if r_norm_sq[0, c] > atol_sq[c]:
             keep = 1
-    if out_state[0] >= maxiter:
+    if out_state[LOOP_ROUND] >= maxiter:
         keep = 0
-    out_state[1] = keep
+    out_state[LOOP_CONDITION] = keep

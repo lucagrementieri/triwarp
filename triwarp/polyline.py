@@ -46,6 +46,7 @@ import triwarp.typing as twt
 from triwarp._device import read_scalar
 from triwarp.kernels import creation as kernel_creation
 from triwarp.kernels import polyline as kernel_polyline
+from triwarp.kernels.array import LOOP_CONDITION
 
 
 def is_closed(polyline: wp.array[wp.vec3]) -> bool:
@@ -644,7 +645,7 @@ def polyline_simplify(
         # readback -- ``polyline_triangulate``'s ear rounds are driven the same way and measured a
         # replayed conditional-graph iteration of a four-launch body at 14 us against 86-93 us for
         # the same body issued from the host with its convergence readback.
-        state = wp.array([0, 1], dtype=wp.int32, device=device)
+        state = wp.array([0, 1], dtype=wp.int32, device=device)  # see array.LOOP_ROUND
         squared_tolerance = wp.float32(tol * tol)
 
         def split_round() -> None:
@@ -681,7 +682,7 @@ def polyline_simplify(
                 device=device,
             )
 
-        condition = state[1:2]
+        condition = state[LOOP_CONDITION : LOOP_CONDITION + 1]
         # Graph capture needs a CUDA stream, so the CPU device takes the direct-execution branch
         # even when the driver supports conditional nodes.
         if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():
@@ -1027,7 +1028,7 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     wp.launch(kernel_polyline.init_ring, dim=n, inputs=[left, right, active], device=device)
 
     # state = [rounds run, loop condition], both written by ``ear_loop_continue``.
-    state = wp.array([0, 1], dtype=wp.int32, device=device)
+    state = wp.array([0, 1], dtype=wp.int32, device=device)  # see array.LOOP_ROUND
 
     def clip_round() -> None:
         wp.launch(
@@ -1055,7 +1056,7 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
             device=device,
         )
 
-    condition = state[1:2]
+    condition = state[LOOP_CONDITION : LOOP_CONDITION + 1]
     # Graph capture needs a CUDA stream, so the CPU device takes the direct-execution branch even
     # when the driver supports conditional nodes.
     if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():

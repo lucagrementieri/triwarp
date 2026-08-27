@@ -325,9 +325,18 @@ def winding_number_tiled(
     out_winding: wp.array[wp.float32],
 ) -> None:
     # One thread per (query, face slice): each walks a strided slice of the face list and commits
-    # one atomic. Deliberately lane-free -- a block-wide `wp.tile_sum(wp.tile(...))` would be the
-    # natural reduction, but `wp.launch_tiled` runs exactly one lane per block on the CPU
-    # backend through Warp 1.16, so a per-lane tile holds one face and under-counts there.
+    # one atomic.
+    #
+    # Lane-free because the threads partition the **outer** work -- the face list -- rather than a
+    # sequence one block owns, so there is no `wp.block_dim()` to stride by; on the CPU device,
+    # where `wp.launch_tiled` runs one lane per block through Warp 1.16, that lane would cover
+    # `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 3, and
+    # `face_to_mesh_distance_tiled` below for the other side of the rule.
+    #
+    # This is the strongest candidate in the tree for the block-per-query rewrite, and it is open:
+    # the query dimension is already the outer one, the walk is over every face, and converting
+    # would also retire `winding_number` above -- the CPU-only serial sibling this kernel exists to
+    # avoid. The `winding_number` benchmark group is where its A/B belongs.
     q, j = wp.tid()
     p = query_points[q]
     total = wp.float32(0.0)

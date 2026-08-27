@@ -2,6 +2,30 @@ from typing import Any
 
 import warp as wp
 
+# Slot table for the **device-side round loop**: one zero-initialized ``wp.array[wp.int32]`` that a
+# ``dim=1`` kernel updates at the end of each round, so ``wp.capture_while`` can drive the rounds
+# with no host readback. Slot 0 counts rounds -- read against a cap, which is what bounds a loop
+# whose progress test could otherwise stall -- and slot 1 is the condition; the wrapper hands
+# ``wp.capture_while`` the view ``state[LOOP_CONDITION : LOOP_CONDITION + 1]``.
+#
+# The condition is written by a **plain store**, never an atomic: it is one address taking one
+# value, so there is nothing to serialize even where every thread of a wide launch may write it
+# (``polyline.rdp_split_spans``). **The condition must be seeded non-zero before the loop starts**:
+# ``wp.capture_while`` evaluates it *before* the first round, so a plain ``wp.zeros`` state runs
+# zero rounds. Seed it with ``wp.array([0, 1])`` / ``assign([0, 1])``, or from the same ``dim=1``
+# kernel that resets the rest of the pass (``remesh.reset_collapse_rounds``).
+#
+# Four loops share this: the level-synchronous Ramer-Douglas-Peucker and the ear-clipping rounds in
+# ``kernels/polyline.py``, the conjugate gradient's iteration test, and ``kernels/remesh.py``'s
+# collapse rounds -- which needs a third slot for the previous round's commit count and **appends**
+# it, so the shared two keep their numbers. ``kernels/algorithms/bfs.py`` deliberately does not:
+# its seven slots are a frontier window (``start``, ``tail``) rather than a round counter, so slot 0
+# does not mean the same thing and renumbering it would buy a coincidence of indices, not a shared
+# convention.
+LOOP_ROUND = wp.constant(wp.int32(0))
+LOOP_CONDITION = wp.constant(wp.int32(1))
+LOOP_STATE_SIZE = 2
+
 
 @wp.func
 def sort3(a: wp.Scalar, b: wp.Scalar, c: wp.Scalar) -> tuple[wp.Scalar, wp.Scalar, wp.Scalar]:

@@ -398,10 +398,17 @@ def hull_support_extremes(
     # Strided slice, NOT a contiguous chunk: consecutive threads read consecutive points, so the
     # loads coalesce, and each thread contributes one atomic instead of one per point.
     #
-    # A block-wide `wp.tile_max(wp.tile(...))` reduction would be the natural fit here and was what
-    # this kernel used, but `wp.launch_tiled` runs exactly ONE lane per block on the Warp CPU
-    # backend through Warp 1.16 (`wp.tid()`'s lane index is always 0), so a tile of per-lane
-    # values holds one element there and returns a wrong extreme. This form is lane-free.
+    # Lane-free because the threads partition the **outer** work -- the cloud this reduction is
+    # over -- rather than a sequence one block owns, so there is no `wp.block_dim()` for them to
+    # stride by and a `wp.tile_max(wp.tile(...))` cannot be reached from here without changing the
+    # launch. `wp.launch_tiled` runs one lane per block on the CPU device through Warp 1.16, and
+    # that lane would then cover `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 3;
+    # `farthest_point_sample_block` below is the other side of the rule, and reduces with
+    # `wp.tile_max` on both devices because its stride *is* `wp.block_dim()`.
+    #
+    # Converting this kernel to one block per direction is open and unmeasured -- the analogous
+    # rewrite of `kernels/visibility.py::obscurance` measured 3.2-11.8x -- and needs the
+    # `convex_subset` benchmark group's A/B before it lands.
     local_max = wp.float32(-FLOAT32_INF_CONSTANT)
     local_min = wp.float32(FLOAT32_INF_CONSTANT)
     for i in range(j, n_p, n_slices):

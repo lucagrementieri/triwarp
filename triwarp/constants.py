@@ -62,16 +62,25 @@ TILE_2D = 8
 # is at its worst exactly where the host floor already hides it.
 TILES_PER_BLOCK_1D = 16
 
-# Elements reduced per thread by the *lane-free* reductions -- those whose body must stay correct on
-# the CPU device, where ``wp.launch_tiled`` runs exactly one lane per block (through Warp 1.16) and
-# any lane-parallel body silently reduces a single element per tile. Each thread walks a strided
-# slice of its input and commits one atomic, so this trades launch width against atomic traffic.
+# Elements reduced per thread by the *lane-free* reductions -- those that partition the **outer**
+# work the grid is over, so there is no block-owned sequence for the lanes to share and no
+# ``wp.block_dim()`` to stride by. Each thread walks a strided slice of its input and commits one
+# atomic, so this trades launch width against atomic traffic.
+#
+# **The stride's source is the rule, not the tile.** A lane-parallel body is correct on both devices
+# exactly when its stride is ``wp.block_dim()`` -- which reads 1 on the CPU device, where
+# ``wp.launch_tiled`` runs one lane per block through Warp 1.16, so that lane covers the whole
+# sequence. Striding by a *kernel argument* instead is wrong on **both** devices, measured on one
+# 1 000-element sum: the CPU answer is short by exactly the stride (16.0 against 1 000.0 at
+# ``n_slices = 64``) and CUDA double-counts whenever ``n_slices != block_dim`` (3 616.0 at
+# ``block_dim = 256``). See ``.claude/CLAUDE.md`` section 3 for the rule, and
+# ``kernels/visibility.py::obscurance`` for a lane-parallel kernel that is correct on both devices
+# because it strides by ``wp.block_dim()``.
 #
 # The optimum splits by device, so there are two values and
 # [`items_per_slice`][triwarp._device.items_per_slice] picks between them; do not read either
-# directly. Swept over 8-256 on a 5k and a 200k point cloud (hull support extremes, the only CUDA
-# consumer left after the tiled reductions were restored) plus the CPU-only centroid and chamfer
-# reductions:
+# directly. Swept over 8-256 on a 5k and a 200k point cloud (hull support extremes) plus the
+# CPU-only centroid and chamfer reductions:
 #
 # - CUDA wants long slices: at 200k points 32 costs 1.54x of the 256 optimum, while 128 is within 1%
 #   of it and within 4% at 5k points, where the whole sweep is flat.

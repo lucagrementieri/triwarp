@@ -1,6 +1,13 @@
 import warp as wp
 
-from triwarp.kernels.array import binary_search_index, cross2, lowbias32, wrap_index
+from triwarp.kernels.array import (
+    LOOP_CONDITION,
+    LOOP_ROUND,
+    binary_search_index,
+    cross2,
+    lowbias32,
+    wrap_index,
+)
 from triwarp.kernels.points import plane_basis
 from triwarp.kernels.predicates import (
     closest_point_on_segment,
@@ -304,8 +311,8 @@ def rdp_begin_round(
     # buffers are baked in at capture time. One extra ``dim=n`` launch per round buys the readback.
     i = wp.int32(wp.tid())
     if i == 0:
-        out_state[0] = out_state[0] + 1
-        out_state[1] = 0
+        out_state[LOOP_ROUND] = out_state[LOOP_ROUND] + 1
+        out_state[LOOP_CONDITION] = 0
     out_span_max[i] = -1.0
     out_span_argmax[i] = out_span_max.shape[0]  # past every valid index, so atomic_min always wins
 
@@ -398,7 +405,9 @@ def rdp_split_spans(
         span_hi[i] = split  # ``lo < i < split``, so the child span is never degenerate
     else:
         span_lo[i] = split
-    state[1] = 1  # a plain store, not an atomic: one address, one value, nothing to serialize
+    # A plain store, not an atomic: one address, one value, nothing to serialize (the rule is
+    # on ``array.LOOP_CONDITION``, which also says why the array must be zero-initialized).
+    state[LOOP_CONDITION] = 1
 
 
 @wp.kernel
@@ -715,11 +724,11 @@ def ear_loop_continue(
     count: wp.array[wp.int32], target: wp.int32, max_rounds: wp.int32, out_state: wp.array[wp.int32]
 ) -> None:
     # Ear-clipping loop control, kept on device so ``wp.capture_while`` can drive the rounds without
-    # a readback each time: ``out_state[0]`` counts rounds and ``out_state[1]`` is the condition.
+    # a readback each time; the slot table is ``array.LOOP_ROUND`` / ``LOOP_CONDITION``.
     # The round cap is what stops a degenerate or self-intersecting loop that never retires an ear
     # -- the same bound the host-driven form got from iterating ``range(n)``.
-    out_state[0] = out_state[0] + 1
-    if count[0] < target and out_state[0] < max_rounds:
-        out_state[1] = wp.int32(1)
+    out_state[LOOP_ROUND] = out_state[LOOP_ROUND] + 1
+    if count[0] < target and out_state[LOOP_ROUND] < max_rounds:
+        out_state[LOOP_CONDITION] = wp.int32(1)
     else:
-        out_state[1] = wp.int32(0)
+        out_state[LOOP_CONDITION] = wp.int32(0)

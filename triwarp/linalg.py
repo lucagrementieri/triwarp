@@ -1217,8 +1217,10 @@ class _BatchedCg:
         self._p_dot_ap = wp.zeros((2, self._n_columns), dtype=wp.float64, device=device)
         self._rz_old = wp.zeros(self._n_columns, dtype=wp.float64, device=device)
         self._atol_sq = wp.zeros(self._n_columns, dtype=wp.float64, device=device)
-        # [iterations, loop condition]; the second element is what ``wp.capture_while`` watches.
-        self._state = wp.zeros(2, dtype=wp.int32, device=device)
+        # The round-loop state array (``kernels/array.py``'s ``LOOP_ROUND`` / ``LOOP_CONDITION``),
+        # the iteration count in the first slot. Seeded to ``[0, 1]`` in ``_reset`` -- a zero
+        # condition would run no iterations at all, since ``wp.capture_while`` reads it first.
+        self._state = wp.zeros(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
 
         # A multigrid V-cycle cannot be fused into a register the way the Jacobi apply is, so it
         # runs as its own launches over the same padded vectors and the x/r update drops its ``z``
@@ -1397,7 +1399,7 @@ class _BatchedCg:
                 math.sqrt(float(self._dots.numpy()[0].max())),
                 math.sqrt(float(self._atol_sq.numpy().max())),
             )
-        condition = self._state[1:2]
+        condition = self._state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
         with wp.ScopedCapture(self._device) as capture:
             wp.capture_while(condition, self._iteration)
         wp.capture_launch(capture.graph)

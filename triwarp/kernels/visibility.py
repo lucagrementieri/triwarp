@@ -222,9 +222,18 @@ def support_argmax_tiled(
     # Support point of the vertex cloud per deferred query: argmax of dot(v, n). One thread per
     # (query, vertex slice) strides over the vertices, reduces its own running best into a packed
     # (projection, index) key, and commits one atomic; the packed key's ordering makes atomic_max
-    # the global argmax with the lowest index as tie-break. Lane-free on purpose -- the block-wide
-    # `wp.tile_max(wp.tile(...))` this replaces reduced a single lane on the Warp CPU backend, where
-    # `wp.launch_tiled` runs one lane per block through Warp 1.16.
+    # the global argmax with the lowest index as tie-break.
+    #
+    # Lane-free because the threads partition the **outer** work -- the vertex cloud -- rather than
+    # a sequence one block owns, so there is no `wp.block_dim()` to stride by; on the CPU device,
+    # where `wp.launch_tiled` runs one lane per block through Warp 1.16, that lane would cover
+    # `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 3, and `obscurance` above for the
+    # other side of the rule -- one block per point, striding by `wp.block_dim()`, `wp.tile_sum` on
+    # both devices.
+    #
+    # Converting this to one block per deferred query is open and unmeasured; `obscurance`'s own
+    # conversion measured 3.2-11.8x, and the `max_tangent_sphere_reach` benchmark group is where
+    # this one's A/B belongs.
     q, j = wp.tid()
     normal = normals[support_indices[q]]
     best = wp.float32(-wp.inf)
