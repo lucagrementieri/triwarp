@@ -135,11 +135,3 @@ def forest_link(
     out_in_forest[e] = True
     wp.atomic_add(out_merges, 0, 1)
     ecl_hook_edge(labels, root_a, root_b)
-
-
-@wp.func
-def is_leftover_edge(candidate: wp.bool, in_forest: wp.bool) -> wp.bool:
-    """Whether this edge is a homology generator: a candidate the cotree left out."""
-    # Edges the primal tree took are already excluded from ``candidate``, so this is "in neither
-    # tree" on a closed surface.
-    return candidate and not in_forest

@@ -201,7 +201,10 @@ def tree_cotree(
 
     leftover_mask = wp.empty(n_edges, dtype=wp.bool, device=device)
     if n_edges > 0:
-        wp.map(kernel_homology.is_leftover_edge, candidate, in_dual_tree, out=leftover_mask)
+        # A homology generator is a candidate the cotree left out. Edges the primal tree
+        # took are already excluded from ``candidate``, so this is "in neither tree" on a
+        # closed surface -- which is ``array.mask_and_not`` and needs no predicate of its own.
+        wp.map(kernel_array.mask_and_not, candidate, in_dual_tree, out=leftover_mask)
     generator_edges = tw.array.gather(unique_edges, tw.array.flatnonzero(leftover_mask))
     return (
         twt.as_array2d(unique_edges, wp.int32),
