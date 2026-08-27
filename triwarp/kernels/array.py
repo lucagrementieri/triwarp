@@ -2,6 +2,8 @@ from typing import Any
 
 import warp as wp
 
+from triwarp.constants import INT32_MAX_CONSTANT
+
 # Slot table for the **device-side round loop**: one zero-initialized ``wp.array[wp.int32]`` that a
 # ``dim=1`` kernel updates at the end of each round, so ``wp.capture_while`` can drive the rounds
 # with no host readback. Slot 0 counts rounds -- read against a cap, which is what bounds a loop
@@ -140,6 +142,31 @@ def update_argmin_pair(
 
 
 @wp.func
+def tile_argmin(value: wp.Float, index: wp.int32) -> tuple[wp.Float, wp.int32]:
+    # The block-cooperative counterpart of ``update_argmin``: given one candidate per lane, the
+    # smallest value over the block and the **lowest index among the lanes attaining it**. Every
+    # lane holds the same pair afterwards, so any lane may store it.
+    #
+    # The two-stage form is what makes the winner independent of *which* lane saw it, and that is
+    # the whole reason this is one function rather than three: a block reduction hands back a value
+    # and not the lane that held it, so recovering the index is a second reduction with a tie-break,
+    # and the three sites that need it (the hole-filling DP's apex choice, ball pivoting's pivot
+    # search, ``proximity``'s straggler faces) were writing that rule out by hand in three
+    # spellings. A duplicated *decision rule* diverges silently where duplicated arithmetic only
+    # reads badly -- and it had: one of the three carried a trailing ``INT32_MAX -> -1`` fixup that
+    # cannot fire, since at least one lane always attains the minimum and therefore contributes its
+    # own index, and when no lane found anything every lane holds the caller's sentinel already.
+    #
+    # No ``wp.ref``, so unlike ``update_argmin`` this imposes no ``enable_backward=False`` on its
+    # callers. Verified generic on Warp 1.16 at ``float32`` and ``float64``, on both devices, at
+    # ``block_dim`` 1 / 32 / 64 / 256 -- including the CPU device, where ``wp.launch_tiled`` runs
+    # one lane per block and both tiles hold that lane's own pair.
+    block_value = wp.tile_min(wp.tile(value))[0]
+    attained = wp.where(value == block_value, index, INT32_MAX_CONSTANT)
+    return block_value, wp.tile_min(wp.tile(attained))[0]
+
+
+@wp.func
 def cross2(a: Any, b: Any) -> wp.Float:
     # 2D cross product (signed parallelogram area). Generic so float32 and float64 call sites share
     # one definition.
@@ -169,6 +196,23 @@ def to_vec2(v: wp.vec2d) -> wp.vec2:
 @wp.func
 def square_scalar(value: wp.Scalar) -> wp.Scalar:
     return value * value
+
+
+@wp.func
+def sqrt_abs(value: wp.Float) -> wp.Float:
+    # ``sqrt(|x|)``, the per-row scaling the algebraic-multigrid strength test takes its geometric
+    # mean from: ``|A_ij| >= theta sqrt(A_ii) sqrt(A_jj)`` is then a product and no square root runs
+    # per edge. The magnitude is taken because a Laplacian written negative-semi-definite has a
+    # negative diagonal.
+    return wp.sqrt(wp.abs(value))
+
+
+@wp.func
+def inverse_or_one(value: wp.Float) -> wp.Float:
+    # The Jacobi preconditioner's reciprocal, with a **zero diagonal mapped to 1 rather than to
+    # infinity** -- what ``warp.optim.linear.preconditioner(m, "diag")`` does, and necessary because
+    # such a row contributes nothing and must not poison the whole vector with a NaN.
+    return wp.where(value != type(value)(0.0), type(value)(1.0) / value, type(value)(1.0))
 
 
 @wp.func

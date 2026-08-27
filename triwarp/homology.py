@@ -195,23 +195,13 @@ def tree_cotree(
             inputs=[unique_edges, parents, in_primal_tree],
             device=device,
         )
-        wp.launch(
-            kernel_homology.dual_candidate_mask,
-            dim=n_edges,
-            inputs=[edge_face_count, in_primal_tree, candidate],
-            device=device,
-        )
+        wp.map(kernel_homology.is_dual_candidate, edge_face_count, in_primal_tree, out=candidate)
 
     in_dual_tree = _dual_spanning_forest(candidate, edge_faces, n_faces)
 
     leftover_mask = wp.empty(n_edges, dtype=wp.bool, device=device)
     if n_edges > 0:
-        wp.launch(
-            kernel_homology.leftover_edge_mask,
-            dim=n_edges,
-            inputs=[candidate, in_dual_tree, leftover_mask],
-            device=device,
-        )
+        wp.map(kernel_homology.is_leftover_edge, candidate, in_dual_tree, out=leftover_mask)
     generator_edges = tw.array.gather(unique_edges, tw.array.flatnonzero(leftover_mask))
     return (
         twt.as_array2d(unique_edges, wp.int32),

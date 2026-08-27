@@ -637,12 +637,11 @@ def emit_density_splits(
         out_region[face_offsets[f] + child] = region[f]
 
 
-@wp.kernel
-def face_split_counts(split: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
-    # A split face becomes three, an unsplit one stays one -- the counts whose exclusive scan gives
-    # ``emit_density_splits`` its output face slots.
-    f = wp.int32(wp.tid())
-    out_counts[f] = wp.int32(1) + wp.int32(2) * split[f]
+@wp.func
+def face_split_count(split: wp.int32) -> wp.int32:
+    """How many faces this one becomes: three when split, one when not."""
+    # The counts whose exclusive scan gives ``emit_density_splits`` its output face slots.
+    return wp.int32(1) + wp.int32(2) * split
 
 
 # ---------------------------------------------------------------------------

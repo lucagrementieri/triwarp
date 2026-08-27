@@ -1,13 +1,8 @@
 import warp as wp
 
-from triwarp.constants import (
-    FLOAT32_INF_CONSTANT,
-    INT32_MAX_CONSTANT,
-    TOLERANCE_MERGE_CONSTANT,
-    TWO_PI,
-)
+from triwarp.constants import FLOAT32_INF_CONSTANT, TOLERANCE_MERGE_CONSTANT, TWO_PI
 from triwarp.kernels import triangles as kernel_triangles
-from triwarp.kernels.array import pack_nearest_key
+from triwarp.kernels.array import pack_nearest_key, tile_argmin
 from triwarp.kernels.neighbors import MAX_SEARCH_ATTEMPTS, complete_radius, deepen_radius
 from triwarp.kernels.predicates import (
     barycentric_2d,
@@ -565,16 +560,10 @@ def face_to_mesh_distance_tiled(
                 best = distance_sq
                 witness = candidate
                 wp.atomic_min(global_best_sq, 0, best)
-    # Two-stage reduction, so the witness does not depend on which lane happened to see it: the
-    # smallest distance, then the smallest face index among the lanes attaining it. Every lane
-    # holds the same pair afterwards and every lane stores it, as the pivot search does.
-    block_best = wp.tile_min(wp.tile(best))[0]
-    mine = witness
-    if best != block_best:
-        mine = INT32_MAX_CONSTANT
-    block_witness = wp.tile_min(wp.tile(mine))[0]
-    if block_witness == INT32_MAX_CONSTANT:
-        block_witness = wp.int32(-1)
+    # The witness must not depend on which lane happened to see it, which is what
+    # ``tile_argmin``'s second stage is for. When no lane found a candidate every lane still holds
+    # ``(inf, -1)``, so it returns -1 and no fixup is needed here.
+    block_best, block_witness = tile_argmin(best, witness)
     out_distance_sq[f] = block_best
     out_witness[f] = block_witness
 

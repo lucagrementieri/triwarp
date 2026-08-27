@@ -72,8 +72,8 @@ when it merely lost the claim.
 
 import warp as wp
 
-from triwarp.constants import INT32_MAX_CONSTANT, UINT64_MAX_CONSTANT
-from triwarp.kernels.array import pack_edge_key
+from triwarp.constants import UINT64_MAX_CONSTANT
+from triwarp.kernels.array import pack_edge_key, tile_argmin
 from triwarp.kernels.grouping import hash_find, hash_find_or_insert
 from triwarp.kernels.predicates import dihedral_angle, triangle_normal
 
@@ -603,14 +603,10 @@ def pivot_front_edges(
                         best_angle = angle
                         best = c
 
-        # Two-stage reduction, so the winner does not depend on which lane happened to see it:
-        # smallest angle, then smallest point index among the lanes attaining it. When no lane found
-        # anything every lane still holds ``(TWO_PI, -1)``, so the second stage returns -1.
-        block_angle = wp.tile_min(wp.tile(best_angle))[0]
-        mine = best
-        if best_angle != block_angle:
-            mine = INT32_MAX_CONSTANT
-        block_best = wp.tile_min(wp.tile(mine))[0]
+        # The winner must not depend on which lane happened to see it, which is what
+        # ``tile_argmin``'s second stage is for. When no lane found anything every lane still holds
+        # ``(TWO_PI, -1)``, so it returns -1.
+        _block_angle, block_best = tile_argmin(best_angle, best)
 
         edges.cand[slot] = block_best
         if block_best < 0:

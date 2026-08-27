@@ -3181,9 +3181,7 @@ def refine_region_to_density(
             break
 
         counts = wp.empty(n_faces, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_remesh.face_split_counts, dim=n_faces, inputs=[split, counts], device=device
-        )
+        wp.map(kernel_remesh.face_split_count, split, out=counts)
         face_offsets, n_out_faces = tw.array.counts_to_offsets(counts)
 
         positions = wp.empty(n_split, dtype=wp.vec3, device=device)

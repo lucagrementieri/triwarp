@@ -113,16 +113,6 @@ def cg_absolute_tolerance(
 
 
 @wp.kernel
-def cg_inverse_diagonal(diag: wp.array[wp.float64], out_inv_diag: wp.array[wp.float64]) -> None:
-    # Jacobi preconditioner. A zero diagonal entry maps to 1 rather than to infinity, which is what
-    # ``warp.optim.linear.preconditioner(m, "diag")`` does: such a row contributes nothing and must
-    # not poison the whole vector with a NaN.
-    i = wp.int32(wp.tid())
-    value = diag[i]
-    out_inv_diag[i] = wp.where(value != wp.float64(0.0), wp.float64(1.0) / value, wp.float64(1.0))
-
-
-@wp.kernel
 def scaled_diagonal_apply(
     n: wp.int32,
     stride: wp.int32,

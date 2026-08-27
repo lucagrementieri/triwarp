@@ -1236,13 +1236,7 @@ class _BatchedCg:
                 )
         # 1 in the pad, so the fused Jacobi apply there is a no-op on an already-zero residual.
         self._inv_diag = wp.full(self._stride, 1.0, dtype=wp.float64, device=device)
-        wp.launch(
-            kernel_cg.cg_inverse_diagonal,
-            dim=self._n,
-            inputs=[wps.bsr_get_diag(matrix)],
-            outputs=[self._inv_diag],
-            device=device,
-        )
+        wp.map(kernel_array.inverse_or_one, wps.bsr_get_diag(matrix), out=self._inv_diag[: self._n])
         # Per-column views, built once: the matvec is ``n_columns`` ``bsr_mv`` calls against the one
         # operator, and re-slicing them per iteration would add Python to every CG step and keep the
         # loop from being captured. They span ``n``, not ``stride``, so nothing writes the pad.
@@ -1806,13 +1800,7 @@ def _multigrid_hierarchy(
         if n_aggregates >= _MULTIGRID_MIN_COARSENING * level.n:
             break
         diagonal = wp.empty(level.n, dtype=wp.float64, device=operator.device)
-        wp.launch(
-            kernel_cg.cg_inverse_diagonal,
-            dim=level.n,
-            inputs=[wps.bsr_get_diag(operator)],
-            outputs=[diagonal],
-            device=operator.device,
-        )
+        wp.map(kernel_array.inverse_or_one, wps.bsr_get_diag(operator), out=diagonal)
         level.inverse_diagonal = diagonal
         level.omega = _MULTIGRID_JACOBI_FACTOR / _multigrid_spectral_radius(
             operator, diagonal, seed
@@ -1853,13 +1841,7 @@ def _multigrid_aggregate(
     # ``sqrt(|A_ii|)`` per row, so the strength test below is a product rather than a square
     # root per edge. One ``(n,)`` buffer and two launches per level, read by both walks.
     scaled_diagonal = wp.empty(n, dtype=wp.float64, device=device)
-    wp.launch(
-        kernel_mg.mg_scaled_diagonal,
-        dim=n,
-        inputs=[wps.bsr_get_diag(matrix)],
-        outputs=[scaled_diagonal],
-        device=device,
-    )
+    wp.map(kernel_array.sqrt_abs, wps.bsr_get_diag(matrix), out=scaled_diagonal)
 
     priority = wp.empty(n, dtype=wp.uint32, device=device)
     wp.launch(
@@ -1894,7 +1876,7 @@ def _multigrid_aggregate(
             break
 
     flags = wp.empty(n, dtype=wp.int32, device=device)
-    wp.launch(kernel_mg.mis_root_flags, dim=n, inputs=[state, flags], device=device)
+    wp.map(kernel_mg.mis_root_flag, state, out=flags)
     scan_pos = wp.empty(n, dtype=wp.int32, device=device)
     wp.utils.array_scan(flags, scan_pos, inclusive=True)
     n_aggregates = int(read_scalar(scan_pos))

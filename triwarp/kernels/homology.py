@@ -50,17 +50,13 @@ def primal_tree_edge_mask(
     out_in_tree[e] = parents[b] == a or parents[a] == b
 
 
-@wp.kernel
-def dual_candidate_mask(
-    edge_face_count: wp.array[wp.int32],
-    in_primal_tree: wp.array[wp.bool],
-    out_candidate: wp.array[wp.bool],
-) -> None:
-    # A dual edge the cotree may cross: an interior edge (exactly two incident faces) that the
-    # primal tree did not already claim. Non-manifold edges count higher than 2 and are excluded,
-    # which is what the exactly-2 row grouping behind ``adjacency.face_adjacency`` did with them.
-    e = wp.int32(wp.tid())
-    out_candidate[e] = edge_face_count[e] == 2 and not in_primal_tree[e]
+@wp.func
+def is_dual_candidate(edge_face_count: wp.int32, in_primal_tree: wp.bool) -> wp.bool:
+    """Whether the cotree may cross this dual edge."""
+    # An interior edge (exactly two incident faces) that the primal tree did not already claim.
+    # Non-manifold edges count higher than 2 and are excluded, which is what the exactly-2 row
+    # grouping behind ``adjacency.face_adjacency`` did with them.
+    return edge_face_count == 2 and not in_primal_tree
 
 
 @wp.kernel
@@ -141,11 +137,9 @@ def forest_link(
     ecl_hook_edge(labels, root_a, root_b)
 
 
-@wp.kernel
-def leftover_edge_mask(
-    candidate: wp.array[wp.bool], in_forest: wp.array[wp.bool], out_leftover: wp.array[wp.bool]
-) -> None:
-    # A homology generator: a candidate the cotree left out. Edges the primal tree took are already
-    # excluded from ``candidate``, so this is "in neither tree" on a closed surface.
-    e = wp.int32(wp.tid())
-    out_leftover[e] = candidate[e] and not in_forest[e]
+@wp.func
+def is_leftover_edge(candidate: wp.bool, in_forest: wp.bool) -> wp.bool:
+    """Whether this edge is a homology generator: a candidate the cotree left out."""
+    # Edges the primal tree took are already excluded from ``candidate``, so this is "in neither
+    # tree" on a closed surface.
+    return candidate and not in_forest

@@ -78,15 +78,45 @@ def free_row(fixed_mask: wp.array[wp.bool], free_map: wp.array[wp.int32], i: wp.
     # ``@wp.func`` cannot return for its caller.
     #
     # This does not shorten the three lines it replaces -- ``if ri < 0: return`` costs what
-    # ``if fixed_mask[i]: return`` cost. What it buys is that the free/fixed/compact-index
-    # convention is written down *once*, in the module that owns the elimination, instead of being
-    # re-inferred at seven sites across four modules: ``free_map`` is defined only where
-    # ``fixed_mask`` is False, it is monotone non-decreasing over the free indices (which is what
-    # lets ``interior_row_entries`` skip a triplet sort), and reading it at a pinned index gives a
-    # stale or out-of-range value rather than an error.
+    # ``if fixed_mask[i]: return`` cost. What it buys is that the mask/compact-index convention is
+    # written down *once*, in the module that owns the elimination, instead of being re-inferred at
+    # every site: ``free_map`` is defined only where ``fixed_mask`` is False, it is monotone
+    # non-decreasing over the free indices (which is what lets ``interior_row_entries`` skip a
+    # triplet sort), and reading it at a pinned index gives a stale or out-of-range value rather
+    # than an error.
+    #
+    # **The mask's polarity is the argument's name and nothing else**, which is why ``selected_row``
+    # below exists: both ask the identical question of a (mask, index map) pair, this one of a mask
+    # marking what is *excluded* and that one of a mask marking what is *kept*. Two polarities are
+    # in the tree because two families of caller legitimately hold different masks -- the Dirichlet
+    # eliminations pin a boundary (``linalg``, ``parametrization``, ``heat/signed`` and three
+    # kernels in ``smoothing``), while the region solves take "which vertices may move" straight
+    # from their public signature -- and inverting one to reach the other costs a ``wp.map`` and an
+    # ``(n,)`` buffer per call. What must not happen again is a *third* site inferring the
+    # convention from scratch: ``smoothing.gather_free_positions`` was written that way, six lines
+    # from a kernel of the opposite sense in a file that already imported this function.
     if fixed_mask[i]:
         return wp.int32(-1)
     return free_map[i]
+
+
+@wp.func
+def selected_row(
+    selected_mask: wp.array[wp.bool], index_map: wp.array[wp.int32], i: wp.int32
+) -> wp.int32:
+    # ``free_row`` for a mask of the opposite sense: the compact row index element ``i`` occupies in
+    # the reduced system, or ``-1`` when the mask does not keep it. See ``free_row`` for why there
+    # are two and for the contract on ``index_map`` (which is ``array.mask_to_index_map``'s output,
+    # exactly as ``free_map`` is ``linalg.free_partition``'s -- the same array, built from the two
+    # complementary masks).
+    #
+    # Two of ``smoothing``'s region-solve kernels ask this of *two different* partitions at once --
+    # the free vertices and the wider set of rows the least-squares system carries -- so having one
+    # name for the question is what keeps those readable; and asking it once per neighbour replaces
+    # a mask test followed by a separate map read.
+    if not selected_mask[i]:
+        return wp.int32(-1)
+    return index_map[i]
 
 
 @wp.kernel

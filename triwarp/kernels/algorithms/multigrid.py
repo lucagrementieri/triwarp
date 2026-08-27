@@ -29,10 +29,12 @@ near-nullspace vector, normalized per aggregate), the smoothed prolongator is
 the Galerkin product ``P^T A P``. Operator complexity comes out at **1.02-1.03**, so the coarse
 levels are nearly free and a cycle's cost is its fine level.
 
-The per-level inverse diagonal is ``conjugate_gradient.cg_inverse_diagonal``, not a copy of it: the
-quantity is the same one the Jacobi preconditioner needs, down to mapping a zero diagonal to 1
-rather than to infinity -- which the least-squares operators here rely on, since they carry empty
-rows (297 of 8 987 on ``bunny``) for free vertices no equation reaches.
+The per-level inverse diagonal is ``array.inverse_or_one`` mapped over the operator's diagonal,
+not a copy of the conjugate gradient's: the quantity is the same one the Jacobi preconditioner
+needs, down to mapping a zero diagonal to 1 rather than to infinity -- which the least-squares
+operators here rely on, since they carry empty rows (297 of 8 987 on ``bunny``) for free vertices
+no equation reaches. The strength test's ``sqrt(|A_ii|)`` is ``array.sqrt_abs`` over the same
+diagonal.
 """
 
 import warp as wp
@@ -143,16 +145,20 @@ def mis_decide(
     wp.atomic_add(out_undecided, 0, wp.int32(1))
 
 
-@wp.kernel
-def mis_root_flags(state: wp.array[wp.int32], out_flag: wp.array[wp.int32]) -> None:
-    # 0/1 in the dtype ``wp.utils.array_scan`` wants, so the inclusive scan of them numbers the
-    # aggregates consecutively and its last element is the aggregate count.
+@wp.func
+def mis_root_flag(state: wp.int32) -> wp.int32:
+    """Whether ``state`` claims an aggregate, as the 0/1 flag ``wp.utils.array_scan`` wants."""
+    # An inclusive scan of these numbers the aggregates consecutively and its last element is the
+    # aggregate count.
     #
     # The test is "not excluded" rather than "is a root" so that a node still undecided when the
     # round cap is reached becomes an aggregate of its own instead of an unaggregated hole. The
     # selection normally settles well inside the cap and the two readings then coincide.
-    i = wp.int32(wp.tid())
-    out_flag[i] = wp.where(state[i] != MG_EXCLUDED, wp.int32(1), wp.int32(0))
+    #
+    # A ``@wp.func`` rather than a kernel because the wrapper maps it (CLAUDE.md section 4). It
+    # returns the flag directly rather than composing ``array.not_equal`` with an
+    # ``array_cast(bool -> int32)``, which would be two device passes and a second buffer.
+    return wp.where(state != MG_EXCLUDED, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
@@ -189,15 +195,6 @@ def spread_aggregate_labels(
         if j != i and mg_is_strong(values[k], scaled_diagonal[i], scaled_diagonal[j], theta):
             best = wp.max(best, label[j])
     out_label[i] = best
-
-
-@wp.kernel
-def mg_scaled_diagonal(diagonal: wp.array[wp.float64], out_scaled: wp.array[wp.float64]) -> None:
-    # ``sqrt(|A_ii|)`` per row, so the strength test's geometric mean is a product. A zero diagonal
-    # gives zero, which makes every edge of that row weak at any positive ``theta`` -- correct: a
-    # row with no equation (the least-squares operators here carry them) is its own aggregate.
-    i = wp.int32(wp.tid())
-    out_scaled[i] = wp.sqrt(wp.abs(diagonal[i]))
 
 
 @wp.kernel

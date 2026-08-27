@@ -2,9 +2,9 @@
 
 import warp as wp
 
-from triwarp.constants import FLOAT32_INF_CONSTANT, INT32_MAX_CONSTANT
+from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels.array import loop_next_slot, pack_nearest_key, update_argmin
+from triwarp.kernels.array import loop_next_slot, pack_nearest_key, tile_argmin, update_argmin
 from triwarp.kernels.array import wrap_index as _wrap
 from triwarp.kernels.predicates import (
     circumcircle_diameter,
@@ -479,9 +479,7 @@ def fill_dp_span_tiled(
             tables, dp, prev, o, b, base, i, j, k, is_top, a_pos, c_pos, plane_normal, char_area
         )
         update_argmin(best_val, best_k, val, k)
-    block_val = wp.tile_min(wp.tile(best_val))[0]
-    attained = wp.where(best_val == block_val, best_k, INT32_MAX_CONSTANT)
-    block_k = wp.tile_min(wp.tile(attained))[0]
+    block_val, block_k = tile_argmin(best_val, best_k)
     if t == 0:
         dp[base + i * b + j] = block_val
         prev[base + i * b + j] = block_k

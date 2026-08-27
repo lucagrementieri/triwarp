@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import to_vec3d
-from triwarp.kernels.linalg import free_row, solve_normal_equations
+from triwarp.kernels.linalg import free_row, selected_row, solve_normal_equations
 from triwarp.kernels.points import plane_basis
 from triwarp.kernels.predicates import closest_point_on_segment
 from triwarp.kernels.triangles import corner_triple
@@ -99,9 +99,9 @@ def dirichlet_system_triplets(
     # positionVertsSmoothlySharpBd: SPD umbrella system A = D - W over free verts (weights in the
     # CSR ``W``), fixed 1-ring neighbors folded into the right-hand side, plus optional stabilizer.
     v = wp.int32(wp.tid())
-    if not free_mask[v]:
+    ri = selected_row(free_mask, free_map, v)
+    if ri < 0:
         return
-    ri = free_map[v]
     start = offsets[v]
     end = offsets[v + 1]
     sum_w = stabilizer
@@ -111,10 +111,11 @@ def dirichlet_system_triplets(
         j = columns[k]
         w = values[k]
         sum_w += w
-        if free_mask[j]:
+        cj = selected_row(free_mask, free_map, j)
+        if cj >= 0:
             slot = base + 1 + (k - start)
             out_rows[slot] = ri
-            out_cols[slot] = free_map[j]
+            out_cols[slot] = cj
             out_vals[slot] = -w
         else:
             rhs += w * to_vec3d(points[j])
@@ -143,13 +144,15 @@ def laplacian_ls_triplets(
     out_rhs_y: wp.array[wp.float64],
     out_rhs_z: wp.array[wp.float64],
 ) -> None:
-    # positionVertsSmoothly: least-squares umbrella rows over R = free plus first-fixed-ring.
-    # Row is
-    # ``p_v = sum_d (w_vd/sumW) p_d``; free neighbors stay in M, fixed ones move to the RHS.
-    # The
-    # normal equations (M^T M) x = M^T b are assembled by the caller.
+    # Least-squares umbrella rows over R = free plus the first fixed ring. The row is
+    # ``p_v = sum_d (w_vd / sumW) p_d``; free neighbours stay in M, fixed ones move to the
+    # right-hand side, and the normal equations ``(M^T M) x = M^T b`` are assembled by the caller.
+    #
+    # Two partitions at once, both read through ``selected_row``: ``row_mask`` / ``row_map`` says
+    # which vertices carry a row, ``free_mask`` / ``free_map`` which carry an unknown.
     v = wp.int32(wp.tid())
-    if not row_mask[v]:
+    r = selected_row(row_mask, row_map, v)
+    if r < 0:
         return
     start = offsets[v]
     end = offsets[v + 1]
@@ -158,25 +161,25 @@ def laplacian_ls_triplets(
         sum_w += values[k]
     if sum_w == wp.float64(0.0):
         return
-    r = row_map[v]
     base = start + v
-    is_free = free_mask[v]
+    free_column = selected_row(free_mask, free_map, v)
     rhs = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
-    if not is_free:
+    if free_column < 0:
         rhs = -to_vec3d(points[v])
     for k in range(start, end):
         j = columns[k]
         coeff = -values[k] / sum_w
-        if free_mask[j]:
+        cj = selected_row(free_mask, free_map, j)
+        if cj >= 0:
             slot = base + 1 + (k - start)
             out_rows[slot] = r
-            out_cols[slot] = free_map[j]
+            out_cols[slot] = cj
             out_vals[slot] = coeff
         else:
             rhs -= coeff * to_vec3d(points[j])
-    if is_free:
+    if free_column >= 0:
         out_rows[base] = r
-        out_cols[base] = free_map[v]
+        out_cols[base] = free_column
         out_vals[base] = wp.float64(1.0)
     out_rhs_x[r] = rhs[0]
     out_rhs_y[r] = rhs[1]
@@ -198,8 +201,8 @@ def gather_free_positions(
     # writes its entry. Seeding from zeros leaves it at the origin; ``smoothing._free_positions``
     # carries the counts. The speed is the smaller half of why this exists.
     v = wp.int32(wp.tid())
-    if free_mask[v]:
-        i = free_map[v]
+    i = selected_row(free_mask, free_map, v)
+    if i >= 0:
         p = points[v]
         out_sol_x[i] = wp.float64(p[0])
         out_sol_y[i] = wp.float64(p[1])
@@ -215,9 +218,11 @@ def scatter_free_solution(
     sol_z: wp.array[wp.float64],
     out_points: wp.array[wp.vec3],
 ) -> None:
+    # Write the reduced solve's answer back over the free vertices; a pinned one keeps the position
+    # it arrived with. The inverse of ``gather_free_positions``, which seeds the same solve.
     v = wp.int32(wp.tid())
-    if free_mask[v]:
-        i = free_map[v]
+    i = selected_row(free_mask, free_map, v)
+    if i >= 0:
         out_points[v] = wp.vec3(wp.float32(sol_x[i]), wp.float32(sol_y[i]), wp.float32(sol_z[i]))
 
 
