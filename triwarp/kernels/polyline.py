@@ -243,13 +243,10 @@ def greedy_downsample_mask(
     # Single-thread greedy walk (dim == 1): the selection is sequential because each kept point
     # moves the reference the next one is measured from.
     #
-    # It is not *inherently* sequential — the same set can be produced by a parallel scan plus a
-    # segmented pick (bucket each point by ``floor(cumulative / step)``, take the first point of
-    # each bucket, then fix up buckets a kept point spilled past). That is a real rewrite and it has
-    # not been shown to be worth one: this kernel is on the live path of ``polyline_downsample``,
-    # open and closed, which measures 0.35 ms on a 528-point loop and 3.9 ms on a
-    # 65 536-point rim (RTX 5090) — the walk is ~60 ns a point and nothing else in those calls is
-    # faster. Revisit if a benchmark ever puts it on top.
+    # **Kept for short polylines only**, and it is `polyline_downsample`'s
+    # ``_DOWNSAMPLE_DOUBLING_FROM`` that decides. The walk is ~60 ns a point, so it is the cheapest
+    # thing available until the point count pays for the ``2 log2(n) + 1`` launches the parallel
+    # form below costs; the numbers and the crossover are on that constant.
     n = cumulative_lengths.shape[0]
     out_keep[0] = True
     last = cumulative_lengths[0]
@@ -257,6 +254,73 @@ def greedy_downsample_mask(
         if cumulative_lengths[i] - last >= step_size:
             out_keep[i] = True
             last = cumulative_lengths[i]
+
+
+@wp.kernel
+def greedy_successors(
+    cumulative_lengths: wp.array[wp.float32],
+    step_size: wp.float32,
+    out_successor: wp.array[wp.int32],
+) -> None:
+    # The greedy walk's step function, for every point at once: ``out_successor[i]`` is the point
+    # the walk would keep next *if* it had just kept ``i``, or ``n`` when the polyline ends first.
+    # The walk is then the orbit of 0 under this map, which ``spread_reached`` below enumerates in
+    # ``log2(n)`` rounds instead of ``n`` steps.
+    #
+    # A hand-written lower bound rather than ``array.binary_search_index_left`` because the
+    # predicate has to be **the serial kernel's, character for character**: ``cum[mid] - base`` and
+    # ``cum[mid] - step`` are not the same test in float32, so searching on a shifted key would
+    # move the accepted set at the boundary. It is monotone in ``mid`` because ``cum`` is
+    # non-decreasing, which is what makes the search valid at all.
+    i = wp.int32(wp.tid())
+    n = cumulative_lengths.shape[0]
+    base = cumulative_lengths[i]
+    lo = i + 1
+    hi = n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cumulative_lengths[mid] - base >= step_size:
+            hi = mid
+        else:
+            lo = mid + 1
+    out_successor[i] = lo
+
+
+@wp.kernel
+def square_successors(successor: wp.array[wp.int32], out_successor: wp.array[wp.int32]) -> None:
+    # One pointer-doubling round: ``succ^(2k)`` from ``succ^k``. ``n`` is the absorbing state (the
+    # walk has run off the end) and stays absorbing.
+    #
+    # Ping-ponged rather than written in place, and that is load-bearing: in place a thread could
+    # read a slot another thread had already doubled, giving ``succ^(a + b)`` for uncontrolled
+    # ``a``, ``b`` -- which breaks the round count's guarantee below.
+    i = wp.int32(wp.tid())
+    n = successor.shape[0]
+    j = successor[i]
+    out_successor[i] = wp.where(j >= n, n, successor[j])
+
+
+@wp.kernel
+def spread_reached(
+    successor: wp.array[wp.int32], reached: wp.array[wp.bool], out_keep: wp.array[wp.bool]
+) -> None:
+    # One round of doubling the *reached set*: given ``successor`` holding ``succ^(2^k)`` and
+    # ``reached`` holding ``{succ^t(0) : t < 2^k}``, mark ``succ^(t + 2^k)(0)`` for each of them, so
+    # the set covers ``t < 2^(k + 1)``. ``ceil(log2(n + 1))`` rounds therefore cover the whole
+    # orbit, whatever its length -- the walk advances by at least ``step_size`` each time, so the
+    # orbit is at most ``n`` long.
+    #
+    # ``reached`` and ``out_keep`` are **the same buffer**, updated in place, and unlike the
+    # doubling above that is safe *and* deliberate. Every write is ``True``, so a lost update is
+    # impossible; a thread that happens to see a mark written this round propagates one extra hop,
+    # which can only mark another point of the same orbit (``succ`` of an orbit point is one).
+    # So intermediate rounds are nondeterministic in *which* extra points they mark and the final
+    # answer is not, because the round count alone guarantees completeness.
+    i = wp.int32(wp.tid())
+    if reached[i]:
+        j = successor[i]
+        if j < successor.shape[0]:
+            out_keep[j] = True
 
 
 RDP_LINE_EPS = wp.constant(wp.float32(1.0e-7))  # libigl FLOAT_EPS: degenerate-segment threshold

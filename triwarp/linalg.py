@@ -1796,11 +1796,22 @@ def _multigrid_hierarchy(
         levels.append(level)
         if level.n <= _MULTIGRID_MAX_COARSE or len(levels) >= _MULTIGRID_MAX_LEVELS:
             break
-        label, n_aggregates = _multigrid_aggregate(operator, seed)
+        # One extraction per level, read by both consumers: the aggregation's strength test wants
+        # ``sqrt(|A_ii|)`` and the smoother wants ``1 / A_ii``. ``wps.bsr_get_diag`` is an
+        # allocation *and* a launch, and this ran it twice on the same operator until the two
+        # readings were noticed -- the aggregation used to extract its own.
+        #
+        # Measured by single attribution (an A/B of the whole hierarchy is inside its own noise):
+        # one ``bsr_get_diag`` is **0.089 ms** at n = 2 562 and **0.120 ms** at n = 10 242, and one
+        # is removed per coarsened level, so this is 0.089 of 13.3 ms (**0.7 %**) and 0.240 of
+        # 16.8 ms (**1.4 %**). Small, and unusually the share *grows* with the operator; the reason
+        # to do it is still that there is one diagonal rather than two.
+        diag = wps.bsr_get_diag(operator)
+        label, n_aggregates = _multigrid_aggregate(operator, diag, seed)
         if n_aggregates >= _MULTIGRID_MIN_COARSENING * level.n:
             break
         diagonal = wp.empty(level.n, dtype=wp.float64, device=operator.device)
-        wp.map(kernel_array.inverse_or_one, wps.bsr_get_diag(operator), out=diagonal)
+        wp.map(kernel_array.inverse_or_one, diag, out=diagonal)
         level.inverse_diagonal = diagonal
         level.omega = _MULTIGRID_JACOBI_FACTOR / _multigrid_spectral_radius(
             operator, diagonal, seed
@@ -1819,7 +1830,7 @@ def _multigrid_hierarchy(
 
 
 def _multigrid_aggregate(
-    matrix: wps.BsrMatrix[wp.float64], seed: int
+    matrix: wps.BsrMatrix[wp.float64], diagonal: wp.array[wp.float64], seed: int
 ) -> tuple[wp.array[wp.int32], int]:
     """
     Aggregate label per row, from a distance-2 maximal independent set on the off-diagonal graph.
@@ -1832,16 +1843,19 @@ def _multigrid_aggregate(
     Both walks are over the operator's **strong** off-diagonal graph
     (``|A_ij| >= _MULTIGRID_THETA sqrt(A_ii A_jj)``), tested per edge rather than materialized, so
     that a level pays no extra allocation for the filter and ``theta = 0`` is bit-exactly the
-    unfiltered aggregation.
+    unfiltered aggregation. ``diagonal`` is ``matrix``'s, passed in because the caller has already
+    extracted it for the smoother.
     """
     device = matrix.device
     n = int(matrix.nrow)
     offsets, columns, values = matrix.offsets, matrix.columns, matrix.values
     theta = wp.float64(_MULTIGRID_THETA)
-    # ``sqrt(|A_ii|)`` per row, so the strength test below is a product rather than a square
-    # root per edge. One ``(n,)`` buffer and two launches per level, read by both walks.
+    # ``sqrt(|A_ii|)`` per row, so the strength test below is a product rather than a square root
+    # per edge. One ``(n,)`` buffer and one map, read by both walks. The ``diagonal`` argument is
+    # the caller's -- the hierarchy needs the same extraction for the smoother, and extracting it
+    # here as well is what this used to do.
     scaled_diagonal = wp.empty(n, dtype=wp.float64, device=device)
-    wp.map(kernel_array.sqrt_abs, wps.bsr_get_diag(matrix), out=scaled_diagonal)
+    wp.map(kernel_array.sqrt_abs, diagonal, out=scaled_diagonal)
 
     priority = wp.empty(n, dtype=wp.uint32, device=device)
     wp.launch(

@@ -37,6 +37,7 @@ without that duplicate, which is the form
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 import warp as wp
@@ -47,6 +48,31 @@ from triwarp._device import read_scalar
 from triwarp.kernels import creation as kernel_creation
 from triwarp.kernels import polyline as kernel_polyline
 from triwarp.kernels.array import LOOP_CONDITION
+
+# Point count from which [`polyline_downsample`][triwarp.polyline.polyline_downsample] stops
+# walking its greedy selection serially and pointer-doubles it instead -- **on the CUDA device
+# only**; see below for why the CPU device never takes that branch.
+#
+# The serial walk is ~60 ns a point and the doubling costs ``2 ceil(log2(n + 1)) + 1`` launches, so
+# this is where a linear cost crosses a nearly flat one. Measured on an RTX 5090, Warp 1.16,
+# interleaved, ``min`` of 15, with the two masks verified **byte-identical** at every row:
+#
+# |      n |  serial | doubling |       |
+# |--------|---------|----------|-------|
+# |    528 | 0.066ms |  0.354ms | 0.19x |
+# |  2 048 | 0.153   |  0.416   | 0.37x |
+# |  4 096 | 0.269   |  0.434   | 0.62x |
+# |  8 192 | 0.499   |  0.430   | 1.16x |
+# | 16 384 | 0.963   |  0.502   | 1.92x |
+# | 65 536 | 3.735   |  0.556   | 6.72x |
+#
+# **On the CPU device the doubling loses at every size, by 9x at 528 points and 30x at 65 536**
+# (0.266 ms serial against 8.105 ms), and that is not the CUDA-decides trade of CLAUDE.md section
+# 13 -- it is an algorithm that does ``n log n`` work where the serial form does ``n``, on a backend
+# that runs a launch grid as one serial loop. There is no GPU win being paid for, so the branch
+# takes the device too. Warp's CPU walk is also *faster than CUDA's* (0.266 against 3.735 ms at
+# 65 536), having no launch to issue and a cache-friendly stride.
+_DOWNSAMPLE_DOUBLING_FROM = 8192
 
 
 def is_closed(polyline: wp.array[wp.vec3]) -> bool:
@@ -515,13 +541,54 @@ def polyline_downsample(
 
     cumulative = cumulative_arc_length(polyline)
     keep_mask = wp.zeros(n, dtype=wp.bool, device=device)
+    if wp.get_device(device).is_cuda and n >= _DOWNSAMPLE_DOUBLING_FROM:
+        _greedy_downsample_doubling(cumulative, step_size, keep_mask)
+    else:
+        wp.launch(
+            kernel_polyline.greedy_downsample_mask,
+            dim=1,
+            inputs=[cumulative, wp.float32(step_size), keep_mask],
+            device=device,
+        )
+    return tw.array.gather(polyline, tw.array.flatnonzero(keep_mask))
+
+
+def _greedy_downsample_doubling(
+    cumulative: wp.array[wp.float32], step_size: float, out_keep: wp.array[wp.bool]
+) -> None:
+    """
+    Mark the greedy walk's kept points by pointer-doubling its step function.
+
+    The kept set is the orbit of point 0 under "the next point at least ``step_size`` further
+    along", so building that step function for every point at once
+    ([`greedy_successors`][triwarp.kernels.polyline.greedy_successors]) turns an ``n``-step walk
+    into ``ceil(log2(n + 1))`` rounds of squaring it. The answer is the serial walk's, exactly and
+    not approximately: the successor search evaluates the same float32 comparison the walk does, so
+    the two masks agree bit for bit -- verified over 27 shapes including exact ties and heavily
+    clustered spacing.
+    """
+    device = cumulative.device
+    n = int(cumulative.shape[0])
+    successor = wp.empty(n, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_polyline.greedy_downsample_mask,
-        dim=1,
-        inputs=[cumulative, wp.float32(step_size), keep_mask],
+        kernel_polyline.greedy_successors,
+        dim=n,
+        inputs=[cumulative, wp.float32(step_size), successor],
         device=device,
     )
-    return tw.array.gather(polyline, tw.array.flatnonzero(keep_mask))
+    out_keep[:1].fill_(True)  # the walk always keeps the first point; the caller zeroed the rest
+    squared = wp.empty(n, dtype=wp.int32, device=device)
+    for _ in range(max(1, math.ceil(math.log2(n + 1)))):
+        wp.launch(
+            kernel_polyline.spread_reached,
+            dim=n,
+            inputs=[successor, out_keep, out_keep],
+            device=device,
+        )
+        wp.launch(
+            kernel_polyline.square_successors, dim=n, inputs=[successor, squared], device=device
+        )
+        successor, squared = squared, successor
 
 
 def polyline_simplify(

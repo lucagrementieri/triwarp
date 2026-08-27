@@ -17,6 +17,7 @@ from tests.conversions import (
     points_to_warp_uv,
     polyline_to_pyvista,
 )
+from triwarp.kernels import polyline as kernel_polyline
 
 
 def _random_open_polyline(seed: int, n: int = 12) -> np.ndarray:
@@ -696,6 +697,100 @@ def test_downsample_polyline_matches_reference(device: str, step: float) -> None
     pts_np = _random_open_polyline(60)
     downsampled_wp = tw.polyline.polyline_downsample(points_to_warp(pts_np, device), step)
     assert np.allclose(downsampled_wp.numpy(), _downsample_np(pts_np, step), rtol=1e-4, atol=1e-4)
+
+
+def test_downsample_polyline_branches_agree(device: str) -> None:
+    """
+    The pointer-doubling greedy selection is the serial walk's, exactly.
+
+    **Triwarp against triwarp**, not a parity assert: the oracle is the *serial* branch, which
+    ``test_downsample_polyline_matches_reference`` pins to a NumPy transcription of the same greedy
+    rule and ``test_downsample_polyline_matches_meshlib`` compares against ``decimatePolyline``.
+    This test carries no oracle of its own; it exists because
+    ``polyline_downsample`` picks between the two branches on the point count *and the device*
+    (``_DOWNSAMPLE_DOUBLING_FROM``, CUDA only), so on any single run one of them is never exercised
+    by the tests above.
+
+    The claim is **exact equality of the masks**, not a tolerance: the successor search evaluates
+    the same ``cumulative[j] - cumulative[i] >= step`` comparison the walk does, on the same
+    device-computed ``cumulative`` array, so nothing rounds differently. A tolerance here would hide
+    precisely the boundary disagreement the shared spelling exists to prevent.
+
+    Four spacings, because the interesting inputs are the ones at the comparison's boundary:
+    uniform-random; heavily clustered (a sixth power, so most segments are far below the step and a
+    few are far above); duplicated points (runs of zero-length segments, where several points sit at
+    the same arc length and the two forms must pick the same one); and an **exact** grid, where
+    ``cumulative[j] - cumulative[i]`` equals the step to the last bit and the two forms must agree
+    on whether that counts.
+
+    That last one is what makes this test bite. **Mutation probe:** loosening the successor search's
+    ``>=`` to ``>`` leaves every other spacing passing and fails on ``exact`` -- so without it the
+    test would not distinguish the predicate the whole shared-spelling argument rests on.
+    """
+    rng = np.random.default_rng(4)
+    for spacing in ("uniform", "clustered", "duplicates", "exact"):
+        n = 3000
+        if spacing == "uniform":
+            steps_np = rng.random(n - 1) * 0.01 + 1e-4
+        elif spacing == "clustered":
+            steps_np = rng.random(n - 1) ** 6 * 0.05
+        elif spacing == "duplicates":
+            steps_np = np.zeros(n - 1)
+            steps_np[::3] = 0.01
+        else:
+            # 0.25 and 1.0 are exact in float32, so cumulative[i + 4] - cumulative[i] == step.
+            steps_np = np.full(n - 1, 0.25)
+        cumulative_np = np.concatenate([[0.0], np.cumsum(steps_np)]).astype(np.float32)
+        cumulative_wp = wp.array(cumulative_np, dtype=wp.float32, device=device)
+        step = 1.0 if spacing == "exact" else float(4.0 * steps_np.mean())
+
+        serial_wp = wp.zeros(n, dtype=wp.bool, device=device)
+        wp.launch(
+            kernel_polyline.greedy_downsample_mask,
+            dim=1,
+            inputs=[cumulative_wp, wp.float32(step), serial_wp],
+            device=device,
+        )
+        doubling_wp = wp.zeros(n, dtype=wp.bool, device=device)
+        tw.polyline._greedy_downsample_doubling(cumulative_wp, step, doubling_wp)
+
+        assert int(serial_wp.numpy().sum()) > 1, f"{spacing}: the walk kept only the first point"
+        assert np.array_equal(serial_wp.numpy(), doubling_wp.numpy()), spacing
+
+
+def test_downsample_polyline_above_the_doubling_threshold(device: str) -> None:
+    """
+    ``polyline_downsample`` obeys its own spacing rule on an input past the branch point.
+
+    Not a library comparison: no reference downsamples to a *step*
+    (``decimatePolyline`` reaches a count, which is why
+    ``test_downsample_polyline_matches_meshlib`` has to convert one into the other), and at this
+    size a NumPy oracle would be comparing a ``float64`` sequential ``cumsum`` against Warp's
+    ``float32`` tree scan -- their difference over 8 192 segments is ~2e-4, which is the same order
+    as the gaps between decisions, so it would flag rounding as disagreement. The exactness claim
+    lives in ``test_downsample_polyline_branches_agree`` instead, against the branch that *is*
+    pinned to an oracle.
+
+    What the invariants exclude: a selection that keeps points closer together than the step (the
+    rule itself), that reorders or moves them (subsequence and membership), or that drops the ends
+    of the polyline it should start from.
+    """
+    n = 2 * tw.polyline._DOWNSAMPLE_DOUBLING_FROM
+    rng = np.random.default_rng(5)
+    points_np = np.cumsum(rng.standard_normal((n, 3)) * 0.01, axis=0)
+    step = 0.05
+    sparse_wp = tw.polyline.polyline_downsample(points_to_warp(points_np, device), step)
+
+    kept_np = sparse_wp.numpy()
+    assert 2 < kept_np.shape[0] < n, "vacuous: the selection kept everything or nothing"
+    assert np.allclose(kept_np[0], points_np[0], rtol=1e-5, atol=1e-5)
+    # Every kept point is an input point, in input order.
+    matches = np.array([int(np.argmin(np.linalg.norm(points_np - p, axis=1))) for p in kept_np])
+    assert np.all(np.diff(matches) > 0)
+    assert np.allclose(kept_np, points_np[matches], rtol=1e-5, atol=1e-5)
+    # Consecutive kept points are at least a step apart in arc length.
+    arc_np = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(points_np, axis=0), axis=1))])
+    assert np.all(np.diff(arc_np[matches]) >= step - 1e-4)
 
 
 @pytest.mark.parity("polyline_downsample", "meshlib")
