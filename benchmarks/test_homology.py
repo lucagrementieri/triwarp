@@ -45,7 +45,7 @@ References
 **meshlib** is the only library in the suite that computes a homology basis. potpourri3d does not
 bind geometry-central's homology code and neither trimesh nor libigl has one, which is why
 ``tests/test_homology.py`` otherwise stands on invariants. Its ``eliminateTunnels`` -- the consumer
-of this basis, benchmarked as ``eliminate_tunnels`` in ``benchmarks/test_repair.py`` -- is a no-op
+of this basis, benchmarked as ``remove_tunnels`` in ``benchmarks/test_repair.py`` -- is a no-op
 on every input probed, so that group has no meshlib row even though this one does.
 ``detectBasisTunnels`` returns a vector
 of ``EdgeId`` paths -- the same 2 * genus loops, though not the same ones, since a basis is not

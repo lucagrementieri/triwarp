@@ -2822,7 +2822,7 @@ def test_straighten_boundary_return_count_shapes(device: str) -> None:
     )
 
 
-def test_eliminate_degree3_vertices_return_count_shapes(device: str) -> None:
+def test_remove_degree3_vertices_return_count_shapes(device: str) -> None:
     """
     Not a library comparison: the two return shapes of the ``return_count`` keyword.
 
@@ -2835,10 +2835,10 @@ def test_eliminate_degree3_vertices_return_count_shapes(device: str) -> None:
         np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
     )
 
-    pair = tw.repair.eliminate_degree3_vertices(vertices_wp, faces_wp)
+    pair = tw.repair.remove_degree3_vertices(vertices_wp, faces_wp)
     assert len(pair) == 2
 
-    triple = tw.repair.eliminate_degree3_vertices(vertices_wp, faces_wp, return_count=True)
+    triple = tw.repair.remove_degree3_vertices(vertices_wp, faces_wp, return_count=True)
     assert len(triple) == 3
     assert triple[2] == 1  # non-vacuity: the fixture really has one valence-3 vertex
     assert np.allclose(pair[0].numpy(), triple[0].numpy(), rtol=1e-5, atol=1e-5)
@@ -2848,22 +2848,22 @@ def test_eliminate_degree3_vertices_return_count_shapes(device: str) -> None:
     )
 
 
-def test_eliminate_tunnels_count_is_unconditional(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+def test_remove_tunnels_count_is_unconditional(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Not a library comparison: that this count is *not* behind ``return_count``, deliberately.
 
-    Unlike the three diagnostics beside it, ``eliminated`` is the caller's documented
+    Unlike the three diagnostics beside it, ``removed`` is the caller's documented
     loop-termination signal -- one call cuts at most one tunnel per disjoint family, so the usage is
     to loop until it reads zero. A caller who could not see it could not use the function
     correctly, which is why it stays a third return element. Pinned so a future consistency pass
     does not sweep it up with the others.
     """
     _mesh_tm, mesh_wp = torus
-    result = tw.repair.eliminate_tunnels(mesh_wp.points, mesh_wp.indices, 1e-9)
+    result = tw.repair.remove_tunnels(mesh_wp.points, mesh_wp.indices, 1e-9)
     assert len(result) == 3
     assert isinstance(result[2], int)
     with pytest.raises(TypeError):
-        tw.repair.eliminate_tunnels(  # pyright: ignore[reportCallIssue]
+        tw.repair.remove_tunnels(  # pyright: ignore[reportCallIssue]
             mesh_wp.points, mesh_wp.indices, 1e-9, return_count=True
         )
 
@@ -2895,8 +2895,8 @@ def _mesh_with_a_degree3_vertex(bump: float = 0.0) -> tm.Trimesh:
     return tm.Trimesh(np.array(vertices), np.array(faces), process=False)
 
 
-@pytest.mark.parity("eliminate_degree3_vertices", "meshlib")
-def test_eliminate_degree3_vertices_mask_matches_meshlib(device: str) -> None:
+@pytest.mark.parity("remove_degree3_vertices", "meshlib")
+def test_remove_degree3_vertices_mask_matches_meshlib(device: str) -> None:
     """
     Class A on which vertices qualify, against ``findInnerVertsOfDegree(topology, 3)``.
 
@@ -2928,7 +2928,7 @@ def test_eliminate_degree3_vertices_mask_matches_meshlib(device: str) -> None:
         )
         assert int(degree3_np.sum()) == expected_removed
 
-        out_vertices_wp, out_faces_wp, removed = tw.repair.eliminate_degree3_vertices(
+        out_vertices_wp, out_faces_wp, removed = tw.repair.remove_degree3_vertices(
             vertices_wp, faces_wp, return_count=True
         )
         assert removed == expected_removed
@@ -2938,7 +2938,7 @@ def test_eliminate_degree3_vertices_mask_matches_meshlib(device: str) -> None:
         assert warp_to_trimesh(out_vertices_wp, out_faces_wp).is_watertight
 
 
-def test_eliminate_degree3_vertices_is_idempotent_and_area_preserving(device: str) -> None:
+def test_remove_degree3_vertices_is_idempotent_and_area_preserving(device: str) -> None:
     """
     Not a library comparison: the two properties that say the collapse was the right triangle.
 
@@ -2951,13 +2951,13 @@ def test_eliminate_degree3_vertices_is_idempotent_and_area_preserving(device: st
     vertices_wp, faces_wp = numpy_to_warp(
         np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
     )
-    out_vertices_wp, out_faces_wp, removed = tw.repair.eliminate_degree3_vertices(
+    out_vertices_wp, out_faces_wp, removed = tw.repair.remove_degree3_vertices(
         vertices_wp, faces_wp, return_count=True
     )
     assert removed == 1  # non-vacuity
     assert np.isclose(warp_to_trimesh(out_vertices_wp, out_faces_wp).area, mesh_tm.area, rtol=1e-6)
 
-    again_vertices_wp, again_faces_wp, again_removed = tw.repair.eliminate_degree3_vertices(
+    again_vertices_wp, again_faces_wp, again_removed = tw.repair.remove_degree3_vertices(
         out_vertices_wp, out_faces_wp, return_count=True
     )
     assert again_removed == 0
@@ -2965,7 +2965,7 @@ def test_eliminate_degree3_vertices_is_idempotent_and_area_preserving(device: st
     assert np.array_equal(again_vertices_wp.numpy(), out_vertices_wp.numpy())
 
     with pytest.raises(ValueError, match="max_iter must be non-negative"):
-        tw.repair.eliminate_degree3_vertices(vertices_wp, faces_wp, max_iter=-1)
+        tw.repair.remove_degree3_vertices(vertices_wp, faces_wp, max_iter=-1)
 
 
 @pytest.mark.parity("flatten_degree3_vertices", "meshlib")
@@ -3055,7 +3055,7 @@ def _genus(faces_wp: wp.array[wp.int32]) -> int:
 
 
 @pytest.mark.parity(
-    "eliminate_tunnels",
+    "remove_tunnels",
     "trimesh",
     "open3d",
     benchmarked=False,
@@ -3068,7 +3068,7 @@ def _genus(faces_wp: wp.array[wp.int32]) -> int:
     "groups.",
 )
 @pytest.mark.parametrize("mesh_name", ["torus", "genus_two"])
-def test_eliminate_tunnels_drops_the_genus_by_the_count_it_reports(
+def test_remove_tunnels_drops_the_genus_by_the_count_it_reports(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
@@ -3084,7 +3084,7 @@ def test_eliminate_tunnels_drops_the_genus_by_the_count_it_reports(
 
     So the *output* has nothing to be compared against, and the invariant carries the claim: cutting
     a surface along a non-separating cycle and sealing the two rims drops the genus by **one**, so
-    chi must rise by exactly ``2 * eliminated``. What the invariant must not do is measure itself.
+    chi must rise by exactly ``2 * removed``. What the invariant must not do is measure itself.
     Read only through [`euler_characteristic`][triwarp.measures.euler_characteristic], the assertion
     is triwarp's cut checked by triwarp's chi, and this group has no other oracle at all -- so chi
     is read a second time off ``trimesh.Trimesh.euler_number``, and the manifold post-conditions off
@@ -3114,14 +3114,12 @@ def test_eliminate_tunnels_drops_the_genus_by_the_count_it_reports(
         tw.measures.euler_characteristic(faces_wp)
     )
 
-    cut_vertices_wp, cut_faces_wp, eliminated = tw.repair.eliminate_tunnels(
-        vertices_wp, faces_wp, 1e9
-    )
-    assert eliminated >= 1
+    cut_vertices_wp, cut_faces_wp, removed = tw.repair.remove_tunnels(vertices_wp, faces_wp, 1e9)
+    assert removed >= 1
     assert tw.measures.euler_characteristic(cut_faces_wp) == (
-        tw.measures.euler_characteristic(faces_wp) + 2 * eliminated
+        tw.measures.euler_characteristic(faces_wp) + 2 * removed
     )
-    assert _genus(cut_faces_wp) == genus_before - eliminated
+    assert _genus(cut_faces_wp) == genus_before - removed
     assert tw.validation.is_edge_manifold(cut_faces_wp)
     assert len(tw.boundary.boundary_loops(cut_vertices_wp, cut_faces_wp)) == 0
     labels_np = tw.adjacency.face_connected_component_labels(cut_faces_wp).numpy()
@@ -3131,18 +3129,18 @@ def test_eliminate_tunnels_drops_the_genus_by_the_count_it_reports(
 
     # The genus drop, and the two properties that stop a shattering cut, read by other libraries.
     cut_tm = warp_to_trimesh(cut_vertices_wp, cut_faces_wp)
-    assert cut_tm.euler_number == tw.measures.euler_characteristic(faces_wp) + 2 * eliminated
+    assert cut_tm.euler_number == tw.measures.euler_characteristic(faces_wp) + 2 * removed
     mesh_o3d = trimesh_to_open3d(cut_tm)
     assert mesh_o3d.is_edge_manifold(allow_boundary_edges=False)
     assert mesh_o3d.is_vertex_manifold()
 
 
-def test_eliminate_tunnels_iterates_to_a_sphere(genus_two: tuple[tm.Trimesh, wp.Mesh]) -> None:
+def test_remove_tunnels_iterates_to_a_sphere(genus_two: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Not a library comparison: see above. This pins the documented "call it again" contract.
 
     One call takes at most one loop per vertex-disjoint family, so a basis whose loops all overlap
-    needs another round. The docstring tells callers to loop until ``eliminated`` is ``0``, and this
+    needs another round. The docstring tells callers to loop until ``removed`` is ``0``, and this
     is that loop: a genus-2 union reaches genus 0 in **two** rounds and the third reports nothing,
     which is both the termination proof and the reason the count is not just the genus.
     """
@@ -3150,8 +3148,8 @@ def test_eliminate_tunnels_iterates_to_a_sphere(genus_two: tuple[tm.Trimesh, wp.
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
     rounds = 0
     while True:
-        vertices_wp, faces_wp, eliminated = tw.repair.eliminate_tunnels(vertices_wp, faces_wp, 1e9)
-        if eliminated == 0:
+        vertices_wp, faces_wp, removed = tw.repair.remove_tunnels(vertices_wp, faces_wp, 1e9)
+        if removed == 0:
             break
         rounds += 1
         assert rounds <= 4  # it must terminate, and two rounds is what this fixture takes
@@ -3160,7 +3158,7 @@ def test_eliminate_tunnels_iterates_to_a_sphere(genus_two: tuple[tm.Trimesh, wp.
     assert tw.validation.is_edge_manifold(faces_wp)
 
 
-def test_eliminate_tunnels_leaves_a_long_tunnel_and_a_sphere_alone(
+def test_remove_tunnels_leaves_a_long_tunnel_and_a_sphere_alone(
     torus: tuple[tm.Trimesh, wp.Mesh], icosphere: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
@@ -3171,23 +3169,23 @@ def test_eliminate_tunnels_leaves_a_long_tunnel_and_a_sphere_alone(
     a genus-0 input has no basis at all, so it returns before cutting anything.
     """
     _, torus_wp = torus
-    kept_vertices_wp, kept_faces_wp, eliminated = tw.repair.eliminate_tunnels(
+    kept_vertices_wp, kept_faces_wp, removed = tw.repair.remove_tunnels(
         torus_wp.points, torus_wp.indices, 0.5
     )
-    assert eliminated == 0
+    assert removed == 0
     assert np.array_equal(kept_faces_wp.numpy(), torus_wp.indices.numpy())
     assert np.array_equal(kept_vertices_wp.numpy(), torus_wp.points.numpy())
 
     _, sphere_wp = icosphere
     assert _genus(sphere_wp.indices) == 0
-    _, sphere_faces_wp, sphere_eliminated = tw.repair.eliminate_tunnels(
+    _, sphere_faces_wp, sphere_removed = tw.repair.remove_tunnels(
         sphere_wp.points, sphere_wp.indices, 1e9
     )
-    assert sphere_eliminated == 0
+    assert sphere_removed == 0
     assert np.array_equal(sphere_faces_wp.numpy(), sphere_wp.indices.numpy())
 
     with pytest.raises(ValueError, match="max_length must be non-negative"):
-        tw.repair.eliminate_tunnels(torus_wp.points, torus_wp.indices, -1.0)
+        tw.repair.remove_tunnels(torus_wp.points, torus_wp.indices, -1.0)
 
 
 def test_remove_t_vertices_flips_the_sliver(

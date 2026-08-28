@@ -36,12 +36,32 @@ The verb predicts the return shape, and that is a rule rather than a coincidence
   property-fixers beside it ([`make_winding_consistent`][triwarp.repair.make_winding_consistent],
   [`make_volume`][triwarp.repair.make_volume],
   [`make_normals_outward`][triwarp.repair.make_normals_outward]) return ``faces``.
+- **A verb that only *moves* vertices** returns the positions alone, since neither buffer of indices
+  changes: [`flatten_degree3_vertices`][triwarp.repair.flatten_degree3_vertices] is the only one,
+  and it is here rather than in [`triwarp.smoothing`][triwarp.smoothing] -- whose every member has
+  that same signature -- because it is the gentler half of a pair with
+  [`remove_degree3_vertices`][triwarp.repair.remove_degree3_vertices]: same defect, same test, one
+  answering it by deleting the vertex and one by flattening the bump. Splitting the pair across two
+  modules to satisfy the shape rule would cost more than the exception does.
 - **``*_mask``** are detectors: they return a ``wp.array[wp.bool]`` and mutate nothing. The one this
   module used to hold now lives in [`triwarp.validation`][triwarp.validation].
 
-[`flip_t_vertices`][triwarp.repair.flip_t_vertices] is named for the third pattern rather than the
-first because it removes nothing: it flips the long edge of each sliver a T-junction leaves, so the
-face count is unchanged and only ``faces`` comes back.
+Two names carry a verb of their own and follow one of the rules anyway, which is worth saying so the
+list does not read as exhaustive. [`flip_t_vertices`][triwarp.repair.flip_t_vertices] is named for
+the ``make_*`` pattern rather than the ``remove_*`` one because it removes nothing: it flips the
+long edge of each sliver a T-junction leaves, so the face count is unchanged and only ``faces``
+comes back. [`straighten_boundary`][triwarp.repair.straighten_boundary] is the same shape under a
+geometric verb. And [`fix_self_intersections`][triwarp.repair.fix_self_intersections],
+[`split_non_manifold_vertices`][triwarp.repair.split_non_manifold_vertices],
+[`collapse_small_triangles`][triwarp.repair.collapse_small_triangles] and
+[`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces] all change the element count
+and all return what the first rule says.
+
+There is no ``eliminate_*``. Two functions used to spell it that way and both opened their own
+summary line with the word *"Remove"* -- one verb in the name and another in the sentence
+mkdocstrings renders beside it -- so they are
+[`remove_degree3_vertices`][triwarp.repair.remove_degree3_vertices] and
+[`remove_tunnels`][triwarp.repair.remove_tunnels].
 """
 
 from __future__ import annotations
@@ -1113,7 +1133,7 @@ def straighten_boundary(
     return (faces, added) if return_count else faces
 
 
-def eliminate_degree3_vertices(
+def remove_degree3_vertices(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     *,
@@ -1162,7 +1182,7 @@ def eliminate_degree3_vertices(
     faces : wp.array[wp.int32]
         Flat triangle index buffer, three faces shorter per removed vertex plus one longer.
     removed : int, optional
-        Present when ``return_count=True``. How many vertices were eliminated. Zero means the input
+        Present when ``return_count=True``. How many vertices were removed. Zero means the input
         had none and the buffers are it. A diagnostic: the pass loop stops itself when a pass finds
         no candidate, so nothing about calling this correctly depends on reading the count.
 
@@ -1256,7 +1276,7 @@ def flatten_degree3_vertices(
     makes a subdivision, a decimation or a hole fill stop leaving visible pimples.
 
     The gentler half of a pair.
-    [`eliminate_degree3_vertices`][triwarp.repair.eliminate_degree3_vertices]
+    [`remove_degree3_vertices`][triwarp.repair.remove_degree3_vertices]
     answers the same defect by deleting the vertex and keeping one triangle, which changes the
     connectivity; this keeps every vertex and every face and only moves positions, so a caller
     holding per-vertex attributes or a face selection can use it and the other one would invalidate
@@ -1296,7 +1316,7 @@ def flatten_degree3_vertices(
 
     See Also
     --------
-    [`eliminate_degree3_vertices`][triwarp.repair.eliminate_degree3_vertices]
+    [`remove_degree3_vertices`][triwarp.repair.remove_degree3_vertices]
         The topological answer to the same defect: delete the vertex instead of moving it.
     [`equalize_triangle_areas`][triwarp.smoothing.equalize_triangle_areas]
         Relaxes every vertex toward an area objective, where this hard-sets only the valence-3 ones.
@@ -1781,7 +1801,7 @@ def _dilate_face_mask(
     return tw.array.indices_to_mask(grown_faces, n_faces, device=device)
 
 
-def eliminate_tunnels(
+def remove_tunnels(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     max_length: float,
@@ -1799,7 +1819,7 @@ def eliminate_tunnels(
     ([`shorten_loop`][triwarp.geodesic_walk.shorten_loop]), keep the ones that come in under
     ``max_length``, cut along those and fill the boundary loops the cut opens. Cutting a surface
     along a non-separating cycle and sealing the two rims it creates drops the genus by exactly one,
-    so ``2 * eliminated`` is the rise in
+    so ``2 * removed`` is the rise in
     [`euler_characteristic`][triwarp.measures.euler_characteristic] -- verified rather than
     reported, and the invariant to assert if you extend this.
 
@@ -1813,8 +1833,8 @@ def eliminate_tunnels(
         split by both cuts at once -- and without the restriction the genus stops dropping one per
         loop: measured on a genus-2 union, two overlapping basis loops dropped it by one, and
         cutting the whole basis shattered the surface into four spheres. The cost is that one call
-        eliminates at most one tunnel per disjoint family, so a mesh whose basis loops all overlap
-        needs to be run again. Call it in a loop until ``eliminated`` is ``0``; on that genus-2
+        removes at most one tunnel per disjoint family, so a mesh whose basis loops all overlap
+        needs to be run again. Call it in a loop until ``removed`` is ``0``; on that genus-2
         union that is two rounds to reach a sphere, and the third round is the one that stops.
 
     Parameters
@@ -1825,7 +1845,7 @@ def eliminate_tunnels(
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer. Must be a closed, connected,
         edge-manifold surface, which is what the homology basis needs.
     max_length
-        Loops at or under this length are eliminated. It is an absolute length in the mesh's own
+        Loops at or under this length are removed. It is an absolute length in the mesh's own
         units, so scale it off something intrinsic -- the mean edge length times the number of
         triangles a real handle would take to go round.
     metric
@@ -1844,15 +1864,15 @@ def eliminate_tunnels(
         over their own vertices.
     faces : wp.array[wp.int32]
         Flat ``3 * n_faces`` triangle index buffer, the cut mesh plus the fill triangles.
-    eliminated : int
+    removed : int
         How many loops were cut. Zero means nothing was short enough, and the buffers are the
         input's.
 
         Returned **unconditionally**, unlike the diagnostic counts on
         [`straighten_boundary`][triwarp.repair.straighten_boundary] and
-        [`eliminate_degree3_vertices`][triwarp.repair.eliminate_degree3_vertices], which sit behind
+        [`remove_degree3_vertices`][triwarp.repair.remove_degree3_vertices], which sit behind
         a ``return_count`` keyword. This one is part of the answer rather than a report on it: one
-        call eliminates at most one tunnel per disjoint family, so the documented usage is to loop
+        call removes at most one tunnel per disjoint family, so the documented usage is to loop
         until it reads zero, and a caller who cannot see it cannot use the function correctly.
         [`remesh.intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay]'s iteration count is
         unconditional for the same reason.
@@ -1909,7 +1929,7 @@ def _disjoint_loops(loops: list[wp.array[wp.int32]]) -> list[wp.array[wp.int32]]
     the shared vertex is split by both cuts at once, and the genus stops dropping by one per loop.
     Measured on a genus-2 union, two overlapping basis loops dropped the genus by one rather than
     two, and cutting the whole basis shattered the surface into four spheres. Keeping the selection
-    pairwise disjoint is what makes ``eliminated`` mean what it says.
+    pairwise disjoint is what makes ``removed`` mean what it says.
     """
     claimed: set[int] = set()
     kept: list[wp.array[wp.int32]] = []

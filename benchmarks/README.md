@@ -300,7 +300,7 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
   | `loop_perimeters[bunny]` | 0.196 | 0.034 | 82 % | 10 |
   | `triangulate_polyline[sphere_small, 64]` | 1.176 | 0.271 | 77 % | 22 |
   | `fillable_loop_mask[bunny]` | 1.287 | 0.217 | 83 % | 35 |
-  | `eliminate_degree3_vertices[bunny]` | 2.545 | 0.333 | 87 % | 75 |
+  | `remove_degree3_vertices[bunny]` | 2.545 | 0.333 | 87 % | 75 |
 
   So the rule for this band is **attribute before optimizing, and expect a floor row**. The
   exception is worth knowing because it is what the attribution is *for*: the same sweep found one
