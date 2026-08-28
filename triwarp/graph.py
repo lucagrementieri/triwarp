@@ -931,14 +931,14 @@ def shortest_path_envelope(
     which is the cheaper side of that trade — see the ``linalg`` note on ``check_every``.
 
     For distance *across* a surface rather than along its edges — shorter, and what "geodesic"
-    usually means — use [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]. The edge-graph
+    usually means — use [`heat_geodesic`][triwarp.heat.heat_geodesic]. The edge-graph
     distance is an upper bound on it.
 
     See Also
     --------
     [`edges_to_csr`][triwarp.graph.edges_to_csr]
     [`bfs`][triwarp.graph.bfs]
-    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
+    [`heat_geodesic`][triwarp.heat.heat_geodesic]
     [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]
     [`scipy.sparse.csgraph.dijkstra`][]
     """

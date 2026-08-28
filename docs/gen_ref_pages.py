@@ -10,11 +10,12 @@ root = Path(__file__).parent.parent
 src = root / "triwarp"
 
 # Curated theme groups. Order within a group matters: it is the docs nav order for that
-# section. Every public module under triwarp/ — including subpackages such as triwarp/heat/,
-# named by its dotted path relative to the package, and excluding triwarp/kernels/,
-# __init__.py and private "_*.py" modules — must appear in exactly one group below. The guard
-# at the bottom fails the build otherwise, so adding a new module without classifying it here
-# is caught immediately rather than silently falling back to a flat alphabetical list.
+# section. Every public module under triwarp/ — excluding triwarp/kernels/, __init__.py and
+# private "_*.py" modules — must appear in exactly one group below, and the guard at the bottom
+# fails the build otherwise, so adding a new module without classifying it here is caught
+# immediately rather than silently falling back to a flat alphabetical list. The package is flat
+# today; the guard walks rglob and names a module by its dotted path, so a future subpackage
+# would surface as an unmapped dotted name rather than be skipped.
 SECTIONS: dict[str, list[str]] = {
     "Primitives & creation": ["creation"],
     "Mesh structure & topology": [
@@ -67,14 +68,9 @@ SECTIONS: dict[str, list[str]] = {
     # ``geodesic_walk`` first: a direct combinatorial walk is the simpler thing, and section 11
     # orders a section by expected frequency of use. It is listed here rather than under
     # "Spatial queries" so the package's two geodesic entry points -- the walk and
-    # ``heat.distance.heat_geodesic`` -- are shelved together; a module may appear in exactly one
-    # section, so widening this one is the fix and moving ``heat_geodesic`` is not.
-    "Geodesics & heat-method solvers": [
-        "geodesic_walk",
-        "heat.distance",
-        "heat.vector",
-        "heat.signed",
-    ],
+    # ``heat.heat_geodesic`` -- are shelved together; a module may appear in exactly one section,
+    # so widening this one is the fix and moving ``heat_geodesic`` is not.
+    "Geodesics & heat-method solvers": ["geodesic_walk", "heat"],
     "Curves": ["polyline"],
     "Attributes & I/O": ["texture", "io"],
     "Arrays & infrastructure": ["array", "reduce", "grouping", "graph", "typing", "constants"],

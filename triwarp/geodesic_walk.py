@@ -13,11 +13,11 @@ come back packed into one buffer with CSR offsets, the same shape
 [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched] uses.
 
 [`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex] is the **exponential map** of the
-surface, and its inverse is [`log_map`][triwarp.heat.vector.log_map]: one takes a tangent direction
+surface, and its inverse is [`log_map`][triwarp.heat.log_map]: one takes a tangent direction
 and a distance to a point, the other takes a point back to the direction and distance that reach it.
 The two live apart because they are different methods -- this one unfolds triangles combinatorially,
 that one solves a vector-heat system -- and geodesic *distance* by the heat method is a third,
-[`heat_geodesic`][triwarp.heat.distance.heat_geodesic].
+[`heat_geodesic`][triwarp.heat.heat_geodesic].
 
 !!! note "Cone points"
     A path that runs exactly into a vertex has no unique straightest continuation — the angle around
@@ -102,7 +102,7 @@ def trace_from_vertex(
     --------
     [`trace_from_face`][triwarp.geodesic_walk.trace_from_face]
     [`trace_polylines`][triwarp.geodesic_walk.trace_polylines]
-    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
+    [`heat_geodesic`][triwarp.heat.heat_geodesic]
     """
     device = vertices.device
     n_rays = int(start_vertices.shape[0])
@@ -349,7 +349,7 @@ def geodesic_path(
     Trace a path across the surface from each target vertex back to a source set.
 
     The **point-to-point** geodesic, as against this module's straightest walks and
-    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]'s distance *field*: one heat solve gives
+    [`heat_geodesic`][triwarp.heat.heat_geodesic]'s distance *field*: one heat solve gives
     the distance to the source everywhere, and descending it from a target follows that geodesic
     back. Every target shares the one solve, so a thousand paths to one source cost one system and a
     thousand independent walks -- which is why the signature is one source and many targets rather
@@ -368,9 +368,9 @@ def geodesic_path(
         ``(n_paths,)`` ``wp.int32`` vertices to trace from.
     t
         Heat diffusion time, forwarded to
-        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]. ``None`` uses its default.
+        [`heat_geodesic`][triwarp.heat.heat_geodesic]. ``None`` uses its default.
     operators
-        Prebuilt [`HeatOperators`][triwarp.heat.distance.HeatOperators] for this mesh, to spare the
+        Prebuilt [`HeatOperators`][triwarp.heat.HeatOperators] for this mesh, to spare the
         factorization when several sources are traced on one mesh.
     max_steps
         Cap on steps per path.
@@ -405,10 +405,10 @@ def geodesic_path(
     --------
     [`descend_field`][triwarp.geodesic_walk.descend_field]
         The walk itself, for descending any other scalar field.
-    [`triwarp.heat.distance.heat_geodesic`][triwarp.heat.distance.heat_geodesic]
+    [`triwarp.heat.heat_geodesic`][triwarp.heat.heat_geodesic]
         The field, when the distance is wanted and not the path.
     """
-    distance = tw.heat.distance.heat_geodesic(vertices, faces, source, t, operators)  # type: ignore[arg-type]
+    distance = tw.heat.heat_geodesic(vertices, faces, source, t, operators)  # type: ignore[arg-type]
     return descend_field(vertices, faces, distance, targets, stop_value=0.0, max_steps=max_steps)
 
 

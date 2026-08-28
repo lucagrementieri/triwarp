@@ -467,7 +467,7 @@ def test_descend_field_stops_at_a_local_minimum_and_at_a_boundary(
     _, sphere_wp = icosphere
     device = sphere_wp.points.device
     source_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
-    distance_wp = tw.heat.distance.heat_geodesic(sphere_wp.points, sphere_wp.indices, source_wp)
+    distance_wp = tw.heat.heat_geodesic(sphere_wp.points, sphere_wp.indices, source_wp)
     at_source_wp, offsets_wp = tw.geodesic_walk.descend_field(
         sphere_wp.points, sphere_wp.indices, distance_wp, source_wp
     )
@@ -479,7 +479,7 @@ def test_descend_field_stops_at_a_local_minimum_and_at_a_boundary(
     mesh_tm, hemi_wp = hemisphere
     rim_wp = tw.boundary.boundary_vertex_indices(hemi_wp.points, hemi_wp.indices)
     assert int(rim_wp.shape[0]) > 0
-    hemi_distance_wp = tw.heat.distance.heat_geodesic(hemi_wp.points, hemi_wp.indices, rim_wp[:1])
+    hemi_distance_wp = tw.heat.heat_geodesic(hemi_wp.points, hemi_wp.indices, rim_wp[:1])
     interior_np = np.setdiff1d(
         np.arange(mesh_tm.vertices.shape[0], dtype=np.int32), rim_wp.numpy()
     )[:8]
@@ -513,7 +513,7 @@ def test_descend_field_accepts_the_precomputed_pair_values_first(
     device = mesh_wp.points.device
     n_vertices = int(mesh_wp.points.shape[0])
     source_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
-    distance_wp = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, source_wp)
+    distance_wp = tw.heat.heat_geodesic(mesh_wp.points, mesh_wp.indices, source_wp)
     starts_wp = wp.array(np.arange(1, 9, dtype=np.int32), dtype=wp.int32, device=device)
 
     derived_points, derived_offsets = tw.geodesic_walk.descend_field(

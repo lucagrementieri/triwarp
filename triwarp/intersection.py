@@ -205,7 +205,7 @@ def marching_triangles(
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
     values
         ``(n_vertices,)`` scalar field, ``wp.float32`` or ``wp.float64``. A ``float64`` field (what
-        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] returns) is interpolated in
+        [`heat_geodesic`][triwarp.heat.heat_geodesic] returns) is interpolated in
         ``float64``.
     isovalue
         Level to extract.
@@ -233,7 +233,7 @@ def marching_triangles(
     --------
     [`clip_mesh_with_field`][triwarp.intersection.clip_mesh_with_field]
     [`mesh_with_plane`][triwarp.intersection.mesh_with_plane]
-    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
+    [`heat_geodesic`][triwarp.heat.heat_geodesic]
     [`polyline_length`][triwarp.polyline.polyline_length]
     ``potpourri3d.MarchingTrianglesSolver``
     """
@@ -934,7 +934,7 @@ def clip_mesh_with_field(
     against the crossing points. The caller supplies the field, so one implementation covers
     clipping by a plane, by another surface's signed distance
     ([`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]), by a box, by geodesic
-    distance ([`heat_geodesic`][triwarp.heat.distance.heat_geodesic]) or by any per-vertex quantity
+    distance ([`heat_geodesic`][triwarp.heat.heat_geodesic]) or by any per-vertex quantity
     the caller can threshold.
 
     Parameters
@@ -988,12 +988,12 @@ def clip_mesh_with_field(
     Examples
     --------
     Keep the geodesic disk of radius 1 around vertex 0, sealed into a solid. The field is the
-    ``float64`` one [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] returns, and the region
+    ``float64`` one [`heat_geodesic`][triwarp.heat.heat_geodesic] returns, and the region
     wanted is the *near* side, so the field enters negated:
 
     ```python
     source = wp.array([0], dtype=wp.int32, device=v.device)
-    distance = tw.heat.distance.heat_geodesic(v, f, source)
+    distance = tw.heat.heat_geodesic(v, f, source)
     negated = wp.empty_like(distance)
     wp.map(wp.neg, distance, out=negated)
     disk_v, disk_f = tw.intersection.clip_mesh_with_field(v, f, negated, -1.0, cap=True)

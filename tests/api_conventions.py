@@ -16,8 +16,9 @@ test run on any violation:
    ``*mask`` parameter) is named for its input and is exempt.
 3. **A module summary does not end in "(Warp)" or "on NVIDIA Warp".** The whole package is Warp.
 4. **Every module has a test file and a benchmark file named for it**, and every ``test_*.py`` in
-   either suite corresponds to a module -- ``tests/test_heat_distance.py`` for
-   ``triwarp/heat/distance.py``, dots becoming underscores.
+   either suite corresponds to a module -- ``tests/test_holes.py`` for ``triwarp/holes.py``. The
+   package is flat, so the mapping is the module name and nothing else; the dotted-path transform
+   this used to carry existed for ``triwarp/heat/``, the one subpackage, and went with it.
 5. **A private name stays inside its module.** A ``_helper`` imported across a module boundary is a
    function that should have been public, and the alias-on-import (``import _x as x``) is the tell.
 6. **Two modules do not export the same public name**, outside a written allowlist.
@@ -689,7 +690,7 @@ def warp_suffix_problems() -> list[str]:
 
 def coverage_location_problems() -> list[str]:
     """Check 4: a suite file that mirrors no module, or a module with no file in a suite."""
-    modules = {name.replace(".", "_") for name in scan_package().modules}
+    modules = set(scan_package().modules)
     problems: list[str] = []
     for directory, extras, exempt in (
         (_TESTS_DIR, _EXTRA_TEST_FILES, _MODULES_WITHOUT_TESTS),
@@ -701,13 +702,11 @@ def coverage_location_problems() -> list[str]:
         stems = {path.stem.removeprefix("test_") for path in directory.glob("test_*.py")}
         for stem in sorted(stems - modules - extras):
             problems.append(
-                f"{suite}/test_{stem}.py: mirrors no module -- name it for the one it covers "
-                "(dots become underscores, so triwarp/heat/distance.py is test_heat_distance.py)"
+                f"{suite}/test_{stem}.py: mirrors no module -- name it for the one it covers"
             )
-        for module in sorted(modules - stems - {name.replace(".", "_") for name in exempt}):
+        for module in sorted(modules - stems - exempt):
             problems.append(
-                f"triwarp/{module.replace('_', '/')}.py: no {suite}/test_{module}.py -- "
-                "coverage is per module"
+                f"triwarp/{module}.py: no {suite}/test_{module}.py -- coverage is per module"
             )
     return problems
 
@@ -866,8 +865,8 @@ def allocation_device_problems() -> list[str]:
     """
     Check 10: a Python-scope allocation that does not name the device it allocates on.
 
-    Walks the whole package rather than ``scan_package``'s public subset -- ``_device.py`` and
-    ``heat/`` allocate too, and a buffer landing on the wrong device is not a question about the
+    Walks the whole package rather than ``scan_package``'s public subset -- private ``_*.py``
+    modules allocate too, and a buffer landing on the wrong device is not a question about the
     API's shape. ``kernels/`` is excluded because a kernel allocates nothing at Python scope.
     """
     problems: list[str] = []

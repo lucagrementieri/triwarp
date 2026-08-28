@@ -922,7 +922,7 @@ class Trimesh:
         Every consumer accepts either precision and casts to the *matrix* dtype in one build, so
         pass this to [`cotmatrix`][triwarp.laplacian.cotmatrix],
         [`connection_laplacian`][triwarp.laplacian.connection_laplacian],
-        [`heat_operators`][triwarp.heat.distance.heat_operators] or
+        [`heat_operators`][triwarp.heat.heat_operators] or
         [`crouzeix_raviart_cotmatrix`][triwarp.energies.crouzeix_raviart_cotmatrix] at either
         precision -- which is what this class's own ``float32`` `cotmatrix` and ``float64``
         `heat_operators` both do.
@@ -1034,11 +1034,11 @@ class Trimesh:
         )
 
     @_CachedProperty
-    def heat_operators(self) -> tw.heat.distance.HeatOperators:
+    def heat_operators(self) -> tw.heat.HeatOperators:
         """
         Source-independent operator bundle for the heat method, at the default diffusion time.
 
-        Pass it to [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] or
+        Pass it to [`heat_geodesic`][triwarp.heat.heat_geodesic] or
         [`geodesic_path`][triwarp.geodesic_walk.geodesic_path] through their ``operators=``
         argument: everything in the bundle depends on the mesh alone, so distance from many
         different source sets costs one assembly.
@@ -1047,29 +1047,29 @@ class Trimesh:
         -----
         At ``t = None`` (the squared mean unique-edge length, ``igl::heat_geodesics``' default) and
         ``use_robust=False``. A mesh with degenerate triangles, or a caller sweeping ``t``, wants
-        [`heat_operators`][triwarp.heat.distance.heat_operators] directly -- and can still pass this
+        [`heat_operators`][triwarp.heat.heat_operators] directly -- and can still pass this
         class's `cotmatrix_entries` into it.
 
         See Also
         --------
-        [`triwarp.heat.distance.heat_operators`][]
+        [`triwarp.heat.heat_operators`][]
         [`vector_heat_operators`][triwarp.mesh.Trimesh.vector_heat_operators]
         """
-        return tw.heat.distance.heat_operators(
+        return tw.heat.heat_operators(
             self._vertices, self._faces, cot_entries=self.cotmatrix_entries
         )
 
     @_CachedProperty
-    def vector_heat_operators(self) -> tw.heat.vector.VectorHeatOperators:
+    def vector_heat_operators(self) -> tw.heat.VectorHeatOperators:
         """
         Operator bundle for the vector heat method, at the default diffusion time.
 
         ``(vector_system, scalar, frames)``: the ``2 x 2``-block connection system, the scalar
         `heat_operators` and the `vertex_tangent_frames`. Pass it to
-        [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors],
-        [`log_map`][triwarp.heat.vector.log_map],
-        [`extend_scalar`][triwarp.heat.vector.extend_scalar] or
-        [`heat_signed_distance`][triwarp.heat.signed.heat_signed_distance] through their
+        [`transport_tangent_vectors`][triwarp.heat.transport_tangent_vectors],
+        [`log_map`][triwarp.heat.log_map],
+        [`extend_scalar`][triwarp.heat.extend_scalar] or
+        [`heat_signed_distance`][triwarp.heat.heat_signed_distance] through their
         ``operators=`` argument.
 
         Its last two fields are this class's own `heat_operators` and `vertex_tangent_frames`, so
@@ -1078,17 +1078,17 @@ class Trimesh:
         Notes
         -----
         At ``t = None``, the same default `heat_operators` uses -- which is load-bearing rather
-        than incidental: [`log_map`][triwarp.heat.vector.log_map]'s radius is asserted to *be* the
-        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] distance, so the two systems must
+        than incidental: [`log_map`][triwarp.heat.log_map]'s radius is asserted to *be* the
+        [`heat_geodesic`][triwarp.heat.heat_geodesic] distance, so the two systems must
         share a diffusion time.
 
         See Also
         --------
-        [`triwarp.heat.vector.vector_heat_operators`][]
+        [`triwarp.heat.vector_heat_operators`][]
         [`heat_operators`][triwarp.mesh.Trimesh.heat_operators]
         [`vertex_tangent_frames`][triwarp.mesh.Trimesh.vertex_tangent_frames]
         """
-        return tw.heat.vector.vector_heat_operators(
+        return tw.heat.vector_heat_operators(
             self._vertices,
             self._faces,
             scalar_operators=self.heat_operators,

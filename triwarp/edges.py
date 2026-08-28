@@ -355,8 +355,8 @@ def mean_unique_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int3
     Each edge is counted once, however many faces share it. This is the definition
     ``igl::avg_edge_length`` and MeshLab's ``avg_edge_length`` both use, and the one
     ``igl::heat_geodesics`` picks its diffusion timestep from -- so it is what
-    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] and
-    [`vector_heat_operators`][triwarp.heat.vector.vector_heat_operators] use here.
+    [`heat_geodesic`][triwarp.heat.heat_geodesic] and
+    [`vector_heat_operators`][triwarp.heat.vector_heat_operators] use here.
 
     See [`mean_edge_length`][triwarp.edges.mean_edge_length] for the per-face average, how far the
     two diverge on an open mesh, and why libigl carries both.

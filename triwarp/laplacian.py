@@ -346,7 +346,7 @@ def robust_laplacian(
     [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay]
     [`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
-    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
+    [`heat_geodesic`][triwarp.heat.heat_geodesic]
     """
     if use_intrinsic_delaunay:
         intrinsic_faces, lengths, _ = tw.remesh.intrinsic_delaunay(vertices, faces, epsilon=epsilon)
@@ -472,7 +472,7 @@ def connection_laplacian(
     --------
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`halfedge_transport_angles`][triwarp.tangent_space.halfedge_transport_angles]
-    [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
+    [`transport_tangent_vectors`][triwarp.heat.transport_tangent_vectors]
     """
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3

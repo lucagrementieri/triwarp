@@ -258,7 +258,7 @@ def harmonic(
         for. At ``k = 1`` it is worth nothing (0.97-1.00x) and on a large well-conditioned Laplacian
         it is an outright **0.41x**, so the switch is on ``k``. ``lscm`` and ``tutte`` measured
         0.58-1.01x and keep Jacobi; ``linalg.CG_MULTIGRID_SIZE_FLOOR`` carries that table.
-        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] reaches the same conclusion from its
+        [`heat_geodesic`][triwarp.heat.heat_geodesic] reaches the same conclusion from its
         own measurements.
 
         The numbers above predate the batched conjugate gradient moving in-house: an *iteration* is

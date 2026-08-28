@@ -857,14 +857,14 @@ def _precomputed_argument_cases(
             ),
         ),
         "heat.distance.heat_operators(cot_entries=)": (
-            lambda: tw.heat.distance.heat_operators(vertices_wp, faces_wp),
-            lambda: tw.heat.distance.heat_operators(
+            lambda: tw.heat.heat_operators(vertices_wp, faces_wp),
+            lambda: tw.heat.heat_operators(
                 vertices_wp, faces_wp, cot_entries=mesh.cotmatrix_entries
             ),
         ),
         "heat.vector.vector_heat_operators(scalar_operators=)": (
-            lambda: tw.heat.vector.vector_heat_operators(vertices_wp, faces_wp),
-            lambda: tw.heat.vector.vector_heat_operators(
+            lambda: tw.heat.vector_heat_operators(vertices_wp, faces_wp),
+            lambda: tw.heat.vector_heat_operators(
                 vertices_wp,
                 faces_wp,
                 scalar_operators=mesh.heat_operators,
