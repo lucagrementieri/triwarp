@@ -49,6 +49,7 @@ import open3d as o3d
 import pymeshlab as ml
 import pytest
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
@@ -61,6 +62,11 @@ _cloud_np_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 _cloud_wp_cache: dict[tuple[str, str], tuple] = {}
 _cloud_o3d_cache: dict[str, tuple] = {}
 _cloud_pml_cache: dict[str, ml.MeshSet] = {}
+
+
+# MeshLib's own float upper bound: ``findProjections`` segfaults on ``math.inf`` rather than
+# raising, and a ``0.0`` in that slot silently returns all-zero distances.
+_MESHLIB_FLT_MAX = 3.4028234663852886e38
 
 
 def _clouds_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
@@ -222,7 +228,7 @@ def test_hausdorff_points_to_points(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="chamfer_points_to_mesh")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "meshlib")
 def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
     """
     Cloud-to-surface Chamfer: an exact mesh query forward, a ``k=1`` cloud search backward.
@@ -238,8 +244,41 @@ def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
     so the backward ``k=1`` search triwarp also performs has no igl equivalent to pair it with. Read
     the row as "what the expensive half costs on one core"; the same partial-reference convention as
     ``igl.doublearea`` in [`test_triangles.py`](test_triangles.py).
+
+    **MeshLib's row is the forward half too**, and is the multi-threaded one -- so it is the fair
+    fight of the two references. Its AABB tree is built and pre-warmed outside the timed callable,
+    because the tree is cached on the ``Mesh`` and a cold first query measures 17-68x a warm one;
+    that matches the triwarp branch, which is handed a ``wp.Mesh`` it does not rebuild. Its
+    ``distSq`` output is exactly triwarp's ``point_reduction=None`` array, compared element-wise in
+    ``tests/test_metrics.py``.
     """
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "meshlib":
+        cloud_np = _clouds_np(bench_case)[1]
+        # The tree is built lazily on the first query and cached on the Mesh, so it is built and
+        # pre-warmed *outside* the timed callable -- the row then prices the query, matching what
+        # the triwarp branch does with a wp.Mesh already in hand. Timing the build instead is a
+        # 17-68x different number (CLAUDE.md section 6).
+        mesh_ml = bench_case.new_mesh_ml()
+        projector_ml = mm.PointsToMeshProjector()
+        projector_ml.updateMeshData(mesh_ml)
+        points_ml = mm.std_vector_Vector3_float()
+        for point in cloud_np:
+            points_ml.append(mm.Vector3f(float(point[0]), float(point[1]), float(point[2])))
+        warmup_ml = mm.std_vector_MeshProjectionResult()
+        projector_ml.findProjections(
+            warmup_ml, points_ml, mm.AffineXf3f(), mm.AffineXf3f(), _MESHLIB_FLT_MAX, 0.0
+        )
+
+        def project() -> mm.std_vector_MeshProjectionResult:
+            results_ml = mm.std_vector_MeshProjectionResult()
+            projector_ml.findProjections(
+                results_ml, points_ml, mm.AffineXf3f(), mm.AffineXf3f(), _MESHLIB_FLT_MAX, 0.0
+            )
+            return results_ml
+
+        assert len(bench_case.run(project, rounds=3)) == cloud_np.shape[0]
+        return
     if bench_case.kind == "igl":
         skip_larger_than(bench_case, "bunny", "the reference builds its AABB tree per call")
         cloud_np = _clouds_np(bench_case)[1]

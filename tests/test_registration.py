@@ -13,7 +13,12 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import points_to_meshlib, points_to_open3d, points_to_warp
+from tests.conversions import (
+    points_to_meshlib,
+    points_to_open3d,
+    points_to_warp,
+    trimesh_to_meshlib,
+)
 
 
 def _make_point_clouds(rng: np.random.Generator, n: int = 200) -> tuple[np.ndarray, np.ndarray]:
@@ -791,6 +796,88 @@ def test_icp_mesh_matches_pyvista(device: str, angle: float) -> None:
     assert _rms(moved_pv, vertices_np) < 1e-2
     assert _rms(moved_wp, vertices_np) < 1e-2
     assert _rms(moved_wp, moved_pv) < 1e-2
+
+
+@pytest.mark.parity(
+    "icp_point_to_plane_mesh",
+    "meshlib",
+    benchmarked=False,
+    reason="MeshLib reaches a mesh target the same way, but its ICP is one call that also "
+    "builds the AABB tree it queries, and that tree is cached on the Mesh -- so a row would "
+    "time either the build or a warmed query depending on call order, the hazard CLAUDE.md "
+    "section 6 records. Its cloud form already carries the timed row.",
+)
+@pytest.mark.parametrize("mesh_name", ["half_torus", "unit_box"])
+def test_icp_point_to_plane_mesh_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    """
+    Class A: the same rigid transform, against ``ICP`` given a ``MeshOrPoints`` holding a mesh.
+
+    This is the surface form -- triwarp projects each source point onto the closest *triangle* and
+    uses that face's plane, where the ``icp_point_to_plane_cloud`` comparisons hand both sides a
+    cloud with per-vertex normals. MeshLib is the only registered reference that takes a mesh target
+    at all: ``mm.MeshOrPoints`` accepts a ``Mesh`` and its ICP then queries that mesh's AABB tree.
+    Measured agreement on the transform is 5.0e-07 on ``unit_box`` and 1.3e-07 on ``half_torus``,
+    both sides converging to an RMS below 1e-06 from a start above 5e-02.
+
+    !!! warning "The fixture must not be rotationally symmetric, and the default one is"
+        Point-to-*surface* alignment has no signal for a rotation that maps the surface to
+        itself: on a sphere every rotation about the centre keeps all source points exactly on
+        the surface, so the objective is flat and the iteration wanders. Measured on
+        ``icosphere(3)`` misaligned by
+        0.08 rad, triwarp's mesh form ends at RMS 1.33e-01 against a 7.06e-02 *start* -- worse
+        than not aligning -- while its cloud form on identical data reaches 8.2e-06, because
+        discrete vertex correspondences do constrain the rotation. That is a property of the
+        objective, not a defect, but it means ``icosphere`` cannot be used here; every
+        non-symmetric fixture probed
+        (``unit_box``, ``half_torus``, a torus, a capsule) converges to 1e-06 or better.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np, faces_np = _mesh_vertices_faces(mesh_tm)
+    rotation_np, translation_np = _rigid_transform(0.08, [0.1, 0.9, 0.2], [0.02, -0.01, 0.015])
+    source_np = np.ascontiguousarray(vertices_np @ rotation_np.T + translation_np)
+
+    matrix_wp, transformed_wp, _cost_wp = tw.registration.icp_point_to_plane(
+        points_to_warp(source_np, mesh_wp.device),
+        points_to_warp(vertices_np, mesh_wp.device),
+        wp.array(faces_np, dtype=wp.int32, device=mesh_wp.device),
+        max_iterations=50,
+        threshold=-np.inf,
+    )
+    matrix_np = matrix_wp.numpy()[0]
+
+    # The mesh has to outlive the ICP: MeshOrPoints does not keep it alive on its own.
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    icp_ml = mm.ICP(
+        mm.MeshOrPoints(points_to_meshlib(source_np)),
+        mm.MeshOrPoints(mesh_ml),
+        mm.AffineXf3f(),
+        mm.AffineXf3f(),
+        0.02,
+    )
+    properties_ml = mm.ICPProperties()
+    properties_ml.iterLimit = 50
+    icp_ml.setParams(properties_ml)
+    assert icp_ml.getParams().method == mm.ICPMethod.PointToPlane  # its default, unchanged
+    transform_ml = icp_ml.calculateTransformation()
+    rotation_ml = np.array(
+        [
+            [transform_ml.A.x.x, transform_ml.A.x.y, transform_ml.A.x.z],
+            [transform_ml.A.y.x, transform_ml.A.y.y, transform_ml.A.y.z],
+            [transform_ml.A.z.x, transform_ml.A.z.y, transform_ml.A.z.z],
+        ]
+    )
+    translation_ml = np.array([transform_ml.b.x, transform_ml.b.y, transform_ml.b.z])
+    moved_ml = source_np @ rotation_ml.T + translation_ml
+
+    assert _rms(source_np, vertices_np) > 1e-2  # non-vacuity: the clouds start apart
+    assert np.allclose(matrix_np[:3, :3], rotation_ml, rtol=1e-4, atol=1e-4)
+    assert np.allclose(matrix_np[:3, 3], translation_ml, rtol=1e-4, atol=1e-4)
+    assert np.allclose(transformed_wp.numpy(), moved_ml, rtol=1e-4, atol=1e-4)
+    # Both converged, rather than agreeing on a transform that fits nothing.
+    assert _rms(transformed_wp.numpy(), vertices_np) < 1e-4
+    assert _rms(moved_ml, vertices_np) < 1e-4
 
 
 def test_icp_point_to_plane_mesh(half_torus: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:

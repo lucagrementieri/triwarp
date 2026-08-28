@@ -2936,6 +2936,73 @@ def test_refine_region_to_density_rejects_a_mismatched_region(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parity(
+    "split_edges",
+    "igl",
+    "open3d",
+    benchmarked=False,
+    reason="both are timed already, and not here: open3d's subdivide_midpoint carries the row in "
+    "the subdivide group and a second one would double-count it, while igl.upsample is absent from "
+    "benchmarks/ outright because it corrupts the process heap on the scan meshes -- the reason it "
+    "is pinned to icosahedron here, the one fixture it is measured clean on.",
+)
+def test_split_edges_all_matches_igl_and_open3d(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B (vertex order): splitting every edge is the regular 1-to-4 subdivision.
+
+    That is the operation both ``igl.upsample`` and open3d's ``subdivide_midpoint(1)`` perform.
+
+    The direct version of the transitive claim
+    [`test_split_edges_every_edge_is_the_regular_subdivision`] makes: rather than routing through
+    ``subdivide`` and inheriting *its* references, this hands the primitive's own output to
+    ``igl.upsample`` and open3d's ``subdivide_midpoint(1)``. Both insert one vertex per edge at its
+    midpoint and retriangulate each face into four, which is exactly ``split_edges`` with an
+    all-``True`` mask.
+
+    The named transform is a nearest-neighbour bijection on the vertex set, because the three
+    libraries number the inserted midpoints in three different orders -- ``lexsort_rows`` is not
+    usable on float coordinates (CLAUDE.md section 6), and the counts are asserted first so the
+    bijection cannot hide a missing or duplicated vertex. Measured max nearest-neighbour distance
+    5.4e-08 against both, i.e. triwarp's float32 storage.
+
+    ``igl.upsample`` is pinned to ``icosahedron``: it corrupts the heap on the scan meshes and
+    SIGSEGVs on ``bunny``, and ``icosahedron`` is the fixture it is measured clean on over 1 200
+    calls.
+    """
+    mesh_tm, mesh_wp = icosahedron
+    n_faces = int(mesh_wp.indices.shape[0]) // 3
+    unique_edges_wp, inverse_wp = tw.edges.edges_unique(mesh_wp.indices)
+    every_edge_wp = wp.full(
+        int(unique_edges_wp.shape[0]), True, dtype=wp.bool, device=mesh_wp.indices.device
+    )
+    split_vertices_wp, split_faces_wp = tw.remesh.split_edges(
+        mesh_wp.points,
+        mesh_wp.indices,
+        every_edge_wp,
+        unique_edges=unique_edges_wp,
+        inverse=inverse_wp,
+    )
+    split_np = split_vertices_wp.numpy().astype(np.float64)
+
+    vertices_igl, faces_upsampled_igl = igl.upsample(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64), faces_igl(mesh_tm)
+    )
+    mesh_o3d = trimesh_to_open3d(mesh_tm).subdivide_midpoint(number_of_iterations=1)
+    vertices_o3d = np.asarray(mesh_o3d.vertices)
+
+    # Counts first: a bijection over the wrong number of points is not a comparison.
+    assert int(split_faces_wp.shape[0]) // 3 == 4 * n_faces
+    assert vertices_igl.shape[0] == split_np.shape[0]
+    assert vertices_o3d.shape[0] == split_np.shape[0]
+    assert np.asarray(faces_upsampled_igl).shape[0] == 4 * n_faces
+    assert np.asarray(mesh_o3d.triangles).shape[0] == 4 * n_faces
+
+    for reference in (vertices_igl, vertices_o3d):
+        distance, index = KDTree(np.ascontiguousarray(reference, dtype=np.float64)).query(split_np)
+        assert distance.max() < 1e-5
+        assert len(set(index.tolist())) == split_np.shape[0]  # a bijection, not a collapse
+
+
 def test_split_edges_every_edge_is_the_regular_subdivision(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:

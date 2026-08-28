@@ -686,6 +686,94 @@ def _dense_blocks_2x2(matrix: object, n_vertices: int) -> np.ndarray:
     return dense
 
 
+def _connection_complex(matrix, n_vertices: int) -> np.ndarray:
+    """
+    Fold the ``2 x 2`` real blocks into one complex matrix, the form potpourri3d returns.
+
+    Each block is a rotation-scale, i.e. ``[[a, -b], [b, a]]``, which is complex multiplication by
+    ``a + ib``. That is asserted rather than assumed by the caller, since the fold is only valid in
+    that form.
+    """
+    nnz = matrix.nnz_sync()
+    offsets = matrix.offsets.numpy()[: n_vertices + 1]
+    values = matrix.values.numpy()[:nnz]
+    rows = np.repeat(np.arange(n_vertices), np.diff(offsets))
+    entries = values[:, 0, 0] + 1j * values[:, 1, 0]
+    dense = np.zeros((n_vertices, n_vertices), dtype=complex)
+    dense[rows, matrix.columns.numpy()[:nnz]] = entries
+    return dense
+
+
+# ``cave_cube`` and ``half_torus`` cannot be used here, for the reason recorded at the top of
+# ``tests/test_tangent_space.py``: every face of a diagonal-split quad grid carries an edge whose
+# two opposite angles are right angles, so that edge's cotangent weight is exactly zero and its
+# phase is erased from the operator -- a limit of the oracle, not of the computation.
+@pytest.mark.parity(
+    "connection_laplacian",
+    "potpourri3d",
+    benchmarked=False,
+    reason="the operator is only reachable through MeshVectorHeatSolver, whose construction builds "
+    "a halfedge mesh, tangent frames and a factorization before get_connection_laplacian returns a "
+    "cached matrix -- so a row would price that build rather than the assembly, exactly as in the "
+    "halfedge_transport_angles claim. The operator itself is what is comparable.",
+)
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "icosphere_coarse", "hemisphere"])
+def test_connection_laplacian_matches_potpourri3d(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    """
+    Class B (block fold, then gauge invariants): the same operator, up to the tangent-frame gauge.
+
+    Two named transforms. The first is representational -- triwarp stores real ``2 x 2``
+    rotation-scale blocks where potpourri3d stores complex scalars, and ``_connection_complex``
+    folds one into the other (asserted exactly: ``v01 == -v10`` and ``v00 == v11`` to ``0.0``).
+
+    The second is the real content. A connection Laplacian is defined only up to a choice of
+    reference direction per vertex, and the two libraries choose differently, so **individual
+    entries are not comparable** -- CLAUDE.md section 6's rule about tangent-space quantities.
+    What a gauge change cannot touch is a diagonal unitary conjugation's invariants, and two are
+    checked here: the entry **magnitudes** ``|L_ij|``, which are the cotangent weights, and the
+    **whole spectrum**, since ``L`` is Hermitian and conjugation by a unitary preserves eigenvalues.
+
+    That makes this stronger than a correlation bound, which is why it is Class B rather than the
+    Class C the plan projected: measured max abs difference 3.7e-07 on the magnitudes and 2.7e-07 on
+    the eigenvalues (5.1e-08 relative) on ``icosphere_coarse``, i.e. at triwarp's float32 vertex
+    floor. The bug class it excludes is a wrong weight, a wrong sparsity pattern, a non-Hermitian
+    assembly, and any phase error large enough to move the spectrum -- a *global* gauge shift is the
+    one thing it cannot see, and that is because a global gauge shift is not an error.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_tm.vertices.shape[0])
+
+    matrix = tw.laplacian.connection_laplacian(mesh_wp.points, mesh_wp.indices)
+    blocks = matrix.values.numpy()[: matrix.nnz_sync()]
+    # The fold below is only valid for a rotation-scale block; pin that rather than trusting it.
+    assert np.array_equal(blocks[:, 0, 1], -blocks[:, 1, 0])
+    assert np.array_equal(blocks[:, 0, 0], blocks[:, 1, 1])
+    connection_wp = _connection_complex(matrix, n_vertices)
+
+    connection_pp = np.asarray(
+        pp3d.MeshVectorHeatSolver(
+            np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+            np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),
+            use_intrinsic_delaunay=False,
+        )
+        .get_connection_laplacian()
+        .todense()
+    )
+
+    # Non-vacuity: a comparison of two all-zero operators would pass everything below.
+    assert np.abs(connection_pp).max() > 1e-3
+    assert np.abs(connection_wp - connection_wp.conj().T).max() < 1e-9
+
+    # Gauge-invariant 1: the magnitudes are the cotangent weights, phases removed.
+    assert np.allclose(np.abs(connection_wp), np.abs(connection_pp), rtol=1e-4, atol=1e-5)
+    # Gauge-invariant 2: the spectrum, since a gauge change is a diagonal unitary conjugation.
+    assert np.allclose(
+        np.linalg.eigvalsh(connection_wp), np.linalg.eigvalsh(connection_pp), rtol=1e-4, atol=1e-5
+    )
+
+
 @pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "half_torus", "hemisphere"])
 def test_connection_laplacian_with_zero_transport_is_the_cotangent_laplacian(
     request: pytest.FixtureRequest, mesh_name: str

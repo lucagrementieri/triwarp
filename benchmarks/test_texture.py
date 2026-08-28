@@ -55,12 +55,29 @@ Inverse:
 ``compute_color_from_texture_per_vertex`` and ``transfer_texture_to_color_per_vertex``
 sample an image back onto the vertices. So all five groups here have a counterpart.
 
-Two things keep them from being rows in this file today, and both are about the comparison rather
-than the library. Its parameter surface is large -- the bake takes a texture size, a sampling
-density and an interpolation mode that do not map one-to-one onto ``resolution`` and ``order`` --
-and its
-output is an *image* rather than an array, so a fair row has to decide what "the same work" means
-before it can be timed. That is its own piece of work; what is not true is that nothing does this.
+What keeps them from being rows -- and from being *parity* oracles -- was probed rather than
+assumed, and the blocker is narrower and harder than "the output is an image". It is that
+**``pymeshlab.Image`` is write-only from Python**: its entire public surface is ``width``,
+``height`` and ``save``, with no array constructor and no pixel accessor. So neither
+direction has an in-memory route.
+
+* **Forward.** The bake's result can only leave Python as a file, so a comparison goes through an
+  8-bit PNG. For a ``float32`` attribute raster that makes the quantization a *difference* between
+  the two sides rather than something both share, which is a class-D shape rather than a tolerance.
+* **Inverse.** The sampler needs a texture *attached to the mesh*, and there is no way to attach one
+  from an array either -- only to load a mesh file that references an image file
+  (``texture_number()`` is 0 for any ``ml.Mesh`` built from matrices). That path does work, and it
+  reveals a second convention: **MeshLab samples with wrap addressing.** Measured on a 32-column
+  ramp texture whose column ``j`` holds ``8j``, vertices at UV ``u = 1.0`` come back as **0**
+  where the texel is 248 -- ``u = 1`` wraps to column 0 -- while an interior sample at
+  ``(0.5, 0.5)`` reads 128 correctly. On a *random* texture that makes all four UV corners
+  return the same value, which reads as a broken oracle rather than an addressing rule.
+
+So the inverse pair is reachable, at 8 bits and on strictly interior UVs, at the cost of writing an
+OBJ, an MTL and a PNG per case; the forward pair is not reachable at array level at all. Both are
+recorded here so the next pass starts from the numbers. Its parameter surface is also large -- the
+bake takes a texture size, a sampling density and an interpolation mode that do not map one-to-one
+onto ``resolution`` and ``order`` -- but that is the smaller obstacle of the two.
 
 The references the *correctness* tests use are not benchmarkable baselines either. The forward
 rasterizers are checked against a **moderngl (OpenGL)** reference, which times GPU driver and

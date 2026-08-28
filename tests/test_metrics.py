@@ -16,11 +16,18 @@ import pytest
 import trimesh as tm
 import trimesh.proximity as tm_proximity
 import warp as wp
+from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 from scipy.spatial.distance import directed_hausdorff
 
 import triwarp as tw
-from tests.conversions import points_to_open3d, points_to_pymeshlab, points_to_warp, trimesh_to_warp
+from tests.conversions import (
+    points_to_open3d,
+    points_to_pymeshlab,
+    points_to_warp,
+    trimesh_to_meshlib,
+    trimesh_to_warp,
+)
 
 # igl requires float64 vertices / int64 faces; Warp uses float32 / int32, so mesh-surface
 # references diverge from Warp at roughly float32 precision.
@@ -183,6 +190,68 @@ def test_chamfer_mesh_to_mesh_identical_is_zero(icosahedron) -> None:
 # ---------------------------------------------------------------------------
 # Chamfer: point cloud to mesh (mixed)
 # ---------------------------------------------------------------------------
+
+# MeshLib's own float upper bound. ``math.inf`` segfaults in ``findProjections`` rather than
+# raising, which is why this is spelled out rather than computed.
+_MESHLIB_FLT_MAX = 3.4028234663852886e38
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parity("chamfer_points_to_mesh", "meshlib")
+def test_chamfer_points_to_mesh_forward_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A on the forward half: ``PointsToMeshProjector`` returns the same squared distances.
+
+    The complement to [`test_chamfer_points_to_mesh`], which composes igl and scipy to reach the
+    whole two-sided Chamfer. This one isolates the expensive half -- the cloud-to-surface query --
+    and compares it **element-wise** rather than through a mean, which is strictly stronger: a mean
+    hides a permutation and a pair of compensating errors, and MeshLib reports one
+    ``MeshProjectionResult`` per query point so the correspondence is available. `distSq` is already
+    squared, matching triwarp's ``point_reduction=None`` output with no transform.
+
+    Measured 2.4e-07 max absolute difference over 500 points (1.1e-07 relative), which is triwarp's
+    float32 vertex storage against MeshLib's float32 -- see the `getNumpyVerts` note in CLAUDE.md
+    section 6.
+
+    Three MeshLib call conventions this depends on, each a documented hazard:
+    ``updateMeshData`` stores a raw pointer, so ``mesh_ml`` is bound to a name that outlives every
+    query; ``upDistLimitSq`` precedes ``loDistLimitSq`` and must be MeshLib's own ``FLT_MAX``
+    (``math.inf`` segfaults, and passing ``0.0`` in that slot silently returns all-zero distances --
+    which is what a first attempt at this test did); and the AABB tree is built lazily on first
+    query, so it is pre-warmed here to keep the comparison independent of call order.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(7)
+    center = np.asarray(mesh_tm.vertices, dtype=np.float64).mean(axis=0)
+    points_np = (center + rng.normal(scale=0.6, size=(500, 3))).astype(np.float32)
+
+    forward_wp = tw.metrics.chamfer_points_to_mesh(
+        points_to_warp(points_np, mesh_wp.device),
+        mesh_wp.points,
+        mesh_wp.indices,
+        single_directional=True,
+        point_reduction=None,
+    ).numpy()
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)  # must outlive the projector: it stores a raw pointer
+    projector_ml = mm.PointsToMeshProjector()
+    projector_ml.updateMeshData(mesh_ml)
+    points_ml = mm.std_vector_Vector3_float()
+    for point in points_np:
+        points_ml.append(mm.Vector3f(float(point[0]), float(point[1]), float(point[2])))
+    results_ml = mm.std_vector_MeshProjectionResult()
+    projector_ml.findProjections(
+        results_ml, points_ml, mm.AffineXf3f(), mm.AffineXf3f(), _MESHLIB_FLT_MAX, 0.0
+    )
+    forward_ml = np.array([result.distSq for result in results_ml], dtype=np.float64)
+
+    # Non-vacuity: an all-zero pair of answers would satisfy the comparison below.
+    assert forward_ml.shape == forward_wp.shape
+    assert forward_ml.min() > 0.0
+    assert np.ptp(forward_ml) > 1e-3
+    assert np.allclose(forward_wp, forward_ml, rtol=_MESH_RTOL, atol=_MESH_ATOL)
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
