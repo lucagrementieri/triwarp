@@ -242,7 +242,7 @@ def test_vertex_face_adjacency_matches_trimesh(
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
-    offsets_np, faces_np = (array.numpy() for array in mesh.vertex_face_adjacency)
+    faces_np, offsets_np = (array.numpy() for array in mesh.vertex_face_adjacency)
 
     padded_tm = mesh_tm.vertex_faces
     assert padded_tm.shape[0] == mesh.n_vertices

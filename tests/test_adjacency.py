@@ -132,7 +132,7 @@ def test_resolve_face_adjacency_derives_and_forwards(
 @pytest.mark.parity("vertex_face_adjacency", "igl")
 def test_vertex_face_adjacency_matches_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
-    Class B (row order): the same ``(offsets, vertex_faces)`` CSR, arbitrary within a row.
+    Class B (row order): the same ``(vertex_faces, offsets)`` CSR, arbitrary within a row.
 
     ``igl.vertex_triangle_adjacency(F, n)`` returns ``(VF, NI)`` -- the payload and the offsets, in
     that order, exactly triwarp's pair reversed -- so the only transform is the unpacking plus
@@ -149,7 +149,7 @@ def test_vertex_face_adjacency_matches_igl(request: pytest.FixtureRequest, mesh_
     faces_np = faces_wp.numpy().reshape(-1, 3).astype(np.int64)
 
     payload_igl, offsets_igl = igl.vertex_triangle_adjacency(faces_np, n_vertices)
-    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=n_vertices)
+    payload_wp, offsets_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=n_vertices)
 
     assert np.array_equal(offsets_wp.numpy(), np.asarray(offsets_igl).ravel())
     bounds_np = offsets_wp.numpy()
@@ -173,8 +173,8 @@ def test_vertex_face_adjacency_infers_n_vertices(
     which is how this test found its own bug.
     """
     _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    inferred_offsets, inferred_faces = tw.adjacency.vertex_face_adjacency(mesh_wp.indices)
-    supplied_offsets, supplied_faces = tw.adjacency.vertex_face_adjacency(
+    inferred_faces, inferred_offsets = tw.adjacency.vertex_face_adjacency(mesh_wp.indices)
+    supplied_faces, supplied_offsets = tw.adjacency.vertex_face_adjacency(
         mesh_wp.indices, n_vertices=int(mesh_wp.points.shape[0])
     )
 
@@ -198,7 +198,7 @@ def test_vertex_face_adjacency_unreferenced_vertex(device: str) -> None:
     faces_np = np.array([0, 1, 2], dtype=np.int32)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
 
-    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=5)
+    payload_wp, offsets_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=5)
 
     assert np.array_equal(offsets_wp.numpy(), np.array([0, 1, 2, 3, 3, 3], dtype=np.int32))
     assert np.array_equal(np.sort(payload_wp.numpy()), np.zeros(3, dtype=np.int32))
@@ -206,7 +206,7 @@ def test_vertex_face_adjacency_unreferenced_vertex(device: str) -> None:
 
 def test_vertex_face_adjacency_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
-    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
+    payload_wp, offsets_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
     assert offsets_wp.shape == (1,)
     assert payload_wp.shape == (0,)
 
@@ -214,7 +214,7 @@ def test_vertex_face_adjacency_empty(device: str) -> None:
 def test_vertex_face_adjacency_zero_rows_with_faces(device: str) -> None:
     """``n_vertices=0`` on a non-empty mesh returns zeros, not an unwritten buffer."""
     faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
-    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
+    payload_wp, offsets_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
     assert offsets_wp.shape == (1,)
     assert np.array_equal(payload_wp.numpy(), np.zeros(3, dtype=np.int32))
 

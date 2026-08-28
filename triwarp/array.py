@@ -213,6 +213,26 @@ def pack_1d_arrays(
     occupies ``flat[offsets[i] : offsets[i] + arrays[i].size]``. This is the usual packed
     representation for variable-length per-item lists on the device (no nested arrays).
 
+    !!! note "The packed pair is spelled values first, offsets second"
+        This function is where the package's convention is stated, because it is the primitive the
+        others are built on: **a packed buffer and its offsets are returned, and accepted, values
+        first.** Fifteen public functions hand back such a pair —
+        [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched],
+        [`successor_cycles`][triwarp.graph.successor_cycles],
+        [`bfs_multi_source`][triwarp.graph.bfs_multi_source],
+        [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets],
+        [`geodesic_ball`][triwarp.neighbors.geodesic_ball],
+        [`vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency],
+        [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] and the
+        [`triwarp.geodesic_walk`][triwarp.geodesic_walk] tracers among them — and every function
+        that *takes* one ([`split`][triwarp.array.split],
+        [`trace_polylines`][triwarp.geodesic_walk.trace_polylines],
+        [`submeshes_from_face_groups`][triwarp.selection.submeshes_from_face_groups]) takes it in
+        the same order. Both halves are ``wp.int32`` in the common case, so a transposed unpack
+        type-checks, runs, and indexes garbage; there is nothing but the convention to lean on.
+        Where a third array rides along it is a *per-item* one and goes last, as in
+        ``(ring_halfedges, offsets, is_boundary)``.
+
     Parameters
     ----------
     arrays

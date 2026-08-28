@@ -1949,6 +1949,18 @@ survive the next upgrade unexamined, which is exactly the failure the check exis
 - **Name a function after what it returns, in NumPy vocabulary — never after the Warp call it
   wraps.** `sort_pairs` named `warp.utils.radix_sort_pairs`'s key/value mechanism rather than its
   result (a sort *and* an argsort), which is why it became `sort_and_argsort`.
+- **A packed buffer and its offsets are returned, and accepted, values first.** `(flat, offsets)`,
+  never `(offsets, flat)`; where a third array rides along it is a *per-item* one and goes last
+  (`(ring_halfedges, offsets, is_boundary)`). The convention is stated in
+  `array.pack_1d_arrays`' docstring, the primitive the rest are built on. Both halves are usually
+  `wp.array[wp.int32]`, so **a transposed unpack type-checks, runs, and indexes garbage** — there
+  is nothing but the convention to lean on, which is why it is written down here. Measured before
+  it was made unanimous: 13 of 15 public returns and **4 of 4** argument lists were already values
+  first, `igl.vertex_triangle_adjacency` orders it the same way, and the two exceptions
+  (`adjacency.vertex_face_adjacency`, `halfedge.vertex_one_rings`) were swapped to match. The one
+  place a caller *constructs* such a pair by hand is a precomputed keyword
+  (`descend_field(vertex_faces=…)`); transposing it there segfaulted the CPU backend several
+  launches after the call, not at it, so that composition carries a test of its own.
 - **A mask is named `<element>_<property>_mask`, element first.** Element-first sorts and
   completes: type `tw.validation.face_` and every per-face predicate appears, which is exactly what
   the property-first spellings did not do — `bad_face_mask` and `flipped_faces_mask` were the two

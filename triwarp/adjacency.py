@@ -278,11 +278,13 @@ def vertex_face_adjacency(
     faces: wp.array[wp.int32], *, n_vertices: int | None = None
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
     """
-    Incidence CSR of the faces touching each vertex, as ``(offsets, vertex_faces)``.
+    Incidence CSR of the faces touching each vertex, as ``(vertex_faces, offsets)``.
 
     Row ``v`` is ``vertex_faces[offsets[v] : offsets[v + 1]]`` and lists every face that references
     vertex ``v``, once per reference. ``offsets`` has length ``n_vertices + 1``, so its last entry
-    is the total ``3 * n_faces`` and no caller needs a sentinel appended.
+    is the total ``3 * n_faces`` and no caller needs a sentinel appended. Values first and offsets
+    second is the package's packed-buffer convention -- see
+    [`array.pack_1d_arrays`][triwarp.array.pack_1d_arrays], which states it.
 
     Built by counting sort rather than from halfedge twins, and that is a deliberate limitation
     rather than an omission: **each row is a set, not a rotation**. Ordering a row would require the
@@ -303,10 +305,10 @@ def vertex_face_adjacency(
 
     Returns
     -------
-    offsets : wp.array[wp.int32]
-        Length ``n_vertices + 1`` row offsets on ``faces.device``.
     vertex_faces : wp.array[wp.int32]
         Length ``3 * n_faces`` face indices, grouped by vertex, arbitrary order within a row.
+    offsets : wp.array[wp.int32]
+        Length ``n_vertices + 1`` row offsets on ``faces.device``.
 
     See Also
     --------
@@ -322,7 +324,7 @@ def vertex_face_adjacency(
     if n_faces == 0 or row_count == 0:
         # ``row_count == 0`` with faces present (reachable only via an explicit ``n_vertices=0``)
         # would otherwise hand back an unwritten ``3 * n_faces`` buffer of allocator garbage.
-        return offsets, wp.zeros(3 * n_faces, dtype=wp.int32, device=device)
+        return wp.zeros(3 * n_faces, dtype=wp.int32, device=device), offsets
 
     vertex_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
 
@@ -343,7 +345,7 @@ def vertex_face_adjacency(
         inputs=[faces, offsets, cursor, vertex_faces],
         device=device,
     )
-    return offsets, vertex_faces
+    return vertex_faces, offsets
 
 
 def face_adjacency_unshared(

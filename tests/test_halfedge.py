@@ -103,7 +103,7 @@ def test_vertex_one_ring_sizes_match_incident_face_counts(
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
-    offsets_wp, ring_wp, _ = tw.halfedge.vertex_one_rings(mesh_wp.indices, n_vertices=n_vertices)
+    ring_wp, offsets_wp, _ = tw.halfedge.vertex_one_rings(mesh_wp.indices, n_vertices=n_vertices)
 
     # One outgoing halfedge per incident face-corner.
     incident_faces_tm = np.bincount(mesh_tm.faces.reshape(-1), minlength=n_vertices)
@@ -145,7 +145,7 @@ def test_vertex_one_ring_neighbor_counts_match_trimesh(
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
-    offsets_wp, _, is_boundary_wp = tw.halfedge.vertex_one_rings(
+    _, offsets_wp, is_boundary_wp = tw.halfedge.vertex_one_rings(
         mesh_wp.indices, n_vertices=n_vertices
     )
 
@@ -170,7 +170,7 @@ def test_vertex_one_rings_are_rotationally_ordered(
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
-    offsets_wp, ring_wp, is_boundary_wp = tw.halfedge.vertex_one_rings(
+    ring_wp, offsets_wp, is_boundary_wp = tw.halfedge.vertex_one_rings(
         mesh_wp.indices, n_vertices=n_vertices
     )
     twins = tw.halfedge.halfedge_twins(mesh_wp.indices, n_vertices=n_vertices).numpy()
@@ -219,7 +219,7 @@ def test_vertex_one_rings_boundary_flags_match_trimesh(
 def test_vertex_one_rings_isolated_vertex_is_empty(device: str) -> None:
     # Vertex 3 is unreferenced: it gets an empty ring rather than a bogus one.
     faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
-    offsets_wp, ring_wp, is_boundary_wp = tw.halfedge.vertex_one_rings(faces_wp, n_vertices=4)
+    ring_wp, offsets_wp, is_boundary_wp = tw.halfedge.vertex_one_rings(faces_wp, n_vertices=4)
 
     assert np.array_equal(offsets_wp.numpy(), np.array([0, 1, 2, 3, 3]))
     assert np.array_equal(np.sort(ring_wp.numpy()), np.array([0, 1, 2]))
@@ -228,7 +228,7 @@ def test_vertex_one_rings_isolated_vertex_is_empty(device: str) -> None:
 
 def test_vertex_one_rings_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
-    offsets_wp, ring_wp, is_boundary_wp = tw.halfedge.vertex_one_rings(faces_wp, n_vertices=0)
+    ring_wp, offsets_wp, is_boundary_wp = tw.halfedge.vertex_one_rings(faces_wp, n_vertices=0)
     assert offsets_wp.shape == (1,)
     assert ring_wp.shape == (0,)
     assert is_boundary_wp.shape == (0,)

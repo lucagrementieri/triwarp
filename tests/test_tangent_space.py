@@ -114,11 +114,11 @@ def test_halfedge_tangent_angles_span_the_rescaled_disk(
 ) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
-    offsets_wp, ring_wp, is_boundary_wp = tw.halfedge.vertex_one_rings(
+    ring_wp, offsets_wp, is_boundary_wp = tw.halfedge.vertex_one_rings(
         mesh_wp.indices, n_vertices=n_vertices
     )
     angles = tw.tangent_space.halfedge_tangent_angles(
-        mesh_wp.points, mesh_wp.indices, rings=(offsets_wp, ring_wp, is_boundary_wp)
+        mesh_wp.points, mesh_wp.indices, rings=(ring_wp, offsets_wp, is_boundary_wp)
     ).numpy()
 
     offsets, ring, is_boundary = offsets_wp.numpy(), ring_wp.numpy(), is_boundary_wp.numpy()

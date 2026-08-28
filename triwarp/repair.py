@@ -1193,7 +1193,7 @@ def eliminate_degree3_vertices(
         if n_faces == 0:
             break
         n_vertices = int(vertices.shape[0])
-        ring_offsets, ring_halfedges, is_boundary = tw.halfedge.vertex_one_rings(
+        ring_halfedges, ring_offsets, is_boundary = tw.halfedge.vertex_one_rings(
             faces, n_vertices=n_vertices
         )
         candidate = wp.empty(n_vertices, dtype=wp.bool, device=device)
@@ -1277,7 +1277,7 @@ def flatten_degree3_vertices(
         flattens every one that qualifies.
     rings
         Optional precomputed [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] as
-        ``(offsets, ring_halfedges, is_boundary)``. Depends on the connectivity alone, so one CSR
+        ``(ring_halfedges, offsets, is_boundary)``. Depends on the connectivity alone, so one CSR
         serves every fan walk over the same mesh --
         [`Trimesh.vertex_one_rings`][triwarp.mesh.Trimesh.vertex_one_rings] has it cached, and
         passing it skips the vertex-manifold check and the host readback that check costs.
@@ -1313,7 +1313,7 @@ def flatten_degree3_vertices(
             f"of {region.dtype}"
         )
 
-    ring_offsets, ring_halfedges, is_boundary = (
+    ring_halfedges, ring_offsets, is_boundary = (
         rings if rings is not None else tw.halfedge.vertex_one_rings(faces, n_vertices=n_vertices)
     )
     flattened = wp.empty(n_vertices, dtype=wp.vec3, device=device)

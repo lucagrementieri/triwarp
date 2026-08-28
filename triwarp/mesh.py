@@ -623,7 +623,7 @@ class Trimesh:
     @_CachedProperty
     def vertex_face_adjacency(self) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
         """
-        Incidence CSR of the faces touching each vertex, as ``(offsets, vertex_faces)``.
+        Incidence CSR of the faces touching each vertex, as ``(vertex_faces, offsets)``.
 
         Each row is a *set*: use `vertex_one_rings` where the rotational order around the vertex
         is what matters, at the price of needing an edge-manifold mesh.
@@ -664,7 +664,7 @@ class Trimesh:
     @_CachedProperty
     def vertex_one_rings(self) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.bool]]:
         """
-        Counter-clockwise outgoing halfedges per vertex: ``(offsets, ring_halfedges, is_boundary)``.
+        Counter-clockwise outgoing halfedges per vertex: ``(ring_halfedges, offsets, is_boundary)``.
 
         Built from the cached `halfedge_twins`, so accessing either first pays for that array once.
 

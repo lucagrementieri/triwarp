@@ -105,6 +105,9 @@ def vertex_one_rings(
     """
     Outgoing halfedges of every vertex in counter-clockwise order, as a CSR buffer.
 
+    Returned values first and offsets second, the package's packed-buffer convention -- see
+    [`array.pack_1d_arrays`][triwarp.array.pack_1d_arrays], which states it.
+
     Vertex ``v`` owns ``ring_halfedges[offsets[v] : offsets[v + 1]]``, each entry a halfedge leaving
     ``v``; the ring size is therefore the number of incident *faces*, one less than the number of
     adjacent vertices at a boundary vertex. Consecutive entries are consecutive around ``v`` in the
@@ -130,10 +133,10 @@ def vertex_one_rings(
 
     Returns
     -------
-    offsets : wp.array[wp.int32]
-        Length ``n_vertices + 1`` CSR row starts; ``offsets[-1] == 3 * n_faces``.
     ring_halfedges : wp.array[wp.int32]
         Length ``3 * n_faces`` outgoing halfedges, grouped and ordered per vertex.
+    offsets : wp.array[wp.int32]
+        Length ``n_vertices + 1`` CSR row starts; ``offsets[-1] == 3 * n_faces``.
     is_boundary : wp.array[wp.bool]
         Length ``n_vertices``; ``True`` where the vertex is incident to a boundary edge.
 
@@ -161,7 +164,7 @@ def vertex_one_rings(
     ring_halfedges = wp.full(n_halfedges, -1, dtype=wp.int32, device=device)
     is_boundary = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     if n_halfedges == 0 or n_vertices == 0:
-        return offsets, ring_halfedges, is_boundary
+        return ring_halfedges, offsets, is_boundary
 
     # Every face contributes exactly one outgoing halfedge per corner, so a vertex's ring size is
     # how often it appears in the flat face buffer -- no walk needed to size the CSR.
@@ -200,4 +203,4 @@ def vertex_one_rings(
             f"vertex_one_rings requires a vertex-manifold mesh: {n_incomplete} vertex/vertices "
             f"have more than one fan of faces (a pinch point)."
         )
-    return offsets, ring_halfedges, is_boundary
+    return ring_halfedges, offsets, is_boundary

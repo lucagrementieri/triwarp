@@ -266,7 +266,7 @@ def test_vertex_face_adjacency(bench_case: BenchCase, known_nv: bool) -> None:
         return
     faces_wp = bench_case.faces_wp
     supplied = n_vertices if known_nv else None
-    offsets, vertex_faces = bench_case.run(
+    vertex_faces, offsets = bench_case.run(
         lambda: tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=supplied)
     )
     assert int(offsets.shape[0]) == n_vertices + 1

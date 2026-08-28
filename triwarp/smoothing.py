@@ -534,7 +534,7 @@ def equalize_triangle_areas(
         within a tolerance of the scan it came from.
     vertex_faces
         Optional precomputed [`vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency] as
-        ``(offsets, vertex_faces)``. Depends on the connectivity alone -- which this filter never
+        ``(vertex_faces, offsets)``. Depends on the connectivity alone -- which this filter never
         changes -- so one CSR serves every call over the same mesh, and
         [`Trimesh.vertex_face_adjacency`][triwarp.mesh.Trimesh.vertex_face_adjacency] has it cached.
 
@@ -571,7 +571,7 @@ def equalize_triangle_areas(
     if flags is None:
         return wp.clone(vertices)
 
-    offsets, vf_indices = (
+    vf_indices, offsets = (
         vertex_faces
         if vertex_faces is not None
         else tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
@@ -1833,7 +1833,7 @@ def smooth_region_boundary(
         Number of solve-and-project passes. ``0`` returns a copy.
     vertex_faces
         Optional precomputed [`vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency] as
-        ``(offsets, vertex_faces)``. Depends on the connectivity alone -- which this filter never
+        ``(vertex_faces, offsets)``. Depends on the connectivity alone -- which this filter never
         changes -- so one CSR serves every call over the same mesh, and
         [`Trimesh.vertex_face_adjacency`][triwarp.mesh.Trimesh.vertex_face_adjacency] has it cached.
 
@@ -1887,7 +1887,7 @@ def smooth_region_boundary(
     field = wp.empty((1, n_vertices), dtype=wp.float64, device=device)
     wp.map(kernel_smoothing.region_side_value, inside, out=field[0])
 
-    offsets, vf_indices = (
+    vf_indices, offsets = (
         vertex_faces
         if vertex_faces is not None
         else tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)

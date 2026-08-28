@@ -241,7 +241,7 @@ def hessian_energy(
         solved against.
     vertex_faces
         Optional precomputed [`vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency] as
-        ``(offsets, vertex_faces)``. Depends on the connectivity alone, so one CSR serves every
+        ``(vertex_faces, offsets)``. Depends on the connectivity alone, so one CSR serves every
         incidence walk over the same mesh --
         [`Trimesh.vertex_face_adjacency`][triwarp.mesh.Trimesh.vertex_face_adjacency] has it cached.
 
@@ -283,7 +283,7 @@ def hessian_energy(
     )
     inverse_mass = _interior_inverse(vertices, faces, mass)
 
-    vf_offsets, vf_indices = (
+    vf_indices, vf_offsets = (
         vertex_faces
         if vertex_faces is not None
         else tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)

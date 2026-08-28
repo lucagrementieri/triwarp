@@ -66,7 +66,7 @@ def _curve(bench_case: BenchCase, kind: str) -> tuple[np.ndarray, np.ndarray]:
     """
     key = (bench_case.mesh_name, kind)
     if key not in _curve_cache:
-        offsets, ring, is_boundary = (
+        ring, offsets, is_boundary = (
             array.numpy()
             for array in tw.halfedge.vertex_one_rings(
                 bench_case.faces_wp, n_vertices=bench_case.n_vertices

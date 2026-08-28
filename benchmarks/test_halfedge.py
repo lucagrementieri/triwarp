@@ -79,7 +79,7 @@ def test_halfedge_twins(bench_case: BenchCase) -> None:
 def test_vertex_one_rings(bench_case: BenchCase) -> None:
     """One serial rotation per vertex: on the valence axis, where the widest ring dominates."""
     faces, n_vertices = bench_case.faces_wp, bench_case.n_vertices
-    offsets, ring, _ = bench_case.run(
+    ring, offsets, _ = bench_case.run(
         lambda: tw.halfedge.vertex_one_rings(faces, n_vertices=n_vertices)
     )
     assert offsets.shape == (n_vertices + 1,)
@@ -93,7 +93,7 @@ def test_vertex_one_rings_scale(bench_case: BenchCase) -> None:
     """The same walk over uniform valence-6 meshes, for the ``N`` slope without the hub."""
     faces, n_vertices = bench_case.faces_wp, bench_case.n_vertices
     twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
-    offsets, _, _ = bench_case.run(
+    _, offsets, _ = bench_case.run(
         lambda: tw.halfedge.vertex_one_rings(faces, twins=twins, n_vertices=n_vertices)
     )
     assert offsets.shape == (n_vertices + 1,)

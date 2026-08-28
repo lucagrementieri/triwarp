@@ -493,6 +493,45 @@ def test_descend_field_stops_at_a_local_minimum_and_at_a_boundary(
     assert int(path_offsets_wp.shape[0]) == interior_np.shape[0] + 1
 
 
+def test_descend_field_accepts_the_precomputed_pair_values_first(
+    icosphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Triwarp against triwarp: ``vertex_faces=`` takes the pair values first.
+
+    Like every packed pair in the package. The oracle is the default branch -- ``descend_field``
+    building the incidence itself -- and this pins the precomputed branch to it. It exists because
+    the keyword is the one place in the package where a caller *constructs* such a pair by hand,
+    and both halves are
+    ``wp.array[wp.int32]``: passing it transposed raises nothing, reads offsets as face indices,
+    and (measured while the convention was being fixed) segfaults the CPU backend several launches
+    later rather than at the call. So the composition is asserted rather than assumed.
+
+    See [`array.pack_1d_arrays`][triwarp.array.pack_1d_arrays] for the convention itself.
+    """
+    _, mesh_wp = icosphere
+    device = mesh_wp.points.device
+    n_vertices = int(mesh_wp.points.shape[0])
+    source_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
+    distance_wp = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, source_wp)
+    starts_wp = wp.array(np.arange(1, 9, dtype=np.int32), dtype=wp.int32, device=device)
+
+    derived_points, derived_offsets = tw.geodesic_walk.descend_field(
+        mesh_wp.points, mesh_wp.indices, distance_wp, starts_wp
+    )
+
+    incidence = tw.adjacency.vertex_face_adjacency(mesh_wp.indices, n_vertices=n_vertices)
+    assert int(incidence[0].shape[0]) == int(mesh_wp.indices.shape[0])  # values, not offsets
+    assert int(incidence[1].shape[0]) == n_vertices + 1  # offsets, not values
+    supplied_points, supplied_offsets = tw.geodesic_walk.descend_field(
+        mesh_wp.points, mesh_wp.indices, distance_wp, starts_wp, vertex_faces=incidence
+    )
+
+    assert int(derived_points.shape[0]) > int(starts_wp.shape[0])  # not a batch of single points
+    assert np.array_equal(derived_offsets.numpy(), supplied_offsets.numpy())
+    assert np.allclose(derived_points.numpy(), supplied_points.numpy(), rtol=1e-5, atol=1e-5)
+
+
 def test_descend_field_guards_and_empty(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """Not a library comparison: the length guard and the empty batch."""
     _, mesh_wp = icosphere

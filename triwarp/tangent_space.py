@@ -65,7 +65,7 @@ def vertex_tangent_frames(
         Optional precomputed ``(n_vertices,)`` unit vertex normals. When ``None``, the
         angle-weighted normals are computed here.
     rings
-        Optional precomputed ``(offsets, ring_halfedges, is_boundary)`` from
+        Optional precomputed ``(ring_halfedges, offsets, is_boundary)`` from
         [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]. When ``None``, they are computed
         here.
 
@@ -91,7 +91,7 @@ def vertex_tangent_frames(
 
     if rings is None:
         rings = vertex_one_rings(faces, n_vertices=n)
-    ring_offsets, ring_halfedges, _ = rings
+    ring_halfedges, ring_offsets, _ = rings
 
     wp.launch(
         kernel_tangent_space.vertex_tangent_frames,
@@ -184,7 +184,7 @@ def halfedge_tangent_angles(
         Optional precomputed ``(n_faces, 3)`` corner angles from
         [`face_angles`][triwarp.triangles.face_angles]. When ``None``, computed here.
     rings
-        Optional precomputed ``(offsets, ring_halfedges, is_boundary)`` from
+        Optional precomputed ``(ring_halfedges, offsets, is_boundary)`` from
         [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]. When ``None``, computed here.
 
     Returns
@@ -209,7 +209,7 @@ def halfedge_tangent_angles(
         face_angles = tw.triangles.face_angles(vertices, faces)
     if rings is None:
         rings = vertex_one_rings(faces, n_vertices=n)
-    ring_offsets, ring_halfedges, is_boundary = rings
+    ring_halfedges, ring_offsets, is_boundary = rings
 
     wp.launch(
         kernel_tangent_space.halfedge_tangent_angles,

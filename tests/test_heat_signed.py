@@ -34,7 +34,7 @@ def _one_ring_cycle(
     not close into a cycle and the last "segment" would be a chord across the surface rather than an
     edge — which both this method and the reference read as a different curve entirely.
     """
-    offsets, ring, is_boundary = (
+    ring, offsets, is_boundary = (
         array.numpy()
         for array in tw.halfedge.vertex_one_rings(mesh_wp.indices, n_vertices=len(mesh_tm.vertices))
     )

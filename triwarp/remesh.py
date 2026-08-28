@@ -1495,7 +1495,7 @@ class _DecimationBuffers:
         wp.launch(kernel_remesh.freeze_dummy_vertex, dim=1, inputs=[dummy, codes], device=device)
         csr = self._edge_csr(incidence.unique_edges)
         quadrics = _vertex_quadrics(self.vertices, self.faces)
-        face_offsets, vertex_faces = tw.adjacency.vertex_face_adjacency(
+        vertex_faces, face_offsets = tw.adjacency.vertex_face_adjacency(
             self.faces, n_vertices=self.n_vertices + 1
         )
 

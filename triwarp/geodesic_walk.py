@@ -116,7 +116,7 @@ def trace_from_vertex(
         twins = halfedge_twins(faces, n_vertices=n_vertices)
     if rings is None:
         rings = vertex_one_rings(faces, twins=twins, n_vertices=n_vertices)
-    ring_offsets, ring_halfedges, is_boundary = rings
+    ring_halfedges, ring_offsets, is_boundary = rings
     if frames is None:
         frames = tw.tangent_space.vertex_tangent_frames(vertices, faces, rings=rings)
     basis_x, basis_y, normals = frames
@@ -260,7 +260,9 @@ def descend_field(
     vertex_faces
         Optional precomputed
         [`triwarp.adjacency.vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency] pair,
-        which case 3 needs.
+        which case 3 needs. ``(vertex_faces, offsets)``, values first, as that function returns it
+        and as every packed pair in the package is spelled -- passing it the other way round reads
+        offsets as face indices and raises nothing, since both are ``wp.int32``.
     gradients
         Optional precomputed per-face gradient of ``values``. Pass it when descending the same field
         from several batches.
@@ -315,7 +317,7 @@ def descend_field(
         vertex_faces = tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
     if gradients is None:
         gradients = tw.laplacian.face_gradients(vertices, faces, values)
-    face_offsets, incident_faces = vertex_faces
+    incident_faces, face_offsets = vertex_faces
 
     inputs = [
         vertices,
@@ -473,7 +475,7 @@ def shorten_loop(
         Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins].
     rings
         Optional precomputed [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] as
-        ``(offsets, ring_halfedges, is_boundary)``. Depends on the connectivity alone, so one CSR
+        ``(ring_halfedges, offsets, is_boundary)``. Depends on the connectivity alone, so one CSR
         serves every fan walk over the same mesh --
         [`Trimesh.vertex_one_rings`][triwarp.mesh.Trimesh.vertex_one_rings] has it cached, and
         passing it skips the vertex-manifold check and the host readback that check costs.
@@ -511,7 +513,7 @@ def shorten_loop(
     n_vertices = int(vertices.shape[0])
     if twins is None:
         twins = halfedge_twins(faces, n_vertices=n_vertices)
-    ring_offsets, ring_halfedges, is_boundary = (
+    ring_halfedges, ring_offsets, is_boundary = (
         rings if rings is not None else vertex_one_rings(faces, twins=twins, n_vertices=n_vertices)
     )
 
