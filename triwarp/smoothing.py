@@ -31,6 +31,17 @@ confined to where it is wanted and kept within a tolerance of the surface it sta
 [`smooth_region_boundary`][triwarp.smoothing.smooth_region_boundary] completes the region trio by
 smoothing the region's *rim curve*, where the two above it smooth across the rim or inside it.
 
+**The verb tracks the mechanism, not the group**, which is why that second group spans three of
+them. ``filter_*`` runs a fixed operator to a schedule -- an assembled Laplacian, a normal-field
+pass, a windowed Taubin pair -- so the answer is a function of the operator and the iteration count.
+``relax_*`` iterates against a *geometric* objective and re-derives its target every pass, which is
+why those take a ``max_displacement`` bound: there is nothing in the mechanism that keeps the result
+near the input. ``equalize_triangle_areas`` and ``smooth_region*`` name their objective outright
+because there is only one of each. By that axis
+[`filter_spikes`][triwarp.smoothing.filter_spikes] is correctly a ``filter_*``: it runs the same
+fixed 1-ring operator the filters above it do, and only its *selection* is geometric. It sits in the
+paragraph above because its selection is what makes it useful, not because it is a relaxation.
+
 [`filter_scalar_laplacian`][triwarp.smoothing.filter_scalar_laplacian] runs the same operator over a
 per-vertex **scalar** field rather than positions. Capping how fast such a field may vary along an
 edge — the other half of turning a raw scalar into a usable sizing field — is not a smoothing filter
@@ -1735,6 +1746,47 @@ def refine_and_smooth_region(
     [`remesh.refine_region_to_density`][triwarp.remesh.refine_region_to_density]. ``max_edge`` and
     ``max_edge_splits`` are ignored under ``"density"``, which takes its target from the mesh
     instead of from an argument.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions, patch included.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer, patch included.
+    n_vertices_before
+        Vertex count before the patch was appended. Everything at or above this index is a patch
+        vertex, which is how the smooth step finds the vertices it may move.
+    patch_face_mask
+        ``(n_faces,)`` flag marking the patch faces to refine and smooth.
+    max_edge
+        Target edge length for ``refine="max_edge"``. Ignored under ``"density"``.
+    max_edge_splits
+        Soft cap on the number of edge splits during subdivision. Ignored under ``"density"``.
+    max_angle_change_after_flip
+        Dihedral-angle-change gate for the Delaunay flip pass, in radians.
+    smooth_curvature
+        When ``True``, smooth the new patch vertices after subdivision. When ``False`` the function
+        returns straight after refining.
+    smooth_boundary
+        When ``True``, let the patch rim move as well as its interior.
+    natural_smooth
+        When ``True``, additionally grow a collar around the patch and smooth it so the patch blends
+        into the surrounding surface.
+    edge_weights
+        Laplacian edge weights for the smooth solve: ``"cotan"`` or ``"unit"``.
+    refine
+        Subdivision criterion, as above.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        ``(n_vertices,)`` positions, the input's plus whatever subdivision appended, with the patch
+        smoothed when ``smooth_curvature``.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer of the refined mesh.
+    patch_face_mask : wp.array[wp.bool]
+        The patch mask carried through the refinement, one flag per face of the *returned* buffer --
+        longer than the input mask, since subdivision adds faces.
 
     Raises
     ------
