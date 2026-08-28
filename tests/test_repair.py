@@ -693,10 +693,10 @@ def test_resolve_duplicated_faces_cancelling(device: str):
     )
 
     f2_wp, j_wp = tw.repair.resolve_duplicated_faces(faces_wp)
-    f2_ref, j_ref = _resolve_duplicated_faces_ref(faces_np)
+    f2_np, j_np = _resolve_duplicated_faces_ref(faces_np)
 
-    assert np.array_equal(f2_wp.numpy().reshape(-1, 3), f2_ref)
-    assert np.array_equal(j_wp.numpy(), j_ref)
+    assert np.array_equal(f2_wp.numpy().reshape(-1, 3), f2_np)
+    assert np.array_equal(j_wp.numpy(), j_np)
 
 
 def test_resolve_duplicated_faces_keep_positive(device: str):
@@ -706,14 +706,36 @@ def test_resolve_duplicated_faces_keep_positive(device: str):
     )
 
     f2_wp, j_wp = tw.repair.resolve_duplicated_faces(faces_wp)
-    f2_ref, j_ref = _resolve_duplicated_faces_ref(faces_np)
+    f2_np, j_np = _resolve_duplicated_faces_ref(faces_np)
 
-    assert np.array_equal(f2_wp.numpy().reshape(-1, 3), f2_ref)
-    assert np.array_equal(j_wp.numpy(), j_ref)
+    assert np.array_equal(f2_wp.numpy().reshape(-1, 3), f2_np)
+    assert np.array_equal(j_wp.numpy(), j_np)
 
 
+@pytest.mark.parity(
+    "resolve_duplicated_faces",
+    "numpy",
+    benchmarked=False,
+    reason="the reference is a hand-rolled NumPy transcription of the signed-count rule, so it is "
+    "not a library implementation to race -- and the two libraries that *are* timed here (open3d "
+    "and pymeshlab) are both exempt because their de-duplication rule differs by design. This is "
+    "the only oracle for the rule itself, which is why it is claimed untimed rather than left "
+    "as the group's third incomparable row.",
+)
 def test_resolve_duplicated_faces_random(device: str):
-    """Randomized orientable duplicate groups vs the CPU reference (order-insensitive)."""
+    """
+    Class B (set equality): the signed-count rule against a NumPy transcription of it.
+
+    The named transform is the emission order. The reference groups with ``np.unique`` and so emits
+    lexicographically, where the production path follows its hash-sorted unique order -- so the
+    *kept sets* are what must agree, and the surviving index list is compared after sorting.
+
+    This is the group's only oracle. Both benchmarked references are exempt: open3d and pymeshlab
+    both de-duplicate by a different rule than the signed count (a cancelling pair vanishes here and
+    survives there), which ``benchmarks/test_repair.py`` records. So the rule itself is checked
+    exactly once, here, and the input is built to exercise all three of its branches -- 100 singles,
+    80 cancelling pairs, and 60 groups with a positive majority.
+    """
     rng = np.random.default_rng(17)
     pool = np.stack(np.meshgrid(np.arange(12), np.arange(12, 24), np.arange(24, 36)), -1).reshape(
         -1, 3
@@ -729,13 +751,13 @@ def test_resolve_duplicated_faces_random(device: str):
     )
 
     f2_wp, j_wp = tw.repair.resolve_duplicated_faces(faces_wp)
-    f2_ref, j_ref = _resolve_duplicated_faces_ref(faces_np)
+    f2_np, j_np = _resolve_duplicated_faces_ref(faces_np)
 
     # The reference emits groups in lexicographic (np.unique) order while the production path
     # follows its hash-sorted unique order; the kept sets must agree exactly.
-    assert np.array_equal(np.sort(j_wp.numpy()), np.sort(j_ref))
+    assert np.array_equal(np.sort(j_wp.numpy()), np.sort(j_np))
     resolved_rows = {tuple(row) for row in f2_wp.numpy().reshape(-1, 3).tolist()}
-    reference_rows = {tuple(row) for row in f2_ref.tolist()}
+    reference_rows = {tuple(row) for row in f2_np.tolist()}
     assert resolved_rows == reference_rows
 
 

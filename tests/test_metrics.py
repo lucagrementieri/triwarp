@@ -545,15 +545,15 @@ def test_chamfer_points_to_points_loss_grad(
 
     # Reference loss and closed-form gradient (pytorch3d convention, fixed assignment).
     scale_f = (1.0 / n) if reduction == "mean" else 1.0
-    loss_ref = _reduce_np(((x_np - y_np[nn_xy]) ** 2).sum(-1), reduction)
-    grad_x_ref = 2.0 * scale_f * (x_np - y_np[nn_xy])
-    grad_y_ref = np.zeros_like(y_np)
-    np.add.at(grad_y_ref, nn_xy, -2.0 * scale_f * (x_np - y_np[nn_xy]))
+    loss_np = _reduce_np(((x_np - y_np[nn_xy]) ** 2).sum(-1), reduction)
+    grad_x_np = 2.0 * scale_f * (x_np - y_np[nn_xy])
+    grad_y_np = np.zeros_like(y_np)
+    np.add.at(grad_y_np, nn_xy, -2.0 * scale_f * (x_np - y_np[nn_xy]))
     if not single_directional:
         scale_b = (1.0 / m) if reduction == "mean" else 1.0
-        loss_ref += _reduce_np(((y_np - x_np[nn_yx]) ** 2).sum(-1), reduction)
-        grad_y_ref += 2.0 * scale_b * (y_np - x_np[nn_yx])
-        np.add.at(grad_x_ref, nn_yx, -2.0 * scale_b * (y_np - x_np[nn_yx]))
+        loss_np += _reduce_np(((y_np - x_np[nn_yx]) ** 2).sum(-1), reduction)
+        grad_y_np += 2.0 * scale_b * (y_np - x_np[nn_yx])
+        np.add.at(grad_x_np, nn_yx, -2.0 * scale_b * (y_np - x_np[nn_yx]))
 
     x_wp = wp.array(x_np, dtype=wp.vec3, device=device, requires_grad=True)
     y_wp = wp.array(y_np, dtype=wp.vec3, device=device, requires_grad=True)
@@ -563,9 +563,9 @@ def test_chamfer_points_to_points_loss_grad(
     )
     tape.backward(loss=loss_wp)
 
-    assert np.allclose(loss_wp.numpy()[0], loss_ref, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
-    assert np.allclose(x_wp.grad.numpy(), grad_x_ref, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
-    assert np.allclose(y_wp.grad.numpy(), grad_y_ref, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
+    assert np.allclose(loss_wp.numpy()[0], loss_np, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
+    assert np.allclose(x_wp.grad.numpy(), grad_x_np, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
+    assert np.allclose(y_wp.grad.numpy(), grad_y_np, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
 
 
 @pytest.mark.parametrize("reduction", ["mean", "sum"])
@@ -590,15 +590,15 @@ def test_chamfer_points_to_mesh_loss_grad(
     face_id = tw.proximity.closest_point_on_mesh(verts_wp, faces_wp, points_wp)[2].numpy()
     nn_vp = tw.neighbors.query_nearest(points_wp, verts_wp, k=1)[0].numpy()
 
-    def loss_np() -> float:
+    def evaluate_loss_np() -> float:
         total = _reduce_np(_surface_sq_np(points_np, verts_np, faces_np, face_id), reduction)
         if not single_directional:
             total += _reduce_np(((verts_np - points_np[nn_vp]) ** 2).sum(-1), reduction)
         return total
 
-    loss_ref = loss_np()
-    grad_points_ref = _fd_grad(loss_np, points_np)
-    grad_verts_ref = _fd_grad(loss_np, verts_np)
+    loss_np = evaluate_loss_np()
+    grad_points_np = _fd_grad(evaluate_loss_np, points_np)
+    grad_verts_np = _fd_grad(evaluate_loss_np, verts_np)
 
     tape = wp.Tape()
     loss_wp = tw.metrics.chamfer_points_to_mesh_loss(
@@ -611,11 +611,20 @@ def test_chamfer_points_to_mesh_loss_grad(
     )
     tape.backward(loss=loss_wp)
 
-    assert np.allclose(loss_wp.numpy()[0], loss_ref, rtol=_FD_RTOL, atol=_FD_ATOL)
-    assert np.allclose(points_wp.grad.numpy(), grad_points_ref, rtol=_FD_RTOL, atol=_FD_ATOL)
-    assert np.allclose(verts_wp.grad.numpy(), grad_verts_ref, rtol=_FD_RTOL, atol=_FD_ATOL)
+    assert np.allclose(loss_wp.numpy()[0], loss_np, rtol=_FD_RTOL, atol=_FD_ATOL)
+    assert np.allclose(points_wp.grad.numpy(), grad_points_np, rtol=_FD_RTOL, atol=_FD_ATOL)
+    assert np.allclose(verts_wp.grad.numpy(), grad_verts_np, rtol=_FD_RTOL, atol=_FD_ATOL)
 
 
+@pytest.mark.parity(
+    "chamfer_mesh_to_mesh_loss",
+    "numpy",
+    benchmarked=False,
+    reason="the reference is a central finite difference of the same loss, which costs two forward "
+    "evaluations per coordinate -- 6n for an n-vertex pair -- so timing it would price the "
+    "oracle's own cost rather than a competing autodiff. No installed library differentiates a "
+    "mesh-to-mesh Chamfer at all; the gradient values are what is comparable.",
+)
 @pytest.mark.parametrize("reduction", ["mean", "sum"])
 @pytest.mark.parametrize("single_directional", [False, True])
 def test_chamfer_mesh_to_mesh_loss_grad(
@@ -634,7 +643,7 @@ def test_chamfer_mesh_to_mesh_loss_grad(
     face_id_ab = tw.proximity.closest_point_on_mesh(verts_b_wp, faces_wp, verts_a_wp)[2].numpy()
     face_id_ba = tw.proximity.closest_point_on_mesh(verts_a_wp, faces_wp, verts_b_wp)[2].numpy()
 
-    def loss_np() -> float:
+    def evaluate_loss_np() -> float:
         total = _reduce_np(_surface_sq_np(verts_a_np, verts_b_np, faces_np, face_id_ab), reduction)
         if not single_directional:
             total += _reduce_np(
@@ -642,9 +651,9 @@ def test_chamfer_mesh_to_mesh_loss_grad(
             )
         return total
 
-    loss_ref = loss_np()
-    grad_a_ref = _fd_grad(loss_np, verts_a_np)
-    grad_b_ref = _fd_grad(loss_np, verts_b_np)
+    loss_np = evaluate_loss_np()
+    grad_a_np = _fd_grad(evaluate_loss_np, verts_a_np)
+    grad_b_np = _fd_grad(evaluate_loss_np, verts_b_np)
 
     tape = wp.Tape()
     loss_wp = tw.metrics.chamfer_mesh_to_mesh_loss(
@@ -658,10 +667,10 @@ def test_chamfer_mesh_to_mesh_loss_grad(
     )
     tape.backward(loss=loss_wp)
 
-    assert np.allclose(loss_wp.numpy()[0], loss_ref, rtol=_FD_RTOL, atol=_FD_ATOL)
-    assert np.allclose(verts_a_wp.grad.numpy(), grad_a_ref, rtol=_FD_RTOL, atol=_FD_ATOL)
+    assert np.allclose(loss_wp.numpy()[0], loss_np, rtol=_FD_RTOL, atol=_FD_ATOL)
+    assert np.allclose(verts_a_wp.grad.numpy(), grad_a_np, rtol=_FD_RTOL, atol=_FD_ATOL)
     if not single_directional:
-        assert np.allclose(verts_b_wp.grad.numpy(), grad_b_ref, rtol=_FD_RTOL, atol=_FD_ATOL)
+        assert np.allclose(verts_b_wp.grad.numpy(), grad_b_np, rtol=_FD_RTOL, atol=_FD_ATOL)
 
 
 @pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])

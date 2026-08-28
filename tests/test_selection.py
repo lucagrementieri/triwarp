@@ -6,10 +6,12 @@ import numpy as np
 import open3d as o3d
 import pytest
 import pyvista as pv
+import scipy.sparse as sp
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
+from scipy.sparse import csgraph
 from scipy.spatial import KDTree
 
 import triwarp as tw
@@ -329,6 +331,82 @@ def test_faces_left_of_contour_edge_cases(torus: tuple[tm.Trimesh, wp.Mesh]) -> 
         tw.selection.faces_left_of_contour(
             faces_wp, twt.as_array2d(wp.zeros((2, 3), dtype=wp.int32, device=device), wp.int32)
         )
+
+
+@pytest.mark.parity(
+    "exclude_fully_selected_components",
+    "scipy",
+    benchmarked=False,
+    reason="the reference is scipy.sparse.csgraph.connected_components plus a per-component all() "
+    "on the host, which is a composition rather than a bound equivalent -- no library exposes this "
+    "predicate -- so a row would time a host labelling against a device pass over an edge set that "
+    "triwarp builds inside the call. The classification is what is comparable.",
+)
+@pytest.mark.parametrize("n_sub", [1, 2])
+def test_exclude_fully_selected_components_matches_scipy(device: str, n_sub: int) -> None:
+    """
+    Class A: the same classification as ``csgraph.connected_components`` plus a per-component all().
+
+    No library binds this predicate, so the reference is composed from one that does the hard half.
+    ``csgraph.connected_components`` over the vertex adjacency labels the components independently
+    of triwarp's own connectivity pass, and the rule on top -- drop a component iff *every* one of
+    its
+    vertices is selected -- is one line, which is what makes this an oracle rather than a
+    reimplementation: the part that could plausibly be wrong is the labelling, and that comes from
+    scipy.
+
+    The input is built to exercise all three branches at once, which is what keeps it non-vacuous: a
+    **fully** selected component (dropped), a **partially** selected one (kept intact) and an
+    **unselected** one (unchanged). Measured on the ``n_sub=1`` arm: 3 components, 16 selected
+    vertices in, 4 out -- so a function that dropped nothing, dropped everything, or ignored
+    component boundaries would each fail a different assert below.
+    """
+    meshes = (
+        tm.creation.icosahedron(),
+        tm.creation.icosphere(subdivisions=n_sub),
+        tm.creation.box(),
+    )
+    parts = []
+    for index, mesh_tm in enumerate(meshes):
+        vertices_np = np.ascontiguousarray(mesh_tm.vertices) + np.array([5.0 * index, 0.0, 0.0])
+        parts.append(
+            (
+                points_to_warp(vertices_np, device),
+                wp.array(
+                    np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32),
+                    dtype=wp.int32,
+                    device=device,
+                ),
+            )
+        )
+    vertices_wp, faces_wp = tw.combine.concatenate(parts)
+    n_vertices = int(vertices_wp.shape[0])
+    offsets = np.cumsum([0, *(len(mesh_tm.vertices) for mesh_tm in meshes)])
+
+    mask_np = np.zeros(n_vertices, dtype=bool)
+    mask_np[offsets[0] : offsets[1]] = True  # component 0: fully selected
+    mask_np[offsets[1] : offsets[1] + 4] = True  # component 1: partially selected
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+
+    kept_wp = tw.selection.exclude_fully_selected_components(faces_wp, mask_wp, n_vertices).numpy()
+
+    faces_2d_np = faces_wp.numpy().reshape(-1, 3)
+    rows_np = np.concatenate([faces_2d_np[:, 0], faces_2d_np[:, 1], faces_2d_np[:, 2]])
+    columns_np = np.concatenate([faces_2d_np[:, 1], faces_2d_np[:, 2], faces_2d_np[:, 0]])
+    adjacency_np = sp.coo_matrix(
+        (np.ones(rows_np.shape[0]), (rows_np, columns_np)), shape=(n_vertices, n_vertices)
+    )
+    n_components, labels_np = csgraph.connected_components(adjacency_np, directed=False)
+    kept_np = mask_np.copy()
+    for component in range(n_components):
+        members_np = labels_np == component
+        if mask_np[members_np].all():
+            kept_np[members_np] = False
+
+    # Non-vacuity: three distinct components, and the answer is neither the input nor empty.
+    assert n_components == 3
+    assert int(mask_np.sum()) > int(kept_np.sum()) > 0
+    assert np.array_equal(kept_wp, kept_np)
 
 
 def test_exclude_fully_selected_components(device: str):

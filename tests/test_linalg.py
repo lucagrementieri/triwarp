@@ -228,7 +228,23 @@ def test_assemble_interior_system_matches_a_numpy_partition(device: str) -> None
     )
 
 
+@pytest.mark.parity(
+    "solve_spd_columns",
+    "numpy",
+    benchmarked=False,
+    reason="numpy.linalg.solve is a dense LU on the host and this is a batched preconditioned CG "
+    "on the device, so a row would compare an O(n^3) factorization with an iterative solve and "
+    "report the crossover as a speedup. The *answer* is what is comparable, and a dense solve "
+    "is the strongest oracle available for it -- exact up to conditioning.",
+)
 def test_solve_spd_columns_matches_numpy(device: str) -> None:
+    """
+    Class A against ``numpy.linalg.solve``, on the default single-column path.
+
+    The reference is a dense LU of the same operator, so this is an exact oracle up to conditioning
+    rather than a tolerance dictated by two approximations meeting. The ``1e-5`` bound is the CG
+    tolerance's, not the reference's.
+    """
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device)
     solution_wp = wp.zeros_like(rhs_wp)
     tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
@@ -236,6 +252,15 @@ def test_solve_spd_columns_matches_numpy(device: str) -> None:
     assert np.allclose(solution_wp.numpy(), solution_np, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity(
+    "solve_spd_columns",
+    "numpy",
+    benchmarked=False,
+    reason="numpy.linalg.solve is a dense LU on the host and this is a batched preconditioned CG "
+    "on the device, so a row would compare an O(n^3) factorization with an iterative solve and "
+    "report the crossover as a speedup. The *answer* is what is comparable, and a dense solve "
+    "is the strongest oracle available for it -- exact up to conditioning.",
+)
 @pytest.mark.parametrize("n", [1, 2, 255, 256, 257, 511, 512, 513])
 def test_solve_spd_columns_across_the_reduction_tile_boundary(device: str, n: int) -> None:
     """
@@ -257,6 +282,15 @@ def test_solve_spd_columns_across_the_reduction_tile_boundary(device: str, n: in
     )
 
 
+@pytest.mark.parity(
+    "solve_spd_columns",
+    "numpy",
+    benchmarked=False,
+    reason="numpy.linalg.solve is a dense LU on the host and this is a batched preconditioned CG "
+    "on the device, so a row would compare an O(n^3) factorization with an iterative solve and "
+    "report the crossover as a speedup. The *answer* is what is comparable, and a dense solve "
+    "is the strongest oracle available for it -- exact up to conditioning.",
+)
 @pytest.mark.parametrize("n_rhs", [1, 2, 5])
 def test_solve_spd_columns_agrees_across_column_counts(device: str, n_rhs: int) -> None:
     """
@@ -289,6 +323,15 @@ def test_solve_spd_columns_check_every_is_solution_invariant(device: str, check_
     assert np.allclose(solution_wp.numpy(), solution_np, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity(
+    "spd_column_solver_amortized",
+    "numpy",
+    benchmarked=False,
+    reason="same dense-LU-against-iterative-CG mismatch as the solve_spd_columns claims above, and "
+    "this group additionally measures *reuse* across calls -- numpy has no hoisted-state form to "
+    "amortize, so there is nothing on its side for the amortization axis to time. The answer each "
+    "reused call converges to is what is comparable.",
+)
 def test_spd_column_solver_check_every_reused_across_calls(device: str) -> None:
     # The hoisted functor keeps its ``check_every`` across calls and warm-starts from ``solution``.
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device)
@@ -355,6 +398,16 @@ def test_solve_spd_is_quiet_when_it_converges(device: str) -> None:
 # --- replicated_operator ------------------------------------------------------------------
 
 
+@pytest.mark.parity(
+    "multigrid_preconditioner",
+    "numpy",
+    benchmarked=False,
+    reason="nothing installed here binds smoothed-aggregation multigrid -- pyamg is not a "
+    "dependency -- so there is no reference *preconditioner* to time. What a preconditioner "
+    "cannot do is change the converged answer, and a dense numpy.linalg.solve of the same "
+    "operator is the oracle for that; timing it would be the O(n^3)-against-iterative "
+    "mismatch the sibling claims record.",
+)
 def test_multigrid_preconditioner_solves_the_same_system(device: str) -> None:
     """
     Class A, against ``numpy.linalg.solve``: the V-cycle changes the path, not the answer.

@@ -82,6 +82,14 @@ _HOLLOW_REASON = re.compile(
 # Reference-variable suffixes mandated by CLAUDE.md section 6, used by the anti-vacuity check.
 # ``trimesh`` and ``scipy`` also allow ``_np``: several benchmark rows are hand-rolled NumPy
 # stand-ins for cached trimesh properties, and every scipy oracle is plain NumPy in and out.
+#
+# ``moderngl`` is the one entry here that is **not** a benchmark library, and it is registered
+# anyway on purpose. It cannot carry a timed row -- an OpenGL rasterization prices driver and
+# context overhead rather than an algorithm, which ``benchmarks/test_texture.py`` records -- so its
+# claims are all ``benchmarked=False``. But an *unregistered* name silently disables
+# ``_library_trace`` below (it returns ``None`` when the library is absent from this table), so
+# leaving it out would let a moderngl claim land on a test that never consults moderngl. Registering
+# a test-only reference is how the anti-vacuity check keeps applying to it.
 _LIBRARY_SUFFIXES: dict[str, frozenset[str]] = {
     "trimesh": frozenset({"_tm", "_np"}),
     "igl": frozenset({"_igl"}),
@@ -92,6 +100,12 @@ _LIBRARY_SUFFIXES: dict[str, frozenset[str]] = {
     "pyvista": frozenset({"_pv"}),
     "meshlib": frozenset({"_ml"}),
     "pymeshfix": frozenset({"_pmf"}),
+    "moderngl": frozenset({"_gl"}),
+    # ``numpy`` has carried timed pairs since ``test_reduce.py`` landed and was missing from this
+    # table the whole time, which meant every one of its claims skipped the check below -- the same
+    # hole the moderngl note above describes, but live rather than hypothetical. Verified: all 16
+    # existing numpy claims pass on ``_np`` with no renames.
+    "numpy": frozenset({"_np"}),
 }
 
 # The second half of the anti-vacuity signal: a test may consult a reference without ever naming
@@ -128,6 +142,8 @@ _LIBRARY_ROOTS: dict[str, frozenset[str]] = {
         {"ml", "trimesh_to_pymeshlab", "warp_to_pymeshlab", "points_to_pymeshlab"}
     ),
     "pyvista": frozenset({"pv", "trimesh_to_pyvista", "points_to_pyvista"}),
+    "moderngl": frozenset({"moderngl", "gl_context"}),
+    "numpy": frozenset({"np"}),
     "meshlib": frozenset(
         {
             "mm",

@@ -168,8 +168,45 @@ def _interior_mask(n: int) -> npt.NDArray[np.bool_]:
 # --------------------------------------------------------------------------------------------
 # Forward rasterization vs OpenGL
 # --------------------------------------------------------------------------------------------
+@pytest.mark.parity(
+    "rasterize_attribute",
+    "moderngl",
+    benchmarked=False,
+    reason="an OpenGL rasterization prices driver dispatch, an FBO allocation and a context "
+    "round-trip rather than an algorithm, so a timed row would compare a GPU driver against a Warp "
+    "kernel and read as a throughput number for neither. benchmarks/test_texture.py carries that "
+    "decline; moderngl is registered as a test-only reference so this claim is still checked.",
+)
 @pytest.mark.parametrize("n_channels", [1, 2, 5])
 def test_rasterize_attribute_matches_opengl(gl_context, device: str, n_channels: int):
+    """
+    Class C (a coverage fraction plus values on the jointly-covered pixels).
+
+    No correspondence is available pixel-for-pixel: OpenGL's top-left fill rule and triwarp's
+    barycentric pixel-centre coverage test disagree by construction on a boundary pixel, so the
+    comparison is a coverage *agreement fraction* and then an exact value check restricted to the
+    pixels both rasterizers claim. The interpolated field is continuous, which is what makes the
+    restriction sound rather than convenient -- where both cover, both are interpolating the same
+    affine function over the same triangle.
+
+    Measured at ``n_channels=5``: coverage agreement is **1.000000** -- the fill-rule band this
+    fixture could exercise is empty -- with 82.1 % of the image covered, 3 364 jointly-covered
+    pixels and a max value difference of **1.99e-04** against the ``1e-3`` bound. So the ``0.98``
+    threshold is *headroom for the documented fill-rule difference, not a fitted number*; it has
+    never been approached on this fixture.
+
+    Mutation probe, and it has a trap worth recording: **transposing** triwarp's coverage mask
+    also scores **1.000000**, because ``_grid_uv_mesh`` is symmetric under transposition -- so the
+    obvious mutation is vacuous here and would "prove" the bound bites when it does not. A
+    **shuffle** is the valid probe: it drops agreement to **0.708**, i.e. 29.2 % disagreement
+    against the 2 % the
+    threshold allows, a **14.6x** margin.
+
+    The bug class this excludes: a wrong barycentric interpolation, a channel permutation, an
+    off-by-one in the pixel-centre offset, a UV-to-NDC sign error, and any coverage rule wrong by
+    more than a boundary pixel. What it does *not* see is a systematic half-pixel shift small enough
+    to keep the same pixel set, which the round-trip tests below are what cover.
+    """
     rng = np.random.default_rng(20240704 + n_channels)
     uv_np, faces_np = _grid_uv_mesh(n=8)
     # Offset into [1, 2] so covered pixels are never ~0 (distinguishable from uncovered 0).
@@ -196,7 +233,38 @@ def test_rasterize_attribute_matches_opengl(gl_context, device: str, n_channels:
     assert np.allclose(image_wp[both], image_gl[both], rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parity(
+    "rasterize_discrete_attribute",
+    "moderngl",
+    benchmarked=False,
+    reason="same decline as the continuous rasterizer above: an OpenGL row prices driver dispatch "
+    "and an FBO round-trip rather than the argmax-over-accumulated-weights this group performs. It "
+    "also needs a one-hot encoding on the reference side, so the two are not even doing the same "
+    "amount of work -- the label agreement is what is comparable, and that is what this checks.",
+)
 def test_rasterize_discrete_attribute_matches_opengl(gl_context, device: str):
+    """
+    Class C (coverage fraction plus label agreement), through a named one-hot transform.
+
+    OpenGL has no per-pixel argmax, so the reference rasterizes the labels **one-hot** as a
+    continuous attribute and takes the argmax afterwards. That is the transform, and it is not free:
+    interpolating a one-hot vector and then taking an argmax is barycentric nearest-label, which is
+    what triwarp's weight accumulation computes -- but the two break argmax *ties* differently, so
+    the label comparison is a fraction rather than an equality.
+
+    Measured: coverage agreement **1.000000** and label agreement **0.999405** -- 2 disagreeing
+    pixels of 3 364, both on a tie edge -- against the ``0.98`` bound.
+
+    Mutation probe: shuffling the reference labels over the jointly-covered pixels drops agreement
+    to **0.2815**, which is chance for this fixture's 4 labels. So the bound sits **34x** above
+    chance
+    in disagreement terms (0.06 % measured against 71.8 % shuffled, with 2 % allowed).
+
+    The bug class this excludes: a label gathered from the wrong vertex, an argmax over the wrong
+    axis, a coverage rule that disagrees by more than a boundary pixel, and the ``-1`` uncovered
+    sentinel leaking into the covered region. Ties near an edge are the residual, and they are the
+    reason this is a fraction and not ``array_equal``.
+    """
     rng = np.random.default_rng(99)
     n = 8
     uv_np, faces_np = _grid_uv_mesh(n=n)
@@ -229,35 +297,153 @@ def test_rasterize_discrete_attribute_matches_opengl(gl_context, device: str):
 # --------------------------------------------------------------------------------------------
 # Inverse sampling vs scipy
 # --------------------------------------------------------------------------------------------
+@pytest.mark.parity(
+    "remap_attribute_from_uv_linear",
+    "scipy",
+    benchmarked=False,
+    reason="scipy.ndimage.map_coordinates samples a plain grid and knows nothing about UV space or "
+    "mesh topology, so it is the right oracle for the interpolation and the wrong baseline for "
+    "the operation -- a row would time a host grid sampler against a device gather over a "
+    "parametrization. benchmarks/test_texture.py carries that decline.",
+)
+@pytest.mark.parity(
+    "remap_attribute_from_uv_nearest",
+    "scipy",
+    benchmarked=False,
+    reason="scipy.ndimage.map_coordinates samples a plain grid and knows nothing about UV space or "
+    "mesh topology, so it is the right oracle for the interpolation and the wrong baseline for "
+    "the operation -- a row would time a host grid sampler against a device gather over a "
+    "parametrization. benchmarks/test_texture.py carries that decline.",
+)
 @pytest.mark.parametrize("order", [0, 1])
 @pytest.mark.parametrize("n_channels", [1, 3])
 def test_remap_attribute_matches_scipy(device: str, order: int, n_channels: int):
+    """
+    Class A against ``scipy.ndimage.map_coordinates``, on both interpolation orders.
+
+    One test covers two benchmark groups because ``order`` is exactly what separates them:
+    ``order=1`` is ``remap_attribute_from_uv_linear`` and ``order=0`` is ``..._nearest``, so both
+    markers sit here rather than one of them borrowing the other's oracle.
+
+    The reference has to be *constructed* to agree, and that construction is the content of the
+    comparison: ``_remap_attribute_scipy`` maps UV to pixel coordinates as
+    ``rows = (1 - v) * height - 0.5`` and ``cols = u * width - 0.5``, which is the pixel-*centre*
+    convention with the v axis flipped, and passes ``mode="nearest"`` plus ``prefilter=False`` so
+    that scipy clamps at the border and does no spline pre-filter. Any of those four wrong and the
+    two
+    disagree by a half-pixel or at the edges -- so this test pins the convention as much as the
+    arithmetic.
+
+    Measured max absolute difference against the ``1e-4`` bound: **exactly 0.0** at ``order=0`` for
+    both channel counts (a nearest fetch is the same integer index on both sides, so there is
+    nothing to round), and **1.37e-06** / **1.67e-06** at ``order=1``, which is float32 lerp
+    against
+    float64 spline evaluation. Mutation probe: shuffling the reference rows takes the max difference
+    to **0.75-0.97**, the full range of the data, so the bound clears the mutation by four orders of
+    magnitude.
+    """
     rng = np.random.default_rng(7 * order + n_channels)
     height, width = 40, 48
     image_np = rng.random((height, width, n_channels), dtype=np.float32)
     uv_np = rng.random((200, 2), dtype=np.float32)
 
-    values_scipy = _remap_attribute_scipy(uv_np, image_np, order)
+    values_np = _remap_attribute_scipy(uv_np, image_np, order)
 
     uv_wp = points_to_warp_uv(uv_np, device)
     image_wp = wp.array(image_np, dtype=wp.float32, device=device)
     values_wp = tw.texture.remap_attribute_from_uv(uv_wp, image_wp, order=order).numpy()
 
     assert values_wp.shape == (200, n_channels)
-    assert np.allclose(values_wp, values_scipy, rtol=1e-4, atol=1e-4)
+    assert np.allclose(values_wp, values_np, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parity(
+    "remap_attribute_from_uv_linear",
+    "scipy",
+    benchmarked=False,
+    reason="scipy.ndimage.map_coordinates samples a plain grid and knows nothing about UV space or "
+    "mesh topology, so it is the right oracle for the interpolation and the wrong baseline for "
+    "the operation -- a row would time a host grid sampler against a device gather over a "
+    "parametrization. benchmarks/test_texture.py carries that decline.",
+)
 def test_remap_attribute_2d_image(device: str):
+    """
+    Class A: the rank-2 image path, which the parametrized test above never reaches.
+
+    ``remap_attribute_from_uv`` accepts a bare ``(height, width)`` image as well as
+    ``(height, width, channels)`` and returns a ``(n, 1)`` column either way; the reference helper
+    promotes the 2-D case with ``image[:, :, None]``. That promotion is the only difference from
+    [`test_remap_attribute_matches_scipy`], and it is a real branch in the wrapper rather than a
+    convenience, which is why it has its own comparison at ``order=1``.
+    """
     rng = np.random.default_rng(3)
     image_np = rng.random((32, 32), dtype=np.float32)
     uv_np = rng.random((50, 2), dtype=np.float32)
-    values_scipy = _remap_attribute_scipy(uv_np, image_np, order=1)
+    values_np = _remap_attribute_scipy(uv_np, image_np, order=1)
 
     uv_wp = points_to_warp_uv(uv_np, device)
     image_wp = wp.array(image_np, dtype=wp.float32, device=device)
     values_wp = tw.texture.remap_attribute_from_uv(uv_wp, image_wp, order=1).numpy()
     assert values_wp.shape == (50, 1)
-    assert np.allclose(values_wp[:, 0], values_scipy[:, 0], rtol=1e-4, atol=1e-4)
+    assert np.allclose(values_wp[:, 0], values_np[:, 0], rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parity(
+    "remap_discrete_attribute_from_uv",
+    "scipy",
+    benchmarked=False,
+    reason="same decline as the continuous samplers above: map_coordinates samples a plain "
+    "grid with no notion of UV space, so it is the interpolation oracle and not a baseline "
+    "for the operation. At order=0 it is additionally doing strictly less -- no label "
+    "semantics, no -1 sentinel -- so a row would price a host nearest fetch against a "
+    "device gather over a parametrization.",
+)
+@pytest.mark.parametrize("n_labels", [2, 5])
+def test_remap_discrete_attribute_matches_scipy(device: str, n_labels: int) -> None:
+    """
+    Class A: a class image sampled back to labels is ``map_coordinates`` at ``order=0``.
+
+    Nearest-neighbour sampling of an integer image is exactly what the discrete remapper does, and
+    scipy performs it on the float64 promotion of the same array -- so the two must agree
+    *exactly*, not to a tolerance: ``order=0`` picks a texel rather than blending it, and both sides
+    address it through the identical pixel-centre convention
+    (``rows = (1 - v) * height - 0.5``, ``cols = u * width - 0.5``, ``mode="nearest"``).
+
+    Measured: **0 mismatches of 300** queries at 5 labels, with all 5 labels present in the answer.
+    Mutation probe: shuffling the reference labels drops agreement to **0.180**, which is chance at
+    5 labels, so ``array_equal`` clears the mutation completely rather than by a margin.
+
+    Random UVs are what make the exactness claim safe. A tie -- a query landing exactly on a pixel
+    boundary -- is where a rounding convention could separate the two, and it has measure zero here;
+    the ``n_labels=2`` arm is the one that would surface a systematic off-by-one: with only
+    two labels a half-pixel shift changes the answer on a large fraction of the image rather
+    than on a thin band.
+
+    The bug class this excludes: a flipped v axis, a half-pixel offset, a row/column transposition,
+    and a label read through the continuous path (which would blend two labels into a third).
+    """
+    rng = np.random.default_rng(11 + n_labels)
+    height, width = 40, 48
+    class_image_np = rng.integers(0, n_labels, size=(height, width)).astype(np.int32)
+    uv_np = rng.random((300, 2), dtype=np.float32)
+
+    rows_np = (1.0 - uv_np[:, 1].astype(np.float64)) * height - 0.5
+    columns_np = uv_np[:, 0].astype(np.float64) * width - 0.5
+    labels_np = map_coordinates(
+        class_image_np.astype(np.float64),
+        [rows_np, columns_np],
+        order=0,
+        mode="nearest",
+        prefilter=False,
+    ).astype(np.int32)
+
+    uv_wp = points_to_warp_uv(uv_np, device)
+    class_image_wp = wp.array(class_image_np, dtype=wp.int32, device=device)
+    labels_wp = tw.texture.remap_discrete_attribute_from_uv(uv_wp, class_image_wp).numpy()
+
+    # Non-vacuity: a constant answer would satisfy array_equal against a constant reference.
+    assert np.unique(labels_np).shape[0] == n_labels
+    assert np.array_equal(labels_wp, labels_np)
 
 
 # --------------------------------------------------------------------------------------------

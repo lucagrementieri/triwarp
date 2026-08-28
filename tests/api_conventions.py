@@ -1494,7 +1494,12 @@ def bare_annotation_problems() -> list[str]:
 # is right there because a ``parity`` marker has already declared that a second implementation was
 # consulted -- but in the suite at large ``_np`` marks *inputs* at least as often as oracles.
 # Measured: adding it takes this scan from 523 comparison tests to 783 and from 0 problems to 290.
-_REFERENCE_SUFFIXES = ("_tm", "_igl", "_pp", "_pml", "_o3d", "_pv", "_ml", "_pmf")
+#
+# ``_gl`` is moderngl's, and this table has to be edited alongside ``tests/parity.py``'s
+# ``_LIBRARY_SUFFIXES`` -- the two encode the same convention independently, so a reference added
+# to one and not the other is enforced by half the gate. Measured clean: the only ``*_gl`` names in
+# the suite are ``image_gl``, ``covered_gl`` and ``class_gl``, all moderngl's.
+_REFERENCE_SUFFIXES = ("_tm", "_igl", "_pp", "_pml", "_o3d", "_pv", "_ml", "_pmf", "_gl")
 
 # The four phrases the suite uses to label a comparison, all four in good standing. ``Class [ABCD]``
 # and ``Not a library comparison`` are section 6's named labels; ``Not a parity assert`` and
