@@ -864,9 +864,22 @@ def test_filter_mut_dif_laplacian_no_volume_constraint(
     assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity(
+    "filter_implicit_fairing",
+    "igl",
+    benchmarked=False,
+    reason="libigl binds no implicit-fairing driver, so the reference is one igl.cotmatrix plus "
+    "one igl.massmatrix plus a scipy spsolve per pass, assembled here. A row would time a "
+    "direct sparse factorization against Warp's conjugate gradient over a composition neither "
+    "library exposes as a function, which is a solver comparison rather than this group's.",
+)
 def test_filter_implicit_fairing(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
-    Class A against trimesh on a closed mesh, which is where the flow is defined.
+    Class A against libigl on a closed mesh, which is where the flow is defined.
+
+    The reference is the flow itself, assembled per pass out of ``igl.cotmatrix`` and
+    ``igl.massmatrix`` and stepped with a direct ``scipy`` solve, because libigl binds no
+    implicit-fairing driver -- which is also why the pair is claimed untimed above.
 
     On an open boundary the unconstrained flow degrades boundary triangles and the CG solve
     diverges -- igl's direct solver tolerates that and Warp offers only CG, so the fixture

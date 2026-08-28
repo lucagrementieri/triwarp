@@ -1339,6 +1339,15 @@ def test_signed_distance_grid_guards_and_conventions(
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "hemisphere"])
 @pytest.mark.parametrize("tiled", [False, True])
 @pytest.mark.parity("winding_number", "igl")
+@pytest.mark.parity(
+    "winding_number_serial",
+    "igl",
+    benchmarked=False,
+    reason="the tiled parametrization above is what covers the serial group: igl.winding_number is "
+    "one implementation, already timed under winding_number, so a second row here would time the "
+    "identical call twice under two names. This group exists to pin triwarp's own tiled=False "
+    "path, which the reference has no counterpart for.",
+)
 def test_winding_number_random(request: pytest.FixtureRequest, mesh_name: str, tiled: bool) -> None:
     """
     Class A: the generalized winding number against ``igl.winding_number``, both kernels.

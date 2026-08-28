@@ -37,11 +37,13 @@ this file rather than with the precomputed-table groups above. ``face_adjacency_
 ``face_adjacency_projections`` plus a threshold, so the delta between the two groups is the
 comparison pass alone.
 
-**trimesh** is a genuine baseline for ``face_adjacency_convex``: ``Trimesh.face_adjacency_convex``
-computes the same predicate. It is a *cached property*, so the ``Trimesh`` is rebuilt inside the
-timed callable -- otherwise rounds 2..n would return a memoized array and measure nothing. That
-rebuild also pays trimesh's own ``face_adjacency`` construction, which is the honest comparison
-since the triwarp side builds its adjacency inside the timed region too. **libigl** has no
+**trimesh** is a genuine baseline for *both*: ``Trimesh.face_adjacency_projections`` is the same
+scalar per adjacent face pair in the same layout, and ``Trimesh.face_adjacency_convex`` is that plus
+the threshold. Both are *cached properties*, so the ``Trimesh`` is rebuilt inside the timed callable
+-- otherwise rounds 2..n would return a memoized array and measure nothing. That rebuild also pays
+trimesh's own ``face_adjacency`` construction, which is the honest comparison since the triwarp side
+builds its adjacency inside the timed region too. Both rows are capped at ``bunny``; the projection
+reference measured 276 ms at 327 680 faces against triwarp's 1.03 ms. **libigl** has no
 local-convexity binding, so igl is absent from these two.
 """
 
@@ -54,7 +56,7 @@ import trimesh as tm
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from conftest import BenchCase
+from conftest import BenchCase, skip_larger_than
 
 _adjacency_cache: dict[tuple[str, str], tuple] = {}
 
@@ -272,12 +274,33 @@ def test_vertex_face_adjacency(bench_case: BenchCase, known_nv: bool) -> None:
 
 
 @pytest.mark.benchmark(group="face_adjacency_projections")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "trimesh")
 def test_face_adjacency_projections(bench_case: BenchCase) -> None:
-    """Unshared-vertex plane projections per adjacent face pair, adjacency built inside."""
-    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    projections = bench_case.run(lambda: tw.adjacency.face_adjacency_projections(vertices, faces))
-    assert projections.shape[0] >= 0
+    """
+    Unshared-vertex plane projections per adjacent face pair, adjacency built inside.
+
+    ``Trimesh.face_adjacency_projections`` is the same quantity in the same layout -- one scalar per
+    adjacent face pair, keyed by that pair -- and is what
+    ``tests/test_adjacency.py::test_face_adjacency_projections`` compares against, so this row is a
+    like-for-like. It is a cached property, so the mesh is rebuilt inside the timed callable exactly
+    as ``face_adjacency_convex``'s row does, which means both sides pay for the adjacency the
+    projection needs; that is the honest comparison here, since the adjacency is what dominates.
+    Capped at ``bunny``: the reference is single-core NumPy and measured 276 ms at 327 680 faces
+    against triwarp's 1.03 ms.
+    """
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        projections = bench_case.run(
+            lambda: tw.adjacency.face_adjacency_projections(vertices, faces)
+        )
+        assert projections.shape[0] >= 0
+    else:  # a cached Trimesh property: rebuild inside, as face_adjacency_convex's row does
+        skip_larger_than(bench_case, "bunny", "the reference projects on one core")
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        projections_tm = bench_case.run(
+            lambda: tm.Trimesh(vertices_np, faces_np, process=False).face_adjacency_projections
+        )
+        assert projections_tm.shape[0] >= 0
 
 
 @pytest.mark.benchmark(group="face_adjacency_convex")

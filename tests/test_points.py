@@ -698,6 +698,17 @@ def test_radial_sort_parallel_start_raises(device: str) -> None:
         )
 
 
+@pytest.mark.parity(
+    "estimate_normals",
+    "open3d",
+    "pymeshlab",
+    benchmarked=False,
+    reason="the marked test below calls the *table-taking* form, "
+    "estimate_normals(points, neighbours), which is exactly what this group times -- "
+    "the neighbour table is its input. A row would put the search back inside the "
+    "callable and re-time estimate_normals_knn under a second name, since every "
+    "reference builds its own.",
+)
 @pytest.mark.parity("estimate_normals_knn", "open3d", "pymeshlab")
 def test_estimate_normals_matches_open3d(device: str) -> None:
     """
@@ -738,6 +749,16 @@ def test_estimate_normals_matches_open3d(device: str) -> None:
     assert_same_up_to_sign(normals_wp.numpy(), normals_pml, atol=1e-5)
 
 
+@pytest.mark.parity(
+    "estimate_normals",
+    "meshlib",
+    benchmarked=False,
+    reason="the marked test below calls the *table-taking* form, "
+    "estimate_normals(points, neighbours), which is exactly what this group times -- "
+    "the neighbour table is its input. A row would put the search back inside the "
+    "callable and re-time estimate_normals_knn under a second name, since every "
+    "reference builds its own.",
+)
 @pytest.mark.parity("estimate_normals_knn", "meshlib")
 def test_estimate_normals_matches_meshlib(device: str) -> None:
     """

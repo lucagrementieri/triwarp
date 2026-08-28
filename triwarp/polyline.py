@@ -670,7 +670,8 @@ def polyline_simplify(
     benchmark's two operating points settle in **7 and 4** rounds, and 3 extra rounds cost 0.017 ms.
 
     A serial fallback below a point count would therefore recover the capture alone, still pay the
-    0.166 ms tail and the allocations, and land near **0.24 ms** against meshlib's 0.14-0.25 -- so
+    0.166 ms tail and the allocations, and land near **0.24 ms** against the fastest CPU
+    reference's 0.14-0.25 -- so
     it would not reliably win the row, and it would cost a second Ramer-Douglas-Peucker (a
     stack-based single-thread kernel, since Warp forbids recursion) plus the test that its accepted
     set matches this one's. Declined on those numbers rather than on the "one algorithm" preference

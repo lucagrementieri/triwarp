@@ -652,6 +652,15 @@ def test_fillable_loop_mask_on_the_fixtures(request: pytest.FixtureRequest, mesh
     assert tw.validation.is_edge_manifold(filled_wp)
 
 
+@pytest.mark.parity(
+    "fill_min_weight_chords",
+    "meshlib",
+    benchmarked=False,
+    reason="resolve_multiple_edges defaults to True, so the marked comparison below runs "
+    "this group's chords configuration without naming it. Its plain row is the same DP "
+    "with the forbidden-chord pass off, which no reference has a counterpart for -- "
+    "banning chords that already exist as mesh edges is triwarp's own guarantee.",
+)
 @pytest.mark.parity("fill_min_weight", "meshlib")
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 @pytest.mark.parametrize("metric", FILL_METRICS)
@@ -779,6 +788,16 @@ def _sealed_volume(vertices_np: np.ndarray, faces_np: np.ndarray) -> float:
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity(
+    "fill_min_weight_chords",
+    "open3d",
+    "pymeshlab",
+    benchmarked=False,
+    reason="resolve_multiple_edges defaults to True, so the marked comparison below runs "
+    "this group's chords configuration without naming it. Its plain row is the same DP "
+    "with the forbidden-chord pass off, which no reference has a counterpart for -- "
+    "banning chords that already exist as mesh edges is triwarp's own guarantee.",
+)
 @pytest.mark.parity("fill_min_weight", "open3d", "pymeshlab")
 def test_fill_min_weight_matches_open3d_and_pymeshlab(
     request: pytest.FixtureRequest, mesh_name: str
@@ -1310,6 +1329,15 @@ def test_fill_min_weight_matches_pymeshfix(
 
 
 @pytest.mark.parity(
+    "fill_smooth_target_edge",
+    "pymeshfix",
+    benchmarked=False,
+    reason="this test calls fill_smooth with no max_edge, so it runs that group's derived "
+    "id -- the per-rim target measurement -- and holds the result to pymeshfix's refined "
+    "patch. A row would re-time the fill_smooth group, since deriving the target is a stage "
+    "of the same call rather than a separable operation.",
+)
+@pytest.mark.parity(
     "fill_smooth",
     "pymeshfix",
     benchmarked=False,
@@ -1462,6 +1490,14 @@ def test_fill_smooth_triangulate_only(device: str, hemisphere: tuple[tm.Trimesh,
     assert np.array_equal(new_vertices.numpy(), mesh_wp.points.numpy())
 
 
+@pytest.mark.parity(
+    "fill_smooth_target_edge",
+    "meshlib",
+    benchmarked=False,
+    reason="this test passes max_edge=0.3, which is that group's explicit id, and MeshLib is "
+    "handed the identical number -- so the pair covers the half the derived row is measured "
+    "against. A row would re-time the fill_smooth group under a second name.",
+)
 @pytest.mark.parity("fill_smooth", "meshlib")
 def test_fill_smooth_statistics_vs_meshlib(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     """

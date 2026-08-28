@@ -2940,11 +2940,19 @@ def test_split_edges_every_edge_is_the_regular_subdivision(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
     """
-    Splitting every edge is the 1-to-4 subdivision, so it must equal ``subdivide``.
+    Triwarp against triwarp: splitting every edge must equal ``subdivide``.
+
+    ``subdivide`` is the half of the pair carrying the oracle -- splitting every edge *is* the
+    1-to-4 subdivision, so the two must agree exactly.
 
     The strongest available check on the templates: the ``count == 3`` branch of the emission kernel
     is only reachable this way, and ``subdivide`` is independently tested against trimesh and igl,
     so agreeing with it exactly validates the primitive against those references transitively.
+
+    That transitivity is why the ``split_edges`` benchmark group carries no parity claim: the
+    reference coverage here is real but indirect, and a marker would assert a comparison this test
+    does not make. A *direct* one is available -- ``igl.upsample`` and open3d's
+    ``subdivide_midpoint`` both bind the regular subdivision -- and would upgrade this to Class B.
     """
     _mesh_tm, mesh_wp = icosahedron
     unique_edges, inverse = tw.edges.edges_unique(mesh_wp.indices)

@@ -151,6 +151,15 @@ def test_halfedge_tangent_angles_span_the_rescaled_disk(
 # In ``cave_cube`` and ``half_torus`` every face carries such an edge (both are quad grids split by
 # a diagonal), so no entry is left to read a transport angle out of — a limit of the oracle, not of
 # the computation. Those meshes are covered by the round-trip test below.
+@pytest.mark.parity(
+    "halfedge_transport_angles",
+    "potpourri3d",
+    benchmarked=False,
+    reason="the transport angles are only reachable through get_connection_laplacian, which "
+    "builds a whole MeshVectorHeatSolver -- a halfedge mesh, a cotangent Laplacian and a "
+    "factorization -- and the phases then have to be divided out of it weight by weight. A row "
+    "would price that solver build under this group's name; the holonomy is still comparable.",
+)
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
 def test_halfedge_transport_angle_holonomy_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str

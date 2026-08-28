@@ -493,6 +493,7 @@ def test_face_adjacency_angles_empty(device: str) -> None:
     assert angles_wp.shape == (0,)
 
 
+@pytest.mark.parity("face_adjacency_projections", "trimesh")
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 def test_face_adjacency_projections(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -533,6 +534,7 @@ def test_face_adjacency_projections(request: pytest.FixtureRequest, mesh_name: s
         assert np.isclose(projection_wp, projection_tm, rtol=1e-4, atol=5e-4)
 
 
+@pytest.mark.parity("face_adjacency_projections", "trimesh")
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_face_adjacency_projections_precomputed(
     request: pytest.FixtureRequest, mesh_name: str

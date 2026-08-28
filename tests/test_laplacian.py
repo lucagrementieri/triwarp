@@ -553,6 +553,15 @@ def test_cotmatrix_entries_are_zero_for_a_zero_area_face(device: str) -> None:
     assert np.isfinite(bsr_to_dense(tw.laplacian.cotmatrix(collinear_wp, faces_wp), 3)).all()
 
 
+@pytest.mark.parity(
+    "mollify_intrinsic",
+    "igl",
+    benchmarked=False,
+    reason="libigl binds no mollification: igl.cotmatrix_intrinsic takes the length table as "
+    "given, so there is nothing on its side to time. What it can still check is the table "
+    "mollify_intrinsic emits -- delta is asserted zero on these clean fixtures, and igl's "
+    "intrinsic assembly over those lengths then confirms they are the plain edge lengths.",
+)
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_robust_laplacian_matches_igl_intrinsic_assembly(
     request: pytest.FixtureRequest, mesh_name: str, device: str

@@ -43,6 +43,42 @@ def test_group(
     assert np.array_equal(groups_wp.numpy(), groups_np)
 
 
+@pytest.mark.parity("group", "trimesh")
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+def test_group_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (row and group order): ``trimesh.grouping.group`` over the same edge inverse.
+
+    Both sides answer "which index sets share a value, at exactly this multiplicity", and on a
+    mesh's unique-edge inverse the ``length=2`` groups are the adjacent face pairs -- the workload
+    the benchmark row times. Neither library promises an order: triwarp emits groups in
+    radix-sorted key order and trimesh in ``argsort`` order, and within a group neither fixes
+    which member comes first, so the named transform is a sort along both axes. The count assert
+    is what makes that sound -- a sort cannot rescue two answers that disagree about *how many*
+    groups there are.
+
+    The boundary case is the point of running ``half_torus`` as well: an open mesh's rim edges
+    appear once, so they must be absent from both answers rather than padded into either.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = len(mesh_tm.vertices)
+    inverse_wp = tw.edges.edges_unique_inverse(mesh_wp.indices, n_vertices=n_vertices)
+    inverse_np = inverse_wp.numpy()
+
+    groups_wp = tw.grouping.group(inverse_wp, 2).numpy()
+    groups_tm = np.asarray(tm.grouping.group(inverse_np, min_len=2, max_len=2))
+
+    # Non-vacuity, and the invariant that fixes the expected count: every interior edge is shared by
+    # exactly two faces, so there is one pair per interior edge and none per boundary edge.
+    n_interior = int((np.bincount(inverse_np, minlength=inverse_np.max() + 1) == 2).sum())
+    assert n_interior > 1
+    assert groups_wp.shape == (n_interior, 2)
+
+    assert np.array_equal(
+        lexsort_rows(np.sort(groups_wp, axis=1)), lexsort_rows(np.sort(groups_tm, axis=1))
+    )
+
+
 def test_group_int_rows(device: str) -> None:
     data_np = np.array([[1, 2], [3, 4], [1, 2], [2, 1], [3, 4], [0, 1], [3, 4]], dtype=np.int32)
     length = 2

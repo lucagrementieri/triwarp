@@ -73,6 +73,62 @@ def _distance_pp(
 # of 0.39 — both are solving a degenerate problem there and degrade differently. The structural
 # tests
 # below still cover ``half_torus``, and they pass.
+@pytest.mark.parity(
+    "heat_signed_distance_constraint",
+    "potpourri3d",
+    benchmarked=False,
+    reason="potpourri3d is already timed in the heat_signed_distance group and this is the same "
+    "compute_distance call with one keyword changed, so a second row would time the identical "
+    "solve under a second name. What the constraint costs is the delta between the two ids, which "
+    "is a triwarp-internal question; whether it is *honoured* is what this checks.",
+)
+@pytest.mark.parametrize(
+    ("level_set_constraint", "constraint_pp"), [("zero_set", "ZeroSet"), ("none", "None")]
+)
+def test_heat_signed_distance_level_set_constraint_matches_potpourri3d(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh], level_set_constraint: str, constraint_pp: str
+) -> None:
+    """
+    Class C (correlation plus a mean-error bound), on both settings of the constraint.
+
+    Same statistic and same reasoning as
+    [`test_heat_signed_distance_matches_potpourri3d`] -- the two boundary handlings differ at the
+    curve, so no vertex-wise tolerance exists -- but parametrized over the keyword the
+    ``heat_signed_distance_constraint`` benchmark group is an axis on. potpourri3d spells the same
+    two settings ``"ZeroSet"`` and ``"None"`` and honours them the same way.
+
+    **The constraint is observable, which is what keeps this from being one comparison run twice.**
+    Under ``zero_set`` both libraries pin the curve to exactly ``0.0``; under ``none`` neither does,
+    and the measured on-curve magnitudes on this fixture are 5.57e-02 (triwarp) and 6.94e-02
+    (potpourri3d). So the last two asserts fail if either side silently ignores the keyword -- the
+    bug this exists for, and one a correlation bound alone would pass, since the two fields
+    correlate 0.940 and 0.936 respectively, i.e. the *statistic does not separate the two modes at
+    all*. The 1e-3 floor is 18x below the smaller measured magnitude.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
+    curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
+
+    distance_wp = tw.heat.signed.heat_signed_distance(
+        mesh_wp.points, mesh_wp.indices, curve_wp, level_set_constraint=level_set_constraint
+    ).numpy()
+    distance_pp = _distance_pp(mesh_tm, curve_np, level_set_constraint=constraint_pp)
+
+    scale = float(np.linalg.norm(mesh_tm.vertices.max(axis=0) - mesh_tm.vertices.min(axis=0)))
+    assert np.corrcoef(distance_wp, distance_pp)[0, 1] > 0.9
+    assert np.abs(distance_wp - distance_pp).mean() < 0.05 * scale
+
+    # The keyword really took, on both sides: pinned to zero, or demonstrably not pinned.
+    on_curve_wp = np.abs(distance_wp[curve_np]).max()
+    on_curve_pp = np.abs(distance_pp[curve_np]).max()
+    if level_set_constraint == "zero_set":
+        assert on_curve_wp == 0.0
+        assert on_curve_pp == 0.0
+    else:
+        assert on_curve_wp > 1e-3
+        assert on_curve_pp > 1e-3
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
 @pytest.mark.parity("heat_signed_distance", "potpourri3d")
 @pytest.mark.parity("heat_signed_distance_conditioning", "potpourri3d")

@@ -11,8 +11,11 @@ changes the size of the output compaction. A gap wider than the output-size rati
 segment scan is not oblivious, which is the thing worth catching.
 
 There is no open3d equivalent for either: grouping and deduplicating rows of an arbitrary id array
-is an array primitive, not a mesh operation, and open3d exposes nothing at that level. trimesh's
-``grouping.unique_rows`` is the host reference for the second group.
+is an array primitive, not a mesh operation, and open3d exposes nothing at that level. **trimesh
+covers both**: ``grouping.unique_rows`` for the second and ``grouping.group(values, min_len,
+max_len)`` for the first, which is the same operation reached by an ``argsort`` plus a NumPy segment
+walk. Both reference branches are capped at ``bunny`` and are handed a host-built input, since a
+benchmark input must not come from the code under test.
 """
 
 from __future__ import annotations
@@ -59,14 +62,54 @@ def _edge_inverse(bench_case: BenchCase) -> wp.array[wp.int32]:
     return _inverse_cache[key]
 
 
+_inverse_np_cache: dict[str, np.ndarray] = {}
+
+
+def _edge_inverse_np(bench_case: BenchCase) -> np.ndarray:
+    """
+    Return the same key array on the host, for the reference branches, built without triwarp.
+
+    A reference case carries no device, so it cannot be handed ``_edge_inverse``'s buffer -- and it
+    should not be, because a benchmark input must not come from the code under test (see
+    ``meshes.py``). ``np.unique`` over the row-sorted edges is the host derivation of the same
+    thing. The two inverses label their classes in different orders, which is irrelevant here: the
+    grouping workload is set by the multiset of key multiplicities, identical either way.
+    """
+    if bench_case.mesh_name not in _inverse_np_cache:
+        faces_np = bench_case.faces_np
+        edges_np = np.sort(faces_np[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2).astype(np.int64), axis=1)
+        _inverse_np_cache[bench_case.mesh_name] = (
+            np.unique(edges_np, axis=0, return_inverse=True)[1].astype(np.int32).ravel()
+        )
+    return _inverse_np_cache[bench_case.mesh_name]
+
+
 @pytest.mark.benchmark(group="group")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "trimesh")
 def test_group(bench_case: BenchCase) -> None:
-    """Fixed-multiplicity index grouping over the edge inverse: a radix sort plus a segment pass."""
-    inverse = _edge_inverse(bench_case)
-    pairs = bench_case.run(lambda: tw.grouping.group(inverse, 2))
-    assert pairs.shape[1] == 2
-    assert pairs.shape[0] > 0
+    """
+    Fixed-multiplicity index grouping over the edge inverse: a radix sort plus a segment pass.
+
+    ``trimesh.grouping.group(values, min_len=2, max_len=2)`` is the same operation and the same
+    answer -- ``tests/test_grouping.py::test_group_matches_trimesh`` shows the two group *sets* are
+    equal -- reached by an ``argsort`` plus a NumPy segment walk instead. Both sides are handed the
+    edge inverse -- built outside the timed callable on both branches, and on the host for the
+    reference so that its input does not come from the code under test -- so this row is the
+    grouping alone. Capped at ``bunny``: the reference measured 123 ms at 327 680 faces.
+    """
+    if bench_case.kind == "triwarp":
+        inverse = _edge_inverse(bench_case)
+        pairs = bench_case.run(lambda: tw.grouping.group(inverse, 2))
+        assert pairs.shape[1] == 2
+        assert pairs.shape[0] > 0
+    else:
+        skip_larger_than(bench_case, "bunny", "the reference sorts and walks segments on one core")
+        inverse_np = _edge_inverse_np(bench_case)
+        pairs_tm = bench_case.run(
+            lambda: np.asarray(tm.grouping.group(inverse_np, min_len=2, max_len=2))
+        )
+        assert pairs_tm.shape[1] == 2
+        assert pairs_tm.shape[0] > 0
 
 
 @pytest.mark.benchmark(group="unique_faces")

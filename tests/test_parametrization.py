@@ -107,6 +107,17 @@ def test_map_vertices_to_circle_matches_igl(request, device, mesh_name):
     assert np.allclose(circle_wp.numpy(), circle_igl, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity(
+    "graph_laplacian",
+    "igl",
+    benchmarked=False,
+    reason="libigl builds A - diag(rowsum(A)) inline inside igl::harmonic rather than binding "
+    "it, so the reference here is igl.adjacency_matrix plus a NumPy diagonal -- timing that "
+    "would price a hand-rolled composition under a library's name. scipy binds the operation "
+    "outright (csgraph.laplacian, measured an exact sign-flipped match at 0.0 on icosphere(2)) "
+    "but takes an adjacency matrix, which triwarp's face buffer is not, so its row would time "
+    "the same composition one step earlier. benchmarks/test_laplacian.py carries the decline.",
+)
 def test_graph_laplacian_matches_igl(device, hemisphere):
     """
     Class B: igl has no ``graph_laplacian``, so the reference is assembled from its adjacency.

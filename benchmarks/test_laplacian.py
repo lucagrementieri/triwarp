@@ -202,7 +202,17 @@ def test_laplacian_inverse_distance(bench_case: BenchCase) -> None:
 @pytest.mark.benchmark(group="graph_laplacian")
 @pytest.mark.benchlibs("triwarp")
 def test_graph_laplacian(bench_case: BenchCase) -> None:
-    """Combinatorial graph Laplacian ``A - diag(deg)`` (no library exposes an equivalent)."""
+    """
+    Combinatorial graph Laplacian ``A - diag(deg)``, timed for triwarp alone.
+
+    Not because nothing computes it -- ``scipy.sparse.csgraph.laplacian`` is exactly this operator
+    up to a sign (measured an exact match at ``0.0`` against a sign flip), and libigl assembles it
+    inline inside ``igl::harmonic``. Neither is a *row*: scipy takes an adjacency matrix, which is
+    not triwarp's input, and libigl does not bind the composition, so either row would time an
+    assembly written here rather than a library function. The module docstring above carries the
+    argument, and ``tests/test_parametrization.py::test_graph_laplacian_matches_igl`` is the
+    correctness comparison the decline does not cost.
+    """
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     matrix = bench_case.run(lambda: tw.laplacian.graph_laplacian(vertices, faces))
     assert matrix.nrow == bench_case.n_vertices
