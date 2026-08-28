@@ -78,7 +78,6 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels import boundary as kernel_boundary
 from triwarp.kernels import holes as kernel_holes
 from triwarp.kernels import scatter as kernel_scatter
 
@@ -119,6 +118,19 @@ class _PackedLoops:
             dtype=wp.int32,
             device=device,
         )
+
+    def perimeters(self, vertices: wp.array[wp.vec3]) -> np.ndarray:
+        """
+        Measure the closed arc length of every packed loop, returning it on the host.
+
+        Delegates to [`boundary.loop_perimeters_batched`][triwarp.boundary.loop_perimeters_batched]
+        rather than launching the segmented kernel again here: the packed layout this class holds
+        *is* that function's argument list, and ``loop_id`` is passed rather than rebuilt, so the
+        call costs exactly what the private copy this replaced did.
+        """
+        return tw.boundary.loop_perimeters_batched(
+            vertices, self.flat_loops, self.starts, self.sizes, loop_id=self.loop_id
+        ).numpy()
 
     def loop_slice(self, index: int) -> slice:
         """Host slice of ``flat_loops`` (and of any other length-``total`` buffer) for a loop."""
@@ -869,7 +881,7 @@ def fill_small(
     else:
         # One segmented-sum launch measures every rim, so the selection costs a single readback
         # rather than a copy of the whole vertex buffer plus one of each loop.
-        small_np = _loop_perimeters(vertices, packed) <= max_perimeter
+        small_np = packed.perimeters(vertices) <= max_perimeter
     if not small_np.any():
         return wp.clone(faces)
     if not small_np.all():
@@ -2821,8 +2833,9 @@ def _mean_rim_edge_length(
 
     Every rim is closed, so its edge count is its vertex count and the mean is the total perimeter
     over ``sum(sizes)`` -- which makes this one
-    [`_loop_perimeters`][triwarp.holes._loop_perimeters] launch plus its one readback, the same
-    measurement [`fill_small`][triwarp.holes.fill_small] already pays. A list is accepted because
+    [`_PackedLoops.perimeters`][triwarp.holes._PackedLoops.perimeters] launch plus its one
+    readback, the same measurement [`fill_small`][triwarp.holes.fill_small] already pays. A list
+    is accepted because
     [`triwarp.holes.stitch_smooth`][triwarp.holes.stitch_smooth] holds its two rims
     individually; it is packed here rather than at that call site so the private surface stays one
     name wide.
@@ -2847,7 +2860,7 @@ def _mean_rim_edge_length(
     count = int(packed.sizes_np.sum())
     if count == 0:
         return 0.0
-    return float(_loop_perimeters(vertices, packed).sum()) / count
+    return float(packed.perimeters(vertices).sum()) / count
 
 
 def _hole_loops(
@@ -2884,7 +2897,7 @@ def _hole_loops(
     keep_np = sizes_np >= 3
     if preserve_largest_hole and bool(keep_np.any()):
         all_loops = _PackedLoops(flat_loops, sizes_np)
-        perimeter_np = _loop_perimeters(vertices, all_loops)
+        perimeter_np = all_loops.perimeters(vertices)
         # Only a fillable loop can be the one preserved, matching the pre-filter order.
         candidates_np = np.flatnonzero(keep_np)
         keep_np[candidates_np[int(np.argmax(perimeter_np[candidates_np]))]] = False
@@ -2904,15 +2917,3 @@ def _hole_loops(
         keep_index_np.astype(np.int32), dtype=wp.int32, device=flat_loops.device
     )
     return _PackedLoops(tw.array.gather(flat_loops, keep_index_wp), sizes_np[keep_np])
-
-
-def _loop_perimeters(vertices: wp.array[wp.vec3], loops: _PackedLoops) -> np.ndarray:
-    """Measure the closed arc length of every packed loop (one launch, one readback)."""
-    perimeter = wp.zeros(loops.n_loops, dtype=wp.float32, device=loops.device)
-    wp.launch(
-        kernel_boundary.loop_perimeters,
-        dim=loops.total,
-        inputs=[loops.flat_loops, loops.loop_id, loops.starts, loops.sizes, vertices, perimeter],
-        device=loops.device,
-    )
-    return perimeter.numpy()

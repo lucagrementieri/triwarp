@@ -801,6 +801,59 @@ def test_loop_measures_agree_with_the_single_loop_forms(
     )
 
 
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+def test_batched_loop_measures_agree_with_the_list_forms(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Triwarp against triwarp: the packed entry points against the list ones, which carry the oracle.
+
+    ``loop_perimeters_batched`` and ``loop_directed_areas_batched`` exist so that a caller holding
+    ``boundary_loops_batched``'s output can measure it without splitting it back into a Python list
+    and repacking; this asserts the two forms are the same measure. The list forms are the ones
+    compared against a reference, so a divergence here is the packed path's.
+
+    Asserted at ``1e-5`` rather than exactly, and that is not slack: both kernels accumulate with
+    ``wp.atomic_add``, so on CUDA the summation order differs between two launches over the same
+    data and the last bits of a ``float32`` differ with it. Measured while these were written --
+    bit-identical on the CPU, agreeing to 9.8e-08 against a host recomputation on CUDA. An
+    ``array_equal`` here would fail on CUDA for a correct implementation.
+
+    Also asserted: passing the precomputed ``loop_id`` gives the same answer as letting the function
+    derive it, which is the keyword ``triwarp.holes`` uses to keep its own cost.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+    assert len(loops_wp) > 0  # non-vacuity: an empty comparison would pass and test nothing
+    flat_wp, offsets_wp, sizes_wp = tw.boundary.boundary_loops_batched(vertices_wp, faces_wp)
+
+    assert np.allclose(
+        tw.boundary.loop_perimeters_batched(vertices_wp, flat_wp, offsets_wp, sizes_wp).numpy(),
+        tw.boundary.loop_perimeters(vertices_wp, loops_wp).numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    areas_np = tw.boundary.loop_directed_areas(vertices_wp, loops_wp).numpy()
+    assert np.allclose(
+        tw.boundary.loop_directed_areas_batched(vertices_wp, flat_wp, offsets_wp, sizes_wp).numpy(),
+        areas_np,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    owner_np = np.repeat(np.arange(sizes_wp.shape[0], dtype=np.int32), sizes_wp.numpy())
+    owner_wp = wp.array(owner_np, dtype=wp.int32, device=vertices_wp.device)
+    assert np.allclose(
+        tw.boundary.loop_directed_areas_batched(
+            vertices_wp, flat_wp, offsets_wp, sizes_wp, loop_id=owner_wp
+        ).numpy(),
+        areas_np,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
 def test_loop_measures_empty(device: str) -> None:
     """Not a library comparison: no loops, and a loop of zero length, both measure to nothing."""
     vertices_wp = wp.zeros(4, dtype=wp.vec3, device=device)

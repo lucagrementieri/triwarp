@@ -5,6 +5,19 @@ A mesh edge lies on the boundary when it appears exactly once among all triangle
 Boundary detection reuses [`group_int_rows`][triwarp.grouping.group_int_rows] (the analog of
 ``trimesh.grouping.group_rows(require_count=1)``), which hashes each sorted edge row and
 returns the original row indices of edges occurring exactly once.
+
+Every loop-shaped entry point comes in two forms, and the pairing is the module's one convention
+worth stating up front: a **list** form returning or taking one ``wp.array`` per loop
+([`boundary_loops`][triwarp.boundary.boundary_loops],
+[`loop_perimeters`][triwarp.boundary.loop_perimeters],
+[`loop_directed_areas`][triwarp.boundary.loop_directed_areas]) and a ``_batched`` form over one
+packed buffer plus per-loop offsets and sizes
+([`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched],
+[`loop_perimeters_batched`][triwarp.boundary.loop_perimeters_batched],
+[`loop_directed_areas_batched`][triwarp.boundary.loop_directed_areas_batched]). They compute the
+same answer; the packed form is the one whose cost is independent of the loop *count*, and it is
+what [`triwarp.holes`][triwarp.holes] carries its rims in from end to end. The list forms pack and
+delegate, so there is one segmented launch behind each measure rather than one per form.
 """
 
 from __future__ import annotations
@@ -17,6 +30,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import boundary as kernel_boundary
 from triwarp.kernels import scatter as kernel_scatter
 
@@ -425,14 +439,76 @@ def loop_perimeters(
     if packed is None:
         return wp.empty(0, dtype=wp.float32, device=vertices.device)
     flat_loops, loop_id, starts, sizes, n_loops = packed
-    perimeters = wp.zeros(n_loops, dtype=wp.float32, device=vertices.device)
-    wp.launch(
+    return _launch_loop_measure(
         kernel_boundary.loop_perimeters,
-        dim=int(flat_loops.shape[0]),
-        inputs=[flat_loops, loop_id, starts, sizes, vertices, perimeters],
-        device=vertices.device,
+        wp.float32,
+        vertices,
+        flat_loops,
+        loop_id,
+        starts,
+        sizes,
+        n_loops,
     )
-    return perimeters
+
+
+def loop_perimeters_batched(
+    vertices: wp.array[wp.vec3],
+    flat_loops: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    *,
+    loop_id: wp.array[wp.int32] | None = None,
+) -> wp.array[wp.float32]:
+    """
+    Perimeter of every loop, taking the loops in the packed form rather than as a list.
+
+    Same measure as [`loop_perimeters`][triwarp.boundary.loop_perimeters] and the same launch; the
+    three arguments after ``vertices`` are exactly what
+    [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched] returns, in that order.
+    Reach for this whenever the loops are already packed, which is the form
+    [`triwarp.holes`][triwarp.holes] carries them in throughout: the list form would have to be
+    split back out and repacked to be measured, and the split is a per-loop Python object.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    flat_loops
+        Concatenated ordered vertex indices of every loop.
+    offsets
+        Length-``n_loops`` start of each loop in ``flat_loops``. Not total-terminated, matching
+        ``boundary_loops_batched``.
+    loop_sizes
+        Length-``n_loops`` vertex count per loop.
+    loop_id
+        Optional precomputed length-``flat_loops`` label saying which loop each packed position
+        belongs to. Built here when ``None``, which costs an allocation, a copy and a launch --
+        0.059 to 0.118 ms on 351 rims on CUDA and 0.035 to 0.078 on the CPU, so **roughly double
+        the call**. Pass it when the caller already holds it, as [`triwarp.holes`][triwarp.holes]
+        does.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        One perimeter per loop, in the packed order, on ``vertices.device``.
+
+    See Also
+    --------
+    [`loop_perimeters`][triwarp.boundary.loop_perimeters]
+        The list form, which packs and then calls this.
+    [`loop_directed_areas_batched`][triwarp.boundary.loop_directed_areas_batched]
+        The vector measure of the same packed loops.
+    """
+    return _launch_loop_measure(
+        kernel_boundary.loop_perimeters,
+        wp.float32,
+        vertices,
+        flat_loops,
+        _loop_owner_labels(flat_loops, offsets, loop_sizes) if loop_id is None else loop_id,
+        offsets,
+        loop_sizes,
+        int(loop_sizes.shape[0]),
+    )
 
 
 def loop_directed_areas(
@@ -479,14 +555,130 @@ def loop_directed_areas(
     if packed is None:
         return wp.empty(0, dtype=wp.vec3, device=vertices.device)
     flat_loops, loop_id, starts, sizes, n_loops = packed
-    directed_areas = wp.zeros(n_loops, dtype=wp.vec3, device=vertices.device)
-    wp.launch(
+    return _launch_loop_measure(
         kernel_boundary.loop_directed_areas,
+        wp.vec3,
+        vertices,
+        flat_loops,
+        loop_id,
+        starts,
+        sizes,
+        n_loops,
+    )
+
+
+def loop_directed_areas_batched(
+    vertices: wp.array[wp.vec3],
+    flat_loops: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    *,
+    loop_id: wp.array[wp.int32] | None = None,
+) -> wp.array[wp.vec3]:
+    """
+    Directed area vector of every loop, taking the loops in the packed form rather than as a list.
+
+    The packed counterpart of
+    [`loop_directed_areas`][triwarp.boundary.loop_directed_areas], exactly as
+    [`loop_perimeters_batched`][triwarp.boundary.loop_perimeters_batched] is of
+    [`loop_perimeters`][triwarp.boundary.loop_perimeters]; the arguments after ``vertices`` are what
+    [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched] returns.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    flat_loops
+        Concatenated ordered vertex indices of every loop.
+    offsets
+        Length-``n_loops`` start of each loop in ``flat_loops``, not total-terminated.
+    loop_sizes
+        Length-``n_loops`` vertex count per loop.
+    loop_id
+        Optional precomputed length-``flat_loops`` label saying which loop each packed position
+        belongs to. Built here when ``None``, which costs an allocation, a copy and a launch --
+        0.059 to 0.118 ms on 351 rims on CUDA and 0.035 to 0.078 on the CPU, so **roughly double
+        the call**. Pass it when the caller already holds it, as [`triwarp.holes`][triwarp.holes]
+        does.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        One directed area per loop, in the packed order, on ``vertices.device``.
+
+    See Also
+    --------
+    [`loop_directed_areas`][triwarp.boundary.loop_directed_areas]
+        The list form, which packs and then calls this.
+    [`loop_perimeters_batched`][triwarp.boundary.loop_perimeters_batched]
+        The scalar measure of the same packed loops.
+    """
+    return _launch_loop_measure(
+        kernel_boundary.loop_directed_areas,
+        wp.vec3,
+        vertices,
+        flat_loops,
+        _loop_owner_labels(flat_loops, offsets, loop_sizes) if loop_id is None else loop_id,
+        offsets,
+        loop_sizes,
+        int(loop_sizes.shape[0]),
+    )
+
+
+def _launch_loop_measure(
+    kernel: wp.Kernel,
+    dtype: type,
+    vertices: wp.array[wp.vec3],
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    starts: wp.array[wp.int32],
+    sizes: wp.array[wp.int32],
+    n_loops: int,
+) -> wp.array:
+    """
+    One segmented launch over every packed loop at once, shared by both measures and both forms.
+
+    The two kernels differ only in what they accumulate -- an arc length into a ``float32`` or a
+    cross-product sum into a ``vec3`` -- and take the identical five inputs, so the launch is
+    written once here rather than four times above. ``wp.zeros`` rather than ``wp.empty``: both
+    kernels accumulate into their output with an atomic add.
+    """
+    out = wp.zeros(n_loops, dtype=dtype, device=vertices.device)
+    wp.launch(
+        kernel,
         dim=int(flat_loops.shape[0]),
-        inputs=[flat_loops, loop_id, starts, sizes, vertices, directed_areas],
+        inputs=[flat_loops, loop_id, starts, sizes, vertices, out],
         device=vertices.device,
     )
-    return directed_areas
+    return out
+
+
+def _loop_owner_labels(
+    flat_loops: wp.array[wp.int32], offsets: wp.array[wp.int32], loop_sizes: wp.array[wp.int32]
+) -> wp.array[wp.int32]:
+    """
+    Which loop each packed position belongs to, built on the device from ``offsets`` alone.
+
+    The list form builds the same labels on the host with ``numpy.repeat``, because it already has
+    the sizes there; the packed form does not, and reading them back to reuse that path would cost
+    a synchronization this saves. So the two forms build ``loop_id`` differently on purpose, and
+    each is the cheaper one for the inputs it has. ``segment_owner_labels`` wants
+    *total-terminated* offsets and ``boundary_loops_batched`` does not return them, but the total
+    is ``flat_loops.shape[0]`` -- known on the host -- so the terminator is a fill rather than a
+    readback.
+    """
+    n_loops = int(loop_sizes.shape[0])
+    device = flat_loops.device
+    loop_id = wp.empty(int(flat_loops.shape[0]), dtype=wp.int32, device=device)
+    if n_loops == 0:
+        return loop_id
+    terminated = wp.empty(n_loops + 1, dtype=wp.int32, device=device)
+    wp.copy(terminated[:n_loops], offsets)
+    terminated[n_loops:].fill_(int(flat_loops.shape[0]))
+    wp.launch(
+        kernel_array.segment_owner_labels, dim=n_loops, inputs=[terminated, loop_id], device=device
+    )
+    return loop_id
 
 
 def _pack_loop_segments(
