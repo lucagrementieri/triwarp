@@ -22,6 +22,7 @@ from tests.conversions import (
     bsr_to_dense,
     faces_igl,
     meshlib_bitset_to_numpy,
+    meshlib_scalars_to_numpy,
     meshlib_to_trimesh,
     numpy_to_meshlib,
     numpy_to_meshlib_bitset,
@@ -29,6 +30,7 @@ from tests.conversions import (
     open3d_to_trimesh,
     points_to_warp,
     points_to_warp_uv,
+    trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
@@ -1746,6 +1748,85 @@ def test_intrinsic_delaunay_metric_matches_igl(
     assert n_flips > 0, "fixture is already Delaunay; this would assert nothing"
     assert np.allclose(
         np.sort(lengths_wp.numpy().ravel()), np.sort(_lengths_igl.ravel()), rtol=1e-4, atol=1e-4
+    )
+
+
+def _undirected_intrinsic_lengths(faces_np: np.ndarray, lengths_np: np.ndarray) -> np.ndarray:
+    """
+    Reduce a ``(n_faces, 3)`` per-corner length table to one sorted length per undirected edge.
+
+    ``lengths[f, e]`` belongs to the edge *opposite* corner ``e``, so the same interior edge appears
+    in two face corners and a boundary edge in one. Deduplicating rather than doubling is what makes
+    the multiset comparable on an open mesh: ``half_torus`` has 64 boundary edges, so the naive
+    ``np.repeat(..., 2)`` of the reference side is 3 136 entries against triwarp's 3 072.
+    """
+    faces = faces_np.reshape(-1, 3)
+    corners = [
+        np.sort(np.stack([faces[:, (e + 1) % 3], faces[:, (e + 2) % 3]], axis=1), axis=1)
+        for e in range(3)
+    ]
+    edges = np.concatenate(corners)
+    lengths = np.concatenate([lengths_np[:, e] for e in range(3)])
+    _unique, first = np.unique(edges, axis=0, return_index=True)
+    return np.sort(lengths[first].astype(np.float64))
+
+
+@pytest.mark.parametrize("mesh_name", ["half_torus", "torus"])
+@pytest.mark.parity(
+    "intrinsic_delaunay",
+    "meshlib",
+    benchmarked=False,
+    reason="Tested but not timed: the row would price EdgeLengthMesh.fromMesh's "
+    "cotangent-and-length precomputation together with the flips, which is not the "
+    "quantity the group times. The igl row is the timed CPU reference.",
+)
+def test_intrinsic_delaunay_metric_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    """
+    Class B: the same intrinsic metric, from a flipper that reaches it in a different flip count.
+
+    A second witness for the invariant
+    [`test_intrinsic_delaunay_metric_matches_igl`][tests.test_remesh.test_intrinsic_delaunay_metric_matches_igl]
+    rests on, and a sharper one, because this reference **disagrees about the flips and still agrees
+    about the metric**. On ``torus`` triwarp performs 476 flips and ``makeDeloneEdgeFlips`` performs
+    **592** -- a 1.24x difference in the work done -- yet the resulting edge-length multisets match
+    to 5.96e-08 absolute / 2.22e-07 relative. That is the content of the claim: the intrinsic
+    Delaunay triangulation of a fixed surface is unique away from cocircular degeneracies, so the
+    flip *sequence* and even the flip *count* are implementation detail while the metric is not.
+    Comparing against igl alone cannot show this, since igl exposes no flip count.
+
+    The named transform is
+    [`_undirected_intrinsic_lengths`][tests.test_remesh._undirected_intrinsic_lengths]: triwarp
+    returns a per-corner ``(n_faces, 3)`` table and ``EdgeLengthMesh.edgeLengths`` is indexed by
+    undirected edge, so triwarp's side is deduplicated to one length per edge. Doubling the
+    reference instead is wrong on an open mesh -- see that helper's docstring for the 64-edge
+    discrepancy on ``half_torus``.
+
+    Measured, ``half_torus``: 298 flips from both sides, agreeing to 4.77e-07 / 3.72e-07.
+
+    !!! note "The intrinsic overload is the third one"
+        ``makeDeloneEdgeFlips`` is overloaded three ways and only the ``EdgeLengthMesh`` form flips
+        *intrinsically*; the ``Mesh`` and ``(MeshTopology, VertCoords)`` forms flip the extrinsic
+        triangulation and would move the surface, which is the thing this function is defined not
+        to do. Its settings type differs accordingly -- ``IntrinsicDeloneSettings``, whose
+        ``threshold`` defaults to ``0.0``, i.e. flip whenever the opposite angles sum past pi, which
+        is triwarp's rule exactly.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp, lengths_wp, n_flips = tw.remesh.intrinsic_delaunay(mesh_wp.points, mesh_wp.indices)
+
+    edge_mesh_ml = mm.EdgeLengthMesh.fromMesh(trimesh_to_meshlib(mesh_tm))
+    n_flips_ml = mm.makeDeloneEdgeFlips(edge_mesh_ml, mm.IntrinsicDeloneSettings(), 100)
+    lengths_ml = np.sort(meshlib_scalars_to_numpy(edge_mesh_ml.edgeLengths).astype(np.float64))
+
+    assert n_flips > 0, "fixture is already Delaunay; this would assert nothing"
+    assert n_flips_ml > 0, "the reference flipped nothing; the comparison would be vacuous"
+    assert np.allclose(
+        _undirected_intrinsic_lengths(faces_wp.numpy(), lengths_wp.numpy()),
+        lengths_ml,
+        rtol=1e-5,
+        atol=1e-5,
     )
 
 

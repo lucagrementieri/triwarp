@@ -512,6 +512,99 @@ def test_mesh_to_mesh_distance_when_the_vertex_bound_is_the_answer(device: str) 
         assert np.isclose(distance, float(np.sqrt(result_ml.distSq)), rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parity(
+    "mesh_to_mesh_distance",
+    "pymeshlab",
+    benchmarked=False,
+    reason="Tested but not timed: get_hausdorff_distance samples one surface and "
+    "queries the other, so its cost is set by samplenum rather than by the mesh, "
+    "and it computes the max and the moments as well. meshlib is the timed oracle.",
+)
+@pytest.mark.parametrize(
+    ("configuration", "expected"),
+    [("crossed_bars", 0.8), ("vertex_witness", 2.0), ("rotated", None), ("overlap", 0.0)],
+)
+def test_mesh_to_mesh_distance_matches_pymeshlab(
+    device: str, configuration: str, expected: float | None
+) -> None:
+    """
+    Class B: the same minimum, against a sampled reference whose `min` bounds it from above.
+
+    A second oracle for the group, and one that answers a different question than ``findDistance``
+    does. ``get_hausdorff_distance`` samples mesh 0 and takes the *exact* point-to-surface distance
+    of each sample to mesh 1, so its ``min`` is the smallest of those -- a real distance between the
+    surfaces, hence an **upper bound** on their minimum, tight exactly when some sample lands on the
+    witness. The named transform is that bound direction; it is asserted separately from the
+    equality so a future sampling change degrades the tight assert and not the sound one.
+
+    The bound is tight on all four configurations here, and for two different reasons worth keeping
+    apart. For the convex pairs it is tight because the support point of a *polytope* in any
+    direction is a vertex, so the witness is a sampled vertex whatever ``samplenum`` is -- measured
+    identical at 1 000 and 100 000 samples, and 1.00361180 against triwarp's 1.00361184 on the
+    rotated pair, where no vertex is axis-aligned. For the crossed bars it is tight because the
+    witness is a two-dimensional patch: the lower bar's top face and the upper bar's bottom face are
+    parallel and overlap in projection, so face sampling cannot miss it. That second case is the one
+    that makes this claim non-redundant with the vertex-only regime -- and note it also means the
+    bars are *not* a fixture that separates a sampled reference from an exact one, which is why
+    ``findDistance`` remains the oracle for
+    [`test_mesh_to_mesh_distance_matches_meshlib_where_no_vertex_wins`][tests.test_proximity.test_mesh_to_mesh_distance_matches_meshlib_where_no_vertex_wins].
+
+    !!! warning "`maxdist` silently returns `inf` past its default cap"
+        The default ``maxdist`` is a percentage of the bounding-box diagonal, and a pair separated
+        further than it comes back with ``min`` of ``inf`` -- no exception, no warning. Measured:
+        two unit spheres at a 2.0 gap read ``inf`` at every ``samplenum`` until ``maxdist`` is
+        passed explicitly, at which point they read 2.00000000. So the ``vertex_witness`` row is
+        exactly the configuration that a defaulted call reports as unreachable, and it is in the
+        parametrization for that reason.
+    """
+    if configuration == "crossed_bars":
+        a_tm, b_tm = _crossed_bars(45.0)
+    else:
+        a_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+        b_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+        if configuration == "rotated":
+            b_tm.apply_transform(tm.transformations.rotation_matrix(0.37, [0.3, 1.0, 0.2]))
+            b_tm.apply_translation([3.0, 0.0, 0.0])
+        else:
+            b_tm.apply_translation([4.0 if configuration == "vertex_witness" else 1.0, 0.0, 0.0])
+
+    a_vertices_wp, a_faces_wp = numpy_to_warp(
+        np.asarray(a_tm.vertices), np.asarray(a_tm.faces).ravel().astype(np.int32), device
+    )
+    b_vertices_wp, b_faces_wp = numpy_to_warp(
+        np.asarray(b_tm.vertices), np.asarray(b_tm.faces).ravel().astype(np.int32), device
+    )
+    distance, _face_a, _face_b = tw.proximity.mesh_to_mesh_distance(
+        a_vertices_wp, a_faces_wp, b_vertices_wp, b_faces_wp
+    )
+
+    meshset_pml = ml.MeshSet()
+    for mesh_tm in (a_tm, b_tm):
+        meshset_pml.add_mesh(
+            ml.Mesh(
+                np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+                np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),
+            )
+        )
+    minimum_pml = float(
+        meshset_pml.get_hausdorff_distance(
+            sampledmesh=0,
+            targetmesh=1,
+            samplevert=True,
+            sampleedge=True,
+            sampleface=True,
+            samplenum=100000,
+            maxdist=ml.PureValue(1.0e6),
+        )["min"]
+    )
+
+    assert np.isfinite(minimum_pml), "maxdist capped the search; see the warning above"
+    if expected is not None:
+        assert np.isclose(distance, expected, rtol=1e-5, atol=1e-6)
+    assert minimum_pml >= distance - 1e-5  # a sampled minimum cannot beat the true one
+    assert np.isclose(distance, minimum_pml, rtol=1e-5, atol=1e-6)
+
+
 def test_mesh_to_mesh_distance_tiled_pass_agrees_with_the_capped_one(device: str) -> None:
     """
     Triwarp against triwarp: the block-cooperative second pass against the thread pass alone.

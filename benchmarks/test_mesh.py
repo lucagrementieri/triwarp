@@ -100,7 +100,16 @@ def _time_property(bench_case: BenchCase, name: str, *, warm: bool, rounds: int 
 @pytest.mark.benchlibs("triwarp")
 @pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
 def test_warp_mesh(bench_case: BenchCase, warm: bool) -> None:
-    """``warp_mesh``: a BVH build over all faces, or a dict lookup."""
+    """
+    ``warp_mesh``: a BVH build over all faces, or a dict lookup.
+
+    triwarp-only, and the cold row is why: what it builds is a ``wp.Mesh``, a Warp construct with no
+    counterpart to time. The reference libraries do keep lazily-built accelerators of their own
+    (trimesh's ``ray`` / ``nearest`` adaptors, meshlib's ``AABBTree``), but each wraps a different
+    structure with a different fanout, so a build-time ratio would be a comparison of data
+    structures rather than of this property. What *is* comparable is the query cost those structures
+    exist for, and the ``proximity`` and ``ray`` groups own that against all of them.
+    """
     skip_larger_than(bench_case, "happy_buddha")
     _time_property(bench_case, "warp_mesh", warm=warm)
 
@@ -265,6 +274,13 @@ def test_invalidation(bench_case: BenchCase, mode: str) -> None:
     ``with_faces`` drops everything and pays the edge sort again. That gap is the entire reason
     ``with_vertices`` exists as a separate method, so it is worth a measurement rather than a
     comment.
+
+    triwarp-only, and not for want of a reference: the quantity is a *cache policy*, so there is
+    nothing to agree with. Which derived properties survive a geometry change is a decision this
+    class makes, and no other library partitions its caches the same way -- trimesh invalidates by
+    a hash over the whole buffer, so its equivalent of ``with_vertices`` drops the topology caches
+    too and the two modes collapse into one. A pair here would assert that two libraries made the
+    same design choice, which is not a correctness claim.
     """
     skip_larger_than(bench_case, "happy_buddha")
     mesh = _warm(bench_case, "face_adjacency")

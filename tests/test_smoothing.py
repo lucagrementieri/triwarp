@@ -1625,6 +1625,70 @@ def test_filter_two_step_matches_pymeshlab_on_crease_preservation(device: str) -
     assert _dihedral_percentile(two_step_np, faces_np, 95.0) > 85.0
 
 
+@pytest.mark.parity(
+    "filter_two_step",
+    "meshlib",
+    benchmarked=False,
+    reason="Tested but not timed: meshDenoiseViaNormals is a different scheme at "
+    "unmappable parameters, so a timed row would compare two different amounts of "
+    "work per call. pymeshlab, which exposes the same four parameters, is timed.",
+)
+def test_filter_two_step_matches_meshlib_on_crease_preserving_denoising(device: str) -> None:
+    """
+    Class C (denoising *and* a crease measure): a second crease-preserving filter, both halves.
+
+    The second oracle for this group, and it closes the half the first one leaves open.
+    [`test_filter_two_step_matches_pymeshlab_on_crease_preservation`][tests.test_smoothing.test_filter_two_step_matches_pymeshlab_on_crease_preservation]
+    can only assert the crease half, because MeshLab at the same four parameters ends *further* from
+    the clean cube than the noise was -- so nothing there confirms that a crease-preserving filter
+    should also denoise. ``meshDenoiseViaNormals`` does both, which makes the conjunction testable:
+    measured RMS to clean **0.012712** against the noise's **0.015620**, with the 95th-percentile
+    dihedral at **86.43** degrees.
+
+    The two are different algorithms and their parameters do not correspond -- the reference is
+    parametrized by ``beta`` and ``gamma`` and has no crease threshold in degrees at all -- so this
+    compares outcomes at each side's own defaults rather than positions. They land close all the
+    same: mutual RMS **0.004979**, max coordinate deviation **0.019910**, which is under half the
+    noise amplitude. triwarp is the closer of the two to clean (0.011415).
+
+    The bug class excluded is the one this filter exists to avoid: a scheme that blurs a crease
+    while reporting a lower residual. Both sides must clear *both* thresholds, and isotropic
+    Laplacian smoothing is the probe -- at 10 iterations it reads dihedral **25.18** against the
+    85.0 bar (a **3.4x** margin) and crease RMS **0.097202** against the reference's 0.011670
+    (**8.3x**), while moving total RMS the wrong way to 0.046993.
+    """
+    clean_np, faces_np, noisy_np = _noisy_cube()
+    vertices_wp = points_to_warp(noisy_np, device)
+    faces_wp = wp.array(
+        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
+    )
+    two_step_np = tw.smoothing.filter_two_step(vertices_wp, faces_wp).numpy().astype(np.float64)
+    laplacian_np = (
+        tw.smoothing.filter_laplacian(vertices_wp, faces_wp, iterations=10)
+        .numpy()
+        .astype(np.float64)
+    )
+
+    mesh_ml = numpy_to_meshlib(noisy_np, faces_np)
+    mm.meshDenoiseViaNormals(mesh_ml, mm.DenoiseViaNormalsSettings())
+    denoised_np = np.ascontiguousarray(meshlib_to_trimesh(mesh_ml).vertices, dtype=np.float64)
+    assert denoised_np.shape == clean_np.shape  # the topology is fixed, so nothing was packed away
+
+    noise_error = _rms_error(noisy_np, clean_np)
+    # Both denoise, and neither rounds the creases off -- the conjunction is the claim.
+    assert _rms_error(denoised_np, clean_np) < noise_error
+    assert _rms_error(two_step_np, clean_np) < noise_error
+    assert _dihedral_percentile(denoised_np, faces_np, 95.0) > 85.0
+    assert _dihedral_percentile(two_step_np, faces_np, 95.0) > 85.0
+
+    # Two different algorithms, so outcomes rather than positions -- but they land close.
+    assert _rms_error(two_step_np, denoised_np) < 0.5 * noise_error
+
+    # The probe: an isotropic filter fails both halves on the same input.
+    assert _rms_error(laplacian_np, clean_np) > noise_error
+    assert _dihedral_percentile(laplacian_np, faces_np, 95.0) < 50.0
+
+
 def test_filter_two_step_leaves_a_flat_patch_alone(device: str) -> None:
     """A plane is a fixed point of both halves: filtered normals are already the geometric ones."""
     grid_vertices_wp, grid_faces_wp = tw.creation.grid(count=(12, 12), device=device)

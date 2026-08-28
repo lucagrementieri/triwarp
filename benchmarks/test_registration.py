@@ -381,6 +381,13 @@ def test_icp_convergence(bench_case: BenchCase, degrees: float) -> None:
     opposite: it leaves the default threshold in place so the loop exits when it converges, which
     makes the timing report the *iteration count*. That is the number a caller actually pays, and
     it is a function of the initial misalignment, not of the mesh.
+
+    triwarp-only, and that follows from what the group measures rather than from a missing binding.
+    The timing here *is* triwarp's own stopping rule -- an absolute cost threshold -- and every
+    reference stops on a different criterion (open3d on relative fitness and RMSE change, trimesh on
+    a mean-cost delta), so an iteration count from any of them is a measurement of its convergence
+    test and not of this one. The comparable quantity is per-iteration cost, which every other ICP
+    group in this file pins ``threshold=-inf`` to isolate and compares against both references.
     """
     source, target = _source_wp(bench_case, degrees), bench_case.vertices_wp
     matrix, _transformed, _cost = bench_case.run(

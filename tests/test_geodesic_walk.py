@@ -16,11 +16,12 @@ import potpourri3d as pp3d
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
 from tests.conftest import MESHES
-from tests.conversions import points_to_warp
+from tests.conversions import points_to_warp, trimesh_to_meshlib
 
 
 def _rays(mesh_tm: tm.Trimesh, n_rays: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -572,6 +573,84 @@ def test_shorten_loop_preserves_the_homotopy_class(torus: tuple[tm.Trimesh, wp.M
         assert np.allclose(exact_after, exact_before, rtol=1e-5, atol=1e-5)
         assert after >= exact_after - 1e-6  # the class's geodesic bounds any curve the sweeps reach
     assert improved >= 1  # and the sweeps did something: 1.411x on this fixture's major generator
+
+
+@pytest.mark.parametrize("mesh_name", ["torus", "genus_two"])
+@pytest.mark.parity(
+    "shorten_loop",
+    "meshlib",
+    benchmarked=False,
+    reason="Tested but not timed: findShortestEquivalentLoops takes one loop per "
+    "call and returns a multi-loop system, so a row over a generator basis would "
+    "price a Python loop and a different output shape. potpourri3d is timed.",
+)
+def test_shorten_loop_bounded_by_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    """
+    Class C: triwarp's edge-path local minimum against a reference minimizing over the same space.
+
+    The second oracle for this group, and it isolates something
+    [`test_shorten_loop_preserves_the_homotopy_class`][tests.test_geodesic_walk.test_shorten_loop_preserves_the_homotopy_class]
+    cannot. That test compares against ``potpourri3d.EdgeFlipGeodesicSolver``, which is allowed to
+    leave the edge graph, so its 1.066x-1.578x gap mixes two separate things: how far triwarp's
+    sweep is from the best *edge path*, and how far the best edge path is from the true geodesic.
+    ``findShortestEquivalentLoops`` stays on mesh edges, so the ratio here is the first of those
+    alone -- the local-versus-global gap over one search space.
+
+    Two asserts, and the sharp one is not the ratio. Building the reference's input requires walking
+    triwarp's output through ``MeshTopology.findEdge`` pair by pair, which **validates the loop
+    against an independent halfedge structure**: a sweep that ever rerouted through a vertex outside
+    the one-ring would emit a consecutive pair that is not a mesh edge, and ``findEdge`` returns an
+    invalid ``EdgeId`` rather than an approximation. Every existing validity check on this function
+    goes through triwarp's own adjacency. The ratio then bounds the length gap.
+
+    The bug class the threshold excludes is a sweep that stalls or lengthens. Measured ratios of
+    triwarp's length to the reference's total: **1.07 and 1.54** on ``torus``, **1.18 / 1.31 /
+    1.55 / 1.17** on ``genus_two`` -- so the 2.0 threshold clears the worst by 1.29x. The mutation
+    probe is the unshortened tree-cotree loop, which the sweep is what removes: feeding ``torus``'s
+    major generator raw takes the ratio to **2.17** and fails. That margin is narrower than a
+    threshold test would normally want, which is why the edge-walk assert above carries the weight
+    and this one is a bound rather than the claim.
+
+    !!! warning "The reference returns a loop *system*, so the comparable total is a sum"
+        ``findShortestEquivalentLoops`` may split one loop into several that are jointly equivalent
+        to it -- measured, 2 loops for two of ``genus_two``'s four generators. Comparing against
+        ``min`` of the returned lengths therefore reads a ratio of **3.71** on one of them and looks
+        like a gross disagreement; against the ``sum`` the same generator reads 1.31. The sum is the
+        equivalent object.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = mesh_wp.points.numpy().astype(np.float64)
+    loops_wp = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
+    shortened_wp, _sweeps = tw.geodesic_walk.shorten_loop(mesh_wp.points, mesh_wp.indices, loops_wp)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    topology_ml = mesh_ml.topology
+    ratios = []
+    for shortened_loop_wp in shortened_wp:
+        shortened_np = shortened_loop_wp.numpy()
+        edge_loop_ml = mm.std_vector_Id_EdgeTag()
+        for tail, head in zip(shortened_np, np.roll(shortened_np, -1), strict=True):
+            edge_ml = topology_ml.findEdge(mm.VertId(int(tail)), mm.VertId(int(head)))
+            assert edge_ml.valid(), (
+                f"{tail} -> {head} is not a mesh edge: the sweep left the one-ring"
+            )
+            edge_loop_ml.append(edge_ml)
+
+        system_ml = mm.findShortestEquivalentLoops(mm.MeshPart(mesh_ml), edge_loop_ml)
+        assert len(system_ml) > 0, "the reference returned nothing; the comparison would be vacuous"
+        total_ml = sum(
+            float(mesh_ml.edgeLength(edge_ml.undirected()))
+            for loop_ml in system_ml
+            for edge_ml in loop_ml
+        )
+        length = _cycle_length(vertices_np, shortened_np)
+        assert total_ml <= length + 1e-4  # it minimizes over the same space, so it cannot do worse
+        ratios.append(length / total_ml)
+
+    assert max(ratios) < 2.0, f"the sweep left the loops long: ratios {ratios}"
+    assert max(ratios) > 1.0 + 1e-3  # non-vacuity: an exactly-equal fixture would assert nothing
 
 
 def test_shorten_loop_accepts_precomputed_connectivity(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
