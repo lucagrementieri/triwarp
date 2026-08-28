@@ -515,7 +515,11 @@ def mesh_to_mesh_distance(
 
 
 def normals_at_closest_faces(
-    mesh: wp.Mesh, points: wp.array[wp.vec3], *, max_dist: float | None = None
+    mesh: wp.Mesh,
+    points: wp.array[wp.vec3],
+    *,
+    max_dist: float | None = None,
+    face_normals: wp.array[wp.vec3] | None = None,
 ) -> wp.array[wp.vec3]:
     """
     Return unit face normals at the closest mesh triangle for each query point.
@@ -532,6 +536,12 @@ def normals_at_closest_faces(
     max_dist
         Maximum search radius per query. When ``None``, derived from the
         axis-aligned box enclosing mesh vertices and query points.
+    face_normals
+        Optional length-``n_faces`` unit face normals of ``mesh``
+        ([`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]); recomputed when
+        ``None``. This function only gathers from them, so a caller issuing several query batches
+        against one mesh should pass them --
+        [`Trimesh.face_normals`][triwarp.mesh.Trimesh.face_normals] has them cached.
 
     Returns
     -------
@@ -557,8 +567,9 @@ def normals_at_closest_faces(
     # over ``m`` and keeps the read in range.
     hit_face = wp.empty(m, dtype=wp.int32, device=device)
     wp.map(wp.max, out_face, wp.int32(0), out=hit_face)
-    all_face_normals, _ = face_normals_and_areas(mesh.points, mesh.indices)
-    return tw.array.gather(all_face_normals, hit_face)
+    if face_normals is None:
+        face_normals, _areas = face_normals_and_areas(mesh.points, mesh.indices)
+    return tw.array.gather(face_normals, hit_face)
 
 
 def signed_distance_on_mesh(

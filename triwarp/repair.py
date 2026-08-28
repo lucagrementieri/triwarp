@@ -1241,7 +1241,11 @@ def eliminate_degree3_vertices(
 
 
 def flatten_degree3_vertices(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], region: wp.array[wp.bool] | None = None
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    region: wp.array[wp.bool] | None = None,
+    *,
+    rings: tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.bool]] | None = None,
 ) -> wp.array[wp.vec3]:
     """
     Flatten each interior valence-3 vertex into the plane of its three neighbours.
@@ -1271,6 +1275,12 @@ def flatten_degree3_vertices(
     region
         ``(n_vertices,)`` boolean mask restricting which vertices may be flattened. ``None``
         flattens every one that qualifies.
+    rings
+        Optional precomputed [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] as
+        ``(offsets, ring_halfedges, is_boundary)``. Depends on the connectivity alone, so one CSR
+        serves every fan walk over the same mesh --
+        [`Trimesh.vertex_one_rings`][triwarp.mesh.Trimesh.vertex_one_rings] has it cached, and
+        passing it skips the vertex-manifold check and the host readback that check costs.
 
     Returns
     -------
@@ -1303,8 +1313,8 @@ def flatten_degree3_vertices(
             f"of {region.dtype}"
         )
 
-    ring_offsets, ring_halfedges, is_boundary = tw.halfedge.vertex_one_rings(
-        faces, n_vertices=n_vertices
+    ring_offsets, ring_halfedges, is_boundary = (
+        rings if rings is not None else tw.halfedge.vertex_one_rings(faces, n_vertices=n_vertices)
     )
     flattened = wp.empty(n_vertices, dtype=wp.vec3, device=device)
     wp.launch(

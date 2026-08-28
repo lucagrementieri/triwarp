@@ -204,7 +204,11 @@ def _diagonal_sandwich(
 
 
 def hessian_energy(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float64
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    dtype: type = wp.float64,
+    *,
+    vertex_faces: tuple[wp.array[wp.int32], wp.array[wp.int32]] | None = None,
 ) -> wps.BsrMatrix[wp.float64]:
     """
     Hessian smoothness energy with natural boundary conditions.
@@ -235,6 +239,11 @@ def hessian_energy(
         Float64 is the default, unlike the first-order operators in this module, because the
         entries scale as the inverse fourth power of the mesh size and the operator exists to be
         solved against.
+    vertex_faces
+        Optional precomputed [`vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency] as
+        ``(offsets, vertex_faces)``. Depends on the connectivity alone, so one CSR serves every
+        incidence walk over the same mesh --
+        [`Trimesh.vertex_face_adjacency`][triwarp.mesh.Trimesh.vertex_face_adjacency] has it cached.
 
     Returns
     -------
@@ -274,7 +283,11 @@ def hessian_energy(
     )
     inverse_mass = _interior_inverse(vertices, faces, mass)
 
-    vf_offsets, vertex_faces = tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
+    vf_offsets, vf_indices = (
+        vertex_faces
+        if vertex_faces is not None
+        else tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
+    )
     counts = wp.empty(n_vertices, dtype=wp.int32, device=device)
     wp.launch(
         kernel_energies.hessian_energy_counts,
@@ -293,7 +306,7 @@ def hessian_energy(
             inputs=[
                 faces,
                 vf_offsets,
-                vertex_faces,
+                vf_indices,
                 gradients,
                 areas,
                 inverse_mass,

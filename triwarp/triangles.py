@@ -112,6 +112,8 @@ def corner_normals(
     weighting: CornerNormalWeighting = "angle",
     twins: wp.array[wp.int32] | None = None,
     n_vertices: int | None = None,
+    face_normals: wp.array[wp.vec3] | None = None,
+    face_areas: wp.array[wp.float32] | None = None,
 ) -> twt.Array2dVec3:
     """
     Per-corner normals: one normal for each ``(face, corner)``, averaged over its smooth group.
@@ -151,6 +153,13 @@ def corner_normals(
     n_vertices
         Total vertex count. When ``None`` it is inferred with
         [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
+    face_normals
+        Optional length-``n_faces`` unit face normals and matching areas from
+        [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]; recomputed together
+        when either is ``None``. [`Trimesh.face_normals`][triwarp.mesh.Trimesh.face_normals] and
+        [`Trimesh.face_areas`][triwarp.mesh.Trimesh.face_areas] cache the pair.
+    face_areas
+        See ``face_normals``.
 
     Returns
     -------
@@ -210,7 +219,8 @@ def corner_normals(
             )
             crease_keys = tw.array.sort_and_argsort(keys)[0]
 
-    normals_per_face, areas = face_normals_and_areas(vertices, faces)
+    if face_normals is None or face_areas is None:
+        face_normals, face_areas = face_normals_and_areas(vertices, faces)
     if weighting == "angle":
         # ``(n_faces, 3)`` reshaped flat is already corner-indexed: row ``f`` column ``k`` is
         # corner ``3f + k``, the same index the kernel's thread carries.
@@ -219,7 +229,7 @@ def corner_normals(
         # One area per face broadcast to its three corners -- a gather rather than a kernel, since
         # ``repeat_range`` already builds ``i // 3``.
         corner_weights = tw.array.gather(
-            areas, tw.array.repeat_range(3 * n_faces, 3, device=device)
+            face_areas, tw.array.repeat_range(3 * n_faces, 3, device=device)
         )
     else:
         raise ValueError(f"weighting must be 'angle' or 'area', got {weighting!r}")
@@ -232,7 +242,7 @@ def corner_normals(
             vertices,
             faces,
             twins,
-            normals_per_face,
+            face_normals,
             corner_weights,
             crease_keys,
             wp.uint64(n_vertices),

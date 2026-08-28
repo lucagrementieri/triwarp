@@ -1009,6 +1009,7 @@ def face_defective_mask(
     min_quality: float | None = 0.02,
     max_normal_angle: float | None = None,
     max_fold_angle: float | None = None,
+    face_normals: wp.array[wp.vec3] | None = None,
 ) -> wp.array[wp.bool]:
     """
     Flag faces that are thin, misoriented relative to their neighbourhood, or folded over it.
@@ -1043,6 +1044,11 @@ def face_defective_mask(
         face, or a strip of exactly three) is therefore never flagged on this criterion alone.
         MeshLab's ``folded_faces_angle_threshold`` (default ``160``, off by default). Must be in
         ``(0, 180]``. ``None`` disables it.
+    face_normals
+        Optional length-``n_faces`` unit face normals from
+        [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]; recomputed when
+        ``None``. Only the two angle criteria read them, so this is the one geometry pass a caller
+        already holding normals can skip.
 
     Returns
     -------
@@ -1064,6 +1070,8 @@ def face_defective_mask(
     --------
     [`repair.remove_folded_faces`][triwarp.repair.remove_folded_faces]
         Deletes the folded ones.
+    [`Trimesh.face_normals`][triwarp.mesh.Trimesh.face_normals]
+        Caches what ``face_normals`` wants.
     [`repair.remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
         Deletes the fully degenerate ones, on an exact test rather than a threshold.
     [`triwarp.triangles.face_quality`][triwarp.triangles.face_quality]
@@ -1084,7 +1092,8 @@ def face_defective_mask(
         if min_quality is not None
         else wp.full(n_faces, 1.0, dtype=wp.float32, device=device)
     )
-    face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
+    if face_normals is None:
+        face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
     neighbor_sum = wp.zeros(n_faces, dtype=wp.vec3, device=device)
     max_angle = wp.zeros(n_faces, dtype=wp.float32, device=device)
     if max_normal_angle is not None or max_fold_angle is not None:

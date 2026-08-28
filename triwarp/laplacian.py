@@ -719,7 +719,11 @@ def graph_laplacian(
 
 
 def mass_matrix_entries(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float32
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    dtype: type = wp.float32,
+    *,
+    face_areas: wp.array[wp.float32] | None = None,
 ) -> twt.Array1dFloat:
     """
     Per-vertex barycentric lumped mass: a third of each incident triangle's area.
@@ -739,6 +743,12 @@ def mass_matrix_entries(
         Scalar type of the returned diagonal: ``wp.float32`` (default) or ``wp.float64``. Request
         ``wp.float64`` to feed a float64 solve (e.g. geodesic heat method, implicit fairing)
         without a downstream recast.
+    face_areas
+        Optional length-``n_faces`` ``wp.float32`` triangle areas
+        ([`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]). The lumping reads
+        nothing else off ``vertices``, so passing them is the whole geometry pass this function
+        would otherwise repeat -- [`Trimesh.face_areas`][triwarp.mesh.Trimesh.face_areas] has them
+        cached.
 
     Returns
     -------
@@ -748,6 +758,7 @@ def mass_matrix_entries(
     See Also
     --------
     [`mass_matrix`][triwarp.laplacian.mass_matrix]
+    [`Trimesh.mass_matrix_entries`][triwarp.mesh.Trimesh.mass_matrix_entries]
 
     Notes
     -----
@@ -758,7 +769,7 @@ def mass_matrix_entries(
     mass = wp.zeros(n_vertices, dtype=dtype, device=device)
     n_faces = int(faces.shape[0]) // 3
     if n_faces > 0:
-        _, areas = face_normals_and_areas(vertices, faces)
+        areas = face_areas if face_areas is not None else face_normals_and_areas(vertices, faces)[1]
         if dtype != wp.float32:
             # scatter_face_thirds shares one float dtype across areas/count/mass; promote the
             # float32 face areas so the scatter specializes to the requested precision.
@@ -773,7 +784,11 @@ def mass_matrix_entries(
 
 
 def mass_matrix(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float32
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    dtype: type = wp.float32,
+    *,
+    face_areas: wp.array[wp.float32] | None = None,
 ) -> wps.BsrMatrix[wp.float32]:
     """
     Diagonal barycentric lumped mass matrix of the mesh.
@@ -787,6 +802,9 @@ def mass_matrix(
     dtype
         Scalar block type of the assembled matrix: ``wp.float32`` (default) or ``wp.float64``. Use
         ``wp.float64`` when the mass matrix feeds a float64 linear-system solve.
+    face_areas
+        Optional precomputed triangle areas, forwarded to
+        [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries].
 
     Returns
     -------
@@ -805,4 +823,6 @@ def mass_matrix(
     -----
     Matches ``igl::massmatrix`` under ``MASSMATRIX_TYPE_BARYCENTRIC``.
     """
-    return wps.bsr_diag(diag=mass_matrix_entries(vertices, faces, dtype=dtype))
+    return wps.bsr_diag(
+        diag=mass_matrix_entries(vertices, faces, dtype=dtype, face_areas=face_areas)
+    )

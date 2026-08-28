@@ -34,6 +34,8 @@ def principal_curvature(
     radius: int = 5,
     *,
     frame_independent: bool = True,
+    face_normals: wp.array[wp.vec3] | None = None,
+    face_areas: wp.array[wp.float32] | None = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.float32], wp.array[wp.float32]]:
     """
     Principal curvature directions and magnitudes per vertex via quadric fitting.
@@ -59,6 +61,13 @@ def principal_curvature(
         ``igl::principal_curvature`` is reproduced verbatim (frame-dependent), matching
         ``igl.principal_curvature`` exactly. The two agree closely on well-sampled smooth
         surfaces; they differ only in the off-diagonal of the shape operator.
+    face_normals
+        Optional length-``n_faces`` unit face normals and matching areas from
+        [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]; recomputed together
+        when either is ``None``. [`Trimesh.face_normals`][triwarp.mesh.Trimesh.face_normals] and
+        [`Trimesh.face_areas`][triwarp.mesh.Trimesh.face_areas] cache the pair.
+    face_areas
+        See ``face_normals``.
 
     Returns
     -------
@@ -77,7 +86,8 @@ def principal_curvature(
     n_vertices = int(vertices.shape[0])
 
     # Compute vertex normals via face normals
-    face_normals, face_areas = tw.triangles.face_normals_and_areas(vertices, faces)
+    if face_normals is None or face_areas is None:
+        face_normals, face_areas = tw.triangles.face_normals_and_areas(vertices, faces)
     vertex_normals = _vertex_normals(
         vertices, faces, face_normals=face_normals, face_weights=face_areas
     )

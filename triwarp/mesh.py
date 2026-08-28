@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Generic, NoReturn, TypeVar, cast, overload
 
 import warp as wp
+import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
@@ -18,7 +19,11 @@ _R = TypeVar("_R")
 # can carry these forward instead of recomputing them. Every new cached property below must
 # be added to this set (if faces-only) or left out of it (if it also depends on `vertices`).
 # `face_adjacency_unshared` is faces-only and belongs here; its neighbour `face_adjacency_angles`
-# reads `face_normals` and is therefore correctly absent.
+# reads `face_normals` and is therefore correctly absent. The halfedge trio -- `halfedge_twins`,
+# `vertex_one_rings`, `vertex_face_adjacency` -- is pure connectivity and belongs here too, while
+# every discrete operator (`cotmatrix` through `vector_heat_operators`) is assembled from the
+# connectivity *and* the geometry and must not: `tests/test_mesh.py` pins both halves of that rule,
+# this set by parametrizing over it and its complement by name.
 _TOPOLOGY_KEYS: frozenset[str] = frozenset(
     {
         "edges",
@@ -30,6 +35,9 @@ _TOPOLOGY_KEYS: frozenset[str] = frozenset(
         "face_adjacency_edges",
         "face_adjacency_unshared",
         "face_connected_component_labels",
+        "vertex_face_adjacency",
+        "halfedge_twins",
+        "vertex_one_rings",
         "boundary_edges",
         "oriented_boundary_edges",
         "boundary_loops",
@@ -86,18 +94,44 @@ class Trimesh:
     waste GPU memory on meshes that never issue a ray or proximity query, so it is built lazily
     behind [`warp_mesh`][triwarp.mesh.Trimesh.warp_mesh] on first use instead.
 
-    Every cached property returns an array that is shared and aliased across repeated
-    accesses (and, for `warp_mesh`, with the mesh's own `vertices`/`faces` buffers) — callers
-    must not mutate a returned array in place. If a buffer is deliberately mutated in place by
-    a kernel, call [`invalidate`][triwarp.mesh.Trimesh.invalidate] afterward to drop every
-    cached value (including the BVH); otherwise use
+    Every cached property returns the same object on each access — an array, a tuple of arrays or
+    a sparse matrix, aliased across repeated accesses and (for `warp_mesh`) with the mesh's own
+    `vertices`/`faces` buffers — so callers must not mutate a returned buffer in place. That
+    matters most where they are passed *into* the free functions as precomputed arguments: a
+    wrapper that rewrites such a buffer copies it first
+    ([`filter_normals`][triwarp.smoothing.filter_normals] is the one that does). If a buffer is
+    deliberately mutated in place by a kernel, call
+    [`invalidate`][triwarp.mesh.Trimesh.invalidate] afterward to drop every cached value
+    (including the BVH); otherwise use
     [`with_vertices`][triwarp.mesh.Trimesh.with_vertices] /
     [`with_faces`][triwarp.mesh.Trimesh.with_faces], which return a new `Trimesh` and carry
     forward whichever cached values are still valid.
 
-    Scalar-valued properties (`area`, `centroid`, `mean_edge_length`,
-    `euler_characteristic`, and every `is_*` predicate) synchronize the result from device to
-    host on first access; the synchronized Python value is then cached like any other property.
+    Scalar-valued properties (`area`, `centroid`, `bounds`, `enclosing_diagonal`,
+    `mean_edge_length`, `euler_characteristic`, and every `is_*` predicate) synchronize the result
+    from device to host on first access; the synchronized Python value is then cached like any
+    other property.
+
+    Most of these are also what the free functions accept as an optional precomputed argument, so
+    the cache is worth more than the repeat accesses on this class: pass `edges_sorted`,
+    `face_adjacency`, `halfedge_twins`, `vertex_one_rings`, `vertex_face_adjacency`,
+    `face_normals` / `face_areas`, `cotmatrix_entries`, `bounds`, `laplacian_operator` or an
+    operator bundle into the wrapper that takes it and the whole assembly is skipped. The discrete
+    operators at the bottom of the class (`cotmatrix` through `vector_heat_operators`) are the
+    heaviest of these and the reason a solver run over one mesh should go through a `Trimesh`.
+
+    Measured on ``icosphere(5)`` (10 242 vertices) on an RTX 5090, interleaved, with the cache
+    built *inside* the timed callable so the first-use cost is paid in every row:
+
+    | workflow | raw | cached | |
+    |---|---|---|---|
+    | `heat_geodesic` from 5 source sets | 60.0 ms | 47.3 ms | 1.27x |
+    | `filter_laplacian`, 3 calls | 4.18 ms | 3.11 ms | 1.35x |
+    | `vertex_tangent_frames`, 4 calls | 3.74 ms | 1.14 ms | 3.30x |
+
+    The gain is the assembly's share of the call, so it grows with how often the mesh is reused and
+    shrinks where the *solve* dominates -- which is why the heat row is the smallest of the three
+    despite caching the most expensive object here.
 
     Parameters
     ----------
@@ -296,6 +330,56 @@ class Trimesh:
         [`trimesh.Trimesh.centroid`][]
         """
         return tw.measures.surface_centroid(self._vertices, self._faces)
+
+    @_CachedProperty
+    def bounds(self) -> tuple[wp.vec3, wp.vec3]:
+        """
+        Axis-aligned bounding box of `vertices`, as ``(min_bound, max_bound)``.
+
+        Pass it to any wrapper taking a ``bounds=`` argument --
+        [`marching_cubes`][triwarp.levelset.marching_cubes],
+        [`signed_distance_grid`][triwarp.proximity.signed_distance_grid],
+        [`query_nearest`][triwarp.neighbors.query_nearest],
+        [`grid_points`][triwarp.voxels.grid_points] -- so the box is reduced once per mesh rather
+        than once per call.
+
+        Notes
+        -----
+        Triggers a device-to-host synchronization on first access. ``(+inf, -inf)`` for an empty
+        mesh, the [`aabb`][triwarp.bounds.aabb] convention.
+
+        See Also
+        --------
+        [`triwarp.bounds.aabb`][]
+        [`enclosing_diagonal`][triwarp.mesh.Trimesh.enclosing_diagonal]
+        """
+        return tw.bounds.aabb(self._vertices)
+
+    @_CachedProperty
+    def enclosing_diagonal(self) -> float:
+        """
+        Diagonal length of `bounds`: this package's default mesh-query search radius.
+
+        Notes
+        -----
+        Costs no device work of its own, unlike
+        [`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal], which reduces the box again --
+        it reads the cached `bounds` on the host. ``inf`` for an empty mesh, that function's
+        convention.
+
+        A query wrapper's own default is the diagonal of the box around the mesh **and the query
+        points**, which this is not; it is the right radius only when the queries lie inside the
+        mesh's own box.
+
+        See Also
+        --------
+        [`triwarp.bounds.enclosing_diagonal`][]
+        [`bounds`][triwarp.mesh.Trimesh.bounds]
+        ``trimesh.Trimesh.scale``
+            The same quantity under trimesh's name for it (no Sphinx inventory entry to link).
+        """
+        lower, upper = self.bounds
+        return float(wp.length(upper - lower))
 
     @_CachedProperty
     def vertex_normals(self) -> wp.array[wp.vec3]:
@@ -537,6 +621,75 @@ class Trimesh:
         )
 
     @_CachedProperty
+    def vertex_face_adjacency(self) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+        """
+        Incidence CSR of the faces touching each vertex, as ``(offsets, vertex_faces)``.
+
+        Each row is a *set*: use `vertex_one_rings` where the rotational order around the vertex
+        is what matters, at the price of needing an edge-manifold mesh.
+
+        See Also
+        --------
+        [`triwarp.adjacency.vertex_face_adjacency`][]
+        [`vertex_one_rings`][triwarp.mesh.Trimesh.vertex_one_rings]
+        """
+        return tw.adjacency.vertex_face_adjacency(self._faces, n_vertices=self.n_vertices)
+
+    @_CachedProperty
+    def halfedge_twins(self) -> wp.array[wp.int32]:
+        """
+        Length-``3 * n_faces`` opposite halfedge of every halfedge, or ``-1`` on a boundary.
+
+        Halfedge ``h = 3 * f + k`` runs from ``faces[3f + k]`` to ``faces[3f + (k + 1) % 3]``, so
+        ``next`` and ``prev`` are index arithmetic and this array is all a walk needs to cross an
+        edge.
+
+        Raises
+        ------
+        ValueError
+            Propagated from [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when an undirected
+            edge carries three or more halfedges, i.e. the mesh is not edge-manifold.
+
+        Notes
+        -----
+        Triggers a device-to-host synchronization on first access (that manifoldness check).
+
+        See Also
+        --------
+        [`triwarp.halfedge.halfedge_twins`][]
+        [`vertex_one_rings`][triwarp.mesh.Trimesh.vertex_one_rings]
+        """
+        return tw.halfedge.halfedge_twins(self._faces, n_vertices=self.n_vertices)
+
+    @_CachedProperty
+    def vertex_one_rings(self) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.bool]]:
+        """
+        Counter-clockwise outgoing halfedges per vertex: ``(offsets, ring_halfedges, is_boundary)``.
+
+        Built from the cached `halfedge_twins`, so accessing either first pays for that array once.
+
+        Raises
+        ------
+        ValueError
+            Propagated from [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] when a vertex's
+            rotation closes before its whole fan is covered (a pinched, vertex-non-manifold
+            vertex), or from `halfedge_twins` on an edge-non-manifold mesh.
+
+        Notes
+        -----
+        Triggers a device-to-host synchronization on first access (that manifoldness check).
+
+        See Also
+        --------
+        [`triwarp.halfedge.vertex_one_rings`][]
+        [`halfedge_twins`][triwarp.mesh.Trimesh.halfedge_twins]
+        [`vertex_face_adjacency`][triwarp.mesh.Trimesh.vertex_face_adjacency]
+        """
+        return tw.halfedge.vertex_one_rings(
+            self._faces, twins=self.halfedge_twins, n_vertices=self.n_vertices
+        )
+
+    @_CachedProperty
     def boundary_edges(self) -> twt.Array2dInt32:
         """
         Shape ``(n_boundary, 2)`` undirected boundary edges (each row sorted, min-first).
@@ -751,6 +904,195 @@ class Trimesh:
         """
         return tw.validation.is_volume(
             self._vertices, self._faces, edges=self.edges, edges_sorted=self.edges_sorted
+        )
+
+    # Discrete operators: the assemblies every solve over this mesh shares. Heavier than everything
+    # above (a sparse build each, and the two heat bundles several) and reached by fewer callers,
+    # so they sit last -- but they are also where the cache pays most, since each is what a whole
+    # family of wrappers accepts as its precomputed argument.
+
+    @_CachedProperty
+    def cotmatrix_entries(self) -> twt.Array2dFloat32:
+        """
+        Shape ``(n_faces, 3)`` per-triangle half-cotangent weights, in igl's edge order.
+
+        The ``float32`` table, and that costs a ``float64`` consumer nothing: the free function
+        computes these weights in ``float32`` -- the vertex precision -- whatever dtype is asked
+        for, and casts on write, so a ``float64`` request would return this same table widened.
+        Every consumer accepts either precision and casts to the *matrix* dtype in one build, so
+        pass this to [`cotmatrix`][triwarp.laplacian.cotmatrix],
+        [`connection_laplacian`][triwarp.laplacian.connection_laplacian],
+        [`heat_operators`][triwarp.heat.distance.heat_operators] or
+        [`crouzeix_raviart_cotmatrix`][triwarp.energies.crouzeix_raviart_cotmatrix] at either
+        precision -- which is what this class's own ``float32`` `cotmatrix` and ``float64``
+        `heat_operators` both do.
+
+        See Also
+        --------
+        [`triwarp.laplacian.cotmatrix_entries`][]
+        [`cotmatrix`][triwarp.mesh.Trimesh.cotmatrix]
+        """
+        return tw.laplacian.cotmatrix_entries(self._vertices, self._faces)
+
+    @_CachedProperty
+    def cotmatrix(self) -> wps.BsrMatrix[wp.float32]:
+        """
+        Cotangent stiffness matrix: the ``float32`` discrete Laplace-Beltrami operator.
+
+        Assembled from the cached `cotmatrix_entries`. Diagonal entries are negative and each row
+        sums to zero, so ``-L`` is positive semi-definite on a closed mesh.
+
+        Notes
+        -----
+        ``float32``, which is the right precision for a *product* (an energy, a residual, a filter
+        weight) and not for a solve -- the heat solvers and
+        [`triwarp.parametrization`][triwarp.parametrization] assemble their own ``float64``
+        operators, and `heat_operators` caches the one they share.
+
+        See Also
+        --------
+        [`triwarp.laplacian.cotmatrix`][]
+        [`cotmatrix_entries`][triwarp.mesh.Trimesh.cotmatrix_entries]
+        [`mass_matrix_entries`][triwarp.mesh.Trimesh.mass_matrix_entries]
+        [`triwarp.energies.k_harmonic`][]
+            Takes this operator and `mass_matrix_entries` as its two arguments.
+        """
+        return tw.laplacian.cotmatrix(
+            self._vertices, self._faces, cot_entries=self.cotmatrix_entries
+        )
+
+    @_CachedProperty
+    def mass_matrix_entries(self) -> wp.array[wp.float32]:
+        """
+        Length-``n_vertices`` barycentric lumped mass: a third of each incident triangle's area.
+
+        Built from the cached `face_areas`, so this is a scatter and nothing else.
+
+        Notes
+        -----
+        ``float32``. A ``float64`` solve wants
+        [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries] at that dtype, which
+        accumulates in the requested precision rather than casting this -- the two are not the same
+        array widened.
+
+        See Also
+        --------
+        [`triwarp.laplacian.mass_matrix_entries`][]
+        [`cotmatrix`][triwarp.mesh.Trimesh.cotmatrix]
+        """
+        return tw.laplacian.mass_matrix_entries(
+            self._vertices, self._faces, face_areas=self.face_areas
+        )
+
+    @_CachedProperty
+    def laplacian_operator(self) -> wps.BsrMatrix[wp.float32]:
+        """
+        Row-normalized 1-ring averaging operator (the uniform / umbrella Laplacian).
+
+        Exactly what every position filter in [`triwarp.smoothing`][triwarp.smoothing] builds for
+        itself when its ``laplacian_operator=`` argument is ``None``, so passing this hoists the
+        assembly out of a multi-filter or multi-call pass.
+
+        Notes
+        -----
+        The **directed** ``mesh.edges`` adjacency, the shared default.
+        [`filter_neighborhood_average`][triwarp.smoothing.filter_neighborhood_average] is the one
+        filter that wants the *symmetric* adjacency instead
+        ([`laplacian`][triwarp.laplacian.laplacian] at ``symmetric=True``) and must not be handed
+        this one; the two differ only on a mesh with an open boundary.
+
+        See Also
+        --------
+        [`triwarp.laplacian.laplacian`][]
+        [`triwarp.smoothing.filter_laplacian`][]
+        [`cotmatrix`][triwarp.mesh.Trimesh.cotmatrix]
+        """
+        return tw.laplacian.laplacian(self._vertices, self._faces)
+
+    @_CachedProperty
+    def vertex_tangent_frames(
+        self,
+    ) -> tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]]:
+        """
+        Orthonormal tangent frame at every vertex as ``(basis_x, basis_y, normal)``.
+
+        The gauge every 2-D tangent quantity on this mesh is measured in. Built from the cached
+        `vertex_normals` and `vertex_one_rings`, and its third element **is** `vertex_normals`.
+
+        Raises
+        ------
+        ValueError
+            Propagated from `vertex_one_rings` on a non-manifold mesh.
+
+        See Also
+        --------
+        [`triwarp.tangent_space.vertex_tangent_frames`][]
+        [`vector_heat_operators`][triwarp.mesh.Trimesh.vector_heat_operators]
+        """
+        return tw.tangent_space.vertex_tangent_frames(
+            self._vertices, self._faces, normals=self.vertex_normals, rings=self.vertex_one_rings
+        )
+
+    @_CachedProperty
+    def heat_operators(self) -> tw.heat.distance.HeatOperators:
+        """
+        Source-independent operator bundle for the heat method, at the default diffusion time.
+
+        Pass it to [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] or
+        [`geodesic_path`][triwarp.geodesic_walk.geodesic_path] through their ``operators=``
+        argument: everything in the bundle depends on the mesh alone, so distance from many
+        different source sets costs one assembly.
+
+        Notes
+        -----
+        At ``t = None`` (the squared mean unique-edge length, ``igl::heat_geodesics``' default) and
+        ``use_robust=False``. A mesh with degenerate triangles, or a caller sweeping ``t``, wants
+        [`heat_operators`][triwarp.heat.distance.heat_operators] directly -- and can still pass this
+        class's `cotmatrix_entries` into it.
+
+        See Also
+        --------
+        [`triwarp.heat.distance.heat_operators`][]
+        [`vector_heat_operators`][triwarp.mesh.Trimesh.vector_heat_operators]
+        """
+        return tw.heat.distance.heat_operators(
+            self._vertices, self._faces, cot_entries=self.cotmatrix_entries
+        )
+
+    @_CachedProperty
+    def vector_heat_operators(self) -> tw.heat.vector.VectorHeatOperators:
+        """
+        Operator bundle for the vector heat method, at the default diffusion time.
+
+        ``(vector_system, scalar, frames)``: the ``2 x 2``-block connection system, the scalar
+        `heat_operators` and the `vertex_tangent_frames`. Pass it to
+        [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors],
+        [`log_map`][triwarp.heat.vector.log_map],
+        [`extend_scalar`][triwarp.heat.vector.extend_scalar] or
+        [`heat_signed_distance`][triwarp.heat.signed.heat_signed_distance] through their
+        ``operators=`` argument.
+
+        Its last two fields are this class's own `heat_operators` and `vertex_tangent_frames`, so
+        the three properties share one assembly however they are reached.
+
+        Notes
+        -----
+        At ``t = None``, the same default `heat_operators` uses -- which is load-bearing rather
+        than incidental: [`log_map`][triwarp.heat.vector.log_map]'s radius is asserted to *be* the
+        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] distance, so the two systems must
+        share a diffusion time.
+
+        See Also
+        --------
+        [`triwarp.heat.vector.vector_heat_operators`][]
+        [`heat_operators`][triwarp.mesh.Trimesh.heat_operators]
+        [`vertex_tangent_frames`][triwarp.mesh.Trimesh.vertex_tangent_frames]
+        """
+        return tw.heat.vector.vector_heat_operators(
+            self._vertices,
+            self._faces,
+            scalar_operators=self.heat_operators,
+            frames=self.vertex_tangent_frames,
         )
 
     def with_vertices(self, new_vertices: wp.array[wp.vec3]) -> Trimesh:

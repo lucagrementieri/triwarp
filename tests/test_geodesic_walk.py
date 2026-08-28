@@ -574,6 +574,31 @@ def test_shorten_loop_preserves_the_homotopy_class(torus: tuple[tm.Trimesh, wp.M
     assert improved >= 1  # and the sweeps did something: 1.411x on this fixture's major generator
 
 
+def test_shorten_loop_accepts_precomputed_connectivity(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Triwarp against triwarp: the ``twins`` / ``rings`` arguments do not change the sweep.
+
+    Not a parity assert. The call that rebuilds the connectivity itself is the one the reference
+    comparison above runs, so it carries the oracle; what this pins is that handing the sweep a
+    precomputed halfedge structure -- which every caller holding a ``Trimesh`` now can -- reaches
+    the identical cycles, since the loop walk reads nothing else about the topology.
+    """
+    _mesh_tm, mesh_wp = torus
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    loops_wp = tw.homology.homology_generators(vertices_wp, faces_wp)
+    assert len(loops_wp) == 2  # non-vacuity: genus 1, so there are two generators to shorten
+
+    rebuilt_wp, rebuilt_sweeps = tw.geodesic_walk.shorten_loop(vertices_wp, faces_wp, loops_wp)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    cached_wp, cached_sweeps = tw.geodesic_walk.shorten_loop(
+        vertices_wp, faces_wp, loops_wp, twins=mesh.halfedge_twins, rings=mesh.vertex_one_rings
+    )
+
+    assert cached_sweeps == rebuilt_sweeps > 0
+    for rebuilt_loop_wp, cached_loop_wp in zip(rebuilt_wp, cached_wp, strict=True):
+        assert np.array_equal(cached_loop_wp.numpy(), rebuilt_loop_wp.numpy())
+
+
 def test_shorten_loop_returns_valid_non_separating_cycles(
     torus: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:

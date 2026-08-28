@@ -80,6 +80,26 @@ def test_heat_operators_are_the_matrices_its_docstring_names(
     assert np.allclose(face_areas_wp.numpy(), mesh_tm.area_faces, rtol=1e-5, atol=1e-5)
 
 
+def test_heat_operators_reject_cot_entries_with_use_robust(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    The two arguments ask for different half-cotangent tables, so together they are an error.
+
+    Not a library comparison: no reference exposes the mollified operator as an option, and this is
+    about the signature rather than the numbers. Passing both silently would let ``use_robust``
+    look like it was honoured while the extrinsic table was used, which is exactly the failure a
+    caller reaches for ``use_robust`` to avoid.
+    """
+    _mesh_tm, mesh_wp = icosphere_coarse
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    cot_entries_wp = tw.laplacian.cotmatrix_entries(vertices_wp, faces_wp)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        tw.heat.distance.heat_operators(
+            vertices_wp, faces_wp, cot_entries=cot_entries_wp, use_robust=True
+        )
+
+
 def test_heat_operators_honour_an_explicit_diffusion_time(
     icosphere_coarse: tuple[object, wp.Mesh],
 ) -> None:

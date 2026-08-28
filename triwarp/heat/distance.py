@@ -8,6 +8,7 @@ import warp.sparse as wps
 
 import triwarp.linalg as twl
 import triwarp.reduce as twr
+import triwarp.typing as twt
 from triwarp.edges import mean_unique_edge_length
 from triwarp.kernels.heat import distance as kernel_heat_distance
 from triwarp.laplacian import (
@@ -42,6 +43,7 @@ def heat_operators(
     t: float | None = None,
     *,
     use_robust: bool = False,
+    cot_entries: twt.Array2dFloat | None = None,
 ) -> HeatOperators:
     """
     Assemble the source-independent operators the heat method solves against.
@@ -76,6 +78,12 @@ def heat_operators(
         fully intrinsic heat method needs intrinsic *mass*, *gradient* and *divergence* as well. Use
         [`robust_laplacian`][triwarp.laplacian.robust_laplacian] directly where only the operator
         matters (smoothing, parametrization, spectral work).
+    cot_entries
+        Optional precomputed [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries], shape
+        ``(n_faces, 3)``. Depends on the mesh alone, so a caller assembling these operators at
+        several diffusion times reuses one table -- and
+        [`Trimesh.cotmatrix_entries`][triwarp.mesh.Trimesh.cotmatrix_entries] has it cached. Both
+        precisions are accepted: the assembly casts to the matrix dtype in a single build.
 
     Returns
     -------
@@ -137,12 +145,24 @@ def heat_operators(
         tuple's *third* field is the raw (singular) Laplacian, not the Poisson system — handing it
         a right-hand side runs CG to its 25 620-iteration cap.
 
+    Raises
+    ------
+    ValueError
+        If both ``cot_entries`` and ``use_robust`` are given: ``use_robust`` exists to build that
+        very table from mollified edge lengths, so the two ask for different weights.
+
     See Also
     --------
     [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]
+    [`Trimesh.heat_operators`][triwarp.mesh.Trimesh.heat_operators]
     """
+    if cot_entries is not None and use_robust:
+        raise ValueError(
+            "cot_entries and use_robust are mutually exclusive: use_robust rebuilds the "
+            "half-cotangent table from mollified edge lengths."
+        )
     if t is None:
         # The unique-edge average, which is what ``igl::heat_geodesics`` uses for its timestep.
         h = mean_unique_edge_length(vertices, faces)
@@ -157,7 +177,7 @@ def heat_operators(
         # the *solves* robust rather than turning the whole method intrinsic.
         lengths, _ = mollify_intrinsic(vertices, faces)
         cot_entries = cotmatrix_entries_intrinsic(lengths)
-    else:
+    elif cot_entries is None:
         cot_entries = cotmatrix_entries(vertices, faces)
     # ``cotmatrix`` casts the shared float32 half-cotangent weights to float64 and assembles the
     # operator natively in a single build, avoiding a recast rebuild (see cotmatrix's kernel note).

@@ -25,12 +25,29 @@ only drops the geometric ones, ``with_faces`` drops everything; that distinction
 
 Properties chosen
 -----------------
-The five that are expensive for genuinely different reasons: ``warp_mesh`` (a BVH build),
+The six that are expensive for genuinely different reasons: ``warp_mesh`` (a BVH build),
 ``vertex_normals`` (an atomic scatter), ``face_adjacency`` (an edge sort plus manifold-pair
-grouping), ``boundary_loops`` (pointer-jumping list ranking plus per-loop host work) and
-``is_watertight`` (which composes an edge test with a self-intersection pass over a fresh BVH, and
-is by far the priciest). Timing all of them would just re-run the rest of the suite through a
-different door.
+grouping), ``boundary_loops`` (pointer-jumping list ranking plus per-loop host work),
+``is_watertight`` (which composes an edge test with a self-intersection pass over a fresh BVH) and
+``vector_heat_operators`` (three sparse assemblies, and the priciest of the lot). Timing all of them
+would just re-run the rest of the suite through a different door.
+
+Cold cost of every property, measured on ``icosphere(5)`` (20 480 faces) on an RTX 5090, minimum of
+five fresh instances, for the record this module exists to keep:
+
+| property | ms | property | ms |
+|---|---|---|---|
+| ``vector_heat_operators`` | **7.20** | ``cotmatrix`` | 0.655 |
+| ``is_watertight`` | 4.23 | ``vertex_one_rings`` | 0.587 |
+| ``heat_operators`` | 2.91 | ``halfedge_twins`` | 0.277 |
+| ``vertex_tangent_frames`` | 1.27 | ``warp_mesh`` | 0.248 |
+| ``laplacian_operator`` | 0.665 | ``mass_matrix_entries`` | 0.151 |
+| | | ``vertex_face_adjacency`` | 0.121 |
+| | | ``bounds`` | 0.089 |
+
+So the operator group at the bottom of the class is where the cache pays, and ``is_watertight`` is
+no longer the priciest property -- it was when it was written, and the two heat bundles arrived
+after it.
 
 References
 ----------
@@ -206,6 +223,35 @@ def test_is_watertight(bench_case: BenchCase, warm: bool) -> None:
         _time_trimesh_property(bench_case, "is_watertight", warm=warm, rounds=_ROUNDS)
         return
     _time_property(bench_case, "is_watertight", warm=warm, rounds=_ROUNDS)
+
+
+@pytest.mark.benchmark(group="mesh_vector_heat_operators")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+def test_vector_heat_operators(bench_case: BenchCase, warm: bool) -> None:
+    """
+    ``vector_heat_operators``: the priciest property, and the one three others are shared with.
+
+    Three sparse assemblies -- the connection Laplacian, the scalar heat bundle and the tangent
+    frames -- of which the last two are the class's own ``heat_operators`` and
+    ``vertex_tangent_frames``, so this cold row is also the cold cost of all three together. That
+    sharing is what the group is really about: a caller solving on one mesh through a ``Trimesh``
+    pays this once where a caller passing raw buffers to
+    [`transport_tangent_vectors`](../triwarp/heat/vector.py) et al. pays it per call.
+
+    On the **scale** axis rather than the scan sweep, for a correctness reason and not a cost one:
+    the tangent frames are a rotation about each vertex, so this whole property raises on an
+    edge-non-manifold mesh -- ``bunny_decimated``'s 150 three-faced edges, measured -- and the
+    scan registry is exactly the set of meshes that have them. That is the same restriction
+    ``benchmarks/test_tangent_space.py`` and ``vector_heat_scale`` already run under.
+
+    triwarp-only. ``potpourri3d.MeshVectorHeatSolver`` is the stateful analogue and would make a
+    fair cold row, but it is a *different* set of operators (it retriangulates to an intrinsic
+    Delaunay mesh by default), so pairing it here would need a parity entry the value comparison in
+    ``tests/test_heat_vector.py`` already owns under its own group name.
+    """
+    _time_property(bench_case, "vector_heat_operators", warm=warm, rounds=_ROUNDS)
 
 
 @pytest.mark.benchmark(group="mesh_invalidation")

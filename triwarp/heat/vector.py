@@ -63,7 +63,12 @@ heat system, the scalar [`heat_operators`][triwarp.heat.distance.heat_operators]
 
 
 def vector_heat_operators(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], t: float | None = None
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    t: float | None = None,
+    *,
+    scalar_operators: HeatOperators | None = None,
+    frames: tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]] | None = None,
 ) -> VectorHeatOperators:
     """
     Assemble everything the vector-valued solvers need before their solves.
@@ -90,6 +95,17 @@ def vector_heat_operators(
     t
         Diffusion time for both the vector and the scalar systems. When ``None``, defaults to the
         squared mean edge length.
+    scalar_operators
+        Optional prebuilt [`heat_operators`][triwarp.heat.distance.heat_operators] bundle to place
+        in the second field instead of assembling one. **Must have been built at the same ``t``**,
+        which nothing here can check: it is the caller's half of the shared-timestep contract the
+        Notes below describe. [`Trimesh.heat_operators`][triwarp.mesh.Trimesh.heat_operators]
+        caches one at this function's own default.
+    frames
+        Optional prebuilt [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames] as
+        ``(basis_x, basis_y, normal)`` -- the gauge, which depends on the mesh alone and not on
+        ``t``. [`Trimesh.vertex_tangent_frames`][triwarp.mesh.Trimesh.vertex_tangent_frames] caches
+        it.
 
     Returns
     -------
@@ -100,11 +116,19 @@ def vector_heat_operators(
     frames : tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]]
         ``(basis_x, basis_y, normal)`` per vertex.
 
+    Notes
+    -----
+    The vector and scalar systems must share ``t``: [`log_map`][triwarp.heat.vector.log_map]'s
+    radius is asserted to *be* the [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] distance,
+    so two diffusion times would split a quantity that is supposed to be one number. That is why
+    ``scalar_operators`` is the one argument here that cannot be validated.
+
     See Also
     --------
     [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
     [`log_map`][triwarp.heat.vector.log_map]
     [`heat_signed_distance`][triwarp.heat.signed.heat_signed_distance]
+    [`Trimesh.vector_heat_operators`][triwarp.mesh.Trimesh.vector_heat_operators]
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -123,7 +147,11 @@ def vector_heat_operators(
     vector_system = wps.bsr_axpy(
         x=connection, y=wps.bsr_diag(diag=mass_blocks), alpha=float(t), beta=1.0
     )
-    return vector_system, heat_operators(vertices, faces, t), vertex_tangent_frames(vertices, faces)
+    if scalar_operators is None:
+        scalar_operators = heat_operators(vertices, faces, t)
+    if frames is None:
+        frames = vertex_tangent_frames(vertices, faces)
+    return vector_system, scalar_operators, frames
 
 
 def extend_scalar(

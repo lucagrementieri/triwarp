@@ -418,6 +418,7 @@ def shorten_loop(
     max_iter: int = 100,
     tolerance: float = 0.0,
     twins: wp.array[wp.int32] | None = None,
+    rings: tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.bool]] | None = None,
 ) -> tuple[list[wp.array[wp.int32]], int]:
     """
     Shorten closed edge loops within their homotopy class, keeping them on mesh edges.
@@ -470,6 +471,12 @@ def shorten_loop(
         to stop the last few sweeps chasing float32 noise on a fine mesh.
     twins
         Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins].
+    rings
+        Optional precomputed [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] as
+        ``(offsets, ring_halfedges, is_boundary)``. Depends on the connectivity alone, so one CSR
+        serves every fan walk over the same mesh --
+        [`Trimesh.vertex_one_rings`][triwarp.mesh.Trimesh.vertex_one_rings] has it cached, and
+        passing it skips the vertex-manifold check and the host readback that check costs.
 
     Returns
     -------
@@ -504,8 +511,8 @@ def shorten_loop(
     n_vertices = int(vertices.shape[0])
     if twins is None:
         twins = halfedge_twins(faces, n_vertices=n_vertices)
-    ring_offsets, ring_halfedges, is_boundary = vertex_one_rings(
-        faces, twins=twins, n_vertices=n_vertices
+    ring_offsets, ring_halfedges, is_boundary = (
+        rings if rings is not None else vertex_one_rings(faces, twins=twins, n_vertices=n_vertices)
     )
 
     # ``copy=False``: each sweep reads ``packed`` and writes a freshly sized buffer, so the

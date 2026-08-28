@@ -119,7 +119,11 @@ def crease_edges(
 
 
 def cut_along_edges(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], edges: twt.Array2dInt32
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    edges: twt.Array2dInt32,
+    *,
+    twins: wp.array[wp.int32] | None = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
     Split the mesh along an edge set, duplicating vertices so the two sides no longer share them.
@@ -147,6 +151,12 @@ def cut_along_edges(
         ``(k, 2)`` vertex-index pairs to cut along, in either order per row. Rows that are not mesh
         edges are ignored, and boundary edges are already cuts so marking them changes nothing.
         Get a crease set from [`crease_edges`][triwarp.seams.crease_edges].
+    twins
+        Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins], length
+        ``3 * n_faces``. Depends on the connectivity alone, so a caller running several passes over
+        one topology builds it once -- and
+        [`Trimesh.halfedge_twins`][triwarp.mesh.Trimesh.halfedge_twins] has it cached. Passing it
+        also skips the edge-manifold check and the host readback that check costs.
 
     Returns
     -------
@@ -188,7 +198,8 @@ def cut_along_edges(
         return wp.clone(vertices), wp.clone(faces)
 
     n_vertices = int(vertices.shape[0])
-    twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
+    if twins is None:
+        twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
 
     # Marked edges as a sorted key set, so the kernel tests membership with a binary search rather
     # than a per-halfedge scan. Keys come from ``pack_edge_key``, the same builder the kernel uses,
@@ -242,6 +253,7 @@ def uv_seam_edges(
     match: Literal["index", "uv"] | None = None,
     tolerance: float = 0.0,
     n_vertices: int | None = None,
+    twins: wp.array[wp.int32] | None = None,
 ) -> tuple[twt.Array2dInt32, twt.Array2dInt32, twt.Array2dInt32]:
     """
     Classify every mesh edge as a UV seam, a boundary or a UV-space foldover.
@@ -281,6 +293,11 @@ def uv_seam_edges(
     n_vertices
         Total vertex count, used as the edge-pairing radix. When ``None`` it is inferred with
         [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
+    twins
+        Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins], length
+        ``3 * n_faces``. Depends on the connectivity alone, so one table serves this call and every
+        other halfedge walk over the same mesh --
+        [`Trimesh.halfedge_twins`][triwarp.mesh.Trimesh.halfedge_twins] has it cached.
 
     Returns
     -------
@@ -361,7 +378,8 @@ def uv_seam_edges(
         face_texcoords = tw.array.arange(3 * n_faces, device)
 
     n_halfedges = 3 * n_faces
-    twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
+    if twins is None:
+        twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
     is_seam = wp.empty(n_halfedges, dtype=wp.bool, device=device)
     is_boundary = wp.empty(n_halfedges, dtype=wp.bool, device=device)
     is_foldover = wp.empty(n_halfedges, dtype=wp.bool, device=device)

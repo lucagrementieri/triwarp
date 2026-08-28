@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 import pytest
 import trimesh as tm
@@ -10,8 +12,44 @@ import warp as wp
 import triwarp as tw
 from tests.comparisons import assert_same_loop_set, lexsort_rows, trimesh_outline_loops
 from tests.conftest import CLOSED_MESHES, MESHES, OPEN_MESHES
-from tests.conversions import points_to_warp
+from tests.conversions import points_to_warp, points_to_warp_uv
 from triwarp.mesh import _TOPOLOGY_KEYS
+
+
+def _bsr_arrays(matrix: object) -> list[np.ndarray]:
+    """
+    Return a BSR matrix as ``[offsets, columns, values]``, sliced to its *true* entry count.
+
+    ``matrix.nnz`` is a stale capacity after a duplicate-emitting triplet build -- ``cotmatrix``
+    emits 12 triplets per face -- so everything past ``nnz_sync()`` is uninitialized memory and
+    comparing it reports a difference that is not there.
+    """
+    n_entries = int(matrix.nnz_sync())
+    return [
+        matrix.offsets.numpy(),
+        matrix.columns.numpy()[:n_entries],
+        matrix.values.numpy()[:n_entries],
+    ]
+
+
+def _comparable_arrays(value: object) -> list[np.ndarray]:
+    """
+    Return whatever a wrapper produced flattened into the arrays a comparison can walk.
+
+    Handles the four return shapes the calls below produce -- an array, a BSR matrix, a nested
+    tuple of either, and a scalar -- and yields nothing for a ``LinearOperator``, whose state is
+    the matrix it wraps and is compared through that matrix instead.
+    """
+    if isinstance(value, wp.array):
+        return [value.numpy()]
+    if hasattr(value, "nnz_sync"):
+        return _bsr_arrays(value)
+    if isinstance(value, tuple | list):
+        return [array for item in value for array in _comparable_arrays(item)]
+    if isinstance(value, bool | int | float):
+        return [np.asarray(float(value))]
+    return []
+
 
 # ---------------------------------------------------------------------------
 # construction
@@ -102,6 +140,26 @@ def test_geometry_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str
     assert np.allclose(mesh.vertex_defects.numpy(), mesh_tm.vertex_defects, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_bounds_and_diagonal_match_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: ``bounds`` is trimesh's ``bounds`` and ``enclosing_diagonal`` is its ``scale``.
+
+    ``Trimesh.scale`` is documented as an order-of-magnitude figure but is exactly the diagonal of
+    the axis-aligned box (measured equal to ``norm(bounds[1] - bounds[0])`` to 16 digits), which is
+    what makes this an equality and not a bound. The pairing is worth pinning because this property
+    derives the diagonal from the cached box on the host instead of reducing again, so a wrong
+    corner convention would show up here and nowhere else.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    lower, upper = mesh.bounds
+
+    assert np.allclose(np.array([list(lower), list(upper)]), mesh_tm.bounds, rtol=1e-5, atol=1e-5)
+    assert np.allclose(mesh.enclosing_diagonal, mesh_tm.scale, rtol=1e-5, atol=1e-5)
+    assert mesh.enclosing_diagonal > 0.0  # non-vacuity: no fixture is a single point
+
+
 # ---------------------------------------------------------------------------
 # edges / adjacency vs trimesh
 # ---------------------------------------------------------------------------
@@ -162,6 +220,103 @@ def test_face_adjacency_matches_trimesh(request: pytest.FixtureRequest, mesh_nam
     adjacency_wp = mesh.face_adjacency.numpy()
     adjacency_tm = tm.graph.face_adjacency(mesh=mesh_tm)
     assert np.array_equal(lexsort_rows(adjacency_wp), lexsort_rows(np.sort(adjacency_tm, axis=1)))
+
+
+# ---------------------------------------------------------------------------
+# halfedge connectivity, incidence and the discrete operators
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_vertex_face_adjacency_matches_trimesh(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B on ``vertex_face_adjacency``: row *sets*, after two named transforms.
+
+    trimesh returns a dense ``(n_vertices, max_degree)`` array right-padded with ``-1`` where
+    triwarp returns a CSR pair, and neither orders a row -- triwarp's counting sort fills each row
+    through an atomic cursor, so the order differs between two calls on the same mesh. The set is
+    the whole claim, and it is the one the free function's docstring makes ("each row is a set, not
+    a rotation").
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    offsets_np, faces_np = (array.numpy() for array in mesh.vertex_face_adjacency)
+
+    padded_tm = mesh_tm.vertex_faces
+    assert padded_tm.shape[0] == mesh.n_vertices
+    for vertex in range(mesh.n_vertices):
+        row = faces_np[offsets_np[vertex] : offsets_np[vertex + 1]]
+        row_tm = padded_tm[vertex][padded_tm[vertex] >= 0]
+        assert np.array_equal(np.sort(row), np.sort(row_tm))
+
+
+def test_halfedge_properties_match_the_free_functions(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Triwarp against triwarp: the facade against ``triwarp.halfedge``, which carries the oracle.
+
+    No reference library exposes a halfedge structure (``tests/test_halfedge.py`` is invariant-only
+    for that reason), so what is testable here is that the properties are the free functions'
+    answers and that the class's ``n_vertices`` shortcut -- which replaces the inferred vertex
+    count both functions would otherwise read back -- does not change them.
+    """
+    _mesh_tm, mesh_wp = icosphere_coarse
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    faces_wp = mesh.faces
+
+    assert np.array_equal(mesh.halfedge_twins.numpy(), tw.halfedge.halfedge_twins(faces_wp).numpy())
+    rings_free = tw.halfedge.vertex_one_rings(faces_wp)
+    for cached, free in zip(mesh.vertex_one_rings, rings_free, strict=True):
+        assert np.array_equal(cached.numpy(), free.numpy())
+
+
+def test_operator_properties_match_the_free_functions(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Triwarp against triwarp: the operator group against the functions that assemble it.
+
+    Each of these is compared with a reference elsewhere -- ``cotmatrix`` and the mass diagonal
+    against igl in ``tests/test_laplacian.py``, ``laplacian_operator`` against trimesh in
+    ``tests/test_smoothing.py``, the frames and both heat bundles against potpourri3d in
+    ``tests/test_tangent.py`` and ``tests/test_heat_*.py``. So the free functions carry the oracle
+    and what is left to pin here is that the properties feed them the same mesh, including the
+    cached by-products they are built from (``cotmatrix`` from ``cotmatrix_entries``, the mass
+    diagonal from ``face_areas``).
+    """
+    _mesh_tm, mesh_wp = icosphere_coarse
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    vertices_wp, faces_wp = mesh.vertices, mesh.faces
+
+    assert np.allclose(
+        mesh.cotmatrix_entries.numpy(),
+        tw.laplacian.cotmatrix_entries(vertices_wp, faces_wp).numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert np.allclose(
+        mesh.mass_matrix_entries.numpy(),
+        tw.laplacian.mass_matrix_entries(vertices_wp, faces_wp).numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    for cached_matrix, free_matrix in (
+        (mesh.cotmatrix, tw.laplacian.cotmatrix(vertices_wp, faces_wp)),
+        (mesh.laplacian_operator, tw.laplacian.laplacian(vertices_wp, faces_wp)),
+    ):
+        for cached_np, free_np in zip(
+            _bsr_arrays(cached_matrix), _bsr_arrays(free_matrix), strict=True
+        ):
+            assert np.allclose(cached_np, free_np, rtol=1e-5, atol=1e-5)
+
+    frames_free = tw.tangent_space.vertex_tangent_frames(vertices_wp, faces_wp)
+    for cached, free in zip(mesh.vertex_tangent_frames, frames_free, strict=True):
+        assert np.allclose(cached.numpy(), free.numpy(), rtol=1e-5, atol=1e-5)
+    # The gauge is the normal's, so its third field is the class's own vertex normals verbatim.
+    assert mesh.vertex_tangent_frames[2] is mesh.vertex_normals
 
 
 # ---------------------------------------------------------------------------
@@ -457,3 +612,298 @@ def test_warp_mesh_supports_ray_queries(icosahedron: tuple[tm.Trimesh, wp.Mesh])
     hits_ref = tw.ray.intersects_any(mesh_wp, origins, directions)
     hits = tw.ray.intersects_any(mesh.warp_mesh, origins, directions)
     assert np.array_equal(hits.numpy(), hits_ref.numpy())
+
+
+# ---------------------------------------------------------------------------
+# precomputed arguments: the cache feeding the free functions
+# ---------------------------------------------------------------------------
+
+
+# Every cached property that reads vertex *positions* and so must not survive ``with_vertices``.
+# The topology-only half is ``_TOPOLOGY_KEYS`` and is covered by the parametrized test above; this
+# is the other side of the same rule, and it exists because the operator group below is the easiest
+# place to get it wrong -- an operator is assembled from the connectivity *and* the geometry.
+_GEOMETRY_KEYS = (
+    "bounds",
+    "enclosing_diagonal",
+    "cotmatrix_entries",
+    "cotmatrix",
+    "mass_matrix_entries",
+    "laplacian_operator",
+    "vertex_tangent_frames",
+    "heat_operators",
+    "vector_heat_operators",
+)
+
+
+@pytest.mark.parametrize("key", _GEOMETRY_KEYS)
+def test_with_vertices_drops_every_position_dependent_cache(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], key: str
+) -> None:
+    """Each position-dependent cached property is dropped by ``with_vertices``, not carried."""
+    _mesh_tm, mesh_wp = icosphere_coarse
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    assert getattr(mesh, key) is not None
+    assert key in mesh._cache
+
+    translated_np = mesh.vertices.numpy() + np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    moved = mesh.with_vertices(points_to_warp(translated_np, mesh.device))
+    assert key not in moved._cache
+
+
+@pytest.mark.parametrize(
+    ("name", "dependencies"),
+    [
+        ("enclosing_diagonal", ("bounds",)),
+        ("vertex_one_rings", ("halfedge_twins",)),
+        ("cotmatrix", ("cotmatrix_entries",)),
+        ("mass_matrix_entries", ("face_areas",)),
+        ("vertex_tangent_frames", ("vertex_normals", "vertex_one_rings", "halfedge_twins")),
+        ("heat_operators", ("cotmatrix_entries",)),
+        ("vector_heat_operators", ("heat_operators", "vertex_tangent_frames")),
+    ],
+)
+def test_cached_property_reuses_its_dependencies(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], name: str, dependencies: tuple[str, ...]
+) -> None:
+    """
+    A composed property is assembled *through* the cache, so its parts land in it too.
+
+    Not a parity assert: it is the class's own contract. It is worth a test rather than a comment
+    because each of these properties would compute the identical answer while rebuilding its parts
+    privately, and nothing about the returned value would show the difference -- only the cache
+    does.
+    """
+    _mesh_tm, mesh_wp = icosphere_coarse
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    assert getattr(mesh, name) is not None
+    for dependency in dependencies:
+        assert dependency in mesh._cache, f"{name} rebuilt {dependency} instead of caching it"
+
+
+def test_vector_heat_operators_shares_its_two_sub_bundles(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    The vector bundle's last two fields *are* the sibling properties, not equal copies.
+
+    Identity rather than equality is the claim: the three properties must be one assembly however
+    they are reached, since ``log_map``'s radius is asserted to be the ``heat_geodesic`` distance
+    and two bundles at two diffusion times would split that into two numbers.
+    """
+    _mesh_tm, mesh_wp = icosphere_coarse
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    vector_system, scalar, frames = mesh.vector_heat_operators
+
+    assert scalar is mesh.heat_operators
+    assert frames is mesh.vertex_tangent_frames
+    assert int(vector_system.nrow) == mesh.n_vertices
+
+
+# One id per entry of the table below, module-level so the parametrization is visible without
+# building a mesh; the test asserts the two stay in step.
+_PRECOMPUTED_ARGUMENT_IDS = (
+    "seams.cut_along_edges(twins=)",
+    "seams.uv_seam_edges(twins=)",
+    "repair.flatten_degree3_vertices(rings=)",
+    "energies.hessian_energy(vertex_faces=)",
+    "smoothing.equalize_triangle_areas(vertex_faces=)",
+    "smoothing.smooth_region_boundary(vertex_faces=)",
+    "smoothing.filter_normals(face_normals=)",
+    "smoothing.filter_mut_dif_laplacian(face_normals=)",
+    "laplacian.mass_matrix_entries(face_areas=)",
+    "laplacian.mass_matrix(face_areas=)",
+    "triangles.corner_normals(face_normals=)",
+    "curvature.principal_curvature(face_normals=)",
+    "validation.face_defective_mask(face_normals=)",
+    "proximity.normals_at_closest_faces(face_normals=)",
+    "heat.distance.heat_operators(cot_entries=)",
+    "heat.vector.vector_heat_operators(scalar_operators=)",
+)
+
+
+def _precomputed_argument_cases(
+    mesh: tw.Trimesh,
+) -> dict[str, tuple[Callable[[], object], Callable[[], object]]]:
+    """
+    ``id -> (rebuild-it-yourself call, fed-from-the-cache call)`` per precomputed argument.
+
+    One table here rather than a pin in each wrapper's own test file, because the claim is about the
+    *pairing* -- that a given cached property is the right thing to hand a given keyword -- and not
+    about any wrapper's behaviour, which its own module's tests cover. A wrong pairing is otherwise
+    silent: every one of these arguments is a buffer of the right shape and dtype whichever mesh
+    quantity it came from.
+    """
+    vertices_wp, faces_wp = mesh.vertices, mesh.faces
+    device = mesh.device
+    creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=0.0)
+    corner_uv_np = mesh.vertices.numpy()[faces_wp.numpy()][:, :2]
+    texcoords_wp = points_to_warp_uv(corner_uv_np, str(device))
+    centroids_np = tw.triangles.face_centroids(vertices_wp, faces_wp).numpy()
+    region_wp = wp.array(centroids_np[:, 2] > 0.0, dtype=wp.bool, device=device)
+    queries_wp = points_to_warp(
+        np.array([[0.4, 0.4, 0.4], [1.5, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32), str(device)
+    )
+
+    return {
+        "seams.cut_along_edges(twins=)": (
+            lambda: tw.seams.cut_along_edges(vertices_wp, faces_wp, creases_wp),
+            lambda: tw.seams.cut_along_edges(
+                vertices_wp, faces_wp, creases_wp, twins=mesh.halfedge_twins
+            ),
+        ),
+        "seams.uv_seam_edges(twins=)": (
+            lambda: tw.seams.uv_seam_edges(faces_wp, texcoords_wp),
+            lambda: tw.seams.uv_seam_edges(faces_wp, texcoords_wp, twins=mesh.halfedge_twins),
+        ),
+        "repair.flatten_degree3_vertices(rings=)": (
+            lambda: tw.repair.flatten_degree3_vertices(vertices_wp, faces_wp),
+            lambda: tw.repair.flatten_degree3_vertices(
+                vertices_wp, faces_wp, rings=mesh.vertex_one_rings
+            ),
+        ),
+        "energies.hessian_energy(vertex_faces=)": (
+            lambda: tw.energies.hessian_energy(vertices_wp, faces_wp),
+            lambda: tw.energies.hessian_energy(
+                vertices_wp, faces_wp, vertex_faces=mesh.vertex_face_adjacency
+            ),
+        ),
+        "smoothing.equalize_triangle_areas(vertex_faces=)": (
+            lambda: tw.smoothing.equalize_triangle_areas(vertices_wp, faces_wp, iterations=2),
+            lambda: tw.smoothing.equalize_triangle_areas(
+                vertices_wp, faces_wp, iterations=2, vertex_faces=mesh.vertex_face_adjacency
+            ),
+        ),
+        "smoothing.smooth_region_boundary(vertex_faces=)": (
+            lambda: tw.smoothing.smooth_region_boundary(vertices_wp, faces_wp, region_wp),
+            lambda: tw.smoothing.smooth_region_boundary(
+                vertices_wp, faces_wp, region_wp, vertex_faces=mesh.vertex_face_adjacency
+            ),
+        ),
+        "smoothing.filter_normals(face_normals=)": (
+            lambda: tw.smoothing.filter_normals(vertices_wp, faces_wp, iterations=3),
+            lambda: tw.smoothing.filter_normals(
+                vertices_wp,
+                faces_wp,
+                iterations=3,
+                face_normals=mesh.face_normals,
+                face_areas=mesh.face_areas,
+            ),
+        ),
+        "smoothing.filter_mut_dif_laplacian(face_normals=)": (
+            lambda: tw.smoothing.filter_mut_dif_laplacian(vertices_wp, faces_wp, iterations=2),
+            lambda: tw.smoothing.filter_mut_dif_laplacian(
+                vertices_wp,
+                faces_wp,
+                iterations=2,
+                face_normals=mesh.face_normals,
+                face_areas=mesh.face_areas,
+            ),
+        ),
+        "laplacian.mass_matrix_entries(face_areas=)": (
+            lambda: tw.laplacian.mass_matrix_entries(vertices_wp, faces_wp),
+            lambda: tw.laplacian.mass_matrix_entries(
+                vertices_wp, faces_wp, face_areas=mesh.face_areas
+            ),
+        ),
+        "laplacian.mass_matrix(face_areas=)": (
+            lambda: tw.laplacian.mass_matrix(vertices_wp, faces_wp),
+            lambda: tw.laplacian.mass_matrix(vertices_wp, faces_wp, face_areas=mesh.face_areas),
+        ),
+        "triangles.corner_normals(face_normals=)": (
+            lambda: tw.triangles.corner_normals(
+                vertices_wp, faces_wp, creases_wp, weighting="area"
+            ),
+            lambda: tw.triangles.corner_normals(
+                vertices_wp,
+                faces_wp,
+                creases_wp,
+                weighting="area",
+                twins=mesh.halfedge_twins,
+                face_normals=mesh.face_normals,
+                face_areas=mesh.face_areas,
+            ),
+        ),
+        # ``[2:]`` keeps the two curvature *magnitudes* and drops the two directions, which are a
+        # gauge on this fixture rather than an answer: every vertex of a sphere is umbilic, so any
+        # tangent direction is principal and two identical calls disagree by up to 1.618 (measured)
+        # while the magnitudes agree to 3.6e-07.
+        "curvature.principal_curvature(face_normals=)": (
+            lambda: tw.curvature.principal_curvature(vertices_wp, faces_wp, radius=2)[2:],
+            lambda: tw.curvature.principal_curvature(
+                vertices_wp,
+                faces_wp,
+                radius=2,
+                face_normals=mesh.face_normals,
+                face_areas=mesh.face_areas,
+            )[2:],
+        ),
+        "validation.face_defective_mask(face_normals=)": (
+            lambda: tw.validation.face_defective_mask(
+                vertices_wp, faces_wp, max_normal_angle=60.0, max_fold_angle=160.0
+            ),
+            lambda: tw.validation.face_defective_mask(
+                vertices_wp,
+                faces_wp,
+                max_normal_angle=60.0,
+                max_fold_angle=160.0,
+                face_normals=mesh.face_normals,
+            ),
+        ),
+        "proximity.normals_at_closest_faces(face_normals=)": (
+            lambda: tw.proximity.normals_at_closest_faces(mesh.warp_mesh, queries_wp),
+            lambda: tw.proximity.normals_at_closest_faces(
+                mesh.warp_mesh, queries_wp, face_normals=mesh.face_normals
+            ),
+        ),
+        "heat.distance.heat_operators(cot_entries=)": (
+            lambda: tw.heat.distance.heat_operators(vertices_wp, faces_wp),
+            lambda: tw.heat.distance.heat_operators(
+                vertices_wp, faces_wp, cot_entries=mesh.cotmatrix_entries
+            ),
+        ),
+        "heat.vector.vector_heat_operators(scalar_operators=)": (
+            lambda: tw.heat.vector.vector_heat_operators(vertices_wp, faces_wp),
+            lambda: tw.heat.vector.vector_heat_operators(
+                vertices_wp,
+                faces_wp,
+                scalar_operators=mesh.heat_operators,
+                frames=mesh.vertex_tangent_frames,
+            ),
+        ),
+    }
+
+
+@pytest.mark.parametrize("name", _PRECOMPUTED_ARGUMENT_IDS)
+def test_a_precomputed_argument_does_not_change_the_answer(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], name: str
+) -> None:
+    """
+    Every keyword added for the cache returns what the wrapper would have computed itself.
+
+    Not a parity assert: triwarp against triwarp, and the *recomputing* call is the one every
+    reference comparison in the suite already runs, so it carries the oracle. What this closes is
+    the failure mode a precomputed argument introduces and nothing else can see -- the wrapper
+    trusting a buffer that is the right shape and the wrong quantity.
+
+    Tolerant rather than exact on the float rows because two of the quantities involved are built
+    by atomic scatters (the lumped mass, the vertex normals) and one runs a CG solve, so bit
+    equality is not a property of the *unchanged* code either.
+    """
+    _mesh_tm, mesh_wp = icosphere_coarse
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    cases = _precomputed_argument_cases(mesh)
+    # The ids are a module-level tuple so a case added to the table without one (or the reverse)
+    # fails here rather than silently going untested.
+    assert set(cases) == set(_PRECOMPUTED_ARGUMENT_IDS)
+    rebuild, from_cache = cases[name]
+
+    rebuilt = _comparable_arrays(rebuild())
+    cached = _comparable_arrays(from_cache())
+    assert rebuilt, f"{name}: nothing comparable came back"
+    assert len(rebuilt) == len(cached), name
+    for left, right in zip(rebuilt, cached, strict=True):
+        if left.dtype.kind == "f":
+            assert np.allclose(left, right, rtol=1e-5, atol=1e-5), name
+        else:
+            assert np.array_equal(left, right), name
