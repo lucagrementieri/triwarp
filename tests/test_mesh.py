@@ -11,15 +11,17 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import (
+    SET_VALUED_CACHE_KEYS,
     assert_same_loop_set,
     bsr_arrays,
     comparable_arrays,
+    csr_row_sets,
     lexsort_rows,
     trimesh_outline_loops,
 )
-from tests.conftest import CLOSED_MESHES, MESHES, OPEN_MESHES
-from tests.conversions import points_to_warp, points_to_warp_uv
-from triwarp.mesh import _TOPOLOGY_KEYS
+from tests.conftest import CLOSED_MESHES, MESHES, OPEN_MESHES, populate_cache
+from tests.conversions import numpy_to_warp, points_to_warp, points_to_warp_uv
+from triwarp.mesh import _ORIENTATION_DEPENDENT_KEYS, _TOPOLOGY_KEYS
 
 # ---------------------------------------------------------------------------
 # construction
@@ -128,6 +130,288 @@ def test_bounds_and_diagonal_match_trimesh(request: pytest.FixtureRequest, mesh_
     assert np.allclose(np.array([list(lower), list(upper)]), mesh_tm.bounds, rtol=1e-5, atol=1e-5)
     assert np.allclose(mesh.enclosing_diagonal, mesh_tm.scale, rtol=1e-5, atol=1e-5)
     assert mesh.enclosing_diagonal > 0.0  # non-vacuity: no fixture is a single point
+
+
+@pytest.mark.parametrize("mesh_name", CLOSED_MESHES)
+def test_mass_properties_match_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: ``volume``, ``center_mass`` and ``moment_inertia`` against trimesh's.
+
+    Closed fixtures only, and that is the definition rather than convenience: all three integrate
+    tetrahedra from the origin to every face, which telescopes to an origin-independent answer only
+    for a closed surface. On an open mesh both libraries return an origin-dependent number, so
+    there would be nothing to compare.
+
+    Non-vacuity: the inertia tensor is asserted to have spread across its entries, so a
+    permutation or a wrong reference point could not pass on an isotropic answer.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+
+    assert mesh.volume == pytest.approx(mesh_tm.volume, rel=1e-5)
+    assert np.allclose(mesh.center_mass, mesh_tm.center_mass, rtol=1e-4, atol=1e-4)
+    inertia_wp = np.array(mesh.moment_inertia, dtype=np.float64).reshape(3, 3)
+    assert np.allclose(inertia_wp, mesh_tm.moment_inertia, rtol=1e-4, atol=1e-4)
+    assert np.ptp(inertia_wp) > 1e-3
+
+
+def test_mass_properties_share_by_product(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """Not a parity assert: ``center_mass`` and ``moment_inertia`` come from one call."""
+    _mesh_tm, mesh_wp = icosahedron
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    _ = mesh.center_mass
+    assert "moment_inertia" in mesh._cache
+
+    other = tw.Trimesh.from_warp_mesh(mesh_wp)
+    _ = other.moment_inertia
+    assert "center_mass" in other._cache
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_extents_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """Class A: ``extents`` against ``trimesh.Trimesh.extents``, the box's side lengths."""
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    assert np.allclose(mesh.extents, mesh_tm.extents, rtol=1e-5, atol=1e-5)
+    assert min(mesh.extents) > 0.0  # non-vacuity: no fixture is flat
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_triangles_center_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """Class A: ``triangles_center`` against ``trimesh.Trimesh.triangles_center``."""
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    assert np.allclose(
+        mesh.triangles_center.numpy(), mesh_tm.triangles_center, rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_body_count_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: ``body_count`` against ``trimesh.Trimesh.body_count``.
+
+    Every fixture is one body, so a second case with a genuinely disconnected mesh carries the
+    non-vacuity -- a property that returned a constant ``1`` would pass the parametrization alone.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    assert tw.Trimesh.from_warp_mesh(mesh_wp).body_count == mesh_tm.body_count
+
+
+def test_body_count_counts_disconnected_bodies(device: str) -> None:
+    """Class A: three disjoint spheres read as three bodies on both sides."""
+    parts = [tm.creation.icosphere(subdivisions=1) for _ in range(3)]
+    for index, part in enumerate(parts):
+        part.apply_translation([index * 10.0, 0.0, 0.0])
+    combined_tm = tm.util.concatenate(parts)
+    vertices_wp, faces_wp = numpy_to_warp(combined_tm.vertices, combined_tm.faces, device)
+
+    mesh = tw.Trimesh(vertices_wp, faces_wp)
+    assert mesh.body_count == 3
+    assert mesh.body_count == combined_tm.body_count
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_faces_unique_edges_indexes_edges_unique(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: ``faces_unique_edges`` against ``trimesh.Trimesh.faces_unique_edges``.
+
+    Both sides index their *own* ``edges_unique``, whose row order is each library's, so the
+    indices are not comparable directly -- the named transform is to resolve each side's indices
+    through its own table and compare the resulting edges, which is what the property means.
+    That makes this Class B on the indices and Class A on what they denote; the assert below is
+    the latter.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+
+    unique_wp = mesh.edges_unique.numpy()
+    resolved_wp = unique_wp[mesh.faces_unique_edges.numpy()]
+    resolved_tm = mesh_tm.edges_unique[mesh_tm.faces_unique_edges]
+    assert np.array_equal(np.sort(resolved_wp, axis=2), np.sort(resolved_tm, axis=2))
+    # ...and it is a view of the inverse, not a copy.
+    assert mesh.faces_unique_edges.ptr == mesh.edges_unique_inverse.ptr
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_face_adjacency_projections_and_convex_match_trimesh(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: the two remaining ``face_adjacency_*`` quantities against trimesh's.
+
+    Non-vacuity: ``face_adjacency_convex`` is asserted to contain both answers on at least one
+    fixture, since a property returning all-``True`` would otherwise pass on a convex mesh.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+
+    assert np.allclose(
+        mesh.face_adjacency_projections.numpy(),
+        mesh_tm.face_adjacency_projections,
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    assert np.array_equal(mesh.face_adjacency_convex.numpy(), mesh_tm.face_adjacency_convex)
+
+
+def test_face_adjacency_convex_is_not_constant(cave_cube: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """Class A: the non-convex fixture produces both answers, so the mask is not a constant."""
+    mesh_tm, mesh_wp = cave_cube
+    convex_wp = tw.Trimesh.from_warp_mesh(mesh_wp).face_adjacency_convex.numpy()
+    assert convex_wp.any()
+    assert not convex_wp.all()
+    assert np.array_equal(convex_wp, mesh_tm.face_adjacency_convex)
+
+
+# ---------------------------------------------------------------------------
+# queries and mesh-producing methods
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mesh_name", CLOSED_MESHES)
+def test_contains_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: ``contains`` against ``trimesh.Trimesh.contains`` on a grid spanning the mesh.
+
+    Non-vacuity: both answers are asserted to contain inside *and* outside points, so a method
+    returning a constant could not pass. Queries are drawn on a lattice over the bounding box
+    rather than at random, so the two libraries are never asked about a point on the surface,
+    where a parity ray is genuinely ambiguous and the answers may differ.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    lower, upper = mesh_tm.bounds
+    axes = [np.linspace(lo, hi, 7)[1:-1] + 1e-3 for lo, hi in zip(lower, upper, strict=True)]
+    grid_np = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+
+    inside_wp = mesh.contains(points_to_warp(grid_np, mesh.device)).numpy()
+    inside_tm = mesh_tm.contains(grid_np)
+    assert inside_wp.any()
+    assert not inside_wp.all()
+    assert np.array_equal(inside_wp, inside_tm)
+
+
+def test_contains_reuses_the_cached_bvh(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """Not a parity assert: the query goes through the cached BVH rather than building one."""
+    _mesh_tm, mesh_wp = icosahedron
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    _ = mesh.contains(points_to_warp(np.zeros((1, 3)), mesh.device))
+    assert mesh._cache["warp_mesh"] is mesh_wp
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_sample_lies_on_the_surface(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Not a library comparison: sampling is stochastic, so there is no answer to compare against.
+
+    Asserts what the sampler must satisfy instead -- every point lies on the face it reports, and
+    the reported faces span more than one triangle. The barycentric residual excludes the bug
+    class of a point/face index mismatch, which a distance-to-surface check alone would not: a
+    point sampled from face ``j`` and labelled ``i`` still lies on the surface.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    points_wp, face_index_wp = mesh.sample(512, seed=3)
+
+    points_np, faces_np = points_wp.numpy(), face_index_wp.numpy()
+    assert np.unique(faces_np).size > 1
+    assert faces_np.min() >= 0
+    assert faces_np.max() < mesh.n_faces
+    corners_np = mesh_tm.vertices[mesh_tm.faces[faces_np]]
+    # Distance from each sample to the plane of the face it claims: zero if the pairing is right.
+    normals_np = np.cross(corners_np[:, 1] - corners_np[:, 0], corners_np[:, 2] - corners_np[:, 0])
+    normals_np /= np.linalg.norm(normals_np, axis=1, keepdims=True)
+    offsets_np = np.einsum("ij,ij->i", points_np - corners_np[:, 0], normals_np)
+    assert np.abs(offsets_np).max() < 1e-4
+
+
+def test_sample_is_reproducible_under_a_seed(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Triwarp against triwarp: one seed gives one answer.
+
+    The oracle for the sampler's correctness is ``test_sample_lies_on_the_surface``; this pins
+    only that the seed is honoured, which that test cannot see.
+    """
+    _mesh_tm, mesh_wp = icosahedron
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    first, _ = mesh.sample(64, seed=11)
+    second, _ = mesh.sample(64, seed=11)
+    assert np.array_equal(first.numpy(), second.numpy())
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_submesh_matches_the_free_function(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Triwarp against triwarp: the mask and index forms of ``submesh`` agree with each other.
+
+    ``triwarp.selection`` carries the oracle for the extraction itself (``tests/test_selection.py``
+    compares it against trimesh); this pins the class's dtype dispatch, which is the only thing the
+    method adds and the only place a wrong branch would show.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    keep_np = np.zeros(mesh.n_faces, dtype=bool)
+    keep_np[::2] = True
+
+    by_mask = mesh.submesh(wp.array(keep_np, dtype=wp.bool, device=mesh.device))
+    by_index = mesh.submesh(
+        wp.array(np.flatnonzero(keep_np).astype(np.int32), dtype=wp.int32, device=mesh.device)
+    )
+    assert by_mask.n_faces == keep_np.sum()
+    assert np.array_equal(by_mask.vertices.numpy(), by_index.vertices.numpy())
+    assert np.array_equal(by_mask.faces.numpy(), by_index.faces.numpy())
+
+
+def test_submesh_bad_dtype_raises(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """Not a parity assert: the guard on a selector that is neither indices nor a mask."""
+    _mesh_tm, mesh_wp = icosahedron
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    with pytest.raises(TypeError, match=r"wp\.int32 or wp\.bool"):
+        mesh.submesh(wp.zeros(4, dtype=wp.float32, device=mesh.device))
+
+
+def test_split_and_add_round_trip(device: str) -> None:
+    """
+    Class A: three disjoint spheres split into three bodies, matching ``trimesh.Trimesh.split``.
+
+    Also pins the pair: ``__add__`` recombines them into a mesh with the original counts, which
+    is the round trip the two methods claim.
+    """
+    parts = [tm.creation.icosphere(subdivisions=1) for _ in range(3)]
+    for index, part in enumerate(parts):
+        part.apply_translation([index * 10.0, 0.0, 0.0])
+    combined_tm = tm.util.concatenate(parts)
+    vertices_wp, faces_wp = numpy_to_warp(combined_tm.vertices, combined_tm.faces, device)
+    mesh = tw.Trimesh(vertices_wp, faces_wp)
+
+    bodies = mesh.split()
+    assert len(bodies) == len(combined_tm.split(only_watertight=False)) == 3
+    assert sorted(body.n_faces for body in bodies) == sorted(
+        len(part.faces) for part in combined_tm.split(only_watertight=False)
+    )
+
+    rejoined = bodies[0] + bodies[1] + bodies[2]
+    assert rejoined.n_vertices == mesh.n_vertices
+    assert rejoined.n_faces == mesh.n_faces
+    assert rejoined.body_count == 3
+
+
+def test_copy_shares_nothing(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """Not a parity assert: ``copy`` breaks the aliasing every other method preserves."""
+    _mesh_tm, mesh_wp = icosahedron
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    _ = mesh.face_normals
+    duplicate = mesh.copy()
+
+    assert duplicate.vertices.ptr != mesh.vertices.ptr
+    assert duplicate.faces.ptr != mesh.faces.ptr
+    assert np.array_equal(duplicate.vertices.numpy(), mesh.vertices.numpy())
+    assert not duplicate._cache
+    # ...where `with_vertices` deliberately aliases the face buffer instead.
+    assert mesh.with_vertices(mesh.vertices).faces.ptr == mesh.faces.ptr
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +868,113 @@ def test_warp_mesh_supports_ray_queries(icosahedron: tuple[tm.Trimesh, wp.Mesh])
     assert np.array_equal(hits.numpy(), hits_ref.numpy())
 
 
+@pytest.mark.parity("reverse_winding", "trimesh")
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_invert_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: ``Trimesh.invert`` against ``trimesh.Trimesh.invert``, face buffer for face buffer.
+
+    Comparable elementwise rather than up to a rotation of each row because both reverse with
+    ``np.fliplr``'s convention -- ``(a, b, c) -> (c, b, a)``. Vertices must be untouched on both
+    sides, which is what separates this from a mirroring transform.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    inverted = mesh.invert()
+
+    flipped_tm = mesh_tm.copy()
+    flipped_tm.invert()
+    assert np.array_equal(inverted.faces.numpy().reshape(-1, 3), flipped_tm.faces)
+    assert np.array_equal(inverted.vertices.numpy(), mesh.vertices.numpy())
+    # non-vacuity: a no-op `invert` would pass the vertex assert and fail this one
+    assert not np.array_equal(inverted.faces.numpy(), mesh.faces.numpy())
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_invert_carried_cache_matches_recomputation(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Triwarp against triwarp: every entry ``invert`` carries equals recomputing it from scratch.
+
+    The same gate as ``test_carried_cache_matches_recomputation``, for the winding flip. The
+    oracle is the uncached ``tw.Trimesh(vertices, reversed_faces)``.
+
+    Non-vacuity: the carried set is asserted non-empty and to include the assembled ``cotmatrix``,
+    which is the one worth carrying; and the run spans a closed and an open mesh, because
+    ``laplacian_operator``, ``oriented_boundary_edges`` and ``boundary_loops`` survive a flip on a
+    closed mesh and fail on an open one.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp))
+    inverted = mesh.invert()
+
+    assert inverted._cache
+    assert "cotmatrix" in inverted._cache
+    reference = tw.Trimesh(inverted.vertices, inverted.faces)
+    for key, carried in inverted._cache.items():
+        if key in SET_VALUED_CACHE_KEYS:
+            assert csr_row_sets(carried) == csr_row_sets(getattr(reference, key)), (
+                f"invert carried a stale {key} on {mesh_name}"
+            )
+            continue
+        for got, expected in zip(
+            comparable_arrays(carried), comparable_arrays(getattr(reference, key)), strict=True
+        ):
+            assert np.allclose(got, expected, rtol=1e-4, atol=1e-4), (
+                f"invert carried a stale {key} on {mesh_name}"
+            )
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_invert_drops_the_orientation_dependent_caches(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """Not a parity assert: a flip costs the same caches a mirroring transform does."""
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp))
+    assert _ORIENTATION_DEPENDENT_KEYS & set(mesh._cache), "fixture did not populate them"
+    assert not (_ORIENTATION_DEPENDENT_KEYS & set(mesh.invert()._cache))
+
+
+def test_invert_negates_normals_and_volume(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A: the flip negates normals and volume, matching trimesh on both.
+
+    The normals are the carried-and-negated path rather than a recomputation, so this checks the
+    shortcut `invert` takes; ``volume`` is dropped and recomputed, and must come back negated.
+    """
+    mesh_tm, mesh_wp = icosphere
+    mesh = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp))
+    inverted = mesh.invert()
+
+    assert np.allclose(
+        inverted.face_normals.numpy(), -mesh.face_normals.numpy(), rtol=1e-5, atol=1e-5
+    )
+    assert np.allclose(
+        inverted.vertex_normals.numpy(), -mesh.vertex_normals.numpy(), rtol=1e-5, atol=1e-5
+    )
+    assert inverted.volume == pytest.approx(-mesh.volume, rel=1e-5)
+
+    flipped_tm = mesh_tm.copy()
+    flipped_tm.invert()
+    assert np.allclose(inverted.face_normals.numpy(), flipped_tm.face_normals, rtol=1e-5, atol=1e-5)
+    assert inverted.volume == pytest.approx(flipped_tm.volume, rel=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_invert_is_an_involution(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Not a library comparison: the property that defines the operation.
+
+    Excludes the bug class of a cyclic rotation standing in for a reversal, which would agree on
+    normals and volume and never return to the original face buffer.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    assert np.array_equal(mesh.invert().invert().faces.numpy(), mesh.faces.numpy())
+
+
 # ---------------------------------------------------------------------------
 # precomputed arguments: the cache feeding the free functions
 # ---------------------------------------------------------------------------
@@ -599,6 +990,13 @@ _GEOMETRY_KEYS = (
     "cotmatrix_entries",
     "cotmatrix",
     "mass_matrix_entries",
+    "volume",
+    "center_mass",
+    "moment_inertia",
+    "extents",
+    "triangles_center",
+    "face_adjacency_projections",
+    "face_adjacency_convex",
     # `laplacian_operator` is deliberately absent: it weights every 1-ring neighbour equally, so it
     # reads `faces` and never the positions -- measured bit-identical across a *scrambled* vertex
     # buffer on a closed and an open mesh. It lives in `_TOPOLOGY_KEYS`, and the parametrization

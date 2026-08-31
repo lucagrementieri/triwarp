@@ -8,8 +8,8 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import comparable_arrays
-from tests.conftest import MESHES
+from tests.comparisons import SET_VALUED_CACHE_KEYS, comparable_arrays, csr_row_sets
+from tests.conftest import MESHES, OPEN_MESHES, populate_cache
 from tests.conversions import (
     numpy_to_warp,
     points_to_open3d,
@@ -17,7 +17,7 @@ from tests.conversions import (
     trimesh_to_pyvista,
     warp_to_trimesh,
 )
-from triwarp.mesh import _ORIENTATION_DEPENDENT_KEYS, _TRANSFORM_CARRY
+from triwarp.mesh import _ORIENTATION_DEPENDENT_KEYS
 from triwarp.transform import TransformKind
 
 # One representative matrix per class, reused across the classification and cache tests. The
@@ -367,33 +367,6 @@ def test_classify_transform_projective_matrix_is_singular() -> None:
 # ---------------------------------------------------------------------------
 
 
-# `vertex_face_adjacency` is documented as a CSR of *sets*, and its row order is nondeterministic
-# (the scatter that fills it races), so it differs run to run on one mesh and an elementwise
-# comparison reports a difference that is not there. Compared as sets instead.
-_SET_VALUED_KEYS = frozenset({"vertex_face_adjacency"})
-
-
-def _csr_row_sets(csr: tuple[wp.array, wp.array]) -> list[frozenset[int]]:
-    """Per-row index sets of a ``(values, offsets)`` CSR pair."""
-    values, offsets = csr
-    flat, bounds = values.numpy(), offsets.numpy()
-    return [frozenset(flat[bounds[i] : bounds[i + 1]].tolist()) for i in range(len(bounds) - 1)]
-
-
-def _populate(mesh: tw.Trimesh) -> tw.Trimesh:
-    """Force every cached property that the fixture meshes support."""
-    for key in (
-        _TRANSFORM_CARRY["translation"]
-        | _ORIENTATION_DEPENDENT_KEYS
-        | {"bounds", "centroid", "face_normals", "vertex_normals"}
-    ):
-        try:
-            getattr(mesh, key)
-        except (ValueError, RuntimeError):
-            pass
-    return mesh
-
-
 @pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parametrize(("kind", "matrix"), TRANSFORMS[1:], ids=[k for k, _ in TRANSFORMS[1:]])
 def test_carried_cache_matches_recomputation(
@@ -413,7 +386,7 @@ def test_carried_cache_matches_recomputation(
     closed-only fixture would pass while carrying wrong values.
     """
     _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    mesh = _populate(tw.Trimesh.from_warp_mesh(mesh_wp))
+    mesh = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp))
     moved = mesh.transform(matrix)
 
     assert moved is not mesh
@@ -423,8 +396,8 @@ def test_carried_cache_matches_recomputation(
     for key, carried in moved._cache.items():
         if key == "warp_mesh":
             continue
-        if key in _SET_VALUED_KEYS:
-            assert _csr_row_sets(carried) == _csr_row_sets(getattr(reference, key)), (
+        if key in SET_VALUED_CACHE_KEYS:
+            assert csr_row_sets(carried) == csr_row_sets(getattr(reference, key)), (
                 f"{kind} carried a stale {key} on {mesh_name}"
             )
             continue
@@ -455,6 +428,61 @@ def test_transform_carries_the_expensive_operators_through_a_rigid_motion(
     assert moved.face_angles is angles
 
 
+def test_adjacency_projections_and_convex_stay_consistent(
+    cave_cube: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a parity assert: the two adjacency quantities never contradict each other.
+
+    ``face_adjacency_convex`` is exactly ``face_adjacency_projections <= TOLERANCE_MERGE``, and
+    neither is
+    carried -- the mask because a rotation's ~1e-7 flips it on a coplanar pair, the projection so
+    it cannot be left holding a value the recomputed mask disagrees with. On ``cave_cube``, whose
+    box faces are coplanar, that pairing is what a stratum holding only one of them would break.
+    """
+    _mesh_tm, mesh_wp = cave_cube
+    mesh = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp))
+    moved = mesh.transform(_ROTATION)
+    assert "face_adjacency_projections" not in moved._cache
+    assert "face_adjacency_convex" not in moved._cache
+
+    projections = moved.face_adjacency_projections.numpy()
+    convex = moved.face_adjacency_convex.numpy()
+    assert np.array_equal(convex, projections <= tw.constants.TOLERANCE_MERGE)
+    assert convex.any()  # non-vacuity: this fixture is not convex everywhere
+    assert not convex.all()
+    # ...and the pairs that make the mask unsafe to carry are inside that band: this rotation
+    # puts two coplanar pairs at 1.9e-09 and 6.5e-09, where a different one would put them past
+    # 1e-8 and flip the answer.
+    assert (np.abs(projections) < tw.constants.TOLERANCE_MERGE).any()
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parametrize("key", ["volume", "center_mass", "moment_inertia"])
+def test_mass_properties_are_never_carried(
+    request: pytest.FixtureRequest, mesh_name: str, key: str
+) -> None:
+    """
+    Not a parity assert: the mass properties are dropped even by a translation, and must be.
+
+    All three integrate tetrahedra from the origin, which telescopes to an origin-independent
+    answer only on a **closed** surface. On an open mesh a translation changes them -- measured
+    2.3e-01 on ``volume`` and 8.7e-01 on ``moment_inertia`` for a hemisphere moved by
+    (1.5, -2, 0.5) -- so no stratum may hold them. Asserting the drop *and* the disagreement keeps
+    this from reading as arbitrary conservatism.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp))
+    assert key in mesh._cache
+
+    moved = mesh.transform(tw.transform.translation_matrix((1.5, -2.0, 0.5)))
+    assert key not in moved._cache
+
+    before = np.array(getattr(mesh, key), dtype=np.float64).ravel()
+    after = np.array(getattr(moved, key), dtype=np.float64).ravel()
+    assert not np.allclose(before, after, rtol=1e-3, atol=1e-3)
+
+
 def test_transform_identity_returns_self(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """Not a parity assert: the identity short-circuit does no work at all."""
     _mesh_tm, mesh_wp = icosphere
@@ -472,7 +500,7 @@ def test_transform_mirror_drops_the_orientation_dependent_caches(
     them wrongly and no value comparison notices.
     """
     _mesh_tm, mesh_wp = hemisphere
-    mesh = _populate(tw.Trimesh.from_warp_mesh(mesh_wp))
+    mesh = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp))
     carried_before = set(mesh._cache)
     assert _ORIENTATION_DEPENDENT_KEYS & carried_before, "fixture did not populate the keys tested"
 
@@ -488,7 +516,7 @@ def test_transform_singular_carries_topology_only(icosphere: tuple[tm.Trimesh, w
     makes every face degenerate, so carrying it would report a flattened mesh as sound.
     """
     _mesh_tm, mesh_wp = icosphere
-    mesh = _populate(tw.Trimesh.from_warp_mesh(mesh_wp))
+    mesh = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp))
     assert "nondegenerate_faces" in mesh._cache
     assert mesh.nondegenerate_faces.numpy().all()
     # Rank *one*, not rank two: projecting a sphere onto a plane leaves most faces with area, so
@@ -506,8 +534,10 @@ def test_transform_assume_skips_classification(icosphere: tuple[tm.Trimesh, wp.M
     property that can be checked -- an incorrect promise is documented as unchecked.
     """
     _mesh_tm, mesh_wp = icosphere
-    inferred = _populate(tw.Trimesh.from_warp_mesh(mesh_wp)).transform(_ROTATION)
-    promised = _populate(tw.Trimesh.from_warp_mesh(mesh_wp)).transform(_ROTATION, assume="rigid")
+    inferred = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp)).transform(_ROTATION)
+    promised = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp)).transform(
+        _ROTATION, assume="rigid"
+    )
     assert set(inferred._cache) == set(promised._cache)
 
 
@@ -530,7 +560,7 @@ def test_transform_agrees_with_the_free_function(
     """
     _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     matrix = TRANSFORMS[4][1]
-    moved = _populate(tw.Trimesh.from_warp_mesh(mesh_wp)).transform(matrix)
+    moved = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp)).transform(matrix)
     vertices_wp, faces_wp = tw.transform.transform_mesh(mesh_wp.points, mesh_wp.indices, matrix)
     assert np.allclose(moved.vertices.numpy(), vertices_wp.numpy(), rtol=1e-5, atol=1e-5)
     assert np.array_equal(moved.faces.numpy(), faces_wp.numpy())
@@ -564,7 +594,7 @@ def test_transform_matches_trimesh_end_to_end(icosphere: tuple[tm.Trimesh, wp.Me
     """
     mesh_tm, mesh_wp = icosphere
     matrix = TRANSFORMS[4][1]
-    moved = _populate(tw.Trimesh.from_warp_mesh(mesh_wp)).transform(matrix)
+    moved = populate_cache(tw.Trimesh.from_warp_mesh(mesh_wp)).transform(matrix)
 
     moved_tm = mesh_tm.copy()
     moved_tm.apply_transform(np.array(matrix, dtype=np.float64).reshape(4, 4))

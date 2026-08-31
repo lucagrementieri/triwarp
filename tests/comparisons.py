@@ -560,4 +560,23 @@ def comparable_arrays(value: object) -> list[np.ndarray]:
         return [array for item in value for array in comparable_arrays(item)]
     if isinstance(value, bool | int | float):
         return [np.asarray(float(value))]
+    # A Warp vector or matrix *value* (`wp.vec3`, `wp.mat33d`): a ctypes array, so it matches
+    # none of the branches above and would otherwise return `[]` -- which reads as "compared and
+    # equal" at every call site that zips this against another list. `centroid` and `bounds` were
+    # silently unchecked that way.
+    if hasattr(value, "_wp_scalar_type_"):
+        return [np.array(value, dtype=np.float64).ravel()]
     return []
+
+
+# `vertex_face_adjacency` is documented as a CSR of *sets*, and its row order is nondeterministic
+# (the scatter that fills it races), so it differs run to run on one mesh and an elementwise
+# comparison reports a difference that is not there. Compare those rows with `csr_row_sets`.
+SET_VALUED_CACHE_KEYS = frozenset({"vertex_face_adjacency"})
+
+
+def csr_row_sets(csr: tuple[wp.array, wp.array]) -> list[frozenset[int]]:
+    """Per-row index sets of a ``(values, offsets)`` CSR pair."""
+    values, offsets = csr
+    flat, bounds = values.numpy(), offsets.numpy()
+    return [frozenset(flat[bounds[i] : bounds[i + 1]].tolist()) for i in range(len(bounds) - 1)]

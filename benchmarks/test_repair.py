@@ -655,6 +655,36 @@ def test_remove_duplicated_vertices(bench_case: BenchCase, epsilon: float) -> No
         assert 0 < len(welded.vertices) <= soup_np.shape[0]
 
 
+@pytest.mark.benchmark(group="reverse_winding")
+@pytest.mark.benchlibs("triwarp", "trimesh")
+def test_reverse_winding(bench_case: BenchCase) -> None:
+    """
+    One unconditional corner swap per face: the floor every orientation row is measured against.
+
+    No axis beyond the scan sweep -- there is no traversal, no predicate and no data-dependent
+    branch, so this is the cost of touching the index buffer once and nothing else. Read
+    ``make_winding_consistent`` and ``make_normals_outward`` against it: whatever they cost above
+    this row is the traversal, since all three write the same buffer.
+
+    trimesh's ``invert`` is an ``np.fliplr`` **plus** a cache invalidation and a normal flip on
+    whatever it had cached, so it is an upper bound; it also mutates, hence a fresh mesh per round.
+    """
+    if bench_case.kind == "trimesh":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+        def invert_tm() -> tm.Trimesh:
+            mesh_tm = tm.Trimesh(vertices_np, faces_np, process=False)
+            mesh_tm.invert()
+            return mesh_tm
+
+        inverted_tm = bench_case.run(invert_tm)
+        assert len(inverted_tm.faces) == bench_case.n_faces
+        return
+    faces_wp = bench_case.faces_wp
+    reversed_wp = bench_case.run(lambda: tw.repair.reverse_winding(faces_wp))
+    assert reversed_wp.shape == faces_wp.shape
+
+
 @pytest.mark.benchmark(group="make_winding_consistent")
 @pytest.mark.benchaxis("diameter")
 @pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab", "meshlib")

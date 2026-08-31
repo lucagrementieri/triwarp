@@ -36,6 +36,10 @@ The verb predicts the return shape, and that is a rule rather than a coincidence
   property-fixers beside it ([`make_winding_consistent`][triwarp.repair.make_winding_consistent],
   [`make_volume`][triwarp.repair.make_volume],
   [`make_normals_outward`][triwarp.repair.make_normals_outward]) return ``faces``.
+- **``reverse_winding``** is the one verb outside that scheme, and it obeys the same shape rule
+  for the same reason: it rewrites only the index buffer, so it returns ``faces``. It is not a
+  ``make_*`` because it establishes no property -- it flips orientation unconditionally, where the
+  three ``make_*`` fixers decide face by face.
 - **A verb that only *moves* vertices** returns the positions alone, since neither buffer of indices
   changes: [`flatten_degree3_vertices`][triwarp.repair.flatten_degree3_vertices] is the only one,
   and it is here rather than in [`triwarp.smoothing`][triwarp.smoothing] -- whose every member has
@@ -1344,6 +1348,69 @@ def flatten_degree3_vertices(
         device=device,
     )
     return flattened
+
+
+def reverse_winding(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
+    """
+    Reverse every face's winding, flipping the surface's orientation.
+
+    Rewrites each triangle ``(a, b, c)`` as ``(c, b, a)``, which negates every face normal and the
+    enclosed signed volume. Unconditional: unlike
+    [`make_winding_consistent`][triwarp.repair.make_winding_consistent] and
+    [`make_normals_outward`][triwarp.repair.make_normals_outward], which decide per face, this
+    flips all of them, so a consistently wound mesh stays consistent and an inconsistent one stays
+    inconsistent.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        New face buffer of the same length. ``faces`` is not modified.
+
+    Notes
+    -----
+    An involution: applying it twice returns the original buffer exactly.
+
+    Each face's signed volume negates *exactly* -- reversing a triangle's corners swaps two
+    arguments of a scalar triple product, which negates the same floating-point products rather
+    than recomputing them -- so the total negates bit-for-bit wherever the reduction visits faces
+    in a fixed order. The example below asserts only the sign, since that is what holds
+    independently of the reduction.
+
+    The corner that stays first is a convention, and this one matches ``np.fliplr`` -- which is
+    what ``trimesh.Trimesh.invert`` applies, so the two agree elementwise rather than only up to a
+    rotation of each row. ``kernels.repair.flip_faces_masked``, which the per-face flippers use,
+    keeps corner 0 instead; both reverse orientation and they differ by a cyclic rotation.
+
+    Examples
+    --------
+    ```python
+    flipped = tw.repair.reverse_winding(f)
+    assert tw.measures.volume(v, flipped) < 0.0 < tw.measures.volume(v, f)
+    ```
+
+    See Also
+    --------
+    [`triwarp.mesh.Trimesh.invert`][]
+        The cached-mesh form, which carries what survives a flip.
+    [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
+    [`make_normals_outward`][triwarp.repair.make_normals_outward]
+    [`triwarp.validation.is_winding_consistent`][]
+    """
+    reversed_faces = wp.empty(int(faces.shape[0]), dtype=wp.int32, device=faces.device)
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces > 0:
+        wp.launch(
+            kernel_repair.reverse_face_winding,
+            dim=n_faces,
+            inputs=[faces, reversed_faces],
+            device=faces.device,
+        )
+    return reversed_faces
 
 
 def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:

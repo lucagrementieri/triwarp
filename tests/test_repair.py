@@ -878,6 +878,25 @@ def test_remove_duplicated_vertices_matches_meshlib(
     )
 
 
+def test_reverse_winding_leaves_its_input_alone(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a parity assert: the free function allocates rather than rewriting the caller's buffer.
+
+    Worth pinning because the kernel it launches is safe in place (``creation`` uses it that way),
+    so an in-place shortcut here would pass every value test while corrupting a shared buffer.
+    """
+    _mesh_tm, mesh_wp = icosphere
+    before = mesh_wp.indices.numpy().copy()
+    reversed_faces = tw.repair.reverse_winding(mesh_wp.indices)
+    assert reversed_faces.ptr != mesh_wp.indices.ptr
+    assert np.array_equal(mesh_wp.indices.numpy(), before)
+
+
+def test_reverse_winding_empty_mesh(device: str) -> None:
+    """Not a parity assert: an empty face buffer reverses to an empty one rather than raising."""
+    assert tw.repair.reverse_winding(wp.empty(0, dtype=wp.int32, device=device)).shape[0] == 0
+
+
 @pytest.mark.parity("make_winding_consistent", "pymeshlab")
 def test_make_winding_consistent_matches_pymeshlab(
     device: str, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]

@@ -37,6 +37,7 @@ from meshlib import mrmeshpy as mm  # noqa: E402
 
 import triwarp as tw  # noqa: E402
 from tests.conversions import meshlib_to_trimesh, trimesh_to_warp, warp_to_trimesh  # noqa: E402
+from triwarp.mesh import _CachedProperty  # noqa: E402
 
 # Reject a launch whose array arguments do not live on the launch device. Warp's default is
 # RELAXED, which passes the pointers straight through: a launch that forgets ``device=`` lands on
@@ -504,3 +505,26 @@ def folded_patch() -> tuple[np.ndarray, np.ndarray]:
     )
     faces = np.array([[0, 1, 2], [1, 3, 2], [3, 1, 4]], dtype=np.int32)
     return vertices, faces
+
+
+CACHED_TRIMESH_KEYS = frozenset(
+    name for name, value in vars(tw.Trimesh).items() if isinstance(value, _CachedProperty)
+)
+
+
+def populate_cache(mesh: tw.Trimesh) -> tw.Trimesh:
+    """
+    Force *every* cached property the fixture supports, not only the ones a caller expects.
+
+    Deriving the set from the class rather than from a carry set is what makes the cache-carrying
+    gates in ``test_transform.py`` and ``test_mesh.py`` bite on future edits: a key populated but
+    deliberately not carried costs nothing today, and the moment someone adds it to a stratum it
+    starts being compared against recomputation. Populating only the carried keys would make every
+    such addition vacuously correct.
+    """
+    for key in CACHED_TRIMESH_KEYS:
+        try:
+            getattr(mesh, key)
+        except (ValueError, RuntimeError):
+            pass  # `warp_mesh` on an empty mesh, `halfedge_twins` on a non-manifold one
+    return mesh

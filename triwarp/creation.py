@@ -66,6 +66,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import creation as kernel_creation
+from triwarp.kernels import repair as kernel_repair
 
 # Default number of pie wedges per full revolution, matching trimesh.
 DEFAULT_SECTIONS = 32
@@ -1457,10 +1458,7 @@ def extrude_triangulation(
     if math.copysign(1.0, tw.reduce.mean(areas)) != math.copysign(1.0, height_f):
         flipped = wp.empty_like(faces)
         wp.launch(
-            kernel_creation.reverse_face_winding,
-            dim=n_faces,
-            inputs=[faces, flipped],
-            device=device,
+            kernel_repair.reverse_face_winding, dim=n_faces, inputs=[faces, flipped], device=device
         )
         faces = flipped
 

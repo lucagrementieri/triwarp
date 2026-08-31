@@ -3,7 +3,6 @@ import math
 import warp as wp
 
 from triwarp.kernels.predicates import orient2d
-from triwarp.kernels.triangles import corner_triple
 
 SQRT3 = wp.constant(wp.float32(math.sqrt(3.0)))
 PI_F = wp.constant(wp.float32(math.pi))
@@ -26,17 +25,6 @@ def project_to_radius(v: wp.vec3, radius: wp.float32) -> wp.vec3:
 def lift_vec2(p: wp.vec2, z: wp.float32) -> wp.vec3:
     # 2D point -> 3D at a fixed height (trimesh's util.stack_3D plus a z offset).
     return wp.vec3(p[0], p[1], z)
-
-
-@wp.kernel
-def reverse_face_winding(faces: wp.array[wp.int32], out_faces: wp.array[wp.int32]) -> None:
-    # np.fliplr on an (n, 3) face block. All three indices are read before any is written, so
-    # this is safe to run in place (out_faces is faces).
-    f = wp.int32(wp.tid())
-    a, b, c = corner_triple(faces, f)
-    out_faces[f * 3 + 0] = c
-    out_faces[f * 3 + 1] = b
-    out_faces[f * 3 + 2] = a
 
 
 @wp.kernel

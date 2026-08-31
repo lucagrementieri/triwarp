@@ -145,6 +145,17 @@ def small_triangle_collapse_edges(
 
 
 @wp.kernel
+def reverse_face_winding(faces: wp.array[wp.int32], out_faces: wp.array[wp.int32]) -> None:
+    # np.fliplr on an (n, 3) face block. All three indices are read before any is written, so
+    # this is safe to run in place (out_faces is faces).
+    f = wp.int32(wp.tid())
+    a, b, c = corner_triple(faces, f)
+    out_faces[f * 3 + 0] = c
+    out_faces[f * 3 + 1] = b
+    out_faces[f * 3 + 2] = a
+
+
+@wp.kernel
 def flip_faces_masked(
     faces: wp.array[wp.int32], flip: wp.array[wp.int32], out_faces: wp.array[wp.int32]
 ) -> None:

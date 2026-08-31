@@ -44,7 +44,7 @@ from enum import StrEnum
 import numpy as np
 import warp as wp
 
-from triwarp.kernels import creation as kernel_creation
+from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import transform as kernel_transform
 
 # Relative tolerance on the Gram matrix ``R Rt`` when deciding whether a linear block is a
@@ -300,7 +300,7 @@ def transform_mesh(
     if reverses_orientation(matrix):
         if n_faces > 0:
             wp.launch(
-                kernel_creation.reverse_face_winding,
+                kernel_repair.reverse_face_winding,
                 dim=n_faces,
                 inputs=[faces, new_faces],
                 device=faces.device,
