@@ -227,15 +227,6 @@ def build_procrustes_matrix(
 
 
 @wp.kernel
-def apply_transform_mat44(
-    points: wp.array[wp.vec3], matrix: wp.array[wp.mat44], out_points: wp.array[wp.vec3]
-) -> None:
-    i = wp.int32(wp.tid())
-    # wp.transform_point(mat44, vec3) is exactly ``(M * vec4(p, 1)).xyz``.
-    out_points[i] = wp.transform_point(matrix[0], points[i])
-
-
-@wp.kernel
 def accumulate_cost(
     transformed: wp.array[wp.vec3],
     b: wp.array[wp.vec3],

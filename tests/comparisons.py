@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import numpy as np
 import trimesh as tm
+import warp as wp
 from scipy.spatial import cKDTree
 
 
@@ -525,3 +526,38 @@ def hausdorff_surface_two_sided(
     a_to_b = np.abs(tm.proximity.signed_distance(mesh_b, sample_a)).max()
     b_to_a = np.abs(tm.proximity.signed_distance(mesh_a, sample_b)).max()
     return float(max(a_to_b, b_to_a))
+
+
+def bsr_arrays(matrix: object) -> list[np.ndarray]:
+    """
+    Return a BSR matrix as ``[offsets, columns, values]``, sliced to its *true* entry count.
+
+    ``matrix.nnz`` is a stale capacity after a duplicate-emitting triplet build -- ``cotmatrix``
+    emits 12 triplets per face -- so everything past ``nnz_sync()`` is uninitialized memory and
+    comparing it reports a difference that is not there.
+    """
+    n_entries = int(matrix.nnz_sync())
+    return [
+        matrix.offsets.numpy(),
+        matrix.columns.numpy()[:n_entries],
+        matrix.values.numpy()[:n_entries],
+    ]
+
+
+def comparable_arrays(value: object) -> list[np.ndarray]:
+    """
+    Return whatever a wrapper produced flattened into the arrays a comparison can walk.
+
+    Handles the four return shapes the calls below produce -- an array, a BSR matrix, a nested
+    tuple of either, and a scalar -- and yields nothing for a ``LinearOperator``, whose state is
+    the matrix it wraps and is compared through that matrix instead.
+    """
+    if isinstance(value, wp.array):
+        return [value.numpy()]
+    if hasattr(value, "nnz_sync"):
+        return bsr_arrays(value)
+    if isinstance(value, tuple | list):
+        return [array for item in value for array in comparable_arrays(item)]
+    if isinstance(value, bool | int | float):
+        return [np.asarray(float(value))]
+    return []

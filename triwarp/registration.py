@@ -14,6 +14,7 @@ from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import registration as kernel_registration
+from triwarp.kernels import transform as kernel_transform
 
 
 # The ``return_cost=True`` overload comes first because it is the *default*: overload resolution
@@ -184,7 +185,7 @@ def _procrustes_into(
     out_transformed = workspace["transformed"]
     assert out_transformed is not None
     wp.launch(
-        kernel_registration.apply_transform_mat44,
+        kernel_transform.apply_transform_mat44,
         dim=n,
         inputs=[a, out_matrix, out_transformed],
         device=device,
@@ -542,7 +543,7 @@ def icp_point_to_plane(
 
         # --- apply the incremental step and compose into the running transform ---
         wp.launch(
-            kernel_registration.apply_transform_mat44,
+            kernel_transform.apply_transform_mat44,
             dim=n,
             inputs=[current, step, updated],
             device=device,
@@ -701,7 +702,7 @@ def _seed_transform(
     initial_matrix = _resolve_initial(initial, device)
     current = wp.empty(int(a.shape[0]), dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_registration.apply_transform_mat44,
+        kernel_transform.apply_transform_mat44,
         dim=int(a.shape[0]),
         inputs=[a, initial_matrix, current],
         device=device,

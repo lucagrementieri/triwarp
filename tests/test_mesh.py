@@ -10,46 +10,16 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import assert_same_loop_set, lexsort_rows, trimesh_outline_loops
+from tests.comparisons import (
+    assert_same_loop_set,
+    bsr_arrays,
+    comparable_arrays,
+    lexsort_rows,
+    trimesh_outline_loops,
+)
 from tests.conftest import CLOSED_MESHES, MESHES, OPEN_MESHES
 from tests.conversions import points_to_warp, points_to_warp_uv
 from triwarp.mesh import _TOPOLOGY_KEYS
-
-
-def _bsr_arrays(matrix: object) -> list[np.ndarray]:
-    """
-    Return a BSR matrix as ``[offsets, columns, values]``, sliced to its *true* entry count.
-
-    ``matrix.nnz`` is a stale capacity after a duplicate-emitting triplet build -- ``cotmatrix``
-    emits 12 triplets per face -- so everything past ``nnz_sync()`` is uninitialized memory and
-    comparing it reports a difference that is not there.
-    """
-    n_entries = int(matrix.nnz_sync())
-    return [
-        matrix.offsets.numpy(),
-        matrix.columns.numpy()[:n_entries],
-        matrix.values.numpy()[:n_entries],
-    ]
-
-
-def _comparable_arrays(value: object) -> list[np.ndarray]:
-    """
-    Return whatever a wrapper produced flattened into the arrays a comparison can walk.
-
-    Handles the four return shapes the calls below produce -- an array, a BSR matrix, a nested
-    tuple of either, and a scalar -- and yields nothing for a ``LinearOperator``, whose state is
-    the matrix it wraps and is compared through that matrix instead.
-    """
-    if isinstance(value, wp.array):
-        return [value.numpy()]
-    if hasattr(value, "nnz_sync"):
-        return _bsr_arrays(value)
-    if isinstance(value, tuple | list):
-        return [array for item in value for array in _comparable_arrays(item)]
-    if isinstance(value, bool | int | float):
-        return [np.asarray(float(value))]
-    return []
-
 
 # ---------------------------------------------------------------------------
 # construction
@@ -308,7 +278,7 @@ def test_operator_properties_match_the_free_functions(
         (mesh.laplacian_operator, tw.laplacian.laplacian(vertices_wp, faces_wp)),
     ):
         for cached_np, free_np in zip(
-            _bsr_arrays(cached_matrix), _bsr_arrays(free_matrix), strict=True
+            bsr_arrays(cached_matrix), bsr_arrays(free_matrix), strict=True
         ):
             assert np.allclose(cached_np, free_np, rtol=1e-5, atol=1e-5)
 
@@ -629,7 +599,10 @@ _GEOMETRY_KEYS = (
     "cotmatrix_entries",
     "cotmatrix",
     "mass_matrix_entries",
-    "laplacian_operator",
+    # `laplacian_operator` is deliberately absent: it weights every 1-ring neighbour equally, so it
+    # reads `faces` and never the positions -- measured bit-identical across a *scrambled* vertex
+    # buffer on a closed and an open mesh. It lives in `_TOPOLOGY_KEYS`, and the parametrization
+    # over that set below is what covers it.
     "vertex_tangent_frames",
     "heat_operators",
     "vector_heat_operators",
@@ -898,8 +871,8 @@ def test_a_precomputed_argument_does_not_change_the_answer(
     assert set(cases) == set(_PRECOMPUTED_ARGUMENT_IDS)
     rebuild, from_cache = cases[name]
 
-    rebuilt = _comparable_arrays(rebuild())
-    cached = _comparable_arrays(from_cache())
+    rebuilt = comparable_arrays(rebuild())
+    cached = comparable_arrays(from_cache())
     assert rebuilt, f"{name}: nothing comparable came back"
     assert len(rebuilt) == len(cached), name
     for left, right in zip(rebuilt, cached, strict=True):

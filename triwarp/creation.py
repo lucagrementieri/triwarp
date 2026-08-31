@@ -66,7 +66,6 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import creation as kernel_creation
-from triwarp.kernels import registration as kernel_registration
 
 # Default number of pie wedges per full revolution, matching trimesh.
 DEFAULT_SECTIONS = 32
@@ -2495,47 +2494,19 @@ def _apply_transform(
     faces: wp.array[wp.int32],
     transform: wp.mat44 | wp.array[wp.mat44] | None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """Transform ``vertices`` in place, reversing face winding when the transform is a mirror."""
+    """
+    Transform ``vertices`` in place, reversing face winding when the transform is a mirror.
+
+    In place is right *here* and nowhere else in the package: every caller has just built the
+    buffer it hands over, so there is no second holder to corrupt and no cache to invalidate --
+    the opposite of [`Trimesh.transform`][triwarp.mesh.Trimesh.transform], which is functional for
+    exactly that reason.
+    """
     if transform is None:
         return vertices, faces
-
-    device = vertices.device
-    matrix = (
-        transform
-        if isinstance(transform, wp.array)
-        else wp.array([transform], dtype=wp.mat44, device=device)
+    return tw.transform.transform_mesh(
+        vertices, faces, transform, out_vertices=vertices, out_faces=faces
     )
-    wp.launch(
-        kernel_registration.apply_transform_mat44,
-        dim=int(vertices.shape[0]),
-        inputs=[vertices, matrix, vertices],
-        device=device,
-    )
-    if _reverses_winding(transform):
-        wp.launch(
-            kernel_creation.reverse_face_winding,
-            dim=int(faces.shape[0]) // 3,
-            inputs=[faces, faces],
-            device=device,
-        )
-    return vertices, faces
-
-
-def _reverses_winding(transform: wp.mat44 | wp.array[wp.mat44]) -> bool:
-    """Whether a transform mirrors, i.e. whether its rotation block has a negative determinant."""
-    matrix = _as_mat44(transform)
-    rotation = wp.mat33(
-        matrix[0][0],
-        matrix[0][1],
-        matrix[0][2],
-        matrix[1][0],
-        matrix[1][1],
-        matrix[1][2],
-        matrix[2][0],
-        matrix[2][1],
-        matrix[2][2],
-    )
-    return float(wp.determinant(rotation)) < 0.0
 
 
 def _transform_to_numpy(transform: wp.mat44 | wp.array[wp.mat44]) -> np.ndarray:
@@ -2545,20 +2516,7 @@ def _transform_to_numpy(transform: wp.mat44 | wp.array[wp.mat44]) -> np.ndarray:
     Needed for composing the transform with the ``mid_plane`` offset in
     [`extrude_polygon`][triwarp.creation.extrude_polygon], which is host matrix arithmetic.
     """
-    return np.array(_as_mat44(transform), dtype=np.float64).reshape(4, 4)
-
-
-def _as_mat44(transform: wp.mat44 | wp.array[wp.mat44]) -> wp.mat44:
-    """
-    Row-indexable host copy of a transform parameter.
-
-    The single place a transform crosses device to host. Both decisions that need it -- whether
-    the transform reverses face winding, and the ``mid_plane`` composition -- are host branches
-    over a whole launch, so the matrix has to cross either way; a scalar ``wp.mat44`` costs
-    nothing. ``list()[0]`` is the spelling CLAUDE.md section 4 names for a
-    ``wp.array[wp.mat44]``, and is cheaper than reading the buffer through ``.numpy()``.
-    """
-    return transform.list()[0] if isinstance(transform, wp.array) else transform
+    return np.array(tw.transform.as_mat44(transform), dtype=np.float64).reshape(4, 4)
 
 
 def _upload_vertices(vertices_np: np.ndarray, device: wp.DeviceLike) -> wp.array[wp.vec3]:

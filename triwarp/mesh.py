@@ -47,8 +47,88 @@ _TOPOLOGY_KEYS: frozenset[str] = frozenset(
         "is_vertex_manifold",
         "is_winding_consistent",
         "is_orientable",
+        # Unit weights on the directed edge adjacency, so the operator reads `faces` and not the
+        # positions -- measured identical across an arbitrary affine remap of the vertices. It is
+        # winding-dependent on an *open* mesh, which `with_vertices` never changes but a mirroring
+        # `transform` does; `_ORIENTATION_DEPENDENT_KEYS` carries that half.
+        "laplacian_operator",
     }
 )
+
+# --- Transform cache strata -------------------------------------------------
+#
+# How much of the cache survives depends on what the transform preserves, and these sets were
+# *measured* rather than reasoned about: every key was computed on a mesh and on its transformed
+# copy and compared, on a closed fixture and on an open one. Four results contradict the obvious
+# reading, so re-measure rather than edit by eye --
+# `tests/test_transform.py::test_carried_cache_matches_recomputation` is that measurement, and it
+# fails if a key is added here that recomputation would disagree with.
+#
+# Each set is what is carried **verbatim**. A quantity that survives only up to a factor (areas
+# under a scale) is dropped rather than rescaled, so "carried" always means "bit-identical to
+# recomputation, up to float32 noise" -- one contract a test can check uniformly. Directions are
+# the exception and are *rotated*; see `Trimesh.transform`.
+
+# Dropped whenever face winding reverses, on top of whatever the metric class allows. Reversing a
+# face's corners renumbers halfedges and permutes every per-corner table, which is invisible on a
+# closed convex fixture and wrong on any mesh -- the last three were each measured failing only
+# after the closed-mesh check had passed them.
+_ORIENTATION_DEPENDENT_KEYS: frozenset[str] = frozenset(
+    {
+        "edges",  # each face's three rows reverse direction and permute
+        "edges_sorted",
+        "edges_unique_inverse",
+        "halfedge_twins",  # halfedge `3f + k` names a different corner
+        "vertex_one_rings",  # and the rotation around each vertex runs the other way
+        "oriented_boundary_edges",  # directed by construction
+        "boundary_loops",  # so the loops come back reversed
+        "face_angles",  # per-corner table, permuted
+        "cotmatrix_entries",  # likewise -- the assembled `cotmatrix` is a sum and survives
+        "vertex_tangent_frames",  # gauge is built from a reference halfedge, which moves
+        "laplacian_operator",  # directed adjacency, asymmetric at an open boundary
+    }
+)
+
+# Survives any *invertible* affine map: connectivity, plus the predicates a bijection preserves.
+_AFFINE_CARRY: frozenset[str] = _TOPOLOGY_KEYS | frozenset(
+    {"nondegenerate_faces", "is_watertight", "is_self_intersecting", "is_volume"}
+)
+
+# Adds the angle functions. A similarity preserves angles, so it preserves cotangent weights --
+# which is why the heaviest object here, the assembled `cotmatrix`, survives a scale.
+_SIMILARITY_CARRY: frozenset[str] = _AFFINE_CARRY | frozenset(
+    {"face_angles", "vertex_defects", "face_adjacency_angles", "cotmatrix_entries", "cotmatrix"}
+)
+
+# Adds the length and area quantities, which only an isometry leaves alone.
+_ISOMETRY_CARRY: frozenset[str] = _SIMILARITY_CARRY | frozenset(
+    {"face_areas", "area", "mean_edge_length", "edges_unique_length", "mass_matrix_entries"}
+)
+
+# A translation moves no direction at all, so normals, frames and the operator bundles built from
+# them survive untouched -- the one rung where nothing has to be recomputed *or* rotated. The
+# bounding box survives too, and `transform` shifts it on the host rather than reducing again.
+_TRANSLATION_CARRY: frozenset[str] = _ISOMETRY_CARRY | frozenset(
+    {
+        "face_normals",
+        "vertex_normals",
+        "vertex_tangent_frames",
+        "heat_operators",
+        "vector_heat_operators",
+        "enclosing_diagonal",
+    }
+)
+
+_TRANSFORM_CARRY: dict[str, frozenset[str]] = {
+    "translation": _TRANSLATION_CARRY,
+    "rigid": _ISOMETRY_CARRY,
+    "reflection": _ISOMETRY_CARRY,
+    "similarity": _SIMILARITY_CARRY,
+    "affine": _AFFINE_CARRY,
+    # A singular map flattens the mesh, so even the predicates a bijection preserves are gone:
+    # every face becomes degenerate, and a flattened surface self-intersects.
+    "singular": _TOPOLOGY_KEYS,
+}
 
 
 class _CachedProperty(Generic[_R]):
@@ -269,7 +349,7 @@ class Trimesh:
         [`trimesh.Trimesh.face_normals`][]
         """
         normals, areas = tw.triangles.face_normals_and_areas(self._vertices, self._faces)
-        self._cache["face_areas"] = areas
+        self._cache.setdefault("face_areas", areas)
         return normals
 
     @_CachedProperty
@@ -285,8 +365,13 @@ class Trimesh:
         [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
         [`trimesh.Trimesh.area_faces`][]
         """
-        _ = self.face_normals
-        return cast("wp.array[wp.float32]", self._cache["face_areas"])
+        # Compute the pair rather than reading the slot `face_normals` would have filled: that
+        # only happens when `face_normals` is itself cold, and it can be cached *alone* -- a
+        # rigid `transform` rotates it while dropping the areas a scale would have changed.
+        # `setdefault` so an already-cached (carried or rotated) normal array is kept.
+        normals, areas = tw.triangles.face_normals_and_areas(self._vertices, self._faces)
+        self._cache.setdefault("face_normals", normals)
+        return areas
 
     @_CachedProperty
     def area(self) -> float:
@@ -498,7 +583,7 @@ class Trimesh:
         unique, inverse = tw.edges.edges_unique(
             self._faces, edges_sorted=self.edges_sorted, n_vertices=self.n_vertices
         )
-        self._cache["edges_unique_inverse"] = inverse
+        self._cache.setdefault("edges_unique_inverse", inverse)
         return unique
 
     @_CachedProperty
@@ -511,8 +596,13 @@ class Trimesh:
         [`triwarp.edges.edges_unique_inverse`][]
         [`trimesh.Trimesh.edges_unique_inverse`][]
         """
-        _ = self.edges_unique
-        return cast("wp.array[wp.int32]", self._cache["edges_unique_inverse"])
+        # As in `face_areas`: `edges_unique` fills this only when it is itself cold, and a
+        # mirroring `transform` carries it while dropping this one, whose row order reverses.
+        unique, inverse = tw.edges.edges_unique(
+            self._faces, edges_sorted=self.edges_sorted, n_vertices=self.n_vertices
+        )
+        self._cache.setdefault("edges_unique", unique)
+        return inverse
 
     @_CachedProperty
     def edges_unique_length(self) -> wp.array[wp.float32]:
@@ -550,7 +640,7 @@ class Trimesh:
             # whole call, measured in benchmarks/test_adjacency.py).
             n_vertices=int(self._vertices.shape[0]),
         )
-        self._cache["face_adjacency_edges"] = adjacency_edges
+        self._cache.setdefault("face_adjacency_edges", adjacency_edges)
         return adjacency
 
     @_CachedProperty
@@ -563,6 +653,9 @@ class Trimesh:
         [`triwarp.adjacency.face_adjacency`][]
         """
         _ = self.face_adjacency
+        # Both halves live in `_TOPOLOGY_KEYS`, so nothing splits this pair today; the read stays
+        # a plain one rather than recomputing, and `face_adjacency` uses `setdefault` so a future
+        # stratum that does split it fails loudly here instead of silently returning a stale edge.
         return cast("twt.Array2dInt32", self._cache["face_adjacency_edges"])
 
     @_CachedProperty
@@ -1094,6 +1187,192 @@ class Trimesh:
             scalar_operators=self.heat_operators,
             frames=self.vertex_tangent_frames,
         )
+
+    def transform(
+        self, matrix: wp.mat44 | wp.array[wp.mat44], *, assume: str | None = None
+    ) -> Trimesh:
+        """
+        Return a new `Trimesh` under an affine transform, carrying forward whatever survives it.
+
+        `Trimesh` is frozen, so this returns a new instance rather than moving this one -- and
+        that is the *fast* path, not merely the safe one. How much of the cache survives is
+        decided by what the transform preserves
+        ([`classify_transform`][triwarp.transform.classify_transform]), and for a rigid motion
+        that is everything expensive: angles, areas, the cotangent table and the assembled
+        [`cotmatrix`][triwarp.mesh.Trimesh.cotmatrix] are all isometry invariants, so only the
+        directions and the bounding box are touched.
+
+        | transform | recomputed on the new mesh |
+        |---|---|
+        | translation | the BVH, and nothing else |
+        | rigid, reflection | the BVH and `bounds`; directions are *rotated*, not rebuilt |
+        | similarity | the above, plus the length and area quantities |
+        | affine | everything but connectivity |
+
+        Face winding is reversed when ``matrix`` mirrors, which keeps normals outward and costs
+        the orientation-dependent caches on top of the row above --
+        [`vertex_one_rings`][triwarp.mesh.Trimesh.vertex_one_rings], the directed edge tables and
+        the per-corner tables among them.
+
+        Measured on an RTX 5090, interleaved, against transforming the buffers and rebuilding a
+        `Trimesh` around them -- the cost of a *warm* mesh moving and being used again:
+
+        | workflow | rebuilt | carried | |
+        |---|---|---|---|
+        | rigid, then the three operators (2 562 v) | 0.878 ms | 0.407 ms | 2.16x |
+        | the same at 40 962 v | 1.022 ms | 0.363 ms | 2.81x |
+        | translation, then `heat_operators` (2 562 v) | 3.307 ms | 0.238 ms | 13.9x |
+        | the same at 40 962 v | 3.346 ms | 0.230 ms | 14.6x |
+
+        (the three operators being `cotmatrix`, `face_angles` and `vertex_normals`)
+
+        Both sides are **launch-bound** at these sizes -- the numbers barely move over a 16x
+        vertex count -- so read the ratio as a count of launches skipped rather than as work that
+        grows with the mesh. That also sets where this is worth reaching for: a mesh transformed
+        once and used once saves a fraction of a millisecond, and a mesh carried through a
+        sequence of poses saves the whole assembly each time.
+
+        Parameters
+        ----------
+        matrix
+            ``4x4`` transform, as a scalar ``wp.mat44`` or a ``(1,)`` ``wp.array[wp.mat44]`` --
+            an [`icp`][triwarp.registration.icp] result can be passed straight through. Build one
+            with [`translation_matrix`][triwarp.transform.translation_matrix],
+            [`rotation_matrix`][triwarp.transform.rotation_matrix],
+            [`scale_matrix`][triwarp.transform.scale_matrix] or
+            [`reflection_matrix`][triwarp.transform.reflection_matrix].
+        assume
+            A [`TransformKind`][triwarp.transform.TransformKind] value promising what ``matrix``
+            preserves, skipping the classification. Use it when a matrix composed from many
+            ``float32`` factors has drifted far enough off orthogonality to be classified
+            `TransformKind.AFFINE`, which is safe but discards the cache. **An incorrect promise
+            silently corrupts every carried value** -- there is no check.
+
+        Returns
+        -------
+        Trimesh
+            New instance on the transformed vertices, sharing whatever cached values survive.
+            ``self`` when ``matrix`` is the identity.
+
+        Raises
+        ------
+        ValueError
+            If ``assume`` is not a `TransformKind` value.
+
+        Notes
+        -----
+        Carried values are **aliased**, not copied, exactly as with
+        [`with_vertices`][triwarp.mesh.Trimesh.with_vertices]: the returned mesh and this one hold
+        the same array objects. That is safe because neither can mutate them, and it is why this
+        class offers no in-place transform -- an edit to a shared buffer would corrupt every mesh
+        derived from it, with nothing to invalidate them. Use
+        [`transform_points`][triwarp.transform.transform_points] with ``out=`` for in-place work on
+        raw buffers.
+
+        Examples
+        --------
+        ```python
+        mesh = tw.Trimesh(v, f)
+        spun = mesh.transform(tw.transform.rotation_matrix((0.0, 0.0, 1.0), 0.5, mesh.centroid))
+        spun.cotmatrix  # carried from `mesh`, not reassembled
+        ```
+
+        See Also
+        --------
+        [`triwarp.transform.transform_mesh`][]
+            The buffer-level form, without the cache.
+        [`with_vertices`][triwarp.mesh.Trimesh.with_vertices]
+        [`invalidate`][triwarp.mesh.Trimesh.invalidate]
+        """
+        kind = str(
+            tw.transform.TransformKind(assume)
+            if assume is not None
+            else tw.transform.classify_transform(matrix)
+        )
+        if kind == tw.transform.TransformKind.IDENTITY:
+            return self
+
+        new_vertices, new_faces = tw.transform.transform_mesh(self._vertices, self._faces, matrix)
+        carry = _TRANSFORM_CARRY[kind]
+        if tw.transform.reverses_orientation(matrix):
+            carry = carry - _ORIENTATION_DEPENDENT_KEYS
+        survived = {key: value for key, value in self._cache.items() if key in carry}
+        self._carry_directions(kind, matrix, survived)
+        self._carry_box(kind, matrix, survived)
+        return Trimesh(new_vertices, new_faces, initial_cache=survived)
+
+    def _carry_directions(
+        self, kind: str, matrix: wp.mat44 | wp.array[wp.mat44], survived: dict[str, object]
+    ) -> None:
+        """
+        Rotate the cached direction quantities into ``survived`` instead of dropping them.
+
+        Only for a similarity or stronger, where a direction's image is determined by the
+        transform alone. A translation moves no direction at all and carries these verbatim
+        through `_TRANSLATION_CARRY`; an affine map tilts them by an amount that depends on the
+        surface, so there they are recomputed -- and recomputing `face_normals` yields
+        `face_areas` with it, which an affine map does not preserve anyway.
+
+        [`transform_normals`][triwarp.transform.transform_normals] is the right map for the frame's
+        tangents too, not just for its normal: for a similarity ``M = sR`` the inverse transpose is
+        ``R / s``, which normalizes to the same unit vector the forward map does.
+        """
+        if kind not in ("rigid", "reflection", "similarity"):
+            return
+        rotate = tw.transform.transform_normals
+        if "face_normals" in self._cache:
+            survived["face_normals"] = rotate(
+                cast("wp.array[wp.vec3]", self._cache["face_normals"]), matrix
+            )
+        frames = self._cache.get("vertex_tangent_frames")
+        if frames is not None and "vertex_tangent_frames" in survived:
+            basis_x, basis_y, normal = cast(
+                "tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]]", frames
+            )
+            rotated_normal = rotate(normal, matrix)
+            # The frame's third element *is* `vertex_normals` (that property's documented
+            # invariant), so rotate it once and fill both slots with the same array.
+            survived["vertex_tangent_frames"] = (
+                rotate(basis_x, matrix),
+                rotate(basis_y, matrix),
+                rotated_normal,
+            )
+            survived["vertex_normals"] = rotated_normal
+        elif "vertex_normals" in self._cache:
+            survived["vertex_normals"] = rotate(
+                cast("wp.array[wp.vec3]", self._cache["vertex_normals"]), matrix
+            )
+
+    def _carry_box(
+        self, kind: str, matrix: wp.mat44 | wp.array[wp.mat44], survived: dict[str, object]
+    ) -> None:
+        """
+        Map the cached `centroid`, and the `bounds` where the transform allows it, on the host.
+
+        Both are single values, so this is float arithmetic rather than a launch -- and it is what
+        keeps a translation from re-reducing the vertex buffer and paying a readback for a box it
+        already knows.
+
+        The area-weighted `centroid` maps exactly under any similarity: a uniform scale multiplies
+        every weight equally, so the normalized weights are unchanged and the weighted mean follows
+        the points. Under an affine map the weights change per face and it does not.
+
+        The axis-aligned `bounds` survive a *translation* only. A rotated box is not derivable from
+        the old one, so `bounds` and the `enclosing_diagonal` read off it are recomputed for every
+        other kind -- `_TRANSLATION_CARRY` is the only set holding the diagonal for that reason.
+        """
+        if kind == "singular":
+            return
+        if (centroid := self._cache.get("centroid")) is not None and kind != "affine":
+            survived["centroid"] = wp.transform_point(
+                tw.transform.as_mat44(matrix), cast("wp.vec3", centroid)
+            )
+        if kind != "translation":
+            return
+        if (bounds := self._cache.get("bounds")) is not None:
+            lower, upper = cast("tuple[wp.vec3, wp.vec3]", bounds)
+            offset = wp.transform_point(tw.transform.as_mat44(matrix), wp.vec3(0.0, 0.0, 0.0))
+            survived["bounds"] = (lower + offset, upper + offset)
 
     def with_vertices(self, new_vertices: wp.array[wp.vec3]) -> Trimesh:
         """

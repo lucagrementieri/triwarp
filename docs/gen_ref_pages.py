@@ -40,6 +40,12 @@ SECTIONS: dict[str, list[str]] = {
     # meets the vertex-preserving edits first. It also holds ``marching_cubes``, which every
     # implicit-surface pipeline in the package ends in.
     "Mesh editing & repair": [
+        # ``transform`` first: moving a mesh rigidly is the simplest edit in the section and the
+        # one every other member leaves invariant, so a reader meets it before the edits that
+        # change the surface. Its natural partner is ``registration``, which *fits* the matrices
+        # this module applies; that pairing is carried by See Also in both directions rather than
+        # by the shelving, since a module may appear in exactly one section.
+        "transform",
         "repair",
         "holes",
         "combine",
