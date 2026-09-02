@@ -143,6 +143,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops as p3d_ops
 import pyvista as pv
 import scipy.spatial
 import trimesh as tm
@@ -151,7 +152,7 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, points_torch_from_numpy, skip_larger_than
 
 # Neighbour count for the PCA normal estimate (open3d's own default for KDTreeSearchParamKNN).
 _KNN = 30
@@ -583,7 +584,7 @@ def _cloud_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
 
 @pytest.mark.benchmark(group="estimate_normals_knn")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab", "meshlib")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab", "meshlib", "pytorch3d")
 def test_estimate_normals_knn(bench_case: BenchCase) -> None:
     """
     Neighbour search plus PCA -- what open3d's ``estimate_normals`` does in one call.
@@ -594,9 +595,24 @@ def test_estimate_normals_knn(bench_case: BenchCase) -> None:
     cloud is uniform, which is what the agreement in ``tests/test_points.py`` is measured on. It is
     also the only row here that returns a *new* array rather than writing into the cloud, so nothing
     is mutated and one cloud serves every round.
+
+    **pytorch3d**'s ``estimate_pointcloud_normals`` is the same search-plus-PCA in one call and the
+    only other row with GPU kernels, but its neighbour search is the brute-force pairwise loop, so
+    at this cloud size it prices the search rather than the eigen-solve.
+    ``disambiguate_directions=False`` leaves out the SHOT sign rule triwarp has no counterpart for,
+    which is also what the parity test compares at.
     """
     if bench_case.mesh_name == "sphere_large":
         pytest.skip("open3d searches one point at a time; capped at sphere_med")
+    if bench_case.kind == "pytorch3d":
+        points_p3d = points_torch_from_numpy(bench_case.vertices_np, bench_case.torch_device)
+        normals_p3d = bench_case.run(
+            lambda: p3d_ops.estimate_pointcloud_normals(
+                points_p3d, neighborhood_size=_KNN, disambiguate_directions=False
+            )
+        )
+        assert normals_p3d.shape == (1, bench_case.n_vertices, 3)
+        return
     if bench_case.kind == "meshlib":
         cloud_ml = _cloud_ml(bench_case)
         radius = 2.0 * bench_case.mean_edge
@@ -765,7 +781,7 @@ def test_point_duplicate_mask(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="farthest_point_sample")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "pytorch3d")
 @pytest.mark.parametrize("count", _SAMPLE_COUNTS)
 def test_farthest_point_sample(bench_case: BenchCase, count: int) -> None:
     """
@@ -780,9 +796,24 @@ def test_farthest_point_sample(bench_case: BenchCase, count: int) -> None:
     open3d's ``FarthestPointDownSample`` runs the identical loop serially in C++ on one core, so
     the comparison is device parallelism against a tighter inner loop; it also copies the selected
     points out where triwarp returns indices.
+
+    **pytorch3d**'s ``sample_farthest_points`` runs the identical greedy loop with CUDA kernels of
+    its own, so it is the one row here that is not a serial C++ baseline -- and the ratio is the
+    narrowest and the flattest of its four: measured 14.35 against triwarp's 5.43 ms at 20 000
+    points and 104.93 against 35.99 at 200 000, i.e. **2.64x and 2.92x**, where its brute-force
+    k-NN swings from 0.70x to 85x over the same range because it has no structure to build.
+    ``random_start_point=False`` pins its start to index 0, which is triwarp's default, and it
+    returns both the points and the indices where triwarp returns indices alone.
     """
     if bench_case.mesh_name == "sphere_large":
         pytest.skip("open3d's greedy loop is serial over the whole cloud; capped at sphere_med")
+    if bench_case.kind == "pytorch3d":
+        points_p3d = points_torch_from_numpy(bench_case.vertices_np, bench_case.torch_device)
+        _, indices_p3d = bench_case.run(
+            lambda: p3d_ops.sample_farthest_points(points_p3d, K=count, random_start_point=False)
+        )
+        assert indices_p3d.shape == (1, count)
+        return
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
         indices = bench_case.run(lambda: tw.points.farthest_point_sample(points, count))

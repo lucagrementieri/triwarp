@@ -45,8 +45,10 @@ import numpy as np
 import pymeshlab as ml
 import pytest
 import pyvista as pv
+import torch
 import warp as wp
 from meshlib import mrmeshpy as mm
+from pytorch3d.ops.marching_cubes import marching_cubes as p3d_marching_cubes
 
 import triwarp as tw
 from conftest import BenchCase, BenchLibrary, skip_larger_than
@@ -299,7 +301,7 @@ def _marching_volume_ml(resolution: int) -> mm.SimpleVolume:
 
 
 @pytest.mark.benchmark(group="marching_cubes")
-@pytest.mark.benchlibs("triwarp", "meshlib", "igl", "pyvista")
+@pytest.mark.benchlibs("triwarp", "meshlib", "igl", "pyvista", "pytorch3d")
 @pytest.mark.parametrize("resolution", _MARCHING_RESOLUTIONS)
 def test_marching_cubes(bench_lib: BenchLibrary, resolution: int) -> None:
     """
@@ -347,7 +349,25 @@ def test_marching_cubes(bench_lib: BenchLibrary, resolution: int) -> None:
     All four return the same surface: at 24^3 on a unit-sphere SDF, igl and pyvista both give
     **1 128** vertices and **2 252** faces with a mean radius of **0.999226** to six digits, and the
     meshlib agreement above is a two-sided Hausdorff of 1.2e-07 (``tests/test_levelset.py``).
+
+    **pytorch3d brings it to five, and it is the only one that needs no convention fix at all**:
+    ``return_local_coords=False`` makes it emit lattice indices, which is exactly what
+    ``marching_cubes`` returns without ``bounds``, so its row marches the identical field with no
+    origin or ordering to get wrong -- and it is the only reference here with GPU kernels.
+    ``tests/test_levelset.py::test_marching_cubes_matches_pytorch3d`` pins it at **0.0** on sorted
+    coordinates. Note the import: it is **not** re-exported from ``pytorch3d.ops``, only from
+    ``pytorch3d.ops.marching_cubes``.
     """
+    if bench_lib.kind == "pytorch3d":
+        field_p3d = torch.as_tensor(_marching_field_np(resolution), device=bench_lib.torch_device)[
+            None
+        ]
+        vertices_p3d, faces_p3d = bench_lib.run(
+            lambda: p3d_marching_cubes(field_p3d, isolevel=0.0, return_local_coords=False)
+        )
+        assert faces_p3d[0].shape[0] > 0
+        assert vertices_p3d[0].shape[0] > 0
+        return
     if bench_lib.kind == "igl":
         field_np = _marching_field_np(resolution)
         half = _MARCHING_TORUS[2]

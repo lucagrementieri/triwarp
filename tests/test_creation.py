@@ -9,6 +9,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pytorch3d.utils as p3d_utils
 import pyvista as pv
 import shapely.geometry as sg
 import trimesh as tm
@@ -23,6 +24,7 @@ from tests.conversions import (
     open3d_to_trimesh,
     points_to_warp,
     points_to_warp_uv,
+    pytorch3d_to_numpy,
     warp_to_trimesh,
 )
 
@@ -868,6 +870,37 @@ def test_icosphere(device: str, subdivisions: int) -> None:
     assert np.allclose(np.linalg.norm(vertices_wp.numpy(), axis=1), 1.0, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("subdivisions", [0, 1, 2])
+@pytest.mark.parity("icosphere", "pytorch3d")
+def test_icosphere_matches_pytorch3d(device: str, subdivisions: int) -> None:
+    """
+    Class B: ``utils.ico_sphere`` is the *same* construction, to its base table's 4 decimal places.
+
+    Not the rotated-frame situation section 6 records for open3d's Platonic solids -- pytorch3d
+    starts from the identical ``(+-0.5257, +-0.8507, 0)`` vertex table triwarp uses and subdivides
+    the same way, so the positions correspond one-to-one and the residual is pytorch3d's table
+    being *written* to four decimals: measured 5.8e-05 at level 0 and 5.2e-05 at level 1 by nearest
+    vertex, with the sorted pairwise-distance spectrum agreeing to 9.8e-05.
+
+    So the transform is the correspondence, not a gauge fix: a ``cKDTree`` nearest-neighbour match
+    plus a bijection check. Counts are asserted first (12/20, 42/80, 162/320), which is what makes
+    the bijection meaningful rather than a statement about a subset.
+    """
+    sphere_p3d = p3d_utils.ico_sphere(subdivisions)
+    vertices_p3d, faces_p3d = pytorch3d_to_numpy(sphere_p3d)
+    vertices_wp, faces_wp = tw.creation.icosphere(subdivisions=subdivisions, device=device)
+    vertices_np = vertices_wp.numpy().astype(np.float64)
+
+    assert vertices_p3d.shape[0] == 10 * 4**subdivisions + 2
+    assert faces_p3d.shape[0] == 20 * 4**subdivisions
+    assert vertices_np.shape[0] == vertices_p3d.shape[0]
+    assert int(faces_wp.shape[0]) // 3 == faces_p3d.shape[0]
+
+    distances_np, indices_np = cKDTree(vertices_p3d).query(vertices_np)
+    assert float(distances_np.max()) < 1e-4
+    assert np.unique(indices_np).size == vertices_np.shape[0]
+
+
 @pytest.mark.parametrize("subdivisions", [1, 2, 3, 5])
 def test_icosphere_is_crack_free(device: str, subdivisions: int) -> None:
     # The whole point of the closed-form numbering is that a point on a base edge gets the same
@@ -1028,6 +1061,45 @@ _CLOSED_BUILDERS = {
     "icosphere": lambda device: tw.creation.icosphere(subdivisions=2, device=device),
     "box": lambda device: tw.creation.box(device=device),
 }
+
+
+@pytest.mark.parity("torus", "pytorch3d")
+def test_torus_matches_pytorch3d(device: str) -> None:
+    """
+    Class B: ``utils.torus(r, R, sides, rings)`` is triwarp's torus under a parameter swap.
+
+    Three things have to be lined up and none is a tolerance. pytorch3d takes the **minor** radius
+    first and triwarp the major; its ``sides`` is the minor loop's section count and its ``rings``
+    the major loop's, which is the reverse order of triwarp's ``(major_sections,
+    minor_sections)``. At the matching mapping both build 96 vertices and 192 faces.
+
+    The comparison is then the surface rather than the buffers -- pytorch3d walks its own Python
+    double loop and numbers vertices in its own order -- so it is a nearest-vertex bijection plus
+    the two radii recovered from the point set, which is what actually distinguishes a swapped
+    ``r``/``R`` from a correct one.
+    """
+    major, minor, major_sections, minor_sections = 1.0, 0.3, 12, 8
+    torus_p3d = p3d_utils.torus(minor, major, minor_sections, major_sections)
+    vertices_p3d, faces_p3d = pytorch3d_to_numpy(torus_p3d)
+    vertices_wp, faces_wp = tw.creation.torus(
+        major, minor, major_sections, minor_sections, device=device
+    )
+    vertices_np = vertices_wp.numpy().astype(np.float64)
+
+    assert vertices_p3d.shape[0] == major_sections * minor_sections
+    assert faces_p3d.shape[0] == 2 * major_sections * minor_sections
+    assert vertices_np.shape[0] == vertices_p3d.shape[0]
+    assert int(faces_wp.shape[0]) // 3 == faces_p3d.shape[0]
+
+    # Distance from the major circle recovers the minor radius on both sides.
+    for points_np in (vertices_np, vertices_p3d):
+        radial_np = np.linalg.norm(points_np[:, :2], axis=1)
+        tube_np = np.sqrt((radial_np - major) ** 2 + points_np[:, 2] ** 2)
+        assert np.allclose(tube_np, minor, rtol=1e-5, atol=1e-6)
+
+    distances_np, indices_np = cKDTree(vertices_p3d).query(vertices_np)
+    assert float(distances_np.max()) < 1e-6
+    assert np.unique(indices_np).size == vertices_np.shape[0]
 
 
 @pytest.mark.parametrize("name", sorted(_CLOSED_BUILDERS))

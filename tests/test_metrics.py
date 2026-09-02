@@ -13,6 +13,7 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pytorch3d.loss as p3d_loss
 import trimesh as tm
 import trimesh.proximity as tm_proximity
 import warp as wp
@@ -22,10 +23,14 @@ from scipy.spatial.distance import directed_hausdorff
 
 import triwarp as tw
 from tests.conversions import (
+    numpy_to_warp,
     points_to_open3d,
     points_to_pymeshlab,
+    points_to_pytorch3d,
+    points_to_torch,
     points_to_warp,
     trimesh_to_meshlib,
+    trimesh_to_pytorch3d,
     trimesh_to_warp,
 )
 
@@ -156,6 +161,33 @@ def test_chamfer_points_to_points_matches_open3d(device: str, single_directional
     assert np.allclose(chamfer_wp, chamfer_o3d, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity("chamfer_points_to_points", "pytorch3d")
+def test_chamfer_points_to_points_matches_pytorch3d(device: str) -> None:
+    """
+    Class A: ``loss.chamfer_distance`` is the convention ``triwarp.metrics`` documents.
+
+    This is the pair the module's own prose has been asserting since it was written -- *"Chamfer
+    distances follow the ``pytorch3d`` convention and are built on squared distances"* -- with
+    nothing running pytorch3d. Measured 7.02e-08 relative on two seeded clouds of 300 and 400
+    points, which is the number those docstrings now carry.
+
+    Two **different** clouds, deliberately: ``chamfer_distance(x, x)`` is 0.0 and so is triwarp's,
+    so a self-comparison passes while testing nothing.
+    """
+    rng = np.random.default_rng(7)
+    a_np = rng.normal(size=(300, 3)).astype(np.float32)
+    b_np = (rng.normal(size=(400, 3)) * 1.1).astype(np.float32)
+    chamfer_p3d, _ = p3d_loss.chamfer_distance(
+        points_to_torch(a_np, device), points_to_torch(b_np, device)
+    )
+    chamfer_wp = tw.metrics.chamfer_points_to_points(
+        points_to_warp(a_np, device), points_to_warp(b_np, device)
+    )
+
+    assert float(chamfer_p3d) > 1e-3
+    assert np.allclose(chamfer_wp, float(chamfer_p3d), rtol=1e-6, atol=0.0)
+
+
 # ---------------------------------------------------------------------------
 # Chamfer: mesh to mesh (vertex-to-surface)
 # ---------------------------------------------------------------------------
@@ -252,6 +284,112 @@ def test_chamfer_points_to_mesh_forward_matches_meshlib(
     assert forward_ml.min() > 0.0
     assert np.ptp(forward_ml) > 1e-3
     assert np.allclose(forward_wp, forward_ml, rtol=_MESH_RTOL, atol=_MESH_ATOL)
+
+
+def _point_triangle_squared(points_np: np.ndarray, triangles_np: np.ndarray) -> np.ndarray:
+    """
+    ``(n_points, n_triangles)`` squared point-to-triangle distances, the Ericson region test.
+
+    A hand port of the standard closest-point-on-triangle classification (Ericson, *Real-Time
+    Collision Detection*, section 5.1.5), which is the algorithm ``point_mesh_face_distance``'s
+    CUDA/C++ kernel implements. Section 6 sanctions a hand port as a *test* oracle, and it is
+    needed here rather than optional: pytorch3d returns only the **sum of two directions**, so
+    without an independent per-pair table there is no way to isolate the forward half that triwarp
+    computes. Validated in ``test_chamfer_points_to_mesh_matches_pytorch3d`` both ways -- its
+    forward column reproduces ``trimesh.proximity.closest_point`` to 1e-16 and its two columns
+    summed reproduce pytorch3d's whole scalar to 1.3e-07.
+    """
+    a_np, b_np, c_np = triangles_np[:, 0], triangles_np[:, 1], triangles_np[:, 2]
+    ab_np, ac_np = b_np - a_np, c_np - a_np
+    queries_np = points_np[:, None, :]
+    to_a_np, to_b_np, to_c_np = queries_np - a_np, queries_np - b_np, queries_np - c_np
+    d1_np = np.einsum("ijk,jk->ij", to_a_np, ab_np)
+    d2_np = np.einsum("ijk,jk->ij", to_a_np, ac_np)
+    d3_np = np.einsum("ijk,jk->ij", to_b_np, ab_np)
+    d4_np = np.einsum("ijk,jk->ij", to_b_np, ac_np)
+    d5_np = np.einsum("ijk,jk->ij", to_c_np, ab_np)
+    d6_np = np.einsum("ijk,jk->ij", to_c_np, ac_np)
+    va_np = d3_np * d6_np - d5_np * d4_np
+    vb_np = d5_np * d2_np - d1_np * d6_np
+    vc_np = d1_np * d4_np - d3_np * d2_np
+    denominator_np = va_np + vb_np + vc_np
+    with np.errstate(divide="ignore", invalid="ignore"):
+        weights_np = np.stack([va_np, vb_np, vc_np], axis=-1) / denominator_np[..., None]
+    closest_np = np.einsum("ijk,jkl->ijl", weights_np, triangles_np)
+
+    def on_segment(start_np, end_np, numerator_np, denominator_np):
+        """Take the closest point on one edge, with the parameter clamped to ``[0, 1]``."""
+        safe_np = np.where(denominator_np == 0.0, 1.0, denominator_np)
+        parameter_np = np.clip(
+            np.where(denominator_np == 0.0, 0.0, numerator_np / safe_np), 0.0, 1.0
+        )
+        return start_np + parameter_np[..., None] * (end_np - start_np)
+
+    # The six degenerate regions, applied outermost-last so a vertex region wins over its edges.
+    for region_np, value_np in (
+        (
+            (va_np <= 0) & ((d4_np - d3_np) >= 0) & ((d5_np - d6_np) >= 0),
+            on_segment(b_np, c_np, d4_np - d3_np, (d4_np - d3_np) + (d5_np - d6_np)),
+        ),
+        ((vb_np <= 0) & (d2_np >= 0) & (d6_np <= 0), on_segment(a_np, c_np, d2_np, d2_np - d6_np)),
+        ((vc_np <= 0) & (d1_np >= 0) & (d3_np <= 0), on_segment(a_np, b_np, d1_np, d1_np - d3_np)),
+        ((d6_np >= 0) & (d5_np <= d6_np), np.broadcast_to(c_np, closest_np.shape)),
+        ((d3_np >= 0) & (d4_np <= d3_np), np.broadcast_to(b_np, closest_np.shape)),
+        ((d1_np <= 0) & (d2_np <= 0), np.broadcast_to(a_np, closest_np.shape)),
+    ):
+        closest_np = np.where(region_np[..., None], value_np, closest_np)
+    return np.sum((queries_np - closest_np) ** 2, axis=-1)
+
+
+@pytest.mark.parity("chamfer_points_to_mesh", "pytorch3d")
+def test_chamfer_points_to_mesh_matches_pytorch3d(device: str) -> None:
+    """
+    Class B: pytorch3d's scalar **minus** its face-to-point half is triwarp's forward mean.
+
+    A measured restriction rather than a caution. ``point_mesh_face_distance`` is the sum of two
+    squared means: point-to-*triangle*, which is triwarp's forward direction, and
+    **face-to-point** -- the minimum over the cloud of the point-to-triangle distance, one per
+    face. triwarp's backward direction is mesh-**vertex** to nearest query, a different quantity:
+    measured 0.606 against pytorch3d's 0.586 here, so the two whole scalars are not comparable and
+    the backward direction is deliberately not compared.
+
+    The decomposition is what licenses the subtraction, and it is checked rather than assumed: the
+    hand-ported per-pair table's two columns summed reproduce pytorch3d's scalar to 1.3e-07, and
+    its forward column reproduces ``trimesh.proximity.closest_point`` to 1e-16. Only then is
+    ``scalar - backward`` a quantity triwarp can be held to; measured 1.02e-07 against it.
+
+    ``min_triangle_area`` is left at its default and ``icosphere`` clears it, so no face is
+    silently dropped from pytorch3d's side.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3)
+    rng = np.random.default_rng(5)
+    queries_np = (rng.normal(size=(300, 3)) * 0.9).astype(np.float32)
+    scalar_p3d = float(
+        p3d_loss.point_mesh_face_distance(
+            trimesh_to_pytorch3d(mesh_tm, device), points_to_pytorch3d(queries_np, device=device)
+        )
+    )
+    squared_np = _point_triangle_squared(
+        np.asarray(queries_np, np.float64), np.ascontiguousarray(mesh_tm.vertices[mesh_tm.faces])
+    )
+    forward_np, backward_np = squared_np.min(axis=1).mean(), squared_np.min(axis=0).mean()
+    _, reference_np, _ = tm_proximity.closest_point(mesh_tm, np.asarray(queries_np, np.float64))
+
+    # The oracle is only usable if it reproduces both sides it stands between.
+    assert np.allclose(scalar_p3d, forward_np + backward_np, rtol=1e-6, atol=0.0)
+    assert np.allclose(forward_np, (reference_np**2).mean(), rtol=1e-12, atol=0.0)
+
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    forward_wp = tw.metrics.chamfer_points_to_mesh(
+        points_to_warp(queries_np, device), vertices_wp, faces_wp, single_directional=True
+    )
+    both_wp = tw.metrics.chamfer_points_to_mesh(
+        points_to_warp(queries_np, device), vertices_wp, faces_wp
+    )
+
+    assert np.allclose(forward_wp, scalar_p3d - backward_np, rtol=1e-6, atol=1e-7)
+    # And the backward halves really do differ, so the restriction above is not decoration.
+    assert not np.allclose(both_wp, scalar_p3d, rtol=1e-3, atol=0.0)
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])

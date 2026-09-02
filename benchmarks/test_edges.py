@@ -102,6 +102,35 @@ def test_edges_face(bench_case) -> None:
         assert result.shape == (n_faces * 3,)
 
 
+def _run_edges_pytorch3d(bench_case, *, inverse: bool = False) -> None:
+    """
+    Time ``edges_packed`` (or its face map) with the ``Meshes`` built inside the timed callable.
+
+    Not an optimization to hoist: both are **memoized accessors on an immutable container**, so a
+    shared ``Meshes`` would have rounds 2..n read a cached tensor and the row would report ~0. That
+    makes it the only reference here whose row carries a container construction; the build is one
+    ``torch.as_tensor`` pair over arrays already in the right dtype, measured 0.287 ms on a
+    40 962-vertex mesh against a 3.7 ms normals derivation, so it is a small share of a grouping
+    pass rather than the row.
+    """
+    import pytorch3d.structures as p3d_structures
+    import torch
+
+    vertices_p3d = torch.as_tensor(
+        np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32),
+        device=bench_case.torch_device,
+    )
+    faces_p3d = torch.as_tensor(
+        np.ascontiguousarray(bench_case.faces_np, dtype=np.int64), device=bench_case.torch_device
+    )
+
+    def run_p3d():
+        mesh_p3d = p3d_structures.Meshes(verts=[vertices_p3d], faces=[faces_p3d])
+        return mesh_p3d.faces_packed_to_edges_packed() if inverse else mesh_p3d.edges_packed()
+
+    assert bench_case.run(run_p3d).shape[1] == (3 if inverse else 2)
+
+
 def _run_edges_unique_reference(bench_case) -> None:
     """
     Time whichever unique-undirected-edge reference this case names.
@@ -110,6 +139,9 @@ def _run_edges_unique_reference(bench_case) -> None:
     parameter: no reference takes a vertex-count hint, so each one runs the identical call in both
     groups and its two rows are a fixed bar against triwarp's with/without pair.
     """
+    if bench_case.kind == "pytorch3d":
+        _run_edges_pytorch3d(bench_case)
+        return
     if bench_case.kind == "pyvista":
         # ``extract_all_edges`` returns the same unique undirected set, wrapped in a line-cell
         # PolyData -- so its row carries the container build as well as the grouping.
@@ -133,8 +165,9 @@ def _run_edges_unique_reference(bench_case) -> None:
 
 
 @pytest.mark.benchmark(group="edges_unique")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista", "pytorch3d")
 def test_edges_unique(bench_case) -> None:
+
     if bench_case.kind != "triwarp":
         _run_edges_unique_reference(bench_case)
         return
@@ -144,7 +177,7 @@ def test_edges_unique(bench_case) -> None:
 
 
 @pytest.mark.benchmark(group="edges_unique_auto_nv")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista", "pytorch3d")
 def test_edges_unique_auto_n_vertices(bench_case) -> None:
     """
     Time ``edges_unique`` without the ``n_vertices=`` shortcut.
@@ -156,6 +189,16 @@ def test_edges_unique_auto_n_vertices(bench_case) -> None:
     none of them has one: they compute the identical unique edge list either way, so their rows are
     the fixed bar and the difference between the two groups is entirely triwarp's inference. Read
     the pair, not this row alone -- on its own it prices a reference that never changes.
+
+    Time the unique undirected edge list with the ``n_vertices=`` radix hint supplied.
+
+    **pytorch3d** joins the reference set as ``Meshes.edges_packed``, which is the same
+    deduplication keyed on the hash ``V * v0 + v1`` -- so its rows come back already lexsorted,
+    which is why ``tests/test_edges.py::test_edges_unique_and_inverse_match_pytorch3d`` only has to
+    move triwarp's side. It is a memoized accessor on an immutable container, so its ``Meshes``
+    is built **inside** the timed callable; reading it on a shared object would price nothing.
+
+    **pytorch3d** has no hint either, so its row is the same fixed bar the other three are.
     """
     if bench_case.kind != "triwarp":
         _run_edges_unique_reference(bench_case)
@@ -195,8 +238,11 @@ def test_edges_unique_manifold(bench_case) -> None:
 
 
 @pytest.mark.benchmark(group="edges_unique_inverse")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pytorch3d")
 def test_edges_unique_inverse(bench_case) -> None:
+    if bench_case.kind == "pytorch3d":
+        _run_edges_pytorch3d(bench_case, inverse=True)
+        return
     if bench_case.kind == "triwarp":
         faces, nv = bench_case.faces_wp, bench_case.n_vertices
         result = bench_case.run(lambda: tw.edges.edges_unique_inverse(faces, n_vertices=nv))
@@ -225,6 +271,14 @@ def test_edges_unique_length(bench_case) -> None:
     different route to the same answer -- and the structure is lazily built and cached on the
     topology like the AABB tree, so the mesh is built inside the timed callable to keep that build
     inside the measurement, matching the dedup the other two rows pay for.
+
+    Time the directed-edge to unique-edge map, which on every side is the grouping's inverse.
+
+    **pytorch3d**'s ``faces_packed_to_edges_packed`` is the same map in its own edge numbering and
+    in the column order ``(e12, e20, e01)``; both are named transforms in
+    ``tests/test_edges.py::test_edges_unique_and_inverse_match_pytorch3d`` and neither costs
+    anything. Its ``Meshes`` is built inside the timed callable, for the memoization reason the
+    ``edges_unique`` group gives.
     """
     if bench_case.kind == "meshlib":
 

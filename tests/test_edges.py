@@ -20,6 +20,7 @@ from tests.conversions import (
     pyvista_edges_to_indices,
     trimesh_to_meshlib,
     trimesh_to_pymeshlab,
+    trimesh_to_pytorch3d,
     trimesh_to_pyvista,
 )
 
@@ -290,6 +291,57 @@ def test_edges_unique_and_inverse_match_igl(request: pytest.FixtureRequest, mesh
     resolved_wp = np.sort(unique_edges_np[inverse_wp.numpy()], axis=1)
     resolved_igl = np.sort(unique_edges_igl[inverse_igl][order_igl], axis=1)
     assert np.array_equal(resolved_wp, resolved_igl)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("edges_unique", "pytorch3d")
+@pytest.mark.parity("edges_unique_auto_nv", "pytorch3d")
+@pytest.mark.parity("edges_unique_inverse", "pytorch3d")
+def test_edges_unique_and_inverse_match_pytorch3d(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B, twice: the edge set after a sort, and the inverse map after a remap and a permutation.
+
+    ``Meshes.edges_packed`` orders its rows by the hash ``V * v0 + v1``, i.e. already lexsorted, so
+    only triwarp's side moves for the set half. The inverse half needs two steps and both were
+    recovered by measurement: pytorch3d numbers its unique edges differently, so triwarp's labels
+    are remapped into pytorch3d's numbering through the sorted pair, and only then does the column
+    order line up -- ``faces_packed_to_edges_packed[:, (2, 0, 1)]``, because pytorch3d builds it by
+    concatenating ``[e12, e20, e01]`` and reshaping, against triwarp's ``(e01, e12, e20)``.
+
+    Doing the remap *and* the permutation is what makes this a check of the map rather than of the
+    edge set: it fails on an off-by-one, on a permuted table, or on two directed edges assigned to
+    the wrong unique row.
+
+    ``edges_unique_auto_nv`` rides here because pytorch3d has no vertex-count hint either -- it
+    computes the same list whichever way triwarp is called, so one comparison covers both groups.
+    The hinted and inferred calls are asserted equal below rather than the marker resting on the
+    hint being irrelevant; that equality *is* the whole content of the inferred-base group, since
+    the hint only chooses the radix width.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh_p3d = trimesh_to_pytorch3d(mesh_tm)
+    edges_p3d = mesh_p3d.edges_packed().numpy()
+    face_edges_p3d = mesh_p3d.faces_packed_to_edges_packed().numpy()
+
+    n_vertices = int(mesh_wp.points.shape[0])
+    unique_edges_wp, inverse_wp = tw.edges.edges_unique(mesh_wp.indices)
+    unique_edges_np = unique_edges_wp.numpy()
+    hinted_edges_wp, hinted_inverse_wp = tw.edges.edges_unique(
+        mesh_wp.indices, n_vertices=n_vertices
+    )
+    assert np.array_equal(hinted_edges_wp.numpy(), unique_edges_np)
+    assert np.array_equal(hinted_inverse_wp.numpy(), inverse_wp.numpy())
+    face_edges_np = tw.edges.edges_unique_inverse(mesh_wp.indices).numpy().reshape(-1, 3)
+
+    assert edges_p3d.shape[0] > 0
+    assert np.array_equal(inverse_wp.numpy().reshape(-1, 3), face_edges_np)
+    assert_unordered_rows_equal(np.sort(unique_edges_np, axis=1), np.sort(edges_p3d, axis=1))
+
+    slot_p3d = {tuple(row): index for index, row in enumerate(np.sort(edges_p3d, axis=1).tolist())}
+    remap_np = np.array([slot_p3d[tuple(row)] for row in np.sort(unique_edges_np, axis=1).tolist()])
+    assert np.array_equal(remap_np[face_edges_np], face_edges_p3d[:, [2, 0, 1]])
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])

@@ -77,13 +77,14 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops as p3d_ops
 import pyvista as pv
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, points_torch_from_numpy, skip_larger_than
 
 _SEED = 42
 _N_POINTS = 20_000
@@ -227,7 +228,7 @@ def _o3d_criteria() -> o3d.pipelines.registration.ICPConvergenceCriteria:
 
 
 @pytest.mark.benchmark(group="procrustes")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "meshlib")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "meshlib", "pytorch3d")
 def test_procrustes(bench_case: BenchCase) -> None:
     """
     Procrustes fit on exact correspondences: tiled reductions plus the SVD kernel.
@@ -238,7 +239,27 @@ def test_procrustes(bench_case: BenchCase) -> None:
     upper bound on the solver and against the other three rows' array interfaces rather than as a
     like-for-like fit; the transform it returns agrees with triwarp's to 1e-06
     (``tests/test_registration.py``).
+
+    **pytorch3d**'s ``corresponding_points_alignment`` is the same closed-form fit on the same
+    exact correspondences -- the fifth engine here and the only one with GPU kernels. Its
+    convention is the row-vector one (``s * X @ R + T = Y``), so its ``R`` is triwarp's linear
+    block transposed; that is a naming difference and not work, which is what makes the ratio
+    readable. ``estimate_scale=False`` matches the ``scale=False`` triwarp's row passes, and
+    ``allow_reflection`` is left at its default ``False`` to match ``reflection=False``.
     """
+    if bench_case.kind == "pytorch3d":
+        source_np, indices = _source_np(bench_case)
+        source_p3d = points_torch_from_numpy(source_np, bench_case.torch_device)
+        target_p3d = points_torch_from_numpy(
+            bench_case.vertices_np[indices], bench_case.torch_device
+        )
+        aligned_p3d = bench_case.run(
+            lambda: p3d_ops.corresponding_points_alignment(
+                source_p3d, target_p3d, estimate_scale=False
+            )
+        )
+        assert abs(float(aligned_p3d.s[0]) - 1.0) < 1e-4
+        return
     source_np, indices = _source_np(bench_case)
     if bench_case.kind == "meshlib":
         skip_larger_than(
@@ -291,7 +312,7 @@ def test_procrustes(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="icp_point_cloud")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "meshlib")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "meshlib", "pytorch3d")
 def test_icp_point_cloud(bench_case: BenchCase) -> None:
     """
     Point-to-point ICP against a point-cloud target: BVH versus cKDTree versus KDTreeFlann.
@@ -304,7 +325,32 @@ def test_icp_point_cloud(bench_case: BenchCase) -> None:
     else. The solver object is stateful and caches its trees, so it is built inside the timed
     callable exactly as trimesh's per-iteration cKDTree is -- the two clouds are the input and are
     not.
+
+    **pytorch3d** is the fifth engine and the second GPU one, and its inner loop is the brute-force
+    ``knn_points`` -- no tree, no grid -- so on the CPU row it is quadratic in the cloud size per
+    iteration and is capped accordingly. ``estimate_scale=False`` matches triwarp's default;
+    ``max_iterations`` is matched to the other rows, but note the *actual* count is each library's
+    own convergence rule, so a row that converges early is reporting fewer iterations rather than a
+    faster one -- which is the same caveat this group's rotation axis exists to expose.
     """
+    if bench_case.kind == "pytorch3d":
+        if bench_case.torch_device == "cpu":
+            skip_larger_than(
+                bench_case, "bunny_decimated", "its per-iteration k-NN is brute force over pairs"
+            )
+        source_p3d = points_torch_from_numpy(_source_np(bench_case)[0], bench_case.torch_device)
+        target_p3d = points_torch_from_numpy(bench_case.vertices_np, bench_case.torch_device)
+        solution_p3d = bench_case.run(
+            lambda: p3d_ops.iterative_closest_point(
+                source_p3d,
+                target_p3d,
+                estimate_scale=False,
+                max_iterations=_ICP_ITERATIONS,
+                verbose=False,
+            )
+        )
+        assert abs(float(solution_p3d.RTs.s[0]) - 1.0) < 1e-4
+        return
     if bench_case.kind == "meshlib":
         skip_larger_than(bench_case, "bunny", "the sampling and tree build are CPU-side")
         source_np = _source_np(bench_case)[0]

@@ -4,19 +4,23 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import pytorch3d.structures as p3d_structures
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
 from scipy.spatial import cKDTree
 
 import triwarp as tw
+from tests.conftest import CLOSED_MESHES
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
+    numpy_to_warp,
     open3d_to_trimesh,
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
+    trimesh_to_pytorch3d,
 )
 
 
@@ -81,6 +85,29 @@ def test_concatenate_matches_meshlib(request: pytest.FixtureRequest) -> None:
     assert merged_tm.faces.shape[0] == mesh_a_tm.faces.shape[0] + mesh_b_tm.faces.shape[0]
     assert np.allclose(concat_vertices_wp.numpy(), merged_tm.vertices, rtol=1e-5, atol=1e-5)
     assert np.array_equal(concat_faces_wp.numpy().reshape(-1, 3), merged_tm.faces)
+
+
+@pytest.mark.parity("concatenate", "pytorch3d")
+def test_concatenate_matches_pytorch3d(request: pytest.FixtureRequest) -> None:
+    """
+    Class A: ``join_meshes_as_scene`` is ``concatenate`` -- positions exact, faces byte-equal.
+
+    "As a scene" is the operation that matters: it concatenates the vertex buffers and shifts each
+    mesh's face indices by the running vertex count, which is triwarp's packing verbatim. The
+    faces comparison is positional and passes, so the two agree on the *order* of the meshes and
+    not merely on the resulting soup -- the sibling ``join_meshes_as_batch`` would keep them as a
+    minibatch instead and is not this operation.
+    """
+    meshes_tm = [request.getfixturevalue(name)[0] for name in CLOSED_MESHES]
+    joined_p3d = p3d_structures.join_meshes_as_scene(
+        [trimesh_to_pytorch3d(mesh_tm) for mesh_tm in meshes_tm]
+    )
+    meshes_wp = [numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, "cpu") for mesh_tm in meshes_tm]
+    vertices_wp, faces_wp = tw.combine.concatenate(meshes_wp)
+
+    assert joined_p3d.verts_packed().shape[0] == sum(len(m.vertices) for m in meshes_tm)
+    assert np.array_equal(vertices_wp.numpy(), joined_p3d.verts_packed().numpy())
+    assert np.array_equal(faces_wp.numpy().reshape(-1, 3), joined_p3d.faces_packed().numpy())
 
 
 def test_concatenate_single_mesh(request: pytest.FixtureRequest) -> None:

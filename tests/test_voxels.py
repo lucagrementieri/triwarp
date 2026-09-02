@@ -28,14 +28,17 @@ import igl
 import numpy as np
 import open3d as o3d
 import pytest
+import pytorch3d.ops as p3d_ops
 import pyvista as pv
 import scipy.ndimage as ndi
+import torch
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+import triwarp.typing as twt
 from tests.comparisons import lexsort_rows
 from tests.conversions import (
     meshlib_bitset_to_numpy,
@@ -43,7 +46,9 @@ from tests.conversions import (
     numpy_to_meshlib_bitset,
     numpy_to_warp,
     points_to_meshlib,
+    points_to_torch,
     points_to_warp,
+    pytorch3d_to_numpy,
     trimesh_to_open3d,
     trimesh_to_pyvista,
     warp_to_trimesh,
@@ -585,6 +590,146 @@ def test_grid_points_matches_igl(device: str):
     assert np.allclose(lattice_wp[1], [0.0, 0.0, 0.2])
 
 
+@pytest.mark.parity("splat_onto_grid", "pytorch3d")
+def test_splat_onto_grid_matches_pytorch3d(device: str):
+    """
+    Class B: ``add_points_features_to_volume_densities_features`` under one **axis transpose**.
+
+    Both outputs agree at exactly **0.0** on the host and at 4.8e-07 / 3.6e-07 on CUDA, where the
+    two sides' atomic accumulations commit in different orders -- and that pins the whole
+    convention: the trilinear weights, the density accumulation and the
+    ``max(density, min_weight)`` division are the reference's, bit for bit where the order allows.
+
+    The transpose is the only transform and it is not a tolerance: pytorch3d stores its volume as
+    ``(minibatch, channels, D, H, W)`` and reads a point's ``(x, y, z)`` into ``(W, H, D)``, so its
+    lattice is indexed ``[z, y, x]`` where triwarp's is ``[x, y, z]``. Its local coordinates are
+    the ``[-1, 1]`` cube with ``align_corners=True``, which is triwarp's
+    ``bounds=(-1, -1, -1), (1, 1, 1)`` exactly, so the coordinate map contributes nothing here --
+    a fixture on a different box would need it and would be measuring the map rather than the
+    splat.
+
+    ``rescale_features=True`` is pytorch3d's default and is what makes both sides an *average*; at
+    ``False`` its features would be the raw accumulation and triwarp has no such switch.
+    """
+    resolution = 8
+    rng = np.random.default_rng(4)
+    points_np = (rng.random((300, 3)) * 1.6 - 0.8).astype(np.float32)
+    values_np = rng.normal(size=(300, 3)).astype(np.float32)
+    shape_p3d = (1, 3, resolution, resolution, resolution)
+    features_p3d, densities_p3d = p3d_ops.add_points_features_to_volume_densities_features(
+        points_to_torch(points_np, device),
+        points_to_torch(values_np, device),
+        torch.zeros((1, 1, resolution, resolution, resolution), device=device),
+        torch.zeros(shape_p3d, device=device),
+        mode="trilinear",
+        min_weight=1e-4,
+        align_corners=True,
+    )
+    field_wp, density_wp = tw.voxels.splat_onto_grid(
+        points_to_warp(points_np, device),
+        points_to_warp(values_np, device),
+        (resolution,) * 3,
+        bounds=(wp.vec3(-1.0, -1.0, -1.0), wp.vec3(1.0, 1.0, 1.0)),
+    )
+
+    assert features_p3d.shape == shape_p3d
+    assert float(densities_p3d.sum()) == pytest.approx(points_np.shape[0], rel=1e-6)
+    assert np.allclose(
+        density_wp.numpy(),
+        densities_p3d[0, 0].cpu().numpy().transpose(2, 1, 0),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert np.allclose(
+        field_wp.numpy(), features_p3d[0].cpu().numpy().transpose(3, 2, 1, 0), rtol=1e-5, atol=1e-6
+    )
+
+
+@pytest.mark.parity("sample_grid_trilinear", "pytorch3d")
+def test_sample_grid_trilinear_matches_pytorch3d(device: str):
+    """
+    Class B: ``torch.nn.functional.grid_sample`` is the gather half, under the same axis transpose.
+
+    The reference is torch's own trilinear sampler rather than a pytorch3d entry point, because
+    that *is* what pytorch3d's volume sampling is -- ``Volumes`` hands ``grid_sample`` its
+    ``[-1, 1]`` local coordinates -- and it is the independent implementation of the stencil this
+    kernel writes. Two conventions and nothing else: the volume is ``(N, C, D, H, W)`` so a point's
+    ``(x, y, z)`` goes in as ``(x, y, z)`` and indexes ``[z, y, x]``, and ``align_corners=True``
+    puts ``-1`` on the first sample rather than on the cell edge, which is triwarp's ``bounds``.
+
+    ``padding_mode="border"`` is the one that matches: triwarp clamps its base cell, so a query
+    outside the lattice reads the boundary stencil rather than zero. Measured 4.77e-07 -- float32,
+    not exact, because torch and Warp sum the eight corners in different orders.
+
+    Also a **triwarp-against-triwarp** round trip, and the reference comparison above carries the
+    oracle for it: points placed *on* the lattice corners make each stencil degenerate to its own
+    corner, so a splat followed by a sample is the identity at **0.0** on any field.
+    """
+    resolution = 8
+    rng = np.random.default_rng(6)
+    field_np = rng.normal(size=(resolution, resolution, resolution)).astype(np.float32)
+    queries_np = (rng.random((200, 3)) * 1.8 - 0.9).astype(np.float32)
+
+    # (N, C, D, H, W) with [z, y, x] indexing against triwarp's [x, y, z].
+    volume_p3d = torch.as_tensor(field_np.transpose(2, 1, 0), device=device)[None, None]
+    sampled_p3d = torch.nn.functional.grid_sample(
+        volume_p3d,
+        points_to_torch(queries_np, device).reshape(1, 1, 1, -1, 3),
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    ).reshape(-1)
+    field_wp = twt.as_array3d(wp.array(field_np, dtype=wp.float32, device=device), wp.float32)
+    sampled_wp = tw.voxels.sample_grid_trilinear(
+        field_wp,
+        points_to_warp(queries_np, device),
+        bounds=(wp.vec3(-1.0, -1.0, -1.0), wp.vec3(1.0, 1.0, 1.0)),
+    )
+
+    assert sampled_p3d.shape == (queries_np.shape[0],)
+    assert float(np.ptp(sampled_p3d.cpu().numpy())) > 1.0
+    assert np.allclose(sampled_wp.numpy(), sampled_p3d.cpu().numpy(), rtol=1e-5, atol=1e-6)
+
+    # The exact round trip: on-lattice points, so each stencil is its own corner.
+    lattice_np = np.stack(
+        np.meshgrid(*[np.arange(resolution, dtype=np.float32)] * 3, indexing="ij"), axis=-1
+    ).reshape(-1, 3)
+    values_np = rng.normal(size=lattice_np.shape[0]).astype(np.float32)
+    lattice_wp = points_to_warp(lattice_np, device)
+    splatted_wp, density_wp = tw.voxels.splat_onto_grid(
+        lattice_wp, wp.array(values_np, dtype=wp.float32, device=device), (resolution,) * 3
+    )
+    round_trip_wp = tw.voxels.sample_grid_trilinear(splatted_wp, lattice_wp)
+
+    assert np.array_equal(density_wp.numpy(), np.ones((resolution,) * 3, dtype=np.float32))
+    assert np.array_equal(round_trip_wp.numpy(), values_np)
+
+
+def test_splat_onto_grid_invalid_arguments(device: str):
+    """Not a parity assert: the guards ``splat_onto_grid`` and its inverse document."""
+    points_wp = points_to_warp(np.zeros((4, 3), dtype=np.float32), device)
+    values_wp = wp.zeros(4, dtype=wp.float32, device=device)
+    with pytest.raises(ValueError, match="three positive integers"):
+        tw.voxels.splat_onto_grid(points_wp, values_wp, (4, 0, 4))
+    with pytest.raises(ValueError, match="same length"):
+        tw.voxels.splat_onto_grid(
+            points_wp, wp.zeros(3, dtype=wp.float32, device=device), (4, 4, 4)
+        )
+    with pytest.raises(ValueError, match="min_weight must be positive"):
+        tw.voxels.splat_onto_grid(points_wp, values_wp, (4, 4, 4), min_weight=0.0)
+    with pytest.raises(ValueError, match="rank-3 lattice"):
+        tw.voxels.sample_grid_trilinear(values_wp, points_wp)
+
+    # An empty cloud is a zero field and a zero density, not an error.
+    empty_wp = points_to_warp(np.zeros((0, 3), dtype=np.float32), device)
+    field_wp, density_wp = tw.voxels.splat_onto_grid(
+        empty_wp, wp.zeros(0, dtype=wp.float32, device=device), (4, 4, 4)
+    )
+    assert not field_wp.numpy().any()
+    assert not density_wp.numpy().any()
+    assert int(tw.voxels.sample_grid_trilinear(field_wp, empty_wp).shape[0]) == 0
+
+
 def test_grid_points_defaults_to_index_space(device: str):
     """``bounds=None`` gives lattice indices, matching ``levelset.marching_cubes``."""
     lattice = tw.voxels.grid_points((2, 3, 4), device=device).numpy()
@@ -984,6 +1129,81 @@ def test_to_boxes_culled_is_a_closed_outward_shell(sphere, device: str):
     assert shell.is_watertight
     # Positive volume is the winding claim: an inward-wound shell would report the negative.
     assert shell.volume == pytest.approx(n_voxels * voxel_size**3, rel=1e-5)
+
+
+def _bbox_normalized(points_np: np.ndarray) -> np.ndarray:
+    """Map a point set into the unit cube by its own bounding box, so two addressings compare."""
+    points_np = np.asarray(points_np, dtype=np.float64)
+    lower_np, upper_np = points_np.min(axis=0), points_np.max(axis=0)
+    return (points_np - lower_np) / (upper_np - lower_np)
+
+
+@pytest.mark.parity(
+    "to_boxes",
+    "pytorch3d",
+    benchmarked=False,
+    reason="the to_boxes group is pinned to cull_internal=False so that trimesh's multibox and "
+    "VTK's glyph filter are like-for-like unwelded rows, and cubify culls and compacts -- timing "
+    "it there would race a 33x smaller face buffer against triwarp's all-faces row (23 136 "
+    "triangles against 762 816 on a 64-cubed sphere). The like-for-like pair was measured anyway "
+    "and is not the interesting kind of gap: cubify 2.238 ms against to_boxes(cull_internal=True) "
+    "at 1.850 ms on 63 568 voxels, CUDA both sides.",
+)
+def test_to_boxes_matches_pytorch3d(device: str):
+    """
+    Class B: ``ops.cubify`` is ``to_boxes(cull_internal=True)`` under one affine coordinate map.
+
+    Both cull the faces between two occupied voxels and both compact the interior corners away, so
+    the counts agree **exactly** -- 74 vertices and 144 faces at resolution 6 -- and what remains
+    is the addressing. triwarp takes ``(voxel_size, origin)`` and pytorch3d normalizes into its own
+    grid, so the comparison is on bounding-box-normalized coordinates, sorted (nothing pins two
+    emission orders). Measured 5.96e-08.
+
+    ``align`` is **not** one of the transforms, and that is worth recording because it looks like
+    it should be: all three of ``"topleft"`` / ``"corner"`` / ``"center"`` return the *identical*
+    face buffer and vertex count, differing only by a uniform scale and a translation -- bounding
+    boxes ``[-0.6, 1.0]``, ``[-0.667, 0.667]`` and ``[-0.8, 0.8]`` on this fixture. So all three
+    are already reachable through ``from_cells(cells, voxel_size, origin)`` and the normalization
+    below absorbs the difference; asserting that here is what keeps the next reader from adding an
+    ``align=`` keyword that would be a second spelling of ``voxel_size`` and ``origin``.
+
+    The unreferenced-vertex assert is the other half: ``to_boxes`` used to return the whole corner
+    lattice, 117 corners where 74 are referenced at this resolution and 4 370 680 where 190 640
+    are at 4.3 M voxels, and that padding was what stood between the two answers.
+    """
+    resolution = 6
+    axis_np = (np.arange(resolution) + 0.5) / resolution * 2.0 - 1.0
+    x_np, y_np, z_np = np.meshgrid(axis_np, axis_np, axis_np, indexing="ij")
+    occupancy_np = ((x_np**2 + y_np**2 + z_np**2) < 0.6).astype(np.float32)
+    occupancy_p3d = torch.as_tensor(occupancy_np, device=device)[None]
+
+    boxes_p3d = p3d_ops.cubify(occupancy_p3d, thresh=0.5, align="topleft")
+    vertices_p3d, faces_p3d = pytorch3d_to_numpy(boxes_p3d)
+    # All three alignments are one uniform scale plus a translation apart, so the normalization
+    # below makes them the same answer -- there is nothing for an ``align=`` keyword to express.
+    for align in ("corner", "center"):
+        other_p3d, other_faces_p3d = pytorch3d_to_numpy(
+            p3d_ops.cubify(occupancy_p3d, thresh=0.5, align=align)
+        )
+        assert np.array_equal(other_faces_p3d, faces_p3d)
+        assert np.allclose(_bbox_normalized(other_p3d), _bbox_normalized(vertices_p3d), atol=1e-6)
+
+    cells_np = np.ascontiguousarray(np.argwhere(occupancy_np > 0.5), dtype=np.int32)
+    grid = tw.voxels.from_cells(
+        wp.array(cells_np, dtype=wp.int32, device=device), 1.0, wp.vec3(0.0, 0.0, 0.0)
+    )
+    vertices_wp, faces_wp = tw.voxels.to_boxes(grid, cull_internal=True)
+    vertices_np, faces_np = vertices_wp.numpy(), faces_wp.numpy().reshape(-1, 3)
+
+    assert vertices_p3d.shape[0] > 0
+    assert np.unique(faces_np).size == vertices_np.shape[0], "to_boxes left a corner unreferenced"
+    assert vertices_np.shape[0] == vertices_p3d.shape[0]
+    assert faces_np.shape[0] == faces_p3d.shape[0]
+    assert np.allclose(
+        lexsort_rows(np.round(_bbox_normalized(vertices_np), 5)),
+        lexsort_rows(np.round(_bbox_normalized(vertices_p3d), 5)),
+        atol=1e-6,
+    )
 
 
 @pytest.mark.parity("voxel_corners", "igl")

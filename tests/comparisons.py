@@ -15,6 +15,7 @@ The classes of comparison, and the bar each has to clear (see CLAUDE.md section 
 - **C** a derived scalar or set distance, because no correspondence between the two answers exists.
   [`symmetric_surface_distance`][tests.comparisons.symmetric_surface_distance],
   [`symmetric_chamfer`][tests.comparisons.symmetric_chamfer],
+  [`chamfer_two_sided`][tests.comparisons.chamfer_two_sided],
   [`hausdorff_two_sided`][tests.comparisons.hausdorff_two_sided] and
   [`fraction_within`][tests.comparisons.fraction_within] are the class-C machinery. A class-C assert
   must name the bug class it excludes and record its measured margin in the test docstring -- a
@@ -453,6 +454,31 @@ def symmetric_surface_distance(
     return mean, float(max(a_to_b.max(), b_to_a.max()))
 
 
+def chamfer_two_sided(points_a: np.ndarray, points_b: np.ndarray) -> float:
+    """
+    Two-sided mean-squared Chamfer distance between two **point sets**, in pytorch3d's convention.
+
+    The point-set counterpart of [`symmetric_chamfer`][tests.comparisons.symmetric_chamfer], which
+    takes two *meshes* and samples them itself -- so it is what a comparison between two samplers
+    that have already produced their clouds needs, and handing point arrays to the mesh form
+    raises inside trimesh rather than doing something sensible.
+
+    The sum of the two directions' mean **squared** nearest-neighbour distances, which is what
+    ``pytorch3d.loss.chamfer_distance`` and [`triwarp.metrics.chamfer_points_to_points`]
+    [triwarp.metrics.chamfer_points_to_points] both return, so a threshold calibrated here reads
+    on the same scale as those.
+
+    Prefer this over [`hausdorff_two_sided`][tests.comparisons.hausdorff_two_sided] when the claim
+    is distributional. Measured on two independent 1 000-point samplings of ``icosphere(2)``: the
+    mean statistic separates the same mesh from one scaled by 1.15 by a factor of **6.8** (0.00768
+    against 0.05227), where the worst-case Hausdorff separates them by **1.4** (0.162 against
+    0.228) -- one stray sample in a tail dominates the max and swamps the signal.
+    """
+    a = np.asarray(points_a, dtype=np.float64)
+    b = np.asarray(points_b, dtype=np.float64)
+    return float((cKDTree(b).query(a)[0] ** 2).mean() + (cKDTree(a).query(b)[0] ** 2).mean())
+
+
 def hausdorff_two_sided(points_a: np.ndarray, points_b: np.ndarray) -> float:
     """
     Two-sided Hausdorff distance between two point sets -- the worst-case counterpart to chamfer.
@@ -471,6 +497,9 @@ def hausdorff_two_sided(points_a: np.ndarray, points_b: np.ndarray) -> float:
     [`hausdorff_surface_two_sided`][tests.comparisons.hausdorff_surface_two_sided]
         The same worst-case statement between two *surfaces*, which needs no correspondence between
         the meshes and no shared vertex count.
+    [`chamfer_two_sided`][tests.comparisons.chamfer_two_sided]
+        The averaged counterpart over the same two point sets, and the better discriminator where
+        the claim is distributional rather than worst-case.
     """
     a = np.asarray(points_a, dtype=np.float64)
     b = np.asarray(points_b, dtype=np.float64)

@@ -2,7 +2,7 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.kernels.array import binary_search_index
+from triwarp.kernels.array import binary_search_index, trilinear_cell, trilinear_weight
 
 
 @wp.func
@@ -285,12 +285,87 @@ def mark_membership_mask(
 #
 # Each set is the dtypes its call sites actually build, not a menu: ``scatter_add`` accumulates a
 # ``wp.float32`` per-component volume in ``repair`` and a ``wp.vec2d`` tangent field in
+@wp.kernel(enable_backward=False)
+def splat_grid_trilinear(
+    points: wp.array[wp.vec3],
+    values: wp.array[Any],
+    lower: wp.vec3,
+    inverse_spacing: wp.vec3,
+    out_field: wp.array3d[Any],
+    out_density: wp.array3d[wp.float32],
+) -> None:
+    # Accumulate one value into the eight lattice corners around its position, weighted
+    # trilinearly, and the same eight weights into a density lattice.
+    #
+    # The density is not an optional extra: the eight weights sum to 1 per point, so ``density``
+    # holds the number of points each corner "saw" and dividing the field by it is what turns an
+    # accumulation into an average. The wrapper does that division, because the floor it needs
+    # (a corner no point reached) is a policy rather than arithmetic.
+    #
+    # ``kernels/interpolation.sample_grid_trilinear`` is the transpose of this kernel, and
+    # ``kernels/reconstruction.splat_normals`` is the same stencil specialized to a flat
+    # ``res**3`` float32 buffer with a confidence weight; all three share ``trilinear_cell`` and
+    # ``trilinear_weight``.
+    s = wp.int32(wp.tid())
+    shape = wp.vec3i(out_field.shape[0], out_field.shape[1], out_field.shape[2])
+    base, fractions = trilinear_cell(wp.cw_mul(points[s] - lower, inverse_spacing), shape)
+    value = values[s]
+    for offset_x in range(2):
+        for offset_y in range(2):
+            for offset_z in range(2):
+                weight = trilinear_weight(fractions, offset_x, offset_y, offset_z)
+                i = base[0] + offset_x
+                j = base[1] + offset_y
+                k = base[2] + offset_z
+                wp.atomic_add(out_field, i, j, k, weight * value)
+                wp.atomic_add(out_density, i, j, k, weight)
+
+
+@wp.kernel(enable_backward=False)
+def divide_by_density(
+    density: wp.array3d[wp.float32], min_weight: wp.float32, out_field: wp.array3d[Any]
+) -> None:
+    # Turn ``splat_grid_trilinear``'s accumulation into a weighted mean, in place.
+    #
+    # The denominator is ``max(density, min_weight)``, not a branch on it: that is what keeps a
+    # lattice larger than its point cloud finite instead of full of amplified noise, and it is the
+    # convention the reference uses (``volume_densities.clamp(min_weight)``). A corner nothing
+    # reached still comes out zero either way, since its numerator is zero too -- the two spellings
+    # differ only for a corner whose density is *between* zero and the floor, where the clamp
+    # scales the answer down smoothly rather than discarding it. An in-place output, so the
+    # argument keeps the ``out_`` prefix and the CLAUDE.md section 3 allowlist carries it.
+    i, j, k = wp.tid()
+    out_field[i, j, k] = out_field[i, j, k] / wp.max(density[i, j, k], min_weight)
+
+
 # ``heat.vector``, and the two mass/curvature scatters follow their wrapper's precision keyword.
 _VALUE_DTYPES = (wp.float32, wp.float64)
 
 
+# ``splat_grid_trilinear``'s dtype set is the pair its wrapper
+# [`voxels.splat_onto_grid`][triwarp.voxels.splat_onto_grid] documents and its inverse
+# [`interpolation.sample_grid_trilinear`][triwarp.interpolation.sample_grid_trilinear] registers:
+# ``wp.float32`` for a scalar field and ``wp.vec3`` for a vector one. Not ``wp.float64`` -- the
+# weights and the density lattice are float32, so a float64 field would carry a float32 accuracy
+# floor and the wider dtype would be a promise the kernel cannot keep.
+_GRID_DTYPES = (wp.float32, wp.vec3)
+
+
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in _GRID_DTYPES:
+        wp.overload(divide_by_density, [wp.array3d[wp.float32], wp.float32, wp.array3d[dtype]])
+        wp.overload(
+            splat_grid_trilinear,
+            [
+                wp.array[wp.vec3],
+                wp.array[dtype],
+                wp.vec3,
+                wp.vec3,
+                wp.array3d[dtype],
+                wp.array3d[wp.float32],
+            ],
+        )
     for dtype in (*_VALUE_DTYPES, wp.vec2d, wp.vec3):
         wp.overload(scatter_add, [wp.array[dtype], wp.array[wp.int32], wp.array[dtype]])
     for dtype in _VALUE_DTYPES:

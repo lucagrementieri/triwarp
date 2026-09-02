@@ -1567,7 +1567,7 @@ def bare_annotation_problems() -> list[str]:
 # ``_LIBRARY_SUFFIXES`` -- the two encode the same convention independently, so a reference added
 # to one and not the other is enforced by half the gate. Measured clean: the only ``*_gl`` names in
 # the suite are ``image_gl``, ``covered_gl`` and ``class_gl``, all moderngl's.
-_REFERENCE_SUFFIXES = ("_tm", "_igl", "_pp", "_pml", "_o3d", "_pv", "_ml", "_pmf", "_gl")
+_REFERENCE_SUFFIXES = ("_tm", "_igl", "_pp", "_pml", "_o3d", "_pv", "_ml", "_pmf", "_gl", "_p3d")
 
 # The four phrases the suite uses to label a comparison, all four in good standing. ``Class [ABCD]``
 # and ``Not a library comparison`` are section 6's named labels; ``Not a parity assert`` and

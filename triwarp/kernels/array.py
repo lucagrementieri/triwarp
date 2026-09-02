@@ -639,3 +639,40 @@ def pack_nearest_key(distance: wp.float32, index: wp.int32) -> wp.int64:
     # sentinel.
     distance_bits = wp.uint64(wp.uint32(wp.cast(distance, wp.int32)))
     return wp.int64((distance_bits << wp.uint64(32)) | wp.uint64(wp.uint32(index)))
+
+
+@wp.func
+def trilinear_cell(coordinate: wp.vec3, shape: wp.vec3i) -> tuple[wp.vec3i, wp.vec3]:
+    # Decompose a continuous lattice coordinate into its base corner and the three fractional
+    # offsets, clamping the corner so the ``+1`` reads of a trilinear stencil stay in range. Exact
+    # integer and subtraction work, which is why the three callers share it safely: extracting it
+    # reorders nothing and a float32 result cannot drift.
+    #
+    # A degenerate axis (``shape[k] < 2``) collapses to corner 0 with fraction 0, so a single-slice
+    # lattice reads and writes that slice rather than indexing out of bounds.
+    limit = wp.vec3i(wp.max(shape[0] - 2, 0), wp.max(shape[1] - 2, 0), wp.max(shape[2] - 2, 0))
+    base = wp.vec3i(
+        wp.clamp(wp.int32(wp.floor(coordinate[0])), 0, limit[0]),
+        wp.clamp(wp.int32(wp.floor(coordinate[1])), 0, limit[1]),
+        wp.clamp(wp.int32(wp.floor(coordinate[2])), 0, limit[2]),
+    )
+    return base, wp.vec3(
+        wp.clamp(coordinate[0] - wp.float32(base[0]), 0.0, 1.0),
+        wp.clamp(coordinate[1] - wp.float32(base[1]), 0.0, 1.0),
+        wp.clamp(coordinate[2] - wp.float32(base[2]), 0.0, 1.0),
+    )
+
+
+@wp.func
+def trilinear_weight(
+    fractions: wp.vec3, offset_x: wp.int32, offset_y: wp.int32, offset_z: wp.int32
+) -> wp.float32:
+    # Weight of one of the eight corners a ``trilinear_cell`` decomposition addresses. The eight
+    # sum to exactly 1, which is what makes ``scatter.splat_grid_trilinear`` and
+    # ``interpolation.sample_grid_trilinear`` transposes of each other -- and, measured, what makes
+    # a splatted density sum to the point count exactly.
+    return (
+        wp.where(offset_x == 0, 1.0 - fractions[0], fractions[0])
+        * wp.where(offset_y == 0, 1.0 - fractions[1], fractions[1])
+        * wp.where(offset_z == 0, 1.0 - fractions[2], fractions[2])
+    )

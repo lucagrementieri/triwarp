@@ -26,6 +26,20 @@ Because the grid *is* a ``warp.Volume``, a caller can sample it (``wp.volume_sam
 (``wp.volume_lookup_index``) inside their own kernels, save it with ``grid.save_to_nvdb(path)``, and
 hand it straight to ``warp.fem``'s nanogrid geometries. There is deliberately no ``to_volume`` pair.
 
+**Three functions here are about a *dense corner lattice* rather than the sparse grid**, and share
+nothing with it but the ``(lower, upper)`` ``bounds`` convention
+[`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes] takes:
+[`grid_points`][triwarp.voxels.grid_points] produces the sample positions,
+[`splat_onto_grid`][triwarp.voxels.splat_onto_grid] accumulates a scattered field onto them and
+[`sample_grid_trilinear`][triwarp.voxels.sample_grid_trilinear] reads one back. The last two are
+transposes of each other and are kept **together**: they share the world-to-lattice map, and
+splitting the pair across modules -- the gather reads like one of
+[`triwarp.interpolation`][triwarp.interpolation]'s transfer verbs -- would put that map behind a
+private import and let the two halves drift a half-cell apart. Section 11's "one operation family,
+one module" is what decided it, and
+[`interpolate_from_points`][triwarp.interpolation.interpolate_from_points] carries the
+cross-reference from the other side.
+
 !!! note "Recipes this module does not wrap"
     - **Set algebra** (trimesh's ``boolean_sparse``): union is
       ``from_cells(array.concatenate([cells(a), cells(b)]), s, o)`` -- the builder dedups;
@@ -88,15 +102,19 @@ See Also
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, TypeVar
 
 import numpy as np
 import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import interpolation as kernel_interpolation
+from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import voxels as kernel_voxels
 from triwarp.kernels.algorithms import connected_components as kernel_components
+
+DType = TypeVar("DType")
 
 # Neighbourhood stencils, in the order ``scipy.ndimage.generate_binary_structure`` induces:
 # 6 = face-adjacent (rank 1), 18 = face + edge (rank 2), 26 = the full 3-cubed shell (rank 3).
@@ -864,6 +882,234 @@ def occupancy_at_cells(grid: wp.Volume, cells: twt.Array2dInt32) -> wp.array[wp.
     return mask
 
 
+def splat_onto_grid(
+    points: wp.array[wp.vec3],
+    values: wp.array[DType],
+    shape: tuple[int, int, int],
+    *,
+    bounds: tuple[wp.vec3, wp.vec3] | None = None,
+    min_weight: float = 1e-4,
+) -> tuple[wp.array[DType, Literal[3]], twt.Array3dFloat32]:
+    """
+    Accumulate a scattered field onto a dense lattice with trilinear weights, and average it.
+
+    pytorch3d's ``add_points_features_to_volume_densities_features``, and the scatter half of the
+    lattice pair: each point contributes to the **eight** lattice corners around it, weighted by
+    the trilinear fractions, and the same eight weights accumulate into a *density* lattice whose
+    entry is the number of points that corner saw. The field is then divided by that density, so
+    the result is a weighted **mean** rather than a sum and is independent of how many points
+    happened to land in a cell.
+
+    This is a **corner lattice** addressed by ``bounds``, the same convention
+    [`grid_points`][triwarp.voxels.grid_points] and
+    [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes] take -- not a
+    ``wp.Volume`` and not the voxel-centre addressing the rest of this module uses. That is
+    deliberate: the field it produces is meant to be marched, sampled or reshaped, and those three
+    all speak ``bounds``.
+
+    Parameters
+    ----------
+    points
+        ``(n_points,)`` positions.
+    values
+        Length-``n_points`` field on those points, ``wp.float32`` or ``wp.vec3``.
+    shape
+        ``(nx, ny, nz)`` lattice size, each at least 1.
+    bounds
+        ``(lower, upper)`` world corners the lattice spans, so corner ``(0, 0, 0)`` sits at
+        ``lower`` and ``(nx-1, ny-1, nz-1)`` at ``upper``. ``None`` (the default) is index space:
+        the positions are read as lattice coordinates directly.
+    min_weight
+        Density floor: the division is by ``max(density, min_weight)``, which is what keeps a
+        lattice larger than its point cloud finite instead of full of amplified noise. A corner
+        nothing reached comes out zero regardless, since its numerator is zero too.
+
+    Returns
+    -------
+    field : wp.array[DType, Literal[3]]
+        ``(nx, ny, nz)`` averaged field on ``points.device``, zero at every corner no point
+        reached.
+    density : Array3dFloat32
+        ``(nx, ny, nz)`` accumulated trilinear weight per corner -- the point count each corner
+        saw. Returned rather than discarded because it *is* the occupancy: a corner at zero was
+        reached by nothing, and thresholding it is how a caller separates the reconstructed region
+        from the empty one.
+
+    Raises
+    ------
+    ValueError
+        If ``shape`` is not three positive integers, if ``points`` and ``values`` differ in length,
+        or if ``min_weight`` is not positive.
+
+    See Also
+    --------
+    [`sample_grid_trilinear`][triwarp.voxels.sample_grid_trilinear]
+        The inverse: read a dense lattice back at arbitrary positions, with the same eight weights.
+    [`grid_points`][triwarp.voxels.grid_points]
+        The positions of the lattice this writes into.
+    [`pool_by_voxel`][triwarp.voxels.pool_by_voxel]
+        The nearest-corner counterpart over a sparse ``wp.Volume``: one cell per point rather than
+        eight, and a ``min`` / ``max`` / ``sum`` choice this has no analogue for.
+    [`interpolate_from_points`][triwarp.interpolation.interpolate_from_points]
+        The gather-side alternative when the target is an arbitrary sample set rather than a
+        lattice, and the source weighting should be Gaussian rather than trilinear.
+
+    Notes
+    -----
+    Departs from pytorch3d in two ways, both forced. It takes ``bounds`` where pytorch3d takes a
+    normalized ``[-1, 1]`` local space plus an ``align_corners`` switch, because every dense
+    lattice in triwarp is addressed by ``bounds``; and it *returns* the pair where pytorch3d
+    accumulates into caller-supplied ``volume_densities`` / ``volume_features`` in place. The
+    ``min_weight`` floor is pytorch3d's, default and all.
+
+    **This averages, so it is not the inverse of a sample except on the lattice itself.** Three
+    properties hold exactly and are worth knowing before reading a round trip as a check
+    (all measured, and asserted in ``tests/test_voxels.py``):
+
+    - ``density.sum()`` is the point count exactly -- the eight weights per point sum to 1.
+    - Points *on* the lattice corners give ``density == 1`` everywhere and a
+      splat-then-sample round trip of **0.0** on any field, because each point's stencil
+      degenerates to its own corner.
+    - A **constant** field comes back as that constant, to 7.2e-07 on every corner some point
+      reached. Off the lattice the round trip is a smoothing rather than the identity -- measured
+      5.6e-05 on a random cloud filling 504 of 512 corners, and the residual is the eight
+      *unreached* corners, not the weights: a query whose stencil touches one averages a zero in.
+    """
+    if len(shape) != 3 or min(int(n) for n in shape) < 1:
+        raise ValueError(f"shape must be three positive integers, got {shape!r}")
+    if int(points.shape[0]) != int(values.shape[0]):
+        raise ValueError(
+            f"points and values must have the same length, got {int(points.shape[0])} and "
+            f"{int(values.shape[0])}"
+        )
+    if min_weight <= 0.0:
+        raise ValueError(f"min_weight must be positive, got {min_weight}")
+    dims = (int(shape[0]), int(shape[1]), int(shape[2]))
+    device = points.device
+    field = wp.zeros(dims, dtype=values.dtype, device=device)
+    density = twt.empty_3d(dims, wp.float32, device=device)
+    density.zero_()
+    if int(points.shape[0]) == 0:
+        return field, twt.as_array3d(density, wp.float32)
+    lower, inverse_spacing = _lattice_transform(dims, bounds)
+    wp.launch(
+        kernel_scatter.splat_grid_trilinear,
+        dim=int(points.shape[0]),
+        inputs=[points, values, lower, inverse_spacing, field, density],
+        device=device,
+    )
+    wp.launch(
+        kernel_scatter.divide_by_density,
+        dim=dims,
+        inputs=[density, wp.float32(min_weight), field],
+        device=device,
+    )
+    return field, twt.as_array3d(density, wp.float32)
+
+
+def sample_grid_trilinear(
+    field: wp.array[DType, Literal[3]],
+    points: wp.array[wp.vec3],
+    *,
+    bounds: tuple[wp.vec3, wp.vec3] | None = None,
+) -> wp.array[DType]:
+    """
+    Read a dense lattice at arbitrary positions by trilinear interpolation.
+
+    The gather half of the lattice pair, and the exact transpose of
+    [`splat_onto_grid`][triwarp.voxels.splat_onto_grid]: the value at a position is the sum of the
+    eight surrounding corners weighted by the same trilinear fractions the splat distributes with.
+    Use it to read a signed-distance field, a density or a reconstructed vector field back at query
+    points; use [`interpolate_from_points`][triwarp.interpolation.interpolate_from_points] instead
+    when the source is a scattered cloud rather than a lattice.
+
+    Parameters
+    ----------
+    field
+        ``(nx, ny, nz)`` lattice, ``wp.float32`` or ``wp.vec3``.
+    points
+        ``(n_points,)`` positions to sample at.
+    bounds
+        ``(lower, upper)`` world corners the lattice spans, the same convention
+        [`grid_points`][triwarp.voxels.grid_points] and
+        [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes] take. ``None`` (the
+        default) is index space.
+
+    Returns
+    -------
+    wp.array[DType]
+        Length-``n_points`` sampled field on ``points.device``, with ``field``'s dtype.
+
+    Raises
+    ------
+    ValueError
+        If ``field`` is not rank 3.
+
+    See Also
+    --------
+    [`splat_onto_grid`][triwarp.voxels.splat_onto_grid]
+        The scatter this transposes: accumulate a scattered field onto the lattice this reads. Its
+        ``Notes`` records exactly which round trips through the pair are exact and which are a
+        smoothing -- averaging makes the pair adjoint, not inverse.
+    [`interpolate_from_points`][triwarp.interpolation.interpolate_from_points]
+        The same question with a scattered source and a Gaussian kernel.
+    [`occupancy_at_points`][triwarp.voxels.occupancy_at_points]
+        The nearest-cell boolean over a sparse ``wp.Volume``, where this is a smooth read of a
+        dense one.
+
+    Notes
+    -----
+    A position outside the lattice reads the nearest boundary cell's stencil rather than a null
+    value -- the field is extended by its boundary, which is what a distance or density lattice
+    wants and is the convention the Poisson sampler in
+    [`triwarp.reconstruction`][triwarp.reconstruction] already had. Clamp or mask the query set
+    yourself if an outside position should be an error.
+    """
+    if field.ndim != 3:
+        raise ValueError(f"field must be a rank-3 lattice, got ndim {field.ndim}")
+    dims = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
+    values = wp.empty(int(points.shape[0]), dtype=field.dtype, device=points.device)
+    if int(points.shape[0]) == 0:
+        return values
+    lower, inverse_spacing = _lattice_transform(dims, bounds)
+    wp.launch(
+        kernel_interpolation.sample_grid_trilinear,
+        dim=int(points.shape[0]),
+        inputs=[field, lower, inverse_spacing, points, values],
+        device=points.device,
+    )
+    return values
+
+
+def _lattice_transform(
+    dims: tuple[int, int, int], bounds: tuple[wp.vec3, wp.vec3] | None
+) -> tuple[wp.vec3, wp.vec3]:
+    """
+    World-to-lattice map as ``(lower, inverse_spacing)``, the pair both grid kernels take.
+
+    Shared by [`splat_onto_grid`][triwarp.voxels.splat_onto_grid] and
+    [`sample_grid_trilinear`][triwarp.voxels.sample_grid_trilinear] so the two cannot
+    disagree about the convention: they are transposes of each other, and a half-cell disagreement
+    between them would move every sampled value by up to one cell. ``bounds=None``
+    is index space, i.e. the identity map, matching
+    [`grid_points`][triwarp.voxels.grid_points]'s own default.
+
+    A degenerate axis (one sample) has no spacing to invert and is mapped to 0, which puts every
+    position on that axis's single slice.
+    """
+    if bounds is None:
+        return wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 1.0, 1.0)
+    lower, upper = bounds
+    return wp.vec3(*(float(lower[axis]) for axis in range(3))), wp.vec3(
+        *(
+            float(dims[axis] - 1) / (float(upper[axis]) - float(lower[axis]))
+            if dims[axis] > 1 and float(upper[axis]) != float(lower[axis])
+            else 0.0
+            for axis in range(3)
+        )
+    )
+
+
 def grid_points(
     shape: tuple[int, int, int],
     *,
@@ -1444,7 +1690,7 @@ def to_boxes(
     Returns
     -------
     vertices : wp.array[wp.vec3]
-        Corner positions on ``grid``'s device.
+        Corner positions on ``grid``'s device, every one of them referenced by a face.
     faces : wp.array[wp.int32]
         Flat ``3 * n_faces`` triangle index buffer, wound so that normals point away from the
         voxel they belong to.
@@ -1463,10 +1709,19 @@ def to_boxes(
     Notes
     -----
     With ``cull_internal=True`` on a solid set the result is closed and manifold; with ``False`` it
-    is not, since interior faces are duplicated back to back. Corner sharing means the output has
-    unreferenced vertices in the culled case (a corner interior to the set is still in the lattice);
-    run [`triwarp.repair.remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices]
-    if that matters.
+    is not, since interior faces are duplicated back to back.
+
+    The corner lattice is shared rather than duplicated, so culling the interior faces leaves the
+    interior *corners* unreferenced -- they belong to the lattice but to no surviving face. Those
+    are compacted away before returning, which is a change worth knowing about if a caller was
+    relying on an index into the full lattice: it was not, since the lattice itself is
+    [`voxel_corners`][triwarp.voxels.voxel_corners] and that is where an index into it comes from.
+
+    The compaction is measured and it pays for itself twice over. On a solid ``icosphere(4)`` at
+    three voxel sizes on CUDA it drops **81-96 %** of the vertex buffer -- 41 624 to 8 072 corners
+    at 37 k voxels, and 4 370 680 to **190 640** at 4.3 M (52 MB of ``wp.vec3`` down to 2.3 MB) --
+    for 1.27x / 1.09x / **1.01x** of the call. A share that falls as the input grows, on a saving
+    that grows with it.
     """
     _require_index_grid(grid)
     device = grid.device
@@ -1509,7 +1764,12 @@ def to_boxes(
         ],
         device=device,
     )
-    return vertices, faces
+    if not cull_internal:
+        # Every corner of every voxel is referenced by six faces, so there is nothing to compact
+        # and the buffers are returned exactly as the emit kernels wrote them.
+        return vertices, faces
+    compacted_vertices, compacted_faces, _ = tw.repair.remove_unreferenced_vertices(vertices, faces)
+    return compacted_vertices, compacted_faces
 
 
 def voxel_corners(grid: wp.Volume) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:

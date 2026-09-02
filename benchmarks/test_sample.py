@@ -64,6 +64,7 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops as p3d_ops
 import trimesh as tm
 from meshlib import mrmeshpy as mm
 
@@ -100,8 +101,30 @@ def _radius_for_mesh(bench_case: BenchCase) -> float:
     return _radius_cache[bench_case.mesh_name]
 
 
+def _mesh_p3d_fresh(bench_case: BenchCase):
+    """
+    Return a zero-argument builder for a fresh ``Meshes``, for use *inside* a timed callable.
+
+    ``sample_points_from_meshes`` reads ``faces_areas_packed``, which a ``Meshes`` memoizes, so a
+    shared container would have rounds 2..n sample from a cached area table -- the same reason
+    trimesh's row rebuilds its ``tm.Trimesh`` for its cached area CDF. The tensors themselves are
+    hoisted, so only the container and its derivations are inside.
+    """
+    import pytorch3d.structures as p3d_structures
+    import torch
+
+    vertices_p3d = torch.as_tensor(
+        np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32),
+        device=bench_case.torch_device,
+    )
+    faces_p3d = torch.as_tensor(
+        np.ascontiguousarray(bench_case.faces_np, dtype=np.int64), device=bench_case.torch_device
+    )
+    return lambda: p3d_structures.Meshes(verts=[vertices_p3d], faces=[faces_p3d])
+
+
 @pytest.mark.benchmark(group="sample_surface")
-@pytest.mark.benchlibs("triwarp", "igl", "trimesh")
+@pytest.mark.benchlibs("triwarp", "igl", "trimesh", "pytorch3d")
 @pytest.mark.parametrize("count", _UNIFORM_COUNTS, ids=["n10k", "n100k"])
 def test_sample_surface(bench_case: BenchCase, count: int) -> None:
     """
@@ -127,7 +150,31 @@ def test_sample_surface(bench_case: BenchCase, count: int) -> None:
     trimesh rebuilds its ``tm.Trimesh`` inside the timed callable, as the other trimesh rows in the
     suite do, because the area CDF is cached on the mesh object and reusing it would time a
     lookup.
+
+    **pytorch3d**'s ``sample_points_from_meshes`` is the same area-weighted sampler and the only
+    GPU one, so it is where the flatness above is tested against another parallel implementation
+    rather than against a serial baseline. It returns positions alone -- the face index is internal
+    -- so unlike igl and trimesh it needs no decode but also cannot be asserted against the area
+    law directly; ``tests/test_sample.py::test_sample_surface_matches_pytorch3d`` compares the two
+    clouds distributionally and pins the area law on triwarp's own face indices. Its ``Meshes``
+    memoizes the per-face areas it samples from, so it is built **inside** the timed callable and
+    the row carries that derivation, which is the same thing trimesh's row does with its area CDF.
+    One hard limit: it draws the face index with ``torch.multinomial``, which refuses more than
+    2^24 categories, so ``lucy`` (28 055 742 faces) raises rather than sampling and is skipped.
     """
+    if bench_case.kind == "pytorch3d":
+        # ``torch.multinomial`` refuses more than 2^24 categories, and the face buffer *is* the
+        # category set here -- so ``lucy``'s 28 055 742 faces raise ``RuntimeError: number of
+        # categories cannot exceed 2^24`` rather than sampling. A hard ceiling on the reference, not
+        # a cost cap: ``happy_buddha``'s 1 087 716 faces are fine and this is the only mesh in the
+        # registry past it.
+        skip_larger_than(
+            bench_case, "happy_buddha", "torch.multinomial caps the face count at 2^24 categories"
+        )
+        mesh_p3d = _mesh_p3d_fresh(bench_case)
+        samples_p3d = bench_case.run(lambda: p3d_ops.sample_points_from_meshes(mesh_p3d(), count))
+        assert samples_p3d.shape == (1, count, 3)
+        return
     skip_larger_than(bench_case, "bunny", "the CPU references are single-threaded per sample")
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp

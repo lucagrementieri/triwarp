@@ -6,9 +6,19 @@ point-to-surface primitives in [`triwarp.proximity`][] with the tiled reductions
 in [`triwarp.reduce`][], and never move per-element data to the host.
 
 Chamfer distances follow the ``pytorch3d`` convention and are built on **squared**
-Euclidean distances. Hausdorff distances follow
-libigl's ``igl::hausdorff`` and reduce the (already Euclidean) per-element distances with
+Euclidean distances -- and that is now measured rather than asserted:
+[`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points] agrees with
+``pytorch3d.loss.chamfer_distance`` to **7.02e-08** relative on two seeded clouds
+(``tests/test_metrics.py::test_chamfer_points_to_points_matches_pytorch3d``). Hausdorff distances
+follow libigl's ``igl::hausdorff`` and reduce the (already Euclidean) per-element distances with
 a maximum, so no squaring or final square root is needed.
+
+One place the convention does *not* carry over, because the two libraries answer different
+questions: ``pytorch3d.loss.point_mesh_face_distance`` sums point-to-triangle with
+**face**-to-point, where
+[`chamfer_points_to_mesh`][triwarp.metrics.chamfer_points_to_mesh]'s backward direction is
+mesh-*vertex* to nearest query. The forward halves agree to 1.02e-07; the whole scalars differ by
+construction (0.606 against 0.586 on one measured fixture) and are not comparable.
 
 Two families of geometry are supported and can be mixed:
 
@@ -80,7 +90,9 @@ def chamfer_points_to_points(
 
     For each point in ``x`` the squared Euclidean distance to its nearest neighbor
     in ``y`` is accumulated (and symmetrically for ``y`` into ``x`` unless
-    ``single_directional``), following the ``pytorch3d`` convention.
+    ``single_directional``), following the ``pytorch3d`` convention -- measured **7.02e-08**
+    relative against ``pytorch3d.loss.chamfer_distance``, whose ``single_directional`` keyword maps
+    onto this one exactly.
 
     Parameters
     ----------
@@ -260,7 +272,10 @@ def chamfer_mesh_to_mesh(
 # The Chamfer functions above return a Python ``float`` (a host scalar) and are not
 # differentiable. The ``*_loss`` variants below instead return a length-1 ``wp.float32``
 # device array carrying the (squared, pytorch3d-convention) Chamfer loss, so gradients
-# can be back-propagated with a caller-owned ``wp.Tape``.
+# can be back-propagated with a caller-owned ``wp.Tape``. The forward *value* is the one measured
+# at 7.02e-08 against ``pytorch3d.loss.chamfer_distance``; the gradient is compared against a
+# closed-form numpy reimplementation of that convention instead (``tests/test_metrics.py``), since
+# a torch autograd comparison would be comparing two tape implementations rather than two answers.
 #
 # Autodiff strategy (mirrors pytorch3d): the nearest-neighbor / closest-face assignment
 # is a non-differentiable ``argmin`` and is computed *outside* the tape; the assignment
@@ -299,7 +314,9 @@ def chamfer_points_to_points_loss(
     The nearest-neighbor assignment (via
     [`query_nearest`][triwarp.neighbors.query_nearest]) is computed
     outside ``tape`` and held constant during the backward pass, matching pytorch3d's
-    ``chamfer_distance`` gradient.
+    ``chamfer_distance`` gradient. The loss value itself is pinned at **7.02e-08** relative against
+    that function by
+    ``tests/test_metrics.py::test_chamfer_points_to_points_matches_pytorch3d``.
 
     Parameters
     ----------
@@ -654,7 +671,8 @@ def _chamfer(
     """
     Combine forward/backward Euclidean distances into a Chamfer value.
 
-    Distances are squared element-wise (pytorch3d convention) before reduction.
+    Distances are squared element-wise (pytorch3d convention) before reduction -- the convention
+    the module docstring records as measured at 7.02e-08.
     """
     sq_forward = _square(d_forward)
     if point_reduction is None:

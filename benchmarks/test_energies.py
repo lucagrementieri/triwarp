@@ -21,7 +21,9 @@ Recorded in ``README.md``.
 from __future__ import annotations
 
 import igl
+import numpy as np
 import pytest
+import pytorch3d.loss as p3d_loss
 import warp as wp
 
 import triwarp as tw
@@ -56,6 +58,108 @@ def _laplacian_and_mass_wp(bench_case: BenchCase) -> tuple:
             tw.laplacian.mass_matrix_entries(vertices, faces, dtype=wp.float64),
         )
     return _operator_inputs_wp_cache[key]
+
+
+def _run_loss_pytorch3d(bench_case: BenchCase, loss_fn) -> None:
+    """
+    Time one ``pytorch3d.loss`` regularizer with the ``Meshes`` built inside the timed callable.
+
+    Every one of the three reads a **memoized** derivation -- ``edges_packed``,
+    ``faces_packed_to_edges_packed``, ``laplacian_packed`` -- so a shared container would have
+    rounds 2..n hit the cache and the row would report the reduction alone. Building it inside is
+    what makes the row comparable with triwarp's, which reassembles per call. The tensors are
+    hoisted; only the container and its derivations are timed.
+    """
+    import pytorch3d.structures as p3d_structures
+    import torch
+
+    vertices_p3d = torch.as_tensor(
+        np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32),
+        device=bench_case.torch_device,
+    )
+    faces_p3d = torch.as_tensor(
+        np.ascontiguousarray(bench_case.faces_np, dtype=np.int64), device=bench_case.torch_device
+    )
+    loss_p3d = bench_case.run(
+        lambda: loss_fn(p3d_structures.Meshes(verts=[vertices_p3d], faces=[faces_p3d]))
+    )
+    assert float(loss_p3d) >= 0.0
+
+
+@pytest.mark.benchmark(group="edge_length_loss")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "pytorch3d")
+def test_edge_length_loss(bench_case: BenchCase) -> None:
+    """
+    The edge regularizer: a unique-edge pass, a squared deviation and one reduction.
+
+    Read against ``edges_unique_length`` in [`test_edges.py`](test_edges.py) -- the deduplication
+    is the whole cost on both sides and the reduction is the difference between the two groups.
+
+    **pytorch3d** is the only reference and it is the one that pins the value
+    (``tests/test_energies.py``). Two things separate the rows and neither is the arithmetic: its
+    ``edges_packed()`` is a memoized accessor, so the ``Meshes`` is built inside the timed callable
+    or the row reports nothing; and its own docstring flags the per-mesh weight gather as a
+    bottleneck, which triwarp has no counterpart for because a single mesh needs none.
+    """
+    if bench_case.kind == "pytorch3d":
+        _run_loss_pytorch3d(bench_case, lambda mesh_p3d: p3d_loss.mesh_edge_loss(mesh_p3d))
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    loss = bench_case.run(lambda: tw.energies.edge_length_loss(vertices, faces))
+    assert loss > 0.0
+
+
+@pytest.mark.benchmark(group="normal_consistency_loss")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "pytorch3d")
+def test_normal_consistency_loss(bench_case: BenchCase) -> None:
+    """
+    The dihedral regularizer: face adjacency, one angle per pair, one reduction.
+
+    The adjacency is inside the timed callable on both sides, and it is the row -- read this
+    against ``face_adjacency_angles`` in [`test_adjacency.py`](test_adjacency.py), where the same
+    build is timed without the reduction.
+
+    **pytorch3d** does measurably more here than triwarp, and the extra is not a constant: it
+    enumerates every *pair* of faces per edge through a C++ helper over a per-edge vertex list,
+    where triwarp reads one pair per adjacency. The two agree on edge-manifold input
+    (``tests/test_energies.py``) and this row prices that generality.
+    """
+    if bench_case.kind == "pytorch3d":
+        _run_loss_pytorch3d(bench_case, lambda mesh_p3d: p3d_loss.mesh_normal_consistency(mesh_p3d))
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    loss = bench_case.run(lambda: tw.energies.normal_consistency_loss(vertices, faces))
+    assert loss >= 0.0
+
+
+@pytest.mark.benchmark(group="laplacian_smoothing_loss")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "pytorch3d")
+@pytest.mark.parametrize("method", ["uniform", "cotcurv"])
+def test_laplacian_smoothing_loss(bench_case: BenchCase, method: str) -> None:
+    """
+    The smoothness regularizer, at the cheap and the expensive end of its ``method`` axis.
+
+    The axis is the *operator*, which is the only thing that separates the three methods in cost:
+    ``uniform`` assembles the row-normalized 1-ring average and ``cotcurv`` assembles the cotangent
+    stiffness matrix **and** the lumped mass, so the pair brackets the range and ``cot`` sits
+    between them (it is the same stiffness assembly with a diagonal read instead of a mass pass).
+    Everything after the assembly is one CSR pass and one reduction on both sides.
+
+    **pytorch3d** reassembles per call as triwarp does, so this is a like-for-like race between two
+    sparse assemblies -- the only group in this module where that is true, since the four operator
+    groups below hand both sides prebuilt inputs.
+    """
+    if bench_case.kind == "pytorch3d":
+        _run_loss_pytorch3d(
+            bench_case, lambda mesh_p3d: p3d_loss.mesh_laplacian_smoothing(mesh_p3d, method=method)
+        )
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    loss = bench_case.run(lambda: tw.energies.laplacian_smoothing_loss(vertices, faces, method))
+    assert loss > 0.0
 
 
 @pytest.mark.benchmark(group="k_harmonic")

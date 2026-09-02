@@ -109,6 +109,7 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops as p3d_ops
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -151,7 +152,7 @@ _ROUNDS = 3
 
 
 @pytest.mark.benchmark(group="subdivide")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pytorch3d")
 def test_subdivide(bench_case: BenchCase) -> None:
     """
     Exactly 4x the faces in one pass: the module's clean throughput baseline.
@@ -179,8 +180,22 @@ def test_subdivide(bench_case: BenchCase) -> None:
         libigl hazards in ``.claude/CLAUDE.md`` §6. It stays a *tested* reference on the small clean
         ``icosahedron`` fixture, where 1 200 calls across six processes are clean --
         ``tests/test_remesh.py::test_subdivide_matches_igl`` keeps the exact class-B comparison.
+
+    **pytorch3d** is the third reference and the only GPU one. ``SubdivideMeshes()`` is
+    constructed *inside* the timed callable on purpose: passing a mesh to its constructor caches
+    the subdivision topology and every later call reuses it, which would time a gather rather than
+    a subdivision -- and triwarp's row rebuilds everything each call. It agrees with triwarp on
+    sorted coordinates at **0.0** (``tests/test_remesh.py::test_subdivide_matches_pytorch3d``), so
+    like the other two it differs only in output ordering. The row carries its ``Meshes`` build,
+    which is cheap next to a 4x face expansion.
     """
     skip_larger_than(bench_case, "dragon", "a 1:4 subdivision above dragon exceeds memory")
+    if bench_case.kind == "pytorch3d":
+        mesh_p3d = bench_case.mesh_p3d
+        n_faces = bench_case.n_faces
+        subdivided_p3d = bench_case.run(lambda: p3d_ops.SubdivideMeshes()(mesh_p3d))
+        assert subdivided_p3d.faces_packed().shape[0] == 4 * n_faces
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         _new_vertices, new_faces = bench_case.run(lambda: tw.remesh.subdivide(vertices, faces))

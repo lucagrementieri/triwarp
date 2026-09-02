@@ -158,8 +158,10 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pytorch3d.utils as p3d_utils
 import pyvista as pv
 import shapely.geometry as sg
+import torch
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -390,7 +392,7 @@ def test_sphere_cap(bench_lib: BenchLibrary, subdivisions: int) -> None:
 
 
 @pytest.mark.benchmark(group="icosphere")
-@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab", "pytorch3d")
 @pytest.mark.parametrize("subdivisions", _SUBDIVISIONS)
 def test_icosphere(bench_lib: BenchLibrary, subdivisions: int) -> None:
     # No open3d counterpart: create_icosahedron is never subdivided. MeshLab's create_sphere is
@@ -399,6 +401,13 @@ def test_icosphere(bench_lib: BenchLibrary, subdivisions: int) -> None:
     # Since the connectivity became closed-form this row is *also* a floor row at every subdivision
     # level it is asked for -- 245 / 253 / 345 us at 3 / 5 / 7 is one launch per level over buffers
     # that reach 164k faces, so the axis reports the wrapper floor rather than the output size.
+    if bench_lib.kind == "pytorch3d":
+        device = bench_lib.torch_device
+        sphere_p3d = bench_lib.run(
+            lambda: p3d_utils.ico_sphere(subdivisions, device=torch.device(device))
+        )
+        assert sphere_p3d.faces_packed().shape[0] == 20 * 4**subdivisions
+        return
     if bench_lib.kind == "pymeshlab":
         if subdivisions > 8:
             pytest.skip("MeshLab's create_sphere caps subdiv at 8")
@@ -444,6 +453,15 @@ def test_uv_sphere(bench_lib: BenchLibrary, sections: int) -> None:
     ``makeUVSphere(1, sections, 2 * sections - 2)``. At that pairing it is the same mesh down to the
     vertex -- same counts, a position bijection at 4.7e-07 -- which
     ``tests/test_creation.py::test_uv_sphere_matches_meshlib`` pins for the same reason.
+
+    **pytorch3d**'s ``utils.ico_sphere`` is the same construction from the same base table -- the
+    positions correspond one-to-one and agree to 5.8e-05, which is only pytorch3d's table being
+    *written* to four decimals (``tests/test_creation.py::test_icosphere_matches_pytorch3d``). It
+    is the only reference here that builds on the GPU, and its implementation is the one thing this
+    row prices that the others do not: it subdivides **iteratively** through ``SubdivideMeshes``,
+    one pass per level, where triwarp's connectivity is closed-form and costs one launch whatever
+    the level. So expect its column to grow with the level where triwarp's is flat -- that contrast
+    is the point of the row.
     """
     count = (2 * sections, sections // 2)
     if bench_lib.kind == "meshlib":
@@ -575,7 +593,7 @@ def test_annulus(bench_lib: BenchLibrary, sections: int) -> None:
 
 
 @pytest.mark.benchmark(group="torus")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib", "pytorch3d")
 @pytest.mark.parametrize("sections", _SECTIONS)
 def test_torus(bench_lib: BenchLibrary, sections: int) -> None:
     """
@@ -583,7 +601,24 @@ def test_torus(bench_lib: BenchLibrary, sections: int) -> None:
 
     Its resolutions are positional -- ``(primaryRadius, secondaryRadius, primaryResolution,
     secondaryResolution)`` -- so the minor resolution is passed as the 32 the other rows fix.
+
+    **pytorch3d**'s ``utils.torus`` takes the **minor** radius first and its ``sides`` / ``rings``
+    are the minor and major loop counts, the reverse of triwarp's ``(major_sections,
+    minor_sections)`` -- the mapping is pinned in
+    ``tests/test_creation.py::test_torus_matches_pytorch3d``. It builds the vertex table in a
+    **Python double loop** and only the tensor conversion is native, so its column is the honest
+    cost of that and grows with the section count faster than any other row here; read it as the
+    per-vertex Python floor rather than as a GPU row, even though the buffers land on the device.
     """
+    if bench_lib.kind == "pytorch3d":
+        if sections > 512:
+            pytest.skip("pytorch3d builds the torus in a Python double loop over the vertices")
+        device = bench_lib.torch_device
+        torus_p3d = bench_lib.run(
+            lambda: p3d_utils.torus(0.25, 1.0, 32, sections, device=torch.device(device))
+        )
+        assert torus_p3d.faces_packed().shape[0] == 2 * 32 * sections
+        return
     if bench_lib.kind == "meshlib":
         mesh_ml = bench_lib.run(lambda: mm.makeTorus(1.0, 0.25, sections, 32))
         assert mesh_ml.topology.numValidFaces() == 2 * 32 * sections

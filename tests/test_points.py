@@ -2,6 +2,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops as p3d_ops
 import pyvista as pv
 import scipy.spatial
 import trimesh.geometry as tm_geometry
@@ -21,6 +22,7 @@ from tests.conversions import (
     points_to_meshlib,
     points_to_open3d,
     points_to_pymeshlab,
+    points_to_torch,
     points_to_warp,
 )
 
@@ -749,6 +751,38 @@ def test_estimate_normals_matches_open3d(device: str) -> None:
     assert_same_up_to_sign(normals_wp.numpy(), normals_pml, atol=1e-5)
 
 
+@pytest.mark.parity("estimate_normals_knn", "pytorch3d")
+def test_estimate_normals_matches_pytorch3d(device: str) -> None:
+    """
+    Class B: the smallest-eigenvector normal, up to sign (``|dot| == 1``).
+
+    ``disambiguate_directions=False`` is not a convenience: with it ``True`` pytorch3d applies the
+    SHOT sign rule, which triwarp has no counterpart for, so the two would disagree on a
+    fixture-dependent subset of points for a reason that is not about the eigenvector. Left off,
+    both sides leave the sign free and the comparison is the *subspace* -- measured min ``|dot|``
+    0.9999979 and mean 1.0 over 600 points at a 16-neighbour window.
+
+    Both sides get the identical neighbourhood: triwarp's k-NN is what
+    ``tests/test_neighbors.py::test_query_nearest_matches_pytorch3d`` pins against ``knn_points``,
+    so a disagreement here is in the eigen-decomposition rather than in the gather.
+    """
+    rng = np.random.default_rng(13)
+    points_np = rng.normal(size=(600, 3)).astype(np.float32)
+    points_np /= np.linalg.norm(points_np, axis=1, keepdims=True)
+    normals_p3d = p3d_ops.estimate_pointcloud_normals(
+        points_to_torch(points_np, device), neighborhood_size=16, disambiguate_directions=False
+    )[0]
+    points_wp = points_to_warp(points_np, device)
+    neighbor_idx_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=16)
+    normals_wp = tw.estimate_normals(points_wp, neighbor_idx_wp)
+
+    assert normals_p3d.shape == (600, 3)
+    alignment_np = np.abs(
+        np.einsum("ij,ij->i", normals_wp.numpy(), normals_p3d.cpu().numpy().astype(np.float32))
+    )
+    assert float(alignment_np.min()) > 0.999
+
+
 @pytest.mark.parity(
     "estimate_normals",
     "meshlib",
@@ -1231,6 +1265,32 @@ def test_farthest_point_sample_matches_open3d(device: str) -> None:
 
         index_wp = tw.farthest_point_sample(points_wp, count).numpy()
         assert set(index_wp.tolist()) == index_o3d
+
+
+@pytest.mark.parity("farthest_point_sample", "pytorch3d")
+def test_farthest_point_sample_matches_pytorch3d(device: str) -> None:
+    """
+    Class A: the greedy **index sequence**, byte-identical, not merely the selected set.
+
+    A strictly stronger oracle than the open3d one above, and worth having for exactly that reason:
+    open3d routes every selection through ``SelectByIndex``, which emits survivors in ascending
+    index order and destroys the greedy order, so that comparison can only assert set equality.
+    pytorch3d returns the indices in the order it picked them. Both libraries and triwarp resolve
+    an arg-max tie to the lowest index, which is what makes an exact sequence comparison legitimate
+    on a cloud that happens to tie.
+
+    ``random_start_point=False`` pins pytorch3d's start to index 0, which is triwarp's default.
+    """
+    rng = np.random.default_rng(7)
+    points_np = rng.normal(size=(500, 3)).astype(np.float32)
+    _, indices_p3d = p3d_ops.sample_farthest_points(
+        points_to_torch(points_np, device), K=8, random_start_point=False
+    )
+    indices_wp = tw.farthest_point_sample(points_to_warp(points_np, device), 8)
+
+    assert indices_p3d.shape == (1, 8)
+    assert np.unique(indices_p3d.cpu().numpy()).size == 8
+    assert np.array_equal(indices_wp.numpy(), indices_p3d[0].cpu().numpy())
 
 
 def _farthest_point_sequence(points_np: np.ndarray, count: int, start: int = 0) -> np.ndarray:

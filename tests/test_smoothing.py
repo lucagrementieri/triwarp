@@ -9,6 +9,7 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops as p3d_ops
 import scipy.sparse.linalg as spla
 import trimesh as tm
 import trimesh.smoothing as tms
@@ -28,6 +29,7 @@ from tests.conversions import (
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
+    trimesh_to_pytorch3d,
     trimesh_to_warp,
     warp_to_trimesh,
 )
@@ -787,6 +789,76 @@ def test_filter_taubin_matches_pymeshlab(device: str, steps: int) -> None:
     assert np.allclose(
         smoothed_wp.numpy(), meshset_pml.current_mesh().vertex_matrix(), rtol=1e-5, atol=1e-5
     )
+
+
+@pytest.mark.parametrize("iterations", [1, 3, 10])
+@pytest.mark.parity(
+    "filter_taubin",
+    "pytorch3d",
+    benchmarked=False,
+    reason="the filter_taubin group times the default fixed-operator filter, which is trimesh's "
+    "and disagrees with pytorch3d by the size of the displacement -- that pair is the noparity "
+    "entry in benchmarks/test_smoothing.py and stays one. recompute=True is what agrees, and it "
+    "is a separate filter at ~23x the cost (0.49 -> 11.06 ms at 10 passes on CUDA), so timing it "
+    "in that group would race two different amounts of work under one name.",
+)
+def test_filter_taubin_recompute_matches_pytorch3d(device: str, iterations: int) -> None:
+    """
+    Class B: ``ops.taubin_smoothing`` under the pass-count doubling, with ``recompute=True``.
+
+    This is the pair section 4's ``recompute`` keyword exists for, and the measurement is what
+    justified building it. pytorch3d rebuilds its inverse-distance operator from the *current*
+    positions before every half-pass; against one fixed operator the two sit **4.1e-03 / 6.5e-03 /
+    9.9e-03** apart at 1 / 3 / 10 of its iterations -- the size of the displacement itself, which
+    is why the default is a ``noparity`` entry rather than a loose tolerance -- and recomputing
+    closes it to **2.4e-07 / 4.2e-07 / 7.2e-07**.
+
+    Two named transforms, both conventions rather than arithmetic: ``num_iter`` counts lambda-mu
+    **pairs** where triwarp does one half-step per ``iterations``, so the count doubles (the same
+    factor the pymeshlab pair above needs); and ``mu=-0.53`` is triwarp's ``nu=0.53``, the sign
+    living in the convention.
+
+    The fixed-operator gap is asserted here too, on the same input -- without it this test would
+    read as a claim that the two libraries agree, when what it shows is that they agree *only*
+    under this keyword.
+    """
+    mesh_tm = _noisy_icosphere()
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
+    smoothed_p3d = p3d_ops.taubin_smoothing(
+        trimesh_to_pytorch3d(mesh_tm), lambd=0.53, mu=-0.53, num_iter=iterations
+    )
+    vertices_p3d = smoothed_p3d.verts_packed().cpu().numpy()
+
+    recomputed_wp = tw.smoothing.filter_taubin(
+        mesh_wp.points,
+        mesh_wp.indices,
+        lamb=0.53,
+        nu=0.53,
+        iterations=2 * iterations,
+        recompute=True,
+    )
+    assert np.allclose(recomputed_wp.numpy(), vertices_p3d, rtol=1e-5, atol=1e-5)
+
+    # The default is a *different* filter, and the whole reason for the keyword.
+    fixed_wp = tw.smoothing.filter_taubin(
+        mesh_wp.points,
+        mesh_wp.indices,
+        lamb=0.53,
+        nu=0.53,
+        iterations=2 * iterations,
+        laplacian_operator=tw.laplacian.laplacian(
+            mesh_wp.points, mesh_wp.indices, equal_weight=False
+        ),
+    )
+    assert float(np.abs(fixed_wp.numpy() - vertices_p3d).max()) > 1e-3
+
+    with pytest.raises(ValueError, match="do not also pass one"):
+        tw.smoothing.filter_taubin(
+            mesh_wp.points,
+            mesh_wp.indices,
+            recompute=True,
+            laplacian_operator=tw.laplacian.laplacian(mesh_wp.points, mesh_wp.indices),
+        )
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])

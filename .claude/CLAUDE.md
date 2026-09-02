@@ -1268,6 +1268,142 @@ takes a **perimeter** threshold because MeshLib's `fillHoles` does, where pymesh
 both take a **boundary-edge count** — two of three references cannot express the incumbent
 signature.
 
+**pytorch3d** (a torch C++/CUDA extension over PyTorch, mirrored under `reference/pytorch3d`) is a
+hard test dependency like the five above — `import pytorch3d.ops as p3d_ops` / `.loss as p3d_loss`
+/ `.structures as p3d_structures`, all three aliases pinned in ruff's import conventions, never
+through `pytest.importorskip`; reference variables take a **`_p3d`** suffix. Build meshes with
+`tests.conversions.trimesh_to_pytorch3d` / `numpy_to_pytorch3d` / `warp_to_pytorch3d`, clouds with
+`points_to_pytorch3d` (the `loss` container form) or `points_to_torch` (the bare batched tensor the
+`ops` entry points take), and read a result back with `pytorch3d_to_numpy`.
+
+It is the **first and only reference here with CUDA kernels of its own**, so it takes *two*
+`LIBRARIES` rows (`pytorch3d-cpu` / `pytorch3d-cuda`) and a `triwarp-cuda` vs `pytorch3d-cuda`
+ratio is the one GPU-against-GPU comparison in the suite. It is also the first reference triwarp
+**already cited in its own prose without testing against**: `metrics.py`, `registration.py` and
+`kernels/metrics.py` named it nine times, so two public functions had their specification pinned to
+a library nothing in the suite ran. Those nine sentences now carry the measured number instead.
+Fifteen hazards, all measured:
+
+- **Everything is batched, with a leading minibatch axis, and the wrap fails silently.**
+  `knn_points(p, q)` handed a bare `(P, 3)` reads it as `(N=P, P1=3, D)` and compares three points
+  at full speed — no exception, and a *faster* wrong answer. So a single cloud goes in as `x[None]`
+  and its answer comes out as `result[0]`, which is what `points_to_torch` is for, and every
+  comparison asserts the reference's output **shape** before its values.
+- **Every neighbour and Chamfer distance it returns is squared.** `knn_points().dists`,
+  `ball_query().dists`, `loss.chamfer_distance` and both `point_mesh_*` scalars. Take the square
+  root before comparing (measured **0.0** afterwards for `knn_points` on the host, 1.19e-07 on
+  CUDA where its own kernel is a different reduction order).
+- **`torch.cuda.is_available()` is the wrong probe for the CUDA extension.** A wheel whose arch
+  list stops short of the device returns `True` and then fails every kernel with *"no kernel image
+  is available"*; a build that compiled the CPU extension only — which is what `setup.py` selects
+  whenever it finds no `CUDA_HOME`, the normal state of a CI runner — raises `RuntimeError: Not
+  compiled with GPU support.` on a CUDA tensor. `benchmarks/conftest.py` gates its `-cuda` row on
+  launching a two-point `knn_points`, which is the only probe that distinguishes them.
+- **`Meshes` and `Pointclouds` are immutable *caching* containers** — the opposite end of the scale
+  from a `ml.MeshSet`. Every `ops.*` / `loss.*` entry point is pure, so **one object serves many
+  comparisons** and there is no freshness rule; but `verts_normals_packed`, `edges_packed`,
+  `faces_packed_to_edges_packed`, `laplacian_packed` and `faces_areas_packed` are memoized on first
+  request, so a *benchmark* row naming one of them has to build the container **inside** the timed
+  callable or it reports nothing. And the answer lives on the `*_packed()` accessors, never in the
+  constructor arguments: `SubdivideMeshes` and `ops.cubify` both return a `Meshes` whose inputs the
+  caller never saw.
+- **It does not cast for you, and one entry point casts anyway.** A float64 `Meshes` keeps float64
+  through `verts_packed()`, so an unconverted reference compares a float64 answer against triwarp's
+  float32 one and reads as triwarp being wrong by ~1e-7 — hence float32 in the converters. The
+  exception is `ops.mesh_face_areas_normals`, whose C++ kernel returns **float32** whatever it was
+  handed. Faces are stored as int64 regardless (an int32 tensor is silently widened).
+- **`corresponding_points_alignment` and `iterative_closest_point` are row-vector.** They solve
+  `s·X·R + T = Y`, so `R` is the transpose of `registration.procrustes`' linear block divided by the
+  scale (measured 2.54e-07 / 2.62e-07); `T` needs no transform. Compare the **converged transform
+  and the rmse**, never the iteration count — `relative_rmse_thr` is its own stopping rule.
+- **`ops.cot_laplacian` returns two conventions in one call and neither is guessable.** Its
+  off-diagonal is **twice** triwarp's half-cotangent table and its diagonal is identically **0.0**
+  (not merely small) where `laplacian.cotmatrix` assembles the row sum; and its second return is
+  `1 / inv_areas == 3 * M_ii`, the *reciprocal* of three times the barycentric lumped mass. Both
+  cancel out of `mesh_laplacian_smoothing`'s ratios, which is why `energies.laplacian_smoothing_loss`
+  can assemble from triwarp's own `cotmatrix`. `ops.laplacian` likewise writes **-1** on the diagonal
+  where `laplacian.laplacian(equal_weight=True)` writes 0, and `ops.norm_laplacian` **is**
+  `laplacian(equal_weight=False)` before its row normalization — same formula, same literal
+  `eps = 1e-12`, measured 1.49e-08 after dividing by the row sum.
+- **`ops.marching_cubes` does not exist**: it is not re-exported from `pytorch3d.ops`, only from
+  `pytorch3d.ops.marching_cubes`, so `p3d_ops.marching_cubes` is an `AttributeError`. With
+  `return_local_coords=False` it emits lattice indices, which is `levelset.marching_cubes`' own
+  default and needs no convention fix at all — the one reference of five that does not.
+- **`ops.cubify`'s three `align` modes are one uniform scale and translation apart.** Measured on a
+  6³ occupancy sphere, `"topleft"` / `"corner"` / `"center"` return the **identical** face buffer
+  and vertex count with bounding boxes `[-0.6, 1.0]`, `[-0.667, 0.667]` and `[-0.8, 0.8]` — all
+  three reachable through `voxels.from_cells(cells, voxel_size, origin)`, so an `align=` keyword
+  would be a second spelling of one that exists. It also **compacts**, which is what exposed
+  `to_boxes(cull_internal=True)` returning the whole corner lattice.
+- **`packed_to_padded` / `padded_to_packed` bounds-check nothing and corrupt the heap.** A
+  mismatched `max_size` or `total_size` does not raise — it writes out of bounds and the process
+  dies in `malloc`/`free` much later, in unrelated code. Their `first_idxs` are **starting indices,
+  not counts**, which makes them `array.pack_1d_arrays`' `offsets` unchanged (measured `[0, 3, 8]`
+  from both sides for lengths `(3, 5, 2)`); read the sizes off the buffers rather than passing
+  literals.
+- **`sample_points_from_meshes` caps the face count at 2²⁴.** It draws the face index with
+  `torch.multinomial`, whose category limit is 16 777 216, so `lucy`'s 28 055 742 faces raise
+  `RuntimeError: number of categories cannot exceed 2^24` rather than sampling.
+  `happy_buddha`'s 1 087 716 are fine.
+- **`add_points_features_to_volume_densities_features` is `[-1, 1]` local space, `[z, y, x]`
+  storage, and `rescale_features=True`.** Its volume is `(minibatch, channels, D, H, W)` and a
+  point's `(x, y, z)` indexes `(W, H, D)`, so its lattice is the **transpose** of
+  `voxels.splat_onto_grid`'s; `align_corners=True` is triwarp's `bounds`; and the default
+  `rescale_features` divides by `density.clamp(min_weight)`, which is what makes both sides an
+  *average* rather than an accumulation. With those three lined up the two agree at exactly **0.0**
+  on the host and 4.8e-07 on CUDA (atomic order).
+- **`mesh_normal_consistency` counts pairs, not adjacencies.** It enumerates every pair of faces
+  sharing an edge through its own `_C.mesh_normal_consistency_find_verts`, so an edge with `k`
+  incident faces contributes `C(k, 2)` terms; `adjacency.face_adjacency` keeps only edges with
+  *exactly* two faces and reports none at all there. The two agree exactly on edge-manifold input
+  (measured 0.0155947 over 480 pairs) and read **0.777 against 0.0** on three faces sharing one
+  edge. Restrict the comparison and pin the divergence.
+- **`ops.taubin_smoothing` rebuilds its operator every half-pass**, from the current positions, and
+  row-normalizes it — where every triwarp smoother assembles once. One fixed operator sits
+  4.1e-03 / 6.5e-03 / 9.9e-03 from it at 1 / 3 / 10 of its iterations, the size of the displacement
+  itself; `smoothing.filter_taubin(recompute=True)` closes that to 2.4e-07 at **~23x** the cost.
+  Its `num_iter` counts lambda-mu **pairs**, like MeshLab's and open3d's.
+- **`ico_sphere` is *not* the rotated-frame hazard open3d's Platonic solids are.** It starts from
+  the identical `(±0.5257, ±0.8507, 0)` table `creation.icosphere` uses and subdivides the same way,
+  so the positions correspond one-to-one and the 5.8e-05 residual is pytorch3d's table being
+  *written* to four decimal places. Match by nearest vertex with a bijection check at 1e-4, not by
+  index. `utils.torus`, by contrast, takes the **minor** radius first and builds its vertex table in
+  a Python double loop, so it needs a real parameter mapping and its benchmark column is a
+  per-vertex Python floor.
+
+**Its CPU rows are Θ(N²) on anything with a neighbour query**, because `_C` carries no spatial
+structure on *either* device — no tree, no grid, just the pairwise loop. Measured on this box:
+`knn_points` 299.8 / 1 189.5 / 4 562.8 ms and `chamfer_distance` 557.8 / 2 319.1 / 9 077.1 ms at
+10 k / 20 k / 40 k self-queries, i.e. 3.84-4.16x per doubling against the 4x a quadratic predicts,
+which extrapolates to ~3.5 s per `knn` round on `bunny` and **~9 minutes per round** on `dragon`.
+So a `pytorch3d-cpu` neighbour or chamfer row is capped at a feature mesh; the `-cuda` rows run the
+scan meshes. Its `-cpu` row is nonetheless a *threaded* one (`torch.get_num_threads()` is 24 here),
+so it belongs with `meshlib` rather than with trimesh / igl / pyvista / pymeshfix.
+
+**And the GPU ratio is a crossover, not a bar — which is the most useful thing this reference
+measures.** Brute force with perfect coalescing *beats* a BVH descent while the whole problem still
+fits the device's bandwidth: measured 2.31 ms against triwarp's 3.29 at 20 000 points
+(`knn_points`, **0.70x** — a loss for triwarp) and 74.65 against 0.87 at 200 000 (**85x**). So the
+neighbour and chamfer groups need the point count as an **axis**; a one-size row reports whichever
+side of the crossover it landed on. Half of that swing is *triwarp's*, and a row must not be read as
+a statement about brute force: pytorch3d is a clean quadratic over the sweep (0.63, 2.26, 5.59,
+20.18, 73.82 ms at 5 k / 20 k / 50 k / 100 k / 200 k) while `query_nearest` is **non-monotonic**
+(0.82, 3.25, 7.38, **0.46**, 0.75 ms) — a 16x drop between 50 k and 100 k, identical to three digits
+between its `bvh` and `hashgrid` backends, so the cost is in a stage the two share. That is the
+search-radius heuristic (memory `hashgrid-nearest-radius-is-cubic`) and it is an open finding.
+
+**Every CUDA row must synchronize torch's stream.** `wp.synchronize_device` synchronizes *Warp's*
+and says nothing about torch's, so a `pytorch3d-cuda` row synchronized the Warp way times the launch
+and not the kernel — the same class of silent error as section 8's launch-device hazard.
+`BenchCase.run` branches on `kind == "pytorch3d"` for exactly this.
+
+**Licensing: pytorch3d is BSD-3 (Meta) and torch is BSD-3**, so there is no `copyleft/` subtree to
+avoid as in `reference/libigl`, no *use* restriction as with MeshLib, and no copyleft as with
+pymeshlab or pymeshfix. `triwarp/` may name it — it already does, nine times — and may be derived
+from it with attribution. It stays a test and benchmark dependency all the same: nothing in the
+shipped package imports torch, and it must not start, since `torch` is a 2.5 GB install for a
+library whose whole premise is Warp.
+
 ### Mesh fixtures (prefer over inline construction)
 
 Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes in each test. Fixtures return `(mesh_tm: tm.Trimesh, mesh_wp: wp.Mesh)` via `tests.conversions.trimesh_to_warp`.
@@ -1321,7 +1457,8 @@ scan, so the scanner rejects it. Run `uv run python -m tests.parity` for the ful
 **Where a reference library computes the same quantity, one test must compare the two outputs.**
 That is the obligation the classes below describe, and it is not discharged by an invariant: a
 function can be watertight, symmetric, idempotent and manifold while computing the wrong answer.
-So if trimesh / igl / potpourri3d / pymeshlab / open3d / pyvista has the quantity — check, do not
+So if trimesh / igl / potpourri3d / pymeshlab / open3d / pyvista / meshlib / pymeshfix / pytorch3d
+has the quantity — check, do not
 assume: §6's hazard blocks list what each one actually binds, and several names that *look* present
 are not — there is a class A/B/C comparison against it, and `tests/test_parity.py` enforces that for
 every *benchmarked* pair. Below that bar, `pytest.mark.parity` is the marker that records it.
@@ -1406,7 +1543,7 @@ Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `un
 `edge_multiplicity`, `euler_characteristic`, `open_edge_count`, `canonical_labels`,
 `same_partition`, `canonical_winding`, `assert_same_up_to_sign`, `assert_cyclic_permutation_equal`,
 `assert_same_loop_set`, `trimesh_outline_loops`, `fraction_within`, `symmetric_chamfer`,
-`symmetric_surface_distance`, `hausdorff_two_sided`,
+`chamfer_two_sided`, `symmetric_surface_distance`, `hausdorff_two_sided`,
 `hausdorff_surface_two_sided`) and `tests/conversions.py` (`numpy_to_warp`, `numpy_to_warp_uv`,
 `points_to_warp`, `points_to_warp_uv`, `trimesh_to_warp`, `warp_to_trimesh`, `trimesh_to_open3d`, `points_to_open3d`, `open3d_to_trimesh`,
 `trimesh_to_open3d_t`, `trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`,
@@ -1414,7 +1551,9 @@ Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `un
 `trimesh_to_meshlib`, `warp_to_meshlib`, `points_to_meshlib`, `meshlib_to_trimesh`,
 `numpy_to_meshlib_bitset`, `meshlib_scalars_to_numpy`, `meshlib_bitset_to_numpy`,
 `numpy_to_pymeshfix`, `trimesh_to_pymeshfix`, `warp_to_pymeshfix`, `pymeshfix_to_numpy`,
-`pymeshfix_intersecting_faces`, `pymeshfix_face_remap`, `faces_igl`, `mesh_igl`)
+`pymeshfix_intersecting_faces`, `pymeshfix_face_remap`, `points_to_torch`, `numpy_to_pytorch3d`,
+`trimesh_to_pytorch3d`, `warp_to_pytorch3d`, `points_to_pytorch3d`, `pytorch3d_to_numpy`,
+`faces_igl`, `mesh_igl`)
 rather than re-rolling either. **Check both modules before writing a private helper in a test
 file** — every one of the six consolidated in 2026-08 was written by someone who did not, and
 `undirected_edges` alone had been spelled three different ways across six files.
@@ -1439,9 +1578,19 @@ drops `cave_cube` because its coplanar box faces make every adjacency angle 0 or
 `canonical_labels` is the label-packing transform every component comparison
 needs — triwarp names a component after a representative element, igl and scipy number `0..k-1` in
 their own traversal orders and VTK's `RegionId` numbers them in a third, so only the *partition* is
-shared. `open3d` and `pyvista` are hard test dependencies like `pymeshlab` and `igl` — import them
-plainly as `import open3d as o3d` / `import pyvista as pv`, never through `pytest.importorskip`; see
-their hazard blocks above.
+shared. `open3d`, `pyvista` and `pytorch3d` are hard test dependencies like `pymeshlab` and
+`igl` — import them plainly as `import open3d as o3d` / `import pyvista as pv` /
+`import pytorch3d.ops as p3d_ops`, never through `pytest.importorskip`; see their hazard blocks
+above.
+
+**Two of the class-C helpers take different inputs and the mesh one raises on point arrays.**
+`symmetric_chamfer(mesh_a, mesh_b)` takes two *meshes* and samples them itself, where
+`chamfer_two_sided(points_a, points_b)` takes two clouds already drawn — which is what a comparison
+between two *samplers* needs. And prefer the mean form over `hausdorff_two_sided` where the claim is
+distributional: measured on two independent 1 000-point samplings of `icosphere(2)`, the mean
+statistic separates the same mesh from one scaled by 1.15 by **6.8x** (0.00768 against 0.05227)
+where the worst-case Hausdorff separates them by **1.4** (0.162 against 0.228), because one stray
+sample in a tail dominates a maximum.
 
 Two measured gotchas worth not rediscovering: MeshLab's `face_normal_matrix()` after
 `compute_normal_per_face()` is the **unnormalised** cross product (magnitude exactly `2 * area`), so

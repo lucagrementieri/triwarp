@@ -352,6 +352,16 @@ def test_filter_taubin(bench_case: BenchCase) -> None:
     MeshLab, timed twice the passes. The MeshLab mapping is pinned exactly (5e-08) in
     ``tests/test_smoothing.py::test_filter_taubin_matches_pymeshlab``; open3d's cannot be (see the
     exemption above).
+
+    **pytorch3d is deliberately absent, and it is the one reference here that agrees with triwarp.**
+    ``ops.taubin_smoothing`` rebuilds its inverse-distance operator from the current positions every
+    half-pass, and ``filter_taubin(recompute=True)`` matches it to **2.4e-07** -- so this is not a
+    D2 exemption, it is a pair whose *tested* configuration is not this row's. Timing it here would
+    race ten sparse assemblies against one under a single group name: the recompute path measures
+    **~23x** this row (0.49 -> 11.06 ms at 10 passes on CUDA, its own docstring carries the sweep),
+    which is the whole ratio rather than a caveat on it. The comparison lives in
+    ``tests/test_smoothing.py::test_filter_taubin_recompute_matches_pytorch3d`` as a
+    ``benchmarked=False`` claim.
     """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "pyvista":

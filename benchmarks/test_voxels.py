@@ -58,13 +58,15 @@ from __future__ import annotations
 import igl
 import numpy as np
 import pytest
+import pytorch3d.ops as p3d_ops
 import pyvista as pv
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from conftest import BenchCase, BenchLibrary, skip_larger_than
+import triwarp.typing as twt
+from conftest import BenchCase, BenchLibrary, points_torch_from_numpy, skip_larger_than
 
 # Cell widths as a fraction of the bounding-box diagonal. The pair is a slope check: 1/256 is 64x
 # the cells of 1/64, and the whole point of the flattened (triangle, cell) work-item design is that
@@ -509,6 +511,147 @@ def test_voxel_corners(bench_case: BenchCase) -> None:
 # Lattice resolutions for the mesh-free group. 256 cubed is 16.7 M samples, the size at which an
 # SDF round trip is actually run.
 _LATTICE_RESOLUTIONS = [64, 256]
+
+
+_normalized_np_cache: dict[str, np.ndarray] = {}
+_splat_field_cache: dict[int, np.ndarray] = {}
+
+
+def _splat_bounds(bench_case: BenchCase) -> tuple[wp.vec3, wp.vec3]:
+    """Return the mesh's bounding box as a lattice ``bounds`` pair, so no vertex is outside."""
+    lower_np = bench_case.vertices_np.min(axis=0)
+    upper_np = bench_case.vertices_np.max(axis=0)
+    return wp.vec3(*lower_np.tolist()), wp.vec3(*upper_np.tolist())
+
+
+def _normalized_points_np(bench_case: BenchCase) -> np.ndarray:
+    """
+    Map the mesh's vertices into the ``[-1, 1]`` cube pytorch3d's local space wants.
+
+    An *input* rather than part of the work, so it is cached and built on the host: the triwarp row
+    reads the raw positions and a ``bounds`` pair instead, which is the same affine map expressed
+    where triwarp expresses it. Handing pytorch3d unnormalized coordinates would put every point
+    outside its volume and time a clamp.
+    """
+    if bench_case.mesh_name not in _normalized_np_cache:
+        vertices_np = bench_case.vertices_np
+        lower_np, upper_np = vertices_np.min(axis=0), vertices_np.max(axis=0)
+        extent_np = np.where(upper_np > lower_np, upper_np - lower_np, 1.0)
+        _normalized_np_cache[bench_case.mesh_name] = np.ascontiguousarray(
+            2.0 * (vertices_np - lower_np) / extent_np - 1.0, dtype=np.float32
+        )
+    return _normalized_np_cache[bench_case.mesh_name]
+
+
+def _splat_field_np(resolution: int) -> np.ndarray:
+    """Build a fixed lattice to sample, cached per resolution: the input, not the operation."""
+    if resolution not in _splat_field_cache:
+        _splat_field_cache[resolution] = np.ascontiguousarray(
+            np.random.default_rng(0).normal(size=(resolution,) * 3), dtype=np.float32
+        )
+    return _splat_field_cache[resolution]
+
+
+@pytest.mark.benchmark(group="splat_onto_grid")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "pytorch3d")
+def test_splat_onto_grid(bench_case: BenchCase) -> None:
+    """
+    Scatter a per-point vector onto a dense lattice: eight atomic adds per point, then a divide.
+
+    The only group in this module whose input is a *cloud* rather than a grid, and the only one
+    whose cost is linear in the point count rather than cubic in the resolution -- the lattice is
+    held at 64^3 so the axis is the mesh's vertex count alone.
+
+    **pytorch3d** is the only reference and it is the same algorithm at the same weights, pinned
+    bit-for-bit on the host in ``tests/test_voxels.py::test_splat_onto_grid_matches_pytorch3d``. It
+    has CUDA kernels of its own, so both its rows are real: read the ``-cuda`` one against
+    ``triwarp-cuda``. Its lattice is transposed relative to triwarp's and its coordinates are the
+    ``[-1, 1]`` cube, so the row hands it the equivalent box rather than the same numbers; neither
+    difference is work. Its ``volume_densities`` / ``volume_features`` are *inputs* it accumulates
+    into, so they are zeroed outside the timed callable -- allocating them inside would price two
+    ``64^3`` allocations, which is what triwarp's row pays and states below.
+    """
+    resolution = 64
+    if bench_case.kind == "pytorch3d":
+        import torch
+
+        points_p3d = points_torch_from_numpy(
+            _normalized_points_np(bench_case), bench_case.torch_device
+        )
+        values_p3d = points_torch_from_numpy(
+            _normalized_points_np(bench_case), bench_case.torch_device
+        )
+        densities_p3d = torch.zeros(
+            (1, 1, resolution, resolution, resolution), device=bench_case.torch_device
+        )
+        features_p3d = torch.zeros(
+            (1, 3, resolution, resolution, resolution), device=bench_case.torch_device
+        )
+        splatted_p3d = bench_case.run(
+            lambda: p3d_ops.add_points_features_to_volume_densities_features(
+                points_p3d,
+                values_p3d,
+                densities_p3d.clone(),
+                features_p3d.clone(),
+                mode="trilinear",
+                align_corners=True,
+            )
+        )
+        assert splatted_p3d[0].shape[1] == 3
+        return
+    points = bench_case.vertices_wp
+    bounds = _splat_bounds(bench_case)
+    field, density = bench_case.run(
+        lambda: tw.voxels.splat_onto_grid(points, points, (resolution,) * 3, bounds=bounds)
+    )
+    assert field.shape == (resolution,) * 3
+    assert int(density.shape[0]) == resolution
+
+
+@pytest.mark.benchmark(group="sample_grid_trilinear")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "pytorch3d")
+def test_sample_grid_trilinear(bench_case: BenchCase) -> None:
+    """
+    The gather half: eight coalesced lattice reads per query against the same eight atomics.
+
+    Read against ``splat_onto_grid`` above -- same stencil, same lattice, same query set, and the
+    only difference is scatter against gather. The gap is what atomic contention costs, which is
+    otherwise invisible.
+
+    **pytorch3d** routes its volume sampling through ``torch.nn.functional.grid_sample``, which is
+    what this row times: that is torch's own trilinear sampler and the independent implementation
+    ``tests/test_voxels.py::test_sample_grid_trilinear_matches_pytorch3d`` compares against
+    (4.77e-07). ``align_corners=True`` and ``padding_mode="border"`` are the settings that match
+    triwarp's ``bounds`` and its clamped stencil; both are non-default and both change the answer
+    rather than the cost.
+    """
+    resolution = 64
+    field_np = _splat_field_np(resolution)
+    if bench_case.kind == "pytorch3d":
+        import torch
+
+        volume_p3d = torch.as_tensor(field_np.transpose(2, 1, 0), device=bench_case.torch_device)[
+            None, None
+        ]
+        queries_p3d = points_torch_from_numpy(
+            _normalized_points_np(bench_case), bench_case.torch_device
+        ).reshape(1, 1, 1, -1, 3)
+        sampled_p3d = bench_case.run(
+            lambda: torch.nn.functional.grid_sample(
+                volume_p3d, queries_p3d, mode="bilinear", padding_mode="border", align_corners=True
+            )
+        )
+        assert sampled_p3d.numel() == bench_case.n_vertices
+        return
+    field = twt.as_array3d(
+        wp.array(field_np, dtype=wp.float32, device=bench_case.device), wp.float32
+    )
+    points = bench_case.vertices_wp
+    bounds = _splat_bounds(bench_case)
+    sampled = bench_case.run(lambda: tw.voxels.sample_grid_trilinear(field, points, bounds=bounds))
+    assert int(sampled.shape[0]) == bench_case.n_vertices
 
 
 @pytest.mark.benchmark(group="grid_points")

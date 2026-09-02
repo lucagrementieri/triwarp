@@ -6,6 +6,7 @@ import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
+import pytorch3d.ops as p3d_ops
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
@@ -22,6 +23,7 @@ from tests.conversions import (
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
+    trimesh_to_pytorch3d,
     trimesh_to_pyvista,
 )
 
@@ -38,6 +40,40 @@ def test_face_normals_and_areas(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     normal_wp, area_wp = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
     assert np.allclose(normal_wp.numpy(), mesh_tm.face_normals, rtol=1e-5, atol=1e-5)
     assert np.allclose(area_wp.numpy(), mesh_tm.area_faces, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("face_normals_and_areas", "pytorch3d")
+def test_face_normals_and_areas_matches_pytorch3d(icosphere: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: ``mesh_face_areas_normals`` is bit-identical to triwarp's, on both outputs.
+
+    Not merely within tolerance -- **exactly** 0.0 on this fixture, because the two implementations
+    are the same three lines: ``(v1 - v0) x (v2 - v0)``, its norm halved for the area, and the same
+    cross product normalized for the normal. Worth having as a separate test from the trimesh one
+    for that reason: a reference that agrees to 1e-7 leaves room for a different summation order,
+    and one that agrees to 0.0 does not.
+
+    Note the areas come back **float32** whatever the ``Meshes`` was built from -- the C++ kernel
+    casts -- so a float64 comparison here would be measuring pytorch3d's own downcast.
+
+    The ``Meshes`` is built on the **triwarp side's own device**, which is what makes the exact
+    claim hold on both: pytorch3d has separate CPU and CUDA kernels, and each agrees bit-for-bit
+    with triwarp's on the same device while a ``pytorch3d``-on-host against ``triwarp``-on-CUDA
+    comparison lands at 1.86e-09 on the areas and 1.19e-07 on the normals. So this is also one of
+    the tests section 6's device rule asks for -- it exercises the reference's *own* two backends
+    rather than trusting the CPU pass.
+    """
+    mesh_tm, mesh_wp = icosphere
+    mesh_p3d = trimesh_to_pytorch3d(mesh_tm, str(mesh_wp.points.device))
+    areas_p3d, normals_p3d = p3d_ops.mesh_face_areas_normals(
+        mesh_p3d.verts_packed(), mesh_p3d.faces_packed()
+    )
+    normals_wp, areas_wp = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
+
+    assert areas_p3d.shape == (mesh_tm.faces.shape[0],)
+    assert float(np.ptp(areas_p3d.cpu().numpy())) > 1e-5
+    assert np.array_equal(areas_wp.numpy(), areas_p3d.cpu().numpy())
+    assert np.array_equal(normals_wp.numpy(), normals_p3d.cpu().numpy())
 
 
 @pytest.mark.parity("face_normals_and_areas", "igl", "potpourri3d", "pymeshlab")

@@ -48,12 +48,14 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pytorch3d.loss as p3d_loss
+import pytorch3d.structures as p3d_structures
 import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, points_torch_from_numpy, skip_larger_than
 
 _TRANSLATION_FRACTION = 0.05
 
@@ -67,6 +69,20 @@ _cloud_pml_cache: dict[str, ml.MeshSet] = {}
 # MeshLib's own float upper bound: ``findProjections`` segfaults on ``math.inf`` rather than
 # raising, and a ``0.0`` in that slot silently returns all-zero distances.
 _MESHLIB_FLT_MAX = 3.4028234663852886e38
+
+
+# pytorch3d's ``_C`` carries no spatial structure on either device, so both cloud rows here are
+# Theta(N^2) and the CPU one is unaffordable past a feature mesh. Measured: ``knn_points`` 299.8 /
+# 1 189.5 / 4 562.8 ms and ``chamfer_distance`` 557.8 / 2 319.1 / 9 077.1 ms at 10 k / 20 k / 40 k
+# points -- 3.84-4.16x per doubling, so ``dragon`` at ~435 k extrapolates to ~9 minutes *per round*
+# and ``--benchmark-json`` is written at session end, which would cost the whole file's rows.
+_PYTORCH3D_QUADRATIC = "pytorch3d's CPU cloud queries are brute force; capped at bunny_decimated"
+
+
+def _skip_p3d_cpu_beyond_bunny_decimated(bench_case: BenchCase) -> None:
+    """Cap the ``pytorch3d-cpu`` row alone: the CUDA one is a different cost curve entirely."""
+    if bench_case.torch_device == "cpu":
+        skip_larger_than(bench_case, "bunny_decimated", _PYTORCH3D_QUADRATIC)
 
 
 def _clouds_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
@@ -136,7 +152,7 @@ def test_chamfer_mesh_to_mesh_loss(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="chamfer_points_to_points")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "pytorch3d")
 @pytest.mark.parametrize("single_directional", [True, False], ids=["oneway", "symmetric"])
 def test_chamfer_points_to_points(bench_case: BenchCase, single_directional: bool) -> None:
     """
@@ -145,8 +161,31 @@ def test_chamfer_points_to_points(bench_case: BenchCase, single_directional: boo
     ``single_directional=False`` does not merely double the work -- it builds a *second*
     acceleration structure over the other cloud. So the symmetric row should be more than 2x the
     one-way row, and how much more is the build cost, which is otherwise invisible.
+
+    **pytorch3d** is the only reference here with GPU kernels, and its ``chamfer_distance`` is the
+    convention this module documents -- same squared distances, same mean-of-two-directions, pinned
+    at 7.02e-08 in ``tests/test_metrics.py::test_chamfer_points_to_points_matches_pytorch3d``. It
+    has no spatial structure on either device, which makes this the group where its crossover is
+    sharpest: measured 3.39 ms against triwarp-cuda's 5.36 at 20 000 points (**0.63x**, a loss for
+    triwarp) and 108.12 against 1.19 at 200 000 (**90x**). Read the two rows as one curve; see the
+    ``LIBRARIES`` block in [`conftest.py`](conftest.py) for why half of that swing is triwarp's own
+    search-radius heuristic. ``single_directional=True`` maps onto its ``single_directional=True``
+    exactly, so the parametrize axis is shared rather than emulated.
     """
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "pytorch3d":
+        _skip_p3d_cpu_beyond_bunny_decimated(bench_case)
+        cloud_a_p3d, cloud_b_p3d = (
+            points_torch_from_numpy(cloud_np, bench_case.torch_device)
+            for cloud_np in _clouds_np(bench_case)
+        )
+        chamfer_p3d, _ = bench_case.run(
+            lambda: p3d_loss.chamfer_distance(
+                cloud_a_p3d, cloud_b_p3d, single_directional=single_directional
+            )
+        )
+        assert float(chamfer_p3d) > 0.0
+        return
     if bench_case.kind == "triwarp":
         cloud_a, cloud_b = _clouds_wp(bench_case)
         chamfer = bench_case.run(
@@ -228,7 +267,7 @@ def test_hausdorff_points_to_points(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="chamfer_points_to_mesh")
-@pytest.mark.benchlibs("triwarp", "igl", "meshlib")
+@pytest.mark.benchlibs("triwarp", "igl", "meshlib", "pytorch3d")
 def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
     """
     Cloud-to-surface Chamfer: an exact mesh query forward, a ``k=1`` cloud search backward.
@@ -251,7 +290,29 @@ def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
     that matches the triwarp branch, which is handed a ``wp.Mesh`` it does not rebuild. Its
     ``distSq`` output is exactly triwarp's ``point_reduction=None`` array, compared element-wise in
     ``tests/test_metrics.py``.
+
+    **pytorch3d's row is the whole scalar and the only GPU one**, but it is a *different* pair of
+    directions: ``point_mesh_face_distance`` sums point-to-triangle with **face**-to-point where
+    triwarp's backward half is mesh-vertex-to-point. So it is not an upper or lower bound on
+    triwarp's answer, it is a neighbouring quantity of the same cost shape -- two exact
+    point-to-triangle sweeps -- which is why it is timed here and why
+    ``tests/test_metrics.py::test_chamfer_points_to_mesh_matches_pytorch3d`` compares only the
+    forward half, through a hand-ported per-pair table. Its ``Meshes`` and ``Pointclouds`` are
+    immutable and pure, so both are built outside the timed callable, and the ``*_packed()``
+    accessors the loss reads are warmed there too.
     """
+    if bench_case.kind == "pytorch3d":
+        _skip_p3d_cpu_beyond_bunny_decimated(bench_case)
+        mesh_p3d = bench_case.mesh_p3d
+        mesh_p3d.verts_packed(), mesh_p3d.faces_packed()  # warm the cached derivations
+        cloud_p3d = p3d_structures.Pointclouds(
+            points=[points_torch_from_numpy(_clouds_np(bench_case)[1], bench_case.torch_device)[0]]
+        )
+        distance_p3d = bench_case.run(
+            lambda: p3d_loss.point_mesh_face_distance(mesh_p3d, cloud_p3d)
+        )
+        assert float(distance_p3d) > 0.0
+        return
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "meshlib":
         cloud_np = _clouds_np(bench_case)[1]

@@ -5,6 +5,7 @@ from pathlib import Path
 import meshio
 import numpy as np
 import pytest
+import pytorch3d.io as p3d_io
 import warp as wp
 
 import triwarp as tw
@@ -70,6 +71,39 @@ def test_load_mesh_returns_wp_mesh(tmp_path, device):
     assert isinstance(mesh_wp, wp.Mesh)
     assert np.allclose(mesh_wp.points.numpy(), source["vertices"], rtol=1e-5, atol=1e-5)
     assert np.array_equal(mesh_wp.indices.numpy().reshape(-1, 3), source["faces"])
+
+
+@pytest.mark.parity(
+    "load_mesh",
+    "pytorch3d",
+    benchmarked=False,
+    reason="triwarp.io has no benchmark group at all and deliberately so -- it is a meshio "
+    "round-trip, so a row here would time meshio's PLY parser against pytorch3d's, neither of "
+    "which is triwarp code. tests/api_conventions.py carries io in "
+    "_MODULES_WITHOUT_BENCHMARKS for that reason. The values are still worth comparing, which is "
+    "what this test does.",
+)
+def test_load_mesh_matches_pytorch3d(tmp_path, device):
+    """
+    Class B: ``pytorch3d.io.load_ply`` reads the same file to the same buffers after a float cast.
+
+    Both sides parse the *same* PLY, so the only thing between them is storage: pytorch3d returns
+    float32 verts and int64 faces where meshio hands triwarp float64 that ``wp.vec3`` narrows, and
+    the faces are byte-equal with no transform. A second independent parser is worth having on a
+    loader precisely because a format bug is invisible to a round trip through the writer that
+    produced the file.
+
+    Note ``load_ply`` returns a bare ``(verts, faces)`` tuple, not a ``Meshes`` -- the container
+    form is ``IO().load_mesh``, and only the ``.obj`` reader has an ``as_meshes`` helper.
+    """
+    path = tmp_path / "mesh.ply"
+    source = _write_synthetic_mesh(path)
+    vertices_p3d, faces_p3d = p3d_io.load_ply(str(path))
+    mesh_wp = tw.io.load_mesh(path, device=device)
+
+    assert vertices_p3d.shape == source["vertices"].shape
+    assert np.array_equal(mesh_wp.points.numpy(), vertices_p3d.numpy())
+    assert np.array_equal(mesh_wp.indices.numpy().reshape(-1, 3), faces_p3d.numpy())
 
 
 def test_load_mesh_without_faces_raises(tmp_path, device):

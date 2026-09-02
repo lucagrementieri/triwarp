@@ -56,6 +56,8 @@ from typing import cast
 
 import numpy as np
 import pytest
+import pytorch3d.ops as p3d_ops
+import torch
 import warp as wp
 
 import triwarp as tw
@@ -146,7 +148,7 @@ def _gather_inputs(bench_case: BenchCase) -> tuple:
 
 
 @pytest.mark.benchmark(group="concatenate_arrays")
-@pytest.mark.benchlibs("triwarp", "numpy")
+@pytest.mark.benchlibs("triwarp", "numpy", "pytorch3d")
 @pytest.mark.parametrize("n_segments", _SEGMENT_COUNTS, ids=["few", "many"])
 def test_concatenate(bench_case: BenchCase, n_segments: int) -> None:
     """
@@ -184,7 +186,32 @@ def test_concatenate(bench_case: BenchCase, n_segments: int) -> None:
     recording is never reused; replaying an *existing* graph is 7.7-8.5x, which is the number that
     makes capture look attractive and is unreachable here. And a segmented gather kernel is not
     available: Warp has no array-of-arrays and a kernel cannot dereference a raw pointer.
+
+    **pytorch3d**'s ``padded_to_packed`` is the same concatenation from the other direction: it
+    reads a dense ``(n_segments, max_size)`` block and writes the flat buffer, so it is the *only*
+    reference here that does it in one device kernel rather than per segment -- which is exactly the
+    lever the two declined ones above are not. It is not free of a cost model of its own: the padded
+    block is ``n_segments * max_size`` elements whatever the true lengths, so at ``many`` on an
+    uneven split it moves more memory than there is data, and the block is built outside the timed
+    callable because it is the input. Read the row as "what a segmented gather would cost if Warp
+    had one"; ``tests/test_array.py::test_the_packing_family_matches_pytorch3d`` pins the two forms
+    to byte equality.
     """
+    if bench_case.kind == "pytorch3d":
+        segments_np = _segments_np(bench_case, n_segments)
+        total = sum(int(segment_np.size) for segment_np in segments_np)
+        widest = max(int(segment_np.size) for segment_np in segments_np)
+        first_p3d = torch.as_tensor(
+            np.cumsum([0, *(int(s.size) for s in segments_np[:-1])], dtype=np.int64),
+            device=bench_case.torch_device,
+        )
+        padded_np = np.zeros((len(segments_np), widest), dtype=np.float32)
+        for row, segment_np in enumerate(segments_np):
+            padded_np[row, : segment_np.size] = segment_np
+        padded_p3d = torch.as_tensor(padded_np, device=bench_case.torch_device)
+        flat_p3d = bench_case.run(lambda: p3d_ops.padded_to_packed(padded_p3d, first_p3d, total))
+        assert flat_p3d.shape[0] == total
+        return
     if bench_case.kind == "numpy":
         segments_np = _segments_np(bench_case, n_segments)
         flat_np = bench_case.run(lambda: np.concatenate(segments_np))

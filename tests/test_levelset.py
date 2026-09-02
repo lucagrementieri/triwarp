@@ -15,10 +15,12 @@ import numpy as np
 import pymeshlab as ml
 import pytest
 import pyvista as pv
+import torch
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
+from pytorch3d.ops.marching_cubes import marching_cubes as p3d_marching_cubes
 from scipy.spatial import cKDTree
 
 import triwarp as tw
@@ -29,6 +31,7 @@ from tests.comparisons import (
     euler_characteristic,
     hausdorff_surface_two_sided,
     hausdorff_two_sided,
+    lexsort_rows,
     open_edge_count,
 )
 from tests.conversions import (
@@ -222,6 +225,45 @@ def test_marching_cubes_matches_meshlib(device: str) -> None:
     volume_ml = tm.Trimesh(vertices_ml_np, faces_ml_np, process=False).volume
     assert volume_tw > 0.0
     assert volume_ml == pytest.approx(volume_tw, rel=1e-5)
+
+
+@pytest.mark.parity("marching_cubes", "pytorch3d")
+def test_marching_cubes_matches_pytorch3d(device: str) -> None:
+    """
+    Class A: the fifth implementation of the case table, in triwarp's own index space.
+
+    ``return_local_coords=False`` is what makes this a direct comparison: with it ``True``
+    pytorch3d rescales its output into a normalized ``[-1, 1]`` cube and the two would differ by an
+    affine map. Off, it emits lattice indices, which is exactly what ``marching_cubes`` returns
+    without ``bounds`` -- so the comparison needs no convention fix at all, unlike the igl /
+    pyvista / meshlib trio above, each of which needed a different one.
+
+    Measured on a 16^3 radial field at ``iso=1.0``: **480** vertices and **956** faces from both
+    sides, and the sorted coordinate rows agree at **0.0**. Sorted rather than indexed because
+    nothing pins two case-table walks to one emission order.
+
+    Note the import: ``marching_cubes`` is **not** re-exported from ``pytorch3d.ops``, only from
+    ``pytorch3d.ops.marching_cubes``, so ``p3d_ops.marching_cubes`` is an ``AttributeError``.
+    """
+    resolution, extent, iso = 16, 1.5, 1.0
+    axis_np = np.linspace(-extent, extent, resolution)
+    x_np, y_np, z_np = np.meshgrid(axis_np, axis_np, axis_np, indexing="ij")
+    field_np = (x_np**2 + y_np**2 + z_np**2).astype(np.float32)
+
+    vertices_p3d, faces_p3d = p3d_marching_cubes(
+        torch.as_tensor(field_np, device=device)[None], isolevel=iso, return_local_coords=False
+    )
+    vertices_p3d = vertices_p3d[0].cpu().numpy()
+
+    field_wp = wp.array(field_np, dtype=wp.float32, device=device)
+    vertices_wp, faces_wp = tw.levelset.marching_cubes(twt.as_array3d(field_wp, wp.float32), iso)
+
+    assert vertices_p3d.shape[0] > 0
+    assert int(vertices_wp.shape[0]) == vertices_p3d.shape[0]
+    assert int(faces_wp.shape[0]) // 3 == faces_p3d[0].shape[0]
+    assert np.array_equal(
+        lexsort_rows(np.round(vertices_wp.numpy(), 5)), lexsort_rows(np.round(vertices_p3d, 5))
+    )
 
 
 def test_marching_cubes_index_space_by_default(device: str) -> None:

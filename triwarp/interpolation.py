@@ -384,7 +384,9 @@ def interpolate_from_points(
     sample set; use
     [`transfer_onto_vertices`][triwarp.interpolation.transfer_onto_vertices] instead when the source
     *is* a mesh, since projecting onto its surface is exact for a piecewise-linear field where this
-    is a smoothing.
+    is a smoothing, and
+    [`sample_grid_trilinear`][triwarp.voxels.sample_grid_trilinear] when the source is a dense
+    lattice, where trilinear weights are exact rather than a kernel estimate.
 
     Parameters
     ----------

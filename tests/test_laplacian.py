@@ -6,6 +6,7 @@ import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
+import pytorch3d.ops as p3d_ops
 import trimesh as tm
 import trimesh.smoothing as tms
 import warp as wp
@@ -18,6 +19,7 @@ from tests.conversions import (
     bsr_to_dense,
     points_to_warp,
     trimesh_to_meshlib,
+    trimesh_to_pytorch3d,
     trimesh_to_pyvista,
 )
 
@@ -432,6 +434,90 @@ def test_cotmatrix_and_mass_match_potpourri3d(
     mass_pp = pp3d.vertex_areas(vertices_np, faces_np)
     mass_wp = tw.laplacian.mass_matrix_entries(mesh_wp.points, mesh_wp.indices)
     assert np.allclose(mass_wp.numpy(), mass_pp, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("cotmatrix", "pytorch3d")
+@pytest.mark.parity("mass_matrix", "pytorch3d")
+def test_cotmatrix_and_mass_match_pytorch3d(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: ``cot_laplacian`` returns **twice** triwarp's off-diagonal and a **zero** diagonal.
+
+    Two conventions in one call and neither is guessable from the name. The off-diagonal ratio is
+    measured at exactly ``0.5`` -- triwarp keeps the *half*-cotangent table that
+    ``cotmatrix_entries`` produces, pytorch3d assembles the sum -- and pytorch3d never writes the
+    row sum onto the diagonal at all (``max|diag|`` is ``0.0``, not merely small), where triwarp's
+    ``cotmatrix`` assembles it. So the comparison is off-diagonals only, and the zero diagonal is
+    asserted rather than sidestepped, because it is what a caller assembling from
+    ``cot_laplacian`` has to know: section 4's ``laplacian_smoothing_loss`` variants need that
+    matrix and not this one.
+
+    Its second return value is the mass matrix in the reciprocal: ``1 / inv_areas`` is **three
+    times** triwarp's ``mass_matrix`` diagonal, because the barycentric lumped mass is a third of
+    the incident area sum. Measured 5.96e-08 absolute / 2.45e-07 relative.
+    """
+    mesh_tm, mesh_wp = icosphere
+    n_vertices = len(mesh_tm.vertices)
+    mesh_p3d = trimesh_to_pytorch3d(mesh_tm)
+    cotangent_p3d, inv_areas_p3d = p3d_ops.cot_laplacian(
+        mesh_p3d.verts_packed(), mesh_p3d.faces_packed()
+    )
+    cotangent_p3d = cotangent_p3d.to_dense().numpy()
+    inv_areas_p3d = inv_areas_p3d.numpy().reshape(-1)
+
+    cotangent_np = bsr_to_dense(tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices), n_vertices)
+    mass_np = bsr_to_dense(tw.laplacian.mass_matrix(mesh_wp.points, mesh_wp.indices), n_vertices)
+
+    off_diagonal = ~np.eye(n_vertices, dtype=bool)
+    assert float(np.abs(np.diag(cotangent_p3d)).max()) == 0.0
+    assert float(np.abs(cotangent_p3d[off_diagonal]).max()) > 1e-2
+    assert np.allclose(
+        cotangent_np[off_diagonal], 0.5 * cotangent_p3d[off_diagonal], rtol=1e-5, atol=1e-6
+    )
+    assert np.allclose(1.0 / inv_areas_p3d, 3.0 * np.diag(mass_np), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parity("laplacian_equal_weight", "pytorch3d")
+@pytest.mark.parity("laplacian_inverse_distance", "pytorch3d")
+def test_laplacian_operators_match_pytorch3d(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: the two ``ops`` graph Laplacians are triwarp's two ``equal_weight`` branches.
+
+    Both transforms were recovered by measurement rather than read off the docstrings. For the
+    uniform operator, pytorch3d writes **-1** on the diagonal where triwarp writes 0, so
+    ``L_p3d == L_tw - I``; the off-diagonals are bit-identical (**0.0**), which is what makes the
+    diagonal claim a claim about the convention and not a tolerance. For the inverse-distance one,
+    pytorch3d leaves the rows *unnormalized* -- it is ``1 / (||vi - vj|| + 1e-12)`` raw, the same
+    formula and the same literal ``eps`` triwarp's docstring quotes -- so dividing by the row sum
+    is the transform, and the two then agree to 1.49e-08 including the diagonal, which is 0 on
+    both sides.
+
+    That second measurement is why there is no ``edge_weights=`` keyword to add here: pytorch3d's
+    ``norm_laplacian`` *is* ``laplacian(equal_weight=False)``, and ``filter_taubin`` already takes
+    it through ``laplacian_operator=``.
+    """
+    mesh_tm, mesh_wp = icosphere
+    n_vertices = len(mesh_tm.vertices)
+    mesh_p3d = trimesh_to_pytorch3d(mesh_tm)
+    uniform_p3d = (
+        p3d_ops.laplacian(mesh_p3d.verts_packed(), mesh_p3d.edges_packed()).to_dense().numpy()
+    )
+    inverse_p3d = (
+        p3d_ops.norm_laplacian(mesh_p3d.verts_packed(), mesh_p3d.edges_packed()).to_dense().numpy()
+    )
+    row_sums_p3d = inverse_p3d.sum(axis=1, keepdims=True)
+    normalized_p3d = inverse_p3d / np.where(row_sums_p3d == 0.0, 1.0, row_sums_p3d)
+
+    uniform_np = bsr_to_dense(
+        tw.laplacian.laplacian(mesh_wp.points, mesh_wp.indices, equal_weight=True), n_vertices
+    )
+    inverse_np = bsr_to_dense(
+        tw.laplacian.laplacian(mesh_wp.points, mesh_wp.indices, equal_weight=False), n_vertices
+    )
+
+    assert np.array_equal(np.diag(uniform_p3d), np.full(n_vertices, -1.0, dtype=np.float32))
+    assert np.array_equal(uniform_np, uniform_p3d + np.eye(n_vertices))
+    assert float(np.abs(np.diag(inverse_p3d)).max()) == 0.0
+    assert np.allclose(inverse_np, normalized_p3d, rtol=1e-5, atol=1e-7)
 
 
 def test_cotmatrix_null_space(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

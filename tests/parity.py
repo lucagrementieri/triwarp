@@ -1,7 +1,9 @@
 """
 Cross-suite parity bookkeeping: which benchmarked reference libraries are also *tested* against.
 
-``benchmarks/`` times triwarp against six CPU references but only ever asserts shapes and
+``benchmarks/`` times triwarp against every reference in ``benchmarks/conftest.py``'s
+``LIBRARIES`` -- ten CPU-only baselines plus ``pytorch3d``, which carries CUDA kernels of its own
+and so takes two rows -- but only ever asserts shapes and
 finiteness -- its ``pytest_generate_tests`` parametrizes over ``(mesh_name, library)``, so one
 benchmark invocation holds exactly one library's result and *cannot* compare them. That leaves room
 for a benchmark to race two implementations computing different things and report the ratio as if it
@@ -101,6 +103,10 @@ _LIBRARY_SUFFIXES: dict[str, frozenset[str]] = {
     "meshlib": frozenset({"_ml"}),
     "pymeshfix": frozenset({"_pmf"}),
     "moderngl": frozenset({"_gl"}),
+    # ``pytorch3d`` is the first reference here with GPU kernels of its own, which is why it takes
+    # two ``LIBRARIES`` rows (``pytorch3d-cpu`` / ``pytorch3d-cuda``) and one entry here: the
+    # library *kind* is what a marker names, and both rows compute the same answer.
+    "pytorch3d": frozenset({"_p3d"}),
     # ``numpy`` has carried timed pairs since ``test_reduce.py`` landed and was missing from this
     # table the whole time, which meant every one of its claims skipped the check below -- the same
     # hole the moderngl note above describes, but live rather than hypothetical. Verified: all 16
@@ -164,6 +170,20 @@ _LIBRARY_ROOTS: dict[str, frozenset[str]] = {
             "warp_to_pymeshfix",
             "pymeshfix_to_numpy",
             "pymeshfix_intersecting_faces",
+        }
+    ),
+    "pytorch3d": frozenset(
+        {
+            "p3d_ops",
+            "p3d_loss",
+            "p3d_structures",
+            "p3d_utils",
+            "numpy_to_pytorch3d",
+            "trimesh_to_pytorch3d",
+            "warp_to_pytorch3d",
+            "points_to_pytorch3d",
+            "points_to_torch",
+            "pytorch3d_to_numpy",
         }
     ),
 }

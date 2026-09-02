@@ -17,6 +17,7 @@ import igl
 import numpy as np
 import open3d as o3d
 import pytest
+import pytorch3d.ops as p3d_ops
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -29,6 +30,7 @@ from tests.conversions import (
     numpy_to_meshlib_bitset,
     points_to_meshlib,
     points_to_open3d,
+    points_to_torch,
     points_to_warp,
     trimesh_to_meshlib,
 )
@@ -677,6 +679,99 @@ def test_query_nearest_matches_igl(device: str, backend: Literal["bvh", "hashgri
     query_indices_igl = igl.knn(queries, points, k, *igl.octree(points)[:4])
 
     assert np.array_equal(query_indices_wp.numpy().reshape(queries.shape[0], k), query_indices_igl)
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+@pytest.mark.parametrize("k", [1, 7])
+@pytest.mark.parity("query_nearest_bvh_k1", "pytorch3d")
+@pytest.mark.parity("query_nearest_bvh_k7", "pytorch3d")
+@pytest.mark.parity("query_nearest_hashgrid_k1", "pytorch3d")
+@pytest.mark.parity("query_nearest_hashgrid_k7", "pytorch3d")
+def test_query_nearest_matches_pytorch3d(
+    device: str, backend: Literal["bvh", "hashgrid"], k: int
+) -> None:
+    """
+    Class B, against the fourth exact k-NN: ``ops.knn_points``, whose distances are **squared**.
+
+    That square root is the whole transform -- measured **0.0** afterwards on the CPU device and
+    1.19e-07 on CUDA, where pytorch3d's own kernel is a different reduction order -- and the
+    indices need none, measured **exactly** equal on both devices and at both ``k``. pytorch3d is a
+    genuinely independent implementation and the most different of the four: no spatial structure
+    at all, just the pairwise loop, against triwarp's BVH / hash grid, scipy's k-d tree and igl's
+    octree. That is also what makes it the crossover row the benchmark exists for -- brute force
+    with perfect coalescing beats a BVH descent at 20 000 points and loses by 98x at 200 000.
+
+    ``k=64`` is left out because there is no ``query_nearest_hashgrid_k64`` group to pair with, and
+    the two BVH-only markers would then read as a different claim than the four here.
+
+    The batched wrap is the trap this asserts against first: ``knn_points`` handed a bare
+    ``(P, 3)`` reads it as ``(N=P, P1=3, D)`` and compares three points without complaint, so the
+    reference's output shape is checked before its values.
+    """
+    rng = np.random.default_rng(3)
+    points_np = rng.normal(size=(500, 3)).astype(np.float32)
+    queries_np = rng.normal(size=(300, 3)).astype(np.float32)
+    nearest_p3d = p3d_ops.knn_points(
+        points_to_torch(queries_np, device), points_to_torch(points_np, device), K=k
+    )
+    indices_wp, distances_wp = tw.neighbors.query_nearest(
+        points_to_warp(points_np, device), points_to_warp(queries_np, device), k=k, backend=backend
+    )
+
+    assert nearest_p3d.idx.shape == (1, queries_np.shape[0], k)
+    assert np.array_equal(
+        indices_wp.numpy().reshape(queries_np.shape[0], k), nearest_p3d.idx[0].cpu().numpy()
+    )
+    assert np.allclose(
+        distances_wp.numpy().reshape(queries_np.shape[0], k),
+        np.sqrt(nearest_p3d.dists[0].cpu().numpy()),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+@pytest.mark.parity("query_ball_bvh", "pytorch3d")
+@pytest.mark.parity("query_ball_hashgrid", "pytorch3d")
+def test_query_ball_matches_pytorch3d(device: str, backend: Literal["bvh", "hashgrid"]) -> None:
+    """
+    Class B: ``ops.ball_query`` after removing its ``K`` cap, compared as **sets** per query.
+
+    Two named transforms, both forced by pytorch3d's fixed-width output. It returns a dense
+    ``(N, P, K)`` block padded with ``-1``, so ``K`` has to be passed at or above the largest true
+    neighbour count -- **26** on this cloud, and a smaller ``K`` is a silent truncation rather than
+    an error. And the fill order is ascending **index**, not ascending distance (verified), so only
+    the set is comparable; ``return_sorted`` has no counterpart to pin against.
+
+    The cap is asserted not to bite, which is the anti-vacuity check that matters here: a ``K``
+    swallowing every row would make the set comparison trivially true on the truncated prefix.
+    Some rows are legitimately **empty** at this radius (the cloud is Gaussian, so the tails are
+    sparse), which is why the second assert is on the total rather than on the per-row minimum.
+    """
+    rng = np.random.default_rng(3)
+    points_np = rng.normal(size=(500, 3)).astype(np.float32)
+    queries_np = rng.normal(size=(50, 3)).astype(np.float32)
+    radius = 0.6
+    ball_p3d = p3d_ops.ball_query(
+        points_to_torch(queries_np, device), points_to_torch(points_np, device), K=40, radius=radius
+    )
+    indices_p3d = ball_p3d.idx[0].cpu().numpy()
+    flat_wp, _, offsets_wp = tw.neighbors.query_ball_with_offsets(
+        points_to_warp(points_np, device),
+        points_to_warp(queries_np, device),
+        radius,
+        backend=backend,
+        include_total=True,
+    )
+
+    counts_p3d = (indices_p3d >= 0).sum(axis=1)
+    assert counts_p3d.max() < 40, "the K cap truncated a row; raise it"
+    assert int(counts_p3d.sum()) > queries_np.shape[0]
+    flat_np, offsets_np = flat_wp.numpy(), offsets_wp.numpy()
+    for query in range(queries_np.shape[0]):
+        assert set(flat_np[offsets_np[query] : offsets_np[query + 1]].tolist()) == set(
+            indices_p3d[query][indices_p3d[query] >= 0].tolist()
+        )
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])

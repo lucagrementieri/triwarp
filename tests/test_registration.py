@@ -6,6 +6,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops as p3d_ops
 import pyvista as pv
 import trimesh as tm
 import trimesh.registration as tm_reg
@@ -16,6 +17,7 @@ import triwarp as tw
 from tests.conversions import (
     points_to_meshlib,
     points_to_open3d,
+    points_to_torch,
     points_to_warp,
     trimesh_to_meshlib,
 )
@@ -368,6 +370,95 @@ def test_procrustes_matches_open3d(device: str) -> None:
 
     assert np.allclose(matrix_wp.numpy()[0], matrix_o3d, rtol=1e-5, atol=1e-5)
     assert np.isclose(np.linalg.det(matrix_o3d[:3, :3]), 1.0, atol=1e-5)
+
+
+@pytest.mark.parity("procrustes", "pytorch3d")
+def test_procrustes_matches_pytorch3d(device: str) -> None:
+    """
+    Class B: ``corresponding_points_alignment`` is a **row-vector** convention, so ``R`` transposes.
+
+    pytorch3d solves ``s * X @ R + T = Y`` where triwarp returns a column-vector ``wp.mat44``, so
+    the reference's ``R`` is triwarp's linear block divided by the scale and **transposed**:
+    measured 2.54e-07. The translation needs no transform (2.38e-07) and the scale comes back
+    1.29999983 against pytorch3d's 1.30000031 on a planted 1.3 -- so the pair pins the scale too,
+    which is the part ``estimate_scale=False`` would silently drop.
+
+    This is the second pair ``triwarp/registration.py``'s prose has been asserting with nothing
+    running pytorch3d.
+    """
+    rng = np.random.default_rng(11)
+    a_np = rng.normal(size=(200, 3)).astype(np.float32)
+    angle = 0.3
+    rotation_np = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    b_np = (1.3 * (a_np @ rotation_np.T) + np.array([0.4, -0.2, 0.7], np.float32)).astype(
+        np.float32
+    )
+    aligned_p3d = p3d_ops.corresponding_points_alignment(
+        points_to_torch(a_np, device), points_to_torch(b_np, device), estimate_scale=True
+    )
+    matrix_wp = tw.registration.procrustes(
+        points_to_warp(a_np, device), points_to_warp(b_np, device), return_cost=False
+    )
+    matrix_np = matrix_wp.numpy()[0]
+    linear_np = matrix_np[:3, :3]
+    scale = float(np.linalg.norm(linear_np[:, 0]))
+
+    assert np.allclose(float(aligned_p3d.s[0]), 1.3, rtol=1e-5, atol=1e-5)
+    assert np.allclose(scale, float(aligned_p3d.s[0]), rtol=1e-5, atol=1e-5)
+    assert np.allclose((linear_np / scale).T, aligned_p3d.R[0].cpu().numpy(), rtol=1e-5, atol=1e-6)
+    assert np.allclose(matrix_np[:3, 3], aligned_p3d.T[0].cpu().numpy(), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parity("icp_point_cloud", "pytorch3d")
+def test_icp_point_cloud_matches_pytorch3d(device: str) -> None:
+    """
+    Class B: ``iterative_closest_point``'s converged transform, under the same ``R`` transpose.
+
+    The **converged transform and its residual** are what is compared, not the iteration count:
+    pytorch3d's stopping rule is its own ``relative_rmse_thr`` and it reached this fixture's answer
+    in 4 iterations where triwarp's threshold takes its own number, so a count comparison would be
+    pinning two different rules. Measured 4.17e-07 on the rotation and 2.35e-07 on the
+    translation for a 300-point cloud under a planted 0.15 rad rotation, with pytorch3d's own
+    ``rmse`` at 4.03e-07 and triwarp's cost at 1.4e-13.
+
+    ``estimate_scale=False`` matches triwarp's ``scale=False`` default, and the pair is
+    correspondence-free on both sides -- each iteration re-runs its own nearest-neighbour search,
+    which is the formulation ``triwarp/registration.py``'s docstring credits to pytorch3d.
+    """
+    rng = np.random.default_rng(11)
+    a_np = rng.normal(size=(300, 3)).astype(np.float32)
+    angle = 0.15
+    rotation_np = np.array(
+        [
+            [np.cos(angle), 0.0, np.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle), 0.0, np.cos(angle)],
+        ],
+        dtype=np.float32,
+    )
+    b_np = (a_np @ rotation_np.T + np.array([0.05, 0.02, -0.03], np.float32)).astype(np.float32)
+    solution_p3d = p3d_ops.iterative_closest_point(
+        points_to_torch(a_np, device), points_to_torch(b_np, device), estimate_scale=False
+    )
+    matrix_wp, _, cost = tw.registration.icp(
+        points_to_warp(a_np, device), points_to_warp(b_np, device)
+    )
+    matrix_np = matrix_wp.numpy()[0]
+
+    assert bool(solution_p3d.converged)
+    assert float(solution_p3d.rmse[0]) < 1e-5
+    assert cost < 1e-9
+    assert np.allclose(
+        matrix_np[:3, :3].T, solution_p3d.RTs.R[0].cpu().numpy(), rtol=1e-5, atol=1e-6
+    )
+    assert np.allclose(matrix_np[:3, 3], solution_p3d.RTs.T[0].cpu().numpy(), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parity("icp_point_cloud", "open3d", "trimesh")

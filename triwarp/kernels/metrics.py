@@ -11,7 +11,9 @@ positions (and, for the surface terms, the mesh vertices).
 Each term accumulates a *scaled* contribution into a length-1 loss accumulator via
 ``wp.atomic_add`` (which has a well-defined adjoint), so ``"sum"`` and ``"mean"``
 reductions differ only by the ``scale`` passed from Python scope. Following the
-``pytorch3d`` convention the distances are **squared** Euclidean distances.
+``pytorch3d`` convention the distances are **squared** Euclidean distances -- measured at
+7.02e-08 relative against ``pytorch3d.loss.chamfer_distance``, in
+``tests/test_metrics.py::test_chamfer_points_to_points_matches_pytorch3d``.
 """
 
 import warp as wp

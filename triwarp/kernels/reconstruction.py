@@ -11,7 +11,7 @@ triangle predicates, shared with ``kernels/predicates.py``.
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
-from triwarp.kernels.array import sort3, update_argmax
+from triwarp.kernels.array import sort3, trilinear_cell, trilinear_weight, update_argmax
 from triwarp.kernels.predicates import (
     delone_metrics,
     is_unfold_quadrangle_convex,
@@ -517,13 +517,17 @@ def poisson_sample_grid(
     field: wp.array[wp.float32], res: wp.int32, gx: wp.float32, gy: wp.float32, gz: wp.float32
 ) -> wp.float32:
     # Trilinear interpolation of ``field`` at grid coordinate (gx, gy, gz) in [0, res - 1].
-    # Clamp the base cell so the (i0 + 1, j0 + 1, k0 + 1) corner reads stay in range.
-    i0 = wp.clamp(wp.int32(wp.floor(gx)), 0, res - 2)
-    j0 = wp.clamp(wp.int32(wp.floor(gy)), 0, res - 2)
-    k0 = wp.clamp(wp.int32(wp.floor(gz)), 0, res - 2)
-    fx = wp.clamp(gx - wp.float32(i0), 0.0, 1.0)
-    fy = wp.clamp(gy - wp.float32(j0), 0.0, 1.0)
-    fz = wp.clamp(gz - wp.float32(k0), 0.0, 1.0)
+    #
+    # The cell decomposition is shared with ``splat_normals`` below and with
+    # ``kernels/interpolation.sample_grid_trilinear`` / ``kernels/scatter.splat_grid_trilinear``.
+    # What is *not* shared is the evaluation: this reads a **flat** ``res**3`` float32 buffer and
+    # nests ``wp.lerp``, where the public pair reads a rank-3 array of any dtype and sums the eight
+    # corner weights. The two are the same function of the same inputs and differ only in float32
+    # summation order, so they are deliberately not merged: this one's arithmetic is what the
+    # Poisson iso-value was measured against, and the storage differs anyway.
+    base, fractions = trilinear_cell(wp.vec3(gx, gy, gz), wp.vec3i(res, res, res))
+    i0, j0, k0 = base[0], base[1], base[2]
+    fx, fy, fz = fractions[0], fractions[1], fractions[2]
     c000 = field[poisson_grid_index(i0, j0, k0, res)]
     c100 = field[poisson_grid_index(i0 + 1, j0, k0, res)]
     c010 = field[poisson_grid_index(i0, j0 + 1, k0, res)]
@@ -564,21 +568,13 @@ def splat_normals(
     n = wp.normalize(n)  # unit direction; magnitude carried by ``weight``
 
     g = (points[s] - cube_lower) * inv_cell
-    # Clamp the base cell so the (i0 + 1, j0 + 1, k0 + 1) splat corner stays in range.
-    i0 = wp.clamp(wp.int32(wp.floor(g[0])), 0, res - 2)
-    j0 = wp.clamp(wp.int32(wp.floor(g[1])), 0, res - 2)
-    k0 = wp.clamp(wp.int32(wp.floor(g[2])), 0, res - 2)
-    fx = wp.clamp(g[0] - wp.float32(i0), 0.0, 1.0)
-    fy = wp.clamp(g[1] - wp.float32(j0), 0.0, 1.0)
-    fz = wp.clamp(g[2] - wp.float32(k0), 0.0, 1.0)
+    base, fractions = trilinear_cell(g, wp.vec3i(res, res, res))
+    i0, j0, k0 = base[0], base[1], base[2]
 
     for di in range(2):
-        wx = wp.where(di == 0, 1.0 - fx, fx)
         for dj in range(2):
-            wy = wp.where(dj == 0, 1.0 - fy, fy)
             for dk in range(2):
-                wz = wp.where(dk == 0, 1.0 - fz, fz)
-                w = wx * wy * wz * weight
+                w = trilinear_weight(fractions, di, dj, dk) * weight
                 idx = poisson_grid_index(i0 + di, j0 + dj, k0 + dk, res)
                 wp.atomic_add(out_vx, idx, w * n[0])
                 wp.atomic_add(out_vy, idx, w * n[1])

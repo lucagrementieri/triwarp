@@ -36,6 +36,7 @@ import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
+import pytorch3d.ops as p3d_ops
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -63,7 +64,15 @@ def _barycentres_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
 
 @pytest.mark.benchmark(group="face_normals_and_areas")
 @pytest.mark.benchlibs(
-    "triwarp", "trimesh", "igl", "open3d", "potpourri3d", "pymeshlab", "pyvista", "meshlib"
+    "triwarp",
+    "trimesh",
+    "igl",
+    "open3d",
+    "potpourri3d",
+    "pymeshlab",
+    "pyvista",
+    "meshlib",
+    "pytorch3d",
 )
 def test_face_normals_and_areas(bench_case: BenchCase) -> None:
     """
@@ -75,8 +84,24 @@ def test_face_normals_and_areas(bench_case: BenchCase) -> None:
     section 6). Both halves are still compared for correctness, in
     tests/test_triangles.py::test_per_face_quantities_match_meshlib. Pure, so the mesh is built once
     outside the timed callable.
+
+    **pytorch3d** is the one reference here that answers both halves in one call, like triwarp --
+    ``mesh_face_areas_normals`` is the same cross product, its norm halved and normalized, and
+    ``tests/test_triangles.py::test_face_normals_and_areas_matches_pytorch3d`` pins the two to
+    **byte equality** on a shared device. So this is the fair race the partial rows above are not,
+    and the only one in this group that also runs on the GPU. ``verts_packed()`` and
+    ``faces_packed()`` are read outside the timed callable: they are cached derivations of the
+    ``Meshes`` container, not part of the arithmetic.
     """
     n_faces = bench_case.n_faces
+    if bench_case.kind == "pytorch3d":
+        vertices_p3d = bench_case.mesh_p3d.verts_packed()
+        faces_p3d = bench_case.mesh_p3d.faces_packed()
+        areas_p3d, _ = bench_case.run(
+            lambda: p3d_ops.mesh_face_areas_normals(vertices_p3d, faces_p3d)
+        )
+        assert areas_p3d.shape == (n_faces,)
+        return
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()
         normals_ml = bench_case.run(lambda: mm.computePerFaceNormals(mesh_ml))

@@ -5,8 +5,10 @@ from __future__ import annotations
 import numpy as np
 import open3d as o3d
 import pymeshlab as ml
+import pytorch3d.structures as p3d_structures
 import pyvista as pv
 import scipy.sparse as sp
+import torch
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
@@ -771,6 +773,142 @@ def pymeshfix_face_remap(tin_pmf: _meshfix.PyTMesh, faces_np: np.ndarray) -> np.
         )
     except KeyError as error:
         raise ValueError(f"returned face {error.args[0]} is not an input face") from error
+
+
+def points_to_torch(points_np: np.ndarray, device: str = "cpu") -> torch.Tensor:
+    """
+    Upload an ``(n, 3)`` point cloud as the ``(1, n, 3)`` float32 tensor ``pytorch3d.ops`` wants.
+
+    **Every** ``pytorch3d.ops`` entry point is batched with a leading minibatch axis, and the
+    padding is expressed as a separate ``lengths`` argument rather than inferred -- so a single
+    cloud goes in as ``x[None]`` and its answer comes back out as ``result[0]``. That wrap is the
+    shape section 6's ``points_to_warp`` note warns about: it is one line, it is needed at every
+    call site, and getting it wrong does not raise. ``knn_points(p, q)`` handed a bare ``(P, 3)``
+    reads it as ``(N=P, P1=3, D)`` and cheerfully compares three points, which is why the
+    pytorch3d comparisons assert the reference's output *shape* before its values.
+
+    float32 because that is what triwarp's ``wp.vec3`` holds; pytorch3d preserves float64 where it
+    is handed it, so matching the storage keeps the residual attributable to one side.
+
+    Parameters
+    ----------
+    points_np
+        ``(n, 3)`` positions or directions, any float dtype.
+    device
+        Torch device string; warp's own ``"cpu"`` / ``"cuda:0"`` spellings are accepted verbatim.
+
+    See Also
+    --------
+    [`points_to_pytorch3d`][tests.conversions.points_to_pytorch3d]
+        The ``Pointclouds`` container form, for the ``loss`` entry points.
+    """
+    return torch.as_tensor(
+        np.ascontiguousarray(points_np, dtype=np.float32), device=device
+    ).unsqueeze(0)
+
+
+def numpy_to_pytorch3d(
+    vertices_np: np.ndarray, faces_np: np.ndarray, device: str = "cpu"
+) -> p3d_structures.Meshes:
+    """
+    Wrap a NumPy mesh in a ``pytorch3d.structures.Meshes``, **float32 positions and int64 faces**.
+
+    A ``Meshes`` is an immutable caching container, which makes it the opposite of a
+    ``pymeshlab.MeshSet``: it derives ``verts_packed`` / ``edges_packed`` /
+    ``faces_packed_to_edges_packed`` / ``verts_normals_packed`` on first request and memoizes them,
+    and every ``pytorch3d.ops`` and ``pytorch3d.loss`` entry point is pure. So **one object serves
+    many comparisons** and there is no freshness rule to observe. The corollary is that the answer
+    lives on the accessors and not in the constructor arguments -- ``verts_packed()`` is what a
+    comparison reads, never the tensors handed in.
+
+    Positions land as float32 because that is what ``wp.vec3`` holds. pytorch3d does *not* cast for
+    you: a float64 ``Meshes`` keeps float64 through ``verts_packed()``, so an unconverted reference
+    would compare a float64 answer against triwarp's float32 one and read as triwarp being wrong by
+    ~1e-7. Faces land as int64, which is what ``Meshes`` stores regardless (an int32 face tensor is
+    silently widened), so the cast is documentation rather than a requirement.
+
+    Parameters
+    ----------
+    vertices_np
+        ``(n, 3)`` positions, any float dtype.
+    faces_np
+        Vertex indices, ``(n_faces, 3)`` or already flat -- reshaped either way.
+    device
+        Torch device string; warp's own ``"cpu"`` / ``"cuda:0"`` spellings are accepted verbatim.
+
+    See Also
+    --------
+    [`pytorch3d_to_numpy`][tests.conversions.pytorch3d_to_numpy]
+        The inverse, for reading a pytorch3d result back out.
+    """
+    return p3d_structures.Meshes(
+        verts=[torch.as_tensor(np.ascontiguousarray(vertices_np, dtype=np.float32), device=device)],
+        faces=[
+            torch.as_tensor(
+                np.ascontiguousarray(np.asarray(faces_np).reshape(-1, 3), dtype=np.int64),
+                device=device,
+            )
+        ],
+    )
+
+
+def trimesh_to_pytorch3d(mesh: tm.Trimesh, device: str = "cpu") -> p3d_structures.Meshes:
+    """Wrap a ``tm.Trimesh`` in a ``pytorch3d.structures.Meshes`` on ``device``."""
+    return numpy_to_pytorch3d(mesh.vertices, mesh.faces, device)
+
+
+def warp_to_pytorch3d(
+    vertices_wp: wp.array, faces_wp: wp.array, device: str | None = None
+) -> p3d_structures.Meshes:
+    """
+    Wrap a triwarp ``(vertices, flat faces)`` pair in a ``Meshes``, on the buffers' own device.
+
+    ``device`` overrides that, which is what the CPU-reference comparisons want: a triwarp answer
+    computed on ``cuda:0`` is still compared against a pytorch3d one built on the host, since
+    pytorch3d has separate CPU and CUDA kernels and only the CPU pass is a stable oracle. Pass the
+    warp device explicitly to exercise the CUDA kernels instead.
+    """
+    return numpy_to_pytorch3d(
+        vertices_wp.numpy(), faces_wp.numpy(), str(vertices_wp.device) if device is None else device
+    )
+
+
+def points_to_pytorch3d(
+    points_np: np.ndarray, normals_np: np.ndarray | None = None, device: str = "cpu"
+) -> p3d_structures.Pointclouds:
+    """
+    Wrap a point cloud, and optionally its normals, in a ``pytorch3d.structures.Pointclouds``.
+
+    The container form of [`points_to_torch`][tests.conversions.points_to_torch]: the ``loss``
+    entry points (``chamfer_distance``, ``point_mesh_face_distance``) take a ``Pointclouds`` where
+    the ``ops`` ones take bare batched tensors. Same caching-container rules as
+    [`numpy_to_pytorch3d`][tests.conversions.numpy_to_pytorch3d] -- immutable, safe to share.
+    """
+    return p3d_structures.Pointclouds(
+        points=[torch.as_tensor(np.ascontiguousarray(points_np, dtype=np.float32), device=device)],
+        normals=(
+            None
+            if normals_np is None
+            else [
+                torch.as_tensor(np.ascontiguousarray(normals_np, dtype=np.float32), device=device)
+            ]
+        ),
+    )
+
+
+def pytorch3d_to_numpy(meshes_p3d: p3d_structures.Meshes) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Read a single-mesh ``Meshes`` back out as ``(vertices_f64, faces_i64)``.
+
+    Goes through the ``*_packed()`` accessors rather than ``verts_list()``, because that is where a
+    pytorch3d *result* lives -- ``SubdivideMeshes`` and ``ops.cubify`` both return a ``Meshes``
+    whose constructor arguments the caller never saw. ``detach()`` because several entry points
+    return tensors carrying a grad graph, which ``numpy()`` refuses.
+    """
+    return (
+        meshes_p3d.verts_packed().detach().cpu().numpy().astype(np.float64),
+        meshes_p3d.faces_packed().detach().cpu().numpy().astype(np.int64),
+    )
 
 
 def warp_to_trimesh(vertices_wp: wp.array, faces_wp: wp.array) -> tm.Trimesh:

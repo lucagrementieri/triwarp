@@ -118,6 +118,8 @@ from __future__ import annotations
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops.utils as p3d_ops_utils
+import torch
 import warp as wp
 
 import triwarp as tw
@@ -256,7 +258,7 @@ def test_mean_vec3(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="weighted_sum")
-@pytest.mark.benchlibs("triwarp", "numpy", "pyvista")
+@pytest.mark.benchlibs("triwarp", "numpy", "pyvista", "pytorch3d")
 def test_weighted_sum(bench_case: BenchCase) -> None:
     """
     ``sum(values * weights)`` in one pass: the reduction every surface integral bottoms out in.
@@ -270,7 +272,24 @@ def test_weighted_sum(bench_case: BenchCase) -> None:
     every array on the mesh and returns a one-cell ``UnstructuredGrid`` -- and it is the whole
     reason this group exists rather than folding into ``sum_scalar``: nothing else in the reference
     set exposes a weighted reduction at all.
+
+    **pytorch3d**'s ``ops.utils.wmean`` is the weighted *mean* -- the same reduction plus a division
+    by ``sum(weights)`` with an ``eps`` floor -- so its row does one more pass than triwarp's and
+    is an upper bound rather than a race. It is the only GPU reference in the module, which is what
+    it is here for: the ``numpy`` row is the host floor and this one says what the same reduction
+    costs in another device library. Both arrays are inputs and are uploaded outside the timed
+    callable, as on the other two rows.
     """
+    if bench_case.kind == "pytorch3d":
+        values_p3d = torch.as_tensor(
+            _face_values_np(bench_case).astype(np.float32), device=bench_case.torch_device
+        ).reshape(1, -1, 1)
+        weights_p3d = torch.as_tensor(
+            _face_areas_np(bench_case).astype(np.float32), device=bench_case.torch_device
+        ).reshape(1, -1)
+        mean_p3d = bench_case.run(lambda: p3d_ops_utils.wmean(values_p3d, weights_p3d))
+        assert bool(torch.isfinite(mean_p3d).all())
+        return
     if bench_case.kind == "pyvista":
         mesh_pv = bench_case.mesh_pv
         mesh_pv.cell_data["field"] = _face_values_np(bench_case).astype(np.float64)

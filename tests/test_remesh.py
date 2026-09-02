@@ -8,6 +8,7 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops as p3d_ops
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
@@ -30,9 +31,11 @@ from tests.conversions import (
     open3d_to_trimesh,
     points_to_warp,
     points_to_warp_uv,
+    pytorch3d_to_numpy,
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
+    trimesh_to_pytorch3d,
     trimesh_to_pyvista,
     trimesh_to_warp,
     warp_to_trimesh,
@@ -1930,6 +1933,34 @@ def test_subdivide_matches_open3d(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> No
 # ``benchmarks/test_remesh.py::test_subdivide``). It is safe on this fixture -- 1 200 calls across
 # six processes are clean -- so the comparison itself is worth keeping, and the parity gate only
 # asks that every *benchmarked* pair be tested, not the reverse.
+@pytest.mark.parity("subdivide", "pytorch3d")
+def test_subdivide_matches_pytorch3d(icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: ``ops.SubdivideMeshes`` is the same 1:4 split, compared on **sorted** coordinates.
+
+    Identical counts (642 vertices, 1 280 faces from 162 / 320) and the sorted coordinate rows
+    agree at **0.0** -- exactly, because both sides take the same midpoint of the same float32
+    edge. Face buffers are deliberately *not* compared positionally: pytorch3d emits its four
+    children in its own order and numbers the new midpoints by its own edge table.
+
+    ``SubdivideMeshes`` is a ``torch.nn.Module`` rather than a function, and constructing it with
+    no ``meshes=`` argument is what makes it recompute the subdivision topology per call -- passing
+    a mesh there caches it, which would be timing a different thing in the benchmark.
+    """
+    mesh_tm, mesh_wp = icosphere_coarse
+    subdivided_p3d = p3d_ops.SubdivideMeshes()(trimesh_to_pytorch3d(mesh_tm))
+    vertices_p3d, faces_p3d = pytorch3d_to_numpy(subdivided_p3d)
+    vertices_wp, faces_wp = tw.remesh.subdivide(mesh_wp.points, mesh_wp.indices)
+
+    assert vertices_p3d.shape[0] == 4 * len(mesh_tm.vertices) - 6
+    assert faces_p3d.shape[0] == 4 * len(mesh_tm.faces)
+    assert int(vertices_wp.shape[0]) == vertices_p3d.shape[0]
+    assert int(faces_wp.shape[0]) // 3 == faces_p3d.shape[0]
+    assert np.array_equal(
+        lexsort_rows(vertices_wp.numpy()), lexsort_rows(vertices_p3d.astype(np.float32))
+    )
+
+
 def test_subdivide_matches_igl(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Class B: ``igl.upsample`` is the same 1:4 midpoint split under a different vertex order.

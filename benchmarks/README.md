@@ -1,9 +1,14 @@
 # triwarp benchmarks
 
-Performance benchmarks comparing `triwarp` against the CPU references **trimesh**, **libigl
-(`igl`)**, **open3d**, **scipy**, **potpourri3d** (geometry-central), **pymeshlab**
-(MeshLab / VCGlib) and **pyvista** (VTK), built on
+Performance benchmarks comparing `triwarp` against the ten CPU references **trimesh**, **libigl
+(`igl`)**, **open3d**, **scipy**, **numpy**, **potpourri3d** (geometry-central), **pymeshlab**
+(MeshLab / VCGlib), **pyvista** (VTK), **meshlib** and **pymeshfix** (MeshFix / TMesh) — plus
+**pytorch3d**, the one reference with CUDA kernels of its own, which therefore takes two rows and
+gives the suite its only GPU-against-GPU comparison. Built on
 [pytest-benchmark](https://pytest-benchmark.readthedocs.io).
+
+The authoritative list is `LIBRARIES` in [`conftest.py`](conftest.py); count it there rather than
+here if the two ever disagree.
 
 These are **not** collected by the normal test run (`pytest`'s `testpaths` is `tests/`); run them
 by pointing pytest at this directory.
@@ -240,7 +245,7 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
 
 | flag | default | meaning |
 |---|---|---|
-| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if available, else cpu. The CPU references (trimesh / igl / open3d / scipy / potpourri3d / pymeshlab / pyvista / meshlib) always run. **`cpu`/`both` on a GPU box inflate the `triwarp-cpu` rows and warn** — use `benchmarks/devices.py`. Registered in the repo-root `conftest.py`, shared with `tests/`. |
+| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if available, else cpu. The CPU references (trimesh / igl / open3d / scipy / numpy / potpourri3d / pymeshlab / pyvista / meshlib / pymeshfix / pytorch3d-cpu) always run, and so does `pytorch3d-cuda` whenever the installed pytorch3d has a working CUDA extension — this flag selects among *triwarp's* targets, not the references'. **`cpu`/`both` on a GPU box inflate the `triwarp-cpu` rows and warn** — use `benchmarks/devices.py`. Registered in the repo-root `conftest.py`, shared with `tests/`. |
 | `--size` | `all` | comma-separated size categories for the **scan** sweep (`small,medium,large,extralarge,huge`). Naming a size also lifts the CPU cap for it. Has no effect on axis-driven groups. |
 | `--cpu-max-size` | `large` | CPU-bound libraries (every reference, plus `triwarp-cpu`) skip scan meshes larger than this unless the size is named in `--size`. |
 
@@ -412,8 +417,8 @@ Also: never construct a `wp.Mesh` with zero triangles on CUDA (it corrupts devic
 
 ## Reference coverage
 
-`trimesh`, `igl`, `open3d`, `scipy`, `potpourri3d`, `pymeshlab` and `pyvista` are all registered in
-`LIBRARIES` and used for
+Every entry in `LIBRARIES` — `trimesh`, `igl`, `open3d`, `scipy`, `numpy`, `potpourri3d`,
+`pymeshlab`, `pyvista`, `meshlib`, `pymeshfix` and `pytorch3d` — is used for
 **every** benchmarked function that has a genuine equivalent — the point is to have independent
 implementations to spot outliers against, not only to fill gaps. `open3d` is marked `cpu_bound`
 even though the installed wheel is a CUDA build: the legacy `open3d.pipelines` / `open3d.geometry`
@@ -425,7 +430,13 @@ VCGlib) and is the **broadest** — it reaches 26 modules, more than any other s
 `pyvista` is CPU-only, single-threaded VTK 9.6 and is the newest; it reaches 47 groups across 26
 modules (see its section below). **A group carries `pyvista` or `vedo`, never both** — they wrap the
 same VTK, so two rows would double-count one implementation; where a group would take both, `vedo`
-gets `noparity(..., oracle="pyvista")`.
+gets `noparity(..., oracle="pyvista")`. `meshlib` is the only **multi-threaded** CPU reference, so a
+`triwarp-cuda` vs `meshlib` ratio is a fair fight where the other CPU ratios are not; `pymeshfix` is
+the narrowest and deepest — nine bound algorithms, all repair — and every one of its rows prices its
+loader, which is why rows exist only where the operation is ≥ ~30 % of the round. `pytorch3d` is the
+only reference with **CUDA kernels of its own** and therefore the only one with two rows
+(`pytorch3d-cpu` / `pytorch3d-cuda`); see its section below for why its GPU ratio is a *crossover*
+rather than a bar, and why every one of its CUDA rows has to synchronize torch's stream.
 
 #### Known coverage gaps
 
@@ -1049,3 +1060,114 @@ Where the reference is not algorithmically identical, the module docstring says 
 (open3d's dedup is orientation-sensitive), `test_sample` (count- vs radius-parametrized),
 `test_holes` and `test_smoothing` (different algorithms for the same task), `test_convex`
 (approximate vs exact).
+
+### pytorch3d — the only GPU reference, and the only crossover
+
+| module | pytorch3d reference |
+|---|---|
+| `test_neighbors` | `ops.knn_points` (`k1` / `k7`, both backends), `ops.ball_query` (both backends) |
+| `test_metrics` | `loss.chamfer_distance` (the convention `triwarp.metrics` documents), `loss.point_mesh_face_distance` |
+| `test_registration` | `ops.corresponding_points_alignment`, `ops.iterative_closest_point` |
+| `test_laplacian` | `ops.laplacian`, `ops.norm_laplacian`, `ops.cot_laplacian` (which carries `mass_matrix`'s row from the same call) |
+| `test_energies` | `loss.mesh_edge_loss`, `loss.mesh_normal_consistency`, `loss.mesh_laplacian_smoothing` — the three regularizers `triwarp.energies` grew for it |
+| `test_points` | `ops.sample_farthest_points`, `ops.estimate_pointcloud_normals` |
+| `test_voxels` | `ops.add_points_features_to_volume_densities_features`, and `torch.nn.functional.grid_sample` for the gather half |
+| `test_triangles` | `ops.mesh_face_areas_normals` — the only reference in that group that answers *both* halves in one call, like triwarp |
+| `test_vertices` | `Meshes.verts_normals_packed` |
+| `test_edges` | `Meshes.edges_packed`, `Meshes.faces_packed_to_edges_packed` |
+| `test_remesh` | `ops.SubdivideMeshes` |
+| `test_levelset` | `ops.marching_cubes.marching_cubes` — the fifth implementation of that case table, and the only one needing no lattice-convention fix |
+| `test_creation` | `utils.ico_sphere`, `utils.torus` |
+| `test_combine` | `structures.join_meshes_as_scene` |
+| `test_sample` | `ops.sample_points_from_meshes` |
+| `test_reduce` | `ops.utils.wmean` |
+| `test_array` | `ops.packed_to_padded` / `padded_to_packed` |
+
+**It is the only reference with CUDA kernels of its own, so it takes two rows** —
+`pytorch3d-cpu` beside the ten CPU baselines and `pytorch3d-cuda` as the suite's only
+GPU-against-GPU comparison. The `-cuda` row is gated on a probe rather than on
+`torch.cuda.is_available()`, which is the wrong question: a build that compiled the CPU extension
+only (the normal state of a runner with no `CUDA_HOME`) reports CUDA available and then raises
+`RuntimeError: Not compiled with GPU support.` on every kernel, and a wheel whose arch list stops
+short of the device reports available and fails with *"no kernel image is available"*.
+`_pytorch3d_cuda_available()` launches a two-point `knn_points` and believes the result.
+
+**Every `-cuda` row synchronizes torch's stream, not Warp's.** `wp.synchronize_device`
+synchronizes Warp's and says nothing about torch's, so a row synchronized the Warp way would time
+the launch rather than the kernel — a number that is silently far too good. `BenchCase.run`
+branches on `kind == "pytorch3d"`.
+
+**Its `_C` carries no spatial structure on either device**, so the GPU ratio is a *crossover* and
+not a bar. Measured on this box, min of 12 interleaved reps on a uniform cloud, each side building
+whatever index it builds inside the timed call:
+
+| (p3d / triwarp-cuda) | 20 000 points | 200 000 points |
+|---|---|---|
+| `knn_points(K=8)` | 2.31 / 3.29 ms **0.70x** | 74.65 / 0.87 ms **85.5x** |
+| `chamfer_distance` | 3.39 / 5.36 ms **0.63x** | 108.12 / 1.19 ms **90.5x** |
+| `ball_query(r=0.15)` | 4.97 / 0.31 ms 16.1x | 179.52 / 2.12 ms 84.6x |
+| `sample_farthest_points(K=1000)` | 14.35 / 5.43 ms 2.64x | 104.93 / 35.99 ms 2.92x |
+
+pytorch3d **wins** the k-NN and chamfer rows at 20 000 points: brute force with perfect coalescing
+beats a BVH descent while the whole problem still fits the device's bandwidth. So those groups need
+the point count as an *axis*; a one-size row reports whichever side of the crossover it happened to
+land on.
+
+**Half of that swing is triwarp's, and the row must not be read as a statement about brute force.**
+pytorch3d is a clean quadratic over the sweep — 0.63, 2.26, 5.59, 20.18, 73.82 ms at 5 k / 20 k /
+50 k / 100 k / 200 k — while `query_nearest` is **non-monotonic**: 0.82, 3.25, 7.38, **0.46**,
+0.75 ms, a 16x *drop* between 50 k and 100 k on the same box and the same extent, and identical to
+three digits between the `bvh` and `hashgrid` backends (0.82/0.82, 3.25/3.25, 7.38/7.18). The cost
+is therefore in a stage the two structures share, which is the search-radius heuristic, and it is an
+open finding rather than a property of the algorithm. Until it is fixed the honest reading of the
+20 000-point rows is "triwarp is 10x off its own 100 000-point cost here".
+
+**The `-cpu` row is a threaded reference implementation, not a tuned one.**
+`torch.get_num_threads()` is 24 here, so it belongs with `meshlib` rather than with trimesh / igl /
+pyvista / pymeshfix — but the same absence of a spatial index makes it Θ(N²), measured rather than
+assumed: `knn_points` 299.8 / 1 189.5 / 4 562.8 ms and `chamfer_distance` 557.8 / 2 319.1 /
+9 077.1 ms at 10 k / 20 k / 40 k self-queries, i.e. 3.84-4.16x per doubling against the 4x a
+quadratic predicts. Extrapolating that fit puts `bunny` at ~3.5 s per `knn` round and `dragon` at
+**~9 minutes per round**, so the `pytorch3d-cpu` neighbour and chamfer rows are capped at a feature
+mesh — `--benchmark-json` is written at session end, so a timeout there costs the whole file's rows.
+The `-cuda` rows have no such problem and run the scan meshes.
+
+**Two structural facts shape almost every row.** `Meshes` and `Pointclouds` are **immutable** and
+every `ops.*` / `loss.*` entry point is pure, so one container serves many calls and there is no
+freshness rule at all — the opposite end of the scale from a `ml.MeshSet`. But they **memoize** their
+derived quantities (`verts_normals_packed`, `edges_packed`, `faces_packed_to_edges_packed`,
+`laplacian_packed`, `faces_areas_packed`), so a row naming one of those must build the container
+*inside* the timed callable or it reports a cache hit — measured 0.287 ms of build against a 3.693 ms
+normals derivation on a 40 962-vertex mesh, so the build is 8 % of that round on the host and 34 % on
+CUDA, and the row says which. Rows that name a pure `ops` function warm the accessors outside
+instead.
+
+**Two hard limits, both of which raise rather than degrade.**
+`ops.sample_points_from_meshes` draws its face index with `torch.multinomial`, whose category limit
+is 2²⁴, so `lucy`'s 28 055 742 faces raise `RuntimeError: number of categories cannot exceed 2^24`
+and are skipped (`happy_buddha`'s 1 087 716 are fine). And `ops.packed_to_padded` /
+`padded_to_packed` bounds-check nothing: a mismatched `max_size` or `total_size` corrupts the heap
+and the process dies in `malloc` much later, in unrelated code, so the sizes are read off the
+buffers.
+
+**No exemptions, and four groups tested but deliberately not timed** — which is unusual for a
+reference this broad and is worth reading as a statement about the *inputs* rather than the answers.
+Each of the four carries a `benchmarked=False` parity claim with its measured reason:
+
+- **`filter_taubin`**: `ops.taubin_smoothing` rebuilds its inverse-distance operator from the
+  current positions every half-pass, and `filter_taubin(recompute=True)` matches it to **2.4e-07**
+  — but that path measures **~23x** the group's default row (0.49 → 11.06 ms at 10 passes), so a
+  row would race ten sparse assemblies against one under a single name. The default *does* disagree
+  (1.04e-02, the size of the displacement), which is why the pair is not a D2 exemption but a
+  configuration mismatch.
+- **`closest_point_on_edges`**: `loss.point_mesh_edge_distance` reads `Meshes.edges_packed`, the
+  mesh's whole undirected edge set, and takes no edge subset — so it cannot be handed the crease set
+  both rows of that group share. A row would price 19.6x more edges on `bunny_decimated` and 76.9x
+  on `bunny`.
+- **`to_boxes`**: `ops.cubify` culls and compacts, where that group is pinned to
+  `cull_internal=False` so trimesh's `multibox` and VTK's glyph filter are like-for-like unwelded
+  rows. The comparable pair was measured anyway and is not interesting: 2.238 ms against
+  `to_boxes(cull_internal=True)`'s 1.850 on 63 568 voxels.
+- **`load_mesh`**: `triwarp.io` has no benchmark group at all and deliberately so — it is a meshio
+  round trip, so a row would time meshio's PLY parser against pytorch3d's, neither of which is
+  triwarp code.

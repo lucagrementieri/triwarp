@@ -2,6 +2,7 @@ from typing import Any
 
 import warp as wp
 
+from triwarp.kernels.array import trilinear_cell, trilinear_weight
 from triwarp.kernels.triangles import face_vertices, point_barycentric_cramer
 
 
@@ -127,6 +128,43 @@ def interpolate_from_points(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+@wp.kernel(enable_backward=False)
+def sample_grid_trilinear(
+    field: wp.array3d[Any],
+    lower: wp.vec3,
+    inverse_spacing: wp.vec3,
+    points: wp.array[wp.vec3],
+    out_values: wp.array[Any],
+) -> None:
+    # Read a dense lattice at one arbitrary position, as the trilinearly weighted sum of the eight
+    # corners around it -- the transpose of ``kernels/scatter.splat_grid_trilinear``. The wrapper's
+    # ``Notes`` records which round trips through the pair are exact; averaging makes the two
+    # adjoint rather than inverse.
+    #
+    # Summed rather than nested as ``wp.lerp``. ``kernels/reconstruction.poisson_sample_grid`` is
+    # the lerp spelling over a flat ``res**3`` float32 buffer; the two are the same function and
+    # differ only in float32 summation order, and they are deliberately kept apart because that
+    # one's arithmetic is what the Poisson iso-value was measured against. All three share
+    # ``trilinear_cell``.
+    #
+    # A position outside the lattice reads the nearest cell's stencil rather than a null value,
+    # because ``trilinear_cell`` clamps: the field is extended by its boundary cells, which is what
+    # a signed-distance or density lattice wants and is the convention ``poisson_sample_grid``
+    # already had.
+    s = wp.int32(wp.tid())
+    shape = wp.vec3i(field.shape[0], field.shape[1], field.shape[2])
+    base, fractions = trilinear_cell(wp.cw_mul(points[s] - lower, inverse_spacing), shape)
+    accumulator = out_values.dtype(0.0)
+    for offset_x in range(2):
+        for offset_y in range(2):
+            for offset_z in range(2):
+                accumulator += (
+                    trilinear_weight(fractions, offset_x, offset_y, offset_z)
+                    * field[base[0] + offset_x, base[1] + offset_y, base[2] + offset_z]
+                )
+    out_values[s] = accumulator
+
+
 # CLAUDE.md section 4. Measured at 2 overloads across **3** module loads.
 #
 # The dtype set is the one ``transfer_onto_vertices``'s own docstring promises -- "any Warp dtype
@@ -149,6 +187,10 @@ def _register_overloads() -> None:
             ],
         )
     for dtype in (wp.float32, wp.vec3):
+        wp.overload(
+            sample_grid_trilinear,
+            [wp.array3d[dtype], wp.vec3, wp.vec3, wp.array[wp.vec3], wp.array[dtype]],
+        )
         wp.overload(
             transfer_onto_vertices,
             [

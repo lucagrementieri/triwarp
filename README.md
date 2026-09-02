@@ -30,11 +30,11 @@ available and falls back to CPU otherwise — same code, same results.
   <https://lucagrementieri.github.io/triwarp/>, and validated function-by-function against the
   established CPU geometry-processing libraries (see below).
 
-## One GPU library instead of five CPU ones
+## One GPU library instead of six
 
-Mesh processing in Python has long meant stitching together several excellent — but CPU-bound
-and stylistically different — libraries. triwarp consolidates the functionality it needs from
-each of them behind a single GPU-accelerated API:
+Mesh processing in Python has long meant stitching together several excellent — but mostly
+CPU-bound and stylistically different — libraries. triwarp consolidates the functionality it needs
+from each of them behind a single GPU-accelerated API:
 
 | Replaces | For | In triwarp |
 |---|---|---|
@@ -43,6 +43,7 @@ each of them behind a single GPU-accelerated API:
 | [Open3D](https://www.open3d.org/) | Point clouds, registration, and surface reconstruction: ICP, screened Poisson, ball pivoting | `points`, `registration`, `reconstruction` |
 | [potpourri3d](https://github.com/nmwsharp/potpourri3d) (geometry-central) | The heat-method family: vector heat, parallel transport, log maps, signed distance, tangent frames | `heat.vector`, `heat.signed`, `tangent_space` |
 | [MeshLab](https://www.meshlab.net/) ([PyMeshLab](https://github.com/cnr-isti-vislab/PyMeshLab)) | Mesh editing filters: isotropic remeshing, decimation, smoothing, hole filling, uniform resampling | `remesh`, `smoothing`, `holes`, `repair` |
+| [PyTorch3D](https://pytorch3d.org/) | Batched neighbour and Chamfer primitives, and the mesh regularization losses | `metrics`, `neighbors`, `registration`, `energies` |
 
 These libraries are not runtime dependencies — they are **test oracles**. Every triwarp
 function ships with a regression test comparing its output against the corresponding reference
@@ -156,9 +157,10 @@ uv run basedpyright             # type checking (0 errors expected)
 DISABLE_MKDOCS_2_WARNING=true uv run mkdocs serve   # preview the docs locally
 ```
 
-The test environment installs the CPU reference stack (trimesh, libigl, Open3D, potpourri3d,
-PyMeshLab, and more) so the comparison suite runs in full. Benchmarks live in `benchmarks/`
-and use `pytest-benchmark`.
+The test environment installs the reference stack (trimesh, libigl, Open3D, potpourri3d,
+PyMeshLab, PyVista, MeshLib, PyMeshFix, PyTorch3D, and more) so the comparison suite runs in full.
+Benchmarks live in `benchmarks/` and use `pytest-benchmark`; PyTorch3D is the one reference with
+CUDA kernels of its own, so it is also the suite's only GPU-against-GPU comparison.
 
 ## Links
 

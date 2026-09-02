@@ -65,6 +65,7 @@ import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
+import pytorch3d.ops as p3d_ops
 import trimesh as tm
 import trimesh.smoothing as tms
 import warp as wp
@@ -100,6 +101,19 @@ def _edge_lengths_wp(bench_case: BenchCase) -> twt.Array2dFloat32:
     return _edge_lengths_wp_cache[key]
 
 
+def _packed_p3d(bench_case: BenchCase, *, edges: bool = False) -> tuple:
+    """
+    Return the ``(verts, faces)`` pair the ``ops`` assemblers take, or ``(verts, edges)``.
+
+    Read outside every timed callable, deliberately. A ``Meshes`` memoizes each of these on first
+    request, and ``edges_packed`` in particular is the unique-undirected-edge build that
+    [`test_edges.py`](test_edges.py) times under ``edges_unique`` -- folding it into a Laplacian row
+    would price two groups under one name and make the assembly look 2-3x its cost.
+    """
+    mesh_p3d = bench_case.mesh_p3d
+    return (mesh_p3d.verts_packed(), mesh_p3d.edges_packed() if edges else mesh_p3d.faces_packed())
+
+
 @pytest.mark.benchmark(group="cotmatrix_entries")
 @pytest.mark.benchlibs("triwarp", "igl")
 def test_cotmatrix_entries(bench_case: BenchCase) -> None:
@@ -131,10 +145,24 @@ def test_cotmatrix_entries_intrinsic(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="cotmatrix")
-@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d")
+@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d", "pytorch3d")
 def test_cotmatrix(bench_case: BenchCase) -> None:
-    """Assembled cotangent stiffness matrix: weight kernel plus the sparse build."""
+    """
+    Assembled cotangent stiffness matrix: weight kernel plus the sparse build.
+
+    **pytorch3d**'s ``cot_laplacian`` is the fourth assembly here and the only one on the GPU. Two
+    conventions separate the answers and neither costs anything: its off-diagonal is **twice**
+    triwarp's half-cotangent table and its diagonal is identically **zero** where triwarp assembles
+    the row sum. So its row does slightly less -- no diagonal pass -- and it returns the lumped
+    mass reciprocal alongside, which is what ``mass_matrix``'s pytorch3d row times from the same
+    call. Read the two rows as one call priced twice rather than as two independent measurements.
+    """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pytorch3d":
+        vertices_p3d, faces_p3d = _packed_p3d(bench_case)
+        matrix_p3d, _ = bench_case.run(lambda: p3d_ops.cot_laplacian(vertices_p3d, faces_p3d))
+        assert matrix_p3d.shape == (n_vertices, n_vertices)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         matrix = bench_case.run(lambda: tw.laplacian.cotmatrix(vertices, faces))
@@ -162,10 +190,24 @@ def test_connection_laplacian(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="laplacian_equal_weight")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pytorch3d")
 def test_laplacian_equal_weight(bench_case: BenchCase) -> None:
-    """Row-normalized 1-ring averaging operator with unit weights."""
+    """
+    Row-normalized 1-ring averaging operator with unit weights.
+
+    **pytorch3d**'s ``ops.laplacian`` is the same operator with **-1** on the diagonal where
+    triwarp writes 0 (pinned bit-exactly off the diagonal in
+    ``tests/test_laplacian.py::test_laplacian_operators_match_pytorch3d``), and it is the only row
+    here with GPU kernels. It takes the edge list rather than the faces, so ``edges_packed()`` is
+    read outside the timed callable -- that derivation is what ``edges_unique`` times in
+    [`test_edges.py`](test_edges.py), and folding it in would price two groups under one name.
+    """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pytorch3d":
+        vertices_p3d, edges_p3d = _packed_p3d(bench_case, edges=True)
+        matrix_p3d = bench_case.run(lambda: p3d_ops.laplacian(vertices_p3d, edges_p3d))
+        assert matrix_p3d.shape == (n_vertices, n_vertices)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         matrix = bench_case.run(lambda: tw.laplacian.laplacian(vertices, faces, equal_weight=True))
@@ -181,10 +223,22 @@ def test_laplacian_equal_weight(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="laplacian_inverse_distance")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pytorch3d")
 def test_laplacian_inverse_distance(bench_case: BenchCase) -> None:
-    """The same operator with inverse-edge-length weights (the geometry-dependent branch)."""
+    """
+    The same operator with inverse-edge-length weights (the geometry-dependent branch).
+
+    **pytorch3d**'s ``norm_laplacian`` is this operator before its row normalization -- same
+    ``1 / (||vi - vj|| + 1e-12)`` weight, same literal ``eps`` -- so it does strictly less work
+    than triwarp's row by exactly one row-sum division, and the gap is the honest content of the
+    ratio. ``edges_packed()`` is read outside the timed callable, as in the uniform group.
+    """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pytorch3d":
+        vertices_p3d, edges_p3d = _packed_p3d(bench_case, edges=True)
+        matrix_p3d = bench_case.run(lambda: p3d_ops.norm_laplacian(vertices_p3d, edges_p3d))
+        assert matrix_p3d.shape == (n_vertices, n_vertices)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         matrix = bench_case.run(lambda: tw.laplacian.laplacian(vertices, faces, equal_weight=False))
@@ -246,10 +300,24 @@ def test_mass_matrix_entries(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="mass_matrix")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pytorch3d")
 def test_mass_matrix(bench_case: BenchCase) -> None:
-    """The same diagonal, assembled as a sparse matrix."""
+    """
+    The same diagonal, assembled as a sparse matrix.
+
+    **pytorch3d** has no separate mass-matrix entry point: ``cot_laplacian`` returns the lumped
+    reciprocal ``inv_areas`` as its second value, three times triwarp's diagonal
+    (``1 / inv_areas == 3 * M_ii``, measured 5.96e-08). So this row times the **same call** the
+    ``cotmatrix`` group times and is an *upper* bound here rather than a race -- it prices the
+    stiffness assembly as well. It is still worth the row: it is the only GPU one in the group, and
+    the two rows together say what the shared call costs and what fraction of it either half is.
+    """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pytorch3d":
+        vertices_p3d, faces_p3d = _packed_p3d(bench_case)
+        _, inv_areas_p3d = bench_case.run(lambda: p3d_ops.cot_laplacian(vertices_p3d, faces_p3d))
+        assert inv_areas_p3d.shape[0] == n_vertices
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         matrix = bench_case.run(lambda: tw.laplacian.mass_matrix(vertices, faces))

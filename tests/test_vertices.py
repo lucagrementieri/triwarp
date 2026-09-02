@@ -15,6 +15,7 @@ from tests.conversions import (
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
+    trimesh_to_pytorch3d,
     trimesh_to_pyvista,
 )
 
@@ -165,6 +166,32 @@ def test_vertex_normals_area(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
     vertex_normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices)
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_igl, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("vertex_normals", "pytorch3d")
+def test_vertex_normals_match_pytorch3d(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A: ``Meshes.verts_normals_packed`` is triwarp's **area**-weighted vertex normal.
+
+    pytorch3d sums the *unnormalized* face cross products into each incident vertex and normalizes
+    once at the end, which is area weighting by construction -- so this pins the default
+    ``weighting="area"`` and nothing else. Measured 1.19e-07 against it, and **1.14e-02** against
+    ``weighting="angle"``, five orders apart: the second assert is what makes the first a claim
+    about the weighting convention rather than about vertex normals in general.
+
+    A closed, fully-referenced fixture on purpose. pytorch3d does not drop unreferenced vertices
+    and leaves their normals at the ``torch.zeros`` initial value rather than ``NaN``, so on a mesh
+    with spares this would be comparing zeros with whatever triwarp writes.
+    """
+    mesh_tm, mesh_wp = icosphere
+    device = str(mesh_wp.points.device)
+    normals_p3d = trimesh_to_pytorch3d(mesh_tm, device).verts_normals_packed().cpu().numpy()
+    normals_wp = tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices)
+    angle_wp = tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices, weighting="angle")
+
+    assert normals_p3d.shape == mesh_tm.vertices.shape
+    assert np.allclose(normals_wp.numpy(), normals_p3d, rtol=1e-5, atol=1e-6)
+    assert not np.allclose(angle_wp.numpy(), normals_p3d, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parity("vertex_normals", "meshlib")

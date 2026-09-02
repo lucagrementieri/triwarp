@@ -3,7 +3,9 @@
 import numpy as np
 import numpy.typing as npt
 import pytest
+import pytorch3d.ops as p3d_ops
 import scipy.sparse
+import torch
 import trimesh as tm
 import warp as wp
 import warp.sparse as wps
@@ -138,6 +140,47 @@ def test_the_packing_family_matches_numpy(device: str, copy: bool) -> None:
     assert len(segments_wp) == len(split_np)
     for segment_wp, part_np in zip(segments_wp, split_np, strict=True):
         assert np.array_equal(segment_wp.numpy(), part_np)
+
+
+@pytest.mark.parity("concatenate_arrays", "pytorch3d")
+def test_the_packing_family_matches_pytorch3d(device: str) -> None:
+    """
+    Class B: pytorch3d's ``packed_to_padded`` is triwarp's ``(flat, offsets)`` densified.
+
+    The transform is the padding itself: pytorch3d's packed form is triwarp's flat buffer verbatim
+    and its padded form is a dense ``(n_segments, max_size)`` block zero-filled past each segment's
+    length -- so ``split`` produces exactly the rows of that block, and ``padded_to_packed`` undoes
+    it byte-for-byte.
+
+    The convention worth pinning is the second argument: pytorch3d's ``first_idxs`` are **starting
+    indices, not counts**, which makes them ``pack_1d_arrays``' ``offsets`` unchanged -- measured
+    ``[0, 3, 8]`` for segment lengths ``(3, 5, 2)`` from both sides. Note that ``offsets`` here is
+    the ``n_segments`` form and its trailing total is what ``padded_to_packed`` wants as
+    ``total_size``; handing it a mismatched size does not raise, it **corrupts the heap** (the
+    C++ kernels bounds-check nothing), which is why the sizes below are read off the buffers.
+    """
+    rng = np.random.default_rng(9)
+    segments_np = [rng.normal(size=length).astype(np.float32) for length in (3, 5, 2)]
+    flat_wp, offsets_wp = tw.array.pack_1d_arrays(
+        [wp.array(segment_np, dtype=wp.float32, device=device) for segment_np in segments_np]
+    )
+    flat_np, offsets_np = flat_wp.numpy(), offsets_wp.numpy()
+    first_p3d = torch.as_tensor(offsets_np.astype(np.int64), device=device)
+
+    assert np.array_equal(offsets_np, np.array([0, 3, 8], dtype=np.int32))
+    padded_p3d = p3d_ops.packed_to_padded(
+        torch.as_tensor(flat_np, device=device), first_p3d, max(len(s) for s in segments_np)
+    )
+    repacked_p3d = p3d_ops.padded_to_packed(padded_p3d, first_p3d, flat_np.shape[0])
+
+    assert padded_p3d.shape == (len(segments_np), 5)
+    assert np.array_equal(repacked_p3d.cpu().numpy(), flat_np)
+    parts_wp = tw.array.split(flat_wp, offsets_wp)
+    padded_np = padded_p3d.cpu().numpy()
+    for index, part_wp in enumerate(parts_wp):
+        length = int(part_wp.shape[0])
+        assert np.array_equal(padded_np[index, :length], part_wp.numpy())
+        assert np.array_equal(padded_np[index, length:], np.zeros(5 - length, dtype=np.float32))
 
 
 def test_pack_1d_arrays_reuses_what_split_produced(device: str) -> None:

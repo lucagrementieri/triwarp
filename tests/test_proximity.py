@@ -15,6 +15,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pytorch3d.loss as p3d_loss
 import pyvista as pv
 import trimesh as tm
 import trimesh.proximity as tm_proximity
@@ -28,12 +29,14 @@ import triwarp.typing as twt
 from tests.conversions import (
     meshlib_scalars_to_numpy,
     numpy_to_warp,
+    points_to_pytorch3d,
     points_to_pyvista,
     points_to_warp,
     points_to_warp_uv,
     trimesh_to_meshlib,
     trimesh_to_open3d_t,
     trimesh_to_pymeshlab,
+    trimesh_to_pytorch3d,
     trimesh_to_pyvista,
     trimesh_to_warp,
 )
@@ -848,6 +851,71 @@ def test_closest_point_on_edges_matches_meshlib(
     )
     assert np.allclose(distance_ml, minimum_np, rtol=1e-5, atol=1e-5)
     assert np.allclose(distance_wp.numpy(), distance_ml, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity(
+    "closest_point_on_edges",
+    "pytorch3d",
+    benchmarked=False,
+    reason="point_mesh_edge_distance reads Meshes.edges_packed -- the mesh's whole undirected edge "
+    "set -- and takes no edge subset, so it cannot be handed the crease set both rows of the "
+    "closest_point_on_edges group share. A row would price a 19.6x larger input on "
+    "bunny_decimated (24 363 edges against 1 242 creases) and 76.9x on bunny (104 288 against "
+    "1 357) under that group's name. The values are still comparable on the full edge set, which "
+    "is what this test does.",
+)
+def test_closest_point_on_edges_matches_pytorch3d(device: str) -> None:
+    """
+    Class B: ``loss.point_mesh_edge_distance`` minus its edge-to-point half is triwarp's answer.
+
+    The same decomposition as ``tests/test_metrics.py``'s ``point_mesh_face_distance`` pair and the
+    same measured restriction. pytorch3d returns the sum of two squared means over
+    ``Meshes.edges_packed`` -- point-to-segment, which is what ``closest_point_on_edges`` computes,
+    and **edge-to-point**, the minimum over the cloud per edge -- and triwarp has no counterpart for
+    the second, so only the forward half is compared.
+
+    The point-to-segment table is exact rather than a port: clamping the projection parameter to
+    ``[0, 1]`` *is* the algorithm, with no region classification to get wrong. It reproduces
+    pytorch3d's whole scalar to **9.7e-10** when its two directions are summed, which is what
+    licenses the subtraction; triwarp's forward mean then lands 4.9e-08 from its forward column.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3)
+    rng = np.random.default_rng(5)
+    queries_np = (rng.normal(size=(300, 3)) * 0.9).astype(np.float32)
+    mesh_p3d = trimesh_to_pytorch3d(mesh_tm, device)
+    scalar_p3d = float(
+        p3d_loss.point_mesh_edge_distance(mesh_p3d, points_to_pytorch3d(queries_np, device=device))
+    )
+    edges_p3d = mesh_p3d.edges_packed().cpu().numpy()
+
+    starts_np = np.asarray(mesh_tm.vertices[edges_p3d[:, 0]], dtype=np.float64)
+    directions_np = np.asarray(mesh_tm.vertices[edges_p3d[:, 1]], dtype=np.float64) - starts_np
+    parameters_np = np.clip(
+        np.einsum("ijk,jk->ij", queries_np[:, None, :] - starts_np, directions_np)
+        / np.einsum("jk,jk->j", directions_np, directions_np),
+        0.0,
+        1.0,
+    )
+    squared_np = np.sum(
+        (queries_np[:, None, :] - (starts_np + parameters_np[..., None] * directions_np)) ** 2,
+        axis=-1,
+    )
+    forward_np, backward_np = squared_np.min(axis=1).mean(), squared_np.min(axis=0).mean()
+
+    assert np.allclose(scalar_p3d, forward_np + backward_np, rtol=1e-6, atol=0.0)
+
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    edges_wp, _ = tw.edges.edges_unique(faces_wp)
+    _, distances_wp, _ = tw.proximity.closest_point_on_edges(
+        vertices_wp, edges_wp, points_to_warp(queries_np, device)
+    )
+
+    assert np.allclose(
+        float((distances_wp.numpy().astype(np.float64) ** 2).mean()),
+        scalar_p3d - backward_np,
+        rtol=1e-5,
+        atol=1e-7,
+    )
 
 
 def test_closest_point_on_edges_max_dist_and_degenerate(device: str) -> None:

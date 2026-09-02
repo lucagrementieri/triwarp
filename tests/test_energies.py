@@ -13,15 +13,18 @@ mistaken for a direct one.
 
 from __future__ import annotations
 
+import itertools
+
 import igl
 import numpy as np
 import pytest
+import pytorch3d.loss as p3d_loss
 import scipy.sparse as sp
 import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import bsr_to_csr, mesh_igl
+from tests.conversions import bsr_to_csr, mesh_igl, numpy_to_warp, trimesh_to_pytorch3d
 
 
 def _upload_bsr_float64(
@@ -37,6 +40,137 @@ def _upload_bsr_float64(
         wp.array(coo.data.astype(np.float64), dtype=wp.float64, device=device),
         prune_numerical_zeros=False,
     )
+
+
+@pytest.mark.parametrize("target_length", [0.0, 0.3])
+@pytest.mark.parity("edge_length_loss", "pytorch3d")
+def test_edge_length_loss_matches_pytorch3d(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], target_length: float
+) -> None:
+    """
+    Class A: ``mesh_edge_loss`` at two resting lengths, one of them non-zero.
+
+    Both points matter. At ``target_length = 0.0`` the loss is the mean squared edge length and a
+    sign error in the deviation would be invisible; at 0.3 the two sides are 240x smaller and only
+    agree if the subtraction happens before the squaring. Measured 0.0899725 against pytorch3d's
+    0.0899726 and 3.73347e-04 against 3.73347e-04 over 480 unique edges.
+
+    pytorch3d's per-mesh ``1 / E`` weighting collapses to a plain mean for a single mesh, which is
+    triwarp's only case -- so this is a direct comparison rather than a class-B one.
+    """
+    mesh_tm, mesh_wp = icosphere_coarse
+    loss_p3d = float(
+        p3d_loss.mesh_edge_loss(trimesh_to_pytorch3d(mesh_tm), target_length=target_length)
+    )
+    loss_wp = tw.energies.edge_length_loss(
+        mesh_wp.points, mesh_wp.indices, target_length=target_length
+    )
+
+    assert loss_p3d > 1e-6
+    assert np.allclose(loss_wp, loss_p3d, rtol=1e-5, atol=0.0)
+
+
+@pytest.mark.parity("normal_consistency_loss", "pytorch3d")
+def test_normal_consistency_loss_matches_pytorch3d(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """
+    Class A on edge-manifold input, with the non-manifold divergence **pinned** rather than avoided.
+
+    ``mesh_normal_consistency`` enumerates every *pair* of faces sharing an edge -- ``C(k, 2)``
+    pairs at an edge with ``k`` incident faces, through its own
+    ``_C.mesh_normal_consistency_find_verts`` -- where
+    [`face_adjacency_angles`][triwarp.adjacency.face_adjacency_angles] reports one pair per
+    adjacency. The two coincide exactly wherever every edge has at most two faces, which is what
+    the first half measures: 0.0155947 against 0.0155947 over ``icosphere(2)``'s 480 pairs.
+
+    The second half is the divergence itself, on three faces sharing one edge, and it is sharper
+    than a factor: pytorch3d sees ``C(3, 2) = 3`` pairs there and reports **0.777**, while
+    [`face_adjacency`][triwarp.adjacency.face_adjacency] keeps only edges with *exactly* two
+    incident faces and so reports **no pairs at all** and a loss of ``0.0``. The test pins both
+    numbers rather than papering over them with a tolerance; without that half the class-A label
+    would read as a claim about all input.
+    """
+    mesh_tm, mesh_wp = icosphere_coarse
+    loss_p3d = float(p3d_loss.mesh_normal_consistency(trimesh_to_pytorch3d(mesh_tm)))
+    loss_wp = tw.energies.normal_consistency_loss(mesh_wp.points, mesh_wp.indices)
+
+    assert loss_p3d > 1e-6
+    assert np.allclose(loss_wp, loss_p3d, rtol=1e-4, atol=0.0)
+
+    # Three faces on one edge: 3 reference pairs against triwarp's 2 adjacencies.
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.3], [0.0, 0.2, 1.0]],
+        dtype=np.float64,
+    )
+    faces_np = np.array([[0, 1, 2], [1, 0, 3], [1, 0, 4]], dtype=np.int64)
+    fan_p3d = float(
+        p3d_loss.mesh_normal_consistency(trimesh_to_pytorch3d(tm.Trimesh(vertices_np, faces_np)))
+    )
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    fan_wp = tw.energies.normal_consistency_loss(vertices_wp, faces_wp)
+
+    assert np.allclose(fan_p3d, 0.777404, rtol=1e-4, atol=0.0)
+    assert fan_wp == 0.0
+
+
+@pytest.mark.parametrize("method", ["uniform", "cot", "cotcurv"])
+@pytest.mark.parity("laplacian_smoothing_loss", "pytorch3d")
+def test_laplacian_smoothing_loss_matches_pytorch3d(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], method: str
+) -> None:
+    """
+    Class B: all three of ``mesh_laplacian_smoothing``'s methods, each under its own rescaling.
+
+    The three are three different quantities and not a tuning knob, which is what makes the
+    parametrize worth having: measured **0.04838 / 0.04401 / 0.33407** on this fixture, so a
+    branch answering with the wrong normalization cannot pass. Agreement 2.07e-07 / 3.12e-07 /
+    5.27e-07 relative.
+
+    Class B rather than A because the reference reads a cotangent Laplacian whose off-diagonal is
+    twice triwarp's half-cotangent table and whose diagonal is identically zero; the two ratios
+    ``(L v) / rowsum`` and ``(L v) / (6 M)`` are invariant to that factor, which is the named
+    transform and is why the wrapper can assemble from triwarp's own ``cotmatrix``.
+    """
+    mesh_tm, mesh_wp = icosphere_coarse
+    loss_p3d = float(
+        p3d_loss.mesh_laplacian_smoothing(trimesh_to_pytorch3d(mesh_tm), method=method)
+    )
+    loss_wp = tw.energies.laplacian_smoothing_loss(mesh_wp.points, mesh_wp.indices, method)
+
+    assert loss_p3d > 1e-3
+    assert np.allclose(loss_wp, loss_p3d, rtol=1e-5, atol=0.0)
+
+
+def test_laplacian_smoothing_loss_methods_are_three_quantities(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Triwarp against triwarp: the three methods are far apart, and an empty mesh is 0.0.
+
+    Not a parity assert -- the reference comparison above carries the oracle. This is the guard
+    that keeps the parametrized test above non-vacuous: if two methods ever collapsed onto one
+    answer, that test would still pass on the wrong branch. ``curvature.mean_curvature`` is the
+    ``cotcurv`` variant's per-vertex sibling and is the reason it is an order of magnitude larger:
+    it carries units of one over length where the other two are lengths.
+    """
+    mesh_tm, mesh_wp = icosphere_coarse
+    del mesh_tm
+    losses = [
+        tw.energies.laplacian_smoothing_loss(mesh_wp.points, mesh_wp.indices, method)
+        for method in ("uniform", "cot", "cotcurv")
+    ]
+    assert losses[0] > losses[1] > 0.0
+    assert losses[2] > 5.0 * losses[0]
+    assert all(abs(a - b) > 1e-3 for a, b in itertools.pairwise(losses))
+
+    empty_vertices_wp = wp.zeros(0, dtype=wp.vec3, device=mesh_wp.points.device)
+    empty_faces_wp = wp.zeros(0, dtype=wp.int32, device=mesh_wp.points.device)
+    assert tw.energies.laplacian_smoothing_loss(empty_vertices_wp, empty_faces_wp) == 0.0
+    assert tw.energies.edge_length_loss(empty_vertices_wp, empty_faces_wp) == 0.0
+    assert tw.energies.normal_consistency_loss(empty_vertices_wp, empty_faces_wp) == 0.0
+    with pytest.raises(ValueError, match="method must be"):
+        tw.energies.laplacian_smoothing_loss(mesh_wp.points, mesh_wp.indices, "cotan")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("k", [1, 2, 3])

@@ -100,6 +100,13 @@ def procrustes(
     ``return_cost``), one allocation for the packed moment accumulator and one readback, so the
     cost is nearly flat in ``n``. Callers in a loop should use the workspace form — see
     [`icp`][triwarp.registration.icp], which allocates once outside its iteration.
+
+    **The returned matrix is column-vector, which is the transpose of pytorch3d's.**
+    ``pytorch3d.ops.corresponding_points_alignment`` solves the row-vector form ``s X R + T = Y``,
+    so its ``R`` is this matrix's linear block divided by the scale and *transposed*. Measured
+    2.54e-07 on the rotation, 2.38e-07 on the translation, and a scale of 1.29999983 against its
+    1.30000031 on a planted 1.3
+    (``tests/test_registration.py::test_procrustes_matches_pytorch3d``).
     """
     n = int(a.shape[0])
     device = a.device
@@ -243,6 +250,14 @@ def icp(
     (mesh target) or [`query_nearest`][triwarp.neighbors.query_nearest]
     (point-cloud target); the alignment is the GPU tiled SVD of
     [`procrustes`][triwarp.registration.procrustes].
+
+    The pytorch3d agreement is measured rather than asserted: on a 300-point cloud under a planted
+    0.15 rad rotation the converged transforms agree to **2.62e-07** on the rotation and 2.35e-07
+    on the translation, with pytorch3d's own ``rmse`` at 4.03e-07
+    (``tests/test_registration.py::test_icp_point_cloud_matches_pytorch3d``). Its ``R`` is the
+    **transpose** of the linear block returned here, because it solves the row-vector form
+    ``s X R + T = Y``; the *converged transform* is what is comparable, not the iteration count,
+    since ``relative_rmse_thr`` is its own stopping rule.
 
     Parameters
     ----------

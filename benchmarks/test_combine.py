@@ -55,6 +55,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import pytorch3d.structures as p3d_structures
+import torch
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -181,6 +183,37 @@ def _parts(bench_case: BenchCase, copies: int) -> list:
     return _parts_cache[key]
 
 
+_parts_p3d_cache: dict[tuple[str, str, int], list] = {}
+
+
+def _parts_p3d(bench_case: BenchCase, copies: int) -> list:
+    """Build the same pieces as a list of ``Meshes``, cached: the input, not the operation."""
+    key = (bench_case.mesh_name, bench_case.torch_device, copies)
+    if key not in _parts_p3d_cache:
+        vertices_p3d = torch.as_tensor(
+            np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32),
+            device=bench_case.torch_device,
+        )
+        faces_np, n_faces = bench_case.faces_np, bench_case.n_faces
+        stride = max(1, n_faces // copies)
+        _parts_p3d_cache[key] = [
+            p3d_structures.Meshes(
+                verts=[vertices_p3d],
+                faces=[
+                    torch.as_tensor(
+                        np.ascontiguousarray(
+                            faces_np[lo : min(lo + stride, n_faces)], dtype=np.int64
+                        ),
+                        device=bench_case.torch_device,
+                    )
+                ],
+            )
+            for lo in range(0, n_faces, stride)
+            if lo < n_faces
+        ]
+    return _parts_p3d_cache[key]
+
+
 _parts_ml_cache: dict[tuple[str, int], mm.std_vector_std_shared_ptr_Mesh] = {}
 
 
@@ -201,7 +234,7 @@ def _parts_ml(bench_case: BenchCase, copies: int) -> mm.std_vector_std_shared_pt
 
 
 @pytest.mark.benchmark(group="concatenate")
-@pytest.mark.benchlibs("triwarp", "trimesh", "meshlib")
+@pytest.mark.benchlibs("triwarp", "trimesh", "meshlib", "pytorch3d")
 @pytest.mark.benchmeshes("sphere_med")
 @pytest.mark.parametrize("copies", _CONCAT_COPIES)
 def test_concatenate(bench_case: BenchCase, copies: int) -> None:
@@ -214,7 +247,19 @@ def test_concatenate(bench_case: BenchCase, copies: int) -> None:
     per input mesh (~32 us of host-side marshalling each) and is now a single launch over the
     packed buffer. The 25x that remains is two ``wp.copy`` calls per piece -- Warp has no gather
     across separate allocations, so the packing itself cannot be batched.
+
+    **pytorch3d**'s ``join_meshes_as_scene`` is this operation exactly -- concatenate the vertex
+    buffers, shift each piece's indices by the running count -- and
+    ``tests/test_combine.py::test_concatenate_matches_pytorch3d`` pins it to byte equality on both
+    halves. Like triwarp's row its pieces are cached (they are the input), and like triwarp's it
+    has no gather across separate allocations to exploit, so its slope in the piece count is the
+    same shape of per-piece overhead this group exists to measure.
     """
+    if bench_case.kind == "pytorch3d":
+        pieces_p3d = _parts_p3d(bench_case, copies)
+        joined_p3d = bench_case.run(lambda: p3d_structures.join_meshes_as_scene(pieces_p3d))
+        assert joined_p3d.faces_packed().shape[0] == bench_case.n_faces
+        return
     if bench_case.kind == "meshlib":
         # ``mergeMeshes`` takes a vector of *shared pointers* and returns a new mesh without
         # touching its inputs, so unlike almost everything else in this library the pieces are

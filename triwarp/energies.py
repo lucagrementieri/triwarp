@@ -1,14 +1,22 @@
 """
-Quadratic energies assembled *from* a Laplacian, and the operators the solvers minimize.
+Energies over a mesh: the scalar regularizers, and the operators the solvers minimize.
 
-Every function here returns a ``warp.sparse.BsrMatrix`` that is the ``Q`` of a quadratic form
-``x' Q x``, and every one is consumed by [`triwarp.linalg`][triwarp.linalg]'s solvers rather than
-read for its own sake. That is the line between this module and
-[`triwarp.laplacian`][triwarp.laplacian], which builds the *first*-order operators these are
-assembled out of: the cotangent stiffness matrix, its mass matrix and the intrinsic repairs that
-keep them finite.
+The line between this module and [`triwarp.laplacian`][triwarp.laplacian] is *order*: laplacian
+builds the first-order operators -- the cotangent stiffness matrix, its mass matrix and the
+intrinsic repairs that keep them finite -- and everything here is assembled out of those.
 
-Three families:
+Four families, and the first is the only one that returns a number rather than a matrix:
+
+- **Scalar mesh regularizers.** [`edge_length_loss`][triwarp.energies.edge_length_loss],
+  [`normal_consistency_loss`][triwarp.energies.normal_consistency_loss] and
+  [`laplacian_smoothing_loss`][triwarp.energies.laplacian_smoothing_loss] are the priors a mesh
+  *optimization* adds to a data term -- one per edge length, one per dihedral angle and one per
+  vertex Laplacian residual, each reduced to a single ``float``. They are here rather than in
+  [`triwarp.metrics`][triwarp.metrics], which hosts the data terms they pair with, because their
+  machinery is this module's: ``laplacian_smoothing_loss``'s two cotangent variants consume
+  [`cotmatrix`][triwarp.laplacian.cotmatrix] and
+  [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries], which is exactly the import set
+  the quadratic forms below use.
 
 - **Smoothness energies over vertices.** [`k_harmonic`][triwarp.energies.k_harmonic] is the
   integrated ``k``-harmonic form -- ``k = 1`` is Dirichlet, ``k = 2`` the biharmonic operator behind
@@ -30,12 +38,15 @@ Three families:
   two coordinate blocks. [`lscm`][triwarp.parametrization.lscm] is the solve; these are what it
   minimizes.
 
-Everything is assembled in ``float64`` in a single ``bsr_from_triplets`` per operator, because the
-conjugate-gradient solves these feed run in ``float64`` for determinism and a ``float32``
-intermediate would be the accuracy floor.
+Every *operator* is assembled in ``float64`` in a single ``bsr_from_triplets``, because the
+conjugate-gradient solves they feed run in ``float64`` for determinism and a ``float32``
+intermediate would be the accuracy floor. The three scalar regularizers are ``float32`` throughout:
+they are read by a human or by an optimizer's stopping rule, not solved with.
 """
 
 from __future__ import annotations
+
+from typing import Literal
 
 import warp as wp
 import warp.sparse as wps
@@ -43,10 +54,211 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar
-from triwarp.edges import edges_unique
+from triwarp.edges import edges_unique, edges_unique_length
 from triwarp.kernels import energies as kernel_energies
 from triwarp.kernels import predicates as kernel_predicates
-from triwarp.laplacian import cotmatrix, cotmatrix_entries
+from triwarp.laplacian import cotmatrix, cotmatrix_entries, mass_matrix_entries
+
+
+def edge_length_loss(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], target_length: float = 0.0
+) -> float:
+    """
+    Mean squared deviation of the undirected edge lengths from a resting length.
+
+    The edge regularizer of the deformation losses: ``mean((||e|| - L0)^2)`` over the **unique
+    undirected** edges, so an interior edge counts once rather than twice. At the default
+    ``target_length = 0.0`` it is the mean squared edge length, which is what a shrinking prior
+    wants; a positive value pulls the mesh toward uniform edges of that size instead.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    target_length
+        Resting edge length ``L0``.
+
+    Returns
+    -------
+    float
+        The mean, as a host scalar. ``0.0`` for a mesh with no edges.
+
+    See Also
+    --------
+    [`normal_consistency_loss`][triwarp.energies.normal_consistency_loss]
+    [`laplacian_smoothing_loss`][triwarp.energies.laplacian_smoothing_loss]
+    [`edges_unique_length`][triwarp.edges.edges_unique_length]
+        The per-edge lengths this reduces, if the distribution rather than the mean is wanted.
+    [`triwarp.metrics`][triwarp.metrics]
+        The data terms these regularizers are added to, and the differentiable Chamfer family.
+
+    Notes
+    -----
+    Matches ``pytorch3d.loss.mesh_edge_loss`` on a single mesh: measured 0.0899725929 against its
+    0.0899726003 at ``target_length = 0.0`` and 3.7334711e-04 against 3.7334702e-04 at 0.3, both
+    on ``icosphere(2)``'s 480 edges. Its per-mesh ``1 / E`` weighting collapses to a plain mean
+    for one mesh, which is triwarp's only case, so there is no batch weighting to port.
+    """
+    lengths = edges_unique_length(vertices, faces)
+    if int(lengths.shape[0]) == 0:
+        return 0.0
+    deviations = wp.empty(int(lengths.shape[0]), dtype=wp.float32, device=lengths.device)
+    wp.map(kernel_energies.squared_deviation, lengths, wp.float32(target_length), out=deviations)
+    return float(tw.reduce.mean(deviations))
+
+
+def normal_consistency_loss(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
+    """
+    Mean ``1 - cos(theta)`` over the pairs of faces sharing an edge.
+
+    The dihedral regularizer of the deformation losses, and the one that penalizes a fold: it is
+    ``0`` for a flat pair, ``1`` at a right angle and ``2`` for a face doubled back on itself. Read
+    it against [`edge_length_loss`][triwarp.energies.edge_length_loss], which constrains the
+    *sizes*; this one constrains the *orientations* and says nothing about scale.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    float
+        The mean, as a host scalar. ``0.0`` for a mesh with no adjacent face pair.
+
+    See Also
+    --------
+    [`edge_length_loss`][triwarp.energies.edge_length_loss]
+    [`laplacian_smoothing_loss`][triwarp.energies.laplacian_smoothing_loss]
+    [`face_adjacency_angles`][triwarp.adjacency.face_adjacency_angles]
+        The per-pair dihedral angles this reduces.
+
+    Notes
+    -----
+    Matches ``pytorch3d.loss.mesh_normal_consistency`` on **edge-manifold** input: measured
+    0.0155946491 against its 0.0155946799 over ``icosphere(2)``'s 480 pairs. The restriction is
+    real and is not a tolerance -- the reference enumerates *every* pair of faces sharing an edge,
+    so an edge with ``k`` incident faces contributes ``C(k, 2)`` terms where
+    [`face_adjacency_angles`][triwarp.adjacency.face_adjacency_angles] reports one pair per
+    adjacency. The two coincide exactly wherever every edge has at most two faces.
+    """
+    angles = tw.adjacency.face_adjacency_angles(vertices, faces)
+    if int(angles.shape[0]) == 0:
+        return 0.0
+    terms = wp.empty(int(angles.shape[0]), dtype=wp.float32, device=angles.device)
+    wp.map(kernel_energies.one_minus_cosine, angles, out=terms)
+    return float(tw.reduce.mean(terms))
+
+
+def laplacian_smoothing_loss(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    method: Literal["uniform", "cot", "cotcurv"] = "uniform",
+) -> float:
+    """
+    Mean magnitude of a Laplacian residual per vertex, under one of three normalizations.
+
+    The smoothness regularizer of the deformation losses. The three methods are **three different
+    quantities**, not one with a tuning knob, and they differ by an order of magnitude -- measured
+    0.04838 / 0.04401 / 0.33407 on ``icosphere(2)``:
+
+    - ``"uniform"``: ``|| (A v)_i - v_i ||`` with ``A`` the row-normalized 1-ring average
+      ([`laplacian`][triwarp.laplacian.laplacian] with ``equal_weight=True``) -- the umbrella
+      residual, which is a *length* and therefore scales with the mesh.
+    - ``"cot"``: the same residual against the **cotangent-weighted** neighbour average,
+      ``|| (L v)_i / s_i ||`` with ``L`` the cotangent stiffness matrix and ``s_i`` its
+      off-diagonal row sum. Also a length, and the geometry-aware version of the above.
+    - ``"cotcurv"``: ``|| (L v)_i / (6 M_ii) ||`` with ``M`` the barycentric lumped mass -- the mean
+      curvature magnitude, so it carries units of one over length and is the largest of the three
+      on a unit-scale mesh.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    method
+        Which normalization, as above.
+
+    Returns
+    -------
+    float
+        The mean, as a host scalar. ``0.0`` for an empty mesh.
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not one of ``"uniform"``, ``"cot"`` or ``"cotcurv"``.
+
+    See Also
+    --------
+    [`edge_length_loss`][triwarp.energies.edge_length_loss]
+    [`normal_consistency_loss`][triwarp.energies.normal_consistency_loss]
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+        The operator the two cotangent variants are built from.
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
+        The smoother that *minimizes* this, rather than measuring it.
+
+    Notes
+    -----
+    Matches ``pytorch3d.loss.mesh_laplacian_smoothing`` on all three methods: measured 2.07e-07,
+    3.12e-07 and 5.27e-07 relative on ``icosphere(2)``. Two conventions are inherited from it
+    rather than chosen here, both because they are what makes the numbers comparable at all: the
+    reference's ``cot`` and ``cotcurv`` read a cotangent Laplacian whose off-diagonal is **twice**
+    triwarp's half-cotangent table and whose diagonal is identically zero, which cancels out of
+    both ratios above -- and where a vertex's row sum is not positive its averaging is undefined,
+    so ``"cot"`` falls back to ``|| v_i ||`` there, matching the reference's ``norm_w = 0`` branch.
+    """
+    if method not in ("uniform", "cot", "cotcurv"):
+        raise ValueError(f'method must be "uniform", "cot" or "cotcurv", got {method!r}')
+    n_vertices = int(vertices.shape[0])
+    if n_vertices == 0 or int(faces.shape[0]) == 0:
+        return 0.0
+    device = vertices.device
+    row_scale = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    self_scale = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    if method == "uniform":
+        operator = tw.laplacian.laplacian(vertices, faces, equal_weight=True)
+        row_scale.fill_(1.0)
+        self_scale.fill_(-1.0)
+    else:
+        operator = cotmatrix(vertices, faces)
+        if method == "cot":
+            wp.launch(
+                kernel_energies.cot_row_scales,
+                dim=n_vertices,
+                inputs=[operator.offsets, operator.columns, operator.values, row_scale, self_scale],
+                device=device,
+            )
+        else:
+            wp.map(
+                kernel_energies.reciprocal_scaled_or_zero,
+                mass_matrix_entries(vertices, faces),
+                wp.float32(1.0 / 6.0),
+                out=row_scale,
+            )
+            self_scale.zero_()
+    norms = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_energies.laplacian_residual_norms,
+        dim=n_vertices,
+        inputs=[
+            operator.offsets,
+            operator.columns,
+            operator.values,
+            vertices,
+            row_scale,
+            self_scale,
+            norms,
+        ],
+        device=device,
+    )
+    return float(tw.reduce.mean(norms))
 
 
 def k_harmonic(

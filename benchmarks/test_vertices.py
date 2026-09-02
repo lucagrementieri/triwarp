@@ -56,6 +56,8 @@ from __future__ import annotations
 import igl
 import numpy as np
 import pytest
+import pytorch3d.structures as p3d_structures
+import torch
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
@@ -134,7 +136,7 @@ def test_mean_vertex_normals(bench_case: BenchCase) -> None:
 )
 @pytest.mark.benchmark(group="vertex_normals")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib", "pytorch3d")
 def test_vertex_normals(bench_case: BenchCase) -> None:
     """
     Area-weighted scatter, uniform valence 6 against two 40 960-valence hubs.
@@ -144,8 +146,32 @@ def test_vertex_normals(bench_case: BenchCase) -> None:
     tests/test_vertices.py::test_vertex_normal_weightings_match_meshlib pins. It is also the only
     **multi-threaded** row in this group, so read the ratio against ``triwarp-cuda`` and not against
     ``triwarp-cpu``. Pure, so the mesh is built once outside the timed callable.
+
+    **pytorch3d**'s ``verts_normals_packed`` is the same area weighting (1.19e-07, pinned in
+    tests/test_vertices.py::test_vertex_normals_match_pytorch3d), but it is a **memoized accessor
+    on an immutable container**, so unlike every other row here the ``Meshes`` has to be built
+    *inside* the timed callable -- reading it twice on a shared object prices nothing. That means
+    the row carries the container construction as well: measured on ``fan_hub``, the build is
+    0.287 ms of a 3.693 ms round on the host (**8 %**) and 0.251 of 0.746 ms on CUDA (**34 %**), so
+    read the CUDA row in particular as an upper bound on the scatter rather than as the scatter.
     """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pytorch3d":
+        vertices_p3d = torch.as_tensor(
+            np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32),
+            device=bench_case.torch_device,
+        )
+        faces_p3d = torch.as_tensor(
+            np.ascontiguousarray(bench_case.faces_np, dtype=np.int64),
+            device=bench_case.torch_device,
+        )
+        normals_p3d = bench_case.run(
+            lambda: p3d_structures.Meshes(
+                verts=[vertices_p3d], faces=[faces_p3d]
+            ).verts_normals_packed()
+        )
+        assert normals_p3d.shape == (n_vertices, 3)
+        return
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()
         normals_ml = bench_case.run(lambda: mm.computePerVertNormals(mesh_ml))

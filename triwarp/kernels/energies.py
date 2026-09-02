@@ -20,6 +20,86 @@ def reciprocal_or_zero(value: wp.Float) -> wp.Float:
     return type(value)(0.0)
 
 
+@wp.func
+def squared_deviation(value: wp.Float, target: wp.Float) -> wp.Float:
+    # ``(x - L0)^2``, the per-edge term of the edge-length regularizer. A ``@wp.func`` rather than
+    # an inline kernel body so ``energies.edge_length_loss`` can reach it through ``wp.map``.
+    difference = value - target
+    return difference * difference
+
+
+@wp.func
+def reciprocal_scaled_or_zero(value: wp.Float, numerator: wp.Float) -> wp.Float:
+    # ``numerator / value``, with the ``reciprocal_or_zero`` convention above for a non-positive
+    # denominator: a vertex whose lumped area is zero contributes nothing rather than an infinity.
+    if value > type(value)(0.0):
+        return numerator / value
+    return type(value)(0.0)
+
+
+@wp.func
+def one_minus_cosine(angle: wp.Float) -> wp.Float:
+    # ``1 - cos(theta)``, the per-pair term of the normal-consistency regularizer: 0 for a flat
+    # pair, 1 at a right angle, 2 for a fold back on itself.
+    return type(angle)(1.0) - wp.cos(angle)
+
+
+@wp.kernel(enable_backward=False)
+def laplacian_residual_norms(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    vertices: wp.array[wp.vec3],
+    row_scale: wp.array[wp.float32],
+    self_scale: wp.array[wp.float32],
+    out_norms: wp.array[wp.float32],
+) -> None:
+    # ``|| row_scale[i] * (L v)_i + self_scale[i] * v_i ||`` for one CSR row.
+    #
+    # The affine form is what lets one kernel serve all three of
+    # ``energies.laplacian_smoothing_loss``'s methods: the uniform variant is the umbrella residual
+    # ``(A v)_i - v_i`` (``row_scale = 1``, ``self_scale = -1``), and the two cotangent variants are
+    # a per-vertex rescaling of the stiffness residual with no self term (``self_scale = 0``). The
+    # scales are arrays rather than scalars because the cotangent ones divide by a per-vertex row
+    # sum or lumped area, and because that is where the reference's degenerate-row convention
+    # lives -- see the wrapper.
+    i = wp.int32(wp.tid())
+    accumulator = wp.vec3(0.0, 0.0, 0.0)
+    for slot in range(offsets[i], offsets[i + 1]):
+        accumulator += values[slot] * vertices[columns[slot]]
+    out_norms[i] = wp.length(row_scale[i] * accumulator + self_scale[i] * vertices[i])
+
+
+@wp.kernel(enable_backward=False)
+def cot_row_scales(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    out_row_scale: wp.array[wp.float32],
+    out_self_scale: wp.array[wp.float32],
+) -> None:
+    # The ``method="cot"`` scales, read off the assembled stiffness matrix's own diagonal.
+    #
+    # The cotangent-weighted neighbour average is ``(L v)_i / s_i`` with ``s_i`` the off-diagonal
+    # row sum, and a cotangent Laplacian carries ``-s_i`` on its diagonal -- so the scale is one
+    # negated diagonal read and no second pass over the row. Where ``s_i`` is not positive (an
+    # obtuse ring whose weights cancel, or an isolated vertex) the averaging is undefined and the
+    # convention is to fall back to ``-v_i``, which is what the reference's ``norm_w = 0`` branch
+    # amounts to.
+    i = wp.int32(wp.tid())
+    diagonal = wp.float32(0.0)
+    for slot in range(offsets[i], offsets[i + 1]):
+        if columns[slot] == i:
+            diagonal = values[slot]
+    row_sum = -diagonal
+    if row_sum > 0.0:
+        out_row_scale[i] = 1.0 / row_sum
+        out_self_scale[i] = 0.0
+    else:
+        out_row_scale[i] = 0.0
+        out_self_scale[i] = -1.0
+
+
 @wp.kernel
 def sandwich_row_counts(
     a_offsets: wp.array[wp.int32],

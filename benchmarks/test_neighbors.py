@@ -125,12 +125,13 @@ from __future__ import annotations
 import igl
 import numpy as np
 import pytest
+import pytorch3d.ops as p3d_ops
 import warp as wp
 from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, points_torch_from_numpy, skip_larger_than
 
 _SEED = 42
 _N_QUERIES = 20_000
@@ -143,6 +144,13 @@ _GRID_BINS = [32, 256]
 # Ball radii as multiples of the mean edge length. Expected neighbours grow ~cubically, so these
 # two points are roughly 8x apart in work.
 _RADIUS_SCALES = [2.0, 4.0]
+
+# pytorch3d's ``ball_query`` returns a fixed-width ``(N, P, K)`` block padded with ``-1`` rather
+# than a ragged CSR, so ``K`` has to sit above the largest true neighbour count at the widest
+# radius this module sweeps. Measured on ``bunny`` at ``_RADIUS_SCALES[-1] * mean_edge``: 89. An
+# undersized ``K`` does not raise -- it stops filling the row, which makes the call *faster* and
+# the answer wrong -- so ``_run_pytorch3d_ball`` asserts the cap did not bite.
+_PYTORCH3D_BALL_K = 256
 
 # Weight spreads for ``query_weighted_nearest``, in mean edge lengths. The weighted query has to
 # search out to ``answer + max_weight`` before it can certify, so this -- not the point count -- is
@@ -278,6 +286,51 @@ def _run_o3d_nns_knn(bench_case: BenchCase, k: int) -> None:
     assert indices_o3d.shape == (queries_np.shape[0], k)
 
 
+def _run_pytorch3d_knn(bench_case: BenchCase, k: int) -> None:
+    """
+    Batched ``knn_points`` -- brute force, so there is no index build to place inside or outside.
+
+    That is the whole reason the row is comparable at all: every other reference in this module
+    times a structure build plus a traversal, and this one times ``n_points x n_queries`` distance
+    evaluations. The upload is hoisted out (0.35-0.60 ms for 36 k points, against a 2-3 ms query at
+    20 000), which matches what the triwarp branches do with their ``wp.array`` buffers.
+
+    The CPU row is capped: it is Theta(N x Q) with no pruning, measured 299.8 / 1 189.5 /
+    4 562.8 ms at 10 k / 20 k / 40 k self-queries, so ``dragon`` extrapolates to minutes per round
+    and ``--benchmark-json`` is written at session end.
+    """
+    if bench_case.torch_device == "cpu":
+        skip_larger_than(
+            bench_case, "bunny_decimated", "pytorch3d's CPU k-NN is brute force over every pair"
+        )
+    queries_p3d = points_torch_from_numpy(_queries_np(bench_case), bench_case.torch_device)
+    points_p3d = points_torch_from_numpy(bench_case.vertices_np, bench_case.torch_device)
+    nearest_p3d = bench_case.run(lambda: p3d_ops.knn_points(queries_p3d, points_p3d, K=k))
+    assert nearest_p3d.idx.shape == (1, _queries_np(bench_case).shape[0], k)
+
+
+def _run_pytorch3d_ball(bench_case: BenchCase, radius: float) -> None:
+    """
+    Batched ``ball_query`` at the same radius, with ``K`` above the largest true neighbour count.
+
+    ``K`` is a real parameter of the answer and not just of the buffer: pytorch3d stops filling a
+    row once it has ``K`` hits, so an undersized ``K`` makes the row *faster* and the answer wrong.
+    It is asserted here rather than trusted, which is the section 13 rule about verifying values
+    and not only timing.
+    """
+    if bench_case.torch_device == "cpu":
+        skip_larger_than(
+            bench_case, "bunny_decimated", "pytorch3d's CPU ball query is brute force over pairs"
+        )
+    queries_p3d = points_torch_from_numpy(_queries_np(bench_case), bench_case.torch_device)
+    points_p3d = points_torch_from_numpy(bench_case.vertices_np, bench_case.torch_device)
+    ball_p3d = bench_case.run(
+        lambda: p3d_ops.ball_query(queries_p3d, points_p3d, K=_PYTORCH3D_BALL_K, radius=radius)
+    )
+    counts_p3d = (ball_p3d.idx[0] >= 0).sum(dim=1)
+    assert int(counts_p3d.max()) < _PYTORCH3D_BALL_K, "the K cap truncated a row; raise it"
+
+
 def _run_meshlib_projector(bench_case: BenchCase) -> None:
     """
     ``PointsProjector`` over the query cloud: meshlib's only batched ``k=1``, tree pre-warmed.
@@ -306,7 +359,7 @@ def _run_meshlib_projector(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="query_nearest_bvh_k1")
-@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d", "meshlib")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d", "meshlib", "pytorch3d")
 def test_query_nearest_bvh_k1(bench_case: BenchCase) -> None:
     """
     ``k=1`` BVH k-NN — the exact call ICP and the Chamfer family make.
@@ -315,10 +368,28 @@ def test_query_nearest_bvh_k1(bench_case: BenchCase) -> None:
     it answers ``k=1`` only -- which is why meshlib appears in this group and not in the ``k7`` or
     ``k64`` ones (``tests/test_neighbors.py`` records that as a ``benchmarked=False`` claim). It is
     exact against triwarp on both indices and distances.
+
+    **pytorch3d** is the fifth exact k-NN and the only reference with GPU kernels, so its
+    ``-cuda`` row is the one GPU-against-GPU comparison in the module. It has no spatial structure
+    on either device -- just the pairwise loop -- which makes it a *crossover* rather than a bar:
+    measured 2.31 ms against triwarp's 3.29 at 20 000 points (**0.70x**, pytorch3d winning) and
+    74.65 against 0.87 at 200 000 (**85x**). Half of that swing is triwarp's own search-radius
+    heuristic and not brute force scaling; the ``LIBRARIES`` block in [`conftest.py`](conftest.py)
+    carries the sweep and the reading. Its ``dists`` are **squared**, which is the named transform
+    ``tests/test_neighbors.py::test_query_nearest_matches_pytorch3d`` applies; its indices are
+    exactly triwarp's. Absent from ``k64`` for the same reason meshlib is absent from ``k7``: there
+    is no ``query_nearest_hashgrid_k64`` group to pair with, so two BVH-only markers would read as
+    a different claim than the four here.
     """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "meshlib":
         _run_meshlib_projector(bench_case)
+        return
+    if bench_case.kind == "pytorch3d":
+        _run_pytorch3d_knn(bench_case, 1)
+        return
+    if bench_case.kind == "pytorch3d":
+        _run_pytorch3d_knn(bench_case, 1)
         return
     if bench_case.kind == "triwarp":
         points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
@@ -335,7 +406,7 @@ def test_query_nearest_bvh_k1(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="query_nearest_hashgrid_k1")
-@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d", "meshlib")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d", "meshlib", "pytorch3d")
 def test_query_nearest_hashgrid_k1(bench_case: BenchCase) -> None:
     """
     ``k=1`` hash-grid k-NN — the backend ``distance.py`` picks.
@@ -345,6 +416,18 @@ def test_query_nearest_hashgrid_k1(bench_case: BenchCase) -> None:
     and ``k`` are identical between the two groups and only triwarp's structure differs. So the pair
     of groups reads as one comparison with triwarp's index as the axis, which is what
     ``tests/test_neighbors.py`` asserts by parametrizing every k-NN comparison over both backends.
+
+    **pytorch3d** is the fifth exact k-NN and the only reference with GPU kernels, so its
+    ``-cuda`` row is the one GPU-against-GPU comparison in the module. It has no spatial structure
+    on either device -- just the pairwise loop -- which makes it a *crossover* rather than a bar:
+    measured 2.31 ms against triwarp's 3.29 at 20 000 points (**0.70x**, pytorch3d winning) and
+    74.65 against 0.87 at 200 000 (**85x**). Half of that swing is triwarp's own search-radius
+    heuristic and not brute force scaling; the ``LIBRARIES`` block in [`conftest.py`](conftest.py)
+    carries the sweep and the reading. Its ``dists`` are **squared**, which is the named transform
+    ``tests/test_neighbors.py::test_query_nearest_matches_pytorch3d`` applies; its indices are
+    exactly triwarp's. Absent from ``k64`` for the same reason meshlib is absent from ``k7``: there
+    is no ``query_nearest_hashgrid_k64`` group to pair with, so two BVH-only markers would read as
+    a different claim than the four here.
     """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "meshlib":
@@ -365,10 +448,30 @@ def test_query_nearest_hashgrid_k1(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="query_nearest_bvh_k7")
-@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d", "pytorch3d")
 def test_query_nearest_bvh_k7(bench_case: BenchCase) -> None:
-    """``k=7`` BVH k-NN — ``ball_pivoting``'s seed-candidate table."""
+    """
+    ``k=7`` BVH k-NN — ``ball_pivoting``'s seed-candidate table.
+
+    **pytorch3d** is the fifth exact k-NN and the only reference with GPU kernels, so its
+    ``-cuda`` row is the one GPU-against-GPU comparison in the module. It has no spatial structure
+    on either device -- just the pairwise loop -- which makes it a *crossover* rather than a bar:
+    measured 2.31 ms against triwarp's 3.29 at 20 000 points (**0.70x**, pytorch3d winning) and
+    74.65 against 0.87 at 200 000 (**85x**). Half of that swing is triwarp's own search-radius
+    heuristic and not brute force scaling; the ``LIBRARIES`` block in [`conftest.py`](conftest.py)
+    carries the sweep and the reading. Its ``dists`` are **squared**, which is the named transform
+    ``tests/test_neighbors.py::test_query_nearest_matches_pytorch3d`` applies; its indices are
+    exactly triwarp's. Absent from ``k64`` for the same reason meshlib is absent from ``k7``: there
+    is no ``query_nearest_hashgrid_k64`` group to pair with, so two BVH-only markers would read as
+    a different claim than the four here.
+    """
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "pytorch3d":
+        _run_pytorch3d_knn(bench_case, 7)
+        return
+    if bench_case.kind == "pytorch3d":
+        _run_pytorch3d_knn(bench_case, 7)
+        return
     if bench_case.kind == "triwarp":
         points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
         indices, _distances = bench_case.run(
@@ -410,7 +513,7 @@ def test_query_nearest_bvh_k64(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="query_nearest_hashgrid_k7")
-@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d", "pytorch3d")
 def test_query_nearest_hashgrid_k7(bench_case: BenchCase) -> None:
     """
     ``k=7`` hash-grid k-NN.
@@ -418,6 +521,18 @@ def test_query_nearest_hashgrid_k7(bench_case: BenchCase) -> None:
     Same three references as ``query_nearest_bvh_k7``, and for the reason given on the ``k1`` group:
     the reference call does not change with triwarp's index. meshlib is absent here rather than
     exempt -- its only batched query-cloud form is ``k=1`` (see ``query_nearest_bvh_k1``).
+
+    **pytorch3d** is the fifth exact k-NN and the only reference with GPU kernels, so its
+    ``-cuda`` row is the one GPU-against-GPU comparison in the module. It has no spatial structure
+    on either device -- just the pairwise loop -- which makes it a *crossover* rather than a bar:
+    measured 2.31 ms against triwarp's 3.29 at 20 000 points (**0.70x**, pytorch3d winning) and
+    74.65 against 0.87 at 200 000 (**85x**). Half of that swing is triwarp's own search-radius
+    heuristic and not brute force scaling; the ``LIBRARIES`` block in [`conftest.py`](conftest.py)
+    carries the sweep and the reading. Its ``dists`` are **squared**, which is the named transform
+    ``tests/test_neighbors.py::test_query_nearest_matches_pytorch3d`` applies; its indices are
+    exactly triwarp's. Absent from ``k64`` for the same reason meshlib is absent from ``k7``: there
+    is no ``query_nearest_hashgrid_k64`` group to pair with, so two BVH-only markers would read as
+    a different claim than the four here.
     """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "triwarp":
@@ -550,7 +665,7 @@ def test_hashgrid_from_points(bench_case: BenchCase, grid_bins: int) -> None:
 
 
 @pytest.mark.benchmark(group="query_ball_bvh")
-@pytest.mark.benchlibs("triwarp", "scipy", "open3d")
+@pytest.mark.benchlibs("triwarp", "scipy", "open3d", "pytorch3d")
 @pytest.mark.parametrize("radius_scale", _RADIUS_SCALES)
 def test_query_ball_bvh(bench_case: BenchCase, radius_scale: float) -> None:
     """
@@ -560,6 +675,15 @@ def test_query_ball_bvh(bench_case: BenchCase, radius_scale: float) -> None:
     ``fixed_radius_index`` -- the last per radius, because that index bakes the radius in.
     ``fixed_radius_search`` returns a CSR-like triple, which is exactly the ``*_with_offsets``
     layout triwarp's row times, so neither side pays per-query host slicing.
+
+    **pytorch3d**'s ``ball_query`` is the fourth structure-free row and the only GPU one, and it is
+    the group where the absence of an index costs most: measured 4.97 ms against triwarp's 0.31 at
+    20 000 points and 179.52 against 2.12 at 200 000, **16x and 85x**, with no crossover at either
+    end -- unlike its k-NN, which triwarp loses at 20 000. Two conventions shape the row and both
+    are asserted rather than assumed: it takes a fixed ``K`` and pads with ``-1`` rather than
+    returning a ragged CSR, so ``K`` is passed above the largest true neighbour count and a smaller
+    one would silently truncate; and it fills in ascending **index** order, not by distance, which
+    is why ``tests/test_neighbors.py::test_query_ball_matches_pytorch3d`` compares sets.
     """
     skip_larger_than(bench_case, "bunny", "the neighbour count grows cubically with the radius")
     radius = radius_scale * bench_case.mean_edge
@@ -644,7 +768,7 @@ def test_query_bvh_box(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="query_ball_hashgrid")
-@pytest.mark.benchlibs("triwarp", "scipy", "open3d")
+@pytest.mark.benchlibs("triwarp", "scipy", "open3d", "pytorch3d")
 @pytest.mark.parametrize("grid_bins", _GRID_BINS)
 def test_query_ball_hashgrid(bench_case: BenchCase, grid_bins: int) -> None:
     """
@@ -658,9 +782,24 @@ def test_query_ball_hashgrid(bench_case: BenchCase, grid_bins: int) -> None:
     scipy's cached ``KDTree`` and open3d's ``fixed_radius_index``, each prebuilt so no row pays for
     a structure. Neither has a bin count, so their two rows per mesh are identical bars and only
     triwarp's move; that is the axis this group exists for.
+
+    **pytorch3d**'s ``ball_query`` is the fourth structure-free row and the only GPU one, and it is
+    the group where the absence of an index costs most: measured 4.97 ms against triwarp's 0.31 at
+    20 000 points and 179.52 against 2.12 at 200 000, **16x and 85x**, with no crossover at either
+    end -- unlike its k-NN, which triwarp loses at 20 000. Two conventions shape the row and both
+    are asserted rather than assumed: it takes a fixed ``K`` and pads with ``-1`` rather than
+    returning a ragged CSR, so ``K`` is passed above the largest true neighbour count and a smaller
+    one would silently truncate; and it fills in ascending **index** order, not by distance, which
+    is why ``tests/test_neighbors.py::test_query_ball_matches_pytorch3d`` compares sets.
     """
     skip_larger_than(bench_case, "bunny", "the neighbour count grows cubically with the radius")
     radius = _RADIUS_SCALES[0] * bench_case.mean_edge
+    if bench_case.kind == "pytorch3d":
+        _run_pytorch3d_ball(bench_case, radius)
+        return
+    if bench_case.kind == "pytorch3d":
+        _run_pytorch3d_ball(bench_case, radius)
+        return
     if bench_case.kind == "open3d":
         import open3d as o3d
 

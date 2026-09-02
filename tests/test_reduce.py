@@ -3,10 +3,12 @@ from __future__ import annotations
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops.utils as p3d_ops_utils
+import torch
 import warp as wp
 
 import triwarp.reduce as tw_reduce
-from tests.conversions import points_to_warp, trimesh_to_pyvista
+from tests.conversions import points_to_torch, points_to_warp, trimesh_to_pyvista
 
 
 @pytest.mark.parity("min_scalar", "numpy")
@@ -576,6 +578,41 @@ def test_weighted_sum_vec3_1d(device: str) -> None:
     sum_wp = tw_reduce.weighted_sum(values_wp, weights_wp)
     exp_np = (weights_np[:, None] * values_np).sum(axis=0)
     assert np.allclose(np.array(sum_wp), exp_np, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parity("weighted_sum", "pytorch3d")
+def test_weighted_sum_matches_pytorch3d(device: str) -> None:
+    """
+    Class B: ``ops.utils.wmean`` is ``weighted_sum`` divided by ``sum(weights)``.
+
+    pytorch3d's is the weighted *mean* -- ``sum(w * x) / sum(w)`` with an ``eps=1e-9`` floor under
+    the denominator -- so dividing triwarp's weighted sum by the plain sum of the same weights is
+    the whole transform, and the two agree to 2.79e-08 over 50 ``vec3`` samples. Both reductions
+    are exercised, which is what makes the pair a check on ``weighted_sum`` rather than on the
+    division: a wrong numerator and a wrong denominator would have to cancel.
+
+    The ``eps`` never bites here (the weights are ``rng.random``, so the sum is far from zero) and
+    triwarp has no counterpart for it, which is why the fixture avoids the case rather than
+    asserting on it.
+    """
+    rng = np.random.default_rng(9)
+    values_np = rng.normal(size=(50, 3)).astype(np.float32)
+    weights_np = rng.random(50).astype(np.float32)
+    mean_p3d = p3d_ops_utils.wmean(
+        points_to_torch(values_np, device), torch.as_tensor(weights_np, device=device).unsqueeze(0)
+    )[0, 0]
+
+    values_wp = points_to_warp(values_np, device)
+    weights_wp = wp.array(weights_np, dtype=wp.float32, device=device)
+    total_wp = tw_reduce.weighted_sum(values_wp, weights_wp)
+
+    assert float(np.abs(mean_p3d.cpu().numpy()).max()) > 1e-3
+    assert np.allclose(
+        np.array(list(total_wp)) / tw_reduce.sum(weights_wp),
+        mean_p3d.cpu().numpy(),
+        rtol=1e-5,
+        atol=1e-7,
+    )
 
 
 @pytest.mark.parametrize("n", [100, 101])

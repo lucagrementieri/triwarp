@@ -8,6 +8,8 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pytorch3d.ops as p3d_ops
+import torch
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -15,11 +17,14 @@ from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist
 
 import triwarp as tw
+from tests.comparisons import chamfer_two_sided
 from tests.conversions import (
     meshlib_bitset_to_numpy,
+    numpy_to_warp,
     points_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
+    trimesh_to_pytorch3d,
 )
 
 
@@ -129,6 +134,53 @@ def test_sample_surface(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(freq_wp, freq_expected, rtol=0.08, atol=0.008)
     assert np.allclose(freq_tm, freq_expected, rtol=0.08, atol=0.008)
     assert np.allclose(freq_igl, freq_expected, rtol=0.08, atol=0.008)
+
+
+@pytest.mark.parity("sample_surface", "pytorch3d")
+def test_sample_surface_matches_pytorch3d(icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class C: a distributional bound, because two independent RNGs give no correspondence at all.
+
+    The statistic is the two-sided Chamfer distance between the two 1 000-point sets, and it is
+    bounded rather than matched. **Mutation probe and margin:** sampling the reference from a mesh
+    scaled by 1.15 takes the same statistic from **0.00768** to **0.05227**, a factor of **6.8** --
+    clear of section 6's 3x bar, and the threshold below sits between the two.
+
+    **Bug class excluded:** a sampler that lands off the surface, concentrates on the wrong faces,
+    or ignores its area weights -- all three move the point cloud far enough to blow the bound. Not
+    excluded: any defect that preserves the surface distribution, e.g. a correlated RNG. The
+    per-face proportionality assert covers the weighting half directly, on a deliberately
+    anisotropic mesh where the face areas span 4.2x (measured correlation 0.90 at 20 000 samples;
+    on a regular icosphere the areas span 1.05x and the correlation is noise, which is why the
+    invariant needs its own fixture rather than riding on this one).
+    """
+    mesh_tm, mesh_wp = icosphere_coarse
+    torch.manual_seed(4)
+    samples_p3d = p3d_ops.sample_points_from_meshes(trimesh_to_pytorch3d(mesh_tm), 1000)[0].numpy()
+    samples_wp, _ = tw.sample.sample_surface(mesh_wp.points, mesh_wp.indices, 1000, seed=4)
+
+    assert samples_p3d.shape == (1000, 3)
+    assert float(np.abs(np.linalg.norm(samples_p3d, axis=1) - 1.0).max()) < 0.05
+    assert chamfer_two_sided(samples_wp.numpy(), samples_p3d) < 0.02
+
+    # The mutation probe, run rather than merely recorded: a 1.15x mesh must fail that bound.
+    scaled_tm = mesh_tm.copy()
+    scaled_tm.apply_scale(1.15)
+    torch.manual_seed(4)
+    scaled_p3d = p3d_ops.sample_points_from_meshes(trimesh_to_pytorch3d(scaled_tm), 1000)[0].numpy()
+    assert chamfer_two_sided(samples_wp.numpy(), scaled_p3d) > 0.02
+
+    # Area weighting, on a mesh whose face areas actually differ.
+    stretched_tm = mesh_tm.copy()
+    stretched_tm.apply_scale([1.0, 1.0, 4.0])
+    vertices_wp, faces_wp = numpy_to_warp(
+        stretched_tm.vertices, stretched_tm.faces, str(mesh_wp.points.device)
+    )
+    _, face_indices_wp = tw.sample.sample_surface(vertices_wp, faces_wp, 20000, seed=1)
+    areas_np = tw.triangles.face_normals_and_areas(vertices_wp, faces_wp)[1].numpy()
+    counts_np = np.bincount(face_indices_wp.numpy(), minlength=len(stretched_tm.faces))
+    assert areas_np.max() / areas_np.min() > 4.0
+    assert float(np.corrcoef(counts_np, areas_np)[0, 1]) > 0.8
 
 
 def test_sample_surface_with_face_weights(icosahedron: tuple[tm.Trimesh, wp.Mesh]):

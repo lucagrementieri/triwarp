@@ -23,13 +23,17 @@ Flags
     Which ``triwarp`` targets to time. ``auto`` (default) uses cuda when CUDA is available,
     else falls back to cpu — ``triwarp-cpu`` is not timed alongside cuda by default. Pass
     ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl`` /
-    ``open3d`` / ``scipy`` / ``potpourri3d`` / ``pymeshlab`` / ``pyvista`` / ``meshlib`` /
-    ``pymeshfix`` CPU baselines are always included.
+    ``open3d`` / ``scipy`` / ``numpy`` / ``potpourri3d`` / ``pymeshlab`` / ``pyvista`` /
+    ``meshlib`` / ``pymeshfix`` / ``pytorch3d-cpu`` CPU baselines are always included, and
+    ``pytorch3d-cuda`` whenever the installed pytorch3d carries a working CUDA extension --
+    ``pytorch3d`` is the one reference with GPU kernels of its own, so it is *not* selected by
+    ``--device``, which chooses among triwarp's targets.
 ``--size=<comma list | all>``
     Restrict meshes to these size categories (``small,medium,large,extralarge,huge``).
 ``--cpu-max-size=<category>``
     CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``, ``scipy``,
-    ``potpourri3d``, ``pymeshlab``, ``pyvista``, ``meshlib``, ``pymeshfix``) skip meshes
+    ``numpy``, ``potpourri3d``, ``pymeshlab``, ``pyvista``, ``meshlib``, ``pymeshfix``,
+    ``pytorch3d-cpu``) skip meshes
     larger than this unless the size was named explicitly in ``--size``. Default ``large`` — so
     ``happy_buddha`` and ``lucy`` run GPU-only by default while
     ``bunny_decimated``/``bunny``/``dragon`` run on CPU.
@@ -37,6 +41,7 @@ Flags
 
 from __future__ import annotations
 
+import functools
 import operator
 import warnings
 from collections import defaultdict
@@ -61,6 +66,7 @@ from meshes import (
 if TYPE_CHECKING:
     import open3d as o3d
     import pymeshlab as ml
+    import pytorch3d.structures as p3d_structures
     import pyvista as pv
     from meshlib import mrmeshpy as mm
     from pymeshfix._meshfix import PyTMesh
@@ -178,6 +184,58 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 # (``triwarp.reduce``), where a host reduction over an already-resident NumPy buffer is the honest
 # CPU floor. It is deliberately not a geometry reference — every other CPU baseline is already
 # built on NumPy, so timing it against a geometry wrapper would measure nothing new.
+#
+# ``pytorch3d`` is the **only** reference here with CUDA kernels of its own, so it takes *two* rows
+# the way triwarp does. The ``-cuda`` row is the point: a ``triwarp-cuda`` vs ``pytorch3d-cuda``
+# ratio is the one GPU-against-GPU comparison in the suite, and it is not a foregone conclusion.
+# pytorch3d's ``_C`` carries **no spatial structure on either device** -- no tree, no grid, just the
+# pairwise loop -- so the ratio is a crossover rather than a constant. Measured on this box, min of
+# 12 interleaved reps, uniform cloud in a 5-unit box, each side synchronized on its own stream and
+# each building whatever index it builds inside the timed call:
+#
+#   | (p3d / triwarp-cuda)       | 20 000 points          | 200 000 points          |
+#   |----------------------------|------------------------|-------------------------|
+#   | ``knn_points(K=8)``        | 2.31 / 3.29 ms  0.70x  | 74.65 / 0.87 ms  85.5x  |
+#   | ``chamfer_distance``       | 3.39 / 5.36 ms  0.63x  | 108.12 / 1.19 ms 90.5x  |
+#   | ``ball_query(r=0.15)``     | 4.97 / 0.31 ms  16.1x  | 179.52 / 2.12 ms 84.6x  |
+#   | ``sample_farthest_points`` | 14.35 / 5.43 ms 2.64x  | 104.93 / 35.99 ms 2.92x |
+#
+# **pytorch3d wins the k-NN and chamfer rows at 20 000 points** -- brute force with perfect
+# coalescing beats a BVH descent while the whole problem still fits the device's bandwidth -- and
+# loses them by ~90x at 200 000. So the neighbour and chamfer groups need the point count as an
+# *axis*: a one-size row reports whichever side of the crossover it landed on, which is section
+# 13's "a single operating point cannot show a trend".
+#
+# **Half of that crossover is triwarp's, not pytorch3d's, and the row must not be read as a
+# statement about brute force.** pytorch3d is a clean quadratic (0.63, 2.26, 5.59, 20.18, 73.82 ms
+# at 5 k / 20 k / 50 k / 100 k / 200 k); triwarp's ``query_nearest`` is **non-monotonic** over the
+# same sweep -- 0.82, 3.25, 7.38, **0.46**, 0.75 ms -- a 16x *drop* between 50 k and 100 k on the
+# same box, same box extent, and identical to three digits between the ``bvh`` and ``hashgrid``
+# backends (0.82/0.82, 3.25/3.25, 7.38/7.18), so the cost is in a stage the two share rather than
+# in either structure. That is the search-radius heuristic, and it is an open finding rather than
+# a property of the algorithm: see memory ``hashgrid-nearest-radius-is-cubic``. Until it is fixed,
+# the honest reading of the 20 000-point rows is "triwarp is 10x off its own 100 000-point cost
+# here", not "pytorch3d is faster".
+#
+# The ``-cpu`` row keeps pytorch3d comparable with the other ten baselines, and it is a *threaded*
+# one (``torch.get_num_threads()`` is 24 here), so it belongs with ``meshlib`` rather than with
+# trimesh / igl / pyvista / pymeshfix. But it is a reference implementation and not a tuned one:
+# the same absence of a spatial index costs it Θ(N²), measured rather than assumed -- ``knn_points``
+# 299.8 / 1 189.5 / 4 562.8 ms at 10 k / 20 k / 40 k points and ``chamfer_distance`` 557.8 /
+# 2 319.1 / 9 077.1 ms, i.e. 3.84-4.16x per doubling against the 4x a quadratic predicts.
+# Extrapolating that fit: ``bunny`` at 34 834 vertices is **~3.5 s per knn round and ~6.9 s per
+# chamfer round**, and ``dragon`` at ~435 k would be **~9 minutes per round**. So the
+# ``pytorch3d-cpu`` neighbour and chamfer rows are capped at a feature mesh, never a scan mesh --
+# ``--benchmark-json`` is written at session end, so a timeout there costs the whole file's rows.
+# The ``pytorch3d-cuda`` rows have no such problem and run the scan meshes.
+#
+# Two things every pytorch3d row has to do. **Synchronize torch's stream** -- ``BenchCase.run``
+# does it on the ``pytorch3d`` kind, because ``wp.synchronize_device`` synchronizes *Warp's* stream
+# and torch launches are asynchronous, so without it a ``-cuda`` row times the launch and not the
+# kernel (the 20 000-point chamfer row measured 3.28 ms synchronized). And **state the measured
+# share**, on the pymeshfix precedent: pytorch3d's per-round overhead is the batched ``[None]``
+# wrap plus the ``Meshes`` construction and its cached ``*_packed()`` derivations, and on a
+# ``-cuda`` row also the host-to-device copy.
 LIBRARIES: list[LibrarySpec] = [
     {"id": "triwarp-cpu", "kind": "triwarp", "device": "cpu", "cpu_bound": True},
     {"id": "triwarp-cuda", "kind": "triwarp", "device": "cuda:0", "cpu_bound": False},
@@ -191,6 +249,8 @@ LIBRARIES: list[LibrarySpec] = [
     {"id": "pyvista", "kind": "pyvista", "device": None, "cpu_bound": True},
     {"id": "meshlib", "kind": "meshlib", "device": None, "cpu_bound": True},
     {"id": "pymeshfix", "kind": "pymeshfix", "device": None, "cpu_bound": True},
+    {"id": "pytorch3d-cpu", "kind": "pytorch3d", "device": None, "cpu_bound": True},
+    {"id": "pytorch3d-cuda", "kind": "pytorch3d", "device": "cuda:0", "cpu_bound": False},
 ]
 LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
 
@@ -205,6 +265,7 @@ _mean_edge_cache: dict[str, float] = {}
 _o3d_cache: dict[str, o3d.geometry.TriangleMesh] = {}
 _pml_cache: dict[str, ml.MeshSet] = {}
 _pv_cache: dict[str, pv.PolyData] = {}
+_p3d_cache: dict[tuple[str, str], p3d_structures.Meshes] = {}
 
 
 def _load_numpy(name: str) -> tuple[np.ndarray, np.ndarray]:
@@ -316,6 +377,29 @@ def _new_mesh_pv(name: str) -> pv.PolyData:
     return pv.PolyData.from_regular_faces(vertices, np.ascontiguousarray(faces, dtype=np.int32))
 
 
+def _new_mesh_p3d(name: str, device: str) -> p3d_structures.Meshes:
+    """
+    Build a ``pytorch3d.structures.Meshes`` on ``device`` from the shared NumPy source.
+
+    Positions land as **float32** and faces as int64, which is what triwarp's ``wp.vec3`` /
+    ``wp.int32`` buffers hold and what pytorch3d's own kernels want; a float64 ``Meshes`` keeps
+    float64 through ``verts_packed()``, so matching the storage keeps a ratio comparing the same
+    arithmetic on both sides.
+
+    Imported lazily (like ``meshio``, ``open3d``, ``pymeshlab``, ``pyvista``, ``meshlib`` and
+    ``pymeshfix`` above) so the ~4 s torch + pytorch3d import is only paid by runs that include a
+    pytorch3d case.
+    """
+    import pytorch3d.structures as p3d_structures
+    import torch
+
+    vertices, faces = _load_numpy(name)
+    return p3d_structures.Meshes(
+        verts=[torch.as_tensor(np.ascontiguousarray(vertices, dtype=np.float32), device=device)],
+        faces=[torch.as_tensor(np.ascontiguousarray(faces, dtype=np.int64), device=device)],
+    )
+
+
 def mesh_ml_from_numpy(vertices: np.ndarray, faces: np.ndarray) -> mm.Mesh:
     """
     Build a ``meshlib.mrmeshpy.Mesh`` from a NumPy pair, **vertices first**.
@@ -396,6 +480,33 @@ def _new_tmesh_pmf(name: str) -> PyTMesh:
     return tmesh_pmf_from_numpy(*_load_numpy(name))
 
 
+def points_torch_from_numpy(points_np: np.ndarray, device: str) -> Any:
+    """
+    Upload an ``(n, 3)`` cloud as the ``(1, n, 3)`` float32 tensor ``pytorch3d.ops`` wants.
+
+    The benchmark-side twin of ``tests.conversions.points_to_torch`` (the two suites do not import
+    each other). **Every** ``pytorch3d.ops`` entry point is batched with a leading minibatch axis,
+    so a single cloud goes in as ``x[None]`` and its answer comes out as ``result[0]``; a bare
+    ``(P, 3)`` handed to ``knn_points`` is silently read as ``(N=P, P1=3, D)`` and compares three
+    points at full speed, which would read as pytorch3d being 1 000x faster than it is. Keeping the
+    wrap in one place per suite is the point.
+
+    The upload is **not free and it is inside every row**: measured 0.35 ms for 35 947 points to
+    the host and 0.60 ms to ``cuda:0``, against a ``knn_points`` call of 2-3 ms at 20 000 points --
+    so it is a real share of a small row and negligible on a large one. State the share in the
+    group docstring, on the pymeshfix precedent.
+
+    Imported lazily (like ``meshio``, ``open3d``, ``pymeshlab``, ``pyvista``, ``meshlib`` and
+    ``pymeshfix`` above) so the ~4 s torch import is only paid by runs that include a pytorch3d
+    case.
+    """
+    import torch
+
+    return torch.as_tensor(
+        np.ascontiguousarray(points_np, dtype=np.float32), device=device
+    ).unsqueeze(0)
+
+
 def _vertices_wp(name: str, device: str) -> wp.array[wp.vec3]:
     """``wp.vec3`` (float32) vertex buffer on ``device``, cached per ``(name, device)``."""
     key = ("verts", name, device)
@@ -443,6 +554,34 @@ def _selected_sizes(config: pytest.Config) -> tuple[set[str], bool]:
     if unknown:
         raise pytest.UsageError(f"unknown --size categories: {sorted(unknown)}")
     return sizes, True
+
+
+@functools.cache
+def _pytorch3d_cuda_available() -> bool:
+    """
+    Whether the installed pytorch3d has a **working** CUDA extension, by running one kernel.
+
+    ``torch.cuda.is_available()`` is the wrong probe and this is not a hypothetical: a
+    ``pipablepytorch3d`` wheel whose arch list stopped at ``sm_90`` returned ``True`` on this
+    RTX 5090 and then failed every kernel with *"no kernel image is available"*. The other failure
+    mode is a build that compiled the CPU extension only -- selected silently whenever
+    ``setup.py`` finds no ``CUDA_HOME``, which is the normal state of a stock CI runner -- and it
+    raises ``RuntimeError: Not compiled with GPU support.`` on a CUDA tensor. Both would otherwise
+    turn a whole benchmark file's ``pytorch3d-cuda`` rows into errors, so the row is gated on the
+    only probe that distinguishes them: launch a two-point ``knn_points`` and see.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+    import pytorch3d.ops as p3d_ops
+
+    try:
+        points_t = torch.zeros(1, 2, 3, device="cuda:0")
+        p3d_ops.knn_points(points_t, points_t, K=1)
+    except RuntimeError:
+        return False
+    return True
 
 
 def _selected_libraries(config: pytest.Config) -> list[LibrarySpec]:
@@ -494,8 +633,10 @@ def _selected_libraries(config: pytest.Config) -> list[LibrarySpec]:
             continue
         if lib["id"] == "triwarp-cuda" and not (include_cuda and cuda_available):
             continue
-        # trimesh / igl / open3d / scipy / potpourri3d / pymeshlab / pyvista / meshlib baselines
-        # are always included.
+        if lib["id"] == "pytorch3d-cuda" and not _pytorch3d_cuda_available():
+            continue
+        # Every other baseline is always included: --device selects among triwarp's targets, and
+        # pytorch3d-cuda is gated on its own extension rather than on that flag.
         selected.append(lib)
     return selected
 
@@ -584,7 +725,7 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "benchlibs(*kinds): library kinds "
         "(triwarp/trimesh/igl/open3d/scipy/numpy/potpourri3d/pymeshlab/pyvista/meshlib/"
-        "pymeshfix) a "
+        "pymeshfix/pytorch3d) a "
         "benchmark supports.",
     )
     config.addinivalue_line(
@@ -670,13 +811,25 @@ class BenchLibrary:
 
     @property
     def kind(self) -> str:
-        """Library family: triwarp, trimesh, igl, open3d, scipy, numpy, potpourri3d or pymeshlab."""
+        """Library family: one of the ``kind`` values in ``LIBRARIES``."""
         return self.library["kind"]
 
     @property
     def device(self) -> str | None:
-        """Warp device for triwarp targets; ``None`` for CPU references."""
+        """Warp device for triwarp targets; ``None`` for CPU-only references."""
         return self.library["device"]
+
+    @property
+    def torch_device(self) -> str:
+        """
+        Torch device string for the ``pytorch3d`` rows: ``"cuda:0"`` or ``"cpu"``.
+
+        The two ``pytorch3d`` rows differ *only* here -- same call, same inputs, different
+        extension -- so a row reads this rather than branching on ``self.library["id"]``. Warp's
+        ``"cuda:0"`` spelling is a valid torch device string, so the ``LIBRARIES`` entry is
+        forwarded verbatim.
+        """
+        return self.device or "cpu"
 
     def run(
         self,
@@ -704,13 +857,24 @@ class BenchLibrary:
         in 0.30 ms against a 0.22 ms ``expandVoxelsMask`` on ``bunny``, so folding the load in would
         report the load. ``pedantic`` runs ``setup`` before every round including the warmup, and
         forbids it above ``iterations=1`` -- which is what every row here already uses.
+
+        **The sync is per-library, not per-device.** ``wp.synchronize_device`` synchronizes *Warp's*
+        stream and says nothing about torch's, so a ``pytorch3d-cuda`` row synchronized the Warp way
+        would time the launch and not the kernel -- the same class of error as section 8's
+        launch-device hazard, in that it does not raise and simply reports a number that is far too
+        good. That row therefore calls ``torch.cuda.synchronize()`` instead.
         """
         device = self.device
-        needs_sync = device is not None and device.startswith("cuda")
+        needs_cuda_sync = device is not None and device.startswith("cuda")
+        needs_torch_sync = needs_cuda_sync and self.kind == "pytorch3d"
 
         def target(*args: Any) -> Any:
             result = fn(*args)
-            if needs_sync:
+            if needs_torch_sync:
+                import torch
+
+                torch.cuda.synchronize()
+            elif needs_cuda_sync:
                 wp.synchronize_device(device)
             return result
 
@@ -805,6 +969,41 @@ class BenchCase(BenchLibrary):
         if self.mesh_name not in _pv_cache:
             _pv_cache[self.mesh_name] = _new_mesh_pv(self.mesh_name)
         return _pv_cache[self.mesh_name]
+
+    @property
+    def mesh_p3d(self) -> p3d_structures.Meshes:
+        """
+        Shared ``pytorch3d.structures.Meshes``, built once per ``(mesh, torch device)``.
+
+        Safe to share, and for a stronger reason than ``mesh_pv``: a ``Meshes`` is **immutable**
+        and every ``pytorch3d.ops`` / ``pytorch3d.loss`` entry point is pure, so there is no
+        freshness rule here at all -- the opposite end of the scale from ``new_meshset_pml``. What
+        it *does* have is a cache of its own derived quantities (``verts_packed``, ``edges_packed``,
+        ``faces_packed_to_edges_packed``, ``verts_normals_packed``), memoized on first request. So
+        a row must decide which side of that it wants to time: reading an accessor for the first
+        time inside the timed callable prices the derivation, and reading it again prices nothing.
+        Warm the accessor outside the callable where the row names an operation rather than a
+        derivation, and say which in the docstring.
+        """
+        key = (self.mesh_name, self.torch_device)
+        if key not in _p3d_cache:
+            _p3d_cache[key] = _new_mesh_p3d(*key)
+        return _p3d_cache[key]
+
+    @property
+    def cloud_p3d(self) -> Any:
+        """
+        The mesh's own vertices as a ``pytorch3d.structures.Pointclouds`` on this row's device.
+
+        The container the ``loss`` entry points take, where the ``ops`` ones take the bare batched
+        tensor ``points_torch_from_numpy`` builds. Not cached: it is one tensor wrap over an array
+        already on the device, and a row that wants it out of the timed region can hoist it itself.
+        """
+        import pytorch3d.structures as p3d_structures
+
+        return p3d_structures.Pointclouds(
+            points=[points_torch_from_numpy(self.vertices_np, self.torch_device)[0]]
+        )
 
     def new_meshset_pml(self) -> ml.MeshSet:
         """
