@@ -284,7 +284,7 @@ def query_bvh_box(
     Notes
     -----
     The test is **inclusive** on every face: a point exactly on a box face is inside it (measured on
-    Warp 1.16, both the lower and the upper face). A box with any ``upper < lower`` component
+    Warp 1.17, both the lower and the upper face). A box with any ``upper < lower`` component
     matches nothing, and that is not checked -- the check would cost a host readback per call
     (CLAUDE.md section 13) to reject a caller error whose answer is already empty.
 

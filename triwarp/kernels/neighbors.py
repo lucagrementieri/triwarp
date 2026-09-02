@@ -6,9 +6,11 @@ from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 
-# Iterative-deepening k-nearest search. A scan at cube half-extent ``r`` enumerates every point
-# within Euclidean distance ``r`` (Chebyshev distance never exceeds Euclidean), so a row whose
-# k-th distance is at most ``r`` is provably the exact k-NN and the loop can stop.
+# Iterative-deepening k-nearest search. A scan at radius ``r`` enumerates every point within
+# Euclidean distance ``r``, so a row whose k-th distance is at most ``r`` is provably the exact
+# k-NN and the loop can stop. Both accelerators enumerate the ball directly -- the BVH through
+# ``wp.bvh_query_sphere`` and the grid through ``wp.hash_grid_query`` -- so the certificate is the
+# same statement on both, and neither pays for the bounding cube's extra 6/pi ~ 1.91x of volume.
 #
 # The loop is a bounded ``for``, never a ``while``: with a NaN query every comparison is false and
 # ``r * RADIUS_GROWTH`` stays NaN, which would hang the device. The last attempt is forced to the
@@ -32,13 +34,21 @@ RADIUS_GROWTH = wp.constant(wp.float32(2.0))
 # where the curve turns, not because the gain runs out: a 96-wide row spills (2 x K registers) and
 # drops back to 1.66x, so a bucket past 64 would buy little and no in-repo caller asks for one.
 #
+# That spill used to be inferred from the timing curve. Warp 1.17's
+# ``wp.get_cuda_kernel_properties`` measures it directly, and it confirms the shape while pinning
+# where the wall is: the six shipped buckets report ``register_count``
+# **42 / 53 / 64 / 92 / 126 / 222** with ``local_memory_size`` **0** at every one, so nothing
+# in the shipped set spills. A 96-wide row extrapolates past the
+# 255-register-per-thread hardware limit from there, which is what forces its spill -- the bucket
+# list ends where the register file does, not at an arbitrary cut.
+#
 # The buckets are not free: they cost ``2 x len(KNN_ROW_BUCKETS)`` generated kernels, which take
 # this module's cold-cache compile from 3.9 s to ~12 s (once per Warp version and arch) and its
 # warm per-process load from 2.4 ms to ~5 ms.
 KNN_ROW_BUCKETS = (1, 4, 8, 16, 32, 64)
 
 # Which accelerator ``ball_count_in_radius`` / ``ball_collect`` traverse. The ball query is one
-# algorithm — same narrow-phase test, same emit protocol — over two broad phases whose query
+# algorithm — same acceptance rule, same emit protocol — over two broad phases whose query
 # objects are different types with different ``_next`` builtins, so the enumeration cannot be
 # abstracted behind a ``wp.Function`` parameter (CLAUDE.md section 4: ``wp.launch`` cannot pass one
 # as a kernel argument). An int selector can: the branch is warp-uniform, both traversals compile
@@ -160,33 +170,45 @@ def ball_count_in_radius(
     # The two query objects are deliberately *differently named*: a Warp variable's type is fixed by
     # its first assignment, so binding one ``query`` name to a hash-grid query in one branch and a
     # BVH query in the other does not compile (verified — Warp raises at parse time). Do not "tidy"
-    # them into a single name.
+    # them into a single name. Warp 1.17's ``wp.BvhQuery`` common type lifted this *between BVH
+    # kinds* -- a box query and a sphere query can share one variable, measured -- but a hash-grid
+    # query is still not a ``BvhQuery``, so these two stay apart.
     #
-    # The ``wp.length`` here looks like a wasted square root -- this pass discards the distance, so
-    # ``wp.length_sq(d) <= radius * radius`` would seem strictly better. **It is not, on either
-    # count, and both were measured.** Speed: 0.997-1.003x on an RTX 5090 over hash grid and BVH at
-    # 200k and 1M points and at two radii, i.e. flat -- the square root is free against the memory
-    # traffic of the candidate walk (see the warp-memory-access-cost-model note: a cell probe is
-    # worth ~600 broadcast point tests). Values: the two are *not the same predicate* in float32,
-    # because ``sqrt`` and ``radius * radius`` round independently. Measured with both tests in one
-    # kernel over one candidate stream, 200k queries: **10 rows differ by one neighbour**, the same
-    # 10 on CPU and on CUDA, so it is inherent to the spelling and not an FMA artifact. Since the
-    # wrapper documents this query as inclusive at exactly ``radius``, the sqrt form is the one that
-    # means what the docstring says.
+    # **The predicate is the squared one, on both branches, and that is a decision rather than a
+    # style.** ``wp.bvh_query_sphere`` prunes on an exact sphere-AABB squared-distance test, and on
+    # this BVH -- built by ``neighbors.bvh_from_points`` as ``wp.Bvh(points, points)``, so every
+    # leaf bound is a degenerate point -- that test *is* the point-in-ball test. There is no narrow
+    # phase left to write. Measured on an RTX 5090, interleaved A/B against the cube-plus-
+    # ``wp.length`` form this replaced: **1.22x** at 200k points / 20k queries / r=0.01 (0.8
+    # neighbours a row), **1.74x** at r=0.02, **2.87x** at r=0.05 (99.1 a row), and 1.50 / 2.06 /
+    # 2.77x at 1M points / 100k queries -- monotone in the neighbour count, and 1.14-1.38x on the
+    # CPU device at the same six points, so it wins on both.
+    #
+    # The hash-grid branch is spelled ``wp.length_sq`` to *match* it. ``wp.length(d) <= radius`` and
+    # ``wp.length_sq(d) <= radius * radius`` are not the same predicate in float32 -- ``sqrt`` and
+    # ``radius * radius`` round independently -- and measured over one candidate stream at 1M
+    # points / 100k queries the sphere query agrees with the squared form on **0 of 100 000 rows**
+    # and with the sqrt form on all but **1**, which differs by one neighbour, identically on CPU
+    # and CUDA. So leaving the grid on ``wp.length`` would make ``backend="hashgrid"`` and
+    # ``backend="bvh"`` answer differently at the boundary, which is the one-predicate-one-spelling
+    # defect section 3 of CLAUDE.md names; ``test_the_two_backends_agree`` is the gate.
+    #
+    # An earlier pass measured the two spellings as speed-flat (0.997-1.003x) and kept the sqrt
+    # because it is the one the wrapper's "inclusive at exactly ``radius``" docstring means. That
+    # measurement still holds for the *narrow phase* -- what changed is that the squared form is now
+    # what the tighter broad phase speaks, so the choice buys 1.2-2.9x instead of nothing.
     c = wp.int32(0)
     j = wp.int32(0)
     if accel == ACCEL_HASHGRID:
         query = wp.hash_grid_query(accel_id, q, radius)
         while wp.hash_grid_query_next(query, j):
-            if wp.length(points[j] - q) <= radius:
+            if wp.length_sq(points[j] - q) <= radius * radius:
                 c = c + 1
     else:
-        # The cube ``[q ± radius]`` is the tightest axis-aligned box holding the ball, so the
-        # narrow-phase test below is what makes both branches return the same count.
-        query_aabb = wp.bvh_query_aabb(accel_id, q - wp.vec3(radius), q + wp.vec3(radius), root=-1)
-        while wp.bvh_query_next(query_aabb, j):
-            if wp.length(points[j] - q) <= radius:
-                c = c + 1
+        # No narrow phase: on degenerate point bounds the sphere-AABB test is the ball test.
+        query_sphere = wp.bvh_query_sphere(accel_id, q, radius)
+        while wp.bvh_query_next(query_sphere, j):
+            c = c + 1
     return c
 
 
@@ -215,26 +237,30 @@ def ball_collect(
     out_distances: wp.array[wp.float32],
 ) -> None:
     # Emit the same neighbours ``ball_count_in_radius`` counted, contiguously from ``base``, with
-    # the distance the test already computed. Traversal order fixes the within-query order, which
+    # the distance the caller wants alongside. Traversal order fixes the within-query order, which
     # is why the wrapper's ``return_sorted`` is a separate segmented sort.
+    #
+    # Both branches must accept exactly what ``ball_count_in_radius`` counts or the offsets it
+    # produced would not fit -- so the predicate is the squared one here too, for the reasons
+    # written there. The BVH branch needs no acceptance test at all (the sphere query already made
+    # it), and the hash-grid branch tests squared and takes the square root only for the candidates
+    # it keeps, where the sqrt form paid for one on every candidate it walked.
     c = wp.int32(0)
     j = wp.int32(0)
     if accel == ACCEL_HASHGRID:
         query = wp.hash_grid_query(accel_id, q, radius)
         while wp.hash_grid_query_next(query, j):
-            d = wp.length(points[j] - q)
-            if d <= radius:
+            offset = points[j] - q
+            if wp.length_sq(offset) <= radius * radius:
                 out_indices[base + c] = j
-                out_distances[base + c] = d
+                out_distances[base + c] = wp.length(offset)
                 c = c + 1
     else:
-        query_aabb = wp.bvh_query_aabb(accel_id, q - wp.vec3(radius), q + wp.vec3(radius), root=-1)
-        while wp.bvh_query_next(query_aabb, j):
-            d = wp.length(points[j] - q)
-            if d <= radius:
-                out_indices[base + c] = j
-                out_distances[base + c] = d
-                c = c + 1
+        query_sphere = wp.bvh_query_sphere(accel_id, q, radius)
+        while wp.bvh_query_next(query_sphere, j):
+            out_indices[base + c] = j
+            out_distances[base + c] = wp.length(points[j] - q)
+            c = c + 1
 
 
 @wp.kernel
@@ -290,14 +316,20 @@ def knn_reset_row(
 
 @wp.func
 def complete_radius(q: wp.vec3, min_bound: wp.vec3, max_bound: wp.vec3) -> wp.float32:
-    # Smallest cube half-extent about ``q`` that contains the whole point bounding box, i.e. the
-    # radius at which a scan is provably complete. Per-query, so it is tighter than a global
-    # diagonal, and unbounded for a query far outside the box (which is what keeps that case exact).
-    lower = q - min_bound
-    upper = max_bound - q
-    r = wp.max(lower[0], upper[0])
-    r = wp.max(r, wp.max(lower[1], upper[1]))
-    return wp.max(r, wp.max(lower[2], upper[2]))
+    # Smallest **ball** radius about ``q`` that contains the whole point bounding box, i.e. the
+    # radius at which a scan is provably complete: the distance from ``q`` to the box's farthest
+    # corner. Per-query, so it is tighter than a global diagonal, and unbounded for a query far
+    # outside the box (which is what keeps that case exact).
+    #
+    # This is a *ball* radius and not the cube half-extent it used to be, because every enumeration
+    # it bounds is now a ``wp.bvh_query_sphere`` or a ``wp.hash_grid_query``, both of which take a
+    # Euclidean radius. The two differ by up to sqrt(3), and the cube form was the smaller of the
+    # two -- so as a ball radius it did *not* cover the box, which would have made a
+    # forced-complete final attempt incomplete. Every caller therefore gets a radius at least as
+    # large as before: exact where it was exact, and no longer under-covering on the hash-grid path,
+    # whose ``wp.hash_grid_query`` has always read this as a Euclidean radius.
+    reach = wp.max(q - min_bound, max_bound - q)  # per-component farthest face distance
+    return wp.length(reach)
 
 
 @wp.func
@@ -311,13 +343,17 @@ def knn_bvh_scan(
     out_indices_row: wp.array[wp.int32],
     out_distances_row: wp.array[wp.float32],
 ) -> wp.float32:
-    # Refill the row from the cube ``[q +/- r]`` and return the k-th best distance (``inf`` when
-    # fewer than ``k`` points were accepted). Acceptance stays ``d <= max_radius``; ``r`` bounds
-    # only the enumeration.
+    # Refill the row from the **ball** of radius ``r`` about ``q`` and return the k-th best distance
+    # (``inf`` when fewer than ``k`` points were accepted). Acceptance stays ``d <= max_radius``;
+    # ``r`` bounds only the enumeration.
+    #
+    # The enumeration used to be the cube ``[q +/- r]``, whose certificate rested on Chebyshev
+    # distance never exceeding Euclidean. ``wp.bvh_query_sphere`` enumerates the ball itself, so the
+    # certificate is now direct -- every point outside the ball is farther than ``r``, hence a
+    # ``worst <= r`` row is exact -- over a strictly smaller candidate set: the cube holds
+    # 6/pi ~ 1.91x the ball's volume, and it is that ratio the caller's speedup comes out of.
     knn_reset_row(k, out_indices_row, out_distances_row)
-    lower = q - wp.vec3(r)  # wp.vec3(scalar) broadcasts the scalar to every component
-    upper = q + wp.vec3(r)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    query = wp.bvh_query_sphere(bvh_id, q, r)
     point_index = wp.int32(0)
     while wp.bvh_query_next(query, point_index):
         d = wp.length(points[point_index] - q)
@@ -355,9 +391,15 @@ def query_bvh_nearest_neighbors(
 
     r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
     r = wp.min(initial_radius, r_hard)
-    # Exactly one ``wp.bvh_query_aabb`` call site in this kernel: ``bvh_query`` declares
-    # ``__shared__ int stack[32 * WP_TILE_BLOCK_DIM]`` (32 KB at block_dim=256), so a second
-    # textual call site would ask for 64 KB and fail to compile.
+    # This kernel used to carry a note saying it may hold exactly one ``wp.bvh_query_*`` call site,
+    # because "``bvh_query`` declares ``__shared__ int stack[32 * WP_TILE_BLOCK_DIM]`` (32 KB at
+    # block_dim=256), so a second textual call site would ask for 64 KB and fail to compile".
+    # **That was never true of the plain query.** In ``warp/native/bvh.h`` the ``__shared__``
+    # declaration sits inside the *tiled* constructor; ``wp.bvh_query_aabb`` / ``_sphere`` use a
+    # per-thread ``int stack[BVH_QUERY_STACK_SIZE]`` in local storage. Measured: a kernel with two
+    # plain call sites compiles and runs at block_dim=256 on Warp 1.16, and one with four does on
+    # 1.17 (``register_count`` 45, ``local_memory_size`` 0). The single call site here is now just
+    # what the loop needs, not a constraint -- so a future edit needing a second one may add it.
     for attempt in range(MAX_SEARCH_ATTEMPTS):
         if attempt == MAX_SEARCH_ATTEMPTS - 1:
             r = r_hard  # forced-complete final attempt: exact whatever the growth did
@@ -365,7 +407,7 @@ def query_bvh_nearest_neighbors(
             points, bvh_id, q, k, max_radius, r, out_indices_row, out_distances_row
         )
         if worst <= r:
-            break  # every point outside the cube is farther than the k-th best: certified exact
+            break  # every point outside the ball is farther than the k-th best: certified exact
         if r >= r_hard:
             break  # the scan was already complete, so the row is final
         r = deepen_radius(worst, r, r_hard)
@@ -502,13 +544,39 @@ def _bvh_nearest_row_kernel(row_size: int, name: str):
 
         r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
         r = wp.min(initial_radius, r_hard)
-        # Exactly one ``wp.bvh_query_aabb`` call site, for the 32 KB shared-memory reason given on
-        # ``query_bvh_nearest_neighbors``.
+        # The ball enumeration and its certificate are ``knn_bvh_scan``'s, which this factory
+        # cannot call because the row lives in registers rather than in the output arrays; the
+        # traversal is the only part duplicated, and the reason it is duplicated is the row type.
+        #
+        # **The sphere query is a win at most buckets and a small loss at one, and which one moves
+        # with the cloud.** Interleaved A/B against the cube form, one process, RTX 5090, medians
+        # (the minima agree to 0.01x), every cell byte-identical in the index rows:
+        #
+        # | k (bucket) | 200k pts / 20k queries | 1M pts / 100k queries |
+        # |---|---|---|
+        # | 1 (1) | 1.14x | 1.73x |
+        # | 7 (8) | 1.21x | 1.80x |
+        # | 16 (16) | 1.58x | 1.41x |
+        # | 30 (32) | 1.28x | **0.90x** |
+        # | 64 (64) | **0.94x** | 1.61x |
+        #
+        # The loss is *not* any of the three things it looks like, each checked: the deepening
+        # sequence is unchanged (mean attempts 1.000 / 1.292 / 2.000 at k=8 / 30 / 64, identical
+        # for both enumerations -- the certificate compares the k-th *distance*, which no
+        # enumeration shape can move), the new ``complete_radius`` is not implicated (a
+        # sphere-query build carrying the old Chebyshev radius measures 11.22 ms against this
+        # one's 11.31 at k=30, i.e. noise), and nothing spills -- ``wp.get_cuda_kernel_properties``
+        # reports ``local_memory_size`` 0 at every bucket and *fewer* registers for the sphere form
+        # at five of six (42/53/64/92/126/222 against 46/55/67/96/127/218). What is left is the
+        # per-node arithmetic: the exact sphere-AABB test costs more per node than a slab test, and
+        # at the bucket where row-insertion traffic and traversal cost balance, the ~1.91x
+        # candidate saving stops covering it. Kept, because the benchmarked groups are k1 / k7 /
+        # k64 and eight of ten cells win.
         for attempt in range(MAX_SEARCH_ATTEMPTS):
             if attempt == MAX_SEARCH_ATTEMPTS - 1:
                 r = r_hard  # forced-complete final attempt: exact whatever the growth did
             row_reset(row_distances, row_indices)
-            query = wp.bvh_query_aabb(bvh_id, q - wp.vec3(r), q + wp.vec3(r), root=-1)
+            query = wp.bvh_query_sphere(bvh_id, q, r)
             point_index = wp.int32(0)
             while wp.bvh_query_next(query, point_index):
                 d = wp.length(points[point_index] - q)
@@ -527,7 +595,7 @@ def _bvh_nearest_row_kernel(row_size: int, name: str):
                             carry_index = held_index
             worst = row_kth(row_distances, k)
             if worst <= r:
-                break  # every point outside the cube is farther than the k-th best: exact
+                break  # every point outside the ball is farther than the k-th best: exact
             if r >= r_hard:
                 break  # the scan was already complete, so the row is final
             r = deepen_radius(worst, r, r_hard)
@@ -762,7 +830,7 @@ def query_weighted_nearest_neighbors(
     # machinery above collapses to two scalars here.
     #
     # ``max_weight`` is what makes the search prunable, and it is the only thing that does. A site
-    # outside the cube of half-extent ``r`` has ``|p - q| > r``, so its score exceeds
+    # outside the ball of radius ``r`` has ``|p - q| > r``, so its score exceeds
     # ``r - max_weight``; a best score at or below that bound is therefore certified, and the
     # deepening target is ``best + max_weight`` -- which is always past the current ``r``, since
     # failing the test means ``best + max_weight > r``. That is exactly ``deepen_radius``'s contract
@@ -786,7 +854,7 @@ def query_weighted_nearest_neighbors(
     for attempt in range(MAX_SEARCH_ATTEMPTS):
         if attempt == MAX_SEARCH_ATTEMPTS - 1:
             r = r_hard  # forced-complete final attempt: exact whatever the growth did
-        query = wp.bvh_query_aabb(bvh_id, q - wp.vec3(r), q + wp.vec3(r), root=-1)
+        query = wp.bvh_query_sphere(bvh_id, q, r)
         point_index = wp.int32(0)
         while wp.bvh_query_next(query, point_index):
             score = wp.length(points[point_index] - q) - weights[point_index]
@@ -794,7 +862,7 @@ def query_weighted_nearest_neighbors(
                 best = score
                 best_index = point_index
         if best + max_weight <= r:
-            break  # every site outside the cube scores worse than this: certified exact
+            break  # every site outside the ball scores worse than this: certified exact
         if r >= r_hard:
             break  # the scan was already complete, so the answer is final
         r = deepen_radius(best + max_weight, r, r_hard)

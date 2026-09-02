@@ -674,7 +674,7 @@ def bfs(
         )
 
     # CUDA only: ``bfs_count_and_scan`` builds its tile with ``wp.tile``, which fills lane 0 alone
-    # on Warp 1.16's CPU backend. On CPU the level loop is skipped entirely and the serial kernel
+    # on Warp 1.17's CPU backend. On CPU the level loop is skipped entirely and the serial kernel
     # below walks from the seed — the same kernel the escape path already hands off to, so the
     # answer is identical rather than degraded, and one CPU core pointer-chasing is the faster
     # engine there anyway.

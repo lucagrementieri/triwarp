@@ -99,7 +99,7 @@ slices, then a second pass marks the extrema. Cost is ``n_points * n_directions`
 compute-bound case in the file. ``convex_subset`` is the mask plus a ``flatnonzero`` and a gather,
 so its delta over the mask is the compaction cost. (This sweep used to be a ``TILE_1D``-wide
 ``wp.tile_max`` / ``wp.tile_min`` block reduction. It is lane-free now because ``wp.launch_tiled``
-runs exactly one lane per block on Warp 1.16's CPU backend, which made every tiled formulation
+runs exactly one lane per block on Warp 1.17's CPU backend, which made every tiled formulation
 silently wrong there; the replacement also measured 1.0-2.7x *faster* on CUDA, the gap widening
 with ``n_points * n_directions``.) ``convex_superset_mask`` adds a second cost shape: after the same
 support sweep over an icosphere's directions, one pass tests every point against the

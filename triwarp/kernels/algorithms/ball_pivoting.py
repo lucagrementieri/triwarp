@@ -222,6 +222,25 @@ def ball_is_empty(
     # against 23.7 ms unsquared, but min-of-mins 19.7 against 17.0 -- the two orderings disagree, so
     # this is flat inside the run-to-run spread, matching the 0.997-1.003x the ``neighbors``
     # narrow-phase decline measured for the same swap. Face count 5 120 either way.
+    #
+    # **``wp.bvh_query_sphere`` (Warp 1.17) was built here and reverted: it is a 1.75x loss.** It
+    # looks like the ideal fit -- the point BVH's bounds are degenerate, so an exact sphere-AABB
+    # test at the shrunk radius *is* this predicate, with no narrow phase and no second radius,
+    # where the grid must query at ``radius`` and filter at ``threshold`` because a cell walk
+    # cannot express either radius exactly. It was also *correct*: the flat face buffer came back
+    # equal element for element on the gate below. It is simply slower. Measured on the same
+    # icosphere(4) cloud, one reconstruction per process, three alternating pairs -- **16.20 /
+    # 15.74 / 15.54 ms** (min) on the grid against **27.61 / 27.99 / 28.12** on the sphere query.
+    #
+    # The reason is that this is a *small-radius, well-centred* query, which is the hash grid's
+    # best case and not the BVH's: the grid was built with cell width ``radius``, so a probe here
+    # reaches 27 cells by address arithmetic and stops, while the BVH pays a ~11-level root descent
+    # per call and there are millions of calls. **Do not read the 2.4-8.9x that
+    # ``pivot_front_edges`` gets from ``wp.tile_bvh_query_aabb`` as transferring to here** (see the
+    # ``warp-hashgrid-no-per-cell-entry`` note): that win is a *block-cooperative* walk over a
+    # ``2 * radius`` reach with ~88 candidates to split across 32 lanes, and every part of that
+    # description is load-bearing. The ~1.91x candidate saving a ball enumeration does deliver is
+    # not worth a tree descent at this radius.
     threshold = radius - BALL_EPS * radius
     threshold_sq = threshold * threshold
     query = wp.hash_grid_query(grid_id, center, radius)

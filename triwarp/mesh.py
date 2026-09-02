@@ -408,7 +408,7 @@ class Trimesh:
         ------
         ValueError
             If the mesh has zero faces — building a ``warp.Mesh`` with an empty BVH silently
-            corrupts CUDA state through Warp 1.16.
+            corrupts CUDA state through Warp 1.17.
 
         See Also
         --------

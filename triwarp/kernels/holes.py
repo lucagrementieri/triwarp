@@ -430,7 +430,7 @@ def fill_dp_span_tiled(
     # **The stride is ``wp.block_dim()``, not ``HOLE_DP_BLOCK``, and that is what makes this kernel
     # portable.** They are the same number on CUDA, where the launch passes ``HOLE_DP_BLOCK`` as
     # ``block_dim``; they differ on the CPU device, where ``wp.launch_tiled`` runs exactly one lane
-    # per block through Warp 1.16 and ``wp.block_dim()`` reads 1. With the constant, lane 0 was the
+    # per block through Warp 1.17 and ``wp.block_dim()`` reads 1. With the constant, lane 0 was the
     # only lane running and it stepped by 32, so the DP minimized over every 32nd apex and returned
     # a valid-looking, equal-count, *wrong* triangulation -- measured on ``_star_tube``, 42 of 44
     # triangles differed from the serial engine. With the runtime value the single CPU lane strides
@@ -1022,7 +1022,7 @@ def directed_edge_opposites(
     #
     # The corners go into a ``wp.vec3i`` rather than staying the tuple ``corner_triple`` returns,
     # because ``k`` is a *runtime* index and a tuple cannot be subscripted by one in kernel scope.
-    # A vector can (verified on Warp 1.16), which is what keeps this off the flat-slice spelling
+    # A vector can (verified on Warp 1.17), which is what keeps this off the flat-slice spelling
     # ``faces[f * 3 : (f + 1) * 3]`` that the rest of the tree no longer uses: the rule is not "no
     # slices", it is "no slice where an index form exists", and here one does.
     f, q = wp.tid()

@@ -247,7 +247,7 @@ _MODULES_WITHOUT_KERNELS = frozenset({"constants", "io", "mesh", "typing"})
 # the number. Anything looser is unusable here -- this package writes measured ratios in the same
 # shape ("within 1.25x of best", "1.06 ms", "1.13x on CUDA at both sizes"), and a bare ``1.N`` token
 # matched 30 of them against 3 real claims when this check was first written. So a version claim
-# says "Warp 1.16", never "through 1.16" with the word three lines up.
+# says "Warp 1.17", never "through 1.17" with the word three lines up.
 _WARP_VERSION_CLAIM = re.compile(r"\bWarp\s+1\.(\d+)(?:\.(\d+))?\b")
 
 # Version claims that deliberately record history rather than describe the installed Warp. Keyed by
@@ -267,6 +267,75 @@ _WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
     ("benchmarks.test_creation", "1.15"): (
         "deliberate history: a measurement stamp on a recorded benchmark table, naming the Warp "
         "the numbers below it were taken on. Re-stamping without re-measuring would be a lie"
+    ),
+    # ---------------------------------------------------------------------------------------
+    # Added by the Warp 1.17 upgrade (``plans/warp_upgrade.md``). Every entry below is one of
+    # two things, and neither is a claim about the installed Warp:
+    #
+    # * a **measurement stamp** on a recorded table -- the ratios were taken on 1.16 and were
+    #   not re-run, so re-stamping them to 1.17 would assert a measurement nobody made. Re-run
+    #   the table and *then* re-stamp, or leave the entry;
+    # * genuine **history** -- the version in which a behaviour changed, which does not move
+    #   when the installed version does.
+    #
+    # The mechanism claims that sat beside these were re-probed on 1.17 and re-stamped: the
+    # CPU single-lane ``wp.launch_tiled`` (8.0 against 512.0 over 8 blocks of 64 ones,
+    # unchanged), the empty-``wp.Mesh`` CUDA corruption (10/10 throwaway subprocesses still
+    # abort), the ``radix_sort_pairs`` key-dtype set, a matrix's missing ``.shape`` in kernel
+    # scope, ``wp.Volume``'s zero-point raise and the inclusive BVH box test.
+    # ---------------------------------------------------------------------------------------
+    ("graph", "1.16"): (
+        "deliberate history: names the version that *fixed* the CPU heap corruption the 1.15 "
+        "entry above records, so the pair reads as a before and an after"
+    ),
+    ("holes", "1.16"): (
+        "measurement stamp: the persistent-block DP table (0.89x / 0.12x / 0.03x at B = 128 / "
+        "512 / 2048) was taken on 1.16 and not re-run"
+    ),
+    ("kernels.holes", "1.16"): (
+        "measurement stamp: the runtime-vs-constant stride A/B on a 400-vertex loop was taken "
+        "on 1.16 and not re-run"
+    ),
+    ("kernels.linalg", "1.16"): (
+        "measurement stamp: the import-cost numbers (0.24-0.29 s against 0.008-0.010 s) were "
+        "taken on 1.16 and not re-run"
+    ),
+    ("kernels.neighbors", "1.16"): (
+        "two of a kind: the insert-spelling table was measured on 1.16 and not re-run, and the "
+        "note refuting the 'one bvh_query call site per kernel' claim deliberately names 1.16 "
+        "as the version the two-call-site probe *also* passed on -- that A/B is the evidence "
+        "the constraint was never real, so the older version is the load-bearing half"
+    ),
+    ("kernels.points", "1.16"): (
+        "measurement stamp: the ``count = 1024`` capture-and-replay comparison was taken on "
+        "1.16 and not re-run"
+    ),
+    ("kernels.reduce", "1.16"): (
+        "measurement stamp: the 66-module-load rebuild measurement that motivates this file's "
+        "overload registration was taken on 1.16 and not re-run"
+    ),
+    ("kernels.visibility", "1.16"): (
+        "measurement stamp: the ``ambient_occlusion`` block-per-point table was taken on 1.16 "
+        "and not re-run"
+    ),
+    ("polyline", "1.16"): (
+        "measurement stamp: the serial-vs-doubling crossover table was taken on 1.16 and not re-run"
+    ),
+    ("reconstruction", "1.16"): (
+        "measurement stamp: the ``warp.fem`` deferral's import cost (1.49 s against 1.18 s) "
+        "was taken on 1.16 and not re-run"
+    ),
+    ("tests.test_reconstruction", "1.16"): (
+        "measurement stamp: the screened-Poisson CPU depth timings behind the ``slow_cpu`` "
+        "marker were taken on 1.16 and not re-run"
+    ),
+    ("tests.test_voxels", "1.16"): (
+        "deliberate history: names the version in which ``wp.Volume.allocate_by_voxels`` "
+        "gained its CPU path, which is why this module is not CUDA-only"
+    ),
+    ("benchmarks.test_creation", "1.16"): (
+        "measurement stamp, same as the 1.15 entry above: the parametric-surface table names "
+        "the Warp its numbers were taken on"
     ),
 }
 

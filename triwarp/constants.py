@@ -55,7 +55,7 @@ TILE_2D = 8
 # there is unobservable, while the 30 us it gives up at 14M is not.
 #
 # The CPU device pays for it, and the ratio is recorded here rather than left to be rediscovered:
-# ``wp.launch_tiled`` runs one lane per block there (through Warp 1.16), so folding 16 tiles means
+# ``wp.launch_tiled`` runs one lane per block there (through Warp 1.17), so folding 16 tiles means
 # 16x fewer blocks and correspondingly less parallelism -- measured **1.28x slower at 36k, 1.07x at
 # 438k, 1.02x at 14M**.
 # Accepted on the CUDA number per CLAUDE.md section 13: the loss is bounded, shrinks with size, and
@@ -69,7 +69,7 @@ TILES_PER_BLOCK_1D = 16
 #
 # **The stride's source is the rule, not the tile.** A lane-parallel body is correct on both devices
 # exactly when its stride is ``wp.block_dim()`` -- which reads 1 on the CPU device, where
-# ``wp.launch_tiled`` runs one lane per block through Warp 1.16, so that lane covers the whole
+# ``wp.launch_tiled`` runs one lane per block through Warp 1.17, so that lane covers the whole
 # sequence. Striding by a *kernel argument* instead is wrong on **both** devices, measured on one
 # 1 000-element sum: the CPU answer is short by exactly the stride (16.0 against 1 000.0 at
 # ``n_slices = 64``) and CUDA double-counts whenever ``n_slices != block_dim`` (3 616.0 at

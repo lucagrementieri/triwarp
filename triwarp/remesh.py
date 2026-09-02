@@ -1311,7 +1311,7 @@ class _DecimationBuffers:
     [`vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency],
     [`sort_and_argsort`][triwarp.array.sort_and_argsort], ``warp.utils.array_scan`` and the round
     loop's own nested ``wp.capture_while`` -- was measured to capture and replay correctly on
-    Warp 1.16 and is used unchanged.
+    Warp 1.17 and is used unchanged.
 
     Padding is carried by two sentinels rather than by a guard in every kernel: a **dummy vertex**
     at index ``n_vertices`` that every padded face corner and edge endpoint points at, and a

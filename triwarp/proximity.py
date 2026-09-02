@@ -257,7 +257,7 @@ def closest_point_on_edges(
     closest point lies within ``r``, so a best distance under ``r`` certifies the answer. The
     tempting shortcut -- one degenerate ``(a, b, b)`` triangle per edge, queried with
     ``wp.mesh_query_point_no_sign`` -- does **not** work: Warp's mesh BVH rejects a zero-area
-    triangle, measured as 64 misses out of 64 queries on both devices (Warp 1.16).
+    triangle, measured as 64 misses out of 64 queries on both devices (Warp 1.17).
 
     See Also
     --------

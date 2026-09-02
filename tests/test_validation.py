@@ -1362,7 +1362,7 @@ def test_empty_mesh(device: str) -> None:
 
 
 def test_is_self_intersecting_fewer_than_two_faces(device: str) -> None:
-    # A `warp.Mesh` with zero triangles corrupts CUDA state when its BVH is built (a Warp 1.16
+    # A `warp.Mesh` with zero triangles corrupts CUDA state when its BVH is built (a Warp 1.17
     # bug independent of triwarp), so this exercises the n_faces < 2 short-circuit with a
     # single-triangle mesh instead of a fully empty one.
     vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])

@@ -38,7 +38,7 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import cross2, sort3
 
 # Full turn in ``float64``; ``type(x)(TWO_PI_F64)`` narrows it to the caller's precision, and at
-# ``float32`` that is bit-identical to ``2 * wp.PI`` (verified on both devices, Warp 1.16).
+# ``float32`` that is bit-identical to ``2 * wp.PI`` (verified on both devices, Warp 1.17).
 TWO_PI_F64 = wp.constant(wp.float64(2.0 * math.pi))
 
 

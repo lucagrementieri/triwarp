@@ -361,7 +361,7 @@ def bfs_count_and_scan(
     # r's own adjacency, so block i needs no value from any other block — unlike the three global
     # barriers that force the rest of the level body apart (see ``bfs_scan_and_advance``). The tile
     # is built from the per-thread count with ``wp.tile``, which is why this kernel is
-    # **CUDA-only**: on Warp 1.16's CPU backend ``wp.tile(scalar)`` fills lane 0 and leaves the
+    # **CUDA-only**: on Warp 1.17's CPU backend ``wp.tile(scalar)`` fills lane 0 and leaves the
     # rest zero (verified: a 256-wide inclusive scan of ``[4, 3, 2, 1, 1]`` returns
     # ``[4, 0, 0, 0, 0]``). ``graph.bfs``
     # therefore runs its serial engine on CPU rather than this one; it does not degrade silently.

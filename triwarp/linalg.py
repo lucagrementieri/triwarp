@@ -51,7 +51,7 @@ preconditioner costing ``k`` mat-vecs per iteration cuts the iteration count by 
 ``sqrt(k)``, so total work scales as ``k / sqrt(k) = sqrt(k)`` — single-level preconditioning loses
 on this operator class, and only a multilevel method escapes it. IC(0) is the instructive case: its
 quality is real (2.1x to 4.2x fewer iterations under an exact apply), but Warp has no sparse
-triangular solve through Warp 1.16 — ``warp.sparse`` exposes only ``bsr_from_triplets`` and
+triangular solve through Warp 1.17 — ``warp.sparse`` exposes only ``bsr_from_triplets`` and
 ``warp.optim.linear`` only the Krylov methods and a diagonal preconditioner — and no substitute for
 one keeps the win. Scored in mat-vec equivalents against
 Jacobi at ``tol=1e-8``, on ``-L`` with one degree of freedom pinned:
@@ -2010,45 +2010,38 @@ def _multigrid_prune(matrix: wps.BsrMatrix[wp.float64]) -> wps.BsrMatrix[wp.floa
     extra entries, max 22). So the product's *pattern* is wider than the true one rather than
     its *count* over-reporting reserved space.
 
-    It has to be a rebuild rather than ``bsr_compress``, which is the API for exactly this and
-    **hard-faults**: compressing a ``bsr_mm`` result makes the *next* ``bsr_mm`` die with
-    ``CUDA error 700: an illegal memory access`` inside ``wp_free_device_async`` on Warp 1.16.0,
-    which is the signature reported as NVIDIA/warp#1769.
+    ``bsr_compress`` is the API for exactly this, and **on Warp 1.17 it is the implementation**. It
+    could not be before: compressing a ``bsr_mm`` result made the *next* ``bsr_mm`` die with
+    ``CUDA error 700: an illegal memory access`` inside ``wp_free_device_async``, the signature
+    reported as NVIDIA/warp#1769, so this function used to rebuild the matrix from its own CSR
+    through ``bsr_from_triplets(..., prune_numerical_zeros=True)`` instead.
 
-    !!! note "Re-probe both halves on the Warp 1.17 upgrade"
-        NVIDIA/warp#1769 (*CUDA ``bsr_compress(inplace=True)`` treats trailing capacity as active*)
-        is **closed upstream with milestone 1.17.0**, unreleased as of Warp 1.16.0. Two separate
-        things to check when it lands, because the fix addresses one of them at most:
+    Both halves of that were re-probed on the 1.17 upgrade, because the fix addresses one of them
+    at most:
 
-        - **The fault.** If ``bsr_compress`` survives a following ``bsr_mm``, this function may
-          collapse to one call. Note the issue is filed against ``inplace=True`` while the crash
-          here came from the *default* ``inplace=False``, so confirm the exact call before trusting
-          it -- and measure, because a rebuild is only 0.46 ms and ``bsr_compress`` was never timed
-          cleanly (it faulted downstream of every attempt).
-        - **The superset**, which is what makes a prune necessary at all and is a *different*
-          behaviour -- see the paragraph above. Nothing in that issue describes it.
+    - **The fault is gone.** A ``bsr_compress`` followed by another ``bsr_mm`` completes. The issue
+      is filed against ``inplace=True`` while the crash here came from the default
+      ``inplace=False``, so the default was the form re-probed.
+    - **The superset is not.** A ``PtAP`` product still measures 5 458 entries against scipy's true
+      2 488 (2.19x) with the extras exactly zero, so the prune is still part of the algorithm and
+      nothing in that issue describes this half.
 
-        The ceiling on the first is small: ``_multigrid_prune`` is **1.78 ms of the hierarchy's
-        15.42 ms** on ``bunny``. The setup's dominant terms are six ``bsr_mm`` calls (4.92 ms) and
-        the aggregation's launches (3.53), and 1.17 touches neither.
+    And it is faster, which the old note flagged as unmeasured because the fault landed downstream
+    of every attempt: on that product, ``float64``, 4 000 rows to 500 aggregates, 12 interleaved
+    reps -- **0.175 ms median / 0.166 min** for ``bsr_compress`` against **0.513 / 0.462** for the
+    triplet rebuild, both landing on exactly 2 488 entries with no explicit zero left. That is
+    ~2.9x on a step worth 1.78 ms of the hierarchy's 15.42 ms on ``bunny``, and it also drops a
+    launch and a ``segment_owner_labels`` pass.
+
+    !!! warning "``inplace=False`` does not mean the source is untouched"
+        Measured on 1.17: ``wps.bsr_compress(m)`` at the documented default returns **``m``
+        itself**, pruned in place -- ``result is m`` and ``result.values.ptr == m.values.ptr``, with
+        ``m.nnz_sync()`` going 5 458 to 2 488 across the call. It returns ``src`` unchanged when
+        there is nothing to prune, too. That is safe at both call sites here only because each
+        passes a freshly built temporary (``bsr_mm(...)`` / ``bsr_axpy(...)``) that nothing else
+        holds. **A caller that still needs the unpruned matrix must copy it first.**
     """
-    device = matrix.device
-    n_rows = int(matrix.nrow)
-    nnz = int(matrix.nnz_sync())
-    if nnz == 0:
-        return matrix
-    rows = wp.empty(nnz, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_array.segment_owner_labels, dim=n_rows, inputs=[matrix.offsets, rows], device=device
-    )
-    return wps.bsr_from_triplets(
-        n_rows,
-        int(matrix.ncol),
-        rows,
-        matrix.columns[:nnz],
-        matrix.values[:nnz],
-        prune_numerical_zeros=True,
-    )
+    return wps.bsr_compress(matrix, prune_numerical_zeros=True)
 
 
 def _multigrid_dense_inverse(matrix: wps.BsrMatrix[wp.float64]) -> wp.array | None:

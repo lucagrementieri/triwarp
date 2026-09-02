@@ -479,7 +479,7 @@ def _tiled_span(
     then alias or copy depending on the allocator. Requiring a common base restricts the fast path
     to callers already holding aliases of one allocation -- exactly the ``split`` round trip.
 
-    ``_ref`` is Warp's own back-reference from a slice to the array it keeps alive (Warp 1.16); it
+    ``_ref`` is Warp's own back-reference from a slice to the array it keeps alive (Warp 1.17); it
     is read through ``getattr`` and every conclusion drawn from it is re-checked against the public
     ``ptr`` / ``shape`` / ``strides`` / ``dtype`` / ``device``, so a release that drops the
     attribute loses the fast path rather than the correctness. ``None`` when the segments are not

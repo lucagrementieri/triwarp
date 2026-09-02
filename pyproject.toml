@@ -36,14 +36,16 @@ keywords = [
     "warp",
 ]
 
-# ``triwarp.voxels`` is the package's first hard 1.16 dependency: it needs CPU
-# ``wp.Volume.allocate_by_voxels`` (CUDA-only through 1.15) and ``Volume.get_active_stats``, which
-# is the only occupancy read that is correct on a rebuildable grid.
+# ``triwarp.neighbors`` and ``triwarp.proximity`` are the package's hard 1.17 dependencies: their
+# ball queries call ``wp.bvh_query_sphere``, which does not exist before it. ``triwarp.voxels`` was
+# the previous floor's reason and still holds -- it needs CPU ``wp.Volume.allocate_by_voxels``
+# (CUDA-only through 1.15) and ``Volume.get_active_stats``, the only occupancy read that is correct
+# on a rebuildable grid.
 #
 # ``numpy`` is core, not optional: 16 of the modules ``triwarp/__init__.py`` imports eagerly use it
 # for host-side metadata math. It adds nothing to an install, since ``warp-lang`` itself declares an
 # unconditional ``Requires-Dist: numpy`` and ``import warp`` loads it before triwarp gets a say.
-dependencies = ["warp-lang>=1.16", "numpy>=1.20"]
+dependencies = ["warp-lang>=1.17", "numpy>=1.20"]
 
 [project.urls]
 Documentation = "https://lucagrementieri.github.io/triwarp/"
@@ -75,17 +77,90 @@ test = [
     "networkx>=3.0",
     "numpy>=2.4.4",
     "open3d>=0.18",
+    # ``ninja`` is not optional: without it setuptools compiles pytorch3d's 36 .cpp + 31 .cu
+    # sources one at a time. Measured on this box -- 10 m 55 s serial and CPU-only, against
+    # **87 s** with ninja at MAX_JOBS=32 *including* the CUDA kernels.
+    "ninja>=1.11",
     "potpourri3d>=1.4",
     "pymeshfix>=0.18.1",
     "pymeshlab>=2023.12",
     "pytest>=9.0",
+    # Built from source (see ``[tool.uv.sources]``) rather than installed as a wheel: no pytorch3d
+    # wheel on PyPI supports Linux + a modern torch, and the one mirror that ships a prebuilt
+    # ``_C.so`` (``pipablepytorch3d``) links a torch 2.1-2.2 symbol, which in turn forces
+    # ``numpy<2`` and cannot target sm_120. The source build is CUDA-capable and keeps NumPy 2.
+    "pytorch3d",
     "pyvista>=0.48",
     "rtree>=0.12",
     "scipy>=1.17",
+    # pytorch3d's ``setup.py`` imports torch and needs setuptools, and it is built with
+    # ``no-build-isolation`` (below), so both have to be resolvable in the target environment.
+    "setuptools>=77",
     "shapely>=2.1.2",
+    # pytorch3d declares no torch dependency although its extension links against it, so the
+    # bound lives here, routed to the CUDA 12.8 index below. **The pin is exact on purpose.**
+    # pytorch3d's ``_C`` is a torch C++ extension, so it is ABI-bound to the torch it was compiled
+    # against, and uv keys its build cache on the git *commit* alone -- not on the build
+    # environment. Measured: a wheel built against 2.11.0+cu128 was silently reused against
+    # 2.10.0+cu128 and imports with ``undefined symbol: c10::cuda::CUDAStream::query() const``.
+    # An exact pin is what keeps that cache entry honest. When bumping it, force the rebuild:
+    # ``uv sync --all-groups --reinstall-package pytorch3d --no-cache``. 2.11.0 is the newest
+    # torch with a cu128 build; cu129/cu130 go further, but need a matching system toolkit.
+    "torch==2.11.0",
     "trimesh>=5.0.0rc1",
 ]
 
+
+# ---------------------------------------------------------------------------
+# uv: how pytorch3d and its torch get installed
+# ---------------------------------------------------------------------------
+#
+# pytorch3d has no usable Linux wheel, so it is compiled from the upstream tag. Three settings
+# make that reproducible, and all three are load-bearing:
+#
+# 1. ``[tool.uv.sources] pytorch3d`` tracks upstream ``main``. That is *not* a floating install:
+#    uv resolves the branch to a commit and records it in ``uv.lock``, so every ``uv sync`` builds
+#    the same code until someone runs ``uv lock --upgrade-package pytorch3d``. There is no released
+#    wheel worth using (see the note on the requirement above) and no PyPI release newer than
+#    0.7.9, so tracking main is how this stays current; the cost is that advancing the pin pays the
+#    87 s rebuild and lands untested upstream code, so advance it deliberately and re-run the
+#    parity suite when you do. ``reference/pytorch3d`` is gitignored and absent from a fresh clone,
+#    so a path source could not work in CI -- the git source is the only form that installs the
+#    same code everywhere.
+# 2. ``no-build-isolation-package`` is required because pytorch3d's ``setup.py`` imports torch at
+#    build time to find its headers and to pick the CUDA / CPU extension. That makes the install
+#    a two-step operation, because torch has to be present *before* pytorch3d is built:
+#
+#        uv sync --all-groups --no-install-package pytorch3d   # torch, ninja, setuptools
+#        uv sync --all-groups                                  # builds pytorch3d against them
+#
+#    uv caches the built wheel against the resolved commit, so the second step measures **1 s**
+#    on a warm cache -- cache ``~/.cache/uv`` in CI and the 87 s build is paid once.
+# 3. torch comes from the CUDA 12.8 index, not from PyPI. PyPI's default torch 2.11 is a cu130
+#    build, and torch's ``cpp_extension`` refuses to compile against a CUDA major it was not
+#    built with (measured: ``nvcc`` 12.8 against a cu130 torch aborts the build), so a
+#    PyPI-default torch silently costs the CUDA extension -- and with it the GPU-vs-GPU
+#    comparison the benchmarks exist for. cu128 also carries ``sm_120``, which the RTX 5090
+#    needs. On a box with a different toolkit, change the index to match its ``nvcc``.
+[tool.uv]
+# The ``warp-lang==1.16.0`` hold that used to sit here is **gone, deliberately**: this is the Warp
+# upgrade it was waiting for (``plans/warp_upgrade.md``). It existed because adding torch made uv
+# re-derive the whole graph and bump ``warp-lang`` 1.16.0 -> 1.17.0 as a side effect, and a Warp
+# minor is its own decision -- it invalidates every ``Warp 1.16`` claim in the tree, which
+# ``test_warp_version_claims_are_not_stale`` fails on by design. Those claims have now been
+# re-probed against 1.17 and re-stamped, and ``[project] dependencies`` carries ``>=1.17`` for a
+# reason of its own (``wp.bvh_query_sphere``, which 1.16 does not have), so a hold here would
+# contradict the floor rather than defer a decision.
+no-build-isolation-package = ["pytorch3d"]
+
+[[tool.uv.index]]
+explicit = true
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+
+[tool.uv.sources]
+pytorch3d = { git = "https://github.com/facebookresearch/pytorch3d.git", branch = "main" }
+torch = { index = "pytorch-cu128" }
 
 [tool.setuptools.packages.find]
 exclude = ["reference*"]
@@ -153,6 +228,9 @@ split-on-trailing-comma = false
 numpy = "np"
 open3d = "o3d"
 pyvista = "pv"
+"pytorch3d.loss" = "p3d_loss"
+"pytorch3d.ops" = "p3d_ops"
+"pytorch3d.structures" = "p3d_structures"
 trimesh = "tm"
 warp = "wp"
 

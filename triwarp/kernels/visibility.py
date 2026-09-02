@@ -226,7 +226,7 @@ def support_argmax_tiled(
     #
     # Lane-free because the threads partition the **outer** work -- the vertex cloud -- rather than
     # a sequence one block owns, so there is no `wp.block_dim()` to stride by; on the CPU device,
-    # where `wp.launch_tiled` runs one lane per block through Warp 1.16, that lane would cover
+    # where `wp.launch_tiled` runs one lane per block through Warp 1.17, that lane would cover
     # `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 3, and `obscurance` above for the
     # other side of the rule -- one block per point, striding by `wp.block_dim()`, `wp.tile_sum` on
     # both devices.

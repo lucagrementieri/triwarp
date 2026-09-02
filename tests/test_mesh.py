@@ -66,7 +66,7 @@ def test_from_warp_mesh_seeds_warp_mesh_cache(icosahedron: tuple[tm.Trimesh, wp.
 
 
 def test_warp_mesh_raises_for_empty_mesh(device: str) -> None:
-    # A warp.Mesh with zero triangles silently corrupts CUDA state (Warp 1.16); warp_mesh must
+    # A warp.Mesh with zero triangles silently corrupts CUDA state (Warp 1.17); warp_mesh must
     # raise instead of building one.
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)

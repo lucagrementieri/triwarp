@@ -27,7 +27,9 @@ def mesh_aabb_collect(
     face_idx = wp.int32(0)
     c = wp.int32(0)
     max_hits_i = max_hits
-    while wp.mesh_query_aabb_next(query, face_idx) and c < max_hits_i:
+    # ``wp.mesh_query_next`` is the canonical iterator from Warp 1.17 -- it advances an AABB query
+    # and a sphere query alike, and ``wp.mesh_query_aabb_next`` survives only as its alias.
+    while wp.mesh_query_next(query, face_idx) and c < max_hits_i:
         if write:
             out_indices[base + c] = face_idx
         c = c + 1
@@ -113,16 +115,28 @@ def closest_point_on_edges(
     out_edge: wp.array[wp.int32],
 ) -> None:
     # The wireframe counterpart of ``closest_point_on_mesh``, and the reason it is a hand-written
-    # traversal rather than a ``wp.mesh_query_point_no_sign`` over degenerate triangles: Warp's mesh
-    # BVH **rejects** a zero-area triangle outright. Measured on Warp 1.16, 200 segments as
+    # traversal rather than a ``wp.mesh_query_point_no_sign`` over degenerate triangles: that query
+    # **rejects** a zero-area triangle outright. Re-measured on Warp 1.17, 200 segments as
     # ``(a, b, b)`` triangles and 64 queries: ``result`` is false for 64 of 64 on both devices, so
     # that shortcut answers nothing at all rather than answering approximately.
     #
+    # 1.17's ``wp.mesh_query_sphere`` *does* handle them -- it falls back to a closest-point-on-
+    # longest-edge test, and the same probe finds a hit for 64 of 64 rows at r=0.3. It is still not
+    # the shortcut, for two reasons: it answers "which faces meet this ball", not "which point is
+    # nearest", so the deepening loop and the ``closest_point_on_segment`` narrow phase below both
+    # stay; and reaching it would mean carrying a ``wp.Mesh`` of degenerate triangles in place of
+    # the ``wp.Bvh`` over edge bounds, which is the same broad phase through a heavier object. What
+    # 1.17 did buy this kernel is the sphere query on the BVH it already has, below.
+    #
     # Iterative deepening, sharing ``complete_radius`` / ``deepen_radius`` with the k-NN kernels
-    # next door: a scan of the cube ``[q +/- r]`` enumerates every edge whose *closest point* is
-    # within ``r`` (that point is then inside the cube, so the edge's AABB overlaps it), which is
-    # what makes ``best <= r`` a proof of exactness rather than a heuristic. One
-    # ``wp.bvh_query_aabb`` call site, for the shared-stack reason the k-NN kernel records.
+    # next door: a scan of the **ball** of radius ``r`` about ``q`` enumerates every edge whose
+    # *closest point* is within ``r`` -- that point is then inside the ball, so the edge's AABB
+    # contains it and therefore overlaps the ball -- which is what makes ``best <= r`` a proof of
+    # exactness rather than a heuristic. The enumeration was the bounding cube until Warp 1.17
+    # supplied ``wp.bvh_query_sphere``; the proof above is the same either way, and the ball is
+    # 6/pi ~ 1.91x less volume to walk. Unlike the point BVH next door this still needs its narrow
+    # phase, because an edge's bounds are not degenerate -- a sphere may overlap the AABB of an
+    # edge whose closest point lies outside it.
     tid = wp.tid()
     q = queries[tid]
 
@@ -134,7 +148,7 @@ def closest_point_on_edges(
     for attempt in range(MAX_SEARCH_ATTEMPTS):
         if attempt == MAX_SEARCH_ATTEMPTS - 1:
             r = r_hard  # forced-complete final attempt: exact whatever the growth did
-        query = wp.bvh_query_aabb(bvh_id, q - wp.vec3(r), q + wp.vec3(r), root=-1)
+        query = wp.bvh_query_sphere(bvh_id, q, r)
         edge_index = wp.int32(0)
         while wp.bvh_query_next(query, edge_index):
             candidate = closest_point_on_segment(
@@ -147,7 +161,7 @@ def closest_point_on_edges(
                 best_edge = edge_index
                 best_point = candidate
         if best_distance <= r:
-            break  # every edge outside the cube is farther than the best: certified exact
+            break  # every edge outside the ball is farther than the best: certified exact
         if r >= r_hard:
             break  # the scan was already complete, so the answer is final
         r = deepen_radius(best_distance, r, r_hard)
@@ -324,7 +338,7 @@ def winding_number_tiled(
     #
     # Lane-free because the threads partition the **outer** work -- the face list -- rather than a
     # sequence one block owns, so there is no `wp.block_dim()` to stride by; on the CPU device,
-    # where `wp.launch_tiled` runs one lane per block through Warp 1.16, that lane would cover
+    # where `wp.launch_tiled` runs one lane per block through Warp 1.17, that lane would cover
     # `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 3, and
     # `face_to_mesh_distance_tiled` below for the other side of the rule.
     #
