@@ -933,13 +933,19 @@ def filter_taubin(
     would rebuild the identical matrix every pass and cost without doing anything. Only the
     geometry-dependent branch has anything to recompute.
 
-    **The cost is ~23x and it is stated rather than left to be discovered.** Measured on CUDA at
-    ``iterations=10``, one operator against ten: 0.485 -> 11.06 ms at 162 vertices (**22.8x**),
-    0.487 -> 10.95 at 10 242 (**22.5x**) and 0.544 -> 12.93 at 163 842 (**23.8x**). Both columns
-    are almost flat in the vertex count, which says what the cost *is*: ten sparse assemblies plus
-    ten float32 narrowings of the running float64 positions, all launch-bound rather than
+    **The cost is ~6x and it is stated rather than left to be discovered.** Measured on CUDA at
+    ``iterations=10``, one operator against ten: 0.852 -> 5.157 ms at 42 vertices (**6.1x**),
+    0.874 -> 5.267 at 2 562 (**6.0x**) and 1.072 -> 6.238 at 40 962 (**5.8x**). Both columns are
+    almost flat in the vertex count, which says what the cost *is*: ten sparse assemblies plus ten
+    float32 narrowings of the running float64 positions, all launch-bound rather than
     bandwidth-bound at these sizes. So the ratio is a fixed multiple and not a scaling problem, and
     the lever if it ever matters is fewer launches per assembly rather than a cheaper operator.
+
+    That ratio was **~23x** until the unique-edge derivation was hoisted out of the loop: the
+    connectivity never changes, so ``laplacian``'s ``edges`` keyword lets all ten passes share one
+    ``edges_unique`` call. Measured back to back across two trees, results bit-identical
+    (checksum equal to 7 digits): **2.13x** on ``bunny`` (10.963 -> 5.138 ms) and **2.58x** on
+    ``dragon`` (17.463 -> 6.779). What is left is the ten assemblies themselves.
 
     Section 13 was applied and this is the honest outcome rather than a default change: the keyword
     is opt-in, the default remains the fixed operator (trimesh's filter, and this group's oracle),
@@ -954,6 +960,12 @@ def filter_taubin(
         return wp.clone(vertices)
 
     operator = None if recompute else _resolved_operator(vertices, faces, laplacian_operator)
+    # The recompute path reassembles the operator every pass from *moved* positions, but over
+    # connectivity that never changes -- so the unique-edge set is derived once here rather than
+    # inside the loop. On the inverse-distance branch that derivation is up to 80 % of a
+    # ``laplacian`` call (``laplacian_entries``' ``edges`` note has the numbers), and it would
+    # otherwise be repaid once per iteration for an identical answer.
+    recompute_edges = tw.edges.edges_unique(faces, n_vertices=n)[0] if recompute and n > 0 else None
     positions = _as_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
@@ -967,7 +979,9 @@ def filter_taubin(
     )
     for index in range(iterations):
         pass_operator = (
-            tw.laplacian.laplacian(_as_vec3(positions), faces, equal_weight=False)
+            tw.laplacian.laplacian(
+                _as_vec3(positions), faces, equal_weight=False, edges=recompute_edges
+            )
             if operator is None
             else operator
         )

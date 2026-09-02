@@ -24,7 +24,7 @@ Flags
     else falls back to cpu — ``triwarp-cpu`` is not timed alongside cuda by default. Pass
     ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl`` /
     ``open3d`` / ``scipy`` / ``numpy`` / ``potpourri3d`` / ``pymeshlab`` / ``pyvista`` /
-    ``meshlib`` / ``pymeshfix`` / ``pytorch3d-cpu`` CPU baselines are always included, and
+    ``meshlib`` / ``pymeshfix`` CPU baselines are always included, and
     ``pytorch3d-cuda`` whenever the installed pytorch3d carries a working CUDA extension --
     ``pytorch3d`` is the one reference with GPU kernels of its own, so it is *not* selected by
     ``--device``, which chooses among triwarp's targets.
@@ -32,9 +32,9 @@ Flags
     Restrict meshes to these size categories (``small,medium,large,extralarge,huge``).
 ``--cpu-max-size=<category>``
     CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``, ``scipy``,
-    ``numpy``, ``potpourri3d``, ``pymeshlab``, ``pyvista``, ``meshlib``, ``pymeshfix``,
-    ``pytorch3d-cpu``) skip meshes
-    larger than this unless the size was named explicitly in ``--size``. Default ``large`` — so
+    ``numpy``, ``potpourri3d``, ``pymeshlab``, ``pyvista``, ``meshlib``, ``pymeshfix``) skip
+    meshes larger than this unless the size was named explicitly in ``--size``. Default ``large``
+    — so
     ``happy_buddha`` and ``lucy`` run GPU-only by default while
     ``bunny_decimated``/``bunny``/``dragon`` run on CPU.
 """
@@ -90,15 +90,29 @@ class LibrarySpec(TypedDict):
 
 def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> None:
     """
-    Skip the current case when its mesh is larger than ``largest`` in scan-registry order.
+    Skip the current case when its mesh is larger than ``largest``.
 
-    A no-op for the synthetic feature meshes: they are not on the size ladder, and every one of
-    them is deliberately sized to run everywhere it is used, so a cap written for the scan sweep
-    has nothing to say about them.
+    On the scan registry the comparison is registry order, which is triangle count. Off it -- the
+    synthetic feature meshes -- it is a **vertex-count** comparison against the cap's own count,
+    because a feature mesh is not on the size ladder and has no order to index.
+
+    That second branch used to be a silent ``return``, on the reasoning that "every feature mesh is
+    deliberately sized to run everywhere it is used, so a cap written for the scan sweep has nothing
+    to say about them". That was a claim about the *reference set*, not about the meshes, and it
+    expired when the first reference with a quadratic cost curve arrived: ``sphere_large``'s 163 842
+    points are sized to run everywhere that "everywhere" is linear or tree-accelerated, and
+    ``pytorch3d``'s brute-force ICP over them did not finish in 926 s. A cap is now honoured
+    wherever it is written.
     """
-    if bench_case.mesh_name not in MESHES_BY_NAME:
+    spec = ALL_MESHES_BY_NAME.get(bench_case.mesh_name)
+    cap_spec = ALL_MESHES_BY_NAME.get(largest)
+    if spec is None or cap_spec is None:
         return
-    if MESH_ORDER.index(bench_case.mesh_name) > MESH_ORDER.index(largest):
+    if bench_case.mesh_name in MESHES_BY_NAME and largest in MESHES_BY_NAME:
+        larger = MESH_ORDER.index(bench_case.mesh_name) > MESH_ORDER.index(largest)
+    else:
+        larger = spec["n_vertices"] > cap_spec["n_vertices"]
+    if larger:
         pytest.skip(reason or f"{bench_case.mesh_name} is larger than the {largest} cap")
 
 
@@ -209,25 +223,35 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 # **Half of that crossover is triwarp's, not pytorch3d's, and the row must not be read as a
 # statement about brute force.** pytorch3d is a clean quadratic (0.63, 2.26, 5.59, 20.18, 73.82 ms
 # at 5 k / 20 k / 50 k / 100 k / 200 k); triwarp's ``query_nearest`` is **non-monotonic** over the
-# same sweep -- 0.82, 3.25, 7.38, **0.46**, 0.75 ms -- a 16x *drop* between 50 k and 100 k on the
-# same box, same box extent, and identical to three digits between the ``bvh`` and ``hashgrid``
-# backends (0.82/0.82, 3.25/3.25, 7.38/7.18), so the cost is in a stage the two share rather than
-# in either structure. That is the search-radius heuristic, and it is an open finding rather than
-# a property of the algorithm: see memory ``hashgrid-nearest-radius-is-cubic``. Until it is fixed,
-# the honest reading of the 20 000-point rows is "triwarp is 10x off its own 100 000-point cost
-# here", not "pytorch3d is faster".
+# same sweep at ``k = 8`` -- 0.837, 3.262, 7.567, **0.472**, 0.801 ms -- a 16x *drop* between 50 k
+# and 100 k on the same box and extent. So the honest reading of the 20 000-point row is "triwarp is
+# 7x off its own 100 000-point cost here", not "pytorch3d is faster".
 #
-# The ``-cpu`` row keeps pytorch3d comparable with the other ten baselines, and it is a *threaded*
-# one (``torch.get_num_threads()`` is 24 here), so it belongs with ``meshlib`` rather than with
-# trimesh / igl / pyvista / pymeshfix. But it is a reference implementation and not a tuned one:
-# the same absence of a spatial index costs it Θ(N²), measured rather than assumed -- ``knn_points``
-# 299.8 / 1 189.5 / 4 562.8 ms at 10 k / 20 k / 40 k points and ``chamfer_distance`` 557.8 /
-# 2 319.1 / 9 077.1 ms, i.e. 3.84-4.16x per doubling against the 4x a quadratic predicts.
-# Extrapolating that fit: ``bunny`` at 34 834 vertices is **~3.5 s per knn round and ~6.9 s per
-# chamfer round**, and ``dragon`` at ~435 k would be **~9 minutes per round**. So the
-# ``pytorch3d-cpu`` neighbour and chamfer rows are capped at a feature mesh, never a scan mesh --
-# ``--benchmark-json`` is written at session end, so a timeout there costs the whole file's rows.
-# The ``pytorch3d-cuda`` rows have no such problem and run the scan meshes.
+# Two qualifications, both from re-running that sweep **interleaved across size and backend in one
+# pre-warmed process** rather than sequentially, and both of which the earlier reading had wrong:
+# it is a ``k >= 8`` effect and **does not exist at k = 1** (0.229, 0.236, 0.249, 0.269, 0.346 ms,
+# flatly monotonic -- so it must not be read onto the ``*_k1`` rows); and it is **hash-grid
+# specific** rather than "a stage the two structures share", because the ``bvh`` backend is
+# monotonic over the identical sweep (0.695, 0.774, 0.854, 1.368, 2.023) and therefore beats the
+# grid 1.2x / 4.2x / 8.9x at 5 k / 20 k / 50 k before losing 2.9x / 2.5x at 100 k / 200 k.
+#
+# The located mechanism: the grid's cell width *is* ``initial_radius``, and a row whose true k-th
+# distance runs past ``_knn_widest_grid_radius(cell, n)`` abandons the walk for an exact linear scan
+# of the cloud -- 50 000**2 tests in 7.567 ms is 3.3e11 tests/s, a scan and not a search. See memory
+# ``hashgrid-nearest-radius-is-cubic``, and ``benchmarks/README.md`` for the full correction.
+#
+# **There is deliberately no ``pytorch3d-cpu`` row.** pytorch3d is registered for its CUDA kernels
+# -- it is the suite's one GPU-against-GPU comparison -- and its host path is a reference
+# implementation rather than a tuned one, so a ``-cpu`` row measures the same missing spatial index
+# at Θ(N²) and adds nothing the other eleven CPU baselines do not already say better. The cost of
+# keeping it was measured rather than assumed: ``knn_points`` 299.8 / 1 189.5 / 4 562.8 ms at 10 k /
+# 20 k / 40 k points and ``chamfer_distance`` 557.8 / 2 319.1 / 9 077.1 ms -- 3.84-4.16x per
+# doubling against the 4x a quadratic predicts, which extrapolates to ~3.5 s per ``knn`` round on
+# ``bunny`` and ~9 minutes per round on ``dragon``. Two of those rows ran unbounded in round 9 and
+# cost 1 h 43 min of wall clock plus two whole modules' JSON, because ``--benchmark-json`` is
+# written at session end. So pytorch3d contributes its ``-cuda`` row or no row at all, and where the
+# CUDA extension is missing the reference is simply absent -- ``_pytorch3d_cuda_available`` gates
+# it, and nothing falls back to the host.
 #
 # Two things every pytorch3d row has to do. **Synchronize torch's stream** -- ``BenchCase.run``
 # does it on the ``pytorch3d`` kind, because ``wp.synchronize_device`` synchronizes *Warp's* stream
@@ -249,7 +273,6 @@ LIBRARIES: list[LibrarySpec] = [
     {"id": "pyvista", "kind": "pyvista", "device": None, "cpu_bound": True},
     {"id": "meshlib", "kind": "meshlib", "device": None, "cpu_bound": True},
     {"id": "pymeshfix", "kind": "pymeshfix", "device": None, "cpu_bound": True},
-    {"id": "pytorch3d-cpu", "kind": "pytorch3d", "device": None, "cpu_bound": True},
     {"id": "pytorch3d-cuda", "kind": "pytorch3d", "device": "cuda:0", "cpu_bound": False},
 ]
 LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
@@ -822,12 +845,13 @@ class BenchLibrary:
     @property
     def torch_device(self) -> str:
         """
-        Torch device string for the ``pytorch3d`` rows: ``"cuda:0"`` or ``"cpu"``.
+        Torch device string for the ``pytorch3d`` row.
 
-        The two ``pytorch3d`` rows differ *only* here -- same call, same inputs, different
-        extension -- so a row reads this rather than branching on ``self.library["id"]``. Warp's
-        ``"cuda:0"`` spelling is a valid torch device string, so the ``LIBRARIES`` entry is
-        forwarded verbatim.
+        Always ``"cuda:0"`` in practice: pytorch3d is registered for its CUDA kernels alone (see
+        the ``LIBRARIES`` block) and ``_pytorch3d_cuda_available`` drops the reference entirely
+        where the extension is missing, so there is no host row to fall back to. Warp's
+        ``"cuda:0"`` spelling is a valid torch device string, so the entry is forwarded verbatim.
+        The ``or "cpu"`` is the harmless floor for a non-pytorch3d row that reads this.
         """
         return self.device or "cpu"
 
@@ -863,6 +887,20 @@ class BenchLibrary:
         would time the launch and not the kernel -- the same class of error as section 8's
         launch-device hazard, in that it does not raise and simply reports a number that is far too
         good. That row therefore calls ``torch.cuda.synchronize()`` instead.
+
+        **And a ``pytorch3d-cuda`` row releases torch's cached blocks when it finishes**, outside
+        the timed region. torch's ``CUDACachingAllocator`` reserves device memory and returns it
+        only on ``torch.cuda.empty_cache()``, so a large row leaves nothing for the Warp allocator
+        that runs next: measured, a 14 M-vertex sparse assembly in torch made Warp fail to allocate
+        **65 368 bytes** on a 32 GB device, and every ``triwarp-cuda`` row after it in that module
+        died with it -- 16 rows, exit 1, and because the failures were all triwarp's the surviving
+        cells *understated* the loss table. The release is per-row rather than per-module because
+        the two allocators interleave at row granularity.
+
+        This is the general guard and it turned out to be the *whole* fix: ``test_laplacian``'s
+        ``lucy`` pytorch3d rows were then measured **uncapped** with it in place and the module runs
+        107 passed / exit 0 with zero allocation failures, so the size cap that was going to
+        accompany this was dropped rather than shipped -- it would have cost four real comparisons.
         """
         device = self.device
         needs_cuda_sync = device is not None and device.startswith("cuda")
@@ -879,17 +917,28 @@ class BenchLibrary:
             return result
 
         if setup is None:
-            return self._benchmark.pedantic(
+            result = self._benchmark.pedantic(
                 target, rounds=rounds, warmup_rounds=_WARMUP_ROUNDS, iterations=1
             )
+        else:
 
-        def make_arguments() -> tuple[tuple[Any, ...], dict[str, Any]]:
-            """Hand ``pedantic`` this round's freshly-built input as ``fn``'s only argument."""
-            return (setup(),), {}
+            def make_arguments() -> tuple[tuple[Any, ...], dict[str, Any]]:
+                """Hand ``pedantic`` this round's freshly-built input as ``fn``'s only argument."""
+                return (setup(),), {}
 
-        return self._benchmark.pedantic(
-            target, setup=make_arguments, rounds=rounds, warmup_rounds=_WARMUP_ROUNDS, iterations=1
-        )
+            result = self._benchmark.pedantic(
+                target,
+                setup=make_arguments,
+                rounds=rounds,
+                warmup_rounds=_WARMUP_ROUNDS,
+                iterations=1,
+            )
+
+        if needs_torch_sync:
+            import torch
+
+            torch.cuda.empty_cache()
+        return result
 
 
 class BenchCase(BenchLibrary):

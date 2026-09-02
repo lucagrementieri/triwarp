@@ -101,6 +101,19 @@ def _edge_lengths_wp(bench_case: BenchCase) -> twt.Array2dFloat32:
     return _edge_lengths_wp_cache[key]
 
 
+# **These rows run on ``lucy`` and are deliberately not capped**, which is worth stating because
+# the obvious reading of round 9 says they should be. A ``lucy`` sparse assembly in torch is the
+# single largest device allocation this suite makes -- 14 027 872 vertices -- and torch's
+# ``CUDACachingAllocator`` reserves those blocks until an explicit ``empty_cache()``, which appeared
+# nowhere in ``benchmarks/``: the module exited 1 with ``RuntimeError: Failed to allocate 65368
+# bytes`` on a 32 GB card and **16 ``triwarp-cuda`` rows were lost**, all of them silently dropping
+# out of the comparison and *understating* the loss table.
+#
+# The fix is the general one, in ``BenchCase.run``'s pytorch3d teardown, and a cap here was measured
+# **unnecessary** rather than assumed: with the release in place and no cap at all, the module runs
+# 107 passed / exit 0 with zero allocation failures. So the cap was dropped again -- it would have
+# cost the four ``lucy`` comparisons for nothing. If a future pytorch3d row fails here it will be a
+# row whose own *peak* does not fit, which no teardown can help and which wants a cap on that row.
 def _packed_p3d(bench_case: BenchCase, *, edges: bool = False) -> tuple:
     """
     Return the ``(verts, faces)`` pair the ``ops`` assemblers take, or ``(verts, edges)``.
@@ -109,9 +122,43 @@ def _packed_p3d(bench_case: BenchCase, *, edges: bool = False) -> tuple:
     request, and ``edges_packed`` in particular is the unique-undirected-edge build that
     [`test_edges.py`](test_edges.py) times under ``edges_unique`` -- folding it into a Laplacian row
     would price two groups under one name and make the assembly look 2-3x its cost.
+
+    **That reasoning is right and it used to be applied to one side only**, which is what made the
+    edge-list groups the largest misreading in the suite. pytorch3d was handed ``edges_packed()``
+    here while triwarp derived its own edge set *inside* the timed call, so the row compared an
+    assembly against an assembly-plus-derivation -- and the derivation is the larger half, not a
+    detail: ``edges_unique`` measures 0.62 / 0.60 / 2.01 / 2.13 / **73.50 ms** on the five scan
+    meshes against a whole ``laplacian(equal_weight=False)`` call of 1.22 / 1.24 / 2.77 / 2.84 /
+    **92.10**, i.e. **80 %** of the ``lucy`` row. Read like for like, the reported 8.61x at
+    ``lucy`` is a **1.40x win** (10.697 + 118.507 against 92.101), and pytorch3d's own
+    ``edges_packed()`` costs 118.5 ms -- 11x its timed row, and 1.29x triwarp's entire call.
+
+    So the two edge-list groups now hand triwarp the same precomputed edges through
+    ``laplacian``'s ``edges`` keyword (``_edges_unique_wp``), and both rows price the assembly
+    alone. The derivation stays where it belongs, in ``edges_unique``'s own group.
     """
     mesh_p3d = bench_case.mesh_p3d
     return (mesh_p3d.verts_packed(), mesh_p3d.edges_packed() if edges else mesh_p3d.faces_packed())
+
+
+_edges_wp_cache: dict[tuple[str, str], twt.Array2dInt32] = {}
+
+
+def _edges_unique_wp(bench_case: BenchCase) -> twt.Array2dInt32:
+    """
+    Return the unique undirected edges, read outside the timed callable as pytorch3d's are.
+
+    ``edges_packed()`` is memoized on the ``Meshes`` and read outside the row; this is the same
+    quantity for the triwarp branch, so the two edge-list groups compare assembly against
+    assembly. See ``_packed_p3d`` for why priced-once-elsewhere is the right convention and why
+    applying it to one side only was worth ~89 ms of the round-9 loss table.
+    """
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _edges_wp_cache:
+        _edges_wp_cache[key] = tw.edges.edges_unique(
+            bench_case.faces_wp, n_vertices=bench_case.n_vertices
+        )[0]
+    return _edges_wp_cache[key]
 
 
 @pytest.mark.benchmark(group="cotmatrix_entries")
@@ -150,12 +197,33 @@ def test_cotmatrix(bench_case: BenchCase) -> None:
     """
     Assembled cotangent stiffness matrix: weight kernel plus the sparse build.
 
-    **pytorch3d**'s ``cot_laplacian`` is the fourth assembly here and the only one on the GPU. Two
-    conventions separate the answers and neither costs anything: its off-diagonal is **twice**
-    triwarp's half-cotangent table and its diagonal is identically **zero** where triwarp assembles
-    the row sum. So its row does slightly less -- no diagonal pass -- and it returns the lumped
-    mass reciprocal alongside, which is what ``mass_matrix``'s pytorch3d row times from the same
-    call. Read the two rows as one call priced twice rather than as two independent measurements.
+    **pytorch3d**'s ``cot_laplacian`` is the fourth assembly here and the only one on the GPU, and
+    its row is a **scope mismatch rather than a race** -- the same class as ``is_watertight``'s
+    cached ``isClosed`` and ``split``'s label-only ``getAllComponents``. It does not assemble a
+    matrix at all: it wraps ``3F`` entries as an *uncoalesced* ``sparse_coo_tensor`` and adds its
+    transpose, so the duplicate ``(i, j)`` pairs are never summed and no diagonal is ever written.
+    triwarp sorts, dedups and accumulates **12 triplets a face** into a CSR *with* its assembled
+    row sum.
+
+    Measured (min of 7 interleaved reps, RTX 5090), which is what settles it -- forcing the
+    reference to actually coalesce closes the whole gap:
+
+    | mesh | triwarp | pytorch3d | + ``.coalesce()`` |
+    |---|---|---|---|
+    | bunny_decimated | 0.526 ms | 0.514 (1.02x) | 0.589 -- **triwarp wins 1.12x** |
+    | dragon | 3.363 | 0.728 (**4.62x**) | 3.042 -- **1.11x**, parity |
+
+    And the structure confirms the mechanism rather than merely being consistent with it: on
+    ``dragon`` the uncoalesced tensor holds 5 228 484 entries (``6F``), coalescing it gives
+    2 618 512, and triwarp's ``nnz_sync()`` is 3 056 157 -- a difference of **437 645, exactly the
+    vertex count**, which is the diagonal pytorch3d has none of. Its coalesced diagonal measures
+    absmax **0**.
+
+    So the reported 3.66-5.13x is not headroom, and the prebuilt-sparsity-pattern rewrite it
+    invited (assemble into an ``edges_unique`` pattern instead of sorting triplets) is **declined
+    on this measurement** rather than left as an open item. It also returns the lumped mass
+    reciprocal alongside, which is what ``mass_matrix``'s pytorch3d row times from the same call:
+    read those two as one call priced twice rather than as two independent measurements.
     """
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "pytorch3d":
@@ -201,6 +269,12 @@ def test_laplacian_equal_weight(bench_case: BenchCase) -> None:
     here with GPU kernels. It takes the edge list rather than the faces, so ``edges_packed()`` is
     read outside the timed callable -- that derivation is what ``edges_unique`` times in
     [`test_edges.py`](test_edges.py), and folding it in would price two groups under one name.
+
+    This group needs no matching precomputation on the triwarp side, and the reason is worth
+    stating because it is *not* symmetry with the inverse-distance group: ``equal_weight=True``
+    takes the ``symmetric=False`` branch, whose triplets come straight off ``faces_to_edges`` --
+    it never calls ``edges_unique`` at all. That is also why ``[lucy]`` is 28.95 ms here against
+    92.10 in the inverse-distance group and **wins** its row.
     """
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "pytorch3d":
@@ -230,8 +304,15 @@ def test_laplacian_inverse_distance(bench_case: BenchCase) -> None:
 
     **pytorch3d**'s ``norm_laplacian`` is this operator before its row normalization -- same
     ``1 / (||vi - vj|| + 1e-12)`` weight, same literal ``eps`` -- so it does strictly less work
-    than triwarp's row by exactly one row-sum division, and the gap is the honest content of the
-    ratio. ``edges_packed()`` is read outside the timed callable, as in the uniform group.
+    than triwarp's row by exactly one row-sum division.
+
+    **The row-sum division is not what the ratio used to measure, though**, and saying it was is
+    what let an 8.61x stand for five rounds. This is the ``symmetric`` branch, so triwarp derived
+    the unique undirected edge set *inside* the timed call while pytorch3d was handed
+    ``edges_packed()`` outside it -- and that derivation is up to **80 %** of the call, two orders
+    of magnitude past a row-sum division. Both sides now take the same precomputed edges
+    (``_edges_unique_wp`` / ``_packed_p3d``, which carries the numbers), so the ratio is the
+    assembly and the division, which is what this sentence always claimed.
     """
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "pytorch3d":
@@ -241,7 +322,10 @@ def test_laplacian_inverse_distance(bench_case: BenchCase) -> None:
         return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-        matrix = bench_case.run(lambda: tw.laplacian.laplacian(vertices, faces, equal_weight=False))
+        edges = _edges_unique_wp(bench_case)
+        matrix = bench_case.run(
+            lambda: tw.laplacian.laplacian(vertices, faces, equal_weight=False, edges=edges)
+        )
         assert matrix.nrow == n_vertices
     else:
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np

@@ -511,6 +511,7 @@ def laplacian_entries(
     equal_weight: bool = True,
     symmetric: bool | None = None,
     dtype: type = wp.float32,
+    edges: twt.Array2dInt32 | None = None,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32], twt.Array1dFloat]:
     """
     Per-edge weight triplets for the 1-ring Laplacian, before assembly.
@@ -537,6 +538,17 @@ def laplacian_entries(
         Scalar type of the returned ``vals``: ``wp.float32`` (default) or ``wp.float64``. The
         assembly kernel casts the float32 edge weights to ``dtype`` so the matrix built from these
         triplets is native float32/float64.
+    edges
+        Optional precomputed ``(m, 2)`` unique undirected edges from
+        [`edges_unique`][triwarp.edges.edges_unique], used only by the ``symmetric`` branch --
+        which is the ``equal_weight=False`` default, so this is the keyword that matters for the
+        geometry-weighted operator. When ``None`` the edge set is derived here.
+
+        Worth passing whenever the caller already holds it, because the derivation dominates:
+        measured on the five scan meshes, ``edges_unique`` costs 0.62 / 0.60 / 2.01 / 2.13 /
+        **73.50 ms** against a whole ``laplacian(equal_weight=False)`` call of 1.22 / 1.24 / 2.77 /
+        2.84 / **92.10** -- so on the largest it is **80 % of the call**. Ignored by the directed
+        branch, which reads ``faces`` alone.
 
     Returns
     -------
@@ -548,6 +560,7 @@ def laplacian_entries(
     --------
     [`laplacian`][triwarp.laplacian.laplacian]
     [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]
+    [`edges_unique`][triwarp.edges.edges_unique]
     """
     if symmetric is None:
         symmetric = not equal_weight
@@ -568,7 +581,9 @@ def laplacian_entries(
         return rows, cols, vals
     # Both directed pairs of each unique undirected edge, matching trimesh's ``vertex_neighbors``
     # (every neighbor counted once).
-    unique_edges, _ = edges_unique(faces, n_vertices=int(vertices.shape[0]))
+    if edges is None:
+        edges, _ = edges_unique(faces, n_vertices=int(vertices.shape[0]))
+    unique_edges = edges
     m_unique = int(unique_edges.shape[0])
     rows, cols, vals = tw.array.triplet_buffers(2 * m_unique, dtype, device)
     if m_unique > 0:
@@ -587,6 +602,7 @@ def laplacian(
     equal_weight: bool = True,
     symmetric: bool | None = None,
     dtype: type = wp.float32,
+    edges: twt.Array2dInt32 | None = None,
 ) -> wps.BsrMatrix[wp.float32]:
     """
     Row-normalized 1-ring averaging operator (uniform / umbrella Laplacian).
@@ -616,6 +632,14 @@ def laplacian(
         Scalar block type of the assembled matrix: ``wp.float32`` (default) or ``wp.float64``. Use
         ``wp.float64`` when the operator feeds a linear-system solve; the matrix is built and
         row-normalized natively in the requested precision (single ``bsr_from_triplets``).
+    edges
+        Optional precomputed ``(m, 2)`` unique undirected edges, forwarded to
+        [`laplacian_entries`][triwarp.laplacian.laplacian_entries]. Read its note before skipping
+        this: on the ``symmetric`` branch (the ``equal_weight=False`` default) deriving the edge
+        set is up to **80 %** of this call, so a caller that already holds one -- or that assembles
+        the operator repeatedly over fixed connectivity, as
+        [`filter_taubin`][triwarp.smoothing.filter_taubin] does at ``recompute=True`` -- should
+        pass it. Ignored when the adjacency is directed.
 
     Returns
     -------
@@ -628,12 +652,13 @@ def laplacian(
     --------
     [`laplacian_entries`][triwarp.laplacian.laplacian_entries]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
+    [`edges_unique`][triwarp.edges.edges_unique]
     [`trimesh.smoothing.laplacian_calculation`][]
     """
     n_vertices = int(vertices.shape[0])
     device = vertices.device
     rows, cols, vals = laplacian_entries(
-        vertices, faces, equal_weight=equal_weight, symmetric=symmetric, dtype=dtype
+        vertices, faces, equal_weight=equal_weight, symmetric=symmetric, dtype=dtype, edges=edges
     )
     operator = wps.bsr_from_triplets(
         n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False

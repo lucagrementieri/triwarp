@@ -295,14 +295,11 @@ def _run_pytorch3d_knn(bench_case: BenchCase, k: int) -> None:
     evaluations. The upload is hoisted out (0.35-0.60 ms for 36 k points, against a 2-3 ms query at
     20 000), which matches what the triwarp branches do with their ``wp.array`` buffers.
 
-    The CPU row is capped: it is Theta(N x Q) with no pruning, measured 299.8 / 1 189.5 /
-    4 562.8 ms at 10 k / 20 k / 40 k self-queries, so ``dragon`` extrapolates to minutes per round
-    and ``--benchmark-json`` is written at session end.
+    There is no CPU row to cap: pytorch3d is registered for its CUDA kernels alone (see the
+    ``LIBRARIES`` block in [`conftest.py`](conftest.py)). Its host path is Theta(N x Q) with no
+    pruning -- measured 299.8 / 1 189.5 / 4 562.8 ms at 10 k / 20 k / 40 k self-queries -- which is
+    minutes per round at ``dragon`` and is why the row is absent rather than capped.
     """
-    if bench_case.torch_device == "cpu":
-        skip_larger_than(
-            bench_case, "bunny_decimated", "pytorch3d's CPU k-NN is brute force over every pair"
-        )
     queries_p3d = points_torch_from_numpy(_queries_np(bench_case), bench_case.torch_device)
     points_p3d = points_torch_from_numpy(bench_case.vertices_np, bench_case.torch_device)
     nearest_p3d = bench_case.run(lambda: p3d_ops.knn_points(queries_p3d, points_p3d, K=k))
@@ -318,10 +315,6 @@ def _run_pytorch3d_ball(bench_case: BenchCase, radius: float) -> None:
     It is asserted here rather than trusted, which is the section 13 rule about verifying values
     and not only timing.
     """
-    if bench_case.torch_device == "cpu":
-        skip_larger_than(
-            bench_case, "bunny_decimated", "pytorch3d's CPU ball query is brute force over pairs"
-        )
     queries_p3d = points_torch_from_numpy(_queries_np(bench_case), bench_case.torch_device)
     points_p3d = points_torch_from_numpy(bench_case.vertices_np, bench_case.torch_device)
     ball_p3d = bench_case.run(

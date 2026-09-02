@@ -40,17 +40,30 @@ contained in the exact accept set. open3d is the oracle for that group.
 
 What has no group, and why
 --------------------------
-``cells``, ``from_cells``, ``grid_transform``, ``cell_indices``, ``cell_centers``,
+``from_cells``, ``grid_transform``, ``cell_indices``, ``cell_centers``,
 ``occupancy_at_cells``, ``erode``, ``surface_voxels``, ``to_dense``, ``from_dense`` and
 ``to_field`` are each one launch over the voxel set with no allocation of their
 own, so a row would time the ~340 µs wrapper floor rather than the operation. Most are measured
 anyway through a group that calls them: ``fill_cavities`` and ``fill_orthographic`` both go through
-``to_dense`` / ``from_dense``, ``surface_voxels`` runs the same probe kernel as ``erode``, and
-``cells`` is on the critical path of every group below.
+``to_dense`` / ``from_dense``, and ``surface_voxels`` runs the same probe kernel as ``erode``.
+
+``cells`` was on that list and has been taken off it, because for ``order="sorted"`` the wrapper
+floor *is* the operation at every size measured -- 322 µs at 1e3 voxels and 380 µs at 4.4e5, a
+1.2x spread over a 440x input -- so "the row would time the floor" is a reason to keep the row
+rather than to drop it. That is what caught the two host readbacks the bound stage used to make.
 
 ``surface_voxels`` has no reference row either: ``trimesh.voxel.morphology.surface`` exists, but it
 is the ``erode`` complement on a dense array and would measure the same thing the ``dilate`` row
 already does.
+
+``closing`` and ``opening`` are ``dilate`` and ``erode`` composed in the two orders, so their rows
+would be the sum of two rows that already exist. ``union`` / ``intersection`` / ``difference`` and
+``revoxelize`` have no row for the reference half rather than the triwarp half: MeshLib answers the
+set algebra as a bitwise fold over a dense ``VoxelBitSet``, so a ratio against a sparse rebuild
+reports the fixture's density, and trimesh's ``ops.boolean_sparse`` needs the optional ``sparse``
+package, which is not a dependency here. ``revoxelize`` is one occupancy probe per new cell over a
+dense lattice that ``to_dense`` / ``from_dense`` already carry the cost of. All four declare the
+omission with ``pytest.mark.parity(..., benchmarked=False)`` in ``tests/test_voxels.py``.
 """
 
 from __future__ import annotations
@@ -254,6 +267,30 @@ def test_voxel_down_sample(bench_case: BenchCase, divisor: int) -> None:
     points = bench_case.vertices_wp
     pooled = bench_case.run(lambda: tw.voxels.voxel_down_sample(points, voxel_size))
     assert int(pooled.shape[0]) > 0
+
+
+@pytest.mark.benchmark(group="cells")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("order", ["grid", "sorted"])
+def test_cells(bench_case: BenchCase, order: str) -> None:
+    """
+    The two row orders of the same readout, so the pair prices the ordering and nothing else.
+
+    ``"grid"`` is the volume's own leaf-major order and is a slice of a buffer the volume already
+    holds -- no launch, no allocation. ``"sorted"`` adds a per-column ``minmax``, a key-packing
+    launch, a radix sort over the voxel count and a gather. The difference between the two rows is
+    therefore the whole cost of the ordering.
+
+    No reference row: open3d's ``get_voxels`` returns a Python list of ``Voxel`` objects, so a row
+    would time the object churn rather than the readout. This is the one group here whose axis is
+    not really the mesh -- both orders stay **host-bound at every voxel count measured** (322 to
+    380 us from 1e3 to 4.4e5 voxels), which is why the group exists at all: it is where a wrapper
+    -floor change shows up.
+    """
+    voxel_size = _voxel_size(bench_case, _MORPHOLOGY_DIVISOR)
+    grid = tw.voxels.voxelize_points(bench_case.vertices_wp, voxel_size)
+    rows = bench_case.run(lambda: tw.voxels.cells(grid, order=order))
+    assert int(rows.shape[1]) == 3
 
 
 # Query counts for the membership group. The grid is fixed, so this axis is purely "how does the

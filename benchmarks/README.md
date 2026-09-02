@@ -245,7 +245,7 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
 
 | flag | default | meaning |
 |---|---|---|
-| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if available, else cpu. The CPU references (trimesh / igl / open3d / scipy / numpy / potpourri3d / pymeshlab / pyvista / meshlib / pymeshfix / pytorch3d-cpu) always run, and so does `pytorch3d-cuda` whenever the installed pytorch3d has a working CUDA extension — this flag selects among *triwarp's* targets, not the references'. **`cpu`/`both` on a GPU box inflate the `triwarp-cpu` rows and warn** — use `benchmarks/devices.py`. Registered in the repo-root `conftest.py`, shared with `tests/`. |
+| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if available, else cpu. The CPU references (trimesh / igl / open3d / scipy / numpy / potpourri3d / pymeshlab / pyvista / meshlib / pymeshfix) always run, and so does `pytorch3d-cuda` whenever the installed pytorch3d has a working CUDA extension (pytorch3d has no host row at all) — this flag selects among *triwarp's* targets, not the references'. **`cpu`/`both` on a GPU box inflate the `triwarp-cpu` rows and warn** — use `benchmarks/devices.py`. Registered in the repo-root `conftest.py`, shared with `tests/`. |
 | `--size` | `all` | comma-separated size categories for the **scan** sweep (`small,medium,large,extralarge,huge`). Naming a size also lifts the CPU cap for it. Has no effect on axis-driven groups. |
 | `--cpu-max-size` | `large` | CPU-bound libraries (every reference, plus `triwarp-cpu`) skip scan meshes larger than this unless the size is named in `--size`. |
 
@@ -434,9 +434,9 @@ gets `noparity(..., oracle="pyvista")`. `meshlib` is the only **multi-threaded**
 `triwarp-cuda` vs `meshlib` ratio is a fair fight where the other CPU ratios are not; `pymeshfix` is
 the narrowest and deepest — nine bound algorithms, all repair — and every one of its rows prices its
 loader, which is why rows exist only where the operation is ≥ ~30 % of the round. `pytorch3d` is the
-only reference with **CUDA kernels of its own** and therefore the only one with two rows
-(`pytorch3d-cpu` / `pytorch3d-cuda`); see its section below for why its GPU ratio is a *crossover*
-rather than a bar, and why every one of its CUDA rows has to synchronize torch's stream.
+only reference with **CUDA kernels of its own**, and it is registered for those alone — one
+`pytorch3d-cuda` row and no host row; see its section below for why its GPU ratio is a *crossover*
+rather than a bar, and why every one of its rows has to synchronize torch's stream.
 
 #### Known coverage gaps
 
@@ -1083,9 +1083,9 @@ Where the reference is not algorithmically identical, the module docstring says 
 | `test_reduce` | `ops.utils.wmean` |
 | `test_array` | `ops.packed_to_padded` / `padded_to_packed` |
 
-**It is the only reference with CUDA kernels of its own, so it takes two rows** —
-`pytorch3d-cpu` beside the ten CPU baselines and `pytorch3d-cuda` as the suite's only
-GPU-against-GPU comparison. The `-cuda` row is gated on a probe rather than on
+**It is the only reference with CUDA kernels of its own, and it is registered for those alone** —
+a single `pytorch3d-cuda` row, the suite's only GPU-against-GPU comparison, and no host row at
+all (see below). That row is gated on a probe rather than on
 `torch.cuda.is_available()`, which is the wrong question: a build that compiled the CPU extension
 only (the normal state of a runner with no `CUDA_HOME`) reports CUDA available and then raises
 `RuntimeError: Not compiled with GPU support.` on every kernel, and a wheel whose arch list stops
@@ -1115,22 +1115,47 @@ land on.
 
 **Half of that swing is triwarp's, and the row must not be read as a statement about brute force.**
 pytorch3d is a clean quadratic over the sweep — 0.63, 2.26, 5.59, 20.18, 73.82 ms at 5 k / 20 k /
-50 k / 100 k / 200 k — while `query_nearest` is **non-monotonic**: 0.82, 3.25, 7.38, **0.46**,
-0.75 ms, a 16x *drop* between 50 k and 100 k on the same box and the same extent, and identical to
-three digits between the `bvh` and `hashgrid` backends (0.82/0.82, 3.25/3.25, 7.38/7.18). The cost
-is therefore in a stage the two structures share, which is the search-radius heuristic, and it is an
-open finding rather than a property of the algorithm. Until it is fixed the honest reading of the
-20 000-point rows is "triwarp is 10x off its own 100 000-point cost here".
+50 k / 100 k / 200 k — while `query_nearest` is **non-monotonic**: 0.837, 3.262, 7.567, **0.472**,
+0.801 ms, a **16x drop** between 50 k and 100 k on the same box and the same extent. So the honest
+reading of the 20 000-point row is "triwarp is 7x off its own 100 000-point cost here", not
+"pytorch3d is faster".
 
-**The `-cpu` row is a threaded reference implementation, not a tuned one.**
-`torch.get_num_threads()` is 24 here, so it belongs with `meshlib` rather than with trimesh / igl /
-pyvista / pymeshfix — but the same absence of a spatial index makes it Θ(N²), measured rather than
-assumed: `knn_points` 299.8 / 1 189.5 / 4 562.8 ms and `chamfer_distance` 557.8 / 2 319.1 /
-9 077.1 ms at 10 k / 20 k / 40 k self-queries, i.e. 3.84-4.16x per doubling against the 4x a
-quadratic predicts. Extrapolating that fit puts `bunny` at ~3.5 s per `knn` round and `dragon` at
-**~9 minutes per round**, so the `pytorch3d-cpu` neighbour and chamfer rows are capped at a feature
-mesh — `--benchmark-json` is written at session end, so a timeout there costs the whole file's rows.
-The `-cuda` rows have no such problem and run the scan meshes.
+Two things about that claim were wrong for a long time and are corrected here, both by re-running
+the sweep **interleaved across size and backend in one pre-warmed process** (§13's rule — the
+original was a sequential sweep, which is exactly the shape that manufactures this artifact, so it
+had to be re-measured before it could be trusted):
+
+- **It is a `k >= 8` effect and does not exist at `k = 1`.** At `k = 1` the same sweep is flatly
+  monotonic — 0.229, 0.236, 0.249, 0.269, 0.346 ms — and per query it *falls* 45.8 → 1.7 ns, which
+  is a warm cache filling up rather than anything pathological. The published figures were a `k = 8`
+  sweep (they reproduce it to ~3 %: 0.82/0.837, 3.25/3.262, 7.38/7.567, 0.46/0.472, 0.75/0.801) and
+  had been read onto the `k1` rows.
+- **It is hash-grid-specific, so it is not "a stage the two structures share".** The `bvh` backend
+  is monotonic over the identical sweep at `k = 8` — 0.695, 0.774, 0.854, 1.368, 2.023 ms — and
+  therefore **beats the hash grid by 1.2x / 4.2x / 8.9x** at 5 k / 20 k / 50 k before losing 2.9x /
+  2.5x at 100 k / 200 k. The earlier "identical to three digits between `bvh` and `hashgrid`
+  (0.82/0.82, 3.25/3.25, 7.38/7.18)" does not reproduce at all.
+
+What survives is the mechanism and it is now located rather than shared: the hash grid's cell width
+is `initial_radius`, and where a query's true `k`-th distance runs past
+`_knn_widest_grid_radius(cell, n)` that row abandons the walk for an **exact linear scan** of the
+whole cloud. 50 000² tests in 7.567 ms is 3.3e11 tests/s, which is that scan and not a search. The
+uniform-density estimate has no distribution behind it, so the *tail* of the true `k`-th distance is
+what trips the cutover, and how much of the cloud is in that tail is what moves between 50 k and
+100 k. `backend="bvh"` has no cell width and is the available workaround at moderate `k`;
+`query_nearest`'s own note documents the choice.
+
+**There is deliberately no `-cpu` row.** pytorch3d earns its seat on the CUDA kernels, and its
+host path is a reference implementation rather than a tuned one: threaded
+(`torch.get_num_threads()` is 24 here) but with the same absence of a spatial index, which makes
+it Θ(N²) — measured rather than assumed: `knn_points` 299.8 / 1 189.5 / 4 562.8 ms and
+`chamfer_distance` 557.8 / 2 319.1 / 9 077.1 ms at 10 k / 20 k / 40 k self-queries, 3.84-4.16x per
+doubling against the 4x a quadratic predicts. Extrapolating puts `bunny` at ~3.5 s per `knn` round
+and `dragon` at **~9 minutes per round**. Round 9 ran two such rows uncapped and lost 1 h 43 min of
+wall clock and two whole modules' JSON to them, because `--benchmark-json` is written at session
+end — and the eleven CPU baselines already say everything a quadratic host row would. So pytorch3d
+contributes its `-cuda` row or no row: where the extension is missing the reference is simply
+absent, with no host fallback.
 
 **Two structural facts shape almost every row.** `Meshes` and `Pointclouds` are **immutable** and
 every `ops.*` / `loss.*` entry point is pure, so one container serves many calls and there is no

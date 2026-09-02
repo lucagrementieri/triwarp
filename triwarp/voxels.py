@@ -41,16 +41,24 @@ one module" is what decided it, and
 cross-reference from the other side.
 
 !!! note "Recipes this module does not wrap"
-    - **Set algebra** (trimesh's ``boolean_sparse``): union is
-      ``from_cells(array.concatenate([cells(a), cells(b)]), s, o)`` -- the builder dedups;
-      intersection is ``cells(a)[occupancy_at_cells(b, cells(a))]``; difference negates the mask.
-    - **Closing and opening**: ``erode(dilate(g))`` and ``dilate(erode(g))``.
-    - **Revoxelize at another pitch**: ``voxelize_points(cell_centers(g), new_size)``.
     - **Implicit CSG**: [`grid_points`][triwarp.voxels.grid_points] →
       [`triwarp.proximity.signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh] per
       solid → ``wp.map(wp.min, ...)`` for a union →
-      [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes].
-    - **A full dense box**: ``from_dense(wp.full(shape, True), s, o)``.
+      [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes]. Wrapping it would put a
+      four-module pipeline behind one name and duplicate ``marching_cubes``'s own arguments; the
+      *voxel* answer to the same question is [`union`][triwarp.voxels.union] and its two siblings.
+    - **A full dense box**: ``from_dense(wp.full(shape, True), s, o)``, which is Open3D's
+      ``VoxelGrid.create_dense``. Two calls with no gotcha between them, and a wrapper would
+      allocate the identical dense lattice.
+
+    The set algebra, morphological closing and opening, and resampling that this note used to list
+    *are* wrapped now -- [`union`][triwarp.voxels.union],
+    [`intersection`][triwarp.voxels.intersection], [`difference`][triwarp.voxels.difference],
+    [`closing`][triwarp.voxels.closing], [`opening`][triwarp.voxels.opening] and
+    [`revoxelize`][triwarp.voxels.revoxelize]. Two of those recipes were wrong as written, which is
+    the argument against a recipe nothing runs:
+    [`triwarp.array.concatenate`][triwarp.array.concatenate] is rank-1 only and raises on a cell
+    array, and a boolean mask is not a Warp gather index.
 
 Notes
 -----
@@ -109,6 +117,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import interpolation as kernel_interpolation
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import voxels as kernel_voxels
@@ -533,18 +542,14 @@ def cells(grid: wp.Volume, *, order: Literal["grid", "sorted"] = "grid") -> twt.
     if order == "grid":
         return rows
 
-    # Shift only where a column actually goes negative, so a non-negative cell set keeps exactly
-    # the keys ``grouping.hash_indices_rows`` would produce and therefore exactly its order.
-    # One readback of three integers per bound: the shift and the radix are host-side kernel
-    # arguments, so they have to cross either way.
+    # The corner pair stays on the device: ``pack_cell_keys`` derives the per-axis shift and the
+    # radix from these two three-element buffers itself, so this whole stage is readback-free.
     lower, upper = tw.reduce.minmax(rows, axis=0)
-    base = [min(int(x), 0) for x in lower.numpy().tolist()]
-    radix = max(int(x) for x in upper.numpy().tolist()) - min(base) + 1
     keys = wp.empty(n_voxels, dtype=wp.uint64, device=grid.device)
     wp.launch(
         kernel_voxels.pack_cell_keys,
         dim=n_voxels,
-        inputs=[rows, wp.vec3i(*(int(x) for x in base)), wp.uint64(radix), keys],
+        inputs=[rows, lower, upper, keys],
         device=grid.device,
     )
     _sorted_keys, permutation = tw.array.sort_and_argsort(keys)
@@ -842,8 +847,8 @@ def occupancy_at_cells(grid: wp.Volume, cells: twt.Array2dInt32) -> wp.array[wp.
     Occupancy mask of a list of integer cells.
 
     The index-space form of [`occupancy_at_points`][triwarp.voxels.occupancy_at_points], and the
-    primitive the set-algebra recipes in this module's docstring are written in: intersection is
-    ``cells(a)[occupancy_at_cells(b, cells(a))]`` and difference negates the mask.
+    primitive the set algebra is built on: [`intersection`][triwarp.voxels.intersection] keeps the
+    voxels this mask accepts and [`difference`][triwarp.voxels.difference] keeps the rest.
 
     Parameters
     ----------
@@ -1179,6 +1184,252 @@ def grid_points(
     return lattice.reshape((dims[0] * dims[1] * dims[2],))
 
 
+def union(a: wp.Volume, b: wp.Volume) -> wp.Volume:
+    """
+    Cells occupied in either grid: ``a | b``.
+
+    trimesh's ``ops.boolean_sparse`` under ``numpy.logical_or``, and the cheapest of the three set
+    operations here -- the two cell arrays are concatenated and the builder collapses the overlap,
+    so there is no membership test and no unique pass to write.
+
+    Parameters
+    ----------
+    a
+        Index grid.
+    b
+        Index grid on the same lattice and device as ``a``.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid on ``a``'s device.
+
+    Raises
+    ------
+    ValueError
+        If the two grids differ in cell width or in origin.
+    TypeError
+        If either argument is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`intersection`][triwarp.voxels.intersection]
+    [`difference`][triwarp.voxels.difference]
+    [`from_cells`][triwarp.voxels.from_cells]
+
+    Notes
+    -----
+    A cell coordinate means nothing without a lattice, so the three set operations require one:
+    two grids share it only when they were built with the same ``voxel_size`` and ``origin``.
+    [`resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid] is what a caller resolves once and
+    passes to both builds; [`revoxelize`][triwarp.voxels.revoxelize] moves an existing grid onto
+    another lattice.
+    """
+    voxel_size, origin = _require_same_lattice(a, b, caller="union")
+    rows_a = cells(a)
+    rows_b = cells(b)
+    n_a = int(rows_a.shape[0])
+    n_b = int(rows_b.shape[0])
+    both = twt.empty_2d((n_a + n_b, 3), wp.int32, device=rows_a.device)
+    if n_a > 0:
+        wp.copy(both[:n_a], rows_a)
+    if n_b > 0:
+        wp.copy(both[n_a:], rows_b)
+    return from_cells(both, voxel_size, origin)
+
+
+def intersection(a: wp.Volume, b: wp.Volume) -> wp.Volume:
+    """
+    Cells occupied in both grids: ``a & b``.
+
+    trimesh's ``ops.boolean_sparse`` under ``numpy.logical_and``. One ``O(1)`` probe of ``b`` per
+    voxel of ``a`` -- no dense lattice is materialized, so the cost is set by the *smaller*
+    argument when it is passed first.
+
+    Parameters
+    ----------
+    a
+        Index grid; its voxels are the ones tested, so pass the smaller set here.
+    b
+        Index grid on the same lattice and device as ``a``.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid on ``a``'s device, empty when the two sets are disjoint.
+
+    Raises
+    ------
+    ValueError
+        If the two grids differ in cell width or in origin.
+    TypeError
+        If either argument is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`union`][triwarp.voxels.union]
+    [`difference`][triwarp.voxels.difference]
+    [`occupancy_at_cells`][triwarp.voxels.occupancy_at_cells]
+    """
+    voxel_size, origin = _require_same_lattice(a, b, caller="intersection")
+    return _select_cells(a, b, voxel_size, origin, present=True)
+
+
+def difference(a: wp.Volume, b: wp.Volume) -> wp.Volume:
+    """
+    Cells occupied in ``a`` and not in ``b``: ``a - b``.
+
+    trimesh's ``ops.boolean_sparse`` under ``numpy.logical_and`` of ``a`` with the complement of
+    ``b``, and [`intersection`][triwarp.voxels.intersection]'s pass with the membership mask
+    negated. Asymmetric: ``difference(a, b)`` and ``difference(b, a)`` are different sets.
+
+    Parameters
+    ----------
+    a
+        Index grid to keep voxels from.
+    b
+        Index grid on the same lattice and device as ``a``, whose voxels are removed.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid on ``a``'s device, empty when ``a`` is contained in ``b``.
+
+    Raises
+    ------
+    ValueError
+        If the two grids differ in cell width or in origin.
+    TypeError
+        If either argument is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`union`][triwarp.voxels.union]
+    [`intersection`][triwarp.voxels.intersection]
+    [`surface_voxels`][triwarp.voxels.surface_voxels]
+        The shell, which is this operation against the grid's own erosion.
+    """
+    voxel_size, origin = _require_same_lattice(a, b, caller="difference")
+    return _select_cells(a, b, voxel_size, origin, present=False)
+
+
+def revoxelize(
+    grid: wp.Volume, voxel_size: float, *, origin: wp.vec3 | None = None, max_cells: int = 1 << 28
+) -> wp.Volume:
+    """
+    Resample the occupied set onto a lattice of a different cell width.
+
+    trimesh's ``VoxelGrid.revoxelized``, which asks the same question the same way: a cell of the
+    new lattice is occupied when **its centre** falls in an occupied cell of the old one. That rule
+    is what makes the operation exact at an unchanged ``voxel_size`` and safe when refining, where
+    voxelizing the old cell *centres* would instead leave holes between them.
+
+    Parameters
+    ----------
+    grid
+        Index grid to resample.
+    voxel_size
+        Cell width of the result. Smaller refines, larger coarsens.
+    origin
+        World position of the lower corner of the new cell ``(0, 0, 0)``. Defaults to ``grid``'s
+        own origin, which is what makes a resample at an unchanged ``voxel_size`` land on the
+        *identical* lattice -- same cells, same numbering -- so the result composes with
+        [`union`][triwarp.voxels.union] and its siblings.
+    max_cells
+        Budget for the sampling lattice, which covers the occupied box and therefore grows as the
+        cube of ``1 / voxel_size``. Exceeding it raises rather than allocating.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid on ``grid``'s device.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` or ``max_cells`` is not positive, or the new lattice would exceed
+        ``max_cells`` cells.
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`voxelize_points`][triwarp.voxels.voxelize_points]
+    [`occupancy_at_points`][triwarp.voxels.occupancy_at_points]
+    [`union`][triwarp.voxels.union]
+        Set algebra, which needs both grids on one lattice -- this is how one gets there.
+
+    Notes
+    -----
+    Coarsening by centre sampling drops an old voxel whose cell contains no new centre, so it is
+    not the same as "any overlap": at ``2 * voxel_size`` a lone voxel survives only if a new centre
+    lands inside it. Take [`dilate`][triwarp.voxels.dilate] first when the result must contain the
+    input.
+
+    Only the occupied box is sampled, not the whole box between ``origin`` and the set, so a grid
+    whose voxels sit far from its own origin costs no more than a tight one. That is what the
+    ``origin_cell`` half of [`from_dense`][triwarp.voxels.from_dense] is for.
+
+    An **even integer** coarsening is the one ill-conditioned case: it places every new centre
+    exactly on a face of the old lattice, at ``origin + (2c + 1) * old_size``, so which of the two
+    neighbouring cells answers is decided by float32 rounding. Pass an ``origin`` displaced by a
+    fraction of a cell where that matters; odd and fractional factors sample strictly inside an old
+    cell and are exact.
+    """
+    old_size, old_origin = _require_index_grid(grid)
+    if voxel_size <= 0.0:
+        raise ValueError(f"revoxelize requires voxel_size > 0, got {voxel_size}")
+    if max_cells <= 0:
+        raise ValueError(f"max_cells must be positive, got {max_cells}")
+    if origin is None:
+        origin = old_origin
+    if _voxel_count(grid) == 0:
+        return _empty_grid(voxel_size, origin, grid.device)
+
+    # The occupied box in world coordinates, then the half-open cell range of the new lattice that
+    # covers it. Anchoring the *cells* rather than the origin is what keeps the sampling tight for
+    # a grid whose voxels sit far from its own origin.
+    lower_cell, extent = _cell_bounds(grid)
+    lower_world = [float(old_origin[axis]) + lower_cell[axis] * old_size for axis in range(3)]
+    upper_world = [lower_world[axis] + extent[axis] * old_size for axis in range(3)]
+    base_cell = tuple(
+        int(np.floor((lower_world[axis] - float(origin[axis])) / voxel_size)) for axis in range(3)
+    )
+    shape = tuple(
+        max(
+            1,
+            int(np.ceil((upper_world[axis] - float(origin[axis])) / voxel_size)) - base_cell[axis],
+        )
+        for axis in range(3)
+    )
+    total = shape[0] * shape[1] * shape[2]
+    if total > max_cells:
+        raise ValueError(
+            f"revoxelize would sample {total} cells, above max_cells={max_cells}: "
+            f"voxel_size={voxel_size:.6g} is too small for this grid (the count grows as its "
+            "reciprocal cubed)"
+        )
+    # The lattice is the new cell *centres* -- the sample positions trimesh's ``is_filled`` tests.
+    half = 0.5 * voxel_size
+    centers = grid_points(
+        shape,
+        bounds=(
+            wp.vec3(
+                *(float(origin[axis]) + base_cell[axis] * voxel_size + half for axis in range(3))
+            ),
+            wp.vec3(
+                *(
+                    float(origin[axis]) + (base_cell[axis] + shape[axis]) * voxel_size - half
+                    for axis in range(3)
+                )
+            ),
+        ),
+        device=grid.device,
+    )
+    occupancy = occupancy_at_points(grid, centers).reshape(shape)
+    return from_dense(twt.as_array3d(occupancy, wp.bool), voxel_size, origin, origin_cell=base_cell)
+
+
 def fill_cavities(grid: wp.Volume) -> wp.Volume:
     """
     Fill every enclosed cavity: an empty cell is kept empty only if it reaches the outside.
@@ -1343,12 +1594,14 @@ def dilate(
     See Also
     --------
     [`erode`][triwarp.voxels.erode]
+    [`closing`][triwarp.voxels.closing]
     [`surface_voxels`][triwarp.voxels.surface_voxels]
 
     Notes
     -----
-    Binary closing is ``erode(dilate(g))`` and opening ``dilate(erode(g))``; neither is wrapped,
-    since each is one line from two exported functions.
+    Binary closing is ``erode(dilate(g))`` and opening ``dilate(erode(g))``; both are wrapped, as
+    [`closing`][triwarp.voxels.closing] and [`opening`][triwarp.voxels.opening], because the order
+    is the whole operation and each name is the other one's mistake.
     """
     voxel_size, origin = _require_index_grid(grid)
     _check_iterations(connectivity, iterations)
@@ -1405,6 +1658,7 @@ def erode(
     See Also
     --------
     [`dilate`][triwarp.voxels.dilate]
+    [`opening`][triwarp.voxels.opening]
     [`surface_voxels`][triwarp.voxels.surface_voxels]
 
     Notes
@@ -1421,6 +1675,110 @@ def erode(
             return _empty_grid(voxel_size, origin, grid.device)
         grid = _grid_from_flagged_cells(grid, interior)
     return grid
+
+
+def closing(
+    grid: wp.Volume, *, connectivity: Literal[6, 18, 26] = 6, iterations: int = 1
+) -> wp.Volume:
+    """
+    Dilation followed by erosion: bridge gaps and cracks thinner than the structuring element.
+
+    trimesh's ``morphology.binary_closing`` (``scipy.ndimage.binary_closing``), and exactly
+    ``erode(dilate(grid))`` at the same settings. It is a name rather than a recipe because the
+    order is the whole operation and the wrong one is the *other* function here.
+
+    Parameters
+    ----------
+    grid
+        Index grid to close.
+    connectivity
+        Neighbourhood of the structuring element: ``6`` (the default), ``18`` or ``26``.
+    iterations
+        Cells of reach: the dilation runs ``iterations`` times and the erosion undoes exactly as
+        many, so the set's extent is unchanged and only gaps up to that width close.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid on ``grid``'s device, containing ``grid``.
+
+    Raises
+    ------
+    ValueError
+        If ``connectivity`` is not 6, 18 or 26, or ``iterations`` is negative.
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`opening`][triwarp.voxels.opening]
+    [`dilate`][triwarp.voxels.dilate]
+    [`erode`][triwarp.voxels.erode]
+    [`fill_cavities`][triwarp.voxels.fill_cavities]
+        The unbounded form: it closes an enclosed void of any size, where this one closes a gap of
+        at most ``iterations`` cells.
+
+    Notes
+    -----
+    Nothing is clipped here, which is the one way this differs from the dense reference: the
+    intermediate dilation grows onto whatever cells it needs, where ``scipy.ndimage``'s runs inside
+    the array it was handed and erodes a shell off every face of it unless the caller padded first.
+    """
+    return erode(
+        dilate(grid, connectivity=connectivity, iterations=iterations),
+        connectivity=connectivity,
+        iterations=iterations,
+    )
+
+
+def opening(
+    grid: wp.Volume, *, connectivity: Literal[6, 18, 26] = 6, iterations: int = 1
+) -> wp.Volume:
+    """
+    Erosion followed by dilation: drop specks and necks thinner than the structuring element.
+
+    ``scipy.ndimage.binary_opening``, and exactly ``dilate(erode(grid))`` at the same settings --
+    the dual of [`closing`][triwarp.voxels.closing], and the one that removes rather than adds.
+
+    Parameters
+    ----------
+    grid
+        Index grid to open.
+    connectivity
+        Neighbourhood of the structuring element: ``6`` (the default), ``18`` or ``26``.
+    iterations
+        Cells of reach: a feature that survives ``iterations`` erosions is restored, and one that
+        does not is gone.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid on ``grid``'s device, contained in ``grid``.
+
+    Raises
+    ------
+    ValueError
+        If ``connectivity`` is not 6, 18 or 26, or ``iterations`` is negative.
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`closing`][triwarp.voxels.closing]
+    [`erode`][triwarp.voxels.erode]
+    [`dilate`][triwarp.voxels.dilate]
+
+    Notes
+    -----
+    A component narrower than the element vanishes entirely rather than shrinking, which is what
+    makes this the speck filter of a noisy voxelization; the surviving components keep their
+    extent but lose their corners.
+    """
+    return dilate(
+        erode(grid, connectivity=connectivity, iterations=iterations),
+        connectivity=connectivity,
+        iterations=iterations,
+    )
 
 
 def surface_voxels(grid: wp.Volume, *, connectivity: Literal[6, 18, 26] = 6) -> wp.Volume:
@@ -1856,6 +2214,38 @@ def _require_index_grid(grid: wp.Volume) -> tuple[float, wp.vec3]:
     translation = grid.get_grid_info().translation
     origin = wp.vec3(*(float(translation[axis]) - 0.5 * voxel_size for axis in range(3)))
     return voxel_size, origin
+
+
+def _require_same_lattice(a: wp.Volume, b: wp.Volume, *, caller: str) -> tuple[float, wp.vec3]:
+    """Shared cell width and origin of two grids, or a ``ValueError`` naming both transforms."""
+    size_a, origin_a = _require_index_grid(a)
+    size_b, origin_b = _require_index_grid(b)
+    tolerance = 1e-4 * size_a
+    offset = max(abs(float(origin_a[axis]) - float(origin_b[axis])) for axis in range(3))
+    if abs(size_a - size_b) > tolerance or offset > tolerance:
+        raise ValueError(
+            f"{caller} needs both grids on one lattice, got voxel_size {size_a:.6g} and "
+            f"{size_b:.6g} at origins {tuple(float(x) for x in origin_a)} and "
+            f"{tuple(float(x) for x in origin_b)}; revoxelize one onto the other's lattice first"
+        )
+    return size_a, origin_a
+
+
+def _select_cells(
+    a: wp.Volume, b: wp.Volume, voxel_size: float, origin: wp.vec3, *, present: bool
+) -> wp.Volume:
+    """Voxels of ``a`` whose membership in ``b`` is ``present``: intersection, or difference."""
+    rows = cells(a)
+    n_cells = int(rows.shape[0])
+    if n_cells == 0:
+        return _empty_grid(voxel_size, origin, rows.device)
+    mask = occupancy_at_cells(b, rows)
+    if not present:
+        complement = wp.empty(n_cells, dtype=wp.bool, device=rows.device)
+        wp.map(kernel_array.mask_not, mask, out=complement)
+        mask = complement
+    keep = tw.array.flatnonzero(mask)
+    return from_cells(twt.as_array2d(tw.array.gather(rows, keep), wp.int32), voxel_size, origin)
 
 
 def _voxel_count(grid: wp.Volume) -> int:

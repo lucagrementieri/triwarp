@@ -265,6 +265,21 @@ def discrete_mean_curvature(
     )
 
     bvh = tw.neighbors.bvh_from_bounds(edge_lower, edge_upper)
+    # The broad phase is the **cube** ``[q +- radius]`` while the narrow phase below keeps only the
+    # edge length inside the *ball* of that radius, so every candidate the cube admits and the ball
+    # rejects is a wasted slot in the flat buffer and a wasted narrow-phase test. Measured rather
+    # than inferred from the 6/pi volume ratio, which overstates it: on ``icosphere(4)`` /
+    # ``icosphere(6)`` at radius scales 0.5 / 1.0 / 2.0 of the mean edge, **70.7-76.6 %** of
+    # candidates meet the ball, i.e. ~**29 %** waste and not the 48 % a volume argument predicts --
+    # the BVH holds edge *AABBs*, so a box near the cube's corner usually still overlaps the ball.
+    #
+    # ``wp.bvh_query_sphere`` (Warp 1.17) is the tighter broad phase and would remove that 29 %,
+    # which shows up mostly on the radius axis where the cost grows (1.795 -> 3.927 ms on
+    # ``icosphere(4)``, 1.977 -> 4.308 on ``icosphere(6)``). Not built: it needs a ball variant of
+    # ``query_bvh_aabb_with_offsets``' count and emit kernels, and that function's *name* says aabb,
+    # so a shape selector renames a public entry point and drags section 14's five move artifacts
+    # with it -- against ~1 ms of the loss table. Sized here so the next pass starts from the
+    # number rather than the volume ratio.
     candidate_edges, offsets = tw.neighbors.query_bvh_aabb_with_offsets(bvh, points, radius)
 
     mean_curvature = wp.zeros(n_points, dtype=wp.float32, device=device)

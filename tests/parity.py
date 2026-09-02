@@ -103,9 +103,9 @@ _LIBRARY_SUFFIXES: dict[str, frozenset[str]] = {
     "meshlib": frozenset({"_ml"}),
     "pymeshfix": frozenset({"_pmf"}),
     "moderngl": frozenset({"_gl"}),
-    # ``pytorch3d`` is the first reference here with GPU kernels of its own, which is why it takes
-    # two ``LIBRARIES`` rows (``pytorch3d-cpu`` / ``pytorch3d-cuda``) and one entry here: the
-    # library *kind* is what a marker names, and both rows compute the same answer.
+    # ``pytorch3d`` is the only reference here with GPU kernels of its own, and it is registered
+    # for those alone -- one ``LIBRARIES`` row (``pytorch3d-cuda``) and one entry here, since a
+    # marker names the library *kind* rather than a row.
     "pytorch3d": frozenset({"_p3d"}),
     # ``numpy`` has carried timed pairs since ``test_reduce.py`` landed and was missing from this
     # table the whole time, which meant every one of its claims skipped the check below -- the same

@@ -887,8 +887,18 @@ def query_nearest(
 
         ``"bvh"`` has no cell width to get wrong, so it is the one to reach for when the query scale
         is unknown, the cloud is non-uniform, or the queries sit outside it. Its own cost grows with
-        ``k`` faster than the grid's -- measured **7x** from ``k=1`` to ``k=30`` -- so at ``k=1`` on
-        a matched cloud the grid wins and at large ``k`` on an awkward one the tree does.
+        ``k`` faster than the grid's -- measured **7x** from ``k=1`` to ``k=30`` -- so at ``k=1``
+        the grid wins at every size measured (0.229 / 0.269 / 0.346 ms against the tree's
+        0.316 / 0.516 / 0.667 at 5 k / 100 k / 200 k self-queries).
+
+        **But at moderate ``k`` the tree wins on a perfectly uniform cloud too, which is not what
+        "an awkward one" suggests.** At ``k=8`` on a uniform self-query the grid is *non-monotonic*
+        -- 0.837, 3.262, 7.567, **0.472**, 0.801 ms at 5 k / 20 k / 50 k / 100 k / 200 k -- because
+        a row whose true ``k``-th distance runs past ``_knn_widest_grid_radius`` abandons it for
+        an exact linear scan of the cloud, and how much of the cloud sits in that tail moves with
+        ``n``. The tree is monotonic over the same sweep (0.695, 0.774, 0.854, 1.368, 2.023) and so
+        beats the grid **1.2x / 4.2x / 8.9x** at 5 k / 20 k / 50 k before losing 2.9x / 2.5x at
+        100 k / 200 k. Both answers are still exact; only the cost moves.
 
         Both are exact; this is a cost choice only. Reuse the structure across calls by passing it
         as ``accelerator`` when several queries share one cloud.

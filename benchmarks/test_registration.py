@@ -327,17 +327,15 @@ def test_icp_point_cloud(bench_case: BenchCase) -> None:
     not.
 
     **pytorch3d** is the fifth engine and the second GPU one, and its inner loop is the brute-force
-    ``knn_points`` -- no tree, no grid -- so on the CPU row it is quadratic in the cloud size per
-    iteration and is capped accordingly. ``estimate_scale=False`` matches triwarp's default;
+    ``knn_points`` -- no tree, no grid -- so its cost is quadratic in the cloud size per iteration
+    on either device, and only the CUDA row is registered (see ``LIBRARIES`` in
+    [`conftest.py`](conftest.py)); the host row was retired after it failed to finish a
+    ``sphere_large`` ICP in 926 s. ``estimate_scale=False`` matches triwarp's default;
     ``max_iterations`` is matched to the other rows, but note the *actual* count is each library's
     own convergence rule, so a row that converges early is reporting fewer iterations rather than a
     faster one -- which is the same caveat this group's rotation axis exists to expose.
     """
     if bench_case.kind == "pytorch3d":
-        if bench_case.torch_device == "cpu":
-            skip_larger_than(
-                bench_case, "bunny_decimated", "its per-iteration k-NN is brute force over pairs"
-            )
         source_p3d = points_torch_from_numpy(_source_np(bench_case)[0], bench_case.torch_device)
         target_p3d = points_torch_from_numpy(bench_case.vertices_np, bench_case.torch_device)
         solution_p3d = bench_case.run(

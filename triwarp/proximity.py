@@ -404,12 +404,42 @@ def mesh_to_mesh_distance(
     if n_faces_a == 0 or n_faces_b == 0:
         return math.inf, -1, -1
 
+    # One structure over B, shared by both phases. It is bound to a name for the whole call because
+    # the kernels read its BVH by id through ``wp.mesh_get_bvh``, and a collected ``wp.Mesh`` would
+    # leave them a dangling id.
+    require_nonempty_mesh(faces_b, "mesh_to_mesh_distance")
+    mesh_b = wp.Mesh(points=vertices_b, indices=faces_b)
+
     if upper_bound is None:
         # A vertex-to-surface distance is a distance between the surfaces, so its minimum bounds the
         # answer from above. One readback, and it is what lets the broad phase cull at all.
-        _points, distances, _faces = closest_point_on_mesh(vertices_b, faces_b, vertices_a)
+        _points, distances, _faces = closest_point_on_mesh(
+            vertices_b, faces_b, vertices_a, mesh=mesh_b
+        )
         upper_bound = float(tw.reduce.min(distances))
 
+    # The per-face AABBs stay: the kernel's box-gap prune reads them, so they are not merely the
+    # input to a build. What is gone is the **second** acceleration structure that used to be built
+    # over them -- ``bvh_from_bounds(lower, upper)`` -- next to the ``wp.Mesh`` the bound above
+    # already built and then discarded. The kernels now read that mesh's own BVH with
+    # ``wp.mesh_get_bvh`` (Warp 1.17).
+    #
+    # Measured at the benchmark's operating point (a disjoint copy at 1.2x the x-extent, which is
+    # ``_CLEARANCE_OFFSETS[0]``), the build alone was **9.2 % / 7.5 / 18.1** of the call on
+    # ``bunny_decimated`` / ``bunny`` / ``dragon`` -- a share that *grows* with the input. End to
+    # end, back to back across two trees at both clearances: **1.07x / 1.00, 1.01 / 1.05,
+    # 1.18 / 1.23** (near / far), with the returned distance **and both witness face indices
+    # bit-identical in all six cells**. The gain tracks the removed build, which answers the one
+    # open question here -- the mesh's BVH uses Warp's own leaf policy rather than ``leaf_size=4``,
+    # so the traversal could have regressed and eaten it; it did not, and ``dragon`` (where the
+    # build was the largest share) gained the most.
+    #
+    # Getting that share right needed the right input, and this is the trap worth recording: a
+    # first pass measured the same stages against a copy translated 0.6x the extent on *all three*
+    # axes -- heavily interpenetrating rather than disjoint -- where the whole call is 5.6 / 37.0 /
+    # 8 754 ms instead of 2.1 / 3.1 / 5.4 and the same build reads **3.8 % falling to 0.7 %**. On
+    # those numbers this was written up as a decline. Same code, same stage, opposite conclusion,
+    # because the traversal explodes on interpenetrating meshes and dilutes everything else.
     lower = wp.empty(n_faces_b, dtype=wp.vec3, device=device)
     upper = wp.empty(n_faces_b, dtype=wp.vec3, device=device)
     wp.launch(
@@ -418,7 +448,6 @@ def mesh_to_mesh_distance(
         inputs=[vertices_b, faces_b, lower, upper],
         device=device,
     )
-    bvh = tw.neighbors.bvh_from_bounds(lower, upper)
     distance_sq = wp.empty(n_faces_a, dtype=wp.float32, device=device)
     witness = wp.empty(n_faces_a, dtype=wp.int32, device=device)
     # Seeded at the bound the vertex query already paid for, so every thread prunes against it from
@@ -461,7 +490,7 @@ def mesh_to_mesh_distance(
             faces_b,
             lower,
             upper,
-            bvh.id,
+            mesh_b.id,
             wp.float32(upper_bound),
             wp.int32(candidate_cap),
             global_best_sq,
@@ -487,7 +516,7 @@ def mesh_to_mesh_distance(
                     faces_b,
                     lower,
                     upper,
-                    bvh.id,
+                    mesh_b.id,
                     wp.float32(upper_bound),
                     overflow,
                     global_best_sq,

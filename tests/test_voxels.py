@@ -738,6 +738,191 @@ def test_grid_points_defaults_to_index_space(device: str):
 
 
 # ---------------------------------------------------------------------------------------------
+# Set algebra and resampling
+# ---------------------------------------------------------------------------------------------
+
+
+def _shifted(grid: wp.Volume, offset: tuple[int, int, int]) -> wp.Volume:
+    """Move a voxel set by whole cells, so the two grids share a lattice but not a set."""
+    voxel_size, origin = tw.voxels.grid_transform(grid)
+    rows = tw.voxels.cells(grid).numpy() + np.array(offset, dtype=np.int32)
+    return tw.voxels.from_cells(
+        wp.array(rows, dtype=wp.int32, device=grid.device), voxel_size, origin
+    )
+
+
+@pytest.mark.parity(
+    "set_algebra",
+    "meshlib",
+    benchmarked=False,
+    reason="MeshLib answers this over a dense VoxelBitSet addressed by a VolumeIndexer, so its "
+    "cost is a bitwise fold over the whole box while triwarp's is a rebuild of a sparse set; "
+    "timing them together would report the density of the fixture rather than either algorithm. "
+    "trimesh's ops.boolean_sparse is the other candidate row and needs the optional `sparse` "
+    "package, which is not a test dependency here.",
+)
+def test_set_algebra_matches_meshlib(sphere, device: str):
+    """
+    Class A on the dense occupancy: MeshLib's ``VoxelBitSet`` ``|``, ``&`` and ``-``.
+
+    ``TypedBitSet`` derives from ``MR::BitSet``, so the three operators are the set algebra itself
+    with no geometry in the way — which is exactly what makes it a clean oracle here: the only
+    thing under test is whether triwarp's sparse rebuild picks the same cells a bitmask would.
+
+    The two grids are one voxel set and a copy of it moved three cells along ``x``, so all three
+    answers are non-vacuous and distinct: the shift is smaller than the sphere, so the overlap is
+    large, and it is non-zero, so neither difference is empty. Both sides see one padded box.
+    """
+    _mesh_tm, vertices_wp, faces_wp = sphere
+    left = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, 0.16, mode="solid")
+    right = _shifted(left, (3, 0, 0))
+    lower, extent = _bounds_of(tw.voxels.union(left, right))
+    padded_lower = tuple(c - 1 for c in lower)
+    padded_shape = tuple(n + 2 for n in extent)
+    left_np = _dense(left, padded_lower, padded_shape)
+    right_np = _dense(right, padded_lower, padded_shape)
+    assert left_np.any()
+    assert right_np.any()
+    assert (left_np & right_np).any()  # non-vacuous: the two sets genuinely overlap
+    assert (left_np & ~right_np).any()  # and genuinely differ
+
+    for operation, expected_ml in (
+        (tw.voxels.union, _voxel_mask_ml(left_np)[0] | _voxel_mask_ml(right_np)[0]),
+        (tw.voxels.intersection, _voxel_mask_ml(left_np)[0] & _voxel_mask_ml(right_np)[0]),
+        (tw.voxels.difference, _voxel_mask_ml(left_np)[0] - _voxel_mask_ml(right_np)[0]),
+    ):
+        result_np = _dense(operation(left, right), padded_lower, padded_shape)
+        assert np.array_equal(result_np, _dense_from_mask_ml(expected_ml, padded_shape))
+
+
+def test_set_algebra_needs_one_lattice(sphere, device: str):
+    """Triwarp against triwarp: a cell coordinate is meaningless across two transforms."""
+    _mesh_tm, vertices_wp, faces_wp = sphere
+    coarse = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, 0.2)
+    finer = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, 0.16)
+    for operation in (tw.voxels.union, tw.voxels.intersection, tw.voxels.difference):
+        with pytest.raises(ValueError, match="one lattice"):
+            operation(coarse, finer)
+
+
+@pytest.mark.parity(
+    "revoxelize",
+    "trimesh",
+    benchmarked=False,
+    reason="the operation is one occupancy probe per cell of the new lattice and is dominated by "
+    "the dense allocation it fills, so a row would price to_dense and from_dense over again; both "
+    "already carry the fill_cavities and fill_orthographic groups. trimesh's own revoxelized is "
+    "additionally not a comparable row, for the sampling reason this test records.",
+)
+def test_revoxelize_matches_trimesh(sphere, device: str):
+    """
+    Class B: ``trimesh.voxel.VoxelGrid.is_filled`` evaluated at the new cell centres.
+
+    That is the membership test ``VoxelGrid.revoxelized`` runs internally, and the reason the
+    comparison goes through it rather than through ``revoxelized`` itself is that ``revoxelized``
+    samples on ``grid_linspace(self.bounds, shape)`` — ``shape`` points spanning the box
+    *inclusive*, so a step of ``extents / (shape - 1)`` — and then attaches a transform whose scale
+    is ``extents / shape``. The two disagree, and the visible consequence is that a completely
+    filled 2x2x2 grid resampled to ``(8, 8, 8)`` comes back with 343 = 7^3 cells filled rather than
+    512: the far face of samples lands exactly on the boundary and reads as empty. So there is no
+    pitch a caller can ask ``revoxelized`` for that lands on the lattice triwarp resamples onto.
+
+    Three settings, so the claim is not a coarsening claim alone: unchanged (exact round trip),
+    halved (refinement, which must be hole-free — this is why the rule is "the new centre lands in
+    an old cell" rather than "voxelize the old centres") and tripled.
+
+    Tripled rather than doubled on purpose: an **even** integer coarsening puts every new cell
+    centre exactly on a face of the old lattice (``origin + (2c + 1) * old_size``), where triwarp's
+    float32 floor and trimesh's float64 round are free to disagree. Measured — at ``2.0`` this
+    comparison fails on cells at the ties. Odd and fractional factors land strictly inside an old
+    cell and the two agree exactly.
+    """
+    _mesh_tm, vertices_wp, faces_wp = sphere
+    grid = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, 0.16, mode="solid")
+    voxel_size, origin = tw.voxels.grid_transform(grid)
+    lower, extent = _bounds_of(grid)
+    voxel_tm = tm.voxel.VoxelGrid(
+        _dense(grid, lower, extent),
+        transform=tm.transformations.scale_and_translate(
+            voxel_size,
+            [float(origin[axis]) + (lower[axis] + 0.5) * voxel_size for axis in range(3)],
+        ),
+    )
+    assert voxel_tm.filled_count == int(tw.voxels.cells(grid).shape[0])
+
+    for factor in (1.0, 0.5, 3.0):
+        resampled = tw.voxels.revoxelize(grid, factor * voxel_size)
+        centers_np = tw.voxels.cell_centers(resampled).numpy()
+        assert centers_np.shape[0] > 0
+        assert np.array_equal(voxel_tm.is_filled(centers_np), np.ones(len(centers_np), bool))
+
+        # And the other direction, which ``is_filled`` on the kept cells cannot see: no occupied
+        # centre of the new lattice was missed. The lattice is regular, so its own resampling at
+        # the same pitch enumerates it.
+        every_center_np = tw.voxels.cell_centers(
+            tw.voxels.revoxelize(tw.voxels.dilate(resampled), factor * voxel_size)
+        ).numpy()
+        filled_tm = every_center_np[voxel_tm.is_filled(every_center_np)]
+        assert np.array_equal(lexsort_rows(filled_tm), lexsort_rows(centers_np))
+
+
+def test_revoxelize_round_trips_and_refines(sphere, device: str):
+    """
+    Triwarp against triwarp: the oracle is ``test_revoxelize_matches_trimesh`` above.
+
+    Two structural claims that comparison does not make. An unchanged ``voxel_size`` returns the
+    *identical* lattice, which is what lets the result compose with the set algebra — the default
+    origin is the input's own, not the occupied box's corner. And halving the pitch multiplies the
+    voxel count by exactly eight, i.e. the refinement leaves no gaps between the old centres.
+    """
+    _mesh_tm, vertices_wp, faces_wp = sphere
+    grid = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, 0.16, mode="solid")
+    voxel_size, origin = tw.voxels.grid_transform(grid)
+    n_voxels = int(tw.voxels.cells(grid).shape[0])
+
+    same = tw.voxels.revoxelize(grid, voxel_size)
+    assert tw.voxels.grid_transform(same) == (voxel_size, origin)
+    assert np.array_equal(
+        lexsort_rows(tw.voxels.cells(same).numpy()), lexsort_rows(tw.voxels.cells(grid).numpy())
+    )
+    assert int(tw.voxels.cells(tw.voxels.union(grid, same)).shape[0]) == n_voxels
+
+    assert (
+        int(tw.voxels.cells(tw.voxels.revoxelize(grid, 0.5 * voxel_size)).shape[0]) == 8 * n_voxels
+    )
+
+
+def test_revoxelize_samples_only_the_occupied_box(sphere, device: str):
+    """
+    Triwarp against triwarp: the oracle is ``test_revoxelize_matches_trimesh`` above.
+
+    A grid whose voxels sit ten thousand cells from its own origin resamples to the same answer as
+    one at the origin, and does not raise the budget guard. Anchoring the sampling lattice with
+    ``from_dense``'s ``origin_cell`` rather than with the grid origin is what makes that true; the
+    naive form allocates the whole box between the two and dies here.
+    """
+    _mesh_tm, vertices_wp, faces_wp = sphere
+    grid = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, 0.16, mode="solid")
+    voxel_size, _origin = tw.voxels.grid_transform(grid)
+    offset = np.array([10000, 0, 0], dtype=np.int32)
+
+    far = _shifted(grid, tuple(int(x) for x in offset))
+    resampled = tw.voxels.revoxelize(far, voxel_size, max_cells=1 << 20)
+    assert np.array_equal(
+        lexsort_rows(tw.voxels.cells(resampled).numpy()),
+        lexsort_rows(tw.voxels.cells(grid).numpy() + offset),
+    )
+
+
+def test_revoxelize_rejects_an_unaffordable_lattice(sphere, device: str):
+    """The budget guard raises before allocating, and names ``voxel_size`` like its sibling."""
+    _mesh_tm, vertices_wp, faces_wp = sphere
+    grid = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, 0.2)
+    with pytest.raises(ValueError, match="voxel_size"):
+        tw.voxels.revoxelize(grid, 1e-4, max_cells=1000)
+
+
+# ---------------------------------------------------------------------------------------------
 # Morphology
 # ---------------------------------------------------------------------------------------------
 
@@ -857,6 +1042,89 @@ def test_dilate_and_erode_match_meshlib(sphere, device: str):
     mm.shrinkVoxelsMask(mask_ml, indexer_ml, 1)
     assert np.array_equal(_dense_from_mask_ml(mask_ml, padded_shape), eroded_np)
     assert eroded_np.sum() < occupancy_np.sum() < dilated_np.sum()
+
+
+@pytest.mark.parity(
+    "closing",
+    "trimesh",
+    benchmarked=False,
+    reason="closing is dilate followed by erode and opening is the reverse, so a row would time "
+    "the two passes the dilate group already times, under a third name; trimesh's own "
+    "morphology.binary_closing is scipy.ndimage on a dense array, which the dilate group's "
+    "reference row already prices at the same connectivity.",
+)
+@pytest.mark.parity(
+    "opening",
+    "scipy",
+    benchmarked=False,
+    reason="scipy.ndimage.binary_opening has no trimesh wrapper and no benchmark row for the same "
+    "reason closing has none: it is erode then dilate, both of which the dilate group times "
+    "already, and the dense reference measures the padded box rather than the voxel set.",
+)
+@pytest.mark.parametrize("connectivity", [6, 18, 26])
+def test_closing_and_opening_match_scipy(sphere, device: str, connectivity: int):
+    """
+    Class A: ``scipy.ndimage.binary_closing`` / ``binary_opening`` at the matching structure rank.
+
+    The first is what trimesh's ``morphology.binary_closing`` wraps; the second trimesh does not
+    expose, so scipy is the reference directly.
+
+    The dense box is padded by two cells on every side, which is what makes this a comparison
+    rather than a divergence: the sparse form dilates onto whatever cells it needs, where the dense
+    reference's intermediate dilation is clipped at the array border and its erosion then eats a
+    shell off every face. With the padding both sides see the same infinite lattice.
+
+    Non-vacuity is asserted rather than assumed: the input is a *hollow* voxelization with a
+    one-cell notch cut out of it, so the closing genuinely fills something and the opening
+    genuinely removes something at every connectivity.
+    """
+    _mesh_tm, vertices_wp, faces_wp = sphere
+    shell = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, 0.16)
+    lower, extent = _bounds_of(shell)
+    padded_lower = tuple(c - 2 for c in lower)
+    padded_shape = tuple(n + 4 for n in extent)
+    occupancy_np = _dense(shell, padded_lower, padded_shape)
+    rank = {6: 1, 18: 2, 26: 3}[connectivity]
+    structure_np = ndi.generate_binary_structure(3, rank)
+
+    closed_np = _dense(
+        tw.voxels.closing(shell, connectivity=connectivity), padded_lower, padded_shape
+    )
+    opened_np = _dense(
+        tw.voxels.opening(shell, connectivity=connectivity), padded_lower, padded_shape
+    )
+    assert np.array_equal(closed_np, ndi.binary_closing(occupancy_np, structure=structure_np))
+    assert np.array_equal(opened_np, ndi.binary_opening(occupancy_np, structure=structure_np))
+    # A hollow shell is thin, so opening removes and closing adds: neither is the identity here.
+    assert opened_np.sum() < occupancy_np.sum() < closed_np.sum()
+
+
+def test_closing_and_opening_are_the_two_compositions(sphere, device: str):
+    """
+    Triwarp against triwarp: the oracle is ``test_closing_and_opening_match_scipy`` above.
+
+    The pair is defined by the *order* of the two passes, which is the one thing a comparison
+    against a single reference call cannot catch — a closing that eroded first would still be a
+    legal morphological filter and would still be idempotent. Both compositions are asserted
+    explicitly, and so are the containments that separate them.
+    """
+    _mesh_tm, vertices_wp, faces_wp = sphere
+    shell = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, 0.16)
+    lower, extent = _bounds_of(shell)
+    padded_lower = tuple(c - 2 for c in lower)
+    padded_shape = tuple(n + 4 for n in extent)
+    occupancy_np = _dense(shell, padded_lower, padded_shape)
+
+    closed_np = _dense(tw.voxels.closing(shell), padded_lower, padded_shape)
+    opened_np = _dense(tw.voxels.opening(shell), padded_lower, padded_shape)
+    assert np.array_equal(
+        closed_np, _dense(tw.voxels.erode(tw.voxels.dilate(shell)), padded_lower, padded_shape)
+    )
+    assert np.array_equal(
+        opened_np, _dense(tw.voxels.dilate(tw.voxels.erode(shell)), padded_lower, padded_shape)
+    )
+    assert np.array_equal(closed_np & occupancy_np, occupancy_np)  # closing contains the input
+    assert np.array_equal(opened_np & occupancy_np, opened_np)  # opening is contained in it
 
 
 def test_surface_voxels_is_the_erosion_complement(sphere, device: str):

@@ -456,7 +456,7 @@ def face_to_mesh_distance(
     target_faces: wp.array[wp.int32],
     target_lower: wp.array[wp.vec3],
     target_upper: wp.array[wp.vec3],
-    target_bvh: wp.uint64,
+    target_mesh: wp.uint64,
     upper_bound: wp.float32,
     candidate_cap: wp.int32,
     global_best_sq: wp.array[wp.float32],
@@ -484,6 +484,9 @@ def face_to_mesh_distance(
     # stops, appends its face to ``overflow``, and lets ``face_to_mesh_distance_tiled`` re-walk it
     # with a whole block. Pass a cap of ``INT32_MAX`` to disable the split and settle every face
     # here, which is what the CPU device does -- ``wp.launch_tiled`` runs one lane per block there.
+    # ``wp.mesh_get_bvh`` (Warp 1.17) hands back the ``wp.Mesh``'s *own* BVH over its faces, so the
+    # caller builds no second structure -- see the wrapper for the measured share.
+    target_bvh = wp.mesh_get_bvh(target_mesh)
     f = wp.int32(wp.tid())
     a0, a1, a2 = kernel_triangles.face_vertices(query_vertices, query_faces, f)
     lower, upper = triangle_aabb(a0, a1, a2)
@@ -534,7 +537,7 @@ def face_to_mesh_distance_tiled(
     target_faces: wp.array[wp.int32],
     target_lower: wp.array[wp.vec3],
     target_upper: wp.array[wp.vec3],
-    target_bvh: wp.uint64,
+    target_mesh: wp.uint64,
     upper_bound: wp.float32,
     overflow: wp.array[wp.int32],
     global_best_sq: wp.array[wp.float32],
@@ -551,6 +554,9 @@ def face_to_mesh_distance_tiled(
     # Each lane keeps its own running best, so a lane cannot prune against its siblings' minima and
     # slightly more candidates reach the leaf test. The answer is unchanged: the minimum over the
     # block is the minimum of the per-lane minima, and the global atomic is still read every step.
+    # ``wp.mesh_get_bvh`` (Warp 1.17) hands back the ``wp.Mesh``'s *own* BVH over its faces, so the
+    # caller builds no second structure -- see the wrapper for the measured share.
+    target_bvh = wp.mesh_get_bvh(target_mesh)
     slot = wp.int32(wp.tid())
     f = overflow[slot]
     a0, a1, a2 = kernel_triangles.face_vertices(query_vertices, query_faces, f)

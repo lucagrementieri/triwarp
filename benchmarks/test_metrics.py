@@ -76,13 +76,6 @@ _MESHLIB_FLT_MAX = 3.4028234663852886e38
 # 1 189.5 / 4 562.8 ms and ``chamfer_distance`` 557.8 / 2 319.1 / 9 077.1 ms at 10 k / 20 k / 40 k
 # points -- 3.84-4.16x per doubling, so ``dragon`` at ~435 k extrapolates to ~9 minutes *per round*
 # and ``--benchmark-json`` is written at session end, which would cost the whole file's rows.
-_PYTORCH3D_QUADRATIC = "pytorch3d's CPU cloud queries are brute force; capped at bunny_decimated"
-
-
-def _skip_p3d_cpu_beyond_bunny_decimated(bench_case: BenchCase) -> None:
-    """Cap the ``pytorch3d-cpu`` row alone: the CUDA one is a different cost curve entirely."""
-    if bench_case.torch_device == "cpu":
-        skip_larger_than(bench_case, "bunny_decimated", _PYTORCH3D_QUADRATIC)
 
 
 def _clouds_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
@@ -174,7 +167,6 @@ def test_chamfer_points_to_points(bench_case: BenchCase, single_directional: boo
     """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "pytorch3d":
-        _skip_p3d_cpu_beyond_bunny_decimated(bench_case)
         cloud_a_p3d, cloud_b_p3d = (
             points_torch_from_numpy(cloud_np, bench_case.torch_device)
             for cloud_np in _clouds_np(bench_case)
@@ -301,8 +293,8 @@ def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
     immutable and pure, so both are built outside the timed callable, and the ``*_packed()``
     accessors the loss reads are warmed there too.
     """
+    skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "pytorch3d":
-        _skip_p3d_cpu_beyond_bunny_decimated(bench_case)
         mesh_p3d = bench_case.mesh_p3d
         mesh_p3d.verts_packed(), mesh_p3d.faces_packed()  # warm the cached derivations
         cloud_p3d = p3d_structures.Pointclouds(
@@ -313,7 +305,6 @@ def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
         )
         assert float(distance_p3d) > 0.0
         return
-    skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "meshlib":
         cloud_np = _clouds_np(bench_case)[1]
         # The tree is built lazily on the first query and cached on the Mesh, so it is built and
