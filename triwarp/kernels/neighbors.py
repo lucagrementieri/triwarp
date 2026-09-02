@@ -42,6 +42,27 @@ RADIUS_GROWTH = wp.constant(wp.float32(2.0))
 # 255-register-per-thread hardware limit from there, which is what forces its spill -- the bucket
 # list ends where the register file does, not at an arbitrary cut.
 #
+# **``cuda_max_registers`` does not move that wall, and it was measured rather than assumed.**
+# 1.17's per-kernel register cap is the obvious lever for trading occupancy against pressure, so
+# the shipped buckets were rebuilt under it (1M points, 100k queries, results identical at every
+# cap). It loses everywhere, and the mechanism is in the ``local_memory_size`` column: capping
+# below the natural count does not make the kernel leaner, it makes it *spill*.
+#
+#   | bucket | cap | regs | lmem | vs shipped |
+#   |--------|-----|------|------|------------|
+#   | 32 | none | 126 | 0 | 3.263 ms |
+#   | 32 | 64 | 64 | 352 | **0.28x** |
+#   | 32 | 96 | 96 | 80 | **0.71x** |
+#   | 32 | 128 | 119 | 0 | 1.01x (a no-op: above the natural count) |
+#   | 64 | none | 222 | 0 | 6.478 ms |
+#   | 64 | 64 | 64 | 624 | **0.12x** |
+#   | 64 | 128 | 128 | 608 | **0.15x** |
+#   | 64 | 168 | 168 | 128 | **0.80x** |
+#
+# So a spilled row is 1.25-12x slower here, which is also the answer to the 96-bucket question
+# above: a 96-wide row must spill whatever the cap says, and spilling is precisely what this table
+# prices. The buckets stay uncapped.
+#
 # The buckets are not free: they cost ``2 x len(KNN_ROW_BUCKETS)`` generated kernels, which take
 # this module's cold-cache compile from 3.9 s to ~12 s (once per Warp version and arch) and its
 # warm per-process load from 2.4 ms to ~5 ms.
@@ -61,17 +82,55 @@ ACCEL_HASHGRID = wp.constant(wp.int32(0))
 ACCEL_BVH = wp.constant(wp.int32(1))
 
 
+# The two BVH walk protocols, over a *query* rather than over a bvh id and bounds.
+#
+# Taking the query is what Warp 1.17 made possible and it is the whole point of these two: a
+# ``wp.BvhQuery`` is the common type over the aabb / sphere / capsule query kinds, and a
+# ``@wp.func`` may take one as a parameter and another may return one (both verified -- a helper
+# that constructs and returns a query, walked by a second helper, compiles and runs). Before that,
+# a walk was pinned to the constructor that opened it, so every query kind carried its own copy of
+# these four lines: the count walk existed twice, once here for the box and once inside
+# ``ball_count_in_radius`` for the ball.
+#
+# ``@wp.func`` calls inline at codegen, so this is free -- confirmed rather than assumed, with
+# ``wp.get_cuda_kernel_properties`` across the extraction: ``query_ball_count`` and
+# ``query_ball_neighbors`` hold at **40** registers and the six row buckets at
+# **42 / 53 / 64 / 92 / 126 / 222**, every one with ``local_memory_size`` **0**, which are the same
+# figures the inline versions reported. And the move is *provably* behaviour-neutral where a
+# float32 extraction would not be (CLAUDE.md section 3 warns that a green suite is not evidence):
+# neither shared run contains a floating-point expression, so there is no evaluation order for it
+# to disturb.
+
+
 @wp.func
-def aabb_count_in_bounds(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3) -> wp.int32:
-    # Broad-phase hits of the box, with no narrow phase: every hit counts. The traversal is shared
-    # by the uniform-cube form below and the per-query-corner one further down -- the two differ
-    # only in where the corners come from, so only the box construction is duplicated.
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+def bvh_walk_count(query: wp.BvhQuery) -> wp.int32:
+    # Every primitive the query returns, counted, with no narrow phase.
     j = wp.int32(0)
     c = wp.int32(0)
     while wp.bvh_query_next(query, j):
         c = c + 1
     return c
+
+
+@wp.func
+def bvh_walk_emit(query: wp.BvhQuery, base: wp.int32, out_indices: wp.array[wp.int32]) -> wp.int32:
+    # The same primitives ``bvh_walk_count`` counts, written contiguously from ``base``. Counting
+    # and emitting are separate walks rather than one ``write``-flagged function: the counting pass
+    # then needs no output array at all, and the emit loop carries no per-candidate branch.
+    j = wp.int32(0)
+    c = wp.int32(0)
+    while wp.bvh_query_next(query, j):
+        out_indices[base + c] = j
+        c = c + 1
+    return c
+
+
+@wp.func
+def aabb_count_in_bounds(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3) -> wp.int32:
+    # Broad-phase hits of the box. The traversal is shared by the uniform-cube form below and the
+    # per-query-corner one further down -- the two differ only in where the corners come from, so
+    # only the box construction is left here.
+    return bvh_walk_count(wp.bvh_query_aabb(bvh_id, lower, upper, root=-1))
 
 
 @wp.func
@@ -99,15 +158,8 @@ def aabb_collect_in_bounds(
     base: wp.int32,
     out_indices: wp.array[wp.int32],
 ) -> None:
-    # Emit the same hits ``aabb_count_in_bounds`` counted, contiguously from ``base``. Counting and
-    # emitting are separate passes rather than one ``write``-flagged function: the counting pass
-    # then needs no output array at all, and the emit loop carries no per-candidate branch.
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = wp.int32(0)
-    c = wp.int32(0)
-    while wp.bvh_query_next(query, j):
-        out_indices[base + c] = j
-        c = c + 1
+    # Emit the same hits ``aabb_count_in_bounds`` counted; the emit protocol is ``bvh_walk_emit``'s.
+    bvh_walk_emit(wp.bvh_query_aabb(bvh_id, lower, upper, root=-1), base, out_indices)
 
 
 @wp.func
@@ -205,10 +257,9 @@ def ball_count_in_radius(
             if wp.length_sq(points[j] - q) <= radius * radius:
                 c = c + 1
     else:
-        # No narrow phase: on degenerate point bounds the sphere-AABB test is the ball test.
-        query_sphere = wp.bvh_query_sphere(accel_id, q, radius)
-        while wp.bvh_query_next(query_sphere, j):
-            c = c + 1
+        # No narrow phase: on degenerate point bounds the sphere-AABB test is the ball test, so
+        # this is the bare walk ``bvh_walk_count`` also serves the box query with.
+        c = bvh_walk_count(wp.bvh_query_sphere(accel_id, q, radius))
     return c
 
 

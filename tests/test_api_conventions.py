@@ -1,10 +1,12 @@
 """
 The convention gate: the public API's names, summaries and file layout, checked statically.
 
-Fourteen conventions, one test each so the failing test's *name* says which one was broken. The scan
-and the reasoning behind each rule live in [`tests/api_conventions.py`](api_conventions.py); this
-file is only the pytest surface -- with one exception, the docstring-example test, whose whole
-point is that a static read cannot find what is wrong with an example.
+One test per convention, so the failing test's *name* says which one was broken. The scan and the
+reasoning behind each rule live in [`tests/api_conventions.py`](api_conventions.py); this file is
+only the pytest surface -- with two exceptions, both of which exist because a static read cannot
+see what they check: the docstring-example test, which executes the examples, and the lazy-package
+tests at the end, which import `triwarp` in a *subprocess* because the in-process import graph is
+already whatever the session made it.
 
 Deliberately not parametrized over modules or functions: that would add hundreds of always-green
 items to every run, and a rule that stopped matching anything would silently lose its check instead
@@ -15,6 +17,8 @@ to name which one.
 from __future__ import annotations
 
 import ast
+import subprocess
+import sys
 import textwrap
 
 import numpy as np
@@ -585,3 +589,90 @@ def test_comparison_label_scan_keys_on_asserts_not_on_fixture_unpacking() -> Non
     functions = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)]
     assert _asserted_reference_names(functions[0]) == set()
     assert _asserted_reference_names(functions[1]) == {"volume_tm"}
+
+
+# --- the lazy package surface ---------------------------------------------------------------
+#
+# ``triwarp/__init__.py`` resolves every submodule through a PEP 562 ``__getattr__`` so that
+# ``import triwarp`` does not decorate 553 kernels. These four tests pin the contract that change
+# rests on. The first is the one that matters: the cost regresses the moment any eager import is
+# added back, and it regresses *silently*, because nothing else in the suite can see it -- by the
+# time a test runs, the modules it needed are imported and the surface looks identical.
+
+
+def test_importing_triwarp_pulls_in_no_kernel_modules() -> None:
+    """
+    ``import triwarp`` imports no kernel module, and so decorates no kernel.
+
+    Not a library comparison: this is a property of triwarp's own import graph. Runs in a
+    subprocess because the in-process answer is always "all of them" -- the test session has
+    already imported what it needs.
+
+    A single eager ``from triwarp.mesh import Trimesh`` in ``__init__.py`` is enough to fail this,
+    which is exactly what it is for: that one line used to cost 0.60 s of ``import triwarp``, and
+    Python imports a parent package before its child, so it cost the same 0.59 s for
+    ``import triwarp.edges`` too.
+    """
+    probe = textwrap.dedent(
+        """
+        import sys
+        import triwarp
+        kernels = sorted(m for m in sys.modules if m.startswith("triwarp.kernels"))
+        public = sorted(
+            m for m in sys.modules if m.startswith("triwarp.") and ".kernels" not in m
+        )
+        print(len(kernels), len(public))
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    n_kernels, n_public = (int(token) for token in completed.stdout.split())
+    assert n_kernels == 0, f"import triwarp pulled in {n_kernels} kernel modules"
+    assert n_public == 0, f"import triwarp pulled in {n_public} public modules"
+
+
+def test_every_public_name_resolves_and_is_cached() -> None:
+    """
+    Every name in ``__all__`` resolves, and resolving it caches it into the package namespace.
+
+    Not a library comparison. The caching half is what keeps ``tw.laplacian`` in a hot wrapper an
+    ordinary global lookup rather than a ``__getattr__`` call, so it is part of the contract and
+    not an implementation detail.
+    """
+    for name in tw.__all__:
+        assert getattr(tw, name) is not None
+        assert name in vars(tw), f"{name} resolved but was not cached into triwarp's namespace"
+    assert tw.Trimesh.__name__ == "Trimesh"  # a class, not a submodule: the one special case
+
+
+def test_unknown_attribute_raises_attribute_error() -> None:
+    """
+    An unknown name raises ``AttributeError``, not ``ImportError`` or ``ModuleNotFoundError``.
+
+    Not a library comparison. This is what keeps ``hasattr`` and ``getattr(..., default)`` working
+    against the package, which a bare ``importlib.import_module`` in ``__getattr__`` would break.
+    """
+    with pytest.raises(AttributeError):
+        _ = tw.definitely_not_a_module
+    assert not hasattr(tw, "definitely_not_a_module")
+
+
+def test_dir_lists_the_whole_surface_before_it_is_touched() -> None:
+    """
+    ``dir(triwarp)`` lists every public name whether or not it has been resolved.
+
+    Not a library comparison. Without the module ``__dir__``, a lazy package lists only what some
+    earlier caller happened to touch, which is what makes one hard to explore interactively.
+    Subprocessed for the same reason as the first test: in-process, everything is already resolved.
+    """
+    probe = textwrap.dedent(
+        """
+        import triwarp
+        print(" ".join(dir(triwarp)))
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert sorted(completed.stdout.split()) == sorted(tw.__all__)

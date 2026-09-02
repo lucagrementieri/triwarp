@@ -21,6 +21,29 @@ together and stops on the worst-case residual, so the cost becomes ``max`` of th
 iteration counts with one set of vector kernels per iteration. The sparse matrix is never
 replicated in memory — the ``matvec`` issues ``k`` ``bsr_mv`` calls against the single operator.
 
+**Two ``warp.optim.linear`` levers, both measured and both declined.** Warp 1.17 added an
+optional ``restart`` to ``cg`` / ``cr`` (periodically recompute the true residual and reset the
+search direction, to limit finite-precision drift) and an optional ``max_batch_length`` to
+``LinearOperator`` (skip redundant reduction levels when the largest subproblem is known). Both look
+made for this module -- the solve family is CG-bound and conditioning-sensitive, and
+``replicated_operator`` knows its subproblem length exactly -- and neither pays. Measured on a
+cotmatrix-shaped system, the dominance-poor class, 3 columns, diagonal preconditioner, ``tol=1e-8``:
+
+| | icosphere(4), n = 2 562 | icosphere(5), n = 10 242 |
+|---|---|---|
+| baseline | 110 iters, 6.29 ms | 220 iters, 10.18 ms |
+| ``restart=50`` | 350 iters, 79.29 ms (**0.08x**) | 900 iters, 85.46 ms (**0.12x**) |
+| ``restart=200`` | 200 iters, 117.54 ms (**0.05x**) | 400 iters, 251.69 ms (**0.04x**) |
+| ``max_batch_length=n`` | 110 iters, 6.23 ms (1.01x) | 220 iters, 10.09 ms (1.01x) |
+
+``restart`` is not a small loss but a 8-25x one, and the iteration counts say why: resetting the
+search direction throws away the Krylov space CG has built, so it costs *more* iterations rather
+than buying better-conditioned ones. It is a fix for drift this operator class does not suffer from
+at this tolerance. ``max_batch_length`` is simply flat -- with a handful of columns there are no
+redundant reduction levels to skip. Neither is exposed as a keyword (CLAUDE.md section 14, no
+speculative generality); re-measure before adding one, and note the 1.17 dot-product accuracy
+improvement that landed *automatically* alongside them is already in the baseline row.
+
 **Whose conjugate gradient.** One column goes to ``warp.optim.linear.cg``; more than one goes to
 this module's own ``_BatchedCg``, which runs the same iteration and the same stopping rule. The
 split is not a preference — it is the one input for which Warp's reduction degrades. Batching is
@@ -1447,6 +1470,13 @@ def replicated_operator(
     A block-diagonal *matrix* would give the same batching at ``n_columns`` times the operator
     memory, and 2x2 blocks holding a scalar multiple of the identity would cost four times the
     storage and flops per scalar entry. Replicating only the ``matvec`` avoids both.
+
+    ``batch_offsets`` is attached and ``max_batch_length`` deliberately is not, although this
+    function knows the value exactly (every subproblem is ``n`` scalars). Warp 1.17 added it to
+    skip redundant reduction levels for a known maximum subproblem size, and it measured **1.01x**
+    at n = 2 562 and n = 10 242 over three columns, with the iteration count unchanged -- flat, so
+    it would be one more argument to explain for nothing. See the module docstring's two-levers
+    table for the numbers and for ``restart``, which is measurably worse.
 
     See Also
     --------

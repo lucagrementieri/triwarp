@@ -634,6 +634,15 @@ def bfs(
         # Count and scan share a launch (see the kernel), and the scan is a capture-safe
         # fixed-buffer one: wp.utils.array_scan allocates temp storage internally, which conditional
         # graph bodies reject.
+        #
+        # **Still true on Warp 1.17, and re-probed because the release looks like it fixed it.**
+        # 1.17 lists four graph-capture fixes for ``radix_sort_pairs`` / ``segmented_sort_pairs``
+        # (NVIDIA/warp#1373), one of them "sorts in conditional body graphs ... could fail or
+        # invalidate capture", which reads like this workaround's reason. It is not: measured
+        # inside a ``wp.capture_while`` body, ``wp.utils.radix_sort_pairs`` now captures and
+        # replays fine, while ``wp.utils.array_scan`` still raises *"Conditional body graph
+        # contains an unsupported operation (memory allocation)"*. The fix covers the sorts and
+        # not the scan, so ``bfs_count_and_scan`` stays.
         wp.launch_tiled(
             kernel_bfs.bfs_count_and_scan,
             dim=[n_blocks],
