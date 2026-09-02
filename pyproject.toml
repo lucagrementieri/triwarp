@@ -85,11 +85,7 @@ test = [
     "pymeshfix>=0.18.1",
     "pymeshlab>=2023.12",
     "pytest>=9.0",
-    # Built from source (see ``[tool.uv.sources]``) rather than installed as a wheel: no pytorch3d
-    # wheel on PyPI supports Linux + a modern torch, and the one mirror that ships a prebuilt
-    # ``_C.so`` (``pipablepytorch3d``) links a torch 2.1-2.2 symbol, which in turn forces
-    # ``numpy<2`` and cannot target sm_120. The source build is CUDA-capable and keeps NumPy 2.
-    "pytorch3d",
+    # Built from source (see ``[tool.uv.sources]``) rather than installed as a wheel
     "pyvista>=0.48",
     "rtree>=0.12",
     "scipy>=1.17",
@@ -101,13 +97,9 @@ test = [
     # bound lives here, routed to the CUDA 12.8 index below. **The pin is exact on purpose.**
     # pytorch3d's ``_C`` is a torch C++ extension, so it is ABI-bound to the torch it was compiled
     # against, and uv keys its build cache on the git *commit* alone -- not on the build
-    # environment. Measured: a wheel built against 2.11.0+cu128 was silently reused against
-    # 2.10.0+cu128 and imports with ``undefined symbol: c10::cuda::CUDAStream::query() const``.
-    # An exact pin is what keeps that cache entry honest. When bumping it, force the rebuild:
-    # ``uv sync --all-groups --reinstall-package pytorch3d --no-cache``. 2.11.0 is the newest
-    # torch with a cu128 build; cu129/cu130 go further, but need a matching system toolkit.
+    # environment.
     "torch==2.11.0",
-    "trimesh>=5.0.0rc1",
+    "trimesh>=5.0.0",
 ]
 
 
@@ -143,14 +135,6 @@ test = [
 #    comparison the benchmarks exist for. cu128 also carries ``sm_120``, which the RTX 5090
 #    needs. On a box with a different toolkit, change the index to match its ``nvcc``.
 [tool.uv]
-# The ``warp-lang==1.16.0`` hold that used to sit here is **gone, deliberately**: this is the Warp
-# upgrade it was waiting for (``plans/warp_upgrade.md``). It existed because adding torch made uv
-# re-derive the whole graph and bump ``warp-lang`` 1.16.0 -> 1.17.0 as a side effect, and a Warp
-# minor is its own decision -- it invalidates every ``Warp 1.16`` claim in the tree, which
-# ``test_warp_version_claims_are_not_stale`` fails on by design. Those claims have now been
-# re-probed against 1.17 and re-stamped, and ``[project] dependencies`` carries ``>=1.17`` for a
-# reason of its own (``wp.bvh_query_sphere``, which 1.16 does not have), so a hold here would
-# contradict the floor rather than defer a decision.
 no-build-isolation-package = ["pytorch3d"]
 
 [[tool.uv.index]]
