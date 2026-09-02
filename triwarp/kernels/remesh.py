@@ -27,6 +27,7 @@ from triwarp.kernels.predicates import (
     triangle_normal,
     vector_angle,
 )
+from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import (
     corner_triple,
     face_normal,
@@ -1840,8 +1841,7 @@ def accumulate_face_quadrics(
         return
     normal = cross / double_area
     quadric = plane_quadric(normal, -wp.dot(normal, v0), double_area * wp.float64(0.5))
-    for k in range(3):
-        wp.atomic_add(out_quadrics, faces[f * 3 + k], quadric)
+    add_corner_triple(out_quadrics, faces, f, quadric, quadric, quadric)
 
 
 @wp.func

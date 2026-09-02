@@ -216,9 +216,9 @@ def inverse_or_one(value: wp.Float) -> wp.Float:
 
 
 @wp.func
-def divide_if_positive(value: wp.float32, divisor: wp.float32) -> wp.float32:
+def divide_if_positive(value: wp.Float, divisor: wp.Float) -> wp.Float:
     # Guarded division: leave ``value`` unchanged when ``divisor <= 0``.
-    if divisor > 0.0:
+    if divisor > type(divisor)(0.0):
         return value / divisor
     return value
 

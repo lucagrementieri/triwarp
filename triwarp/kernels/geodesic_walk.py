@@ -134,18 +134,6 @@ def trace_walk(
 
 
 @wp.func
-def face_value_at(
-    faces: wp.array[wp.int32], values: wp.array[wp.float64], f: wp.int32, weight: wp.vec3
-) -> wp.float64:
-    # The field, interpolated at a barycentric point of one face.
-    return (
-        wp.float64(weight[0]) * values[faces[f * 3]]
-        + wp.float64(weight[1]) * values[faces[f * 3 + 1]]
-        + wp.float64(weight[2]) * values[faces[f * 3 + 2]]
-    )
-
-
-@wp.func
 def descend_at_vertex(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],

@@ -7,6 +7,7 @@ from triwarp.kernels.predicates import (
     squared_edge_lengths,
     triangle_double_area,
 )
+from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import face_vertices_vec3d
 
 
@@ -136,9 +137,7 @@ def voronoi_mass(
         quad0 = wp.float64(0.125) * dbl_area
         quad1 = wp.float64(0.125) * dbl_area
         quad2 = wp.float64(0.25) * dbl_area
-    wp.atomic_add(out_mass, faces[f * 3 + 0], quad0)
-    wp.atomic_add(out_mass, faces[f * 3 + 1], quad1)
-    wp.atomic_add(out_mass, faces[f * 3 + 2], quad2)
+    add_corner_triple(out_mass, faces, f, quad0, quad1, quad2)
 
 
 @wp.kernel
@@ -239,9 +238,7 @@ def internal_angles_and_sums(
     out_angles[f, 0] = theta0
     out_angles[f, 1] = theta1
     out_angles[f, 2] = theta2
-    wp.atomic_add(out_angle_sums, faces[f * 3 + 0], theta0)
-    wp.atomic_add(out_angle_sums, faces[f * 3 + 1], theta1)
-    wp.atomic_add(out_angle_sums, faces[f * 3 + 2], theta2)
+    add_corner_triple(out_angle_sums, faces, f, theta0, theta1, theta2)
 
 
 @wp.func
@@ -504,9 +501,7 @@ def crouzeix_raviart_mass_diag(
     f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     third = type(out_mass[0])(triangle_double_area(v0, v1, v2) / wp.float64(6.0))
-    wp.atomic_add(out_mass, inverse[f * 3 + 0], third)
-    wp.atomic_add(out_mass, inverse[f * 3 + 1], third)
-    wp.atomic_add(out_mass, inverse[f * 3 + 2], third)
+    add_corner_triple(out_mass, inverse, f, third, third, third)
 
 
 @wp.kernel

@@ -335,7 +335,7 @@ def triangle_intersection_segment(
     line_direction = wp.cross(normal, other_normal)
 
     edge_direction = vertex_at(
-        order1_x if proj1b >= wp.float32(0.0) else order1_z, a0, a1, a2
+        wp.where(proj1b >= wp.float32(0.0), order1_x, order1_z), a0, a1, a2
     ) - vertex_at(order1_y, a0, a1, a2)
     t2 = intersection_line_coordinate(
         line_origin, line_direction, vertex_at(order1_y, a0, a1, a2), edge_direction
@@ -352,7 +352,7 @@ def triangle_intersection_segment(
         line_origin, line_direction, vertex_at(order2_x, b0, b1, b2), edge_direction
     )
     edge_direction = vertex_at(
-        order2_x if proj2[order2_y] >= wp.float32(0.0) else order2_z, b0, b1, b2
+        wp.where(proj2[order2_y] >= wp.float32(0.0), order2_x, order2_z), b0, b1, b2
     ) - vertex_at(order2_y, b0, b1, b2)
     s2 = intersection_line_coordinate(
         line_origin, line_direction, vertex_at(order2_y, b0, b1, b2), edge_direction

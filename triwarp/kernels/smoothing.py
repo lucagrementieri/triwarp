@@ -4,6 +4,7 @@ from triwarp.kernels.array import to_vec3d
 from triwarp.kernels.linalg import free_row, selected_row, solve_normal_equations
 from triwarp.kernels.points import plane_basis
 from triwarp.kernels.predicates import closest_point_on_segment
+from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import corner_triple
 
 # Fixed-size float64 types for the 6-coefficient quadric fit in ``relax_approx``. The rest of the
@@ -49,9 +50,10 @@ def edge_cotan_add(
     p0 = vertices[v0]
     p1 = vertices[v1]
     p2 = vertices[v2]
-    wp.atomic_add(out_w, inverse[f * 3 + 0], _corner_cotan(p0, p1, p2))
-    wp.atomic_add(out_w, inverse[f * 3 + 1], _corner_cotan(p1, p2, p0))
-    wp.atomic_add(out_w, inverse[f * 3 + 2], _corner_cotan(p2, p0, p1))
+    cotan0 = _corner_cotan(p0, p1, p2)
+    cotan1 = _corner_cotan(p1, p2, p0)
+    cotan2 = _corner_cotan(p2, p0, p1)
+    add_corner_triple(out_w, inverse, f, cotan0, cotan1, cotan2)
 
 
 @wp.func

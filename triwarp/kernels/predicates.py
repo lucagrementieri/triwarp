@@ -334,6 +334,14 @@ def unit_tangent(vector: Any, normal: Any, tolerance: Any):
 
 
 @wp.func
+def normalize_or_zero(v: Any, tolerance: Any):
+    length = wp.length(v)
+    if length <= tolerance:
+        return type(v)()
+    return v / length
+
+
+@wp.func
 def angle_defect(angle_sum: wp.Float) -> wp.Float:
     """Angle defect at a vertex: a full turn minus the incident corner angles."""
     return type(angle_sum)(TWO_PI_F64) - angle_sum

@@ -212,11 +212,16 @@ def query_bvh_aabb_with_offsets(
         )
 
     hit_counts = wp.empty(m, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_neighbors.query_bvh_aabb_count,
-        dim=m,
-        inputs=[queries, bvh.id, wp.float32(half_extent), hit_counts],
-        device=device,
+    # ``wp.uint64(bvh.id)`` explicitly: unlike ``wp.launch``, ``wp.map`` infers a bare Python int
+    # scalar's dtype as ``wp.int32`` rather than matching the mapped @wp.func's declared parameter
+    # type, and a mismatched dtype is a codegen-time TypeError, not a silent truncation (probed
+    # this session, both here and at ``aabb_count_in_bounds`` below).
+    wp.map(
+        kernel_neighbors.aabb_count_in_box,
+        wp.uint64(bvh.id),
+        queries,
+        wp.float32(half_extent),
+        out=hit_counts,
     )
 
     # One ``m + 1`` scan buffer serves both forms: the length-``m`` one is a view of its prefix.
@@ -312,11 +317,14 @@ def query_bvh_box(
         )
 
     hit_counts = wp.empty(m, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_neighbors.query_bvh_box_count,
-        dim=m,
-        inputs=[query_lower, query_upper, bvh.id, hit_counts],
-        device=device,
+    # ``wp.uint64(bvh.id)`` explicitly -- see the same cast in ``query_bvh_aabb_with_offsets``
+    # above.
+    wp.map(
+        kernel_neighbors.aabb_count_in_bounds,
+        wp.uint64(bvh.id),
+        query_lower,
+        query_upper,
+        out=hit_counts,
     )
 
     segment_bounds, total_hits = tw.array.counts_to_offsets(hit_counts, include_total=True)

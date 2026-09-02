@@ -1639,3 +1639,39 @@ def comparison_label_problems() -> list[str]:
                 f"'Class C'/'Class D', 'Not a library comparison' or 'Not a parity assert'"
             )
     return problems
+
+
+# --- check 20 -----------------------------------------------------------------------------------
+
+
+def kernel_scope_ternary_problems() -> list[str]:
+    """
+    Check 20: a Python ternary (``a if cond else b``) inside a ``@wp.kernel`` or ``@wp.func`` body.
+
+    ``.claude/CLAUDE.md`` section 5: the tree's spelling for a conditional value at kernel scope is
+    ``wp.where(cond, a, b)``, 33+ sites in 16 kernel modules. A ternary compiles to the same code --
+    Warp lowers ``ast.IfExp`` the same way it lowers a call to ``wp.where`` -- so like checks 16, 17
+    and 18 this is legibility rather than correctness, and like them nothing but a scan holds the
+    line. The sixth kernels pass declared this axis at zero and was wrong: two ternaries in
+    ``kernels/intersection.py`` (``git log -L`` puts them at a line-length reformat, well before
+    that pass) survived it and at least two review passes before. Converting bare ``wp.where``
+    eagerly evaluates both arms where a ternary would short-circuit; every kernel-scope ternary
+    found to date has both arms already evaluated (an argsort output, an index), so the two are
+    interchangeable at the sites this check has found -- a future site where they are not needs a
+    comment explaining why the ternary stays, not a blanket exemption.
+    """
+    problems: list[str] = []
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # test_package_scan_is_discoverable reports the parse failure
+        for function in _kernel_scope_functions(tree):
+            for node in ast.walk(function):
+                if not isinstance(node, ast.IfExp):
+                    continue
+                problems.append(
+                    f"{path.relative_to(_REPO_ROOT)}:{node.lineno} {function.name} uses a "
+                    f"ternary ('{ast.unparse(node)}') -- write wp.where(cond, a, b) instead"
+                )
+    return problems

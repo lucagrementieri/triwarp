@@ -49,9 +49,11 @@ import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.reduce as twr
 import triwarp.typing as twt
+from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.edges import mean_unique_edge_length
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import heat as kernel_heat
+from triwarp.kernels import predicates as kernel_predicates
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.laplacian import (
     connection_laplacian,
@@ -345,9 +347,9 @@ def heat_geodesic(
     # Unit vector field X = -grad(u)/|grad(u)|.
     field = wp.empty(n_faces, dtype=wp.vec3d, device=device)
     wp.launch(
-        kernel_heat.face_gradient_normalized,
+        kernel_heat.face_unit_gradients,
         dim=n_faces,
-        inputs=[vertices, faces, normals, areas, heat, field],
+        inputs=[vertices, faces, normals, areas, heat, wp.float64(-1.0), field],
         device=device,
     )
 
@@ -495,7 +497,12 @@ def heat_signed_distance(
     # Stage 2: diffuse the tangent field, then keep only its direction.
     diffused = tw.heat.diffuse_tangent_field(vector_system, source)
     unit_field = wp.empty(n_vertices, dtype=wp.vec2d, device=device)
-    wp.map(kernel_heat.normalize_or_zero, diffused, out=unit_field)
+    wp.map(
+        kernel_predicates.normalize_or_zero,
+        diffused,
+        wp.float64(TOLERANCE_ZERO_CONSTANT),
+        out=unit_field,
+    )
 
     # Stage 3: integrate the unit field back into a scalar with a Poisson solve. The cotangent
     # weights and face normals come from the same bundle, so the Poisson stage and the diffusion
@@ -1037,9 +1044,9 @@ def log_map(
     n_faces = int(faces.shape[0]) // 3
     face_gradient = wp.empty(n_faces, dtype=wp.vec3d, device=device)
     wp.launch(
-        kernel_heat.face_gradient_unit,
+        kernel_heat.face_unit_gradients,
         dim=n_faces,
-        inputs=[vertices, faces, normals, areas, distance, face_gradient],
+        inputs=[vertices, faces, normals, areas, distance, wp.float64(1.0), face_gradient],
         device=device,
     )
     vertex_gradient = wp.zeros(n_vertices, dtype=wp.vec3, device=device)

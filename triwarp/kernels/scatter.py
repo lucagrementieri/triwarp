@@ -92,6 +92,15 @@ def scatter_offset_sum(
     wp.atomic_add(out_sum, out_index, value)
 
 
+@wp.func
+def add_corner_triple(
+    out_sum: wp.array[Any], indices: wp.array[wp.int32], row: wp.int32, a: Any, b: Any, c: Any
+) -> None:
+    wp.atomic_add(out_sum, indices[row * 3 + 0], a)
+    wp.atomic_add(out_sum, indices[row * 3 + 1], b)
+    wp.atomic_add(out_sum, indices[row * 3 + 2], c)
+
+
 @wp.kernel
 def scatter_face_thirds(
     faces: wp.array[wp.int32],
@@ -104,9 +113,7 @@ def scatter_face_thirds(
     # float32 (Laplacian) or float64 (geodesic heat method) at launch time.
     f = wp.int32(wp.tid())
     third = areas[f] / count
-    wp.atomic_add(out_mass, faces[f * 3 + 0], third)
-    wp.atomic_add(out_mass, faces[f * 3 + 1], third)
-    wp.atomic_add(out_mass, faces[f * 3 + 2], third)
+    add_corner_triple(out_mass, faces, f, third, third, third)
 
 
 @wp.kernel

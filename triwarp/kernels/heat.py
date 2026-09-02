@@ -17,7 +17,8 @@ import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.linalg import free_row
-from triwarp.kernels.predicates import unit_tangent
+from triwarp.kernels.predicates import normalize_or_zero, unit_tangent
+from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import corner_triple, face_unit_gradient, face_vertices_vec3d
 
 # --------------------------------------------------------------------------------------
@@ -30,21 +31,6 @@ def seed_source_indicator(sources: wp.array[wp.int32], out_u0: wp.array[wp.float
     # Set the initial heat to 1 at each source vertex (out_u0 pre-zeroed by the caller).
     t = wp.int32(wp.tid())
     out_u0[sources[t]] = wp.float64(1.0)
-
-
-@wp.kernel
-def face_gradient_normalized(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    normals: wp.array[wp.vec3],
-    areas: wp.array[wp.float32],
-    u: wp.array[wp.float64],
-    out_x: wp.array[wp.vec3d],
-) -> None:
-    # X = -grad(u)/|grad(u)|: the unit field pointing *away* from the source, which is the direction
-    # the Poisson stage integrates back into a distance.
-    f = wp.int32(wp.tid())
-    out_x[f] = -face_unit_gradient(vertices, faces, normals, areas, u, f)
 
 
 @wp.kernel
@@ -125,16 +111,6 @@ def splat_curve_normals(
                 wp.float64(wp.dot(curve_normal, basis_y[v])),
             ),
         )
-
-
-@wp.func
-def normalize_or_zero(vector: wp.vec2d) -> wp.vec2d:
-    # Away from every source the diffused field decays; where it has decayed to nothing there is no
-    # direction left to normalize and zero is the honest answer.
-    length = wp.length(vector)
-    if length <= wp.float64(TOLERANCE_ZERO_CONSTANT):
-        return wp.vec2d(wp.float64(0.0), wp.float64(0.0))
-    return vector / length
 
 
 @wp.kernel
@@ -227,6 +203,12 @@ def divide_positive(
     # Away from every source the indicator decays to ~0; guard the ratio rather than emit inf.
     # ``floor`` is a fraction of the indicator field's own maximum, never an absolute value -- see
     # ``scale_to_magnitude`` below for why an absolute one is a silent wrong answer on a large mesh.
+    #
+    # Not folded into ``array.divide_if_positive`` despite the shared shape: that one's threshold is
+    # a fixed zero and its fallback is the unchanged numerator, where this one's threshold is the
+    # caller's own floor and its fallback is zero -- two differences, and a four-argument
+    # ``divide_or(numerator, denominator, floor, fallback)`` covering both would be a mode argument
+    # with one caller per mode (§14).
     if denominator <= floor:
         return wp.float64(0.0)
     return numerator / denominator
@@ -258,10 +240,7 @@ def scale_to_magnitude(direction: wp.vec2d, magnitude: wp.float64, floor: wp.flo
     # linearly, extrapolating back to ~2e-07 rad of effective error, which is float32 epsilon on an
     # O(1) angle; and redoing the ring accumulation in float64 while still storing float32 leaves it
     # at 9.9e-09, so it is the angles' storage precision rather than the accumulation order.
-    length = wp.length(direction)
-    if length <= floor:
-        return wp.vec2d(wp.float64(0.0), wp.float64(0.0))
-    return (magnitude / length) * direction
+    return magnitude * normalize_or_zero(direction, floor)
 
 
 @wp.func
@@ -285,31 +264,36 @@ def scatter_face_field_to_vertices(
         wp.float32(field[f][1]) * area,
         wp.float32(field[f][2]) * area,
     )
-    for k in range(3):
-        wp.atomic_add(out_vertex_field, faces[f * 3 + k], value)
+    add_corner_triple(out_vertex_field, faces, f, value, value, value)
 
 
 @wp.kernel
-def face_gradient_unit(
+def face_unit_gradients(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     normals: wp.array[wp.vec3],
     areas: wp.array[wp.float32],
     values: wp.array[wp.float64],
+    sign: wp.float64,
     out_gradient: wp.array[wp.vec3d],
 ) -> None:
-    # For a distance field this points away from the source: the radial direction the log map's
-    # angle is measured against.
+    # The field's unit gradient direction, times an explicit sign. For a distance field this is the
+    # radial direction: `sign=1` is the direction *away* from the source (the log map's angle is
+    # measured against it), `sign=-1` is `X = -grad(u)/|grad(u)|` (the direction the heat solve's
+    # Poisson stage integrates back into a distance).
     #
-    # Deliberately not merged with ``triangles.face_gradients`` behind a ``normalize`` flag. The
-    # arithmetic is already shared -- both kernels are one-line launch shims over a ``triangles``
-    # @wp.func, and ``face_unit_gradient`` is ``normalize(face_gradient(...))`` -- so a flag would
-    # save one shim while putting a mode argument on ``laplacian.face_gradients``' path that only
-    # this caller would ever set (§14, speculative generality: one caller per mode). The two also
-    # return different quantities: a gradient carries the field's rate of change, this carries only
-    # a direction.
+    # One kernel serving both callers, not two: they used to be `face_gradient_normalized` (the
+    # `sign=-1` heat-solve shim) and `face_gradient_unit` (this one, `sign=1`), identical apart from
+    # the sign, and both are launched from `triwarp/heat.py`. Deliberately still not merged with
+    # `triangles.face_gradients` behind a `normalize` flag, though: the arithmetic is already
+    # shared -- this is a one-line launch shim over a `triangles` @wp.func, and
+    # `face_unit_gradient` is `normalize(face_gradient(...))` -- so a flag would save one shim while
+    # putting a mode argument on `laplacian.face_gradients`' path that only this module's callers
+    # would ever set (§14, speculative generality: one caller per mode). The two also return
+    # different quantities: a gradient carries the field's rate of change, this carries only a
+    # direction.
     f = wp.int32(wp.tid())
-    out_gradient[f] = face_unit_gradient(vertices, faces, normals, areas, values, f)
+    out_gradient[f] = sign * face_unit_gradient(vertices, faces, normals, areas, values, f)
 
 
 @wp.func
@@ -317,10 +301,7 @@ def world_to_tangent_unit(value: wp.vec3, basis_x: wp.vec3, basis_y: wp.vec3) ->
     # Express a 3D vertex field in each vertex's tangent basis, normalized. Only the direction
     # survives, which is all the log map's angle needs.
     tangent = wp.vec2(wp.dot(value, basis_x), wp.dot(value, basis_y))
-    length = wp.length(tangent)
-    if length <= TOLERANCE_ZERO_CONSTANT:
-        return wp.vec2(0.0, 0.0)
-    return tangent / length
+    return normalize_or_zero(tangent, TOLERANCE_ZERO_CONSTANT)
 
 
 @wp.kernel

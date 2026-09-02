@@ -58,6 +58,33 @@ def row_triple(buffer: wp.array2d[Any], row: wp.int32):
 
 
 @wp.func
+def write_corner_triple(
+    out: wp.array[wp.int32], row: wp.int32, a: wp.int32, b: wp.int32, c: wp.int32
+) -> None:
+    """
+    Write ``(a, b, c)`` into row ``row`` of a flat 3-stride buffer.
+
+    The write-side counterpart of [`corner_triple`][triwarp.kernels.triangles.corner_triple], and
+    only for the sites that permute an existing triple: most triangle-emitting kernels in the tree
+    synthesize a face from local context (a fan, a cut, a bridge) rather than reorder one, and those
+    stay as they are -- there is no shared decision to extract from a one-off construction. No
+    separate "reversed" sibling: a full ``np.fliplr``-style reversal is this same function called
+    ``write_corner_triple(out, row, c, b, a)`` -- callers pass their own arguments in the order they
+    want written, the way ``repair.reverse_face_winding`` does, rather than naming a second
+    ``@wp.func`` whose body would be this one's with its parameters permuted (identical code once
+    inlined, so the only thing a "reversed" sibling would add is a second name for the same three
+    atomics).
+    ``repair.flip_faces_masked`` and ``levelset.shell_faces`` keep corner 0 and swap only corners 1
+    and 2 -- a *different* reversal, already cross-referenced to each other, and not an adopter of
+    this function: conflating the two conventions behind one flag would be the correctness hazard
+    CLAUDE.md section 3 warns against, not a simplification.
+    """
+    out[row * wp.int32(3) + wp.int32(0)] = a
+    out[row * wp.int32(3) + wp.int32(1)] = b
+    out[row * wp.int32(3) + wp.int32(2)] = c
+
+
+@wp.func
 def face_vertices(vertices: wp.array[Any], faces: wp.array[wp.int32], face_index: wp.int32):
     """
     Load the three per-corner values of face ``face_index`` from a flat index buffer.

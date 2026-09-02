@@ -3,6 +3,7 @@ import math
 import warp as wp
 
 from triwarp.kernels.predicates import orient2d
+from triwarp.kernels.triangles import write_corner_triple
 
 SQRT3 = wp.constant(wp.float32(math.sqrt(3.0)))
 PI_F = wp.constant(wp.float32(math.pi))
@@ -289,13 +290,9 @@ def revolve_cap_faces(
     b = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 1], n_slices, column, offsets, on_axis)
     c = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 2], n_slices, column, offsets, on_axis)
     if reverse:
-        out_faces[t * 3 + 0] = c
-        out_faces[t * 3 + 1] = b
-        out_faces[t * 3 + 2] = a
+        write_corner_triple(out_faces, t, c, b, a)
     else:
-        out_faces[t * 3 + 0] = a
-        out_faces[t * 3 + 1] = b
-        out_faces[t * 3 + 2] = c
+        write_corner_triple(out_faces, t, a, b, c)
 
 
 @wp.kernel
@@ -309,13 +306,9 @@ def offset_cap_faces(
     b = cap_faces[t * 3 + 1] + offset
     c = cap_faces[t * 3 + 2] + offset
     if reverse:
-        out_faces[t * 3 + 0] = c
-        out_faces[t * 3 + 1] = b
-        out_faces[t * 3 + 2] = a
+        write_corner_triple(out_faces, t, c, b, a)
     else:
-        out_faces[t * 3 + 0] = a
-        out_faces[t * 3 + 1] = b
-        out_faces[t * 3 + 2] = c
+        write_corner_triple(out_faces, t, a, b, c)
 
 
 @wp.kernel
@@ -472,13 +465,9 @@ def write_prism_face(
     # reverses the winding for prisms whose source triangle faces the plane (trimesh's
     # ``f_seq[cross > 0] = np.fliplr(f)``).
     if flip:
-        out_faces[slot * 3 + 0] = offset + c
-        out_faces[slot * 3 + 1] = offset + b
-        out_faces[slot * 3 + 2] = offset + a
+        write_corner_triple(out_faces, slot, offset + c, offset + b, offset + a)
     else:
-        out_faces[slot * 3 + 0] = offset + a
-        out_faces[slot * 3 + 1] = offset + b
-        out_faces[slot * 3 + 2] = offset + c
+        write_corner_triple(out_faces, slot, offset + a, offset + b, offset + c)
 
 
 @wp.kernel
@@ -809,24 +798,6 @@ def parametric_position(
     elif kind == SURFACE_SUPER_TOROID:
         position = surface_super_toroid(u, v, n1, n2)
     return position
-
-
-@wp.kernel
-def parametric_surface_vertices(
-    kind: wp.int32,
-    n1: wp.float32,
-    n2: wp.float32,
-    sample_u: wp.array[wp.float32],
-    sample_v: wp.array[wp.float32],
-    out_vertices: wp.array[wp.vec3],
-) -> None:
-    # One thread per *output* vertex, carrying the one lattice sample chosen to represent it. Where
-    # the surface glues, several lattice samples map to the same vertex; evaluating only the
-    # canonical one keeps the result bit-exact run to run, which launching over the lattice and
-    # letting the identified samples race for the slot would not (a twisted seam and a collapsed
-    # pole row reach the same point through different expressions, so they agree only to rounding).
-    t = wp.int32(wp.tid())
-    out_vertices[t] = parametric_position(kind, sample_u[t], sample_v[t], n1, n2)
 
 
 @wp.kernel

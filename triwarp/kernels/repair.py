@@ -3,7 +3,7 @@ import warp as wp
 from triwarp.kernels.array import pack_ranked_key, update_argmin_pair
 from triwarp.kernels.halfedge import halfedge_destination, halfedge_next
 from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_normal
-from triwarp.kernels.triangles import corner_triple, triangle_cross
+from triwarp.kernels.triangles import corner_triple, triangle_cross, write_corner_triple
 
 
 @wp.func
@@ -150,9 +150,7 @@ def reverse_face_winding(faces: wp.array[wp.int32], out_faces: wp.array[wp.int32
     # this is safe to run in place (out_faces is faces).
     f = wp.int32(wp.tid())
     a, b, c = corner_triple(faces, f)
-    out_faces[f * 3 + 0] = c
-    out_faces[f * 3 + 1] = b
-    out_faces[f * 3 + 2] = a
+    write_corner_triple(out_faces, f, c, b, a)
 
 
 @wp.kernel

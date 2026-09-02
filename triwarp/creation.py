@@ -2329,20 +2329,22 @@ def _parametric_surface(
     n2: float = 1.0,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """Sample one analytic surface on its identified lattice, for the four public builders."""
+    # One output per *vertex*, carrying the one lattice sample chosen to represent it, never one per
+    # lattice sample: where the surface glues, several lattice samples map to the same vertex, and
+    # evaluating only the canonical one keeps the result bit-exact run to run -- mapping over the
+    # lattice and letting the identified samples race for the slot would not (a twisted seam and a
+    # collapsed pole row reach the same point through different expressions, so they agree only to
+    # rounding).
     sample_u, sample_v, faces = _parametric_samples(spec, u_resolution, v_resolution)
     vertices = wp.empty(sample_u.shape[0], dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_creation.parametric_surface_vertices,
-        dim=int(vertices.shape[0]),
-        inputs=[
-            spec.kind,
-            wp.float32(n1),
-            wp.float32(n2),
-            wp.array(sample_u, dtype=wp.float32, device=device),
-            wp.array(sample_v, dtype=wp.float32, device=device),
-            vertices,
-        ],
-        device=device,
+    wp.map(
+        kernel_creation.parametric_position,
+        spec.kind,
+        wp.array(sample_u, dtype=wp.float32, device=device),
+        wp.array(sample_v, dtype=wp.float32, device=device),
+        wp.float32(n1),
+        wp.float32(n2),
+        out=vertices,
     )
     return vertices, wp.array(faces, dtype=wp.int32, device=device)
 

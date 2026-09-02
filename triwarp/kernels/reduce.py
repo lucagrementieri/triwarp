@@ -447,8 +447,8 @@ def minmax2d_tiled(values: wp.array2d[wp.Scalar], out_minmax: wp.array[wp.Scalar
 
     remaining_rows = n_rows - row_offset
     remaining_cols = n_cols - col_offset
-    tile_rows = TILE_2D if remaining_rows >= TILE_2D else remaining_rows
-    tile_cols = TILE_2D if remaining_cols >= TILE_2D else remaining_cols
+    tile_rows = wp.where(remaining_rows >= TILE_2D, TILE_2D, remaining_rows)
+    tile_cols = wp.where(remaining_cols >= TILE_2D, TILE_2D, remaining_cols)
     if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
         tile = wp.tile_load(
             values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register"

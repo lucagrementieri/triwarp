@@ -48,6 +48,7 @@ from tests.api_conventions import (
     integer_division_problems,
     kernel_module_problems,
     kernel_output_naming_problems,
+    kernel_scope_ternary_problems,
     launch_device_problems,
     library_in_summary_problems,
     mask_return_problems,
@@ -402,6 +403,19 @@ def test_bare_annotation_scan_ignores_kernel_factories() -> None:
         if isinstance(annotation, ast.Name) and annotation.id in {"bool", "int", "float"}
     ]
     assert flagged == ["is_short:->", "row_kernel:scale"]  # ast.walk is breadth-first
+
+
+def test_kernel_scope_has_no_python_ternary() -> None:
+    """
+    A ``@wp.kernel`` / ``@wp.func`` body spells a conditional value ``wp.where(cond, a, b)``.
+
+    ``.claude/CLAUDE.md`` section 5. A Python ternary (``a if cond else b``) compiles to the same
+    code as ``wp.where``, so -- as with checks 16, 17 and 18 -- nothing but a scan keeps the two
+    spellings apart. This is check 20, added because the sixth kernels pass reported this axis at
+    zero and was wrong: two ternaries in ``kernels/intersection.py`` predate that pass by several
+    review rounds and survived a scan built specifically to find them.
+    """
+    _fail("kernel-scope ternary(s):", kernel_scope_ternary_problems())
 
 
 def test_generic_kernels_register_their_overloads() -> None:

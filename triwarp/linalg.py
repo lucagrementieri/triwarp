@@ -1927,9 +1927,7 @@ def _multigrid_aggregate(
 
     label = wp.empty(n, dtype=wp.int32, device=device)
     next_label = wp.empty(n, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_mg.seed_aggregate_labels, dim=n, inputs=[state, scan_pos, label], device=device
-    )
+    wp.map(kernel_mg.aggregate_label, state, scan_pos, out=label)
     for _ in range(2):
         wp.launch(
             kernel_mg.spread_aggregate_labels,

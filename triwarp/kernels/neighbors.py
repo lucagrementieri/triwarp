@@ -139,17 +139,6 @@ def aabb_count_in_box(bvh_id: wp.uint64, q: wp.vec3, half_extent: wp.float32) ->
     return aabb_count_in_bounds(bvh_id, q - wp.vec3(half_extent), q + wp.vec3(half_extent))
 
 
-@wp.kernel
-def query_bvh_aabb_count(
-    queries: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    half_extent: wp.float32,
-    out_counts: wp.array[wp.int32],
-) -> None:
-    tid = wp.tid()
-    out_counts[tid] = aabb_count_in_box(bvh_id, queries[tid], half_extent)
-
-
 @wp.func
 def aabb_collect_in_bounds(
     bvh_id: wp.uint64,
@@ -189,18 +178,8 @@ def query_bvh_aabb_neighbors(
 
 # The per-query-box pair. Same traversal as the two kernels above, and the only difference is that
 # the corners are read per query instead of derived from one warp-uniform half extent -- so a caller
-# with a single cube size keeps the cheaper pair and pays for no corner buffers.
-@wp.kernel
-def query_bvh_box_count(
-    query_lower: wp.array[wp.vec3],
-    query_upper: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    out_counts: wp.array[wp.int32],
-) -> None:
-    tid = wp.tid()
-    out_counts[tid] = aabb_count_in_bounds(bvh_id, query_lower[tid], query_upper[tid])
-
-
+# with a single cube size keeps the cheaper pair and pays for no corner buffers. The count half is a
+# ``wp.map`` over ``aabb_count_in_bounds`` now rather than a kernel shim (CLAUDE.md section 4).
 @wp.kernel
 def query_bvh_box_neighbors(
     query_lower: wp.array[wp.vec3],

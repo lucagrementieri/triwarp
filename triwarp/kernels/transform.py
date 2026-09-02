@@ -10,6 +10,8 @@ apply it would cost the readback [`triwarp.registration`][triwarp.registration] 
 
 import warp as wp
 
+from triwarp.kernels.predicates import normalize_or_zero
+
 
 @wp.func
 def transform_point_mat44(point: wp.vec3, matrix: wp.mat44) -> wp.vec3:
@@ -34,9 +36,12 @@ def transform_normal_mat33(normal: wp.vec3, normal_matrix: wp.mat33) -> wp.vec3:
     # Length is not preserved even for a rotation once float32 rounding is in play, so renormalize
     # unconditionally. A zero input stays zero: the degenerate-face convention
     # ``face_normals_and_areas`` writes, which every consumer already reads.
+    #
+    # ``predicates.normalize_or_zero`` takes a ``<=`` tolerance where this guard was ``> 0.0``
+    # (strictly zero); passing an explicit ``wp.float32(0.0)`` preserves that exactly rather than
+    # silently moving this normal-transform path onto the package's ``TOLERANCE_ZERO_CONSTANT``.
     mapped = normal_matrix * normal
-    length = wp.length(mapped)
-    return wp.where(length > wp.float32(0.0), mapped / length, wp.vec3(wp.float32(0.0)))
+    return normalize_or_zero(mapped, wp.float32(0.0))
 
 
 @wp.kernel

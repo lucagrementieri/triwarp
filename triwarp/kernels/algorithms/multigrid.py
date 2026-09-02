@@ -161,12 +161,17 @@ def mis_root_flag(state: wp.int32) -> wp.int32:
     return wp.where(state != MG_EXCLUDED, wp.int32(1), wp.int32(0))
 
 
-@wp.kernel
-def seed_aggregate_labels(
-    state: wp.array[wp.int32], scan_pos: wp.array[wp.int32], out_label: wp.array[wp.int32]
-) -> None:
-    i = wp.int32(wp.tid())
-    out_label[i] = wp.where(state[i] != MG_EXCLUDED, scan_pos[i] - wp.int32(1), MG_UNAGGREGATED)
+@wp.func
+def aggregate_label(state: wp.int32, scan_pos: wp.int32) -> wp.int32:
+    # An excluded node has no aggregate; everything else takes the (0-based) index its inclusive
+    # scan position names. A `wp.map` target (CLAUDE.md section 4) rather than a kernel: the body
+    # is one indexed assignment reading only `state[i]` / `scan_pos[i]`, the elementwise-map scan's
+    # own definition of a trivial kernel. Left un-hoisted (no `return_kernel=True`) at its one call
+    # site inside `linalg._multigrid_aggregate`'s per-level loop: hoisting would need a dummy
+    # int32 array allocated before the loop just to seed the kernel factory, or threading the
+    # cached kernel object through the function's signature, for an ~11 us/level saving against a
+    # setup section already measured at 9-18 ms (CLAUDE.md section 13) -- not where that cost lives.
+    return wp.where(state != MG_EXCLUDED, scan_pos - wp.int32(1), MG_UNAGGREGATED)
 
 
 @wp.kernel
