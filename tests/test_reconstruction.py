@@ -676,6 +676,19 @@ def test_poisson_matches_open3d_metric(device: str):
 
 @pytest.mark.slow_cpu(18.5)
 def test_poisson_screening_improves_fit(device: str):
+    """
+    Triwarp against triwarp: screening ties the surface to the samples, so the fit cannot worsen.
+
+    Also the only test that reconstructs at ``point_weight=0``, which is why the no-degenerate-face
+    invariant is asserted here rather than in a test of its own (CLAUDE.md section 6). That config
+    is ill-conditioned -- the operator is held SPD by a ``1e-4`` floor alone -- and its raw
+    marching-cubes output carried 27-64 zero-area triangles, run to run, until
+    ``screened_poisson`` grew its ``remove_degenerate_faces`` tail. They are not cosmetic: a
+    zero-area face has no normal to orient, and trimesh's ``closest_point`` divides by its
+    zero-length edge, so ``_points_to_surface`` below emitted an intermittent
+    ``RuntimeWarning: invalid value encountered in divide`` from this test alone. The screened side
+    emits none at any depth and is included so the assertion is not one-sided.
+    """
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -691,6 +704,13 @@ def test_poisson_screening_improves_fit(device: str):
     )
     # Screening ties the surface to the samples: the fit is at least as good.
     assert fit_screened <= fit_unscreened + 1e-4
+    # Neither output may carry a zero-area triangle -- see the docstring. Asserted on the faces
+    # actually returned, so this fails if the cleanup tail is dropped from either code path.
+    for vertices_wp, faces_wp in (
+        (vertices_screened, faces_screened),
+        (vertices_unscreened, faces_unscreened),
+    ):
+        assert np.all(tw.triangles.face_nondegenerate_mask(vertices_wp, faces_wp).numpy())
 
 
 @pytest.mark.parity(

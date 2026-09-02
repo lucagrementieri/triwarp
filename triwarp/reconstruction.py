@@ -436,7 +436,8 @@ def screened_poisson(
     vertices : wp.array[wp.vec3]
         Iso-surface vertices on ``points.device``.
     faces : wp.array[wp.int32]
-        Flat ``3 * n_faces`` triangle index buffer, oriented outward
+        Flat ``3 * n_faces`` triangle index buffer, free of zero-area triangles
+        ([`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]) and oriented outward
         ([`make_normals_outward`][triwarp.repair.make_normals_outward]).
 
     Raises
@@ -479,6 +480,16 @@ def screened_poisson(
     flatter in depth (it already caps near-surface refinement at the sample spacing) and is the
     better choice when the depth wanted for the extraction lattice exceeds what the sampling
     supports.
+
+    **``point_weight=0`` is ill-conditioned, and its output is not reproducible.** Screening is what
+    conditions the operator; at ``0`` only the ``1e-4`` floor above keeps it SPD, so the conjugate
+    gradient stops on a solution whose level set is genuinely uncertain. Measured on a 642-point
+    sphere at ``depth=6``, three runs in one process: **34 614 / 34 539 / 34 877** faces, of which
+    59 / 64 / 48 were zero-area before the cleanup described under ``Returns``, and the surface is
+    not watertight (measured 187-213 boundary edges). The default ``point_weight=4`` is bit-stable
+    at 32 552 faces over the same three runs and is watertight with χ = 2. So ``0`` is for comparing
+    *against* a screened reconstruction, not for producing one -- and do not pin a count taken
+    from it.
     """
     if not (3 <= full_depth <= depth <= 10):
         raise ValueError(
@@ -538,6 +549,17 @@ def screened_poisson(
         iso = _poisson_iso_value(sampled, normals, confidence)
         vertices, faces = _extract_poisson_surface(solution, res, iso, cube_lower, cube_upper)
 
+    # Drop zero-area triangles before orienting. Marching cubes emits one wherever the level set
+    # grazes a lattice node, and such a face has no normal for ``make_normals_outward`` to orient
+    # and hands the caller a NaN out of any closest-point query -- trimesh's ``closest_point``
+    # divides by the squared length of the zero-length edge (measured). This is deliberately *not*
+    # the full ``_clean_reconstruction`` tail the other three reconstructions use: welding the
+    # coincident vertices as well preserves the boundary-edge count but manufactures non-manifold
+    # edges (measured 6 on an unscreened sphere), and dedup would change the default path's output.
+    # As written it is **byte-identical** on a well-screened reconstruction -- the default
+    # ``point_weight`` emits no degenerate face at all -- and costs 0.7 % of the call at the default
+    # ``depth=8`` (0.89 ms of 123), 5.7 % at ``depth=6``.
+    vertices, faces = tw.repair.remove_degenerate_faces(vertices, faces)
     if int(faces.shape[0]) > 0:
         faces = tw.repair.make_normals_outward(vertices, faces)
     return vertices, faces
