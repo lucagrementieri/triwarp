@@ -1271,16 +1271,22 @@ def scramble_index(index: wp.int32) -> wp.int32:
 
 
 @wp.kernel(enable_backward=False)
-def claim_collapses(
+def claim_collapse_key(
     survivor: wp.array[wp.int32],
     removed: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
-    out_claim: wp.array[wp.int32],
+    out_min_key: wp.array[wp.int32],
 ) -> None:
-    # Lock the full closed 1-ring of both endpoints (min scrambled key wins), so committed
-    # collapses have disjoint neighbourhoods and stay independent.
+    # The winning (smallest scrambled) key over the closed 1-rings of both endpoints.
     #
+    # **Both collapse paths launch this same kernel**, and all they differ by is what they do with
+    # the answer: ``isotropic_remesh``'s ``_collapse_pass`` reads it back directly as the claim,
+    # while the quadric path treats it as pass 1 of 3 and follows it with ``claim_collapse_index``
+    # to break a key collision. It was two kernels -- ``claim_collapses`` and this -- whose bodies
+    # became byte-identical once ``scatter.lock_two_rings`` was extracted and the isotropic path's
+    # raw-index key was fixed; the duplicate scan found them the same pass that produced them,
+    # which is section 3's point about a fusion not being done until the shared code has a name.
     # The key is ``scramble_index(k)`` and not ``k`` for the reason that function records at
     # length: a min-key lock over a *spatially monotone* key field has essentially one local
     # minimum, so it commits a single collapse per pass however many candidates there are. This
@@ -1309,7 +1315,7 @@ def claim_collapses(
     s = survivor[k]
     if s < 0:
         return
-    lock_two_rings(offsets, columns, s, removed[k], scramble_index(k), out_claim)
+    lock_two_rings(offsets, columns, s, removed[k], scramble_index(k), out_min_key)
 
 
 @wp.kernel(enable_backward=False)
@@ -2332,22 +2338,6 @@ def end_collapse_round(
     out_state[COLLAPSE_COMMITS] = count[0]
     keep_going = progressed and out_state[LOOP_ROUND] < max_rounds
     out_state[LOOP_CONDITION] = wp.where(keep_going, wp.int32(1), wp.int32(0))
-
-
-@wp.kernel(enable_backward=False)
-def claim_collapse_key(
-    survivor: wp.array[wp.int32],
-    removed: wp.array[wp.int32],
-    offsets: wp.array[wp.int32],
-    columns: wp.array[wp.int32],
-    out_min_key: wp.array[wp.int32],
-) -> None:
-    # Pass 1 of 3: the winning (smallest scrambled) key over the closed 1-rings of both endpoints.
-    k = wp.int32(wp.tid())
-    s = survivor[k]
-    if s < 0:
-        return
-    lock_two_rings(offsets, columns, s, removed[k], scramble_index(k), out_min_key)
 
 
 @wp.kernel(enable_backward=False)

@@ -517,7 +517,7 @@ def _collapse_pass(
 
         claim = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_remesh.claim_collapses,
+            kernel_remesh.claim_collapse_key,
             dim=m,
             inputs=[survivor, removed, csr.offsets, csr.columns, claim],
             device=device,

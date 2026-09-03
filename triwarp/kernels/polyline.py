@@ -106,6 +106,16 @@ def accumulate_newell_normal(polyline: wp.array[wp.vec3], out_normal: wp.array[w
     # down, ``boundary.find_ears``, ``remesh.commit_flips`` -- contends in proportion to its
     # **hits** rather than to the launch, so converting one would add a block reduction to a
     # kernel that atomically adds a handful of times. Leave those alone.
+    #
+    # The four-statement prologue below (``wp.tid()``, ``tile_chunk``, the guard, the clamp) is
+    # repeated in all four converted kernels and the statement-run scan pairs them; it is **not**
+    # extractable and the reason is structural rather than a judgement call. ``wp.tid()`` may only
+    # be called from a ``@wp.kernel`` (section 1), and the third statement is an early ``return``
+    # that a ``@wp.func`` cannot perform for its caller -- so a helper would have to return a
+    # validity flag and every call site would regain the guard it was meant to lose. Same verdict
+    # and same reason as ``holes.fill_dp_span``'s written decline. What *is* shared is the number
+    # the four of them have to agree on, and that is named: ``reduce.ITEMS_PER_BLOCK_1D``, read by
+    # ``blocks_1d`` at the launch and by ``tile_chunk`` here.
     chunk, lane = wp.tid()
     n_pairs = polyline.shape[0] - 1
     offset, remaining = tile_chunk(n_pairs, chunk, ITEMS_PER_BLOCK_1D)
