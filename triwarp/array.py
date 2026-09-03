@@ -561,9 +561,6 @@ def allclose(
         return True
 
     mask = wp.empty(n, dtype=wp.bool, device=a.device)
-    # ``is_close_scalar`` is generic over ``wp.Float`` and instantiates at the input's precision, so
-    # the tolerances have to arrive at that precision too. Vectors get a concrete overload: Warp has
-    # no generic vector annotation, and no ``wp.all`` over components to fold one with.
     if a.dtype == wp.vec3:
         wp.map(kernel_array.is_close_vec3, a, b, wp.float32(rtol), wp.float32(atol), out=mask)
     else:

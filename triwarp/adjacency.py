@@ -414,9 +414,6 @@ def face_adjacency_unshared(
     # indices instead. Only the pairing rule is shared.
     _require_paired_adjacency(face_adjacency, face_adjacency_edges)
     if face_adjacency is None:
-        # Both the owning faces and the shared edge are recoverable from the two grouped *edge*
-        # indices, so the adjacency and edge tables this used to build (and gather through) are
-        # never needed. Identical values to the branch below, including row order.
         n_faces = int(faces.shape[0]) // 3
         edge_groups = (
             _edge_groups(faces, None, n_vertices)
@@ -503,9 +500,6 @@ def face_adjacency_angles(
         return wp.empty(0, dtype=wp.float32, device=device)
 
     if face_adjacency is None:
-        # Through the package namespace because the parameter shadows the module-level function,
-        # which is also how ``resolve_face_adjacency`` reaches it. ``vertices`` already bounds the
-        # face indices, so the radix needs no inference.
         face_adjacency = tw.adjacency.face_adjacency(faces, n_vertices=int(vertices.shape[0]))
     if face_normals is None:
         face_normals, _ = tw.triangles.face_normals_and_areas(vertices, faces)
@@ -719,8 +713,6 @@ def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.in
     """
     n_faces = int(faces.shape[0]) // 3
     adjacency = face_adjacency(faces)
-    # ``face_adjacency`` emits face indices, so they are in range by construction; validating would
-    # copy the whole adjacency buffer to the host on an otherwise sync-free path.
     return tw.graph.connected_component_labels_from_edges(
         adjacency, node_count=n_faces, validate=False
     )

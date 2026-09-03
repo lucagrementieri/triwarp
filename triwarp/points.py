@@ -313,12 +313,11 @@ def centered_covariance(
     out = wp.zeros(1, dtype=wp.mat33, device=device)
     if n == 0:
         return out
-    n_tiles = (n + TILE_1D - 1) // TILE_1D
     if center is None:
         center = centroid(points)
     wp.launch_tiled(
         kernel_points.centered_covariance,
-        dim=[n_tiles],
+        dim=[kernel_reduce.blocks_1d(n)],
         inputs=[points, center, out],
         block_dim=TILE_1D,
         device=device,

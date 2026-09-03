@@ -171,11 +171,10 @@ def _procrustes_into(
     if weights is None:
         weights = workspace["uniform_weights"]
 
-    n_chunks = (n + TILE_1D - 1) // TILE_1D
     acc.zero_()
     wp.launch_tiled(
         kernel_registration.accumulate_procrustes_moments,
-        dim=[n_chunks],
+        dim=kernel_reduce.blocks_1d(n),
         inputs=[a, b, weights, translation, acc],
         block_dim=TILE_1D,
         device=device,
@@ -192,16 +191,12 @@ def _procrustes_into(
 
     out_transformed = workspace["transformed"]
     assert out_transformed is not None
-    wp.launch(
-        kernel_transform.apply_transform_mat44,
-        dim=n,
-        inputs=[a, out_matrix, out_transformed],
-        device=device,
-    )
+    # One launch, not two: this both writes ``out_transformed`` and reduces the residual against
+    # it. See the kernel for why fusing became worth it only after the reduction was flattened.
     wp.launch_tiled(
-        kernel_registration.accumulate_cost,
+        kernel_registration.transform_and_accumulate_cost,
         dim=kernel_reduce.blocks_1d(n),
-        inputs=[out_transformed, b, weights, acc],
+        inputs=[a, b, weights, out_matrix, acc, out_transformed],
         block_dim=TILE_1D,
         device=device,
     )
@@ -482,7 +477,6 @@ def icp_point_to_plane(
     max_d = max_distance if max_distance is not None else math.inf
     scale_value = robust_scale
     old_cost = math.inf
-    n_tiles = (n + TILE_1D - 1) // TILE_1D
 
     # All per-iteration buffers are allocated once; the accumulators are zeroed in place and
     # ``current``/``updated`` ping-pong. ``total`` is cloned so composing in place never mutates
@@ -534,7 +528,7 @@ def icp_point_to_plane(
         cost_acc.zero_()
         wp.launch_tiled(
             kernel_registration.accumulate_point_to_plane,
-            dim=[n_tiles],
+            dim=kernel_reduce.blocks_1d(n),
             inputs=[
                 current,
                 closest,

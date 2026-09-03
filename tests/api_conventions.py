@@ -409,8 +409,8 @@ _KERNEL_WRITE_CALLS = frozenset(
 # - **In-place**: the argument is both the input and the result -- an ``out_`` prefix would misread
 #   as write-only. ``sort_rows_insertion(data)``, ``orient_ccw(points2d)``,
 #   ``offset_packed_faces(faces)``, the hole-filling DP tables (read at smaller spans, written at
-#   the current one) and ``accumulate_cost(acc)``, which reads the packed accumulator's weight-sum
-#   slot while atomically adding into its cost slot.
+#   the current one) and ``transform_and_accumulate_cost(acc)``, which reads the packed
+#   accumulator's weight-sum slot while atomically adding into its cost slot.
 # - **Scratch / persistent state**: caller-allocated working memory carried across launches --
 #   cursors, stacks, open-addressing tables, the ear-clipping ring, ``ball_pivoting``'s
 #   persistent front. Neither an input nor the answer, so the name says what the buffer holds
@@ -428,7 +428,7 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # ``quadric_decimate``'s provenance column, folded one pass at a time: the array is the previous
     # pass's answer *and* this pass's, so it is in place and ``out_`` would read as write-only.
     ("remesh", "compose_vertex_index"): frozenset({"index"}),
-    ("registration", "accumulate_cost"): frozenset({"acc"}),
+    ("registration", "transform_and_accumulate_cost"): frozenset({"acc"}),
     # scratch / persistent state
     ("adjacency", "scatter_vertex_faces"): frozenset({"cursor"}),
     # ``min_distance_sq`` is the farthest-point sampler's running distance-to-the-chosen-set:

@@ -1472,6 +1472,13 @@ def extrude_triangulation(
 
     out_faces = wp.empty((2 * n_faces + 2 * n_boundary) * 3, dtype=wp.int32, device=device)
     # Bottom cap winding is reversed; the top cap keeps it and is offset by one vertex block.
+    #
+    # These two write disjoint slices and could be one launch over both caps. Declined on the
+    # measured share: one ``offset_cap_faces`` launch is 13.54-13.60 us (200 launches between two
+    # syncs -- 4 arguments, so exactly what the ~9.7 us + ~1.0 us/argument model predicts) against
+    # a call of 0.717 / 0.762 / 0.864 ms at a 64 / 512 / 4096-vertex ring, i.e. **1.89 % falling to
+    # 1.57 %**. The call is flat in ``n_faces`` and dominated by the boundary extraction above, so
+    # the saving is largest exactly where the call is already cheap.
     wp.launch(
         kernel_creation.offset_cap_faces,
         dim=n_faces,
@@ -1667,6 +1674,9 @@ def sweep_polygon(
     )
     if n_cap > 0:
         base = 2 * n_slices * n_boundary * 3
+        # Same disjoint-slice pair as ``extrude_triangulation``, declined the same way and for the
+        # same reason: one launch is 14.12 / 16.08 us against a 1.451 / 1.609 ms call at
+        # sections=16 path=32 / sections=64 path=256 -- **0.97-1.00 %** of it.
         wp.launch(
             kernel_creation.offset_cap_faces,
             dim=n_cap,

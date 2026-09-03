@@ -646,6 +646,11 @@ def _scatter_constraints(
     fixed_values = wp.zeros((2, n_vertices), dtype=wp.float64, device=device)
     n_fixed = int(indices.shape[0])
     if n_fixed > 0:
+        # Two independent per-pin scatters into different buffers, so they fuse trivially into one
+        # launch. Declined on the share: ``n_fixed`` is 2 for ``lscm`` and a boundary loop for the
+        # fixed-boundary solvers, and one ``scatter_boundary_mask`` launch is 11.45 / 14.72 us
+        # against an ``lscm`` call of 15.27 / 81.05 ms on a 40x40 / 120x120 grid -- **0.07 %
+        # falling to 0.02 %**, the smallest share of any fusion candidate in the package.
         wp.launch(
             kernel_parametrization.scatter_boundary_mask,
             dim=n_fixed,

@@ -53,9 +53,11 @@ def blocks_1d(n: int) -> int:
     idempotent for the extrema, that would leave ``min`` / ``max`` / ``any`` / ``all`` looking
     correct while ``sum`` silently returned 16x its answer.
 
-    It is also the launch width for the *lane-strided* single-slot reductions outside this module
-    -- ``registration.accumulate_cost``, ``polyline.accumulate_newell_normal`` /
-    ``accumulate_turning_angle`` / ``accumulate_loop_frame`` -- which own the same
+    It is also the launch width for the *lane-strided* reductions outside this module --
+    ``registration.transform_and_accumulate_cost`` / ``accumulate_procrustes_moments`` /
+    ``accumulate_point_to_plane``, ``points.centered_covariance``,
+    ``polyline.accumulate_newell_normal`` / ``accumulate_turning_angle`` /
+    ``accumulate_loop_frame`` -- which own the same
     [`ITEMS_PER_BLOCK_1D`][triwarp.kernels.reduce.ITEMS_PER_BLOCK_1D] chunk per block but partition
     it across lanes with ``wp.block_dim()`` rather than loading tiles from it.
 
@@ -594,16 +596,24 @@ weighted_sum_vec3_1d_tiled = _weighted_sum_1d_tiled("weighted_sum_vec3_1d_tiled"
 
 @wp.func
 def outer_sum_chunk(
-    points: wp.array[wp.vec3], center: wp.vec3, offset: wp.int32, remaining: wp.int32
+    points: wp.array[wp.vec3],
+    center: wp.vec3,
+    offset: wp.int32,
+    remaining: wp.int32,
+    lane: wp.int32,
+    stride: wp.int32,
 ) -> wp.mat33:
-    # ``_chunk``, not ``_tile``: unlike the sum reductions above this walks the chunk with a plain
-    # loop and uses no tile primitive, so every lane of the block recomputes the same matrix and
-    # only lane 0's copy is accumulated. The name says so rather than promising a cooperative
+    # ``_chunk``, not ``_tile``: this walks its share of the block's chunk with a plain loop and
+    # uses no tile primitive, so it returns one lane's *partial* matrix and the caller is
+    # responsible for reducing across lanes. The name says so rather than promising a cooperative
     # reduction that is not here.
-    count = wp.min(remaining, TILE_1D)
+    #
+    # ``lane`` / ``stride`` are passed rather than read from ``wp.block_dim()`` because this is a
+    # ``@wp.func``: the caller is the kernel that knows its own launch shape.
+    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     # M = sum_k outer(x_k, x_k) where x_k = points[k] - center
     m = wp.mat33(0.0)
-    for k in range(count):
+    for k in range(lane, count, stride):
         x = points[offset + k] - center
         m += wp.outer(x, x)
     return m

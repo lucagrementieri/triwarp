@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import FLOAT32_INF_CONSTANT, TILE_1D
+from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels.array import (
     declare_map_signatures,
     map_probe,
@@ -10,7 +10,7 @@ from triwarp.kernels.array import (
     unpack_ranked_index,
 )
 from triwarp.kernels.intersection import point_plane_dot
-from triwarp.kernels.reduce import outer_sum_chunk, tile_chunk
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, outer_sum_chunk, tile_chunk
 
 
 @wp.func
@@ -53,15 +53,45 @@ def centered_covariance(
     # callers are ``points``' own ``gram_matrix`` / ``fit_line`` / ``fit_plane``. ``triwarp.reduce``
     # is axis-parametrized array reductions in NumPy's vocabulary; a mat33 of second moments is not
     # one of those (§11, the machinery half outranks the subject half).
-    i, t = wp.tid()
-    offset, remaining = tile_chunk(points.shape[0], i, TILE_1D)
+    # Launched ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``: one block per
+    # ``ITEMS_PER_BLOCK_1D`` points, lanes striding that block's own chunk, nine ``wp.tile_sum``
+    # tree reductions, one ``wp.mat33`` atomic per block.
+    #
+    # It was every lane walking a ``TILE_1D`` chunk with lane 0 publishing its own copy, which put
+    # one add per block on each of nine hot addresses at ``n / TILE_1D`` blocks. The redundant lane
+    # arithmetic was not the cost -- the block count was; the same finding as
+    # ``registration.accumulate_procrustes_moments``, where removing the redundancy alone was
+    # measured at 1.02-1.13x. Interleaved A/B, min of seven alternating reps on an RTX 5090:
+    #
+    #   n              5 000    20 000   200 000   1 000 000
+    #   every-lane     0.0176   0.0169   0.0411    0.1663  ms
+    #   lane-strided   0.0173   0.0164   0.0147    0.0169  ms
+    #   speed-up       1.02x    1.03x    2.80x     9.82x
+    #
+    # Nine reductions is the cheapest accumulator in this family to amortize, which is why it turns
+    # over sooner than the 25- and 43-slot ``registration`` pair. Against a float64 reference the
+    # tree is 1.24e-07 / 5.64e-07 at n = 200 000 / 1 000 000 where the serialized form is
+    # 6.07e-07 / **3.56e-06**.
+    #
+    # No ``prefers_tiled_reduction`` branch, for the reason in ``.claude/CLAUDE.md`` section 2.2:
+    # the lanes partition a chunk the block already owns and stride by ``wp.block_dim()``, which
+    # reads 1 on CPU. ``measures.centroid_tiled`` needs a device pair because *its* lanes partition
+    # the outer work at a constant stride; this is the other form.
+    chunk, lane = wp.tid()
+    offset, remaining = tile_chunk(points.shape[0], chunk, ITEMS_PER_BLOCK_1D)
     if remaining <= 0:
         return
 
-    m = outer_sum_chunk(points, center[0], offset, remaining)
+    m = outer_sum_chunk(points, center[0], offset, remaining, lane, wp.block_dim())
 
-    if t == 0:
-        wp.atomic_add(out_cov, 0, m)
+    # Block-collective, so all nine run outside the ``lane == 0`` guard.
+    total = wp.mat33(wp.float32(0.0))
+    for r in range(3):
+        for c in range(3):
+            total[r, c] = wp.tile_sum(wp.tile(m[r, c]))[0]
+
+    if lane == 0:
+        wp.atomic_add(out_cov, 0, total)
 
 
 @wp.kernel
