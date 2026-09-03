@@ -182,6 +182,39 @@ def filter_laplacian(
     return _as_vec3(positions)
 
 
+def _build_implicit_system(
+    operator: wps.BsrMatrix[wp.float32], lamb: float, n: int, device: wp.DeviceLike
+) -> wps.BsrMatrix[wp.float64]:
+    # ``nnz_sync()``, never ``operator.nnz``: after ``bsr_from_triplets`` the ``nnz`` field is a
+    # stale cache holding the triplet *capacity* it was handed, duplicates included, and only a
+    # ``nnz_sync()`` repairs it (no other operation does, so whether ``nnz`` reads correctly depends
+    # on unrelated earlier code). The uniform default is duplicate-free so the two agree there, but
+    # a caller-supplied ``cotmatrix`` (12 triplets per face) overshoots 3.4x on an ``icosphere(3)``,
+    # and that gap in these ``wp.empty`` buffers would reach ``bsr_from_triplets`` uninitialized.
+    # Out-of-range garbage indices are dropped silently, but any landing in ``[0, n)`` accumulate a
+    # garbage value into a real entry: measured ``‖values‖ = 1.1e13`` against the correct 84.3 with
+    # the pool holding plausible indices. One host readback per call, not per pass.
+    nnz = operator.nnz_sync()
+    n_triplets = nnz + n
+    rows, cols, vals = tw.array.triplet_buffers(n_triplets, wp.float64, device)
+    wp.launch(
+        kernel_smoothing.implicit_laplacian_triplets,
+        dim=n,
+        inputs=[
+            operator.offsets,
+            operator.columns,
+            operator.values,
+            wp.float64(lamb),
+            wp.int32(nnz),
+            rows,
+            cols,
+            vals,
+        ],
+        device=device,
+    )
+    return wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
+
+
 def _apply_volume_constraint(
     positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], vol_ini: float
 ) -> None:
@@ -1413,39 +1446,6 @@ def _empty_components(
     )
 
 
-def _build_implicit_system(
-    operator: wps.BsrMatrix[wp.float32], lamb: float, n: int, device: wp.DeviceLike
-) -> wps.BsrMatrix[wp.float64]:
-    # ``nnz_sync()``, never ``operator.nnz``: after ``bsr_from_triplets`` the ``nnz`` field is a
-    # stale cache holding the triplet *capacity* it was handed, duplicates included, and only a
-    # ``nnz_sync()`` repairs it (no other operation does, so whether ``nnz`` reads correctly depends
-    # on unrelated earlier code). The uniform default is duplicate-free so the two agree there, but
-    # a caller-supplied ``cotmatrix`` (12 triplets per face) overshoots 3.4x on an ``icosphere(3)``,
-    # and that gap in these ``wp.empty`` buffers would reach ``bsr_from_triplets`` uninitialized.
-    # Out-of-range garbage indices are dropped silently, but any landing in ``[0, n)`` accumulate a
-    # garbage value into a real entry: measured ``‖values‖ = 1.1e13`` against the correct 84.3 with
-    # the pool holding plausible indices. One host readback per call, not per pass.
-    nnz = operator.nnz_sync()
-    n_triplets = nnz + n
-    rows, cols, vals = tw.array.triplet_buffers(n_triplets, wp.float64, device)
-    wp.launch(
-        kernel_smoothing.implicit_laplacian_triplets,
-        dim=n,
-        inputs=[
-            operator.offsets,
-            operator.columns,
-            operator.values,
-            wp.float64(lamb),
-            wp.int32(nnz),
-            rows,
-            cols,
-            vals,
-        ],
-        device=device,
-    )
-    return wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
-
-
 def smooth_region_fixed_rim(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -1911,6 +1911,16 @@ def refine_and_smooth_region(
     return vertices, faces, patch_face_mask
 
 
+def _boundary_verts_mask(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wp.array[wp.bool]:
+    """Length-``n_vertices`` mask of mesh-boundary vertices."""
+    device = faces.device
+    n = int(vertices.shape[0])
+    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
+    return tw.array.indices_to_mask(boundary, n, device=device)
+
+
 def smooth_region_boundary(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -2095,16 +2105,6 @@ def _region_rim_vertices(
         out=free,
     )
     return free
-
-
-def _boundary_verts_mask(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> wp.array[wp.bool]:
-    """Length-``n_vertices`` mask of mesh-boundary vertices."""
-    device = faces.device
-    n = int(vertices.shape[0])
-    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
-    return tw.array.indices_to_mask(boundary, n, device=device)
 
 
 def filter_scalar_laplacian(

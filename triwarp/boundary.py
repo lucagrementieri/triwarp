@@ -298,8 +298,7 @@ def _needs_unoriented_boundary_walk(directed: twt.Array2dInt32, n_vertices: int)
     this function on an open mesh.
     """
     device = directed.device
-    degrees = twt.empty_2d((n_vertices, 2), wp.int32, device=device)
-    degrees.zero_()
+    degrees = twt.as_array2d(wp.zeros((n_vertices, 2), dtype=wp.int32, device=device), wp.int32)
     flags = wp.zeros(2, dtype=wp.int32, device=device)
     wp.launch(
         kernel_boundary.count_boundary_degrees,

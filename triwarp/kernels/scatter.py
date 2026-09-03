@@ -366,6 +366,11 @@ def divide_by_density(
 
 # ``heat.vector``, and the two mass/curvature scatters follow their wrapper's precision keyword.
 _VALUE_DTYPES = (wp.float32, wp.float64)
+# ``scatter_add`` gets its own, narrower set: it has exactly three call sites -- ``repair.py``'s two
+# per-component ``wp.float32`` volume/area accumulators and ``heat.py``'s ``wp.vec2d`` tangent seed
+# -- so the ``wp.float64`` and ``wp.vec3`` rows registered beside them were compile time paid on
+# every rebuild for an overload nothing can reach.
+_SCATTER_ADD_DTYPES = (wp.float32, wp.vec2d)
 
 
 # ``splat_grid_trilinear``'s dtype set is the pair its wrapper
@@ -392,7 +397,7 @@ def _register_overloads() -> None:
                 wp.array3d[wp.float32],
             ],
         )
-    for dtype in (*_VALUE_DTYPES, wp.vec2d, wp.vec3):
+    for dtype in _SCATTER_ADD_DTYPES:
         wp.overload(scatter_add, [wp.array[dtype], wp.array[wp.int32], wp.array[dtype]])
     for dtype in _VALUE_DTYPES:
         wp.overload(

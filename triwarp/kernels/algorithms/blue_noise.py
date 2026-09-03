@@ -107,9 +107,9 @@ def lookup_cell(sorted_unique_keys: wp.array[wp.int64], nk: wp.int64) -> wp.int3
 @wp.func
 def grid_coord(point: wp.vec3, bbox_min: wp.vec3, inv_cell_size: wp.float32) -> wp.vec3i:
     p = point - bbox_min
-    gx = wp.int32(wp.float32(p.x) * inv_cell_size)
-    gy = wp.int32(wp.float32(p.y) * inv_cell_size)
-    gz = wp.int32(wp.float32(p.z) * inv_cell_size)
+    gx = wp.int32(p.x * inv_cell_size)
+    gy = wp.int32(p.y * inv_cell_size)
+    gz = wp.int32(p.z * inv_cell_size)
     return wp.vec3i(gx, gy, gz)
 
 

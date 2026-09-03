@@ -118,6 +118,27 @@ def test_unique_1d_inverse(device: str):
     assert np.array_equal(inverse_wp.numpy(), inverse_np)
 
 
+def test_unique_1d_inverse_float_with_nan(device: str):
+    """
+    Class A against ``numpy.unique``.
+
+    Regression: the inverse used a ``side="right"`` binary search, which ``NaN`` poisons --
+    every comparison against the sorted array's ``NaN`` tail is false, so the search walked into
+    it and reported the last slot for every *finite* value
+    (measured ``[2, 0, 2, 2, 0]`` against numpy's ``[1, 0, 1, 2, 0]``). Non-vacuous by
+    construction: the two asserts below pin that the finite values do not collapse onto one slot
+    and that ``NaN`` still gets its own.
+    """
+    data_np = np.array([3.5, 1.25, 3.5, np.nan, 1.25, np.nan], dtype=np.float32)
+    unique_np, inverse_np = np.unique(data_np, return_inverse=True)
+    assert np.unique(inverse_np).shape[0] == 3
+
+    data_wp = wp.array(data_np, dtype=wp.float32, device=device)
+    unique_wp, inverse_wp = tw.grouping.unique_1d(data_wp, return_inverse=True)
+    assert np.array_equal(unique_wp.numpy(), unique_np, equal_nan=True)
+    assert np.array_equal(inverse_wp.numpy(), inverse_np.ravel())
+
+
 def test_unique_1d_inverse_counts(device: str):
     data_np = np.array([20, 10, 20, 3, 1, 3, 10, 20], dtype=np.uint64)
     unique_np, inverse_np, counts_np = np.unique(data_np, return_inverse=True, return_counts=True)

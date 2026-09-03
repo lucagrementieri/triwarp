@@ -25,9 +25,9 @@ def faces_to_edges(
     i0 = faces[f + 0]
     i1 = faces[f + 1]
     i2 = faces[f + 2]
-    _write_edge(out_edges, wp.int32(f), i0, i1, sort)
-    _write_edge(out_edges, wp.int32(f + 1), i1, i2, sort)
-    _write_edge(out_edges, wp.int32(f + 2), i2, i0, sort)
+    _write_edge(out_edges, f, i0, i1, sort)
+    _write_edge(out_edges, f + 1, i1, i2, sort)
+    _write_edge(out_edges, f + 2, i2, i0, sort)
 
 
 @wp.kernel

@@ -25,6 +25,11 @@ from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND
 # Lanes per block for both stages of the conjugate-gradient dot product. The partial stage gets one
 # block per ``CG_TILE`` entries *of each column*, which is what makes its grid grow with the system
 # instead of its serial depth; the finalize stage folds that column's partials with one more tile.
+# Deliberately a bare ``wp.constant(256)`` and not ``wp.constant(wp.int32(256))``: this constant
+# also serves as a ``wp.tile_load`` / ``wp.tile_zeros`` ``shape=``, and a tile shape must be a
+# plain integer -- the typed spelling fails to parse on Warp 1.17 with an ``AttributeError`` in
+# ``cg_dot_finalize``. The cost is that check 17 cannot type the ``//`` below from the constant's
+# declaration and has to take it on trust.
 CG_TILE = wp.constant(256)
 
 
@@ -89,7 +94,7 @@ def cg_dot_finalize(
         return
     row = partials[p, c]
     acc = wp.tile_zeros(shape=CG_TILE, dtype=wp.float64)
-    for s in range((n_blocks + CG_TILE - 1) / CG_TILE):
+    for s in range((n_blocks + CG_TILE - 1) // CG_TILE):
         acc += wp.tile_load(row, shape=CG_TILE, offset=s * CG_TILE, storage="register")
     total = wp.tile_sum(acc)[0]
     if t == 0:
@@ -203,7 +208,7 @@ def cg_step_x_r_z(
     # elementwise multiply of the residual this pass has just written.
     i = wp.int32(wp.tid())
     c = i // stride
-    local = i - c * stride
+    local = i % stride
     residual = cg_advance_x_r(
         i, c, local, n, rz_old, p_dot_ap, r_norm_sq, atol_sq, p, ap, out_x, out_r
     )
@@ -229,7 +234,7 @@ def cg_step_x_r(
     # and that is the whole cost of un-fusing.
     i = wp.int32(wp.tid())
     c = i // stride
-    local = i - c * stride
+    local = i % stride
     cg_advance_x_r(i, c, local, n, rz_old, p_dot_ap, r_norm_sq, atol_sq, p, ap, out_x, out_r)
 
 

@@ -35,7 +35,7 @@ from triwarp.kernels.triangles import (
     face_vertices_vec3d,
     triangle_quality,
 )
-from triwarp.kernels.voxels import voxel_cell
+from triwarp.kernels.voxels import voxel_cell, voxel_cell_center
 
 # The collapse round loop's third state slot, **appended** after ``array.LOOP_ROUND`` and
 # ``LOOP_CONDITION`` so the shared two keep their numbers: the total commits as of the end of
@@ -910,7 +910,7 @@ def _resolve_flip_quad_in_region(
 @wp.func
 def flip_quad_positions_d(
     vertices: wp.array[Any], a: wp.int32, b: wp.int32, c: wp.int32, d: wp.int32
-):
+) -> tuple[wp.vec3d, wp.vec3d, wp.vec3d, wp.vec3d]:
     # The four corners of a flip quad, promoted to ``float64``. Every flip predicate in this module
     # -- convexity, the Delone empty-circumcircle test, the segment distance -- runs in float64 on a
     # float32 vertex buffer, because they are *branches*: a lost digit changes a flip decision
@@ -999,6 +999,38 @@ def incircle_flip_candidates(
     out_flip[k] = _incircle_d(ap, cp, dp, bp) > wp.float64(0.0)
 
 
+@wp.func
+def flip_claim_won(
+    flip: wp.array[wp.bool],
+    quad: wp.array2d[wp.int32],
+    adjacency: wp.array2d[wp.int32],
+    face_claim: wp.array[wp.int32],
+    edge_claim: wp.array[wp.int32],
+    edge_claim_mask: wp.int32,
+    key_base: wp.uint64,
+    k: wp.int32,
+) -> tuple[wp.int32, wp.int32, wp.bool]:
+    # Did candidate ``k`` win every claim ``claim_flips`` above wrote -- both its faces and the
+    # hashed slot of the new diagonal it would create? Returns the two face indices alongside the
+    # verdict because every caller needs them straight afterwards, and both are already loaded here.
+    #
+    # Shared by ``commit_flips`` and ``update_flipped_lengths``, which must agree *exactly* on which
+    # candidates commit: the second rewrites the edge-length rows of the faces the first rewrites
+    # the connectivity of, so a divergence between two copies of this guard would leave the two
+    # tables describing different meshes. That is why it is one function rather than two identical
+    # seven-statement runs.
+    if not flip[k]:
+        return wp.int32(-1), wp.int32(-1), False
+    f0 = adjacency[k, 0]
+    f1 = adjacency[k, 1]
+    if face_claim[f0] != k or face_claim[f1] != k:
+        return f0, f1, False
+    slot = hash_slot(pack_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
+    if edge_claim[slot] != k:
+        return f0, f1, False
+    return f0, f1, True
+
+
 @wp.kernel
 def claim_flips(
     flip: wp.array[wp.bool],
@@ -1031,14 +1063,10 @@ def commit_flips(
     out_count: wp.array[wp.int32],
 ) -> None:
     k = wp.int32(wp.tid())
-    if not flip[k]:
-        return
-    f0 = adjacency[k, 0]
-    f1 = adjacency[k, 1]
-    if face_claim[f0] != k or face_claim[f1] != k:
-        return
-    slot = hash_slot(pack_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
-    if edge_claim[slot] != k:
+    f0, f1, won = flip_claim_won(
+        flip, quad, adjacency, face_claim, edge_claim, edge_claim_mask, key_base, k
+    )
+    if not won:
         return
     a = quad[k, 0]
     b = quad[k, 1]
@@ -1612,13 +1640,10 @@ def update_flipped_lengths(
     # corner holds which vertex; a committed flip owns both its faces exclusively, so reading and
     # writing the same rows here is race-free.
     k = wp.int32(wp.tid())
-    if not flip[k]:
-        return
-    f0 = adjacency[k, 0]
-    f1 = adjacency[k, 1]
-    if face_claim[f0] != k or face_claim[f1] != k:
-        return
-    if edge_claim[hash_slot(pack_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)] != k:
+    f0, f1, won = flip_claim_won(
+        flip, quad, adjacency, face_claim, edge_claim, edge_claim_mask, key_base, k
+    )
+    if not won:
         return
 
     first = quad[k, 0]
@@ -1672,11 +1697,7 @@ def cluster_min_center_distance(
     # deterministic because pass 2 breaks ties by lowest vertex index.
     v = wp.int32(wp.tid())
     cell = voxel_cell(vertices[v], origin, voxel_size_inverse(voxel_size))
-    center = origin + wp.vec3(
-        (wp.float32(cell[0]) + 0.5) * voxel_size,
-        (wp.float32(cell[1]) + 0.5) * voxel_size,
-        (wp.float32(cell[2]) + 0.5) * voxel_size,
-    )
+    center = voxel_cell_center(cell, origin, voxel_size)
     wp.atomic_min(out_min_distance, labels[v], wp.length_sq(vertices[v] - center))
 
 
@@ -1692,11 +1713,7 @@ def cluster_pick_closest(
     # Pass 2: whichever vertices tie for their cluster's winning distance, the lowest index wins.
     v = wp.int32(wp.tid())
     cell = voxel_cell(vertices[v], origin, voxel_size_inverse(voxel_size))
-    center = origin + wp.vec3(
-        (wp.float32(cell[0]) + 0.5) * voxel_size,
-        (wp.float32(cell[1]) + 0.5) * voxel_size,
-        (wp.float32(cell[2]) + 0.5) * voxel_size,
-    )
+    center = voxel_cell_center(cell, origin, voxel_size)
     if wp.length_sq(vertices[v] - center) <= min_distance[labels[v]]:
         wp.atomic_min(out_representative, labels[v], v)
 

@@ -199,7 +199,7 @@ def solid_angle(a: wp.vec3, b: wp.vec3, c: wp.vec3, p: wp.vec3) -> wp.float32:
 def solid_angle_at_face(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32, p: wp.vec3
 ) -> wp.float32:
-    v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, wp.int32(f))
+    v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, f)
     return solid_angle(v0, v1, v2, p)
 
 
@@ -393,7 +393,7 @@ def face_containing_point_2d(
     if not query.result:
         return
 
-    face = wp.int32(query.face)
+    face = query.face
     barycentric = barycentric_2d(
         vertices[faces[face * 3 + 0]],
         vertices[faces[face * 3 + 1]],

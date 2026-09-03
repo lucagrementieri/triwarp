@@ -2224,6 +2224,74 @@ def stitch_loops_min_weight(
     return combined_vertices, tw.array.concatenate([combined_faces, band_faces])
 
 
+def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tuple[int, int]:
+    """
+    Return the closest vertex pair ``(i, j)`` between the two rims: the band's start pair.
+
+    The full ``(n_a, n_b)`` squared-distance matrix and its argmin run in Warp kernels (the same
+    ``row_argmin`` / ``global_argmin`` reduction the greedy zippering uses); only the two winning
+    indices come back to the host. Ties resolve to the smallest ``i`` then smallest ``j``, matching
+    ``numpy.argmin`` on the flattened matrix.
+
+    ``kernels/holes.reduce_closest_cross_label_pair`` answers the same question in **one** kernel
+    with no matrix at all, by reducing a ``pack_nearest_key`` atomic over labelled members, and
+    routing this through it was measured and **declined**. Its caller's own preamble comment carries
+    the number: the whole preamble -- two readbacks, this search, the host roll and two uploads --
+    is 5.0 % of ``stitch_loops_min_weight`` at a 100-vertex rim and 0.7 % at 1 000, of which this is
+    a fraction. The two are also not one function wearing two hats: that kernel takes members and
+    labels over a shared vertex buffer, this takes two separate position arrays, and the three
+    launches here reuse ``row_argmin`` / ``global_argmin``, which the caller needs anyway for its
+    *perimeter* objective. See ``global_argmin`` for the same decline measured from the other side.
+    """
+    device = a_pos.device
+    n_a = int(a_pos.shape[0])
+    n_b = int(b_pos.shape[0])
+    dist_sq = twt.empty_2d((n_a, n_b), wp.float32, device=device)
+    wp.launch(
+        kernel_holes.pair_sq_distances,
+        dim=(n_a, n_b),
+        inputs=[a_pos, b_pos, dist_sq],
+        device=device,
+    )
+    col_min = wp.empty(n_a, dtype=wp.int32, device=device)
+    val_min = wp.empty(n_a, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_holes.row_argmin,
+        dim=n_a,
+        inputs=[dist_sq, wp.int32(n_b), col_min, val_min],
+        device=device,
+    )
+    pair = wp.empty(2, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_holes.global_argmin,
+        dim=1,
+        inputs=[col_min, val_min, wp.int32(n_a), pair],
+        device=device,
+    )
+    pair_np = pair.numpy()
+    return int(pair_np[0]), int(pair_np[1])
+
+
+def _stitch_band_triangles(
+    came_np: np.ndarray, la: np.ndarray, lb: np.ndarray, n_a: int, n_b: int, offset: int
+) -> np.ndarray:
+    """Trace the grid-DP came-from table from ``(n_a, n_b)`` to ``(0, 0)`` into band triangles."""
+    triangles: list[tuple[int, int, int]] = []
+    i, j = n_a, n_b
+    while i > 0 or j > 0:
+        if came_np[i, j] == 0:  # advanced A: triangle (a[i-1], a[i], b[j])
+            triangles.append((int(la[(i - 1) % n_a]), int(la[i % n_a]), int(lb[j % n_b]) + offset))
+            i -= 1
+        elif came_np[i, j] == 1:  # advanced B: triangle (a[i], b[j], b[j-1])
+            triangles.append(
+                (int(la[i % n_a]), int(lb[j % n_b]) + offset, int(lb[(j - 1) % n_b]) + offset)
+            )
+            j -= 1
+        else:  # unreachable cell (should not happen for valid rims)
+            break
+    return np.asarray(triangles, dtype=np.int32)
+
+
 def bridge_edges(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -2308,6 +2376,21 @@ def bridge_edges(
         np.asarray(triangles, dtype=np.int32).reshape(-1), dtype=wp.int32, device=faces.device
     )
     return tw.array.concatenate([faces, patch])
+
+
+def _bridge_joined_pairs(edge_a: tuple[int, int], edge_b: tuple[int, int]) -> list[tuple[int, int]]:
+    """List the pairs of *existing* vertices the flat patch joins: its two sides and diagonal."""
+    a0, a1 = edge_a
+    b0, b1 = edge_b
+    incident = {(min(a0, a1), max(a0, a1)), (min(b0, b1), max(b0, b1))}
+    pairs = []
+    for triangle in _bridge_triangles(edge_a, edge_b):
+        for k in range(3):
+            u, v = triangle[k], triangle[(k + 1) % 3]
+            key = (min(u, v), max(u, v))
+            if key not in incident and key not in pairs:
+                pairs.append(key)
+    return pairs
 
 
 def bridge_edges_smooth(
@@ -2423,6 +2506,96 @@ def bridge_edges_smooth(
     )
     strip = wp.array(strip_np.reshape(-1), dtype=wp.int32, device=device)
     return bridged_vertices, tw.array.concatenate([faces, strip])
+
+
+def _bridge_strip(
+    positions_np: np.ndarray, corners: np.ndarray, n_vertices: int, sampling_step: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Sample the bridge cubic and build the strip: interior positions, and the triangle rows.
+
+    Host-side NumPy over six positions and a handful of samples -- the strip never scales with the
+    mesh, so a kernel here would buy a launch and no parallelism.
+    """
+    a0, a1, b0, b1 = (int(corners[k]) for k in range(4))
+    pa0, pa1, pb0, pb1, pta, ptb = positions_np
+
+    center_a, center_b = 0.5 * (pa0 + pa1), 0.5 * (pb0 + pb1)
+    # The tangent lies in the incident triangle's plane, runs across its edge and points into it, so
+    # the spline's end control points sit inside the two surfaces and the curve leaves them
+    # tangentially rather than at an angle.
+    tangent_a = _unit(np.cross(_unit(np.cross(pa1 - pa0, pta - pa0)), _unit(pa1 - pa0)))
+    tangent_b = _unit(np.cross(_unit(np.cross(pb1 - pb0, ptb - pb0)), _unit(pb1 - pb0)))
+    # The cubic leaves A along -tangent_a and arrives at B along +tangent_b, so it continues each
+    # surface rather than turning off it, and both velocities are scaled by the span -- a cubic
+    # whose end velocities do not grow with the gap it crosses is a chord with a kink at each end.
+    span = float(np.linalg.norm(center_b - center_a))
+    velocity_0 = -span * tangent_a
+    velocity_1 = span * tangent_b
+
+    def hermite(u: np.ndarray) -> np.ndarray:
+        column = u[:, None]
+        squared, cubed = column * column, column * column * column
+        return (
+            (2.0 * cubed - 3.0 * squared + 1.0) * center_a
+            + (cubed - 2.0 * squared + column) * velocity_0
+            + (-2.0 * cubed + 3.0 * squared) * center_b
+            + (cubed - squared) * velocity_1
+        )
+
+    dense = hermite(np.linspace(0.0, 1.0, 64))
+    arc_length = float(np.linalg.norm(np.diff(dense, axis=0), axis=1).sum())
+    n_segments = max(1, math.ceil(arc_length / sampling_step))
+    if n_segments == 1:
+        rows = [t for t in ((a1, a0, b0), (a0, b1, b0)) if len(set(t)) == 3]
+        return np.zeros((0, 3), dtype=np.float64), np.asarray(rows, dtype=np.int32).reshape(-1, 3)
+
+    # The strip's two chains run a1 -> b0 and a0 -> b1, which are the quadrilateral's own two sides.
+    # Their width tapers from one edge's length to the other's, so both ends land on the existing
+    # four vertices exactly and only the interior samples are new.
+    width_dir_a, width_dir_b = _unit(pa0 - pa1), _unit(pb1 - pb0)
+    length_a = float(np.linalg.norm(pa1 - pa0))
+    length_b = float(np.linalg.norm(pb1 - pb0))
+    parameters = np.linspace(0.0, 1.0, n_segments + 1)
+    samples = hermite(parameters)
+    directions = (1.0 - parameters)[:, None] * width_dir_a + parameters[:, None] * width_dir_b
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    half_width = (0.5 * ((1.0 - parameters) * length_a + parameters * length_b))[:, None]
+    minus_np = samples - half_width * directions
+    plus_np = samples + half_width * directions
+
+    # A shared vertex collapses that side of the strip onto the vertex itself, turning the strip
+    # into a fan -- the multi-segment form of the flat patch's one-triangle case.
+    interior: list[np.ndarray] = []
+    minus_ids, plus_ids = [a1], [a0]
+    for i in range(1, n_segments):
+        for shared, ring, ids in ((a1 == b0, minus_np, minus_ids), (a0 == b1, plus_np, plus_ids)):
+            if shared:
+                ids.append(ids[0])
+            else:
+                ids.append(n_vertices + len(interior))
+                interior.append(ring[i])
+    minus_ids.append(b0)
+    plus_ids.append(b1)
+
+    rows = []
+    for i in range(n_segments):
+        for triangle in (
+            (minus_ids[i], plus_ids[i], minus_ids[i + 1]),
+            (plus_ids[i], plus_ids[i + 1], minus_ids[i + 1]),
+        ):
+            if len(set(triangle)) == 3:
+                rows.append(triangle)
+    return (
+        np.asarray(interior, dtype=np.float64).reshape(-1, 3),
+        np.asarray(rows, dtype=np.int32).reshape(-1, 3),
+    )
+
+
+def _unit(vector: np.ndarray) -> np.ndarray:
+    """Normalize, leaving a zero vector alone."""
+    norm = float(np.linalg.norm(vector))
+    return vector if norm == 0.0 else vector / norm
 
 
 def join_closest_components(
@@ -2657,179 +2830,6 @@ def _bridge_triangles(
     # diagonal is a0 - b0, and a shared vertex collapses one of the two halves onto a line.
     triangles = [(a1, a0, b0), (a0, b1, b0)]
     return [t for t in triangles if len(set(t)) == 3]
-
-
-def _bridge_joined_pairs(edge_a: tuple[int, int], edge_b: tuple[int, int]) -> list[tuple[int, int]]:
-    """List the pairs of *existing* vertices the flat patch joins: its two sides and diagonal."""
-    a0, a1 = edge_a
-    b0, b1 = edge_b
-    incident = {(min(a0, a1), max(a0, a1)), (min(b0, b1), max(b0, b1))}
-    pairs = []
-    for triangle in _bridge_triangles(edge_a, edge_b):
-        for k in range(3):
-            u, v = triangle[k], triangle[(k + 1) % 3]
-            key = (min(u, v), max(u, v))
-            if key not in incident and key not in pairs:
-                pairs.append(key)
-    return pairs
-
-
-def _bridge_strip(
-    positions_np: np.ndarray, corners: np.ndarray, n_vertices: int, sampling_step: float
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Sample the bridge cubic and build the strip: interior positions, and the triangle rows.
-
-    Host-side NumPy over six positions and a handful of samples -- the strip never scales with the
-    mesh, so a kernel here would buy a launch and no parallelism.
-    """
-    a0, a1, b0, b1 = (int(corners[k]) for k in range(4))
-    pa0, pa1, pb0, pb1, pta, ptb = positions_np
-
-    center_a, center_b = 0.5 * (pa0 + pa1), 0.5 * (pb0 + pb1)
-    # The tangent lies in the incident triangle's plane, runs across its edge and points into it, so
-    # the spline's end control points sit inside the two surfaces and the curve leaves them
-    # tangentially rather than at an angle.
-    tangent_a = _unit(np.cross(_unit(np.cross(pa1 - pa0, pta - pa0)), _unit(pa1 - pa0)))
-    tangent_b = _unit(np.cross(_unit(np.cross(pb1 - pb0, ptb - pb0)), _unit(pb1 - pb0)))
-    # The cubic leaves A along -tangent_a and arrives at B along +tangent_b, so it continues each
-    # surface rather than turning off it, and both velocities are scaled by the span -- a cubic
-    # whose end velocities do not grow with the gap it crosses is a chord with a kink at each end.
-    span = float(np.linalg.norm(center_b - center_a))
-    velocity_0 = -span * tangent_a
-    velocity_1 = span * tangent_b
-
-    def hermite(u: np.ndarray) -> np.ndarray:
-        column = u[:, None]
-        squared, cubed = column * column, column * column * column
-        return (
-            (2.0 * cubed - 3.0 * squared + 1.0) * center_a
-            + (cubed - 2.0 * squared + column) * velocity_0
-            + (-2.0 * cubed + 3.0 * squared) * center_b
-            + (cubed - squared) * velocity_1
-        )
-
-    dense = hermite(np.linspace(0.0, 1.0, 64))
-    arc_length = float(np.linalg.norm(np.diff(dense, axis=0), axis=1).sum())
-    n_segments = max(1, math.ceil(arc_length / sampling_step))
-    if n_segments == 1:
-        rows = [t for t in ((a1, a0, b0), (a0, b1, b0)) if len(set(t)) == 3]
-        return np.zeros((0, 3), dtype=np.float64), np.asarray(rows, dtype=np.int32).reshape(-1, 3)
-
-    # The strip's two chains run a1 -> b0 and a0 -> b1, which are the quadrilateral's own two sides.
-    # Their width tapers from one edge's length to the other's, so both ends land on the existing
-    # four vertices exactly and only the interior samples are new.
-    width_dir_a, width_dir_b = _unit(pa0 - pa1), _unit(pb1 - pb0)
-    length_a = float(np.linalg.norm(pa1 - pa0))
-    length_b = float(np.linalg.norm(pb1 - pb0))
-    parameters = np.linspace(0.0, 1.0, n_segments + 1)
-    samples = hermite(parameters)
-    directions = (1.0 - parameters)[:, None] * width_dir_a + parameters[:, None] * width_dir_b
-    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
-    half_width = (0.5 * ((1.0 - parameters) * length_a + parameters * length_b))[:, None]
-    minus_np = samples - half_width * directions
-    plus_np = samples + half_width * directions
-
-    # A shared vertex collapses that side of the strip onto the vertex itself, turning the strip
-    # into a fan -- the multi-segment form of the flat patch's one-triangle case.
-    interior: list[np.ndarray] = []
-    minus_ids, plus_ids = [a1], [a0]
-    for i in range(1, n_segments):
-        for shared, ring, ids in ((a1 == b0, minus_np, minus_ids), (a0 == b1, plus_np, plus_ids)):
-            if shared:
-                ids.append(ids[0])
-            else:
-                ids.append(n_vertices + len(interior))
-                interior.append(ring[i])
-    minus_ids.append(b0)
-    plus_ids.append(b1)
-
-    rows = []
-    for i in range(n_segments):
-        for triangle in (
-            (minus_ids[i], plus_ids[i], minus_ids[i + 1]),
-            (plus_ids[i], plus_ids[i + 1], minus_ids[i + 1]),
-        ):
-            if len(set(triangle)) == 3:
-                rows.append(triangle)
-    return (
-        np.asarray(interior, dtype=np.float64).reshape(-1, 3),
-        np.asarray(rows, dtype=np.int32).reshape(-1, 3),
-    )
-
-
-def _unit(vector: np.ndarray) -> np.ndarray:
-    """Normalize, leaving a zero vector alone."""
-    norm = float(np.linalg.norm(vector))
-    return vector if norm == 0.0 else vector / norm
-
-
-def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tuple[int, int]:
-    """
-    Return the closest vertex pair ``(i, j)`` between the two rims: the band's start pair.
-
-    The full ``(n_a, n_b)`` squared-distance matrix and its argmin run in Warp kernels (the same
-    ``row_argmin`` / ``global_argmin`` reduction the greedy zippering uses); only the two winning
-    indices come back to the host. Ties resolve to the smallest ``i`` then smallest ``j``, matching
-    ``numpy.argmin`` on the flattened matrix.
-
-    ``kernels/holes.reduce_closest_cross_label_pair`` answers the same question in **one** kernel
-    with no matrix at all, by reducing a ``pack_nearest_key`` atomic over labelled members, and
-    routing this through it was measured and **declined**. Its caller's own preamble comment carries
-    the number: the whole preamble -- two readbacks, this search, the host roll and two uploads --
-    is 5.0 % of ``stitch_loops_min_weight`` at a 100-vertex rim and 0.7 % at 1 000, of which this is
-    a fraction. The two are also not one function wearing two hats: that kernel takes members and
-    labels over a shared vertex buffer, this takes two separate position arrays, and the three
-    launches here reuse ``row_argmin`` / ``global_argmin``, which the caller needs anyway for its
-    *perimeter* objective. See ``global_argmin`` for the same decline measured from the other side.
-    """
-    device = a_pos.device
-    n_a = int(a_pos.shape[0])
-    n_b = int(b_pos.shape[0])
-    dist_sq = twt.empty_2d((n_a, n_b), wp.float32, device=device)
-    wp.launch(
-        kernel_holes.pair_sq_distances,
-        dim=(n_a, n_b),
-        inputs=[a_pos, b_pos, dist_sq],
-        device=device,
-    )
-    col_min = wp.empty(n_a, dtype=wp.int32, device=device)
-    val_min = wp.empty(n_a, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_holes.row_argmin,
-        dim=n_a,
-        inputs=[dist_sq, wp.int32(n_b), col_min, val_min],
-        device=device,
-    )
-    pair = wp.empty(2, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_holes.global_argmin,
-        dim=1,
-        inputs=[col_min, val_min, wp.int32(n_a), pair],
-        device=device,
-    )
-    pair_np = pair.numpy()
-    return int(pair_np[0]), int(pair_np[1])
-
-
-def _stitch_band_triangles(
-    came_np: np.ndarray, la: np.ndarray, lb: np.ndarray, n_a: int, n_b: int, offset: int
-) -> np.ndarray:
-    """Trace the grid-DP came-from table from ``(n_a, n_b)`` to ``(0, 0)`` into band triangles."""
-    triangles: list[tuple[int, int, int]] = []
-    i, j = n_a, n_b
-    while i > 0 or j > 0:
-        if came_np[i, j] == 0:  # advanced A: triangle (a[i-1], a[i], b[j])
-            triangles.append((int(la[(i - 1) % n_a]), int(la[i % n_a]), int(lb[j % n_b]) + offset))
-            i -= 1
-        elif came_np[i, j] == 1:  # advanced B: triangle (a[i], b[j], b[j-1])
-            triangles.append(
-                (int(la[i % n_a]), int(lb[j % n_b]) + offset, int(lb[(j - 1) % n_b]) + offset)
-            )
-            j -= 1
-        else:  # unreachable cell (should not happen for valid rims)
-            break
-    return np.asarray(triangles, dtype=np.int32)
 
 
 # ---------------------------------------------------------------------------

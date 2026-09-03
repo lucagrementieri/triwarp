@@ -34,7 +34,7 @@ def sample_surface(
 ) -> None:
     tid = wp.int32(wp.tid())
     state = wp.rand_init(seed, tid)
-    fi = wp.int32(wp.sample_cdf(state, cdf))
+    fi = wp.sample_cdf(state, cdf)
 
     v0, v1, v2 = face_vertices(vertices, faces, fi)
 
@@ -56,7 +56,7 @@ def sample_volume_tetrahedra(
 ) -> None:
     tid = wp.int32(wp.tid())
     state = wp.rand_init(seed, tid)
-    fi = wp.int32(wp.sample_cdf(state, cdf))
+    fi = wp.sample_cdf(state, cdf)
 
     v0, v1, v2 = face_vertices(vertices, faces, fi)
 

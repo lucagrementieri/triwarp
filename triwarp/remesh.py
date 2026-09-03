@@ -3058,6 +3058,48 @@ def subdivide_region_to_size(
     return current_vertices, current_faces, new_region
 
 
+def _keep_longest_edges(
+    long_mask: wp.array[wp.bool],
+    lengths: wp.array[wp.float32],
+    remaining: int,
+    m: int,
+    device: wp.DeviceLike,
+) -> wp.array[wp.bool]:
+    """
+    Keep only the ``remaining`` longest edges currently flagged in ``long_mask``.
+
+    This used to read ``long_mask`` and ``lengths`` back in full and pick the top ``remaining`` with
+    ``numpy.argsort``, moving ``2 * m`` elements across the bus in a loop that otherwise moves four
+    bytes a pass. Sorting the eligible lengths on the device removes both readbacks and the upload
+    that returned the answer, the same spelling
+    [`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk]'s final round uses.
+
+    Measured interleaved, ``min`` of 9: **3.5-19x on CUDA** over the range this branch actually sees
+    (1.95 -> 0.56 ms at ``m = 104 288``, the first budgeted pass on ``bunny``; 11.9 -> 0.62 ms at
+    ``m = 10^6``), worth **1.14-1.21x on the whole call**. The device sort has a ~0.5 ms floor and
+    so loses below ``m ~ 20 000``, and in isolation it loses 1.7-3.6x on CPU -- but the CPU call is
+    flat (0.98-1.00x) because the branch is a small share of it there, so nothing regresses at the
+    call level. ``m`` is the unique-edge count and grows with the mesh, which is what makes the
+    readback the wrong side of the trade.
+
+    Ties are not ordered by contract on either path -- ``numpy.argsort``'s introsort is unstable and
+    ``sort_and_argsort`` is a stable radix sort, and the budget is documented as soft and as keeping
+    "the longest eligible edges", which every tie-break satisfies equally. Measured, they in fact
+    agree: the selected set is identical on three constructed tie patterns (all-equal, a cut inside
+    the middle of three tie runs, a cut inside one long tie run) and the output mesh is byte-equal
+    on ``icosphere(6)`` and ``bunny``.
+    """
+    eligible = tw.array.flatnonzero(long_mask)
+    # Ascending on the negated length is descending on the length, and ``sort_and_argsort`` is the
+    # package's one radix-sort spelling. ``order`` is a view, so it is cloned dense before gathering
+    # through it (Warp ignores an index array's stride).
+    descending = wp.empty(int(eligible.shape[0]), dtype=wp.float32, device=device)
+    wp.map(wp.neg, tw.array.gather(lengths, eligible), out=descending)
+    _sorted, order = tw.array.sort_and_argsort(descending)
+    keep = tw.array.gather(eligible, wp.clone(order[:remaining]))
+    return tw.array.indices_to_mask(keep, m, device=device)
+
+
 def refine_region_to_density(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -3504,45 +3546,3 @@ def _flip_region_faces(
         )
 
     return _flip_interior_edges(faces, n_vertices, launch, max_iter)
-
-
-def _keep_longest_edges(
-    long_mask: wp.array[wp.bool],
-    lengths: wp.array[wp.float32],
-    remaining: int,
-    m: int,
-    device: wp.DeviceLike,
-) -> wp.array[wp.bool]:
-    """
-    Keep only the ``remaining`` longest edges currently flagged in ``long_mask``.
-
-    This used to read ``long_mask`` and ``lengths`` back in full and pick the top ``remaining`` with
-    ``numpy.argsort``, moving ``2 * m`` elements across the bus in a loop that otherwise moves four
-    bytes a pass. Sorting the eligible lengths on the device removes both readbacks and the upload
-    that returned the answer, the same spelling
-    [`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk]'s final round uses.
-
-    Measured interleaved, ``min`` of 9: **3.5-19x on CUDA** over the range this branch actually sees
-    (1.95 -> 0.56 ms at ``m = 104 288``, the first budgeted pass on ``bunny``; 11.9 -> 0.62 ms at
-    ``m = 10^6``), worth **1.14-1.21x on the whole call**. The device sort has a ~0.5 ms floor and
-    so loses below ``m ~ 20 000``, and in isolation it loses 1.7-3.6x on CPU -- but the CPU call is
-    flat (0.98-1.00x) because the branch is a small share of it there, so nothing regresses at the
-    call level. ``m`` is the unique-edge count and grows with the mesh, which is what makes the
-    readback the wrong side of the trade.
-
-    Ties are not ordered by contract on either path -- ``numpy.argsort``'s introsort is unstable and
-    ``sort_and_argsort`` is a stable radix sort, and the budget is documented as soft and as keeping
-    "the longest eligible edges", which every tie-break satisfies equally. Measured, they in fact
-    agree: the selected set is identical on three constructed tie patterns (all-equal, a cut inside
-    the middle of three tie runs, a cut inside one long tie run) and the output mesh is byte-equal
-    on ``icosphere(6)`` and ``bunny``.
-    """
-    eligible = tw.array.flatnonzero(long_mask)
-    # Ascending on the negated length is descending on the length, and ``sort_and_argsort`` is the
-    # package's one radix-sort spelling. ``order`` is a view, so it is cloned dense before gathering
-    # through it (Warp ignores an index array's stride).
-    descending = wp.empty(int(eligible.shape[0]), dtype=wp.float32, device=device)
-    wp.map(wp.neg, tw.array.gather(lengths, eligible), out=descending)
-    _sorted, order = tw.array.sort_and_argsort(descending)
-    keep = tw.array.gather(eligible, wp.clone(order[:remaining]))
-    return tw.array.indices_to_mask(keep, m, device=device)

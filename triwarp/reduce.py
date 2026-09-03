@@ -569,6 +569,15 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
 }
 
 
+# --- private helpers ---------------------------------------------------------------------
+#
+# The launch/dispatch layer every public reduction above shares, kept together because that is what
+# makes the six of them one mechanism rather than six. ``_launch_global_vec3_minmax`` is the only
+# member with a single caller (``minmax``) and it stays here for that reason: it is the ``wp.vec3``
+# sibling of ``_launch_global_scalar_tiled`` below, and moving it 20 functions up would put half of
+# one dispatch table in the middle of the public surface.
+
+
 def _launch_global_vec3_minmax(array: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     """Component-wise corner pair of a ``wp.vec3`` array: one launch, one buffer, one readback."""
     n = int(array.shape[0])

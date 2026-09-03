@@ -139,10 +139,10 @@ def icosphere_generation(
     j = bj * step
     # The two parents are the ends of the previous level's edge this vertex bisects, which is the
     # pair of coordinates that came out odd.
-    i0 = wp.int32(i)
-    j0 = wp.int32(j)
-    i1 = wp.int32(i)
-    j1 = wp.int32(j)
+    i0 = i
+    j0 = j
+    i1 = i
+    j1 = j
     if (bi & 1) != 0 and (bj & 1) != 0:
         i0 = i + step
         j0 = j - step
@@ -263,7 +263,7 @@ def revolve_faces(
     for k in range(3):
         g = tri[k]
         out_faces[base + k] = revolve_vertex_slot(
-            s + g / per, g % per, n_slices, column, offsets, on_axis
+            s + g // per, g % per, n_slices, column, offsets, on_axis
         )
 
 
@@ -689,7 +689,7 @@ def surface_kuen(u: wp.float32, v: wp.float32) -> wp.vec3:
     # limit of ``log(tan(v / 2))`` actually goes to. Both rows are sampled, so both are replicated
     # here -- and the second guard doubles as the float32 one, since ``tan(v / 2)`` turns negative
     # a single ulp past pi and ``log`` of it is NaN.
-    v_safe = wp.float32(v)
+    v_safe = v
     if v_safe <= 0.0:
         v_safe = KUEN_DELTA_V0
     sv = wp.sin(v_safe)

@@ -25,7 +25,7 @@ QUALITY_AREA = wp.constant(wp.int32(4))  # plain triangle area
 
 
 @wp.func
-def corner_triple(buffer: wp.array[Any], row: wp.int32):
+def corner_triple(buffer: wp.array[Any], row: wp.int32) -> tuple[Any, Any, Any]:
     """
     Load the three entries of row ``row`` of a flat 3-stride buffer.
 
@@ -44,7 +44,7 @@ def corner_triple(buffer: wp.array[Any], row: wp.int32):
 
 
 @wp.func
-def row_triple(buffer: wp.array2d[Any], row: wp.int32):
+def row_triple(buffer: wp.array2d[Any], row: wp.int32) -> tuple[Any, Any, Any]:
     """
     Load the three entries of row ``row`` of a rank-2 buffer.
 
@@ -85,7 +85,9 @@ def write_corner_triple(
 
 
 @wp.func
-def face_vertices(vertices: wp.array[Any], faces: wp.array[wp.int32], face_index: wp.int32):
+def face_vertices(
+    vertices: wp.array[Any], faces: wp.array[wp.int32], face_index: wp.int32
+) -> tuple[Any, Any, Any]:
     """
     Load the three per-corner values of face ``face_index`` from a flat index buffer.
 

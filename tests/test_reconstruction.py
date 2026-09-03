@@ -997,6 +997,13 @@ def test_resample_uniform_matches_pymeshlab(
 
     What must agree is the surface: both watertight, both enclosing the sphere's volume, and a
     two-sided Hausdorff distance between them of well under a cell.
+
+    **Mutation probe**, and it retightened the threshold. The measured agreement is **0.00313**,
+    identical on both devices; the bug class is resampling a *differently scaled* surface, so the
+    probe re-runs the reference on a scaled sphere and reads the distance: 1.05x gives 0.0514, 1.10x
+    gives 0.1020, 1.15x gives 0.1521. The original ``2.0 * voxel_size`` bar (0.12, a 38x headroom)
+    admitted every scale error up to 10 %, so it is now ``0.5 * voxel_size``: 0.03, still **9.6x**
+    the measured agreement, and it now separates a 5 % scale error.
     """
     sphere_tm, _sphere_tm_wp = icosphere
     voxel_size = 0.06
@@ -1024,8 +1031,8 @@ def test_resample_uniform_matches_pymeshlab(
     # Two-sided Hausdorff between the surfaces, within a cell.
     sample_wp, _face = tm.sample.sample_surface(out_tm, 4000, seed=0)
     sample_pml, _face_pml = tm.sample.sample_surface(pml_tm, 4000, seed=1)
-    assert np.abs(tm.proximity.signed_distance(pml_tm, sample_wp)).max() < 2.0 * voxel_size
-    assert np.abs(tm.proximity.signed_distance(out_tm, sample_pml)).max() < 2.0 * voxel_size
+    assert np.abs(tm.proximity.signed_distance(pml_tm, sample_wp)).max() < 0.5 * voxel_size
+    assert np.abs(tm.proximity.signed_distance(out_tm, sample_pml)).max() < 0.5 * voxel_size
 
 
 @pytest.mark.parity("resample_uniform", "igl")

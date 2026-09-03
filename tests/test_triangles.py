@@ -216,16 +216,14 @@ def test_corner_normals_degenerate_crease_sets_are_exact(
     assert not np.allclose(smooth_np, hard_np, rtol=1e-3, atol=1e-3)
 
 
-def test_corner_normals_edge_cases(device: str) -> None:
+def test_corner_normals_edge_cases(device: str, unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """Not a library comparison: an empty mesh, and the two argument errors."""
     empty_vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
     empty_faces_wp = wp.empty(0, dtype=wp.int32, device=device)
     assert tw.triangles.corner_normals(empty_vertices_wp, empty_faces_wp).shape == (0, 3)
 
-    mesh_tm = tm.creation.box()
-    vertices_wp, faces_wp = numpy_to_warp(
-        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
-    )
+    _mesh_tm, mesh_wp = unit_box
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
     with pytest.raises(ValueError, match=r"shape \(k, 2\)"):
         tw.triangles.corner_normals(
             vertices_wp,
@@ -592,16 +590,45 @@ def test_face_quality_unknown_metric(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
         tw.triangles.face_quality(mesh_wp.points, mesh_wp.indices, metric="skewness")  # type: ignore[arg-type]
 
 
-def test_face_nondegenerate_mask(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+@pytest.mark.parametrize("with_degenerate", [False, True], ids=["clean", "with_degenerate"])
+def test_face_nondegenerate_mask(hemisphere: tuple[tm.Trimesh, wp.Mesh], with_degenerate: bool):
     """
     Class A on a boolean mask, against ``trimesh.triangles.nondegenerate``.
 
-    All-``True`` on this fixture, which is why the degenerate branch is covered separately by
-    the zero-area tests in this file -- a mask that was always ``True`` would pass here alone.
+    Parametrized so the comparison sees **both** answers. On the fixture alone every face is
+    nondegenerate, so an implementation returning all-``True`` unconditionally passed -- and the
+    docstring here used to say the degenerate branch was "covered separately by the zero-area tests
+    in this file", which do not exist. The two asserts below carry that claim now instead of a
+    sentence: each parametrization is checked to produce the answer it is named for before the mask
+    is compared. Both of trimesh's stated degeneracy causes are present in the second case, an
+    exactly collinear triangle and one with a repeated corner.
+
+    The appended vertices are exact powers of two and the mesh is scaled to ~1e-2 deliberately
+    (CLAUDE.md section 12.4): both libraries test an *absolute* 1e-8 altitude, and at unit scale FMA
+    fusion gives a repeated-corner triangle an area of ~1e-8 on CUDA against exactly 0 on the CPU,
+    so an inexactly-collinear face would disagree across devices for a reason that is not the
+    code's.
     """
     mesh_tm, mesh_wp = hemisphere
-    nondegenerate_tm = tm.triangles.nondegenerate(mesh_tm.triangles)
-    nondegenerate_wp = tw.triangles.face_nondegenerate_mask(mesh_wp.points, mesh_wp.indices)
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64) * 1e-2
+    faces_np = np.asarray(mesh_tm.faces, dtype=np.int32).reshape(-1)
+    if with_degenerate:
+        base = vertices_np.shape[0]
+        step = 2.0**-7  # exact in float32, so ``2 * step`` is too and the triple is truly collinear
+        vertices_np = np.vstack(
+            [vertices_np, np.array([[0.0, 0.0, 0.0], [step, 0.0, 0.0], [2.0 * step, 0.0, 0.0]])]
+        )
+        faces_np = np.concatenate(
+            [faces_np, np.array([base, base + 1, base + 2, base, base + 1, base], dtype=np.int32)]
+        )
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, mesh_wp.points.device)
+    # Compare on the *uploaded* float32 positions, so the two sides see identical coordinates.
+    triangles_np = vertices_wp.numpy()[faces_np.reshape(-1, 3)]
+    nondegenerate_tm = tm.triangles.nondegenerate(triangles_np)
+    assert np.count_nonzero(~nondegenerate_tm) == (2 if with_degenerate else 0)
+
+    nondegenerate_wp = tw.triangles.face_nondegenerate_mask(vertices_wp, faces_wp)
     assert np.array_equal(nondegenerate_wp.numpy().astype(bool), nondegenerate_tm)
 
 

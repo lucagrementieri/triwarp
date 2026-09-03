@@ -34,8 +34,7 @@ from triwarp.kernels.array import (
     map_probe,
     map_probe_single,
 )
-from triwarp.kernels.intersection import triangle_aabb_overlap
-from triwarp.kernels.predicates import triangle_aabb
+from triwarp.kernels.predicates import triangle_aabb, triangle_aabb_overlap
 from triwarp.kernels.triangles import face_vertices
 
 # ---------------------------------------------------------------------------------------------
@@ -52,6 +51,23 @@ def voxel_cell(position: wp.vec3, origin: wp.vec3, inverse_size: wp.float32) -> 
     local = (position - origin) * inverse_size
     return wp.vec3i(
         wp.int32(wp.floor(local[0])), wp.int32(wp.floor(local[1])), wp.int32(wp.floor(local[2]))
+    )
+
+
+@wp.func
+def voxel_cell_center(cell: wp.vec3i, origin: wp.vec3, voxel_size: wp.float32) -> wp.vec3:
+    # World position of a cell's centre: the inverse of ``voxel_cell`` above, up to the half-voxel
+    # that names the centre rather than the lower corner.
+    #
+    # The hand-rolled form rather than ``wp.volume_index_to_world`` (which
+    # ``cell_center_positions`` below uses, and which the module docstring names as the convention)
+    # because every caller here is *pre-volume*: it holds an origin and a cell width and no
+    # ``wp.Volume`` handle to ask. The two agree to 3.58e-07 over 3 929 voxels -- float32 rounding,
+    # not a convention difference -- and the measurement is recorded on ``cell_center_positions``.
+    return wp.vec3(
+        origin[0] + (wp.float32(cell[0]) + 0.5) * voxel_size,
+        origin[1] + (wp.float32(cell[1]) + 0.5) * voxel_size,
+        origin[2] + (wp.float32(cell[2]) + 0.5) * voxel_size,
     )
 
 
@@ -130,17 +146,13 @@ def test_triangle_candidates(
     local = item - offsets[f]
     plane = span_y * span_z
     i = local // plane
-    rest = local - i * plane
+    rest = local % plane
     j = rest // span_z
-    k = rest - j * span_z
+    k = rest % span_z
     cell = wp.vec3i(lo[0] + i, lo[1] + j, lo[2] + k)
 
     half = wp.vec3(0.5 * voxel_size, 0.5 * voxel_size, 0.5 * voxel_size)
-    center = wp.vec3(
-        origin[0] + (wp.float32(cell[0]) + 0.5) * voxel_size,
-        origin[1] + (wp.float32(cell[1]) + 0.5) * voxel_size,
-        origin[2] + (wp.float32(cell[2]) + 0.5) * voxel_size,
-    )
+    center = voxel_cell_center(cell, origin, voxel_size)
     out_cells[item, 0] = cell[0]
     out_cells[item, 1] = cell[1]
     out_cells[item, 2] = cell[2]

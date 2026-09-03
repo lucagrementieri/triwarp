@@ -2045,6 +2045,16 @@ def test_stitch_smooth_statistics_vs_meshlib(device: str):
 
     What the volume excludes is a band that bulges, collapses or pinches while still being
     watertight; what it cannot see is a band that is smooth in the wrong place.
+
+    **Mutation probe** for that claim, since a 5 % scalar bound is exactly the shape that a
+    plausible-but-wrong answer can slip through. Displacing the equatorial band of a unit sphere --
+    the geometry a stitched pair of hemispheres is -- and reading the same two statistics: a 2 %
+    band-radius error moves the volume 1.4 % and the area 1.1 % (**passes**), 5 % moves them 3.6 %
+    and 3.3 % (**passes**), and **10 % moves them 7.4 % and 7.9 %, which fails both bounds**. So the
+    bound separates a band misplaced by a tenth of the radius and tolerates one misplaced by a
+    twentieth -- which is the right order, because the two libraries' own refinement schedules
+    already differ by the 0.7 % recorded above and by 3.8 % at the coarser target. Tightening it
+    would be measuring the schedule, not the band.
     """
     (va, fa), (vb, fb) = _hemisphere_pair(device)
     max_edge = 0.15

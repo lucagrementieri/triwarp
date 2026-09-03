@@ -202,7 +202,7 @@ def _procrustes_into(
     )
     # One readback for the whole accumulator; ICP's convergence test needs the cost on the host,
     # and at ~0.1 ms it is under 1% of an iteration (an extra device-side pass would cost more).
-    cost = float(acc.numpy()[kernel_registration.ACC_COST])
+    cost = float(read_scalar(acc, int(kernel_registration.ACC_COST)))
     return out_matrix, out_transformed, cost
 
 

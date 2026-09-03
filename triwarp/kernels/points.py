@@ -9,7 +9,7 @@ from triwarp.kernels.array import (
     pack_nearest_key,
     unpack_ranked_index,
 )
-from triwarp.kernels.intersection import point_plane_dot
+from triwarp.kernels.predicates import point_plane_dot
 from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, outer_sum_chunk, tile_chunk
 
 
@@ -349,14 +349,41 @@ def nearest_pair_keys(
     out_keys[i] = pack_nearest_key(nearest_distances[i, 1], i)
 
 
-# Lanes per block for ``farthest_point_sample_block``, keyed on the cloud size. Measured on an RTX
-# 5090, Warp 1.16, ``count = 1024``, against the capture-and-replay loop it replaced (two replayed
-# kernels per sample, ~2 us each): 2 562 points 4.32 -> 1.20 ms at 256 lanes (1.37 at 1024);
-# 10 242 points 8.51 -> 3.51 at 1024 (8.43 at 256, 4.82 at 512); 40 962 points 21.1 -> 9.5 at 1024
-# (30.5 at 256). The crossover is somewhere in (2 562, 10 242) and 4 096 splits the bracket.
+# Lanes per block for ``farthest_point_sample_block``, keyed on the cloud size. The kernel is one
+# persistent block, so this is the whole launch's width and there is nothing else to tune.
+#
+# **Three brackets, and the middle one is what a Warp 1.17 re-probe added.** The original reading
+# was taken on Warp 1.16 against the capture-and-replay loop this kernel replaced (two replayed
+# kernels per sample, ~2 us each) and sampled only 256 and 1024, which is why it read as two
+# brackets split at 4 096. Re-measured on an RTX 5090 / Warp 1.17 over 128 / 256 / 512 / 1024,
+# interleaved, med/min of 11, with the selected index buffer **identical at every width in every
+# row** (so this is a pure cost choice) -- median ms at ``count = 1024``:
+#
+# |       n |    128 |    256 |    512 |   1024 | best |
+# |---------|--------|--------|--------|--------|------|
+# |     642 |   0.75 | **0.67** |   0.79 |   1.07 |  256 |
+# |   1 024 |   0.82 | **0.71** |   0.78 |   1.13 |  256 |
+# |   2 048 |   1.21 | **0.92** |   0.93 |   1.28 |  tie |
+# |   2 562 |   1.47 |   1.10 | **1.05** |   1.37 |  512 |
+# |   3 072 |   1.59 |   1.14 | **1.07** |   1.42 |  512 |
+# |   4 096 |   5.40 |   1.35 | **1.21** |   1.56 |  512 |
+# |   5 120 |   7.56 |   1.54 | **1.33** |   1.67 |  512 |
+# |   6 144 |   8.85 |   4.32 |   2.68 | **1.77** | 1024 |
+# |  10 242 |  13.43 |   7.12 |   4.12 | **3.01** | 1024 |
+# |  40 962 |  51.79 |  26.44 |  14.01 | **8.50** | 1024 |
+# | 163 842 | 204.96 | 103.73 |  53.72 | **30.31** | 1024 |
+#
+# The brackets are **not** an artefact of ``count``: re-run at ``count = 256`` the best width is the
+# same at every size (642 -> 256, 2 562 and 4 096 -> 512, 6 144 and 40 962 -> 1024).
+#
+# Against the two-bracket dispatch this replaces, the win is 1.05x at 2 562 and **1.29x at exactly
+# 4 096**, where the old crossover handed a cloud that wants 512 lanes to 1 024. 2 048 is where 256
+# and 512 measure a tie, which is what makes it a safe boundary in either direction.
 FARTHEST_BLOCK_SMALL = 256
+FARTHEST_BLOCK_MID = 512
+FARTHEST_BLOCK_MID_FROM = 2048
 FARTHEST_BLOCK_LARGE = 1024
-FARTHEST_BLOCK_LARGE_FROM = 4096
+FARTHEST_BLOCK_LARGE_FROM = 6144
 
 
 @wp.kernel

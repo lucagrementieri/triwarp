@@ -79,6 +79,7 @@ __all__ = [
     "Array2dInt",
     "Array2dInt32",
     "Array2dScalar",
+    "Array2dVec3",
     "Array3dBool",
     "Array3dFloat32",
     "ArrayNd",
@@ -151,19 +152,19 @@ def as_array2d(arr: wp.array[T], dtype: type) -> Array2dInt32 | Array2dFloat | A
     Parameters
     ----------
     arr
-        Warp array expected to be rank-2 with scalar type ``dtype``.
+        Warp array expected to be rank-2 with element type ``dtype``.
     dtype
-        Expected scalar type: ``wp.int32``, ``wp.float32`` or ``wp.float64``.
+        Expected element type: ``wp.int32``, ``wp.float32``, ``wp.float64`` or ``wp.vec3``.
 
     Returns
     -------
-    Array2dInt32 | Array2dFloat32 | Array2dFloat64
+    Array2dInt32 | Array2dFloat32 | Array2dFloat64 | Array2dVec3
         ``arr`` unchanged, narrowed to the checked alias.
 
     Raises
     ------
     TypeError
-        If ``arr`` is not rank-2 with scalar type ``dtype``.
+        If ``arr`` is not rank-2 with element type ``dtype``.
     """
     ensure_ndim(arr, 2, dtype=dtype)
     return cast(Array2dInt32 | Array2dFloat, arr)
@@ -336,7 +337,7 @@ def empty_2d(
     shape: tuple[int, int] | list[int], dtype: type, *, device: wp.DeviceLike = None
 ) -> Array2dInt32 | Array2dFloat | Array2dVec3:
     """
-    Allocate an uninitialized rank-2 Warp array of the given scalar type.
+    Allocate an uninitialized rank-2 Warp array of the given element type.
 
     One function for what used to be ``empty_int32_2d`` / ``empty_float32_2d`` / ``empty_float_2d``.
     The dtype selects the return alias through overloads, so a call site keeps the narrow type it
@@ -348,14 +349,16 @@ def empty_2d(
     shape
         ``(rows, cols)`` shape of the allocated array.
     dtype
-        Scalar type: ``wp.int32``, ``wp.float32`` or ``wp.float64``.
+        Element type: ``wp.int32``, ``wp.float32``, ``wp.float64`` or ``wp.vec3``. The last is
+        what an ``(m, 2)`` table of segment endpoints wants, and it has an overload like the
+        scalars do -- ``triwarp.intersection``'s two public segment returns are the callers.
     device
         Target Warp device.
 
     Returns
     -------
-    Array2dInt32 | Array2dFloat32 | Array2dFloat64
-        Uninitialized ``(rows, cols)`` array of scalar type ``dtype`` on ``device``.
+    Array2dInt32 | Array2dFloat32 | Array2dFloat64 | Array2dVec3
+        Uninitialized ``(rows, cols)`` array of element type ``dtype`` on ``device``.
     """
     return cast(Array2dInt32 | Array2dFloat, wp.empty(_shape_2d(shape), dtype=dtype, device=device))
 

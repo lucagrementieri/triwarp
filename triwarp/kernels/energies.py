@@ -512,23 +512,23 @@ def curved_hessian_triplets(
     diag1, pp1, pq1 = curved_pair_terms(l2_1, l2_2, l2_0, dbl_area, oh1 * oh2, kv2, kv0, kv1)
     diag2, pp2, pq2 = curved_pair_terms(l2_2, l2_0, l2_1, dbl_area, oh2 * oh0, kv0, kv1, kv2)
     for alpha in range(3):
-        edge_a = select3(eid0, eid1, eid2, wp.int32(alpha))
+        edge_a = select3(eid0, eid1, eid2, alpha)
         mi_a = inv_mass[edge_a]
         for beta in range(3):
-            edge_b = select3(eid0, eid1, eid2, wp.int32(beta))
+            edge_b = select3(eid0, eid1, eid2, beta)
             mimi = mi_a * inv_mass[edge_b]
             b_pp = zero
             b_pq = zero
             b_qp = zero
             if alpha == beta:
-                b_pp = select3(diag0, diag1, diag2, wp.int32(alpha))
+                b_pp = select3(diag0, diag1, diag2, alpha)
             elif beta == (alpha + 2) % 3:
-                b_pp = select3(pp0, pp1, pp2, wp.int32(alpha))
-                b_pq = select3(pq0, pq1, pq2, wp.int32(alpha))
+                b_pp = select3(pp0, pp1, pp2, alpha)
+                b_pq = select3(pq0, pq1, pq2, alpha)
                 b_qp = -b_pq
             else:
-                b_pp = select3(pp0, pp1, pp2, wp.int32(beta))
-                b_qp = select3(pq0, pq1, pq2, wp.int32(beta))
+                b_pp = select3(pp0, pp1, pp2, beta)
+                b_qp = select3(pq0, pq1, pq2, beta)
                 b_pq = -b_qp
             pair_out = base_out + (alpha * 3 + beta) * 16
             for u_slot in range(4):
@@ -681,7 +681,17 @@ def _register_overloads() -> None:
         values = wp.array[dtype]
         wp.overload(zero_at_indices, [i32, values])
         wp.overload(crouzeix_raviart_mass_diag, [wp.array[wp.vec3], i32, i32, values])
-        wp.overload(crouzeix_raviart_cotmatrix_triplets, [i32, wp.array2d[dtype], i32, i32, values])
+        # ``cot_entries`` and the matrix precision are *independent* templates:
+        # ``crouzeix_raviart_cotmatrix`` takes ``cot_entries`` as ``twt.Array2dFloat`` beside a
+        # separate ``dtype`` keyword, and the kernel casts the entries to the matrix precision, so
+        # this is a genuine 2x2 rather than a diagonal. Measured on Warp 1.17 before the second row
+        # existed: the first float64-entries/float32-matrix launch recompiled this whole module and
+        # took 80.3 s and returned the right answer -- the silent cost CLAUDE.md section 2.5 names.
+        for entry_dtype in _MATRIX_DTYPES:
+            wp.overload(
+                crouzeix_raviart_cotmatrix_triplets,
+                [i32, wp.array2d[entry_dtype], i32, i32, values],
+            )
         wp.overload(sandwich_row_counts, [i32, i32, values, i32])
         wp.overload(
             sandwich_row_triplets,

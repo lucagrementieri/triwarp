@@ -2202,6 +2202,12 @@ def random_soup(
 
 
 # --- private helpers ---------------------------------------------------------------------
+#
+# Cross-cutting, which is what CLAUDE.md section 5 reserves a trailing block for.
+# ``_transform_to_numpy`` is the one member with a single caller (``extrude_polygon``) and it
+# stays here deliberately: it is the read half of ``_apply_transform`` directly above it, which
+# is reached from seven builders, and splitting the pair to satisfy the stepdown rule would
+# cost more than the backward jump it saves.
 
 
 class _ParametricSpec(NamedTuple):

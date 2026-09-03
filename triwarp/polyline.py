@@ -49,7 +49,6 @@ from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import polyline as kernel_polyline
 from triwarp.kernels import reduce as kernel_reduce
-from triwarp.kernels.array import LOOP_CONDITION
 
 # Point count from which [`polyline_downsample`][triwarp.polyline.polyline_downsample] stops
 # walking its greedy selection serially and pointer-doubles it instead -- **on the CUDA device
@@ -753,7 +752,7 @@ def polyline_simplify(
                 device=device,
             )
 
-        condition = state[LOOP_CONDITION : LOOP_CONDITION + 1]
+        condition = state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
         # Graph capture needs a CUDA stream, so the CPU device takes the direct-execution branch
         # even when the driver supports conditional nodes.
         if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():
@@ -1132,7 +1131,7 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
             device=device,
         )
 
-    condition = state[LOOP_CONDITION : LOOP_CONDITION + 1]
+    condition = state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
     # Graph capture needs a CUDA stream, so the CPU device takes the direct-execution branch even
     # when the driver supports conditional nodes.
     if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():

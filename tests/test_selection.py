@@ -1130,8 +1130,8 @@ def test_face_indices_from_vertex_indices(request: pytest.FixtureRequest, face_m
     assert np.array_equal(face_indices_wp.numpy(), face_indices_ref_np)
 
 
-def test_face_indices_from_vertex_indices_empty() -> None:
-    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device="cpu")
-    vertex_indices_wp = wp.empty(0, dtype=wp.int32, device="cpu")
+def test_face_indices_from_vertex_indices_empty(device: str) -> None:
+    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
+    vertex_indices_wp = wp.empty(0, dtype=wp.int32, device=device)
     face_indices_wp = tw.selection.face_indices_from_vertex_indices(faces_wp, vertex_indices_wp)
     assert face_indices_wp.shape == (0,)

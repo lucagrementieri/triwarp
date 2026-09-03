@@ -111,6 +111,33 @@ def load_mesh_data(path: str | Path, *, device: wp.DeviceLike = None) -> dict[st
     return result
 
 
+def _stack_columns(data: dict[str, np.ndarray], names: tuple[str, ...]) -> np.ndarray | None:
+    """Stack scalar ``point_data``/``cell_data`` columns into ``(n, len(names))`` or ``None``."""
+    if not all(name in data for name in names):
+        return None
+    return np.column_stack([np.asarray(data[name]) for name in names])
+
+
+def _face_normals_from_cell_data(mesh: meshio.Mesh) -> np.ndarray | None:
+    """Read ``nx, ny, nz`` cell data aligned with the triangle cell block, if present."""
+    cell_data = mesh.cell_data
+    if not cell_data:
+        return None
+    tri_index = None
+    for i, block in enumerate(mesh.cells):
+        if block.type == "triangle":
+            tri_index = i
+            break
+    if tri_index is None:
+        return None
+    columns = []
+    for name in _NORMAL_COLUMNS:
+        if name not in cell_data:
+            return None
+        columns.append(np.asarray(cell_data[name][tri_index]))
+    return np.column_stack(columns)
+
+
 def _import_meshio():
     try:
         import meshio
@@ -192,30 +219,3 @@ def mesh_from_numpy(
         np.ascontiguousarray(faces.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
     )
     return Trimesh(vertices_wp, faces_wp)
-
-
-def _stack_columns(data: dict[str, np.ndarray], names: tuple[str, ...]) -> np.ndarray | None:
-    """Stack scalar ``point_data``/``cell_data`` columns into ``(n, len(names))`` or ``None``."""
-    if not all(name in data for name in names):
-        return None
-    return np.column_stack([np.asarray(data[name]) for name in names])
-
-
-def _face_normals_from_cell_data(mesh: meshio.Mesh) -> np.ndarray | None:
-    """Read ``nx, ny, nz`` cell data aligned with the triangle cell block, if present."""
-    cell_data = mesh.cell_data
-    if not cell_data:
-        return None
-    tri_index = None
-    for i, block in enumerate(mesh.cells):
-        if block.type == "triangle":
-            tri_index = i
-            break
-    if tri_index is None:
-        return None
-    columns = []
-    for name in _NORMAL_COLUMNS:
-        if name not in cell_data:
-            return None
-        columns.append(np.asarray(cell_data[name][tri_index]))
-    return np.column_stack(columns)

@@ -1059,11 +1059,12 @@ def farthest_point_sample(
 
     # Scratch for the running squared distance to the chosen set; the kernel initializes it.
     min_distance_sq = wp.empty(n, dtype=wp.float32, device=device)
-    block_dim = (
-        kernel_points.FARTHEST_BLOCK_LARGE
-        if n >= kernel_points.FARTHEST_BLOCK_LARGE_FROM
-        else kernel_points.FARTHEST_BLOCK_SMALL
-    )
+    if n >= kernel_points.FARTHEST_BLOCK_LARGE_FROM:
+        block_dim = kernel_points.FARTHEST_BLOCK_LARGE
+    elif n >= kernel_points.FARTHEST_BLOCK_MID_FROM:
+        block_dim = kernel_points.FARTHEST_BLOCK_MID
+    else:
+        block_dim = kernel_points.FARTHEST_BLOCK_SMALL
     # The whole greedy sweep is one persistent block -- see the kernel for why that wins here and
     # the constants for the measured widths. It replaced a captured two-kernel round replayed
     # ``count - 1`` times: 4.32 -> 1.20 ms at ``count=1024`` on 2 562 points, 21.1 -> 9.5 on 40 962.

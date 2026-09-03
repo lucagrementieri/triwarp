@@ -586,7 +586,7 @@ def test_query_weighted_nearest(bench_case: BenchCase, weight_spread: float) -> 
     max_weight = float(weight_spread * bench_case.mean_edge)
     indices, distances = bench_case.run(
         lambda: tw.neighbors.query_weighted_nearest(
-            points, weights, queries, max_weight=max_weight, bvh=bvh
+            points, weights, queries, max_weight=max_weight, accelerator=bvh
         )
     )
     assert indices.shape == (queries.shape[0],)

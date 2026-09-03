@@ -497,7 +497,7 @@ def binary_search_index(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int
             right = mid - 1
         else:
             left = mid + 1
-    return wp.int32(result)
+    return result
 
 
 @wp.func
@@ -512,7 +512,7 @@ def binary_search_index_left(values: wp.array[wp.Scalar], value: wp.Scalar) -> w
     index = wp.lower_bound(values, value)
     if index == n - 1 and values[n - 1] < value:
         index = n
-    return wp.int32(index)
+    return index
 
 
 @wp.func
@@ -529,8 +529,30 @@ def binary_search_sorted_contains(values: wp.array[wp.Scalar], value: wp.Scalar)
 def map_sorted_inverse(
     data: wp.array[wp.Scalar], sorted_unique: wp.array[wp.Scalar], out_inverse: wp.array[wp.int32]
 ) -> None:
+    # ``numpy.unique(return_inverse=True)``: each element's position in the sorted unique output,
+    # which is ``searchsorted(sorted_unique, x, side="left")``. Every key searched for came out of
+    # that same unique set, so on an ordered dtype the left search lands on the exact slot and the
+    # equality below always holds -- for an integer key this is the identical answer the older
+    # ``binary_search_index(...) - 1`` spelling gave, since for a key that is present
+    # ``side="right" - 1 == side="left"``.
+    #
+    # **The two lines that are not cosmetic are the ``side="left"`` search and the equality, and
+    # both are the ``NaN`` case.** Warp's float radix sort puts ``NaN`` last and every comparison
+    # against it is false, so a binary search whose midpoint lands in that tail is steered by a
+    # predicate that never fires. ``side="right"`` is steered *into* the tail and reported the last
+    # slot for every finite value -- measured on Warp 1.17, ``[3.5, 1.25, 3.5, nan, 1.25]`` gave
+    # ``[2, 0, 2, 2, 0]`` where numpy gives ``[1, 0, 1, 2, 0]``, a silent wrong answer on
+    # ``grouping.unique_1d``'s documented float path. ``side="left"`` is steered *away* from it and
+    # is correct for every finite value; what it then gets wrong is ``NaN`` itself, which lands at
+    # slot 0 -- and that is exactly what the equality catches, ``NaN`` comparing unequal to
+    # everything including itself, since the only slot a ``NaN`` can belong to is the last one.
     i = wp.int32(wp.tid())
-    out_inverse[i] = binary_search_index(sorted_unique, data[i]) - wp.int32(1)
+    value = data[i]
+    n = wp.int32(sorted_unique.shape[0])
+    index = binary_search_index_left(sorted_unique, value)
+    if index >= n or sorted_unique[index] != value:
+        index = n - 1
+    out_inverse[i] = index
 
 
 @wp.kernel
@@ -557,7 +579,16 @@ def mark_rows_present(
 # ``wp.int32``; ``wp.Int`` in their annotation is the template, not a menu. The two search kernels
 # take the caller's *key* dtype, whose surface is the one ``sortable_dtype`` maps onto.
 _INDEX_DTYPES = (wp.int32,)
+# ``isin_lookup_sorted``'s only caller is ``array.isin``, which raises on a non-integer dtype, so
+# its key surface stops at the integers.
 _KEY_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64)
+# ``map_sorted_inverse`` reaches further: its sole caller
+# ``grouping.unique_1d(return_inverse=True)`` launches it in ``twt.sortable_dtype(data.dtype)``,
+# and ``unique_1d`` accepts *any* scalar dtype --
+# its own docstring documents the float ``NaN`` slot semantics for exactly this path. So the float
+# rows are reachable public API, and omitting them recompiled ``triwarp.kernels.array`` (imported by
+# 25 kernel modules and 15 wrappers) on the first float call.
+_SORT_KEY_DTYPES = (*_KEY_DTYPES, wp.float32, wp.float64)
 
 
 def _register_overloads() -> None:
@@ -569,6 +600,7 @@ def _register_overloads() -> None:
         wp.overload(init_sort_pair_indices, [dtype, dtype, wp.array[dtype]])
     for dtype in _KEY_DTYPES:
         wp.overload(isin_lookup_sorted, [wp.array[dtype], wp.array[dtype], wp.array[wp.bool]])
+    for dtype in _SORT_KEY_DTYPES:
         wp.overload(map_sorted_inverse, [wp.array[dtype], wp.array[dtype], wp.array[wp.int32]])
     # ``sort_rows_insertion`` sorts a rank-2 table in place; ``unique_rows`` and the hashing paths
     # that reach it build that table in the caller's dtype.

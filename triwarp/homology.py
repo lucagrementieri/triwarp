@@ -97,6 +97,34 @@ def homology_generators(
     return tw.array.split(packed, offsets, copy=copy)
 
 
+def _loop_through_tree(start: int, end: int, parents: np.ndarray) -> np.ndarray:
+    """
+    Close an edge into a loop through the spanning tree: ``start -> root``, ``root -> end``, edge.
+
+    The two root paths share a suffix above their lowest common ancestor, and that shared part is
+    dropped: otherwise the "loop" would walk up it and straight back down, a contractible spur that
+    says nothing about the surface's topology.
+    """
+    path_start = [start]
+    while parents[path_start[-1]] >= 0:
+        path_start.append(int(parents[path_start[-1]]))
+    path_end = [end]
+    while parents[path_end[-1]] >= 0:
+        path_end.append(int(parents[path_end[-1]]))
+
+    shared = 0
+    while (
+        shared + 1 <= len(path_start)
+        and shared + 1 <= len(path_end)
+        and path_start[-1 - shared] == path_end[-1 - shared]
+    ):
+        shared += 1
+    # Keep the lowest common ancestor once: it is a real corner of the loop.
+    trimmed_start = path_start[: len(path_start) - shared + 1]
+    trimmed_end = path_end[: len(path_end) - shared]
+    return np.array(trimmed_start + trimmed_end[::-1], dtype=np.int32)
+
+
 def tree_cotree(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
 ) -> tuple[twt.Array2dInt32, twt.Array2dInt32, wp.array[wp.int32]]:
@@ -268,31 +296,3 @@ def _dual_spanning_forest(
         if int(read_scalar(merges, 0)) == 0:
             break
     return in_forest
-
-
-def _loop_through_tree(start: int, end: int, parents: np.ndarray) -> np.ndarray:
-    """
-    Close an edge into a loop through the spanning tree: ``start -> root``, ``root -> end``, edge.
-
-    The two root paths share a suffix above their lowest common ancestor, and that shared part is
-    dropped: otherwise the "loop" would walk up it and straight back down, a contractible spur that
-    says nothing about the surface's topology.
-    """
-    path_start = [start]
-    while parents[path_start[-1]] >= 0:
-        path_start.append(int(parents[path_start[-1]]))
-    path_end = [end]
-    while parents[path_end[-1]] >= 0:
-        path_end.append(int(parents[path_end[-1]]))
-
-    shared = 0
-    while (
-        shared + 1 <= len(path_start)
-        and shared + 1 <= len(path_end)
-        and path_start[-1 - shared] == path_end[-1 - shared]
-    ):
-        shared += 1
-    # Keep the lowest common ancestor once: it is a real corner of the loop.
-    trimmed_start = path_start[: len(path_start) - shared + 1]
-    trimmed_end = path_end[: len(path_end) - shared]
-    return np.array(trimmed_start + trimmed_end[::-1], dtype=np.int32)

@@ -75,10 +75,10 @@ def test_warp_mesh_raises_for_empty_mesh(device: str) -> None:
         _ = mesh.warp_mesh
 
 
-def test_mesh_from_numpy_round_trip(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+def test_mesh_from_numpy_round_trip(icosahedron: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:
     """Class A: the numpy arrays survive the upload unchanged, positions and indices alike."""
     mesh_tm, _mesh_wp = icosahedron
-    mesh = tw.io.mesh_from_numpy(mesh_tm.vertices, mesh_tm.faces, device="cpu")
+    mesh = tw.io.mesh_from_numpy(mesh_tm.vertices, mesh_tm.faces, device=device)
     assert np.allclose(mesh.vertices.numpy(), mesh_tm.vertices, rtol=1e-5, atol=1e-5)
     assert np.array_equal(mesh.faces.numpy().reshape(-1, 3), mesh_tm.faces)
 

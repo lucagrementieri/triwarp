@@ -129,11 +129,6 @@ def mesh_with_plane_segment_for_face(
     return False, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
 
 
-@wp.func
-def point_plane_dot(point: wp.vec3, plane_normal: wp.vec3, plane_origin: wp.vec3) -> wp.float32:
-    return wp.dot(point - plane_origin, plane_normal)
-
-
 @wp.kernel
 def mesh_with_plane_segments(
     vertices: wp.array[wp.vec3],
@@ -224,88 +219,6 @@ def triangles_share_vertex(
         or vec3_equal(a2, b1)
         or vec3_equal(a2, b2)
     )
-
-
-@wp.func
-def axis_interval_projection(axis: wp.vec3, v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> wp.vec2:
-    p = wp.vec3(wp.dot(axis, v0), wp.dot(axis, v1), wp.dot(axis, v2))
-    # Single-argument wp.min / wp.max reduce a vector to its extreme element.
-    return wp.vec2(wp.min(p), wp.max(p))
-
-
-@wp.func
-def unit_axis(axis: wp.int32) -> wp.vec3:
-    if axis == 0:
-        return wp.vec3(1.0, 0.0, 0.0)
-    if axis == 1:
-        return wp.vec3(0.0, 1.0, 0.0)
-    return wp.vec3(0.0, 0.0, 1.0)
-
-
-@wp.func
-def plane_box_overlap(normal: wp.vec3, offset: wp.float32, half: wp.vec3) -> wp.bool:
-    # Moller's ``planeBoxOverlap``: the plane ``dot(normal, x) == offset`` meets the box
-    # ``[-half, half]`` iff ``|offset|`` is within the box's support along ``normal``.
-    support = (
-        wp.abs(normal[0]) * half[0] + wp.abs(normal[1]) * half[1] + wp.abs(normal[2]) * half[2]
-    )
-    return wp.abs(offset) <= support
-
-
-@wp.func
-def edge_axes_separate(
-    edge: wp.vec3, half: wp.vec3, a0: wp.vec3, a1: wp.vec3, a2: wp.vec3
-) -> wp.bool:
-    # The three cross-product axes ``e_i x edge`` of Moller's tribox3, written out rather than
-    # crossed with a unit vector: ``e_x x (x, y, z) == (0, -z, y)`` and cyclically. A degenerate
-    # edge gives a zero axis, whose intervals are both ``[0, 0]`` and therefore never separate.
-    axis_x = wp.vec3(0.0, -edge[2], edge[1])
-    axis_y = wp.vec3(edge[2], 0.0, -edge[0])
-    axis_z = wp.vec3(-edge[1], edge[0], 0.0)
-    for a in range(3):
-        axis = axis_x
-        if a == 1:
-            axis = axis_y
-        elif a == 2:
-            axis = axis_z
-        # The two endpoints of ``edge`` project to the same value on ``e_i x edge``, so projecting
-        # all three vertices gives the identical interval the AXISTEST_* macros compute from two.
-        interval = axis_interval_projection(axis, a0, a1, a2)
-        radius = wp.abs(axis[0]) * half[0] + wp.abs(axis[1]) * half[1] + wp.abs(axis[2]) * half[2]
-        if interval[0] > radius or interval[1] < -radius:
-            return True
-    return False
-
-
-@wp.func
-def triangle_aabb_overlap(
-    center: wp.vec3, half: wp.vec3, v0: wp.vec3, v1: wp.vec3, v2: wp.vec3
-) -> wp.bool:
-    # Moller's tribox3, the 13-axis separating-axis test between a triangle and an axis-aligned
-    # box: the three box face normals, the triangle's own plane, and the nine edge-cross axes. No
-    # epsilon, matching Open3D's ``IntersectionTest::TriangleAABB`` (which runs it in ``float64``,
-    # so tangency within ``float32`` rounding is where the two can disagree).
-    a0 = v0 - center
-    a1 = v1 - center
-    a2 = v2 - center
-
-    for axis in range(3):
-        interval = axis_interval_projection(unit_axis(axis), a0, a1, a2)
-        if interval[0] > half[axis] or interval[1] < -half[axis]:
-            return False
-
-    edge0 = a1 - a0
-    edge1 = a2 - a1
-    edge2 = a0 - a2
-    if edge_axes_separate(edge0, half, a0, a1, a2):
-        return False
-    if edge_axes_separate(edge1, half, a0, a1, a2):
-        return False
-    if edge_axes_separate(edge2, half, a0, a1, a2):
-        return False
-
-    normal = wp.cross(edge0, edge1)
-    return plane_box_overlap(normal, wp.dot(normal, a0), half)
 
 
 @wp.func
@@ -495,6 +408,35 @@ SLICE_CLASS_ON_PLANE = wp.constant(wp.int32(4))
 SLICE_CLASSES = 3
 
 
+@wp.func
+def face_level_set_signs(
+    faces: wp.array[wp.int32],
+    vertex_dots: wp.array[wp.float32],
+    f: wp.int32,
+    out_signs: wp.array2d[wp.int32],
+) -> tuple[wp.int32, wp.int32]:
+    # One face's three level-set signs, stored, plus the two sums every classifier decides on.
+    #
+    # ``SLICE_SIGN_INSIDE`` (-1) is the ``>= isovalue`` side, so the tolerance sign is negated and a
+    # value on the level set counts as positive. ``signs_sum`` separates "all one side" from "cut"
+    # and ``signs_asum`` counts the corners strictly off the plane; between them they name every
+    # case both classifiers below distinguish.
+    #
+    # Shared by ``classify_faces_for_slice`` and ``classify_faces_for_split``, which differ only in
+    # the 3-way vs 4-way decision they map these two sums onto -- that is the genuine variation, and
+    # the nine statements above it were a copy. Kept here rather than in ``kernels/predicates.py``
+    # because it writes an output array: that module holds pure predicates, and both callers of this
+    # one are in this file.
+    i0, i1, i2 = kernel_triangles.corner_triple(faces, f)
+    s0 = -kernel_array.sign_with_tolerance(vertex_dots[i0], TOLERANCE_MERGE_CONSTANT)
+    s1 = -kernel_array.sign_with_tolerance(vertex_dots[i1], TOLERANCE_MERGE_CONSTANT)
+    s2 = -kernel_array.sign_with_tolerance(vertex_dots[i2], TOLERANCE_MERGE_CONSTANT)
+    out_signs[f, 0] = s0
+    out_signs[f, 1] = s1
+    out_signs[f, 2] = s2
+    return s0 + s1 + s2, wp.abs(s0) + wp.abs(s1) + wp.abs(s2)
+
+
 @wp.kernel
 def classify_faces_for_slice(
     faces: wp.array[wp.int32],
@@ -503,18 +445,7 @@ def classify_faces_for_slice(
     out_signs: wp.array2d[wp.int32],
 ) -> None:
     f = wp.int32(wp.tid())
-    i0 = faces[f * 3]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
-    s0 = -kernel_array.sign_with_tolerance(vertex_dots[i0], TOLERANCE_MERGE_CONSTANT)
-    s1 = -kernel_array.sign_with_tolerance(vertex_dots[i1], TOLERANCE_MERGE_CONSTANT)
-    s2 = -kernel_array.sign_with_tolerance(vertex_dots[i2], TOLERANCE_MERGE_CONSTANT)
-    out_signs[f, 0] = s0
-    out_signs[f, 1] = s1
-    out_signs[f, 2] = s2
-
-    signs_sum = s0 + s1 + s2
-    signs_asum = wp.abs(s0) + wp.abs(s1) + wp.abs(s2)
+    signs_sum, signs_asum = face_level_set_signs(faces, vertex_dots, f, out_signs)
 
     # A face lying in the plane also satisfies the "wholly inside" test (both sums are zero), so
     # it has to be tested first -- its side is decided from its normal, not from its vertices.
@@ -735,19 +666,9 @@ def classify_faces_for_split(
 ) -> None:
     # Four classes rather than the clip's three, because a split keeps both sides and so has to
     # tell the two *uncut* sides apart -- and because a face with one corner exactly on the level
-    # set splits into two triangles, not three. Signs follow ``classify_faces_for_slice``:
-    # ``SLICE_SIGN_INSIDE`` (-1) is the ``>= isovalue`` side, so a zero value counts as positive.
+    # set splits into two triangles, not three. The sign convention is ``face_level_set_signs``'.
     f = wp.int32(wp.tid())
-    i0, i1, i2 = kernel_triangles.corner_triple(faces, f)
-    s0 = -kernel_array.sign_with_tolerance(vertex_dots[i0], TOLERANCE_MERGE_CONSTANT)
-    s1 = -kernel_array.sign_with_tolerance(vertex_dots[i1], TOLERANCE_MERGE_CONSTANT)
-    s2 = -kernel_array.sign_with_tolerance(vertex_dots[i2], TOLERANCE_MERGE_CONSTANT)
-    out_signs[f, 0] = s0
-    out_signs[f, 1] = s1
-    out_signs[f, 2] = s2
-
-    signs_sum = s0 + s1 + s2
-    signs_asum = wp.abs(s0) + wp.abs(s1) + wp.abs(s2)
+    signs_sum, signs_asum = face_level_set_signs(faces, vertex_dots, f, out_signs)
     if signs_sum == -signs_asum:
         # Every corner on the positive side, or all three exactly on the level set -- which counts
         # as positive, so the face is kept whole rather than cut along itself.

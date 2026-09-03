@@ -1319,7 +1319,9 @@ def test_quadric_decimate_provenance_maps_are_consistent(
     assert np.allclose(plain_vertices_wp.numpy(), out_vertices_wp.numpy(), rtol=1e-6, atol=1e-6)
 
 
-def test_quadric_decimate_provenance_on_degenerate_inputs(device: str) -> None:
+def test_quadric_decimate_provenance_on_degenerate_inputs(
+    device: str, unit_box: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """
     Not a library comparison: the ``-1`` entry, and the no-op path's identity maps.
 
@@ -1345,7 +1347,7 @@ def test_quadric_decimate_provenance_on_degenerate_inputs(device: str) -> None:
     assert np.array_equal(face_index_wp.numpy(), np.arange(1))
 
     # A mesh with an unreferenced vertex, decimated for real: vertex 3 has nowhere to go.
-    grid_tm = tm.creation.box()
+    grid_tm, _grid_wp = unit_box
     grid_vertices_np = np.vstack([np.asarray(grid_tm.vertices), [[9.0, 9.0, 9.0]]])
     grid_vertices_wp, grid_faces_wp = numpy_to_warp(
         grid_vertices_np, np.asarray(grid_tm.faces, dtype=np.int32).reshape(-1), device
@@ -1979,12 +1981,19 @@ def test_subdivide_matches_open3d(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> No
 @pytest.mark.parity("subdivide", "pytorch3d")
 def test_subdivide_matches_pytorch3d(icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
-    Class B: ``ops.SubdivideMeshes`` is the same 1:4 split, compared on **sorted** coordinates.
+    Class B: ``ops.SubdivideMeshes`` is the same 1:4 split, matched by nearest neighbour.
 
-    Identical counts (642 vertices, 1 280 faces from 162 / 320) and the sorted coordinate rows
-    agree at **0.0** -- exactly, because both sides take the same midpoint of the same float32
-    edge. Face buffers are deliberately *not* compared positionally: pytorch3d emits its four
-    children in its own order and numbers the new midpoints by its own edge table.
+    Identical counts (642 vertices, 1 280 faces from 162 / 320) and the matched coordinates agree
+    at **0.0** -- exactly, because both sides take the same midpoint of the same float32 edge.
+    Face buffers are deliberately *not* compared positionally: pytorch3d emits its four children in
+    its own order and numbers the new midpoints by its own edge table.
+
+    The vertex correspondence is a ``cKDTree`` query plus a bijection check and **not**
+    ``lexsort_rows``, which CLAUDE.md section 7.5 records as unusable on float coordinates with
+    ties: two sides that tie in float32 but differ in the 16th float64 digit order those rows
+    differently and the compare then fails by the full coordinate range. It passed here only
+    because both sides happen to produce bit-identical midpoints today, so any change to either
+    summation order would have turned it into a false negative reading as a real disagreement.
 
     ``SubdivideMeshes`` is a ``torch.nn.Module`` rather than a function, and constructing it with
     no ``meshes=`` argument is what makes it recompute the subdivision topology per call -- passing
@@ -1999,9 +2008,9 @@ def test_subdivide_matches_pytorch3d(icosphere_coarse: tuple[tm.Trimesh, wp.Mesh
     assert faces_p3d.shape[0] == 4 * len(mesh_tm.faces)
     assert int(vertices_wp.shape[0]) == vertices_p3d.shape[0]
     assert int(faces_wp.shape[0]) // 3 == faces_p3d.shape[0]
-    assert np.array_equal(
-        lexsort_rows(vertices_wp.numpy()), lexsort_rows(vertices_p3d.astype(np.float32))
-    )
+    distance_np, match_np = KDTree(vertices_p3d.astype(np.float32)).query(vertices_wp.numpy())
+    assert distance_np.max() == 0.0, f"vertices differ by up to {distance_np.max():.3e}"
+    assert len(set(match_np.tolist())) == match_np.shape[0], "the vertex match is not a bijection"
 
 
 def test_subdivide_matches_igl(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

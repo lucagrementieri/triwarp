@@ -1029,6 +1029,76 @@ def query_nearest(
     return _shape_nearest(neighbor_indices, neighbor_distances, k, single_query)
 
 
+def _knn_cell_size(
+    initial_radius: float, min_bound: wp.vec3, max_bound: wp.vec3, grid_bins: int
+) -> float:
+    """Hash-grid cell width for a k-NN search starting at ``initial_radius``."""
+    extent = max(float(max_bound[axis] - min_bound[axis]) for axis in range(3))
+    if extent <= 0.0:
+        # Every point is at the same position, so any positive width buckets them together.
+        return 1.0
+    # Lower bound ``extent / grid_bins`` keeps the cloud inside one period of the spatial hash;
+    # upper bound ``extent`` keeps a huge ``initial_radius`` (``k >= n`` gives ``inf``) finite.
+    return min(max(initial_radius, extent / grid_bins), extent)
+
+
+def _knn_widest_grid_radius(cell_size: float, n: int) -> float:
+    """
+    Radius past which an exact linear scan beats widening the hash-grid walk.
+
+    ``wp.hash_grid_query`` visits ``(2 ceil(r / cell) + 1) ** 3`` cells, and each visit is a hash
+    plus two dependent, uncoalesced global loads. The linear scan it falls back to is the opposite:
+    every thread in a warp reads the *same* ``points[j]``, so it streams out of L2 as a broadcast.
+    Measured on an RTX 5090, one cell probe costs on the order of ``_CELL_PROBE_POINTS`` point
+    tests, which makes the break-even span grow as ``n ** (1/3)`` — one cell of slack on ``bunny``
+    (36k points), four on ``dragon`` (438k). A fixed span gets one of those two badly wrong.
+    """
+    span = 0.5 * ((n / _CELL_PROBE_POINTS) ** (1.0 / 3.0) - 1.0)
+    # Never below one cell: the 3x3x3 walk is what the grid was built for and is cheap at any n.
+    return max(span, 1.0) * cell_size
+
+
+def _validate_nearest(k: int, max_radius: float, initial_radius: float | None) -> None:
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    if max_radius < 0:
+        raise ValueError("max_radius must be >= 0")
+    if initial_radius is not None and initial_radius < 0:
+        raise ValueError("initial_radius must be >= 0")
+
+
+def _empty_nearest(
+    m: int, k: int, single_query: bool, device: wp.DeviceLike
+) -> tuple[twt.Array2dInt32 | twt.Array1dInt32, twt.Array2dFloat32 | twt.Array1dFloat32]:
+    """Build the result rows for an empty point cloud: every slot unfilled."""
+    neighbor_indices = wp.full((m, k), wp.int32(-1), dtype=wp.int32, device=device)
+    neighbor_distances = wp.full((m, k), math.inf, dtype=wp.float32, device=device)
+    if single_query:
+        return neighbor_indices[0], neighbor_distances[0]
+    return twt.as_array2d(neighbor_indices, wp.int32), twt.as_array2d(
+        neighbor_distances, wp.float32
+    )
+
+
+def _shape_nearest(
+    neighbor_indices: wp.array[wp.int32],
+    neighbor_distances: wp.array[wp.float32],
+    k: int,
+    single_query: bool,
+) -> tuple[twt.Array2dInt32 | twt.Array1dInt32, twt.Array2dFloat32 | twt.Array1dFloat32]:
+    """Collapse the ``(m, k)`` result to the rank the caller's ``queries`` / ``k`` imply."""
+    if k == 1:
+        return (
+            cast(twt.Array1dInt32, neighbor_indices.reshape(-1)),
+            cast(twt.Array1dFloat32, neighbor_distances.reshape(-1)),
+        )
+    if single_query:
+        return neighbor_indices[0], neighbor_distances[0]
+    return twt.as_array2d(neighbor_indices, wp.int32), twt.as_array2d(
+        neighbor_distances, wp.float32
+    )
+
+
 def _resolve_accelerator(
     accelerator: wp.HashGrid | wp.Bvh | None, backend: QueryBackend | None
 ) -> tuple[QueryBackend, wp.HashGrid | wp.Bvh | None]:
@@ -1066,7 +1136,7 @@ def query_weighted_nearest(
     queries: wp.array[wp.vec3],
     *,
     max_weight: float | None = None,
-    bvh: wp.Bvh | None = None,
+    accelerator: wp.Bvh | None = None,
     leaf_size: int = 4,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]:
     """
@@ -1092,8 +1162,12 @@ def query_weighted_nearest(
         An **upper bound** on ``weights``, which is what makes the search prunable. ``None`` reduces
         ``weights`` on the device and reads the maximum back (one readback, ~0.1 ms), so pass it
         when the bound is already known -- a radius cap, or a previous call's reduction.
-    bvh
-        A ``wp.Bvh`` already built over ``points``, to spare the build.
+    accelerator
+        A prebuilt ``wp.Bvh`` over ``points``, to reuse across queries. Spelled the way the four
+        [`query_ball`][triwarp.neighbors.query_ball] /
+        [`query_nearest`][triwarp.neighbors.query_nearest] entry points spell it, but with no
+        ``backend`` beside it: this query has only the BVH broad phase, so there is nothing to
+        select between.
     leaf_size
         Maximum primitives per BVH leaf when one is built here.
 
@@ -1144,8 +1218,8 @@ def query_weighted_nearest(
             wp.full(m, float("inf"), dtype=wp.float32, device=device),
         )
 
-    if bvh is None:
-        bvh = bvh_from_points(points, leaf_size=leaf_size)
+    if accelerator is None:
+        accelerator = bvh_from_points(points, leaf_size=leaf_size)
     if max_weight is None:
         max_weight = float(cast(float, tw.reduce.max(weights)))
     min_bound, max_bound = tw.bounds.aabb(points)
@@ -1164,7 +1238,7 @@ def query_weighted_nearest(
             points,
             weights,
             queries,
-            bvh.id,
+            accelerator.id,
             wp.float32(max_weight),
             wp.float32(initial_radius),
             min_bound,
@@ -1445,73 +1519,3 @@ def geodesic_ball(
     # Chunk order equals ascending source order, so concatenation lines up with the global scan.
     # Same per-segment ``wp.copy`` loop either way -- that is the packing floor -- one call for it.
     return tw.array.concatenate(chunk_flats), offsets, reference_neighbors
-
-
-def _knn_cell_size(
-    initial_radius: float, min_bound: wp.vec3, max_bound: wp.vec3, grid_bins: int
-) -> float:
-    """Hash-grid cell width for a k-NN search starting at ``initial_radius``."""
-    extent = max(float(max_bound[axis] - min_bound[axis]) for axis in range(3))
-    if extent <= 0.0:
-        # Every point is at the same position, so any positive width buckets them together.
-        return 1.0
-    # Lower bound ``extent / grid_bins`` keeps the cloud inside one period of the spatial hash;
-    # upper bound ``extent`` keeps a huge ``initial_radius`` (``k >= n`` gives ``inf``) finite.
-    return min(max(initial_radius, extent / grid_bins), extent)
-
-
-def _knn_widest_grid_radius(cell_size: float, n: int) -> float:
-    """
-    Radius past which an exact linear scan beats widening the hash-grid walk.
-
-    ``wp.hash_grid_query`` visits ``(2 ceil(r / cell) + 1) ** 3`` cells, and each visit is a hash
-    plus two dependent, uncoalesced global loads. The linear scan it falls back to is the opposite:
-    every thread in a warp reads the *same* ``points[j]``, so it streams out of L2 as a broadcast.
-    Measured on an RTX 5090, one cell probe costs on the order of ``_CELL_PROBE_POINTS`` point
-    tests, which makes the break-even span grow as ``n ** (1/3)`` — one cell of slack on ``bunny``
-    (36k points), four on ``dragon`` (438k). A fixed span gets one of those two badly wrong.
-    """
-    span = 0.5 * ((n / _CELL_PROBE_POINTS) ** (1.0 / 3.0) - 1.0)
-    # Never below one cell: the 3x3x3 walk is what the grid was built for and is cheap at any n.
-    return max(span, 1.0) * cell_size
-
-
-def _validate_nearest(k: int, max_radius: float, initial_radius: float | None) -> None:
-    if k < 1:
-        raise ValueError("k must be >= 1")
-    if max_radius < 0:
-        raise ValueError("max_radius must be >= 0")
-    if initial_radius is not None and initial_radius < 0:
-        raise ValueError("initial_radius must be >= 0")
-
-
-def _empty_nearest(
-    m: int, k: int, single_query: bool, device: wp.DeviceLike
-) -> tuple[twt.Array2dInt32 | twt.Array1dInt32, twt.Array2dFloat32 | twt.Array1dFloat32]:
-    """Build the result rows for an empty point cloud: every slot unfilled."""
-    neighbor_indices = wp.full((m, k), wp.int32(-1), dtype=wp.int32, device=device)
-    neighbor_distances = wp.full((m, k), math.inf, dtype=wp.float32, device=device)
-    if single_query:
-        return neighbor_indices[0], neighbor_distances[0]
-    return twt.as_array2d(neighbor_indices, wp.int32), twt.as_array2d(
-        neighbor_distances, wp.float32
-    )
-
-
-def _shape_nearest(
-    neighbor_indices: wp.array[wp.int32],
-    neighbor_distances: wp.array[wp.float32],
-    k: int,
-    single_query: bool,
-) -> tuple[twt.Array2dInt32 | twt.Array1dInt32, twt.Array2dFloat32 | twt.Array1dFloat32]:
-    """Collapse the ``(m, k)`` result to the rank the caller's ``queries`` / ``k`` imply."""
-    if k == 1:
-        return (
-            cast(twt.Array1dInt32, neighbor_indices.reshape(-1)),
-            cast(twt.Array1dFloat32, neighbor_distances.reshape(-1)),
-        )
-    if single_query:
-        return neighbor_indices[0], neighbor_distances[0]
-    return twt.as_array2d(neighbor_indices, wp.int32), twt.as_array2d(
-        neighbor_distances, wp.float32
-    )

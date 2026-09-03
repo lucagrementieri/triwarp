@@ -88,7 +88,7 @@ def test_concatenate_matches_meshlib(request: pytest.FixtureRequest) -> None:
 
 
 @pytest.mark.parity("concatenate", "pytorch3d")
-def test_concatenate_matches_pytorch3d(request: pytest.FixtureRequest) -> None:
+def test_concatenate_matches_pytorch3d(request: pytest.FixtureRequest, device: str) -> None:
     """
     Class A: ``join_meshes_as_scene`` is ``concatenate`` -- positions exact, faces byte-equal.
 
@@ -102,7 +102,7 @@ def test_concatenate_matches_pytorch3d(request: pytest.FixtureRequest) -> None:
     joined_p3d = p3d_structures.join_meshes_as_scene(
         [trimesh_to_pytorch3d(mesh_tm) for mesh_tm in meshes_tm]
     )
-    meshes_wp = [numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, "cpu") for mesh_tm in meshes_tm]
+    meshes_wp = [numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device) for mesh_tm in meshes_tm]
     vertices_wp, faces_wp = tw.combine.concatenate(meshes_wp)
 
     assert joined_p3d.verts_packed().shape[0] == sum(len(m.vertices) for m in meshes_tm)

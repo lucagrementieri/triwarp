@@ -251,6 +251,22 @@ def test_heat_geodesic_matches_meshlib(device: str, icosphere: tuple[tm.Trimesh,
     overload for the single-source case -- and the result is a ``VertScalars``, read through
     [`meshlib_scalars_to_numpy`][tests.conversions.meshlib_scalars_to_numpy] since ``np.asarray``
     on one silently yields a 0-d object array.
+
+    **Mutation probe**, and what it says is that the three asserts divide the work unevenly. The
+    measured errors against the exact field are 0.0515 (triwarp) and 0.0442 (meshlib) against a
+    0.1571 bar, and the correlation is 0.99983 against a 0.999 bar. Mutating the triwarp field:
+
+    | mutation      | error vs the 5 % bar | correlation vs the 0.999 bar |
+    |---------------|----------------------|------------------------------|
+    | shuffle       | 2.753 -- **fails**   | -0.014 -- **fails**          |
+    | scale x1.10   | 0.273 -- **fails**   | 0.99983 -- passes            |
+    | scale x1.05   | 0.124 -- passes      | 0.99983 -- passes            |
+
+    So the **correlation cannot see a scale error at all** (it is scale-invariant), and the error
+    bar is what carries that half -- but only past ~5 %, because the bar *is* 5 % and the field
+    already spends a third of it on discretization. That is the honest limit of this comparison and
+    not a threshold to tighten: 5 % is where two first-order methods genuinely sit, which the
+    paragraph above already argues. A finer claim needs a finer mesh, not a smaller number.
     """
     mesh_tm, mesh_wp = icosphere
     source = 0
@@ -665,6 +681,13 @@ def test_heat_signed_distance_level_set_constraint_matches_potpourri3d(
     bug this exists for, and one a correlation bound alone would pass, since the two fields
     correlate 0.940 and 0.936 respectively, i.e. the *statistic does not separate the two modes at
     all*. The 1e-3 floor is 18x below the smaller measured magnitude.
+
+    **Mutation probe.** The paragraph above already *is* one for the last two asserts -- it names
+    the bug (a silently ignored keyword), shows the correlation cannot see it, and records the 18x
+    floor. For the two statistical asserts the probe is the sibling's, on this same fixture and
+    these same two bounds: shuffling one side gives a mean error of **0.478 against the 0.150 bar**
+    and negating it gives ``r = -0.94``, so both fail. What that probe also found and this test
+    inherits: the ``hemisphere`` error bound has only **1.19x** headroom on unshuffled input.
     """
     mesh_tm, mesh_wp = hemisphere
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
@@ -705,6 +728,21 @@ def test_heat_signed_distance_matches_potpourri3d(
     matters here: a sign flip, a scale error, or a field ignoring the curve would each break a 0.9
     correlation and a mean error under 5 % of the mesh diagonal. Measured margins are in the comment
     below, and the correlation is the tighter constraint (0.996 and 0.940 against the 0.9 bar).
+
+    **Mutation probe** (30 permutations, both fixtures), and it shows the two statistics are
+    complementary rather than redundant -- neither alone excludes the whole bug class:
+
+    | mutation             | correlation      | mean error vs its bar        |
+    |----------------------|------------------|------------------------------|
+    | shuffle one side     | 0.73 / 0.21      | 0.487 / 0.478 vs 0.147 / 0.150 -- **fails** |
+    | negate one side      | -0.996 / -0.940 -- **fails** | unchanged in magnitude |
+    | scale one side x1.5  | unchanged (scale-invariant) | 0.284 / 0.533 -- **fails** |
+
+    So the correlation catches the sign flip and the error bound catches the scale error and the
+    shuffle, which is the division of labour the docstring above claims. One caveat worth carrying:
+    on ``hemisphere`` the measured mean error is **0.1259 against a 0.1500 bar -- 1.19x**, well
+    inside section 7.4's 3x preference, because that curve sits one ring from the rim where the two
+    boundary handlings diverge most. Do not tighten that bar without re-measuring both fixtures.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)

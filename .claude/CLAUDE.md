@@ -80,7 +80,10 @@ Two conventions that hold throughout:
 - **Every argument of both `@wp.kernel` and `@wp.func` MUST be explicitly typed.**
 - `wp.tid()` may be called **only inside `@wp.kernel`**, never inside `@wp.func` — pass the thread
   index as an argument.
-- `@wp.func` may return several values as a tuple; declare `tuple[T1, T2, ...]`.
+- `@wp.func` may return several values as a tuple; declare `tuple[T1, T2, ...]`. **The generic
+  forms parse on Warp 1.17** — probed directly: `tuple[Any, Any, Any]`, `tuple[wp.Float,
+  wp.Float]` and the mixed `tuple[Any, wp.Float]` all compile and run on an `Any`-generic
+  helper, so a dtype- or rank-generic helper is no reason to leave the annotation off.
 - A `@wp.func` may read `values.shape[1]` and may carry **default argument values**
   (`def f(a: wp.int32, b: wp.int32 = 3)`). `wp.launch` also accepts **`None` for an array argument**
   (a null descriptor) — legal as long as no thread indexes it.
@@ -427,6 +430,17 @@ hash links.
   `sortable_dtype` maps onto, a docstring naming its own admissible dtypes — and say so in a
   comment. Where two generic arguments are independent (`laplacian.cotmatrix_triplets`' entry
   precision and matrix precision), it is a genuine cross product, not a diagonal.
+- **A diagonal registration where the wrapper admits a cross product is the expensive half of this
+  rule, and it now has a clock reading.** `energies.crouzeix_raviart_cotmatrix_triplets` was
+  registered `for dtype in _MATRIX_DTYPES` with one loop variable serving both its `cot_entries`
+  and its value precision, while the public
+  `crouzeix_raviart_cotmatrix(cot_entries: twt.Array2dFloat, dtype: type)` takes the two
+  *independently* and the kernel body casts one to the other. Measured on an RTX 5090, Warp 1.17,
+  with the diagonal path warmed first: the first `float64`-entries / `float32`-matrix call logged
+  `Module hash changed, recompiling: triwarp.kernels.energies` and took **80.3 s**, returning the
+  right answer — §2.5's failure mode with a number on it. The nested loop takes the same call to
+  **1.47 ms**. So when a wrapper exposes two dtype knobs, check whether the registration crosses
+  them; `laplacian.py`'s sibling did and says so in a comment, which is the model.
 - **Registration is not compilation.** `wp.overload` builds the overload's `Adjoint` and nothing
   else, so this costs milliseconds of import and nothing on a process that never launches the
   kernel. Do **not** `wp.load_module` / `wp.force_load` at import — that *would* compile eagerly.
@@ -668,7 +682,10 @@ At **Python scope**, Warp supports **gather** with integer indexing: `view = src
   `triwarp/kernels/array.py`).
 
 Do **not** add custom per-element gather kernels when `[]` plus `wp.copy` suffices. Probe tests live
-in `tests/test_*_indexing_probe.py`.
+in `tests/test_*_indexing_probe.py` — `test_array_indexing_probe.py` pins the stride hazard
+itself (still live on Warp 1.17), written as *"the gather returns the flat prefix"* rather than
+*"not the column"* so that a Warp release honouring the stride fails it and this rule is revisited
+rather than silently kept.
 
 ### 3.5 Elementwise ops at Python scope (`wp.map`)
 
@@ -1392,6 +1409,17 @@ carries the oracle.
 - **Assert the reference produced a non-empty answer, or its expected count, before comparing to
   it** — and treat "this function is already the oracle in tests/" as no evidence that the comparison
   is live.
+- **A docstring that says the vacuous branch is "covered separately" is a claim to check, not a
+  reason to stop.** `test_face_nondegenerate_mask` compared against `trimesh.triangles.nondegenerate`
+  on a fixture where both sides are all-`True`, and said so — *"which is why the degenerate branch is
+  covered separately by the zero-area tests in this file"*. **Those tests did not exist**; the
+  nearest one exercised a different function, and every call in the suite that feeds the mask a
+  degenerate face lives in `tests/test_repair.py`. So the guard §7.7 records as the regression
+  detector for `screened_poisson(point_weight=0.0)`'s zero-area triangles had its own reference
+  comparison untested on the condition it guards. It is now parametrized over a clean and a
+  degenerate arm with `assert np.count_nonzero(~nondegenerate_tm) == (2 if with_degenerate else 0)`
+  carrying the claim, and the mutation probe confirms it is the *trimesh comparison* that fails when
+  the mask is forced all-`True`. **Grep for the tests a docstring names before believing it.**
 
 **Proving a guard test "bites" means identifying WHICH assertion fails under the mutation, not that
 the test fails.** A multi-assert test can fail for a reason unrelated to the defect it was written
@@ -1402,6 +1430,27 @@ disclaims and cost a second kernel path per bucket. Corollaries: if a test compa
 itself, ask what an external oracle would say instead; and **before building a test around a plan's
 failure-mode claim, reproduce the claim** — a plan's "measured" claims are hypotheses about what was
 probed.
+
+**A Class C threshold with a large headroom is a threshold that does not bite, and the probe is
+what shows it.** §7.4 asks for a margin of at least 3x *between the threshold and the measured
+agreement*, which is a floor against flakiness; it says nothing about the ceiling, and four of the
+tests probed in one pass sat at 9.5-38x. Two were retightened on the probe's own numbers —
+`offset_mesh` against both MeshLab and pymeshlab from `0.5 * _VOXEL` to `0.25` (14x and 9.5x → 7.0x
+and 4.8x, which is what makes a **10 %** offset error fail where only a 25 % one did before), and
+`resample_uniform` from `2.0 * voxel_size` to `0.5` (38x → 9.6x, separating a **5 %** scale error
+where 10 % used to pass). The probe to run is the one that re-runs the *reference* on a deliberately
+wrong input, not one that perturbs the triwarp side: it measures what the threshold can actually
+distinguish. Two results that went the other way and are recorded as such: `heat_geodesic`'s 5 % bar
+against the exact great-circle field cannot be tightened, because a third of it is genuine
+discretization error in both methods; and the two `heat_signed_distance` correlations pair with an
+error bound that has only **1.19x** headroom on `hemisphere`, so that one is at its floor already.
+
+**A rank correlation is scale-invariant and an error bound is not, so a Class C test carrying both
+is carrying two different guards — say which catches what.** Measured on
+`heat_signed_distance`: shuffling one side fails the error bound (0.478 against a 0.150 bar) but
+leaves the correlation at 0.73 on a 12-vertex fixture; negating one side fails the correlation and
+leaves the error bound's magnitude untouched; scaling one side by 1.5 fails the error bound and
+leaves the correlation *exactly* unchanged. Neither statistic alone excludes the bug class.
 
 **Run the mutation probe on a test whose whole point is a boundary predicate.** A branch-agreement
 test for `greedy_downsample_mask` did not bite: mutating the search's `>=` to `>` left all three
@@ -2766,6 +2815,15 @@ Consequence: the shared argmin/argmax/swap helpers in `kernels/array.py` are con
   the code under test.
 - **`wp.length(d) < r` and `wp.length_sq(d) < r*r` are not the same predicate in float32** — 10 rows
   of 200k disagree at the boundary, the same 10 on CPU and CUDA. Rule: §2.4.
+- **`NaN` breaks a binary search, and which way it breaks depends on the search's convention.**
+  Every comparison against `NaN` is false, so a midpoint landing on one is steered by a predicate
+  that never fires. `searchsorted(side="right")`'s `values[mid] > value` then advances `left`, i.e.
+  *into* Warp's float radix sort's trailing `NaN` block, and the search returns the array length for
+  every finite value; `side="left"`'s `wp.lower_bound` is steered away from it and is correct for
+  every finite value while landing `NaN` itself at slot 0. Neither raises. Where a `NaN` can only
+  belong to the last slot — which is exactly a sorted-unique table — the fix is the left search plus
+  `if index >= n or values[index] != value: index = n - 1`, since `NaN` compares unequal to
+  everything including itself. §16.5 has the case this cost.
 - **float32 storage sets a hard noise floor that no solver tolerance reaches.**
   `tangent_space.halfedge_transport_angles` (and `halfedge_tangent_angles`, and `triangles.face_angles`
   under them) are float32, and that storage precision — not the CG tolerance, not the frames — sets
@@ -2852,6 +2910,14 @@ Rules: §1.3, §1.5, §1.6.
 - **`wp.config.verbose = True` is deprecated in Warp 1.17** — it prints a deprecation notice to
   stderr, which is noise in exactly the output you are grepping. Use
   `wp.config.log_level = wp.LOG_DEBUG`; the log lines themselves are unchanged.
+- **A tile `shape=` must be a plain integer, so `wp.constant(wp.int32(n))` cannot serve as one.**
+  `wp.constant(256)` works as a `wp.tile_load` / `wp.tile_zeros` `shape=`; the typed spelling fails
+  at *parse* time with an `AttributeError` naming the kernel. That matters because §1.5's check 17
+  types an operand by declaration and only recognises an integer `wp.constant` in the typed form, so
+  a constant that is also a tile shape can never be made visible to it — `algorithms/bfs.py`'s
+  `BFS_SCAN_BLOCK` converted (it is only an offset and an index) and `conjugate_gradient.py`'s
+  `CG_TILE` cannot, and says so at the site. A typed constant is also not usable in *host* arithmetic
+  (`(n + c - 1) // c` raises `unsupported operand type(s) for //`), so the wrapper reads `int(...)`.
 
 ### 12.7 `warp.sparse`
 
@@ -3152,7 +3218,7 @@ launch** — 0.59x at 10 000 elements and 0.94x at 10M against the concrete form
 `min` and median, so it is per-launch and not a first-call effect. Isolated by timing three variants
 of one body: concrete hand-written, concrete factory-generated, and `Any`; the first two agree to
 ~3 µs and only `Any` pays. A generic kernel is right for a *rarely launched* op
-(`kernels/scatter.py:scatter_add` has two call sites, one launch each) and wrong for anything in a
+(`kernels/scatter.py:scatter_add` has three call sites, one launch each) and wrong for anything in a
 loop or anything whose own work is under ~50 µs. The factory form is §2.7.
 
 **Per-segment packing costs are host constants and flat in the data** — the same rows measure 1.46 ms
@@ -3391,6 +3457,19 @@ the constants that branch reads** — the old measurement may no longer describe
 CUDA/CPU path was added so those two stopped reaching the sliced form on CUDA at all, and the
 constant's only remaining CUDA consumer became the convex-hull support sweep, which nothing in the
 original sweep had weighted for.
+
+**Sweep the values you did not try the first time, or the re-probe inherits the original's blind
+spot.** §9's "re-probe after a Warp upgrade" was run on the three constants stamped Warp 1.16, and
+the two outcomes are opposite. `polyline._DOWNSAMPLE_DOUBLING_FROM = 8192` **reproduces exactly** on
+1.17 (0.19 / 0.40 / 0.65 / 1.14 / 2.24 / 7.58x at 528 → 65 536 against the recorded 0.19 / 0.37 /
+0.62 / 1.16 / 1.92 / 6.72x, masks byte-identical, CPU still losing at every size) — no change.
+`kernels/points.FARTHEST_BLOCK_*` did not: the original was a two-value sweep (256 and 1024) and
+read as two brackets split at 4 096, but sweeping 128 / 256 / 512 / 1024 shows **three** — 256 below
+~2 048, **512 from ~2 048 to ~5 120**, 1 024 from ~6 144 — so the old crossover handed a 4 096-point
+cloud that wants 512 lanes to 1 024, a **1.29x loss at exactly the bracket point**. The brackets are
+stable across `count` (256 and 1 024 pick the same width at every size) and the selected indices are
+identical at every width, so it is a pure cost choice. **A constant whose sweep sampled two values
+has not been shown to be a two-bracket problem.**
 
 ---
 
@@ -3784,6 +3863,14 @@ multiply. Two specific traps: a *warm* repeat of a stage measures a different re
 one inside the real call (a CG solve especially), and `wp.empty` vs `wp.zeros` differ by ~4 µs of
 memset against ~8.6 µs of allocator, so "remove the memset" and "remove the allocation" are different
 claims.
+
+**And price it at more than one size, because the *sign of the trend* is the decision.** Two items
+worked in one pass had nearly the same share at the small end and opposite verdicts, which only the
+second point revealed. `mesh_to_mesh_distance`'s two tail readbacks are 3.3 % of the call on `bunny`
+and **12.5 % on `lucy`** — a share that *grows*, so the fix is worth more the more it matters, and
+it landed. `hash_indices_rows`' validation readback is 14.9 % of `edges_unique` on
+`bunny_decimated` and **4.8 % on `dragon`** — a share that falls, which §9 calls a decline, and it
+was declined. A single operating point would have read the two as the same item.
 
 ### 15.3 Attribute at the benchmarked operating point
 
@@ -4219,6 +4306,19 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   function produced the identical symptom, so the second bug was only findable after the first was
   fixed: **when one fix does not change a symptom, suspect two causes rather than concluding the fix
   was wrong.**
+- **FIXED, and the same convention was the cause: `side="right"` is poisoned by `NaN`, so
+  `unique_1d(return_inverse=True)` was silently wrong on any float array containing one.** Warp's
+  float radix sort puts `NaN` last and every comparison against it is false, so a binary search
+  whose midpoint lands in that tail is steered by a predicate that never fires — and `side="right"`
+  is steered *into* the tail, reporting the **last** slot for every finite value. Measured on
+  Warp 1.17: `[3.5, 1.25, 3.5, nan, 1.25]` returned `[2, 0, 2, 2, 0]` against numpy's
+  `[1, 0, 1, 2, 0]`, while `unique_1d`'s own docstring documents numpy's `NaN` semantics for exactly
+  this path. `map_sorted_inverse` now searches `side="left"` (identical for an integer key, since
+  every key it looks up is present) and falls back to the last slot when the found element compares
+  unequal — which is the `NaN` branch, and costs one comparison. **How it was found is the
+  transferable part: it fell out of *registering the float overloads*** (§2.5), because writing the
+  registration meant asking what dtypes the wrapper's dispatch reaches, and then launching one. A
+  dtype nothing had ever knowingly run is a dtype nothing had ever checked.
 - **`_unique_hash`'s two whole-table bookkeeping passes were 40 % of `unique_1d`.** Phase-timed at
   313 µs for 100k int32: `mark_occupied` + `array_scan` + `wp.map(sub)` + readback **93.4 µs**,
   `arange` for the sort's permutation **30.4**, `radix_sort_pairs` **55.3**, `hash_insert` + its two
@@ -4345,7 +4445,16 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   is ~2 % and the cost is in the structure builds and the bound; the imbalance that motivated the
   two-pass design (98.2 % of faces returning no candidate, §14.2) simply does not appear at that
   scale. By contrast `happy_buddha` has 14 overflowing faces and pass 2 is **81.8 %** of its two
-  passes.
+  passes. **Partly closed, and the missing piece was host time.** The remainder above was attributed
+  to "the structure builds and the bound" because a device profile is where it was looked for;
+  **12.5 % of it was two `.numpy()` calls in the function's own tail**, each copying a whole
+  per-face array to the host to index one element. Priced directly at the benchmark's own operating
+  point, min of 15: `bunny` 0.106 → 0.048 ms (3.34 % → 1.52 % of a 3.18 ms call), `dragon`
+  0.490 → 0.058 (8.88 % → 1.05 % of 5.51 ms), **`lucy` 102.6 → 0.12 ms (12.46 % → 0.01 % of
+  823.9 ms)** with `_device.read_scalar`, which takes an arbitrary index. The share *grows* with the
+  mesh, the inverse of §9's falling-share decline. Two lessons: read the *host* half before
+  accepting a device attribution, and a `.numpy()[k]` on an array that scales with the mesh is the
+  shape to grep for (`wp.mesh_get_bvh` had already taken the build out of this same function).
 - **`cotmatrix`'s 3.7-5.1x loss to pytorch3d is a scope mismatch, and the rewrite it invited is
   DECLINED.** `p3d_ops.cot_laplacian` does **not assemble a sparse matrix** — it wraps `3F` entries
   as an uncoalesced `torch.sparse_coo_tensor` and adds its transpose, so duplicate `(i, j)` pairs are

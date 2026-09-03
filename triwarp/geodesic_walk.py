@@ -34,6 +34,7 @@ from collections.abc import Sequence
 import warp as wp
 
 import triwarp as tw
+from triwarp._device import read_scalar
 from triwarp.halfedge import halfedge_twins, vertex_one_rings
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import geodesic_walk as kernel_geodesic_walk
@@ -569,7 +570,7 @@ def shorten_loop(
         # One 4-byte readback per sweep, and the only way to stop early: whether any replacement was
         # accepted is a device-side fact, and the alternative -- always running `max_iter` sweeps --
         # costs a full pass over every loop for each one that would have been skipped.
-        if int(changed.numpy()[0]) == 0:
+        if int(read_scalar(changed, 0)) == 0:
             if sweep % 2 == 1:
                 break  # both parities have now had a turn with nothing to do
             continue

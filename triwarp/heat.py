@@ -829,6 +829,21 @@ def extend_scalar(
     return extended
 
 
+def _solve_scalar(
+    system: wps.BsrMatrix[wp.float64],
+    right_hand_side: wp.array[wp.float64],
+    n_vertices: int,
+    device: wp.DeviceLike,
+    preconditioner: wpl.LinearOperator,
+) -> wp.array[wp.float64]:
+    """Diffuse one scalar right-hand side through an already-assembled heat system."""
+    solution = wp.zeros(n_vertices, dtype=wp.float64, device=device)
+    twl.solve_spd(
+        system, right_hand_side, solution, tol=_CG_TOLERANCE, preconditioner=preconditioner
+    )
+    return solution
+
+
 def transport_tangent_vectors(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -1157,21 +1172,6 @@ def diffuse_tangent_field(
         return diffused
     twl.solve_spd(system, source, diffused, tol=_CG_TOLERANCE)
     return diffused
-
-
-def _solve_scalar(
-    system: wps.BsrMatrix[wp.float64],
-    right_hand_side: wp.array[wp.float64],
-    n_vertices: int,
-    device: wp.DeviceLike,
-    preconditioner: wpl.LinearOperator,
-) -> wp.array[wp.float64]:
-    """Diffuse one scalar right-hand side through an already-assembled heat system."""
-    solution = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    twl.solve_spd(
-        system, right_hand_side, solution, tol=_CG_TOLERANCE, preconditioner=preconditioner
-    )
-    return solution
 
 
 def _as_vec2d(vectors: wp.array[wp.vec2]) -> wp.array[wp.vec2d]:

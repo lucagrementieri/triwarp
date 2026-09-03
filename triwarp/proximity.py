@@ -36,7 +36,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import prefers_tiled_reduction, require_nonempty_mesh
+from triwarp._device import prefers_tiled_reduction, read_scalar, require_nonempty_mesh
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
@@ -505,7 +505,7 @@ def mesh_to_mesh_distance(
     if tiled:
         # One readback, and it is what sizes the second launch. Skipping it by launching
         # ``n_faces_a`` blocks would put an empty block on 98 % of them.
-        n_overflow = int(counter.numpy()[0])
+        n_overflow = int(read_scalar(counter, 0))
         if n_overflow > 0:
             wp.launch_tiled(
                 kernel_proximity.face_to_mesh_distance_tiled,
@@ -537,10 +537,24 @@ def mesh_to_mesh_distance(
     # The key's low 32 bits are the winning face, so one reduction and one 8-byte read give both the
     # distance and the argmin -- no second pass over the candidates.
     best_face_a = int(tw.reduce.min(keys)) & 0xFFFFFFFF
+    # Two 4-byte reads, not two ``.numpy()`` calls: each of those copies the *whole* per-face array
+    # to the host to index one element. Measured on an RTX 5090, Warp 1.17, at this benchmark's own
+    # operating point (x-only translation of 1.2x the x-extent), interleaved, min of 15 -- the pair
+    # of reads against the whole call:
+    #
+    #   bunny  69 451 faces    0.106 -> 0.048 ms      3.34% -> 1.52% of a 3.18 ms call
+    #   dragon 871 414         0.490 -> 0.058          8.88% -> 1.05% of a 5.51 ms call
+    #   lucy   28 055 742    102.629 -> 0.123         12.46% -> 0.01% of an 823.9 ms call
+    #
+    # The share *grows* with the mesh because the copy does and the rest of the call does not, so
+    # this is the opposite of the falling share section 9 calls a decline. It also revises the
+    # attribution in section 16.6, which had this function's cost as "the structure builds and the
+    # bound" after finding the two traversal passes were ~2% of it: 12.5% of ``lucy``'s call was
+    # these two lines, invisible to a device profile because it is host time.
     return (
-        math.sqrt(float(distance_sq.numpy()[best_face_a])),
+        math.sqrt(float(read_scalar(distance_sq, best_face_a))),
         best_face_a,
-        int(witness.numpy()[best_face_a]),
+        int(read_scalar(witness, best_face_a)),
     )
 
 

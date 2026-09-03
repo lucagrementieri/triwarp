@@ -35,7 +35,7 @@ from warp._src.fem.linalg import householder_qr_decomposition, solve_triangular
 
 
 @wp.func
-def solve_normal_equations(matrix: Any, rhs: Any):
+def solve_normal_equations(matrix: Any, rhs: Any) -> tuple[Any, wp.bool]:
     """
     Solve a small dense symmetric system ``A x = b`` by Householder QR, at any rank.
 
@@ -180,21 +180,21 @@ def interior_system_csr(
     values: wp.array[wp.float64],
     fixed_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],
-    out_offsets: wp.array[wp.int32],
+    row_offsets: wp.array[wp.int32],
     out_columns: wp.array[wp.int32],
     out_values: wp.array[wp.float64],
 ) -> None:
     # Pass 2: one thread per row ``i`` of ``Q``, writing that row's surviving entries into the slots
-    # ``out_offsets`` reserved for it. ``out_offsets`` is the exclusive scan of
-    # ``interior_row_counts``' output, so the destination range is exactly the right size and no two
-    # threads overlap. Column order is inherited from ``Q``'s row and ``free_map`` is monotone
-    # non-decreasing, so the emitted row is column-sorted by construction -- which is the whole
-    # reason this can skip a triplet sort.
+    # ``row_offsets`` reserved for it. ``row_offsets`` is read-only here -- it is the exclusive scan
+    # of ``interior_row_counts``' output, produced by ``counts_to_offsets`` in the wrapper -- so the
+    # destination range is exactly the right size and no two threads overlap. Column order is
+    # inherited from ``Q``'s row and ``free_map`` is monotone non-decreasing, so the emitted row is
+    # column-sorted by construction -- which is the whole reason this can skip a triplet sort.
     i = wp.int32(wp.tid())
     ri = free_row(fixed_mask, free_map, i)
     if ri < 0:
         return
-    slot = out_offsets[ri]
+    slot = row_offsets[ri]
     for e in range(offsets[i], offsets[i + 1]):
         j = columns[e]
         if not fixed_mask[j]:

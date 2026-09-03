@@ -1052,21 +1052,20 @@ def test_slice_mesh_with_plane_empty(device: str) -> None:
 
 
 @pytest.mark.parity("slice_mesh_with_plane", "trimesh")
-def test_slice_mesh_with_plane_box_corner() -> None:
+def test_slice_mesh_with_plane_box_corner(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Class B: a corner cut against ``slice_faces_plane``, compared as canonical winding rows.
 
     The cut crosses three faces at once, which is the case where the retriangulation has a real
     choice to make; a plane cutting one face at a time would not exercise it.
     """
-    mesh_tm = tm.creation.box()
+    mesh_tm, mesh_wp = unit_box
     plane_origin_np = mesh_tm.bounds[1] - 0.05
     plane_normal_np = mesh_tm.bounds[1]
 
     vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
         mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
     )
-    mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
     vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
         mesh_wp.points,
         mesh_wp.indices,
@@ -1082,7 +1081,7 @@ def test_slice_mesh_with_plane_box_corner() -> None:
     assert len(faces_tm) == 5
 
 
-def test_slice_mesh_with_plane_box_top() -> None:
+def test_slice_mesh_with_plane_box_top(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Class B: a face-parallel cut, where whole faces fall on one side rather than being split.
 
@@ -1090,14 +1089,13 @@ def test_slice_mesh_with_plane_box_top() -> None:
     untouched, and a wrong side test would show up as a missing or duplicated face rather than
     a bad triangulation.
     """
-    mesh_tm = tm.creation.box()
+    mesh_tm, mesh_wp = unit_box
     plane_origin_np = mesh_tm.bounds[1] - 0.05
     plane_normal_np = np.array([0.0, 0.0, 1.0])
 
     vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
         mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
     )
-    mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
     vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
         mesh_wp.points,
         mesh_wp.indices,
@@ -1273,7 +1271,7 @@ def test_slice_and_split_with_plane_match_meshlib(icosphere: tuple[tm.Trimesh, w
 
 
 @pytest.mark.parity("split_mesh_with_plane", "pyvista")
-def test_split_mesh_with_plane_matches_pyvista() -> None:
+def test_split_mesh_with_plane_matches_pyvista(device: str) -> None:
     """
     Class B against ``PolyData.clip(return_clipped=True)``, VTK's both-sides plane clip.
 
@@ -1289,7 +1287,7 @@ def test_split_mesh_with_plane_matches_pyvista() -> None:
     bidirectionally (measured 5.4e-08).
     """
     mesh_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
-    mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
     height = 0.1
 
     vertices_wp, faces_wp, above_wp = tw.intersection.split_mesh_with_plane(
@@ -1490,7 +1488,7 @@ def test_clip_mesh_with_field_empty(device: str) -> None:
 
 
 @pytest.mark.parity("clip_mesh_with_field", "pyvista")
-def test_clip_mesh_with_field_matches_pyvista_clip_scalar() -> None:
+def test_clip_mesh_with_field_matches_pyvista_clip_scalar(device: str) -> None:
     """
     Class A on the kept surface, against ``PolyData.clip_scalar`` over the identical field.
 
@@ -1505,11 +1503,11 @@ def test_clip_mesh_with_field_matches_pyvista_clip_scalar() -> None:
     mesh, which the face-count assert catches only because they happen to differ in size.
     """
     mesh_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
-    mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
     isovalue = 0.1
 
     clipped_v, clipped_f = tw.intersection.clip_mesh_with_field(
-        mesh_wp.points, mesh_wp.indices, _height_field(mesh_tm, "cpu"), isovalue
+        mesh_wp.points, mesh_wp.indices, _height_field(mesh_tm, device), isovalue
     )
     mesh_pv = trimesh_to_pyvista(mesh_tm)
     mesh_pv.point_data["height"] = np.ascontiguousarray(mesh_tm.vertices[:, 2])
@@ -1534,7 +1532,7 @@ def test_clip_mesh_with_field_matches_pyvista_clip_scalar() -> None:
 
 
 @pytest.mark.parity("clip_mesh_with_field", "pyvista")
-def test_clip_mesh_with_field_capped_matches_pyvista_clip_closed_surface() -> None:
+def test_clip_mesh_with_field_capped_matches_pyvista_clip_closed_surface(device: str) -> None:
     """
     Class A on the enclosed volume, against ``clip_closed_surface`` — VTK's capped plane clip.
 
@@ -1545,11 +1543,11 @@ def test_clip_mesh_with_field_capped_matches_pyvista_clip_closed_surface() -> No
     section rim would break.
     """
     mesh_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
-    mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
     isovalue = 0.1
 
     capped_v, capped_f = tw.intersection.clip_mesh_with_field(
-        mesh_wp.points, mesh_wp.indices, _height_field(mesh_tm, "cpu"), isovalue, cap=True
+        mesh_wp.points, mesh_wp.indices, _height_field(mesh_tm, device), isovalue, cap=True
     )
     capped_tm = warp_to_trimesh(capped_v, capped_f)
     mesh_pv = trimesh_to_pyvista(mesh_tm)
@@ -1564,7 +1562,7 @@ def test_clip_mesh_with_field_capped_matches_pyvista_clip_closed_surface() -> No
     assert np.isclose(capped_tm.volume, closed_pv.volume, rtol=1e-5)
     # The cap is not free: without it the same clip is open.
     _, uncapped_f = tw.intersection.clip_mesh_with_field(
-        mesh_wp.points, mesh_wp.indices, _height_field(mesh_tm, "cpu"), isovalue
+        mesh_wp.points, mesh_wp.indices, _height_field(mesh_tm, device), isovalue
     )
     assert int(capped_f.shape[0]) > int(uncapped_f.shape[0])
 

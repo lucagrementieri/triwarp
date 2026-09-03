@@ -212,6 +212,98 @@ def unique_1d(
     return _unique_hash(data, data_int, data.dtype, n, mask, return_inverse, return_counts)
 
 
+def _unique_hash(
+    data: wp.array[Scalar],
+    data_int: wp.array[wp.int32] | wp.array[wp.int64],
+    original_dtype: type[Scalar],
+    n: int,
+    mask: wp.int32,
+    return_inverse: bool,
+    return_counts: bool,
+) -> (
+    wp.array[Scalar]
+    | tuple[wp.array[Scalar], wp.array[wp.int32]]
+    | tuple[wp.array[Scalar], wp.array[wp.int32], wp.array[wp.int32]]
+):
+    # One slot past the table is reserved for the single key that collides with the empty-slot
+    # sentinel; see the comment on ``kernel_grouping.hash_insert``.
+    cap = int(mask) + 2
+    key_dtype = data_int.dtype
+    device = data_int.device
+
+    # Phase 1: parallel insert into open-addressing hash table (slot_key 0 = empty). ``occupied``
+    # is stamped by the insert itself rather than derived from ``slot_counts`` in a second pass --
+    # see the comment on ``hash_insert`` -- so it is zero-filled rather than ``wp.empty``.
+    slot_key = wp.zeros(cap, dtype=key_dtype, device=device)
+    slot_counts = wp.zeros(cap, dtype=wp.int32, device=device)
+    occupied = wp.zeros(cap, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_grouping.hash_insert,
+        dim=n,
+        inputs=[data_int, slot_key, slot_counts, mask, occupied],
+        device=device,
+    )
+
+    # Phase 2: prefix-scan the occupancy to get compact positions.
+    scan_pos = wp.empty(cap, dtype=wp.int32, device=device)
+    wp.utils.array_scan(occupied, scan_pos, inclusive=True)
+    # An inclusive scan of 0/1 flags ends at the number set, so one 4-byte tail read sizes the
+    # output where ``reduce.max`` would scan all ``cap`` (~2n) slots. The same idiom as
+    # ``array.flatnonzero`` and ``array.counts_to_offsets``.
+    n_unique = int(read_scalar(scan_pos))
+
+    # Phase 3: compact unique keys, their occurrence counts, and the identity permutation the sort
+    # below pairs with them -- all three in one pass over the table.
+    keys_compact = wp.empty(n_unique, dtype=key_dtype, device=device)
+    cnts_compact = wp.empty(n_unique, dtype=wp.int32, device=device)
+    perm_buf = wp.empty(2 * n_unique, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_grouping.compact_from_table,
+        dim=cap,
+        inputs=[slot_key, slot_counts, occupied, scan_pos, keys_compact, cnts_compact, perm_buf],
+        device=device,
+    )
+
+    # Phase 4: sort only the n_unique keys (typically n_unique << n), in a dtype that orders them
+    # the way the caller's dtype does rather than by their reinterpreted bit pattern.
+    sort_dtype = twt.sortable_dtype(original_dtype)
+    keys_buf = bitcast_from_int(keys_compact, sort_dtype, count=2 * n_unique)
+    wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
+
+    if sort_dtype == original_dtype:
+        unique_values = wp.empty(n_unique, dtype=original_dtype, device=device)
+        wp.copy(unique_values, keys_buf, count=n_unique)
+    else:
+        # A dtype narrower than 32 bits was widened to be sortable; narrow it back.
+        unique_values = bitcast_from_int(
+            bitcast_to_int(keys_buf, n_unique), original_dtype, count=n_unique
+        )
+
+    unique_counts = None
+    if return_counts:
+        sort_perm = wp.empty(n_unique, dtype=wp.int32, device=device)
+        wp.copy(sort_perm, perm_buf, count=n_unique)
+        unique_counts = gather(cnts_compact, sort_perm)
+
+    unique_inverse = None
+    if return_inverse:
+        sorted_dense = wp.empty(n_unique, dtype=sort_dtype, device=device)
+        wp.copy(sorted_dense, keys_buf, count=n_unique)
+        # The binary search has to probe in the same space the keys were sorted in.
+        data_sorted_space = (
+            data if data.dtype == sort_dtype else bitcast_from_int(data_int, sort_dtype, count=n)
+        )
+        unique_inverse = wp.empty(n, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_array.map_sorted_inverse,
+            dim=n,
+            inputs=[data_sorted_space, sorted_dense, unique_inverse],
+            device=device,
+        )
+
+    return _pack_unique_result(unique_values, inverse=unique_inverse, counts=unique_counts)
+
+
 @overload
 def unique_rows(
     data: wp.array[wp.vec3],
@@ -629,6 +721,20 @@ def hash_indices_rows(
         bound is already guaranteed by construction (mesh edge rows are built from face indices, so
         they are non-negative and below the vertex count by definition).
 
+        **A caller that derived its ``max_index`` from
+        [`index_domain_size`][triwarp.array.index_domain_size] has *not* thereby made this
+        redundant, and four of them deliberately keep it on.** ``index_domain_size`` is a ``max``
+        reduction; the validation is a ``minmax``, and it is the ``min`` half -- the negative-index
+        guard -- that has no counterpart above it, so skipping it would turn a malformed face
+        buffer from a raise into a silently wrong grouping. Measured on an RTX 5090, Warp 1.17,
+        interleaved, min of 15: the check costs a flat **0.10-0.12 ms**, which is 14.9 / 14.5 /
+        4.8 % of ``edges_unique`` and 13.5 / 15.1 / 4.6 % of ``is_edge_manifold`` on
+        ``bunny_decimated`` / ``bunny`` / ``dragon``. The share *falls* as the mesh grows, which
+        section 9 calls a decline rather than a small win -- so ``edges.edges_unique``,
+        ``validation.is_edge_manifold``, ``validation.edge_manifold_mask`` and ``holes._EdgeTable``
+        all validate, and the ten callers that pass ``False`` are the ones whose bound *and*
+        non-negativity are structural.
+
     Returns
     -------
     wp.array[wp.uint64]
@@ -685,98 +791,6 @@ def hash_indices_rows(
         device=data.device,
     )
     return hashes
-
-
-def _unique_hash(
-    data: wp.array[Scalar],
-    data_int: wp.array[wp.int32] | wp.array[wp.int64],
-    original_dtype: type[Scalar],
-    n: int,
-    mask: wp.int32,
-    return_inverse: bool,
-    return_counts: bool,
-) -> (
-    wp.array[Scalar]
-    | tuple[wp.array[Scalar], wp.array[wp.int32]]
-    | tuple[wp.array[Scalar], wp.array[wp.int32], wp.array[wp.int32]]
-):
-    # One slot past the table is reserved for the single key that collides with the empty-slot
-    # sentinel; see the comment on ``kernel_grouping.hash_insert``.
-    cap = int(mask) + 2
-    key_dtype = data_int.dtype
-    device = data_int.device
-
-    # Phase 1: parallel insert into open-addressing hash table (slot_key 0 = empty). ``occupied``
-    # is stamped by the insert itself rather than derived from ``slot_counts`` in a second pass --
-    # see the comment on ``hash_insert`` -- so it is zero-filled rather than ``wp.empty``.
-    slot_key = wp.zeros(cap, dtype=key_dtype, device=device)
-    slot_counts = wp.zeros(cap, dtype=wp.int32, device=device)
-    occupied = wp.zeros(cap, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_grouping.hash_insert,
-        dim=n,
-        inputs=[data_int, slot_key, slot_counts, mask, occupied],
-        device=device,
-    )
-
-    # Phase 2: prefix-scan the occupancy to get compact positions.
-    scan_pos = wp.empty(cap, dtype=wp.int32, device=device)
-    wp.utils.array_scan(occupied, scan_pos, inclusive=True)
-    # An inclusive scan of 0/1 flags ends at the number set, so one 4-byte tail read sizes the
-    # output where ``reduce.max`` would scan all ``cap`` (~2n) slots. The same idiom as
-    # ``array.flatnonzero`` and ``array.counts_to_offsets``.
-    n_unique = int(read_scalar(scan_pos))
-
-    # Phase 3: compact unique keys, their occurrence counts, and the identity permutation the sort
-    # below pairs with them -- all three in one pass over the table.
-    keys_compact = wp.empty(n_unique, dtype=key_dtype, device=device)
-    cnts_compact = wp.empty(n_unique, dtype=wp.int32, device=device)
-    perm_buf = wp.empty(2 * n_unique, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_grouping.compact_from_table,
-        dim=cap,
-        inputs=[slot_key, slot_counts, occupied, scan_pos, keys_compact, cnts_compact, perm_buf],
-        device=device,
-    )
-
-    # Phase 4: sort only the n_unique keys (typically n_unique << n), in a dtype that orders them
-    # the way the caller's dtype does rather than by their reinterpreted bit pattern.
-    sort_dtype = twt.sortable_dtype(original_dtype)
-    keys_buf = bitcast_from_int(keys_compact, sort_dtype, count=2 * n_unique)
-    wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
-
-    if sort_dtype == original_dtype:
-        unique_values = wp.empty(n_unique, dtype=original_dtype, device=device)
-        wp.copy(unique_values, keys_buf, count=n_unique)
-    else:
-        # A dtype narrower than 32 bits was widened to be sortable; narrow it back.
-        unique_values = bitcast_from_int(
-            bitcast_to_int(keys_buf, n_unique), original_dtype, count=n_unique
-        )
-
-    unique_counts = None
-    if return_counts:
-        sort_perm = wp.empty(n_unique, dtype=wp.int32, device=device)
-        wp.copy(sort_perm, perm_buf, count=n_unique)
-        unique_counts = gather(cnts_compact, sort_perm)
-
-    unique_inverse = None
-    if return_inverse:
-        sorted_dense = wp.empty(n_unique, dtype=sort_dtype, device=device)
-        wp.copy(sorted_dense, keys_buf, count=n_unique)
-        # The binary search has to probe in the same space the keys were sorted in.
-        data_sorted_space = (
-            data if data.dtype == sort_dtype else bitcast_from_int(data_int, sort_dtype, count=n)
-        )
-        unique_inverse = wp.empty(n, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_array.map_sorted_inverse,
-            dim=n,
-            inputs=[data_sorted_space, sorted_dense, unique_inverse],
-            device=device,
-        )
-
-    return _pack_unique_result(unique_values, inverse=unique_inverse, counts=unique_counts)
 
 
 def _pack_unique_result(

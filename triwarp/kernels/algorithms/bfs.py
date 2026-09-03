@@ -290,7 +290,7 @@ _STATE_EMIT_START = wp.constant(wp.int32(4))
 _STATE_EMIT_TAIL = wp.constant(wp.int32(5))
 _STATE_EMIT_LEVEL = wp.constant(wp.int32(6))
 BFS_STATE_SIZE = 7
-BFS_SCAN_BLOCK = 256
+BFS_SCAN_BLOCK = wp.constant(wp.int32(256))
 
 
 @wp.func
@@ -307,7 +307,7 @@ def bfs_segment_base(
     if rank <= wp.int32(0):
         return wp.int32(0)
     base = offsets_scan[rank - 1]
-    block = (rank - wp.int32(1)) // wp.int32(BFS_SCAN_BLOCK)
+    block = (rank - wp.int32(1)) // BFS_SCAN_BLOCK
     if block > wp.int32(0):
         base += block_sums[block - 1]
     return base
@@ -372,7 +372,7 @@ def bfs_count_and_scan(
         u = order[state[_STATE_START] + rank]
         for k in range(adj_offsets[u], adj_offsets[u + 1]):
             v = adj_columns[k]
-            if dist[v] == wp.int32(-1) and claim_rank[v] == wp.int32(rank):
+            if dist[v] == wp.int32(-1) and claim_rank[v] == rank:
                 count += wp.int32(1)
     scanned = wp.tile_scan_inclusive(wp.tile(count))
     wp.tile_store(out_scanned, scanned, offset=i * BFS_SCAN_BLOCK)
@@ -415,7 +415,7 @@ def bfs_scan_and_advance(
     # ``bfs_segment_base`` and ``bfs_count_and_scan`` take the body from seven kernels to four.
     _ = wp.int32(wp.tid())
     frontier = out_state[_STATE_TAIL] - out_state[_STATE_START]
-    n = wp.min((frontier + BFS_SCAN_BLOCK - 1) / BFS_SCAN_BLOCK, out_block_sums.shape[0])
+    n = wp.min((frontier + BFS_SCAN_BLOCK - 1) // BFS_SCAN_BLOCK, out_block_sums.shape[0])
     total = wp.int32(0)
     for k in range(n):
         total += out_block_sums[k]

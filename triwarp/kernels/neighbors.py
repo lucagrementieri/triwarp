@@ -944,7 +944,7 @@ def query_geodesic_ball_collect(
     t = wp.int32(wp.tid())
     i = chunk_start + t
     out_counts[i] = kernel_bfs.per_source_bfs_collect(
-        wp.int32(i),
+        i,
         vertices,
         adj_offsets,
         adj_columns,

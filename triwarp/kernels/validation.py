@@ -144,6 +144,12 @@ def build_signed_face_edges(
     ``sign == 0`` when the two faces already traverse the shared edge in opposite
     directions (compatible orientations), ``sign == 1`` when a flip is required.
     """
+    # The five opening statements match ``build_corner_adjacency_edges`` above, and that is
+    # *not* an unfactored duplicate: they are this kernel's own argument list unpacked -- the
+    # adjacency row's two faces and the two endpoints of the edge they share -- so a shared
+    # ``@wp.func`` would name what the two signatures already say and cost a longer call than the
+    # four reads it replaced. The two kernels diverge at the line after, which is the whole point
+    # of each.
     r = wp.int32(wp.tid())
     f0 = adjacency[r, 0]
     f1 = adjacency[r, 1]

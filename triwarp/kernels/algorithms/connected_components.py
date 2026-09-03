@@ -77,7 +77,7 @@ def ecl_hook(
     # hooked exactly once. Fine for bounded-degree mesh graphs (a reversed star — hub id n-1 —
     # would serialize on the hub thread, but mesh degrees are ~6). ``rep_v`` is hoisted across
     # the row, ECL-CC's ``vstat`` carry.
-    v = wp.int32(wp.int32(wp.tid()))
+    v = wp.int32(wp.tid())
     start = offsets[v]
     end = offsets[v + 1]
     rep_v = find_representative(parents, v)
@@ -89,7 +89,7 @@ def ecl_hook(
 
 @wp.kernel
 def ecl_flatten(parents: wp.array[wp.int32], out_labels: wp.array[wp.int32]) -> None:
-    v = wp.int32(wp.int32(wp.tid()))
+    v = wp.int32(wp.tid())
     out_labels[v] = find_representative(parents, v)
 
 
@@ -107,14 +107,14 @@ def find_representative_parity(words: wp.array[wp.int32], v: wp.int32) -> tuple[
     # under us, and on a consistent component the parity to a given ancestor is invariant, so the
     # written word is always valid — only possibly less compressed than it could be.
     word = words[v]
-    parent = wp.int32(word >> 1)
-    parity = wp.int32(word & 1)
+    parent = word >> 1
+    parity = word & 1
     accumulated = wp.int32(0)
     child = v
     if parent != v:
         grandword = words[parent]
-        grandparent = wp.int32(grandword >> 1)
-        grandparity = wp.int32(grandword & 1)
+        grandparent = grandword >> 1
+        grandparity = grandword & 1
         while parent > grandparent:
             words[child] = (grandparent << 1) | (parity ^ grandparity)
             accumulated = accumulated ^ parity
@@ -122,8 +122,8 @@ def find_representative_parity(words: wp.array[wp.int32], v: wp.int32) -> tuple[
             parent = grandparent
             parity = grandparity
             grandword = words[parent]
-            grandparent = wp.int32(grandword >> 1)
-            grandparity = wp.int32(grandword & 1)
+            grandparent = grandword >> 1
+            grandparity = grandword & 1
     return parent, accumulated ^ parity
 
 
@@ -198,7 +198,7 @@ def ecl_hook_parity(
 def ecl_flatten_parity(
     words: wp.array[wp.int32], out_labels: wp.array[wp.int32], out_parity: wp.array[wp.int32]
 ) -> None:
-    v = wp.int32(wp.int32(wp.tid()))
+    v = wp.int32(wp.tid())
     root = wp.int32(0)
     parity = wp.int32(0)
     root, parity = find_representative_parity(words, v)

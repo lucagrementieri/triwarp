@@ -605,7 +605,10 @@ def bfs(
     # The loop also *stops early* once the frontier narrows (``_BFS_ESCAPE_FRONTIER``) and hands
     # its half-built FIFO to the serial kernel above, which is what keeps a long-diameter graph
     # from paying four fixed-size launches for a two-node frontier, tens of thousands of times.
-    scan_block = kernel_bfs.BFS_SCAN_BLOCK
+    # ``int(...)`` because the kernel-side constant is a ``wp.int32``, which carries no
+    # host-scope ``//``; it is spelled that way so check 17 can type the divisions inside
+    # the kernels that read it.
+    scan_block = int(kernel_bfs.BFS_SCAN_BLOCK)
     n_blocks = (node_count + scan_block - 1) // scan_block
     padded = n_blocks * scan_block
     claim_rank = wp.full(node_count, INT32_MAX, dtype=wp.int32, device=device)

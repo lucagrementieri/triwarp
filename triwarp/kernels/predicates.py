@@ -8,10 +8,16 @@ set in ``kernels/remesh.py``, and a third partial copy in ``kernels/holes.py``. 
 `@wp.func` here is generic over the scalar type, so one definition instantiates at whatever
 precision the calling kernel uses.
 
-The three later arrivals are the same defect one level out: ``triangle_aabb`` came from
+The later arrivals are the same defect one level out: ``triangle_aabb`` came from
 ``kernels/intersection.py`` and ``triangle_double_area`` / ``circumcircle_diameter`` from
 ``kernels/holes.py``, where a general triangle quantity had ended up inside a module that owns an
 *algorithm* and other modules were importing the algorithm to reach the geometry.
+``point_plane_dot`` and ``triangle_aabb_overlap`` (with its ``axis_interval_projection`` /
+``unit_axis`` / ``plane_box_overlap`` / ``edge_axes_separate`` helpers) followed from the same
+place and for the same reason: they were the last two edges of the whole ``kernels/`` import graph
+running from an algorithm module to a geometric predicate, with ``kernels/points.py`` and
+``kernels/voxels.py`` importing the mesh-slicing algorithm to reach a plane dot and a
+separating-axis test.
 
 Degenerate inputs return [`float_inf`][triwarp.kernels.predicates.float_inf] — an actual infinity,
 so callers detect the case with ``wp.isinf`` rather than by comparing against a magic large value.
@@ -150,14 +156,14 @@ def corner_cosines_from_l2(
 
 
 @wp.func
-def triangle_aabb(a: Any, b: Any, c: Any):
+def triangle_aabb(a: Any, b: Any, c: Any) -> tuple[Any, Any]:
     # Lower and upper corners of triangle ABC's axis-aligned bounding box. ``wp.min`` / ``wp.max``
     # on vectors are element-wise.
     return wp.min(a, wp.min(b, c)), wp.max(a, wp.max(b, c))
 
 
 @wp.func
-def segment_aabb(a: Any, b: Any):
+def segment_aabb(a: Any, b: Any) -> tuple[Any, Any]:
     # Lower and upper corners of segment AB's axis-aligned bounding box -- the input a *segment*
     # BVH is built from, as ``triangle_aabb`` is for a face BVH. Element-wise for the same reason.
     return wp.min(a, b), wp.max(a, b)
@@ -196,6 +202,105 @@ def is_in_obb(point: Any, rotation: Any, min_bound: Any, max_bound: Any) -> wp.b
     # convention ``bounds.oriented_bounding_box`` returns -- so the two share one predicate and one
     # boundary rule rather than spelling the six comparisons twice.
     return is_in_aabb(rotation * point, min_bound, max_bound)
+
+
+@wp.func
+def point_plane_dot(point: Any, plane_normal: Any, plane_origin: Any) -> wp.Float:
+    # Signed, *unnormalized* distance from a point to the plane through ``plane_origin`` with
+    # normal ``plane_normal``: positive on the normal's side, zero on the plane. Unnormalized
+    # because every caller either only reads the sign (``points.half_space_mask``, the slice
+    # classifiers) or divides by ``wp.length(plane_normal)`` itself
+    # (``points.point_plane_distance``), so normalizing here would be a square root two of the
+    # three call paths throw away.
+    return wp.dot(point - plane_origin, plane_normal)
+
+
+# Moller's tribox3, the 13-axis separating-axis test between a triangle and an axis-aligned box,
+# and the three helpers it is built from. Concrete ``float32`` rather than scalar-generic like most
+# of this module: the box-axis sweep needs a unit vector per axis and a vector literal cannot be
+# built at the caller's precision without threading a type witness through all four signatures,
+# which section 4.2's "no speculative generality" rules out while ``voxels.mark_surface_voxels``
+# remains the only caller and is ``float32``. Generalize when a ``float64`` caller appears.
+@wp.func
+def axis_interval_projection(axis: wp.vec3, v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> wp.vec2:
+    p = wp.vec3(wp.dot(axis, v0), wp.dot(axis, v1), wp.dot(axis, v2))
+    # Single-argument wp.min / wp.max reduce a vector to its extreme element.
+    return wp.vec2(wp.min(p), wp.max(p))
+
+
+@wp.func
+def unit_axis(axis: wp.int32) -> wp.vec3:
+    if axis == 0:
+        return wp.vec3(1.0, 0.0, 0.0)
+    if axis == 1:
+        return wp.vec3(0.0, 1.0, 0.0)
+    return wp.vec3(0.0, 0.0, 1.0)
+
+
+@wp.func
+def plane_box_overlap(normal: wp.vec3, offset: wp.float32, half: wp.vec3) -> wp.bool:
+    # Moller's ``planeBoxOverlap``: the plane ``dot(normal, x) == offset`` meets the box
+    # ``[-half, half]`` iff ``|offset|`` is within the box's support along ``normal``.
+    support = (
+        wp.abs(normal[0]) * half[0] + wp.abs(normal[1]) * half[1] + wp.abs(normal[2]) * half[2]
+    )
+    return wp.abs(offset) <= support
+
+
+@wp.func
+def edge_axes_separate(
+    edge: wp.vec3, half: wp.vec3, a0: wp.vec3, a1: wp.vec3, a2: wp.vec3
+) -> wp.bool:
+    # The three cross-product axes ``e_i x edge`` of Moller's tribox3, written out rather than
+    # crossed with a unit vector: ``e_x x (x, y, z) == (0, -z, y)`` and cyclically. A degenerate
+    # edge gives a zero axis, whose intervals are both ``[0, 0]`` and therefore never separate.
+    axis_x = wp.vec3(0.0, -edge[2], edge[1])
+    axis_y = wp.vec3(edge[2], 0.0, -edge[0])
+    axis_z = wp.vec3(-edge[1], edge[0], 0.0)
+    for a in range(3):
+        axis = axis_x
+        if a == 1:
+            axis = axis_y
+        elif a == 2:
+            axis = axis_z
+        # The two endpoints of ``edge`` project to the same value on ``e_i x edge``, so projecting
+        # all three vertices gives the identical interval the AXISTEST_* macros compute from two.
+        interval = axis_interval_projection(axis, a0, a1, a2)
+        radius = wp.abs(axis[0]) * half[0] + wp.abs(axis[1]) * half[1] + wp.abs(axis[2]) * half[2]
+        if interval[0] > radius or interval[1] < -radius:
+            return True
+    return False
+
+
+@wp.func
+def triangle_aabb_overlap(
+    center: wp.vec3, half: wp.vec3, v0: wp.vec3, v1: wp.vec3, v2: wp.vec3
+) -> wp.bool:
+    # Moller's tribox3, the 13-axis separating-axis test between a triangle and an axis-aligned
+    # box: the three box face normals, the triangle's own plane, and the nine edge-cross axes. No
+    # epsilon, matching Open3D's ``IntersectionTest::TriangleAABB`` (which runs it in ``float64``,
+    # so tangency within ``float32`` rounding is where the two can disagree).
+    a0 = v0 - center
+    a1 = v1 - center
+    a2 = v2 - center
+
+    for axis in range(3):
+        interval = axis_interval_projection(unit_axis(axis), a0, a1, a2)
+        if interval[0] > half[axis] or interval[1] < -half[axis]:
+            return False
+
+    edge0 = a1 - a0
+    edge1 = a2 - a1
+    edge2 = a0 - a2
+    if edge_axes_separate(edge0, half, a0, a1, a2):
+        return False
+    if edge_axes_separate(edge1, half, a0, a1, a2):
+        return False
+    if edge_axes_separate(edge2, half, a0, a1, a2):
+        return False
+
+    normal = wp.cross(edge0, edge1)
+    return plane_box_overlap(normal, wp.dot(normal, a0), half)
 
 
 @wp.func
@@ -254,7 +359,7 @@ def circumcircle_diameter(a: Any, b: Any, c: Any) -> wp.Float:
 
 
 @wp.func
-def delone_metrics(a: Any, b: Any, c: Any, d: Any):
+def delone_metrics(a: Any, b: Any, c: Any, d: Any) -> tuple[wp.Float, wp.Float]:
     # For quadrangle ABCD, the pair of Delone metrics compared when deciding whether to flip the
     # diagonal AC to BD: each is the larger circumcircle of the two triangles that diagonal makes.
     # Either may be infinite (a degenerate triangle), so callers test with ``wp.isinf`` rather than
@@ -352,7 +457,7 @@ def project_out_normal(vector: Any, normal: Any):
 
 
 @wp.func
-def unit_tangent(vector: Any, normal: Any, tolerance: Any):
+def unit_tangent(vector: Any, normal: Any, tolerance: Any) -> tuple[Any, wp.Float]:
     # Project ``vector`` into the plane orthogonal to unit ``normal`` and normalize it, returning
     # the projection's length alongside.
     #
@@ -383,7 +488,7 @@ def angle_defect(angle_sum: wp.Float) -> wp.Float:
 
 
 @wp.func
-def barycentric_gram(a: Any, b: Any, c: Any, p: Any):
+def barycentric_gram(a: Any, b: Any, c: Any, p: Any) -> tuple[wp.Float, wp.Float, wp.Float]:
     """
     Cramer's rule on the Gram system of triangle ABC's two edge vectors, undivided.
 

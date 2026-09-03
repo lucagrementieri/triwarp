@@ -31,7 +31,6 @@ from tests.comparisons import (
     euler_characteristic,
     hausdorff_surface_two_sided,
     hausdorff_two_sided,
-    lexsort_rows,
     open_edge_count,
 )
 from tests.conversions import (
@@ -239,8 +238,11 @@ def test_marching_cubes_matches_pytorch3d(device: str) -> None:
     pyvista / meshlib trio above, each of which needed a different one.
 
     Measured on a 16^3 radial field at ``iso=1.0``: **480** vertices and **956** faces from both
-    sides, and the sorted coordinate rows agree at **0.0**. Sorted rather than indexed because
-    nothing pins two case-table walks to one emission order.
+    sides, and the matched coordinates agree at **0.0**. Matched rather than indexed because
+    nothing pins two case-table walks to one emission order -- and matched by ``cKDTree`` with a
+    bijection check rather than by ``lexsort_rows``, which CLAUDE.md section 7.5 records as
+    unusable on float coordinates: the rounding this used to do mitigates the hazard without
+    removing it, since two values straddling a rounding boundary still sort differently.
 
     Note the import: ``marching_cubes`` is **not** re-exported from ``pytorch3d.ops``, only from
     ``pytorch3d.ops.marching_cubes``, so ``p3d_ops.marching_cubes`` is an ``AttributeError``.
@@ -261,9 +263,9 @@ def test_marching_cubes_matches_pytorch3d(device: str) -> None:
     assert vertices_p3d.shape[0] > 0
     assert int(vertices_wp.shape[0]) == vertices_p3d.shape[0]
     assert int(faces_wp.shape[0]) // 3 == faces_p3d[0].shape[0]
-    assert np.array_equal(
-        lexsort_rows(np.round(vertices_wp.numpy(), 5)), lexsort_rows(np.round(vertices_p3d, 5))
-    )
+    distance_np, match_np = cKDTree(vertices_p3d).query(vertices_wp.numpy())
+    assert distance_np.max() == 0.0, f"vertices differ by up to {distance_np.max():.3e}"
+    assert len(set(match_np.tolist())) == match_np.shape[0], "the vertex match is not a bijection"
 
 
 def test_marching_cubes_index_space_by_default(device: str) -> None:
@@ -355,6 +357,15 @@ def test_offset_mesh_matches_meshlib(
 
     ``OffsetParameters.voxelSize`` is set explicitly rather than left at its default, which is the
     parameter that would otherwise decide the comparison.
+
+    **Mutation probe**, and it retightened the threshold. The bug class the deviation bar has to
+    exclude is an offset applied at the wrong *distance*, so the probe re-runs MeshLib at a wrong
+    one: against a measured agreement of **0.00263**, 0.15 and 0.25 (25 % out) give 0.0528 and
+    0.0515 and both **fail**, but **0.22 -- 10 % out -- gives 0.0210**, which the original
+    ``0.5 * _VOXEL`` bar (0.025, a 9.5x headroom) let through. It is now ``0.25 * _VOXEL``: 0.0125,
+    still **4.8x** the agreement, and the same bar
+    [`test_offset_mesh_matches_pymeshlab`][] carries, so the two references are held to one
+    standard.
     """
     mesh_tm, _ = icosphere
     vertices_wp, faces_wp = numpy_to_warp(
@@ -382,7 +393,7 @@ def test_offset_mesh_matches_meshlib(
         np.asarray(offset_ml.vertices, dtype=np.float64),
         np.asarray(offset_ml.faces),
     )
-    assert deviation < 0.5 * _VOXEL
+    assert deviation < 0.25 * _VOXEL
 
 
 @pytest.mark.parity("offset_mesh", "pymeshlab")
@@ -399,6 +410,12 @@ def test_offset_mesh_matches_pymeshlab(device: str, icosphere: tuple[tm.Trimesh,
     applies to triwarp: MeshLab's own output sits at mean signed distance **+0.1999** with a spread
     of 0.0002 from the input, so the two implementations are measuring the same quantity rather than
     two things that happen to look alike.
+
+    **Mutation probe**, and it retightened the threshold, identically to the MeshLab comparison
+    above. Measured agreement **0.00179**, the same on both devices; re-running pymeshlab at a wrong
+    offset gives 0.0521 at 0.15 and 0.0516 at 0.25 (25 % out, both **fail**) and **0.0212 at 0.22**
+    -- 10 % out, which the original ``0.5 * _VOXEL`` bar (0.025, a 14x headroom) admitted. It is now
+    ``0.25 * _VOXEL``: 0.0125, still **7.0x** the measured agreement.
     """
     distance = 0.2
     mesh_tm, _ = icosphere
@@ -427,7 +444,7 @@ def test_offset_mesh_matches_pymeshlab(device: str, icosphere: tuple[tm.Trimesh,
         np.asarray(offset_pml.vertices, dtype=np.float64),
         np.asarray(offset_pml.faces),
     )
-    assert deviation < 0.5 * _VOXEL
+    assert deviation < 0.25 * _VOXEL
 
 
 def test_offset_mesh_resolves_what_survives_a_large_inward_offset(

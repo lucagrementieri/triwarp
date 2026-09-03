@@ -32,6 +32,7 @@ import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
 from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import intersection as kernel_intersections
+from triwarp.kernels import predicates as kernel_predicates
 from triwarp.kernels import triangles as kernel_triangles
 
 
@@ -104,7 +105,7 @@ def mesh_with_plane(
     plane_origin: wp.vec3,
     *,
     return_faces: bool = False,
-) -> wp.array[wp.vec3] | tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+) -> twt.Array2dVec3 | tuple[twt.Array2dVec3, wp.array[wp.int32]]:
     """
     Intersect a mesh with a plane, returning line segments on the plane.
 
@@ -136,7 +137,7 @@ def mesh_with_plane(
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        empty_segments = wp.empty((0, 2), dtype=wp.vec3, device=device)
+        empty_segments = twt.empty_2d((0, 2), wp.vec3, device=device)
         if return_faces:
             return empty_segments, wp.empty(0, dtype=wp.int32, device=device)
         return empty_segments
@@ -144,7 +145,7 @@ def mesh_with_plane(
     vertex_dots = _plane_dots(vertices, plane_normal, plane_origin)
 
     valid = wp.empty(n_faces, dtype=wp.bool, device=device)
-    segments = wp.empty((n_faces, 2), dtype=wp.vec3, device=device)
+    segments = twt.empty_2d((n_faces, 2), wp.vec3, device=device)
     wp.launch(
         kernel_intersections.mesh_with_plane_segments,
         dim=n_faces,
@@ -155,12 +156,12 @@ def mesh_with_plane(
     hit_faces = tw.array.flatnonzero(valid)
     n_hit = int(hit_faces.shape[0])
     if n_hit == 0:
-        empty_segments = wp.empty((0, 2), dtype=wp.vec3, device=device)
+        empty_segments = twt.empty_2d((0, 2), wp.vec3, device=device)
         if return_faces:
             return empty_segments, wp.empty(0, dtype=wp.int32, device=device)
         return empty_segments
 
-    lines = tw.array.gather(segments, hit_faces)
+    lines = twt.as_array2d(tw.array.gather(segments, hit_faces), wp.vec3)
     if not return_faces:
         return lines
     # ``hit_faces`` is already a fresh dense buffer out of ``flatnonzero``; nothing else holds it,
@@ -249,7 +250,7 @@ def marching_triangles(
 
     edge_ids = tw.edges.edges_unique_inverse(faces, n_vertices=n_vertices)
     valid = wp.empty(n_faces, dtype=wp.bool, device=device)
-    segments = wp.empty((n_faces, 2), dtype=wp.vec3, device=device)
+    segments = twt.empty_2d((n_faces, 2), wp.vec3, device=device)
     segment_edges = twt.empty_2d((n_faces, 2), wp.int32, device=device)
     wp.launch(
         kernel_intersections.marching_triangles_segments,
@@ -387,7 +388,7 @@ def mesh_with_mesh(
     faces_b: wp.array[wp.int32],
     *,
     max_triangle_collisions: int = 16,
-) -> wp.array[wp.vec3]:
+) -> twt.Array2dVec3:
     """
     Intersect two meshes, returning line segments along the intersection curve(s).
 
@@ -420,11 +421,11 @@ def mesh_with_mesh(
         vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, "mesh_with_mesh"
     )
     if crossing is None:
-        return wp.empty((0, 2), dtype=wp.vec3, device=device)
+        return twt.empty_2d((0, 2), wp.vec3, device=device)
     hit_pairs, query_vertices, query_faces, target_vertices, target_faces, _swapped = crossing
     n_hit = int(hit_pairs.shape[0])
 
-    segments = wp.empty((n_hit, 2), dtype=wp.vec3, device=device)
+    segments = twt.empty_2d((n_hit, 2), wp.vec3, device=device)
     wp.launch(
         kernel_intersections.triangle_pair_segments,
         dim=n_hit,
@@ -443,9 +444,9 @@ def mesh_with_mesh(
     keep = tw.array.flatnonzero(seg_valid)
     n_keep = int(keep.shape[0])
     if n_keep == 0:
-        return wp.empty((0, 2), dtype=wp.vec3, device=device)
+        return twt.empty_2d((0, 2), wp.vec3, device=device)
 
-    return tw.array.gather(segments, keep)
+    return twt.as_array2d(tw.array.gather(segments, keep), wp.vec3)
 
 
 def _colliding_face_pairs(
@@ -1125,7 +1126,7 @@ def _plane_dots(
 ) -> wp.array[wp.float32]:
     """Signed plane distance of every vertex, the field all three plane entry points classify on."""
     dots = wp.empty(int(vertices.shape[0]), dtype=wp.float32, device=vertices.device)
-    wp.map(kernel_intersections.point_plane_dot, vertices, plane_normal, plane_origin, out=dots)
+    wp.map(kernel_predicates.point_plane_dot, vertices, plane_normal, plane_origin, out=dots)
     return dots
 
 

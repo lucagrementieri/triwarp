@@ -893,7 +893,9 @@ def test_uv_seam_edges_empty_mesh(device: str) -> None:
     )
 
 
-def test_cut_along_edges_accepts_a_row_in_either_order(device: str) -> None:
+def test_cut_along_edges_accepts_a_row_in_either_order(
+    device: str, unit_box: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """
     Not a library comparison: this pins the documented row-order contract against itself.
 
@@ -903,10 +905,8 @@ def test_cut_along_edges_accepts_a_row_in_either_order(device: str) -> None:
     returned the input mesh unchanged rather than raising. Reversing every row and comparing the two
     results is what makes that failure visible.
     """
-    mesh_tm = tm.creation.box()
-    vertices_wp, faces_wp = numpy_to_warp(
-        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
-    )
+    _mesh_tm, mesh_wp = unit_box
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
     creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=0.5)
     reversed_np = np.ascontiguousarray(creases_wp.numpy()[:, ::-1])
     reversed_wp = twt.as_array2d(wp.array(reversed_np, dtype=wp.int32, device=device), wp.int32)

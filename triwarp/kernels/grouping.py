@@ -298,28 +298,35 @@ def sort_face_indices(faces: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int
     tid = wp.int32(wp.tid())
     i0, i1, i2 = row_triple(faces, tid)
     s0, s1, s2 = kernel_array.sort3(i0, i1, i2)
-    out_sorted[tid, 0] = wp.int32(s0)
-    out_sorted[tid, 1] = wp.int32(s1)
-    out_sorted[tid, 2] = wp.int32(s2)
+    out_sorted[tid, 0] = s0
+    out_sorted[tid, 1] = s1
+    out_sorted[tid, 2] = s2
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
 # CLAUDE.md section 4. Measured over the suite: 7 overloads created across **9** module loads.
 #
-# These three take the caller's *key* dtype. ``hash_indices_rows`` packs rows into ``wp.uint64``
-# hashes and ``unique``/``group_rows`` pass the caller's own integer buffer through, so the surface
-# is the same one ``triwarp.array``'s search kernels see.
+# These take the caller's *key* dtype, and the two sets differ because the two call paths do.
+# ``mark_group_starts`` is reached from ``grouping.group``, which widens through
+# ``twt.sortable_dtype`` and is handed ``wp.uint64`` row hashes by ``hash_indices_rows`` -- so it
+# needs the full unsigned surface ``triwarp.array``'s search kernels see. The open-addressing pair
+# does not: their only caller is ``grouping._unique_hash``, whose ``data_int`` parameter is typed
+# ``wp.array[wp.int32] | wp.array[wp.int64]`` because ``array.bitcast_to_int`` reinterprets every
+# key into one *signed* space before the table sees it. The unsigned rows were unreachable, and
+# section 2.5's rule is to register what the wrapper's dispatch can reach.
 _KEY_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64)
+_TABLE_DTYPES = (wp.int32, wp.int64)
 
 
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
     for dtype in _KEY_DTYPES:
+        wp.overload(mark_group_starts, [wp.array[dtype], wp.int32, wp.int32, wp.array[wp.bool]])
+    for dtype in _TABLE_DTYPES:
         wp.overload(
             hash_insert,
             [wp.array[dtype], wp.array[dtype], wp.array[wp.int32], wp.int32, wp.array[wp.int32]],
         )
-        wp.overload(mark_group_starts, [wp.array[dtype], wp.int32, wp.int32, wp.array[wp.bool]])
         # ``slot_key`` and ``out_keys`` carry the key dtype; every count/offset buffer is int32.
         wp.overload(
             compact_from_table,

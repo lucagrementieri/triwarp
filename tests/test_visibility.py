@@ -88,6 +88,12 @@ def test_ambient_occlusion_ranks_like_pymeshlab(torus: tuple[tm.Trimesh, wp.Mesh
     ``1``, and its direction set is not this one. What must hold is that both call the same vertices
     the occluded ones — hence a rank correlation over a torus, whose hole occludes half of its inner
     wall.
+
+    **Mutation probe**, the one section 7.4 requires of a Class C threshold and this test did not
+    carry: shuffling the triwarp side, 30 permutations on this fixture, gives ``|r|`` at most
+    **0.0695** (mean 0.0269) against the measured **-0.8621** -- a separation of **12.4x**, well
+    past the 3x floor, so the threshold is testing the correspondence and not the two marginal
+    distributions.
     """
     mesh_tm, mesh_wp = torus
     meshset_pml = trimesh_to_pymeshlab(mesh_tm)
@@ -299,6 +305,10 @@ def test_volumetric_obscurance_ranks_like_pymeshlab(torus: tuple[tm.Trimesh, wp.
     below **-0.8**, not above it -- an implementation that returned exposure would pass a
     ``|corr| > 0.8`` bar and fails this one. The torus is the fixture because its hole obscures the
     inner wall and leaves the outer wall exposed, giving the ranks something to disagree about.
+
+    **Mutation probe**: shuffling the triwarp side, 30 permutations on this fixture, gives ``|r|``
+    at most **0.0777** (mean 0.0274) against the measured **-0.8651** -- a separation of **11.1x**,
+    past section 7.4's 3x floor.
     """
     mesh_tm, mesh_wp = torus
     meshset_pml = trimesh_to_pymeshlab(mesh_tm)
@@ -399,10 +409,15 @@ def test_shape_diameter_measures_a_slab(device: str) -> None:
 
 def test_shape_diameter_trimming_rejects_the_escaping_rays(device: str) -> None:
     """
-    On a hollow shell the untrimmed mean is dragged out by the rays that cross the whole cavity.
+    Triwarp against triwarp: trimming rejects the rays that escape through the cavity.
 
+    On a hollow shell the untrimmed mean is dragged out by the rays that cross the whole cavity.
     This is what the outlier rejection is *for*, so it has to be visible: with ``trim`` wide open
-    the inner-shell diameters inflate well past the shell's own thickness.
+    the inner-shell diameters inflate well past the shell's own thickness. Not a parity assert and
+    not a Class C threshold -- there is no reference here, both fields come from
+    ``shape_diameter`` at two settings of one keyword, and what is pinned is that the keyword does
+    something in the direction it claims. ``pymeshlab`` carries the oracle for this group, in
+    ``test_shape_diameter_agrees_with_pymeshlab_on_which_part_is_thinner`` below.
     """
     outer_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
     inner_tm = tm.creation.icosphere(subdivisions=3, radius=0.8)

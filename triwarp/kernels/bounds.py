@@ -65,7 +65,7 @@ def oriented_box_refine_axes(
     i = wp.int32(wp.tid())
     count = count_per_chain
     chain = i // count
-    p = i - chain * count
+    p = i % count
     base = chains[chain]
     if p == count - 1:
         out_axes[i] = base

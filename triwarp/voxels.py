@@ -996,10 +996,9 @@ def splat_onto_grid(
     dims = (int(shape[0]), int(shape[1]), int(shape[2]))
     device = points.device
     field = wp.zeros(dims, dtype=values.dtype, device=device)
-    density = twt.empty_3d(dims, wp.float32, device=device)
-    density.zero_()
+    density = twt.as_array3d(wp.zeros(dims, dtype=wp.float32, device=device), wp.float32)
     if int(points.shape[0]) == 0:
-        return field, twt.as_array3d(density, wp.float32)
+        return field, density
     lower, inverse_spacing = _lattice_transform(dims, bounds)
     wp.launch(
         kernel_scatter.splat_grid_trilinear,
@@ -1013,7 +1012,7 @@ def splat_onto_grid(
         inputs=[density, wp.float32(min_weight), field],
         device=device,
     )
-    return field, twt.as_array3d(density, wp.float32)
+    return field, density
 
 
 def sample_grid_trilinear(
@@ -2280,6 +2279,15 @@ def _empty_grid(voxel_size: float, origin: wp.vec3, device: wp.DeviceLike) -> wp
         point_mask=wp.zeros(1, dtype=wp.int32, device=device),
         device=device,
     )
+
+
+# Three members of this trailing block have a single caller -- ``_cell_slots``
+# (``occupancy_at_cells``), ``_face_neighbors`` and ``_face_corner_table`` (both ``to_boxes``) --
+# and all three stay here rather than moving up to their caller under CLAUDE.md section 5's
+# stepdown rule. Each is one half of a pair whose other half *is* cross-cutting: ``_cell_slots`` is
+# the cell twin of ``_point_slots`` immediately below, and the two face tables are the constant
+# tables ``_stencil`` above them builds from. Splitting a pair across 2 000 lines to save a
+# backward jump is the worse trade.
 
 
 def _point_slots(grid: wp.Volume, points: wp.array[wp.vec3]) -> wp.array[wp.int32]:

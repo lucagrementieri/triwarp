@@ -28,6 +28,7 @@ from tests.conversions import (
     meshlib_indices_to_numpy,
     meshlib_scalars_to_numpy,
     numpy_to_meshlib_bitset,
+    numpy_to_warp,
     points_to_meshlib,
     points_to_open3d,
     points_to_torch,
@@ -1536,17 +1537,15 @@ def test_geodesic_ball_matches_meshlib(device: str) -> None:
         assert ball_wp == ball_ml, f"source {source}"
 
 
-def test_geodesic_ball_neighborhoods_overflow_warns() -> None:
+def test_geodesic_ball_neighborhoods_overflow_warns(device: str) -> None:
     """Not a library comparison: a neighborhood past the 512 cap must clamp and warn, not crash."""
     # A subdivided icosphere has > 512 vertices; a radius covering the whole mesh makes every
     # vertex's geodesic ball the entire connected component, exceeding the fixed scratch capacity.
     mesh_tm = tm.creation.icosphere(subdivisions=4)
     assert mesh_tm.vertices.shape[0] > 512
-    device = "cuda:0" if wp.is_cuda_available() else "cpu"
-    vertices_wp = wp.array(
-        np.array(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces, dtype=np.int32).reshape(-1), device
     )
-    faces_wp = wp.array(np.array(mesh_tm.faces, dtype=np.int32).reshape(-1), device=device)
     radius = 100.0 * float(mesh_tm.scale)
 
     with pytest.warns(UserWarning, match="capacity breaches"):
