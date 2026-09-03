@@ -16,7 +16,12 @@ from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
-from tests.comparisons import hausdorff_surface_two_sided, lexsort_rows, undirected_edges
+from tests.comparisons import (
+    hausdorff_surface_two_sided,
+    lexsort_rows,
+    trimesh_outline_loops,
+    undirected_edges,
+)
 from tests.conftest import CLOSED_MESHES, MESHES
 from tests.conversions import (
     bsr_to_csr,
@@ -392,6 +397,44 @@ def test_remesh_flags_off(device: str) -> None:
     )
     assert int(out_faces.shape[0]) // 3 <= n_faces_before
     assert tw.validation.is_watertight(out_vertices, out_faces)
+
+
+def test_collapse_pass_commits_a_useful_fraction_on_a_structured_patch(device: str) -> None:
+    """
+    The collapse stage removes a real fraction of a grid patch's vertices, not a handful.
+
+    Not a library comparison: this is a claim about triwarp's own parallel independent set, and no
+    reference exposes one pass of a collapse stage. The independent set is chosen by an atomic-min
+    lock over each candidate's two closed 1-rings, and the *key* it locks by decides how much a
+    pass commits. ``edges_unique`` orders edges lexicographically by endpoint index, which on a
+    structured mesh is spatially monotone, and a monotone key field has essentially one local
+    minimum -- so a lock keyed by the raw edge index commits **one** collapse per pass however many
+    candidates there are. ``kernels/remesh.py``'s ``scramble_index`` breaks that correlation.
+
+    A grid patch is the input that exposes it, which is why this test does not use a sphere
+    fixture. **Mutation probe, measured on this box:** with the raw index restored as the key,
+    ``_collapse_pass`` removes exactly **5** vertices at both ``32 x 32`` (1 024 vertices) and
+    ``68 x 68`` (4 624) against **171** and **733** hashed -- so the 10 % bound below sits 20x
+    above the broken answer and is insensitive to the mesh size, where an absolute count would not
+    be. Every other ``isotropic_remesh`` test passed against the broken version, which is how it
+    survived; a claim about the input's shape is a claim an assert can carry cheaply.
+    """
+    vertices_wp, faces_wp = tw.creation.grid(count=(68, 68), extents=(1.0, 1.0), device=device)
+    n_vertices = int(vertices_wp.shape[0])
+    target = 2.0 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
+    low, high = tw.remesh._length_bands(None, target, n_vertices, device)
+
+    out_vertices, out_faces = tw.remesh._collapse_pass(
+        vertices_wp, faces_wp, low, high, wp.float32(math.radians(30.0))
+    )
+    removed = n_vertices - int(out_vertices.shape[0])
+    assert removed >= 0.1 * n_vertices, f"collapse stage removed only {removed} of {n_vertices}"
+    # The pass must still leave a valid mesh: no degenerate faces, boundary loop intact.
+    faces_np = out_faces.numpy().reshape(-1, 3)
+    assert np.all(faces_np[:, 0] != faces_np[:, 1])
+    assert np.all(faces_np[:, 1] != faces_np[:, 2])
+    assert np.all(faces_np[:, 0] != faces_np[:, 2])
+    assert len(trimesh_outline_loops(warp_to_trimesh(out_vertices, out_faces))) == 1
 
 
 def test_remesh_adaptive_sizing_field_grades_the_result(device: str) -> None:

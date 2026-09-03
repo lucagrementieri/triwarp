@@ -551,26 +551,41 @@ def test_isotropic_remesh(bench_case: BenchCase) -> None:
     Five stages x ``iterations``, on a nearly-converged mesh and a badly conditioned one.
 
     MeshLab runs the identical five stages, and the pair reads in opposite directions: **pymeshlab
-    339 -> 1 116 ms** across the axis (a 3.3x spread) against **triwarp flat at 123 / 124 ms**, so
-    the 2.8x win on ``saddle`` becomes 9.0x on ``saddle_graded``.
+    343 -> 1 147 ms** across the axis (a 3.3x spread) against **triwarp at 62 / 71 ms**, so the
+    5.6x win on ``saddle`` becomes 16x on ``saddle_graded``. MeshLib's own queue is 93 / 71 ms,
+    i.e. level with triwarp, and its unchanged column is what certifies the triwarp row against the
+    123 / 124 ms this docstring used to carry.
 
     **This is not a like-for-like win, and the timing alone is misleading.** triwarp is flat because
     its loop is a fixed ``iterations`` x five launches whatever the input looks like; MeshLab's
     serial local-operation queue keeps working until the operations stop paying off. Comparing the
     *outputs* at ``iterations=3`` and the identical target length says what the difference buys:
 
-    | | faces | edge / target | zero-area | min angle p1 | aspect p99 / max |
-    |---|---|---|---|---|---|
-    | ``saddle`` in | 34 848 | 1.00 | 0 | 36.9 deg | 1.64 / 1.66 |
-    | ``saddle`` triwarp | 39 100 | 0.93 | 0 | 39.2 deg | 1.58 / 3.5 |
-    | ``saddle`` pymeshlab | 34 946 | 0.99 | 0 | 39.6 deg | 1.57 / 2.18 |
-    | ``saddle_graded`` in | 34 848 | 1.00 | 0 | 0.013 deg | 4 400 / 4 719 |
-    | ``saddle_graded`` tw | 64 867 | 0.73 | 0 | 0.16 deg | 352 / 4 711 |
-    | ``saddle_graded`` pml | 31 414 | 0.98 | 0 | 31.9 deg | 1.87 / 3.55 |
+    | | faces | edge / target | min angle p1 | aspect p99 / max |
+    |---|---|---|---|---|
+    | ``saddle`` in | 34 848 | 1.00 | 36.9 deg | 1.64 / 1.66 |
+    | ``saddle`` triwarp | 35 488 | 0.98 | 38.3 deg | 1.31 / 2.6 |
+    | ``saddle`` pymeshlab | 34 946 | 0.99 | 39.6 deg | 1.57 / 2.18 |
+    | ``saddle_graded`` in | 34 848 | 1.00 | 0.013 deg | 4 400 / 4 719 |
+    | ``saddle_graded`` tw | 40 893 | 0.85 | 0.20 deg | 7 440 / 2.0e6 |
+    | ``saddle_graded`` pml | 31 414 | 0.98 | 31.9 deg | 1.87 / 3.55 |
 
-    On ``saddle`` triwarp is now at parity (aspect 99th pct 1.58 against 1.57). On the *graded*
-    patch it is not: it misses the target length by 27% and leaves a 99th-percentile aspect ratio of
-    352 against MeshLab's 1.87, though it no longer makes anything worse than the input.
+    On ``saddle`` triwarp is now past parity (aspect 99th pct 1.31 against 1.57, worst 2.6 against
+    2.18) and within 2 % of the requested length. On the *graded* patch it is not: it misses the
+    target by 15 % and leaves a 99th-percentile aspect ratio of 7 440 against MeshLab's 1.87.
+
+    **The two triwarp rows moved together and for one reason, which is worth stating because the
+    graded row got worse.** The collapse stage's parallel independent set locked by the *raw* edge
+    index, which ``edges_unique`` orders lexicographically and which is therefore spatially
+    monotone on any structured mesh -- so the lock had one local minimum and committed **one**
+    collapse per pass out of 40 934 candidates (5 vertices removed from 17 689 over five passes,
+    against 2 761 hashed, at the same wall clock). ``kernels/remesh.py``'s ``scramble_index`` fixes
+    it, which is what took ``saddle`` from 39 100 faces at 0.93 to 35 488 at 0.98. It also unmasked
+    the open defect below: with collapse finally committing, the graded patch's worst triangles get
+    worse rather than better. That is not the key's doing -- at ``tests/test_remesh.py``'s target of
+    half the mean edge the raw key leaves **192** float32-degenerate faces on this mesh against the
+    hashed key's **40** -- it is what a collapse stage does on anisotropic input when the smoother
+    downstream of it cannot see the anisotropy.
 
     Two bugs were found and one fixed by reading this pair against the reference; both were
     pre-existing and invisible to ``tests/test_remesh.py``, which only ever runs the remesher on
@@ -590,7 +605,9 @@ def test_isotropic_remesh(bench_case: BenchCase) -> None:
       take the 99th-percentile aspect ratio from **352 to 20** and to improve the icospheres too
       (min angle 45 -> 54 deg), but it makes ``is_watertight`` fail on ``cave_cube`` through a
       self-intersection at *every* step size down to ``lam=0.1``, so it needs a fold guard before it
-      can land. Not shipped.
+      can land. Not shipped. **This is now the binding defect on the graded row**, not a residual:
+      with the collapse lock key fixed the equilibrium is gone and the aspect figures above are what
+      the unweighted smoother leaves behind.
     """
     target = bench_case.mean_edge
     if bench_case.kind == "meshlib":

@@ -1223,6 +1223,24 @@ def collapse_candidates(
     out_pos[k] = p
 
 
+@wp.func
+def scramble_index(index: wp.int32) -> wp.int32:
+    # Spatially incoherent lock key for the independent-set pass, from the candidate's own index.
+    #
+    # This is the load-bearing detail of the whole parallel selection. ``edges_unique`` orders edges
+    # lexicographically by endpoint index, which on any structured mesh is *spatially monotone* --
+    # and a monotone key field has essentially one local minimum, so a min-key lock commits a single
+    # collapse per pass however many candidates there are. Measured on ``saddle_graded``: locking by
+    # raw edge index yields exactly **1** winner out of 51 546 candidates, and locking by quadric
+    # cost yields 23 (the cost field is smoothly graded there, so it is monotone too). Hashing the
+    # index breaks the correlation and restores the expected ~candidates/valence winners.
+    #
+    # ``array.lowbias32`` with the top bit cleared, so the key stays a non-negative int32 and
+    # ``INT32_MAX`` remains usable as the unclaimed sentinel. The measurement behind the hash is
+    # recorded there, on the shared function, rather than here.
+    return wp.int32(lowbias32(wp.uint32(index)) & wp.uint32(0x7FFFFFFF))
+
+
 @wp.kernel(enable_backward=False)
 def claim_collapses(
     survivor: wp.array[wp.int32],
@@ -1231,13 +1249,38 @@ def claim_collapses(
     columns: wp.array[wp.int32],
     out_claim: wp.array[wp.int32],
 ) -> None:
-    # Lock the full closed 1-ring of both endpoints (min edge id wins), so committed
+    # Lock the full closed 1-ring of both endpoints (min scrambled key wins), so committed
     # collapses have disjoint neighbourhoods and stay independent.
+    #
+    # The key is ``scramble_index(k)`` and not ``k`` for the reason that function records at
+    # length: a min-key lock over a *spatially monotone* key field has essentially one local
+    # minimum, so it commits a single collapse per pass however many candidates there are. This
+    # kernel locked by the raw edge index until it was measured -- on ``saddle`` at a 2x band,
+    # 40 934 candidates yielded exactly **1** winner against 608 hashed, and five passes of
+    # ``_collapse_pass`` removed **5** vertices of 17 689 against 2 761, at the same wall clock
+    # (10.6 against 10.7 ms) because a pass is dominated by its rebuild rather than by its commits.
+    # A flat ``creation.grid`` shows it without the lift and is what
+    # ``test_collapse_pass_commits_a_useful_fraction_on_a_structured_patch`` asserts against.
+    #
+    # Two things measured with the change, interleaved over five alternating pairs at
+    # ``iterations=3``, that the next reader will want. **Where it helps:** on ``saddle`` at
+    # ``target = mean_edge`` the achieved-over-requested edge length goes 0.93 -> 0.98, the face
+    # count 39 100 -> 35 488 (the input is 34 848) and the worst aspect ratio 136 -> 2.6, for 2.9 %
+    # more wall clock. On the icospheres at half the mean edge -- the whole of
+    # ``tests/test_remesh.py`` -- the output is *identical* either way, because there the split
+    # stage does the work and collapse commits nothing under either key. That is why the suite
+    # passed against the broken version. **Where it does not:** on ``saddle_graded`` the target
+    # tracking improves the same way (0.73 -> 0.85, 64 867 -> 40 893 faces) but the worst triangles
+    # get worse (99th-pct aspect 177 -> 7 440, three float32-degenerate faces against none). That
+    # is not this key's defect -- at the tests' target the *raw* key leaves 192 degenerate faces
+    # against the hashed key's 40 -- it is the unweighted ``_smooth_pass`` that
+    # ``benchmarks/test_remesh.py::test_isotropic_remesh`` already records as open, unmasked here by
+    # a collapse stage that finally commits. It needs a fold guard, not a different lock key.
     k = wp.int32(wp.tid())
     s = survivor[k]
     if s < 0:
         return
-    key = k
+    key = scramble_index(k)
     r = removed[k]
     wp.atomic_min(out_claim, s, key)
     wp.atomic_min(out_claim, r, key)
@@ -1263,7 +1306,7 @@ def commit_collapses(
     s = survivor[k]
     if s < 0:
         return
-    key = k
+    key = scramble_index(k)
     r = removed[k]
     won = True
     if claim[s] != key or claim[r] != key:
@@ -2277,24 +2320,6 @@ def end_collapse_round(
     out_state[COLLAPSE_COMMITS] = count[0]
     keep_going = progressed and out_state[LOOP_ROUND] < max_rounds
     out_state[LOOP_CONDITION] = wp.where(keep_going, wp.int32(1), wp.int32(0))
-
-
-@wp.func
-def scramble_index(index: wp.int32) -> wp.int32:
-    # Spatially incoherent lock key for the independent-set pass, from the candidate's own index.
-    #
-    # This is the load-bearing detail of the whole parallel selection. ``edges_unique`` orders edges
-    # lexicographically by endpoint index, which on any structured mesh is *spatially monotone* --
-    # and a monotone key field has essentially one local minimum, so a min-key lock commits a single
-    # collapse per pass however many candidates there are. Measured on ``saddle_graded``: locking by
-    # raw edge index yields exactly **1** winner out of 51 546 candidates, and locking by quadric
-    # cost yields 23 (the cost field is smoothly graded there, so it is monotone too). Hashing the
-    # index breaks the correlation and restores the expected ~candidates/valence winners.
-    #
-    # ``array.lowbias32`` with the top bit cleared, so the key stays a non-negative int32 and
-    # ``INT32_MAX`` remains usable as the unclaimed sentinel. The measurement behind the hash is
-    # recorded there, on the shared function, rather than here.
-    return wp.int32(lowbias32(wp.uint32(index)) & wp.uint32(0x7FFFFFFF))
 
 
 @wp.kernel(enable_backward=False)
