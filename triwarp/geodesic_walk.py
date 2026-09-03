@@ -386,8 +386,8 @@ def geodesic_path(
     Examples
     --------
     ```python
-    source = tw.array.arange(1, v.device)
-    targets = tw.array.arange(int(v.shape[0]), v.device)
+    source = tw.array.arange(1, device=v.device)
+    targets = tw.array.arange(int(v.shape[0]), device=v.device)
     points, offsets = tw.geodesic_walk.geodesic_path(v, f, source, targets)
     ```
 

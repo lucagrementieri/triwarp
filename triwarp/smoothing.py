@@ -1498,7 +1498,7 @@ def smooth_region_fixed_rim(
     out = wp.clone(vertices)
     if int(faces.shape[0]) == 0 or n == 0:
         return out
-    free_map, n_free = tw.array.mask_to_index_map(free_mask)
+    free_map, n_free = tw.array.mask_to_compact_ranks(free_mask)
     if n_free == 0:
         return out
 
@@ -1510,10 +1510,8 @@ def smooth_region_fixed_rim(
     # one of them accumulates onto entry ``(0, 0)`` and ``bsr_from_triplets``' accumulation atomic
     # serializes them. An out-of-range index is dropped instead -- ``n_free`` is one past the last
     # row and column of the ``(n_free, n_free)`` system.
-    out_rows = wp.empty(size, dtype=wp.int32, device=device)
-    out_cols = wp.empty(size, dtype=wp.int32, device=device)
-    out_rows.fill_(n_free)
-    out_cols.fill_(n_free)
+    out_rows = wp.full(size, n_free, dtype=wp.int32, device=device)
+    out_cols = wp.full(size, n_free, dtype=wp.int32, device=device)
     out_vals = wp.zeros(size, dtype=wp.float64, device=device)
     # One contiguous (3, n_free) right-hand side: its rows are contiguous 1-D views, so the
     # assembly kernel writes them directly and the three columns solve in one batched CG.
@@ -1612,12 +1610,12 @@ def smooth_region(
     out = wp.clone(vertices)
     if int(faces.shape[0]) == 0 or n == 0:
         return out
-    free_map, n_free = tw.array.mask_to_index_map(free_mask)
+    free_map, n_free = tw.array.mask_to_compact_ranks(free_mask)
     if n_free == 0:
         return out
 
     row_mask = tw.selection.expand_vertex_mask(faces, free_mask, 1)
-    row_map, n_rows = tw.array.mask_to_index_map(row_mask)
+    row_map, n_rows = tw.array.mask_to_compact_ranks(row_mask)
     weight_matrix = _edge_weight_matrix(vertices, faces, edge_weights)
     nnz = int(weight_matrix.nnz)
     size = nnz + n
@@ -1627,10 +1625,8 @@ def smooth_region(
     # serializes them -- measured 14.3 ms against 0.45 ms (31.8x) for the ~185 000 unwritten slots
     # of a 35 947-vertex mesh. Both arrays are filled one past their own extent, so the padding is
     # out of range as the *row* index of ``M`` (``rows``) and of ``M^T`` (``cols``) alike.
-    rows = wp.empty(size, dtype=wp.int32, device=device)
-    cols = wp.empty(size, dtype=wp.int32, device=device)
-    rows.fill_(n_rows)
-    cols.fill_(n_free)
+    rows = wp.full(size, n_rows, dtype=wp.int32, device=device)
+    cols = wp.full(size, n_free, dtype=wp.int32, device=device)
     vals = wp.zeros(size, dtype=wp.float64, device=device)
     rhs_x = wp.zeros(n_rows, dtype=wp.float64, device=device)
     rhs_y = wp.zeros(n_rows, dtype=wp.float64, device=device)

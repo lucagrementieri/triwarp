@@ -43,7 +43,7 @@ respectively, so they carry the flat host cost that sets the crossover. ``pack_1
 pair to read ``concatenate_arrays`` against: the offsets are host metadata on both sides.
 
 trimesh, igl, open3d and pymeshlab stay unregistered here and it is not a judgement -- they operate
-a level above and expose nothing comparable. ``index_domain_size``'s "trimesh" row is likewise a
+a level above and expose nothing comparable. ``index_bound``'s "trimesh" row is likewise a
 NumPy stand-in (``int(faces.max()) + 1``) rather than a library call, because trimesh has no
 *uncached* equivalent: its vertex count comes from the array it was built with. That row predates
 this section and is the group that first established the crossover is inside the registry's size
@@ -386,9 +386,9 @@ def test_gather(bench_case: BenchCase) -> None:
     assert int(out.shape[0]) == int(indices.shape[0])
 
 
-@pytest.mark.benchmark(group="index_domain_size")
+@pytest.mark.benchmark(group="index_bound")
 @pytest.mark.benchlibs("triwarp", "trimesh")
-def test_index_domain_size(bench_case: BenchCase) -> None:
+def test_index_bound(bench_case: BenchCase) -> None:
     """
     A max-reduce over ``3F`` indices; the scan sweep is here for ``lucy``'s 84M of them.
 
@@ -399,7 +399,7 @@ def test_index_domain_size(bench_case: BenchCase) -> None:
     """
     if bench_case.kind == "triwarp":
         faces = cast(twt.Array1dInt32, bench_case.faces_wp)
-        result = bench_case.run(lambda: tw.array.index_domain_size(faces))
+        result = bench_case.run(lambda: tw.array.index_bound(faces))
         assert result == bench_case.n_vertices
     else:  # numpy reference: what trimesh-style code does on host arrays
         faces_np = bench_case.faces_np

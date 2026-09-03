@@ -307,7 +307,7 @@ class _EdgeTable:
     ) -> None:
         device = faces.device
         n_rows = int(edges_sorted.shape[0])
-        n_vertices = tw.array.index_domain_size(edges_sorted)
+        n_vertices = tw.array.index_bound(edges_sorted)
         self.vertices = vertices
         self.edges_sorted = edges_sorted
         self.max_index = wp.uint64(n_vertices)
@@ -1506,7 +1506,7 @@ def fillable_loop_mask(
     if not loops:
         return wp.empty(0, dtype=wp.bool, device=device)
 
-    # ``vertices`` is the domain, so its length is the bound ``index_domain_size`` would go to the
+    # ``vertices`` is the domain, so its length is the bound ``index_bound`` would go to the
     # device to re-derive -- 0.096 ms, flat in the mesh, so 8 % of a 1.12 ms call on ``bunny``.
     # An unreferenced vertex only widens the two tables below, which are indexed by vertex id.
     n_vertices = int(vertices.shape[0])

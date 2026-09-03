@@ -220,15 +220,20 @@ def laplacian_smoothing_loss(
     if n_vertices == 0 or int(faces.shape[0]) == 0:
         return 0.0
     device = vertices.device
-    row_scale = wp.empty(n_vertices, dtype=wp.float32, device=device)
-    self_scale = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    # The three methods initialize the two scale buffers three different ways, so each branch
+    # allocates them holding what it needs -- ``wp.full`` where the value is a constant,
+    # ``wp.empty`` where a launch writes every element, ``wp.zeros`` where the value is zero.
+    # Allocating both with ``wp.empty`` up front and filling after read as one shared allocation
+    # and was three.
     if method == "uniform":
         operator = tw.laplacian.laplacian(vertices, faces, equal_weight=True)
-        row_scale.fill_(1.0)
-        self_scale.fill_(-1.0)
+        row_scale = wp.full(n_vertices, 1.0, dtype=wp.float32, device=device)
+        self_scale = wp.full(n_vertices, -1.0, dtype=wp.float32, device=device)
     else:
         operator = cotmatrix(vertices, faces)
+        row_scale = wp.empty(n_vertices, dtype=wp.float32, device=device)
         if method == "cot":
+            self_scale = wp.empty(n_vertices, dtype=wp.float32, device=device)
             wp.launch(
                 kernel_energies.cot_row_scales,
                 dim=n_vertices,
@@ -242,7 +247,7 @@ def laplacian_smoothing_loss(
                 wp.float32(1.0 / 6.0),
                 out=row_scale,
             )
-            self_scale.zero_()
+            self_scale = wp.zeros(n_vertices, dtype=wp.float32, device=device)
     norms = wp.empty(n_vertices, dtype=wp.float32, device=device)
     wp.launch(
         kernel_energies.laplacian_residual_norms,

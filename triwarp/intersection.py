@@ -1169,7 +1169,7 @@ def _split_with_vertex_field(
         inputs=[unique_edges, vertex_dots, TOLERANCE_MERGE, crossed],
         device=device,
     )
-    edge_vertex_rank, n_new = tw.array.mask_to_index_map(crossed)
+    edge_vertex_rank, n_new = tw.array.mask_to_compact_ranks(crossed)
     crossed_edge_indices = tw.array.flatnonzero(crossed)
 
     n_uncut = n_positive + n_negative

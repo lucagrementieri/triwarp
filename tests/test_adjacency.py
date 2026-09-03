@@ -11,6 +11,7 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+import triwarp.typing as twt
 from tests.comparisons import lexsort_rows, same_partition
 from tests.conversions import (
     meshlib_bitset_to_numpy,
@@ -73,7 +74,7 @@ def test_face_adjacency_radix_is_invariant_to_an_oversized_base(
     edge rows.
     """
     _, mesh_wp = request.getfixturevalue(mesh_name)
-    tight = tw.array.index_domain_size(mesh_wp.indices)
+    tight = tw.array.index_bound(mesh_wp.indices)
     edges_sorted = tw.edges.faces_to_edges(mesh_wp.indices, sorted=True)
 
     baseline_wp = tw.adjacency.face_adjacency(mesh_wp.indices, n_vertices=tight)
@@ -95,37 +96,100 @@ def test_face_adjacency_empty(device: str) -> None:
     assert adjacency_edges_wp.shape == (0, 2)
 
 
+@pytest.mark.parametrize(
+    "function",
+    [
+        tw.adjacency.face_adjacency_unshared,
+        tw.adjacency.face_adjacency_projections,
+        tw.adjacency.face_adjacency_convex,
+    ],
+)
+def test_half_a_precomputed_pair_raises_even_on_an_empty_mesh(
+    device: str, function: object
+) -> None:
+    """
+    Not a library comparison: no reference takes a precomputed face-adjacency pair at all.
+
+    The four wrappers that accept ``(face_adjacency, face_adjacency_edges)`` used to disagree about
+    when a half-supplied pair is rejected -- two checked before their empty-mesh guard and two
+    returned an empty answer first, so the same wrong call raised or did not depending on the mesh.
+    The empty mesh is the whole point of the test: a non-empty one has always raised, so a
+    regression here is invisible without it.
+
+    ``face_adjacency_unshared`` takes ``faces`` first and the other two take ``vertices, faces``,
+    which is why the call goes through ``*args`` rather than a shared signature.
+    """
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    adjacency_wp = twt.empty_2d((0, 2), wp.int32, device=device)
+    args = (
+        (faces_wp,) if function is tw.adjacency.face_adjacency_unshared else (vertices_wp, faces_wp)
+    )
+    with pytest.raises(ValueError, match="both be provided or both omitted"):
+        function(*args, adjacency_wp)  # type: ignore[operator]
+
+
 @pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
-def test_resolve_face_adjacency_derives_and_forwards(
+def test_the_precomputed_pair_reaches_the_same_answer_as_deriving_it(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    Class A: the resolver derives what ``face_adjacency`` does, and ``n_vertices`` does not move it.
+    Triwarp against triwarp: passing the pair in agrees with letting each wrapper derive it.
 
-    Both branches are covered -- deriving from ``faces`` with and without the radix, and passing the
-    tables straight through, where the radix is documented as ignored and must therefore be
-    accepted without changing anything.
+    The wrappers taking ``(face_adjacency, face_adjacency_edges)`` each derive it inline from
+    [`face_adjacency`][triwarp.adjacency.face_adjacency] when it is omitted, so nothing external
+    can be the oracle -- the claim is that the two paths are the same computation, and the oracle
+    for the derived path is the reference comparison each wrapper carries in its own test.
+
+    ``n_vertices`` is exercised on the derive path because it is documented as changing only the
+    row-hashing radix and not the answer; a wrong radix collides edge keys and silently drops
+    adjacency rows, which is what the row-count assert below would catch.
     """
     _, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = int(mesh_wp.points.shape[0])
     adjacency_wp, edges_wp = tw.adjacency.face_adjacency(mesh_wp.indices, return_edges=True)
-
-    derived_wp, derived_edges_wp = tw.adjacency.resolve_face_adjacency(mesh_wp.indices)
-    supplied_wp, supplied_edges_wp = tw.adjacency.resolve_face_adjacency(
-        mesh_wp.indices, n_vertices=n_vertices
-    )
-    passed_wp, passed_edges_wp = tw.adjacency.resolve_face_adjacency(
-        mesh_wp.indices, adjacency_wp, edges_wp, n_vertices=n_vertices
-    )
-
     assert int(adjacency_wp.shape[0]) > 0
-    for got_wp, got_edges_wp in (
-        (derived_wp, derived_edges_wp),
-        (supplied_wp, supplied_edges_wp),
-        (passed_wp, passed_edges_wp),
+    tight_wp, tight_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True, n_vertices=n_vertices
+    )
+    assert np.array_equal(tight_wp.numpy(), adjacency_wp.numpy())
+    assert np.array_equal(tight_edges_wp.numpy(), edges_wp.numpy())
+
+    for supplied_np, derived_np in (
+        (
+            tw.adjacency.face_adjacency_unshared(mesh_wp.indices, adjacency_wp, edges_wp).numpy(),
+            tw.adjacency.face_adjacency_unshared(mesh_wp.indices).numpy(),
+        ),
+        (
+            tw.adjacency.face_adjacency_projections(
+                mesh_wp.points, mesh_wp.indices, adjacency_wp, edges_wp
+            ).numpy(),
+            tw.adjacency.face_adjacency_projections(mesh_wp.points, mesh_wp.indices).numpy(),
+        ),
+        (
+            tw.adjacency.face_adjacency_convex(
+                mesh_wp.points, mesh_wp.indices, adjacency_wp, edges_wp
+            ).numpy(),
+            tw.adjacency.face_adjacency_convex(mesh_wp.points, mesh_wp.indices).numpy(),
+        ),
     ):
-        assert np.array_equal(got_wp.numpy(), adjacency_wp.numpy())
-        assert np.array_equal(got_edges_wp.numpy(), edges_wp.numpy())
+        assert supplied_np.shape[0] == int(adjacency_wp.shape[0])
+        assert np.array_equal(supplied_np, derived_np)
+
+
+def test_require_paired_adjacency_accepts_both_and_neither(device: str) -> None:
+    """
+    Not a library comparison: no reference takes a precomputed face-adjacency pair at all.
+
+    The two accepting cases as well as the raise, because a validator that rejects everything
+    passes a test written around the raise alone.
+    """
+    pair_wp = twt.empty_2d((0, 2), wp.int32, device=device)
+    tw.adjacency.require_paired_adjacency(None, None)
+    tw.adjacency.require_paired_adjacency(pair_wp, pair_wp)
+    for half in ((pair_wp, None), (None, pair_wp)):
+        with pytest.raises(ValueError, match="both be provided or both omitted"):
+            tw.adjacency.require_paired_adjacency(*half)
 
 
 @pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
@@ -419,8 +483,8 @@ def test_face_adjacency_angles_matches_meshlib(
     what makes a missed pair a failure rather than a silently smaller comparison.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    adjacency_wp, adjacency_edges_wp = tw.adjacency.resolve_face_adjacency(
-        mesh_wp.indices, n_vertices=int(mesh_wp.points.shape[0])
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True, n_vertices=int(mesh_wp.points.shape[0])
     )
     angles_wp = tw.adjacency.face_adjacency_angles(
         mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp

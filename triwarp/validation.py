@@ -71,7 +71,7 @@ def is_edge_manifold(
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     if n_vertices is None:
-        n_vertices = tw.array.index_domain_size(faces)
+        n_vertices = tw.array.index_bound(faces)
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
     _, counts = tw.grouping.unique_1d(keys, return_counts=True)
 
@@ -125,7 +125,7 @@ def edge_manifold_mask(
 
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=tw.array.index_domain_size(faces))
+    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=tw.array.index_bound(faces))
     _, inverse, counts = tw.grouping.unique_1d(keys, return_inverse=True, return_counts=True)
 
     n_unique = int(counts.shape[0])
@@ -199,15 +199,17 @@ def is_vertex_manifold(
     [`vertex_manifold_mask`][triwarp.validation.vertex_manifold_mask] for a per-vertex flag
     sized to a caller-provided vertex buffer.
     """
-    # Resolved before the empty-mesh guard so a caller passing only one half of the pair is told
-    # about it whatever the mesh is; on an empty buffer the resolve itself is two empty arrays.
-    adjacency, adjacency_edges = tw.adjacency.resolve_face_adjacency(
-        faces, face_adjacency, face_adjacency_edges
-    )
+    # Checked before the empty-mesh guard so a caller passing only one half of the pair is told
+    # about it whatever the mesh is; resolved after it, because on an empty buffer the resolve is
+    # two empty tables nothing reads. Every wrapper taking this pair does it in this order.
+    tw.adjacency.require_paired_adjacency(face_adjacency, face_adjacency_edges)
     if int(faces.shape[0]) // 3 == 0:
         return True
+    if face_adjacency is None:
+        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
+    assert face_adjacency_edges is not None
     manifold = _vertex_manifold_flags(
-        faces, tw.array.index_domain_size(faces), adjacency, adjacency_edges
+        faces, tw.array.index_bound(faces), face_adjacency, face_adjacency_edges
     )
     return bool(tw.reduce.all(manifold))
 

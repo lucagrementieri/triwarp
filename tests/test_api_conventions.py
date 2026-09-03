@@ -240,7 +240,7 @@ def test_strict_launch_mode_rejects_a_cross_device_launch() -> None:
         pytest.skip("a cross-device launch needs a CUDA device to launch on")
     indices = wp.empty(4, dtype=wp.int32, device="cpu")
     with pytest.raises(RuntimeError, match="device"):
-        wp.launch(kernel_array.init_range, dim=4, inputs=[indices], device="cuda:0")
+        wp.launch(kernel_array.arange, dim=4, inputs=[indices], device="cuda:0")
 
 
 def test_kernel_outputs_are_named_and_placed() -> None:

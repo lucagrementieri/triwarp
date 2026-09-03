@@ -457,8 +457,7 @@ def interpolate_from_points(
     if k is not None and int(k) <= 0:
         raise ValueError(f"k must be positive when given, got {k}")
 
-    out_values = wp.empty(n_query, dtype=source_values.dtype, device=device)
-    out_values.fill_(null_value)
+    out_values = wp.full(n_query, null_value, dtype=source_values.dtype, device=device)
     if n_query == 0 or n_source == 0:
         return out_values
 
@@ -475,7 +474,7 @@ def interpolate_from_points(
         n_slots = n_query * int(k)
         indices = row_indices.reshape((n_slots,))
         distances = row_distances.reshape((n_slots,))
-        offsets = tw.array.arange_step(n_query + 1, int(k), device)
+        offsets = tw.array.arange(0, (n_query + 1) * int(k), int(k), device=device)
 
     wp.launch(
         kernel_interpolation.INTERPOLATE_FROM_POINTS[source_values.dtype],

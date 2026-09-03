@@ -14,26 +14,26 @@ import triwarp as tw
 from tests.conversions import points_to_warp
 
 
-def test_arange(device: str) -> None:
-    n = 8
-    out_wp = tw.array.arange(n, device)
-    assert np.array_equal(out_wp.numpy(), np.arange(n, dtype=np.int32))
+@pytest.mark.parametrize(
+    "args",
+    [(8,), (0,), (3, 11), (0, 18, 3), (2, 20, 6), (11, 3, -2), (5, 5), (5, 2), (-4, 4), (-4, 4, 3)],
+)
+def test_arange_matches_numpy(device: str, args: tuple[int, ...]) -> None:
+    """
+    Class A: the merged range reproduces [`numpy.arange`][] over every positional arity.
+
+    The cases are chosen so each one exercises something the single-argument form cannot: the
+    two- and three-argument overloads, a negative ``step`` (a descending interval), an empty
+    result from ``start == stop`` and from ``start > stop`` with a positive step, and negative
+    values, which the ``i * step`` kernel would get wrong if it dropped ``start``.
+    """
+    out_wp = tw.array.arange(*args, device=device)
+    assert np.array_equal(out_wp.numpy(), np.arange(*args, dtype=np.int32))
 
 
-def test_arange_zero(device: str) -> None:
-    out_wp = tw.array.arange(0, device)
-    assert out_wp.shape == (0,)
-
-
-def test_arange_step(device: str) -> None:
-    count, step = 6, 3
-    out_wp = tw.array.arange_step(count, step, device)
-    assert np.array_equal(out_wp.numpy(), np.arange(0, count * step, step, dtype=np.int32))
-
-
-def test_arange_step_zero_count(device: str) -> None:
-    out_wp = tw.array.arange_step(0, 5, device)
-    assert out_wp.shape == (0,)
+def test_arange_rejects_a_zero_step(device: str) -> None:
+    with pytest.raises(ValueError, match="step must be non-zero"):
+        tw.array.arange(0, 10, 0, device=device)
 
 
 def test_sort_pair_indices(device: str) -> None:
@@ -48,15 +48,15 @@ def test_sort_pair_indices_zero(device: str) -> None:
     assert out_wp.shape == (0,)
 
 
-def test_repeat_range(device: str) -> None:
+def test_arange_repeat(device: str) -> None:
     count, repeats = 9, 3
-    out_wp = tw.array.repeat_range(count, repeats, device)
+    out_wp = tw.array.arange_repeat(count, repeats, device)
     expected_np = np.repeat(np.arange(count // repeats, dtype=np.int32), repeats)
     assert np.array_equal(out_wp.numpy(), expected_np)
 
 
-def test_repeat_range_zero_count(device: str) -> None:
-    out_wp = tw.array.repeat_range(0, 4, device)
+def test_arange_repeat_zero_count(device: str) -> None:
+    out_wp = tw.array.arange_repeat(0, 4, device)
     assert out_wp.shape == (0,)
 
 
@@ -669,7 +669,7 @@ def test_flatnonzero_indices_to_mask_round_trip(device: str, n: int) -> None:
 
 
 @pytest.mark.parametrize("invert", [False, True])
-def test_mask_to_index_map_is_the_exclusive_scan_of_the_mask(device: str, invert: bool) -> None:
+def test_mask_to_compact_ranks_is_the_exclusive_scan_of_the_mask(device: str, invert: bool) -> None:
     """
     Class A: the map is ``cumsum(mask) - mask`` and the count is the mask's population.
 
@@ -681,7 +681,7 @@ def test_mask_to_index_map_is_the_exclusive_scan_of_the_mask(device: str, invert
     mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
     selected_np = ~mask_np if invert else mask_np
 
-    index_map_wp, count = tw.array.mask_to_index_map(mask_wp, invert=invert)
+    index_map_wp, count = tw.array.mask_to_compact_ranks(mask_wp, invert=invert)
 
     assert count == int(selected_np.sum())
     assert np.array_equal(index_map_wp.numpy(), np.cumsum(selected_np) - selected_np)
@@ -689,9 +689,9 @@ def test_mask_to_index_map_is_the_exclusive_scan_of_the_mask(device: str, invert
     assert np.array_equal(index_map_wp.numpy()[positions_np], np.arange(count, dtype=np.int32))
 
 
-def test_mask_to_index_map_empty(device: str) -> None:
+def test_mask_to_compact_ranks_empty(device: str) -> None:
     """An empty mask maps to an empty array and a zero count, without launching a scan."""
-    index_map_wp, count = tw.array.mask_to_index_map(wp.empty(0, dtype=wp.bool, device=device))
+    index_map_wp, count = tw.array.mask_to_compact_ranks(wp.empty(0, dtype=wp.bool, device=device))
     assert count == 0
     assert index_map_wp.shape == (0,)
 
@@ -968,9 +968,50 @@ def test_trim_to_count_zero(device: str) -> None:
     assert trimmed_wp.shape == (0,)
 
 
+def test_isin_max_index_matches_the_inferred_span(device: str) -> None:
+    """
+    Triwarp against triwarp: the supplied bound reaches the answer the two reductions infer.
+
+    ``max_index`` skips the ``minmax`` pair that would otherwise select the strategy and anchor the
+    table, so the inferred path is the oracle for the supplied one -- and [`numpy.isin`][] is the
+    oracle for the inferred path in the tests above it.
+
+    The last case is the one that matters: values **at or above** the bound. They are outside what
+    the keyword promises, so the answer is documented as wrong rather than raised -- but the
+    element-side lookup range-guards its slot, so it must be wrong by reading ``False`` and not by
+    reading past the end of the table. Without the guard this case is an out-of-bounds gather,
+    which on the CPU device is host-heap corruption (CLAUDE.md section 12.1) rather than a failure
+    anything here could catch.
+    """
+    rng = np.random.default_rng(11)
+    elements_np = rng.integers(0, 64, size=500).astype(np.int32)
+    test_np = rng.integers(0, 64, size=40).astype(np.int32)
+    elements_wp = wp.array(elements_np, dtype=wp.int32, device=device)
+    test_wp = wp.array(test_np, dtype=wp.int32, device=device)
+
+    inferred_np = tw.array.isin(elements_wp, test_wp).numpy()
+    assert inferred_np.any()
+    assert not inferred_np.all()
+    assert np.array_equal(tw.array.isin(elements_wp, test_wp, max_index=64).numpy(), inferred_np)
+
+    # Rank-2 input, so the reshape path is covered by the supplied branch too.
+    rows_wp = wp.array(elements_np.reshape(-1, 5), dtype=wp.int32, device=device)
+    assert np.array_equal(
+        tw.array.isin(rows_wp, test_wp, max_index=64).numpy(), inferred_np.reshape(-1, 5)
+    )
+
+    # A bound the values exceed: everything at or above it reads absent, nothing reads out of range.
+    truncated_np = tw.array.isin(elements_wp, test_wp, max_index=32).numpy()
+    assert np.array_equal(truncated_np, inferred_np & (elements_np < 32))
+    assert truncated_np.any()
+
+    with pytest.raises(ValueError, match="max_index must be positive"):
+        tw.array.isin(elements_wp, test_wp, max_index=0)
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
-@pytest.mark.parity("index_domain_size", "trimesh")
-def test_index_domain_size_matches_the_index_maximum(
+@pytest.mark.parity("index_bound", "trimesh")
+def test_index_bound_matches_the_index_maximum(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
@@ -984,8 +1025,8 @@ def test_index_domain_size_matches_the_index_maximum(
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     faces_np = mesh_tm.faces
 
-    assert tw.array.index_domain_size(mesh_wp.indices) == int(faces_np.max()) + 1
-    assert tw.array.index_domain_size(mesh_wp.indices) == len(mesh_tm.vertices)
+    assert tw.array.index_bound(mesh_wp.indices) == int(faces_np.max()) + 1
+    assert tw.array.index_bound(mesh_wp.indices) == len(mesh_tm.vertices)
 
 
 def test_read_scalar_returns_a_detached_row_for_a_vector_dtype(device: str) -> None:

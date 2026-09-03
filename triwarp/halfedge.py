@@ -46,7 +46,7 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
     n_vertices
         Total vertex count, used as the key radix. When ``None`` it is inferred with
-        [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
+        [`array.index_bound`][triwarp.array.index_bound], which costs a host readback.
 
     Returns
     -------
@@ -73,7 +73,7 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
         return twins
 
     if n_vertices is None:
-        n_vertices = tw.array.index_domain_size(faces)
+        n_vertices = tw.array.index_bound(faces)
 
     # Edge rows are built from face indices, so they are non-negative and below the vertex count by
     # construction: the range check would only add a readback.
@@ -129,7 +129,7 @@ def vertex_one_rings(
         is computed here.
     n_vertices
         Total vertex count (the number of CSR rows). When ``None`` it is inferred with
-        [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
+        [`array.index_bound`][triwarp.array.index_bound], which costs a host readback.
 
     Returns
     -------
@@ -156,7 +156,7 @@ def vertex_one_rings(
     n_halfedges = int(faces.shape[0]) // 3 * 3
 
     if n_vertices is None:
-        n_vertices = tw.array.index_domain_size(faces)
+        n_vertices = tw.array.index_bound(faces)
     if twins is None:
         twins = halfedge_twins(faces, n_vertices=n_vertices)
 

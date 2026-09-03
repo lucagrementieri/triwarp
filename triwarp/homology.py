@@ -263,7 +263,7 @@ def _dual_spanning_forest(
     in_forest = wp.zeros(n_candidates, dtype=wp.bool, device=device)
     if n_candidates == 0 or n_faces == 0:
         return in_forest
-    labels = tw.array.arange(n_faces, device)
+    labels = tw.array.arange(n_faces, device=device)
     roots = wp.empty(n_faces, dtype=wp.int32, device=device)
     proposal = wp.empty(n_faces, dtype=wp.int32, device=device)
     merges = wp.zeros(1, dtype=wp.int32, device=device)

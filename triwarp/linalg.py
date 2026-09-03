@@ -514,9 +514,9 @@ def free_partition(fixed_mask: wp.array[wp.bool]) -> tuple[wp.array[wp.int32], i
     """
     Compact remap of the *unpinned* degrees of freedom, plus their count.
 
-    Thin inversion of [`mask_to_index_map`][triwarp.array.mask_to_index_map]: ``fixed_mask`` marks
-    the constrained degrees of freedom, and the returned map indexes the reduced system built over
-    the complement.
+    Thin inversion of [`mask_to_compact_ranks`][triwarp.array.mask_to_compact_ranks]:
+    ``fixed_mask`` marks the constrained degrees of freedom, and the returned map indexes the
+    reduced system built over the complement.
 
     Parameters
     ----------
@@ -533,9 +533,9 @@ def free_partition(fixed_mask: wp.array[wp.bool]) -> tuple[wp.array[wp.int32], i
 
     See Also
     --------
-    [`mask_to_index_map`][triwarp.array.mask_to_index_map]
+    [`mask_to_compact_ranks`][triwarp.array.mask_to_compact_ranks]
     """
-    return tw.array.mask_to_index_map(fixed_mask, invert=True)
+    return tw.array.mask_to_compact_ranks(fixed_mask, invert=True)
 
 
 def assemble_interior_system(

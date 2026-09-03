@@ -106,9 +106,9 @@ def selected_row(
 ) -> wp.int32:
     # ``free_row`` for a mask of the opposite sense: the compact row index element ``i`` occupies in
     # the reduced system, or ``-1`` when the mask does not keep it. See ``free_row`` for why there
-    # are two and for the contract on ``index_map`` (which is ``array.mask_to_index_map``'s output,
-    # exactly as ``free_map`` is ``linalg.free_partition``'s -- the same array, built from the two
-    # complementary masks).
+    # are two and for the contract on ``index_map`` (which is ``array.mask_to_compact_ranks``'s
+    # output, exactly as ``free_map`` is ``linalg.free_partition``'s -- the same array, built from
+    # the two complementary masks).
     #
     # Two of ``smoothing``'s region-solve kernels ask this of *two different* partitions at once --
     # the free vertices and the wider set of rows the least-squares system carries -- so having one

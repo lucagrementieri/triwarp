@@ -549,7 +549,7 @@ def test_fillable_loop_mask(bench_case: BenchCase) -> None:
     arithmetic. Two things were taken because they were free rather than because they showed up:
     the rim concatenation now re-uses the buffer ``boundary_loops`` already packed (``copy=False``,
     see ``benchmarks/test_boundary.py::test_loop_perimeters``), worth **1.39x on ``dragon``**, and
-    an ``index_domain_size`` readback is gone because ``vertices`` already states the bound -- 0.096
+    an ``index_bound`` readback is gone because ``vertices`` already states the bound -- 0.096
     ms, flat in the mesh, so 8 % of the small rows. ``dragon``'s remaining 40 % is a **Python loop
     over 407 rims** building two vertex-indexed tables, which is the one stage here with an
     algorithm left in it and the reason that row is not a floor row.

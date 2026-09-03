@@ -686,12 +686,16 @@ def resolve_voxel_grid(
         If ``voxel_size`` is not positive.
 
     !!! note "The ``resolve_*`` pattern"
-        Three modules carry one of these -- turn an optional argument into the concrete value the
-        wrapper would have derived, so a caller who wants two functions to share the derived thing
-        can resolve it once and pass it to both. Each default is domain knowledge, so they cannot
-        share a module: [`sample.resolve_seed`][triwarp.sample.resolve_seed],
-        [`adjacency.resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency] and
-        [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid].
+        Both of these -- this and [`sample.resolve_seed`][triwarp.sample.resolve_seed] /
+        [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid] -- turn an optional
+        argument into the concrete value the wrapper would have derived, so a caller who wants two
+        functions to share the derived thing can resolve it once and pass it to both. Each default
+        is domain knowledge, so they cannot share a module. The optional face-adjacency pair
+        deliberately has **no** such resolver: deriving it is one
+        [`face_adjacency`][triwarp.adjacency.face_adjacency] call with ``return_edges=True``, so
+        only the *pairing rule* is worth sharing and
+        [`adjacency.require_paired_adjacency`][triwarp.adjacency.require_paired_adjacency] is that
+        rule on its own.
 
     See Also
     --------
@@ -699,7 +703,6 @@ def resolve_voxel_grid(
     [`cell_indices`][triwarp.voxels.cell_indices]
     [`cluster_decimate`][triwarp.remesh.cluster_decimate]
     [`sample.resolve_seed`][triwarp.sample.resolve_seed]
-    [`adjacency.resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency]
     """
     if voxel_size is None or origin is None:
         if int(points.shape[0]) == 0:

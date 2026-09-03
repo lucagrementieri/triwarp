@@ -152,7 +152,7 @@ def corner_normals(
         Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins].
     n_vertices
         Total vertex count. When ``None`` it is inferred with
-        [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
+        [`array.index_bound`][triwarp.array.index_bound], which costs a host readback.
     face_normals
         Optional length-``n_faces`` unit face normals and matching areas from
         [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]; recomputed together
@@ -199,7 +199,7 @@ def corner_normals(
     if n_faces == 0:
         return twt.as_array2d(twt.empty_2d((0, 3), wp.vec3, device=device), wp.vec3)
     if n_vertices is None:
-        n_vertices = tw.array.index_domain_size(faces)
+        n_vertices = tw.array.index_bound(faces)
     if twins is None:
         twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
 
@@ -227,9 +227,9 @@ def corner_normals(
         corner_weights = face_angles(vertices, faces).reshape(3 * n_faces)
     elif weighting == "area":
         # One area per face broadcast to its three corners -- a gather rather than a kernel, since
-        # ``repeat_range`` already builds ``i // 3``.
+        # ``arange_repeat`` already builds ``i // 3``.
         corner_weights = tw.array.gather(
-            face_areas, tw.array.repeat_range(3 * n_faces, 3, device=device)
+            face_areas, tw.array.arange_repeat(3 * n_faces, 3, device=device)
         )
     else:
         raise ValueError(f"weighting must be 'angle' or 'area', got {weighting!r}")

@@ -1863,7 +1863,7 @@ def _dilate_face_mask(
         vertex_mask = tw.selection.expand_vertex_mask(faces, vertex_mask, hops)
 
     grown_faces = tw.selection.face_indices_from_vertex_indices(
-        faces, tw.array.flatnonzero(vertex_mask), face_mode="any"
+        faces, tw.array.flatnonzero(vertex_mask), face_mode="any", n_vertices=n_vertices
     )
     return tw.array.indices_to_mask(grown_faces, n_faces, device=device)
 

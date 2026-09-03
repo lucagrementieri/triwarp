@@ -722,8 +722,8 @@ def hash_indices_rows(
         they are non-negative and below the vertex count by definition).
 
         **A caller that derived its ``max_index`` from
-        [`index_domain_size`][triwarp.array.index_domain_size] has *not* thereby made this
-        redundant, and four of them deliberately keep it on.** ``index_domain_size`` is a ``max``
+        [`index_bound`][triwarp.array.index_bound] has *not* thereby made this
+        redundant, and four of them deliberately keep it on.** ``index_bound`` is a ``max``
         reduction; the validation is a ``minmax``, and it is the ``min`` half -- the negative-index
         guard -- that has no counterpart above it, so skipping it would turn a malformed face
         buffer from a raise into a silently wrong grouping. Measured on an RTX 5090, Warp 1.17,

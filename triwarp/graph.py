@@ -133,7 +133,7 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
     if node_count <= 1:
         return wp.zeros(node_count, dtype=wp.int32, device=device)
     if adjacency.nnz == 0:
-        return arange(node_count, device)
+        return arange(node_count, device=device)
 
     labels = wp.empty(node_count, dtype=wp.int32, device=device)
     parents = wp.empty(node_count, dtype=wp.int32, device=device)
@@ -217,7 +217,7 @@ def connected_component_labels_from_edges(
     # With no edges every node is its own component, which ``arange`` gives directly -- the
     # CSR build and traversal below would reach the same answer the long way.
     if int(edges.shape[0]) == 0:
-        return arange(node_count, edges.device)
+        return arange(node_count, device=edges.device)
 
     adjacency = edges_to_csr(node_count, edges)
     return connected_component_labels(adjacency)
@@ -1025,7 +1025,7 @@ def _validate_edge_list(edges: twt.Array2dInt32, node_count: int | None, *, vali
         raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
 
     if node_count is None:
-        return int(tw.array.index_domain_size(edges))
+        return int(tw.array.index_bound(edges))
     if node_count < 0:
         raise ValueError(f"node_count must be non-negative, got {node_count}")
     if validate and int(edges.shape[0]) > 0:

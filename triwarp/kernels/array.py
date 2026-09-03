@@ -243,19 +243,31 @@ def divide_if_positive(value: wp.Float, divisor: wp.Float) -> wp.Float:
 
 
 @wp.kernel
-def init_range(out_indices: wp.array[wp.Int]) -> None:
+def arange(out_indices: wp.array[wp.Int]) -> None:
+    # The ``start == 0, step == 1`` fast path of ``array.arange``, kept beside the general affine
+    # form because it is the only one any in-repo caller reaches and it marshals two fewer
+    # arguments -- ~2 us of the ~26 us the whole 200k-element call costs (CLAUDE.md 13.1).
+    #
+    # ``wp.tile_arange`` was measured here and **declined**, on two counts. It cannot express this
+    # kernel at all: its bounds are read at *codegen* (``tile_arange_value_func`` computes the tile
+    # length from them), so a runtime ``block * TILE`` start is a parse error and the only
+    # expressible form is a constant tile shifted by a ``tile_map(wp.add, ...)`` over a broadcast
+    # scalar. Measured that way against this kernel, values identical, min of 9 interleaved reps of
+    # 100 launches at ``block_dim=256``: **0.85x at 1 024, 0.91x at 200 192 and 0.998x at
+    # 13 999 872** -- a loss below the bandwidth limit and a wash at it, because writing
+    # ``out[i] = i`` is a pure streaming store with no reuse for a tile to exploit.
     i = wp.int32(wp.tid())
     out_indices[i] = i
 
 
 @wp.kernel
-def init_range_step(step: wp.Int, out_indices: wp.array[wp.Int]) -> None:
+def arange_affine(start: wp.Int, step: wp.Int, out_indices: wp.array[wp.Int]) -> None:
     i = wp.int32(wp.tid())
-    out_indices[i] = i * step
+    out_indices[i] = start + type(start)(i) * step
 
 
 @wp.kernel
-def init_sort_pair_indices(n: wp.Int, fill_value: wp.Int, out_indices: wp.array[wp.Int]) -> None:
+def sort_pair_indices(n: wp.Int, fill_value: wp.Int, out_indices: wp.array[wp.Int]) -> None:
     i = wp.int32(wp.tid())
     if i < n:
         out_indices[i] = i
@@ -264,7 +276,7 @@ def init_sort_pair_indices(n: wp.Int, fill_value: wp.Int, out_indices: wp.array[
 
 
 @wp.kernel
-def init_repeat_index(repeats: wp.Int, out_indices: wp.array[wp.Int]) -> None:
+def arange_repeat(repeats: wp.Int, out_indices: wp.array[wp.Int]) -> None:
     i = wp.int32(wp.tid())
     out_indices[i] = i // repeats
 
@@ -272,7 +284,7 @@ def init_repeat_index(repeats: wp.Int, out_indices: wp.array[wp.Int]) -> None:
 @wp.kernel
 def segment_owner_labels(offsets: wp.array[wp.int32], out_owner: wp.array[wp.int32]) -> None:
     # For every element of a packed ragged array, which segment it belongs to -- the ragged
-    # counterpart of ``init_repeat_index``, whose segments are all one width. ``offsets`` is the
+    # counterpart of ``arange_repeat``, whose segments are all one width. ``offsets`` is the
     # exclusive scan of the segment sizes with the total appended, so this is launched over the
     # *segment* count and each thread writes its own label across its own span.
     #
@@ -352,6 +364,32 @@ def shifted_index(value: wp.Scalar, offset: wp.Scalar) -> wp.int32:
 
 
 @wp.kernel
+def isin_lookup_mask(
+    elements: wp.array[wp.Scalar],
+    anchor: wp.Scalar,
+    span: wp.int32,
+    membership: wp.array[wp.bool],
+    out_mask: wp.array[wp.bool],
+) -> None:
+    # The element side of ``array.isin``'s direct-index strategy: shift into the table anchored at
+    # ``anchor`` and read the flag there, in one launch. Written as a kernel rather than as
+    # ``wp.map(shifted_index, ...)`` followed by a Python-scope gather for two reasons. It halves
+    # the element-side work -- one launch instead of a launch, an ``(n,)`` int32 slot buffer and
+    # the gather's own ``wp.copy``. And the range guard is what makes ``isin``'s ``max_index``
+    # escape hatch *safe*: a caller-supplied bound the values exceed reads ``False`` here, where an
+    # unguarded gather would read past the end of ``membership`` -- silent memory unsafety rather
+    # than a wrong answer (CLAUDE.md section 12.1).
+    #
+    # An ``if`` rather than ``wp.where``: ``wp.where`` evaluates both arms, so it would index
+    # ``membership`` at the very slot the guard exists to reject (CLAUDE.md section 1.5).
+    i = wp.int32(wp.tid())
+    slot = shifted_index(elements[i], anchor)
+    out_mask[i] = False
+    if slot >= wp.int32(0) and slot < span:
+        out_mask[i] = membership[slot]
+
+
+@wp.kernel
 def isin_lookup_sorted(
     elements: wp.array[wp.Scalar], sorted_test: wp.array[wp.Scalar], out_mask: wp.array[wp.bool]
 ) -> None:
@@ -394,7 +432,7 @@ def mask_and_not(a: wp.bool, b: wp.bool) -> wp.bool:
 @wp.func
 def complement_flag(a: wp.bool) -> wp.int32:
     # ``1`` where the mask is False, ``0`` where it is True: the scan input for an inverted
-    # ``mask_to_index_map`` (free/interior DOFs of a fixed-vertex mask, for instance).
+    # ``mask_to_compact_ranks`` (free/interior DOFs of a fixed-vertex mask, for instance).
     return wp.where(a, wp.int32(0), wp.int32(1))
 
 
@@ -655,10 +693,11 @@ class OverloadTable(KernelTable):
 # rather than through the generic kernel above it (measured 2.17x on a launch, and nothing extra is
 # compiled). Declared here so a type checker sees them at module scope; ``_register_overloads``
 # fills them in at import.
-INIT_RANGE: OverloadTable
-INIT_RANGE_STEP: OverloadTable
-INIT_REPEAT_INDEX: OverloadTable
-INIT_SORT_PAIR_INDICES: OverloadTable
+ARANGE: OverloadTable
+ARANGE_AFFINE: OverloadTable
+ARANGE_REPEAT: OverloadTable
+SORT_PAIR_INDICES: OverloadTable
+ISIN_LOOKUP_MASK: OverloadTable
 ISIN_LOOKUP_SORTED: OverloadTable
 MAP_SORTED_INVERSE: OverloadTable
 SORT_ROWS_INSERTION: OverloadTable
@@ -666,15 +705,17 @@ SORT_ROWS_INSERTION: OverloadTable
 
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
-    global INIT_RANGE, INIT_RANGE_STEP, INIT_REPEAT_INDEX, INIT_SORT_PAIR_INDICES
-    global ISIN_LOOKUP_SORTED, MAP_SORTED_INVERSE, SORT_ROWS_INSERTION
-    INIT_RANGE = OverloadTable(init_range, {d: [wp.array[d]] for d in _INDEX_DTYPES})
-    INIT_RANGE_STEP = OverloadTable(init_range_step, {d: [d, wp.array[d]] for d in _INDEX_DTYPES})
-    INIT_REPEAT_INDEX = OverloadTable(
-        init_repeat_index, {d: [d, wp.array[d]] for d in _INDEX_DTYPES}
+    global ARANGE, ARANGE_AFFINE, ARANGE_REPEAT, SORT_PAIR_INDICES
+    global ISIN_LOOKUP_MASK, ISIN_LOOKUP_SORTED, MAP_SORTED_INVERSE, SORT_ROWS_INSERTION
+    ARANGE = OverloadTable(arange, {d: [wp.array[d]] for d in _INDEX_DTYPES})
+    ARANGE_AFFINE = OverloadTable(arange_affine, {d: [d, d, wp.array[d]] for d in _INDEX_DTYPES})
+    ARANGE_REPEAT = OverloadTable(arange_repeat, {d: [d, wp.array[d]] for d in _INDEX_DTYPES})
+    SORT_PAIR_INDICES = OverloadTable(
+        sort_pair_indices, {d: [d, d, wp.array[d]] for d in _INDEX_DTYPES}
     )
-    INIT_SORT_PAIR_INDICES = OverloadTable(
-        init_sort_pair_indices, {d: [d, d, wp.array[d]] for d in _INDEX_DTYPES}
+    ISIN_LOOKUP_MASK = OverloadTable(
+        isin_lookup_mask,
+        {d: [wp.array[d], d, wp.int32, wp.array[wp.bool], wp.array[wp.bool]] for d in _KEY_DTYPES},
     )
     ISIN_LOOKUP_SORTED = OverloadTable(
         isin_lookup_sorted, {d: [wp.array[d], wp.array[d], wp.array[wp.bool]] for d in _KEY_DTYPES}

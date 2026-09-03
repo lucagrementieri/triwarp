@@ -228,6 +228,11 @@ def discrete_mean_curvature(
     wp.array[wp.float32]
         Length ``n`` discrete mean curvature measure on ``points.device``.
 
+    Raises
+    ------
+    ValueError
+        If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided.
+
     See Also
     --------
     [`discrete_gaussian_curvature`][triwarp.curvature.discrete_gaussian_curvature]
@@ -235,6 +240,9 @@ def discrete_mean_curvature(
     """
     device = points.device
     n_points = int(points.shape[0])
+    # The pairing check first, so a half-supplied pair raises whatever the mesh looks like; the
+    # resolve after the two guards, so an empty input does not allocate tables nothing reads.
+    tw.adjacency.require_paired_adjacency(face_adjacency, face_adjacency_edges)
     if n_points == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
 
@@ -242,9 +250,11 @@ def discrete_mean_curvature(
     if n_faces == 0:
         return wp.zeros(n_points, dtype=wp.float32, device=device)
 
-    face_adjacency, face_adjacency_edges = tw.adjacency.resolve_face_adjacency(
-        faces, face_adjacency, face_adjacency_edges, n_vertices=int(vertices.shape[0])
-    )
+    if face_adjacency is None:
+        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(
+            faces, return_edges=True, n_vertices=int(vertices.shape[0])
+        )
+    assert face_adjacency_edges is not None
 
     m = int(face_adjacency.shape[0])
     if m == 0:

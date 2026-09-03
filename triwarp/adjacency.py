@@ -4,8 +4,8 @@ Mesh face-adjacency graph: which faces share an edge, and what each adjacent pai
 [`face_adjacency`][triwarp.adjacency.face_adjacency] is the table every other function here reads:
 one row per edge-adjacent face pair. The rest are per-adjacency-row quantities over that table, all
 row-aligned with it, so a caller derives the pairs once and passes them in --
-[`resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency] is the helper that makes that
-optional argument concrete.
+[`require_paired_adjacency`][triwarp.adjacency.require_paired_adjacency] states the one rule those
+keywords carry, and is public because the functions taking the pair span three modules.
 
 - [`face_adjacency_unshared`][triwarp.adjacency.face_adjacency_unshared] gives the two opposite
   corners of each pair, and [`face_adjacency_angles`][triwarp.adjacency.face_adjacency_angles] the
@@ -147,73 +147,46 @@ def face_adjacency(
     return twt.as_array2d(adjacency, wp.int32)
 
 
-def resolve_face_adjacency(
-    faces: wp.array[wp.int32],
-    face_adjacency: twt.Array2dInt32 | None = None,
-    face_adjacency_edges: twt.Array2dInt32 | None = None,
-    *,
-    n_vertices: int | None = None,
-) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:
+def require_paired_adjacency(
+    face_adjacency: twt.Array2dInt32 | None, face_adjacency_edges: twt.Array2dInt32 | None
+) -> None:
     """
-    Return the face-adjacency pair, computed from ``faces`` only when the caller supplied none.
+    Raise unless a precomputed face-adjacency pair is either wholly given or wholly omitted.
 
-    The precompute-or-derive step shared by every function that takes an optional
-    ``(face_adjacency, face_adjacency_edges)`` pair: the two are useless apart, so they must be
-    passed together or not at all, and a caller that already has them should not pay for a second
-    [`face_adjacency`][triwarp.adjacency.face_adjacency] pass.
+    The contract behind every ``face_adjacency=`` / ``face_adjacency_edges=`` keyword in the
+    package: the two tables are row-aligned halves of one answer and are useless apart, so a
+    function that accepts them accepts both or neither. Public because the functions that take the
+    pair live in three modules -- here, [`triwarp.curvature`][triwarp.curvature] and
+    [`triwarp.validation`][triwarp.validation] -- and they must all reject the same call with the
+    same message; a caller that validates its own arguments before dispatching between them can
+    use it for that too.
+
+    **Call it before an empty-mesh guard, not after.** A half-supplied pair is a caller bug
+    whatever the mesh is, and the four wrappers that take the pair once disagreed about this, so
+    the same wrong call raised or returned an empty answer depending on the input. The *derivation*
+    goes the other way round -- below the guard -- because on an empty mesh
+    [`face_adjacency`][triwarp.adjacency.face_adjacency] would build two empty tables nothing reads.
 
     Parameters
     ----------
-    faces
-        Flat ``wp.int32`` triangle index buffer of length ``3 * n_faces``.
     face_adjacency
-        Precomputed ``(m, 2)`` face pairs sharing an edge. Computed from ``faces`` when omitted,
-        in which case ``face_adjacency_edges`` must be omitted too.
+        Candidate ``(m, 2)`` face pairs, or ``None``.
     face_adjacency_edges
-        Precomputed ``(m, 2)`` shared-edge endpoints, row-aligned with ``face_adjacency``.
-    n_vertices
-        Optional vertex count forwarded to [`face_adjacency`][triwarp.adjacency.face_adjacency] as
-        its row-hashing radix, skipping the reduction and host readback that would otherwise infer
-        it. Ignored when the tables are supplied, since then nothing is computed.
-
-    Returns
-    -------
-    face_adjacency : twt.Array2dInt32
-        The supplied pairs, or the ones computed from ``faces``.
-    face_adjacency_edges : twt.Array2dInt32
-        The supplied shared edges, or the ones computed from ``faces``.
+        Candidate ``(m, 2)`` shared-edge endpoints, or ``None``.
 
     Raises
     ------
     ValueError
-        If exactly one of the two is provided.
-
-    !!! note "The ``resolve_*`` pattern"
-        Three modules carry one of these -- turn an optional argument into the concrete value the
-        wrapper would have derived, so a caller who wants two functions to share the derived thing
-        can resolve it once and pass it to both. Each default is domain knowledge, so they cannot
-        share a module: [`sample.resolve_seed`][triwarp.sample.resolve_seed],
-        [`adjacency.resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency] and
-        [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid].
+        If exactly one of the two is given.
 
     See Also
     --------
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
-        The function this calls when nothing was supplied.
-    [`sample.resolve_seed`][triwarp.sample.resolve_seed]
-    [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid]
+        Produces the pair, with ``return_edges=True``.
+    [`face_adjacency_unshared`][triwarp.adjacency.face_adjacency_unshared]
+    [`face_adjacency_projections`][triwarp.adjacency.face_adjacency_projections]
+    [`face_adjacency_convex`][triwarp.adjacency.face_adjacency_convex]
     """
-    _require_paired_adjacency(face_adjacency, face_adjacency_edges)
-    if face_adjacency is None:
-        return tw.adjacency.face_adjacency(faces, return_edges=True, n_vertices=n_vertices)
-    assert face_adjacency_edges is not None
-    return face_adjacency, face_adjacency_edges
-
-
-def _require_paired_adjacency(
-    face_adjacency: twt.Array2dInt32 | None, face_adjacency_edges: twt.Array2dInt32 | None
-) -> None:
-    """Raise unless ``face_adjacency`` and ``face_adjacency_edges`` are both given or both not."""
     if (face_adjacency is None) != (face_adjacency_edges is None):
         raise ValueError(
             "face_adjacency and face_adjacency_edges must both be provided or both omitted"
@@ -299,9 +272,9 @@ def vertex_face_adjacency(
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
     n_vertices
         Number of vertices, i.e. the number of CSR rows. When ``None`` it is inferred from
-        ``faces`` with [`array.index_domain_size`][triwarp.array.index_domain_size], which costs one
-        host readback; pass it when the caller already knows it. Rows for vertices no face
-        references come out empty.
+        ``faces`` with [`array.index_bound`][triwarp.array.index_bound], which costs one host
+        readback; pass it when the caller already knows it. Rows for vertices no face references
+        come out empty.
 
     Returns
     -------
@@ -318,7 +291,7 @@ def vertex_face_adjacency(
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
-    row_count = tw.array.index_domain_size(faces) if n_vertices is None else int(n_vertices)
+    row_count = tw.array.index_bound(faces) if n_vertices is None else int(n_vertices)
 
     offsets = wp.zeros(row_count + 1, dtype=wp.int32, device=device)
     if n_faces == 0 or row_count == 0:
@@ -409,43 +382,36 @@ def face_adjacency_unshared(
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
     [`trimesh.graph.face_adjacency_unshared`][]
     """
-    # Not resolve_face_adjacency: the None branch below deliberately does *not* call
-    # face_adjacency, recovering both owning faces and the shared edge from the grouped edge
-    # indices instead. Only the pairing rule is shared.
-    _require_paired_adjacency(face_adjacency, face_adjacency_edges)
+    # The derive branch below deliberately does *not* call face_adjacency, recovering both
+    # owning faces and the shared edge from the grouped edge indices instead. Only the pairing
+    # rule is shared with the other wrappers that take this pair.
+    require_paired_adjacency(face_adjacency, face_adjacency_edges)
+    device = faces.device
+    # Both branches end in one launch over ``m`` adjacency rows writing one ``(m, 2)`` buffer, so
+    # the two differ only in the kernel and the table it reads. Resolving that first, and letting a
+    # single ``m == 0`` return cover an empty mesh, an empty adjacency and an empty supplied table
+    # alike, is what keeps the empty case to *one* allocation: deriving used to build an empty
+    # ``edge_groups`` only to size an empty output off it.
     if face_adjacency is None:
-        n_faces = int(faces.shape[0]) // 3
-        edge_groups = (
-            _edge_groups(faces, None, n_vertices)
-            if n_faces > 0
-            else twt.empty_2d((0, 2), wp.int32, device=faces.device)
-        )
-        m = int(edge_groups.shape[0])
-        unshared = twt.empty_2d((m, 2), wp.int32, device=faces.device)
-        if m > 0:
-            wp.launch(
-                kernel_adjacency.face_adjacency_unshared_from_edges,
-                dim=m,
-                inputs=[faces, edge_groups, unshared],
-                device=faces.device,
+        edge_groups = _edge_groups(faces, None, n_vertices) if int(faces.shape[0]) >= 3 else None
+        m = 0 if edge_groups is None else int(edge_groups.shape[0])
+        kernel, tables = kernel_adjacency.face_adjacency_unshared_from_edges, (edge_groups,)
+    else:
+        assert face_adjacency_edges is not None
+        if face_adjacency.shape[0] != face_adjacency_edges.shape[0]:
+            raise ValueError(
+                "face_adjacency and face_adjacency_edges row counts must match, "
+                f"got {face_adjacency.shape[0]} and {face_adjacency_edges.shape[0]}"
             )
-        return twt.as_array2d(unshared, wp.int32)
-    assert face_adjacency_edges is not None
-    if face_adjacency.shape[0] != face_adjacency_edges.shape[0]:
-        raise ValueError(
-            "face_adjacency and face_adjacency_edges row counts must match, "
-            f"got {face_adjacency.shape[0]} and {face_adjacency_edges.shape[0]}"
+        m = int(face_adjacency.shape[0])
+        kernel, tables = (
+            kernel_adjacency.face_adjacency_unshared,
+            (face_adjacency, face_adjacency_edges),
         )
-    m = int(face_adjacency.shape[0])
-    unshared = twt.empty_2d((m, 2), wp.int32, device=faces.device)
-    if m == 0:
-        return unshared
-    wp.launch(
-        kernel_adjacency.face_adjacency_unshared,
-        dim=m,
-        inputs=[faces, face_adjacency, face_adjacency_edges, unshared],
-        device=faces.device,
-    )
+
+    unshared = twt.empty_2d((m, 2), wp.int32, device=device)
+    if m > 0:
+        wp.launch(kernel, dim=m, inputs=[faces, *tables, unshared], device=device)
     return twt.as_array2d(unshared, wp.int32)
 
 
@@ -575,12 +541,22 @@ def face_adjacency_projections(
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
+    # The pairing check runs *before* the empty-mesh guard, so a caller who passed only one half
+    # of the pair is told about it whatever the mesh is -- the four wrappers that take this pair
+    # used to disagree about that, two validating first and two returning empty first. The
+    # *resolve* stays below the guard, because on an empty mesh it would allocate two empty tables
+    # nothing reads.
+    require_paired_adjacency(face_adjacency, face_adjacency_edges)
     if n_faces == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
 
-    face_adjacency, face_adjacency_edges = tw.adjacency.resolve_face_adjacency(
-        faces, face_adjacency, face_adjacency_edges, n_vertices=int(vertices.shape[0])
-    )
+    if face_adjacency is None:
+        # ``tw.adjacency.`` rather than a bare call: the parameter shadows the module-level
+        # ``face_adjacency`` it derives from.
+        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(
+            faces, return_edges=True, n_vertices=int(vertices.shape[0])
+        )
+    assert face_adjacency_edges is not None
 
     if face_adjacency_unshared is None:
         face_adjacency_unshared = tw.adjacency.face_adjacency_unshared(
@@ -651,6 +627,11 @@ def face_adjacency_convex(
         ``face_adjacency`` row. Empty when there are no faces or no adjacency
         pairs.
 
+    Raises
+    ------
+    ValueError
+        If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided.
+
     See Also
     --------
     [`face_adjacency_projections`][triwarp.adjacency.face_adjacency_projections]
@@ -658,12 +639,17 @@ def face_adjacency_convex(
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
+    require_paired_adjacency(face_adjacency, face_adjacency_edges)
     if n_faces == 0:
         return wp.empty(0, dtype=wp.bool, device=device)
 
-    face_adjacency, face_adjacency_edges = tw.adjacency.resolve_face_adjacency(
-        faces, face_adjacency, face_adjacency_edges, n_vertices=int(vertices.shape[0])
-    )
+    if face_adjacency is None:
+        # ``tw.adjacency.`` rather than a bare call: the parameter shadows the module-level
+        # ``face_adjacency`` it derives from.
+        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(
+            faces, return_edges=True, n_vertices=int(vertices.shape[0])
+        )
+    assert face_adjacency_edges is not None
 
     m = int(face_adjacency.shape[0])
     if m == 0:

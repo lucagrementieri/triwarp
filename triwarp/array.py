@@ -26,56 +26,96 @@ _ISIN_MASK_SIZE_FACTOR = 8
 SORT_ROWS_INSERTION_MAX_COLS = 8
 
 
-def arange(n: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32) -> wp.array:
+def arange(
+    start: int,
+    stop: int | None = None,
+    step: int = 1,
+    dtype: type[wp.Int] = wp.int32,
+    *,
+    device: wp.DeviceLike,
+) -> wp.array:
     """
-    Fill ``out[i] = i`` for ``i`` in ``[0, n)`` (``numpy.arange``).
+    Evenly spaced integers over the half-open interval ``[start, stop)`` (``numpy.arange``).
+
+    Called with a varying number of positional arguments, exactly as [`numpy.arange`][]:
+    ``arange(stop, device=...)`` runs from ``0``, ``arange(start, stop, device=...)`` from
+    ``start``, and ``arange(start, stop, step, device=...)`` spaces the values by ``step``. A
+    ``step`` may be negative, in which case the interval runs downwards.
 
     Parameters
     ----------
-    n
-        Number of elements; must be non-negative.
-    device
-        Warp device for the result.
+    start
+        Start of the interval, included. Read as ``stop`` when ``stop`` is omitted, in which case
+        the interval starts at ``0``.
+    stop
+        End of the interval, excluded.
+    step
+        Spacing between consecutive values, so ``out[i + 1] - out[i] == step``. Must be non-zero.
     dtype
-        Integer dtype of the result. Must be able to represent ``n - 1``.
+        Integer dtype of the result. Must be able to represent every value produced.
+    device
+        Warp device for the result. Keyword-only, unlike the first three, so the positional
+        arguments stay [`numpy.arange`][]'s; required, because nothing in this package allocates
+        onto Warp's ambient current device.
 
     Returns
     -------
     wp.array
-        Length-``n`` array of consecutive indices on ``device``.
+        1-D array of ``max(0, ceil((stop - start) / step))`` values on ``device``.
 
     Raises
     ------
     ValueError
-        If ``n`` is negative, or ``n - 1`` does not fit in ``dtype``.
+        If ``step`` is zero, or the first or last value does not fit in ``dtype``.
+
+    See Also
+    --------
+    [`arange_repeat`][triwarp.array.arange_repeat]
+        The same range with each value repeated a fixed number of times.
+    [`numpy.arange`][]
     """
     dtype = _ensure_int_dtype(dtype)
-    if n < 0:
-        raise ValueError(f"n must be non-negative, got {n}")
+    if stop is None:
+        start, stop = 0, start
+    if step == 0:
+        raise ValueError("step must be non-zero")
+    # ``ceil((stop - start) / step)`` in integers, correct for either sign of ``step``: Python's
+    # ``//`` floors, so negating both sides of the division ceils.
+    n = max(0, -((start - stop) // step))
     if n > 0:
-        _check_int_fits(dtype, n - 1, "n")
+        _check_int_fits(dtype, start, "start")
+        _check_int_fits(dtype, start + (n - 1) * step, "stop")
     out = wp.empty(n, dtype=dtype, device=device)
-    if n > 0:
-        wp.launch(kernel_array.INIT_RANGE[dtype], dim=n, inputs=[out], device=device)
+    if n == 0:
+        return out
+    if start == 0 and step == 1:
+        wp.launch(kernel_array.ARANGE[dtype], dim=n, inputs=[out], device=device)
+    else:
+        wp.launch(
+            kernel_array.ARANGE_AFFINE[dtype],
+            dim=n,
+            inputs=[_int_scalar(dtype, start), _int_scalar(dtype, step), out],
+            device=device,
+        )
     return out
 
 
-def arange_step(
-    count: int, step: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32
+def arange_repeat(
+    count: int, repeats: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
     """
-    Fill ``out[i] = i * step`` (``numpy.arange(0, count * step, step)``).
+    Fill ``out[i] = i // repeats`` (``numpy.repeat`` of an index range).
 
     Parameters
     ----------
     count
         Number of elements; must be non-negative.
-    step
-        Stride between consecutive values; must be non-negative.
+    repeats
+        How many consecutive entries share an index; must be positive.
     device
         Warp device for the result.
     dtype
-        Integer dtype of the result. Must be able to represent ``(count - 1) * step``.
+        Integer dtype of the result.
 
     Returns
     -------
@@ -85,29 +125,35 @@ def arange_step(
     Raises
     ------
     ValueError
-        If ``count`` or ``step`` is negative, or the largest value does not fit in ``dtype``.
+        If ``count`` is negative, ``repeats`` is not positive, or the largest value does not fit
+        in ``dtype``.
+
+    See Also
+    --------
+    [`arange`][triwarp.array.arange]
+        The range this repeats.
+    [`numpy.repeat`][]
     """
     dtype = _ensure_int_dtype(dtype)
     if count < 0:
         raise ValueError(f"count must be non-negative, got {count}")
-    if step < 0:
-        raise ValueError(f"step must be non-negative, got {step}")
+    if repeats <= 0:
+        raise ValueError(f"repeats must be positive, got {repeats}")
     if count > 0:
-        _check_int_fits(dtype, (count - 1) * step, "count * step")
-        _check_int_fits(dtype, step, "step")
+        _check_int_fits(dtype, (count - 1) // repeats, "count // repeats")
     out = wp.empty(count, dtype=dtype, device=device)
     if count > 0:
         wp.launch(
-            kernel_array.INIT_RANGE_STEP[dtype],
+            kernel_array.ARANGE_REPEAT[dtype],
             dim=count,
-            inputs=[_int_scalar(dtype, step), out],
+            inputs=[_int_scalar(dtype, repeats), out],
             device=device,
         )
     return out
 
 
 def sort_pair_indices(
-    n: int, fill_value: int, device: str, *, dtype: type[wp.Int] = wp.int32
+    n: int, fill_value: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
     """
     Fill ``[0, 1, ..., n-1, fill_value, ..., fill_value]`` (length ``2 * n``).
@@ -149,55 +195,9 @@ def sort_pair_indices(
     out = wp.empty(2 * n, dtype=dtype, device=device)
     if n > 0:
         wp.launch(
-            kernel_array.INIT_SORT_PAIR_INDICES[dtype],
+            kernel_array.SORT_PAIR_INDICES[dtype],
             dim=2 * n,
             inputs=[_int_scalar(dtype, n), _int_scalar(dtype, fill_value), out],
-            device=device,
-        )
-    return out
-
-
-def repeat_range(
-    count: int, repeats: int, device: str, *, dtype: type[wp.Int] = wp.int32
-) -> wp.array:
-    """
-    Fill ``out[i] = i // repeats`` (``numpy.repeat`` of an index range).
-
-    Parameters
-    ----------
-    count
-        Number of elements; must be non-negative.
-    repeats
-        How many consecutive entries share an index; must be positive.
-    device
-        Warp device for the result.
-    dtype
-        Integer dtype of the result.
-
-    Returns
-    -------
-    wp.array
-        Length-``count`` array on ``device``.
-
-    Raises
-    ------
-    ValueError
-        If ``count`` is negative, ``repeats`` is not positive, or the largest value does not fit
-        in ``dtype``.
-    """
-    dtype = _ensure_int_dtype(dtype)
-    if count < 0:
-        raise ValueError(f"count must be non-negative, got {count}")
-    if repeats <= 0:
-        raise ValueError(f"repeats must be positive, got {repeats}")
-    if count > 0:
-        _check_int_fits(dtype, (count - 1) // repeats, "count // repeats")
-    out = wp.empty(count, dtype=dtype, device=device)
-    if count > 0:
-        wp.launch(
-            kernel_array.INIT_REPEAT_INDEX[dtype],
-            dim=count,
-            inputs=[_int_scalar(dtype, repeats), out],
             device=device,
         )
     return out
@@ -241,9 +241,8 @@ def pack_1d_arrays(
         Keep ``False`` for a read-only result. ``arrays`` that are already consecutive non-empty
         views of one buffer -- what [`split`][triwarp.array.split] returns with ``copy=False`` --
         are then handed back as that buffer's span instead of being copied into a new one, so the
-        ``split`` round trip costs nothing at all: measured at **2.505 ms of ``loop_perimeters``'
-        2.633 ms on ``dragon``**, 407 ``warp.copy`` launches to move 17 kB. The default copies, so
-        writing into ``flat`` is safe; with ``copy=False`` such a write reaches the segments.
+        ``split`` round trip costs nothing at all. The default copies, so writing into ``flat`` is
+        safe; with ``copy=False`` such a write reaches the segments.
 
     Returns
     -------
@@ -410,9 +409,16 @@ def _pack_segments(
     Validate rank-1 segments and copy them into one contiguous buffer.
 
     The shared body of [`pack_1d_arrays`][triwarp.array.pack_1d_arrays] and
-    [`concatenate`][triwarp.array.concatenate], which differ only in whether the caller wants the
-    segment offsets back as a device array. Returns them as a Python list so ``concatenate`` pays
-    nothing for the offsets it discards.
+    [`concatenate`][triwarp.array.concatenate] -- its only two callers -- which differ only in
+    whether the caller wants the segment offsets back as a device array.
+
+    **The offsets come back as a host list, and only ``pack_1d_arrays`` converts.** They are
+    computed on the host in the first place, from each segment's ``shape``, so a device array is
+    strictly an extra ``wp.array(...)`` upload (~16 us of host time, flat in the segment count) --
+    and ``concatenate`` discards the offsets entirely, taking ``[0]`` of this return. Converting
+    here would make one of the two callers pay for a buffer it never reads; the conversion
+    therefore sits in the caller that wants it, which is also the only place the *convention* for
+    the pair (values first) is stated.
 
     With ``copy=False`` the result may be one of the inputs' own storage rather than a fresh
     buffer -- see [`_tiled_span`][triwarp.array._tiled_span] for when, and for why the choice
@@ -644,10 +650,13 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     -----
     Rows no wider than ``SORT_ROWS_INSERTION_MAX_COLS`` are sorted by a per-row insertion sort (one
     thread per row); wider rows fall back to a segmented radix sort. The narrow path is not a
-    micro-optimization: ``segmented_sort_pairs`` pays a fixed cost per *segment*, so sorting a
-    million two-element rows with it cost ~183 ms against ~0.1 ms for the compare-and-swap the width
-    actually needs. Every in-library caller sorts vertex pairs or triangle corners.
+    micro-optimization: ``segmented_sort_pairs`` pays a fixed cost per *segment*, which for the
+    two- and three-wide rows every in-library caller sorts dominates the comparison work by orders
+    of magnitude.
     """
+    # The narrow path's margin, for whoever considers deleting it: sorting a million two-element
+    # rows through ``segmented_sort_pairs`` cost ~183 ms against ~0.1 ms for the compare-and-swap
+    # the width actually needs.
     n = data.size
     n_rows, n_cols = int(data.shape[0]), int(data.shape[1])
     if n_rows == 0 or n_cols < 2:
@@ -664,7 +673,7 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     data_buffer = wp.empty(n * 2, dtype=data.dtype, device=data.device)
     wp.copy(data_buffer, data, count=n)
     indices_buffer = sort_pair_indices(n, -1, data.device)
-    segment_start_indices = arange_step(n // n_cols + 1, n_cols, data.device)
+    segment_start_indices = arange(0, (n // n_cols + 1) * n_cols, n_cols, device=data.device)
     wp.utils.segmented_sort_pairs(
         data_buffer, indices_buffer, n, segment_start_indices=segment_start_indices
     )
@@ -769,7 +778,7 @@ def index_sparse(
             data = astype(data, dtype)
 
     n_cols, n_repeats = indices.shape
-    cols = repeat_range(n_cols * n_repeats, n_repeats, indices.device)
+    cols = arange_repeat(n_cols * n_repeats, n_repeats, indices.device)
     return wps.bsr_from_triplets(
         n_rows,
         indices.shape[0],
@@ -780,7 +789,9 @@ def index_sparse(
     )
 
 
-def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.bool]:
+def isin(
+    elements: twt.ArrayNd, test_elements: wp.array[wp.Int], *, max_index: int | None = None
+) -> wp.array[wp.bool]:
     """
     Test whether each element appears in ``test_elements`` (``numpy.isin`` for integers).
 
@@ -801,6 +812,14 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
         strategies looks at the shape.
     test_elements
         1D array of values to test membership against, of the same dtype as ``elements``.
+    max_index
+        Optional exclusive upper bound on the values of **both** arrays, which must then be
+        non-negative -- the same escape hatch, and the same shape of it, as
+        [`hash_indices_rows`][triwarp.grouping.hash_indices_rows]' ``max_index``. Supplying it
+        pins the strategy to the direct-index table and skips the two ``triwarp.reduce.minmax``
+        reductions that would otherwise infer the span, and with them **two host readbacks that
+        serialise the device pipeline** -- worth roughly half the call. Must be positive. Pass it
+        wherever the bound is structural, as it is for any buffer of mesh vertex indices.
 
     Returns
     -------
@@ -812,6 +831,15 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
     ------
     TypeError
         If either array is not an integer dtype, or the two dtypes differ.
+    ValueError
+        If ``max_index`` is not positive.
+
+    Warnings
+    --------
+    A ``max_index`` smaller than the true maximum is a wrong answer, not a raise: a value at or
+    above it reads as absent. Unlike
+    [`hash_indices_rows`][triwarp.grouping.hash_indices_rows]' bound it is at least memory-safe,
+    because the table lookup range-guards each slot.
 
     See Also
     --------
@@ -825,8 +853,16 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
     [`sortable_dtype`][triwarp.typing.sortable_dtype] rule) before either strategy runs: Warp's
     radix sort does not accept them, and neither does the tiled min/max reduction the span needs.
 
-    Two host readbacks, one min/max reduction per input, which is what selects the strategy and
-    anchors the table.
+    There is no ``assume_unique``, and it is worth saying why rather than leaving its absence to
+    look like an omission: [`numpy.isin`][] gains from one because the ``numpy.in1d`` sort path
+    behind it calls [`numpy.unique`][] on both arrays first, and neither strategy here dedups
+    anything -- the table is an idempotent scatter and the binary search is over the sorted keys as
+    given. Duplicates on either side are already free. What the two
+    strategies *do* pay for is inferring the value span, which is why the guarantee this takes is a
+    bound rather than a uniqueness claim.
+
+    Without ``max_index``: two host readbacks, one min/max reduction per input, which is what
+    selects the strategy and anchors the table.
     """
     device = elements.device
     dtype = elements.dtype
@@ -836,6 +872,9 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
         )
     if not wp.types.type_is_int(dtype) or dtype == wp.bool:
         raise TypeError(f"isin requires an integer dtype, got {dtype}")
+
+    if max_index is not None and max_index <= 0:
+        raise ValueError(f"max_index must be positive, got {max_index}")
 
     k = int(test_elements.shape[0])
     if k == 0 or int(elements.size) == 0:
@@ -850,6 +889,13 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
         elements_flat = astype(elements_flat, wide)
         test_elements = astype(test_elements, wide)
 
+    if max_index is not None:
+        # A supplied bound is the whole point of the keyword: it is what the two reductions below
+        # would have inferred, so it also settles the strategy -- a caller who knows the values are
+        # dense mesh indices is describing exactly the table's best case, and honouring a
+        # ``_ISIN_MASK_SIZE_FACTOR`` test here would spend the readback to reach the same branch.
+        return _reshaped(_isin_lookup_mask(elements_flat, test_elements, max_index, 0), elements)
+
     lo_elements, hi_elements = tw.reduce.minmax(elements_flat)
     lo_test, hi_test = tw.reduce.minmax(test_elements)
     offset = min(int(lo_elements), int(lo_test))
@@ -859,7 +905,12 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
     else:
         out_flat = _isin_lookup_sorted(elements_flat, test_elements)
 
-    return out_flat if is_flat else out_flat.reshape(elements.shape)
+    return _reshaped(out_flat, elements)
+
+
+def _reshaped(out_flat: wp.array[wp.bool], elements: twt.ArrayNd) -> wp.array[wp.bool]:
+    """Restore ``elements``' shape on a per-element answer computed over its flattened view."""
+    return out_flat if int(elements.ndim) == 1 else out_flat.reshape(elements.shape)
 
 
 def _isin_lookup_mask(
@@ -868,14 +919,23 @@ def _isin_lookup_mask(
     # The table is anchored at ``offset`` (the global minimum over both inputs) rather than at zero,
     # so it holds negative values and stays span-sized instead of max-sized. Anchoring at zero
     # instead is a *silent wrong answer* for negative input: ``mark_membership_mask`` drops the
-    # negative test values as out of range, so they read back as absent.
+    # negative test values as out of range, so they read back as absent. A caller-supplied
+    # ``max_index`` anchors at zero precisely because it asserts the values are non-negative.
+    #
+    # The element side is one guarded launch rather than a shift plus a Python-scope gather --
+    # see ``kernels/array.py::isin_lookup_mask`` for what that buys and why the guard is required.
+    #
+    # Measured on an RTX 5090, Warp 1.17, interleaved, min of 7 rounds of 100 calls, values equal
+    # to ``numpy.isin`` throughout. The fused element side is worth **1.22x** on the inferred path
+    # (348.5 -> 285.6 us at 60k elements over a 20k table), and the ``max_index`` it makes safe is
+    # worth **2.74-2.87x** on top -- 285.6 -> 99.4 us at 60k, 285.4 -> 100.8 at 200k, 289.3 ->
+    # 105.5 at 1M, flat because what it removes is two reductions and two host readbacks rather
+    # than anything proportional to the data (48-54 % of the call at every size probed).
     device = elements_flat.device
     dtype = elements_flat.dtype
     anchor = dtype(offset)
     test_slots = wp.empty(int(test_elements.shape[0]), dtype=wp.int32, device=device)
     wp.map(kernel_array.shifted_index, test_elements, anchor, out=test_slots)
-    element_slots = wp.empty(int(elements_flat.shape[0]), dtype=wp.int32, device=device)
-    wp.map(kernel_array.shifted_index, elements_flat, anchor, out=element_slots)
 
     membership_wp = wp.zeros(span, dtype=wp.bool, device=device)
     wp.launch(
@@ -884,8 +944,14 @@ def _isin_lookup_mask(
         inputs=[test_slots, wp.int32(span), membership_wp],
         device=device,
     )
-    # ``membership_wp[element_slots]`` gathers the boolean membership flag per element.
-    return gather(membership_wp, element_slots)
+    out_mask = wp.empty(int(elements_flat.shape[0]), dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_array.ISIN_LOOKUP_MASK[dtype],
+        dim=int(elements_flat.shape[0]),
+        inputs=[elements_flat, anchor, wp.int32(span), membership_wp, out_mask],
+        device=device,
+    )
+    return out_mask
 
 
 def _isin_lookup_sorted(
@@ -943,7 +1009,7 @@ def flatnonzero(values: wp.array[wp.bool] | wp.array[wp.Scalar]) -> wp.array[wp.
     See Also
     --------
     [`indices_to_mask`][triwarp.array.indices_to_mask]
-    [`mask_to_index_map`][triwarp.array.mask_to_index_map]
+    [`mask_to_compact_ranks`][triwarp.array.mask_to_compact_ranks]
     [`numpy.flatnonzero`][]
     """
     if int(values.ndim) != 1:
@@ -1079,9 +1145,9 @@ def astype(values: twt.ArrayNd, dtype: type) -> wp.array:
     return out
 
 
-def index_domain_size(indices: twt.IntArray) -> int:
+def index_bound(indices: twt.IntArray) -> int:
     """
-    Size of the domain an index buffer addresses, as ``max(indices) + 1``.
+    Exclusive upper bound on an index buffer's values, as ``max(indices) + 1``.
 
     For a face or edge buffer this is the vertex count, and it follows libigl's
     ``F.maxCoeff() + 1`` convention: one past the largest referenced index, so a mesh with trailing
@@ -1090,7 +1156,10 @@ def index_domain_size(indices: twt.IntArray) -> int:
     only the 4-byte maximum back to the host.
 
     Named for the index buffer rather than for vertices because that is all it sees: it is
-    index arithmetic, and nothing about it is geometric.
+    index arithmetic, and nothing about it is geometric. Named a *bound* rather than a size
+    because that is what a consumer wants it for -- to allocate a table the indices address, or to
+    hand [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] its radix -- and because a mesh
+    with trailing unreferenced vertices has more of them than this reports.
 
     Parameters
     ----------
@@ -1150,7 +1219,7 @@ def indices_to_mask(
     return mask
 
 
-def mask_to_index_map(
+def mask_to_compact_ranks(
     mask: wp.array[wp.bool], *, invert: bool = False
 ) -> tuple[wp.array[wp.int32], int]:
     """
@@ -1175,7 +1244,7 @@ def mask_to_index_map(
 
     Returns
     -------
-    index_map : wp.array[wp.int32]
+    compact_ranks : wp.array[wp.int32]
         Length-``n`` array on ``mask.device``: an exclusive scan of the (optionally inverted) mask,
         so ``index_map[i]`` is the compact 0-based rank of element ``i`` among the selected
         entries at or before it (meaningful only where element ``i`` is itself selected).
@@ -1233,17 +1302,19 @@ def counts_to_offsets(
     ``geodesic_walk.trace_from_vertex``, and every ``segmented_sort_pairs`` caller). Both come
     out of here, so no caller has to append the terminator afterwards.
 
-    **This is for callers that want ``total``**, which it reads back unconditionally -- about
-    0.1 ms of host synchronization. A caller that only needs the offsets and already knows its
-    buffer size should keep the open-coded ``wp.zeros(n + 1)`` plus a scan into ``[1:]``, as
+    **This is for callers that want ``total``**, which it reads back unconditionally, and a host
+    readback serialises the device pipeline. A caller that only needs the offsets and already knows
+    its buffer size should keep the open-coded ``wp.zeros(n + 1)`` plus a scan into ``[1:]``, as
     ``halfedge.vertex_one_rings`` and ``adjacency.vertex_face_adjacency`` do: both size their
     payload from ``3 * n_faces`` and would gain a synchronization they currently do not have.
 
     See Also
     --------
     [`flatnonzero`][triwarp.array.flatnonzero]
-    [`mask_to_index_map`][triwarp.array.mask_to_index_map]
+    [`mask_to_compact_ranks`][triwarp.array.mask_to_compact_ranks]
     """
+    # The unconditional readback of ``total`` is ~0.1 ms of host synchronization -- the number
+    # behind the Notes section's advice to open-code the scan when only the offsets are wanted.
     n = int(counts.shape[0])
     device = counts.device
     if n == 0:

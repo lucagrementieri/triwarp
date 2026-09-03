@@ -686,6 +686,35 @@ Kernels in `triwarp/kernels/` keep `wp.array2d[dtype]` unchanged. Optional 2D ar
   function's output convention is a smell to be fixed at the producer.
 - **Warp raises on a zero-length slice** (`RuntimeError: Invalid indexing in slice: 20:20:1`), so a
   trailing-mask `fill_` needs an `if stop > start` guard where a NumPy version silently no-opped.
+- **A buffer whose initial value matters is *allocated holding it* — never `wp.empty` followed by
+  `fill_` / `zero_`.** One statement instead of two, and no window in which the buffer holds
+  garbage. `wp.zeros`, `wp.full(n, value, dtype=..., device=...)`, and at rank 2
+  `twt.as_array2d(wp.full((rows, cols), value, ...), dtype)` — there is deliberately no
+  `twt.full_2d`, because that spelling already appears at the one site that needs it and §4.2
+  forbids the speculative helper. **The reason is legibility, not speed**: measured on an RTX 5090,
+  Warp 1.17, 200 calls between two syncs, min of 7 — `wp.empty` plus `fill_` against `wp.full` is
+  **0.96-1.00x** at 1 024 / 200 000 / 4 000 000 elements, rank 1 and rank 2 alike, so the two-call
+  form is if anything a few tenths of a microsecond *cheaper* and the choice is entirely about how
+  the code reads.
+    - `wp.empty` stays correct — and is the rule — where **every** element is written before it is
+      read (the bullet above). What this rule forbids is allocating uninitialized and then
+      initializing.
+    - **Where the branches initialize differently, allocate inside each branch.**
+      `energies.laplacian_smoothness` held two `wp.empty` buffers above a three-way `method`
+      branch that filled them, launched into them, or half-zeroed them; each branch now allocates
+      what it will hold. A shared allocation above a branch that initializes reads as one thing
+      and is as many things as there are branches.
+    - **A *partial* write into a buffer another writer already filled is not this pattern.** Ten
+      `arr[a:b].fill_(...)` sites carry a running state counter, a padded triplet index, or a
+      mask whose head a kernel wrote; those stay. The scan that finds the real thing keys on a
+      whole-buffer `fill_` / `zero_` on a name assigned from `wp.empty` / `twt.empty_*` within a
+      few lines — measured 8 sites, all converted — and a second pass keying on a *slice* target
+      found one more (`boundary._loop_owner_labels`' terminator), so run both.
+    - There is **no** Python-scope scalar write to pair with `_device.read_scalar`, and asking for
+      one is usually the wrong question: `arr[k] = v` raises `TypeError: 'array' object does not
+      support item assignment` on both devices (Warp 1.17) and `arr[k : k + 1].fill_(v)` is
+      already the primitive such a helper would wrap. The site that prompted the question wanted
+      the *allocation* to carry the value instead, after which the write disappears.
 
 ### 3.4 Python-scope gather indexing (prefer over trivial gather kernels)
 
@@ -960,6 +989,34 @@ found them: §12.1.
   `boundary.boundary_loop` and `boundary.boundary_loops` meant "the longest one" and "all of them";
   the singular is now `longest_boundary_loop`. Look for this whenever a plural is added next to an
   existing singular.
+- **A wrapper whose whole device side is one kernel nobody else launches shares that kernel's
+  name.** `array.sort_pair_indices` launched `init_sort_pair_indices` and `array.arange` launched
+  `init_range`; the `init_` prefix says "this kernel initializes a buffer", which is true of every
+  fill kernel in the tree and therefore says nothing, so all it did was stop `grep sort_pair_indices`
+  from finding both halves at once. Both are renamed, and the affix classes to reject are
+  `init_` / `do_` / `compute_` / `run_` / `make_` / `kernel_` / `_impl` / `_inner`.
+  **Do not apply this literally — it is a rule about *filler*, and a literal scan is 129 rows of
+  which one was the defect.** Measured: an AST scan over `triwarp/` pairing each wrapper with the
+  kernels it references, restricted to wrappers referencing exactly one kernel that no other
+  wrapper references, flags 129 sites; narrowing to "the two names differ only by a filler affix or
+  a plural" leaves **6**, and every one of those six is *informative*:
+    - a **plural** because the kernel is batched over what the wrapper answers for one thing
+      (`geodesic_walk.trace_from_face` → `trace_from_faces`);
+    - **`_pass` / `_step`** because the kernel is one iteration of a loop the wrapper runs
+      (`graph.shortest_path_envelope` → `shortest_path_envelope_pass`, `smoothing.relax_approx` →
+      `relax_approx_step`);
+    - **`finalize_`** because the kernel is the second half of a two-stage reduction whose first
+      half is another wrapper (`points.fit_line` / `fit_plane` / `principal_axes`).
+
+  Two further exemptions the 129 make obvious. A kernel in a **shared kernel library** (§3.1's four)
+  keeps that library's vocabulary — `vertices.vertex_defects` launches `scatter.scatter_sum_scalar`
+  and must, because the name has to read correctly for the other ten importers. And a kernel that
+  computes one *ingredient* of the wrapper's answer keeps the ingredient's name, the rest of the
+  wrapper being host-side index arithmetic: `remesh.subdivide` → `compute_midpoints` is right about
+  the midpoints and would be wrong called `subdivide`. So the question to ask is not "do the names
+  match" but **"does the kernel's name carry information the wrapper's name does not"** — and if it
+  does not, the kernel takes the wrapper's name. Re-run the scan
+  (`plans/`-local, ~60 lines of `ast`) rather than re-deriving the 129.
 - **A tuning choice is a keyword, not a name — and if the kernel already branches on it, the Python
   layer is the only place it doubled.** `neighbors` exposed each ball and nearest query twice, once
   per accelerator, for eight names covering four operations: identical arguments, identical returns,
@@ -1013,6 +1070,22 @@ found them: §12.1.
 - **A guard must encode a real limitation.** When the implementation is naturally rank- or
   dtype-agnostic — a flatten/reshape, a generic `@wp.func` — drop the `ensure_ndim` cap and widen the
   annotation instead of validating a restriction that is not there.
+- **When a function mirrors a NumPy one, mirror its *positional* signature too, and make `device`
+  keyword-only.** `array.arange(n, device)` / `arange_step(count, step, device)` were two functions
+  covering the one NumPy call whose whole convention is its positional arity —
+  `arange(stop)` / `arange(start, stop)` / `arange(start, stop, step)` — so a caller who knew
+  `numpy.arange` had to learn a second spelling and a reader could not tell `arange_step(6, 3)`
+  from `arange(6, 3)`. They are now one `arange(start, stop=None, step=1, dtype=wp.int32, *,
+  device)`, which is `numpy.arange`'s signature with `device` promoted from optional to required
+  (nothing here allocates onto Warp's ambient device, §3.3). Two things that fall out:
+    - **A required keyword-only `device` breaks every positional call site, and the residual set
+      must be re-derived from the *new* name** (§4.4). A `tw.array.arange(` grep found 15 and
+      missed 4 more reached through `from triwarp.array import arange`; those failed at runtime,
+      not at lint or type-check time.
+    - **Keep the specialised kernel for the common case.** One `start + i * step` kernel would be
+      the tidy answer and costs two more marshalled arguments (~2 µs of a ~26 µs 200k-element
+      call, §13.1) on the only path any in-repo caller takes, so `arange` dispatches: the
+      zero-argument `arange` kernel when `start == 0 and step == 1`, `arange_affine` otherwise.
 - **No speculative generality.** Add an axis, parameter, or mode only when an in-repo call site needs
   it. The absence of a caller is a reason not to build it, not a gap to fill.
 - **No near-duplicate wrappers.** Two public functions that are the same algorithm with different
@@ -1097,6 +1170,24 @@ a targeted per-file run does not — a rename is not done until the whole suite 
   re-verification notes go. **A stale `pytest.skip` is worse than a stale comment** — the comment
   misinforms, the skip deletes a branch, and on a CUDA box the deleted branch is the one nobody runs;
   16 skips for one long-fixed `cg` bug survived because check 9 originally scanned `triwarp/` only.
+- **Check 5 has a `_`-prefixed-module escape, and reaching for it is usually the wrong of two
+  answers.** The check reads only public wrapper modules (`scan_package` skips `kernels/` and any
+  path component starting with `_`) and only `_`-prefixed *names*, so a shared wrapper-side helper
+  with a plain name inside `triwarp/_thing.py` is invisible to it — which is what `_device.py` is.
+  But a new `_*.py` holding one helper is a module created to dodge a check, and the check's premise
+  is sound: a shared *operation* wants a home, not a hiding place. Worked through on
+  `adjacency.resolve_face_adjacency`, which review wanted off the public surface while
+  `curvature` and `validation` both called it. Moving it to `triwarp/_adjacency.py` passed every
+  gate and was still reverted, because splitting it showed which half was actually shared: the
+  **rule** (both tables or neither) is a contract three modules must enforce identically, and is
+  now the public `adjacency.require_paired_adjacency`; the **derivation** is one
+  `face_adjacency(return_edges=True)` call that each caller writes inline with its own
+  `n_vertices`. So when a private cross-module helper has to stop being public, first ask whether
+  it is really one operation — a validator plus a one-line default is two, and only one of them
+  needs to be reachable. Two knock-ons either way: every `[`x`][triwarp.mod.x]` cross-reference to
+  a name that moves into a `_*.py` breaks `mkdocs build --strict` (a private module generates no
+  page), and a *newly* public validator needs its own `Raises` block (check 11) and a test that
+  covers the accepting cases as well as the raise.
 - **Check 10**: an allocation with no `device=` (§3.3). **Check 11**: a public function that raises
   with no `Raises` block (§4.3).
 - **Check 12**: a fenced ```python docstring example that does not run. The one static check that is
@@ -1202,6 +1293,28 @@ stays — 32 of the 49 wrapper modules mention a reference library somewhere in 
 line down, in `Notes` or `See Also`. Enforced by check 1, whose allowlist is `mesh.py`'s "mirrors
 `trimesh.Trimesh`" alone. Check 3 forbids a module summary ending in `(Warp)` or `on NVIDIA Warp`:
 the whole package is Warp.
+
+**No measured timing belongs in a public function's docstring.** Not a millisecond figure, not a
+speedup ratio, not a launch or byte count — those are facts about *this* box, *this* Warp version
+and *this* mesh, and mkdocstrings publishes them as though they were part of the contract, where a
+reader on other hardware reads a number that is simply false for them. The docstring keeps the
+*claim* the number supports, in terms a caller can act on: "roughly doubles the call", "a host
+readback serialises the device pipeline", "the fixed per-segment cost dominates at these widths".
+
+**Moving the number, not deleting it.** §9 requires a measured result to live at its site, so the
+figure goes into a `#` comment in the same function's body — or into the private helper that
+actually pays it, which is usually better, because two public forms sharing one cost then carry the
+sentence once. Numbers stay welcome in private helpers' docstrings, in `kernels/` (nothing there
+renders), in `benchmarks/` group docstrings and in Part II here.
+
+The scan is an `ast` walk over `triwarp/`'s public functions matching
+`\d[\d.,]*\s*(ms|us|µs|ns|GB|MB|kB)\b` or `\b\d+(\.\d+)?x\b` against each docstring — a plain
+grep for `ms` is unusable, and the same regex over *prose* words (`measured`, `faster`,
+`benchmark`) returns 35 kB of legitimate behavioural text, so key on the *quantity*.
+**Measured 2026-09-03: 50 public functions across 30 modules, 174 lines.** The three modules
+reviewed that day (`adjacency`, `array`, `boundary`) are clean; **45 functions across 24 modules are
+not yet converted** — `linalg` 5, `proximity` 4, then `voxels` / `selection` / `remesh` / `holes` 3
+each — and the list regenerates from the scan rather than being maintained here.
 
 Docstrings stay **NumPy-style** (`Parameters`/`Returns`/`Raises`/`See Also`), but cross-references use
 **mkdocs-autorefs** link syntax, not Sphinx roles — Sphinx interpreted-text roles (`:func:`, `:attr:`,
@@ -3129,6 +3242,15 @@ The `nnz`-is-a-capacity rule and its consequences are §3.7. Three further behav
   parity test would need a tolerance instead of an equality.
 - **`wp.norm_huber`** is the Huber *norm* where `registration.robust_weight` needs the IRLS *weight*
   `ρ'(r)/r`.
+- **`wp.tile_arange`** cannot express `array.arange` and loses where it can. Its bounds are read
+  at *codegen* — `tile_arange_value_func` computes the tile length from them — so a runtime
+  `block * TILE` start is a `TypeError` at parse (`unsupported operand type(s) for -: 'Var' and
+  'Var'`), and the only expressible form is a constant tile shifted by a
+  `tile_map(wp.add, ..., tile_broadcast(tile(start)))`. Measured that way against the plain
+  `out[i] = i` kernel, values identical, `block_dim=256`, min of 9 interleaved reps of 100
+  launches: **0.85x at 1 024, 0.91x at 200 192, 0.998x at 13 999 872**. A range fill is a pure
+  streaming store with no reuse for a tile to exploit, and §13.1 already prices the whole
+  200k-element call as launch- and allocation-bound.
 - **`wp.volume_voxel_count`** is a capacity (§3.7).
 - **The `dense_chol` / `dense_subs` / `dense_solve` family** is `hidden: True` / `doc: "WIP"`, and it
   takes `wp.array[float32]` where the caller holds a `wp.spatial_matrix` in registers — a 2x loss
@@ -4544,6 +4666,23 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   transferable part: it fell out of *registering the float overloads*** (§2.5), because writing the
   registration meant asking what dtypes the wrapper's dispatch reaches, and then launching one. A
   dtype nothing had ever knowingly run is a dtype nothing had ever checked.
+- **`array.isin` spent 48-54 % of every call inferring the value span, and the guarantee that
+  removes it is a *bound*, not `assume_unique`.** Stage-timed on an RTX 5090, Warp 1.17: the two
+  `reduce.minmax` reductions and their two host readbacks are **169-181 µs of a 315-350 µs call**,
+  flat from 60k to 1M elements and identical on the dense and sparse branches, while
+  `_sorted_copy` is 30 %. `assume_unique` — either side — buys **nothing**, and the reason is worth
+  keeping: `numpy.isin` gains from one only because `numpy.in1d`'s sort path calls `numpy.unique`
+  on both arrays first, where neither triwarp strategy dedups anything (the table is an idempotent
+  scatter, the binary search reads the keys as given). So `isin` takes `max_index`, spelled and
+  documented like `grouping.hash_indices_rows`' — **2.74-2.87x** (285.6 → 99.4 µs at 60k over a 20k
+  table, 285.4 → 100.8 at 200k, 289.3 → 105.5 at 1M), threaded from both in-repo callers
+  (`selection.face_indices_from_vertex_indices(n_vertices=...)`, which `submesh_from_vertex_indices`
+  and `repair` both supply) per §3.10. Two details that came out of it: fusing the element side's
+  `wp.map(shifted_index)` plus Python-scope gather into one `isin_lookup_mask` launch is a further
+  **1.22x** (348.5 → 285.6 µs) on the *inferred* path, and that kernel's range guard is what makes
+  the bound safe rather than merely wrong — without it an over-tight `max_index` is an
+  out-of-bounds gather, i.e. §12.1's host-heap corruption on the CPU device. The guard's test
+  bites on exactly that assert (mutation-probed).
 - **`_unique_hash`'s two whole-table bookkeeping passes were 40 % of `unique_1d`.** Phase-timed at
   313 µs for 100k int32: `mark_occupied` + `array_scan` + `wp.map(sub)` + readback **93.4 µs**,
   `arange` for the sort's permutation **30.4**, `radix_sort_pairs` **55.3**, `hash_insert` + its two

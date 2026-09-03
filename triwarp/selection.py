@@ -67,7 +67,7 @@ def region_boundary_edges(
     if n_faces == 0:
         return twt.empty_2d((0, 2), wp.int32, device=device)
     if n_vertices is None:
-        n_vertices = tw.array.index_domain_size(faces)
+        n_vertices = tw.array.index_bound(faces)
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
     m = int(unique_edges.shape[0])
     count = wp.zeros(m, dtype=wp.int32, device=device)
@@ -134,7 +134,7 @@ def faces_left_of_contour(
         mesh edge blocks nothing and seeds nothing.
     n_vertices
         Total vertex count, used as the key radix. When ``None`` it is inferred with
-        [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
+        [`array.index_bound`][triwarp.array.index_bound], which costs a host readback.
     twins
         Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins]. Building it is the
         single largest cost here, so pass it when several contours are filled on one mesh.
@@ -178,7 +178,7 @@ def faces_left_of_contour(
     if n_faces == 0 or n_contour == 0:
         return left
     if n_vertices is None:
-        n_vertices = tw.array.index_domain_size(faces)
+        n_vertices = tw.array.index_bound(faces)
     if twins is None:
         twins = halfedge_twins(faces, n_vertices=n_vertices)
     base = wp.uint64(n_vertices)
@@ -353,7 +353,7 @@ def submesh_from_face_indices(
 
     if unique_indices:
         unique_face_indices = face_indices
-        face_slots = arange(k, device)
+        face_slots = arange(k, device=device)
     else:
         unique_face_indices, face_slots = tw.grouping.unique_1d(face_indices, return_inverse=True)
 
@@ -696,7 +696,9 @@ def submesh_from_vertex_indices(
     [`submesh_from_vertex_mask`][triwarp.selection.submesh_from_vertex_mask]
     [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]
     """
-    face_indices = face_indices_from_vertex_indices(faces, vertex_indices, face_mode=face_mode)
+    face_indices = face_indices_from_vertex_indices(
+        faces, vertex_indices, face_mode=face_mode, n_vertices=int(vertices.shape[0])
+    )
     return submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True)
 
 
@@ -916,6 +918,7 @@ def face_indices_from_vertex_indices(
     vertex_indices: wp.array[wp.int32],
     *,
     face_mode: Literal["all", "any"] = "all",
+    n_vertices: int | None = None,
 ) -> wp.array[wp.int32]:
     """
     Face indices whose vertex indices match a set under an all/any rule.
@@ -929,6 +932,11 @@ def face_indices_from_vertex_indices(
     face_mode
         ``"all"`` keeps faces whose three vertex indices all lie in ``vertex_indices``;
         ``"any"`` keeps faces with at least one vertex index in ``vertex_indices``.
+    n_vertices
+        Optional vertex count, forwarded to [`isin`][triwarp.array.isin] as its ``max_index``.
+        Supplying it skips the two min/max reductions and the two host readbacks that would
+        otherwise infer the value span -- worth roughly half of the membership test. Must be
+        greater than every index in ``faces`` and in ``vertex_indices``.
 
     Returns
     -------
@@ -950,7 +958,7 @@ def face_indices_from_vertex_indices(
         return wp.empty(0, dtype=wp.int32, device=device)
 
     faces2d = faces.reshape((-1, 3))
-    corner_hit = tw.array.isin(faces2d, vertex_indices)
+    corner_hit = tw.array.isin(faces2d, vertex_indices, max_index=n_vertices)
     if face_mode == "all":
         face_hit = tw.reduce.all(corner_hit, axis=1)
     else:

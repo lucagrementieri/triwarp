@@ -522,7 +522,7 @@ def _collapse_pass(
             inputs=[survivor, removed, csr.offsets, csr.columns, claim],
             device=device,
         )
-        remap = tw.array.arange(n_vertices, device)
+        remap = tw.array.arange(n_vertices, device=device)
         positions = wp.clone(vertices)
         count = wp.zeros(1, dtype=wp.int32, device=device)
         wp.launch(
@@ -852,7 +852,7 @@ class _FlipTopology:
             device=self._device,
         )
         wp.launch(
-            kernel_array.INIT_SORT_PAIR_INDICES[wp.int32],
+            kernel_array.SORT_PAIR_INDICES[wp.int32],
             dim=2 * n,
             inputs=[wp.int32(n), wp.int32(-1), self._order],
             device=self._device,
@@ -1275,8 +1275,8 @@ def quadric_decimate(
         return (
             kept_vertices,
             kept_faces,
-            tw.array.arange(int(vertices.shape[0]), device),
-            tw.array.arange(n_faces, device),
+            tw.array.arange(int(vertices.shape[0]), device=device),
+            tw.array.arange(n_faces, device=device),
         )
 
     buffers = _DecimationBuffers(
@@ -1389,12 +1389,12 @@ class _DecimationBuffers:
         # face column because the face buffer is -- so tracking them does not stop the pass being
         # captured; the scratch exists because the compaction cannot read and write one buffer.
         self.vertex_index = (
-            tw.array.arange(self.n_vertices, device)
+            tw.array.arange(self.n_vertices, device=device)
             if track_index
             else wp.empty(0, dtype=wp.int32, device=device)
         )
         self.face_source = (
-            tw.array.arange(self.n_faces, device)
+            tw.array.arange(self.n_faces, device=device)
             if track_index
             else wp.empty(0, dtype=wp.int32, device=device)
         )
@@ -1557,7 +1557,7 @@ class _DecimationBuffers:
         locked = wp.zeros(self.n_vertices + 1, dtype=wp.int32, device=device)
         min_key = wp.empty(self.n_vertices + 1, dtype=wp.int32, device=device)
         claim = wp.empty(self.n_vertices + 1, dtype=wp.int32, device=device)
-        remap = tw.array.arange(self.n_vertices + 1, device)
+        remap = tw.array.arange(self.n_vertices + 1, device=device)
         wp.copy(self._positions, self.vertices)
         self._count.zero_()
 
@@ -1621,7 +1621,7 @@ class _DecimationBuffers:
             device=device,
         )
         wp.launch(
-            kernel_array.INIT_SORT_PAIR_INDICES[wp.int32],
+            kernel_array.SORT_PAIR_INDICES[wp.int32],
             dim=2 * n,
             inputs=[wp.int32(n), wp.int32(-1), self._order],
             device=device,
@@ -1882,7 +1882,7 @@ def _run_collapse_rounds(
         )
         # The set is already independent, so dropping members of it keeps it independent.
         wp.launch(
-            kernel_array.INIT_SORT_PAIR_INDICES[wp.int32],
+            kernel_array.SORT_PAIR_INDICES[wp.int32],
             dim=2 * m,
             inputs=[wp.int32(m), wp.int32(-1), sort_values],
             device=device,
@@ -2228,7 +2228,7 @@ def _flip_setup(
         region_flags = wp.full(n_faces, wp.int32(1), dtype=wp.int32, device=device)
     else:
         region_flags = tw.array.astype(region, wp.int32)
-    return wp.clone(faces), tw.array.index_domain_size(faces), region_flags
+    return wp.clone(faces), tw.array.index_bound(faces), region_flags
 
 
 def intrinsic_delaunay(
@@ -2787,7 +2787,7 @@ def subdivide_to_size(
     current_vertices = vertices
     current_faces = faces
     n_faces = int(faces.shape[0]) // 3
-    index = tw.array.arange(n_faces, device)
+    index = tw.array.arange(n_faces, device=device)
 
     if n_faces == 0:
         if return_index:
@@ -3448,7 +3448,7 @@ def split_edges(
             f"got {int(split_mask.shape[0])}."
         )
 
-    carried = index if index is not None else tw.array.arange(n_faces, device)
+    carried = index if index is not None else tw.array.arange(n_faces, device=device)
     if int(carried.shape[0]) != n_faces:
         raise ValueError(
             f"index must have one entry per face ({n_faces}), got {int(carried.shape[0])}."

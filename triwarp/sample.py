@@ -584,7 +584,7 @@ def _dart_throw_blue_noise(
 
     # Work-list buffers sized for their final use once: the first round's list is the whole pool and
     # every later one is a prefix of it, so nothing here is reallocated per round.
-    alive = arange(n_pool, device)
+    alive = arange(n_pool, device=device)
     next_alive = wp.empty(n_pool, dtype=wp.int32, device=device)
     survivor_flag = wp.empty(n_pool, dtype=wp.int32, device=device)
     positions = wp.empty(n_pool, dtype=wp.int32, device=device)
@@ -770,18 +770,21 @@ def resolve_seed(seed: int | None) -> int:
         ``seed`` unchanged when provided, otherwise a random value in ``[0, 2**31)``.
 
     !!! note "The ``resolve_*`` pattern"
-        Three modules carry one of these -- turn an optional argument into the concrete value the
-        wrapper would have derived, so a caller who wants two functions to share the derived thing
-        can resolve it once and pass it to both. Each default is domain knowledge, so they cannot
-        share a module: [`sample.resolve_seed`][triwarp.sample.resolve_seed],
-        [`adjacency.resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency] and
-        [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid].
+        Both of these -- this and [`sample.resolve_seed`][triwarp.sample.resolve_seed] /
+        [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid] -- turn an optional
+        argument into the concrete value the wrapper would have derived, so a caller who wants two
+        functions to share the derived thing can resolve it once and pass it to both. Each default
+        is domain knowledge, so they cannot share a module. The optional face-adjacency pair
+        deliberately has **no** such resolver: deriving it is one
+        [`face_adjacency`][triwarp.adjacency.face_adjacency] call with ``return_edges=True``, so
+        only the *pairing rule* is worth sharing and
+        [`adjacency.require_paired_adjacency`][triwarp.adjacency.require_paired_adjacency] is that
+        rule on its own.
 
     See Also
     --------
     [`sample_surface`][triwarp.sample.sample_surface]
     [`random_soup`][triwarp.creation.random_soup]
-    [`adjacency.resolve_face_adjacency`][triwarp.adjacency.resolve_face_adjacency]
     [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid]
     """
     if seed is None:

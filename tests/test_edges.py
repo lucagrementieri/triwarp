@@ -382,7 +382,7 @@ def test_edges_unique_radix_is_invariant_to_an_oversized_base(
     that count exceeds ``max(faces) + 1`` whenever the mesh carries unreferenced vertices.
     """
     _, mesh_wp = request.getfixturevalue(mesh_name)
-    tight = tw.array.index_domain_size(mesh_wp.indices)
+    tight = tw.array.index_bound(mesh_wp.indices)
     edges_tight_wp, inverse_tight_wp = tw.edges.edges_unique(mesh_wp.indices, n_vertices=tight)
 
     for base in (tight + 1, tight + 1000):

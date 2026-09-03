@@ -292,7 +292,7 @@ def uv_seam_edges(
         is exact comparison, which is what MeshLab does. Ignored under ``match="index"``.
     n_vertices
         Total vertex count, used as the edge-pairing radix. When ``None`` it is inferred with
-        [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
+        [`array.index_bound`][triwarp.array.index_bound], which costs a host readback.
     twins
         Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins], length
         ``3 * n_faces``. Depends on the connectivity alone, so one table serves this call and every
@@ -375,7 +375,7 @@ def uv_seam_edges(
             twt.empty_2d((0, 4), wp.int32, device=device),
         )
     if face_texcoords is None:
-        face_texcoords = tw.array.arange(3 * n_faces, device)
+        face_texcoords = tw.array.arange(3 * n_faces, device=device)
 
     n_halfedges = 3 * n_faces
     if twins is None:
@@ -507,7 +507,7 @@ def uv_seam_vertex_mask(
         Coordinate tolerance under ``match="uv"``.
     n_vertices
         Total vertex count. When ``None`` it is inferred with
-        [`array.index_domain_size`][triwarp.array.index_domain_size], which costs a host readback.
+        [`array.index_bound`][triwarp.array.index_bound], which costs a host readback.
 
     Returns
     -------
@@ -521,7 +521,7 @@ def uv_seam_vertex_mask(
     [`triwarp.array.indices_to_mask`][triwarp.array.indices_to_mask]
     """
     if n_vertices is None:
-        n_vertices = tw.array.index_domain_size(faces)
+        n_vertices = tw.array.index_bound(faces)
     seams, boundaries, _foldovers = uv_seam_edges(
         faces, texcoords, face_texcoords, match=match, tolerance=tolerance, n_vertices=n_vertices
     )

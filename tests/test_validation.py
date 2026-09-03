@@ -342,7 +342,7 @@ def test_edge_manifold_mask_edges_sorted_shortcut(icosahedron: tuple[tm.Trimesh,
 def test_is_edge_manifold_precomputed_shortcut(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = icosahedron
     edges_sorted = tw.edges.faces_to_edges(mesh_wp.indices, sorted=True)
-    n_vertices = tw.array.index_domain_size(edges_sorted)
+    n_vertices = tw.array.index_bound(edges_sorted)
     assert tw.validation.is_edge_manifold(
         mesh_wp.indices, edges_sorted=edges_sorted, n_vertices=n_vertices
     ) == tw.validation.is_edge_manifold(mesh_wp.indices)
@@ -363,7 +363,7 @@ def test_is_edge_manifold_radix_is_invariant_to_an_oversized_base(
     answers = set()
     for mesh_name in ("icosahedron", "hemisphere"):
         _, mesh_wp = request.getfixturevalue(mesh_name)
-        tight = tw.array.index_domain_size(mesh_wp.indices)
+        tight = tw.array.index_bound(mesh_wp.indices)
         baseline = tw.validation.is_edge_manifold(
             mesh_wp.indices, allow_boundary_edges, n_vertices=tight
         )
@@ -384,7 +384,7 @@ def test_is_vertex_manifold_precomputed_shortcut(icosahedron: tuple[tm.Trimesh, 
     assert tw.validation.is_vertex_manifold(
         mesh_wp.indices, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges
     ) == tw.validation.is_vertex_manifold(mesh_wp.indices)
-    # The half-pair raise now comes from the shared ``adjacency.resolve_face_adjacency``, so the
+    # The half-pair raise now comes from the shared ``adjacency.require_paired_adjacency``, so the
     # message is the one every caller of that resolver reports rather than this module's own.
     with pytest.raises(ValueError, match="both be provided or both omitted"):
         tw.validation.is_vertex_manifold(mesh_wp.indices, face_adjacency=adjacency)
