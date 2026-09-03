@@ -11,7 +11,13 @@ triangle predicates, shared with ``kernels/predicates.py``.
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
-from triwarp.kernels.array import sort3, trilinear_cell, trilinear_weight, update_argmax
+from triwarp.kernels.array import (
+    lattice_position,
+    sort3,
+    trilinear_cell,
+    trilinear_weight,
+    update_argmax,
+)
 from triwarp.kernels.predicates import (
     delone_metrics,
     is_unfold_quadrangle_convex,
@@ -179,27 +185,32 @@ def tris_angle_profit(
 
 
 @wp.func
-def cycle_next(nbr: wp.array[wp.int32], m: wp.int32, i: wp.int32) -> wp.int32:
+def cycle_step(nbr: wp.array[wp.int32], m: wp.int32, i: wp.int32, step: wp.int32) -> wp.int32:
+    # Walk the ring of ``m`` fan slots from ``i`` in direction ``step`` until a live neighbour
+    # (``nbr[j] >= 0``) is found; return ``i`` if the whole ring is dead. One function with an
+    # explicit direction rather than a ``+1`` and a ``-1`` copy that differed only in their wrap
+    # guard -- the fan optimizer removes slots as it goes, so both directions have to skip holes
+    # and the skipping is the whole body.
     j = i
     for _ in range(m):
-        j = j + 1
+        j = j + step
         if j >= m:
             j = 0
+        elif j < 0:
+            j = m - 1
         if nbr[j] >= 0:
             return j
     return i
 
 
 @wp.func
+def cycle_next(nbr: wp.array[wp.int32], m: wp.int32, i: wp.int32) -> wp.int32:
+    return cycle_step(nbr, m, i, wp.int32(1))
+
+
+@wp.func
 def cycle_prev(nbr: wp.array[wp.int32], m: wp.int32, i: wp.int32) -> wp.int32:
-    j = i
-    for _ in range(m):
-        j = j - 1
-        if j < 0:
-            j = m - 1
-        if nbr[j] >= 0:
-            return j
-    return i
+    return cycle_step(nbr, m, i, wp.int32(-1))
 
 
 # --------------------------------------------------------------------------------------
@@ -732,10 +743,10 @@ def sample_field_trilinear(
 def lattice_points(
     resolution: wp.vec3i, origin: wp.vec3, spacing: wp.vec3, out_points: wp.array[wp.vec3]
 ) -> None:
-    # World positions of a dense ``res_x * res_y * res_z`` lattice, in the row-major order
-    # ``wp.MarchingCubes`` expects of a ``(nx, ny, nz)`` field: ``x`` is the slowest axis.
+    # World positions of a dense ``res_x * res_y * res_z`` node lattice, in the row-major order
+    # ``wp.MarchingCubes`` expects of a ``(nx, ny, nz)`` field: ``x`` is the slowest axis. The
+    # position itself is ``array.lattice_position``, shared with ``voxels.lattice_points``, which
+    # writes the same quantity into a ``wp.array3d`` instead of flattening.
     i, j, k = wp.tid()
     index = (i * resolution[1] + j) * resolution[2] + k
-    out_points[index] = origin + wp.vec3(
-        spacing[0] * wp.float32(i), spacing[1] * wp.float32(j), spacing[2] * wp.float32(k)
-    )
+    out_points[index] = lattice_position(origin, spacing, i, j, k)

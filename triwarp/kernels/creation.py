@@ -2,6 +2,7 @@ import math
 
 import warp as wp
 
+from triwarp.kernels.array import lift_vec2
 from triwarp.kernels.predicates import orient2d
 from triwarp.kernels.triangles import write_corner_triple
 
@@ -20,12 +21,6 @@ def project_to_radius(v: wp.vec3, radius: wp.float32) -> wp.vec3:
     # than the algebraically equal unit * r, so the float32 result matches the reference bit
     # for bit.
     return v + wp.normalize(v) * (radius - wp.length(v))
-
-
-@wp.func
-def lift_vec2(p: wp.vec2, z: wp.float32) -> wp.vec3:
-    # 2D point -> 3D at a fixed height (trimesh's util.stack_3D plus a z offset).
-    return wp.vec3(p[0], p[1], z)
 
 
 @wp.kernel
@@ -424,7 +419,9 @@ def sweep_slice_vertices(
     out_vertices: wp.array[wp.vec3],
 ) -> None:
     s, i = wp.tid()
-    out_vertices[s * stride + i] = wp.transform_point(transforms[s], lift_vec2(ring[i], 0.0))
+    out_vertices[s * stride + i] = wp.transform_point(
+        transforms[s], lift_vec2(ring[i], wp.float32(0.0))
+    )
 
 
 @wp.kernel

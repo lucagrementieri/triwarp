@@ -194,6 +194,24 @@ def to_vec2(v: wp.vec2d) -> wp.vec2:
 
 
 @wp.func
+def lift_vec2(p: wp.vec2, z: wp.float32) -> wp.vec3:
+    # 2D point -> 3D at a fixed height: trimesh's ``util.stack_3D`` plus a z offset.
+    #
+    # The fifth of the vec-conversion family above, and it was written **twice** -- once in
+    # ``kernels/creation.py`` with this signature and once in ``kernels/proximity.py`` with the
+    # height hardcoded to zero -- which is the collision ``.claude/CLAUDE.md`` section 4 warns
+    # about as a hypothetical: ``wp.map``'s cache is keyed by the *unqualified* function name plus
+    # the input dtypes, so two same-named ops fork one generated module. The two arities kept it
+    # from being a wrong answer, and a warp-debug log of one suite run showed what it did cost --
+    # ``Module map_lift_vec2`` loading at two distinct hashes on ``cuda:0``.
+    #
+    # ``z`` stays a parameter because ``creation.extrude_triangulation`` genuinely lifts to a
+    # height; the four zero-lifting call sites pass ``wp.float32(0.0)`` explicitly, which all but
+    # one of them already did.
+    return wp.vec3(p[0], p[1], z)
+
+
+@wp.func
 def square_scalar(value: wp.Scalar) -> wp.Scalar:
     return value * value
 
@@ -651,6 +669,27 @@ def pack_nearest_key(distance: wp.float32, index: wp.int32) -> wp.int64:
     # sentinel.
     distance_bits = wp.uint64(wp.uint32(wp.cast(distance, wp.int32)))
     return wp.int64((distance_bits << wp.uint64(32)) | wp.uint64(wp.uint32(index)))
+
+
+@wp.func
+def lattice_position(
+    lower: wp.vec3, step: wp.vec3, i: wp.int32, j: wp.int32, k: wp.int32
+) -> wp.vec3:
+    # World position of node ``(i, j, k)`` of a dense lattice whose node 0 sits at ``lower``.
+    #
+    # A **node** lattice, not a cell-centre one: there is no half-step shift, so a lattice of
+    # ``dims`` nodes with ``step = extent / (dims - 1)`` spans its box inclusively at both ends.
+    # Both callers want that -- ``reconstruction``'s signed-distance sample grid, in the row-major
+    # order ``wp.MarchingCubes`` expects, and ``voxels.lattice`` -- and neither is a candidate for
+    # ``wp.volume_index_to_world``, the spelling ``kernels/voxels.py``'s module docstring records
+    # as preferred: both run *before* any ``wp.Volume`` exists, so there is no volume id to pass.
+    # That is the same un-convertible half of the split that docstring names. Getting this wrong is
+    # a rigid half-diagonal offset, which is exactly the failure mode a half-step convention has.
+    #
+    # It differs from the two kernels that share it only in the *destination's rank* -- a flat
+    # row-major buffer against a ``wp.array3d`` -- so each keeps its own indexing and shares the
+    # arithmetic, per section 3's "factor the family, not the pair".
+    return lower + wp.cw_mul(step, wp.vec3(wp.float32(i), wp.float32(j), wp.float32(k)))
 
 
 @wp.func

@@ -65,6 +65,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.constants import TOLERANCE_MERGE
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import creation as kernel_creation
 from triwarp.kernels import repair as kernel_repair
 
@@ -1277,7 +1278,7 @@ def revolve(
     n_cap = 0
     if cap and not closed:
         profile_3d = wp.empty(per, dtype=wp.vec3, device=device)
-        wp.map(kernel_creation.lift_vec2, linestring, wp.float32(0.0), out=profile_3d)
+        wp.map(kernel_array.lift_vec2, linestring, wp.float32(0.0), out=profile_3d)
         # Ear clipping introduces no new vertices, so its indices address profile points directly --
         # the guarantee trimesh gets from ``triangulate_polygon(force_vertices=True)``.
         cap_faces = tw.polyline.polyline_triangulate(profile_3d).reshape((-1,))
@@ -1463,8 +1464,8 @@ def extrude_triangulation(
         faces = flipped
 
     bottom = wp.empty(2 * n, dtype=wp.vec3, device=device)
-    wp.map(kernel_creation.lift_vec2, vertices, wp.float32(0.0), out=bottom[:n])
-    wp.map(kernel_creation.lift_vec2, vertices, wp.float32(height_f), out=bottom[n:])
+    wp.map(kernel_array.lift_vec2, vertices, wp.float32(0.0), out=bottom[:n])
+    wp.map(kernel_array.lift_vec2, vertices, wp.float32(height_f), out=bottom[n:])
 
     boundary = tw.boundary.oriented_boundary_edges(bottom[:n].contiguous(), faces)
     n_boundary = int(boundary.shape[0])

@@ -27,7 +27,7 @@ import warp as wp
 
 from triwarp.constants import INT32_MAX_CONSTANT
 from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_representative
-from triwarp.kernels.array import binary_search_index
+from triwarp.kernels.array import binary_search_index, lattice_position
 from triwarp.kernels.intersection import triangle_aabb_overlap
 from triwarp.kernels.predicates import triangle_aabb
 from triwarp.kernels.triangles import face_vertices
@@ -236,12 +236,12 @@ def pack_cell_keys(
 
 @wp.kernel
 def lattice_points(lower: wp.vec3, step: wp.vec3, out_points: wp.array3d[wp.vec3]) -> None:
+    # A dense node lattice, rank-2 destination. The position is ``array.lattice_position``, shared
+    # with ``reconstruction.lattice_points``, which writes the same quantity into a flat row-major
+    # buffer instead. This is one of the two sites this module's docstring names as running before
+    # a ``wp.Volume`` exists, so ``wp.volume_index_to_world`` is not available to it.
     i, j, k = wp.tid()
-    out_points[i, j, k] = wp.vec3(
-        lower[0] + wp.float32(i) * step[0],
-        lower[1] + wp.float32(j) * step[1],
-        lower[2] + wp.float32(k) * step[2],
-    )
+    out_points[i, j, k] = lattice_position(lower, step, i, j, k)
 
 
 # ---------------------------------------------------------------------------------------------

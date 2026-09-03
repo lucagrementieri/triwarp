@@ -38,6 +38,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import prefers_tiled_reduction, require_nonempty_mesh
 from triwarp.constants import INT32_MAX
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import triangles as kernel_triangles
@@ -1127,7 +1128,7 @@ def containing_faces_2d(
         return wp.full(m, -1, dtype=wp.int32, device=device)
 
     lifted = wp.empty(int(vertices.shape[0]), dtype=wp.vec3, device=device)
-    wp.map(kernel_proximity.lift_vec2, vertices, out=lifted)
+    wp.map(kernel_array.lift_vec2, vertices, wp.float32(0.0), out=lifted)
     # One readback, the same one `closest_point_on_mesh` pays and for the same reason: the search
     # radius has to be in the triangulation's own units and nothing else knows its scale.
     search_radius = _CONTAINMENT_SEARCH_SCALE * tw.bounds.enclosing_diagonal(lifted)
