@@ -187,6 +187,32 @@ def scatter_unique_edges_sum_and_valence(
     accumulate_endpoint_value(edges[e, 0], edges[e, 1], edge_values[e], out_sum, out_valence)
 
 
+@wp.func
+def lock_two_rings(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    s: wp.int32,
+    r: wp.int32,
+    key: wp.int32,
+    out_claim: wp.array[wp.int32],
+) -> None:
+    # Atomic-min ``key`` into every vertex of the two closed 1-rings of ``s`` and ``r``: the lock
+    # half of a parallel independent set over edge candidates, so that whichever candidate wins
+    # everywhere it touched has a neighbourhood disjoint from every other winner's.
+    #
+    # ``kernels/remesh.py`` runs this three times per collapse pass -- once for the isotropic
+    # path's single claim and twice for the quadric path's key-then-index pair -- with a different
+    # ``key`` each time, which is the whole of the difference between the three. What the *key*
+    # must be is recorded at ``remesh.scramble_index``, and it is load-bearing: a spatially
+    # monotone key commits one collapse per pass.
+    wp.atomic_min(out_claim, s, key)
+    wp.atomic_min(out_claim, r, key)
+    for i in range(offsets[s], offsets[s + 1]):
+        wp.atomic_min(out_claim, columns[i], key)
+    for i in range(offsets[r], offsets[r + 1]):
+        wp.atomic_min(out_claim, columns[i], key)
+
+
 @wp.kernel
 def scatter_index(index: wp.array[wp.int32], out_scattered: wp.array[wp.int32]) -> None:
     tid = wp.int32(wp.tid())

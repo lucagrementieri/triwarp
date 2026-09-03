@@ -27,7 +27,7 @@ from triwarp.kernels.predicates import (
     triangle_normal,
     vector_angle,
 )
-from triwarp.kernels.scatter import add_corner_triple
+from triwarp.kernels.scatter import add_corner_triple, lock_two_rings
 from triwarp.kernels.triangles import (
     corner_triple,
     face_normal,
@@ -1224,6 +1224,35 @@ def collapse_candidates(
 
 
 @wp.func
+def wins_key_everywhere(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    locks: wp.array[wp.int32],
+    s: wp.int32,
+    r: wp.int32,
+    key: wp.int32,
+) -> wp.bool:
+    # Does ``key`` win at every vertex of the two closed 1-rings? The read half of
+    # ``scatter.lock_two_rings``, and the same table: ``locks`` is a minimum over candidates
+    # *including this one*, so the test is equality rather than ``<=``.
+    #
+    # Both collapse paths call it, and the quadric path calls it twice against two different
+    # tables -- once on the scrambled-key minimum and once on the edge-index minimum that breaks a
+    # key collision -- which is why the parameter is named for its role and not for either table.
+    # This rule was written out inline three times before it was one function, and the copies had
+    # already diverged: the improvement that hashed the key reached one of them and not the other.
+    if locks[s] != key or locks[r] != key:
+        return False
+    for i in range(offsets[s], offsets[s + 1]):
+        if locks[columns[i]] != key:
+            return False
+    for i in range(offsets[r], offsets[r + 1]):
+        if locks[columns[i]] != key:
+            return False
+    return True
+
+
+@wp.func
 def scramble_index(index: wp.int32) -> wp.int32:
     # Spatially incoherent lock key for the independent-set pass, from the candidate's own index.
     #
@@ -1280,14 +1309,7 @@ def claim_collapses(
     s = survivor[k]
     if s < 0:
         return
-    key = scramble_index(k)
-    r = removed[k]
-    wp.atomic_min(out_claim, s, key)
-    wp.atomic_min(out_claim, r, key)
-    for i in range(offsets[s], offsets[s + 1]):
-        wp.atomic_min(out_claim, columns[i], key)
-    for i in range(offsets[r], offsets[r + 1]):
-        wp.atomic_min(out_claim, columns[i], key)
+    lock_two_rings(offsets, columns, s, removed[k], scramble_index(k), out_claim)
 
 
 @wp.kernel(enable_backward=False)
@@ -1306,18 +1328,8 @@ def commit_collapses(
     s = survivor[k]
     if s < 0:
         return
-    key = scramble_index(k)
     r = removed[k]
-    won = True
-    if claim[s] != key or claim[r] != key:
-        won = False
-    for i in range(offsets[s], offsets[s + 1]):
-        if claim[columns[i]] != key:
-            won = False
-    for i in range(offsets[r], offsets[r + 1]):
-        if claim[columns[i]] != key:
-            won = False
-    if not won:
+    if not wins_key_everywhere(offsets, columns, claim, s, r, scramble_index(k)):
         return
     out_remap[r] = s
     out_positions[s] = pos[k]
@@ -2335,36 +2347,7 @@ def claim_collapse_key(
     s = survivor[k]
     if s < 0:
         return
-    key = scramble_index(k)
-    r = removed[k]
-    wp.atomic_min(out_min_key, s, key)
-    wp.atomic_min(out_min_key, r, key)
-    for i in range(offsets[s], offsets[s + 1]):
-        wp.atomic_min(out_min_key, columns[i], key)
-    for i in range(offsets[r], offsets[r + 1]):
-        wp.atomic_min(out_min_key, columns[i], key)
-
-
-@wp.func
-def wins_key_everywhere(
-    offsets: wp.array[wp.int32],
-    columns: wp.array[wp.int32],
-    min_key: wp.array[wp.int32],
-    s: wp.int32,
-    r: wp.int32,
-    key: wp.int32,
-) -> wp.bool:
-    # Does ``key`` win at every vertex of the two closed 1-rings? ``min_key`` is a minimum over
-    # candidates including this one, so the test is equality rather than ``<=``.
-    if min_key[s] != key or min_key[r] != key:
-        return False
-    for i in range(offsets[s], offsets[s + 1]):
-        if min_key[columns[i]] != key:
-            return False
-    for i in range(offsets[r], offsets[r + 1]):
-        if min_key[columns[i]] != key:
-            return False
-    return True
+    lock_two_rings(offsets, columns, s, removed[k], scramble_index(k), out_min_key)
 
 
 @wp.kernel(enable_backward=False)
@@ -2386,12 +2369,7 @@ def claim_collapse_index(
     r = removed[k]
     if not wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(k)):
         return
-    wp.atomic_min(out_claim, s, k)
-    wp.atomic_min(out_claim, r, k)
-    for i in range(offsets[s], offsets[s + 1]):
-        wp.atomic_min(out_claim, columns[i], k)
-    for i in range(offsets[r], offsets[r + 1]):
-        wp.atomic_min(out_claim, columns[i], k)
+    lock_two_rings(offsets, columns, s, r, k, out_claim)
 
 
 @wp.kernel(enable_backward=False)
@@ -2417,14 +2395,7 @@ def mark_collapse_winners(
         return
     r = removed[k]
     won = wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(k))
-    if claim[s] != k or claim[r] != k:
-        won = False
-    for i in range(offsets[s], offsets[s + 1]):
-        if claim[columns[i]] != k:
-            won = False
-    for i in range(offsets[r], offsets[r + 1]):
-        if claim[columns[i]] != k:
-            won = False
+    won = won and wins_key_everywhere(offsets, columns, claim, s, r, k)
     if not won:
         out_survivor[k] = -1
         return
