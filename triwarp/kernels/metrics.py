@@ -126,7 +126,7 @@ def chamfer_nn_term_sliced(
     the block shuffle-reduce and measures 1.57x slower on CUDA at 500k points (19.0 -> 29.7 us),
     which is why both exist.
     """
-    j = wp.tid()
+    j = wp.int32(wp.tid())
     total = wp.float32(0.0)
     for idx in range(j, x.shape[0], n_slices):
         diff = x[idx] - y[nearest[idx]]
@@ -185,7 +185,7 @@ def chamfer_surface_term_sliced(
     [`chamfer_nn_term_sliced`][triwarp.kernels.metrics.chamfer_nn_term_sliced], for the same
     reason.
     """
-    j = wp.tid()
+    j = wp.int32(wp.tid())
     total = wp.float32(0.0)
     for idx in range(j, points.shape[0], n_slices):
         f = face_id[idx]

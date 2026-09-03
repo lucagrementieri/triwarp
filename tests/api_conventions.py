@@ -1726,3 +1726,61 @@ def meshlib_reference_problems() -> list[str]:
                 f"('{match.group(0)}') -- say what the code computes, or name the algorithm"
             )
     return problems
+
+
+# --- check 22 -----------------------------------------------------------------------------------
+
+_TID_CASTS = frozenset({"wp.int32", "wp.int64", "wp.uint32", "wp.uint64"})
+
+
+def _is_tid_call(node: ast.expr) -> bool:
+    """Report whether this expression is exactly ``wp.tid()``, with no arguments."""
+    return (
+        isinstance(node, ast.Call)
+        and not node.args
+        and not node.keywords
+        and _dotted(node.func) == ("wp", "tid")
+    )
+
+
+def bare_tid_problems() -> list[str]:
+    """
+    Check 22: a single-index ``wp.tid()`` assigned without the declarative ``wp.int32`` cast.
+
+    ``.claude/CLAUDE.md`` section 3 retires every redundant cast and keeps exactly one -- the tid
+    cast -- *because* it is the declarative one: it names the type of the index the whole kernel is
+    written against. ``wp.tid()`` already returns ``wp.int32``, so both spellings generate
+    identical code and neither the compiler nor the suite can see the difference; this is the fifth
+    member of the family checks 16, 17, 18 and 20 belong to, and like them nothing but a scan holds
+    the line. Measured over ``kernels/`` when it was written: 422 cast against 45 bare, 90.4 % to
+    9.6 %, and the drift was *per file* rather than scattered -- 13 sites in ``intersection.py``, 9
+    in ``triangles.py`` -- which is the signature of a convention that was never checked.
+    ``intersection.py`` was the sharpest case: ``emit_quad_cut`` and ``emit_tri_cut`` opened bare
+    while ``emit_split_cut_edges`` and ``emit_split_cut_corner``, four kernels emitting the same
+    family of triangles in one file, opened with the cast.
+
+    A **multi-index** unpack (``i, j = wp.tid()``) cannot carry a cast and is out of scope by
+    construction, which is the one thing that would make this misfire -- 61 such sites are correct
+    as they are and the check never looks at a tuple target.
+    """
+    problems: list[str] = []
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # test_package_scan_is_discoverable reports the parse failure
+        for function in _kernel_scope_functions(tree):
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                    continue
+                if not isinstance(node.targets[0], ast.Name):
+                    continue  # a tuple target is a multi-index unpack: out of scope
+                if not _is_tid_call(node.value):
+                    continue
+                name = node.targets[0].id
+                problems.append(
+                    f"{path.relative_to(_REPO_ROOT)}:{node.lineno} {function.name} opens "
+                    f"'{name} = wp.tid()' -- write '{name} = wp.int32(wp.tid())', the one cast "
+                    f"the tree keeps because it is declarative"
+                )
+    return problems

@@ -32,7 +32,7 @@ def sample_surface(
     out_points: wp.array[wp.vec3],
     out_face_indices: wp.array[wp.int32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     state = wp.rand_init(seed, tid)
     fi = wp.int32(wp.sample_cdf(state, cdf))
 

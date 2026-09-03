@@ -172,7 +172,7 @@ def query_bvh_aabb_neighbors(
     offsets: wp.array[wp.int32],
     out_indices: wp.array[wp.int32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     aabb_collect(bvh_id, queries[tid], half_extent, offsets[tid], out_indices)
 
 
@@ -188,7 +188,7 @@ def query_bvh_box_neighbors(
     offsets: wp.array[wp.int32],
     out_indices: wp.array[wp.int32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     aabb_collect_in_bounds(bvh_id, query_lower[tid], query_upper[tid], offsets[tid], out_indices)
 
 
@@ -251,7 +251,7 @@ def query_ball_count(
     radius: wp.float32,
     out_neighbor_counts: wp.array[wp.int32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     out_neighbor_counts[tid] = ball_count_in_radius(points, accel, accel_id, queries[tid], radius)
 
 
@@ -304,7 +304,7 @@ def query_ball_neighbors(
     out_indices: wp.array[wp.int32],
     out_distances: wp.array[wp.float32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     ball_collect(
         points, accel, accel_id, queries[tid], radius, offsets[tid], out_indices, out_distances
     )
@@ -414,7 +414,7 @@ def query_bvh_nearest_neighbors(
     out_indices: wp.array2d[wp.int32],
     out_distances: wp.array2d[wp.float32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     q = queries[tid]
     out_indices_row = out_indices[tid]
     out_distances_row = out_distances[tid]
@@ -719,7 +719,7 @@ def query_hashgrid_nearest_neighbors(
     out_indices: wp.array2d[wp.int32],
     out_distances: wp.array2d[wp.float32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     q = queries[tid]
     out_indices_row = out_indices[tid]
     out_distances_row = out_distances[tid]
@@ -874,7 +874,7 @@ def query_weighted_nearest_neighbors(
     # radius for the full 16-attempt budget on 0.1% of queries, each of which then paid the
     # forced-complete final scan -- 437 757 candidates against a mean of 651. Computing the same
     # expression on both sides makes the loop exact, and it is what keeps the worst case bounded.
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     q = queries[tid]
 
     r_hard = complete_radius(q, min_bound, max_bound)

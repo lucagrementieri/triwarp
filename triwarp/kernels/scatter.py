@@ -47,7 +47,7 @@ def count_occurrences_rows(indices: wp.array2d[wp.int32], out_counts: wp.array[w
 def scatter_sum_scalar(
     values: wp.array2d[wp.Scalar], indices: wp.array2d[wp.int32], out_sum: wp.array[wp.Scalar]
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     index = indices[tid]
     for j in range(indices.shape[1]):
         wp.atomic_add(out_sum, index[j], values[tid, j])
@@ -57,7 +57,7 @@ def scatter_sum_scalar(
 def scatter_sum_vec(
     values: wp.array[wp.vec3], indices: wp.array2d[wp.int32], out_sum: wp.array2d[wp.float32]
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     index = indices[tid]
     value = values[tid]
     for j in range(indices.shape[1]):
@@ -71,7 +71,7 @@ def scatter_weighted_sum_vec(
     weights: wp.array2d[wp.float32],
     out_sum: wp.array2d[wp.float32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     index = indices[tid]
     value = values[tid]
     for j in range(indices.shape[1]):
@@ -85,7 +85,7 @@ def scatter_offset_sum(
     offsets: wp.array[wp.int32],
     out_sum: wp.array[wp.Scalar],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     in_index = flat_indices[tid]
     value = values[in_index]
     out_index = binary_search_index(offsets, tid) - 1

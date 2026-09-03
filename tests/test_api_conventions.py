@@ -34,10 +34,12 @@ from tests.api_conventions import (
     _int_module_constants,
     _int_typed_names,
     _is_int_expression,
+    _is_tid_call,
     _kernel_scope_functions,
     allocation_device_problems,
     array_annotation_style_problems,
     bare_annotation_problems,
+    bare_tid_problems,
     builtin_cast_problems,
     comparison_label_problems,
     coverage_location_problems,
@@ -691,6 +693,57 @@ def test_dir_lists_the_whole_surface_before_it_is_touched() -> None:
         [sys.executable, "-c", probe], capture_output=True, text=True, check=True
     )
     assert sorted(completed.stdout.split()) == sorted(tw.__all__)
+
+
+def test_single_index_tid_carries_the_declarative_cast() -> None:
+    """
+    A single-index ``wp.tid()`` is assigned as ``wp.int32(wp.tid())``, the one cast the tree keeps.
+
+    ``.claude/CLAUDE.md`` section 3. ``wp.tid()`` already returns ``wp.int32``, so both spellings
+    generate identical code and the defect is invisible to the compiler and to the suite -- this is
+    check 22, the fifth member of the family checks 16, 17, 18 and 20 belong to. It was written
+    with the axis at 422 cast against 45 bare, and the drift was per *file* rather than scattered,
+    which is the signature of a convention nothing was holding. A multi-index unpack cannot carry a
+    cast and is out of scope by construction.
+    """
+    _fail("bare single-index wp.tid():", bare_tid_problems())
+
+
+def test_bare_tid_scan_ignores_multi_index_unpacks() -> None:
+    """
+    Check 22 never flags ``i, j = wp.tid()``, which cannot carry a cast.
+
+    Not a library comparison: this pins the negative case of the scan above, the way
+    ``test_integer_division_scan_ignores_float_operands`` pins check 17's. 61 multi-index unpacks
+    in ``kernels/`` are correct as they are, so a scan that keyed on the call rather than on the
+    target shape would report the axis at 61 defects and get switched off.
+    """
+    source = textwrap.dedent(
+        """
+        import warp as wp
+
+        @wp.kernel
+        def two_index(out: wp.array2d[wp.int32]) -> None:
+            i, j = wp.tid()
+            out[i, j] = i
+
+        @wp.kernel
+        def one_index_bare(out: wp.array[wp.int32]) -> None:
+            i = wp.tid()
+            out[i] = i
+        """
+    )
+    tree = ast.parse(source)
+    flagged = [
+        function.name
+        for function in _kernel_scope_functions(tree)
+        for node in ast.walk(function)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and _is_tid_call(node.value)
+    ]
+    assert flagged == ["one_index_bare"]
 
 
 def test_no_meshlib_references_in_the_package() -> None:

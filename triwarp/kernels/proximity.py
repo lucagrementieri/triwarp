@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, TOLERANCE_MERGE_CONSTANT, TWO_PI
 from triwarp.kernels import triangles as kernel_triangles
-from triwarp.kernels.array import pack_nearest_key, tile_argmin
+from triwarp.kernels.array import lift_vec2, pack_nearest_key, tile_argmin
 from triwarp.kernels.neighbors import MAX_SEARCH_ATTEMPTS, complete_radius, deepen_radius
 from triwarp.kernels.predicates import (
     barycentric_2d,
@@ -44,7 +44,7 @@ def query_mesh_aabb_count(
     max_hits: wp.int32,
     out_counts: wp.array[wp.int32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     out_counts[tid] = mesh_aabb_collect(
         mesh_id,
         query_lower[tid],
@@ -65,7 +65,7 @@ def query_mesh_aabb_neighbors(
     offsets: wp.array[wp.int32],
     out_indices: wp.array[wp.int32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     mesh_aabb_collect(
         mesh_id,
         query_lower[tid],
@@ -86,7 +86,7 @@ def closest_point_on_mesh(
     out_distance: wp.array[wp.float32],
     out_face: wp.array[wp.int32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     p = points[tid]
     query = wp.mesh_query_point_no_sign(mesh_id, p, max_dist)
     if query.result:
@@ -137,7 +137,7 @@ def closest_point_on_edges(
     # 6/pi ~ 1.91x less volume to walk. Unlike the point BVH next door this still needs its narrow
     # phase, because an edge's bounds are not degenerate -- a sphere may overlap the AABB of an
     # edge whose closest point lies outside it.
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     q = queries[tid]
 
     r_hard = wp.min(max_dist, complete_radius(q, min_bound, max_bound))
@@ -226,7 +226,7 @@ def contains_points_sign_parity(
     mesh_max: wp.vec3,
     out_contains: wp.array[wp.bool],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     p = points[tid]
 
     if not point_strictly_inside_aabb(p, mesh_min, mesh_max):
@@ -275,7 +275,7 @@ def signed_distance_on_mesh(
     perturbation_scale: wp.float32,
     out_distance: wp.array[wp.float32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     p = points[tid]
     query = wp.mesh_query_point_sign_parity(mesh_id, p, max_dist, n_sample, perturbation_scale)
     out_distance[tid] = signed_distance_from_query(
@@ -296,7 +296,7 @@ def signed_distance_on_mesh_winding(
     # handling is the shared ``signed_distance_from_query``. ``mesh_id`` MUST come from a
     # ``wp.Mesh`` built with ``support_winding_number=True`` -- otherwise this builtin silently
     # falls back to ray parity (warp/native/mesh.h:1348).
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     p = points[tid]
     query = wp.mesh_query_point_sign_winding_number(
         mesh_id, p, max_dist, accuracy, winding_threshold
@@ -362,12 +362,6 @@ def winding_number_tiled(
     wp.atomic_add(out_winding, q, total)
 
 
-@wp.func
-def lift_vec2(p: wp.vec2) -> wp.vec3:
-    """Embed a 2D point in the ``z = 0`` plane."""
-    return wp.vec3(p[0], p[1], wp.float32(0.0))
-
-
 @wp.kernel
 def face_containing_point_2d(
     mesh_id: wp.uint64,
@@ -395,7 +389,7 @@ def face_containing_point_2d(
     tid = wp.int32(wp.tid())
     p = points[tid]
     out_face[tid] = wp.int32(-1)
-    query = wp.mesh_query_point_no_sign(mesh_id, lift_vec2(p), search_radius)
+    query = wp.mesh_query_point_no_sign(mesh_id, lift_vec2(p, wp.float32(0.0)), search_radius)
     if not query.result:
         return
 

@@ -54,7 +54,7 @@ def centroid_sliced(
     # is not; it gives up the block shuffle-reduce and measures 1.67x slower on CUDA at 327k faces
     # (16.0 -> 26.7 us), which is why both exist. That bug was invisible on a symmetric mesh, whose
     # every-Nth-face centroid is still the true centroid.
-    j = wp.tid()
+    j = wp.int32(wp.tid())
     total = wp.vec3(0.0, 0.0, 0.0)
     area_total = wp.float32(0.0)
     for f in range(j, n_faces, n_slices):

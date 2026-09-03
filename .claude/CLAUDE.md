@@ -1897,9 +1897,14 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
   # 1. The compile is single-threaded nvcc, so the GPU is idle while the clock runs.
   nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader   # 0 % during the stall
   # 2. Warp says so outright.
-  uv run python -c "import warp as wp; wp.config.verbose = True; ..." 2>&1 \
+  uv run python -c "import warp as wp; wp.config.log_level = wp.LOG_DEBUG; ..." 2>&1 \
       | grep -E "Module hash changed, recompiling|took .* ms  \(compiled\)"
   ```
+  `wp.config.verbose = True` was the old spelling and is **deprecated in Warp 1.17** — it prints
+  *"warp.config.verbose is deprecated; use warp.config.log_level = warp.LOG_DEBUG instead"* to
+  stderr before it answers, which is noise in exactly the output you are grepping. The log lines
+  themselves are unchanged. Note check 9 (a comment blaming a Warp version older than the installed
+  one) cannot see this, because `CLAUDE.md` is not one of its scan roots.
   Any `Module hash changed, recompiling: <module>` line for a `triwarp.kernels.*` module is the
   defect: add the dtype to that module's `_register_overloads`. A *second* line for the same module
   in one run means the chain is still forking. This is the first thing to inspect because the
@@ -2024,7 +2029,7 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ## 14. Evolving the Public API
 
 **`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
-`pytest` run. Nineteen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
+`pytest` run. Twenty-two checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
 summary line naming a reference library (§10); a `*_mask` producer that does not return
 `wp.array[wp.bool]`; a module summary advertising Warp; a module without a `tests/` **and** a
 `benchmarks/` file named for it; a private name reached across a module boundary; one public name
@@ -2038,12 +2043,16 @@ package, because only in an *annotation* position is `wp.array(dtype=T)` the sta
 than a legal allocation; §3's cast spelling, **check 16**, no bare `int(...)` / `float(...)`; §5's
 integer division, **check 17**, no `/` between two operands that are integers *by declaration*; and
 §2's type standard, **check 18**, no bare `bool` / `int` / `float` annotation in a `@wp.kernel` /
-`@wp.func` signature. Those last three are one family, and the family is the point: all three
-spellings are *legal* and generate identical code, so the defect is invisible to the compiler and to
-the suite, and nothing but a scan holds the line. Check 18 reads kernel-scope signatures **only** —
-a kernel *factory* is ordinary Python and its `row_size: int` / `name: str` parameters are correct,
-which is why `str` is not in its table. The last six are newer and each exists because the same
-defect was found twice:
+`@wp.func` signature. Those last three are one family — with §5's kernel-scope ternary (**check
+20**) and §3's declarative tid cast (**check 22**) they are *five* — and the family is the point:
+every one of those spellings is *legal* and generates identical code, so the defect is invisible to
+the compiler and to the suite, and nothing but a scan holds the line. Check 18 reads kernel-scope
+signatures **only** — a kernel *factory* is ordinary Python and its `row_size: int` / `name: str`
+parameters are correct, which is why `str` is not in its table. Check 22 reads single-`Name`
+assignment targets only: a multi-index `i, j = wp.tid()` cannot carry a cast, and a scan that keyed
+on the *call* instead would report 61 correct sites as defects and be switched off by the first
+person it annoyed — `test_bare_tid_scan_ignores_multi_index_unpacks` pins that. The last eight are
+newer and each exists because the same defect was found twice:
 
 - **A `wp.launch` / `wp.launch_tiled` with no `device=`.** Check 15, and it is a memory-safety guard
   rather than a style one — see §8 for the measured failure. It is also the *load-bearing* half of
@@ -2090,6 +2099,13 @@ defect was found twice:
   not proof of an oracle — `test_split_single_component` compares `split`'s output against the
   *input* mesh's vertices, which is a round trip. The rarer defect it also closes is a comparison
   with **no docstring at all**, which ruff cannot see because `D103` is in the ignore list.
+
+- **A MeshLib name anywhere under `triwarp/`.** Check 21, and it is a *licensing* guard rather than
+  a style one — see the MeshLib block above for the rule, the pattern and why the four symbols that
+  sentence used to name were not enough.
+- **A bare single-index `wp.tid()`.** Check 22, the fifth of the legal-but-undeclared family above.
+  It landed at 45 sites against 422, clustered per file rather than scattered — four kernels
+  emitting the same family of triangles in one `intersection.py` split 2–2 on the spelling.
 
 Each check carries a written allowlist — read the reason before adding an entry, and prefer fixing
 the code. It does not replace review: it cannot tell whether a *new* name is a good one, only that

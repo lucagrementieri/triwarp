@@ -176,7 +176,7 @@ def face_normals_and_areas(
     out_normals: wp.array[wp.vec3],
     out_areas: wp.array[wp.float32],
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     normal, area = face_normals_and_area(vertices, faces, f)
     out_normals[f] = normal
     out_areas[f] = area
@@ -186,7 +186,7 @@ def face_normals_and_areas(
 def angles(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_angles: wp.array2d[wp.float32]
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     edges = triangle_edges(vertices, faces, f)
 
     # ``vector_angle`` is atan2(|a x b|, a . b) and is scale-free, so the edges go in unnormalized
@@ -281,7 +281,7 @@ def face_quality(
     metric: wp.int32,
     out_quality: wp.array[wp.float32],
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices(vertices, faces, f)
     out_quality[f] = triangle_quality(v0, v1, v2, metric)
 
@@ -290,7 +290,7 @@ def face_quality(
 def face_nondegenerate_mask(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_nondegenerate: wp.array[wp.bool]
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     e0, e1, _ = triangle_edges(vertices, faces, f)
     _, area = face_normals_and_area(vertices, faces, f)
     length_e0 = wp.length(e0)
@@ -312,7 +312,7 @@ def barycentric_to_points(
     barycentric: wp.array[wp.vec3],
     out_points: wp.array[wp.vec3],
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices(vertices, faces, f)
     face_barycentric = barycentric[f]
     s = face_barycentric[0] + face_barycentric[1] + face_barycentric[2]
@@ -341,7 +341,7 @@ def points_to_barycentric_cramer(
     points: wp.array[wp.vec3],
     out_barycentric: wp.array[wp.vec3],
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices(vertices, faces, f)
     out_barycentric[f] = point_barycentric_cramer(v0, v1, v2, points[f])
 
@@ -353,7 +353,7 @@ def points_to_barycentric_cross(
     points: wp.array[wp.vec3],
     out_barycentric: wp.array[wp.vec3],
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices(vertices, faces, f)
     e0 = v1 - v0
     e1 = v2 - v0
@@ -372,7 +372,7 @@ def closest_point(
     points: wp.array[wp.vec3],
     out_closest: wp.array[wp.vec3],
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     corner_a, corner_b, corner_c = face_vertices(vertices, faces, f)
     ab, ac, bc = triangle_edges(vertices, faces, f)
 
@@ -618,7 +618,7 @@ def face_aabb_bounds(
     out_lower: wp.array[wp.vec3],
     out_upper: wp.array[wp.vec3],
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices(vertices, faces, f)
     lower, upper = triangle_aabb(v0, v1, v2)
     out_lower[f] = lower

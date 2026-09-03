@@ -314,7 +314,7 @@ def step_sphere_shrink(
     # Every lane writes all three outputs (converged lanes pass their state through), so the
     # wrapper can ping-pong two preallocated buffer sets instead of cloning per iteration, and
     # extra launches on a fully converged state are harmless no-ops.
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     p = points[tid]
     center = centers[tid]
     if not not_converged[tid]:

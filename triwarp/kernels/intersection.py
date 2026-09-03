@@ -143,7 +143,7 @@ def mesh_with_plane_segments(
     out_valid: wp.array[wp.bool],
     out_segments: wp.array2d[wp.vec3],
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     i0 = faces[f * 3]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
@@ -377,7 +377,7 @@ def expand_query_target_pairs(
     target_indices: wp.array[wp.int32],
     out_pairs: wp.array2d[wp.int32],
 ) -> None:
-    q = wp.tid()
+    q = wp.int32(wp.tid())
     start = offsets[q]
     count = hit_counts[q]
     i = wp.int32(0)
@@ -398,7 +398,7 @@ def filter_intersecting_pairs(
     pairs: wp.array2d[wp.int32],
     out_valid: wp.array[wp.bool],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, pairs[tid, 0])
     ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, pairs[tid, 1])
     if triangles_share_vertex(qa, qb, qc, ta, tb, tc):
@@ -439,7 +439,7 @@ def triangle_pair_segments(
     pairs: wp.array2d[wp.int32],
     out_segments: wp.array2d[wp.vec3],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, pairs[tid, 0])
     ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, pairs[tid, 1])
     valid, p0, p1 = triangle_intersection_segment(qa, qb, qc, ta, tb, tc)
@@ -450,7 +450,7 @@ def triangle_pair_segments(
 
 @wp.kernel
 def segment_nondegenerate(segments: wp.array2d[wp.vec3], out_valid: wp.array[wp.bool]) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     p0 = segments[tid, 0]
     p1 = segments[tid, 1]
     out_valid[tid] = wp.length(p1 - p0) > TOLERANCE_MERGE_CONSTANT
@@ -501,7 +501,7 @@ def classify_faces_for_slice(
     out_classes: wp.array[wp.int32],
     out_signs: wp.array2d[wp.int32],
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     i0 = faces[f * 3]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
@@ -537,7 +537,7 @@ def resolve_on_plane_faces(
     plane_normal: wp.vec3,
     out_classes: wp.array[wp.int32],
 ) -> None:
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     if out_classes[f] != SLICE_CLASS_ON_PLANE:
         return
     normal, area = kernel_triangles.face_normals_and_area(vertices, faces, f)
@@ -563,7 +563,7 @@ def slice_class_flags(
     # three of each. Every thread writes all three of its slots, which is what keeps the buffer
     # from needing a memset first. ``n_classes`` is an argument rather than a module constant so
     # that the both-sides split, which keeps four classes where the clip keeps three, shares it.
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     face_class = classes[f]
     for block in range(n_classes):
         # ``wp.int32(0)``, not ``0``: the loop bound is now an argument rather than a module
@@ -600,7 +600,7 @@ def scatter_slice_class(
 ) -> None:
     # ``scatter.scatter_index_where`` over the blocked flag buffer, except that the value written is
     # the *face* index rather than the flag index, so each block comes out addressing faces.
-    t = wp.tid()
+    t = wp.int32(wp.tid())
     if flags[t] != 0:
         out_indices[inclusive[t] - 1] = t % n_faces
 
@@ -627,7 +627,7 @@ def edge_level_crossings(
 ) -> None:
     # The three edge crossings of one cut face, from the per-vertex field the classifier already
     # signed -- so the plane case reuses the dot products rather than recomputing them per edge.
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     face_index = face_indices[tid]
     i0, i1, i2 = kernel_triangles.corner_triple(faces, face_index)
     out_points[tid, 0] = canonical_edge_crossing(vertices, vertex_values, i0, i1)
@@ -668,7 +668,7 @@ def emit_quad_cut(
     out_new_verts: wp.array[wp.vec3],
     out_new_faces: wp.array2d[wp.int32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     face_index = face_indices[tid]
     base = face_index * wp.int32(3)
     s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
@@ -700,7 +700,7 @@ def emit_tri_cut(
     out_new_verts: wp.array[wp.vec3],
     out_new_faces: wp.array2d[wp.int32],
 ) -> None:
-    tid = wp.tid()
+    tid = wp.int32(wp.tid())
     face_index = face_indices[tid]
     base = face_index * wp.int32(3)
     s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
@@ -736,7 +736,7 @@ def classify_faces_for_split(
     # tell the two *uncut* sides apart -- and because a face with one corner exactly on the level
     # set splits into two triangles, not three. Signs follow ``classify_faces_for_slice``:
     # ``SLICE_SIGN_INSIDE`` (-1) is the ``>= isovalue`` side, so a zero value counts as positive.
-    f = wp.tid()
+    f = wp.int32(wp.tid())
     i0, i1, i2 = kernel_triangles.corner_triple(faces, f)
     s0 = -kernel_array.sign_with_tolerance(vertex_dots[i0], TOLERANCE_MERGE_CONSTANT)
     s1 = -kernel_array.sign_with_tolerance(vertex_dots[i1], TOLERANCE_MERGE_CONSTANT)
