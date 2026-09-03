@@ -27,7 +27,13 @@ import warp as wp
 
 from triwarp.constants import INT32_MAX_CONSTANT
 from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_representative
-from triwarp.kernels.array import binary_search_index, lattice_position
+from triwarp.kernels.array import (
+    binary_search_index,
+    declare_map_signatures,
+    lattice_position,
+    map_probe,
+    map_probe_single,
+)
 from triwarp.kernels.intersection import triangle_aabb_overlap
 from triwarp.kernels.predicates import triangle_aabb
 from triwarp.kernels.triangles import face_vertices
@@ -598,3 +604,20 @@ def emit_box_faces(
         out_faces[base + 4] = c
         out_faces[base + 5] = e
         quad += 1
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not three.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was
+    derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
+    here (the shared builtins are declared there).
+    """
+    dense, single = map_probe, map_probe_single
+    declare_map_signatures(
+        [(is_present, (dense(wp.int32),), wp.bool), (is_present, (single(wp.int32),), wp.bool)]
+    )
+
+
+_declare_map_kernels()

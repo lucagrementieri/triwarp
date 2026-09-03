@@ -4,7 +4,15 @@ import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels.array import loop_next_slot, pack_nearest_key, tile_argmin, update_argmin
+from triwarp.kernels.array import (
+    declare_map_signatures,
+    loop_next_slot,
+    map_probe,
+    map_probe_single,
+    pack_nearest_key,
+    tile_argmin,
+    update_argmin,
+)
 from triwarp.kernels.array import wrap_index as _wrap
 from triwarp.kernels.predicates import (
     circumcircle_diameter,
@@ -1123,3 +1131,25 @@ def reduce_closest_cross_label_pair(
     out_partner[i] = best
     if best >= 0 and best_sq <= max_distance_sq:
         wp.atomic_min(out_best, 0, pack_nearest_key(wp.sqrt(best_sq), i))
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not three.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was
+    derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
+    here (the shared builtins are declared there).
+    """
+    dense, single = map_probe, map_probe_single
+    declare_map_signatures(
+        [
+            (char_area_from_max, (dense(wp.float32),), wp.float32),
+            (char_area_from_max, (single(wp.float32),), wp.float32),
+            (plane_origin_from_extreme, (dense(wp.float32), wp.vec3(), wp.float32(1)), wp.vec3),
+            (plane_origin_from_extreme, (single(wp.float32), wp.vec3(), wp.float32(1)), wp.vec3),
+        ]
+    )
+
+
+_declare_map_kernels()

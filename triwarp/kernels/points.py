@@ -1,7 +1,14 @@
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, TILE_1D
-from triwarp.kernels.array import pack_farthest_key, pack_nearest_key, unpack_ranked_index
+from triwarp.kernels.array import (
+    declare_map_signatures,
+    map_probe,
+    map_probe_single,
+    pack_farthest_key,
+    pack_nearest_key,
+    unpack_ranked_index,
+)
 from triwarp.kernels.intersection import point_plane_dot
 from triwarp.kernels.reduce import outer_sum_chunk, tile_chunk
 
@@ -579,3 +586,23 @@ def mark_hull_superset(
                 keep = wp.int32(0)
                 break
     out_mask[i] = keep != 0
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not three.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was
+    derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
+    here (the shared builtins are declared there).
+    """
+    dense, single = map_probe, map_probe_single
+    declare_map_signatures(
+        [
+            (is_in_half_space, (dense(wp.vec3), wp.vec3(), wp.vec3()), wp.bool),
+            (is_in_half_space, (single(wp.vec3), wp.vec3(), wp.vec3()), wp.bool),
+        ]
+    )
+
+
+_declare_map_kernels()

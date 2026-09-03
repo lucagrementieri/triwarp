@@ -53,6 +53,7 @@ from tests.api_conventions import (
     kernel_scope_ternary_problems,
     launch_device_problems,
     library_in_summary_problems,
+    map_declaration_problems,
     mask_return_problems,
     meshlib_reference_problems,
     private_import_problems,
@@ -760,3 +761,26 @@ def test_no_meshlib_references_in_the_package() -> None:
     package.
     """
     _fail("MeshLib reference(s) under triwarp/:", meshlib_reference_problems())
+
+
+def test_repeatedly_mapped_kernel_funcs_declare_their_signatures() -> None:
+    """
+    A kernel module whose ``@wp.func`` is ``wp.map``'d from several sites declares its signatures.
+
+    Not a library comparison: this is a property of triwarp's own module-hash chains. ``wp.map``
+    names its generated module after the *unqualified* op and forks its hash per call signature, so
+    an op reached at three signatures builds its module three times, each build containing every
+    kernel accumulated so far. Measured over one suite run before the tables existed: **182**
+    distinct ``map_*`` module loads over **143** ``(module, device, block_dim)`` pairs -- 39
+    redundant builds, 100-250 ms each cold -- and **143 over 143** afterwards, which is the floor.
+
+    This is check 23, and it is the same *kind* of check as
+    ``test_generic_kernels_register_their_overloads``: it asserts a module which needs a table has
+    one, never that the table is complete. Nothing cheap can prove completeness, and the cost of an
+    incomplete table is a rebuild rather than a wrong answer -- the completeness gate is the load
+    census, which is a clock measurement.
+    """
+    _fail(
+        "kernel module(s) mapping an op from several sites with no declaration table:",
+        map_declaration_problems(),
+    )

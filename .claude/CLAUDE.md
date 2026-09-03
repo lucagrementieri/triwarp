@@ -394,6 +394,28 @@ identical to a hand-written kernel; cached calls cost ~11 µs extra host-side Py
 - Still a real kernel: ops needing the thread index as *data* (`init_range`,
   `seed_orientation`), whole arrays as uniform arguments (binary-search tables), scatters,
   and multi-element/row-indexed outputs.
+- **A `wp.map` op reached at more than one call signature must have those signatures declared at
+  import**, the same rule and the same reason as `wp.overload` below. `wp.map` names its generated
+  module `map_<unqualified op name>` and each distinct signature forks that module's hash, and a
+  module's hash covers the kernels instantiated in it — so an op reached at three signatures builds
+  its module three times, each build containing every kernel accumulated so far. Measured on
+  Warp 1.17: `wp.mul` at float32 → vec3 → float64 in a fresh cache compiles 245 + 43 + 43 ms where
+  the final hash alone is one 253 ms build, and over the tree's eight longest chains, cold cache
+  1 365-1 485 → 647-665 ms (**2.1x**) and warm cache 114.9 → 97.1 ms (1.18x). **Declaration is not
+  compilation** — `return_kernel=True` on a zero-length host array costs ~0.5 ms and reaches the
+  final module directly. The tables live in `_declare_map_kernels()` at the bottom of the module
+  that owns the op (`declare_map_signatures` in `kernels/array.py` carries them and the reasoning);
+  the Warp *builtins* live in `kernels/array.py` because one generated module is shared across
+  several wrappers and every declaration for it has to run before the first launch from any of
+  them. **The fork axis is not only the dtype, which is the part that is not guessable:**
+  `warp._src.utils.map` keys on `(is_array, type(input).__name__, dtype, ndim, broadcast_mask)` per
+  input, where `broadcast_mask` is `tuple(d == 1 for d in shape)` — so a **length-1** array forks a
+  module (12 ops fork on that axis *alone*, and it is the normal path for every reduction-into-a-
+  scalar wrapper), as does an **`indexedarray`** from a Python-scope gather, as does the rank.
+  Derive the table by instrumenting `wp.map` over a suite run and recording Warp's own key; check
+  23 fails when a module needs a table and has none, and the completeness gate is the load census
+  (182 distinct `map_*` loads over 143 `(module, device, block_dim)` pairs before, **143 over 143**
+  after — 143 is the floor).
 
 ### Function-valued parameters and kernel factories (Warp 1.15+)
 
@@ -2029,7 +2051,7 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ## 14. Evolving the Public API
 
 **`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
-`pytest` run. Twenty-two checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
+`pytest` run. Twenty-three checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
 summary line naming a reference library (§10); a `*_mask` producer that does not return
 `wp.array[wp.bool]`; a module summary advertising Warp; a module without a `tests/` **and** a
 `benchmarks/` file named for it; a private name reached across a module boundary; one public name
@@ -2106,6 +2128,14 @@ newer and each exists because the same defect was found twice:
 - **A bare single-index `wp.tid()`.** Check 22, the fifth of the legal-but-undeclared family above.
   It landed at 45 sites against 422, clustered per file rather than scattered — four kernels
   emitting the same family of triangles in one `intersection.py` split 2–2 on the spelling.
+- **A kernel module whose `@wp.func` is `wp.map`'d from several sites with no declaration table.**
+  Check 23, and it is the `_register_overloads` rule one construct over: `wp.map` names its
+  generated module after the *unqualified* op and forks its hash per call **signature**, so an op
+  reached at three signatures builds its module three times. Measured 182 distinct `map_*` loads
+  over 143 `(module, device, block_dim)` pairs before the tables existed and **143 over 143** after
+  — see `kernels/array.py::declare_map_signatures` for the fork axes, which are not only the dtype.
+  Like check 23's sibling for `wp.overload`, it asserts a table *exists* and never that it is
+  complete; the completeness gate is the load census, which is a clock measurement.
 
 Each check carries a written allowlist — read the reason before adding an entry, and prefer fixing
 the code. It does not replace review: it cannot tell whether a *new* name is a good one, only that

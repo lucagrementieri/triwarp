@@ -1784,3 +1784,67 @@ def bare_tid_problems() -> list[str]:
                     f"the tree keeps because it is declarative"
                 )
     return problems
+
+
+# --- check 23 -----------------------------------------------------------------------------------
+
+# Modules whose repeated ``wp.map`` sites are measured *not* to fork: every one of them reaches a
+# single call signature, so a declaration table would be import cost for nothing. Derived from the
+# same census as the tables themselves -- add an entry only with that measurement, never to quiet
+# the check, because the whole point of the census is that a fork is invisible without it.
+_MAP_DECLARATION_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        # ``reciprocal_or_zero`` from three sites, all float32.
+        "energies",
+        # ``abs_deviation`` from two sites, both float32.
+        "registration",
+        # ``extract_components`` from three and ``add_scaled_normal`` / ``combine_components`` /
+        # ``laplacian_step`` from two each -- every one of them a single signature, because the
+        # smoothers are float32 throughout and their repeated sites differ in the *buffer*, not
+        # in its dtype, rank or length.
+        "smoothing",
+    }
+)
+
+
+def map_declaration_problems() -> list[str]:
+    """
+    Check 23: a kernel module that maps its own ``@wp.func`` at two dtypes with no declaration.
+
+    ``.claude/CLAUDE.md`` section 4's ``_register_overloads`` rule, one construct over. ``wp.map``
+    generates a module named ``map_<unqualified op name>`` and each distinct *call signature* forks
+    its hash, so reaching one op at three signatures builds its module three times -- measured
+    182 distinct ``map_*`` module loads over 143 ``(module, device, block_dim)`` pairs on one suite
+    run, i.e. 39 redundant builds at 100-250 ms each cold. ``kernels/array.py``'s
+    ``declare_map_signatures`` block carries the whole reasoning, the fork axes and the numbers.
+
+    This is the same *kind* of check as ``test_generic_kernels_register_their_overloads``: it
+    asserts only that a module which needs a declaration table **has** one, never that the table
+    is complete -- proving that means launching the whole dispatch, and the cost of getting it
+    wrong is a rebuild rather than a wrong answer. The completeness gate is the load census the
+    block above documents, which is a clock measurement and not an assert.
+
+    A module is flagged when the *wrappers* map one of its ``@wp.func``s from two or more distinct
+    call sites and it has no ``_declare_map_kernels``. Two sites is the trigger rather than two
+    dtypes because a static scan cannot see a dtype: what it can see is that the same op is mapped
+    from more than one place, which is the precondition for a fork.
+    """
+    declared = {
+        path.stem
+        for path in _KERNELS_DIR.rglob("*.py")
+        if "_declare_map_kernels" in path.read_text(encoding="utf-8")
+    }
+    # ``wp.map(kernel_<module>.<op>, ...)`` at Python scope, per (module, op).
+    call = re.compile(r"wp\.map\(\s*kernel_(\w+)\.(\w+)")
+    sites: dict[tuple[str, str], int] = {}
+    for path in sorted(_PACKAGE_DIR.glob("*.py")):
+        for module, op in call.findall(path.read_text(encoding="utf-8")):
+            sites[(module, op)] = sites.get((module, op), 0) + 1
+    problems: list[str] = []
+    for (module, op), count in sorted(sites.items()):
+        if count >= 2 and module not in declared and module not in _MAP_DECLARATION_ALLOWLIST:
+            problems.append(
+                f"triwarp/kernels/{module}.py maps '{op}' from {count} call sites and has no "
+                f"_declare_map_kernels() -- see kernels/array.py::declare_map_signatures"
+            )
+    return problems

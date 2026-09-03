@@ -5,6 +5,7 @@ import warp as wp
 from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.algorithms import bfs as kernel_bfs
+from triwarp.kernels.array import declare_map_signatures, map_probe, map_probe_single
 
 # Iterative-deepening k-nearest search. A scan at radius ``r`` enumerates every point within
 # Euclidean distance ``r``, so a row whose k-th distance is at most ``r`` is provably the exact
@@ -973,3 +974,25 @@ def gather_queue_rows(
     if j >= counts[chunk_start + t]:
         return
     out_flat[local_offsets[t] + j] = queue_pool[t, j]
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not three.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was
+    derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
+    here (the shared builtins are declared there).
+    """
+    dense, single = map_probe, map_probe_single
+    declare_map_signatures(
+        [
+            (aabb_count_in_bounds, (wp.uint64(1), dense(wp.vec3), dense(wp.vec3)), wp.int32),
+            (aabb_count_in_bounds, (wp.uint64(1), single(wp.vec3), single(wp.vec3)), wp.int32),
+            (aabb_count_in_box, (wp.uint64(1), dense(wp.vec3), wp.float32(1)), wp.int32),
+            (aabb_count_in_box, (wp.uint64(1), single(wp.vec3), wp.float32(1)), wp.int32),
+        ]
+    )
+
+
+_declare_map_kernels()

@@ -1,5 +1,7 @@
 import warp as wp
 
+from triwarp.kernels.array import declare_map_signatures, map_probe, map_probe_single
+
 
 @wp.func
 def ray_query_first(
@@ -73,3 +75,23 @@ def longest_ray_distance(
         if t_offset >= max_t:
             break
     return wp.inf
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not three.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was
+    derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
+    here (the shared builtins are declared there).
+    """
+    dense, single = map_probe, map_probe_single
+    declare_map_signatures(
+        [
+            (any_hit, (wp.uint64(1), dense(wp.vec3), dense(wp.vec3), wp.float32(1)), wp.bool),
+            (any_hit, (wp.uint64(1), single(wp.vec3), single(wp.vec3), wp.float32(1)), wp.bool),
+        ]
+    )
+
+
+_declare_map_kernels()

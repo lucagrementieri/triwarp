@@ -35,7 +35,7 @@ from triwarp.constants import (
     TOLERANCE_ZERO_F64,
 )
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels.array import cross2, sort3
+from triwarp.kernels.array import cross2, declare_map_signatures, map_probe, sort3
 
 # Full turn in ``float64``; ``type(x)(TWO_PI_F64)`` narrows it to the caller's precision, and at
 # ``float32`` that is bit-identical to ``2 * wp.PI`` (verified on both devices, Warp 1.17).
@@ -678,3 +678,23 @@ def triangle_triangle_distance_sq(
     best = wp.min(best, point_triangle_distance_sq(q1, p0, p1, p2))
     best = wp.min(best, point_triangle_distance_sq(q2, p0, p1, p2))
     return wp.float32(best)
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not three.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was
+    derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
+    here (the shared builtins are declared there).
+    """
+    dense = map_probe
+    declare_map_signatures(
+        [
+            (angle_defect, (dense(wp.float32),), wp.float32),
+            (angle_defect, (dense(wp.float64),), wp.float64),
+        ]
+    )
+
+
+_declare_map_kernels()

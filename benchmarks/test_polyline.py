@@ -320,6 +320,39 @@ def test_polyline_length(bench_case: BenchCase) -> None:
     assert length > 0.0
 
 
+@pytest.mark.benchmark(group="polyline_normal")
+@pytest.mark.benchaxis("polyline")
+@pytest.mark.benchlibs("triwarp")
+def test_polyline_normal(bench_case: BenchCase) -> None:
+    """
+    Newell's loop normal: a ``wp.cross`` accumulated over the closing segments.
+
+    triwarp-only, and it is an absence rather than a cost objection -- no registered library
+    computes a polyline's Newell normal. meshlib's ``Polyline3`` offers a centroid
+    (``findCenterFromPoints``) and a projection but no loop normal, and pyvista's line filters read
+    an arc length rather than an orientation.
+
+    **A second row in the whole-polyline-reduction class**, which the module docstring above
+    otherwise times through one representative. The rule held while the class really did differ
+    "only in the per-segment expression", and it stopped holding: ``polyline_length`` maps
+    ``segment_length`` and reduces through ``triwarp.reduce``, so it was always a proper block
+    reduction, while this one accumulated one ``wp.atomic_add`` per thread into a single
+    ``wp.vec3`` slot -- every thread in the launch contending for one address, and the reduction
+    serialized. Measured, converting it to the lane-strided form
+    (``kernels/polyline.py::accumulate_newell_normal`` carries the table): **1.32x** at 4 096
+    vertices, **19.6x** at 65 536 and **71.8x** at 262 144, with the answer three orders of
+    magnitude more accurate against a float64 reference. So the representative had the *good*
+    shape and the class member it stood in for did not, which is what a one-row class cannot show.
+    ``polyline_centroid`` stays unrepresented: it reaches ``triwarp.reduce`` the way
+    ``polyline_length`` does.
+
+    ``rim_long`` is the row that matters here -- 65 536 vertices, the axis's asymptotic point.
+    """
+    polyline = _polyline_wp(bench_case)
+    normal = bench_case.run(lambda: tw.polyline.polyline_normal(polyline))
+    assert float(np.linalg.norm(np.asarray(list(normal), dtype=np.float64))) > 0.0
+
+
 @pytest.mark.benchmark(group="polyline_radius")
 @pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")

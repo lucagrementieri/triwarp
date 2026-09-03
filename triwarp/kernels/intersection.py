@@ -3,6 +3,7 @@ import warp as wp
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import triangles as kernel_triangles
+from triwarp.kernels.array import declare_map_signatures, map_probe, map_probe_single
 from triwarp.kernels.predicates import triangles_intersect
 
 SLICE_SIGN_INSIDE = wp.constant(wp.int32(-1))
@@ -1074,3 +1075,31 @@ _register_overloads()
 def is_positive_split_class(face_class: wp.int32) -> wp.bool:
     """Side label for an *uncut* face, so the no-crossing path needs no second classifier."""
     return face_class == SPLIT_CLASS_POSITIVE
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not three.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was
+    derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
+    here (the shared builtins are declared there).
+    """
+    dense, single = map_probe, map_probe_single
+    declare_map_signatures(
+        [
+            (
+                plane_with_line,
+                (wp.vec3(), wp.vec3(), dense(wp.vec3), dense(wp.vec3), wp.bool(True)),
+                [wp.vec3, wp.bool],
+            ),
+            (
+                plane_with_line,
+                (wp.vec3(), wp.vec3(), single(wp.vec3), single(wp.vec3), wp.bool(True)),
+                [wp.vec3, wp.bool],
+            ),
+        ]
+    )
+
+
+_declare_map_kernels()

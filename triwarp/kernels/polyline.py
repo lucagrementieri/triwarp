@@ -5,7 +5,10 @@ from triwarp.kernels.array import (
     LOOP_ROUND,
     binary_search_index,
     cross2,
+    declare_map_signatures,
     lowbias32,
+    map_probe,
+    map_probe_single,
     wrap_index,
 )
 from triwarp.kernels.points import plane_basis
@@ -889,3 +892,23 @@ def ear_loop_continue(
         out_state[LOOP_CONDITION] = wp.int32(1)
     else:
         out_state[LOOP_CONDITION] = wp.int32(0)
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not three.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was
+    derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
+    here (the shared builtins are declared there).
+    """
+    dense, single = map_probe, map_probe_single
+    declare_map_signatures(
+        [
+            (segment_length, (dense(wp.vec3), dense(wp.vec3)), wp.float32),
+            (segment_length, (single(wp.vec3), single(wp.vec3)), wp.float32),
+        ]
+    )
+
+
+_declare_map_kernels()
