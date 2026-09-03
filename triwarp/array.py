@@ -56,7 +56,7 @@ def arange(n: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32) -> 
         _check_int_fits(dtype, n - 1, "n")
     out = wp.empty(n, dtype=dtype, device=device)
     if n > 0:
-        wp.launch(kernel_array.init_range, dim=n, inputs=[out], device=device)
+        wp.launch(kernel_array.INIT_RANGE[dtype], dim=n, inputs=[out], device=device)
     return out
 
 
@@ -98,7 +98,7 @@ def arange_step(
     out = wp.empty(count, dtype=dtype, device=device)
     if count > 0:
         wp.launch(
-            kernel_array.init_range_step,
+            kernel_array.INIT_RANGE_STEP[dtype],
             dim=count,
             inputs=[_int_scalar(dtype, step), out],
             device=device,
@@ -149,7 +149,7 @@ def sort_pair_indices(
     out = wp.empty(2 * n, dtype=dtype, device=device)
     if n > 0:
         wp.launch(
-            kernel_array.init_sort_pair_indices,
+            kernel_array.INIT_SORT_PAIR_INDICES[dtype],
             dim=2 * n,
             inputs=[_int_scalar(dtype, n), _int_scalar(dtype, fill_value), out],
             device=device,
@@ -195,7 +195,7 @@ def repeat_range(
     out = wp.empty(count, dtype=dtype, device=device)
     if count > 0:
         wp.launch(
-            kernel_array.init_repeat_index,
+            kernel_array.INIT_REPEAT_INDEX[dtype],
             dim=count,
             inputs=[_int_scalar(dtype, repeats), out],
             device=device,
@@ -653,7 +653,12 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     if n_rows == 0 or n_cols < 2:
         return
     if n_cols <= SORT_ROWS_INSERTION_MAX_COLS:
-        wp.launch(kernel_array.sort_rows_insertion, dim=n_rows, inputs=[data], device=data.device)
+        wp.launch(
+            kernel_array.SORT_ROWS_INSERTION[data.dtype],
+            dim=n_rows,
+            inputs=[data],
+            device=data.device,
+        )
         return
 
     data_buffer = wp.empty(n * 2, dtype=data.dtype, device=data.device)
@@ -890,7 +895,7 @@ def _isin_lookup_sorted(
     sorted_test_wp = _sorted_copy(test_elements)
     out_wp = wp.empty(elements_flat.shape, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_array.isin_lookup_sorted,
+        kernel_array.ISIN_LOOKUP_SORTED[elements_flat.dtype],
         dim=int(elements_flat.shape[0]),
         inputs=[elements_flat, sorted_test_wp, out_wp],
         device=device,

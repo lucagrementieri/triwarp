@@ -236,7 +236,7 @@ def cut_along_edges(
 
     out_vertices = wp.empty(int(unique_labels.shape[0]), dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_seams.scatter_corner_values,
+        kernel_seams.SCATTER_CORNER_VALUES[vertices.dtype],
         dim=n_halfedges,
         inputs=[faces, corner_index, vertices, out_vertices],
         device=device,

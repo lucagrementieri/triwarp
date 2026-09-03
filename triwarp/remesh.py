@@ -852,7 +852,7 @@ class _FlipTopology:
             device=self._device,
         )
         wp.launch(
-            kernel_array.init_sort_pair_indices,
+            kernel_array.INIT_SORT_PAIR_INDICES[wp.int32],
             dim=2 * n,
             inputs=[wp.int32(n), wp.int32(-1), self._order],
             device=self._device,
@@ -1621,7 +1621,7 @@ class _DecimationBuffers:
             device=device,
         )
         wp.launch(
-            kernel_array.init_sort_pair_indices,
+            kernel_array.INIT_SORT_PAIR_INDICES[wp.int32],
             dim=2 * n,
             inputs=[wp.int32(n), wp.int32(-1), self._order],
             device=device,
@@ -1882,7 +1882,7 @@ def _run_collapse_rounds(
         )
         # The set is already independent, so dropping members of it keeps it independent.
         wp.launch(
-            kernel_array.init_sort_pair_indices,
+            kernel_array.INIT_SORT_PAIR_INDICES[wp.int32],
             dim=2 * m,
             inputs=[wp.int32(m), wp.int32(-1), sort_values],
             device=device,

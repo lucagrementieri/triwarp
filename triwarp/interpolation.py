@@ -257,7 +257,7 @@ def transfer_onto_vertices(
         source_vertices, source_faces, target_vertices, max_dist=max_dist
     )
     wp.launch(
-        kernel_interpolation.transfer_onto_vertices,
+        kernel_interpolation.TRANSFER_ONTO_VERTICES[source_values.dtype],
         dim=n_target,
         inputs=[
             source_vertices,
@@ -356,7 +356,7 @@ def transfer_through_operator(
         return out_values
 
     wp.launch(
-        kernel_interpolation.apply_transfer_operator,
+        kernel_interpolation.APPLY_TRANSFER_OPERATOR[values.dtype],
         dim=n_out,
         inputs=[operator.offsets, operator.columns, operator.values, values, out_values],
         device=device,
@@ -478,7 +478,7 @@ def interpolate_from_points(
         offsets = tw.array.arange_step(n_query + 1, int(k), device)
 
     wp.launch(
-        kernel_interpolation.interpolate_from_points,
+        kernel_interpolation.INTERPOLATE_FROM_POINTS[source_values.dtype],
         dim=n_query,
         inputs=[
             source_values,

@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.array import to_vec3d
+from triwarp.kernels.array import OverloadTable, to_vec3d
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.predicates import (
     corner_cosines_from_l2,
@@ -674,32 +674,72 @@ def vector_area_triplets(
 _MATRIX_DTYPES = (wp.float32, wp.float64)
 
 
+# The concrete handles keyed by the caller's matrix dtype -- see
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable].
+# ``CROUZEIX_RAVIART_COTMATRIX_TRIPLETS`` keys on the pair ``(entry dtype, matrix dtype)`` for the
+# reason its registration already gave: the two templates are independent.
+ZERO_AT_INDICES: OverloadTable
+CROUZEIX_RAVIART_MASS_DIAG: OverloadTable
+CROUZEIX_RAVIART_COTMATRIX_TRIPLETS: OverloadTable
+SANDWICH_ROW_COUNTS: OverloadTable
+SANDWICH_ROW_TRIPLETS: OverloadTable
+HESSIAN_ENERGY_TRIPLETS: OverloadTable
+CURVED_HESSIAN_TRIPLETS: OverloadTable
+
+
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
+    global ZERO_AT_INDICES, CROUZEIX_RAVIART_MASS_DIAG, CROUZEIX_RAVIART_COTMATRIX_TRIPLETS
+    global SANDWICH_ROW_COUNTS, SANDWICH_ROW_TRIPLETS
+    global HESSIAN_ENERGY_TRIPLETS, CURVED_HESSIAN_TRIPLETS
     i32 = wp.array[wp.int32]
-    for dtype in _MATRIX_DTYPES:
-        values = wp.array[dtype]
-        wp.overload(zero_at_indices, [i32, values])
-        wp.overload(crouzeix_raviart_mass_diag, [wp.array[wp.vec3], i32, i32, values])
-        # ``cot_entries`` and the matrix precision are *independent* templates:
-        # ``crouzeix_raviart_cotmatrix`` takes ``cot_entries`` as ``twt.Array2dFloat`` beside a
-        # separate ``dtype`` keyword, and the kernel casts the entries to the matrix precision, so
-        # this is a genuine 2x2 rather than a diagonal. Measured on Warp 1.17 before the second row
-        # existed: the first float64-entries/float32-matrix launch recompiled this whole module and
-        # took 80.3 s and returned the right answer -- the silent cost CLAUDE.md section 2.5 names.
-        for entry_dtype in _MATRIX_DTYPES:
-            wp.overload(
-                crouzeix_raviart_cotmatrix_triplets,
-                [i32, wp.array2d[entry_dtype], i32, i32, values],
-            )
-        wp.overload(sandwich_row_counts, [i32, i32, values, i32])
-        wp.overload(
-            sandwich_row_triplets,
-            [i32, i32, values, i32, i32, values, values, i32, i32, i32, values],
-        )
-        wp.overload(
-            hessian_energy_triplets,
-            [
+    ZERO_AT_INDICES = OverloadTable(
+        zero_at_indices, {d: [i32, wp.array[d]] for d in _MATRIX_DTYPES}
+    )
+    CROUZEIX_RAVIART_MASS_DIAG = OverloadTable(
+        crouzeix_raviart_mass_diag,
+        {d: [wp.array[wp.vec3], i32, i32, wp.array[d]] for d in _MATRIX_DTYPES},
+    )
+    # ``cot_entries`` and the matrix precision are *independent* templates:
+    # ``crouzeix_raviart_cotmatrix`` takes ``cot_entries`` as ``twt.Array2dFloat`` beside a
+    # separate ``dtype`` keyword, and the kernel casts the entries to the matrix precision, so
+    # this is a genuine 2x2 rather than a diagonal. Measured on Warp 1.17 before the second row
+    # existed: the first float64-entries/float32-matrix launch recompiled this whole module and
+    # took 80.3 s and returned the right answer -- the silent cost CLAUDE.md section 2.5 names.
+    CROUZEIX_RAVIART_COTMATRIX_TRIPLETS = OverloadTable(
+        crouzeix_raviart_cotmatrix_triplets,
+        {
+            (entry_dtype, dtype): [i32, wp.array2d[entry_dtype], i32, i32, wp.array[dtype]]
+            for dtype in _MATRIX_DTYPES
+            for entry_dtype in _MATRIX_DTYPES
+        },
+    )
+    SANDWICH_ROW_COUNTS = OverloadTable(
+        sandwich_row_counts, {d: [i32, i32, wp.array[d], i32] for d in _MATRIX_DTYPES}
+    )
+    SANDWICH_ROW_TRIPLETS = OverloadTable(
+        sandwich_row_triplets,
+        {
+            d: [
+                i32,
+                i32,
+                wp.array[d],
+                i32,
+                i32,
+                wp.array[d],
+                wp.array[d],
+                i32,
+                i32,
+                i32,
+                wp.array[d],
+            ]
+            for d in _MATRIX_DTYPES
+        },
+    )
+    HESSIAN_ENERGY_TRIPLETS = OverloadTable(
+        hessian_energy_triplets,
+        {
+            d: [
                 i32,
                 i32,
                 i32,
@@ -709,12 +749,15 @@ def _register_overloads() -> None:
                 i32,
                 i32,
                 i32,
-                values,
-            ],
-        )
-        wp.overload(
-            curved_hessian_triplets,
-            [
+                wp.array[d],
+            ]
+            for d in _MATRIX_DTYPES
+        },
+    )
+    CURVED_HESSIAN_TRIPLETS = OverloadTable(
+        curved_hessian_triplets,
+        {
+            d: [
                 wp.array[wp.vec3],
                 i32,
                 i32,
@@ -726,9 +769,11 @@ def _register_overloads() -> None:
                 wp.array2d[wp.float64],
                 i32,
                 i32,
-                values,
-            ],
-        )
+                wp.array[d],
+            ]
+            for d in _MATRIX_DTYPES
+        },
+    )
 
 
 _register_overloads()

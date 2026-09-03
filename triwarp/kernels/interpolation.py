@@ -2,7 +2,7 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.kernels.array import trilinear_cell, trilinear_weight
+from triwarp.kernels.array import OverloadTable, trilinear_cell, trilinear_weight
 from triwarp.kernels.triangles import face_vertices, point_barycentric_cramer
 
 
@@ -173,47 +173,67 @@ def sample_grid_trilinear(
 # ``interpolate_from_points`` documents the same pair. ``apply_transfer_operator`` adds ``wp.vec2``,
 # since it is the one that carries a *stored attribute* through a topology edit and a UV pair is one
 # of the things such an attribute is. It cannot add ``wp.float64``: its weights are float32.
+# The concrete handles keyed by the caller's value dtype -- see
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable].
+APPLY_TRANSFER_OPERATOR: OverloadTable
+SAMPLE_GRID_TRILINEAR: OverloadTable
+TRANSFER_ONTO_VERTICES: OverloadTable
+INTERPOLATE_FROM_POINTS: OverloadTable
+
+
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
-    for dtype in (wp.float32, wp.vec2, wp.vec3):
-        wp.overload(
-            apply_transfer_operator,
-            [
+    global APPLY_TRANSFER_OPERATOR, SAMPLE_GRID_TRILINEAR
+    global TRANSFER_ONTO_VERTICES, INTERPOLATE_FROM_POINTS
+    APPLY_TRANSFER_OPERATOR = OverloadTable(
+        apply_transfer_operator,
+        {
+            d: [
                 wp.array[wp.int32],
                 wp.array[wp.int32],
                 wp.array[wp.float32],
-                wp.array[dtype],
-                wp.array[dtype],
-            ],
-        )
-    for dtype in (wp.float32, wp.vec3):
-        wp.overload(
-            sample_grid_trilinear,
-            [wp.array3d[dtype], wp.vec3, wp.vec3, wp.array[wp.vec3], wp.array[dtype]],
-        )
-        wp.overload(
-            transfer_onto_vertices,
-            [
+                wp.array[d],
+                wp.array[d],
+            ]
+            for d in (wp.float32, wp.vec2, wp.vec3)
+        },
+    )
+    SAMPLE_GRID_TRILINEAR = OverloadTable(
+        sample_grid_trilinear,
+        {
+            d: [wp.array3d[d], wp.vec3, wp.vec3, wp.array[wp.vec3], wp.array[d]]
+            for d in (wp.float32, wp.vec3)
+        },
+    )
+    TRANSFER_ONTO_VERTICES = OverloadTable(
+        transfer_onto_vertices,
+        {
+            d: [
                 wp.array[wp.vec3],
                 wp.array[wp.int32],
-                wp.array[dtype],
+                wp.array[d],
                 wp.array[wp.vec3],
                 wp.array[wp.int32],
-                wp.array[dtype],
+                wp.array[d],
                 wp.array[wp.float32],
-            ],
-        )
-        wp.overload(
-            interpolate_from_points,
-            [
-                wp.array[dtype],
+            ]
+            for d in (wp.float32, wp.vec3)
+        },
+    )
+    INTERPOLATE_FROM_POINTS = OverloadTable(
+        interpolate_from_points,
+        {
+            d: [
+                wp.array[d],
                 wp.array[wp.int32],
                 wp.array[wp.float32],
                 wp.array[wp.int32],
                 wp.float32,
-                wp.array[dtype],
-            ],
-        )
+                wp.array[d],
+            ]
+            for d in (wp.float32, wp.vec3)
+        },
+    )
 
 
 _register_overloads()

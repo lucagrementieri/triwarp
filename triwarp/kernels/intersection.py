@@ -3,7 +3,7 @@ import warp as wp
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import triangles as kernel_triangles
-from triwarp.kernels.array import declare_map_signatures, map_probe, map_probe_single
+from triwarp.kernels.array import OverloadTable, declare_map_signatures, map_probe, map_probe_single
 from triwarp.kernels.predicates import triangles_intersect
 
 SLICE_SIGN_INSIDE = wp.constant(wp.int32(-1))
@@ -972,21 +972,29 @@ def marching_triangles_segments(
 # Only the scalar field being contoured is generic: ``marching_triangles`` accepts a ``wp.float32``
 # or ``wp.float64`` per-vertex field (the heat solvers produce the latter), while the geometry it
 # writes stays ``wp.vec3``.
+# The concrete handle keyed by the field dtype -- see
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable].
+MARCHING_TRIANGLES_SEGMENTS: OverloadTable
+
+
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
-    for dtype in (wp.float32, wp.float64):
-        wp.overload(
-            marching_triangles_segments,
-            [
+    global MARCHING_TRIANGLES_SEGMENTS
+    MARCHING_TRIANGLES_SEGMENTS = OverloadTable(
+        marching_triangles_segments,
+        {
+            d: [
                 wp.array[wp.vec3],
                 wp.array[wp.int32],
-                wp.array[dtype],
+                wp.array[d],
                 wp.array[wp.int32],
                 wp.array[wp.bool],
                 wp.array2d[wp.vec3],
                 wp.array2d[wp.int32],
-            ],
-        )
+            ]
+            for d in (wp.float32, wp.float64)
+        },
+    )
 
 
 _register_overloads()

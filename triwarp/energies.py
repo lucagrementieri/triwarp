@@ -383,7 +383,7 @@ def _diagonal_sandwich(
     device = inverse_mass.device
     counts = wp.empty(n_rows, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_energies.sandwich_row_counts,
+        kernel_energies.SANDWICH_ROW_COUNTS[inverse_mass.dtype],
         dim=n_rows,
         inputs=[a.offsets, b.offsets, inverse_mass, counts],
         device=device,
@@ -395,7 +395,7 @@ def _diagonal_sandwich(
     rows, cols, vals = tw.array.triplet_buffers(n_triplets, dtype, device)
     if n_triplets > 0:
         wp.launch(
-            kernel_energies.sandwich_row_triplets,
+            kernel_energies.SANDWICH_ROW_TRIPLETS[dtype],
             dim=n_rows,
             inputs=[
                 a.offsets,
@@ -513,7 +513,7 @@ def hessian_energy(
     rows, cols, vals = tw.array.triplet_buffers(n_triplets, dtype, device)
     if n_triplets > 0:
         wp.launch(
-            kernel_energies.hessian_energy_triplets,
+            kernel_energies.HESSIAN_ENERGY_TRIPLETS[dtype],
             dim=n_vertices,
             inputs=[
                 faces,
@@ -638,7 +638,7 @@ def curved_hessian_energy(
     n_triplets = 144 * n_faces
     rows, cols, vals = tw.array.triplet_buffers(n_triplets, dtype, device)
     wp.launch(
-        kernel_energies.curved_hessian_triplets,
+        kernel_energies.CURVED_HESSIAN_TRIPLETS[dtype],
         dim=n_faces,
         inputs=[
             vertices,
@@ -733,7 +733,7 @@ def crouzeix_raviart_cotmatrix(
     n_triplets = 12 * n_faces
     rows, cols, vals = tw.array.triplet_buffers(n_triplets, dtype, device)
     wp.launch(
-        kernel_energies.crouzeix_raviart_cotmatrix_triplets,
+        kernel_energies.CROUZEIX_RAVIART_COTMATRIX_TRIPLETS[cot_entries.dtype, dtype],
         dim=n_faces,
         inputs=[edge_map, cot_entries, rows, cols, vals],
         device=device,
@@ -815,7 +815,7 @@ def _cr_mass_diagonal(
     mass = wp.zeros(n_edges, dtype=dtype, device=faces.device)
     if n_faces > 0:
         wp.launch(
-            kernel_energies.crouzeix_raviart_mass_diag,
+            kernel_energies.CROUZEIX_RAVIART_MASS_DIAG[dtype],
             dim=n_faces,
             inputs=[vertices, faces, edge_map, mass],
             device=faces.device,
@@ -1005,7 +1005,7 @@ def _zero_at_boundary(
     n_boundary = int(boundary.shape[0])
     if n_boundary > 0:
         wp.launch(
-            kernel_energies.zero_at_indices,
+            kernel_energies.ZERO_AT_INDICES[values.dtype],
             dim=n_boundary,
             inputs=[boundary, values],
             device=values.device,

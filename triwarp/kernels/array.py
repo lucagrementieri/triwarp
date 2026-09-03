@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import warp as wp
@@ -591,21 +591,103 @@ _KEY_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64)
 _SORT_KEY_DTYPES = (*_KEY_DTYPES, wp.float32, wp.float64)
 
 
+class KernelTable(dict[Any, wp.Kernel]):
+    """
+    Concrete kernels by dtype key, so a wrapper hands ``wp.launch`` the kernel it already resolved.
+
+    The base of [`OverloadTable`][triwarp.kernels.array.OverloadTable], and used directly by
+    ``kernels/reduce.py``, whose kernels are factory instantiations rather than ``wp.overload``
+    results. The whole content of the class is what a *missing* key means: a dtype the module's
+    dispatch can reach but never registered, which is a registration gap and not a slow path -- see
+    [`OverloadTable`][triwarp.kernels.array.OverloadTable] for what that silently costs.
+    """
+
+    def __init__(self, owner: str, entries: Mapping[Any, wp.Kernel]) -> None:
+        """Key ``entries`` by dtype, naming ``owner`` in the error a missing key raises."""
+        super().__init__(entries)
+        self._owner = owner
+
+    def __missing__(self, key: Any) -> wp.Kernel:
+        raise KeyError(
+            f"{self._owner} has no kernel registered for {key!r}; add the dtype to the owning "
+            "kernel module's registration rather than launching a generic kernel, which would "
+            "rebuild the whole module on first use (CLAUDE.md section 2.5)."
+        )
+
+
+class OverloadTable(KernelTable):
+    """
+    Concrete kernel handles by dtype key, so a launch never re-infers the overload.
+
+    ``wp.launch`` on a generic kernel runs ``infer_argument_types`` over the whole argument list
+    and *then* looks the overload up, on **every** call -- and that inference is the cost, not the
+    lookup. Measured on Warp 1.17 / RTX 5090, 100 launches between two synchronization points:
+    ``triangles.face_signed_volumes`` (three generic parameters) costs **26.6 us** launched
+    generically and **12.2 us** launched through the handle ``wp.overload`` already returned, with
+    bit-identical output -- **2.17x, 14.3 us a launch**.
+    A kernel generic in one array dtype costs about 12 us of the same overhead, against a ~12 us
+    concrete launch floor: a generic launch is roughly *twice* the host cost of a concrete one.
+
+    Nothing new is compiled. ``_register_overloads`` was already creating these overloads at import
+    for the reason in ``.claude/CLAUDE.md`` section 2.5 (a lazily instantiated overload rebuilds the
+    whole module); this only keeps the ``wp.Kernel`` that ``wp.overload`` returns instead of
+    discarding it. The kernel source stays dtype-generic, so section 1.2's preference for generic
+    ``@wp.func``/kernel bodies is untouched -- what changes is only which object the wrapper hands
+    ``wp.launch``.
+
+    A missing key raises rather than falling back to the generic kernel. Falling back would work
+    and would be *slow in the way section 2.5 exists to prevent* -- the first launch at an
+    unregistered dtype rebuilds the module, measured at 80.3 s for one
+    ``energies.crouzeix_raviart_cotmatrix_triplets`` call -- so an unregistered dtype is a
+    registration gap to fix, and this turns it from a clock reading into an error naming the
+    kernel.
+    """
+
+    def __init__(self, kernel: wp.Kernel, signatures: Mapping[Any, Sequence[Any]]) -> None:
+        """Instantiate ``kernel``'s overloads, keyed by whatever ``signatures`` keys them by."""
+        super().__init__(
+            kernel.key, {key: wp.overload(kernel, list(types)) for key, types in signatures.items()}
+        )
+
+
+# The concrete handles ``wp.overload`` hands back, keyed by the caller's dtype -- see
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable] for why a wrapper launches through these
+# rather than through the generic kernel above it (measured 2.17x on a launch, and nothing extra is
+# compiled). Declared here so a type checker sees them at module scope; ``_register_overloads``
+# fills them in at import.
+INIT_RANGE: OverloadTable
+INIT_RANGE_STEP: OverloadTable
+INIT_REPEAT_INDEX: OverloadTable
+INIT_SORT_PAIR_INDICES: OverloadTable
+ISIN_LOOKUP_SORTED: OverloadTable
+MAP_SORTED_INVERSE: OverloadTable
+SORT_ROWS_INSERTION: OverloadTable
+
+
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
-    for dtype in _INDEX_DTYPES:
-        wp.overload(init_range, [wp.array[dtype]])
-        wp.overload(init_range_step, [dtype, wp.array[dtype]])
-        wp.overload(init_repeat_index, [dtype, wp.array[dtype]])
-        wp.overload(init_sort_pair_indices, [dtype, dtype, wp.array[dtype]])
-    for dtype in _KEY_DTYPES:
-        wp.overload(isin_lookup_sorted, [wp.array[dtype], wp.array[dtype], wp.array[wp.bool]])
-    for dtype in _SORT_KEY_DTYPES:
-        wp.overload(map_sorted_inverse, [wp.array[dtype], wp.array[dtype], wp.array[wp.int32]])
+    global INIT_RANGE, INIT_RANGE_STEP, INIT_REPEAT_INDEX, INIT_SORT_PAIR_INDICES
+    global ISIN_LOOKUP_SORTED, MAP_SORTED_INVERSE, SORT_ROWS_INSERTION
+    INIT_RANGE = OverloadTable(init_range, {d: [wp.array[d]] for d in _INDEX_DTYPES})
+    INIT_RANGE_STEP = OverloadTable(init_range_step, {d: [d, wp.array[d]] for d in _INDEX_DTYPES})
+    INIT_REPEAT_INDEX = OverloadTable(
+        init_repeat_index, {d: [d, wp.array[d]] for d in _INDEX_DTYPES}
+    )
+    INIT_SORT_PAIR_INDICES = OverloadTable(
+        init_sort_pair_indices, {d: [d, d, wp.array[d]] for d in _INDEX_DTYPES}
+    )
+    ISIN_LOOKUP_SORTED = OverloadTable(
+        isin_lookup_sorted, {d: [wp.array[d], wp.array[d], wp.array[wp.bool]] for d in _KEY_DTYPES}
+    )
+    MAP_SORTED_INVERSE = OverloadTable(
+        map_sorted_inverse,
+        {d: [wp.array[d], wp.array[d], wp.array[wp.int32]] for d in _SORT_KEY_DTYPES},
+    )
     # ``sort_rows_insertion`` sorts a rank-2 table in place; ``unique_rows`` and the hashing paths
     # that reach it build that table in the caller's dtype.
-    for dtype in (wp.int32, wp.float32, wp.float64):
-        wp.overload(sort_rows_insertion, [wp.array2d[dtype]])
+    SORT_ROWS_INSERTION = OverloadTable(
+        sort_rows_insertion, {d: [wp.array2d[d]] for d in (wp.int32, wp.float32, wp.float64)}
+    )
 
 
 _register_overloads()

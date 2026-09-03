@@ -337,7 +337,7 @@ def vertex_defects(
     angle_sum = wp.zeros(n_vertices, dtype=wp.float32, device=faces.device)
     faces2d = faces.reshape((-1, 3))
     wp.launch(
-        kernel_scatter.scatter_sum_scalar,
+        kernel_scatter.SCATTER_SUM_SCALAR[face_angles.dtype],
         dim=int(face_angles.shape[0]),
         inputs=[face_angles, faces2d, angle_sum],
         device=faces.device,

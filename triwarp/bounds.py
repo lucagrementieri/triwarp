@@ -25,6 +25,7 @@ import numpy as np
 import warp as wp
 
 import triwarp as tw
+from triwarp._device import read_scalar
 from triwarp.kernels import bounds as kernel_bounds
 from triwarp.kernels import predicates as kernel_predicates
 
@@ -626,9 +627,9 @@ def oriented_bounding_box(
     best = int(loss_np.argmin())
 
     if refine_iterations == 0:
-        # The winning frame alone, 36 bytes off a contiguous one-element slice, so the pure
+        # The winning frame alone, 36 bytes through the shared readback scratch, so the pure
         # sampled path stays bit-comparable with the device-generated candidate set.
-        rotation_np = axes[best : best + 1].numpy()[0]
+        rotation_np = read_scalar(axes, best)
         return (
             wp.mat33(*rotation_np.ravel().tolist()),
             wp.vec3(*lower_np[best].tolist()),
@@ -716,8 +717,8 @@ def _refine_box(
         sigma *= 0.4
 
     winner = int(chain_loss.argmin())
-    # The winning frame alone, 36 bytes off a contiguous one-element slice.
-    frame_np = chains[winner : winner + 1].numpy()[0].astype(np.float64)
+    # The winning frame alone, 36 bytes through the shared readback scratch.
+    frame_np = read_scalar(chains, winner).astype(np.float64)
     return frame_np, chain_lower[winner], chain_upper[winner]
 
 

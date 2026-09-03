@@ -64,6 +64,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import creation as kernel_creation
@@ -1627,9 +1628,12 @@ def sweep_polygon(
         )
 
     # Two 12-byte endpoint reads decide whether the path closes; the rest of it never leaves the
-    # device. Both slices are contiguous prefixes/suffixes, so the readbacks are exact.
-    first = path[:1].numpy()[0]
-    last = path[n_path - 1 :].numpy()[0]
+    # device. ``read_scalar`` rather than ``path[k : k + 1].numpy()[0]``: each spelling of the
+    # latter allocates a fresh host array per call and measures 27.8 us against the shared-scratch
+    # copy's 15.7 (see [`read_scalar`][triwarp._device.read_scalar]), and this function is
+    # 94-99 % host time.
+    first = read_scalar(path, 0)
+    last = read_scalar(path, n_path - 1)
     closed = math.dist(first.tolist(), last.tolist()) < TOLERANCE_MERGE
     connect_closed = closed and connect
 

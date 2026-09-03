@@ -63,7 +63,7 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     # (n, length) over-allocation).
     is_start = wp.empty(n, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_grouping.mark_group_starts,
+        kernel_grouping.MARK_GROUP_STARTS[values_buffer.dtype],
         dim=n,
         inputs=[values_buffer, wp.int32(n), wp.int32(length), is_start],
         device=device,
@@ -238,7 +238,7 @@ def _unique_hash(
     slot_counts = wp.zeros(cap, dtype=wp.int32, device=device)
     occupied = wp.zeros(cap, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_grouping.hash_insert,
+        kernel_grouping.HASH_INSERT[key_dtype],
         dim=n,
         inputs=[data_int, slot_key, slot_counts, mask, occupied],
         device=device,
@@ -258,7 +258,7 @@ def _unique_hash(
     cnts_compact = wp.empty(n_unique, dtype=wp.int32, device=device)
     perm_buf = wp.empty(2 * n_unique, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_grouping.compact_from_table,
+        kernel_grouping.COMPACT_FROM_TABLE[key_dtype],
         dim=cap,
         inputs=[slot_key, slot_counts, occupied, scan_pos, keys_compact, cnts_compact, perm_buf],
         device=device,
@@ -295,7 +295,7 @@ def _unique_hash(
         )
         unique_inverse = wp.empty(n, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_array.map_sorted_inverse,
+            kernel_array.MAP_SORTED_INVERSE[data_sorted_space.dtype],
             dim=n,
             inputs=[data_sorted_space, sorted_dense, unique_inverse],
             device=device,

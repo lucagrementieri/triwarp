@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import warp as wp
 
 from triwarp.constants import ITEMS_PER_SLICE_CPU, ITEMS_PER_SLICE_CUDA
@@ -199,23 +200,37 @@ def read_scalar(arr: wp.array[Any], index: int = -1) -> Any:
     Returns
     -------
     Any
-        The element, as the Python scalar ``numpy`` gives for that dtype (``int`` for the integer
-        dtypes, ``float`` for the floating ones). Callers wrap it in ``int(...)`` / ``float(...)``
+        The element, as the value ``numpy`` gives for that dtype: a Python scalar for the scalar
+        dtypes (``int`` for the integer ones, ``float`` for the floating ones), and a **copy** of
+        the row for a vector or matrix dtype. Callers wrap it in ``int(...)`` / ``float(...)``
         where a definite type is wanted.
 
     Notes
     -----
     Not reentrant: the scratch is shared, so two concurrent readbacks of the same dtype from
     different threads would clobber each other. Nothing in this package reads back off-thread.
+
+    **The copy is load-bearing for the non-scalar dtypes, and its absence is silent.** Indexing a
+    ``wp.array[wp.vec3]``'s ``.numpy()`` yields a *view*, so without it two sequential reads of the
+    same dtype would both alias the one cached scratch row and the first would take the second's
+    value -- ``creation.sweep_polygon`` reads a path's two endpoints back to back and would decide
+    every open path was closed. On the host branch the view is onto the caller's own buffer, where
+    a caller writing through it would corrupt the array. Scalar dtypes are unaffected (``numpy``
+    hands back a scalar, which is already a copy), which is exactly why this hides.
     """
     n = int(arr.shape[0])
     slot = index if index >= 0 else n + index
     device = arr.device
     if device is None or not device.is_cuda:
-        return arr.numpy()[slot]
+        return _detached(arr.numpy()[slot])
     scratch = _SCALAR_SCRATCH.get(arr.dtype)
     if scratch is None:
         scratch = wp.empty(1, dtype=arr.dtype, device="cpu")
         _SCALAR_SCRATCH[arr.dtype] = scratch
     wp.copy(scratch, arr[slot : slot + 1])
-    return scratch.numpy()[0]
+    return _detached(scratch.numpy()[0])
+
+
+def _detached(value: Any) -> Any:
+    """Copy ``value`` when it is a view, so a vector or matrix element outlives the next read."""
+    return value.copy() if isinstance(value, np.ndarray) else value

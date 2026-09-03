@@ -182,7 +182,7 @@ def discrete_gaussian_curvature(
     defects = vertex_defects(vertices.shape[0], faces, face_angles)
     gauss_curvature = wp.zeros(int(points.shape[0]), dtype=wp.float32, device=points.device)
     wp.launch(
-        kernel_scatter.scatter_offset_sum,
+        kernel_scatter.SCATTER_OFFSET_SUM[defects.dtype],
         dim=int(nearest_indices.shape[0]),
         inputs=[defects, nearest_indices, nearest_offsets, gauss_curvature],
         device=points.device,

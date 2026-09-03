@@ -2,7 +2,12 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.kernels.array import binary_search_index, trilinear_cell, trilinear_weight
+from triwarp.kernels.array import (
+    OverloadTable,
+    binary_search_index,
+    trilinear_cell,
+    trilinear_weight,
+)
 
 
 @wp.func
@@ -382,32 +387,59 @@ _SCATTER_ADD_DTYPES = (wp.float32, wp.vec2d)
 _GRID_DTYPES = (wp.float32, wp.vec3)
 
 
+# The concrete handles keyed by the caller's value dtype -- see
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable]. This module's kernels are one launch of a
+# short wrapper each, which is where the ~12 us a generic launch costs is worth the most: the
+# ``voxels.splat_onto_grid`` pair alone is two of them on a 0.13-0.21 ms call.
+DIVIDE_BY_DENSITY: OverloadTable
+SPLAT_GRID_TRILINEAR: OverloadTable
+SCATTER_ADD: OverloadTable
+SCATTER_FACE_THIRDS: OverloadTable
+SCATTER_OFFSET_SUM: OverloadTable
+SCATTER_SUM_SCALAR: OverloadTable
+
+
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
-    for dtype in _GRID_DTYPES:
-        wp.overload(divide_by_density, [wp.array3d[wp.float32], wp.float32, wp.array3d[dtype]])
-        wp.overload(
-            splat_grid_trilinear,
-            [
+    global DIVIDE_BY_DENSITY, SPLAT_GRID_TRILINEAR, SCATTER_ADD
+    global SCATTER_FACE_THIRDS, SCATTER_OFFSET_SUM, SCATTER_SUM_SCALAR
+    DIVIDE_BY_DENSITY = OverloadTable(
+        divide_by_density,
+        {d: [wp.array3d[wp.float32], wp.float32, wp.array3d[d]] for d in _GRID_DTYPES},
+    )
+    SPLAT_GRID_TRILINEAR = OverloadTable(
+        splat_grid_trilinear,
+        {
+            d: [
                 wp.array[wp.vec3],
-                wp.array[dtype],
+                wp.array[d],
                 wp.vec3,
                 wp.vec3,
-                wp.array3d[dtype],
+                wp.array3d[d],
                 wp.array3d[wp.float32],
-            ],
-        )
-    for dtype in _SCATTER_ADD_DTYPES:
-        wp.overload(scatter_add, [wp.array[dtype], wp.array[wp.int32], wp.array[dtype]])
-    for dtype in _VALUE_DTYPES:
-        wp.overload(
-            scatter_face_thirds, [wp.array[wp.int32], wp.array[dtype], dtype, wp.array[dtype]]
-        )
-        wp.overload(
-            scatter_offset_sum,
-            [wp.array[dtype], wp.array[wp.int32], wp.array[wp.int32], wp.array[dtype]],
-        )
-        wp.overload(scatter_sum_scalar, [wp.array2d[dtype], wp.array2d[wp.int32], wp.array[dtype]])
+            ]
+            for d in _GRID_DTYPES
+        },
+    )
+    SCATTER_ADD = OverloadTable(
+        scatter_add,
+        {d: [wp.array[d], wp.array[wp.int32], wp.array[d]] for d in _SCATTER_ADD_DTYPES},
+    )
+    SCATTER_FACE_THIRDS = OverloadTable(
+        scatter_face_thirds,
+        {d: [wp.array[wp.int32], wp.array[d], d, wp.array[d]] for d in _VALUE_DTYPES},
+    )
+    SCATTER_OFFSET_SUM = OverloadTable(
+        scatter_offset_sum,
+        {
+            d: [wp.array[d], wp.array[wp.int32], wp.array[wp.int32], wp.array[d]]
+            for d in _VALUE_DTYPES
+        },
+    )
+    SCATTER_SUM_SCALAR = OverloadTable(
+        scatter_sum_scalar,
+        {d: [wp.array2d[d], wp.array2d[wp.int32], wp.array[d]] for d in _VALUE_DTYPES},
+    )
 
 
 _register_overloads()

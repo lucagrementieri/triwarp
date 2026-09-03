@@ -2,6 +2,7 @@ import math
 
 import warp as wp
 
+from triwarp.kernels.array import OverloadTable
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.predicates import doublearea_from_lengths, squared_edge_lengths
 from triwarp.kernels.triangles import face_vertices, row_triple
@@ -290,51 +291,83 @@ def add_constant(length: wp.float32, delta: wp.float32) -> wp.float32:
 _MATRIX_DTYPES = (wp.float32, wp.float64)
 
 
+# The concrete handles keyed by the caller's dtype -- see
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable]. Measured interleaved, min of 12, on an
+# icosphere(6): ``laplacian.cotmatrix`` 372.7 -> 339.6 us (**1.10x**) and ``laplacian.laplacian``
+# 380.6 -> 348.5 (1.09x), from removing one generic launch each. ``COTMATRIX_TRIPLETS`` keys on the
+# pair ``(entry dtype, matrix dtype)`` because those two templates are independent, exactly as the
+# registration already was.
+COTMATRIX_ENTRIES: OverloadTable
+COTMATRIX_ENTRIES_INTRINSIC: OverloadTable
+ROW_NORMALIZE: OverloadTable
+LAPLACIAN_TRIPLETS_SYMMETRIC: OverloadTable
+LAPLACIAN_TRIPLETS_DIRECTED: OverloadTable
+COTMATRIX_TRIPLETS: OverloadTable
+CONNECTION_LAPLACIAN_TRIPLETS: OverloadTable
+
+
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
-    for dtype in _MATRIX_DTYPES:
-        wp.overload(cotmatrix_entries, [wp.array[wp.vec3], wp.array[wp.int32], wp.array2d[dtype]])
-        wp.overload(cotmatrix_entries_intrinsic, [wp.array2d[wp.float32], wp.array2d[dtype]])
-        wp.overload(row_normalize, [wp.array[wp.int32], wp.array[dtype]])
-        for kernel in (laplacian_triplets_symmetric, laplacian_triplets_directed):
-            wp.overload(
-                kernel,
-                [
-                    wp.array2d[wp.int32],
-                    wp.array[wp.vec3],
-                    wp.int32,
-                    wp.array[wp.int32],
-                    wp.array[wp.int32],
-                    wp.array[dtype],
-                ],
-            )
-        # ``cot_entries`` and the matrix precision are *independent* templates: cotmatrix's
-        # docstring says the entries "may be float32 or float64 regardless of dtype: the assembly
-        # kernel casts them to the matrix precision", so this is a genuine 2x2, not a diagonal.
-        for entry_dtype in _MATRIX_DTYPES:
-            wp.overload(
-                cotmatrix_triplets,
-                [
-                    wp.array[wp.int32],
-                    wp.array2d[entry_dtype],
-                    wp.array[wp.int32],
-                    wp.array[wp.int32],
-                    wp.array[dtype],
-                ],
-            )
-        # The connection Laplacian's values are always ``wp.mat22d``; only its cotangent entries
-        # follow the caller, who may pass their own in place of the float64 default.
-        wp.overload(
-            connection_laplacian_triplets,
-            [
+    global COTMATRIX_ENTRIES, COTMATRIX_ENTRIES_INTRINSIC, ROW_NORMALIZE
+    global LAPLACIAN_TRIPLETS_SYMMETRIC, LAPLACIAN_TRIPLETS_DIRECTED
+    global COTMATRIX_TRIPLETS, CONNECTION_LAPLACIAN_TRIPLETS
+    COTMATRIX_ENTRIES = OverloadTable(
+        cotmatrix_entries,
+        {d: [wp.array[wp.vec3], wp.array[wp.int32], wp.array2d[d]] for d in _MATRIX_DTYPES},
+    )
+    COTMATRIX_ENTRIES_INTRINSIC = OverloadTable(
+        cotmatrix_entries_intrinsic,
+        {d: [wp.array2d[wp.float32], wp.array2d[d]] for d in _MATRIX_DTYPES},
+    )
+    ROW_NORMALIZE = OverloadTable(
+        row_normalize, {d: [wp.array[wp.int32], wp.array[d]] for d in _MATRIX_DTYPES}
+    )
+    triplet_signature = {
+        d: [
+            wp.array2d[wp.int32],
+            wp.array[wp.vec3],
+            wp.int32,
+            wp.array[wp.int32],
+            wp.array[wp.int32],
+            wp.array[d],
+        ]
+        for d in _MATRIX_DTYPES
+    }
+    LAPLACIAN_TRIPLETS_SYMMETRIC = OverloadTable(laplacian_triplets_symmetric, triplet_signature)
+    LAPLACIAN_TRIPLETS_DIRECTED = OverloadTable(laplacian_triplets_directed, triplet_signature)
+    # ``cot_entries`` and the matrix precision are *independent* templates: cotmatrix's
+    # docstring says the entries "may be float32 or float64 regardless of dtype: the assembly
+    # kernel casts them to the matrix precision", so this is a genuine 2x2, not a diagonal.
+    COTMATRIX_TRIPLETS = OverloadTable(
+        cotmatrix_triplets,
+        {
+            (entry_dtype, dtype): [
                 wp.array[wp.int32],
-                wp.array2d[dtype],
+                wp.array2d[entry_dtype],
+                wp.array[wp.int32],
+                wp.array[wp.int32],
+                wp.array[dtype],
+            ]
+            for dtype in _MATRIX_DTYPES
+            for entry_dtype in _MATRIX_DTYPES
+        },
+    )
+    # The connection Laplacian's values are always ``wp.mat22d``; only its cotangent entries
+    # follow the caller, who may pass their own in place of the float64 default.
+    CONNECTION_LAPLACIAN_TRIPLETS = OverloadTable(
+        connection_laplacian_triplets,
+        {
+            d: [
+                wp.array[wp.int32],
+                wp.array2d[d],
                 wp.array[wp.float32],
                 wp.array[wp.int32],
                 wp.array[wp.int32],
                 wp.array[wp.mat22d],
-            ],
-        )
+            ]
+            for d in _MATRIX_DTYPES
+        },
+    )
 
 
 _register_overloads()

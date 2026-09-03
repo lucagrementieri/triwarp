@@ -33,6 +33,7 @@ import warp.optim.linear as wpl
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels import remesh as kernel_remesh
@@ -1254,7 +1255,7 @@ def ball_pivoting(
     state = _BpaState(points, normals, grid, bvh, radius, clustering, crease_cos, 4 * n + 16)
     _bpa_run(state, max_waves if max_waves > 0 else 16 * n)
 
-    count = int(state.counters.numpy()[kernel_bpa.CNT_FACE])
+    count = int(read_scalar(state.counters, kernel_bpa.CNT_FACE))
     faces = wp.clone(state.all_faces[: count * 3])
     return _clean_reconstruction(points, faces, crit_hole_length)
 
@@ -1369,7 +1370,7 @@ class _BpaState:
         )
         old_capacity = int(self.edge_key.shape[0])
         old_faces = self.all_faces
-        old_count = min(int(self.counters.numpy()[kernel_bpa.CNT_FACE]), self.max_faces)
+        old_count = min(int(read_scalar(self.counters, kernel_bpa.CNT_FACE)), self.max_faces)
 
         self._allocate_budget(2 * self.max_faces)
         wp.copy(self.all_faces, old_faces, count=old_count * 3)

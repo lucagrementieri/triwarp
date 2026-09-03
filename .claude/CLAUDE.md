@@ -59,8 +59,8 @@ Two conventions that hold throughout:
     constants
 14. [Kernel-shape verdicts](#14-kernel-shape-verdicts) — what wins, what is refuted
 15. [Benchmark and measurement traps](#15-benchmark-and-measurement-traps)
-16. [triwarp component status](#16-triwarp-component-status) — shipped results, open defects,
-    refuted plans
+16. [triwarp component status](#16-triwarp-component-status) — the launch-resolution pass,
+    shipped results, open defects, refuted plans
 
 ---
 ---
@@ -454,6 +454,21 @@ hash links.
   failing assert** — see §15.1.
 - **`wp.map` has the same chain**, keyed by the unqualified op name and forked per *signature*, and
   it needs the same treatment — §3.5 (check 23) and §12.6.
+- **And the registration pays twice: keep the `wp.Kernel` `wp.overload` returns, and launch through
+  it.** Registering fixes the *rebuild*; it does nothing about the ~12 µs of `infer_argument_types`
+  every generic launch runs before it can even look the overload up (§13.1, measured 2.17x on one
+  launch and 1.09-1.58x end to end across 20 wrappers). So a module's registration builds a
+  dtype-keyed [`OverloadTable`][triwarp.kernels.array.OverloadTable] and the wrapper writes
+  `kernel_laplacian.COTMATRIX_TRIPLETS[cot_entries.dtype, dtype]` rather than naming the generic
+  kernel. Nothing extra is compiled — the overloads already existed — and the kernel source stays
+  generic, so §1.2 is untouched. **All 42 generic launch sites in the tree are converted**; a new
+  generic kernel adds a table rather than a bare `wp.overload` call. A dtype the table lacks raises
+  a `KeyError` naming the kernel, which is this section's failure mode made visible instead of
+  costing 80 s of silent rebuild. `kernels/reduce.py` goes one step further and has **no** generic
+  kernels at all: its factories always could bake the dtype in, and its own `_reduce_1d_tiled`
+  docstring had said so since it was written — the 34 that stayed at the `wp.Scalar` default were
+  simply never revisited. They are now `KernelTable`s of concrete instantiations, compiling exactly
+  the 106 kernels the registration used to create.
 
 ### 2.6 In-place `@wp.func` parameters (`wp.ref[T]`)
 
@@ -483,17 +498,29 @@ elements, struct fields) — use for multi-value updates like argmin/minmax/swap
   `warp._src.context.builtin_functions["tile_max"]` and closure-capturing it — captured builtins
   emit inline at codegen and template on the tile dtype (see `triwarp/kernels/reduce.py`). Give each
   factory instantiation a unique kernel `name`.
-- **A factory is also how you avoid `wp.array[Any]`'s dispatch cost.** A generic kernel pays
-  ~15-18 µs of host-side overload resolution on *every* launch (§13.1); a factory that writes
+- **Name it with `wp.kernel(f, name=...)`, not by mutating `__name__` / `__qualname__`.** Warp 1.17
+  added a `name=` parameter to the decorator (NVIDIA/warp#1561) that sets both the registration key
+  and the base of the generated native entry point; it must be a valid C++ identifier. That is one
+  line instead of two assignments the reader has to recognise as a naming convention, and it is the
+  documented route to ahead-of-time compilation. `kernels/reduce.py` uses it at all nine factories.
+- **A factory is also how you avoid a generic kernel's dispatch cost.** A generic kernel pays
+  ~12 µs of host-side overload resolution on *every* launch — the same for `Any`, `wp.Float` and
+  `wp.Scalar`, and more when several parameters are generic (§13.1). A factory that writes
   `__annotations__` after defining the body produces concrete kernels from one source:
   ```python
   def _factory(name, dtype):
       def _k(values: wp.array[wp.Scalar], out: wp.array[wp.Scalar]) -> None: ...
-      _k.__name__ = _k.__qualname__ = name
       _k.__annotations__["values"] = wp.array[dtype]
       _k.__annotations__["out"] = wp.array[dtype]
-      return wp.kernel(_k)
+      return wp.kernel(_k, name=name)
   ```
+  **A factory whose `dtype` parameter has a generic default is a factory nobody specialised**, which
+  is exactly how `kernels/reduce.py` ended up with 34 generic kernels behind a template that could
+  always have baked the dtype in. If a factory takes a dtype, give it no default.
+- **Where the kernel body should stay generic, the table form in §2.5 gets the same launch cost for
+  no restructuring at all** — `wp.overload` already returns the concrete kernel. Reach for a factory
+  when the *body* needs specialising (an axis, a storage class, a captured builtin) and for the
+  table when only the dtype does.
 - **`if wp.static(flag):` prunes the untaken branch even when the two branches bind locals of
   *different types*** (probed: `wp.types.vector(length=K)()` vs `wp.zeros(shape=K)`, and
   `values[i, k]` vs `values[k, i]`). That is what lets one body generate axis- or
@@ -712,7 +739,14 @@ hand-written kernel; cached calls cost ~11 µs extra host-side Python.
   `wp.indexedarray` view (see `repair.make_volume`).
 - Inside **per-iteration wrapper loops**, hoist the kernel once with `wp.map(..., return_kernel=True)`
   and `wp.launch(kernel, dim, inputs=[...], outputs=[...])` in the loop (see `triwarp/smoothing.py`)
-  — this removes the per-call Python overhead.
+  — this removes the per-call Python overhead, and the overhead has a number: **a cached `wp.map`
+  call costs 23.8-26.6 µs against 13.4-14.3 for the launch it wraps, 1.78-1.86x, ~11 µs** (Warp
+  1.17, RTX 5090, 100 calls between two syncs, flat from 1 024 to 200 000 elements). It is the same
+  host-side resolution a generic kernel pays (§13.1), so the two conversions look alike and are
+  priced alike. `smoothing.filter_normals` ran two maps over 20 passes for ~0.44 ms of pure host
+  time and hoisting them is most of its measured 1.48x. **Hoist where the loop body is cheap; a map
+  inside a solve loop is a fraction of a percent** — `linalg._multigrid_hierarchy`, the ARAP and CG
+  component loops and the remesh pass loops are all left alone deliberately.
 - **An op reached at more than one call signature must have those signatures declared at import**
   (check 23) — the same rule and the same reason as `wp.overload` in §2.5. `wp.map` names its
   generated module `map_<unqualified op name>`, each distinct signature forks that module's hash, and
@@ -895,7 +929,10 @@ found them: §12.1.
 - **A readback costs ~0.1 ms; an extra device pass costs 0.9-2.4 ms.** Trading one readback for an
   extra pass is usually a *loss* (§13.1, §14.6).
 - **Use `triwarp._device.read_scalar(arr, index=-1)` for a tail read**, not a hand-rolled spelling —
-  the fast path is device-split and a pinned scratch is a **race** (§12.1).
+  the fast path is device-split and a pinned scratch is a **race** (§12.1). It takes any index and
+  any dtype, so `arr[k : k + 1].numpy()[0]` and `arr.numpy()[k]` are both it, spelled slower
+  (27.8 against 15.7 µs on CUDA); the sites converted in this pass were `creation.sweep_polygon`'s
+  two path endpoints, `bounds`' two winning frames and `reconstruction`'s two face counters.
 
 ---
 
@@ -2500,6 +2537,19 @@ The methodology is here; the *numbers* are Part II (§13 cost model, §14 kernel
   comment declined a rewrite and said *"revisit if a benchmark ever puts it on top"*; a
   level-synchronous RDP then took `polyline_simplify` from 84 ms to 0.68 ms and **inverted the
   module's ordering**. Re-read the declines in a module after any big win in it.
+- **A decline written in one place is not a decline applied everywhere, and the tree's own source is
+  the census you should not trust.** `kernels/reduce.py::_reduce_1d_tiled` has documented "the
+  generic form is declined here, measured ~18 us per launch" since it was written — and 34 of that
+  module's kernels took the generic default anyway, because the factory's `dtype` parameter had one
+  (§16.0). **When a finding is a property Warp computes rather than one the source spells, take the
+  census from the runtime**: an AST scan of annotations found 39 of the 71 generic kernels, and
+  `wp.get_module(name).kernels` found all 71.
+- **A probe that instruments the thing it measures must carry a third, do-nothing arm.** A
+  monkeypatched `wp.launch` reported two wrappers *regressing* under a change that was in fact worth
+  1.15-1.28x on them: the patch added its own Python frame to every launch in one arm only, and
+  silently failed to specialise non-array generic parameters. Adding a "same wrapper, no
+  substitution" control separated the two, and a detached-worktree A/B (§15.6) settled it. **Instrument
+  both arms identically, or measure without instrumenting.**
 - **Re-probe a tuning constant after a Warp upgrade.** The hole-DP block-size reading *"measured flat
   between 32 and 128"* was taken on Warp 1.16 and does not hold on 1.17.
 - **Sweep both devices before writing a single tuning number**, and if the two optima differ by more
@@ -2684,6 +2734,17 @@ re-deriving a number.
   Pinning buys nothing even done correctly (14.7 against 15.7). `triwarp._device.read_scalar` is
   this, with a per-dtype scratch cached at module level; measured `array.flatnonzero(200k)`
   114.1 → 96.2 µs on CUDA, 1.01x on CPU. **Not reentrant** — the scratch is shared.
+
+  **And the shared scratch has a second, silent hazard the scalar dtypes hide: for a vector or
+  matrix dtype `.numpy()[0]` is a *view*, so two sequential reads both alias the one cached row and
+  the first takes the second's value.** Found by converting `creation.sweep_polygon`'s two endpoint
+  readbacks, which then decided every open path was closed; `read_scalar` now copies before
+  returning (and on the host branch the view is onto the caller's own buffer, where a caller writing
+  through it would corrupt the array). Pinned by
+  `test_read_scalar_returns_a_detached_row_for_a_vector_dtype`, whose mutation probe confirms it is
+  the *vector* assert that fails without the copy. **The general shape: a helper that caches one
+  buffer per dtype is safe for as long as everything it returns is a scalar, and the day someone
+  passes a `wp.vec3` it is wrong without an error.**
 - **Warp's CPU work runs ~36x slower in a process where CUDA has been initialised.** Measured on one
   `heat_signed_distance` call, same mesh, same code, only `CUDA_VISIBLE_DEVICES` differing: `STRICT`
   50.57 s vs **1.40 s**, `RELAXED` 50.34 vs 1.40, `CHECKED` 49.77. **It is CUDA *presence*, not the
@@ -3213,13 +3274,61 @@ identical kernel taking one bundle measures **43.1 → 18.2 µs median (0.40x)**
 host-side cost should look like. Building the bundle costs **2.6 µs**. Rule and eligibility: §2.8.
 Only 18 of 440 triwarp kernels take ≥12 arguments.
 
-**A `wp.array[Any]` kernel costs a further ~15-18 µs of host-side overload resolution on every
-launch** — 0.59x at 10 000 elements and 0.94x at 10M against the concrete form, elevated in both
-`min` and median, so it is per-launch and not a first-call effect. Isolated by timing three variants
-of one body: concrete hand-written, concrete factory-generated, and `Any`; the first two agree to
-~3 µs and only `Any` pays. A generic kernel is right for a *rarely launched* op
-(`kernels/scatter.py:scatter_add` has three call sites, one launch each) and wrong for anything in a
-loop or anything whose own work is under ~50 µs. The factory form is §2.7.
+**A generic kernel costs a further ~12 µs of host-side overload resolution on every launch, which
+is roughly *double* the host cost of a concrete one — and `wp.Float` / `wp.Scalar` cost exactly what
+`Any` costs.** That last clause is the correction: this entry read "a `wp.array[Any]` kernel" for
+several rounds, and the annotation is not the axis. `wp.launch` runs `infer_argument_types` over the
+**whole argument list** and only then looks the overload up, so the cost scales with how many
+parameters are generic, not with which spelling names them. Re-measured on Warp 1.17 / RTX 5090, 100
+launches between two synchronization points, min of 25 interleaved reps:
+
+| kernel | per launch |
+|---|---|
+| concrete, hand-written | 12.1-12.3 µs |
+| concrete, factory-generated (§2.7) | 12.0-12.2 — identical to hand-written |
+| one generic array parameter, `wp.Float` | 23.4-24.2 (**+11.3-12.3**) |
+| the same body annotated `Any` | 24.2-24.5 — **the same** |
+| three generic parameters (`triangles.face_signed_volumes`: `wp.array[Any]`, `Any`, `wp.array[wp.Float]`) | 26.6 against 12.2 concrete — **2.17x, 14.3 µs** |
+
+Flat in `dim` (1 024 to 4M), elevated in both `min` and median, so it is per-launch and not a
+first-call effect.
+
+**The fix is one line per module and compiles nothing new: `wp.overload()` *returns* the concrete
+`wp.Kernel`, and `_register_overloads()` was already calling it and discarding the result.** Keeping
+it in a dtype-keyed table (`kernels/array.py::OverloadTable`, whose base `KernelTable` also serves
+`kernels/reduce.py`'s factory instantiations) lets the wrapper hand `wp.launch` the resolved kernel.
+The kernel source stays dtype-generic, so §1.2's preference is untouched; what changes is only which
+object reaches `wp.launch`. Landed across all 42 generic launch sites in the tree — measured
+end to end against a detached baseline worktree, interleaved processes, min of 3 rounds of 12 reps:
+
+Ratios are the range over **two** such sessions, because §15.7's ±10 % drift is the same size as
+several of these:
+
+| call | before → after (µs) | ratio |
+|---|---|---|
+| `smoothing.filter_normals` (20 passes) | 2 030 → 1 373 | **1.46-1.48x** (also §3.5's map hoist) |
+| `voxels.sample_grid_trilinear` (50k queries) | 60.4 → 38.6 | 1.35-1.56x |
+| `voxels.splat_onto_grid` (200k) | 124.5 → 82.5 | 1.34-1.51x |
+| `measures.volume` (81 920 faces) | 147.1 → 98.7 | 1.29-1.49x |
+| `reduce.max(axis=1)` on `(60k, 3)` | 39.8 → 25.2 | 1.35-1.58x |
+| `vertices.vertex_defects` | 92.5 → 62.4 | 1.33-1.48x |
+| `reduce.min(axis=0)` | 50.5 → 34.9 | 1.28-1.45x |
+| `array.arange(200k)` | 33.8 → 25.6 | 1.30-1.32x |
+| `grouping.unique_1d(200k, inverse)` | 317.0 → 240.9 | 1.21-1.32x |
+| `array.isin` / `grouping.unique_rows` / `edges.edges_unique` | 364 → 300, 641 → 526, 736 → 629 | 1.14-1.25x |
+| `laplacian.cotmatrix` / `laplacian` / `mass_matrix` | 410 → 355, 381 → 339, 238 → 207 | 1.11-1.17x |
+| `reduce.sum` / `minmax` / `any` (200k) | 83.9 → 69.8, 93.6 → 84.0, 122 → 109 | 1.08-1.22x |
+
+19 of 20 probed calls improved and none regressed (`bounds.aabb` is flat at 0.99-1.00x — its kernel
+was already concrete, which is the control this table needed). **A missing dtype now raises rather
+than silently rebuilding the module**, which is the §2.5 failure mode turned from a clock reading
+into an error naming the kernel.
+
+**A cached `wp.map` call carries the same kind of overhead: 23.8-26.6 µs against 13.4-14.3 for the
+launch it wraps — 1.78-1.86x, ~11 µs.** That is what §3.5's `return_kernel=True` hoist removes, and
+it prices the hoist for any *loop*: `smoothing.filter_normals` ran two maps over 20 passes and was
+~0.44 ms of pure host time. The 199 `wp.map` call sites reached once per wrapper call each pay it
+too; converting those would fight §3.5's readability rule and has **not** been measured end to end.
 
 **Per-segment packing costs are host constants and flat in the data** — the same rows measure 1.46 ms
 at 0.07 MB total and 2.42 ms at 268 MB, a 4 000x range:
@@ -3358,7 +3467,21 @@ what made it findable. Look for `wp.launch_tiled` at a `dim` of `n / TILE_1D` (r
 in the tree that match the `dim` half do **not** match the shape: `metrics.chamfer_*_tiled` and
 `measures.centroid_tiled` compute `f = i * TILE_1D + t` and so partition the *outer* work at a
 constant stride — the `_sliced` / `prefers_tiled_reduction` case, where changing the fold is a
-rewrite of the partition and not a one-token change. Checked, correct as they stand.
+rewrite of the partition and not a one-token change.
+
+**That rewrite has now been built for `measures.centroid_tiled` and it is flat, which puts a
+threshold on this whole family.** The lane-strided form (`tile_chunk(n_faces, chunk,
+ITEMS_PER_BLOCK_1D)` plus a `wp.block_dim()` stride, which would additionally retire
+`centroid_sliced` and one device branch) measures **0.98-1.01x** at 1 280 / 20 480 / 81 920 /
+327 680 faces, areas agreeing to 1.5e-07. **The quantity the fold reduces is `blocks x slots`, and
+the threshold is around 1e5, not 1e4**: centroid is 5 120 blocks x 4 slots ≈ 2e4 at 327k faces and
+sits under the launch floor, where every kernel that won was at ~1e5 (3 125 blocks x 25 or 43 slots
+at 200k-1M points, and `polyline.accumulate_loop_frame`'s three atomics over 262 144 elements). So
+**compute `blocks x accumulator slots` before proposing this rewrite**; under ~1e5 it will be flat.
+The chamfer pair is one slot and further under. With no CUDA win to pay for it the portability is
+not free either — `blocks_1d(n)` gives the CPU path `n / 1024` single-lane blocks against
+`slice_count`'s `n / 32` threads — so all three keep their `_sliced` siblings, and the numbers are
+written at `kernels/measures.py::centroid_tiled` and `kernels/metrics.py`.
 
 Two consequences for the next conversion of this shape. **The fold is what pays for the
 `wp.tile_sum` calls, so a wide accumulator needs it more, not less**: 43 reductions per block is a
@@ -4048,6 +4171,37 @@ harness, with **0.94x** on the `saddle_graded` conditioning rows (§14.6). Same 
 
 Shipped results, open defects and refuted plans, by area. **Check here before opening work on any of
 these.**
+
+### 16.0 The launch-resolution pass, and what it says about where to look next
+
+The single largest cross-cutting win the tree has taken: **every generic-kernel launch site (42) and
+`kernels/reduce.py`'s 34 generic kernels now go through a dtype-keyed table of concrete kernels**,
+removing ~12 µs of `infer_argument_types` from each launch. Measured against a detached baseline
+worktree, 19 of 20 probed wrappers improved and none regressed, from 1.09x (`laplacian.mass_matrix`)
+to 1.58x (`reduce.max(axis=1)`); the table and the mechanism are §13.1, the rule is §2.5, the
+factory guidance §2.7. Full suite unchanged at 3 121 passed, and the suite's own wall clock is flat
+(63.9 s against 60.5 s, inside session noise) once the one-time cold compile of the renamed kernels
+is paid — nothing extra is compiled, since a registered overload *is* a compiled kernel.
+
+**Three method points from that pass, because they generalise past this one finding:**
+
+- **An AST scan of kernel annotations found 39 of the 71 generic kernels; a runtime census found all
+  71.** The 34 it missed are in `kernels/reduce.py`, where a *factory* leaves the dtype generic by
+  default — nothing in the source text says `Any`. Take the census from Warp, not from the parser:
+  `[k for k, v in wp.get_module(name).kernels.items() if v.is_generic]` after importing every
+  `triwarp.kernels.*`. The same reasoning applies to any property Warp computes rather than reads.
+- **The module that had already written the finding down was the one still paying it.**
+  `_reduce_1d_tiled`'s docstring has said "the generic form is declined here, measured ~18 us per
+  launch" since it was written — and 34 of its instantiations took the generic default anyway,
+  because the `dtype` parameter had one. §9's "read what calls the thing, the decline may already be
+  written there" has a converse: **a written decline is not a landed one; grep for the sites that
+  should have obeyed it.**
+- **The probe that measures a fix must not also change the thing it measures.** A first pass
+  monkeypatched `wp.launch` to substitute concrete kernels and read *losses* on two wrappers; both
+  were artifacts — the patch left non-array generic parameters generic, and it added its own Python
+  wrapper to every launch in the arm. Adding a third "control" arm with the wrapper but no
+  substitution, and then re-measuring against a real baseline worktree, turned both losses into
+  1.28x and 1.15x wins.
 
 ### 16.1 Where triwarp's benchmark losses actually are
 

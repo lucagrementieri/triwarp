@@ -3,7 +3,12 @@ from typing import Any
 import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.array import binary_search_sorted_contains, pack_edge_key, to_vec3d
+from triwarp.kernels.array import (
+    OverloadTable,
+    binary_search_sorted_contains,
+    pack_edge_key,
+    to_vec3d,
+)
 from triwarp.kernels.halfedge import halfedge_next, halfedge_prev
 from triwarp.kernels.predicates import (
     barycentric_gram,
@@ -531,12 +536,25 @@ def face_gradients(
 # The vertex precision and the volume precision move together: ``face_signed_volumes`` reads a
 # ``wp.vec3`` cloud into ``wp.float32`` volumes or a ``wp.vec3d`` one into ``wp.float64``, never a
 # mixture, because the wrapper derives the output dtype from the vertex dtype.
+# The concrete handle keyed by the vertex dtype -- see
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable]. This kernel is the tree's clearest case:
+# it is generic in *three* parameters (the vertex array, the apex vector and the output scalar), and
+# resolution cost scales with that count. Measured on an RTX 5090, Warp 1.17, 100 launches between
+# two synchronization points at 81 920 faces: **26.6 us generic against 12.2 us through the handle,
+# 2.17x**, output bit-identical.
+FACE_SIGNED_VOLUMES: OverloadTable
+
+
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
-    for vector, scalar in ((wp.vec3, wp.float32), (wp.vec3d, wp.float64)):
-        wp.overload(
-            face_signed_volumes, [wp.array[vector], wp.array[wp.int32], vector, wp.array[scalar]]
-        )
+    global FACE_SIGNED_VOLUMES
+    FACE_SIGNED_VOLUMES = OverloadTable(
+        face_signed_volumes,
+        {
+            vector: [wp.array[vector], wp.array[wp.int32], vector, wp.array[scalar]]
+            for vector, scalar in ((wp.vec3, wp.float32), (wp.vec3d, wp.float64))
+        },
+    )
 
 
 _register_overloads()

@@ -94,6 +94,11 @@ def chamfer_nn_term_tiled(
     [`chamfer_nn_term_sliced`][triwarp.kernels.metrics.chamfer_nn_term_sliced] instead:
     ``wp.launch_tiled`` runs exactly one lane per block there, so this block reduction would see
     one point per tile and the loss would come out roughly 64x too small.
+
+    The lane-strided ``ITEMS_PER_BLOCK_1D`` fold that would make this portable is declined for the
+    reason measured on its sibling [`centroid_tiled`][triwarp.kernels.measures.centroid_tiled]:
+    flat (0.98-1.01x), because one accumulator slot at ``n / TILE_1D`` blocks is nowhere near the
+    contention where the fold starts paying.
     """
     i, t = wp.tid()
     idx = i * TILE_1D + t

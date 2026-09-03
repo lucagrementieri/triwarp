@@ -1001,13 +1001,13 @@ def splat_onto_grid(
         return field, density
     lower, inverse_spacing = _lattice_transform(dims, bounds)
     wp.launch(
-        kernel_scatter.splat_grid_trilinear,
+        kernel_scatter.SPLAT_GRID_TRILINEAR[values.dtype],
         dim=int(points.shape[0]),
         inputs=[points, values, lower, inverse_spacing, field, density],
         device=device,
     )
     wp.launch(
-        kernel_scatter.divide_by_density,
+        kernel_scatter.DIVIDE_BY_DENSITY[field.dtype],
         dim=dims,
         inputs=[density, wp.float32(min_weight), field],
         device=device,
@@ -1081,7 +1081,7 @@ def sample_grid_trilinear(
         return values
     lower, inverse_spacing = _lattice_transform(dims, bounds)
     wp.launch(
-        kernel_interpolation.sample_grid_trilinear,
+        kernel_interpolation.SAMPLE_GRID_TRILINEAR[field.dtype],
         dim=int(points.shape[0]),
         inputs=[field, lower, inverse_spacing, points, values],
         device=points.device,

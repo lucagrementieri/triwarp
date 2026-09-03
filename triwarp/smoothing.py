@@ -1196,7 +1196,7 @@ def filter_mut_dif_laplacian(
         )
         adil_sum.zero_()
         wp.launch_tiled(
-            kernel_reduce.sum1d_tiled,
+            kernel_reduce.SUM1D_TILED[wp.float64],
             dim=[n_blocks],
             inputs=[adil, adil_sum],
             block_dim=TILE_1D,
@@ -2293,8 +2293,16 @@ def filter_normals(
     threshold_cos = wp.float32(math.cos(math.radians(threshold)))
 
     accumulated = wp.empty(n_faces, dtype=wp.vec3, device=device)
+    # Both maps are hoisted out of the pass loop (CLAUDE.md section 3.5): a cached ``wp.map`` call
+    # re-resolves its kernel in Python every time, measured on Warp 1.17 at 23.8-26.6 us against
+    # 13.4-14.3 for the launch it wraps -- **1.78-1.86x, ~11 us a call** -- so at the default 20
+    # passes these two were ~0.44 ms of pure host time.
+    seed = wp.map(
+        kernel_smoothing.seed_weighted_normal, normals, areas, out=accumulated, return_kernel=True
+    )
+    renormalize = wp.map(wp.normalize, accumulated, out=normals, return_kernel=True)
     for _ in range(iterations):
-        wp.map(kernel_smoothing.seed_weighted_normal, normals, areas, out=accumulated)
+        wp.launch(seed, dim=n_faces, inputs=[normals, areas], outputs=[accumulated], device=device)
         if m > 0:
             wp.launch(
                 kernel_smoothing.accumulate_smoothed_normals,
@@ -2302,7 +2310,7 @@ def filter_normals(
                 inputs=[normals, areas, face_adjacency, threshold_cos, accumulated],
                 device=device,
             )
-        wp.map(wp.normalize, accumulated, out=normals)
+        wp.launch(renormalize, dim=n_faces, inputs=[accumulated], outputs=[normals], device=device)
     return normals
 
 
@@ -2383,6 +2391,11 @@ def filter_two_step(
     adjacency = tw.adjacency.face_adjacency(faces, n_vertices=n)
     delta = wp.empty(n, dtype=wp.vec3, device=device)
     counts = wp.empty(n, dtype=wp.float32, device=device)
+    # Hoisted out of the doubly-nested pass loop, where it ran ``iterations * fit_iterations``
+    # times; see [`filter_normals`][triwarp.smoothing.filter_normals] for the measurement.
+    fit_step = wp.map(
+        kernel_smoothing.apply_fit_step, out, delta, counts, out=out, return_kernel=True
+    )
     for _ in range(iterations):
         normals = filter_normals(
             out, faces, iterations=normal_iterations, threshold=threshold, face_adjacency=adjacency
@@ -2396,7 +2409,7 @@ def filter_two_step(
                 inputs=[out, faces, normals, delta, counts],
                 device=device,
             )
-            wp.map(kernel_smoothing.apply_fit_step, out, delta, counts, out=out)
+            wp.launch(fit_step, dim=n, inputs=[out, delta, counts], outputs=[out], device=device)
     return out
 
 

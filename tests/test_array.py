@@ -986,3 +986,32 @@ def test_index_domain_size_matches_the_index_maximum(
 
     assert tw.array.index_domain_size(mesh_wp.indices) == int(faces_np.max()) + 1
     assert tw.array.index_domain_size(mesh_wp.indices) == len(mesh_tm.vertices)
+
+
+def test_read_scalar_returns_a_detached_row_for_a_vector_dtype(device: str) -> None:
+    """
+    Triwarp against triwarp: two reads of one vector array must not alias each other.
+
+    Not a library comparison: ``_device.read_scalar`` is a private readback helper with no
+    counterpart in any reference. The invariant is that the value survives the *next* read, which
+    is what a shared per-dtype scratch buffer threatens: ``.numpy()`` on a ``wp.array[wp.vec3]``
+    yields a view, so without a copy the first read would take the second's value. That defect is
+    silent -- every scalar dtype is unaffected, because ``numpy`` hands those back as scalars --
+    and it was found by ``creation.sweep_polygon``, which reads a path's two endpoints back to back
+    and decided every open path was closed.
+    """
+    path_wp = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [9.0, 8.0, 7.0]], dtype=np.float32),
+        dtype=wp.vec3,
+        device=device,
+    )
+
+    first = tw._device.read_scalar(path_wp, 0)
+    last = tw._device.read_scalar(path_wp, 2)
+
+    assert np.array_equal(first, np.array([0.0, 0.0, 0.0], dtype=np.float32))
+    assert np.array_equal(last, np.array([9.0, 8.0, 7.0], dtype=np.float32))
+    # The scalar path is the one that never needed the copy; assert it still reads correctly.
+    counts_wp = wp.array(np.array([4, 5, 6], dtype=np.int32), dtype=wp.int32, device=device)
+    assert int(tw._device.read_scalar(counts_wp, 0)) == 4
+    assert int(tw._device.read_scalar(counts_wp)) == 6

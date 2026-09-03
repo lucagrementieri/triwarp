@@ -1126,7 +1126,7 @@ def _diffuse_from_sources(
     """Seed a tangent field at the source vertices, then diffuse it."""
     field = wp.zeros(n_vertices, dtype=wp.vec2d, device=device)
     wp.launch(
-        kernel_scatter.scatter_add,
+        kernel_scatter.SCATTER_ADD[wp.vec2d],
         dim=int(sources.shape[0]),
         inputs=[_as_vec2d(vectors), sources, field],
         device=device,

@@ -21,6 +21,18 @@ def centroid_tiled(
     # is the constant-stride case of the rule in `.claude/CLAUDE.md` section 3, and it is why this
     # reduction keeps a device pair where `kernels/visibility.py::obscurance` needs only one
     # kernel. See `centroid_sliced` and `_device.prefers_tiled_reduction`.
+    #
+    # **Rewriting it into the lane-strided `ITEMS_PER_BLOCK_1D` fold was measured and declined**,
+    # and the number is worth keeping: the same rewrite is worth 2.8-10.7x on the `registration`
+    # and `points` accumulators (`.claude/CLAUDE.md` section 13.2). Built as
+    # `tile_chunk(n_faces, chunk, ITEMS_PER_BLOCK_1D)` plus a `wp.block_dim()` stride -- which would
+    # also make it portable and retire `centroid_sliced` -- it measures **0.98-1.01x** at 1 280 /
+    # 20 480 / 81 920 / 327 680 faces, the areas agreeing to 1.5e-07: flat everywhere. The fold pays
+    # on *atomic contention*, and contention here is `blocks x slots`: 5 120 blocks x 4 slots is
+    # ~2e4 atomics at 327k faces, where the accumulators that won were at ~1e5 (3 125 blocks x 25 or
+    # 43 slots at 200k-1M points). Below that the launch floor hides it. With no CUDA win to pay for
+    # it the portability is not free either -- `blocks_1d(n)` would give the CPU path `n / 1024`
+    # single-lane blocks against `slice_count`'s `n / 32` threads -- so the device pair stays.
     i, t = wp.tid()
     f = i * TILE_1D + t
     contrib = wp.vec3(0.0, 0.0, 0.0)

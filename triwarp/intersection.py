@@ -253,7 +253,7 @@ def marching_triangles(
     segments = twt.empty_2d((n_faces, 2), wp.vec3, device=device)
     segment_edges = twt.empty_2d((n_faces, 2), wp.int32, device=device)
     wp.launch(
-        kernel_intersections.marching_triangles_segments,
+        kernel_intersections.MARCHING_TRIANGLES_SEGMENTS[shifted.dtype],
         dim=n_faces,
         inputs=[vertices, faces, shifted, edge_ids, valid, segments, segment_edges],
         device=device,

@@ -416,7 +416,7 @@ def face_signed_volumes(
             else wp.vec3(0.0, 0.0, 0.0)
         )
     wp.launch(
-        kernel_triangles.face_signed_volumes,
+        kernel_triangles.FACE_SIGNED_VOLUMES[vertices.dtype],
         dim=n_faces,
         inputs=[vertices, faces, apex, volumes],
         device=device,

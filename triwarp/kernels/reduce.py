@@ -12,6 +12,7 @@ import warp as wp
 from warp._src.context import builtin_functions as _warp_builtins
 
 from triwarp.constants import TILE_1D, TILE_2D, TILES_PER_BLOCK_1D
+from triwarp.kernels.array import KernelTable
 
 _tile_min = _warp_builtins["tile_min"]
 _tile_max = _warp_builtins["tile_max"]
@@ -87,7 +88,7 @@ def blocks_1d(n: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _reduce_1d_tiled(tile_reduce, atomic, scalar, name, dtype=wp.Scalar):
+def _reduce_1d_tiled(tile_reduce, atomic, scalar, name, dtype):
     """
     axis=None on a 1-D array: ``TILES_PER_BLOCK_1D`` tiles per block, one atomic per block.
 
@@ -132,11 +133,9 @@ def _reduce_1d_tiled(tile_reduce, atomic, scalar, name, dtype=wp.Scalar):
         if t == 0:
             atomic(out, 0, result)
 
-    _k.__name__ = name
-    _k.__qualname__ = name
     _k.__annotations__["values"] = wp.array[dtype]
     _k.__annotations__["out"] = wp.array[dtype]
-    return wp.kernel(_k)
+    return wp.kernel(_k, name=name)
 
 
 def _weighted_sum_1d_tiled(name, dtype):
@@ -187,14 +186,12 @@ def _weighted_sum_1d_tiled(name, dtype):
         if t == 0:
             wp.atomic_add(out_sum, 0, result)
 
-    _k.__name__ = name
-    _k.__qualname__ = name
     _k.__annotations__["values"] = wp.array[dtype]
     _k.__annotations__["out_sum"] = wp.array[dtype]
-    return wp.kernel(_k)
+    return wp.kernel(_k, name=name)
 
 
-def _reduce_2d_tiled(tile_reduce, atomic, scalar, name):
+def _reduce_2d_tiled(tile_reduce, atomic, scalar, name, dtype):
     """axis=None on a 2-D array: one 2-D tile per block, atomically fold into slot 0."""
 
     def _k(values: wp.array2d[wp.Scalar], out: wp.array[wp.Scalar]) -> None:
@@ -229,9 +226,9 @@ def _reduce_2d_tiled(tile_reduce, atomic, scalar, name):
         if t == 0:
             atomic(out, 0, result)
 
-    _k.__name__ = name
-    _k.__qualname__ = name
-    return wp.kernel(_k)
+    _k.__annotations__["values"] = wp.array2d[dtype]
+    _k.__annotations__["out"] = wp.array[dtype]
+    return wp.kernel(_k, name=name)
 
 
 # Element access for a per-axis reduction, as two ``@wp.func``s a factory *captures* rather than as
@@ -261,7 +258,7 @@ def _element_along_col(values: wp.array2d[wp.Scalar], i: wp.int32, k: wp.int32):
     return values[k, i]
 
 
-def _reduce_2d_axis_tiled(tile_reduce, atomic, scalar, name, rows):
+def _reduce_2d_axis_tiled(tile_reduce, atomic, scalar, name, rows, dtype):
     """
     axis=1 (``rows=True``) or axis=0: one output slot per grid index, tiled along its extent.
 
@@ -299,9 +296,9 @@ def _reduce_2d_axis_tiled(tile_reduce, atomic, scalar, name, rows):
         if t == 0:
             atomic(out, i, result)
 
-    _k.__name__ = name
-    _k.__qualname__ = name
-    return wp.kernel(_k)
+    _k.__annotations__["values"] = wp.array2d[dtype]
+    _k.__annotations__["out"] = wp.array[dtype]
+    return wp.kernel(_k, name=name)
 
 
 # When the reduced extent is narrower than ``TILE_1D`` the tiled kernels above never take their
@@ -313,7 +310,7 @@ def _reduce_2d_axis_tiled(tile_reduce, atomic, scalar, name, rows):
 # ``(n, 3)`` table reduced along axis=0 has only 3 outputs — 3 serial threads would be 89x slower).
 
 
-def _reduce_2d_axis_serial(scalar, name, rows):
+def _reduce_2d_axis_serial(scalar, name, rows, dtype):
     """
     axis=1 (``rows=True``) or axis=0 with a reduced extent under ``TILE_1D``: one thread per output.
 
@@ -334,74 +331,210 @@ def _reduce_2d_axis_serial(scalar, name, rows):
             result = scalar(result, element(values, i, k))
         out[i] = result
 
-    _k.__name__ = name
-    _k.__qualname__ = name
-    return wp.kernel(_k)
+    _k.__annotations__["values"] = wp.array2d[dtype]
+    _k.__annotations__["out"] = wp.array[dtype]
+    return wp.kernel(_k, name=name)
+
+
+# A **global** reduction takes whatever scalar dtype the caller's buffer carries, and the package
+# itself hands it two families: geometry and solver values (``wp.float32``, ``wp.float64`` in the
+# heat and smoothing solvers) and *keys* --
+# [`isin`][triwarp.array.isin] and [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] bound
+# an index range with ``reduce.minmax`` over the caller's key dtype, whose public surface is
+# ``wp.int32`` / ``wp.int64`` / ``wp.uint32`` / ``wp.uint64`` (``isin`` widens anything narrower
+# with ``sortable_dtype`` before reducing, so sub-32-bit dtypes never reach a kernel here).
+_GLOBAL_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64, wp.float32, wp.float64)
+
+# A **per-axis** reduction is only ever reached with an index or a geometry dtype: nothing in the
+# package reduces a table of 64-bit keys along an axis, and the six-dtype cross product over these
+# 24 kernels would be 72 more kernels to compile on every rebuild for no call site (CLAUDE.md
+# section 14). A caller who does reduce a ``wp.uint64`` table along an axis pays one fork, once.
+_AXIS_DTYPES = (wp.int32, wp.float32, wp.float64)
 
 
 # ---------------------------------------------------------------------------
 # Scalar reductions (min / max / sum) over ``wp.Scalar`` arrays.
 # ---------------------------------------------------------------------------
 
-min1d_tiled = _reduce_1d_tiled(_tile_min, wp.atomic_min, wp.min, "min1d_tiled")
-min2d_tiled = _reduce_2d_tiled(_tile_min, wp.atomic_min, wp.min, "min2d_tiled")
-min_2d_rows_tiled = _reduce_2d_axis_tiled(
-    _tile_min, wp.atomic_min, wp.min, "min_2d_rows_tiled", rows=True
+# One concrete kernel per dtype, and the tables are what the wrapper launches. The factories have
+# always been able to bake the dtype in -- ``sum_vec3_1d_tiled`` and the weighted sums below always
+# did -- and leaving the rest at the ``wp.Scalar`` template made every launch pay Warp's host-side
+# ``infer_argument_types`` over the whole argument list. Measured on Warp 1.17 / RTX 5090, 100
+# launches between two synchronization points: ``sum1d_tiled`` at 25.2-25.8 us generic against
+# 13.6-14.5 concrete -- **1.77-1.88x, ~12 us a launch** -- and every scalar-returning reduction in
+# the package issues one. Nothing extra is compiled: these are the same instantiations
+# ``_register_overloads`` was already creating for the same dtype sets.
+MIN1D_TILED = KernelTable(
+    "min1d_tiled",
+    {
+        d: _reduce_1d_tiled(_tile_min, wp.atomic_min, wp.min, f"min1d_tiled_{d.__name__}", d)
+        for d in _GLOBAL_DTYPES
+    },
 )
-min_2d_cols_tiled = _reduce_2d_axis_tiled(
-    _tile_min, wp.atomic_min, wp.min, "min_2d_cols_tiled", rows=False
+MIN2D_TILED = KernelTable(
+    "min2d_tiled",
+    {
+        d: _reduce_2d_tiled(_tile_min, wp.atomic_min, wp.min, f"min2d_tiled_{d.__name__}", d)
+        for d in _GLOBAL_DTYPES
+    },
 )
-min_2d_rows_serial = _reduce_2d_axis_serial(wp.min, "min_2d_rows_serial", rows=True)
-min_2d_cols_serial = _reduce_2d_axis_serial(wp.min, "min_2d_cols_serial", rows=False)
+MIN_2D_ROWS_TILED = KernelTable(
+    "min_2d_rows_tiled",
+    {
+        d: _reduce_2d_axis_tiled(
+            _tile_min, wp.atomic_min, wp.min, f"min_2d_rows_tiled_{d.__name__}", True, d
+        )
+        for d in _AXIS_DTYPES
+    },
+)
+MIN_2D_COLS_TILED = KernelTable(
+    "min_2d_cols_tiled",
+    {
+        d: _reduce_2d_axis_tiled(
+            _tile_min, wp.atomic_min, wp.min, f"min_2d_cols_tiled_{d.__name__}", False, d
+        )
+        for d in _AXIS_DTYPES
+    },
+)
+MIN_2D_ROWS_SERIAL = KernelTable(
+    "min_2d_rows_serial",
+    {
+        d: _reduce_2d_axis_serial(wp.min, f"min_2d_rows_serial_{d.__name__}", True, d)
+        for d in _AXIS_DTYPES
+    },
+)
+MIN_2D_COLS_SERIAL = KernelTable(
+    "min_2d_cols_serial",
+    {
+        d: _reduce_2d_axis_serial(wp.min, f"min_2d_cols_serial_{d.__name__}", False, d)
+        for d in _AXIS_DTYPES
+    },
+)
 
-max1d_tiled = _reduce_1d_tiled(_tile_max, wp.atomic_max, wp.max, "max1d_tiled")
-max2d_tiled = _reduce_2d_tiled(_tile_max, wp.atomic_max, wp.max, "max2d_tiled")
-max_2d_rows_tiled = _reduce_2d_axis_tiled(
-    _tile_max, wp.atomic_max, wp.max, "max_2d_rows_tiled", rows=True
+MAX1D_TILED = KernelTable(
+    "max1d_tiled",
+    {
+        d: _reduce_1d_tiled(_tile_max, wp.atomic_max, wp.max, f"max1d_tiled_{d.__name__}", d)
+        for d in _GLOBAL_DTYPES
+    },
 )
-max_2d_cols_tiled = _reduce_2d_axis_tiled(
-    _tile_max, wp.atomic_max, wp.max, "max_2d_cols_tiled", rows=False
+MAX2D_TILED = KernelTable(
+    "max2d_tiled",
+    {
+        d: _reduce_2d_tiled(_tile_max, wp.atomic_max, wp.max, f"max2d_tiled_{d.__name__}", d)
+        for d in _GLOBAL_DTYPES
+    },
 )
-max_2d_rows_serial = _reduce_2d_axis_serial(wp.max, "max_2d_rows_serial", rows=True)
-max_2d_cols_serial = _reduce_2d_axis_serial(wp.max, "max_2d_cols_serial", rows=False)
+MAX_2D_ROWS_TILED = KernelTable(
+    "max_2d_rows_tiled",
+    {
+        d: _reduce_2d_axis_tiled(
+            _tile_max, wp.atomic_max, wp.max, f"max_2d_rows_tiled_{d.__name__}", True, d
+        )
+        for d in _AXIS_DTYPES
+    },
+)
+MAX_2D_COLS_TILED = KernelTable(
+    "max_2d_cols_tiled",
+    {
+        d: _reduce_2d_axis_tiled(
+            _tile_max, wp.atomic_max, wp.max, f"max_2d_cols_tiled_{d.__name__}", False, d
+        )
+        for d in _AXIS_DTYPES
+    },
+)
+MAX_2D_ROWS_SERIAL = KernelTable(
+    "max_2d_rows_serial",
+    {
+        d: _reduce_2d_axis_serial(wp.max, f"max_2d_rows_serial_{d.__name__}", True, d)
+        for d in _AXIS_DTYPES
+    },
+)
+MAX_2D_COLS_SERIAL = KernelTable(
+    "max_2d_cols_serial",
+    {
+        d: _reduce_2d_axis_serial(wp.max, f"max_2d_cols_serial_{d.__name__}", False, d)
+        for d in _AXIS_DTYPES
+    },
+)
 
-sum1d_tiled = _reduce_1d_tiled(_tile_sum, wp.atomic_add, wp.add, "sum1d_tiled")
-sum2d_tiled = _reduce_2d_tiled(_tile_sum, wp.atomic_add, wp.add, "sum2d_tiled")
-sum_2d_rows_tiled = _reduce_2d_axis_tiled(
-    _tile_sum, wp.atomic_add, wp.add, "sum_2d_rows_tiled", rows=True
+SUM1D_TILED = KernelTable(
+    "sum1d_tiled",
+    {
+        d: _reduce_1d_tiled(_tile_sum, wp.atomic_add, wp.add, f"sum1d_tiled_{d.__name__}", d)
+        for d in _GLOBAL_DTYPES
+    },
 )
-sum_2d_cols_tiled = _reduce_2d_axis_tiled(
-    _tile_sum, wp.atomic_add, wp.add, "sum_2d_cols_tiled", rows=False
+SUM2D_TILED = KernelTable(
+    "sum2d_tiled",
+    {
+        d: _reduce_2d_tiled(_tile_sum, wp.atomic_add, wp.add, f"sum2d_tiled_{d.__name__}", d)
+        for d in _GLOBAL_DTYPES
+    },
 )
-sum_2d_rows_serial = _reduce_2d_axis_serial(wp.add, "sum_2d_rows_serial", rows=True)
-sum_2d_cols_serial = _reduce_2d_axis_serial(wp.add, "sum_2d_cols_serial", rows=False)
+SUM_2D_ROWS_TILED = KernelTable(
+    "sum_2d_rows_tiled",
+    {
+        d: _reduce_2d_axis_tiled(
+            _tile_sum, wp.atomic_add, wp.add, f"sum_2d_rows_tiled_{d.__name__}", True, d
+        )
+        for d in _AXIS_DTYPES
+    },
+)
+SUM_2D_COLS_TILED = KernelTable(
+    "sum_2d_cols_tiled",
+    {
+        d: _reduce_2d_axis_tiled(
+            _tile_sum, wp.atomic_add, wp.add, f"sum_2d_cols_tiled_{d.__name__}", False, d
+        )
+        for d in _AXIS_DTYPES
+    },
+)
+SUM_2D_ROWS_SERIAL = KernelTable(
+    "sum_2d_rows_serial",
+    {
+        d: _reduce_2d_axis_serial(wp.add, f"sum_2d_rows_serial_{d.__name__}", True, d)
+        for d in _AXIS_DTYPES
+    },
+)
+SUM_2D_COLS_SERIAL = KernelTable(
+    "sum_2d_cols_serial",
+    {
+        d: _reduce_2d_axis_serial(wp.add, f"sum_2d_cols_serial_{d.__name__}", False, d)
+        for d in _AXIS_DTYPES
+    },
+)
 
 # ---------------------------------------------------------------------------
 # Boolean reductions over int32 0/1 masks. ``any`` == OR == max; ``all`` == AND
 # == min (a 0/1 mask minimises to 1 iff every element is 1). The 2-D global case
 # is handled by the wrapper flattening the mask and reusing the 1-D kernel, so no
 # ``*2d_tiled`` bool kernel is needed.
+#
+# These reach a kernel only through ``reduce._reduce_bool``, which casts the mask to a 0/1
+# ``wp.int32`` first -- and ``wp.bool`` is not a ``wp.Scalar`` anyway -- so each is a single
+# concrete kernel rather than a dtype table.
 # ---------------------------------------------------------------------------
 
-any_1d_tiled = _reduce_1d_tiled(_tile_max, wp.atomic_max, wp.max, "any_1d_tiled")
+any_1d_tiled = _reduce_1d_tiled(_tile_max, wp.atomic_max, wp.max, "any_1d_tiled", wp.int32)
 any_2d_rows_tiled = _reduce_2d_axis_tiled(
-    _tile_max, wp.atomic_max, wp.max, "any_2d_rows_tiled", rows=True
+    _tile_max, wp.atomic_max, wp.max, "any_2d_rows_tiled", True, wp.int32
 )
 any_2d_cols_tiled = _reduce_2d_axis_tiled(
-    _tile_max, wp.atomic_max, wp.max, "any_2d_cols_tiled", rows=False
+    _tile_max, wp.atomic_max, wp.max, "any_2d_cols_tiled", False, wp.int32
 )
-any_2d_rows_serial = _reduce_2d_axis_serial(wp.max, "any_2d_rows_serial", rows=True)
-any_2d_cols_serial = _reduce_2d_axis_serial(wp.max, "any_2d_cols_serial", rows=False)
+any_2d_rows_serial = _reduce_2d_axis_serial(wp.max, "any_2d_rows_serial", True, wp.int32)
+any_2d_cols_serial = _reduce_2d_axis_serial(wp.max, "any_2d_cols_serial", False, wp.int32)
 
-all_1d_tiled = _reduce_1d_tiled(_tile_min, wp.atomic_min, wp.min, "all_1d_tiled")
+all_1d_tiled = _reduce_1d_tiled(_tile_min, wp.atomic_min, wp.min, "all_1d_tiled", wp.int32)
 all_2d_rows_tiled = _reduce_2d_axis_tiled(
-    _tile_min, wp.atomic_min, wp.min, "all_2d_rows_tiled", rows=True
+    _tile_min, wp.atomic_min, wp.min, "all_2d_rows_tiled", True, wp.int32
 )
 all_2d_cols_tiled = _reduce_2d_axis_tiled(
-    _tile_min, wp.atomic_min, wp.min, "all_2d_cols_tiled", rows=False
+    _tile_min, wp.atomic_min, wp.min, "all_2d_cols_tiled", False, wp.int32
 )
-all_2d_rows_serial = _reduce_2d_axis_serial(wp.min, "all_2d_rows_serial", rows=True)
-all_2d_cols_serial = _reduce_2d_axis_serial(wp.min, "all_2d_cols_serial", rows=False)
+all_2d_rows_serial = _reduce_2d_axis_serial(wp.min, "all_2d_rows_serial", True, wp.int32)
+all_2d_cols_serial = _reduce_2d_axis_serial(wp.min, "all_2d_cols_serial", False, wp.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -412,83 +545,105 @@ all_2d_cols_serial = _reduce_2d_axis_serial(wp.min, "all_2d_cols_serial", rows=F
 # ---------------------------------------------------------------------------
 
 
-@wp.kernel
-def minmax1d_tiled(values: wp.array[wp.Scalar], out_minmax: wp.array[wp.Scalar]) -> None:
-    # Same TILES_PER_BLOCK_1D fold as the factory kernels above, with two accumulators seeded from
-    # the block's first chunk; two atomics per block instead of two per tile.
-    i, t = wp.tid()
-    n = values.shape[0]
-    base, remaining = tile_chunk(n, i, TILES_PER_BLOCK_1D * TILE_1D)
-    if remaining <= 0:
-        return
+def _minmax_1d_tiled(name, dtype):
+    """
+    axis=None on a 1-D array, both extrema in one pass.
 
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(values, shape=TILE_1D, offset=base, storage="register")
-        tile_min = wp.tile_min(tile)[0]
-        tile_max = wp.tile_max(tile)[0]
-    else:
-        tile_min = values[base]
-        tile_max = values[base]
-        for k in range(1, remaining):
-            v = values[base + k]
-            tile_min = wp.min(tile_min, v)
-            tile_max = wp.max(tile_max, v)
+    A factory for the reason in [`_reduce_1d_tiled`][triwarp.kernels.reduce._reduce_1d_tiled]: a
+    ``wp.Scalar`` template would make every launch pay Warp's host-side overload resolution,
+    measured on Warp 1.17 at 25.2-25.8 us against 13.6-14.5 for the concrete kernel
+    (**1.77-1.88x, ~12 us a launch**).
+    """
 
-    for s in range(1, TILES_PER_BLOCK_1D):
-        offset = base + s * TILE_1D
-        rest = n - offset
-        if rest >= TILE_1D:
-            chunk = wp.tile_load(values, shape=TILE_1D, offset=offset, storage="register")
-            tile_min = wp.min(tile_min, wp.tile_min(chunk)[0])
-            tile_max = wp.max(tile_max, wp.tile_max(chunk)[0])
-        elif rest > 0:
-            for k in range(rest):
-                v = values[offset + k]
+    def _k(values: wp.array[wp.Scalar], out_minmax: wp.array[wp.Scalar]) -> None:
+        # Same TILES_PER_BLOCK_1D fold as the factory kernels above, with two accumulators seeded
+        # from the block's first chunk; two atomics per block instead of two per tile.
+        i, t = wp.tid()
+        n = values.shape[0]
+        base, remaining = tile_chunk(n, i, TILES_PER_BLOCK_1D * TILE_1D)
+        if remaining <= 0:
+            return
+
+        if remaining >= TILE_1D:
+            tile = wp.tile_load(values, shape=TILE_1D, offset=base, storage="register")
+            tile_min = wp.tile_min(tile)[0]
+            tile_max = wp.tile_max(tile)[0]
+        else:
+            tile_min = values[base]
+            tile_max = values[base]
+            for k in range(1, remaining):
+                v = values[base + k]
                 tile_min = wp.min(tile_min, v)
                 tile_max = wp.max(tile_max, v)
 
-    if t == 0:
-        wp.atomic_min(out_minmax, 0, tile_min)
-        wp.atomic_max(out_minmax, 1, tile_max)
+        for s in range(1, TILES_PER_BLOCK_1D):
+            offset = base + s * TILE_1D
+            rest = n - offset
+            if rest >= TILE_1D:
+                chunk = wp.tile_load(values, shape=TILE_1D, offset=offset, storage="register")
+                tile_min = wp.min(tile_min, wp.tile_min(chunk)[0])
+                tile_max = wp.max(tile_max, wp.tile_max(chunk)[0])
+            elif rest > 0:
+                for k in range(rest):
+                    v = values[offset + k]
+                    tile_min = wp.min(tile_min, v)
+                    tile_max = wp.max(tile_max, v)
+
+        if t == 0:
+            wp.atomic_min(out_minmax, 0, tile_min)
+            wp.atomic_max(out_minmax, 1, tile_max)
+
+    _k.__annotations__["values"] = wp.array[dtype]
+    _k.__annotations__["out_minmax"] = wp.array[dtype]
+    return wp.kernel(_k, name=name)
 
 
-@wp.kernel
-def minmax2d_tiled(values: wp.array2d[wp.Scalar], out_minmax: wp.array[wp.Scalar]) -> None:
-    i, j, t = wp.tid()
-    n_rows = values.shape[0]
-    n_cols = values.shape[1]
-    row_offset = i * TILE_2D
-    col_offset = j * TILE_2D
-    if row_offset >= n_rows or col_offset >= n_cols:
-        return
+def _minmax_2d_tiled(name, dtype):
+    """axis=None on a 2-D array, both extrema in one pass; concrete for the same reason."""
 
-    remaining_rows = n_rows - row_offset
-    remaining_cols = n_cols - col_offset
-    tile_rows = wp.where(remaining_rows >= TILE_2D, TILE_2D, remaining_rows)
-    tile_cols = wp.where(remaining_cols >= TILE_2D, TILE_2D, remaining_cols)
-    if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
-        tile = wp.tile_load(
-            values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register"
-        )
-        tile_min = wp.tile_min(tile)[0]
-        tile_max = wp.tile_max(tile)[0]
-    else:
-        tile_min = values[row_offset, col_offset]
-        tile_max = values[row_offset, col_offset]
-        for r in range(tile_rows):
-            for c in range(tile_cols):
-                if r == 0 and c == 0:
-                    continue
-                v = values[row_offset + r, col_offset + c]
-                tile_min = wp.min(tile_min, v)
-                tile_max = wp.max(tile_max, v)
+    def _k(values: wp.array2d[wp.Scalar], out_minmax: wp.array[wp.Scalar]) -> None:
+        i, j, t = wp.tid()
+        n_rows = values.shape[0]
+        n_cols = values.shape[1]
+        row_offset = i * TILE_2D
+        col_offset = j * TILE_2D
+        if row_offset >= n_rows or col_offset >= n_cols:
+            return
 
-    if t == 0:
-        wp.atomic_min(out_minmax, 0, tile_min)
-        wp.atomic_max(out_minmax, 1, tile_max)
+        remaining_rows = n_rows - row_offset
+        remaining_cols = n_cols - col_offset
+        tile_rows = wp.where(remaining_rows >= TILE_2D, TILE_2D, remaining_rows)
+        tile_cols = wp.where(remaining_cols >= TILE_2D, TILE_2D, remaining_cols)
+        if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
+            tile = wp.tile_load(
+                values,
+                shape=(TILE_2D, TILE_2D),
+                offset=(row_offset, col_offset),
+                storage="register",
+            )
+            tile_min = wp.tile_min(tile)[0]
+            tile_max = wp.tile_max(tile)[0]
+        else:
+            tile_min = values[row_offset, col_offset]
+            tile_max = values[row_offset, col_offset]
+            for r in range(tile_rows):
+                for c in range(tile_cols):
+                    if r == 0 and c == 0:
+                        continue
+                    v = values[row_offset + r, col_offset + c]
+                    tile_min = wp.min(tile_min, v)
+                    tile_max = wp.max(tile_max, v)
+
+        if t == 0:
+            wp.atomic_min(out_minmax, 0, tile_min)
+            wp.atomic_max(out_minmax, 1, tile_max)
+
+    _k.__annotations__["values"] = wp.array2d[dtype]
+    _k.__annotations__["out_minmax"] = wp.array[dtype]
+    return wp.kernel(_k, name=name)
 
 
-def _minmax_2d_axis_tiled(name, rows):
+def _minmax_2d_axis_tiled(name, rows, dtype):
     """axis=1 (``rows=True``) or axis=0: ``_reduce_2d_axis_tiled`` with both extrema at once."""
     element = _element_along_row if rows else _element_along_col
 
@@ -526,12 +681,13 @@ def _minmax_2d_axis_tiled(name, rows):
             wp.atomic_min(out_min, i, tile_min)
             wp.atomic_max(out_max, i, tile_max)
 
-    _k.__name__ = name
-    _k.__qualname__ = name
-    return wp.kernel(_k)
+    _k.__annotations__["values"] = wp.array2d[dtype]
+    _k.__annotations__["out_min"] = wp.array[dtype]
+    _k.__annotations__["out_max"] = wp.array[dtype]
+    return wp.kernel(_k, name=name)
 
 
-def _minmax_2d_axis_serial(name, rows):
+def _minmax_2d_axis_serial(name, rows, dtype):
     """
     axis=1 (``rows=True``) or axis=0 with a reduced extent under ``TILE_1D``: one thread per output.
 
@@ -557,15 +713,45 @@ def _minmax_2d_axis_serial(name, rows):
         out_min[i] = slot_min
         out_max[i] = slot_max
 
-    _k.__name__ = name
-    _k.__qualname__ = name
-    return wp.kernel(_k)
+    _k.__annotations__["values"] = wp.array2d[dtype]
+    _k.__annotations__["out_min"] = wp.array[dtype]
+    _k.__annotations__["out_max"] = wp.array[dtype]
+    return wp.kernel(_k, name=name)
 
 
-minmax_2d_rows_tiled = _minmax_2d_axis_tiled("minmax_2d_rows_tiled", rows=True)
-minmax_2d_cols_tiled = _minmax_2d_axis_tiled("minmax_2d_cols_tiled", rows=False)
-minmax_2d_rows_serial = _minmax_2d_axis_serial("minmax_2d_rows_serial", rows=True)
-minmax_2d_cols_serial = _minmax_2d_axis_serial("minmax_2d_cols_serial", rows=False)
+MINMAX1D_TILED = KernelTable(
+    "minmax1d_tiled",
+    {d: _minmax_1d_tiled(f"minmax1d_tiled_{d.__name__}", d) for d in _GLOBAL_DTYPES},
+)
+MINMAX2D_TILED = KernelTable(
+    "minmax2d_tiled",
+    {d: _minmax_2d_tiled(f"minmax2d_tiled_{d.__name__}", d) for d in _GLOBAL_DTYPES},
+)
+MINMAX_2D_ROWS_TILED = KernelTable(
+    "minmax_2d_rows_tiled",
+    {d: _minmax_2d_axis_tiled(f"minmax_2d_rows_tiled_{d.__name__}", True, d) for d in _AXIS_DTYPES},
+)
+MINMAX_2D_COLS_TILED = KernelTable(
+    "minmax_2d_cols_tiled",
+    {
+        d: _minmax_2d_axis_tiled(f"minmax_2d_cols_tiled_{d.__name__}", False, d)
+        for d in _AXIS_DTYPES
+    },
+)
+MINMAX_2D_ROWS_SERIAL = KernelTable(
+    "minmax_2d_rows_serial",
+    {
+        d: _minmax_2d_axis_serial(f"minmax_2d_rows_serial_{d.__name__}", True, d)
+        for d in _AXIS_DTYPES
+    },
+)
+MINMAX_2D_COLS_SERIAL = KernelTable(
+    "minmax_2d_cols_serial",
+    {
+        d: _minmax_2d_axis_serial(f"minmax_2d_cols_serial_{d.__name__}", False, d)
+        for d in _AXIS_DTYPES
+    },
+)
 
 
 # ---------------------------------------------------------------------------
@@ -706,77 +892,8 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
 # interleaved reps.
 # ---------------------------------------------------------------------------
 
-# A **global** reduction takes whatever scalar dtype the caller's buffer carries, and the package
-# itself hands it two families: geometry and solver values (``wp.float32``, ``wp.float64`` in the
-# heat and smoothing solvers) and *keys* --
-# [`isin`][triwarp.array.isin] and [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] bound
-# an index range with ``reduce.minmax`` over the caller's key dtype, whose public surface is
-# ``wp.int32`` / ``wp.int64`` / ``wp.uint32`` / ``wp.uint64`` (``isin`` widens anything narrower
-# with ``sortable_dtype`` before reducing, so sub-32-bit dtypes never reach a kernel here).
-_GLOBAL_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64, wp.float32, wp.float64)
-
-# A **per-axis** reduction is only ever reached with an index or a geometry dtype: nothing in the
-# package reduces a table of 64-bit keys along an axis, and the six-dtype cross product over these
-# 24 kernels would be 72 more kernels to compile on every rebuild for no call site (CLAUDE.md
-# section 14). A caller who does reduce a ``wp.uint64`` table along an axis pays one fork, once.
-_AXIS_DTYPES = (wp.int32, wp.float32, wp.float64)
-
-# Grouped by signature shape, which is what ``wp.overload`` matches on; the operator each kernel
-# folds with does not enter into it.
-_GLOBAL_1D = (min1d_tiled, max1d_tiled, sum1d_tiled, minmax1d_tiled)
-_GLOBAL_2D = (min2d_tiled, max2d_tiled, sum2d_tiled, minmax2d_tiled)
-_AXIS_SINGLE_OUT = (
-    min_2d_rows_tiled,
-    min_2d_cols_tiled,
-    min_2d_rows_serial,
-    min_2d_cols_serial,
-    max_2d_rows_tiled,
-    max_2d_cols_tiled,
-    max_2d_rows_serial,
-    max_2d_cols_serial,
-    sum_2d_rows_tiled,
-    sum_2d_cols_tiled,
-    sum_2d_rows_serial,
-    sum_2d_cols_serial,
-)
-_AXIS_DUAL_OUT = (
-    minmax_2d_rows_tiled,
-    minmax_2d_cols_tiled,
-    minmax_2d_rows_serial,
-    minmax_2d_cols_serial,
-)
-# The boolean reductions reach these kernels only through ``_reduce_bool``, which casts the mask to
-# a 0/1 ``wp.int32`` first, so one dtype covers them -- and ``wp.bool`` is not a ``wp.Scalar``
-# anyway.
-_MASK_1D = (any_1d_tiled, all_1d_tiled)
-_MASK_2D = (
-    any_2d_rows_tiled,
-    any_2d_cols_tiled,
-    any_2d_rows_serial,
-    any_2d_cols_serial,
-    all_2d_rows_tiled,
-    all_2d_cols_tiled,
-    all_2d_rows_serial,
-    all_2d_cols_serial,
-)
-
-
-def _register_overloads() -> None:
-    """Instantiate every concrete overload of this module's generic kernels."""
-    for dtype in _GLOBAL_DTYPES:
-        for kernel in _GLOBAL_1D:
-            wp.overload(kernel, [wp.array[dtype], wp.array[dtype]])
-        for kernel in _GLOBAL_2D:
-            wp.overload(kernel, [wp.array2d[dtype], wp.array[dtype]])
-    for dtype in _AXIS_DTYPES:
-        for kernel in _AXIS_SINGLE_OUT:
-            wp.overload(kernel, [wp.array2d[dtype], wp.array[dtype]])
-        for kernel in _AXIS_DUAL_OUT:
-            wp.overload(kernel, [wp.array2d[dtype], wp.array[dtype], wp.array[dtype]])
-    for kernel in _MASK_1D:
-        wp.overload(kernel, [wp.array[wp.int32], wp.array[wp.int32]])
-    for kernel in _MASK_2D:
-        wp.overload(kernel, [wp.array2d[wp.int32], wp.array[wp.int32]])
-
-
-_register_overloads()
+# Nothing in this module is generic any more, so there is no ``_register_overloads`` here: every
+# kernel above is a concrete factory instantiation, which is what a registered overload *is*. The
+# rule in CLAUDE.md section 2.5 is unchanged and still binds every other kernel module -- what
+# changed is that the tables now hand the wrapper the concrete kernel instead of making
+# ``wp.launch`` re-derive it (see the note above ``MIN1D_TILED``).

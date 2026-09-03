@@ -159,7 +159,7 @@ def cotmatrix_entries(
 
     out_cot = twt.empty_2d((n_faces, 3), dtype, device=device)
     wp.launch(
-        kernel_laplacian.cotmatrix_entries,
+        kernel_laplacian.COTMATRIX_ENTRIES[dtype],
         dim=n_faces,
         inputs=[vertices, faces, out_cot],
         device=device,
@@ -203,7 +203,7 @@ def cotmatrix_entries_intrinsic(
 
     out_cot = twt.empty_2d((n_faces, 3), dtype, device=device)
     wp.launch(
-        kernel_laplacian.cotmatrix_entries_intrinsic,
+        kernel_laplacian.COTMATRIX_ENTRIES_INTRINSIC[dtype],
         dim=n_faces,
         inputs=[edge_lengths, out_cot],
         device=device,
@@ -283,7 +283,7 @@ def cotmatrix(
     # One generic kernel handles both precisions: it casts the (float32 or float64) half-cotangent
     # weights to the matrix dtype, assembling a native float32/float64 matrix in a single build.
     wp.launch(
-        kernel_laplacian.cotmatrix_triplets,
+        kernel_laplacian.COTMATRIX_TRIPLETS[cot_entries.dtype, dtype],
         dim=n_faces,
         inputs=[faces, cot_entries, rows, cols, vals],
         device=device,
@@ -495,7 +495,7 @@ def connection_laplacian(
     n_triplets = 12 * n_faces
     rows, cols, vals = tw.array.triplet_buffers(n_triplets, wp.mat22d, device)
     wp.launch(
-        kernel_laplacian.connection_laplacian_triplets,
+        kernel_laplacian.CONNECTION_LAPLACIAN_TRIPLETS[cot_entries.dtype],
         dim=n_faces,
         inputs=[faces, cot_entries, transport_angles, rows, cols, vals],
         device=device,
@@ -573,7 +573,7 @@ def laplacian_entries(
         rows, cols, vals = tw.array.triplet_buffers(m, dtype, device)
         if m > 0:
             wp.launch(
-                kernel_laplacian.laplacian_triplets_directed,
+                kernel_laplacian.LAPLACIAN_TRIPLETS_DIRECTED[dtype],
                 dim=m,
                 inputs=[edges, vertices, equal_weight_flag, rows, cols, vals],
                 device=device,
@@ -588,7 +588,7 @@ def laplacian_entries(
     rows, cols, vals = tw.array.triplet_buffers(2 * m_unique, dtype, device)
     if m_unique > 0:
         wp.launch(
-            kernel_laplacian.laplacian_triplets_symmetric,
+            kernel_laplacian.LAPLACIAN_TRIPLETS_SYMMETRIC[dtype],
             dim=m_unique,
             inputs=[unique_edges, vertices, equal_weight_flag, rows, cols, vals],
             device=device,
@@ -665,7 +665,7 @@ def laplacian(
     )
     if n_vertices > 0 and operator.nnz > 0:
         wp.launch(
-            kernel_laplacian.row_normalize,
+            kernel_laplacian.ROW_NORMALIZE[operator.values.dtype],
             dim=n_vertices,
             inputs=[operator.offsets, operator.values],
             device=device,
@@ -800,7 +800,7 @@ def mass_matrix_entries(
             # float32 face areas so the scatter specializes to the requested precision.
             areas = tw.array.astype(areas, dtype)
         wp.launch(
-            kernel_scatter.scatter_face_thirds,
+            kernel_scatter.SCATTER_FACE_THIRDS[dtype],
             dim=n_faces,
             inputs=[faces, areas, dtype(3.0), mass],
             device=device,

@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels.array import OverloadTable
 from triwarp.kernels.triangles import row_triple
 
 
@@ -318,28 +319,47 @@ _KEY_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64)
 _TABLE_DTYPES = (wp.int32, wp.int64)
 
 
+# The concrete handles keyed by the caller's key dtype -- see
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable]. Measured end to end on this module's own
+# consumers, interleaved and min-of-12 on an RTX 5090: ``unique_1d(200k, return_inverse=True)``
+# 305.0 -> 266.4 us (**1.15x**), ``unique_rows`` over an icosphere(6) edge table 612.4 -> 548.9
+# (1.12x), ``edges_unique`` 683.7 -> 647.8 (1.055x), ``group(200k, 2)`` 273.9 -> 261.6 (1.047x) --
+# roughly 12 us per generic launch removed, and this path issues two or three of them.
+MARK_GROUP_STARTS: OverloadTable
+HASH_INSERT: OverloadTable
+COMPACT_FROM_TABLE: OverloadTable
+
+
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
-    for dtype in _KEY_DTYPES:
-        wp.overload(mark_group_starts, [wp.array[dtype], wp.int32, wp.int32, wp.array[wp.bool]])
-    for dtype in _TABLE_DTYPES:
-        wp.overload(
-            hash_insert,
-            [wp.array[dtype], wp.array[dtype], wp.array[wp.int32], wp.int32, wp.array[wp.int32]],
-        )
-        # ``slot_key`` and ``out_keys`` carry the key dtype; every count/offset buffer is int32.
-        wp.overload(
-            compact_from_table,
-            [
-                wp.array[dtype],
+    global MARK_GROUP_STARTS, HASH_INSERT, COMPACT_FROM_TABLE
+    MARK_GROUP_STARTS = OverloadTable(
+        mark_group_starts,
+        {d: [wp.array[d], wp.int32, wp.int32, wp.array[wp.bool]] for d in _KEY_DTYPES},
+    )
+    HASH_INSERT = OverloadTable(
+        hash_insert,
+        {
+            d: [wp.array[d], wp.array[d], wp.array[wp.int32], wp.int32, wp.array[wp.int32]]
+            for d in _TABLE_DTYPES
+        },
+    )
+    # ``slot_key`` and ``out_keys`` carry the key dtype; every count/offset buffer is int32.
+    COMPACT_FROM_TABLE = OverloadTable(
+        compact_from_table,
+        {
+            d: [
+                wp.array[d],
                 wp.array[wp.int32],
                 wp.array[wp.int32],
                 wp.array[wp.int32],
-                wp.array[dtype],
+                wp.array[d],
                 wp.array[wp.int32],
                 wp.array[wp.int32],
-            ],
-        )
+            ]
+            for d in _TABLE_DTYPES
+        },
+    )
 
 
 _register_overloads()

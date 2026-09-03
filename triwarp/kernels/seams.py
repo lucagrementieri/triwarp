@@ -2,7 +2,12 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.kernels.array import binary_search_sorted_contains, cross2, pack_edge_key
+from triwarp.kernels.array import (
+    OverloadTable,
+    binary_search_sorted_contains,
+    cross2,
+    pack_edge_key,
+)
 from triwarp.kernels.halfedge import halfedge_next
 
 
@@ -183,13 +188,21 @@ def face_corner_edge_vertices(
 #
 # ``cut_mesh_from_seams`` scatters the corner *positions* it is splitting, so the value dtype is the
 # vertex dtype and nothing else reaches this kernel.
+# The concrete handle keyed by the value dtype -- see
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable].
+SCATTER_CORNER_VALUES: OverloadTable
+
+
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
-    for dtype in (wp.vec3, wp.vec3d):
-        wp.overload(
-            scatter_corner_values,
-            [wp.array[wp.int32], wp.array[wp.int32], wp.array[dtype], wp.array[dtype]],
-        )
+    global SCATTER_CORNER_VALUES
+    SCATTER_CORNER_VALUES = OverloadTable(
+        scatter_corner_values,
+        {
+            d: [wp.array[wp.int32], wp.array[wp.int32], wp.array[d], wp.array[d]]
+            for d in (wp.vec3, wp.vec3d)
+        },
+    )
 
 
 _register_overloads()
