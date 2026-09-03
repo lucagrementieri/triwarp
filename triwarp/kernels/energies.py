@@ -86,6 +86,27 @@ def cot_row_scales(
     # obtuse ring whose weights cancel, or an isolated vertex) the averaging is undefined and the
     # convention is to fall back to ``-v_i``, which is what the reference's ``norm_w = 0`` branch
     # amounts to.
+    #
+    # **The row walk is deliberate, and this is the fourth spelling of "get the diagonal" in the
+    # tree.** The other three are ``linalg._multigrid_levels`` (through ``wps.bsr_get_diag``),
+    # ``reconstruction.screened_inverse_diagonal`` and
+    # ``algorithms/conjugate_gradient.scaled_diagonal_apply``. The single-source-of-truth argument
+    # for routing this one through ``wps.bsr_get_diag`` too is real; it was measured and declined.
+    # Interleaved A/B in one session on an RTX 5090, ``wps.bsr_get_diag(operator)`` plus a
+    # two-output ``wp.map`` against this launch, min of three alternating pairs:
+    #
+    #   n              162      642      2 562    10 242
+    #   row walk       0.0183   0.0161   0.0164   0.0164  ms
+    #   builtin + map  0.1131   0.1046   0.1035   0.1045  ms   -> 6.2x / 6.5x / 6.3x / 6.4x slower
+    #
+    # ~0.09 ms flat, from an allocation and two launches against one, on a function
+    # ``energies.laplacian_smoothing_loss`` calls once. The values agree **exactly** at every size
+    # (``np.allclose`` on both outputs), which also settles the one substantive worry: the walk
+    # assumes the diagonal is *present* in the pattern, and it is not load-bearing -- an absent
+    # diagonal leaves ``diagonal`` at zero and takes the same undefined-averaging fallback that
+    # ``bsr_get_diag``'s own zero would. So the walk costs ~6 cached loads instead of 1 and buys a
+    # launch; ``bsr_get_diag`` remains the right spelling wherever the diagonal is wanted as an
+    # *array*, which is what ``linalg`` wants and this kernel does not.
     i = wp.int32(wp.tid())
     diagonal = wp.float32(0.0)
     for slot in range(offsets[i], offsets[i + 1]):

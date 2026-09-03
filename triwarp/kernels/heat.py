@@ -147,6 +147,27 @@ def scatter_free_rhs(
 ) -> None:
     # Compact a full-length right-hand side down to the unpinned degrees of freedom, in the layout
     # ``linalg.solve_spd_columns`` expects (one row per right-hand side).
+    #
+    # **Not factored with ``gather_free_solution`` below or with
+    # ``smoothing.scatter_free_scalar``, deliberately, and the near-duplicate scan's 0.917 on the
+    # last pair is a false positive worth knowing about.** After ``linalg.free_row`` -- which is
+    # already the shared guard, and is what makes the statement-run scan's biggest group (nine
+    # sites) an extraction rather than a duplicate -- each of the three is *one assignment*, and
+    # the three assignments are three different operations:
+    #
+    #   * this one **compacts** (full-length -> reduced), into a rank-2 destination's row 0;
+    #   * ``gather_free_solution`` **expands** (reduced -> full-length) and writes an explicit
+    #     zero at every pinned entry, which is why it tests ``fixed_mask`` directly instead of
+    #     calling ``free_row`` at all;
+    #   * ``smoothing.scatter_free_scalar`` expands from a rank-1 source and **leaves** the pinned
+    #     entries alone, because there they hold boundary values the caller set.
+    #
+    # So the pair the scan matched at 0.917 runs in *opposite directions*, and what is left to
+    # share after the guard is the destination's rank and the pinned-entry policy -- which is the
+    # whole of what distinguishes them. This is the same verdict, for the same reason, as
+    # ``holes.fill_dp_span``'s written decline about the prologue it shares with its tiled sibling:
+    # a helper here would cost more at the three call sites than it removes. Recorded because a
+    # text-keyed scan cannot see a direction and will match this pair again.
     i = wp.int32(wp.tid())
     ri = free_row(fixed_mask, free_map, i)
     if ri < 0:
