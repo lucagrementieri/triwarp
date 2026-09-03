@@ -946,6 +946,29 @@ def test_fix_self_intersections(bench_case: BenchCase, method: str) -> None:
     | `voxel` | **18.7 ms** | 117.4 (6.3x) |
     | `local` | 196.3 | **46.0** (4.3x behind) |
 
+    **``local`` is the largest single loss in the suite and it is attributed rather than open, so
+    read this before proposing anything for it.** Re-measured at this row's own input (132.0 ms):
+    ``face_self_intersecting_mask`` is **1.321 ms, 1.0 % of the call** -- the detector is not the
+    cost -- and one delete-and-refill round leaves **5 rims whose longest is 642 vertices**, which
+    the ``max_iter=3`` loop then pays three times. So the launch count is three min-weight DP
+    sweeps at ``2 * (max_rim - 2)`` each, which is round 7's 3 419 launches and its 55 % host share,
+    and the sweep itself is **launch-bound**: ``holes._run_hole_dp``'s docstring measures its floor
+    at a flat 16.4-18.6 us a launch, 37-74 % of the sweep across every rim length reached here.
+
+    Three things are refuted and must not be re-proposed: the **capture** (round 7's T3; a
+    once-through loop records and replays once, 0.84x), the **scope discount** (round 8's U3
+    re-measured it on *this* input -- 1 176 intersecting faces in to 158 out, and meshlib also
+    reduces without clearing, so the 0-against-281 discount is available on the torus fixture and
+    not here), and now the **DP block knob** that round 9 predicted would carry it. That knob ships
+    and is worth 1.10-1.13x on ``rim_short``, but it is gated on a *narrow* grid and this row's
+    5 rims fall outside it by one: forcing the gate open (``HOLE_DP_WIDE_GRID_LOOPS`` 4 -> 8) was
+    measured in-process at **1.01x**, i.e. nothing. So "it moves when V4 moves" is false for that
+    lever specifically.
+
+    What is left is the one unbuilt item both this row and the hole chains wait on: a **blocked**
+    interval DP, which would cut ~640 launches per sweep to ~20 and is a new kernel rather than a
+    knob. See ``holes._run_hole_dp``.
+
     The split is the point. The voxel path is a device field plus a marching pass and wins by the
     margin the ``offset`` groups show; the local path is a host-side loop of detect, dilate, delete,
     DP, refine -- five wrapper chains per pass, three passes -- and loses to a single C++ traversal.

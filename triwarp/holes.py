@@ -719,9 +719,28 @@ def _run_hole_dp(
     One launch per triangulation span **across all loops**, so the launch count is
     ``max(B) - 1`` for the whole mesh rather than ``B - 1`` per hole.
 
-    **That launch count is the floor on this stack, and folding the spans into one persistent
-    block per loop was built and is refuted.** Each span launch costs ~25 us with the GPU mostly
-    idle, so a ``wp.launch_tiled(dim=(n_loops,))`` kernel that loops over the spans internally --
+    **That launch count is the floor on this stack, and it is what the sweep is bound by.**
+    Re-attributed on Warp 1.17 by replaying the identical launch at ``dim=(1, 1)``, so the residual
+    is marshalling and nothing else: the floor is a flat **16.4-18.6 us per launch** and it accounts
+    for **37 % / 61 / 74 / 52** of the whole sweep at one rim of ``B`` = 128 / 256 / 512 / 1024
+    (5.610 / 7.305 / 12.893 / 32.675 ms). Apex throughput over the same range is 0.06 / 0.38 / 1.73
+    / 5.48 G evaluations a second -- three orders below what the arithmetic would run at -- so the
+    device is idle waiting for launches until the rim is very long indeed. The earlier reading that
+    this sweep is "device-bound at a large rim" holds only past ``B`` ~ 1 000, which no benchmarked
+    rim reaches (the longest are 512 on ``rim_short`` and 590 on ``dragon``).
+
+    The consequence is that the remaining levers are *fewer* launches or *cheaper* ones, and a
+    replayed graph launch costs ~1.17 us against this 17 -- which is why a captured sweep is the
+    obvious lever and why it still loses: recording costs about what launching costs, so
+    record-and-replay-**once** is round 6's measured 0.84x, and this loop runs once per call. A
+    graph reused across calls would need the same ``dp`` / ``prev`` pointers and the same rim-size
+    vector, which is a cache that mostly misses in real use. The other lever is algorithmic: a
+    *blocked* interval DP, tiling the ``(i, j)`` plane into ``T x T`` tiles so the tile-level DAG
+    keeps this shape at ``1/T`` the span count, cutting ~511 launches to ~16 at ``T = 32``.
+    That is a new kernel with in-tile sequencing, not a knob, and it is unbuilt.
+
+    **Folding the spans into one persistent block per loop was built and is refuted.** A
+    ``wp.launch_tiled(dim=(n_loops,))`` kernel that loops over the spans internally --
     lanes striding the ``(interval, apex)`` pairs, ``wp.atomic_min`` on the cost, a second pass for
     the smallest attaining apex, ``wp.tile_sum`` as the level barrier -- looked like the obvious
     lever. It reproduces this engine's ``dp`` / ``prev`` **byte for byte** and loses at every size
@@ -751,6 +770,10 @@ def _run_hole_dp(
     device = loops.device
     if tiled is None:
         tiled = not wp.get_device(device).is_cpu
+    # One of two lane counts, picked from the rim count *and* the longest rim -- see
+    # ``kernels/holes.hole_dp_block``, whose table shows why both matter. Read once here rather
+    # than per span so the whole sweep shares one module hash.
+    block = kernel_holes.hole_dp_block(loops.max_size, loops.n_loops)
     wp.launch(
         kernel_holes.init_dp_base,
         dim=(loops.n_loops, loops.max_size),
@@ -782,7 +805,7 @@ def _run_hole_dp(
                 kernel_holes.fill_dp_span_tiled,
                 dim=dim,
                 inputs=inputs,
-                block_dim=kernel_holes.HOLE_DP_BLOCK,
+                block_dim=block,
                 device=device,
             )
         else:

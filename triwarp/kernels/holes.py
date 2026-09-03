@@ -261,14 +261,63 @@ def init_dp_base(
 # apex loop. Short spans leave lanes idle, which costs nothing the one-thread-per-interval kernel
 # was not already wasting on its ~1 024-wide grid.
 #
-# **Measured flat between 32 and 128** on ``rim_short`` (two 512-vertex loops, medians of 15 over
-# two runs each): 19.0/20.1 at 32, 20.5/35.4 at 64, 19.6/23.9 at 128, against 24.0/36.0 at 256 —
-# i.e. within the noise band up to 128 and a regression past it, so the apex loop is not what the
-# call is bound by. 32 wins the tie on cost per barrier: a single-warp block takes the
-# ``warp_count == 1`` fast path in Warp's ``tile_reduce_impl`` (a ballot plus a warp shuffle, no
-# cross-warp shared-memory round trip), measured at 126 ns per ``tile_min`` against 325 ns at 64
-# and 369 ns at 128.
+# **Two values, and the choice is an occupancy question rather than a rim-length one.** The grid is
+# ``(n_loops, max_size - span)``, so a *wide* block only pays when that grid on its own would
+# starve the device -- which is CLAUDE.md section 3's block-per-item rule in a second place, and
+# getting it backwards costs 12 %. Measured on an RTX 5090 / Warp 1.17, interleaved, ``min`` of
+# 4-5, with the emitted face buffer **identical at every block size in every row**:
+#
+# | case | ``n_loops`` | ``max_size`` | 32 -> 128 |
+# |---|---|---|---|
+# | one wavy rim | 1 | 128 | **0.93x** |
+# | one wavy rim | 1 | 197 | 1.00 |
+# | one wavy rim | 1 | 380 | 1.06 |
+# | one wavy rim | 1 | 590 | 1.17 |
+# | one wavy rim | 1 | 1024 | **1.45** |
+# | ``rim_short`` (the benchmarked shape) | 2 | 512 | **1.13** |
+# | capped tubes | 1 | 512 | 1.01 |
+# | capped tubes | 8 | 512 | 1.03 |
+# | capped tubes | 32 | 512 | **0.93** |
+# | capped tubes | 128 | 512 | **0.89** |
+# | ``happy_buddha``, a scattered 1/5 region | 99 | 3025 | **0.88** |
+# | ``holes_many`` | 512 | 3 | 1.02 |
+#
+# So the wide block is worth 1.13-1.45x at one or two long rims and **loses 0.88-0.93x from ~32
+# rims up**, whatever the rim length -- the 99-rim ``happy_buddha`` row has the *longest* spans here
+# and is the worst loss, which is what rules out keying on ``max_size``. Hence both conditions in
+# ``hole_dp_block``: a long rim for the lanes to have work, and few enough rims that the grid needs
+# them. Within the winning corner the size of the win is mesh-dependent (1.01x on a capped tube
+# against 1.13x on ``rim_short`` at the same shape), so treat the table as a floor, not a formula.
+#
+# Two notes on method, each of which reversed a conclusion here. The previous reading of this knob,
+# **"measured flat between 32 and 128"** (19.0/20.1 at 32 against 19.6/23.9 at 128 on
+# ``rim_short``), was taken on Warp 1.16 and no longer holds on 1.17 -- re-probe a tuning constant
+# after an upgrade rather than trusting the comment. And a first version of this cut keyed on
+# ``max_size`` alone; it was caught by an A/B on a *scattered* deleted region, not by the benchmark
+# rows, so a many-rim case belongs in any future sweep of it. The old tie-break reason still stands
+# on its own terms -- a single-warp block takes the ``warp_count == 1`` fast path in Warp's
+# ``tile_reduce_impl``, 126 ns per ``tile_min`` against 325 at 64 and 369 at 128 -- it is simply
+# outweighed when the grid is narrow and the apex loop long.
 HOLE_DP_BLOCK = 32
+HOLE_DP_BLOCK_LONG = 128
+# Longest rim at or above which the wide block can pay (measured flat for both at exactly 256)...
+HOLE_DP_LONG_RIM = 256
+# ...and the rim count above which the grid no longer needs it. Between 8 and 32 in the table above;
+# placed at the low end because the losses past it are consistent and the wins below it are not.
+HOLE_DP_WIDE_GRID_LOOPS = 4
+
+
+def hole_dp_block(max_size: int, n_loops: int) -> int:
+    """
+    Lanes per block for a DP sweep over ``n_loops`` rims whose longest is ``max_size``.
+
+    Wide only when the rim is long enough to give the lanes work *and* there are few enough rims
+    that the ``(n_loops, max_size - span)`` grid would otherwise starve the device. See the table
+    above for why both conditions are needed.
+    """
+    if max_size >= HOLE_DP_LONG_RIM and n_loops <= HOLE_DP_WIDE_GRID_LOOPS:
+        return HOLE_DP_BLOCK_LONG
+    return HOLE_DP_BLOCK
 
 
 @wp.struct
@@ -428,8 +477,10 @@ def fill_dp_span_tiled(
     # hundred out of a few hundred thousand.
     #
     # **The stride is ``wp.block_dim()``, not ``HOLE_DP_BLOCK``, and that is what makes this kernel
-    # portable.** They are the same number on CUDA, where the launch passes ``HOLE_DP_BLOCK`` as
-    # ``block_dim``; they differ on the CPU device, where ``wp.launch_tiled`` runs exactly one lane
+    # portable.** On CUDA they agree, because the launch passes whichever of the two constants
+    # ``hole_dp_block`` picked -- which is a second reason the stride must be the runtime value and
+    # not the constant, since the constant is now only one of the two it could have been launched
+    # with. They differ on the CPU device, where ``wp.launch_tiled`` runs exactly one lane
     # per block through Warp 1.17 and ``wp.block_dim()`` reads 1. With the constant, lane 0 was the
     # only lane running and it stepped by 32, so the DP minimized over every 32nd apex and returned
     # a valid-looking, equal-count, *wrong* triangulation -- measured on ``_star_tube``, 42 of 44
