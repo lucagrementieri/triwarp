@@ -1691,7 +1691,10 @@ def kernel_scope_ternary_problems() -> list[str]:
 # Prose mentions in ``tests/`` and ``benchmarks/`` are correct and required -- a comparison has to
 # say what it compares against -- so the scan is scoped to the package.
 _MESHLIB_REFERENCES = re.compile(
-    r"\bmeshlib\b|\bmrmesh(py|numpy)\b|\bMR[A-Z][A-Za-z]{2,}"
+    # The ``MR`` source-file / class prefix is matched case-**sensitively**, inside a scoped
+    # ``(?-i:)``, so that ``IGNORECASE`` on the rest cannot turn it into "any word starting with
+    # mr". The ``\b`` is what keeps ``circumradius`` from matching it either way.
+    r"\bmeshlib\b|\bmrmesh(py|numpy)\b|(?-i:\bMR[A-Z][A-Za-z]{2,})"
     r"|\bFanOptimizer\b|\bbuildLocalTriangulation\b|\bpositionVertsSmoothly"
     r"|\bcalcQueueElement|\bupdateBorderQueueElement",
     re.IGNORECASE,

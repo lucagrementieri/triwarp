@@ -28,6 +28,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.api_conventions import (
+    _MESHLIB_REFERENCES,
     DocstringExample,
     _annotation_nodes,
     _asserted_reference_names,
@@ -761,6 +762,38 @@ def test_no_meshlib_references_in_the_package() -> None:
     package.
     """
     _fail("MeshLib reference(s) under triwarp/:", meshlib_reference_problems())
+
+
+def test_meshlib_scan_catches_every_shape_it_has_seen_and_not_circumradius() -> None:
+    r"""
+    Check 21's pattern fires on all five reference shapes and on nothing that merely reads like one.
+
+    Not a library comparison: this pins both directions of a licensing scan, the way
+    ``test_bare_tid_scan_ignores_multi_index_unpacks`` pins check 22's. Both halves cost a wrong
+    answer once. The five positives are the shapes actually found in the tree -- a C++ source file,
+    a class, a function, the package, an import -- and the four symbols ``CLAUDE.md``'s sentence
+    used to name matched **none** of the file-name ones. The negatives matter because the ``MR``
+    prefix is matched under ``IGNORECASE``: without its ``\b`` it hits *circu-mradius*, and without
+    the scoped ``(?-i:)`` it hits any word starting with "mr". A narrowed pattern is how this rule
+    failed the first two times.
+    """
+    caught = [
+        "# Fan weight (port of FanOptimizer::calcQueueElement_)",
+        "# MRLaplacian.cpp",
+        "# MRPointCloudTriangulationHelpers.cpp",
+        "positionVertsSmoothlySharpBd: SPD umbrella system",
+        "from meshlib import mrmeshpy as mm",
+    ]
+    ignored = [
+        "circumradius over twice the inradius",  # the \b, under IGNORECASE
+        "the mrunning total",  # the scoped (?-i:), under IGNORECASE
+        "MeshLab's ``inradius/circumradius``",  # pymeshlab is GPL and may be named
+        "Attene's lightweight repair pipeline",  # pymeshfix may be named too
+    ]
+    for line in caught:
+        assert _MESHLIB_REFERENCES.search(line) is not None, line
+    for line in ignored:
+        assert _MESHLIB_REFERENCES.search(line) is None, line
 
 
 def test_repeatedly_mapped_kernel_funcs_declare_their_signatures() -> None:
