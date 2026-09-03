@@ -150,7 +150,10 @@ Two conventions that hold throughout:
   it.** `wp.vec3(*(vertices[face[1]] - vertices[face[0]]))` splats a `wp.vec3` and rebuilds it; the
   difference of two `wp.vec3`s is already a `wp.vec3`. Check 16 classifies *casts*, so a
   `wp.vecN(*(...))` / `wp.matNM(*(...))` splat-and-reconstruct survives it — three such sites
-  outlived the pass that deleted 184 redundant casts, in `triangles.triangle_edges`. When deleting
+  outlived the pass that deleted 184 redundant casts, in `triangles.triangle_edges` (since fixed —
+  that helper now returns the differences directly, and a re-scan of `kernels/` finds no surviving
+  `wp.vecN(*(...))` / `wp.matNM(*(...))` splat; the nine remaining hits are Python-scope
+  constructions from host sequences, which are not this defect). When deleting
   one class of no-op conversion, grep the constructor spelling too, and read the operand's type
   rather than trusting the scan's silence.
 - `wp.cast(expr, TargetType)` is an explicit conversion **only between types of the same size** — it
@@ -2501,6 +2504,11 @@ The methodology is here; the *numbers* are Part II (§13 cost model, §14 kernel
   derives its parameter and profile at *that* value (§15.3).
 - **Read device time before diagnosing anything.** Six of triwarp's ten biggest losses are 92-99 %
   host-side launch/allocation cost, not slow kernels (§16.1).
+- **But first ask whether the function graph-captures, because `wp.timing_begin` cannot see a
+  replayed kernel and will report a device-bound function as ~100 % host** (§15.10). That covers
+  triwarp's own five capture sites *and* every CG solve, since `warp.optim.linear` captures by
+  default. Three functions were attributed backwards this way. Disable the capture, measure there,
+  and carry the device total back.
 - **Before proposing an optimization, read what *calls* the thing — the decline may already be
   written there.** A scan reads bodies; a measured decision is prose, and it lives at the call site,
   in a constant's comment, or in the benchmark's docstring rather than in the function. All three
@@ -2625,7 +2633,12 @@ notification arrives.
   yourself launching a second command to learn whether the first finished, delete it.
 - **When a poll genuinely is unavoidable** — external state the harness cannot see — make the pattern
   unable to self-match (`pgrep -f '[p]robe_p4'`) or test a sentinel file the process writes on exit,
-  and give the loop a **bounded** iteration count.
+  and give the loop a **bounded** iteration count. **The bracket trick is not sufficient on its
+  own**: this harness runs a command as `zsh -c '… && eval '\''<your command>'\''…'`, so the pattern
+  string appears *literally* in the invoking shell's command line and `pgrep -f` matches that shell
+  even though it does not match the pattern. Measured: `pgrep -af '[p]ytest'` returned exactly one
+  row, its own wrapper. **Prefer the sentinel file, and read a `pgrep` hit's command line before
+  believing the process it names is real.**
 - **Do not chain short sleeps** to approximate a long wait. Pass a longer `timeout`, or background it.
 
 A foreground command that outruns its timeout is *also* moved to the background and notified the same
@@ -3693,6 +3706,9 @@ crossover at ~1024 segments that **does not reproduce**: re-measured at 300 000 
 flattening near 0.85x rather than crossing 1. Replaying an *already recorded* graph there is 7.7-8.5x
 — but a pack's segment pointers change every call, so the recording is never reused.
 
+**And a captured function cannot be attributed with `wp.timing_begin`** — it reports zero kernels
+for the replay, so the very functions capture helps most read as ~100 % host (§15.10).
+
 **Where capture pays, it pays large.** `quadric_decimate`'s whole pass is now one captured graph
 replayed at a fixed width: **115 → 37 ms** on `saddle@0.1` (2.6-4.5x across fixtures), now faster
 than pyvista, igl, open3d and pymeshlab on every benchmarked cell. What made it legal is that the
@@ -4165,6 +4181,51 @@ footprint, not a reproduced defect.
 harness, with **0.94x** on the `saddle_graded` conditioning rows (§14.6). Same shape as §15.4's
 1.2-2.5x factor: **decide on the harness number.**
 
+### 15.10 `wp.timing_begin` is blind to graph-replayed kernels, so a captured function reads as ~100 % host
+
+**This invalidates the device/wall split for every function that graph-captures**, and it fails in
+the most expensive direction: a device-bound function reads as host-bound, which points the next
+optimization at launch elimination when the kernels are the cost. Measured directly — 20 launches
+of one kernel, timed both ways in one process:
+
+| | `timing_begin` reports |
+|---|---|
+| 20 loose `wp.launch` calls | 20 kernels, 0.113 ms |
+| the identical 20 inside a `wp.ScopedCapture`, replayed | **0 kernels, 0.000 ms** |
+
+**The reach is much wider than triwarp's own five capture sites** (`graph`, `polyline`, `remesh`,
+`linalg`, `reconstruction`), because **`warp.optim.linear`'s solvers capture their iteration by
+default** (`use_cuda_graph=True`). So every triwarp CG solve — heat, parametrization, smoothing,
+`min_quad_with_fixed`, `solve_spd*` — has its dominant kernels hidden from this measurement. Three
+corrections measured on Warp 1.17 / RTX 5090:
+
+| call | reads as | actually |
+|---|---|---|
+| `graph.bfs[handles_64]` | 97 % host (0.29 ms, 62 kernels) | **~100 % device** — 3.73 ms over **572** kernels against a 3.53 ms captured wall |
+| `heat.heat_geodesic[sphere_med]` | 97 % host (0.48 ms, 85 kernels) | **87 % device** — 13.03 ms over **2 949** kernels, 362 CG iterations |
+| `heat.transport_tangent_vectors[sphere_med]` | 93 % host (1.03 ms, 168 kernels) | **71 % device** — 4.17 ms over 864 kernels |
+
+**How to measure it correctly.** Re-run with capture disabled and read `timing_begin` there; the
+kernel *set* is unchanged, so the device total transfers back to the captured run (only the wall
+does not — the uncaptured wall is 3.7-9.5x higher, which is what the capture is worth).
+`warp.optim.linear` takes `use_cuda_graph=False`; triwarp's own `wp.capture_while` sites fall back
+to direct execution when `wp.is_conditional_graph_supported` returns `False`, so monkeypatching that
+is the lever. **Both arms must be instrumented identically** (§9) — the uncaptured arm is the
+measurement, not the baseline.
+
+**The tell that this was wrong all along was already in the tree.** `heat.heat_operators`' docstring
+had concluded *"the call is iteration-bound, and the Poisson half is the expensive one … the cost is
+device-side rather than host"* — derived from a tolerance sweep (12.65 / 10.21 / 5.16 / 2.44 ms at
+`tol` = 1e-10 / 1e-6 / 1e-3 / 1e-1) rather than from `timing_begin`. When a device/wall split
+contradicts a tolerance or input-size sweep on the same function, **the sweep is right**: it cannot
+be fooled by where the kernels were issued from.
+
+**Two second-order traps in the same family**, both of which make host time look larger than it is:
+a `.numpy()` readback's wall time is the queue depth in front of it (§14.6), and once ~1 000
+launches are pending the driver's launch queue fills and `wp.launch` itself blocks — measured 41 µs
+per `wp.launch` inside `transport_tangent_vectors`' CG against the 12 µs floor of §13.1, which is a
+device-bound signature and not a marshalling cost.
+
 ---
 
 ## 16. triwarp component status
@@ -4207,7 +4268,15 @@ is paid — nothing extra is compiled, since a registered overload *is* a compil
 
 **Six of the ten biggest losses are 92-99 % host-side launch/allocation cost, not slow kernels.**
 Device time from `wp.timing_begin(cuda_filter=wp.TIMING_KERNEL | wp.TIMING_MEMSET, synchronize=True)`,
-wall from the benchmark suite:
+wall from the benchmark suite.
+
+!!! warning "Every reading in this section is only valid for a function that does **not** graph-capture"
+    `wp.timing_begin` reports **zero** kernels for graph-replayed work (§15.10), and
+    `warp.optim.linear` captures its solver iteration by default — so this method reads any CG-backed
+    or `wp.capture_while`-driven function as ~100 % host whatever it really is. The rows below were
+    taken before their functions were captured, or on functions that never were; three that this
+    method got backwards are corrected in §15.10. **Check for capture before trusting a host share,
+    and re-derive one that was taken before a capture landed.**
 
 | group / case | wall | device | host share |
 |---|---|---|---|
@@ -4412,12 +4481,15 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
 - **Never quote the `isotropic_remesh` speedup over MeshLab without the quality caveat** — triwarp is
   flat at 123 ms against pymeshlab's 339 → 1 116 because it spends a fixed budget, not because it does
   the same job (§14.8).
-- **OPEN — `remesh.claim_collapses` locks by the raw edge index.** `kernels/remesh.py` holds two
-  independent-set implementations for edge collapse. The **quadric** path hashes its lock key
+- **CLOSED — `remesh.claim_collapses` locked by the raw edge index.** Fixed in `3428899` by
+  merging both collapse paths onto one `claim_collapse_key` kernel, so the isotropic path now hashes
+  its lock key like the quadric one; `kernels/remesh.py` reads `scramble_index(k)` at all four
+  sites. The measurement is kept because it prices the *shape* of the defect, which recurs wherever
+  a parallel independent set locks on a spatially monotone index. The **quadric** path always hashed
   (`scramble_index`, whose comment records that a raw index gives 1 winner out of 51 546 candidates
-  because `edges_unique` is spatially monotone). The **isotropic** path (`claim_collapses` →
-  `commit_collapses`, backing `isotropic_remesh`) still uses `key = k` — i.e. it is the thing that
-  comment warns about:
+  because `edges_unique` is spatially monotone); the **isotropic** path (`claim_collapses` →
+  `commit_collapses`, backing `isotropic_remesh`) used `key = k` — the thing that comment warns
+  about:
 
   | mesh | candidates | winners raw | winners hashed |
   |---|---|---|---|
@@ -4428,10 +4500,9 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   End to end through `_collapse_pass` at `max_passes=5`, kernels monkeypatched so nothing else
   differs: `saddle` 17 689 → **17 684** verts (raw) against **14 928** (hashed), at **10.6 vs
   10.7 ms** — the cost is flat because a pass is dominated by rebuilding the edge incidence, so the
-  hashed key buys ~500x the work for free. **Every existing test passes against the broken version —
-  nothing asserts a collapse *count*.** One-line fix, but gate it on a new count assert and
-  re-baseline against the reference rather than the old output. The same two kernels also duplicate
-  the 1-ring atomic-min scatter 3x and the win test 3x.
+  hashed key buys ~500x the work for free. **Every existing test passed against the broken version —
+  nothing asserted a collapse *count***, which is the lasting lesson: an independent-set kernel needs
+  a test on how many winners a round produces, not only on the validity of the ones it commits.
 - **`isotropic_remesh` is not byte-gateable.** Its face buffer is stable but vertex positions differ
   by ~2.7e-06 run to run (icosphere(2), 3 iterations, CUDA), because `accumulate_one_ring` and the
   area-weighted normals accumulate with atomics in nondeterministic order; on some fixtures (a
@@ -4758,6 +4829,25 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   through `"auto"` without measuring it.** `harmonic k=2` is 2.25x on `saddle` and 0.23x on
   `saddle_graded` at identical connectivity, so a strength-of-connection threshold (`theta > 0`) is
   the open lead for anisotropic operators.
+- **The gate's decline branch generalizes to a fifth operator class it was never fitted on: the heat
+  Poisson system.** `heat.heat_operators`' docstring names *"a preconditioner stronger than Jacobi on
+  a cotangent operator"* as the only lever for `heat_geodesic`, and §15.10's correction confirms that
+  call is 87 % device and iteration-bound — so the hierarchy is the obvious thing to try. Measured on
+  `-L` with a mean-zero right-hand side (a random one is out of range — the constants are in the
+  nullspace — and runs CG to its 25 620-iteration cap, which is the docstring's own trap in a second
+  guise), `tol=1e-8`:
+
+  | mesh | n | dominance | Jacobi | multigrid | build | solve | with build |
+  |---|---|---|---|---|---|---|---|
+  | `sphere_small` | 2 562 | **1.00** | 100 it / 3.59 ms | 10 it / 3.78 | 13.06 ms | 0.95x | **0.21x** |
+  | `sphere_med` | 40 962 | **1.00** | 380 it / 10.60 | 20 it / 6.44 | 25.10 | 1.65x | **0.34x** |
+  | `saddle` | 17 689 | **1.20** | 710 it / 17.17 | 20 it / 6.12 | 19.68 | 2.80x | **0.67x** |
+
+  Iterations fall **10-35x** and the solve wins up to 2.80x, and the setup loses all of it — the same
+  sentence as every other losing case above. **The gate is right without being touched**: all three
+  read dominance 1.00-1.20, far below `CG_MULTIGRID_SIZE_FLOOR = 1.9`, so `"auto"` declines them. It
+  flips only for a caller that solves **four or more** times against one `heat_operators`; no in-repo
+  caller does, so §4.2 says do not build the keyword. Re-open this if one appears.
 - **OPEN: `robust_laplacian` keeps a -16 off-diagonal on Dini's surface although
   `intrinsic_delaunay` reports convergence.** On `parametric_surface("dini")` (40x40, 1600 vertices,
   edge lengths 3.3e-4 to 4.02 — a 12 000:1 ratio, face areas 5.4e-5 to 0.033), `robust_laplacian` with
@@ -4783,7 +4873,7 @@ Attributed per row before touching any of it (97 rows, 158.1 ms by gap). Top gro
 | group | gap ms | rows | status |
 |---|---|---|---|
 | `split_array` | 15.06 | 6 | per-segment `wp.clone` floor — 256 × ~15 µs, the measured constant (§13.1) |
-| `transport_tangent_vectors` | 8.62 | 2 | **no attribution yet** |
+| `transport_tangent_vectors` | 8.62 | 2 | **attributed** — 71 % *device*, `warp.optim.linear`'s two `TiledDot` kernels are 42 % of the solve (§15.10) |
 | `cluster_decimate` | 8.59 | 4 | flat over a 67x face range, wins 9.14x at `dragon`. Not a work item |
 | `chamfer_points_to_points` | 7.71 | 5 | **closed** by the backward-radius seeding (§16.6) |
 | `laplacian_inverse_distance` | 7.50 | 4 | **closed** — `edges=` made two cells wins |
@@ -4793,20 +4883,44 @@ Attributed per row before touching any of it (97 rows, 158.1 ms by gap). Top gro
 | `is_watertight` | 5.88 | 2 | documented scope mismatch (meshlib reads a cached `isClosed`) |
 | `cotmatrix` | 5.87 | 2 | **closed** as a scope mismatch (§16.6) |
 | `fillable_loop_mask` | 5.67 | 3 | `edges_unique` at 62-66 %; deleting the chord test outright still leaves ~0.4 ms |
-| `homology_generators` | 4.94 | 1 | **no attribution yet** |
+| `homology_generators` | 4.94 | 1 | **attributed** — `graph.bfs` is 3.57 of `tree_cotree`'s 6.09 ms and is ~100 % device (§15.10) |
 | `lscm` | 4.83 | 1 | the ill-conditioned-solve family |
 | `pack_1d_arrays` | 4.02 | 3 | the per-segment floor |
 | `marching_triangles` | 3.98 | 2 | **not real** — a median artifact at `rounds=3` (§15.4) |
-| `vector_heat_scale` | 3.82 | 1 | **no attribution yet** |
-| `delaunay_triangulation` | 3.73 | 1 | **no attribution yet** |
+| `vector_heat_scale` | 3.82 | 1 | **attributed** — the same transport, so the same CG (§15.10) |
+| `delaunay_triangulation` | 3.73 | 1 | **attributed** — genuinely host (no capture), and it is the *documented* CPU seed: 5.2 ms in `invoke` plus 2.8 in `_lexicographic_triangulation`, 8.0 of 18.1 ms at n = 20 000 |
 
 **The finding: the band is mostly closed or floor, and the six largest genuinely-open rows were
 addressed by other items rather than by working the band.** That is the argument for attributing
-first and expecting the row to belong to someone else's item. Four rows have no attribution at all
-and are where a next pass should start — `transport_tangent_vectors` (8.62),
-`homology_generators` (4.94), `vector_heat_scale` (3.82), `delaunay_triangulation` (3.73), 21.1 ms
-between them. One caveat on reading any of it: the band is computed from **medians** — run
-`aggregate.py --suspect` first (§15.4).
+first and expecting the row to belong to someone else's item. One caveat on reading any of it: the
+band is computed from **medians** — run `aggregate.py --suspect` first (§15.4).
+
+**The four rows that had no attribution now have one, and three of the four are *device*-bound —
+the opposite of what this section's method reported**, because all three graph-capture and
+`wp.timing_begin` cannot see that (§15.10). So the band's remaining 21.1 ms is not launch overhead
+and launch elimination will not touch it:
+
+- **`transport_tangent_vectors` / `vector_heat_scale`** are one call. 71 % device; of the solve's
+  4.17 ms the two `TiledDot` kernels are 1.75 ms (42 %) at 186 calls each, the sparse mat-vec only
+  0.31. Same shape as §12.7's batched-dot finding, on the *unbatched* path — `wpl.cg`, not
+  `_BatchedCg`. A CG iteration here is ~36 µs of which two dots are ~10, and every kernel in it is
+  latency-bound at ~5 µs over 40 962 rows.
+- **`homology_generators`** = `tree_cotree` (6.09 ms) + ~5.0 ms of Python loop tracing. Of the
+  `tree_cotree` half, **`graph.bfs` is 3.57 ms and is ~100 % device** — 4 kernels x 142 levels at
+  26.1 µs a level (`bfs_scatter_claims` 8.6, `bfs_expand_claim` 7.6, `bfs_count_and_scan` 7.0,
+  `bfs_scan_and_advance` 2.9, the last at `dim=1`). Capture is already worth **3.7-5.0x** there
+  (3.53 ms against 13.3 uncaptured), and `wp.capture_while`'s own per-iteration overhead is only
+  ~4-6 µs against a captured fixed chain's 1.0-2.1 (measured on a 142-iteration synthetic; batching
+  K bodies per conditional check is worth at most 1.38x there, best at K = 4, and nothing here).
+  **So the level loop is real work and the only lever is fewer levels or fewer kernels per level**,
+  which is §14.9's standing conclusion. The primal tree cannot take the dual side's Boruvka
+  treatment — `tree_cotree` reads the dual tree as a *set* but walks the primal one's rooted
+  `parents`, and rooting a forest in parallel is a different problem; `homology.py` says so at the
+  site. Second-largest piece after that is `_device.read_scalar`, 11 calls for 0.154 ms.
+- **`delaunay_triangulation`** is the one that is genuinely host, and its host half is the
+  *designed* one: the single-thread CPU seed kernel, 5.2 ms in `invoke` plus 2.8 in
+  `_lexicographic_triangulation` of an 18.1 ms call at n = 20 000. Already recorded in the
+  benchmark's own docstring as the fixed design (a CUDA thread is 66x worse at it).
 
 Two related notes: `homology_generators[handles_64]` spends 4.43 of 10.9 ms in the Python
 `_loop_through_tree` walks (128 generators, mean loop 110), which a NumPy binary-lifting LCA would
