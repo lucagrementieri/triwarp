@@ -52,12 +52,52 @@ median and nothing else.
 
 ``aabb_union`` gets no row: it is four ``wp.vec3`` component-wise minima at Python scope with no
 device work at all, so a row would time the interpreter. It is covered in ``tests/test_bounds.py``.
+
+The module's other half runs the opposite way -- points against a box that already exists -- and
+its three groups (``points_in_aabb``, ``crop_points``, ``crop_mesh``) share one shape: triwarp is
+**flat** in the input and open3d is **linear**, so each row is a *crossover* and not a ratio. The
+flat readings are the host launch floor -- three to five launches plus the one readback that sizes
+the output -- so nothing on triwarp's side is bandwidth-bound anywhere in this sweep, and a change
+here will show up as a slope long before it shows up as a level.
+
+In-harness medians on an RTX 5090 against open3d's one core, at 2 562 / 40 962 / 163 842 vertices:
+
+| group | triwarp-cuda (µs) | open3d (µs) | triwarp / open3d |
+|---|---|---|---|
+| ``points_in_aabb`` | 271 / 230 / 301 | 15 / 243 / 991 | 0.06x / 1.06x / **3.29x** |
+| ``crop_points`` | 333 / 344 / 314 | 17 / 219 / 830 | 0.05x / 0.64x / **2.65x** |
+| ``crop_mesh`` | 1 108 / 1 000 / 1 037 | 186 / 3 014 / 13 718 | 0.17x / 3.02x / **13.2x** |
+
+So the crossover sits near 40 000 vertices for the two point groups and somewhere below 2 562 for
+the mesh crop, which is the one row that is worth reading as a win. Every row here is sub-10 ms and
+therefore clock-state bimodal (see ``benchmarks/README.md``), so treat the *crossover* as the
+finding and not any single ratio; the small-sphere columns are the launch floor being reported and
+mean nothing beyond "open3d has no floor".
+
+``crop_points`` is the ``points_in_aabb`` row plus a gather, and the row is kept rather than
+declined because open3d answers it through a *different* entry point (``PointCloud.crop`` rather
+than ``get_point_indices_within_bounding_box``) whose extra work -- materializing the survivors --
+is the same extra work triwarp does, so the two rows bracket it on both sides. The gather's own cost
+is the number to check a change against rather than the difference of two medians from separate
+rows: measured **interleaved** in one process, a flat 36-42 µs over the whole 64x size range, which
+is one ``wp.copy`` launch and matches section 13's launch cost model.
+
+The two ``*_mask`` entry points get **no** rows: each is its group's row minus the
+``flatnonzero`` that sizes the index buffer, so a row would re-time the same ``wp.map`` under a
+fourth and fifth name. They are covered in ``tests/test_bounds.py``.
+
+**No reference other than open3d answers the query half**, which was checked rather than assumed:
+trimesh has no box crop for either a cloud or a mesh, and pyvista's ``clip_box`` is a *clip* -- it
+splits the straddling cells and introduces vertices the input never had, so it answers a different
+question (its ``crinkle=True`` mode keeps whole cells, which is ``face_mode="any"`` and not the
+all-corners rule these groups time).
 """
 
 from __future__ import annotations
 
 import igl
 import numpy as np
+import open3d as o3d
 import pytest
 import trimesh as tm
 import warp as wp
@@ -179,6 +219,155 @@ def test_enclosing_diagonal(bench_case: BenchCase) -> None:
     assert diagonal_igl > 0.0
 
 
+# Box for every containment row: the low corner of the mesh's own bounds, 60% of each side and
+# padded 1% outward, which is the construction ``tests/test_bounds.py`` documents. Fixed rather than
+# swept: the predicate is six comparisons per point whatever the box holds, so the *selectivity* is
+# not a cost axis (verified -- the full box and an empty one measure within noise of each other),
+# and only the compaction downstream sees how many points survived.
+_BOX_KEEP = 0.6
+_BOX_PAD = 0.01
+
+_cloud_o3d_cache: dict[str, o3d.geometry.PointCloud] = {}
+_vector_o3d_cache: dict[str, o3d.utility.Vector3dVector] = {}
+
+
+def _box_np(bench_case: BenchCase) -> np.ndarray:
+    """Build the ``(2, 3)`` query box on the host, so both sides get identical corners."""
+    vertices_np = bench_case.vertices_np
+    lower_np = vertices_np.min(axis=0)
+    extent_np = vertices_np.max(axis=0) - lower_np
+    return np.stack([lower_np - _BOX_PAD * extent_np, lower_np + _BOX_KEEP * extent_np])
+
+
+def _corners_wp(box_np: np.ndarray) -> tuple[wp.vec3, wp.vec3]:
+    """Return the same box as the two ``wp.vec3`` corners triwarp takes."""
+    return wp.vec3(*box_np[0].tolist()), wp.vec3(*box_np[1].tolist())
+
+
+def _vector_o3d(bench_case: BenchCase) -> o3d.utility.Vector3dVector:
+    """Wrap the vertices as an Open3D vector once per mesh: an input conversion, not the op."""
+    name = bench_case.mesh_name
+    if name not in _vector_o3d_cache:
+        _vector_o3d_cache[name] = o3d.utility.Vector3dVector(bench_case.vertices_np)
+    return _vector_o3d_cache[name]
+
+
+def _cloud_o3d(bench_case: BenchCase) -> o3d.geometry.PointCloud:
+    """
+    Open3D point cloud over the same vertices, built once per mesh.
+
+    One cloud serves every round here, unlike the ``remove_*`` filters in ``test_points.py``:
+    ``crop`` returns a fresh geometry and mutates nothing (checked -- the input's point count is
+    unchanged after the call).
+    """
+    name = bench_case.mesh_name
+    if name not in _cloud_o3d_cache:
+        _cloud_o3d_cache[name] = o3d.geometry.PointCloud(_vector_o3d(bench_case))
+    return _cloud_o3d_cache[name]
+
+
+@pytest.mark.benchmark(group="points_in_aabb")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "open3d")
+def test_points_in_aabb(bench_case: BenchCase) -> None:
+    """
+    Six comparisons per point, then the scan that compacts them: the module's cheapest group.
+
+    Read this row as a **crossover, not a ratio**. triwarp is flat -- one ``wp.map``, one
+    ``array_cast``, one scan, one 4-byte readback and one scatter, none of which the vertex count
+    moves at these sizes -- while open3d walks the cloud once on one core and grows linearly, so
+    open3d wins by 17.6x at 2 562 vertices and loses by 3.29x at 163 842. Neither endpoint means
+    anything alone; the sweep is the measurement.
+
+    open3d's ``get_point_indices_within_bounding_box`` returns exactly this index list and is
+    compared against it element-wise in ``tests/test_bounds.py``. The ``Vector3dVector`` its box
+    query takes is built in setup, so the row prices the query and not the conversion.
+    """
+    box_np = _box_np(bench_case)
+    if bench_case.kind == "triwarp":
+        vertices_wp = bench_case.vertices_wp
+        lower_wp, upper_wp = _corners_wp(box_np)
+        indices_wp = bench_case.run(
+            lambda: tw.bounds.points_in_aabb(vertices_wp, lower_wp, upper_wp)
+        )
+        assert 0 < int(indices_wp.shape[0]) < bench_case.n_vertices
+        return
+    box_o3d = o3d.geometry.AxisAlignedBoundingBox(box_np[0], box_np[1])
+    vector_o3d = _vector_o3d(bench_case)
+    indices_o3d = bench_case.run(lambda: box_o3d.get_point_indices_within_bounding_box(vector_o3d))
+    assert 0 < len(indices_o3d) < bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="crop_points")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "open3d")
+def test_crop_points(bench_case: BenchCase) -> None:
+    """
+    The selection plus the gather that materializes it -- ``points_in_aabb`` with the copy included.
+
+    The gather is a flat 0.036-0.042 ms over a 64x size range (one ``wp.copy`` launch), so this row
+    should track the ``points_in_aabb`` row at a constant offset and any *slope* appearing here is
+    the finding. Both sides materialize: open3d's ``PointCloud.crop`` runs the same index query as
+    the group above and then copies the survivors through ``SelectByIndex``, and triwarp returns
+    the indices alongside the points so a caller never pays the query twice.
+    """
+    box_np = _box_np(bench_case)
+    if bench_case.kind == "triwarp":
+        vertices_wp = bench_case.vertices_wp
+        lower_wp, upper_wp = _corners_wp(box_np)
+        kept_wp, indices_wp = bench_case.run(
+            lambda: tw.bounds.crop_points(vertices_wp, lower_wp, upper_wp)
+        )
+        assert int(kept_wp.shape[0]) == int(indices_wp.shape[0])
+        assert 0 < int(kept_wp.shape[0]) < bench_case.n_vertices
+        return
+    box_o3d = o3d.geometry.AxisAlignedBoundingBox(box_np[0], box_np[1])
+    cloud_o3d = _cloud_o3d(bench_case)
+    kept_o3d = bench_case.run(lambda: cloud_o3d.crop(box_o3d))
+    assert 0 < len(kept_o3d.points) < bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="crop_mesh")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "open3d")
+def test_crop_mesh(bench_case: BenchCase) -> None:
+    """
+    The vertex query, the all-corners face reduction, and the compaction that reindexes from zero.
+
+    The module's widest gap and the one worth watching: **13.2x at 163 842 vertices** (1.04 ms
+    against 13.72) where the two point groups manage 2.65-3.29x, because the mesh crop is where the
+    work stops being one comparison per point -- the face reduction and the vertex compaction both
+    scale, and open3d does them serially. It is also flat on triwarp's side across the whole sweep,
+    which says the four-launch chain is still host-bound at 327 680 faces and that a change here
+    will show up as a *slope* long before it shows up as a level.
+
+    This is the row that pins the mask-input route through
+    [`triwarp.selection.submesh_from_vertex_mask`][triwarp.selection.submesh_from_vertex_mask]:
+    the crop hands it a mask, which reduces onto faces directly rather than going back through
+    ``isin``, and that route measured 1.96x on CUDA in isolation. Reading this row against the
+    ``submesh`` groups in ``benchmarks/test_selection.py`` is how a regression in either is
+    attributed.
+
+    open3d's ``TriangleMesh.crop`` applies the identical all-corners rule (compared element-wise,
+    modulo vertex renumbering, in ``tests/test_bounds.py``) and returns a fresh mesh, so the shared
+    input mesh stays valid across rounds.
+    """
+    box_np = _box_np(bench_case)
+    if bench_case.kind == "triwarp":
+        vertices_wp, faces_wp = bench_case.vertices_wp, bench_case.faces_wp
+        lower_wp, upper_wp = _corners_wp(box_np)
+        sub_vertices_wp, sub_faces_wp = bench_case.run(
+            lambda: tw.bounds.crop_mesh(vertices_wp, faces_wp, lower_wp, upper_wp)
+        )
+        assert 0 < int(sub_faces_wp.shape[0]) // 3 < bench_case.n_faces
+        assert 0 < int(sub_vertices_wp.shape[0]) < bench_case.n_vertices
+        return
+    box_o3d = o3d.geometry.AxisAlignedBoundingBox(box_np[0], box_np[1])
+    mesh_o3d = bench_case.mesh_o3d
+    cropped_o3d = bench_case.run(lambda: mesh_o3d.crop(box_o3d))
+    assert 0 < len(cropped_o3d.triangles) < bench_case.n_faces
+
+
 @pytest.mark.benchmark(group="oriented_bounding_box")
 @pytest.mark.benchlibs("triwarp", "igl", "trimesh", "open3d", "pyvista")
 def test_oriented_bounding_box(bench_case: BenchCase) -> None:
@@ -214,8 +403,6 @@ def test_oriented_bounding_box(bench_case: BenchCase) -> None:
         assert box_pv.volume > 0.0
         return
     if bench_case.kind == "open3d":
-        import open3d as o3d
-
         vertices_np = bench_case.vertices_np
 
         def minimal_box_o3d() -> object:

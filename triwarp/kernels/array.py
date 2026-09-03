@@ -341,6 +341,18 @@ def isin_lookup_sorted(
 
 
 @wp.func
+def masked_at(mask: wp.array[wp.bool], index: wp.int32) -> wp.bool:
+    # The mask's value at ``index``, reading ``False`` for an index outside it rather than off the
+    # end of the buffer. The guard is what lets a *membership* mask stand in for an ``isin`` over
+    # the equivalent index list: ``isin`` answers ``False`` for a value it has never seen, so a
+    # malformed buffer carrying an out-of-range index keeps the answer it had instead of turning
+    # into an out-of-bounds read. Two compares on a memory-bound lookup.
+    if index < 0 or index >= mask.shape[0]:
+        return False
+    return mask[index]
+
+
+@wp.func
 def mask_not(a: wp.bool) -> wp.bool:
     # Mask complement -- for a caller holding the region to *delete* and needing the one to keep,
     # among others. Warp exposes no ``logical_not`` builtin (``wp.invert`` is the bitwise

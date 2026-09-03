@@ -719,7 +719,9 @@ def submesh_from_vertex_mask(
     vertex_mask
         Length-``n_vertices`` ``wp.bool`` array on the same device as ``vertices``.
     face_mode
-        Passed to [`submesh_from_vertex_indices`][triwarp.selection.submesh_from_vertex_indices].
+        ``"all"`` selects faces whose three corners are all selected; ``"any"`` selects faces with
+        at least one corner selected. Same rule as
+        [`submesh_from_vertex_indices`][triwarp.selection.submesh_from_vertex_indices]'s.
 
     Returns
     -------
@@ -729,11 +731,25 @@ def submesh_from_vertex_mask(
     Raises
     ------
     ValueError
-        If ``vertex_mask`` length does not equal ``n_vertices``.
+        If ``vertex_mask`` length does not equal ``n_vertices``, or ``face_mode`` is not
+        ``"all"`` or ``"any"``.
+
+    Notes
+    -----
+    A mask is a *cheaper* input than the equivalent index list, not merely a more convenient one:
+    the face reduction reads it directly, where the index form has to rebuild membership through
+    [`isin`][triwarp.array.isin]. Measured interleaved against the route this used to take
+    (``flatnonzero``, then ``isin``, then a row reduction, then a second ``flatnonzero``): **1.96x
+    on CUDA**, flat from 320 to 81 920 faces because the saving is nine launches and three host
+    readbacks rather than device work, and 1.88x falling to 1.19x on CPU over the same range. The
+    index form still pays it, because it starts from indices and has nothing else to go on.
 
     See Also
     --------
     [`submesh_from_vertex_indices`][triwarp.selection.submesh_from_vertex_indices]
+        The index form, for a caller that holds a list rather than a mask.
+    [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]
+        The per-face selection this reduces onto.
     """
     n_vertices = int(vertices.shape[0])
     if int(vertex_mask.shape[0]) != n_vertices:
@@ -741,8 +757,41 @@ def submesh_from_vertex_mask(
             f"vertex_mask length must equal n_vertices={n_vertices}, got {vertex_mask.shape[0]}"
         )
 
-    vertex_indices = tw.array.flatnonzero(vertex_mask)
-    return submesh_from_vertex_indices(vertices, faces, vertex_indices, face_mode=face_mode)
+    face_mask = _face_mask_from_vertex_mask(faces, vertex_mask, face_mode=face_mode)
+    return submesh_from_face_mask(vertices, faces, face_mask)
+
+
+def _face_mask_from_vertex_mask(
+    faces: wp.array[wp.int32],
+    vertex_mask: wp.array[wp.bool],
+    *,
+    face_mode: Literal["all", "any"] = "all",
+) -> wp.array[wp.bool]:
+    """
+    Reduce a per-vertex mask onto a per-face mask under the all/any rule.
+
+    The mask counterpart of
+    [`face_indices_from_vertex_indices`][triwarp.selection.face_indices_from_vertex_indices], and
+    the reason a mask input is cheaper: one kernel with three O(1) mask lookups per face, against
+    that function's ``isin`` (two min/max reductions with a host readback each, then either a
+    radix sort or a span-sized lookup table) plus a row reduction plus a ``flatnonzero``.
+    """
+    if face_mode not in ("all", "any"):
+        raise ValueError(f'face_mode must be "all" or "any", got {face_mode!r}')
+
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    out_face_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
+    if n_faces == 0:
+        return out_face_mask
+
+    wp.launch(
+        kernel_selection.face_mask_from_vertex_mask,
+        dim=n_faces,
+        inputs=[faces, vertex_mask, wp.bool(face_mode == "all"), out_face_mask],
+        device=device,
+    )
+    return out_face_mask
 
 
 def expand_vertex_mask(

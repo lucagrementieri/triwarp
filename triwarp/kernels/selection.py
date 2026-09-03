@@ -1,7 +1,8 @@
 import warp as wp
 
-from triwarp.kernels.array import binary_search_index, binary_search_sorted_contains
+from triwarp.kernels.array import binary_search_index, binary_search_sorted_contains, masked_at
 from triwarp.kernels.halfedge import halfedge_destination
+from triwarp.kernels.triangles import corner_triple
 
 
 @wp.kernel
@@ -56,6 +57,34 @@ def local_vertex_index(
     # group's faces must refer to. A real kernel because the thread index *is* the datum.
     slot = wp.int32(wp.tid())
     out_local[slot] = slot - vertex_offsets[slot_groups[slot]]
+
+
+@wp.kernel
+def face_mask_from_vertex_mask(
+    faces: wp.array[wp.int32],
+    vertex_mask: wp.array[wp.bool],
+    require_all: wp.bool,
+    out_face_mask: wp.array[wp.bool],
+) -> None:
+    # Reduce a per-vertex selection onto its faces: keep a face when all three of its corners are
+    # selected (``require_all``), or when at least one is. One warp-uniform branch rather than two
+    # kernels, since the two differ by a parameter and not by an algorithm.
+    #
+    # This replaces the route the wrapper used to take -- ``flatnonzero`` the mask, ``array.isin``
+    # the face buffer against the resulting index list, then reduce along the rows -- which
+    # rebuilt as a lookup table exactly the membership the mask already *is*, at the cost of two
+    # min/max reductions with a host readback each, a sort or a span-sized table, and a second
+    # ``flatnonzero``. Reading the mask directly is one O(1) lookup per corner; see
+    # ``masked_at`` for why the read is guarded.
+    f = wp.int32(wp.tid())
+    a, b, c = corner_triple(faces, f)
+    hit_a = masked_at(vertex_mask, a)
+    hit_b = masked_at(vertex_mask, b)
+    hit_c = masked_at(vertex_mask, c)
+    if require_all:
+        out_face_mask[f] = hit_a and hit_b and hit_c
+    else:
+        out_face_mask[f] = hit_a or hit_b or hit_c
 
 
 @wp.kernel

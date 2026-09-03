@@ -636,7 +636,11 @@ def grid_transform(grid: wp.Volume) -> tuple[float, wp.vec3]:
     [`from_cells`][triwarp.voxels.from_cells]
     [`cell_centers`][triwarp.voxels.cell_centers]
     """
-    return _require_index_grid(grid)
+    _require_index_grid(grid)
+    voxel_size = float(grid.get_voxel_size()[0])
+    translation = grid.get_grid_info().translation
+    origin = wp.vec3(*(float(translation[axis]) - 0.5 * voxel_size for axis in range(3)))
+    return voxel_size, origin
 
 
 def resolve_voxel_grid(
@@ -1376,7 +1380,7 @@ def revoxelize(
     fraction of a cell where that matters; odd and fractional factors sample strictly inside an old
     cell and are exact.
     """
-    old_size, old_origin = _require_index_grid(grid)
+    old_size, old_origin = grid_transform(grid)
     if voxel_size <= 0.0:
         raise ValueError(f"revoxelize requires voxel_size > 0, got {voxel_size}")
     if max_cells <= 0:
@@ -1467,7 +1471,7 @@ def fill_cavities(grid: wp.Volume) -> wp.Volume:
     is written against the stencil rather than against
     [`triwarp.graph.connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges].
     """
-    voxel_size, origin = _require_index_grid(grid)
+    voxel_size, origin = grid_transform(grid)
     device = grid.device
     if _voxel_count(grid) == 0:
         return _empty_grid(voxel_size, origin, device)
@@ -1528,7 +1532,7 @@ def fill_orthographic(grid: wp.Volume) -> wp.Volume:
     --------
     [`fill_cavities`][triwarp.voxels.fill_cavities]
     """
-    voxel_size, origin = _require_index_grid(grid)
+    voxel_size, origin = grid_transform(grid)
     device = grid.device
     if _voxel_count(grid) == 0:
         return _empty_grid(voxel_size, origin, device)
@@ -1603,7 +1607,7 @@ def dilate(
     [`closing`][triwarp.voxels.closing] and [`opening`][triwarp.voxels.opening], because the order
     is the whole operation and each name is the other one's mistake.
     """
-    voxel_size, origin = _require_index_grid(grid)
+    voxel_size, origin = grid_transform(grid)
     _check_iterations(connectivity, iterations)
     device = grid.device
     for _ in range(iterations):
@@ -1667,7 +1671,7 @@ def erode(
     region always erodes away — the same convention ``scipy.ndimage.binary_erosion`` takes with
     ``border_value=0``.
     """
-    voxel_size, origin = _require_index_grid(grid)
+    voxel_size, origin = grid_transform(grid)
     _check_iterations(connectivity, iterations)
     for _ in range(iterations):
         interior = _interior_flags(grid, connectivity)
@@ -1817,7 +1821,7 @@ def surface_voxels(grid: wp.Volume, *, connectivity: Literal[6, 18, 26] = 6) -> 
     A voxel on the edge of the grid's occupied region counts as surface, since everything outside
     the set is empty by definition.
     """
-    voxel_size, origin = _require_index_grid(grid)
+    voxel_size, origin = grid_transform(grid)
     interior = _interior_flags(grid, connectivity)
     if interior is None:
         return _empty_grid(voxel_size, origin, grid.device)
@@ -2009,7 +2013,7 @@ def to_field(
     """
     if pad < 0:
         raise ValueError(f"pad must be non-negative, got {pad}")
-    voxel_size, origin = _require_index_grid(grid)
+    voxel_size, origin = grid_transform(grid)
     lower_cell, extent = _cell_bounds(grid)
     base = (lower_cell[0] - pad, lower_cell[1] - pad, lower_cell[2] - pad)
     dims = (extent[0] + 2 * pad, extent[1] + 2 * pad, extent[2] + 2 * pad)
@@ -2200,8 +2204,15 @@ def voxel_corners(grid: wp.Volume) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:
     return corner_cells, cell_corners
 
 
-def _require_index_grid(grid: wp.Volume) -> tuple[float, wp.vec3]:
-    """Validate that ``grid`` is an isotropic index grid; return ``(voxel_size, origin)``."""
+def _require_index_grid(grid: wp.Volume) -> None:
+    """
+    Validate that ``grid`` is a NanoVDB index grid with isotropic voxels.
+
+    Separate from [`grid_transform`][triwarp.voxels.grid_transform], which reads the transform
+    *through* it, because eight entry points here want the guard and not the pair -- and a bare
+    ``grid_transform(grid)`` on a line of its own would read as a discarded computation rather than
+    a check, which is how a type guard gets deleted as dead code.
+    """
     if not grid.is_index:
         raise TypeError(
             "voxels functions need a NanoVDB *index* grid, whose linear indices address a "
@@ -2210,16 +2221,12 @@ def _require_index_grid(grid: wp.Volume) -> tuple[float, wp.vec3]:
     sizes = grid.get_voxel_size()
     if not (sizes[0] == sizes[1] == sizes[2]):
         raise TypeError(f"voxels functions need isotropic voxels, got voxel_size={tuple(sizes)}")
-    voxel_size = float(sizes[0])
-    translation = grid.get_grid_info().translation
-    origin = wp.vec3(*(float(translation[axis]) - 0.5 * voxel_size for axis in range(3)))
-    return voxel_size, origin
 
 
 def _require_same_lattice(a: wp.Volume, b: wp.Volume, *, caller: str) -> tuple[float, wp.vec3]:
     """Shared cell width and origin of two grids, or a ``ValueError`` naming both transforms."""
-    size_a, origin_a = _require_index_grid(a)
-    size_b, origin_b = _require_index_grid(b)
+    size_a, origin_a = grid_transform(a)
+    size_b, origin_b = grid_transform(b)
     tolerance = 1e-4 * size_a
     offset = max(abs(float(origin_a[axis]) - float(origin_b[axis])) for axis in range(3))
     if abs(size_a - size_b) > tolerance or offset > tolerance:
@@ -2350,7 +2357,7 @@ def _interior_flags(grid: wp.Volume, connectivity: int) -> wp.array[wp.int32] | 
 
 def _grid_from_flagged_cells(grid: wp.Volume, flags: wp.array[wp.int32]) -> wp.Volume:
     """Rebuild ``grid`` keeping only the voxels whose flag is non-zero."""
-    voxel_size, origin = _require_index_grid(grid)
+    voxel_size, origin = grid_transform(grid)
     return wp.Volume.allocate_by_voxels(
         cells(grid),
         voxel_size=voxel_size,

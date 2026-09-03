@@ -999,7 +999,7 @@ millisecond.
 | `test_repair` | `remove_duplicated_triangles`, `remove_duplicated_vertices`, `remove_unreferenced_vertices` |
 | `test_validation` | `is_watertight`, `is_edge_manifold` (same `allow_boundary_edges` switch), `is_vertex_manifold` (connectivity-based: agrees with triwarp exactly on edge-manifold input, passes vertices on a non-manifold edge that the fan definition fails) |
 | `test_vertices` | `compute_vertex_normals` |
-| `test_bounds` | `get_axis_aligned_bounding_box` (`aabb`), `get_minimal_oriented_bounding_box` (hull-based, trimesh's algorithm family — not the PCA `get_oriented_bounding_box`, which minimizes nothing) |
+| `test_bounds` | `get_axis_aligned_bounding_box` (`aabb`), `get_minimal_oriented_bounding_box` (hull-based, trimesh's algorithm family — not the PCA `get_oriented_bounding_box`, which minimizes nothing), `AxisAlignedBoundingBox.get_point_indices_within_bounding_box` (`points_in_aabb`), `PointCloud.crop` (`crop_points`) and `TriangleMesh.crop` (`crop_mesh`) — the three query rows, all of them crossovers rather than ratios, and the only reference of the ten that answers the query half at all |
 | `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`), `remove_statistical_outlier`, `remove_radius_outlier` (**nondeterministic** — a shared `KDTreeFlann` across an OpenMP loop; three keep sets over eight reps, so the correctness comparison queries that tree serially instead), `remove_duplicated_points`, `farthest_point_down_sample` (its `SelectByIndex` sorts, so only the selected *set* is comparable) |
 | `test_metrics` | `PointCloud.compute_point_cloud_distance` (the non-differentiable Chamfer / Hausdorff cases) |
 | `test_convex` | `compute_convex_hull` (exact qhull vs the approximate support sweep) |
@@ -1019,7 +1019,10 @@ unordered segments with no length/resample/simplify), `test_heat_distance` (no g
 traversal over an abstract CSR), plus the individual functions noted inline. One function is *tested*
 against open3d and deliberately **not** benchmarked: `points.point_finite_mask` is a single `wp.map`
 over a three-component `isfinite`, so a group would report the ~11 us launch floor and nothing else,
-while `remove_non_finite_points` would be timing its copy of the surviving cloud. Two rows were
+while `remove_non_finite_points` would be timing its copy of the surviving cloud. `bounds`'
+`points_in_aabb_mask` / `points_in_obb_mask` are declined for the same reason from the other side:
+each is its group's row *minus* the `flatnonzero` that sizes the index buffer, so a row would
+re-time one `wp.map` under a second name. Two rows were
 *rejected on measurement* rather than absence and carry the numbers in their module docstrings:
 `test_measures`' `get_volume` validates before it integrates (13.8 s of `IsWatertight` for a
 microsecond integral — it would re-time the watertightness row under another name), and

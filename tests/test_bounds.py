@@ -12,10 +12,13 @@ import pyvista as pv
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
+from scipy.spatial import cKDTree
 
 import triwarp as tw
+from tests.comparisons import lexsort_rows
 from tests.conftest import MESHES
 from tests.conversions import (
+    numpy_to_warp,
     points_to_warp,
     trimesh_to_meshlib,
     trimesh_to_open3d,
@@ -232,6 +235,348 @@ def test_enclosing_diagonal_ignores_an_empty_second_set(device: str) -> None:
     alone = tw.bounds.enclosing_diagonal(cloud_wp)
     assert alone == tw.bounds.enclosing_diagonal(cloud_wp, None)
     assert alone == tw.bounds.enclosing_diagonal(cloud_wp, empty_wp)
+
+
+def _corner_box_np(lower_wp: wp.vec3, upper_wp: wp.vec3) -> np.ndarray:
+    """
+    Cut the low corner out of a box: 60% of each side, padded 1% outward on the low side.
+
+    Every comparison below runs on this rather than on the fixture's own bounds, for two reasons
+    that both had to be measured. It must select a **strict** subset, or the assertion has no
+    teeth: against the full box every point is inside, so an implementation returning ``arange(n)``
+    would pass. And it cannot be the box *shrunk about its centre*, which is the obvious
+    construction and selects **nothing** on ``icosahedron`` and ``hemisphere`` -- every vertex of a
+    convex polyhedron is at an extreme on some axis, so a window excluding all six extremes is
+    empty and the comparison becomes ``[] == []``. Keeping the low corner leaves 3 / 9 / 14 / 35
+    vertices of 12 / 16 / 97 / 544 across the four fixtures, checked here by an assert rather than
+    by this sentence.
+
+    The 1% outward pad is the float32 half of it: triwarp tests the ``float32`` vertex buffer where
+    the reference tests trimesh's ``float64`` one, so a plane placed exactly at a coordinate would
+    let the two disagree at the boundary on rounding alone. Pushed off the data, the inclusive rule
+    is pinned by ``test_points_in_aabb_boundary_and_non_finite_match_open3d`` instead, where both
+    sides get exactly representable corners.
+    """
+    box_np = _bounds_np(lower_wp, upper_wp)
+    extent_np = np.ptp(box_np, axis=0)
+    return np.stack([box_np[0] - 0.01 * extent_np, box_np[0] + 0.6 * extent_np])
+
+
+def _corners_wp(box_np: np.ndarray) -> tuple[wp.vec3, wp.vec3]:
+    """Return a ``(2, 3)`` box as its two ``wp.vec3`` corners, for the triwarp side."""
+    return wp.vec3(*box_np[0].tolist()), wp.vec3(*box_np[1].tolist())
+
+
+def _aabb_o3d(box_np: np.ndarray) -> o3d.geometry.AxisAlignedBoundingBox:
+    """Open3D's axis-aligned box over the *same* two corners triwarp is given."""
+    return o3d.geometry.AxisAlignedBoundingBox(box_np[0], box_np[1])
+
+
+def _obb_o3d(box_np: np.ndarray, frame_np: np.ndarray) -> o3d.geometry.OrientedBoundingBox:
+    """
+    Open3D's oriented box built **from** triwarp's ``(rotation, min_bound, max_bound)`` triple.
+
+    Constructing the reference's input from triwarp's output is what leaves the *predicate* as the
+    only thing under test: Open3D takes a world-space centre, a box-to-world rotation and an
+    extent, where triwarp takes a world-to-box frame and the extent in box coordinates, so the
+    conversion is a transpose plus one corner rebuild. Had the box been searched independently on
+    both sides, a disagreement could not be attributed to either half.
+    """
+    return o3d.geometry.OrientedBoundingBox(
+        frame_np.T @ box_np.mean(axis=0), frame_np.T, np.ptp(box_np, axis=0)
+    )
+
+
+def _original_face_rows(
+    sub_vertices_wp: wp.array[wp.vec3], sub_faces_wp: wp.array[wp.int32], vertices_np: np.ndarray
+) -> np.ndarray:
+    """
+    Canonicalize a submesh's faces back into the *input's* vertex numbering.
+
+    A crop compacts and renumbers its vertices, and two implementations are free to number them
+    differently, so the face buffers are not comparable as returned. Matching each output vertex to
+    the input vertex it came from puts both sides back in one numbering; sorting within each row and
+    then lexsorting the rows drops the winding and the face order, neither of which a containment
+    rule fixes. The row canonicalization is exact because it runs on integers -- the section 6
+    lexsort hazard is about float coordinates, and none survive to here.
+
+    The match is nearest-neighbour with a bijection check rather than an equality, because a crop
+    moves no vertex but triwarp *stores* them in ``float32`` where the reference table is trimesh's
+    ``float64``: measured 4.3e-07 at worst on these fixtures, against a vertex spacing of order
+    0.05 on the finest of them, so the 1e-5 bound sits ~20x above the rounding and ~5 000x below
+    the nearest wrong answer. The bijection is what makes the bound safe: two output vertices
+    collapsing onto one input row would fail it even inside the tolerance.
+    """
+    sub_np = sub_vertices_wp.numpy()
+    distance_np, original_np = cKDTree(vertices_np).query(sub_np)
+    assert np.max(distance_np) < 1e-5, "a cropped vertex is not one of the input's"
+    assert np.unique(original_np).shape[0] == original_np.shape[0], "the vertex match is not 1:1"
+    rows_np = original_np[sub_faces_wp.numpy().reshape(-1, 3)]
+    return lexsort_rows(np.sort(rows_np, axis=1))
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+@pytest.mark.parity("points_in_aabb", "open3d")
+def test_points_in_aabb_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the selected index list, element-wise against Open3D's, plus the mask/index round trip.
+
+    Both sides are handed the identical two corners, so the only thing that can differ is the
+    comparison. The mask assert is the second half of the same claim -- the index form is defined
+    as [`flatnonzero`][triwarp.array.flatnonzero] of the mask, and this pins that the two agree
+    rather than trusting the composition.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp = mesh_wp.points
+    box_np = _corner_box_np(*tw.bounds.aabb(vertices_wp))
+
+    indices_o3d = np.sort(
+        np.asarray(
+            _aabb_o3d(box_np).get_point_indices_within_bounding_box(
+                o3d.utility.Vector3dVector(mesh_tm.vertices)
+            )
+        )
+    )
+    # Non-vacuous on both sides: a full box or an empty one would make this test pass on nothing.
+    assert 0 < indices_o3d.shape[0] < mesh_tm.vertices.shape[0]
+
+    lower_wp, upper_wp = _corners_wp(box_np)
+    indices_wp = tw.bounds.points_in_aabb(vertices_wp, lower_wp, upper_wp)
+    assert np.array_equal(indices_wp.numpy(), indices_o3d)
+
+    mask_wp = tw.bounds.points_in_aabb_mask(vertices_wp, lower_wp, upper_wp)
+    assert np.array_equal(np.flatnonzero(mask_wp.numpy()), indices_o3d)
+
+
+def test_points_in_aabb_boundary_and_non_finite_match_open3d(device: str) -> None:
+    """
+    Class A: the two conventions a random cloud cannot exercise -- the closed boundary and ``nan``.
+
+    A containment rule's edge cases are exactly the points a random fixture never produces, and
+    both of these were decided by measurement rather than by preference: the boundary is
+    **inclusive** on Open3D's side (a point on a corner, an edge midpoint and a face centre are all
+    selected) and a coordinate that is ``nan`` or infinite is **not**. The kernel's shorter
+    vector spelling, ``wp.min(point, lower) == lower``, agrees on every finite row here and reports
+    all three ``nan`` rows as inside, which is what this test would catch.
+    """
+    points_np = np.array(
+        [
+            [0.0, 0.0, 0.0],  # interior
+            [-1.0, -1.0, -1.0],  # the min corner
+            [1.0, 1.0, 1.0],  # the max corner
+            [1.0, 0.0, 0.0],  # a face centre
+            [1.0, 1.0, 0.0],  # an edge midpoint
+            [1.0 + 1e-6, 0.0, 0.0],  # just outside one face
+            [np.nan, 0.0, 0.0],
+            [0.0, np.nan, np.nan],
+            [np.nan, np.nan, np.nan],
+            [np.inf, 0.0, 0.0],
+            [-np.inf, 0.0, 0.0],
+        ]
+    )
+    box_np = np.array([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
+
+    indices_o3d = np.sort(
+        np.asarray(
+            _aabb_o3d(box_np).get_point_indices_within_bounding_box(
+                o3d.utility.Vector3dVector(points_np)
+            )
+        )
+    )
+    assert np.array_equal(indices_o3d, np.arange(5)), "the reference's own convention moved"
+
+    indices_wp = tw.bounds.points_in_aabb(points_to_warp(points_np, device), *_corners_wp(box_np))
+    assert np.array_equal(indices_wp.numpy(), indices_o3d)
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_points_in_obb_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the same index-list equality through an oriented box, on a tilted cloud.
+
+    The box comes from [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box] and is
+    handed to Open3D through ``_obb_o3d``, so triwarp's ``(rotation, min_bound, max_bound)``
+    convention is under test alongside the predicate: a transposed frame or a corner read in world
+    coordinates instead of box coordinates selects a different set, not a differently-numbered one.
+    The cloud is tilted so that the frame is far from the identity and the assert cannot pass
+    through the axis-aligned path by accident.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    points_np, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
+
+    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(points_wp, 256)
+    frame_np = _frame_np(rotation_wp)
+    box_np = _corner_box_np(lower_wp, upper_wp)
+    assert not np.allclose(frame_np, np.eye(3), atol=1e-3), "the frame is the identity"
+
+    indices_o3d = np.sort(
+        np.asarray(
+            _obb_o3d(box_np, frame_np).get_point_indices_within_bounding_box(
+                o3d.utility.Vector3dVector(points_np)
+            )
+        )
+    )
+    assert 0 < indices_o3d.shape[0] < points_np.shape[0]
+
+    indices_wp = tw.bounds.points_in_obb(points_wp, rotation_wp, *_corners_wp(box_np))
+    assert np.array_equal(indices_wp.numpy(), indices_o3d)
+
+    mask_wp = tw.bounds.points_in_obb_mask(points_wp, rotation_wp, *_corners_wp(box_np))
+    assert np.array_equal(np.flatnonzero(mask_wp.numpy()), indices_o3d)
+
+
+def test_points_in_obb_with_the_identity_frame_is_the_aabb_form(device: str) -> None:
+    """
+    Triwarp against triwarp: the oriented query at ``rotation = I`` is the axis-aligned one.
+
+    Not a parity assert -- the two entry points share one predicate, and the Open3D comparisons
+    above carry the oracle for both. What this pins is that the *rotation* is applied as a
+    world-to-box map and not as its inverse, which the identity is precisely the frame that cannot
+    show: it runs on the non-finite and boundary rows too, where the two forms could otherwise
+    diverge without any random point noticing.
+    """
+    points_np = np.array(
+        [[0.0, 0.0, 0.0], [-1.0, -1.0, -1.0], [1.0, 1.0, 1.0], [2.0, 0.0, 0.0], [np.nan, 0.0, 0.0]]
+    )
+    points_wp = points_to_warp(points_np, device)
+    lower_wp, upper_wp = _corners_wp(np.array([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]))
+    identity_wp = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+    aligned_np = tw.bounds.points_in_aabb(points_wp, lower_wp, upper_wp).numpy()
+    assert np.array_equal(aligned_np, np.arange(3)), "the axis-aligned answer moved"
+    assert np.array_equal(
+        tw.bounds.points_in_obb(points_wp, identity_wp, lower_wp, upper_wp).numpy(), aligned_np
+    )
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+@pytest.mark.parity("crop_points", "open3d")
+def test_crop_points_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the cropped positions element-wise against ``PointCloud.crop``, and their indices.
+
+    Both sides emit the survivors in ascending input order -- Open3D because every legacy selection
+    routes through ``SelectByIndex``, which walks a mask -- so the positions compare row by row
+    with no reordering. The returned indices are checked against the same crop's index list rather
+    than assumed: they are what lets a caller crop a parallel attribute, so a silently misaligned
+    second return would be worse than none.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp = mesh_wp.points
+    box_np = _corner_box_np(*tw.bounds.aabb(vertices_wp))
+    box_o3d = _aabb_o3d(box_np)
+
+    cloud_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(mesh_tm.vertices))
+    kept_o3d = np.asarray(cloud_o3d.crop(box_o3d).points)
+    assert 0 < kept_o3d.shape[0] < mesh_tm.vertices.shape[0]
+
+    kept_wp, indices_wp = tw.bounds.crop_points(vertices_wp, *_corners_wp(box_np))
+    assert np.allclose(kept_wp.numpy(), kept_o3d, rtol=1e-5, atol=1e-5)
+    assert np.array_equal(
+        indices_wp.numpy(),
+        np.sort(
+            np.asarray(
+                box_o3d.get_point_indices_within_bounding_box(
+                    o3d.utility.Vector3dVector(mesh_tm.vertices)
+                )
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize("mesh_name", MESHES)
+@pytest.mark.parity("crop_mesh", "open3d")
+def test_crop_mesh_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: the kept triangles against ``TriangleMesh.crop``, remapped into one vertex numbering.
+
+    The transform is ``_original_face_rows``: both crops renumber their compacted vertices in their
+    own order, so the face buffers are pushed back through the input's numbering before being
+    compared as sets. The vertex and face *counts* are class A on top of that, and the invariant --
+    every surviving vertex inside the box -- is what a shared misreading of the containment rule
+    could not satisfy, since it is checked against the box rather than against the reference.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    box_np = _corner_box_np(*tw.bounds.aabb(vertices_wp))
+
+    mesh_o3d = trimesh_to_open3d(mesh_tm).crop(_aabb_o3d(box_np))
+    faces_o3d = np.asarray(mesh_o3d.triangles)
+    assert 0 < faces_o3d.shape[0] < mesh_tm.faces.shape[0]
+
+    sub_vertices_wp, sub_faces_wp = tw.bounds.crop_mesh(vertices_wp, faces_wp, *_corners_wp(box_np))
+    assert int(sub_faces_wp.shape[0]) // 3 == faces_o3d.shape[0]
+    assert int(sub_vertices_wp.shape[0]) == np.asarray(mesh_o3d.vertices).shape[0]
+    assert np.array_equal(
+        _original_face_rows(sub_vertices_wp, sub_faces_wp, mesh_tm.vertices),
+        _original_face_rows(
+            points_to_warp(np.asarray(mesh_o3d.vertices), mesh_wp.device),
+            wp.array(
+                np.ascontiguousarray(faces_o3d.ravel(), dtype=np.int32),
+                dtype=wp.int32,
+                device=mesh_wp.device,
+            ),
+            mesh_tm.vertices,
+        ),
+    )
+
+    inside_np = tw.bounds.points_in_aabb_mask(sub_vertices_wp, *_corners_wp(box_np)).numpy()
+    assert inside_np.all(), "a cropped vertex lies outside the box"
+
+
+def test_crop_mesh_drops_the_faces_that_straddle_the_box(device: str) -> None:
+    """
+    Not a library comparison: the all-corners rule, on a mesh built so that one face straddles.
+
+    The reference comparison above cannot isolate this -- both libraries apply the same rule, so a
+    shared misreading would agree -- and it is the whole difference between a crop and a boolean:
+    the straddling triangle is **dropped**, leaving a ragged edge, rather than clipped into new
+    geometry. The counts are asserted exactly because the mesh is small enough to enumerate: two
+    triangles fully inside, one straddling, one fully outside.
+    """
+    vertices_np = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],  # the four inside the box
+            [5.0, 0.0, 0.0],
+            [5.0, 5.0, 0.0],
+            [6.0, 0.0, 0.0],  # three well outside it
+        ]
+    )
+    faces_np = np.array([[0, 1, 2], [1, 3, 2], [1, 4, 3], [4, 5, 6]], dtype=np.int32)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np.ravel(), device)
+    lower_wp, upper_wp = _corners_wp(np.array([[-0.5, -0.5, -0.5], [1.5, 1.5, 0.5]]))
+
+    sub_vertices_wp, sub_faces_wp = tw.bounds.crop_mesh(vertices_wp, faces_wp, lower_wp, upper_wp)
+    assert int(sub_faces_wp.shape[0]) // 3 == 2
+    assert int(sub_vertices_wp.shape[0]) == 4
+
+    # ``face_mode="any"`` is the documented escape hatch, and it keeps the straddling one.
+    mask_wp = tw.bounds.points_in_aabb_mask(vertices_wp, lower_wp, upper_wp)
+    _, any_faces_wp = tw.selection.submesh_from_vertex_mask(
+        vertices_wp, faces_wp, mask_wp, face_mode="any"
+    )
+    assert int(any_faces_wp.shape[0]) // 3 == 3
+
+
+def test_points_in_aabb_empty_cloud_and_empty_box(device: str) -> None:
+    """An empty cloud and an inverted box both select nothing, through all four entry points."""
+    rng = np.random.default_rng(21)
+    cloud_wp = points_to_warp(rng.normal(size=(64, 3)), device)
+    empty_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    lower_wp, upper_wp = wp.vec3(-1.0, -1.0, -1.0), wp.vec3(1.0, 1.0, 1.0)
+    identity_wp = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+    assert int(tw.bounds.points_in_aabb(empty_wp, lower_wp, upper_wp).shape[0]) == 0
+    assert int(tw.bounds.points_in_aabb_mask(empty_wp, lower_wp, upper_wp).shape[0]) == 0
+    assert int(tw.bounds.points_in_obb(empty_wp, identity_wp, lower_wp, upper_wp).shape[0]) == 0
+    assert int(tw.bounds.crop_points(empty_wp, lower_wp, upper_wp)[0].shape[0]) == 0
+
+    # An inverted box is empty rather than universal: no point satisfies both comparisons.
+    assert int(tw.bounds.points_in_aabb(cloud_wp, upper_wp, lower_wp).shape[0]) == 0
+    assert int(tw.bounds.points_in_obb(cloud_wp, identity_wp, upper_wp, lower_wp).shape[0]) == 0
 
 
 def _tilted_cloud(mesh_tm: tm.Trimesh, device: str) -> tuple[np.ndarray, wp.array[wp.vec3]]:

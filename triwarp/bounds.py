@@ -1,5 +1,15 @@
 """
-Bounding boxes: the axis-aligned box, its diagonal and union, and the oriented box.
+Bounding boxes: building them, and selecting or cropping with them.
+
+Two halves. The **constructors** -- [`aabb`][triwarp.bounds.aabb],
+[`aabb_union`][triwarp.bounds.aabb_union], [`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal]
+and [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box] -- reduce a cloud to a box. The
+**queries** -- [`points_in_aabb`][triwarp.bounds.points_in_aabb],
+[`points_in_obb`][triwarp.bounds.points_in_obb] and the
+[`crop_points`][triwarp.bounds.crop_points] / [`crop_mesh`][triwarp.bounds.crop_mesh] pair -- run
+the other way, testing points against a box someone already has. The two halves compose directly:
+every constructor's return is a query's argument, in that layout, which is why an oriented box is a
+``(rotation, min_bound, max_bound)`` triple here rather than an object.
 
 [`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal] is the one entry point here that
 exists for another module's sake rather than its own: it is the default search radius every
@@ -16,6 +26,7 @@ import warp as wp
 
 import triwarp as tw
 from triwarp.kernels import bounds as kernel_bounds
+from triwarp.kernels import predicates as kernel_predicates
 
 # Points reduced per thread by the per-candidate extent reduction in
 # [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box]. Long, and one value for both
@@ -71,6 +82,8 @@ def aabb(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     --------
     [`aabb_union`][triwarp.bounds.aabb_union]
     [`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal]
+    [`points_in_aabb`][triwarp.bounds.points_in_aabb]
+        The other direction: which points a box already in hand contains.
     [`triwarp.reduce.minmax`][triwarp.reduce.minmax]
     """
     if int(points.shape[0]) == 0:
@@ -139,6 +152,328 @@ def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | Non
         other_lower, other_upper = aabb(other)
         lower, upper = aabb_union(lower, upper, other_lower, other_upper)
     return float(wp.length(upper - lower))
+
+
+def points_in_aabb(
+    points: wp.array[wp.vec3], min_bound: wp.vec3, max_bound: wp.vec3
+) -> wp.array[wp.int32]:
+    """
+    Return the indices of the points inside an axis-aligned box, boundary included.
+
+    The bounded selection primitive, and the one that needs no spatial index at all: every point is
+    tested independently against six planes, so the cost is one pass over the cloud whatever the
+    box holds. A tree would only help if the *box* were the thing being searched for -- see
+    [`triwarp.neighbors.query_bvh_box`][triwarp.neighbors.query_bvh_box] for that direction.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+    min_bound, max_bound
+        Opposite corners of the box, as [`aabb`][triwarp.bounds.aabb] returns them. An empty box
+        (any ``min_bound[i] > max_bound[i]``) selects nothing.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Ascending indices into ``points`` on ``points.device``. Empty when nothing is inside.
+
+    Examples
+    --------
+    ```python
+    inside = tw.bounds.points_in_aabb(pts, wp.vec3(-1.0, -1.0, -1.0), wp.vec3(1.0, 1.0, 1.0))
+    ```
+
+    Notes
+    -----
+    Containment is **inclusive**: a point exactly on a face, edge or corner of the box is selected.
+    A point with a ``nan`` coordinate is *not* selected, and neither is one at an infinity. Both
+    conventions were measured against the one reference that answers this question rather than
+    chosen -- points placed on both corners, on an edge midpoint and on a face centre are all
+    selected there, and the three ``nan`` rows are not -- and both differ from
+    [`half_space_mask`][triwarp.points.half_space_mask], whose test is strict.
+
+    **The call is host-launch-bound at every size that fits a GPU**, which is what to know before
+    optimizing it. Medians on an RTX 5090 at 2 562 / 40 962 / 163 842 / 1 000 000 points: 0.164 /
+    0.167 / 0.203 / 0.171 ms for the whole call -- flat over a 390x range -- of which the predicate
+    ``wp.map`` is 0.030-0.036, the ``bool``-to-``int32`` cast inside
+    [`flatnonzero`][triwarp.array.flatnonzero] is 0.026-0.030, its scan is 0.014-0.016 and the
+    4-byte readback that sizes the output is 0.032-0.035. So the six comparisons are never the cost
+    and a faster predicate would buy nothing.
+
+    That cast is the one stage a fused path could drop -- ~17% of the call -- and it is
+    **deliberately not fused**. Mapping the predicate straight onto ``int32`` flags does not help
+    (``flatnonzero`` then maps ``nonzero_flag`` over them, the same launch under another name), so
+    the saving needs a primitive that takes the predicate *and* does the compaction: a kernel
+    factory over a closure-captured ``wp.Function``, the ``kernels/reduce.py`` pattern. That
+    belongs in [`triwarp.array`][triwarp.array] and would serve every ``*_mask`` plus
+    ``flatnonzero`` pair in the package rather than this one, so it is not built here.
+
+    See Also
+    --------
+    [`points_in_aabb_mask`][triwarp.bounds.points_in_aabb_mask]
+        The same selection as a boolean mask, for a caller that wants to combine it.
+    [`points_in_obb`][triwarp.bounds.points_in_obb]
+        The oriented counterpart.
+    [`crop_points`][triwarp.bounds.crop_points]
+        This plus the gather, when the points themselves are wanted.
+    [`aabb`][triwarp.bounds.aabb]
+    """
+    return tw.array.flatnonzero(points_in_aabb_mask(points, min_bound, max_bound))
+
+
+def points_in_aabb_mask(
+    points: wp.array[wp.vec3], min_bound: wp.vec3, max_bound: wp.vec3
+) -> wp.array[wp.bool]:
+    """
+    Flag the points inside an axis-aligned box, boundary included.
+
+    The mask form of [`points_in_aabb`][triwarp.bounds.points_in_aabb], for a caller that wants to
+    intersect the selection with another predicate before compacting it -- combining masks costs
+    one ``wp.map`` where combining index lists costs a set operation.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+    min_bound, max_bound
+        Opposite corners of the box, as [`aabb`][triwarp.bounds.aabb] returns them.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n`` mask on ``points.device``. ``True`` marks a point to **keep**, the same sense
+        as [`triwarp.points.half_space_mask`][triwarp.points.half_space_mask].
+
+    See Also
+    --------
+    [`points_in_aabb`][triwarp.bounds.points_in_aabb]
+        The index form, and where the boundary and ``nan`` conventions are documented.
+    [`points_in_obb_mask`][triwarp.bounds.points_in_obb_mask]
+    [`triwarp.array.flatnonzero`][triwarp.array.flatnonzero]
+    """
+    out_mask = wp.empty(int(points.shape[0]), dtype=wp.bool, device=points.device)
+    if int(points.shape[0]) == 0:
+        return out_mask
+
+    wp.map(kernel_predicates.is_in_aabb, points, min_bound, max_bound, out=out_mask)
+    return out_mask
+
+
+def points_in_obb(
+    points: wp.array[wp.vec3], rotation: wp.mat33, min_bound: wp.vec3, max_bound: wp.vec3
+) -> wp.array[wp.int32]:
+    """
+    Return the indices of the points inside an oriented box, boundary included.
+
+    Takes the box exactly as [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box]
+    returns it, so the two compose without a transpose or a corner rebuild.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in world space as ``wp.vec3``.
+    rotation
+        World-to-box frame as ``wp.mat33``, i.e. its **rows** are the box axes in world
+        coordinates. A point's box coordinates are ``rotation * p``.
+    min_bound, max_bound
+        Extent of the box along its own axes, in box coordinates.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Ascending indices into ``points`` on ``points.device``. Empty when nothing is inside.
+
+    Examples
+    --------
+    ```python
+    rotation, lower, upper = tw.bounds.oriented_bounding_box(v, 256)
+    inside = tw.bounds.points_in_obb(v, rotation, lower, upper)
+    ```
+
+    Notes
+    -----
+    One rotated point per thread, then the identical six comparisons
+    [`points_in_aabb`][triwarp.bounds.points_in_aabb] makes -- the two share one predicate, so the
+    inclusive boundary and the ``nan`` exclusion documented there hold here too, and the two
+    functions cannot drift apart on either. Passing the identity as ``rotation`` reproduces the
+    axis-aligned answer exactly (measured, on points sitting on the corners and on ``nan`` rows).
+
+    Being a proper rotation, the frame's inverse is its transpose, so nothing here inverts a
+    matrix; a general affine box would, and is not what this takes.
+
+    See Also
+    --------
+    [`points_in_obb_mask`][triwarp.bounds.points_in_obb_mask]
+    [`points_in_aabb`][triwarp.bounds.points_in_aabb]
+        The axis-aligned counterpart, and the shared conventions.
+    [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box]
+        Where the ``(rotation, min_bound, max_bound)`` triple comes from.
+    """
+    return tw.array.flatnonzero(points_in_obb_mask(points, rotation, min_bound, max_bound))
+
+
+def points_in_obb_mask(
+    points: wp.array[wp.vec3], rotation: wp.mat33, min_bound: wp.vec3, max_bound: wp.vec3
+) -> wp.array[wp.bool]:
+    """
+    Flag the points inside an oriented box, boundary included.
+
+    The mask form of [`points_in_obb`][triwarp.bounds.points_in_obb]; see
+    [`points_in_aabb_mask`][triwarp.bounds.points_in_aabb_mask] for why the mask form exists.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in world space as ``wp.vec3``.
+    rotation
+        World-to-box frame as ``wp.mat33``, rows being the box axes
+        ([`points_in_obb`][triwarp.bounds.points_in_obb] documents the convention).
+    min_bound, max_bound
+        Extent of the box along its own axes, in box coordinates.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n`` mask on ``points.device``. ``True`` marks a point to **keep**.
+
+    See Also
+    --------
+    [`points_in_obb`][triwarp.bounds.points_in_obb]
+        The index form, and where the conventions are documented.
+    [`points_in_aabb_mask`][triwarp.bounds.points_in_aabb_mask]
+    """
+    out_mask = wp.empty(int(points.shape[0]), dtype=wp.bool, device=points.device)
+    if int(points.shape[0]) == 0:
+        return out_mask
+
+    wp.map(kernel_predicates.is_in_obb, points, rotation, min_bound, max_bound, out=out_mask)
+    return out_mask
+
+
+def crop_points(
+    points: wp.array[wp.vec3],
+    min_bound: wp.vec3,
+    max_bound: wp.vec3,
+    *,
+    rotation: wp.mat33 | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Keep the points inside a box, returning the survivors and where they came from.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in world space as ``wp.vec3``.
+    min_bound, max_bound
+        Opposite corners of the box: in world coordinates when ``rotation`` is ``None``, in box
+        coordinates otherwise.
+    rotation
+        World-to-box frame as ``wp.mat33``, rows being the box axes. ``None`` -- the default --
+        crops to the **axis-aligned** box, which is the same test with one transform fewer rather
+        than a different rule; pass the frame
+        [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box] returns to crop to an
+        oriented one.
+
+    Returns
+    -------
+    kept : wp.array[wp.vec3]
+        The points inside the box, in ascending index order, on ``points.device``.
+    indices : wp.array[wp.int32]
+        Their indices in ``points``, so a caller can crop a parallel per-point attribute with
+        [`triwarp.array.gather`][triwarp.array.gather] instead of re-running the test. This is the
+        second return rather than an option because the compaction has already computed it.
+
+    Examples
+    --------
+    ```python
+    kept, indices = tw.bounds.crop_points(pts, wp.vec3(-1.0, -1.0, -1.0), wp.vec3(1.0, 1.0, 1.0))
+    ```
+
+    See Also
+    --------
+    [`crop_mesh`][triwarp.bounds.crop_mesh]
+        The mesh counterpart, which must also decide what to do with a straddling face.
+    [`points_in_aabb`][triwarp.bounds.points_in_aabb]
+        The selection alone, when the points are not needed.
+    [`triwarp.array.gather`][triwarp.array.gather]
+    """
+    indices = tw.array.flatnonzero(_box_mask(points, min_bound, max_bound, rotation))
+    return tw.array.gather(points, indices), indices
+
+
+def crop_mesh(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    min_bound: wp.vec3,
+    max_bound: wp.vec3,
+    *,
+    rotation: wp.mat33 | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Keep the faces whose three vertices all lie inside a box, reindexed from zero.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer.
+    min_bound, max_bound
+        Opposite corners of the box: in world coordinates when ``rotation`` is ``None``, in box
+        coordinates otherwise.
+    rotation
+        World-to-box frame as ``wp.mat33``, rows being the box axes; ``None`` crops to the
+        axis-aligned box. Same argument as
+        [`crop_points`][triwarp.bounds.crop_points]'s.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        Compact ``(sub_vertices, sub_faces)`` on ``vertices.device``, carrying only the vertices
+        the kept faces reference.
+
+    Examples
+    --------
+    ```python
+    rotation, lower, upper = tw.bounds.oriented_bounding_box(v, 256)
+    sub_v, sub_f = tw.bounds.crop_mesh(v, f, lower, upper, rotation=rotation)
+    ```
+
+    Notes
+    -----
+    A face straddling the box boundary is **dropped**, not clipped: the result is a subset of the
+    input's triangles, so the crop never introduces a vertex the input did not have and the cut
+    edge is ragged at the triangle scale. That is what makes the operation a selection rather than
+    a boolean -- for a flush cut, intersect the mesh with the box as a solid instead -- and it is
+    the rule the one reference that answers this question applies, verified face for face on four
+    fixtures rather than assumed.
+
+    To keep the straddling faces instead, take the mask and pass it on directly, which is the
+    ``face_mode="any"`` rule:
+
+    ```python
+    mask = tw.bounds.points_in_aabb_mask(v, wp.vec3(-1.0, -1.0, 0.0), wp.vec3(1.0, 1.0, 3.0))
+    sub_v, sub_f = tw.selection.submesh_from_vertex_mask(v, f, mask, face_mode="any")
+    ```
+
+    See Also
+    --------
+    [`crop_points`][triwarp.bounds.crop_points]
+    [`triwarp.selection.submesh_from_vertex_mask`][triwarp.selection.submesh_from_vertex_mask]
+        The face selection this delegates to, where ``face_mode`` is exposed.
+    """
+    vertex_mask = _box_mask(vertices, min_bound, max_bound, rotation)
+    return tw.selection.submesh_from_vertex_mask(vertices, faces, vertex_mask, face_mode="all")
+
+
+def _box_mask(
+    points: wp.array[wp.vec3], min_bound: wp.vec3, max_bound: wp.vec3, rotation: wp.mat33 | None
+) -> wp.array[wp.bool]:
+    """Dispatch the two crop entry points onto the axis-aligned or the oriented predicate."""
+    if rotation is None:
+        return points_in_aabb_mask(points, min_bound, max_bound)
+    return points_in_obb_mask(points, rotation, min_bound, max_bound)
 
 
 def oriented_bounding_box(
@@ -246,6 +581,8 @@ def oriented_bounding_box(
     See Also
     --------
     [`aabb`][triwarp.bounds.aabb]
+    [`points_in_obb`][triwarp.bounds.points_in_obb]
+        Takes this triple as returned, to select the points a box contains.
     [`trimesh.bounds.oriented_bounds`][]
     ``igl.oriented_bounding_box``
     """

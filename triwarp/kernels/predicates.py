@@ -164,6 +164,41 @@ def segment_aabb(a: Any, b: Any):
 
 
 @wp.func
+def is_in_aabb(point: Any, min_bound: Any, max_bound: Any) -> wp.bool:
+    # Is the point inside an axis-aligned box, boundary included? The containment counterpart of
+    # ``triangle_aabb`` above: that one builds a box, this one tests against it.
+    #
+    # Six explicit comparisons rather than the shorter ``wp.min(point, min_bound) == min_bound``,
+    # which is the same predicate on finite input and the *wrong* one on a ``nan`` coordinate:
+    # ``wp.min`` returns the other operand for a ``nan`` (measured), so the vector form reports a
+    # ``nan`` point as inside every box. Each ``>=`` / ``<=`` here is false for a ``nan`` instead,
+    # which is both the honest answer and the reference convention -- open3d's
+    # ``GetPointIndicesWithinBoundingBox`` compares component-wise for exactly this reason.
+    #
+    # Generic over the scalar type but fixed at three components: a vector has no readable
+    # component count in kernel scope (the same restriction ``.claude/CLAUDE.md`` section 14
+    # records for a matrix's ``.shape``), so a rank-free spelling would have to go back through
+    # ``wp.min`` and give up the ``nan`` answer.
+    return (
+        point[0] >= min_bound[0]
+        and point[0] <= max_bound[0]
+        and point[1] >= min_bound[1]
+        and point[1] <= max_bound[1]
+        and point[2] >= min_bound[2]
+        and point[2] <= max_bound[2]
+    )
+
+
+@wp.func
+def is_in_obb(point: Any, rotation: Any, min_bound: Any, max_bound: Any) -> wp.bool:
+    # Is the point inside an oriented box, boundary included? Exactly ``is_in_aabb`` in box
+    # coordinates -- ``rotation`` is the world-to-box frame whose *rows* are the box axes, the
+    # convention ``bounds.oriented_bounding_box`` returns -- so the two share one predicate and one
+    # boundary rule rather than spelling the six comparisons twice.
+    return is_in_aabb(rotation * point, min_bound, max_bound)
+
+
+@wp.func
 def vector_angle(a: Any, b: Any) -> wp.Float:
     # Unsigned angle in [0, pi] between two vectors, as ``atan2(|a x b|, a . b)`` rather than
     # ``acos(a . b)``.
