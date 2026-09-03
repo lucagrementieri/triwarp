@@ -45,8 +45,10 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar
-from triwarp.kernels import creation as kernel_creation
+from triwarp.constants import TILE_1D
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import polyline as kernel_polyline
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels.array import LOOP_CONDITION
 
 # Point count from which [`polyline_downsample`][triwarp.polyline.polyline_downsample] stops
@@ -271,10 +273,11 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
     out_normal = wp.zeros(1, dtype=wp.vec3, device=device)
     # The polyline is closed (last vertex duplicates the first), so summing cross(V_i, V_{i + 1})
     # over the n - 1 consecutive pairs includes the wrap-around edge — full Newell's method.
-    wp.launch(
+    wp.launch_tiled(
         kernel_polyline.accumulate_newell_normal,
-        dim=n - 1,
+        dim=kernel_reduce.blocks_1d(n - 1),
         inputs=[polyline, out_normal],
+        block_dim=TILE_1D,
         device=device,
     )
     wp.map(wp.normalize, out_normal, out=out_normal)
@@ -1050,10 +1053,11 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     normal = wp.zeros(1, dtype=wp.vec3, device=device)
     weighted_midpoint = wp.zeros(1, dtype=wp.vec3, device=device)
     total_length = wp.zeros(1, dtype=wp.float32, device=device)
-    wp.launch(
+    wp.launch_tiled(
         kernel_polyline.accumulate_loop_frame,
-        dim=n,
+        dim=kernel_reduce.blocks_1d(n),
         inputs=[polyline, normal, weighted_midpoint, total_length],
+        block_dim=TILE_1D,
         device=device,
     )
     frame = wp.empty(3, dtype=wp.vec3, device=device)
@@ -1074,8 +1078,12 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     # Orientation is fixed up on device (``orient_ccw`` reads the accumulated angle itself), so the
     # reflex count below is the only readback before the convex fast path returns.
     total = wp.zeros(1, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_polyline.accumulate_turning_angle, dim=n, inputs=[points2d, total], device=device
+    wp.launch_tiled(
+        kernel_polyline.accumulate_turning_angle,
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[points2d, total],
+        block_dim=TILE_1D,
+        device=device,
     )
     wp.launch(kernel_polyline.orient_ccw, dim=n, inputs=[points2d, total], device=device)
 
@@ -1183,7 +1191,7 @@ def triangulate_polygon(polygon: wp.array[wp.vec2]) -> tuple[wp.array[wp.vec2], 
         return polygon, wp.empty(0, dtype=wp.int32, device=device)
 
     lifted = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.map(kernel_creation.lift_vec2, polygon, wp.float32(0.0), out=lifted)
+    wp.map(kernel_array.lift_vec2, polygon, wp.float32(0.0), out=lifted)
     opened = polyline_open(lifted)
     faces = polyline_triangulate(opened).reshape((-1,))
     # polyline_open only ever drops a repeated final point, so the matching 2D ring is a prefix.

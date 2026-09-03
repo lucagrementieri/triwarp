@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
-from triwarp.kernels.reduce import tile_chunk
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
 
 # ---------------------------------------------------------------------------
 # Packed Procrustes accumulator
@@ -234,12 +234,49 @@ def accumulate_cost(
     acc: wp.array[wp.float32],
 ) -> None:
     # Weighted mean squared residual, into the packed accumulator's cost slot. A zero-length
-    # ``weights`` means uniform.
-    i = wp.int32(wp.tid())
-    w = wp.float32(1.0)
-    if weights.shape[0] > 0:
-        w = weights[i]
-    wp.atomic_add(acc, ACC_COST, (w / acc[ACC_W_SUM]) * wp.length_sq(b[i] - transformed[i]))
+    # ``weights`` means uniform. Launched with ``wp.launch_tiled(dim=blocks_1d(n),
+    # block_dim=TILE_1D)``: one block per ``ITEMS_PER_BLOCK_1D`` residuals, lanes striding that
+    # block's own chunk, one atomic per block instead of one per point.
+    #
+    # It was one ``wp.atomic_add`` per thread to a *constant* slot, which serializes the whole
+    # reduction on one address, and it runs once per ICP iteration over the caller's whole cloud.
+    # Interleaved A/B in one session on an RTX 5090, min of three alternating pairs, the reset
+    # hoisted out of the timing loop (it is a launch of its own and dominates at small n):
+    #
+    #   n         5 000    20 000   200 000   1 000 000
+    #   atomic    0.0149   0.0270   0.2542    1.2594  ms
+    #   tiled     0.0168   0.0165   0.0153    0.0167  ms
+    #   speed-up  0.89x    1.64x    16.6x     75.6x
+    #
+    # The tiled form is flat because its grid is ``n / 1024``; the 5 000 row is a small loss and is
+    # the occupancy trade (five blocks), which ``icp`` never sits at -- it is benchmarked at the
+    # scan-mesh point counts. The reduction is also *more accurate*, which is the opposite of what
+    # a different summation order usually costs: relative to a float64 reference at n = 1 000 000
+    # the tree sits at **2.9e-07** where the serialized atomic sits at **1.9e-04**.
+    #
+    # **No ``prefers_tiled_reduction`` branch, and that is the load-bearing part.** The lanes
+    # partition a chunk *the block already owns* and take their stride from ``wp.block_dim()``,
+    # which is the case ``.claude/CLAUDE.md`` section 3 says is correct on both devices: on CPU
+    # ``wp.block_dim()`` reads 1, lane 0 walks the whole chunk, and the one-element tile holds that
+    # chunk's true total. Measured with ``CUDA_VISIBLE_DEVICES=""``: 1.02-1.03x at every n above,
+    # and 1.9e-07 relative error against the float64 reference at n = 200 000 where the atomic
+    # form sits at 1.1e-05. ``measures.centroid_tiled`` needs a ``_sliced`` sibling because *its*
+    # lanes partition the outer work at a constant stride; this family is the other form.
+    chunk, lane = wp.tid()
+    offset, remaining = tile_chunk(transformed.shape[0], chunk, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+    local = wp.float32(0.0)
+    for k in range(lane, count, wp.block_dim()):
+        i = offset + k
+        w = wp.float32(1.0)
+        if weights.shape[0] > 0:
+            w = weights[i]
+        local += w * wp.length_sq(b[i] - transformed[i])
+    total = wp.tile_sum(wp.tile(local))[0]
+    if lane == 0:
+        wp.atomic_add(acc, ACC_COST, total / acc[ACC_W_SUM])
 
 
 # --- Iterative closest point (ICP) -----------------------------------------

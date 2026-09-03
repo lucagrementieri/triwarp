@@ -13,6 +13,7 @@ from triwarp._device import read_scalar, require_nonempty_mesh
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import proximity as kernel_proximity
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import registration as kernel_registration
 from triwarp.kernels import transform as kernel_transform
 
@@ -197,10 +198,11 @@ def _procrustes_into(
         inputs=[a, out_matrix, out_transformed],
         device=device,
     )
-    wp.launch(
+    wp.launch_tiled(
         kernel_registration.accumulate_cost,
-        dim=n,
+        dim=kernel_reduce.blocks_1d(n),
         inputs=[out_transformed, b, weights, acc],
+        block_dim=TILE_1D,
         device=device,
     )
     # One readback for the whole accumulator; ICP's convergence test needs the cost on the host,

@@ -33,6 +33,15 @@ def tile_chunk(n: wp.int32, chunk: wp.int32, width: wp.int32) -> tuple[wp.int32,
     return offset, n - offset
 
 
+# Elements one block of a 1-D global reduction owns. It is a ``wp.constant`` because both halves
+# of the contract read it and they must read the *same* number: [`blocks_1d`] derives the launch
+# width from it at Python scope, and a kernel-scope ``tile_chunk(n, chunk, ITEMS_PER_BLOCK_1D)``
+# derives each block's slice from it. A launch and a kernel that disagree here do not fail -- they
+# fold some elements twice and drop others, which for a sum is a wrong answer and for an extremum
+# looks right. See [`blocks_1d`] for the same hazard stated from the launch side.
+ITEMS_PER_BLOCK_1D = wp.constant(TILE_1D * TILES_PER_BLOCK_1D)
+
+
 def blocks_1d(n: int) -> int:
     """
     Launch width for the 1-D global reduction kernels in this module.
@@ -44,6 +53,12 @@ def blocks_1d(n: int) -> int:
     idempotent for the extrema, that would leave ``min`` / ``max`` / ``any`` / ``all`` looking
     correct while ``sum`` silently returned 16x its answer.
 
+    It is also the launch width for the *lane-strided* single-slot reductions outside this module
+    -- ``registration.accumulate_cost``, ``polyline.accumulate_newell_normal`` /
+    ``accumulate_turning_angle`` / ``accumulate_loop_frame`` -- which own the same
+    [`ITEMS_PER_BLOCK_1D`][triwarp.kernels.reduce.ITEMS_PER_BLOCK_1D] chunk per block but partition
+    it across lanes with ``wp.block_dim()`` rather than loading tiles from it.
+
     Parameters
     ----------
     n
@@ -54,7 +69,7 @@ def blocks_1d(n: int) -> int:
     int
         Block count to pass as ``dim`` to ``wp.launch_tiled`` with ``block_dim=TILE_1D``.
     """
-    items = TILE_1D * TILES_PER_BLOCK_1D
+    items = ITEMS_PER_BLOCK_1D
     return (n + items - 1) // items
 
 

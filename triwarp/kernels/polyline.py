@@ -16,6 +16,7 @@ from triwarp.kernels.predicates import (
     project_out_normal,
     vector_angle,
 )
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
 
 
 @wp.func
@@ -56,11 +57,67 @@ def segment_midpoint_and_length(start: wp.vec3, end: wp.vec3) -> tuple[wp.vec3, 
 
 @wp.kernel
 def accumulate_newell_normal(polyline: wp.array[wp.vec3], out_normal: wp.array[wp.vec3]) -> None:
-    # dim == n_points - 1: Newell's method sums cross products of consecutive vertices
-    # (position vectors), cross(V_i, V_{i + 1}). Appending the closing vertex before launch
-    # (as polyline_normal does) folds the wrap-around edge into this same sum.
-    i = wp.int32(wp.tid())
-    wp.atomic_add(out_normal, 0, wp.cross(polyline[i], polyline[i + 1]))
+    # Newell's method sums cross products of consecutive vertices (position vectors),
+    # cross(V_i, V_{i + 1}), over the ``n - 1`` pairs of a *closed* polyline whose last vertex
+    # duplicates its first -- which folds the wrap-around edge into this same sum, and is what
+    # ``polyline_normal`` appends before launching.
+    #
+    # This kernel and the two below are the lane-strided single-slot reduction: launched with
+    # ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``, one block per
+    # ``ITEMS_PER_BLOCK_1D`` elements, lanes striding that block's own chunk by
+    # ``wp.block_dim()``, one atomic per block. All three were one ``wp.atomic_add`` per thread to
+    # a *constant* slot, which serializes the entire reduction on one address. Interleaved A/B in
+    # one session on an RTX 5090, min of three alternating pairs, and the values against a float64
+    # reference of the same sum:
+    #
+    #   n                          4 096    65 536   262 144
+    #   newell_normal    atomic    0.0187   0.2482   0.9880  ms
+    #                    tiled     0.0142   0.0127   0.0138  ms   -> 1.32x / 19.6x / 71.8x
+    #   turning_angle    atomic    0.0113   0.0843   0.3319  ms
+    #                    tiled     0.0135   0.0141   0.0121  ms   -> 0.84x / 5.97x / 27.4x
+    #   loop_frame       atomic    0.0310   0.4390   1.6174  ms
+    #                    tiled     0.0163   0.0150   0.0155  ms   -> 1.90x / 29.3x / 104x
+    #
+    # ``rim_long`` is 1 << 16 = 65 536 vertices per rim and is the ``polyline`` group's asymptotic
+    # fixture, so the middle column is the benchmarked point. The 4 096 turning-angle row is a
+    # small loss and is the occupancy trade: four blocks on 170 SMs.
+    #
+    # The reduction is also **three orders of magnitude more accurate**, which is the opposite of
+    # what a different summation order usually costs -- at n = 262 144 the tree sits at 2.6e-07 /
+    # 3.5e-07 / 4.7e-07 relative against float64 where the serialized atomics sit at 1.4e-03 /
+    # 5.3e-06 / 1.4e-03.
+    #
+    # **No ``prefers_tiled_reduction`` branch.** The lanes partition a chunk the block already
+    # owns and take their stride from ``wp.block_dim()``, which section 3 of
+    # ``.claude/CLAUDE.md`` says is correct on both devices: on CPU ``wp.block_dim()`` reads 1,
+    # lane 0 walks the whole chunk, and the one-element tile holds that chunk's true total.
+    # Measured with ``CUDA_VISIBLE_DEVICES=""``: 0.79-1.00x on the clock, and the same accuracy
+    # win (4.3e-07 against 2.6e-04 for the Newell normal at n = 65 536).
+    #
+    # A ``wp.vec3`` accumulator is summed component-wise because ``wp.tile(wp.vec3)`` does not
+    # parse (verified on Warp 1.17: ``Error while parsing function``), which is the same reason
+    # ``measures.centroid_tiled`` takes three ``wp.tile_sum`` calls.
+    #
+    # Only an *unconditional* atomic belongs in this shape. A compaction cursor, a
+    # "did anything change" flag or a rare-event counter -- ``count_reflex`` two hundred lines
+    # down, ``boundary.find_ears``, ``remesh.commit_flips`` -- contends in proportion to its
+    # **hits** rather than to the launch, so converting one would add a block reduction to a
+    # kernel that atomically adds a handful of times. Leave those alone.
+    chunk, lane = wp.tid()
+    n_pairs = polyline.shape[0] - 1
+    offset, remaining = tile_chunk(n_pairs, chunk, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+    local = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    for k in range(lane, count, wp.block_dim()):
+        i = offset + k
+        local += wp.cross(polyline[i], polyline[i + 1])
+    sum_x = wp.tile_sum(wp.tile(local[0]))[0]
+    sum_y = wp.tile_sum(wp.tile(local[1]))[0]
+    sum_z = wp.tile_sum(wp.tile(local[2]))[0]
+    if lane == 0:
+        wp.atomic_add(out_normal, 0, wp.vec3(sum_x, sum_y, sum_z))
 
 
 @wp.kernel
@@ -582,23 +639,47 @@ def accumulate_loop_frame(
     out_weighted_midpoint: wp.array[wp.vec3],
     out_length: wp.array[wp.float32],
 ) -> None:
-    # dim == n, over an *open* loop of n distinct vertices. One pass replaces the three separate
-    # reductions ``polyline_triangulate``'s prologue used to run, each of which ended in a host
-    # readback because the next one consumed its Python-scope result.
+    # Over an *open* loop of n distinct vertices. One pass replaces the three separate reductions
+    # ``polyline_triangulate``'s prologue used to run, each of which ended in a host readback
+    # because the next one consumed its Python-scope result.
     #
-    # Newell's normal is cyclic -- thread i takes the edge (i, (i + 1) % n), so the wrap-around
-    # edge is thread n - 1 and no closing vertex has to be appended first. The length-weighted
+    # Newell's normal is cyclic -- element i takes the edge (i, (i + 1) % n), so the wrap-around
+    # edge is element n - 1 and no closing vertex has to be appended first. The length-weighted
     # centroid deliberately is *not* cyclic: it runs over the n - 1 open segments, which is what
     # ``polyline_centroid`` (``closed=False``) computes and what this function has always used.
-    i = wp.int32(wp.tid())
+    #
+    # Lane-strided single-slot reduction -- see ``accumulate_newell_normal`` for the shape and why
+    # no device branch is needed. This is the largest of the three wins, at 1.90x / 29.3x / 104x
+    # for n = 4 096 / 65 536 / 262 144, because it carried *three* unconditional atomics per
+    # element and so three times the contention.
+    chunk, lane = wp.tid()
     n = polyline.shape[0]
-    start = polyline[i]
-    wp.atomic_add(out_normal, 0, wp.cross(start, polyline[wrap_index(i + 1, n)]))
-    if i + 1 < n:
-        end = polyline[i + 1]
-        midpoint, length = segment_midpoint_and_length(start, end)
-        wp.atomic_add(out_weighted_midpoint, 0, midpoint * length)
-        wp.atomic_add(out_length, 0, length)
+    offset, remaining = tile_chunk(n, chunk, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+    normal = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    weighted = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    length_total = wp.float32(0.0)
+    for k in range(lane, count, wp.block_dim()):
+        i = offset + k
+        start = polyline[i]
+        normal += wp.cross(start, polyline[wrap_index(i + 1, n)])
+        if i + 1 < n:
+            midpoint, length = segment_midpoint_and_length(start, polyline[i + 1])
+            weighted += midpoint * length
+            length_total += length
+    normal_x = wp.tile_sum(wp.tile(normal[0]))[0]
+    normal_y = wp.tile_sum(wp.tile(normal[1]))[0]
+    normal_z = wp.tile_sum(wp.tile(normal[2]))[0]
+    weighted_x = wp.tile_sum(wp.tile(weighted[0]))[0]
+    weighted_y = wp.tile_sum(wp.tile(weighted[1]))[0]
+    weighted_z = wp.tile_sum(wp.tile(weighted[2]))[0]
+    total_length = wp.tile_sum(wp.tile(length_total))[0]
+    if lane == 0:
+        wp.atomic_add(out_normal, 0, wp.vec3(normal_x, normal_y, normal_z))
+        wp.atomic_add(out_weighted_midpoint, 0, wp.vec3(weighted_x, weighted_y, weighted_z))
+        wp.atomic_add(out_length, 0, total_length)
 
 
 @wp.kernel
@@ -630,15 +711,27 @@ def project_polyline_to_plane(
 @wp.kernel
 def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_total: wp.array[wp.float32]) -> None:
     # Cyclic signed exterior angle at each vertex; the sum's sign gives the loop orientation.
-    i = wp.int32(wp.tid())
+    # Lane-strided single-slot reduction -- see ``accumulate_newell_normal`` for the shape, its
+    # measured table (0.84x / 5.97x / 27.4x at n = 4 096 / 65 536 / 262 144) and why no device
+    # branch is needed.
+    chunk, lane = wp.tid()
     n = points2d.shape[0]
-    current = points2d[i]
-    nxt = points2d[(i + 1) % n]
-    after = points2d[(i + 2) % n]
-    d1 = nxt - current
-    d2 = after - nxt
-    angle = wp.atan2(cross2(d1, d2), wp.dot(d1, d2))
-    wp.atomic_add(out_total, 0, angle)
+    offset, remaining = tile_chunk(n, chunk, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+    local = wp.float32(0.0)
+    for k in range(lane, count, wp.block_dim()):
+        i = offset + k
+        current = points2d[i]
+        nxt = points2d[(i + 1) % n]
+        after = points2d[(i + 2) % n]
+        d1 = nxt - current
+        d2 = after - nxt
+        local += wp.atan2(cross2(d1, d2), wp.dot(d1, d2))
+    total = wp.tile_sum(wp.tile(local))[0]
+    if lane == 0:
+        wp.atomic_add(out_total, 0, total)
 
 
 @wp.kernel
