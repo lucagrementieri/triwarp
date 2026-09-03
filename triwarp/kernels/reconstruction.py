@@ -160,7 +160,7 @@ def lexicographic_triangulation(
 
 @wp.func
 def delone_flip_profit_sq(a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3) -> wp.float32:
-    # MRPointCloudTriangulationHelpers.cpp: profit of flipping diagonal AC to BD.
+    # Empty-circumcircle (Delone) profit of flipping diagonal AC to BD.
     metric_ac, metric_bd = delone_metrics(a, b, c, d)
     return metric_ac - metric_bd
 
@@ -169,7 +169,7 @@ def delone_flip_profit_sq(a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3) -> wp.
 def tris_angle_profit(
     a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3, crit_ang: wp.float32
 ) -> wp.float32:
-    # MRPointCloudTriangulationHelpers.cpp: dihedral angle across edge AC minus critical angle.
+    # Dihedral angle across edge AC minus the critical angle.
     ac = c - a
     ab = b - a
     ad = d - a
@@ -203,7 +203,7 @@ def cycle_prev(nbr: wp.array[wp.int32], m: wp.int32, i: wp.int32) -> wp.int32:
 
 
 # --------------------------------------------------------------------------------------
-# Fan edge-removal weight (port of FanOptimizer::calcQueueElement_ / updateBorderQueueElement_)
+# Fan edge-removal weight: the priority with which a fan edge is dropped
 # --------------------------------------------------------------------------------------
 @wp.func
 def edge_removal_weight(
@@ -226,7 +226,7 @@ def edge_removal_weight(
     a = points[center]
     n_center = normals[center]
 
-    # --- boundary-edge handling (updateBorderQueueElement_) ---
+    # --- boundary-edge handling ---
     if border >= 0 and (nbr[i] == border or nbr[prev] == border):
         next_el = nbr[prev] == border
         if next_el:
@@ -247,7 +247,7 @@ def edge_removal_weight(
             return stable
         return wp.vec2(FLOAT32_INF_CONSTANT, 0.0)
 
-    # --- interior-edge handling (calcQueueElement_) ---
+    # --- interior-edge handling ---
     dif_angle = ang[nxt] - ang[prev]
     if dif_angle < 0.0:
         dif_angle += TWO_PI
@@ -314,7 +314,7 @@ def edge_removal_weight(
 
 
 # --------------------------------------------------------------------------------------
-# Local fan triangulation (port of buildLocalTriangulation + FanOptimizer)
+# Local fan triangulation: a Boissonnat-style fan about each point, greedily optimized
 # --------------------------------------------------------------------------------------
 @wp.kernel(enable_backward=False)
 def build_local_triangulations(

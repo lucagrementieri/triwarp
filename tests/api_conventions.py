@@ -1675,3 +1675,54 @@ def kernel_scope_ternary_problems() -> list[str]:
                     f"ternary ('{ast.unparse(node)}') -- write wp.where(cond, a, b) instead"
                 )
     return problems
+
+
+# --- check 21 -----------------------------------------------------------------------------------
+
+# MeshLib's licence restricts *use*, not merely distribution of derivatives, and triwarp ships
+# ``MIT OR Apache-2.0`` -- so ``.claude/CLAUDE.md``'s MeshLib block requires that nothing under
+# ``triwarp/`` name the library at all: not the library, not one of its C++ functions, not one of
+# its source files. This is the pattern that sentence's grep asks for, widened in two ways the
+# eighth kernels pass measured as necessary. The ``MR`` prefix covers a source-file or class name
+# generically (the block's own list of four symbols matched *none* of the three file-name comments
+# found in ``kernels/``, because they name ``MRLaplacian.cpp`` and
+# ``MRPointCloudTriangulationHelpers.cpp``); the named C++ identifiers cover the two comments that
+# said "port of" in the imperative, which is the sharper half of the defect and carries no ``MR``.
+# Prose mentions in ``tests/`` and ``benchmarks/`` are correct and required -- a comparison has to
+# say what it compares against -- so the scan is scoped to the package.
+_MESHLIB_REFERENCES = re.compile(
+    r"\bmeshlib\b|\bmrmesh(py|numpy)\b|\bMR[A-Z][A-Za-z]{2,}"
+    r"|\bFanOptimizer\b|\bbuildLocalTriangulation\b|\bpositionVertsSmoothly"
+    r"|\bcalcQueueElement|\bupdateBorderQueueElement",
+    re.IGNORECASE,
+)
+
+
+def meshlib_reference_problems() -> list[str]:
+    """
+    Check 21: a MeshLib name -- library, function or source file -- anywhere under ``triwarp/``.
+
+    ``.claude/CLAUDE.md``'s MeshLib block: *"Nothing under ``triwarp/`` may name MeshLib at all"*,
+    because its licence restricts use rather than distribution and triwarp ships
+    ``MIT OR Apache-2.0``, so an attribution comment collectively reads as a claim that a
+    permissively licensed package is derived from a proprietary one. 89 such references were
+    removed in one pass across 19 files; five had come back by the eighth kernels pass, two of them
+    stating the claim outright ("port of ``FanOptimizer``"). A rule whose enforcement is "someone
+    remembers to grep" has now failed once, which is what this check is for.
+
+    Describe what the code computes, or name the algorithm in the literature's vocabulary -- which
+    is what section 10 asks for independently and what a reader needed anyway. Reading
+    ``reference/MeshLib`` to understand an operation's *interface* stays allowed; naming it here
+    does not.
+    """
+    problems: list[str] = []
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            match = _MESHLIB_REFERENCES.search(line)
+            if match is None:
+                continue
+            problems.append(
+                f"{path.relative_to(_REPO_ROOT)}:{number} names MeshLib "
+                f"('{match.group(0)}') -- say what the code computes, or name the algorithm"
+            )
+    return problems

@@ -1091,8 +1091,15 @@ anyway and what §10 asks for independently. Read `reference/MeshLib` to underst
 
 **Keep it a test/benchmark dependency.** It belongs in `tests/` and `benchmarks/`, where naming it
 is correct and required — a comparison has to say what it compares against. Nothing in the shipped
-package imports it or mentions it; `grep -rni 'meshlib\|MRTriMath\|MRReducePath\|MRMesh' triwarp/`
-must stay empty.
+package imports it or mentions it, and **`tests/test_api_conventions.py` check 21 enforces
+that** rather than trusting a remembered grep — the rule has failed twice, once at 89 sites and
+once at five, two of which said "port of" in the imperative. Its pattern is wider than the
+four symbols this sentence used to name, because those four matched **none** of the three
+file-name comments the eighth kernels pass found (`MRLaplacian.cpp`,
+`MRPointCloudTriangulationHelpers.cpp`): it keys on `meshlib` / `mrmeshpy` / `mrmeshnumpy`, on
+an `MR<CamelCase>` prefix generically, and on the C++ identifiers that carry no `MR` at all
+(`FanOptimizer`, `buildLocalTriangulation`, `positionVertsSmoothly`, `calcQueueElement_`,
+`updateBorderQueueElement_`). Add to that pattern when a new symbol is found; do not narrow it.
 
 One more, for the fixtures rather than the API: **`trimesh.slice_plane`'s output is a poor MeshLib
 input.** A hemisphere built that way from `icosphere(2)` reports **17** `findHoleRepresentiveEdges`

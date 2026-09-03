@@ -52,6 +52,7 @@ from tests.api_conventions import (
     launch_device_problems,
     library_in_summary_problems,
     mask_return_problems,
+    meshlib_reference_problems,
     private_import_problems,
     scan_package,
     undocumented_raise_problems,
@@ -690,3 +691,19 @@ def test_dir_lists_the_whole_surface_before_it_is_touched() -> None:
         [sys.executable, "-c", probe], capture_output=True, text=True, check=True
     )
     assert sorted(completed.stdout.split()) == sorted(tw.__all__)
+
+
+def test_no_meshlib_references_in_the_package() -> None:
+    """
+    Nothing under ``triwarp/`` names MeshLib -- the library, a function of it, or a source file.
+
+    Not a library comparison: this is a licensing property of triwarp's own source. MeshLib's
+    licence restricts *use* rather than distribution of derivatives, and triwarp ships
+    ``MIT OR Apache-2.0``, so an attribution comment here reads as a claim that a permissively
+    licensed package is derived from a proprietary one. This is check 21, added because the rule
+    has now failed twice: 89 references were removed in one pass across 19 files, and five had
+    accumulated again by the eighth kernels pass -- two of them saying "port of" in the imperative.
+    Naming it in ``tests/`` and ``benchmarks/`` is correct and required, so the scan stops at the
+    package.
+    """
+    _fail("MeshLib reference(s) under triwarp/:", meshlib_reference_problems())

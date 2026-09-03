@@ -21,7 +21,7 @@ mat66d = wp.types.matrix(shape=(6, 6), dtype=wp.float64)
 
 
 # ---------------------------------------------------------------------------
-# Region Dirichlet / least-squares smoothing (positionVertsSmoothly, MRLaplacian.cpp)
+# Region Dirichlet / least-squares smoothing
 # ---------------------------------------------------------------------------
 
 
@@ -98,7 +98,7 @@ def dirichlet_system_triplets(
     out_rhs_y: wp.array[wp.float64],
     out_rhs_z: wp.array[wp.float64],
 ) -> None:
-    # positionVertsSmoothlySharpBd: SPD umbrella system A = D - W over free verts (weights in the
+    # SPD umbrella system A = D - W over free verts, sharp boundary (weights in the
     # CSR ``W``), fixed 1-ring neighbors folded into the right-hand side, plus optional stabilizer.
     v = wp.int32(wp.tid())
     ri = selected_row(free_mask, free_map, v)

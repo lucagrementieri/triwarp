@@ -1706,7 +1706,7 @@ def smooth_region(
 
 
 # ---------------------------------------------------------------------------
-# Region smoothing solves (positionVertsSmoothly / positionVertsSmoothlySharpBd)
+# Region smoothing solves (Dirichlet umbrella, smooth and sharp boundary)
 # ---------------------------------------------------------------------------
 
 
