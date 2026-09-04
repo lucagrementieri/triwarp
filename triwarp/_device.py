@@ -25,14 +25,13 @@ def prefers_tiled_reduction(device: wp.DeviceLike) -> bool:
 
     Reductions that land in a single accumulator have two implementations in this package, and the
     choice is forced rather than stylistic. ``wp.launch_tiled`` runs exactly **one** lane per block
-    on the Warp CPU device -- ``wp.tid()``'s lane index is always 0 -- through Warp 1.17, so a tile
-    built out of *per-lane* values, ``wp.tile(x)``, holds a single element there and any reduction
-    over it silently returns one element's worth of answer. Re-measured on Warp 1.17.0: over 8
-    blocks of 64 ones, ``wp.tile_sum(wp.tile(v))`` totals **8.0 on CPU** against 512.0 on CUDA.
+    on the Warp CPU device -- ``wp.tid()``'s lane index is always 0 -- so a tile built out of
+    *per-lane* values, ``wp.tile(x)``, holds a single element there and any reduction over it
+    silently returns one element's worth of answer.
 
     The distinction matters, because it is *only* the lane-constructed tile that breaks.
-    ``wp.tile_load`` reads its whole tile out of an array and is lane-independent, so it totals
-    512.0 on both devices -- which is why every factory in ``kernels/reduce.py`` may be tiled
+    ``wp.tile_load`` reads its whole tile out of an array and is lane-independent, so it totals the
+    same value on both devices -- which is why every factory in ``kernels/reduce.py`` may be tiled
     unconditionally while ``kernels/measures.py`` and ``kernels/metrics.py``, which build their
     tiles from a per-thread contribution, must branch here.
 
@@ -42,21 +41,17 @@ def prefers_tiled_reduction(device: wp.DeviceLike) -> bool:
     Upstream tracks closing the gap in two open issues -- NVIDIA/warp#1480 (*CPU/GPU parity for all
     tile code*, which names ``wp.tile(lane_value)`` followed by reductions or scans as an affected
     pattern) and NVIDIA/warp#1638 (*Add efficient CPU block execution with fibers*, the request to
-    honour ``block_dim > 1`` on CPU). So do not re-probe this from scratch on the next upgrade and
-    do not file it: read those two issues, and expect the branch to become removable only once CPU
-    blocks run more than one logical thread.
+    honour ``block_dim > 1`` on CPU). The branch becomes removable only once CPU blocks run more
+    than one logical thread.
 
     The portable form instead gives each thread a strided slice and one atomic, which is correct on
-    both devices but gives up the block shuffle-reduce, and that costs real CUDA time once the input
-    is large enough to exceed the launch overhead: measured 1.67x on the area-weighted centroid at
-    327k faces (16.0 -> 26.7 us of kernel time) and 1.57x on the chamfer loss term at 500k points
-    (19.0 -> 29.7 us). Below roughly 100k elements both forms sit at the ~18 us launch floor and the
-    difference is unmeasurable.
+    both devices but gives up the block shuffle-reduce, which costs real CUDA time once the input
+    is large enough to exceed the launch overhead. Below roughly 100k elements both forms sit at the
+    launch floor and the difference is negligible.
 
     So: tiles on CUDA, slices on CPU. Reductions with *many* accumulators do not need this -- one
-    per query already fills the device, and there the portable form is the faster one on CUDA too
-    (the solid-angle winding sum measured 1.6x faster at 5k queries and 2.0x at 50k), so those have
-    a single implementation.
+    per query already fills the device, and there the portable form is the faster one on CUDA too,
+    so those have a single implementation.
 
     Parameters
     ----------
@@ -134,15 +129,10 @@ def require_nonempty_mesh(faces: wp.array[wp.int32], name: str) -> None:
     Raise before constructing a ``warp.Mesh`` with zero triangles.
 
     A ``warp.Mesh`` built with an empty ``indices`` array does not raise, but silently
-    corrupts CUDA driver/allocator state through Warp 1.17: the constructor itself "succeeds", but a
-    later, unrelated CUDA allocation anywhere else in the process then fails and cascades into
-    "illegal memory access" errors. Every ``wp.Mesh(...)`` call site in this package must call
-    this first instead of letting the native constructor run on an empty face buffer.
-
-    Re-verified on Warp 1.17.0 in ten throwaway subprocesses, since the failure lands on a *later*
-    allocation and an in-process probe would poison the session: 10/10 aborted with
-    ``Warp CUDA error 2: out of memory`` on the first 4 MiB allocation after the empty mesh, on a
-    card with 32 GiB free.
+    corrupts CUDA driver/allocator state: the constructor itself "succeeds", but a later, unrelated
+    CUDA allocation anywhere else in the process then fails and cascades into "illegal memory
+    access" errors. Every ``wp.Mesh(...)`` call site in this package must call this first instead
+    of letting the native constructor run on an empty face buffer.
 
     Parameters
     ----------
@@ -172,22 +162,18 @@ def read_scalar(arr: wp.array[Any], index: int = -1) -> Any:
     """
     One element of ``arr``, read back to the host as a Python scalar.
 
-    The spelling matters more than it looks. ``int(arr[n - 1 :].numpy()[0])`` -- what this package
-    used everywhere -- builds a one-element Warp view, then a *fresh* host array for it, then
-    synchronizes; measured **29.5 us** per call at 200 calls between two synchronization points,
-    which is the regime a wrapper runs in. Copying into a scratch buffer allocated once costs
-    **15.7**, and on a host array, where ``.numpy()`` is already a zero-copy view of the whole
-    buffer, indexing that view directly costs **1.7** against the slice spelling's 6.6. So the
-    device branch is not a portability concession: each side's fast path is the other's slow one.
+    The spelling matters more than it looks. ``int(arr[n - 1 :].numpy()[0])`` -- a natural first
+    attempt -- builds a one-element Warp view, then a *fresh* host array for it, then synchronizes.
+    Copying into a scratch buffer allocated once avoids that intermediate array; on a host array,
+    where ``.numpy()`` is already a zero-copy view of the whole buffer, indexing that view directly
+    is cheaper than slicing first. So the device branch is not a portability concession: each
+    side's fast path is the other's slow one.
 
     !!! warning "The scratch must not be pinned"
         A pinned host destination makes ``cudaMemcpyAsync`` genuinely asynchronous, and Warp issues
-        the copy without an event or a synchronization, so the read races the producing kernel:
-        measured **20 of 20** reads wrong behind a 140 ms kernel, silently returning the *previous*
-        round's value. Pageable memory is documented to return only once a device-to-host copy has
-        completed, and measures 0 of 20 wrong on the same probe. Adding the missing
-        ``wp.synchronize_device`` to a pinned buffer gives back the whole difference (14.7 us
-        against 15.7), so pinning buys nothing here even done correctly.
+        the copy without an event or a synchronization, so the read can race the producing kernel
+        and silently return the *previous* round's value instead. Pageable memory is documented to
+        return only once a device-to-host copy has completed.
 
     Parameters
     ----------

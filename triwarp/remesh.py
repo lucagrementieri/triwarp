@@ -82,10 +82,9 @@ class _EdgeIncidence(NamedTuple):
 #
 # One round commits only a fraction of the scored candidates -- each winner locks the closed 1-rings
 # of both endpoints, so a hashed-key round takes on the order of ``m / 50`` of them -- and the
-# rebuild that follows is ~40 wrapper calls against a handful of launches for another round. So the
-# pass loop runs rounds against the same scoring **until one finds nothing new**, which is the real
-# stopping rule; this constant only bounds it. 6 and 8 produce byte-identical output on every
-# fixture measured, i.e. saturation happens first, and a round that finds nothing costs ~8 launches.
+# rebuild that follows is much more expensive than another round. So the pass loop runs rounds
+# against the same scoring **until one finds nothing new**, which is the real stopping rule; this
+# constant only bounds it.
 _QUADRIC_ROUNDS = 8
 
 
@@ -190,12 +189,11 @@ def isotropic_remesh(
     transported, because there the correspondence is known exactly: a split midpoint takes the mean
     of the endpoints it splits, and a collapse compacts the bands alongside the vertices.
 
-    A **constant** field is not quite the scalar path: measured on a remeshed ``icosphere(3)`` at 3
-    iterations the two agree on the face buffer *exactly* (``np.array_equal``) and on positions to
-    1.2e-05 on a mesh of extent 2.0. The gap is float rounding in the threshold alone — the array
-    path forms ``4/3 * t`` per vertex in ``float32`` where the scalar path forms it in Python
-    ``float64`` and narrows once — and the resampled constant itself is exact to 7.5e-09. Pass a
-    scalar when the target is uniform; it is also one closest-point query per stage cheaper.
+    A **constant** field is not quite the scalar path: the two agree on the face buffer exactly and
+    on positions to within float rounding. The gap is float rounding in the threshold alone — the
+    array path forms ``4/3 * t`` per vertex in ``float32`` where the scalar path forms it in Python
+    ``float64`` and narrows once. Pass a scalar when the target is uniform; it is also one
+    closest-point query per stage cheaper.
 
     ``max_deviation`` is a **positional bound applied per iteration**, not a per-operation rejection
     test: an individual collapse or flip is never vetoed for moving the surface too far, it is the
@@ -206,16 +204,11 @@ def isotropic_remesh(
     How tightly the bound holds is worth stating, because it is set by
     ``wp.mesh_query_point_no_sign`` rather than by this function. Against that query — the one the
     clamp is implemented with, and the one ``reproject`` has always used — the result is within the
-    bound to **1.4e-07**. Against an independent ``float64`` query
-    (``trimesh.proximity.closest_point``) on a remeshed ``icosphere(3)`` at 5 iterations with
-    ``reproject=False``, whose unconstrained deviation is
-    3.21e-03: a bound of 1.07e-03 measures 1.00x the bound, 3.21e-04 measures 1.01x, and 1.07e-04
-    measures **1.37x** — the two queries disagree by up to 2.1e-05 in absolute terms (mean 1.6e-08,
-    so it is a handful of vertices, and iterating the clamp does not converge further because Warp's
-    answer is a fixed point). The bound therefore controls deviation proportionally — those three
-    settings reduce it by 3.0x, 9.9x and 21.9x — but at a bound near Warp's own query accuracy it is
-    approximate rather than hard. Ask for a bound comfortably above 2e-05 in model units, or scale
-    the model up.
+    bound almost exactly. Against an independent closest-point query, the bound controls deviation
+    proportionally, but at a bound near Warp's own query accuracy it becomes approximate rather
+    than hard, because the two queries can disagree by a small absolute amount and iterating the
+    clamp does not converge further (Warp's answer is a fixed point). Ask for a bound comfortably
+    above the scale of a single-precision closest-point query, or scale the model up.
 
     The remaining limitation, stated because the parameter that used to advertise it is gone:
     PyMeshLab's ``selectedonly`` has no equivalent here, and a region-restricted refinement is
@@ -390,16 +383,11 @@ def _classify(
     edge; a vertex with zero is FREE, exactly two is CREASE (a smooth feature/boundary line), and
     anything else (a feature endpoint or a junction) is a frozen CORNER.
 
-    Both questions are answered by **one launch** over ``incidence``, which the collapse passes have
-    already built for their own scoring and pass in. That matters because the answer used to come
-    from ``boundary.boundary_edges`` plus ``adjacency.face_adjacency``, each of which hashes, sorts
-    and groups the same ``3 * n_faces`` edge rows the incidence was grouped from -- two of those
-    three groupings were pure repetition, and they were 84 % of this function. Measured back to
-    back on ``saddle`` with the incidence supplied: **1 059 -> 100 us, 10.6x**, which is
-    ``quadric_decimate`` **1.31-1.36x** end to end (``saddle`` at ``target_ratio=0.1`` 148 -> 112
-    ms, ``saddle_graded`` 193 -> 142) because the pass runs 35-45 times. ``_classify`` is also
-    called up to seven times per ``isotropic_remesh`` iteration, which gains **1.27x** from the
-    same change even though those callers have no incidence to hand and build their own.
+    Both questions are answered by **one launch** over ``incidence``, which the collapse passes
+    have already built for their own scoring and pass in. That matters because computing the
+    answer from ``boundary.boundary_edges`` plus ``adjacency.face_adjacency`` would hash, sort and
+    group the same ``3 * n_faces`` edge rows the incidence was already grouped from — sharing the
+    grouping avoids that repeated work whenever a caller has it in hand.
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -677,7 +665,8 @@ def _flip_interior_edges(
     ``igl::flip_edge``.
 
     The per-pass topology is built by ``_FlipTopology`` on fixed buffers rather than by composing
-    the public wrappers, which is a measured 1.5-2.6x on the whole call; see it for why.
+    the public wrappers, which avoids rebuilding structure that does not change shape between
+    passes; see it for why.
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -747,30 +736,20 @@ class _FlipTopology:
     """
     Persistent per-pass working set of the parallel edge-flip loop.
 
-    The flip loop reruns the same topology build 20-40 times on a face buffer whose *shape* never
+    The flip loop reruns the same topology build many times on a face buffer whose *shape* never
     changes — a flip rewrites two triangles' corners and leaves the vertex, face and interior-edge
-    counts alone — so composing the public wrappers pays for a fresh allocation chain every pass.
-    Measured on ``delaunay_triangulation``: the composed form spent 442 us/pass in
-    [`face_adjacency`][triwarp.adjacency.face_adjacency] and another 186 in
-    [`sort_and_argsort`][triwarp.array.sort_and_argsort] out of 962 us of host time, against ~1.2 ms
-    of device work for the *whole* 37-pass loop.
+    counts alone — so composing the public wrappers would pay for a fresh allocation chain every
+    pass. Every buffer here is instead allocated once and rewritten in place.
 
-    Two things collapse here. Every buffer is allocated once and rewritten in place; and the pass
-    sorted its edge keys **twice** — once inside ``face_adjacency``'s row grouping and once again
-    for the "would this flip duplicate an existing edge" table the candidate predicates search —
-    where one radix sort produces both. What remains is one key launch, one sort, a run-length
-    mark, a scan and a single emit launch that writes the adjacency pairs, their shared-edge
-    endpoints and the opposite apexes together.
+    The pass also needs its edge keys sorted only **once**, not twice: the same radix sort that
+    groups the interior-edge rows also produces the "would this flip duplicate an existing edge"
+    table the candidate predicates search, where composing the public wrappers would sort twice for
+    the same information. What remains per pass is one key launch, one sort, a run-length mark, a
+    scan and a single emit launch that writes the adjacency pairs, their shared-edge endpoints and
+    the opposite apexes together.
 
-    Measured back to back in one process, interleaved:
-    ``delaunay_triangulation`` **2.61x** at 2 000 points (18.70 -> 7.16 ms) and **1.93x** at 20 000
-    (36.14 -> 18.70), [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay] and
-    [`flip_by_objective`][triwarp.remesh.flip_by_objective] 1.50-1.61x,
-    [`isotropic_remesh`][triwarp.remesh.isotropic_remesh] 1.06x (its flip stage is a small share of
-    the iteration). CPU agrees: 1.98-2.08x, 1.51-1.73x, 1.06x. The one row that does not gain is
-    [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay], whose input is already near-Delaunay
-    so the loop exits in one or two passes and the fixed setup is the whole cost -- 1.00x on CUDA
-    and 0.92-0.98x on CPU.
+    On [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay] the setup dominates instead, since
+    its input is usually already near-Delaunay and the loop exits after one or two passes.
 
     Every intermediate is byte-identical to the composed path: the keys match
     [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] over
@@ -831,18 +810,12 @@ class _FlipTopology:
         for the candidate, claim and commit kernels.
 
         **It is launch-bound, not data-bound, and that is why the region flip pass does not scope
-        it to the region.** Measured on icospheres, one rebuild, ``min`` of 7 on an RTX 5090: 0.161
-        ms at 320 faces, 0.204 at 5 120, 0.248 at 81 920 and 0.316 at 327 680 -- a **1 024x** range
-        of input for **1.96x** of cost, because the eight launches' marshalling dominates the radix
-        sort. So the reading that suggests itself from ``_flip_region_faces``, where the sort covers
-        the whole mesh while only edges with *both* faces in the region are flippable, is a much
-        smaller number than it looks: on ``refill_region``'s ``dragon`` row the pass rebuilds 1 050
-        555 interior-edge rows to serve a 4 314-face region (0.61 %), and scoping it to that region
-        would save the difference between 0.454 ms per round and the ~0.16 ms floor -- about 0.15
-        ms x 13 rounds on the largest mesh in the suite, and nothing at all on ``bunny`` (0.252 ms
-        per round already). Restricting the *duplicate-edge* table would also need the region's
-        vertex one-ring closure to stay exact, since a flip's new edge may already exist outside the
-        region. Not worth it at that price; measure again if the floor moves.
+        it to the region.** The cost is dominated by the fixed launches' own marshalling rather than
+        by the radix sort over the mesh, so it grows very little with mesh size — which is also why
+        ``_flip_region_faces`` rebuilds over the whole mesh even though only edges with *both* faces
+        in the region are flippable, rather than scoping the rebuild to the region. Restricting the
+        *duplicate-edge* table to the region would also need the region's vertex one-ring closure to
+        stay exact, since a flip's new edge may already exist outside the region.
         """
         n = self._n_corners
         wp.launch(
@@ -871,7 +844,7 @@ class _FlipTopology:
         if m == 0:
             return 0
         if m != self._rows:
-            # Never taken after the first pass on any mesh measured: the duplicate-edge guard in
+            # Not expected to trigger after the first pass: the duplicate-edge guard in
             # ``_resolve_flip_quad_guarded`` is what keeps the exactly-two-corner edge count fixed.
             self._allocate_rows(m)
         wp.launch(
@@ -980,15 +953,9 @@ def cluster_decimate(
 
     The binning goes through [`triwarp.voxels.cell_indices`][triwarp.voxels.cell_indices], but the
     *dedup* deliberately stays on [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows]
-    rather than moving onto a NanoVDB grid, which was measured back to back and rejected. The grid
-    dedups 2.6-3.0x faster as a stage (0.34 against 0.90 ms), but it numbers the clusters
-    leaf-major, so keeping today's vertex order costs a restoring sort that gives the whole
-    advantage back: end to end over three icospheres at two cell widths, the grid with its own
-    ordering is 0.80-0.88x of today (12-20 % faster) and the grid with today's ordering is
-    0.94-1.02x, i.e. inside the session drift. Neither clears the bar for changing a public output
-    convention, and the 12-20 % is the ceiling because the dedup is only a quarter of the call —
-    ``_cluster_positions``, the face remap, ``submesh_from_face_mask``, ``unique_faces`` and
-    ``remove_unreferenced_vertices`` are untouched by it.
+    rather than moving onto a NanoVDB grid: a grid numbers its clusters leaf-major, so preserving
+    today's vertex order would need a restoring sort that gives back most of any gain, and it is not
+    worth changing the public output convention for what remains.
     """
     if contraction not in ("average", "closest"):
         raise ValueError(f"contraction must be 'average' or 'closest', got {contraction!r}")
@@ -1188,57 +1155,32 @@ def quadric_decimate(
     the resulting triangulation is not the same mesh, even though both are driven by the same
     metric. Compare the two by deviation from the input rather than by equality.
 
-    In exchange the *quality* is competitive and then some: at 512 faces from a subdivision-4
-    icosphere the two-sided Hausdorff distance to the input is **0.0133 here against
-    ``igl.decimate``'s 0.0250 and Open3D's 0.0236**, and the ordering holds at every target tried.
-    Committing an independent set spreads the error over the surface where draining a queue
-    concentrates it, and a max-norm rewards that.
+    In exchange the *quality* is competitive with the sequential method despite the different
+    collapse order: committing an independent set spreads the error over the surface where draining
+    a priority queue concentrates it, and a max-norm error measure rewards that.
 
     A pass commits **several independent sets against one scoring**, not one. A single hashed-key
     round takes on the order of ``m / 50`` of the candidates, because each winner locks the closed
-    1-rings of both its endpoints; the geometry rebuild that would otherwise follow is ~40 wrapper
-    calls, which is 92 % of this function's wall clock. So the pass retires only the candidates the
-    previous round's commits actually invalidated — those whose closed 1-rings touch a collapsed
-    neighbourhood, for which the cached quadric, cost, target position, link condition and
-    normal-flip verdict are the only things that went stale — and runs another round until one finds
-    nothing new. Worth **1.3-1.8x**, and it *improves* the deviation above at two of three targets
-    (the max-norm moves by ±20 % run to run on a tied fixture in any case; see below).
+    1-rings of both its endpoints, and rebuilding the geometry between rounds is comparatively
+    expensive. So the pass retires only the candidates the previous round's commits actually
+    invalidated — those whose closed 1-rings touch a collapsed neighbourhood, for which the cached
+    quadric, cost, target position, link condition and normal-flip verdict are the only things that
+    went stale — and runs another round until one finds nothing new.
 
-    That round loop then runs **entirely on device**, as one ``wp.capture_while`` graph — see
-    ``_run_collapse_rounds``. It was 73 % of this function's 3 948 ``wp.launch`` calls while
-    committing ~65 collapses a round, so it was almost pure host marshalling; capturing it took
-    the 240 per-round readbacks with it. Measured against the four CPU references as a control in
-    the same run (they moved 0.91-1.07x, i.e. noise): **167 -> 147 ms at ``saddle`` 0.1, 209 -> 189
-    at ``saddle_graded`` 0.1**, and 1.06-1.07x at 0.5. That is **1.06-1.13x**, not the ~1.2x a
-    launch count alone predicted — the round loop's share of the *clock* was smaller than its share
-    of the launches, and what is left is the per-pass rebuild, 44 of them, each ~45 wrapper calls
-    whose cost is Python rather than either launches or kernels.
+    That round loop runs **entirely on device**, as one ``wp.capture_while`` graph — see
+    ``_run_collapse_rounds`` — which removes the host readback that would otherwise happen once per
+    round.
 
-    **The per-pass cost did not depend on the mesh**: 4.35 ms at 32 524 faces against 4.15 at
-    3 484, a 1.05x range over a 9.3x range of size, so the wrapper calls per rebuild — not the
-    kernels, and not the pass count — were the lever. The largest single one was ``_classify``
-    re-deriving what the pass had already grouped, which is why the pass groups its edges once,
-    into an ``_EdgeIncidence``, and hands it over: measured back to back, **148 -> 112 ms at
-    ``saddle`` 0.1, 193 -> 142 at ``saddle_graded`` 0.1, 47 -> 36 at ``saddle`` 0.5**, i.e.
-    **1.31-1.36x**.
-
-    The end of that road is ``_DecimationBuffers``, which removes the pass's host readbacks
-    entirely and replays the whole rebuild as one captured graph — a further **2.6-4.5x**
-    (``saddle`` at 0.1: 115 -> 37 ms, ``capsule``: 95 -> 21), and the point at which this function
-    became the fastest of the five implementations benchmarked rather than 3.1x behind
-    ``pyvista``. Read that class before changing anything here: the pass now runs at a **fixed
-    width** with its live sizes in a device array, which is what makes the replay legal.
-    What is *not* the lever, measured: more rounds (the loop saturates at ~5.3 of its 8-round cap),
-    and narrowing the fixed width (worth 1.01x on the device, since these kernels sit at the launch
-    floor — it is kept only because it is worth 1.3-1.7x on **CPU**, which has no graph to replay).
+    The per-pass rebuild cost is dominated by the number of wrapper calls it issues rather than by
+    the mesh size, which is why it shares its edge grouping (an ``_EdgeIncidence``) with
+    ``_classify`` instead of letting each re-derive it, and why ``_DecimationBuffers`` goes further
+    still and replays the whole rebuild as one captured graph with fixed-width buffers and live
+    sizes carried in a device array. Read that class before changing anything here.
 
     **``return_index`` costs nothing when it is off and next to nothing when it is on.** The two
-    provenance maps are folded per pass by two launches and one copy against the pass's ~77, and the
-    branch that adds them is evaluated when the pass is *issued*, so the captured graph a CUDA run
-    replays does not even contain it. Measured interleaved on ``icosphere(5)``, medians of 7:
-    **1.00-1.07x on CUDA** (36.6 -> 39.0 ms at 0.1, 18.19 -> 18.20 at 0.5) and within noise on CPU,
-    where the two directions disagreed (0.92x and 1.06x) -- i.e. unmeasurable against this
-    function's own run-to-run spread.
+    provenance maps are folded per pass by two launches and one copy, and the branch that adds them
+    is evaluated when the pass is *issued*, so the captured graph a CUDA run replays does not even
+    contain it.
 
     Four consequences to plan around:
 
@@ -1254,15 +1196,15 @@ def quadric_decimate(
     - The independent set is chosen under a **hashed** lock key rather than by cost rank. That looks
       like a detail and is not: on a structured mesh both the edge index and the quadric cost are
       spatially monotone fields, and a monotone key has one local minimum, so either of those keys
-      commits a single collapse per pass. See ``scramble_index`` in ``kernels/remesh.py`` for the
-      measured numbers.
+      would commit only a single collapse per pass. See ``scramble_index`` in
+      ``kernels/remesh.py``.
     - **The output is not bit-reproducible on a mesh with tied costs, and never was.** The
       vertex-face incidence CSR is built by an atomic counting scatter, so a row's order varies run
-      to run; where two candidate edges tie on cost, which one the sort keeps varies with it. On the
-      ``saddle`` grid at 10 % this moves the two-sided Hausdorff between 0.21 and 0.77 across
-      identical runs, so **treat the max-norm as a band, not a value**: the mean deviation is stable
-      to three digits over the same runs (0.0144-0.0149). Compare a change to this function on the
-      mean, or on many repeats.
+      to run; where two candidate edges tie on cost, which one the sort keeps varies with it. On a
+      mesh with many tied costs this can move the two-sided Hausdorff distance noticeably between
+      otherwise identical runs, so **treat the max-norm as a band, not a value** — the mean
+      deviation is far more stable. Compare a change to this function on the mean, or on many
+      repeats.
     """
     n_faces = int(faces.shape[0]) // 3
     target = _resolve_decimation_target(target_faces, target_ratio, n_faces)
@@ -1295,13 +1237,10 @@ class _DecimationBuffers:
     """
     The whole working set of [`quadric_decimate`][triwarp.remesh.quadric_decimate], allocated once.
 
-    A decimation pass is **flat in the mesh size** -- 3.13 ms at 32 258 faces and 2.82 ms at 3 227,
-    a 1.11x range over a 10x one -- because only 0.81 ms of it is device work and the rest is the
-    ~77 launches and ~40 wrapper calls that rebuild the geometry. Two measurements say what to do
-    about that. A wrapper chain issued costs 2.69x what the same chain costs replayed from a CUDA
-    graph, because a replay pays for no Python at all; and running every pass at the **pass-0
-    width** instead of the live one costs 1.01x, because the device time barely tracks the size.
-    So the pass is issued once against fixed-capacity buffers and replayed for every pass after.
+    A decimation pass is dominated by the launches and wrapper calls that rebuild the geometry
+    rather than by the device work itself, and that cost barely tracks the mesh size. So the pass is
+    issued once against fixed-capacity buffers sized at the pass-0 width, and replayed as a captured
+    CUDA graph for every pass after, which pays for no Python at all on replay.
 
     The only thing that stopped that was the host readbacks -- ``edges_unique``, ``flatnonzero`` and
     ``remove_unreferenced_vertices`` each read a count back to size their own output, and a
@@ -1310,8 +1249,7 @@ class _DecimationBuffers:
     [`edges_to_csr`][triwarp.graph.edges_to_csr] (so ``warp.sparse.bsr_from_triplets``),
     [`vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency],
     [`sort_and_argsort`][triwarp.array.sort_and_argsort], ``warp.utils.array_scan`` and the round
-    loop's own nested ``wp.capture_while`` -- was measured to capture and replay correctly on
-    Warp 1.17 and is used unchanged.
+    loop's own nested ``wp.capture_while`` -- captures and replays correctly and is used unchanged.
 
     Padding is carried by two sentinels rather than by a guard in every kernel: a **dummy vertex**
     at index ``n_vertices`` that every padded face corner and edge endpoint points at, and a
@@ -1480,12 +1418,10 @@ class _DecimationBuffers:
         Every array this creates is kept in ``self._retain``. ``warp``'s ``Graph`` references the
         *modules* a captured launch needs but **not its arrays**, so on the face of it an
         intermediate dropped when this returns has its memory recycled and the replay then writes
-        into whatever took its place. That was probed and **could not be reproduced** -- dropping
-        the list and then churning the mempool with buffers of the intermediates' exact shapes and
-        dtypes still replays correctly, which matches CUDA's graph-memory model, where an
-        allocation made *during* capture becomes a memory node the graph owns. The list is kept
-        anyway because it costs a few object references and the guarantee is the driver's rather
-        than Warp's; do not remove it on the grounds that the probe was clean.
+        into whatever took its place. In practice an allocation made *during* capture becomes a
+        memory node the graph owns under CUDA's graph-memory model, but the list is kept anyway
+        because it costs only a few object references and the guarantee belongs to the driver
+        rather than to Warp -- do not remove it.
         """
         device = self._device
         dummy = wp.int32(self.n_vertices)
@@ -1798,12 +1734,10 @@ def _run_collapse_rounds(
     ``LOOP_CONDITION``) with a third slot appended for the previous round's commit count -- so
     the body holds no host readback and the whole loop is a single ``wp.capture_while`` graph.
 
-    That is the point of the shape. A round is ~12 launches over an ``m`` that is tens of
-    thousands wide, and it commits only ~65 collapses (measured on ``saddle_graded`` at
-    ``target_ratio=0.1``: 45 passes x 5.3 rounds for 15 682 collapses), so the round loop was **73%
-    of this function's 3 948 launches** and the host marshalling — not the kernels, which are 11% of
-    the call — was the cost. Capturing costs about what issuing the same launches costs (measured
-    1.03-1.13x, so the break-even is ~1.1 replays), and this replays 5.3 times per capture.
+    That is the point of the shape. A round issues a fixed number of launches over an ``m`` that can
+    be tens of thousands wide while committing only a small fraction of the candidates, so the
+    round loop's host marshalling — not its kernels — is the cost, and capturing it removes that
+    marshalling from every round after the first.
 
     Every round runs the identical body, which is what makes one captured graph enough:
 
@@ -2826,8 +2760,7 @@ def subdivide_to_size(
         # ``index`` rides through the split rather than being gathered afterwards, and the "did
         # anything split" test reads the resulting face count rather than reducing the mask: a face
         # count strictly grows when a mask is non-empty and is unchanged when it is empty, so this
-        # is exact and costs nothing. Both points are why the refactor to ``split_edges`` left the
-        # launch count per pass identical to the inline version it replaced (CLAUDE.md section 13).
+        # is exact and costs nothing.
         new_vertices, new_faces, new_index = split_edges(
             current_vertices,
             current_faces,
@@ -3068,26 +3001,15 @@ def _keep_longest_edges(
     """
     Keep only the ``remaining`` longest edges currently flagged in ``long_mask``.
 
-    This used to read ``long_mask`` and ``lengths`` back in full and pick the top ``remaining`` with
-    ``numpy.argsort``, moving ``2 * m`` elements across the bus in a loop that otherwise moves four
-    bytes a pass. Sorting the eligible lengths on the device removes both readbacks and the upload
-    that returned the answer, the same spelling
+    Sorts the eligible lengths on the device rather than reading ``long_mask`` and ``lengths`` back
+    to pick the top ``remaining`` with ``numpy.argsort``, the same spelling
     [`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk]'s final round uses.
-
-    Measured interleaved, ``min`` of 9: **3.5-19x on CUDA** over the range this branch actually sees
-    (1.95 -> 0.56 ms at ``m = 104 288``, the first budgeted pass on ``bunny``; 11.9 -> 0.62 ms at
-    ``m = 10^6``), worth **1.14-1.21x on the whole call**. The device sort has a ~0.5 ms floor and
-    so loses below ``m ~ 20 000``, and in isolation it loses 1.7-3.6x on CPU -- but the CPU call is
-    flat (0.98-1.00x) because the branch is a small share of it there, so nothing regresses at the
-    call level. ``m`` is the unique-edge count and grows with the mesh, which is what makes the
-    readback the wrong side of the trade.
+    ``m`` is the unique-edge count and grows with the mesh, which is what makes a host readback here
+    the wrong side of the trade at scale.
 
     Ties are not ordered by contract on either path -- ``numpy.argsort``'s introsort is unstable and
     ``sort_and_argsort`` is a stable radix sort, and the budget is documented as soft and as keeping
-    "the longest eligible edges", which every tie-break satisfies equally. Measured, they in fact
-    agree: the selected set is identical on three constructed tie patterns (all-equal, a cut inside
-    the middle of three tie runs, a cut inside one long tie run) and the output mesh is byte-equal
-    on ``icosphere(6)`` and ``bunny``.
+    "the longest eligible edges", which every tie-break satisfies equally.
     """
     eligible = tw.array.flatnonzero(long_mask)
     # Ascending on the negated length is descending on the length, and ``sort_and_argsort`` is the
@@ -3277,9 +3199,7 @@ def _vertex_scale_attribute(
     faces **outside** ``region``. Including the region's own edges is the natural-looking mistake
     and it defeats the criterion -- a minimum-weight patch spans its rim with long chords, so a rim
     vertex that happens to carry two of them reads a scale several times its neighbourhood's, the
-    ``alpha * sigma(c) > sigma(v_m)`` clause fails there, and the patch is left unrefined. Measured
-    on a 24-edge rim: counting the patch chords splits **nothing** at ``alpha = sqrt(2)`` where
-    excluding them inserts the expected vertices.
+    ``alpha * sigma(c) > sigma(v_m)`` clause fails there, and the patch is left unrefined.
 
     Over the **unique** edge list, so an interior edge counts once at each endpoint rather than
     twice -- which is why this goes through ``scatter_unique_edges_sum_and_valence`` rather than the

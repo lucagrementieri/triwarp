@@ -226,8 +226,8 @@ def _occlusion_bundle(
 
     normals, diagonal = _resolve_normals_and_radius(mesh, points, normals, name)
     directions = tw.sample.sample_fibonacci_hemisphere(n_rays, device=device)
-    # One block per point, lanes over the bundle -- see ``kernel_visibility.BUNDLE_BLOCK`` for the
-    # 3-12x this is worth over a thread per point, and why the width is 64.
+    # One block per point, lanes over the bundle -- see ``kernel_visibility.BUNDLE_BLOCK`` for why
+    # this wins over a thread per point, and why the width is 64.
     wp.launch_tiled(
         kernel_visibility.obscurance,
         dim=(m,),

@@ -142,10 +142,9 @@ def tree_cotree(
 
     The dual side is a forest rather than a traversal because only its edge *set* is read, never its
     shape. That matters for cost as well as tidiness: the dual graph restricted to non-primal-tree
-    edges is already nearly a tree, so a breadth-first traversal of it runs its diameter -- measured
-    765-891 levels against the primal tree's 116-192, and ``graph.bfs`` costs
-    ``4 kernels x levels`` whatever the node count. A Boruvka forest needs ``O(log n_faces)`` rounds
-    instead, and the whole call measures **8.3-9.7x** faster for it.
+    edges is already nearly a tree, so a breadth-first traversal of it would run its diameter, which
+    can be very large, and ``graph.bfs`` costs one pass of kernels per level whatever the node
+    count. A Boruvka forest instead needs only ``O(log n_faces)`` rounds.
 
     Parameters
     ----------
@@ -183,8 +182,8 @@ def tree_cotree(
     # unique edge, and one scatter over it fills both the per-edge face count and the two incident
     # faces. That is the whole dual graph, indexed by unique edge -- which is why nothing here needs
     # to locate a shared edge's row afterwards. The host ``argsort`` + ``searchsorted`` pair this
-    # replaces was doing exactly that lookup, at 7.1-10.4 ms of a 51-61 ms call, over an ``inverse``
-    # the same ``edges_unique`` call had already returned and thrown away.
+    # replaces was doing exactly that lookup, over an ``inverse`` the same ``edges_unique`` call had
+    # already returned and thrown away.
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
     n_edges = int(unique_edges.shape[0])
     edge_face_count = wp.zeros(n_edges, dtype=wp.int32, device=device)
@@ -209,8 +208,7 @@ def tree_cotree(
         )
 
     # Primal spanning tree over the vertex graph. This one stays a breadth-first traversal: the mesh
-    # graph's diameter is small (measured 116-192 levels) and ``parents`` is the rooted tree the
-    # loop tracing walks.
+    # graph's diameter is small, and ``parents`` is the rooted tree the loop tracing walks.
     adjacency = tw.graph.edges_to_csr(n_vertices, unique_edges)
     _, parents, _ = tw.graph.bfs(adjacency, 0)
 
@@ -255,8 +253,8 @@ def _dual_spanning_forest(
     as a set, and the loop tracing walks the *primal* parents — so the dual side has no root and no
     parent pointers, and its shape is free to choose. The breadth-first shape is the expensive one
     here: the dual graph restricted to non-primal-tree edges is already nearly a tree, so its
-    diameter is enormous, and ``graph.bfs`` costs ``4 kernels x levels`` whatever the node count.
-    Measured **765-891 levels** for the traversal this replaces against 12-17 rounds here.
+    diameter is enormous, and ``graph.bfs`` costs one pass of kernels per level whatever the node
+    count.
     """
     device = candidate.device
     n_candidates = int(candidate.shape[0])
@@ -291,8 +289,7 @@ def _dual_spanning_forest(
             inputs=[candidate, edge_faces, roots, proposal, labels, in_forest, merges],
             device=device,
         )
-        # One 4-byte readback per round. ~17 of those against the 765-891 kernel-bound levels the
-        # traversal needed is not a close trade, and there is no bound on the rounds without it.
+        # One 4-byte readback per round, and there is no bound on the rounds without it.
         if int(read_scalar(merges, 0)) == 0:
             break
     return in_forest

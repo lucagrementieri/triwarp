@@ -276,17 +276,10 @@ def discrete_mean_curvature(
 
     bvh = tw.neighbors.bvh_from_bounds(edge_lower, edge_upper)
     # The predicate the narrow phase below applies is the *ball* -- it keeps the edge length inside
-    # the ball of ``radius`` -- so the broad phase is the ball query and not the enclosing cube.
-    #
-    # This was declined once, on the sizing that the cube admits ~29 % more candidates than the
-    # ball and that trimming them was worth ~1 ms. Both halves of that were wrong. The candidate
-    # trim is real (70-74 % of the cube's candidates meet the ball, measured against a brute-force
-    # oracle at three sizes) and it is the smaller half: ``wp.bvh_query_sphere``'s traversal is
-    # itself far cheaper than ``wp.bvh_query_aabb``'s on the identical BVH, so the whole call is
-    # **3.4-6.8x** faster and the query alone 3.7-6.9x. Isolated with the inscribed cube, which
-    # returns strictly *fewer* candidates than the ball and still costs 6.5x it -- so the lever is
-    # the traversal, not the candidate count. Numbers and the platform reading: CLAUDE.md section
-    # 12.8.
+    # the ball of ``radius`` -- so the broad phase is the ball query and not the enclosing cube:
+    # ``wp.bvh_query_sphere``'s traversal is cheaper than ``wp.bvh_query_aabb``'s on the identical
+    # BVH, and the cube would also admit candidates outside the ball that the narrow phase would
+    # then have to reject.
     candidate_edges, offsets = tw.neighbors.query_bvh_ball(bvh, points, radius)
 
     mean_curvature = wp.zeros(n_points, dtype=wp.float32, device=device)

@@ -477,8 +477,8 @@ def median(array: twt.Array1dScalar) -> float:
 # Every kernel slot below is a ``{dtype: wp.Kernel}`` table rather than one kernel, because
 # ``kernels/reduce.py`` bakes the dtype into each factory instantiation -- see the note above
 # ``MIN1D_TILED`` there for why (a ``wp.Scalar`` template made every launch pay Warp's host-side
-# overload resolution, ~12 us, which is 1.77-1.88x of the launch itself). The bool specs are the
-# exception: their masks are cast to ``wp.int32`` before any kernel sees them, so one kernel each.
+# overload resolution). The bool specs are the exception: their masks are cast to ``wp.int32``
+# before any kernel sees them, so one kernel each.
 class _ScalarReduceSpec(NamedTuple):
     name: str
     axis_rows_tiled: kernel_array.KernelTable
@@ -669,13 +669,10 @@ def _flattened_for_global(array: twt.ScalarArray) -> twt.Array1dScalar | None:
     narrow clips every tile — so its ``wp.tile_load`` branch never runs and all ``TILE_2D**2`` lanes
     walk the same short block, the rank-2 form of the amplification ``_launch_axis_scalar``
     documents. Flattening costs nothing on a contiguous buffer and hands the work to the 1-D kernel,
-    which also carries the ``TILES_PER_BLOCK_1D`` fold. Measured on ``minmax``: **5.95x** on a
-    ``(14M, 3)`` table and **6.18x** on ``(8M, 2)``, against 1.02x on ``(40k, 128)`` — where the
-    tile branch does fire, which is why the width test is there and not just a contiguity test.
-
-    The cost is at the small end: ``(36k, 3)`` measures **0.79x**, because 16 tiles per block leaves
-    too few blocks to fill the device. That is 13 µs of kernel time under the ~82 µs host floor
-    every scalar-returning reduction already pays, so it is invisible end to end.
+    which also carries the ``TILES_PER_BLOCK_1D`` fold — a large win on a table with a narrow
+    trailing extent, and a wash at the small end where too few blocks are produced to fill the
+    device, which is invisible next to the fixed host cost every scalar-returning reduction pays
+    regardless.
 
     ``wp.array.flatten()`` raises on a non-contiguous array rather than copying, so a strided view
     keeps the rank-2 kernel — correctness first, and such a view is not the common case.
@@ -705,8 +702,8 @@ def _launch_axis_scalar(
 
     if reduced < TILE_1D:
         # The tiled kernels never take their tile_load branch below TILE_1D: every lane of every
-        # block redundantly runs the serial remainder, a TILE_1D-fold read amplification (measured
-        # 49x on a (14M, 3) axis=1 max). One plain thread per output, direct write, no init fill.
+        # block redundantly runs the serial remainder, a TILE_1D-fold read amplification. One plain
+        # thread per output, direct write, no init fill, avoids that.
         serial = (spec.axis_rows_serial if axis == 1 else spec.axis_cols_serial)[array.dtype]
         if spec.dual_axis:
             out_min = wp.empty(n_out, dtype=array.dtype, device=array.device)

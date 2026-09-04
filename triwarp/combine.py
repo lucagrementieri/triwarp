@@ -65,9 +65,9 @@ def concatenate(
         concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
         vertex_offsets = wp.zeros(len(meshes_data), dtype=wp.int32, device=device)
     else:
-        concatenated_vertices, vertex_offsets = tw.array.pack_1d_arrays([
-            vertices for vertices, _ in meshes_data
-        ])
+        concatenated_vertices, vertex_offsets = tw.array.pack_1d_arrays(
+            [vertices for vertices, _ in meshes_data]
+        )
 
     concatenated_faces, piece_starts = tw.array.pack_1d_arrays([faces for _, faces in meshes_data])
     total_indices = int(concatenated_faces.shape[0])

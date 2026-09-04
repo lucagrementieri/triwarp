@@ -431,9 +431,8 @@ def interpolate_from_points(
     neighbours, so the interpolant reproduces the data at the data. VTK's kernels do the same.
 
     This is ``vtkPointInterpolator`` with a ``vtkGaussianKernel``, which pyvista exposes as
-    ``DataSet.interpolate`` — the weight was recovered from its output rather than read from the
-    docs, and agrees to eight digits. Two conventions of the reference are deliberately not copied:
-    it clamps ``sharpness`` up to ``1.0`` (so its own ``0.5`` behaves as ``1.0``), and it offers
+    ``DataSet.interpolate``. Two conventions of the reference are deliberately not copied: it
+    clamps ``sharpness`` up to ``1.0`` (so its own ``0.5`` behaves as ``1.0``), and it offers
     ``mask_points`` / ``closest_point`` fallbacks for a query with no neighbour. The mask is
     ``counts == 0`` from [`query_ball_count`][triwarp.neighbors.query_ball_count] and the
     closest-point fallback is this function at ``k=1``, so neither needs a mode of its own.

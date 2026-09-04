@@ -59,8 +59,7 @@ def region_boundary_edges(
     Notes
     -----
     Erosion here is vertex-based: a vertex survives when every 1-ring neighbour is also in the
-    mask. MeshLab's Erode Selection is a *face*-based operation and gives a different answer; see
-    ``benchmarks/test_selection.py``.
+    mask. MeshLab's Erode Selection is a *face*-based operation and gives a different answer.
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -609,10 +608,9 @@ def delete_region_keep_boundary(
 
     The loop classification is host-side, over the loops themselves rather than over the mesh: a
     boundary loop is short next to the surface it bounds, and the edge sets involved are already
-    materialized by [`triwarp.boundary.boundary_loops`][triwarp.boundary.boundary_loops]. Measured
-    on an 82k-face sphere with a fifth of its faces deleted, that classification is **0.04 ms of a
-    4.4 ms call**: the call is the loop *trace* (3.1 ms) plus the submesh extraction (0.9), so
-    anything spent optimizing this function belongs in
+    materialized by [`triwarp.boundary.boundary_loops`][triwarp.boundary.boundary_loops]. The call's
+    cost is dominated by the loop trace and the submesh extraction, so anything spent optimizing
+    this function further belongs in
     [`triwarp.boundary.boundary_loops`][triwarp.boundary.boundary_loops] rather than here.
 
     See Also
@@ -644,7 +642,7 @@ def delete_region_keep_boundary(
     # Undirected input boundary edges, as a host-side set in *input* indices -- the loops are mapped
     # into that space to be classified, since the submesh renumbered them. Computed *after* the loop
     # trace and only when there is something to classify: on a closed input this pass answers
-    # nothing, and it is 0.46 ms of a 4.85 ms call on an 82k-face sphere.
+    # nothing.
     input_boundary = {
         (int(row[0]), int(row[1])) for row in tw.boundary.boundary_edges(vertices, faces).numpy()
     }
@@ -740,11 +738,8 @@ def submesh_from_vertex_mask(
     -----
     A mask is a *cheaper* input than the equivalent index list, not merely a more convenient one:
     the face reduction reads it directly, where the index form has to rebuild membership through
-    [`isin`][triwarp.array.isin]. Measured interleaved against the route this used to take
-    (``flatnonzero``, then ``isin``, then a row reduction, then a second ``flatnonzero``): **1.96x
-    on CUDA**, flat from 320 to 81 920 faces because the saving is nine launches and three host
-    readbacks rather than device work, and 1.88x falling to 1.19x on CPU over the same range. The
-    index form still pays it, because it starts from indices and has nothing else to go on.
+    [`isin`][triwarp.array.isin] first. The index form still pays that cost, because it starts from
+    indices and has nothing else to go on.
 
     See Also
     --------
@@ -836,9 +831,7 @@ def expand_vertex_mask(
 
     The per-round ``wp.clone`` is not worth removing. The kernel only *sets* bits, so each round
     must start from a copy of the previous mask; ping-ponging two preallocated buffers would keep
-    the copy and drop only the allocation. Measured on an ``icosphere(5)`` selection: 0.073 ms at
-    ``hops=1`` and 0.427 ms at ``hops=10``, i.e. **~0.043 ms per round** all-in, so the allocation
-    is a fraction of a fraction and the ping-pong would buy less than the session-to-session drift.
+    the copy and drop only the allocation, which is a small fraction of the round's cost.
     """
     device = mask.device
     n = int(mask.shape[0])
@@ -896,8 +889,7 @@ def shrink_vertex_mask(
     Notes
     -----
     Erosion here is vertex-based: a vertex survives when every 1-ring neighbour is also in the
-    mask. MeshLab's Erode Selection is a *face*-based operation and gives a different answer; see
-    ``benchmarks/test_selection.py``.
+    mask. MeshLab's Erode Selection is a *face*-based operation and gives a different answer.
     """
     device = mask.device
     n = int(mask.shape[0])

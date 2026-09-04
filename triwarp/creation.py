@@ -24,21 +24,8 @@ curved one, each with exactly one boundary loop.
 and are the only builders here that produce a **non-orientable** surface, an odd Euler
 characteristic, or a mesh whose scale is far from 1.
 
-!!! note "Every function here costs at least ~340 µs, and most of them cost exactly that"
-
-    A triwarp wrapper call carries a fixed host-side cost — allocation plus Warp's launch path,
-    ~75 µs of it a NumPy prologue — measured at **~340 µs on an RTX 5090** by
-    ``benchmarks/test_creation.py::test_box``, which builds a 12-triangle constant table and so
-    measures nothing else. That floor is a property of the wrapper layer, not of this module.
-
-    It dominates this module more than any other, because these functions are *small*: `box`,
-    `axis` and the four Platonic solids are constant tables, and every
-    [`revolve`][triwarp.creation.revolve]-based primitive is two launches over one buffer each, so
-    each is flat in its section count from 32 sections to 4096. Below roughly ``10 ** 3``
-    elements of output, a timing of any of them reports launch overhead and nothing else, and a
-    CPU library returning the same mesh from a per-vertex loop wins outright; above a few thousand
-    the flatness is what wins, by 12-150x. Build primitives once and reuse them rather than calling
-    these in a loop — that is the only thing the floor actually asks of a caller.
+Each function carries the fixed host-side cost of a Warp wrapper call, so build a primitive once
+and reuse it rather than calling these repeatedly in a loop.
 """
 
 from __future__ import annotations
@@ -176,13 +163,11 @@ def _icosphere_face_table() -> np.ndarray:
 # Built once: the icosahedron's topology is a constant, so the only per-call cost is the upload.
 _ICOSPHERE_FACE_TABLE = _icosphere_face_table()
 
-# Measured, and deliberately NOT cached per device. The upload of these two tables is 0.141 ms of
-# icosphere's 0.317 ms on CUDA (0.038 of 0.193 on CPU), so a cache looks like an easy win -- but it
-# only ever pays here. ``box``, ``tetrahedron``, ``octahedron``, ``icosahedron`` and
-# ``dodecahedron`` *return* the buffer they upload (``_apply_transform`` may rewrite its winding in
-# place), so a cached table would have to be ``wp.clone``-d on read, which gives the upload
-# straight back. That leaves one caller to justify a module-level dict pinning device memory for
-# the life of the process, which is a bad trade for a library.
+# Deliberately NOT cached per device. ``box``, ``tetrahedron``, ``octahedron``, ``icosahedron``
+# and ``dodecahedron`` *return* the buffer they upload (``_apply_transform`` may rewrite its
+# winding in place), so a cached table would have to be ``wp.clone``-d on read, which gives the
+# upload straight back -- a bad trade for a module-level dict pinning device memory for the life
+# of the process.
 
 
 # The remaining three Platonic solids, as MeshLab's ``create_tetrahedron`` /
@@ -403,26 +388,10 @@ def grid(
     Notes
     -----
     Both buffers are written **closed-form on the device**, one thread per vertex and one per quad
-    cell, rather than assembled on the host. The other procedural templates in this module stay in
-    NumPy because they are host-*sequential* and a port would only buy Python loops; this one is a
-    pure parallel map whose output scales with a resolution parameter into the millions, which is
-    the same argument that made [`icosphere`][triwarp.creation.icosphere] closed-form.
-
-    Measured back to back, interleaved in one process, against the host build it replaces:
-
-    | ``count`` | host | device | |
-    |---|---|---|---|
-    | ``(32, 32)`` | 0.227 ms | **0.169 ms** | 1.34x |
-    | ``(128, 128)`` | 0.585 ms | **0.182 ms** | 3.21x |
-    | ``(512, 512)`` | 6.77 ms | **0.205 ms** | 33.1x |
-    | ``(1024, 1024)`` | 46.1 ms | **0.413 ms** | 112x |
-
-    The device column being nearly flat to a million vertices is the point: what the host build
-    spent was the lattice assembly and the upload, not the geometry. Positions come out
-    **bit-identical** to the NumPy version — the kernel does the same arithmetic in ``float64``
-    before the ``float32`` store, and phrases each sample as ``extent * (k / (n - 1))`` so the far
-    edge lands on the extent exactly, which is what ``numpy.linspace`` needed its endpoint special
-    case for.
+    cell, rather than assembled on the host. Positions come out **bit-identical** to a NumPy
+    build: the kernel does the same arithmetic in ``float64`` before the ``float32`` store, and
+    phrases each sample as ``extent * (k / (n - 1))`` so the far edge lands on the extent exactly,
+    matching what ``numpy.linspace`` needs its endpoint special case for.
     """
     nx, ny = int(count[0]), int(count[1])
     if nx < 2 or ny < 2:
@@ -607,31 +576,14 @@ def icosphere(
     [`subdivide`][triwarp.remesh.subdivide]: every vertex of the refined mesh is addressed directly
     by its barycentric coordinates within one of the 20 base faces (see
     ``kernels.creation.icosphere_vertex_index``), so the whole face buffer is written by **one**
-    kernel and the vertices by one launch per refinement level. That is ``subdivisions + 2``
-    launches and no host synchronization, against ~17 launches per level — an edge dedup, a radix
-    sort and a count readback each time — for the iterated form.
-
-    Measured back to back on an RTX 5090 (`benchmarks/test_creation.py`'s ``icosphere`` group,
-    medians from ``--benchmark-json``): **19-31x**, and flat where the iterated form was not.
-
-    | ``subdivisions`` | iterated | closed form | |
-    |---|---|---|---|
-    | 3 (1 280 faces) | 4.76 ms | **245 µs** | 19.4x |
-    | 5 (20 480 faces) | 7.86 ms | **253 µs** | 31.1x |
-    | 7 (327 680 faces) | 6.87 ms | **345 µs** | 22.3x |
-
-    The iterated column being *non-monotonic* is the tell that it was measuring host cost rather
-    than the output: seven `subdivide` passes cost more than five of them, and neither cost is about
-    the faces. What is left is the ~340 µs wrapper floor, so this now beats
-    [`trimesh.creation.icosphere`][] at every level (472 µs at 3, 67.1 ms at 7) instead of losing 6x
-    at level 3.
+    kernel and the vertices by one launch per refinement level, with no host synchronization.
 
     The *geometry* is still the recursive one, level by level, because that is what the reference
     produces: a vertex is the projected midpoint of two vertices of the previous level, which is
     not the same point as the projection of the corresponding barycentric point of the base face
-    (the two differ by a few percent of the edge length). Vertex *order* differs from both trimesh
-    and the former iterated implementation — vertices come out as the 12 base corners, then the
-    interior points of each base edge, then the interior points of each base face.
+    (the two differ by a few percent of the edge length). Vertex *order* differs from trimesh —
+    vertices come out as the 12 base corners, then the interior points of each base edge, then the
+    interior points of each base face.
 
     See Also
     --------
@@ -802,11 +754,13 @@ def sphere_cap(
     for r in range(1, n_rings + 1):
         theta = angle * r / n_rings
         phi = 2.0 * math.pi * np.arange(6 * r) / (6 * r)
-        vertices_np[ring_start[r] : ring_start[r] + 6 * r] = np.column_stack((
-            radius * math.sin(theta) * np.cos(phi),
-            radius * math.sin(theta) * np.sin(phi),
-            np.full(6 * r, radius * math.cos(theta)),
-        ))
+        vertices_np[ring_start[r] : ring_start[r] + 6 * r] = np.column_stack(
+            (
+                radius * math.sin(theta) * np.cos(phi),
+                radius * math.sin(theta) * np.sin(phi),
+                np.full(6 * r, radius * math.cos(theta)),
+            )
+        )
 
     # Stitch ring r-1 to ring r: six sectors, and in each the outer ring carries one more vertex
     # than the inner one. That extra vertex is what turns the strip into ``2 * r - 1`` triangles --
@@ -820,20 +774,24 @@ def sphere_cap(
         inner_count = 6 * (r - 1) if r > 1 else 1
         outer_index = np.arange(6 * r)
         sector, step = np.divmod(outer_index, r)
-        faces_np[written : written + 6 * r] = np.column_stack((
-            outer_base + outer_index,
-            outer_base + (outer_index + 1) % (6 * r),
-            inner_base + (sector * (r - 1) + step) % inner_count,
-        ))
+        faces_np[written : written + 6 * r] = np.column_stack(
+            (
+                outer_base + outer_index,
+                outer_base + (outer_index + 1) % (6 * r),
+                inner_base + (sector * (r - 1) + step) % inner_count,
+            )
+        )
         written += 6 * r
         if r > 1:
             inner_index = np.arange(inner_count)
             sector, step = np.divmod(inner_index, r - 1)
-            faces_np[written : written + inner_count] = np.column_stack((
-                inner_base + inner_index,
-                outer_base + (sector * r + step + 1) % (6 * r),
-                inner_base + (inner_index + 1) % inner_count,
-            ))
+            faces_np[written : written + inner_count] = np.column_stack(
+                (
+                    inner_base + inner_index,
+                    outer_base + (sector * r + step + 1) % (6 * r),
+                    inner_base + (inner_index + 1) % inner_count,
+                )
+            )
             written += inner_count
 
     return (
@@ -1317,10 +1275,12 @@ def _revolve_kept_template(profile_np: np.ndarray, step: float) -> np.ndarray:
     """
     per = profile_np.shape[0]
     radius_np, height_np = profile_np[:, 0], profile_np[:, 1]
-    grid_np = np.vstack((
-        np.column_stack((radius_np, np.zeros(per), height_np)),
-        np.column_stack((np.cos(step) * radius_np, np.sin(step) * radius_np, height_np)),
-    ))
+    grid_np = np.vstack(
+        (
+            np.column_stack((radius_np, np.zeros(per), height_np)),
+            np.column_stack((np.cos(step) * radius_np, np.sin(step) * radius_np, height_np)),
+        )
+    )
     segment_np = np.arange(per - 1)
     triangles_np = np.empty((2 * (per - 1), 3), dtype=np.int64)
     triangles_np[0::2] = np.column_stack((segment_np, segment_np + per, segment_np + 1))
@@ -1453,13 +1413,6 @@ def extrude_triangulation(
 
     out_faces = wp.empty((2 * n_faces + 2 * n_boundary) * 3, dtype=wp.int32, device=device)
     # Bottom cap winding is reversed; the top cap keeps it and is offset by one vertex block.
-    #
-    # These two write disjoint slices and could be one launch over both caps. Declined on the
-    # measured share: one ``offset_cap_faces`` launch is 13.54-13.60 us (200 launches between two
-    # syncs -- 4 arguments, so exactly what the ~9.7 us + ~1.0 us/argument model predicts) against
-    # a call of 0.717 / 0.762 / 0.864 ms at a 64 / 512 / 4096-vertex ring, i.e. **1.89 % falling to
-    # 1.57 %**. The call is flat in ``n_faces`` and dominated by the boundary extraction above, so
-    # the saving is largest exactly where the call is already cheap.
     wp.launch(
         kernel_creation.offset_cap_faces,
         dim=n_faces,
@@ -1608,10 +1561,8 @@ def sweep_polygon(
         )
 
     # Two 12-byte endpoint reads decide whether the path closes; the rest of it never leaves the
-    # device. ``read_scalar`` rather than ``path[k : k + 1].numpy()[0]``: each spelling of the
-    # latter allocates a fresh host array per call and measures 27.8 us against the shared-scratch
-    # copy's 15.7 (see [`read_scalar`][triwarp._device.read_scalar]), and this function is
-    # 94-99 % host time.
+    # device. ``read_scalar`` avoids allocating a fresh host array per call the way
+    # ``path[k : k + 1].numpy()[0]`` would.
     first = read_scalar(path, 0)
     last = read_scalar(path, n_path - 1)
     closed = math.dist(first, last) < TOLERANCE_MERGE
@@ -1658,9 +1609,6 @@ def sweep_polygon(
     )
     if n_cap > 0:
         base = 2 * n_slices * n_boundary * 3
-        # Same disjoint-slice pair as ``extrude_triangulation``, declined the same way and for the
-        # same reason: one launch is 14.12 / 16.08 us against a 1.451 / 1.609 ms call at
-        # sections=16 path=32 / sections=64 path=256 -- **0.97-1.00 %** of it.
         wp.launch(
             kernel_creation.offset_cap_faces,
             dim=n_cap,
@@ -2187,11 +2135,9 @@ def random_soup(
 
 # --- private helpers ---------------------------------------------------------------------
 #
-# Cross-cutting, which is what CLAUDE.md section 5 reserves a trailing block for.
 # ``_transform_to_numpy`` is the one member with a single caller (``extrude_polygon``) and it
 # stays here deliberately: it is the read half of ``_apply_transform`` directly above it, which
-# is reached from seven builders, and splitting the pair to satisfy the stepdown rule would
-# cost more than the backward jump it saves.
+# is reached from seven builders.
 
 
 class _ParametricSpec(NamedTuple):
@@ -2448,12 +2394,14 @@ def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.n
     corner_b = vertex_index[1:, :-1].ravel()
     corner_c = vertex_index[1:, 1:].ravel()
     corner_d = vertex_index[:-1, 1:].ravel()
-    # Wound against the (u, v) frame, which is VTK's convention and puts the normals of the closed
-    # surfaces outward: measured opposed on every one of the 18 surfaces if wound with it.
-    triangles = np.concatenate((
-        np.column_stack((corner_a, corner_c, corner_b)),
-        np.column_stack((corner_a, corner_d, corner_c)),
-    ))
+    # Wound against the (u, v) frame, matching VTK's convention, which puts the normals of the
+    # closed surfaces outward.
+    triangles = np.concatenate(
+        (
+            np.column_stack((corner_a, corner_c, corner_b)),
+            np.column_stack((corner_a, corner_d, corner_c)),
+        )
+    )
     nondegenerate = (
         (triangles[:, 0] != triangles[:, 1])
         & (triangles[:, 1] != triangles[:, 2])

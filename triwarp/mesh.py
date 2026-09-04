@@ -50,7 +50,7 @@ _TOPOLOGY_KEYS: frozenset[str] = frozenset(
         "faces_unique_edges",  # a reshaped view of `edges_unique_inverse`
         "body_count",
         # Unit weights on the directed edge adjacency, so the operator reads `faces` and not the
-        # positions -- measured identical across an arbitrary affine remap of the vertices. It is
+        # positions, and is invariant under any affine remap of the vertices. It is
         # winding-dependent on an *open* mesh, which `with_vertices` never changes but a mirroring
         # `transform` does; `_ORIENTATION_DEPENDENT_KEYS` carries that half.
         "laplacian_operator",
@@ -59,12 +59,10 @@ _TOPOLOGY_KEYS: frozenset[str] = frozenset(
 
 # --- Transform cache strata -------------------------------------------------
 #
-# How much of the cache survives depends on what the transform preserves, and these sets were
-# *measured* rather than reasoned about: every key was computed on a mesh and on its transformed
-# copy and compared, on a closed fixture and on an open one. Four results contradict the obvious
-# reading, so re-measure rather than edit by eye --
-# `tests/test_transform.py::test_carried_cache_matches_recomputation` is that measurement, and it
-# fails if a key is added here that recomputation would disagree with.
+# How much of the cache survives depends on what the transform preserves.
+# `tests/test_transform.py::test_carried_cache_matches_recomputation` checks each set against
+# recomputation on both a closed and an open fixture, and fails if a key is added here that
+# recomputation would disagree with.
 #
 # Each set is what is carried **verbatim**. A quantity that survives only up to a factor (areas
 # under a scale) is dropped rather than rescaled, so "carried" always means "bit-identical to
@@ -73,8 +71,7 @@ _TOPOLOGY_KEYS: frozenset[str] = frozenset(
 
 # Dropped whenever face winding reverses, on top of whatever the metric class allows. Reversing a
 # face's corners renumbers halfedges and permutes every per-corner table, which is invisible on a
-# closed convex fixture and wrong on any mesh -- the last three were each measured failing only
-# after the closed-mesh check had passed them.
+# closed convex fixture and wrong in general.
 _ORIENTATION_DEPENDENT_KEYS: frozenset[str] = frozenset(
     {
         "edges",  # each face's three rows reverse direction and permute
@@ -97,14 +94,13 @@ _AFFINE_CARRY: frozenset[str] = _TOPOLOGY_KEYS | frozenset(
     {"nondegenerate_faces", "is_watertight", "is_self_intersecting", "is_volume"}
 )
 
-# `face_adjacency_convex` is in no set, and it is the sharpest illustration of why these are
-# measured. Convexity of a face pair *is* preserved by every invertible affine map, and the
-# quantity it thresholds -- `face_adjacency_projections` -- carries through an isometry at
-# 5.1e-06. The **boolean** does not: on a mesh with coplanar neighbours the projection is exactly
-# zero, so the ~1e-7 a rotation perturbs it by crosses the threshold and flips the answer.
-# Measured on `cave_cube`, whose box faces are coplanar by construction; invisible on every curved
-# fixture, where the probe read 0.0 at all five classes. A thresholded quantity is not carryable
-# just because the quantity is.
+# `face_adjacency_convex` is in no set. Convexity of a face pair *is* preserved by every
+# invertible affine map, and the quantity it thresholds -- `face_adjacency_projections` --
+# carries through an isometry closely. The **boolean** does not: on a mesh with coplanar
+# neighbours the projection is exactly zero, so the tiny perturbation a rotation introduces
+# crosses the threshold and flips the answer. Visible on `cave_cube`, whose box faces are coplanar
+# by construction; invisible on any curved mesh. A thresholded quantity is not carryable just
+# because the quantity is.
 
 # Adds the angle functions. A similarity preserves angles, so it preserves cotangent weights --
 # which is why the heaviest object here, the assembled `cotmatrix`, survives a scale.
@@ -118,14 +114,13 @@ _ISOMETRY_CARRY: frozenset[str] = _SIMILARITY_CARRY | frozenset(
 )
 
 # `face_adjacency_projections` is in no set either, and not because it fails to survive an
-# isometry -- measured, it carries at 5.1e-06. It is dropped so it cannot contradict
-# `face_adjacency_convex`, which is exactly `projections <= TOLERANCE_MERGE` (measured: zero
-# disagreements, before and after a rotation) and is *not* carryable for the threshold reason
-# above. Carrying one while recomputing the other lets a transformed mesh report a projection
-# next to a `convex` that disagrees with it, on precisely the coplanar meshes where the threshold
-# is fragile: one rotation of `cave_cube` leaves two pairs at 1.9e-09 and 6.5e-09, inside a 1e-8
-# band. The pair is cheap -- one kernel over the adjacency rows -- so recomputing both keeps them
-# consistent for less than the bug is worth.
+# isometry -- it carries through cleanly. It is dropped so it cannot contradict
+# `face_adjacency_convex`, which is exactly `projections <= TOLERANCE_MERGE` and is *not*
+# carryable for the threshold reason above. Carrying one while recomputing the other lets a
+# transformed mesh report a projection next to a `convex` that disagrees with it, on precisely the
+# coplanar meshes where the threshold is fragile: one rotation of `cave_cube` leaves pairs within
+# nanometres of the `1e-8` threshold band. The pair is cheap -- one kernel over the adjacency
+# rows -- so recomputing both keeps them consistent for less than the bug is worth.
 
 # The mass properties -- `volume`, `center_mass`, `moment_inertia` -- are in **no** set, and the
 # reason is not the obvious one. Each is an integral over the tetrahedra from the origin to every
@@ -152,16 +147,14 @@ _TRANSLATION_CARRY: frozenset[str] = _ISOMETRY_CARRY | frozenset(
 )
 
 # What survives reversing every face's winding with the positions untouched --
-# [`Trimesh.invert`][triwarp.mesh.Trimesh.invert]. Measured the same way as the transform strata,
-# on a closed and an open fixture, and enumerated positively rather than by subtraction so a new
-# cached property is *not* carried until someone classifies it.
+# [`Trimesh.invert`][triwarp.mesh.Trimesh.invert]. Enumerated positively rather than by
+# subtraction so a new cached property is *not* carried until someone classifies it.
 #
 # Three groups are absent and each for its own reason. The orientation-dependent tables go for the
 # reason `_ORIENTATION_DEPENDENT_KEYS` lists. `face_normals`, `vertex_normals` and the mass
-# properties **negate** rather than surviving (measured to 1.2e-07 against the negated original),
-# so `invert` flips the two normal buffers itself and drops the rest. And everything derived from
-# a sign -- `is_volume`, `face_adjacency_convex`, `face_adjacency_projections`, the tangent frames
-# and both heat bundles -- goes with them.
+# properties **negate** rather than surviving, so `invert` flips the two normal buffers itself and
+# drops the rest. And everything derived from a sign -- `is_volume`, `face_adjacency_convex`,
+# `face_adjacency_projections`, the tangent frames and both heat bundles -- goes with them.
 _INVERT_CARRY: frozenset[str] = frozenset(
     {
         # positions are untouched, so every quantity of the point set itself survives
@@ -283,18 +276,8 @@ class Trimesh:
     operators at the bottom of the class (`cotmatrix` through `vector_heat_operators`) are the
     heaviest of these and the reason a solver run over one mesh should go through a `Trimesh`.
 
-    Measured on ``icosphere(5)`` (10 242 vertices) on an RTX 5090, interleaved, with the cache
-    built *inside* the timed callable so the first-use cost is paid in every row:
-
-    | workflow | raw | cached | |
-    |---|---|---|---|
-    | `heat_geodesic` from 5 source sets | 60.0 ms | 47.3 ms | 1.27x |
-    | `filter_laplacian`, 3 calls | 4.18 ms | 3.11 ms | 1.35x |
-    | `vertex_tangent_frames`, 4 calls | 3.74 ms | 1.14 ms | 3.30x |
-
-    The gain is the assembly's share of the call, so it grows with how often the mesh is reused and
-    shrinks where the *solve* dominates -- which is why the heat row is the smallest of the three
-    despite caching the most expensive object here.
+    Caching pays off most when the same mesh is reused across many calls, and least where a single
+    solve dominates the cost of any one call.
 
     Parameters
     ----------
@@ -408,7 +391,7 @@ class Trimesh:
         ------
         ValueError
             If the mesh has zero faces — building a ``warp.Mesh`` with an empty BVH silently
-            corrupts CUDA state through Warp 1.17.
+            corrupts CUDA state.
 
         See Also
         --------
@@ -853,8 +836,7 @@ class Trimesh:
             edges_sorted=self.edges_sorted,
             return_edges=True,
             # The mesh knows its own vertex count, so the row-hash radix never has to be inferred
-            # -- that inference is a device reduction ending in a host readback (1.25-1.74x on the
-            # whole call, measured in benchmarks/test_adjacency.py).
+            # from a device reduction ending in a host readback.
             n_vertices=int(self._vertices.shape[0]),
         )
         self._cache.setdefault("face_adjacency_edges", adjacency_edges)
@@ -1568,23 +1550,10 @@ class Trimesh:
         [`vertex_one_rings`][triwarp.mesh.Trimesh.vertex_one_rings], the directed edge tables and
         the per-corner tables among them.
 
-        Measured on an RTX 5090, interleaved, against transforming the buffers and rebuilding a
-        `Trimesh` around them -- the cost of a *warm* mesh moving and being used again:
-
-        | workflow | rebuilt | carried | |
-        |---|---|---|---|
-        | rigid, then the three operators (2 562 v) | 0.878 ms | 0.407 ms | 2.16x |
-        | the same at 40 962 v | 1.022 ms | 0.363 ms | 2.81x |
-        | translation, then `heat_operators` (2 562 v) | 3.307 ms | 0.238 ms | 13.9x |
-        | the same at 40 962 v | 3.346 ms | 0.230 ms | 14.6x |
-
-        (the three operators being `cotmatrix`, `face_angles` and `vertex_normals`)
-
-        Both sides are **launch-bound** at these sizes -- the numbers barely move over a 16x
-        vertex count -- so read the ratio as a count of launches skipped rather than as work that
-        grows with the mesh. That also sets where this is worth reaching for: a mesh transformed
-        once and used once saves a fraction of a millisecond, and a mesh carried through a
-        sequence of poses saves the whole assembly each time.
+        Carrying the cache forward is cheaper than transforming the buffers and rebuilding a
+        `Trimesh` around them whenever the mesh is reused for further queries: the saving is a
+        count of assembly launches skipped, so it is worth reaching for on a mesh carried through
+        a sequence of poses, and worth little on a mesh transformed once and used once.
 
         Parameters
         ----------
@@ -1745,12 +1714,9 @@ class Trimesh:
         rather than dropped, which is exact and saves rebuilding `vertex_normals` from the
         `face_angles` this drops.
 
-        Measured on an RTX 5090, interleaved, against reversing the buffer and rebuilding a
-        `Trimesh` around it, then reading `cotmatrix`, `face_areas` and `vertex_normals`:
-        **5.53x** at 2 562 vertices (0.767 -> 0.139 ms) and **6.28x** at 40 962 (0.910 -> 0.145).
-        Launch-bound at both, like [`transform`][triwarp.mesh.Trimesh.transform]'s rows, and about
-        twice that method's rigid-motion ratio for the reason above -- nothing moves, so nothing
-        has to be rotated either.
+        Cheaper than reversing the buffer and rebuilding a `Trimesh` around it: nothing here has to
+        be rotated or reassembled, since positions do not move -- only the two normal buffers are
+        touched, and by negation rather than recomputation.
 
         Returns
         -------

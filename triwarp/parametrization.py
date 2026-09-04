@@ -236,37 +236,11 @@ def harmonic(
     -----
     Matches ``igl::harmonic``, ``k`` included.
 
-    !!! note "An iterative solve against a direct factorization; it stays 1.2-2.2x behind"
-        Measured against ``igl`` on the benchmark's ``patch`` and ``quality`` axes: 254 ms against
-        128 at ``saddle`` with ``k=2``, 59 against 28 at ``saddle_small`` with ``k=2``, 83 against
-        38 for the conditioning row, and ``lscm`` 29 against 24. That gap is **CG iteration count**,
-        and it is not assembly: the assembly was rebuilt to emit CSR directly and won 2.4-9.8x on
-        the rows where assembly *was* the cost, while measuring **flat** on exactly these (254 vs
-        257 ms at ``k=2``) — the ``k=2`` biharmonic operator has ~5x the ``nnz`` and squares the
-        condition number, so the solve dominates and always did. Every factorizing reference is flat
-        along the triangle-quality axis for the same reason, which is the other side of the same
-        observation.
-
-        So this is a **deliberate trade, not an open defect**: triwarp pays on the solve and wins
-        ~13x on setup, because it factors nothing.
-        **Do not re-open this as an assembly problem; that has now measured flat three times.**
-
-        Part of the rest has since been closed, at ``k >= 2`` only. The V-cycle
-        [`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner] builds is worth
-        **1.42x / 2.92x / 2.75x** on ``saddle_small`` / ``saddle`` / ``hemisphere`` at ``k = 2``,
-        because squaring the operator squares its condition number and that is what a hierarchy is
-        for. At ``k = 1`` it is worth nothing (0.97-1.00x) and on a large well-conditioned Laplacian
-        it is an outright **0.41x**, so the switch is on ``k``. ``lscm`` and ``tutte`` measured
-        0.58-1.01x and keep Jacobi; ``linalg.CG_MULTIGRID_SIZE_FLOOR`` carries that table.
-        [`heat_geodesic`][triwarp.heat.heat_geodesic] reaches the same conclusion from its
-        own measurements.
-
-        The numbers above predate the batched conjugate gradient moving in-house: an *iteration* is
-        now **1.42-1.50x** cheaper on these systems, which took ``saddle`` ``k=2`` from 257 to 181
-        ms and the conditioning row from 73 to 49, without touching the iteration count. What that
-        did **not** change is the paragraph above it — the remaining gap is still iteration count
-        against a factorization, and still a preconditioner question. See "Whose conjugate
-        gradient" in [`triwarp.linalg`][triwarp.linalg].
+    The interior system is solved iteratively (conjugate gradient) rather than by direct
+    factorization, with an automatic multigrid preconditioner
+    ([`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner]) engaged for ``k >= 2``,
+    since squaring the operator squares its condition number. For ``k == 1`` a simple Jacobi
+    preconditioner is used instead.
     """
     if k < 1:
         raise ValueError(f"harmonic power k must be >= 1, got {k}.")
@@ -378,14 +352,11 @@ def _solve_fixed_boundary(
         n_vertices, boundary_indices, boundary_uv, device
     )
 
-    # ``k >= 2`` squares the Laplacian's condition number, and that is the one thing on this side of
-    # the package worth a multigrid hierarchy. Routed through ``"auto"`` rather than forced, so the
-    # gate's own size floor still declines a system too small to repay a setup -- measured
-    # **1.52x / 2.90x / 2.73x** on ``saddle_small`` / ``saddle`` / ``hemisphere`` at ``k = 2``,
-    # against **0.97x / 0.41x / 0.97x** at ``k = 1``, which is why the switch is on ``k`` and not on
-    # the gate alone. ``linalg.CG_MULTIGRID_SIZE_FLOOR`` carries the operator-class table behind
-    # that; the short version is that a plain Laplacian's rows nearly sum to zero and a large one of
-    # those wants iterations, not levels.
+    # ``k >= 2`` squares the Laplacian's condition number, which is what makes a multigrid
+    # hierarchy worth building. Routed through ``"auto"`` rather than forced, so the gate's own
+    # size floor can still decline a system too small to repay the setup cost; the switch is on
+    # ``k`` rather than on the gate alone because a plain (``k == 1``) Laplacian's rows nearly sum
+    # to zero and wants iterations, not levels.
     sol, free_map, _ = twl.min_quad_with_fixed(
         q,
         fixed_mask,
@@ -492,22 +463,10 @@ def arap(
     **Why ``tolerance`` defaults to ``1e-7`` and not ``1e-8``.** Unlike
     [`harmonic`][triwarp.parametrization.harmonic] or [`lscm`][triwarp.parametrization.lscm], whose
     single solve *is* the answer, ARAP's global solves are inner steps of a truncated outer
-    iteration: solving one more accurately than the outer iteration's own truncation error is wasted
-    work. Measured on an RTX 5090 at ``max_iterations=10``, against the same run at ``1e-8``:
-
-    | mesh | vertices | speedup | max UV change | one more outer iteration changes |
-    |---|---|---|---|---|
-    | saddle patch | 4.6k | -13 % | 7.7e-07 | 6.3e-06 |
-    | saddle patch | 17.7k | -18 % | 1.4e-06 | 5.8e-06 |
-    | bunny (decimated) | 8.2k | -29 % | 1.1e-05 | 5.8e-05 |
-    | bunny | 35.9k | -32 % | 1.3e-05 | 8.9e-06 |
-
-    On every mesh the error the looser tolerance introduces is at or below the error the caller
-    already accepts by stopping at ``max_iterations``, and agreement with ``igl.arap_solve`` stays
-    at ``5e-07`` or better (the regression tests compare at ``1e-4``). Pass ``tolerance=1e-8`` to
-    restore the previous behaviour. Going further to ``1e-6`` is roughly twice as fast again
-    (-25 % to -55 %) but lets the inner error reach ``1.3e-04``, above the outer truncation error on
-    the largest mesh, so it is not the default.
+    iteration, so solving more accurately than the outer iteration's own truncation error wastes
+    work without changing the result. Pass ``tolerance=1e-8`` for stricter per-iteration solves;
+    going looser than the default risks the inner error exceeding the outer truncation error on
+    large meshes, which is why ``1e-7`` rather than something looser is the default.
     """
     if max_iterations < 1:
         raise ValueError(f"arap max_iterations must be >= 1, got {max_iterations}.")
@@ -646,11 +605,8 @@ def _scatter_constraints(
     fixed_values = wp.zeros((2, n_vertices), dtype=wp.float64, device=device)
     n_fixed = int(indices.shape[0])
     if n_fixed > 0:
-        # Two independent per-pin scatters into different buffers, so they fuse trivially into one
-        # launch. Declined on the share: ``n_fixed`` is 2 for ``lscm`` and a boundary loop for the
-        # fixed-boundary solvers, and one ``scatter_boundary_mask`` launch is 11.45 / 14.72 us
-        # against an ``lscm`` call of 15.27 / 81.05 ms on a 40x40 / 120x120 grid -- **0.07 %
-        # falling to 0.02 %**, the smallest share of any fusion candidate in the package.
+        # Two independent per-pin scatters into different buffers. Kept as separate launches rather
+        # than fused into one, since the cost is negligible against the rest of the call.
         wp.launch(
             kernel_parametrization.scatter_boundary_mask,
             dim=n_fixed,

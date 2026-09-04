@@ -405,16 +405,14 @@ def fill_min_weight(
     ragged buffer, so the launch count is ``max(B) - 1`` for the whole mesh rather than ``B - 1``
     per hole, and the chord test, the plane normals and the min-area fallback decision are likewise
     one pass each. Only the ``O(B)`` traceback is host-side, over a single predecessor buffer. A
-    mesh with many small holes therefore costs about what one hole costs; before this was batched,
-    512 three-vertex holes ran to 376 ms, of which ~100 % was per-hole overhead.
+    mesh with many small holes therefore costs about what one hole costs.
 
     Each span launch puts a **block** on every interval rather than a thread, with the block's lanes
-    striding the apex loop and a two-stage tile reduction picking the winner. That is where the
-    parallelism is: the interval grid is only ``n_loops * (max(B) - span)`` wide, so a mesh with a
-    couple of long rims had a few hundred threads carrying the whole cubic term. Worth **4.8-7.6x on
-    two 512-vertex rims and 3.0x on 512 three-vertex ones**, at a byte-identical triangulation — the
-    reduction reproduces the DP's smallest-apex tie-break exactly, which it has to, because the tie
-    decides the triangles (see ``kernels/holes.py::fill_dp_span_tiled``).
+    striding the apex loop and a two-stage tile reduction picking the winner: the interval grid is
+    only ``n_loops * (max(B) - span)`` wide, so a mesh with a couple of long rims would otherwise
+    have only a few hundred threads carrying the whole cubic term. The reduction reproduces the DP's
+    smallest-apex tie-break exactly, which it has to, because the tie decides the triangles (see
+    ``kernels/holes.py::fill_dp_span_tiled``).
 
     Parameters
     ----------
@@ -628,19 +626,12 @@ def _fill_packed_loops(
             inputs=[loops.sizes, loops.dp_offsets, dp, retry],
             device=device,
         )
-        # ...but *whether* any loop failed is worth one host read of ``n_loops`` int32s, because a
-        # pass with an all-zero mask is still a full ``max(B) - 1`` launch sweep -- 510 launches on
-        # ``rim_short`` -- in which every thread returns immediately. Measured back to back:
-        # 155.6 -> 152.5 ms on ``rim_short`` and 4.16 -> 4.03 on ``holes_many``, so about 3 ms and
-        # 3 %. That is the *marshalling* of an empty sweep and nothing else; do not expect more from
-        # it. In particular the ~33 ms gap between the ``plane_normalized`` default and a single
-        # ``min_area`` pass is **not** this pass -- it is ``plane_normalized``'s own per-span kernel
-        # doing more work (plane normals, dihedral terms) than ``min_area``'s. ``prev`` is read back
-        # a few lines below regardless, so this adds no synchronisation point that was not there.
-        # The test itself is a device reduction rather than a full readback of the ``n_loops``
-        # buffer (CLAUDE.md section 13) -- 4 bytes back instead of 36 KB on ``dragon``'s 8 978
-        # loops. That is a consistency fix, not a speed one: the readback it replaces is noise
-        # against a 150 ms call, and no benchmark move should be attributed to it.
+        # ...but *whether* any loop failed is worth one host read, because a pass with an all-zero
+        # mask is still a full ``max(B) - 1`` launch sweep in which every thread returns
+        # immediately -- that is pure marshalling and buys nothing on its own. ``prev`` is read
+        # back a few lines below regardless, so this adds no synchronisation point that was not
+        # there. The test itself is a device reduction rather than a full readback of the
+        # ``n_loops`` buffer, so it stays cheap even on a mesh with many loops.
         if tw.reduce.max(retry) > 0:
             _run_hole_dp(
                 loops,
@@ -717,61 +708,14 @@ def _run_hole_dp(
     Fill the ragged ``dp`` / ``prev`` tables for every loop flagged in ``active``, in place.
 
     One launch per triangulation span **across all loops**, so the launch count is
-    ``max(B) - 1`` for the whole mesh rather than ``B - 1`` per hole.
-
-    **That launch count is the floor on this stack, and it is what the sweep is bound by.**
-    Re-attributed on Warp 1.17 by replaying the identical launch at ``dim=(1, 1)``, so the residual
-    is marshalling and nothing else: the floor is a flat **16.4-18.6 us per launch** and it accounts
-    for **37 % / 61 / 74 / 52** of the whole sweep at one rim of ``B`` = 128 / 256 / 512 / 1024
-    (5.610 / 7.305 / 12.893 / 32.675 ms). Apex throughput over the same range is 0.06 / 0.38 / 1.73
-    / 5.48 G evaluations a second -- three orders below what the arithmetic would run at -- so the
-    device is idle waiting for launches until the rim is very long indeed. The earlier reading that
-    this sweep is "device-bound at a large rim" holds only past ``B`` ~ 1 000, which no benchmarked
-    rim reaches (the longest are 512 on ``rim_short`` and 590 on ``dragon``).
-
-    The consequence is that the remaining levers are *fewer* launches or *cheaper* ones, and a
-    replayed graph launch costs ~1.17 us against this 17 -- which is why a captured sweep is the
-    obvious lever and why it still loses: recording costs about what launching costs, so
-    record-and-replay-**once** is round 6's measured 0.84x, and this loop runs once per call. A
-    graph reused across calls would need the same ``dp`` / ``prev`` pointers and the same rim-size
-    vector, which is a cache that mostly misses in real use. The other lever is algorithmic: a
-    *blocked* interval DP, tiling the ``(i, j)`` plane into ``T x T`` tiles so the tile-level DAG
-    keeps this shape at ``1/T`` the span count, cutting ~511 launches to ~16 at ``T = 32``.
-    That is a new kernel with in-tile sequencing, not a knob, and it is unbuilt.
-
-    **Pick the caller before building it: this sweep is the call for ``fill_min_weight`` and a
-    tenth of it for ``refill_region``.** Measured stage by stage on ``fix_self_intersections``'s
-    own benchmark inputs, this sweep is **4.0 %** of the call at 8 192 faces (4 rims of 64) and
-    **10.2 %** at 163 840 (4-6 rims, longest 327) -- the refiner and the two smoothers are 64-72 %
-    between them. So a blocked DP -- and equally an *approximate* one that caps each cell's apex
-    scan at a constant past some chain length, trading the exact minimum for an ``O(B^2 * c)`` sweep
-    -- is capped at that tenth for the repair path however well it works.
-
-    **And the long-rim fill groups, the obvious place to spend it instead, have no loss to close.**
-    The only reference running this same algorithm is the one the parity test uses as the DP's
-    oracle; the other rows in ``benchmarks/test_holes.py::test_fill_min_weight`` do a topological
-    fill and say so. Against that oracle triwarp is **5.0x ahead** on ``rim_short``'s two 512-edge
-    rims (14.88 ms against 74.47) and **2.1x** on ``holes_many`` (4.86 against 10.17), and
-    ``stitch_min_weight`` is ahead too (23.21 against 27.74). So this launch floor is real and is
-    still not anybody's bottleneck: build the blocked DP when a row appears that it would flip, not
-    for the floor's own sake. Where ``fill_smooth[rim_short]`` *does* lose (74.69 against 41.59),
-    the DP is 13.85 ms of it and the refinement and smoothing are the other 61 -- the same split
-    ``fix_self_intersections`` shows. CLAUDE.md section 16.6 carries both tables.
-
-    **Folding the spans into one persistent block per loop was built and is refuted.** A
-    ``wp.launch_tiled(dim=(n_loops,))`` kernel that loops over the spans internally --
-    lanes striding the ``(interval, apex)`` pairs, ``wp.atomic_min`` on the cost, a second pass for
-    the smallest attaining apex, ``wp.tile_sum`` as the level barrier -- looked like the obvious
-    lever. It reproduces this engine's ``dp`` / ``prev`` **byte for byte** and loses at every size
-    that matters, measured under ``fill_min_weight`` on two rims of ``B`` (RTX 5090, Warp 1.16,
-    interleaved, ``min`` of 3): ``B = 128`` 5.13 -> 5.75 ms (0.89x), ``B = 512`` 12.93 -> **106.8**
-    (0.12x), ``B = 2048`` 124.4 -> **4 914** (0.03x). The barriers are ~1.5 ms of the 107; the rest
-    is the ``B^3 / 6`` apex evaluations (22 M at ``B = 512``) running on **one SM** of ~170, where
-    510 launches at the floor still spread them over the whole device. Beating both needs
-    whole-GPU work between cheap level barriers -- a grid-wide barrier, which Warp does not expose
-    (no cooperative groups, no fence). Do not re-propose "one block per loop"; the remaining levers
-    are a different algorithm for long rims or a captured graph where an identical span sequence
-    genuinely repeats.
+    ``max(B) - 1`` for the whole mesh rather than ``B - 1`` per hole. The launch count is the
+    floor on this engine: a *blocked* interval DP that tiled the ``(i, j)`` plane could cut it
+    further, but that is a new kernel with in-tile sequencing rather than a knob, and it is
+    unbuilt. Folding the spans into one persistent block per loop -- lanes striding the
+    ``(interval, apex)`` pairs, a tile reduction as the level barrier -- was tried and loses,
+    because the cubic apex-evaluation work then runs on a single SM instead of being spread across
+    one block per span by the whole device; beating both needs a grid-wide barrier, which Warp
+    does not expose.
 
     ``tiled`` selects the per-span engine: a block per interval with its lanes striding the apex
     loop, or one thread per interval. Both produce byte-identical ``dp`` / ``prev`` on **both**
@@ -783,8 +727,8 @@ def _run_hole_dp(
     That portability rests on ``fill_dp_span_tiled`` striding by ``wp.block_dim()`` rather than by
     the ``HOLE_DP_BLOCK`` it is launched with: the two agree on CUDA, and on CPU the former reads 1,
     so the single lane covers every apex and the tile reductions after it degenerate to one-element
-    tiles holding that lane's own answer. With the constant it silently minimized over every 32nd
-    apex instead; see the kernel's comment for the measurement.
+    tiles holding that lane's own answer. With the constant it would silently minimize over every
+    32nd apex instead.
     """
     device = loops.device
     if tiled is None:
@@ -800,8 +744,7 @@ def _run_hole_dp(
         device=device,
     )
     # Built once, outside the loop: every field is invariant across spans, and a wp.launch argument
-    # costs ~1 us of host time whatever it holds. Rebuilding it per span would cost ~2.6 us and give
-    # the saving straight back.
+    # costs host time whatever it holds. Rebuilding it per span would give the saving straight back.
     tables = kernel_holes.HoleFillTables()
     tables.loop_pos = loop_pos
     tables.loop_starts = loops.starts
@@ -1009,11 +952,9 @@ def fill_smooth(
         patch edges longer than ``max_edge``; ``"density"`` splits patch triangles at their centroid
         while their sampling is coarser than the surrounding mesh's, which is Liepa's criterion and
         what the reference hole fillers do. The two differ only on a **graded** neighbourhood, where
-        a single target length cannot be right at both ends of the grading: measured on a patch
-        whose surroundings vary 8x in edge length, the ratio of patch triangle size to local
-        surrounding scale spreads **1.90x** under ``"density"`` against **3.58x** under
-        ``"max_edge"``, and its mean sits at 1.09 rather than 0.59. ``max_edge`` and
-        ``max_edge_splits`` are ignored under ``"density"``.
+        a single target length cannot be right at both ends of the grading: ``"density"`` keeps the
+        patch triangle size closer to the local surrounding scale there than a single ``max_edge``
+        target can. ``max_edge`` and ``max_edge_splits`` are ignored under ``"density"``.
     return_patch
         When ``True``, also return a length-``n_out_faces`` ``wp.bool`` mask of the patch faces.
 
@@ -1526,12 +1467,12 @@ def fillable_loop_mask(
         return wp.empty(0, dtype=wp.bool, device=device)
 
     # ``vertices`` is the domain, so its length is the bound ``index_bound`` would go to the
-    # device to re-derive -- 0.096 ms, flat in the mesh, so 8 % of a 1.12 ms call on ``bunny``.
-    # An unreferenced vertex only widens the two tables below, which are indexed by vertex id.
+    # device to re-derive. An unreferenced vertex only widens the two tables below, which are
+    # indexed by vertex id.
     n_vertices = int(vertices.shape[0])
     # **One** readback for all the loops, not one each: they are concatenated on the device first,
-    # and the sizes are already on the host. A scan mesh carries dozens of rims, so the per-loop
-    # spelling cost a sync apiece and was measured at 16x behind the reference before this.
+    # and the sizes are already on the host. A scan mesh carries dozens of rims, so a per-loop
+    # readback would cost a sync apiece.
     #
     # A readback at all because the position table cannot be built on the device: a pinched loop
     # wants two entries for one vertex, and the pinch is what disqualifies it. Its size is bounded
@@ -1903,10 +1844,8 @@ def stitch_loops(
     **This is the fast one, and that is the reason to keep it.** It is metric-free and makes one
     O(N·M) pass, where
     [`stitch_loops_min_weight`][triwarp.holes.stitch_loops_min_weight] fills the same size table
-    with ``N + M`` sequential launches along the anti-diagonals. Measured on two facing cylinder
-    rims (RTX 5090, min of 5), the DP costs **5.0x** at a 100-vertex rim, **7.7x** at 1 000 and
-    **8.9x** at 4 000; on CPU, 5.2x / 7.5x / 7.2x. The gap widens with rim size, so the DP is never
-    the cheaper option -- prefer it for the seam it produces, not for speed.
+    with ``N + M`` sequential launches along the anti-diagonals, and that gap widens with rim size.
+    The DP is never the cheaper option -- prefer it for the seam it produces, not for speed.
     """
     device = faces_a.device
     n = int(loop_a.shape[0])
@@ -2175,11 +2114,9 @@ def stitch_loops_min_weight(
 
     # Reverse loop A so the two rims wind oppositely (facing), then align both at the closest pair.
     # ``la`` / ``lb`` stay on the host for the sequential band traceback, but the closest-pair
-    # search, rim gathers and rim-opposite lookups all run on device.
-    # Measured, and deliberately left alone: this preamble (two readbacks, the closest-pair gather,
-    # the host roll and two more uploads) is 5.0% of the call at a 100-vertex rim on CUDA and falls
-    # to 0.7% at 1 000 and 0.4% at 4 000 -- the anti-diagonal DP below dominates and grows faster.
-    # Folding the roll into ``cyclic_gather`` would buy a shrinking fraction of a noise floor.
+    # search, rim gathers and rim-opposite lookups all run on device. This preamble (two readbacks,
+    # the closest-pair gather, the host roll and two more uploads) is a fixed cost that the
+    # anti-diagonal DP below dominates and outgrows as the rims lengthen.
     la = loop_a.numpy()[::-1].copy()
     lb = loop_b.numpy().copy()
     a_rim = tw.array.gather(vertices_a, wp.array(la, dtype=wp.int32, device=device))
@@ -2206,15 +2143,8 @@ def stitch_loops_min_weight(
     wp.launch(kernel_holes.set_dp_origin, dim=1, inputs=[dp], device=device)
     came = twt.as_array2d(wp.full((n_a + 1, n_b + 1), -1, dtype=wp.int32, device=device), wp.int32)
     # Built once, outside the loop: the ten values below are the same on every one of the
-    # ``n_a + n_b`` launches, and a wp.launch argument costs ~1.0 us of host time linearly on both
-    # devices. Measured on an RTX 5090, the two spellings of this loop interleaved in one process
-    # over the same tables, 12 reps, gated on the emitted ``came`` traceback being identical:
-    # **1.88x/1.89x** at 100 x 100 (200 launches), **1.87x/1.89x** at 200 x 200 (400) and
-    # **1.90x/1.90x** at 512 x 512 (1 024). Flat in the rim size, as the model predicts -- the
-    # saving works out at ~16 us per launch for nine dropped arguments, i.e. ~1.8 us each against
-    # the ~1.0 us the linear model predicts -- the same over-delivery ``HoleFillTables`` measured
-    # (9.5-11.9 us against a 12 us prediction is the other direction; this kernel's arguments are
-    # six `wp.array` handles rather than scalars). Treat ~1.0 us/argument as the floor it is.
+    # ``n_a + n_b`` launches, and a wp.launch argument costs host time linearly on both devices, so
+    # bundling them once here rather than passing all ten on every launch is a real saving.
     tables = kernel_holes.StitchTables()
     tables.a_pos = a_pos
     tables.b_pos = b_pos
@@ -2253,14 +2183,10 @@ def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tu
     ``numpy.argmin`` on the flattened matrix.
 
     ``kernels/holes.reduce_closest_cross_label_pair`` answers the same question in **one** kernel
-    with no matrix at all, by reducing a ``pack_nearest_key`` atomic over labelled members, and
-    routing this through it was measured and **declined**. Its caller's own preamble comment carries
-    the number: the whole preamble -- two readbacks, this search, the host roll and two uploads --
-    is 5.0 % of ``stitch_loops_min_weight`` at a 100-vertex rim and 0.7 % at 1 000, of which this is
-    a fraction. The two are also not one function wearing two hats: that kernel takes members and
-    labels over a shared vertex buffer, this takes two separate position arrays, and the three
-    launches here reuse ``row_argmin`` / ``global_argmin``, which the caller needs anyway for its
-    *perimeter* objective. See ``global_argmin`` for the same decline measured from the other side.
+    with no matrix at all, by reducing a ``pack_nearest_key`` atomic over labelled members, but the
+    two are not one function wearing two hats: that kernel takes members and labels over a shared
+    vertex buffer, this takes two separate position arrays, and the three launches here reuse
+    ``row_argmin`` / ``global_argmin``, which the caller needs anyway for its *perimeter* objective.
     """
     device = a_pos.device
     n_a = int(a_pos.shape[0])
@@ -2730,7 +2656,7 @@ def _closest_cross_component_edges(
     of that table is already a boundary edge wound the way its face winds it, i.e. exactly what
     [`bridge_edges`][triwarp.holes.bridge_edges] takes, so the winning slots name their own edges.
     The column is materialized with ``wp.clone`` because a column view is strided and Warp's
-    Python-scope gather silently ignores an index array's stride (CLAUDE.md section 4).
+    Python-scope gather silently ignores an index array's stride.
 
     Only three scalars come back: the packed winner key and the two rows it names. The boundary
     table itself never leaves the device.
@@ -2881,22 +2807,6 @@ def _mean_rim_edge_length(
     [`triwarp.holes.stitch_smooth`][triwarp.holes.stitch_smooth] holds its two rims
     individually; it is packed here rather than at that call site so the private surface stays one
     name wide.
-
-    It used to read back the whole vertex buffer plus one array per loop and take the norms on the
-    host. Measured back-to-back, punching a hole every 97th face: on ``bunny`` 32.0 ms -> 0.13 ms
-    (253x) on CUDA and 8.3 -> 0.07 (111x) on CPU; on ``dragon``'s 8 978 loops, 427 ms -> 0.22 ms
-    (1 941x). End to end that is 1.13-1.30x of ``fill_smooth``, whose cubic DP dominates.
-
-    **The axis is the loop count, not the vertex buffer**, which the measurement said and the
-    obvious reading did not: on CPU the old form ran 0.09 ms flat from 8 k to 438 k vertices, so
-    ``vertices.numpy()`` there is a view and the "whole vertex buffer copy" it looked like never
-    existed -- what cost 427 ms on ``dragon`` was iterating 8 978 loops in Python, one ``.numpy()``
-    per loop. So this is deliberately **not** faster everywhere: at
-    [`stitch_smooth`][triwarp.holes.stitch_smooth]'s two rims it is a measured *loss* -- 0.26 ->
-    0.34 ms (0.77x) on CUDA and 0.09 -> 0.24 (0.38x) on CPU, since ``_pack_loops`` plus a launch
-    plus a readback cannot beat two host fancy-indexes. That is ~0.15 ms against the 100+ ms
-    refine-and-smooth pass its only caller runs immediately afterwards, so a loop-count threshold
-    would buy 0.15 % of one path at the cost of a per-device tuning constant, and is not worth it.
     """
     packed = loops if isinstance(loops, _PackedLoops) else _pack_loops(loops)
     count = int(packed.sizes_np.sum())

@@ -52,27 +52,13 @@ from triwarp.kernels import reduce as kernel_reduce
 
 # Point count from which [`polyline_downsample`][triwarp.polyline.polyline_downsample] stops
 # walking its greedy selection serially and pointer-doubles it instead -- **on the CUDA device
-# only**; see below for why the CPU device never takes that branch.
+# only**. The doubling costs ``2 ceil(log2(n + 1)) + 1`` launches, which pays off once the polyline
+# is long enough that a serial walk's linear cost exceeds it; the two masks are verified
+# **byte-identical** at every size.
 #
-# The serial walk is ~60 ns a point and the doubling costs ``2 ceil(log2(n + 1)) + 1`` launches, so
-# this is where a linear cost crosses a nearly flat one. Measured on an RTX 5090, Warp 1.16,
-# interleaved, ``min`` of 15, with the two masks verified **byte-identical** at every row:
-#
-# |      n |  serial | doubling |       |
-# |--------|---------|----------|-------|
-# |    528 | 0.066ms |  0.354ms | 0.19x |
-# |  2 048 | 0.153   |  0.416   | 0.37x |
-# |  4 096 | 0.269   |  0.434   | 0.62x |
-# |  8 192 | 0.499   |  0.430   | 1.16x |
-# | 16 384 | 0.963   |  0.502   | 1.92x |
-# | 65 536 | 3.735   |  0.556   | 6.72x |
-#
-# **On the CPU device the doubling loses at every size, by 9x at 528 points and 30x at 65 536**
-# (0.266 ms serial against 8.105 ms), and that is not the CUDA-decides trade of CLAUDE.md section
-# 13 -- it is an algorithm that does ``n log n`` work where the serial form does ``n``, on a backend
-# that runs a launch grid as one serial loop. There is no GPU win being paid for, so the branch
-# takes the device too. Warp's CPU walk is also *faster than CUDA's* (0.266 against 3.735 ms at
-# 65 536), having no launch to issue and a cache-friendly stride.
+# On the CPU device the doubling loses at every size, because it does ``n log n`` work where the
+# serial form does ``n``, on a backend that runs a launch grid as one serial loop -- there is no GPU
+# win being paid for, so the branch takes the device too.
 _DOWNSAMPLE_DOUBLING_FROM = 8192
 
 
@@ -489,7 +475,7 @@ def cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     if n_segments <= 0:
         # No segment to sum: a single vertex is at arc length 0, an empty polyline has no entry.
         # The guard is required, not defensive -- ``polyline[:-1]`` below would be a zero-length
-        # slice, which Warp rejects outright (CLAUDE.md section 4).
+        # slice, which Warp rejects outright.
         return wp.zeros(max(int(polyline.shape[0]), 0), dtype=wp.float32, device=device)
 
     lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
@@ -631,66 +617,24 @@ def polyline_simplify(
     -----
     The round loop runs **on device**, driven by ``wp.capture_while`` exactly as
     [`polyline_triangulate`][triwarp.polyline.polyline_triangulate]'s ear rounds are, so the whole
-    simplification costs one graph launch and no readback at all. Measured interleaved on an RTX
-    5090 against the single-thread recursive kernel this replaces, with the accepted index set
-    asserted identical in every cell (median of 40, or 12 above 20 000 points):
-
-    | polyline | n | kept | recursive | level-synchronous | |
-    |---|---|---|---|---|---|
-    | ``rim_long`` | 65 536 | 14 249 | 80.47 ms | **1.11 ms** | **72x** |
-    | ``rim_long``, coarse ``tol`` | 65 536 | 1 025 | 53.22 | **0.90** | 59x |
-    | a 100-turn spiral | 4 096 | 3 856 | 27.64 | **2.69** | 10.3x |
-    | ``saddle`` | 528 | 528 | 0.60 | 0.57 | 1.05x |
-    | ``saddle_small`` | 268 | 268 | 0.40 | 0.56 | **0.72x** |
+    simplification costs one graph launch and no readback at all. The accepted index set is
+    identical to a single-thread recursive evaluation of the same recursion, since breadth-first and
+    depth-first evaluation accept the same points.
 
     **The depth is bounded by the accepted count, not by ``n``, and that is why there is no round
     cap and no serial fallback here.** Every root-to-leaf path of the split tree accepts one point
     per level, so ``rounds <= kept + 1`` -- a deep tree is precisely an input that accepts most of
-    its points, which is also the input the recursion does the most work on. Seven shapes were
-    constructed looking for an ``O(n)`` case and none was found: a spiral's depth tracks its *turn
-    count* rather than ``n`` (25 rounds at 10 turns, **204** at 100, both at ``n = 4096``, so 5.0 %
-    of ``n`` at worst), while a power curve, a geometric staircase and a decaying sawtooth are all
-    *shallower* than a boundary loop at 1-11 rounds. The deepest of them still wins 10.3x, because
-    the recursion's own cost grows on exactly the same axis. Do not read the spiral row as a
-    near-crossover.
+    its points, which is also the input the recursion does the most work on. A spiral's depth tracks
+    its *turn count* rather than ``n``, while a power curve, a geometric staircase and a decaying
+    sawtooth are all shallower than a boundary loop.
 
-    **The two smallest rows are a machinery floor, and a serial fallback for them is measured and
-    declined.** They were read once as measuring the level count; they do not. At ``n = 268`` the
-    whole call is flat at **0.427-0.473 ms** across tolerances spanning ``1e-3`` to ``1e3`` -- a
-    10^6 range that moves the accepted set from 65 points to 2 -- and flat again between 268 and
-    528 points. Decomposed at ``n = 268``, min of 60 on an RTX 5090:
-
-    | | ms | share |
-    |---|---|---|
-    | graph capture (recorded, replayed with the condition false) | 0.185 | 40 % |
-    | ``flatnonzero`` + ``gather`` on the keep mask | 0.166 | 36 % |
-    | allocations and the seed launch | ~0.07 | 15 % |
-    | **the split rounds themselves** | **~0.04** | **9 %** |
-
-    So three quarters of the row is machinery every implementation of this signature pays, and the
-    rounds -- the only part a different algorithm could change -- are a twentieth of it. The
-    benchmark's two operating points settle in **7 and 4** rounds, and 3 extra rounds cost 0.017 ms.
-
-    A serial fallback below a point count would therefore recover the capture alone, still pay the
-    0.166 ms tail and the allocations, and land near **0.24 ms** against the fastest CPU
-    reference's 0.14-0.25 -- so
-    it would not reliably win the row, and it would cost a second Ramer-Douglas-Peucker (a
-    stack-based single-thread kernel, since Warp forbids recursion) plus the test that its accepted
-    set matches this one's. Declined on those numbers rather than on the "one algorithm" preference
-    below.
-
-    Host-driving the loop instead of capturing it is declined by the same measurement and more
-    clearly: at the measured 90 us per host-issued round against 14 us replayed, 7 rounds is
-    0.630 ms host-driven against 0.283 captured, and the gap only widens with depth. The capture is
-    right at every operating point in the suite, including the smallest.
-
-    On **cpu** the change is a 3.7-5.6x loss on these boundary loops (``rim_long`` 5.90 -> 24.28 ms)
-    and 11x on the 100-turn spiral, because Warp's cpu backend runs a ``dim=n`` launch as one lane,
-    so a round costs ``4n`` sequential iterations whatever it settles -- against the recursion's
-    ``O(n log n)`` total, and the gap therefore widens with the depth rather than staying uniform.
-    The device is the target (``.claude/CLAUDE.md`` section 13) and the absolute cpu cost stays in
-    the tens of milliseconds, so this is recorded rather than branched on: one algorithm, one
-    accepted set, on both devices.
+    This is deliberately **one algorithm on both devices, with no serial fallback and no
+    host-driven loop for small inputs**: the fixed cost of graph capture, the keep-mask compaction
+    and the round loop itself all scale with the tree depth rather than with ``n``, so a size-gated
+    fallback would add a second implementation (and the test that its accepted set agrees with this
+    one's) without a reliable win. On the CPU backend a ``dim=n`` launch runs as a single lane, so
+    each round costs ``O(n)`` sequential work rather than the host's ``O(n log n)`` recursive total
+    -- the device is the target, so this is recorded rather than branched on.
 
     See Also
     --------
@@ -712,9 +656,7 @@ def polyline_simplify(
         span_argmax = wp.empty(n, dtype=wp.int32, device=device)
         squared_distances = wp.empty(n, dtype=wp.float32, device=device)
         # state = [levels run, loop condition], both written on device so the round loop needs no
-        # readback -- ``polyline_triangulate``'s ear rounds are driven the same way and measured a
-        # replayed conditional-graph iteration of a four-launch body at 14 us against 86-93 us for
-        # the same body issued from the host with its convergence readback.
+        # readback -- ``polyline_triangulate``'s ear rounds are driven the same way.
         state = wp.array([0, 1], dtype=wp.int32, device=device)  # see array.LOOP_ROUND
         squared_tolerance = wp.float32(tol * tol)
 
@@ -982,8 +924,7 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     ranked by a bijective hash of their ring index rather than by the index itself, which is what
     keeps that logarithmic: under the raw index an alternating star lets the ear at ``i - 2``
     suppress the ear at ``i`` for every ``i``, so one ear is clipped per round and the loop runs its
-    full ``n``-round cap — measured at 141 ms for a 1 024-point star, against 4.6 ms and 30 rounds
-    under the hash.
+    full ``n``-round cap, where the hash keeps the round count near ``log2(n)``.
 
     Parameters
     ----------
@@ -1002,29 +943,17 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     -----
     The round loop runs **on device**, driven by ``wp.capture_while`` over a device-side condition
     exactly as [`bfs`][triwarp.graph.bfs] drives its levels, so the whole clip costs one graph
-    launch and one readback (the final face count) rather than a readback per round. The reason is
-    worth recording because this docstring previously said the opposite: a *replayed*
-    conditional-graph iteration of a four-launch body costs **14 us** at 64 points (0.224 ms over
-    16 rounds, measured on an RTX 5090), against **86-93 us** for the same body launched from the
-    host with its convergence readback. The ~0.25 ms per iteration quoted elsewhere in this package
-    is the one-off cost of *capturing* the graph — measured at 0.104 ms here, independent of ``n``
-    — not of iterating it, so at one round the captured form is slower and it breaks even by round
-    three.
+    launch and one readback (the final face count) rather than a readback per round.
 
-    Measured on `benchmarks/test_polyline.py`'s ``triangulate_polygon`` group, back to back:
-    **2.07x** at a 64-point star (4.53 -> 2.19 ms) and **1.53x** at 1 024 (6.89 -> 4.51).
-
-    **The prologue is now fused.** It used to be the dominant fixed cost: three reductions
+    **The prologue is fused.** The plane frame
     ([`polyline_normal`][triwarp.polyline.polyline_normal], its internal
     [`polyline_close`][triwarp.polyline.polyline_close] closure test, and
-    [`polyline_centroid`][triwarp.polyline.polyline_centroid]) that each ended in a host readback
-    because each returned a Python-scope value the next one consumed. They are one accumulation
-    pass, one single-thread finalize and one projection, with the plane frame living in device
-    memory and never crossing to the host. Measured interleaved on an RTX 5090 (min of 40):
-    **1.06 -> 0.38 ms, 2.80x**, and — being fixed cost — the same 2.81x at 1 024 points. Only two
-    readbacks are left in the whole function, both structural: ``polyline_open``'s
-    [`is_closed`][triwarp.polyline.is_closed], which decides ``n`` and therefore every launch
-    dimension, and the reflex count that selects the convex fan fast path.
+    [`polyline_centroid`][triwarp.polyline.polyline_centroid]) is built as one accumulation pass,
+    one single-thread finalize and one projection, living in device memory and never crossing to
+    the host -- rather than as three separate host-scope reductions each ending in its own
+    readback. Only two readbacks are left in the whole function, both structural:
+    ``polyline_open``'s [`is_closed`][triwarp.polyline.is_closed], which decides ``n`` and
+    therefore every launch dimension, and the reflex count that selects the convex fan fast path.
 
     When conditional graph nodes are unavailable (CPU, or a CUDA driver below 12.4)
     ``wp.capture_while`` executes the same loop directly with one pinned 4-byte readback per round,

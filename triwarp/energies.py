@@ -96,10 +96,8 @@ def edge_length_loss(
 
     Notes
     -----
-    Matches ``pytorch3d.loss.mesh_edge_loss`` on a single mesh: measured 0.0899725929 against its
-    0.0899726003 at ``target_length = 0.0`` and 3.7334711e-04 against 3.7334702e-04 at 0.3, both
-    on ``icosphere(2)``'s 480 edges. Its per-mesh ``1 / E`` weighting collapses to a plain mean
-    for one mesh, which is triwarp's only case, so there is no batch weighting to port.
+    Matches ``pytorch3d.loss.mesh_edge_loss``. Its per-mesh ``1 / E`` weighting collapses to a
+    plain mean for one mesh, which is triwarp's only case, so there is no batch weighting to port.
     """
     lengths = edges_unique_length(vertices, faces)
     if int(lengths.shape[0]) == 0:
@@ -139,10 +137,9 @@ def normal_consistency_loss(vertices: wp.array[wp.vec3], faces: wp.array[wp.int3
 
     Notes
     -----
-    Matches ``pytorch3d.loss.mesh_normal_consistency`` on **edge-manifold** input: measured
-    0.0155946491 against its 0.0155946799 over ``icosphere(2)``'s 480 pairs. The restriction is
-    real and is not a tolerance -- the reference enumerates *every* pair of faces sharing an edge,
-    so an edge with ``k`` incident faces contributes ``C(k, 2)`` terms where
+    Matches ``pytorch3d.loss.mesh_normal_consistency`` on **edge-manifold** input. The restriction
+    is real and is not a tolerance -- the reference enumerates *every* pair of faces sharing an
+    edge, so an edge with ``k`` incident faces contributes ``C(k, 2)`` terms where
     [`face_adjacency_angles`][triwarp.adjacency.face_adjacency_angles] reports one pair per
     adjacency. The two coincide exactly wherever every edge has at most two faces.
     """
@@ -163,8 +160,7 @@ def laplacian_smoothing_loss(
     Mean magnitude of a Laplacian residual per vertex, under one of three normalizations.
 
     The smoothness regularizer of the deformation losses. The three methods are **three different
-    quantities**, not one with a tuning knob, and they differ by an order of magnitude -- measured
-    0.04838 / 0.04401 / 0.33407 on ``icosphere(2)``:
+    quantities**, not one with a tuning knob, and they differ by roughly an order of magnitude:
 
     - ``"uniform"``: ``|| (A v)_i - v_i ||`` with ``A`` the row-normalized 1-ring average
       ([`laplacian`][triwarp.laplacian.laplacian] with ``equal_weight=True``) -- the umbrella
@@ -206,9 +202,9 @@ def laplacian_smoothing_loss(
 
     Notes
     -----
-    Matches ``pytorch3d.loss.mesh_laplacian_smoothing`` on all three methods: measured 2.07e-07,
-    3.12e-07 and 5.27e-07 relative on ``icosphere(2)``. Two conventions are inherited from it
-    rather than chosen here, both because they are what makes the numbers comparable at all: the
+    Matches ``pytorch3d.loss.mesh_laplacian_smoothing`` on all three methods. Two conventions are
+    inherited from it rather than chosen here, both because they are what makes the numbers
+    comparable at all: the
     reference's ``cot`` and ``cotcurv`` read a cotangent Laplacian whose off-diagonal is **twice**
     triwarp's half-cotangent table and whose diagonal is identically zero, which cancels out of
     both ratios above -- and where a vertex's row sum is not positive its averaging is undefined,
@@ -223,8 +219,6 @@ def laplacian_smoothing_loss(
     # The three methods initialize the two scale buffers three different ways, so each branch
     # allocates them holding what it needs -- ``wp.full`` where the value is a constant,
     # ``wp.empty`` where a launch writes every element, ``wp.zeros`` where the value is zero.
-    # Allocating both with ``wp.empty`` up front and filling after read as one shared allocation
-    # and was three.
     if method == "uniform":
         operator = tw.laplacian.laplacian(vertices, faces, equal_weight=True)
         row_scale = wp.full(n_vertices, 1.0, dtype=wp.float32, device=device)
@@ -288,14 +282,7 @@ def k_harmonic(
 
     Each power is assembled by one triplet pass over matching CSR rows —
     ``(A M^-1 B)_ij = sum_t A_ti M_t^-1 B_tj`` with both operands symmetric — followed by a single
-    ``bsr_from_triplets``, so the product is built without ``warp.sparse.bsr_mm``. That choice was
-    originally made to dodge a suspected ``bsr_mm`` nondeterminism, which turned out to be this
-    package's own defect: a triplet buffer sized by ``BsrMatrix.nnz`` — the *capacity* the matrix
-    was built with, not its entry count — left an uninitialized gap that ``bsr_from_triplets`` read
-    back as garbage triplets. ``bsr_mm`` is sound. The triplet pass stays on its own merits: it
-    measures ~2x faster than a chained ``bsr_mm`` on both devices up to ~40 000 vertices, though
-    ``bsr_mm`` overtakes it on CUDA above ~100 000 — the measured table is on the private
-    ``_diagonal_sandwich`` helper below.
+    ``bsr_from_triplets``, so the product is built without ``warp.sparse.bsr_mm``.
 
     Parameters
     ----------
@@ -361,28 +348,9 @@ def _diagonal_sandwich(
 
     Row ``t`` of the product is the outer product of ``A``'s and ``B``'s rows ``t`` scaled by the
     diagonal weight, so the whole product is one count kernel, one scan, one emission kernel and a
-    single ``bsr_from_triplets``.
-
-    **Why not ``bsr_mm``, and where that stops being true.**
-    ``bsr_mm(bsr_mm(a, bsr_diag(inverse_mass)), b)`` is a genuine drop-in — identical ``nnz`` and
-    values agreeing to 3.4e-16 relative at every size probed. It is a *size* trade, measured
-    back-to-back on an RTX 5090 as ``min`` of 8-12 interleaved reps (ratio is ``bsr_mm`` over this
-    path, so above 1 means ``bsr_mm`` loses):
-
-    | vertices | 2 562 | 10 242 | 40 962 | 163 842 | 655 362 |
-    |---|---|---|---|---|---|
-    | CUDA | 2.29x | 2.04x | 1.85x | **0.89x** | **0.67x** |
-    | CPU | 2.29x | 2.26x | 2.15x | 2.18x | — |
-
-    So the triplet pass wins ~2x across the range this package is normally used at and loses
-    11-33 % above ~100 000 vertices, while CPU never prefers ``bsr_mm`` at any measured size,
-    staying flat at ~2.2x over a 64x size range.
-
-    What ``bsr_mm`` avoids is the scratch, which is why it crosses over at all: this path
-    materializes **2.58x the output ``nnz``** as triplets, 514 MB at 655 362 vertices against a
-    149 MB result. A size-thresholded switch is viable — ``n_triplets`` is known from the scan
-    below *before* any buffer is allocated — but it would need a CUDA-only constant (§13) and no
-    in-repo caller runs meshes that large, so it is deliberately not done.
+    single ``bsr_from_triplets``, built without ``warp.sparse.bsr_mm``. ``bsr_mm(bsr_mm(a,
+    bsr_diag(inverse_mass)), b)`` is an equivalent construction, but this path avoids materializing
+    an intermediate diagonal matrix and its scratch.
     """
     n_rows = int(a.nrow)
     device = inverse_mass.device

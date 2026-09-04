@@ -127,14 +127,13 @@ def filter_laplacian(
     [`filter_implicit_fairing`][triwarp.smoothing.filter_implicit_fairing]
     [`trimesh.smoothing.filter_laplacian`][]
     """
-    # This six-line prologue opens five of the filters (here, ``filter_humphrey``,
-    # ``filter_taubin``, ``filter_neighborhood_average`` and ``filter_mut_dif_laplacian``) and a
-    # ``_smoothing_setup`` helper for it has been proposed twice and declined twice. The reason is
-    # not line count: the two halves have no common consumer. ``filter_implicit_fairing`` needs the
-    # guard and ``_as_vec3d`` but builds no operator, ``filter_neighborhood_average`` needs the
-    # operator built ``symmetric=True``, and a helper returning both would have to hand back an
-    # optional operator that three of the six callers immediately unwrap -- which reads worse than
-    # the six lines it replaces. Do not re-propose it without a shape that avoids the ``Optional``.
+    # This six-line prologue is shared by five of the filters (here, ``filter_humphrey``,
+    # ``filter_taubin``, ``filter_neighborhood_average`` and ``filter_mut_dif_laplacian``), but a
+    # shared helper is not worth it: the two halves have no common consumer.
+    # ``filter_implicit_fairing`` needs the guard and ``_as_vec3d`` but builds no operator,
+    # ``filter_neighborhood_average`` needs the operator built ``symmetric=True``, and a helper
+    # returning both would have to hand back an optional operator that three of the six callers
+    # immediately unwrap.
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0 or iterations == 0:
@@ -189,11 +188,10 @@ def _build_implicit_system(
     # stale cache holding the triplet *capacity* it was handed, duplicates included, and only a
     # ``nnz_sync()`` repairs it (no other operation does, so whether ``nnz`` reads correctly depends
     # on unrelated earlier code). The uniform default is duplicate-free so the two agree there, but
-    # a caller-supplied ``cotmatrix`` (12 triplets per face) overshoots 3.4x on an ``icosphere(3)``,
-    # and that gap in these ``wp.empty`` buffers would reach ``bsr_from_triplets`` uninitialized.
-    # Out-of-range garbage indices are dropped silently, but any landing in ``[0, n)`` accumulate a
-    # garbage value into a real entry: measured ``‖values‖ = 1.1e13`` against the correct 84.3 with
-    # the pool holding plausible indices. One host readback per call, not per pass.
+    # a caller-supplied ``cotmatrix`` operator can overshoot it, and that gap in these ``wp.empty``
+    # buffers would reach ``bsr_from_triplets`` uninitialized. Out-of-range garbage indices are
+    # dropped silently, but any landing in ``[0, n)`` accumulate a garbage value into a real entry.
+    # One host readback per call, not per pass.
     nnz = operator.nnz_sync()
     n_triplets = nnz + n
     rows, cols, vals = tw.array.triplet_buffers(n_triplets, wp.float64, device)
@@ -307,15 +305,14 @@ def inflate(
     positions = wp.clone(vertices)
     # The relaxation operator is hoisted for the same reason the step kernel below is, and it is the
     # larger of the two: ``filter_laplacian`` builds the uniform operator per call, and at
-    # ``equal_weight=True`` that operator is the mesh's topology, which no pass changes. Same
-    # finding as ``filter_spikes``, which is where it was measured.
+    # ``equal_weight=True`` that operator is the mesh's topology, which no pass changes.
     operator = laplacian.laplacian(vertices, faces)
     if pre_smooth:
         positions = filter_laplacian(
             positions, faces, lamb, iterations=1, laplacian_operator=operator
         )
-    # Hoisted once: the displacement is the same map every pass, and section 4 records that a
-    # per-iteration wrapper loop should not re-derive it.
+    # Hoisted once: the displacement is the same map every pass, so a per-iteration wrapper loop
+    # should not re-derive it.
     step_kernel = wp.map(
         kernel_smoothing.step_along_normal,
         positions,
@@ -501,9 +498,7 @@ def filter_spikes(
     # and at ``equal_weight=True`` -- its default, and what ``_resolved_operator`` asks for -- the
     # operator reads no positions at all: every off-diagonal weight is ``1`` before the row
     # normalization, so it is the mesh's *topology*, which no pass changes. Hoisting it is therefore
-    # exactly equivalent, and it is where this row's cost was: 10 builds at 1.27 ms is **13.0 of the
-    # call's 19.6 ms** on ``bunny_decimated`` (RTX 5090), and a build is flat in the mesh, which is
-    # what made the whole row flat in the mesh -- 15.65 ms at 16 301 faces against 15.16 at 69 630.
+    # exactly equivalent, and the cost of a build is flat in the mesh size.
     operator = laplacian.laplacian(vertices, faces, symmetric=True)
     for _ in range(max_iter):
         defects = tw.vertices.vertex_defects(
@@ -929,8 +924,8 @@ def filter_taubin(
         and ignored when ``recompute`` is set.
     recompute
         Reassemble the inverse-distance operator from the *current* positions before every pass,
-        instead of applying one operator throughout. Off by default, and see the ``Notes``: it is
-        a different filter and it costs **~23x**.
+        instead of applying one operator throughout. Off by default; see the ``Notes`` — it is a
+        different filter and markedly more expensive per pass.
 
     Returns
     -------
@@ -951,14 +946,11 @@ def filter_taubin(
 
     Notes
     -----
-    **``recompute`` is a different filter, not a tuning of this one, and it is what the
-    ``pytorch3d`` agreement needs.** ``pytorch3d.ops.taubin_smoothing`` rebuilds its
-    inverse-distance operator from the current geometry before each half-pass; measured on a noisy
-    ``icosphere(2)`` at ``lambd = 0.53, mu = -0.53``, one fixed operator sits **4.1e-03 / 6.5e-03 /
-    9.9e-03** from it at 1 / 3 / 10 of its iterations -- the size of the displacement itself -- and
-    recomputing closes that to **2.4e-07 / 4.8e-07 / 6.6e-07**, four orders of magnitude. That is
-    the only reason the keyword exists; the default is unchanged and stays the fixed operator,
-    which is trimesh's filter and this group's oracle.
+    ``recompute`` is a different filter, not a tuning of this one:
+    ``pytorch3d.ops.taubin_smoothing`` rebuilds its inverse-distance operator from the current
+    geometry before each half-pass, and matching that convention is what makes ``recompute=True``
+    agree with it, where the fixed operator does not. The default is unchanged and stays the fixed
+    operator, which is trimesh's filter and this group's oracle.
 
     It is pinned to the **inverse-distance** weighting rather than taking a weighting of its own,
     and that is not a simplification: the uniform operator is ``1 / degree`` off the diagonal, a
@@ -966,24 +958,9 @@ def filter_taubin(
     would rebuild the identical matrix every pass and cost without doing anything. Only the
     geometry-dependent branch has anything to recompute.
 
-    **The cost is ~6x and it is stated rather than left to be discovered.** Measured on CUDA at
-    ``iterations=10``, one operator against ten: 0.852 -> 5.157 ms at 42 vertices (**6.1x**),
-    0.874 -> 5.267 at 2 562 (**6.0x**) and 1.072 -> 6.238 at 40 962 (**5.8x**). Both columns are
-    almost flat in the vertex count, which says what the cost *is*: ten sparse assemblies plus ten
-    float32 narrowings of the running float64 positions, all launch-bound rather than
-    bandwidth-bound at these sizes. So the ratio is a fixed multiple and not a scaling problem, and
-    the lever if it ever matters is fewer launches per assembly rather than a cheaper operator.
-
-    That ratio was **~23x** until the unique-edge derivation was hoisted out of the loop: the
-    connectivity never changes, so ``laplacian``'s ``edges`` keyword lets all ten passes share one
-    ``edges_unique`` call. Measured back to back across two trees, results bit-identical
-    (checksum equal to 7 digits): **2.13x** on ``bunny`` (10.963 -> 5.138 ms) and **2.58x** on
-    ``dragon`` (17.463 -> 6.779). What is left is the ten assemblies themselves.
-
-    Section 13 was applied and this is the honest outcome rather than a default change: the keyword
-    is opt-in, the default remains the fixed operator (trimesh's filter, and this group's oracle),
-    and ``benchmarks/test_smoothing.py`` keeps its ``noparity`` entry for pytorch3d because the
-    *default* still disagrees with it.
+    ``recompute`` reassembles a sparse operator every pass instead of once, which is markedly more
+    expensive; the connectivity never changes, though, so ``laplacian``'s ``edges`` keyword lets
+    every pass share one ``edges_unique`` call rather than re-deriving it each time.
     """
     if recompute and laplacian_operator is not None:
         raise ValueError("recompute rebuilds the operator each pass; do not also pass one")
@@ -995,9 +972,8 @@ def filter_taubin(
     operator = None if recompute else _resolved_operator(vertices, faces, laplacian_operator)
     # The recompute path reassembles the operator every pass from *moved* positions, but over
     # connectivity that never changes -- so the unique-edge set is derived once here rather than
-    # inside the loop. On the inverse-distance branch that derivation is up to 80 % of a
-    # ``laplacian`` call (``laplacian_entries``' ``edges`` note has the numbers), and it would
-    # otherwise be repaid once per iteration for an identical answer.
+    # inside the loop, which would otherwise repay the same derivation once per iteration for an
+    # identical answer.
     recompute_edges = tw.edges.edges_unique(faces, n_vertices=n)[0] if recompute and n > 0 else None
     positions = _as_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
@@ -1622,9 +1598,8 @@ def smooth_region(
     # ``laplacian_ls_triplets`` emits conditionally, so most slots stay unwritten. Padding must be a
     # *hole*, not a value: a ``(0, 0, 0.0)`` triplet is a harmless structural zero, but every one of
     # them accumulates onto entry ``(0, 0)`` and ``bsr_from_triplets``' accumulation atomic
-    # serializes them -- measured 14.3 ms against 0.45 ms (31.8x) for the ~185 000 unwritten slots
-    # of a 35 947-vertex mesh. Both arrays are filled one past their own extent, so the padding is
-    # out of range as the *row* index of ``M`` (``rows``) and of ``M^T`` (``cols``) alike.
+    # serializes them. Both arrays are filled one past their own extent, so the padding is out of
+    # range as the *row* index of ``M`` (``rows``) and of ``M^T`` (``cols``) alike.
     rows = wp.full(size, n_rows, dtype=wp.int32, device=device)
     cols = wp.full(size, n_free, dtype=wp.int32, device=device)
     vals = wp.zeros(size, dtype=wp.float64, device=device)
@@ -1664,26 +1639,12 @@ def smooth_region(
     for column, component in enumerate((rhs_x, rhs_y, rhs_z)):
         wps.bsr_mv(mt_matrix, component, atb[column], alpha=1.0, beta=0.0)
     sol = _free_positions(vertices, free_mask, free_map, n_free)
-    # The normal equations are the worst-conditioned system this package solves -- Jacobi-
-    # preconditioned conjugate gradient takes 6 541 iterations on ``bunny``'s benchmarked free
-    # region -- and the solve is 99 % of the call, so a multigrid hierarchy is worth its setup
-    # there: the *solve* alone measures 2.46x, and 2.55x on the CPU device.
-    #
-    # ``"auto"`` rather than ``"multigrid"`` because *this same function* is also called on hole
-    # patches by ``refine_and_smooth_region``, whose systems are small. Asking for the hierarchy
-    # unconditionally took ``holes.fill_smooth`` to **0.21x** on ``holes_many``: every patch paid a
-    # 15 ms setup to save nothing.
-    #
-    # What separates a patch from a region is *not* what three earlier attempts looked for. Size,
-    # Jacobi iteration count and probe-rate extrapolation all interleave the two classes, and a
-    # size threshold on its own is refuted outright by this function's own population: a patch of
-    # 1 000 unknowns loses under a forced hierarchy while ``bunny_decimated``'s 2 043-unknown
-    # region wins 2.23x. The axis that does separate them is the operator's off-diagonal dominance
-    # crossed with a size floor, which is what ``"auto"`` now gates on -- ``linalg``'s
-    # ``CG_MULTIGRID_DOMINANCE`` carries all 29 systems and the one 1.26x it forgoes. End to end
-    # against forcing Jacobi: **2.02x** on ``bunny_decimated``'s benchmarked region, 1.80x on
-    # ``bunny``'s and 1.58x on a 10 239-unknown icosphere, with all four hole-patch chains flat at
-    # 0.98-1.04x.
+    # The normal equations here are the worst-conditioned system this package solves, so a
+    # multigrid hierarchy usually pays for its own setup. ``"auto"`` rather than an unconditional
+    # ``"multigrid"`` because this same function is also called on small hole patches by
+    # ``refine_and_smooth_region``, where the hierarchy's setup cost is not repaid. What separates a
+    # patch from a region is not size or iteration count alone but the operator's off-diagonal
+    # dominance, which is what ``"auto"`` gates on (``linalg.CG_MULTIGRID_DOMINANCE``).
     twl.solve_spd_columns(
         system,
         twt.as_array2d(atb, wp.float64),
@@ -1721,20 +1682,9 @@ def _free_positions(
 
     It is a **correctness** requirement before it is a warm start. A vertex no face refers to
     contributes no row to either system, so CG never writes its entry and it keeps whatever the
-    seed held: from ``wp.zeros`` such a vertex is silently moved to the origin -- 7 of
-    ``bunny_decimated``'s free vertices and 297 of ``bunny``'s 1 113 unreferenced ones, up to 60 %
-    of the bounding-box diagonal. Seeded from the current positions it stays put, which is the only
-    defensible answer for an unknown the system does not constrain.
-
-    The speed is the smaller half and is worth stating so nobody expects more of it: the stopping
-    test is relative to the right-hand side's norm rather than to the initial residual, so the seed
-    cannot change which answers count as converged, only how far CG has to travel. Measured
-    interleaved, ``min`` of 5 -- iterations 1 784 -> 1 708 on ``bunny_decimated``'s benchmarked
-    region, 6 541 -> 6 167 on ``bunny``'s under Jacobi and 310 -> 263 under the V-cycle, which is
-    **1.04-1.06x** on the whole ``smooth_region`` / ``smooth_region_fixed_rim`` call, reproduced
-    across two sessions. On the hole-filling chains it is **flat**: two sessions measured
-    ``refill_region`` at 1.02x and 0.94x on the same row, which is that chain's own run-to-run
-    spread rather than a gain or a regression, so do not attribute either to this.
+    seed held: from ``wp.zeros`` such a vertex would be silently moved to the origin. Seeded from
+    the current positions it stays put, which is the only defensible answer for an unknown the
+    system does not constrain.
     """
     device = vertices.device
     guess = wp.empty((3, n_free), dtype=wp.float64, device=device)
@@ -1894,9 +1844,8 @@ def refine_and_smooth_region(
         incident = tw.selection.expand_vertex_mask(faces, incident, 5)
         incident = tw.selection.shrink_vertex_mask(faces, incident, 2)
         incident = tw.selection.exclude_fully_selected_components(faces, incident, n)
-        # A 1-byte-per-vertex copy is cheap, so this is the latest crossover of the reduction
-        # family: measured on CUDA 0.65x at 400k vertices, 1.09x at 1M, 1.65x at 2M, 3.23x at 8M.
-        # Taken on the CUDA number per the GPU-first rule; the losing sizes are sub-0.1 ms.
+        # A one-byte-per-vertex device reduction is cheap enough here to prefer over a host
+        # readback.
         if tw.reduce.any(incident):
             bd_mask = _boundary_verts_mask(vertices, faces)
             free2 = wp.empty(n, dtype=wp.bool, device=device)
@@ -2289,10 +2238,8 @@ def filter_normals(
     threshold_cos = wp.float32(math.cos(math.radians(threshold)))
 
     accumulated = wp.empty(n_faces, dtype=wp.vec3, device=device)
-    # Both maps are hoisted out of the pass loop (CLAUDE.md section 3.5): a cached ``wp.map`` call
-    # re-resolves its kernel in Python every time, measured on Warp 1.17 at 23.8-26.6 us against
-    # 13.4-14.3 for the launch it wraps -- **1.78-1.86x, ~11 us a call** -- so at the default 20
-    # passes these two were ~0.44 ms of pure host time.
+    # Both maps are hoisted out of the pass loop: a cached ``wp.map`` call re-resolves its kernel in
+    # Python every time, which adds up over many passes.
     seed = wp.map(
         kernel_smoothing.seed_weighted_normal, normals, areas, out=accumulated, return_kernel=True
     )
@@ -2387,8 +2334,8 @@ def filter_two_step(
     adjacency = tw.adjacency.face_adjacency(faces, n_vertices=n)
     delta = wp.empty(n, dtype=wp.vec3, device=device)
     counts = wp.empty(n, dtype=wp.float32, device=device)
-    # Hoisted out of the doubly-nested pass loop, where it ran ``iterations * fit_iterations``
-    # times; see [`filter_normals`][triwarp.smoothing.filter_normals] for the measurement.
+    # Hoisted out of the doubly-nested pass loop, where it would otherwise run
+    # ``iterations * fit_iterations`` times.
     fit_step = wp.map(
         kernel_smoothing.apply_fit_step, out, delta, counts, out=out, return_kernel=True
     )

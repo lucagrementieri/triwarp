@@ -1345,20 +1345,37 @@ reader on other hardware reads a number that is simply false for them. The docst
 *claim* the number supports, in terms a caller can act on: "roughly doubles the call", "a host
 readback serialises the device pipeline", "the fixed per-segment cost dominates at these widths".
 
-**Moving the number, not deleting it.** §9 requires a measured result to live at its site, so the
-figure goes into a `#` comment in the same function's body — or into the private helper that
-actually pays it, which is usually better, because two public forms sharing one cost then carry the
-sentence once. Numbers stay welcome in private helpers' docstrings, in `kernels/` (nothing there
-renders), in `benchmarks/` group docstrings and in Part II here.
+**And no development-history narrative belongs in `triwarp/*.py` either — in a docstring or in a
+code comment.** A sentence that reads as a lab notebook rather than documentation ("measured X,
+declined Y", "reverted", "one session", "round N", "probe"/"sweep" used as a methodology rather than
+an algorithm term, a cross-reference to an internal doc section) describes how the code came to be,
+not what it does or how to use it. The public wrapper layer — every module under `triwarp/`,
+excluding `kernels/` — is documentation for a caller, not an engineering log; keep the behavioral or
+correctness fact a piece of history was attached to (a convention, a sign rule, an aliasing warning,
+what raises and when), and cut the narrative around it.
+
+**Delete it, don't relocate it.** This reverses the file's own earlier guidance, which said to move
+a pruned number into a `#` comment in the same function's body — that is no longer the rule for
+`triwarp/*.py`. §9's "a measured decline is a result, written at the site" still holds, but the site
+for that discipline is now `kernels/`, `benchmarks/`, and `tests/`, not the public wrapper: a
+decline's number and reasoning belong in the private helper that actually pays it, or in Part II
+here, not in a comment a caller has to scroll past. Numbers and decline-history stay welcome in
+private helpers' docstrings, in `kernels/` (nothing there renders), in `benchmarks/` group
+docstrings, and in Part II.
+
+A full pass across all 52 public modules (2026-09-04) removed every instance the scan below found,
+plus the matching code-comment narrative in the same files, and fixed the two stale allowlist
+entries in `tests/api_conventions.py`'s check 9 that removing two "Warp 1.16" history notes left
+dangling. This is now a zero-tolerance completeness rule rather than a tracked backlog: a fresh hit
+in a new or edited public function is a regression to fix in the commit that introduced it, not an
+item for a future pass.
 
 The scan is an `ast` walk over `triwarp/`'s public functions matching
 `\d[\d.,]*\s*(ms|us|µs|ns|GB|MB|kB)\b` or `\b\d+(\.\d+)?x\b` against each docstring — a plain
 grep for `ms` is unusable, and the same regex over *prose* words (`measured`, `faster`,
-`benchmark`) returns 35 kB of legitimate behavioural text, so key on the *quantity*.
-**Measured 2026-09-03: 50 public functions across 30 modules, 174 lines.** The three modules
-reviewed that day (`adjacency`, `array`, `boundary`) are clean; **45 functions across 24 modules are
-not yet converted** — `linalg` 5, `proximity` 4, then `voxels` / `selection` / `remesh` / `holes` 3
-each — and the list regenerates from the scan rather than being maintained here.
+`benchmark`) returns 35 kB of legitimate behavioural text, so key on the *quantity*. It has no
+comment-scanning counterpart yet; a code-comment narrative slipping back in is caught by review,
+not by this scan.
 
 Docstrings stay **NumPy-style** (`Parameters`/`Returns`/`Raises`/`See Also`), but cross-references use
 **mkdocs-autorefs** link syntax, not Sphinx roles — Sphinx interpreted-text roles (`:func:`, `:attr:`,

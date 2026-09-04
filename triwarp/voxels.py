@@ -2,19 +2,19 @@
 Sparse voxel grids: voxelize a mesh or a cloud, test membership, reshape, and mesh the result.
 
 The grid is a ``warp.Volume`` -- a NanoVDB *index* grid -- rather than a triwarp value type, and
-every function here either produces one or consumes one. Four measured properties are what make
-that the right centre, and they are worth knowing before reading anything else:
+every function here either produces one or consumes one. Four properties of that grid shape the
+rest of the module:
 
 - **The builder is the dedup.** ``Volume.allocate_by_voxels`` collapses repeated cells as it builds,
-  2.3x faster than a sort-and-unique over the same rows on *both* devices, so no function here ever
-  calls [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows].
+  so no function here ever calls
+  [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows] first.
 - **The volume's linear index is the row index of its cell array.** ``wp.volume_lookup_index``
   returns exactly the row [`cells`][triwarp.voxels.cells] puts that voxel in, so a per-voxel payload
   is a plain ``wp.array`` of length ``n_voxels`` and membership costs one ``O(1)`` probe.
 - **NanoVDB centres voxels on integers**, so the volume's translation is ``origin + 0.5 * s`` where
   ``origin`` is the world position of the lower corner of cell ``(0, 0, 0)``. Under that shift cell
   ``c`` covers world ``[origin + c * s, origin + (c + 1) * s)`` exactly, which is Open3D's cell and
-  the anchor [`triwarp.remesh.cluster_decimate`][triwarp.remesh.cluster_decimate] already uses.
+  the anchor [`triwarp.remesh.cluster_decimate`][triwarp.remesh.cluster_decimate] also uses.
   [`grid_transform`][triwarp.voxels.grid_transform] undoes the shift so callers never see it.
 - **The cell order is leaf-major, not lexicographic**: ``get_voxels`` walks NanoVDB's 8-cubed leaves
   and the cells within each. It is deterministic and identical on CPU and CUDA, but it is *not* a
@@ -35,8 +35,7 @@ nothing with it but the ``(lower, upper)`` ``bounds`` convention
 transposes of each other and are kept **together**: they share the world-to-lattice map, and
 splitting the pair across modules -- the gather reads like one of
 [`triwarp.interpolation`][triwarp.interpolation]'s transfer verbs -- would put that map behind a
-private import and let the two halves drift a half-cell apart. Section 11's "one operation family,
-one module" is what decided it, and
+private import and let the two halves drift a half-cell apart.
 [`interpolate_from_points`][triwarp.interpolation.interpolate_from_points] carries the
 cross-reference from the other side.
 
@@ -55,52 +54,7 @@ cross-reference from the other side.
     *are* wrapped now -- [`union`][triwarp.voxels.union],
     [`intersection`][triwarp.voxels.intersection], [`difference`][triwarp.voxels.difference],
     [`closing`][triwarp.voxels.closing], [`opening`][triwarp.voxels.opening] and
-    [`revoxelize`][triwarp.voxels.revoxelize]. Two of those recipes were wrong as written, which is
-    the argument against a recipe nothing runs:
-    [`triwarp.array.concatenate`][triwarp.array.concatenate] is rank-1 only and raises on a cell
-    array, and a boolean mask is not a Warp gather index.
-
-Notes
------
-An 8-cubed NanoVDB leaf carries a 64-byte occupancy mask, so a set with one voxel per leaf costs
-more than the ``(n, 3)`` ``int32`` cell array would. [`cells`][triwarp.voxels.cells] is 0.03 ms per
-million voxels, so that array form is always one call away.
-
-The grid build is the module's floor and it is where the data-structure choice was decided: on one
-million random cells over a 128-cubed box collapsing to 794 875 voxels, ``allocate_by_voxels``
-medians **0.64 ms on CUDA and 138 ms on CPU** against **1.51 ms / 316 ms** for the equivalent
-[`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows] dedup -- 2.3x on both devices, which
-is why there is no per-device path here.
-
-Measured medians on ``bunny`` (35 947 vertices, RTX 5090, cells at ``diagonal / 96`` unless noted),
-against the reference each function is tested for:
-
-| function | triwarp | reference |
-|---|---|---|
-| ``voxelize_mesh`` at ``diagonal / 64`` | 0.63 ms | 19.3 ms (open3d) |
-| ``voxelize_mesh`` at ``diagonal / 256`` | 0.67 ms | 61.1 ms (open3d) |
-| ``voxelize_points`` | 0.55 ms | 2.29 ms (open3d) |
-| ``voxel_down_sample`` | 0.80 ms | 1.34 ms (open3d) |
-| ``occupancy_at_points``, 10^6 queries | 0.083 ms | 44.0 ms (open3d) |
-| ``dilate`` | 0.41 ms | 1.77 ms (trimesh / ndimage) |
-| ``fill_cavities`` | 0.74 ms | 5.32 ms (trimesh / ndimage) |
-| ``fill_orthographic`` | 1.13 ms | 4.73 ms (trimesh) |
-| ``to_boxes`` | 1.01 ms | 23.8 ms (trimesh ``multibox``) |
-| ``voxel_corners`` | 0.67 ms | 4.83 ms (igl) |
-| ``grid_points`` at 64-cubed | 0.053 ms | 1.62 ms (igl) |
-
-The one place the grid build is *not* the cheap part is [`dilate`][triwarp.voxels.dilate], where it
-is **68 %** of the call (0.67 of 0.99 ms at 179 k voxels, against 3 % for the candidate kernel). A
-1.16 rebuildable volume was measured as the obvious fix and **rejected**: ``Volume.rebuild`` into a
-pre-reserved topology is only 5-7 % faster than a fresh ``allocate_by_voxels`` (0.344 against 0.369
-ms at 179 k voxels, 0.836 against 0.885 at 262 k), because the cost is inserting the points and
-building the leaves, not the allocation. Two traps found while measuring that, in case it is
-retried: the four ``max_*`` capacities **cascade** (``max_leaf_nodes`` defaults to
-``max_active_voxels`` and so on down), so supplying only ``max_active_voxels`` at 800 k voxels asks
-for 800 k *upper* nodes and dies of out-of-memory -- reported as ``Failed to create volume``, after
-which the CUDA context raises illegal-memory-access on everything; and a rebuildable grid reports
-its **capacity** through ``get_voxel_count``, which is why [`cells`][triwarp.voxels.cells] never
-uses it.
+    [`revoxelize`][triwarp.voxels.revoxelize].
 
 See Also
 --------
@@ -290,7 +244,7 @@ def voxelize_points(
     Occupancy grid of a point cloud: one active voxel per cell that contains at least one point.
 
     Open3D's ``VoxelGrid.create_from_point_cloud``. There is no dedup step to write — the builder
-    collapses repeated cells itself, faster than a sort-and-unique over the same rows.
+    collapses repeated cells itself.
 
     Parameters
     ----------
@@ -974,18 +928,15 @@ def splat_onto_grid(
     accumulates into caller-supplied ``volume_densities`` / ``volume_features`` in place. The
     ``min_weight`` floor is pytorch3d's, default and all.
 
-    **This averages, so it is not the inverse of a sample except on the lattice itself.** Three
-    properties hold exactly and are worth knowing before reading a round trip as a check
-    (all measured, and asserted in ``tests/test_voxels.py``):
+    **This averages, so it is not the inverse of a sample except on the lattice itself.** A few
+    properties hold exactly and are worth knowing before reading a round trip as a check:
 
     - ``density.sum()`` is the point count exactly -- the eight weights per point sum to 1.
-    - Points *on* the lattice corners give ``density == 1`` everywhere and a
-      splat-then-sample round trip of **0.0** on any field, because each point's stencil
-      degenerates to its own corner.
-    - A **constant** field comes back as that constant, to 7.2e-07 on every corner some point
-      reached. Off the lattice the round trip is a smoothing rather than the identity -- measured
-      5.6e-05 on a random cloud filling 504 of 512 corners, and the residual is the eight
-      *unreached* corners, not the weights: a query whose stencil touches one averages a zero in.
+    - Points *on* the lattice corners give ``density == 1`` everywhere and an exact
+      splat-then-sample round trip, because each point's stencil degenerates to its own corner.
+    - A **constant** field comes back as that constant everywhere some point was reached. Off the
+      lattice the round trip is a smoothing rather than the identity, and the residual comes from
+      the corners no point reached: a query whose stencil touches one averages a zero in.
     """
     if len(shape) != 3 or min(int(n) for n in shape) < 1:
         raise ValueError(f"shape must be three positive integers, got {shape!r}")
@@ -1469,8 +1420,8 @@ def fill_cavities(grid: wp.Volume) -> wp.Volume:
     -----
     The 6-neighbour stencil is *implicit*: the union-find hooks three backward probes per cell
     straight off the dense occupancy, so no edge list is ever built. An explicit one would cost
-    ``3 * n_empty`` rows — 400 MB over a 256-cubed box — which is why the connected-component pass
-    is written against the stencil rather than against
+    ``3 * n_empty`` rows, which is why the connected-component pass is written against the stencil
+    rather than against
     [`triwarp.graph.connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges].
     """
     voxel_size, origin = grid_transform(grid)
@@ -1570,8 +1521,8 @@ def dilate(
 
     trimesh's ``morphology.binary_dilation`` (``scipy.ndimage.binary_dilation``). Every voxel writes
     its whole neighbourhood as candidate cells and the builder dedups them, so there is no unique
-    pass — but the candidate buffer is ``(connectivity + 1) * n_voxels`` cells, which is
-    **324 MB at a million voxels and ``connectivity=26``**. That bound is why 6 is the default.
+    pass — but the candidate buffer is ``(connectivity + 1) * n_voxels`` cells, which grows quickly
+    at ``connectivity=26``. That growth is why 6 is the default.
 
     Parameters
     ----------
@@ -2080,12 +2031,6 @@ def to_boxes(
     are compacted away before returning, which is a change worth knowing about if a caller was
     relying on an index into the full lattice: it was not, since the lattice itself is
     [`voxel_corners`][triwarp.voxels.voxel_corners] and that is where an index into it comes from.
-
-    The compaction is measured and it pays for itself twice over. On a solid ``icosphere(4)`` at
-    three voxel sizes on CUDA it drops **81-96 %** of the vertex buffer -- 41 624 to 8 072 corners
-    at 37 k voxels, and 4 370 680 to **190 640** at 4.3 M (52 MB of ``wp.vec3`` down to 2.3 MB) --
-    for 1.27x / 1.09x / **1.01x** of the call. A share that falls as the input grows, on a saving
-    that grows with it.
     """
     _require_index_grid(grid)
     device = grid.device
@@ -2177,8 +2122,8 @@ def voxel_corners(grid: wp.Volume) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:
     igl numbers a cell's corners in ``yxz`` binary-counting order, a fixed permutation of the order
     used here.
 
-    ``warp.fem`` is imported inside this function, not at module scope: it costs ~0.15 s to import
-    and nothing else in this module needs it.
+    ``warp.fem`` is imported inside this function, not at module scope, since nothing else in this
+    module needs it.
     """
     _require_index_grid(grid)
     device = grid.device
@@ -2189,8 +2134,7 @@ def voxel_corners(grid: wp.Volume) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:
             (0, 8), wp.int32, device=device
         )
 
-    # Deferred: importing ``warp.fem`` costs ~0.15 s of ``import triwarp`` and only this path
-    # needs it.
+    # Deferred: importing ``warp.fem`` here, not at module scope, since only this path needs it.
     import warp.fem as fem
 
     corner_grid = fem.Nanogrid(grid).vertex_grid
@@ -2286,11 +2230,10 @@ def _empty_grid(voxel_size: float, origin: wp.vec3, device: wp.DeviceLike) -> wp
 
 # Three members of this trailing block have a single caller -- ``_cell_slots``
 # (``occupancy_at_cells``), ``_face_neighbors`` and ``_face_corner_table`` (both ``to_boxes``) --
-# and all three stay here rather than moving up to their caller under CLAUDE.md section 5's
-# stepdown rule. Each is one half of a pair whose other half *is* cross-cutting: ``_cell_slots`` is
-# the cell twin of ``_point_slots`` immediately below, and the two face tables are the constant
-# tables ``_stencil`` above them builds from. Splitting a pair across 2 000 lines to save a
-# backward jump is the worse trade.
+# and all three stay here rather than moving up to their caller. Each is one half of a pair whose
+# other half *is* cross-cutting: ``_cell_slots`` is the cell twin of ``_point_slots`` immediately
+# below, and the two face tables are the constant tables ``_stencil`` above them builds from.
+# Splitting a pair across the file to save a backward jump is the worse trade.
 
 
 def _point_slots(grid: wp.Volume, points: wp.array[wp.vec3]) -> wp.array[wp.int32]:

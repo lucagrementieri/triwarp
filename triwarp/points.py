@@ -80,8 +80,8 @@ SUPPORT_TIE_SLACK = wp.constant(wp.float32(1e-6))
 # used. Rejection is free -- neighbouring, well-shaped tetrahedra cover the same region -- while a
 # sliver's face normals are ill-conditioned cross products of nearly parallel edges, and that error
 # is the one that can cost the superset guarantee. Chosen well above ``TOLERANCE_PLANAR`` for that
-# reason, and paired with ``convex_superset_mask``'s ``margin`` default: measured, dropping this to
-# 1e-9 makes every margin in the useful range unsafe.
+# reason, and paired with ``convex_superset_mask``'s ``margin`` default -- dropping this to 1e-9
+# makes every margin in the useful range unsafe.
 TETRAHEDRON_FLATNESS = wp.constant(wp.float32(1e-3))
 
 
@@ -155,9 +155,8 @@ def half_space_mask(
     Notes
     -----
     The test is **strict**, so a point exactly on the plane is excluded and the two masks for
-    opposite normals are disjoint rather than overlapping. That is the convention a reference
-    half-space split also takes (measured against one: with the plane ``z = 1``, a point at
-    ``z = 1`` is in neither half), and it makes the pair of masks a partition of the points off
+    opposite normals are disjoint rather than overlapping -- with the plane ``z = 1``, a point at
+    ``z = 1`` is in neither half -- and it makes the pair of masks a partition of the points off
     the plane.
 
     See Also
@@ -1065,9 +1064,7 @@ def farthest_point_sample(
         block_dim = kernel_points.FARTHEST_BLOCK_MID
     else:
         block_dim = kernel_points.FARTHEST_BLOCK_SMALL
-    # The whole greedy sweep is one persistent block -- see the kernel for why that wins here and
-    # the constants for the measured widths. It replaced a captured two-kernel round replayed
-    # ``count - 1`` times: 4.32 -> 1.20 ms at ``count=1024`` on 2 562 points, 21.1 -> 9.5 on 40 962.
+    # The whole greedy sweep runs as one persistent block; see the kernel for why.
     wp.launch_tiled(
         kernel_points.farthest_point_sample_block,
         dim=(1,),
@@ -1267,30 +1264,18 @@ def convex_superset_mask(
 
     Notes
     -----
-    Measured selectivity on 200k points (``subdivisions=3``), against the exact hull-vertex count
-    from [`scipy.spatial.ConvexHull`][]: standard normal, 88 hull vertices, 206 kept (0.10% of the
-    cloud); uniform in a ball, 2060 hull vertices, 3411 kept (1.7%); uniform in a cube, 223 hull
-    vertices, 1834 kept (0.9%). Flat-faced clouds are the weak case -- a triangulated inner shell
-    cannot hug a plane, so the survivors form a thin slab under each face -- and near-spherical
-    clouds are the strong one.
+    Selectivity depends strongly on the cloud's shape: a near-spherical cloud keeps a small
+    fraction of its points (a triangulated inner shell hugs it tightly), while a flat-faced cloud
+    keeps far more, because the shell cannot hug a plane and the survivors form a thin slab under
+    each face.
 
     The guarantee is exact in real arithmetic; in float32 it rests on ``margin`` covering the error
-    in the plane evaluation, so the default was measured rather than picked. Over 192 cases (six
-    distributions x eight seeds x ``subdivisions`` 0-3, 4k points, checked against
-    [`scipy.spatial.ConvexHull`][]), ``margin=1e-8`` discards a true hull vertex in 119 of them and
-    ``1e-7`` in 2 -- always a point lying *essentially exactly* on a tetrahedron face, where the
-    computed distance straddles zero -- while everything from ``1e-6`` up is clean. The ``1e-5``
-    default therefore sits 100x above the largest margin observed to fail, and costs 0.8 percentage
-    points of selectivity against the unsafe floor. ``TETRAHEDRON_FLATNESS`` is the other half of
-    the same protection: it discards sliver tetrahedra whose face normals are too ill-conditioned to
+    in the plane evaluation. Values of ``margin`` below ``1e-6`` can discard a true hull vertex --
+    always a point lying *essentially exactly* on a tetrahedron face, where the computed distance
+    straddles zero -- while ``1e-6`` and above are clean; the ``1e-5`` default sits well above that
+    boundary, at a small cost in selectivity. ``TETRAHEDRON_FLATNESS`` is the other half of the
+    same protection: it discards sliver tetrahedra whose face normals are too ill-conditioned to
     trust, and without it no margin in this range is safe.
-
-    Measuring the margin as a *distance* is what makes that trade cheap. The obvious alternative --
-    barycentric coordinates from an inverse of the tetrahedron's edge matrix, one matrix-vector
-    product instead of four plane evaluations -- needs a barycentric slack of ``1e-3`` for the same
-    safety, because these tetrahedra run from the centroid out to the shell and a fixed barycentric
-    slack cuts a thick layer off the base while cutting nothing off the sides. Measured on 200k
-    standard-normal points, that formulation keeps 4035 points where this one keeps 206.
 
     Degenerate input is handled by the same conservative logic rather than by a special case. A
     coplanar or collinear cloud makes every tetrahedron flat; flat tetrahedra are rejected as
@@ -1362,10 +1347,9 @@ def _support_extremes(
     Each thread reduces a strided slice of the cloud, so the launch is sized by
     [`items_per_slice`][triwarp._device.items_per_slice] points per thread rather than by the point
     count -- enough parallelism to fill the device while keeping the number of atomics into the
-    ``n_directions`` accumulator slots low. Four reductions still run the strided form on CUDA --
-    this one, ``visibility``'s support arg-max, ``proximity``'s winding-number sum and ``bounds``'
-    oriented-box extents -- and the slice length is chosen per device because this is the one they
-    were swept on.
+    ``n_directions`` accumulator slots low. The same per-device slice length also backs three other
+    strided reductions: ``visibility``'s support arg-max, ``proximity``'s winding-number sum and
+    ``bounds``' oriented-box extents.
     """
     device = points.device
     n_points = int(points.shape[0])

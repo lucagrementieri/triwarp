@@ -6,19 +6,16 @@ point-to-surface primitives in [`triwarp.proximity`][] with the tiled reductions
 in [`triwarp.reduce`][], and never move per-element data to the host.
 
 Chamfer distances follow the ``pytorch3d`` convention and are built on **squared**
-Euclidean distances -- and that is now measured rather than asserted:
-[`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points] agrees with
-``pytorch3d.loss.chamfer_distance`` to **7.02e-08** relative on two seeded clouds
-(``tests/test_metrics.py::test_chamfer_points_to_points_matches_pytorch3d``). Hausdorff distances
-follow libigl's ``igl::hausdorff`` and reduce the (already Euclidean) per-element distances with
-a maximum, so no squaring or final square root is needed.
+Euclidean distances. Hausdorff distances follow libigl's ``igl::hausdorff`` and reduce the
+(already Euclidean) per-element distances with a maximum, so no squaring or final square root is
+needed.
 
 One place the convention does *not* carry over, because the two libraries answer different
 questions: ``pytorch3d.loss.point_mesh_face_distance`` sums point-to-triangle with
 **face**-to-point, where
 [`chamfer_points_to_mesh`][triwarp.metrics.chamfer_points_to_mesh]'s backward direction is
-mesh-*vertex* to nearest query. The forward halves agree to 1.02e-07; the whole scalars differ by
-construction (0.606 against 0.586 on one measured fixture) and are not comparable.
+mesh-*vertex* to nearest query. The forward halves agree, but the whole scalars differ by
+construction and are not comparable.
 
 Two families of geometry are supported and can be mixed:
 
@@ -91,9 +88,8 @@ def chamfer_points_to_points(
 
     For each point in ``x`` the squared Euclidean distance to its nearest neighbor
     in ``y`` is accumulated (and symmetrically for ``y`` into ``x`` unless
-    ``single_directional``), following the ``pytorch3d`` convention -- measured **7.02e-08**
-    relative against ``pytorch3d.loss.chamfer_distance``, whose ``single_directional`` keyword maps
-    onto this one exactly.
+    ``single_directional``), following the ``pytorch3d`` convention, whose ``single_directional``
+    keyword maps onto this one exactly.
 
     Parameters
     ----------
@@ -273,10 +269,7 @@ def chamfer_mesh_to_mesh(
 # The Chamfer functions above return a Python ``float`` (a host scalar) and are not
 # differentiable. The ``*_loss`` variants below instead return a length-1 ``wp.float32``
 # device array carrying the (squared, pytorch3d-convention) Chamfer loss, so gradients
-# can be back-propagated with a caller-owned ``wp.Tape``. The forward *value* is the one measured
-# at 7.02e-08 against ``pytorch3d.loss.chamfer_distance``; the gradient is compared against a
-# closed-form numpy reimplementation of that convention instead (``tests/test_metrics.py``), since
-# a torch autograd comparison would be comparing two tape implementations rather than two answers.
+# can be back-propagated with a caller-owned ``wp.Tape``.
 #
 # Autodiff strategy (mirrors pytorch3d): the nearest-neighbor / closest-face assignment
 # is a non-differentiable ``argmin`` and is computed *outside* the tape; the assignment
@@ -315,9 +308,7 @@ def chamfer_points_to_points_loss(
     The nearest-neighbor assignment (via
     [`query_nearest`][triwarp.neighbors.query_nearest]) is computed
     outside ``tape`` and held constant during the backward pass, matching pytorch3d's
-    ``chamfer_distance`` gradient. The loss value itself is pinned at **7.02e-08** relative against
-    that function by
-    ``tests/test_metrics.py::test_chamfer_points_to_points_matches_pytorch3d``.
+    ``chamfer_distance`` gradient.
 
     Parameters
     ----------
@@ -654,8 +645,8 @@ def hausdorff_mesh_to_mesh(
 # Every helper below is shared by two or three of the public entry points above -- the
 # validation guards and reductions by all three ``chamfer_*`` functions, the three geometry
 # dispatches by a ``chamfer_*`` and a ``hausdorff_*`` pair each, and the launch/tape machinery
-# by the ``*_loss`` family -- so section 11's stepdown rule puts them in one trailing block
-# rather than after any single caller.
+# by the ``*_loss`` family -- so they are grouped in one trailing block rather than placed after
+# any single caller.
 
 
 def _validate_point_reduction(point_reduction: _PointReduction | None) -> None:
@@ -672,8 +663,7 @@ def _chamfer(
     """
     Combine forward/backward Euclidean distances into a Chamfer value.
 
-    Distances are squared element-wise (pytorch3d convention) before reduction -- the convention
-    the module docstring records as measured at 7.02e-08.
+    Distances are squared element-wise (pytorch3d convention) before reduction.
     """
     sq_forward = _square(d_forward)
     if point_reduction is None:
@@ -775,7 +765,7 @@ def _distances_points_to_mesh(
     d_backward = None
     if not single_directional:
         # The forward half is point-to-*surface*, so it is a lower bound on the point-to-vertex
-        # answer this search wants -- still the right scale, and measured 1.27-3.22x.
+        # answer this search wants -- still the right scale to seed it with.
         d_backward = tw.neighbors.query_nearest(
             points, vertices, k=1, initial_radius=_backward_radius(d_forward)
         )[1]
@@ -791,25 +781,14 @@ def _backward_radius(d_forward: twt.Array1dFloat32) -> float | None:
     cloud's* density -- and under ``"hashgrid"`` that number also fixes the cell width. For two
     clouds sampled from the same surface the density is the right scale, which is why the default
     is what it is. For two clouds that are **displaced** it is not: the answer sits at the
-    displacement, the cell width is sized for the density, and the walk widens past
-    ``_knn_widest_grid_radius`` into an exact linear scan of the whole cloud. Measured on a
-    ``dragon``-sized pair displaced by 0.05x its own bounding-box diagonal, that is 185 ms of
-    O(n**2) scan against 25 ms at a radius matched to the answer.
+    displacement rather than at the density scale, so the search can widen into an exact scan of
+    the whole cloud.
 
     Both directions of a pair share one distance scale, so the forward half already holds the
-    estimate -- no probe, no subsample, and the answer is unchanged either way, since the radius
-    is where the ladder *starts* and every row still certifies itself. Measured (min of 7
-    interleaved reps, RTX 5090, values bit-identical to the unseeded run):
-
-    | symmetric call | 8 171 pts | 35 947 | 437 645 |
-    |---|---|---|---|
-    | ``chamfer_points_to_points`` | **1.22x** | **1.31x** | **1.50x** |
-    | ``chamfer_points_to_mesh`` | **1.27x** | **1.45x** | **3.22x** |
-
-    The one host readback is what buys that, and it is the cheap half of the trade: ~0.1 ms
-    against 0.4-136 ms saved. ``max`` rather than a mean or a median because the radius only
-    *starts* the ladder -- overshooting costs a coarser grid, undershooting costs a full extra
-    deepening round per row, and the reduction is one launch either way.
+    estimate the backward search needs -- the answer is unchanged either way, since this only sets
+    where the search ladder *starts* and every row still certifies itself. ``max`` rather than a
+    mean or a median because overshooting the radius only costs a coarser grid, while
+    undershooting costs a full extra deepening round per row.
 
     Returns
     -------

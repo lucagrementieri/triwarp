@@ -51,9 +51,9 @@ from triwarp.kernels import transform as kernel_transform
 # rotation, a reflection or a uniform scale. A matrix composed from several rotations drifts off
 # orthogonality in ``float32``, so an exact test would demote a rigid motion to
 # ``TransformKind.AFFINE`` -- correct, but it throws away the cache carry-forward that
-# classification exists to enable. 1e-5 is the package's comparison tolerance (CLAUDE.md section
-# 6) and holds for a few dozen composed float32 rotations; past that a caller should pass
-# ``assume=`` rather than loosen this.
+# classification exists to enable. 1e-5 is the package's usual comparison tolerance and holds for a
+# few dozen composed float32 rotations; past that a caller should pass ``assume=`` rather than
+# loosen this.
 ORTHOGONALITY_RTOL = 1e-5
 
 
@@ -627,8 +627,8 @@ def as_mat44(matrix: wp.mat44 | wp.array[wp.mat44]) -> wp.mat44:
 
     Notes
     -----
-    A device array costs one host readback (~0.1 ms). Every caller here is making a host branch
-    over a whole launch, so the matrix has to cross either way.
+    A device array costs one host readback. Every caller here is making a host branch over a whole
+    launch, so the matrix has to cross either way.
 
     See Also
     --------
@@ -700,7 +700,7 @@ def _to_numpy(matrix: wp.mat44 | wp.array[wp.mat44]) -> np.ndarray:
     The single place a transform crosses device to host. Every decision made on it -- the
     orientation flip, the classification, the normal map -- is a host branch over a whole launch,
     so the matrix has to cross either way and a scalar ``wp.mat44`` costs nothing. ``list()[0]``
-    is the spelling CLAUDE.md section 4 names for a ``wp.array[wp.mat44]``, and is cheaper than
-    reading the buffer through ``.numpy()``.
+    is the preferred spelling for a ``wp.array[wp.mat44]``, and is cheaper than reading the buffer
+    through ``.numpy()``.
     """
     return np.array(as_mat44(matrix), dtype=np.float64).reshape(4, 4)

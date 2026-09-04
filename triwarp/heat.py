@@ -157,41 +157,20 @@ def heat_operators(
     -----
     The Poisson operator and both Jacobi preconditioners are here because they satisfy this
     function's own contract — they depend on the mesh alone — and
-    [`heat_geodesic`][triwarp.heat.heat_geodesic] used to rebuild all three on every call.
-    Measured on ``sphere_small`` (2 562 vertices), that was 0.33 ms for the ``bsr_axpy`` and 0.12 ms
-    per preconditioner out of a 6.29 ms amortized call, and the same on ``sphere_med`` where the
-    call is 12.57 ms: about 10 % and 5 % respectively. It is *only* those three — the solver
-    **state** is deliberately not cached, because a ``warp.optim.linear`` state captures its
-    right-hand-side and solution buffers at construction, which would make these operators
-    stateful and unsafe to share between two concurrent solves.
+    [`heat_geodesic`][triwarp.heat.heat_geodesic] used to rebuild all three on every call, which is
+    unnecessary work whenever the mesh is unchanged across several solves. It is *only* those
+    three — the solver **state** is deliberately not cached, because a ``warp.optim.linear`` state
+    captures its right-hand-side and solution buffers at construction, which would make these
+    operators stateful and unsafe to share between two concurrent solves. The remaining lever for
+    repeated calls is conditioning — a preconditioner stronger than Jacobi on a cotangent operator —
+    the same conclusion the constrained-solve family reaches in
+    [`harmonic`][triwarp.parametrization.harmonic].
 
-    !!! note "Caching the solver state would not pay, and this is why"
-        The obvious next step — a persistent single-rhs solver mirroring
-        [`spd_column_solver`][triwarp.linalg.spd_column_solver], keeping the CG loop's captured
-        graph alive across calls — was priced and **declined**: there is no host-side per-iteration
-        cost for it to remove. Measured on the amortized path, both solves cold-started the way
-        ``heat_geodesic`` actually starts them:
-
-        | | ``sphere_small`` | ``sphere_med`` |
-        |---|---|---|
-        | amortized call | 5.65 ms | 11.66 ms |
-        | heat solve alone | 1.98 | 2.02 |
-        | Poisson solve alone | **3.30** | **9.28** |
-        | the two together | **93.5 %** | **97.0 %** |
-
-        and the whole call tracks the CG tolerance almost linearly (``sphere_med``: 12.65 / 10.21 /
-        5.16 / 2.44 ms at ``tol`` = 1e-10 / 1e-6 / 1e-3 / 1e-1). So the call is **iteration-bound,
-        and the Poisson half is the expensive one**. That the cost is *device*-side rather than host
-        follows from ``check_every=0``, which takes the host out of the loop entirely and measures a
-        1.9x **loss** warm. The only real lever is conditioning — a preconditioner stronger than
-        Jacobi on a cotangent operator — which is the same conclusion the constrained-solve family
-        reaches in [`harmonic`][triwarp.parametrization.harmonic].
-
-        Two traps for anyone re-measuring this. ``solve_spd`` **warm-starts from whatever the
-        solution buffer already holds**, so timing it in a loop over one buffer makes every rep
-        after the first converge in ~0 iterations and reports 0.52 ms instead of 3.30. And this
-        tuple's *third* field is the raw (singular) Laplacian, not the Poisson system — handing it
-        a right-hand side runs CG to its 25 620-iteration cap.
+    !!! note
+        ``solve_spd`` **warm-starts from whatever the solution buffer already holds**, so reusing
+        one buffer across unrelated right-hand sides carries over the previous solution as the
+        initial guess. And this tuple's *third* field is the raw (singular) Laplacian, not the
+        Poisson system — handing it a right-hand side runs CG to its iteration cap.
 
     Raises
     ------
@@ -377,11 +356,9 @@ def heat_geodesic(
 
     # Shift so the distance field is zero at the (nearest) source. For a correctly signed field
     # the global minimum sits at the source set, so subtracting it yields a nonnegative field.
-    # Device reduction, not ``phi.numpy().min()``: ``phi`` is float64, so a readback moves 8 B per
-    # vertex across the bus to produce one scalar. Measured interleaved (RTX 5090, min of 30):
-    # CUDA 0.42x at 5k vertices, crossing over near 100k, 3.96x at 500k and 13.69x at 2M. CPU
-    # regresses 6-13x throughout -- Warp's CPU reduction against vectorized NumPy -- and that is
-    # the accepted price under CLAUDE.md section 13, which decides on the CUDA number.
+    # A device reduction rather than ``phi.numpy().min()``: ``phi`` is float64, so a readback moves
+    # 8 B per vertex across the bus to produce one scalar, which dominates on a large mesh even
+    # though a host reduction wins on a small one.
     offset = float(twr.min(phi))
     wp.map(wp.sub, phi, wp.float64(offset), out=phi)
     return phi
@@ -948,8 +925,8 @@ def transport_tangent_vectors(
     extended = extend_scalar(vertices, faces, sources, magnitudes, operators=scalar)
 
     # Both questions below are asked relative to the field, because the field's length carries the
-    # mesh's scale. One host readback: ``reduce.max`` returns a Python scalar, ~0.1 ms against the
-    # three conjugate-gradient solves this function has already run.
+    # mesh's scale. One host readback here (``reduce.max`` returns a Python scalar) is negligible
+    # next to the three conjugate-gradient solves this function has already run.
     lengths = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(wp.length, direction, out=lengths)
     maximum = tw.reduce.max(lengths)

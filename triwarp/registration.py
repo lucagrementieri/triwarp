@@ -104,10 +104,7 @@ def procrustes(
 
     **The returned matrix is column-vector, which is the transpose of pytorch3d's.**
     ``pytorch3d.ops.corresponding_points_alignment`` solves the row-vector form ``s X R + T = Y``,
-    so its ``R`` is this matrix's linear block divided by the scale and *transposed*. Measured
-    2.54e-07 on the rotation, 2.38e-07 on the translation, and a scale of 1.29999983 against its
-    1.30000031 on a planted 1.3
-    (``tests/test_registration.py::test_procrustes_matches_pytorch3d``).
+    so its ``R`` is this matrix's linear block divided by the scale and *transposed*.
     """
     n = int(a.shape[0])
     device = a.device
@@ -201,7 +198,7 @@ def _procrustes_into(
         device=device,
     )
     # One readback for the whole accumulator; ICP's convergence test needs the cost on the host,
-    # and at ~0.1 ms it is under 1% of an iteration (an extra device-side pass would cost more).
+    # and an extra device-side pass would cost more than the readback.
     cost = float(read_scalar(acc, int(kernel_registration.ACC_COST)))
     return out_matrix, out_transformed, cost
 
@@ -248,13 +245,9 @@ def icp(
     (point-cloud target); the alignment is the GPU tiled SVD of
     [`procrustes`][triwarp.registration.procrustes].
 
-    The pytorch3d agreement is measured rather than asserted: on a 300-point cloud under a planted
-    0.15 rad rotation the converged transforms agree to **2.62e-07** on the rotation and 2.35e-07
-    on the translation, with pytorch3d's own ``rmse`` at 4.03e-07
-    (``tests/test_registration.py::test_icp_point_cloud_matches_pytorch3d``). Its ``R`` is the
-    **transpose** of the linear block returned here, because it solves the row-vector form
-    ``s X R + T = Y``; the *converged transform* is what is comparable, not the iteration count,
-    since ``relative_rmse_thr`` is its own stopping rule.
+    Its ``R`` is the **transpose** of the linear block returned here, because it solves the
+    row-vector form ``s X R + T = Y``; the *converged transform* is what is comparable, not the
+    iteration count, since ``relative_rmse_thr`` is its own stopping rule.
 
     Parameters
     ----------
@@ -784,8 +777,7 @@ def _target_index(target_vertices: wp.array[wp.vec3]) -> _TargetIndex:
 
     Only the *source* moves between ICP iterations, so the target's BVH, bounding box and density
     estimate are all loop-invariant. Hoisting them turns each iteration's correspondence step into
-    a single launch with no host synchronisation at all — worth ~0.4 ms per iteration on a 36k
-    cloud, which is the dominant remaining cost once the search radius itself is sane.
+    a single launch with no host synchronisation at all.
     """
     bounds = tw.bounds.aabb(target_vertices)
     return {

@@ -295,15 +295,8 @@ def _link_segments(segment_edges: np.ndarray) -> tuple[np.ndarray, np.ndarray, l
 
     **Nothing here iterates per segment.** The successor comes from a lookup table rather than a
     sort -- an endpoint's unique-edge id indexes "which segment starts here", three ``O(n)`` passes
-    against an ``argsort``, measured 0.205 ms against 2.382 at 26 246 segments -- and the ordering
-    is two passes of Wyllie pointer doubling, ``O(n log L)`` in NumPy rather than one Python
-    iteration per segment. Measured on level sets of an ``icosphere(6)``, against the ``while``
-    loop this replaced: **1.56x at 742 segments, 4.13x at 8 280, 5.04x at 26 246 and 5.12x at
-    47 898**, with bit-identical slots, starts and flags at every size and on 18 mixed open/closed
-    level sets of ``hemisphere`` and ``half_torus``. The Python walk was 84-88 % of
-    ``marching_triangles``' whole cost on the many-curve fields, flat at 0.3 us per segment across
-    a 61x range of them; end to end the call measures **1.94x at wave40** and unchanged (1.06x) on
-    the single-contour fields, where the linking was never the cost.
+    against an ``argsort`` -- and the ordering is two passes of Wyllie pointer doubling, vectorized
+    in NumPy rather than one Python iteration per segment.
     """
     n = int(segment_edges.shape[0])
     start_edge = np.ascontiguousarray(segment_edges[:, 0])
@@ -648,9 +641,9 @@ def collision_masks(
 
     [`mesh_collision_pairs`][triwarp.intersection.mesh_collision_pairs] reduced to the two questions
     a repair or a selection actually asks -- *which of my faces are in trouble* -- and the form a
-    per-mesh collision bitset takes. It exists as its own entry point because
-    deriving it from the pairs means scattering a **column** of a rank-2 array, and a column is a
-    strided view that Warp's Python-scope gather silently misreads (CLAUDE.md section 4).
+    per-mesh collision bitset takes. It exists as its own entry point because deriving it from the
+    pairs means scattering a **column** of a rank-2 array, and a column is a strided view that
+    Warp's Python-scope gather silently misreads.
 
     Parameters
     ----------
@@ -736,17 +729,11 @@ def slice_mesh_with_plane(
 
     Every face falls into exactly one of three kept classes — wholly inside, cut into a quad, cut
     into a triangle — and the three are compacted by a *single* scan over one blocked flag buffer,
-    so the call makes **one** host readback (the three class counts, 12 bytes) rather than one per
-    class. Those counts then size the output buffers for their final use, and the two cut kernels
-    write their triangles and their intersection points straight into them, so nothing is
-    concatenated afterwards.
-
-    Measured back to back on an RTX 5090 (`benchmarks/test_intersection.py`'s
-    ``slice_mesh_with_plane`` group, medians from ``--benchmark-json``): **2.40x** on ``bunny``
-    (1.94 -> 0.81 ms), 2.17x on ``happy_buddha``, 1.90x on ``dragon`` (1.75 -> 0.92) and 1.15x on
-    ``lucy``. It is *flat* on ``bunny_decimated`` (1.20 -> 1.23 ms), the smallest mesh, because
-    three readbacks or one, that row is at the ~340 µs wrapper floor — which is also why the cost
-    here barely tracks the face count: the plane still meets only ``O(sqrt(n_faces))`` triangles.
+    so the call makes one host readback (the three class counts) rather than one per class. Those
+    counts then size the output buffers for their final use, and the two cut kernels write their
+    triangles and their intersection points straight into them, so nothing is concatenated
+    afterwards. The cost barely tracks the face count, since the plane still meets only
+    ``O(sqrt(n_faces))`` triangles.
 
     See Also
     --------
@@ -977,10 +964,6 @@ def clip_mesh_with_field(
     [`trimesh.intersections.slice_faces_plane`][]'s: each cut face writes its own copy of the
     crossing points, so a rim edge carries two coincident vertices. Those copies are bitwise equal
     by construction, which is what makes ``cap=True``'s weld exact rather than a tolerance choice.
-
-    Measured against ``clip_closed_surface`` on ``icosphere(3)`` at ``z = 0.1``: same 762 faces and
-    the same volume to seven digits (1.7651057), from a min-weight cap against VTK's own
-    triangulation of the section.
 
     Equivalent to VTK's ``clip_scalar`` (uncapped) and ``clip_closed_surface`` (capped, over a
     plane's signed distance), which pyvista exposes on ``PolyData``; VTK's default keeps

@@ -46,9 +46,8 @@ from triwarp.triangles import face_normals_and_areas
 
 # Elements per thread for the two *per-query* lane-free reductions here (solid-angle sum, packed
 # support argmax). Unlike a global reduction, these have one accumulator per query, so the query
-# dimension already supplies the parallelism and a short slice only multiplies the atomic traffic:
-# measured on 20k faces x 5000 queries, 128 runs 0.49 ms against 3.7 ms at 8 and 13.8 ms at 4. The
-# optimum is flat over 128-256 and degrades again past 512, so this is not a sensitive knob.
+# dimension already supplies the parallelism and a short slice only multiplies the atomic traffic.
+# This is not a sensitive knob: the optimum is flat over a fairly wide range.
 ITEMS_PER_QUERY_SLICE = 128
 
 # First search radius for [`closest_point_on_edges`][triwarp.proximity.closest_point_on_edges], as a
@@ -68,65 +67,37 @@ _MIN_POSITIVE_FLOAT32 = 1.1754943508222875e-38
 # [`mesh_to_mesh_distance`][triwarp.proximity.mesh_to_mesh_distance]'s first pass before handing its
 # face to the block-cooperative second one.
 #
-# The split exists because that traversal is not merely uneven, it is a long tail on a flat floor.
-# Measured on ``bunny`` against a translated copy, 69 451 query faces and 2.01 M candidate tests:
-# **98.2 % of the faces return no candidate at all**, 0.5 % of them carry half the total, and the
-# busiest single face walks **3 428** candidates by itself -- so the launch's wall time was set by a
-# few hundred threads each stepping a BVH sequentially while the rest of the machine idled. Only
-# **0.16 %** of candidates survive the box prune, so the cost is the walk and not the leaf test.
+# The split exists because that traversal is badly unbalanced: the vast majority of query faces
+# return no candidate at all, a small fraction carry most of the cost, and the busiest single face
+# can walk a BVH sequentially for far longer than typical, so the launch's wall time is set by a
+# handful of threads while the rest of the machine idles.
 #
-# 64 is chosen to sit well above the floor and far below the tail: at that value 1 194 of 69 451
-# faces overflow on ``bunny`` and 283 of 16 301 on ``bunny_decimated``, so the second launch is
-# small and the first is not doing the tail's work. Measured on the query launch alone, interleaved,
-# ``min`` of 7, with the returned distance and face pair asserted identical:
-#
-#     row                     one pass    two passes
-#     bunny_decimated near      2.60 ms      0.81      3.21x
-#     bunny_decimated far       2.87         0.75      3.82x
-#     bunny near                9.79         1.24      7.93x
-#     bunny far                 6.38         1.16      5.51x
-#
-# The value is not sharp -- it trades first-pass work against second-pass launches, and both ends
-# are cheap -- but do not raise it far: the point of the cap is that a thread stops *before* it
-# becomes the launch's critical path.
+# 64 is chosen to sit well above the typical floor and far below the tail, so only a small fraction
+# of faces overflow into the second launch. The value is not sharp -- it trades first-pass work
+# against second-pass launches, and both ends are cheap -- but do not raise it far: the point of the
+# cap is that a thread stops *before* it becomes the launch's critical path.
 _QUERY_CANDIDATE_CAP = 64
 
 # Query points to draw from mesh A when deriving ``mesh_to_mesh_distance``'s own upper bound. The
 # bound only has to be an upper bound -- it seeds the broad phase's prune limit and nothing else --
 # so a *subsample* of A's vertices is as correct as all of them and merely looser, and the whole
-# question is what a looser bound costs the traversal it is paying for.
+# question is what a looser bound costs the traversal it is paying for. On a large mesh this vertex
+# query can otherwise dominate the whole call, since it costs one closest-point query per vertex to
+# prune a broad phase that itself is comparatively cheap.
 #
-# It costs almost nothing, and the bound was almost the whole call. Stage-attributed at the
-# benchmark's own operating point (a disjoint copy at 1.2x the x-extent), warm, one call between
-# two syncs: on ``lucy`` the vertex query is a single kernel at **702.78 ms of a 758.47 ms call --
-# 93.1 %** -- against 31.6 ms for the ``wp.Mesh`` build and **6.1 ms for both traversal passes
-# together**. Fourteen million vertex queries were being paid to prune a walk that costs 0.8 % of
-# the call.
-#
-# Interleaved against the full-vertex bound, warm, min of 5, distance and ``face_a`` identical in
-# every cell:
-#
-#     target      bunny        dragon      happy_buddha
-#     2 048       1.00-1.02x   1.14-1.24x  1.38-1.45x
-#     16 384      1.02-1.03x   1.16-1.24x  1.30-1.36x
-#     65 536      --           1.16-1.18x  1.31-1.37x
-#
-# and ``lucy`` at 16 384 measures **9.32x** (638.53 -> 68.51 ms) with the distance *and* both
-# witness faces identical. The sweep is flat because the bound barely loosens -- 0.0464651 against
-# an exact 0.0459145 at 2 048 points on ``dragon``, 1.2 % -- so the traversal is handed almost the
-# same limit for a thousandth of the queries. The value is therefore not sharp; 16 384 sits in the
-# flat middle with margin at both ends, and it is a *count* rather than a fraction so the saving
-# grows with the mesh, which is where it is needed.
+# A subsample barely loosens the bound in practice -- the true minimum vertex-to-surface distance is
+# rarely realized by only a rare vertex -- so the traversal is handed almost the same limit for a
+# small fraction of the queries. The value is a *count* rather than a fraction, so the saving grows
+# with the mesh, which is where it is needed.
 #
 # A stride, not a random draw: it is deterministic, needs no RNG and no gather, and a strided view
-# is a legal kernel argument (section 3.4's hazard is Python-scope *index* gathers, which this is
-# not). A pathological vertex ordering can only make the bound looser, never wrong.
+# is a legal kernel argument. A pathological vertex ordering can only make the bound looser, never
+# wrong.
 _BOUND_SAMPLE_TARGET = 16_384
 
-# Block width for that second pass: one warp per straggler face. Wider blocks were not measured to
-# help, and a warp is what
-# [`ball_pivoting`][triwarp.reconstruction.ball_pivoting]'s pivot search settled on for the same
-# ``wp.tile_bvh_query_aabb`` walk.
+# Block width for that second pass: one warp per straggler face. Wider blocks did not help, and a
+# warp is what [`ball_pivoting`][triwarp.reconstruction.ball_pivoting]'s pivot search settled on for
+# the same ``wp.tile_bvh_query_aabb`` walk.
 _QUERY_TILE_WIDTH = 32
 
 # Ray-origin offset *below* the surface along the inward normal, as a fraction of the query AABB
@@ -136,8 +107,8 @@ _SDF_SURFACE_OFFSET = 1e-4
 # [`containing_faces_2d`][triwarp.proximity.containing_faces_2d]'s candidate search radius, as a
 # fraction of the triangulation's bounding-box diagonal, and the barycentric slack that then decides
 # containment. The radius only has to exceed the float32 rounding of a closest-point query on a flat
-# mesh (measured at ~1e-5 of the diagonal), and being generous costs only BVH descent on queries
-# that land outside; the sign test classifies, so the two are not a precision trade-off.
+# mesh, and being generous costs only BVH descent on queries that land outside; the sign test
+# classifies, so the two are not a precision trade-off.
 _CONTAINMENT_SEARCH_SCALE = 1e-3
 _CONTAINMENT_BARYCENTRIC_EPS = wp.float32(1e-6)
 
@@ -175,8 +146,6 @@ def closest_point_on_mesh(
         build this otherwise pays on every call. Purely an optimization: the answer is identical
         either way, and it is not checked against ``vertices`` / ``faces`` -- passing a mesh over
         *different* geometry silently answers for that geometry, since only ``mesh`` is queried.
-        Measured saving on an RTX 5090: a flat **0.15-0.27 ms** (the clone plus the build), so 32%
-        of a single-query call and 1.7% of a 100 000-query one on 82k faces.
         [`Trimesh.warp_mesh`][triwarp.mesh.Trimesh.warp_mesh] is a cached property and is what to
         pass.
 
@@ -241,8 +210,7 @@ def closest_point_on_edges(
     ``max_dist`` semantics, but the geometry is a set of segments rather than a surface. That is the
     query a crease set, a seam, a boundary rim or a feature curve wants -- all four are already
     produced as an edge array by [`triwarp.seams`][triwarp.seams],
-    [`triwarp.boundary`][triwarp.boundary] and [`triwarp.edges`][triwarp.edges], and none of them
-    could be measured against before.
+    [`triwarp.boundary`][triwarp.boundary] and [`triwarp.edges`][triwarp.edges].
 
     Parameters
     ----------
@@ -290,7 +258,7 @@ def closest_point_on_edges(
     closest point lies within ``r``, so a best distance under ``r`` certifies the answer. The
     tempting shortcut -- one degenerate ``(a, b, b)`` triangle per edge, queried with
     ``wp.mesh_query_point_no_sign`` -- does **not** work: Warp's mesh BVH rejects a zero-area
-    triangle, measured as 64 misses out of 64 queries on both devices (Warp 1.17).
+    triangle outright, on both devices.
 
     See Also
     --------
@@ -417,11 +385,9 @@ def mesh_to_mesh_distance(
         and ties are the common case rather than the exotic one: whenever the closest approach is
         realised at a *vertex*, every face around that vertex achieves the minimum exactly. The
         tie-break on ``face_a`` is the lowest index; ``face_b`` is **unspecified** among the faces
-        attaining it, and which one comes back depends on how many candidates that face's broad
-        phase walked. Measured on ``bunny`` against a translated copy, two runs of the same input
-        return ``face_b`` 9 814 and 1 283 with the squared distance bit-identical. Compare
-        *distances* against another implementation, and faces only where the configuration is
-        generic.
+        attaining it, and which one comes back can differ between runs of the identical input even
+        though the squared distance is bit-identical. Compare *distances* against another
+        implementation, and faces only where the configuration is generic.
 
     See Also
     --------
@@ -451,8 +417,8 @@ def mesh_to_mesh_distance(
         # answer from above. One readback, and it is what lets the broad phase cull at all.
         #
         # Over a *subsample* of A's vertices, because a minimum over a subset is still an upper
-        # bound and this query was 93 % of the call on ``lucy`` -- see ``_BOUND_SAMPLE_TARGET`` for
-        # the attribution and the sweep. A looser limit prunes less, so the traversal examines a
+        # bound and this query can otherwise dominate the whole call on a large mesh -- see
+        # ``_BOUND_SAMPLE_TARGET``. A looser limit prunes less, so the traversal examines a
         # superset of the candidates it did before and its minimum is the same value.
         stride = max(1, int(vertices_a.shape[0]) // _BOUND_SAMPLE_TARGET)
         probe = vertices_a if stride == 1 else vertices_a[::stride]
@@ -460,27 +426,8 @@ def mesh_to_mesh_distance(
         upper_bound = float(tw.reduce.min(distances))
 
     # The per-face AABBs stay: the kernel's box-gap prune reads them, so they are not merely the
-    # input to a build. What is gone is the **second** acceleration structure that used to be built
-    # over them -- ``bvh_from_bounds(lower, upper)`` -- next to the ``wp.Mesh`` the bound above
-    # already built and then discarded. The kernels now read that mesh's own BVH with
-    # ``wp.mesh_get_bvh`` (Warp 1.17).
-    #
-    # Measured at the benchmark's operating point (a disjoint copy at 1.2x the x-extent, which is
-    # ``_CLEARANCE_OFFSETS[0]``), the build alone was **9.2 % / 7.5 / 18.1** of the call on
-    # ``bunny_decimated`` / ``bunny`` / ``dragon`` -- a share that *grows* with the input. End to
-    # end, back to back across two trees at both clearances: **1.07x / 1.00, 1.01 / 1.05,
-    # 1.18 / 1.23** (near / far), with the returned distance **and both witness face indices
-    # bit-identical in all six cells**. The gain tracks the removed build, which answers the one
-    # open question here -- the mesh's BVH uses Warp's own leaf policy rather than ``leaf_size=4``,
-    # so the traversal could have regressed and eaten it; it did not, and ``dragon`` (where the
-    # build was the largest share) gained the most.
-    #
-    # Getting that share right needed the right input, and this is the trap worth recording: a
-    # first pass measured the same stages against a copy translated 0.6x the extent on *all three*
-    # axes -- heavily interpenetrating rather than disjoint -- where the whole call is 5.6 / 37.0 /
-    # 8 754 ms instead of 2.1 / 3.1 / 5.4 and the same build reads **3.8 % falling to 0.7 %**. On
-    # those numbers this was written up as a decline. Same code, same stage, opposite conclusion,
-    # because the traversal explodes on interpenetrating meshes and dilutes everything else.
+    # input to a build. There is no second acceleration structure built over them -- the kernels
+    # read the ``wp.Mesh`` built above's own BVH directly with ``wp.mesh_get_bvh``.
     lower = wp.empty(n_faces_b, dtype=wp.vec3, device=device)
     upper = wp.empty(n_faces_b, dtype=wp.vec3, device=device)
     wp.launch(
@@ -492,10 +439,7 @@ def mesh_to_mesh_distance(
     distance_sq = wp.empty(n_faces_a, dtype=wp.float32, device=device)
     witness = wp.empty(n_faces_a, dtype=wp.int32, device=device)
     # Seeded at the bound the vertex query already paid for, so every thread prunes against it from
-    # its first candidate instead of waiting for some other thread to publish one. Worth 1.05-1.64x
-    # on this launch, measured interleaved with byte-identical distances (``bunny_decimated``
-    # 6.93 -> 5.25 ms near and 2.92 -> 1.98 far, ``bunny`` 8.66 -> 7.69 and 7.29 -> 6.91,
-    # ``dragon`` 5.59 -> 5.17 and 1.67 -> 1.02).
+    # its first candidate instead of waiting for some other thread to publish one.
     #
     # Seeded at *exactly* ``upper_bound ** 2`` this is wrong, and that is why it used to be ``inf``:
     # the prune skips a candidate whose box gap is ``>=`` the limit, so when the bound *is* the
@@ -511,12 +455,11 @@ def mesh_to_mesh_distance(
         dtype=wp.float32,
         device=device,
     )
-    # The broad phase is wildly unbalanced -- 98.2 % of query faces return no candidate and 0.5 %
-    # carry half the traversal -- so the walk runs in two passes on CUDA: a thread per face, capped,
-    # then a *block* per face that exceeded the cap. See ``_QUERY_CANDIDATE_CAP``. On the cpu device
-    # ``wp.launch_tiled`` runs one lane per block, so the second pass would be a serial re-walk;
-    # there the cap is disabled and the first pass settles every face, which is what this function
-    # did on both devices before.
+    # The broad phase is wildly unbalanced -- most query faces return no candidate at all, while a
+    # few carry most of the traversal -- so the walk runs in two passes on CUDA: a thread per face,
+    # capped, then a *block* per face that exceeded the cap. See ``_QUERY_CANDIDATE_CAP``. On the
+    # cpu device ``wp.launch_tiled`` runs one lane per block, so the second pass would be a serial
+    # re-walk; there the cap is disabled and the first pass settles every face instead.
     tiled = prefers_tiled_reduction(device)
     candidate_cap = _QUERY_CANDIDATE_CAP if tiled else INT32_MAX
     overflow = wp.empty(n_faces_a if tiled else 1, dtype=wp.int32, device=device)
@@ -544,7 +487,7 @@ def mesh_to_mesh_distance(
     )
     if tiled:
         # One readback, and it is what sizes the second launch. Skipping it by launching
-        # ``n_faces_a`` blocks would put an empty block on 98 % of them.
+        # ``n_faces_a`` blocks would put an empty block on nearly all of them.
         n_overflow = int(read_scalar(counter, 0))
         if n_overflow > 0:
             wp.launch_tiled(
@@ -578,19 +521,8 @@ def mesh_to_mesh_distance(
     # distance and the argmin -- no second pass over the candidates.
     best_face_a = int(tw.reduce.min(keys)) & 0xFFFFFFFF
     # Two 4-byte reads, not two ``.numpy()`` calls: each of those copies the *whole* per-face array
-    # to the host to index one element. Measured on an RTX 5090, Warp 1.17, at this benchmark's own
-    # operating point (x-only translation of 1.2x the x-extent), interleaved, min of 15 -- the pair
-    # of reads against the whole call:
-    #
-    #   bunny  69 451 faces    0.106 -> 0.048 ms      3.34% -> 1.52% of a 3.18 ms call
-    #   dragon 871 414         0.490 -> 0.058          8.88% -> 1.05% of a 5.51 ms call
-    #   lucy   28 055 742    102.629 -> 0.123         12.46% -> 0.01% of an 823.9 ms call
-    #
-    # The share *grows* with the mesh because the copy does and the rest of the call does not, so
-    # this is the opposite of the falling share section 9 calls a decline. It also revises the
-    # attribution in section 16.6, which had this function's cost as "the structure builds and the
-    # bound" after finding the two traversal passes were ~2% of it: 12.5% of ``lucy``'s call was
-    # these two lines, invisible to a device profile because it is host time.
+    # to the host to index one element, which matters increasingly on a large mesh where the copy
+    # would dominate.
     return (
         math.sqrt(float(read_scalar(distance_sq, best_face_a))),
         best_face_a,
@@ -698,21 +630,17 @@ def signed_distance_on_mesh(
         Jacobson et al. robust inside/outside criterion and it degrades gracefully on
         non-watertight input, which is why it is the mode to reach for on raw scan data.
 
-        Measured on this repo's fixtures: the two modes agree on watertight meshes
-        (icosahedron, ``cave_cube``), but on a sphere with a patch of faces removed ``"winding"``
-        reproduces the exact generalized winding number's sign on 100% of query points while
-        ``"parity"`` manages 93.2%. The costs are a 1.2-1.5x slower query
-        (``benchmarks/test_proximity.py``) and a substantially larger ``wp.Mesh``:
-        ``support_winding_number=True`` stores a solid-angle expansion per BVH node, measured at
-        roughly 3x the mesh's device memory (+235 MB on dragon's 871k faces).
+        The two modes agree on watertight meshes, but on a surface with an open patch ``"winding"``
+        reproduces the exact generalized winding number's sign far more often than ``"parity"``
+        does. The cost is a slower query and a larger ``wp.Mesh``: ``support_winding_number=True``
+        stores a solid-angle expansion per BVH node, using noticeably more device memory.
 
         ``"winding"`` is still much cheaper than thresholding
         [`winding_number`][triwarp.proximity.winding_number] yourself, because that sums the exact
-        solid angle over *every* face for *every* query: at 10k queries the same sign decision costs
-        8.1 ms this way versus 167 ms exactly on dragon (871k faces), and the gap widens with the
-        face count. Reach for [`winding_number`][triwarp.proximity.winding_number] only when you
-        need the winding *value* — Warp exposes no builtin for the approximated value, only its
-        sign.
+        solid angle over *every* face for *every* query rather than using the BVH's Barnes-Hut
+        traversal, and the gap widens with the face count. Reach for
+        [`winding_number`][triwarp.proximity.winding_number] only when you need the winding
+        *value* — Warp exposes no builtin for the approximated value, only its sign.
 
     Parameters
     ----------
@@ -746,8 +674,6 @@ def signed_distance_on_mesh(
         build. **Only valid with ``sign_mode="parity"``**: the winding mode needs a mesh built with
         ``support_winding_number=True``, and ``wp.Mesh`` exposes no way to read that flag back, so a
         supplied mesh cannot be checked and is refused rather than silently degraded to parity.
-        See [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh] for the measured
-        saving.
 
     Returns
     -------
@@ -1154,18 +1080,14 @@ def containing_faces_2d(
     query's own coordinates decides. That reuses the BVH ``wp.Mesh`` already builds, at the cost of
     one lifted ``wp.vec3`` copy of ``vertices``.
 
-    The second stage is not redundant. Deciding on the query radius alone misclassifies ~0.2% of
-    random queries on a 3 979-triangle Delaunay mesh, because an in-plane point's closest-point
-    distance is not exactly zero in ``float32``: measured against
-    ``scipy.spatial.Delaunay.find_simplex``, a radius of 1e-7 / 1e-6 / 1e-5 of the bounding diagonal
-    misses 73 / 28 / 6 interior points, while 1e-5 / 1e-4 / 1e-3 falsely accepts 0 / 14 / 59
-    exterior ones -- no radius separates them. The barycentric test is ~1000x sharper, so the radius
-    is only a search bound and there is no tolerance to tune.
+    The second stage is not redundant: deciding on the query radius alone misclassifies some
+    queries, because an in-plane point's closest-point distance is not exactly zero in
+    ``float32`` and no radius threshold separates every interior point from every exterior one.
+    The barycentric test is much sharper, so the radius is only a search bound and there is no
+    tolerance to tune.
 
-    Building that BVH is per call, so a caller locating several point sets in one triangulation pays
-    for it each time -- there is no prebuilt-index entry point, which is also why the benchmark's
-    scipy row (``scipy.spatial.Delaunay.find_simplex`` on a triangulation built outside the timed
-    region) is the *unfavourable* comparison for triwarp rather than the flattering one.
+    Building that BVH happens on every call, so a caller locating several point sets against the
+    same triangulation pays for it each time -- there is no prebuilt-index entry point.
 
     See Also
     --------

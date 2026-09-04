@@ -208,9 +208,9 @@ def _edge_groups(
     vertices than faces). The grouping partition is invariant to the (sufficiently large) base.
 
     When ``edges_sorted`` is ``None`` the keys are built straight off ``faces`` in one launch, so
-    the ``(3 * n_faces, 2)`` edge rows are never written or read back — measured 1.1-1.6x over
-    building them first. Both spellings produce byte-identical keys, hence identical group order,
-    so callers can mix the two paths and still get row-aligned results.
+    the ``(3 * n_faces, 2)`` edge rows are never written or read back. Both spellings produce
+    byte-identical keys, hence identical group order, so callers can mix the two paths and still
+    get row-aligned results.
     """
     if edges_sorted is not None:
         return tw.grouping.group_int_rows(
@@ -232,10 +232,9 @@ def _hash_radix(faces: wp.array[wp.int32], n_vertices: int | None) -> int:
     Resolve the row-hash base for the fused edge keys: ``n_vertices``, or one past the largest.
 
     Inferring it costs a ``reduce.minmax`` and the host readback that ends it, which is the sync
-    ``n_vertices=`` exists to skip (measured 1.25-1.74x on the whole call). The reduction runs over
-    the ``3 * n_faces`` face buffer rather than the ``(3 * n_faces, 2)`` edge rows the composed
-    path scans, so it also sees half the data. The negativity check matches
-    [`hash_indices_rows`][triwarp.grouping.hash_indices_rows].
+    ``n_vertices=`` exists to skip. The reduction runs over the ``3 * n_faces`` face buffer rather
+    than the ``(3 * n_faces, 2)`` edge rows the composed path scans, so it also sees half the data.
+    The negativity check matches [`hash_indices_rows`][triwarp.grouping.hash_indices_rows].
     """
     if n_vertices is not None:
         if n_vertices <= 0:

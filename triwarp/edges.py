@@ -246,8 +246,7 @@ def _edge_lengths(vertices: wp.array[wp.vec3], edges: twt.Array2dInt32) -> wp.ar
     The shared body of [`edges_unique_length`][triwarp.edges.edges_unique_length] and
     [`edges_length`][triwarp.edges.edges_length], which differ only in which edge table they
     obtain first. Stays a kernel rather than a ``wp.map`` over gathered endpoints: the columns
-    of ``edges`` are strided views, and Warp's Python-scope gather ignores a view's stride
-    (CLAUDE.md section 4).
+    of ``edges`` are strided views, and Warp's Python-scope gather ignores a view's stride.
     """
     m = int(edges.shape[0])
     device = vertices.device

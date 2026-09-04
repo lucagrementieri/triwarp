@@ -378,23 +378,14 @@ def split(
     # Warp rejects a zero-length slice at the very end of a buffer (``arr[n:n]``) while accepting
     # an interior one, so an empty trailing segment needs its own allocation.
     #
-    # Both loops below are per-segment host constants, measured on an RTX 5090 at 256 segments and
-    # flat from 48 903 to 2 614 242 elements: **3.63 us** to build one ``wp.array`` view and
-    # **15.06 us** for one ``wp.clone`` (a 10 us allocation plus a 6 us copy). The offsets readback
-    # above is 0.026 ms *once*, so it is 2.6 % of the view path rather than its cost. Two levers
-    # were measured and declined:
+    # Views are built with ``array[begin:end]`` rather than a raw ``wp.array(ptr=..., shape=...,
+    # strides=...)`` construction: the latter re-implements ``wp.array.__getitem__``'s contract (20
+    # attributes) and already gets one of them wrong, dropping the ``grad`` view a slice of a
+    # ``requires_grad`` array carries.
     #
-    # - Constructing the views with ``wp.array(ptr=..., shape=..., strides=...)`` and a ``_ref``
-    #   back-reference instead of ``array[begin:end]`` is **1.57-1.69x** (3.71 -> 2.19 us each).
-    #   Declined: it re-implements ``wp.array.__getitem__``'s contract, which a probe found to be
-    #   20 attributes -- and the raw form already gets one of them wrong, dropping the ``grad``
-    #   view a slice of a ``requires_grad`` array carries. The reward is ~1.0 ms across a benchmark
-    #   group whose rows stay losses either way, against a permanent liability to a Warp field
-    #   nobody re-checks.
-    # - Allocating **one** buffer for ``copy=True``, filling it with a single ``wp.copy`` and
-    #   returning disjoint views of that is **3.93-4.02x**. Declined: it would keep the promise
-    #   that a write cannot reach ``array`` while quietly dropping the other half of what
-    #   ``copy=True`` is for -- holding one segment would again pin the whole allocation.
+    # ``copy=True`` clones each segment independently rather than filling one shared buffer with
+    # disjoint views into it, because a shared allocation would mean holding one segment pins the
+    # whole buffer alive -- the opposite of what ``copy=True`` promises.
     segments = [
         array[begin:end] if end > begin else wp.empty(0, dtype=array.dtype, device=array.device)
         for begin, end in itertools.pairwise(bounds)
@@ -413,12 +404,11 @@ def _pack_segments(
     whether the caller wants the segment offsets back as a device array.
 
     **The offsets come back as a host list, and only ``pack_1d_arrays`` converts.** They are
-    computed on the host in the first place, from each segment's ``shape``, so a device array is
-    strictly an extra ``wp.array(...)`` upload (~16 us of host time, flat in the segment count) --
-    and ``concatenate`` discards the offsets entirely, taking ``[0]`` of this return. Converting
-    here would make one of the two callers pay for a buffer it never reads; the conversion
-    therefore sits in the caller that wants it, which is also the only place the *convention* for
-    the pair (values first) is stated.
+    computed on the host in the first place, from each segment's ``shape``, and ``concatenate``
+    discards the offsets entirely, taking ``[0]`` of this return. Converting here would make one
+    of the two callers pay for a buffer it never reads; the conversion therefore sits in the
+    caller that wants it, which is also the only place the *convention* for the pair (values
+    first) is stated.
 
     With ``copy=False`` the result may be one of the inputs' own storage rather than a fresh
     buffer -- see [`_tiled_span`][triwarp.array._tiled_span] for when, and for why the choice
@@ -446,14 +436,10 @@ def _pack_segments(
         if already_packed is not None:
             return already_packed, offsets
 
-    # One ``wp.copy`` per segment at **6.02 us** of host time each, and that is the whole cost: the
-    # same 2 614 242 elements moved in a *single* ``wp.copy`` measure 0.015 ms, so 99 % of a
-    # 256-segment pack is per-call overhead and the row is flat from 0.07 MB to 268 MB. There is no
-    # segmented alternative -- Warp has no array-of-arrays and a kernel cannot dereference a raw
-    # pointer -- and **graph capture is refuted**: recording this loop and replaying it once is
-    # 0.84-0.88x at 256, 1 024 and 4 096 segments, because the segment pointers change per call so
-    # the recording is never reused. (Replaying an *already recorded* graph is 7.7-8.5x, which is
-    # the number that makes capture look attractive and is unreachable from here.)
+    # One ``wp.copy`` per segment. There is no segmented alternative -- Warp has no array-of-arrays
+    # and a kernel cannot dereference a raw pointer -- and graph capture cannot amortize this loop
+    # either, since the segment pointers change on every call, so a recorded graph could never be
+    # replayed against new segments.
     flat = wp.empty(total, dtype=dtype, device=device)
     for arr, offset, n in zip(arrays, offsets, sizes, strict=True):
         if n > 0:
@@ -470,15 +456,13 @@ def _tiled_span(
     ``split`` and [`pack_1d_arrays`][triwarp.array.pack_1d_arrays] are documented inverses, and the
     round trip is common: [`boundary_loops`][triwarp.boundary.boundary_loops] slices one packed
     buffer into per-loop views and every batched consumer of those loops packs them straight back.
-    Copying there rebuilds a buffer that already exists, one ``wp.copy`` per segment -- measured at
-    **2.505 ms of ``loop_perimeters``' 2.633 ms on ``dragon``**, 407 launches to move 17 kB, against
-    0.023 ms for the launch the function exists for.
+    Copying there would rebuild a buffer that already exists, one ``wp.copy`` per segment to move
+    data that never needs to move.
 
     It runs only for a caller that asked (``copy=False``), because a packer that *sometimes* aliases
-    is a trap and this one was caught by the suite on its first run: ``combine.concatenate`` adds
-    each piece's vertex offset into the packed face buffer **in place**, so a view handed to it
-    rewrites the caller's own faces. Which callers write is not inferable from here, so the choice
-    stays theirs.
+    is a trap: ``combine.concatenate`` adds each piece's vertex offset into the packed face buffer
+    **in place**, so a view handed to it rewrites the caller's own faces. Which callers write is not
+    inferable from here, so the choice stays theirs.
 
     The gate is *identity* on the base rather than adjacency of the pointers. Two separately
     allocated buffers can land adjacent in Warp's memory pool by luck, and an adjacency test would
@@ -654,9 +638,9 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     two- and three-wide rows every in-library caller sorts dominates the comparison work by orders
     of magnitude.
     """
-    # The narrow path's margin, for whoever considers deleting it: sorting a million two-element
-    # rows through ``segmented_sort_pairs`` cost ~183 ms against ~0.1 ms for the compare-and-swap
-    # the width actually needs.
+    # The narrow path's margin, for whoever considers deleting it: a fixed per-segment cost in
+    # ``segmented_sort_pairs`` dominates the comparison work for rows this narrow, where a plain
+    # compare-and-swap needs none of it.
     n = data.size
     n_rows, n_cols = int(data.shape[0]), int(data.shape[1])
     if n_rows == 0 or n_cols < 2:
@@ -817,9 +801,9 @@ def isin(
         non-negative -- the same escape hatch, and the same shape of it, as
         [`hash_indices_rows`][triwarp.grouping.hash_indices_rows]' ``max_index``. Supplying it
         pins the strategy to the direct-index table and skips the two ``triwarp.reduce.minmax``
-        reductions that would otherwise infer the span, and with them **two host readbacks that
-        serialise the device pipeline** -- worth roughly half the call. Must be positive. Pass it
-        wherever the bound is structural, as it is for any buffer of mesh vertex indices.
+        reductions that would otherwise infer the span, and with them two host readbacks that
+        serialise the device pipeline. Must be positive. Pass it wherever the bound is structural,
+        as it is for any buffer of mesh vertex indices.
 
     Returns
     -------
@@ -924,13 +908,6 @@ def _isin_lookup_mask(
     #
     # The element side is one guarded launch rather than a shift plus a Python-scope gather --
     # see ``kernels/array.py::isin_lookup_mask`` for what that buys and why the guard is required.
-    #
-    # Measured on an RTX 5090, Warp 1.17, interleaved, min of 7 rounds of 100 calls, values equal
-    # to ``numpy.isin`` throughout. The fused element side is worth **1.22x** on the inferred path
-    # (348.5 -> 285.6 us at 60k elements over a 20k table), and the ``max_index`` it makes safe is
-    # worth **2.74-2.87x** on top -- 285.6 -> 99.4 us at 60k, 285.4 -> 100.8 at 200k, 289.3 ->
-    # 105.5 at 1M, flat because what it removes is two reductions and two host readbacks rather
-    # than anything proportional to the data (48-54 % of the call at every size probed).
     device = elements_flat.device
     dtype = elements_flat.dtype
     anchor = dtype(offset)
@@ -1313,8 +1290,8 @@ def counts_to_offsets(
     [`flatnonzero`][triwarp.array.flatnonzero]
     [`mask_to_compact_ranks`][triwarp.array.mask_to_compact_ranks]
     """
-    # The unconditional readback of ``total`` is ~0.1 ms of host synchronization -- the number
-    # behind the Notes section's advice to open-code the scan when only the offsets are wanted.
+    # The unconditional readback of ``total`` is a host synchronization -- which is why the Notes
+    # section advises open-coding the scan when only the offsets are wanted.
     n = int(counts.shape[0])
     device = counts.device
     if n == 0:
@@ -1333,9 +1310,7 @@ def remap_indices(indices: wp.array[wp.int32], remap: wp.array[wp.int32]) -> wp.
     Not a plain [`gather`][triwarp.array.gather]: the ``-1`` slots that mark padded or removed
     entries in an index buffer must survive the remap unchanged, where a gather would read out of
     bounds on them. [`triwarp.repair`][triwarp.repair] relies on this — its functions preserve
-    ``-1`` face sentinels through vertex renumbering (see
-    ``remove_unreferenced_vertices``, pinned by ``tests/test_repair.py::
-    test_remove_unreferenced_sentinel``).
+    ``-1`` face sentinels through vertex renumbering (see ``remove_unreferenced_vertices``).
 
     Parameters
     ----------

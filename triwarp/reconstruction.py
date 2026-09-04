@@ -87,10 +87,9 @@ def delaunay_triangulation(points: wp.array[wp.vec2], max_iter: int = 1000) -> w
     Notes
     -----
     The seed triangulation is an inherently sequential hull sweep, so it runs single-threaded on the
-    **CPU** device and only the flips run on ``points.device``. That is a measured choice, not a
-    concession: on 20 000 points the same sweep costs 93 ms in one CUDA thread against 1.40 ms in
-    one CPU thread. A float64 in-circle determinant is used rather than exact predicates, so
-    near-cocircular inputs may resolve either ambiguous diagonal.
+    **CPU** device and only the flips run on ``points.device`` -- a sequential sweep is genuinely
+    faster on the CPU than as a single CUDA thread. A float64 in-circle determinant is used rather
+    than exact predicates, so near-cocircular inputs may resolve either ambiguous diagonal.
     """
     device = points.device
     n = int(points.shape[0])
@@ -350,9 +349,9 @@ def _assemble_faces(
 
     Orientation is **not** re-derived here (``orient=False``): the local fans are already wound
     consistently from the trusted per-point normals, and re-deriving it would break that contract.
-    Measured on an inward-normal icosphere cloud, ``make_normals_outward`` rewinds the whole mesh
-    from its signed volume (volume ``-4.15`` -> ``+4.15``, agreement with the input normals
-    ``100%`` -> ``0%``), so a caller passing inward normals would silently get an outward mesh.
+    On an inward-normal icosphere cloud, ``make_normals_outward`` rewinds the whole mesh from its
+    signed volume (volume ``-4.15`` -> ``+4.15``, agreement with the input normals ``100%`` ->
+    ``0%``), so a caller passing inward normals would silently get an outward mesh.
     """
     parts = [f for f in (t3.reshape(-1), t2.reshape(-1)) if int(f.shape[0]) > 0]
     if not parts:
@@ -402,9 +401,9 @@ def screened_poisson(
         ``confidence`` is set).
     depth
         Finest grid depth: the finest grid has ``2**depth + 1`` nodes per axis. Memory grows as the
-        cube of this; ``depth=8`` (a ``257**3`` grid, ~0.7 GB peak) is a safe default and ``depth``
-        is capped at ``10``. This is the single biggest speed lever here, and the *only* one whose
-        quality cost is not negligible — see Notes for the measured curve before lowering it.
+        cube of this; ``depth=8`` (a ``257**3`` grid) is a safe default and ``depth`` is capped at
+        ``10``. This is the single biggest lever on both cost and quality — see Notes before
+        lowering it.
     full_depth
         Coarsest depth of the cascade (``3 <= full_depth <= depth``). The system is solved at every
         depth from ``full_depth`` to ``depth``.
@@ -462,35 +461,19 @@ def screened_poisson(
     default for unit-scale clouds.
 
     **Choosing ``depth``.** The useful depth follows the cloud's *sampling density*, not its size,
-    and past that point extra depth costs time without buying fidelity. Measured on an RTX 5090
-    over the bunny vertex clouds (mean symmetric chamfer back to the source mesh, in units of the
-    cloud's mean point spacing):
-
-    | depth | dense, 16k points | dense, 69k points |
-    |---|---|---|
-    | 6 | 14 ms, 0.044 | 14 ms, 0.096 |
-    | 7 | 26 ms, 0.042 | 27 ms, 0.043 |
-    | 8 (default) | 133 ms, 0.048 | 136 ms, 0.057 |
-    | 9 | 968 ms, 0.207 | 966 ms, 0.060 |
-
-    Both clouds bottom out at ``depth=7``, where the reconstruction is **5x faster than the default
-    and no less accurate**; ``depth=9`` on the sparser cloud is 5x *worse*, as the grid outruns the
-    samples. The default stays at ``8`` because it matches PoissonRecon's own and because mean
-    chamfer on two clouds from a single source is too narrow a basis on which to move a fidelity
-    default — but for a known cloud density, measure and lower it. The ``adaptive`` backend is much
-    flatter in depth (it already caps near-surface refinement at the sample spacing) and is the
-    better choice when the depth wanted for the extraction lattice exceeds what the sampling
-    supports.
+    and past that point extra depth costs time without buying fidelity -- once the grid outruns the
+    samples, accuracy can get worse rather than better. The default of ``8`` matches PoissonRecon's
+    own; for a known cloud density it is worth lowering. The ``adaptive`` backend is much flatter in
+    depth (it already caps near-surface refinement at the sample spacing) and is the better choice
+    when the depth wanted for the extraction lattice exceeds what the sampling supports.
 
     **``point_weight=0`` is ill-conditioned, and its output is not reproducible.** Screening is what
     conditions the operator; at ``0`` only the ``1e-4`` floor above keeps it SPD, so the conjugate
-    gradient stops on a solution whose level set is genuinely uncertain. Measured on a 642-point
-    sphere at ``depth=6``, three runs in one process: **34 614 / 34 539 / 34 877** faces, of which
-    59 / 64 / 48 were zero-area before the cleanup described under ``Returns``, and the surface is
-    not watertight (measured 187-213 boundary edges). The default ``point_weight=4`` is bit-stable
-    at 32 552 faces over the same three runs and is watertight with χ = 2. So ``0`` is for comparing
-    *against* a screened reconstruction, not for producing one -- and do not pin a count taken
-    from it.
+    gradient stops on a solution whose level set is genuinely uncertain, and the face count (and
+    how many faces come out zero-area before the cleanup described under ``Returns``) varies
+    between runs on the same input; the surface is also not watertight. The default
+    ``point_weight=4`` is stable across runs and watertight. So ``0`` is for comparing *against* a
+    screened reconstruction, not for producing one -- and do not pin a count taken from it.
     """
     if not (3 <= full_depth <= depth <= 10):
         raise ValueError(
@@ -553,13 +536,11 @@ def screened_poisson(
     # Drop zero-area triangles before orienting. Marching cubes emits one wherever the level set
     # grazes a lattice node, and such a face has no normal for ``make_normals_outward`` to orient
     # and hands the caller a NaN out of any closest-point query -- trimesh's ``closest_point``
-    # divides by the squared length of the zero-length edge (measured). This is deliberately *not*
-    # the full ``_clean_reconstruction`` tail the other three reconstructions use: welding the
-    # coincident vertices as well preserves the boundary-edge count but manufactures non-manifold
-    # edges (measured 6 on an unscreened sphere), and dedup would change the default path's output.
-    # As written it is **byte-identical** on a well-screened reconstruction -- the default
-    # ``point_weight`` emits no degenerate face at all -- and costs 0.7 % of the call at the default
-    # ``depth=8`` (0.89 ms of 123), 5.7 % at ``depth=6``.
+    # divides by the squared length of the zero-length edge. This is deliberately *not* the full
+    # ``_clean_reconstruction`` tail the other three reconstructions use: welding the coincident
+    # vertices as well preserves the boundary-edge count but manufactures non-manifold edges, and
+    # dedup would change the default path's output. As written it is **byte-identical** on a
+    # well-screened reconstruction -- the default ``point_weight`` emits no degenerate face at all.
     vertices, faces = tw.repair.remove_degenerate_faces(vertices, faces)
     if int(faces.shape[0]) > 0:
         faces = tw.repair.make_normals_outward(vertices, faces)
@@ -589,12 +570,7 @@ def _poisson_iso_value(
     uniform; the two weightings are deliberately kept distinct rather than unified. Shared by both
     backends, whose only difference is how ``sampled`` was produced.
 
-    Both branches reduce on the device rather than reading the fields back. Measured on CUDA, the
-    weighted form (which also has to read ``normals``) goes 0.62 ms -> 0.24 at 36 k samples and
-    15.9 -> 0.32 at 1 M (50x), with the ``lengths`` allocation counted inside; the uniform mean wins
-    from 100 k (1.17x) to 19x at 8 M. Reconstruction inputs are point clouds, so these are the sizes
-    that matter -- and the sub-100 k losses are tens of microseconds against a call that runs once
-    per reconstruction.
+    Both branches reduce on the device rather than reading the fields back.
     """
     if not confidence:
         return tw.reduce.mean(sampled)
@@ -768,9 +744,9 @@ def _diagonal_operator(
 ) -> wpl.LinearOperator:
     """Jacobi (inverse-diagonal) preconditioner as a ``LinearOperator``."""
     # ``wpl.cg`` applies the preconditioner once per iteration, so the mapped kernel is derived
-    # once here and only relaunched inside the loop (CLAUDE.md section 4). ``return_kernel=True``
-    # returns before mapping, so passing ``inv_diag`` for the x / y / out slots writes nothing --
-    # it only supplies the dtype and length that ``x``, ``y`` and ``z`` will have.
+    # once here and only relaunched inside the loop. ``return_kernel=True`` returns before
+    # mapping, so passing ``inv_diag`` for the x / y / out slots writes nothing -- it only
+    # supplies the dtype and length that ``x``, ``y`` and ``z`` will have.
     precond = wp.map(
         kernel_reconstruction.diagonal_precond_axpby,
         inv_diag,
@@ -826,12 +802,11 @@ def _screened_poisson_adaptive(
     balance matches the dense backend's index-space calibration. The (un-oriented) iso-surface
     ``(vertices, faces)`` is returned; the caller orients it outward.
     """
-    # Deferred: importing ``warp.fem`` costs ~0.3 s of ``import triwarp`` (measured on Warp 1.16,
-    # 1.49 s against 1.18 s over four interleaved reps), and the kernel module below imports it at
-    # module scope, so both stay behind the one adaptive-Poisson path. The deferral is only real
-    # because ``kernels/curvature.py`` and ``kernels/smoothing.py`` take their two QR helpers from
-    # ``warp._src.fem.linalg``; while they used the public path this saved nothing at all, since
-    # ``import triwarp`` loaded the whole fem package anyway.
+    # Deferred: importing ``warp.fem`` adds meaningfully to ``import triwarp``, and the kernel
+    # module below imports it at module scope, so both stay behind the one adaptive-Poisson path.
+    # The deferral is only real because ``kernels/curvature.py`` and ``kernels/smoothing.py`` take
+    # their two QR helpers from ``warp._src.fem.linalg``; while they used the public path this saved
+    # nothing at all, since ``import triwarp`` loaded the whole fem package anyway.
     import warp.fem as fem
 
     from triwarp.kernels.algorithms import poisson_fem as kernel_poisson_fem
@@ -839,8 +814,8 @@ def _screened_poisson_adaptive(
     device = points.device
     # ``warp.fem`` launches its internal kernels on Warp's *ambient* device, not on the device of
     # the arrays it is handed, so on a box with a CUDA device every ``fem`` call below would land
-    # on ``cuda:0`` while these buffers sit on the host -- a genuine cross-device launch that
-    # section 8's STRICT mode rejects (``PicQuadrature``'s ``finalize_cell_particle_data`` is the
+    # on ``cuda:0`` while these buffers sit on the host -- a genuine cross-device launch that a
+    # strict launch-device check rejects (``PicQuadrature``'s ``finalize_cell_particle_data`` is the
     # first to fire). triwarp's own allocations already carry ``device=``; this is the one place
     # where a dependency picks the device for us, so the whole fem section runs under a scope.
     with wp.ScopedDevice(device):
@@ -981,7 +956,7 @@ def _extract_poisson_surface_fem(
     so welding independent slabs leaves non-manifold seams -- and depth 9-10 already oversamples the
     spacing-capped solve, so the simple capped extraction is used.
     """
-    # Deferred: importing ``warp.fem`` costs ~0.15 s of ``import triwarp``, and the kernel module
+    # Deferred: importing ``warp.fem`` adds to ``import triwarp``'s cost, and the kernel module
     # below imports it at module scope, so both stay behind the one adaptive-Poisson path.
     import warp.fem as fem
 
@@ -1205,7 +1180,7 @@ def ball_pivoting(
     vertices and the wave counter rather than by the order they reached an atomic counter — device
     state the loop advances deterministically, so the ordering varies between waves (which keeps a
     front edge from being starved by a globally fixed key) without varying between runs. Two caveats
-    on how far that reaches, both measured rather than assumed:
+    on how far that reaches:
 
     * the face buffer's *row order* is not pinned — ``commit_triangles`` appends with a
       ``wp.atomic_add`` — so compare reconstructions as a set of triangles, not buffer-to-buffer;
@@ -1244,8 +1219,8 @@ def ball_pivoting(
 
     # Cell width equal to the ball radius, not to the ``2 * radius`` neighbourhood the pivot
     # searches: the inner empty-ball test is by far the most frequent query, and a cell twice its
-    # radius made it enumerate ~8x the points it needed. Measured 12% end-to-end; going finer than
-    # this loses more to cell-probe overhead than it saves in point tests.
+    # radius makes it enumerate roughly 8x the points it needs. Going finer than this loses more to
+    # cell-probe overhead than it saves in point tests.
     grid = tw.neighbors.hashgrid_from_points(points, radius)
     # The pivot search walks this cooperatively (one warp an edge); the empty-ball test inside
     # it stays on the hash grid, which is the better structure for a *serial* per-lane query.
@@ -1264,10 +1239,7 @@ class _BpaState:
     """
     Every buffer a ball-pivoting run touches, allocated once and mutated in place.
 
-    The wave loop does no allocation and no host synchronisation, which is what makes it cheap
-    enough to matter: the previous design rebuilt the advancing front from the whole triangle soup
-    on every wave (a sort, a scan and three readbacks), and that host traffic — not the pivot
-    search — was two thirds of the runtime.
+    The wave loop does no allocation and no host synchronisation, which is what keeps it cheap.
     """
 
     def __init__(
@@ -1336,10 +1308,9 @@ class _BpaState:
 
     def _bind_edge_table(self) -> None:
         """Rebuild the ``BpaEdgeTable`` view of the edge arrays: once here, never per launch."""
-        # Nine of the wave kernels' arguments live in here, and a wp.launch argument costs ~1.0 us
-        # of host time. A run issues ~1400 launches, so binding these once is worth milliseconds --
-        # see BpaEdgeTable's docstring for the measurement. Call this after anything that
-        # *reallocates* an edge array, which is only ``grow``.
+        # Nine of the wave kernels' arguments live in here, so binding these once here rather than
+        # per launch avoids re-marshalling them across the whole wave loop. Call this after
+        # anything that *reallocates* an edge array, which is only ``grow``.
         table = kernel_bpa.BpaEdgeTable()
         table.key = self.edge_key
         table.count = self.edge_count
@@ -1438,16 +1409,8 @@ def _mean_positive_finite(values: wp.array[wp.float32]) -> float | None:
 
     The spacing estimator both auto-guessing call sites in this module share: a neighbour-distance
     table carries a zero per self-match and an ``inf`` per unfilled slot, and neither belongs in a
-    mean spacing. Two device reductions plus two scalar readbacks rather than the full ``.numpy()``
-    the two sites used to take, because the buffer scales with the cloud.
-
-    Measured interleaved against that host readback, best of 21, on the flattened ``k=7`` table
-    both callers hand over. **CUDA**: 0.26x at 2 562 points, then 2.17x / 8.33x / 34.1x at 41k /
-    164k / 870k -- the readback grows without bound (13.5 ms on the largest) where the reduction is
-    flat at ~0.3 ms. **CPU**: a 5-10x *loss* at every size (0.10x / 0.15x / 0.17x / 0.21x), which
-    is Warp's CPU reductions running about one lane per block against vectorized NumPy. Section 13
-    decides on the CUDA number, and the CPU cost stays under 0.4 ms on any reconstruction input --
-    next to a Poisson solve or a wave loop that is not measurable.
+    mean spacing. Reduces on the device rather than reading the whole table back, since the buffer
+    scales with the cloud.
     """
     device = values.device
     n = int(values.shape[0])
@@ -1473,9 +1436,8 @@ _BPA_MIN_GRID = 1 << 12
 # needs to look in order to *stop*, and it can queue a batch and let the device run ahead. A wave
 # that runs after the flag clears costs six no-op launches, which is far less than a sync.
 #
-# ``wp.capture_while`` would remove even that, and it was tried: on this workload the conditional
-# graph's per-iteration overhead (~0.25 ms/wave on ``bunny_decimated``) is larger than the sync it
-# replaces, because a batch already amortises the sync over eight waves.
+# ``wp.capture_while`` is not used here: its conditional-graph per-iteration overhead is larger
+# than the sync it would replace, because a batch already amortises the sync over eight waves.
 _BPA_WAVES_PER_BATCH = 8
 
 # Host round-trips beyond the batching are only taken to grow the budget (doubling, so

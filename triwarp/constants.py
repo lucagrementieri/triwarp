@@ -39,27 +39,12 @@ TILE_2D = 8
 
 # Tiles folded per block by the *global* (``axis=None``) 1-D reductions in ``kernels/reduce.py``.
 # One block per tile means one ``atomic_add`` per 64 elements, and at scale that single accumulator
-# address is the bottleneck rather than bandwidth: 219k blocks contending on one slot cost 309 us to
-# sum 14M float32 (56 MB), against a ~31 us bandwidth floor on this card. Folding several tiles into
-# a register first divides the atomic traffic by this factor.
+# address is the bottleneck rather than bandwidth. Folding several tiles into a register first
+# divides the atomic traffic by this factor before the final commit.
 #
-# Swept 1/4/16/64/256 at 36k, 438k, 1.09M and 14M elements, interleaved under one clock state:
-#
-# - 16 is 1.28x / 1.50x / 1.90x / **4.89x** over the one-tile form and never loses;
-# - 4 is better below ~1M (1.58x / 1.70x) but only 3.33x at 14M;
-# - 64 matches 16 at 14M and loses 1.4x below it; 256 loses everywhere (the tail block does too much
-#   serial work while the rest of the device idles).
-#
-# 16 wins where the difference is visible: below ~1M the whole reduction sits under the ~82 us of
-# host-side launch + readback that ends any scalar-returning call, so the 5 us that 4 would save
-# there is unobservable, while the 30 us it gives up at 14M is not.
-#
-# The CPU device pays for it, and the ratio is recorded here rather than left to be rediscovered:
-# ``wp.launch_tiled`` runs one lane per block there (through Warp 1.17), so folding 16 tiles means
-# 16x fewer blocks and correspondingly less parallelism -- measured **1.28x slower at 36k, 1.07x at
-# 438k, 1.02x at 14M**.
-# Accepted on the CUDA number per CLAUDE.md section 13: the loss is bounded, shrinks with size, and
-# is at its worst exactly where the host floor already hides it.
+# The CPU device pays for this: ``wp.launch_tiled`` runs one lane per block there, so folding 16
+# tiles means 16x fewer blocks and correspondingly less parallelism. Accepted anyway because the
+# CUDA gain is large and the CPU cost shrinks with input size.
 TILES_PER_BLOCK_1D = 16
 
 # Elements reduced per thread by the *lane-free* reductions -- those that partition the **outer**
@@ -69,31 +54,20 @@ TILES_PER_BLOCK_1D = 16
 #
 # **The stride's source is the rule, not the tile.** A lane-parallel body is correct on both devices
 # exactly when its stride is ``wp.block_dim()`` -- which reads 1 on the CPU device, where
-# ``wp.launch_tiled`` runs one lane per block through Warp 1.17, so that lane covers the whole
-# sequence. Striding by a *kernel argument* instead is wrong on **both** devices, measured on one
-# 1 000-element sum: the CPU answer is short by exactly the stride (16.0 against 1 000.0 at
-# ``n_slices = 64``) and CUDA double-counts whenever ``n_slices != block_dim`` (3 616.0 at
-# ``block_dim = 256``). See ``.claude/CLAUDE.md`` section 3 for the rule, and
+# ``wp.launch_tiled`` runs one lane per block, so that lane covers the whole sequence. Striding by
+# a *kernel argument* instead is wrong on **both** devices: the CPU answer comes up short by the
+# stride, and CUDA double-counts whenever the argument does not match the block width. See
 # ``kernels/visibility.py::obscurance`` for a lane-parallel kernel that is correct on both devices
 # because it strides by ``wp.block_dim()``.
 #
-# **And converting the four consumers of this constant to that form is measured and declined**, so
-# the constant stays: the block-per-item shape pays only where the *outer* dimension alone starves
-# the device, and the whole point of a slice dimension is that it does not. Measured on
-# ``hull_support_extremes``, 2.3x faster at 5 000 points and **0.12-0.60x at 200 000** -- the
-# numbers are on that kernel.
+# The four consumers of this constant do not fit a block-per-item shape instead: that form only
+# pays where the *outer* dimension alone starves the device, and the whole point of a slice
+# dimension is that it does not.
 #
 # The optimum splits by device, so there are two values and
 # [`items_per_slice`][triwarp._device.items_per_slice] picks between them; do not read either
-# directly. Swept over 8-256 on a 5k and a 200k point cloud (hull support extremes) plus the
-# CPU-only centroid and chamfer reductions:
-#
-# - CUDA wants long slices: at 200k points 32 costs 1.54x of the 256 optimum, while 128 is within 1%
-#   of it and within 4% at 5k points, where the whole sweep is flat.
-# - CPU wants short ones: 128 costs 1.43x of the 32 optimum on the 5k cloud, and the CPU sweep is
-#   otherwise flat (32 within 1.11x of best everywhere measured).
-#
-# A *per-query* reduction wants a much longer slice on both devices -- the query dimension already
-# fills the device -- and sets its own value locally (see ``proximity.ITEMS_PER_QUERY_SLICE``).
+# directly. CUDA wants long slices; CPU wants short ones. A *per-query* reduction wants a much
+# longer slice on both devices -- the query dimension already fills the device -- and sets its own
+# value locally (see ``proximity.ITEMS_PER_QUERY_SLICE``).
 ITEMS_PER_SLICE_CUDA = 128
 ITEMS_PER_SLICE_CPU = 32

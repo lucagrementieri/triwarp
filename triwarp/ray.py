@@ -308,11 +308,8 @@ def contains_points(
     if n == 0:
         return wp.empty(0, dtype=wp.bool, device=points.device)
     # One reduction, not two: ``enclosing_diagonal(mesh.points)`` would recompute exactly these
-    # corners, and the parity kernel needs both them and the diagonal. Measured interleaved on this
-    # box, the prologue goes 202 -> 118 us on CUDA and 1433 -> 737 us on CPU at 164k vertices --
-    # a flat ~0.085 ms on CUDA either way, since an ``aabb`` is one reduction plus one host
-    # sync whatever the mesh size. That is 2.1 % of a 10k-vertex call and 0.6 % of a 164k one, so
-    # it is below the noise floor of any end-to-end benchmark; ``ray`` has none by design.
+    # corners, and the parity kernel needs both them and the diagonal, so compute the AABB once
+    # and derive the diagonal from it directly.
     mesh_min, mesh_max = aabb(mesh.points)
     max_dist = float(wp.length(mesh_max - mesh_min))
     out_contains = wp.empty(n, dtype=wp.bool, device=points.device)

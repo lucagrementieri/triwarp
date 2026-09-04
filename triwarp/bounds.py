@@ -47,10 +47,8 @@ def aabb(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     Axis-aligned bounding box of ``points`` (component-wise min / max).
 
     The reduction is [`minmax`][triwarp.reduce.minmax]'s ``wp.vec3`` path: one chunked kernel
-    writes both corners into a single six-element buffer, read back once — it is called on the
-    hot path of every k-NN query, where it is entirely host-latency-bound, so nothing beyond
-    that single launch and readback is spent. This wrapper contributes only the empty-input
-    ``(+inf, -inf)`` convention, where ``minmax`` raises.
+    writes both corners into a single six-element buffer, read back once. This wrapper contributes
+    only the empty-input ``(+inf, -inf)`` convention, where ``minmax`` raises.
 
     Parameters
     ----------
@@ -173,10 +171,8 @@ def points_in_aabb(
     -----
     Containment is **inclusive**: a point exactly on a face, edge or corner of the box is selected.
     A point with a ``nan`` coordinate is *not* selected, and neither is one at an infinity. Both
-    conventions were measured against the one reference that answers this question rather than
-    chosen -- points placed on both corners, on an edge midpoint and on a face centre are all
-    selected there, and the three ``nan`` rows are not -- and both differ from
-    [`half_space_mask`][triwarp.points.half_space_mask], whose test is strict.
+    conventions differ from [`half_space_mask`][triwarp.points.half_space_mask], whose test is
+    strict.
 
     See Also
     --------
@@ -266,7 +262,7 @@ def points_in_obb(
     [`points_in_aabb`][triwarp.bounds.points_in_aabb] makes -- the two share one predicate, so the
     inclusive boundary and the ``nan`` exclusion documented there hold here too, and the two
     functions cannot drift apart on either. Passing the identity as ``rotation`` reproduces the
-    axis-aligned answer exactly (measured, on points sitting on the corners and on ``nan`` rows).
+    axis-aligned answer exactly.
 
     Being a proper rotation, the frame's inverse is its transpose, so nothing here inverts a
     matrix; a general affine box would, and is not what this takes.
@@ -414,9 +410,7 @@ def crop_mesh(
     A face straddling the box boundary is **dropped**, not clipped: the result is a subset of the
     input's triangles, so the crop never introduces a vertex the input did not have and the cut
     edge is ragged at the triangle scale. That is what makes the operation a selection rather than
-    a boolean -- for a flush cut, intersect the mesh with the box as a solid instead -- and it is
-    the rule the one reference that answers this question applies, verified face for face on four
-    fixtures rather than assumed.
+    a boolean -- for a flush cut, intersect the mesh with the box as a solid instead.
 
     To keep the straddling faces instead, take the mask and pass it on directly, which is the
     ``face_mode="any"`` rule:
@@ -513,26 +507,24 @@ def oriented_bounding_box(
     Host traffic: the ``(rotations, 6)`` extent table (its objective and ``argmin`` are
     ``O(rotations)`` host arithmetic over a buffer far too small to be worth a device pass), the
     36 bytes of the winning frame, and one ``(512, 6)`` table per refinement round. The
-    refinement frames are generated and composed **on the device** (the host quaternion math,
-    einsum and per-round upload they replace measured 63% of every round), so the chains live on
+    refinement frames are generated and composed **on the device**, so the chains live on
     the device and the extent tables are the only per-round traffic.
 
     **The result is a converged local minimum, not a certified global one.** Certifying the true
     minimum-volume box requires the exact-arithmetic search over the convex hull's face and edge
     events (O'Rourke's rotating-calipers family), and triwarp deliberately has no exact convex hull.
-    What the sampling-plus-refinement search gives up is the *certificate*, not (measurably) the
-    volume: the global phase lands in the optimum's basin whenever the grid's covering radius
-    resolves it, refinement converges within the basin, and against both hull-based references on
-    every fixture probed (tilted/stretched icosahedron, cube shell, hemisphere, half torus) the
-    refined default **ties or beats each of them**.
+    What the sampling-plus-refinement search gives up is the *certificate*, not the volume: the
+    global phase lands in the optimum's basin whenever the grid's covering radius resolves it,
+    refinement converges within the basin, and the refined default ties or beats hull-based
+    reference methods on volume across a range of test shapes (tilted/stretched icosahedron, cube
+    shell, hemisphere, half torus).
     A pathological cloud whose optimum basin is narrower than the covering radius of ``rotations``
     samples can still hide its box from this search; raise ``rotations`` if the input is a
     near-symmetric polyhedron far from any sampled orientation.
 
     Neither hull-based reference is an oracle for the minimum either: on a stretched icosahedron
-    the refined search returns **less** volume than both (the hull-face-flush restriction misses
-    optima whose box touches only edges and vertices), which is why the regression tests compare
-    within measured bands rather than one-sidedly.
+    the refined search returns **less** volume than both, because the hull-face-flush restriction
+    misses optima whose box touches only edges and vertices.
 
     See Also
     --------
@@ -654,10 +646,8 @@ def _refine_box(
                 chain_lower[chain] = lower_np[row]
                 chain_upper[chain] = upper_np[row]
         # 0.4 rather than 0.5: a flat-flush optimum is a *kink*, so the volume error is linear in
-        # the final angular resolution. Swept at eight rounds on the four tilted fixtures: 0.4
-        # reads 6.0013 on the cube shell against 0.5's 6.0040 (exact minimum 6.0) and 975.29 on
-        # the half torus against 979.73, at identical cost; the 127-frame ball resolves ~sigma/5
-        # per round, so shrinking by 0.4 never outruns what a round can see.
+        # the final angular resolution, and the 127-frame ball resolves ~sigma/5 per round, so
+        # shrinking by 0.4 never outruns what a round can see.
         sigma *= 0.4
 
     winner = int(chain_loss.argmin())
@@ -759,8 +749,10 @@ def _spiral_frames(indices: np.ndarray, rotations: int) -> np.ndarray:
         axis=1,
     )
     x, y, z, w = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
-    return np.array([
-        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-    ]).transpose(2, 1, 0)
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ]
+    ).transpose(2, 1, 0)

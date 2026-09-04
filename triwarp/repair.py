@@ -134,14 +134,14 @@ def make_solid(
     5. A final fill if stage 4 reopened a boundary -- which it routinely does, since cutting an
        intersecting region out is what opens one. Nothing geometric runs after it, and that is not
        an omission: filling a 3-vertex rim produces one sliver, a degeneracy pass deletes the sliver
-       and reopens the rim, and the two trade the same faces indefinitely. Measured on
-       ``bunny_decimated``, one extra degeneracy pass after the fill takes it from closed (chi = 2)
-       to 58 rims (chi = -56) and holds it there.
+       and reopens the rim, and the two trade the same faces indefinitely if run again after the
+       fill.
 
     Under ``keep_largest`` the component filter runs **inside** stage 4 as well as at the top, and
     that is not belt and braces: cutting an intersecting band out can disconnect the surface, so the
-    extra piece does not exist yet when stage 1 looks. Measured on a torus whose inner wall crosses
-    itself, the intersection repair alone leaves two closed shells where the input was one.
+    extra piece does not exist yet when stage 1 looks. For example, on a torus whose inner wall
+    crosses itself, the intersection repair alone can leave two closed shells where the input was
+    one.
 
     !!! warning "It returns the best it managed, not a guarantee"
         There is no success flag, deliberately. Convergence is not guaranteed for any input -- a
@@ -152,10 +152,10 @@ def make_solid(
         ``join_components`` is where that bites in practice, and the failure mode is worth knowing
         because it is not a bug in any stage: welding several shells leaves **one** rim spanning all
         of them, and if that rim is badly non-planar the minimum-weight patch across it
-        self-intersects, so stage 4 cuts the patch out and undoes the join. Measured on three
-        hemispherical bowls 3.0 apart, it converges to one solid (291 v / 578 f, chi = 2) when their
-        rims are coplanar and returns the **three separate shells** when each bowl is tilted 45
-        degrees. Rims that are far from coplanar want
+        self-intersects, so stage 4 cuts the patch out and undoes the join. For example, three
+        hemispherical bowls joined at coplanar rims converge to one solid, but the same bowls
+        tilted 45 degrees relative to each other come back as **three separate shells**. Rims that
+        are far from coplanar want
         [`holes.stitch_loops`][triwarp.holes.stitch_loops] or a per-pair
         [`holes.bridge_edges`][triwarp.holes.bridge_edges] followed by a targeted fill, not this.
 
@@ -209,9 +209,9 @@ def make_solid(
         return vertices, faces
 
     # Stage 0. The reference does this inside its *loader*, which is why it is easy to leave out and
-    # why leaving it out is visible: measured on ``bunny_decimated``, whose 87 duplicated faces make
-    # it non-edge-manifold, the pipeline without this stage returns chi = 2 and one component and is
-    # still **not watertight**, because nothing downstream addresses a non-manifold edge.
+    # why leaving it out is dangerous: skipping it can leave a mesh at the right Euler
+    # characteristic and one component while still **not watertight**, because nothing downstream
+    # addresses a non-manifold edge.
     vertices, faces, _remap = remove_unreferenced_vertices(vertices, faces)
     faces = make_winding_consistent(faces)
     vertices, faces, _source = split_non_manifold_vertices(vertices, faces)
@@ -228,9 +228,8 @@ def make_solid(
         vertices, faces = collapse_small_triangles(vertices, faces)
         vertices, faces = fix_self_intersections(vertices, faces, max_iter=inner_iter)
         # Cutting an intersecting band out can *disconnect* the surface, so the component filter has
-        # to run again here and not only at the top: measured on a torus whose inner wall crosses
-        # itself, the local repair leaves two closed shells (chi = 4) where the input was one, and a
-        # single pass at the start cannot see a component that did not exist yet.
+        # to run again here and not only at the top: a single pass at the start cannot see a
+        # component that did not exist yet.
         if keep_largest:
             vertices, faces = remove_small_components(vertices, faces, keep_largest=True)
         if int(faces.shape[0]) == n_faces_before:
@@ -238,10 +237,9 @@ def make_solid(
 
     # Stage 4 opens a rim whenever it cuts an intersecting region out, so the last fill is not a
     # belt-and-braces repeat of stage 3 -- it is what makes the common case come back closed. And
-    # nothing geometric may run *after* it: filling a 3-vertex rim produces one sliver, degeneracy
-    # removal deletes that sliver and reopens the rim, and the two then trade the same 122 faces for
-    # ever. Measured on ``bunny_decimated``: closed at chi = 2 after the fill, chi = -56 with 58
-    # rims after one more degeneracy pass, and stable there -- so the fill goes last.
+    # nothing geometric may run *after* it: filling a small rim produces one sliver, degeneracy
+    # removal deletes that sliver and reopens the rim, and the two then trade the same faces
+    # forever -- so the fill goes last.
     faces = _fill_any_boundary(vertices, faces)
     if keep_largest:
         vertices, faces = remove_small_components(vertices, faces, keep_largest=True)
@@ -294,8 +292,7 @@ def remove_unreferenced_vertices(
 
     # ``flatnonzero`` already paid the readback that sizes its own output, and that size *is* the
     # referenced count -- a separate ``reduce.sum`` of the mask would be a second scan and a second
-    # host sync for a number already in hand (measured at 0.170 ms of this call's 0.543 ms on
-    # ``bunny_decimated``, 31 %).
+    # host sync for a number already in hand.
     inverse = tw.array.flatnonzero(referenced)
     n_referenced = int(inverse.shape[0])
     remap = wp.full(n_vertices, wp.int32(-1), dtype=wp.int32, device=device)
@@ -647,9 +644,8 @@ def remove_small_components(
     - ``min_diameter`` keeps components whose axis-aligned bounding-box diagonal reaches it, which
       is the measure that survives a component being a thin sheet of many tiny triangles.
 
-    All three ``min_*`` bounds are **inclusive**, which is what the reference implementations do
-    (measured: a component of exactly the threshold face count, or of exactly the threshold
-    diagonal, survives).
+    All three ``min_*`` bounds are **inclusive**, matching the reference implementations: a
+    component of exactly the threshold face count, or of exactly the threshold diagonal, survives.
 
     Parameters
     ----------
@@ -722,11 +718,10 @@ def remove_small_components(
         )
         # Gather-then-compare at Python scope rather than a kernel: ``statistic[labels]`` is a
         # per-component table read through the per-face label, and ``wp.map`` over that
-        # ``indexedarray`` is exactly the form section 4 of CLAUDE.md prescribes (and that
-        # ``make_volume`` below already uses). ``labels`` is a dense array, so the strided-index
-        # hazard -- which applies to a *column* of a rank-2 buffer -- does not arise. The bound
-        # is inclusive at every criterion: measured, a component of exactly ``min_faces`` faces
-        # or exactly ``min_diameter`` across survives, matching both references.
+        # ``indexedarray`` is the standard elementwise-op idiom (and ``make_volume`` below already
+        # uses it). ``labels`` is a dense array, so the strided-index hazard -- which applies to a
+        # *column* of a rank-2 buffer -- does not arise. The bound is inclusive at every criterion,
+        # matching both references.
         wp.map(kernel_array.greater_equal, statistic[labels], wp.float32(min_area), out=keep)
     elif min_diameter is not None:
         diagonals = _component_diagonals(vertices, faces, labels)
@@ -791,9 +786,8 @@ def split_non_manifold_vertices(
     [`remove_non_manifold_faces`][triwarp.repair.remove_non_manifold_faces], which deletes geometry
     to reach the same property: this changes no position and drops no triangle, it only splits
     vertices apart, so the surface is unchanged and the face count is exactly preserved. Use it to
-    feed a mesh to code that requires manifold input -- the potpourri3d references in
-    ``benchmarks/README.md`` reject non-manifold meshes outright, and so do triwarp's own halfedge
-    consumers.
+    feed a mesh to code that requires manifold input -- several reference libraries (e.g.
+    potpourri3d) reject non-manifold meshes outright, and so do triwarp's own halfedge consumers.
 
     Two corners are kept together only across an edge that is **manifold and consistently
     oriented**: exactly one half-edge each way. Every other edge -- a boundary edge, one shared by
@@ -1175,7 +1169,7 @@ def remove_degree3_vertices(
         fan around a vertex is what this reasons about.
     max_iter
         Cap on the number of passes. Each pass removes an independent set, so a chain of adjacent
-        candidates needs one pass per link; the default covers any chain this has been measured on.
+        candidates needs one pass per link; the default covers any chain length likely in practice.
     return_count
         If ``True``, also return ``removed``.
 
@@ -1450,11 +1444,9 @@ def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
 
     On a **non-orientable** mesh no consistent winding exists, so this cannot succeed and does not
     fail either: the flood-fill orients everything it reaches and the contradiction is left on a
-    seam. Measured on a 3 042-triangle Moebius band
-    ([`parametric_surface`][triwarp.creation.parametric_surface]``("mobius")``), 41 of its 4 524
-    edges stay inconsistent, against 39 before the pass — so treat the result as unrepaired rather
-    than partly repaired, and test with
-    [`is_orientable`][triwarp.validation.is_orientable] first if that matters.
+    seam. The seam can even end up with *more* inconsistent edges than before the pass ran, not
+    merely the same ones — so treat the result as unrepaired rather than partly repaired, and test
+    with [`is_orientable`][triwarp.validation.is_orientable] first if that matters.
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
@@ -1548,8 +1540,7 @@ def make_volume(
     # The predicate, not ``all(face_watertight_mask(faces))``: the mask additionally builds
     # ``unique_1d``'s inverse and runs a per-face gather pass, only to be reduced to one bool.
     # Both answer "is every undirected edge shared by exactly two faces", because every unique edge
-    # in the table comes from a face. Measured interleaved: 1.17-1.19x on CUDA and 1.64-1.77x on
-    # CPU, at 20k and 328k faces.
+    # in the table comes from a face.
     if not tw.validation.is_edge_manifold(
         faces, allow_boundary_edges=False, n_vertices=int(vertices.shape[0])
     ):
@@ -1726,38 +1717,29 @@ def fix_self_intersections(
     region whose rim cannot be triangulated without crossing something, or one that grows to swallow
     the mesh, leaves intersections behind; the loop stops at ``max_iter`` and returns what it has.
     For ``"voxel"``: the level set is clean, but Warp's ``MarchingCubes`` can emit a touching or
-    non-manifold pair at an ambiguous cell, and that is resolution-dependent -- measured on a
-    16x16 self-intersecting torus, **0** intersecting faces at a 1 % lattice and **2 of 26 688** at
-    1/128. So check with
+    non-manifold pair at an ambiguous cell, and that is resolution-dependent: a finer lattice can
+    introduce a handful of such faces where a coarser one has none. So check with
     [`triwarp.validation.is_self_intersecting`][triwarp.validation.is_self_intersecting] when it
     matters. Stating this is better than a loop that cannot terminate, and better than a promise the
     extraction does not keep.
 
-    **What the ``"local"`` method is for, measured.** It clears a *shallow* self-intersection
-    outright -- a torus whose tube passes through itself goes from 66 intersecting faces to **0** at
-    either dilation budget -- and only reduces a *deep* one: two icospheres overlapping by a third
-    of their diameter, concatenated into one mesh, go from 152 faces to 34 and from 296 to 121. That
+    **What the ``"local"`` method is for.** It clears a *shallow* self-intersection outright -- a
+    torus whose tube passes through itself can be fully cleared at either dilation budget -- and
+    only reduces a *deep* one, such as two icospheres overlapping by a third of their diameter. That
     is the method's shape rather than a tuning failure. Cutting out a lens-shaped overlap leaves a
     rim whose minimum-weight patch runs back through the other shell, so the pass converges only
     where the damage is a band. Reach for ``"voxel"`` when two closed pieces genuinely
     interpenetrate: a level set has no notion of two shells.
 
     **On that input class the result is nondeterministic and ``max_iter`` is not a quality knob**,
-    which "only reduces" does not by itself tell you. Measured one call per fresh process on the
-    benchmark's own fixture -- ``sphere_med`` doubled and offset by 0.35 of its diagonal, 163 840
-    faces and 1 176 intersecting:
-
-    | ``max_iter`` | intersecting after | faces after |
-    |---|---|---|
-    | 3 | 158, 158, 365 | 161 167 - 161 693 |
-    | 6 | 156, 392 | 170 791 - 178 923 |
-    | 10 | 381, 550 | 185 087 - **245 552** |
-
-    The residual does not fall with more passes while the face count climbs past the input's, so
-    each pass is refilling a rim that the next one cuts out again. The spread within a row is the
-    refill chain's own nondeterminism (atomic ordering, as in
-    [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]), so a repeat run is not a
-    regression. Do not raise ``max_iter`` hoping for convergence here; the answer is ``"voxel"``.
+    which "only reduces" does not by itself tell you. Past a certain point, raising it does not
+    reduce the residual intersections further while the face count climbs past the input's -- each
+    pass is refilling a rim that the next one cuts out again. Repeated runs on the same input can
+    also produce a slightly different result, from the refill chain's own atomic-ordering
+    nondeterminism (as in
+    [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]), so that variation is not
+    a regression. Do not raise ``max_iter`` hoping for convergence on a deep interpenetration; the
+    answer is ``"voxel"``.
 
     The two methods differ in what they preserve, not in quality. ``"local"`` keeps the input's
     triangulation everywhere it did not cut, so a per-vertex attribute survives outside the patch;
@@ -1795,11 +1777,9 @@ def fix_self_intersections(
     for _ in range(max_iter):
         bad_mask = tw.validation.face_self_intersecting_mask(current_vertices, current_faces)
         # Two readbacks per pass, and each decides the loop. Deliberately *not* ``tw.reduce.any`` /
-        # ``tw.reduce.all``: a device reduction costs ~0.1-0.3 ms flat on CUDA, and copying a
-        # ``bool`` array only overtakes it at ~1M elements (CLAUDE.md section 13). These are
-        # ``n_faces`` long -- 320 on ``icosphere``, 16 k on ``bunny_decimated``, 69 k on ``bunny``,
-        # 871 k on ``dragon`` -- so every fixture in the suite, ``dragon`` included, sits under the
-        # crossover and the copy is the cheaper call. Revisit above ~1M faces, not before.
+        # ``tw.reduce.all``: a device reduction has a roughly fixed cost, while copying a ``bool``
+        # array of length ``n_faces`` is cheaper below roughly a million faces, which covers
+        # ordinary mesh sizes. Revisit if that stops being true for the meshes this runs on.
         if not bool(bad_mask.numpy().any()):
             break
         region = _dilate_face_mask(
@@ -1837,9 +1817,9 @@ def _dilate_face_mask(
         every face sharing a vertex with it, since a cut has to leave a rim rather than a slit.
     n_vertices
         Length of the vertex buffer ``faces`` indexes, supplied by the caller. Not inferred from
-        ``faces.max()``: that is a whole-buffer readback -- 833 KB per call on ``bunny``, and
-        ``fix_self_intersections`` calls this once per pass -- to recover a number the caller is
-        already holding, which is what ``face_adjacency(n_vertices=...)`` exists to avoid.
+        ``faces.max()``: that is a whole-buffer readback, and ``fix_self_intersections`` calls this
+        once per pass, to recover a number the caller is already holding -- which is what
+        ``face_adjacency(n_vertices=...)`` exists to avoid.
 
     Returns
     -------
@@ -1897,12 +1877,10 @@ def remove_tunnels(
     !!! note "One disjoint pass per call"
         The loops kept are pairwise **vertex-disjoint**, shortest first. Cutting along two loops
         that cross is not the same operation as cutting along each in turn -- the shared vertex is
-        split by both cuts at once -- and without the restriction the genus stops dropping one per
-        loop: measured on a genus-2 union, two overlapping basis loops dropped it by one, and
-        cutting the whole basis shattered the surface into four spheres. The cost is that one call
-        removes at most one tunnel per disjoint family, so a mesh whose basis loops all overlap
-        needs to be run again. Call it in a loop until ``removed`` is ``0``; on that genus-2
-        union that is two rounds to reach a sphere, and the third round is the one that stops.
+        split by both cuts at once -- and without the restriction the genus can stop dropping one
+        per loop, or the surface can shatter into extra pieces. The cost is that one call removes at
+        most one tunnel per disjoint family, so a mesh whose basis loops all overlap needs to be run
+        again. Call it in a loop until ``removed`` is ``0``.
 
     Parameters
     ----------
@@ -1993,10 +1971,9 @@ def _disjoint_loops(loops: list[wp.array[wp.int32]]) -> list[wp.array[wp.int32]]
     Greedily keep the loops that share no vertex, taking them shortest first.
 
     Cutting along two loops that *cross* is not the same operation as cutting along each in turn:
-    the shared vertex is split by both cuts at once, and the genus stops dropping by one per loop.
-    Measured on a genus-2 union, two overlapping basis loops dropped the genus by one rather than
-    two, and cutting the whole basis shattered the surface into four spheres. Keeping the selection
-    pairwise disjoint is what makes ``removed`` mean what it says.
+    the shared vertex is split by both cuts at once, and the genus can stop dropping by one per
+    loop, or cutting the whole basis can shatter the surface into several pieces. Keeping the
+    selection pairwise disjoint is what makes ``removed`` mean what it says.
     """
     claimed: set[int] = set()
     kept: list[wp.array[wp.int32]] = []

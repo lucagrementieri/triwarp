@@ -9,9 +9,8 @@ within ``r``" and "the ``k`` nearest" -- and each is one function:
 flat CSR form) and [`query_nearest`][triwarp.neighbors.query_nearest]. Which broad phase runs is a
 [`QueryBackend`][triwarp.neighbors.QueryBackend] keyword -- ``"hashgrid"`` or ``"bvh"`` -- or is
 inferred from a prebuilt structure passed as ``accelerator``. Both backends are **exact and return
-the same answer**; the choice is a cost one, and ``query_nearest``'s docstring carries the measured
-guidance. The kernel side was already one
-warp-uniform kernel branching on an ``ACCEL_*`` selector, so only the Python layer had doubled.
+the same answer**; the choice is a cost one, and ``query_nearest``'s docstring carries guidance on
+which to pick. The kernel side is one warp-uniform kernel branching on an ``ACCEL_*`` selector.
 
 The BVH-only queries keep the structure in their names, because naming it is informative rather
 than redundant there: these index arbitrary **bounds** rather than points, which a hash grid
@@ -23,10 +22,6 @@ narrow-phase filter on the primitive's own geometry.
 ``query_ball_with_offsets``, which needs one to separate it from ``query_ball``'s dense form.
 **Prefer the ball whenever the predicate is a ball**: it is not merely tighter, its traversal is
 substantially cheaper per candidate than the box one (see ``query_bvh_ball``).
-
-A uniform-cube form used to sit beside these and was removed: it was exactly
-``query_bvh_box(bvh, q - h, q + h)``, returned an identical set, and the corner buffers it saved
-measured as no saving at all.
 
 Also home to [`geodesic_ball`][triwarp.neighbors.geodesic_ball], the surface-aware counterpart to
 the spatial ball queries here: it returns the same CSR ``(indices, offsets)`` shape but walks the
@@ -294,10 +289,10 @@ def query_bvh_box(
 
     Notes
     -----
-    The test is **inclusive** on every face: a point exactly on a box face is inside it (measured on
-    Warp 1.17, both the lower and the upper face). A box with any ``upper < lower`` component
-    matches nothing, and that is not checked -- the check would cost a host readback per call
-    (CLAUDE.md section 13) to reject a caller error whose answer is already empty.
+    The test is **inclusive** on every face: a point exactly on a box face (lower or upper) is
+    inside it. A box with any ``upper < lower`` component matches nothing, and that is not checked
+    -- the check would cost a host readback per call to reject a caller error whose answer is
+    already empty.
 
     There is no list-returning sibling, so the name carries no ``_with_offsets`` suffix: this
     query's consumers are kernels that recover the owning query from ``offsets``, and a Python list
@@ -310,9 +305,8 @@ def query_bvh_box(
         The same packing over the same bounds for a **ball**, and the one to prefer wherever the
         predicate is a ball rather than an axis-aligned region -- not only because the box admits
         corners the ball excludes, but because the box *traversal* is itself several times more
-        expensive per candidate returned. Measured with the box's own inscribed cube, which
-        returns strictly fewer candidates than the ball and still costs multiples of it, so the
-        cost is the node test and not the candidate count.
+        expensive per candidate returned: the cost is dominated by the node test itself, not by
+        how many candidates come back.
     [`triwarp.points.half_space_mask`][triwarp.points.half_space_mask]
         The unbounded counterpart: selection by one plane rather than by a box.
     """
@@ -354,9 +348,9 @@ def query_bvh_box(
     return candidate_indices_flat, offsets
 
 
-# Which broad phase a query runs. Public and named because it appears in four public signatures and
-# in the benchmark group names; both values are exact and return the same answer, so this is a cost
-# choice -- see ``query_nearest``'s docstring for the measured guidance.
+# Which broad phase a query runs. Public and named because it appears in four public signatures;
+# both values are exact and return the same answer, so this is a cost choice -- see
+# ``query_nearest``'s docstring for guidance.
 QueryBackend = Literal["hashgrid", "bvh"]
 
 
@@ -894,22 +888,19 @@ def query_nearest(
         ``(2 ceil(r / cell) + 1) ** 3`` cells, so a radius **f** times too large costs ``f ** 3``,
         and the search falls back to an exact linear scan once ``r`` outgrows a few cells. That also
         makes it sensitive to a cloud whose density is not uniform, and to queries drawn from a
-        different distribution than the points -- a translated query cloud measured **87x** worse.
+        different distribution than the points, since the cell width was sized for the data rather
+        than for where the queries land.
 
         ``"bvh"`` has no cell width to get wrong, so it is the one to reach for when the query scale
-        is unknown, the cloud is non-uniform, or the queries sit outside it. Its own cost grows with
-        ``k`` faster than the grid's -- measured **7x** from ``k=1`` to ``k=30`` -- so at ``k=1``
-        the grid wins at every size measured (0.229 / 0.269 / 0.346 ms against the tree's
-        0.316 / 0.516 / 0.667 at 5 k / 100 k / 200 k self-queries).
+        is unknown, the cloud is non-uniform, or the queries sit outside it. Its own cost grows
+        with ``k`` faster than the grid's, so at small ``k`` the grid tends to win.
 
-        **But at moderate ``k`` the tree wins on a perfectly uniform cloud too, which is not what
-        "an awkward one" suggests.** At ``k=8`` on a uniform self-query the grid is *non-monotonic*
-        -- 0.837, 3.262, 7.567, **0.472**, 0.801 ms at 5 k / 20 k / 50 k / 100 k / 200 k -- because
-        a row whose true ``k``-th distance runs past ``_knn_widest_grid_radius`` abandons it for
-        an exact linear scan of the cloud, and how much of the cloud sits in that tail moves with
-        ``n``. The tree is monotonic over the same sweep (0.695, 0.774, 0.854, 1.368, 2.023) and so
-        beats the grid **1.2x / 4.2x / 8.9x** at 5 k / 20 k / 50 k before losing 2.9x / 2.5x at
-        100 k / 200 k. Both answers are still exact; only the cost moves.
+        **But at moderate ``k`` the tree can win on a perfectly uniform cloud too, which is not what
+        "an awkward one" suggests.** The grid's cost is *non-monotonic* in cloud size at moderate
+        ``k``: a row whose true ``k``-th distance runs past ``_knn_widest_grid_radius`` abandons
+        the cell walk for an exact linear scan of the whole cloud, and how much of the cloud falls
+        in that tail moves with ``n``. The tree's cost stays monotonic over the same range. Both
+        answers are still exact; only the cost moves.
 
         Both are exact; this is a cost choice only. Reuse the structure across calls by passing it
         as ``accelerator`` when several queries share one cloud.
@@ -1046,65 +1037,23 @@ def _knn_cell_size(
     """
     Hash-grid cell width for a k-NN search starting at ``initial_radius``.
 
-    **This width, not the ladder start, is what ``initial_radius`` actually buys, and the tree's
-    largest unclaimed k-NN win is in choosing it.** Isolated by sharing one grid between two
-    searches so that only the ladder start could improve: **0.98x**, against 1.94x for the same seed
-    allowed to rebuild the grid, on a 437 645-point displaced pair (the grid build itself is
-    0.10 ms, so it is not the cost either).
+    **This width, not the deepening ladder's starting radius, is what actually governs the cost of
+    a hash-grid k-NN search.** Too narrow a cell and a query widens over many rounds; too wide and
+    every cell probe scans far more points than it needs to. The true optimal width depends on how
+    far the query points sit from the data cloud, which the cloud's own density says nothing about
+    -- so there is no cheap, general way to estimate it in advance without a real cost model of the
+    cell walk itself, which does not exist yet. A per-query empirical probe does not help either:
+    a query whose true answer is far outside the initial radius falls back to an exact linear scan
+    of the whole cloud, and a CUDA launch's wall time is set by its slowest thread, so even a small
+    probe subsample is liable to include one such row and cost close to what the full query would.
 
-    Sweeping the width directly as a multiple of ``knn_initial_radius``'s value on that cloud, the
-    optimum moves with how far the two clouds sit apart and is nowhere near either the density or
-    the answer distance: at a 0.005x-diagonal displacement the default (1x) is best at 1.0 ms; at
-    0.05x the optimum is **8x the default, 24.1 ms against the default's 160.6**; at 0.5x nothing
-    below 32x changes the number and everything above it is worse. A probe that measures the answer
-    distance seeds those three cases at 2x / 20x / 173x -- right, overshooting by 2.5x, and far past
-    the plateau -- which is why seeding this from a query-prefix probe was measured and **refused**
-    (CLAUDE.md section 16.6 carries the sweep and the four displacements it fails on).
-
-    So the missing piece is a cost model of the cell walk against the width, not a better estimate
-    of the answer. Until there is one, the density model is the honest default: it is optimal at
-    small separations and the failure mode at large ones is a slow query rather than a wrong one --
-    every row still certifies itself, so this value affects speed only.
-
-    **Investigated once more (`plans/benchmark-round-11.md` section 3) and closed as a negative
-    result: no cheap, general, safe escalation trigger exists for this, and the reason is now
-    understood rather than only measured.** Two designs were built and rejected:
-
-    - **An analytic cost model** (`n_cells_visited(r, cell) = (2 ceil(r/cell) + 1)^3`, weighted by
-      an average points-per-cell term and two hardware constants fit by grid search against a real
-      four-displacement sweep) tracks the *shape* of the true cost curve at small perturbations but
-      is not safe to act on: at the largest displacement measured it predicts the optimum at 8x the
-      default cell width and rates 16x-64x as better still, where the true optimum is 2x and 16x-64x
-      measure **1.9-2.9x losses** against the default. It has no term for non-uniform point density
-      or hash-bucket collision effects at coarse widths, and both matter more than cells-visited
-      does once the cell is wide.
-    - **A subsample-based empirical probe** (try a handful of candidate widths on a small prefix of
-      the query set, keep whichever measures fastest) is safe -- it can only choose among widths it
-      actually timed -- and captures most of the available win where the win is moderate (chose 4x
-      against a true optimum of 3x at a displacement measuring **12x**, itself catching **9x** of
-      it). But its own cost is not what a "subsample" suggests, because of a fact about *this
-      kernel's execution model* rather than about search algorithms: measured on the 437 645-point
-      cloud, **36 %** of queries fall past `_knn_widest_grid_radius` into the exact O(n) fallback at
-      a 0.05x-diagonal displacement, and **92 %** do at 0.5x -- not a rare straggler, most of the
-      population. A CUDA launch waits for its slowest thread, so wall time at low occupancy tracks
-      the worst query in the batch, not the query count: a **4-query** subsample already cost
-      **46 ms**, indistinguishable from cost at 1 000 queries (45 ms) and over half the cost of the
-      full 20 000-query run it exists to avoid (85 ms), because a subsample this size already has
-      better than even odds of containing one O(n) fallback row. Shrinking the subsample further
-      does not help -- the probe's cost floor is set by whichever single query it happens to sample,
-      not by how many it samples.
-
-    **The obstacle is therefore not "which formula predicts the right width" -- it is that cheaply
-    detecting the need to escalate is, for a kernel that puts one query per thread and blocks the
-    whole launch on its slowest one, no cheaper than paying the cost being avoided**, whenever
-    "expensive" describes a third or more of the query population rather than a rare outlier. Do not
-    re-propose either design without a change to that execution model. The more promising unexplored
-    lead is structural, not a tuning constant: CLAUDE.md section 14.2's cooperative-BVH-walk pattern
-    (one warp per query, `tile_bvh_query_aabb`) already fixed an analogous per-query load imbalance
-    for `mesh_to_mesh_distance` and `ball_pivoting`'s pivot search, by spreading one expensive
-    query's work across a block instead of leaving it serial on one thread. A block-cooperative
-    k-NN walk would address the per-thread cost directly rather than trying to avoid triggering it,
-    but is a new kernel family, not a wider cell -- unattempted, and a large effort on its own.
+    Until a proper cost model exists, this uses a simple, safe default -- bounded between one grid
+    period and the cloud's full extent -- rather than trying to estimate the true optimum. The
+    failure mode of a bad width is a slower query, never a wrong one: every row still certifies
+    itself, so this value affects speed only. A block-cooperative k-NN walk (one warp per query,
+    on the model of the cooperative BVH walks used elsewhere) would address the underlying
+    per-thread cost imbalance directly, but is a new kernel family rather than a tuning constant,
+    and has not been attempted here.
     """
     extent = max(float(max_bound[axis] - min_bound[axis]) for axis in range(3))
     if extent <= 0.0:
@@ -1122,9 +1071,9 @@ def _knn_widest_grid_radius(cell_size: float, n: int) -> float:
     ``wp.hash_grid_query`` visits ``(2 ceil(r / cell) + 1) ** 3`` cells, and each visit is a hash
     plus two dependent, uncoalesced global loads. The linear scan it falls back to is the opposite:
     every thread in a warp reads the *same* ``points[j]``, so it streams out of L2 as a broadcast.
-    Measured on an RTX 5090, one cell probe costs on the order of ``_CELL_PROBE_POINTS`` point
-    tests, which makes the break-even span grow as ``n ** (1/3)`` — one cell of slack on ``bunny``
-    (36k points), four on ``dragon`` (438k). A fixed span gets one of those two badly wrong.
+    One cell probe costs on the order of ``_CELL_PROBE_POINTS`` point tests, which makes the
+    break-even span grow as ``n ** (1/3)`` -- a small cloud needs only one cell of slack, a much
+    larger one several. A fixed span gets one of those two badly wrong.
     """
     span = 0.5 * ((n / _CELL_PROBE_POINTS) ** (1.0 / 3.0) - 1.0)
     # Never below one cell: the 3x3x3 walk is what the grid was built for and is cheap at any n.
@@ -1233,8 +1182,8 @@ def query_weighted_nearest(
         ``(m,)`` query positions as ``wp.vec3``.
     max_weight
         An **upper bound** on ``weights``, which is what makes the search prunable. ``None`` reduces
-        ``weights`` on the device and reads the maximum back (one readback, ~0.1 ms), so pass it
-        when the bound is already known -- a radius cap, or a previous call's reduction.
+        ``weights`` on the device and reads the maximum back (one readback), so pass it when the
+        bound is already known -- a radius cap, or a previous call's reduction.
     accelerator
         A prebuilt ``wp.Bvh`` over ``points``, to reuse across queries. Spelled the way the four
         [`query_ball`][triwarp.neighbors.query_ball] /

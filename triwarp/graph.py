@@ -18,8 +18,8 @@ from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
 
 # Frontier width at which the level-synchronous BFS hands the rest of the traversal to one serial
-# thread. A level costs a fixed ~13 us of launch overhead whatever its frontier, while the serial
-# walk costs ~0.5 us a node (measured, RTX 5090), so the two break even around 26 nodes wide.
+# thread. A level costs a fixed amount of launch overhead whatever its frontier, while the serial
+# walk costs a small amount per node, so the two break even once the frontier is narrow.
 #
 # This replaces a ``node_count < 16384`` guard, which was the wrong predicate: its own comment named
 # the failure mode as "small **or path-like**" but a node count only detects "small", and no static
@@ -512,62 +512,24 @@ def bfs(
 
     Notes
     -----
-    !!! note "A long-diameter graph is at its ceiling here, and the ceiling is measured"
+    !!! note "A long, narrow graph (e.g. a thin ribbon) hits a ceiling here"
 
-        On a two-wide ribbon of 40 962 vertices (diameter 20 480) the serial engine takes almost
-        the whole traversal and runs **23.3 ms against scipy's 0.74 ms**. That is not a defect in
-        the serial kernel, and three ways of attacking it were measured and all failed:
+        Once the frontier narrows, the traversal hands the rest of the walk to a single serial
+        thread, so a graph that stays narrow for most of its diameter costs close to one thread's
+        full pointer-chasing walk over it. This is a genuine memory-throughput limit rather than a
+        tuning gap: the per-node cost is dominated by dependent loads with no independent work left
+        to hide behind them, and a cooperative block-synchronized rewrite is *slower* here because
+        a narrow frontier's per-level barriers cost more than the work they protect. A host (CPU)
+        fallback is not used either, since it would mean copying the whole CSR structure and the
+        result back across the bus, a different contract from the one this function has. So on a
+        very long, narrow graph this function will not beat
+        ``scipy.sparse.csgraph.breadth_first_order``, whose single-threaded walk has no such
+        transfer cost.
 
-        - **It is memory-op *throughput* per thread, not a latency chain.** 481 ns per node against
-          524 ns for fifteen *independent* loads issued from one thread on the same device (one
-          dependent L2 load is 118 ns), so there is no stall left to hide. One- and two-deep
-          software pipelining of the ``order -> offsets`` half measured **1.05x and 1.01x**, and
-          batching the neighbours' ``dist`` loads through a register vector was a **loss**
-          (21.0 against 19.7 ms).
-        - **More threads cannot pay for their own synchronization.** A single-block cooperative
-          rewrite — level-synchronous, order-exact by construction, verified byte-identical in
-          ``order`` / ``parents`` / ``distances`` at 4, 8, 16 and 32 lanes — runs **39.9-44.1 ms, a
-          2.2x loss**. A ribbon's frontier is ~2 nodes, so the block barriers *are* the cost:
-          ``wp.tile_sum(wp.tile(x))[0]`` is 126 ns and ``wp.tile_scan_exclusive`` 353 ns, and a
-          correct round needs one of each plus a second barrier — ~600 ns of synchronization against
-          the serial engine's 962 ns for the whole level. Over 20 480 levels that is a ~12 ms floor
-          on the synchronization alone, so no barrier arrangement reaches even 2x.
-        - **The host is not the answer, though it is no longer unsafe.** One CPU core does this in
-          well under a millisecond. Until Warp 1.16 that was moot — the CPU backend corrupted the
-          process heap on this stack, so a host fallback traded a slow row for a random crash —
-          but the corruption is **fixed** as of Warp 1.16.0 (the recorded
-          ``filter_mut_dif_laplacian`` repro, which aborted ~60 % of the time on Warp 1.15, ran
-          clean in 12/12 subprocesses and in 5/5 long sessions interleaving Warp-CPU with igl and
-          trimesh). What rules it out now is
-          the interface: a host walk means reading the whole CSR and the result back across the
-          bus, which is a different contract from the one this function has.
-
-        The parallel engine is far worse on this shape (four fixed-size launches per level,
-        ~410 ms even under conditional-graph capture), which is why the handover exists at all.
-        Single-source BFS on a path graph has two-way parallelism, and one GPU thread
-        pointer-chasing is ~30x slower than one CPU core doing the same, so **triwarp will not beat
-        scipy on this axis.**
-
-        !!! note "The narrower ``sphere_med`` gap is a launch-count floor, and it is now at it"
-            There the captured engine runs its level body for a ~130-wide frontier, and the cost is
-            per-*kernel* rather than per-node: measured **~2.8 us of device time per launch, flat
-            from ``dim=1024`` to ``dim=163842``**, so Warp's inability to take a device-side launch
-            dimension costs nothing and narrowing the grid is not the lever. Fusing is, and the body
-            has now been fused as far as the algorithm's barriers allow — **seven kernels to four**,
-            worth a measured **3.94 -> 3.53 ms** on ``sphere_med`` (1.15 -> 1.05x per level on
-            ``sphere_large``, 8.04 -> 7.09 ms).
-
-            The returns fell off sharply, which is the useful part of the result: the first two
-            kernels removed were nearly free ones (3.94 -> 3.67), and folding the claim count into
-            the block scan bought only another 0.13 ms because the fused kernel inherited the work
-            rather than the launch. So ~1.8 us of each surviving kernel's 4.6 us is real work and
-            the 2.8 us floor is the rest.
-
-            The remaining four are the minimum: ``expand_claim`` must finish its ``atomic_min``
-            ownership before the count can read it, the block scan must finish before its block sums
-            are cumulated, and the scatter must see the cumulated sums — three global barriers, four
-            kernels. **triwarp will not reach scipy on this row either**, and the residual is
-            dispatch, not algorithm.
+        On a moderately wide frontier the parallel engine's per-level cost is dominated by its
+        fixed launch overhead rather than by graph size, so narrowing the grid is not a useful
+        lever there; the remaining launches per level are already at the minimum the algorithm's
+        synchronization points allow.
     """
     node_count, offsets, columns = _validate_square_csr(adjacency)
     if source < 0 or source >= node_count:
@@ -635,17 +597,9 @@ def bfs(
             device=device,
         )
         # Count and scan share a launch (see the kernel), and the scan is a capture-safe
-        # fixed-buffer one: wp.utils.array_scan allocates temp storage internally, which conditional
-        # graph bodies reject.
-        #
-        # **Still true on Warp 1.17, and re-probed because the release looks like it fixed it.**
-        # 1.17 lists four graph-capture fixes for ``radix_sort_pairs`` / ``segmented_sort_pairs``
-        # (NVIDIA/warp#1373), one of them "sorts in conditional body graphs ... could fail or
-        # invalidate capture", which reads like this workaround's reason. It is not: measured
-        # inside a ``wp.capture_while`` body, ``wp.utils.radix_sort_pairs`` now captures and
-        # replays fine, while ``wp.utils.array_scan`` still raises *"Conditional body graph
-        # contains an unsupported operation (memory allocation)"*. The fix covers the sorts and
-        # not the scan, so ``bfs_count_and_scan`` stays.
+        # fixed-buffer one: wp.utils.array_scan allocates temp storage internally, which a
+        # conditional graph body rejects ("Conditional body graph contains an unsupported
+        # operation (memory allocation)"), so ``bfs_count_and_scan`` avoids it with a fixed buffer.
         wp.launch_tiled(
             kernel_bfs.bfs_count_and_scan,
             dim=[n_blocks],
@@ -686,10 +640,10 @@ def bfs(
         )
 
     # CUDA only: ``bfs_count_and_scan`` builds its tile with ``wp.tile``, which fills lane 0 alone
-    # on Warp 1.17's CPU backend. On CPU the level loop is skipped entirely and the serial kernel
-    # below walks from the seed — the same kernel the escape path already hands off to, so the
-    # answer is identical rather than degraded, and one CPU core pointer-chasing is the faster
-    # engine there anyway.
+    # on the CPU backend. On CPU the level loop is skipped entirely and the serial kernel below
+    # walks from the seed — the same kernel the escape path already hands off to, so the answer is
+    # identical rather than degraded, and one CPU core doing the walk is the faster engine there
+    # anyway.
     if device.is_cuda:
         condition = state[3:4]
         if wp.is_conditional_graph_supported():
@@ -809,9 +763,8 @@ def bfs_multi_source(
         return empty, wp.empty(0, dtype=wp.int32, device=device)
 
     # Unlike the two edge-buffer range checks in this module, this one stays on the host:
-    # ``sources`` is ``k`` seeds, not a mesh-sized buffer (16-256 on the benchmark axis), so the
-    # copy is bytes and a ``tw.reduce.minmax`` launch costs more than it saves at every realistic
-    # ``k``. No gain on CUDA at any size is the reason, not the CPU cost.
+    # ``sources`` is ``k`` seeds, not a mesh-sized buffer, so a plain host-side check is cheaper
+    # than a device reduction launch at any realistic ``k``.
     sources_np = sources.numpy()
     if sources_np.min() < 0 or int(sources_np.max()) >= node_count:
         raise ValueError(
@@ -872,9 +825,8 @@ def shortest_path_envelope(
     * **A shortest-path distance — Dijkstra's answer.** Seed ``values`` with ``0`` on the source
       nodes and a number larger than any reachable distance elsewhere, and the result is the
       weighted multi-source shortest-path distance to the nearest source, ``d`` being the sum of
-      ``adjacency``'s values along the path. Measured equal to
-      [`scipy.sparse.csgraph.dijkstra`][] to 7.1e-07 (``float32`` against ``float64``) on a
-      subdivided icosphere, for one source and for three.
+      ``adjacency``'s values along the path, agreeing with
+      [`scipy.sparse.csgraph.dijkstra`][] up to float32 precision.
     * **A Lipschitz cap.** Applied to an arbitrary field it enforces
       ``values[i] <= values[j] + w(i, j)`` on every edge by lowering values only, so every local
       minimum of the input survives untouched and only peaks that rise too steeply out of them are
@@ -939,8 +891,8 @@ def shortest_path_envelope(
 
     One kernel launch per pass, double-buffered, so a pass is a pure function of the previous labels
     and the answer does not depend on thread interleaving. The pass count is data-dependent and each
-    pass ends in one ``int32`` readback (~0.1 ms against ~1 ms of launches per pass on a scan mesh),
-    which is the cheaper side of that trade — see the ``linalg`` note on ``check_every``.
+    pass ends in one small ``int32`` readback to check for convergence, which is cheap relative to
+    the launches themselves — see the ``linalg`` note on ``check_every``.
 
     For distance *across* a surface rather than along its edges — shorter, and what "geodesic"
     usually means — use [`heat_geodesic`][triwarp.heat.heat_geodesic]. The edge-graph
@@ -995,7 +947,7 @@ def _validate_square_csr(
 
     The shared entry check of every function here that takes a prebuilt adjacency. The
     ``pyright: ignore`` comments live here rather than at each call site: Warp's stub omits
-    ``BsrMatrix.offsets`` / ``.columns`` (see CLAUDE.md section 12).
+    ``BsrMatrix.offsets`` / ``.columns``.
     """
     node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
     ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
@@ -1029,8 +981,7 @@ def _validate_edge_list(edges: twt.Array2dInt32, node_count: int | None, *, vali
     if node_count < 0:
         raise ValueError(f"node_count must be non-negative, got {node_count}")
     if validate and int(edges.shape[0]) > 0:
-        # One 8-byte read of both bounds, not a copy of the whole edge buffer: measured on CUDA,
-        # 1.69x at 400k entries and 16.3x at 8M, crossing over near 200k.
+        # One 8-byte read of both bounds, not a copy of the whole edge buffer.
         lowest, highest = tw.reduce.minmax(edges)
         if lowest < 0 or highest >= node_count:
             raise ValueError(

@@ -287,10 +287,9 @@ def sortable_dtype(dtype: type[wp.Scalar]) -> type[wp.Scalar]:
     ordering: negative floats have descending bit patterns, and a ``uint64`` with its top bit set
     reads as a negative ``int64``. Warp sorts ``int32`` / ``int64`` / ``uint32`` / ``uint64`` /
     ``float32`` / ``float64`` keys directly, so the sort is done in this dtype instead of on the
-    reinterpreted bits. The set is unchanged through Warp 1.17.0 (re-probed on both devices: every
-    narrower width -- ``int8`` / ``uint8`` / ``int16`` / ``uint16`` / ``float16`` -- still raises
-    ``Unsupported keys and values data types``), so the widening table below still has a case for
-    each of them.
+    reinterpreted bits. Every narrower width -- ``int8`` / ``uint8`` / ``int16`` / ``uint16`` /
+    ``float16`` -- raises ``Unsupported keys and values data types``, so the widening table below
+    has a case for each of them.
 
     Parameters
     ----------
@@ -341,8 +340,7 @@ def empty_2d(
 
     One function for what used to be ``empty_int32_2d`` / ``empty_float32_2d`` / ``empty_float_2d``.
     The dtype selects the return alias through overloads, so a call site keeps the narrow type it
-    had rather than falling back to a union -- verified with ``reveal_type`` under this repo's
-    basedpyright config, which is the only place Warp's stubs resolve.
+    had rather than falling back to a union.
 
     Parameters
     ----------

@@ -544,11 +544,9 @@ def laplacian_entries(
         which is the ``equal_weight=False`` default, so this is the keyword that matters for the
         geometry-weighted operator. When ``None`` the edge set is derived here.
 
-        Worth passing whenever the caller already holds it, because the derivation dominates:
-        measured on the five scan meshes, ``edges_unique`` costs 0.62 / 0.60 / 2.01 / 2.13 /
-        **73.50 ms** against a whole ``laplacian(equal_weight=False)`` call of 1.22 / 1.24 / 2.77 /
-        2.84 / **92.10** -- so on the largest it is **80 % of the call**. Ignored by the directed
-        branch, which reads ``faces`` alone.
+        Worth passing whenever the caller already holds it, because deriving the edge set can
+        dominate the whole call on a large mesh. Ignored by the directed branch, which reads
+        ``faces`` alone.
 
     Returns
     -------
@@ -636,8 +634,8 @@ def laplacian(
         Optional precomputed ``(m, 2)`` unique undirected edges, forwarded to
         [`laplacian_entries`][triwarp.laplacian.laplacian_entries]. Read its note before skipping
         this: on the ``symmetric`` branch (the ``equal_weight=False`` default) deriving the edge
-        set is up to **80 %** of this call, so a caller that already holds one -- or that assembles
-        the operator repeatedly over fixed connectivity, as
+        set can dominate the call, so a caller that already holds one -- or that assembles the
+        operator repeatedly over fixed connectivity, as
         [`filter_taubin`][triwarp.smoothing.filter_taubin] does at ``recompute=True`` -- should
         pass it. Ignored when the adjacency is directed.
 

@@ -257,10 +257,6 @@ _WARP_VERSION_CLAIM = re.compile(r"\bWarp\s+1\.(\d+)(?:\.(\d+))?\b")
 # ``triwarp/`` are keyed by their dotted name, everything else by its path
 # (``tests.api_conventions``, ``benchmarks.test_creation``).
 _WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
-    ("graph", "1.15"): (
-        "deliberate history: names the version the CPU heap corruption was measured on so the "
-        "1.16 fix beside it has something to be a fix *of*"
-    ),
     ("tests.api_conventions", "1.13"): (
         "deliberate history: this check's own rationale, naming the range of versions the twelve "
         "stale workarounds cited -- the thing it was written to stop"
@@ -285,14 +281,6 @@ _WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
     # abort), the ``radix_sort_pairs`` key-dtype set, a matrix's missing ``.shape`` in kernel
     # scope, ``wp.Volume``'s zero-point raise and the inclusive BVH box test.
     # ---------------------------------------------------------------------------------------
-    ("graph", "1.16"): (
-        "deliberate history: names the version that *fixed* the CPU heap corruption the 1.15 "
-        "entry above records, so the pair reads as a before and an after"
-    ),
-    ("holes", "1.16"): (
-        "measurement stamp: the persistent-block DP table (0.89x / 0.12x / 0.03x at B = 128 / "
-        "512 / 2048) was taken on 1.16 and not re-run"
-    ),
     ("kernels.holes", "1.16"): (
         "measurement stamp: the runtime-vs-constant stride A/B on a 400-vertex loop was taken "
         "on 1.16 and not re-run"
@@ -318,13 +306,6 @@ _WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
     ("kernels.visibility", "1.16"): (
         "measurement stamp: the ``ambient_occlusion`` block-per-point table was taken on 1.16 "
         "and not re-run"
-    ),
-    ("polyline", "1.16"): (
-        "measurement stamp: the serial-vs-doubling crossover table was taken on 1.16 and not re-run"
-    ),
-    ("reconstruction", "1.16"): (
-        "measurement stamp: the ``warp.fem`` deferral's import cost (1.49 s against 1.18 s) "
-        "was taken on 1.16 and not re-run"
     ),
     ("tests.test_reconstruction", "1.16"): (
         "measurement stamp: the screened-Poisson CPU depth timings behind the ``slow_cpu`` "

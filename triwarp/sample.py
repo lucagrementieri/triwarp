@@ -246,8 +246,7 @@ def sample_surface(
 
     # ``array_scan`` is inclusive by default, so the total is the scan's last element -- a 4-byte
     # tail read instead of a whole second reduction over the weights. Same trick as
-    # ``array.flatnonzero`` and ``array.counts_to_offsets``. Measured interleaved, CDF + total:
-    # 1.13x on CUDA at both 20k and 328k faces (it is launch-bound there), 1.53x and 2.04x on CPU.
+    # ``array.flatnonzero`` and ``array.counts_to_offsets``.
     cdf = wp.empty(n_faces, dtype=wp.float32, device=vertices.device)
     wp.utils.array_scan(weights, out_array=cdf)
     total = float(read_scalar(cdf))
@@ -405,19 +404,11 @@ def _top_maxima_by_weight(
     Only the last elimination round needs this -- every earlier one deletes all of its local
     maxima. It used to read ``is_max`` and ``weights`` back in full and pick the top ``excess`` with
     ``numpy.argsort``, moving ``2 * init_count`` elements across the bus where the rest of the loop
-    moves none.
+    moves none. Sorting the flagged weights on the device removes both readbacks and the upload.
 
-    Measured end to end on an ``icosphere(5)`` pool,
-    [`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk] goes 6.55 -> 6.19 ms
-    at ``count=20000`` (**1.06x**) and 5.81 -> 5.75 at ``count=2000``. Timing the branch in
-    isolation suggested far more -- 24 % of the call -- but that probe fed it a synthetic ``excess``
-    an order of magnitude larger than the real final round's, so the call-level number is the one to
-    believe. The win grows with ``count`` because the readback does and the sort does not.
-
-    Sorting the flagged weights on the device removes both readbacks and the upload. Ties order
-    differently from ``numpy.argsort``'s quicksort -- ``radix_sort_pairs`` is stable -- but the
-    weights are sums of continuous kernel falloffs, so an exact tie between two of them does not
-    arise in practice, and which of two equally-crowded points is dropped is not a property the
+    Ties order differently from ``numpy.argsort``'s quicksort -- ``radix_sort_pairs`` is stable --
+    but the weights are sums of continuous kernel falloffs, so an exact tie between two of them does
+    not arise in practice, and which of two equally-crowded points is dropped is not a property the
     algorithm defines anyway.
 
     Parameters
@@ -593,7 +584,7 @@ def _dart_throw_blue_noise(
 
     while alive_count > 0:
         view = alive[:alive_count]
-        # Two fills rather than a reset kernel: a memset is ~3.1 us against ~9.7 for a launch.
+        # Two fills rather than a reset kernel: a memset is cheaper than a full launch.
         cell_min_priority.fill_(kernel_blue_noise.DART_NO_PRIORITY)
         cell_accepted.fill_(False)
         wp.launch(
@@ -725,8 +716,6 @@ def sample_volume(
 
     # One device reduction, not two: the star-shaped test genuinely needs a ``min``, but the total
     # is the inclusive scan's last element and comes for free with the CDF this builds anyway.
-    # (The earlier note here recorded 2.07x-19.6x for the reduction over a full host readback of
-    # the per-face volumes; that comparison still holds, and the scan tail is cheaper again.)
     if tw.reduce.min(signed_vols) < 0.0:
         raise ValueError(
             "mesh is not star-shaped with respect to its centroid (e.g. a torus); "

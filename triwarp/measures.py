@@ -215,10 +215,8 @@ def moments(
     # Four device reductions, each returning its total to the host: every return here is a
     # host-side value, so ten sums have to cross -- but only the ten, not the per-face integrands.
     # ``wp.utils.array_sum`` reduces a ``wp.vec3d`` array componentwise, so the three vector groups
-    # need no kernel of their own. Reading them with ``.numpy().sum(axis=0)`` instead copied three
-    # ``(n_faces,)`` ``vec3d`` buffers -- 72 bytes per face -- to add them on the host: measured
-    # back-to-back, 3.08 ms -> 0.18 ms (17x) on ``bunny`` and 33.6 -> 0.19 (174x) on ``dragon`` on
-    # CUDA, and 2.54 -> 0.55 (4.7x) on CPU.
+    # need no kernel of their own. Reading them with ``.numpy().sum(axis=0)`` instead would copy
+    # the whole ``(n_faces,)`` ``vec3d`` buffers to the host just to add them there.
     total_volume = float(wp.utils.array_sum(volumes))
     first_moment = np.asarray(list(wp.utils.array_sum(first)), dtype=np.float64)
     integral_squares = np.asarray(list(wp.utils.array_sum(squares)), dtype=np.float64)

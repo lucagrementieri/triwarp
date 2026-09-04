@@ -279,9 +279,9 @@ def _needs_unoriented_boundary_walk(directed: twt.Array2dInt32, n_vertices: int)
     they need different answers, so this returns ``True`` for only one of them:
 
     - **A non-orientable seam.** The winding cannot be made consistent globally, so at the seam two
-      boundary edges leave the same vertex and ``succ[tail] = head`` drops one silently. Measured
-      on the Moebius fixture: exactly one vertex of 78 has out-degree 2, and the walk that follows
-      returns 78 entries over only 40 distinct vertices. The boundary is still 2-regular, so
+      boundary edges leave the same vertex and ``succ[tail] = head`` drops one silently. On the
+      Moebius fixture, exactly one vertex of 78 has out-degree 2, and the walk that follows returns
+      78 entries over only 40 distinct vertices. The boundary is still 2-regular, so
       [`_unoriented_boundary_cycles`][triwarp.boundary._unoriented_boundary_cycles] recovers it
       exactly -- this is the case worth taking.
     - **A pinch point**, where two loops meet at one vertex, which then has four boundary
@@ -289,13 +289,12 @@ def _needs_unoriented_boundary_walk(directed: twt.Array2dInt32, n_vertices: int)
       -- it would have to drop neighbours too, just at a different place. The documented last-write-
       wins behaviour stands, and this returns ``False``.
 
-    Conflating them is easy and was measured: an icosphere with every seventh face removed has
-    pinch points and *no* orientability problem, and a gate reading only out-degree sends it down
-    the fallback for 1.39x and no benefit.
+    Conflating them is easy: an icosphere with every seventh face removed has pinch points but no
+    orientability problem, and a gate reading only out-degree would incorrectly send it down the
+    undirected fallback.
 
     One 8-byte host readback. Both flags come from one pass over the boundary and one over the
-    vertices, rather than two max-reductions, because at ~0.14 ms a reduction pair would be 5% of
-    this function on an open mesh.
+    vertices, rather than two separate max-reductions.
     """
     device = directed.device
     degrees = twt.as_array2d(wp.zeros((n_vertices, 2), dtype=wp.int32, device=device), wp.int32)
@@ -348,17 +347,13 @@ def _unoriented_boundary_cycles(
     right side of the fence rather than an unfinished port. The host loop is over *cycles*, not over
     darts -- twice the boundary-loop count, so **two** iterations on the Moebius fixture -- and each
     iteration's body is a vectorized slice, not a per-element Python step. And the device
-    alternative is a segment compaction: a keep mask, a ``counts_to_offsets`` scan and a gather,
-    which is four or five launches at ~10 us each before any work happens (CLAUDE.md section 13.1),
-    against a host constant that only overtakes it somewhere past a hundred boundary loops on a
-    surface that also has to be non-orientable. No fixture or benchmark in the package reaches
-    that, and CLAUDE.md section 9 wants the benchmark before the rewrite.
+    alternative is a segment compaction (a keep mask, a ``counts_to_offsets`` scan and a gather)
+    that only pays for itself on a mesh with many boundary loops that is also non-orientable.
     """
     device = boundary_edges.device
     # Allocated with the sentinel rather than filled after: a buffer whose initial value matters
     # is created holding it, so there is no window in which it holds garbage and no second
-    # statement to keep in step with the first. Cost is a wash -- measured 0.96-1.00x against
-    # ``empty`` plus ``fill_`` at 1 024, 200 000 and 4 000 000 elements -- so this is legibility.
+    # statement to keep in step with the first.
     neighbors = twt.as_array2d(
         wp.full((n_vertices, 2), -1, dtype=wp.int32, device=device), wp.int32
     )
@@ -654,13 +649,8 @@ def _launch_loop_measure(
     kernels accumulate into their output with an atomic add.
 
     Bundling the launch's six arguments -- those five inputs plus the output -- into a
-    ``@wp.struct`` is **declined**, and the arithmetic is the reason rather than a preference. A
-    launch argument costs ~1.0 us of host time and a bundle costs ~2.6 us to build (CLAUDE.md
-    section 13.1), so six arguments collapsed to one saves at most ~2.4 us -- and section 2.8's
-    rule is that width alone does not qualify a kernel, the launch *count* around it does. This
-    launches **once** per call, where the measured win came from a 25-argument kernel launched once
-    per span inside a Python loop; 2.4 us against a call measured at 0.36 ms on ``dragon``'s 407
-    rims is under 1 %.
+    ``@wp.struct`` is not worth it here: this launches once per call rather than repeatedly inside
+    a loop, so there is little host-side argument-marshalling overhead to remove.
     """
     out = wp.zeros(n_loops, dtype=dtype, device=vertices.device)
     wp.launch(
@@ -686,8 +676,6 @@ def _loop_owner_labels(
     is ``flat_loops.shape[0]`` -- known on the host -- so the terminator comes from the allocation
     rather than from a readback.
     """
-    # What the two public forms' ``loop_id`` keyword saves by not coming here: 0.059 to 0.118 ms
-    # on 351 rims on CUDA and 0.035 to 0.078 on the CPU, against a measure that is one launch.
     n_loops = int(loop_sizes.shape[0])
     device = flat_loops.device
     loop_id = wp.empty(int(flat_loops.shape[0]), dtype=wp.int32, device=device)
@@ -724,12 +712,11 @@ def _pack_loop_segments(
     # ``shape`` -- so it is the sanctioned kind and not a readback: nothing crosses the bus except
     # the two uploads at the end, and there is no device buffer to reduce.
     #
-    # Building ``loop_id`` on the device instead -- ``kernels/array.py``'s ``segment_owner_labels``,
-    # one launch -- was measured and **declined**: 0.078 -> 0.029 ms on ``dragon``'s 407 rims and
-    # 0.051 -> 0.029 on ``bunny``'s five, so at most 0.05 ms of a 0.36 ms call, and the kernel wants
-    # total-terminated offsets, whose extra allocation and copy is most of that back. The
-    # ``numpy.repeat`` stays. This is also why the packed form takes ``loop_id`` as a keyword: the
-    # two forms build it from different inputs and each is the cheaper one for what it holds.
+    # Building ``loop_id`` on the device instead (``kernels/array.py``'s ``segment_owner_labels``)
+    # is not worth it here: that kernel wants total-terminated offsets, and the extra allocation
+    # and copy to produce them outweighs the launch it would save, so the ``numpy.repeat`` stays.
+    # This is also why the packed form takes ``loop_id`` as a keyword: the two forms build it from
+    # different inputs and each is the cheaper one for what it holds.
     device = vertices.device
     loops = list(loops)
     for loop in loops:
@@ -739,8 +726,7 @@ def _pack_loop_segments(
         return None
     # ``copy=False``: nothing below writes into ``flat_loops``, and a caller's loops usually
     # come straight from ``boundary_loops``, which already sliced them out of one packed
-    # buffer -- so the pack is free instead of one ``wp.copy`` per rim (2.594 -> 0.336 ms on
-    # ``dragon``'s 407 rims, whose measurement launch is 0.023 ms of that).
+    # buffer -- so the pack is free instead of one ``wp.copy`` per rim.
     flat_loops, starts = tw.array.pack_1d_arrays(loops, copy=False)
     sizes_np = np.array([int(loop.shape[0]) for loop in loops], dtype=np.int32)
     loop_id = wp.array(
@@ -865,8 +851,7 @@ def ears(
         one facing vertex ``i``, ``(faces[f, (i + 1) % 3], faces[f, (i + 2) % 3])`` -- because it
         reads its mask from ``igl::on_boundary``, whose columns are documented that way. The two
         agree on *which* faces are ears and differ on the index by a cyclic shift:
-        ``triwarp_opp == (igl_opp + 1) % 3``. See
-        ``tests/test_boundary.py::test_ears_match_igl``.
+        ``triwarp_opp == (igl_opp + 1) % 3``.
 
     Parameters
     ----------

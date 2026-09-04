@@ -653,7 +653,7 @@ def _compact_repeats(
 def _offsets_through(
     positions: wp.array[wp.int32], loop_offsets: wp.array[wp.int32]
 ) -> wp.array[wp.int32]:
-    """Map old per-loop offsets through a position remap -- a Python-scope gather (§4)."""
+    """Map old per-loop offsets through a position remap -- a Python-scope gather."""
     mapped = wp.empty(int(loop_offsets.shape[0]), dtype=wp.int32, device=positions.device)
     wp.copy(mapped, positions[loop_offsets])
     return mapped

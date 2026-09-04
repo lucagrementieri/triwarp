@@ -206,8 +206,8 @@ def unique_1d(
 
     # ``_unique_hash`` only ever *reads* the integer key array, so when the input already is one of
     # the two key dtypes the bit reinterpretation is the identity and the buffer can be shared --
-    # skipping a full-length copy and its allocation, measured 17.9 us of a 313 us
-    # ``unique_1d(100k)``. Every other dtype still needs the real conversion.
+    # skipping a full-length copy and its allocation. Every other dtype still needs the real
+    # conversion.
     data_int = data if data.dtype in (wp.int32, wp.int64) else bitcast_to_int(data, n)
     return _unique_hash(data, data_int, data.dtype, n, mask, return_inverse, return_counts)
 
@@ -726,11 +726,7 @@ def hash_indices_rows(
         redundant, and four of them deliberately keep it on.** ``index_bound`` is a ``max``
         reduction; the validation is a ``minmax``, and it is the ``min`` half -- the negative-index
         guard -- that has no counterpart above it, so skipping it would turn a malformed face
-        buffer from a raise into a silently wrong grouping. Measured on an RTX 5090, Warp 1.17,
-        interleaved, min of 15: the check costs a flat **0.10-0.12 ms**, which is 14.9 / 14.5 /
-        4.8 % of ``edges_unique`` and 13.5 / 15.1 / 4.6 % of ``is_edge_manifold`` on
-        ``bunny_decimated`` / ``bunny`` / ``dragon``. The share *falls* as the mesh grows, which
-        section 9 calls a decline rather than a small win -- so ``edges.edges_unique``,
+        buffer from a raise into a silently wrong grouping. So ``edges.edges_unique``,
         ``validation.is_edge_manifold``, ``validation.edge_manifold_mask`` and ``holes._EdgeTable``
         all validate, and the ten callers that pass ``False`` are the ones whose bound *and*
         non-negativity are structural.

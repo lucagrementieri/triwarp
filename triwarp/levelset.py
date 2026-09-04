@@ -51,11 +51,11 @@ from triwarp.kernels import levelset as kernel_levelset
 # The **cap** stops a small offset distance on a large mesh from asking for a lattice nobody can
 # allocate: a distance field costs 4 bytes a sample, so 256 per axis is 67 MB.
 #
-# The **floor** is the one that was measured. Tying the spacing to the offset distance alone
+# The **floor** guards a real failure mode. Tying the spacing to the offset distance alone
 # resolves the *band* the level set sits in but not necessarily what is left of the object: an
 # inward offset of 0.9 on a unit sphere leaves a sphere of radius 0.1, which at a spacing of 0.9/3
-# is smaller than one cell -- so marching cubes found nothing and the call returned **empty** for a
-# level set that exists. At least 64 samples across the mesh fixes it, for a 64 ** 3 lattice.
+# is smaller than one cell -- so marching cubes finds nothing and the call returns **empty** for a
+# level set that exists. At least 64 samples across the mesh avoids that, for a 64 ** 3 lattice.
 _MAX_AUTO_RESOLUTION = 256
 _MIN_AUTO_RESOLUTION = 64
 
