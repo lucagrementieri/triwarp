@@ -14,9 +14,19 @@ guidance. The kernel side was already one
 warp-uniform kernel branching on an ``ACCEL_*`` selector, so only the Python layer had doubled.
 
 The BVH-only queries keep the structure in their names, because naming it is informative rather
-than redundant there -- a hash grid has no box query:
-[`query_bvh_aabb_with_offsets`][triwarp.neighbors.query_bvh_aabb_with_offsets] and
-[`query_bvh_box`][triwarp.neighbors.query_bvh_box].
+than redundant there: these index arbitrary **bounds** rather than points, which a hash grid
+cannot, and they are broad phase only -- every bound the query region reaches is returned, with no
+narrow-phase filter on the primitive's own geometry.
+[`query_bvh_ball`][triwarp.neighbors.query_bvh_ball] is the ball and
+[`query_bvh_box`][triwarp.neighbors.query_bvh_box] the per-query box; both return the same flat
+``(indices, offsets)`` pair, so neither carries a ``_with_offsets`` suffix -- unlike
+``query_ball_with_offsets``, which needs one to separate it from ``query_ball``'s dense form.
+**Prefer the ball whenever the predicate is a ball**: it is not merely tighter, its traversal is
+substantially cheaper per candidate than the box one (see ``query_bvh_ball``).
+
+A uniform-cube form used to sit beside these and was removed: it was exactly
+``query_bvh_box(bvh, q - h, q + h)``, returned an identical set, and the corner buffers it saved
+measured as no saving at all.
 
 Also home to [`geodesic_ball`][triwarp.neighbors.geodesic_ball], the surface-aware counterpart to
 the spatial ball queries here: it returns the same CSR ``(indices, offsets)`` shape but walks the
@@ -134,7 +144,8 @@ def bvh_from_bounds(
 
     Each primitive ``i`` is represented by ``lower[i]`` and ``upper[i]`` corner
     positions, suitable for
-    [`query_bvh_aabb_with_offsets`][triwarp.neighbors.query_bvh_aabb_with_offsets]
+    [`query_bvh_ball`][triwarp.neighbors.query_bvh_ball] and
+    [`query_bvh_box`][triwarp.neighbors.query_bvh_box]
     broad-phase intersection tests.
 
     Parameters
@@ -154,17 +165,18 @@ def bvh_from_bounds(
     return wp.Bvh(lower, upper, leaf_size=leaf_size)
 
 
-def query_bvh_aabb_with_offsets(
-    bvh: wp.Bvh, queries: wp.array[wp.vec3], half_extent: float, *, include_total: bool = False
+def query_bvh_ball(
+    bvh: wp.Bvh, queries: wp.array[wp.vec3], radius: float, *, include_total: bool = False
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
     """
-    Low-level BVH AABB query: primitive indices in one flat buffer plus offsets.
+    Low-level BVH ball query: primitive indices in one flat buffer plus offsets.
 
-    For each query center ``q``, tests intersection of the query cube
-    ``[q - h, q + h]`` against every primitive bound in ``bvh``. Unlike
-    [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets],
-    there is no narrow-phase distance filter;
-    every broad-phase hit is returned.
+    For each query center ``q``, tests whether every primitive bound in ``bvh`` comes within
+    ``radius`` of ``q`` -- the exact bound-to-point distance, so the returned set is the ball's and
+    not its enclosing cube's. Like
+    [`query_bvh_box`][triwarp.neighbors.query_bvh_box] and unlike
+    [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets], there is no
+    narrow-phase filter on the primitive's own geometry: every bound the ball reaches is returned.
 
     Parameters
     ----------
@@ -173,8 +185,8 @@ def query_bvh_aabb_with_offsets(
         or [`bvh_from_points`][triwarp.neighbors.bvh_from_points].
     queries
         ``(m, 3)`` query centers stored as ``wp.vec3``.
-    half_extent
-        Half side length of the axis-aligned query cube along each axis.
+    radius
+        Ball radius about each query center.
     include_total
         Return ``offsets`` in the length-``m + 1`` CSR form whose trailing element is the total hit
         count, instead of the length-``m`` form. Same meaning as on the ball queries.
@@ -182,25 +194,27 @@ def query_bvh_aabb_with_offsets(
     Returns
     -------
     candidate_indices_flat, offsets
-        ``offsets`` has length ``m`` (or ``m + 1`` with ``include_total``) and is the exclusive
-        prefix sum of per-query hit counts. Query ``k`` owns
-        ``candidate_indices_flat[offsets[k] : offsets[k+1]]``. In the length-``m`` form
-        ``offsets[m]`` is understood as ``candidate_indices_flat.shape[0]``, so a Python-scope
-        caller iterating the queries wants ``include_total=True`` rather than appending it.
+        Exactly the packing
+        [`query_bvh_box`][triwarp.neighbors.query_bvh_box] returns:
+        ``offsets`` is the exclusive prefix sum of per-query hit counts, and query ``k`` owns
+        ``candidate_indices_flat[offsets[k] : offsets[k+1]]``.
 
     Notes
     -----
-    The default is the length-``m`` form because this function's only in-repo consumer is a kernel
-    that recovers the owning query with ``kernels.array.binary_search_index`` and never addresses
-    ``offsets[m]``. Both forms are views into one ``m + 1`` scan buffer
-    ([`counts_to_offsets`][triwarp.array.counts_to_offsets]), so the keyword costs no allocation.
+    Prefer this over the cube query wherever the caller's predicate is a ball, and not only for the
+    candidates it does not return: the ball traversal is *substantially cheaper per candidate* than
+    the box one, enough that the cube query loses even when handed the inscribed cube and therefore
+    strictly fewer candidates. The margin grows with the radius, which is where a cube broad phase
+    hurts most.
 
     See Also
     --------
     [`query_bvh_box`][triwarp.neighbors.query_bvh_box]
-        The same query with a **per-query** box instead of one cube size for every query.
+        The same packing for an axis-aligned **box**, given per query. A box is a different
+        predicate and not a looser ball -- it admits corners the ball excludes -- so reach for it
+        when the neighbourhood really is axis-aligned, and for this when it is a ball.
     [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets]
-        The same packing and the same keyword, for a ball query with a narrow-phase filter.
+        The same ball, over a **point** cloud and with a narrow-phase distance filter.
     """
     device = queries.device
     m = int(queries.shape[0])
@@ -214,17 +228,15 @@ def query_bvh_aabb_with_offsets(
     hit_counts = wp.empty(m, dtype=wp.int32, device=device)
     # ``wp.uint64(bvh.id)`` explicitly: unlike ``wp.launch``, ``wp.map`` infers a bare Python int
     # scalar's dtype as ``wp.int32`` rather than matching the mapped @wp.func's declared parameter
-    # type, and a mismatched dtype is a codegen-time TypeError, not a silent truncation (probed
-    # this session, both here and at ``aabb_count_in_bounds`` below).
+    # type, and a mismatched dtype is a codegen-time TypeError, not a silent truncation.
     wp.map(
-        kernel_neighbors.aabb_count_in_box,
+        kernel_neighbors.ball_count_in_bounds,
         wp.uint64(bvh.id),
         queries,
-        wp.float32(half_extent),
+        wp.float32(radius),
         out=hit_counts,
     )
 
-    # One ``m + 1`` scan buffer serves both forms: the length-``m`` one is a view of its prefix.
     segment_bounds, total_hits = tw.array.counts_to_offsets(hit_counts, include_total=True)
     offsets = segment_bounds if include_total else segment_bounds[:m]
     if total_hits == 0:
@@ -232,15 +244,9 @@ def query_bvh_aabb_with_offsets(
 
     candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_neighbors.query_bvh_aabb_neighbors,
+        kernel_neighbors.query_bvh_ball_neighbors,
         dim=m,
-        inputs=[
-            queries,
-            bvh.id,
-            wp.float32(half_extent),
-            segment_bounds[:m],
-            candidate_indices_flat,
-        ],
+        inputs=[queries, bvh.id, wp.float32(radius), segment_bounds[:m], candidate_indices_flat],
         device=device,
     )
 
@@ -258,7 +264,7 @@ def query_bvh_box(
     Primitives overlapping one axis-aligned box **per query**, in the same CSR packing.
 
     The box counterpart of the ball queries, and the per-query generalization of
-    [`query_bvh_aabb_with_offsets`][triwarp.neighbors.query_bvh_aabb_with_offsets]: each query
+    [`query_bvh_ball`][triwarp.neighbors.query_bvh_ball]: each query
     carries its own ``(lower, upper)`` corners rather than sharing one cube size. On a BVH built by
     [`bvh_from_points`][triwarp.neighbors.bvh_from_points], whose leaf bounds are degenerate, a hit
     means the point is **inside** the box, so the answer is exact and no narrow phase is needed; on
@@ -300,8 +306,13 @@ def query_bvh_box(
 
     See Also
     --------
-    [`query_bvh_aabb_with_offsets`][triwarp.neighbors.query_bvh_aabb_with_offsets]
-        One cube size for every query, which needs no corner buffers at all.
+    [`query_bvh_ball`][triwarp.neighbors.query_bvh_ball]
+        The same packing over the same bounds for a **ball**, and the one to prefer wherever the
+        predicate is a ball rather than an axis-aligned region -- not only because the box admits
+        corners the ball excludes, but because the box *traversal* is itself several times more
+        expensive per candidate returned. Measured with the box's own inscribed cube, which
+        returns strictly fewer candidates than the ball and still costs multiples of it, so the
+        cost is the node test and not the candidate count.
     [`triwarp.points.half_space_mask`][triwarp.points.half_space_mask]
         The unbounded counterpart: selection by one plane rather than by a box.
     """
@@ -317,7 +328,7 @@ def query_bvh_box(
         )
 
     hit_counts = wp.empty(m, dtype=wp.int32, device=device)
-    # ``wp.uint64(bvh.id)`` explicitly -- see the same cast in ``query_bvh_aabb_with_offsets``
+    # ``wp.uint64(bvh.id)`` explicitly -- see the same cast in ``query_bvh_ball``
     # above.
     wp.map(
         kernel_neighbors.aabb_count_in_bounds,

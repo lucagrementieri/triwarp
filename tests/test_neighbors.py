@@ -208,72 +208,74 @@ def test_query_ball_count_matches_scipy_and_the_list_form(
 
 
 @pytest.mark.parametrize("include_total", [False, True])
-def test_query_bvh_aabb_with_offsets_matches_a_brute_force_box_overlap(
+def test_query_bvh_ball_matches_a_brute_force_ball_overlap(
     device: str, include_total: bool
 ) -> None:
     """
-    Class A: the broad-phase hits are exactly the boxes overlapping the query cube.
+    Class A: the broad-phase hits are exactly the boxes the ball of ``radius`` reaches.
 
-    ``bvh_from_bounds`` plus this query is the one pair in the module that indexes *bounds* rather
-    than points, and it has no narrow-phase filter -- so the oracle is the full ``lower <= q + h and
-    upper >= q - h`` test on all three axes, and the comparison is exact rather than a superset.
+    Not a library comparison for the *shape*: no reference binds a broad-phase ball query over
+    arbitrary bounds, so the oracle is the exact point-to-AABB squared distance
+    ``sum(max(lower - q, q - upper, 0)**2) <= radius**2``, which is what
+    ``wp.bvh_query_sphere``'s node test computes.
 
-    Both offsets forms are covered, and the length-``m`` one is asserted to be the ``m + 1`` form's
-    prefix: they are two views of one scan buffer, so a divergence would mean the slicing is wrong
-    rather than the query. Measured 8 hits over 6 queries, 3 of which hit at least one box.
+    The assert that matters is the *strict* containment against the cube query on the same bounds
+    and the same radius: the ball's hits must be a proper subset, or this function is returning the
+    cube's answer under a ball's name -- which is precisely how a query that silently ignored the
+    radius would pass an exactness check against itself.
     """
     rng = np.random.default_rng(4)
     lower_np = (rng.random((40, 3)) * 2.0).astype(np.float32)
     upper_np = (lower_np + rng.random((40, 3)) * 0.3).astype(np.float32)
     queries_np = (rng.random((6, 3)) * 2.0).astype(np.float32)
-    half_extent = 0.25
+    radius = 0.25
     n_queries = queries_np.shape[0]
 
     bvh = tw.neighbors.bvh_from_bounds(
         points_to_warp(lower_np, device), points_to_warp(upper_np, device)
     )
     queries_wp = points_to_warp(queries_np, device)
-    indices_wp, offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
-        bvh, queries_wp, half_extent, include_total=include_total
+    indices_wp, offsets_wp = tw.neighbors.query_bvh_ball(
+        bvh, queries_wp, radius, include_total=include_total
     )
     indices_np = indices_wp.numpy()
     offsets_np = offsets_wp.numpy()
 
     assert offsets_np.shape == (n_queries + 1 if include_total else n_queries,)
     assert indices_np.size > 0
+    bounds_np = offsets_np if include_total else np.append(offsets_np, indices_np.size)
     if include_total:
-        # The trailing element is the flat length, so no caller has to know it separately.
         assert int(offsets_np[-1]) == indices_np.size
-        bounds_np = offsets_np
-    else:
-        bounds_np = np.append(offsets_np, indices_np.size)
-        _indices_wp, total_offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
-            bvh, queries_wp, half_extent, include_total=True
-        )
-        assert np.array_equal(offsets_np, total_offsets_wp.numpy()[:-1])
 
     n_matched = 0
     for query_index, query_np in enumerate(queries_np):
-        overlapping_np = np.flatnonzero(
-            np.all(
-                (lower_np <= query_np + half_extent) & (upper_np >= query_np - half_extent), axis=1
-            )
-        )
+        gap_np = np.maximum(np.maximum(lower_np - query_np, query_np - upper_np), 0.0)
+        within_np = np.flatnonzero((gap_np * gap_np).sum(axis=1) <= radius * radius)
         hits_np = indices_np[bounds_np[query_index] : bounds_np[query_index + 1]]
-        assert np.array_equal(np.sort(hits_np), overlapping_np)
-        n_matched += overlapping_np.size > 0
-    # Three of the six queries hit at least one box here; a run where none did would pass vacuously.
+        assert np.array_equal(np.sort(hits_np), within_np)
+        n_matched += within_np.size > 0
     assert n_matched >= 3
+
+    # The ball is strictly inside the cube of the same half extent, so its hits must be a proper
+    # subset of what ``query_bvh_box`` returns for that cube -- a query ignoring the radius would
+    # return the cube's answer and still pass the exactness check above, since it would then be
+    # compared against a cube oracle it happens to match.
+    cube_lower_wp = points_to_warp(queries_np - radius, device)
+    cube_upper_wp = points_to_warp(queries_np + radius, device)
+    cube_indices_wp, _cube_offsets_wp = tw.neighbors.query_bvh_box(
+        bvh, cube_lower_wp, cube_upper_wp, include_total=include_total
+    )
+    assert int(indices_np.size) < int(cube_indices_wp.shape[0])
 
 
 @pytest.mark.parametrize("include_total", [False, True])
-def test_query_bvh_aabb_with_offsets_degenerate_inputs(device: str, include_total: bool) -> None:
+def test_query_bvh_ball_degenerate_inputs(device: str, include_total: bool) -> None:
     """
     An empty query set and a query that hits nothing, both honouring ``include_total``.
 
-    These are the two early returns, and each has to produce the *same* offsets shape the general
-    path does: a zero-hit query giving the length-``m`` form under ``include_total=True`` would
-    break a caller reading the trailing total. Measured ``[0]`` and ``[0, 0]``.
+    The two early returns, mirroring ``test_query_bvh_box_degenerate_inputs``: a zero-hit query
+    must still produce the offsets shape the general path does, or a caller reading the trailing
+    total breaks.
     """
     lower_np = np.zeros((4, 3), dtype=np.float32)
     upper_np = np.full((4, 3), 0.1, dtype=np.float32)
@@ -281,17 +283,14 @@ def test_query_bvh_aabb_with_offsets_degenerate_inputs(device: str, include_tota
         points_to_warp(lower_np, device), points_to_warp(upper_np, device)
     )
 
-    empty_indices_wp, empty_offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
+    empty_indices_wp, empty_offsets_wp = tw.neighbors.query_bvh_ball(
         bvh, wp.empty(0, dtype=wp.vec3, device=device), 0.25, include_total=include_total
     )
     assert empty_indices_wp.shape == (0,)
     assert empty_offsets_wp.shape == ((1,) if include_total else (0,))
-    assert np.array_equal(empty_offsets_wp.numpy(), np.zeros(1 if include_total else 0, np.int32))
 
-    far_wp = wp.array(
-        np.array([[99.0, 99.0, 99.0]], dtype=np.float32), dtype=wp.vec3, device=device
-    )
-    miss_indices_wp, miss_offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
+    far_wp = points_to_warp(np.array([[99.0, 99.0, 99.0]], dtype=np.float32), device)
+    miss_indices_wp, miss_offsets_wp = tw.neighbors.query_bvh_ball(
         bvh, far_wp, 0.25, include_total=include_total
     )
     assert miss_indices_wp.shape == (0,)

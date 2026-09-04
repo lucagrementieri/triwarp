@@ -2542,11 +2542,18 @@ def test_fix_self_intersections_local_clears_them(
     Class A on the *post-condition*, through two detectors that are not triwarp's.
 
     No reference does this **repair** the way this does -- MeshLib's ``localFixSelfIntersections``
-    subdivides and relaxes rather than cutting and refilling, and on this very input it leaves
-    **281** intersecting faces where this leaves **0** (the benchmark's docstring carries that
-    measurement, and says to read its meshlib rows as scale). So the *outputs* are not comparable,
-    and the claim about them is the contract: the intersecting faces are gone, the result is
-    watertight, and the surface did not run away from the input.
+    subdivides and relaxes rather than cutting and refilling, and on this very input it makes the
+    problem *worse*: measured with this file's own detector, 64 intersecting faces in and **128**
+    out, while subdividing 512 faces into 2 512, where this leaves **0**. So the *outputs* are not
+    comparable, and the claim about them is the contract: the intersecting faces are gone, the
+    result is watertight, and the surface did not run away from the input.
+
+    (That number was recorded as "281" for several rounds. It is 128 in this detector's units, and
+    the direction is the part worth keeping: MeshLib's local fixer is not a weaker version of this
+    repair, it is a different operation that does not converge on this input. It *does* clear a
+    self-intersecting torus built the other way -- see the ``tangle`` axis in
+    ``benchmarks/test_repair.py`` -- so its behaviour is fixture-dependent and neither reading
+    generalizes.)
 
     What *is* a library comparison is the contract's own predicate. Asserting it with
     [`face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask] alone would

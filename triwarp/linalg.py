@@ -1776,6 +1776,41 @@ _MULTIGRID_MIS_ROUNDS = 32
 # than as "there was no multigrid". And ``0.0`` keeps every off-diagonal, which is the aggregation
 # this package shipped first and is bit-exactly what a zero threshold reduces to -- so the
 # unfiltered form is a special case of this one and not a separate path.
+#
+# **Re-probed clock-free, and the cost model above does not hold on the systems ``smooth_region``
+# actually solves -- so this is re-opened, with the clock half specified rather than done.** The
+# two sweeps that set this value both priced a *clock*, and the reasoning that stops them at 0.05
+# is "a larger theta grows the hierarchy a level, and a level is 5-8 ms of setup whatever its
+# size". Measured on the real ``(Q_uu, rhs)`` systems, captured at ``solve_spd_columns`` the way
+# section 16.8's table was, at HEAD on Warp 1.17 -- iterations, levels and operator complexity,
+# all three deterministic and immune to the machine load that makes a clock unreadable:
+#
+#     theta   bunny_decimated (n=2 497)          bunny (n=11 426)
+#             lvls  opcx   cg(mg)  cg(jacobi)    lvls  opcx   cg(mg)  cg(jacobi)
+#     0.0      2    1.023   160      1 810        3    1.027   330      6 360
+#     0.02     2    1.053   120      1 810        4    1.060   240      6 360
+#     0.05     2    1.075   100      1 810        4    1.086   210      6 360
+#     0.08     2    1.132    90      1 810        4    1.135   190      6 360
+#     0.12     2    1.232    70      1 810        4    1.329   160      6 360
+#
+# **The extra level does not fire between 0.05 and 0.12 on either system** -- both stay at 2 and 4
+# levels across that whole range -- while the iteration count keeps falling, 30 % on
+# ``bunny_decimated`` (100 -> 70) and 24 % on ``bunny`` (210 -> 160). The level growth the sweeps
+# priced happens *below* the current value (``bunny`` 3 -> 4 between 0.0 and 0.02) and on the
+# ``saddle_graded`` **cotmatrix**, which is a different operator from the ones this gate routes
+# here. What 0.12 does cost is operator complexity, +14 % and +22 %, so a cycle's matvec work grows
+# by that -- against 24-30 % fewer cycles, the arithmetic is favourable and the setup is unchanged.
+#
+# That is the "evidence bigger than 1.2 %" the paragraph above asks for, on the axis it names as
+# the one that transfers -- but a *decision* needs the sum, and the sum needs a clock. **Do not
+# move this value on the table above alone**; take an interleaved A/B of setup-plus-solve on a
+# quiet box (the session that measured this had three other agents and two ``pytest`` processes
+# live, and read a 4x swing at *fixed* theta) and only then choose between 0.05 and 0.12.
+#
+# One correction that needs no clock: the stall is **nearer than 0.25**. At ``0.2`` ``bunny``'s
+# ``smooth_region`` operator already leaves ``_multigrid_hierarchy`` with nothing usable, and the
+# three that still coarsen do so at operator complexity **6.0-8.0** -- the band section 14.9
+# rejected voxel aggregation in. So 0.12 is the last value probed that is safe, not a midpoint.
 _MULTIGRID_THETA = 0.05
 
 

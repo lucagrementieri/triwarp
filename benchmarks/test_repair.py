@@ -880,37 +880,8 @@ def test_remove_degenerate_faces(bench_case: BenchCase) -> None:
     assert int(kept_vertices.shape[0]) <= bench_case.n_vertices
 
 
-_tangled_cache: dict[tuple[str, str], tuple] = {}
-
-
-def _tangled(bench_case: BenchCase) -> tuple:
-    """
-    One mesh that genuinely self-intersects: the mesh concatenated with a shifted copy of itself.
-
-    The registry has no self-intersecting mesh, and a repair benchmark needs damage to repair. Two
-    copies overlapping by a third of the diagonal, welded into a single face buffer, is the standard
-    way to make one -- the same construction ``test_intersection.py`` uses for its two-mesh rows,
-    except merged so the intersection is a *self*-intersection.
-
-    Cached: it is the input, and building it is a concatenate plus a translation.
-    """
-    key = (bench_case.mesh_name, str(bench_case.device))
-    if key not in _tangled_cache:
-        vertices_np = bench_case.vertices_np
-        diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
-        shifted_np = np.ascontiguousarray(
-            vertices_np + np.array([0.35 * diagonal, 0.0, 0.0]), dtype=np.float32
-        )
-        vertices_wp, faces_wp = bench_case.vertices_wp, bench_case.faces_wp
-        shifted_wp = wp.array(shifted_np, dtype=wp.vec3, device=bench_case.device)
-        _tangled_cache[key] = tw.combine.concatenate(
-            [(vertices_wp, faces_wp), (shifted_wp, faces_wp)]
-        )
-    return _tangled_cache[key]
-
-
 @pytest.mark.benchmark(group="fix_self_intersections")
-@pytest.mark.benchmeshes("sphere_med")
+@pytest.mark.benchaxis("tangle")
 @pytest.mark.benchlibs("triwarp", "meshlib")
 @pytest.mark.parametrize("method", ["local", "voxel"])
 def test_fix_self_intersections(bench_case: BenchCase, method: str) -> None:
@@ -921,95 +892,80 @@ def test_fix_self_intersections(bench_case: BenchCase, method: str) -> None:
     attributable. ``local`` is a detect-dilate-delete-refill loop whose cost is the *damage*: the
     detector runs on the whole mesh but the DP runs on the rims, so it tracks the intersecting band
     rather than the face count. ``voxel`` is a signed distance field plus a marching pass, so its
-    cost is the *lattice* and it does not care what was wrong.
+    cost is the *lattice* and it does not care what was wrong -- visible in its output, which is
+    ~55 500 faces from both the 8 192-face and the 163 840-face input.
 
-    The input is one mesh overlapping a shifted copy of itself -- a deep interpenetration, which
-    is the case the local method only *reduces* rather than clears (152 intersecting faces to 34
-    on a small instance; the function's docstring measures this). The row therefore asserts
-    progress and a non-empty answer, not convergence: asserting zero would be asserting
-    something the method does not promise on this input class.
+    Why the ``tangle`` axis and not two welded spheres
+    --------------------------------------------------
+    This group ran for four rounds on ``sphere_med`` concatenated with a shifted copy of itself,
+    and **the meshlib ``local`` cell was timing a no-op**: that construction is two components, and
+    ``mm.localFixSelfIntersections`` returns a multi-component mesh unchanged -- byte-identical
+    buffers, all 1 176 colliding faces intact, at every configuration probed (CLAUDE.md section 7.6
+    carries the sweep). The row read as this suite's largest single loss, 5.02x and 127.8 ms,
+    against a call that returned its argument.
 
-    **Read the meshlib rows as scale, not as a like-for-like race.** Its local fixer subdivides the
-    affected region and relaxes it where this cuts the region out and refills the rim, and on the
-    shared 16x16 self-intersecting torus MeshLib's leaves **281** intersecting faces where triwarp's
-    leaves **0** -- so the two outputs are not comparable and neither is a reference for the other
-    repair. What *is* comparable, and what the parity claim on
-    ``tests/test_repair.py::test_fix_self_intersections_local_clears_them`` rests on, is the
-    post-condition: MeshLib's ``findSelfCollidingTrianglesBS`` counts the same 64 intersecting faces
-    on that fixture before the repair and the same 0 after it, at both dilation budgets. That is the
-    detector agreeing, not the fixer.
+    ``tangle_torus`` is a self-intersecting **single** component, so both libraries do real work
+    and the comparison is like-for-like for the first time. It is also a *size* axis rather than
+    one point, because this is a crossover and a single row would report whichever side of it the
+    mesh landed on. Harness medians:
 
-    First measurement, medians on an RTX 5090 at ``sphere_med`` doubled to 163 840 faces:
+    | faces | triwarp ``local`` | meshlib ``local`` | triwarp ``voxel`` | meshlib ``voxel`` |
+    |---|---|---|---|---|
+    | 8 192 | 46.2 ms | **14.7** (3.14x) | **8.7** | 50.6 (5.81x) |
+    | 163 840 | 188.3 | **183.0** (1.03x) | **18.6** | 88.6 (4.77x) |
 
-    | | triwarp-cuda | meshlib |
-    |---|---|---|
-    | `voxel` | **18.7 ms** | 117.4 (6.3x) |
-    | `local` | 196.3 | **46.0** (4.3x behind) |
+    So the serial C++ fixer leads by 3.14x at the small end and holds only 1.03x at the large one,
+    while the voxel path wins 4.8-5.8x throughout.
 
-    **``local`` is the largest single loss in the suite and it is attributed rather than open, so
-    read this before proposing anything for it.** Re-measured at this row's own input (132.0 ms):
-    ``face_self_intersecting_mask`` is **1.321 ms, 1.0 % of the call** -- the detector is not the
-    cost -- and one delete-and-refill round leaves **5 rims whose longest is 642 vertices**, which
-    the ``max_iter=3`` loop then pays three times. So the launch count is three min-weight DP
-    sweeps at ``2 * (max_rim - 2)`` each, which is round 7's 3 419 launches and its 55 % host share,
-    and the sweep itself is **launch-bound**: ``holes._run_hole_dp``'s docstring measures its floor
-    at a flat 16.4-18.6 us a launch, 37-74 % of the sweep across every rim length reached here.
+    **Read the ``local`` parity at 163 840 faces with its quality caveat, which runs the other
+    way.** Measured on this axis' own inputs, with triwarp's detector applied to both outputs: at
+    8 192 faces both reach **0** intersecting from 256, but at 163 840 triwarp leaves **20** from
+    884 where MeshLib reaches 0. So the large cell is 1.03x for a slightly *less* complete repair,
+    not a clean tie -- and the two are still different algorithms (MeshLib subdivides the affected
+    band and relaxes it, 163 840 -> 164 416 faces; this cuts the band out and refills the rim,
+    163 840 -> 162 254). ``max_iter`` is what closes triwarp's residue and the function's Notes
+    carry that table.
 
-    Three things are refuted and must not be re-proposed: the **capture** (round 7's T3; a
-    once-through loop records and replays once, 0.84x), the **scope discount** (round 8's U3
-    re-measured it on *this* input -- 1 176 intersecting faces in to 158 out, and meshlib also
-    reduces without clearing, so the 0-against-281 discount is available on the torus fixture and
-    not here), and now the **DP block knob** that round 9 predicted would carry it. That knob ships
-    and is worth 1.10-1.13x on ``rim_short``, but it is gated on a *narrow* grid and this row's
-    5 rims fall outside it by one: forcing the gate open (``HOLE_DP_WIDE_GRID_LOOPS`` 4 -> 8) was
-    measured in-process at **1.01x**, i.e. nothing. So "it moves when V4 moves" is false for that
-    lever specifically.
-
-    What is left is the one unbuilt item both this row and the hole chains wait on: a **blocked**
-    interval DP, which would cut ~640 launches per sweep to ~20 and is a new kernel rather than a
-    knob. See ``holes._run_hole_dp``.
-
-    The split is the point. The voxel path is a device field plus a marching pass and wins by the
-    margin the ``offset`` groups show; the local path is a host-side loop of detect, dilate, delete,
-    DP, refine -- five wrapper chains per pass, three passes -- and loses to a single C++ traversal.
-    Anything spent here belongs in the refill chain, not in the detector.
-
-    **The ``local`` row is a fair loss and must not be discounted as "triwarp does strictly more
-    work".** That discount is available on the *torus* fixture two paragraphs up, where triwarp
-    reaches 0 and MeshLib leaves 281; it is not available here. Measured on this row's own input,
-    one call per fresh process: 1 176 intersecting faces in, **158-365** out at the default
-    ``max_iter=3`` -- both libraries reduce, and neither clears. Raising ``max_iter`` does not close
-    it either (the function's Notes carry the table). So the 4.3x is a cost comparison between two
-    incomplete repairs, not the price of a better answer.
-
-    Its 3 419 launches are three ``holes.refill_region`` chains -- the ``max_iter`` loop -- and not
-    per-component work; ``benchmarks/test_holes.py``'s ``refill_region`` group carries the per-stage
-    attribution and the measurements that refuted capturing the chain.
+    The post-condition is what
+    ``tests/test_repair.py::test_fix_self_intersections_local_clears_them`` claims, and it uses
+    MeshLib as a **detector** rather than as a fixer -- which is the sound way to consult it here,
+    since on that test's own 16x16 fixture the MeshLib *fixer* makes things worse (64 intersecting
+    faces in, **128** out, while subdividing 512 faces into 2 512).
     """
+    vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+    diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
+    voxel = diagonal / 128.0
+    n_faces_in = faces_np.shape[0]
+
     if bench_case.kind == "meshlib":
-        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
-        diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
-        tangled_np = np.vstack([vertices_np, vertices_np + np.array([0.35 * diagonal, 0.0, 0.0])])
-        tangled_faces_np = np.vstack([faces_np, faces_np + vertices_np.shape[0]])
-        voxel = diagonal / 128.0
 
         def fix_ml() -> int:
-            mesh_ml = mesh_ml_from_numpy(tangled_np, tangled_faces_np)
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
             if method == "voxel":
                 mm.fixSelfIntersections(mesh_ml, voxel)
             else:
                 mm.localFixSelfIntersections(mesh_ml, mm.SelfIntersections.Settings())
+            mesh_ml.pack()
             return mesh_ml.topology.numValidFaces()
 
-        assert bench_case.run(fix_ml, rounds=3) > 0
+        # Assert the mutator actually mutated, which is CLAUDE.md section 7.6's standing rule for
+        # MeshLib and the guard whose absence let this group time a no-op for four rounds:
+        # ``localFixSelfIntersections`` returns normally on an input it declines, and
+        # ``numValidFaces() > 0`` passes that. Both methods change the face count here -- the local
+        # one subdivides the band, the voxel one remeshes the surface -- so inequality is the
+        # assertion, and a wheel that starts declining this input fails rather than drifting.
+        n_faces_ml = bench_case.run(fix_ml, rounds=3)
+        assert n_faces_ml > 0
+        assert n_faces_ml != n_faces_in
         return
 
-    vertices, faces = _tangled(bench_case)
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     fixed_vertices, fixed_faces = bench_case.run(
         lambda: tw.repair.fix_self_intersections(vertices, faces, method=method), rounds=3
     )
     assert int(fixed_faces.shape[0]) > 0
     assert int(fixed_vertices.shape[0]) > 0
+    assert int(fixed_faces.shape[0]) // 3 != n_faces_in
 
 
 @pytest.mark.benchmark(group="collapse_small_triangles")

@@ -144,6 +144,28 @@ RIBBON_LENGTH = 20_481
 _Arrays = tuple[npt.NDArray[np.floating], npt.NDArray[np.integer]]
 
 
+def _tangled_torus(major_sections: int, minor_sections: int) -> _Arrays:
+    """
+    Build a torus whose tube is wider than its hole, so the surface passes through itself.
+
+    The registry's other self-intersecting input, ``tangle_2``, is two overlapping spheres and is
+    therefore **two components** -- which several repair references decline outright rather than
+    handle (MeshLib's ``localFixSelfIntersections`` returns such a mesh unchanged). This one is a
+    single closed component that genuinely crosses itself, which is what a repair comparison needs
+    if both sides are to do work. ``minor_radius > major_radius`` is the whole trick: the tube
+    sweeps through the axis and the inner wall crosses the outer one in a band.
+
+    Self-intersection scales with the resolution rather than with the radii -- measured 256 / 478 /
+    884 intersecting faces at 64x64 / 160x128 / 320x256, so ~3 % of the surface at the small end
+    and ~0.5 % at the large one.
+    """
+    mesh = tm.creation.torus(1.0, 1.5, major_sections=major_sections, minor_sections=minor_sections)
+    return (
+        np.ascontiguousarray(mesh.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh.faces, dtype=np.int64),
+    )
+
+
 def _spheres(subdivisions: int, count: int = 1, layout: str = "lattice") -> _Arrays:
     """
     ``count`` icospheres arranged as disjoint copies, concentric shells or an overlapping pair.
@@ -353,6 +375,8 @@ FEATURE_MESHES: list[MeshSpec] = [
     _mesh("hemisphere", "", 20_737, 41_088, "patch"),
     _mesh("shells_8", "", 20_496, 40_960, "depth"),
     _mesh("tangle_2", "", 20_484, 40_960, "overlap"),
+    _mesh("tangle_torus_small", "", 4_096, 8_192, "tangle"),
+    _mesh("tangle_torus", "", 81_920, 163_840, "tangle"),
     _mesh("handles_1", "", 44_580, 89_160, "genus"),
     _mesh("handles_64", "", 46_862, 93_976, "genus"),
 ]
@@ -377,6 +401,8 @@ BUILDERS: dict[str, Callable[[], _Arrays]] = {
     "hemisphere": lambda: _hemisphere(6),
     "shells_8": lambda: _spheres(4, 8, "concentric"),
     "tangle_2": lambda: _spheres(5, 2, "overlap"),
+    "tangle_torus_small": lambda: _tangled_torus(64, 64),
+    "tangle_torus": lambda: _tangled_torus(320, 256),
     "handles_1": lambda: _handles(1),
     "handles_64": lambda: _handles(8),
 }
@@ -415,6 +441,11 @@ AXES: dict[str, tuple[str, ...]] = {
     "depth": ("sphere_med", "shells_8"),
     # Disjoint -> deeply interpenetrating, for collision density.
     "overlap": ("sphere_med", "tangle_2"),
+    # Self-intersecting *single* component, 8 192 -> 163 840 faces. A size axis rather than a
+    # feature contrast, because the repair comparison it serves is a crossover: a serial C++ fixer
+    # leads at the small end and loses the lead as the mesh grows, so a one-size row reports
+    # whichever side of it the mesh landed on.
+    "tangle": ("tangle_torus_small", "tangle_torus"),
     # Genus 0 -> 1 -> 64 at ~90 000 faces: the number of handles, which is the only thing a
     # homology basis is looking for and the only property no other mesh here varies.
     "genus": ("sphere_med", "handles_1", "handles_64"),

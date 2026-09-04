@@ -275,22 +275,19 @@ def discrete_mean_curvature(
     )
 
     bvh = tw.neighbors.bvh_from_bounds(edge_lower, edge_upper)
-    # The broad phase is the **cube** ``[q +- radius]`` while the narrow phase below keeps only the
-    # edge length inside the *ball* of that radius, so every candidate the cube admits and the ball
-    # rejects is a wasted slot in the flat buffer and a wasted narrow-phase test. Measured rather
-    # than inferred from the 6/pi volume ratio, which overstates it: on ``icosphere(4)`` /
-    # ``icosphere(6)`` at radius scales 0.5 / 1.0 / 2.0 of the mean edge, **70.7-76.6 %** of
-    # candidates meet the ball, i.e. ~**29 %** waste and not the 48 % a volume argument predicts --
-    # the BVH holds edge *AABBs*, so a box near the cube's corner usually still overlaps the ball.
+    # The predicate the narrow phase below applies is the *ball* -- it keeps the edge length inside
+    # the ball of ``radius`` -- so the broad phase is the ball query and not the enclosing cube.
     #
-    # ``wp.bvh_query_sphere`` (Warp 1.17) is the tighter broad phase and would remove that 29 %,
-    # which shows up mostly on the radius axis where the cost grows (1.795 -> 3.927 ms on
-    # ``icosphere(4)``, 1.977 -> 4.308 on ``icosphere(6)``). Not built: it needs a ball variant of
-    # ``query_bvh_aabb_with_offsets``' count and emit kernels, and that function's *name* says aabb,
-    # so a shape selector renames a public entry point and drags section 14's five move artifacts
-    # with it -- against ~1 ms of the loss table. Sized here so the next pass starts from the
-    # number rather than the volume ratio.
-    candidate_edges, offsets = tw.neighbors.query_bvh_aabb_with_offsets(bvh, points, radius)
+    # This was declined once, on the sizing that the cube admits ~29 % more candidates than the
+    # ball and that trimming them was worth ~1 ms. Both halves of that were wrong. The candidate
+    # trim is real (70-74 % of the cube's candidates meet the ball, measured against a brute-force
+    # oracle at three sizes) and it is the smaller half: ``wp.bvh_query_sphere``'s traversal is
+    # itself far cheaper than ``wp.bvh_query_aabb``'s on the identical BVH, so the whole call is
+    # **3.4-6.8x** faster and the query alone 3.7-6.9x. Isolated with the inscribed cube, which
+    # returns strictly *fewer* candidates than the ball and still costs 6.5x it -- so the lever is
+    # the traversal, not the candidate count. Numbers and the platform reading: CLAUDE.md section
+    # 12.8.
+    candidate_edges, offsets = tw.neighbors.query_bvh_ball(bvh, points, radius)
 
     mean_curvature = wp.zeros(n_points, dtype=wp.float32, device=device)
     n_candidates = int(candidate_edges.shape[0])

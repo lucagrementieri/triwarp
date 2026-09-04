@@ -126,18 +126,44 @@ def bvh_walk_emit(query: wp.BvhQuery, base: wp.int32, out_indices: wp.array[wp.i
     return c
 
 
+# The ball-shaped broad phase over bounds, and it is *not* a tighter spelling of the box one below.
+# ``wp.bvh_query_sphere`` prunes on an exact sphere-AABB squared distance where
+# ``wp.bvh_query_aabb`` prunes on a box overlap, and on Warp 1.17 the box traversal is far the more
+# expensive of the two *per candidate returned* -- measured 6.5-15x, isolated with the box's own
+# *inscribed* cube (half extent ``r / sqrt(3)``, so strictly fewer candidates than the ball) still
+# costing 6.5x the ball query. So the ball trims candidates *and* walks more cheaply, and a caller
+# whose predicate is a ball wants this pair rather than the box pair plus a narrow phase. Both
+# counts are exact against a brute-force oracle; CLAUDE.md section 12.8 has the numbers.
+@wp.func
+def ball_count_in_bounds(bvh_id: wp.uint64, q: wp.vec3, radius: wp.float32) -> wp.int32:
+    # Broad-phase hits of the ball: every bound whose AABB comes within ``radius`` of ``q``.
+    return bvh_walk_count(wp.bvh_query_sphere(bvh_id, q, radius))
+
+
+@wp.kernel
+def query_bvh_ball_neighbors(
+    queries: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    radius: wp.float32,
+    offsets: wp.array[wp.int32],
+    out_indices: wp.array[wp.int32],
+) -> None:
+    tid = wp.int32(wp.tid())
+    bvh_walk_emit(wp.bvh_query_sphere(bvh_id, queries[tid], radius), offsets[tid], out_indices)
+
+
+# The per-query-box pair, in the order its wrapper appears (section 5). Same walk skeleton as the
+# ball above and a different node test; the count half is a ``wp.map`` over
+# ``aabb_count_in_bounds`` rather than a kernel shim (CLAUDE.md section 4).
+#
+# There was a third pair here, for one warp-uniform half extent, and it is gone: it was exactly
+# this one at ``q -+ h``, returned an identical set, and the corner buffers it saved measured
+# **0.950-1.031x** -- no saving, one size the wrong way -- against a query several milliseconds
+# long. Do not reintroduce it without a number bigger than that.
 @wp.func
 def aabb_count_in_bounds(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3) -> wp.int32:
-    # Broad-phase hits of the box. The traversal is shared by the uniform-cube form below and the
-    # per-query-corner one further down -- the two differ only in where the corners come from, so
-    # only the box construction is left here.
+    # Broad-phase hits of the box.
     return bvh_walk_count(wp.bvh_query_aabb(bvh_id, lower, upper, root=-1))
-
-
-@wp.func
-def aabb_count_in_box(bvh_id: wp.uint64, q: wp.vec3, half_extent: wp.float32) -> wp.int32:
-    # wp.vec3(scalar) broadcasts the scalar to every component.
-    return aabb_count_in_bounds(bvh_id, q - wp.vec3(half_extent), q + wp.vec3(half_extent))
 
 
 @wp.func
@@ -152,35 +178,6 @@ def aabb_collect_in_bounds(
     bvh_walk_emit(wp.bvh_query_aabb(bvh_id, lower, upper, root=-1), base, out_indices)
 
 
-@wp.func
-def aabb_collect(
-    bvh_id: wp.uint64,
-    q: wp.vec3,
-    half_extent: wp.float32,
-    base: wp.int32,
-    out_indices: wp.array[wp.int32],
-) -> None:
-    aabb_collect_in_bounds(
-        bvh_id, q - wp.vec3(half_extent), q + wp.vec3(half_extent), base, out_indices
-    )
-
-
-@wp.kernel
-def query_bvh_aabb_neighbors(
-    queries: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    half_extent: wp.float32,
-    offsets: wp.array[wp.int32],
-    out_indices: wp.array[wp.int32],
-) -> None:
-    tid = wp.int32(wp.tid())
-    aabb_collect(bvh_id, queries[tid], half_extent, offsets[tid], out_indices)
-
-
-# The per-query-box pair. Same traversal as the two kernels above, and the only difference is that
-# the corners are read per query instead of derived from one warp-uniform half extent -- so a caller
-# with a single cube size keeps the cheaper pair and pays for no corner buffers. The count half is a
-# ``wp.map`` over ``aabb_count_in_bounds`` now rather than a kernel shim (CLAUDE.md section 4).
 @wp.kernel
 def query_bvh_box_neighbors(
     query_lower: wp.array[wp.vec3],
@@ -989,8 +986,8 @@ def _declare_map_kernels() -> None:
         [
             (aabb_count_in_bounds, (wp.uint64(1), dense(wp.vec3), dense(wp.vec3)), wp.int32),
             (aabb_count_in_bounds, (wp.uint64(1), single(wp.vec3), single(wp.vec3)), wp.int32),
-            (aabb_count_in_box, (wp.uint64(1), dense(wp.vec3), wp.float32(1)), wp.int32),
-            (aabb_count_in_box, (wp.uint64(1), single(wp.vec3), wp.float32(1)), wp.int32),
+            (ball_count_in_bounds, (wp.uint64(1), dense(wp.vec3), wp.float32(1)), wp.int32),
+            (ball_count_in_bounds, (wp.uint64(1), single(wp.vec3), wp.float32(1)), wp.int32),
         ]
     )
 

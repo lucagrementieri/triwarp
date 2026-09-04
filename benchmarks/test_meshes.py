@@ -48,6 +48,12 @@ _TOPOLOGY: dict[str, tuple[int, bool, int, int]] = {
     "hemisphere": (1, False, 1, 6),
     "shells_8": (8, True, 0, 6),
     "tangle_2": (2, True, 0, 6),
+    # The self-intersection is geometric, not topological: both tori are one closed watertight
+    # component with regular valence, and only the *embedding* crosses itself. That is exactly
+    # what distinguishes them from ``tangle_2``, whose two bodies several repair references
+    # decline rather than handle.
+    "tangle_torus_small": (1, True, 0, 6),
+    "tangle_torus": (1, True, 0, 6),
     # The two genus meshes come out of a boolean, so their valence peaks are whatever the
     # retriangulation around a tunnel produced -- recorded rather than designed, unlike the rest.
     "handles_1": (1, True, 0, 16),

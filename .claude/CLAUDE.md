@@ -1034,7 +1034,7 @@ found them: §12.1.
     - **A merge like this needs a triwarp-against-triwarp test that the two paths agree**, or the
       shared group name is an unchecked claim (`test_the_two_backends_agree`).
 
-  What stays split: `query_bvh_aabb_with_offsets` and `query_bvh_box` are genuinely BVH-only — a hash
+  What stays split: `query_bvh_ball` and `query_bvh_box` are genuinely BVH-only — a hash
   grid has no box query. And where the *pairings are different algorithms over different inputs*
   rather than one algorithm with a tuning knob, the name keeps carrying the type: `metrics.chamfer_*`
   / `hausdorff_*` were considered for the same treatment and declined.
@@ -2195,6 +2195,45 @@ incomparable with the others. Fourteen hazards, all measured:
   assert it changed the mesh**; where it did not, fall back to the invariant that carries the claim
   (χ arithmetic for tunnels, volume monotonicity and normal alignment for inflation) and say in the
   test docstring what was probed.
+- **`mm.localFixSelfIntersections` is the third inert mutator, and it cost four rounds of reading
+  the suite's largest loss backwards.** On the `fix_self_intersections` benchmark's own fixture —
+  `sphere_med` concatenated with a copy of itself offset by 0.35 of the diagonal — it returns its
+  input: 81 924 v / 163 840 f in and out, `np.array_equal` on **both** buffers, with all **1 176**
+  colliding triangles still colliding. Inert at every configuration probed: both
+  `SelfIntersections.Settings.Method` values (`Relax`, `CutAndFill`), `relaxIterations` 0 / 5 / 20 /
+  100, `maxExpand` 1 / 3 / 10, `subdivideEdgeLen` at 1.0 / 0.5 / 0.1 of the mean edge,
+  `touchIsIntersection=False` and `mimicPatch=True`.
+
+  **It needs a single-component input, and that is the part no signature says.** On the 512-face
+  `torus_self_intersecting` it does mutate — 512 → 2 512 faces — and *still* does not clear: 64 →
+  **128** colliding by its own detector. The benchmark's fixture is two welded copies of one sphere,
+  so two components, and it declines outright. Its sibling `mm.fixSelfIntersections` (the voxel
+  path) has no such limit and genuinely repairs the same input, 163 840 → 82 052 faces with 0
+  intersecting, which is why only the `local` cell is skipped.
+
+  Two general lessons, both of which the rule above already states and neither of which was applied
+  here. The benchmark's callable returned `numValidFaces()` and asserted `> 0` — **a no-op passes
+  that**, and it read as a 4.3-5.0x triwarp loss (127.8 ms, the largest single row in the suite)
+  against triwarp's real 1 176 → 126 repair. And the earlier "both libraries reduce, and neither
+  clears" measurement had counted only triwarp's side with a detector; **apply the same detector to
+  both outputs**, which is what `tests/test_repair.py` already does correctly by using MeshLib as a
+  *detector* rather than as a fixer.
+
+  **The fix was the fixture, not a skip — which is the better move whenever a reference declines an
+  input rather than being wrong about it.** Skipping the cell would have dropped a comparison;
+  giving the group a single-component input restored one. `benchmarks/meshes.py` now registers a
+  self-intersecting **torus** (`tangle` axis, `tangle_torus_small` / `tangle_torus`, tube wider
+  than hole), where all four cells do real work and the row is like-for-like for the first time:
+  triwarp's local path goes from **3.14x behind** at 8 192 faces to **1.03x** at 163 840, and the
+  voxel path wins 4.8-5.8x throughout. So the suite's largest single loss was neither a real loss
+  nor an unmeasurable one — it was the wrong input.
+
+  **And its behaviour is fixture-dependent in both directions, so neither reading generalizes.** On
+  the trimesh-built torus the local fixer *clears* the self-intersections; on the MeshLib-built
+  16x16 torus `tests/test_repair.py` uses it makes them **worse** (64 intersecting faces in, 128
+  out, subdividing 512 faces into 2 512 — that figure had been recorded as "281" and is corrected
+  at the site); on two welded spheres it declines outright. Probe the mutator on the *specific*
+  input a row or a test will use.
 
 **Two pairings worth knowing before writing a comparison, neither guessable from the names:**
 `computePerVertNormals` matches `vertices.area_weighted_vertex_normals` to **1.19e-07** while
@@ -3208,6 +3247,31 @@ The `nnz`-is-a-capacity rule and its consequences are §3.7. Three further behav
   the structure and a BVH already exists; do not convert a probe whose radius equals the hash-grid
   cell width.** And do not read §14.2's tiled 2.4-8.9x as transferring — there is no
   `tile_bvh_query_sphere` in 1.17.
+- **`wp.bvh_query_sphere` again, as a broad phase over *bounds* — and the reason to prefer it is
+  the traversal, not the candidates it does not return.** `neighbors.query_bvh_ball`
+  is the ball sibling of `query_bvh_box`, and adopting it in
+  `curvature.discrete_mean_curvature` measured **2.40-4.26x on the whole public call** (harness
+  medians, pymeshlab's own column reproducing within 4.4 % as the control): `sphere_small` 4.109 →
+  1.553 ms, `sphere_med` 4.592 → 1.760 and 11.791 → 3.042, `sphere_large` 9.458 → 3.949 and
+  26.665 → 8.531 at radius scales 2.0 / 4.0. The `sphere_small` cell flips from a 0.94x **loss** to
+  pymeshlab into a 2.37x win.
+
+  **The platform fact underneath it is worth more than the one adoption: on Warp 1.17
+  `wp.bvh_query_aabb`'s traversal costs 6.5-15x `wp.bvh_query_sphere`'s per candidate returned, on
+  the identical BVH.** Both are exact — checked against brute-force oracles, the cube query
+  returning 228 396 candidates against the cube oracle's 228 396 and the ball query 169 164 against
+  the ball oracle's 169 164 — and the ball returns only 26-30 % fewer, so the candidate trim
+  explains almost none of the gap. **The control that isolates it is the *inscribed* cube**
+  (half extent `r / sqrt(3)`, strictly contained in the ball, so strictly fewer candidates): it
+  returns 91 164 candidates and still costs **6.5x** the ball query's time. Count-pass only,
+  `leaf_size=1`, `icosphere(4)`: cube 1.468 ms / inscribed cube 0.723 / ball **0.111**. `root=-1`
+  versus the default root makes no difference. So **wherever a caller's predicate is a ball, the
+  cube broad phase is the wrong query even before its extra candidates are counted** — and a
+  decline sized on the candidate ratio alone (this one was, at "~29 % waste, ~1 ms of the loss
+  table") is sized on the smaller half. Not transferable to `ball_pivoting`'s pivot search: that
+  walk is `wp.tile_bvh_query_aabb` and 1.17 still ships no `tile_bvh_query_sphere`, so converting
+  it would trade §14.2's measured 4.5-4.9x tiled win for this one — **unmeasured, and the one open
+  lead this finding creates.**
 - **`wp.mesh_get_bvh`** (Warp 1.17) — `proximity.mesh_to_mesh_distance` now builds **one** structure
   over mesh B instead of two; §16.6.
 - **`wp.volume_index_to_world`** — perf-neutral (1.08x at 200k voxels, 1.005x at 2M, both
@@ -3975,6 +4039,17 @@ costs two — a 1.5x launch increase for a ~1.03x iteration decrease. The same r
 sweep-count table being flat: iterations fall 1.4-1.7x from 1 to 4 sweeps while the clock is flat to
 rising.
 
+**That 1.5x is the smoother's own arithmetic and it overstates the cycle's by ~4x — the verdict
+survives on the other ground, not this one.** Counted at HEAD: one V-cycle apply on
+`smooth_region[bunny]` (n = 11 426, 4 levels) issues **34 launches**, of which the smoother is
+**9 (26.5 %)** and `csr_matvec` is 18 — so swapping every Jacobi sweep for a Chebyshev step raises
+the *cycle's* launch count by **1.132x**, not 1.5x, against a ~1.03x iteration decrease. Still a
+loss, and only by ~10 %, so a Chebyshev variant reaching the 1.15x iteration reduction some
+intervals gave would flip it on launches alone. **What still refutes it is interval robustness**:
+no single `(degree, interval)` is best everywhere and `rho/5` is a cliff of up to 17x, so there is
+no safe default to ship — that is the reason to keep, and "the cycle is launch-bound" is the reason
+to stop quoting.
+
 Two traps from that work: **a small synthetic system lied** (on a 576-unknown grid Laplacian,
 Chebyshev degree 2 over `[rho/3, rho]` gave **12 iterations against Jacobi's 87** — a 7x that
 vanished entirely on the real meshes); and **`sweeps` is a default argument of
@@ -4006,6 +4081,16 @@ path; and systems with **empty rows** (unreferenced free vertices — 7 on `bunn
 `bunny`) are singular for a direct solver where CG leaves them at the initial guess. Footprint:
 `libcudss.so` 143 MB + CuPy, CUDA-only.
 
+**Plan reuse re-checked, and there is still nothing to spend it on.** `parametrization.arap` is the
+ARAP-shaped loop the lead names — one operator build, then `max_iterations` reuses of
+`spd_column_solver` — and it **beats igl in all six benchmarked cells**: 1.76x and 2.81x on
+`saddle_small`, 4.20x and 6.08x on `saddle`, 13.97x and 17.25x on `hemisphere`, at 10 and 3
+iterations. So no loss row justifies a 143 MB dependency, and neither `nvmath` nor `cupy` is
+installed to measure one with. One caveat if this is ever opened: **a host launch count cannot bound
+the solve's share here** — an ARAP outer iteration issues only ~12 host launches because
+`spd_column_solver`'s CG is graph-captured, which is §15.10 exactly, so the bound has to be taken
+with the capture disabled.
+
 **Every direct-factorization reference is flat across the conditioning axis and triwarp's CG is
 not**, which says where to look: a conditioning regression in triwarp is an **iteration-count**
 problem, not an assembly or operator problem. Across `saddle` vs `saddle_graded` (identical
@@ -4026,9 +4111,22 @@ not insensitivity** (§16.4).
   pipelining measured 1.05x and a register-vector batch of the `dist` loads was a loss. And a
   ribbon's frontier is ~2 nodes, so the level's work is under the ~600 ns of barriers a correct round
   needs (§13.2); 20 480 levels puts a ~12 ms floor on the synchronization alone. `graph.bfs` on
-  `ribbon_long` stays at 23.3 ms against scipy's 0.74 ms and that is its ceiling on this stack. The
-  *separate* `sphere_med` gap (2.2x) is still open with a different lever: fusing the seven per-level
-  kernels into two or three.
+  `ribbon_long` stays at 23.3 ms against scipy's 0.74 ms and that is its ceiling on this stack.
+
+  **And `ribbon_long` does not pay per-level dispatch at all, which is the part every write-up of
+  this row has had backwards.** `graph.bfs` has *two* engines and hands over to the serial drain as
+  soon as the frontier is narrow and no longer growing — its own docstring says so — and a path
+  graph trips that immediately. Measured at HEAD: `ribbon_long` runs **20 481 levels** and issues
+  **5** host launches, and `wp.timing_begin` attributes **22.755 ms of the 23.5 ms call to
+  `resume_bfs_kernel` alone** — the single-thread serial walk, 555 ns a node, matching the 481-544
+  ns/node this section already measured for it. So *fusing the four-kernel level body would do
+  nothing here*: the level body never runs. The refutation above is the right one; the reason
+  usually given for it is not.
+
+  The *separate* `sphere_med` gap is where the level body does run — **193 levels at ~20 µs each**,
+  4.03 ms against scipy's 2.24 (1.79x, not the 2.2x once recorded) — and four replayed kernels are
+  ~4.7 µs of that 20 µs, so a perfect fusion of all four into one caps at ~1.3x on a 1.79x gap.
+  Worth knowing before opening it: the level is mostly device work, as §16.9 says.
 - **A persistent one-block-per-loop tiled kernel for the Liepa hole-fill DP.** Built,
   byte-identical, and it loses **0.89x / 0.12x / 0.03x** at rims of 128 / 512 / 2048. The DP is
   `B³/6` apex evaluations (22 M at B = 512) and a block is one SM of ~170; the shipped engine pays
@@ -4159,6 +4257,18 @@ is 9.2 % / 7.5 / 18.1 and the change is a win. **Read the fixture, not the call.
 
 ### 15.4 Benchmark-harness hazards
 
+- **`benchmarks/test_meshes.py` is a real gate and the default `pytest` run does not collect it.**
+  It self-checks the registry — recorded vertex/face counts, and a `_TOPOLOGY` table of
+  `(bodies, watertight, loops, peak valence)` every feature mesh must match. Registering a mesh
+  without adding its `_TOPOLOGY` row fails there with a bare `KeyError`, and **the full suite,
+  `basedpyright`, `mkdocs --strict` and `tests.parity` all stay green while it does** — measured,
+  after adding the `tangle` axis. So **after touching `benchmarks/meshes.py`, run
+  `pytest benchmarks/test_meshes.py`** (9 s) as a fifth gate. The upside of the table is that it
+  makes a new mesh state its claim: `tangle_torus` is `(1, True, 0, 6)`, which is what says out
+  loud that its self-intersection is *geometric* and not topological — one closed watertight
+  component whose embedding crosses itself — and therefore what distinguishes it from `tangle_2`'s
+  two bodies.
+
 - **`--benchmark-json` is written at session end, so one pathological row costs the whole module.**
   Round 9 lost **three modules of 48** to a newly added reference, all three the harness rather than
   triwarp, all three sharing one false premise stated in a docstring (*"Cap the `pytorch3d-cpu` row
@@ -4203,6 +4313,14 @@ is 9.2 % / 7.5 / 18.1 and the change is a win. **Read the fixture, not the call.
   (`bvh_from_points[bunny-igl-4]` is **7.72x**, min 28.704 ms against median 221.460, and four
   `query_nearest_*[bunny-igl]` rows are 2.2-3.1x), **so a *win* against one of those needs the
   reference's own min checked.**
+  **Confirmed a third time on a fresh round**, which is what closing this kind of item looks like:
+  the same cell re-measured `median=2.915 min=2.854` — a ratio of **1.02** — so the floor never
+  moved and the one-off is gone. Two things worth carrying away rather than re-deriving. A cell
+  once flagged suspect should be **re-read on the next round before anything is built against it**,
+  because a fresh median is the cheapest possible disconfirmation. And the *real* shape of that row
+  was hidden behind the artifact: `marching_triangles` genuinely loses to meshlib by **7.7x at
+  `sphere_large` and 17x at `sphere_med`** — but on 2.9 ms against 0.38, a **2.5 ms** absolute gap,
+  which is why it never appeared in a loss table ranked by milliseconds and is not a target.
 
 ### 15.5 A plan item may be refuted by its own target
 
@@ -4247,6 +4365,25 @@ silently measures the wrong thing. Drop the finder first:
 sys.meta_path = [f for f in sys.meta_path if "editable" not in getattr(f, "__module__", "")]
 sys.path.insert(0, BASELINE)
 ```
+
+**A `sed`-based in-place sweep is the same hazard as `git stash`, and it is worse because it looks
+harmless.** Sweeping a tuning constant by editing `triwarp/*.py` between runs mutates the tree
+*another agent may be running `pytest` against* — measured this session: three other `claude`
+processes and two foreign `pytest` runs were live, so the sweep was simultaneously reading their
+GPU load and writing their source. **A constant baked into a kernel cannot be swept in one
+process** (Warp fixes it at codegen), which is exactly the case that tempts the in-place edit; put
+the value in a detached worktree instead and drive it with the main venv's interpreter.
+
+**And check whether the box is yours before taking any clock reading at all.** `nvidia-smi`'s
+utilization and `ps -eo pcpu,comm | grep pytest` cost nothing and are the difference between a
+measurement and a fiction: a theta sweep interleaved at pass granularity read a **4x swing at
+*fixed* theta** (`multigrid_preconditioner[saddle]` 16.8 ms in pass 1, 71.7 in pass 2) while two
+foreign `pytest` processes held the GPU at 100 %, against round 10's 20.4 ms for the same cell.
+Two rules follow. **Interleave A and B inside one process where the change permits it** — pass-level
+interleaving is too coarse when the noise timescale is seconds. And **when the box is not quiet,
+measure the quantity that is not a clock**: iteration counts, launch counts, level counts,
+candidate counts, `nnz`, and whether a reference mutated its input are all deterministic, and every
+one of this session's five re-probes of a declined item was settled by one of them.
 
 **Verify with `print(triwarp.__file__)` before trusting a single number.** Do **not** `uv run` from
 inside the worktree — it resolves that copy as its own project and builds a second virtualenv (the
@@ -4835,20 +4972,60 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   count**, i.e. the diagonal, whose coalesced absmax measures **0**. Assembling into an `edges_unique`
   pattern with a `binary_search_index` per entry would have been a medium-large build against a gap
   that does not exist.
-- **OPEN: `repair.fix_self_intersections(method="local")` is the largest single loss in the suite**
-  (~110 ms of gap, 4.55x behind meshlib) and is **attributed, not open to re-opening without a new
-  mechanism.** At its benchmarked input (`sphere_med` doubled, 163 840 faces, 132.0 ms):
-  `face_self_intersecting_mask` is **1.321 ms — 1.0 % of the call**, so the detector is not the cost;
-  one delete-and-refill round leaves **5 rims whose longest is 642 vertices**, paid three times by
-  `max_iter=3`, so the cost is three min-weight DP sweeps at `2 * (max_rim - 2)` launches each, and
-  that sweep is launch-bound. **Four refuted levers:** graph capture of the chain (a once-through loop
-  records and replays once, 0.84x); retiring the row as a scope mismatch (re-measured on *this* input,
-  1 176 → 158 faces, and meshlib also reduces without clearing, so the discount belongs to the torus
-  fixture and not here); the DP block knob (it ships, but is gated on a narrow grid and this row's 5
-  rims miss it by one — forcing the gate open measured **1.01x**); and one persistent block per loop
-  (built and reverted, 0.03-0.89x). It waits on the one unbuilt item: a **blocked interval DP**. The
-  `voxel` sibling on the identical input is a 5.26x *win* at 51 launches, so **the method choice —
-  not the method's implementation — is the available answer for a caller today.**
+
+  **Re-verified on Warp 1.17, including at `lucy` — the row whose 3.7x headline made this look like
+  the biggest assembly gap in the suite.** `dragon` 2.431 / 0.631 / **3.025** ms and `happy_buddha`
+  3.046 / 0.803 / **3.906** (triwarp / raw / coalesced), reproducing the recorded table to within
+  7 %, so triwarp is **1.24-1.28x ahead** once pytorch3d does the same job. `lucy`'s coalesce cannot
+  be re-run on a box with 12 GiB already committed elsewhere (it OOMs at 10.4 GiB peak), but its
+  **raw arm is the control and reproduces exactly** — 28.247 ms against the harness's 28.320 and
+  `nnz` 168 334 452 to the digit — so the recorded 128.0 ms coalesced figure stands and triwarp is
+  **1.22x ahead at `lucy` too** (105.3 ms). The scope mismatch therefore holds at *every* size.
+  - **And the bookkeeping fix this invites is a defect: `cotmatrix / pytorch3d` is already COVERED
+    by a live class-B parity test.** Adding `noparity` would delete a real comparison from the
+    matrix — `noparity` is for a benchmarked pair whose *results* are incomparable, and these
+    agree once the named coalesce transform is applied. What is incomparable is the **timing**, and
+    the benchmark docstring already carries the full table. Leave both alone.
+- **`repair.fix_self_intersections(method="local")` was the suite's largest single loss for four
+  rounds, and it was never a loss: the reference call is a no-op.** `mm.localFixSelfIntersections`
+  returns its input byte-for-byte on this row's fixture, all 1 176 colliding faces intact, at every
+  configuration probed — full detail and the single-component requirement behind it in §7.6. So the
+  4.3-5.0x (127.8 ms) was triwarp's real repair, 1 176 → **126** intersecting at the default
+  `max_iter=3`, timed against a call that returns its argument. **Do not re-derive this as a scope
+  discount argument** — it was not that triwarp does more work, it is that the reference did none
+  on that input.
+  - **The group now runs on the `tangle` axis instead — a self-intersecting single-component torus
+    at 8 192 and 163 840 faces — and the loss is gone rather than exempted.** All four cells do
+    real work, both libraries carry §7.6's assert-it-mutated guard, and the harness reads: local
+    46.2 against meshlib's 14.7 at 8 192 faces (**3.14x behind**) and 188.3 against 183.0 at
+    163 840 (**1.03x**), with voxel winning 4.8-5.8x at both. The size axis is there because this
+    is a crossover — a serial C++ fixer leads while the mesh is small — and one row would report
+    whichever side of it the fixture landed on.
+  - **Read that 1.03x with its quality caveat, which runs the other way**: at 163 840 faces triwarp
+    leaves **20** intersecting of 884 where MeshLib reaches 0 (both reach 0 at 8 192). So the large
+    cell is parity for a marginally less complete repair, and `max_iter` is what closes the
+    residue.
+  - **What the earlier reading got wrong is instructive: it measured only triwarp's side with a
+    detector.** "1 176 in, 158-365 out, and meshlib also reduces without clearing" was recorded
+    twice and refuted twice as a scope mismatch (round 7's T3, round 8's U3), each time arguing
+    about *whether both reduce*. Applying triwarp's detector to **both** outputs settles it in one
+    call. That is §7.7's rule — ask what the reference was handed and whether it finished the job —
+    and the benchmark's own assert (`numValidFaces() > 0`) could not see it.
+  - **The cost attribution for the local path is unaffected and still stands**, because it was
+    measured against triwarp's own launches rather than against the reference. At its benchmarked
+    input (163 840 faces): `face_self_intersecting_mask` is **1.321 ms — 1.0 % of the call**, so the
+    detector is not the cost; one delete-and-refill round leaves **5 rims whose longest is 642
+    vertices**, paid three times by `max_iter=3`, so the cost is three min-weight DP sweeps at
+    `2 * (max_rim - 2)` launches each, and that sweep is launch-bound. **Four refuted levers:**
+    graph capture of the chain (a once-through loop records and replays once, 0.84x); the DP block
+    knob (it ships, but is gated on a narrow grid and this row's 5 rims miss it by one — forcing the
+    gate open measured **1.01x**); one persistent block per loop (built and reverted, 0.03-0.89x);
+    and the scope-discount argument above, now superseded rather than refuted. It waits on the one
+    unbuilt item: a **blocked interval DP** — and the rim measurement it needs (5 rims, longest 642)
+    is already here, so that item starts from a number.
+  - The `voxel` sibling on the identical input is a **5.19x win** (17.3 ms against meshlib's 90.0,
+    re-measured), and meshlib genuinely repairs there, so **the method choice — not the method's
+    implementation — is still the available answer for a caller today.**
 - **The hole DP is launch-bound.** `holes._run_hole_dp` runs one launch per triangulation span,
   `max(B) - 1` for the whole mesh. Replaying the identical launch at `dim=(1, 1)` isolates
   marshalling: the floor is a flat **16.4-18.6 µs per launch** and accounts for **37 % / 61 / 74 /
@@ -4905,6 +5082,27 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   radius does not merely change the answer, it **stops the loop converging within 500 s**, because
   `dart_select_minima` will not accept a point while a smaller-priority *alive* point sits within r.
   Its byte gate therefore bites hard and is cheap to run.
+- **The residual `blue_noise` gap to meshlib is 16-46 % per-round dispatch, not "most likely" all
+  of it.** The standing reading — two shipped fixes in, MeshLib still 1.26-2.44x ahead at
+  `bunny` / `bunny_decimated` — was that the remainder "most likely reflects fixed per-round GPU
+  dispatch cost against a tight single-threaded C++ loop", which is a hypothesis rather than a
+  number. Counted at HEAD, **5 launches per round** (the dart pair, the cell summary, the alive
+  flags and the compaction):
+
+  | cell | rounds | launches | triwarp | meshlib | dispatch floor @ ~12 µs | share of the gap |
+  |---|---|---|---|---|---|---|
+  | `bunny_decimated` r=1.0 | 36 | 196 | 26.216 ms | 11.787 | 2.35 ms | **16 %** |
+  | `bunny` r=1.0 | 112 | 576 | 29.066 | 11.909 | 6.91 | **40 %** |
+  | `bunny` r=0.5 | 91 | 471 | 59.858 | 47.448 | 5.65 | **46 %** |
+
+  So dispatch is a real and substantial share and not the whole story; the majority is device work
+  at the tighter radius. **The unexpected lever is the round count, which does not track the output
+  size**: `bunny` at r=1.0 spends **112** rounds producing 46 427 samples where `bunny_decimated`
+  at r=0.5 spends **36** producing 43 052 — 3x the rounds for the same answer. Bringing the first
+  to the second's round count would take its dispatch floor from 6.91 to 2.2 ms, ~27 % of that
+  cell's gap. Why one cloud needs 3x the rounds of another at a comparable sample count is
+  unmeasured and is where this row's remaining headroom is; §9's rule applies — a benchmark for the
+  round count lands before any change to it.
 - **SHIPPED: `points.farthest_point_sample` as one persistent block** — §14.1.
 
 ### 16.8 `linalg`, `smoothing`, `laplacian`
