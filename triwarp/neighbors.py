@@ -1065,6 +1065,46 @@ def _knn_cell_size(
     of the answer. Until there is one, the density model is the honest default: it is optimal at
     small separations and the failure mode at large ones is a slow query rather than a wrong one --
     every row still certifies itself, so this value affects speed only.
+
+    **Investigated once more (`plans/benchmark-round-11.md` section 3) and closed as a negative
+    result: no cheap, general, safe escalation trigger exists for this, and the reason is now
+    understood rather than only measured.** Two designs were built and rejected:
+
+    - **An analytic cost model** (`n_cells_visited(r, cell) = (2 ceil(r/cell) + 1)^3`, weighted by
+      an average points-per-cell term and two hardware constants fit by grid search against a real
+      four-displacement sweep) tracks the *shape* of the true cost curve at small perturbations but
+      is not safe to act on: at the largest displacement measured it predicts the optimum at 8x the
+      default cell width and rates 16x-64x as better still, where the true optimum is 2x and 16x-64x
+      measure **1.9-2.9x losses** against the default. It has no term for non-uniform point density
+      or hash-bucket collision effects at coarse widths, and both matter more than cells-visited
+      does once the cell is wide.
+    - **A subsample-based empirical probe** (try a handful of candidate widths on a small prefix of
+      the query set, keep whichever measures fastest) is safe -- it can only choose among widths it
+      actually timed -- and captures most of the available win where the win is moderate (chose 4x
+      against a true optimum of 3x at a displacement measuring **12x**, itself catching **9x** of
+      it). But its own cost is not what a "subsample" suggests, because of a fact about *this
+      kernel's execution model* rather than about search algorithms: measured on the 437 645-point
+      cloud, **36 %** of queries fall past `_knn_widest_grid_radius` into the exact O(n) fallback at
+      a 0.05x-diagonal displacement, and **92 %** do at 0.5x -- not a rare straggler, most of the
+      population. A CUDA launch waits for its slowest thread, so wall time at low occupancy tracks
+      the worst query in the batch, not the query count: a **4-query** subsample already cost
+      **46 ms**, indistinguishable from cost at 1 000 queries (45 ms) and over half the cost of the
+      full 20 000-query run it exists to avoid (85 ms), because a subsample this size already has
+      better than even odds of containing one O(n) fallback row. Shrinking the subsample further
+      does not help -- the probe's cost floor is set by whichever single query it happens to sample,
+      not by how many it samples.
+
+    **The obstacle is therefore not "which formula predicts the right width" -- it is that cheaply
+    detecting the need to escalate is, for a kernel that puts one query per thread and blocks the
+    whole launch on its slowest one, no cheaper than paying the cost being avoided**, whenever
+    "expensive" describes a third or more of the query population rather than a rare outlier. Do not
+    re-propose either design without a change to that execution model. The more promising unexplored
+    lead is structural, not a tuning constant: CLAUDE.md section 14.2's cooperative-BVH-walk pattern
+    (one warp per query, `tile_bvh_query_aabb`) already fixed an analogous per-query load imbalance
+    for `mesh_to_mesh_distance` and `ball_pivoting`'s pivot search, by spreading one expensive
+    query's work across a block instead of leaving it serial on one thread. A block-cooperative
+    k-NN walk would address the per-thread cost directly rather than trying to avoid triggering it,
+    but is a new kernel family, not a wider cell -- unattempted, and a large effort on its own.
     """
     extent = max(float(max_bound[axis] - min_bound[axis]) for axis in range(3))
     if extent <= 0.0:

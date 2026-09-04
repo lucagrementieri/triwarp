@@ -4977,6 +4977,36 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   default width and the best one on the benchmark's own input, and finding it needs a model of the
   walk's cost against the width rather than another estimate of the answer. Do not re-propose the
   forward probe.
+- **CLOSED as a negative result, with the reason now understood: no cheap, general, safe cell-width
+  escalation trigger exists for `_knn_cell_size` within the kernel's current execution model.**
+  (`plans/benchmark-round-11.md` section 3.) Two designs were built and rejected on real measurement,
+  full detail at `neighbors._knn_cell_size`'s own docstring:
+  - An **analytic cost model** (cells-visited weighted by average points-per-cell, two constants fit
+    against a real four-displacement sweep) tracks the cost curve's shape at small perturbations but
+    is unsafe to act on — at the largest displacement measured it rates progressively wider cells as
+    better all the way to 64x the default, where 16x-64x are measured **1.9-2.9x losses**. It has no
+    term for non-uniform point density or hash-bucket collisions at coarse widths.
+  - A **subsample-based empirical probe** (time a handful of candidate widths on a query prefix, keep
+    the fastest) is safe but not actually cheap, and the reason is a fact about the kernel's execution
+    model rather than about search algorithms: **36 % of queries fall past
+    `_knn_widest_grid_radius` into the exact O(n) fallback at a 0.05x-diagonal displacement on a
+    437 645-point cloud, and 92 % do at 0.5x** — not a rare straggler, most of the population. A CUDA
+    launch blocks on its slowest thread, so wall time at low occupancy tracks the worst query
+    sampled, not the sample count: a **4-query** subsample already cost 46 ms, indistinguishable from
+    1 000 queries (45 ms) and over half the 85 ms full run it exists to avoid, because a subsample
+    that size already has better-than-even odds of drawing one O(n) row. Shrinking it further does
+    not help — the floor is set by which single query gets sampled, not by how many.
+
+  **The obstacle is therefore not which formula predicts the right width — cheaply detecting the
+  need to escalate is, for a kernel that puts one query per thread and blocks the whole launch on
+  its slowest one, no cheaper than paying the cost being avoided**, whenever "expensive" describes a
+  third or more of the query population. Do not re-propose either design without a change to that
+  execution model. **The more promising unexplored lead is structural**: this section's own
+  cooperative-BVH-walk pattern (one warp per query, `tile_bvh_query_aabb`), which already fixed an
+  analogous per-query load imbalance for `mesh_to_mesh_distance` and `ball_pivoting`'s pivot search
+  by spreading one expensive query's work across a block instead of leaving it serial on one thread.
+  A block-cooperative k-NN walk would address the per-thread cost directly rather than avoid
+  triggering it — a new kernel family, not a tuning constant, and unattempted here.
 - **`query_nearest`'s famous 16x non-monotonic drop is real, but it is `k >= 8` and hash-grid-only.**
   `benchmarks/README.md` carried for several rounds the strongest negative claim in the benchmark
   prose — 0.82, 3.25, 7.38, **0.46**, 0.75 ms at 5 k / 20 k / 50 k / 100 k / 200 k, "identical to
