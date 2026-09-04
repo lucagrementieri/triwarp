@@ -4932,11 +4932,51 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   **Two things measurement refuted — do not re-propose either:** `backend="bvh"` at these call sites
   is a **LOSS at every size** (0.45x / 0.73x / 0.95x on the displaced pair), and the old "290 ms
   hashgrid against 146 ms bvh at 0.05x offset on dragon" **no longer reproduces under Warp 1.17**
-  (185 vs 194 ms) — that record's 2x has expired. And seeding the *forward* pass too, from a
-  query-prefix probe, is a **sign change**: 0.90x / 0.96x / **2.40x**, and shrinking the probe makes
-  it worse not better (0.73x / 0.88x / 2.44x at 256 samples), so the cost is estimate quality plus a
-  fixed launch+readback. A real 2.4x at `dragon` scale, needing a defensible gate; the one-way rows
-  are where it would pay. **Left open.**
+  (185 vs 194 ms) — that record's 2x has expired.
+- **CLOSED — REFUTED: seeding the *forward* pass from a query-prefix probe cannot be gated on size,
+  and the "sign change across scale" reading of it was wrong.** The design (probe a prefix, seed
+  `initial_radius` from its answers, gate on the query count the way
+  `CG_MULTIGRID_SIZE_FLOOR` gates) was measured properly and does not survive. Two findings, in the
+  order they killed it:
+  - **Across size it looks exactly like a gateable cliff.** Sweeping `dragon`'s vertices at the
+    benchmark's own 0.05x displacement, probe 1 024, min of 5, distances bit-identical in every
+    cell: **0.63x** at 8 171, **0.60x** at 35 947, 0.61-0.62x through 70 000, then **1.22x** at
+    80 000, 1.37x at 160 000, 1.66x at 300 000, **1.95x** at 437 645. The transition is a cliff, not
+    a slope — the *unseeded* cost jumps 8.52 → 18.83 ms between 70 000 and 80 000 — and it is
+    genuinely `n`-driven, because `_knn_widest_grid_radius` is itself `n`-aware. A floor at 100 000
+    fits that sweep perfectly.
+  - **And the fit is an artefact of one displacement.** Holding `n` at 437 645 — far above any floor
+    — and varying only how far the clouds sit apart: two independent samplings of one surface
+    **1.10x**, a 0.005x translation **0.67x**, the benchmark's 0.05x **1.95x**, a 0.5x translation
+    **0.42x**. A size gate would therefore ship a 2.4x regression on a widely separated pair. This is
+    §16.8's "the size branch did not transfer" a second time, and it is why the earlier record of
+    this idea as "0.90x / 0.96x / 2.40x, needing a defensible gate" was the wrong axis: the sign
+    changes with the **ratio of the answer distance to the point spacing**, not with the size, and it
+    is not monotonic in that either.
+
+  **What the sweep found instead is a much larger prize in a different place.** `initial_radius`
+  sets the hash-grid *cell width*, and that — not the ladder start — is the whole effect: sharing one
+  grid between probe and query, so only the ladder start improves, measures **0.98x** at `dragon`
+  against the fresh-grid arm's 1.94x, while the grid build itself is **0.10 ms**. Sweeping the width
+  directly as a multiple of the default (`dragon`, 437 645 points, ms):
+
+  | displacement | 1x | 2x | 4x | **8x** | 16x | 32x | 64x | probe's own seed |
+  |---|---|---|---|---|---|---|---|---|
+  | 0.005x diag | **1.0** | 1.2 | 2.7 | 10.2 | 42.2 | 115.5 | 210.3 | 2x |
+  | 0.05x diag | 160.6 | 188.8 | 107.2 | **24.1** | 40.4 | 106.9 | 216.9 | 20x |
+  | 0.5x diag | 147.3 | 148.4 | 148.5 | 148.3 | 148.5 | 275.7 | 341.1 | 173x |
+
+  So the shipping default is optimal at 0.005x; at 0.05x the optimum is **8x the default and 24.1 ms
+  against the shipping 160.6 — 6.7x**, three times what the probe's 1.95x recovers, because the probe
+  seeds at 20x and overshoots; and at 0.5x nothing under 32x moves the number at all. **The optimum
+  cell width is neither the density nor the answer distance**, which is exactly why no statistic of a
+  probe finds it — `max` / `mean` / `p50` / `p90` all measure 0.45-0.65x below the cliff and
+  1.38-1.87x above it, i.e. the statistic is not the variable.
+
+  **The open lead is therefore `neighbors._knn_cell_size`, not `metrics.py`**: a 6.7x sits between the
+  default width and the best one on the benchmark's own input, and finding it needs a model of the
+  walk's cost against the width rather than another estimate of the answer. Do not re-propose the
+  forward probe.
 - **`query_nearest`'s famous 16x non-monotonic drop is real, but it is `k >= 8` and hash-grid-only.**
   `benchmarks/README.md` carried for several rounds the strongest negative claim in the benchmark
   prose — 0.82, 3.25, 7.38, **0.46**, 0.75 ms at 5 k / 20 k / 50 k / 100 k / 200 k, "identical to

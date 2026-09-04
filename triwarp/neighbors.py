@@ -1043,7 +1043,29 @@ def query_nearest(
 def _knn_cell_size(
     initial_radius: float, min_bound: wp.vec3, max_bound: wp.vec3, grid_bins: int
 ) -> float:
-    """Hash-grid cell width for a k-NN search starting at ``initial_radius``."""
+    """
+    Hash-grid cell width for a k-NN search starting at ``initial_radius``.
+
+    **This width, not the ladder start, is what ``initial_radius`` actually buys, and the tree's
+    largest unclaimed k-NN win is in choosing it.** Isolated by sharing one grid between two
+    searches so that only the ladder start could improve: **0.98x**, against 1.94x for the same seed
+    allowed to rebuild the grid, on a 437 645-point displaced pair (the grid build itself is
+    0.10 ms, so it is not the cost either).
+
+    Sweeping the width directly as a multiple of ``knn_initial_radius``'s value on that cloud, the
+    optimum moves with how far the two clouds sit apart and is nowhere near either the density or
+    the answer distance: at a 0.005x-diagonal displacement the default (1x) is best at 1.0 ms; at
+    0.05x the optimum is **8x the default, 24.1 ms against the default's 160.6**; at 0.5x nothing
+    below 32x changes the number and everything above it is worse. A probe that measures the answer
+    distance seeds those three cases at 2x / 20x / 173x -- right, overshooting by 2.5x, and far past
+    the plateau -- which is why seeding this from a query-prefix probe was measured and **refused**
+    (CLAUDE.md section 16.6 carries the sweep and the four displacements it fails on).
+
+    So the missing piece is a cost model of the cell walk against the width, not a better estimate
+    of the answer. Until there is one, the density model is the honest default: it is optimal at
+    small separations and the failure mode at large ones is a slow query rather than a wrong one --
+    every row still certifies itself, so this value affects speed only.
+    """
     extent = max(float(max_bound[axis] - min_bound[axis]) for axis in range(3))
     if extent <= 0.0:
         # Every point is at the same position, so any positive width buckets them together.
