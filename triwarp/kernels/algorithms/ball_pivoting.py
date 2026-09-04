@@ -587,11 +587,57 @@ def pivot_front_edges(
         best_angle = TWO_PI
         best = wp.int32(-1)
         reach = 2.0 * radius
+        # ``c < n_points`` is load-bearing, not defensive. ``wp.tile_bvh_query_aabb`` returns
+        # **out-of-range** primitive indices whenever one traversal round finds more primitives
+        # than its shared result buffer holds: ``warp/native/tile_bvh.h`` counts them with an
+        # unconditional ``atomicAdd`` and guards only the *write* against
+        # ``result_buffer_capacity = WP_TILE_BLOCK_DIM * 5`` (160 lanes-wide here), then reads
+        # ``buffer[counter - block_size + lane]`` -- past the written region once the counter has
+        # overrun it, so a lane gets uninitialised shared memory as an index. Diagnosed on
+        # ``proximity.face_to_mesh_distance_tiled``, the tree's only other consumer of this
+        # builtin, where ``compute-sanitizer`` named it as a read **12.26 GB past the nearest
+        # allocation**; a garbage index is positive far more often than not, so the ``>= 0`` test
+        # alone lets it through to ``points[c]``.
+        #
+        # **It is not the long-open intermittent ``CUDA error 700`` recorded against this function**
+        # (CLAUDE.md section 16.3), which was the obvious guess -- same builtin, same block width --
+        # and was tested rather than assumed: that section's own repro (three *different* clouds in
+        # one process) faults **6 of 6** with this guard in place and 6 of 6 without, on the same
+        # third cloud. So the guard rules the tile-BVH garbage-index path *out* as that defect's
+        # cause, which is the useful half of the result; section 16.3's remaining leads stand.
+        #
+        # Guarding is still right here, and cheap: the overflow is a property of the builtin and the
+        # query, not of the caller, so this walk is exposed to the same corruption whenever a round
+        # overruns. What it cannot do is recover the primitives the overflow *dropped* -- that
+        # defect is upstream's -- so a guarded round can still return a slightly incomplete
+        # candidate set.
+        #
+        # It is output-neutral **by construction**, which is the only argument available: an index
+        # ``>= n_points`` is never a primitive of this BVH, so the test can reject nothing the walk
+        # was entitled to return. A measured claim is not available and should not be attempted --
+        # this function's output is still run-to-run nondeterministic (``make_winding_consistent``
+        # seeds each component from an arbitrary face, section 16.3), and the control proves the
+        # comparison is blind: two *baseline* runs of one 40 000-point cloud differ from each other
+        # in the face count, 69 346 against 69 347, before any change is applied.
+        n_points = points.shape[0]
         query = wp.tile_bvh_query_aabb(bvh_id, mp - wp.vec3(reach), mp + wp.vec3(reach))
         while wp.tile_query_valid(query):
             c = wp.untile(wp.tile_bvh_query_next(query))
-            if c >= 0 and candidate_prefilter(
-                points, p_src, p_tgt, src, tgt, opp, c, min_cluster_sq, point_used, boundary_degree
+            if (
+                c >= 0
+                and c < n_points
+                and candidate_prefilter(
+                    points,
+                    p_src,
+                    p_tgt,
+                    src,
+                    tgt,
+                    opp,
+                    c,
+                    min_cluster_sq,
+                    point_used,
+                    boundary_degree,
+                )
             ):
                 new_center = compute_ball_center(
                     p_src, p_tgt, points[c], normals[src] + normals[tgt] + normals[c], radius

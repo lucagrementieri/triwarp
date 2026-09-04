@@ -2978,7 +2978,46 @@ way to hand lane `t` cells `t, t+32, …`** — the cell *walk* cannot be split 
 per-candidate arithmetic can. Measured: the walk is **70-73 %** of the per-candidate cost, flat from
 64 to 8 171 queries, so a cooperative search that keeps `wp.HashGrid` is capped at **1.37x**. **Never
 propose a warp-per-edge search that keeps the hash grid.** Warp *does* ship a block-cooperative BVH
-walk (`tile_bvh_query_aabb` / `tile_query_valid` / `tile_bvh_query_next`) — §14.2.
+walk (`tile_bvh_query_aabb` / `tile_query_valid` / `tile_bvh_query_next`) — §14.2 — and it has a
+silent correctness bug, next.
+
+**`wp.tile_bvh_query_aabb` returns out-of-range primitive indices once a traversal round overruns
+its result buffer, and every caller must bound-check what it hands back.** Read from
+`warp/native/tile_bvh.h` (1.17): a round appends each hit with an **unconditional**
+`atomicAdd(&query.result_counter_shared_mem[0], 1)` and guards only the *write* against
+`result_buffer_capacity = WP_TILE_BLOCK_DIM * 5` — **160** at the `block_dim=32` both triwarp
+consumers use. The consumer then reads
+`result_buffer_shared_mem[counter - block_size + lane_id]`, so as soon as the counter has run past
+the capacity that index is past the written region and a lane is handed **uninitialised shared
+memory as a primitive index**. The stack has the same shape at
+`stack_capacity = 64 * BVH_QUERY_STACK_SIZE`, dropping children instead. Nothing raises, and the
+`>= 0` test every documented example uses does not catch it — a garbage word is positive about half
+the time and arbitrarily large.
+
+Confirmed rather than read: `proximity.mesh_to_mesh_distance` on `lucy` against a translated copy,
+7 007 straggler faces reaching `face_to_mesh_distance_tiled`, dereferences one at
+**12.26 GB past the nearest allocation** — `compute-sanitizer --tool memcheck` naming that kernel
+and that load, 7 errors, and **0 errors** with a `candidate < n_target_faces` test added (the run
+genuinely instrumented: 278 ms against 30 ms uninstrumented, §12.10's rule). It is deterministic at
+that face count and **not** allocator-sensitive — 6/6 with the CUDA mempool on and 6/6 with it off —
+which is what distinguishes it from §16.3's `ball_pivoting` fault.
+
+Three consequences:
+
+- **Bound-check the index at every `tile_bvh_query_next` site**, `candidate >= 0 and candidate < n`.
+  Both of triwarp's do. It is output-neutral by construction — an out-of-range index is never a
+  primitive of the BVH — so it can only reject what was already garbage.
+- **The guard stops the corruption and cannot restore the dropped primitives.** An overrun round
+  silently loses hits, so a guarded walk may return an incomplete candidate set; that half is
+  upstream's. In practice the two triwarp callers survive it because each has a *second*, sound
+  bound on the answer — the global running minimum, and the pivot's own acceptance test.
+- **The obvious attribution was tested and is wrong.** §16.3's long-open intermittent
+  `ball_pivoting` `CUDA error 700` is *not* this: its own repro faults **6 of 6 with the guard in
+  place**, on the same cloud. So this rules the garbage-index path out there rather than closing it.
+
+**A query box grown by a distance bound is what reaches the overrun**, which is why this had gone
+years unseen: the round count scales with how many primitives one box meets, so a big mesh plus a
+generous box is the trigger and a tight box on a small mesh never gets near 160.
 
 **Warp exposes no node-by-node BVH traversal** either (`bvh_query_aabb` / `bvh_query_ray` /
 `bvh_query_sphere` / `bvh_get_group_root` only), so a BVH-pair wavefront means writing our own

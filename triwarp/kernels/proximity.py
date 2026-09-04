@@ -553,6 +553,7 @@ def face_to_mesh_distance_tiled(
     target_bvh = wp.mesh_get_bvh(target_mesh)
     slot = wp.int32(wp.tid())
     f = overflow[slot]
+    n_target_faces = target_faces.shape[0] // 3
     a0, a1, a2 = kernel_triangles.face_vertices(query_vertices, query_faces, f)
     lower, upper = triangle_aabb(a0, a1, a2)
     margin = wp.vec3(upper_bound, upper_bound, upper_bound)
@@ -564,7 +565,18 @@ def face_to_mesh_distance_tiled(
         candidate = wp.untile(wp.tile_bvh_query_next(query))
         # A lane with no candidate this step gets -1; the tile is block-wide, so it cannot simply
         # leave the loop.
-        if candidate >= 0:
+        #
+        # The **upper** half of that test is not defensive: ``wp.tile_bvh_query_aabb`` hands back
+        # out-of-range indices on a query whose traversal round finds more primitives than its
+        # internal buffer holds, and without this line they are dereferenced. See
+        # ``kernels/algorithms/ball_pivoting.py::pivot_front_edges`` for the diagnosis and
+        # CLAUDE.md section 12.2 for the read of Warp's own source; the short version is that
+        # ``tile_bvh.h`` counts results with an unconditional ``atomicAdd`` and guards only the
+        # *write* against a ``block_dim * 5`` capacity, so once a round overruns it the consumer
+        # reads uninitialised shared memory as a primitive index. Measured here: 7 007 straggler
+        # faces of ``lucy`` against a translated copy read **12.26 GB past the nearest
+        # allocation**, ``compute-sanitizer`` naming this kernel and this load.
+        if candidate >= 0 and candidate < n_target_faces:
             distance_sq = face_pair_distance_sq(
                 a0,
                 a1,
