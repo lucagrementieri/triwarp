@@ -743,9 +743,10 @@ def _run_hole_dp(
     tenth of it for ``refill_region``.** Measured stage by stage on ``fix_self_intersections``'s
     own benchmark inputs, this sweep is **4.0 %** of the call at 8 192 faces (4 rims of 64) and
     **10.2 %** at 163 840 (4-6 rims, longest 327) -- the refiner and the two smoothers are 64-72 %
-    between them. So a blocked DP, and equally a bounded-candidate DP in MeshLib's
-    ``getOptimalSteps`` shape, is capped at that tenth for the repair path however well it works.
-    The long-rim fill groups are where it pays; CLAUDE.md section 16.6 carries the table.
+    between them. So a blocked DP -- and equally an *approximate* one that caps each cell's apex
+    scan at a constant past some chain length, trading the exact minimum for an ``O(B^2 * c)`` sweep
+    -- is capped at that tenth for the repair path however well it works. The long-rim fill groups
+    are where it pays; CLAUDE.md section 16.6 carries the table.
 
     **Folding the spans into one persistent block per loop was built and is refuted.** A
     ``wp.launch_tiled(dim=(n_loops,))`` kernel that loops over the spans internally --
