@@ -292,7 +292,7 @@ def test_trace_empty(device: str) -> None:
         vertices_wp, faces_wp, empty_int, empty_vec
     )
     assert points_wp.shape == (0,)
-    assert offsets_wp.numpy().tolist() == [0]
+    assert offsets_wp.list() == [0]
 
 
 # --------------------------------------------------------------------------------------

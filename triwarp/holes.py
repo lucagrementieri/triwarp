@@ -2835,7 +2835,7 @@ def _rows_present(
         inputs=[rows, query_wp, present],
         device=device,
     )
-    return present.numpy().tolist()
+    return present.list()
 
 
 def _bridge_triangles(

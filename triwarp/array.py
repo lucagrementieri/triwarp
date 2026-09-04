@@ -367,7 +367,7 @@ def split(
         raise ValueError(f"split requires rank-1 offsets, got ndim={offsets.ndim}")
 
     n = int(array.shape[0])
-    starts = [int(start) for start in offsets.numpy().tolist()]
+    starts = [int(start) for start in offsets.list()]
     if not starts:
         return []
     bounds = [*starts, n]

@@ -905,6 +905,22 @@ Three things are still defects:
   `np.nan` / `np.inf`. One trap: **`wp.svd3` is not a substitute for `np.linalg.svd` of a non-square
   matrix** — `creation._align_vectors` takes the SVD of a `(3, 1)` for basis completion and its free
   rotation about the axis is a *gauge* the trimesh comparison pins element-wise.
+- **`arr.numpy().tolist()` is `arr.list()`, but only for a rank-1 array — verified on Warp 1.17.**
+  `wp.array.list()`'s scalar-dtype branch is literally `self.numpy().flatten().tolist()`, so for an
+  already-1D array the two spellings return the identical Python list (checked byte-for-byte across
+  `int32`, `uint64`, `bool` and `float32`) at identical cost — `.list()` calls `.numpy()` internally,
+  so there is no speed win, only one fewer visible readback call. **It is not a substitute for a
+  rank-2 (or higher) array: `.list()` unconditionally flattens**, where `.numpy().tolist()` preserves
+  the row structure. `boundary_edges`'s `(n, 2)` output as `.list()` returns one flat `2n`-element
+  list rather than `n` pairs, which silently breaks anything iterating rows
+  (`for edge in edges.numpy().tolist()`) or indexing into it (`cells(grid).numpy().tolist().index([0,
+  0, 0])`) — both patterns exist in the tree and were left alone for exactly this reason (see
+  `tests/test_boundary.py`, `tests/test_seams.py`, `tests/test_voxels.py`,
+  `tests/test_geodesic_walk.py::test_shorten_loop_*`). Restrict the swap to a genuinely `ndim == 1`
+  buffer — an offsets/index/mask array, a `list[wp.array]` element from `boundary_loops`, or an
+  already-indexed row of a 2D array — which is what `array.py`'s `split` already asserts before this
+  exact pattern (`if int(offsets.ndim) != 1: raise ValueError(...)`), and is the cheap tell to check
+  before converting a site.
 - **NumPy reducing a full `.numpy()` readback** — `.min()`, `.max()`, `.any()`, `.sum(axis=0)` — is a
   §9 defect wearing NumPy's clothes: the whole array crossed the bus to produce one scalar. Use
   `triwarp.reduce` (or `wp.utils.array_sum`, which reduces a `wp.vec3d` array componentwise and so

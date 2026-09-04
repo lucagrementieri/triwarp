@@ -2709,7 +2709,7 @@ def _ragged_grid(device: str) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp
     """
     vertices_wp, faces_wp = tw.creation.grid(count=(8, 8), device=device)
     n_faces = int(faces_wp.shape[0]) // 3
-    rim = set(tw.boundary.boundary_loops(vertices_wp, faces_wp)[0].numpy().tolist())
+    rim = set(tw.boundary.boundary_loops(vertices_wp, faces_wp)[0].list())
     faces_np = faces_wp.numpy().reshape(-1, 3)
     keep_np = np.ones(n_faces, dtype=bool)
     rim_faces = [

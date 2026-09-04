@@ -380,7 +380,7 @@ def test_hash_vector_rows_folds_signed_zero(device: str) -> None:
         dtype=wp.vec3,
         device=device,
     )
-    assert len(set(tw.grouping.hash_vector_rows(vectors_wp).numpy().tolist())) == 1
+    assert len(set(tw.grouping.hash_vector_rows(vectors_wp).list())) == 1
 
 
 def test_hash_vector_rows_epsilon_allows_negative_coordinates(device: str) -> None:

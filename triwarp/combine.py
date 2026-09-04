@@ -65,18 +65,10 @@ def concatenate(
         concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
         vertex_offsets = wp.zeros(len(meshes_data), dtype=wp.int32, device=device)
     else:
-        # ``pack_1d_arrays`` already returns the exclusive scan of the segment sizes, on the
-        # device and of exactly this length -- the renumbering offsets, for free. Recomputing them
-        # with ``itertools.accumulate`` and uploading the result was a second copy of the same
-        # numbers.
-        concatenated_vertices, vertex_offsets = tw.array.pack_1d_arrays(
-            [vertices for vertices, _ in meshes_data]
-        )
+        concatenated_vertices, vertex_offsets = tw.array.pack_1d_arrays([
+            vertices for vertices, _ in meshes_data
+        ])
 
-    # Renumbering used to be one ``wp.map`` per input mesh, which put ~32 us of host-side launch
-    # marshalling on every piece — the dominant cost of the call once there were more than a
-    # handful. The packing copy is unavoidable (Warp has no gather across separate allocations),
-    # but the renumbering collapses into a single launch over the packed buffer.
     concatenated_faces, piece_starts = tw.array.pack_1d_arrays([faces for _, faces in meshes_data])
     total_indices = int(concatenated_faces.shape[0])
     if total_indices > 0:
@@ -142,8 +134,8 @@ def split(
     if k == 0:
         return []
 
-    vertex_bounds = [*vertex_offsets.numpy().tolist(), int(vertices_all.shape[0])]
-    face_bounds = [*face_offsets.numpy().tolist(), int(faces_all.shape[0]) // 3]
+    vertex_bounds = [*vertex_offsets.list(), int(vertices_all.shape[0])]
+    face_bounds = [*face_offsets.list(), int(faces_all.shape[0]) // 3]
 
     meshes: list[tuple[wp.array[wp.vec3], wp.array[wp.int32]]] = []
     for (v_begin, v_end), (f_begin, f_end) in zip(

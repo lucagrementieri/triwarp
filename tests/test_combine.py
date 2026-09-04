@@ -333,8 +333,8 @@ def test_split_batched_matches_split(request: pytest.FixtureRequest) -> None:
     split_wp = tw.combine.split(concat_vertices_wp, concat_faces_wp)
     assert int(vertex_offsets_wp.shape[0]) == len(split_wp) == 3
 
-    vertex_bounds_np = [*vertex_offsets_wp.numpy().tolist(), int(vertices_all_wp.shape[0])]
-    face_bounds_np = [*face_offsets_wp.numpy().tolist(), int(faces_all_wp.shape[0]) // 3]
+    vertex_bounds_np = [*vertex_offsets_wp.list(), int(vertices_all_wp.shape[0])]
+    face_bounds_np = [*face_offsets_wp.list(), int(faces_all_wp.shape[0]) // 3]
     for index, (vertices_wp, faces_wp) in enumerate(split_wp):
         v_begin, v_end = vertex_bounds_np[index], vertex_bounds_np[index + 1]
         f_begin, f_end = face_bounds_np[index], face_bounds_np[index + 1]

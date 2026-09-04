@@ -1615,7 +1615,7 @@ def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgr
         order_ml = np.argsort(indices_ml)
         order_wp = np.argsort(neighbours_wp[query_index].numpy())
 
-        assert set(neighbours_wp[query_index].numpy().tolist()) == set(indices_ml.tolist())
+        assert set(neighbours_wp[query_index].list()) == set(indices_ml.tolist())
         assert np.allclose(
             distances_wp[query_index].numpy()[order_wp],
             np.sqrt(squared_ml[order_ml]),
@@ -1640,7 +1640,7 @@ def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgr
     tie_ball_ml.radiusSq = 1.0
     mm.findPointsInBall(points_to_meshlib(tie_np), tie_ball_ml, collect_tie)
     assert sorted(tie_found) == [0, 1, 2, 3]
-    assert sorted(tie_indices_wp.numpy().tolist()) == [0, 1, 2, 3]
+    assert sorted(tie_indices_wp.list()) == [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])

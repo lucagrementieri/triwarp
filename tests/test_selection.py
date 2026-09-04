@@ -646,7 +646,7 @@ def test_submeshes_from_face_groups_matches_single(
         wp.array(np.concatenate(groups_np).astype(np.int32), dtype=wp.int32, device=device),
         wp.array(offsets_np, dtype=wp.int32, device=device),
     )
-    vertex_bounds_np = [*vertex_offsets_wp.numpy().tolist(), int(vertices_all_wp.shape[0])]
+    vertex_bounds_np = [*vertex_offsets_wp.list(), int(vertices_all_wp.shape[0])]
     face_bounds_np = [*offsets_np.tolist(), n_faces]
 
     for group, v_begin, v_end, f_begin, f_end in zip(

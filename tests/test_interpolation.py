@@ -464,7 +464,7 @@ def test_interpolate_from_points_empty(device: str):
     interpolated_wp = tw.interpolation.interpolate_from_points(
         empty_points, empty_values, query_wp, 0.5, null_value=3.0
     )
-    assert interpolated_wp.numpy().tolist() == [3.0]
+    assert interpolated_wp.list() == [3.0]
     assert (
         tw.interpolation.interpolate_from_points(
             empty_points, empty_values, empty_points, 0.5

@@ -34,26 +34,11 @@ from triwarp.kernels import predicates as kernel_predicates
 # devices, because the *candidate* dimension already fills the device -- this is the per-query
 # regime [`ITEMS_PER_SLICE_CUDA`][triwarp.constants.ITEMS_PER_SLICE_CUDA]'s note describes, not the
 # global-reduction one.
-#
-# Swept 32-8192 over three regimes (bunny's 35 947 points at 1 024 and at 10 000 rotations, and a
-# 2 000-point cloud at 1 024). The curve is shallow and its optimum drifts with the work: the short
-# end pays atomic contention (32 gives 1 124 slices and costs 1.4-2.7x), the long end serializes the
-# point loop (8192 costs 1.6-4.6x), and in between everything from 256 to 1024 sits within 1.25x of
-# the best reading in every regime. Larger candidate counts want longer slices, small clouds shorter
-# ones; 256 is the compromise, and its worst case is the 10 000-rotation row at 1.24x.
 ITEMS_PER_CANDIDATE_SLICE = 256
 
 # Cloud size at which [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box] first runs
 # [`convex_superset_mask`][triwarp.points.convex_superset_mask] and searches only the survivors.
-# The mask keeps every convex-hull vertex and the extent reduction is decided by hull vertices
-# alone, so the box is *identical* (min/max are order-independent; measured dVol == 0 on every
-# probe) — the threshold trades only time. Measured interleaved on anisotropic normal clouds
-# (RTX 5090, defaults): below ~60k the search is launch-latency-bound at ~3.5-4 ms and the
-# prefilter's ~0.5 ms sweep is pure overhead (60k: 3.83 vs 4.12 ms); the crossover sits near 80k
-# (100k: 4.34 vs 4.15 ms), and the win grows without bound past it (500k: 11.4 vs 4.1 ms, 2.8x)
-# because the filtered search runs on ~1k survivors whatever the input size. ``subdivisions=2``
-# beat 3 at every size probed (at 500k: 4.09 vs 5.84 ms) — more directions cost more sweep and
-# buy nothing the box can see.
+# The mask keeps every convex-hull vertex and the extent reduction is decided by hull vertices.
 CONVEX_PREFILTER_MIN_POINTS = 100_000
 
 
@@ -115,7 +100,6 @@ def aabb_union(
     [`aabb`][triwarp.bounds.aabb]
     [`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal]
     """
-    # ``wp.min`` / ``wp.max`` are component-wise on vectors and work at Python scope.
     return wp.min(a_min, b_min), wp.max(a_max, b_max)
 
 
@@ -193,22 +177,6 @@ def points_in_aabb(
     chosen -- points placed on both corners, on an edge midpoint and on a face centre are all
     selected there, and the three ``nan`` rows are not -- and both differ from
     [`half_space_mask`][triwarp.points.half_space_mask], whose test is strict.
-
-    **The call is host-launch-bound at every size that fits a GPU**, which is what to know before
-    optimizing it. Medians on an RTX 5090 at 2 562 / 40 962 / 163 842 / 1 000 000 points: 0.164 /
-    0.167 / 0.203 / 0.171 ms for the whole call -- flat over a 390x range -- of which the predicate
-    ``wp.map`` is 0.030-0.036, the ``bool``-to-``int32`` cast inside
-    [`flatnonzero`][triwarp.array.flatnonzero] is 0.026-0.030, its scan is 0.014-0.016 and the
-    4-byte readback that sizes the output is 0.032-0.035. So the six comparisons are never the cost
-    and a faster predicate would buy nothing.
-
-    That cast is the one stage a fused path could drop -- ~17% of the call -- and it is
-    **deliberately not fused**. Mapping the predicate straight onto ``int32`` flags does not help
-    (``flatnonzero`` then maps ``nonzero_flag`` over them, the same launch under another name), so
-    the saving needs a primitive that takes the predicate *and* does the compaction: a kernel
-    factory over a closure-captured ``wp.Function``, the ``kernels/reduce.py`` pattern. That
-    belongs in [`triwarp.array`][triwarp.array] and would serve every ``*_mask`` plus
-    ``flatnonzero`` pair in the package rather than this one, so it is not built here.
 
     See Also
     --------
@@ -488,15 +456,14 @@ def oriented_bounding_box(
 
     The box is searched, not solved, in two phases. The **global phase** scores ``rotations``
     candidate orientations from the **Super-Fibonacci spiral** [Alexa 2022], a low-discrepancy
-    sampling of ``SO(3)``, with the identity appended as the last candidate -- the same candidate
-    set ``igl.oriented_bounding_box`` searches, scored in parallel. The **refinement phase** then
-    takes the best-scoring candidates from up to four mutually distant basins and runs
-    ``refine_iterations`` trust-region rounds around each: every round scores a low-discrepancy
-    ball of perturbed frames whose angular radius starts at the global grid's covering radius and
-    halves per round, keeping each chain's best. Refinement is monotone (each chain re-scores its
-    own base), so the answer is never worse than the global phase's and never worse than
-    [`aabb`][triwarp.bounds.aabb]; with ``refine_iterations=0`` and ``rotations=1``
-    it reproduces the axis-aligned box exactly.
+    sampling of ``SO(3)``, with the identity appended as the last candidate, scored in parallel.
+    The **refinement phase** then takes the best-scoring candidates from up to four mutually distant
+    basins and runs ``refine_iterations`` trust-region rounds around each: every round scores a
+    low-discrepancy ball of perturbed frames whose angular radius starts at the global grid's
+    covering radius and halves per round, keeping each chain's best. Refinement is monotone (each
+    chain re-scores its own base), so the answer is never worse than the global phase's and never
+    worse than [`aabb`][triwarp.bounds.aabb]; with ``refine_iterations=0`` and ``rotations=1`` it
+    reproduces the axis-aligned box exactly.
 
     Cost is ``rotations * len(points)`` point transforms for the global phase plus
     ``refine_iterations * 512 * len(points)`` for refinement — but past
@@ -505,10 +472,6 @@ def oriented_bounding_box(
     point that provably cannot touch the box, so both phases run on the few hull-candidate
     survivors and the cost stops growing with the cloud (the box is identical: the mask keeps
     every hull vertex and the extents are order-independent reductions over them).
-    Refinement is what makes the *default* polyhedron-safe: it
-    recovers the flat-flush orientation a sampled grid can only land near (measured on a tilted
-    cube whose exact minimum is 6.0: 6.31 sampled at 32 768 candidates against **6.0013** refined
-    at the default 4 096 — from 5.2% over the true box to 0.02%).
 
     Parameters
     ----------
@@ -523,12 +486,7 @@ def oriented_bounding_box(
         squared diagonal length, which has the same minimizer as the length).
     refine_iterations
         Trust-region rounds after the global phase, ``>= 0``. ``0`` disables refinement and returns
-        the pure sampled answer, which is what makes the result element-wise comparable to
-        ``igl.oriented_bounding_box``'s identical candidate set (the parity tests pass ``0`` for
-        exactly that reason). Each round costs two launches (frame generation and extents) and
-        one small table readback -- measured back to back on a 36k cloud, ~0.24 ms per round,
-        ~1.9 ms at the default eight rounds; the quality gain past eight rounds is under 0.05%
-        on every fixture measured.
+        the pure sampled answer.
 
     Returns
     -------
@@ -536,8 +494,7 @@ def oriented_bounding_box(
         World-to-box frame, i.e. its **rows** are the box axes in world coordinates. A world point
         ``p`` has box coordinates ``rotation * p``, and a box corner maps back with
         ``wp.transpose(rotation) * corner``. ``rotation`` is a proper rotation (orthonormal,
-        determinant ``+1``); ``igl.oriented_bounding_box`` returns its transpose, since igl applies
-        the matrix on the right of a row vector.
+        determinant ``+1``).
     min_bound, max_bound
         Extent of ``points`` along the box axes, in box coordinates -- so the box is
         ``{transpose(rotation) * q : min_bound <= q <= max_bound}`` and its side lengths are
@@ -562,17 +519,15 @@ def oriented_bounding_box(
 
     **The result is a converged local minimum, not a certified global one.** Certifying the true
     minimum-volume box requires the exact-arithmetic search over the convex hull's face and edge
-    events (O'Rourke's rotating-calipers family -- what ``trimesh.bounds.oriented_bounds`` and
-    open3d's ``get_minimal_oriented_bounding_box`` approximate over qhull output), and triwarp
-    deliberately has no exact convex hull, on the GPU or off it. What the sampling-plus-refinement
-    search gives up is the *certificate*, not (measurably) the volume: the global phase lands in
-    the optimum's basin whenever the grid's covering radius resolves it, refinement converges
-    within the basin, and against both hull-based references on every fixture probed
-    (tilted/stretched icosahedron, cube shell, hemisphere, half torus) the refined default **ties
-    or beats each of them** -- including the exact 6.0 on the cube that sampling alone misses by
-    5.2%. A pathological cloud whose optimum basin is narrower than the covering radius of
-    ``rotations`` samples can still hide its box from this search; raise ``rotations`` if the
-    input is a near-symmetric polyhedron far from any sampled orientation.
+    events (O'Rourke's rotating-calipers family), and triwarp deliberately has no exact convex hull.
+    What the sampling-plus-refinement search gives up is the *certificate*, not (measurably) the
+    volume: the global phase lands in the optimum's basin whenever the grid's covering radius
+    resolves it, refinement converges within the basin, and against both hull-based references on
+    every fixture probed (tilted/stretched icosahedron, cube shell, hemisphere, half torus) the
+    refined default **ties or beats each of them**.
+    A pathological cloud whose optimum basin is narrower than the covering radius of ``rotations``
+    samples can still hide its box from this search; raise ``rotations`` if the input is a
+    near-symmetric polyhedron far from any sampled orientation.
 
     Neither hull-based reference is an oracle for the minimum either: on a stretched icosahedron
     the refined search returns **less** volume than both (the hull-face-flush restriction misses
@@ -665,13 +620,10 @@ def _refine_box(
     Trust-region refinement of the sampled winner(s): shrink a low-discrepancy ball per round.
 
     Chains start from the best sampled candidates of mutually distant basins (greedy spread over
-    the top of the loss table) and live on the device: each round one kernel generates the
-    ``delta @ base`` perturbations in place of the host quaternion math, einsum and 18 KB upload
-    the loop used to pay (measured 63% of every round -- 0.245 ms of 0.386 ms on a 36k cloud;
-    the extent launch plus its table readback is the irreducible rest). The same extent kernel
-    as the global phase scores them, the per-chain argmin stays host arithmetic over the
-    already-read-back table, and an improved chain is refreshed with a 36-byte device copy; the
-    last delta is the identity, which is what makes the refinement monotone per chain.
+    the top of the loss table) and live on the device. The same extent kernel as the global phase
+    scores them, the per-chain argmin stays host arithmetic over the already-read-back table, and
+    an improved chain is refreshed with a 36-byte device copy; the last delta is the identity,
+    which is what makes the refinement monotone per chain.
     """
     device = points.device
     order = np.argsort(loss_np)
@@ -717,7 +669,6 @@ def _refine_box(
         sigma *= 0.4
 
     winner = int(chain_loss.argmin())
-    # The winning frame alone, 36 bytes through the shared readback scratch.
     frame_np = read_scalar(chains, winner).astype(np.float64)
     return frame_np, chain_lower[winner], chain_upper[winner]
 
@@ -757,25 +708,30 @@ def _spread_chain_frames(order: np.ndarray, rotations: int) -> np.ndarray:
     Adjacent spiral candidates score adjacently, so the top of the table is usually one basin
     sampled several times; the greedy pass keeps only heads at least 0.2 rad apart so the chains
     explore *different* basins. Falls back to the plain head when the spread exhausts the window.
+
+    Runs once per [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box] call (before the
+    refinement loop, not inside it) on at most 32 candidates picking `_REFINE_CHAINS`, so it is
+    Python-call-overhead bound rather than compute bound.
     """
     head = order[: min(32, rotations)]
     head_frames = _spiral_frames(head, rotations)
+    flat = head_frames.reshape(head_frames.shape[0], 9)
+    # angle < 0.2 rad  <=>  trace > 1 + 2*cos(0.2), since acos is decreasing and every trace here
+    # already lies in the valid [-1, 3] range for a rotation-matrix pair -- no clip needed.
+    trace_threshold = 1.0 + 2.0 * math.cos(0.2)
     picked = [0]
-    for i in range(1, head_frames.shape[0]):
+    for i in range(1, flat.shape[0]):
         if len(picked) == _REFINE_CHAINS:
             break
-        candidate = head_frames[i]
-        # Geodesic distance via the relative rotation's angle.
+        candidate = flat[i]
         far = True
         for j in picked:
-            relative = candidate @ head_frames[j].T
-            angle = math.acos(min(1.0, max(-1.0, (float(np.trace(relative)) - 1.0) * 0.5)))
-            if angle < 0.2:
+            if candidate @ flat[j] > trace_threshold:
                 far = False
                 break
         if far:
             picked.append(i)
-    for i in range(1, head_frames.shape[0]):
+    for i in range(1, flat.shape[0]):
         if len(picked) == _REFINE_CHAINS:
             break
         if i not in picked:
@@ -810,24 +766,9 @@ def _spiral_frames(indices: np.ndarray, rotations: int) -> np.ndarray:
         ],
         axis=1,
     )
-    # World -> box frames: the transpose of the rotation each quaternion names.
-    return _quat_matrices(quats).transpose(0, 2, 1)
-
-
-def _quat_matrices(quats: np.ndarray) -> np.ndarray:
-    """Rotation matrices from ``(x, y, z, w)`` quaternions, matching ``wp.quat_to_matrix``."""
     x, y, z, w = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
-    return np.stack(
-        [
-            np.stack(
-                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)], 1
-            ),
-            np.stack(
-                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)], 1
-            ),
-            np.stack(
-                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)], 1
-            ),
-        ],
-        axis=1,
-    )
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ]).transpose(2, 1, 0)

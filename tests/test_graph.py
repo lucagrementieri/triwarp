@@ -759,7 +759,7 @@ def test_bfs_multi_source_matches_scipy_min_only(request: pytest.FixtureRequest)
         )
 
         reachable_np = set(np.flatnonzero(np.isfinite(distances_np)).tolist())
-        reachable_wp = set(neighbors_wp.numpy().tolist())
+        reachable_wp = set(neighbors_wp.list())
         # Non-vacuity: on the disjoint graph the sources must leave something out.
         assert n_nodes - len(reachable_np) == n_unreachable
         assert reachable_wp == reachable_np
@@ -815,7 +815,7 @@ def test_bfs_multi_source_large_component(device: str) -> None:
     adjacency = tw.graph.edges_to_csr(n, edges_wp)
     sources_wp = wp.array(np.array([5], dtype=np.int32), dtype=wp.int32, device=device)
     neighbors_wp, offsets_wp = tw.graph.bfs_multi_source(adjacency, sources_wp)
-    assert offsets_wp.numpy().tolist() == [0]
+    assert offsets_wp.list() == [0]
     neighbors_np = neighbors_wp.numpy()
     assert neighbors_np.shape == (n,)
     assert neighbors_np[0] == 5  # the source leads its own range
