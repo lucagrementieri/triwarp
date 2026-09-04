@@ -585,20 +585,12 @@ def oriented_bounding_box(
         # The winning frame alone, 36 bytes through the shared readback scratch, so the pure
         # sampled path stays bit-comparable with the device-generated candidate set.
         rotation_np = read_scalar(axes, best)
-        return (
-            wp.mat33(*rotation_np.ravel().tolist()),
-            wp.vec3(*lower_np[best].tolist()),
-            wp.vec3(*upper_np[best].tolist()),
-        )
+        return (wp.mat33(*rotation_np.ravel()), wp.vec3(*lower_np[best]), wp.vec3(*upper_np[best]))
 
     frame_np, lower_best, upper_best = _refine_box(
         points, rotations, objective, refine_iterations, loss_np, n_slices
     )
-    return (
-        wp.mat33(*frame_np.ravel().tolist()),
-        wp.vec3(*lower_best.tolist()),
-        wp.vec3(*upper_best.tolist()),
-    )
+    return (wp.mat33(*frame_np.ravel()), wp.vec3(*lower_best), wp.vec3(*upper_best))
 
 
 # Refinement geometry: up to four chains cover distinct basins of the sampled landscape (a

@@ -11,28 +11,28 @@ TOLERANCE_ZERO = 1e-12
 # finite cotangent weight. Shared by `laplacian.mollify_intrinsic` and `remesh.intrinsic_delaunay`.
 TOLERANCE_MOLLIFY = 1e-5
 
-TOLERANCE_MERGE_CONSTANT = wp.constant(wp.float32(TOLERANCE_MERGE))
-TOLERANCE_PLANAR_CONSTANT = wp.constant(wp.float32(TOLERANCE_PLANAR))
-TOLERANCE_ZERO_CONSTANT = wp.constant(wp.float32(TOLERANCE_ZERO))
-TOLERANCE_ZERO_F64 = wp.constant(wp.float64(TOLERANCE_ZERO))
+TOLERANCE_MERGE_CONSTANT = wp.float32(TOLERANCE_MERGE)
+TOLERANCE_PLANAR_CONSTANT = wp.float32(TOLERANCE_PLANAR)
+TOLERANCE_ZERO_CONSTANT = wp.float32(TOLERANCE_ZERO)
+TOLERANCE_ZERO_F64 = wp.float64(TOLERANCE_ZERO)
 """``TOLERANCE_ZERO`` at ``float64``, for the predicates that widen before deciding."""
 
 # Largest representable values, usable as "sorts last" sentinels inside kernels (computing them
 # here in Python scope avoids the literals Warp cannot evaluate at kernel scope).
 INT32_MAX = 2**31 - 1
-INT32_MAX_CONSTANT = wp.constant(wp.int32(INT32_MAX))
+INT32_MAX_CONSTANT = wp.int32(INT32_MAX)
 INT64_MAX = 2**63 - 1
-INT64_MAX_CONSTANT = wp.constant(wp.int64(INT64_MAX))
+INT64_MAX_CONSTANT = wp.int64(INT64_MAX)
 UINT64_MAX = 2**64 - 1
-UINT64_MAX_CONSTANT = wp.constant(wp.uint64(UINT64_MAX))
-FLOAT32_INF_CONSTANT = wp.constant(wp.INF)
+UINT64_MAX_CONSTANT = wp.uint64(UINT64_MAX)
+FLOAT32_INF_CONSTANT = wp.INF
 # The float64 twin, for a kernel that widens float32 geometry to make its *decisions* in double --
 # ``kernels/intersection.triangles_intersect`` is the one that does. ``wp.INF`` is a float32
 # constant, and mixing it into float64 arithmetic does not parse.
-FLOAT64_INF_CONSTANT = wp.constant(wp.float64(float("inf")))
+FLOAT64_INF_CONSTANT = wp.float64(float("inf"))
 
-PI = wp.constant(wp.PI)
-TWO_PI = wp.constant(2 * wp.PI)
+PI = wp.PI
+TWO_PI = 2 * wp.PI
 
 TILE_1D = 64
 TILE_2D = 8

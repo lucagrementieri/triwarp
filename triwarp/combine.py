@@ -193,13 +193,6 @@ def split_batched(
 
     face_labels = tw.adjacency.face_connected_component_labels(faces)
 
-    # One stable label sort replaces the per-component isin/flatnonzero full-array passes: the
-    # sort is stable (see tw.array.sort_and_argsort's Notes), so faces stay ascending within each
-    # component and components ascend by label — the exact emission order of the previous
-    # per-label loop.
-    # Views into ``sort_and_argsort``'s scratch, deliberately not cloned: neither escapes this
-    # frame. ``sorted_labels`` feeds only the adjacent-element map below, and ``sorted_face_ids``
-    # only the submesh builders, which read it into fresh buffers.
     sorted_labels, sorted_face_ids = tw.array.sort_and_argsort(face_labels)
 
     # Segment boundaries of the label-sorted array: position 0, plus every label change. The
@@ -212,8 +205,6 @@ def split_batched(
     face_offsets = tw.array.flatnonzero(is_start)
 
     if int(face_offsets.shape[0]) == 1:
-        # Overwhelmingly the common call. Packing one group through the int64 key would be pure
-        # overhead, and on a big single-component mesh it is a materially larger sort.
         component_vertices, component_faces = tw.selection.submesh_from_face_indices(
             vertices, faces, sorted_face_ids, unique_indices=True
         )

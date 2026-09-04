@@ -238,7 +238,7 @@ def moments(
         shift = total_volume * (float(center @ center) * np.eye(3) - np.outer(center, center))
         inertia = inertia - shift
 
-    return total_volume, wp.vec3(*center.tolist()), wp.mat33d(*inertia.ravel().tolist())
+    return total_volume, wp.vec3(*center), wp.mat33d(*inertia.ravel())
 
 
 def euler_characteristic(faces: wp.array[wp.int32]) -> int:

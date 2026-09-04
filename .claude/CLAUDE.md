@@ -102,12 +102,19 @@ Two conventions that hold throughout:
   (check 18). This reads kernel-scope signatures only — a kernel **factory** is ordinary Python and
   its `row_size: int` / `name: str` parameters are correct, which is why `str` is not in the check's
   table.
-- Module-level numeric constants go through `wp.constant()` so they are visible in kernel scope:
+- **`wp.constant()` is not what makes a module-level value visible in kernel scope, and wrapping
+  with it is optional.** On Warp 1.17 it is `return x` after an `is_value(x)` check (§12.6) — any
+  module-level global that evaluates to a scalar/vector/matrix is resolvable from kernel scope
+  whether or not it passed through `wp.constant()`. What *is* load-bearing is the typed
+  constructor:
   ```python
-  TOLERANCE_MERGE = wp.constant(wp.float32(1e-8))
+  TOLERANCE_MERGE = wp.float32(1e-8)
   ```
-  A plain Python float works but is treated as `wp.float32`; use the `wp.float64(...)` constructor
-  where 64-bit precision is required.
+  A plain Python float works too but is treated as `wp.float32` in kernel-scope arithmetic, and
+  mixing that default against a `float64` kernel variable is a parse error — use the
+  `wp.float64(...)` constructor where 64-bit precision is required. `triwarp/constants.py` carries
+  no `wp.constant()` calls for this reason; do not add one to a new constant on the theory that it
+  is required for visibility.
 - **Prefer dtype-generic `@wp.func`s** — `wp.Float` / `wp.Scalar` for scalars, `Any` for vectors,
   the `kernels/predicates.py` convention — as long as the dispatch stays readable. Coverage and its
   limits are measured in §12.4.
@@ -905,6 +912,27 @@ Three things are still defects:
   `np.nan` / `np.inf`. One trap: **`wp.svd3` is not a substitute for `np.linalg.svd` of a non-square
   matrix** — `creation._align_vectors` takes the SVD of a `(3, 1)` for basis completion and its free
   rotation about the axis is a *gauge* the trimesh comparison pins element-wise.
+- **A `.tolist()` immediately splatted into a Warp vector/matrix constructor is noise — delete it.**
+  `wp.vec3(*x.tolist())`, `wp.mat33(*x.ravel().tolist())`, `wp.mat44(*x.flatten().tolist())`,
+  `wp.mat33d(*x.ravel().tolist())` all construct identically from the raw NumPy array with the
+  `.tolist()` dropped — verified on Warp 1.17 for `float32` and `float64`, for a contiguous row and
+  for a non-contiguous (transposed / column / negated) view. `.tolist()` changes neither the
+  dtype-narrowing a `wp.mat33`/`wp.vec3` float32 constructor does (a Python `float` and a
+  `np.float64` round to the same bits) nor anything else observable; it only allocates a throwaway
+  Python list the constructor immediately consumes and discards. Swept and removed across the
+  tree — **19 sites in 5 files** (`bounds.py`, `transform.py`, `measures.py`, `reduce.py`,
+  `creation.py`), two of which were the identical redundancy one level down —
+  `math.dist(a.tolist(), b.tolist())`, where `math.dist` also takes a raw NumPy array directly.
+  Two shapes are **not** this defect and must stay: a `.tolist()` whose result **is** the return
+  value, satisfying a genuine `list[...]`-typed public signature rather than feeding a Warp
+  constructor (`intersection._link_segments`'s `closed.tolist()` — the function's declared return
+  is `list[bool]`, so this is what keeps a public return from naming `np.ndarray`, the very thing
+  this section's first bullet forbids); and a `.tolist()` used to get plain Python scalars for
+  non-Warp bookkeeping such as a dict key (`creation._icosphere_face_table`'s
+  `for f, (a, b, c) in enumerate(faces_np.tolist())`). §7.1's test-writing convention
+  (`wp.vec3(*array_np.tolist())`) is unaffected by this finding and stays the sanctioned spelling
+  in `tests/` for consistency across the suite, where the redundant allocation is immaterial — do
+  not carry it into `triwarp/` production code as though the `.tolist()` there were load-bearing.
 - **`arr.numpy().tolist()` is `arr.list()`, but only for a rank-1 array — verified on Warp 1.17.**
   `wp.array.list()`'s scalar-dtype branch is literally `self.numpy().flatten().tolist()`, so for an
   already-1D array the two spellings return the identical Python list (checked byte-for-byte across
@@ -3191,6 +3219,29 @@ Rules: §1.3, §1.5, §1.6.
 - **`wp.config.verbose = True` is deprecated in Warp 1.17** — it prints a deprecation notice to
   stderr, which is noise in exactly the output you are grepping. Use
   `wp.config.log_level = wp.LOG_DEBUG`; the log lines themselves are unchanged.
+- **`wp.constant(x)` is `return x` after an `is_value(x)` check — on Warp 1.17 it is an identity
+  function, not a declaration.** Read from `warp/__init__.py`:
+  ```python
+  def constant(x):
+      if not is_value(x):
+          raise TypeError(...)
+      return x
+  ```
+  `is_value` accepts any scalar, vector, matrix, quaternion or transform — a bare Python `float` or
+  `int` (including one past `int64` range, e.g. `2**64 - 1`) passes it, so the check almost never
+  rejects anything this package would pass it anyway. Probed directly: a bare module-level global
+  with **no** `wp.constant()` and **no** typed constructor — a plain `TOL = 1e-8`, `N = 2**31 - 1`,
+  `float("inf")`, or `2 * wp.PI` computed at import time — compiles and runs correctly from kernel
+  scope on both devices, because Warp's codegen (`Adjoint.eval_num` /
+  `resolve_static_expression` → `add_constant`) resolves *any* free variable that evaluates to a
+  static value, wrapped or not. **So `wp.constant()` adds no kernel-scope visibility, and
+  `triwarp/constants.py` no longer calls it** (§1.2). What the wrapper never did is fix a dtype
+  either — `wp.constant(wp.INF)` and `wp.INF` are the same `float` object, `is` each other's equal.
+  The one behavior that *is* real and worth keeping in mind: a value handed to `wp.constant()` that
+  is not a value type (a list, dict, string, function) raises `TypeError` immediately at the
+  definition site rather than failing later and more confusingly inside a kernel that references
+  it — so it remains a legitimate early type-check for a constant that might not be scalar-shaped,
+  just not the mechanism this package had credited it with.
 - **A tile `shape=` must be a plain integer, so `wp.constant(wp.int32(n))` cannot serve as one.**
   `wp.constant(256)` works as a `wp.tile_load` / `wp.tile_zeros` `shape=`; the typed spelling fails
   at *parse* time with an `AttributeError` naming the kernel. That matters because §1.5's check 17

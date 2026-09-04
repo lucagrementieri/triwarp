@@ -600,7 +600,7 @@ def _launch_global_vec3_minmax(array: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.ve
     )
     corners_np = corners.numpy()
     # Slots 3..5 hold the *negated* upper corner; see the kernel.
-    return wp.vec3(*corners_np[:3].tolist()), wp.vec3(*(-corners_np[3:]).tolist())
+    return wp.vec3(*corners_np[:3]), wp.vec3(*(-corners_np[3:]))
 
 
 def _reduce_scalar(

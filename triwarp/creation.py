@@ -24,18 +24,6 @@ curved one, each with exactly one boundary loop.
 and are the only builders here that produce a **non-orientable** surface, an odd Euler
 characteristic, or a mesh whose scale is far from 1.
 
-Differences from `trimesh.creation` that apply module-wide:
-
-- No ``**kwargs`` passthrough, no ``metadata`` and no colors — triwarp has no visual layer, so
-  `axis` takes no ``origin_color`` and no function records a ``{"shape": ...}`` tag.
-- Where trimesh relies on ``Trimesh(process=True)`` merging coincident vertices to make a result
-  watertight, the duplicates are avoided or collapsed structurally instead — exactly, and without
-  a position hash. See the Notes of [`revolve`][triwarp.creation.revolve] and
-  [`extrude_triangulation`][triwarp.creation.extrude_triangulation]. Results that trimesh builds
-  with ``process=False`` keep their duplicates here too.
-- Polygon inputs are ``wp.vec2`` rings rather than ``shapely`` polygons; interior rings (holes)
-  are not supported. See [`triangulate_polygon`][triwarp.polyline.triangulate_polygon].
-
 !!! note "Every function here costs at least ~340 µs, and most of them cost exactly that"
 
     A triwarp wrapper call carries a fixed host-side cost — allocation plus Warp's launch path,
@@ -814,13 +802,11 @@ def sphere_cap(
     for r in range(1, n_rings + 1):
         theta = angle * r / n_rings
         phi = 2.0 * math.pi * np.arange(6 * r) / (6 * r)
-        vertices_np[ring_start[r] : ring_start[r] + 6 * r] = np.column_stack(
-            (
-                radius * math.sin(theta) * np.cos(phi),
-                radius * math.sin(theta) * np.sin(phi),
-                np.full(6 * r, radius * math.cos(theta)),
-            )
-        )
+        vertices_np[ring_start[r] : ring_start[r] + 6 * r] = np.column_stack((
+            radius * math.sin(theta) * np.cos(phi),
+            radius * math.sin(theta) * np.sin(phi),
+            np.full(6 * r, radius * math.cos(theta)),
+        ))
 
     # Stitch ring r-1 to ring r: six sectors, and in each the outer ring carries one more vertex
     # than the inner one. That extra vertex is what turns the strip into ``2 * r - 1`` triangles --
@@ -834,24 +820,20 @@ def sphere_cap(
         inner_count = 6 * (r - 1) if r > 1 else 1
         outer_index = np.arange(6 * r)
         sector, step = np.divmod(outer_index, r)
-        faces_np[written : written + 6 * r] = np.column_stack(
-            (
-                outer_base + outer_index,
-                outer_base + (outer_index + 1) % (6 * r),
-                inner_base + (sector * (r - 1) + step) % inner_count,
-            )
-        )
+        faces_np[written : written + 6 * r] = np.column_stack((
+            outer_base + outer_index,
+            outer_base + (outer_index + 1) % (6 * r),
+            inner_base + (sector * (r - 1) + step) % inner_count,
+        ))
         written += 6 * r
         if r > 1:
             inner_index = np.arange(inner_count)
             sector, step = np.divmod(inner_index, r - 1)
-            faces_np[written : written + inner_count] = np.column_stack(
-                (
-                    inner_base + inner_index,
-                    outer_base + (sector * r + step + 1) % (6 * r),
-                    inner_base + (inner_index + 1) % inner_count,
-                )
-            )
+            faces_np[written : written + inner_count] = np.column_stack((
+                inner_base + inner_index,
+                outer_base + (sector * r + step + 1) % (6 * r),
+                inner_base + (inner_index + 1) % inner_count,
+            ))
             written += inner_count
 
     return (
@@ -1335,12 +1317,10 @@ def _revolve_kept_template(profile_np: np.ndarray, step: float) -> np.ndarray:
     """
     per = profile_np.shape[0]
     radius_np, height_np = profile_np[:, 0], profile_np[:, 1]
-    grid_np = np.vstack(
-        (
-            np.column_stack((radius_np, np.zeros(per), height_np)),
-            np.column_stack((np.cos(step) * radius_np, np.sin(step) * radius_np, height_np)),
-        )
-    )
+    grid_np = np.vstack((
+        np.column_stack((radius_np, np.zeros(per), height_np)),
+        np.column_stack((np.cos(step) * radius_np, np.sin(step) * radius_np, height_np)),
+    ))
     segment_np = np.arange(per - 1)
     triangles_np = np.empty((2 * (per - 1), 3), dtype=np.int64)
     triangles_np[0::2] = np.column_stack((segment_np, segment_np + per, segment_np + 1))
@@ -1545,10 +1525,10 @@ def extrude_polygon(
         translation = np.eye(4)
         translation[2, 3] = abs(float(height)) / -2.0
         if transform is None:
-            transform = wp.mat44(*translation.flatten().tolist())
+            transform = wp.mat44(*translation.flatten())
         else:
             composed = _transform_to_numpy(transform).dot(translation)
-            transform = wp.mat44(*composed.flatten().tolist())
+            transform = wp.mat44(*composed.flatten())
     return extrude_triangulation(ring, faces, height, transform=transform)
 
 
@@ -1634,7 +1614,7 @@ def sweep_polygon(
     # 94-99 % host time.
     first = read_scalar(path, 0)
     last = read_scalar(path, n_path - 1)
-    closed = math.dist(first.tolist(), last.tolist()) < TOLERANCE_MERGE
+    closed = math.dist(first, last) < TOLERANCE_MERGE
     connect_closed = closed and connect
 
     normals = wp.empty(n_path, dtype=wp.vec3, device=device)
@@ -1762,7 +1742,7 @@ def truncated_prisms(
 
     out_vertices = wp.empty(6 * n_faces, dtype=wp.vec3, device=device)
     out_faces = wp.empty(24 * n_faces, dtype=wp.int32, device=device)
-    to_plane = wp.mat44(*transform_np.flatten().tolist())
+    to_plane = wp.mat44(*transform_np.flatten())
     wp.launch(
         kernel_creation.truncated_prism_geometry,
         dim=n_faces,
@@ -1843,7 +1823,7 @@ def axis(
             cylinder(
                 radius=float(axis_radius),
                 height=float(axis_length),
-                transform=wp.mat44(*placement.flatten().tolist()),
+                transform=wp.mat44(*placement.flatten()),
                 device=device,
             )
         )
@@ -2470,12 +2450,10 @@ def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.n
     corner_d = vertex_index[:-1, 1:].ravel()
     # Wound against the (u, v) frame, which is VTK's convention and puts the normals of the closed
     # surfaces outward: measured opposed on every one of the 18 surfaces if wound with it.
-    triangles = np.concatenate(
-        (
-            np.column_stack((corner_a, corner_c, corner_b)),
-            np.column_stack((corner_a, corner_d, corner_c)),
-        )
-    )
+    triangles = np.concatenate((
+        np.column_stack((corner_a, corner_c, corner_b)),
+        np.column_stack((corner_a, corner_d, corner_c)),
+    ))
     nondegenerate = (
         (triangles[:, 0] != triangles[:, 1])
         & (triangles[:, 1] != triangles[:, 2])
@@ -2494,7 +2472,7 @@ def _segment_to_cylinder(segment: Sequence[Sequence[float]]) -> tuple[wp.mat44, 
     matrix = _align_vectors(np.array([0.0, 0.0, 1.0]), vector)
     # Compose translation-to-midpoint with the rotation.
     matrix[:3, 3] = segment_np[0] + vector * 0.5
-    return wp.mat44(*matrix.flatten().tolist()), height
+    return wp.mat44(*matrix.flatten()), height
 
 
 def _align_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
