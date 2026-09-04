@@ -671,6 +671,66 @@ def test_mesh_to_mesh_distance_tiled_pass_agrees_with_the_capped_one(device: str
     assert split[0] > 0.0
 
 
+@pytest.mark.parametrize("side", [8, 16, 32])
+def test_mesh_to_mesh_distance_when_every_face_overflows_the_cap(device: str, side: int) -> None:
+    """
+    Not a library comparison: the answer is exact by construction, and it used to be ``inf``.
+
+    Two flat unit sheets, one lifted 0.3 in ``z``, so every closest pair is exactly 0.300000 and no
+    reference is needed to know it. What the fixture is *for* is the second pass: a query face's
+    box grown by the 0.3 bound covers a large disc of the other sheet, so from ``side = 16``
+    (512 faces) **every** face overflows ``_QUERY_CANDIDATE_CAP`` and every face is re-walked --
+    the configuration the scan meshes never reach, where only 0.02-0.5 % of faces overflow.
+
+    What it pins is the second pass's **publish rule**: it must keep the better of its own answer
+    and the grid pass's, not overwrite. Its prune drops a candidate whose box gap is ``>=`` the
+    running global minimum, and that minimum is by then the answer itself -- published by this very
+    face moments earlier -- so an overwriting re-walk prunes the winning pair, returns ``inf``, and
+    replaces 0.3 with it. The cpu device runs no second pass at all (the cap is disabled there), so
+    it answered correctly throughout and is the arm that named the bug.
+
+    Parametrized across the transition on purpose. Mutation-probed: restoring the overwrite fails
+    ``side = 16`` and ``32`` and **passes** ``side = 8``, which overflows nothing -- so a regression
+    here reads as a size-dependent failure, and a fixture that stopped saturating the pass would
+    stop testing anything.
+
+    It does **not** cover the other defect this pair of sheets was found alongside --
+    ``wp.tile_bvh_query_aabb`` returning out-of-range primitive indices once a traversal round
+    overruns its shared result buffer (CLAUDE.md section 12.2). Checked rather than assumed:
+    ``compute-sanitizer`` reports **0 errors** on this fixture with the kernel's index guard removed
+    as well as with it, at every ``side`` here, so the overrun is not reachable at this size. That
+    defect's evidence is a benchmark-scale mesh and it has no test.
+    """
+    positions = np.linspace(0.0, 1.0, side + 1)
+    grid_x, grid_y = np.meshgrid(positions, positions, indexing="ij")
+    vertices_np = np.stack([grid_x.ravel(), grid_y.ravel(), np.zeros(grid_x.size)], axis=1).astype(
+        np.float64
+    )
+    corners = np.arange((side + 1) ** 2).reshape(side + 1, side + 1)
+    lower_left, lower_right = corners[:-1, :-1], corners[1:, :-1]
+    upper_right, upper_left = corners[1:, 1:], corners[:-1, 1:]
+    faces_np = np.concatenate(
+        [
+            np.stack([lower_left, lower_right, upper_right], axis=-1).reshape(-1, 3),
+            np.stack([lower_left, upper_right, upper_left], axis=-1).reshape(-1, 3),
+        ]
+    ).ravel()
+
+    gap = 0.3
+    sheet_vertices_wp, sheet_faces_wp = numpy_to_warp(
+        vertices_np, faces_np.astype(np.int32), device
+    )
+    lifted_vertices_wp, lifted_faces_wp = numpy_to_warp(
+        vertices_np + np.array([0.0, 0.0, gap]), faces_np.astype(np.int32), device
+    )
+    distance, face_a, face_b = tw.proximity.mesh_to_mesh_distance(
+        sheet_vertices_wp, sheet_faces_wp, lifted_vertices_wp, lifted_faces_wp
+    )
+    assert np.isclose(distance, gap, rtol=1e-6, atol=1e-7)
+    assert face_a >= 0
+    assert face_b >= 0
+
+
 def test_mesh_to_mesh_distance_upper_bound_and_edge_cases(device: str) -> None:
     """
     Not a library comparison: what ``upper_bound`` does, including when it is wrong.

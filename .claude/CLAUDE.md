@@ -5053,10 +5053,37 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   than a tuned optimum, and it does not need re-probing after an upgrade. One earlier reading of
   0.88x at 1 024 points on `dragon` was an **unwarmed** arm and does not reproduce.
 
-  **It also uncovered a platform defect that gates it**: widening the query box is what first
-  reaches `wp.tile_bvh_query_aabb`'s result-buffer overrun (§12.2), which faults deterministically
-  on `lucy[near]` — through the *public* `upper_bound=` parameter on the shipping code, before this
-  change existed. The bound-check went in first, as its own commit.
+  **It also uncovered two defects that gate it, both older than it and both reached through the
+  *public* `upper_bound=` parameter on the shipping code.** Widening the query box is what finds
+  them, which is the general lesson: an optimization that loosens a bound is a fuzzer for everything
+  downstream of that bound.
+  - `wp.tile_bvh_query_aabb`'s result-buffer overrun (§12.2), which faults deterministically on
+    `lucy[near]`. Bound-checked, as its own commit.
+  - **`mesh_to_mesh_distance` returned `inf` on CUDA from 512 faces up**, where the CPU device
+    returned the exact answer. Two unit sheets 0.3 apart: every query face's box grown by the 0.3
+    bound covers a large disc of the other sheet, so **every** face overflows
+    `_QUERY_CANDIDATE_CAP` and is re-walked by the second pass — and that pass *overwrote* the grid
+    pass's answer. `face_pair_distance_sq` drops a candidate whose box gap is `>=` its limit, the
+    limit is the running global minimum, and by then that minimum **is** the answer, published by
+    this very face moments earlier. So the re-walk pruned the winning pair, returned `inf`, and
+    replaced 0.300000 with it. **This is the identical bound-is-the-answer trap the wrapper's
+    `global_best_sq` seeding already documents** (seeded at exactly `upper_bound ** 2` the pair
+    achieving the bound is skipped — hence the `1 + 1e-4` bump), one level down and unnoticed
+    because the seed comment reads as being about the *seed*. The fix is `if block_best <
+    out_distance_sq[f]`: the grid pass's partial answer is a real distance between two real
+    triangles, so the smaller of the two is always better and never wrong. It also makes the tiled
+    pass **safe** against the overrun above, which the index guard alone cannot be — a round that
+    dropped primitives now leaves the first pass's answer standing instead of replacing it with a
+    worse one.
+
+  Two method notes from finding it. **The scan meshes cannot reach it**: only 0.02-0.5 % of their
+  faces overflow the cap, where this fixture overflows 100 %, so the whole benchmark suite and the
+  whole test suite were green against it. And **the CPU device was the oracle** — it disables the
+  cap and runs no second pass, so `cpu` answered correctly throughout while `cuda` did not, which is
+  §7.2's two-device rule paying off on a function whose device paths differ by design. A serial
+  uncapped straggler pass was also built, is correct by construction, and was **reverted at 0.19x**
+  on `bunny` (3.10 → 16.28 ms): §14.2's load imbalance is real and the block-cooperative walk earns
+  its place.
 - **OPEN: `mesh_to_mesh_distance[lucy]`'s 105x for 26x the faces is NOT the load imbalance.**
   Instrumented at 28 055 742 faces: pass 1 (thread per face, cap 64) is **14.5 ms**, **zero** faces
   overflow the cap, and pass 2 is 0.003 ms — against 789-853 ms for the whole call. So the traversal

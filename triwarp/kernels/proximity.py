@@ -598,8 +598,30 @@ def face_to_mesh_distance_tiled(
     # ``tile_argmin``'s second stage is for. When no lane found a candidate every lane still holds
     # ``(inf, -1)``, so it returns -1 and no fixup is needed here.
     block_best, block_witness = tile_argmin(best, witness)
-    out_distance_sq[f] = block_best
-    out_witness[f] = block_witness
+    # **``<``, not an overwrite, and that is a correctness fix rather than a tidy-up.** What the
+    # grid pass left in ``out_distance_sq[f]`` is a *partial* answer -- the best over its first
+    # ``candidate_cap`` candidates -- but it is a real distance between two real triangles, so the
+    # smaller of the two is always the better answer and never a wrong one.
+    #
+    # Overwriting loses it, and loses it in exactly the case that matters.
+    # ``face_pair_distance_sq`` skips a candidate whose box gap is ``>=`` its limit, and the limit
+    # here is the *running global minimum* -- which, by the time this pass runs, is frequently the
+    # answer itself, published by this very face in the grid pass. Its re-walk then prunes every
+    # candidate including the pair that achieved it, comes back ``inf``, and overwrites the right
+    # answer with it. Measured before the fix: ``mesh_to_mesh_distance`` between two unit sheets
+    # 0.3 apart returned **inf** on CUDA from **512 faces** up -- every face overflows the cap, so
+    # every face is re-walked -- where the cpu device, which runs no second pass at all, returned
+    # 0.300000. This is the identical bound-is-the-answer trap the ``global_best_sq`` seeding in
+    # the wrapper documents, one level down: there the fix is a relative bump on the seed, here it
+    # is keeping what the first pass already found.
+    #
+    # It is also what makes this pass **safe against the ``wp.tile_bvh_query_aabb`` result-buffer
+    # overrun** the guard above can only half-fix (CLAUDE.md section 12.2): a round that silently
+    # dropped primitives now leaves the grid pass's answer standing instead of replacing it with a
+    # worse one, so an overrun can cost accuracy but can no longer cost correctness outright.
+    if block_best < out_distance_sq[f]:
+        out_distance_sq[f] = block_best
+        out_witness[f] = block_witness
 
 
 @wp.kernel
