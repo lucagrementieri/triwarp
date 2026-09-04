@@ -5361,6 +5361,34 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   read dominance 1.00-1.20, far below `CG_MULTIGRID_SIZE_FLOOR = 1.9`, so `"auto"` declines them. It
   flips only for a caller that solves **four or more** times against one `heat_operators`; no in-repo
   caller does, so §4.2 says do not build the keyword. Re-open this if one appears.
+- **The same decline extends to a sixth operator: the connection-Laplacian vector-heat system
+  `heat.vector_heat_operators` builds (`M + t * L_connection`, `wp.mat22d` blocks), which
+  `heat.transport_tangent_vectors` / `heat.vector_heat_scale` solve via `solve_spd` — a function that
+  has never been wired to the `"auto"` gate at all (unlike `solve_spd_columns`).** Measured (Warp
+  1.17, RTX 5090) by expanding the block CSR to its scalar-equivalent 2n x 2n matrix and applying
+  `_offdiagonal_dominance`'s exact formula (cross-checked bit-for-bit against the kernel on the
+  scalar heat operator built alongside it, same call):
+
+  | mesh | n_vertices | connection-Laplacian dominance | scalar heat-operator dominance |
+  |---|---|---|---|
+  | `sphere_small` | 2 562 | 1.14 | 0.85 |
+  | `sphere_med` | 40 962 | 1.14 | 0.85 |
+  | `saddle` | 17 689 | 1.23 | 1.00 |
+  | `saddle_graded` | 17 689 | 1.10 | 1.00 |
+
+  Every value sits below `CG_MULTIGRID_SIZE_FLOOR = 1.9`, so `"auto"` would decline all four even at
+  `solve_spd_columns`-scale unknown counts — wiring `solve_spd` to the gate has nothing to fire on for
+  either loss row (`transport_tangent_vectors[saddle/saddle_graded]`,
+  `vector_heat_scale[sphere_small]`). **Do not wire `solve_spd` to `"auto"` on this evidence.**
+
+  **And the gate could not have fired even if dominance had cleared it, which changes this from a
+  small wiring change to a large one**: `multigrid_preconditioner` / `_multigrid_hierarchy` /
+  `_offdiagonal_dominance`'s own kernel all take `wps.BsrMatrix[wp.float64]` — scalar blocks only —
+  and the aggregation/prolongation/`bsr_mm` chain underneath assumes a scalar CSR throughout. A
+  `wp.mat22d`-block operator would need a block-generalized hierarchy (block Gershgorin for strength
+  of connection, block aggregation, block prolongation), not a one-line dispatch change. Re-open this
+  only alongside that generalization, and only if a future caller solves the *same* connection
+  Laplacian four or more times (§4.2 — no in-repo caller does today).
 - **OPEN: `robust_laplacian` keeps a -16 off-diagonal on Dini's surface although
   `intrinsic_delaunay` reports convergence.** On `parametric_surface("dini")` (40x40, 1600 vertices,
   edge lengths 3.3e-4 to 4.02 — a 12 000:1 ratio, face areas 5.4e-5 to 0.033), `robust_laplacian` with
@@ -5378,6 +5406,56 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
 - **`smoothing`'s two conditional-emit triplet writers must `rows.fill_(n_rows)` before launch** —
   §12.7, measured 31.8x and 9.1x. `holes.fill_smooth` reaches both through
   `smoothing.refine_and_smooth_region`, so one fix lands on three benchmark rows.
+- **SHIPPED: block conjugate gradient (`linalg._BlockCg2`) for exactly two columns under
+  `preconditioner="diag"`.** Classical block CG (O'Leary 1980), sharing one Krylov subspace across
+  the two columns instead of `_BatchedCg`'s independent-per-column one — the scalar `alpha` / `beta`
+  of a two-column CG iteration become 2x2 dense matrices, solved fresh every iteration by
+  `kernel_cg.solve_sym2x2`. Reaches `harmonic`/`tutte` at `k = 1` (always `"diag"`) and `arap`'s
+  global step (`spd_column_solver`, default `"diag"`) — the only two in-repo `n_columns == 2`
+  callers.
+  - **The system the mechanism was first probed on (`plans/benchmark-round-11.md` section 2,
+    outside Warp, scipy) is not the system it actually reaches.** `harmonic`'s `k = 2` interior
+    system measured a 1.740x / 1.735x iteration reduction at `saddle_small` / `saddle`, but that
+    system's off-diagonal dominance (2.63 / 2.66) clears `CG_MULTIGRID_DOMINANCE` and it is solved
+    with a multigrid V-cycle in production, never Jacobi — `_BlockCg2` has no multigrid variant
+    (see below), so it is never reached there. Re-measured on the system that *is* reached —
+    `harmonic`'s `k = 1` system, always `"diag"` — the same probe gives a smaller but real **1.300x
+    / 1.291x** (182/355 independent worst-column iterations against 140/275 block,
+    `saddle_small`/`saddle`). **Always re-probe on the system the gate you are wiring into actually
+    reaches, not the one that was convenient to capture first.**
+  - **End to end, interleaved same-process A/B (§15.6/§15.7), production call shape
+    (`parametrization.harmonic(..., k=1)`, `check_every=0`, i.e. graph-captured on CUDA and the
+    host-driven `CG_CHECK_EVERY_FALLBACK` loop on CPU): 1.05x / 1.05x on CUDA
+    (`saddle_small`/`saddle`), 1.46x / 1.45x on CPU.** The CUDA number is modest because block CG's
+    iteration is 11 launches against `_BatchedCg`'s 9 for the same `n_columns = 2` system (two extra
+    2x2-solve launches, `block_cg_solve_alpha`/`block_cg_solve_beta`, needed because Warp exposes no
+    grid-wide barrier — §12.2 — so a Gram reduction's three block-scattered partial sums can only be
+    consumed by a *subsequent* launch, never folded into the finalize that produced them). A 1.30x
+    iteration reduction against ~1.22x more launches nets to ~1.06x, matching what was measured. The
+    larger CPU win is the host-driven-loop regime (`check_every` falls back off `wp.capture_while`
+    on a non-CUDA device), where the extra launches cost less relative to the iterations saved.
+  - **No multigrid variant, and none is planned without new evidence.** `_BatchedCg`'s
+    `preconditioner="multigrid"` branch is not carried over — the probe never touched it, `M^-1` no
+    longer being a per-column elementwise multiply changes what "one shared Krylov subspace" even
+    means, and the existing dominance gate already wins more there (1.42-2.92x at `k = 2`) than this
+    mechanism has been measured to win anywhere. `_cg_columns` therefore gates on
+    `n_columns == 2 and preconditioner == "diag"` literally — never `"auto"` resolving to
+    `"multigrid"`, and never three or more columns (`smooth_region`'s `x, y, z` was never probed).
+  - **The near-rank-deficiency guard is a Tikhonov floor on the 2x2 Gram's diagonal
+    (`kernel_cg.solve_sym2x2`, `BLOCK_CG_REG_EPS = 1e-10` relative to the trace), not a deflation.**
+    It keeps the iteration finite when the block's two directions go nearly parallel but does not
+    recover a real two-column convergence rate on a genuinely rank-deficient block — pinned by
+    `test_block_cg_identical_columns_does_not_diverge` (two literally identical right-hand-side
+    columns, the worst case reachable), which asserts finiteness and the correct answer, not a tight
+    bound. No pathological input has been found in this package's own solves that reaches this path
+    for real: `harmonic`/`tutte`'s `u`, `v` boundary data and `arap`'s rotation-fitted right-hand
+    side are unrelated functions by construction.
+  - **Verified correct against `_BatchedCg` on real captured systems** (both devices,
+    `check_every` in `{0, 10}`): final solutions agree to ≤1e-9 relative, both converge under the
+    requested tolerance, and block CG's own iteration count is strictly lower in every cell
+    measured — `tests/test_linalg.py::test_block_cg_matches_independent_columns_and_needs_fewer_iterations`
+    pins the mechanism as a regression guard (a silent fallback to independent columns would still
+    pass an `<=` bound but not a strict `<`).
 
 ### 16.9 The 0.3-5.0 ms loss band, attributed
 

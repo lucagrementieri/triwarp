@@ -309,6 +309,123 @@ def test_solve_spd_columns_agrees_across_column_counts(device: str, n_rhs: int) 
     )
 
 
+def test_solve_spd_columns_two_columns_reaches_block_cg(device: str) -> None:
+    """
+    Triwarp against triwarp: the dispatch itself, not just the answer it produces.
+
+    Exactly two columns under ``"diag"`` must build a ``linalg._BlockCg2``, not
+    ``linalg._BatchedCg`` -- the class the rest of this module's block-CG tests exercise directly.
+    A wrong gate here would still converge to the right answer (both classes solve the same
+    system) and every other test would stay green, which is why the gate needs its own assert.
+    """
+    matrix_wp, rhs_wp, _dense, _rhs = _spd_system(device, n_rhs=2)
+    solution_wp = wp.zeros_like(rhs_wp)
+    solver = tw.linalg.spd_column_solver(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
+    assert isinstance(solver, tw.linalg._BlockCg2)
+
+
+@pytest.mark.parametrize("n", [255, 256, 257, 511, 512, 513])
+def test_block_cg_across_the_reduction_tile_boundary(device: str, n: int) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``.
+
+    Same boundary ``test_solve_spd_columns_across_the_reduction_tile_boundary`` pins for
+    ``_BatchedCg``, run again at ``n_rhs=2`` so it actually reaches ``_BlockCg2`` -- that class
+    computes its own padded ``stride`` rather than sharing ``_BatchedCg``'s, so a mistake in its
+    padding arithmetic is invisible to the ``n_rhs=3`` default every other tile-boundary case uses.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device, n=n, n_rhs=2)
+    solution_wp = wp.zeros_like(rhs_wp)
+    tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
+    assert np.allclose(
+        solution_wp.numpy(), np.linalg.solve(dense_np, rhs_np.T).T, rtol=1e-5, atol=1e-5
+    )
+
+
+def test_block_cg_matches_independent_columns_and_needs_fewer_iterations(device: str) -> None:
+    """
+    Triwarp against triwarp: ``_BlockCg2``'s shared-subspace iteration against ``_BatchedCg``'s.
+
+    Both must converge to the same answer -- they solve the same linear system, just through
+    different Krylov subspaces -- and ``_BlockCg2`` must do it in *at most* as many iterations,
+    which is the mechanism the class exists for (``plans/benchmark-round-11.md`` section 2's probe,
+    reproduced here as a regression guard rather than as the probe's own scipy comparison). A
+    strict improvement is asserted, not just a bound, because a change that silently fell back to
+    running the two columns independently would still pass an ``<=`` check that allowed equality.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _grid_laplacian_system(device, k=40, n_rhs=2, shift=1e-6)
+    solution_np = np.linalg.solve(dense_np, rhs_np.T).T
+
+    block_solution = wp.zeros_like(rhs_wp)
+    block_iterations, _residual, _tol = tw.linalg._BlockCg2(
+        matrix_wp,
+        rhs_wp,
+        twt.as_array2d(block_solution, wp.float64),
+        tol=1e-10,
+        maxiter=40_000,
+        check_every=1,
+    )()
+
+    batched_solution = wp.zeros_like(rhs_wp)
+    batched_iterations, _residual, _tol = tw.linalg._BatchedCg(
+        matrix_wp,
+        rhs_wp,
+        twt.as_array2d(batched_solution, wp.float64),
+        tol=1e-10,
+        maxiter=40_000,
+        check_every=1,
+        preconditioner="diag",
+    )()
+
+    assert np.allclose(block_solution.numpy(), solution_np, rtol=1e-5, atol=1e-5)
+    assert np.allclose(batched_solution.numpy(), solution_np, rtol=1e-5, atol=1e-5)
+    assert block_iterations < batched_iterations, (
+        f"block CG ({block_iterations} it) must need fewer iterations than independent columns "
+        f"({batched_iterations} it) on a shared-subspace-friendly system"
+    )
+
+
+def test_block_cg_multigrid_preconditioner_bypasses_block_cg(device: str) -> None:
+    """
+    Triwarp against triwarp: two columns under ``preconditioner="multigrid"`` must bypass block CG.
+
+    ``_BlockCg2`` carries no multigrid variant (see its own Notes), so the dispatch has to keep
+    routing to ``_BatchedCg`` there regardless of the column count.
+    """
+    matrix_wp, rhs_wp, _dense, _rhs = _grid_laplacian_system(device, k=24, n_rhs=2)
+    squared_wp = wps.bsr_mm(matrix_wp, matrix_wp)
+    solution_wp = wp.zeros_like(rhs_wp)
+    solver = tw.linalg.spd_column_solver(
+        squared_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), preconditioner="multigrid"
+    )
+    assert isinstance(solver, tw.linalg._BatchedCg)
+
+
+def test_block_cg_identical_columns_does_not_diverge(device: str) -> None:
+    """
+    Not a library comparison: no reference runs a block Krylov method, so this pins the guard.
+
+    The near-rank-deficiency guard is ``kernels.algorithms.conjugate_gradient.solve_sym2x2``. Two
+    identical right-hand-side columns are the worst case block CG's mechanism can be handed --
+    the two directions are parallel from the very first iteration, not just nearly so -- and the
+    guard's job is only to keep the iteration finite, not to recover a real two-column convergence
+    rate on a degenerate block (see ``_BlockCg2``'s own Notes on that limit). The regression this
+    catches is a ``NaN`` / ``inf`` from an unguarded 2x2 solve, not a tight numerical bound.
+    """
+    matrix_wp, _rhs_wp, dense_np, rhs_np = _spd_system(device, n_rhs=1)
+    rhs_two_np = np.concatenate([rhs_np, rhs_np], axis=0)
+    rhs_two_wp = wp.array(np.ascontiguousarray(rhs_two_np), dtype=wp.float64, device=device)
+    solution_wp = wp.zeros((2, dense_np.shape[0]), dtype=wp.float64, device=device)
+    tw.linalg.solve_spd_columns(
+        matrix_wp, twt.as_array2d(rhs_two_wp, wp.float64), twt.as_array2d(solution_wp, wp.float64)
+    )
+    solution_np = solution_wp.numpy()
+    assert np.all(np.isfinite(solution_np))
+    expected_np = np.linalg.solve(dense_np, rhs_np.T).T
+    assert np.allclose(solution_np[0], expected_np[0], rtol=1e-4, atol=1e-4)
+    assert np.allclose(solution_np[1], expected_np[0], rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.parametrize("check_every", [1, 25, 0])
 def test_solve_spd_columns_check_every_is_solution_invariant(device: str, check_every: int) -> None:
     # ``check_every`` only changes how often the residual is tested (``0`` tests it on device via
