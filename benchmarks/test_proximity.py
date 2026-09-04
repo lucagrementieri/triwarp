@@ -286,13 +286,18 @@ def test_closest_point_on_mesh(bench_case: BenchCase) -> None:
 
     **The per-query cost is not flat in the mesh, and the knee is between 1 M and 28 M faces.**
     This group holds its query count fixed, so the effect shows up in a *caller* instead --
-    ``mesh_to_mesh_distance``, which derives its bound by querying at every vertex of one mesh.
-    Measured there, with the ``wp.Mesh`` build separated out: **26.5 ns** per query at 36k queries
-    against ``bunny``, **5.4** at 438k / ``dragon``, **10.2** at 544k / ``happy_buddha`` and
+    ``mesh_to_mesh_distance``, which used to derive its bound by querying at every vertex of one
+    mesh. Measured there, with the ``wp.Mesh`` build separated out: **26.5 ns** per query at 36k
+    queries against ``bunny``, **5.4** at 438k / ``dragon``, **10.2** at 544k / ``happy_buddha`` and
     **58.3** at 14 M / ``lucy`` -- while the build itself stays linear (0.26 / 0.97 / 1.05 /
     31.61 ms). The first number is launch overhead at a small dim; the last is a cache cliff, the
     BVH having stopped fitting. It is worth knowing before reading any large-mesh row that ends in a
     closest-point query as an algorithm result.
+
+    That cliff is why the caller no longer queries every vertex: 14 M of them cost 93 % of its call
+    to prune a traversal worth 0.8 % of it, and a subsample bounds the answer just as soundly
+    (``proximity._BOUND_SAMPLE_TARGET`` carries the sweep). This group is the one that still prices
+    the unsampled query, which is what keeps that cliff visible.
     """
     if bench_case.kind == "pyvista":
         # 160 / 376 / 906 ms per 10 000-query call on bunny_decimated / bunny / dragon: VTK's

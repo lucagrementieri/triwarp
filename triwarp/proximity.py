@@ -91,6 +91,38 @@ _MIN_POSITIVE_FLOAT32 = 1.1754943508222875e-38
 # becomes the launch's critical path.
 _QUERY_CANDIDATE_CAP = 64
 
+# Query points to draw from mesh A when deriving ``mesh_to_mesh_distance``'s own upper bound. The
+# bound only has to be an upper bound -- it seeds the broad phase's prune limit and nothing else --
+# so a *subsample* of A's vertices is as correct as all of them and merely looser, and the whole
+# question is what a looser bound costs the traversal it is paying for.
+#
+# It costs almost nothing, and the bound was almost the whole call. Stage-attributed at the
+# benchmark's own operating point (a disjoint copy at 1.2x the x-extent), warm, one call between
+# two syncs: on ``lucy`` the vertex query is a single kernel at **702.78 ms of a 758.47 ms call --
+# 93.1 %** -- against 31.6 ms for the ``wp.Mesh`` build and **6.1 ms for both traversal passes
+# together**. Fourteen million vertex queries were being paid to prune a walk that costs 0.8 % of
+# the call.
+#
+# Interleaved against the full-vertex bound, warm, min of 5, distance and ``face_a`` identical in
+# every cell:
+#
+#     target      bunny        dragon      happy_buddha
+#     2 048       1.00-1.02x   1.14-1.24x  1.38-1.45x
+#     16 384      1.02-1.03x   1.16-1.24x  1.30-1.36x
+#     65 536      --           1.16-1.18x  1.31-1.37x
+#
+# and ``lucy`` at 16 384 measures **9.32x** (638.53 -> 68.51 ms) with the distance *and* both
+# witness faces identical. The sweep is flat because the bound barely loosens -- 0.0464651 against
+# an exact 0.0459145 at 2 048 points on ``dragon``, 1.2 % -- so the traversal is handed almost the
+# same limit for a thousandth of the queries. The value is therefore not sharp; 16 384 sits in the
+# flat middle with margin at both ends, and it is a *count* rather than a fraction so the saving
+# grows with the mesh, which is where it is needed.
+#
+# A stride, not a random draw: it is deterministic, needs no RNG and no gather, and a strided view
+# is a legal kernel argument (section 3.4's hazard is Python-scope *index* gathers, which this is
+# not). A pathological vertex ordering can only make the bound looser, never wrong.
+_BOUND_SAMPLE_TARGET = 16_384
+
 # Block width for that second pass: one warp per straggler face. Wider blocks were not measured to
 # help, and a warp is what
 # [`ball_pivoting`][triwarp.reconstruction.ball_pivoting]'s pivot search settled on for the same
@@ -344,12 +376,15 @@ def mesh_to_mesh_distance(
     clearance between edge interiors, and every vertex of each is further from the other than
     that.
 
-    Two phases. An upper bound comes first -- the smallest distance from a vertex of ``A`` to ``B``,
-    which is a real distance between the surfaces and therefore an upper bound on their minimum.
-    Then every face of ``A`` queries a BVH over ``B``'s faces with its own bounding box grown by
-    that bound, and each candidate pair gets the exact triangle-triangle distance. The bound is what
-    makes the broad phase sound rather than heuristic: the true minimum is at most the bound, so the
-    pair achieving it has boxes within that distance and cannot be culled.
+    Two phases. An upper bound comes first -- the smallest distance from a *sample* of ``A``'s
+    vertices to ``B``, which is a real distance between the surfaces and therefore an upper bound on
+    their minimum. Then every face of ``A`` queries a BVH over ``B``'s faces with its own bounding
+    box grown by that bound, and each candidate pair gets the exact triangle-triangle distance. The
+    bound is what makes the broad phase sound rather than heuristic: the true minimum is at most the
+    bound, so the pair achieving it has boxes within that distance and cannot be culled -- and that
+    argument needs an upper bound rather than a *tight* one, which is why sampling is sound and why
+    supplying your own coarse ``upper_bound`` is too. The returned distance is exact either way; a
+    looser bound only leaves more candidates for the narrow phase to reject.
 
     Parameters
     ----------
@@ -414,9 +449,14 @@ def mesh_to_mesh_distance(
     if upper_bound is None:
         # A vertex-to-surface distance is a distance between the surfaces, so its minimum bounds the
         # answer from above. One readback, and it is what lets the broad phase cull at all.
-        _points, distances, _faces = closest_point_on_mesh(
-            vertices_b, faces_b, vertices_a, mesh=mesh_b
-        )
+        #
+        # Over a *subsample* of A's vertices, because a minimum over a subset is still an upper
+        # bound and this query was 93 % of the call on ``lucy`` -- see ``_BOUND_SAMPLE_TARGET`` for
+        # the attribution and the sweep. A looser limit prunes less, so the traversal examines a
+        # superset of the candidates it did before and its minimum is the same value.
+        stride = max(1, int(vertices_a.shape[0]) // _BOUND_SAMPLE_TARGET)
+        probe = vertices_a if stride == 1 else vertices_a[::stride]
+        _points, distances, _faces = closest_point_on_mesh(vertices_b, faces_b, probe, mesh=mesh_b)
         upper_bound = float(tw.reduce.min(distances))
 
     # The per-face AABBs stay: the kernel's box-gap prune reads them, so they are not merely the

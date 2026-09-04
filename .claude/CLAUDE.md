@@ -4979,6 +4979,44 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   18.1 of the call. The per-face AABBs stay (the kernel's box-gap prune reads them), and Warp's own
   leaf policy (vs `leaf_size=4`) did not cost the traversal. **The operating point decided this
   item's sign** — §15.3.
+- **CLOSED: `mesh_to_mesh_distance`'s cost was its own upper bound, and the bound did not need
+  every vertex.** The remainder §16.1 had as "the structure builds and the bound" is 93.1 % **the
+  bound alone**, and it is one kernel: stage-attributed on `lucy` at the benchmark's own operating
+  point (a disjoint copy at 1.2x the x-extent), warm, one call between two syncs — the vertex query
+  is **702.78 ms of a 758.47 ms call**, against 31.58 ms (4.2 %) for the `wp.Mesh` build and
+  **6.13 ms (0.8 %) for both traversal passes together**. Fourteen million closest-point queries
+  were being paid to prune a walk worth under a percent of the call.
+
+  The bound only seeds the broad phase's prune limit, so a **subsample** of A's vertices is exactly
+  as sound and merely looser — and it barely loosens, because the nearest approach is not a rare
+  event on a surface: 0.0464651 against an exact 0.0459145 from **2 048** of `dragon`'s 437 645
+  vertices, 1.2 %. Shipped as `proximity._BOUND_SAMPLE_TARGET = 16_384` (a stride, so no RNG and no
+  gather). A/B against a detached baseline worktree, interleaved, min of 5, at both benchmarked
+  offsets:
+
+  | mesh | near | far |
+  |---|---|---|
+  | `bunny` (35 947 v) | 0.99x | 0.98x |
+  | `dragon` (437 645) | 1.22x | 1.12x |
+  | `happy_buddha` (543 652) | 1.36x | 1.37x |
+  | **`lucy` (14 027 872)** | **10.1x** (744.3 → 73.5 ms) | **9.06x** (651.9 → 72.0) |
+
+  The distance is **bit-identical in all eight cells** and so is `face_a`; `face_b` differs in the
+  two `happy_buddha` cells, which is the tie the function's own Notes already declare unspecified.
+  Bit-identity is not luck — a looser limit prunes *less*, so the narrow phase sees a superset of
+  the candidates it saw before and the minimum over a superset containing the argmin is the same
+  float. The gain grows with the mesh because the removed work does and the rest does not, which is
+  the opposite of §9's falling-share decline; the target is a *count* for that reason.
+
+  **The sweep is flat and that is the useful part** — 1.14-1.24x on `dragon` and 1.27-1.45x on
+  `happy_buddha` across targets from 2 048 to 65 536 — so 16 384 is a middle with margin rather
+  than a tuned optimum, and it does not need re-probing after an upgrade. One earlier reading of
+  0.88x at 1 024 points on `dragon` was an **unwarmed** arm and does not reproduce.
+
+  **It also uncovered a platform defect that gates it**: widening the query box is what first
+  reaches `wp.tile_bvh_query_aabb`'s result-buffer overrun (§12.2), which faults deterministically
+  on `lucy[near]` — through the *public* `upper_bound=` parameter on the shipping code, before this
+  change existed. The bound-check went in first, as its own commit.
 - **OPEN: `mesh_to_mesh_distance[lucy]`'s 105x for 26x the faces is NOT the load imbalance.**
   Instrumented at 28 055 742 faces: pass 1 (thread per face, cap 64) is **14.5 ms**, **zero** faces
   overflow the cap, and pass 2 is 0.003 ms — against 789-853 ms for the whole call. So the traversal
