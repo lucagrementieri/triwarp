@@ -5011,18 +5011,43 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
     about *whether both reduce*. Applying triwarp's detector to **both** outputs settles it in one
     call. That is §7.7's rule — ask what the reference was handed and whether it finished the job —
     and the benchmark's own assert (`numValidFaces() > 0`) could not see it.
-  - **The cost attribution for the local path is unaffected and still stands**, because it was
-    measured against triwarp's own launches rather than against the reference. At its benchmarked
-    input (163 840 faces): `face_self_intersecting_mask` is **1.321 ms — 1.0 % of the call**, so the
-    detector is not the cost; one delete-and-refill round leaves **5 rims whose longest is 642
-    vertices**, paid three times by `max_iter=3`, so the cost is three min-weight DP sweeps at
-    `2 * (max_rim - 2)` launches each, and that sweep is launch-bound. **Four refuted levers:**
-    graph capture of the chain (a once-through loop records and replays once, 0.84x); the DP block
-    knob (it ships, but is gated on a narrow grid and this row's 5 rims miss it by one — forcing the
-    gate open measured **1.01x**); one persistent block per loop (built and reverted, 0.03-0.89x);
-    and the scope-discount argument above, now superseded rather than refuted. It waits on the one
-    unbuilt item: a **blocked interval DP** — and the rim measurement it needs (5 rims, longest 642)
-    is already here, so that item starts from a number.
+  - **REFUTED: the DP is not this row's cost, and every DP lever is capped at 4-10 %.** The
+    attribution above was taken on the retired two-sphere fixture and its "the cost is three
+    min-weight DP sweeps … and that sweep is launch-bound" does **not** transfer to the `tangle`
+    axis this group now runs on. Re-measured stage by stage on the benchmark's own inputs
+    (`_run_hole_dp`, `delete_region_keep_boundary`, `subdivide_region_to_size` and both smoothers
+    wrapped, warm, one call between two syncs):
+
+    | stage | `tangle_torus_small` (8 192 f, 47.1 ms) | `tangle_torus` (163 840 f, 209.5 ms) |
+    |---|---|---|
+    | `refill_region` | 43.56 ms (92.5 %) | 194.54 ms (92.9 %) |
+    |  `smooth_region` (least squares) | 19.54 (41.5 %) | 79.90 (38.1 %) |
+    |  `subdivide_region_to_size` | 10.80 (22.9 %) | 53.42 (25.5 %) |
+    |  `smooth_region_fixed_rim` | 5.07 (10.8 %) | 15.91 (7.6 %) |
+    |  **the min-weight DP sweep** | **1.88 (4.0 %)** | **21.27 (10.2 %)** |
+    |  `delete_region_keep_boundary` | 3.79 (8.0 %) | 13.32 (6.4 %) |
+    | `_dilate_face_mask` | 1.69 (3.6 %) | 6.86 (3.3 %) |
+    | `face_self_intersecting_mask` | 1.59 (3.4 %) | 6.79 (3.2 %) |
+
+    **The rims are short.** One pass opens 4 rims of 64 vertices on the small mesh, and 4-6 rims of
+    at most 327 on the large one (top sizes `[321, 321, 203, 54, 52, 43]`, median 128, over 4 DP
+    calls) — not the "5 rims, longest 642" the retired fixture produced. So a **bounded candidate
+    search** (MeshLib's `getOptimalSteps` caps the apex scan at ~20 past
+    `maxPolygonSubdivisions`, making the DP `O(n²·20)` rather than `O(n³)`) is worth nothing at
+    `max_size` 64 and at most a fraction of 10.2 % at 327 — while costing `fill_min_weight`'s
+    documented exactness. The **blocked interval DP** is bounded by the same 4-10 %: it removes
+    launches from a sweep that is already a tenth of the call. Both are declined **for this row**;
+    the blocked DP remains open for `fill_min_weight` / `fill_smooth`'s own long-rim groups, where
+    the sweep *is* the call.
+  - **What is left is the smoother and the refiner, 64-72 % between them**, and that is where a
+    lever for this row has to come from. `face_self_intersecting_mask` is 3.2-3.4 %, so the
+    detector is still not the cost. **Four refuted levers, unchanged:** graph capture of the chain
+    (a once-through loop records and replays once, 0.84x); the DP block knob (it ships, but is
+    gated on a narrow grid); one persistent block per loop (built and reverted, 0.03-0.89x); and
+    the scope-discount argument above, superseded rather than refuted. **A fifth, already
+    recorded elsewhere:** §16.8 measured `refill_region`'s patch solves at dominance 2.69-4.02 and
+    found all four *lose* under a forced multigrid hierarchy, because a 17-25 ms setup is most of
+    a patch solve — so the 38-41 % `smooth_region` share is not reachable that way either.
   - The `voxel` sibling on the identical input is a **5.19x win** (17.3 ms against meshlib's 90.0,
     re-measured), and meshlib genuinely repairs there, so **the method choice — not the method's
     implementation — is still the available answer for a caller today.**
