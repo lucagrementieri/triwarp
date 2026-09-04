@@ -66,6 +66,7 @@ import numpy as np
 import potpourri3d as pp3d
 import pytest
 import pytorch3d.ops as p3d_ops
+import torch
 import trimesh as tm
 import trimesh.smoothing as tms
 import warp as wp
@@ -161,6 +162,64 @@ def _edges_unique_wp(bench_case: BenchCase) -> twt.Array2dInt32:
     return _edges_wp_cache[key]
 
 
+def _assembled_p3d(matrix: torch.Tensor, *, normalize: bool = False) -> torch.Tensor:
+    """
+    Finish the assembly ``ops``' Laplacians defer, so the row prices a matrix and not a promise.
+
+    Every ``ops`` assembler returns an **uncoalesced** ``sparse_coo_tensor`` -- a bag of
+    ``(index, value)`` pairs in scatter order -- where triwarp returns a ``BsrMatrix``, a sorted
+    CSR with unique columns. ``bsr_from_triplets`` does that sort and dedup eagerly; ``.coalesce()``
+    is where torch does the same work. A row that omits it compares an assembly against a scatter,
+    which is the same misreading ``_packed_p3d`` describes for the edge lists, arriving by a
+    different route: there one side was handed a precomputed input, here one side is let off the
+    output.
+
+    The deferral is not a discount invented for this file. ``cot_laplacian`` builds ``6F`` entries
+    in which every interior edge appears **twice**, so coalescing takes ``dragon``'s 5 228 484
+    entries to 2 618 512 -- the duplicate sum is *deferred*, not avoided, and ``to_dense`` pays it
+    on first read. The two edge-list assemblers carry no duplicates (``_nnz()`` is unchanged by the
+    call) and pay only the sort, which is still the difference between a scatter and a CSR.
+
+    ``normalize`` adds the row-sum division that separates ``norm_laplacian`` from
+    ``laplacian(equal_weight=False)``: the same transform
+    [`test_laplacian_operators_match_pytorch3d`](../tests/test_laplacian.py) names to make the two
+    matrices equal (measured 1.49e-08 there), in its sparse spelling.
+
+    Measured min of 9 interleaved reps of 5 calls, RTX 5090, milliseconds -- one probe covering all
+    three groups, so read it probe-to-probe and not against a harness number (§15.4):
+
+    | group | mesh | triwarp | p3d raw | + coalesce | + normalize |
+    |---|---|---|---|---|---|
+    | ``cotmatrix`` | bunny_decimated | 0.448 | 0.453 | **0.584** | -- |
+    | | bunny | 0.487 | 0.474 | **0.666** | -- |
+    | | dragon | 2.418 | 0.677 | **3.017** | -- |
+    | | happy_buddha | 3.086 | 0.825 | **3.907** | -- |
+    | ``laplacian_equal_weight`` | bunny_decimated | 0.472 | 0.322 | **0.439** | -- |
+    | | bunny | 0.487 | 0.371 | **0.518** | -- |
+    | | dragon | 0.575 | 0.873 | **2.083** | -- |
+    | | happy_buddha | 0.682 | 1.145 | **2.852** | -- |
+    | ``laplacian_inverse_distance`` | bunny_decimated | 0.428 | 0.125 | 0.252 | **0.443** |
+    | | bunny | 0.432 | 0.127 | 0.297 | **0.521** |
+    | | dragon | 0.529 | 0.176 | 1.153 | **1.809** |
+    | | happy_buddha | 0.631 | 0.223 | 1.511 | **2.361** |
+
+    ``lucy`` is measured separately because holding three triwarp operators and the torch tensors
+    at once does not fit: on the torch side alone ``cot_laplacian`` is 28.3 ms raw and **128.0 ms**
+    coalesced, at an unchanged **10.41 GiB** peak (``max_memory_allocated``, 168 334 452 entries to
+    84 167 282). So the leveling needs no ``skip_larger_than`` cap of its own -- the peak is the raw
+    call's, which this module already runs.
+    """
+    coalesced = matrix.coalesce()
+    if not normalize:
+        return coalesced
+    row_sums = torch.sparse.sum(coalesced, dim=1).to_dense()
+    row_sums = torch.where(row_sums == 0.0, torch.ones_like(row_sums), row_sums)
+    indices = coalesced.indices()
+    return torch.sparse_coo_tensor(
+        indices, coalesced.values() / row_sums[indices[0]], coalesced.shape, dtype=torch.float32
+    )
+
+
 @pytest.mark.benchmark(group="cotmatrix_entries")
 @pytest.mark.benchlibs("triwarp", "igl")
 def test_cotmatrix_entries(bench_case: BenchCase) -> None:
@@ -197,38 +256,38 @@ def test_cotmatrix(bench_case: BenchCase) -> None:
     """
     Assembled cotangent stiffness matrix: weight kernel plus the sparse build.
 
-    **pytorch3d**'s ``cot_laplacian`` is the fourth assembly here and the only one on the GPU, and
-    its row is a **scope mismatch rather than a race** -- the same class as ``is_watertight``'s
-    cached ``isClosed`` and ``split``'s label-only ``getAllComponents``. It does not assemble a
-    matrix at all: it wraps ``3F`` entries as an *uncoalesced* ``sparse_coo_tensor`` and adds its
-    transpose, so the duplicate ``(i, j)`` pairs are never summed and no diagonal is ever written.
-    triwarp sorts, dedups and accumulates **12 triplets a face** into a CSR *with* its assembled
-    row sum.
+    **pytorch3d**'s ``cot_laplacian`` is the fourth assembly here and the only one on the GPU. It
+    does not assemble a matrix: it wraps ``3F`` entries as an *uncoalesced* ``sparse_coo_tensor``
+    and adds its transpose, so the duplicate ``(i, j)`` pairs are never summed and no diagonal is
+    ever written, where triwarp sorts, dedups and accumulates **12 triplets a face** into a CSR
+    *with* its assembled row sum. The row therefore times ``_assembled_p3d``, which finishes the
+    assembly -- and this row is why that helper exists.
 
-    Measured (min of 7 interleaved reps, RTX 5090), which is what settles it -- forcing the
-    reference to actually coalesce closes the whole gap:
+    The structure names the mechanism rather than merely being consistent with it: on ``dragon``
+    the uncoalesced tensor holds 5 228 484 entries (``6F``), coalescing it gives 2 618 512, and
+    triwarp's ``nnz_sync()`` is 3 056 157 -- a difference of **437 645, exactly the vertex
+    count**, which is the diagonal pytorch3d has none of (its coalesced diagonal measures absmax
+    **0**). So the leveled row still **flatters pytorch3d by a diagonal**: it is charged the sort
+    and the duplicate sum, not the row sum triwarp also assembles.
 
-    | mesh | triwarp | pytorch3d | + ``.coalesce()`` |
-    |---|---|---|---|
-    | bunny_decimated | 0.526 ms | 0.514 (1.02x) | 0.589 -- **triwarp wins 1.12x** |
-    | dragon | 3.363 | 0.728 (**4.62x**) | 3.042 -- **1.11x**, parity |
-
-    And the structure confirms the mechanism rather than merely being consistent with it: on
-    ``dragon`` the uncoalesced tensor holds 5 228 484 entries (``6F``), coalescing it gives
-    2 618 512, and triwarp's ``nnz_sync()`` is 3 056 157 -- a difference of **437 645, exactly the
-    vertex count**, which is the diagonal pytorch3d has none of. Its coalesced diagonal measures
-    absmax **0**.
-
-    So the reported 3.66-5.13x is not headroom, and the prebuilt-sparsity-pattern rewrite it
-    invited (assemble into an ``edges_unique`` pattern instead of sorting triplets) is **declined
-    on this measurement** rather than left as an open item. It also returns the lumped mass
-    reciprocal alongside, which is what ``mass_matrix``'s pytorch3d row times from the same call:
-    read those two as one call priced twice rather than as two independent measurements.
+    Even so the row inverts. Measured in the harness (round 10's own configuration, so read these
+    against its table and not against ``_assembled_p3d``'s probe, §15.4): a reported **1.24-5.23x
+    behind** becomes **1.76 / 1.58 / 0.96 / 0.96 / 1.22x** on
+    ``bunny_decimated`` / ``bunny`` / ``dragon`` / ``happy_buddha`` / ``lucy`` -- ahead on three,
+    and within the ±5 % session drift §15.7 documents on the other two. The
+    prebuilt-sparsity-pattern rewrite the old number invited (assemble into an ``edges_unique``
+    pattern instead of sorting triplets) is **declined on that measurement**: there was never a
+    gap to close. It also returns the lumped mass reciprocal alongside, which is what
+    ``mass_matrix``'s pytorch3d row times from the same call -- read those two as one call priced
+    twice, and note the two prices now differ by exactly this coalesce, which that row does not
+    need and does not pay.
     """
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "pytorch3d":
         vertices_p3d, faces_p3d = _packed_p3d(bench_case)
-        matrix_p3d, _ = bench_case.run(lambda: p3d_ops.cot_laplacian(vertices_p3d, faces_p3d))
+        matrix_p3d = bench_case.run(
+            lambda: _assembled_p3d(p3d_ops.cot_laplacian(vertices_p3d, faces_p3d)[0])
+        )
         assert matrix_p3d.shape == (n_vertices, n_vertices)
         return
     if bench_case.kind == "triwarp":
@@ -270,6 +329,15 @@ def test_laplacian_equal_weight(bench_case: BenchCase) -> None:
     read outside the timed callable -- that derivation is what ``edges_unique`` times in
     [`test_edges.py`](test_edges.py), and folding it in would price two groups under one name.
 
+    Its result is an **uncoalesced** COO, so the row times ``_assembled_p3d``; here the call is a
+    pure sort, since ``_nnz()`` is unchanged by it (this assembler writes no duplicate index).
+    Leveled, the harness reads **1.03x behind / 1.21 / 2.08 / 3.00 / 4.17x ahead** on
+    ``bunny_decimated`` / ``bunny`` / ``dragon`` / ``happy_buddha`` / ``lucy``, against a reported
+    1.00-1.81x behind on the four that were losses. Only the smallest mesh stays behind, and only
+    just, which is where both sides sit near the launch floor. The row still runs **against**
+    triwarp in one respect worth stating: pytorch3d writes ``V`` explicit ``-1`` diagonal entries
+    that triwarp does not (244 523 against 208 353 on ``bunny``), so it sorts 17 % more of them.
+
     This group needs no matching precomputation on the triwarp side, and the reason is worth
     stating because it is *not* symmetry with the inverse-distance group: ``equal_weight=True``
     takes the ``symmetric=False`` branch, whose triplets come straight off ``faces_to_edges`` --
@@ -279,7 +347,9 @@ def test_laplacian_equal_weight(bench_case: BenchCase) -> None:
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "pytorch3d":
         vertices_p3d, edges_p3d = _packed_p3d(bench_case, edges=True)
-        matrix_p3d = bench_case.run(lambda: p3d_ops.laplacian(vertices_p3d, edges_p3d))
+        matrix_p3d = bench_case.run(
+            lambda: _assembled_p3d(p3d_ops.laplacian(vertices_p3d, edges_p3d))
+        )
         assert matrix_p3d.shape == (n_vertices, n_vertices)
         return
     if bench_case.kind == "triwarp":
@@ -303,21 +373,30 @@ def test_laplacian_inverse_distance(bench_case: BenchCase) -> None:
     The same operator with inverse-edge-length weights (the geometry-dependent branch).
 
     **pytorch3d**'s ``norm_laplacian`` is this operator before its row normalization -- same
-    ``1 / (||vi - vj|| + 1e-12)`` weight, same literal ``eps`` -- so it does strictly less work
-    than triwarp's row by exactly one row-sum division.
+    ``1 / (||vi - vj|| + 1e-12)`` weight, same literal ``eps`` -- so it computes a *different
+    operator* until the division is applied, and returns it as an uncoalesced COO besides.
 
-    **The row-sum division is not what the ratio used to measure, though**, and saying it was is
+    **Neither of those is what the ratio used to measure, though**, and saying the division was is
     what let an 8.61x stand for five rounds. This is the ``symmetric`` branch, so triwarp derived
     the unique undirected edge set *inside* the timed call while pytorch3d was handed
     ``edges_packed()`` outside it -- and that derivation is up to **80 %** of the call, two orders
     of magnitude past a row-sum division. Both sides now take the same precomputed edges
-    (``_edges_unique_wp`` / ``_packed_p3d``, which carries the numbers), so the ratio is the
-    assembly and the division, which is what this sentence always claimed.
+    (``_edges_unique_wp`` / ``_packed_p3d``, which carries the numbers).
+
+    With that settled the remaining two *are* the ratio, so the row times
+    ``_assembled_p3d(..., normalize=True)`` and both sides then hold the same matrix (equal to
+    1.49e-08 in the parity test). Its table splits the two transforms -- on ``dragon`` the sort is
+    0.176 -> 1.153 ms and the division 1.153 -> 1.809 -- and in the harness the row goes from a
+    reported 2.63-4.67x loss to **1.16 / 1.30 / 2.14 / 2.70 / 3.93x triwarp ahead** across the five
+    scan meshes, tightest on the smallest, which is the shape every group here shows once the two
+    sides produce the same matrix.
     """
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "pytorch3d":
         vertices_p3d, edges_p3d = _packed_p3d(bench_case, edges=True)
-        matrix_p3d = bench_case.run(lambda: p3d_ops.norm_laplacian(vertices_p3d, edges_p3d))
+        matrix_p3d = bench_case.run(
+            lambda: _assembled_p3d(p3d_ops.norm_laplacian(vertices_p3d, edges_p3d), normalize=True)
+        )
         assert matrix_p3d.shape == (n_vertices, n_vertices)
         return
     if bench_case.kind == "triwarp":
@@ -395,6 +474,14 @@ def test_mass_matrix(bench_case: BenchCase) -> None:
     ``cotmatrix`` group times and is an *upper* bound here rather than a race -- it prices the
     stiffness assembly as well. It is still worth the row: it is the only GPU one in the group, and
     the two rows together say what the shared call costs and what fraction of it either half is.
+
+    **This row deliberately does not go through ``_assembled_p3d``**, unlike the three assembly
+    groups: ``inv_areas`` is the dense second return and a coalesce of the *stiffness* tensor
+    beside it would charge pytorch3d for an answer this row does not read. The scope mismatch here
+    already runs against pytorch3d and needs no correction -- and it does not need one on the
+    numbers either, which is worth recording because it is easy to file this row with the other
+    three: triwarp measures **0.272 / 0.286 ms** against pytorch3d's 0.501 / 0.447 on
+    ``fan_hub`` / ``sphere_med``, i.e. it is already a **1.6-1.8x win**.
     """
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "pytorch3d":
