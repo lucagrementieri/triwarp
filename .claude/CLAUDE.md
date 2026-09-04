@@ -5154,8 +5154,15 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
     `max_size` 64 and at most a fraction of 10.2 % at 327 — while costing `fill_min_weight`'s
     documented exactness. The **blocked interval DP** is bounded by the same 4-10 %: it removes
     launches from a sweep that is already a tenth of the call. Both are declined **for this row**;
-    the blocked DP remains open for `fill_min_weight` / `fill_smooth`'s own long-rim groups, where
-    the sweep *is* the call.
+    the blocked DP is **also declined for `fill_min_weight` / `fill_smooth`**, where the sweep *is*
+    the call but there is no loss to close: against `meshlib`, the only reference running the same
+    minimum-weight DP (the others do a topological fill and the group docstring says so), triwarp
+    is **5.0x ahead** on `rim_short` (14.88 ms against 74.47), **2.1x** on `holes_many` (4.86
+    against 10.17), and ahead on `stitch_min_weight` (23.21 against 27.74). The ~17 µs-per-span
+    launch floor is real and is nobody's bottleneck. **Build the blocked DP when a row appears that
+    it would flip.** The one hole-family row that does lose, `fill_smooth[rim_short-refined]` at
+    74.69 against 41.59, is 13.85 ms of DP and ~61 ms of refinement and smoothing — the same split
+    `fix_self_intersections` shows above, which is the second independent sighting of it.
   - **What is left is the smoother and the refiner, 64-72 % between them**, and that is where a
     lever for this row has to come from. `face_self_intersecting_mask` is 3.2-3.4 %, so the
     detector is still not the cost. **Four refuted levers, unchanged:** graph capture of the chain

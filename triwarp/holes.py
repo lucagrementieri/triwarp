@@ -745,8 +745,18 @@ def _run_hole_dp(
     **10.2 %** at 163 840 (4-6 rims, longest 327) -- the refiner and the two smoothers are 64-72 %
     between them. So a blocked DP -- and equally an *approximate* one that caps each cell's apex
     scan at a constant past some chain length, trading the exact minimum for an ``O(B^2 * c)`` sweep
-    -- is capped at that tenth for the repair path however well it works. The long-rim fill groups
-    are where it pays; CLAUDE.md section 16.6 carries the table.
+    -- is capped at that tenth for the repair path however well it works.
+
+    **And the long-rim fill groups, the obvious place to spend it instead, have no loss to close.**
+    The only reference running this same algorithm is the one the parity test uses as the DP's
+    oracle; the other rows in ``benchmarks/test_holes.py::test_fill_min_weight`` do a topological
+    fill and say so. Against that oracle triwarp is **5.0x ahead** on ``rim_short``'s two 512-edge
+    rims (14.88 ms against 74.47) and **2.1x** on ``holes_many`` (4.86 against 10.17), and
+    ``stitch_min_weight`` is ahead too (23.21 against 27.74). So this launch floor is real and is
+    still not anybody's bottleneck: build the blocked DP when a row appears that it would flip, not
+    for the floor's own sake. Where ``fill_smooth[rim_short]`` *does* lose (74.69 against 41.59),
+    the DP is 13.85 ms of it and the refinement and smoothing are the other 61 -- the same split
+    ``fix_self_intersections`` shows. CLAUDE.md section 16.6 carries both tables.
 
     **Folding the spans into one persistent block per loop was built and is refuted.** A
     ``wp.launch_tiled(dim=(n_loops,))`` kernel that loops over the spans internally --
