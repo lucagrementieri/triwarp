@@ -550,7 +550,7 @@ def first_occurrence_indices(
     n = int(inverse.shape[0])
     if n_unique is None:
         n_unique = int(tw.reduce.max(inverse)) + 1 if n > 0 else 0
-    first = wp.full(n_unique, wp.int32(n), dtype=wp.int32, device=device)
+    first = wp.full(n_unique, n, dtype=wp.int32, device=device)
     if n > 0 and n_unique > 0:
         wp.launch(
             kernel_grouping.scatter_first_occurrence, dim=n, inputs=[inverse, first], device=device

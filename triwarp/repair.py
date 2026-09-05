@@ -295,7 +295,7 @@ def remove_unreferenced_vertices(
     # host sync for a number already in hand.
     inverse = tw.array.flatnonzero(referenced)
     n_referenced = int(inverse.shape[0])
-    remap = wp.full(n_vertices, wp.int32(-1), dtype=wp.int32, device=device)
+    remap = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
     if n_referenced > 0:
         wp.launch(
             kernel_scatter.scatter_index, dim=n_referenced, inputs=[inverse, remap], device=device
@@ -869,8 +869,8 @@ def split_non_manifold_vertices(
 
     forward_count = wp.zeros(n_unique, dtype=wp.int32, device=device)
     backward_count = wp.zeros(n_unique, dtype=wp.int32, device=device)
-    forward_corner = wp.full(n_unique, wp.int32(-1), dtype=wp.int32, device=device)
-    backward_corner = wp.full(n_unique, wp.int32(-1), dtype=wp.int32, device=device)
+    forward_corner = wp.full(n_unique, -1, dtype=wp.int32, device=device)
+    backward_corner = wp.full(n_unique, -1, dtype=wp.int32, device=device)
     wp.launch(
         kernel_repair.halfedge_orientation_slots,
         dim=n_corners,
@@ -1551,7 +1551,7 @@ def make_volume(
         return wp.clone(faces)
 
     out_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
-    flip = wp.full(n_faces, wp.int32(1), dtype=wp.int32, device=device)
+    flip = wp.full(n_faces, 1, dtype=wp.int32, device=device)
     wp.launch(
         kernel_repair.flip_faces_masked, dim=n_faces, inputs=[faces, flip, out_faces], device=device
     )

@@ -1111,7 +1111,7 @@ def _empty_nearest(
     [`_shape_nearest`][triwarp.neighbors._shape_nearest] rather than returning rank-2 directly, so
     that the rank a caller sees does not depend on whether the answer happened to be empty.
     """
-    neighbor_indices = wp.full((m, k), wp.int32(-1), dtype=wp.int32, device=device)
+    neighbor_indices = wp.full((m, k), -1, dtype=wp.int32, device=device)
     neighbor_distances = wp.full((m, k), math.inf, dtype=wp.float32, device=device)
     return _shape_nearest(neighbor_indices, neighbor_distances, k, single_query)
 
@@ -1326,7 +1326,7 @@ def nearest_neighbor_distance(points: wp.array[wp.vec3]) -> wp.array[wp.float32]
     device = points.device
     n = int(points.shape[0])
     if n < 2:
-        return wp.full(n, wp.float32(math.inf), dtype=wp.float32, device=device)
+        return wp.full(n, math.inf, dtype=wp.float32, device=device)
 
     _indices, distances = query_nearest(points, points, k=2, backend="bvh")
     # Column 1 of the ``(n, 2)`` table, which is a *strided* view -- so it is copied into a dense

@@ -2198,7 +2198,7 @@ def _flip_setup(
         raise ValueError(f"region must have length n_faces={n_faces}, got {int(region.shape[0])}")
 
     if region is None:
-        region_flags = wp.full(n_faces, wp.int32(1), dtype=wp.int32, device=device)
+        region_flags = wp.full(n_faces, 1, dtype=wp.int32, device=device)
     else:
         region_flags = tw.array.astype(region, wp.int32)
     return wp.clone(faces), tw.array.index_bound(faces), region_flags

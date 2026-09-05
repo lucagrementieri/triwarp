@@ -1300,7 +1300,7 @@ def build_bottom(
     if packed is None:
         return wp.clone(vertices), wp.clone(faces)
 
-    extremes = wp.full(packed.n_loops, wp.float32(math.inf), dtype=wp.float32, device=device)
+    extremes = wp.full(packed.n_loops, math.inf, dtype=wp.float32, device=device)
     wp.launch(
         kernel_holes.loop_extreme_projection,
         dim=int(packed.indices.shape[0]),
@@ -2477,7 +2477,7 @@ def bridge_edges_smooth(
     # One launch to find each edge's opposite corner, then one gather of the six positions the
     # spline needs. Both are here so the host never reads back a buffer that scales with the mesh.
     query = wp.array(np.array([[a0, a1], [b0, b1]], dtype=np.int32), dtype=wp.int32, device=device)
-    opposites = wp.full(2, wp.int32(-1), dtype=wp.int32, device=device)
+    opposites = wp.full(2, -1, dtype=wp.int32, device=device)
     wp.launch(
         kernel_holes.directed_edge_opposites,
         dim=(int(faces.shape[0]) // 3, 2),
@@ -2725,7 +2725,7 @@ def _closest_cross_component_edges(
 
     n_faces = int(faces.shape[0]) // 3
     face_labels = tw.adjacency.face_connected_component_labels(faces)
-    vertex_labels = wp.full(int(vertices.shape[0]), wp.int32(-1), dtype=wp.int32, device=device)
+    vertex_labels = wp.full(int(vertices.shape[0]), -1, dtype=wp.int32, device=device)
     wp.launch(
         kernel_scatter.scatter_face_labels_to_vertices,
         dim=3 * n_faces,
