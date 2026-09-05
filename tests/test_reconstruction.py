@@ -1331,6 +1331,89 @@ def test_ball_pivoting_grows_the_triangle_budget(device: str):
     assert abs(grown - direct) <= 0.01 * direct
 
 
+@pytest.mark.parametrize("max_waves", [1, 2, 3, 4, 7, 8])
+def test_bpa_front_swap_tracks_the_waves_that_ran(
+    device: str, max_waves: int, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Triwarp against triwarp: ``front_in`` must hold the buffer the last wave that *ran* wrote.
+
+    ``_bpa_run`` queues ``_BPA_WAVES_PER_BATCH`` waves before it looks at the counters, and swaps
+    ``front_in`` / ``front_out`` after each queued one -- but every wave kernel opens with
+    ``if counters[CNT_CONTINUE] == 0: return``, so the waves after the device stops write nothing.
+    An odd number of those used to leave the pair exchanged, and the next ``compact()`` then read
+    the wrong buffer; in the first batch that buffer is the one ``wp.empty`` allocated and nothing
+    ever wrote, so it was an unbounded out-of-bounds read of the edge table, not merely a stale
+    front. Measured before the fix: on a 40 962-point cloud, four of five ``compact()`` calls over a
+    seven-cloud sweep read the wrong buffer, and two of three such processes died with
+    ``CUDA error 700`` at an unrelated readback later on.
+
+    ``max_waves`` is the parametrization because it *is* the trigger and it is exact: ``end_wave``
+    clears ``CNT_CONTINUE`` once ``CNT_WAVE >= max_waves``, so an odd value ends the batch with an
+    odd number of no-op waves on any cloud at all, and the even values are the controls that pass
+    either way. A fixture large enough to reach ``compact()`` on its own is ~25 000 points, far too
+    slow for a unit test -- the parameter reaches the same code path on 162.
+
+    Buffer *identity* is the assertion rather than any count: ``id(state.front_out)`` before a wave
+    that runs is the buffer that wave writes, and ``grow()`` / ``compact()`` each re-establish the
+    invariant themselves (one rebuilds ``front_in`` from the edge table, the other swaps after
+    writing), so recording their result covers a run that takes either.
+
+    The mutation probe bites on the final assert, and only for the odd values: reverting the parity
+    correction fails ``max_waves`` 1, 3 and 7 with *"front_in is not the buffer the last wave that
+    ran wrote"* and leaves 2, 4 and 8 passing. The entry assert inside ``compact()`` is a second
+    guard on the one place a violation is actually *read* rather than merely present; neither it
+    nor the ``grow()`` arm fires at these wave caps, which is the point of keeping the caps small.
+    """
+    points_np, normals_np = _sphere_cloud(2)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+    n_points = int(points_wp.shape[0])
+    radius = 0.2
+    grid = tw.neighbors.hashgrid_from_points(points_wp, radius)
+    bvh = tw.neighbors.bvh_from_points(points_wp)
+    state = tw.reconstruction._BpaState(
+        points_wp, normals_wp, grid, bvh, radius, 0.2, -1.0, 4 * n_points + 16
+    )
+
+    # The buffer that should be live, appended to by whatever last established it.
+    live: list[int] = []
+    resyncs = 0
+    unpatched_wave = tw.reconstruction._bpa_wave
+    unpatched = {name: getattr(tw.reconstruction._BpaState, name) for name in ("compact", "grow")}
+
+    def recording_wave(tracked: tw.reconstruction._BpaState, waves: int) -> None:
+        if int(tracked.counters.numpy()[kernel_bpa.CNT_CONTINUE]):
+            live.append(id(tracked.front_out))
+        unpatched_wave(tracked, waves)
+
+    def checked(name: str):
+        def wrapper(tracked: tw.reconstruction._BpaState) -> None:
+            nonlocal resyncs
+            resyncs += 1
+            if name == "compact":
+                assert id(tracked.front_in) == live[-1], (
+                    "compact() read a buffer no wave wrote: the host swapped for a wave that "
+                    "did not run"
+                )
+            unpatched[name](tracked)
+            live.append(id(tracked.front_in))
+
+        return wrapper
+
+    monkeypatch.setattr(tw.reconstruction, "_bpa_wave", recording_wave)
+    for name in unpatched:
+        monkeypatch.setattr(tw.reconstruction._BpaState, name, checked(name))
+    tw.reconstruction._bpa_run(state, max_waves)
+
+    counters_np = state.counters.numpy()
+    waves_run = int(counters_np[kernel_bpa.CNT_WAVE])
+    # Non-vacuity: the run must have reached the parametrized cap, so the batch really did end with
+    # `_BPA_WAVES_PER_BATCH - max_waves` no-op waves rather than converging before the cap.
+    assert waves_run == max_waves
+    assert len(live) == waves_run + resyncs
+    assert id(state.front_in) == live[-1], "front_in is not the buffer the last wave that ran wrote"
+
+
 @pytest.mark.parity("ball_pivoting", "open3d")
 def test_ball_pivoting_face_count_near_open3d(device: str):
     """

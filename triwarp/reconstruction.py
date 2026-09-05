@@ -1452,13 +1452,28 @@ def _bpa_run(state: _BpaState, max_waves: int) -> None:
 
     The host is woken once per batch, and only acts when the device asks it to — to grow the
     triangle budget, to compact a sparse front, or to stop.
+
+    The invariant every batch boundary restores is that **``front_in`` holds the live front**: a
+    wave reads ``front_in`` and writes ``front_out``, so one host swap per wave hands the result to
+    the next one. The batch is queued blind, though, and the device may stop partway through it —
+    every wave kernel opens with ``if counters[CNT_CONTINUE] == 0: return`` — so the trailing waves
+    of a batch write nothing while the loop below swaps for them regardless. An odd number of those
+    leaves the pair exchanged, and ``compact()`` then reads the buffer the *previous* wave wrote
+    (in the first batch, one that ``wp.empty`` never wrote at all). ``CNT_WAVE`` counts only the
+    waves that ran, and the batch's counter readback is already paid for, so the correction is a
+    parity test on a number the host is holding.
     """
     state.counters[kernel_bpa.CNT_CONTINUE : kernel_bpa.CNT_CONTINUE + 1].fill_(1)
+    waves_run = 0
     for _ in range(_BPA_MAX_BATCHES):
         for _ in range(_BPA_WAVES_PER_BATCH):
             _bpa_wave(state, max_waves)
             state.front_in, state.front_out = state.front_out, state.front_in
         counters = state.counters.numpy()
+        no_op_waves = _BPA_WAVES_PER_BATCH - (int(counters[kernel_bpa.CNT_WAVE]) - waves_run)
+        waves_run = int(counters[kernel_bpa.CNT_WAVE])
+        if no_op_waves % 2:
+            state.front_in, state.front_out = state.front_out, state.front_in
         if counters[kernel_bpa.CNT_CONTINUE]:
             continue
         if counters[kernel_bpa.CNT_DONE] or counters[kernel_bpa.CNT_WAVE] >= max_waves:

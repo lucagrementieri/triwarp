@@ -4805,25 +4805,57 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   `resolve_duplicated_faces`, `remove_degenerate_faces`, `remove_non_manifold_faces` and
   `holes.fill_small` are all deterministic. This is why sorting the face buffer would not buy
   bit-identity.
-- **OPEN: `ball_pivoting` intermittently dies with CUDA error 700** on ~50-70 % of runs that
-  reconstruct three *different* clouds in one process, surfacing at a `.numpy()` readback.
-  **Pre-existing** (baseline faults 3 of 5, HEAD 4 of 6, verified in a detached worktree with
-  `triwarp.__file__` printed). Each cloud alone is fine. **Not a lifetime bug** — holding every
-  input/output/intermediate alive makes it *worse* (6 of 6). **Invisible to both sanitizers**:
-  `compute-sanitizer --tool memcheck` reports zero invalid accesses and passes, and Warp
-  `mode="debug"` bounds checking also passes — do not conclude "clean" from either, they perturb the
-  timing/layout the fault depends on. Not queued-wave runaway. **The unguarded-scatter suspect was
-  investigated and CLEARED** (all five now route through a guarded `push_front_edge` with a
-  `CNT_OVERFLOW` counter; instrumented on the faulting sequence, overflow reads **0** and the front
-  peaks at **0.1 %** of capacity). **What it does depend on is the allocator:** default (CUDA mempool
-  on) faults 4 of 6; `wp.set_mempool_enabled(dev, False)` faults **0 of 6** — so the fault needs
-  **async allocation overlapping in-flight work**, an ordering bug between a free / pool-block reuse
-  and a kernel still reading it, not a static OOB. **Workaround:**
-  `wp.set_mempool_enabled(wp.get_device("cuda:0"), False)` around the reconstruction. **Where to look
-  next:** what `_BpaState.grow()` / `compact()` / `_adopt_next_front()` free or rebind while waves are
-  still queued, and whether the `wp.Bvh` or `wp.HashGrid` outlives the kernels holding its `id` — a
-  `wp.uint64` id is not a reference Python can see. Treat every `ball_pivoting` benchmark and test
-  result as provisional until closed.
+- **CLOSED: `ball_pivoting`'s intermittent CUDA error 700 was a host-side buffer swap, not an
+  allocator or lifetime bug.** The symptom — dying on ~50-70 % of runs that reconstruct three
+  *different* clouds in one process, always at a `.numpy()` readback, never on one cloud alone —
+  had been open for a long time and every attempt read it as a memory question. It was a *counting*
+  question. `_bpa_run` swapped `front_in` / `front_out` after every **queued** wave, but all five
+  wave kernels open with `if counters[CNT_CONTINUE] == 0: return`, so once the device stops partway
+  through a batch the trailing waves write nothing while the host swaps for them anyway. An odd
+  number of those leaves the pair exchanged, and `compact()` then reads the buffer the *previous*
+  wave wrote — in the first batch, the one `wp.empty` allocated and nothing ever wrote, so its
+  contents are dereferenced as edge-table slot indices. Unbounded OOB read; the garbage is whatever
+  the pool last left there, which is exactly why it looked allocator-shaped.
+
+  Measured on `cuda:0`, seven clouds each also jittered, one process, three reps per arm.
+  `CNT_WAVE` counts only the waves that ran and `_bpa_run` already reads the counter array once per
+  batch, so the real-wave count costs **no extra synchronization**:
+
+  | arm | desynced `compact()` | outcome |
+  |---|---|---|
+  | before | 4-5 of 5 | **2 of 3 processes died** with `CUDA error 700` in `wp_memcpy_d2h` |
+  | after | 0 of 5 | 3 of 3 completed; re-run 3x more on the fixed source, still clean |
+
+  Every desync had the same shape — **batch 0, 1 real wave, 7 no-op swaps** — on `icosphere(6)`
+  (40 962 points), a subdivided `box` (24 578) and both jittered. **Clouds below ~20 000 points
+  never reach `compact()` at all**, which is why the whole suite was structurally blind to it.
+
+  The fix is a parity test on a number the host is already holding, in `_bpa_run`:
+  `no_op_waves = _BPA_WAVES_PER_BATCH - (CNT_WAVE - waves_run)`, and one more swap when it is odd.
+  Guarded by `test_bpa_front_swap_tracks_the_waves_that_ran`, which parametrizes **`max_waves`**
+  rather than the cloud: `end_wave` clears `CNT_CONTINUE` at `CNT_WAVE >= max_waves`, so an odd cap
+  ends the batch with an odd number of no-op waves on a 162-point sphere, and the even caps are
+  controls. The mutation probe fails 1 / 3 / 7 and passes 2 / 4 / 8.
+
+  Three prior readings this corrects, all of which were *evidence about the fix's shape* rather
+  than wrong observations. "Not a lifetime bug — holding everything alive makes it worse (6 of 6)":
+  true, and it makes it worse because keeping buffers alive changes what the stale buffer's garbage
+  indexes. "It depends on the allocator — mempool off faults 0 of 6": true, and for the same
+  reason; `wp.set_mempool_enabled(dev, False)` was a *suppression*, not a workaround for a Warp
+  defect. "Invisible to both sanitizers": `compute-sanitizer` and `mode="debug"` both perturb the
+  timing this defect's schedule depends on. **When the memory tools come back clean on a
+  memory-shaped symptom, instrument the control flow instead** — one instrumented copy of the host
+  loop found it, and the information it needed was already in the array the loop reads.
+- **`ball_pivoting`'s default (`radius=0`) auto-radius is nondeterministic, and its docstring's
+  reproducibility claim does not cover it.** `_mean_positive_finite` reduces with `tw.reduce.sum`
+  over `float32`, an order-dependent atomic reduction, so the guessed radius takes two values ~1 ULP
+  apart *within a single process*: measured `0.141745895` / `0.141745880` over five calls on one
+  2 048-point torus, and the resulting face count varies 3 200 / 3 200 / 3 154 across three calls in
+  one process. **Pinning `radius=` makes it constant** — 3 200 in every call of three separate
+  processes — which is why `test_ball_pivoting_is_reproducible` pins it and says so. Separate from
+  the swap defect above and unaffected by fixing it. Open: either the docstring's "repeated runs on
+  one device and build return the same set of triangles" needs a third caveat beside row order and
+  winding, or the estimator needs a deterministic reduction.
 - **Slab-chunked marching cubes is not viable and was abandoned.** `wp.MarchingCubes` is crack-free
   only *within* one grid: its per-cell face triangulation is not consistent across independent
   invocations, so welding independent z-slabs leaves ~2·(seam-verts) non-manifold edges spread over
