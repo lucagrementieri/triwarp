@@ -1659,23 +1659,27 @@ def smooth_region(
         ],
         device=device,
     )
-    # M is (n_rows x n_free); M^T comes from the same triplets with the two index arrays swapped,
-    # and A = M^T M is SPD.
+    # M is (n_rows x n_free) and A = M^T M is SPD.
     #
-    # Both operands' ``nnz`` is a padded *capacity*, not an exact count: a single
-    # ``bsr_from_triplets`` leaves the field at the triplet count it was handed, which is the
-    # ``size`` above -- overwhelmingly padding here, since the emit is conditional and the tail is
-    # deliberately out of range. That is harmless to the product, because ``bsr_mm`` and
-    # ``bsr_transposed`` both treat the field as a bound rather than as a count, but it means
-    # nothing downstream may be sized off it (section 3.7).
+    # ``m_matrix``'s ``nnz`` is a padded *capacity*, not an exact count: ``bsr_from_triplets``
+    # leaves the field at the triplet count it was handed, which is the ``size`` above --
+    # overwhelmingly padding here, since the emit is conditional and the tail is deliberately out
+    # of range. That is harmless to ``bsr_mm`` and ``bsr_transposed``, which treat the field as a
+    # bound rather than as a count, but nothing downstream may be sized off it (section 3.7).
     #
-    # It also means the second build is a choice rather than a safeguard:
-    # ``wps.bsr_transposed(m_matrix)`` is exact on an operand of this shape and would replace a
-    # full sort-and-accumulate over ``size`` triplets, plus three clones, with one transpose.
+    # The transpose used to be a second ``bsr_from_triplets`` over the same triplets with the two
+    # index arrays swapped, plus three ``wp.clone``s to feed it. ``bsr_transposed`` is exact on an
+    # operand of this shape and says in one call what the swap said in five lines.
+    #
+    # **Not a speed change, and the number is here so it is not re-proposed as one.** Interleaved
+    # against the swapped-triplet build at the benchmark's own operating point (the top quarter by
+    # z of an icosphere, min of 4 rounds of 10), it is 1.16x / 1.14x / 1.09x on the step at 2 562 /
+    # 10 242 / 40 962 vertices -- which is 0.41% / 0.19% / 0.05% of the whole call, a share that
+    # *falls* as the mesh grows and is therefore a decline by section 9's rule. What it buys is one
+    # concept fewer and three fewer buffers; the assembled system is bit-identical at all three
+    # sizes (max |delta| exactly 0.0 over the sorted values, same nnz).
     m_matrix = wps.bsr_from_triplets(n_rows, n_free, rows, cols, vals, prune_numerical_zeros=False)
-    mt_matrix = wps.bsr_from_triplets(
-        n_free, n_rows, wp.clone(cols), wp.clone(rows), wp.clone(vals), prune_numerical_zeros=False
-    )
+    mt_matrix = wps.bsr_transposed(m_matrix)
     system = wps.bsr_mm(mt_matrix, m_matrix)
     # A^T b straight into the rows of one contiguous buffer, so the three columns batch.
     atb = wp.zeros((3, n_free), dtype=wp.float64, device=device)
