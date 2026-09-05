@@ -569,6 +569,14 @@ def _fill_packed_loops(
     per (loop, span),
     and a device-side min-area retry mask instead of a host branch per loop. What is left on the
     host is the ``O(B)`` traceback, which reads *one* packed predecessor table.
+
+    ``edges_sorted`` lets a caller that already built the sorted edge rows hand them over.
+    ``fill_min_weight`` does; ``fill_small`` and ``fill_smooth`` deliberately do **not**, and it is
+    not an oversight to fix. Threading it there was measured and declined: the rebuild is 0.75-0.96%
+    of ``fill_small`` and 0.11-0.16% of ``fill_smooth``, and the share *falls* with mesh size (0.96
+    / 0.89 / 0.75% at 1 240 / 4 960 / 19 840 faces), which section 9 calls a decline rather than a
+    small win -- the saving would be largest exactly where the call is already cheap, and threading
+    a derived buffer adds a stays-in-sync-with-``faces`` obligation for it.
     """
     device = faces.device
     if edges_sorted is None:
@@ -2473,7 +2481,12 @@ def bridge_edges_smooth(
     b0, b1 = int(edge_b[0]), int(edge_b[1])
     # A strip with interior samples joins nothing but its own new vertices, so it has no pair to
     # check; the one-segment case falls through to the flat patch below, which checks its own.
-    _check_bridge_edges(vertices, faces, (a0, a1), (b0, b1), (), validate)
+    #
+    # The rim table is built here rather than inside each check so the one-segment path does not
+    # rebuild it: nothing between the two calls touches ``faces``, and that rebuild measured
+    # 22.5-23.7% of that path (0.38 ms of 1.60-1.71 ms, flat from 1 240 to 20 440 faces).
+    rim = tw.boundary.oriented_boundary_edges(vertices, faces) if validate else None
+    _check_bridge_edges(vertices, faces, (a0, a1), (b0, b1), (), validate, rim)
 
     # One launch to find each edge's opposite corner, then one gather of the six positions the
     # spline needs. Both are here so the host never reads back a buffer that scales with the mesh.
@@ -2498,7 +2511,7 @@ def bridge_edges_smooth(
     if interior_np.shape[0] == 0:
         # One segment: the strip *is* the flat patch, so hand it over with the caller's own
         # ``validate`` -- that path adds edges between existing vertices and has its own check.
-        return wp.clone(vertices), bridge_edges(vertices, faces, (a0, a1), (b0, b1), validate)
+        return wp.clone(vertices), bridge_edges(vertices, faces, (a0, a1), (b0, b1), validate, rim)
 
     bridged_vertices = wp.empty(n_vertices + interior_np.shape[0], dtype=wp.vec3, device=device)
     wp.copy(bridged_vertices[:n_vertices], vertices)
@@ -2868,7 +2881,17 @@ def _bridge_triangles(
 def _patch_mask(
     n_faces_before: int, n_faces_after: int, device: wp.DeviceLike
 ) -> wp.array[wp.bool]:
-    """Boolean face mask marking the trailing ``[n_faces_before, n_faces_after)`` fill faces."""
+    """
+    Boolean face mask marking the trailing ``[n_faces_before, n_faces_after)`` fill faces.
+
+    The eight ``return (*result, mask) if return_patch else result`` lines that consume this are
+    **deliberately not** folded into a helper. Each is already one line, so a
+    ``_finish_patch(vertices, faces, mask, return_patch)`` call would replace one line with one
+    line and add an indirection the reader has to follow to learn it is a conditional tuple.
+    Section 2.4 asks for merging on identity of *meaning*; these agree because "return two arrays,
+    optionally with a mask" has only one shape, which is the noise case that rule names rather than
+    a duplicated decision rule.
+    """
     mask = wp.zeros(n_faces_after, dtype=wp.bool, device=device)
     # Warp rejects a zero-length slice, and the "nothing was filled" caller passes an empty range.
     if n_faces_after > n_faces_before:
