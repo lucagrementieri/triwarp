@@ -2217,9 +2217,19 @@ def intrinsic_delaunay(
     Notes
     -----
     A flip that would duplicate an existing edge is skipped rather than allowed to create a
-    multi-edge, so a few non-Delaunay edges can survive on coarse meshes — geometry-central's
-    signpost machinery represents those, this does not. The count is small in practice: on the
-    fixtures used in the tests the result matches ``igl.intrinsic_delaunay_cotmatrix`` exactly.
+    multi-edge, so some non-Delaunay edges can survive — geometry-central's signpost machinery
+    represents those, this does not. The output stays a simplicial complex, and that is the whole
+    limitation: the flip machinery keys its topology on the vertex pair ``(u, v)``, so a second
+    edge between the same two vertices has nowhere to live.
+
+    **So the loop stopping is not the same as the result being Delaunay, and ``n_flips`` cannot
+    tell you which happened.** A round ends when no edge is *flippable*, not when none is
+    violating, and the two differ exactly on the edges this skips. The gap is invisible on a
+    well-shaped mesh — on the test fixtures the result matches ``igl.intrinsic_delaunay_cotmatrix``
+    exactly — and opens up on a strongly graded surface, where a surviving edge's cotangent weight
+    can be large and negative rather than marginally so. A caller that needs the maximum principle
+    should check the weights it got ([`cotmatrix_entries_intrinsic`]
+    [triwarp.laplacian.cotmatrix_entries_intrinsic]) instead of inferring them from convergence.
 
     See Also
     --------

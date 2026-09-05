@@ -4846,6 +4846,17 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   tangent-plane constraint the barycentric weighting did not) — that is the obvious thing to try
   against the `cave_cube` self-intersection, but **it has not been tried, and the fold guard is still
   unwritten.**
+
+  **And the smooth pass may not be the only contributor: the isotropic *collapse* has no fold veto
+  either.** `quadric_collapse_candidates` runs `collapse_flips_normal` both ways before accepting;
+  `collapse_candidates` runs nothing equivalent — its link condition is topological and its
+  anti-oscillation walk bounds *lengths*, so neither sees a collapse that inverts an incident face.
+  The two kernels deliberately share `collapse_survivor` and `satisfies_link_condition` precisely
+  because a duplicated *decision rule* is the hazard (§2.4), so this divergence is a gap rather than
+  a variant, and it is now written at the site. Unmeasured, and not a one-line change: the veto
+  reads a vertex-*face* CSR that `_collapse_pass` does not build (it has only the vertex-vertex
+  `edges_to_csr`). Price the stage first, and attribute the graded-input degeneracies between the
+  two guards rather than assuming the smoother owns them all.
 - **FIXED — `valence_flip_candidates` had no shape guard.** It flipped on valence alone with only a
   convexity test, and convexity makes a flip legal but bounds nothing about the shape produced: on a
   graded mesh it turned slivers into worse slivers and in float32 hit exactly-zero area — **2 738 of
@@ -5571,13 +5582,34 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   **-16.13**, contradicting its own docstring; the plain `cotmatrix` on the same mesh reads -40.5.
   `remesh.intrinsic_delaunay` reports **3792 flips and is stable at `max_iter` 100 / 400 / 2000**, so
   it believes it converged; both matrices are finite (mollification is working) and no face is
-  zero-area. **Untriaged** — either the parallel flipper has a fixed point that is not intrinsically
-  Delaunay on strongly graded input, or float32 intrinsic edge lengths break the flip predicate at
-  this length ratio. It is the first graded open patch the suite can build, which is why nobody had
-  seen it. **Do not add `dini` to
-  `test_intrinsic_delaunay_removes_negative_cotangent_weights` until this is resolved — it fails.**
-  Build the mesh with `tw.creation.parametric_surface("dini")` to reproduce (there is no fixture,
-  deliberately).
+  zero-area. It is the first graded open patch the suite can build, which is why nobody had seen it.
+
+  **TRIAGED, and it is not a defect in the flipper: it is the documented simplicial limitation,
+  reached for the first time by an input where it matters.** Of the two hypotheses first recorded
+  here — a flipper fixed point, or float32 breaking the predicate at this length ratio — it is the
+  first, and specifically the duplicate-edge test in
+  `kernels/remesh._resolve_flip_quad_guarded`. Measured on the converged output: **38** interior
+  edges still violate the Delaunay condition and **38 of 38** are edges whose flip target already
+  joins the same two vertices, so the guard declines every one of them and the round reports no
+  candidates. Nothing about float32 is involved; the unfolding predicate is exact here (the
+  violated condition forces `wedge0 + wedge1 < pi`, so the unfolded quad is always convex).
+  `remesh.intrinsic_delaunay`'s Notes had stated the limitation all along — this entry did not
+  connect the two, which is §15.5's "the refutation was already written in the file the item
+  proposed changing" from the other direction: **grep the wrapper's Notes before opening an item
+  against its kernel.**
+
+  What was actually wrong was the *claim*, not the code, and both halves are now fixed:
+  `laplacian.robust_laplacian` said the flips "retriangulate until no edge has a negative cotangent
+  weight", and `intrinsic_delaunay`'s Notes reassured with "the count is small in practice" where
+  the surviving *magnitude* is what bites. The remaining lever is a Delta-complex representation
+  (geometry-central's signposts) — a rewrite of the flip topology, which keys on the vertex pair
+  `(u, v)` and so has nowhere to put a second edge between the same endpoints. Price it as that.
+
+  **`dini` therefore stays out of `test_intrinsic_delaunay_removes_negative_cotangent_weights`,
+  permanently rather than pending** — that test asserts a property this function does not promise.
+  A test that *pins* the gap (assert the residue is exactly the unflippable set) is the honest one
+  to add instead. Build the mesh with `tw.creation.parametric_surface("dini")` to reproduce (there
+  is no fixture, deliberately).
 - **SHIPPED: `filter_laplacian(implicit_time_integration=True)` and `filter_implicit_fairing` solved
   their three position components as three *separate* single-column `solve_spd` calls, where
   `solve_spd_columns` batches them. Converting is 2.06-2.83x, bit-identical.** All three columns

@@ -309,9 +309,12 @@ def robust_laplacian(
     * **mollification** adds one constant to every edge length so that no triangle is degenerate,
       which is what keeps the weights finite at all
       ([`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic]);
-    * **intrinsic Delaunay flips** retriangulate until no edge has a negative cotangent weight,
-      which is what makes the operator satisfy a maximum principle
-      ([`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay]).
+    * **intrinsic Delaunay flips** retriangulate toward non-negative cotangent weights, which is
+      what makes the operator satisfy a maximum principle
+      ([`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay]). Not *until* — that function
+      keeps a simplicial output, so it declines a flip whose new edge already joins the same two
+      vertices, and a strongly graded surface can leave a handful of negative weights behind that
+      no number of rounds removes. See its Notes; check the result rather than assuming it.
 
     With both on this is ``igl::intrinsic_delaunay_cotmatrix``, and the operator
     ``potpourri3d``'s ``use_robust=True`` solvers build. Turn the flips off for a drop-in

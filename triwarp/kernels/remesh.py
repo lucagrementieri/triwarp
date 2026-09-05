@@ -1256,6 +1256,21 @@ def collapse_candidates(
     if not satisfies_link_condition(offsets, columns, u, v, is_boundary):
         return
 
+    # **No fold veto here, unlike ``quadric_collapse_candidates``, and that asymmetry is a known
+    # gap rather than a decision.** That kernel runs ``collapse_flips_normal`` both ways before
+    # accepting -- the guard its own comment calls the difference between a usable decimator and
+    # one that produces self-intersecting geometry -- and this one has nothing equivalent: the
+    # link condition is topological and the band walk below bounds *lengths*, so neither notices a
+    # collapse that inverts an incident face. It is a plausible contributor to the degenerate faces
+    # ``isotropic_remesh`` leaves on strongly graded input, which AGENTS.md section 16.4 currently
+    # attributes to the unweighted smooth pass alone.
+    #
+    # Closing it is not a one-line change and must not be done unmeasured: ``collapse_flips_normal``
+    # reads a vertex-*face* CSR, which ``remesh._collapse_pass`` does not build (it has only the
+    # vertex-vertex ``edges_to_csr``), so this costs an adjacency build per pass on a stage that is
+    # already rebuild-dominated, and it changes the output of a shipped decimator that is not
+    # byte-gateable. Benchmark the stage first.
+    #
     # Anti-oscillation: reject if the collapse would create an edge longer than the high band. The
     # band is read at the far endpoint ``w``, so a collapse reaching into a finely-sized region is
     # judged by that region's target rather than by the survivor's.
@@ -1617,6 +1632,13 @@ def intrinsic_delaunay_candidates(
     out_new_length[k] = 0.0
     f0 = adjacency[k, 0]
     f1 = adjacency[k, 1]
+    # The shared guard's duplicate-edge test is load-bearing here and is *not* free: intrinsically,
+    # the flipped edge is a different geodesic between the same two endpoints and is a legitimate
+    # new edge, but a simplicial face buffer cannot hold two of them and the topology this pass
+    # rebuilds is keyed on the vertex pair. So the guard is the reason a violating edge can be
+    # unflippable, and therefore the reason a round can end with the triangulation still not
+    # Delaunay -- which reads as convergence at the wrapper. ``remesh.intrinsic_delaunay``'s Notes
+    # state that limitation for callers; a Delta-complex representation is what lifts it.
     first, _apex1, second, apex0 = _resolve_flip_quad_guarded(
         faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
     )

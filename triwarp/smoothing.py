@@ -1659,8 +1659,19 @@ def smooth_region(
         ],
         device=device,
     )
-    # M is (n_rows x n_free); build M and M^T from the same (swapped) triplets in a single build
-    # each (both single builds, so bsr_mm gets operands whose nnz is exact), then A = M^T M is SPD.
+    # M is (n_rows x n_free); M^T comes from the same triplets with the two index arrays swapped,
+    # and A = M^T M is SPD.
+    #
+    # Both operands' ``nnz`` is a padded *capacity*, not an exact count: a single
+    # ``bsr_from_triplets`` leaves the field at the triplet count it was handed, which is the
+    # ``size`` above -- overwhelmingly padding here, since the emit is conditional and the tail is
+    # deliberately out of range. That is harmless to the product, because ``bsr_mm`` and
+    # ``bsr_transposed`` both treat the field as a bound rather than as a count, but it means
+    # nothing downstream may be sized off it (section 3.7).
+    #
+    # It also means the second build is a choice rather than a safeguard:
+    # ``wps.bsr_transposed(m_matrix)`` is exact on an operand of this shape and would replace a
+    # full sort-and-accumulate over ``size`` triplets, plus three clones, with one transpose.
     m_matrix = wps.bsr_from_triplets(n_rows, n_free, rows, cols, vals, prune_numerical_zeros=False)
     mt_matrix = wps.bsr_from_triplets(
         n_free, n_rows, wp.clone(cols), wp.clone(rows), wp.clone(vals), prune_numerical_zeros=False

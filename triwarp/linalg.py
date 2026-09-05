@@ -554,6 +554,12 @@ def solve_spd_columns(
         ``check_every=0``; see the warning above. A one-column solve returns Warp's own values and
         a batched one returns the same three from this module's solver.
 
+    Raises
+    ------
+    ValueError
+        If ``preconditioner`` is not one of the three names above. It is rejected rather than
+        treated as ``"diag"``, so a misspelling cannot turn into a silently slower solve.
+
     Warns
     -----
     UserWarning
@@ -671,6 +677,12 @@ def spd_column_solver(
         [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] returns, including its
         ``check_every=0`` device arrays.
 
+    Raises
+    ------
+    ValueError
+        If ``preconditioner`` is ``"auto"``, for the reason above, or is not one of the two names
+        this accepts.
+
     Examples
     --------
     ```python
@@ -734,6 +746,16 @@ def _cg_columns(
             cap=iteration_cap,
             check_every=check_every,
             caller=caller,
+        )
+    # Validated rather than left to fall through. Every branch below tests for one name and treats
+    # anything else as ``"diag"``, so without this an unrecognised string -- ``"jacobi"``,
+    # ``"amg"``, a capitalised ``"Multigrid"`` -- runs a Jacobi solve silently, bit-identically to
+    # ``"diag"`` and with nothing but the clock to tell the caller. At two columns it would also
+    # skip ``_BlockCg2``, whose branch keys on the literal string.
+    if preconditioner not in ("diag", "multigrid"):
+        raise ValueError(
+            f'{caller}: unknown preconditioner {preconditioner!r}, expected "diag", "multigrid" '
+            'or "auto".'
         )
     if n_columns > 1:
         # ``_BatchedCg`` exists only for this branch; a single column already reaches
@@ -1144,7 +1166,11 @@ class _BatchedCg:
                 kernel_cg.scaled_diagonal_apply,
                 dim=self._dofs,
                 inputs=[
-                    # ``n == stride``: this state's vectors carry no rows the kernel must skip.
+                    # ``stride`` twice, so the kernel skips nothing -- *not* because ``n ==
+                    # stride`` (it is only equal when ``n`` is a whole number of tiles), but
+                    # because running the apply over the pad is a no-op: ``r``'s pad is zero and
+                    # ``inv_diag``'s is one, so ``z`` gets zero there, which is what the dots
+                    # downstream already assume.
                     wp.int32(self._stride),
                     wp.int32(self._stride),
                     self._inv_diag,
@@ -2192,14 +2218,19 @@ def _warn_if_not_converged(result: tuple[int, float, float], iteration_cap: int,
 
     Skipped under ``check_every=0``, where the three values are 1-element *device* arrays and
     inspecting them would cost the host sync that setting exists to avoid.
+
+    That early return is also why the message says "residual norm" and not "squared residual": the
+    squared form is what the *device* path carries, and this never reaches it. Every value this
+    formats has already had its square root taken -- by ``warp.optim.linear.cg`` on the one-column
+    path, and by ``_BatchedCg`` / ``_BlockCg2`` on the batched ones.
     """
     iterations, residual, atol = result
     if isinstance(iterations, wp.array):
         return
     if int(iterations) >= iteration_cap and float(residual) > float(atol):
         warnings.warn(
-            f"{name}: conjugate gradient hit its {iteration_cap}-iteration cap with squared "
-            f"residual {float(residual):.3e} against tolerance {float(atol):.3e}; the result is "
+            f"{name}: conjugate gradient hit its {iteration_cap}-iteration cap with residual norm "
+            f"{float(residual):.3e} against tolerance {float(atol):.3e}; the result is "
             f"the last iterate, not a solution. The operator is likely ill-conditioned or "
             f"singular — consider triwarp.laplacian.robust_laplacian, or a smaller step.",
             stacklevel=3,
