@@ -748,10 +748,16 @@ def _register_overloads() -> None:
         map_sorted_inverse,
         {d: [wp.array[d], wp.array[d], wp.array[wp.int32]] for d in _SORT_KEY_DTYPES},
     )
-    # ``sort_rows_insertion`` sorts a rank-2 table in place; ``unique_rows`` and the hashing paths
-    # that reach it build that table in the caller's dtype.
+    # ``sort_rows_insertion`` sorts a rank-2 table in place. Its only caller is ``array.sort_rows``
+    # -- not ``unique_rows``, which an earlier version of this comment claimed and which sorts no
+    # rows -- so the set is that wrapper's annotation, ``Array2dInt32 | Array2dFloat32``. The
+    # ``wp.float64`` entry that used to sit here was reachable through no annotation and, worse,
+    # made the accepted dtypes depend on the row width: this kernel is generic, so a float64 table
+    # sorted silently while the wide-row fallback (``segmented_sort_pairs``, int32/float32 keys
+    # only) raised from inside Warp. ``sort_rows`` now rejects the dtype up front and this set
+    # matches it.
     SORT_ROWS_INSERTION = OverloadTable(
-        sort_rows_insertion, {d: [wp.array2d[d]] for d in (wp.int32, wp.float32, wp.float64)}
+        sort_rows_insertion, {d: [wp.array2d[d]] for d in (wp.int32, wp.float32)}
     )
 
 

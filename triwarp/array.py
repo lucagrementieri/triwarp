@@ -620,19 +620,35 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     Parameters
     ----------
     data
-        ``(n, w)`` device array sorted in place, row by row.
+        ``(n, w)`` ``int32`` or ``float32`` device array sorted in place, row by row.
+
+    Raises
+    ------
+    TypeError
+        If ``data`` is not ``int32`` or ``float32``.
 
     Notes
     -----
     Rows no wider than ``SORT_ROWS_INSERTION_MAX_COLS`` are sorted by a per-row insertion sort (one
     thread per row); wider rows fall back to a segmented radix sort. The narrow path is not a
-    micro-optimization: ``segmented_sort_pairs`` pays a fixed cost per *segment*, which for the
-    two- and three-wide rows every in-library caller sorts dominates the comparison work by orders
-    of magnitude.
+    micro-optimization: ``segmented_sort_pairs`` pays a fixed cost per *segment*, which for rows
+    this narrow dominates the comparison work by orders of magnitude.
+
+    The dtype restriction comes from that fallback -- ``warp.utils.segmented_sort_pairs`` takes
+    ``int32`` or ``float32`` keys and nothing else -- and it is checked up front rather than left
+    to whichever path a row width happens to select, so the accepted dtypes do not depend on ``w``.
     """
     # The narrow path's margin, for whoever considers deleting it: a fixed per-segment cost in
     # ``segmented_sort_pairs`` dominates the comparison work for rows this narrow, where a plain
     # compare-and-swap needs none of it.
+    #
+    # The dtype guard is here rather than at the wide branch because without it the two paths
+    # disagree: the insertion kernel is generic, so a ``float64`` table used to sort silently at
+    # ``w <= SORT_ROWS_INSERTION_MAX_COLS`` and raise ``RuntimeError: Unsupported data type:
+    # float64`` from inside Warp one column later. Support that turns on the row width is worse
+    # than no support.
+    if data.dtype not in (wp.int32, wp.float32):
+        raise TypeError(f"sort_rows requires an int32 or float32 array, got {data.dtype}")
     n = data.size
     n_rows, n_cols = int(data.shape[0]), int(data.shape[1])
     if n_rows == 0 or n_cols < 2:
