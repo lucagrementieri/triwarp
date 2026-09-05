@@ -1131,7 +1131,8 @@ def quadric_decimate(
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
     target_faces
         Desired face count. Mutually exclusive with ``target_ratio``; exactly one must be given.
-        Values at or above the input count return a copy.
+        A value at or above the input count collapses nothing, but still returns an independent
+        copy with the same compaction and provenance every other target gets — see Returns.
     target_ratio
         Desired face count as a fraction of the input's, so ``0.1`` is MeshLab's usual "10 %". Must
         be in ``(0, 1]``.
@@ -1244,16 +1245,17 @@ def quadric_decimate(
     target = _resolve_decimation_target(target_faces, target_ratio, n_faces)
 
     if n_faces == 0 or target >= n_faces:
-        kept_vertices, kept_faces = wp.clone(vertices), wp.clone(faces)
+        # Nothing to collapse, but the *output* contract still holds: vertices compacted from index
+        # zero, and ``vertex_index`` reporting -1 for an input vertex no output face references.
+        # Returning the buffer verbatim with an identity map would make the shape of the answer
+        # depend on whether the target happened to clear the input's face count -- a caller sweeping
+        # a ratio would see an already-unreferenced vertex appear and disappear across that
+        # boundary. This is the same compaction ``_DecimationBuffers`` runs at the end of every
+        # pass, reached through the shared helper so the two cannot drift apart.
+        kept_vertices, kept_faces, remap = tw.repair.remove_unreferenced_vertices(vertices, faces)
         if not return_index:
             return kept_vertices, kept_faces
-        device = faces.device
-        return (
-            kept_vertices,
-            kept_faces,
-            tw.array.arange(int(vertices.shape[0]), device=device),
-            tw.array.arange(n_faces, device=device),
-        )
+        return kept_vertices, kept_faces, remap, tw.array.arange(n_faces, device=faces.device)
 
     buffers = _DecimationBuffers(
         vertices, faces, target, wp.float32(math.radians(feature_angle)), track_index=return_index

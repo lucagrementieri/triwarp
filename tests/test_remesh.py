@@ -1384,13 +1384,20 @@ def test_quadric_decimate_provenance_on_degenerate_inputs(
     device: str, unit_box: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
-    Not a library comparison: the ``-1`` entry, and the no-op path's identity maps.
+    Not a library comparison: the ``-1`` entry, and that the no-op path reports it too.
 
     An input vertex no face references cannot land anywhere, so it reports ``-1`` rather than a
     plausible index -- the one case where ``vertex_index`` is not total, which is why the docstring
-    says so. And a target at or above the input count returns copies, where both maps must be the
-    identity: a caller carrying an attribute through a decimation that did nothing should get its
-    attribute back, not an exception.
+    says so.
+
+    **The no-op path is held to the same contract, and this assert is what pins that.** A target at
+    or above the input count collapses nothing, but it still compacts and still reports ``-1``, so
+    the shape of the answer does not depend on which side of the input's face count the target
+    landed on. An earlier version of this test asserted the opposite -- identity maps and the
+    vertex buffer verbatim -- on the reasoning that "a decimation that did nothing should give the
+    attribute back". That reasoning does not survive the discontinuity it creates: ``bunny`` carries
+    1 113 unreferenced vertices, so a caller sweeping ``target_ratio`` over it would watch them
+    appear at ``1.0`` and vanish at ``0.99``.
     """
     vertices_np = np.array(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [9.0, 9.0, 9.0]], dtype=np.float32
@@ -1402,10 +1409,18 @@ def test_quadric_decimate_provenance_on_degenerate_inputs(
     kept_vertices_wp, kept_faces_wp, vertex_index_wp, face_index_wp = tw.remesh.quadric_decimate(
         vertices_wp, faces_wp, target_faces=8, return_index=True
     )
-    assert np.array_equal(kept_vertices_wp.numpy(), vertices_np)
+    assert np.array_equal(kept_vertices_wp.numpy(), vertices_np[:3])
     assert np.array_equal(kept_faces_wp.numpy(), faces_np)
-    assert np.array_equal(vertex_index_wp.numpy(), np.arange(4))
+    assert np.array_equal(vertex_index_wp.numpy(), np.array([0, 1, 2, -1]))
     assert np.array_equal(face_index_wp.numpy(), np.arange(1))
+
+    # A mesh with nothing unreferenced is untouched by that compaction, which is what keeps the
+    # no-op path a pass-through for every ordinary input.
+    clean_vertices_wp, clean_faces_wp = tw.remesh.quadric_decimate(
+        points_to_warp(vertices_np[:3], device), faces_wp, target_faces=8
+    )
+    assert np.array_equal(clean_vertices_wp.numpy(), vertices_np[:3])
+    assert np.array_equal(clean_faces_wp.numpy(), faces_np)
 
     # A mesh with an unreferenced vertex, decimated for real: vertex 3 has nowhere to go.
     grid_tm, _grid_wp = unit_box
