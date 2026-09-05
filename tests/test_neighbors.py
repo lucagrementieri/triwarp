@@ -910,29 +910,59 @@ def test_query_nearest_ties(device: str, backend: Literal["bvh", "hashgrid"], k:
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
-def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"]):
+@pytest.mark.parametrize("k", [1, 2])
+def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"], k: int):
+    """
+    Class A on the shape, against ``KDTree.query``: a degenerate input keeps its rank.
+
+    ``query_nearest`` collapses the trailing axis at ``k == 1``, exactly as ``KDTree.query`` does,
+    so the rank is a function of ``k`` and the form of ``queries`` alone -- never of whether an
+    answer was found. Both degenerate inputs used to bypass that collapse and come back rank-2 at
+    ``k == 1`` while every populated call returned rank-1, so ``indices[i]`` was a scalar on an
+    ordinary cloud and a length-1 row on an empty one.
+
+    **``k`` is the parametrization because ``k = 2`` was this test's hardcoded value and is the one
+    value that cannot see the defect.** The mutation probe is the fix itself: routing the two early
+    returns back through ``twt.empty_2d`` / an unshaped ``_empty_nearest`` fails all four ``k == 1``
+    cells on the rank asserts below, and leaves every ``k == 2`` cell passing.
+
+    Class B on the values, one named difference: a slot with no neighbour is ``-1`` here and the
+    tree size (so ``0`` for an empty cloud) in SciPy, which is why only the distances are compared
+    element-wise.
+    """
     rng = np.random.default_rng(0)
     points = rng.random((10, 3), dtype=np.float32)
+    empty = np.empty((0, 3), dtype=np.float32)
 
     points_wp = points_to_warp(points, device)
     empty_points_wp = wp.empty(0, dtype=wp.vec3, device=device)
     empty_queries_wp = wp.empty(0, dtype=wp.vec3, device=device)
     query_wp = wp.vec3(points[0][0], points[0][1], points[0][2])
     queries_wp = points_to_warp(points[-3:], device)
-    k = 2
     query_nearest = partial(tw.neighbors.query_nearest, backend=backend)
 
+    # A single `wp.vec3` query is rank-1 of length k whatever k is -- SciPy returns a 0-d scalar at
+    # k == 1 instead, the one place the two conventions differ, since Warp has no 0-d array.
     indices, distances = query_nearest(empty_points_wp, query_wp, k=k)
     assert np.array_equal(indices.numpy(), -np.ones(k))
     assert np.array_equal(distances.numpy(), np.full(k, np.inf))
 
-    indices, distances = query_nearest(empty_points_wp, queries_wp, k=k)
-    assert indices.shape == (queries_wp.shape[0], k)
-    assert distances.shape == (queries_wp.shape[0], k)
+    # The anchor: whatever rank a populated call returns is the rank both degenerate calls owe.
+    populated_distances_np = KDTree(points).query(points[-3:], k=k)[0]
+    indices, distances = query_nearest(points_wp, queries_wp, k=k)
+    assert indices.shape == populated_distances_np.shape
+    assert distances.shape == populated_distances_np.shape
 
-    indices, distances = query_nearest(points_wp, empty_queries_wp, k=k)
-    assert indices.shape == (0, k)
-    assert distances.shape == (0, k)
+    for points_arg, queries_arg, points_np, queries_np in (
+        (empty_points_wp, queries_wp, empty, points[-3:]),
+        (points_wp, empty_queries_wp, points, empty),
+    ):
+        distances_np = KDTree(points_np).query(queries_np, k=k)[0]
+        indices, distances = query_nearest(points_arg, queries_arg, k=k)
+        assert indices.shape == distances_np.shape
+        assert distances.shape == distances_np.shape
+        assert np.array_equal(distances.numpy(), distances_np.astype(np.float32))
+        assert np.array_equal(indices.numpy(), np.full(distances_np.shape, -1, dtype=np.int32))
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])

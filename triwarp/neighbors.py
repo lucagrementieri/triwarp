@@ -847,7 +847,9 @@ def query_nearest(
     leaf_size: int = ...,
     initial_radius: float | None = ...,
     bounds: tuple[wp.vec3, wp.vec3] | None = ...,
-) -> tuple[twt.Array2dInt32, twt.Array2dFloat32]: ...
+    # Rank 1, not 2: a single neighbour per query collapses the trailing axis away, whichever form
+    # `queries` took. `scipy.spatial.KDTree.query` does the same at `k=1`.
+) -> tuple[twt.Array1dInt32, twt.Array1dFloat32]: ...
 @overload
 def query_nearest(
     points: wp.array[wp.vec3],
@@ -944,7 +946,13 @@ def query_nearest(
     neighbor_indices, neighbor_distances
         ``(m, k)`` ``wp.int32`` indices into ``points`` and ``(m, k)`` ``wp.float32`` distances,
         each row sorted by increasing distance. A slot no neighbour was found for holds ``-1`` and
-        ``inf``. For a single ``wp.vec3`` query the two are rank-1 of length ``k``.
+        ``inf``.
+
+        The trailing axis collapses when there is only one of it, as
+        [`scipy.spatial.KDTree.query`][] does: at ``k == 1`` the two are rank-1 of length ``m``, and
+        for a single ``wp.vec3`` query they are rank-1 of length ``k``. The rank depends only on
+        ``k`` and the form of ``queries``, never on whether an answer was found — an empty
+        ``points`` or an empty ``queries`` returns the same rank a populated one would.
 
     Raises
     ------
@@ -975,12 +983,10 @@ def query_nearest(
     m = int(queries.shape[0])
     n = int(points.shape[0])
 
-    if m == 0:
-        return (
-            twt.empty_2d((0, k), wp.int32, device=device),
-            twt.empty_2d((0, k), wp.float32, device=device),
-        )
-    if n == 0:
+    # Both degenerate inputs answer "every slot unfilled" over `(m, k)`, which is empty of its own
+    # accord when there are no queries -- and both must go through the same shaping as the general
+    # path, or `k == 1` comes back rank-2 here and rank-1 everywhere else.
+    if m == 0 or n == 0:
         return _empty_nearest(m, k, single_query, device)
 
     if bounds is None:
@@ -1092,14 +1098,17 @@ def _validate_nearest(k: int, max_radius: float, initial_radius: float | None) -
 def _empty_nearest(
     m: int, k: int, single_query: bool, device: wp.DeviceLike
 ) -> tuple[twt.Array2dInt32 | twt.Array1dInt32, twt.Array2dFloat32 | twt.Array1dFloat32]:
-    """Build the result rows for an empty point cloud: every slot unfilled."""
+    """
+    Build the result rows for a query that can find nothing: every slot unfilled.
+
+    Serves both degenerate inputs -- no data points, and no queries at all, where ``m`` is zero and
+    the two buffers come out empty. Shapes through
+    [`_shape_nearest`][triwarp.neighbors._shape_nearest] rather than returning rank-2 directly, so
+    that the rank a caller sees does not depend on whether the answer happened to be empty.
+    """
     neighbor_indices = wp.full((m, k), wp.int32(-1), dtype=wp.int32, device=device)
     neighbor_distances = wp.full((m, k), math.inf, dtype=wp.float32, device=device)
-    if single_query:
-        return neighbor_indices[0], neighbor_distances[0]
-    return twt.as_array2d(neighbor_indices, wp.int32), twt.as_array2d(
-        neighbor_distances, wp.float32
-    )
+    return _shape_nearest(neighbor_indices, neighbor_distances, k, single_query)
 
 
 def _shape_nearest(

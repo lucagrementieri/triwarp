@@ -1157,6 +1157,24 @@ found them: §12.1.
   to the normal, and x or y always qualifies), and "correcting" it into a three-way argmin would move
   the tangent frame at every z-dominant normal. Fix the sentence, leave the branch, and say in the
   commit which of the two you changed and why.
+- **When a private helper's docstring states a rule the public surface must obey, the defect is in
+  the paths that *bypass* the helper — and the `@overload` stubs and the `Returns` block are two
+  further statements of that rule that no test reads.** `neighbors._shape_nearest` exists to
+  *"collapse the `(m, k)` result to the rank the caller's `queries` / `k` imply"* and collapses to
+  rank-1 at `k == 1`; `query_nearest`'s two degenerate early returns were taken **before** it and
+  came back rank-2, so `indices[i]` was a scalar on an ordinary cloud and a length-1 row on an
+  empty one. The `k: Literal[1]` overload and the `Returns` prose independently declared rank-2 as
+  well — one intent, four statements, one of them right. This is §2.4's duplicated *decision rule*
+  one level up, and the fix is the same shape: route the bypassing paths back through the helper
+  (`_empty_nearest` now returns `_shape_nearest(...)`) rather than repeating the collapse at each
+  site. **After changing a rank/shape/dtype rule, grep for the early returns and the `@overload`
+  stubs, not just the main path** — basedpyright cannot see the mismatch, because a wrong overload
+  return type is self-consistent.
+- **A test that hardcodes one value of the parameter the contract turns on is testing the one case
+  that cannot fail.** `test_query_nearest_empty` pinned `k = 2` — the only `k` where the collapse
+  above is a no-op — so the whole suite was green against it. §7.4's vacuity rule usually reads as
+  "check the fixture is not degenerate"; this is the same rule about a *parameter*, and the cheap
+  version is to parametrize over the boundary value rather than a comfortable one.
 
 ### 4.4 Moving or renaming
 
