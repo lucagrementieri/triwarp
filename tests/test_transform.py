@@ -428,6 +428,63 @@ def test_transform_carries_the_expensive_operators_through_a_rigid_motion(
     assert moved.face_angles is angles
 
 
+@pytest.mark.parametrize("mesh_name", MESHES)
+@pytest.mark.parametrize(("kind", "matrix"), TRANSFORMS[1:], ids=[k for k, _ in TRANSFORMS[1:]])
+def test_transform_rotates_the_tangent_frames_where_it_can(
+    request: pytest.FixtureRequest, mesh_name: str, kind: TransformKind, matrix: wp.mat44
+) -> None:
+    """
+    Triwarp against triwarp: which transforms keep ``vertex_tangent_frames``, and how.
+
+    ``test_carried_cache_matches_recomputation`` is the oracle for the frames' *values*, and it
+    cannot see this: a key that is silently **dropped** is simply absent from the carried cache, so
+    a value comparison over the carried keys passes vacuously. That is exactly how the frames came
+    to be rebuilt on every rigid pose change while `Trimesh.transform` documented that directions
+    are rotated -- the branch that rotates them was unreachable, because the key was in no carry
+    set the branch's own guard would let through. This asserts the membership, which is the half
+    the value test structurally cannot check.
+
+    Three regimes, and each pins a different mechanism:
+
+    - **translation** carries the frame *verbatim*, the same objects, because `_carry_directions`
+      returns before rotating anything -- a translation moves no direction.
+    - **rigid** and **similarity** carry a *rotated* frame: new arrays, since a rotation genuinely
+      moves the basis. The gauge commutes with both because it is built from unit directions.
+    - **reflection**, **affine** and **singular** drop it. The mirror is the interesting one: it is
+      dropped by the `_ORIENTATION_DEPENDENT_KEYS` subtraction rather than by the stratum, because
+      ``basis_y = normal x basis_x`` flips with the winding while the normal itself does not.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    frames = mesh.vertex_tangent_frames
+    moved = mesh.transform(matrix)
+    carried = moved._cache.get("vertex_tangent_frames")
+
+    if kind in (TransformKind.REFLECTION, TransformKind.AFFINE, TransformKind.SINGULAR):
+        assert carried is None, f"{kind} carried a frame it does not preserve"
+        return
+
+    assert carried is not None, f"{kind} dropped the tangent frames instead of carrying them"
+    if kind is TransformKind.TRANSLATION:
+        assert all(got is original for got, original in zip(carried, frames, strict=True)), (
+            "a translation moves no direction, so the frame should be the same arrays"
+        )
+        return
+
+    # Rotated, not aliased -- and the third element is `vertex_normals` by that property's
+    # documented invariant, so `transform` must publish the same array into both slots rather than
+    # leaving a stale normal beside a fresh frame.
+    assert all(got is not original for got, original in zip(carried, frames, strict=True))
+    assert moved._cache["vertex_normals"] is carried[2]
+
+    basis_x, basis_y, normal = (component.numpy() for component in carried)
+    assert np.allclose(np.linalg.norm(basis_x, axis=1), 1.0, atol=1e-5)
+    assert np.allclose(np.einsum("ij,ij->i", basis_x, normal), 0.0, atol=1e-5)
+    assert np.allclose(np.cross(normal, basis_x), basis_y, atol=1e-5)
+    # Non-vacuity: the rotation must actually have moved the basis, or "rotated" is untested.
+    assert float(np.abs(basis_x - frames[0].numpy()).max()) > 1e-3
+
+
 def test_adjacency_projections_and_convex_stay_consistent(
     cave_cube: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:

@@ -83,7 +83,12 @@ _ORIENTATION_DEPENDENT_KEYS: frozenset[str] = frozenset(
         "boundary_loops",  # so the loops come back reversed
         "face_angles",  # per-corner table, permuted
         "cotmatrix_entries",  # likewise -- the assembled `cotmatrix` is a sum and survives
-        "vertex_tangent_frames",  # gauge is built from a reference halfedge, which moves
+        # Gauge is built from a reference halfedge, which moves -- and `basis_y = normal x basis_x`
+        # flips with the winding. Measured against recomputation after a mirror: `basis_x` 1.1-1.9,
+        # `basis_y` 1.7, where the frame's own normal is 4e-07 because it is mapped by the inverse
+        # transpose. Dropping the triple here is also what keeps `_carry_directions` from rotating
+        # it, which is why that helper tests `survived` rather than the cache.
+        "vertex_tangent_frames",
         "laplacian_operator",  # directed adjacency, asymmetric at an open boundary
         "faces_unique_edges",  # a view of `edges_unique_inverse`; carrying it alone would stale
     }
@@ -104,8 +109,26 @@ _AFFINE_CARRY: frozenset[str] = _TOPOLOGY_KEYS | frozenset(
 
 # Adds the angle functions. A similarity preserves angles, so it preserves cotangent weights --
 # which is why the heaviest object here, the assembled `cotmatrix`, survives a scale.
+#
+# `vertex_tangent_frames` is here rather than one rung up because the gauge is a set of *unit*
+# tangent directions: the reference halfedge scales, the projection into the tangent plane scales
+# with it, and the normalization divides the scale back out, so a similarity leaves the frame where
+# an isometry does. It is the one entry in this set that `transform` **rotates** rather than
+# carrying verbatim (see the header's note and `_carry_directions`), and membership here is
+# load-bearing twice over: it is also what subjects the frame to the `_ORIENTATION_DEPENDENT_KEYS`
+# subtraction, which a mirror needs -- measured, a reflected frame's `basis_x` sits 1.1 to 1.9 away
+# from the recomputed one, where the *normal* agrees to 4e-07 because `transform_normals` maps it
+# by the inverse transpose. Not one rung further down either: an affine map tilts the tangent plane
+# by an amount that depends on the surface, measured 0.77 on `basis_x` and 2.6e-02 on the normal.
 _SIMILARITY_CARRY: frozenset[str] = _AFFINE_CARRY | frozenset(
-    {"face_angles", "vertex_defects", "face_adjacency_angles", "cotmatrix_entries", "cotmatrix"}
+    {
+        "face_angles",
+        "vertex_defects",
+        "face_adjacency_angles",
+        "cotmatrix_entries",
+        "cotmatrix",
+        "vertex_tangent_frames",
+    }
 )
 
 # Adds the length and area quantities, which only an isometry leaves alone.
@@ -134,11 +157,14 @@ _ISOMETRY_CARRY: frozenset[str] = _SIMILARITY_CARRY | frozenset(
 # A translation moves no direction at all, so normals, frames and the operator bundles built from
 # them survive untouched -- the one rung where nothing has to be recomputed *or* rotated. The
 # bounding box survives too, and `transform` shifts it on the host rather than reducing again.
+#
+# `vertex_tangent_frames` is *not* relisted here: it comes in through `_SIMILARITY_CARRY`, and a
+# translation is the one kind for which `_carry_directions` returns before rotating anything, so
+# the frame arrives verbatim exactly as this comment says.
 _TRANSLATION_CARRY: frozenset[str] = _ISOMETRY_CARRY | frozenset(
     {
         "face_normals",
         "vertex_normals",
-        "vertex_tangent_frames",
         "heat_operators",
         "vector_heat_operators",
         "enclosing_diagonal",
@@ -1639,6 +1665,17 @@ class Trimesh:
         [`transform_normals`][triwarp.transform.transform_normals] is the right map for the frame's
         tangents too, not just for its normal: for a similarity ``M = sR`` the inverse transpose is
         ``R / s``, which normalizes to the same unit vector the forward map does.
+
+        **The two normal branches test `self._cache` and the frame branch tests `survived`, and
+        that asymmetry is deliberate.** `survived` is the carry set after the
+        `_ORIENTATION_DEPENDENT_KEYS` subtraction, so testing it is what stops a *mirror* from
+        rotating a gauge that a mirror does not preserve: measured, a reflected `basis_x` sits 1.1
+        to 1.9 from the recomputed one. The normals need no such gate -- `transform_normals` maps
+        them by the inverse transpose, which is already correct under a reflection (4e-07). So do
+        not "simplify" the frame branch to read `self._cache` like its siblings; it would silently
+        carry a mirrored frame. Mutation-probed: that edit fails the reflection arm of
+        `test_transform_rotates_the_tangent_frames_where_it_can` on every fixture, closed and open
+        alike, with "carried a frame it does not preserve".
         """
         if kind not in ("rigid", "reflection", "similarity"):
             return
