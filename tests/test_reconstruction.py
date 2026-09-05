@@ -445,11 +445,22 @@ def test_empty_cloud(device: str):
 
 
 def test_too_few_points(device: str):
-    points_wp = wp.array(
-        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64), dtype=wp.vec3, device=device
-    )
-    _, faces_wp = tw.reconstruction.triangulate_point_cloud(points_wp, num_neighbours=4)
+    """
+    Not a library comparison: two points admit no triangle, and nothing else computes this.
+
+    Also pins that the returned vertices are the function's **own** buffer on this path. Two points
+    reach the "no candidate survived" early return, which used to hand the caller's array straight
+    back while every other exit -- including the populated one, through ``_assemble_faces`` --
+    clones. Writing into the result must not reach the input.
+    """
+    points_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    vertices_wp, faces_wp = tw.reconstruction.triangulate_point_cloud(points_wp, num_neighbours=4)
     assert int(faces_wp.shape[0]) == 0
+
+    assert np.allclose(vertices_wp.numpy(), points_np, rtol=1e-5, atol=1e-5)
+    vertices_wp.fill_(wp.vec3(9.0, 9.0, 9.0))
+    assert np.allclose(points_wp.numpy(), points_np, rtol=1e-5, atol=1e-5)
 
 
 def test_invalid_parameters(device: str):

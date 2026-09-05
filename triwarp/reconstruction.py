@@ -263,7 +263,11 @@ def triangulate_point_cloud(
     device = points.device
     n = int(points.shape[0])
     if n == 0:
-        return points, wp.empty(0, dtype=wp.int32, device=device)
+        # Cloned, like every other exit from this module: the returned vertices are the function's
+        # own buffer on the populated path (`_assemble_faces`, `_clean_reconstruction`), so handing
+        # back the caller's array here would make the degenerate input the one case where mutating
+        # the result mutates the input.
+        return wp.clone(points), wp.empty(0, dtype=wp.int32, device=device)
 
     k = num_neighbours if num_neighbours > 0 else max_neighbours
     k = min(k, max_neighbours)
@@ -297,7 +301,7 @@ def triangulate_point_cloud(
     # Compact the emitted candidate triangles.
     kept = tw.array.flatnonzero(out_valid.reshape(-1))
     if int(kept.shape[0]) == 0:
-        return points, wp.empty(0, dtype=wp.int32, device=device)
+        return wp.clone(points), wp.empty(0, dtype=wp.int32, device=device)
     candidates = twt.as_array2d(tw.array.gather(out_tris.reshape((n * k, 3)), kept), wp.int32)
 
     # Repeated oriented triangles: t3 (3 reps) preferred, then t2 (2 reps).
