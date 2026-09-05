@@ -821,9 +821,9 @@ def isin(
     Warnings
     --------
     A ``max_index`` smaller than the true maximum is a wrong answer, not a raise: a value at or
-    above it reads as absent. Unlike
-    [`hash_indices_rows`][triwarp.grouping.hash_indices_rows]' bound it is at least memory-safe,
-    because the table lookup range-guards each slot.
+    above it reads as absent, however far above it lies and on either side of the comparison.
+    Unlike [`hash_indices_rows`][triwarp.grouping.hash_indices_rows]' bound it is at least
+    memory-safe, because the table lookup range-guards each slot.
 
     See Also
     --------
@@ -908,11 +908,18 @@ def _isin_lookup_mask(
     #
     # The element side is one guarded launch rather than a shift plus a Python-scope gather --
     # see ``kernels/array.py::isin_lookup_mask`` for what that buys and why the guard is required.
+    #
+    # ``last`` is the largest value the table holds, and both sides are shifted through it so that
+    # ``shifted_index`` range-tests before it narrows to int32. Computing it here in Python
+    # integers is exact: on the inferred path it is the maximum over both inputs, and on the
+    # ``max_index`` path it is ``max_index - 1``, so it is representable in ``dtype`` by
+    # construction where ``offset + span`` need not be.
     device = elements_flat.device
     dtype = elements_flat.dtype
     anchor = dtype(offset)
+    last = dtype(offset + span - 1)
     test_slots = wp.empty(int(test_elements.shape[0]), dtype=wp.int32, device=device)
-    wp.map(kernel_array.shifted_index, test_elements, anchor, out=test_slots)
+    wp.map(kernel_array.shifted_index, test_elements, anchor, last, out=test_slots)
 
     membership_wp = wp.zeros(span, dtype=wp.bool, device=device)
     wp.launch(
@@ -925,7 +932,7 @@ def _isin_lookup_mask(
     wp.launch(
         kernel_array.ISIN_LOOKUP_MASK[dtype],
         dim=int(elements_flat.shape[0]),
-        inputs=[elements_flat, anchor, wp.int32(span), membership_wp, out_mask],
+        inputs=[elements_flat, anchor, last, membership_wp, out_mask],
         device=device,
     )
     return out_mask

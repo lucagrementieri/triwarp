@@ -1009,6 +1009,39 @@ def test_isin_max_index_matches_the_inferred_span(device: str) -> None:
         tw.array.isin(elements_wp, test_wp, max_index=0)
 
 
+@pytest.mark.parametrize("wide_side", ["elements", "test_elements"])
+def test_isin_max_index_rejects_a_value_that_would_wrap_int32(device: str, wide_side: str) -> None:
+    """
+    Class A against [`numpy.isin`][]: a 64-bit value far above ``max_index`` reads absent.
+
+    The test above this one bounds ``int32`` values, where the offending value is representable as
+    a slot however far outside the table it lies -- so it is the case that *cannot* fail, and it
+    was the only one covered. What makes the bound load-bearing is a value whose distance from the
+    table anchor does not fit in the ``int32`` slot type: ``2**32 + 5`` is congruent to ``5``, so a
+    lookup that narrows before it range-tests places it at slot 5 and reports the membership of a
+    value the array does not contain.
+
+    Both sides are parametrized because the shift runs twice with the same helper -- once over
+    ``test_elements`` to fill the table and once over ``elements`` to read it -- and each direction
+    fabricates a different wrong answer: a wide *element* borrows the flag of its congruent value,
+    a wide *test value* plants a flag for a value nobody asked about.
+
+    The inferred path is the control. It never reaches this: it anchors the table at the true
+    minimum and only takes the table strategy when the span is small, which is the precondition
+    ``max_index`` exists to skip.
+    """
+    near_np = np.array([5, 7], dtype=np.int64)
+    wide_np = np.array([2**32 + 5, 7], dtype=np.int64)
+    elements_np, test_np = (wide_np, near_np) if wide_side == "elements" else (near_np, wide_np)
+    elements_wp = wp.array(elements_np, dtype=wp.int64, device=device)
+    test_wp = wp.array(test_np, dtype=wp.int64, device=device)
+
+    expected_np = np.isin(elements_np, test_np)
+    assert not expected_np.all()  # The comparison is not vacuous: exactly one element matches.
+    assert np.array_equal(tw.array.isin(elements_wp, test_wp, max_index=100).numpy(), expected_np)
+    assert np.array_equal(tw.array.isin(elements_wp, test_wp).numpy(), expected_np)
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("index_bound", "trimesh")
 def test_index_bound_matches_the_index_maximum(

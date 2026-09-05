@@ -355,11 +355,38 @@ def gather_vec_skip_negative(
 
 
 @wp.func
-def shifted_index(value: wp.Scalar, offset: wp.Scalar) -> wp.int32:
-    # Position of ``value`` in a table anchored at ``offset``. The subtraction happens in the
-    # value's own dtype, which is exact for every dtype ``array.isin`` reaches this with: it widens
-    # sub-32-bit dtypes first (so the span cannot overflow the type) and only takes the table path
-    # when the span is small (so a 64-bit difference cannot overflow either).
+def masked_at(mask: wp.array[wp.bool], index: wp.int32) -> wp.bool:
+    # The mask's value at ``index``, reading ``False`` for an index outside it rather than off the
+    # end of the buffer. The guard is what lets a *membership* mask stand in for an ``isin`` over
+    # the equivalent index list: ``isin`` answers ``False`` for a value it has never seen, so a
+    # malformed buffer carrying an out-of-range index keeps the answer it had instead of turning
+    # into an out-of-bounds read. Two compares on a memory-bound lookup.
+    if index < 0 or index >= mask.shape[0]:
+        return False
+    return mask[index]
+
+
+@wp.func
+def shifted_index(value: wp.Scalar, offset: wp.Scalar, last: wp.Scalar) -> wp.int32:
+    # Position of ``value`` in a table anchored at ``offset`` and holding values up to ``last``
+    # inclusive, or ``-1`` for a value outside ``[offset, last]``.
+    #
+    # The range test runs in the value's **own** dtype and the narrowing to ``int32`` runs after
+    # it, and that order is the whole reason ``last`` is an argument. Narrowing first is exact only
+    # while the difference is known to fit, and the caller that establishes that -- ``array.isin``
+    # inferring the span with two ``reduce.minmax`` reductions -- is precisely the caller a
+    # supplied ``max_index`` exists to skip. On that path a 64-bit value far above the table used
+    # to wrap into a valid slot and read as *present*: ``isin([2**32 + 5, 7], [5, 7],
+    # max_index=100)`` answered ``[True, True]`` where numpy answers ``[False, True]``, on both the
+    # element side and the ``wp.map`` over the test values. Testing ``value`` rather than the
+    # difference cannot overflow, and it leaves ``value - offset`` bounded by the table's own
+    # length, so the cast below is exact by construction rather than by precondition.
+    #
+    # ``last`` rather than a span: ``offset + span`` is not always representable at the top of a
+    # dtype, where ``offset + span - 1`` is the largest value the table holds and therefore always
+    # is.
+    if value < offset or value > last:
+        return wp.int32(-1)
     return wp.int32(value - offset)
 
 
@@ -367,7 +394,7 @@ def shifted_index(value: wp.Scalar, offset: wp.Scalar) -> wp.int32:
 def isin_lookup_mask(
     elements: wp.array[wp.Scalar],
     anchor: wp.Scalar,
-    span: wp.int32,
+    last: wp.Scalar,
     membership: wp.array[wp.bool],
     out_mask: wp.array[wp.bool],
 ) -> None:
@@ -380,13 +407,12 @@ def isin_lookup_mask(
     # unguarded gather would read past the end of ``membership`` -- silent memory unsafety rather
     # than a wrong answer (CLAUDE.md section 12.1).
     #
-    # An ``if`` rather than ``wp.where``: ``wp.where`` evaluates both arms, so it would index
-    # ``membership`` at the very slot the guard exists to reject (CLAUDE.md section 1.5).
+    # The guard is ``masked_at``, which reads the *buffer's* own length. ``shifted_index`` already
+    # rejects an out-of-range value, so this is a second, independent bound rather than the only
+    # one -- and reading ``membership.shape[0]`` means the two cannot disagree, where a separate
+    # ``span`` argument beside ``last`` would be one launch argument encoding the same limit twice.
     i = wp.int32(wp.tid())
-    slot = shifted_index(elements[i], anchor)
-    out_mask[i] = False
-    if slot >= wp.int32(0) and slot < span:
-        out_mask[i] = membership[slot]
+    out_mask[i] = masked_at(membership, shifted_index(elements[i], anchor, last))
 
 
 @wp.kernel
@@ -395,18 +421,6 @@ def isin_lookup_sorted(
 ) -> None:
     tid = wp.int32(wp.tid())
     out_mask[tid] = binary_search_sorted_contains(sorted_test, elements[tid])
-
-
-@wp.func
-def masked_at(mask: wp.array[wp.bool], index: wp.int32) -> wp.bool:
-    # The mask's value at ``index``, reading ``False`` for an index outside it rather than off the
-    # end of the buffer. The guard is what lets a *membership* mask stand in for an ``isin`` over
-    # the equivalent index list: ``isin`` answers ``False`` for a value it has never seen, so a
-    # malformed buffer carrying an out-of-range index keeps the answer it had instead of turning
-    # into an out-of-bounds read. Two compares on a memory-bound lookup.
-    if index < 0 or index >= mask.shape[0]:
-        return False
-    return mask[index]
 
 
 @wp.func
@@ -715,7 +729,7 @@ def _register_overloads() -> None:
     )
     ISIN_LOOKUP_MASK = OverloadTable(
         isin_lookup_mask,
-        {d: [wp.array[d], d, wp.int32, wp.array[wp.bool], wp.array[wp.bool]] for d in _KEY_DTYPES},
+        {d: [wp.array[d], d, d, wp.array[wp.bool], wp.array[wp.bool]] for d in _KEY_DTYPES},
     )
     ISIN_LOOKUP_SORTED = OverloadTable(
         isin_lookup_sorted, {d: [wp.array[d], wp.array[d], wp.array[wp.bool]] for d in _KEY_DTYPES}
@@ -912,9 +926,16 @@ def _declare_map_kernels() -> None:
             (nonzero_flag, (dense(wp.float32),), wp.int32),
             (nonzero_flag, (dense(wp.int32),), wp.int32),
             (nonzero_flag, (dense(wp.int8),), wp.int32),
-            (shifted_index, (dense(wp.int32), wp.int32(1)), wp.int32),
-            (shifted_index, (dense(wp.uint32), wp.uint32(1)), wp.int32),
-            (shifted_index, (dense(wp.uint64), wp.uint64(1)), wp.int32),
+            # One row per dtype in ``kernels/array._KEY_DTYPES``, which is the set
+            # ``array.isin`` -- ``shifted_index``'s only caller -- can reach after it widens
+            # sub-32-bit dtypes. ``int64`` was missing and forked the module on first use: a probe
+            # on an ``int64`` input logged ``map_shifted_index ... (compiled)``, which is exactly
+            # the cost CLAUDE.md section 3.5 exists to remove and which check 23 cannot see,
+            # because the table's *existence* is all it asserts.
+            (shifted_index, (dense(wp.int32), wp.int32(1), wp.int32(1)), wp.int32),
+            (shifted_index, (dense(wp.int64), wp.int64(1), wp.int64(1)), wp.int32),
+            (shifted_index, (dense(wp.uint32), wp.uint32(1), wp.uint32(1)), wp.int32),
+            (shifted_index, (dense(wp.uint64), wp.uint64(1), wp.uint64(1)), wp.int32),
         ]
     )
 
