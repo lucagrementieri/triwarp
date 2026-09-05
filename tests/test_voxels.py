@@ -1229,6 +1229,40 @@ def test_fill_orthographic_matches_trimesh(sphere, device: str):
     assert np.array_equal(filled, reference)
 
 
+@pytest.mark.parametrize("fill", ["fill_cavities", "fill_orthographic"])
+def test_fills_budget_the_box_they_densify(device: str, fill: str):
+    """
+    Not a library comparison: a budget guard has no counterpart in trimesh or scipy.
+
+    Both densify unconditionally, because both are *handed* a dense array rather than a sparse grid.
+
+    Both fills answer a question about the empty complement, so both densify the occupied bounding
+    box. That box is set by how far apart the voxels are and has no relation to how many there are,
+    so a two-voxel grid is unbounded -- at a separation of 800 cells it is 803**3 nodes, and the
+    five lattices built over it come to 5.3 GiB. The sibling ``revoxelize`` already guards its own
+    lattice for the same reason; these two did not.
+
+    Asserted on a grid small enough to be harmless (two voxels, 128 apart) with the budget lowered
+    to match, so the test never allocates what it is guarding against.
+    """
+    fill_fn = getattr(tw.voxels, fill)
+    cells_np = np.array([[0, 0, 0], [128, 128, 128]], dtype=np.int32)
+    grid = tw.voxels.from_cells(
+        wp.array(cells_np, dtype=wp.int32, device=device), voxel_size=1.0, origin=wp.vec3()
+    )
+    assert int(grid.get_active_stats().voxel_count) == 2
+
+    # The box is ~130**3 = 2.2e6 cells for a two-voxel grid: the guard is about the box, not the
+    # count, and a budget above the *count* but below the *box* is exactly what must raise.
+    with pytest.raises(ValueError, match="above max_cells"):
+        fill_fn(grid, max_cells=1000)
+    with pytest.raises(ValueError, match="max_cells must be positive"):
+        fill_fn(grid, max_cells=0)
+
+    # Generous budget: the same call runs, and a fill of two isolated voxels adds nothing.
+    assert int(fill_fn(grid, max_cells=1 << 28).get_active_stats().voxel_count) == 2
+
+
 # ---------------------------------------------------------------------------------------------
 # resolve_voxel_grid
 # ---------------------------------------------------------------------------------------------

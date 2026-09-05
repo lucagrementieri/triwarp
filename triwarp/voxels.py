@@ -155,6 +155,10 @@ def voxelize_mesh(
     ValueError
         If ``voxel_size`` is not positive, if ``mode`` is not one of the two names, if
         ``max_candidates`` is not positive, or if the candidate count exceeds ``max_candidates``.
+        At ``mode="solid"``, also whatever [`fill_cavities`][triwarp.voxels.fill_cavities] raises:
+        ``max_candidates`` bounds the (triangle, cell) pairs, which is a *surface* count, and the
+        fill densifies the occupied *box*, so a large thin mesh can clear this guard and meet that
+        one. The fill runs at its own default budget.
 
     See Also
     --------
@@ -1389,7 +1393,7 @@ def revoxelize(
     return from_dense(twt.as_array3d(occupancy, wp.bool), voxel_size, origin, origin_cell=base_cell)
 
 
-def fill_cavities(grid: wp.Volume) -> wp.Volume:
+def fill_cavities(grid: wp.Volume, *, max_cells: int = 1 << 28) -> wp.Volume:
     """
     Fill every enclosed cavity: an empty cell is kept empty only if it reaches the outside.
 
@@ -1402,6 +1406,10 @@ def fill_cavities(grid: wp.Volume) -> wp.Volume:
     ----------
     grid
         Index grid to fill.
+    max_cells
+        Budget for the dense box this labels over, which spans the occupied cells and is therefore
+        set by how far apart the voxels are rather than by how many there are. Exceeding it raises
+        rather than allocating. Five lattices are built over the box, so this bounds the footprint.
 
     Returns
     -------
@@ -1410,12 +1418,15 @@ def fill_cavities(grid: wp.Volume) -> wp.Volume:
 
     Raises
     ------
+    ValueError
+        If ``max_cells`` is not positive, or the occupied box exceeds ``max_cells`` cells.
     TypeError
         If ``grid`` is not a NanoVDB index grid with isotropic voxels.
 
     See Also
     --------
     [`fill_orthographic`][triwarp.voxels.fill_orthographic]
+        The blunter fill, with the same budget for the same reason.
     [`voxelize_mesh`][triwarp.voxels.voxelize_mesh]
 
     Notes
@@ -1426,12 +1437,16 @@ def fill_cavities(grid: wp.Volume) -> wp.Volume:
     rather than against
     [`triwarp.graph.connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges].
     """
+    if max_cells <= 0:
+        raise ValueError(f"max_cells must be positive, got {max_cells}")
     voxel_size, origin = grid_transform(grid)
     device = grid.device
     if _voxel_count(grid) == 0:
         return _empty_grid(voxel_size, origin, device)
 
-    occupancy, origin_cell = _to_dense_padded(grid, pad=1)
+    occupancy, origin_cell = _to_dense_padded(
+        grid, pad=1, max_cells=max_cells, caller="fill_cavities"
+    )
     dims = (int(occupancy.shape[0]), int(occupancy.shape[1]), int(occupancy.shape[2]))
     n_nodes = dims[0] * dims[1] * dims[2]
 
@@ -1458,7 +1473,7 @@ def fill_cavities(grid: wp.Volume) -> wp.Volume:
     return from_dense(filled, voxel_size, origin, origin_cell=origin_cell)
 
 
-def fill_orthographic(grid: wp.Volume) -> wp.Volume:
+def fill_orthographic(grid: wp.Volume, *, max_cells: int = 1 << 28) -> wp.Volume:
     """
     Fill the intersection of the three axis-aligned solid shadows of the voxel set.
 
@@ -1472,6 +1487,10 @@ def fill_orthographic(grid: wp.Volume) -> wp.Volume:
     ----------
     grid
         Index grid to fill.
+    max_cells
+        Budget for the dense box the three axis sweeps run over, which spans the occupied cells and
+        is therefore set by how far apart the voxels are rather than by how many there are.
+        Exceeding it raises rather than allocating.
 
     Returns
     -------
@@ -1480,19 +1499,26 @@ def fill_orthographic(grid: wp.Volume) -> wp.Volume:
 
     Raises
     ------
+    ValueError
+        If ``max_cells`` is not positive, or the occupied box exceeds ``max_cells`` cells.
     TypeError
         If ``grid`` is not a NanoVDB index grid with isotropic voxels.
 
     See Also
     --------
     [`fill_cavities`][triwarp.voxels.fill_cavities]
+        The exact fill, with the same budget for the same reason.
     """
+    if max_cells <= 0:
+        raise ValueError(f"max_cells must be positive, got {max_cells}")
     voxel_size, origin = grid_transform(grid)
     device = grid.device
     if _voxel_count(grid) == 0:
         return _empty_grid(voxel_size, origin, device)
 
-    occupancy, origin_cell = _to_dense_padded(grid, pad=0)
+    occupancy, origin_cell = _to_dense_padded(
+        grid, pad=0, max_cells=max_cells, caller="fill_orthographic"
+    )
     dims = (int(occupancy.shape[0]), int(occupancy.shape[1]), int(occupancy.shape[2]))
     filled = twt.empty_3d(dims, wp.bool, device=device)
     scratch = twt.empty_3d(dims, wp.bool, device=device)
@@ -2277,11 +2303,30 @@ def _cell_bounds(grid: wp.Volume) -> tuple[tuple[int, int, int], tuple[int, int,
     )
 
 
-def _to_dense_padded(grid: wp.Volume, *, pad: int) -> tuple[twt.Array3dBool, tuple[int, int, int]]:
-    """Dense occupancy of the tight cell box grown by ``pad`` empty cells on every side."""
+def _to_dense_padded(
+    grid: wp.Volume, *, pad: int, max_cells: int, caller: str
+) -> tuple[twt.Array3dBool, tuple[int, int, int]]:
+    """
+    Dense occupancy of the tight cell box grown by ``pad`` empty cells on every side.
+
+    ``max_cells`` bounds the box before it is allocated, the way
+    [`revoxelize`][triwarp.voxels.revoxelize] bounds its sampling lattice. The guard belongs here
+    rather than at the two callers because the quantity it bounds is this box, and because a
+    caller's own argument does not bound it: the box is the *bounding box* of the cell set and has
+    no relation to the voxel count, so a two-voxel grid whose cells sit far apart densifies to
+    whatever their separation cubed happens to be. Each caller then allocates several more lattices
+    over the same box, so this count is the one that decides the footprint.
+    """
     lower_cell, extent = _cell_bounds(grid)
     base = (lower_cell[0] - pad, lower_cell[1] - pad, lower_cell[2] - pad)
     shape = (extent[0] + 2 * pad, extent[1] + 2 * pad, extent[2] + 2 * pad)
+    total = shape[0] * shape[1] * shape[2]
+    if total > max_cells:
+        raise ValueError(
+            f"{caller} would densify {total} cells, above max_cells={max_cells}: the occupied box "
+            f"is {shape[0]}x{shape[1]}x{shape[2]} cells, which is set by how far apart the voxels "
+            "are and not by how many there are"
+        )
     return to_dense(grid, origin_cell=base, shape=shape)
 
 
