@@ -71,6 +71,22 @@ def voxel_cell_center(cell: wp.vec3i, origin: wp.vec3, voxel_size: wp.float32) -
     )
 
 
+@wp.func
+def squared_distance_to_own_cell_center(
+    position: wp.vec3, origin: wp.vec3, voxel_size: wp.float32
+) -> wp.float32:
+    # How far a point sits from the centre of the voxel it falls in, squared. The quantity a
+    # "closest to the cell centre" cluster representative is chosen by.
+    #
+    # Named because that choice is a *two-pass* argmin -- one kernel reduces the winning distance
+    # per cluster and a second re-tests it to break the tie by lowest index -- and the two passes
+    # agree only while both compute this expression identically. Two copies of it is a silent
+    # correctness hazard rather than a duplication nit: a change to one that rounds differently
+    # leaves clusters with no representative at all.
+    cell = voxel_cell(position, origin, 1.0 / voxel_size)
+    return wp.length_sq(position - voxel_cell_center(cell, origin, voxel_size))
+
+
 @wp.kernel
 def voxel_cell_indices(
     points: wp.array[wp.vec3],

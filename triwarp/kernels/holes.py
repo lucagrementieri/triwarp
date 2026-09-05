@@ -966,8 +966,11 @@ def stitch_dp_diag(
             if out_came[i, j - 1] != CAME_NONE:
                 c_op = stitch_prev_apex(a_pos, b_pos, out_came, n_a, n_b, i, j - 1)
                 w = w + stitch_edge_metric(a_cur, b_prev, c_op, b_cur)
-            if tables.b_opp_valid[j % n_b] != 0:
-                w = w + stitch_edge_metric(b_prev, b_cur, tables.b_opp[j % n_b], a_cur)
+            # ``rim_opposite_from_table`` keys slot k on the rim edge (loop[k], loop[k + 1]), so
+            # the edge (b[j - 1], b[j]) introduced by this step is slot j - 1, not j -- the same
+            # convention the A branch uses above.
+            if tables.b_opp_valid[(j - 1) % n_b] != 0:
+                w = w + stitch_edge_metric(b_prev, b_cur, tables.b_opp[(j - 1) % n_b], a_cur)
         update_argmin(best, best_came, w, CAME_B)
 
     out_dp[i, j] = best

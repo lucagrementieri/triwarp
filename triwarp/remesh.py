@@ -35,7 +35,7 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_nonempty_mesh
-from triwarp.constants import INT32_MAX, TOLERANCE_MOLLIFY
+from triwarp.constants import INT32_MAX, INT64_MAX, TOLERANCE_MOLLIFY
 from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import remesh as kernel_remesh
@@ -63,15 +63,14 @@ class _EdgeIncidence(NamedTuple):
     The unique undirected edges of one triangulation, and which faces meet along each of them.
 
     Everything the collapse passes and ``_classify`` need about edge topology, grouped once:
-    ``unique_edges`` and ``inverse`` come straight from
-    [`edges_unique`][triwarp.edges.edges_unique], and one scatter over ``inverse`` fills both
-    ``face_count`` (1 on a boundary edge, 2 on an interior one) and ``faces``.
+    ``unique_edges`` comes straight from [`edges_unique`][triwarp.edges.edges_unique], and one
+    scatter over that call's corner -> unique-edge map fills both ``face_count`` (1 on a boundary
+    edge, 2 on an interior one) and ``faces``. The map itself is not carried: it is scratch for
+    that scatter, and no consumer of this tuple has ever read it.
     """
 
     unique_edges: twt.Array2dInt32
     """``(m, 2)`` unique undirected vertex pairs, each row min-first."""
-    inverse: wp.array[wp.int32]
-    """Length ``3 * n_faces`` corner -> unique-edge map; corner ``c`` belongs to face ``c // 3``."""
     face_count: wp.array[wp.int32]
     """Length ``m`` face-corners per unique edge."""
     faces: twt.Array2dInt32
@@ -277,17 +276,20 @@ def isotropic_remesh(
         # reads it, because the stage before it changed the vertex set. Two closest-point passes per
         # iteration is the price of keeping the field exact; see this function's Notes.
         if split:
-            _, high = _length_bands(
-                _sizing_at(current_vertices, vertices, faces, sizing_input, query_radius),
-                target,
-                int(current_vertices.shape[0]),
-                device,
-            )
+            # Only the *high* band gates a split, and with no sizing field it is one constant at
+            # every vertex -- which ``subdivide_to_size`` takes as a scalar. So the uniform path
+            # builds neither the two per-vertex band buffers nor the ``low`` band that only the
+            # collapse stage below reads.
+            split_limit: float | wp.array[wp.float32] = 4.0 / 3.0 * target
+            if sizing_input is not None:
+                split_limit = _length_bands(
+                    _sizing_at(current_vertices, vertices, faces, sizing_input, query_radius),
+                    target,
+                    int(current_vertices.shape[0]),
+                    device,
+                )[1]
             current_vertices, current_faces = subdivide_to_size(
-                current_vertices,
-                current_faces,
-                high if sizing_input is not None else 4.0 / 3.0 * target,
-                max_iter=20,
+                current_vertices, current_faces, split_limit, max_iter=20
             )
         if collapse:
             low, high = _length_bands(
@@ -444,7 +446,7 @@ def _edge_incidence(faces: wp.array[wp.int32], n_vertices: int) -> _EdgeIncidenc
             inputs=[inverse, face_count, edge_faces],
             device=device,
         )
-    return _EdgeIncidence(unique_edges, inverse, face_count, twt.as_array2d(edge_faces, wp.int32))
+    return _EdgeIncidence(unique_edges, face_count, twt.as_array2d(edge_faces, wp.int32))
 
 
 def _collapse_pass(
@@ -503,7 +505,9 @@ def _collapse_pass(
             device=device,
         )
 
-        claim = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
+        # 64-bit because the lock key is: see ``kernel_remesh.scramble_index`` for why it has to
+        # be injective, and what committing two collapses into overlapping 1-rings costs.
+        claim = wp.full(n_vertices, INT64_MAX, dtype=wp.int64, device=device)
         wp.launch(
             kernel_remesh.claim_collapse_key,
             dim=m,
@@ -653,7 +657,11 @@ def _reproject_pass(
 
 
 def _flip_interior_edges(
-    faces: wp.array[wp.int32], n_vertices: int, launch_candidates: _LaunchCandidates, max_iter: int
+    faces: wp.array[wp.int32],
+    n_vertices: int,
+    launch_candidates: _LaunchCandidates,
+    max_iter: int,
+    before_commit: Callable[[_FlipTopology, int], None] | None = None,
 ) -> int:
     """
     Repeatedly flip an independent set of interior edges until none is a candidate.
@@ -663,6 +671,13 @@ def _flip_interior_edges(
     conflict-free subset (no two committed flips touch a shared face or create the same new
     edge). Returns the total number of flips performed. The winding rewrite matches
     ``igl::flip_edge``.
+
+    ``before_commit`` runs after the independent set has been claimed and before the faces are
+    rewritten, which is the only window in which a caller can still read the *old* connectivity
+    alongside the decision. [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay] is why it
+    exists: it carries an edge-length table beside the face buffer and has to update the lengths of
+    the winning flips while the corners still say which vertex each length belongs to. Every other
+    caller needs nothing there, which is the whole of the difference between the three flip loops.
 
     The per-pass topology is built by ``_FlipTopology`` on fixed buffers rather than by composing
     the public wrappers, which avoids rebuilding structure that does not change shape between
@@ -708,6 +723,8 @@ def _flip_interior_edges(
             ],
             device=device,
         )
+        if before_commit is not None:
+            before_commit(topology, m)
         count.zero_()
         wp.launch(
             kernel_remesh.commit_flips,
@@ -972,8 +989,10 @@ def cluster_decimate(
         vertices, voxel_size, caller="cluster_decimate"
     )
     cells = tw.voxels.cell_indices(vertices, voxel_size, origin=origin)
-    _unique_cells, labels = tw.grouping.unique_rows(cells, return_inverse=True)
-    n_clusters = int(tw.reduce.max(labels)) + 1
+    unique_cells, labels = tw.grouping.unique_rows(cells, return_inverse=True)
+    # The unique rows *are* the clusters, so their count is the answer -- a device reduction over
+    # ``labels`` plus its readback would re-derive a number ``unique_rows`` has already paid for.
+    n_clusters = int(unique_cells.shape[0])
 
     cluster_vertices = _cluster_positions(
         vertices, labels, n_clusters, origin, voxel_size, contraction
@@ -1491,8 +1510,7 @@ class _DecimationBuffers:
         # than approximate).
         candidates = wp.clone(survivor)
         locked = wp.zeros(self.n_vertices + 1, dtype=wp.int32, device=device)
-        min_key = wp.empty(self.n_vertices + 1, dtype=wp.int32, device=device)
-        claim = wp.empty(self.n_vertices + 1, dtype=wp.int32, device=device)
+        min_key = wp.empty(self.n_vertices + 1, dtype=wp.int64, device=device)
         remap = tw.array.arange(self.n_vertices + 1, device=device)
         wp.copy(self._positions, self.vertices)
         self._count.zero_()
@@ -1508,12 +1526,10 @@ class _DecimationBuffers:
             survivor,
             locked,
             min_key,
-            claim,
             remap,
             self._positions,
             self._count,
             self._surplus,
-            capture=False,
         )
         compaction_scratch = self._compact(remap, dummy)
         self._retain = [
@@ -1533,7 +1549,6 @@ class _DecimationBuffers:
             candidates,
             locked,
             min_key,
-            claim,
             remap,
             round_scratch,
             compaction_scratch,
@@ -1599,9 +1614,7 @@ class _DecimationBuffers:
             inputs=[self._inverse, self._edge_face_count, self._edge_faces],
             device=device,
         )
-        return _EdgeIncidence(
-            self._unique_edges, self._inverse, self._edge_face_count, self._edge_faces
-        )
+        return _EdgeIncidence(self._unique_edges, self._edge_face_count, self._edge_faces)
 
     def _edge_csr(self, unique_edges: twt.Array2dInt32) -> wps.BsrMatrix[wp.Scalar]:
         """
@@ -1718,13 +1731,11 @@ def _run_collapse_rounds(
     target_pos: wp.array[wp.vec3],
     survivor: wp.array[wp.int32],
     locked: wp.array[wp.int32],
-    min_key: wp.array[wp.int32],
-    claim: wp.array[wp.int32],
+    min_key: wp.array[wp.int64],
     remap: wp.array[wp.int32],
     positions: wp.array[wp.vec3],
     count: wp.array[wp.int32],
     surplus: wp.array[wp.int32],
-    capture: bool = True,
 ) -> list[wp.array]:
     """
     Commit independent sets of collapses against one scoring, until a round finds nothing new.
@@ -1732,14 +1743,16 @@ def _run_collapse_rounds(
     Everything the loop decides with lives in two small device arrays -- ``budget``, and
     ``round_state``, the shared round-loop state (``kernels/array.py``'s ``LOOP_ROUND`` /
     ``LOOP_CONDITION``) with a third slot appended for the previous round's commit count -- so
-    the body holds no host readback and the whole loop is a single ``wp.capture_while`` graph.
+    the body holds no host readback and the whole loop is a single ``wp.capture_while`` node.
 
     That is the point of the shape. A round issues a fixed number of launches over an ``m`` that can
     be tens of thousands wide while committing only a small fraction of the candidates, so the
-    round loop's host marshalling — not its kernels — is the cost, and capturing it removes that
-    marshalling from every round after the first.
+    round loop's host marshalling — not its kernels — is the cost, and putting it on the device
+    removes that marshalling from every round after the first.
 
-    Every round runs the identical body, which is what makes one captured graph enough:
+    The sole caller is already capturing when it issues this, so the conditional graph built here
+    nests as an inner ``while`` node of *its* graph rather than being captured and launched
+    separately. Every round runs the identical body, which is what makes one graph enough:
 
     - ``drop_locked_candidates`` runs on the first round too, where ``locked`` is all-zero and it
       restores ``survivor`` from ``candidates`` unchanged.
@@ -1756,9 +1769,9 @@ def _run_collapse_rounds(
     Returns
     -------
     list of wp.array
-        This loop's own scratch, returned only so that a caller which is itself capturing
-        (``capture=False``) can keep it alive; see ``_DecimationBuffers._issue_pass`` for why that
-        is defensive rather than known to be required.
+        This loop's own scratch, returned only so the capturing caller can keep it alive; see
+        ``_DecimationBuffers._issue_pass`` for why that is defensive rather than known to be
+        required.
     """
     budget = wp.zeros(1, dtype=wp.int32, device=device)
     round_state = wp.zeros(kernel_remesh.COLLAPSE_STATE_SIZE, dtype=wp.int32, device=device)
@@ -1782,18 +1795,11 @@ def _run_collapse_rounds(
             inputs=[candidates, removed, csr.offsets, csr.columns, locked, survivor],
             device=device,
         )
-        min_key.fill_(INT32_MAX)
+        min_key.fill_(INT64_MAX)
         wp.launch(
             kernel_remesh.claim_collapse_key,
             dim=m,
             inputs=[survivor, removed, csr.offsets, csr.columns, min_key],
-            device=device,
-        )
-        claim.fill_(INT32_MAX)
-        wp.launch(
-            kernel_remesh.claim_collapse_index,
-            dim=m,
-            inputs=[survivor, removed, csr.offsets, csr.columns, min_key, claim],
             device=device,
         )
         # Writes the winners' costs straight into the sort's key buffer (+inf elsewhere, so every
@@ -1807,7 +1813,6 @@ def _run_collapse_rounds(
                 csr.offsets,
                 csr.columns,
                 min_key,
-                claim,
                 cost,
                 survivor,
                 sort_keys,
@@ -1848,14 +1853,9 @@ def _run_collapse_rounds(
         )
 
     condition = round_state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
-    if capture and device.is_cuda and wp.is_conditional_graph_supported():
-        with wp.ScopedCapture(device) as capture_scope:
-            wp.capture_while(condition, round_body)
-        wp.capture_launch(capture_scope.graph)
-    else:
-        # ``capture=False`` when the caller is already capturing: a conditional graph nests, so the
-        # round loop becomes an inner ``while`` node of the pass graph rather than its own.
-        wp.capture_while(condition, round_body)
+    # The caller is already capturing, so this nests: a conditional graph becomes an inner
+    # ``while`` node of the pass graph rather than a graph captured and launched on its own.
+    wp.capture_while(condition, round_body)
     return [budget, round_state, sort_keys, sort_values]
 
 
@@ -2231,25 +2231,29 @@ def intrinsic_delaunay(
     if n_faces == 0:
         return intrinsic_faces, lengths, 0
 
-    total = 0
-    for _ in range(max_iter):
-        edges_sorted = tw.edges.faces_to_edges(intrinsic_faces, sorted=True)
-        adjacency, adjacency_edges = tw.adjacency.face_adjacency(
-            intrinsic_faces, edges_sorted, return_edges=True, n_vertices=n_vertices
-        )
-        n_interior = int(adjacency.shape[0])
-        if n_interior == 0:
-            break
-        unshared = tw.adjacency.face_adjacency_unshared(intrinsic_faces, adjacency, adjacency_edges)
-        keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
-        sorted_keys, _order = tw.array.sort_and_argsort(keys)
+    # The loop *is* ``_flip_interior_edges``: same topology rebuild, same candidate/claim/commit
+    # protocol, same stopping rule. All that is intrinsic about it is the predicate and the
+    # edge-length table that rides beside the faces -- the first is the ``launch_candidates``
+    # argument every flip pass supplies, and the second is what ``before_commit`` is for.
+    new_length: list[wp.array[wp.float32] | None] = [None]
 
-        flip = wp.zeros(n_interior, dtype=wp.bool, device=device)
-        quad = twt.empty_2d((n_interior, 4), wp.int32, device=device)
-        new_length = wp.empty(n_interior, dtype=wp.float32, device=device)
+    def launch_candidates(
+        adjacency: twt.Array2dInt32,
+        adjacency_edges: twt.Array2dInt32,
+        unshared: twt.Array2dInt32,
+        sorted_keys: wp.array[wp.uint64],
+        key_base: wp.uint64,
+        flip: wp.array[wp.bool],
+        quad: twt.Array2dInt32,
+    ) -> None:
+        m = int(adjacency.shape[0])
+        # Sized alongside the topology's own row tables, which are reallocated on the same
+        # condition, so this stays row-aligned with ``flip`` and ``quad`` without tracking ``m``.
+        if new_length[0] is None or int(new_length[0].shape[0]) != m:
+            new_length[0] = wp.empty(m, dtype=wp.float32, device=device)
         wp.launch(
             kernel_remesh.intrinsic_delaunay_candidates,
-            dim=n_interior,
+            dim=m,
             inputs=[
                 intrinsic_faces,
                 lengths,
@@ -2257,75 +2261,38 @@ def intrinsic_delaunay(
                 adjacency_edges,
                 unshared,
                 sorted_keys,
-                wp.uint64(n_vertices),
+                key_base,
                 flip,
                 quad,
-                new_length,
+                new_length[0],
             ],
             device=device,
         )
 
-        # Independent set: a flip commits only if it wins both incident faces and its new edge's
-        # hashed slot, so no two committed flips share a face or invent the same edge.
-        table = 1
-        while table < 4 * n_interior + 1:
-            table <<= 1
-        face_claim = wp.full(n_faces, INT32_MAX, dtype=wp.int32, device=device)
-        edge_claim = wp.full(table, INT32_MAX, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_remesh.claim_flips,
-            dim=n_interior,
-            inputs=[
-                flip,
-                quad,
-                adjacency,
-                wp.int32(table - 1),
-                wp.uint64(n_vertices),
-                face_claim,
-                edge_claim,
-            ],
-            device=device,
-        )
-        # Lengths first: this pass needs the *old* connectivity to know which corner holds which
-        # vertex, and ``commit_flips`` is about to overwrite it.
+    def update_lengths(topology: _FlipTopology, m: int) -> None:
+        # Lengths before the commit: this pass needs the *old* connectivity to know which corner
+        # holds which vertex, and ``commit_flips`` is about to overwrite it.
         wp.launch(
             kernel_remesh.update_flipped_lengths,
-            dim=n_interior,
+            dim=m,
             inputs=[
                 intrinsic_faces,
-                flip,
-                quad,
-                adjacency,
-                new_length,
-                face_claim,
-                edge_claim,
-                wp.int32(table - 1),
+                topology.flip,
+                topology.quad,
+                topology.adjacency,
+                new_length[0],
+                topology.face_claim,
+                topology.edge_claim,
+                wp.int32(topology.edge_claim_mask),
                 wp.uint64(n_vertices),
                 lengths,
             ],
             device=device,
         )
-        count = wp.zeros(1, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_remesh.commit_flips,
-            dim=n_interior,
-            inputs=[
-                flip,
-                quad,
-                adjacency,
-                face_claim,
-                edge_claim,
-                wp.int32(table - 1),
-                wp.uint64(n_vertices),
-                intrinsic_faces,
-                count,
-            ],
-            device=device,
-        )
-        committed = int(read_scalar(count, 0))
-        total += committed
-        if committed == 0:
-            break
+
+    total = _flip_interior_edges(
+        intrinsic_faces, n_vertices, launch_candidates, max_iter, update_lengths
+    )
     return intrinsic_faces, lengths, total
 
 
@@ -2360,7 +2327,9 @@ def subdivide(
 
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        return vertices, faces
+        # Cloned, not aliased: every other entry point in this module returns independent buffers,
+        # and a caller that mutates a "subdivided" mesh must not reach back into its own input.
+        return wp.clone(vertices), wp.clone(faces)
 
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
     n_unique = int(unique_edges.shape[0])
@@ -2477,10 +2446,15 @@ def subdivide_loop(
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
+        # No faces means no edges and no relocation, so the pass is the identity -- but it
+        # returns independent buffers all the same, as every other entry point here does.
         if return_operator:
-            # No faces means no edges and no relocation, so the pass is the identity.
-            return vertices, faces, wps.bsr_identity(n_vertices, wp.float32, device=device)
-        return vertices, faces
+            return (
+                wp.clone(vertices),
+                wp.clone(faces),
+                wps.bsr_identity(n_vertices, wp.float32, device=device),
+            )
+        return wp.clone(vertices), wp.clone(faces)
 
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
     n_unique = int(unique_edges.shape[0])
@@ -2919,8 +2893,9 @@ def subdivide_region_to_size(
         long_mask = wp.empty(m, dtype=wp.bool, device=device)
         wp.map(kernel_remesh.long_region_edge, lengths, max_edge_f, edge_in_region, out=long_mask)
 
-        flags = tw.array.astype(long_mask, wp.int32)
-        offsets, n_long = tw.array.counts_to_offsets(flags)
+        # Only the *count* is wanted here -- for the stopping test, the budget and the running
+        # total. ``split_edges`` derives the per-edge vertex slots from ``long_mask`` itself.
+        n_long = int(tw.reduce.sum(tw.array.astype(long_mask, wp.int32)))
 
         if n_long == 0:
             break
@@ -2934,47 +2909,24 @@ def subdivide_region_to_size(
             if remaining <= 0:
                 break
             if n_long > remaining:
+                # It keeps exactly ``remaining`` of the flagged edges, by construction, so the
+                # new count needs no second reduction.
                 long_mask = _keep_longest_edges(long_mask, lengths, remaining, m, device)
-                wp.utils.array_cast(long_mask, flags)
-                offsets, n_long = tw.array.counts_to_offsets(flags)
+                n_long = remaining
 
-        midpoint_idx = wp.empty(m, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_remesh.build_midpoint_index,
-            dim=m,
-            inputs=[long_mask, offsets, wp.int32(n_vertices), midpoint_idx],
-            device=device,
+        # The crack-free split itself is [`split_edges`][triwarp.remesh.split_edges], which is
+        # exactly what this loop contributes nothing new to: all this function decides is *which*
+        # edges (long, and inside the region) and what rides along (``region_flags``, carried
+        # through ``index`` so the grown region comes back resolved onto the new faces).
+        current_vertices, current_faces, region_flags = split_edges(
+            current_vertices,
+            current_faces,
+            long_mask,
+            unique_edges=unique_edges,
+            inverse=inverse,
+            index=region_flags,
+            return_index=True,
         )
-        new_mid = wp.empty(n_long, dtype=wp.vec3, device=device)
-        wp.launch(
-            kernel_remesh.fill_edge_midpoints,
-            dim=m,
-            inputs=[current_vertices, unique_edges, long_mask, offsets, new_mid],
-            device=device,
-        )
-        current_vertices, _ = tw.array.pack_1d_arrays([current_vertices, new_mid])
-
-        face_mid = tw.array.gather(midpoint_idx, inverse).reshape((n_faces, 3))
-        out_faces = twt.empty_2d((n_faces * 4, 3), wp.int32, device=device)
-        out_valid = wp.empty(n_faces * 4, dtype=wp.bool, device=device)
-        out_slot_index = wp.empty(n_faces * 4, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_remesh.emit_size_faces,
-            dim=n_faces,
-            inputs=[
-                current_faces,
-                face_mid,
-                current_vertices,
-                region_flags,
-                out_faces,
-                out_valid,
-                out_slot_index,
-            ],
-            device=device,
-        )
-        kept = tw.array.flatnonzero(out_valid)
-        current_faces = tw.array.gather(out_faces, kept).reshape(-1)
-        region_flags = tw.array.gather(out_slot_index, kept)
         splits_done += n_long
 
         if delaunay:

@@ -198,18 +198,18 @@ def lock_two_rings(
     columns: wp.array[wp.int32],
     s: wp.int32,
     r: wp.int32,
-    key: wp.int32,
-    out_claim: wp.array[wp.int32],
+    key: wp.int64,
+    out_claim: wp.array[wp.int64],
 ) -> None:
     # Atomic-min ``key`` into every vertex of the two closed 1-rings of ``s`` and ``r``: the lock
     # half of a parallel independent set over edge candidates, so that whichever candidate wins
     # everywhere it touched has a neighbourhood disjoint from every other winner's.
     #
-    # ``kernels/remesh.py`` runs this three times per collapse pass -- once for the isotropic
-    # path's single claim and twice for the quadric path's key-then-index pair -- with a different
-    # ``key`` each time, which is the whole of the difference between the three. What the *key*
-    # must be is recorded at ``remesh.scramble_index``, and it is load-bearing: a spatially
-    # monotone key commits one collapse per pass.
+    # Both of ``kernels/remesh.py``'s collapse paths run this once per pass, with the key
+    # ``remesh.scramble_index`` builds. Two properties of that key are load-bearing and both are
+    # recorded there: it must not be spatially monotone (a monotone key commits one collapse per
+    # pass), and it must be *injective*, or two candidates can tie and both believe they won --
+    # which is why it is 64 bits wide here rather than the natural int32 of a vertex index.
     wp.atomic_min(out_claim, s, key)
     wp.atomic_min(out_claim, r, key)
     for i in range(offsets[s], offsets[s + 1]):

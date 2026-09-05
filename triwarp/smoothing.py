@@ -55,7 +55,6 @@ import math
 from typing import Literal, NamedTuple
 
 import warp as wp
-import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
@@ -105,9 +104,8 @@ def filter_laplacian(
     iterations
         Number of smoothing passes.
     implicit_time_integration
-        If ``True`` solve ``((1 + lamb) I - lamb L) V' = V`` each pass via conjugate gradient
-        (**CUDA only** — raises on CPU). If ``False`` apply the explicit step
-        ``V' = V + lamb (L V - V)``.
+        If ``True`` solve ``((1 + lamb) I - lamb L) V' = V`` each pass via conjugate gradient.
+        If ``False`` apply the explicit step ``V' = V + lamb (L V - V)``.
     volume_constraint
         If ``True`` rescale the mesh after each pass to preserve its initial volume, counteracting
         Laplacian shrinkage.
@@ -145,23 +143,29 @@ def filter_laplacian(
 
     if implicit_time_integration:
         system = _build_implicit_system(operator, lamb, n, device)
-        precond = wpl.preconditioner(system, "diag")
-        components = _empty_components(n, device)
-        solutions = _empty_components(n, device)
+        components = _component_columns(n, device)
+        solutions = _component_columns(n, device)
+        # The operator is fixed for the whole flow -- only the right-hand side moves -- so the
+        # batched solver state is built once outside the loop and re-reads both buffers on every
+        # call, which is the shape its own docstring asks for.
+        solver = twl.spd_column_solver(
+            system, components, solutions, tol=twl.CG_TOLERANCE, maxiter=10 * n
+        )
+        component_rows = [components[column] for column in range(3)]
         for _ in range(iterations):
-            wp.map(kernel_smoothing.extract_components, positions, out=list(components))
-            for rhs, solution in zip(components, solutions, strict=True):
-                wp.copy(solution, rhs)
-                twl.solve_spd(
-                    system,
-                    rhs,
-                    solution,
-                    tol=twl.CG_TOLERANCE,
-                    maxiter=10 * n,
-                    preconditioner=precond,
-                    name="filter_laplacian(implicit_time_integration=True)",
-                )
-            wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
+            wp.map(kernel_smoothing.extract_components, positions, out=component_rows)
+            # Seed each column with its own right-hand side, which here *is* the current position
+            # component. Only a volume-constrained pass makes the two differ, since the rescale
+            # moves the positions after the previous solve wrote them.
+            wp.copy(solutions, components)
+            solver()
+            wp.map(
+                kernel_smoothing.combine_components,
+                solutions[0],
+                solutions[1],
+                solutions[2],
+                out=positions,
+            )
             if volume_constraint:
                 _apply_volume_constraint(positions, faces, vol_ini)
     else:
@@ -216,10 +220,19 @@ def _build_implicit_system(
 def _apply_volume_constraint(
     positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], vol_ini: float
 ) -> None:
+    """
+    Rescale about the origin so the signed volume returns to ``vol_ini``.
+
+    The ratio has to be *positive* as well as finite: a smoothing pass that flips the sign of the
+    signed volume -- an inconsistently wound or non-watertight input, where the "volume" is not a
+    volume at all -- makes ``ratio ** (1 / 3)`` a Python ``complex``, which ``wp.float64`` then
+    rejects with a bare ``TypeError``. There is no scale factor that restores a volume of the
+    opposite sign, so the pass is skipped rather than approximated.
+    """
     vol_new = tw.measures.volume(positions, faces)
-    if vol_new != 0.0:
-        factor = (vol_ini / vol_new) ** (1.0 / 3.0)
-        wp.map(wp.mul, positions, wp.float64(factor), out=positions)
+    ratio = vol_ini / vol_new if vol_new != 0.0 else 0.0
+    if ratio > 0.0:
+        wp.map(wp.mul, positions, wp.float64(ratio ** (1.0 / 3.0)), out=positions)
 
 
 def inflate(
@@ -253,7 +266,8 @@ def inflate(
         ``pressure``, and the tests compare the properties an inflation must have (volume grows,
         the displacement is normal-aligned) rather than positions. Pass the result through
         [`filter_implicit_fairing`][triwarp.smoothing.filter_implicit_fairing] if you want that
-        formulation; it is CUDA-only, which is why it is not the default here.
+        formulation; it costs a conjugate-gradient solve per pass, which is why it is not the
+        default here.
 
     Parameters
     ----------
@@ -877,15 +891,20 @@ def _relaxation_state(
         raise ValueError(f"max_displacement must be non-negative, got {max_displacement}")
     n_vertices = int(vertices.shape[0])
     limit = wp.float32(-1.0 if max_displacement is None else max_displacement)
-    if n_vertices == 0 or iterations == 0:
-        return None, limit
-    if region is None:
-        return wp.full(n_vertices, True, dtype=wp.bool, device=vertices.device), limit
-    if len(region.shape) != 1 or region.shape[0] != n_vertices or region.dtype is not wp.bool:
+    # Validate before the do-nothing early return, so a malformed ``region`` raises whatever
+    # ``iterations`` happens to be -- ``smooth_region_boundary`` orders it this way too, and a
+    # validation a caller can switch off by asking for zero passes is not one.
+    if region is not None and (
+        len(region.shape) != 1 or region.shape[0] != n_vertices or region.dtype is not wp.bool
+    ):
         raise ValueError(
             f"region must be a length-{n_vertices} wp.bool array, got shape {tuple(region.shape)} "
             f"of {region.dtype}"
         )
+    if n_vertices == 0 or iterations == 0:
+        return None, limit
+    if region is None:
+        return wp.full(n_vertices, True, dtype=wp.bool, device=vertices.device), limit
     return region, limit
 
 
@@ -920,8 +939,8 @@ def filter_taubin(
         Number of smoothing passes (shrink and inflate alternate by pass index).
     laplacian_operator
         Optional precomputed row-stochastic operator (see
-        [`laplacian`][triwarp.laplacian.laplacian]). Autogenerated (uniform weights) when ``None``,
-        and ignored when ``recompute`` is set.
+        [`laplacian`][triwarp.laplacian.laplacian]). Autogenerated (uniform weights) when ``None``.
+        Passing one *and* setting ``recompute`` is a contradiction and raises.
     recompute
         Reassemble the inverse-distance operator from the *current* positions before every pass,
         instead of applying one operator throughout. Off by default; see the ``Notes`` — it is a
@@ -974,7 +993,7 @@ def filter_taubin(
     # connectivity that never changes -- so the unique-edge set is derived once here rather than
     # inside the loop, which would otherwise repay the same derivation once per iteration for an
     # identical answer.
-    recompute_edges = tw.edges.edges_unique(faces, n_vertices=n)[0] if recompute and n > 0 else None
+    recompute_edges = tw.edges.edges_unique(faces, n_vertices=n)[0] if recompute else None
     positions = _as_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
@@ -988,7 +1007,7 @@ def filter_taubin(
     )
     for index in range(iterations):
         pass_operator = (
-            tw.laplacian.laplacian(
+            laplacian.laplacian(
                 _as_vec3(positions), faces, equal_weight=False, edges=recompute_edges
             )
             if operator is None
@@ -1235,8 +1254,7 @@ def filter_implicit_fairing(
     cotangent stiffness matrix ([`cotmatrix`][triwarp.laplacian.cotmatrix]) and ``M`` the
     barycentric lumped mass matrix ([`mass_matrix`][triwarp.laplacian.mass_matrix]), both recomputed
     from the current geometry. This is the most accurate of the smoothing filters (curvature flow;
-    libigl tutorial 205) and is **CUDA only** (raises on
-    CPU). The solve uses ``float64`` throughout.
+    libigl tutorial 205). The solve uses ``float64`` throughout.
 
     On a mesh with an open boundary the flow needs a boundary condition, which is what
     ``pin_boundary`` supplies: without one the unconstrained boundary is pulled inward, collapsing
@@ -1283,14 +1301,18 @@ def filter_implicit_fairing(
         return wp.clone(vertices)
 
     positions = _as_vec3d(vertices)
-    components = _empty_components(n, device)
-    rhs = _empty_components(n, device)
-    solutions = _empty_components(n, device)
+    components = _component_columns(n, device)
+    rhs = _component_columns(n, device)
+    solutions = _component_columns(n, device)
+    component_rows = [components[column] for column in range(3)]
 
     # Boundary topology is fixed for the whole flow, so the partition is built once. ``None`` means
     # "solve over every vertex" -- either the caller asked for the unconstrained flow, or the mesh
     # is closed and there is nothing to pin.
     dirichlet = _dirichlet_state(vertices, faces, positions, n, device) if pin_boundary else None
+    if dirichlet is not None and dirichlet.n_free == 0:
+        # Every vertex is pinned, so the flow has no unknown to move and the pass is the identity.
+        return _as_vec3(positions)
 
     for _ in range(iterations):
         current = _as_vec3(positions)
@@ -1302,27 +1324,27 @@ def filter_implicit_fairing(
         mass = laplacian.mass_matrix_entries(current, faces, dtype=wp.float64)
 
         # Right-hand side b = M V, formed before ``bsr_axpy`` mutates the mass matrix.
-        wp.map(kernel_smoothing.extract_components, positions, out=list(components))
-        for component, b in zip(components, rhs, strict=True):
-            wp.map(wp.mul, mass, component, out=b)
+        wp.map(kernel_smoothing.extract_components, positions, out=component_rows)
+        for column in range(3):
+            wp.map(wp.mul, mass, components[column], out=rhs[column])
 
         # A = M - lamb L (SPD: L has a negative diagonal, so subtracting it adds to the diagonal).
         system = wps.bsr_axpy(x=stiffness, y=wps.bsr_diag(diag=mass), alpha=-float(lamb), beta=1.0)
 
         if dirichlet is None:
-            precond = wpl.preconditioner(system, "diag")
-            for b, solution, component in zip(rhs, solutions, components, strict=True):
-                wp.copy(solution, component)
-                twl.solve_spd(
-                    system,
-                    b,
-                    solution,
-                    tol=twl.CG_TOLERANCE,
-                    maxiter=10 * n,
-                    preconditioner=precond,
-                    name="filter_implicit_fairing",
-                )
-            wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
+            # Seed CG with the current positions, not with ``b = M V``: an unreferenced vertex has
+            # an all-zero row and a zero right-hand side, so CG never writes its entry and it would
+            # keep whatever the seed left there. One batched solve advances all three columns
+            # together; the operator is rebuilt every pass, so there is no state to hoist.
+            wp.copy(solutions, components)
+            twl.solve_spd_columns(system, rhs, solutions, tol=twl.CG_TOLERANCE, maxiter=10 * n)
+            wp.map(
+                kernel_smoothing.combine_components,
+                solutions[0],
+                solutions[1],
+                solutions[2],
+                out=positions,
+            )
             continue
 
         # Dirichlet pass: eliminate the pinned rows and columns, then solve over the interior.
@@ -1337,19 +1359,23 @@ def filter_implicit_fairing(
             inputs=[dirichlet.fixed_mask, dirichlet.free_map, mass, positions, interior_rhs],
             device=device,
         )
-        interior_precond = wpl.preconditioner(interior_system, "diag")
         solution_2d = dirichlet.solution
-        for column in range(3):
-            wp.copy(solution_2d[column], interior_rhs[column])
-            twl.solve_spd(
-                interior_system,
-                interior_rhs[column],
-                solution_2d[column],
-                tol=twl.CG_TOLERANCE,
-                maxiter=10 * dirichlet.n_free,
-                preconditioner=interior_precond,
-                name="filter_implicit_fairing",
-            )
+        # Seed CG with the free vertices' current positions, exactly as the unreduced branch above
+        # does -- the right-hand side is not a position, and an unreferenced vertex whose row and
+        # right-hand side are both zero would be left wherever the seed put it.
+        wp.launch(
+            kernel_smoothing.gather_free_positions_2d,
+            dim=n,
+            inputs=[dirichlet.fixed_mask, dirichlet.free_map, positions, solution_2d],
+            device=device,
+        )
+        twl.solve_spd_columns(
+            interior_system,
+            interior_rhs,
+            solution_2d,
+            tol=twl.CG_TOLERANCE,
+            maxiter=10 * dirichlet.n_free,
+        )
         wp.launch(
             kernel_smoothing.scatter_free_positions,
             dim=n,
@@ -1397,8 +1423,11 @@ def _dirichlet_state(
         return None
     fixed_mask = tw.array.indices_to_mask(boundary_wp, n, device=device)
     free_map, n_free = twl.free_partition(fixed_mask)
-    if n_free == 0:
-        return None
+    # ``n_free == 0`` is *not* folded into the ``None`` above, although it too has nothing to
+    # solve: ``None`` means "no boundary, so run unconstrained", and a mesh whose every vertex is
+    # on the boundary (a single triangle, a fan, a strip, a small hole patch) would then have the
+    # unconstrained flow move every vertex the caller asked to pin. The caller reads ``n_free`` and
+    # returns the input unchanged instead.
     pinned = wp.zeros((3, n), dtype=wp.float64, device=device)
     wp.map(
         kernel_smoothing.extract_components, positions, out=[pinned[column] for column in range(3)]
@@ -1412,14 +1441,17 @@ def _dirichlet_state(
     )
 
 
-def _empty_components(
-    n: int, device: wp.DeviceLike
-) -> tuple[wp.array[wp.float64], wp.array[wp.float64], wp.array[wp.float64]]:
-    return (
-        wp.empty(n, dtype=wp.float64, device=device),
-        wp.empty(n, dtype=wp.float64, device=device),
-        wp.empty(n, dtype=wp.float64, device=device),
-    )
+def _component_columns(n: int, device: wp.DeviceLike) -> twt.Array2dFloat64:
+    """
+    ``(3, n)`` ``float64`` scratch holding one vertex-position component per row.
+
+    Rank 2 rather than three separate buffers so the whole thing reaches
+    [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]: the three components share one
+    operator, so batching them advances all three in a single Krylov iteration whose count is the
+    worst column's rather than the sum of three separate solves. Both that solver and ``wp.map``'s
+    multi-output form read the rows as contiguous slices of this one allocation.
+    """
+    return twt.as_array2d(wp.empty((3, n), dtype=wp.float64, device=device), wp.float64)
 
 
 def smooth_region_fixed_rim(

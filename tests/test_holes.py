@@ -2508,6 +2508,53 @@ def test_bridge_edges_shared_vertex_is_one_triangle(
     )
 
 
+@pytest.mark.parametrize(
+    ("shared", "edge_a", "edge_b", "expected"),
+    [("a0 == b0", (0, 1), (0, 3), [1, 0, 3]), ("a1 == b1", (2, 0), (4, 0), [0, 2, 4])],
+)
+def test_bridge_edges_shared_endpoint_on_the_split_diagonal(
+    device: str, shared: str, edge_a: tuple[int, int], edge_b: tuple[int, int], expected: list[int]
+) -> None:
+    """
+    Not a library comparison: meshlib's ``makeBridge`` declines this input.
+
+    It needs a manifold topology, so the collapsed quad's own traversal is the only available
+    oracle -- which is exact, the answer being a single named triangle rather than a tolerance.
+
+    The quad ``(a1, a0, b1, b0)`` is split along its ``a0``-``b0`` diagonal, so a shared endpoint
+    *on that diagonal* is the one case the split cannot express: at ``a0 == b0`` both halves fold
+    onto a line and the patch came out **empty** (``bridge_edges`` returned the mesh unchanged, with
+    no error, despite documenting a 3-entry growth), and at ``a1 == b1`` the two halves were the
+    same triangle wound opposite ways and the patch came out **doubled**. The rim-consecutive test
+    above cannot reach either: it exercises the *crossed* endpoints (``a0 == b1`` / ``a1 == b0``),
+    where the plain degeneracy filter is already correct.
+
+    Reaching the aligned case needs two boundary loops sharing a vertex, which a single simple rim
+    cannot have -- hence the explicit bowtie rather than a fixture. What the invariants exclude is
+    the empty and the doubled patch; they say nothing about the general two-triangle case, which
+    the meshlib comparisons above cover.
+    """
+    vertices_np = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [-1, 0, 0], [0, -1, 0]], dtype=np.float64
+    )
+    faces_np = np.array([0, 1, 2, 0, 3, 4], dtype=np.int32)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    # Non-vacuity: the two edges really are boundary edges that share exactly one endpoint.
+    rim_np = tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp).numpy()
+    rim_rows = {(int(u), int(v)) for u, v in rim_np}
+    assert edge_a in rim_rows
+    assert edge_b in rim_rows
+    assert len(set(edge_a) | set(edge_b)) == 3
+
+    bridged_faces_wp = tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_b)
+    patch_np = bridged_faces_wp.numpy().reshape(-1, 3)[2:]
+    assert len(patch_np) == 1, f"{shared} must give one triangle, got {len(patch_np)}"
+    assert np.array_equal(patch_np[0], expected)
+    # The documented growth is 3 entries for the shared-vertex case; an empty patch would leave the
+    # buffer at its input length and a doubled one would add 6.
+    assert int(bridged_faces_wp.shape[0]) == int(faces_wp.shape[0]) + 3
+
+
 def test_bridge_edges_rejects_bad_pairs(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Not a library comparison: meshlib returns a falsy result where this raises.

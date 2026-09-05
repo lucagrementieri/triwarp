@@ -942,6 +942,24 @@ def test_uv_sphere_explicit_count_doubles_longitude(device: str) -> None:
     assert int(vertices_wp.shape[0]) == 14 * 32 + 2
 
 
+def test_uv_sphere_does_not_mutate_the_caller_s_count(device: str) -> None:
+    """
+    Triwarp against triwarp: the odd-to-even rounding must not write through the caller's array.
+
+    ``np.asanyarray`` does not copy an ``int64`` ndarray, so an in-place ``counts += counts % 2``
+    reaches back into the caller's own buffer. The sibling ``capsule`` never had the defect, and
+    ``trimesh`` uses ``np.array(...)``, which always copies -- so this pins the one spelling that
+    differed rather than a behaviour any reference defines.
+    """
+    count_np = np.array([31, 63], dtype=np.int64)
+    tw.creation.uv_sphere(count=count_np, device=device)
+    assert np.array_equal(count_np, [31, 63])
+    # A tuple cannot be written through, so it is the control: both spellings must round the same.
+    from_tuple_wp, _ = tw.creation.uv_sphere(count=(31, 63), device=device)
+    from_array_wp, _ = tw.creation.uv_sphere(count=count_np, device=device)
+    assert int(from_tuple_wp.shape[0]) == int(from_array_wp.shape[0])
+
+
 def test_capsule(device: str) -> None:
     vertices_wp, faces_wp = tw.creation.capsule(height=2.0, radius=0.5, device=device)
     mesh_tm = tm.creation.capsule(height=2.0, radius=0.5)
@@ -1570,6 +1588,42 @@ def test_parametric_surface_invalid(device: str) -> None:
         tw.creation.parametric_surface("mobius", 1, 40, device=device)
     with pytest.raises(ValueError, match="at least 2"):
         tw.creation.parametric_surface("mobius", 40, 1, device=device)
+
+
+@pytest.mark.parametrize(
+    ("surface", "u_resolution", "v_resolution"),
+    [("klein", 40, 2), ("pseudosphere", 40, 2), ("bohemian_dome", 2, 40)],
+)
+def test_parametric_surface_rejects_resolution_2_on_a_wrapped_axis(
+    device: str, surface: str, u_resolution: int, v_resolution: int
+) -> None:
+    """
+    Not a library comparison: no reference builds these lattices combinatorially.
+
+    There is nothing to compare a *rejection* against, so the claim is the rejection itself.
+
+    A wrapped, untwisted axis identifies its last row with its first, so at resolution 2 every cell
+    along it has two equal corners and the degeneracy filter removes the entire face buffer -- a
+    vertices-only "mesh" that contradicts the documented face count and, handed to
+    ``Trimesh.warp_mesh``, builds the zero-triangle ``wp.Mesh`` that corrupts CUDA allocator state.
+    What the invariant excludes is only that silent case; it says nothing about the face *values*
+    at any resolution, which the topology tests above cover.
+    """
+    with pytest.raises(ValueError, match="at least 3"):
+        tw.creation.parametric_surface(
+            surface,  # type: ignore[arg-type]
+            u_resolution,
+            v_resolution,
+            device=device,
+        )
+    # The twisted wrap is the control: a flip keeps the two rows distinct, so 2 stays admissible.
+    _vertices_wp, faces_wp = tw.creation.parametric_surface("mobius", 2, 40, device=device)
+    assert int(faces_wp.shape[0]) > 0
+
+    with pytest.raises(ValueError, match="at least 3"):
+        tw.creation.super_toroid(u_resolution=2, device=device)
+    with pytest.raises(ValueError, match="at least 3"):
+        tw.creation.super_ellipsoid(u_resolution=2, device=device)
 
 
 def test_super_ellipsoid_unit_exponents_are_a_sphere(device: str) -> None:

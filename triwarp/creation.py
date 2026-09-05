@@ -333,7 +333,7 @@ def box(
     else:
         vertices_np -= 0.5
 
-    vertices = _upload_vertices(vertices_np, device)
+    vertices = _upload_points(vertices_np, wp.vec3, device)
     faces = wp.array(_BOX_FACES, dtype=wp.int32, device=device)
     return _apply_transform(vertices, faces, transform)
 
@@ -445,7 +445,7 @@ def icosahedron(device: wp.DeviceLike = None) -> tuple[wp.array[wp.vec3], wp.arr
     [`icosphere`][triwarp.creation.icosphere]
     [`trimesh.creation.icosahedron`][]
     """
-    vertices = _upload_vertices(_ICOSAHEDRON_VERTICES, device)
+    vertices = _upload_points(_ICOSAHEDRON_VERTICES, wp.vec3, device)
     faces = wp.array(_ICOSAHEDRON_FACES, dtype=wp.int32, device=device)
     return vertices, faces
 
@@ -475,7 +475,7 @@ def tetrahedron(device: wp.DeviceLike = None) -> tuple[wp.array[wp.vec3], wp.arr
     [`icosahedron`][triwarp.creation.icosahedron]
     """
     return (
-        _upload_vertices(_TETRAHEDRON_VERTICES, device),
+        _upload_points(_TETRAHEDRON_VERTICES, wp.vec3, device),
         wp.array(_TETRAHEDRON_FACES, dtype=wp.int32, device=device),
     )
 
@@ -504,7 +504,7 @@ def octahedron(device: wp.DeviceLike = None) -> tuple[wp.array[wp.vec3], wp.arra
     [`icosahedron`][triwarp.creation.icosahedron]
     """
     return (
-        _upload_vertices(_OCTAHEDRON_VERTICES, device),
+        _upload_points(_OCTAHEDRON_VERTICES, wp.vec3, device),
         wp.array(_OCTAHEDRON_FACES, dtype=wp.int32, device=device),
     )
 
@@ -538,7 +538,7 @@ def dodecahedron(device: wp.DeviceLike = None) -> tuple[wp.array[wp.vec3], wp.ar
     [`octahedron`][triwarp.creation.octahedron]
     """
     return (
-        _upload_vertices(_DODECAHEDRON_VERTICES, device),
+        _upload_points(_DODECAHEDRON_VERTICES, wp.vec3, device),
         wp.array(_DODECAHEDRON_FACES, dtype=wp.int32, device=device),
     )
 
@@ -597,7 +597,7 @@ def icosphere(
     radius_f = wp.float32(float(radius))
 
     table = wp.array(_ICOSPHERE_FACE_TABLE, dtype=wp.int32, device=device)
-    corners = _upload_vertices(_ICOSAHEDRON_VERTICES, device)
+    corners = _upload_points(_ICOSAHEDRON_VERTICES, wp.vec3, device)
     vertices = wp.empty(10 * 4**levels + 2, dtype=wp.vec3, device=corners.device)
     # The 12 base corners occupy the first block of the numbering, so scaling them to `radius` is
     # the whole of level 0.
@@ -679,7 +679,7 @@ def uv_sphere(
         counts = np.asanyarray(count, dtype=np.int64)
         if counts.shape != (2,):
             raise ValueError(f"count must be (2,) int, got {counts.shape}")
-        counts += counts % 2
+        counts = counts + counts % 2
         latitude, longitude = int(counts[0]), int(counts[1]) * 2
 
     radius_f = abs(float(radius))
@@ -689,7 +689,9 @@ def uv_sphere(
     profile[0] = (0.0, -radius_f)
     profile[-1] = (0.0, radius_f)
 
-    return revolve(_upload_profile(profile, device), sections=longitude, transform=transform)
+    return revolve(
+        _upload_points(profile, wp.vec2, device), sections=longitude, transform=transform
+    )
 
 
 def sphere_cap(
@@ -795,7 +797,7 @@ def sphere_cap(
             written += inner_count
 
     return (
-        _upload_vertices(vertices_np, device),
+        _upload_points(vertices_np, wp.vec3, device),
         wp.array(np.ascontiguousarray(faces_np.reshape(-1)), dtype=wp.int32, device=device),
     )
 
@@ -869,7 +871,9 @@ def capsule(
     profile[0] = (0.0, -height_f / 2.0 - radius_f)
     profile[-1] = (0.0, height_f / 2.0 + radius_f)
 
-    return revolve(_upload_profile(profile, device), sections=longitude, transform=transform)
+    return revolve(
+        _upload_points(profile, wp.vec2, device), sections=longitude, transform=transform
+    )
 
 
 def cylinder(
@@ -917,17 +921,12 @@ def cylinder(
     [`capsule`][triwarp.creation.capsule]
     [`trimesh.creation.cylinder`][]
     """
-    if segment is not None:
-        transform, height = _segment_to_cylinder(segment)
-    if height is None:
-        raise ValueError("either height or segment must be passed")
-
-    half = abs(float(height)) / 2.0
+    transform, half = _resolve_cylinder_axis(height, segment, transform)
     radius_f = float(radius)
     profile = np.array(
         [[0.0, -half], [radius_f, -half], [radius_f, half], [0.0, half]], dtype=np.float64
     )
-    return revolve(_upload_profile(profile, device), sections=sections, transform=transform)
+    return revolve(_upload_points(profile, wp.vec2, device), sections=sections, transform=transform)
 
 
 def cone(
@@ -965,7 +964,7 @@ def cone(
     [`trimesh.creation.cone`][]
     """
     profile = np.array([[0.0, 0.0], [float(radius), 0.0], [0.0, float(height)]], dtype=np.float64)
-    return revolve(_upload_profile(profile, device), sections=sections, transform=transform)
+    return revolve(_upload_points(profile, wp.vec2, device), sections=sections, transform=transform)
 
 
 def annulus(
@@ -1015,26 +1014,21 @@ def annulus(
     [`torus`][triwarp.creation.torus]
     [`trimesh.creation.annulus`][]
     """
-    if segment is not None:
-        transform, height = _segment_to_cylinder(segment)
-    if height is None:
-        raise ValueError("either height or segment must be passed")
-
+    transform, half = _resolve_cylinder_axis(height, segment, transform)
     r_min_f = abs(float(r_min))
     if r_min_f < TOLERANCE_MERGE:
         return cylinder(
-            radius=r_max, height=height, sections=sections, transform=transform, device=device
+            radius=r_max, height=2.0 * half, sections=sections, transform=transform, device=device
         )
 
     r_max_f = abs(float(r_max))
-    half = abs(float(height)) / 2.0
     # Counter-clockwise rectangle with the first point repeated: the duplicate closes the profile
     # (and therefore the inner-wall/cap seam) once revolve's weld runs.
     profile = np.array(
         [[r_min_f, -half], [r_max_f, -half], [r_max_f, half], [r_min_f, half], [r_min_f, -half]],
         dtype=np.float64,
     )
-    return revolve(_upload_profile(profile, device), sections=sections, transform=transform)
+    return revolve(_upload_points(profile, wp.vec2, device), sections=sections, transform=transform)
 
 
 def torus(
@@ -1088,7 +1082,9 @@ def torus(
     profile += (float(major_radius), 0.0)
     profile[-1] = profile[0]
 
-    return revolve(_upload_profile(profile, device), sections=major_sections, transform=transform)
+    return revolve(
+        _upload_points(profile, wp.vec2, device), sections=major_sections, transform=transform
+    )
 
 
 def revolve(
@@ -1188,9 +1184,13 @@ def revolve(
     # the merged output. The two kernels below then write their final layout directly, with no
     # compaction pass and no device-to-host synchronization.
     profile_np = linestring.numpy().astype(np.float64)
+    # A closed revolution folds its last slice back onto the first; an open one keeps them all.
+    # The vertex layout and the launch must agree on this exactly -- the layout reserves the block
+    # the kernel then writes into -- so it is computed once and passed to both.
+    n_kept_slices = n_slices if closed else n_points
     keep_np = _revolve_kept_template(profile_np, span / float(n_slices))
     column_np, offsets_np, on_axis_np, n_vertices = _revolve_vertex_layout(
-        profile_np, n_slices if closed else n_points
+        profile_np, n_kept_slices
     )
     n_keep = int(keep_np.shape[0])
     layout = (
@@ -1198,7 +1198,6 @@ def revolve(
         wp.array(offsets_np, dtype=wp.int32, device=device),
         wp.array(on_axis_np, dtype=wp.bool, device=device),
     )
-    n_kept_slices = n_slices if closed else n_points
 
     vertices = wp.empty(n_vertices, dtype=wp.vec3, device=device)
     wp.launch(
@@ -1850,7 +1849,9 @@ def parametric_surface(
     Raises
     ------
     ValueError
-        If ``kind`` is not one of the listed names, or either resolution is below 2.
+        If ``kind`` is not one of the listed names, or either resolution is below 2 — or below
+        3 along an axis the surface wraps without a twist, where a resolution of 2 would identify
+        every cell's two rows and leave no faces at all.
 
     Notes
     -----
@@ -1927,7 +1928,9 @@ def super_ellipsoid(
     Raises
     ------
     ValueError
-        If ``radii`` does not have shape ``(3,)``, or either resolution is below 2.
+        If ``radii`` does not have shape ``(3,)``, if ``v_resolution`` is below 2, or if
+        ``u_resolution`` is below 3 — the u direction wraps, and a resolution of 2 there would
+        identify every cell's two rows and leave no faces at all.
 
     Notes
     -----
@@ -1987,7 +1990,8 @@ def super_toroid(
     Raises
     ------
     ValueError
-        If either resolution is below 2.
+        If either resolution is below 3. Both parameter directions wrap, and a resolution of 2
+        would identify every cell's two rows and leave no faces at all.
 
     Notes
     -----
@@ -2308,6 +2312,15 @@ def _parametric_samples(
     n_u, n_v = int(u_resolution), int(v_resolution)
     if n_u < 2 or n_v < 2:
         raise ValueError(f"resolutions must be at least 2, got {(n_u, n_v)}")
+    # A wrapped, untwisted axis identifies its last row with its first, so at resolution 2 every
+    # cell along it has two equal corners and the whole face buffer is filtered away as degenerate
+    # -- a vertex-only mesh, which is silently wrong rather than merely coarse (and reaches
+    # `wp.Mesh` as a zero-triangle build). A twist glues the seam with a flip, which keeps the two
+    # rows distinct, so the floor of 3 applies only to the untwisted case.
+    if spec.u_wrap and not spec.u_twist and n_u < 3:
+        raise ValueError(f"u_resolution must be at least 3 on a wrapped axis, got {n_u}")
+    if spec.v_wrap and not spec.v_twist and n_v < 3:
+        raise ValueError(f"v_resolution must be at least 3 on a wrapped axis, got {n_v}")
     sample_ij, faces = _parametric_lattice(spec, n_u, n_v)
     sample_u = np.linspace(*spec.u_range, n_u)[sample_ij[:, 0]]
     sample_v = np.linspace(*spec.v_range, n_v)[sample_ij[:, 1]]
@@ -2410,6 +2423,30 @@ def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.n
     return sample_ij, np.ascontiguousarray(triangles[nondegenerate].reshape(-1), dtype=np.int32)
 
 
+def _resolve_cylinder_axis(
+    height: float | None,
+    segment: Sequence[Sequence[float]] | None,
+    transform: wp.mat44 | wp.array[wp.mat44] | None,
+) -> tuple[wp.mat44 | wp.array[wp.mat44] | None, float]:
+    """
+    Resolve a cylinder-like body's axis to ``(transform, half_height)``.
+
+    ``segment`` and ``height`` are two spellings of the same axis, shared by
+    [`cylinder`][triwarp.creation.cylinder] and [`annulus`][triwarp.creation.annulus]. A segment
+    fixes the placement as well as the length, so it supersedes ``transform``.
+
+    Raises
+    ------
+    ValueError
+        If neither ``height`` nor ``segment`` is given, or ``segment`` is not ``(2, 3)``.
+    """
+    if segment is not None:
+        transform, height = _segment_to_cylinder(segment)
+    if height is None:
+        raise ValueError("either height or segment must be passed")
+    return transform, abs(float(height)) / 2.0
+
+
 def _segment_to_cylinder(segment: Sequence[Sequence[float]]) -> tuple[wp.mat44, float]:
     """Convert a 3D line segment to the transform and height of a Z-extruded origin cylinder."""
     segment_np = np.asanyarray(segment, dtype=np.float64)
@@ -2466,23 +2503,14 @@ def _transform_to_numpy(transform: wp.mat44 | wp.array[wp.mat44]) -> np.ndarray:
     return np.array(tw.transform.as_mat44(transform), dtype=np.float64).reshape(4, 4)
 
 
-def _upload_vertices(vertices_np: np.ndarray, device: wp.DeviceLike) -> wp.array[wp.vec3]:
-    """Upload an ``(n, 3)`` host array as a ``wp.vec3`` device buffer."""
-    return wp.array(
-        np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
-
-
-def _upload_profile(profile_np: np.ndarray, device: wp.DeviceLike) -> wp.array[wp.vec2]:
+def _upload_points(points_np: np.ndarray, dtype: type, device: wp.DeviceLike) -> wp.array:
     """
-    Upload an ``(n, 2)`` revolution profile as a ``wp.vec2`` device buffer.
+    Upload an ``(n, 2)`` or ``(n, 3)`` host point table as a ``wp.vec2`` / ``wp.vec3`` buffer.
 
-    Profiles are built on the host in ``float64`` and downcast here. Evaluating them on the
-    device in ``float32`` instead would put the closing point of a closed profile roughly
-    ``1e-7`` away from its first point — outside [`revolve`][triwarp.creation.revolve]'s weld
-    tolerance — while ``float64`` keeps the gap near ``1e-16``. The profiles are tiny; the
-    per-slice work they drive is what runs on the device.
+    Vertex tables and revolution profiles are both built on the host in ``float64`` and downcast
+    here. Evaluating a profile on the device in ``float32`` instead would put the closing point of
+    a closed profile roughly ``1e-7`` away from its first point — outside
+    [`revolve`][triwarp.creation.revolve]'s weld tolerance — while ``float64`` keeps the gap near
+    ``1e-16``. These tables are tiny; the per-slice work they drive is what runs on the device.
     """
-    return wp.array(
-        np.ascontiguousarray(profile_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
+    return wp.array(np.ascontiguousarray(points_np, dtype=np.float32), dtype=dtype, device=device)

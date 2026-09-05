@@ -162,9 +162,9 @@ def fill_fan(
     faces
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
     preserve_largest_hole
-        When ``True``, leave the single largest boundary loop (most vertices) open and fill only
-        the rest. This turns a mesh with a known disk-like topology into a single-boundary disk,
-        which is the input a robust UV parametrization expects.
+        When ``True``, leave the single largest boundary loop (greatest perimeter) open and fill
+        only the rest. This turns a mesh with a known disk-like topology into a single-boundary
+        disk, which is the input a robust UV parametrization expects.
 
     Returns
     -------
@@ -222,9 +222,9 @@ def fill_cone(
     faces
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
     preserve_largest_hole
-        When ``True``, leave the single largest boundary loop (most vertices) open and fill only
-        the rest. This turns a mesh with a known disk-like topology into a single-boundary disk,
-        which is the input a robust UV parametrization expects.
+        When ``True``, leave the single largest boundary loop (greatest perimeter) open and fill
+        only the rest. This turns a mesh with a known disk-like topology into a single-boundary
+        disk, which is the input a robust UV parametrization expects.
 
     Returns
     -------
@@ -989,6 +989,7 @@ def fill_smooth(
         raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
     if edge_weights not in ("cotan", "unit"):
         raise ValueError(f"edge_weights must be 'cotan' or 'unit', got {edge_weights!r}")
+    _check_refine(refine)
 
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -1114,6 +1115,7 @@ def refill_region(
     """
     if metric not in _METRIC_IDS:
         raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
+    _check_refine(refine)
 
     kept_vertices, kept_faces, new_loops = tw.selection.delete_region_keep_boundary(
         vertices, faces, face_mask
@@ -1402,7 +1404,8 @@ def fillable_loop_mask(
     per loop, so the policy is the caller's rather than a flag's:
 
     * **A repeated vertex.** A rim that visits one vertex twice is pinched there, and any
-      triangulation of it folds through that pinch.
+      triangulation of it folds through that pinch. A vertex shared by two *different* rims is the
+      same pinch spread across two loops, and disqualifies both.
     * **A chord.** Two loop vertices that are *not* neighbours along the rim but are already joined
       by a mesh edge. The fill may propose that pair as a fill edge, and the mesh already has one,
       so that edge ends up with three faces. This is what
@@ -1439,8 +1442,9 @@ def fillable_loop_mask(
     Returns
     -------
     wp.array[wp.bool]
-        One entry per loop, ``True`` where the loop is simple and chord-free, on ``faces.device``.
-        ``True`` is a guarantee; ``False`` is a warning, per the note above.
+        One entry per loop, ``True`` where the loop is simple, shares no vertex with another loop,
+        and is chord-free, on ``faces.device``. ``True`` is a guarantee; ``False`` is a warning,
+        per the note above.
 
     Raises
     ------
@@ -1482,14 +1486,30 @@ def fillable_loop_mask(
     bounds = np.cumsum([0, *sizes])
     loops_np = [flat_np[bounds[index] : bounds[index + 1]] for index in range(len(sizes))]
     fillable_np = np.ones(len(loops_np), dtype=bool)
+    for index, loop_np in enumerate(loops_np):
+        if np.unique(loop_np).shape[0] != loop_np.shape[0]:
+            fillable_np[index] = False  # pinched within itself, and would corrupt the table below
+
+    # A vertex on two different rims is a pinch *between* loops: filling either one leaves that
+    # vertex non-manifold. It also cannot be represented in the two vertex-indexed tables below,
+    # which hold one owner apiece -- so writing the loops in order would let the later loop
+    # silently overwrite the earlier one's ownership and hide the earlier one's chords, returning
+    # ``True`` for a loop that has one. ``True`` is a guarantee, so every loop touching a shared
+    # vertex answers ``False`` and is kept out of the tables. Counting owners up front rather
+    # than resolving collisions in the write loop keeps the answer independent of loop order.
+    owned = [loops_np[index] for index in range(len(loops_np)) if fillable_np[index]]
+    if owned:
+        owner_count = np.bincount(np.concatenate(owned), minlength=n_vertices)
+        for index, loop_np in enumerate(loops_np):
+            if fillable_np[index] and (owner_count[loop_np] > 1).any():
+                fillable_np[index] = False
+
     loop_of_vertex_np = np.full(n_vertices, -1, dtype=np.int32)
     position_np = np.zeros(n_vertices, dtype=np.int32)
     for index, loop_np in enumerate(loops_np):
-        if np.unique(loop_np).shape[0] != loop_np.shape[0]:
-            fillable_np[index] = False
-            continue  # a pinched loop is disqualified already, and would corrupt the table below
-        loop_of_vertex_np[loop_np] = index
-        position_np[loop_np] = np.arange(loop_np.shape[0], dtype=np.int32)
+        if fillable_np[index]:
+            loop_of_vertex_np[loop_np] = index
+            position_np[loop_np] = np.arange(loop_np.shape[0], dtype=np.int32)
 
     if fillable_np.any():
         unique_edges, _inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
@@ -1702,6 +1722,7 @@ def stitch_smooth(
         raise ValueError(f"metric must be one of {sorted(_STITCH_METRIC_IDS)}, got {metric!r}")
     if edge_weights not in ("cotan", "unit"):
         raise ValueError(f"edge_weights must be 'cotan' or 'unit', got {edge_weights!r}")
+    _check_refine(refine)
 
     loop_a, loop_b = _single_boundary_loops(
         vertices_a, faces_a, vertices_b, faces_b, caller="stitch_smooth"
@@ -1745,6 +1766,25 @@ def stitch_smooth(
         refine=refine,
     )
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
+
+
+def _check_refine(refine: str) -> None:
+    """
+    Reject an unknown subdivision criterion, for the three ``*_smooth`` / ``refill`` entry points.
+
+    [`smoothing.refine_and_smooth_region`][triwarp.smoothing.refine_and_smooth_region] raises on
+    the same names, but each of these functions has paths that never reach it -- an empty mesh,
+    ``triangulate_only``, a face mask selecting nothing -- so without this the documented
+    ``Raises`` would hold on one path and not another, and a typo'd criterion would be silently
+    accepted on the cheap ones.
+
+    Raises
+    ------
+    ValueError
+        If ``refine`` is neither ``"max_edge"`` nor ``"density"``.
+    """
+    if refine not in ("max_edge", "density"):
+        raise ValueError(f"unknown refine {refine!r}, expected 'max_edge' or 'density'")
 
 
 def _single_boundary_loops(
@@ -2771,8 +2811,18 @@ def _bridge_triangles(
     a0, a1 = edge_a
     b0, b1 = edge_b
     # The quadrilateral runs (a1, a0, b1, b0): each edge is traversed backwards from the way its own
-    # face winds it, which is what makes the patch's outward side agree with the mesh's. Its
-    # diagonal is a0 - b0, and a shared vertex collapses one of the two halves onto a line.
+    # face winds it, which is what makes the patch's outward side agree with the mesh's. It is split
+    # along the a0-b0 diagonal, so a shared endpoint *on that diagonal* is the one case the split
+    # cannot express: at a0 == b0 both halves fold onto a line and the patch comes out empty, and at
+    # a1 == b1 the two halves are the same triangle wound opposite ways. Both are named here, and
+    # the surviving triangle is the collapsed quad's own traversal. (Sharing both endpoints means
+    # the two edges are one edge, which the caller rejects before reaching this.)
+    if a0 == b0:
+        return [(a1, a0, b1)]
+    if a1 == b1:
+        return [(a1, a0, b0)]
+    # A *crossed* shared endpoint (a0 == b1 or a1 == b0) collapses exactly one half, which the
+    # degeneracy filter removes correctly -- the survivor is already the right triangle.
     triangles = [(a1, a0, b0), (a0, b1, b0)]
     return [t for t in triangles if len(set(t)) == 3]
 

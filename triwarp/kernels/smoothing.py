@@ -251,6 +251,29 @@ def add_interior_mass_rhs(
 
 
 @wp.kernel
+def gather_free_positions_2d(
+    fixed_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    positions: wp.array[wp.vec3d],
+    out_solution: wp.array2d[wp.float64],
+) -> None:
+    # Seed the reduced solve with the free vertices' *current* positions: the exact inverse of
+    # ``scatter_free_positions`` below, and the counterpart of ``gather_free_positions`` above for
+    # the ``fixed_mask`` partition and the float64 storage the implicit-fairing flow carries.
+    # Seeding from the right-hand side instead would leave a vertex no face refers to at the
+    # origin -- it has an all-zero row and so a zero right-hand side, and CG never writes its
+    # entry -- which is the failure ``gather_free_positions`` exists to avoid on the region solves.
+    v = wp.int32(wp.tid())
+    i = free_row(fixed_mask, free_map, v)
+    if i < 0:
+        return
+    p = positions[v]
+    out_solution[0, i] = p[0]
+    out_solution[1, i] = p[1]
+    out_solution[2, i] = p[2]
+
+
+@wp.kernel
 def scatter_free_positions(
     fixed_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],

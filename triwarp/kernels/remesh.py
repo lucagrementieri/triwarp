@@ -35,7 +35,7 @@ from triwarp.kernels.triangles import (
     face_vertices_vec3d,
     triangle_quality,
 )
-from triwarp.kernels.voxels import voxel_cell, voxel_cell_center
+from triwarp.kernels.voxels import squared_distance_to_own_cell_center
 
 # The collapse round loop's third state slot, **appended** after ``array.LOOP_ROUND`` and
 # ``LOOP_CONDITION`` so the shared two keep their numbers: the total commits as of the end of
@@ -1196,6 +1196,28 @@ def csr_common_neighbor_count(
     return count
 
 
+@wp.func
+def satisfies_link_condition(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    u: wp.int32,
+    v: wp.int32,
+    is_boundary: wp.bool,
+) -> wp.bool:
+    # May edge (u, v) collapse without changing the surface's topology? Exactly two vertices
+    # adjacent to both endpoints for an interior edge -- the two apexes of its own faces -- and one
+    # for a boundary edge. A third shared neighbour means the edge closes a tetrahedral loop the
+    # collapse would pinch shut.
+    #
+    # Both collapse-candidate kernels test this, and it is a *decision rule* rather than an
+    # arithmetic run: two copies can diverge into accepting an edge in one decimator and rejecting
+    # it in the other, which is a correctness hazard the duplicate scans do not rank as one.
+    required = 2
+    if is_boundary:
+        required = 1
+    return csr_common_neighbor_count(offsets, columns, u, v) == required
+
+
 @wp.kernel(enable_backward=False)
 def collapse_candidates(
     unique_edges: wp.array2d[wp.int32],
@@ -1231,20 +1253,27 @@ def collapse_candidates(
     if placement == COLLAPSE_PINNED:
         p = vertices[s]
 
-    # Link condition: exactly 2 shared neighbours for an interior edge, 1 for a boundary edge.
-    required = 2
-    if is_boundary:
-        required = 1
-    if csr_common_neighbor_count(offsets, columns, u, v) != required:
+    if not satisfies_link_condition(offsets, columns, u, v, is_boundary):
         return
 
     # Anti-oscillation: reject if the collapse would create an edge longer than the high band. The
     # band is read at the far endpoint ``w``, so a collapse reaching into a finely-sized region is
     # judged by that region's target rather than by the survivor's.
+    #
+    # **Both** rings under a free placement, not just the removed vertex's. The reattached edges
+    # from ``r``'s neighbours are the obvious new ones, but a ``COLLAPSE_FREE`` placement moves the
+    # *survivor* to the midpoint as well, so every edge from ``s``'s own neighbours to ``p`` is
+    # equally new and equally able to overshoot the band. Under ``COLLAPSE_PINNED`` the survivor
+    # keeps its position and its ring is unchanged, which is the case one walk covers.
     for i in range(offsets[r], offsets[r + 1]):
         w = columns[i]
         if w != s and wp.length(p - vertices[w]) > high[w]:
             return
+    if placement == COLLAPSE_FREE:
+        for i in range(offsets[s], offsets[s + 1]):
+            w = columns[i]
+            if w != r and wp.length(p - vertices[w]) > high[w]:
+                return
 
     out_survivor[k] = s
     out_removed[k] = r
@@ -1255,20 +1284,19 @@ def collapse_candidates(
 def wins_key_everywhere(
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
-    locks: wp.array[wp.int32],
+    locks: wp.array[wp.int64],
     s: wp.int32,
     r: wp.int32,
-    key: wp.int32,
+    key: wp.int64,
 ) -> wp.bool:
     # Does ``key`` win at every vertex of the two closed 1-rings? The read half of
     # ``scatter.lock_two_rings``, and the same table: ``locks`` is a minimum over candidates
     # *including this one*, so the test is equality rather than ``<=``.
     #
-    # Both collapse paths call it, and the quadric path calls it twice against two different
-    # tables -- once on the scrambled-key minimum and once on the edge-index minimum that breaks a
-    # key collision -- which is why the parameter is named for its role and not for either table.
-    # This rule was written out inline three times before it was one function, and the copies had
-    # already diverged: the improvement that hashed the key reached one of them and not the other.
+    # Equality is only a sound win test because ``scramble_index`` is injective; it was not, and
+    # two candidates sharing a key both passed this. This rule was also written out inline three
+    # times before it was one function, and the copies had already diverged: the improvement that
+    # hashed the key reached one of them and not the other.
     if locks[s] != key or locks[r] != key:
         return False
     for i in range(offsets[s], offsets[s + 1]):
@@ -1281,21 +1309,33 @@ def wins_key_everywhere(
 
 
 @wp.func
-def scramble_index(index: wp.int32) -> wp.int32:
-    # Spatially incoherent lock key for the independent-set pass, from the candidate's own index.
+def scramble_index(index: wp.int32) -> wp.int64:
+    # Spatially incoherent *and injective* lock key for the independent-set pass, from the
+    # candidate's own index. Two separate properties, and the selection needs both.
     #
-    # This is the load-bearing detail of the whole parallel selection. ``edges_unique`` orders edges
-    # lexicographically by endpoint index, which on any structured mesh is *spatially monotone* --
-    # and a monotone key field has essentially one local minimum, so a min-key lock commits a single
-    # collapse per pass however many candidates there are. Measured on ``saddle_graded``: locking by
-    # raw edge index yields exactly **1** winner out of 51 546 candidates, and locking by quadric
-    # cost yields 23 (the cost field is smoothly graded there, so it is monotone too). Hashing the
-    # index breaks the correlation and restores the expected ~candidates/valence winners.
+    # **Incoherent**, which is the load-bearing detail of the whole parallel selection.
+    # ``edges_unique`` orders edges lexicographically by endpoint index, which on any structured
+    # mesh is *spatially monotone* -- and a monotone key field has essentially one local minimum, so
+    # a min-key lock commits a single collapse per pass however many candidates there are. Measured
+    # on ``saddle_graded``: locking by raw edge index yields exactly **1** winner out of 51 546
+    # candidates, and locking by quadric cost yields 23 (the cost field is smoothly graded there, so
+    # it is monotone too). Hashing the index breaks the correlation and restores the expected
+    # ~candidates/valence winners. That is what the high half carries: ``array.lowbias32`` with the
+    # top bit cleared, so the key stays non-negative and ``INT64_MAX`` remains usable as the
+    # unclaimed sentinel. The measurement behind the hash is recorded there, on the shared function.
     #
-    # ``array.lowbias32`` with the top bit cleared, so the key stays a non-negative int32 and
-    # ``INT32_MAX`` remains usable as the unclaimed sentinel. The measurement behind the hash is
-    # recorded there, on the shared function, rather than here.
-    return wp.int32(lowbias32(wp.uint32(index)) & wp.uint32(0x7FFFFFFF))
+    # **Injective**, which is why the key is 64 bits and not the natural 32. ``wins_key_everywhere``
+    # tests equality against a neighbourhood minimum, so two candidates sharing a key both win and
+    # both commit -- overlapping 1-rings, which is a corrupted mesh rather than a worse one. A
+    # masked ``lowbias32`` is exactly 2-to-1, and at scan-mesh candidate counts the collision rate
+    # is ~m^2 / 2^32, i.e. not negligible. Appending the index in the low half restores injectivity
+    # without disturbing the ordering the high half provides, so every candidate that used to win
+    # uniquely still does and only a tie changes -- from "both commit" to "the lower index takes
+    # it". This is what lets both paths run **one** lock pass: the quadric path used to follow this
+    # with a second, raw-index lock (``claim_collapse_index``) purely to break such a tie, and the
+    # isotropic path never did, which was the asymmetry that made the collision reachable at all.
+    hashed = wp.int64(lowbias32(wp.uint32(index)) & wp.uint32(0x7FFFFFFF))
+    return (hashed << wp.int64(32)) | wp.int64(index)
 
 
 @wp.kernel(enable_backward=False)
@@ -1304,14 +1344,14 @@ def claim_collapse_key(
     removed: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
-    out_min_key: wp.array[wp.int32],
+    out_min_key: wp.array[wp.int64],
 ) -> None:
     # The winning (smallest scrambled) key over the closed 1-rings of both endpoints.
     #
-    # **Both collapse paths launch this same kernel**, and all they differ by is what they do with
-    # the answer: ``isotropic_remesh``'s ``_collapse_pass`` reads it back directly as the claim,
-    # while the quadric path treats it as pass 1 of 3 and follows it with ``claim_collapse_index``
-    # to break a key collision. It was two kernels -- ``claim_collapses`` and this -- whose bodies
+    # **Both collapse paths launch this same kernel**, exactly once each, and read the answer the
+    # same way -- ``scramble_index`` being injective is what removed the quadric path's second,
+    # raw-index lock pass, which existed only to break a key collision the isotropic path never
+    # guarded against at all. It was two kernels -- ``claim_collapses`` and this -- whose bodies
     # became byte-identical once ``scatter.lock_two_rings`` was extracted and the isotropic path's
     # raw-index key was fixed; the duplicate scan found them the same pass that produced them,
     # which is section 3's point about a fusion not being done until the shared code has a name.
@@ -1353,7 +1393,7 @@ def commit_collapses(
     pos: wp.array[wp.vec3],
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
-    claim: wp.array[wp.int32],
+    claim: wp.array[wp.int64],
     out_remap: wp.array[wp.int32],
     out_positions: wp.array[wp.vec3],
     out_count: wp.array[wp.int32],
@@ -1665,13 +1705,6 @@ def update_flipped_lengths(
     out_edge_lengths[f1, 2] = second_apex0
 
 
-@wp.func
-def voxel_size_inverse(voxel_size: wp.float32) -> wp.float32:
-    # Reciprocal cell width, so the two ``cluster_*`` kernels can take the width itself (which they
-    # also need for the cell centre) without the caller passing both.
-    return 1.0 / voxel_size
-
-
 @wp.kernel
 def cluster_accumulate(
     labels: wp.array[wp.int32],
@@ -1696,9 +1729,11 @@ def cluster_min_center_distance(
     # Split from the index pick so both passes use 32-bit atomics only; the two together are
     # deterministic because pass 2 breaks ties by lowest vertex index.
     v = wp.int32(wp.tid())
-    cell = voxel_cell(vertices[v], origin, voxel_size_inverse(voxel_size))
-    center = voxel_cell_center(cell, origin, voxel_size)
-    wp.atomic_min(out_min_distance, labels[v], wp.length_sq(vertices[v] - center))
+    wp.atomic_min(
+        out_min_distance,
+        labels[v],
+        squared_distance_to_own_cell_center(vertices[v], origin, voxel_size),
+    )
 
 
 @wp.kernel
@@ -1712,9 +1747,10 @@ def cluster_pick_closest(
 ) -> None:
     # Pass 2: whichever vertices tie for their cluster's winning distance, the lowest index wins.
     v = wp.int32(wp.tid())
-    cell = voxel_cell(vertices[v], origin, voxel_size_inverse(voxel_size))
-    center = voxel_cell_center(cell, origin, voxel_size)
-    if wp.length_sq(vertices[v] - center) <= min_distance[labels[v]]:
+    if (
+        squared_distance_to_own_cell_center(vertices[v], origin, voxel_size)
+        <= min_distance[labels[v]]
+    ):
         wp.atomic_min(out_representative, labels[v], v)
 
 
@@ -2052,15 +2088,18 @@ def emit_unique_edges(
         out_inverse[corner] = edge_capacity
         return
     e = ranks[i] - 1
-    out_inverse[corner] = e
-    if starts[i] != 0:
-        # The capacity is a bound the *previous* pass measured, and a collapse removes at least
-        # three undirected edges and adds none, so this cannot fire. Clamped anyway: getting the
-        # invariant wrong should cost a dropped edge, not an out-of-bounds write.
-        if e < edge_capacity:
-            a, b = edge_endpoints(faces, corner)
-            out_unique_edges[e, 0] = a
-            out_unique_edges[e, 1] = b
+    # The capacity is a bound the *previous* pass measured, and a collapse removes at least three
+    # undirected edges and adds none, so an overflow cannot fire. Handled anyway -- and handled in
+    # **both** writes, which is the whole point: clamping only the row write below would leave
+    # ``out_inverse`` pointing a live corner at an edge slot past the end of the buffer, and
+    # ``scatter_edge_incidence`` dereferences exactly that index, so a clamp meant to prevent an
+    # out-of-bounds write would have left an out-of-bounds read. An overflowing corner goes to the
+    # dummy slot, which is where a padded one already goes.
+    out_inverse[corner] = wp.min(e, edge_capacity)
+    if starts[i] != 0 and e < edge_capacity:
+        a, b = edge_endpoints(faces, corner)
+        out_unique_edges[e, 0] = a
+        out_unique_edges[e, 1] = b
     if i + 1 == live:
         out_state[DECIMATION_EDGES] = wp.min(ranks[i], edge_capacity)
 
@@ -2274,11 +2313,7 @@ def quadric_collapse_candidates(
         return
     free_position = placement == COLLAPSE_FREE
 
-    # Link condition: exactly 2 shared neighbours for an interior edge, 1 for a boundary edge.
-    required = 2
-    if is_boundary:
-        required = 1
-    if csr_common_neighbor_count(offsets, columns, u, v) != required:
+    if not satisfies_link_condition(offsets, columns, u, v, is_boundary):
         return
 
     quadric = quadrics[u] + quadrics[v]
@@ -2358,40 +2393,17 @@ def end_collapse_round(
 
 
 @wp.kernel(enable_backward=False)
-def claim_collapse_index(
-    survivor: wp.array[wp.int32],
-    removed: wp.array[wp.int32],
-    offsets: wp.array[wp.int32],
-    columns: wp.array[wp.int32],
-    min_key: wp.array[wp.int32],
-    out_claim: wp.array[wp.int32],
-) -> None:
-    # Pass 2 of 3: two candidates whose scrambled keys collide would both believe they won, which
-    # would break independence -- unlikely at 2^31 keys, but a corrupted mesh when it happens. Among
-    # the key winners in a neighbourhood the lowest edge index takes it.
-    k = wp.int32(wp.tid())
-    s = survivor[k]
-    if s < 0:
-        return
-    r = removed[k]
-    if not wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(k)):
-        return
-    lock_two_rings(offsets, columns, s, r, k, out_claim)
-
-
-@wp.kernel(enable_backward=False)
 def mark_collapse_winners(
     survivor: wp.array[wp.int32],
     removed: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
-    min_key: wp.array[wp.int32],
-    claim: wp.array[wp.int32],
+    min_key: wp.array[wp.int64],
     cost: wp.array[wp.float32],
     out_survivor: wp.array[wp.int32],
     out_cost: wp.array[wp.float32],
 ) -> None:
-    # Pass 3 of 3: the win test, kept separate from the commit so the caller can apply its per-pass
+    # Pass 2 of 2: the win test, kept separate from the commit so the caller can apply its per-pass
     # budget *after* the independent set is known. Trimming members from an independent set keeps it
     # independent; trimming the candidate list beforehand would change which set is found.
     k = wp.int32(wp.tid())
@@ -2401,9 +2413,7 @@ def mark_collapse_winners(
         out_survivor[k] = -1
         return
     r = removed[k]
-    won = wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(k))
-    won = won and wins_key_everywhere(offsets, columns, claim, s, r, k)
-    if not won:
+    if not wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(k)):
         out_survivor[k] = -1
         return
     out_survivor[k] = s

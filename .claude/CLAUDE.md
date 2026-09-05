@@ -4885,6 +4885,37 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   hashed key buys ~500x the work for free. **Every existing test passed against the broken version —
   nothing asserted a collapse *count***, which is the lasting lesson: an independent-set kernel needs
   a test on how many winners a round produces, not only on the validity of the ones it commits.
+- **CLOSED — and the *same* key had a second, opposite defect: it was not injective, so two
+  candidates could both win.** `scramble_index` was `lowbias32(k) & 0x7FFFFFFF`, and masking the top
+  bit off a bijection makes it exactly **2-to-1**. `wins_key_everywhere` tests *equality* against a
+  neighbourhood minimum, so a colliding pair both passed and both committed into overlapping
+  1-rings — a corrupted mesh rather than a worse one. The quadric path guarded it with a second,
+  raw-index lock pass (`claim_collapse_index`, whose own comment called the unguarded case exactly
+  that); **the isotropic path never did**, and that asymmetry is what made it reachable. Collision
+  rate is ~m²/2^32 in *keys* and ~m·valence/2^32 in keys that also land in one neighbourhood, i.e.
+  rare but not negligible at scan-mesh candidate counts.
+
+  The fix is to make the key injective rather than to duplicate the guard: **64 bits, the masked
+  hash in the high half and the index itself in the low half**. The ordering the hash provides is
+  untouched, so every candidate that used to win uniquely still does and only a tie changes — from
+  "both commit" to "the lower index takes it". That retires `claim_collapse_index` and one lock pass
+  from the quadric round, and `scatter.lock_two_rings` / `wins_key_everywhere` / both claim buffers
+  are `int64` throughout (`wp.atomic_min` on int64 works on both devices — §16.3). Verified
+  output-identical: `quadric_decimate` still hits `target_ratio` exactly (2 560 and 512 faces from
+  5 120 at 0.5 and 0.1), and the full suite is unchanged.
+
+  **The general shape to look for: a min-key parallel independent set needs its key to be both
+  spatially incoherent *and* injective, and those are separate properties fixed by separate halves
+  of the key.** A guard bolted onto one of two callers is the tell that the key itself is wrong.
+- **FIXED — `collapse_candidates`' anti-oscillation test walked only the *removed* endpoint's ring.**
+  A `COLLAPSE_FREE` placement moves the **survivor** to the midpoint too, so every edge from `s`'s
+  own neighbours to the new position is as new as the reattached ones and was never tested against
+  the high band. (`COLLAPSE_PINNED` keeps the survivor put, which is the case one walk covers, so
+  the second walk is gated on the placement.) Measured on a 133x133 graded saddle patch at
+  `iterations=3`, before → after: at `target = mean_edge` 31 952 → 33 319 faces and achieved/target
+  0.939 → 0.923; at 2x, 21 324 → 21 398 and 0.580 → 0.582. Aspect p99 and the degenerate-face count
+  are unchanged in every cell. So the stricter (correct) predicate costs about **4 %** of the
+  collapses at the tight target and nothing measurable at the loose one.
 - **`isotropic_remesh` is not byte-gateable.** Its face buffer is stable but vertex positions differ
   by ~2.7e-06 run to run (icosphere(2), 3 iterations, CUDA), because `accumulate_one_ring` and the
   area-weighted normals accumulate with atomics in nondeterministic order; on some fixtures (a
@@ -5517,6 +5548,38 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   `test_intrinsic_delaunay_removes_negative_cotangent_weights` until this is resolved — it fails.**
   Build the mesh with `tw.creation.parametric_surface("dini")` to reproduce (there is no fixture,
   deliberately).
+- **SHIPPED: `filter_laplacian(implicit_time_integration=True)` and `filter_implicit_fairing` solved
+  their three position components as three *separate* single-column `solve_spd` calls, where
+  `solve_spd_columns` batches them. Converting is 2.06-2.83x, bit-identical.** All three columns
+  share one operator, so a batched solve advances them in one Krylov iteration whose count is the
+  worst column's rather than the sum of three — and it routes through triwarp's own `_BatchedCg`
+  instead of `warp.optim.linear`'s `TiledDot`, which §12.7 already prices at a further 1.10-1.50x.
+  Measured against a detached baseline worktree, interleaved, min of 9, on a noised `icosphere(4)`
+  at 3 iterations:
+
+  | call | baseline (3 reps) | batched | ratio |
+  |---|---|---|---|
+  | `filter_implicit_fairing` | 27.07 / 28.39 / 27.61 ms | 13.12 / 13.22 / 13.37 | **2.06-2.12x** |
+  | `filter_laplacian(implicit)` | 19.43 / 19.82 / 19.74 | 6.88 / 6.85 / 7.12 | **2.77-2.83x** |
+
+  Output checksums identical in both arms. Two structural notes. The component scratch is now one
+  `(3, n)` `float64` array (`_component_columns`) rather than three 1-D buffers, because both
+  `solve_spd_columns` and `wp.map`'s multi-output form want contiguous rows of one allocation. And
+  `filter_laplacian`'s operator is fixed for the whole flow, so it hoists a `spd_column_solver`
+  state outside the loop — the shape that function's own docstring asks for — while
+  `filter_implicit_fairing` rebuilds its operator every pass and calls `solve_spd_columns` inline.
+  **The tell that this was worth checking is textual: a `for` loop around a single-column solver in
+  a module whose sibling functions all call the batched one.**
+- **Two correctness defects fixed in `filter_implicit_fairing`'s Dirichlet path, both silent.**
+  `_dirichlet_state` returned `None` for `n_free == 0` as well as for a closed mesh, and the caller
+  reads `None` as "solve over every vertex" — so `pin_boundary=True` on a mesh with *no interior
+  vertex* (a single triangle, a fan, a strip, a small hole patch) ran the unconstrained flow and
+  moved every vertex the caller asked to pin. And the reduced solve seeded CG with
+  `interior_rhs[column]` instead of the free vertices' current positions, so an unreferenced vertex
+  — all-zero row, zero right-hand side, never written by CG — was teleported to the origin, the
+  exact failure `gather_free_positions` exists to prevent on the region solves and which the
+  unreduced branch three lines up already avoided. `gather_free_positions_2d` is that kernel for the
+  `fixed_mask` partition and float64 storage.
 - **`smoothing`'s two conditional-emit triplet writers must `rows.fill_(n_rows)` before launch** —
   §12.7, measured 31.8x and 9.1x. `holes.fill_smooth` reaches both through
   `smoothing.refine_and_smooth_region`, so one fix lands on three benchmark rows.

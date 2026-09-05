@@ -1020,6 +1020,38 @@ def test_filter_implicit_fairing_pinned_stays_stable_on_an_open_mesh(
     assert np.abs(smoothed_np).max() <= extent * 1.01
 
 
+def test_filter_implicit_fairing_pins_a_mesh_with_no_interior_vertex(device: str) -> None:
+    """
+    Not a library comparison: no reference exposes a boundary-pinned implicit fairing.
+
+    There is nothing to compare a *no-op* against, and the claim is exactly that nothing moves.
+
+    A mesh whose every vertex is on the boundary -- a single triangle, a fan, a strip, a small hole
+    patch -- leaves the pinned flow with no unknown, so the pass is the identity. ``None`` from the
+    partition builder means "no boundary, run unconstrained", and folding this case into it ran the
+    *unconstrained* flow and moved every vertex the caller asked to pin. What the invariant excludes
+    is only that substitution; the pinned-versus-free contrast is what makes it non-vacuous, since
+    an unconditional early return would pass the first assert alone.
+    """
+    vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.4]])
+    faces_np = np.array([0, 1, 2, 1, 3, 2], dtype=np.int32)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    # Non-vacuity: every vertex really is on the boundary, so there is no interior to solve over.
+    boundary_np = tw.boundary.boundary_vertex_indices(vertices_wp, faces_wp).numpy()
+    assert len(boundary_np) == len(vertices_np)
+
+    pinned_np = tw.smoothing.filter_implicit_fairing(
+        vertices_wp, faces_wp, iterations=4, pin_boundary=True
+    ).numpy()
+    assert np.array_equal(pinned_np, vertices_wp.numpy())
+    # The unconstrained flow on the same input *does* move, which is what the pinned path was
+    # silently doing before -- so this is the arm that makes the equality above mean something.
+    free_np = tw.smoothing.filter_implicit_fairing(
+        vertices_wp, faces_wp, iterations=4, pin_boundary=False
+    ).numpy()
+    assert np.abs(free_np - vertices_wp.numpy()).max() > 1e-6
+
+
 def test_filter_implicit_fairing_pin_boundary_is_a_no_op_on_a_closed_mesh(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
