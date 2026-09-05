@@ -3225,6 +3225,62 @@ def test_refine_region_to_density_rejects_a_mismatched_region(
         tw.remesh.refine_region_to_density(vertices_wp, faces_wp, short_wp)
 
 
+@pytest.mark.parametrize(
+    "entry_point", ["subdivide_to_size", "subdivide_region_to_size", "refine_region_to_density"]
+)
+def test_refiners_return_buffers_independent_of_their_input(
+    entry_point: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Not a library comparison: no reference exposes a buffer-aliasing contract.
+
+    All three refiners bind ``current_vertices = vertices`` and can leave their pass loop before
+    ever replacing it, so the "nothing needed splitting" path used to hand the caller its own
+    arrays straight back — ``refine_region_to_density`` did it for the region mask too. The module
+    documents independent buffers (``subdivide``'s guard says so in as many words), so the check
+    that bites is *writing into the result and finding the input untouched*, which the three
+    existing no-op tests cannot make: they compare values, and an alias compares equal.
+    """
+    vertices_src, faces_src, region_wp = _filled_hemisphere(hemisphere)
+    # Clone off the session fixture first, so a regression corrupts this test's own buffers rather
+    # than every later test that shares the hemisphere.
+    vertices_wp = wp.clone(vertices_src)
+    faces_wp = wp.clone(faces_src)
+    empty_wp = wp.zeros(int(region_wp.shape[0]), dtype=wp.bool, device=region_wp.device)
+    vertices_before = vertices_wp.numpy().copy()
+    faces_before = faces_wp.numpy().copy()
+
+    new_region_wp = None
+    if entry_point == "subdivide_to_size":
+        beyond_longest = 10.0 * float(np.ptp(vertices_before, axis=0).max())
+        new_vertices_wp, new_faces_wp = tw.remesh.subdivide_to_size(
+            vertices_wp, faces_wp, beyond_longest
+        )
+    elif entry_point == "subdivide_region_to_size":
+        new_vertices_wp, new_faces_wp, new_region_wp = tw.remesh.subdivide_region_to_size(
+            vertices_wp, faces_wp, empty_wp, max_edge=0.01, delaunay=False
+        )
+    else:
+        new_vertices_wp, new_faces_wp, new_region_wp = tw.remesh.refine_region_to_density(
+            vertices_wp, faces_wp, empty_wp
+        )
+
+    # The no-op path is the one under test, so confirm it was taken before reading anything into
+    # the independence check below.
+    assert np.array_equal(new_vertices_wp.numpy(), vertices_before)
+    assert np.array_equal(new_faces_wp.numpy(), faces_before)
+
+    new_vertices_wp.fill_(wp.vec3(1.0e3, 1.0e3, 1.0e3))
+    new_faces_wp.fill_(-7)
+    if new_region_wp is not None:
+        new_region_wp.fill_(True)
+
+    assert np.array_equal(vertices_wp.numpy(), vertices_before)
+    assert np.array_equal(faces_wp.numpy(), faces_before)
+    if new_region_wp is not None:
+        assert not np.any(empty_wp.numpy())
+
+
 # ---------------------------------------------------------------------------
 # split_edges
 # ---------------------------------------------------------------------------

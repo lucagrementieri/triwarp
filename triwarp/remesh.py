@@ -2724,8 +2724,8 @@ def subdivide_to_size(
 
     if n_faces == 0:
         if return_index:
-            return current_vertices, current_faces, index
-        return current_vertices, current_faces
+            return wp.clone(vertices), wp.clone(faces), index
+        return wp.clone(vertices), wp.clone(faces)
 
     for i in range(max_iter + 1):
         n_vertices = int(current_vertices.shape[0])
@@ -2782,6 +2782,13 @@ def subdivide_to_size(
             next_sizing,
         )
 
+    # Nothing ever split, so ``current_*`` are still the caller's own buffers. Every entry point in
+    # this module returns independent ones -- ``subdivide`` says so in as many words -- and a caller
+    # that mutates a "subdivided" mesh must not reach back into its own input. Cloning here rather
+    # than up front keeps the path that *did* split free, since ``split_edges`` already handed back
+    # fresh buffers there.
+    if current_vertices is vertices:
+        current_vertices, current_faces = wp.clone(vertices), wp.clone(faces)
     if return_index:
         return current_vertices, current_faces, index
     return current_vertices, current_faces
@@ -2890,7 +2897,7 @@ def subdivide_region_to_size(
     if int(region.shape[0]) != n_faces:
         raise ValueError(f"region must have length n_faces={n_faces}, got {int(region.shape[0])}")
     if n_faces == 0:
-        return vertices, faces, region
+        return wp.clone(vertices), wp.clone(faces), wp.clone(region)
 
     max_edge_f = wp.float32(max_edge)
     current_vertices = vertices
@@ -2964,6 +2971,11 @@ def subdivide_region_to_size(
             current_vertices, current_faces, region_flags, max_angle_change, max_deviation, 50
         )
 
+    # Nothing in the region needed splitting, so ``current_*`` are still the caller's own buffers;
+    # see ``subdivide_to_size``'s tail for why that has to be broken here. ``new_region`` is always
+    # freshly allocated by ``astype``, so only the two mesh buffers are at stake.
+    if current_vertices is vertices:
+        current_vertices, current_faces = wp.clone(vertices), wp.clone(faces)
     new_region = tw.array.astype(region_flags, wp.bool)
     return current_vertices, current_faces, new_region
 
@@ -3100,7 +3112,7 @@ def refine_region_to_density(
     if int(region.shape[0]) != n_faces:
         raise ValueError(f"region must have length n_faces={n_faces}, got {int(region.shape[0])}")
     if n_faces == 0:
-        return vertices, faces, region
+        return wp.clone(vertices), wp.clone(faces), wp.clone(region)
 
     alpha_f = wp.float32(alpha)
     current_vertices = vertices
@@ -3163,6 +3175,14 @@ def refine_region_to_density(
                 8,
             )
 
+    # No face was dense enough to split, so all three are still the caller's own buffers -- this one
+    # aliases ``region`` outright, with no ``astype`` in between. See ``subdivide_to_size``'s tail.
+    if current_vertices is vertices:
+        current_vertices, current_faces, current_region = (
+            wp.clone(vertices),
+            wp.clone(faces),
+            wp.clone(region),
+        )
     return current_vertices, current_faces, current_region
 
 
