@@ -1982,10 +1982,7 @@ def flip_to_delaunay(
     if setup is None:
         return wp.clone(faces)
     out_faces, n_vertices, region_flags = setup
-
-    mac = wp.float32(max_angle_change if max_angle_change is not None else float(2.0 * math.pi))
-    mdsq = wp.float32(max_deviation * max_deviation if max_deviation is not None else 3.0e38)
-    car = wp.float32(critical_aspect_ratio)
+    mac, mdsq, car = _flip_gates(max_angle_change, max_deviation, critical_aspect_ratio)
 
     def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
         wp.launch(
@@ -3460,9 +3457,7 @@ def _flip_region_faces(
     """Run the parallel Delone flip pass over the region, mutating ``faces`` in place."""
     device = faces.device
     n_vertices = int(vertices.shape[0])
-    mac = wp.float32(max_angle_change if max_angle_change is not None else float(2.0 * math.pi))
-    mdsq = wp.float32(max_deviation * max_deviation if max_deviation is not None else 3.0e38)
-    car = wp.float32(1000.0)
+    mac, mdsq, car = _flip_gates(max_angle_change, max_deviation)
 
     def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
         wp.launch(
@@ -3487,3 +3482,26 @@ def _flip_region_faces(
         )
 
     return _flip_interior_edges(faces, n_vertices, launch, max_iter)
+
+
+def _flip_gates(
+    max_angle_change: float | None,
+    max_deviation: float | None,
+    critical_aspect_ratio: float = 1000.0,
+) -> tuple[wp.float32, wp.float32, wp.float32]:
+    """
+    Build the three gate scalars ``delone_flip_candidates`` takes from a caller's optional bounds.
+
+    Both flip drivers that reach that kernel --
+    [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay] and ``_flip_region_faces`` -- built this
+    triple inline and identically, differing only in that the region driver exposes no
+    ``critical_aspect_ratio`` and so takes the public default.
+
+    ``None`` means "no gate", and each is disabled by a sentinel the kernel cannot exceed rather
+    than by a branch: a full turn for the dihedral change, and a squared deviation near the top of
+    ``float32``. The deviation is squared here so the kernel compares against a squared length and
+    needs no root per candidate.
+    """
+    mac = wp.float32(max_angle_change if max_angle_change is not None else float(2.0 * math.pi))
+    mdsq = wp.float32(max_deviation * max_deviation if max_deviation is not None else 3.0e38)
+    return mac, mdsq, wp.float32(critical_aspect_ratio)

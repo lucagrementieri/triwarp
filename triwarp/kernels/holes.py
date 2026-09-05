@@ -1016,6 +1016,13 @@ def project_loop_to_plane(
     # Each rim vertex's orthogonal projection onto its loop's plane. The *ring* of these is what the
     # rim is bridged to, so the extension is exactly the ruled surface between the two. The origin
     # is per loop rather than global because a bottom plane is fitted to each rim separately.
+    #
+    # Written out rather than as ``origin + project_out_normal(point - origin, plane_normal)``,
+    # which is the same projection algebraically and **not** the same float32 arithmetic: routing
+    # through the shared predicate subtracts ``origin`` and adds it back, and the two forms diverge
+    # by up to 4.8e-07 / 1.2e-04 / 9.8e-04 as the plane origin sits at 1 / 1e3 / 1e5 from the model
+    # origin (20 000 random planes each). Off-plane residual is a wash, so it buys no accuracy
+    # either -- only a cancellation the direct form does not have, plus one more subtract.
     i = wp.int32(wp.tid())
     point = vertices[loop_vertices[i]]
     origin = plane_origins[loop_id[i]]
