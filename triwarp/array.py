@@ -1419,8 +1419,21 @@ def bitcast_to_int(
     """
     n_bits = wp.types.type_size_in_bytes(data.dtype) * 8
     n = data.shape[0]
-    count = count or n
+    # ``is None``, not ``or``: zero is a legitimate length and ``or`` would read it as "not passed"
+    # and hand back the whole buffer -- an ``n``-element array of stale bits where the caller asked
+    # for an empty one. The signature already spells the distinction; only this line lost it.
+    count = n if count is None else count
     copy_count = min(n, count)
+    target = wp.int64 if n_bits > 32 else wp.int32
+
+    # ``count=0`` reaches ``wp.copy`` and ``wp.utils.array_cast`` as *"copy the whole source"* --
+    # a documented back-compatibility rule in Warp 1.17 (``if count == 0: count = src.size``), so
+    # the zero that means "nothing" and the zero that means "everything" are the same argument.
+    # Into a length-0 destination that is not even a clean refusal: it raises ``TypeError:
+    # unsupported operand type(s) for +: 'NoneType' and 'int'`` from inside the copy. Returning the
+    # empty allocation here is both the right answer and the only way to state it.
+    if copy_count == 0:
+        return wp.empty(count, dtype=target, device=data.device)
 
     if n_bits > 32:
         reinterpreted = wp.empty(count, dtype=wp.int64, device=data.device)
@@ -1471,8 +1484,12 @@ def bitcast_from_int(
     n_bits = wp.types.type_size_in_bytes(data.dtype) * 8
     n_target_bits = wp.types.type_size_in_bytes(dtype) * 8
     n = data.shape[0]
-    count = count or n
+    # ``is None`` rather than ``or``, and the zero-length short circuit, both for the reasons
+    # recorded at ``bitcast_to_int``: Warp reads ``count=0`` as "copy everything".
+    count = n if count is None else count
     copy_count = min(n, count)
+    if copy_count == 0:
+        return wp.empty(count, dtype=dtype, device=data.device)
 
     if n_bits == n_target_bits:
         reinterpreted = wp.empty(count, dtype=dtype, device=data.device)

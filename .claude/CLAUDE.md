@@ -2971,6 +2971,21 @@ re-deriving a number.
   26.7 µs on 900k edges), because it reads a contiguous prefix — so a benchmark alone reads as a win.
   Audited 2026-07-26: every existing Python-scope gather in `triwarp/` passes a full array or a
   contiguous prefix. Rule: §3.4.
+- **`wp.copy(dst, src, count=0)` copies the *whole* source, and `wp.utils.array_cast` inherits it.**
+  Warp 1.17 carries an explicit back-compatibility rule — `# backwards compatibility, if count is
+  zero then copy entire src array` / `if count == 0: count = src.size` — so the zero that means
+  "nothing" and the zero that means "everything" are the same argument. Measured: copying a
+  5-element `float32` source into a 5-element destination with `count=0` writes all five
+  (`[0. 1. 2. 3. 4.]`), silently; into a **length-0** destination it does not refuse cleanly either,
+  but raises `TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'` from inside the
+  copy, which names nothing a caller passed.
+  **So a `count` derived from data — `min(n, requested)`, a compacted length, a readback — must be
+  tested for zero at the call site, and the zero case answered without calling `wp.copy` at all.**
+  This is the same shape as §3.3's zero-length-slice raise and §3.7's capacity-versus-count rule: a
+  legitimate empty case that the Warp API spells as a special value rather than as a length. Found
+  through `array.bitcast_to_int` / `bitcast_from_int`, which had the defect *twice* — once in their
+  own `count = count or n` (a falsy legitimate zero read as "not passed") and again one level down
+  in the `wp.copy` the corrected zero then reached.
 - **`wp.copy` into a *pinned* host buffer is a genuine async memcpy with no event, so reading it
   races.** `wp_memcpy_d2h` is a bare `cudaMemcpyAsync` on the current stream, and CUDA only blocks the
   host when the destination is **pageable**. Measured behind a 140 ms kernel: a pinned scratch read

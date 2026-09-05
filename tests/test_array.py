@@ -959,6 +959,31 @@ def test_bitcast_int_reciprocity(device: str, data: wp.array[wp.Scalar]):
     assert np.array_equal(data.numpy(), recovered.numpy(), equal_nan=True)
 
 
+@pytest.mark.parametrize(
+    "data", bitcast_test_data, ids=[a.dtype.__name__ for a in bitcast_test_data]
+)
+def test_bitcast_honours_an_explicit_zero_count(device: str, data: wp.array[wp.Scalar]):
+    """
+    Not a library comparison: ``count=0`` is a length, not an omitted argument.
+
+    Both functions resolved the argument with ``count = count or n``, so a caller asking for an
+    empty result got the whole buffer -- ``n`` elements of *stale* bits, since the tail past
+    ``copy_count`` is deliberately left uninitialized for radix-sort scratch. The signature already
+    spelled the distinction as ``int | None``; only the resolution lost it.
+
+    Parametrized over the same dtype table as the reciprocity test above, because the two functions
+    branch on the input's width and the zero path has to hold on every branch. ``count=1`` is the
+    control: it separates "honours a zero" from "returns empty for any small count".
+    """
+    data_wp = data.to(device)
+    as_int = tw.array.bitcast_to_int(data_wp)
+
+    assert tw.array.bitcast_to_int(data_wp, count=0).shape == (0,)
+    assert tw.array.bitcast_from_int(as_int, data.dtype, count=0).shape == (0,)
+    assert tw.array.bitcast_to_int(data_wp, count=1).shape == (1,)
+    assert tw.array.bitcast_from_int(as_int, data.dtype, count=1).shape == (1,)
+
+
 def test_trim_to_count_keeps_the_written_prefix_of_every_buffer(device: str) -> None:
     """
     Class A: the atomic-append pattern this finalizes, checked across dtype and rank together.
