@@ -690,10 +690,10 @@ def _ball_with_offsets(
     """
     Count, scan, gather and optionally sort one ball query -- the body both accelerators share.
 
-    [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets] and
-    [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets] differ only in
-    which structure they build, which counting pass they run and which traversal the one shared
-    neighbour kernel takes (``accel``, one of ``kernels.neighbors.ACCEL_*``); everything else --
+    The two backends of [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets]
+    differ only in which structure they build, which counting pass they run and which traversal the
+    one shared neighbour kernel takes (``accel``, one of ``kernels.neighbors.ACCEL_*``); everything
+    else --
     the empty guards, the CSR scan, the ``2x`` sort scratch and the trailing compaction -- is
     identical. The accelerator is built lazily so an empty query never pays for one.
     """
@@ -764,8 +764,7 @@ def knn_initial_radius(
 
     Inverts a uniform-density model of ``points``: the smallest ball expected to hold ``k`` of
     ``n`` points is the one whose volume is ``k / n`` of the bounding box's. This is the default
-    ``initial_radius`` of [`query_nearest`][triwarp.neighbors.query_nearest] and
-    [`query_nearest`][triwarp.neighbors.query_nearest], which deepen from it
+    ``initial_radius`` of [`query_nearest`][triwarp.neighbors.query_nearest], which deepens from it
     until each row certifies itself, so the value affects **speed only** and never the result.
 
     A cloud that is flat or collinear has a (near-)zero box volume, which the 3-D formula would
@@ -783,7 +782,10 @@ def knn_initial_radius(
     bounds
         Optional ``(min_bound, max_bound)`` from
         [`aabb`][triwarp.bounds.aabb]. Pass it to reuse a reduction you already ran;
-        otherwise it is computed here (one device reduction plus one readback).
+        otherwise it is computed here (one device reduction plus one readback). Trusted, not
+        validated — but only the estimate depends on it, so a wrong box costs speed and not
+        correctness, unlike the identically named argument of
+        [`query_nearest`][triwarp.neighbors.query_nearest].
 
     Returns
     -------
@@ -795,7 +797,6 @@ def knn_initial_radius(
 
     See Also
     --------
-    [`query_nearest`][triwarp.neighbors.query_nearest]
     [`query_nearest`][triwarp.neighbors.query_nearest]
     [`aabb`][triwarp.bounds.aabb]
     """
@@ -939,7 +940,11 @@ def query_nearest(
         under ``"hashgrid"`` this also sets the cell width.
     bounds
         ``(min_bound, max_bound)`` of ``points``, to skip
-        [`triwarp.bounds.aabb`][triwarp.bounds.aabb] and its readback.
+        [`triwarp.bounds.aabb`][triwarp.bounds.aabb] and its readback. **Trusted, not validated, and
+        not only a shortcut**: it also fixes the per-query radius at which a scan is provably
+        complete, so a box that does not contain ``points`` can end the search early and leave
+        slots unfilled (``-1`` and ``inf``) rather than merely running slower. Pass the real
+        bounding box, or leave it ``None``.
 
     Returns
     -------

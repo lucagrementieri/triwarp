@@ -71,18 +71,13 @@ def delaunay_triangulation(points: wp.array[wp.vec2], max_iter: int = 1000) -> w
     Raises
     ------
     ValueError
-        If fewer than 3 points are given.
+        If fewer than 3 points are given, or if a degenerate input (duplicate or collinear points)
+        drives the seed past the ``2 * n`` triangle bound a triangulation obeys.
 
     See Also
     --------
     [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
     [`triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
-
-    Raises
-    ------
-    ValueError
-        If fewer than 3 points are given, or if a degenerate input (duplicate or collinear points)
-        drives the seed past the ``2 * n`` triangle bound a triangulation obeys.
 
     Notes
     -----
@@ -1411,7 +1406,6 @@ class _BpaState:
         )
 
 
-# Floor on the launch width of the grid-strided wave kernels, for clouds too small to fill the
 def _mean_positive_finite(values: wp.array[wp.float32]) -> float | None:
     """
     Mean of the strictly positive finite entries of ``values``, or ``None`` if there are none.
@@ -1436,6 +1430,7 @@ def _mean_positive_finite(values: wp.array[wp.float32]) -> float | None:
     return float(tw.reduce.sum(kept)) / float(count)
 
 
+# Floor on the launch width of the grid-strided wave kernels, for clouds too small to fill the
 # device on their own.
 _BPA_MIN_GRID = 1 << 12
 
