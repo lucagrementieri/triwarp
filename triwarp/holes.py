@@ -1144,9 +1144,7 @@ def refill_region(
         result = (kept_vertices, faces_filled)
         return (*result, patch_mask) if return_patch else result
 
-    target_edge = max_edge
-    if target_edge is None:
-        target_edge = _mean_rim_edge_length(kept_vertices, packed)
+    target_edge = max_edge if max_edge is not None else _mean_rim_edge_length(kept_vertices, packed)
     new_vertices, new_faces, out_patch = tw.smoothing.refine_and_smooth_region(
         kept_vertices,
         faces_filled,
@@ -2287,6 +2285,7 @@ def bridge_edges(
     edge_a: tuple[int, int],
     edge_b: tuple[int, int],
     validate: bool = True,
+    boundary_edges: twt.Array2dInt32 | None = None,
 ) -> wp.array[wp.int32]:
     """
     Join two boundary edges with a two-triangle patch, leaving the rest of both rims open.
@@ -2319,6 +2318,14 @@ def bridge_edges(
         ``False`` when the edges came from
         [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges] and the pairing is
         known good.
+    boundary_edges
+        The rim table of ``faces``, when the caller already has one — as any caller that picked
+        ``edge_a`` and ``edge_b`` out of
+        [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges] does. Read only under
+        ``validate``, and only for the on-rim half of it: the chord-duplicate half always runs.
+        Trusted, not checked, so it must have been built from this same ``faces``; ``None``
+        rebuilds it. This is the middle setting between paying for the whole check and turning it
+        off — it keeps the half a rim-derived pair cannot satisfy by construction.
 
     Returns
     -------
@@ -2358,7 +2365,13 @@ def bridge_edges(
     edge_a = (int(edge_a[0]), int(edge_a[1]))
     edge_b = (int(edge_b[0]), int(edge_b[1]))
     _check_bridge_edges(
-        vertices, faces, edge_a, edge_b, _bridge_joined_pairs(edge_a, edge_b), validate
+        vertices,
+        faces,
+        edge_a,
+        edge_b,
+        _bridge_joined_pairs(edge_a, edge_b),
+        validate,
+        boundary_edges,
     )
     triangles = _bridge_triangles(edge_a, edge_b)
     patch = wp.array(
@@ -2675,7 +2688,11 @@ def join_closest_components(
         pair = _closest_cross_component_edges(vertices, current, max_distance_sq)
         if pair is None:
             break
-        current = bridge_edges(vertices, current, pair[0], pair[1])
+        # The rim table the pair was chosen from is the one ``bridge_edges`` would rebuild to check
+        # it against, over the same unchanged ``current``. Handing it over keeps the docstring's
+        # "recomputes ... the boundary edges ... each round" true at one rebuild per round rather
+        # than two -- measured 13.5-15% of this call, and the share does not fall with mesh size.
+        current = bridge_edges(vertices, current, pair[0], pair[1], boundary_edges=pair[2])
         joins += 1
 
     return wp.clone(faces) if joins == 0 else current
@@ -2688,7 +2705,7 @@ _NEAREST_KEY_SEED = (1 << 63) - 1
 
 def _closest_cross_component_edges(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_distance_sq: wp.float32
-) -> tuple[tuple[int, int], tuple[int, int]] | None:
+) -> tuple[tuple[int, int], tuple[int, int], twt.Array2dInt32] | None:
     """
     Pick the two oriented boundary edges to bridge next, or ``None`` when nothing is left to join.
 
@@ -2703,7 +2720,9 @@ def _closest_cross_component_edges(
     Python-scope gather silently ignores an index array's stride.
 
     Only three scalars come back: the packed winner key and the two rows it names. The boundary
-    table itself never leaves the device.
+    table itself never leaves the device, and is handed back alongside the pair so the caller can
+    give it to [`bridge_edges`][triwarp.holes.bridge_edges] rather than have it rebuilt to check a
+    pair that came out of it.
     """
     device = faces.device
     boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
@@ -2742,7 +2761,11 @@ def _closest_cross_component_edges(
         boundary,
         wp.array(np.array([slot_a, slot_b], dtype=np.int32), dtype=wp.int32, device=device),
     ).numpy()
-    return (int(rows_np[0, 0]), int(rows_np[0, 1])), (int(rows_np[1, 0]), int(rows_np[1, 1]))
+    return (
+        (int(rows_np[0, 0]), int(rows_np[0, 1])),
+        (int(rows_np[1, 0]), int(rows_np[1, 1])),
+        boundary,
+    )
 
 
 def _check_bridge_edges(
@@ -2752,6 +2775,7 @@ def _check_bridge_edges(
     edge_b: tuple[int, int],
     joined: Sequence[tuple[int, int]],
     validate: bool,
+    boundary_edges: twt.Array2dInt32 | None = None,
 ) -> None:
     """
     Reject a bridge that is degenerate, not on the boundary, or would duplicate an edge.
@@ -2759,15 +2783,20 @@ def _check_bridge_edges(
     Both membership tests run on device against a handful of query rows, so the only readback is
     those few flags -- an earlier version built Python sets over every mesh edge, which is one
     interpreter pass per edge and made ``validate=True`` unusable on a scan mesh.
+
+    ``boundary_edges`` is the rim table when the caller already built one from the same ``faces``;
+    the on-rim half of the check reads it instead of rebuilding it. Only the *rim* half is skipped
+    -- the chord-duplicate half always runs, because a bridge can create a duplicate edge no matter
+    where its two rim edges came from.
     """
     if tuple(edge_a) == tuple(edge_b):
         raise ValueError("edge_a and edge_b must be different edges")
     if not validate:
         return
 
-    on_rim = _rows_present(
-        tw.boundary.oriented_boundary_edges(vertices, faces), [edge_a, edge_b], faces.device
-    )
+    if boundary_edges is None:
+        boundary_edges = tw.boundary.oriented_boundary_edges(vertices, faces)
+    on_rim = _rows_present(boundary_edges, [edge_a, edge_b], faces.device)
     for name, edge, present in (("edge_a", edge_a, on_rim[0]), ("edge_b", edge_b, on_rim[1])):
         if not present:
             raise ValueError(

@@ -2603,6 +2603,41 @@ def test_bridge_edges_rejects_bad_pairs(hemisphere: tuple[tm.Trimesh, wp.Mesh]) 
     )
 
 
+def test_bridge_edges_precomputed_rim_keeps_the_chord_check(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Triwarp against triwarp: ``boundary_edges=`` is a shortcut, not a third setting of ``validate``.
+
+    Passing the rim table skips only the *on-rim* half of the check -- the half a pair taken out of
+    that very table satisfies by construction. The chord-duplicate half must still fire, because a
+    bridge can leave two vertices sharing a second edge however its rim edges were chosen, and that
+    is the failure ``validate`` exists for. ``join_closest_components`` takes this path on every
+    join, so a shortcut that quietly disabled the other half would go unnoticed there.
+
+    The oracle is the same call without the keyword: same patch, same rejection.
+    """
+    _, mesh_wp = hemisphere
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    rim_wp = tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp)
+    rim_np = rim_wp.numpy()
+    edge_a = (int(rim_np[0][0]), int(rim_np[0][1]))
+    edge_far = (int(rim_np[len(rim_np) // 2][0]), int(rim_np[len(rim_np) // 2][1]))
+
+    with_table = tw.holes.bridge_edges(
+        vertices_wp, faces_wp, edge_a, edge_far, boundary_edges=rim_wp
+    )
+    without = tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_far)
+    assert np.array_equal(with_table.numpy(), without.numpy())
+
+    # The chord-duplicate rejection still fires with the table supplied.
+    successors = _rim_successors(vertices_wp, faces_wp)
+    middle = successors[edge_a[1]]
+    edge_next = (middle, successors[middle])
+    with pytest.raises(ValueError, match="non-manifold"):
+        tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_next, boundary_edges=rim_wp)
+
+
 @pytest.mark.parity("bridge_edges_smooth", "meshlib")
 def test_bridge_edges_smooth_matches_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
