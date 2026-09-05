@@ -5716,6 +5716,25 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   (geometry-central's signposts) — a rewrite of the flip topology, which keys on the vertex pair
   `(u, v)` and so has nowhere to put a second edge between the same endpoints. Price it as that.
 
+  **CORRECTION — the -16.13 is a *boundary* edge and was never part of the 38.** Writing the
+  regression test for this entry decomposed the residue and the headline number belongs to the
+  other half. Measured on the converged output: **48** edges carry a negative summed
+  half-cotangent, of which **38 are interior** (all 38 unflippable, as above, worst weight
+  **-0.15**) and **10 are boundary** edges with one incident face, worst **-16.13** at edge
+  `(0, 1)`. A boundary edge has *one* opposite angle, so the Delaunay condition — two opposite
+  angles summing past pi — does not apply to it, it is simply an obtuse corner on the rim, and
+  **no flip of any kind could ever fix it**. So the Delta-complex lever above would remove the 38
+  and leave the -16.13 exactly where it is: the two halves have different causes and only one has
+  a remedy. The hand-summed weights were checked against the assembled matrix entry for all 4 641
+  edges (0 differ), so this is the operator's own number and not a re-derivation.
+
+  **The generalizable error is quoting a min over a set whose members have different causes.**
+  `off_diagonal.min()` is one number over interior *and* boundary edges, and it was read as
+  evidence for the mechanism that explains only the interior ones — which then sized a proposed
+  rewrite by 100x the magnitude that rewrite could actually remove. Pinned by
+  `test_intrinsic_delaunay_residue_is_exactly_the_unflippable_set`, whose mutation probe is
+  precisely this conflation: dropping the `incident == 2` filter fails with `assert 38 == 48`.
+
   **`dini` therefore stays out of `test_intrinsic_delaunay_removes_negative_cotangent_weights`,
   permanently rather than pending** — that test asserts a property this function does not promise.
   A test that *pins* the gap (assert the residue is exactly the unflippable set) is the honest one

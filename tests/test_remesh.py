@@ -6,6 +6,7 @@ import math
 
 import igl
 import numpy as np
+import numpy.typing as npt
 import pymeshlab as ml
 import pytest
 import pytorch3d.ops as p3d_ops
@@ -1824,6 +1825,75 @@ def test_intrinsic_delaunay_leaves_a_delaunay_mesh_alone(
     assert n_flips == 0
     assert np.array_equal(faces.numpy(), mesh_wp.indices.numpy())
     assert np.allclose(lengths.numpy(), original_lengths, rtol=1e-6, atol=1e-6)
+
+
+def _summed_cotangent_weights(
+    faces_np: npt.NDArray[np.int32], cot_np: npt.NDArray[np.float32]
+) -> tuple[
+    dict[tuple[int, int], float], dict[tuple[int, int], int], dict[tuple[int, int], list[int]]
+]:
+    """
+    Per undirected edge: summed half-cotangent, incident face count, and opposite corners.
+
+    ``cotmatrix_entries_intrinsic`` returns one half-cotangent per ``(face, corner)``, for the edge
+    *opposite* that corner, and the assembled matrix entry is their sum -- verified equal to this
+    dictionary for all 4 641 edges of the fixture below, so this is the operator's own weight and
+    not a re-derivation of it.
+    """
+    weight: dict[tuple[int, int], float] = {}
+    incident: dict[tuple[int, int], int] = {}
+    opposite: dict[tuple[int, int], list[int]] = {}
+    for face_index, triangle in enumerate(faces_np):
+        for corner in range(3):
+            a, b = int(triangle[(corner + 1) % 3]), int(triangle[(corner + 2) % 3])
+            key = (min(a, b), max(a, b))
+            weight[key] = weight.get(key, 0.0) + float(cot_np[face_index, corner])
+            incident[key] = incident.get(key, 0) + 1
+            opposite.setdefault(key, []).append(int(triangle[corner]))
+    return weight, incident, opposite
+
+
+def test_intrinsic_delaunay_residue_is_exactly_the_unflippable_set(device: str) -> None:
+    """
+    Not a library comparison: the documented gap between "converged" and "Delaunay".
+
+    ``intrinsic_delaunay`` declines a flip whose new edge already joins the same two vertices,
+    because the flip topology keys on the vertex pair and a multi-edge has nowhere to live, so its
+    loop ends when no edge is *flippable* rather than when none is violating. Its ``Notes`` say so;
+    nothing asserted it, and the alternative test -- "no edge has a negative weight" -- asserts a
+    property the function does not promise and fails on this fixture.
+
+    Dini's surface is the fixture because it is strongly graded (edge lengths spanning four orders)
+    and open. There is deliberately no ``conftest`` entry for it: it exists to exercise the failure
+    the well-shaped fixtures cannot reach, and the tests above already cover those.
+
+    **Two causes, and separating them is the point.** The 38 surviving *interior* violations are all
+    unflippable, which is the claim. The far larger negative weights on this mesh are on *boundary*
+    edges, where a single opposite angle is obtuse -- those are not Delaunay violations at all (the
+    condition is about two opposite angles summing past pi, and a boundary edge has one) and no
+    flip could ever fix them. A write-up that quotes the worst weight as evidence for the
+    duplicate-edge guard is quoting the boundary number; the assertions below keep the two apart.
+    """
+    vertices_wp, faces_wp = tw.creation.parametric_surface("dini", device=device)
+    intrinsic_faces_wp, lengths_wp, n_flips = tw.remesh.intrinsic_delaunay(vertices_wp, faces_wp)
+    assert n_flips > 0  # The comparison is not vacuous: the flipper did real work first.
+
+    faces_np = intrinsic_faces_wp.numpy().reshape(-1, 3)
+    cot_np = tw.laplacian.cotmatrix_entries_intrinsic(lengths_wp).numpy()
+    weight, incident, opposite = _summed_cotangent_weights(faces_np, cot_np)
+    existing = set(weight)
+
+    interior_violating = [e for e in weight if incident[e] == 2 and weight[e] < -1e-6]
+    boundary_negative = [e for e in weight if incident[e] == 1 and weight[e] < -1e-6]
+
+    # The claim: every surviving interior violation is one the guard declined, none is a miss.
+    assert interior_violating, "fixture no longer reaches the unflippable case"
+    unflippable = [e for e in interior_violating if tuple(sorted(opposite[e])) in existing]
+    assert len(unflippable) == len(interior_violating)
+
+    # And the magnitude lives on the boundary, which is a different, unfixable thing.
+    assert boundary_negative
+    assert min(weight[e] for e in boundary_negative) < min(weight[e] for e in interior_violating)
 
 
 @pytest.mark.parametrize("mesh_name", ["half_torus", "torus"])
