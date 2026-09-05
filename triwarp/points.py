@@ -89,7 +89,10 @@ def point_plane_distance(
     points: wp.array[wp.vec3], plane_normal: wp.vec3, plane_origin: wp.vec3 | None = None
 ) -> wp.array[wp.float32]:
     """
-    Minimum perpendicular distance of each point to a plane.
+    Signed perpendicular distance of each point to a plane.
+
+    The sign follows ``plane_normal``: positive on the side it points to, negative on the other,
+    zero on the plane. An unsigned distance is ``wp.map(wp.abs, ...)`` over the result.
 
     Parameters
     ----------
