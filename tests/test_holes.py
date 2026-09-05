@@ -2181,7 +2181,16 @@ def _stitch_loops_np(
 
 @pytest.mark.parametrize(
     ("n_a", "n_b", "phase", "offset"),
-    [(16, 11, 0.3, 0.0), (7, 13, 0.7, 0.0), (24, 5, 1.1, 0.0), (17, 11, 0.9, 1.2)],
+    [
+        (16, 11, 0.3, 0.0),
+        (7, 13, 0.7, 0.0),
+        (24, 5, 1.1, 0.0),
+        (17, 11, 0.9, 1.2),
+        # Equal-length rims take the branch where the larger-loop swap does *not* fire (it is on a
+        # strict inequality), so the caller's own argument order decides which mesh is A. Every
+        # other case here swaps or not by size; only this one pins the tie.
+        (13, 13, 0.5, 0.0),
+    ],
 )
 def test_stitch_loops_matches_numpy(
     device: str, n_a: int, n_b: int, phase: float, offset: float

@@ -1835,7 +1835,11 @@ def stitch_loops(
     only the two loops' existing vertices, adding ``len(loop_a) + len(loop_b)`` bridge triangles.
 
     The larger loop is treated as A (the meshes are swapped internally when
-    ``len(loop_a) < len(loop_b)``), so the output is invariant to argument order. Both loops must
+    ``len(loop_a) < len(loop_b)``), so the output is invariant to argument order **except when the
+    two loops are the same length**: the swap is on a strict inequality, so equal-length rims keep
+    the caller's order, and A and B are not interchangeable — A's edges are matched to B's
+    vertices, not the reverse — so two equal-length rims can produce a different seam either way
+    round. Both loops must
     wind following the face orientation, as returned by
     [`boundary_loops`][triwarp.boundary.boundary_loops]; the two boundaries are assumed to wind in
     opposite directions (as two open meshes facing each other do), so loop A is reversed to align
@@ -1854,11 +1858,11 @@ def stitch_loops(
     Returns
     -------
     new_vertices : wp.array[wp.vec3]
-        Concatenation of ``vertices_a`` then ``vertices_b`` (larger loop first), on
-        ``faces_a.device``.
+        Concatenation of ``vertices_a`` then ``vertices_b`` (larger loop first), on the device of
+        the **larger** loop's mesh — which is the caller's ``faces_a`` unless the swap above fired.
     new_faces : wp.array[wp.int32]
         Original faces (B reindexed by ``len(vertices_a)``) followed by the bridge triangles, on
-        ``faces_a.device``.
+        that same device.
 
     Raises
     ------
@@ -1887,7 +1891,6 @@ def stitch_loops(
     with ``N + M`` sequential launches along the anti-diagonals, and that gap widens with rim size.
     The DP is never the cheaper option -- prefer it for the seam it produces, not for speed.
     """
-    device = faces_a.device
     n = int(loop_a.shape[0])
     m = int(loop_b.shape[0])
     if n < m:
@@ -1895,6 +1898,9 @@ def stitch_loops(
         faces_a, faces_b = faces_b, faces_a
         loop_a, loop_b = loop_b, loop_a
         n, m = m, n
+    # Read *after* the swap: every allocation and launch below is on the A mesh's device, and the
+    # swap is what decides which of the caller's two meshes that is.
+    device = faces_a.device
     if m < 3:
         raise ValueError(f"each boundary loop must have at least 3 vertices, got {n} and {m}")
     n_vertices_a = int(vertices_a.shape[0])
