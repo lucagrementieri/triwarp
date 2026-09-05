@@ -1046,24 +1046,53 @@ def lattice_position(
 
 
 @wp.func
-def trilinear_cell(coordinate: wp.vec3, shape: wp.vec3i) -> tuple[wp.vec3i, wp.vec3]:
-    # Decompose a continuous lattice coordinate into its base corner and the three fractional
-    # offsets, clamping the corner so the ``+1`` reads of a trilinear stencil stay in range. Exact
-    # integer and subtraction work, which is why the three callers share it safely: extracting it
-    # reorders nothing and a float32 result cannot drift.
+def trilinear_cell(coordinate: wp.vec3, shape: wp.vec3i) -> tuple[wp.vec3i, wp.vec3i, wp.vec3]:
+    # Decompose a continuous lattice coordinate into the two corners of its cell and the three
+    # fractional offsets. Exact integer and subtraction work, which is why the three callers share
+    # it safely: extracting it reorders nothing and a float32 result cannot drift.
     #
-    # A degenerate axis (``shape[k] < 2``) collapses to corner 0 with fraction 0, so a single-slice
-    # lattice reads and writes that slice rather than indexing out of bounds.
+    # **It returns the far corner rather than leaving the caller to write ``base + 1``, and that is
+    # the whole point of the second return value.** Clamping the base into ``[0, shape - 2]`` bounds
+    # the base and says nothing about the stencil, so on a degenerate axis (``shape[k] == 1``) the
+    # base is 0 and ``base + 1`` is one slice past the end -- an out-of-bounds access at every one
+    # of the four stencil corners on that axis. The fraction there is 0, so the *weight* is 0 and no
+    # number is ever wrong; the address is computed and dereferenced regardless, which on the CPU
+    # device is host-heap corruption (CLAUDE.md section 12) and in release mode is silent on both.
+    # Handing back ``next_corner`` is what makes that unwriteable rather than merely documented.
+    #
+    # For any axis with two or more samples ``base <= shape - 2``, so ``next_corner`` is exactly
+    # ``base + 1`` and every currently-legal lattice indexes bit-identically to before.
     limit = wp.vec3i(wp.max(shape[0] - 2, 0), wp.max(shape[1] - 2, 0), wp.max(shape[2] - 2, 0))
     base = wp.vec3i(
         wp.clamp(wp.int32(wp.floor(coordinate[0])), 0, limit[0]),
         wp.clamp(wp.int32(wp.floor(coordinate[1])), 0, limit[1]),
         wp.clamp(wp.int32(wp.floor(coordinate[2])), 0, limit[2]),
     )
-    return base, wp.vec3(
-        wp.clamp(coordinate[0] - wp.float32(base[0]), 0.0, 1.0),
-        wp.clamp(coordinate[1] - wp.float32(base[1]), 0.0, 1.0),
-        wp.clamp(coordinate[2] - wp.float32(base[2]), 0.0, 1.0),
+    next_corner = wp.vec3i(
+        wp.min(base[0] + 1, shape[0] - 1),
+        wp.min(base[1] + 1, shape[1] - 1),
+        wp.min(base[2] + 1, shape[2] - 1),
+    )
+    return (
+        base,
+        next_corner,
+        wp.vec3(
+            wp.clamp(coordinate[0] - wp.float32(base[0]), 0.0, 1.0),
+            wp.clamp(coordinate[1] - wp.float32(base[1]), 0.0, 1.0),
+            wp.clamp(coordinate[2] - wp.float32(base[2]), 0.0, 1.0),
+        ),
+    )
+
+
+@wp.func
+def trilinear_corner(base: wp.vec3i, next_corner: wp.vec3i, offset: wp.vec3i) -> wp.vec3i:
+    # Pick one of the eight corners a ``trilinear_cell`` decomposition addresses, given the 0/1
+    # offset per axis. Paired with ``trilinear_weight``, which takes the same three offsets and
+    # returns that corner's weight, so the two cannot disagree about which corner is being named.
+    return wp.vec3i(
+        wp.where(offset[0] == 0, base[0], next_corner[0]),
+        wp.where(offset[1] == 0, base[1], next_corner[1]),
+        wp.where(offset[2] == 0, base[2], next_corner[2]),
     )
 
 

@@ -6,6 +6,7 @@ from triwarp.kernels.array import (
     OverloadTable,
     binary_search_index,
     trilinear_cell,
+    trilinear_corner,
     trilinear_weight,
     unpack_edge_key,
 )
@@ -360,17 +361,17 @@ def splat_grid_trilinear(
     # ``trilinear_weight``.
     s = wp.int32(wp.tid())
     shape = wp.vec3i(out_field.shape[0], out_field.shape[1], out_field.shape[2])
-    base, fractions = trilinear_cell(wp.cw_mul(points[s] - lower, inverse_spacing), shape)
+    base, next_corner, fractions = trilinear_cell(
+        wp.cw_mul(points[s] - lower, inverse_spacing), shape
+    )
     value = values[s]
     for offset_x in range(2):
         for offset_y in range(2):
             for offset_z in range(2):
                 weight = trilinear_weight(fractions, offset_x, offset_y, offset_z)
-                i = base[0] + offset_x
-                j = base[1] + offset_y
-                k = base[2] + offset_z
-                wp.atomic_add(out_field, i, j, k, weight * value)
-                wp.atomic_add(out_density, i, j, k, weight)
+                corner = trilinear_corner(base, next_corner, wp.vec3i(offset_x, offset_y, offset_z))
+                wp.atomic_add(out_field, corner[0], corner[1], corner[2], weight * value)
+                wp.atomic_add(out_density, corner[0], corner[1], corner[2], weight)
 
 
 @wp.kernel(enable_backward=False)

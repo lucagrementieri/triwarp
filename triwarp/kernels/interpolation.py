@@ -2,7 +2,7 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.kernels.array import OverloadTable, trilinear_cell, trilinear_weight
+from triwarp.kernels.array import OverloadTable, trilinear_cell, trilinear_corner, trilinear_weight
 from triwarp.kernels.triangles import face_vertices, point_barycentric_cramer
 
 
@@ -153,14 +153,17 @@ def sample_grid_trilinear(
     # already had.
     s = wp.int32(wp.tid())
     shape = wp.vec3i(field.shape[0], field.shape[1], field.shape[2])
-    base, fractions = trilinear_cell(wp.cw_mul(points[s] - lower, inverse_spacing), shape)
+    base, next_corner, fractions = trilinear_cell(
+        wp.cw_mul(points[s] - lower, inverse_spacing), shape
+    )
     accumulator = out_values.dtype(0.0)
     for offset_x in range(2):
         for offset_y in range(2):
             for offset_z in range(2):
+                corner = trilinear_corner(base, next_corner, wp.vec3i(offset_x, offset_y, offset_z))
                 accumulator += (
                     trilinear_weight(fractions, offset_x, offset_y, offset_z)
-                    * field[base[0] + offset_x, base[1] + offset_y, base[2] + offset_z]
+                    * field[corner[0], corner[1], corner[2]]
                 )
     out_values[s] = accumulator
 

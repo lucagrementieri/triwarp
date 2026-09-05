@@ -730,6 +730,61 @@ def test_splat_onto_grid_invalid_arguments(device: str):
     assert int(tw.voxels.sample_grid_trilinear(field_wp, empty_wp).shape[0]) == 0
 
 
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_splat_and_sample_handle_a_single_slice_axis(device: str, axis: int):
+    """
+    Not a library comparison: pytorch3d's volume admits no degenerate axis.
+
+    There is nothing to compare against, so the oracle is the non-degenerate lattice beside it.
+
+    A lattice with one sample on an axis is documented as legal ("each at least 1"), and the
+    trilinear stencil still addresses two corners per axis. The base corner is clamped into
+    ``[0, shape - 2]``, which is ``0`` here, so a stencil written ``base + 1`` steps one slice off
+    the end at four of its eight corners. The weight there is exactly zero, so no *value* is ever
+    wrong and only the address is out of range -- which is why this needs a bounds check to see it
+    and why the asserts below cannot: run under ``wp.config.mode = "debug"`` to reproduce the
+    original failure, or on the cpu device, where an out-of-bounds Warp write is heap corruption.
+
+    The values are asserted against the same field on a two-slice lattice, which must agree
+    exactly: a degenerate axis contributes weight 1 at its only corner either way.
+    """
+    rng = np.random.default_rng(11)
+    shape = [3, 3, 3]
+    shape[axis] = 1
+    n_points = 32
+    points_np = rng.uniform(0.0, 2.0, size=(n_points, 3)).astype(np.float32)
+    # Every position collapses onto the single slice, so pin the coordinate there too: that is what
+    # ``_lattice_transform`` does by mapping the degenerate axis's inverse spacing to zero.
+    points_np[:, axis] = 0.0
+    values_np = rng.normal(size=n_points).astype(np.float32)
+    points_wp = points_to_warp(points_np, device)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+
+    field_wp, density_wp = tw.voxels.splat_onto_grid(points_wp, values_wp, tuple(shape))
+    assert field_wp.shape == tuple(shape)
+    # The eight weights sum to one per point, so the density is the point count exactly -- the
+    # invariant `splat_onto_grid`'s own Notes states, and it fails if a corner escaped the lattice.
+    assert float(density_wp.numpy().sum()) == pytest.approx(float(n_points), rel=1e-5)
+
+    sampled_wp = tw.voxels.sample_grid_trilinear(field_wp, points_wp)
+    assert np.all(np.isfinite(sampled_wp.numpy()))
+
+    # The oracle: the same lattice with two slices on that axis. The degenerate axis's stencil
+    # weight is 1 at slice 0 and 0 at slice 1, so slice 0 must match element for element.
+    thick = list(shape)
+    thick[axis] = 2
+    thick_field_wp, thick_density_wp = tw.voxels.splat_onto_grid(points_wp, values_wp, tuple(thick))
+    slice_0 = [slice(None)] * 3
+    slice_0[axis] = slice(0, 1)
+    assert np.allclose(field_wp.numpy(), thick_field_wp.numpy()[tuple(slice_0)], atol=1e-6)
+    assert np.allclose(density_wp.numpy(), thick_density_wp.numpy()[tuple(slice_0)], atol=1e-6)
+    assert np.allclose(
+        sampled_wp.numpy(),
+        tw.voxels.sample_grid_trilinear(thick_field_wp, points_wp).numpy(),
+        atol=1e-6,
+    )
+
+
 def test_grid_points_defaults_to_index_space(device: str):
     """``bounds=None`` gives lattice indices, matching ``levelset.marching_cubes``."""
     lattice = tw.voxels.grid_points((2, 3, 4), device=device).numpy()

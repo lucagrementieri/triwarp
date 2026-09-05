@@ -1057,7 +1057,9 @@ def _lattice_transform(
     [`grid_points`][triwarp.voxels.grid_points]'s own default.
 
     A degenerate axis (one sample) has no spacing to invert and is mapped to 0, which puts every
-    position on that axis's single slice.
+    position on that axis's single slice. That is only half of what makes a single-slice lattice
+    safe -- it fixes the *coordinate*, and ``kernels/array.trilinear_cell`` is what keeps the
+    stencil's far corner from stepping off the end of that axis.
     """
     if bounds is None:
         return wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 1.0, 1.0)

@@ -15,6 +15,7 @@ from triwarp.kernels.array import (
     lattice_position,
     sort3,
     trilinear_cell,
+    trilinear_corner,
     trilinear_weight,
     update_argmax,
 )
@@ -536,17 +537,21 @@ def poisson_sample_grid(
     # corner weights. The two are the same function of the same inputs and differ only in float32
     # summation order, so they are deliberately not merged: this one's arithmetic is what the
     # Poisson iso-value was measured against, and the storage differs anyway.
-    base, fractions = trilinear_cell(wp.vec3(gx, gy, gz), wp.vec3i(res, res, res))
+    base, next_corner, fractions = trilinear_cell(wp.vec3(gx, gy, gz), wp.vec3i(res, res, res))
     i0, j0, k0 = base[0], base[1], base[2]
+    # The far corner comes from ``trilinear_cell`` rather than being written ``i0 + 1`` here, so a
+    # ``res == 1`` grid cannot index past this flat ``res**3`` buffer. Identical to ``i0 + 1`` at
+    # every ``res >= 2``, which is every resolution the Poisson solver builds.
+    i1, j1, k1 = next_corner[0], next_corner[1], next_corner[2]
     fx, fy, fz = fractions[0], fractions[1], fractions[2]
     c000 = field[poisson_grid_index(i0, j0, k0, res)]
-    c100 = field[poisson_grid_index(i0 + 1, j0, k0, res)]
-    c010 = field[poisson_grid_index(i0, j0 + 1, k0, res)]
-    c110 = field[poisson_grid_index(i0 + 1, j0 + 1, k0, res)]
-    c001 = field[poisson_grid_index(i0, j0, k0 + 1, res)]
-    c101 = field[poisson_grid_index(i0 + 1, j0, k0 + 1, res)]
-    c011 = field[poisson_grid_index(i0, j0 + 1, k0 + 1, res)]
-    c111 = field[poisson_grid_index(i0 + 1, j0 + 1, k0 + 1, res)]
+    c100 = field[poisson_grid_index(i1, j0, k0, res)]
+    c010 = field[poisson_grid_index(i0, j1, k0, res)]
+    c110 = field[poisson_grid_index(i1, j1, k0, res)]
+    c001 = field[poisson_grid_index(i0, j0, k1, res)]
+    c101 = field[poisson_grid_index(i1, j0, k1, res)]
+    c011 = field[poisson_grid_index(i0, j1, k1, res)]
+    c111 = field[poisson_grid_index(i1, j1, k1, res)]
     c00 = wp.lerp(c000, c100, fx)
     c10 = wp.lerp(c010, c110, fx)
     c01 = wp.lerp(c001, c101, fx)
@@ -579,14 +584,14 @@ def splat_normals(
     n = wp.normalize(n)  # unit direction; magnitude carried by ``weight``
 
     g = (points[s] - cube_lower) * inv_cell
-    base, fractions = trilinear_cell(g, wp.vec3i(res, res, res))
-    i0, j0, k0 = base[0], base[1], base[2]
+    base, next_corner, fractions = trilinear_cell(g, wp.vec3i(res, res, res))
 
     for di in range(2):
         for dj in range(2):
             for dk in range(2):
                 w = trilinear_weight(fractions, di, dj, dk) * weight
-                idx = poisson_grid_index(i0 + di, j0 + dj, k0 + dk, res)
+                corner = trilinear_corner(base, next_corner, wp.vec3i(di, dj, dk))
+                idx = poisson_grid_index(corner[0], corner[1], corner[2], res)
                 wp.atomic_add(out_vx, idx, w * n[0])
                 wp.atomic_add(out_vy, idx, w * n[1])
                 wp.atomic_add(out_vz, idx, w * n[2])
