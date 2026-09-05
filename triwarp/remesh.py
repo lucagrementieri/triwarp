@@ -116,7 +116,8 @@ def isotropic_remesh(
     surface. Feature and boundary structure is preserved: each vertex is classified FREE / CREASE
     (on a boundary loop or a dihedral crease sharper than ``feature_angle``) / CORNER (feature
     junction or endpoint), corners are frozen, crease vertices only move along their feature, and
-    feature edges are never flipped.
+    feature edges are never flipped. Passing ``max_deviation`` relaxes that last guarantee on
+    purpose — see its own entry below.
 
     Inputs are cloned and never mutated.
 
@@ -125,9 +126,10 @@ def isotropic_remesh(
     vertices
         ``(n_vertices,)`` vertex positions on the target device.
     faces
-        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer. Under ``reproject``,
-        the reference ``wp.Mesh`` aliases ``vertices`` and ``faces`` rather than copying them;
-        do not mutate them for the duration of the call.
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer. Whenever a reference
+        ``wp.Mesh`` is needed — under ``reproject``, under ``max_deviation``, or with an array
+        ``target_length``, any one of which is enough — it aliases ``vertices`` and ``faces``
+        rather than copying them; do not mutate them for the duration of the call.
     target_length
         Desired edge length. A **scalar** is the uniform target, defaulting to ``1 %`` of the
         bounding-box diagonal. A ``(n_vertices,)`` ``wp.float32`` array is an **adaptive sizing
@@ -152,6 +154,15 @@ def isotropic_remesh(
         Hausdorff distance to the input. ``None`` (the default) leaves fidelity to ``reproject``
         alone, as before. This is PyMeshLab's ``checksurfdist`` / ``maxsurfdist`` pair as a single
         optional bound. See the Notes for how tightly the bound actually holds.
+
+        **The clamp overrides feature preservation, deliberately, and it is the one thing here
+        that does.** It runs over *every* vertex with no regard for its FREE / CREASE / CORNER
+        classification, because a crease or a corner is exactly the kind of vertex that drifts and
+        that ``reproject`` refuses to touch. So a crease or corner vertex that has strayed past the
+        bound is pulled back toward its closest point on the whole input surface, which need not
+        lie on its own feature curve. It moves no further than the bound requires, and a vertex
+        already inside the band is untouched — but if the feature curves must be honoured exactly,
+        leave this ``None``.
 
     Returns
     -------
@@ -972,6 +983,9 @@ def cluster_decimate(
 
     See Also
     --------
+    [`quadric_decimate`][triwarp.remesh.quadric_decimate]
+        The other way to simplify: a face budget and a quadric error metric, rather than a voxel
+        size.
     [`isotropic_remesh`][triwarp.remesh.isotropic_remesh]
     [`triwarp.repair.remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices]
     [`triwarp.grouping.unique_faces`][triwarp.grouping.unique_faces]
@@ -1949,8 +1963,16 @@ def flip_to_delaunay(
         Flat face buffer with the region re-triangulated, on ``faces.device`` (a copy; the
         input is not modified).
 
+    Raises
+    ------
+    ValueError
+        If ``region`` is given and is not length ``n_faces``.
+
     See Also
     --------
+    [`flip_by_objective`][triwarp.remesh.flip_by_objective]
+        The same flip engine with a shape or flatness predicate in front of it instead of the
+        Delone test.
     [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]
     [`delaunay_triangulation`][triwarp.reconstruction.delaunay_triangulation]
     [`face_adjacency`][triwarp.adjacency.face_adjacency]

@@ -1571,6 +1571,22 @@ def test_flip_to_delaunay_empty(device: str):
     assert int(out.shape[0]) == 0
 
 
+def test_flip_to_delaunay_rejects_a_mismatched_region(device: str) -> None:
+    """
+    Not a library comparison: the documented ``ValueError`` on a wrong-length ``region``.
+
+    It comes from ``_flip_setup``, shared with ``flip_by_objective`` -- whose own
+    ``test_flip_by_objective_invalid`` has always covered it from that side. This one was
+    undocumented and untested until the ``Raises`` block was added, which is the asymmetry worth
+    pinning: one guard, two entry points, and only one of them said so.
+    """
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
+    with pytest.raises(ValueError, match="region must have length"):
+        tw.remesh.flip_to_delaunay(
+            vertices_wp, faces_wp, region=wp.zeros(2, dtype=wp.bool, device=device)
+        )
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "cave_cube"])
 def test_flip_topology_matches_the_composed_adjacency(
     mesh_name: str, request: pytest.FixtureRequest
