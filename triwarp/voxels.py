@@ -625,7 +625,9 @@ def resolve_voxel_grid(
     Parameters
     ----------
     points
-        ``(n,)`` positions the grid must cover. An empty set yields a unit diagonal.
+        ``(n,)`` positions the grid must cover. A set with no extent -- empty, a single point, or
+        any cloud whose points coincide -- yields a unit diagonal, since there is no scale to read
+        off it and one point belongs in one cell at any width.
     voxel_size
         Edge length of a cell. ``None`` takes ``1 %`` of the bounding-box diagonal.
     origin
@@ -641,7 +643,8 @@ def resolve_voxel_grid(
     Raises
     ------
     ValueError
-        If ``voxel_size`` is not positive.
+        If ``voxel_size`` is passed and is not positive. A derived one never trips this: the
+        zero-extent fallback above is what keeps the guard about the caller's argument.
 
     !!! note "The ``resolve_*`` pattern"
         Both of these -- this and [`sample.resolve_seed`][triwarp.sample.resolve_seed] /
@@ -669,6 +672,14 @@ def resolve_voxel_grid(
         else:
             lower, upper = tw.bounds.aabb(points)
             diagonal = float(wp.length(upper - lower))
+            # A single point -- or any cloud whose points are all coincident -- has a zero-extent
+            # box and so carries no scale to derive a cell width from. Take the same unit diagonal
+            # the empty cloud takes: one point belongs in one cell whatever the width, so there is
+            # a right answer here and it does not depend on the number chosen. Without this the
+            # derived width is ``0.01 * 0.0`` and the guard below rejects it, naming a
+            # ``voxel_size`` the caller never passed.
+            if diagonal == 0.0:
+                diagonal = 1.0
         if voxel_size is None:
             voxel_size = 0.01 * diagonal
         if origin is None:

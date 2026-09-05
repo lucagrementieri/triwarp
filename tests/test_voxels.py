@@ -1319,6 +1319,33 @@ def test_resolve_voxel_grid_empty_input_takes_a_unit_diagonal(device: str) -> No
     assert np.allclose(list(origin), -0.005, rtol=0, atol=1e-7)
 
 
+@pytest.mark.parametrize("n_points", [1, 5])
+def test_resolve_voxel_grid_zero_extent_input_takes_a_unit_diagonal(
+    device: str, n_points: int
+) -> None:
+    """
+    Not a library comparison: this is triwarp's own default convention, which no reference shares.
+
+    A single point, or any all-coincident cloud, has a zero-extent bounding box and so no scale to
+    read a cell width off. It takes the same unit diagonal the empty set takes -- the alternative
+    was a derived ``0.01 * 0.0`` that tripped the positivity guard and reported
+    ``requires voxel_size > 0, got 0.0``, naming the one argument the caller left as ``None``.
+
+    Both arities matter: ``n_points=1`` is the obvious case and ``n_points=5`` is the one a check
+    written as ``shape[0] == 1`` would miss, since coincidence rather than count is the condition.
+    """
+    points_wp = points_to_warp(np.full((n_points, 3), 2.5, dtype=np.float32), device)
+
+    voxel_size, origin = tw.voxels.resolve_voxel_grid(points_wp)
+
+    assert voxel_size == pytest.approx(0.01)
+    assert np.allclose(list(origin), 2.5 - 0.005, rtol=0, atol=1e-6)
+
+    # The whole point is that the derived grid is usable, not merely that nothing raised.
+    grid = tw.voxels.voxelize_points(points_wp)
+    assert int(grid.get_active_stats().voxel_count) == 1
+
+
 def test_resolve_voxel_grid_rejects_a_non_positive_size_and_names_its_caller(device: str) -> None:
     """
     The ``caller`` argument exists so the message names the public entry point, not this helper.
