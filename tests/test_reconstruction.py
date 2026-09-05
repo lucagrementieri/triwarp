@@ -1279,7 +1279,11 @@ def test_ball_pivoting_is_reproducible(device: str):
     )
     points_wp, normals_wp = _to_warp(torus_tm.vertices, torus_tm.vertex_normals, device)
     n_points = int(points_wp.shape[0])
-    # The wrapper's own auto-radius, pinned here so the raw runs below see the identical parameter.
+    # The wrapper's own auto-radius, recomputed on the host and then passed explicitly to every run
+    # below -- including the two public calls. That is load-bearing, not tidiness: the wrapper's own
+    # `radius <= 0` guess averages the spacings with a device reduction whose summation order is not
+    # fixed, so it lands a few ULP apart between calls and tips a borderline pivot. Dropping
+    # `radius=` from either public call makes this test flaky rather than stricter.
     spacing = tw.neighbors.query_nearest(points_wp, points_wp, k=7, backend="bvh")[1].numpy()[:, 1:]
     radius = 1.5 * float(spacing[np.isfinite(spacing) & (spacing > 0.0)].mean())
 

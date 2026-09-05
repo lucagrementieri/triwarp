@@ -1138,7 +1138,8 @@ def ball_pivoting(
         star-shaped clouds only).
     radius
         Ball radius. When ``<= 0``, it is auto-guessed as ``1.5 x`` the mean nearest-neighbour
-        spacing.
+        spacing — a device reduction, so the guess is not bit-reproducible between calls and neither
+        is the triangulation built from it (see ``Notes``).
     clustering
         Candidate points closer than ``clustering * radius`` to an edge endpoint are rejected
         (vcglib clustering, as a fraction of ``radius``).
@@ -1175,13 +1176,17 @@ def ball_pivoting(
     A single radius is used (the classic multi-radius schedule is a documented follow-up), and the
     triangle budget grows on demand rather than raising.
 
-    The triangulation is **reproducible**: repeated runs on one device and build return the same
-    set of triangles, because a wave resolves competing proposals by a key packed from their own
-    vertices and the wave counter rather than by the order they reached an atomic counter — device
-    state the loop advances deterministically, so the ordering varies between waves (which keeps a
-    front edge from being starved by a globally fixed key) without varying between runs. Two caveats
-    on how far that reaches:
+    The triangulation is **reproducible at an explicit ``radius``**: repeated runs on one device and
+    build return the same set of triangles, because a wave resolves competing proposals by a key
+    packed from their own vertices and the wave counter rather than by the order they reached an
+    atomic counter — device state the loop advances deterministically, so the ordering varies
+    between waves (which keeps a front edge from being starved by a globally fixed key) without
+    varying between runs. Three caveats on how far that reaches:
 
+    * the default ``radius <= 0`` is **not** covered. The auto-guess averages the nearest-neighbour
+      spacings with a device reduction whose summation order is not fixed, so two calls on one cloud
+      can guess radii a few ULP apart — enough to tip a borderline pivot and change the triangle
+      set. Pass ``radius`` explicitly wherever the result has to be reproducible;
     * the face buffer's *row order* is not pinned — ``commit_triangles`` appends with a
       ``wp.atomic_add`` — so compare reconstructions as a set of triangles, not buffer-to-buffer;
     * neither is the *winding* of a component that the cleanup tail cannot orient by volume, since

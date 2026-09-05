@@ -4853,9 +4853,25 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   2 048-point torus, and the resulting face count varies 3 200 / 3 200 / 3 154 across three calls in
   one process. **Pinning `radius=` makes it constant** — 3 200 in every call of three separate
   processes — which is why `test_ball_pivoting_is_reproducible` pins it and says so. Separate from
-  the swap defect above and unaffected by fixing it. Open: either the docstring's "repeated runs on
-  one device and build return the same set of triangles" needs a third caveat beside row order and
-  winding, or the estimator needs a deterministic reduction.
+  the swap defect above and unaffected by fixing it.
+
+  **Resolved as a documentation defect, deliberately.** The docstring claimed "repeated runs on one
+  device and build return the same set of triangles" and caveated exactly two things, row order and
+  winding; the claim is now scoped to *"reproducible at an explicit `radius`"* with the auto-guess
+  as a third caveat, and the `radius` parameter entry says the guess is not bit-reproducible. The
+  alternative — a deterministic reduction in `_mean_positive_finite` — was **not** taken: it would
+  buy bit-reproducibility for a *heuristic* (`1.5 x` the mean spacing is a rule of thumb, not a
+  quantity anything downstream is calibrated against), and a caller who needs a fixed triangulation
+  needs a fixed radius anyway, which the caveat now tells them. **Do not "fix" this by making the
+  sum deterministic without a caller that needs it** (§4.2). No test asserts the nondeterminism —
+  a test that asserts two runs *differ* is flaky by construction; the guard is a comment in
+  `test_ball_pivoting_is_reproducible` saying its `radius=` pinning is load-bearing, since dropping
+  it would make that test flaky rather than stricter.
+
+  `_mean_positive_finite`'s other caller is not exposed the same way: `screened_poisson` feeds it to
+  `int(np.floor(np.log2(...)))` and then clamps to `[full_depth, depth]`, so a 1-ULP wobble has to
+  land on a power-of-two boundary to change anything. Re-check that if the estimator ever returns
+  something other than a mean.
 - **Slab-chunked marching cubes is not viable and was abandoned.** `wp.MarchingCubes` is crack-free
   only *within* one grid: its per-cell face triangulation is not consistent across independent
   invocations, so welding independent z-slabs leaves ~2·(seam-verts) non-manifold edges spread over
