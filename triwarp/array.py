@@ -27,13 +27,8 @@ SORT_ROWS_INSERTION_MAX_COLS = 8
 
 
 def arange(
-    start: int,
-    stop: int | None = None,
-    step: int = 1,
-    dtype: type[wp.Int] = wp.int32,
-    *,
-    device: wp.DeviceLike,
-) -> wp.array:
+    start: int, stop: int | None = None, step: int = 1, *, device: wp.DeviceLike
+) -> wp.array[wp.int32]:
     """
     Evenly spaced integers over the half-open interval ``[start, stop)`` (``numpy.arange``).
 
@@ -51,8 +46,6 @@ def arange(
         End of the interval, excluded.
     step
         Spacing between consecutive values, so ``out[i + 1] - out[i] == step``. Must be non-zero.
-    dtype
-        Integer dtype of the result. Must be able to represent every value produced.
     device
         Warp device for the result. Keyword-only, unlike the first three, so the positional
         arguments stay [`numpy.arange`][]'s; required, because nothing in this package allocates
@@ -60,13 +53,21 @@ def arange(
 
     Returns
     -------
-    wp.array
+    wp.array[wp.int32]
         1-D array of ``max(0, ceil((stop - start) / step))`` values on ``device``.
 
     Raises
     ------
     ValueError
-        If ``step`` is zero, or the first or last value does not fit in ``dtype``.
+        If ``step`` is zero, or the first or last value does not fit in ``int32``.
+
+    Notes
+    -----
+    There is no ``dtype`` argument, which is the one place this departs from [`numpy.arange`][]'s
+    signature. Every index buffer in this package is ``int32``, so a second width has no caller,
+    and registering the kernel overloads for widths nothing reaches would cost compile time on
+    every rebuild. The range check above is what stands in for choosing a wider dtype: a range
+    that does not fit raises rather than silently wrapping.
 
     See Also
     --------
@@ -74,7 +75,6 @@ def arange(
         The same range with each value repeated a fixed number of times.
     [`numpy.arange`][]
     """
-    dtype = _ensure_int_dtype(dtype)
     if stop is None:
         start, stop = 0, start
     if step == 0:
@@ -83,26 +83,24 @@ def arange(
     # ``//`` floors, so negating both sides of the division ceils.
     n = max(0, -((start - stop) // step))
     if n > 0:
-        _check_int_fits(dtype, start, "start")
-        _check_int_fits(dtype, start + (n - 1) * step, "stop")
-    out = wp.empty(n, dtype=dtype, device=device)
+        _check_int32_fits(start, "start")
+        _check_int32_fits(start + (n - 1) * step, "stop")
+    out = wp.empty(n, dtype=wp.int32, device=device)
     if n == 0:
         return out
     if start == 0 and step == 1:
-        wp.launch(kernel_array.ARANGE[dtype], dim=n, inputs=[out], device=device)
+        wp.launch(kernel_array.ARANGE[wp.int32], dim=n, inputs=[out], device=device)
     else:
         wp.launch(
-            kernel_array.ARANGE_AFFINE[dtype],
+            kernel_array.ARANGE_AFFINE[wp.int32],
             dim=n,
-            inputs=[_int_scalar(dtype, start), _int_scalar(dtype, step), out],
+            inputs=[wp.int32(start), wp.int32(step), out],
             device=device,
         )
     return out
 
 
-def arange_repeat(
-    count: int, repeats: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32
-) -> wp.array:
+def arange_repeat(count: int, repeats: int, device: wp.DeviceLike) -> wp.array[wp.int32]:
     """
     Fill ``out[i] = i // repeats`` (``numpy.repeat`` of an index range).
 
@@ -114,47 +112,42 @@ def arange_repeat(
         How many consecutive entries share an index; must be positive.
     device
         Warp device for the result.
-    dtype
-        Integer dtype of the result.
 
     Returns
     -------
-    wp.array
+    wp.array[wp.int32]
         Length-``count`` array on ``device``.
 
     Raises
     ------
     ValueError
         If ``count`` is negative, ``repeats`` is not positive, or the largest value does not fit
-        in ``dtype``.
+        in ``int32``.
 
     See Also
     --------
     [`arange`][triwarp.array.arange]
-        The range this repeats.
+        The range this repeats, and whose ``Notes`` explain why neither takes a ``dtype``.
     [`numpy.repeat`][]
     """
-    dtype = _ensure_int_dtype(dtype)
     if count < 0:
         raise ValueError(f"count must be non-negative, got {count}")
     if repeats <= 0:
         raise ValueError(f"repeats must be positive, got {repeats}")
     if count > 0:
-        _check_int_fits(dtype, (count - 1) // repeats, "count // repeats")
-    out = wp.empty(count, dtype=dtype, device=device)
+        _check_int32_fits((count - 1) // repeats, "count // repeats")
+    out = wp.empty(count, dtype=wp.int32, device=device)
     if count > 0:
         wp.launch(
-            kernel_array.ARANGE_REPEAT[dtype],
+            kernel_array.ARANGE_REPEAT[wp.int32],
             dim=count,
-            inputs=[_int_scalar(dtype, repeats), out],
+            inputs=[wp.int32(repeats), out],
             device=device,
         )
     return out
 
 
-def sort_pair_indices(
-    n: int, fill_value: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32
-) -> wp.array:
+def sort_pair_indices(n: int, fill_value: int, device: wp.DeviceLike) -> wp.array[wp.int32]:
     """
     Fill ``[0, 1, ..., n-1, fill_value, ..., fill_value]`` (length ``2 * n``).
 
@@ -169,35 +162,34 @@ def sort_pair_indices(
         Padding written into the upper half.
     device
         Warp device for the result.
-    dtype
-        Integer dtype of the result.
 
     Returns
     -------
-    wp.array
+    wp.array[wp.int32]
         Length-``2 * n`` array on ``device``.
 
     Raises
     ------
     ValueError
-        If ``n`` is negative, or ``n - 1`` / ``fill_value`` does not fit in ``dtype``.
+        If ``n`` is negative, or ``n - 1`` / ``fill_value`` does not fit in ``int32``.
 
     See Also
     --------
     [`sort_and_argsort`][triwarp.array.sort_and_argsort]
+    [`arange`][triwarp.array.arange]
+        Whose ``Notes`` explain why neither takes a ``dtype``.
     """
-    dtype = _ensure_int_dtype(dtype)
     if n < 0:
         raise ValueError(f"n must be non-negative, got {n}")
     if n > 0:
-        _check_int_fits(dtype, n - 1, "n")
-    _check_int_fits(dtype, fill_value, "fill_value")
-    out = wp.empty(2 * n, dtype=dtype, device=device)
+        _check_int32_fits(n - 1, "n")
+    _check_int32_fits(fill_value, "fill_value")
+    out = wp.empty(2 * n, dtype=wp.int32, device=device)
     if n > 0:
         wp.launch(
-            kernel_array.SORT_PAIR_INDICES[dtype],
+            kernel_array.SORT_PAIR_INDICES[wp.int32],
             dim=2 * n,
-            inputs=[_int_scalar(dtype, n), _int_scalar(dtype, fill_value), out],
+            inputs=[wp.int32(n), wp.int32(fill_value), out],
             device=device,
         )
     return out
@@ -1505,19 +1497,11 @@ def bitcast_from_int(
 # ---------------------------------------------------------------------------
 
 
-def _ensure_int_dtype(dtype: type) -> type[wp.Int]:
-    if not wp.types.type_is_int(dtype):
-        raise TypeError(f"dtype must be a Warp integer type, got {dtype!r}")
-    return dtype
-
-
-def _check_int_fits(dtype: type[wp.Int], value: int, name: str) -> None:
-    vmin = twt.dtype_min(dtype)
-    vmax = twt.dtype_max(dtype)
+def _check_int32_fits(value: int, name: str) -> None:
+    # The range guard for the three index-buffer builders, which are ``int32`` by signature. It is
+    # what stands in for a ``dtype`` argument on them: a range too wide for the buffer raises here
+    # instead of wrapping silently in the ``wp.int32(...)`` constructor a few lines on.
+    vmin = twt.dtype_min(wp.int32)
+    vmax = twt.dtype_max(wp.int32)
     if value < vmin or value > vmax:
-        raise ValueError(f"{name}={value} is out of range for {dtype} [{vmin}, {vmax}]")
-
-
-def _int_scalar(dtype: type[wp.Int], value: int) -> wp.Int:
-    _check_int_fits(dtype, value, "value")
-    return dtype(value)
+        raise ValueError(f"{name}={value} is out of range for int32 [{vmin}, {vmax}]")

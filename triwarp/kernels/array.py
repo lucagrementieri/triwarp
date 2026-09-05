@@ -627,9 +627,19 @@ def mark_rows_present(
 # CLAUDE.md section 4. Measured over the suite: 12 overloads created across **13** module loads,
 # and this module is imported by 25 kernel modules and 15 wrappers, so its rebuilds are felt widely.
 #
-# The ``init_*`` kernels fill an index buffer and every caller in the package allocates that buffer
-# ``wp.int32``; ``wp.Int`` in their annotation is the template, not a menu. The two search kernels
-# take the caller's *key* dtype, whose surface is the one ``sortable_dtype`` maps onto.
+# The index-buffer kernels fill a buffer every caller in the package allocates ``wp.int32``;
+# ``wp.Int`` in their annotation is the template, not a menu. Their three wrappers
+# (``array.arange``, ``arange_repeat``, ``sort_pair_indices``) used to expose a ``dtype=`` keyword
+# that contradicted this: it type-checked, ran the per-dtype range validation, and then died in
+# ``OverloadTable.__getitem__`` for every value but the default. The keyword is gone rather than
+# the set widened -- nothing can have depended on an argument that only ever accepted one value,
+# where widening would compile three more overloads per kernel on every rebuild for no caller
+# (CLAUDE.md sections 2.5 and 4.2). So this tuple is now an exact statement of the public surface
+# rather than a restriction of it, and a second width belongs here only alongside a wrapper that
+# offers one.
+#
+# The two search kernels take the caller's *key* dtype, whose surface is the one
+# ``sortable_dtype`` maps onto.
 _INDEX_DTYPES = (wp.int32,)
 # ``isin_lookup_sorted``'s only caller is ``array.isin``, which raises on a non-integer dtype, so
 # its key surface stops at the integers.

@@ -60,6 +60,33 @@ def test_arange_repeat_zero_count(device: str) -> None:
     assert out_wp.shape == (0,)
 
 
+def test_index_builders_are_int32_and_guard_the_range(device: str) -> None:
+    """
+    Not a library comparison: the dtype contract of the three index-buffer builders.
+
+    They are ``int32`` by signature -- the ``dtype=`` keyword they used to advertise accepted only
+    ``wp.int32`` and raised a ``KeyError`` from the kernel table for every other value, so it was
+    removed rather than widened. The dtype assert is what makes that a stated contract instead of
+    an accident of the default, and it is a *membership* check of the kind a value comparison
+    cannot make: a builder that silently returned ``int64`` would still compare equal to numpy.
+
+    The range guard is the other half. With no ``dtype`` to widen to, a range too large for the
+    buffer must raise rather than wrap, and each of the three reaches that check by a different
+    route -- the interval's endpoints, the repeated index, and the padding value.
+    """
+    assert tw.array.arange(4, device=device).dtype == wp.int32
+    assert tw.array.arange_repeat(9, 3, device).dtype == wp.int32
+    assert tw.array.sort_pair_indices(5, -1, device).dtype == wp.int32
+
+    # Each raises before it allocates, so these cost nothing despite the sizes named.
+    with pytest.raises(ValueError, match=r"start=.* out of range for int32"):
+        tw.array.arange(2**31, 2**31 + 2, device=device)
+    with pytest.raises(ValueError, match=r"out of range for int32"):
+        tw.array.arange_repeat(2**31 + 1, 1, device)
+    with pytest.raises(ValueError, match=r"fill_value=.* out of range for int32"):
+        tw.array.sort_pair_indices(1, 2**31, device)
+
+
 def test_concatenate(device: str) -> None:
     parts = [
         wp.array([0, 3], dtype=wp.int32, device=device),
