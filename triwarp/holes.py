@@ -176,6 +176,8 @@ def fill_fan(
     See Also
     --------
     [`fill_cone`][triwarp.holes.fill_cone]
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
+        Far more robust on a non-convex or non-planar hole, and it also adds no vertices.
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
 
@@ -238,6 +240,8 @@ def fill_cone(
     See Also
     --------
     [`fill_fan`][triwarp.holes.fill_fan]
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
+        Far more robust on a non-convex or non-planar hole, and unlike this it adds no vertices.
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
 
@@ -426,7 +430,10 @@ def fill_min_weight(
         - ``"plane_normalized"`` (default) — circumcircle-diameter times aspect ratio, penalizing
           triangles flipped or tilted more than 60 degrees off the hole plane; falls back to
           ``"min_area"`` when the best triangulation is still bad (non-planar/degenerate).
-        - ``"min_area"`` — summed triangle area; always yields a filling.
+        - ``"min_area"`` — summed triangle area; never rejects a triangulation as bad, which is
+          what makes it the fallback the other metrics fall back *to*. That is a statement about
+          the metric only: see ``resolve_multiple_edges`` for the one thing that can still leave an
+          interval unfilled under it.
         - ``"circumscribed"`` — summed circumcircle diameter.
         - ``"plane"`` — circumcircle diameter with a flipped-normal penalty.
         - ``"min_tri_angle"`` — maximizes the minimal triangle angle.
@@ -441,7 +448,11 @@ def fill_min_weight(
     resolve_multiple_edges
         When ``True`` (default), forbid the triangulation from creating a chord that duplicates an
         existing mesh edge, avoiding non-manifold results on pinched holes. Such a chord is
-        forbidden outright rather than re-routed.
+        forbidden outright rather than re-routed, and the constraint binds under **every** metric
+        including the ``min_area`` fallback. An interval with no admissible apex left contributes
+        no triangles and is skipped silently, so a hole whose every triangulation is blocked comes
+        back still open rather than raising — pass ``False`` to trade that for a possibly
+        non-manifold fill.
     preserve_largest_hole
         When ``True``, leave the single largest boundary loop (greatest perimeter) open and fill
         only the rest — the single-boundary disk a robust UV parametrization expects.
@@ -499,13 +510,12 @@ def fill_loops_min_weight(
     """
     Min-weight-triangulate the given boundary ``loops`` and append the fill faces.
 
-    Lower-level engine shared by
-    [`fill_min_weight`][triwarp.holes.fill_min_weight] and
-    [`triwarp.reconstruction.triangulate_point_cloud`]
-    [triwarp.reconstruction.triangulate_point_cloud] (to close only a caller-selected subset of
-    boundary loops): every loop is sealed **together** by the interval DP under ``metric`` (with a
-    ``min_area`` fallback where the primary metric yields a bad triangulation), reusing only
-    existing vertices. Cost is set by the longest loop, not by the loop count; see
+    The loop-selecting form of [`fill_min_weight`][triwarp.holes.fill_min_weight]: same engine, but
+    the caller names which boundary loops to close rather than getting every one of them. Both
+    wrappers hand the packed loops to one shared private engine, so the triangulation is identical
+    where the loop sets are. Every loop is sealed **together** by the interval DP under ``metric``
+    (with a ``min_area`` fallback where the primary metric yields a bad triangulation), reusing
+    only existing vertices. Cost is set by the longest loop, not by the loop count; see
     [`fill_min_weight`][triwarp.holes.fill_min_weight].
 
     Parameters
