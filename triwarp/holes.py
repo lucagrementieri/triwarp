@@ -69,7 +69,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import Literal, NamedTuple
+from typing import Literal
 
 import numpy as np
 import warp as wp
@@ -1303,8 +1303,8 @@ def build_bottom(
     extremes = wp.full(packed.n_loops, math.inf, dtype=wp.float32, device=device)
     wp.launch(
         kernel_holes.loop_extreme_projection,
-        dim=int(packed.indices.shape[0]),
-        inputs=[vertices, packed.indices, packed.loop_id, direction, extremes],
+        dim=packed.total,
+        inputs=[vertices, packed.flat_loops, packed.loop_id, direction, extremes],
         device=device,
     )
     origins = wp.empty(packed.n_loops, dtype=wp.vec3, device=device)
@@ -1318,23 +1318,20 @@ def build_bottom(
     return _extend_packed_rims(vertices, faces, packed, direction, origins)
 
 
-class _PackedRims(NamedTuple):
-    """One flat buffer of rim vertices, with the per-loop bookkeeping the extension kernels read."""
-
-    indices: wp.array[wp.int32]
-    loop_id: wp.array[wp.int32]
-    starts: wp.array[wp.int32]
-    sizes: wp.array[wp.int32]
-    n_loops: int
-
-
 def _packed_rims(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     loops: Sequence[wp.array[wp.int32]] | None,
-) -> _PackedRims | None:
-    """Pack the rims to extend, or ``None`` when there is nothing to extend."""
-    device = faces.device
+) -> _PackedLoops | None:
+    """
+    Pack the rims to extend, or ``None`` when there is nothing to extend.
+
+    The packed form is ``_PackedLoops`` -- the same one the fill engine consumes -- rather than a
+    second bookkeeping type of its own. The extension kernels read exactly its ``flat_loops`` /
+    ``loop_id`` / ``starts`` / ``sizes``, and the two were building all four the same way from the
+    same ``pack_1d_arrays`` call. Its DP fields go unused here, which costs one host cumsum and one
+    ``n_loops``-long upload.
+    """
     if loops is None:
         loops = tw.boundary.boundary_loops(vertices, faces)
     loops = list(loops)
@@ -1343,28 +1340,19 @@ def _packed_rims(
             raise ValueError("every loop must be a rank-1 wp.int32 array of vertex indices")
     if not loops or all(int(loop.shape[0]) == 0 for loop in loops):
         return None
-
-    # ``copy=False``: the extension kernels only read the rim indices, so loops that came from
-    # ``boundary_loops`` are re-used in place rather than re-packed rim by rim.
-    packed, starts = tw.array.pack_1d_arrays(loops, copy=False)
-    sizes_np = np.array([int(loop.shape[0]) for loop in loops], dtype=np.int32)
-    loop_id = wp.array(
-        np.repeat(np.arange(len(loops), dtype=np.int32), sizes_np), dtype=wp.int32, device=device
-    )
-    sizes = wp.array(sizes_np, dtype=wp.int32, device=device)
-    return _PackedRims(packed, loop_id, starts, sizes, len(loops))
+    return _pack_loops(loops)
 
 
 def _extend_packed_rims(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    rims: _PackedRims,
+    rims: _PackedLoops,
     plane_normal: wp.vec3,
     plane_origins: wp.array[wp.vec3],
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """Project every packed rim vertex onto its loop's plane and bridge the two rings."""
     device = faces.device
-    total = int(rims.indices.shape[0])
+    total = rims.total
     n_vertices = int(vertices.shape[0])
     extended_vertices = wp.empty(n_vertices + total, dtype=wp.vec3, device=device)
     wp.copy(extended_vertices[:n_vertices], vertices)
@@ -1373,7 +1361,7 @@ def _extend_packed_rims(
         dim=total,
         inputs=[
             vertices,
-            rims.indices,
+            rims.flat_loops,
             rims.loop_id,
             plane_normal,
             plane_origins,
@@ -1389,7 +1377,7 @@ def _extend_packed_rims(
         kernel_holes.bridge_loop_to_ring,
         dim=total,
         inputs=[
-            rims.indices,
+            rims.flat_loops,
             rims.loop_id,
             rims.starts,
             rims.sizes,
