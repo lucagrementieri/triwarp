@@ -556,7 +556,8 @@ def estimate_normals(
     Raises
     ------
     ValueError
-        If both ``orient_reference`` and ``camera_location`` are given.
+        If both ``orient_reference`` and ``camera_location`` are given, or if ``neighbor_idx`` does
+        not have one row per point.
 
     See Also
     --------
@@ -570,6 +571,15 @@ def estimate_normals(
 
     device = points.device
     n = int(points.shape[0])
+    # The launch is one thread per *point* and each reads its own row, so a table with fewer rows
+    # than the cloud is an out-of-bounds read rather than a short answer -- and on the CPU device a
+    # Warp array is host heap, so that is heap corruption with no exception in release mode
+    # (CLAUDE.md section 12.1). The sibling ``outlier_probability`` checks the same pair of shapes;
+    # this one only checked the rank.
+    if int(neighbor_idx.shape[0]) != n:
+        raise ValueError(
+            f"neighbor_idx must have one row per point, got {neighbor_idx.shape} for {n} points"
+        )
     if n == 0:
         return wp.empty(0, dtype=wp.vec3, device=device)
 

@@ -860,6 +860,31 @@ def test_estimate_normals_orientation(device: str) -> None:
     assert np.all(np.einsum("ij,ij->i", normals_cam, points_np) <= tol)
 
 
+def test_estimate_normals_rejects_a_table_that_is_not_one_row_per_point(device: str) -> None:
+    """
+    Not a library comparison: no reference validates a caller-supplied neighbour table.
+
+    The launch is one thread per point and each thread reads its own row of ``neighbor_idx``, so a
+    table with fewer rows than the cloud is an out-of-bounds read, not a short answer -- and on the
+    CPU device a Warp array is host heap, so it is heap corruption with no exception in release
+    mode (CLAUDE.md section 12.1). Only the rank was checked.
+
+    Both directions are asserted, because only the short one is unsafe and a guard written against
+    inequality is the honest contract: a table with *more* rows than points is a caller error too,
+    it just happens to be a survivable one, and accepting it silently would leave the argument's
+    meaning ambiguous.
+    """
+    points_wp = points_to_warp(_fibonacci_sphere(10), device)
+    for rows in (6, 14):
+        neighbor_idx_wp = wp.zeros((rows, 4), dtype=wp.int32, device=device)
+        with pytest.raises(ValueError, match=r"one row per point"):
+            tw.estimate_normals(points_wp, neighbor_idx_wp)
+
+    # The accepting case, so the guard is a bound and not a blanket refusal.
+    matching_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=4, backend="bvh")
+    assert tw.estimate_normals(points_wp, matching_wp).shape == (10,)
+
+
 def test_estimate_normals_mutually_exclusive_orientation(device: str) -> None:
     points_wp = points_to_warp(_fibonacci_sphere(16), device)
     neighbor_idx_wp, _ = tw_neighbors.query_nearest(points_wp, points_wp, k=8, backend="bvh")
