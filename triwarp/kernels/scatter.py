@@ -7,7 +7,9 @@ from triwarp.kernels.array import (
     binary_search_index,
     trilinear_cell,
     trilinear_weight,
+    unpack_edge_key,
 )
+from triwarp.kernels.grouping import sorted_run_start
 
 
 @wp.func
@@ -40,12 +42,31 @@ def count_occurrences(indices: wp.array[wp.int32], out_counts: wp.array[wp.int32
 
 
 @wp.kernel
-def count_occurrences_rows(indices: wp.array2d[wp.int32], out_counts: wp.array[wp.int32]) -> None:
-    # Row form of ``count_occurrences``: every column of every row increments its own counter.
-    # One thread per row, so an edge list ``(n, 2)`` gives each endpoint's degree in one launch.
-    row = wp.int32(wp.tid())
-    for j in range(indices.shape[1]):
-        wp.atomic_add(out_counts, indices[row, j], 1)
+def scatter_valence_from_sorted_edge_keys(
+    sorted_keys: wp.array[wp.uint64], n: wp.int32, base: wp.uint64, out_valence: wp.array[wp.int32]
+) -> None:
+    # Vertex degree straight off a sorted ``pack_edge_key`` buffer: each run of equal keys is one
+    # undirected edge, so its first position -- and only its first -- increments both endpoints.
+    #
+    # This replaced (and retired) a row form of ``count_occurrences`` above, which took the
+    # *materialized* unique-edge rows. Anything holding those rows has already run a grouping pass,
+    # and that pass sorted these very keys -- so the rows were being re-derived to reach a number
+    # the sorted buffer already carries, which left the row form with no caller at all.
+    # ``remesh``'s flip loop is the case that made it visible: its topology rebuild radix-sorts the
+    # keys every pass, and recovering valence through ``edges.edges_unique`` grouped the identical
+    # corner rows a *third* time, after ``_classify`` and after the rebuild's own sort.
+    #
+    # Run length is not tested, unlike ``remesh.mark_edge_pair_starts``, which wants the
+    # manifold-interior edges alone: an edge is one edge whether one, two or five face corners
+    # claim it, which is what makes this match ``edges_unique``'s row set exactly -- a pair-only
+    # marker would silently drop every boundary edge. ``n`` bounds the live data because the buffer
+    # is usually over-allocated radix-sort scratch.
+    i = wp.int32(wp.tid())
+    if i >= n or not sorted_run_start(sorted_keys, i):
+        return
+    lo, hi = unpack_edge_key(sorted_keys[i], base)
+    wp.atomic_add(out_valence, lo, 1)
+    wp.atomic_add(out_valence, hi, 1)
 
 
 @wp.kernel

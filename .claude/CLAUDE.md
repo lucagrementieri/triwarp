@@ -4916,6 +4916,36 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   0.939 → 0.923; at 2x, 21 324 → 21 398 and 0.580 → 0.582. Aspect p99 and the degenerate-face count
   are unchanged in every cell. So the stricter (correct) predicate costs about **4 %** of the
   collapses at the tight target and nothing measurable at the loose one.
+- **SHIPPED — `_valence_flip_pass` grouped the same edge rows a *third* time per pass, and taking
+  the degrees off the sort the flip topology had already run is 1.40-1.55x on the stage.** Its
+  candidate closure called `edges.edges_unique(faces)` every pass purely to recover vertex valence,
+  after `_classify` had grouped those corner rows once and `_FlipTopology.rebuild()` had radix-sorted
+  the identical keys again. The sorted key buffer already carries the answer: each run of equal keys
+  is one undirected edge, so its **first** position increments both endpoints — one launch in place
+  of a whole `edges_unique` chain plus a `count_occurrences_rows`.
+
+  `scatter.scatter_valence_from_sorted_edge_keys` is that kernel, beside the
+  `count_occurrences_rows` it replaces so the two spellings of "vertex degree" cannot drift, and
+  `array.unpack_edge_key` is `pack_edge_key`'s inverse, placed beside it for the same reason.
+  Measured against a detached baseline worktree, interleaved, min of 9, with `_valence_flip_pass`
+  itself as the gate (§16.4's own advice — it mutates its face buffer in place and is exactly
+  reproducible, where `isotropic_remesh` is not):
+
+  | | 642 v | 2 562 v | 10 242 v |
+  |---|---|---|---|
+  | `_valence_flip_pass` | **1.44-1.52x** | **1.40-1.55x** | **1.41-1.49x** |
+
+  Face checksums identical in every cell. End to end, `isotropic_remesh(iterations=5)` is
+  **1.09-1.12x** (83.4 → 75.4 ms) at an identical face count. **The stage is flat in `n`** — 2.0 ms
+  at 642 vertices and at 10 242 — which is the tell that what was removed is host-side launch
+  chain rather than device work, and is §16.1's "remesh is launch-bound" again.
+
+  Two things worth carrying. **`mark_edge_pair_starts` is not the marker to reuse here**: it flags
+  runs of *exactly two*, i.e. manifold-interior edges, so valence built on it would silently drop
+  every boundary edge — the any-length run start (`grouping.sorted_run_start`, unqualified) is what
+  matches `edges_unique`'s row set. And **check 17 caught the first draft**: `wp.int32(key / base)`
+  on two `uint64`s is the stale spelling, `//` is the rule, and the two generate identical code —
+  which is precisely why only a scan holds that line (§1.5).
 - **`isotropic_remesh` is not byte-gateable.** Its face buffer is stable but vertex positions differ
   by ~2.7e-06 run to run (icosphere(2), 3 iterations, CUDA), because `accumulate_one_ring` and the
   area-weighted normals accumulate with atomics in nondeterministic order; on some fixtures (a

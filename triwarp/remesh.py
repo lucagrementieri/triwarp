@@ -565,13 +565,17 @@ def _valence_flip_pass(
     _codes, boundary_vertex = _classify(vertices, faces, feature)
 
     def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
-        # Valence is recomputed from the (in-place mutated) faces each pass to avoid staleness.
+        # Valence is recomputed each pass because the faces are mutated in place -- but from
+        # ``sorted_keys``, which the topology rebuild that produced this call has just radix-sorted,
+        # rather than from a fresh ``edges_unique``. Both give the number of incident unique edges;
+        # the second would group the identical corner rows a *third* time (after ``_classify``, and
+        # after the rebuild's own sort) to reach a number the sorted buffer already carries.
         valence = wp.zeros(n_vertices, dtype=wp.int32, device=device)
-        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+        n_keys = int(sorted_keys.shape[0])
         wp.launch(
-            kernel_scatter.count_occurrences_rows,
-            dim=int(unique_edges.shape[0]),
-            inputs=[unique_edges, valence],
+            kernel_scatter.scatter_valence_from_sorted_edge_keys,
+            dim=n_keys,
+            inputs=[sorted_keys, wp.int32(n_keys), key_base, valence],
             device=device,
         )
         wp.launch(

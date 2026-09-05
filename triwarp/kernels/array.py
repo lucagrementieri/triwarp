@@ -959,6 +959,15 @@ def pack_edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
 
 
 @wp.func
+def unpack_edge_key(key: wp.uint64, base: wp.uint64) -> tuple[wp.int32, wp.int32]:
+    """Endpoints ``(lo, hi)`` of a ``pack_edge_key`` key, min first as it was packed."""
+    # Beside its inverse rather than at the one call site, because the packing is a *convention*
+    # shared by ``face_edge_keys``, ``pass_edge_keys`` and ``grouping.hash_indices_rows``: a caller
+    # that recovers the endpoints by open-coding the divmod is one that can drift from it silently.
+    return wp.int32(key % base), wp.int32(key // base)
+
+
+@wp.func
 def pack_farthest_key(distance_sq: wp.float32, index: wp.int32) -> wp.int64:
     # One int64 whose ``wp.atomic_max`` is "largest distance, lowest index on a tie". The IEEE-754
     # bits of a non-negative float increase monotonically with the value, so the high half orders
