@@ -2695,6 +2695,19 @@ test-group packages.
 
 **`plans/` is gitignored** — plan documents are local working notes and never appear in a commit.
 
+### Version control
+
+**Commit directly on `main` unless the user asks for a branch.** This is a single-developer
+repository: there is no review queue for a feature branch to sit in and no second working copy to
+integrate with, so a branch-and-merge cycle buys nothing and costs a merge. The default overrides
+any general "branch before committing" habit — branch only when the user names one, or when a change
+is genuinely speculative and expected to be thrown away.
+
+Two things this does **not** change. Committing is still an explicit request: finish the work, run
+the gates (§8, §12.10), and commit when asked, not on your own initiative. And the measurement
+discipline that depends on a clean tree is unaffected — an A/B against a prior revision uses a
+**detached worktree**, never `git stash` and never a branch checkout in the live tree (§15.6).
+
 ---
 
 ## 9. Performance work: measure before you change
