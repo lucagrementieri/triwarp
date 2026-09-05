@@ -4941,16 +4941,33 @@ cross-process cache fix buys triwarp nothing because named `@wp.func`s already c
   against the `cave_cube` self-intersection, but **it has not been tried, and the fold guard is still
   unwritten.**
 
-  **And the smooth pass may not be the only contributor: the isotropic *collapse* has no fold veto
-  either.** `quadric_collapse_candidates` runs `collapse_flips_normal` both ways before accepting;
-  `collapse_candidates` runs nothing equivalent — its link condition is topological and its
-  anti-oscillation walk bounds *lengths*, so neither sees a collapse that inverts an incident face.
-  The two kernels deliberately share `collapse_survivor` and `satisfies_link_condition` precisely
-  because a duplicated *decision rule* is the hazard (§2.4), so this divergence is a gap rather than
-  a variant, and it is now written at the site. Unmeasured, and not a one-line change: the veto
-  reads a vertex-*face* CSR that `_collapse_pass` does not build (it has only the vertex-vertex
-  `edges_to_csr`). Price the stage first, and attribute the graded-input degeneracies between the
-  two guards rather than assuming the smoother owns them all.
+  **FIXED — the smooth pass was not the only contributor: the isotropic *collapse* had no fold
+  veto.** `quadric_collapse_candidates` ran `collapse_flips_normal` both ways before accepting and
+  `collapse_candidates` ran nothing equivalent — its link condition is topological and its
+  anti-oscillation walk bounds *lengths*, so neither saw a collapse that inverts an incident face.
+  Since the two kernels deliberately share `collapse_survivor` and `satisfies_link_condition`
+  precisely because a duplicated *decision rule* is the hazard (§2.4), that divergence was a gap
+  rather than a variant. `collapse_candidates` now runs the same veto, in the same both-ways
+  spelling, and `_collapse_pass` builds the vertex-face CSR it needs.
+
+  **It is free, which is the part that was mispriced.** The concern on record was that the veto
+  "costs an adjacency build per pass on a stage that is already rebuild-dominated". Measured
+  against a baseline worktree on a 133x133 graded saddle patch, three reps per arm, both arms
+  deterministic on that fixture: the CSR build is **0.124 ms against an ~11 ms five-pass stage**,
+  and the stage's two timing ranges *overlap* (11.09-11.58 ms → 9.77-12.34), because rejecting a
+  collapse early removes work downstream. What it buys: `_collapse_pass` zero-area faces
+  **1 → 0** and minimum face area **0.0 → 3.9e-12**, aspect p99 6260.79 → 5882.00; and
+  `isotropic_remesh(iterations=3)` aspect p99 **3100-3116 → 2007.16**, a **1.55x** improvement
+  against a baseline that drifts only ~0.5 % run to run.
+
+  **The attribution is now split rather than settled**: `isotropic_remesh` still leaves one
+  degenerate face on that input, so the smooth pass (or a later stage) still owns part of it. The
+  open item above — an area-equalizing smoother with a real fold guard — is unchanged.
+
+  Method note worth keeping: the two arms had to be shown *deterministic on this fixture* before
+  the quality delta could be read at all, because §16.4's own "not byte-gateable" warning applies
+  to `isotropic_remesh`. Three reps per arm cost seconds and turned a plausible-looking 1.55x into
+  a measured one.
 - **FIXED — `valence_flip_candidates` had no shape guard.** It flipped on valence alone with only a
   convexity test, and convexity makes a flip legal but bounds nothing about the shape produced: on a
   graded mesh it turned slivers into worse slivers and in float32 hit exactly-zero area — **2 738 of

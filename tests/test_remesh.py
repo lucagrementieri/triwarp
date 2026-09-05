@@ -437,6 +437,66 @@ def test_collapse_pass_commits_a_useful_fraction_on_a_structured_patch(device: s
     assert len(trimesh_outline_loops(warp_to_trimesh(out_vertices, out_faces))) == 1
 
 
+def test_collapse_pass_vetoes_a_collapse_that_would_fold_a_face(device: str) -> None:
+    """
+    The collapse stage rejects a collapse that inverts an incident face, as the quadric one does.
+
+    Not a library comparison: no reference exposes one pass of a collapse stage, and this is a
+    claim about triwarp's own guard. ``collapse_candidates`` shares ``collapse_survivor`` and
+    ``satisfies_link_condition`` with ``quadric_collapse_candidates`` precisely because a
+    duplicated *decision rule* is a correctness hazard, and for a long time it did not share the
+    fold veto -- the link condition is topological and the anti-oscillation walk bounds *lengths*,
+    so nothing else in the kernel notices a fold.
+
+    **A strongly graded patch is the input that exposes it**, which is why this builds one rather
+    than using a sphere fixture: on a well-shaped mesh no candidate collapse folds a face and the
+    assertion is vacuous.
+
+    **The assertion is the invariant a fold breaks, not a quality statistic.** The patch is a
+    *height field* -- ``z = x^2 - y^2`` sampled on a graded grid -- so every face's projection to
+    the xy-plane carries the same winding, and a collapse moves a vertex to an edge midpoint, whose
+    projection is the midpoint of the projections. A surviving face with the opposite projected
+    winding is therefore folded, exactly. Mutation probe against a baseline worktree: removing the
+    veto leaves **9 folded faces of 30 450** where the guard leaves **0 of 30 502**. A
+    minimum-area assertion was tried first and is *not* usable -- the fold produces an exactly
+    zero-area face only at some targets, and at this one both arms bottom out around 5e-12, so the
+    probe passed against the broken code.
+    """
+    samples = np.sign(np.linspace(-1.0, 1.0, 133)) * np.abs(np.linspace(-1.0, 1.0, 133)) ** 3
+    x_np, y_np = np.meshgrid(samples, samples, indexing="ij")
+    vertices_np = np.stack([x_np, y_np, x_np * x_np - y_np * y_np], axis=-1).reshape(-1, 3)
+    index_np = np.arange(133 * 133).reshape(133, 133)
+    faces_np = np.stack(
+        [
+            index_np[:-1, :-1],
+            index_np[:-1, 1:],
+            index_np[1:, :-1],
+            index_np[:-1, 1:],
+            index_np[1:, 1:],
+            index_np[1:, :-1],
+        ],
+        axis=-1,
+    ).reshape(-1)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np.astype(np.int32), device)
+
+    n_vertices = int(vertices_wp.shape[0])
+    target = 2.0 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
+    low, high = tw.remesh._length_bands(None, target, n_vertices, device)
+    out_vertices, out_faces = tw.remesh._collapse_pass(
+        vertices_wp, faces_wp, low, high, wp.float32(math.radians(30.0))
+    )
+
+    # The stage must have done real work, or the guard was never reached.
+    assert int(out_vertices.shape[0]) < n_vertices
+
+    triangles_np = out_vertices.numpy()[out_faces.numpy().reshape(-1, 3)]
+    edge_a_np = triangles_np[:, 1] - triangles_np[:, 0]
+    edge_b_np = triangles_np[:, 2] - triangles_np[:, 0]
+    projected_np = edge_a_np[:, 0] * edge_b_np[:, 1] - edge_b_np[:, 0] * edge_a_np[:, 1]
+    # Every input face projects with one winding; a survivor carrying the other one is folded.
+    assert not (np.any(projected_np > 0.0) and np.any(projected_np < 0.0))
+
+
 def test_remesh_adaptive_sizing_field_grades_the_result(device: str) -> None:
     """
     A graded sizing field produces a graded mesh: achieved edge length tracks the requested one.

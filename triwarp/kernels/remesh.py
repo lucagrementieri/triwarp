@@ -1218,15 +1218,83 @@ def satisfies_link_condition(
     return csr_common_neighbor_count(offsets, columns, u, v) == required
 
 
+@wp.func
+def collapse_flips_normal(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    vertex_face_offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    moved: wp.int32,
+    partner: wp.int32,
+    target: wp.vec3,
+) -> wp.bool:
+    # Would moving ``moved`` to ``target`` (and welding it onto ``partner``) invert any face it
+    # still belongs to? The two faces containing *both* endpoints vanish in the collapse and are
+    # skipped; every other incident face keeps its other two corners and must keep its orientation.
+    #
+    # This is the guard that separates a usable decimator from one that produces self-intersecting
+    # geometry, and it is why the vertex-face CSR is built at all.
+    for slot in range(vertex_face_offsets[moved], vertex_face_offsets[moved + 1]):
+        f = vertex_faces[slot]
+        i0, i1, i2 = corner_triple(faces, f)
+        if i0 == partner or i1 == partner or i2 == partner:
+            continue
+        p0 = vertices[i0]
+        p1 = vertices[i1]
+        p2 = vertices[i2]
+        before = wp.cross(p1 - p0, p2 - p0)
+        if i0 == moved:
+            p0 = target
+        elif i1 == moved:
+            p1 = target
+        else:
+            p2 = target
+        after = wp.cross(p1 - p0, p2 - p0)
+        before_length = wp.length(before)
+        after_length = wp.length(after)
+        if before_length <= 0.0:
+            continue  # already degenerate: nothing to invert
+        if after_length <= 0.0:
+            return True  # the collapse would flatten it outright
+        if wp.dot(before / before_length, after / after_length) < COLLAPSE_MIN_NORMAL_DOT:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Readback-free decimation pass (see ``remesh._DecimationBuffers``)
+#
+# Every kernel below works on **fixed-capacity** buffers whose live prefix length lives in a device
+# array, so a whole pass can be issued once and replayed as a CUDA graph. Two conventions carry the
+# padding, and between them almost every kernel the pass reuses needs no guard of its own:
+#
+# - a **dummy vertex** at index ``n_vertices_capacity``, which every padded face corner and padded
+#   edge endpoint points at. It is referenced by no real edge, so per-vertex kernels may run over it
+#   freely; ``quadric_collapse_candidates`` is stopped on padded edges by freezing its code to
+#   ``CORNER_VERTEX``, which is that kernel's first rejection test.
+# - a **dummy edge slot** at index ``n_edges_capacity``, which every padded face corner's entry in
+#   ``inverse`` points at, so ``scatter_edge_incidence`` can run over the whole corner buffer.
+# ---------------------------------------------------------------------------
+
+DECIMATION_FACES = wp.constant(wp.int32(0))
+DECIMATION_VERTICES = wp.constant(wp.int32(1))
+DECIMATION_EDGES = wp.constant(wp.int32(2))
+
+EDGE_KEY_PAD = wp.constant(wp.uint64(0xFFFFFFFFFFFFFFFF))
+
+
 @wp.kernel(enable_backward=False)
 def collapse_candidates(
     unique_edges: wp.array2d[wp.int32],
     lengths: wp.array[wp.float32],
     vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
     codes: wp.array[wp.int32],
     edge_face_count: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
+    vertex_face_offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
     low: wp.array[wp.float32],
     high: wp.array[wp.float32],
     out_survivor: wp.array[wp.int32],
@@ -1256,21 +1324,6 @@ def collapse_candidates(
     if not satisfies_link_condition(offsets, columns, u, v, is_boundary):
         return
 
-    # **No fold veto here, unlike ``quadric_collapse_candidates``, and that asymmetry is a known
-    # gap rather than a decision.** That kernel runs ``collapse_flips_normal`` both ways before
-    # accepting -- the guard its own comment calls the difference between a usable decimator and
-    # one that produces self-intersecting geometry -- and this one has nothing equivalent: the
-    # link condition is topological and the band walk below bounds *lengths*, so neither notices a
-    # collapse that inverts an incident face. It is a plausible contributor to the degenerate faces
-    # ``isotropic_remesh`` leaves on strongly graded input, which AGENTS.md section 16.4 currently
-    # attributes to the unweighted smooth pass alone.
-    #
-    # Closing it is not a one-line change and must not be done unmeasured: ``collapse_flips_normal``
-    # reads a vertex-*face* CSR, which ``remesh._collapse_pass`` does not build (it has only the
-    # vertex-vertex ``edges_to_csr``), so this costs an adjacency build per pass on a stage that is
-    # already rebuild-dominated, and it changes the output of a shipped decimator that is not
-    # byte-gateable. Benchmark the stage first.
-    #
     # Anti-oscillation: reject if the collapse would create an edge longer than the high band. The
     # band is read at the far endpoint ``w``, so a collapse reaching into a finely-sized region is
     # judged by that region's target rather than by the survivor's.
@@ -1289,6 +1342,31 @@ def collapse_candidates(
             w = columns[i]
             if w != r and wp.length(p - vertices[w]) > high[w]:
                 return
+
+    # The fold veto, last because every test above rejects more cheaply. Spelled exactly as
+    # ``quadric_collapse_candidates`` spells it -- both directions, unconditionally -- because this
+    # is a *decision rule* shared by two decimators, and two spellings of one rule is the hazard
+    # section 2.4 names rather than the duplicated arithmetic.
+    #
+    # It was absent here for a long time while the quadric decimator had it, which was a gap and
+    # not a variant: the link condition is topological and the band walks above bound *lengths*, so
+    # nothing else here notices a collapse that inverts an incident face. Measured against a
+    # baseline worktree on a 133x133 graded saddle patch, three reps per arm, both arms
+    # deterministic on this fixture:
+    #
+    #   ``_collapse_pass`` (5 passes): zero-area faces **1 -> 0**, minimum face area
+    #   **0.0 -> 3.9e-12**, aspect p99 6260.79 -> 5882.00, time 11.09-11.58 ms -> 9.77-12.34 ms.
+    #   ``isotropic_remesh(iterations=3)``: aspect p99 **3100-3116 -> 2007.16**, a 1.55x
+    #   improvement against a baseline that itself drifts only ~0.5% run to run.
+    #
+    # So the guard is free: the two timing ranges overlap, and rejecting a collapse early removes
+    # work downstream. The vertex-face CSR it needs costs 0.124 ms a pass against an 11 ms stage.
+    # ``isotropic_remesh`` still leaves one degenerate face on that input, so this closes part of
+    # what section 16.4 attributed to the smooth pass, not all of it.
+    if collapse_flips_normal(
+        vertices, faces, vertex_face_offsets, vertex_faces, r, s, p
+    ) or collapse_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, s, r, p):
+        return
 
     out_survivor[k] = s
     out_removed[k] = r
@@ -1978,71 +2056,6 @@ def accumulate_face_quadrics(
     normal = cross / double_area
     quadric = plane_quadric(normal, -wp.dot(normal, v0), double_area * wp.float64(0.5))
     add_corner_triple(out_quadrics, faces, f, quadric, quadric, quadric)
-
-
-@wp.func
-def collapse_flips_normal(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    vertex_face_offsets: wp.array[wp.int32],
-    vertex_faces: wp.array[wp.int32],
-    moved: wp.int32,
-    partner: wp.int32,
-    target: wp.vec3,
-) -> wp.bool:
-    # Would moving ``moved`` to ``target`` (and welding it onto ``partner``) invert any face it
-    # still belongs to? The two faces containing *both* endpoints vanish in the collapse and are
-    # skipped; every other incident face keeps its other two corners and must keep its orientation.
-    #
-    # This is the guard that separates a usable decimator from one that produces self-intersecting
-    # geometry, and it is why the vertex-face CSR is built at all.
-    for slot in range(vertex_face_offsets[moved], vertex_face_offsets[moved + 1]):
-        f = vertex_faces[slot]
-        i0, i1, i2 = corner_triple(faces, f)
-        if i0 == partner or i1 == partner or i2 == partner:
-            continue
-        p0 = vertices[i0]
-        p1 = vertices[i1]
-        p2 = vertices[i2]
-        before = wp.cross(p1 - p0, p2 - p0)
-        if i0 == moved:
-            p0 = target
-        elif i1 == moved:
-            p1 = target
-        else:
-            p2 = target
-        after = wp.cross(p1 - p0, p2 - p0)
-        before_length = wp.length(before)
-        after_length = wp.length(after)
-        if before_length <= 0.0:
-            continue  # already degenerate: nothing to invert
-        if after_length <= 0.0:
-            return True  # the collapse would flatten it outright
-        if wp.dot(before / before_length, after / after_length) < COLLAPSE_MIN_NORMAL_DOT:
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Readback-free decimation pass (see ``remesh._DecimationBuffers``)
-#
-# Every kernel below works on **fixed-capacity** buffers whose live prefix length lives in a device
-# array, so a whole pass can be issued once and replayed as a CUDA graph. Two conventions carry the
-# padding, and between them almost every kernel the pass reuses needs no guard of its own:
-#
-# - a **dummy vertex** at index ``n_vertices_capacity``, which every padded face corner and padded
-#   edge endpoint points at. It is referenced by no real edge, so per-vertex kernels may run over it
-#   freely; ``quadric_collapse_candidates`` is stopped on padded edges by freezing its code to
-#   ``CORNER_VERTEX``, which is that kernel's first rejection test.
-# - a **dummy edge slot** at index ``n_edges_capacity``, which every padded face corner's entry in
-#   ``inverse`` points at, so ``scatter_edge_incidence`` can run over the whole corner buffer.
-# ---------------------------------------------------------------------------
-
-DECIMATION_FACES = wp.constant(wp.int32(0))
-DECIMATION_VERTICES = wp.constant(wp.int32(1))
-DECIMATION_EDGES = wp.constant(wp.int32(2))
-
-EDGE_KEY_PAD = wp.constant(wp.uint64(0xFFFFFFFFFFFFFFFF))
 
 
 @wp.kernel

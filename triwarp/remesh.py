@@ -481,6 +481,14 @@ def _collapse_pass(
 
         codes, _boundary = _classify(vertices, faces, feature, incidence)
         csr = tw.graph.edges_to_csr(n_vertices, unique_edges)
+        # The vertex-face CSR exists only for ``collapse_candidates``' fold veto, which needs the
+        # faces incident to a vertex where ``csr`` above has only its neighbours. One build is
+        # 0.124 ms against ~11 ms for the five-pass stage on a 133x133 graded saddle patch, and the
+        # veto's own per-candidate work does not show above run-to-run noise -- the numbers, and
+        # the quality it buys, are at the veto itself in ``kernels/remesh.collapse_candidates``.
+        vertex_faces, face_offsets = tw.adjacency.vertex_face_adjacency(
+            faces, n_vertices=n_vertices
+        )
 
         survivor = wp.full(m, -1, dtype=wp.int32, device=device)
         removed = wp.empty(m, dtype=wp.int32, device=device)
@@ -492,10 +500,13 @@ def _collapse_pass(
                 unique_edges,
                 lengths,
                 vertices,
+                faces,
                 codes,
                 incidence.face_count,
                 csr.offsets,
                 csr.columns,
+                face_offsets,
+                vertex_faces,
                 low,
                 high,
                 survivor,
