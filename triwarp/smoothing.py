@@ -139,7 +139,16 @@ def filter_laplacian(
 
     operator = _resolved_operator(vertices, faces, laplacian_operator)
     positions = _as_vec3d(vertices)
-    vol_ini = tw.measures.volume(positions, faces) if volume_constraint else 0.0
+    if volume_constraint:
+        vol_ini = tw.measures.volume(positions, faces)
+        # The *initial* centre of mass, computed once here rather than inside the loop -- see
+        # _apply_volume_constraint's Notes for why the rescale has to stay anchored to this one
+        # fixed point rather than the mesh's current (already-moved) centre of mass.
+        _, center_f32, _ = tw.measures.moments(vertices, faces)
+        center_ini = wp.vec3d(float(center_f32[0]), float(center_f32[1]), float(center_f32[2]))
+    else:
+        vol_ini = 0.0
+        center_ini = wp.vec3d(0.0, 0.0, 0.0)
 
     if implicit_time_integration:
         system = _build_implicit_system(operator, lamb, n, device)
@@ -167,7 +176,7 @@ def filter_laplacian(
                 out=positions,
             )
             if volume_constraint:
-                _apply_volume_constraint(positions, faces, vol_ini)
+                _apply_volume_constraint(positions, faces, vol_ini, center_ini)
     else:
         lv = wp.empty(n, dtype=wp.vec3d, device=device)
         nxt = wp.empty(n, dtype=wp.vec3d, device=device)
@@ -180,7 +189,7 @@ def filter_laplacian(
             wp.launch(step, dim=n, inputs=[positions, lv, coeff], outputs=[nxt], device=device)
             positions, nxt = nxt, positions
             if volume_constraint:
-                _apply_volume_constraint(positions, faces, vol_ini)
+                _apply_volume_constraint(positions, faces, vol_ini, center_ini)
 
     return _as_vec3(positions)
 
@@ -218,10 +227,19 @@ def _build_implicit_system(
 
 
 def _apply_volume_constraint(
-    positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], vol_ini: float
+    positions: wp.array[wp.vec3d],
+    faces: wp.array[wp.int32],
+    vol_ini: float,
+    center: wp.vec3d,
 ) -> None:
     """
-    Rescale about the origin so the signed volume returns to ``vol_ini``.
+    Rescale about ``center`` so the signed volume returns to ``vol_ini``.
+
+    ``center`` must be the mesh's *initial* centre of mass, fixed once before the smoothing loop
+    starts -- matching ``trimesh.smoothing.filter_laplacian``, which rescales about that same
+    fixed point on every pass rather than the current (already-drifted) one. Rescaling about the
+    origin is only equivalent when the mesh happens to be centred there; on any mesh that is not,
+    the two answers diverge and the divergence compounds with every iteration.
 
     The ratio has to be *positive* as well as finite: a smoothing pass that flips the sign of the
     signed volume -- an inconsistently wound or non-watertight input, where the "volume" is not a
@@ -232,7 +250,8 @@ def _apply_volume_constraint(
     vol_new = tw.measures.volume(positions, faces)
     ratio = vol_ini / vol_new if vol_new != 0.0 else 0.0
     if ratio > 0.0:
-        wp.map(wp.mul, positions, wp.float64(ratio ** (1.0 / 3.0)), out=positions)
+        scale = wp.float64(ratio ** (1.0 / 3.0))
+        wp.map(kernel_smoothing.rescale_about_center, positions, center, scale, out=positions)
 
 
 def inflate(

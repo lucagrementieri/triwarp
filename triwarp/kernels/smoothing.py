@@ -292,6 +292,17 @@ def scatter_free_positions(
 
 
 @wp.func
+def rescale_about_center(position: wp.vec3d, center: wp.vec3d, scale: wp.float64) -> wp.vec3d:
+    # (position - center) * scale + center: a uniform rescale about an arbitrary fixed point
+    # rather than the origin. ``smoothing._apply_volume_constraint`` needs this, not a bare
+    # multiply, because the mesh being smoothed is rarely centred at the origin and
+    # ``trimesh.smoothing.filter_laplacian`` rescales about the mesh's own (fixed, initial) centre
+    # of mass -- multiplying by ``scale`` alone silently translates the whole mesh on every pass
+    # whenever the two points differ, and the error compounds with the iteration count.
+    return (position - center) * scale + center
+
+
+@wp.func
 def laplacian_step(v_prev: wp.vec3d, lv: wp.vec3d, coeff: wp.float64) -> wp.vec3d:
     # Explicit diffusion step v' = v + coeff * (L·v - v); coeff = +lambda (shrink) or -nu (inflate).
     # ``wp.lerp`` extrapolates for coeff outside [0, 1], which the inflating step relies on.
