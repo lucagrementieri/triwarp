@@ -309,18 +309,6 @@ def test_closest_point_on_mesh_unreferenced_vertex(device: str) -> None:
     assert np.array_equal(triangle_id_wp.numpy(), triangle_id_tm)
 
 
-def test_closest_point_on_mesh_empty_points(device: str) -> None:
-    vertices = wp.array(np.zeros((3, 3), dtype=np.float32), dtype=wp.vec3, device=device)
-    faces = wp.array([0, 1, 2], dtype=wp.int32, device=device)
-    points = wp.empty(0, dtype=wp.vec3, device=device)
-    closest_wp, distance_wp, triangle_id_wp = tw.proximity.closest_point_on_mesh(
-        vertices, faces, points
-    )
-    assert closest_wp.shape == (0,)
-    assert distance_wp.shape == (0,)
-    assert triangle_id_wp.shape == (0,)
-
-
 def test_closest_point_on_mesh_empty_faces(device: str) -> None:
     vertices = wp.zeros(1, dtype=wp.vec3, device=device)
     faces = wp.empty(0, dtype=wp.int32, device=device)
@@ -1455,14 +1443,6 @@ def test_signed_distance_contains_points_consistency(
     assert np.array_equal(contains_np[off_surface], signed_np[off_surface] < 0.0)
 
 
-def test_signed_distance_on_mesh_empty_points(device: str) -> None:
-    vertices = wp.array(np.zeros((3, 3), dtype=np.float32), dtype=wp.vec3, device=device)
-    faces = wp.array([0, 1, 2], dtype=wp.int32, device=device)
-    points = wp.empty(0, dtype=wp.vec3, device=device)
-    signed_wp = tw.proximity.signed_distance_on_mesh(vertices, faces, points)
-    assert signed_wp.shape == (0,)
-
-
 def test_signed_distance_on_mesh_empty_faces(device: str) -> None:
     vertices = wp.zeros(1, dtype=wp.vec3, device=device)
     faces = wp.empty(0, dtype=wp.int32, device=device)
@@ -1696,12 +1676,30 @@ def test_winding_number_cave_cube_origin(cave_cube: tuple[tm.Trimesh, wp.Mesh]) 
     assert np.allclose(winding_wp.numpy(), 0.0, atol=1e-3)
 
 
-def test_winding_number_empty_points(device: str) -> None:
+# (name, callable) pairs; each callable takes (vertices, faces, points) and returns the tuple of
+# arrays the wrapper produces -- closest_point_on_mesh returns three, the other two return one.
+_PROXIMITY_EMPTY_POINTS_CASES = [
+    ("closest_point_on_mesh", lambda v, f, p: tw.proximity.closest_point_on_mesh(v, f, p)),
+    (
+        "signed_distance_on_mesh",
+        lambda v, f, p: (tw.proximity.signed_distance_on_mesh(v, f, p),),
+    ),
+    ("winding_number", lambda v, f, p: (tw.proximity.winding_number(v, f, p),)),
+]
+
+
+@pytest.mark.parametrize(
+    "proximity_fn",
+    [case[1] for case in _PROXIMITY_EMPTY_POINTS_CASES],
+    ids=[case[0] for case in _PROXIMITY_EMPTY_POINTS_CASES],
+)
+def test_proximity_empty_points_is_a_noop(device: str, proximity_fn) -> None:
+    """Not a library comparison: zero query points give an all-empty result for every operator."""
     vertices = wp.array(np.zeros((3, 3), dtype=np.float32), dtype=wp.vec3, device=device)
     faces = wp.array([0, 1, 2], dtype=wp.int32, device=device)
     points = wp.empty(0, dtype=wp.vec3, device=device)
-    winding_wp = tw.proximity.winding_number(vertices, faces, points)
-    assert winding_wp.shape == (0,)
+    for result_wp in proximity_fn(vertices, faces, points):
+        assert result_wp.shape == (0,)
 
 
 def test_winding_number_empty_faces(device: str) -> None:
