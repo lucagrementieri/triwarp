@@ -616,10 +616,12 @@ def polyline_simplify(
     Notes
     -----
     The round loop runs **on device**, driven by ``wp.capture_while`` exactly as
-    [`polyline_triangulate`][triwarp.polyline.polyline_triangulate]'s ear rounds are, so the whole
-    simplification costs one graph launch and no readback at all. The accepted index set is
-    identical to a single-thread recursive evaluation of the same recursion, since breadth-first and
-    depth-first evaluation accept the same points.
+    [`polyline_triangulate`][triwarp.polyline.polyline_triangulate]'s ear rounds are, so however
+    many levels the split tree has, the loop itself costs one graph launch and no readback. The one
+    host synchronisation in the call is the compaction that follows it, where
+    [`flatnonzero`][triwarp.array.flatnonzero] reads back the kept count in order to size
+    ``indices``. The accepted index set is identical to a single-thread recursive evaluation of the
+    same recursion, since breadth-first and depth-first evaluation accept the same points.
 
     **The depth is bounded by the accepted count, not by ``n``, and that is why there is no round
     cap and no serial fallback here.** Every root-to-leaf path of the split tree accepts one point
@@ -823,10 +825,12 @@ def polyline_radius(
         The two defaults for the plane.
     [`median`][triwarp.reduce.median]
     """
+    if reduction not in ("min", "max", "mean", "median"):
+        # Before ``polyline_close``, which is device work (an ``allclose`` and possibly a
+        # concatenate): a rejected argument should not cost a launch first.
+        raise ValueError(f"unsupported reduction {reduction!r}")
     if closed:
         polyline = polyline_close(polyline)
-    if reduction not in ("min", "max", "mean", "median"):
-        raise ValueError(f"unsupported reduction {reduction!r}")
     device = polyline.device
     n_segments = int(polyline.shape[0]) - 1
     if n_segments < 1:
@@ -951,9 +955,10 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     [`polyline_centroid`][triwarp.polyline.polyline_centroid]) is built as one accumulation pass,
     one single-thread finalize and one projection, living in device memory and never crossing to
     the host -- rather than as three separate host-scope reductions each ending in its own
-    readback. Only two readbacks are left in the whole function, both structural:
+    readback. Three readbacks are left in the whole function, every one of them structural:
     ``polyline_open``'s [`is_closed`][triwarp.polyline.is_closed], which decides ``n`` and
-    therefore every launch dimension, and the reflex count that selects the convex fan fast path.
+    therefore every launch dimension; the reflex count that selects the convex fan fast path, which
+    is the last one a convex loop pays; and the face count above, which sizes the returned slice.
 
     When conditional graph nodes are unavailable (CPU, or a CUDA driver below 12.4)
     ``wp.capture_while`` executes the same loop directly with one pinned 4-byte readback per round,
