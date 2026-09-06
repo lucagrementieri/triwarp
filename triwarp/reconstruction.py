@@ -1361,7 +1361,14 @@ class _BpaState:
         old_count = min(int(read_scalar(self.counters, kernel_bpa.CNT_FACE)), self.max_faces)
 
         self._allocate_budget(2 * self.max_faces)
-        wp.copy(self.all_faces, old_faces, count=old_count * 3)
+        if old_count > 0:
+            # The guard is the API's, not the algorithm's: ``wp.copy`` reads ``count=0`` as "copy
+            # the entire source" for backwards compatibility, so a budget grown before the first
+            # triangle commits would copy the whole stale buffer instead of nothing. In bounds
+            # (the destination is twice the size) and unreachable today, since the initial budget
+            # is ``4 n + 16`` and a wave proposes at most one triangle per front edge -- but the
+            # count is derived from device state, which is exactly the shape that rule is about.
+            wp.copy(self.all_faces, old_faces, count=old_count * 3)
         wp.launch(
             kernel_bpa.rehash_edges,
             dim=old_capacity,
