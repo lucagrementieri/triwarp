@@ -14,6 +14,7 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
+from tests.comparisons import assert_nonconstant
 from tests.conversions import (
     faces_igl,
     meshlib_corner_normals_to_numpy,
@@ -71,7 +72,7 @@ def test_face_normals_and_areas_matches_pytorch3d(icosphere: tuple[tm.Trimesh, w
     normals_wp, areas_wp = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
 
     assert areas_p3d.shape == (mesh_tm.faces.shape[0],)
-    assert float(np.ptp(areas_p3d.cpu().numpy())) > 1e-5
+    assert_nonconstant(areas_p3d.cpu().numpy(), tol=1e-5)
     assert np.array_equal(areas_wp.numpy(), areas_p3d.cpu().numpy())
     assert np.array_equal(normals_wp.numpy(), normals_p3d.cpu().numpy())
 
@@ -358,7 +359,7 @@ def test_face_quality_against_the_verdict_measures(
     quality_pv = np.asarray(trimesh_to_pyvista(mesh_tm).cell_quality(measure).cell_data[measure])
     # Neither a null (-1.0) nor a constant: both would pass an allclose against a broken port.
     assert quality_pv.min() > 0.0
-    assert np.ptp(quality_pv) > 1e-3
+    assert_nonconstant(quality_pv, tol=1e-3)
 
     quality_wp = tw.triangles.face_quality(mesh_wp.points, mesh_wp.indices, metric=metric)
     expected_pv = 1.0 / quality_pv if reciprocal else quality_pv
@@ -420,7 +421,7 @@ def test_face_angles_extremes_against_pyvista(half_torus: tuple[tm.Trimesh, wp.M
         angles_np.max(axis=1), np.asarray(quality_pv.cell_data["max_angle"]), rtol=1e-5, atol=1e-4
     )
     # Non-vacuous: on a mesh of congruent equilateral faces both columns would read 60 everywhere.
-    assert np.ptp(np.asarray(quality_pv.cell_data["min_angle"])) > 1.0
+    assert_nonconstant(np.asarray(quality_pv.cell_data["min_angle"]), tol=1.0)
 
 
 @pytest.mark.parity("face_normals_and_areas", "meshlib")
@@ -502,7 +503,7 @@ def test_per_face_quantities_match_meshlib(half_torus: tuple[tm.Trimesh, wp.Mesh
 
     aspect_ml = np.array([mm.triangleAspectRatio(topology_ml, points_ml, f) for f in faces_ml])
     aspect_wp = tw.triangles.face_quality(mesh_wp.points, mesh_wp.indices, metric="aspect_ratio")
-    assert np.ptp(aspect_ml) > 0.1  # non-vacuity: a constant would pass any tolerance
+    assert_nonconstant(aspect_ml, tol=0.1)  # non-vacuity: a constant would pass any tolerance
     assert np.allclose(aspect_wp.numpy(), aspect_ml, rtol=1e-5, atol=1e-5)
 
     faces_np = np.asarray(mesh_tm.faces)
@@ -520,7 +521,8 @@ def test_per_face_quantities_match_meshlib(half_torus: tuple[tm.Trimesh, wp.Mesh
         ]
     )
     angles_wp = tw.triangles.face_angles(mesh_wp.points, mesh_wp.indices)
-    assert np.ptp(corner_ml) > 0.5  # non-vacuity: equilateral faces would read 60 degrees flat
+    # non-vacuity: equilateral faces would read 60 degrees flat
+    assert_nonconstant(corner_ml, tol=0.5)
     assert np.allclose(angles_wp.numpy(), corner_ml, rtol=1e-5, atol=1e-5)
 
     # The same table read the other way: MeshLib's per-vertex angle sum.

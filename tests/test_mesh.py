@@ -12,6 +12,7 @@ import warp as wp
 import triwarp as tw
 from tests.comparisons import (
     SET_VALUED_CACHE_KEYS,
+    assert_nonconstant,
     assert_same_loop_set,
     bsr_arrays,
     comparable_arrays,
@@ -152,7 +153,7 @@ def test_mass_properties_match_trimesh(request: pytest.FixtureRequest, mesh_name
     assert np.allclose(mesh.center_mass, mesh_tm.center_mass, rtol=1e-4, atol=1e-4)
     inertia_wp = np.array(mesh.moment_inertia, dtype=np.float64).reshape(3, 3)
     assert np.allclose(inertia_wp, mesh_tm.moment_inertia, rtol=1e-4, atol=1e-4)
-    assert np.ptp(inertia_wp) > 1e-3
+    assert_nonconstant(inertia_wp, tol=1e-3)
 
 
 def test_mass_properties_share_by_product(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

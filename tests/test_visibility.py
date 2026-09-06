@@ -12,6 +12,7 @@ from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from tests.comparisons import assert_nonconstant
 from tests.conversions import (
     meshlib_scalars_to_numpy,
     numpy_to_warp,
@@ -544,7 +545,7 @@ def test_shape_diameter_collapses_onto_meshlibs_single_ray(device: str) -> None:
     )
     finite = thickness_ml < 1e30
     assert finite.all()  # non-vacuity: every vertex found an opposite surface
-    assert np.ptp(thickness_ml) > 1.0  # ... and the answer is not a constant
+    assert_nonconstant(thickness_ml, tol=1.0)  # ... and the answer is not a constant
 
     narrow_np = tw.visibility.shape_diameter(
         mesh_wp, vertices_wp, normals=normals_wp, n_rays=64, cone_angle=0.05
@@ -678,7 +679,8 @@ def test_thickness_at_vertices_matches_meshlib(device: str) -> None:
     )
     assert thickness_ml.shape == (n_vertices,)
     assert (thickness_ml < 1e30).all()  # every vertex found an opposite surface
-    assert np.ptp(thickness_ml) > 1.0  # non-vacuity: on a sphere every ray would read 2 * radius
+    # non-vacuity: on a sphere every ray would read 2 * radius
+    assert_nonconstant(thickness_ml, tol=1.0)
 
     angle_normals_wp = tw.vertices.vertex_normals(vertices_wp, faces_wp, weighting="angle")
     thickness_wp = tw.visibility.thickness(
@@ -848,7 +850,7 @@ def test_max_tangent_sphere_matches_meshlib(device: str) -> None:
         mm.computeInSphereThicknessAtVertices(trimesh_to_meshlib(mesh_tm), settings_ml)
     )
     assert (diameter_ml < settings_ml.maxRadius * 2.0).all()  # nothing hit the cap
-    assert np.ptp(diameter_ml) > 0.5  # non-vacuity: a sphere would read one constant
+    assert_nonconstant(diameter_ml, tol=0.5)  # non-vacuity: a sphere would read one constant
 
     offset = 0.005 * float(extent_np.min())  # 0.5% of the smallest side; see the docstring sweep
     inside_np = np.ascontiguousarray(

@@ -22,6 +22,7 @@ from scipy.spatial import KDTree
 from scipy.spatial.distance import directed_hausdorff
 
 import triwarp as tw
+from tests.comparisons import assert_nonconstant
 from tests.conversions import (
     numpy_to_warp,
     points_to_open3d,
@@ -282,7 +283,7 @@ def test_chamfer_points_to_mesh_forward_matches_meshlib(
     # Non-vacuity: an all-zero pair of answers would satisfy the comparison below.
     assert forward_ml.shape == forward_wp.shape
     assert forward_ml.min() > 0.0
-    assert np.ptp(forward_ml) > 1e-3
+    assert_nonconstant(forward_ml, tol=1e-3)
     assert np.allclose(forward_wp, forward_ml, rtol=_MESH_RTOL, atol=_MESH_ATOL)
 
 

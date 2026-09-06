@@ -64,6 +64,19 @@ def assert_unordered_rows_equal(rows_a: np.ndarray, rows_b: np.ndarray) -> None:
     assert np.array_equal(sorted_a, sorted_b)
 
 
+def assert_nonconstant(values: np.ndarray, tol: float) -> None:
+    """
+    Assert a numeric field actually varies, guarding a comparison against passing vacuously.
+
+    The same shape of bug as an empty answer (section 7.4): a reference or a triwarp field that
+    happens to be constant on its fixture makes a permuted result, an off-by-one gather, or a
+    query/vertex index swap all pass. ``tol`` is the field's own spread threshold and has no
+    universal default -- callers pass what CLAUDE.md's own comment at the original site measured.
+    """
+    spread = float(np.ptp(values))
+    assert spread > tol, f"expected non-constant values, got ptp={spread:.3e} (tol={tol:.3e})"
+
+
 def undirected_edges(faces_np: np.ndarray) -> np.ndarray:
     """
     Build the ``(n_faces * 3, 2)`` undirected edge list of a face array, each row min-first.

@@ -39,7 +39,7 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
-from tests.comparisons import lexsort_rows
+from tests.comparisons import assert_nonconstant, lexsort_rows
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     numpy_to_meshlib,
@@ -687,7 +687,7 @@ def test_sample_grid_trilinear_matches_pytorch3d(device: str):
     )
 
     assert sampled_p3d.shape == (queries_np.shape[0],)
-    assert float(np.ptp(sampled_p3d.cpu().numpy())) > 1.0
+    assert_nonconstant(sampled_p3d.cpu().numpy(), tol=1.0)
     assert np.allclose(sampled_wp.numpy(), sampled_p3d.cpu().numpy(), rtol=1e-5, atol=1e-6)
 
     # The exact round trip: on-lattice points, so each stencil is its own corner.

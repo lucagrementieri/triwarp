@@ -7,7 +7,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import fraction_within
+from tests.comparisons import assert_nonconstant, fraction_within
 from tests.conversions import points_to_warp, trimesh_to_pymeshlab
 
 
@@ -229,7 +229,8 @@ def test_discrete_mean_curvature(
         points_wp, vertices_wp, faces_wp, radius
     )
     # Non-vacuous on the curved fixture: a constant reference would pass any per-vertex bug.
-    assert mesh_name == "icosahedron" or np.ptp(mean_curvature_tm) > 1e-3
+    if mesh_name != "icosahedron":
+        assert_nonconstant(mean_curvature_tm, tol=1e-3)
     assert np.allclose(mean_curvature_wp.numpy(), mean_curvature_tm, rtol=1e-5, atol=1e-5)
 
 

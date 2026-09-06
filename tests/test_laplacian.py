@@ -13,6 +13,7 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from tests.comparisons import assert_nonconstant
 from tests.conftest import MESHES
 from tests.conversions import (
     bsr_to_csr,
@@ -194,7 +195,7 @@ def test_face_gradients_matches_meshlib(request: pytest.FixtureRequest, mesh_nam
         ]
     )
     # Non-vacuity: a constant field would make every row zero and pass any tolerance.
-    assert np.ptp(np.linalg.norm(gradients_ml, axis=1)) > 1.0
+    assert_nonconstant(np.linalg.norm(gradients_ml, axis=1), tol=1.0)
     assert np.allclose(gradients_wp.numpy(), gradients_ml, rtol=1e-5, atol=1e-5)
 
 
@@ -316,7 +317,7 @@ def test_cotmatrix_entries_matches_meshlib(request: pytest.FixtureRequest, mesh_
     # near zero -- a right-angled corner has cotangent 0 -- so only the maximum is bounded away.
     assert np.abs(entries_wp).max() > 0.1
     if mesh_name != "icosahedron":
-        assert np.ptp(entries_wp) > 0.1
+        assert_nonconstant(entries_wp, tol=0.1)
     assert np.allclose(2.0 * entries_wp, cot_ml, rtol=1e-5, atol=1e-5)
 
 

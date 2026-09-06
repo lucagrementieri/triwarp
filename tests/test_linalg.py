@@ -13,6 +13,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
+from tests.comparisons import assert_nonconstant
 from tests.conversions import bsr_to_dense, trimesh_to_pymeshlab
 
 
@@ -160,9 +161,8 @@ def test_min_quad_with_fixed_matches_pymeshlab_harmonic_field(
             True,
         )
     ).ravel()
-    assert (
-        np.ptp(field_igl) > 0.5
-    )  # non-vacuity: the reference produced a real field, not a constant
+    # non-vacuity: the reference produced a real field, not a constant
+    assert_nonconstant(field_igl, tol=0.5)
     assert np.allclose(field_wp, field_igl, rtol=1e-5, atol=1e-5)
 
 
