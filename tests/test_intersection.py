@@ -1064,10 +1064,7 @@ _SLICE_MESH_WITH_PLANE_CASES = [
 )
 @pytest.mark.parity("slice_mesh_with_plane", "trimesh")
 def test_slice_mesh_with_plane_matches_trimesh(
-    request: pytest.FixtureRequest,
-    mesh_name: str,
-    plane_scenario,
-    expected_face_count: int | None,
+    request: pytest.FixtureRequest, mesh_name: str, plane_scenario, expected_face_count: int | None
 ) -> None:
     """
     Class B: cross-sections against ``slice_faces_plane``, compared as canonical winding rows.
@@ -1569,9 +1566,7 @@ _INTERSECTION_EMPTY_MESH_CASES = [
     (
         "mesh_with_plane",
         lambda v, f: (
-            tw.intersection.mesh_with_plane(
-                v, f, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
-            ),
+            tw.intersection.mesh_with_plane(v, f, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)),
         ),
         ((0, 2),),
     ),

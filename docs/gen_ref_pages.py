@@ -150,6 +150,6 @@ with mkdocs_gen_files.open("SUMMARY.md", "w") as nav_file:
     for entry in GUIDE_PAGES:
         title, path, *rest = entry
         nav_file.write(f"* [{title}]({path})\n")
-        for child_title, child_path in (rest[0] if rest else []):
+        for child_title, child_path in rest[0] if rest else []:
             nav_file.write(f"    * [{child_title}]({child_path})\n")
     nav_file.writelines(nav.build_literate_nav())

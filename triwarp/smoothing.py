@@ -227,10 +227,7 @@ def _build_implicit_system(
 
 
 def _apply_volume_constraint(
-    positions: wp.array[wp.vec3d],
-    faces: wp.array[wp.int32],
-    vol_ini: float,
-    center: wp.vec3d,
+    positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], vol_ini: float, center: wp.vec3d
 ) -> None:
     """
     Rescale about ``center`` so the signed volume returns to ``vol_ini``.

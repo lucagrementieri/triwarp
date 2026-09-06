@@ -1695,10 +1695,7 @@ def test_winding_number_cave_cube_origin(cave_cube: tuple[tm.Trimesh, wp.Mesh]) 
 # arrays the wrapper produces -- closest_point_on_mesh returns three, the other two return one.
 _PROXIMITY_EMPTY_POINTS_CASES = [
     ("closest_point_on_mesh", lambda v, f, p: tw.proximity.closest_point_on_mesh(v, f, p)),
-    (
-        "signed_distance_on_mesh",
-        lambda v, f, p: (tw.proximity.signed_distance_on_mesh(v, f, p),),
-    ),
+    ("signed_distance_on_mesh", lambda v, f, p: (tw.proximity.signed_distance_on_mesh(v, f, p),)),
     ("winding_number", lambda v, f, p: (tw.proximity.winding_number(v, f, p),)),
 ]
 
