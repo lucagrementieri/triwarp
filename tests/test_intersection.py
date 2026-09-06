@@ -172,28 +172,66 @@ def test_segments_with_plane_parallel(device: str) -> None:
     assert np.array_equal(valid_wp.numpy(), valid_tm)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def _axis_planes(mesh_tm: tm.Trimesh) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Three axis-aligned planes through the centroid; none can miss the mesh."""
+    mid_np = 0.5 * (mesh_tm.bounds[0] + mesh_tm.bounds[1])
+    return [
+        (np.array([0.0, 0.0, 1.0]), mid_np),
+        (np.array([1.0, 0.0, 0.0]), mid_np),
+        (np.array([0.0, 1.0, 0.0]), mid_np),
+    ]
+
+
+def _tilted_plane(mesh_tm: tm.Trimesh) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Build a plane aligned with no axis and no face.
+
+    An axis-aligned plane can pass through vertices and edges of a symmetric fixture, which
+    exercises the degenerate branches rather than the general one; an 11-degree tilt makes
+    every crossing a clean edge interior.
+    """
+    axis_np = tm.unitize(np.array([1.0, 2.0, 0.3], dtype=np.float32))
+    angle = np.radians(11)
+    base = tm.transformations.rotation_matrix(angle=angle, direction=axis_np)
+    plane_normal_np = tm.transform_points([[0.0, 0.0, 1.0]], base, translate=False)[0]
+    plane_origin_np = tm.transform_points([mesh_tm.centroid], base)[0]
+    return [(plane_normal_np, plane_origin_np)]
+
+
+def _miss_plane(mesh_tm: tm.Trimesh) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build a plane translated well past the mesh's bounds, so it misses the mesh entirely."""
+    return [(np.array([0.0, 0.0, 1.0]), mesh_tm.bounds[1] + np.array([0.0, 0.0, 10.0]))]
+
+
+_MESH_WITH_PLANE_CASES = [
+    *[
+        pytest.param(mesh_name, _axis_planes, id=f"axis_planes-{mesh_name}")
+        for mesh_name in ("icosahedron", "half_torus", "hemisphere")
+    ],
+    *[
+        pytest.param(mesh_name, _tilted_plane, id=f"tilted_plane-{mesh_name}")
+        for mesh_name in ("icosahedron", "hemisphere")
+    ],
+    pytest.param("icosahedron", _miss_plane, id="miss_plane"),
+]
+
+
+@pytest.mark.parametrize(("mesh_name", "plane_scenario"), _MESH_WITH_PLANE_CASES)
 @pytest.mark.parity("mesh_with_plane", "trimesh")
-def test_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: str) -> None:
+def test_mesh_with_plane_matches_trimesh(
+    request: pytest.FixtureRequest, mesh_name: str, plane_scenario
+) -> None:
     """
     Class B (segment canonicalization): the cross-section as an unordered set of segments.
 
     Neither library defines the segment order or which end of a segment comes first, so both
     sides go through ``_segments_equal``, which sorts endpoints within a segment and then
-    segments within the set. Three axis planes through the centroid, so no plane misses the
-    mesh.
+    segments within the set. ``miss_plane``'s expected answer is the empty set on both sides --
+    ``_segments_equal`` already handles that, and this is verified directly against trimesh
+    rather than only checking triwarp's own output shape, which is what the unmerged test did.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-
-    bounds = mesh_tm.bounds
-    mid = 0.5 * (bounds[0] + bounds[1])
-    planes = [
-        (np.array([0.0, 0.0, 1.0]), mid),
-        (np.array([1.0, 0.0, 0.0]), mid),
-        (np.array([0.0, 1.0, 0.0]), mid),
-    ]
-
-    for plane_normal, plane_origin in planes:
+    for plane_normal, plane_origin in plane_scenario(mesh_tm):
         lines_tm = tm_intersections.mesh_plane(
             mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin
         )
@@ -204,35 +242,6 @@ def test_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: 
             wp.vec3(*plane_origin.tolist()),
         )
         assert _segments_equal(lines_wp.numpy(), lines_tm)
-
-
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
-def test_mesh_with_plane_tilted_plane(request: pytest.FixtureRequest, mesh_name: str) -> None:
-    """
-    Class B: the same comparison on a plane aligned with no axis and no face.
-
-    An axis-aligned plane can pass through vertices and edges of a symmetric fixture, which
-    exercises the degenerate branches rather than the general one; an 11-degree tilt makes
-    every crossing a clean edge interior.
-    """
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-
-    axis = tm.unitize(np.array([1.0, 2.0, 0.3], dtype=np.float32))
-    angle = np.radians(11)
-    base = tm.transformations.rotation_matrix(angle=angle, direction=axis)
-    plane_normal = tm.transform_points([[0.0, 0.0, 1.0]], base, translate=False)[0]
-    plane_origin = tm.transform_points([mesh_tm.centroid], base)[0]
-
-    lines_tm = tm_intersections.mesh_plane(
-        mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin
-    )
-    lines_wp = tw.intersection.mesh_with_plane(
-        mesh_wp.points,
-        mesh_wp.indices,
-        wp.vec3(*plane_normal.tolist()),
-        wp.vec3(*plane_origin.tolist()),
-    )
-    assert _segments_equal(lines_wp.numpy(), lines_tm)
 
 
 def test_mesh_with_plane_return_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
@@ -260,20 +269,6 @@ def test_mesh_with_plane_return_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -
 
     assert _segments_equal(lines_wp.numpy(), lines_tm)
     assert np.array_equal(np.sort(faces_wp.numpy()), np.sort(faces_tm))
-
-
-def test_mesh_with_plane_miss_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    mesh_tm, mesh_wp = icosahedron
-    plane_normal = np.array([0.0, 0.0, 1.0])
-    plane_origin = mesh_tm.bounds[1] + np.array([0.0, 0.0, 10.0])
-
-    lines_wp = tw.intersection.mesh_with_plane(
-        mesh_wp.points,
-        mesh_wp.indices,
-        wp.vec3(*plane_normal.tolist()),
-        wp.vec3(*plane_origin.tolist()),
-    )
-    assert lines_wp.shape == (0, 2)
 
 
 @pytest.mark.parity("mesh_with_plane", "meshlib")
@@ -1020,10 +1015,15 @@ def _sliced_meshes_equivalent(
     rtol: float = 1e-5,
     atol: float = 1e-5,
 ) -> bool:
+    if len(faces_a_np) != len(faces_b_np):
+        return False
+    if len(faces_a_np) == 0:
+        # A plane that touches without cutting (test_slice_mesh_with_plane_on_plane) leaves both
+        # sides with no faces and nothing left to compare -- trimesh's own .bounds is None for a
+        # zero-face mesh, so the checks below cannot run on this case at all.
+        return len(vertices_a_np) == 0 and len(vertices_b_np) == 0
     mesh_a_tm = tm.Trimesh(vertices_a_np, faces_a_np, process=False)
     mesh_b_tm = tm.Trimesh(vertices_b_np, faces_b_np, process=False)
-    if len(mesh_a_tm.faces) != len(mesh_b_tm.faces):
-        return False
     if not np.allclose(mesh_a_tm.bounds, mesh_b_tm.bounds, rtol=rtol, atol=atol):
         return False
     if not np.isclose(mesh_a_tm.area, mesh_b_tm.area, rtol=1e-4, atol=1e-4):
@@ -1032,84 +1032,59 @@ def _sliced_meshes_equivalent(
     return bool(np.min(dots_b_np) >= -max(TOLERANCE_MERGE, 1e-5))
 
 
+def _box_corner_plane(mesh_tm: tm.Trimesh) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build a corner cut crossing three faces at once, so the retriangulation has a real choice."""
+    return [(mesh_tm.bounds[1], mesh_tm.bounds[1] - 0.05)]
+
+
+def _box_top_plane(mesh_tm: tm.Trimesh) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build a face-parallel cut: whole faces fall on one side rather than being split."""
+    return [(np.array([0.0, 0.0, 1.0]), mesh_tm.bounds[1] - 0.05)]
+
+
+def _on_plane(mesh_tm: tm.Trimesh) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build a plane exactly at the bounding box's top: touches the mesh without cutting it."""
+    return [(np.array([0.0, 0.0, 1.0]), mesh_tm.bounds[1])]
+
+
+_SLICE_MESH_WITH_PLANE_CASES = [
+    pytest.param("unit_box", _box_corner_plane, 5, id="box_corner"),
+    pytest.param("unit_box", _box_top_plane, 14, id="box_top"),
+    *[
+        pytest.param(mesh_name, _axis_planes, None, id=f"axis_planes-{mesh_name}")
+        for mesh_name in ("icosahedron", "hemisphere")
+    ],
+    pytest.param("icosahedron", _tilted_plane, None, id="tilted_plane"),
+    pytest.param("icosahedron", _on_plane, None, id="on_plane"),
+]
+
+
+@pytest.mark.parametrize(
+    ("mesh_name", "plane_scenario", "expected_face_count"), _SLICE_MESH_WITH_PLANE_CASES
+)
 @pytest.mark.parity("slice_mesh_with_plane", "trimesh")
-def test_slice_mesh_with_plane_box_corner(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
+def test_slice_mesh_with_plane_matches_trimesh(
+    request: pytest.FixtureRequest,
+    mesh_name: str,
+    plane_scenario,
+    expected_face_count: int | None,
+) -> None:
     """
-    Class B: a corner cut against ``slice_faces_plane``, compared as canonical winding rows.
+    Class B: cross-sections against ``slice_faces_plane``, compared as canonical winding rows.
 
-    The cut crosses three faces at once, which is the case where the retriangulation has a real
-    choice to make; a plane cutting one face at a time would not exercise it.
-    """
-    mesh_tm, mesh_wp = unit_box
-    plane_origin_np = mesh_tm.bounds[1] - 0.05
-    plane_normal_np = mesh_tm.bounds[1]
-
-    vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
-        mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
-    )
-    vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
-        mesh_wp.points,
-        mesh_wp.indices,
-        wp.vec3(*plane_normal_np.tolist()),
-        wp.vec3(*plane_origin_np.tolist()),
-    )
-    vertices_wp_np = vertices_wp.numpy()
-    faces_wp_np = faces_wp.numpy().reshape(-1, 3)
-
-    assert _sliced_meshes_equivalent(
-        vertices_tm, faces_tm, vertices_wp_np, faces_wp_np, plane_normal_np, plane_origin_np
-    )
-    assert len(faces_tm) == 5
-
-
-def test_slice_mesh_with_plane_box_top(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """
-    Class B: a face-parallel cut, where whole faces fall on one side rather than being split.
-
-    The complement of the corner case above: here the interesting behaviour is *keeping* faces
-    untouched, and a wrong side test would show up as a missing or duplicated face rather than
-    a bad triangulation.
-    """
-    mesh_tm, mesh_wp = unit_box
-    plane_origin_np = mesh_tm.bounds[1] - 0.05
-    plane_normal_np = np.array([0.0, 0.0, 1.0])
-
-    vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
-        mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
-    )
-    vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
-        mesh_wp.points,
-        mesh_wp.indices,
-        wp.vec3(*plane_normal_np.tolist()),
-        wp.vec3(*plane_origin_np.tolist()),
-    )
-    vertices_wp_np = vertices_wp.numpy()
-    faces_wp_np = faces_wp.numpy().reshape(-1, 3)
-
-    assert _sliced_meshes_equivalent(
-        vertices_tm, faces_tm, vertices_wp_np, faces_wp_np, plane_normal_np, plane_origin_np
-    )
-    assert len(faces_tm) == 14
-
-
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
-def test_slice_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: str) -> None:
-    """
-    Class B: three axis planes through the centroid on the curved and open fixtures.
-
-    The box tests above pin the retriangulation on flat faces with clean corners; these run the
-    same comparison where the cut meets many small faces and, on ``hemisphere``, an existing
-    boundary.
+    ``box_corner`` and ``box_top`` share the ``unit_box`` fixture and pin the retriangulation on
+    flat faces with clean corners -- one crossing three faces at once, the case where the
+    retriangulation has a real choice, the other face-parallel, where whole faces should stay
+    untouched rather than being split; each carries its own expected face count, which no other
+    scenario needs. ``axis_planes``/``tilted_plane`` run the same comparison on curved and open
+    fixtures, where the cut meets many small faces and, on ``hemisphere``, an existing boundary.
+    ``on_plane`` is the boundary between *cut* and *miss*, where a strict-versus-inclusive side
+    test changes the answer -- trimesh's convention is the reference, and both sides end up
+    empty, which ``_sliced_meshes_equivalent`` now handles directly rather than needing its own
+    separate assertion.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    mid_np = 0.5 * (mesh_tm.bounds[0] + mesh_tm.bounds[1])
-    planes = [
-        (np.array([0.0, 0.0, 1.0]), mid_np),
-        (np.array([1.0, 0.0, 0.0]), mid_np),
-        (np.array([0.0, 1.0, 0.0]), mid_np),
-    ]
-
-    for plane_normal_np, plane_origin_np in planes:
+    for plane_normal_np, plane_origin_np in plane_scenario(mesh_tm):
         vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
             mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
         )
@@ -1124,65 +1099,8 @@ def test_slice_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_
         assert _sliced_meshes_equivalent(
             vertices_tm, faces_tm, vertices_wp_np, faces_wp_np, plane_normal_np, plane_origin_np
         )
-
-
-def test_slice_mesh_with_plane_tilted_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """
-    Class B: the tilted-plane cut, avoiding the vertex-and-edge coincidences an axis plane hits.
-
-    Same reasoning as [`test_mesh_with_plane_tilted_plane`]: the tilt is what makes this the
-    general case rather than the degenerate one.
-    """
-    mesh_tm, mesh_wp = icosahedron
-    axis_np = tm.unitize(np.array([1.0, 2.0, 0.3], dtype=np.float32))
-    angle = np.radians(11)
-    base = tm.transformations.rotation_matrix(angle=angle, direction=axis_np)
-    plane_normal_np = tm.transform_points([[0.0, 0.0, 1.0]], base, translate=False)[0]
-    plane_origin_np = tm.transform_points([mesh_tm.centroid], base)[0]
-
-    vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
-        mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
-    )
-    vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
-        mesh_wp.points,
-        mesh_wp.indices,
-        wp.vec3(*plane_normal_np.tolist()),
-        wp.vec3(*plane_origin_np.tolist()),
-    )
-    vertices_wp_np = vertices_wp.numpy()
-    faces_wp_np = faces_wp.numpy().reshape(-1, 3)
-    assert _sliced_meshes_equivalent(
-        vertices_tm, faces_tm, vertices_wp_np, faces_wp_np, plane_normal_np, plane_origin_np
-    )
-
-
-def test_slice_mesh_with_plane_on_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """
-    Class B: a plane exactly at the bounding box's top, so it touches the mesh without cutting it.
-
-    The boundary case between *cut* and *miss*, and the one where a strict-versus-inclusive
-    side test changes the answer. trimesh's convention is the reference, so this pins triwarp
-    to it rather than asserting a self-chosen one.
-    """
-    mesh_tm, mesh_wp = icosahedron
-    plane_origin_np = mesh_tm.bounds[1]
-    plane_normal_np = np.array([0.0, 0.0, 1.0])
-
-    vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
-        mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
-    )
-    vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
-        mesh_wp.points,
-        mesh_wp.indices,
-        wp.vec3(*plane_normal_np.tolist()),
-        wp.vec3(*plane_origin_np.tolist()),
-    )
-    vertices_wp_np = vertices_wp.numpy()
-    faces_wp_np = faces_wp.numpy().reshape(-1, 3)
-    assert len(vertices_tm) == 0
-    assert len(faces_tm) == 0
-    assert vertices_wp_np.shape[0] == 0
-    assert faces_wp_np.shape[0] == 0
+        if expected_face_count is not None:
+            assert len(faces_tm) == expected_face_count
 
 
 # ---------------------------------------------------------------------------
