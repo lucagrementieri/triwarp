@@ -912,11 +912,43 @@ def _declare_map_kernels() -> None:
     derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
     here (the shared builtins are declared there).
     """
+    # Every op here forks on the **length-1** axis alone, and it is the whole table's shape: the
+    # three of them are mapped over the shifted pair ``polyline[:-1]`` / ``polyline[1:]``, so a
+    # two-point polyline hands them one-element views where every longer one hands them dense
+    # arrays. That is section 3's "the fork axis is not only the dtype", and a two-point polyline
+    # is an ordinary input rather than a corner: ``polyline_centroid`` and ``polyline_radius``
+    # accept one, their guard being ``n_segments < 1``.
+    #
+    # ``segment_midpoint_and_length`` and ``radius_segment_distances`` were missing from this list
+    # and the cost is what section 15 predicts. Measured on the CPU device by walking an 8-point
+    # polyline and then a 2-point one through ``polyline_centroid`` / ``polyline_radius`` /
+    # ``polyline_length`` with Warp's debug log on: ``Module hash changed, recompiling`` for
+    # ``map_segment_midpoint_and_length`` (**1 620 ms**) and ``map_radius_segment_distances``
+    # (**196 ms**), while ``map_segment_length`` -- the one that was declared -- held. Three ops on
+    # one call path, the declared one steady and the two undeclared ones rebuilding, is the
+    # controlled version of that finding.
     dense, single = map_probe, map_probe_single
+    center, normal = wp.vec3(), wp.vec3()
     declare_map_signatures(
         [
             (segment_length, (dense(wp.vec3), dense(wp.vec3)), wp.float32),
             (segment_length, (single(wp.vec3), single(wp.vec3)), wp.float32),
+            (segment_midpoint_and_length, (dense(wp.vec3), dense(wp.vec3)), (wp.vec3, wp.float32)),
+            (
+                segment_midpoint_and_length,
+                (single(wp.vec3), single(wp.vec3)),
+                (wp.vec3, wp.float32),
+            ),
+            (
+                radius_segment_distances,
+                (dense(wp.vec3), dense(wp.vec3), center, normal),
+                wp.float32,
+            ),
+            (
+                radius_segment_distances,
+                (single(wp.vec3), single(wp.vec3), center, normal),
+                wp.float32,
+            ),
         ]
     )
 
