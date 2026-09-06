@@ -97,8 +97,7 @@ CNT_CONTINUE = wp.constant(7)  # the wave loop's condition
 CNT_DONE = wp.constant(8)  # the loop finished for good (as opposed to pausing to grow)
 CNT_WAVE = wp.constant(9)  # waves executed
 CNT_GROW = wp.constant(10)  # the triangle budget is exhausted; hand back to the host
-CNT_OVERFLOW = wp.constant(11)  # a fixed-capacity scatter ran out of room this wave
-BPA_COUNTERS = 12
+BPA_COUNTERS = 11
 
 # Lanes per front edge in the cooperative pivot search. One warp: the block-cooperative BVH walk
 # hands one candidate per lane per step, and 32 covers the ~88 candidates an edge enumerates in
@@ -281,16 +280,16 @@ def push_front_edge(
     # that table with ``collect_front_from_table``. So a dropped entry is restored by the same host
     # round-trip that doubles the budget, and raising ``CNT_GROW`` is what asks for it.
     #
-    # This is hardening, **not** a fix for the intermittent ``CUDA error 700`` that
-    # ``ball_pivoting`` still shows on a multi-cloud run: instrumenting ``CNT_OVERFLOW`` measured it
-    # at **0**, with the front peaking near 0.1 % of capacity, so these scatters were cleared as the
-    # cause. That fault's cause is still unidentified -- it needs the CUDA memory pool, and is
-    # invisible to both ``compute-sanitizer`` and Warp's debug mode.
+    # This is hardening, **not** a fix for the intermittent ``CUDA error 700`` ``ball_pivoting``
+    # used to show on a multi-cloud run: instrumenting an overflow counter here measured it at
+    # **0**, with the front peaking near 0.1 % of capacity, so these scatters were cleared as the
+    # cause. (That fault was since root-caused elsewhere -- the host-side front-buffer swap parity
+    # in ``_bpa_run``.) The counter itself is gone: nothing ever read it and nothing cleared it,
+    # and ``CNT_GROW`` beside it is the signal the host acts on.
     position = wp.atomic_add(counters, CNT_NEXT_FRONT, 1)
     if position < capacity:
         out_front[position] = slot
         return
-    counters[CNT_OVERFLOW] = 1
     counters[CNT_GROW] = 1
 
 
@@ -320,8 +319,8 @@ def propose_triangle(
     slot = wp.atomic_add(counters, CNT_PROPOSAL, 1)
     if slot >= capacity:
         # Dropping a proposal is safe and self-healing: the front edge that raised it stays live and
-        # is searched again next wave. Only the *write* would be unsafe.
-        counters[CNT_OVERFLOW] = 1
+        # is searched again next wave. Only the *write* would be unsafe -- and unlike a front-list
+        # overflow this needs no host round-trip, so it raises no flag.
         return
     out_a[slot] = a
     out_b[slot] = b
@@ -350,8 +349,10 @@ def seed_triangles(
         return
 
     # Gather the local orphan neighbourhood into scratch so it can be scanned as a double loop.
-    # Only the lowest-index orphan in each neighbourhood seeds, so seed fronts start well separated
-    # and do not collide into overlapping sheets before they can glue.
+    # A point yields to any lower-index orphan it *sees*, so seed fronts start well separated and do
+    # not collide into overlapping sheets before they can glue. It sees the whole neighbourhood only
+    # while that fits in ``MAX_SEED_NEIGHBORS`` -- see the ``break`` below, which is where the rule
+    # stops being exact and why that is the wanted behaviour.
     #
     # ``wp.zeros``, not the ``wp.types.vector(length=K)`` register row that ``neighbors.py``'s k-NN
     # kernels hold their candidates in: measured, both spellings of this kernel end to end on bunny
@@ -363,6 +364,28 @@ def seed_triangles(
     # And ``wp.fixedarray`` is not a third option: its own docstring says it is "only used during
     # codegen, and for type hints" -- it *is* the codegen type of a kernel-scope ``wp.zeros``, not a
     # separate storage class. So the choice here is registers or the stack, and both are measured.
+    #
+    # **The ``break`` bounds the walk and not just the candidate list, so the "lowest-index orphan
+    # seeds" rule above is enforced only while the neighbourhood fits in ``MAX_SEED_NEIGHBORS``.
+    # That is deliberate, it was measured, and tightening it is a regression.** Past 64 stored
+    # neighbours the scan stops before it can see a lower-indexed orphan, so adjacent points both
+    # seed -- and the neighbourhoods a real run has are past it routinely: at
+    # ``radius = 2 * mean_edge``, 65.6 % of the 2 048-point torus's points have 64 or more unused
+    # neighbours within ``2 * radius`` on the first seeding wave, and 100 % do at ``3 *``.
+    #
+    # The exact form (bound the store with ``if count < MAX_SEED_NEIGHBORS`` and let the walk run
+    # to completion) was built and measured on that torus, wave-0 seed proposals, baseline against
+    # it: **5 -> 1** at ``1.5 *``, **5 -> 1** at ``2.0 *``, and **13 -> 0** at ``3.0 *`` -- where
+    # zero seeds means ``end_wave`` sees a seeding wave that committed nothing, raises ``CNT_DONE``
+    # and the whole run returns an empty mesh (3 004 faces before, 0 after).
+    #
+    # The reason is a design gap the truncation happens to paper over: the rule elects **one**
+    # seeder per neighbourhood, and a neighbourhood whose lowest-indexed orphan cannot form a valid
+    # seed triangle is then dead for good -- the next seeding wave sees identical state, fails
+    # identically, and ends the run. Truncating the walk lets several points try, which is why it
+    # is load-bearing. Fixing this properly means letting a *failed* seeder stop suppressing its
+    # neighbourhood (a second wave phase, or dropping the pre-filter and leaning on the vertex
+    # claim, which already serialises colliding seeds), not tightening the guard.
     nbr = wp.zeros(shape=MAX_SEED_NEIGHBORS, dtype=wp.int32)
     count = wp.int32(0)
     query = wp.hash_grid_query(grid_id, points[p], 2.0 * radius)
@@ -675,7 +698,11 @@ def pivot_front_edges(
 
         edges.cand[slot] = block_best
         if block_best < 0:
-            edges.state[slot] = EDGE_RETIRED  # provably impossible; see the module docstring
+            # The search found nothing, so this edge is Open3D's ``Border``: retiring it is
+            # output-preserving because the candidate set only ever shrinks (module docstring),
+            # not an approximation. An edge that merely *lost* its vertex claim keeps its cached
+            # candidate and comes back next wave, which is the branch above.
+            edges.state[slot] = EDGE_RETIRED
         elif lane == 0:
             propose_triangle(
                 src, tgt, block_best, front_capacity, counters, out_owner, out_a, out_b, out_c
@@ -708,9 +735,22 @@ def proposal_key(a: wp.int32, b: wp.int32, salt: wp.int32) -> wp.uint64:
     # * a pivot wave proposes at most once per live front edge, and a front edge *is* one slot of
     #   a table keyed by the undirected pair, so no two share ``{src, tgt}``;
     # * a seed wave proposes at most once per seeding point ``p``, and ``seed_triangles`` seeds
-    #   only a point that is the lowest-indexed unused point of its own neighbourhood, so ``p`` is
-    #   the smaller of its pair and distinct seeds give distinct pairs;
+    #   only a point that is the lowest-indexed unused point of the neighbourhood it *scanned*, so
+    #   ``p`` is the smaller of its pair and distinct seeds give distinct pairs;
     # * the two never share a wave -- ``pivot_front_edges`` proposes nothing while ``CNT_SEEDING``.
+    #
+    # The second bullet is exact only while a neighbourhood fits in ``MAX_SEED_NEIGHBORS``; past
+    # that the scan is truncated deliberately (the measurement is at ``seed_triangles``), and two
+    # points ``p1``, ``p2`` can each seed with the other as partner, giving one key twice. **That
+    # degrades rather than corrupting**, which is why the truncation is affordable: both proposals
+    # then win the claim and commit, they share exactly the edge ``(p1, p2)``, and
+    # ``register_face_edge`` folds them correctly anyway -- ``hash_find_or_insert`` publishes
+    # through a single ``atomic_cas`` so both threads converge on one slot, and the ``atomic_add``
+    # hands ``previous == 0`` to one and ``1`` to the other, so the edge is inserted once, pushed
+    # to the front once, and its boundary degree nets to zero. The pair is a manifold pair, which
+    # is what a shared edge should be. What is *not* preserved in that case is the per-wave
+    # vertex-disjointness ``register_face_edge`` states above; the state stays consistent because
+    # every transition it makes is an atomic read-modify-write.
     #
     # ``salt`` rotates that order **per wave**, and it is what keeps the ordering from being global.
     # An order fixed for the whole run starves a high-key front edge: it loses every contested
