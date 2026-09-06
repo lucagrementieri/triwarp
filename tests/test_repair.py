@@ -250,15 +250,6 @@ def test_make_solid_rejects_negative_iteration_caps(
         tw.repair.make_solid(mesh_wp.points, mesh_wp.indices, **kwargs)
 
 
-def test_make_solid_empty_mesh(device: str) -> None:
-    """An empty mesh comes back unchanged rather than raising."""
-    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.zeros(0, dtype=wp.int32, device=device)
-    solid_wp, solid_faces_wp = tw.repair.make_solid(vertices_wp, faces_wp)
-    assert int(solid_wp.shape[0]) == 0
-    assert int(solid_faces_wp.shape[0]) == 0
-
-
 def _resolve_duplicated_faces_ref(faces_np: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """CPU reference mirroring ``igl::resolve_duplicated_faces``."""
     faces = np.asarray(faces_np, dtype=np.int32).reshape((-1, 3))
@@ -892,11 +883,6 @@ def test_reverse_winding_leaves_its_input_alone(icosphere: tuple[tm.Trimesh, wp.
     assert np.array_equal(mesh_wp.indices.numpy(), before)
 
 
-def test_reverse_winding_empty_mesh(device: str) -> None:
-    """Not a parity assert: an empty face buffer reverses to an empty one rather than raising."""
-    assert tw.repair.reverse_winding(wp.empty(0, dtype=wp.int32, device=device)).shape[0] == 0
-
-
 @pytest.mark.parity("make_winding_consistent", "pymeshlab")
 def test_make_winding_consistent_matches_pymeshlab(
     device: str, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]
@@ -1309,14 +1295,6 @@ def test_make_volume_multibody(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     ok_a = _body_is_volume(repaired_single, body_a)
     ok_b = _body_is_volume(repaired_single, body_b)
     assert not (ok_a and ok_b)
-
-
-def test_make_repairs_empty_mesh(device: str) -> None:
-    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    assert tw.repair.make_winding_consistent(faces_wp).shape[0] == 0
-    assert tw.repair.make_volume(vertices_wp, faces_wp).shape[0] == 0
-    assert tw.repair.make_normals_outward(vertices_wp, faces_wp).shape[0] == 0
 
 
 # --- degenerate / small triangle removal ----------------------------------------------------
@@ -2043,18 +2021,6 @@ def test_split_nonmanifold_splits_a_duplicated_face_further_than_igl(
         tw.repair.resolve_duplicated_faces(faces_wp)
 
 
-def test_split_nonmanifold_empty(device: str) -> None:
-    """An empty mesh passes through with an empty source map."""
-    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    new_vertices_wp, new_faces_wp, source_wp = tw.repair.split_non_manifold_vertices(
-        vertices_wp, faces_wp
-    )
-    assert int(new_vertices_wp.shape[0]) == 0
-    assert int(new_faces_wp.shape[0]) == 0
-    assert int(source_wp.shape[0]) == 0
-
-
 @pytest.mark.parity(
     "split_non_manifold_vertices",
     "pymeshfix",
@@ -2457,14 +2423,6 @@ def test_collapse_small_triangles_matches_meshlib(
     )
 
 
-def test_collapse_small_triangles_empty(device: str) -> None:
-    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    out_vertices_wp, out_faces_wp = tw.repair.collapse_small_triangles(vertices_wp, faces_wp)
-    assert out_vertices_wp.shape[0] == 0
-    assert out_faces_wp.shape[0] == 0
-
-
 # ---------------------------------------------------------------------------
 # Geometric defects: bad faces, folds and T-vertices (pymeshlab reference)
 # ---------------------------------------------------------------------------
@@ -2502,14 +2460,6 @@ def test_remove_folded_faces_leaves_a_clean_mesh_alone(
     kept_vertices_wp, kept_faces_wp = tw.repair.remove_folded_faces(mesh_wp.points, mesh_wp.indices)
     assert int(kept_faces_wp.shape[0]) == int(mesh_wp.indices.shape[0])
     assert int(kept_vertices_wp.shape[0]) == int(mesh_wp.points.shape[0])
-
-
-def test_remove_folded_faces_empty(device: str) -> None:
-    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    out_vertices_wp, out_faces_wp = tw.repair.remove_folded_faces(vertices_wp, faces_wp)
-    assert int(out_vertices_wp.shape[0]) == 0
-    assert int(out_faces_wp.shape[0]) == 0
 
 
 def _self_intersecting_count_ml(vertices_wp: wp.array, faces_wp: wp.array) -> int:
@@ -3293,7 +3243,38 @@ def test_remove_t_vertices_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> N
         tw.repair.flip_t_vertices(mesh_wp.points, mesh_wp.indices, threshold=0.0)
 
 
-def test_remove_t_vertices_empty(device: str) -> None:
-    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+# ---------------------------------------------------------------------------
+# empty mesh is a no-op, across every repair operator
+# ---------------------------------------------------------------------------
+
+# (name, callable) pairs; each callable takes (vertices, faces) and returns the tuple of arrays
+# the wrapper produces, normalized to a tuple even where the wrapper returns a single array.
+_EMPTY_MESH_REPAIR_CASES = [
+    ("make_solid", lambda v, f: tw.repair.make_solid(v, f)),
+    ("reverse_winding", lambda v, f: (tw.repair.reverse_winding(f),)),
+    ("make_winding_consistent", lambda v, f: (tw.repair.make_winding_consistent(f),)),
+    ("make_volume", lambda v, f: (tw.repair.make_volume(v, f),)),
+    ("make_normals_outward", lambda v, f: (tw.repair.make_normals_outward(v, f),)),
+    ("split_non_manifold_vertices", lambda v, f: tw.repair.split_non_manifold_vertices(v, f)),
+    ("collapse_small_triangles", lambda v, f: tw.repair.collapse_small_triangles(v, f)),
+    ("remove_folded_faces", lambda v, f: tw.repair.remove_folded_faces(v, f)),
+    ("flip_t_vertices", lambda v, f: (tw.repair.flip_t_vertices(v, f),)),
+]
+
+
+@pytest.mark.parametrize(
+    "repair_fn",
+    [case[1] for case in _EMPTY_MESH_REPAIR_CASES],
+    ids=[case[0] for case in _EMPTY_MESH_REPAIR_CASES],
+)
+def test_repair_empty_mesh_is_a_noop(device: str, repair_fn) -> None:
+    """
+    Not a library comparison: every repair operator returns an all-empty result on an empty mesh.
+
+    No reference is consulted here -- the claim is only that the shape stays ``(0,)`` through
+    every array a repair function returns, rather than raising.
+    """
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    assert int(tw.repair.flip_t_vertices(vertices_wp, faces_wp).shape[0]) == 0
+    for result_wp in repair_fn(vertices_wp, faces_wp):
+        assert int(result_wp.shape[0]) == 0
