@@ -3379,6 +3379,46 @@ The `nnz`-is-a-capacity rule and its consequences are §3.7. Three further behav
   `cg` calls per column do reach the tree reduction and measure **0.60-0.81x** (a second copy of
   every other kernel in the iteration); and dropping `batch_offsets` is not a tuning change —
   `alpha` and `beta` become global rather than per column, which is CG on the block system.
+- **`warp.optim.linear.cg` silently sets `atol := tol` when a caller passes only `tol=`, which
+  turns a "relative residual tolerance" into an absolute floor of the same numeric value.**
+  Confirmed with a standalone, triwarp-free probe (one 50x50 SPD system, `tol=1e-8`, no `atol=`):
+  `wpl.cg`'s own reported `tol` is `8.87e-6` (`= tol * ‖b‖`, genuinely relative) at unit scale, but
+  **`1.00e-8`** (`= atol`, *not* `8.87e-12 = tol * ‖b‖`) once `‖b‖` shrinks to `8.87e-4` or
+  `8.87e-7` — the convergence criterion is `max(atol, tol * ‖b‖)` (documented at
+  `warp/_src/optim/linear.py:1104`), and its `_get_tolerances` helper (same file, ~line 2019)
+  resolves an omitted `atol` to `atol := tol` rather than to something negligibly small. The
+  practical failure mode is silent: a solve whose right-hand side has fallen below the tolerance
+  value returns **zero iterations** and the untouched initial guess as "converged" — not a wrong
+  answer flagged by `_warn_if_not_converged`, a **correct-looking** one, since `‖r‖ <= tol` really
+  does hold for `x = 0` when `‖b‖ <= atol`. Passing an explicit tiny `atol` (e.g. `1e-30`) alongside
+  `tol=` restores exact scale-invariance (relative error flat at `1.26e-08` from unit scale down to
+  `1e-9`, confirmed in the same probe) — the fix is one keyword per call site, not a numerical
+  redesign.
+
+  **Confirmed live in this codebase at four call sites, all silent, none passing `atol=`:**
+  `linalg.solve_spd` (`linalg.py:473`), `linalg.solve_spd_columns`'s single-column path (inside
+  `_cg_columns`, `linalg.py:795`), and `reconstruction._poisson_dense_solve` /
+  `reconstruction`'s adaptive `warp.fem` Poisson solve (`reconstruction.py:719` and `:912`).
+  Reproduced end to end: `heat.log_map`'s final Poisson solve (`tol=_CG_TOLERANCE=1e-8`) returns
+  `phi` bit-exact zero at every vertex once its right-hand side's norm drops under ~1e-8, which on
+  a 162-vertex icosphere happens between mesh coordinate scale 1e-8 and 5e-9 — this is what made
+  `log_map` collapse *completely* (radius included, not merely the angle §16's own log_map finding
+  fixed) at extreme mesh scale, and it is a different, unfixed mechanism from that one.
+  **Triwarp's own `_BatchedCg` / `_BlockCg2` (`linalg.py`, the multi-column CG paths) do not have
+  this defect**: both compute their stopping threshold via
+  `kernels/algorithms/conjugate_gradient.py::cg_absolute_tolerance` with an **explicit**
+  `atol_sq = 0.0` (`linalg.py:1155`, `:1438`), sidestepping `wpl.cg`'s default-resolution trap
+  entirely — the omission is specific to the two places `linalg.py` calls `wpl.cg` directly, plus
+  `reconstruction.py`'s two independent direct calls.
+
+  **Not fixed as of this writing.** `CG_TOLERANCE = 1e-10` (`linalg.py`) and `_CG_TOLERANCE = 1e-8`
+  (`heat.py`) are both squarely in the range a small-magnitude right-hand side can cross, and
+  `screened_poisson`'s public `solver_tolerance` defaults to `1e-6` on a `float32` system — but the
+  blast radius beyond `heat.log_map`/`heat_geodesic` was not measured. Landing the one-keyword fix
+  at all four sites changes iteration counts wherever it actually fires, which is a real behavior
+  change (§9) needing the benchmark suite re-run alongside the correctness suite, not a pure
+  bugfix with no observable cost difference — decline pending that measurement, not because the
+  diagnosis is in doubt.
 
 ### 12.8 Warp builtins: adoption verdicts
 
