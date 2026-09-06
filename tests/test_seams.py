@@ -27,7 +27,7 @@ from tests.conversions import (
 
 
 def _sorted_edge_set(edges_np: np.ndarray) -> set[tuple[int, int]]:
-    return {tuple(sorted(row)) for row in edges_np.tolist()}
+    return {tuple(row) for row in np.sort(edges_np, axis=1).tolist()}
 
 
 def _face_component_count(vertices_wp, faces_wp) -> int:

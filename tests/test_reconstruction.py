@@ -33,6 +33,7 @@ from tests.comparisons import (
     lexsort_rows,
     symmetric_chamfer,
     symmetric_surface_distance,
+    undirected_edges,
 )
 from tests.conversions import (
     meshlib_to_trimesh,
@@ -80,14 +81,8 @@ def _cross2(u: np.ndarray, v: np.ndarray) -> np.ndarray:
     return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
 
 
-def _edge_set(faces_flat: np.ndarray) -> set[tuple[int, int]]:
-    faces_flat = faces_flat.reshape(-1)
-    edges: set[tuple[int, int]] = set()
-    for i in range(0, len(faces_flat), 3):
-        t = faces_flat[i : i + 3]
-        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
-            edges.add((int(min(a, b)), int(max(a, b))))
-    return edges
+def _edge_set(faces_flat: np.ndarray) -> np.ndarray:
+    return np.unique(undirected_edges(np.asarray(faces_flat).reshape(-1, 3)), axis=0)
 
 
 def _incircle_violations(points_np: np.ndarray, faces_flat: np.ndarray) -> int:
@@ -140,7 +135,7 @@ def test_delaunay_matches_scipy_random(device: str):
     faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy()
     faces_sp = Delaunay(points_np.astype(np.float64)).simplices
 
-    assert _edge_set(faces_wp) == _edge_set(faces_sp.reshape(-1))
+    assert np.array_equal(_edge_set(faces_wp), _edge_set(faces_sp.reshape(-1)))
 
 
 @pytest.mark.parity("delaunay_triangulation", "pyvista")
@@ -233,7 +228,7 @@ def test_delaunay_grid_perturbed(device: str):
 
     faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy()
     faces_sp = Delaunay(points_np.astype(np.float64)).simplices
-    assert _edge_set(faces_wp) == _edge_set(faces_sp.reshape(-1))
+    assert np.array_equal(_edge_set(faces_wp), _edge_set(faces_sp.reshape(-1)))
 
 
 def test_delaunay_collinear(device: str):
