@@ -480,7 +480,7 @@ def heat_signed_distance(
 
     if operators is None:
         operators = tw.heat.vector_heat_operators(vertices, faces, t)
-    vector_system, scalar, frames = operators
+    vector_system, scalar, frames, vector_preconditioner = operators
     basis_x, basis_y, vertex_normals = frames
     poisson_system, poisson_preconditioner = scalar[3], scalar[4]
     cot_entries, face_normals = scalar[5], scalar[6]
@@ -501,7 +501,9 @@ def heat_signed_distance(
     # heat method's direction field below, and an absolute floor zeroes most of it on a mesh not
     # near unit scale (confirmed: 111 of 162 vertices at a 1e-6 scale, all resolved relative to the
     # field's own maximum).
-    diffused = tw.heat.diffuse_tangent_field(vector_system, source)
+    diffused = tw.heat.diffuse_tangent_field(
+        vector_system, source, preconditioner=vector_preconditioner
+    )
     diffused_lengths = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(wp.length, diffused, out=diffused_lengths)
     diffused_maximum = tw.reduce.max(diffused_lengths)
@@ -661,9 +663,11 @@ VectorHeatOperators = tuple[
     wps.BsrMatrix[wp.float64],
     HeatOperators,
     tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]],
+    wpl.LinearOperator,
 ]
 """What [`vector_heat_operators`][triwarp.heat.vector_heat_operators] returns: the vector
-heat system, the scalar [`heat_operators`][triwarp.heat.heat_operators], and the frames."""
+heat system, the scalar [`heat_operators`][triwarp.heat.heat_operators], the frames, and the
+vector system's own Jacobi preconditioner."""
 
 
 def vector_heat_operators(
@@ -677,24 +681,23 @@ def vector_heat_operators(
     """
     Assemble everything the vector-valued solvers need before their solves.
 
-    Three pieces, none of which depends on a source:
+    Four pieces, none of which depends on a source:
 
     1. the **vector heat system** ``M + t * L_connection``, whose ``2 x 2`` blocks act on tangent
        vectors ([`connection_laplacian`][triwarp.laplacian.connection_laplacian]);
     2. the scalar [`heat_operators`][triwarp.heat.heat_operators], for the magnitude
        extension and the distance field the log map needs;
     3. the [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames] every 2D component
-       is measured in.
+       is measured in;
+    4. the vector system's own Jacobi preconditioner.
 
-    Pass the result back through any solver's ``operators=`` argument to skip the assembly of these
-    three pieces on every call after the first. That is the split
-    ``potpourri3d.MeshVectorHeatSolver`` gets from being an object; here it stays a plain tuple.
-    What it does **not** skip is the vector system's own Jacobi preconditioner:
-    [`diffuse_tangent_field`][triwarp.heat.diffuse_tangent_field] calls
-    [`solve_spd`][triwarp.linalg.solve_spd] with no ``preconditioner=``, so every diffusion solve
-    rebuilds one from ``vector_system`` -- unlike the scalar bundle's own preconditioners, which
-    [`heat_operators`][triwarp.heat.heat_operators] builds once and this tuple carries. A caller
-    running many transports or log maps against one mesh still pays that rebuild each time.
+    Pass the result back through any solver's ``operators=`` argument to skip the assembly of all
+    four on every call after the first. That is the split ``potpourri3d.MeshVectorHeatSolver`` gets
+    from being an object; here it stays a plain tuple.
+    [`diffuse_tangent_field`][triwarp.heat.diffuse_tangent_field] threads the fourth piece into
+    [`solve_spd`][triwarp.linalg.solve_spd]'s own ``preconditioner=``, so a caller running many
+    transports or log maps against one mesh pays for it once rather than on
+    every diffusion solve.
 
     Parameters
     ----------
@@ -725,6 +728,8 @@ def vector_heat_operators(
         The [`heat_operators`][triwarp.heat.heat_operators] bundle for the same ``t``.
     frames : tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]]
         ``(basis_x, basis_y, normal)`` per vertex.
+    preconditioner : ``warp.optim.linear.LinearOperator``
+        Jacobi preconditioner for ``vector_system``.
 
     Notes
     -----
@@ -761,7 +766,8 @@ def vector_heat_operators(
         scalar_operators = heat_operators(vertices, faces, t)
     if frames is None:
         frames = vertex_tangent_frames(vertices, faces)
-    return vector_system, scalar_operators, frames
+    preconditioner = wpl.preconditioner(vector_system, "diag")
+    return vector_system, scalar_operators, frames, preconditioner
 
 
 def extend_scalar(
@@ -948,9 +954,11 @@ def transport_tangent_vectors(
 
     if operators is None:
         operators = vector_heat_operators(vertices, faces, t)
-    vector_system, scalar, _ = operators
+    vector_system, scalar, _, vector_preconditioner = operators
 
-    direction = _diffuse_from_sources(vector_system, sources, vectors, n_vertices, device)
+    direction = _diffuse_from_sources(
+        vector_system, sources, vectors, n_vertices, device, preconditioner=vector_preconditioner
+    )
 
     magnitudes = wp.empty(n_sources, dtype=wp.float64, device=device)
     wp.map(wp.length, _as_vec2d(vectors), out=magnitudes)
@@ -1047,7 +1055,7 @@ def log_map(
 
     if operators is None:
         operators = vector_heat_operators(vertices, faces, t)
-    vector_system, scalar, frames = operators
+    vector_system, scalar, frames, vector_preconditioner = operators
     basis_x, basis_y, _ = frames
 
     sources = wp.array([source], dtype=wp.int32, device=device)
@@ -1056,7 +1064,9 @@ def log_map(
     # ``transport_tangent_vectors``' own ``direction`` -- so the cut-locus test below has to floor
     # it relative to its own maximum for the same reason that function does (§ its docstring).
     reference = wp.array([[1.0, 0.0]], dtype=wp.vec2, device=device)
-    transported_raw = _diffuse_from_sources(vector_system, sources, reference, n_vertices, device)
+    transported_raw = _diffuse_from_sources(
+        vector_system, sources, reference, n_vertices, device, preconditioner=vector_preconditioner
+    )
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.map(kernel_array.to_vec2, transported_raw, out=transported)
 
@@ -1149,6 +1159,8 @@ def _diffuse_from_sources(
     vectors: wp.array[wp.vec2],
     n_vertices: int,
     device: wp.DeviceLike,
+    *,
+    preconditioner: wpl.LinearOperator | None = None,
 ) -> wp.array[wp.vec2d]:
     """Seed a tangent field at the source vertices, then diffuse it."""
     field = wp.zeros(n_vertices, dtype=wp.vec2d, device=device)
@@ -1158,11 +1170,14 @@ def _diffuse_from_sources(
         inputs=[_as_vec2d(vectors), sources, field],
         device=device,
     )
-    return diffuse_tangent_field(system, field)
+    return diffuse_tangent_field(system, field, preconditioner=preconditioner)
 
 
 def diffuse_tangent_field(
-    system: wps.BsrMatrix[wp.float64], source: wp.array[wp.vec2d]
+    system: wps.BsrMatrix[wp.float64],
+    source: wp.array[wp.vec2d],
+    *,
+    preconditioner: wpl.LinearOperator | None = None,
 ) -> wp.array[wp.vec2d]:
     """
     Short-time diffusion of a tangent-vector field: solve ``(M + t L_connection) X = source``.
@@ -1182,6 +1197,10 @@ def diffuse_tangent_field(
         [`vector_heat_operators`][triwarp.heat.vector_heat_operators].
     source
         ``(n_vertices,)`` ``wp.vec2d`` right-hand side, in each vertex's own tangent frame.
+    preconditioner
+        Optional Jacobi preconditioner for ``system``, the fourth field of
+        [`vector_heat_operators`][triwarp.heat.vector_heat_operators]'s return. Built here when
+        ``None``, which is the cost passing it back through ``operators=`` skips.
 
     Returns
     -------
@@ -1197,7 +1216,7 @@ def diffuse_tangent_field(
     diffused = wp.zeros(n_vertices, dtype=wp.vec2d, device=source.device)
     if n_vertices == 0:
         return diffused
-    twl.solve_spd(system, source, diffused, tol=_CG_TOLERANCE)
+    twl.solve_spd(system, source, diffused, tol=_CG_TOLERANCE, preconditioner=preconditioner)
     return diffused
 
 

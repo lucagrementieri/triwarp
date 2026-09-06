@@ -1517,7 +1517,9 @@ def test_diffuse_tangent_field_solves_its_own_system(
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = int(mesh_tm.vertices.shape[0])  # type: ignore[attr-defined]
-    vector_system, _scalar, _frames = tw.heat.vector_heat_operators(mesh_wp.points, mesh_wp.indices)
+    vector_system, _scalar, _frames, _preconditioner = tw.heat.vector_heat_operators(
+        mesh_wp.points, mesh_wp.indices
+    )
 
     source_np = np.zeros((n_vertices, 2))
     source_np[0] = [1.0, 0.0]
@@ -1538,7 +1540,9 @@ def test_diffuse_tangent_field_solves_its_own_system(
 def test_diffuse_tangent_field_empty(icosahedron: tuple[object, wp.Mesh]) -> None:
     """An empty source returns an empty field without entering the solver."""
     _mesh_tm, mesh_wp = icosahedron
-    vector_system, _scalar, _frames = tw.heat.vector_heat_operators(mesh_wp.points, mesh_wp.indices)
+    vector_system, _scalar, _frames, _preconditioner = tw.heat.vector_heat_operators(
+        mesh_wp.points, mesh_wp.indices
+    )
 
     diffused_wp = tw.heat.diffuse_tangent_field(
         vector_system, wp.empty(0, dtype=wp.vec2d, device=mesh_wp.points.device)

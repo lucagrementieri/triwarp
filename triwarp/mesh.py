@@ -1447,16 +1447,18 @@ class Trimesh:
         """
         Operator bundle for the vector heat method, at the default diffusion time.
 
-        ``(vector_system, scalar, frames)``: the ``2 x 2``-block connection system, the scalar
-        `heat_operators` and the `vertex_tangent_frames`. Pass it to
+        ``(vector_system, scalar, frames, preconditioner)``: the ``2 x 2``-block connection system,
+        the scalar `heat_operators`, the `vertex_tangent_frames`, and the connection system's own
+        Jacobi preconditioner. Pass it to
         [`transport_tangent_vectors`][triwarp.heat.transport_tangent_vectors],
         [`log_map`][triwarp.heat.log_map],
         [`extend_scalar`][triwarp.heat.extend_scalar] or
         [`heat_signed_distance`][triwarp.heat.heat_signed_distance] through their
         ``operators=`` argument.
 
-        Its last two fields are this class's own `heat_operators` and `vertex_tangent_frames`, so
-        the three properties share one assembly however they are reached.
+        Its second and third fields are this class's own `heat_operators` and
+        `vertex_tangent_frames`, so the three properties share one assembly however they are
+        reached.
 
         Notes
         -----

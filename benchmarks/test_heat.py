@@ -164,6 +164,15 @@ table shows: a factorization is expensive once and cheap thereafter, conjugate g
 Note too that transport barely feels the ``quality`` axis (7.11 against 7.05 ms) where ``log_map``
 feels it 2.7x; the difference is the distance field the log map also solves.
 
+``vector_heat_operators`` now caches the vector system's own Jacobi preconditioner too (its fourth
+tuple field), which the amortized row here does not visibly move: `wpl.preconditioner` on this
+system costs ~0.15 ms in isolation (measured directly, 200 calls between two syncs), against the
+~3 ms `diffuse_tangent_field` solve it feeds and the further `extend_scalar` pair the full
+``transport_tangent_vectors`` call also pays for -- a real ~7% saving on the vector solve alone,
+diluted below this benchmark's own run-to-run noise once the rest of the call is included. Landed
+for the architectural consistency with ``heat_operators``'s own two cached preconditioners, not for
+a win visible at this level.
+
 Measured on an RTX 5090, ``saddle`` then ``saddle_graded``: ``extend_scalar`` 7.2 / 5.6 ms against
 the reference's 38.3 / 38.1; ``transport_tangent_vectors`` 10.4 ms at ``saddle``; ``log_map`` 26.6 /
 **72.7 ms** against 182 / 188. That last row is the module's real result: triwarp's vector solve

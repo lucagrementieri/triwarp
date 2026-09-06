@@ -1056,7 +1056,7 @@ def test_vector_heat_operators_shares_its_two_sub_bundles(
     icosphere_coarse: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
     """
-    The vector bundle's last two fields *are* the sibling properties, not equal copies.
+    The vector bundle's second and third fields *are* the sibling properties, not equal copies.
 
     Identity rather than equality is the claim: the three properties must be one assembly however
     they are reached, since ``log_map``'s radius is asserted to be the ``heat_geodesic`` distance
@@ -1064,7 +1064,7 @@ def test_vector_heat_operators_shares_its_two_sub_bundles(
     """
     _mesh_tm, mesh_wp = icosphere_coarse
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
-    vector_system, scalar, frames = mesh.vector_heat_operators
+    vector_system, scalar, frames, _preconditioner = mesh.vector_heat_operators
 
     assert scalar is mesh.heat_operators
     assert frames is mesh.vertex_tangent_frames
