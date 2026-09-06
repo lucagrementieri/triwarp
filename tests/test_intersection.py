@@ -172,15 +172,6 @@ def test_segments_with_plane_parallel(device: str) -> None:
     assert np.array_equal(valid_wp.numpy(), valid_tm)
 
 
-def test_mesh_with_plane_empty(device: str) -> None:
-    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    lines_wp = tw.intersection.mesh_with_plane(
-        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
-    )
-    assert lines_wp.shape == (0, 2)
-
-
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("mesh_with_plane", "trimesh")
 def test_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: str) -> None:
@@ -1041,16 +1032,6 @@ def _sliced_meshes_equivalent(
     return bool(np.min(dots_b_np) >= -max(TOLERANCE_MERGE, 1e-5))
 
 
-def test_slice_mesh_with_plane_empty(device: str) -> None:
-    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    out_vertices_wp, out_faces_wp = tw.intersection.slice_mesh_with_plane(
-        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
-    )
-    assert out_vertices_wp.shape == (0,)
-    assert out_faces_wp.shape == (0,)
-
-
 @pytest.mark.parity("slice_mesh_with_plane", "trimesh")
 def test_slice_mesh_with_plane_box_corner(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
@@ -1451,17 +1432,6 @@ def test_split_mesh_with_plane_misses_the_mesh(icosahedron: tuple[tm.Trimesh, wp
     assert not above_wp.numpy().any()
 
 
-def test_split_mesh_with_plane_empty(device: str) -> None:
-    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    out_vertices_wp, out_faces_wp, above_wp = tw.intersection.split_mesh_with_plane(
-        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
-    )
-    assert out_vertices_wp.shape == (0,)
-    assert out_faces_wp.shape == (0,)
-    assert above_wp.shape == (0,)
-
-
 # ---------------------------------------------------------------------------
 # clip_mesh_with_field
 # ---------------------------------------------------------------------------
@@ -1474,17 +1444,6 @@ def _height_field(mesh_tm: tm.Trimesh, device: str) -> wp.array[wp.float32]:
         dtype=wp.float32,
         device=device,
     )
-
-
-def test_clip_mesh_with_field_empty(device: str) -> None:
-    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    values_wp = wp.empty(0, dtype=wp.float32, device=device)
-    out_vertices_wp, out_faces_wp = tw.intersection.clip_mesh_with_field(
-        vertices_wp, faces_wp, values_wp
-    )
-    assert out_vertices_wp.shape == (0,)
-    assert out_faces_wp.shape == (0,)
 
 
 @pytest.mark.parity("clip_mesh_with_field", "pyvista")
@@ -1677,6 +1636,63 @@ def test_clip_mesh_with_field_accepts_a_float64_field(
     assert int(clipped_64[1].shape[0]) > 0
     assert np.array_equal(clipped_64[1].numpy(), clipped_32[1].numpy())
     assert np.allclose(clipped_64[0].numpy(), clipped_32[0].numpy(), rtol=1e-5, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# empty mesh is a no-op, across mesh_with_plane / slice_mesh_with_plane /
+# split_mesh_with_plane / clip_mesh_with_field
+# ---------------------------------------------------------------------------
+
+# (name, callable, expected shapes) triples; each callable takes (vertices, faces) and returns
+# the tuple of arrays the wrapper produces, paired with the exact shape each must have on an
+# empty mesh -- kept per-function rather than normalized to "shape[0] == 0", since
+# mesh_with_plane's line-segment array is 2D and the original test pinned both dimensions.
+_INTERSECTION_EMPTY_MESH_CASES = [
+    (
+        "mesh_with_plane",
+        lambda v, f: (
+            tw.intersection.mesh_with_plane(
+                v, f, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
+            ),
+        ),
+        ((0, 2),),
+    ),
+    (
+        "slice_mesh_with_plane",
+        lambda v, f: tw.intersection.slice_mesh_with_plane(
+            v, f, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
+        ),
+        ((0,), (0,)),
+    ),
+    (
+        "split_mesh_with_plane",
+        lambda v, f: tw.intersection.split_mesh_with_plane(
+            v, f, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
+        ),
+        ((0,), (0,), (0,)),
+    ),
+    (
+        "clip_mesh_with_field",
+        lambda v, f: tw.intersection.clip_mesh_with_field(
+            v, f, wp.empty(0, dtype=wp.float32, device=f.device)
+        ),
+        ((0,), (0,)),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("intersection_fn", "expected_shapes"),
+    [case[1:] for case in _INTERSECTION_EMPTY_MESH_CASES],
+    ids=[case[0] for case in _INTERSECTION_EMPTY_MESH_CASES],
+)
+def test_intersection_empty_mesh_is_a_noop(device: str, intersection_fn, expected_shapes) -> None:
+    """Not a library comparison: every operator returns an all-empty result on an empty mesh."""
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    result = intersection_fn(vertices_wp, faces_wp)
+    for got_wp, expected_shape in zip(result, expected_shapes, strict=True):
+        assert got_wp.shape == expected_shape
 
 
 def _off_vertex_isovalue(mesh_tm: tm.Trimesh) -> float:
