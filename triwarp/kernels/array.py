@@ -866,7 +866,14 @@ def declare_map_signatures(
     raises ``TypeError`` at import if a table row gets it wrong. Deriving it here removes the trap.
     """
     for op, inputs, out_dtype in signatures:
-        arrays = [value for value in inputs if isinstance(value, wp.array)]
+        # ``wp.indexedarray`` (a Python-scope gather view, from ``map_probe_gathered``) is not a
+        # ``wp.array`` subclass -- checked directly, both derive from a common ``Array`` base but
+        # neither from the other -- so a length check against ``wp.array`` alone silently drops a
+        # gathered operand. Every row declared here today pairs a gathered operand with a bare
+        # scalar, so the omission has never mattered (an all-gathered or gathered-plus-single row
+        # would infer length 0 regardless of the gathered view's real length); include both kinds so
+        # the next such row is not the one that finds it.
+        arrays = [value for value in inputs if isinstance(value, (wp.array, wp.indexedarray))]
         length = 1 if arrays and all(value.shape[0] == 1 for value in arrays) else 0
         dtypes = out_dtype if isinstance(out_dtype, (list, tuple)) else [out_dtype]
         outputs = [wp.zeros(length, dtype=dtype, device="cpu") for dtype in dtypes]
@@ -1005,6 +1012,16 @@ def unpack_edge_key(key: wp.uint64, base: wp.uint64) -> tuple[wp.int32, wp.int32
 
 
 @wp.func
+def complement_rank_index(index: wp.int32) -> wp.uint32:
+    # ``index`` complemented within int32 so that a *smaller* index compares *larger* once packed
+    # into the low half of a rank key. Shared by ``pack_farthest_key`` and ``pack_ranked_key``'s low
+    # half, and by ``unpack_ranked_index``'s inverse -- the complement is its own inverse (comparing
+    # ``INT32_MAX_CONSTANT`` on both sides), so one function serves both directions rather than the
+    # same expression appearing three times.
+    return wp.uint32(INT32_MAX_CONSTANT - index)
+
+
+@wp.func
 def pack_farthest_key(distance_sq: wp.float32, index: wp.int32) -> wp.int64:
     # One int64 whose ``wp.atomic_max`` is "largest distance, lowest index on a tie". The IEEE-754
     # bits of a non-negative float increase monotonically with the value, so the high half orders
@@ -1013,7 +1030,7 @@ def pack_farthest_key(distance_sq: wp.float32, index: wp.int32) -> wp.int64:
     # makes ``-1`` a sentinel below every real candidate. ``unpack_ranked_index`` inverts the
     # low half.
     distance_bits = wp.uint64(wp.uint32(wp.cast(distance_sq, wp.int32)))
-    rank = wp.uint64(wp.uint32(wp.int32(2147483647) - index))
+    rank = wp.uint64(complement_rank_index(index))
     return wp.int64((distance_bits << wp.uint64(32)) | rank)
 
 
@@ -1030,8 +1047,7 @@ def pack_ranked_key(value: wp.int32, index: wp.int32) -> wp.int64:
     # maximum identifies the winner on the device. Where the host does need the index,
     # ``unpack_ranked_index`` inverts the low half.
     return wp.int64(
-        (wp.uint64(wp.uint32(value)) << wp.uint64(32))
-        | wp.uint64(wp.uint32(wp.int32(2147483647) - index))
+        (wp.uint64(wp.uint32(value)) << wp.uint64(32)) | wp.uint64(complement_rank_index(index))
     )
 
 
@@ -1047,7 +1063,8 @@ def unpack_ranked_index(key: wp.int64) -> wp.int32:
     # against the reduced maximum, keeping the winner on the device instead of pulling it back to
     # pick a row. Unpack when the host needs the index (a greedy loop's next seed); recompute when
     # only the device does.
-    return wp.int32(2147483647) - wp.int32(wp.uint32(wp.uint64(key) & wp.uint64(4294967295)))
+    low = wp.int32(wp.uint32(wp.uint64(key) & wp.uint64(4294967295)))
+    return wp.int32(complement_rank_index(low))
 
 
 @wp.func
@@ -1099,6 +1116,14 @@ def trilinear_cell(coordinate: wp.vec3, shape: wp.vec3i) -> tuple[wp.vec3i, wp.v
     #
     # For any axis with two or more samples ``base <= shape - 2``, so ``next_corner`` is exactly
     # ``base + 1`` and every currently-legal lattice indexes bit-identically to before.
+    #
+    # ``shape[k] == 0`` is a distinct precondition this function does not guard: with a zero-size
+    # axis there is no valid index at all, ``base`` clamps to 0 and ``next_corner`` clamps to -1, so
+    # every one of the four callers below must keep rejecting it before this is ever reached (as
+    # ``voxels.splat_onto_grid`` / ``sample_grid_trilinear`` already do with a `shape` validation,
+    # and as every ``res`` this module's own callers derive is bounded well above zero). Unlike
+    # the ``shape[k] == 1`` case above, there is no in-range corner to hand back for a zero-size
+    # axis, so the fix there does not generalize here.
     limit = wp.vec3i(wp.max(shape[0] - 2, 0), wp.max(shape[1] - 2, 0), wp.max(shape[2] - 2, 0))
     base = wp.vec3i(
         wp.clamp(wp.int32(wp.floor(coordinate[0])), 0, limit[0]),
