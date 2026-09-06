@@ -491,13 +491,16 @@ def _colliding_face_pairs(
     ValueError
         If ``max_triangle_collisions`` is less than 1.
     """
+    # Before the empty-mesh early return, not after: the three public callers all document this
+    # unconditionally ("Raises: ValueError if max_triangle_collisions is less than 1"), and an empty
+    # mesh plus an invalid cap must not silently return `None` instead.
+    if max_triangle_collisions < 1:
+        raise ValueError("max_triangle_collisions must be >= 1")
     device = vertices_a.device
     n_faces_a = int(faces_a.shape[0]) // 3
     n_faces_b = int(faces_b.shape[0]) // 3
     if n_faces_a == 0 or n_faces_b == 0:
         return None
-    if max_triangle_collisions < 1:
-        raise ValueError("max_triangle_collisions must be >= 1")
 
     # The smaller mesh supplies the BVH, so the larger one's faces are the queries.
     swapped = n_faces_a <= n_faces_b
@@ -587,6 +590,11 @@ def mesh_collision_pairs(
         Empty ``(0, 2)`` when the meshes do not cross. Pairs that merely touch or are coplanar are
         **not** collisions -- the same convention
         [`triwarp.validation.is_self_intersecting`][triwarp.validation.is_self_intersecting] uses.
+        A pair whose triangles share an exact vertex position is one case of "touch" and is
+        excluded unconditionally, even where the two triangles otherwise cross through each other's
+        interior away from that vertex -- this is what keeps two meshes glued along a common seam
+        (or one watertight mesh split into pieces) from reporting every shared-edge face pair as a
+        collision.
 
     Raises
     ------
@@ -811,7 +819,12 @@ def split_mesh_with_plane(
         side [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane] returns,
         including its tie-break for a face lying *in* the plane (kept when its own normal opposes
         ``plane_normal``), so
-        ``submesh_from_face_mask(*split_mesh_with_plane(...))`` and ``slice_mesh_with_plane`` agree.
+        ``submesh_from_face_mask(*split_mesh_with_plane(...))`` and ``slice_mesh_with_plane`` agree
+        — with one exception: a face lying in the plane whose own area is degenerate (below
+        [`TOLERANCE_MERGE`][triwarp.constants.TOLERANCE_MERGE]-scale zero) has no normal to break
+        the tie with, so [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane] drops
+        it from the output entirely, on either side, while this function — which keeps every face
+        somewhere — assigns it to ``True`` by convention.
 
     Notes
     -----
@@ -1144,7 +1157,7 @@ def _split_with_vertex_field(
     # what makes the cut watertight rather than a seam of coincident pairs. Sign agreement with the
     # classifier is a correctness requirement, so the mask is built at ``TOLERANCE_MERGE`` -- the
     # dead zone ``classify_faces_for_split`` passes ``sign_with_tolerance`` a few lines above.
-    unique_edges, halfedge_edges = tw.edges.edges_unique(faces)
+    unique_edges, halfedge_edges = tw.edges.edges_unique(faces, n_vertices=n_vertices)
     crossed = wp.empty(int(unique_edges.shape[0]), dtype=wp.bool, device=device)
     wp.launch(
         kernel_intersections.plane_crossed_edge_mask,
@@ -1249,9 +1262,6 @@ def _clip_with_vertex_field(
     (inside_idx, quad_idx, tri_idx), (n_in, n_quad, n_tri) = _slice_class_partition(
         face_classes, n_faces, kernel_intersections.SLICE_CLASSES
     )
-    n_in = int(inside_idx.shape[0])
-    n_quad = int(quad_idx.shape[0])
-    n_tri = int(tri_idx.shape[0])
 
     if n_quad + n_tri == 0:
         if n_in == 0:
