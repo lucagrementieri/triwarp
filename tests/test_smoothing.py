@@ -262,19 +262,6 @@ def test_filter_laplacian_implicit_duplicate_built_operator(
     assert np.allclose(smoothed_wp.numpy(), compact_wp.numpy(), rtol=1e-6, atol=1e-6)
 
 
-def test_zero_iterations_returns_copy(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    _, mesh_wp = icosahedron
-    smoothed_wp = tw.smoothing.filter_taubin(mesh_wp.points, mesh_wp.indices, iterations=0)
-    assert np.array_equal(smoothed_wp.numpy(), mesh_wp.points.numpy())
-
-
-def test_empty_mesh(device: str) -> None:
-    vertices = wp.empty(0, dtype=wp.vec3, device=device)
-    faces = wp.empty(0, dtype=wp.int32, device=device)
-    smoothed_wp = tw.smoothing.filter_taubin(vertices, faces, iterations=4)
-    assert int(smoothed_wp.shape[0]) == 0
-
-
 # ---------------------------------------------------------------------------
 # Region smoothing solves vs MeshLib (positionVertsSmoothly / SharpBd)
 # ---------------------------------------------------------------------------
@@ -880,16 +867,6 @@ def test_filter_neighborhood_average(request: pytest.FixtureRequest, mesh_name: 
     mesh_o3d = trimesh_to_open3d(mesh_tm).filter_smooth_simple(number_of_iterations=iterations)
 
     assert np.allclose(smoothed_wp.numpy(), np.asarray(mesh_o3d.vertices), rtol=1e-5, atol=1e-5)
-
-
-def test_filter_neighborhood_average_zero_iterations(
-    icosahedron: tuple[tm.Trimesh, wp.Mesh],
-) -> None:
-    _, mesh_wp = icosahedron
-    smoothed_wp = tw.smoothing.filter_neighborhood_average(
-        mesh_wp.points, mesh_wp.indices, iterations=0
-    )
-    assert np.array_equal(smoothed_wp.numpy(), mesh_wp.points.numpy())
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
@@ -1800,18 +1777,6 @@ def test_filter_two_step_leaves_a_flat_patch_alone(device: str) -> None:
     assert np.allclose(smoothed_wp.numpy(), grid_vertices_wp.numpy(), rtol=1e-5, atol=1e-5)
 
 
-def test_filter_two_step_zero_iterations(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    _mesh_tm, mesh_wp = icosahedron
-    out_wp = tw.smoothing.filter_two_step(mesh_wp.points, mesh_wp.indices, iterations=0)
-    assert np.array_equal(out_wp.numpy(), mesh_wp.points.numpy())
-
-
-def test_filter_two_step_empty(device: str) -> None:
-    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    assert tw.smoothing.filter_two_step(vertices_wp, faces_wp).shape == (0,)
-
-
 @pytest.mark.parametrize("iterations", [1, 5])
 @pytest.mark.parity("filter_sharpen", "pymeshlab")
 def test_filter_sharpen_matches_pymeshlab(device: str, iterations: int) -> None:
@@ -1891,10 +1856,59 @@ def test_filter_sharpen_zero_weight_is_the_identity(
     assert np.allclose(out_wp.numpy(), mesh_wp.points.numpy(), rtol=1e-6, atol=1e-6)
 
 
-def test_filter_sharpen_empty(device: str) -> None:
-    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+# (name, callable) pairs; each callable takes (vertices, faces) and returns the smoothed vertex
+# array a vertex-position filter produces. filter_scalar_laplacian is not among these: it smooths
+# a per-vertex scalar field rather than positions and takes a values array first, a genuinely
+# different signature rather than a boilerplate variation.
+_SMOOTHING_VERTEX_FILTER_CASES = [
+    (
+        "filter_taubin",
+        lambda v, f, iterations: tw.smoothing.filter_taubin(v, f, iterations=iterations),
+    ),
+    (
+        "filter_neighborhood_average",
+        lambda v, f, iterations: tw.smoothing.filter_neighborhood_average(
+            v, f, iterations=iterations
+        ),
+    ),
+    (
+        "filter_two_step",
+        lambda v, f, iterations: tw.smoothing.filter_two_step(v, f, iterations=iterations),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "smoothing_fn",
+    [case[1] for case in _SMOOTHING_VERTEX_FILTER_CASES],
+    ids=[case[0] for case in _SMOOTHING_VERTEX_FILTER_CASES],
+)
+def test_smoothing_zero_iterations_returns_a_copy(
+    smoothing_fn, icosahedron: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """Not a library comparison: zero iterations is the identity for a vertex-position filter."""
+    _, mesh_wp = icosahedron
+    smoothed_wp = smoothing_fn(mesh_wp.points, mesh_wp.indices, 0)
+    assert np.array_equal(smoothed_wp.numpy(), mesh_wp.points.numpy())
+
+
+# filter_taubin's own case additionally requests real iterations (4), confirming the empty-mesh
+# guard fires before the solve rather than merely being what a 0-iteration no-op would look like
+# anyway; the other two filters keep their default iteration counts, as the original tests did.
+@pytest.mark.parametrize(
+    "smoothing_fn",
+    [
+        lambda v, f: tw.smoothing.filter_taubin(v, f, iterations=4),
+        lambda v, f: tw.smoothing.filter_two_step(v, f),
+        lambda v, f: tw.smoothing.filter_sharpen(v, f),
+    ],
+    ids=["filter_taubin", "filter_two_step", "filter_sharpen"],
+)
+def test_smoothing_empty_mesh_is_a_noop(device: str, smoothing_fn) -> None:
+    """Not a library comparison: every vertex-position filter returns nothing on an empty mesh."""
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    assert tw.smoothing.filter_sharpen(vertices_wp, faces_wp).shape == (0,)
+    assert smoothing_fn(vertices_wp, faces_wp).shape == (0,)
 
 
 _REFINE_KWARGS = {
