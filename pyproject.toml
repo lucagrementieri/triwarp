@@ -89,6 +89,14 @@ test = [
     "pymeshfix>=0.18.1",
     "pymeshlab>=2023.12",
     "pytest>=9.0",
+    # The actual dependency declaration the rest of this block's comments assume exists --
+    # ``[tool.uv.sources]`` below only overrides *where* a package named ``pytorch3d`` comes from,
+    # it does not itself make anything depend on one. Without this line ``uv lock``/``uv sync``
+    # never resolve or build pytorch3d at all: it can sit importable in a venv from a manual
+    # ``uv pip install`` and still be entirely absent from ``uv.lock``, which is exactly the state
+    # this project was in until this line was added. No version specifier -- the git source below
+    # is the only version that exists.
+    "pytorch3d",
     # Built from source (see ``[tool.uv.sources]``) rather than installed as a wheel
     "pyvista>=0.48",
     "rtree>=0.12",

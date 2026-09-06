@@ -776,6 +776,17 @@ wheels = [
 ]
 
 [[package]]
+name = "iopath"
+version = "0.1.10"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "portalocker" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/72/73/b3d451dfc523756cf177d3ebb0af76dc7751b341c60e2a21871be400ae29/iopath-0.1.10.tar.gz", hash = "sha256:3311c16a4d9137223e20f141655759933e1eda24f8bff166af834af3c645ef01", size = 42226, upload-time = "2022-07-09T19:00:50.866Z" }
+
+[[package]]
 name = "itsdangerous"
 version = "2.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2071,6 +2082,15 @@ wheels = [
 ]
 
 [[package]]
+name = "portalocker"
+version = "4.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0d/8e/27672cd2dde9d2345ead0352146a401be4ec0af132be86ca7a2db24afb09/portalocker-4.3.0.tar.gz", hash = "sha256:69bf8e46769d66eb0a23219b9550253d2c3b5f03400202a2333784c1e6395e32", size = 263582, upload-time = "2026-08-25T18:05:20.267Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6a/76/57be9bb352b3f91c80671a7b7ce2cd51f99ad324c89df82a098df9b9e609/portalocker-4.3.0-py3-none-any.whl", hash = "sha256:aa91709ccfc322b8225171392d64a2f9fc833f15f5ab741cfba6d3fba285ce31", size = 129554, upload-time = "2026-08-25T18:05:18.64Z" },
+]
+
+[[package]]
 name = "potpourri3d"
 version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2413,6 +2433,14 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
+]
+
+[[package]]
+name = "pytorch3d"
+version = "0.7.9"
+source = { git = "https://github.com/facebookresearch/pytorch3d.git?branch=main#0a7d4c1a171e8b768c63f15b17564f9ad495f49b" }
+dependencies = [
+    { name = "iopath" },
 ]
 
 [[package]]
@@ -3127,6 +3155,7 @@ bench = [
     { name = "pymeshlab" },
     { name = "pytest" },
     { name = "pytest-benchmark" },
+    { name = "pytorch3d" },
     { name = "pyvista" },
     { name = "rtree" },
     { name = "scipy" },
@@ -3164,6 +3193,7 @@ test = [
     { name = "pymeshfix" },
     { name = "pymeshlab" },
     { name = "pytest" },
+    { name = "pytorch3d" },
     { name = "pyvista" },
     { name = "rtree" },
     { name = "scipy" },
@@ -3200,6 +3230,7 @@ bench = [
     { name = "pymeshlab", specifier = ">=2023.12" },
     { name = "pytest", specifier = ">=9.0" },
     { name = "pytest-benchmark", specifier = ">=5.1" },
+    { name = "pytorch3d", git = "https://github.com/facebookresearch/pytorch3d.git?branch=main" },
     { name = "pyvista", specifier = ">=0.48" },
     { name = "rtree", specifier = ">=0.12" },
     { name = "scipy", specifier = ">=1.17" },
@@ -3236,6 +3267,7 @@ test = [
     { name = "pymeshfix", specifier = ">=0.18.1" },
     { name = "pymeshlab", specifier = ">=2023.12" },
     { name = "pytest", specifier = ">=9.0" },
+    { name = "pytorch3d", git = "https://github.com/facebookresearch/pytorch3d.git?branch=main" },
     { name = "pyvista", specifier = ">=0.48" },
     { name = "rtree", specifier = ">=0.12" },
     { name = "scipy", specifier = ">=1.17" },
