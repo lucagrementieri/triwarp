@@ -824,7 +824,8 @@ def capsule(
         Radius of the cylinder and of both hemispheres.
     count
         ``(2,)`` number of sections along latitude and longitude. Defaults to ``(32, 64)``. Both
-        entries are rounded up to even, which is what keeps the cylindrical wall vertical.
+        entries are rounded up to even, which is what gives the two quarter-circle profiles below
+        the equator the same point count.
     transform
         Transform applied after construction, as a ``(1,)`` ``wp.mat44`` array or a scalar
         ``wp.mat44``.
@@ -848,6 +849,18 @@ def capsule(
     the origin and the other at ``height``; the implementation (and this port) centers it
     instead.
 
+    The profile is two quarter-circles, each swept from the equator to a pole, rather than one
+    continuous sweep from pole to pole: sharing the equator between two *exactly*
+    ``cos(0) = 1``-radius points (one shifted to each hemisphere) is what gives the cylindrical
+    wall between them an exact, constant radius, matching
+    [`trimesh.creation.capsule`][]'s own construction (which does this for the same reason,
+    per its own comment, "two quarter circles sharing an equator vertex"). A single pole-to-pole
+    sweep only *approximates* the equator at the two points nearest ``latitude / 2``, which are a
+    fraction of a section short of it, and reads as a nearly-vertical wall rather than an exactly
+    vertical one; more concretely, it counts two fewer profile points than the exact
+    construction, which shows up as a vertex-count mismatch against
+    [`trimesh.creation.capsule`][] at every longitude count.
+
     See Also
     --------
     [`uv_sphere`][triwarp.creation.uv_sphere]
@@ -862,7 +875,15 @@ def capsule(
 
     height_f = abs(float(height))
     radius_f = abs(float(radius))
-    theta = np.linspace(-math.pi / 2.0, math.pi / 2.0, latitude)
+    # Two quarter-circles sharing the equator, not one pole-to-pole sweep -- see the Notes above
+    # for why the naive single sweep is both the wrong shape and the wrong vertex count.
+    quarter_points = latitude // 2 + 1
+    theta = np.concatenate(
+        (
+            np.linspace(-math.pi / 2.0, 0.0, quarter_points),
+            np.linspace(0.0, math.pi / 2.0, quarter_points),
+        )
+    )
     profile = np.column_stack((np.cos(theta), np.sin(theta))) * radius_f
     half = len(profile) // 2
     profile[:half, 1] -= height_f / 2.0
