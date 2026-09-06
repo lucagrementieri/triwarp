@@ -18,7 +18,7 @@ from meshlib import mrmeshpy as mm
 from scipy.spatial import cKDTree
 
 import triwarp as tw
-from tests.comparisons import euler_characteristic, open_edge_count
+from tests.comparisons import euler_characteristic, lexsort_rows, open_edge_count
 from tests.conversions import (
     meshlib_to_trimesh,
     open3d_to_trimesh,
@@ -96,9 +96,7 @@ def _assert_same_vertices_and_faces(
     assert distance_np.max() < 1e-5, f"vertices differ by up to {distance_np.max():.3e}"
     mapped_np = np.sort(remap_np[faces_np], axis=1)
     reference_np = np.sort(mesh_tm.faces, axis=1)
-    assert np.array_equal(
-        mapped_np[np.lexsort(mapped_np.T[::-1])], reference_np[np.lexsort(reference_np.T[::-1])]
-    )
+    assert np.array_equal(lexsort_rows(mapped_np), lexsort_rows(reference_np))
 
 
 def _mat44(matrix_np: np.ndarray) -> wp.mat44:

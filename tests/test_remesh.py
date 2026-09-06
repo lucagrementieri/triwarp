@@ -2098,11 +2098,9 @@ def test_subdivide(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
 
     centroids_wp = new_v_wp_np[new_f_wp_np].mean(axis=1)
     centroids_tm = new_v_tm[new_f_tm_np].mean(axis=1)
-    order_wp = np.lexsort(centroids_wp.T[::-1])
-    order_tm = np.lexsort(centroids_tm.T[::-1])
-    assert np.allclose(centroids_wp[order_wp], centroids_tm[order_tm], rtol=1e-5, atol=1e-5), (
-        "face centroid sets do not match"
-    )
+    assert np.allclose(
+        lexsort_rows(centroids_wp), lexsort_rows(centroids_tm), rtol=1e-5, atol=1e-5
+    ), "face centroid sets do not match"
 
 
 @pytest.mark.parity("subdivide", "open3d")
@@ -2608,9 +2606,7 @@ def test_subdivide_to_size_reference_regular(icosahedron: tuple[tm.Trimesh, wp.M
 
     faces_mapped = np.sort(wp_to_ref[new_f_np], axis=1)
     faces_ref = np.sort(ref_f, axis=1)
-    order_mapped = np.lexsort(faces_mapped.T[::-1])
-    order_ref = np.lexsort(faces_ref.T[::-1])
-    assert np.array_equal(faces_mapped[order_mapped], faces_ref[order_ref])
+    assert np.array_equal(lexsort_rows(faces_mapped), lexsort_rows(faces_ref))
 
     n_in_faces = mesh_tm.faces.shape[0]
     hist_wp = np.bincount(index_wp.numpy(), minlength=n_in_faces)
@@ -2670,9 +2666,7 @@ def test_subdivide_to_size_matches_pymeshlab(
     assert len(set(remap_np.tolist())) == remap_np.shape[0]
     mapped_np = np.sort(remap_np[faces_np], axis=1)
     reference_np = np.sort(faces_pml, axis=1)
-    assert np.array_equal(
-        mapped_np[np.lexsort(mapped_np.T[::-1])], reference_np[np.lexsort(reference_np.T[::-1])]
-    )
+    assert np.array_equal(lexsort_rows(mapped_np), lexsort_rows(reference_np))
 
 
 def test_subdivide_to_size_reference_mixed(device: str) -> None:
@@ -2702,9 +2696,7 @@ def test_subdivide_to_size_reference_mixed(device: str) -> None:
 
     faces_mapped = np.sort(wp_to_ref[new_f_np], axis=1)
     faces_ref = np.sort(ref_f, axis=1)
-    assert np.array_equal(
-        faces_mapped[np.lexsort(faces_mapped.T[::-1])], faces_ref[np.lexsort(faces_ref.T[::-1])]
-    )
+    assert np.array_equal(lexsort_rows(faces_mapped), lexsort_rows(faces_ref))
 
     hist_wp = np.bincount(index_wp.numpy(), minlength=mesh_tm.faces.shape[0])
     hist_ref = np.bincount(ref_index, minlength=mesh_tm.faces.shape[0])

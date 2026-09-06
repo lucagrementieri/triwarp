@@ -1424,8 +1424,9 @@ def _triangle_set_close(a: np.ndarray, b: np.ndarray, atol: float = 1e-4) -> boo
         return False
     if a.shape[0] == 0:
         return True
-    key = lambda t: np.lexsort(t.reshape(t.shape[0], -1).T[::-1])  # noqa: E731
-    return bool(np.allclose(a[key(a)], b[key(b)], atol=atol))
+    a_sorted = lexsort_rows(a.reshape(a.shape[0], -1))
+    b_sorted = lexsort_rows(b.reshape(b.shape[0], -1))
+    return bool(np.allclose(a_sorted, b_sorted, atol=atol))
 
 
 # --------------------------------------------------------------------------------------
@@ -3268,7 +3269,7 @@ def test_remove_t_vertices_matches_pymeshlab(
 
     def face_set(faces: np.ndarray) -> np.ndarray:
         sorted_np = np.sort(np.asarray(faces).reshape(-1, 3), axis=1)
-        return sorted_np[np.lexsort(sorted_np.T[::-1])]
+        return lexsort_rows(sorted_np)
 
     assert np.array_equal(face_set(flipped_np), face_set(faces_pml))
     assert (not np.array_equal(face_set(flipped_np), face_set(faces_np))) is expect_change

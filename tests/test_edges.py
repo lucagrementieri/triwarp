@@ -164,9 +164,7 @@ def test_edges_unique(request: pytest.FixtureRequest, mesh_name: str) -> None:
     unique_edges_wp, _ = tw.edges.edges_unique(mesh_wp.indices)
     unique_edges_wp_np = unique_edges_wp.numpy()
 
-    order_tm = np.lexsort((unique_edges_tm[:, 1], unique_edges_tm[:, 0]))
-    order_wp = np.lexsort((unique_edges_wp_np[:, 1], unique_edges_wp_np[:, 0]))
-    assert np.array_equal(unique_edges_wp_np[order_wp], unique_edges_tm[order_tm])
+    assert np.array_equal(lexsort_rows(unique_edges_wp_np), lexsort_rows(unique_edges_tm))
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
