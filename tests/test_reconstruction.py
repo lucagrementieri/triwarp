@@ -572,37 +572,6 @@ def _open3d_poisson(points_np: np.ndarray, normals_np: np.ndarray, depth: int) -
     return open3d_to_trimesh(mesh_o3d)
 
 
-@pytest.mark.slow_cpu(71.9)
-def test_poisson_sphere_watertight_manifold(device: str):
-    """
-    Watertightness needs depth 6, so this is the one solving test that does not drop to 5 on CPU.
-
-    Measured on this 642-point cloud, one reconstruction per process on **both** devices: depth 5
-    gives 7 976 faces that are edge-manifold with zero boundary edges but **self-intersecting**, so
-    ``is_watertight`` -- which follows Open3D and includes that clause -- is ``False``. Depth 6
-    closes it. The radius tolerances below are calibrated to a depth-6 cell (~0.034) as well, so
-    this test is pinned to 6 on both devices and pays the ~68 s that costs on CPU.
-
-    Not a device difference: CPU and CUDA agree at every depth, and the depth-5 answer is equally
-    non-watertight on both.
-    """
-    points_np, normals_np = _sphere_cloud(3)
-    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
-
-    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4
-    )
-    mesh_tw = warp_to_trimesh(vertices_wp, faces_wp)
-
-    assert tw.validation.is_watertight(vertices_wp, faces_wp)
-    assert mesh_tw.euler_number == 2  # closed genus-0 surface
-
-    radius_tw = np.linalg.norm(mesh_tw.vertices, axis=1)
-    # A depth-6 cube spans ~2.2 across 64 cells => cell ~0.034; recon must hug the unit sphere.
-    assert abs(radius_tw.mean() - 1.0) < 0.02
-    assert np.abs(radius_tw - 1.0).max() < 0.06
-
-
 def test_poisson_outward_orientation(device: str):
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
@@ -612,18 +581,6 @@ def test_poisson_outward_orientation(device: str):
     )
     # Outward normals => positive enclosed volume.
     assert warp_to_trimesh(vertices_wp, faces_wp).volume > 0.0
-
-
-def test_poisson_torus_genus(device: str):
-    points_np, normals_np = _torus_cloud()
-    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
-
-    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4
-    )
-    mesh_tw = warp_to_trimesh(vertices_wp, faces_wp)
-    assert tw.validation.is_watertight(vertices_wp, faces_wp)
-    assert mesh_tw.euler_number == 0  # genus-1 torus: V - E + F = 0
 
 
 @pytest.mark.parity(
@@ -829,33 +786,58 @@ def test_poisson_cpu_matches_cuda():
 # ======================================================================================
 
 
-def test_poisson_adaptive_sphere_watertight_manifold(device: str):
-    points_np, normals_np = _sphere_cloud(4)
+_POISSON_WATERTIGHT_CASES = [
+    pytest.param("sphere", "dense", marks=pytest.mark.slow_cpu(71.9), id="sphere-dense"),
+    pytest.param("sphere", "adaptive", id="sphere-adaptive"),
+    pytest.param("torus", "dense", id="torus-dense"),
+    pytest.param("torus", "adaptive", id="torus-adaptive"),
+]
+
+
+@pytest.mark.parametrize(("shape", "method"), _POISSON_WATERTIGHT_CASES)
+def test_poisson_watertight_manifold(device: str, shape: str, method: str) -> None:
+    """
+    Not a library comparison: reconstructing a closed surface from a clean, oriented cloud closes.
+
+    ``sphere`` asserts the reconstructed radius hugs the unit sphere in addition to the topology;
+    ``torus`` only checks watertightness and genus, since it has no analogous single-number shape
+    to pin. ``adaptive`` additionally asserts outward orientation directly (the dense backend has
+    its own [`test_poisson_outward_orientation`]).
+
+    **The sphere/dense cell is pinned to depth 6 on both devices**, unlike every other cell here,
+    which uses [`_poisson_depth`] and so drops to 5 on CPU. Measured on this 642-point cloud,
+    one reconstruction per process on **both** devices: depth 5 gives 7 976 faces that are
+    edge-manifold with zero boundary edges but **self-intersecting**, so ``is_watertight`` --
+    which follows Open3D and includes that clause -- is ``False``. Depth 6 closes it, and the
+    sphere/dense radius tolerances are calibrated to a depth-6 cell (~0.034) as well. Not a device
+    difference: CPU and CUDA agree at every depth, and the depth-5 answer is equally
+    non-watertight on both -- the pin, and the ~68 s it costs on CPU, is unique to this one cell.
+    """
+    if shape == "sphere":
+        # adaptive resolves a finer cloud than dense; each was tuned against its own resolution.
+        points_np, normals_np = _sphere_cloud(3 if method == "dense" else 4)
+        depth = 6 if method == "dense" else _poisson_depth(device)
+    else:
+        points_np, normals_np = _torus_cloud()
+        depth = _poisson_depth(device)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, method="adaptive"
+        points_wp, normals_wp, depth=depth, full_depth=4, method=method
     )
     mesh_tw = warp_to_trimesh(vertices_wp, faces_wp)
 
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
-    assert mesh_tw.euler_number == 2  # closed genus-0 surface
-    assert mesh_tw.volume > 0.0  # outward orientation
+    assert mesh_tw.euler_number == (2 if shape == "sphere" else 0)
 
+    if shape != "sphere":
+        return
+    if method == "adaptive":
+        assert mesh_tw.volume > 0.0  # outward orientation
     radius_tw = np.linalg.norm(mesh_tw.vertices, axis=1)
-    assert abs(radius_tw.mean() - 1.0) < 0.03
-    assert np.abs(radius_tw - 1.0).max() < 0.08
-
-
-def test_poisson_adaptive_torus_genus(device: str):
-    points_np, normals_np = _torus_cloud()
-    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
-
-    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, method="adaptive"
-    )
-    assert tw.validation.is_watertight(vertices_wp, faces_wp)
-    assert warp_to_trimesh(vertices_wp, faces_wp).euler_number == 0  # genus-1 torus
+    mean_tol, max_tol = (0.02, 0.06) if method == "dense" else (0.03, 0.08)
+    assert abs(radius_tw.mean() - 1.0) < mean_tol
+    assert np.abs(radius_tw - 1.0).max() < max_tol
 
 
 def test_poisson_adaptive_matches_dense(device: str):
