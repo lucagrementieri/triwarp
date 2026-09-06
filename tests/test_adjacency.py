@@ -558,7 +558,7 @@ def test_face_adjacency_angles_empty(device: str) -> None:
 
 
 @pytest.mark.parity("face_adjacency_projections", "trimesh")
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
 def test_face_adjacency_projections(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class B (dict index): the projection is keyed by its adjacency *pair*, not by row position.
@@ -659,7 +659,7 @@ def test_face_adjacency_projections_empty(device: str) -> None:
     assert projections_wp.shape == (0,)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
 @pytest.mark.parity("face_adjacency_convex", "trimesh")
 def test_face_adjacency_convex(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """

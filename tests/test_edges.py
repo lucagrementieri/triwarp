@@ -24,6 +24,9 @@ from tests.conversions import (
     trimesh_to_pyvista,
 )
 
+# Not ``conftest.MESHES``: this predates that constant and has never carried ``cave_cube``.
+_EDGE_MESHES = ["icosahedron", "half_torus", "hemisphere"]
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -139,7 +142,7 @@ def test_edges_face_empty(device: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 @pytest.mark.parity("edges_unique", "trimesh")
 @pytest.mark.parity("edges_unique_auto_nv", "trimesh")
 def test_edges_unique(request: pytest.FixtureRequest, mesh_name: str) -> None:
@@ -167,7 +170,7 @@ def test_edges_unique(request: pytest.FixtureRequest, mesh_name: str) -> None:
     assert np.array_equal(lexsort_rows(unique_edges_wp_np), lexsort_rows(unique_edges_tm))
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 @pytest.mark.parity("edges_unique_inverse", "trimesh")
 def test_edges_unique_inverse(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -188,7 +191,7 @@ def test_edges_unique_inverse(request: pytest.FixtureRequest, mesh_name: str) ->
     assert np.array_equal(reconstructed, edges_sorted_wp.numpy())
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 @pytest.mark.parity("edges_unique_manifold", "potpourri3d")
 def test_edges_unique_matches_potpourri3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -219,7 +222,7 @@ def test_edges_unique_matches_potpourri3d(request: pytest.FixtureRequest, mesh_n
     assert_unordered_rows_equal(np.sort(unique_edges_wp.numpy(), axis=1), np.sort(edges_pp, axis=1))
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 @pytest.mark.parity("edges_unique", "igl")
 @pytest.mark.parity("edges_unique_auto_nv", "igl")
 @pytest.mark.parity("edges_unique_manifold", "igl")
@@ -291,7 +294,7 @@ def test_edges_unique_and_inverse_match_igl(request: pytest.FixtureRequest, mesh
     assert np.array_equal(resolved_wp, resolved_igl)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 @pytest.mark.parity("edges_unique", "pytorch3d")
 @pytest.mark.parity("edges_unique_auto_nv", "pytorch3d")
 @pytest.mark.parity("edges_unique_inverse", "pytorch3d")
@@ -342,7 +345,7 @@ def test_edges_unique_and_inverse_match_pytorch3d(
     assert np.array_equal(remap_np[face_edges_np], face_edges_p3d[:, [2, 0, 1]])
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 @pytest.mark.parity("edges_unique", "pyvista")
 @pytest.mark.parity("edges_unique_auto_nv", "pyvista")
 def test_edges_unique_matches_pyvista(request: pytest.FixtureRequest, mesh_name: str) -> None:
@@ -369,7 +372,7 @@ def test_edges_unique_matches_pyvista(request: pytest.FixtureRequest, mesh_name:
     assert_unordered_rows_equal(np.sort(unique_edges_wp.numpy(), axis=1), edges_pv)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 def test_edges_unique_radix_is_invariant_to_an_oversized_base(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -401,7 +404,7 @@ def test_edges_unique_empty(device: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 def test_edges_unique_inverse_standalone(request: pytest.FixtureRequest, mesh_name: str) -> None:
     _, mesh_wp = request.getfixturevalue(mesh_name)
 
@@ -415,7 +418,7 @@ def test_edges_unique_inverse_standalone(request: pytest.FixtureRequest, mesh_na
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 @pytest.mark.parity("edges_unique_length", "trimesh", "meshlib")
 def test_edges_unique_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -474,7 +477,7 @@ def test_edges_unique_length_precomputed(device: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 @pytest.mark.parity("edges_length", "trimesh")
 def test_edges_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -515,7 +518,7 @@ def test_edges_length_empty(device: str) -> None:
     assert tw.edges.edges_length(verts_wp, faces_wp).shape == (0,)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 @pytest.mark.parity("mean_edge_length", "trimesh")
 def test_mean_edge_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -546,7 +549,7 @@ def test_mean_edge_length(request: pytest.FixtureRequest, mesh_name: str) -> Non
         assert not np.isclose(unique_wp, per_face_np, rtol=1e-4)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _EDGE_MESHES)
 @pytest.mark.parity("mean_unique_edge_length", "igl", "pymeshlab", "trimesh", "meshlib")
 @pytest.mark.parity("mean_edge_length", "igl")
 @pytest.mark.parity("edges_length", "igl")

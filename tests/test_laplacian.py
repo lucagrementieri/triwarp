@@ -23,12 +23,15 @@ from tests.conversions import (
     trimesh_to_pyvista,
 )
 
+# Not ``conftest.MESHES``: this predates that constant and has never carried ``cave_cube``.
+_LAPLACIAN_MESHES = ["icosahedron", "half_torus", "hemisphere"]
+
 # -----------------------------------------------------------------------------------------
 # face_gradients (libigl `grad`, pyvista `compute_derivative`)
 # -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parity("face_gradients", "igl")
 def test_face_gradients_matches_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -76,7 +79,7 @@ def test_face_gradients_matches_igl(request: pytest.FixtureRequest, mesh_name: s
     )
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parity("face_gradients", "pyvista")
 def test_face_gradients_matches_pyvista(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -132,7 +135,7 @@ def test_face_gradients_matches_pyvista(request: pytest.FixtureRequest, mesh_nam
     assert np.allclose(sphere_gradient_pv.mean(axis=0), [2.0 / 3.0, 0.0, 0.0], atol=1e-6)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parity(
     "face_gradients",
     "meshlib",
@@ -238,7 +241,7 @@ def test_face_gradients_empty(device: str) -> None:
 # -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parity("cotmatrix_entries", "igl")
 def test_cotmatrix_entries(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -258,7 +261,7 @@ def test_cotmatrix_entries(request: pytest.FixtureRequest, mesh_name: str) -> No
     assert np.allclose(cot_entries_wp.numpy(), cot_entries_igl, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parity(
     "cotmatrix_entries",
     "meshlib",
@@ -322,7 +325,7 @@ def test_cotmatrix_entries_matches_meshlib(request: pytest.FixtureRequest, mesh_
 # -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parity("cotmatrix_entries_intrinsic", "igl")
 def test_cotmatrix_entries_intrinsic(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -374,7 +377,7 @@ def test_cotmatrix_entries_intrinsic_float64(icosahedron: tuple[tm.Trimesh, wp.M
 # -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parity("cotmatrix", "igl")
 def test_cotmatrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -395,7 +398,7 @@ def test_cotmatrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
     assert np.allclose(laplacian_wp.toarray(), laplacian_igl.toarray(), rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parity("cotmatrix", "potpourri3d")
 @pytest.mark.parity("mass_matrix_entries", "potpourri3d")
 def test_cotmatrix_and_mass_match_potpourri3d(
@@ -996,7 +999,7 @@ def test_laplacian_entries_assemble_into_the_laplacian(
 # -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parametrize("equal_weight", [True, False])
 @pytest.mark.parity("laplacian_equal_weight", "trimesh")
 @pytest.mark.parity("laplacian_inverse_distance", "trimesh")
@@ -1050,7 +1053,7 @@ def test_laplacian_symmetric_flag(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> Non
 # -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parity("mass_matrix_entries", "igl")
 def test_mass_matrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -1075,7 +1078,7 @@ def test_mass_matrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
 # -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 @pytest.mark.parity("mass_matrix", "igl")
 def test_mass_matrix_assembled_matches_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -1105,7 +1108,7 @@ def test_mass_matrix_assembled_matches_igl(request: pytest.FixtureRequest, mesh_
 # -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _LAPLACIAN_MESHES)
 def test_operators_float64_match_float32(request: pytest.FixtureRequest, mesh_name: str) -> None:
     # Every operator exposes a ``dtype`` parameter for native float64 assembly (used by the
     # linear-system solvers). The float64 build must carry float64 values and agree with the

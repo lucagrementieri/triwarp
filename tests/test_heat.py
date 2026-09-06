@@ -54,6 +54,10 @@ from tests.conversions import (
     trimesh_to_warp,
 )
 
+# Not ``conftest.MESHES``: both predate that constant and neither has ever carried ``cave_cube``.
+_HEAT_MESHES = ["icosahedron", "hemisphere", "half_torus"]
+_HEAT_MESHES_SMALL = ["icosahedron", "hemisphere"]
+
 # --------------------------------------------------------------------------
 # heat_operators / heat_geodesic
 # --------------------------------------------------------------------------
@@ -195,7 +199,7 @@ def _heat_geodesic_igl(
     return np.asarray(igl.heat_geodesics_solve(data, sources_np))
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES_SMALL)
 @pytest.mark.parity("heat_geodesic", "igl")
 @pytest.mark.parity("heat_geodesic_conditioning", "igl")
 def test_heat_geodesic_matches_igl(
@@ -366,7 +370,7 @@ def test_heat_geodesic_empty_sources(icosahedron: tuple[object, wp.Mesh]) -> Non
     assert np.array_equal(distance.numpy(), np.zeros(int(mesh_wp.points.shape[0])))
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES_SMALL)
 def test_heat_geodesic_cpu_matches_cuda(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class A: the CPU solve is the CUDA solve. Pins the removal of the old CUDA-only guard.
@@ -391,7 +395,7 @@ def test_heat_geodesic_cpu_matches_cuda(request: pytest.FixtureRequest, mesh_nam
     assert np.allclose(distances["cpu"], distances["cuda:0"], rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES)
 @pytest.mark.parity("heat_geodesic", "potpourri3d")
 @pytest.mark.parity("heat_geodesic_conditioning", "potpourri3d")
 def test_heat_geodesic_matches_potpourri3d_plain(
@@ -446,7 +450,7 @@ def test_heat_geodesic_matches_potpourri3d_plain(
     assert error.max() < 0.05 * diameter
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES)
 @pytest.mark.parity("heat_geodesic", "pymeshlab")
 @pytest.mark.parity("heat_geodesic_conditioning", "pymeshlab")
 def test_heat_geodesic_matches_pymeshlab(
@@ -544,7 +548,7 @@ def test_heat_geodesic_is_bounded_by_the_graph_distance(
 
 
 # --- the heat method's robust path (potpourri3d use_robust=True reference) -------------
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES)
 def test_robust_heat_geodesic_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -713,7 +717,7 @@ def test_heat_signed_distance_level_set_constraint_matches_potpourri3d(
         assert on_curve_pp > 1e-3
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES_SMALL)
 @pytest.mark.parity("heat_signed_distance", "potpourri3d")
 @pytest.mark.parity("heat_signed_distance_conditioning", "potpourri3d")
 def test_heat_signed_distance_matches_potpourri3d(
@@ -763,7 +767,7 @@ def test_heat_signed_distance_matches_potpourri3d(
     assert np.abs(distance_wp - distance_pp).mean() < 0.05 * scale
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES_SMALL)
 def test_signed_distance_magnitude_is_the_unsigned_distance(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -782,7 +786,7 @@ def test_signed_distance_magnitude_is_the_unsigned_distance(
     assert np.abs(np.abs(signed) - unsigned).mean() < 0.15 * span
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES)
 def test_signed_distance_is_positive_inside_the_curve(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -1075,7 +1079,7 @@ def test_transport_on_a_flat_patch_is_constant(device: str) -> None:
 # geometry-central's direct factorization of the connection Laplacian fails ("factorization
 # failed").
 # It is covered by the disconnected-component test below instead.
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES)
 @pytest.mark.parity("transport_tangent_vectors", "potpourri3d")
 @pytest.mark.parity("vector_heat_scale", "potpourri3d")
 def test_transport_tangent_vectors_matches_potpourri3d(
@@ -1124,7 +1128,7 @@ def test_transport_tangent_vectors_matches_potpourri3d(
     assert np.median(angle) < 2.0
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES_SMALL)
 def test_transport_preserves_source_magnitudes(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -1444,7 +1448,7 @@ def test_log_map_is_invariant_to_mesh_scale(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES)
 def test_reused_operators_give_the_same_transport(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -1503,7 +1507,7 @@ def test_operators_fix_the_diffusion_time(icosahedron: tuple[object, wp.Mesh], d
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+@pytest.mark.parametrize("mesh_name", _HEAT_MESHES_SMALL)
 def test_diffuse_tangent_field_solves_its_own_system(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:

@@ -43,6 +43,9 @@ from tests.conversions import (
 from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import proximity as kernel_proximity
 
+_SIGNED_DISTANCE_MESHES = ["icosahedron", "cave_cube"]
+_SIGNED_DISTANCE_MESHES_TORUS = ["icosahedron", "cave_cube", "torus"]
+
 
 def _queries_in_bounds_np(mesh_tm: tm.Trimesh, n: int, seed: int) -> np.ndarray:
     """
@@ -1059,7 +1062,7 @@ def test_normals_at_closest_faces_empty(icosahedron: tuple[tm.Trimesh, wp.Mesh])
     assert normals_wp.shape == (0,)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES)
 def test_signed_distance_on_mesh_random(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(42)
@@ -1071,7 +1074,7 @@ def test_signed_distance_on_mesh_random(request: pytest.FixtureRequest, mesh_nam
     assert np.allclose(signed_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "torus"])
+@pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES_TORUS)
 @pytest.mark.parity("signed_distance_on_mesh", "pymeshlab")
 def test_signed_distance_on_mesh_matches_pymeshlab(
     request: pytest.FixtureRequest, mesh_name: str
@@ -1114,7 +1117,7 @@ def test_signed_distance_on_mesh_matches_pymeshlab(
     assert np.allclose(signed_wp.numpy(), signed_pml, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES)
 @pytest.mark.parity("signed_distance_on_mesh", "meshlib")
 def test_signed_distance_on_mesh_matches_meshlib(
     request: pytest.FixtureRequest, mesh_name: str
@@ -1156,7 +1159,7 @@ def test_signed_distance_on_mesh_matches_meshlib(
     assert np.allclose(distances_wp, -tm_proximity.signed_distance(mesh_tm, points_np), atol=1e-4)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "torus"])
+@pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES_TORUS)
 @pytest.mark.parity("signed_distance_on_mesh", "igl")
 def test_signed_distance_on_mesh_matches_igl(
     request: pytest.FixtureRequest, mesh_name: str
@@ -1197,7 +1200,7 @@ def test_signed_distance_on_mesh_matches_igl(
     assert np.allclose(signed_wp.numpy(), signed_igl, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "torus"])
+@pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES_TORUS)
 @pytest.mark.parity("signed_distance_on_mesh", "open3d")
 def test_signed_distance_on_mesh_matches_open3d(
     request: pytest.FixtureRequest, mesh_name: str
@@ -1230,7 +1233,7 @@ def test_signed_distance_on_mesh_matches_open3d(
     assert np.allclose(signed_wp.numpy(), signed_o3d, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "torus"])
+@pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES_TORUS)
 @pytest.mark.parity("signed_distance_on_mesh", "pyvista")
 def test_signed_distance_on_mesh_matches_pyvista(
     request: pytest.FixtureRequest, mesh_name: str
@@ -1272,7 +1275,7 @@ def test_signed_distance_on_mesh_matches_pyvista(
     assert np.allclose(signed_wp.numpy(), signed_pv, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES)
 def test_signed_distance_on_mesh_winding_matches_trimesh(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -1345,7 +1348,7 @@ def test_signed_distance_on_mesh_rejects_unknown_sign_mode(
         )
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES)
 def test_supplied_mesh_gives_the_same_answer(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -1417,7 +1420,7 @@ def test_signed_distance_on_mesh_sign_direction(icosahedron: tuple[tm.Trimesh, w
     assert (inside_signed_wp.numpy() < 0.0).all()
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES)
 def test_signed_distance_on_mesh_coplanar(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     outside_np = np.asarray([mesh_tm.bounds[0] + [100.0, 0.0, 0.0]], dtype=np.float32)
@@ -1589,7 +1592,7 @@ def test_winding_number_random(request: pytest.FixtureRequest, mesh_name: str, t
     assert np.allclose(winding_wp.numpy(), winding_igl.ravel(), rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES)
 @pytest.mark.parity("winding_number", "meshlib")
 def test_winding_number_matches_meshlib(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
