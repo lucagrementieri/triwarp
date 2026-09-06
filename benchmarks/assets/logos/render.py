@@ -1,18 +1,20 @@
 """
-Rasterize each vendored library mark in ``svg/`` to a fixed-size, square, transparent PNG.
+Rasterize each vendored library mark (``svg/`` and ``raster/``) to a fixed-size, square PNG.
 
-Run once (or after touching a source SVG or ``SIZE``):
+Run once (or after touching a source, ``raster/``, or ``SIZE``):
 
     uv run python benchmarks/assets/logos/render.py
 
 ``registry.py`` and ``plot_comparison.py`` only ever read the PNGs this writes -- neither needs
 ``cairosvg`` at chart-render time, only this script does, and only when regenerating.
 
-Every source mark under ``svg/`` is either exactly square already (the common case: a project's
-own icon-only mark, as opposed to its wordmark) or, for triwarp's own lockup, wider than it is
-tall. Rather than distort the wide ones to fit a square, this renders each at its native aspect
-ratio scaled to fit inside ``SIZE x SIZE`` and centers it on a transparent square canvas -- so
-every PNG this writes is ``SIZE x SIZE`` regardless of the source's own proportions, which is the
+Most vendored marks are SVG (a project's own icon-only mark, read from ``svg/``), but not every
+project publishes one -- MeshLab's own site links only a PNG, so ``raster/`` holds pre-rasterized
+sources for those, loaded directly with Pillow rather than through cairosvg. Both paths converge on
+the same `_fit_and_chip`: every source mark is either exactly square already or, for triwarp's own
+lockup, wider than it is tall, and rather than distort the wide ones to fit a square, this scales
+each to fit inside ``SIZE x SIZE`` at its native aspect ratio and centers it -- so every PNG this
+writes is ``SIZE x SIZE`` regardless of the source's own proportions or format, which is the
 property a chart placing these as fixed-size axis glyphs actually needs.
 
 A neutral mid-gray chip is composited *behind* every mark, baked into the PNG rather than left to
@@ -43,34 +45,55 @@ CHIP_MARGIN = 4  # px of chip visible past the mark's own bounding box, before i
 
 HERE = Path(__file__).parent
 SVG_DIR = HERE / "svg"
+RASTER_DIR = HERE / "raster"
 PNG_DIR = HERE / "png"
 
 
-def render_one(svg_path: Path, png_path: Path, size: int = SIZE) -> None:
-    """Rasterize one SVG to a `size x size` transparent PNG, on a chip, centered and fitted."""
-    # Render oversized on the long axis, then fit -- asking cairosvg for the exact output size
-    # directly would stretch a non-square source instead of letter/pillar-boxing it.
-    raw = cairosvg.svg2png(url=str(svg_path), output_width=size * 4, output_height=size * 4)
-    rendered = Image.open(io.BytesIO(raw)).convert("RGBA")
-    rendered.thumbnail((size, size), Image.LANCZOS)
+def _fit_and_chip(source: Image.Image, size: int = SIZE) -> Image.Image:
+    """Scale `source` (any size/aspect) to fit inside `size x size`, centered on a gray chip."""
+    fitted = source.convert("RGBA")
+    fitted.thumbnail((size, size), Image.LANCZOS)
 
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     chip_box = (CHIP_MARGIN, CHIP_MARGIN, size - CHIP_MARGIN, size - CHIP_MARGIN)
     ImageDraw.Draw(canvas).rounded_rectangle(chip_box, radius=size * 0.18, fill=CHIP_COLOR)
-    offset = ((size - rendered.width) // 2, (size - rendered.height) // 2)
-    canvas.paste(rendered, offset, rendered)
-    canvas.save(png_path)
+    offset = ((size - fitted.width) // 2, (size - fitted.height) // 2)
+    canvas.paste(fitted, offset, fitted)
+    return canvas
+
+
+def render_svg(svg_path: Path, png_path: Path, size: int = SIZE) -> None:
+    """Rasterize one SVG to a `size x size` PNG, on a chip, centered and fitted."""
+    # Render oversized on the long axis, then fit -- asking cairosvg for the exact output size
+    # directly would stretch a non-square source instead of letter/pillar-boxing it.
+    raw = cairosvg.svg2png(url=str(svg_path), output_width=size * 4, output_height=size * 4)
+    _fit_and_chip(Image.open(io.BytesIO(raw)), size).save(png_path)
+
+
+def render_raster(image_path: Path, png_path: Path, size: int = SIZE) -> None:
+    """Fit one pre-rasterized source (PNG/JPG) to a `size x size` PNG, on a chip."""
+    with Image.open(image_path) as source:
+        _fit_and_chip(source, size).save(png_path)
 
 
 def main() -> None:
     PNG_DIR.mkdir(parents=True, exist_ok=True)
     svg_paths = sorted(SVG_DIR.glob("*.svg"))
-    if not svg_paths:
-        raise SystemExit(f"no .svg sources found under {SVG_DIR}")
+    raster_paths = sorted(p for ext in ("*.png", "*.jpg", "*.jpeg") for p in RASTER_DIR.glob(ext))
+    if not svg_paths and not raster_paths:
+        raise SystemExit(f"no sources found under {SVG_DIR} or {RASTER_DIR}")
+    collisions = {p.stem for p in svg_paths} & {p.stem for p in raster_paths}
+    if collisions:
+        raise SystemExit(f"same stem in both svg/ and raster/, ambiguous: {sorted(collisions)}")
+
     for svg_path in svg_paths:
         png_path = PNG_DIR / f"{svg_path.stem}.png"
-        render_one(svg_path, png_path)
-        print(f"  {svg_path.name} -> {png_path.relative_to(HERE.parent.parent)}")
+        render_svg(svg_path, png_path)
+        print(f"  {svg_path.relative_to(HERE)} -> {png_path.relative_to(HERE.parent.parent)}")
+    for image_path in raster_paths:
+        png_path = PNG_DIR / f"{image_path.stem}.png"
+        render_raster(image_path, png_path)
+        print(f"  {image_path.relative_to(HERE)} -> {png_path.relative_to(HERE.parent.parent)}")
 
 
 if __name__ == "__main__":

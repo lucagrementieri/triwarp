@@ -6,22 +6,26 @@ the only place library ids are defined, so a new library added there needs one n
 missing id falls back to the id itself as the label, with no logo, rather than raising: a chart
 should degrade to a plain text bar for an unmapped library, not fail to render).
 
-Not every library has a distinct mark of its own to show. Four rows deliberately carry
+Not every library has a distinct mark of its own to show. Three rows deliberately carry
 ``logo=None``:
 
 - ``pymeshfix`` -- no distinct PyMeshFix project mark exists; its own docs reuse PyVista's logo
   (``reference/pymeshfix/doc/_static/pyvista_logo_sm.png``), which would misattribute the mark.
 - ``igl`` (libigl) -- no small icon-only mark is bound in this project's vendored ``reference/``
   copy or found on the project's own site.
-- ``pymeshlab`` -- PyMeshLab wraps MeshLab; MeshLab has a logo, but no small icon-only mark was
-  found at a stable URL in the time budget for this pass. Labelled "MeshLab" (the tool the
-  bindings wrap) rather than "PyMeshLab" for that reason -- see the caption in a chart that plots
-  it.
 - ``potpourri3d`` -- potpourri3d is geometry-central's Python binding and has no separate mark of
   its own; geometry-central likewise has none vendored or found.
 
-A library gaining a mark later is a one-line change here plus a new SVG under ``svg/`` and a
-``render.py`` re-run -- nothing in ``plot_comparison.py`` needs to change.
+``pymeshlab`` is the one row that looks like it should be in that list but isn't: PyMeshLab wraps
+MeshLab and ships no mark of its own, but MeshLab's own site (``meshlab.net/img/meshlabLogo.png``)
+does -- and using it is the right call, not a stretch, because a PyMeshLab call in this suite is
+never anything but a thin binding over the same MeshLab filters the desktop app runs. Labelled
+"MeshLab" rather than "PyMeshLab" for that reason -- see ``raster/meshlab.png``'s entry in
+``SOURCES.md``, and the caption in any chart that plots it.
+
+A library gaining a mark later is a one-line change here plus a new source under ``svg/`` (or
+``raster/``, for a project with no SVG to vendor) and a ``render.py`` re-run -- nothing in
+``plot_comparison.py`` needs to change.
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ _REGISTRY: dict[str, tuple[str | None, str]] = {
     "scipy": ("scipy.png", "SciPy"),
     "numpy": ("numpy.png", "NumPy"),
     "potpourri3d": (None, "potpourri3d"),
-    "pymeshlab": (None, "MeshLab"),
+    "pymeshlab": ("meshlab.png", "MeshLab"),
     "pyvista": ("pyvista.png", "PyVista"),
     "meshlib": ("meshlib.png", "MeshLib"),
     "pymeshfix": (None, "PyMeshFix"),
