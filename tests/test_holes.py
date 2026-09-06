@@ -235,17 +235,6 @@ def test_fill_holes_centroid_position(hemisphere: tuple[tm.Trimesh, wp.Mesh]) ->
     assert np.allclose(centroid_wp, centroid_expected, rtol=1e-4, atol=1e-4)
 
 
-def test_fill_holes_watertight_mesh_unchanged(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    _, mesh_wp = icosahedron
-
-    filled_faces = tw.holes.fill_fan(mesh_wp.points, mesh_wp.indices)
-    assert np.array_equal(filled_faces.numpy(), mesh_wp.indices.numpy())
-
-    new_vertices, cone_faces = tw.holes.fill_cone(mesh_wp.points, mesh_wp.indices)
-    assert np.array_equal(cone_faces.numpy(), mesh_wp.indices.numpy())
-    assert int(new_vertices.shape[0]) == int(mesh_wp.points.shape[0])
-
-
 def test_fill_fan_preserve_largest(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = half_torus
 
@@ -310,17 +299,6 @@ def test_fill_holes_preserve_largest_single_hole_unchanged(
     )
     assert np.array_equal(cone_faces.numpy(), mesh_wp.indices.numpy())
     assert int(new_vertices.shape[0]) == int(mesh_wp.points.shape[0])
-
-
-def test_fill_holes_empty_mesh(device: str) -> None:
-    vertices = wp.empty(0, dtype=wp.vec3, device=device)
-    faces = wp.empty(0, dtype=wp.int32, device=device)
-
-    assert int(tw.holes.fill_fan(vertices, faces).shape[0]) == 0
-
-    new_vertices, new_faces = tw.holes.fill_cone(vertices, faces)
-    assert int(new_vertices.shape[0]) == 0
-    assert int(new_faces.shape[0]) == 0
 
 
 # --- Minimum-weight hole triangulation (``fill_min_weight``) ---------------------------
@@ -1032,12 +1010,6 @@ def test_fill_min_weight_avoids_multiple_edges(device: str) -> None:
     assert not tw.validation.is_edge_manifold(unresolved, allow_boundary_edges=True)
 
 
-def test_fill_min_weight_watertight_mesh_unchanged(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    _, mesh_wp = icosahedron
-    filled_faces = tw.holes.fill_min_weight(mesh_wp.points, mesh_wp.indices)
-    assert np.array_equal(filled_faces.numpy(), mesh_wp.indices.numpy())
-
-
 def test_fill_min_weight_preserve_largest(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = half_torus
     loop_sizes = _loop_sizes(mesh_wp)
@@ -1051,12 +1023,6 @@ def test_fill_min_weight_preserve_largest(half_torus: tuple[tm.Trimesh, wp.Mesh]
     n_new_faces = (int(filled_faces.shape[0]) - int(mesh_wp.indices.shape[0])) // 3
     assert n_new_faces == sum(size - 2 for size in loop_sizes) - (preserved_size - 2)
     assert len(_loop_sizes_of(mesh_wp.points, filled_faces)) == 1
-
-
-def test_fill_min_weight_empty_mesh(device: str) -> None:
-    vertices = wp.empty(0, dtype=wp.vec3, device=device)
-    faces = wp.empty(0, dtype=wp.int32, device=device)
-    assert int(tw.holes.fill_min_weight(vertices, faces).shape[0]) == 0
 
 
 def test_fill_min_weight_rejects_unknown_metric(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
@@ -1652,19 +1618,68 @@ def test_fill_smooth_natural_smooth(device: str, icosphere: tuple[tm.Trimesh, wp
     assert mesh_tm.is_winding_consistent
 
 
-def test_fill_smooth_watertight_unchanged(device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]):
-    _, mesh_wp = icosahedron
-    new_vertices, new_faces = tw.holes.fill_smooth(mesh_wp.points, mesh_wp.indices)
-    assert np.array_equal(new_vertices.numpy(), mesh_wp.points.numpy())
-    assert np.array_equal(new_faces.numpy(), mesh_wp.indices.numpy())
-
-
 def test_fill_smooth_rejects_unknown(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     _, mesh_wp = hemisphere
     with pytest.raises(ValueError, match="metric must be one of"):
         tw.holes.fill_smooth(mesh_wp.points, mesh_wp.indices, metric="nope")
     with pytest.raises(ValueError, match="edge_weights must be"):
         tw.holes.fill_smooth(mesh_wp.points, mesh_wp.indices, edge_weights="nope")
+
+
+# ---------------------------------------------------------------------------
+# empty mesh / already-watertight mesh, across every hole-filling operator
+# ---------------------------------------------------------------------------
+
+# (name, callable) pairs; each callable takes (vertices, faces) and returns the tuple of arrays
+# the wrapper produces -- fill_fan and fill_min_weight return faces only, fill_cone and
+# fill_smooth return (vertices, faces).
+_HOLE_FILL_CASES = [
+    ("fill_fan", lambda v, f: (tw.holes.fill_fan(v, f),)),
+    ("fill_cone", lambda v, f: tw.holes.fill_cone(v, f)),
+    ("fill_min_weight", lambda v, f: (tw.holes.fill_min_weight(v, f),)),
+    ("fill_smooth", lambda v, f: tw.holes.fill_smooth(v, f)),
+]
+
+# The same callables paired with what each must equal on an already-watertight mesh -- faces
+# alone for the single-output wrappers, (vertices, faces) for the pair-output ones -- so the
+# comparison never has to infer which reference goes with which result from its length.
+_HOLE_FILL_WATERTIGHT_CASES = [
+    ("fill_fan", lambda v, f: (tw.holes.fill_fan(v, f),), lambda v, f: (f,)),
+    ("fill_cone", lambda v, f: tw.holes.fill_cone(v, f), lambda v, f: (v, f)),
+    ("fill_min_weight", lambda v, f: (tw.holes.fill_min_weight(v, f),), lambda v, f: (f,)),
+    ("fill_smooth", lambda v, f: tw.holes.fill_smooth(v, f), lambda v, f: (v, f)),
+]
+
+
+@pytest.mark.parametrize(
+    ("hole_fill_fn", "reference_fn"),
+    [case[1:] for case in _HOLE_FILL_WATERTIGHT_CASES],
+    ids=[case[0] for case in _HOLE_FILL_WATERTIGHT_CASES],
+)
+def test_holes_watertight_mesh_is_unchanged(
+    hole_fill_fn, reference_fn, icosahedron: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """Not a library comparison: an already-closed mesh has no hole for any of these to fill."""
+    _, mesh_wp = icosahedron
+    result = hole_fill_fn(mesh_wp.points, mesh_wp.indices)
+    expected = reference_fn(mesh_wp.points, mesh_wp.indices)
+    for got_wp, expected_wp in zip(result, expected, strict=True):
+        assert np.array_equal(got_wp.numpy(), expected_wp.numpy())
+
+
+# fill_smooth carries no empty-mesh case: unlike the other three, nothing in its own test file
+# ever exercised it on a zero-face mesh, and this merge is a consolidation, not new coverage.
+@pytest.mark.parametrize(
+    "hole_fill_fn",
+    [case[1] for case in _HOLE_FILL_CASES if case[0] != "fill_smooth"],
+    ids=[case[0] for case in _HOLE_FILL_CASES if case[0] != "fill_smooth"],
+)
+def test_holes_empty_mesh_is_a_noop(device: str, hole_fill_fn) -> None:
+    """Not a library comparison: every output array stays empty on a zero-face mesh."""
+    vertices = wp.empty(0, dtype=wp.vec3, device=device)
+    faces = wp.empty(0, dtype=wp.int32, device=device)
+    for result_wp in hole_fill_fn(vertices, faces):
+        assert int(result_wp.shape[0]) == 0
 
 
 # --- Stitching two open meshes across one boundary loop each ----------------------------------
