@@ -87,6 +87,22 @@ def _orientable_np(faces_np: np.ndarray) -> bool:
     return True
 
 
+def _tangled_boxes() -> tm.Trimesh:
+    """
+    Two unit boxes, one offset by (0.5, 0.5, 0.5), welded at the crossing.
+
+    The module's one transversal self-intersection fixture -- every closed conftest fixture either
+    self-intersects tangentially or not at all -- so the five tests that need a clean crossing all
+    built this identically before it was factored out here.
+    """
+    first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    second_tm = first_tm.copy()
+    second_tm.apply_translation([0.5, 0.5, 0.5])
+    tangled_tm = tm.util.concatenate([first_tm, second_tm])
+    tangled_tm.merge_vertices()
+    return tangled_tm
+
+
 def _mobius_strip(n: int) -> tuple[np.ndarray, np.ndarray]:
     """Triangulated Möbius strip (edge- and vertex-manifold, non-orientable)."""
     theta = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
@@ -639,11 +655,7 @@ def test_face_self_intersecting_mask_two_boxes_matches_meshlib(device: str) -> N
     the only input in the module where two triangles cross cleanly through each other's interior
     and both libraries have to say so. Both flag the same 12 of 24 faces.
     """
-    first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    second_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    second_tm.apply_translation([0.5, 0.5, 0.5])
-    tangled_tm = tm.util.concatenate([first_tm, second_tm])
-    tangled_tm.merge_vertices()
+    tangled_tm = _tangled_boxes()
 
     vertices_wp, faces_wp = numpy_to_warp(tangled_tm.vertices, tangled_tm.faces, device)
     mask_wp = tw.validation.face_self_intersecting_mask(vertices_wp, faces_wp)
@@ -698,11 +710,7 @@ def test_face_self_intersecting_mask_matches_open3d_and_pymeshlab(device: str, k
     returned nothing would fail rather than agree.
     """
     if kind == "boxes":
-        first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-        second_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-        second_tm.apply_translation([0.5, 0.5, 0.5])
-        mesh_tm = tm.util.concatenate([first_tm, second_tm])
-        mesh_tm.merge_vertices()
+        mesh_tm = _tangled_boxes()
         n_expected = 12
     elif kind == "spheres":
         first_tm = tm.creation.icosphere(subdivisions=2)
@@ -777,11 +785,7 @@ def test_face_self_intersecting_mask_matches_pymeshfix(device: str, kind: str) -
     default, so a future wheel that starts honouring either one fails here instead of drifting.
     """
     if kind == "boxes":
-        first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-        second_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-        second_tm.apply_translation([0.5, 0.5, 0.5])
-        mesh_tm = tm.util.concatenate([first_tm, second_tm])
-        mesh_tm.merge_vertices()
+        mesh_tm = _tangled_boxes()
         n_expected = 12
     elif kind == "spheres":
         first_tm = tm.creation.icosphere(subdivisions=2)
@@ -1171,11 +1175,7 @@ def test_is_watertight_rejects_self_intersection_like_open3d(device: str) -> Non
     neither may triwarp -- this is the only case in the module that separates the two definitions,
     and without it the parametrized test above would be satisfied by an edge-manifold check alone.
     """
-    first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    second_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    second_tm.apply_translation([0.5, 0.5, 0.5])
-    tangled_tm = tm.util.concatenate([first_tm, second_tm])
-    tangled_tm.merge_vertices()
+    tangled_tm = _tangled_boxes()
 
     vertices_wp = points_to_warp(tangled_tm.vertices, device)
     faces_wp = wp.array(
@@ -1255,11 +1255,7 @@ def test_is_watertight_closedness_clause_matches_meshlib(
     assert tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices) == closed_ml
     assert tw.validation.is_edge_manifold(mesh_wp.indices, allow_boundary_edges=False) == closed_ml
 
-    first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    second_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    second_tm.apply_translation([0.5, 0.5, 0.5])
-    tangled_tm = tm.util.concatenate([first_tm, second_tm])
-    tangled_tm.merge_vertices()
+    tangled_tm = _tangled_boxes()
     vertices_wp, faces_wp = numpy_to_warp(tangled_tm.vertices, tangled_tm.faces, mesh_wp.device)
     # The clause MeshLib does not carry: closed, and still not watertight under Open3D's definition.
     assert trimesh_to_meshlib(tangled_tm).topology.isClosed() is True
