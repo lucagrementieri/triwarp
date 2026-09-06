@@ -1216,7 +1216,7 @@ def extend_hole(
 
     Raises
     ------
-    ValueError
+    TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
 
     !!! note "The rim may cross the plane"
@@ -1291,7 +1291,7 @@ def build_bottom(
 
     Raises
     ------
-    ValueError
+    TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
 
     See Also
@@ -1342,8 +1342,7 @@ def _packed_rims(
         loops = tw.boundary.boundary_loops(vertices, faces)
     loops = list(loops)
     for loop in loops:
-        if len(loop.shape) != 1 or loop.dtype is not wp.int32:
-            raise ValueError("every loop must be a rank-1 wp.int32 array of vertex indices")
+        twt.ensure_ndim(loop, 1, dtype=wp.int32)
     if not loops or all(int(loop.shape[0]) == 0 for loop in loops):
         return None
     return _pack_loops(loops)
@@ -1452,7 +1451,7 @@ def fillable_loop_mask(
 
     Raises
     ------
-    ValueError
+    TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
 
     See Also
@@ -1469,8 +1468,7 @@ def fillable_loop_mask(
         loops = tw.boundary.boundary_loops(vertices, faces)
     loops = list(loops)
     for loop in loops:
-        if len(loop.shape) != 1 or loop.dtype is not wp.int32:
-            raise ValueError("every loop must be a rank-1 wp.int32 array of vertex indices")
+        twt.ensure_ndim(loop, 1, dtype=wp.int32)
     if not loops:
         return wp.empty(0, dtype=wp.bool, device=device)
 

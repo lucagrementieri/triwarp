@@ -34,6 +34,7 @@ from collections.abc import Sequence
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
 from triwarp._device import read_scalar
 from triwarp.halfedge import halfedge_twins, vertex_one_rings
 from triwarp.kernels import array as kernel_array
@@ -491,7 +492,7 @@ def shorten_loop(
 
     Raises
     ------
-    ValueError
+    TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
 
     See Also
@@ -506,8 +507,7 @@ def shorten_loop(
     device = faces.device
     loops = list(loops)
     for loop in loops:
-        if len(loop.shape) != 1 or loop.dtype is not wp.int32:
-            raise ValueError("every loop must be a rank-1 wp.int32 array of vertex indices")
+        twt.ensure_ndim(loop, 1, dtype=wp.int32)
     if not loops or int(faces.shape[0]) == 0 or max_iter <= 0:
         return loops, 0
 

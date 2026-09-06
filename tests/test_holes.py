@@ -2309,7 +2309,7 @@ def test_extend_hole_then_fill_is_watertight(hemisphere: tuple[tm.Trimesh, wp.Me
     )
     assert np.array_equal(same_faces_wp.numpy(), faces_wp.numpy())
     assert np.array_equal(same_vertices_wp.numpy(), vertices_wp.numpy())
-    with pytest.raises(ValueError, match=r"rank-1 wp\.int32"):
+    with pytest.raises(TypeError, match=r"expected dtype"):
         tw.holes.extend_hole(
             vertices_wp,
             faces_wp,

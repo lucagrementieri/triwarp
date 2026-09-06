@@ -861,8 +861,13 @@ def test_loop_measures_empty(device: str) -> None:
     assert tw.boundary.loop_directed_areas(vertices_wp, []).shape == (0,)
     empty_loop_wp = wp.empty(0, dtype=wp.int32, device=device)
     assert tw.boundary.loop_perimeters(vertices_wp, [empty_loop_wp]).shape == (0,)
-    with pytest.raises(ValueError, match=r"rank-1 wp\.int32"):
+    # Both halves of the loop guard, which is ``twt.ensure_ndim`` at one call rather than the
+    # hand-written rank-and-dtype test it replaced. Only the dtype half was ever reached before, so
+    # the rank half is here to pin that the single call still covers what the two-clause ``if`` did.
+    with pytest.raises(TypeError, match=r"expected dtype"):
         tw.boundary.loop_perimeters(vertices_wp, [wp.zeros(3, dtype=wp.float32, device=device)])
+    with pytest.raises(TypeError, match=r"expected 1D array"):
+        tw.boundary.loop_perimeters(vertices_wp, [wp.zeros((3, 2), dtype=wp.int32, device=device)])
 
 
 def _boundary_indices_tm(mesh_tm: tm.Trimesh) -> np.ndarray:

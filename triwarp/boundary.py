@@ -430,7 +430,7 @@ def loop_perimeters(
 
     Raises
     ------
-    ValueError
+    TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
 
     See Also
@@ -442,7 +442,7 @@ def loop_perimeters(
     [`polyline_length`][triwarp.polyline.polyline_length]
         The single-loop form, over positions rather than indices.
     """
-    packed = _pack_loop_segments(vertices, loops, caller="loop_perimeters")
+    packed = _pack_loop_segments(vertices, loops)
     if packed is None:
         return wp.empty(0, dtype=wp.float32, device=vertices.device)
     flat_loops, loop_id, starts, sizes, n_loops = packed
@@ -547,7 +547,7 @@ def loop_directed_areas(
 
     Raises
     ------
-    ValueError
+    TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
 
     See Also
@@ -557,7 +557,7 @@ def loop_directed_areas(
     [`polyline_normal`][triwarp.polyline.polyline_normal]
         The single-loop direction, normalized and over positions.
     """
-    packed = _pack_loop_segments(vertices, loops, caller="loop_directed_areas")
+    packed = _pack_loop_segments(vertices, loops)
     if packed is None:
         return wp.empty(0, dtype=wp.vec3, device=vertices.device)
     flat_loops, loop_id, starts, sizes, n_loops = packed
@@ -696,7 +696,7 @@ def _loop_owner_labels(
 
 
 def _pack_loop_segments(
-    vertices: wp.array[wp.vec3], loops: Sequence[wp.array[wp.int32]], *, caller: str
+    vertices: wp.array[wp.vec3], loops: Sequence[wp.array[wp.int32]]
 ) -> (
     tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32], int]
     | None
@@ -720,8 +720,7 @@ def _pack_loop_segments(
     device = vertices.device
     loops = list(loops)
     for loop in loops:
-        if len(loop.shape) != 1 or loop.dtype is not wp.int32:
-            raise ValueError(f"{caller}: every loop must be a rank-1 wp.int32 array")
+        twt.ensure_ndim(loop, 1, dtype=wp.int32)
     if not loops or all(int(loop.shape[0]) == 0 for loop in loops):
         return None
     # ``copy=False``: nothing below writes into ``flat_loops``, and a caller's loops usually

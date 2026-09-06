@@ -782,7 +782,7 @@ def test_shorten_loop_is_idempotent_and_handles_edge_cases(
     kept_wp, _ = tw.geodesic_walk.shorten_loop(mesh_wp.points, mesh_wp.indices, [stub_wp])
     assert np.array_equal(kept_wp[0].numpy(), [0, 1])
 
-    with pytest.raises(ValueError, match=r"rank-1 wp\.int32"):
+    with pytest.raises(TypeError, match=r"expected dtype"):
         tw.geodesic_walk.shorten_loop(
             mesh_wp.points,
             mesh_wp.indices,
