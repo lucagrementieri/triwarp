@@ -17,6 +17,7 @@ from triwarp.kernels.array import wrap_index as _wrap
 from triwarp.kernels.predicates import (
     circumcircle_diameter,
     dihedral_angle,
+    project_out_normal,
     side_lengths,
     triangle_aspect_ratio,
     triangle_double_area,
@@ -1017,16 +1018,18 @@ def project_loop_to_plane(
     # rim is bridged to, so the extension is exactly the ruled surface between the two. The origin
     # is per loop rather than global because a bottom plane is fitted to each rim separately.
     #
-    # Written out rather than as ``origin + project_out_normal(point - origin, plane_normal)``,
-    # which is the same projection algebraically and **not** the same float32 arithmetic: routing
-    # through the shared predicate subtracts ``origin`` and adds it back, and the two forms diverge
-    # by up to 4.8e-07 / 1.2e-04 / 9.8e-04 as the plane origin sits at 1 / 1e3 / 1e5 from the model
-    # origin (20 000 random planes each). Off-plane residual is a wash, so it buys no accuracy
-    # either -- only a cancellation the direct form does not have, plus one more subtract.
+    # The shared predicate takes the offset from the origin and returns it, so the origin is
+    # subtracted and added back -- one more subtract than writing the projection out, and a
+    # cancellation the direct form does not have. Not bit-identical to it, and deliberately so: the
+    # disagreement is **3.0e-08 relative** on the extension's own output and stays there whatever
+    # the model's scale or distance from the origin (probed at unit scale, at 1e3 and 1e5 away, and
+    # at scale 100), i.e. it sits at float32 epsilon rather than growing. Face buffers are
+    # unchanged, so nothing topological turns on it, and the off-plane residual is a wash between
+    # the two forms -- neither is the more accurate one.
     i = wp.int32(wp.tid())
     point = vertices[loop_vertices[i]]
     origin = plane_origins[loop_id[i]]
-    out_positions[i] = point - plane_normal * wp.dot(point - origin, plane_normal)
+    out_positions[i] = origin + project_out_normal(point - origin, plane_normal)
 
 
 @wp.kernel
