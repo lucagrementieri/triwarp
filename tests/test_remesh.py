@@ -1564,22 +1564,6 @@ def test_flip_to_delaunay_region_gated(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     assert np.array_equal(faces_before[~region_np], faces_after[~region_np])
 
 
-def test_flip_to_delaunay_rejects_a_mismatched_region(device: str) -> None:
-    """
-    Not a library comparison: the documented ``ValueError`` on a wrong-length ``region``.
-
-    It comes from ``_flip_setup``, shared with ``flip_by_objective`` -- whose own
-    ``test_flip_by_objective_invalid`` has always covered it from that side. This one was
-    undocumented and untested until the ``Raises`` block was added, which is the asymmetry worth
-    pinning: one guard, two entry points, and only one of them said so.
-    """
-    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
-    with pytest.raises(ValueError, match="region must have length"):
-        tw.remesh.flip_to_delaunay(
-            vertices_wp, faces_wp, region=wp.zeros(2, dtype=wp.bool, device=device)
-        )
-
-
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "cave_cube"])
 def test_flip_topology_matches_the_composed_adjacency(
     mesh_name: str, request: pytest.FixtureRequest
@@ -1801,6 +1785,12 @@ def test_flip_by_objective_region_gated(device: str) -> None:
 
 
 def test_flip_by_objective_invalid(device: str) -> None:
+    """
+    Not the mismatched-``region`` guard.
+
+    That guard is shared with the other two remesh operators and covered once, for all three, by
+    ``test_remesh_rejects_a_mismatched_region``.
+    """
     _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
     with pytest.raises(ValueError, match="objective must be"):
         tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="delaunay")  # type: ignore[arg-type]
@@ -1808,10 +1798,6 @@ def test_flip_by_objective_invalid(device: str) -> None:
         tw.remesh.flip_by_objective(vertices_wp, faces_wp, metric="aspect_ratio")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="planar_angle must be in"):
         tw.remesh.flip_by_objective(vertices_wp, faces_wp, planar_angle=200.0)
-    with pytest.raises(ValueError, match="region must have length"):
-        tw.remesh.flip_by_objective(
-            vertices_wp, faces_wp, region=wp.zeros(2, dtype=wp.bool, device=device)
-        )
 
 
 # --- intrinsic_delaunay ---------------------------------------------------------------
@@ -3248,14 +3234,30 @@ def test_remesh_empty_mesh_is_a_noop(device: str, remesh_fn) -> None:
         assert int(result_wp.shape[0]) == 0
 
 
-def test_refine_region_to_density_rejects_a_mismatched_region(
-    hemisphere: tuple[tm.Trimesh, wp.Mesh],
-) -> None:
-    """The documented ``ValueError`` on a region whose length is not the face count."""
-    vertices_wp, faces_wp, region_wp = _filled_hemisphere(hemisphere)
-    short_wp = wp.zeros(int(region_wp.shape[0]) - 1, dtype=wp.bool, device=region_wp.device)
+# (name, callable) pairs; each callable takes (vertices, faces, region) and calls the operator
+# with that region. flip_to_delaunay and flip_by_objective share the guard via _flip_setup;
+# refine_region_to_density has its own but raises the identical message -- verified directly
+# against all three on the same icosphere(1) + 2-element region before merging.
+_REMESH_REJECTS_MISMATCHED_REGION_CASES = [
+    ("flip_to_delaunay", lambda v, f, r: tw.remesh.flip_to_delaunay(v, f, region=r)),
+    ("flip_by_objective", lambda v, f, r: tw.remesh.flip_by_objective(v, f, region=r)),
+    (
+        "refine_region_to_density",
+        lambda v, f, r: tw.remesh.refine_region_to_density(v, f, region=r),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "remesh_fn",
+    [case[1] for case in _REMESH_REJECTS_MISMATCHED_REGION_CASES],
+    ids=[case[0] for case in _REMESH_REJECTS_MISMATCHED_REGION_CASES],
+)
+def test_remesh_rejects_a_mismatched_region(device: str, remesh_fn) -> None:
+    """Not a library comparison: the documented ``ValueError`` on a wrong-length ``region``."""
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
     with pytest.raises(ValueError, match="region must have length"):
-        tw.remesh.refine_region_to_density(vertices_wp, faces_wp, short_wp)
+        remesh_fn(vertices_wp, faces_wp, wp.zeros(2, dtype=wp.bool, device=device))
 
 
 @pytest.mark.parametrize(
