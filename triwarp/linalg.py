@@ -475,6 +475,14 @@ def solve_spd(
         rhs,
         solution,
         tol=tol,
+        # ``atol=0.0`` rather than omitted: ``warp.optim.linear``'s own tolerance resolution sets
+        # ``atol := tol`` whenever ``atol`` is left ``None``, silently turning this "relative
+        # residual tolerance" into an *absolute* floor of the same numeric value -- a right-hand
+        # side whose own norm falls below ``tol`` then "converges" at the untouched initial guess
+        # in zero iterations, which looks like a correct answer rather than a failure (CLAUDE.md
+        # section 12.7). ``_BatchedCg`` / ``_BlockCg2`` below already pass an explicit zero for the
+        # same reason.
+        atol=0.0,
         maxiter=iteration_cap,
         M=wpl.preconditioner(matrix, "diag") if preconditioner is None else preconditioner,
         check_every=_supported_check_every(check_every),
@@ -797,6 +805,9 @@ def _cg_columns(
         rhs.flatten(),
         solution.flatten(),
         tol=tol,
+        # See the identical comment in solve_spd (CLAUDE.md section 12.7): an omitted atol here
+        # silently becomes atol := tol, an absolute floor of the "relative" tolerance value.
+        atol=0.0,
         maxiter=iteration_cap,
         M=apply_inverse,
         check_every=_supported_check_every(check_every),

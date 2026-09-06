@@ -716,8 +716,18 @@ def _poisson_solve_level(
 
     operator = _screened_operator(weights, screen, res, n_nodes, device)
     preconditioner = _diagonal_operator(inv_diag, n_nodes, device)
+    # atol=0.0, not omitted: warp.optim.linear.cg silently sets atol := tol when atol is left
+    # None, turning solver_tolerance into an absolute floor rather than a relative one -- a
+    # right-hand side smaller than it "converges" at the untouched initial guess in zero
+    # iterations (CLAUDE.md section 12.7).
     wpl.cg(
-        operator, rhs, initial, tol=solver_tolerance, maxiter=solver_iterations, M=preconditioner
+        operator,
+        rhs,
+        initial,
+        tol=solver_tolerance,
+        atol=0.0,
+        maxiter=solver_iterations,
+        M=preconditioner,
     )
     return initial
 
@@ -909,11 +919,14 @@ def _screened_poisson_adaptive(
         )
 
         solution = wp.zeros_like(rhs)
+        # atol=0.0: see the identical comment at this function's other wpl.cg call, above
+        # (CLAUDE.md section 12.7).
         wpl.cg(
             matrix,
             rhs,
             solution,
             tol=solver_tolerance,
+            atol=0.0,
             maxiter=solver_iterations,
             M=wpl.preconditioner(matrix, "diag"),
         )

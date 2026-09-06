@@ -3403,7 +3403,7 @@ The `nnz`-is-a-capacity rule and its consequences are §3.7. Three further behav
   `phi` bit-exact zero at every vertex once its right-hand side's norm drops under ~1e-8, which on
   a 162-vertex icosphere happens between mesh coordinate scale 1e-8 and 5e-9 — this is what made
   `log_map` collapse *completely* (radius included, not merely the angle §16's own log_map finding
-  fixed) at extreme mesh scale, and it is a different, unfixed mechanism from that one.
+  fixed) at extreme mesh scale — a different mechanism from that one, fixed separately below.
   **Triwarp's own `_BatchedCg` / `_BlockCg2` (`linalg.py`, the multi-column CG paths) do not have
   this defect**: both compute their stopping threshold via
   `kernels/algorithms/conjugate_gradient.py::cg_absolute_tolerance` with an **explicit**
@@ -3411,14 +3411,26 @@ The `nnz`-is-a-capacity rule and its consequences are §3.7. Three further behav
   entirely — the omission is specific to the two places `linalg.py` calls `wpl.cg` directly, plus
   `reconstruction.py`'s two independent direct calls.
 
-  **Not fixed as of this writing.** `CG_TOLERANCE = 1e-10` (`linalg.py`) and `_CG_TOLERANCE = 1e-8`
-  (`heat.py`) are both squarely in the range a small-magnitude right-hand side can cross, and
-  `screened_poisson`'s public `solver_tolerance` defaults to `1e-6` on a `float32` system — but the
-  blast radius beyond `heat.log_map`/`heat_geodesic` was not measured. Landing the one-keyword fix
-  at all four sites changes iteration counts wherever it actually fires, which is a real behavior
-  change (§9) needing the benchmark suite re-run alongside the correctness suite, not a pure
-  bugfix with no observable cost difference — decline pending that measurement, not because the
-  diagnosis is in doubt.
+  **FIXED**: all four sites now pass `atol=0.0` explicitly alongside `tol=`. `CG_TOLERANCE = 1e-10`
+  (`linalg.py`) and `_CG_TOLERANCE = 1e-8` (`heat.py`) were both squarely in the range a
+  small-magnitude right-hand side can cross, and `screened_poisson`'s public `solver_tolerance`
+  defaults to `1e-6` on a `float32` system.
+
+  **Measured to be free at ordinary mesh scale, both by iteration count and by benchmark.**
+  Iteration counts are bit-identical before and after on two ordinary meshes (icosphere at
+  subdivisions 2 and 3: `20` and `30` heat-solve iterations either way, same residual to the digit,
+  `heat_geodesic`'s output unchanged), confirmed via a proper baseline comparison (a detached
+  worktree at the pre-fix commit, `sys.meta_path` stripped of the editable-install finder and the
+  worktree path prepended — the naive `cd`-into-worktree-and-run-a-script approach silently
+  re-imports the *main* tree's installed package instead, because a script's own directory, not the
+  caller's `cwd`, is what lands in `sys.path[0]`). The benchmark groups that reach the fixed
+  `solve_spd` path directly (`heat_geodesic_conditioning`, `log_map`, both go through
+  `heat.heat_geodesic`) show **1.04-1.07x** on the `saddle` / `saddle_graded` fixtures — inside this
+  package's own documented ±10% cross-session drift (§9), not a real regression; `solve_spd_columns`
+  (`_N_RHS = 2`, so it reaches `_BlockCg2`, a path this fix does not touch at all) is flat at
+  0.999-1.023x, the expected negative control. `screened_poisson`'s benchmark rows could not be
+  run from the detached worktree (its scan meshes are not tracked by git) and were not re-measured;
+  the fix there is the identical one-line change as the other three sites.
 
 ### 12.8 Warp builtins: adoption verdicts
 
