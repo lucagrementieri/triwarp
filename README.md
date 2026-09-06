@@ -7,12 +7,14 @@
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://pypi.org/project/triwarp/)
 [![Docs](https://img.shields.io/badge/docs-lucagrementieri.github.io%2Ftriwarp-blue)](https://lucagrementieri.github.io/triwarp/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
+[![Status](https://img.shields.io/badge/status-alpha-orange)](#status)
 
-**triwarp** is a GPU-first triangular mesh processing library built on
-[NVIDIA Warp](https://github.com/NVIDIA/warp). It provides mesh geometry, connectivity,
-queries, editing, and solvers as plain array-in / array-out functions backed by Warp kernels,
-with a [trimesh](https://trimesh.org)-inspired API. Every function runs on CUDA when a GPU is
-available and falls back to CPU otherwise — same code, same results.
+**triwarp puts mesh processing on the GPU.** Geometry, topology, repair, remeshing, spatial
+queries, discrete differential operators, geodesics, point-cloud reconstruction, and
+registration — as plain array-in / array-out functions backed by
+[NVIDIA Warp](https://github.com/NVIDIA/warp) kernels, with a
+[trimesh](https://trimesh.org)-inspired API. Every function runs on CUDA when a GPU is available
+and falls back to CPU otherwise — same code, same results.
 
 ## Highlights
 
@@ -30,6 +32,19 @@ available and falls back to CPU otherwise — same code, same results.
   <https://lucagrementieri.github.io/triwarp/>, and validated function-by-function against the
   established CPU geometry-processing libraries (see below).
 
+## Learn more
+
+- **[Getting started](https://lucagrementieri.github.io/triwarp/getting-started/)** — install, the
+  mental model, and a first repair-then-remesh pipeline.
+- **[Cookbook](https://lucagrementieri.github.io/triwarp/cookbook/)** — task-oriented recipes:
+  cleaning a scan, point clouds to watertight surfaces, geodesic distance fields, aligning two
+  scans.
+- **[Migrating from another library](https://lucagrementieri.github.io/triwarp/migrating-from/)**
+  — already know trimesh, libigl, Open3D, MeshLab, potpourri3d, or PyTorch3D? Start here for a
+  function-by-function map.
+- **[Performance](https://lucagrementieri.github.io/triwarp/performance/)** — why the GPU path is
+  fast, and how to check any speed claim yourself.
+
 ## One GPU library instead of six
 
 Mesh processing in Python has long meant stitching together several excellent — but mostly
@@ -39,9 +54,9 @@ from each of them behind a single GPU-accelerated API:
 | Replaces | For | In triwarp |
 |---|---|---|
 | [trimesh](https://github.com/mikedh/trimesh) | Mesh bookkeeping: edges, adjacency, boundary, validation, primitives, sampling, proximity | `edges`, `adjacency`, `boundary`, `validation`, `creation`, `sample`, `proximity`, the `Trimesh` class |
-| [libigl](https://libigl.github.io/) ([Python bindings](https://github.com/libigl/libigl-python-bindings)) | Discrete differential geometry: cotangent Laplacians, mass matrices, curvature, parametrization, exact/heat geodesics | `laplacian`, `energies`, `curvature`, `parametrization`, `heat.distance` |
+| [libigl](https://libigl.github.io/) ([Python bindings](https://github.com/libigl/libigl-python-bindings)) | Discrete differential geometry: cotangent Laplacians, mass matrices, curvature, parametrization, exact/heat geodesics | `laplacian`, `energies`, `curvature`, `parametrization`, `heat` |
 | [Open3D](https://www.open3d.org/) | Point clouds, registration, and surface reconstruction: ICP, screened Poisson, ball pivoting | `points`, `registration`, `reconstruction` |
-| [potpourri3d](https://github.com/nmwsharp/potpourri3d) (geometry-central) | The heat-method family: vector heat, parallel transport, log maps, signed distance, tangent frames | `heat.vector`, `heat.signed`, `tangent_space` |
+| [potpourri3d](https://github.com/nmwsharp/potpourri3d) (geometry-central) | The heat-method family: vector heat, parallel transport, log maps, signed distance, tangent frames | `heat`, `tangent_space` |
 | [MeshLab](https://www.meshlab.net/) ([PyMeshLab](https://github.com/cnr-isti-vislab/PyMeshLab)) | Mesh editing filters: isotropic remeshing, decimation, smoothing, hole filling, uniform resampling | `remesh`, `smoothing`, `holes`, `repair` |
 | [PyTorch3D](https://pytorch3d.org/) | Batched neighbour and Chamfer primitives, and the mesh regularization losses | `metrics`, `neighbors`, `registration`, `energies` |
 
@@ -64,9 +79,9 @@ or with `pip`:
 pip install triwarp
 ```
 
-Requires Python ≥ 3.11 and `warp-lang` ≥ 1.16. A CUDA-capable GPU is recommended but not
-required. Mesh file I/O via [meshio](https://github.com/nschloe/meshio) is an optional extra:
-`pip install triwarp[io]`.
+Requires Python ≥ 3.11 and `warp-lang` ≥ 1.17. A CUDA-capable GPU is recommended but not
+required — every function also runs on Warp's CPU backend. Mesh file I/O via
+[meshio](https://github.com/nschloe/meshio) is an optional extra: `pip install triwarp[io]`.
 
 ## Quickstart
 
@@ -96,7 +111,7 @@ vertices, faces = tw.creation.icosphere(subdivisions=4)
 
 # Geodesic distance from vertex 0 via the heat method (two sparse CG solves, on-device).
 sources = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=vertices.device)
-distance = tw.heat.distance.heat_geodesic(vertices, faces, sources)
+distance = tw.heat.heat_geodesic(vertices, faces, sources)
 
 # Uniform, area-weighted surface sampling.
 points, face_ids = tw.sample.sample_surface(vertices, faces, 10_000, seed=0)
@@ -109,24 +124,27 @@ remeshed_vertices, remeshed_faces = tw.remesh.isotropic_remesh(
 
 Interop with NumPy is a `wp.array(...)` / `.numpy()` pair away, and
 `tw.mesh.Trimesh.from_warp_mesh` / `mesh.warp_mesh` bridge to Warp's own `wp.Mesh` BVH for ray
-and proximity queries.
+and proximity queries. For a pipeline that starts from a realistically messy input — a hole to
+close, stray debris to drop — see the
+[Cookbook](https://lucagrementieri.github.io/triwarp/cookbook/).
 
 ## What's inside
 
 | Area | Modules | Highlights |
 |---|---|---|
 | **Primitives** | `creation` | Boxes, spheres, platonic solids, capsules, tori; extrusion, revolution, sweeps, 2D polygon triangulation |
-| **Structure & topology** | `mesh`, `vertices`, `edges`, `triangles`, `boundary`, `adjacency`, `halfedge`, `tangent_space`, `homology`, `validation`, `totals`, `selection` | Edge/face adjacency, half-edge structure, boundary loops, manifold/watertight/orientability predicates, submesh selection |
-| **Editing & repair** | `repair`, `holes`, `combine`, `remesh`, `smoothing`, `seams` | Hole filling, winding repair, isotropic remeshing, quadric and clustering decimation, Loop and midpoint subdivision, Laplacian/Taubin smoothing, seam cutting |
-| **Queries & measures** | `proximity`, `neighbors`, `bounds`, `voxels`, `ray`, `distance`, `intersection`, `curvature`, `convex`, `visibility` | Closest point, signed distance, winding number, ray casting, BVH and hash-grid neighbor queries, chamfer distance (differentiable via `wp.Tape`), curvature measures, convex hulls, ambient occlusion |
-| **Operators & fields** | `laplacian`, `energies`, `linalg`, `interpolation`, `parametrization` | Cotangent Laplacian, mass matrices, discrete energies, sparse conjugate-gradient solvers, harmonic and LSCM parametrization |
-| **Geodesics & heat methods** | `geodesic_walk`, `heat.distance`, `heat.vector`, `heat.signed` | Surface walks, heat-method geodesic distance, vector heat / parallel transport / log maps, signed heat method |
-| **Point clouds & registration** | `points`, `sample`, `reconstruction`, `registration` | Poisson-disk and blue-noise sampling, screened Poisson reconstruction, ball pivoting, marching cubes, Delaunay triangulation, Procrustes and ICP (point-to-point, point-to-plane) |
+| **Structure & topology** | `mesh`, `vertices`, `edges`, `triangles`, `halfedge`, `adjacency`, `boundary`, `selection`, `validation`, `homology`, `tangent_space` | Edge/face adjacency, half-edge structure, boundary loops, manifold/watertight/orientability predicates, submesh selection, homology generators, tangent frames |
+| **Measures & shape descriptors** | `measures`, `curvature`, `bounds`, `visibility` | Volume, centroid, and inertia integrals; discrete mean/Gaussian curvature and principal directions; axis-aligned and oriented bounding boxes; ambient occlusion, shape diameter, thickness |
+| **Editing & repair** | `transform`, `repair`, `holes`, `combine`, `remesh`, `smoothing`, `seams`, `levelset` | Rigid transforms, hole filling, winding repair, isotropic remeshing, quadric and clustering decimation, Loop and midpoint subdivision, Laplacian/Taubin smoothing, seam cutting, level-set offsets and marching cubes |
+| **Spatial queries** | `proximity`, `ray`, `neighbors`, `intersection`, `metrics` | Closest point, signed distance, winding number, ray casting, BVH and hash-grid neighbor queries, triangle-triangle intersection, chamfer and Hausdorff distance (differentiable via `wp.Tape`) |
+| **Point clouds, voxels & reconstruction** | `points`, `sample`, `voxels`, `reconstruction`, `registration` | Poisson-disk and blue-noise sampling, farthest-point and voxel down-sampling, screened Poisson reconstruction, ball pivoting, marching cubes, Delaunay triangulation, Procrustes and ICP (point-to-point, point-to-plane) |
+| **Operators & solvers** | `laplacian`, `energies`, `linalg`, `interpolation`, `parametrization` | Cotangent Laplacian, mass matrices, discrete energies, sparse conjugate-gradient solvers (Jacobi and multigrid-preconditioned), harmonic, LSCM, and ARAP parametrization |
+| **Geodesics & heat methods** | `geodesic_walk`, `heat` | Direct combinatorial surface walks, heat-method geodesic distance, vector heat / parallel transport / log maps, signed heat method |
 | **Curves** | `polyline` | Polyline resampling, simplification, and measures |
 | **Attributes & I/O** | `texture`, `io` | Per-vertex/face attribute handling, meshio-backed mesh loading |
-| **Arrays & infrastructure** | `array`, `reduce`, `grouping`, `graph`, `typing`, `constants` | GPU sort/scan/unique/group primitives, reductions, typed array aliases |
+| **Arrays & infrastructure** | `array`, `reduce`, `grouping`, `graph`, `typing`, `constants` | GPU sort/scan/unique/group primitives, reductions, graph algorithms (BFS, connected components), typed array aliases |
 
-The full API reference, generated per module, lives at
+50 public modules in total — the full API reference, generated per module, lives at
 <https://lucagrementieri.github.io/triwarp/>.
 
 ## Design
@@ -142,6 +160,20 @@ The full API reference, generated per module, lives at
 - **Measured, not assumed.** Every public module has both a test file and a benchmark file;
   performance work lands only with a before/after measurement, and correctness is asserted on
   values, never just shapes.
+
+## Status
+
+triwarp is pre-1.0 (`0.x`): the test suite is extensive (nearly 2,000 tests, a nine-library parity
+gate) and the library is safe to build on, but a public signature may still shift a positional
+argument to a keyword or gain a required parameter between minor versions until 1.0.
+
+**Known limitation:**
+[`reconstruction.ball_pivoting`](https://lucagrementieri.github.io/triwarp/api/reconstruction/)
+intermittently raises a CUDA `700` ("illegal memory access") when reconstructing several different
+point clouds back to back in one long-running process — pre-existing on each cloud in isolation,
+and traced to CUDA's async memory pool reusing a block while a kernel is still reading it, not to
+a bug in the reconstruction itself. Workaround until it's resolved upstream:
+`wp.set_mempool_enabled(wp.get_device("cuda:0"), False)` around the call.
 
 ## Development
 
@@ -168,6 +200,20 @@ CUDA kernels of its own, so it is also the suite's only GPU-against-GPU comparis
 - **Source:** <https://github.com/lucagrementieri/triwarp>
 - **Issues:** <https://github.com/lucagrementieri/triwarp/issues>
 - **NVIDIA Warp:** <https://nvidia.github.io/warp/>
+
+## Citation
+
+If triwarp is useful in your research, please cite it:
+
+```bibtex
+@software{grementieri_triwarp,
+  author  = {Grementieri, Luca},
+  title   = {{triwarp}: GPU-accelerated triangular mesh processing on NVIDIA Warp},
+  year    = {2026},
+  url     = {https://github.com/lucagrementieri/triwarp},
+  version = {0.1.0}
+}
+```
 
 ## License
 
