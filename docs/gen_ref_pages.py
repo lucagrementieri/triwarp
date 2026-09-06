@@ -142,6 +142,7 @@ GUIDE_PAGES: list[tuple[str, str] | tuple[str, str, list[tuple[str, str]]]] = [
         ],
     ),
     ("Performance", "performance.md"),
+    ("Benchmarks", "benchmarks.md"),
 ]
 
 with mkdocs_gen_files.open("SUMMARY.md", "w") as nav_file:

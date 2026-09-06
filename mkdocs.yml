@@ -4,6 +4,13 @@ site_url: https://lucagrementieri.github.io/triwarp/
 repo_url: https://github.com/lucagrementieri/triwarp
 docs_dir: docs
 
+# `benchmarks/plot_comparison.py` writes a `.md` table alongside every chart PNG under
+# `assets/benchmarks/`, for the "full results appendix" case (rendering every cell, not just the
+# curated few `docs/benchmarks.md` embeds by hand) -- those sidecar tables are data, not nav pages,
+# so they're excluded here rather than left to surface as unlinked stray pages.
+exclude_docs: |
+  assets/benchmarks/*.md
+
 theme:
   name: material
   logo: assets/logo.svg

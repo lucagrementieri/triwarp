@@ -29,8 +29,8 @@ was measured against, and it is kept current rather than copied once and left to
 
 ## How to reproduce a number
 
-Every timing this project publishes — in its README, in a release's changelog, or on a future
-benchmarks page — comes from `benchmarks/`, built on
+Every timing this project publishes — in its README, in a release's changelog, or on the
+[Benchmarks](benchmarks.md) page — comes from `benchmarks/`, built on
 [pytest-benchmark](https://pytest-benchmark.readthedocs.io) and run against nine established CPU
 geometry-processing libraries plus PyTorch3D's own CUDA kernels (the one reference with a GPU path
 of its own, and so the suite's only GPU-against-GPU comparison). Anyone can run the same
@@ -48,6 +48,9 @@ the repository for the full methodology: which axis each benchmark group sweeps,
 are compared for which operation, and why a handful of comparisons are excluded (a different
 algorithm answering a related-but-not-identical question, a parameter one library's API doesn't
 expose — every exclusion is written down at the point it's made, not left implicit).
+
+See [Benchmarks](benchmarks.md) for a curated set of these comparisons rendered as charts, each
+library named by its own logo.
 
 ## What "fast" means here
 

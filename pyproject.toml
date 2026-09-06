@@ -57,7 +57,11 @@ Repository = "https://github.com/lucagrementieri/triwarp"
 io = ["meshio>=5.0"]
 
 [dependency-groups]
-bench = ["pytest-benchmark>=5.1", { include-group = "test" }]
+# ``cairosvg`` and ``matplotlib`` are ``plot_comparison.py``'s only extras over the plain
+# ``aggregate.py`` text tables: rasterizing a vendored SVG logo to a fixed-size PNG once
+# (``benchmarks/assets/logos/render.py``) and drawing the comparison charts. Neither is a runtime
+# dependency of triwarp itself.
+bench = ["cairosvg>=2.7", "matplotlib>=3.9", "pytest-benchmark>=5.1", { include-group = "test" }]
 dev = ["basedpyright>=1.39", "ruff>=0.9", "scipy-stubs>=1.17.1.5"]
 docs = [
     "mkdocs-gen-files>=0.5",

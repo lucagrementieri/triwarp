@@ -68,6 +68,8 @@ repair-then-remesh pipeline on a realistically broken mesh), or jump straight to
   Open3D, MeshLab, potpourri3d, or PyTorch3D? Start here.
 - **[Performance](performance.md)** — why the GPU path is fast, and how to check any number
   yourself.
+- **[Benchmarks](benchmarks.md)** — a curated set of triwarp-vs-reference comparisons, rendered as
+  charts, each library named by its own logo.
 
 ## One GPU library instead of six
 
