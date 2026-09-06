@@ -359,9 +359,8 @@ _HELPER_ORDER_ALLOWLIST: dict[str, frozenset[str]] = {
     "creation": frozenset({"_icosphere_face_table"})
 }
 
-# --- check 15 -----------------------------------------------------------------------------------
-
-# The Python-scope launchers that take a ``device`` keyword.
+# The Python-scope launchers that take a ``device`` keyword. Data for check 15, hoisted up here
+# alongside check 10's device-related allowlists rather than beside check 15's own logic section.
 _LAUNCHERS = frozenset({"launch", "launch_tiled"})
 
 # Launches that deliberately fall back to Warp's current device, keyed by ``(module, kernel)``.
@@ -369,9 +368,8 @@ _LAUNCHERS = frozenset({"launch", "launch_tiled"})
 # reason a reader can check, because the failure mode is silent memory corruption on CPU runs.
 _LAUNCH_DEVICE_ALLOWLIST: dict[tuple[str, str], str] = {}
 
-# --- check 13 -----------------------------------------------------------------------------------
-
-# Kernel-scope calls whose first argument is a buffer the kernel writes.
+# Kernel-scope calls whose first argument is a buffer the kernel writes. Data for check 13, hoisted
+# up here for the same reason.
 _KERNEL_WRITE_CALLS = frozenset(
     {
         "atomic_add",
