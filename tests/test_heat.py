@@ -1406,10 +1406,12 @@ def test_log_map_is_invariant_to_mesh_scale(
 
     Excludes vertex 3, this mesh's genuine cut-locus antipode (confirmed against
     [`transport_tangent_vectors`][triwarp.heat.transport_tangent_vectors]'s own ``resolved``
-    mask): there the transported directions arriving from either side genuinely cancel, and on
-    CUDA enough round-off survives that cancellation to be renormalized into a full-length but
-    arbitrary direction (see ``transport_tangent_vectors``'s own ``Notes``) -- so its angle is not
-    expected to agree between the two scales, independently of this bug.
+    mask): there the transported directions arriving from either side genuinely cancel, and which
+    way that cancellation rounds is device-dependent -- on CUDA enough round-off survives it to be
+    renormalized into a full-length but arbitrary direction, while on CPU the same point can cancel
+    to exactly zero (see ``transport_tangent_vectors``'s own ``Notes``) -- so its angle is not
+    expected to agree between the two scales, or to read as zero on one device and not the other,
+    independently of this bug.
     """
     _, mesh_wp = icosphere_coarse
     cut_locus = 3  # this mesh's antipode of vertex 0 -- see the docstring above
@@ -1419,13 +1421,14 @@ def test_log_map_is_invariant_to_mesh_scale(
     ).numpy()
 
     # Non-vacuous on both sides: the unit-scale angles spread widely away from the source and the
-    # cut locus, and the source's own row -- no other -- reads as vanished at either scale.
+    # cut locus, and no row *other than* the source and the cut locus reads as vanished at either
+    # scale -- the source always does, by construction; the cut locus may or may not, by device.
     excluded = (0, cut_locus)
     unit_angles = np.arctan2(unit[:, 1], unit[:, 0])
     assert np.std(np.delete(unit_angles, excluded)) > 0.5
     rescaled_angles = np.arctan2(rescaled[:, 1], rescaled[:, 0])
-    assert np.flatnonzero(np.abs(unit[:, 1]) < 1e-30).tolist() == [0]
-    assert np.flatnonzero(np.abs(rescaled[:, 1]) < 1e-30).tolist() == [0]
+    assert set(np.flatnonzero(np.abs(unit[:, 1]) < 1e-30).tolist()) <= {0, cut_locus}
+    assert set(np.flatnonzero(np.abs(rescaled[:, 1]) < 1e-30).tolist()) <= {0, cut_locus}
 
     # Compare angles rather than raw coordinates: at 1e-7 the *radius* already carries seven orders
     # of magnitude of scale, so an absolute tolerance on the coordinates themselves would either
