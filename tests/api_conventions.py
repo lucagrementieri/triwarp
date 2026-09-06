@@ -1032,8 +1032,47 @@ def docstring_examples() -> list[DocstringExample]:
 # --- check 13 -----------------------------------------------------------------------------------
 
 
-def _is_kernel(node: ast.FunctionDef) -> bool:
-    """Whether ``node`` is decorated ``@wp.kernel`` or ``@wp.kernel(...)``."""
+def _factory_registered(tree: ast.Module, attribute: str) -> frozenset[str]:
+    """
+    Names passed as the first argument to ``wp.<attribute>(...)`` anywhere in ``tree``.
+
+    A kernel factory (``.claude/CLAUDE.md`` section 2's ``wp.kernel(_k, name=...)``) registers a
+    plain nested ``def`` whose body is Warp's DSL but which carries **no decorator**, so every
+    check that enumerates kernel scope by walking ``decorator_list`` is blind to it. That is
+    section 4's "a new Warp construct can silently switch off a static check" with the construct
+    being the factory: measured when this was added, **14** such bodies existed and **six** carried
+    defects the family of checks 16-22 exists to catch -- four bare ``wp.tid()`` and two
+    kernel-scope ternaries, in ``kernels/reduce.py`` and ``kernels/neighbors.py``, the two modules
+    that use factories most.
+
+    Resolved by *name* rather than by identity because the registration
+    (``return wp.kernel(_k, name=name)``) is textually separate from the ``def``; a factory that
+    ever shadowed one nested name with another kernel-scope body in the same module would over-
+    report, which no module does and which would be a defect of its own.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        target = node.func
+        if (
+            isinstance(target, ast.Attribute)
+            and target.attr == attribute
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "wp"
+            and isinstance(node.args[0], ast.Name)
+        ):
+            names.add(node.args[0].id)
+    return frozenset(names)
+
+
+def _is_kernel(node: ast.FunctionDef, tree: ast.Module | None = None) -> bool:
+    """
+    Whether ``node`` is a kernel: decorated ``@wp.kernel`` / ``@wp.kernel(...)``, or factory-built.
+
+    ``tree`` enables the factory half; pass it unless the caller has already filtered to decorated
+    definitions for a reason it can state.
+    """
     for decorator in node.decorator_list:
         target = decorator.func if isinstance(decorator, ast.Call) else decorator
         if (
@@ -1043,7 +1082,7 @@ def _is_kernel(node: ast.FunctionDef) -> bool:
             and target.value.id == "wp"
         ):
             return True
-    return False
+    return tree is not None and node.name in _factory_registered(tree, "kernel")
 
 
 def _subscript_base(node: ast.expr) -> str | None:
@@ -1114,8 +1153,11 @@ def kernel_output_naming_problems() -> list[str]:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except SyntaxError:
             continue  # test_package_scan_is_discoverable reports the parse failure
-        for node in tree.body:
-            if not isinstance(node, ast.FunctionDef) or not _is_kernel(node):
+        # ``ast.walk``, not ``tree.body``: a kernel factory's body is a *nested* ``def``, so a
+        # top-level pass never sees it. It reached the tree as ``out`` where the convention is
+        # ``out_`` and nothing complained -- see ``_factory_registered``.
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or not _is_kernel(node, tree):
                 continue
             allowed = _KERNEL_OUTPUT_ALLOWLIST.get((module, node.name), frozenset())
             site = f"{path.relative_to(_REPO_ROOT)}:{node.lineno}"
@@ -1262,13 +1304,22 @@ _BUILTIN_CASTS = frozenset({"int", "float"})
 
 
 def _kernel_scope_functions(tree: ast.Module) -> list[ast.FunctionDef]:
-    """Every ``@wp.kernel`` / ``@wp.func`` in a module, whose body is Warp's DSL and not Python."""
+    """
+    Every ``@wp.kernel`` / ``@wp.func`` in a module, whose body is Warp's DSL and not Python.
+
+    Includes the **factory-registered** bodies -- a nested ``def`` handed to ``wp.kernel(...)`` or
+    ``wp.func(...)`` rather than decorated -- which are kernel scope with no decorator to match on;
+    see [`_factory_registered`][tests.api_conventions._factory_registered] for what that blind spot
+    was hiding. The enclosing *factory* is ordinary Python and stays out of scope, which is what
+    keeps a ``row_size: int`` parameter from tripping check 18.
+    """
+    factory = _factory_registered(tree, "kernel") | _factory_registered(tree, "func")
     found: list[ast.FunctionDef] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
             continue
         decorators = " ".join(ast.unparse(decorator) for decorator in node.decorator_list)
-        if "wp.kernel" in decorators or "wp.func" in decorators:
+        if "wp.kernel" in decorators or "wp.func" in decorators or node.name in factory:
             found.append(node)
     return found
 

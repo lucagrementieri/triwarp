@@ -565,7 +565,7 @@ def _bvh_nearest_row_kernel(row_size: int, name: str):
         out_indices: wp.array2d[wp.int32],
         out_distances: wp.array2d[wp.float32],
     ) -> None:
-        tid = wp.tid()
+        tid = wp.int32(wp.tid())
         q = queries[tid]
         row_indices = vec_indices()
         row_distances = vec_distances()
@@ -757,7 +757,7 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
         out_indices: wp.array2d[wp.int32],
         out_distances: wp.array2d[wp.float32],
     ) -> None:
-        tid = wp.tid()
+        tid = wp.int32(wp.tid())
         q = queries[tid]
         row_indices = vec_indices()
         row_distances = vec_distances()

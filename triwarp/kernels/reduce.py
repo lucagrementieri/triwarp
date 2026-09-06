@@ -103,7 +103,7 @@ def _reduce_1d_tiled(tile_reduce, atomic, scalar, name, dtype):
     resolution (0.59x at 10 000 elements, 0.94x at 10M), so the generic form is declined here.
     """
 
-    def _k(values: wp.array[wp.Scalar], out: wp.array[wp.Scalar]) -> None:
+    def _k(values: wp.array[wp.Scalar], out_result: wp.array[wp.Scalar]) -> None:
         i, t = wp.tid()
         n = values.shape[0]
         base, remaining = tile_chunk(n, i, TILES_PER_BLOCK_1D * TILE_1D)
@@ -131,10 +131,10 @@ def _reduce_1d_tiled(tile_reduce, atomic, scalar, name, dtype):
                     result = scalar(result, values[offset + k])
 
         if t == 0:
-            atomic(out, 0, result)
+            atomic(out_result, 0, result)
 
     _k.__annotations__["values"] = wp.array[dtype]
-    _k.__annotations__["out"] = wp.array[dtype]
+    _k.__annotations__["out_result"] = wp.array[dtype]
     return wp.kernel(_k, name=name)
 
 
@@ -194,7 +194,7 @@ def _weighted_sum_1d_tiled(name, dtype):
 def _reduce_2d_tiled(tile_reduce, atomic, scalar, name, dtype):
     """axis=None on a 2-D array: one 2-D tile per block, atomically fold into slot 0."""
 
-    def _k(values: wp.array2d[wp.Scalar], out: wp.array[wp.Scalar]) -> None:
+    def _k(values: wp.array2d[wp.Scalar], out_result: wp.array[wp.Scalar]) -> None:
         i, j, t = wp.tid()
         n_rows = values.shape[0]
         n_cols = values.shape[1]
@@ -205,8 +205,8 @@ def _reduce_2d_tiled(tile_reduce, atomic, scalar, name, dtype):
 
         remaining_rows = n_rows - row_offset
         remaining_cols = n_cols - col_offset
-        tile_rows = TILE_2D if remaining_rows >= TILE_2D else remaining_rows
-        tile_cols = TILE_2D if remaining_cols >= TILE_2D else remaining_cols
+        tile_rows = wp.where(remaining_rows >= TILE_2D, TILE_2D, remaining_rows)
+        tile_cols = wp.where(remaining_cols >= TILE_2D, TILE_2D, remaining_cols)
         if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
             tile = wp.tile_load(
                 values,
@@ -224,10 +224,10 @@ def _reduce_2d_tiled(tile_reduce, atomic, scalar, name, dtype):
                     result = scalar(result, values[row_offset + r, col_offset + c])
 
         if t == 0:
-            atomic(out, 0, result)
+            atomic(out_result, 0, result)
 
     _k.__annotations__["values"] = wp.array2d[dtype]
-    _k.__annotations__["out"] = wp.array[dtype]
+    _k.__annotations__["out_result"] = wp.array[dtype]
     return wp.kernel(_k, name=name)
 
 
@@ -267,7 +267,7 @@ def _reduce_2d_axis_tiled(tile_reduce, atomic, scalar, name, rows, dtype):
     """
     element = _element_along_row if rows else _element_along_col
 
-    def _k(values: wp.array2d[wp.Scalar], out: wp.array[wp.Scalar]) -> None:
+    def _k(values: wp.array2d[wp.Scalar], out_result: wp.array[wp.Scalar]) -> None:
         i, j, t = wp.tid()
         if wp.static(rows):
             extent = values.shape[1]
@@ -294,10 +294,10 @@ def _reduce_2d_axis_tiled(tile_reduce, atomic, scalar, name, rows, dtype):
             for k in range(1, remaining):
                 result = scalar(result, element(values, i, offset + k))
         if t == 0:
-            atomic(out, i, result)
+            atomic(out_result, i, result)
 
     _k.__annotations__["values"] = wp.array2d[dtype]
-    _k.__annotations__["out"] = wp.array[dtype]
+    _k.__annotations__["out_result"] = wp.array[dtype]
     return wp.kernel(_k, name=name)
 
 
@@ -314,14 +314,14 @@ def _reduce_2d_axis_serial(scalar, name, rows, dtype):
     """
     axis=1 (``rows=True``) or axis=0 with a reduced extent under ``TILE_1D``: one thread per output.
 
-    Writes ``out`` directly, so unlike the tiled form it needs no identity pre-fill. The
+    Writes ``out_result`` directly, so unlike the tiled form it needs no identity pre-fill. The
     ``rows=False`` instantiation walks a column, whose consecutive threads read consecutive
     addresses -- coalesced, where the ``rows=True`` one is strided by the row length.
     """
     element = _element_along_row if rows else _element_along_col
 
-    def _k(values: wp.array2d[wp.Scalar], out: wp.array[wp.Scalar]) -> None:
-        i = wp.tid()
+    def _k(values: wp.array2d[wp.Scalar], out_result: wp.array[wp.Scalar]) -> None:
+        i = wp.int32(wp.tid())
         if wp.static(rows):
             extent = values.shape[1]
         else:
@@ -329,10 +329,10 @@ def _reduce_2d_axis_serial(scalar, name, rows, dtype):
         result = element(values, i, 0)
         for k in range(1, extent):
             result = scalar(result, element(values, i, k))
-        out[i] = result
+        out_result[i] = result
 
     _k.__annotations__["values"] = wp.array2d[dtype]
-    _k.__annotations__["out"] = wp.array[dtype]
+    _k.__annotations__["out_result"] = wp.array[dtype]
     return wp.kernel(_k, name=name)
 
 
@@ -699,7 +699,7 @@ def _minmax_2d_axis_serial(name, rows, dtype):
     def _k(
         values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar], out_max: wp.array[wp.Scalar]
     ) -> None:
-        i = wp.tid()
+        i = wp.int32(wp.tid())
         if wp.static(rows):
             extent = values.shape[1]
         else:
