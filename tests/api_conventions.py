@@ -160,6 +160,7 @@ _EXTRA_TEST_FILES = frozenset(
         "api_conventions",  # this gate
         "map_uniform_probe",  # a Warp-behaviour probe, not a module's coverage
         "array_indexing_probe",  # ditto: Python-scope gather semantics, section 3.4
+        "aggregate",  # covers benchmarks.aggregate, the loss-table loader -- tooling, not a module
     }
 )
 _EXTRA_BENCHMARK_FILES = frozenset({"meshes"})  # mesh-fixture invariants, nothing timed
