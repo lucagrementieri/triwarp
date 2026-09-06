@@ -11,6 +11,11 @@ import triwarp.reduce as tw_reduce
 from tests.conversions import points_to_torch, points_to_warp, trimesh_to_pyvista
 
 
+def _random_values(shape: tuple[int, ...] | int, seed: int = 42) -> np.ndarray:
+    """Fixed-seed float32 standard-normal test data."""
+    return np.random.default_rng(seed).standard_normal(shape, dtype=np.float32)
+
+
 @pytest.mark.parity("min_scalar", "numpy")
 def test_min_1d(device: str) -> None:
     """Class A: direct comparison against ``numpy.min``."""
@@ -25,10 +30,9 @@ def test_min_1d(device: str) -> None:
 
 
 def test_min_2d(device: str) -> None:
-    rng = np.random.default_rng(42)
     n = 200
     m = 100
-    values_np = rng.standard_normal((n, m), dtype=np.float32)
+    values_np = _random_values((n, m))
     min_np = values_np.min()
     values_wp = wp.array(values_np, dtype=wp.float32, device=device)
     min_wp = tw_reduce.min(values_wp)
@@ -57,10 +61,9 @@ def test_max_1d(device: str) -> None:
 
 
 def test_max_2d(device: str) -> None:
-    rng = np.random.default_rng(42)
     n = 200
     m = 100
-    values_np = rng.standard_normal((n, m), dtype=np.float32)
+    values_np = _random_values((n, m))
     max_np = values_np.max()
     values_wp = wp.array(values_np, dtype=wp.float32, device=device)
     max_wp = tw_reduce.max(values_wp)
@@ -104,8 +107,7 @@ def test_minmax_2d(device: str, shape: tuple[int, int]) -> None:
     shape [`triwarp.graph.connected_components`][] validates, and it clips the ``TILE_2D`` square
     so the tile branch never runs — a wide-only fixture would leave that path untested.
     """
-    rng = np.random.default_rng(42)
-    values_np = rng.standard_normal(shape, dtype=np.float32)
+    values_np = _random_values(shape)
     min_np = values_np.min()
     max_np = values_np.max()
     values_wp = wp.array(values_np, dtype=wp.float32, device=device)
@@ -136,8 +138,7 @@ def test_minmax_vec3_rejects_axis_and_empty(device: str) -> None:
 
 @pytest.mark.parametrize("axis", [0, 1])
 def test_minmax_2d_axis(device: str, axis: int) -> None:
-    rng = np.random.default_rng(42)
-    values_np = rng.standard_normal((32, 10), dtype=np.float32)
+    values_np = _random_values((32, 10))
     values_wp = wp.array(values_np, dtype=wp.float32, device=device)
     got_min_wp, got_max_wp = tw_reduce.minmax(values_wp, axis=axis)
     exp_min_np = values_np.min(axis=axis)
@@ -307,10 +308,9 @@ def test_sum_1d(device: str) -> None:
 
 
 def test_sum_2d(device: str) -> None:
-    rng = np.random.default_rng(42)
     n = 200
     m = 100
-    values_np = rng.standard_normal((n, m), dtype=np.float32)
+    values_np = _random_values((n, m))
     sum_np = values_np.sum()
     values_wp = wp.array(values_np, dtype=wp.float32, device=device)
     sum_wp = tw_reduce.sum(values_wp)
@@ -444,8 +444,7 @@ def test_sum_partial_tiles_axis(device: str, shape: tuple[int, int], axis: int) 
 
 
 def test_mean_1d_float(device: str) -> None:
-    rng = np.random.default_rng(42)
-    values_np = rng.standard_normal(100, dtype=np.float32)
+    values_np = _random_values(100)
     values_wp = wp.array(values_np, dtype=wp.float32, device=device)
     mean_wp = tw_reduce.mean(values_wp)
     assert np.allclose(mean_wp, values_np.mean(), rtol=1e-5, atol=1e-5)
@@ -460,8 +459,7 @@ def test_mean_1d_int(device: str) -> None:
 
 
 def test_mean_2d(device: str) -> None:
-    rng = np.random.default_rng(42)
-    values_np = rng.standard_normal((200, 100), dtype=np.float32)
+    values_np = _random_values((200, 100))
     values_wp = wp.array(values_np, dtype=wp.float32, device=device)
     mean_wp = tw_reduce.mean(values_wp)
     assert np.allclose(mean_wp, values_np.mean(), rtol=1e-5, atol=1e-5)
@@ -469,8 +467,7 @@ def test_mean_2d(device: str) -> None:
 
 @pytest.mark.parametrize("axis", [0, 1])
 def test_mean_2d_axis(device: str, axis: int) -> None:
-    rng = np.random.default_rng(42)
-    values_np = rng.standard_normal((32, 10), dtype=np.float32)
+    values_np = _random_values((32, 10))
     values_wp = wp.array(values_np, dtype=wp.float32, device=device)
     mean_wp = tw_reduce.mean(values_wp, axis=axis)
     assert np.allclose(mean_wp.numpy(), values_np.mean(axis=axis), rtol=1e-5, atol=1e-5)

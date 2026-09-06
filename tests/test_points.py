@@ -37,6 +37,11 @@ def _fibonacci_sphere(n: int) -> np.ndarray:
     return np.stack([r * np.cos(theta), r * np.sin(theta), z], axis=1)
 
 
+def _random_points(n: int, seed: int) -> np.ndarray:
+    """Fixed-seed float32 point cloud."""
+    return np.random.default_rng(seed).standard_normal((n, 3)).astype(np.float32)
+
+
 @pytest.mark.parity("point_plane_distance", "trimesh", "pyvista")
 @pytest.mark.parity("half_space_mask", "pyvista")
 def test_point_plane_distance(device: str) -> None:
@@ -111,8 +116,7 @@ def test_half_space_mask_matches_meshlib(device: str) -> None:
     is asserted directly -- the masks for opposite normals are disjoint and together cover every
     point off the plane.
     """
-    rng = np.random.default_rng(3)
-    points_np = rng.standard_normal((300, 3)).astype(np.float32)
+    points_np = _random_points(300, seed=3)
     plane_normal_np = np.array([0.4, -1.7, 0.9], dtype=np.float64)
     plane_origin_np = np.array([0.1, 0.2, -0.3], dtype=np.float64)
 
@@ -171,8 +175,7 @@ def test_half_space_mask_defaults_to_the_origin(device: str) -> None:
 
 
 def test_centroid(device: str) -> None:
-    rng = np.random.default_rng(14)
-    points_np = rng.standard_normal((128, 3)).astype(np.float32)
+    points_np = _random_points(128, seed=14)
     points_wp = points_to_warp(points_np, device)
     centroid_wp = tw.centroid(points_wp)
     assert np.allclose(centroid_wp.numpy()[0], points_np.mean(axis=0), rtol=1e-5, atol=1e-5)
@@ -180,8 +183,7 @@ def test_centroid(device: str) -> None:
 
 def test_gram_matrix(device: str) -> None:
     # 200 = 3 * 64 + 8 exercises the multi-tile reduction and remainder path.
-    rng = np.random.default_rng(10)
-    points_np = rng.standard_normal((200, 3)).astype(np.float32)
+    points_np = _random_points(200, seed=10)
     points_wp = points_to_warp(points_np, device)
     gram_np = points_np.T @ points_np
     assert np.allclose(tw.gram_matrix(points_wp).numpy()[0], gram_np, rtol=1e-4, atol=1e-4)
@@ -221,8 +223,7 @@ def test_fit_line(device: str) -> None:
 
 
 def test_centered_covariance(device: str) -> None:
-    rng = np.random.default_rng(11)
-    points_np = rng.standard_normal((200, 3)).astype(np.float32)
+    points_np = _random_points(200, seed=11)
     points_wp = points_to_warp(points_np, device)
     centered_np = points_np - points_np.mean(axis=0)
     scatter_np = centered_np.T @ centered_np
@@ -231,8 +232,7 @@ def test_centered_covariance(device: str) -> None:
 
 
 def test_centered_covariance_precomputed_center(device: str) -> None:
-    rng = np.random.default_rng(12)
-    points_np = rng.standard_normal((150, 3)).astype(np.float32)
+    points_np = _random_points(150, seed=12)
     points_wp = points_to_warp(points_np, device)
     mean_np = points_np.mean(axis=0)
     center_wp = points_to_warp(mean_np.reshape(1, 3), device)
@@ -539,8 +539,7 @@ def test_plane_basis_is_right_handed_and_orthonormal(normal: tuple[float, float,
 
 
 def test_covariance(device: str) -> None:
-    rng = np.random.default_rng(13)
-    points_np = rng.standard_normal((200, 3)).astype(np.float32)
+    points_np = _random_points(200, seed=13)
     points_wp = points_to_warp(points_np, device)
     cov_np = np.cov(points_np.T, ddof=1)
     assert np.allclose(tw.covariance(points_wp).numpy()[0], cov_np, rtol=1e-4, atol=1e-4)
