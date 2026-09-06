@@ -259,12 +259,13 @@ def skip_known_slow(
 # states its measured share in its docstring, and rows are capped at ``bunny``: ``dragon`` is
 # seconds of load plus seconds of query per round.
 #
-# The shares for the three algorithms *not* timed above, so the next author does not re-measure them
-# (same mesh, ``bunny_decimated``, best of 3, load 53.1 ms in that session):
-# ``join_closest_components`` 900.7 ms round / 847.6 ms operation = **94.1 %**, ``clean`` 225.9 /
+# The shares for the algorithms *not* timed above, so the next author does not re-measure them
+# (same mesh, ``bunny_decimated``, best of 3, load 53.1 ms in that session): ``clean`` 225.9 /
 # 172.8 = **76.5 %**, ``strong_intersection_removal`` 174.4 / 121.3 = **69.5 %**,
 # ``fix_connectivity`` 124.4 / 71.3 = **57.3 %**, ``strong_degeneracy_removal`` 65.4 / 12.3 =
-# 18.8 %. Four of five clear the bar on cost -- and **a share is necessary, not sufficient.**
+# 18.8 %. Three of four clear the bar on cost -- and **a share is necessary, not sufficient.**
+# (``join_closest_components`` was in this list at 94.1 % and is now a timed row on the
+# ``open_components`` axis, where it re-measures at 51.4 / 75.9 / 90.6 % as the join count rises.)
 # ``fix_connectivity`` is the counter-example: 57.3 % of a round doing provably nothing, since
 # ``load_array`` already ran it (measured, 8 372 V / 16 220 F / 86 boundaries in and out,
 # unchanged). A row for it would price a no-op. ``clean`` and ``strong_intersection_removal`` are

@@ -36,6 +36,11 @@ _TOPOLOGY: dict[str, tuple[int, bool, int, int]] = {
     "sphere_large": (1, True, 0, 6),
     "parts_64": (64, True, 0, 6),
     "parts_1024": (1024, True, 0, 6),
+    # Open counterparts of the two above: one face dropped per shell, so every component
+    # carries exactly one 3-edge rim and the joining functions have something to bridge.
+    "open_parts_4": (4, False, 4, 6),
+    "open_parts_16": (16, False, 16, 6),
+    "open_parts_64": (64, False, 64, 6),
     "ribbon_long": (1, False, 1, 3),
     "fan_hub": (1, True, 0, 40_960),
     "rim_long": (1, False, 2, 3),

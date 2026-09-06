@@ -87,6 +87,11 @@ if TYPE_CHECKING:
 # The DP runs to hundreds of milliseconds a call on both axis points.
 _ROUNDS = 3
 
+# Open shells per ``open_components`` mesh. Read from the registry name rather than counted per
+# round: the count is what the joins are asserted against, so deriving it from the mesh under test
+# would let a driver that joined nothing still pass.
+_OPEN_COMPONENT_COUNTS = {"open_parts_4": 4, "open_parts_16": 16, "open_parts_64": 64}
+
 _tensor_mesh_cache: dict[str, o3d.t.geometry.TriangleMesh] = {}
 
 
@@ -777,3 +782,73 @@ def test_bridge_edges_smooth(bench_case: BenchCase) -> None:
     )
     assert int(strip_faces.shape[0]) > int(faces.shape[0])
     assert int(strip_vertices.shape[0]) >= bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="join_closest_components")
+@pytest.mark.benchaxis("open_components")
+@pytest.mark.benchlibs("triwarp", "pymeshfix")
+def test_join_closest_components(bench_case: BenchCase) -> None:
+    """
+    Greedy nearest-link agglomeration over *open* shells: the driver, not the bridge.
+
+    **The axis is the join count, and the face count is very nearly free.** Measured at a fixed
+    ~81 900 faces, triwarp runs **9.0 / 37.2 / 152.7 ms** at 4 / 16 / 64 components -- 4.1x for
+    each 4x of components, i.e. linear in the ``k - 1`` joins. Holding the *components* fixed and
+    cutting the mesh instead barely moves it: 64 shells cost 148 ms at 81 856 faces and 150 ms at
+    20 416 (isolated probe, so read the ratio not the absolute), a 4x face reduction for 1 %. That
+    is the shape the function's own Notes
+    predict -- each round rebuilds the component labelling and the rim table from the updated face
+    buffer, and each of those is a fixed chain of wrapper calls whose launch overhead dominates the
+    per-face work at these sizes.
+
+    So this group exists to watch the **round count times the per-round chain**, and anything that
+    moves it will be a launch removed from that chain rather than a faster kernel. One such change
+    is already in: the pair selection and ``bridge_edges``' rim check used to build the same
+    oriented boundary table twice per round, which was 13.5-15 % of the call.
+
+    A closed lattice cannot serve this. ``parts_64`` returns **0 bridges** -- a shell with no
+    boundary has nothing to bridge to and is left alone by design -- so the ``components`` axis
+    would time a no-op, which is why ``open_components`` exists and drops one face per shell.
+
+    First measurement, harness medians on an RTX 5090:
+
+    | mesh | triwarp-cuda | pymeshfix |
+    |---|---|---|
+    | ``open_parts_4`` | **9.0 ms** | 377.7 (42.0x) |
+    | ``open_parts_16`` | **37.2 ms** | 968.7 (26.0x) |
+    | ``open_parts_64`` | **152.7 ms** | 3 065.5 (20.1x) |
+
+    The ratio *narrows* with the join count because triwarp's per-round chain is the launch-bound
+    part while MeshFix's is sequential C++ over a halfedge structure it already holds -- the gap is
+    widest where triwarp's fixed overhead is amortized least.
+
+    pymeshfix's row is timed rather than declared because the operation clears its load by a wide
+    margin, which is the ~30 % rule in ``conftest``'s LIBRARIES block: **51.4 % / 75.9 / 90.6** of
+    the round at 4 / 16 / 64 components (load 152.3 / 229.2 / 284.3 ms). That split is an isolated
+    measurement, since the harness can only time the whole callable -- the load cannot leave it, a
+    ``PyTMesh`` taking exactly one ``load_array``. So read the row as join-plus-load and subtract
+    accordingly, most of all at the 4-component point, where the load is over half of it and the
+    42.0x above correspondingly overstates the algorithmic gap.
+
+    Both sides add exactly ``2 * (k - 1)`` faces and no vertices, which is what the assertions
+    check: a driver that fanned a rim or joined the wrong number of shells fails on the count.
+    ``tests/test_holes.py::test_join_closest_components_matches_pymeshfix`` is the parity claim and
+    compares the same counts, because the two pick different incident edges to bridge and so need
+    not produce the same two triangles.
+    """
+    n_faces = bench_case.n_faces
+    n_components = _OPEN_COMPONENT_COUNTS[bench_case.mesh_name]
+    expected = 2 * (n_components - 1)
+
+    if bench_case.kind == "pymeshfix":
+
+        def join_pmf() -> int:
+            tin_pmf = bench_case.new_tmesh_pmf()
+            tin_pmf.join_closest_components()
+            return tin_pmf.n_faces
+
+        assert bench_case.run(join_pmf, rounds=3) == n_faces + expected
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    joined = bench_case.run(lambda: tw.holes.join_closest_components(vertices, faces), rounds=3)
+    assert int(joined.shape[0]) // 3 == n_faces + expected

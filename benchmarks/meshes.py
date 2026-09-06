@@ -201,6 +201,25 @@ def _spheres(subdivisions: int, count: int = 1, layout: str = "lattice") -> _Arr
     return combined.vertices, combined.faces
 
 
+def _open_spheres(subdivisions: int, count: int) -> _Arrays:
+    """
+    ``count`` disjoint icospheres on a lattice, each **opened** by dropping one face.
+
+    The closed ``_spheres`` lattice cannot serve the component-joining functions: a shell with no
+    boundary has nothing to bridge to, so ``join_closest_components`` returns ``parts_64``
+    unchanged -- 0 bridges, a timed no-op. One face removed per shell is the smallest edit that
+    gives each component a rim, and it leaves the vertex buffer alone (all three of a dropped
+    face's vertices are still referenced by its neighbours), so the face count moves by exactly
+    ``count`` and nothing else about the lattice changes.
+    """
+    vertices, faces = _spheres(subdivisions, count, "lattice")
+    # ``concatenate`` keeps each part's faces contiguous, so face ``i * per`` belongs to shell i.
+    per = len(faces) // count
+    keep = np.ones(len(faces), dtype=bool)
+    keep[np.arange(count) * per] = False
+    return vertices, faces[keep]
+
+
 def _open_cylinder(sections: int) -> _Arrays:
     """
     Uncapped tube: two boundary rims of ``sections`` vertices, ``2 * sections`` triangles.
@@ -363,6 +382,9 @@ FEATURE_MESHES: list[MeshSpec] = [
     _mesh("sphere_large", "", 163_842, 327_680, "scale"),
     _mesh("parts_64", "", 41_088, 81_920, "components"),
     _mesh("parts_1024", "", 43_008, 81_920, "components"),
+    _mesh("open_parts_4", "", 40_968, 81_916, "open_components"),
+    _mesh("open_parts_16", "", 40_992, 81_904, "open_components"),
+    _mesh("open_parts_64", "", 41_088, 81_856, "open_components"),
     _mesh("ribbon_long", "", 40_962, 40_960, "diameter"),
     _mesh("fan_hub", "", 40_962, 81_920, "valence"),
     _mesh("rim_long", "", 131_072, 131_072, "loops"),
@@ -389,6 +411,9 @@ BUILDERS: dict[str, Callable[[], _Arrays]] = {
     "sphere_large": lambda: _spheres(7),
     "parts_64": lambda: _spheres(3, 64, "lattice"),
     "parts_1024": lambda: _spheres(1, 1024, "lattice"),
+    "open_parts_4": lambda: _open_spheres(5, 4),
+    "open_parts_16": lambda: _open_spheres(4, 16),
+    "open_parts_64": lambda: _open_spheres(3, 64),
     "ribbon_long": lambda: _ribbon(RIBBON_LENGTH),
     "fan_hub": lambda: _cone_fan(40_960),
     "rim_long": lambda: _open_cylinder(RIM_LONG),
@@ -420,6 +445,11 @@ AXES: dict[str, tuple[str, ...]] = {
     "scale": ("sphere_small", "sphere_med", "sphere_large"),
     # Components 1 -> 64 -> 1024 at F = 81 920 throughout.
     "components": ("sphere_med", "parts_64", "parts_1024"),
+    # *Open* components 4 -> 16 -> 64, each shell holding one 3-edge rim, at F = 81 920 minus one
+    # face per shell. The closed ``components`` axis cannot serve the joining functions -- a shell
+    # with no boundary has nothing to bridge, so they return it untouched -- and the variable here
+    # is the number of *joins* a driver has to make, which is one fewer than the component count.
+    "open_components": ("open_parts_4", "open_parts_16", "open_parts_64"),
     # Graph diameter ~130 -> 20 481 at V = 40 962, same triangle quality.
     "diameter": ("sphere_med", "ribbon_long"),
     # Max vertex valence 6 -> 40 960 at both V = 40 962 and F = 81 920.

@@ -2731,15 +2731,7 @@ def _open_shells_tm(hemisphere: tuple[tm.Trimesh, wp.Mesh], count: int, gap: flo
     return tm.util.concatenate(shells_tm)
 
 
-@pytest.mark.parity(
-    "join_closest_components",
-    "pymeshfix",
-    benchmarked=False,
-    reason="0.29 ms on three shells, which is below the harness floor, and its cost driver is the "
-    "component count -- the axis the remove_small_components group already sweeps. A pymeshfix row "
-    "would price its 67.9 ms load besides. Folding it into a group would measure the labelling "
-    "twice under two names.",
-)
+@pytest.mark.parity("join_closest_components", "pymeshfix")
 @pytest.mark.parametrize("count", [2, 3, 5])
 def test_join_closest_components_matches_pymeshfix(
     hemisphere: tuple[tm.Trimesh, wp.Mesh], device: str, count: int

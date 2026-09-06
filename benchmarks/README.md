@@ -100,6 +100,9 @@ Every other mesh perturbs exactly one of those while pinning `V` and/or `F` to i
 | `sphere_large` | 163 842 | 327 680 | — | clean large `N` |
 | `parts_64` | 41 088 | 81 920 | **F** | components 1 → 64 |
 | `parts_1024` | 43 008 | 81 920 | **F** | components 1 → 1 024 |
+| `open_parts_4` | 40 968 | 81 916 | **F** | 4 *open* shells, 1 rim each |
+| `open_parts_16` | 40 992 | 81 904 | **F** | 16 *open* shells, 1 rim each |
+| `open_parts_64` | 41 088 | 81 856 | **F** | 64 *open* shells, 1 rim each |
 | `ribbon_long` | 40 962 | 40 960 | **V** | graph diameter 130 → 20 481 |
 | `fan_hub` | 40 962 | 81 920 | **V, F** | max valence 6 → 40 960 |
 | `rim_long` | 131 072 | 131 072 | — | 2 boundary loops × 65 536 |
@@ -112,7 +115,7 @@ Every other mesh perturbs exactly one of those while pinning `V` and/or `F` to i
 | `shells_8` | 20 496 | 40 960 | — | ray crossings 2 → 16 |
 | `tangle_2` | 20 484 | 40 960 | — | self-intersection density |
 
-Seven parametric builders produce all sixteen, and [`test_meshes.py`](test_meshes.py) asserts every
+Ten parametric builders produce them, and [`test_meshes.py`](test_meshes.py) asserts every
 recorded count, the topology each mesh is chosen for, and the cross-mesh pinning invariants. **Run
 it after touching `meshes.py`** — a silent change in `trimesh.creation` would otherwise leave the
 benchmarks green while comparing meshes that differ in more than one way.
@@ -126,6 +129,7 @@ table reads left-to-right as "baseline, then the perturbation".
 |---|---|---|
 | `scale` | sphere_small → med → large | — (the igl-safe `N` sweep) |
 | `components` | sphere_med, parts_64, parts_1024 | `F` |
+| `open_components` | open_parts_4, _16, _64 | `F` (the joins axis: closed shells are a no-op) |
 | `diameter` | sphere_med, ribbon_long | `V`, triangle quality |
 | `valence` | sphere_med, fan_hub | `V` and `F` |
 | `loops` | sphere_med, rim_long, holes_many | — (loop length vs loop count) |
