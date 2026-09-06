@@ -565,7 +565,10 @@ def normals_at_closest_faces(
         ``(m,)`` face normals at the closest triangle for each query. A query with no face
         within ``max_dist`` reports the first face's normal; use
         [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh] directly, whose
-        ``triangle_id`` is ``-1`` there, when a miss has to be detected.
+        ``triangle_id`` is ``-1`` there, when a miss has to be detected. A mesh with no faces
+        reports an all-NaN normal for every query, matching
+        [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]'s own zero-face
+        convention.
 
     See Also
     --------
@@ -575,6 +578,13 @@ def normals_at_closest_faces(
     m = int(points.shape[0])
     if m == 0:
         return wp.empty(0, dtype=wp.vec3, device=device)
+    if int(mesh.indices.shape[0]) == 0:
+        # closest_point_on_mesh's own n_faces == 0 branch leaves out_face at -1 for every query,
+        # which the miss-clamp below would map to face 0 of a face_normals array that has no face
+        # 0 -- an out-of-bounds Python-scope gather (array.gather bounds-checks nothing) that
+        # segfaults rather than raising. Match closest_point_on_mesh's own convention instead.
+        nan = float("nan")
+        return wp.full(m, wp.vec3(nan, nan, nan), dtype=wp.vec3, device=device)
 
     _closest, _distance, out_face = closest_point_on_mesh(
         mesh.points, mesh.indices, points, max_dist=max_dist, mesh=mesh

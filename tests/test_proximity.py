@@ -1050,6 +1050,21 @@ def test_normals_at_closest_faces_empty(icosahedron: tuple[tm.Trimesh, wp.Mesh])
     assert normals_wp.shape == (0,)
 
 
+def test_normals_at_closest_faces_empty_mesh() -> None:
+    """A zero-face mesh reports NaN normals rather than segfaulting."""
+    # A zero-face wp.Mesh is unsafe to build on CUDA (§12.1), so this is CPU-only by construction,
+    # not by a `device` fixture choice: reproducing the crash this guards against needs the real
+    # object, and building it on CUDA would corrupt allocator state rather than reproduce anything.
+    device = wp.get_device("cpu")
+    vertices = wp.zeros(1, dtype=wp.vec3, device=device)
+    faces = wp.empty(0, dtype=wp.int32, device=device)
+    mesh_wp = wp.Mesh(points=vertices, indices=faces)
+    points_wp = wp.array(np.zeros((2, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    normals_wp = tw.proximity.normals_at_closest_faces(mesh_wp, points_wp)
+    assert normals_wp.shape == (2,)
+    assert np.all(np.isnan(normals_wp.numpy()))
+
+
 @pytest.mark.parametrize("mesh_name", _SIGNED_DISTANCE_MESHES)
 def test_signed_distance_on_mesh_random(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
