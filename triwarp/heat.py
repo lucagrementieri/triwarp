@@ -49,7 +49,6 @@ import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.reduce as twr
 import triwarp.typing as twt
-from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.edges import mean_unique_edge_length
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import heat as kernel_heat
@@ -70,6 +69,16 @@ from triwarp.triangles import face_normals_and_areas
 # spelled three times when these were three modules.
 _CG_TOLERANCE = 1e-8
 
+# A diffused tangent field is treated as having vanished below this fraction of its *own* maximum,
+# never below a fixed absolute floor. Every field this module normalizes this way -- the signed
+# heat method's diffused direction field, the vector heat method's transported direction and its
+# source indicator -- carries the mesh's scale as ~1/scale, so an absolute cutoff silently zeroes
+# most of the field on a mesh measured in millimetres (confirmed: 111 of 162 vertices on a unit
+# icosphere scaled by 1e-6, all resolved relative to the field's own maximum). It is deliberately
+# far below the round-off floor (~1e-08 of the maximum): see ``kernels/heat.py`` for why nothing
+# here can separate noise from signal.
+_RELATIVE_ZERO = 1e-12
+
 
 HeatOperators = tuple[
     wps.BsrMatrix[wp.float64],
@@ -77,7 +86,7 @@ HeatOperators = tuple[
     wps.BsrMatrix[wp.float64],
     wps.BsrMatrix[wp.float64],
     wpl.LinearOperator,
-    wp.array[wp.float32],
+    twt.Array2dFloat32,
     wp.array[wp.vec3],
     wp.array[wp.float32],
 ]
@@ -146,8 +155,9 @@ def heat_operators(
         ``-L``, the positive-semi-definite Poisson operator.
     poisson_preconditioner : ``warp.optim.linear.LinearOperator``
         Jacobi preconditioner for ``poisson_system``.
-    cot_entries : wp.array[wp.float32]
-        Per-face half-cotangent weights, reused by the divergence.
+    cot_entries : twt.Array2dFloat32
+        ``(n_faces, 3)`` per-face half-cotangent weights, reused by the divergence. Always
+        ``float32`` regardless of the ``cot_entries`` precision passed in or built internally.
     face_normals : wp.array[wp.vec3]
         One unit normal per face.
     face_areas : wp.array[wp.float32]
@@ -209,6 +219,20 @@ def heat_operators(
     # ``cotmatrix`` casts the shared float32 half-cotangent weights to float64 and assembles the
     # operator natively in a single build, avoiding a recast rebuild (see cotmatrix's kernel note).
     laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
+
+    # The divergence kernel this bundle feeds (``kernels/heat.py::integrated_divergence``) is
+    # hardcoded ``wp.array2d[wp.float32]`` -- ``cotmatrix`` above accepts either precision because
+    # it casts internally, but this tuple's own ``cot_entries`` field is documented and used
+    # downstream as float32 only, so a caller-supplied float64 table must be narrowed before it is
+    # returned rather than passed through at whatever precision it arrived in.
+    if cot_entries.dtype is not wp.float32:
+        narrowed_cot_entries = twt.empty_2d(
+            (int(cot_entries.shape[0]), int(cot_entries.shape[1])),
+            wp.float32,
+            device=vertices.device,
+        )
+        wp.utils.array_cast(cot_entries.flatten(), narrowed_cot_entries.flatten())
+        cot_entries = narrowed_cot_entries
 
     # Face normals / areas (float32) for the gradient; the lumped mass is built natively in float64
     # by ``mass_matrix_entries``.
@@ -471,13 +495,22 @@ def heat_signed_distance(
         device=device,
     )
 
-    # Stage 2: diffuse the tangent field, then keep only its direction.
+    # Stage 2: diffuse the tangent field, then keep only its direction. The floor below which a
+    # vector is treated as vanished has to be relative to the field's own maximum, not the fixed
+    # ``TOLERANCE_ZERO_CONSTANT`` -- this field carries the mesh's scale exactly like the vector
+    # heat method's direction field below, and an absolute floor zeroes most of it on a mesh not
+    # near unit scale (confirmed: 111 of 162 vertices at a 1e-6 scale, all resolved relative to the
+    # field's own maximum).
     diffused = tw.heat.diffuse_tangent_field(vector_system, source)
+    diffused_lengths = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    wp.map(wp.length, diffused, out=diffused_lengths)
+    diffused_maximum = tw.reduce.max(diffused_lengths)
+
     unit_field = wp.empty(n_vertices, dtype=wp.vec2d, device=device)
     wp.map(
         kernel_predicates.normalize_or_zero,
         diffused,
-        wp.float64(TOLERANCE_ZERO_CONSTANT),
+        wp.float64(_RELATIVE_ZERO * diffused_maximum),
         out=unit_field,
     )
 
@@ -616,13 +649,6 @@ def _solve_poisson_shifted(
 # The vector heat method: transport, scalar extension and the logarithmic map
 # --------------------------------------------------------------------------------------
 
-# A diffused field is treated as having vanished below this fraction of its *own* maximum. Both
-# fields these solvers divide by -- the direction field and the source indicator -- carry the mesh's
-# scale as ~1/scale^2, so the cutoff has to be relative or the whole answer silently goes to zero on
-# a mesh measured in millimetres. It is deliberately far below the round-off floor (~1e-08 of the
-# maximum): see ``kernels/heat/vector.py`` for why nothing here can separate noise from signal.
-_RELATIVE_ZERO = 1e-12
-
 # Below this fraction of the direction field's maximum, a transported direction cannot be told from
 # the round-off the solve leaves where the transported copies cancel, measured at 8.7e-09 of the
 # maximum. A decade above that, and the *only* thing it drives is the mask
@@ -660,9 +686,15 @@ def vector_heat_operators(
     3. the [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames] every 2D component
        is measured in.
 
-    Pass the result back through any solver's ``operators=`` argument to skip the assembly — most of
-    the cost on a coarse mesh, and all of it when the solve converges quickly. That is the split
+    Pass the result back through any solver's ``operators=`` argument to skip the assembly of these
+    three pieces on every call after the first. That is the split
     ``potpourri3d.MeshVectorHeatSolver`` gets from being an object; here it stays a plain tuple.
+    What it does **not** skip is the vector system's own Jacobi preconditioner:
+    [`diffuse_tangent_field`][triwarp.heat.diffuse_tangent_field] calls
+    [`solve_spd`][triwarp.linalg.solve_spd] with no ``preconditioner=``, so every diffusion solve
+    rebuilds one from ``vector_system`` -- unlike the scalar bundle's own preconditioners, which
+    [`heat_operators`][triwarp.heat.heat_operators] builds once and this tuple carries. A caller
+    running many transports or log maps against one mesh still pays that rebuild each time.
 
     Parameters
     ----------
@@ -1020,14 +1052,17 @@ def log_map(
 
     sources = wp.array([source], dtype=wp.int32, device=device)
     # The source's own reference direction, transported outwards: this is the "which way was x?"
-    # field the angle is measured against.
+    # field the angle is measured against. Raw (unnormalized) magnitude, exactly like
+    # ``transport_tangent_vectors``' own ``direction`` -- so the cut-locus test below has to floor
+    # it relative to its own maximum for the same reason that function does (§ its docstring).
     reference = wp.array([[1.0, 0.0]], dtype=wp.vec2, device=device)
+    transported_raw = _diffuse_from_sources(vector_system, sources, reference, n_vertices, device)
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.map(
-        kernel_array.to_vec2,
-        _diffuse_from_sources(vector_system, sources, reference, n_vertices, device),
-        out=transported,
-    )
+    wp.map(kernel_array.to_vec2, transported_raw, out=transported)
+
+    reference_lengths = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    wp.map(wp.length, transported_raw, out=reference_lengths)
+    reference_tolerance = wp.float32(_RELATIVE_ZERO * tw.reduce.max(reference_lengths))
 
     # Radial direction: the unit gradient of the distance field, averaged onto vertices and
     # expressed in each vertex's frame.
@@ -1048,14 +1083,29 @@ def log_map(
         inputs=[faces, areas, face_gradient, vertex_gradient],
         device=device,
     )
+    # ``vertex_gradient`` is an area-weighted *sum* of unit vectors (see
+    # ``scatter_face_field_to_vertices``), so its magnitude carries the mesh's coordinate scale
+    # squared and the floor below it has to be relative to its own maximum -- the same reasoning as
+    # ``reference_tolerance`` above, applied to a differently-scaled field.
+    gradient_lengths = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    wp.map(wp.length, vertex_gradient, out=gradient_lengths)
+    gradient_tolerance = wp.float32(_RELATIVE_ZERO * tw.reduce.max(gradient_lengths))
+
     radial = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.map(kernel_heat.world_to_tangent_unit, vertex_gradient, basis_x, basis_y, out=radial)
+    wp.map(
+        kernel_heat.world_to_tangent_unit,
+        vertex_gradient,
+        basis_x,
+        basis_y,
+        gradient_tolerance,
+        out=radial,
+    )
 
     logarithm = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.launch(
         kernel_heat.log_map_from_angles,
         dim=n_vertices,
-        inputs=[radial, transported, distance, logarithm],
+        inputs=[radial, transported, distance, reference_tolerance, logarithm],
         device=device,
     )
     return logarithm

@@ -318,11 +318,19 @@ def face_unit_gradients(
 
 
 @wp.func
-def world_to_tangent_unit(value: wp.vec3, basis_x: wp.vec3, basis_y: wp.vec3) -> wp.vec2:
+def world_to_tangent_unit(
+    value: wp.vec3, basis_x: wp.vec3, basis_y: wp.vec3, tolerance: wp.float32
+) -> wp.vec2:
     # Express a 3D vertex field in each vertex's tangent basis, normalized. Only the direction
     # survives, which is all the log map's angle needs.
+    #
+    # ``tolerance`` must be relative to ``value``'s own field maximum, not a fixed constant:
+    # ``value`` is an area-weighted *sum* of unit vectors (see ``scatter_face_field_to_vertices``),
+    # so its magnitude carries the mesh's coordinate scale squared and a fixed floor collapses the
+    # whole log map to angle zero on any mesh not near unit scale (confirmed: every one of 162
+    # vertices on a unit icosphere scaled by 1e-7).
     tangent = wp.vec2(wp.dot(value, basis_x), wp.dot(value, basis_y))
-    return normalize_or_zero(tangent, TOLERANCE_ZERO_CONSTANT)
+    return normalize_or_zero(tangent, tolerance)
 
 
 @wp.kernel
@@ -330,6 +338,7 @@ def log_map_from_angles(
     radial: wp.array[wp.vec2],
     transported: wp.array[wp.vec2],
     distance: wp.array[wp.float64],
+    reference_tolerance: wp.float32,
     out_log: wp.array[wp.vec2],
 ) -> None:
     # Polar coordinates of each vertex as seen from the source.
@@ -342,9 +351,13 @@ def log_map_from_angles(
     reference = transported[v]
     outward = radial[v]
     r = wp.float32(distance[v])
-    if wp.length(reference) <= TOLERANCE_ZERO_CONSTANT or wp.length(outward) <= (
-        TOLERANCE_ZERO_CONSTANT
-    ):
+    # ``reference`` is the raw (unnormalized) diffused field -- the same quantity
+    # ``transport_tangent_vectors`` calls ``direction`` and floors relative to its own maximum, so
+    # this comparison must be too, for the identical reason ``world_to_tangent_unit`` above needs
+    # one. ``outward`` is different: ``world_to_tangent_unit`` already normalized it to unit length
+    # or exactly zero, so comparing it to the fixed ``TOLERANCE_ZERO_CONSTANT`` here is only asking
+    # "was it zeroed", not re-testing a raw physical magnitude.
+    if wp.length(reference) <= reference_tolerance or wp.length(outward) <= TOLERANCE_ZERO_CONSTANT:
         # On the cut locus the transported directions arriving from either side cancel and there is
         # no angle to report -- the log map genuinely has none there. Keep the radius and use angle
         # zero, so the magnitude still means what it should.

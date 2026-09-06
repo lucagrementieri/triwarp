@@ -1390,6 +1390,52 @@ def test_log_map_is_zero_at_its_source(icosahedron: tuple[object, wp.Mesh], devi
     assert np.allclose(logarithm[3], 0.0, rtol=1e-6, atol=1e-6)
 
 
+def test_log_map_is_invariant_to_mesh_scale(
+    icosphere_coarse: tuple[object, wp.Mesh], device: str
+) -> None:
+    """
+    Class A: the same surface in different units maps to the same angles, scaled.
+
+    ``world_to_tangent_unit``'s vertex-gradient field is an area-weighted *sum* of unit vectors
+    (see ``kernels/heat.py::scatter_face_field_to_vertices``), so its magnitude carries the mesh's
+    coordinate scale *squared* -- against a fixed absolute floor the failure is not an error but a
+    silent collapse of the whole log map to angle zero, because ``log_map_from_angles`` keeps the
+    (correct) radius and reports an arbitrary angle whenever it reads the field as vanished. Every
+    one of this fixture's 162 vertices reported angle zero at a scale of 1e-7, and 0 do now (the
+    source's own row aside, which is forced to angle zero by construction at every scale).
+
+    Excludes vertex 3, this mesh's genuine cut-locus antipode (confirmed against
+    [`transport_tangent_vectors`][triwarp.heat.transport_tangent_vectors]'s own ``resolved``
+    mask): there the transported directions arriving from either side genuinely cancel, and on
+    CUDA enough round-off survives that cancellation to be renormalized into a full-length but
+    arbitrary direction (see ``transport_tangent_vectors``'s own ``Notes``) -- so its angle is not
+    expected to agree between the two scales, independently of this bug.
+    """
+    _, mesh_wp = icosphere_coarse
+    cut_locus = 3  # this mesh's antipode of vertex 0 -- see the docstring above
+    unit = tw.heat.log_map(mesh_wp.points, mesh_wp.indices, 0).numpy()
+    rescaled = tw.heat.log_map(
+        points_to_warp(mesh_wp.points.numpy() * 1e-7, mesh_wp.device), mesh_wp.indices, 0
+    ).numpy()
+
+    # Non-vacuous on both sides: the unit-scale angles spread widely away from the source and the
+    # cut locus, and the source's own row -- no other -- reads as vanished at either scale.
+    excluded = (0, cut_locus)
+    unit_angles = np.arctan2(unit[:, 1], unit[:, 0])
+    assert np.std(np.delete(unit_angles, excluded)) > 0.5
+    rescaled_angles = np.arctan2(rescaled[:, 1], rescaled[:, 0])
+    assert np.flatnonzero(np.abs(unit[:, 1]) < 1e-30).tolist() == [0]
+    assert np.flatnonzero(np.abs(rescaled[:, 1]) < 1e-30).tolist() == [0]
+
+    # Compare angles rather than raw coordinates: at 1e-7 the *radius* already carries seven orders
+    # of magnitude of scale, so an absolute tolerance on the coordinates themselves would either
+    # miss a real angular error (loose) or fail on float32 noise alone (tight). 0.02 rad (~1.1
+    # degrees) is well above the ~7e-3 rad of float32 noise measured at this scale and far below
+    # the near-pi error the collapse produces.
+    angle_diff = np.abs(np.angle(np.exp(1j * (rescaled_angles - unit_angles))))
+    assert np.delete(angle_diff, excluded).max() < 0.02
+
+
 # ---------------------------------------------------------------------------
 # vector_heat_operators (the amortized path)
 # ---------------------------------------------------------------------------
