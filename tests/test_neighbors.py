@@ -24,6 +24,7 @@ from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
+import triwarp.typing as twt
 from tests.conversions import (
     meshlib_indices_to_numpy,
     meshlib_scalars_to_numpy,
@@ -907,6 +908,69 @@ def test_query_nearest_ties(device: str, backend: Literal["bvh", "hashgrid"], k:
         lattice[query_indices_wp.numpy().reshape(rows)] - queries[:, None, :], axis=-1
     )
     assert np.allclose(gathered, query_distances_np, rtol=1e-5, atol=1e-5)
+
+
+def test_knn_sorted_insert_rejects_nan_instead_of_writing_past_its_row(device: str):
+    """
+    Not a library comparison: no reference can observe an out-of-bounds kernel write.
+
+    ``knn_sorted_insert`` admits a candidate on two comparisons and then places it with
+    ``binary_search_index`` (``searchsorted(side="right")``) plus ``array_shift_insert``. Every
+    comparison against a NaN is false, so a NaN distance passes *both* admissions (``NaN > radius``
+    and ``NaN >= inf`` are each false), the search's ``values[mid] > value`` probe never fires, and
+    it returns ``n`` -- whereupon ``array_shift_insert`` writes ``row[n]``, one element past the
+    caller's ``k``-wide row.
+
+    A NaN query reaches it: ``wp.hash_grid_query`` clamps a NaN centre into the guard region and
+    enumerates a real cell, and ``knn_linear_scan`` walks the whole cloud unconditionally, so every
+    candidate arrives with ``d`` NaN. Only the global-memory row path is exposed -- the register-row
+    kernels bound their carry by ``row_size`` -- so ``k`` must exceed the largest
+    ``KNN_ROW_BUCKETS`` entry, which is what makes this a kernel-level test rather than a
+    ``query_nearest`` one: the public call allocates exactly ``(m, k)``, so the overrun of the last
+    query's row lands past the whole allocation and is invisible from Python (host-heap corruption
+    on the CPU device, section 12 of ``.claude/CLAUDE.md``).
+
+    The canary is the second row of a two-row output with **one** thread launched, so nothing is
+    entitled to touch it. Mutation probe: deleting the ``wp.isnan`` guard from
+    ``knn_sorted_insert`` fails the two canary asserts on both devices, with row 1 holding the NaN
+    and the offending point index; the ``row0`` assert passes either way, so it is the canary that
+    carries this test and not the answer.
+    """
+    k = max(kernel_neighbors.KNN_ROW_BUCKETS) + 6
+    rng = np.random.default_rng(0)
+    points = rng.random((200, 3), dtype=np.float32) * 0.1
+    points_wp = points_to_warp(points, device)
+    grid = wp.HashGrid(16, 16, 16, device=device)
+    grid.build(points_wp, 0.05)
+
+    indices_wp = twt.empty_2d((2, k), wp.int32, device=device)
+    distances_wp = twt.empty_2d((2, k), wp.float32, device=device)
+    indices_wp.fill_(-7)
+    distances_wp.fill_(-7.0)
+    queries_wp = points_to_warp(np.full((1, 3), np.nan, dtype=np.float32), device)
+    wp.launch(
+        kernel_neighbors.query_hashgrid_nearest_neighbors,
+        dim=1,
+        inputs=[
+            points_wp,
+            queries_wp,
+            grid.id,
+            wp.int32(k),
+            wp.float32(1e30),
+            wp.float32(0.05),
+            wp.float32(1.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.1, 0.1, 0.1),
+            indices_wp,
+            distances_wp,
+        ],
+        device=device,
+    )
+    # A NaN query matches nothing, which is the answer the row itself should carry.
+    assert np.array_equal(distances_wp.numpy()[0], np.full(k, np.inf, dtype=np.float32))
+    # The canary: no thread was launched over row 1, so it must still hold the fill.
+    assert np.array_equal(distances_wp.numpy()[1], np.full(k, -7.0, dtype=np.float32))
+    assert np.array_equal(indices_wp.numpy()[1], np.full(k, -7, dtype=np.int32))
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])

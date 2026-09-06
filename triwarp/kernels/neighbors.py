@@ -313,12 +313,34 @@ def knn_sorted_insert(
     point_index: wp.int32,
     d: wp.float32,
     k: wp.int32,
-    radius: wp.float32,
+    max_radius: wp.float32,
     out_indices_row: wp.array[wp.int32],
     out_distances_row: wp.array[wp.float32],
 ) -> None:
     # Insert ``(point_index, d)`` into the ascending k-nearest rows, dropping the current worst.
-    if d > radius:
+    #
+    # **The NaN rejection is a memory-safety guard, not tidiness.** Every comparison against a NaN
+    # is false, so a NaN ``d`` passes both admission tests below (``NaN > max_radius`` and
+    # ``NaN >= inf`` are each false) and then steers ``binary_search_index`` -- which is
+    # ``searchsorted(side="right")``, so its ``values[mid] > value`` probe never fires -- all the
+    # way to ``left = n``. It returns ``n``, and ``array_shift_insert`` writes ``row[n]``: one
+    # element past the caller's ``k``-wide row, i.e. into the next query's row, or past the whole
+    # ``(m, k)`` allocation for the last query. Measured on both devices with a canary row that no
+    # thread was launched over: it comes back holding the NaN and the offending point index.
+    #
+    # It is reachable from the public surface at ``k > 64`` (below that the register-row kernels
+    # bound their own loops): a NaN query point makes ``wp.hash_grid_query`` clamp into the guard
+    # region and enumerate cell 0 (``warp/native/hashgrid.h`` asserts on it only in debug mode),
+    # and ``knn_linear_scan`` enumerates the whole cloud unconditionally, so *every* candidate then
+    # arrives here with ``d`` NaN. A NaN in ``points`` reaches it the same way. On the CPU device
+    # an out-of-bounds kernel write is host-heap corruption rather than a fault.
+    #
+    # Spelled ``wp.isnan`` rather than folding the test into the two comparisons below (``if not
+    # (d <= max_radius): return``): the negated form generates the same code but reads as a typo,
+    # and this is the one line here a future edit must not "simplify".
+    if wp.isnan(d):
+        return
+    if d > max_radius:
         return
     if d >= out_distances_row[k - 1]:
         return
