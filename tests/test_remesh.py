@@ -1564,13 +1564,6 @@ def test_flip_to_delaunay_region_gated(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     assert np.array_equal(faces_before[~region_np], faces_after[~region_np])
 
 
-def test_flip_to_delaunay_empty(device: str):
-    v = wp.zeros(0, dtype=wp.vec3, device=device)
-    f = wp.zeros(0, dtype=wp.int32, device=device)
-    out = tw.remesh.flip_to_delaunay(v, f)
-    assert int(out.shape[0]) == 0
-
-
 def test_flip_to_delaunay_rejects_a_mismatched_region(device: str) -> None:
     """
     Not a library comparison: the documented ``ValueError`` on a wrong-length ``region``.
@@ -1819,12 +1812,6 @@ def test_flip_by_objective_invalid(device: str) -> None:
         tw.remesh.flip_by_objective(
             vertices_wp, faces_wp, region=wp.zeros(2, dtype=wp.bool, device=device)
         )
-
-
-def test_flip_by_objective_empty(device: str) -> None:
-    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    assert int(tw.remesh.flip_by_objective(vertices_wp, faces_wp).shape[0]) == 0
 
 
 # --- intrinsic_delaunay ---------------------------------------------------------------
@@ -3229,13 +3216,36 @@ def test_refine_region_to_density_empty_region(hemisphere: tuple[tm.Trimesh, wp.
     assert int(whole_f.shape[0]) >= int(faces_wp.shape[0])
 
 
-def test_refine_region_to_density_empty_mesh(device: str) -> None:
-    """An empty mesh comes back unchanged rather than raising."""
-    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
-    faces_wp = wp.zeros(0, dtype=wp.int32, device=device)
-    region_wp = wp.zeros(0, dtype=wp.bool, device=device)
-    _new_v, new_f, _new_r = tw.remesh.refine_region_to_density(vertices_wp, faces_wp, region_wp)
-    assert int(new_f.shape[0]) == 0
+# (name, callable) pairs; each callable takes (vertices, faces) and returns a one-tuple of the
+# array to check, matching what each original empty-mesh test checked -- flip_to_delaunay and
+# flip_by_objective return faces only; refine_region_to_density returns (vertices, faces, region)
+# but only its faces were ever asserted on an empty mesh, so this keeps that same narrower claim
+# rather than widening it.
+_REMESH_EMPTY_MESH_CASES = [
+    ("flip_to_delaunay", lambda v, f: (tw.remesh.flip_to_delaunay(v, f),)),
+    ("flip_by_objective", lambda v, f: (tw.remesh.flip_by_objective(v, f),)),
+    (
+        "refine_region_to_density",
+        lambda v, f: (
+            tw.remesh.refine_region_to_density(v, f, wp.zeros(0, dtype=wp.bool, device=f.device))[
+                1
+            ],
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "remesh_fn",
+    [case[1] for case in _REMESH_EMPTY_MESH_CASES],
+    ids=[case[0] for case in _REMESH_EMPTY_MESH_CASES],
+)
+def test_remesh_empty_mesh_is_a_noop(device: str, remesh_fn) -> None:
+    """Not a library comparison: every operator returns an all-empty result on an empty mesh."""
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    for result_wp in remesh_fn(vertices_wp, faces_wp):
+        assert int(result_wp.shape[0]) == 0
 
 
 def test_refine_region_to_density_rejects_a_mismatched_region(
