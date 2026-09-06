@@ -112,6 +112,43 @@ for section, modules in SECTIONS.items():
 
         mkdocs_gen_files.set_edit_path(doc_path, module_path.relative_to(root))
 
+# The narrative/guide pages are hand-written under docs/ (not generated), so they're listed here
+# by hand rather than discovered -- this is the one place literate-nav's ordering is authored
+# rather than derived from SECTIONS above. Keep this list and the files under docs/ in sync: a
+# page added to one without the other is either unreachable from the nav or a 404 in this file.
+GUIDE_PAGES: list[tuple[str, str] | tuple[str, str, list[tuple[str, str]]]] = [
+    ("Getting started", "getting-started.md"),
+    ("Concepts", "concepts.md"),
+    (
+        "Cookbook",
+        "cookbook/index.md",
+        [
+            ("Cleaning and remeshing a rough mesh", "cookbook/clean-and-remesh.md"),
+            ("Point cloud to watertight surface", "cookbook/point-cloud-to-surface.md"),
+            ("Geodesic distance fields", "cookbook/geodesic-distance.md"),
+            ("Aligning two scans", "cookbook/align-two-scans.md"),
+        ],
+    ),
+    (
+        "Migrating from another library",
+        "migrating-from/index.md",
+        [
+            ("trimesh", "migrating-from/trimesh.md"),
+            ("libigl", "migrating-from/igl.md"),
+            ("Open3D", "migrating-from/open3d.md"),
+            ("MeshLab / PyMeshLab", "migrating-from/meshlab.md"),
+            ("potpourri3d", "migrating-from/potpourri3d.md"),
+            ("PyTorch3D", "migrating-from/pytorch3d.md"),
+        ],
+    ),
+    ("Performance", "performance.md"),
+]
+
 with mkdocs_gen_files.open("SUMMARY.md", "w") as nav_file:
     nav_file.write("* [Home](index.md)\n")
+    for entry in GUIDE_PAGES:
+        title, path, *rest = entry
+        nav_file.write(f"* [{title}]({path})\n")
+        for child_title, child_path in (rest[0] if rest else []):
+            nav_file.write(f"    * [{child_title}]({child_path})\n")
     nav_file.writelines(nav.build_literate_nav())

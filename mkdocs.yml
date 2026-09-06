@@ -9,8 +9,11 @@ theme:
   logo: assets/logo.svg
   favicon: assets/logo.svg
   features:
+    - navigation.tabs
     - navigation.sections
     - navigation.indexes
+    - navigation.top
+    - toc.follow
     - content.code.copy
     - search.suggest
   palette:
