@@ -456,7 +456,15 @@ def fill_dp_span(
     base = tables.dp_offsets[ell]
     if tables.forbidden[base + i * b + j] != 0:
         # Interior chord would duplicate an existing mesh edge (non-manifold) — leave it unfilled.
-        dp[base + i * b + j] = BAD_METRIC
+        # This is a *hard* rejection and must use the true-infinite sentinel, not ``BAD_METRIC``:
+        # ``BAD_METRIC`` is also what a legal-but-ugly triangle scores (see
+        # ``triangle_fill_metric``), and that value is deliberately still selectable so the
+        # min-area fallback has something to work with. Using it here too would let a parent
+        # interval, forced to choose between two forbidden children, numerically prefer whichever
+        # BAD_METRIC total happened to be smaller and emit its own triangle anyway — reusing the
+        # very chord that made the child infeasible. Only genuine infinity propagates through
+        # ``combine_metric``'s sum/max without being mistaken for "bad but legal".
+        dp[base + i * b + j] = FLOAT32_INF_CONSTANT
         prev[base + i * b + j] = -1
         return
     o = tables.loop_starts[ell]
@@ -473,7 +481,13 @@ def fill_dp_span(
         )
         update_argmin(best_val, best_k, val, k)
     dp[base + i * b + j] = best_val
-    prev[base + i * b + j] = best_k
+    # Every apex left available required at least one forbidden sub-chord (a genuinely infinite
+    # child cost propagates here through the sum/max in ``apex_cost``, never a finite BAD_METRIC),
+    # so there is no legal triangulation of this span at all — not merely a bad-looking one.
+    if best_val >= FLOAT32_INF_CONSTANT:
+        prev[base + i * b + j] = wp.int32(-1)
+    else:
+        prev[base + i * b + j] = best_k
 
 
 @wp.kernel(enable_backward=False)
@@ -522,8 +536,9 @@ def fill_dp_span_tiled(
     j = i + span
     base = tables.dp_offsets[ell]
     if tables.forbidden[base + i * b + j] != 0:
+        # True infinity, not ``BAD_METRIC`` — see the identical branch in ``fill_dp_span``.
         if t == 0:
-            dp[base + i * b + j] = BAD_METRIC
+            dp[base + i * b + j] = FLOAT32_INF_CONSTANT
             prev[base + i * b + j] = -1
         return
     o = tables.loop_starts[ell]
@@ -542,7 +557,11 @@ def fill_dp_span_tiled(
     block_val, block_k = tile_argmin(best_val, best_k)
     if t == 0:
         dp[base + i * b + j] = block_val
-        prev[base + i * b + j] = block_k
+        # Every remaining apex required a forbidden sub-chord — see ``fill_dp_span``.
+        if block_val >= FLOAT32_INF_CONSTANT:
+            prev[base + i * b + j] = wp.int32(-1)
+        else:
+            prev[base + i * b + j] = block_k
 
 
 @wp.kernel

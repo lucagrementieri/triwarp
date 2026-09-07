@@ -1010,6 +1010,66 @@ def test_fill_min_weight_avoids_multiple_edges(device: str) -> None:
     assert not tw.validation.is_edge_manifold(unresolved, allow_boundary_edges=True)
 
 
+def test_fill_min_weight_leaves_a_hole_open_when_both_diagonals_are_forbidden(device: str) -> None:
+    """
+    A quad hole whose both diagonals are already forbidden must come back unfilled.
+
+    A quad hole (0, 1, 2, 3) whose *both* diagonals -- 0-2 and 1-3 -- already exist as mesh edges
+    elsewhere. A single forbidden diagonal (the sibling test above) still leaves one legal
+    triangulation; here neither of the two possible triangulations of a 4-gon has an admissible
+    apex, so the hole must come back untouched rather than filled with a triangle that reuses one
+    of the forbidden chords.
+
+    This configuration needs a non-orientable surrounding to exist at all (a planar/orientable
+    quad's two diagonals always cross, so at most one can be a pre-existing edge without already
+    making some rim vertex non-manifold) -- vertices 4 and 5 below are each connected to all four
+    rim vertices, giving the patch a single cross-cap. Verified independently: every incident edge
+    has the expected face count (rim edges 1, everything else 2) and every vertex's link is one
+    connected fan, i.e. this is a genuine 2-manifold with one boundary loop -- (0, 1, 2, 3) -- and
+    diagonals (0, 2) and (1, 3) both present with two faces each, not touching the rim.
+    """
+    vertices = wp.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.3, 0.1, 0.7],
+            [-0.2, 0.2, -0.7],
+        ],
+        dtype=wp.vec3,
+        device=device,
+    )
+    faces = wp.array(
+        [
+            0, 1, 5,
+            1, 2, 4,
+            2, 3, 5,
+            3, 0, 4,
+            0, 2, 4,
+            0, 2, 5,
+            1, 3, 4,
+            1, 3, 5,
+        ],
+        dtype=wp.int32,
+        device=device,
+    )  # fmt: skip
+
+    loops = tw.boundary.boundary_loops(vertices, faces)
+    assert len(loops) == 1
+    assert loops[0].numpy().tolist() == [0, 1, 2, 3]
+
+    for metric in ["plane_normalized", "min_area", "universal"]:
+        filled = tw.holes.fill_min_weight(
+            vertices, faces, metric=metric, resolve_multiple_edges=True
+        )
+        assert np.array_equal(filled.numpy(), faces.numpy())
+
+    result_loops = tw.boundary.boundary_loops(vertices, faces)
+    assert len(result_loops) == 1
+    assert result_loops[0].numpy().tolist() == [0, 1, 2, 3]
+
+
 def test_fill_min_weight_preserve_largest(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = half_torus
     loop_sizes = _loop_sizes(mesh_wp)
