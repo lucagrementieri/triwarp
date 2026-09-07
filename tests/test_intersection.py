@@ -796,6 +796,54 @@ def test_mesh_with_mesh_icosahedron_cave_cube(
     assert np.isclose(_segment_total_length(segments_np), _segment_total_length(ref_segments_np))
 
 
+def test_mesh_with_mesh_near_tangent_pair_is_not_dropped(device: str) -> None:
+    """
+    A pair crossing at a very small dihedral angle is not silently dropped by the narrow phase.
+
+    ``triangle_intersection_segment`` computes ``line_direction = cross(normal, other_normal)`` in
+    float32; for two triangles related by a tiny tilt about a *generic* (non-axis-aligned) axis,
+    this cross product used to underflow to the exact zero vector via catastrophic cancellation --
+    two float32 products agreeing to more digits than float32 carries -- even though the two
+    triangles genuinely cross (confirmed independently by the float64 broad-phase test that admits
+    the pair). The fix does the whole computation in float64, the same precedent
+    ``predicates.triangles_intersect`` already sets one level up. This exact vertex pair was found
+    by searching random rigid rotations for one that reproduces the failure; it is pinned here
+    rather than re-searched.
+    """
+    a = np.array(
+        [
+            [-4.6970606, -2.4794655, -4.6679626],
+            [2.8626564, -6.442955, 0.54178125],
+            [0.917202, 4.4612103, 2.0630906],
+        ],
+        dtype=np.float32,
+    )
+    b = np.array(
+        [
+            [-4.69706, -2.4794652, -4.667963],
+            [2.8626568, -6.442955, 0.5417808],
+            [0.9172017, 4.4612103, 2.063091],
+        ],
+        dtype=np.float32,
+    )
+    verts_np = np.concatenate([a, b], axis=0)
+    faces_a_np = np.array([0, 1, 2], dtype=np.int32)
+    faces_b_np = np.array([3, 4, 5], dtype=np.int32)
+    verts_wp = wp.array(verts_np, dtype=wp.vec3, device=device)
+    faces_a_wp = wp.array(faces_a_np, dtype=wp.int32, device=device)
+    faces_b_wp = wp.array(faces_b_np, dtype=wp.int32, device=device)
+
+    crossing = tw.intersection._colliding_face_pairs(
+        verts_wp, faces_a_wp, verts_wp, faces_b_wp, 16, "probe"
+    )
+    assert crossing is not None, "the float64 broad phase must confirm this pair genuinely crosses"
+
+    segments_wp = tw.intersection.mesh_with_mesh(verts_wp, faces_a_wp, verts_wp, faces_b_wp)
+    assert int(segments_wp.shape[0]) == 1
+    p0, p1 = segments_wp.numpy()[0]
+    assert np.linalg.norm(p1 - p0) > 1e-5, "the recovered segment must not itself be degenerate"
+
+
 # --- marching_triangles: isocontours of a scalar field (potpourri3d reference) ---------
 @pytest.mark.parity("mesh_collision_pairs", "meshlib")
 def test_mesh_collision_pairs_matches_meshlib(
@@ -1475,6 +1523,43 @@ def test_clip_mesh_with_field_reproduces_slice_mesh_with_plane(
     assert int(sliced_f.shape[0]) > 0
     assert np.array_equal(clipped_f.numpy(), sliced_f.numpy())
     assert np.allclose(clipped_v.numpy(), sliced_v.numpy(), rtol=1e-5, atol=1e-5)
+
+
+def test_clip_mesh_with_field_through_a_saddle_vertex_reuses_it(device: str) -> None:
+    """
+    A saddle vertex within tolerance of the level set is reused exactly, not interpolated nearby.
+
+    ``test_split_mesh_with_plane_through_a_vertex_inserts_nothing_there`` covers the *local
+    extremum* case (a plane through the icosahedron's apex, whose whole ring is on one side), which
+    ``classify_faces_for_split``'s ``SPLIT_CLASS_CUT_CORNER`` and this function's slice/clip path
+    both handle safely without reaching the cut-triangle kernel at all. This is the other case that
+    class exists for: a *saddle* on-plane vertex, whose ring straddles the level set, which used to
+    land in ``SLICE_CLASS_CUT_TRI`` alongside a genuine two-crossing cut and get a new,
+    near-duplicate vertex interpolated next to it instead of reusing it.
+    """
+    # One triangle: corner 0 sits within TOLERANCE_MERGE of the level set (but not exactly on it,
+    # so a naive interpolation would land a hair's breadth away rather than exactly on it), corner
+    # 1 is strictly kept, corner 2 is strictly dropped.
+    vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    faces_np = np.array([0, 1, 2], dtype=np.int32)
+    values_np = np.array([0.5 * TOLERANCE_MERGE, 1.0, -1.0], dtype=np.float32)
+
+    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+
+    new_v, new_f = tw.intersection.clip_mesh_with_field(vertices_wp, faces_wp, values_wp, 0.0)
+    positions_np = new_v.numpy()
+
+    # Exactly one genuine crossing (corner 1 to corner 2) plus the reused on-plane corner: three
+    # vertices, one triangle -- not four vertices from two independently-interpolated corners.
+    assert positions_np.shape[0] == 3
+    assert int(new_f.shape[0]) == 3
+    assert np.any(np.all(positions_np == vertices_np[0], axis=1)), (
+        "the on-plane vertex must be reused bit-exactly, not interpolated near it"
+    )
+    mesh_out = tm.Trimesh(positions_np, new_f.numpy().reshape(-1, 3), process=False)
+    assert mesh_out.area_faces.min() > 0
 
 
 def test_clip_mesh_with_field_section_is_the_marching_triangles_curve(

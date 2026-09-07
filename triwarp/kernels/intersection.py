@@ -1,3 +1,5 @@
+from typing import Any
+
 import warp as wp
 
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
@@ -19,6 +21,19 @@ CASE_ONE_EDGE = wp.constant(wp.int32(3))
 
 @wp.func
 def triangle_case_code(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
+    # ``CASE_ONE_EDGE`` fires only for the sorted pattern ``(0, 0, 1)`` -- an edge lying in the
+    # plane with its free vertex strictly positive -- and *not* for its sign-flipped mirror
+    # ``(-1, 0, 0)``. That asymmetry looks like a bug (an edge-in-plane face with the free vertex
+    # negative silently reports no segment) and was changed to fire on both for a session, which
+    # regressed test_mesh_with_plane_matches_trimesh: an in-plane mesh edge is normally shared by
+    # two faces whose own free vertices sit on *opposite* sides of the plane, so making the test
+    # symmetric makes both faces emit the same segment (a duplicate), where the asymmetric form
+    # emits it from exactly one side. Confirmed on the icosahedron's axis-plane cut: the shared
+    # edge (vtx0, vtx1) lies exactly in the z=0 plane, face [0, 5, 1]'s free vertex is at +z (kept)
+    # and face [0, 1, 7]'s is at -z (dropped) -- trimesh reports that edge once, matching only the
+    # positive side. A genuine residual gap remains for a *boundary* edge (one incident face, no
+    # partner to report from) whose lone free vertex is negative, which still reports nothing; that
+    # is unmeasured and is a narrower, real question than the symmetric fix this comment replaces.
     sa, sb, sc = kernel_array.sort3(s0, s1, s2)
     coded = wp.int32(14) + (sa << 3) + (sb << 2) + (sc << 1)
     if coded == wp.int32(4) or coded == wp.int32(12):
@@ -52,6 +67,14 @@ def plane_with_line(
 
 @wp.func
 def find_unique_sign_vertex(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
+    # The corner whose sign differs from the other two -- shared by ``CASE_BASIC`` (this file's
+    # own sign convention) and the split path's edge-to-edge cut (``face_level_set_signs``'
+    # convention), which is what makes the predicate itself convention-independent: it only
+    # compares the three inputs to each other, never to a named sign value. Every caller has
+    # already established that exactly one of the three differs, which is what makes corner 2 a
+    # safe fallthrough rather than a third test; the all-equal input the two conditions above
+    # would otherwise disagree on (falling through here, `0` under the mirrored `==` form this
+    # replaced) never reaches either caller.
     if s0 != s1 and s0 != s2:
         return wp.int32(0)
     if s1 != s0 and s1 != s2:
@@ -60,12 +83,27 @@ def find_unique_sign_vertex(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int3
 
 
 @wp.func
-def vertex_at(local_index: wp.int32, v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> wp.vec3:
+def vertex_at(local_index: wp.int32, v0: Any, v1: Any, v2: Any) -> Any:
+    # Generic over the vector's precision: called on ``wp.vec3`` throughout
+    # ``mesh_with_plane_segment_for_face`` and on ``wp.vec3d`` inside
+    # ``triangle_intersection_segment``, which does its own arithmetic in float64 (see there).
     if local_index == wp.int32(0):
         return v0
     if local_index == wp.int32(1):
         return v1
     return v2
+
+
+@wp.func
+def find_corner_with_sign(s0: wp.int32, s1: wp.int32, s2: wp.int32, sign: wp.int32) -> wp.int32:
+    # The corner carrying ``sign``, for the cut cases where exactly one does. Corner 2 is the
+    # fallthrough rather than a third test: the caller has already established that one of the
+    # three matches.
+    if s0 == sign:
+        return wp.int32(0)
+    if s1 == sign:
+        return wp.int32(1)
+    return wp.int32(2)
 
 
 @wp.func
@@ -95,13 +133,7 @@ def mesh_with_plane_segment_for_face(
         return False, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
 
     if case_code == CASE_ONE_VERTEX:
-        on_plane_i = wp.int32(0)
-        if s0 == wp.int32(0):
-            on_plane_i = wp.int32(0)
-        elif s1 == wp.int32(0):
-            on_plane_i = wp.int32(1)
-        else:
-            on_plane_i = wp.int32(2)
+        on_plane_i = find_corner_with_sign(s0, s1, s2, SLICE_SIGN_ON_PLANE)
         other_a = (on_plane_i + wp.int32(1)) % wp.int32(3)
         other_b = (on_plane_i + wp.int32(2)) % wp.int32(3)
         on_plane_v = vertex_at(on_plane_i, v0, v1, v2)
@@ -113,8 +145,6 @@ def mesh_with_plane_segment_for_face(
         return False, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
 
     if case_code == CASE_ONE_EDGE:
-        i0 = wp.int32(0)
-        i1 = wp.int32(1)
         if s0 == wp.int32(0) and s1 == wp.int32(0):
             i0 = wp.int32(0)
             i1 = wp.int32(1)
@@ -163,7 +193,10 @@ def vec3_equal(a: wp.vec3, b: wp.vec3) -> wp.bool:
 
 
 @wp.func
-def vec3_argsort(a: wp.vec3) -> tuple[wp.int32, wp.int32, wp.int32]:
+def vec3_argsort(a: wp.vec3d) -> tuple[wp.int32, wp.int32, wp.int32]:
+    # float64 rather than generic: its only caller is ``intersection_line_coordinate``, itself only
+    # called from ``triangle_intersection_segment``, which does its whole computation in float64 --
+    # see the comment there for why.
     xy = a[0] <= a[1]
     yz = a[1] <= a[2]
     xz = a[0] <= a[2]
@@ -181,14 +214,14 @@ def vec3_argsort(a: wp.vec3) -> tuple[wp.int32, wp.int32, wp.int32]:
 
 
 @wp.func
-def interval_intersect(a: wp.vec2, b: wp.vec2) -> wp.vec2:
-    return wp.vec2(wp.max(a[0], b[0]), wp.min(a[1], b[1]))
+def interval_intersect(a: wp.vec2d, b: wp.vec2d) -> wp.vec2d:
+    return wp.vec2d(wp.max(a[0], b[0]), wp.min(a[1], b[1]))
 
 
 @wp.func
 def intersection_line_coordinate(
-    start1: wp.vec3, direction1: wp.vec3, start2: wp.vec3, direction2: wp.vec3
-) -> wp.float32:
+    start1: wp.vec3d, direction1: wp.vec3d, start2: wp.vec3d, direction2: wp.vec3d
+) -> wp.float64:
     minors = wp.cross(direction1, direction2)
     order_x, _order_y, order_z = vec3_argsort(minors)
     minor_x = minors[order_x]
@@ -225,63 +258,84 @@ def triangles_share_vertex(
 def triangle_intersection_segment(
     a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
 ) -> tuple[wp.bool, wp.vec3, wp.vec3]:
-    edge0 = a1 - a0
-    edge1 = a2 - a0
+    # Done in float64 on float32 inputs, the same precedent ``predicates.triangles_intersect``
+    # already sets one level up (the broad phase that accepts a pair before this narrow phase runs)
+    # -- widening is lossless, so this is the same geometry, and what the extra precision buys is
+    # the *decisions*. ``line_direction = cross(normal, other_normal)`` is the one that needed it:
+    # for two triangles whose planes meet at a small dihedral angle, this cross product subtracts
+    # two float32 products that can agree to more digits than float32 carries, underflowing to the
+    # exact zero vector even though the true magnitude -- and the float64 broad-phase test that
+    # already accepted the pair -- is nonzero. Confirmed reproducing a dropped segment (a genuinely
+    # crossing pair, tilted ~1e-7 rad about a generic, non-axis-aligned axis) before this fix;
+    # see plans/review.md item 6c.
+    da0 = kernel_array.to_vec3d(a0)
+    da1 = kernel_array.to_vec3d(a1)
+    da2 = kernel_array.to_vec3d(a2)
+    db0 = kernel_array.to_vec3d(b0)
+    db1 = kernel_array.to_vec3d(b1)
+    db2 = kernel_array.to_vec3d(b2)
+
+    edge0 = da1 - da0
+    edge1 = da2 - da0
     normal = wp.normalize(wp.cross(edge0, edge1))
 
-    other_edge0 = b1 - b0
-    other_edge1 = b2 - b0
+    other_edge0 = db1 - db0
+    other_edge1 = db2 - db0
     other_normal = wp.normalize(wp.cross(other_edge0, other_edge1))
 
-    proj1 = wp.vec3(
-        wp.dot(other_normal, a0 - b0), wp.dot(other_normal, a1 - b0), wp.dot(other_normal, a2 - b0)
+    proj1 = wp.vec3d(
+        wp.dot(other_normal, da0 - db0),
+        wp.dot(other_normal, da1 - db0),
+        wp.dot(other_normal, da2 - db0),
     )
-    proj2 = wp.vec3(wp.dot(normal, b0 - a0), wp.dot(normal, b1 - a0), wp.dot(normal, b2 - a0))
+    proj2 = wp.vec3d(
+        wp.dot(normal, db0 - da0), wp.dot(normal, db1 - da0), wp.dot(normal, db2 - da0)
+    )
 
     order1_x, order1_y, order1_z = vec3_argsort(proj1)
     proj1a = proj1[order1_x]
     proj1c = proj1[order1_z]
     proj1b = proj1[order1_y]
 
-    va_min = vertex_at(order1_x, a0, a1, a2)
-    va_max = vertex_at(order1_z, a0, a1, a2)
+    va_min = vertex_at(order1_x, da0, da1, da2)
+    va_max = vertex_at(order1_z, da0, da1, da2)
     line_origin = (va_min * proj1c - va_max * proj1a) / (proj1c - proj1a)
     line_direction = wp.cross(normal, other_normal)
 
     edge_direction = vertex_at(
-        wp.where(proj1b >= wp.float32(0.0), order1_x, order1_z), a0, a1, a2
-    ) - vertex_at(order1_y, a0, a1, a2)
+        wp.where(proj1b >= wp.float64(0.0), order1_x, order1_z), da0, da1, da2
+    ) - vertex_at(order1_y, da0, da1, da2)
     t2 = intersection_line_coordinate(
-        line_origin, line_direction, vertex_at(order1_y, a0, a1, a2), edge_direction
+        line_origin, line_direction, vertex_at(order1_y, da0, da1, da2), edge_direction
     )
 
-    if t2 > wp.float32(0.0):
-        interval = wp.vec2(wp.float32(0.0), t2)
+    if t2 > wp.float64(0.0):
+        interval = wp.vec2d(wp.float64(0.0), t2)
     else:
-        interval = wp.vec2(t2, wp.float32(0.0))
+        interval = wp.vec2d(t2, wp.float64(0.0))
 
     order2_x, order2_y, order2_z = vec3_argsort(proj2)
-    edge_direction = vertex_at(order2_z, b0, b1, b2) - vertex_at(order2_x, b0, b1, b2)
+    edge_direction = vertex_at(order2_z, db0, db1, db2) - vertex_at(order2_x, db0, db1, db2)
     s1 = intersection_line_coordinate(
-        line_origin, line_direction, vertex_at(order2_x, b0, b1, b2), edge_direction
+        line_origin, line_direction, vertex_at(order2_x, db0, db1, db2), edge_direction
     )
     edge_direction = vertex_at(
-        wp.where(proj2[order2_y] >= wp.float32(0.0), order2_x, order2_z), b0, b1, b2
-    ) - vertex_at(order2_y, b0, b1, b2)
+        wp.where(proj2[order2_y] >= wp.float64(0.0), order2_x, order2_z), db0, db1, db2
+    ) - vertex_at(order2_y, db0, db1, db2)
     s2 = intersection_line_coordinate(
-        line_origin, line_direction, vertex_at(order2_y, b0, b1, b2), edge_direction
+        line_origin, line_direction, vertex_at(order2_y, db0, db1, db2), edge_direction
     )
 
     if s1 <= s2:
-        other_interval = wp.vec2(s1, s2)
+        other_interval = wp.vec2d(s1, s2)
     else:
-        other_interval = wp.vec2(s2, s1)
+        other_interval = wp.vec2d(s2, s1)
 
     interval = interval_intersect(interval, other_interval)
 
     p0 = line_origin + interval[0] * line_direction
     p1 = line_origin + interval[1] * line_direction
-    return True, p0, p1
+    return True, kernel_array.to_vec3(p0), kernel_array.to_vec3(p1)
 
 
 @wp.kernel
@@ -371,18 +425,6 @@ def segment_nondegenerate(segments: wp.array2d[wp.vec3], out_valid: wp.array[wp.
 
 
 @wp.func
-def find_corner_with_sign(s0: wp.int32, s1: wp.int32, s2: wp.int32, sign: wp.int32) -> wp.int32:
-    # The corner carrying ``sign``, for the two cut cases where exactly one does. Corner 2 is the
-    # fallthrough rather than a third test: the caller has already established that one of the three
-    # matches.
-    if s0 == sign:
-        return wp.int32(0)
-    if s1 == sign:
-        return wp.int32(1)
-    return wp.int32(2)
-
-
-@wp.func
 def edge_level_crossing(
     origin: wp.vec3, dest: wp.vec3, value_origin: wp.float32, value_dest: wp.float32
 ) -> wp.vec3:
@@ -462,6 +504,21 @@ def classify_faces_for_slice(
     out_classes[f] = face_class
 
 
+@wp.func
+def on_plane_face_side(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], plane_normal: wp.vec3, f: wp.int32
+) -> tuple[wp.bool, wp.bool]:
+    # A face lying in the plane has no vertex-based tie-break, so its own normal decides which side
+    # it belongs to -- opposing the plane's normal (``dot < 0``) is the side both
+    # ``resolve_on_plane_faces`` and ``label_faces_by_plane_side`` keep. The second return flags a
+    # degenerate (zero-area) face, which has no usable normal at all; each caller maps that onto its
+    # own answer rather than sharing one here, because the two operations disagree on it for a good
+    # reason -- a clip has a side to drop the face into, a split does not.
+    normal, area = kernel_triangles.face_normals_and_area(vertices, faces, f)
+    is_below = wp.dot(normal, plane_normal) < wp.float32(0.0)
+    return is_below, area <= TOLERANCE_ZERO_CONSTANT
+
+
 @wp.kernel
 def resolve_on_plane_faces(
     vertices: wp.array[wp.vec3],
@@ -472,11 +529,8 @@ def resolve_on_plane_faces(
     f = wp.int32(wp.tid())
     if out_classes[f] != SLICE_CLASS_ON_PLANE:
         return
-    normal, area = kernel_triangles.face_normals_and_area(vertices, faces, f)
-    if area <= TOLERANCE_ZERO_CONSTANT:
-        out_classes[f] = SLICE_CLASS_DROP
-        return
-    if wp.dot(normal, plane_normal) < wp.float32(0.0):
+    is_below, degenerate = on_plane_face_side(vertices, faces, plane_normal, f)
+    if not degenerate and is_below:
         out_classes[f] = SLICE_CLASS_INSIDE
     else:
         out_classes[f] = SLICE_CLASS_DROP
@@ -638,13 +692,29 @@ def emit_tri_cut(
     s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
     inside = find_corner_with_sign(s0, s1, s2, SLICE_SIGN_INSIDE)
     v_inside = faces[base + inside]
+    corner_a = (inside + wp.int32(1)) % wp.int32(3)
+    corner_b = (inside + wp.int32(2)) % wp.int32(3)
     edge_0 = inside
-    edge_1 = (inside + wp.int32(2)) % wp.int32(3)
+    edge_1 = corner_b
     new_i0, new_i1 = emit_cut_vertices(edge_points, tid, edge_0, edge_1, vertex_base, out_new_verts)
     # The corner stays one triangle, so this kernel writes one face row per cut, not two.
     out_new_faces[tid, 0] = v_inside
-    out_new_faces[tid, 1] = new_i0
-    out_new_faces[tid, 2] = new_i1
+    # ``classify_faces_for_slice`` routes both a genuine two-crossing cut (both neighbours
+    # strictly outside) and "one neighbour sits exactly on the level set" into this same class --
+    # they share ``signs_asum == 2`` and can't be told apart there (see plans/review.md item 6a).
+    # An on-plane neighbour is not a real crossing: reuse its existing vertex directly rather than
+    # interpolating a near-duplicate a hair's breadth away from it. Whichever of ``new_i0`` /
+    # ``new_i1`` is unused in that case is simply left unreferenced -- the caller's
+    # ``remove_unreferenced_vertices`` sweeps it up, so no buffer accounting changes.
+    if face_signs[face_index, corner_a] == SLICE_SIGN_ON_PLANE:
+        out_new_faces[tid, 1] = faces[base + corner_a]
+        out_new_faces[tid, 2] = new_i1
+    elif face_signs[face_index, corner_b] == SLICE_SIGN_ON_PLANE:
+        out_new_faces[tid, 1] = new_i0
+        out_new_faces[tid, 2] = faces[base + corner_b]
+    else:
+        out_new_faces[tid, 1] = new_i0
+        out_new_faces[tid, 2] = new_i1
 
 
 # Face classes for the both-sides split. Numbered from 1 contiguously because
@@ -681,16 +751,6 @@ def classify_faces_for_split(
         # One corner exactly on the level set and the other two on opposite sides: a single edge
         # crossing, joined to that corner.
         out_classes[f] = SPLIT_CLASS_CUT_CORNER
-
-
-@wp.func
-def split_lone_corner(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
-    # The corner alone in sign, which is the apex of the one-triangle side of an edge-to-edge cut.
-    if s1 == s2:
-        return wp.int32(0)
-    if s0 == s2:
-        return wp.int32(1)
-    return wp.int32(2)
 
 
 @wp.kernel
@@ -742,7 +802,7 @@ def emit_split_cut_edges(
     face_index = face_indices[tid]
     base = face_index * wp.int32(3)
     s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
-    lone = split_lone_corner(s0, s1, s2)
+    lone = find_unique_sign_vertex(s0, s1, s2)
     next_corner = (lone + wp.int32(1)) % wp.int32(3)
     last_corner = (lone + wp.int32(2)) % wp.int32(3)
     # ``p0`` on the edge leaving the lone corner, ``p1`` on the edge arriving at it.
@@ -816,9 +876,13 @@ def plane_crossed_edge_mask(
     # An edge needs a new vertex only when the plane passes through its *interior*: an endpoint
     # already in the plane (within ``tolerance``) serves as the crossing itself, so splitting there
     # would emit a duplicate. Strict opposite signs is therefore the condition, and it is also why
-    # at most two of a triangle's three edges can ever be flagged -- two of three vertices always
-    # share a sign, so their edge is never crossed and ``emit_size_faces``' 3-split branch is
-    # unreachable from here.
+    # at most two of a triangle's three edges can ever be flagged, for one of two reasons depending
+    # on the sign triple: a zero-valued corner caps its two incident edges at one crossing between
+    # them by itself (whichever of its two neighbours differs from it takes the one crossing; the
+    # other neighbour either agrees with it, or the zero blocks that edge's test outright), and
+    # with no zero present there are only two sign values among three corners, so a third crossing
+    # would need all three edges to alternate sign, which three values pulled from a two-value set
+    # cannot do. Either way ``emit_size_faces``' 3-split branch is unreachable from here.
     e = wp.int32(wp.tid())
     a = unique_edges[e, 0]
     b = unique_edges[e, 1]
@@ -873,13 +937,12 @@ def label_faces_by_plane_side(
         return
 
     # The face lies *in* the plane, so its vertices give no answer. Decide from its own normal, the
-    # same tie-break ``resolve_on_plane_faces`` applies, so that the ``above`` block of this split
-    # holds exactly the faces ``slice_mesh_with_plane`` keeps.
-    normal, area = kernel_triangles.face_normals_and_area(vertices, faces, f)
-    if area <= TOLERANCE_ZERO_CONSTANT:
-        out_above[f] = True
-    else:
-        out_above[f] = wp.dot(normal, plane_normal) < wp.float32(0.0)
+    # same tie-break ``resolve_on_plane_faces`` applies (``on_plane_face_side``), so that the
+    # ``above`` block of this split holds exactly the faces ``slice_mesh_with_plane`` keeps. Unlike
+    # the clip, a split has nowhere to drop a degenerate face, so it goes to ``above`` by
+    # convention rather than being excluded.
+    is_below, degenerate = on_plane_face_side(vertices, faces, plane_normal, f)
+    out_above[f] = degenerate or is_below
 
 
 @wp.func
@@ -910,6 +973,18 @@ def marching_triangles_segments(
     d0 = values[i0]
     d1 = values[i1]
     d2 = values[i2]
+
+    # A NaN field value (an unreachable vertex in a heat-distance field, say) must be rejected
+    # before the sign test below, not after: ``NaN >= 0.0`` is ``False`` under IEEE-754, so it would
+    # otherwise land in the same bucket as a genuine negative value, pass as a "lone corner" against
+    # two real opposite-signed neighbours, and feed ``crossing_point`` a ``NaN`` that reaches the
+    # returned curve with no filter anywhere downstream (unlike ``mesh_with_mesh``'s
+    # ``segment_nondegenerate``). Confirmed reproducing a `[nan, nan, nan]` point in a returned
+    # curve from field values ``[NaN, 1.0, -1.0]`` before this guard; see plans/review.md item 6c.
+    if wp.isnan(d0) or wp.isnan(d1) or wp.isnan(d2):
+        out_valid[f] = False
+        return
+
     p0 = d0 >= values.dtype(0.0)
     p1 = d1 >= values.dtype(0.0)
     p2 = d2 >= values.dtype(0.0)
