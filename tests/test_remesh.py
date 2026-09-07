@@ -1841,7 +1841,7 @@ def _summed_cotangent_weights(
 
     ``cotmatrix_entries_intrinsic`` returns one half-cotangent per ``(face, corner)``, for the edge
     *opposite* that corner, and the assembled matrix entry is their sum -- verified equal to this
-    dictionary for all 4 641 edges of the fixture below, so this is the operator's own weight and
+    dictionary for all 4 375 edges of the fixture below, so this is the operator's own weight and
     not a re-derivation of it.
     """
     weight: dict[tuple[int, int], float] = {}
@@ -1857,26 +1857,22 @@ def _summed_cotangent_weights(
     return weight, incident, opposite
 
 
-def test_intrinsic_delaunay_residue_is_exactly_the_unflippable_set(device: str) -> None:
+def test_intrinsic_delaunay_resolves_interior_violations_via_multi_edges(device: str) -> None:
     """
-    Not a library comparison: the documented gap between "converged" and "Delaunay".
+    Not a library comparison: the fixture that needs a second edge between two adjacent vertices.
 
-    ``intrinsic_delaunay`` declines a flip whose new edge already joins the same two vertices,
-    because the flip topology keys on the vertex pair and a multi-edge has nowhere to live, so its
-    loop ends when no edge is *flippable* rather than when none is violating. Its ``Notes`` say so;
-    nothing asserted it, and the alternative test -- "no edge has a negative weight" -- asserts a
-    property the function does not promise and fails on this fixture.
+    ``intrinsic_delaunay`` tracks connectivity through an incrementally-maintained halfedge twin
+    table, so a flip may legitimately create a second, geometrically distinct edge between two
+    vertices some other edge already connects (intrinsically that is a different geodesic, not a
+    duplicate). Dini's surface is strongly graded (edge lengths spanning four orders) and open,
+    which is what makes it reach that case at all -- there is deliberately no ``conftest`` entry
+    for it, since it exists only to exercise what the well-shaped fixtures above cannot.
 
-    Dini's surface is the fixture because it is strongly graded (edge lengths spanning four orders)
-    and open. There is deliberately no ``conftest`` entry for it: it exists to exercise the failure
-    the well-shaped fixtures cannot reach, and the tests above already cover those.
-
-    **Two causes, and separating them is the point.** The 38 surviving *interior* violations are all
-    unflippable, which is the claim. The far larger negative weights on this mesh are on *boundary*
-    edges, where a single opposite angle is obtuse -- those are not Delaunay violations at all (the
-    condition is about two opposite angles summing past pi, and a boundary edge has one) and no
-    flip could ever fix them. A write-up that quotes the worst weight as evidence for the
-    duplicate-edge guard is quoting the boundary number; the assertions below keep the two apart.
+    **Two things to check, and they are different claims.** Every *interior* edge -- whether it is
+    the only edge between its two vertices or one of several -- must satisfy the Delaunay
+    non-negativity condition, since a flip can reach any of them. A *boundary* edge is exempt: the
+    two-opposite-angles condition has nothing to compare a boundary edge's one angle against, so an
+    obtuse boundary corner is not a Delaunay violation and no flip addresses it.
     """
     vertices_wp, faces_wp = tw.creation.parametric_surface("dini", device=device)
     intrinsic_faces_wp, lengths_wp, n_flips = tw.remesh.intrinsic_delaunay(vertices_wp, faces_wp)
@@ -1884,20 +1880,22 @@ def test_intrinsic_delaunay_residue_is_exactly_the_unflippable_set(device: str) 
 
     faces_np = intrinsic_faces_wp.numpy().reshape(-1, 3)
     cot_np = tw.laplacian.cotmatrix_entries_intrinsic(lengths_wp).numpy()
-    weight, incident, opposite = _summed_cotangent_weights(faces_np, cot_np)
-    existing = set(weight)
+    weight, incident, _opposite = _summed_cotangent_weights(faces_np, cot_np)
 
-    interior_violating = [e for e in weight if incident[e] == 2 and weight[e] < -1e-6]
-    boundary_negative = [e for e in weight if incident[e] == 1 and weight[e] < -1e-6]
+    interior = [e for e in weight if incident[e] >= 2]
+    boundary = [e for e in weight if incident[e] == 1]
+    multi_edges = [e for e in weight if incident[e] > 2]
 
-    # The claim: every surviving interior violation is one the guard declined, none is a miss.
-    assert interior_violating, "fixture no longer reaches the unflippable case"
-    unflippable = [e for e in interior_violating if tuple(sorted(opposite[e])) in existing]
-    assert len(unflippable) == len(interior_violating)
+    # The fixture must actually reach a multi-edge, or the claim below is vacuous.
+    assert multi_edges, "fixture no longer creates a second edge between adjacent vertices"
+    assert all(incident[e] % 2 == 0 for e in interior), "an interior edge count must be even"
 
-    # And the magnitude lives on the boundary, which is a different, unfixable thing.
-    assert boundary_negative
-    assert min(weight[e] for e in boundary_negative) < min(weight[e] for e in interior_violating)
+    # The claim: every interior edge -- single or multi -- is now non-negative.
+    assert min(weight[e] for e in interior) > -1e-6
+
+    # And the boundary residue is untouched: it is not a Delaunay violation, so it survives.
+    assert boundary
+    assert min(weight[e] for e in boundary) < -1e-6
 
 
 @pytest.mark.parametrize("mesh_name", ["half_torus", "torus"])

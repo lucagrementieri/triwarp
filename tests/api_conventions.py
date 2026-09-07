@@ -414,6 +414,15 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # ``quadric_decimate``'s provenance column, folded one pass at a time: the array is the previous
     # pass's answer *and* this pass's, so it is in place and ``out_`` would read as write-only.
     ("remesh", "compose_vertex_index"): frozenset({"index"}),
+    # ``intrinsic_delaunay``'s halfedge-twin flip engine mutates the mesh it was handed rather than
+    # producing a fresh one each round: ``faces`` and ``edge_lengths`` are the caller's own
+    # connectivity and metric, read pre-flip and overwritten in the same launch, and ``twin`` is the
+    # incrementally-maintained twin table every round both reads and updates. ``out_`` would misread
+    # all three as write-only.
+    ("remesh", "commit_intrinsic_flips"): frozenset({"faces", "edge_lengths", "twin"}),
+    # The other half of the same round's twin-table update: every halfedge not touched directly by
+    # ``commit_intrinsic_flips`` reads and, where its neighbor moved, corrects its own twin pointer.
+    ("remesh", "fixup_twin_remap"): frozenset({"twin"}),
     ("registration", "transform_and_accumulate_cost"): frozenset({"acc"}),
     # ``rhs`` arrives already holding ``-A_ub x_b`` from ``linalg.assemble_interior_system`` (which
     # eliminates a quadratic form with no linear term of its own), and this kernel only ever

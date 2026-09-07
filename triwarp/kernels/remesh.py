@@ -2,7 +2,7 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import INT32_MAX_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.adjacency import edge_endpoints, edge_pair_topology, write_face_edge_keys
 from triwarp.kernels.array import (
     LOOP_CONDITION,
@@ -1675,65 +1675,85 @@ def local_corner(faces: wp.array[wp.int32], f: wp.int32, vertex: wp.int32) -> wp
     return wp.int32(-1)
 
 
-@wp.func
-def edge_lengths_at(
-    edge_lengths: wp.array2d[wp.float32],
+@wp.kernel
+def build_intrinsic_twins(
     faces: wp.array[wp.int32],
-    f: wp.int32,
-    opposite_vertex: wp.int32,
-) -> wp.float32:
-    # The length of the edge of ``f`` that faces ``opposite_vertex``.
-    corner = local_corner(faces, f, opposite_vertex)
-    if corner < 0:
-        return wp.float32(0.0)
-    return edge_lengths[f, corner]
+    adjacency: wp.array2d[wp.int32],
+    unshared: wp.array2d[wp.int32],
+    out_twin: wp.array[wp.int32],
+) -> None:
+    # The *one* point in ``intrinsic_delaunay``'s loop where a vertex-pair-keyed adjacency table
+    # (``_FlipTopology``'s, built once from the caller's still-simplicial input) is trustworthy: a
+    # halfedge ``h = 3 * f + e`` opposite corner ``e`` (``edge_lengths``' own indexing) paired with
+    # its twin across each of ``adjacency``'s rows. Every flip after this one maintains ``out_twin``
+    # incrementally instead of re-deriving it, because a second flip can create a second edge
+    # between two already-adjacent vertices, and at that point no vertex-pair key can tell which of
+    # several same-key corners is which edge's true twin -- see ``intrinsic_delaunay_candidates``.
+    k = wp.int32(wp.tid())
+    f0 = adjacency[k, 0]
+    f1 = adjacency[k, 1]
+    corner0 = local_corner(faces, f0, unshared[k, 0])
+    corner1 = local_corner(faces, f1, unshared[k, 1])
+    if corner0 < 0 or corner1 < 0:
+        return
+    h0 = f0 * 3 + corner0
+    h1 = f1 * 3 + corner1
+    out_twin[h0] = h1
+    out_twin[h1] = h0
 
 
 @wp.kernel
 def intrinsic_delaunay_candidates(
     faces: wp.array[wp.int32],
     edge_lengths: wp.array2d[wp.float32],
-    adjacency: wp.array2d[wp.int32],
-    adjacency_edges: wp.array2d[wp.int32],
-    unshared: wp.array2d[wp.int32],
-    sorted_edge_keys: wp.array[wp.uint64],
-    key_base: wp.uint64,
+    twin: wp.array[wp.int32],
     out_flip: wp.array[wp.bool],
     out_quad: wp.array2d[wp.int32],
     out_new_length: wp.array[wp.float32],
+    out_neighbors: wp.array2d[wp.int32],
 ) -> None:
     # Mark the interior edges that violate the local Delaunay condition, and measure what the
     # flipped edge would be -- both from edge lengths only, which is what makes the retriangulation
     # intrinsic: no vertex moves, so the *surface* is unchanged and only its triangulation improves.
-    k = wp.int32(wp.tid())
-    out_flip[k] = False
-    out_new_length[k] = 0.0
-    f0 = adjacency[k, 0]
-    f1 = adjacency[k, 1]
-    # The shared guard's duplicate-edge test is load-bearing here and is *not* free: intrinsically,
-    # the flipped edge is a different geodesic between the same two endpoints and is a legitimate
-    # new edge, but a simplicial face buffer cannot hold two of them and the topology this pass
-    # rebuilds is keyed on the vertex pair. So the guard is the reason a violating edge can be
-    # unflippable, and therefore the reason a round can end with the triangulation still not
-    # Delaunay -- which reads as convergence at the wrapper. ``remesh.intrinsic_delaunay``'s Notes
-    # state that limitation for callers; a Delta-complex representation is what lifts it.
-    first, _apex1, second, apex0 = _resolve_flip_quad_guarded(
-        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
-    )
-    if first < wp.int32(0):
+    #
+    # Indexed per *halfedge* (``h = 3 * f + e``, the edge opposite corner ``e`` -- ``edge_lengths``'
+    # own convention) and read through ``twin`` rather than a duplicate-edge-keyed adjacency table.
+    # Nothing here looks an edge up by its endpoint labels, so a flip this kernel proposes may
+    # legitimately create a second edge between two vertices some other edge already connects: the
+    # two are simply two different halfedges and never collide. That is what lifts the limitation
+    # ``remesh.intrinsic_delaunay``'s Notes used to describe -- see ``commit_intrinsic_flips`` for
+    # the other half, maintaining ``twin`` across the flip this decides.
+    h = wp.int32(wp.tid())
+    out_flip[h] = False
+    out_new_length[h] = 0.0
+    h1 = twin[h]
+    if h1 < 0 or h1 <= h:
+        return  # boundary, or the mirror of a lower-indexed canonical candidate
+
+    f0 = h // 3
+    e0 = h % 3
+    f1 = h1 // 3
+    e1 = h1 % 3
+    apex0 = faces[f0 * 3 + e0]
+    apex1 = faces[f1 * 3 + e1]
+    u = faces[f0 * 3 + (e0 + 1) % 3]
+    v = faces[f0 * 3 + (e0 + 2) % 3]
+    quad = _resolve_flip_quad(faces, f0, u, v, apex0, apex1)
+    first = quad[0]
+    if first < wp.int32(0) or quad[1] == quad[3]:
         return
+    second = quad[2]
 
     corner_f0_first = local_corner(faces, f0, first)
     corner_f0_second = local_corner(faces, f0, second)
-    corner_f0_apex = local_corner(faces, f0, apex0)
     corner_f1_first = local_corner(faces, f1, first)
     corner_f1_second = local_corner(faces, f1, second)
-    if corner_f0_first < 0 or corner_f0_second < 0 or corner_f0_apex < 0:
+    if corner_f0_first < 0 or corner_f0_second < 0:
         return
     if corner_f1_first < 0 or corner_f1_second < 0:
         return
 
-    shared = edge_lengths[f0, corner_f0_apex]
+    shared = edge_lengths[f0, e0]
     first_apex0 = edge_lengths[f0, corner_f0_second]
     second_apex0 = edge_lengths[f0, corner_f0_first]
     first_apex1 = edge_lengths[f1, corner_f1_second]
@@ -1758,51 +1778,182 @@ def intrinsic_delaunay_candidates(
     )
     if flipped <= TOLERANCE_ZERO_CONSTANT:
         return
-    out_new_length[k] = wp.sqrt(flipped)
-    out_flip[k] = True
+
+    out_quad[h, 0] = quad[0]
+    out_quad[h, 1] = quad[1]
+    out_quad[h, 2] = quad[2]
+    out_quad[h, 3] = quad[3]
+    # The pre-flip twin of each of the quad's four *other* edges, captured now because
+    # ``commit_intrinsic_flips`` must fix up both this face pair's own halfedges and each of these
+    # neighbors' twin pointer, and by then it is looking at whichever candidate won its own claim,
+    # not necessarily this one -- these are read once, while the mesh still agrees with ``quad``.
+    out_neighbors[h, 0] = twin[f1 * 3 + corner_f1_second]  # edge (a, b), opposite c in f1
+    out_neighbors[h, 1] = twin[f1 * 3 + corner_f1_first]  # edge (b, c), opposite a in f1
+    out_neighbors[h, 2] = twin[f0 * 3 + corner_f0_first]  # edge (c, d), opposite a in f0
+    out_neighbors[h, 3] = twin[f0 * 3 + corner_f0_second]  # edge (d, a), opposite c in f0
+    out_new_length[h] = wp.sqrt(flipped)
+    out_flip[h] = True
 
 
 @wp.kernel
-def update_flipped_lengths(
-    faces: wp.array[wp.int32],
+def claim_intrinsic_flips(
+    flip: wp.array[wp.bool], twin: wp.array[wp.int32], out_face_claim: wp.array[wp.int32]
+) -> None:
+    # Only a flip's own two faces are claimed -- unlike the vertex-pair-keyed flip loops' shared
+    # ``claim_flips``, there is no new-edge hash to also claim, because two flips creating an edge
+    # with the same endpoint labels are no longer a conflict at all (see
+    # ``intrinsic_delaunay_candidates``). The *other* four faces a commit touches (each one's twin
+    # pointer, not its connectivity) are handled without a lock, by ``fixup_twin_remap`` below.
+    h = wp.int32(wp.tid())
+    if not flip[h]:
+        return
+    f0 = h // 3
+    f1 = twin[h] // 3
+    wp.atomic_min(out_face_claim, f0, h)
+    wp.atomic_min(out_face_claim, f1, h)
+
+
+@wp.func
+def intrinsic_flip_claim_won(
+    flip: wp.array[wp.bool], twin: wp.array[wp.int32], face_claim: wp.array[wp.int32], h: wp.int32
+) -> tuple[wp.int32, wp.int32, wp.bool]:
+    # ``flip_claim_won``'s counterpart for the halfedge-twin engine, minus the new-edge hash claim
+    # that engine also checks -- see ``claim_intrinsic_flips``.
+    if not flip[h]:
+        return wp.int32(-1), wp.int32(-1), False
+    f0 = h // 3
+    f1 = twin[h] // 3
+    if face_claim[f0] != h or face_claim[f1] != h:
+        return f0, f1, False
+    return f0, f1, True
+
+
+@wp.kernel
+def commit_intrinsic_flips(
     flip: wp.array[wp.bool],
     quad: wp.array2d[wp.int32],
-    adjacency: wp.array2d[wp.int32],
-    new_length: wp.array[wp.float32],
+    neighbors: wp.array2d[wp.int32],
     face_claim: wp.array[wp.int32],
-    edge_claim: wp.array[wp.int32],
-    edge_claim_mask: wp.int32,
-    key_base: wp.uint64,
-    out_edge_lengths: wp.array2d[wp.float32],
+    new_length: wp.array[wp.float32],
+    faces: wp.array[wp.int32],
+    edge_lengths: wp.array2d[wp.float32],
+    twin: wp.array[wp.int32],
+    out_remap: wp.array[wp.int32],
+    out_no_remap: wp.array[wp.bool],
+    out_count: wp.array[wp.int32],
 ) -> None:
-    # Rewrite the two faces' edge-length rows for the flips that won their claims, reading the old
-    # rows first. This must run *before* the connectivity rewrite, which is what still knows which
-    # corner holds which vertex; a committed flip owns both its faces exclusively, so reading and
-    # writing the same rows here is race-free.
-    k = wp.int32(wp.tid())
-    f0, f1, won = flip_claim_won(
-        flip, quad, adjacency, face_claim, edge_claim, edge_claim_mask, key_base, k
-    )
+    # Rewrites connectivity, edge lengths and this flip's own six halfedge slots in one launch, and
+    # records how the *other* four -- the neighbors across the quad's non-diagonal edges -- are to
+    # be fixed up, rather than writing into them directly.
+    #
+    # A neighbor across edge (d, a), say, may itself be winning an unrelated flip in this same
+    # round: if it is, that flip's own commit is concurrently overwriting *its* three halfedge
+    # slots, including the one this thread would otherwise read to learn "my new slot number" or
+    # write to redirect it -- a genuine cross-thread race, not merely a stale value. So this thread
+    # writes only into cells it exclusively owns (its own two faces' six slots, all locked by
+    # ``intrinsic_flip_claim_won``): ``twin[f0 * 3 + 1] = neighbors[h, 3]`` places the *pre-round*
+    # neighbor halfedge (captured back in ``intrinsic_delaunay_candidates``, before any commit in
+    # this round ran) as a placeholder, and ``out_remap[old_slot] = new_slot`` -- keyed by this
+    # face's own *old* slot number, also exclusively owned -- is what a neighbor reads, in
+    # ``fixup_twin_remap``, to learn that old slot became this one. Two such placeholders can point
+    # at each other (both across the same unaffected edge) and each is corrected by the *other*
+    # side's remap entry, independent of whether either, both, or neither side actually flipped.
+    h = wp.int32(wp.tid())
+    f0, f1, won = intrinsic_flip_claim_won(flip, twin, face_claim, h)
     if not won:
         return
 
-    first = quad[k, 0]
-    second = quad[k, 2]
-    diagonal = new_length[k]
+    a = quad[h, 0]
+    b = quad[h, 1]
+    c = quad[h, 2]
+    d = quad[h, 3]
+    diagonal = new_length[h]
 
-    first_apex0 = edge_lengths_at(out_edge_lengths, faces, f0, second)
-    second_apex0 = edge_lengths_at(out_edge_lengths, faces, f0, first)
-    first_apex1 = edge_lengths_at(out_edge_lengths, faces, f1, second)
-    second_apex1 = edge_lengths_at(out_edge_lengths, faces, f1, first)
+    # ``faces`` still reads pre-flip here; the four other edges of the flip quad, read by vertex
+    # label (and so by which corner still holds it, not by a fixed offset) so this does not depend
+    # on which physical corner a vertex happens to occupy.
+    corner_f0_a = local_corner(faces, f0, a)
+    corner_f0_c = local_corner(faces, f0, c)
+    corner_f1_a = local_corner(faces, f1, a)
+    corner_f1_c = local_corner(faces, f1, c)
+    first_apex0 = edge_lengths[f0, corner_f0_c]  # edge (d, a)
+    second_apex0 = edge_lengths[f0, corner_f0_a]  # edge (c, d)
+    first_apex1 = edge_lengths[f1, corner_f1_c]  # edge (a, b)
+    second_apex1 = edge_lengths[f1, corner_f1_a]  # edge (b, c)
+    old_h_da = f0 * 3 + corner_f0_c
+    old_h_cd = f0 * 3 + corner_f0_a
+    old_h_ab = f1 * 3 + corner_f1_c
+    old_h_bc = f1 * 3 + corner_f1_a
 
-    # ``commit_flips`` rewrites f0 as (first, apex1, apex0) and f1 as (second, apex0, apex1); each
-    # column holds the edge opposite that corner.
-    out_edge_lengths[f0, 0] = diagonal
-    out_edge_lengths[f0, 1] = first_apex0
-    out_edge_lengths[f0, 2] = first_apex1
-    out_edge_lengths[f1, 0] = diagonal
-    out_edge_lengths[f1, 1] = second_apex1
-    out_edge_lengths[f1, 2] = second_apex0
+    # New diagonal b-d: faces become (a, b, d) and (c, d, b), preserving winding -- matching
+    # ``commit_flips``. Each new corner's opposite edge is one of: the new diagonal, or one of the
+    # four edges just measured above.
+    faces[f0 * 3 + 0] = a
+    faces[f0 * 3 + 1] = b
+    faces[f0 * 3 + 2] = d
+    faces[f1 * 3 + 0] = c
+    faces[f1 * 3 + 1] = d
+    faces[f1 * 3 + 2] = b
+
+    edge_lengths[f0, 0] = diagonal
+    edge_lengths[f0, 1] = first_apex0
+    edge_lengths[f0, 2] = first_apex1
+    edge_lengths[f1, 0] = diagonal
+    edge_lengths[f1, 1] = second_apex1
+    edge_lengths[f1, 2] = second_apex0
+
+    h_f0_diagonal = f0 * 3 + 0
+    h_f1_diagonal = f1 * 3 + 0
+    h_f0_da = f0 * 3 + 1
+    h_f0_ab = f0 * 3 + 2
+    h_f1_bc = f1 * 3 + 1
+    h_f1_cd = f1 * 3 + 2
+
+    twin[h_f0_diagonal] = h_f1_diagonal
+    twin[h_f1_diagonal] = h_f0_diagonal
+    twin[h_f0_da] = neighbors[h, 3]  # placeholder: this edge's pre-round neighbor
+    twin[h_f0_ab] = neighbors[h, 0]
+    twin[h_f1_bc] = neighbors[h, 1]
+    twin[h_f1_cd] = neighbors[h, 2]
+
+    out_remap[old_h_da] = h_f0_da
+    out_remap[old_h_cd] = h_f1_cd
+    out_remap[old_h_ab] = h_f0_ab
+    out_remap[old_h_bc] = h_f1_bc
+
+    # Only the new diagonal's own two halfedges must never go through ``fixup_twin_remap``: they
+    # already point at each other, freshly, and each other's index is also a face this same commit
+    # owns -- so the *lookup* ``remap[twin[h_f0_diagonal]]`` reads ``remap[h_f1_diagonal]``, a slot
+    # this same flip may separately have written for an unrelated carried-over edge (if the old
+    # corner arithmetic happened to land there), which would silently misapply to the diagonal. The
+    # four carried-over cells just written above (``h_f0_da`` etc.) are not exempted: each of their
+    # placeholder values names a genuinely *different* face's row, so the same collision cannot
+    # arise, and they need exactly the same fixup an untouched face's cell would if that other face
+    # also flipped this round.
+    out_no_remap[h_f0_diagonal] = True
+    out_no_remap[h_f1_diagonal] = True
+    wp.atomic_add(out_count, 0, 1)
+
+
+@wp.kernel
+def fixup_twin_remap(
+    remap: wp.array[wp.int32], no_remap: wp.array[wp.bool], twin: wp.array[wp.int32]
+) -> None:
+    # The other half of ``commit_intrinsic_flips``'s deferred neighbor fixup: every halfedge except
+    # this round's two brand-new diagonal cells (``no_remap``, set only there) asks whether its twin
+    # pointer's target moved this round. For a halfedge whose own face did not flip, the pointer is
+    # exactly what it was before the round started, so this is safe whether or not the *target* face
+    # flipped: ``remap`` is keyed by each flipped face's own old slot, which is where the answer
+    # lives if it flipped, and stays at the sentinel (leaving ``twin`` unchanged) if it did not.
+    h = wp.int32(wp.tid())
+    if no_remap[h]:
+        return
+    target = twin[h]
+    if target < 0:
+        return
+    remapped = remap[target]
+    if remapped != INT32_MAX_CONSTANT:
+        twin[h] = remapped
 
 
 @wp.kernel

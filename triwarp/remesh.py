@@ -686,11 +686,7 @@ def _reproject_pass(
 
 
 def _flip_interior_edges(
-    faces: wp.array[wp.int32],
-    n_vertices: int,
-    launch_candidates: _LaunchCandidates,
-    max_iter: int,
-    before_commit: Callable[[_FlipTopology, int], None] | None = None,
+    faces: wp.array[wp.int32], n_vertices: int, launch_candidates: _LaunchCandidates, max_iter: int
 ) -> int:
     """
     Repeatedly flip an independent set of interior edges until none is a candidate.
@@ -701,12 +697,10 @@ def _flip_interior_edges(
     edge). Returns the total number of flips performed. The winding rewrite matches
     ``igl::flip_edge``.
 
-    ``before_commit`` runs after the independent set has been claimed and before the faces are
-    rewritten, which is the only window in which a caller can still read the *old* connectivity
-    alongside the decision. [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay] is why it
-    exists: it carries an edge-length table beside the face buffer and has to update the lengths of
-    the winning flips while the corners still say which vertex each length belongs to. Every other
-    caller needs nothing there, which is the whole of the difference between the three flip loops.
+    [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay] does not use this engine: it carries
+    an edge-length table beside the face buffer and needs to create a second edge between two
+    already-adjacent vertices, which this loop's vertex-pair-keyed topology cannot represent. It
+    drives its own halfedge-twin-based loop instead (see ``kernel_remesh.build_intrinsic_twins``).
 
     The per-pass topology is built by ``_FlipTopology`` on fixed buffers rather than by composing
     the public wrappers, which avoids rebuilding structure that does not change shape between
@@ -752,8 +746,6 @@ def _flip_interior_edges(
             ],
             device=device,
         )
-        if before_commit is not None:
-            before_commit(topology, m)
         count.zero_()
         wp.launch(
             kernel_remesh.commit_flips,
@@ -794,8 +786,12 @@ class _FlipTopology:
     scan and a single emit launch that writes the adjacency pairs, their shared-edge endpoints and
     the opposite apexes together.
 
-    On [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay] the setup dominates instead, since
-    its input is usually already near-Delaunay and the loop exits after one or two passes.
+    [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay] uses this class for exactly one
+    build, not a per-round rebuild: its input is still a simplicial complex at that point, so the
+    vertex-pair key this class groups on is trustworthy, and the one build seeds an
+    incrementally-maintained halfedge twin table that the rest of its loop drives instead (see
+    ``kernel_remesh.build_intrinsic_twins``). A flip can make that key ambiguous, which is exactly
+    why nothing after the first round goes through a rebuild here.
 
     Every intermediate is byte-identical to the composed path: the keys match
     [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] over
@@ -2268,20 +2264,15 @@ def intrinsic_delaunay(
 
     Notes
     -----
-    A flip that would duplicate an existing edge is skipped rather than allowed to create a
-    multi-edge, so some non-Delaunay edges can survive — geometry-central's signpost machinery
-    represents those, this does not. The output stays a simplicial complex, and that is the whole
-    limitation: the flip machinery keys its topology on the vertex pair ``(u, v)``, so a second
-    edge between the same two vertices has nowhere to live.
-
-    **So the loop stopping is not the same as the result being Delaunay, and ``n_flips`` cannot
-    tell you which happened.** A round ends when no edge is *flippable*, not when none is
-    violating, and the two differ exactly on the edges this skips. The gap is invisible on a
-    well-shaped mesh — on the test fixtures the result matches ``igl.intrinsic_delaunay_cotmatrix``
-    exactly — and opens up on a strongly graded surface, where a surviving edge's cotangent weight
-    can be large and negative rather than marginally so. A caller that needs the maximum principle
-    should check the weights it got ([`cotmatrix_entries_intrinsic`]
-    [triwarp.laplacian.cotmatrix_entries_intrinsic]) instead of inferring them from convergence.
+    Unlike the other flip passes in this module, this one *can* create a second edge between two
+    vertices some other edge already connects — intrinsically that is a different geodesic, not a
+    duplicate, and the flip loop tracks connectivity through an incrementally-maintained halfedge
+    twin table rather than a vertex-pair key, so the two never collide. The one thing that still
+    cannot be flipped away is a negative weight on a *boundary* edge: the Delaunay two-opposite-
+    angles condition has nothing to compare a boundary edge's one incident angle against, so no
+    flip of any kind addresses it. A caller that needs the maximum principle should check the
+    weights it got ([`cotmatrix_entries_intrinsic`][triwarp.laplacian.cotmatrix_entries_intrinsic])
+    rather than inferring them from convergence.
 
     See Also
     --------
@@ -2298,68 +2289,80 @@ def intrinsic_delaunay(
     if n_faces == 0:
         return intrinsic_faces, lengths, 0
 
-    # The loop *is* ``_flip_interior_edges``: same topology rebuild, same candidate/claim/commit
-    # protocol, same stopping rule. All that is intrinsic about it is the predicate and the
-    # edge-length table that rides beside the faces -- the first is the ``launch_candidates``
-    # argument every flip pass supplies, and the second is what ``before_commit`` is for.
-    new_length: list[wp.array[wp.float32] | None] = [None]
+    n_half = n_faces * 3
+    # The one point in this loop where a vertex-pair-keyed adjacency table is trustworthy: the
+    # caller's input is still a simplicial complex, so ``_FlipTopology``'s ordinary rebuild can
+    # derive it, once. Every later round instead maintains ``twin`` in place, because a flip can
+    # make the vertex-pair key ambiguous (see ``kernel_remesh.build_intrinsic_twins``).
+    initial = _FlipTopology(intrinsic_faces, n_vertices)
+    m0 = initial.rebuild()
+    twin = wp.full(n_half, -1, dtype=wp.int32, device=device)
+    if m0 > 0:
+        wp.launch(
+            kernel_remesh.build_intrinsic_twins,
+            dim=m0,
+            inputs=[intrinsic_faces, initial.adjacency, initial.unshared, twin],
+            device=device,
+        )
+    del initial  # its vertex-pair-keyed tables cannot represent what a flip may do from here on
 
-    def launch_candidates(
-        adjacency: twt.Array2dInt32,
-        adjacency_edges: twt.Array2dInt32,
-        unshared: twt.Array2dInt32,
-        sorted_keys: wp.array[wp.uint64],
-        key_base: wp.uint64,
-        flip: wp.array[wp.bool],
-        quad: twt.Array2dInt32,
-    ) -> None:
-        m = int(adjacency.shape[0])
-        # Sized alongside the topology's own row tables, which are reallocated on the same
-        # condition, so this stays row-aligned with ``flip`` and ``quad`` without tracking ``m``.
-        if new_length[0] is None or int(new_length[0].shape[0]) != m:
-            new_length[0] = wp.empty(m, dtype=wp.float32, device=device)
+    flip = wp.empty(n_half, dtype=wp.bool, device=device)
+    quad = twt.empty_2d((n_half, 4), wp.int32, device=device)
+    new_length = wp.empty(n_half, dtype=wp.float32, device=device)
+    neighbors = twt.empty_2d((n_half, 4), wp.int32, device=device)
+    face_claim = wp.empty(n_faces, dtype=wp.int32, device=device)
+    remap = wp.empty(n_half, dtype=wp.int32, device=device)
+    no_remap = wp.zeros(n_half, dtype=wp.bool, device=device)
+    count = wp.zeros(1, dtype=wp.int32, device=device)
+
+    total = 0
+    for _ in range(max_iter):
         wp.launch(
             kernel_remesh.intrinsic_delaunay_candidates,
-            dim=m,
+            dim=n_half,
+            inputs=[intrinsic_faces, lengths, twin, flip, quad, new_length, neighbors],
+            device=device,
+        )
+        # Independent-set selection over just the flipping pair -- ``claim_intrinsic_flips``'s own
+        # docstring says why that is enough here, unlike the vertex-pair-keyed flip loops.
+        face_claim.fill_(INT32_MAX)
+        wp.launch(
+            kernel_remesh.claim_intrinsic_flips,
+            dim=n_half,
+            inputs=[flip, twin, face_claim],
+            device=device,
+        )
+        count.zero_()
+        remap.fill_(INT32_MAX)
+        no_remap.zero_()
+        wp.launch(
+            kernel_remesh.commit_intrinsic_flips,
+            dim=n_half,
             inputs=[
-                intrinsic_faces,
-                lengths,
-                adjacency,
-                adjacency_edges,
-                unshared,
-                sorted_keys,
-                key_base,
                 flip,
                 quad,
-                new_length[0],
-            ],
-            device=device,
-        )
-
-    def update_lengths(topology: _FlipTopology, m: int) -> None:
-        # Lengths before the commit: this pass needs the *old* connectivity to know which corner
-        # holds which vertex, and ``commit_flips`` is about to overwrite it.
-        wp.launch(
-            kernel_remesh.update_flipped_lengths,
-            dim=m,
-            inputs=[
+                neighbors,
+                face_claim,
+                new_length,
                 intrinsic_faces,
-                topology.flip,
-                topology.quad,
-                topology.adjacency,
-                new_length[0],
-                topology.face_claim,
-                topology.edge_claim,
-                wp.int32(topology.edge_claim_mask),
-                wp.uint64(n_vertices),
                 lengths,
+                twin,
+                remap,
+                no_remap,
+                count,
             ],
             device=device,
         )
-
-    total = _flip_interior_edges(
-        intrinsic_faces, n_vertices, launch_candidates, max_iter, update_lengths
-    )
+        wp.launch(
+            kernel_remesh.fixup_twin_remap,
+            dim=n_half,
+            inputs=[remap, no_remap, twin],
+            device=device,
+        )
+        n = int(read_scalar(count, 0))
+        total += n
+        if n == 0:
+            break
     return intrinsic_faces, lengths, total
 
 
