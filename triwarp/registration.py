@@ -99,6 +99,8 @@ def procrustes(
     ------
     RuntimeError
         If ``a``, ``b`` and ``weights`` are not all on one device.
+    ValueError
+        If ``b`` (or a non-empty ``weights``) does not have the same length as ``a``.
 
     Notes
     -----
@@ -114,99 +116,21 @@ def procrustes(
     require_same_device(a=a, b=b, weights=weights)
     n = int(a.shape[0])
     device = a.device
+    if int(b.shape[0]) != n:
+        raise ValueError(f"a and b must have the same length, got {n} and {b.shape[0]}")
+    # A zero-length weights array is the kernels' own "uniform weights" sentinel (see
+    # ``_uniform_weights``), not a caller mistake -- only a non-empty mismatch is a real error.
+    if weights is not None and int(weights.shape[0]) not in (0, n):
+        raise ValueError(f"weights must have the same length as a, got {weights.shape[0]} and {n}")
+
+    if n == 0:
+        matrix = _identity_mat44(device)
+        if not return_cost:
+            return matrix
+        return matrix, wp.clone(a), 0.0
+
     workspace = _procrustes_workspace(n, device, return_cost=return_cost)
     return _procrustes_into(a, b, weights, reflection, translation, scale, return_cost, workspace)
-
-
-class _ProcrustesWorkspace(TypedDict):
-    """Buffers a [`procrustes`][triwarp.registration.procrustes] fit writes into."""
-
-    acc: wp.array[wp.float32]
-    matrix: wp.array[wp.mat44]
-    transformed: wp.array[wp.vec3] | None
-    uniform_weights: wp.array[wp.float32]
-
-
-def _procrustes_workspace(
-    n: int, device: wp.DeviceLike, *, return_cost: bool
-) -> _ProcrustesWorkspace:
-    """Allocate the buffers one Procrustes fit needs; reuse across iterations of a loop."""
-    return {
-        "acc": wp.empty(kernel_registration.PROCRUSTES_ACC_SIZE, dtype=wp.float32, device=device),
-        "matrix": wp.empty(1, dtype=wp.mat44, device=device),
-        "transformed": wp.empty(n, dtype=wp.vec3, device=device) if return_cost else None,
-        "uniform_weights": _uniform_weights(device),
-    }
-
-
-_UNIFORM_WEIGHTS: dict[str, wp.array[wp.float32]] = {}
-
-
-def _uniform_weights(device: wp.DeviceLike) -> wp.array[wp.float32]:
-    """
-    Return the kernels' "uniform weights" sentinel: a zero-length array, shared per device.
-
-    Length zero means "every weight is 1", so the common weightless call needs neither a
-    ``wp.full(n, 1.0)`` allocation nor its fill — and since the buffer carries no data, one
-    instance per device serves every caller.
-    """
-    key = str(device)
-    if key not in _UNIFORM_WEIGHTS:
-        _UNIFORM_WEIGHTS[key] = wp.empty(0, dtype=wp.float32, device=device)
-    return _UNIFORM_WEIGHTS[key]
-
-
-def _procrustes_into(
-    a: wp.array[wp.vec3],
-    b: wp.array[wp.vec3],
-    weights: wp.array[wp.float32] | None,
-    reflection: bool,
-    translation: bool,
-    scale: bool,
-    return_cost: bool,
-    workspace: _ProcrustesWorkspace,
-) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float] | wp.array[wp.mat44]:
-    """Run one Procrustes fit into caller-owned buffers. See ``procrustes`` for the semantics."""
-    n = int(a.shape[0])
-    device = a.device
-    acc = workspace["acc"]
-    out_matrix = workspace["matrix"]
-    if weights is None:
-        weights = workspace["uniform_weights"]
-
-    acc.zero_()
-    wp.launch_tiled(
-        kernel_registration.accumulate_procrustes_moments,
-        dim=kernel_reduce.blocks_1d(n),
-        inputs=[a, b, weights, translation, acc],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    wp.launch(
-        kernel_registration.build_procrustes_matrix,
-        dim=1,
-        inputs=[a, b, acc, reflection, translation, scale, out_matrix],
-        device=device,
-    )
-
-    if not return_cost:
-        return out_matrix
-
-    out_transformed = workspace["transformed"]
-    assert out_transformed is not None
-    # One launch, not two: this both writes ``out_transformed`` and reduces the residual against
-    # it. See the kernel for why fusing became worth it only after the reduction was flattened.
-    wp.launch_tiled(
-        kernel_registration.transform_and_accumulate_cost,
-        dim=kernel_reduce.blocks_1d(n),
-        inputs=[a, b, weights, out_matrix, acc, out_transformed],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    # One readback for the whole accumulator; ICP's convergence test needs the cost on the host,
-    # and an extra device-side pass would cost more than the readback.
-    cost = float(read_scalar(acc, int(kernel_registration.ACC_COST)))
-    return out_matrix, out_transformed, cost
 
 
 _ROBUST_KINDS: dict[str, int] = {"none": 0, "huber": 1, "tukey": 2}
@@ -353,6 +277,7 @@ def icp(
                 wp.float32(max_distance),
                 out=weights,
             )
+            # Readback: the loop's own early-exit test, no cheaper than the sum it reads.
             if float(tw.reduce.sum(weights)) == 0.0:
                 break
 
@@ -366,6 +291,97 @@ def icp(
         old_cost = cost
 
     return total, transformed, cost
+
+
+class _ProcrustesWorkspace(TypedDict):
+    """Buffers a [`procrustes`][triwarp.registration.procrustes] fit writes into."""
+
+    acc: wp.array[wp.float32]
+    matrix: wp.array[wp.mat44]
+    transformed: wp.array[wp.vec3] | None
+    uniform_weights: wp.array[wp.float32]
+
+
+def _procrustes_workspace(
+    n: int, device: wp.DeviceLike, *, return_cost: bool
+) -> _ProcrustesWorkspace:
+    """Allocate the buffers one Procrustes fit needs; reuse across iterations of a loop."""
+    return {
+        "acc": wp.empty(kernel_registration.PROCRUSTES_ACC_SIZE, dtype=wp.float32, device=device),
+        "matrix": wp.empty(1, dtype=wp.mat44, device=device),
+        "transformed": wp.empty(n, dtype=wp.vec3, device=device) if return_cost else None,
+        "uniform_weights": _uniform_weights(device),
+    }
+
+
+_UNIFORM_WEIGHTS: dict[str, wp.array[wp.float32]] = {}
+
+
+def _uniform_weights(device: wp.DeviceLike) -> wp.array[wp.float32]:
+    """
+    Return the kernels' "uniform weights" sentinel: a zero-length array, shared per device.
+
+    Length zero means "every weight is 1", so the common weightless call needs neither a
+    ``wp.full(n, 1.0)`` allocation nor its fill — and since the buffer carries no data, one
+    instance per device serves every caller.
+    """
+    key = str(device)
+    if key not in _UNIFORM_WEIGHTS:
+        _UNIFORM_WEIGHTS[key] = wp.empty(0, dtype=wp.float32, device=device)
+    return _UNIFORM_WEIGHTS[key]
+
+
+def _procrustes_into(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    weights: wp.array[wp.float32] | None,
+    reflection: bool,
+    translation: bool,
+    scale: bool,
+    return_cost: bool,
+    workspace: _ProcrustesWorkspace,
+) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float] | wp.array[wp.mat44]:
+    """Run one Procrustes fit into caller-owned buffers. See ``procrustes`` for the semantics."""
+    n = int(a.shape[0])
+    device = a.device
+    acc = workspace["acc"]
+    out_matrix = workspace["matrix"]
+    if weights is None:
+        weights = workspace["uniform_weights"]
+
+    acc.zero_()
+    wp.launch_tiled(
+        kernel_registration.accumulate_procrustes_moments,
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[a, b, weights, translation, acc],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    wp.launch(
+        kernel_registration.build_procrustes_matrix,
+        dim=1,
+        inputs=[a, b, acc, reflection, translation, scale, out_matrix],
+        device=device,
+    )
+
+    if not return_cost:
+        return out_matrix
+
+    out_transformed = workspace["transformed"]
+    assert out_transformed is not None
+    # One launch, not two: this both writes ``out_transformed`` and reduces the residual against
+    # it. See the kernel for why fusing became worth it only after the reduction was flattened.
+    wp.launch_tiled(
+        kernel_registration.transform_and_accumulate_cost,
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[a, b, weights, out_matrix, acc, out_transformed],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    # One readback for the whole accumulator; ICP's convergence test needs the cost on the host,
+    # and an extra device-side pass would cost more than the readback.
+    cost = float(read_scalar(acc, int(kernel_registration.ACC_COST)))
+    return out_matrix, out_transformed, cost
 
 
 def icp_point_to_plane(
@@ -443,8 +459,8 @@ def icp_point_to_plane(
     Raises
     ------
     ValueError
-        If the target is a point cloud (``target_faces is None``) and
-        ``target_normals`` is not provided.
+        If the target is a point cloud (``target_faces is None``) and ``target_normals`` is not
+        provided, or does not have the same length as ``target_vertices``.
     RuntimeError
         If ``a``, ``target_vertices``, ``target_faces``, ``target_normals`` and ``initial`` are not
         all on one device.
@@ -472,12 +488,23 @@ def icp_point_to_plane(
             "icp_point_to_plane requires target_normals for a point-cloud target "
             "(target_faces is None)."
         )
+    if (
+        not is_mesh
+        and target_normals is not None
+        and int(target_normals.shape[0]) != int(target_vertices.shape[0])
+    ):
+        # ``target_normals`` feeds ``gather_vec_skip_negative`` below, indexed by a nearest-vertex
+        # id that ranges over ``target_vertices``; a shorter buffer is an out-of-bounds read on
+        # both devices (CLAUDE.md §12.1), not merely a wrong answer.
+        raise ValueError(
+            "target_normals must have the same length as target_vertices, got "
+            f"{target_normals.shape[0]} and {target_vertices.shape[0]}."
+        )
 
     if n == 0 or int(target_vertices.shape[0]) == 0:
         return _identity_mat44(device), wp.clone(a), math.inf
 
     initial_matrix, current = _seed_transform(a, initial, device)
-    total = initial_matrix
     transformed = wp.clone(current)
     cost = math.inf
 
@@ -488,8 +515,9 @@ def icp_point_to_plane(
     if is_mesh:
         assert target_faces is not None
         face_normals, _ = tw.triangles.face_normals_and_areas(target_vertices, target_faces)
-    else:
-        target_index = _target_index(target_vertices)
+    # ``target_index`` is already the point-cloud one from ``_resolve_icp_target`` above when
+    # ``not is_mesh`` -- rebuilding it here duplicated a ``wp.Bvh`` build and an ``aabb`` reduction
+    # for no behavioral difference.
 
     max_d = max_distance if max_distance is not None else math.inf
     scale_value = robust_scale
@@ -503,6 +531,11 @@ def icp_point_to_plane(
     distance_mesh = wp.empty(n, dtype=wp.float32, device=device)
     triangle_id_mesh = wp.empty(n, dtype=wp.int32, device=device)
     normals = wp.empty(n, dtype=wp.vec3, device=device)
+    # Only allocated when correspondences can actually be rejected -- see the all-rejected guard
+    # below, which needs a buffer to reduce over.
+    valid: wp.array[wp.bool] | None = (
+        wp.empty(n, dtype=wp.bool, device=device) if max_distance is not None else None
+    )
     jtj = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
     jtr = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     cost_acc = wp.zeros(1, dtype=wp.float32, device=device)
@@ -532,6 +565,22 @@ def icp_point_to_plane(
             inputs=[normal_source, triangle_id, normals],
             device=device,
         )
+
+        # --- bail out once no correspondence survives the distance gate ---
+        # Mirrors ``icp``'s ``sum(weights) == 0`` check: without it, every accumulator below stays
+        # at its zeroed initial value, the damped 6x6 solve returns a zero step, and the loop
+        # reports ``cost=0.0`` -- indistinguishable from a perfect fit -- instead of stopping with
+        # the last real cost (or ``math.inf`` if nothing ever matched).
+        if valid is not None:
+            wp.map(
+                kernel_registration.residual_valid,
+                triangle_id,
+                distance,
+                wp.float32(max_d),
+                out=valid,
+            )
+            if not tw.reduce.any(valid):
+                break
 
         # --- resolve robust scale on the first iteration ---
         if kind != 0 and scale_value is None:

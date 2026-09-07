@@ -281,9 +281,9 @@ def _unique_hash(
 
     unique_counts = None
     if return_counts:
-        sort_perm = wp.empty(n_unique, dtype=wp.int32, device=device)
-        wp.copy(sort_perm, perm_buf, count=n_unique)
-        unique_counts = gather(cnts_compact, sort_perm)
+        # A contiguous prefix slice, not a gather-unsafe strided view (CLAUDE.md §3.4) -- no copy
+        # needed before handing it to ``gather`` as the index array.
+        unique_counts = gather(cnts_compact, perm_buf[:n_unique])
 
     unique_inverse = None
     if return_inverse:
@@ -416,10 +416,17 @@ def unique_rows(
     if n == 0:
         if is_vec3:
             empty_unique = wp.empty(0, dtype=wp.vec3, device=device)
-        elif data.dtype == wp.int32:
-            empty_unique = twt.empty_2d((0, int(data.shape[1])), wp.int32, device=device)
         else:
-            empty_unique = twt.empty_2d((0, int(data.shape[1])), wp.float32, device=device)
+            # Same dtype check ``hash_rows`` performs on the non-empty path below, so a caller who
+            # only ever exercises this function on empty input still gets the documented raise
+            # rather than a silently wrong output dtype.
+            twt.ensure_ndim(data, 2)
+            if data.dtype == wp.int32:
+                empty_unique = twt.empty_2d((0, int(data.shape[1])), wp.int32, device=device)
+            elif data.dtype == wp.float32:
+                empty_unique = twt.empty_2d((0, int(data.shape[1])), wp.float32, device=device)
+            else:
+                raise ValueError(f"unique_rows unsupported dtype {data.dtype}")
         empty_i32 = wp.empty(0, dtype=wp.int32, device=device)
         return _pack_unique_result(
             empty_unique,
@@ -427,18 +434,7 @@ def unique_rows(
             counts=empty_i32 if return_counts else None,
         )
 
-    row_keys = hash_rows(data)
-    keys_result = unique_1d(row_keys, return_inverse=True, return_counts=return_counts)
-    if return_counts:
-        unique_keys, inverse, counts = keys_result
-    else:
-        unique_keys, inverse = keys_result
-        counts = None
-
-    # The class count is the length of the unique-key array ``unique_1d`` just returned; recovering
-    # it as ``reduce.max(inverse) + 1`` would be a whole reduction launch and a host sync for a
-    # number already in hand.
-    first_idx = first_occurrence_indices(inverse, int(unique_keys.shape[0]))
+    _unique_keys, inverse, first_idx, counts = _unique_rows_core(data, return_counts=return_counts)
 
     if not is_vec3:
         twt.ensure_ndim(data, 2)
@@ -500,13 +496,43 @@ def unique_faces(
         inputs=[faces2d, sorted_faces],
         device=device,
     )
-    unique_sorted_faces, inverse = unique_rows(sorted_faces, return_inverse=True)
-    # As in ``unique_rows``: the count is a shape, not something to reduce for.
-    first = first_occurrence_indices(inverse, int(unique_sorted_faces.shape[0]))
+    # Not ``unique_rows(sorted_faces, return_inverse=True)``: that gathers ``sorted_faces`` by the
+    # first-occurrence indices to build its own return, an answer this function has no use for --
+    # it gathers ``faces2d`` (the unsorted rows) by the same indices instead, to keep each
+    # representative's original winding. Sharing the core skips that discarded gather and the
+    # ``first_occurrence_indices`` launch it would otherwise take a second time on the identical
+    # ``inverse``.
+    _unique_keys, inverse, first, _counts = _unique_rows_core(sorted_faces, return_counts=False)
     unique_faces_out = gather(faces2d, first).reshape((-1,))
     if return_inverse:
         return unique_faces_out, inverse
     return unique_faces_out
+
+
+def _unique_rows_core(
+    data: wp.array, *, return_counts: bool
+) -> tuple[wp.array[wp.uint64], wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32] | None]:
+    """
+    Shared core of [`unique_rows`][triwarp.grouping.unique_rows]: hash, dedup, find first index.
+
+    Returns ``(unique_keys, inverse, first_idx, counts)``. Both callers hash and deduplicate
+    identically; they differ only in what they gather with ``first_idx`` --
+    [`unique_rows`][triwarp.grouping.unique_rows] gathers ``data`` itself, while
+    [`unique_faces`][triwarp.grouping.unique_faces] gathers the un-sorted face buffer to preserve
+    each representative's original vertex order. Requires ``data.shape[0] > 0``.
+    """
+    row_keys = hash_rows(data)
+    keys_result = unique_1d(row_keys, return_inverse=True, return_counts=return_counts)
+    if return_counts:
+        unique_keys, inverse, counts = keys_result
+    else:
+        unique_keys, inverse = keys_result
+        counts = None
+    # The class count is the length of the unique-key array ``unique_1d`` just returned; recovering
+    # it as ``reduce.max(inverse) + 1`` would be a whole reduction launch and a host sync for a
+    # number already in hand.
+    first_idx = first_occurrence_indices(inverse, int(unique_keys.shape[0]))
+    return unique_keys, inverse, first_idx, counts
 
 
 def first_occurrence_indices(
@@ -763,13 +789,15 @@ def hash_indices_rows(
     twt.ensure_ndim(data, 2, dtype=wp.int32)
     if max_index is not None and max_index <= 0:
         raise ValueError(f"max_index must be positive, got {max_index}")
+    n = int(data.shape[0])
     if not validate:
         if max_index is None:
             raise ValueError("validate=False requires an explicit max_index (the radix to use).")
-    else:
+    elif n > 0:
         # The min/max is a device reduction with a host readback, so it serialises the pipeline.
         # It is unavoidable when the radix has to be inferred, and skippable via validate=False
-        # when the caller already knows the bound.
+        # when the caller already knows the bound. Skipped for an empty ``data`` -- there is
+        # nothing to validate, and ``reduce.minmax`` itself raises on an empty array.
         min_data, max_data = tw.reduce.minmax(data)
         if min_data < 0:
             raise ValueError(f"data must be non-negative, got a minimum of {min_data}")
@@ -779,13 +807,14 @@ def hash_indices_rows(
             )
         if max_index is None:
             max_index = max_data + 1
-    hashes = wp.empty(data.shape[0], dtype=wp.uint64, device=data.device)
-    wp.launch(
-        kernel_grouping.pack_indices,
-        dim=data.shape[0],
-        inputs=[data, wp.uint64(max_index), hashes],
-        device=data.device,
-    )
+    hashes = wp.empty(n, dtype=wp.uint64, device=data.device)
+    if n > 0:
+        wp.launch(
+            kernel_grouping.pack_indices,
+            dim=n,
+            inputs=[data, wp.uint64(max_index), hashes],
+            device=data.device,
+        )
     return hashes
 
 

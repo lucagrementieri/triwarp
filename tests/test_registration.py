@@ -316,6 +316,35 @@ def test_procrustes_return_matrix_only(device: str) -> None:
     assert np.allclose(result.numpy()[0], matrix_tm, rtol=1e-4, atol=1e-4)
 
 
+def test_procrustes_length_mismatch(device: str) -> None:
+    a_wp = points_to_warp(np.random.default_rng(20).standard_normal((10, 3)), device)
+    b_wp = points_to_warp(np.random.default_rng(21).standard_normal((11, 3)), device)
+    with pytest.raises(ValueError, match="same length"):
+        tw.registration.procrustes(a_wp, b_wp)
+
+
+def test_procrustes_weights_length_mismatch(device: str) -> None:
+    a_wp = points_to_warp(np.random.default_rng(22).standard_normal((10, 3)), device)
+    b_wp = points_to_warp(np.random.default_rng(23).standard_normal((10, 3)), device)
+    weights_wp = wp.zeros(5, dtype=wp.float32, device=device)
+    with pytest.raises(ValueError, match="same length"):
+        tw.registration.procrustes(a_wp, b_wp, weights=weights_wp)
+
+
+def test_procrustes_empty(device: str) -> None:
+    """``n == 0`` must return the identity, not the NaN a division by zero would give."""
+    a_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    b_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+
+    matrix_wp, transformed_wp, cost_tw = tw.registration.procrustes(a_wp, b_wp)
+    assert np.allclose(matrix_wp.numpy()[0], np.eye(4))
+    assert transformed_wp.shape == (0,)
+    assert cost_tw == 0.0
+
+    matrix_only = tw.registration.procrustes(a_wp, b_wp, return_cost=False)
+    assert np.allclose(matrix_only.numpy()[0], np.eye(4))
+
+
 # --- Iterative closest point (ICP) -----------------------------------------
 
 
@@ -1070,3 +1099,31 @@ def test_icp_max_distance_all_rejected(device: str) -> None:
     )
     assert np.isfinite(matrix_wp.numpy()).all()
     assert np.allclose(matrix_wp.numpy()[0], np.eye(4), atol=1e-6)
+
+
+def test_icp_point_to_plane_target_normals_length_mismatch(device: str) -> None:
+    rng = np.random.default_rng(16)
+    target_wp = points_to_warp(rng.standard_normal((50, 3)), device)
+    source_wp = points_to_warp(rng.standard_normal((50, 3)), device)
+    normals_wp = points_to_warp(rng.standard_normal((40, 3)), device)
+    with pytest.raises(ValueError, match="target_normals"):
+        tw.registration.icp_point_to_plane(source_wp, target_wp, None, target_normals=normals_wp)
+
+
+def test_icp_point_to_plane_max_distance_all_rejected(device: str) -> None:
+    rng = np.random.default_rng(17)
+    target_np = rng.standard_normal((100, 3)).astype(np.float32)
+    normals_np = target_np / np.linalg.norm(target_np, axis=1, keepdims=True)
+    source_np = (target_np + np.array([5.0, 5.0, 5.0], dtype=np.float32)).astype(np.float32)
+    source_wp = points_to_warp(source_np, device)
+    target_wp = points_to_warp(target_np, device)
+    normals_wp = points_to_warp(normals_np, device)
+
+    # Every correspondence is beyond max_distance -> the loop must bail out on the first
+    # iteration rather than read a zeroed accumulator as a converged cost=0.0 fit.
+    matrix_wp, _, cost_tw = tw.registration.icp_point_to_plane(
+        source_wp, target_wp, None, target_normals=normals_wp, max_iterations=10, max_distance=1e-6
+    )
+    assert np.isfinite(matrix_wp.numpy()).all()
+    assert np.allclose(matrix_wp.numpy()[0], np.eye(4), atol=1e-6)
+    assert not np.isfinite(cost_tw)

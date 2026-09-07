@@ -216,6 +216,31 @@ def test_unique_rows_vec3(device: str):
         )
 
 
+def test_unique_rows_empty_unsupported_dtype_raises(device: str) -> None:
+    """
+    The ``n == 0`` branch must validate the same way ``hash_rows`` does on non-empty input.
+
+    Before this test, an empty, unsupported-dtype array silently fell into the ``float32`` guess
+    rather than raising, so an empty input and a non-empty one disagreed about the same bad dtype.
+    """
+    empty_wp = wp.empty((0, 3), dtype=wp.int64, device=device)
+    non_empty_wp = wp.array([[1, 2, 3]], dtype=wp.int64, device=device)
+    with pytest.raises(ValueError, match="unsupported dtype"):
+        tw.grouping.unique_rows(empty_wp)
+    with pytest.raises(ValueError, match="unsupported dtype"):
+        tw.grouping.unique_rows(non_empty_wp)
+
+
+def test_unique_rows_empty_wrong_rank_raises(device: str) -> None:
+    """A rank-1, non-``vec3`` array must raise consistently whether or not it is empty."""
+    empty_wp = wp.empty(0, dtype=wp.int32, device=device)
+    non_empty_wp = wp.array([1, 2, 3], dtype=wp.int32, device=device)
+    with pytest.raises(TypeError):
+        tw.grouping.unique_rows(empty_wp)
+    with pytest.raises(TypeError):
+        tw.grouping.unique_rows(non_empty_wp)
+
+
 @pytest.mark.parity("unique_faces", "igl", "trimesh")
 def test_unique_faces(device: str):
     """
@@ -474,12 +499,34 @@ def test_hash_indices_rows_unvalidated(device: str) -> None:
         _ = tw.grouping.hash_indices_rows(indices_wp, validate=False)
 
 
+def test_hash_indices_rows_empty(device: str) -> None:
+    """An empty ``data`` must not reach ``reduce.minmax``, which raises on an empty array."""
+    empty_wp = wp.empty((0, 3), dtype=wp.int32, device=device)
+    packed_wp = tw.grouping.hash_indices_rows(empty_wp)
+    assert packed_wp.shape == (0,)
+    assert packed_wp.dtype == wp.uint64
+
+    packed_unvalidated_wp = tw.grouping.hash_indices_rows(empty_wp, max_index=5, validate=False)
+    assert packed_unvalidated_wp.shape == (0,)
+
+
 def test_group_int_rows_unvalidated(device: str) -> None:
     data_np = np.array([[1, 2], [3, 4], [1, 2], [3, 4], [5, 6]], dtype=np.int32)
     data_wp = wp.array(data_np, dtype=wp.int32, device=device)
     groups_wp = tw.grouping.group_int_rows(data_wp, 2, max_value=7)
     groups_unvalidated_wp = tw.grouping.group_int_rows(data_wp, 2, max_value=7, validate=False)
     assert np.array_equal(groups_unvalidated_wp.numpy(), groups_wp.numpy())
+
+
+def test_group_int_rows_empty(device: str) -> None:
+    """
+    An empty ``data`` must reach ``group``'s own empty-input path.
+
+    Not crash inside ``hash_indices_rows``'s default validation on the way there.
+    """
+    empty_wp = wp.empty((0, 3), dtype=wp.int32, device=device)
+    groups_wp = tw.grouping.group_int_rows(empty_wp, 2)
+    assert groups_wp.shape == (0, 2)
 
 
 def _pack_vec3_np(vectors_np: np.ndarray) -> np.ndarray:
