@@ -2,8 +2,8 @@
 Chamfer and Hausdorff distances between point clouds and meshes.
 
 All metrics are fully GPU-resident: they compose the nearest-neighbor and
-point-to-surface primitives in [`triwarp.proximity`][] with the tiled reductions
-in [`triwarp.reduce`][], and never move per-element data to the host.
+point-to-surface primitives in [`proximity`][triwarp.proximity] with the tiled reductions
+in [`reduce`][triwarp.reduce], and never move per-element data to the host.
 
 Chamfer distances follow the ``pytorch3d`` convention and are built on **squared**
 Euclidean distances. Hausdorff distances follow libigl's ``igl::hausdorff`` and reduce the
@@ -117,6 +117,8 @@ def chamfer_points_to_points(
     ------
     RuntimeError
         If ``x`` and ``y`` are not all on one device.
+    ValueError
+        If ``point_reduction`` is not ``"mean"``, ``"sum"``, ``"max"`` or ``None``.
 
     See Also
     --------
@@ -184,12 +186,18 @@ def chamfer_points_to_mesh(
     -------
     float or wp.array[wp.float32] or tuple
         Same layout as [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points].
-        The forward array has length ``n`` and the backward array length ``v``.
+        The forward array has length ``n`` and the backward array length ``v``, except when
+        ``points``, ``vertices`` or ``faces`` is empty -- a mesh with no faces counts as empty here
+        even when ``vertices`` is not, since there is no surface for the forward term to measure
+        against -- in which case both arrays are length 0, matching
+        [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points]'s own convention.
 
     Raises
     ------
     RuntimeError
         If ``points``, ``vertices`` and ``faces`` are not all on one device.
+    ValueError
+        If ``point_reduction`` is not ``"mean"``, ``"sum"``, ``"max"`` or ``None``.
 
     See Also
     --------
@@ -257,12 +265,17 @@ def chamfer_mesh_to_mesh(
     -------
     float or wp.array[wp.float32] or tuple
         Same layout as [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points].
-        The forward array has length ``va`` and the backward array length ``vb``.
+        The forward array has length ``va`` and the backward array length ``vb``, except when any
+        of ``vertices_a``, ``faces_a``, ``vertices_b`` or ``faces_b`` is empty -- a mesh with no
+        faces counts as empty here even when its vertices are not -- in which case both arrays are
+        length 0.
 
     Raises
     ------
     RuntimeError
         If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
+    ValueError
+        If ``point_reduction`` is not ``"mean"``, ``"sum"``, ``"max"`` or ``None``.
 
     See Also
     --------
@@ -356,6 +369,8 @@ def chamfer_points_to_points_loss(
     ------
     RuntimeError
         If ``x`` and ``y`` are not all on one device.
+    ValueError
+        If ``point_reduction`` is not ``"mean"`` or ``"sum"``.
 
     See Also
     --------
@@ -372,19 +387,19 @@ def chamfer_points_to_points_loss(
     if n == 0 or m == 0:
         return loss
 
-    # Non-differentiable nearest-neighbor indices (computed outside the tape).
-    nearest_xy = tw.neighbors.query_nearest(y, x, k=1)[0]
-    nearest_yx = None
+    # Non-differentiable nearest-neighbor indices (computed outside the tape). The backward search
+    # is seeded from the forward one's own distances -- see `_backward_radius`.
+    nearest_xy, dist_xy = tw.neighbors.query_nearest(y, x, k=1)
+    terms = [lambda: _launch_nn_term(x, y, nearest_xy, _reduction_scale(point_reduction, n), loss)]
     if not single_directional:
-        nearest_yx = tw.neighbors.query_nearest(x, y, k=1)[0]
+        nearest_yx = tw.neighbors.query_nearest(
+            x, y, k=1, initial_radius=_backward_radius(dist_xy)
+        )[0]
+        terms.append(
+            lambda: _launch_nn_term(y, x, nearest_yx, _reduction_scale(point_reduction, m), loss)
+        )
 
-    def _record() -> None:
-        _launch_nn_term(x, y, nearest_xy, _reduction_scale(point_reduction, n), loss)
-        if not single_directional:
-            assert nearest_yx is not None
-            _launch_nn_term(y, x, nearest_yx, _reduction_scale(point_reduction, m), loss)
-
-    _maybe_taped(tape, _record)
+    _accumulate_chamfer_terms(tape, terms)
     return loss
 
 
@@ -430,6 +445,8 @@ def chamfer_points_to_mesh_loss(
     ------
     RuntimeError
         If ``points``, ``vertices`` and ``faces`` are not all on one device.
+    ValueError
+        If ``point_reduction`` is not ``"mean"`` or ``"sum"``.
 
     See Also
     --------
@@ -447,23 +464,25 @@ def chamfer_points_to_mesh_loss(
     if n == 0 or v == 0 or n_faces == 0:
         return loss
 
-    # Non-differentiable closest-face and nearest-neighbor assignment (outside the tape).
-    face_id = tw.proximity.closest_point_on_mesh(vertices, faces, points)[2]
-    nearest_vp = None
-    if not single_directional:
-        nearest_vp = tw.neighbors.query_nearest(points, vertices, k=1)[0]
-
-    def _record() -> None:
-        _launch_surface_term(
+    # Non-differentiable closest-face and nearest-neighbor assignment (outside the tape). The
+    # backward search is seeded from the forward one's own distances -- see `_backward_radius`.
+    _, dist_forward, face_id = tw.proximity.closest_point_on_mesh(vertices, faces, points)
+    terms = [
+        lambda: _launch_surface_term(
             points, vertices, faces, face_id, _reduction_scale(point_reduction, n), loss
         )
-        if not single_directional:
-            assert nearest_vp is not None
-            _launch_nn_term(
+    ]
+    if not single_directional:
+        nearest_vp = tw.neighbors.query_nearest(
+            points, vertices, k=1, initial_radius=_backward_radius(dist_forward)
+        )[0]
+        terms.append(
+            lambda: _launch_nn_term(
                 vertices, points, nearest_vp, _reduction_scale(point_reduction, v), loss
             )
+        )
 
-    _maybe_taped(tape, _record)
+    _accumulate_chamfer_terms(tape, terms)
     return loss
 
 
@@ -508,6 +527,8 @@ def chamfer_mesh_to_mesh_loss(
     ------
     RuntimeError
         If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
+    ValueError
+        If ``point_reduction`` is not ``"mean"`` or ``"sum"``.
 
     See Also
     --------
@@ -530,17 +551,15 @@ def chamfer_mesh_to_mesh_loss(
 
     # Non-differentiable closest-face assignment for each direction (outside the tape).
     face_id_ab = tw.proximity.closest_point_on_mesh(vertices_b, faces_b, vertices_a)[2]
-    face_id_ba = None
-    if not single_directional:
-        face_id_ba = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[2]
-
-    def _record() -> None:
-        _launch_surface_term(
+    terms = [
+        lambda: _launch_surface_term(
             vertices_a, vertices_b, faces_b, face_id_ab, _reduction_scale(point_reduction, va), loss
         )
-        if not single_directional:
-            assert face_id_ba is not None
-            _launch_surface_term(
+    ]
+    if not single_directional:
+        face_id_ba = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[2]
+        terms.append(
+            lambda: _launch_surface_term(
                 vertices_b,
                 vertices_a,
                 faces_a,
@@ -548,8 +567,9 @@ def chamfer_mesh_to_mesh_loss(
                 _reduction_scale(point_reduction, vb),
                 loss,
             )
+        )
 
-    _maybe_taped(tape, _record)
+    _accumulate_chamfer_terms(tape, terms)
     return loss
 
 
@@ -901,19 +921,28 @@ def _zero_loss(device: wp.DeviceLike) -> twt.Array1dFloat32:
     return cast(twt.Array1dFloat32, zeros)
 
 
-def _maybe_taped(tape: wp.Tape | None, record: Callable[[], None]) -> None:
+def _accumulate_chamfer_terms(tape: wp.Tape | None, terms: list[Callable[[], None]]) -> None:
     """
-    Run ``record``, inside ``tape`` when there is one.
+    Run every term's launch closure into ``loss``, inside ``tape`` when there is one.
 
-    The three ``chamfer_*_loss`` entry points each build their launches in a closure so the same
-    body can run recorded or not; this is the branch that decides which. Recording is opt-in
-    because a ``wp.Tape`` context is only wanted when the caller intends to backpropagate.
+    Each of the three ``chamfer_*_loss`` entry points builds ``terms`` as one zero-argument closure
+    per direction it accumulates (one when ``single_directional``, two otherwise) and hands them
+    here instead of each writing its own ``_record`` closure -- which is what let all three drop the
+    ``nearest_yx: ... | None = None`` / ``assert nearest_yx is not None`` dance they used to repeat:
+    a closure already captures whichever assignment it was built from, so there is nothing to
+    narrow. Recording is opt-in because a ``wp.Tape`` context is only wanted when the caller intends
+    to backpropagate; passing ``tape=None`` still runs every term, just untaped.
     """
+
+    def _record() -> None:
+        for term in terms:
+            term()
+
     if tape is not None:
         with tape:
-            record()
+            _record()
     else:
-        record()
+        _record()
 
 
 def _launch_nn_term(
@@ -923,31 +952,15 @@ def _launch_nn_term(
     scale: float,
     loss: twt.Array1dFloat32,
 ) -> None:
-    """
-    Accumulate the point-to-point Chamfer term for ``x`` into ``loss``.
-
-    Dispatches on the device: the block-reducing ``*_tiled`` kernel on CUDA, the portable
-    strided-slice one on CPU, where ``wp.launch_tiled`` runs a single lane per block (see
-    [`prefers_tiled_reduction`][triwarp._device.prefers_tiled_reduction]).
-    """
-    n = int(x.shape[0])
-    device = x.device
-    if prefers_tiled_reduction(device):
-        wp.launch_tiled(
-            kernel_metrics.chamfer_nn_term_tiled,
-            dim=[(n + TILE_1D - 1) // TILE_1D],
-            inputs=[x, y, nearest, wp.float32(scale), loss],
-            block_dim=TILE_1D,
-            device=device,
-        )
-    else:
-        slices = slice_count(n, device)
-        wp.launch(
-            kernel_metrics.chamfer_nn_term_sliced,
-            dim=slices,
-            inputs=[x, y, nearest, wp.float32(scale), wp.int32(slices), loss],
-            device=device,
-        )
+    """Accumulate the point-to-point Chamfer term for ``x`` into ``loss``."""
+    _launch_reduction_pair(
+        kernel_metrics.chamfer_nn_term_tiled,
+        kernel_metrics.chamfer_nn_term_sliced,
+        int(x.shape[0]),
+        x.device,
+        [x, y, nearest, wp.float32(scale)],
+        loss,
+    )
 
 
 def _launch_surface_term(
@@ -958,26 +971,51 @@ def _launch_surface_term(
     scale: float,
     loss: twt.Array1dFloat32,
 ) -> None:
-    """
-    Accumulate the point-to-surface Chamfer term for ``points`` into ``loss``.
+    """Accumulate the point-to-surface Chamfer term for ``points`` into ``loss``."""
+    _launch_reduction_pair(
+        kernel_metrics.chamfer_surface_term_tiled,
+        kernel_metrics.chamfer_surface_term_sliced,
+        int(points.shape[0]),
+        points.device,
+        [points, vertices, faces, face_id, wp.float32(scale)],
+        loss,
+    )
 
-    Same device dispatch as [`_launch_nn_term`][triwarp.metrics._launch_nn_term].
+
+def _launch_reduction_pair(
+    kernel_tiled: wp.Kernel,
+    kernel_sliced: wp.Kernel,
+    n: int,
+    device: wp.DeviceLike,
+    common_inputs: list[object],
+    loss: twt.Array1dFloat32,
+) -> None:
     """
-    n = int(points.shape[0])
-    device = points.device
+    Dispatch one of a matched ``*_tiled`` / ``*_sliced`` kernel pair over ``n`` items into ``loss``.
+
+    The block-reducing ``*_tiled`` kernel runs on CUDA, the portable strided-slice one on CPU, where
+    ``wp.launch_tiled`` runs a single lane per block (see
+    [`prefers_tiled_reduction`][triwarp._device.prefers_tiled_reduction]). ``common_inputs`` is
+    every argument both kernels share, in the order they declare it, before the sliced kernel's
+    extra ``slices`` count and both kernels' trailing ``loss``.
+
+    Shared by [`_launch_nn_term`][triwarp.metrics._launch_nn_term] and
+    [`_launch_surface_term`][triwarp.metrics._launch_surface_term] (its last caller), whose only
+    difference is which kernel pair and argument list they carry.
+    """
     if prefers_tiled_reduction(device):
         wp.launch_tiled(
-            kernel_metrics.chamfer_surface_term_tiled,
+            kernel_tiled,
             dim=[(n + TILE_1D - 1) // TILE_1D],
-            inputs=[points, vertices, faces, face_id, wp.float32(scale), loss],
+            inputs=[*common_inputs, loss],
             block_dim=TILE_1D,
             device=device,
         )
     else:
         slices = slice_count(n, device)
         wp.launch(
-            kernel_metrics.chamfer_surface_term_sliced,
+            kernel_sliced,
             dim=slices,
-            inputs=[points, vertices, faces, face_id, wp.float32(scale), wp.int32(slices), loss],
+            inputs=[*common_inputs, wp.int32(slices), loss],
             device=device,
         )

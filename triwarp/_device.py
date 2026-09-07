@@ -1,12 +1,12 @@
 """
 Private device-capability guards and host-readback helpers shared across wrapper modules.
 
-Two of the six members are not about devices, and the name is a historical accident rather than a
-claim: ``read_scalar`` is a host-readback helper (which is at least device-adjacent -- it is the
-sync) and ``require_nonempty_mesh`` is a plain validation guard, with 19 internal uses between
-them. They live here because this is the module wrapper code already imports for shared internals,
-not because either consults the device. Noted so a reader grepping for the guard is not surprised
-to find it under this name.
+Three of the seven members are not about devices, and the name is a historical accident rather
+than a claim: ``read_scalar`` is a host-readback helper (which is at least device-adjacent -- it is
+the sync) and ``require_nonempty_mesh`` / ``require_valid_faces`` are plain validation guards. They
+live here because this is the module wrapper code already imports for shared internals, not because
+any of them consults the device. Noted so a reader grepping for a guard is not surprised to find it
+under this name.
 
 ``require_same_device`` is the exception: it is squarely about devices, and it is the one member of
 this module every public two-or-more-array function in the package now calls. See its own
@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+import triwarp as tw
 from triwarp.constants import ITEMS_PER_SLICE_CPU, ITEMS_PER_SLICE_CUDA
 
 
@@ -155,6 +156,53 @@ def require_nonempty_mesh(faces: wp.array[wp.int32], name: str) -> None:
         raise ValueError(
             f"{name} cannot build a warp.Mesh with zero triangles: this silently corrupts CUDA "
             "state through Warp 1.17 (see the Warp issue tracker for wp.Mesh + empty BVH)."
+        )
+
+
+def require_valid_faces(faces: wp.array[wp.int32], n_vertices: int, name: str) -> None:
+    """
+    Raise if any index in ``faces`` falls outside ``[0, n_vertices)``.
+
+    An out-of-range face index is not a wrong-answer bug; it is an out-of-bounds read at every
+    downstream kernel that indexes ``vertices[faces[...]]`` -- silent glibc heap corruption on the
+    CPU device, and a silently wrong or crashing answer on CUDA, with no Python exception either way
+    (the same memory-safety class as an unvalidated device mismatch, which is why
+    [`require_same_device`][triwarp._device.require_same_device] exists). Nothing downstream of a
+    well-formed mesh checks this -- several reference libraries this package tests against don't
+    either (§7.6) -- so it is a precondition, not a runtime-checked invariant.
+
+    Unlike [`require_nonempty_mesh`][triwarp._device.require_nonempty_mesh], this is **not** free:
+    it costs two device reductions and two host readbacks (~0.2-0.6 ms, §13.1), because it has to
+    read the actual index values, not just a shape. That is deliberate: it is meant for the small
+    number of public entry points that are the real trust boundary for a mesh's connectivity -- a
+    freshly loaded file ([`io.load_mesh`][triwarp.io.load_mesh],
+    [`io.mesh_from_numpy`][triwarp.io.mesh_from_numpy]) or a freshly repaired one
+    ([`repair.make_solid`][triwarp.repair.make_solid]) -- not every downstream helper, which is
+    expected to trust the connectivity it was handed the same way every other per-face kernel
+    wrapper in this package already does.
+
+    Parameters
+    ----------
+    faces
+        Flat ``wp.int32`` triangle (or other) index buffer to check.
+    n_vertices
+        Exclusive upper bound every index in ``faces`` must stay under.
+    name
+        Name of the calling function, used in the error message.
+
+    Raises
+    ------
+    ValueError
+        If ``faces`` is non-empty and any of its indices is negative or ``>= n_vertices``.
+    """
+    if int(faces.shape[0]) == 0:
+        return
+    lo = int(tw.reduce.min(faces))
+    hi = int(tw.reduce.max(faces))
+    if lo < 0 or hi >= n_vertices:
+        raise ValueError(
+            f"{name}: faces must reference vertex indices in [0, {n_vertices}), "
+            f"got a range of [{lo}, {hi}]"
         )
 
 

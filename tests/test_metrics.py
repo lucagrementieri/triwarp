@@ -14,10 +14,13 @@ import numpy as np
 import pymeshlab as ml
 import pytest
 import pytorch3d.loss as p3d_loss
+import pytorch3d.structures as p3d_structures
+import torch
 import trimesh as tm
 import trimesh.proximity as tm_proximity
 import warp as wp
 from meshlib import mrmeshpy as mm
+from pytorch3d.loss import point_mesh_distance as p3d_point_mesh_distance
 from scipy.spatial import KDTree
 from scipy.spatial.distance import directed_hausdorff
 
@@ -707,6 +710,54 @@ def test_chamfer_points_to_points_loss_grad(
     assert np.allclose(y_wp.grad.numpy(), grad_y_np, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
 
 
+@pytest.mark.parity(
+    "chamfer_points_to_points_loss",
+    "pytorch3d",
+    benchmarked=False,
+    reason="chamfer_points_to_points_loss carries no benchmark group of its own (only its "
+    "non-differentiable sibling chamfer_points_to_points does); this is a correctness-only "
+    "comparison against pytorch3d's autograd, not a timed one.",
+)
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
+@pytest.mark.parametrize("single_directional", [False, True])
+def test_chamfer_points_to_points_loss_grad_matches_pytorch3d(
+    device: str, reduction: str, single_directional: bool
+) -> None:
+    """
+    Class A: pytorch3d's own autograd through ``loss.chamfer_distance`` is the gradient oracle.
+
+    Unlike the closed-form NumPy check above, this backpropagates through pytorch3d's own
+    nearest-neighbor assignment and reduction rather than a hand-derived formula. No restriction to
+    a single direction is needed here (contrast the mesh comparison below): both directions are
+    plain point-to-point nearest neighbor on both sides, which is exactly what pytorch3d's
+    ``single_directional`` keyword already means, so the two definitions agree completely rather
+    than needing a subtraction to isolate a comparable half. Measured close to float32 machine
+    epsilon on the loss and both gradients (max absolute gradient difference 4.77e-07 here).
+    """
+    rng = np.random.default_rng(25)
+    x_np = (rng.random((25, 3)) * 4.0 - 2.0).astype(np.float32)
+    y_np = (rng.random((18, 3)) * 4.0 - 2.0).astype(np.float32)
+
+    x_t = torch.tensor(x_np, device=device, requires_grad=True)
+    y_t = torch.tensor(y_np, device=device, requires_grad=True)
+    loss_p3d, _ = p3d_loss.chamfer_distance(
+        x_t[None], y_t[None], point_reduction=reduction, single_directional=single_directional
+    )
+    loss_p3d.backward()
+
+    x_wp = wp.array(x_np, dtype=wp.vec3, device=device, requires_grad=True)
+    y_wp = wp.array(y_np, dtype=wp.vec3, device=device, requires_grad=True)
+    tape = wp.Tape()
+    loss_wp = tw.metrics.chamfer_points_to_points_loss(
+        x_wp, y_wp, tape=tape, point_reduction=reduction, single_directional=single_directional
+    )
+    tape.backward(loss=loss_wp)
+
+    assert np.allclose(loss_wp.numpy()[0], loss_p3d.item(), rtol=1e-5, atol=1e-6)
+    assert np.allclose(x_wp.grad.numpy(), x_t.grad.cpu().numpy(), rtol=1e-4, atol=1e-5)
+    assert np.allclose(y_wp.grad.numpy(), y_t.grad.cpu().numpy(), rtol=1e-4, atol=1e-5)
+
+
 @pytest.mark.parametrize("reduction", ["mean", "sum"])
 @pytest.mark.parametrize("single_directional", [False, True])
 def test_chamfer_points_to_mesh_loss_grad(
@@ -753,6 +804,74 @@ def test_chamfer_points_to_mesh_loss_grad(
     assert np.allclose(loss_wp.numpy()[0], loss_np, rtol=_FD_RTOL, atol=_FD_ATOL)
     assert np.allclose(points_wp.grad.numpy(), grad_points_np, rtol=_FD_RTOL, atol=_FD_ATOL)
     assert np.allclose(verts_wp.grad.numpy(), grad_verts_np, rtol=_FD_RTOL, atol=_FD_ATOL)
+
+
+@pytest.mark.parity(
+    "chamfer_points_to_mesh_loss",
+    "pytorch3d",
+    benchmarked=False,
+    reason="chamfer_points_to_mesh_loss carries no benchmark group of its own (only its "
+    "non-differentiable sibling chamfer_points_to_mesh does), so this is correctness-only, and "
+    "single_directional=True only: pytorch3d's point_mesh_face_distance sums point-to-face with "
+    "face-to-point (see test_chamfer_points_to_mesh_matches_pytorch3d), where triwarp's backward "
+    "direction is vertex-to-nearest-point, so the two-sided loss and its gradient are not "
+    "comparable. The forward-only case needs no numpy subtraction trick to isolate, unlike the "
+    "value-only comparison above: pytorch3d's own point_face_distance primitive already returns "
+    "just the point-to-triangle term, with correct gradients w.r.t. both the points and the mesh "
+    "vertices, so it *is* the forward-only oracle directly.",
+)
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
+def test_chamfer_points_to_mesh_loss_grad_matches_pytorch3d(device: str, reduction: str) -> None:
+    """
+    Class B, forward-only: pytorch3d's ``point_mesh_distance.point_face_distance`` autograd.
+
+    ``point_mesh_face_distance`` (used by the value-only comparison above) always sums this term
+    with its face-to-point half, which has no triwarp counterpart -- see that test's own docstring.
+    Its lower-level primitive, ``point_face_distance``, returns only the per-point squared
+    point-to-triangle distance the sum is built from, still differentiable w.r.t. both the query
+    points and the mesh vertices (through ``verts_packed()[faces_packed()]``), which is exactly
+    what ``chamfer_points_to_mesh_loss(single_directional=True)`` computes -- so this needs no
+    subtraction, unlike the two-sided value comparison. Measured close to float32 machine epsilon
+    on the loss and both gradients (max absolute gradient difference 1.48e-06 here).
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    verts_np = np.asarray(mesh_tm.vertices, dtype=np.float32)
+    faces_np = np.asarray(mesh_tm.faces, dtype=np.int64)
+    rng = np.random.default_rng(24)
+    center = verts_np.mean(axis=0)
+    points_np = (center + rng.normal(scale=0.5, size=(20, 3))).astype(np.float32)
+
+    verts_t = torch.tensor(verts_np, device=device, requires_grad=True)
+    faces_t = torch.tensor(faces_np, device=device)
+    points_t = torch.tensor(points_np, device=device, requires_grad=True)
+    meshes_p3d = p3d_structures.Meshes(verts=[verts_t], faces=[faces_t])
+    pcls_p3d = p3d_structures.Pointclouds(points=[points_t])
+
+    # The packed representation `point_mesh_face_distance` builds internally (see its source),
+    # taken apart here to reach its forward-only primitive instead of the point+face sum.
+    points_packed = pcls_p3d.points_packed()
+    points_first_idx = pcls_p3d.cloud_to_packed_first_idx()
+    max_points = pcls_p3d.num_points_per_cloud().max().item()
+    tris = meshes_p3d.verts_packed()[meshes_p3d.faces_packed()]
+    tris_first_idx = meshes_p3d.mesh_to_faces_packed_first_idx()
+    point_to_face = p3d_point_mesh_distance.point_face_distance(
+        points_packed, points_first_idx, tris, tris_first_idx, max_points
+    )
+    loss_p3d = point_to_face.mean() if reduction == "mean" else point_to_face.sum()
+    loss_p3d.backward()
+
+    verts_wp = wp.array(verts_np, dtype=wp.vec3, device=device, requires_grad=True)
+    faces_wp = wp.array(faces_np.reshape(-1).astype(np.int32), dtype=wp.int32, device=device)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device, requires_grad=True)
+    tape = wp.Tape()
+    loss_wp = tw.metrics.chamfer_points_to_mesh_loss(
+        points_wp, verts_wp, faces_wp, tape=tape, point_reduction=reduction, single_directional=True
+    )
+    tape.backward(loss=loss_wp)
+
+    assert np.allclose(loss_wp.numpy()[0], loss_p3d.item(), rtol=1e-5, atol=1e-6)
+    assert np.allclose(points_wp.grad.numpy(), points_t.grad.cpu().numpy(), rtol=1e-4, atol=1e-5)
+    assert np.allclose(verts_wp.grad.numpy(), verts_t.grad.cpu().numpy(), rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.parity(

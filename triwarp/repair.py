@@ -78,7 +78,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar, require_same_device
+from triwarp._device import read_scalar, require_same_device, require_valid_faces
 from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces, unique_rows
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import bounds as kernel_bounds
@@ -188,7 +188,8 @@ def make_solid(
     Raises
     ------
     ValueError
-        If ``max_iter`` or ``inner_iter`` is negative.
+        If ``max_iter`` or ``inner_iter`` is negative, or if a face references a vertex index
+        ``vertices`` does not cover.
     RuntimeError
         If ``vertices`` and ``faces`` are not all on one device.
 
@@ -210,6 +211,12 @@ def make_solid(
 
     if int(faces.shape[0]) == 0:
         return vertices, faces
+
+    # This is the trust boundary for "a broken digitised surface": every stage below indexes
+    # ``vertices[faces]`` without a bound check, the same way every other per-face kernel wrapper in
+    # this package does, so an out-of-range index arriving here would otherwise reach the first one
+    # silently (§12.1's memory-safety class) rather than raising a Python exception.
+    require_valid_faces(faces, int(vertices.shape[0]), "make_solid")
 
     # Stage 0. The reference does this inside its *loader*, which is why it is easy to leave out and
     # why leaving it out is dangerous: skipping it can leave a mesh at the right Euler

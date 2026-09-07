@@ -126,10 +126,12 @@ class _PackedLoops:
         Delegates to [`boundary.loop_perimeters_batched`][triwarp.boundary.loop_perimeters_batched]
         rather than launching the segmented kernel again here: the packed layout this class holds
         *is* that function's argument list, and ``loop_id`` is passed rather than rebuilt, so the
-        call costs exactly what the private copy this replaced did.
+        call costs exactly what the private copy this replaced did. ``validate=False``: ``starts``
+        and ``sizes`` are built from ``sizes_np`` right above in this class's own constructor, not
+        handed in from outside, so they already fit ``flat_loops`` by construction.
         """
         return tw.boundary.loop_perimeters_batched(
-            vertices, self.flat_loops, self.starts, self.sizes, loop_id=self.loop_id
+            vertices, self.flat_loops, self.starts, self.sizes, loop_id=self.loop_id, validate=False
         ).numpy()
 
     def loop_slice(self, index: int) -> slice:
@@ -1466,6 +1468,20 @@ def fillable_loop_mask(
         is the big one*, is already
         answered by ``fill_min_weight(preserve_largest_hole=True)`` and by
         [`loop_perimeters`][triwarp.boundary.loop_perimeters].
+
+    !!! warning "A known gap: a seam *and* a pinch at the same vertex"
+        The repeated-vertex check above catches a pinch because
+        [`boundary_loops`][triwarp.boundary.boundary_loops]'s underlying walk represents it as a
+        loop that visits one vertex twice. But when that same vertex also sits on a non-orientable
+        seam, the walk has no 2-regular path to fall back on at all and instead silently *drops*
+        one of the vertex's two outgoing boundary edges (see
+        ``triwarp.boundary._needs_unoriented_boundary_walk``'s docstring) -- so the loop this
+        function sees is simply **shorter** than the true rim, with
+        no repeated vertex to flag. Such a loop can pass this mask as fillable while not actually
+        closing along real mesh edges. No fixture in this package's test suite combines a seam and
+        a pinch at one vertex, so this gap is documented rather than guarded against; closing it
+        needs [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched] itself to detect
+        and report the dropped edge, which is a separate, larger change.
 
     Parameters
     ----------

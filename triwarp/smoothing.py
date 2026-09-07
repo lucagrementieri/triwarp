@@ -1055,7 +1055,14 @@ def filter_taubin(
     for index in range(iterations):
         pass_operator = (
             laplacian.laplacian(
-                _as_vec3(positions), faces, equal_weight=False, edges=recompute_edges
+                _as_vec3(positions),
+                faces,
+                equal_weight=False,
+                edges=recompute_edges,
+                # ``recompute_edges`` was derived from this same ``faces``/``n`` a few lines up and
+                # never changes across the loop, so re-checking it every pass would only re-pay the
+                # per-iteration cost this hoist exists to remove.
+                validate=False,
             )
             if operator is None
             else operator

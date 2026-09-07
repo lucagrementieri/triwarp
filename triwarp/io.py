@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import warp as wp
 
-from triwarp._device import require_nonempty_mesh
+from triwarp._device import require_nonempty_mesh, require_valid_faces
 from triwarp.mesh import Trimesh
 
 if TYPE_CHECKING:
@@ -171,7 +171,8 @@ def load_mesh(path: str | Path, *, device: wp.DeviceLike = None) -> wp.Mesh:
     ------
     ValueError
         If the file contains no triangle faces (e.g. a point cloud or a triangle-strip
-        PLY that ``meshio`` cannot decode).
+        PLY that ``meshio`` cannot decode), or if a face references a vertex index the file's own
+        vertex count does not cover.
 
     See Also
     --------
@@ -181,6 +182,10 @@ def load_mesh(path: str | Path, *, device: wp.DeviceLike = None) -> wp.Mesh:
     if "faces" not in data:
         raise ValueError(f"Mesh file {path!r} has no triangle faces; cannot build a wp.Mesh.")
     require_nonempty_mesh(data["faces"], "load_mesh")
+    # A malformed file (or a meshio decoder bug) can hand back a face index the vertex buffer
+    # doesn't cover; this is the trust boundary where that first enters triwarp, so check it once
+    # here rather than trusting it through every downstream kernel that indexes ``vertices[faces]``.
+    require_valid_faces(data["faces"], int(data["vertices"].shape[0]), "load_mesh")
     # ``load_mesh_data`` allocated both buffers on the line above and nothing else holds
     # them, so the mesh can own them directly.
     return wp.Mesh(points=data["vertices"], indices=data["faces"])
@@ -208,6 +213,11 @@ def mesh_from_numpy(
         New mesh with ``vec3`` vertices and a flat ``int32`` face buffer, owning freshly
         allocated Warp arrays (no aliasing with ``vertices`` / ``faces``).
 
+    Raises
+    ------
+    ValueError
+        If a face references a vertex index ``vertices`` does not cover.
+
     See Also
     --------
     [`load_mesh`][triwarp.io.load_mesh]
@@ -218,4 +228,8 @@ def mesh_from_numpy(
     faces_wp = wp.array(
         np.ascontiguousarray(faces.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
     )
+    # This is the trust boundary where an external caller's raw NumPy connectivity first enters
+    # triwarp -- check it once here rather than trusting it through every downstream kernel that
+    # indexes ``vertices[faces]``.
+    require_valid_faces(faces_wp, int(vertices_wp.shape[0]), "mesh_from_numpy")
     return Trimesh(vertices_wp, faces_wp)

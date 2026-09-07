@@ -475,7 +475,7 @@ def hessian_energy(
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
     if n_faces == 0:
-        return _empty_square_operator(n_vertices, dtype, device)
+        return tw.array.empty_square_bsr(n_vertices, dtype, device)
 
     gradients = wp.empty(3 * n_faces, dtype=wp.vec3d, device=device)
     areas = wp.empty(n_faces, dtype=wp.float64, device=device)
@@ -595,7 +595,7 @@ def curved_hessian_energy(
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
     if n_faces == 0:
-        return _empty_square_operator(n_vertices, dtype, device)
+        return tw.array.empty_square_bsr(n_vertices, dtype, device)
 
     unique_edges, inverse = edges_unique(faces, n_vertices=n_vertices)
     n_edges = int(unique_edges.shape[0])
@@ -738,7 +738,7 @@ def crouzeix_raviart_cotmatrix(
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     if n_faces == 0:
-        return _empty_square_operator(n_edges, dtype, device)
+        return tw.array.empty_square_bsr(n_edges, dtype, device)
 
     if cot_entries is None:
         cot_entries = cotmatrix_entries(vertices, faces, dtype=dtype)
@@ -968,7 +968,7 @@ def vector_area_matrix(
     boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
     n_be = int(boundary.shape[0])
     if n_be == 0:
-        return _empty_square_operator(2 * n, wp.float64, device)
+        return tw.array.empty_square_bsr(2 * n, wp.float64, device)
 
     rows, cols, vals = tw.array.triplet_buffers(4 * n_be, wp.float64, device)
     _vector_area_triplets(boundary, n, 1.0, rows, cols, vals)
@@ -1040,17 +1040,3 @@ def _zero_at_boundary(
             inputs=[boundary, values],
             device=values.device,
         )
-
-
-def _empty_square_operator(
-    n_rows: int, dtype: type, device: wp.DeviceLike
-) -> wps.BsrMatrix[wp.float32]:
-    """Zero-nnz square operator, the empty-mesh return shared by the assembly wrappers."""
-    return wps.bsr_from_triplets(
-        n_rows,
-        n_rows,
-        wp.empty(0, dtype=wp.int32, device=device),
-        wp.empty(0, dtype=wp.int32, device=device),
-        wp.empty(0, dtype=dtype, device=device),
-        prune_numerical_zeros=False,
-    )

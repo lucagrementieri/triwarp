@@ -945,10 +945,13 @@ def shortest_path_envelope(
     CSR here against ``O(E log V)`` sequential work there. The name is the result, per this
     package's naming rule, not the algorithm.
 
-    One kernel launch per pass, double-buffered, so a pass is a pure function of the previous labels
-    and the answer does not depend on thread interleaving. The pass count is data-dependent and each
-    pass ends in one small ``int32`` readback to check for convergence, which is cheap relative to
-    the launches themselves — see the ``linalg`` note on ``check_every``.
+    One relaxation kernel per pass, so a pass is a pure function of the previous labels and the
+    answer does not depend on thread interleaving. The pass count is data-dependent; on CUDA the
+    whole pass loop runs as one device-side conditional graph (``wp.capture_while``, as
+    [`bfs`][triwarp.graph.bfs] already does), so the convergence check costs no host readback at
+    all rather than the one-per-pass a naive early exit would need — see the ``linalg`` note on
+    ``check_every`` for why that per-pass sync would otherwise be the expensive part. The CPU
+    backend, which has no conditional-graph capture, still checks with a plain readback per pass.
 
     For distance *across* a surface rather than along its edges — shorter, and what "geodesic"
     usually means — use [`heat_geodesic`][triwarp.heat.heat_geodesic]. The edge-graph
@@ -971,7 +974,7 @@ def shortest_path_envelope(
             f"values must have one entry per node, got {values.shape[0]} for {node_count} nodes"
         )
 
-    device = values.device
+    device = wp.get_device(values.device)
     labels = wp.clone(values)
     if node_count == 0:
         return labels
@@ -979,19 +982,64 @@ def shortest_path_envelope(
     weights = adjacency.values  # pyright: ignore[reportAttributeAccessIssue]
     if int(weights.shape[0]) > 0 and float(tw.reduce.min(weights)) < 0.0:
         raise ValueError("adjacency weights must be non-negative for the envelope to converge")
+
+    max_pass_count = max_iterations or node_count
     relaxed = wp.empty(node_count, dtype=wp.float32, device=device)
     changed = wp.zeros(1, dtype=wp.int32, device=device)
-    for _ in range(max_iterations or node_count):
-        changed.zero_()
+
+    if not device.is_cuda:
+        # No conditional-graph capture on the CPU backend (see `bfs`'s identical device split);
+        # the plain per-pass loop below, with its one 4-byte readback per pass, is already the
+        # cheapest thing a CPU launch can do here.
+        for _ in range(max_pass_count):
+            changed.zero_()
+            wp.launch(
+                kernel_graph.shortest_path_envelope_pass,
+                dim=node_count,
+                inputs=[offsets, columns, weights, labels, relaxed, changed],
+                device=device,
+            )
+            labels, relaxed = relaxed, labels
+            if int(read_scalar(changed, 0)) == 0:
+                break
+        return labels
+
+    # CUDA: the whole pass loop runs on-device via ``wp.capture_while`` (as ``bfs`` does), so the
+    # only host sync in the common case is none at all -- each pass's convergence check and
+    # iteration cap are folded into ``envelope_advance_and_check``, which runs after the relax
+    # kernel and the label copy below.
+    #
+    # Buffer *swapping* (the CPU path's ``labels, relaxed = relaxed, labels``) cannot be captured:
+    # a conditional graph replays the exact pointers its body recorded the one time it was traced,
+    # so a Python-level rebind between iterations has no effect on the device-side loop -- every
+    # replayed pass would keep reading and writing the same two buffers in the same direction.
+    # ``wp.copy`` moves this pass's answer into ``labels`` in place instead, which is itself just a
+    # device memcpy and captures fine (no allocation, no host sync, unlike ``wp.utils.array_scan``).
+    counter = wp.zeros(1, dtype=wp.int32, device=device)
+    condition = wp.ones(1, dtype=wp.int32, device=device)
+    max_pass_count_i32 = wp.int32(max_pass_count)
+
+    def envelope_pass_body() -> None:
         wp.launch(
             kernel_graph.shortest_path_envelope_pass,
             dim=node_count,
             inputs=[offsets, columns, weights, labels, relaxed, changed],
             device=device,
         )
-        labels, relaxed = relaxed, labels
-        if int(read_scalar(changed, 0)) == 0:
-            break
+        wp.copy(labels, relaxed)
+        wp.launch(
+            kernel_graph.envelope_advance_and_check,
+            dim=1,
+            inputs=[max_pass_count_i32, changed, counter, condition],
+            device=device,
+        )
+
+    if wp.is_conditional_graph_supported():
+        with wp.ScopedCapture(device) as capture:
+            wp.capture_while(condition, envelope_pass_body)
+        wp.capture_launch(capture.graph)
+    else:
+        wp.capture_while(condition, envelope_pass_body)
     return labels
 
 

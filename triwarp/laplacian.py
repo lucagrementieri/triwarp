@@ -44,6 +44,7 @@ from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.reduce import max as reduce_max
+from triwarp.reduce import mean as reduce_mean
 from triwarp.tangent_space import halfedge_transport_angles
 from triwarp.triangles import face_normals_and_areas
 
@@ -210,6 +211,11 @@ def cotmatrix_entries_intrinsic(
     twt.Array2dFloat
         Shape ``(n_faces, 3)`` on ``edge_lengths.device``. Empty ``(0, 3)`` when ``n_faces == 0``.
 
+    Raises
+    ------
+    TypeError
+        If ``edge_lengths`` is not rank 2 or not ``wp.float32``.
+
     See Also
     --------
     [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]
@@ -254,7 +260,8 @@ def cotmatrix(
         Optional precomputed ``(n_faces, 3)`` weights from
         [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]. When ``None``, entries are
         computed from ``vertices`` and ``faces`` in ``dtype``. May be ``float32`` or ``float64``
-        regardless of ``dtype``: the assembly kernel casts them to the matrix precision.
+        regardless of ``dtype``: the assembly kernel casts them to the matrix precision. Must have
+        ``shape[0] == n_faces``.
     dtype
         Scalar block type of the assembled matrix: ``wp.float32`` (default) or ``wp.float64``. Use
         ``wp.float64`` when the matrix feeds an ill-conditioned solve (e.g. the biharmonic operator
@@ -271,6 +278,8 @@ def cotmatrix(
     ------
     RuntimeError
         If ``vertices``, ``faces`` and ``cot_entries`` are not all on one device.
+    ValueError
+        If ``cot_entries`` is given and its row count does not match ``faces``' triangle count.
 
     See Also
     --------
@@ -292,17 +301,15 @@ def cotmatrix(
     device = vertices.device
 
     if n_faces == 0:
-        return wps.bsr_from_triplets(
-            n_vertices,
-            n_vertices,
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=dtype, device=device),
-            prune_numerical_zeros=False,
-        )
+        return tw.array.empty_square_bsr(n_vertices, dtype, device)
 
     if cot_entries is None:
         cot_entries = cotmatrix_entries(vertices, faces, dtype=dtype)
+    elif int(cot_entries.shape[0]) != n_faces:
+        raise ValueError(
+            f"cot_entries must have shape (n_faces, 3) = ({n_faces}, 3), "
+            f"got {(int(cot_entries.shape[0]), int(cot_entries.shape[1]))}"
+        )
 
     n_triplets = 12 * n_faces
     rows, cols, vals = tw.array.triplet_buffers(n_triplets, dtype, device)
@@ -393,10 +400,7 @@ def robust_laplacian(
 
 
 def mollify_intrinsic(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    epsilon: float = TOLERANCE_MOLLIFY,
-    edge_lengths: twt.Array2dFloat32 | None = None,
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], epsilon: float = TOLERANCE_MOLLIFY
 ) -> tuple[twt.Array2dFloat32, float]:
     """
     Add the smallest constant to every edge length that makes every triangle non-degenerate.
@@ -416,9 +420,6 @@ def mollify_intrinsic(
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
     epsilon
         Required margin, relative to the mean edge length.
-    edge_lengths
-        Optional precomputed ``(n_faces, 3)`` table from
-        [`face_edge_lengths`][triwarp.edges.face_edge_lengths]; recomputed here when ``None``.
 
     Returns
     -------
@@ -431,7 +432,7 @@ def mollify_intrinsic(
     Raises
     ------
     RuntimeError
-        If ``vertices``, ``faces`` and ``edge_lengths`` are not all on one device.
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -439,16 +440,18 @@ def mollify_intrinsic(
     [`face_edge_lengths`][triwarp.edges.face_edge_lengths]
     [`cotmatrix_entries_intrinsic`][triwarp.laplacian.cotmatrix_entries_intrinsic]
     """
-    require_same_device(vertices=vertices, faces=faces, edge_lengths=edge_lengths)
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return twt.empty_2d((0, 3), wp.float32, device=device), 0.0
 
-    if edge_lengths is None:
-        edge_lengths = face_edge_lengths(vertices, faces)
+    edge_lengths = face_edge_lengths(vertices, faces)
 
-    scale = float(reduce_max(edge_lengths))
+    # The margin scales with the *mean* edge length (matching intrinsic_delaunay's docstring and
+    # this function's own), not the max: a single long edge on a graded mesh would otherwise inflate
+    # delta far past what any degenerate face on the rest of the mesh actually needs.
+    scale = float(reduce_mean(edge_lengths))
     slack = wp.empty(n_faces, dtype=wp.float32, device=device)
     wp.launch(
         kernel_laplacian.triangle_inequality_slack,
@@ -493,10 +496,12 @@ def connection_laplacian(
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
     cot_entries
         Optional precomputed ``(n_faces, 3)`` half-cotangent weights from
-        [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries].
+        [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]. Must have
+        ``shape[0] == n_faces``.
     transport_angles
         Optional precomputed per-halfedge
-        [`halfedge_transport_angles`][triwarp.tangent_space.halfedge_transport_angles].
+        [`halfedge_transport_angles`][triwarp.tangent_space.halfedge_transport_angles]. Must have
+        length ``3 * n_faces``.
 
         There is deliberately no ``frames`` argument. The gauge is fixed by the one-ring
         flattening — angles are measured from each vertex's first outgoing halfedge, the same
@@ -514,6 +519,9 @@ def connection_laplacian(
     RuntimeError
         If ``vertices``, ``faces``, ``cot_entries`` and ``transport_angles`` are not all on one
         device.
+    ValueError
+        If ``cot_entries`` or ``transport_angles`` is given and does not match ``faces``' triangle
+        count.
 
     See Also
     --------
@@ -528,19 +536,22 @@ def connection_laplacian(
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
     if n_faces == 0:
-        return wps.bsr_from_triplets(
-            n_vertices,
-            n_vertices,
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.mat22d, device=device),
-            prune_numerical_zeros=False,
-        )
+        return tw.array.empty_square_bsr(n_vertices, wp.mat22d, device)
 
     if cot_entries is None:
         cot_entries = cotmatrix_entries(vertices, faces, dtype=wp.float64)
+    elif int(cot_entries.shape[0]) != n_faces:
+        raise ValueError(
+            f"cot_entries must have shape (n_faces, 3) = ({n_faces}, 3), "
+            f"got {(int(cot_entries.shape[0]), int(cot_entries.shape[1]))}"
+        )
     if transport_angles is None:
         transport_angles = halfedge_transport_angles(vertices, faces)
+    elif int(transport_angles.shape[0]) != 3 * n_faces:
+        raise ValueError(
+            f"transport_angles must have length 3 * n_faces = {3 * n_faces}, "
+            f"got {int(transport_angles.shape[0])}"
+        )
 
     n_triplets = 12 * n_faces
     rows, cols, vals = tw.array.triplet_buffers(n_triplets, wp.mat22d, device)
@@ -562,6 +573,8 @@ def laplacian_entries(
     symmetric: bool | None = None,
     dtype: type = wp.float32,
     edges: twt.Array2dInt32 | None = None,
+    *,
+    validate: bool = True,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32], twt.Array1dFloat]:
     """
     Per-edge weight triplets for the 1-ring Laplacian, before assembly.
@@ -598,6 +611,21 @@ def laplacian_entries(
         dominate the whole call on a large mesh. Ignored by the directed branch, which reads
         ``faces`` alone.
 
+        Trusted to already be **unique and undirected**, the way ``edges_unique`` guarantees --
+        that invariant is not, and cannot cheaply be, checked (verifying it would mean redoing the
+        sort-and-deduplicate pass this argument exists to let a caller skip). A duplicated or
+        non-deduplicated array silently doubles or miscounts the affected edges' weights rather
+        than raising. ``validate`` below only guards the cheaper, memory-unsafe half of this
+        precondition (an out-of-range vertex index), not this one.
+    validate
+        When ``True`` (default) and a caller-supplied ``edges`` is used (the ``symmetric`` branch
+        with ``edges`` not ``None``), check that every index in it falls inside
+        ``[0, n_vertices)`` before launching -- a stale ``edges`` array (e.g. from before a
+        decimation pass changed the vertex count) otherwise drives the triplet kernel to read
+        ``vertices`` out of bounds with no exception (§12.1's memory-safety class). Pass ``False``
+        only when ``edges`` is known correct by construction, as this module's own
+        [`laplacian`][triwarp.laplacian.laplacian] does when it just derived ``edges`` itself.
+
     Returns
     -------
     tuple of wp.array
@@ -608,6 +636,9 @@ def laplacian_entries(
     ------
     RuntimeError
         If ``vertices``, ``faces`` and ``edges`` are not all on one device.
+    ValueError
+        If ``validate`` and a caller-supplied ``edges`` references a vertex index outside
+        ``[0, n_vertices)``.
 
     See Also
     --------
@@ -637,14 +668,21 @@ def laplacian_entries(
     # (every neighbor counted once).
     if edges is None:
         edges, _ = edges_unique(faces, n_vertices=int(vertices.shape[0]))
-    unique_edges = edges
-    m_unique = int(unique_edges.shape[0])
+    elif validate and int(edges.shape[0]) > 0:
+        n_vertices = int(vertices.shape[0])
+        lowest, highest = tw.reduce.minmax(edges)
+        if lowest < 0 or highest >= n_vertices:
+            raise ValueError(
+                f"laplacian_entries: edges must reference vertex indices in [0, {n_vertices}), "
+                f"got a range of [{lowest}, {highest}]"
+            )
+    m_unique = int(edges.shape[0])
     rows, cols, vals = tw.array.triplet_buffers(2 * m_unique, dtype, device)
     if m_unique > 0:
         wp.launch(
             kernel_laplacian.LAPLACIAN_TRIPLETS_SYMMETRIC[dtype],
             dim=m_unique,
-            inputs=[unique_edges, vertices, equal_weight_flag, rows, cols, vals],
+            inputs=[edges, vertices, equal_weight_flag, rows, cols, vals],
             device=device,
         )
     return rows, cols, vals
@@ -657,6 +695,8 @@ def laplacian(
     symmetric: bool | None = None,
     dtype: type = wp.float32,
     edges: twt.Array2dInt32 | None = None,
+    *,
+    validate: bool = True,
 ) -> wps.BsrMatrix[wp.float32]:
     """
     Row-normalized 1-ring averaging operator (uniform / umbrella Laplacian).
@@ -694,6 +734,12 @@ def laplacian(
         operator repeatedly over fixed connectivity, as
         [`filter_taubin`][triwarp.smoothing.filter_taubin] does at ``recompute=True`` -- should
         pass it. Ignored when the adjacency is directed.
+    validate
+        Forwarded to [`laplacian_entries`][triwarp.laplacian.laplacian_entries]: when ``True``
+        (default) and ``edges`` is given, check its indices fall in ``[0, n_vertices)`` before
+        launching. Pass ``False`` only when ``edges`` is known correct by construction (e.g.
+        derived once outside a loop over fixed connectivity, as
+        [`filter_taubin`][triwarp.smoothing.filter_taubin] does).
 
     Returns
     -------
@@ -706,6 +752,8 @@ def laplacian(
     ------
     RuntimeError
         If ``vertices``, ``faces`` and ``edges`` are not all on one device.
+    ValueError
+        If ``validate`` and ``edges`` references a vertex index outside ``[0, n_vertices)``.
 
     See Also
     --------
@@ -718,7 +766,13 @@ def laplacian(
     n_vertices = int(vertices.shape[0])
     device = vertices.device
     rows, cols, vals = laplacian_entries(
-        vertices, faces, equal_weight=equal_weight, symmetric=symmetric, dtype=dtype, edges=edges
+        vertices,
+        faces,
+        equal_weight=equal_weight,
+        symmetric=symmetric,
+        dtype=dtype,
+        edges=edges,
+        validate=validate,
     )
     operator = wps.bsr_from_triplets(
         n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
@@ -783,14 +837,7 @@ def graph_laplacian(
     device = vertices.device
 
     if n_faces == 0:
-        return wps.bsr_from_triplets(
-            n_vertices,
-            n_vertices,
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=dtype, device=device),
-            prune_numerical_zeros=False,
-        )
+        return tw.array.empty_square_bsr(n_vertices, dtype, device)
 
     # Symmetric unit-weight adjacency: each undirected edge emits both directed (a, b) and (b, a)
     # triplets with weight 1, matching ``igl::adjacency_matrix`` (all non-zeros forced to one).
@@ -835,11 +882,11 @@ def mass_matrix_entries(
         ``wp.float64`` to feed a float64 solve (e.g. geodesic heat method, implicit fairing)
         without a downstream recast.
     face_areas
-        Optional length-``n_faces`` ``wp.float32`` triangle areas
+        Optional length-``n_faces`` triangle areas
         ([`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]). The lumping reads
         nothing else off ``vertices``, so passing them is the whole geometry pass this function
         would otherwise repeat -- [`Trimesh.face_areas`][triwarp.mesh.Trimesh.face_areas] has them
-        cached.
+        cached. May be any float dtype: cast to ``dtype`` when it differs.
 
     Returns
     -------
@@ -850,6 +897,8 @@ def mass_matrix_entries(
     ------
     RuntimeError
         If ``vertices``, ``faces`` and ``face_areas`` are not all on one device.
+    ValueError
+        If ``face_areas`` is given and its length does not match ``faces``' triangle count.
 
     See Also
     --------
@@ -866,10 +915,14 @@ def mass_matrix_entries(
     mass = wp.zeros(n_vertices, dtype=dtype, device=device)
     n_faces = int(faces.shape[0]) // 3
     if n_faces > 0:
+        if face_areas is not None and int(face_areas.shape[0]) != n_faces:
+            raise ValueError(
+                f"face_areas must have length n_faces={n_faces}, got {int(face_areas.shape[0])}"
+            )
         areas = face_areas if face_areas is not None else face_normals_and_areas(vertices, faces)[1]
-        if dtype != wp.float32:
-            # scatter_face_thirds shares one float dtype across areas/count/mass; promote the
-            # float32 face areas so the scatter specializes to the requested precision.
+        if areas.dtype != dtype:
+            # scatter_face_thirds shares one dtype across areas/count/mass; cast whenever the
+            # caller-supplied (or freshly computed float32) areas don't already match ``dtype``.
             areas = tw.array.astype(areas, dtype)
         wp.launch(
             kernel_scatter.SCATTER_FACE_THIRDS[dtype],

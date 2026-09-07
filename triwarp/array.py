@@ -722,6 +722,48 @@ def triplet_buffers(
     return rows, cols, values
 
 
+def empty_square_bsr(n_rows: int, dtype: type, device: wp.DeviceLike) -> wps.BsrMatrix[wp.float32]:
+    """
+    Zero-nnz ``(n_rows, n_rows)`` operator, the ``n_faces == 0`` return several assemblers share.
+
+    A square BSR matrix with no faces to build triplets from is still a valid, correctly-shaped
+    operator -- just an empty one -- so [`laplacian.cotmatrix`][triwarp.laplacian.cotmatrix],
+    [`laplacian.connection_laplacian`][triwarp.laplacian.connection_laplacian],
+    [`laplacian.graph_laplacian`][triwarp.laplacian.graph_laplacian] and
+    [`energies`][triwarp.energies]'s assembly wrappers all construct this exact matrix for their
+    empty-mesh early return, and did so as four near-identical inline copies before this was
+    factored out.
+
+    Parameters
+    ----------
+    n_rows
+        Row and column count of the square matrix.
+    dtype
+        Element type of the (empty) value buffer -- a scalar for a 1x1-block matrix, or a matrix
+        type (e.g. ``wp.mat22d``) for a block matrix, exactly as
+        [`triplet_buffers`][triwarp.array.triplet_buffers] takes it.
+    device
+        Warp device for the matrix.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(n_rows, n_rows)`` matrix with zero stored entries, on ``device``.
+
+    See Also
+    --------
+    [`triplet_buffers`][triwarp.array.triplet_buffers]
+    """
+    return wps.bsr_from_triplets(
+        n_rows,
+        n_rows,
+        wp.empty(0, dtype=wp.int32, device=device),
+        wp.empty(0, dtype=wp.int32, device=device),
+        wp.empty(0, dtype=dtype, device=device),
+        prune_numerical_zeros=False,
+    )
+
+
 def index_sparse(
     n_rows: int,
     indices: twt.Array2dInt32,

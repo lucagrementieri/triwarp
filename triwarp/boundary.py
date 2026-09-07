@@ -499,6 +499,7 @@ def loop_perimeters_batched(
     loop_sizes: wp.array[wp.int32],
     *,
     loop_id: wp.array[wp.int32] | None = None,
+    validate: bool = True,
 ) -> wp.array[wp.float32]:
     """
     Perimeter of every loop, taking the loops in the packed form rather than as a list.
@@ -526,6 +527,13 @@ def loop_perimeters_batched(
         belongs to. Built here when ``None``, which costs an allocation, a copy and a launch --
         **roughly doubling the call**, since the measure itself is one launch. Pass it when the
         caller already holds it, as [`triwarp.holes`][triwarp.holes] does.
+    validate
+        When ``True`` (default), check that ``offsets`` and ``loop_sizes`` agree in length and that
+        every ``(offset, size)`` pair stays within ``flat_loops`` before launching -- a real cost (a
+        host readback of both arrays), paid because a hand-built or stale packed triple otherwise
+        drives the kernel's per-loop index past ``flat_loops``'s end with no exception raised. Pass
+        ``False`` only when the triple is known correct by construction, as
+        [`triwarp.holes`][triwarp.holes]'s internal packing already is.
 
     Returns
     -------
@@ -537,6 +545,8 @@ def loop_perimeters_batched(
     RuntimeError
         If ``vertices``, ``flat_loops``, ``offsets``, ``loop_sizes`` and ``loop_id`` are not all on
         one device.
+    ValueError
+        If ``validate`` and the packed triple is malformed -- see ``validate`` above.
 
     See Also
     --------
@@ -552,6 +562,8 @@ def loop_perimeters_batched(
         loop_sizes=loop_sizes,
         loop_id=loop_id,
     )
+    if validate:
+        _validate_packed_loops(flat_loops, offsets, loop_sizes, "loop_perimeters_batched")
     return _launch_loop_measure(
         kernel_boundary.loop_perimeters,
         wp.float32,
@@ -630,6 +642,7 @@ def loop_directed_areas_batched(
     loop_sizes: wp.array[wp.int32],
     *,
     loop_id: wp.array[wp.int32] | None = None,
+    validate: bool = True,
 ) -> wp.array[wp.vec3]:
     """
     Directed area vector of every loop, taking the loops in the packed form rather than as a list.
@@ -655,6 +668,11 @@ def loop_directed_areas_batched(
         belongs to. Built here when ``None``, which costs an allocation, a copy and a launch --
         **roughly doubling the call**, since the measure itself is one launch. Pass it when the
         caller already holds it, as [`triwarp.holes`][triwarp.holes] does.
+    validate
+        When ``True`` (default), check that ``offsets`` and ``loop_sizes`` agree in length and that
+        every ``(offset, size)`` pair stays within ``flat_loops`` before launching -- see
+        [`loop_perimeters_batched`][triwarp.boundary.loop_perimeters_batched]'s docstring for the
+        cost and the reasoning.
 
     Returns
     -------
@@ -666,6 +684,8 @@ def loop_directed_areas_batched(
     RuntimeError
         If ``vertices``, ``flat_loops``, ``offsets``, ``loop_sizes`` and ``loop_id`` are not all on
         one device.
+    ValueError
+        If ``validate`` and the packed triple is malformed -- see ``validate`` above.
 
     See Also
     --------
@@ -681,6 +701,8 @@ def loop_directed_areas_batched(
         loop_sizes=loop_sizes,
         loop_id=loop_id,
     )
+    if validate:
+        _validate_packed_loops(flat_loops, offsets, loop_sizes, "loop_directed_areas_batched")
     return _launch_loop_measure(
         kernel_boundary.loop_directed_areas,
         wp.vec3,
@@ -691,6 +713,46 @@ def loop_directed_areas_batched(
         loop_sizes,
         int(loop_sizes.shape[0]),
     )
+
+
+def _validate_packed_loops(
+    flat_loops: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    name: str,
+) -> None:
+    """
+    Raise if ``(offsets, loop_sizes)`` do not describe a set of segments that fits ``flat_loops``.
+
+    Shared by [`loop_perimeters_batched`][triwarp.boundary.loop_perimeters_batched] and
+    [`loop_directed_areas_batched`][triwarp.boundary.loop_directed_areas_batched] (its last
+    caller), whose ``validate=True`` default calls this before launching. A malformed triple
+    otherwise drives ``_launch_loop_measure``'s kernel to read ``flat_loops`` past its own end for
+    an inflated ``loop_sizes`` entry -- an out-of-bounds read with no exception, not merely a wrong
+    answer -- so this reads both arrays back to the host and checks the one invariant that matters
+    before that can happen.
+    """
+    n_loops = int(loop_sizes.shape[0])
+    if int(offsets.shape[0]) != n_loops:
+        raise ValueError(
+            f"{name}: offsets and loop_sizes must have the same length, got "
+            f"{int(offsets.shape[0])} and {n_loops}"
+        )
+    if n_loops == 0:
+        return
+    total = int(flat_loops.shape[0])
+    offsets_np = offsets.numpy().astype(np.int64)
+    sizes_np = loop_sizes.numpy().astype(np.int64)
+    if (
+        int(offsets_np.min()) < 0
+        or int(sizes_np.min()) < 0
+        or int((offsets_np + sizes_np).max()) > total
+    ):
+        raise ValueError(
+            f"{name}: every (offset, size) pair must stay within flat_loops (length {total}); got "
+            f"offsets in [{int(offsets_np.min())}, {int(offsets_np.max())}] and sizes up to "
+            f"{int(sizes_np.max())}"
+        )
 
 
 def _launch_loop_measure(
