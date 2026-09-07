@@ -124,10 +124,18 @@ def trace_from_vertex(
     device = vertices.device
     n_rays = int(start_vertices.shape[0])
     n_vertices = int(vertices.shape[0])
-    if n_rays == 0 or int(faces.shape[0]) == 0:
+    if n_rays == 0:
         return wp.empty(0, dtype=wp.vec3, device=device), wp.zeros(
             max(n_rays + 1, 1), dtype=wp.int32, device=device
         )
+    # No short-circuit on ``faces.shape[0] == 0``: unlike ``trace_from_face``, a start *vertex* is
+    # still a valid reference into ``vertices`` with no faces at all (every vertex is isolated), and
+    # the general path below already produces the documented one-point-per-ray answer for that case
+    # -- ``vertex_one_rings`` gives every vertex an empty ring, and the kernel's
+    # ``start_direction_at_vertex`` then reports "isolated vertex, nowhere to go" (``f == -1``),
+    # which ``trace_from_vertices`` turns into exactly one written point, the start vertex itself.
+    # A short-circuit here returned an empty polyline per ray instead, contradicting this function's
+    # own "a ray always contributes at least one point" guarantee.
 
     if twins is None:
         twins = halfedge_twins(faces, n_vertices=n_vertices)
@@ -311,7 +319,8 @@ def descend_field(
     Raises
     ------
     ValueError
-        If ``values`` does not have one entry per vertex.
+        If ``values`` does not have one entry per vertex, or ``gradients`` is given and does not
+        have one entry per face.
     RuntimeError
         If ``vertices``, ``faces``, ``values``, ``starts``, ``twins``, ``vertex_faces`` and
         ``gradients`` are not all on one device.
@@ -346,6 +355,15 @@ def descend_field(
     if int(values.shape[0]) != n_vertices:
         raise ValueError(
             f"values must have one entry per vertex, got {values.shape[0]} for {n_vertices}"
+        )
+    n_faces = int(faces.shape[0]) // 3
+    if gradients is not None and int(gradients.shape[0]) != n_faces:
+        # Unlike ``values``, a mismatched ``gradients`` was an out-of-bounds read with no
+        # exception -- ``descent_walk``/``descend_at_vertex`` index it as ``gradients[f]`` for
+        # every face index up to ``n_faces - 1`` (silent host-heap corruption on CPU, garbage or a
+        # crash on CUDA), the exact hazard a caller-supplied precomputed cache exists to avoid.
+        raise ValueError(
+            f"gradients must have one entry per face, got {gradients.shape[0]} for {n_faces}"
         )
     n_paths = int(starts.shape[0])
     if n_paths == 0:
@@ -456,7 +474,9 @@ def geodesic_path(
     [`triwarp.heat.heat_geodesic`][triwarp.heat.heat_geodesic]
         The field, when the distance is wanted and not the path.
     """
-    require_same_device(vertices=vertices, faces=faces, source=source, targets=targets)
+    require_same_device(
+        vertices=vertices, faces=faces, source=source, targets=targets, operators=operators
+    )
     distance = tw.heat.heat_geodesic(vertices, faces, source, t, operators)  # type: ignore[arg-type]
     return descend_field(vertices, faces, distance, targets, stop_value=0.0, max_steps=max_steps)
 
@@ -490,17 +510,14 @@ def shorten_loop(
     !!! note "Shorter, not geodesic"
         The result stays **on the edge graph**, so it is a local minimum over edge paths rather than
         the shortest curve on the surface -- reaching that means letting the loop cross face
-        interiors, which needs an intrinsic triangulation it can flip. The gap is small: measured
-        against ``potpourri3d.EdgeFlipGeodesicSolver.find_geodesic_loop`` started from this very
-        output, **1.066x to 1.578x** of the geodesic length across three tori and a genus-2 union.
-        It is widest where the mesh is a regular grid whose rows are not geodesics, because no
-        one-ring move can step the loop off a row without lengthening the edge path first -- so the
-        result is a true local minimum over edge paths, and the remaining gap is the edge graph's,
-        not the sweep's. What it does deliver is the reduction from the tree-cotree loop it starts
-        from: **1.03x to 1.41x** shorter over the same four meshes.
+        interiors, which needs an intrinsic triangulation it can flip. The gap to the true geodesic
+        is small, and is widest where the mesh is a regular grid whose rows are not geodesics,
+        because no one-ring move can step the loop off a row without lengthening the edge path
+        first -- so the result is a true local minimum over edge paths, and the remaining gap is the
+        edge graph's, not the sweep's.
 
-        Sweeps ratchet the loop one position at a time, so the count needed grows with the loop --
-        12 sweeps for a 24x12 torus, 48 for 96x48 -- which is what ``max_iter`` has to cover.
+        Sweeps ratchet the loop one position at a time, so the count needed to converge grows with
+        the loop's own length, which is what ``max_iter`` has to cover.
 
     Parameters
     ----------
@@ -580,6 +597,10 @@ def shorten_loop(
     changed = wp.zeros(1, dtype=wp.int32, device=device)
 
     sweeps = 0
+    # Requires TWO CONSECUTIVE sweeps to accept nothing, not "this sweep is odd and accepted
+    # nothing" -- a rewrite can shift which loop positions land on even/odd parity, so a single
+    # unchanged sweep says nothing about whether the *other* parity would still find something.
+    consecutive_unchanged = 0
     for sweep in range(max_iter):
         n_positions = int(packed.shape[0])
         if n_positions == 0:
@@ -621,9 +642,11 @@ def shorten_loop(
         # accepted is a device-side fact, and the alternative -- always running `max_iter` sweeps --
         # costs a full pass over every loop for each one that would have been skipped.
         if int(read_scalar(changed, 0)) == 0:
-            if sweep % 2 == 1:
+            consecutive_unchanged += 1
+            if consecutive_unchanged >= 2:
                 break  # both parities have now had a turn with nothing to do
             continue
+        consecutive_unchanged = 0
         packed, loop_offsets = _rewrite_loops(
             faces, ring_offsets, ring_halfedges, packed, counts, arc_slot, arc_step, loop_offsets
         )

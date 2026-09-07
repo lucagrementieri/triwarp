@@ -324,7 +324,7 @@ def heat_geodesic(
     [`mean_unique_edge_length`][triwarp.edges.mean_unique_edge_length]
     [`marching_triangles`][triwarp.intersection.marching_triangles]
     """
-    require_same_device(vertices=vertices, faces=faces, sources=sources)
+    require_same_device(vertices=vertices, faces=faces, sources=sources, operators=operators)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3

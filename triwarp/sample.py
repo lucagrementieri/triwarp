@@ -224,23 +224,29 @@ def sample_surface(
     Raises
     ------
     ValueError
-        If ``face_weight`` is given and its length is not the triangle count, or if the total
-        face weight is not positive.
+        If ``face_weight`` is given and its length is not the triangle count, if the mesh has no
+        faces and ``count > 0``, or if the total face weight is not positive.
     RuntimeError
         If ``vertices``, ``faces`` and ``face_weight`` are not all on one device.
     """
     require_same_device(vertices=vertices, faces=faces, face_weight=face_weight)
     n_faces = faces.shape[0] // 3
-    if count == 0:
-        return (
-            wp.empty(0, dtype=wp.vec3, device=vertices.device),
-            wp.empty(0, dtype=wp.int32, device=vertices.device),
-        )
+    # Validated before the ``count == 0`` short-circuit below, so a bad ``face_weight`` still
+    # raises even when nothing would otherwise be sampled.
     if face_weight is not None and face_weight.shape[0] != n_faces:
         raise ValueError(
             f"face_weight length must match number of triangles (expected {n_faces}, "
             f"got {face_weight.shape[0]})"
         )
+    if count == 0:
+        return (
+            wp.empty(0, dtype=wp.vec3, device=vertices.device),
+            wp.empty(0, dtype=wp.int32, device=vertices.device),
+        )
+    if n_faces == 0:
+        # Without this, an empty ``weights``/``cdf`` reaches ``read_scalar``'s tail read below and
+        # raises an unrelated ``IndexError`` (CPU) or a Warp slicing error (CUDA) instead.
+        raise ValueError("mesh has no faces; cannot sample its surface")
 
     if face_weight is None:
         _, weights = face_normals_and_areas(vertices, faces)
@@ -320,14 +326,15 @@ def sample_surface_poisson_disk(
     require_same_device(vertices=vertices, faces=faces, face_weight=face_weight)
     device = vertices.device
 
+    # Validated before the ``count == 0`` short-circuit below, matching ``sample_surface``.
+    if init_factor < 1.0:
+        raise ValueError(f"init_factor must be >= 1, got {init_factor}")
+
     if count == 0:
         return (
             wp.empty(0, dtype=wp.vec3, device=device),
             wp.empty(0, dtype=wp.int32, device=device),
         )
-
-    if init_factor < 1.0:
-        raise ValueError(f"init_factor must be >= 1, got {init_factor}")
 
     init_count = max(math.ceil(init_factor * count), count)
 
@@ -438,7 +445,9 @@ def _top_maxima_by_weight(
     descending = wp.empty(int(flagged.shape[0]), dtype=wp.float32, device=is_max.device)
     wp.map(wp.neg, gather(weights, flagged), out=descending)
     _sorted, order = tw.array.sort_and_argsort(descending)
-    chosen = gather(flagged, wp.clone(order[:excess]))
+    # No clone: ``order`` need not outlive this frame (no further sort call reuses its scratch),
+    # and ``gather`` only requires a contiguous index array, which a prefix slice already is.
+    chosen = gather(flagged, order[:excess])
     return tw.array.astype(tw.array.indices_to_mask(chosen, n_pool, device=is_max.device), wp.int32)
 
 
@@ -480,7 +489,7 @@ def sample_surface_blue_noise(
     Raises
     ------
     ValueError
-        If ``radius <= 0`` or if the mesh has no faces.
+        If ``radius <= 0``.
     RuntimeError
         If ``vertices`` and ``faces`` are not all on one device.
 
@@ -490,6 +499,8 @@ def sample_surface_blue_noise(
     surface comes to, so it lands near — not at — the hexagonal-packing estimate the radius is
     usually chosen from. Ask for a *count* with
     [`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk] instead.
+
+    A mesh with no faces returns two empty arrays rather than raising.
     """
     require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
@@ -509,8 +520,17 @@ def sample_surface_blue_noise(
     expected = surface_area * (math.pi * math.sqrt(3.0) / 6.0) / (math.pi * radius * radius / 4.0)
     nx = max(1, int(30.0 * expected))
 
-    init_points, init_face_indices = sample_surface(vertices, faces, nx, seed=seed)
-    return _dart_throw_blue_noise(init_points, init_face_indices, radius, resolve_seed(seed))
+    # The pool draw and the dart-throw priority draw both key off the same point index (``tid``
+    # here, ``i`` in ``random_priorities``) at the same pool size, so a shared seed would give
+    # ``wp.rand_init(seed, i)`` the identical initial state in both kernels -- ``sample_cdf``'s
+    # first draw and ``random_priorities``'s only draw are then the exact same ``rand_pcg`` step,
+    # making each point's dart-throw priority an exact, monotonic function of the very draw that
+    # picked its face. A distinct, seed-derived salt for the priority draw removes that
+    # correlation while staying a deterministic function of the caller's own seed.
+    pool_seed = resolve_seed(seed)
+    priority_seed = (pool_seed ^ 0x2545F491) & 0x7FFFFFFF
+    init_points, init_face_indices = sample_surface(vertices, faces, nx, seed=pool_seed)
+    return _dart_throw_blue_noise(init_points, init_face_indices, radius, priority_seed)
 
 
 def _dart_throw_blue_noise(
@@ -703,18 +723,18 @@ def sample_volume(
     ValueError
         If the mesh is not watertight (open boundary edges detected).
     ValueError
-        If the mesh has zero total volume, or some signed tetrahedron volumes are negative after
+        If the mesh has zero total volume, some signed tetrahedron volumes are negative after
         fanning from the centroid (the mesh is not star-shaped with respect to its own centroid,
-        e.g. a torus).
+        e.g. a torus), or the mesh has no faces and ``count > 0``.
     RuntimeError
         If ``vertices`` and ``faces`` are not all on one device.
     """
     require_same_device(vertices=vertices, faces=faces)
     n_faces = faces.shape[0] // 3
 
-    if count == 0:
-        return wp.empty(0, dtype=wp.vec3, device=vertices.device)
-
+    # These two validations run regardless of ``count`` -- unlike the "no faces" guard below,
+    # which only matters once something is actually being sampled -- so a caller cannot skip a
+    # documented raise on a malformed mesh by asking for zero points.
     if not tw.validation.is_edge_manifold(
         faces, allow_boundary_edges=False, n_vertices=int(vertices.shape[0])
     ):
@@ -728,11 +748,21 @@ def sample_volume(
 
     # One device reduction, not two: the star-shaped test genuinely needs a ``min``, but the total
     # is the inclusive scan's last element and comes for free with the CDF this builds anyway.
-    if tw.reduce.min(signed_vols) < 0.0:
+    # ``n_faces > 0`` guards the empty mesh, where "no negative volumes" holds vacuously and
+    # ``reduce.min`` would otherwise raise its own unrelated "requires a non-empty array" error.
+    if n_faces > 0 and tw.reduce.min(signed_vols) < 0.0:
         raise ValueError(
             "mesh is not star-shaped with respect to its centroid (e.g. a torus); "
             "tetrahedral decomposition cannot sample it without rejection"
         )
+
+    if count == 0:
+        return wp.empty(0, dtype=wp.vec3, device=vertices.device)
+
+    if n_faces == 0:
+        # Without this, an empty ``signed_vols``/``cdf`` reaches ``read_scalar``'s tail read below
+        # and raises an unrelated ``IndexError`` (CPU) or a Warp slicing error (CUDA) instead.
+        raise ValueError("mesh has no faces; cannot sample its volume")
 
     cdf = wp.empty(n_faces, dtype=wp.float32, device=vertices.device)
     wp.utils.array_scan(signed_vols, out_array=cdf)

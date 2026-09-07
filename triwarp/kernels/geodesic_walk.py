@@ -31,8 +31,15 @@ def exit_edge(
         a = vertices[faces[f * 3 + k]]
         b = vertices[faces[f * 3 + (k + 1) % 3]]
         edge = b - a
+        # ``direction`` and ``normal`` are unit vectors (the caller always hands in a normalized
+        # tangent), so ``denom`` is ``|edge| * sin(angle between direction and edge)`` -- it scales
+        # with the mesh's own edge length, not with a fixed absolute unit. Comparing it against
+        # ``length_epsilon`` (already ``mean_edge_length``-scaled, same as the crossing-distance
+        # test below) makes this a scale-invariant "is the edge parallel to within this angle"
+        # test; a fixed absolute constant here rejected a genuinely non-parallel edge on any mesh
+        # small enough that ``|edge|`` itself approached that constant.
         denom = wp.dot(normal, wp.cross(direction, edge))
-        if wp.abs(denom) <= TOLERANCE_ZERO_CONSTANT:
+        if wp.abs(denom) <= length_epsilon:
             continue
         t = -wp.dot(normal, wp.cross(point - a, edge)) / denom
         s = wp.dot(normal, wp.cross(point - a, direction)) / -denom
@@ -249,6 +256,12 @@ def descent_walk(
         out_points[write_begin] = point
     count += wp.int32(1)
 
+    # The field value at the last written point, tracked exactly rather than read off ``vertex`` --
+    # ``vertex`` goes stale the moment the walk crosses into a second (or third, ...) face without
+    # passing through a vertex in between, and the flat-face fallback below needs the value at
+    # *this* point, not at whichever vertex the walk last stood on.
+    last_value = values[vertex]
+
     face = wp.int32(-1)
     entry_edge = wp.int32(-1)
     for _step in range(max_steps):
@@ -270,6 +283,7 @@ def descent_walk(
                 break  # a local minimum of the field
             vertex = neighbour
             point = vertices[vertex]
+            last_value = values[vertex]
             if write_begin >= wp.int32(0):
                 out_points[write_begin + count] = point
             count += wp.int32(1)
@@ -297,10 +311,11 @@ def descent_walk(
             for k in range(1, 3):
                 if values[faces[face * 3 + k]] < values[lowest]:
                     lowest = faces[face * 3 + k]
-            if values[lowest] >= values[vertex] and face >= wp.int32(0):
+            if values[lowest] >= last_value and face >= wp.int32(0):
                 break  # no progress available here
             vertex = lowest
             point = vertices[vertex]
+            last_value = values[vertex]
             if write_begin >= wp.int32(0):
                 out_points[write_begin + count] = point
             count += wp.int32(1)
@@ -308,6 +323,10 @@ def descent_walk(
             continue
 
         point = point + distance * direction
+        # Exact, not interpolated: ``direction`` is ``-gradient / slope``, so the field's
+        # directional derivative along it is ``-slope`` and the step is a straight line inside one
+        # face's affine field.
+        last_value -= wp.float64(slope) * wp.float64(distance)
         if write_begin >= wp.int32(0):
             out_points[write_begin + count] = point
         count += wp.int32(1)
@@ -356,6 +375,7 @@ def descent_walk(
         if values[end] < values[start]:
             vertex = end
         point = vertices[vertex]
+        last_value = values[vertex]
         if write_begin >= wp.int32(0):
             out_points[write_begin + count] = point
         count += wp.int32(1)

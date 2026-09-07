@@ -158,7 +158,11 @@ def sandwich_row_triplets(
     # package, not a Warp bug — see ``k_harmonic`` in ``triwarp/energies.py``.)
     t = wp.int32(wp.tid())
     weight = inv_mass[t]
-    if weight <= type(inv_mass[0])(0.0):
+    # The negation of ``sandwich_row_counts``'s own gate, not an independent ``<=`` -- a NaN
+    # ``inv_mass[t]`` fails both ``>`` and ``<=``, so the two spellings disagree on it and the
+    # count kernel (which reserves 0 triplets for a killed row) would silently under-allocate
+    # against this kernel writing a full row's worth into the next row's reserved segment.
+    if not (weight > type(inv_mass[0])(0.0)):
         return
     cursor = segment_offsets[t]
     for a in range(a_offsets[t], a_offsets[t + 1]):
@@ -289,7 +293,9 @@ def hessian_energy_triplets(
     # ``k``; the per-thread work is quadratic in the vertex's valence.
     k = wp.int32(wp.tid())
     weight = inv_mass[k]
-    if weight <= wp.float64(0.0):
+    # The negation of ``hessian_energy_counts``'s own gate -- see ``sandwich_row_triplets`` for why
+    # this must not be an independent ``<=``.
+    if not (weight > wp.float64(0.0)):
         return
     start = vf_offsets[k]
     end = vf_offsets[k + 1]
@@ -332,6 +338,19 @@ def internal_angles_and_sums(
     f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
+    zero = wp.float64(0.0)
+    if triangle_double_area(v0, v1, v2) <= zero:
+        # A coincident-vertex edge (not merely a thin sliver) drives ``corner_cosines_from_l2``'s
+        # law-of-cosines division to a genuine 0/0 for the two corners touching it -- ``wp.acos``'s
+        # clamp rescues a finite-but-out-of-[-1,1] cosine, not a NaN, and ``add_corner_triple``
+        # would then atomically accumulate that NaN into ``out_angle_sums`` for both of the
+        # degenerate edge's vertices, poisoning the Gaussian-curvature correction at every *other*,
+        # perfectly valid face sharing one of them. A degenerate face contributes nothing instead,
+        # the same convention ``voronoi_mass``/``hessian_corner_gradients`` already use.
+        out_angles[f, 0] = zero
+        out_angles[f, 1] = zero
+        out_angles[f, 2] = zero
+        return
     cos0, cos1, cos2 = corner_cosines_from_l2(l2_0, l2_1, l2_2)
     theta0 = wp.acos(cos0)
     theta1 = wp.acos(cos1)
@@ -490,9 +509,13 @@ def curved_hessian_triplets(
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     dbl_area = triangle_double_area(v0, v1, v2)
     if dbl_area <= zero:
+        # Padding must be a hole, not a value: -1 is out of range for ``bsr_from_triplets``'s
+        # ``(n_vertices, n_vertices)`` build and is silently dropped, where row/col 0 would collide
+        # with every other degenerate face (and every absent edge-vertex slot below) on that one
+        # real matrix entry and serialize the assembly's duplicate accumulation there.
         for empty in range(144):
-            out_rows[base_out + empty] = 0
-            out_cols[base_out + empty] = 0
+            out_rows[base_out + empty] = -1
+            out_cols[base_out + empty] = -1
             out_vals[base_out + empty] = type(out_vals[0])(0.0)
         return
     # Squared edge lengths, column e opposite corner e (the igl intrinsic convention).
@@ -502,9 +525,9 @@ def curved_hessian_triplets(
     kv1 = scaled_kappa[faces[f * 3 + 1]] * angles[f, 1]
     kv2 = scaled_kappa[faces[f * 3 + 2]] * angles[f, 2]
     # igl edge slot e is triwarp halfedge (e + 1) % 3; o2[e] = oE(f,e) * oE(f,(e+2)%3).
-    oh0 = halfedge_orientation(faces, wp.int32(f * 3 + 0))
-    oh1 = halfedge_orientation(faces, wp.int32(f * 3 + 1))
-    oh2 = halfedge_orientation(faces, wp.int32(f * 3 + 2))
+    oh0 = halfedge_orientation(faces, f * 3 + 0)
+    oh1 = halfedge_orientation(faces, f * 3 + 1)
+    oh2 = halfedge_orientation(faces, f * 3 + 2)
     eid0 = inverse[f * 3 + 1]
     eid1 = inverse[f * 3 + 2]
     eid2 = inverse[f * 3 + 0]
@@ -539,8 +562,10 @@ def curved_hessian_triplets(
                     col = edge_vertex_slots[edge_b, v_slot]
                     position = pair_out + u_slot * 4 + v_slot
                     value = zero
-                    out_row = 0
-                    out_col = 0
+                    # An absent slot (a boundary edge's missing second incident face) pads with an
+                    # out-of-range row/col rather than 0 -- see the degenerate-face branch above.
+                    out_row = -1
+                    out_col = -1
                     if row >= 0 and col >= 0:
                         par_v = par[edge_b, v_slot]
                         perp_v = perp[edge_b, v_slot]
@@ -693,9 +718,10 @@ def _register_overloads() -> None:
     global SANDWICH_ROW_COUNTS, SANDWICH_ROW_TRIPLETS
     global HESSIAN_ENERGY_TRIPLETS, CURVED_HESSIAN_TRIPLETS
     i32 = wp.array[wp.int32]
-    ZERO_AT_INDICES = OverloadTable(
-        zero_at_indices, {d: [i32, wp.array[d]] for d in _MATRIX_DTYPES}
-    )
+    # ``_zero_at_boundary``'s only caller, ``float64`` in and out (``mass``/``kappa`` are fixed at
+    # that precision by their own producers) -- one dtype, not the full ``_MATRIX_DTYPES`` cross
+    # product this kernel's ``wp.Float`` genericity would otherwise admit (CLAUDE.md section 2.5).
+    ZERO_AT_INDICES = OverloadTable(zero_at_indices, {wp.float64: [i32, wp.array[wp.float64]]})
     CROUZEIX_RAVIART_MASS_DIAG = OverloadTable(
         crouzeix_raviart_mass_diag,
         {d: [wp.array[wp.vec3], i32, i32, wp.array[d]] for d in _MATRIX_DTYPES},
