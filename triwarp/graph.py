@@ -21,10 +21,9 @@ from triwarp.kernels.algorithms import connected_components as kernel_connected_
 # thread. A level costs a fixed amount of launch overhead whatever its frontier, while the serial
 # walk costs a small amount per node, so the two break even once the frontier is narrow.
 #
-# This replaces a ``node_count < 16384`` guard, which was the wrong predicate: its own comment named
-# the failure mode as "small **or path-like**" but a node count only detects "small", and no static
-# function of ``(node_count, nnz)`` separates a ribbon (average degree 4.0) from a sphere (6.0).
-# Frontier width is observable and is the quantity that actually decides it.
+# Frontier width, not node count, decides this: node count alone cannot separate a small graph
+# from a large one whose frontier still narrows early (a long thin ribbon, average degree 4.0,
+# from a sphere, average degree 6.0). Frontier width is observable and is what actually decides.
 _BFS_ESCAPE_FRONTIER = 32
 
 
@@ -210,8 +209,7 @@ def connected_component_labels_from_edges(
     See Also
     --------
     [`connected_component_labels`][triwarp.graph.connected_component_labels]
-    [`connected_component_parity_from_edges`]
-    [triwarp.graph.connected_component_parity_from_edges]
+    [`connected_component_parity_from_edges`][triwarp.graph.connected_component_parity_from_edges]
     [`face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels]
     [`trimesh.graph.connected_component_labels`][]
     """
@@ -227,7 +225,7 @@ def connected_component_labels_from_edges(
 
 
 def connected_component_parity_from_edges(
-    edges: twt.Array2dInt32, signs: wp.array[wp.int32], node_count: int
+    edges: twt.Array2dInt32, signs: wp.array[wp.int32], node_count: int, *, validate: bool = True
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
     """
     Component labels plus a Z2 potential satisfying the per-edge parity constraints.
@@ -251,6 +249,11 @@ def connected_component_parity_from_edges(
         Length-``m`` ``wp.int32`` parity constraint per edge, ``0`` (equal) or ``1`` (opposite).
     node_count
         Number of nodes ``0 .. node_count - 1``.
+    validate
+        When ``False``, skip the range check on ``edges`` and the device synchronization it
+        costs. Follows the same convention as
+        [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
+        — see the warning there.
 
     Returns
     -------
@@ -264,10 +267,20 @@ def connected_component_parity_from_edges(
     Raises
     ------
     ValueError
-        If ``edges`` is not ``(m, 2)``, ``signs`` is not length ``m``, or ``node_count`` is
-        negative.
+        If ``edges`` is not ``(m, 2)``, ``signs`` is not length ``m``, ``node_count`` is
+        negative, or (with ``validate``) an endpoint is out of range.
     RuntimeError
         If ``edges`` and ``signs`` are not all on one device.
+
+    Warning
+    -------
+    !!! warning "``validate=False`` trades a guard for a synchronization"
+        With an out-of-range endpoint the unchecked path reads **and writes** out of bounds
+        rather than raising: ``ecl_hook_parity`` indexes a ``node_count``-element buffer by the
+        raw endpoint. On a CUDA device that lands in device memory; on the **CPU** device a Warp
+        array is host heap, so it overwrites glibc's allocator metadata and aborts the process
+        later, somewhere unrelated. Pass ``validate=False`` only when the caller produced
+        ``edges`` itself and knows the bound holds.
 
     Notes
     -----
@@ -291,6 +304,14 @@ def connected_component_parity_from_edges(
         raise ValueError(f"signs must have length {m} to match edges, got {int(signs.shape[0])}")
     if node_count < 0:
         raise ValueError(f"node_count must be non-negative, got {node_count}")
+    if validate and m > 0:
+        # One 8-byte read of both bounds, not a copy of the whole edge buffer -- see
+        # ``_validate_edge_list``, whose range check this mirrors for a signed edge list.
+        lowest, highest = tw.reduce.minmax(edges)
+        if lowest < 0 or highest >= node_count:
+            raise ValueError(
+                f"edge indices must lie in [0, {node_count}), got min={lowest} max={highest}"
+            )
 
     device = edges.device
     labels = wp.empty(node_count, dtype=wp.int32, device=device)
@@ -402,12 +423,33 @@ def successor_cycles(
 
     label_min = wp.full(node_count, node_count, dtype=wp.int32, device=device)
     label_count = wp.zeros(node_count, dtype=wp.int32, device=device)
+    is_chain = wp.zeros(node_count, dtype=wp.int32, device=device)
     wp.launch(
         kernel_graph.scatter_cycle_min_and_count,
         dim=n_nodes,
-        inputs=[cycle_nodes, labels, label_min, label_count],
+        inputs=[cycle_nodes, next_node, labels, label_min, label_count, is_chain],
         device=device,
     )
+
+    # A successor graph decomposes into node-disjoint cycles *and* chains (see the docstring). A
+    # chain component contains a node with no outgoing edge (``next_node[v] < 0``), which
+    # ``init_rank_arrays`` below treats as a fixed point identical to a genuine cycle's cut at
+    # ``label_min`` -- two fixed points in one component collide onto rank slot 0 and fabricate a
+    # bogus "cycle" out of whatever the collision leaves there, including node ids that never
+    # appeared in the input. Excluding a chain's nodes here keeps that collision scoped to the
+    # malformed input the Notes above already describe (an in-degree collision), rather than
+    # firing on an ordinary chain.
+    keep_mask = wp.empty(n_nodes, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_graph.chain_node_mask,
+        dim=n_nodes,
+        inputs=[cycle_nodes, labels, is_chain, keep_mask],
+        device=device,
+    )
+    cycle_nodes = tw.array.gather(cycle_nodes, tw.array.flatnonzero(keep_mask))
+    n_nodes = int(cycle_nodes.shape[0])
+    if n_nodes == 0:
+        return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
 
     # Pointer-jumping list ranking (Wyllie): O(log L) rounds of pointer doubling replace the
     # per-node successor walk, whose total work was quadratic in the cycle length.
@@ -573,9 +615,8 @@ def bfs(
     # The loop also *stops early* once the frontier narrows (``_BFS_ESCAPE_FRONTIER``) and hands
     # its half-built FIFO to the serial kernel above, which is what keeps a long-diameter graph
     # from paying four fixed-size launches for a two-node frontier, tens of thousands of times.
-    # ``int(...)`` because the kernel-side constant is a ``wp.int32``, which carries no
-    # host-scope ``//``; it is spelled that way so check 17 can type the divisions inside
-    # the kernels that read it.
+    # ``int(...)`` because ``BFS_SCAN_BLOCK`` is a typed ``wp.int32`` constant, and ``//`` on a
+    # ``wp.int32`` at host scope raises ``TypeError`` rather than dividing.
     scan_block = int(kernel_bfs.BFS_SCAN_BLOCK)
     n_blocks = (node_count + scan_block - 1) // scan_block
     padded = n_blocks * scan_block
@@ -752,12 +793,15 @@ def bfs_multi_source(
     ------
     ValueError
         If ``adjacency`` is not square, does not use 1x1 blocks, or a source is out of range.
+    RuntimeError
+        If ``adjacency`` and ``sources`` are not on the same device.
 
     See Also
     --------
     [`bfs`][triwarp.graph.bfs]
     [`geodesic_ball`][triwarp.neighbors.geodesic_ball]
     """
+    require_same_device(adjacency=adjacency, sources=sources)
     # This one traverses through ``bfs`` rather than the CSR buffers directly, so it wants only
     # the validation and the node count.
     node_count, _, _ = _validate_square_csr(adjacency)
@@ -783,6 +827,10 @@ def bfs_multi_source(
     # with no per-thread scratch and no reachable-set capacity cap.
     labels = connected_component_labels(adjacency)
     n = int(node_count)
+    # This is ``sort_and_argsort``'s body, not a call to it: that helper takes an already-built
+    # length-``n`` key array and copies it into its own ``2n`` scratch, where the keys here can be
+    # written directly into the scratch's first half by the packing kernel below, at n's cost in
+    # ``wp.int64`` one ``wp.copy`` cheaper.
     keys_buffer = wp.empty(2 * n, dtype=wp.int64, device=device)
     node_ids = tw.array.sort_pair_indices(n, -1, device)
     wp.launch(
@@ -868,8 +916,10 @@ def shortest_path_envelope(
     Raises
     ------
     ValueError
-        If ``adjacency`` is not square with 1x1 blocks, if ``max_iterations`` is negative, or if
-        ``values`` is not length ``node_count``.
+        If ``adjacency`` is not square with 1x1 blocks, if ``max_iterations`` is negative, if
+        ``values`` is not length ``node_count``, or if any weight in ``adjacency`` is negative.
+    RuntimeError
+        If ``adjacency`` and ``values`` are not on the same device.
 
     Examples
     --------
@@ -912,6 +962,7 @@ def shortest_path_envelope(
     [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]
     [`scipy.sparse.csgraph.dijkstra`][]
     """
+    require_same_device(adjacency=adjacency, values=values)
     node_count, offsets, columns = _validate_square_csr(adjacency)
     if max_iterations < 0:
         raise ValueError(f"max_iterations must be non-negative, got {max_iterations}")
@@ -926,6 +977,8 @@ def shortest_path_envelope(
         return labels
 
     weights = adjacency.values  # pyright: ignore[reportAttributeAccessIssue]
+    if int(weights.shape[0]) > 0 and float(tw.reduce.min(weights)) < 0.0:
+        raise ValueError("adjacency weights must be non-negative for the envelope to converge")
     relaxed = wp.empty(node_count, dtype=wp.float32, device=device)
     changed = wp.zeros(1, dtype=wp.int32, device=device)
     for _ in range(max_iterations or node_count):

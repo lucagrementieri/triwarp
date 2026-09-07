@@ -334,6 +334,19 @@ def test_connected_component_parity_signs_length_mismatch(device: str) -> None:
         tw.graph.connected_component_parity_from_edges(edges_wp, signs_wp, 4)
 
 
+def test_connected_component_parity_validates_range(device: str) -> None:
+    """
+    The default range check rejects an endpoint outside ``[0, node_count)``.
+
+    Without this, ``ecl_hook_parity`` indexes a ``node_count``-element buffer by the raw
+    endpoint -- an out-of-range value reads and writes out of bounds rather than raising.
+    """
+    edges_wp = wp.array(np.array([[0, 10]], dtype=np.int32), dtype=wp.int32, device=device)
+    signs_wp = wp.zeros(1, dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="edge indices must lie in"):
+        tw.graph.connected_component_parity_from_edges(edges_wp, signs_wp, 5)
+
+
 def test_face_connected_component_labels(request: pytest.FixtureRequest) -> None:
     """
     Class B: the face-side partition against scipy over ``trimesh.face_adjacency``.
@@ -465,6 +478,33 @@ def test_successor_cycles_malformed_input_stays_in_range(device: str) -> None:
     flat_np = flat_wp.numpy()
     assert flat_np.shape[0] == int(sizes_wp.numpy().sum()) == 4
     assert np.all((flat_np >= 0) & (flat_np < 4))
+
+
+def test_successor_cycles_excludes_a_chain(device: str) -> None:
+    """
+    A plain successor chain (no cycle at all) contributes nothing to the result.
+
+    The docstring promises a successor graph decomposes into cycles *and* chains, with only
+    cycles returned. A chain's dead end (a node with no outgoing edge) used to be treated as a
+    second rank-0 fixed point alongside the arbitrary cut at the component's smallest node, so
+    the two collided and fabricated a bogus "cycle" out of the collision -- one that could even
+    contain a node id that never appeared in the input at all.
+    """
+    edges_wp = wp.array(np.array([[5, 3], [3, 7]], dtype=np.int32), dtype=wp.int32, device=device)
+    flat_wp, offsets_wp, sizes_wp = tw.graph.successor_cycles(edges_wp, 8)
+    assert flat_wp.shape == (0,)
+    assert offsets_wp.shape == (0,)
+    assert sizes_wp.shape == (0,)
+
+
+def test_successor_cycles_mixed_cycle_and_chain(device: str) -> None:
+    """A real cycle is reported unchanged alongside a chain that contributes nothing."""
+    edges_np = np.array([[0, 1], [1, 2], [2, 0], [5, 3], [3, 7]], dtype=np.int32)
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    flat_wp, offsets_wp, sizes_wp = tw.graph.successor_cycles(edges_wp, 8)
+    assert np.array_equal(flat_wp.numpy(), np.array([0, 1, 2], dtype=np.int32))
+    assert np.array_equal(offsets_wp.numpy(), np.array([0], dtype=np.int32))
+    assert np.array_equal(sizes_wp.numpy(), np.array([3], dtype=np.int32))
 
 
 def test_successor_cycles_empty(device: str) -> None:
@@ -981,3 +1021,19 @@ def test_shortest_path_envelope_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh])
     edges, n_vertices = _mesh_vertex_edges(mesh_wp)
     with pytest.raises(ValueError, match="one entry per edge"):
         tw.graph.edges_to_csr(n_vertices, edges, values_wp)
+
+
+def test_shortest_path_envelope_rejects_negative_weights(device: str) -> None:
+    """
+    A negative weight makes the relaxation decrease without bound instead of converging.
+
+    Without this guard the loop returns a plausible-looking array that keeps getting smaller as
+    ``max_iterations`` grows -- silently wrong rather than raising, exactly what the docstring's
+    "not admissible" note warns about.
+    """
+    edges_wp = wp.array(np.array([[0, 1]], dtype=np.int32), dtype=wp.int32, device=device)
+    weights_wp = wp.array(np.array([-1.0], dtype=np.float32), dtype=wp.float32, device=device)
+    adjacency = tw.graph.edges_to_csr(2, edges_wp, weights_wp)
+    values_wp = wp.array(np.array([0.0, 1000.0], dtype=np.float32), dtype=wp.float32, device=device)
+    with pytest.raises(ValueError, match="non-negative"):
+        tw.graph.shortest_path_envelope(adjacency, values_wp, max_iterations=5)

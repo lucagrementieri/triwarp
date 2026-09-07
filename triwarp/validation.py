@@ -740,7 +740,12 @@ def face_orientation_bits(
     # parity 0. What changes is the cost — the fill ran one launch per graph level, so a mesh whose
     # face adjacency is a long path (a ribbon) paid tens of thousands of launches and thousands of
     # readbacks for work bounded by a few milliseconds of bandwidth.
-    _labels, orient = tw.graph.connected_component_parity_from_edges(signed_edges, signs, n_faces)
+    # ``validate=False``: ``signed_edges`` holds face ids this function just built from
+    # ``adjacency`` (itself bounded by ``n_faces`` by construction), so the range check would only
+    # re-derive a bound already guaranteed -- at the cost of a device synchronization.
+    _labels, orient = tw.graph.connected_component_parity_from_edges(
+        signed_edges, signs, n_faces, validate=False
+    )
     return orient, signed_edges, signs, m
 
 

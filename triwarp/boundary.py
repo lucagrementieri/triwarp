@@ -33,7 +33,6 @@ import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import boundary as kernel_boundary
-from triwarp.kernels import scatter as kernel_scatter
 
 
 def boundary_edges(
@@ -70,15 +69,7 @@ def boundary_edges(
         If ``vertices``, ``faces`` and ``edges_sorted`` are not all on one device.
     """
     require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted)
-    n_faces = int(faces.shape[0]) // 3
-    if n_faces == 0:
-        return twt.empty_2d((0, 2), wp.int32, device=faces.device)
-
-    if edges_sorted is None:
-        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    return twt.as_array2d(
-        tw.array.gather(edges_sorted, _boundary_rows(vertices, edges_sorted)), wp.int32
-    )
+    return _boundary_edges_impl(vertices, faces, edges_sorted, None, oriented=False)
 
 
 def oriented_boundary_edges(
@@ -118,15 +109,30 @@ def oriented_boundary_edges(
         If ``vertices``, ``faces``, ``edges_sorted`` and ``edges`` are not all on one device.
     """
     require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted, edges=edges)
+    return _boundary_edges_impl(vertices, faces, edges_sorted, edges, oriented=True)
+
+
+def _boundary_edges_impl(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    edges_sorted: twt.Array2dInt32 | None,
+    edges: twt.Array2dInt32 | None,
+    *,
+    oriented: bool,
+) -> twt.Array2dInt32:
+    """Shared body of [`boundary_edges`][triwarp.boundary.boundary_edges] and its oriented form."""
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return twt.empty_2d((0, 2), wp.int32, device=faces.device)
 
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    rows = _boundary_rows(int(vertices.shape[0]), edges_sorted)
+    if not oriented:
+        return twt.as_array2d(tw.array.gather(edges_sorted, rows), wp.int32)
     if edges is None:
         edges = tw.edges.faces_to_edges(faces)
-    return twt.as_array2d(tw.array.gather(edges, _boundary_rows(vertices, edges_sorted)), wp.int32)
+    return twt.as_array2d(tw.array.gather(edges, rows), wp.int32)
 
 
 def boundary_loops(
@@ -270,11 +276,12 @@ def boundary_loops_batched(
         # Three *distinct* empty allocations, so callers may write into them independently.
         return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
 
+    n_vertices = int(vertices.shape[0])
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     # One boundary detection for all three edge views below; ``boundary_edges`` /
     # ``oriented_boundary_edges`` / ``boundary_vertex_indices`` would each redo the row grouping.
-    rows = _boundary_rows(vertices, edges_sorted)
+    rows = _boundary_rows(n_vertices, edges_sorted)
     n_boundary_edges = int(rows.shape[0])
     if n_boundary_edges == 0:
         return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
@@ -283,7 +290,6 @@ def boundary_loops_batched(
         edges = tw.edges.faces_to_edges(faces)
     directed = twt.as_array2d(tw.array.gather(edges, rows), wp.int32)
 
-    n_vertices = int(vertices.shape[0])
     if _needs_unoriented_boundary_walk(directed, n_vertices):
         return _unoriented_boundary_cycles(
             twt.as_array2d(tw.array.gather(edges_sorted, rows), wp.int32), n_vertices
@@ -968,18 +974,8 @@ def ears(
     if n_vertices is None:
         n_vertices = tw.array.index_bound(edges_sorted)
 
-    boundary_rows = tw.grouping.group_int_rows(
-        edges_sorted, 1, n_vertices, validate=False
-    ).flatten()
-    edge_boundary = wp.zeros(n_faces * 3, dtype=wp.bool, device=device)
-    n_boundary_rows = int(boundary_rows.shape[0])
-    if n_boundary_rows > 0:
-        wp.launch(
-            kernel_scatter.mark_membership_mask,
-            dim=n_boundary_rows,
-            inputs=[boundary_rows, wp.int32(n_faces * 3), edge_boundary],
-            device=device,
-        )
+    boundary_rows = _boundary_rows(n_vertices, edges_sorted)
+    edge_boundary = tw.array.indices_to_mask(boundary_rows, n_faces * 3, device=device)
 
     out_ear = wp.empty(n_faces, dtype=wp.int32, device=device)
     out_ear_opp = wp.empty(n_faces, dtype=wp.int32, device=device)
@@ -997,10 +993,6 @@ def ears(
     return ear, ear_opp
 
 
-def _boundary_rows(
-    vertices: wp.array[wp.vec3], edges_sorted: twt.Array2dInt32
-) -> wp.array[wp.int32]:
+def _boundary_rows(n_vertices: int, edges_sorted: twt.Array2dInt32) -> wp.array[wp.int32]:
     """Row indices of the triangle edges appearing exactly once — the boundary edges."""
-    return tw.grouping.group_int_rows(
-        edges_sorted, 1, int(vertices.shape[0]), validate=False
-    ).flatten()
+    return tw.grouping.group_int_rows(edges_sorted, 1, n_vertices, validate=False).flatten()

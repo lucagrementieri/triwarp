@@ -115,15 +115,33 @@ def scatter_successor(directed_edges: wp.array2d[wp.int32], out_next: wp.array[w
 @wp.kernel
 def scatter_cycle_min_and_count(
     cycle_nodes: wp.array[wp.int32],
+    next_node: wp.array[wp.int32],
     labels: wp.array[wp.int32],
     out_label_min: wp.array[wp.int32],
     out_label_count: wp.array[wp.int32],
+    out_is_chain: wp.array[wp.int32],
 ) -> None:
     tid = wp.int32(wp.tid())
     v = cycle_nodes[tid]
     label = labels[v]
     wp.atomic_min(out_label_min, label, v)
     wp.atomic_add(out_label_count, label, wp.int32(1))
+    # A node with no outgoing edge is a chain terminus, not a cycle: mark the whole
+    # (undirected-connectivity) component so its nodes can be excluded before ranking.
+    if next_node[v] < 0:
+        wp.atomic_max(out_is_chain, label, wp.int32(1))
+
+
+@wp.kernel
+def chain_node_mask(
+    cycle_nodes: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    is_chain: wp.array[wp.int32],
+    out_keep: wp.array[wp.int32],
+) -> None:
+    tid = wp.int32(wp.tid())
+    v = cycle_nodes[tid]
+    out_keep[tid] = wp.where(is_chain[labels[v]] != 0, wp.int32(0), wp.int32(1))
 
 
 @wp.kernel
