@@ -462,7 +462,16 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # been built and is not needed unscaled.
     ("algorithms.multigrid", "scale_rows"): frozenset({"values"}),
     ("polyline", "clip_selected"): frozenset({"active", "left", "right"}),
+    # ``state`` is the ``wp.capture_while`` loop's own [rounds run, condition] pair, read and
+    # incremented across launches -- the ``rdp_begin_round`` / ``rdp_split_spans`` case below,
+    # under the same name.
+    ("polyline", "ear_loop_continue"): frozenset({"state"}),
     ("polyline", "init_ring"): frozenset({"active", "left", "right"}),
+    # Round, pass 1 of 4 of the level-synchronous Ramer-Douglas-Peucker split: only arms the
+    # per-span accumulators (``out_span_max`` / ``out_span_argmax``) and advances the loop's own
+    # [rounds run, condition] pair -- the same ``state`` buffer ``rdp_split_spans`` and
+    # ``ear_loop_continue`` carry under this name.
+    ("polyline", "rdp_begin_round"): frozenset({"state"}),
     # The level-synchronous Ramer-Douglas-Peucker round. ``span_lo`` / ``span_hi`` are each point's
     # current span, rewritten in place to the child span it belongs to at the next level;
     # ``state`` is the ``wp.capture_while`` loop's own [levels run, condition] pair, which is the

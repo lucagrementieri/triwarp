@@ -398,12 +398,17 @@ def polyline_smooth_upsample(
     [`polyline_upsample`][triwarp.polyline.polyline_upsample]
         The straight-chord version, which is what this reduces to on the end segments.
     """
-    if closed:
+    # An *explicitly* closed input (last point already equal to the first) is detected the same
+    # way ``polyline_angles`` detects one, per the module docstring -- so a caller does not have
+    # to pass ``closed=True`` for a ring ``boundary_loops`` already returned. ``polyline_close`` is
+    # idempotent on an already-closed input, so calling it unconditionally here costs nothing.
+    treat_as_closed = closed or is_closed(polyline)
+    if treat_as_closed:
         # Every segment including the seam becomes interior, so neighbour tangents wrap cyclically
         # and the duplicated closing point is dropped -- a clean cyclic ring.
         polyline = polyline_close(polyline)
     gather = kernel_polyline.smooth_upsample_gather
-    return _upsample(polyline, step_size, gather, [wp.int32(closed)])
+    return _upsample(polyline, step_size, gather, [wp.int32(treat_as_closed)])
 
 
 def _upsample(
@@ -815,8 +820,10 @@ def polyline_radius(
     Raises
     ------
     ValueError
-        If ``reduction`` is not one of the supported values, or the polyline has fewer than
-        two points.
+        If ``reduction`` is not one of the supported values, if the polyline has fewer than two
+        points, or if it has fewer than three and either ``center`` or ``normal`` is left at its
+        default (both defaults need a plane derived from the polyline, which a single segment does
+        not determine).
 
     See Also
     --------
@@ -836,6 +843,16 @@ def polyline_radius(
     if n_segments < 1:
         raise ValueError("polyline_radius requires at least two points")
 
+    if (center is None or normal is None) and n_segments < 2:
+        # ``polyline_centroid`` has no such floor, but ``polyline_normal`` needs three distinct
+        # points to fit a plane, so a 2-point input can only reach past here with both supplied
+        # explicitly -- raising ``polyline_radius``'s own message rather than deferring to
+        # ``polyline_normal``'s, whose "three points" precondition this function does not itself
+        # document anywhere else.
+        raise ValueError(
+            "polyline_radius requires at least three points when 'center' or 'normal' is not "
+            "supplied explicitly"
+        )
     if center is None:
         center = polyline_centroid(polyline)
     if normal is None:
@@ -901,7 +918,15 @@ def polyline_angles(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.
         kernel_polyline.cyclic_segment_angles, dim=n_segments, inputs=[polyline, raw], device=device
     )
     if is_closed(polyline):
-        return tw.array.concatenate([raw, raw[0:1]])
+        # ``cyclic_segment_angles`` writes ``raw[i]`` as the angle between segment ``i`` and its
+        # cyclic successor, which is the turning angle at vertex ``i + 1`` (mod ``n_segments``),
+        # not at vertex ``i``. So ``raw`` is the answer rotated one slot ahead of the vertex it
+        # belongs to; roll it back by one (last element first) to index it by vertex instead of by
+        # segment, then repeat the first (rolled) entry for the duplicated closing point, the same
+        # way the un-rotated form used to repeat ``raw[0]``. The open branch below already applies
+        # the equivalent shift by prepending a zero.
+        last = raw[n_segments - 1 : n_segments]
+        return tw.array.concatenate([last, raw[0 : n_segments - 1], last])
     zero = wp.zeros(1, dtype=wp.float32, device=device)
     return tw.array.concatenate([zero, raw[0 : n_segments - 1], zero])
 

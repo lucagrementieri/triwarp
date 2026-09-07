@@ -106,7 +106,11 @@ def _angles_np(pts: np.ndarray) -> np.ndarray:
     )
     angles = np.arccos(np.clip(cos, -1.0, 1.0))
     if np.allclose(pts[0], pts[-1]):
-        return np.concatenate([angles, angles[:1]])
+        # ``angles[i]`` is the angle between segment ``i`` and its cyclic successor, which is the
+        # turning angle at vertex ``i + 1`` (mod n_segments), not at vertex ``i`` -- roll it back
+        # by one so it is indexed by vertex, matching ``polyline_angles``' own per-vertex output.
+        rotated = np.roll(angles, 1)
+        return np.concatenate([rotated, rotated[:1]])
     angles[-1] = 0.0
     return np.concatenate([angles[-1:], angles])
 
@@ -423,6 +427,23 @@ def test_polyline_angles_closed_length_matches_original(device: str) -> None:
     assert angles_wp.shape[0] == pts_np.shape[0]
 
 
+def test_polyline_angles_closed_is_indexed_by_vertex_not_by_segment(device: str) -> None:
+    """
+    A hand-computed right triangle pins the per-vertex indexing, independent of ``_angles_np``.
+
+    ``cyclic_segment_angles`` writes the angle between segment ``i`` and its cyclic successor,
+    which is the turning angle at vertex ``i + 1``, not vertex ``i`` -- an off-by-one rotation that
+    a fuzz comparison against a reference sharing the same convention would not catch. The
+    triangle's three turning angles (90 degrees at the right-angle corner, 135 degrees at the other
+    two, i.e. 180 minus each interior angle) are distinct enough that a rotated result cannot pass
+    by coincidence.
+    """
+    triangle_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    angles_wp = tw.polyline.polyline_angles(points_to_warp(triangle_np, device), closed=True)
+    expected = np.radians([90.0, 135.0, 135.0])
+    assert np.allclose(angles_wp.numpy(), expected, rtol=1e-4, atol=1e-4)
+
+
 # --- distance (NumPy reference) ---
 
 
@@ -662,6 +683,40 @@ def test_smooth_upsample_closed_recovers_circle(device: str) -> None:
         points_to_warp(polygon_np, device), 0.35, closed=True
     ).numpy()
     assert np.linalg.norm(linear, axis=-1).min() < radius - 1e-2
+
+
+@pytest.mark.parametrize("radius", [2.0, 3e-2, 1e-4, 1e-5])
+def test_smooth_upsample_closed_recovers_circle_at_any_scale(device: str, radius: float) -> None:
+    """
+    The circumscribed-arc fit must not silently fall back to the straight chord at small scale.
+
+    ``endpoint_normals``' collinearity guard used to compare an absolute cross-product magnitude to
+    a fixed epsilon, and that magnitude scales as the *4th power* of the coordinate scale, so an
+    ordinary (non-collinear) octagon bend was reclassified as degenerate once its radius dropped
+    below ~4e-2 -- the arc fit collapsed to the straight chord there even though nothing about the
+    octagon's *shape* (an angle, which is scale-invariant) had changed. `radius=2.0` is the
+    original, always-passing scale; the smaller ones reproduce the failure this guards against.
+    """
+    polygon_np = _planar_circle(8, radius)
+    smoothed = tw.polyline.polyline_smooth_upsample(
+        points_to_warp(polygon_np, device), 0.35 * radius, closed=True
+    ).numpy()
+    assert np.allclose(np.linalg.norm(smoothed, axis=-1), radius, rtol=1e-3, atol=1e-3 * radius)
+
+
+def test_smooth_upsample_detects_an_already_closed_input(device: str) -> None:
+    """
+    An explicitly closed input is smoothed at the seam even without passing ``closed=True``.
+
+    Without the auto-detection the two segments touching the seam fall back to linear
+    interpolation instead of the fitted arc every other segment gets, which is visible as the same
+    radial deviation a plain ``polyline_upsample`` would leave.
+    """
+    radius = 2.0
+    ring_np = _planar_circle(8, radius)
+    closed_np = np.concatenate([ring_np, ring_np[:1]], axis=0)
+    smoothed = tw.polyline.polyline_smooth_upsample(points_to_warp(closed_np, device), 0.35).numpy()
+    assert np.allclose(np.linalg.norm(smoothed[:, :2], axis=-1), radius, rtol=1e-3, atol=1e-3)
 
 
 def test_smooth_upsample_short_polyline_unchanged(device: str) -> None:
@@ -969,6 +1024,28 @@ def test_polyline_radius_rejects_unknown_reduction(device: str) -> None:
     pts_np = _random_open_polyline(81)
     with pytest.raises(ValueError, match="unsupported reduction"):
         tw.polyline.polyline_radius(points_to_warp(pts_np, device), "sum")  # type: ignore[arg-type]
+
+
+def test_polyline_radius_two_points_raises_its_own_message(device: str) -> None:
+    """
+    Two points pass the "at least two" floor but cannot derive a default plane on their own.
+
+    ``polyline_normal`` needs three points to fit a plane and used to be reached unguarded whenever
+    ``center`` or ``normal`` was left at its default, raising a message about a different
+    function's minimum for an input this one's own docs call valid.
+    """
+    two_points = points_to_warp(np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]), device)
+    with pytest.raises(ValueError, match="polyline_radius requires at least three points"):
+        tw.polyline.polyline_radius(two_points)
+
+
+def test_polyline_radius_two_points_with_explicit_plane_succeeds(device: str) -> None:
+    """With both defaults supplied explicitly, a 2-point polyline needs no minimum beyond two."""
+    two_points = points_to_warp(np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]), device)
+    radius = tw.polyline.polyline_radius(
+        two_points, center=wp.vec3(0.5, 1.0, 0.0), normal=wp.vec3(0.0, 0.0, 1.0)
+    )
+    assert np.isclose(radius, 1.0, atol=1e-5)
 
 
 # --- new reducers / array helpers ---

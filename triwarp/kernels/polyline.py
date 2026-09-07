@@ -203,18 +203,45 @@ CURVATURE_EPS = wp.constant(wp.float32(1.0e-6))
 
 
 @wp.func
-def plane_normal(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec3:
+def plane_normal(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> tuple[wp.vec3, wp.bool]:
     """
-    Return the normal of the plane approximately containing segment vectors ``a``, ``b``, ``c``.
+    Return the plane normal of segment vectors ``a``, ``b``, ``c``, plus whether they are collinear.
 
     Returns whichever of ``b x (a + c)`` and ``b x (a - c)`` has the larger magnitude, which stays
     well-defined when ``a`` and ``c`` are nearly parallel or anti-parallel.
+
+    The degeneracy test is scale-free: it reads ``sin²`` of the angle between ``b`` and the chosen
+    sum/difference (``length_sq(normal) / (length_sq(b) * length_sq(reference))``), not an absolute
+    cross-product magnitude. ``length_sq(normal)`` scales as the *4th power* of the coordinate
+    scale (``b`` and the reference vector each contribute a factor of length, twice over once
+    squared), so comparing it to a fixed absolute epsilon -- what this replaced -- silently
+    reclassified an ordinary, non-collinear bend as degenerate once the polyline's coordinates
+    dropped a couple of orders of magnitude below 1: reproduced on a regular octagon inscribed at
+    radius ``r``, the arc fit was exact down to ``r = 5e-2`` and fully collapsed to the straight
+    chord at ``r = 3e-2`` and below, tracking `length_sq(normal)` crossing the old fixed
+    ``CURVATURE_EPS`` exactly at that boundary (see plans/review.md item 7's ``endpoint_normals``
+    finding). ``scale`` still needs a floor against a genuinely zero-length ``b`` or reference
+    vector, which makes the ratio vacuously small (or an outright ``0 < 0`` if ``normal`` is zero
+    too) regardless of angle -- but the floor has to be an *exact*-zero test, not another fixed
+    epsilon: ``scale`` is ``length_sq(b) * length_sq(reference)``, the same 4th-power quantity the
+    ratio exists to stop comparing against a fixed constant, so reusing ``CURVATURE_EPS`` here
+    reintroduces the identical scale dependence one line down -- measured directly: the octagon
+    repro above still failed identically with a ``scale < CURVATURE_EPS`` floor, because the
+    floor fired instead of the ratio at every scale below the same old boundary. A duplicated
+    (bit-identical) point makes ``b`` or ``reference`` the exact zero vector, at any coordinate
+    scale, which is what the floor below actually tests for.
     """
     n1 = wp.cross(b, a + c)
     n2 = wp.cross(b, a - c)
     if wp.length_sq(n1) >= wp.length_sq(n2):
-        return n1
-    return n2
+        normal = n1
+        reference = a + c
+    else:
+        normal = n2
+        reference = a - c
+    scale = wp.length_sq(b) * wp.length_sq(reference)
+    degenerate = scale <= wp.float32(0.0) or wp.length_sq(normal) < CURVATURE_EPS * scale
+    return normal, degenerate
 
 
 @wp.func
@@ -227,8 +254,8 @@ def endpoint_normals(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> tuple[wp.vec3, wp.ve
     collinear, signalling the caller to fall back to a
     straight chord.
     """
-    normal = plane_normal(a, b, c)
-    if wp.length_sq(normal) < CURVATURE_EPS:
+    normal, degenerate = plane_normal(a, b, c)
+    if degenerate:
         return wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
     nod = wp.normalize(wp.cross(normal, b))
     no = wp.normalize(nod + wp.normalize(wp.cross(normal, a)))
@@ -251,7 +278,11 @@ def arc_point(po: wp.vec3, pd: wp.vec3, no: wp.vec3, nd: wp.vec3, t: wp.float32)
     chord = wp.length(b)
     linear = wp.lerp(po, pd, t)
     if chord < CURVATURE_EPS:
-        return po
+        # ``linear``, not a bare ``po``, to match the docstring's straight-chord contract and its
+        # sibling degenerate branches below -- numerically indistinguishable here (``t * chord`` is
+        # already under ``CURVATURE_EPS``), but ``linear`` is exactly ``po`` at ``t == 0`` too, so
+        # the "t == 0 returns po exactly" guarantee is unaffected.
+        return linear
     # Zero end-normals are the collinear sentinel from endpoint_normals; unit normals have norm 1.
     if wp.length_sq(no) < 0.5 or wp.length_sq(nd) < 0.5:
         return linear
@@ -367,7 +398,12 @@ def square_successors(successor: wp.array[wp.int32], out_successor: wp.array[wp.
     i = wp.int32(wp.tid())
     n = successor.shape[0]
     j = successor[i]
-    out_successor[i] = wp.where(j >= n, n, successor[j])
+    # ``wp.where`` evaluates both arms (it is not a short-circuiting ternary), so indexing
+    # ``successor[j]`` directly is an out-of-bounds read once ``j`` has reached the absorbing
+    # state ``n`` -- the read value is discarded either way, but it is a real OOB and aborts under
+    # ``wp.config.mode = "debug"``. Clamp the index before the load rather than after.
+    safe_j = wp.min(j, n - wp.int32(1))
+    out_successor[i] = wp.where(j >= n, n, successor[safe_j])
 
 
 @wp.kernel
@@ -435,7 +471,7 @@ def rdp_seed_spans(
 
 @wp.kernel
 def rdp_begin_round(
-    out_state: wp.array[wp.int32],
+    state: wp.array[wp.int32],
     out_span_max: wp.array[wp.float32],
     out_span_argmax: wp.array[wp.int32],
 ) -> None:
@@ -443,10 +479,15 @@ def rdp_begin_round(
     # own launch rather than folded into the split kernel (which knows each child span's slot)
     # because a ping-ponged pair of accumulators cannot be swapped inside a captured graph -- the
     # buffers are baked in at capture time. One extra ``dim=n`` launch per round buys the readback.
+    #
+    # ``state`` is read-and-incremented round-index/loop-condition scratch carried across launches
+    # by the caller (the same buffer ``rdp_split_spans`` takes under this name), not a fresh
+    # per-call answer -- it does not wear the ``out_`` prefix for that reason (see plans/review.md
+    # item 7a).
     i = wp.int32(wp.tid())
     if i == 0:
-        out_state[LOOP_ROUND] = out_state[LOOP_ROUND] + 1
-        out_state[LOOP_CONDITION] = 0
+        state[LOOP_ROUND] = state[LOOP_ROUND] + 1
+        state[LOOP_CONDITION] = 0
     out_span_max[i] = -1.0
     out_span_argmax[i] = out_span_max.shape[0]  # past every valid index, so atomic_min always wins
 
@@ -891,17 +932,21 @@ def clip_selected(
 
 @wp.kernel
 def ear_loop_continue(
-    count: wp.array[wp.int32], target: wp.int32, max_rounds: wp.int32, out_state: wp.array[wp.int32]
+    count: wp.array[wp.int32], target: wp.int32, max_rounds: wp.int32, state: wp.array[wp.int32]
 ) -> None:
     # Ear-clipping loop control, kept on device so ``wp.capture_while`` can drive the rounds without
     # a readback each time; the slot table is ``array.LOOP_ROUND`` / ``LOOP_CONDITION``.
     # The round cap is what stops a degenerate or self-intersecting loop that never retires an ear
     # -- the same bound the host-driven form got from iterating ``range(n)``.
-    out_state[LOOP_ROUND] = out_state[LOOP_ROUND] + 1
-    if count[0] < target and out_state[LOOP_ROUND] < max_rounds:
-        out_state[LOOP_CONDITION] = wp.int32(1)
+    #
+    # ``state`` is read-and-incremented round-index/loop-condition scratch carried across launches,
+    # not a fresh per-call answer -- see ``rdp_begin_round``'s identical naming (plans/review.md
+    # item 7a).
+    state[LOOP_ROUND] = state[LOOP_ROUND] + 1
+    if count[0] < target and state[LOOP_ROUND] < max_rounds:
+        state[LOOP_CONDITION] = wp.int32(1)
     else:
-        out_state[LOOP_CONDITION] = wp.int32(0)
+        state[LOOP_CONDITION] = wp.int32(0)
 
 
 def _declare_map_kernels() -> None:
