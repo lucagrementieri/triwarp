@@ -78,10 +78,15 @@ def region_boundary_edges(
     m = int(unique_edges.shape[0])
     count = wp.zeros(m, dtype=wp.int32, device=device)
     region_count = wp.zeros(m, dtype=wp.int32, device=device)
+    # `region_halfedge` is written only for edges the flag pass below keeps (region_count == 1,
+    # exactly one write each), so an unwritten entry is never read and `wp.empty` is correct
+    # (§3.3). It stays `None` on the non-oriented path: the kernel's write is itself guarded by
+    # `oriented`, so this never indexes the null array.
+    region_halfedge = wp.empty(m, dtype=wp.int32, device=device) if oriented else None
     wp.launch(
         kernel_selection.edge_region_counts,
         dim=3 * n_faces,
-        inputs=[inverse, face_mask, count, region_count],
+        inputs=[inverse, face_mask, oriented, count, region_count, region_halfedge],
         device=device,
     )
     flag = wp.empty(m, dtype=wp.bool, device=device)
@@ -90,13 +95,6 @@ def region_boundary_edges(
     if not oriented:
         return twt.as_array2d(tw.array.gather(unique_edges, ids), wp.int32)
 
-    region_halfedge = wp.full(m, -1, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_selection.mark_region_halfedges,
-        dim=3 * n_faces,
-        inputs=[inverse, face_mask, region_halfedge],
-        device=device,
-    )
     oriented_edges = twt.empty_2d((int(ids.shape[0]), 2), wp.int32, device=device)
     wp.launch(
         kernel_selection.oriented_edges_from_halfedges,

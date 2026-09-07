@@ -102,20 +102,6 @@ def dilate_vertex_mask(
 
 
 @wp.kernel
-def mark_region_halfedges(
-    inverse: wp.array[wp.int32],
-    face_mask: wp.array[wp.bool],
-    out_region_halfedge: wp.array[wp.int32],
-) -> None:
-    # One halfedge per unique edge that belongs to a *region* face. A seam edge has exactly one such
-    # face by definition, so no race decides anything there; edges with two or none are not seam
-    # edges and whatever lands is discarded.
-    h = wp.int32(wp.tid())
-    if face_mask[h // 3]:
-        out_region_halfedge[inverse[h]] = h
-
-
-@wp.kernel
 def oriented_edges_from_halfedges(
     faces: wp.array[wp.int32], halfedges: wp.array[wp.int32], out_edges: wp.array2d[wp.int32]
 ) -> None:
@@ -129,15 +115,24 @@ def oriented_edges_from_halfedges(
 def edge_region_counts(
     inverse: wp.array[wp.int32],
     face_mask: wp.array[wp.bool],
+    write_region_halfedge: wp.bool,
     out_count: wp.array[wp.int32],
     out_region_count: wp.array[wp.int32],
+    out_region_halfedge: wp.array[wp.int32],
 ) -> None:
-    # Per unique edge: total incident-face count and how many of those faces are in the region.
+    # Per unique edge: total incident-face count, how many of those faces are in the region, and
+    # (only when the caller asked for the oriented form) which halfedge belongs to the region face.
+    # A seam edge has exactly one region-incident face by definition, so no race decides that write;
+    # edges with two or none region-incident faces are not seams and whatever lands there is
+    # discarded downstream. `out_region_halfedge` is `None` and `write_region_halfedge` is `False`
+    # together on the non-oriented path, so this thread never indexes the null array.
     i = wp.int32(wp.tid())
     e = inverse[i]
     wp.atomic_add(out_count, e, wp.int32(1))
     if face_mask[i // 3]:
         wp.atomic_add(out_region_count, e, wp.int32(1))
+        if write_region_halfedge:
+            out_region_halfedge[e] = i
 
 
 @wp.func
