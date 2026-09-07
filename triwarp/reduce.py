@@ -52,8 +52,8 @@ def min(
     Raises
     ------
     ValueError
-        If ``array`` is empty, its rank is not 1 or 2, or ``axis`` is not
-        ``None`` for a rank-1 input.
+        If ``array`` is empty, its rank is not 1 or 2, ``axis`` is not ``None`` for a
+        rank-1 input, or ``axis`` is not ``0``, ``1``, or ``None`` for a rank-2 input.
     """
     return cast(float | int | twt.Array1dScalar, _reduce_scalar(array, axis, _SCALAR_REDUCE["min"]))
 
@@ -94,8 +94,8 @@ def max(
     Raises
     ------
     ValueError
-        If ``array`` is empty, its rank is not 1 or 2, or ``axis`` is not
-        ``None`` for a rank-1 input.
+        If ``array`` is empty, its rank is not 1 or 2, ``axis`` is not ``None`` for a
+        rank-1 input, or ``axis`` is not ``0``, ``1``, or ``None`` for a rank-2 input.
     """
     return cast(float | int | twt.Array1dScalar, _reduce_scalar(array, axis, _SCALAR_REDUCE["max"]))
 
@@ -156,7 +156,8 @@ def minmax(
     ------
     ValueError
         If ``array`` is empty, its rank is not 1 or 2, ``axis`` is not ``None`` for a
-        rank-1 or ``wp.vec3`` input.
+        rank-1 or ``wp.vec3`` input, or ``axis`` is not ``0``, ``1``, or ``None`` for a
+        rank-2 input.
 
     See Also
     --------
@@ -254,8 +255,8 @@ def sum(
     Raises
     ------
     ValueError
-        If ``array`` is empty, its rank is not 1 or 2, or ``axis`` is not
-        ``None`` for a rank-1 input.
+        If ``array`` is empty, its rank is not 1 or 2, ``axis`` is not ``None`` for a
+        rank-1 input, or ``axis`` is not ``0``, ``1``, or ``None`` for a rank-2 input.
     """
     if array.dtype == wp.vec3:
         if axis is not None:
@@ -265,15 +266,7 @@ def sum(
         n = int(array.shape[0])
         if n == 0:
             raise ValueError("sum requires a non-empty array.")
-        out_vec = wp.zeros(1, dtype=wp.vec3, device=array.device)
-        wp.launch_tiled(
-            kernel_reduce.sum_vec3_1d_tiled,
-            dim=[kernel_reduce.blocks_1d(n)],
-            inputs=[array, out_vec],
-            block_dim=TILE_1D,
-            device=array.device,
-        )
-        return out_vec.list()[0]
+        return _launch_vec3_tiled_sum(kernel_reduce.sum_vec3_1d_tiled, n, array.device, [array])
     if array.dtype == wp.bool:
         mask = cast(wp.array[wp.bool], array)
         mask_i32 = astype(mask, wp.int32)
@@ -332,8 +325,9 @@ def mean(
     Raises
     ------
     ValueError
-        If ``array`` is empty, its rank is not 1 or 2, or ``axis`` is not
-        ``None`` for a rank-1 (or ``wp.vec3``) input.
+        If ``array`` is empty, its rank is not 1 or 2, ``axis`` is not ``None`` for a
+        rank-1 (or ``wp.vec3``) input, or ``axis`` is not ``0``, ``1``, or ``None`` for a
+        rank-2 input.
     """
     if array.dtype == wp.vec3:
         return cast(wp.vec3, sum(array, axis=axis)) / float(int(array.size))
@@ -372,11 +366,13 @@ def weighted_sum(
     Raises
     ------
     ValueError
-        If either array is empty or their lengths differ.
+        If either array is not rank-1, either is empty, or their lengths differ.
     RuntimeError
         If ``values`` and ``weights`` are not all on one device.
     """
     require_same_device(values=values, weights=weights)
+    if values.ndim != 1 or weights.ndim != 1:
+        raise ValueError("weighted_sum requires rank-1 values and weights arrays.")
     n_values = int(values.shape[0])
     n_weights = int(weights.shape[0])
     if n_values == 0 or n_weights == 0:
@@ -384,18 +380,12 @@ def weighted_sum(
     if n_values != n_weights:
         raise ValueError("weighted_sum requires values and weights of equal length.")
 
-    n_blocks = kernel_reduce.blocks_1d(n_values)
     if values.dtype == wp.vec3:
-        out_vec = wp.zeros(1, dtype=wp.vec3, device=values.device)
-        wp.launch_tiled(
-            kernel_reduce.weighted_sum_vec3_1d_tiled,
-            dim=[n_blocks],
-            inputs=[values, weights, out_vec],
-            block_dim=TILE_1D,
-            device=values.device,
+        return _launch_vec3_tiled_sum(
+            kernel_reduce.weighted_sum_vec3_1d_tiled, n_values, values.device, [values, weights]
         )
-        return out_vec.list()[0]
 
+    n_blocks = kernel_reduce.blocks_1d(n_values)
     out = wp.zeros(1, dtype=wp.float32, device=values.device)
     wp.launch_tiled(
         kernel_reduce.weighted_sum1d_tiled,
@@ -404,7 +394,7 @@ def weighted_sum(
         block_dim=TILE_1D,
         device=values.device,
     )
-    return float(out.numpy().item())
+    return float(read_scalar(out, 0))
 
 
 def all(array: wp.array[wp.bool], *, axis: Literal[0, 1] | None = None) -> wp.array[wp.bool] | bool:
@@ -587,13 +577,33 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
 # one dispatch table in the middle of the public surface.
 
 
+def _launch_vec3_tiled_sum(
+    kernel: wp.Kernel, n: int, device: wp.DeviceLike, inputs: list[wp.array]
+) -> wp.vec3:
+    """
+    Shared boilerplate behind ``sum``'s and ``weighted_sum``'s ``wp.vec3`` branches.
+
+    One tiled launch into a single-slot ``wp.vec3`` accumulator, one readback. ``inputs`` holds
+    the array arguments the reduction kernel expects before its own accumulator output.
+    """
+    out_vec = wp.zeros(1, dtype=wp.vec3, device=device)
+    wp.launch_tiled(
+        kernel,
+        dim=[kernel_reduce.blocks_1d(n)],
+        inputs=[*inputs, out_vec],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    return out_vec.list()[0]
+
+
 def _launch_global_vec3_minmax(array: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     """Component-wise corner pair of a ``wp.vec3`` array: one launch, one buffer, one readback."""
+    if int(array.ndim) != 1:
+        raise ValueError("minmax requires a rank-1 wp.vec3 array.")
     n = int(array.shape[0])
     if n == 0:
         raise ValueError("minmax requires a non-empty array.")
-    if int(array.ndim) != 1:
-        raise ValueError("minmax requires a rank-1 wp.vec3 array.")
     corners = wp.full(6, math.inf, dtype=wp.float32, device=array.device)
     wp.launch(
         kernel_reduce.minmax_vec3_chunked,
@@ -657,6 +667,10 @@ def _launch_global_scalar_tiled(
             device=array.device,
         )
 
+    # ``.item()``, not ``read_scalar`` -- ``out`` is already a single-slot array, so there is no
+    # whole-array copy to avoid, and unlike ``read_scalar`` (which hands back a numpy scalar; see
+    # its own docstring on wrapping with ``int()``/``float()``), ``.item()`` converts to the
+    # correct native Python type for whichever of ``int``/``float`` ``array.dtype`` is.
     out_np = out.numpy()
     if spec.global_output_slots == 2:
         return cast(tuple[int, int] | tuple[float, float], (out_np[0].item(), out_np[1].item()))
@@ -754,6 +768,8 @@ def _validate_scalar_array(
         raise ValueError(f"{spec.name} requires axis=None for a 1D array.")
     if array.ndim not in (1, 2):
         raise ValueError(f"{spec.name} requires a 1D or 2D array.")
+    if array.ndim == 2 and axis is not None and axis not in (0, 1):
+        raise ValueError(f"{spec.name} requires axis to be 0, 1, or None for a 2D array.")
 
 
 def _reduce_bool(
@@ -771,6 +787,8 @@ def _reduce_bool(
         n_rows, n_cols = int(array.shape[0]), int(array.shape[1])
         if axis is None:
             return _launch_global_bool_tiled(mask_i32.flatten(), spec)
+        if axis not in (0, 1):
+            raise ValueError(f"{spec.name} requires axis to be 0, 1, or None for a 2D array.")
         n_out, reduced = (n_rows, n_cols) if axis == 1 else (n_cols, n_rows)
         if reduced < TILE_1D:
             # Same rule as _launch_axis_scalar: below TILE_1D the tiled form only amplifies reads.
@@ -804,4 +822,4 @@ def _launch_global_bool_tiled(mask_i32: wp.array[wp.int32], spec: _BoolReduceSpe
         block_dim=TILE_1D,
         device=mask_i32.device,
     )
-    return bool(out.numpy().item() != 0)
+    return bool(int(read_scalar(out, 0)) != 0)

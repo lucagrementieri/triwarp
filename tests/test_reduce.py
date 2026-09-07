@@ -224,6 +224,22 @@ def test_sum_bool_1d_axis_raises(device: str) -> None:
         tw_reduce.sum(mask_wp, axis=0)
 
 
+def test_scalar_reduce_2d_invalid_axis_raises(device: str) -> None:
+    """An axis outside {0, 1, None} must raise rather than silently reading as axis=0."""
+    values_wp = wp.array([[1, 2], [3, 4]], dtype=wp.int32, device=device)
+    for fn in (tw_reduce.min, tw_reduce.max, tw_reduce.minmax, tw_reduce.sum):
+        with pytest.raises(ValueError, match="requires axis to be 0, 1, or None"):
+            fn(values_wp, axis=2)  # pyright: ignore[reportArgumentType]
+
+
+def test_bool_reduce_2d_invalid_axis_raises(device: str) -> None:
+    """Same invalid-axis contract as the scalar family, for ``any``/``all``."""
+    mask_wp = wp.array([[True, False], [False, True]], dtype=wp.bool, device=device)
+    for fn in (tw_reduce.any, tw_reduce.all):
+        with pytest.raises(ValueError, match="requires axis to be 0, 1, or None"):
+            fn(mask_wp, axis=2)  # pyright: ignore[reportArgumentType]
+
+
 @pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])
 def test_min_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
     rng = np.random.default_rng(99)
@@ -438,6 +454,14 @@ def test_weighted_sum_length_mismatch_raises(device: str) -> None:
     values_wp = wp.array([1.0, 2.0], dtype=wp.float32, device=device)
     weights_wp = wp.array([1.0], dtype=wp.float32, device=device)
     with pytest.raises(ValueError, match="equal length"):
+        tw_reduce.weighted_sum(values_wp, weights_wp)
+
+
+def test_weighted_sum_rank2_raises(device: str) -> None:
+    """A rank-2 argument must raise rather than silently reading its leading dimension."""
+    values_wp = wp.array([[1.0, 2.0]], dtype=wp.float32, device=device)
+    weights_wp = wp.array([1.0], dtype=wp.float32, device=device)
+    with pytest.raises(ValueError, match="requires rank-1"):
         tw_reduce.weighted_sum(values_wp, weights_wp)
 
 

@@ -334,9 +334,26 @@ def dihedral_angle(left_normal: Any, right_normal: Any, edge_vector: Any) -> wp.
 
 
 @wp.func
+def _circumdiameter_sq_from_sides(
+    a: Any, b: Any, c: Any, bc: wp.Float, ca: wp.Float, ab: wp.Float
+) -> wp.Float:
+    # Shared tail of circumcircle_diameter_sq and mincircle_diameter_sq once the caller's own
+    # degenerate-side dispatch has ruled out a repeated vertex: the squared circumdiameter from the
+    # three squared side lengths and the doubled-area cross product. Zero area (collinear, distinct
+    # vertices) means no circumcircle at all.
+    f = wp.length_sq(wp.cross(b - a, c - a))
+    if f <= type(ab)(0.0):
+        return float_inf(ab)
+    return ab * ca * bc / f
+
+
+@wp.func
 def circumcircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
     # Squared diameter of triangle ABC's circumcircle.
-    # A zero-length side collapses to the opposite side; zero area means no circumcircle at all.
+    # A zero-length side collapses to the opposite side -- this is the exact limit of the
+    # circumdiameter as that side shrinks to zero (the two endpoints coincide and the circumcircle
+    # degenerates to the segment to the third vertex), not a stand-in for "undefined"; only a
+    # zero-*area* triangle with distinct vertices has no circumcircle and returns float_inf.
     bc, ca, ab = squared_edge_lengths(a, b, c)
     zero = type(ab)(0.0)
     if ab <= zero:
@@ -345,10 +362,7 @@ def circumcircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
         return bc
     if bc <= zero:
         return ab
-    f = wp.length_sq(wp.cross(b - a, c - a))
-    if f <= zero:
-        return float_inf(ab)
-    return ab * ca * bc / f
+    return _circumdiameter_sq_from_sides(a, b, c, bc, ca, ab)
 
 
 @wp.func
@@ -380,10 +394,7 @@ def mincircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
         return bc
     if ab >= ca + bc:
         return ab
-    f = wp.length_sq(wp.cross(b - a, c - a))
-    if f <= type(ab)(0.0):
-        return float_inf(ab)
-    return ab * ca * bc / f
+    return _circumdiameter_sq_from_sides(a, b, c, bc, ca, ab)
 
 
 @wp.func
@@ -565,6 +576,44 @@ def plane_crossing_span(distance: wp.vec3d, coordinate: wp.vec3d) -> tuple[wp.bo
 
 
 @wp.func
+def _triangles_intersect_d(
+    da0: wp.vec3d, da1: wp.vec3d, da2: wp.vec3d, db0: wp.vec3d, db1: wp.vec3d, db2: wp.vec3d
+) -> wp.bool:
+    # Moller's interval test itself, taking the already-widened float64 corners. Split out of
+    # triangles_intersect so a caller that needs those corners afterward regardless of the verdict
+    # (triangle_triangle_distance_sq, which falls through to a float64 distance solve on a `False`)
+    # converts its six vertices once rather than once per call.
+    zero = wp.float64(0.0)
+
+    normal_a = wp.cross(da1 - da0, da2 - da0)
+    distance_b = wp.vec3d(
+        wp.dot(normal_a, db0 - da0), wp.dot(normal_a, db1 - da0), wp.dot(normal_a, db2 - da0)
+    )
+    # Entirely in one closed half-space of A's plane: separated, coplanar, or touching at most.
+    if wp.min(distance_b) >= zero or wp.max(distance_b) <= zero:
+        return False
+
+    normal_b = wp.cross(db1 - db0, db2 - db0)
+    distance_a = wp.vec3d(
+        wp.dot(normal_b, da0 - db0), wp.dot(normal_b, da1 - db0), wp.dot(normal_b, da2 - db0)
+    )
+    if wp.min(distance_a) >= zero or wp.max(distance_a) <= zero:
+        return False
+
+    # Both straddle, so the planes are neither parallel nor coincident and this cannot vanish.
+    direction = wp.cross(normal_a, normal_b)
+    valid_a, span_a = plane_crossing_span(
+        distance_a, wp.vec3d(wp.dot(direction, da0), wp.dot(direction, da1), wp.dot(direction, da2))
+    )
+    valid_b, span_b = plane_crossing_span(
+        distance_b, wp.vec3d(wp.dot(direction, db0), wp.dot(direction, db1), wp.dot(direction, db2))
+    )
+    if not valid_a or not valid_b:
+        return False
+    return span_a[0] <= span_b[1] and span_b[0] <= span_a[1]
+
+
+@wp.func
 def triangles_intersect(
     a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
 ) -> wp.bool:
@@ -603,40 +652,14 @@ def triangles_intersect(
     # phase is only 6-8 % of ``face_self_intersecting_mask``'s wall clock -- the BVH build, the
     # broad phase and the scan are the rest. That is the trade, and its docstring records what the
     # accuracy buys.
-    da0 = kernel_array.to_vec3d(a0)
-    da1 = kernel_array.to_vec3d(a1)
-    da2 = kernel_array.to_vec3d(a2)
-    db0 = kernel_array.to_vec3d(b0)
-    db1 = kernel_array.to_vec3d(b1)
-    db2 = kernel_array.to_vec3d(b2)
-    zero = wp.float64(0.0)
-
-    normal_a = wp.cross(da1 - da0, da2 - da0)
-    distance_b = wp.vec3d(
-        wp.dot(normal_a, db0 - da0), wp.dot(normal_a, db1 - da0), wp.dot(normal_a, db2 - da0)
+    return _triangles_intersect_d(
+        kernel_array.to_vec3d(a0),
+        kernel_array.to_vec3d(a1),
+        kernel_array.to_vec3d(a2),
+        kernel_array.to_vec3d(b0),
+        kernel_array.to_vec3d(b1),
+        kernel_array.to_vec3d(b2),
     )
-    # Entirely in one closed half-space of A's plane: separated, coplanar, or touching at most.
-    if wp.min(distance_b) >= zero or wp.max(distance_b) <= zero:
-        return False
-
-    normal_b = wp.cross(db1 - db0, db2 - db0)
-    distance_a = wp.vec3d(
-        wp.dot(normal_b, da0 - db0), wp.dot(normal_b, da1 - db0), wp.dot(normal_b, da2 - db0)
-    )
-    if wp.min(distance_a) >= zero or wp.max(distance_a) <= zero:
-        return False
-
-    # Both straddle, so the planes are neither parallel nor coincident and this cannot vanish.
-    direction = wp.cross(normal_a, normal_b)
-    valid_a, span_a = plane_crossing_span(
-        distance_a, wp.vec3d(wp.dot(direction, da0), wp.dot(direction, da1), wp.dot(direction, da2))
-    )
-    valid_b, span_b = plane_crossing_span(
-        distance_b, wp.vec3d(wp.dot(direction, db0), wp.dot(direction, db1), wp.dot(direction, db2))
-    )
-    if not valid_a or not valid_b:
-        return False
-    return span_a[0] <= span_b[1] and span_b[0] <= span_a[1]
 
 
 @wp.func
@@ -757,14 +780,25 @@ def triangle_triangle_distance_sq(
     # for the same reason: widening is lossless, and what the precision buys is the *decisions* --
     # here the region tests and the clamped parameter solves, each of which is a comparison of
     # differences of products.
-    if triangles_intersect(a0, a1, a2, b0, b1, b2):
-        return wp.float32(0.0)
+    #
+    # Converted once: calling ``triangles_intersect`` here would widen all six corners a second
+    # time on the common disjoint-triangle path (the intersection test itself already widens and
+    # discards its own copies), so the intersection test runs on these corners via
+    # ``_triangles_intersect_d`` instead of going through the ``wp.vec3``-taking wrapper. This is a
+    # duplication fix, not a measured speedup: min-of-30 timings of ``mesh_to_mesh_distance``'s own
+    # disjoint-heavy benchmark (bunny/bunny_decimated, near/far separations) before and after this
+    # change, each in its own process, land within ~1-3% of each other -- session-to-session noise
+    # (§15.7 of ``.claude/CLAUDE.md``), not a resolvable effect either way. The kernel's cost is the
+    # broad-phase BVH walk and the fifteen edge/point distance solves, not six scalar-to-scalar
+    # casts, so that null result is what the cost model predicts.
     p0 = kernel_array.to_vec3d(a0)
     p1 = kernel_array.to_vec3d(a1)
     p2 = kernel_array.to_vec3d(a2)
     q0 = kernel_array.to_vec3d(b0)
     q1 = kernel_array.to_vec3d(b1)
     q2 = kernel_array.to_vec3d(b2)
+    if _triangles_intersect_d(p0, p1, p2, q0, q1, q2):
+        return wp.float32(0.0)
 
     best = segment_segment_distance_sq(p0, p1, q0, q1)
     best = wp.min(best, segment_segment_distance_sq(p0, p1, q1, q2))
