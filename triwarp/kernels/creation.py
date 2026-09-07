@@ -2,9 +2,11 @@ import math
 
 import warp as wp
 
+from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import lift_vec2
+from triwarp.kernels.polyline import segment_displacement
 from triwarp.kernels.predicates import orient2d
-from triwarp.kernels.triangles import write_corner_triple
+from triwarp.kernels.triangles import write_corner_triple_reversible
 
 SQRT3 = wp.constant(wp.float32(math.sqrt(3.0)))
 PI_F = wp.constant(wp.float32(math.pi))
@@ -284,10 +286,7 @@ def revolve_cap_faces(
     a = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 0], n_slices, column, offsets, on_axis)
     b = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 1], n_slices, column, offsets, on_axis)
     c = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 2], n_slices, column, offsets, on_axis)
-    if reverse:
-        write_corner_triple(out_faces, t, c, b, a)
-    else:
-        write_corner_triple(out_faces, t, a, b, c)
+    write_corner_triple_reversible(out_faces, t, a, b, c, reverse)
 
 
 @wp.kernel
@@ -300,10 +299,7 @@ def offset_cap_faces(
     a = cap_faces[t * 3 + 0] + offset
     b = cap_faces[t * 3 + 1] + offset
     c = cap_faces[t * 3 + 2] + offset
-    if reverse:
-        write_corner_triple(out_faces, t, c, b, a)
-    else:
-        write_corner_triple(out_faces, t, a, b, c)
+    write_corner_triple_reversible(out_faces, t, a, b, c, reverse)
 
 
 @wp.kernel
@@ -341,7 +337,7 @@ def extrude_wall_faces(
 @wp.func
 def path_tangent(path: wp.array[wp.vec3], i: wp.int32) -> wp.vec3:
     # Unit vector of path segment i -> i + 1.
-    return wp.normalize(path[i + 1] - path[i])
+    return wp.normalize(segment_displacement(path, i))
 
 
 @wp.kernel
@@ -385,8 +381,19 @@ def sweep_transforms(
     # for a Z+ normal and needs no matrix inverse at runtime.
     i = wp.int32(wp.tid())
     normal = normals[i]
-    theta = wp.atan2(snap_spherical(normal[1]), snap_spherical(normal[0]))
-    phi = wp.acos(snap_spherical(normal[2]))
+    # A degenerate (near-zero) normal has no direction to convert -- ``sweep_plane_normals``'s own
+    # comment names the case, two consecutive path tangents cancelling at a sharp path reversal --
+    # so leave both angles at the Z+-identity zero rather than computing one, matching trimesh's
+    # ``vector_to_spherical`` (``unitize(..., check_valid=True)`` marks such a row invalid and its
+    # spherical angles stay at their zeroed default). Without this, ``wp.acos(0.0) == pi/2`` here
+    # would instead rotate local +Z onto +X -- an arbitrary ~90 degree twist, not the identity a
+    # degenerate plane should fall back to. Initialized before the branch, per the kernel-scope
+    # conditional-scoping rule.
+    theta = wp.float32(0.0)
+    phi = wp.float32(0.0)
+    if wp.length(normal) > TOLERANCE_ZERO_CONSTANT:
+        theta = wp.atan2(snap_spherical(normal[1]), snap_spherical(normal[0]))
+        phi = wp.acos(snap_spherical(normal[2]))
     cos_theta, sin_theta = wp.cos(theta), wp.sin(theta)
     cos_phi, sin_phi = wp.cos(phi), wp.sin(phi)
     cos_roll, sin_roll = wp.cos(angles[i]), wp.sin(angles[i])
@@ -461,10 +468,7 @@ def write_prism_face(
     # One triangle of a prism's 8-face template, offset into its own 6-vertex block. `flip`
     # reverses the winding for prisms whose source triangle faces the plane (trimesh's
     # ``f_seq[cross > 0] = np.fliplr(f)``).
-    if flip:
-        write_corner_triple(out_faces, slot, offset + c, offset + b, offset + a)
-    else:
-        write_corner_triple(out_faces, slot, offset + a, offset + b, offset + c)
+    write_corner_triple_reversible(out_faces, slot, offset + a, offset + b, offset + c, flip)
 
 
 @wp.kernel

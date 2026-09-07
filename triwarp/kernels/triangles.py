@@ -90,6 +90,27 @@ def write_corner_triple(
 
 
 @wp.func
+def write_corner_triple_reversible(
+    out: wp.array[wp.int32], row: wp.int32, a: wp.int32, b: wp.int32, c: wp.int32, reverse: wp.bool
+) -> None:
+    """
+    [`write_corner_triple`][triwarp.kernels.triangles.write_corner_triple], reversed by ``reverse``.
+
+    The one decision several face-emitting kernels share -- write a triple forward, or with its
+    first and last corners swapped (trimesh's ``np.fliplr``) -- factored once rather than repeated
+    at every call site that computes a per-face orientation flag
+    (``creation.revolve_cap_faces``/``offset_cap_faces``/``write_prism_face``). Still just
+    ``write_corner_triple`` under either branch, so this is not the permuted "reversed" sibling that
+    function's own docstring declines to add: the swap happens once here, at the one place a
+    *runtime* flag decides which of the two a caller wanted, not as a second three-atomic body.
+    """
+    if reverse:
+        write_corner_triple(out, row, c, b, a)
+    else:
+        write_corner_triple(out, row, a, b, c)
+
+
+@wp.func
 def face_vertices(
     vertices: wp.array[Any], faces: wp.array[wp.int32], face_index: wp.int32
 ) -> tuple[Any, Any, Any]:

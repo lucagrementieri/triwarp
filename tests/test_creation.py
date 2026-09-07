@@ -1310,6 +1310,11 @@ _SWEEP_PATHS = {
         )
     )
     * 2.0,
+    # Doubles back on itself at the middle vertex, so the two segment tangents there sum to the
+    # zero vector -- ``sweep_plane_normals``' own comment names this cancellation. Included so the
+    # degenerate-normal path always runs under the ordinary sweep suite, not only in the dedicated
+    # position regression below (which needs an asymmetric profile the square one here can't give).
+    "reversing": np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.5]]),
 }
 
 
@@ -1332,6 +1337,36 @@ def test_sweep_polygon(device: str, path_name: str) -> None:
     _assert_same_solid(vertices_wp, faces_wp, mesh_tm)
     _assert_closed(vertices_wp, faces_wp)
     assert warp_to_trimesh(vertices_wp, faces_wp).body_count == 1
+
+
+def test_sweep_polygon_reversing_path_matches_trimesh_at_the_reversal(device: str) -> None:
+    """
+    Regression: a sharp path reversal used to twist the cross-section ~90 degrees at that vertex.
+
+    ``sweep_plane_normals`` legitimately produces the exact zero vector at an interior vertex where
+    two consecutive path tangents cancel (the "reversing" path in ``_SWEEP_PATHS``, and the module's
+    own comment already names the case). ``sweep_transforms`` used to compute
+    ``phi = acos(0) == pi/2`` for that degenerate normal, where trimesh's ``vector_to_spherical``
+    (which the kernel's docstring says it is unrolled from) leaves a near-zero vector's angles at
+    their zero default instead — the identity mapping for local +Z, not a quarter turn about it.
+
+    ``test_sweep_polygon``'s volume-based Class C check cannot catch this: rotating a straight
+    prism's cross-section about its own axis doesn't change the swept volume, and that test's own
+    profile is a square, invariant under a 90 degree rotation in any case. This uses an asymmetric
+    rectangle instead, and matches by nearest point (Class B) since trimesh's ear-clipped caps use a
+    different, equally valid diagonal choice than triwarp's — only the *positions* are the shared
+    claim, and this profile has no interior cap point for that choice to add or move.
+    """
+    ring_np = np.array([[-0.5, -0.1], [0.5, -0.1], [0.5, 0.1], [-0.5, 0.1]])
+    path_np = _SWEEP_PATHS["reversing"]
+    vertices_wp, faces_wp = tw.creation.sweep_polygon(
+        points_to_warp_uv(ring_np, device), points_to_warp(path_np, device), cap=True, connect=False
+    )
+    mesh_tm = tm.creation.sweep_polygon(sg.Polygon(ring_np), path_np, cap=True, connect=False)
+    _assert_closed(vertices_wp, faces_wp)
+    assert int(vertices_wp.shape[0]) == mesh_tm.vertices.shape[0]
+    distance_np, _ = cKDTree(mesh_tm.vertices).query(vertices_wp.numpy().astype(np.float64))
+    assert distance_np.max() < 1e-4, f"vertices differ by up to {distance_np.max():.3e}"
 
 
 def test_sweep_polygon_angles_roll_the_profile(device: str) -> None:
