@@ -29,6 +29,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.halfedge import halfedge_twins, vertex_one_rings
 from triwarp.kernels import tangent_space as kernel_tangent_space
 
@@ -74,12 +75,18 @@ def vertex_tangent_frames(
     tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]]
         ``(basis_x, basis_y, normal)``, each ``(n_vertices,)`` on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``normals`` and ``rings`` are not all on one device.
+
     See Also
     --------
     [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]
     [`vertex_normals`][triwarp.vertices.vertex_normals] at ``weighting="angle"``
     [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]
     """
+    require_same_device(vertices=vertices, faces=faces, normals=normals, rings=rings)
     device = vertices.device
     n = int(vertices.shape[0])
     basis_x = wp.empty(n, dtype=wp.vec3, device=device)
@@ -134,12 +141,18 @@ def face_tangent_frames(
     tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]]
         ``(basis_x, basis_y, normal)``, each ``(n_faces,)`` on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``normals`` are not all on one device.
+
     See Also
     --------
     [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames]
     [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
     ``igl.local_basis``
     """
+    require_same_device(vertices=vertices, faces=faces, normals=normals)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     basis_x = wp.empty(n_faces, dtype=wp.vec3, device=device)
@@ -192,12 +205,18 @@ def halfedge_tangent_angles(
     wp.array[wp.float32]
         Length ``3 * n_faces`` angles in radians on ``vertices.device``, indexed by halfedge.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``face_angles`` and ``rings`` are not all on one device.
+
     See Also
     --------
     [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames]
     [`halfedge_transport_angles`][triwarp.tangent_space.halfedge_transport_angles]
     [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]
     """
+    require_same_device(vertices=vertices, faces=faces, face_angles=face_angles, rings=rings)
     device = vertices.device
     n = int(vertices.shape[0])
     n_halfedges = int(faces.shape[0]) // 3 * 3
@@ -263,11 +282,17 @@ def halfedge_transport_angles(
     wp.array[wp.float32]
         Length ``3 * n_faces`` rotations in radians on ``vertices.device``, indexed by halfedge.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``twins`` and ``tangent_angles`` are not all on one device.
+
     See Also
     --------
     [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]
     [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames]
     """
+    require_same_device(vertices=vertices, faces=faces, twins=twins, tangent_angles=tangent_angles)
     device = vertices.device
     n_halfedges = int(faces.shape[0]) // 3 * 3
     rho = wp.empty(n_halfedges, dtype=wp.float32, device=device)

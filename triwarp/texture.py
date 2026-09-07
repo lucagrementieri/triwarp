@@ -24,7 +24,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import texture as kernel_texture
 
@@ -64,11 +64,17 @@ def rasterize_attribute(
         corresponds to ``v = 1`` (vertical flip), matching the sampling convention of
         [`remap_attribute_from_uv`][triwarp.texture.remap_attribute_from_uv].
 
+    Raises
+    ------
+    RuntimeError
+        If ``uv``, ``faces`` and ``attribute`` are not all on one device.
+
     See Also
     --------
     [`remap_attribute_from_uv`][triwarp.texture.remap_attribute_from_uv]
     [`rasterize_discrete_attribute`][triwarp.texture.rasterize_discrete_attribute]
     """
+    require_same_device(uv=uv, faces=faces, attribute=attribute)
     twt.ensure_ndim(attribute, 2, dtype=wp.float32)
     n_channels = int(attribute.shape[1])
     _check_rasterize_inputs(uv, int(attribute.shape[0]), resolution)
@@ -122,12 +128,15 @@ def rasterize_discrete_attribute(
     ------
     ValueError
         If any entry of ``attribute`` is negative.
+    RuntimeError
+        If ``uv``, ``faces`` and ``attribute`` are not all on one device.
 
     See Also
     --------
     [`remap_discrete_attribute_from_uv`][triwarp.texture.remap_discrete_attribute_from_uv]
     [`rasterize_attribute`][triwarp.texture.rasterize_attribute]
     """
+    require_same_device(uv=uv, faces=faces, attribute=attribute)
     twt.ensure_ndim(attribute, 1, dtype=wp.int32)
     n_vertices = int(attribute.shape[0])
     _check_rasterize_inputs(uv, n_vertices, resolution)
@@ -247,11 +256,14 @@ def remap_attribute_from_uv(
     ------
     TypeError
         If ``image`` is neither rank 2 nor rank 3.
+    RuntimeError
+        If ``uv`` and ``image`` are not all on one device.
 
     See Also
     --------
     [`rasterize_attribute`][triwarp.texture.rasterize_attribute]
     """
+    require_same_device(uv=uv, image=image)
     if int(image.ndim) == 2:
         height, width = int(image.shape[0]), int(image.shape[1])
         n_channels = 1
@@ -314,11 +326,17 @@ def remap_discrete_attribute_from_uv(
         ``(n_vertices,)`` ``int32`` per-vertex labels on ``uv.device``. Non-finite-UV rows
         are ``-1``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``uv`` and ``class_image`` are not all on one device.
+
     See Also
     --------
     [`rasterize_discrete_attribute`][triwarp.texture.rasterize_discrete_attribute]
     [`remap_attribute_from_uv`][triwarp.texture.remap_attribute_from_uv]
     """
+    require_same_device(uv=uv, class_image=class_image)
     twt.ensure_ndim(class_image, 2, dtype=wp.int32)
     device = uv.device
     float_image = twt.as_array2d(tw.array.astype(class_image, wp.float32), wp.float32)

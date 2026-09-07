@@ -25,6 +25,7 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.kernels import parametrization as kernel_parametrization
 from triwarp.laplacian import cotmatrix, cotmatrix_entries, graph_laplacian, mass_matrix_entries
 
@@ -55,6 +56,11 @@ def face_flipped_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) ->
     wp.array[wp.bool]
         Length ``n_faces`` on ``vertices.device``. Empty for an empty mesh.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`face_flipped_indices`][triwarp.parametrization.face_flipped_indices]
@@ -73,6 +79,7 @@ def face_flipped_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) ->
     reversed to agree with its patch. A mesh can be consistently wound and still have flipped UVs,
     and vice versa.
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -112,11 +119,17 @@ def face_flipped_indices(
         Ascending face indices of the flipped triangles on ``vertices.device``. Empty when no
         triangle is flipped.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`face_flipped_mask`][triwarp.parametrization.face_flipped_mask]
     [`flatnonzero`][triwarp.array.flatnonzero]
     """
+    require_same_device(vertices=vertices, faces=faces)
     return tw.array.flatnonzero(face_flipped_mask(vertices, faces))
 
 
@@ -146,6 +159,11 @@ def map_vertices_to_circle(
     wp.array[wp.vec2]
         ``(n_boundary,)`` unit-circle positions on ``vertices.device``, aligned with ``boundary``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``boundary`` are not all on one device.
+
     Notes
     -----
     The name and the arc-length placement follow ``igl::map_vertices_to_circle``.
@@ -156,6 +174,7 @@ def map_vertices_to_circle(
     [`tutte`][triwarp.parametrization.tutte]
     [`harmonic`][triwarp.parametrization.harmonic]
     """
+    require_same_device(vertices=vertices, boundary=boundary)
     device = vertices.device
     n_boundary = int(boundary.shape[0])
     out_uv = wp.empty(n_boundary, dtype=wp.vec2, device=device)
@@ -222,6 +241,9 @@ def harmonic(
     ValueError
         If ``k < 1``, or if there are interior vertices but ``boundary_indices`` is empty (the
         Dirichlet system would be singular).
+    RuntimeError
+        If ``vertices``, ``faces``, ``boundary_indices`` and ``boundary_uv`` are not all on one
+        device.
 
     See Also
     --------
@@ -242,6 +264,9 @@ def harmonic(
     since squaring the operator squares its condition number. For ``k == 1`` a simple Jacobi
     preconditioner is used instead.
     """
+    require_same_device(
+        vertices=vertices, faces=faces, boundary_indices=boundary_indices, boundary_uv=boundary_uv
+    )
     if k < 1:
         raise ValueError(f"harmonic power k must be >= 1, got {k}.")
     device = vertices.device
@@ -298,6 +323,9 @@ def tutte(
     ------
     ValueError
         If ``k < 1``, or if there are interior vertices but ``boundary_indices`` is empty.
+    RuntimeError
+        If ``vertices``, ``faces``, ``boundary_indices`` and ``boundary_uv`` are not all on one
+        device.
 
     See Also
     --------
@@ -305,6 +333,9 @@ def tutte(
     [`graph_laplacian`][triwarp.laplacian.graph_laplacian]
     [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]
     """
+    require_same_device(
+        vertices=vertices, faces=faces, boundary_indices=boundary_indices, boundary_uv=boundary_uv
+    )
     if k < 1:
         raise ValueError(f"tutte power k must be >= 1, got {k}.")
     device = vertices.device
@@ -437,6 +468,9 @@ def arap(
     ValueError
         If ``max_iterations < 1``, if ``tolerance <= 0``, or if there are interior vertices but
         ``fixed_indices`` is empty.
+    RuntimeError
+        If ``vertices``, ``faces``, ``fixed_indices``, ``fixed_uv`` and ``uv_init`` are not all on
+        one device.
 
     See Also
     --------
@@ -468,6 +502,13 @@ def arap(
     going looser than the default risks the inner error exceeding the outer truncation error on
     large meshes, which is why ``1e-7`` rather than something looser is the default.
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        fixed_indices=fixed_indices,
+        fixed_uv=fixed_uv,
+        uv_init=uv_init,
+    )
     if max_iterations < 1:
         raise ValueError(f"arap max_iterations must be >= 1, got {max_iterations}.")
     if tolerance <= 0.0:
@@ -667,6 +708,8 @@ def lscm(
     ------
     ValueError
         If fewer than two vertices are pinned (and the mesh has at least two vertices).
+    RuntimeError
+        If ``vertices``, ``faces``, ``pinned_indices`` and ``pinned_uv`` are not all on one device.
 
     See Also
     --------
@@ -682,6 +725,9 @@ def lscm(
     ``Q`` of ``igl.lscm`` equals ``-repdiag(L, 2) - 2 A`` exactly (see
     [`lscm_hessian`][triwarp.energies.lscm_hessian]).
     """
+    require_same_device(
+        vertices=vertices, faces=faces, pinned_indices=pinned_indices, pinned_uv=pinned_uv
+    )
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0:

@@ -320,6 +320,11 @@ _WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
         "measurement stamp, same as the 1.15 entry above: the parametric-surface table names "
         "the Warp its numbers were taken on"
     ),
+    ("_device", "1.14"): (
+        "deliberate history: the version in which ``wp.launch`` stopped validating a "
+        "cross-device argument list (NVIDIA/warp GH-1461), which is why ``require_same_device`` "
+        "exists at all and does not move when the installed version does"
+    ),
 }
 
 # Directories check 9 scans, and the prefix each one's allowlist key carries. ``triwarp/`` keeps the

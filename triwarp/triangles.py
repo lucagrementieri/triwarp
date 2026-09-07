@@ -20,6 +20,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import triangles as kernel_triangles
 
@@ -45,11 +46,17 @@ def face_normals_and_areas(
     areas : wp.array[wp.float32]
         Length-``n_faces`` triangle areas on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`trimesh.Trimesh.face_normals`][]
     [`trimesh.Trimesh.area_faces`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     f = faces.shape[0] // 3
     out_normal = wp.empty(f, dtype=wp.vec3, device=vertices.device)
     out_area = wp.empty(f, dtype=wp.float32, device=vertices.device)
@@ -79,10 +86,16 @@ def face_angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> twt.A
         Shape ``(n_faces, 3)`` interior angles on ``vertices.device``, aligned with the
         corners ``(i0, i1, i2)`` of each face.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`trimesh.triangles.angles`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     f = faces.shape[0] // 3
     out_angle = twt.empty_2d((f, 3), wp.float32, device=vertices.device)
     wp.launch(
@@ -176,6 +189,9 @@ def corner_normals(
         [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when the mesh is **not edge-manifold**:
         rotating about a vertex is what this computes, and an edge with three faces has no rotation.
         Pass ``twins`` yourself if you have already resolved that.
+    RuntimeError
+        If ``vertices``, ``faces``, ``crease_edges``, ``twins``, ``face_normals`` and
+        ``face_areas`` are not all on one device.
 
     Examples
     --------
@@ -194,6 +210,14 @@ def corner_normals(
     [`crease_edges`][triwarp.seams.crease_edges]
         Produces the hard-edge set.
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        crease_edges=crease_edges,
+        twins=twins,
+        face_normals=face_normals,
+        face_areas=face_areas,
+    )
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -303,6 +327,8 @@ def face_quality(
     ------
     ValueError
         If ``metric`` is not one of the listed names.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -310,6 +336,7 @@ def face_quality(
     [`face_nondegenerate_mask`][triwarp.triangles.face_nondegenerate_mask]
     [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]
     """
+    require_same_device(vertices=vertices, faces=faces)
     if metric not in _QUALITY_METRICS:
         raise ValueError(f"unknown metric {metric!r}, expected one of {sorted(_QUALITY_METRICS)}")
     f = faces.shape[0] // 3
@@ -343,12 +370,18 @@ def face_centroids(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp
     wp.array[wp.vec3]
         ``(n_faces,)`` face barycentres on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`centroid`][triwarp.measures.surface_centroid]
     [`moments`][triwarp.measures.moments]
     ``igl.barycenter``
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_faces = int(faces.shape[0]) // 3
     out_centroids = wp.empty(n_faces, dtype=wp.vec3, device=vertices.device)
     if n_faces == 0:
@@ -395,6 +428,11 @@ def face_signed_volumes(
         ``(n_faces,)`` signed volumes on ``vertices.device``, in ``vertices``' scalar type. Empty
         when ``faces`` is empty.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`volume`][triwarp.measures.volume]
@@ -403,6 +441,7 @@ def face_signed_volumes(
         Whether that sum is a meaningful volume at all.
     [`face_centroids`][triwarp.triangles.face_centroids]
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
     scalar = wp.float64 if vertices.dtype is wp.vec3d else wp.float32
@@ -443,10 +482,16 @@ def face_nondegenerate_mask(
         Length-``n_faces`` mask on ``vertices.device``; ``True`` where the triangle area is
         non-zero.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`trimesh.triangles.nondegenerate`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     f = faces.shape[0] // 3
     out_nondegenerate = wp.empty(f, dtype=wp.bool, device=vertices.device)
     wp.launch(
@@ -483,10 +528,16 @@ def barycentric_to_points(
     wp.array[wp.vec3]
         Length-``n_faces`` Cartesian points on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``barycentric`` are not all on one device.
+
     See Also
     --------
     [`trimesh.triangles.barycentric_to_points`][]
     """
+    require_same_device(vertices=vertices, faces=faces, barycentric=barycentric)
     f = faces.shape[0] // 3
     out_points = wp.empty(f, dtype=wp.vec3, device=vertices.device)
     wp.launch(
@@ -529,10 +580,16 @@ def points_to_barycentric(
     wp.array[wp.vec3]
         Length-``n_faces`` barycentric coordinates ``(u, v, w)`` on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``points`` are not all on one device.
+
     See Also
     --------
     [`trimesh.triangles.points_to_barycentric`][]
     """
+    require_same_device(vertices=vertices, faces=faces, points=points)
     f = faces.shape[0] // 3
     out_barycentric = wp.empty(f, dtype=wp.vec3, device=vertices.device)
     kernel = (
@@ -572,10 +629,16 @@ def closest_point(
     wp.array[wp.vec3]
         Length-``n_faces`` closest points on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``points`` are not all on one device.
+
     See Also
     --------
     [`trimesh.triangles.closest_point`][]
     """
+    require_same_device(vertices=vertices, faces=faces, points=points)
     f = faces.shape[0] // 3
     out_closest = wp.empty(f, dtype=wp.vec3, device=vertices.device)
     wp.launch(

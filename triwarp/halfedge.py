@@ -18,7 +18,7 @@ from __future__ import annotations
 import warp as wp
 
 import triwarp as tw
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import halfedge as kernel_halfedge
 from triwarp.kernels import scatter as kernel_scatter
@@ -146,12 +146,15 @@ def vertex_one_rings(
         If a vertex's rotation closes before its whole fan is covered — a pinched,
         vertex-non-manifold vertex where two fans meet at a single index. Detecting this needs one
         4-byte readback, so this function always synchronizes once.
+    RuntimeError
+        If ``faces`` and ``twins`` are not all on one device.
 
     See Also
     --------
     [`halfedge_twins`][triwarp.halfedge.halfedge_twins]
     [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]
     """
+    require_same_device(faces=faces, twins=twins)
     device = faces.device
     n_halfedges = int(faces.shape[0]) // 3 * 3
 

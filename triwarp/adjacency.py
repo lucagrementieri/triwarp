@@ -27,6 +27,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT
 from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import array as kernel_array
@@ -96,6 +97,11 @@ def face_adjacency(
         shape ``(m, 2)`` with the sorted vertex pair for that shared edge (one row
         per adjacency pair, taken from the first matching edge row).
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``edges_sorted`` are not all on one device.
+
     Notes
     -----
     Duplicate-edge grouping uses
@@ -110,6 +116,7 @@ def face_adjacency(
     [`face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels]
     [`trimesh.graph.face_adjacency`][]
     """
+    require_same_device(faces=faces, edges_sorted=edges_sorted)
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -178,6 +185,8 @@ def require_paired_adjacency(
     ------
     ValueError
         If exactly one of the two is given.
+    RuntimeError
+        If ``face_adjacency`` and ``face_adjacency_edges`` are not all on one device.
 
     See Also
     --------
@@ -187,6 +196,7 @@ def require_paired_adjacency(
     [`face_adjacency_projections`][triwarp.adjacency.face_adjacency_projections]
     [`face_adjacency_convex`][triwarp.adjacency.face_adjacency_convex]
     """
+    require_same_device(face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges)
     if (face_adjacency is None) != (face_adjacency_edges is None):
         raise ValueError(
             "face_adjacency and face_adjacency_edges must both be provided or both omitted"
@@ -375,12 +385,17 @@ def face_adjacency_unshared(
     ValueError
         If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided,
         or if their row counts differ.
+    RuntimeError
+        If ``faces``, ``face_adjacency`` and ``face_adjacency_edges`` are not all on one device.
 
     See Also
     --------
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
     [`trimesh.graph.face_adjacency_unshared`][]
     """
+    require_same_device(
+        faces=faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
+    )
     # The derive branch below deliberately does *not* call face_adjacency, recovering both
     # owning faces and the shared edge from the grouped edge indices instead. Only the pairing
     # rule is shared with the other wrappers that take this pair.
@@ -451,6 +466,12 @@ def face_adjacency_angles(
         Length ``m`` unsigned angles in radians on ``faces.device``, one per
         ``face_adjacency`` row. Empty when there are no faces or no adjacency pairs.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``face_adjacency`` and ``face_normals`` are not all on one
+        device.
+
     See Also
     --------
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
@@ -459,6 +480,9 @@ def face_adjacency_angles(
     [`vector_angle`][triwarp.points.vector_angle]
     [`trimesh.Trimesh.face_adjacency_angles`][]
     """
+    require_same_device(
+        vertices=vertices, faces=faces, face_adjacency=face_adjacency, face_normals=face_normals
+    )
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -532,12 +556,23 @@ def face_adjacency_projections(
     ------
     ValueError
         If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided.
+    RuntimeError
+        If ``vertices``, ``faces``, ``face_adjacency``, ``face_adjacency_edges``,
+        ``face_adjacency_unshared`` and ``face_normals`` are not all on one device.
 
     See Also
     --------
     [`face_adjacency_convex`][triwarp.adjacency.face_adjacency_convex]
     [`trimesh.Trimesh.face_adjacency_projections`][]
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        face_adjacency=face_adjacency,
+        face_adjacency_edges=face_adjacency_edges,
+        face_adjacency_unshared=face_adjacency_unshared,
+        face_normals=face_normals,
+    )
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     # The pairing check runs *before* the empty-mesh guard, so a caller who passed only one half
@@ -630,12 +665,23 @@ def face_adjacency_convex(
     ------
     ValueError
         If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided.
+    RuntimeError
+        If ``vertices``, ``faces``, ``face_adjacency``, ``face_adjacency_edges``,
+        ``face_adjacency_unshared`` and ``face_normals`` are not all on one device.
 
     See Also
     --------
     [`face_adjacency_projections`][triwarp.adjacency.face_adjacency_projections]
     [`trimesh.Trimesh.face_adjacency_convex`][]
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        face_adjacency=face_adjacency,
+        face_adjacency_edges=face_adjacency_edges,
+        face_adjacency_unshared=face_adjacency_unshared,
+        face_normals=face_normals,
+    )
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     require_paired_adjacency(face_adjacency, face_adjacency_edges)

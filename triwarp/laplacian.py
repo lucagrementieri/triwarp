@@ -37,6 +37,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.constants import TOLERANCE_MOLLIFY
 from triwarp.edges import edges_unique, face_edge_lengths, faces_to_edges
 from triwarp.kernels import laplacian as kernel_laplacian
@@ -87,6 +88,12 @@ def face_gradients(
     wp.array[wp.vec3d]
         ``(n_faces,)`` gradient vectors on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``values``, ``face_normals`` and ``face_areas`` are not all on
+        one device.
+
     Notes
     -----
     ``igl.grad(V, F)`` is the same operator in *matrix* form, a sparse ``(3 * n_faces, n_vertices)``
@@ -101,6 +108,13 @@ def face_gradients(
     [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
     ``igl.grad``
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        values=values,
+        face_normals=face_normals,
+        face_areas=face_areas,
+    )
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     gradients = wp.empty(n_faces, dtype=wp.vec3d, device=device)
@@ -143,6 +157,11 @@ def cotmatrix_entries(
     twt.Array2dFloat
         Shape ``(n_faces, 3)`` on ``faces.device``. Empty ``(0, 3)`` when ``n_faces == 0``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`cotmatrix_entries_intrinsic`][triwarp.laplacian.cotmatrix_entries_intrinsic]
@@ -152,6 +171,7 @@ def cotmatrix_entries(
     -----
     Matches ``igl::cotmatrix_entries``, column order included.
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     if n_faces == 0:
@@ -247,6 +267,11 @@ def cotmatrix(
         Square ``(n_vertices, n_vertices)`` cotangent matrix in 1x1-block BSR form on
         ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``cot_entries`` are not all on one device.
+
     See Also
     --------
     [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]
@@ -261,6 +286,7 @@ def cotmatrix(
     -----
     Matches ``igl::cotmatrix``, sign convention included; asserted in ``tests/test_laplacian.py``.
     """
+    require_same_device(vertices=vertices, faces=faces, cot_entries=cot_entries)
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
@@ -344,6 +370,11 @@ def robust_laplacian(
         ``(n_vertices, n_vertices)`` cotangent stiffness matrix, in ``cotmatrix``'s sign convention
         (negative diagonal, so ``-L`` is positive semi-definite).
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay]
@@ -351,6 +382,7 @@ def robust_laplacian(
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`heat_geodesic`][triwarp.heat.heat_geodesic]
     """
+    require_same_device(vertices=vertices, faces=faces)
     if use_intrinsic_delaunay:
         intrinsic_faces, lengths, _ = tw.remesh.intrinsic_delaunay(vertices, faces, epsilon=epsilon)
     else:
@@ -396,12 +428,18 @@ def mollify_intrinsic(
         The constant added to every length. Reading it costs one host readback, and it is returned
         because it is the honest measure of how much the geometry had to be changed.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``edge_lengths`` are not all on one device.
+
     See Also
     --------
     [`robust_laplacian`][triwarp.laplacian.robust_laplacian]
     [`face_edge_lengths`][triwarp.edges.face_edge_lengths]
     [`cotmatrix_entries_intrinsic`][triwarp.laplacian.cotmatrix_entries_intrinsic]
     """
+    require_same_device(vertices=vertices, faces=faces, edge_lengths=edge_lengths)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -471,12 +509,21 @@ def connection_laplacian(
     warp.sparse.BsrMatrix
         ``(n_vertices, n_vertices)`` matrix of ``wp.mat22d`` blocks on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``cot_entries`` and ``transport_angles`` are not all on one
+        device.
+
     See Also
     --------
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`halfedge_transport_angles`][triwarp.tangent_space.halfedge_transport_angles]
     [`transport_tangent_vectors`][triwarp.heat.transport_tangent_vectors]
     """
+    require_same_device(
+        vertices=vertices, faces=faces, cot_entries=cot_entries, transport_angles=transport_angles
+    )
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
@@ -557,12 +604,18 @@ def laplacian_entries(
         ``(rows, cols, vals)`` on ``faces.device``. Length ``3 * n_faces`` for the directed case,
         ``2 * n_unique_edges`` for the symmetric case.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``edges`` are not all on one device.
+
     See Also
     --------
     [`laplacian`][triwarp.laplacian.laplacian]
     [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]
     [`edges_unique`][triwarp.edges.edges_unique]
     """
+    require_same_device(vertices=vertices, faces=faces, edges=edges)
     if symmetric is None:
         symmetric = not equal_weight
     device = faces.device
@@ -649,6 +702,11 @@ def laplacian(
         ``vertices.device``. Isolated vertices (empty rows) map to themselves under
         [`filter_laplacian`][triwarp.smoothing.filter_laplacian] et al.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``edges`` are not all on one device.
+
     See Also
     --------
     [`laplacian_entries`][triwarp.laplacian.laplacian_entries]
@@ -656,6 +714,7 @@ def laplacian(
     [`edges_unique`][triwarp.edges.edges_unique]
     [`trimesh.smoothing.laplacian_calculation`][]
     """
+    require_same_device(vertices=vertices, faces=faces, edges=edges)
     n_vertices = int(vertices.shape[0])
     device = vertices.device
     rows, cols, vals = laplacian_entries(
@@ -707,12 +766,18 @@ def graph_laplacian(
         Square ``(n_vertices, n_vertices)`` combinatorial Laplacian in 1x1-block BSR form on
         ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`laplacian`][triwarp.laplacian.laplacian]
     [`tutte`][triwarp.parametrization.tutte]
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
@@ -781,6 +846,11 @@ def mass_matrix_entries(
     twt.Array1dFloat
         Length-``n_vertices`` diagonal on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``face_areas`` are not all on one device.
+
     See Also
     --------
     [`mass_matrix`][triwarp.laplacian.mass_matrix]
@@ -790,6 +860,7 @@ def mass_matrix_entries(
     -----
     This is the diagonal of ``igl::massmatrix`` under ``MASSMATRIX_TYPE_BARYCENTRIC``.
     """
+    require_same_device(vertices=vertices, faces=faces, face_areas=face_areas)
     n_vertices = int(vertices.shape[0])
     device = vertices.device
     mass = wp.zeros(n_vertices, dtype=dtype, device=device)
@@ -838,6 +909,11 @@ def mass_matrix(
         Square ``(n_vertices, n_vertices)`` diagonal matrix in 1x1-block BSR form on
         ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``face_areas`` are not all on one device.
+
     See Also
     --------
     [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]
@@ -849,6 +925,7 @@ def mass_matrix(
     -----
     Matches ``igl::massmatrix`` under ``MASSMATRIX_TYPE_BARYCENTRIC``.
     """
+    require_same_device(vertices=vertices, faces=faces, face_areas=face_areas)
     return wps.bsr_diag(
         diag=mass_matrix_entries(vertices, faces, dtype=dtype, face_areas=face_areas)
     )

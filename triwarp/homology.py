@@ -26,7 +26,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import homology as kernel_homology
 from triwarp.kernels import scatter as kernel_scatter
@@ -69,6 +69,8 @@ def homology_generators(
     ValueError
         If the mesh has a boundary, since a surface with boundary has a different homology basis
         (every boundary loop contributes one, and the tree-cotree count no longer applies).
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -78,6 +80,7 @@ def homology_generators(
     [`euler_characteristic`][triwarp.measures.euler_characteristic]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = faces.device
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0:
@@ -167,6 +170,8 @@ def tree_cotree(
     ValueError
         If the mesh has a boundary (see
         [`homology_generators`][triwarp.homology.homology_generators]).
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -174,6 +179,7 @@ def tree_cotree(
     [`bfs`][triwarp.graph.bfs]
     [`edges_unique`][triwarp.edges.edges_unique]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = faces.device
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3

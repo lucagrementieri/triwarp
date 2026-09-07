@@ -33,7 +33,7 @@ import warp.optim.linear as wpl
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels import remesh as kernel_remesh
@@ -236,6 +236,8 @@ def triangulate_point_cloud(
     ValueError
         If both ``num_neighbours`` and ``radius`` are positive, or ``max_neighbours`` exceeds the
         compile-time cap.
+    RuntimeError
+        If ``points`` and ``normals`` are not all on one device.
 
     Notes
     -----
@@ -247,6 +249,7 @@ def triangulate_point_cloud(
     [`fill_min_weight`][triwarp.holes.fill_min_weight]
     [`triwarp.repair.remove_degenerate_faces`][]
     """
+    require_same_device(points=points, normals=normals)
     if num_neighbours > 0 and radius > 0.0:
         raise ValueError("pass at most one of num_neighbours and radius")
     if max_neighbours > kernel_reconstruction.MAX_NEIGHBOURS:
@@ -443,6 +446,8 @@ def screened_poisson(
     ------
     ValueError
         If ``points`` has fewer than 3 points, or the depth/scale parameters are out of range.
+    RuntimeError
+        If ``points`` and ``normals`` are not all on one device.
 
     See Also
     --------
@@ -474,6 +479,7 @@ def screened_poisson(
     ``point_weight=4`` is stable across runs and watertight. So ``0`` is for comparing *against* a
     screened reconstruction, not for producing one -- and do not pin a count taken from it.
     """
+    require_same_device(points=points, normals=normals)
     if not (3 <= full_depth <= depth <= 10):
         raise ValueError(
             "screened_poisson requires 3 <= full_depth <= depth <= 10, got "
@@ -1046,6 +1052,8 @@ def resample_uniform(
     ------
     ValueError
         If ``voxel_size`` is not positive.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -1060,6 +1068,7 @@ def resample_uniform(
     set is never clipped by the lattice boundary and the extracted surface is always closed. That
     padding is why the memory cost is a little above ``(extent / voxel_size) ** 3``.
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -1176,6 +1185,8 @@ def ball_pivoting(
     ------
     ValueError
         If fewer than 3 points are given.
+    RuntimeError
+        If ``points`` and ``normals`` are not all on one device.
 
     See Also
     --------
@@ -1218,6 +1229,7 @@ def ball_pivoting(
     ``crit_hole_length``); for an implicit surface that is watertight by construction use
     [`screened_poisson`][triwarp.reconstruction.screened_poisson].
     """
+    require_same_device(points=points, normals=normals)
     device = points.device
     n = int(points.shape[0])
     if n < 3:

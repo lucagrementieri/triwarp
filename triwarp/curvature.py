@@ -21,6 +21,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.kernels import curvature as kernel_curvature
 from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import scatter as kernel_scatter
@@ -76,12 +77,20 @@ def principal_curvature(
         the quadric fit failed (fewer than 6 neighbors or degenerate system) have zero
         directions and zero curvature values.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``face_normals`` and ``face_areas`` are not all on one device.
+
     Notes
     -----
     A failed fit is signalled by that all-zero output and nothing else -- there is no separate
     validity mask. The two states it conflates are a failed fit and a genuinely flat vertex, which
     is why the test is worth stating: ``PD1`` is zero only where the fit did not produce a frame.
     """
+    require_same_device(
+        vertices=vertices, faces=faces, face_normals=face_normals, face_areas=face_areas
+    )
     device = vertices.device
     n_vertices = int(vertices.shape[0])
 
@@ -167,6 +176,11 @@ def discrete_gaussian_curvature(
     wp.array[wp.float32]
         Length ``n`` discrete Gaussian curvature measure on ``points.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``points``, ``vertices``, ``faces`` and ``face_angles`` are not all on one device.
+
     See Also
     --------
     [`vertex_defects`][triwarp.vertices.vertex_defects]
@@ -176,6 +190,7 @@ def discrete_gaussian_curvature(
     [`discrete_mean_curvature`][triwarp.curvature.discrete_mean_curvature]
         The mean-curvature measure over the same ball.
     """
+    require_same_device(points=points, vertices=vertices, faces=faces, face_angles=face_angles)
     nearest_indices, _, nearest_offsets = tw.neighbors.query_ball_with_offsets(
         vertices, points, radius
     )
@@ -232,12 +247,22 @@ def discrete_mean_curvature(
     ------
     ValueError
         If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided.
+    RuntimeError
+        If ``points``, ``vertices``, ``faces``, ``face_adjacency`` and ``face_adjacency_edges`` are
+        not all on one device.
 
     See Also
     --------
     [`discrete_gaussian_curvature`][triwarp.curvature.discrete_gaussian_curvature]
     [`trimesh.curvature.discrete_mean_curvature_measure`][]
     """
+    require_same_device(
+        points=points,
+        vertices=vertices,
+        faces=faces,
+        face_adjacency=face_adjacency,
+        face_adjacency_edges=face_adjacency_edges,
+    )
     device = points.device
     n_points = int(points.shape[0])
     # The pairing check first, so a half-supplied pair raises whatever the mesh looks like; the

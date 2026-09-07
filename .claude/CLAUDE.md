@@ -961,9 +961,30 @@ Three things are still defects:
 
 ### 3.9 Device checks and the launch-device memory-safety rule
 
-**Do not check that input arrays share the same device.** Manual
-`if arr.device != device: raise ValueError(...)` guards are redundant, and §4.3 forbids a docstring
-documenting a `ValueError` for arrays "on different devices". Omit them entirely.
+**Every public function that accepts two or more device-bearing arguments calls
+`_device.require_same_device(**named)` as its first statement**, passing every array, mesh, BVH,
+hash grid, `wp.Volume` or list/tuple of those it received — including an `X | None = None`
+precomputed-cache argument; the helper skips `None` silently, so nothing is filtered beforehand.
+It raises `RuntimeError` (deliberately not `ValueError` — see the reasoning below) naming the two
+mismatched arguments and their devices. Document it with a `Raises` entry the same way a direct
+`raise` is documented (§4.3) — check 11 cannot see through the delegation, but a caller reading the
+docstring should not have to know that.
+
+This reverses what an earlier revision of this file said (*"do not check that input arrays share
+the same device"*), and the reversal is deliberate, not a relaxation of the reasoning that produced
+the original rule. That rule was correct for triwarp's own internal call sites: every kernel
+factory forwards `device=` from an input array (§2.1), the test harness runs under
+`LaunchArrayAccessMode.STRICT`, and an internal wrapper calling another triwarp wrapper already
+passes arrays it just validated or produced itself, so a repeated check there really was redundant.
+None of that holds for an external caller of the *public* API, who has no reason to know Warp has a
+device model at all and who can trivially construct a mismatch by accident — one mesh loaded from
+disk (landing on CPU) and one built with a GPU default. For that caller, the two ways a mismatch
+actually fails (below) are not a `ValueError` away; they are silent memory corruption or a bare
+segfault with no Python traceback. A cheap comparison of a handful of `.device` attributes, once,
+at the public boundary, converts an undebuggable native failure into an ordinary Python exception,
+for a cost (a dict of attribute reads) that is unmeasurable next to a single `wp.launch` (§13.1).
+**The rule is still "do not scatter ad hoc checks through internal helpers"** — it is now "the
+public boundary checks once, through one shared helper, and everything behind it stays trusting."
 
 **But do not believe that `wp.launch` raises on a device mismatch — it has not since Warp 1.14.**
 That release removed the unconditional same-device check (`NVIDIA/warp` GH-1461) so that
@@ -977,7 +998,7 @@ consequences are asymmetric and both are silent:
   the kernel is still running the heap is corrupted and the process aborts in `malloc` much later.
 - **CUDA arrays, CPU launch**: immediate `SIGSEGV`, no Python exception (GH-1693).
 
-Four consequences:
+Five consequences:
 
 - **`tests/conftest.py` sets `LaunchArrayAccessMode.STRICT`**, the only mode that rejects a *genuine*
   cross-device argument; `CHECKED` validates addressability, which HMM genuinely provides, so it
@@ -991,6 +1012,15 @@ Four consequences:
 - **`.numpy()` is not a sync on a CPU array.** On a CUDA array it synchronizes; on a host array it is
   a zero-copy view, so "I read the result and it was correct" proves nothing about whether the kernel
   finished.
+- **`require_same_device` raises `RuntimeError`, matching the exception type PyTorch raises for the
+  same class of mistake, deliberately with different, triwarp-specific wording** — PyTorch's own
+  message names tensors and an internal kernel-dispatch frame (`"Expected all tensors to be on the
+  same device, but found at least two devices, cuda:0 and cpu!"`); triwarp's names the caller's own
+  keyword-argument names and both devices, and suggests the fix (`"'a' is on cpu while 'c' is on
+  cuda:0. Move one onto the other's device ... before calling this function."`). `RuntimeError`
+  rather than `ValueError` because this is not a bad *value* in the NumPy sense (the arrays are each
+  perfectly valid on their own device) — it names the same failure class PyTorch, a library with the
+  same multi-device model, already reserves `RuntimeError` for.
 
 Full root-cause history, the free-while-in-flight measurements and the two bisection techniques that
 found them: §12.1.
@@ -1145,9 +1175,10 @@ found them: §12.1.
 ### 4.3 Docstring, signature and body must agree
 
 - A documented `Raises` must be reachable, and any function with a direct `raise` in its own body
-  needs a `Raises` block (check 11; the 42 functions that delegate validation to a shared guard and
-  document its `Raises` are correct and are not scanned). In particular §3.9 forbids device-mismatch
-  checks, so **no docstring may document a `ValueError` for arrays "on different devices"**.
+  needs a `Raises` block (check 11; the functions that delegate validation to a shared guard and
+  document its `Raises` are correct and are not scanned — the largest such family is every public
+  function with two or more device-bearing arguments, which documents
+  `_device.require_same_device`'s `RuntimeError` per §3.9).
 - A documented validation must actually be performed, or the claim goes.
 - Annotations must cover every rank and dtype the docstring claims and the body supports.
 - **When a comment and the body disagree, decide which one is load-bearing before "fixing" it — the

@@ -34,7 +34,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar, require_nonempty_mesh
+from triwarp._device import read_scalar, require_nonempty_mesh, require_same_device
 from triwarp.constants import INT32_MAX, INT64_MAX, TOLERANCE_MOLLIFY
 from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import array as kernel_array
@@ -176,6 +176,8 @@ def isotropic_remesh(
     ValueError
         If ``target_length`` is non-positive, a sizing field does not have one entry per vertex or
         holds a non-positive value, or ``max_deviation`` is non-positive.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``target_length`` are not all on one device.
 
     See Also
     --------
@@ -225,6 +227,7 @@ def isotropic_remesh(
     [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size] rather than a mode of this
     function.
     """
+    require_same_device(vertices=vertices, faces=faces, target_length=target_length)
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -980,6 +983,8 @@ def cluster_decimate(
     ------
     ValueError
         If ``voxel_size`` is not positive, or ``contraction`` is not one of the two names.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -1003,6 +1008,7 @@ def cluster_decimate(
     today's vertex order would need a restoring sort that gives back most of any gain, and it is not
     worth changing the public output convention for what remains.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if contraction not in ("average", "closest"):
         raise ValueError(f"contraction must be 'average' or 'closest', got {contraction!r}")
 
@@ -1187,6 +1193,8 @@ def quadric_decimate(
     ValueError
         If neither or both of ``target_faces`` / ``target_ratio`` is given, ``target_faces`` is
         negative, or ``target_ratio`` is outside ``(0, 1]``.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -1255,6 +1263,7 @@ def quadric_decimate(
       deviation is far more stable. Compare a change to this function on the mean, or on many
       repeats.
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_faces = int(faces.shape[0]) // 3
     target = _resolve_decimation_target(target_faces, target_ratio, n_faces)
 
@@ -1967,6 +1976,8 @@ def flip_to_delaunay(
     ------
     ValueError
         If ``region`` is given and is not length ``n_faces``.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``region`` are not all on one device.
 
     See Also
     --------
@@ -1977,6 +1988,7 @@ def flip_to_delaunay(
     [`delaunay_triangulation`][triwarp.reconstruction.delaunay_triangulation]
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
     """
+    require_same_device(vertices=vertices, faces=faces, region=region)
     device = faces.device
     setup = _flip_setup(faces, region)
     if setup is None:
@@ -2090,6 +2102,8 @@ def flip_by_objective(
     ValueError
         If ``objective`` or ``metric`` is unknown, ``planar_angle`` is outside ``[0, 180]``, or
         ``region`` has the wrong length.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``region`` are not all on one device.
 
     See Also
     --------
@@ -2104,6 +2118,7 @@ def flip_by_objective(
     rather than merely tie it. That margin is what makes ``max_iter`` a safety net rather than the
     normal stopping condition.
     """
+    require_same_device(vertices=vertices, faces=faces, region=region)
     if objective not in ("planarity", "curvature", "t_vertex"):
         raise ValueError(
             f"objective must be 'planarity', 'curvature' or 't_vertex', got {objective!r}"
@@ -2246,6 +2261,11 @@ def intrinsic_delaunay(
     n_flips : int
         How many edges were flipped. Zero means the input was already intrinsically Delaunay.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     Notes
     -----
     A flip that would duplicate an existing edge is skipped rather than allowed to create a
@@ -2269,6 +2289,7 @@ def intrinsic_delaunay(
     [`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic]
     [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -2364,10 +2385,16 @@ def subdivide(
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
         ``(new_vertices, new_faces)`` on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`trimesh.remesh.subdivide`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
 
@@ -2457,6 +2484,11 @@ def subdivide_loop(
         ``float32`` matrix of Loop weights, one row per output vertex in the same layout as
         ``new_vertices``. Every row sums to 1.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     Notes
     -----
     **Why an operator rather than an index map.** Every other topology edit here reports provenance
@@ -2488,6 +2520,7 @@ def subdivide_loop(
     [`subdivide_to_size`][triwarp.remesh.subdivide_to_size]
     ``igl.loop``
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -2728,12 +2761,15 @@ def subdivide_to_size(
     ------
     ValueError
         If any edge is still longer than ``max_edge`` after ``max_iter`` passes.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``max_edge`` are not all on one device.
 
     See Also
     --------
     [`subdivide`][triwarp.remesh.subdivide]
     [`trimesh.remesh.subdivide_to_size`][]
     """
+    require_same_device(vertices=vertices, faces=faces, max_edge=max_edge)
     device = vertices.device
     sizing = max_edge if isinstance(max_edge, wp.array) else None
     max_edge_f = wp.float32(0.0) if sizing is not None else wp.float32(max_edge)
@@ -2906,6 +2942,8 @@ def subdivide_region_to_size(
     ValueError
         If ``region`` length does not match the face count, or if over-long region edges remain
         after ``max_iter`` passes and ``max_splits`` is ``None``.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``region`` are not all on one device.
 
     See Also
     --------
@@ -2913,6 +2951,7 @@ def subdivide_region_to_size(
     [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
     [`fill_smooth`][triwarp.holes.fill_smooth]
     """
+    require_same_device(vertices=vertices, faces=faces, region=region)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if int(region.shape[0]) != n_faces:
@@ -3109,6 +3148,8 @@ def refine_region_to_density(
     ------
     ValueError
         If ``region`` length does not match the face count.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``region`` are not all on one device.
 
     See Also
     --------
@@ -3128,6 +3169,7 @@ def refine_region_to_density(
     carries the surrounding sampling inward across the patch instead of being re-measured from the
     increasingly fine triangles it is producing, which would never converge.
     """
+    require_same_device(vertices=vertices, faces=faces, region=region)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if int(region.shape[0]) != n_faces:
@@ -3348,6 +3390,9 @@ def split_edges(
     ValueError
         If ``split_mask`` does not have one entry per unique edge, ``split_positions`` does not have
         one entry per flagged edge, or ``index`` does not have one entry per face.
+    RuntimeError
+        If ``vertices``, ``faces``, ``split_mask``, ``split_positions``, ``unique_edges``,
+        ``inverse`` and ``index`` are not all on one device.
 
     See Also
     --------
@@ -3369,6 +3414,15 @@ def split_edges(
     print(int(fine_f.shape[0]) // 3 == 4 * (int(f.shape[0]) // 3))
     ```
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        split_mask=split_mask,
+        split_positions=split_positions,
+        unique_edges=unique_edges,
+        inverse=inverse,
+        index=index,
+    )
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3

@@ -60,7 +60,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import slice_count
+from triwarp._device import require_same_device, slice_count
 from triwarp.constants import TILE_1D, TOLERANCE_ZERO
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import points as kernel_points
@@ -309,7 +309,13 @@ def centered_covariance(
     wp.array[wp.mat33]
         Shape ``(1,)`` device array holding the centered ``3x3`` scatter matrix
         on ``points.device``. All-zeros when ``points`` is empty.
+
+    Raises
+    ------
+    RuntimeError
+        If ``points`` and ``center`` are not all on one device.
     """
+    require_same_device(points=points, center=center)
     device = points.device
     n = int(points.shape[0])
     out = wp.zeros(1, dtype=wp.mat33, device=device)
@@ -561,12 +567,15 @@ def estimate_normals(
     ValueError
         If both ``orient_reference`` and ``camera_location`` are given, or if ``neighbor_idx`` does
         not have one row per point.
+    RuntimeError
+        If ``points`` and ``neighbor_idx`` are not all on one device.
 
     See Also
     --------
     [`triwarp.points.fit_plane`][triwarp.points.fit_plane]
     [`triwarp.reconstruction.triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
     """
+    require_same_device(points=points, neighbor_idx=neighbor_idx)
     if orient_reference is not None and camera_location is not None:
         raise ValueError("pass at most one of orient_reference and camera_location")
 
@@ -657,6 +666,8 @@ def outlier_probability(
     ------
     ValueError
         If ``scale <= 0``, or the two tables disagree in shape.
+    RuntimeError
+        If ``neighbor_idx`` and ``neighbor_distance`` are not all on one device.
 
     See Also
     --------
@@ -664,6 +675,7 @@ def outlier_probability(
     [`estimate_normals`][triwarp.points.estimate_normals]
     [`triwarp.neighbors.query_nearest`][triwarp.neighbors.query_nearest]
     """
+    require_same_device(neighbor_idx=neighbor_idx, neighbor_distance=neighbor_distance)
     twt.ensure_ndim(neighbor_idx, 2, dtype=wp.int32)
     twt.ensure_ndim(neighbor_distance, 2, dtype=wp.float32)
     if neighbor_idx.shape != neighbor_distance.shape:
@@ -838,6 +850,8 @@ def radius_outlier_mask(
     ------
     ValueError
         If ``radius <= 0`` or ``min_neighbors < 1``.
+    RuntimeError
+        If ``points`` and ``grid`` are not all on one device.
 
     Notes
     -----
@@ -862,6 +876,7 @@ def radius_outlier_mask(
     [`outlier_probability`][triwarp.points.outlier_probability]
     [`triwarp.neighbors.query_ball_count`][triwarp.neighbors.query_ball_count]
     """
+    require_same_device(points=points, grid=grid)
     if radius <= 0.0:
         raise ValueError(f"radius must be > 0, got {radius}")
     if min_neighbors < 1:
@@ -1406,11 +1421,14 @@ def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.floa
     ------
     ValueError
         If ``a`` and ``b`` have different lengths.
+    RuntimeError
+        If ``a`` and ``b`` are not all on one device.
 
     See Also
     --------
     [`trimesh.geometry.vector_angle`][]
     """
+    require_same_device(a=a, b=b)
     device = a.device
     n = int(a.shape[0])
     if n != int(b.shape[0]):

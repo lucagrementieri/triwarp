@@ -78,7 +78,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces, unique_rows
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import bounds as kernel_bounds
@@ -189,6 +189,8 @@ def make_solid(
     ------
     ValueError
         If ``max_iter`` or ``inner_iter`` is negative.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -200,6 +202,7 @@ def make_solid(
     [`make_normals_outward`][triwarp.repair.make_normals_outward]
         What to run afterwards if the winding has to face outward as well as be consistent.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if max_iter < 0 or inner_iter < 0:
         raise ValueError(
             f"max_iter and inner_iter must be non-negative, got {max_iter}, {inner_iter}"
@@ -284,7 +287,13 @@ def remove_unreferenced_vertices(
         Length ``n_vertices`` old-to-new map (``-1`` when unreferenced).
     inverse : wp.array[wp.int32], optional
         Present when ``return_inverse=True``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = faces.device
     n_vertices = int(vertices.shape[0])
 
@@ -342,6 +351,11 @@ def remove_duplicated_vertices(
     unique_faces : wp.array[wp.int32]
         Face buffer with indices remapped into ``unique_vertices``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     Notes
     -----
     Both tolerance modes quantize positions and group by cell, so both separate a pair straddling a
@@ -362,6 +376,7 @@ def remove_duplicated_vertices(
     [`duplicate_vertex_inverse`][triwarp.repair.duplicate_vertex_inverse]
     [`hash_vector_rows`][triwarp.grouping.hash_vector_rows]
     """
+    require_same_device(vertices=vertices, faces=faces)
     inverse = duplicate_vertex_inverse(vertices, epsilon)
     # No ``n_unique`` to pass: ``duplicate_vertex_inverse`` discards the unique array internally,
     # so the class count genuinely is not available here and the reduction is the only way to it.
@@ -555,12 +570,18 @@ def remove_degenerate_faces(
     new_faces : wp.array[wp.int32]
         Flat buffer of the non-degenerate faces, remapped into ``new_vertices``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles]
     [`face_nondegenerate_mask`][triwarp.triangles.face_nondegenerate_mask]
     [`trimesh.triangles.nondegenerate`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.clone(vertices), wp.clone(faces)
@@ -595,11 +616,17 @@ def remove_non_manifold_faces(
     new_faces : wp.array[wp.int32]
         Flat buffer of the surviving (edge-manifold, up to ``max_iter`` passes) faces.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
     [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]
     """
+    require_same_device(vertices=vertices, faces=faces)
     for _ in range(max_iter):
         n_faces = int(faces.shape[0]) // 3
         if n_faces == 0:
@@ -673,6 +700,8 @@ def remove_small_components(
     ------
     ValueError
         If no criterion is given, or if more than one is.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -692,6 +721,7 @@ def remove_small_components(
     That is deliberate: densifying the labels first would cost a sort and a search per face to save
     an allocation, and it is the allocation that is cheap.
     """
+    require_same_device(vertices=vertices, faces=faces)
     given = (keep_largest, min_faces is not None, min_area is not None, min_diameter is not None)
     if sum(given) != 1:
         raise ValueError(
@@ -816,6 +846,11 @@ def split_non_manifold_vertices(
         ``new_vertices == vertices[source]`` and a per-vertex attribute transfers with
         [`gather`][triwarp.array.gather]. This is ``igl.split_nonmanifold``'s ``SVI``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     Notes
     -----
     Vertices unreferenced by any face are **dropped**, since a new vertex only exists as some face's
@@ -857,6 +892,7 @@ def split_non_manifold_vertices(
     [`is_edge_manifold`][triwarp.validation.is_edge_manifold]
     ``igl.split_nonmanifold``
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -939,6 +975,11 @@ def collapse_small_triangles(
     new_faces : wp.array[wp.int32]
         Flat buffer of the surviving faces, remapped into ``new_vertices``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
@@ -957,6 +998,7 @@ def collapse_small_triangles(
     The bounding-box diagonal is measured once on the input ``vertices`` so the threshold is fixed
     across iterations.
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0 or int(vertices.shape[0]) == 0:
@@ -1065,6 +1107,8 @@ def straighten_boundary(
     ValueError
         If ``iterations`` is negative, or propagated from
         [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when the mesh is not edge-manifold.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -1075,6 +1119,7 @@ def straighten_boundary(
         notch cuts in.
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
+    require_same_device(vertices=vertices, faces=faces)
     if iterations < 0:
         raise ValueError(f"iterations must be non-negative, got {iterations}")
     device = faces.device
@@ -1189,6 +1234,8 @@ def remove_degree3_vertices(
     ValueError
         If ``max_iter`` is negative, or propagated from
         [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when the mesh is not edge-manifold.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -1202,6 +1249,7 @@ def remove_degree3_vertices(
     [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]
         The fan this walks.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if max_iter < 0:
         raise ValueError(f"max_iter must be non-negative, got {max_iter}")
     device = faces.device
@@ -1311,6 +1359,8 @@ def flatten_degree3_vertices(
     ValueError
         If ``region`` is not a length-``n_vertices`` ``wp.bool`` array, or propagated from
         [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when the mesh is not edge-manifold.
+    RuntimeError
+        If ``vertices``, ``faces``, ``region`` and ``rings`` are not all on one device.
 
     See Also
     --------
@@ -1319,6 +1369,7 @@ def flatten_degree3_vertices(
     [`equalize_triangle_areas`][triwarp.smoothing.equalize_triangle_areas]
         Relaxes every vertex toward an area objective, where this hard-sets only the valence-3 ones.
     """
+    require_same_device(vertices=vertices, faces=faces, region=region, rings=rings)
     device = faces.device
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0:
@@ -1491,6 +1542,11 @@ def make_volume(
         New flat face buffer with outward-oriented normals, on ``faces.device``. Vertices are
         unchanged.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`is_volume`][triwarp.validation.is_volume]
@@ -1510,6 +1566,7 @@ def make_volume(
     [`make_normals_outward`][triwarp.repair.make_normals_outward]) and reserve ``multibody``
     for meshes whose bodies are individually closed.
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     if n_faces == 0:
@@ -1586,12 +1643,18 @@ def make_normals_outward(
         New flat face buffer with consistent winding and outward normals, on ``faces.device``.
         Vertices are unchanged.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
     [`make_volume`][triwarp.repair.make_volume]
     [`is_volume`][triwarp.validation.is_volume]
     """
+    require_same_device(vertices=vertices, faces=faces)
     wound = make_winding_consistent(faces)
     return make_volume(vertices, wound, multibody=multibody)
 
@@ -1625,6 +1688,11 @@ def remove_folded_faces(
     new_faces : wp.array[wp.int32]
         Flat buffer of the kept faces, remapped into ``new_vertices``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`validation.face_defective_mask`][triwarp.validation.face_defective_mask]
@@ -1640,6 +1708,7 @@ def remove_folded_faces(
     [`remove_non_manifold_faces`][triwarp.repair.remove_non_manifold_faces]), and it leaves a hole
     that [`triwarp.holes`][triwarp.holes] can retriangulate properly.
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.clone(vertices), wp.clone(faces)
@@ -1704,6 +1773,8 @@ def fix_self_intersections(
     ValueError
         If ``method`` is not ``"local"`` or ``"voxel"``, ``max_expand`` is negative, or ``max_iter``
         is less than 1.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     Examples
     --------
@@ -1754,6 +1825,7 @@ def fix_self_intersections(
     [`triwarp.levelset.offset_mesh`][triwarp.levelset.offset_mesh]
         The same level-set machinery at a non-zero distance.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if method not in ("local", "voxel"):
         raise ValueError(f"method must be 'local' or 'voxel', got {method!r}")
     if max_expand < 0:
@@ -1927,6 +1999,8 @@ def remove_tunnels(
     ValueError
         If ``max_length`` is negative, or the mesh has a boundary (a surface with boundary has a
         different homology basis, so "tunnel" is not defined by this test).
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -1936,6 +2010,7 @@ def remove_tunnels(
     [`fix_self_intersections`][triwarp.repair.fix_self_intersections]
         The other topological repair here: that one removes crossings, this one removes genus.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if max_length < 0.0:
         raise ValueError(f"max_length must be non-negative, got {max_length}")
     device = faces.device
@@ -2039,6 +2114,11 @@ def flip_t_vertices(
         Flat face buffer with the slivers re-triangulated, on ``faces.device`` (a copy; the input is
         not modified).
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`triwarp.remesh.flip_by_objective`][triwarp.remesh.flip_by_objective]
@@ -2052,6 +2132,7 @@ def flip_t_vertices(
     here the equivalent is [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles],
     which removes the sliver by merging its short edge instead.
     """
+    require_same_device(vertices=vertices, faces=faces)
     return tw.remesh.flip_by_objective(
         vertices, faces, objective="t_vertex", aspect_threshold=threshold, max_iter=max_iter
     )

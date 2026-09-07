@@ -53,7 +53,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.edges import edges_unique, edges_unique_length
 from triwarp.kernels import energies as kernel_energies
 from triwarp.kernels import predicates as kernel_predicates
@@ -85,6 +85,11 @@ def edge_length_loss(
     float
         The mean, as a host scalar. ``0.0`` for a mesh with no edges.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`normal_consistency_loss`][triwarp.energies.normal_consistency_loss]
@@ -99,6 +104,7 @@ def edge_length_loss(
     Matches ``pytorch3d.loss.mesh_edge_loss``. Its per-mesh ``1 / E`` weighting collapses to a
     plain mean for one mesh, which is triwarp's only case, so there is no batch weighting to port.
     """
+    require_same_device(vertices=vertices, faces=faces)
     lengths = edges_unique_length(vertices, faces)
     if int(lengths.shape[0]) == 0:
         return 0.0
@@ -128,6 +134,11 @@ def normal_consistency_loss(vertices: wp.array[wp.vec3], faces: wp.array[wp.int3
     float
         The mean, as a host scalar. ``0.0`` for a mesh with no adjacent face pair.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`edge_length_loss`][triwarp.energies.edge_length_loss]
@@ -143,6 +154,7 @@ def normal_consistency_loss(vertices: wp.array[wp.vec3], faces: wp.array[wp.int3
     [`face_adjacency_angles`][triwarp.adjacency.face_adjacency_angles] reports one pair per
     adjacency. The two coincide exactly wherever every edge has at most two faces.
     """
+    require_same_device(vertices=vertices, faces=faces)
     angles = tw.adjacency.face_adjacency_angles(vertices, faces)
     if int(angles.shape[0]) == 0:
         return 0.0
@@ -190,6 +202,8 @@ def laplacian_smoothing_loss(
     ------
     ValueError
         If ``method`` is not one of ``"uniform"``, ``"cot"`` or ``"cotcurv"``.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -210,6 +224,7 @@ def laplacian_smoothing_loss(
     both ratios above -- and where a vertex's row sum is not positive its averaging is undefined,
     so ``"cot"`` falls back to ``|| v_i ||`` there, matching the reference's ``norm_w = 0`` branch.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if method not in ("uniform", "cot", "cotcurv"):
         raise ValueError(f'method must be "uniform", "cot" or "cotcurv", got {method!r}')
     n_vertices = int(vertices.shape[0])
@@ -309,6 +324,8 @@ def k_harmonic(
     ------
     ValueError
         If ``k < 1``.
+    RuntimeError
+        If ``laplacian`` and ``mass`` are not on the same device.
 
     See Also
     --------
@@ -317,6 +334,7 @@ def k_harmonic(
     [`hessian_energy`][triwarp.energies.hessian_energy]
     [`harmonic`][triwarp.parametrization.harmonic]
     """
+    require_same_device(laplacian=laplacian, mass=mass)
     if k < 1:
         raise ValueError(f"harmonic power k must be >= 1, got {k}.")
     negated = wps.bsr_axpy(x=laplacian, alpha=-1.0)
@@ -436,6 +454,11 @@ def hessian_energy(
         Square ``(n_vertices, n_vertices)`` positive semi-definite energy matrix on
         ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``vertex_faces`` are not all on one device.
+
     See Also
     --------
     [`curved_hessian_energy`][triwarp.energies.curved_hessian_energy]
@@ -447,6 +470,7 @@ def hessian_energy(
     Matches ``igl::hessian_energy`` except on degenerate faces, which contribute nothing here and
     ``NaN`` there.
     """
+    require_same_device(vertices=vertices, faces=faces, vertex_faces=vertex_faces)
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
@@ -555,12 +579,18 @@ def curved_hessian_energy(
         Square ``(n_vertices, n_vertices)`` positive semi-definite energy matrix on
         ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`hessian_energy`][triwarp.energies.hessian_energy]
     [`crouzeix_raviart_cotmatrix`][triwarp.energies.crouzeix_raviart_cotmatrix]
     [`vertex_defects`][triwarp.vertices.vertex_defects]
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
@@ -681,6 +711,9 @@ def crouzeix_raviart_cotmatrix(
     ------
     ValueError
         If exactly one of ``unique_edges`` / ``edge_map`` is provided.
+    RuntimeError
+        If ``vertices``, ``faces``, ``cot_entries``, ``unique_edges`` and ``edge_map`` are not all
+        on one device.
 
     See Also
     --------
@@ -693,6 +726,13 @@ def crouzeix_raviart_cotmatrix(
     Matches ``igl::crouzeix_raviart_cotmatrix`` up to the edge numbering, which follows
     [`edges_unique`][triwarp.edges.edges_unique] rather than ``igl::unique_edge_map``.
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        cot_entries=cot_entries,
+        unique_edges=unique_edges,
+        edge_map=edge_map,
+    )
     unique_edges, edge_map = _edge_numbering(vertices, faces, unique_edges, edge_map)
     n_edges = int(unique_edges.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -752,6 +792,8 @@ def crouzeix_raviart_massmatrix(
     ------
     ValueError
         If exactly one of ``unique_edges`` / ``edge_map`` is provided.
+    RuntimeError
+        If ``vertices``, ``faces``, ``unique_edges`` and ``edge_map`` are not all on one device.
 
     See Also
     --------
@@ -763,6 +805,9 @@ def crouzeix_raviart_massmatrix(
     -----
     Matches ``igl::crouzeix_raviart_massmatrix`` up to the edge numbering, as above.
     """
+    require_same_device(
+        vertices=vertices, faces=faces, unique_edges=unique_edges, edge_map=edge_map
+    )
     unique_edges, edge_map = _edge_numbering(vertices, faces, unique_edges, edge_map)
     n_edges = int(unique_edges.shape[0])
 
@@ -822,6 +867,11 @@ def lscm_hessian(
     warp.sparse.BsrMatrix
         Square ``(2n, 2n)`` float64 matrix in 1x1-block BSR form on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`lscm`][triwarp.parametrization.lscm]
@@ -832,6 +882,7 @@ def lscm_hessian(
     -----
     Matches ``igl::lscm_hessian``.
     """
+    require_same_device(vertices=vertices, faces=faces)
     n = int(vertices.shape[0])
     device = vertices.device
     laplacian = cotmatrix(vertices, faces, dtype=wp.float64)
@@ -896,6 +947,11 @@ def vector_area_matrix(
     warp.sparse.BsrMatrix
         Square ``(2n, 2n)`` float64 matrix in 1x1-block BSR form on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`lscm_hessian`][triwarp.energies.lscm_hessian]
@@ -906,6 +962,7 @@ def vector_area_matrix(
     -----
     Matches ``igl::vector_area_matrix``.
     """
+    require_same_device(vertices=vertices, faces=faces)
     n = int(vertices.shape[0])
     device = vertices.device
     boundary = tw.boundary.oriented_boundary_edges(vertices, faces)

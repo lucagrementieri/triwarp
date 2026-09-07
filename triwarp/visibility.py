@@ -40,6 +40,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.bounds import enclosing_diagonal
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import visibility as kernel_visibility
@@ -122,6 +123,8 @@ def ambient_occlusion(
     ValueError
         If ``n_rays < 1``, ``weight`` is not one of the two names, or ``normals`` has a different
         length from ``points``.
+    RuntimeError
+        If ``mesh``, ``points`` and ``normals`` are not all on one device.
 
     See Also
     --------
@@ -136,6 +139,7 @@ def ambient_occlusion(
     ``n_rays`` whole-sphere directions. Its direction set is also its own, so the two agree in
     distribution and in ranking rather than value by value.
     """
+    require_same_device(mesh=mesh, points=points, normals=normals)
     return _occlusion_bundle(mesh, points, normals, n_rays, weight, 0.0, max_t, "ambient_occlusion")
 
 
@@ -190,11 +194,14 @@ def volumetric_obscurance(
     ------
     ValueError
         If ``tau <= 0``, ``n_rays < 1``, ``weight`` is unknown, or ``normals`` is the wrong length.
+    RuntimeError
+        If ``mesh``, ``points`` and ``normals`` are not all on one device.
 
     See Also
     --------
     [`ambient_occlusion`][triwarp.visibility.ambient_occlusion]
     """
+    require_same_device(mesh=mesh, points=points, normals=normals)
     if tau <= 0.0:
         raise ValueError(f"tau must be positive, got {tau}; use ambient_occlusion for the limit")
     return _occlusion_bundle(
@@ -314,6 +321,8 @@ def shape_diameter(
     ValueError
         If ``n_rays < 1``, ``cone_angle`` is outside ``(0, pi / 2]``, ``trim < 0``, or ``normals``
         has a different length from ``points``.
+    RuntimeError
+        If ``mesh``, ``points`` and ``normals`` are not all on one device.
 
     See Also
     --------
@@ -331,6 +340,7 @@ def shape_diameter(
     reduction to [`thickness`][triwarp.visibility.thickness] at ``n_rays=1`` and the analytic
     ``2 R`` on a sphere.
     """
+    require_same_device(mesh=mesh, points=points, normals=normals)
     if n_rays < 1:
         raise ValueError(f"shape_diameter requires n_rays >= 1, got {n_rays}")
     if not 0.0 < cone_angle <= math.pi / 2.0:
@@ -415,6 +425,8 @@ def thickness(
     ValueError
         If ``method`` is neither ``"max_sphere"`` nor ``"ray"``, or if ``normals`` has a different
         length from ``points``.
+    RuntimeError
+        If ``mesh``, ``points`` and ``normals`` are not all on one device.
 
     See Also
     --------
@@ -423,6 +435,7 @@ def thickness(
         The stable many-ray generalization of ``method="ray"``.
     [`longest_ray`][triwarp.ray.longest_ray]
     """
+    require_same_device(mesh=mesh, points=points, normals=normals)
     if method not in _THICKNESS_METHODS:
         raise ValueError(f"method must be one of {sorted(_THICKNESS_METHODS)}, got {method!r}")
 
@@ -484,7 +497,10 @@ def max_tangent_sphere(
     ------
     ValueError
         If ``normals`` has a different length from ``points``.
+    RuntimeError
+        If ``mesh``, ``points`` and ``normals`` are not all on one device.
     """
+    require_same_device(mesh=mesh, points=points, normals=normals)
     device = points.device
     m = int(points.shape[0])
     if m == 0:

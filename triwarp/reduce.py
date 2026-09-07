@@ -9,7 +9,7 @@ from typing import Literal, NamedTuple, cast, overload
 import warp as wp
 
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.array import _sorted_copy, astype
 from triwarp.constants import TILE_1D, TILE_2D
 from triwarp.kernels import array as kernel_array
@@ -373,7 +373,10 @@ def weighted_sum(
     ------
     ValueError
         If either array is empty or their lengths differ.
+    RuntimeError
+        If ``values`` and ``weights`` are not all on one device.
     """
+    require_same_device(values=values, weights=weights)
     n_values = int(values.shape[0])
     n_weights = int(weights.shape[0])
     if n_values == 0 or n_weights == 0:

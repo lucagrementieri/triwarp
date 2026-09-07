@@ -29,7 +29,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_nonempty_mesh
+from triwarp._device import require_nonempty_mesh, require_same_device
 from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import intersection as kernel_intersections
 from triwarp.kernels import predicates as kernel_predicates
@@ -76,7 +76,10 @@ def segments_with_plane(
     ------
     ValueError
         If ``start_points`` and ``end_points`` do not have the same shape.
+    RuntimeError
+        If ``start_points`` and ``end_points`` are not all on one device.
     """
+    require_same_device(start_points=start_points, end_points=end_points)
     if start_points.shape != end_points.shape:
         raise ValueError("start_points and end_points must have the same shape")
     n = int(start_points.shape[0])
@@ -133,7 +136,13 @@ def mesh_with_plane(
     face_index
         Returned only when ``return_faces=True``; ``(m,)`` ``wp.int32`` source
         face indices into the mesh.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -229,6 +238,8 @@ def marching_triangles(
         If two segments start on the same mesh edge, which means the faces are not consistently
         oriented (the level set cannot then be linked into oriented curves). Repair the winding with
         [`make_winding_consistent`][triwarp.repair.make_winding_consistent] first.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``values`` are not all on one device.
 
     See Also
     --------
@@ -238,6 +249,7 @@ def marching_triangles(
     [`polyline_length`][triwarp.polyline.polyline_length]
     ``potpourri3d.MarchingTrianglesSolver``
     """
+    require_same_device(vertices=vertices, faces=faces, values=values)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -408,7 +420,12 @@ def mesh_with_mesh(
     ------
     ValueError
         If ``max_triangle_collisions`` is less than 1.
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
     """
+    require_same_device(
+        vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
+    )
     device = vertices_a.device
     crossing = _colliding_face_pairs(
         vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, "mesh_with_mesh"
@@ -600,6 +617,8 @@ def mesh_collision_pairs(
     ------
     ValueError
         If ``max_triangle_collisions`` is less than 1.
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
 
     Examples
     --------
@@ -616,6 +635,9 @@ def mesh_collision_pairs(
     [`triwarp.proximity.closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
         What to reach for when the meshes do *not* touch and the clearance is the question.
     """
+    require_same_device(
+        vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
+    )
     device = vertices_a.device
     crossing = _colliding_face_pairs(
         vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, "mesh_collision_pairs"
@@ -670,12 +692,17 @@ def collision_masks(
     ------
     ValueError
         If ``max_triangle_collisions`` is less than 1.
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
 
     See Also
     --------
     [`mesh_collision_pairs`][triwarp.intersection.mesh_collision_pairs]
         The pair list this reduces, when *which* faces meet matters.
     """
+    require_same_device(
+        vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
+    )
     device = vertices_a.device
     n_faces_a = int(faces_a.shape[0]) // 3
     n_faces_b = int(faces_b.shape[0]) // 3
@@ -727,6 +754,11 @@ def slice_mesh_with_plane(
     new_faces
         Length-``3 * m`` flat triangle index buffer for the sliced mesh.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     Notes
     -----
     The plane's signed distance is one per-vertex scalar field, so this is
@@ -749,6 +781,7 @@ def slice_mesh_with_plane(
     [`mesh_with_plane`][triwarp.intersection.mesh_with_plane]
     [`trimesh.intersections.slice_faces_plane`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0:
@@ -826,6 +859,11 @@ def split_mesh_with_plane(
         it from the output entirely, on either side, while this function — which keeps every face
         somewhere — assigns it to ``True`` by convention.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     Notes
     -----
     A plane crosses at most **two** of a triangle's three edges — two of three vertices always share
@@ -864,6 +902,7 @@ def split_mesh_with_plane(
     [`triwarp.remesh.subdivide_to_size`][triwarp.remesh.subdivide_to_size]
     [`triwarp.selection.submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -966,6 +1005,11 @@ def clip_mesh_with_field(
     new_faces
         Length-``3 * m`` flat triangle index buffer for the clipped region.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``values`` are not all on one device.
+
     Notes
     -----
     A face whose three values all equal ``isovalue`` is dropped: it lies *in* the level set, so
@@ -1003,6 +1047,7 @@ def clip_mesh_with_field(
     [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane]
     [`fill_min_weight`][triwarp.holes.fill_min_weight]
     """
+    require_same_device(vertices=vertices, faces=faces, values=values)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0:
@@ -1075,6 +1120,11 @@ def split_faces_along_field(
     positive : wp.array[wp.bool]
         Length-``m`` mask, ``True`` for the faces on the ``values >= isovalue`` side.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``values`` are not all on one device.
+
     See Also
     --------
     [`clip_mesh_with_field`][triwarp.intersection.clip_mesh_with_field]
@@ -1086,6 +1136,7 @@ def split_faces_along_field(
     [`faces_left_of_contour`][triwarp.selection.faces_left_of_contour]
         The mask this returns for free, for a contour that was *given* rather than just created.
     """
+    require_same_device(vertices=vertices, faces=faces, values=values)
     device = vertices.device
     if int(faces.shape[0]) == 0 or int(vertices.shape[0]) == 0:
         return (

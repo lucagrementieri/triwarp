@@ -11,6 +11,21 @@ from triwarp.kernels.predicates import (
     triangle_triangle_distance_sq,
 )
 
+# ``face_to_mesh_distance`` / ``_tiled`` publish each thread's own best distance into
+# ``global_best_sq`` so other threads can prune against it (see the wrapper's seeding comment for
+# why this needs a bound rather than a tight one). Publishing the *exact* value has the same
+# bound-is-the-answer failure the wrapper's seed epsilon already guards against, one level down and
+# across threads rather than across the two passes: whenever two distinct query faces genuinely tie
+# for the global minimum -- the documented common case, e.g. every face around the vertex realising
+# the closest approach -- and both have a tight (corner-touching) AABB against the target, the first
+# thread to publish the exact minimum prunes the *other* tied thread's own winning candidate before
+# it reaches the leaf test, leaving that thread's ``out_distance_sq`` at ``inf``. The reported
+# distance is still correct (the surviving thread found it too), but the documented "``face_a`` is
+# the lowest index on a tie" guarantee silently depends on scheduling order. The same relative
+# margin the wrapper's seed uses keeps every publication just loose enough that a tied thread's own
+# tight bound is never pruned by another thread's, at a prune strength cost too small to measure.
+_GLOBAL_BEST_RELAX = wp.float32(1.0 + 1e-4)
+
 
 @wp.func
 def mesh_aabb_collect(
@@ -513,7 +528,7 @@ def face_to_mesh_distance(
         if distance_sq < best:
             best = distance_sq
             witness = candidate
-            wp.atomic_min(global_best_sq, 0, best)
+            wp.atomic_min(global_best_sq, 0, best * _GLOBAL_BEST_RELAX)
     out_distance_sq[f] = best
     out_witness[f] = witness
     if overflowed == 1:
@@ -593,7 +608,7 @@ def face_to_mesh_distance_tiled(
             if distance_sq < best:
                 best = distance_sq
                 witness = candidate
-                wp.atomic_min(global_best_sq, 0, best)
+                wp.atomic_min(global_best_sq, 0, best * _GLOBAL_BEST_RELAX)
     # The witness must not depend on which lane happened to see it, which is what
     # ``tile_argmin``'s second stage is for. When no lane found a candidate every lane still holds
     # ``(inf, -1)``, so it returns -1 and no fixup is needed here.

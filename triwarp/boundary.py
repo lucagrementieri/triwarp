@@ -30,6 +30,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import boundary as kernel_boundary
 from triwarp.kernels import scatter as kernel_scatter
@@ -62,7 +63,13 @@ def boundary_edges(
     twt.Array2dInt32
         Shape ``(n_boundary, 2)`` sorted boundary edges on ``faces.device``. Empty ``(0, 2)``
         when the mesh has no boundary.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``edges_sorted`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return twt.empty_2d((0, 2), wp.int32, device=faces.device)
@@ -104,7 +111,13 @@ def oriented_boundary_edges(
     twt.Array2dInt32
         Shape ``(n_boundary, 2)`` directed boundary edges on ``faces.device``. Empty
         ``(0, 2)`` when the mesh has no boundary.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``edges_sorted`` and ``edges`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted, edges=edges)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return twt.empty_2d((0, 2), wp.int32, device=faces.device)
@@ -167,6 +180,11 @@ def boundary_loops(
         (not repeating the start vertex), on ``faces.device``. Empty list when the mesh has no
         boundary.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``edges_sorted`` and ``edges`` are not all on one device.
+
     Notes
     -----
     Assumes a **manifold** boundary: each boundary vertex lies on exactly two boundary edges. A
@@ -186,6 +204,7 @@ def boundary_loops(
     [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
     ``igl.boundary_loop_all``
     """
+    require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted, edges=edges)
     flat_loops, offsets, _loop_sizes = boundary_loops_batched(vertices, faces, edges_sorted, edges)
     return tw.array.split(flat_loops, offsets, copy=copy)
 
@@ -233,12 +252,18 @@ def boundary_loops_batched(
     loop_sizes
         Length-``n_loops`` vertex count per loop.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``edges_sorted`` and ``edges`` are not all on one device.
+
     See Also
     --------
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     [`longest_boundary_loop`][triwarp.boundary.longest_boundary_loop]
     [`successor_cycles`][triwarp.graph.successor_cycles]
     """
+    require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted, edges=edges)
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     if n_faces == 0:
@@ -432,6 +457,8 @@ def loop_perimeters(
     ------
     TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
+    RuntimeError
+        If ``vertices`` and ``loops`` are not all on one device.
 
     See Also
     --------
@@ -442,6 +469,7 @@ def loop_perimeters(
     [`polyline_length`][triwarp.polyline.polyline_length]
         The single-loop form, over positions rather than indices.
     """
+    require_same_device(vertices=vertices, loops=loops)
     packed = _pack_loop_segments(vertices, loops)
     if packed is None:
         return wp.empty(0, dtype=wp.float32, device=vertices.device)
@@ -498,6 +526,12 @@ def loop_perimeters_batched(
     wp.array[wp.float32]
         One perimeter per loop, in the packed order, on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``flat_loops``, ``offsets``, ``loop_sizes`` and ``loop_id`` are not all on
+        one device.
+
     See Also
     --------
     [`loop_perimeters`][triwarp.boundary.loop_perimeters]
@@ -505,6 +539,13 @@ def loop_perimeters_batched(
     [`loop_directed_areas_batched`][triwarp.boundary.loop_directed_areas_batched]
         The vector measure of the same packed loops.
     """
+    require_same_device(
+        vertices=vertices,
+        flat_loops=flat_loops,
+        offsets=offsets,
+        loop_sizes=loop_sizes,
+        loop_id=loop_id,
+    )
     return _launch_loop_measure(
         kernel_boundary.loop_perimeters,
         wp.float32,
@@ -549,6 +590,8 @@ def loop_directed_areas(
     ------
     TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
+    RuntimeError
+        If ``vertices`` and ``loops`` are not all on one device.
 
     See Also
     --------
@@ -557,6 +600,7 @@ def loop_directed_areas(
     [`polyline_normal`][triwarp.polyline.polyline_normal]
         The single-loop direction, normalized and over positions.
     """
+    require_same_device(vertices=vertices, loops=loops)
     packed = _pack_loop_segments(vertices, loops)
     if packed is None:
         return wp.empty(0, dtype=wp.vec3, device=vertices.device)
@@ -611,6 +655,12 @@ def loop_directed_areas_batched(
     wp.array[wp.vec3]
         One directed area per loop, in the packed order, on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``flat_loops``, ``offsets``, ``loop_sizes`` and ``loop_id`` are not all on
+        one device.
+
     See Also
     --------
     [`loop_directed_areas`][triwarp.boundary.loop_directed_areas]
@@ -618,6 +668,13 @@ def loop_directed_areas_batched(
     [`loop_perimeters_batched`][triwarp.boundary.loop_perimeters_batched]
         The scalar measure of the same packed loops.
     """
+    require_same_device(
+        vertices=vertices,
+        flat_loops=flat_loops,
+        offsets=offsets,
+        loop_sizes=loop_sizes,
+        loop_id=loop_id,
+    )
     return _launch_loop_measure(
         kernel_boundary.loop_directed_areas,
         wp.vec3,
@@ -760,6 +817,11 @@ def longest_boundary_loop(
         independent buffer, not a view into the packed result. Empty when the mesh has no
         boundary.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``edges_sorted`` and ``edges`` are not all on one device.
+
     See Also
     --------
     [`boundary_loops`][triwarp.boundary.boundary_loops]
@@ -767,6 +829,7 @@ def longest_boundary_loop(
     [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]
     ``igl.boundary_loop``
     """
+    require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted, edges=edges)
     flat_loops, offsets, _loop_sizes = boundary_loops_batched(vertices, faces, edges_sorted, edges)
     loops = tw.array.split(flat_loops, offsets)
     if not loops:
@@ -800,7 +863,13 @@ def boundary_vertex_indices(
     wp.array[wp.int32]
         Sorted unique boundary vertex indices on ``faces.device``. Empty when the mesh has
         no boundary.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``edges_sorted`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted)
     edges = boundary_edges(vertices, faces, edges_sorted)
     return tw.grouping.unique_1d(edges.flatten())
 
@@ -828,7 +897,13 @@ def boundary_vertices(
     wp.array[wp.vec3]
         Shape ``(n_boundary_vertices,)`` boundary vertex positions on ``vertices.device``,
         ordered by ascending vertex index. Empty when the mesh has no boundary.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``edges_sorted`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted)
     indices = boundary_vertex_indices(vertices, faces, edges_sorted)
     return tw.array.gather(vertices, indices)
 
@@ -871,10 +946,16 @@ def ears(
     ear_opp : wp.array[wp.int32]
         Local edge index of the interior edge for each ear face, same length as ``ear``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``edges_sorted`` are not all on one device.
+
     See Also
     --------
     ``igl.ears``
     """
+    require_same_device(faces=faces, edges_sorted=edges_sorted)
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     empty = wp.empty(0, dtype=wp.int32, device=device)

@@ -662,6 +662,24 @@ def is_ear_at(
     # Corner (a, i, b) is an ear iff it is strictly convex and no other active vertex lies
     # strictly inside triangle (a, i, b). Equivalent to libigl's edge-intersection walk for a
     # simple polygon, but simpler to evaluate in parallel per corner.
+    #
+    # This walk is O(active ring size) per convex candidate corner (a reflex one returns above,
+    # in O(1)), so the round with the most active convex candidates -- always round 0 on a ring
+    # that is not fully convex, since ``compute_ears`` is launched at ``dim=n`` -- costs O(n) per
+    # thread across up to n threads: O(n^2) total device work (plans/review.md item 7). Measured
+    # on a synthetic pathological ring built to maximize it -- a near-circular polygon of n points
+    # with one vertex pulled inward (so ~n-1 of the n corners are convex ear candidates that each
+    # walk the whole remaining ring, while the single dent forces the ear-clip path instead of the
+    # O(1) convex fan) -- ``polyline_triangulate`` stays close to linear in wall-clock time up to
+    # the GPU's own thread-level parallelism (1.86-1.95x per doubling of n from 8 192 to 131 072,
+    # RTX 5090, Warp 1.17: 15.2 / 28.3 / 53.8 / 103.2 / 201.6 ms), because up to that many resident
+    # threads the O(n) total work is hidden behind the O(n) longest single thread. Past it, the
+    # true O(n^2) total work stops being hidden and the ratio jumps to 3.0-3.4x per doubling
+    # (690.1 ms at n=262 144, 2 068.4 ms at n=524 288). Every polyline this package's own benchmark
+    # axis exercises (the longest boundary loop measured is 65 536) sits inside the near-linear
+    # regime; a fix would need a spatially-accelerated ear test (a real data structure over the
+    # active ring, not a topological linked-list walk) rather than a tuning constant, so this is
+    # left as a documented, measured limitation rather than rewritten.
     a = left[i]
     b = right[i]
     if a == b or a == i or b == i:

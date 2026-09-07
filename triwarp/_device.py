@@ -1,12 +1,17 @@
 """
 Private device-capability guards and host-readback helpers shared across wrapper modules.
 
-Two of the five members are not about devices, and the name is a historical accident rather than a
+Two of the six members are not about devices, and the name is a historical accident rather than a
 claim: ``read_scalar`` is a host-readback helper (which is at least device-adjacent -- it is the
 sync) and ``require_nonempty_mesh`` is a plain validation guard, with 19 internal uses between
 them. They live here because this is the module wrapper code already imports for shared internals,
 not because either consults the device. Noted so a reader grepping for the guard is not surprised
 to find it under this name.
+
+``require_same_device`` is the exception: it is squarely about devices, and it is the one member of
+this module every public two-or-more-array function in the package now calls. See its own
+docstring for why a manual device check, generally discouraged for internal call sites, is load-
+bearing at the public boundary.
 """
 
 from __future__ import annotations
@@ -151,6 +156,65 @@ def require_nonempty_mesh(faces: wp.array[wp.int32], name: str) -> None:
             f"{name} cannot build a warp.Mesh with zero triangles: this silently corrupts CUDA "
             "state through Warp 1.17 (see the Warp issue tracker for wp.Mesh + empty BVH)."
         )
+
+
+def require_same_device(**named: Any) -> None:
+    """
+    Raise if two or more of the given device-bearing arguments disagree on device.
+
+    Warp does not catch this for you. Since Warp 1.14, ``wp.launch`` accepts a cross-device
+    argument list without complaint -- the default ``wp.config.launch_array_access_mode`` is
+    ``RELAXED``, which passes pointers straight through -- and the two ways such a call then fails
+    are both invisible to a Python ``except`` clause: a CUDA launch reading CPU arrays computes the
+    *right* answer and corrupts the host heap later, once those arrays are freed while the kernel
+    is still running asynchronously; a CPU launch reading CUDA arrays segfaults immediately, with no
+    Python exception at all. Neither is something a caller can catch or debug from the traceback it
+    gets, so every public function that accepts more than one device-bearing argument calls this
+    first, before any of them reaches a kernel.
+
+    Every argument may be ``None`` -- a caller should pass every device-bearing parameter it
+    received unconditionally, including an ``X | None = None`` precomputed-cache argument, rather
+    than filtering beforehand. A ``list`` or ``tuple`` argument (a sequence of loops, rings, ...) is
+    unpacked element-wise, each labelled ``f"{name}[{i}]"`` in the message, rather than compared as
+    one opaque object.
+
+    Parameters
+    ----------
+    **named
+        Every device-bearing argument the caller received (arrays, meshes, BVHs, hash grids,
+        volumes, or a list/tuple of any of those), keyed by its own parameter name.
+
+    Raises
+    ------
+    RuntimeError
+        If two of the given arguments report a different ``.device``.
+    """
+    seen: list[tuple[str, Any]] = []
+    for name, value in named.items():
+        seen.extend(_named_devices(name, value))
+    if not seen:
+        return
+    first_name, first_device = seen[0]
+    for name, device in seen[1:]:
+        if device != first_device:
+            raise RuntimeError(
+                f"triwarp requires every argument to run on one device, but '{first_name}' is on "
+                f"{first_device} while '{name}' is on {device}. Move one onto the other's device "
+                "(e.g. wp.clone(array, device=...) for a wp.array) before calling this function."
+            )
+
+
+def _named_devices(name: str, value: Any) -> list[tuple[str, Any]]:
+    """Flatten ``value`` into ``(label, device)`` pairs, descending into a list/tuple."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        found: list[tuple[str, Any]] = []
+        for i, item in enumerate(value):
+            found.extend(_named_devices(f"{name}[{i}]", item))
+        return found
+    device = getattr(value, "device", None)
+    return [(name, device)] if device is not None else []
 
 
 # One scratch buffer per dtype for ``read_scalar`` below, allocated on first use and reused for the

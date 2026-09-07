@@ -19,6 +19,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.array import arange_repeat
 from triwarp.kernels import edges as kernel_edges
 
@@ -114,11 +115,17 @@ def edges_unique(
     inverse : wp.array[wp.int32]
         Length ``n_faces * 3``. ``unique_edges[inverse[i]] == edges_sorted[i]``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``edges_sorted`` are not all on one device.
+
     See Also
     --------
     [`trimesh.Trimesh.edges_unique`][]
     [`trimesh.Trimesh.edges_unique_inverse`][]
     """
+    require_same_device(faces=faces, edges_sorted=edges_sorted)
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
 
@@ -169,10 +176,16 @@ def edges_unique_inverse(
     wp.array[wp.int32]
         Length ``n_faces * 3`` inverse indices.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``edges_sorted`` are not all on one device.
+
     See Also
     --------
     [`trimesh.Trimesh.edges_unique_inverse`][]
     """
+    require_same_device(faces=faces, edges_sorted=edges_sorted)
     return edges_unique(faces, edges_sorted=edges_sorted, n_vertices=n_vertices)[1]
 
 
@@ -202,10 +215,16 @@ def edges_unique_length(
     wp.array[wp.float32]
         Length ``m`` edge lengths on ``faces.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``unique_edges`` are not all on one device.
+
     See Also
     --------
     [`trimesh.Trimesh.edges_unique_length`][]
     """
+    require_same_device(vertices=vertices, faces=faces, unique_edges=unique_edges)
     if unique_edges is None:
         unique_edges, _ = edges_unique(faces, n_vertices=n_vertices)
 
@@ -232,7 +251,13 @@ def edges_length(
     -------
     wp.array[wp.float32]
         Length ``n_faces * 3`` edge lengths on ``faces.device``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``edges_in`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces, edges_in=edges_in)
     if edges_in is None:
         edges_in = faces_to_edges(faces)
 
@@ -280,11 +305,17 @@ def face_edge_lengths(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) ->
     twt.Array2dFloat32
         ``(n_faces, 3)`` edge lengths on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic]
     [`edges_unique_length`][triwarp.edges.edges_unique_length]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     lengths = twt.empty_2d((n_faces, 3), wp.float32, device=device)
@@ -334,6 +365,11 @@ def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     float
         Mean length over the ``3 * n_faces`` per-face edges. ``0.0`` when ``n_faces == 0``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`mean_unique_edge_length`][triwarp.edges.mean_unique_edge_length]
@@ -341,6 +377,7 @@ def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     [`edges_length`][triwarp.edges.edges_length]
         The per-face lengths this averages.
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return 0.0
@@ -372,6 +409,11 @@ def mean_unique_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int3
     float
         Mean length over the unique undirected edges. ``0.0`` when ``n_faces == 0``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`mean_edge_length`][triwarp.edges.mean_edge_length]
@@ -379,6 +421,7 @@ def mean_unique_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int3
     [`edges_unique_length`][triwarp.edges.edges_unique_length]
         The per-edge lengths this averages.
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return 0.0

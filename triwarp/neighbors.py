@@ -44,7 +44,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.kernels import neighbors as kernel_neighbors
 from triwarp.kernels import points as kernel_points
 from triwarp.kernels.algorithms import bfs as kernel_bfs
@@ -156,7 +156,13 @@ def bvh_from_bounds(
     -------
     warp.Bvh
         BVH suited for AABB intersection queries.
+
+    Raises
+    ------
+    RuntimeError
+        If ``lower`` and ``upper`` are not all on one device.
     """
+    require_same_device(lower=lower, upper=upper)
     return wp.Bvh(lower, upper, leaf_size=leaf_size)
 
 
@@ -194,6 +200,11 @@ def query_bvh_ball(
         ``offsets`` is the exclusive prefix sum of per-query hit counts, and query ``k`` owns
         ``candidate_indices_flat[offsets[k] : offsets[k+1]]``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``bvh`` and ``queries`` are not all on one device.
+
     Notes
     -----
     Prefer this over the cube query wherever the caller's predicate is a ball, and not only for the
@@ -211,6 +222,7 @@ def query_bvh_ball(
     [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets]
         The same ball, over a **point** cloud and with a narrow-phase distance filter.
     """
+    require_same_device(bvh=bvh, queries=queries)
     device = queries.device
     m = int(queries.shape[0])
 
@@ -286,6 +298,8 @@ def query_bvh_box(
     ------
     ValueError
         If ``query_lower`` and ``query_upper`` do not have the same length.
+    RuntimeError
+        If ``bvh``, ``query_lower`` and ``query_upper`` are not all on one device.
 
     Notes
     -----
@@ -310,6 +324,7 @@ def query_bvh_box(
     [`triwarp.points.half_space_mask`][triwarp.points.half_space_mask]
         The unbounded counterpart: selection by one plane rather than by a box.
     """
+    require_same_device(bvh=bvh, query_lower=query_lower, query_upper=query_upper)
     device = query_lower.device
     m = int(query_lower.shape[0])
     if int(query_upper.shape[0]) != m:
@@ -449,6 +464,8 @@ def query_ball(
     ------
     ValueError
         If ``backend`` is neither name, or contradicts the type of ``accelerator``.
+    RuntimeError
+        If ``points``, ``queries`` and ``accelerator`` are not all on one device.
 
     Notes
     -----
@@ -467,6 +484,7 @@ def query_ball(
     [`bvh_from_points`][triwarp.neighbors.bvh_from_points]
     [`scipy.spatial.KDTree.query_ball_point`][]
     """
+    require_same_device(points=points, queries=queries, accelerator=accelerator)
     device = points.device
 
     single_query = isinstance(queries, wp.vec3)
@@ -532,6 +550,8 @@ def query_ball_count(
     ------
     ValueError
         If ``backend`` is neither name, or contradicts the type of ``accelerator``.
+    RuntimeError
+        If ``points``, ``queries`` and ``accelerator`` are not all on one device.
 
     See Also
     --------
@@ -540,6 +560,7 @@ def query_ball_count(
     [`bvh_from_points`][triwarp.neighbors.bvh_from_points]
     [`scipy.spatial.KDTree.query_ball_point`][]
     """
+    require_same_device(points=points, queries=queries, accelerator=accelerator)
     kind, accelerator = _resolve_accelerator(accelerator, backend)
     device = points.device
     n = int(points.shape[0])
@@ -628,6 +649,8 @@ def query_ball_with_offsets(
     ------
     ValueError
         If ``backend`` is neither name, or contradicts the type of ``accelerator``.
+    RuntimeError
+        If ``points``, ``queries`` and ``accelerator`` are not all on one device.
 
     Notes
     -----
@@ -644,6 +667,7 @@ def query_ball_with_offsets(
     [`bvh_from_points`][triwarp.neighbors.bvh_from_points]
     [`scipy.spatial.KDTree.query_ball_point`][]
     """
+    require_same_device(points=points, queries=queries, accelerator=accelerator)
     kind, resolved = _resolve_accelerator(accelerator, backend)
     if kind == "hashgrid":
         return _ball_with_offsets(
@@ -964,6 +988,8 @@ def query_nearest(
     ValueError
         If ``k < 1``, ``max_radius < 0``, ``initial_radius < 0``, or ``backend`` is neither name or
         contradicts the type of ``accelerator``.
+    RuntimeError
+        If ``points``, ``queries`` and ``accelerator`` are not all on one device.
 
     See Also
     --------
@@ -977,6 +1003,7 @@ def query_nearest(
     [`bvh_from_points`][triwarp.neighbors.bvh_from_points]
     [`scipy.spatial.KDTree.query`][]
     """
+    require_same_device(points=points, queries=queries, accelerator=accelerator)
     kind, resolved = _resolve_accelerator(accelerator, backend)
     _validate_nearest(k, max_radius, initial_radius)
 
@@ -1218,6 +1245,8 @@ def query_weighted_nearest(
     ------
     ValueError
         If ``weights`` does not have one entry per point.
+    RuntimeError
+        If ``points``, ``weights``, ``queries`` and ``accelerator`` are not all on one device.
 
     Notes
     -----
@@ -1237,6 +1266,7 @@ def query_weighted_nearest(
         The unweighted query, and the ``k > 1`` form. This one answers ``k = 1`` only, because no
         caller has needed more.
     """
+    require_same_device(points=points, weights=weights, queries=queries, accelerator=accelerator)
     device = points.device
     n = int(points.shape[0])
     m = int(queries.shape[0])
@@ -1455,7 +1485,13 @@ def geodesic_ball(
         length-``n_vertices`` exclusive prefix sum of per-vertex neighbor counts (CSR starts);
         vertex ``i`` owns ``neighbor_indices[offsets[i] : offsets[i + 1]]`` with ``offsets[n]``
         implied as the total. ``reference_neighbors`` has length ``n_vertices``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0:

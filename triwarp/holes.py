@@ -76,7 +76,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import holes as kernel_holes
 from triwarp.kernels import scatter as kernel_scatter
@@ -173,6 +173,11 @@ def fill_fan(
         ``faces.device``. A watertight or empty mesh — or, with ``preserve_largest_hole``, a mesh
         whose only hole is the largest — is returned unchanged (a copy).
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`fill_cone`][triwarp.holes.fill_cone]
@@ -186,6 +191,7 @@ def fill_fan(
     Fill winding is consistent with the adjacent faces only when the input mesh is consistently
     wound (see [`make_winding_consistent`][triwarp.repair.make_winding_consistent]).
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     packed = _hole_loops(vertices, faces, preserve_largest_hole) if n_faces > 0 else None
@@ -237,6 +243,11 @@ def fill_cone(
         empty mesh — or, with ``preserve_largest_hole``, a mesh whose only hole is the largest —
         is returned unchanged (copies).
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`fill_fan`][triwarp.holes.fill_fan]
@@ -250,6 +261,7 @@ def fill_cone(
     Fill winding is consistent with the adjacent faces only when the input mesh is consistently
     wound (see [`make_winding_consistent`][triwarp.repair.make_winding_consistent]).
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     packed = _hole_loops(vertices, faces, preserve_largest_hole) if n_faces > 0 else None
@@ -472,6 +484,8 @@ def fill_min_weight(
     ------
     ValueError
         If ``metric`` is not one of the supported metric names.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -485,6 +499,7 @@ def fill_min_weight(
     Fill winding is consistent with the adjacent faces only when the input mesh is consistently
     wound (see [`make_winding_consistent`][triwarp.repair.make_winding_consistent]).
     """
+    require_same_device(vertices=vertices, faces=faces)
     if metric not in _METRIC_IDS:
         raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
     n_faces = int(faces.shape[0]) // 3
@@ -540,10 +555,16 @@ def fill_loops_min_weight(
         Flat face buffer of ``faces`` followed by the fill triangles for ``loops``, on
         ``faces.device``. Unchanged (a copy) when ``loops`` is empty.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``loops`` are not all on one device.
+
     See Also
     --------
     [`fill_min_weight`][triwarp.holes.fill_min_weight]
     """
+    require_same_device(vertices=vertices, faces=faces, loops=loops)
     if len(loops) == 0:
         return wp.clone(faces)
     return _fill_packed_loops(
@@ -856,6 +877,8 @@ def fill_small(
     ------
     ValueError
         If neither ``max_perimeter`` nor ``max_edges`` is given, or if both are.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     Notes
     -----
@@ -872,6 +895,7 @@ def fill_small(
     [`fillable_loop_mask`][triwarp.holes.fillable_loop_mask]
         Which loops the DP can fill at all, a separate question from which are small.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if (max_perimeter is None) == (max_edges is None):
         raise ValueError("pass exactly one of max_perimeter or max_edges")
 
@@ -989,6 +1013,8 @@ def fill_smooth(
     ------
     ValueError
         If ``metric``, ``edge_weights`` or ``refine`` is unknown.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -1003,6 +1029,7 @@ def fill_smooth(
 
     Winding is consistent with the surrounding faces only for a consistently wound input.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if metric not in _METRIC_IDS:
         raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
     if edge_weights not in ("cotan", "unit"):
@@ -1114,6 +1141,8 @@ def refill_region(
     ValueError
         If ``metric`` or ``refine`` is not one of the supported names, or ``face_mask`` does not
         have one entry per face.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``face_mask`` are not all on one device.
 
     Examples
     --------
@@ -1131,6 +1160,7 @@ def refill_region(
     [`triwarp.repair.remove_folded_faces`][triwarp.repair.remove_folded_faces]
         One of several ways to produce the mask this takes.
     """
+    require_same_device(vertices=vertices, faces=faces, face_mask=face_mask)
     if metric not in _METRIC_IDS:
         raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
     _check_refine(refine)
@@ -1224,6 +1254,8 @@ def extend_hole(
         extension that folds through the plane, which is geometrically what "project each vertex"
         means and is almost never wanted -- place the plane clear of the rim, and check with
         [`bounds.aabb`][triwarp.bounds.aabb] if the input is not yours.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``loops`` are not all on one device.
 
     See Also
     --------
@@ -1235,6 +1267,7 @@ def extend_hole(
         Bridges two rims that both already exist, where this generates the second one.
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
+    require_same_device(vertices=vertices, faces=faces, loops=loops)
     packed = _packed_rims(vertices, faces, loops)
     if packed is None:
         return wp.clone(vertices), wp.clone(faces)
@@ -1293,6 +1326,8 @@ def build_bottom(
     ------
     TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``loops`` are not all on one device.
 
     See Also
     --------
@@ -1301,6 +1336,7 @@ def build_bottom(
     [`fill_min_weight`][triwarp.holes.fill_min_weight]
         Closes the flat rim this leaves.
     """
+    require_same_device(vertices=vertices, faces=faces, loops=loops)
     device = faces.device
     packed = _packed_rims(vertices, faces, loops)
     if packed is None:
@@ -1453,6 +1489,8 @@ def fillable_loop_mask(
     ------
     TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``loops`` are not all on one device.
 
     See Also
     --------
@@ -1463,6 +1501,7 @@ def fillable_loop_mask(
     [`loop_perimeters`][triwarp.boundary.loop_perimeters]
         Ranks the same loops by size, which is the other question a caller asks about a rim.
     """
+    require_same_device(vertices=vertices, faces=faces, loops=loops)
     device = faces.device
     if loops is None:
         loops = tw.boundary.boundary_loops(vertices, faces)
@@ -1565,6 +1604,8 @@ def stitch(
     ------
     ValueError
         If either mesh does not have exactly one boundary loop of at least 3 vertices.
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
 
     See Also
     --------
@@ -1572,6 +1613,9 @@ def stitch(
     [`stitch_min_weight`][triwarp.holes.stitch_min_weight]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
+    require_same_device(
+        vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
+    )
     loop_a, loop_b = _single_boundary_loops(
         vertices_a, faces_a, vertices_b, faces_b, caller="stitch"
     )
@@ -1617,6 +1661,8 @@ def stitch_min_weight(
     ValueError
         If either mesh does not have exactly one boundary loop of at least 3 vertices, or ``metric``
         is unknown.
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
 
     See Also
     --------
@@ -1628,6 +1674,9 @@ def stitch_min_weight(
     The band is the minimum-weight two-loop stitch; see
     [`stitch_min_weight`][triwarp.holes.stitch_min_weight] for the metrics.
     """
+    require_same_device(
+        vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
+    )
     loop_a, loop_b = _single_boundary_loops(
         vertices_a, faces_a, vertices_b, faces_b, caller="stitch_min_weight"
     )
@@ -1709,6 +1758,8 @@ def stitch_smooth(
     ValueError
         If either mesh lacks exactly one boundary loop, or ``metric`` / ``edge_weights`` /
         ``refine`` is unknown.
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
 
     See Also
     --------
@@ -1720,6 +1771,9 @@ def stitch_smooth(
     The three stages are: minimum-weight stitch, refine the band to the target edge length, then
     smooth its new interior vertices into both surrounding surfaces.
     """
+    require_same_device(
+        vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
+    )
     if metric not in _STITCH_METRIC_IDS:
         raise ValueError(f"metric must be one of {sorted(_STITCH_METRIC_IDS)}, got {metric!r}")
     if edge_weights not in ("cotan", "unit"):
@@ -1870,6 +1924,9 @@ def stitch_loops(
     ------
     ValueError
         If either loop has fewer than 3 vertices.
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``loop_a``, ``vertices_b``, ``faces_b`` and ``loop_b`` are
+        not all on one device.
 
     See Also
     --------
@@ -1893,6 +1950,14 @@ def stitch_loops(
     with ``N + M`` sequential launches along the anti-diagonals, and that gap widens with rim size.
     The DP is never the cheaper option -- prefer it for the seam it produces, not for speed.
     """
+    require_same_device(
+        vertices_a=vertices_a,
+        faces_a=faces_a,
+        loop_a=loop_a,
+        vertices_b=vertices_b,
+        faces_b=faces_b,
+        loop_b=loop_b,
+    )
     n = int(loop_a.shape[0])
     m = int(loop_b.shape[0])
     if n < m:
@@ -2143,12 +2208,23 @@ def stitch_loops_min_weight(
     ------
     ValueError
         If either loop has fewer than 3 vertices, or ``metric`` is unknown.
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``loop_a``, ``vertices_b``, ``faces_b`` and ``loop_b`` are
+        not all on one device.
 
     See Also
     --------
     [`stitch_loops`][triwarp.holes.stitch_loops]
     [`stitch_min_weight`][triwarp.holes.stitch_min_weight]
     """
+    require_same_device(
+        vertices_a=vertices_a,
+        faces_a=faces_a,
+        loop_a=loop_a,
+        vertices_b=vertices_b,
+        faces_b=faces_b,
+        loop_b=loop_b,
+    )
     if metric not in _STITCH_METRIC_IDS:
         raise ValueError(f"metric must be one of {sorted(_STITCH_METRIC_IDS)}, got {metric!r}")
     n_a = int(loop_a.shape[0])
@@ -2347,6 +2423,8 @@ def bridge_edges(
         edge of ``faces``, or if ``validate`` is set and the patch would create a second edge
         between a pair of vertices that already share one (which would leave the mesh
         non-manifold).
+    RuntimeError
+        If ``vertices``, ``faces`` and ``boundary_edges`` are not all on one device.
 
     Examples
     --------
@@ -2368,6 +2446,7 @@ def bridge_edges(
     [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
         Produces the edges this takes, already in the right direction.
     """
+    require_same_device(vertices=vertices, faces=faces, boundary_edges=boundary_edges)
     edge_a = (int(edge_a[0]), int(edge_a[1]))
     edge_b = (int(edge_b[0]), int(edge_b[1]))
     _check_bridge_edges(
@@ -2464,6 +2543,8 @@ def bridge_edges_smooth(
         self-intersection, so a step far smaller than the span across two nearly opposed edges can
         fold; run [`fix_self_intersections`][triwarp.repair.fix_self_intersections] if the input
         pairing is not yours to choose.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -2472,6 +2553,7 @@ def bridge_edges_smooth(
     [`fill_smooth`][triwarp.holes.fill_smooth]
         The same idea for a whole rim: a patch refined and faired rather than merely spanned.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if sampling_step <= 0.0:
         raise ValueError(f"sampling_step must be positive, got {sampling_step}")
     device = faces.device
@@ -2665,6 +2747,8 @@ def join_closest_components(
     ValueError
         If ``max_joins`` is negative, or if a chosen pair admits no valid bridge at either of its
         two incident boundary edges.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -2689,6 +2773,7 @@ def join_closest_components(
     A component with no boundary -- a closed shell -- has nothing to bridge to and is left alone, so
     an input of closed shells comes back unchanged rather than raising.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if max_joins is not None and max_joins < 0:
         raise ValueError(f"max_joins must be non-negative, got {max_joins}")
     max_distance_sq = wp.float32(float("inf") if max_distance is None else float(max_distance) ** 2)

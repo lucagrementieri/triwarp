@@ -43,6 +43,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.kernels import levelset as kernel_levelset
 
 # Bounds on the automatic ``voxel_size``, both expressed as samples across the mesh's bounding-box
@@ -188,6 +189,8 @@ def offset_mesh(
     ------
     ValueError
         If ``distance`` is zero, ``voxel_size`` is not positive, or ``faces`` is empty.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     Examples
     --------
@@ -220,6 +223,7 @@ def offset_mesh(
     [`triwarp.levelset.marching_cubes`][triwarp.levelset.marching_cubes]
         The extraction, and where the triangulation's own caveats live.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if distance == 0.0:
         raise ValueError("distance must be non-zero; an offset of zero is a resampling")
     if voxel_size is not None and voxel_size <= 0.0:
@@ -292,6 +296,8 @@ def thicken_mesh(
     ------
     ValueError
         If ``thickness`` is not positive, ``outside`` is negative, or ``faces`` is empty.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     Examples
     --------
@@ -325,6 +331,7 @@ def thicken_mesh(
     [`triwarp.boundary.oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
         Where the band's orientation comes from.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if thickness <= 0.0:
         raise ValueError("thickness must be positive")
     if outside < 0.0:

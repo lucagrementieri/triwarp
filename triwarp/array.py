@@ -11,7 +11,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import scatter as kernel_scatter
 
@@ -342,6 +342,8 @@ def split(
     ValueError
         If ``array`` or ``offsets`` is not rank-1, or ``offsets`` is not a non-decreasing
         sequence starting at ``0`` and bounded by ``array``'s length.
+    RuntimeError
+        If ``array`` and ``offsets`` are not all on one device.
 
     See Also
     --------
@@ -353,6 +355,7 @@ def split(
         ``trimesh.Trimesh.split``.
     [`numpy.split`][]
     """
+    require_same_device(array=array, offsets=offsets)
     if int(array.ndim) != 1:
         raise ValueError(f"split requires a rank-1 array, got ndim={array.ndim}")
     if int(offsets.ndim) != 1:
@@ -533,7 +536,10 @@ def allclose(
     ------
     ValueError
         If ``a`` and ``b`` have different lengths or dtypes.
+    RuntimeError
+        If ``a`` and ``b`` are not all on one device.
     """
+    require_same_device(a=a, b=b)
     if a.dtype != b.dtype:
         raise ValueError(f"allclose requires matching dtypes, got {a.dtype} and {b.dtype}")
     n = int(a.shape[0])
@@ -755,7 +761,10 @@ def index_sparse(
     ------
     ValueError
         If ``data`` is given and its size differs from ``indices.size``.
+    RuntimeError
+        If ``indices`` and ``data`` are not all on one device.
     """
+    require_same_device(indices=indices, data=data)
     prune_numerical_zeros = prune_numerical_zeros and data is not None
     if data is None:
         data = wp.ones(
@@ -1071,12 +1080,18 @@ def gather(
         ``(len(indices), *src.shape[1:])`` and the same ``dtype`` as ``src``. Empty along the
         first axis when ``indices`` is empty.
 
+    Raises
+    ------
+    RuntimeError
+        If ``src`` and ``indices`` are not all on one device.
+
     See Also
     --------
     [`index_sparse`][triwarp.array.index_sparse]
     [`remap_indices`][triwarp.array.remap_indices]
         The sentinel-preserving variant for index buffers that may carry ``-1`` entries.
     """
+    require_same_device(src=src, indices=indices)
     k = int(indices.shape[0])
     out_shape = (k, *(int(dim) for dim in src.shape[1:]))
     out = wp.empty(out_shape, dtype=src.dtype, device=src.device)
@@ -1341,11 +1356,17 @@ def remap_indices(indices: wp.array[wp.int32], remap: wp.array[wp.int32]) -> wp.
         Length ``len(indices)`` array on ``indices.device`` with ``out[i] = remap[indices[i]]``
         for non-negative ``indices[i]``, and ``out[i] = indices[i]`` otherwise.
 
+    Raises
+    ------
+    RuntimeError
+        If ``indices`` and ``remap`` are not all on one device.
+
     See Also
     --------
     [`gather`][triwarp.array.gather]
         The sentinel-free form: a dense first-axis gather for index buffers known to be in range.
     """
+    require_same_device(indices=indices, remap=remap)
     n = int(indices.shape[0])
     device = indices.device
     if n == 0:

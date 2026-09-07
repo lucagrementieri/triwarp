@@ -9,6 +9,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.array import arange
 from triwarp.halfedge import halfedge_twins
 from triwarp.kernels import array as kernel_array
@@ -50,6 +51,11 @@ def region_boundary_edges(
     twt.Array2dInt32
         ``(k, 2)`` vertex pairs on ``faces.device``, sorted ascending per row unless ``oriented``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``face_mask`` are not all on one device.
+
     See Also
     --------
     [`faces_left_of_contour`][triwarp.selection.faces_left_of_contour]
@@ -61,6 +67,7 @@ def region_boundary_edges(
     Erosion here is vertex-based: a vertex survives when every 1-ring neighbour is also in the
     mask. MeshLab's Erode Selection is a *face*-based operation and gives a different answer.
     """
+    require_same_device(faces=faces, face_mask=face_mask)
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -149,6 +156,8 @@ def faces_left_of_contour(
     ------
     ValueError
         If ``contour_edges`` is not a rank-2 ``wp.int32`` array with two columns.
+    RuntimeError
+        If ``faces``, ``contour_edges`` and ``twins`` are not all on one device.
 
     Examples
     --------
@@ -167,6 +176,7 @@ def faces_left_of_contour(
     [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]
         Turns the returned mask into a mesh.
     """
+    require_same_device(faces=faces, contour_edges=contour_edges, twins=twins)
     twt.ensure_ndim(contour_edges, 2, dtype=wp.int32)
     if int(contour_edges.shape[1]) != 2:
         raise ValueError(f"contour_edges must have shape (k, 2), got {contour_edges.shape}")
@@ -249,7 +259,13 @@ def exclude_fully_selected_components(
     -------
     wp.array[wp.bool]
         Selection with fully-selected components removed, on ``mask.device``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``faces``, ``mask`` and ``unique_edges`` are not all on one device.
     """
+    require_same_device(faces=faces, mask=mask, unique_edges=unique_edges)
     device = mask.device
     if n_vertices == 0:
         return wp.clone(mask)
@@ -334,6 +350,11 @@ def submesh_from_face_indices(
         output vertex came from, ascending. That direction makes it a gather, so a per-vertex
         attribute follows the submesh with ``tw.array.gather(attribute, vertex_index)``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``face_indices`` are not all on one device.
+
     See Also
     --------
     [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]
@@ -341,6 +362,7 @@ def submesh_from_face_indices(
     [`concatenate`][triwarp.combine.concatenate]
     [`trimesh.util.submesh`][]
     """
+    require_same_device(vertices=vertices, faces=faces, face_indices=face_indices)
     device = vertices.device
     k = int(face_indices.shape[0])
     if k == 0:
@@ -425,6 +447,9 @@ def submeshes_from_face_groups(
     ------
     ValueError
         If ``k * n_vertices`` overflows the ``int64`` packing budget of ``2 ** 62``.
+    RuntimeError
+        If ``vertices``, ``faces``, ``group_face_indices`` and ``group_offsets`` are not all on one
+        device.
 
     See Also
     --------
@@ -432,6 +457,12 @@ def submeshes_from_face_groups(
     [`split_batched`][triwarp.combine.split_batched]
     [`unique_1d`][triwarp.grouping.unique_1d]
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        group_face_indices=group_face_indices,
+        group_offsets=group_offsets,
+    )
     device = vertices.device
     k = int(group_offsets.shape[0])
     n_selected = int(group_face_indices.shape[0])
@@ -538,12 +569,18 @@ def submesh_from_face_mask(
         Compact ``(sub_vertices, sub_faces)`` on ``vertices.device``, plus ``vertex_index`` when
         ``return_index`` is ``True``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``face_mask`` are not all on one device.
+
     See Also
     --------
     [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]
     [`delete_region_keep_boundary`][triwarp.selection.delete_region_keep_boundary]
         The complement: keep everything *outside* a region, and report the rims that opens.
     """
+    require_same_device(vertices=vertices, faces=faces, face_mask=face_mask)
     face_indices = tw.array.flatnonzero(face_mask)
     if return_index:
         return submesh_from_face_indices(
@@ -591,6 +628,8 @@ def delete_region_keep_boundary(
     ------
     ValueError
         If ``face_mask`` does not have one entry per face.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``face_mask`` are not all on one device.
 
     Examples
     --------
@@ -620,6 +659,7 @@ def delete_region_keep_boundary(
     [`triwarp.holes.refill_region`][triwarp.holes.refill_region]
         Delete and immediately fill, which is what this is usually the first half of.
     """
+    require_same_device(vertices=vertices, faces=faces, face_mask=face_mask)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if int(face_mask.shape[0]) != n_faces:
@@ -688,12 +728,18 @@ def submesh_from_vertex_indices(
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
         Compact ``(sub_vertices, sub_faces)`` on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``vertex_indices`` are not all on one device.
+
     See Also
     --------
     [`face_indices_from_vertex_indices`][triwarp.selection.face_indices_from_vertex_indices]
     [`submesh_from_vertex_mask`][triwarp.selection.submesh_from_vertex_mask]
     [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]
     """
+    require_same_device(vertices=vertices, faces=faces, vertex_indices=vertex_indices)
     face_indices = face_indices_from_vertex_indices(
         faces, vertex_indices, face_mode=face_mode, n_vertices=int(vertices.shape[0])
     )
@@ -733,6 +779,8 @@ def submesh_from_vertex_mask(
     ValueError
         If ``vertex_mask`` length does not equal ``n_vertices``, or ``face_mode`` is not
         ``"all"`` or ``"any"``.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``vertex_mask`` are not all on one device.
 
     Notes
     -----
@@ -748,6 +796,7 @@ def submesh_from_vertex_mask(
     [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]
         The per-face selection this reduces onto.
     """
+    require_same_device(vertices=vertices, faces=faces, vertex_mask=vertex_mask)
     n_vertices = int(vertices.shape[0])
     if int(vertex_mask.shape[0]) != n_vertices:
         raise ValueError(
@@ -821,6 +870,11 @@ def expand_vertex_mask(
     wp.array[wp.bool]
         Dilated mask on ``mask.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces``, ``mask`` and ``unique_edges`` are not all on one device.
+
     See Also
     --------
     [`shrink_vertex_mask`][triwarp.selection.shrink_vertex_mask]
@@ -833,6 +887,7 @@ def expand_vertex_mask(
     must start from a copy of the previous mask; ping-ponging two preallocated buffers would keep
     the copy and drop only the allocation, which is a small fraction of the round's cost.
     """
+    require_same_device(faces=faces, mask=mask, unique_edges=unique_edges)
     device = mask.device
     n = int(mask.shape[0])
     current = wp.clone(mask)
@@ -882,6 +937,11 @@ def shrink_vertex_mask(
     wp.array[wp.bool]
         Eroded mask on ``mask.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces``, ``mask`` and ``unique_edges`` are not all on one device.
+
     See Also
     --------
     [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
@@ -891,6 +951,7 @@ def shrink_vertex_mask(
     Erosion here is vertex-based: a vertex survives when every 1-ring neighbour is also in the
     mask. MeshLab's Erode Selection is a *face*-based operation and gives a different answer.
     """
+    require_same_device(faces=faces, mask=mask, unique_edges=unique_edges)
     device = mask.device
     n = int(mask.shape[0])
     if hops <= 0 or n == 0:
@@ -940,7 +1001,10 @@ def face_indices_from_vertex_indices(
     ------
     ValueError
         If ``face_mode`` is not ``"all"`` or ``"any"``.
+    RuntimeError
+        If ``faces`` and ``vertex_indices`` are not all on one device.
     """
+    require_same_device(faces=faces, vertex_indices=vertex_indices)
     if face_mode not in ("all", "any"):
         raise ValueError(f'face_mode must be "all" or "any", got {face_mode!r}')
 

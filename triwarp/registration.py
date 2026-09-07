@@ -9,7 +9,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar, require_nonempty_mesh
+from triwarp._device import read_scalar, require_nonempty_mesh, require_same_device
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import proximity as kernel_proximity
@@ -95,6 +95,11 @@ def procrustes(
         Weighted sum of squared distances between *transformed* and *b*.
         Only returned when ``return_cost=True``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``a``, ``b`` and ``weights`` are not all on one device.
+
     Notes
     -----
     Latency-bound at every size that matters: the fit is two kernel launches (four with
@@ -106,6 +111,7 @@ def procrustes(
     ``pytorch3d.ops.corresponding_points_alignment`` solves the row-vector form ``s X R + T = Y``,
     so its ``R`` is this matrix's linear block divided by the scale and *transposed*.
     """
+    require_same_device(a=a, b=b, weights=weights)
     n = int(a.shape[0])
     device = a.device
     workspace = _procrustes_workspace(n, device, return_cost=return_cost)
@@ -286,12 +292,20 @@ def icp(
     cost
         Weighted mean squared correspondence distance at the final iteration.
 
+    Raises
+    ------
+    RuntimeError
+        If ``a``, ``target_vertices``, ``target_faces`` and ``initial`` are not all on one device.
+
     See Also
     --------
     [`procrustes`][triwarp.registration.procrustes]
     [`icp_point_to_plane`][triwarp.registration.icp_point_to_plane]
     [`trimesh.registration.icp`][]
     """
+    require_same_device(
+        a=a, target_vertices=target_vertices, target_faces=target_faces, initial=initial
+    )
     device = a.device
     n = int(a.shape[0])
 
@@ -431,6 +445,9 @@ def icp_point_to_plane(
     ValueError
         If the target is a point cloud (``target_faces is None``) and
         ``target_normals`` is not provided.
+    RuntimeError
+        If ``a``, ``target_vertices``, ``target_faces``, ``target_normals`` and ``initial`` are not
+        all on one device.
 
     See Also
     --------
@@ -438,6 +455,13 @@ def icp_point_to_plane(
     [`estimate_normals`][triwarp.points.estimate_normals]
     [`normals_at_closest_faces`][triwarp.proximity.normals_at_closest_faces]
     """
+    require_same_device(
+        a=a,
+        target_vertices=target_vertices,
+        target_faces=target_faces,
+        target_normals=target_normals,
+        initial=initial,
+    )
     device = a.device
     n = int(a.shape[0])
     is_mesh = _is_mesh_target(target_faces)

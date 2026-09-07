@@ -33,6 +33,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import seams as kernel_seams
@@ -82,6 +83,8 @@ def crease_edges(
     ------
     ValueError
         If ``angle`` is outside ``[0, 180]``.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -89,6 +92,7 @@ def crease_edges(
     [`triwarp.adjacency.face_adjacency_angles`][triwarp.adjacency.face_adjacency_angles]
     [`triwarp.boundary.boundary_edges`][triwarp.boundary.boundary_edges]
     """
+    require_same_device(vertices=vertices, faces=faces)
     if not 0.0 <= angle <= 180.0:
         raise ValueError(f"angle must be in [0, 180] degrees, got {angle}")
 
@@ -173,6 +177,8 @@ def cut_along_edges(
     ValueError
         If ``edges`` is not a rank-2 ``int32`` array with two columns, or ``faces`` is not
         edge-manifold.
+    RuntimeError
+        If ``vertices``, ``faces``, ``edges`` and ``twins`` are not all on one device.
 
     See Also
     --------
@@ -188,6 +194,7 @@ def cut_along_edges(
     warning — a cut mesh must not be passed through a position-based weld if the seams are meant to
     survive.
     """
+    require_same_device(vertices=vertices, faces=faces, edges=edges, twins=twins)
     twt.ensure_ndim(edges, 2, dtype=wp.int32)
     if int(edges.shape[1]) != 2:
         raise ValueError(f"edges must have shape (k, 2), got {edges.shape}")
@@ -323,6 +330,8 @@ def uv_seam_edges(
         ``texcoords`` is not length ``3 * n_faces``; or if ``faces`` is not edge-manifold.
     KeyError
         If ``match`` is neither ``"index"`` nor ``"uv"``.
+    RuntimeError
+        If ``faces``, ``texcoords``, ``face_texcoords`` and ``twins`` are not all on one device.
 
     See Also
     --------
@@ -347,6 +356,9 @@ def uv_seam_edges(
       type.
     - igl also takes ``V``, but reads only its row count — the ``n_vertices`` argument here.
     """
+    require_same_device(
+        faces=faces, texcoords=texcoords, face_texcoords=face_texcoords, twins=twins
+    )
     n_faces = int(faces.shape[0]) // 3
     if match is None:
         match = "index" if face_texcoords is not None else "uv"
@@ -449,12 +461,15 @@ def seam_edge_vertices(
     ------
     ValueError
         If ``face_corners`` is not a rank-2 ``int32`` array with at least two columns.
+    RuntimeError
+        If ``faces`` and ``face_corners`` are not all on one device.
 
     See Also
     --------
     [`uv_seam_edges`][triwarp.seams.uv_seam_edges]
     [`cut_along_edges`][triwarp.seams.cut_along_edges]
     """
+    require_same_device(faces=faces, face_corners=face_corners)
     twt.ensure_ndim(face_corners, 2, dtype=wp.int32)
     if int(face_corners.shape[1]) < 2:
         raise ValueError(f"face_corners must have at least two columns, got {face_corners.shape}")
@@ -514,12 +529,18 @@ def uv_seam_vertex_mask(
     wp.array[wp.bool]
         Length-``n_vertices`` mask on ``faces.device``. Unreferenced vertices are always ``False``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces``, ``texcoords`` and ``face_texcoords`` are not all on one device.
+
     See Also
     --------
     [`uv_seam_edges`][triwarp.seams.uv_seam_edges]
     [`seam_edge_vertices`][triwarp.seams.seam_edge_vertices]
     [`triwarp.array.indices_to_mask`][triwarp.array.indices_to_mask]
     """
+    require_same_device(faces=faces, texcoords=texcoords, face_texcoords=face_texcoords)
     if n_vertices is None:
         n_vertices = tw.array.index_bound(faces)
     seams, boundaries, _foldovers = uv_seam_edges(

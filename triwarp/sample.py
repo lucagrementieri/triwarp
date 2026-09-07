@@ -37,7 +37,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.array import arange, flatnonzero, gather
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
@@ -226,7 +226,10 @@ def sample_surface(
     ValueError
         If ``face_weight`` is given and its length is not the triangle count, or if the total
         face weight is not positive.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``face_weight`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces, face_weight=face_weight)
     n_faces = faces.shape[0] // 3
     if count == 0:
         return (
@@ -311,7 +314,10 @@ def sample_surface_poisson_disk(
     ------
     ValueError
         If ``init_factor < 1`` or if the mesh has no faces.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``face_weight`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces, face_weight=face_weight)
     device = vertices.device
 
     if count == 0:
@@ -475,6 +481,8 @@ def sample_surface_blue_noise(
     ------
     ValueError
         If ``radius <= 0`` or if the mesh has no faces.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     Notes
     -----
@@ -483,6 +491,7 @@ def sample_surface_blue_noise(
     usually chosen from. Ask for a *count* with
     [`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk] instead.
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_faces = faces.shape[0] // 3
 
@@ -697,7 +706,10 @@ def sample_volume(
         If the mesh has zero total volume, or some signed tetrahedron volumes are negative after
         fanning from the centroid (the mesh is not star-shaped with respect to its own centroid,
         e.g. a torus).
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_faces = faces.shape[0] // 3
 
     if count == 0:

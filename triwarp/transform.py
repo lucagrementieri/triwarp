@@ -44,6 +44,7 @@ from enum import StrEnum
 import numpy as np
 import warp as wp
 
+from triwarp._device import require_same_device
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import transform as kernel_transform
 
@@ -130,6 +131,11 @@ def transform_points(
     wp.array[wp.vec3]
         ``out``, or a freshly allocated ``(n,)`` buffer on ``points.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``points``, ``matrix`` and ``out`` are not all on one device.
+
     Notes
     -----
     Safe in place: each thread reads exactly the element it writes.
@@ -140,6 +146,7 @@ def transform_points(
     [`transform_normals`][triwarp.transform.transform_normals]
     [`transform_mesh`][triwarp.transform.transform_mesh]
     """
+    require_same_device(points=points, matrix=matrix, out=out)
     result = (
         wp.empty(int(points.shape[0]), dtype=wp.vec3, device=points.device) if out is None else out
     )
@@ -181,11 +188,17 @@ def transform_vectors(
     wp.array[wp.vec3]
         ``out``, or a freshly allocated ``(n,)`` buffer on ``vectors.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vectors`` and ``out`` are not all on one device.
+
     See Also
     --------
     [`transform_points`][triwarp.transform.transform_points]
     [`transform_normals`][triwarp.transform.transform_normals]
     """
+    require_same_device(vectors=vectors, out=out)
     result = (
         wp.empty(int(vectors.shape[0]), dtype=wp.vec3, device=vectors.device)
         if out is None
@@ -227,6 +240,8 @@ def transform_normals(
     ------
     ValueError
         If the linear block of ``matrix`` is singular, so no normal map exists.
+    RuntimeError
+        If ``normals`` and ``out`` are not all on one device.
 
     Notes
     -----
@@ -239,6 +254,7 @@ def transform_normals(
     [`normal_matrix`][triwarp.transform.normal_matrix]
     [`transform_vectors`][triwarp.transform.transform_vectors]
     """
+    require_same_device(normals=normals, out=out)
     result = (
         wp.empty(int(normals.shape[0]), dtype=wp.vec3, device=normals.device)
         if out is None
@@ -284,12 +300,25 @@ def transform_mesh(
     faces : wp.array[wp.int32]
         Face buffer, corner-reversed if ``matrix`` mirrors and otherwise a copy of the input.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``matrix``, ``out_vertices`` and ``out_faces`` are not all on
+        one device.
+
     See Also
     --------
     [`transform_points`][triwarp.transform.transform_points]
     [`Trimesh.transform`][triwarp.mesh.Trimesh.transform]
         The cached-mesh entry point, which carries derived quantities forward.
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        matrix=matrix,
+        out_vertices=out_vertices,
+        out_faces=out_faces,
+    )
     new_vertices = transform_points(vertices, matrix, out=out_vertices)
     new_faces = (
         wp.empty(int(faces.shape[0]), dtype=wp.int32, device=faces.device)

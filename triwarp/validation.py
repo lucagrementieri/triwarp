@@ -9,7 +9,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_nonempty_mesh
+from triwarp._device import read_scalar, require_nonempty_mesh, require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import intersection as kernel_intersections
 from triwarp.kernels import triangles as kernel_triangles
@@ -50,6 +50,11 @@ def is_edge_manifold(
         ``True`` when all edges satisfy the manifold condition. Vacuously ``True`` for an empty
         mesh.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``edges_sorted`` are not all on one device.
+
     See Also
     --------
     [`is_vertex_manifold`][triwarp.validation.is_vertex_manifold]
@@ -64,6 +69,7 @@ def is_edge_manifold(
     pairs here: this reduces the per-edge counts directly, where the mask additionally needs
     ``unique_1d``'s inverse and a per-face gather pass. Delegating would add both to the cheap path.
     """
+    require_same_device(faces=faces, edges_sorted=edges_sorted)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return True
@@ -83,8 +89,9 @@ def is_edge_manifold(
 
 def edge_manifold_mask(
     faces: wp.array[wp.int32],
-    edges_sorted: twt.Array2dInt32 | None = None,
     allow_boundary_edges: bool = True,
+    *,
+    edges_sorted: twt.Array2dInt32 | None = None,
 ) -> wp.array[wp.bool]:
     """
     Per-face flag: whether all three of each face's undirected edges are edge-manifold.
@@ -100,24 +107,30 @@ def edge_manifold_mask(
     ----------
     faces
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    allow_boundary_edges
+        When ``True`` (default) boundary edges (used by a single face) count as manifold. When
+        ``False`` every edge of a face must be shared by exactly two faces.
     edges_sorted
         Optional precomputed ``(n_faces * 3, 2)`` sorted edges in
         [`faces_to_edges`][triwarp.edges.faces_to_edges] row order (each row min-first). When
         ``None``, built from ``faces``.
-    allow_boundary_edges
-        When ``True`` (default) boundary edges (used by a single face) count as manifold. When
-        ``False`` every edge of a face must be shared by exactly two faces.
 
     Returns
     -------
     wp.array[wp.bool]
         Length ``n_faces`` on ``faces.device``. Empty for an empty mesh.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``edges_sorted`` are not all on one device.
+
     See Also
     --------
     [`is_edge_manifold`][triwarp.validation.is_edge_manifold]
     [`vertex_manifold_mask`][triwarp.validation.vertex_manifold_mask]
     """
+    require_same_device(faces=faces, edges_sorted=edges_sorted)
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     if n_faces == 0:
@@ -181,6 +194,8 @@ def is_vertex_manifold(
     ------
     ValueError
         If exactly one of ``face_adjacency`` / ``face_adjacency_edges`` is provided.
+    RuntimeError
+        If ``faces``, ``face_adjacency`` and ``face_adjacency_edges`` are not all on one device.
 
     See Also
     --------
@@ -199,6 +214,9 @@ def is_vertex_manifold(
     [`vertex_manifold_mask`][triwarp.validation.vertex_manifold_mask] for a per-vertex flag
     sized to a caller-provided vertex buffer.
     """
+    require_same_device(
+        faces=faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
+    )
     # Checked before the empty-mesh guard so a caller passing only one half of the pair is told
     # about it whatever the mesh is; resolved after it, because on an empty buffer the resolve is
     # two empty tables nothing reads. Every wrapper taking this pair does it in this order.
@@ -238,11 +256,17 @@ def vertex_manifold_mask(
     wp.array[wp.bool]
         Length ``n_vertices`` on ``faces.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`is_vertex_manifold`][triwarp.validation.is_vertex_manifold]
     [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]
     """
+    require_same_device(vertices=vertices, faces=faces)
     n_vertices = int(vertices.shape[0])
     if int(faces.shape[0]) // 3 == 0:
         return wp.zeros(n_vertices, dtype=wp.bool, device=faces.device)
@@ -434,10 +458,16 @@ def face_self_intersecting_mask(
     wp.array[wp.bool]
         Length ``n_faces`` on ``faces.device``. All-``False`` for meshes with fewer than two faces.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``mesh`` are not all on one device.
+
     See Also
     --------
     [`is_self_intersecting`][triwarp.validation.is_self_intersecting]
     """
+    require_same_device(vertices=vertices, faces=faces, mesh=mesh)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     mask = wp.zeros(n_faces, dtype=wp.bool, device=device)
@@ -599,11 +629,17 @@ def edge_winding_consistent_mask(
     wp.array[wp.bool]
         Length ``n_shared_edges`` on ``faces.device``. Empty when the mesh has no shared edges.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces``, ``edges`` and ``edges_sorted`` are not all on one device.
+
     See Also
     --------
     [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
     [`face_flip_mask`][triwarp.validation.face_flip_mask]
     """
+    require_same_device(faces=faces, edges=edges, edges_sorted=edges_sorted)
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     if n_faces == 0:
@@ -759,7 +795,7 @@ def is_orientable(faces: wp.array[wp.int32]) -> bool:
         inputs=[signed_edges, signs, orient, conflict],
         device=device,
     )
-    return conflict.numpy().item() == 0
+    return int(read_scalar(conflict, 0)) == 0
 
 
 def face_flip_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
@@ -846,6 +882,11 @@ def is_watertight(
         ``True`` when the mesh is edge-manifold (no boundary), vertex-manifold, and not
         self-intersecting.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``edges_sorted`` and ``mesh`` are not all on one device.
+
     See Also
     --------
     [`face_watertight_mask`][triwarp.validation.face_watertight_mask]
@@ -867,6 +908,7 @@ def is_watertight(
     ``all(face_watertight_mask(faces))`` is the *first* of the three conditions and not this
     function. Every other ``is_*`` / ``*_mask`` pair in this module does relate that way.
     """
+    require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted, mesh=mesh)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return True
@@ -918,11 +960,17 @@ def face_watertight_mask(
     wp.array[wp.bool]
         Length ``n_faces`` on ``faces.device``. Empty for an empty mesh.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``edges_sorted`` are not all on one device.
+
     See Also
     --------
     [`is_watertight`][triwarp.validation.is_watertight]
     [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]
     """
+    require_same_device(faces=faces, edges_sorted=edges_sorted)
     return edge_manifold_mask(faces, edges_sorted=edges_sorted, allow_boundary_edges=False)
 
 
@@ -961,6 +1009,11 @@ def is_volume(
         ``True`` when the mesh is watertight, winding-consistent, and has outward normals (positive
         signed volume). ``False`` for an empty mesh.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``edges`` and ``edges_sorted`` are not all on one device.
+
     See Also
     --------
     [`make_volume`][triwarp.repair.make_volume]
@@ -980,6 +1033,7 @@ def is_volume(
     volumes ``dot(v0, cross(v1, v2)) / 6`` measured from the origin; for a closed surface this is
     independent of the reference point and its sign encodes the normal orientation.
     """
+    require_same_device(vertices=vertices, faces=faces, edges=edges, edges_sorted=edges_sorted)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return False
@@ -1062,6 +1116,8 @@ def face_defective_mask(
     ------
     ValueError
         If ``max_normal_angle`` or ``max_fold_angle`` is outside ``(0, 180]``.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``face_normals`` are not all on one device.
 
     Notes
     -----
@@ -1079,6 +1135,7 @@ def face_defective_mask(
     [`triwarp.triangles.face_quality`][triwarp.triangles.face_quality]
         The thinness measure ``min_quality`` gates on.
     """
+    require_same_device(vertices=vertices, faces=faces, face_normals=face_normals)
     for name, angle in (("max_normal_angle", max_normal_angle), ("max_fold_angle", max_fold_angle)):
         if angle is not None and not 0.0 < angle <= 180.0:
             raise ValueError(f"{name} must be in (0, 180] degrees, got {angle}")

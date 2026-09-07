@@ -5,6 +5,7 @@ from __future__ import annotations
 import warp as wp
 
 import triwarp as tw
+from triwarp._device import require_same_device
 from triwarp.bounds import aabb, enclosing_diagonal
 from triwarp.constants import TOLERANCE_PLANAR
 from triwarp.kernels import proximity as kernel_proximity
@@ -46,7 +47,13 @@ def intersects_location(
         ``(m,)`` index of the ray that produced each hit.
     index_tri
         ``(m,)`` face indices for each hit.
+
+    Raises
+    ------
+    RuntimeError
+        If ``mesh``, ``ray_origins`` and ``ray_directions`` are not all on one device.
     """
+    require_same_device(mesh=mesh, ray_origins=ray_origins, ray_directions=ray_directions)
     n = ray_origins.shape[0]
     device = ray_origins.device
     if n == 0:
@@ -112,7 +119,13 @@ def intersects_first(
     -------
     wp.array[wp.int32]
         ``(n,)`` face indices; ``-1`` when a ray misses within ``max_t``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``mesh``, ``ray_origins`` and ``ray_directions`` are not all on one device.
     """
+    require_same_device(mesh=mesh, ray_origins=ray_origins, ray_directions=ray_directions)
     n = ray_origins.shape[0]
     if n == 0:
         return wp.empty(0, dtype=wp.int32, device=ray_origins.device)
@@ -163,7 +176,13 @@ def intersects_any(
     -------
     wp.array[wp.bool]
         ``(n,)`` hit flags; ``True`` when a ray hits within ``max_t``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``mesh``, ``ray_origins`` and ``ray_directions`` are not all on one device.
     """
+    require_same_device(mesh=mesh, ray_origins=ray_origins, ray_directions=ray_directions)
     n = ray_origins.shape[0]
     if n == 0:
         return wp.empty(0, dtype=wp.bool, device=ray_origins.device)
@@ -219,7 +238,13 @@ def longest_ray(
     -------
     wp.array[wp.float32]
         ``(n,)`` unobstructed ray lengths; ``inf`` when a ray misses within ``max_t``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``mesh``, ``ray_origins`` and ``ray_directions`` are not all on one device.
     """
+    require_same_device(mesh=mesh, ray_origins=ray_origins, ray_directions=ray_directions)
     n = ray_origins.shape[0]
     if n == 0:
         return wp.empty(0, dtype=wp.float32, device=ray_origins.device)
@@ -300,10 +325,16 @@ def contains_points(
     wp.array[wp.bool]
         ``(n,)`` flags; ``True`` when the point is classified as inside the mesh.
 
+    Raises
+    ------
+    RuntimeError
+        If ``mesh`` and ``points`` are not all on one device.
+
     See Also
     --------
     [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
     """
+    require_same_device(mesh=mesh, points=points)
     n = points.shape[0]
     if n == 0:
         return wp.empty(0, dtype=wp.bool, device=points.device)

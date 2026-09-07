@@ -30,7 +30,7 @@ import numpy as np
 import warp as wp
 
 import triwarp as tw
-from triwarp._device import prefers_tiled_reduction, read_scalar, slice_count
+from triwarp._device import prefers_tiled_reduction, read_scalar, require_same_device, slice_count
 from triwarp.constants import TILE_1D
 from triwarp.kernels import measures as kernel_measures
 
@@ -59,6 +59,11 @@ def volume(vertices: wp.array[wp.vec3] | wp.array[wp.vec3d], faces: wp.array[wp.
     float
         Signed volume, accumulated in ``vertices``' scalar type. ``0.0`` for an empty mesh.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`face_signed_volumes`][triwarp.triangles.face_signed_volumes]
@@ -73,6 +78,7 @@ def volume(vertices: wp.array[wp.vec3] | wp.array[wp.vec3d], faces: wp.array[wp.
         The ``float64`` consumer: its volume constraint rescales the mesh to hold this fixed.
     [`trimesh.Trimesh.volume`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     if int(faces.shape[0]) == 0:
         return 0.0
     return tw.reduce.sum(tw.triangles.face_signed_volumes(vertices, faces))
@@ -99,6 +105,11 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     wp.vec3
         Area-weighted mean of per-face centroids. All-``NaN`` when ``faces`` is empty.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`moments`][triwarp.measures.moments]
@@ -109,6 +120,7 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
         The unweighted mean of a point cloud, and the only other ``centroid`` in the package.
     [`trimesh.Trimesh.centroid`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     f = faces.shape[0] // 3
     if f == 0:
         return wp.vec3(float("nan"), float("nan"), float("nan"))
@@ -178,6 +190,11 @@ def moments(
         integrals it is assembled from -- a ``wp.mat33`` would discard exactly the low digits this
         function accumulates in double precision to keep.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     Notes
     -----
     ``igl.moments`` returns ``(m0, m1, m2)`` where ``m1`` is the first moment -- the centre of mass
@@ -196,6 +213,7 @@ def moments(
     [`trimesh.Trimesh.moment_inertia`][]
     ``igl.moments``
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:

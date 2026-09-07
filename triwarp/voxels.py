@@ -71,6 +71,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import interpolation as kernel_interpolation
 from triwarp.kernels import scatter as kernel_scatter
@@ -159,6 +160,8 @@ def voxelize_mesh(
         ``max_candidates`` bounds the (triangle, cell) pairs, which is a *surface* count, and the
         fill densifies the occupied *box*, so a large thin mesh can clear this guard and meet that
         one. The fill runs at its own default budget.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -177,6 +180,7 @@ def voxelize_mesh(
     under half a pitch, then round each vertex to a cell -- and its result neither contains nor is
     contained in this one.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if mode not in ("surface", "solid"):
         raise ValueError(f"mode must be 'surface' or 'solid', got {mode!r}")
     if max_candidates <= 0:
@@ -387,12 +391,15 @@ def pool_by_voxel(
         If ``pooling`` is not one of the four names, or ``points`` and ``values`` differ in length.
     TypeError
         If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+    RuntimeError
+        If ``grid``, ``points`` and ``values`` are not all on one device.
 
     See Also
     --------
     [`voxel_down_sample`][triwarp.voxels.voxel_down_sample]
     [`cell_centers`][triwarp.voxels.cell_centers]
     """
+    require_same_device(grid=grid, points=points, values=values)
     if pooling not in ("mean", "min", "max", "sum"):
         raise ValueError(f"pooling must be 'mean', 'sum', 'min' or 'max', got {pooling!r}")
     if int(points.shape[0]) != int(values.shape[0]):
@@ -803,12 +810,15 @@ def occupancy_at_points(grid: wp.Volume, points: wp.array[wp.vec3]) -> wp.array[
     ------
     TypeError
         If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+    RuntimeError
+        If ``grid`` and ``points`` are not all on one device.
 
     See Also
     --------
     [`occupancy_at_cells`][triwarp.voxels.occupancy_at_cells]
     [`cell_indices`][triwarp.voxels.cell_indices]
     """
+    require_same_device(grid=grid, points=points)
     _require_index_grid(grid)
     n_points = int(points.shape[0])
     mask = wp.empty(n_points, dtype=wp.bool, device=points.device)
@@ -845,12 +855,15 @@ def occupancy_at_cells(grid: wp.Volume, cells: twt.Array2dInt32) -> wp.array[wp.
     TypeError
         If ``cells`` is not a rank-2 ``wp.int32`` array, or ``grid`` is not a NanoVDB index grid
         with isotropic voxels.
+    RuntimeError
+        If ``grid`` and ``cells`` are not all on one device.
 
     See Also
     --------
     [`occupancy_at_points`][triwarp.voxels.occupancy_at_points]
     [`cells`][triwarp.voxels.cells]
     """
+    require_same_device(grid=grid, cells=cells)
     _require_index_grid(grid)
     twt.ensure_ndim(cells, 2, dtype=wp.int32)
     if int(cells.shape[1]) != 3:
@@ -921,6 +934,8 @@ def splat_onto_grid(
     ValueError
         If ``shape`` is not three positive integers, if ``points`` and ``values`` differ in length,
         or if ``min_weight`` is not positive.
+    RuntimeError
+        If ``points`` and ``values`` are not all on one device.
 
     See Also
     --------
@@ -953,6 +968,7 @@ def splat_onto_grid(
       lattice the round trip is a smoothing rather than the identity, and the residual comes from
       the corners no point reached: a query whose stencil touches one averages a zero in.
     """
+    require_same_device(points=points, values=values)
     if len(shape) != 3 or min(int(n) for n in shape) < 1:
         raise ValueError(f"shape must be three positive integers, got {shape!r}")
     if int(points.shape[0]) != int(values.shape[0]):
@@ -1021,6 +1037,8 @@ def sample_grid_trilinear(
     ------
     ValueError
         If ``field`` is not rank 3.
+    RuntimeError
+        If ``field`` and ``points`` are not all on one device.
 
     See Also
     --------
@@ -1042,6 +1060,7 @@ def sample_grid_trilinear(
     [`triwarp.reconstruction`][triwarp.reconstruction] already had. Clamp or mask the query set
     yourself if an outside position should be an error.
     """
+    require_same_device(field=field, points=points)
     if field.ndim != 3:
         raise ValueError(f"field must be a rank-3 lattice, got ndim {field.ndim}")
     dims = (int(field.shape[0]), int(field.shape[1]), int(field.shape[2]))
@@ -1184,6 +1203,8 @@ def union(a: wp.Volume, b: wp.Volume) -> wp.Volume:
         If the two grids differ in cell width or in origin.
     TypeError
         If either argument is not a NanoVDB index grid with isotropic voxels.
+    RuntimeError
+        If ``a`` and ``b`` are not all on one device.
 
     See Also
     --------
@@ -1199,6 +1220,7 @@ def union(a: wp.Volume, b: wp.Volume) -> wp.Volume:
     passes to both builds; [`revoxelize`][triwarp.voxels.revoxelize] moves an existing grid onto
     another lattice.
     """
+    require_same_device(a=a, b=b)
     voxel_size, origin = _require_same_lattice(a, b, caller="union")
     rows_a = cells(a)
     rows_b = cells(b)
@@ -1238,6 +1260,8 @@ def intersection(a: wp.Volume, b: wp.Volume) -> wp.Volume:
         If the two grids differ in cell width or in origin.
     TypeError
         If either argument is not a NanoVDB index grid with isotropic voxels.
+    RuntimeError
+        If ``a`` and ``b`` are not all on one device.
 
     See Also
     --------
@@ -1245,6 +1269,7 @@ def intersection(a: wp.Volume, b: wp.Volume) -> wp.Volume:
     [`difference`][triwarp.voxels.difference]
     [`occupancy_at_cells`][triwarp.voxels.occupancy_at_cells]
     """
+    require_same_device(a=a, b=b)
     voxel_size, origin = _require_same_lattice(a, b, caller="intersection")
     return _select_cells(a, b, voxel_size, origin, present=True)
 
@@ -1275,6 +1300,8 @@ def difference(a: wp.Volume, b: wp.Volume) -> wp.Volume:
         If the two grids differ in cell width or in origin.
     TypeError
         If either argument is not a NanoVDB index grid with isotropic voxels.
+    RuntimeError
+        If ``a`` and ``b`` are not all on one device.
 
     See Also
     --------
@@ -1283,6 +1310,7 @@ def difference(a: wp.Volume, b: wp.Volume) -> wp.Volume:
     [`surface_voxels`][triwarp.voxels.surface_voxels]
         The shell, which is this operation against the grid's own erosion.
     """
+    require_same_device(a=a, b=b)
     voxel_size, origin = _require_same_lattice(a, b, caller="difference")
     return _select_cells(a, b, voxel_size, origin, present=False)
 

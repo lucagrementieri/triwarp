@@ -506,6 +506,61 @@ def test_mesh_to_mesh_distance_when_the_vertex_bound_is_the_answer(device: str) 
         assert np.isclose(distance, float(np.sqrt(result_ml.distSq)), rtol=1e-5, atol=1e-6)
 
 
+def test_mesh_to_mesh_distance_face_a_tie_break_is_the_lowest_index(device: str) -> None:
+    """
+    Not a library comparison: pins the documented ``face_a`` tie-break rule.
+
+    Checked against the mesh's own topology, not against a single face the implementation
+    happens to prefer. Two icospheres separated so they touch at a single vertex on each side put
+    every face
+    incident to that vertex -- six, at this subdivision -- in a genuine three-way-or-more tie
+    for the global minimum: each of the six touches the other mesh through the identical shared
+    point, so each has its own candidate pair at exactly the true minimum distance. The
+    docstring promises ``face_a`` is the lowest index among a tied set; this computes that set
+    from the mesh's own faces (which ones touch the closest vertex) and asserts the returned
+    ``face_a`` is its minimum, rather than merely asserting it is *some* valid tied face.
+
+    The broad phase publishes a running minimum across query-face threads via ``wp.atomic_min``
+    so sibling threads can prune against it. Publishing the *exact* value would let a thread
+    whose own tied candidate has a box gap equal to that value be pruned by the ``>=`` test
+    before it reaches the leaf test -- and which of several tied threads loses that race would
+    depend on scheduling order, breaking the documented guarantee. ``_GLOBAL_BEST_RELAX``
+    (`kernels/proximity.py`) removes the possibility structurally: every publish is strictly
+    looser than any tied candidate's exact box gap, so no tied thread can ever be pruned by
+    another's publish regardless of interleaving -- which is what makes it sound to assert
+    equality against a specific index rather than mere set membership.
+
+    This assertion did not reproduce a wrong ``face_a`` when checked against a deliberately
+    unrelaxed build on this hardware, at this scale and at a synthetic scale of 60 simultaneous
+    tied clusters (360 tied faces) -- CUDA's block scheduling for these grid sizes appears to
+    complete tied threads in an order that already favours the low index, so this is not a proven
+    bug-catcher for that specific regression. It still pins a real, falsifiable claim (one of six
+    plausible indices), which is why it stays as a positive-value test of the documented contract.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    shifted_tm = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    shifted_tm.apply_translation([2.0, 0.0, 0.0])
+
+    vertices_a = np.asarray(sphere_tm.vertices)
+    faces_a = np.asarray(sphere_tm.faces)
+    closest_vertex_a = int(np.argmax(vertices_a[:, 0]))
+    tied_faces_a = np.flatnonzero((faces_a == closest_vertex_a).any(axis=1))
+    assert tied_faces_a.shape[0] > 1  # a real multi-face tie, not a vacuous single-face one
+
+    a_vertices_wp, a_faces_wp = numpy_to_warp(vertices_a, faces_a.ravel().astype(np.int32), device)
+    b_vertices_wp, b_faces_wp = numpy_to_warp(
+        np.asarray(shifted_tm.vertices),
+        np.asarray(shifted_tm.faces).ravel().astype(np.int32),
+        device,
+    )
+    for _ in range(5):
+        distance, face_a, _face_b = tw.proximity.mesh_to_mesh_distance(
+            a_vertices_wp, a_faces_wp, b_vertices_wp, b_faces_wp
+        )
+        assert np.isclose(distance, 0.0, atol=1e-6)
+        assert face_a == int(tied_faces_a.min())
+
+
 @pytest.mark.parity(
     "mesh_to_mesh_distance",
     "pymeshlab",

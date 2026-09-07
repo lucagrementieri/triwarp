@@ -37,7 +37,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import prefers_tiled_reduction, slice_count
+from triwarp._device import prefers_tiled_reduction, require_same_device, slice_count
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import metrics as kernel_metrics
@@ -113,12 +113,18 @@ def chamfer_points_to_points(
         ``(n,)`` array when ``single_directional``, else an ``((n,), (m,))`` tuple.
         Empty inputs yield ``0.0`` (reduced) or empty arrays.
 
+    Raises
+    ------
+    RuntimeError
+        If ``x`` and ``y`` are not all on one device.
+
     See Also
     --------
     [`chamfer_points_to_mesh`][triwarp.metrics.chamfer_points_to_mesh]
     [`chamfer_mesh_to_mesh`][triwarp.metrics.chamfer_mesh_to_mesh]
     [`query_nearest`][triwarp.neighbors.query_nearest]
     """
+    require_same_device(x=x, y=y)
     _validate_point_reduction(point_reduction)
     distances = _distances_points_to_points(x, y, single_directional)
     if distances is None:
@@ -180,12 +186,18 @@ def chamfer_points_to_mesh(
         Same layout as [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points].
         The forward array has length ``n`` and the backward array length ``v``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``points``, ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points]
     [`chamfer_mesh_to_mesh`][triwarp.metrics.chamfer_mesh_to_mesh]
     [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
     """
+    require_same_device(points=points, vertices=vertices, faces=faces)
     _validate_point_reduction(point_reduction)
     distances = _distances_points_to_mesh(points, vertices, faces, single_directional)
     if distances is None:
@@ -247,12 +259,20 @@ def chamfer_mesh_to_mesh(
         Same layout as [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points].
         The forward array has length ``va`` and the backward array length ``vb``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
+
     See Also
     --------
     [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points]
     [`chamfer_points_to_mesh`][triwarp.metrics.chamfer_points_to_mesh]
     [`hausdorff_mesh_to_mesh`][triwarp.metrics.hausdorff_mesh_to_mesh]
     """
+    require_same_device(
+        vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
+    )
     _validate_point_reduction(point_reduction)
     distances = _distances_mesh_to_mesh(
         vertices_a, faces_a, vertices_b, faces_b, single_directional
@@ -332,12 +352,18 @@ def chamfer_points_to_points_loss(
         Length-1 device array holding the Chamfer loss (``requires_grad=True``). Empty
         inputs yield a length-1 zero array.
 
+    Raises
+    ------
+    RuntimeError
+        If ``x`` and ``y`` are not all on one device.
+
     See Also
     --------
     [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points]
     [`chamfer_points_to_mesh_loss`][triwarp.metrics.chamfer_points_to_mesh_loss]
     [`chamfer_mesh_to_mesh_loss`][triwarp.metrics.chamfer_mesh_to_mesh_loss]
     """
+    require_same_device(x=x, y=y)
     _validate_diff_reduction(point_reduction)
     device = x.device
     n = int(x.shape[0])
@@ -400,12 +426,18 @@ def chamfer_points_to_mesh_loss(
     wp.array[wp.float32]
         Length-1 device array holding the Chamfer loss (``requires_grad=True``).
 
+    Raises
+    ------
+    RuntimeError
+        If ``points``, ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`chamfer_points_to_mesh`][triwarp.metrics.chamfer_points_to_mesh]
     [`chamfer_points_to_points_loss`][triwarp.metrics.chamfer_points_to_points_loss]
     [`chamfer_mesh_to_mesh_loss`][triwarp.metrics.chamfer_mesh_to_mesh_loss]
     """
+    require_same_device(points=points, vertices=vertices, faces=faces)
     _validate_diff_reduction(point_reduction)
     device = points.device
     n = int(points.shape[0])
@@ -472,12 +504,20 @@ def chamfer_mesh_to_mesh_loss(
     wp.array[wp.float32]
         Length-1 device array holding the Chamfer loss (``requires_grad=True``).
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
+
     See Also
     --------
     [`chamfer_mesh_to_mesh`][triwarp.metrics.chamfer_mesh_to_mesh]
     [`chamfer_points_to_points_loss`][triwarp.metrics.chamfer_points_to_points_loss]
     [`chamfer_points_to_mesh_loss`][triwarp.metrics.chamfer_points_to_mesh_loss]
     """
+    require_same_device(
+        vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
+    )
     _validate_diff_reduction(point_reduction)
     device = vertices_a.device
     va = int(vertices_a.shape[0])
@@ -542,12 +582,18 @@ def hausdorff_points_to_points(
     float
         The (symmetric or directed) Hausdorff distance. ``0.0`` for empty inputs.
 
+    Raises
+    ------
+    RuntimeError
+        If ``x`` and ``y`` are not all on one device.
+
     See Also
     --------
     [`hausdorff_points_to_mesh`][triwarp.metrics.hausdorff_points_to_mesh]
     [`hausdorff_mesh_to_mesh`][triwarp.metrics.hausdorff_mesh_to_mesh]
     [`scipy.spatial.distance.directed_hausdorff`][]
     """
+    require_same_device(x=x, y=y)
     distances = _distances_points_to_points(x, y, single_directional)
     if distances is None:
         return 0.0
@@ -584,11 +630,17 @@ def hausdorff_points_to_mesh(
     float
         The (symmetric or directed) Hausdorff distance. ``0.0`` for empty inputs.
 
+    Raises
+    ------
+    RuntimeError
+        If ``points``, ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`hausdorff_points_to_points`][triwarp.metrics.hausdorff_points_to_points]
     [`hausdorff_mesh_to_mesh`][triwarp.metrics.hausdorff_mesh_to_mesh]
     """
+    require_same_device(points=points, vertices=vertices, faces=faces)
     distances = _distances_points_to_mesh(points, vertices, faces, single_directional)
     if distances is None:
         return 0.0
@@ -625,11 +677,19 @@ def hausdorff_mesh_to_mesh(
     float
         The (symmetric or directed) Hausdorff distance. ``0.0`` for empty inputs.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
+
     See Also
     --------
     [`chamfer_mesh_to_mesh`][triwarp.metrics.chamfer_mesh_to_mesh]
     [`hausdorff_points_to_mesh`][triwarp.metrics.hausdorff_points_to_mesh]
     """
+    require_same_device(
+        vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
+    )
     distances = _distances_mesh_to_mesh(
         vertices_a, faces_a, vertices_b, faces_b, single_directional
     )

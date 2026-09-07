@@ -121,7 +121,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import linalg as kernel_linalg
 from triwarp.kernels.algorithms import conjugate_gradient as kernel_cg
@@ -243,6 +243,11 @@ def min_quad_with_fixed(
     n_free : int
         Number of unpinned degrees of freedom.
 
+    Raises
+    ------
+    RuntimeError
+        If ``fixed_mask`` and ``fixed_values`` are not all on one device.
+
     Notes
     -----
     The elimination is ``igl::min_quad_with_fixed``'s, without its ``Aeq`` linear-equality block --
@@ -258,6 +263,7 @@ def min_quad_with_fixed(
     [`assemble_interior_system`][triwarp.linalg.assemble_interior_system]
     [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
     """
+    require_same_device(fixed_mask=fixed_mask, fixed_values=fixed_values)
     device = fixed_mask.device
     n_rhs = int(fixed_values.shape[0])
     free_map, n_free = free_partition(fixed_mask)
@@ -355,10 +361,16 @@ def assemble_interior_system(
         ``(n_rhs, n_free)`` constant right-hand side. ``arap`` adds its per-iteration rotation term
         to this buffer rather than reassembling it.
 
+    Raises
+    ------
+    RuntimeError
+        If ``fixed_mask``, ``free_map`` and ``fixed_values`` are not all on one device.
+
     See Also
     --------
     [`min_quad_with_fixed`][triwarp.linalg.min_quad_with_fixed]
     """
+    require_same_device(fixed_mask=fixed_mask, free_map=free_map, fixed_values=fixed_values)
     device = fixed_mask.device
     n_dofs = int(fixed_mask.shape[0])
     n_rhs = int(fixed_values.shape[0])
@@ -454,6 +466,11 @@ def solve_spd(
         Whatever ``warp.optim.linear.cg`` returns: iteration count, residual and tolerance. Device
         1-element arrays instead of host scalars when ``check_every=0``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``rhs`` and ``solution`` are not all on one device.
+
     Warns
     -----
     UserWarning
@@ -468,6 +485,7 @@ def solve_spd(
     [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
     [`spd_column_solver`][triwarp.linalg.spd_column_solver]
     """
+    require_same_device(rhs=rhs, solution=solution)
     n_rows = int(rhs.shape[0])
     iteration_cap = CG_MAXITER_FACTOR * n_rows if maxiter is None else maxiter
     result = wpl.cg(
@@ -567,6 +585,8 @@ def solve_spd_columns(
     ValueError
         If ``preconditioner`` is not one of the three names above. It is rejected rather than
         treated as ``"diag"``, so a misspelling cannot turn into a silently slower solve.
+    RuntimeError
+        If ``rhs`` and ``solution`` are not all on one device.
 
     Warns
     -----
@@ -613,6 +633,7 @@ def solve_spd_columns(
     [`spd_column_solver`][triwarp.linalg.spd_column_solver]
     [`replicated_operator`][triwarp.linalg.replicated_operator]
     """
+    require_same_device(rhs=rhs, solution=solution)
     result = _cg_columns(
         matrix,
         rhs,
@@ -690,6 +711,8 @@ def spd_column_solver(
     ValueError
         If ``preconditioner`` is ``"auto"``, for the reason above, or is not one of the two names
         this accepts.
+    RuntimeError
+        If ``rhs`` and ``solution`` are not all on one device.
 
     Examples
     --------
@@ -704,6 +727,7 @@ def spd_column_solver(
     --------
     [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
     """
+    require_same_device(rhs=rhs, solution=solution)
     return _cg_columns(
         matrix,
         rhs,

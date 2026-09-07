@@ -31,6 +31,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import interpolation as kernel_interpolation
 from triwarp.kernels import scatter as kernel_scatter
@@ -58,7 +59,13 @@ def average_onto_faces(
     -------
     wp.array[wp.float32]
         Length ``n_faces`` scalar field defined on faces. Empty when ``n_faces == 0``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``vertex_values`` are not all on one device.
     """
+    require_same_device(faces=faces, vertex_values=vertex_values)
     n_faces = int(faces.shape[0]) // 3
     device = vertex_values.device
     if n_faces == 0:
@@ -98,6 +105,11 @@ def average_onto_vertices(
     wp.array[wp.float32]
         Length ``n_vertices`` scalar field defined on vertices.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``face_values`` are not all on one device.
+
     See Also
     --------
     [`average_from_edges_onto_vertices`][triwarp.interpolation.average_from_edges_onto_vertices]
@@ -105,6 +117,7 @@ def average_onto_vertices(
         **zero-valence** vertex on purpose, each mirroring its own igl function: this one divides
         unguarded and yields ``nan``, that one guards and yields ``0``.
     """
+    require_same_device(faces=faces, face_values=face_values)
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
 
@@ -158,6 +171,12 @@ def average_from_edges_onto_vertices(
     wp.array[wp.float32]
         Length ``n_vertices`` scalar field defined on vertices.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces``, ``edges``, ``edges_orientation`` and ``edge_values`` are not all on one
+        device.
+
     See Also
     --------
     [`average_onto_vertices`][triwarp.interpolation.average_onto_vertices]
@@ -165,6 +184,9 @@ def average_from_edges_onto_vertices(
         **zero-valence** vertex on purpose, each mirroring its own igl function: this one guards
         the division and yields ``0``, that one divides unguarded and yields ``nan``.
     """
+    require_same_device(
+        faces=faces, edges=edges, edges_orientation=edges_orientation, edge_values=edge_values
+    )
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
 
@@ -233,6 +255,9 @@ def transfer_onto_vertices(
     ------
     ValueError
         If ``source_values`` does not have one entry per source vertex.
+    RuntimeError
+        If ``source_vertices``, ``source_faces``, ``source_values`` and ``target_vertices`` are not
+        all on one device.
 
     See Also
     --------
@@ -240,6 +265,12 @@ def transfer_onto_vertices(
     [`triwarp.proximity.closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
     [`triwarp.triangles.barycentric_to_points`][triwarp.triangles.barycentric_to_points]
     """
+    require_same_device(
+        source_vertices=source_vertices,
+        source_faces=source_faces,
+        source_values=source_values,
+        target_vertices=target_vertices,
+    )
     device = target_vertices.device
     n_target = int(target_vertices.shape[0])
     n_source = int(source_vertices.shape[0])
@@ -424,6 +455,8 @@ def interpolate_from_points(
     ValueError
         If ``source_values`` does not have one entry per source point, if ``radius`` is not
         positive, or if ``k`` is given and is not positive.
+    RuntimeError
+        If ``source_points``, ``source_values`` and ``query_points`` are not all on one device.
 
     Notes
     -----
@@ -443,6 +476,9 @@ def interpolate_from_points(
     [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets]
     [`query_nearest`][triwarp.neighbors.query_nearest]
     """
+    require_same_device(
+        source_points=source_points, source_values=source_values, query_points=query_points
+    )
     device = query_points.device
     n_source = int(source_points.shape[0])
     n_query = int(query_points.shape[0])

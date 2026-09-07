@@ -61,6 +61,7 @@ import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.typing as twt
 from triwarp import laplacian
+from triwarp._device import require_same_device
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import laplacian as kernel_laplacian
@@ -118,6 +119,11 @@ def filter_laplacian(
     wp.array[wp.vec3]
         Smoothed ``(n_vertices,)`` vertex positions on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`filter_taubin`][triwarp.smoothing.filter_taubin]
@@ -125,6 +131,7 @@ def filter_laplacian(
     [`filter_implicit_fairing`][triwarp.smoothing.filter_implicit_fairing]
     [`trimesh.smoothing.filter_laplacian`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     # This six-line prologue is shared by five of the filters (here, ``filter_humphrey``,
     # ``filter_taubin``, ``filter_neighborhood_average`` and ``filter_mut_dif_laplacian``), but a
     # shared helper is not worth it: the two halves have no common consumer.
@@ -314,6 +321,8 @@ def inflate(
     ------
     ValueError
         If ``iterations`` is negative.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -325,6 +334,7 @@ def inflate(
     [`thicken_mesh`][triwarp.levelset.thicken_mesh]
         Turns a surface into a solid shell, which is the other way to give it thickness.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if iterations < 0:
         raise ValueError(f"iterations must be non-negative, got {iterations}")
     device = faces.device
@@ -405,11 +415,17 @@ def filter_humphrey(
     wp.array[wp.vec3]
         Smoothed ``(n_vertices,)`` vertex positions on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
     [`trimesh.smoothing.filter_humphrey`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0 or iterations == 0:
@@ -503,6 +519,8 @@ def filter_spikes(
     ------
     ValueError
         If ``max_iter`` is negative.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -513,6 +531,7 @@ def filter_spikes(
     [`validation.face_defective_mask`][triwarp.validation.face_defective_mask]
         Flags the *faces* a spike produces, where this flags the vertex itself.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if max_iter < 0:
         raise ValueError(f"max_iter must be non-negative, got {max_iter}")
     device = faces.device
@@ -624,6 +643,8 @@ def equalize_triangle_areas(
         right area. For shape, flip the triangulation
         ([`flip_by_objective`][triwarp.remesh.flip_by_objective]) or remesh
         ([`isotropic_remesh`][triwarp.remesh.isotropic_remesh]); this moves vertices only.
+    RuntimeError
+        If ``vertices``, ``faces``, ``region`` and ``vertex_faces`` are not all on one device.
 
     See Also
     --------
@@ -634,6 +655,7 @@ def equalize_triangle_areas(
     [`isotropic_remesh`][triwarp.remesh.isotropic_remesh]
         Equalizes edge *lengths*, by changing the connectivity as well.
     """
+    require_same_device(vertices=vertices, faces=faces, region=region, vertex_faces=vertex_faces)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     flags, limit = _relaxation_state(vertices, iterations, region, max_displacement)
@@ -728,6 +750,8 @@ def relax_keep_volume(
     ValueError
         If ``iterations`` is negative, if ``max_displacement`` is negative, or if ``region`` is not
         a length-``n_vertices`` ``wp.bool`` array.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``region`` are not all on one device.
 
     See Also
     --------
@@ -737,6 +761,7 @@ def relax_keep_volume(
         The other anti-shrinkage answer: alternate a shrinking pass with an inflating one.
     [`equalize_triangle_areas`][triwarp.smoothing.equalize_triangle_areas]
     """
+    require_same_device(vertices=vertices, faces=faces, region=region)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     flags, limit = _relaxation_state(vertices, iterations, region, max_displacement)
@@ -839,6 +864,8 @@ def relax_approx(
         fewer than six vertices is left exactly where it is rather than fitted to whatever it has.
         On a mesh whose edges are longer than ``dilate_radius`` that is *every* vertex and the call
         returns the input -- check the result moved before concluding the parameters were right.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``region`` are not all on one device.
 
     See Also
     --------
@@ -848,6 +875,7 @@ def relax_approx(
         Fits a quadric over the same geodesic balls, to measure rather than to move.
     [`geodesic_ball`][triwarp.neighbors.geodesic_ball]
     """
+    require_same_device(vertices=vertices, faces=faces, region=region)
     if fit not in ("planar", "quadric"):
         raise ValueError(f"fit must be 'planar' or 'quadric', got {fit!r}")
     if dilate_radius <= 0.0:
@@ -971,6 +999,8 @@ def filter_taubin(
     ------
     ValueError
         If ``recompute`` is set together with ``laplacian_operator``, which would be ignored.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -997,6 +1027,7 @@ def filter_taubin(
     expensive; the connectivity never changes, though, so ``laplacian``'s ``edges`` keyword lets
     every pass share one ``edges_unique`` call rather than re-deriving it each time.
     """
+    require_same_device(vertices=vertices, faces=faces)
     if recompute and laplacian_operator is not None:
         raise ValueError("recompute rebuilds the operator each pass; do not also pass one")
     device = vertices.device
@@ -1074,11 +1105,17 @@ def filter_neighborhood_average(
     wp.array[wp.vec3]
         Smoothed ``(n_vertices,)`` vertex positions on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
     [`filter_taubin`][triwarp.smoothing.filter_taubin]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0 or iterations == 0:
@@ -1164,6 +1201,11 @@ def filter_mut_dif_laplacian(
     wp.array[wp.vec3]
         Smoothed ``(n_vertices,)`` vertex positions on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``face_normals`` and ``face_areas`` are not all on one device.
+
     See Also
     --------
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
@@ -1171,6 +1213,9 @@ def filter_mut_dif_laplacian(
     [`filter_taubin`][triwarp.smoothing.filter_taubin]
     [`trimesh.smoothing.filter_mut_dif_laplacian`][]
     """
+    require_same_device(
+        vertices=vertices, faces=faces, face_normals=face_normals, face_areas=face_areas
+    )
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0 or iterations == 0:
@@ -1304,12 +1349,18 @@ def filter_implicit_fairing(
     wp.array[wp.vec3]
         Smoothed ``(n_vertices,)`` vertex positions on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`mass_matrix`][triwarp.laplacian.mass_matrix]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -1501,6 +1552,11 @@ def smooth_region_fixed_rim(
     wp.array[wp.vec3]
         New vertex positions on ``vertices.device`` (a copy; fixed vertices unchanged).
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``free_mask`` are not all on one device.
+
     See Also
     --------
     [`smooth_region`][triwarp.smoothing.smooth_region]
@@ -1517,6 +1573,7 @@ def smooth_region_fixed_rim(
     and it is returned where it was. That is what the ``solution`` seed decides rather than the
     system: it is seeded with the current positions, not with zeros.
     """
+    require_same_device(vertices=vertices, faces=faces, free_mask=free_mask)
     device = vertices.device
     n = int(vertices.shape[0])
     out = wp.clone(vertices)
@@ -1615,6 +1672,8 @@ def smooth_region(
     ------
     ValueError
         If ``edge_weights`` is not ``"cotan"`` or ``"unit"``.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``free_mask`` are not all on one device.
 
     See Also
     --------
@@ -1629,6 +1688,7 @@ def smooth_region(
     constrain it and it is returned where it was. That is what the ``solution`` seed decides rather
     than the system: it is seeded with the current positions, not with zeros.
     """
+    require_same_device(vertices=vertices, faces=faces, free_mask=free_mask)
     device = vertices.device
     n = int(vertices.shape[0])
     out = wp.clone(vertices)
@@ -1866,7 +1926,10 @@ def refine_and_smooth_region(
     ------
     ValueError
         If ``refine`` is neither ``"max_edge"`` nor ``"density"``.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``patch_face_mask`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces, patch_face_mask=patch_face_mask)
     device = faces.device
     if refine == "density":
         vertices, faces, patch_face_mask = tw.remesh.refine_region_to_density(
@@ -1992,6 +2055,8 @@ def smooth_region_boundary(
         [`split_faces_along_field`][triwarp.intersection.split_faces_along_field] to cut along the
         level set outright) is the way to get past that, and is deliberately not folded in here --
         it changes the face buffer, which this promises not to.
+    RuntimeError
+        If ``vertices``, ``faces``, ``region`` and ``vertex_faces`` are not all on one device.
 
     See Also
     --------
@@ -2002,6 +2067,7 @@ def smooth_region_boundary(
     [`region_boundary_edges`][triwarp.selection.region_boundary_edges]
         The rim as an edge list, which is what this leaves in a better place.
     """
+    require_same_device(vertices=vertices, faces=faces, region=region, vertex_faces=vertex_faces)
     if iterations < 0:
         raise ValueError(f"iterations must be non-negative, got {iterations}")
     device = faces.device
@@ -2181,6 +2247,8 @@ def filter_scalar_laplacian(
     ------
     ValueError
         If ``values`` is not length ``n_vertices``.
+    RuntimeError
+        If ``values``, ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -2188,6 +2256,7 @@ def filter_scalar_laplacian(
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
     [`triwarp.laplacian.laplacian`][triwarp.laplacian.laplacian]
     """
+    require_same_device(values=values, vertices=vertices, faces=faces)
     device = values.device
     n = int(vertices.shape[0])
     if int(values.shape[0]) != n:
@@ -2276,12 +2345,22 @@ def filter_normals(
     ------
     ValueError
         If ``threshold`` is outside ``[0, 180]``.
+    RuntimeError
+        If ``vertices``, ``faces``, ``face_adjacency``, ``face_normals`` and ``face_areas`` are not
+        all on one device.
 
     See Also
     --------
     [`filter_two_step`][triwarp.smoothing.filter_two_step]
     [`triwarp.triangles.face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        face_adjacency=face_adjacency,
+        face_normals=face_normals,
+        face_areas=face_areas,
+    )
     if not 0.0 <= threshold <= 180.0:
         raise ValueError(f"threshold must be in [0, 180] degrees, got {threshold}")
 
@@ -2372,6 +2451,8 @@ def filter_two_step(
     ------
     ValueError
         If ``threshold`` is outside ``[0, 180]``.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     See Also
     --------
@@ -2386,6 +2467,7 @@ def filter_two_step(
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian] has to correct for does not arise. A
     flat region is already a fixed point of both halves.
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -2465,11 +2547,17 @@ def filter_sharpen(
     wp.array[wp.vec3]
         Sharpened ``(n_vertices,)`` vertex positions on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
     [`filter_two_step`][triwarp.smoothing.filter_two_step]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n = int(vertices.shape[0])
     out = wp.empty(n, dtype=wp.vec3, device=device)

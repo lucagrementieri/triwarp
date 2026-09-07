@@ -29,6 +29,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.kernels import predicates as kernel_predicates
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import vertices as kernel_vertices
@@ -61,6 +62,11 @@ def mean_vertex_normals(
         Length-``n_vertices`` device array of unit normals where the accumulated vector was
         non-zero; otherwise the corresponding entry is zero.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``face_normals`` are not all on one device.
+
     See Also
     --------
     [`weighted_vertex_normals`][triwarp.vertices.weighted_vertex_normals]
@@ -68,6 +74,7 @@ def mean_vertex_normals(
     [`vertex_normals`][triwarp.vertices.vertex_normals]
         The geometry-aware entry point, which derives a weight table and calls one of these two.
     """
+    require_same_device(faces=faces, face_normals=face_normals)
     return _accumulate_and_normalize(
         n_vertices, faces, kernel_scatter.scatter_sum_vec, face_normals
     )
@@ -104,6 +111,11 @@ def weighted_vertex_normals(
         Length-``n_vertices`` device array of unit normals where the accumulated vector was
         non-zero; otherwise the corresponding entry is zero.
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces``, ``face_normals`` and ``face_weights`` are not all on one device.
+
     See Also
     --------
     [`mean_vertex_normals`][triwarp.vertices.mean_vertex_normals]
@@ -111,6 +123,7 @@ def weighted_vertex_normals(
     [`vertex_normals`][triwarp.vertices.vertex_normals]
         The geometry-aware entry point, which derives a weight table and calls this.
     """
+    require_same_device(faces=faces, face_normals=face_normals, face_weights=face_weights)
     return _accumulate_and_normalize(
         n_vertices, faces, kernel_scatter.scatter_weighted_sum_vec, face_normals, face_weights
     )
@@ -231,6 +244,9 @@ def vertex_normals(
     ValueError
         If ``weighting`` is not one of the three names, or if ``face_weights`` is passed with
         ``weighting="mwselr"``.
+    RuntimeError
+        If ``vertices``, ``faces``, ``face_normals`` and ``face_weights`` are not all on one
+        device.
 
     See Also
     --------
@@ -243,6 +259,9 @@ def vertex_normals(
     [`triwarp.triangles.face_angles`][triwarp.triangles.face_angles]
         Produces the ``"angle"`` path's weight table.
     """
+    require_same_device(
+        vertices=vertices, faces=faces, face_normals=face_normals, face_weights=face_weights
+    )
     if weighting not in ("area", "angle", "mwselr"):
         raise ValueError(f'weighting must be "area", "angle" or "mwselr", got {weighting!r}')
     if weighting == "mwselr" and face_weights is not None:
@@ -325,6 +344,11 @@ def vertex_defects(
         Length-``n_vertices`` device array ``2π - Σ angles`` at each vertex. Vertices not
         referenced by any face have defect ``2π`` (empty angle sum).
 
+    Raises
+    ------
+    RuntimeError
+        If ``faces`` and ``face_angles`` are not all on one device.
+
     See Also
     --------
     [`discrete_gaussian_curvature`][triwarp.curvature.discrete_gaussian_curvature]
@@ -334,6 +358,7 @@ def vertex_defects(
     [`face_angles`][triwarp.triangles.face_angles]
         The angles this sums.
     """
+    require_same_device(faces=faces, face_angles=face_angles)
     angle_sum = wp.zeros(n_vertices, dtype=wp.float32, device=faces.device)
     faces2d = faces.reshape((-1, 3))
     wp.launch(

@@ -36,7 +36,12 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import prefers_tiled_reduction, read_scalar, require_nonempty_mesh
+from triwarp._device import (
+    prefers_tiled_reduction,
+    read_scalar,
+    require_nonempty_mesh,
+    require_same_device,
+)
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
@@ -158,7 +163,13 @@ def closest_point_on_mesh(
     triangle_id
         ``(m,)`` index of the triangle containing each closest point, or ``-1``
         when no face lies within ``max_dist``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``points`` and ``mesh`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces, points=points, mesh=mesh)
     device = vertices.device
     m = int(points.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -246,6 +257,8 @@ def closest_point_on_edges(
     ------
     ValueError
         If ``edges`` is not a rank-2 ``wp.int32`` array with two columns.
+    RuntimeError
+        If ``vertices``, ``edges``, ``queries`` and ``bvh`` are not all on one device.
 
     Notes
     -----
@@ -268,6 +281,7 @@ def closest_point_on_edges(
         The same computation for an *ordered* chain, where the segments are consecutive vertices and
         no index structure is built.
     """
+    require_same_device(vertices=vertices, edges=edges, queries=queries, bvh=bvh)
     device = vertices.device
     twt.ensure_ndim(edges, 2, dtype=wp.int32)
     if int(edges.shape[1]) != 2:
@@ -388,6 +402,8 @@ def mesh_to_mesh_distance(
         attaining it, and which one comes back can differ between runs of the identical input even
         though the squared distance is bit-identical. Compare *distances* against another
         implementation, and faces only where the configuration is generic.
+    RuntimeError
+        If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
 
     See Also
     --------
@@ -398,6 +414,9 @@ def mesh_to_mesh_distance(
     [`face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask]
         The one-mesh analogue of that.
     """
+    require_same_device(
+        vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
+    )
     if upper_bound is not None and upper_bound < 0.0:
         raise ValueError(f"upper_bound must be non-negative, got {upper_bound}")
     device = faces_a.device
@@ -570,10 +589,16 @@ def normals_at_closest_faces(
         [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]'s own zero-face
         convention.
 
+    Raises
+    ------
+    RuntimeError
+        If ``mesh``, ``points`` and ``face_normals`` are not all on one device.
+
     See Also
     --------
     [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
     """
+    require_same_device(mesh=mesh, points=points, face_normals=face_normals)
     device = points.device
     m = int(points.shape[0])
     if m == 0:
@@ -695,12 +720,15 @@ def signed_distance_on_mesh(
     ValueError
         If ``sign_mode`` is not ``"parity"`` or ``"winding"``, or if ``mesh`` is supplied together
         with ``sign_mode="winding"``.
+    RuntimeError
+        If ``vertices``, ``faces``, ``points`` and ``mesh`` are not all on one device.
 
     See Also
     --------
     [`winding_number`][triwarp.proximity.winding_number]
     [`contains_points`][triwarp.ray.contains_points]
     """
+    require_same_device(vertices=vertices, faces=faces, points=points, mesh=mesh)
     if sign_mode not in ("parity", "winding"):
         raise ValueError(f"sign_mode must be 'parity' or 'winding', got {sign_mode!r}")
 
@@ -830,6 +858,8 @@ def signed_distance_grid(
     ------
     ValueError
         If ``voxel_size`` is not positive, ``pad`` is negative, or ``faces`` is empty.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``mesh`` are not all on one device.
 
     Examples
     --------
@@ -861,6 +891,7 @@ def signed_distance_grid(
     [`triwarp.voxels.to_field`][triwarp.voxels.to_field]
         The occupancy lattice, when a binary inside test is all that is needed.
     """
+    require_same_device(vertices=vertices, faces=faces, mesh=mesh)
     if pad < 0:
         raise ValueError("pad must be non-negative")
     if int(faces.shape[0]) == 0:
@@ -922,7 +953,13 @@ def winding_number(
     -------
     wp.array[wp.float32]
         ``(m,)`` winding numbers in ``float32``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``points`` are not all on one device.
     """
+    require_same_device(vertices=vertices, faces=faces, points=points)
     device = points.device
     n_queries = int(points.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -1002,7 +1039,10 @@ def query_mesh_aabb_with_offsets(
     ------
     ValueError
         If ``query_lower`` and ``query_upper`` have different lengths, or ``max_hits < 1``.
+    RuntimeError
+        If ``mesh``, ``query_lower`` and ``query_upper`` are not all on one device.
     """
+    require_same_device(mesh=mesh, query_lower=query_lower, query_upper=query_upper)
     device = query_lower.device
     m = int(query_lower.shape[0])
     if int(query_upper.shape[0]) != m:
@@ -1082,6 +1122,11 @@ def containing_faces_2d(
         query lies outside the triangulation. A query exactly on a shared edge is inside *both* its
         triangles and which one is returned is not specified.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``points`` are not all on one device.
+
     Notes
     -----
     Two stages: a closest-point query against the triangulation lifted to the ``z = 0`` plane picks
@@ -1105,6 +1150,7 @@ def containing_faces_2d(
     [`points_to_barycentric`][triwarp.triangles.points_to_barycentric]
     [`remap_attribute_from_uv`][triwarp.texture.remap_attribute_from_uv]
     """
+    require_same_device(vertices=vertices, faces=faces, points=points)
     device = vertices.device
     m = int(points.shape[0])
     n_faces = int(faces.shape[0]) // 3

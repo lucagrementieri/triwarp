@@ -35,7 +35,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.halfedge import halfedge_twins, vertex_one_rings
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import geodesic_walk as kernel_geodesic_walk
@@ -100,12 +100,27 @@ def trace_from_vertex(
         Length ``n_rays + 1``; ray ``r`` owns ``points[offsets[r] : offsets[r + 1]]``, beginning at
         its start vertex. A ray always contributes at least one point.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``start_vertices``, ``directions``, ``twins``, ``rings`` and
+        ``frames`` are not all on one device.
+
     See Also
     --------
     [`trace_from_face`][triwarp.geodesic_walk.trace_from_face]
     [`trace_polylines`][triwarp.geodesic_walk.trace_polylines]
     [`heat_geodesic`][triwarp.heat.heat_geodesic]
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        start_vertices=start_vertices,
+        directions=directions,
+        twins=twins,
+        rings=rings,
+        frames=frames,
+    )
     device = vertices.device
     n_rays = int(start_vertices.shape[0])
     n_vertices = int(vertices.shape[0])
@@ -182,11 +197,25 @@ def trace_from_face(
     offsets : wp.array[wp.int32]
         Length ``n_rays + 1`` CSR bounds into ``points``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``start_faces``, ``start_barycentric``, ``directions`` and
+        ``twins`` are not all on one device.
+
     See Also
     --------
     [`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex]
     [`barycentric_to_points`][triwarp.triangles.barycentric_to_points]
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        start_faces=start_faces,
+        start_barycentric=start_barycentric,
+        directions=directions,
+        twins=twins,
+    )
     device = vertices.device
     n_rays = int(start_faces.shape[0])
     if n_rays == 0 or int(faces.shape[0]) == 0:
@@ -283,6 +312,9 @@ def descend_field(
     ------
     ValueError
         If ``values`` does not have one entry per vertex.
+    RuntimeError
+        If ``vertices``, ``faces``, ``values``, ``starts``, ``twins``, ``vertex_faces`` and
+        ``gradients`` are not all on one device.
 
     Notes
     -----
@@ -300,6 +332,15 @@ def descend_field(
         The direction-driven walk, for a *straightest* geodesic rather than a shortest one.
     [`triwarp.laplacian.face_gradients`][triwarp.laplacian.face_gradients]
     """
+    require_same_device(
+        vertices=vertices,
+        faces=faces,
+        values=values,
+        starts=starts,
+        twins=twins,
+        vertex_faces=vertex_faces,
+        gradients=gradients,
+    )
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     if int(values.shape[0]) != n_vertices:
@@ -384,6 +425,11 @@ def geodesic_path(
         with [`trace_polylines`][triwarp.geodesic_walk.trace_polylines] and measure with
         [`triwarp.polyline.polyline_length`][triwarp.polyline.polyline_length].
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``source`` and ``targets`` are not all on one device.
+
     Examples
     --------
     ```python
@@ -410,6 +456,7 @@ def geodesic_path(
     [`triwarp.heat.heat_geodesic`][triwarp.heat.heat_geodesic]
         The field, when the distance is wanted and not the path.
     """
+    require_same_device(vertices=vertices, faces=faces, source=source, targets=targets)
     distance = tw.heat.heat_geodesic(vertices, faces, source, t, operators)  # type: ignore[arg-type]
     return descend_field(vertices, faces, distance, targets, stop_value=0.0, max_steps=max_steps)
 
@@ -494,6 +541,8 @@ def shorten_loop(
     ------
     TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
+    RuntimeError
+        If ``vertices``, ``faces``, ``loops``, ``twins`` and ``rings`` are not all on one device.
 
     See Also
     --------
@@ -504,6 +553,7 @@ def shorten_loop(
     [`geodesic_path`][triwarp.geodesic_walk.geodesic_path]
         The open, endpoint-to-endpoint problem, solved by descending a heat field instead.
     """
+    require_same_device(vertices=vertices, faces=faces, loops=loops, twins=twins, rings=rings)
     device = faces.device
     loops = list(loops)
     for loop in loops:
@@ -685,11 +735,17 @@ def trace_polylines(
     list[wp.array[wp.vec3]]
         One open polyline per ray, in ray order.
 
+    Raises
+    ------
+    RuntimeError
+        If ``points`` and ``offsets`` are not all on one device.
+
     See Also
     --------
     [`polyline_length`][triwarp.polyline.polyline_length]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
+    require_same_device(points=points, offsets=offsets)
     # ``offsets`` is the total-terminated n + 1 form, and ``split`` wants the length-n one, whose
     # last segment already runs to the end of ``points``. The guard is required rather than
     # defensive: a no-ray trace returns a length-1 offsets array, and Warp rejects the resulting

@@ -338,6 +338,24 @@ def test_allclose_rejects_mismatched_dtypes(device: str) -> None:
         tw.array.allclose(a_wp, b_wp)
 
 
+def test_allclose_rejects_mismatched_devices() -> None:
+    """
+    Triwarp against triwarp: a public two-array function must reject a cross-device call.
+
+    Not a library comparison: no reference library shares Warp's device model. This pins the
+    public-boundary contract every function wired to ``_device.require_same_device`` shares --
+    ``allclose`` stands in for the family. See
+    ``test_require_same_device_flags_a_mismatch_and_ignores_none`` below for the shared helper
+    itself.
+    """
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to construct a mismatch")
+    a_wp = wp.zeros(3, dtype=wp.float32, device="cpu")
+    b_wp = wp.zeros(3, dtype=wp.float32, device="cuda:0")
+    with pytest.raises(RuntimeError, match="one device"):
+        tw.array.allclose(a_wp, b_wp)
+
+
 @pytest.mark.parity("sort_and_argsort", "numpy")
 def test_sort_and_argsort_distinct_keys(device: str) -> None:
     """Class A: with distinct keys the permutation is unique, so it must equal ``numpy.argsort``."""
@@ -1141,3 +1159,27 @@ def test_read_scalar_returns_a_detached_row_for_a_vector_dtype(device: str) -> N
     counts_wp = wp.array(np.array([4, 5, 6], dtype=np.int32), dtype=wp.int32, device=device)
     assert int(tw._device.read_scalar(counts_wp, 0)) == 4
     assert int(tw._device.read_scalar(counts_wp)) == 6
+
+
+def test_require_same_device_flags_a_mismatch_and_ignores_none(device: str) -> None:
+    """
+    Not a library comparison: ``_device.require_same_device`` has no reference-library equivalent.
+
+    No other library shares Warp's launch-time device hazard, so there is nothing to compare its
+    verdict against. Pins its three contracts directly instead: a ``None`` argument is skipped
+    rather than compared, a ``list``/``tuple`` argument is unpacked element-wise with an
+    ``f"{name}[{i}]"`` label, and same-device arguments are a silent no-op.
+    """
+    a_wp = wp.zeros(3, dtype=wp.float32, device=device)
+    b_wp = wp.zeros(3, dtype=wp.float32, device=device)
+
+    tw._device.require_same_device(a=a_wp, b=b_wp, unset=None)  # no raise
+    tw._device.require_same_device(loops=[a_wp, b_wp, None])  # no raise
+
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to construct a mismatch")
+    c_wp = wp.zeros(3, dtype=wp.float32, device="cuda:0" if device == "cpu" else "cpu")
+    with pytest.raises(RuntimeError, match=r"'a' is on .+ while 'c' is on"):
+        tw._device.require_same_device(a=a_wp, c=c_wp)
+    with pytest.raises(RuntimeError, match=r"'loops\[0\]' is on .+ while 'loops\[1\]' is on"):
+        tw._device.require_same_device(loops=[a_wp, c_wp])

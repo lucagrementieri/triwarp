@@ -25,7 +25,7 @@ import numpy as np
 import warp as wp
 
 import triwarp as tw
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.kernels import bounds as kernel_bounds
 from triwarp.kernels import predicates as kernel_predicates
 
@@ -125,11 +125,17 @@ def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | Non
         ``|max_bound - min_bound|`` of the union box. ``inf`` when ``points`` is empty, since an
         empty box has infinite negative extent -- callers guard on the point count first.
 
+    Raises
+    ------
+    RuntimeError
+        If ``points`` and ``other`` are not all on one device.
+
     See Also
     --------
     [`aabb`][triwarp.bounds.aabb]
     [`aabb_union`][triwarp.bounds.aabb_union]
     """
+    require_same_device(points=points, other=other)
     lower, upper = aabb(points)
     if other is not None and int(other.shape[0]) > 0:
         other_lower, other_upper = aabb(other)
@@ -398,6 +404,11 @@ def crop_mesh(
         Compact ``(sub_vertices, sub_faces)`` on ``vertices.device``, carrying only the vertices
         the kept faces reference.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     Examples
     --------
     ```python
@@ -426,6 +437,7 @@ def crop_mesh(
     [`triwarp.selection.submesh_from_vertex_mask`][triwarp.selection.submesh_from_vertex_mask]
         The face selection this delegates to, where ``face_mode`` is exposed.
     """
+    require_same_device(vertices=vertices, faces=faces)
     vertex_mask = _box_mask(vertices, min_bound, max_bound, rotation)
     return tw.selection.submesh_from_vertex_mask(vertices, faces, vertex_mask, face_mode="all")
 

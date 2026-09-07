@@ -44,7 +44,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import polyline as kernel_polyline
@@ -293,7 +293,13 @@ def polyline_point_distance(
         ``polyline`` is empty, there being no segment to measure against -- the same
         ``inf``-on-miss convention
         [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh] uses.
+
+    Raises
+    ------
+    RuntimeError
+        If ``points`` and ``polyline`` are not all on one device.
     """
+    require_same_device(points=points, polyline=polyline)
     if closed:
         polyline = polyline_close(polyline)
     device = points.device

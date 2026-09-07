@@ -39,7 +39,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import creation as kernel_creation
@@ -1151,6 +1151,8 @@ def revolve(
     ValueError
         If ``linestring`` is not a rank-1 ``wp.vec2`` array with at least 2 points, or
         ``sections`` resolves to less than 1.
+    RuntimeError
+        If ``linestring`` and ``transform`` are not all on one device.
 
     Notes
     -----
@@ -1183,6 +1185,7 @@ def revolve(
     [`extrude_triangulation`][triwarp.creation.extrude_triangulation]
     [`trimesh.creation.revolve`][]
     """
+    require_same_device(linestring=linestring, transform=transform)
     twt.ensure_ndim(linestring, 1, dtype=wp.vec2)
     device = linestring.device
     per = int(linestring.shape[0])
@@ -1375,6 +1378,8 @@ def extrude_triangulation(
     ValueError
         If ``vertices`` is not a rank-1 ``wp.vec2`` array, ``faces`` is not a flat multiple of 3,
         or ``abs(height)`` is at most ``1e-8``.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``transform`` are not all on one device.
 
     Notes
     -----
@@ -1394,6 +1399,7 @@ def extrude_triangulation(
     [`revolve`][triwarp.creation.revolve]
     [`trimesh.creation.extrude_triangulation`][]
     """
+    require_same_device(vertices=vertices, faces=faces, transform=transform)
     twt.ensure_ndim(vertices, 1, dtype=wp.vec2)
     twt.ensure_ndim(faces, 1, dtype=wp.int32)
     device = vertices.device
@@ -1486,6 +1492,11 @@ def extrude_polygon(
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
         ``(vertices, faces)`` on ``polygon.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``polygon`` and ``transform`` are not all on one device.
+
     See Also
     --------
     [`triangulate_polygon`][triwarp.polyline.triangulate_polygon]
@@ -1493,6 +1504,7 @@ def extrude_polygon(
     [`sweep_polygon`][triwarp.creation.sweep_polygon]
     [`trimesh.creation.extrude_polygon`][]
     """
+    require_same_device(polygon=polygon, transform=transform)
     ring, faces = tw.polyline.triangulate_polygon(polygon)
     if mid_plane:
         translation = np.eye(4)
@@ -1547,6 +1559,8 @@ def sweep_polygon(
         If ``path`` has fewer than 2 vertices, ``angles`` does not match ``path`` in length, or the
         polygon's triangulation is not bounded by exactly one edge per ring vertex (which means the
         ring is not a simple polygon).
+    RuntimeError
+        If ``polygon``, ``path`` and ``angles`` are not all on one device.
 
     See Also
     --------
@@ -1554,6 +1568,7 @@ def sweep_polygon(
     [`revolve`][triwarp.creation.revolve]
     [`trimesh.creation.sweep_polygon`][]
     """
+    require_same_device(polygon=polygon, path=path, angles=angles)
     twt.ensure_ndim(path, 1, dtype=wp.vec3)
     device = polygon.device
     n_path = int(path.shape[0])
@@ -1680,6 +1695,8 @@ def truncated_prisms(
     ------
     ValueError
         If ``faces`` is not a flat multiple of 3, or ``origin`` is given without ``normal``.
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
 
     Notes
     -----
@@ -1693,6 +1710,7 @@ def truncated_prisms(
     [`extrude_triangulation`][triwarp.creation.extrude_triangulation]
     [`trimesh.creation.truncated_prisms`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     twt.ensure_ndim(faces, 1, dtype=wp.int32)
     device = vertices.device
     if int(faces.shape[0]) % 3 != 0:

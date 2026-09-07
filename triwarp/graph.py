@@ -9,7 +9,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar
+from triwarp._device import read_scalar, require_same_device
 from triwarp.array import arange
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import graph as kernel_graph
@@ -61,12 +61,15 @@ def edges_to_csr(
     ------
     ValueError
         If ``weights`` is given and does not have one entry per edge row.
+    RuntimeError
+        If ``edges`` and ``weights`` are not all on one device.
 
     See Also
     --------
     [`bfs`][triwarp.graph.bfs]
     [`shortest_path_envelope`][triwarp.graph.shortest_path_envelope]
     """
+    require_same_device(edges=edges, weights=weights)
     device = edges.device
     m = int(edges.shape[0])
     if weights is not None and int(weights.shape[0]) != m:
@@ -263,6 +266,8 @@ def connected_component_parity_from_edges(
     ValueError
         If ``edges`` is not ``(m, 2)``, ``signs`` is not length ``m``, or ``node_count`` is
         negative.
+    RuntimeError
+        If ``edges`` and ``signs`` are not all on one device.
 
     Notes
     -----
@@ -277,6 +282,7 @@ def connected_component_parity_from_edges(
     [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
     [`face_orientation_bits`][triwarp.validation.face_orientation_bits]
     """
+    require_same_device(edges=edges, signs=signs)
     twt.ensure_ndim(edges, 2, dtype=wp.int32)
     if int(edges.shape[1]) != 2:
         raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")

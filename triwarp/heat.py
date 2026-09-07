@@ -49,6 +49,7 @@ import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.reduce as twr
 import triwarp.typing as twt
+from triwarp._device import require_same_device
 from triwarp.edges import mean_unique_edge_length
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import heat as kernel_heat
@@ -187,6 +188,8 @@ def heat_operators(
     ValueError
         If both ``cot_entries`` and ``use_robust`` are given: ``use_robust`` exists to build that
         very table from mollified edge lengths, so the two ask for different weights.
+    RuntimeError
+        If ``vertices``, ``faces`` and ``cot_entries`` are not all on one device.
 
     See Also
     --------
@@ -195,6 +198,7 @@ def heat_operators(
     [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]
     [`Trimesh.heat_operators`][triwarp.mesh.Trimesh.heat_operators]
     """
+    require_same_device(vertices=vertices, faces=faces, cot_entries=cot_entries)
     if cot_entries is not None and use_robust:
         raise ValueError(
             "cot_entries and use_robust are mutually exclusive: use_robust rebuilds the "
@@ -308,6 +312,11 @@ def heat_geodesic(
     wp.array[wp.float64]
         ``(n_vertices,)`` geodesic distance field on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``sources`` are not all on one device.
+
     See Also
     --------
     [`heat_operators`][triwarp.heat.heat_operators]
@@ -315,6 +324,7 @@ def heat_geodesic(
     [`mean_unique_edge_length`][triwarp.edges.mean_unique_edge_length]
     [`marching_triangles`][triwarp.intersection.marching_triangles]
     """
+    require_same_device(vertices=vertices, faces=faces, sources=sources)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -460,6 +470,9 @@ def heat_signed_distance(
     ------
     ValueError
         If ``level_set_constraint`` is not ``"zero_set"`` or ``"none"``.
+    RuntimeError
+        If ``vertices``, ``faces``, ``curve_vertices`` and ``curve_offsets`` are not all on one
+        device.
 
     See Also
     --------
@@ -468,6 +481,9 @@ def heat_signed_distance(
     [`homology_generators`][triwarp.homology.homology_generators]
     [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
     """
+    require_same_device(
+        vertices=vertices, faces=faces, curve_vertices=curve_vertices, curve_offsets=curve_offsets
+    )
     if level_set_constraint not in ("zero_set", "none"):
         raise ValueError(
             f'level_set_constraint must be "zero_set" or "none", got {level_set_constraint!r}'
@@ -731,6 +747,11 @@ def vector_heat_operators(
     preconditioner : ``warp.optim.linear.LinearOperator``
         Jacobi preconditioner for ``vector_system``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces`` and ``frames`` are not all on one device.
+
     Notes
     -----
     The vector and scalar systems must share ``t``: [`log_map`][triwarp.heat.log_map]'s
@@ -745,6 +766,7 @@ def vector_heat_operators(
     [`heat_signed_distance`][triwarp.heat.heat_signed_distance]
     [`Trimesh.vector_heat_operators`][triwarp.mesh.Trimesh.vector_heat_operators]
     """
+    require_same_device(vertices=vertices, faces=faces, frames=frames)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     if t is None:
@@ -807,11 +829,17 @@ def extend_scalar(
     wp.array[wp.float64]
         ``(n_vertices,)`` extended field on ``vertices.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``sources`` and ``values`` are not all on one device.
+
     See Also
     --------
     [`transport_tangent_vectors`][triwarp.heat.transport_tangent_vectors]
     [`heat_geodesic`][triwarp.heat.heat_geodesic]
     """
+    require_same_device(vertices=vertices, faces=faces, sources=sources, values=values)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     n_sources = int(sources.shape[0])
@@ -925,6 +953,11 @@ def transport_tangent_vectors(
     resolved : wp.array[wp.bool]
         ``(n_vertices,)`` — ``True`` where the transported direction carries information.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices``, ``faces``, ``sources`` and ``vectors`` are not all on one device.
+
     See Also
     --------
     [`log_map`][triwarp.heat.log_map]
@@ -943,6 +976,7 @@ def transport_tangent_vectors(
         length in an arbitrary direction, while on CPU the same point can cancel to exactly zero and
         read as unreached. ``resolved`` is ``False`` on both, and is the only way to tell.
     """
+    require_same_device(vertices=vertices, faces=faces, sources=sources, vectors=vectors)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     n_sources = int(sources.shape[0])
@@ -1043,11 +1077,17 @@ def log_map(
         from every side — there is no direction to report, and the entry keeps the correct magnitude
         with an arbitrary angle.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`transport_tangent_vectors`][triwarp.heat.transport_tangent_vectors]
     [`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0:
@@ -1144,10 +1184,16 @@ def tangent_to_world(
     wp.array[wp.vec3]
         ``(n_vertices,)`` world-space vectors on ``tangent.device``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``tangent``, ``basis_x`` and ``basis_y`` are not all on one device.
+
     See Also
     --------
     [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames]
     """
+    require_same_device(tangent=tangent, basis_x=basis_x, basis_y=basis_y)
     world = wp.empty(int(tangent.shape[0]), dtype=wp.vec3, device=tangent.device)
     wp.map(kernel_heat.tangent_to_world, tangent, basis_x, basis_y, out=world)
     return world

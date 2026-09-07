@@ -20,6 +20,7 @@ from collections.abc import Sequence
 import warp as wp
 
 import triwarp as tw
+from triwarp._device import require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import combine as kernel_combine
 
@@ -119,6 +120,11 @@ def split(
         One ``(vertices, faces)`` pair per face-connected component on
         ``vertices.device``. Empty when ``n_faces == 0``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`split_batched`][triwarp.combine.split_batched]
@@ -129,6 +135,7 @@ def split(
     [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]
     [`trimesh.graph.split`][]
     """
+    require_same_device(vertices=vertices, faces=faces)
     vertices_all, vertex_offsets, faces_all, face_offsets = split_batched(vertices, faces)
     k = int(vertex_offsets.shape[0])
     if k == 0:
@@ -180,11 +187,17 @@ def split_batched(
 
     All four arrays are empty (and ``k == 0``) when ``n_faces == 0``.
 
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
     See Also
     --------
     [`split`][triwarp.combine.split]
     [`submeshes_from_face_groups`][triwarp.selection.submeshes_from_face_groups]
     """
+    require_same_device(vertices=vertices, faces=faces)
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:

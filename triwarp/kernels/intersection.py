@@ -398,6 +398,21 @@ def mark_pair_masks(
     out_mask_b[pairs[i, 1]] = True
 
 
+# Launched over ``filter_intersecting_pairs``'s survivors, so ``triangle_intersection_segment``
+# below recomputes each pair's normals, edge vectors and plane-distance projections that
+# ``triangles_intersect`` already derived one launch earlier (plans/review.md item 6). Measured
+# on an RTX 5090, Warp 1.17, min of 7 interleaved reps, ``wp.timing_begin`` device time for the
+# whole ``mesh_with_mesh`` call at its own benchmarked "deep" self-offset: this kernel is
+# **7.9-8.1%** of the call on ``bunny_decimated`` (2 608 pairs, 0.0226 of 0.286 ms) and ``bunny``
+# (5 861 pairs, 0.0243 of 0.301 ms) alike -- flat across a 2.3x face-count range, not a falling
+# share. But it bounds the *maximum* possible saving from eliminating the redundancy, since not
+# all of this kernel's own time is the shared prefix (the segment extraction's ordering and
+# division are unique to it); the broad-phase AABB query kernels are 71-72% of the same call and
+# dominate it regardless. And ``filter_intersecting_pairs`` also backs two call sites that never
+# need a segment at all (``mesh_collision_pairs``, ``validation.face_self_intersecting_mask``), so
+# a single fused kernel would need a caller-selected tail rather than a clean merge. Declined on
+# that basis: a single-digit percent of an already sub-millisecond call is not worth a
+# shared-output kernel reached from three call sites with two different needs.
 @wp.kernel
 def triangle_pair_segments(
     query_vertices: wp.array[wp.vec3],
