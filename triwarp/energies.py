@@ -560,7 +560,7 @@ def curved_hessian_energy(
     couples edges within a face only, so each face emits its own 6x6 block sandwiched between its
     edges' gradient rows (a fixed 144 triplets per face), and no intermediate ``(2 n_edges, ...)``
     matrix or sparse product exists. Requires an edge-manifold mesh, like the igl original (which
-    asserts it); a degenerate face contributes nothing.
+    asserts it) — raises ``ValueError`` otherwise; a degenerate face contributes nothing.
 
     Parameters
     ----------
@@ -581,6 +581,8 @@ def curved_hessian_energy(
 
     Raises
     ------
+    ValueError
+        If the mesh is not edge-manifold (some edge is shared by more than two faces).
     RuntimeError
         If ``vertices`` and ``faces`` are not all on one device.
 
@@ -597,7 +599,16 @@ def curved_hessian_energy(
     if n_faces == 0:
         return tw.array.empty_square_bsr(n_vertices, dtype, device)
 
-    unique_edges, inverse = edges_unique(faces, n_vertices=n_vertices)
+    # Reused below for ``edges_unique`` too, so the manifold check costs no extra sort.
+    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    if not tw.validation.is_edge_manifold(faces, edges_sorted=edges_sorted, n_vertices=n_vertices):
+        raise ValueError(
+            "mesh must be edge-manifold (every edge shared by at most two faces); the "
+            "Crouzeix-Raviart discretization curved_hessian_energy is built on is undefined "
+            "otherwise, like igl::curved_hessian_energy, which asserts it"
+        )
+
+    unique_edges, inverse = edges_unique(faces, edges_sorted, n_vertices=n_vertices)
     n_edges = int(unique_edges.shape[0])
 
     angles = wp.empty((n_faces, 3), dtype=wp.float64, device=device)
@@ -614,7 +625,9 @@ def curved_hessian_energy(
     wp.map(kernel_predicates.angle_defect, angle_sums, out=kappa)
     _zero_at_boundary(vertices, faces, kappa)
     scaled_kappa = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.map(kernel_energies.divide_or_zero, kappa, angle_sums, out=scaled_kappa)
+    # ``kappa / angle_sums``, zeroed instead of dividing by a non-positive angle sum --
+    # ``reciprocal_scaled_or_zero(value, numerator)`` takes the denominator first.
+    wp.map(kernel_energies.reciprocal_scaled_or_zero, angle_sums, kappa, out=scaled_kappa)
 
     mass = _cr_mass_diagonal(vertices, faces, inverse, n_edges, wp.float64)
     inverse_mass = wp.empty(n_edges, dtype=wp.float64, device=device)
@@ -681,7 +694,8 @@ def crouzeix_raviart_cotmatrix(
     its three edges pairwise with minus four times the half-cotangent at their shared corner
     (positive diagonal — the igl sign convention for this operator, opposite to ``cotmatrix``'s).
     Rows follow [`edges_unique`][triwarp.edges.edges_unique]'s edge numbering. Requires an
-    edge-manifold mesh, like the igl original (which asserts it).
+    edge-manifold mesh, like the igl original (which asserts it) — raises ``ValueError``
+    otherwise.
 
     Parameters
     ----------
@@ -710,7 +724,8 @@ def crouzeix_raviart_cotmatrix(
     Raises
     ------
     ValueError
-        If exactly one of ``unique_edges`` / ``edge_map`` is provided.
+        If exactly one of ``unique_edges`` / ``edge_map`` is provided, or if the mesh is not
+        edge-manifold (some edge is shared by more than two faces).
     RuntimeError
         If ``vertices``, ``faces``, ``cot_entries``, ``unique_edges`` and ``edge_map`` are not all
         on one device.
@@ -739,6 +754,13 @@ def crouzeix_raviart_cotmatrix(
     device = faces.device
     if n_faces == 0:
         return tw.array.empty_square_bsr(n_edges, dtype, device)
+
+    if not tw.validation.is_edge_manifold(faces, n_vertices=int(vertices.shape[0])):
+        raise ValueError(
+            "mesh must be edge-manifold (every edge shared by at most two faces); the "
+            "Crouzeix-Raviart discretization is undefined otherwise, like "
+            "igl::crouzeix_raviart_cotmatrix, which asserts it"
+        )
 
     if cot_entries is None:
         cot_entries = cotmatrix_entries(vertices, faces, dtype=dtype)

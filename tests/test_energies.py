@@ -425,6 +425,28 @@ def test_operator_family_empty_mesh(device: str) -> None:
     assert (int(cr_mass.nrow), int(cr_mass.ncol)) == (0, 0)
 
 
+def test_curved_hessian_and_crouzeix_raviart_cotmatrix_reject_non_edge_manifold(
+    device: str,
+) -> None:
+    """
+    Both raise on the edge-manifold precondition their docstrings document.
+
+    Like the igl originals, which assert it, instead of silently disagreeing about what a third
+    incident face means. Three faces sharing one edge: the same non-edge-manifold fixture
+    ``test_is_edge_manifold_nonmanifold_fan_matches_pyvista`` uses.
+    """
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    faces_np = np.array([[0, 1, 2], [0, 3, 1], [0, 1, 4]])
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+
+    with pytest.raises(ValueError, match="edge-manifold"):
+        tw.energies.curved_hessian_energy(vertices_wp, faces_wp)
+    with pytest.raises(ValueError, match="edge-manifold"):
+        tw.energies.crouzeix_raviart_cotmatrix(vertices_wp, faces_wp)
+
+
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 def test_lscm_hessian_matches_igl(request, device, mesh_name):
     """

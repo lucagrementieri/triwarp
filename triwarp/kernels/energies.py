@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.array import OverloadTable, to_vec3d
+from triwarp.kernels.array import OverloadTable, declare_map_signatures, map_probe, to_vec3d
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.predicates import (
     corner_cosines_from_l2,
@@ -32,6 +32,9 @@ def squared_deviation(value: wp.Float, target: wp.Float) -> wp.Float:
 def reciprocal_scaled_or_zero(value: wp.Float, numerator: wp.Float) -> wp.Float:
     # ``numerator / value``, with the ``reciprocal_or_zero`` convention above for a non-positive
     # denominator: a vertex whose lumped area is zero contributes nothing rather than an infinity.
+    # Reached at two ``wp.map`` signatures -- a float32 array against a float32 scalar
+    # (``laplacian_smoothing_loss``) and a float64 array against a float64 array
+    # (``curved_hessian_energy``'s ``kappa / angle_sums``) -- both declared below.
     if value > type(value)(0.0):
         return numerator / value
     return type(value)(0.0)
@@ -361,20 +364,15 @@ def internal_angles_and_sums(
     add_corner_triple(out_angle_sums, faces, f, theta0, theta1, theta2)
 
 
-@wp.func
-def divide_or_zero(numerator: wp.float64, denominator: wp.float64) -> wp.float64:
-    if denominator > wp.float64(0.0):
-        return numerator / denominator
-    return wp.float64(0.0)
-
-
 @wp.kernel
 def scatter_edge_halfedges(
     inverse: wp.array[wp.int32], cursor: wp.array[wp.int32], out_halfedges: wp.array2d[wp.int32]
 ) -> None:
-    # Up to two halfedges per unique edge, in arbitrary order. On a non-edge-manifold edge the
-    # third and later halfedges are dropped; the Crouzeix-Raviart discretization (like
-    # ``igl::crouzeix_raviart_*``, which asserts edge-manifoldness) is undefined there.
+    # Up to two halfedges per unique edge, in arbitrary order. ``curved_hessian_energy`` (this
+    # kernel's only caller) validates edge-manifoldness before launching it, so a third halfedge
+    # for one edge id is unreachable in practice; the ``slot < 2`` guard stays as a defensive
+    # bound against writing out of ``out_halfedges``' row width rather than as a behavior any
+    # caller may rely on.
     h = wp.int32(wp.tid())
     slot = wp.atomic_add(cursor, inverse[h], 1)
     if slot < 2:
@@ -687,6 +685,27 @@ def vector_area_triplets(
     out_rows[base + 3] = j + n_vertices
     out_cols[base + 3] = i
     out_vals[base + 3] = q
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not two.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists and what forks a
+    ``wp.map`` module. ``reciprocal_scaled_or_zero`` is reached at two signatures:
+    ``laplacian_smoothing_loss``'s float32 array against a float32 scalar, and
+    ``curved_hessian_energy``'s float64 array against a float64 array.
+    """
+    dense = map_probe
+    declare_map_signatures(
+        [
+            (reciprocal_scaled_or_zero, (dense(wp.float32), wp.float32(1)), wp.float32),
+            (reciprocal_scaled_or_zero, (dense(wp.float64), dense(wp.float64)), wp.float64),
+        ]
+    )
+
+
+_declare_map_kernels()
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in

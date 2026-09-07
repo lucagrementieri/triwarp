@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_ZERO_CONSTANT, TWO_PI
+from triwarp.kernels.array import to_vec3, wrap_index
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.predicates import project_out_normal, unit_tangent
 from triwarp.kernels.tangent_space import corner_angle
@@ -141,6 +142,184 @@ def trace_walk(
 
 
 @wp.func
+def start_direction_at_vertex(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_angles: wp.array2d[wp.float32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    is_boundary: wp.array[wp.bool],
+    basis_x: wp.array[wp.vec3],
+    basis_y: wp.array[wp.vec3],
+    vertex: wp.int32,
+    direction: wp.vec3,
+) -> tuple[wp.int32, wp.vec3]:
+    # Which incident face a direction leaves the vertex through, and the 3D direction to use.
+    #
+    # The naive test -- project into each face's plane and ask which wedge contains the result --
+    # has no answer for a direction pointing away from the surface, and picks the wrong face near
+    # the normal. The intrinsic flattening does have one: rescaling the incident corner angles to a
+    # full turn makes the fan a disk, so *every* tangent direction lands in exactly one wedge. Same
+    # construction as ``tangent.halfedge_tangent_angles``, same convention geometry-central uses.
+    begin = ring_offsets[vertex]
+    end = ring_offsets[vertex + 1]
+    if end <= begin:
+        return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
+
+    # Polar angle of the direction in the vertex's tangent frame, in [0, 2*pi).
+    angle = wp.atan2(wp.dot(direction, basis_y[vertex]), wp.dot(direction, basis_x[vertex]))
+    if angle < wp.float32(0.0):
+        angle += TWO_PI
+
+    total = wp.float32(0.0)
+    for j in range(begin, end):
+        total += corner_angle(face_angles, ring_halfedges[j])
+    if total <= TOLERANCE_ZERO_CONSTANT:
+        return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
+    full_turn = TWO_PI
+    if is_boundary[vertex]:
+        full_turn = PI
+    scale = full_turn / total
+    if angle > full_turn:
+        # A boundary vertex's fan spans half a disk; a direction outside it points off the surface.
+        return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
+
+    # Walk the ring until the accumulated (rescaled) angle passes the target.
+    accumulated = wp.float32(0.0)
+    chosen = ring_halfedges[end - 1]
+    offset_in_wedge = wp.float32(0.0)
+    for j in range(begin, end):
+        h = ring_halfedges[j]
+        wedge = scale * corner_angle(face_angles, h)
+        if angle <= accumulated + wedge or j == end - 1:
+            chosen = h
+            offset_in_wedge = (angle - accumulated) / scale
+            break
+        accumulated += wedge
+
+    # Undo the rescale: rotate the chosen halfedge's direction by the true in-face angle.
+    f = chosen // wp.int32(3)
+    normal = face_normal(vertices, faces, f)
+    edge = vertices[halfedge_destination(faces, chosen)] - vertices[vertex]
+    tangential, length = unit_tangent(edge, normal, TOLERANCE_ZERO_CONSTANT)
+    if length <= TOLERANCE_ZERO_CONSTANT:
+        return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
+    rotation = wp.quat_from_axis_angle(normal, offset_in_wedge)
+    return f, wp.quat_rotate(rotation, tangential)
+
+
+@wp.kernel
+def trace_from_vertices(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    face_angles: wp.array2d[wp.float32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    is_boundary: wp.array[wp.bool],
+    basis_x: wp.array[wp.vec3],
+    basis_y: wp.array[wp.vec3],
+    vertex_normals: wp.array[wp.vec3],
+    start_vertices: wp.array[wp.int32],
+    directions: wp.array[wp.vec3],
+    max_steps: wp.int32,
+    length_epsilon: wp.float32,
+    offsets: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
+    out_points: wp.array[wp.vec3],
+) -> None:
+    r = wp.int32(wp.tid())
+    v = start_vertices[r]
+    direction = directions[r]
+    f, in_face = start_direction_at_vertex(
+        vertices,
+        faces,
+        face_angles,
+        ring_offsets,
+        ring_halfedges,
+        is_boundary,
+        basis_x,
+        basis_y,
+        v,
+        direction,
+    )
+    write_begin = wp.int32(-1)
+    if offsets.shape[0] > 0:
+        write_begin = offsets[r]
+    if f == wp.int32(-1):
+        # An isolated vertex, or a direction pointing out of a boundary vertex's fan: nowhere to go.
+        if write_begin >= wp.int32(0):
+            out_points[write_begin] = vertices[v]
+        out_counts[r] = wp.int32(1)
+        return
+    # The trace length is measured in the *vertex's* tangent plane, not in the plane of whichever
+    # incident face the walk starts in -- the vertex has one tangent space and the fan's faces each
+    # tilt differently out of it.
+    normal = vertex_normals[v]
+    arc_length = wp.length(project_out_normal(direction, normal))
+    out_counts[r] = trace_walk(
+        vertices,
+        faces,
+        twins,
+        f,
+        vertices[v],
+        in_face,
+        arc_length,
+        max_steps,
+        length_epsilon,
+        write_begin,
+        out_points,
+    )
+
+
+@wp.kernel
+def trace_from_faces(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    start_faces: wp.array[wp.int32],
+    start_bary: wp.array[wp.vec3],
+    directions: wp.array[wp.vec3],
+    max_steps: wp.int32,
+    length_epsilon: wp.float32,
+    offsets: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
+    out_points: wp.array[wp.vec3],
+) -> None:
+    # One ray per thread. ``offsets`` is empty on the counting pass, which is how the two passes
+    # share ``trace_walk``.
+    r = wp.int32(wp.tid())
+    f = start_faces[r]
+    bary = start_bary[r]
+    point = (
+        bary[0] * vertices[faces[f * 3 + 0]]
+        + bary[1] * vertices[faces[f * 3 + 1]]
+        + bary[2] * vertices[faces[f * 3 + 2]]
+    )
+    write_begin = wp.int32(-1)
+    if offsets.shape[0] > 0:
+        write_begin = offsets[r]
+    # The trace length is the direction's component in the *face's* plane: a direction leaving the
+    # surface traces only what is tangential to it.
+    direction = directions[r]
+    normal = face_normal(vertices, faces, f)
+    arc_length = wp.length(project_out_normal(direction, normal))
+    out_counts[r] = trace_walk(
+        vertices,
+        faces,
+        twins,
+        f,
+        point,
+        direction,
+        arc_length,
+        max_steps,
+        length_epsilon,
+        write_begin,
+        out_points,
+    )
+
+
+@wp.func
 def descend_at_vertex(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -171,9 +350,7 @@ def descend_at_vertex(
         slope = wp.length(gradient)
         if slope <= wp.float64(0.0):
             continue
-        direction = -wp.vec3(
-            wp.float32(gradient[0]), wp.float32(gradient[1]), wp.float32(gradient[2])
-        ) / wp.float32(slope)
+        direction = -to_vec3(gradient) / wp.float32(slope)
         normal_of = face_normal(vertices, faces, f)
         # Is the direction inside the fan wedge at ``v``? The wedge is spanned by the two incident
         # edges, and the test is the orientation-agnostic "same side of each": ``d`` is inside when
@@ -297,9 +474,7 @@ def descent_walk(
         distance = wp.float32(0.0)
         direction = wp.vec3(0.0, 0.0, 0.0)
         if slope > wp.float64(0.0):
-            descent = -wp.vec3(
-                wp.float32(gradient[0]), wp.float32(gradient[1]), wp.float32(gradient[2])
-            ) / wp.float32(slope)
+            descent = -to_vec3(gradient) / wp.float32(slope)
             direction, tangential_length = unit_tangent(descent, normal, TOLERANCE_ZERO_CONSTANT)
             if tangential_length > TOLERANCE_ZERO_CONSTANT:
                 edge, distance = exit_edge(
@@ -359,11 +534,7 @@ def descent_walk(
             opposite = faces[next_face * 3 + (twin % wp.int32(3) + 2) % 3]
             if wp.dot(inward, vertices[opposite] - vertices[start]) < 0.0:
                 inward = -inward
-            next_descent = -wp.vec3(
-                wp.float32(next_gradient[0]),
-                wp.float32(next_gradient[1]),
-                wp.float32(next_gradient[2]),
-            )
+            next_descent = -to_vec3(next_gradient)
             enters = wp.dot(next_descent, inward) > 0.0
         if enters:
             face = next_face
@@ -424,184 +595,6 @@ def descent_paths(
 
 
 @wp.func
-def start_direction_at_vertex(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    face_angles: wp.array2d[wp.float32],
-    ring_offsets: wp.array[wp.int32],
-    ring_halfedges: wp.array[wp.int32],
-    is_boundary: wp.array[wp.bool],
-    basis_x: wp.array[wp.vec3],
-    basis_y: wp.array[wp.vec3],
-    vertex: wp.int32,
-    direction: wp.vec3,
-) -> tuple[wp.int32, wp.vec3]:
-    # Which incident face a direction leaves the vertex through, and the 3D direction to use.
-    #
-    # The naive test -- project into each face's plane and ask which wedge contains the result --
-    # has no answer for a direction pointing away from the surface, and picks the wrong face near
-    # the normal. The intrinsic flattening does have one: rescaling the incident corner angles to a
-    # full turn makes the fan a disk, so *every* tangent direction lands in exactly one wedge. Same
-    # construction as ``tangent.halfedge_tangent_angles``, same convention geometry-central uses.
-    begin = ring_offsets[vertex]
-    end = ring_offsets[vertex + 1]
-    if end <= begin:
-        return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
-
-    # Polar angle of the direction in the vertex's tangent frame, in [0, 2*pi).
-    angle = wp.atan2(wp.dot(direction, basis_y[vertex]), wp.dot(direction, basis_x[vertex]))
-    if angle < wp.float32(0.0):
-        angle += TWO_PI
-
-    total = wp.float32(0.0)
-    for j in range(begin, end):
-        total += corner_angle(face_angles, ring_halfedges[j])
-    if total <= TOLERANCE_ZERO_CONSTANT:
-        return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
-    full_turn = TWO_PI
-    if is_boundary[vertex]:
-        full_turn = PI
-    scale = full_turn / total
-    if angle > full_turn:
-        # A boundary vertex's fan spans half a disk; a direction outside it points off the surface.
-        return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
-
-    # Walk the ring until the accumulated (rescaled) angle passes the target.
-    accumulated = wp.float32(0.0)
-    chosen = ring_halfedges[end - 1]
-    offset_in_wedge = wp.float32(0.0)
-    for j in range(begin, end):
-        h = ring_halfedges[j]
-        wedge = scale * corner_angle(face_angles, h)
-        if angle <= accumulated + wedge or j == end - 1:
-            chosen = h
-            offset_in_wedge = (angle - accumulated) / scale
-            break
-        accumulated += wedge
-
-    # Undo the rescale: rotate the chosen halfedge's direction by the true in-face angle.
-    f = chosen // wp.int32(3)
-    normal = face_normal(vertices, faces, f)
-    edge = vertices[halfedge_destination(faces, chosen)] - vertices[vertex]
-    tangential, length = unit_tangent(edge, normal, TOLERANCE_ZERO_CONSTANT)
-    if length <= TOLERANCE_ZERO_CONSTANT:
-        return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
-    rotation = wp.quat_from_axis_angle(normal, offset_in_wedge)
-    return f, wp.quat_rotate(rotation, tangential)
-
-
-@wp.kernel
-def trace_from_faces(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    twins: wp.array[wp.int32],
-    start_faces: wp.array[wp.int32],
-    start_bary: wp.array[wp.vec3],
-    directions: wp.array[wp.vec3],
-    max_steps: wp.int32,
-    length_epsilon: wp.float32,
-    offsets: wp.array[wp.int32],
-    out_counts: wp.array[wp.int32],
-    out_points: wp.array[wp.vec3],
-) -> None:
-    # One ray per thread. ``offsets`` is empty on the counting pass, which is how the two passes
-    # share ``trace_walk``.
-    r = wp.int32(wp.tid())
-    f = start_faces[r]
-    bary = start_bary[r]
-    point = (
-        bary[0] * vertices[faces[f * 3 + 0]]
-        + bary[1] * vertices[faces[f * 3 + 1]]
-        + bary[2] * vertices[faces[f * 3 + 2]]
-    )
-    write_begin = wp.int32(-1)
-    if offsets.shape[0] > 0:
-        write_begin = offsets[r]
-    # The trace length is the direction's component in the *face's* plane: a direction leaving the
-    # surface traces only what is tangential to it.
-    direction = directions[r]
-    normal = face_normal(vertices, faces, f)
-    arc_length = wp.length(project_out_normal(direction, normal))
-    out_counts[r] = trace_walk(
-        vertices,
-        faces,
-        twins,
-        f,
-        point,
-        direction,
-        arc_length,
-        max_steps,
-        length_epsilon,
-        write_begin,
-        out_points,
-    )
-
-
-@wp.kernel
-def trace_from_vertices(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    twins: wp.array[wp.int32],
-    face_angles: wp.array2d[wp.float32],
-    ring_offsets: wp.array[wp.int32],
-    ring_halfedges: wp.array[wp.int32],
-    is_boundary: wp.array[wp.bool],
-    basis_x: wp.array[wp.vec3],
-    basis_y: wp.array[wp.vec3],
-    vertex_normals: wp.array[wp.vec3],
-    start_vertices: wp.array[wp.int32],
-    directions: wp.array[wp.vec3],
-    max_steps: wp.int32,
-    length_epsilon: wp.float32,
-    offsets: wp.array[wp.int32],
-    out_counts: wp.array[wp.int32],
-    out_points: wp.array[wp.vec3],
-) -> None:
-    r = wp.int32(wp.tid())
-    v = start_vertices[r]
-    direction = directions[r]
-    f, in_face = start_direction_at_vertex(
-        vertices,
-        faces,
-        face_angles,
-        ring_offsets,
-        ring_halfedges,
-        is_boundary,
-        basis_x,
-        basis_y,
-        v,
-        direction,
-    )
-    write_begin = wp.int32(-1)
-    if offsets.shape[0] > 0:
-        write_begin = offsets[r]
-    if f == wp.int32(-1):
-        # An isolated vertex, or a direction pointing out of a boundary vertex's fan: nowhere to go.
-        if write_begin >= wp.int32(0):
-            out_points[write_begin] = vertices[v]
-        out_counts[r] = wp.int32(1)
-        return
-    # The trace length is measured in the *vertex's* tangent plane, not in the plane of whichever
-    # incident face the walk starts in -- the vertex has one tangent space and the fan's faces each
-    # tilt differently out of it.
-    normal = vertex_normals[v]
-    arc_length = wp.length(project_out_normal(direction, normal))
-    out_counts[r] = trace_walk(
-        vertices,
-        faces,
-        twins,
-        f,
-        vertices[v],
-        in_face,
-        arc_length,
-        max_steps,
-        length_epsilon,
-        write_begin,
-        out_points,
-    )
-
-
-@wp.func
 def ring_slot_of(
     faces: wp.array[wp.int32],
     ring_offsets: wp.array[wp.int32],
@@ -637,7 +630,7 @@ def ring_arc_length(
     previous = halfedge_destination(faces, ring_halfedges[slot_from])
     s = slot_from
     for _ in range(n):
-        s = begin + (s - begin + step + n) % n
+        s = begin + wrap_index(s - begin + step, n)
         current = halfedge_destination(faces, ring_halfedges[s])
         total += wp.length(vertices[current] - vertices[previous])
         previous = current
@@ -683,8 +676,8 @@ def shorten_loop_counts(
     if is_boundary[b]:
         return  # the link of a boundary vertex is a path, not a cycle: there is no way round
 
-    a = loop_vertices[begin + (p - 1 + n) % n]
-    c = loop_vertices[begin + (p + 1) % n]
+    a = loop_vertices[begin + wrap_index(p - 1, n)]
+    c = loop_vertices[begin + wrap_index(p + 1, n)]
     if a == c:
         # The loop doubles back through b. Dropping b leaves the duplicate that the compaction pass
         # removes, and both together contract the spur.
@@ -740,7 +733,7 @@ def shorten_loop_write(
     n = ring_offsets[loop_vertices[t] + 1] - begin
     s = arc_slot[t]
     for k in range(count):
-        s = begin + (s - begin + arc_step[t] + n) % n
+        s = begin + wrap_index(s - begin + arc_step[t], n)
         out_loop_vertices[positions[t] + k] = halfedge_destination(faces, ring_halfedges[s])
 
 
@@ -758,7 +751,7 @@ def distinct_from_predecessor(
     begin = loop_offsets[position_loop[t]]
     n = loop_offsets[position_loop[t] + 1] - begin
     p = t - begin
-    if p == 0 or loop_vertices[t] != loop_vertices[begin + (p - 1 + n) % n]:
+    if p == 0 or loop_vertices[t] != loop_vertices[begin + wrap_index(p - 1, n)]:
         out_counts[t] = wp.int32(1)
     else:
         out_counts[t] = wp.int32(0)
