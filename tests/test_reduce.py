@@ -252,6 +252,31 @@ def test_minmax_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
     assert np.allclose(got_max, values_np.max(), rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("shape", [(9, 9), (65, 10), (16, 16), (3, 5), (200, 100)])
+def test_scalar_reduce_global_noncontiguous(device: str, shape: tuple[int, int]) -> None:
+    """
+    The last remaining exerciser of ``kernels/reduce.py``'s rank-2 ``axis=None`` kernels.
+
+    A non-contiguous rank-2 array can't flatten onto the 1-D kernel, so this is the only path left
+    to reach them: every contiguous array now flattens there instead
+    (``reduce._flattened_for_global``). Shapes span the full-tile case, both single- and
+    double-boundary-short cases, and a wide table -- the same coverage
+    ``test_min_2d``/``test_minmax_2d``/``test_min_partial_tiles`` used to give the rank-2 kernel
+    before it stopped being reachable for a contiguous array.
+    """
+    rng = np.random.default_rng(99)
+    wide_np = rng.integers(-1000, 1000, (shape[0], shape[1] * 2), dtype=np.int32)
+    values_np = wide_np[:, ::2]
+    values_wp = wp.array(wide_np, dtype=wp.int32, device=device)[:, ::2]
+    assert not values_wp.is_contiguous
+    assert np.array_equal(tw_reduce.min(values_wp), values_np.min())
+    assert np.array_equal(tw_reduce.max(values_wp), values_np.max())
+    assert np.array_equal(tw_reduce.sum(values_wp), values_np.sum())
+    got_min, got_max = tw_reduce.minmax(values_wp)
+    assert np.array_equal(got_min, values_np.min())
+    assert np.array_equal(got_max, values_np.max())
+
+
 @pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])
 def test_any_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
     rng = np.random.default_rng(99)

@@ -664,18 +664,25 @@ def _flattened_for_global(array: twt.ScalarArray) -> twt.Array1dScalar | None:
     """
     Return a 1-D view when the 1-D kernel is the better way to reduce ``array``, else ``None``.
 
-    Rank-1 input is already the 1-D case. Rank-2 input is worth flattening when its trailing extent
-    is under ``TILE_2D``, because the rank-2 kernel tiles ``TILE_2D``-squares and a table that
-    narrow clips every tile — so its ``wp.tile_load`` branch never runs and all ``TILE_2D**2`` lanes
-    walk the same short block, the rank-2 form of the amplification ``_launch_axis_scalar``
-    documents. Flattening costs nothing on a contiguous buffer and hands the work to the 1-D kernel,
-    which also carries the ``TILES_PER_BLOCK_1D`` fold — a large win on a table with a narrow
-    trailing extent, and a wash at the small end where too few blocks are produced to fill the
-    device, which is invisible next to the fixed host cost every scalar-returning reduction pays
-    regardless.
+    Rank-1 input is already the 1-D case. **Any contiguous** rank-2 input flattens too, regardless
+    of its trailing extent: flattening costs nothing on a contiguous buffer (it is a reshape, not a
+    copy), and the 1-D kernel carries the ``TILES_PER_BLOCK_1D`` fold that the rank-2 tiled kernel
+    does not — one atomic per ``ITEMS_PER_BLOCK_1D`` (1024) elements against the rank-2 kernel's one
+    atomic per ``TILE_2D**2`` (64), which serializes badly on a wide table (a ``(1_000_000, 16)``
+    array puts 250 000 blocks on one accumulator address through the unfolded rank-2 path). This
+    also fixes the narrow case ``_launch_axis_scalar`` documents on its own axis: a table narrower
+    than ``TILE_2D`` clips every rank-2 tile, so its ``wp.tile_load`` branch never runs and all
+    ``TILE_2D**2`` lanes redundantly walk the same short block. Flattening is a wash only at the
+    small end, where too few blocks are produced to fill the device either way — invisible next to
+    the fixed host cost every scalar-returning reduction pays regardless. The bool reductions
+    (``reduce.any``/``reduce.all``) already flatten unconditionally for exactly this reason; this
+    makes the scalar family consistent with that precedent rather than a narrower special case of
+    it.
 
     ``wp.array.flatten()`` raises on a non-contiguous array rather than copying, so a strided view
-    keeps the rank-2 kernel — correctness first, and such a view is not the common case.
+    (a column slice, a transpose) keeps the rank-2 kernel — correctness first, and such a view is
+    not the common case; ``kernels/reduce.py``'s ``_reduce_2d_tiled``/``_minmax_2d_tiled`` exist
+    for it.
 
     Parameters
     ----------
@@ -689,7 +696,7 @@ def _flattened_for_global(array: twt.ScalarArray) -> twt.Array1dScalar | None:
     """
     if array.ndim == 1:
         return cast(twt.Array1dScalar, array)
-    if int(array.shape[1]) < TILE_2D and array.is_contiguous:
+    if array.is_contiguous:
         return cast(twt.Array1dScalar, array.flatten())
     return None
 

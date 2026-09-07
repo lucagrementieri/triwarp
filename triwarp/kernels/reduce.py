@@ -192,7 +192,15 @@ def _weighted_sum_1d_tiled(name, dtype):
 
 
 def _reduce_2d_tiled(tile_reduce, atomic, scalar, name, dtype):
-    """axis=None on a 2-D array: one 2-D tile per block, atomically fold into slot 0."""
+    """
+    axis=None on a 2-D array: one 2-D tile per block, atomically fold into slot 0.
+
+    Reached only for a **non-contiguous** rank-2 array: ``reduce._flattened_for_global`` flattens
+    every contiguous one onto the 1-D kernel instead, which carries the anti-contention
+    ``TILES_PER_BLOCK_1D`` fold this kernel does not (CLAUDE.md section 13.2) — flattening a
+    contiguous buffer is a free reshape, so there is no reason to fold this kernel's atomics too. A
+    non-contiguous view (a column slice, a transpose) is the rare remaining caller.
+    """
 
     def _k(values: wp.array2d[wp.Scalar], out_result: wp.array[wp.Scalar]) -> None:
         i, j, t = wp.tid()
@@ -215,15 +223,20 @@ def _reduce_2d_tiled(tile_reduce, atomic, scalar, name, dtype):
                 storage="register",
             )
             result = tile_reduce(tile)[0]
-        else:
+            if t == 0:
+                atomic(out_result, 0, result)
+        elif t == 0:
+            # A boundary block short in either dimension has no tile shape to load -- ``tile_rows``
+            # / ``tile_cols`` are runtime values and a tile's shape must be a compile-time constant
+            # -- so this folds serially. Only lane 0 runs it (every other lane's ``result`` would be
+            # thrown away at the atomic below anyway), rather than every one of the block's
+            # ``TILE_2D**2`` lanes redundantly recomputing the identical sum.
             result = values[row_offset, col_offset]
             for r in range(tile_rows):
                 for c in range(tile_cols):
                     if r == 0 and c == 0:
                         continue
                     result = scalar(result, values[row_offset + r, col_offset + c])
-
-        if t == 0:
             atomic(out_result, 0, result)
 
     _k.__annotations__["values"] = wp.array2d[dtype]
@@ -599,7 +612,12 @@ def _minmax_1d_tiled(name, dtype):
 
 
 def _minmax_2d_tiled(name, dtype):
-    """axis=None on a 2-D array, both extrema in one pass; concrete for the same reason."""
+    """
+    axis=None on a 2-D array, both extrema in one pass; concrete for the same reason.
+
+    Reached only for a non-contiguous rank-2 array, for the same reason as
+    [`_reduce_2d_tiled`][triwarp.kernels.reduce._reduce_2d_tiled] — see its docstring.
+    """
 
     def _k(values: wp.array2d[wp.Scalar], out_minmax: wp.array[wp.Scalar]) -> None:
         i, j, t = wp.tid()
@@ -623,7 +641,12 @@ def _minmax_2d_tiled(name, dtype):
             )
             tile_min = wp.tile_min(tile)[0]
             tile_max = wp.tile_max(tile)[0]
-        else:
+            if t == 0:
+                wp.atomic_min(out_minmax, 0, tile_min)
+                wp.atomic_max(out_minmax, 1, tile_max)
+        elif t == 0:
+            # Only lane 0 folds the boundary serially -- see _reduce_2d_tiled's comment at the same
+            # branch for why every other lane running this loop too would be pure redundant work.
             tile_min = values[row_offset, col_offset]
             tile_max = values[row_offset, col_offset]
             for r in range(tile_rows):
@@ -633,8 +656,6 @@ def _minmax_2d_tiled(name, dtype):
                     v = values[row_offset + r, col_offset + c]
                     tile_min = wp.min(tile_min, v)
                     tile_max = wp.max(tile_max, v)
-
-        if t == 0:
             wp.atomic_min(out_minmax, 0, tile_min)
             wp.atomic_max(out_minmax, 1, tile_max)
 
