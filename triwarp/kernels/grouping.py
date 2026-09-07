@@ -245,7 +245,7 @@ def pack_directed_index_keys(
     # Row order is preserved, so ``(a, b)`` and ``(b, a)`` get different keys -- which is the point
     # wherever a directed edge has to be told from its twin.
     i = wp.int32(wp.tid())
-    out_keys[i] = wp.uint64(wp.uint32(indices[i, 0])) + wp.uint64(wp.uint32(indices[i, 1])) * base
+    out_keys[i] = kernel_array.pack_directed_key(indices[i, 0], indices[i, 1], base)
 
 
 @wp.kernel

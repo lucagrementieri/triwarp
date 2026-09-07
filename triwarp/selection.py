@@ -10,7 +10,6 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_same_device
-from triwarp.array import arange
 from triwarp.halfedge import halfedge_twins
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
@@ -53,6 +52,8 @@ def region_boundary_edges(
 
     Raises
     ------
+    ValueError
+        If ``face_mask`` does not have one entry per face.
     RuntimeError
         If ``faces`` and ``face_mask`` are not all on one device.
 
@@ -61,15 +62,14 @@ def region_boundary_edges(
     [`faces_left_of_contour`][triwarp.selection.faces_left_of_contour]
         The inverse: turns this seam back into the region it bounds, given ``oriented=True``.
     [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
-
-    Notes
-    -----
-    Erosion here is vertex-based: a vertex survives when every 1-ring neighbour is also in the
-    mask. MeshLab's Erode Selection is a *face*-based operation and gives a different answer.
     """
     require_same_device(faces=faces, face_mask=face_mask)
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
+    if int(face_mask.shape[0]) != n_faces:
+        raise ValueError(
+            f"face_mask must have one entry per face, got {face_mask.shape[0]} for {n_faces}"
+        )
     if n_faces == 0:
         return twt.empty_2d((0, 2), wp.int32, device=device)
     if n_vertices is None:
@@ -262,10 +262,16 @@ def exclude_fully_selected_components(
 
     Raises
     ------
+    ValueError
+        If ``mask`` does not have one entry per vertex.
     RuntimeError
         If ``faces``, ``mask`` and ``unique_edges`` are not all on one device.
     """
     require_same_device(faces=faces, mask=mask, unique_edges=unique_edges)
+    if int(mask.shape[0]) != n_vertices:
+        raise ValueError(
+            f"mask must have one entry per vertex, got {mask.shape[0]} for n_vertices={n_vertices}"
+        )
     device = mask.device
     if n_vertices == 0:
         return wp.clone(mask)
@@ -374,7 +380,7 @@ def submesh_from_face_indices(
 
     if unique_indices:
         unique_face_indices = face_indices
-        face_slots = arange(k, device=device)
+        face_slots = None
     else:
         unique_face_indices, face_slots = tw.grouping.unique_1d(face_indices, return_inverse=True)
 
@@ -383,7 +389,13 @@ def submesh_from_face_indices(
     unique_vertex_indices, remapped_faces = tw.grouping.unique_1d(unique_faces, return_inverse=True)
     sub_vertices = tw.array.gather(vertices, unique_vertex_indices)
 
-    sub_faces = tw.array.gather(remapped_faces.reshape((-1, 3)), face_slots).reshape((-1,))
+    # ``face_slots`` is ``arange(k)`` exactly when ``unique_face_indices == face_indices`` (the
+    # ``unique_indices=True`` branch above), which makes the gather below the identity -- skip it
+    # rather than pay an allocation and a launch to reproduce ``remapped_faces`` unchanged.
+    if face_slots is None:
+        sub_faces = remapped_faces
+    else:
+        sub_faces = tw.array.gather(remapped_faces.reshape((-1, 3)), face_slots).reshape((-1,))
 
     if return_index:
         return sub_vertices, sub_faces, unique_vertex_indices
@@ -492,8 +504,12 @@ def submeshes_from_face_groups(
     n_slots = int(unique_keys.shape[0])
     slot_groups = wp.empty(n_slots, dtype=wp.int32, device=device)
     vertex_ids = wp.empty(n_slots, dtype=wp.int32, device=device)
-    wp.map(kernel_selection.group_of_key, unique_keys, wp.int64(radix), out=slot_groups)
-    wp.map(kernel_selection.vertex_of_key, unique_keys, wp.int64(radix), out=vertex_ids)
+    wp.map(
+        kernel_selection.group_and_vertex_of_key,
+        unique_keys,
+        wp.int64(radix),
+        out=[slot_groups, vertex_ids],
+    )
 
     # Group starts from a histogram plus an exclusive scan rather than ``flatnonzero`` on the run
     # starts: no host synchronisation, and an empty group still gets a (zero-length) entry.
@@ -571,6 +587,8 @@ def submesh_from_face_mask(
 
     Raises
     ------
+    ValueError
+        If ``face_mask`` does not have one entry per face.
     RuntimeError
         If ``vertices``, ``faces`` and ``face_mask`` are not all on one device.
 
@@ -581,6 +599,11 @@ def submesh_from_face_mask(
         The complement: keep everything *outside* a region, and report the rims that opens.
     """
     require_same_device(vertices=vertices, faces=faces, face_mask=face_mask)
+    n_faces = int(faces.shape[0]) // 3
+    if int(face_mask.shape[0]) != n_faces:
+        raise ValueError(
+            f"face_mask must have one entry per face, got {face_mask.shape[0]} for {n_faces}"
+        )
     face_indices = tw.array.flatnonzero(face_mask)
     if return_index:
         return submesh_from_face_indices(
@@ -890,12 +913,12 @@ def expand_vertex_mask(
     require_same_device(faces=faces, mask=mask, unique_edges=unique_edges)
     device = mask.device
     n = int(mask.shape[0])
-    current = wp.clone(mask)
     if hops <= 0 or n == 0:
-        return current
+        return wp.clone(mask)
     if unique_edges is None:
         unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
     m = int(unique_edges.shape[0])
+    current = mask
     for _ in range(hops):
         nxt = wp.clone(current)
         if m > 0:

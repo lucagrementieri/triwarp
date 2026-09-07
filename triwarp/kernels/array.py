@@ -995,11 +995,15 @@ def lowbias32(x: wp.uint32) -> wp.uint32:
 
 
 @wp.func
+def pack_directed_key(a: wp.int32, b: wp.int32, base: wp.uint64) -> wp.uint64:
+    """Key of directed pair ``(a, b)``; ``(a, b)`` and ``(b, a)`` get different keys."""
+    return wp.uint64(wp.uint32(a)) + wp.uint64(wp.uint32(b)) * base
+
+
+@wp.func
 def pack_edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
     """Key of undirected edge (u, v); matches ``pack_indices`` for a sorted 2-index row."""
-    lo = wp.uint64(wp.uint32(wp.min(u, v)))
-    hi = wp.uint64(wp.uint32(wp.max(u, v)))
-    return lo + hi * base
+    return pack_directed_key(wp.min(u, v), wp.max(u, v), base)
 
 
 @wp.func

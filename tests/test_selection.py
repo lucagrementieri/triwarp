@@ -229,6 +229,16 @@ def test_region_boundary_edges_oriented_round_trips_through_the_fill(
     assert int(tw.selection.faces_left_of_contour(faces_wp, unoriented_wp).numpy().sum()) == n_faces
 
 
+def test_region_boundary_edges_rejects_mismatched_face_mask(device: str) -> None:
+    """Not a parity assert: pins the ``ValueError`` guard against an out-of-bounds kernel read."""
+    _vertices_np, faces_np = _grid_mesh(3)
+    n_faces = len(faces_np) // 3
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    short_mask = wp.zeros(n_faces - 1, dtype=wp.bool, device=device)
+    with pytest.raises(ValueError, match="one entry per face"):
+        tw.selection.region_boundary_edges(faces_wp, short_mask)
+
+
 def _meshlib_contour(topology_ml: mm.MeshTopology, contour_np: np.ndarray) -> object:
     """Directed vertex pairs as MeshLib's ``EdgeId`` vector, as ``fillContourLeft`` takes it."""
     contour_ml = mm.std_vector_Id_EdgeTag()
@@ -431,6 +441,16 @@ def test_exclude_fully_selected_components(device: str):
     # The fully-selected icosahedron component is dropped; the partial hemisphere subset stays.
     assert not result[:n_ico].any()
     assert np.array_equal(result[n_ico : n_ico + 3], np.ones(3, dtype=bool))
+
+
+def test_exclude_fully_selected_components_rejects_mismatched_mask(device: str) -> None:
+    """Not a parity assert: pins the ``ValueError`` guard against an out-of-bounds kernel read."""
+    _vertices_np, faces_np = _grid_mesh(3)
+    n_vertices = int(faces_np.max()) + 1
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    short_mask = wp.zeros(n_vertices - 1, dtype=wp.bool, device=device)
+    with pytest.raises(ValueError, match="one entry per vertex"):
+        tw.selection.exclude_fully_selected_components(faces_wp, short_mask, n_vertices)
 
 
 def test_submesh_from_face_indices_empty(device: str) -> None:
@@ -809,6 +829,19 @@ def test_submesh_from_face_mask(request: pytest.FixtureRequest, mesh_name: str) 
     assert np.array_equal(got_faces_wp.numpy(), exp_faces_wp.numpy())
     assert np.allclose(got_vertices_wp.numpy(), submesh_tm.vertices)
     assert np.array_equal(got_faces_wp.numpy(), submesh_tm.faces.reshape(-1))
+
+
+def test_submesh_from_face_mask_rejects_mismatched_length(device: str) -> None:
+    """Not a parity assert: pins the ``ValueError`` guard against an out-of-bounds kernel read."""
+    _vertices_np, faces_np = _grid_mesh(3)
+    n_faces = len(faces_np) // 3
+    vertices_wp = wp.array(
+        np.zeros((int(faces_np.max()) + 1, 3), dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    short_mask = wp.zeros(n_faces - 1, dtype=wp.bool, device=device)
+    with pytest.raises(ValueError, match="one entry per face"):
+        tw.selection.submesh_from_face_mask(vertices_wp, faces_wp, short_mask)
 
 
 @pytest.mark.parity("delete_region_keep_boundary", "meshlib")

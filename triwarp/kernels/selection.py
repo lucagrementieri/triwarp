@@ -1,6 +1,11 @@
 import warp as wp
 
-from triwarp.kernels.array import binary_search_index, binary_search_sorted_contains, masked_at
+from triwarp.kernels.array import (
+    binary_search_index,
+    binary_search_sorted_contains,
+    masked_at,
+    pack_directed_key,
+)
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.triangles import corner_triple
 
@@ -30,15 +35,9 @@ def pack_group_vertex_keys(
 
 
 @wp.func
-def group_of_key(key: wp.int64, radix: wp.int64) -> wp.int32:
-    """Group index packed into ``key`` by [`pack_group_vertex_keys`][]."""
-    return wp.int32(key // radix)
-
-
-@wp.func
-def vertex_of_key(key: wp.int64, radix: wp.int64) -> wp.int32:
-    """Source vertex index packed into ``key`` by [`pack_group_vertex_keys`][]."""
-    return wp.int32(key % radix)
+def group_and_vertex_of_key(key: wp.int64, radix: wp.int64) -> tuple[wp.int32, wp.int32]:
+    """``(group, vertex)`` packed into ``key`` by [`pack_group_vertex_keys`][], one divmod."""
+    return wp.int32(key // radix), wp.int32(key % radix)
 
 
 @wp.kernel
@@ -184,7 +183,7 @@ def open_dual_edges_and_seeds(
     h = wp.int32(wp.tid())
     tail = faces[h]
     tip = halfedge_destination(faces, h)
-    forward = wp.uint64(wp.uint32(tail)) + wp.uint64(wp.uint32(tip)) * base
+    forward = pack_directed_key(tail, tip, base)
     along_contour = binary_search_sorted_contains(contour_keys_sorted, forward)
     if along_contour:
         out_seeds[h // 3] = True
@@ -192,7 +191,7 @@ def open_dual_edges_and_seeds(
     twin = twins[h]
     if twin <= h:
         return  # boundary halfedge, or the far half of an edge the lower half already emitted
-    backward = wp.uint64(wp.uint32(tip)) + wp.uint64(wp.uint32(tail)) * base
+    backward = pack_directed_key(tip, tail, base)
     if along_contour or binary_search_sorted_contains(contour_keys_sorted, backward):
         return
     slot = wp.atomic_add(cursor, 0, 1)
