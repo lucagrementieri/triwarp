@@ -1285,6 +1285,11 @@ class _BpaState:
         self.counters = wp.zeros(kernel_bpa.BPA_COUNTERS, dtype=wp.int32, device=self.device)
         self.counters[kernel_bpa.CNT_SEEDING : kernel_bpa.CNT_SEEDING + 1].fill_(1)
         self.point_used = wp.zeros(self.n, dtype=wp.bool, device=self.device)
+        # Persists across every seeding wave for the run's whole lifetime -- see
+        # ``kernel_bpa.seed_triangles`` for why a point that once exhausted its candidates without
+        # seeding can never succeed later (its candidate set only shrinks), which is what makes
+        # never resetting this safe.
+        self.seed_failed = wp.zeros(self.n, dtype=wp.bool, device=self.device)
         self.boundary_degree = wp.zeros(self.n, dtype=wp.int32, device=self.device)
         # ``uint64`` because the per-wave vertex claim is a ``wp.atomic_min`` over a *packed vertex
         # pair* rather than over a proposal index — see ``kernel_bpa.proposal_key``, which is what
@@ -1520,6 +1525,7 @@ def _bpa_wave(state: _BpaState, max_waves: int) -> None:
             state.points,
             state.normals,
             state.point_used,
+            state.seed_failed,
             state.grid.id,
             state.radius,
             state.clustering,

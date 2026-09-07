@@ -433,6 +433,9 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # ``register_face_edge``, and check 13 does not follow writes into a called ``@wp.func``.
     ("algorithms.ball_pivoting", "commit_triangles"): frozenset({"counters", "point_used"}),
     ("algorithms.ball_pivoting", "end_wave"): frozenset({"counters"}),
+    # ``seed_failed`` is persistent per-point state, carried across every seeding wave for the
+    # run's whole lifetime -- the ``point_used`` case one level up, not a fresh per-call answer.
+    ("algorithms.ball_pivoting", "seed_triangles"): frozenset({"counters", "seed_failed"}),
     # ``edges`` is the open-addressing edge table (``BpaEdgeTable``): persistent state carried
     # across every wave, mutated in place by the pivot and commit kernels and read by both. It is
     # the ``front_out`` case one level up -- neither an input nor the answer -- so it keeps the name

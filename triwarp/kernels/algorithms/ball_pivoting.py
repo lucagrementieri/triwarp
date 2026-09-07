@@ -97,7 +97,9 @@ CNT_CONTINUE = wp.constant(7)  # the wave loop's condition
 CNT_DONE = wp.constant(8)  # the loop finished for good (as opposed to pausing to grow)
 CNT_WAVE = wp.constant(9)  # waves executed
 CNT_GROW = wp.constant(10)  # the triangle budget is exhausted; hand back to the host
-BPA_COUNTERS = 11
+CNT_SEED_FAILED = wp.constant(11)  # orphans marked "cannot seed" so far (see seed_triangles)
+CNT_PREV_SEED_FAILED = wp.constant(12)  # ... as of the start of this wave (the other progress test)
+BPA_COUNTERS = 13
 
 # Lanes per front edge in the cooperative pivot search. One warp: the block-cooperative BVH walk
 # hands one candidate per lane per step, and 32 covers the ~88 candidates an edge enumerates in
@@ -253,15 +255,17 @@ def ball_is_empty(
 
 @wp.kernel(enable_backward=False)
 def begin_wave(counters: wp.array[wp.int32]) -> None:
-    # Reset the per-wave counters and snapshot the face count the progress test compares against.
-    # The vertex claim is *not* cleared here: ``propose_triangle`` clears the three vertices it is
-    # about to contend for, which is the only part of an n-sized array a wave ever reads.
+    # Reset the per-wave counters and snapshot the face count and the seed-failure count the two
+    # progress tests compare against. The vertex claim is *not* cleared here: ``propose_triangle``
+    # clears the three vertices it is about to contend for, which is the only part of an n-sized
+    # array a wave ever reads.
     if counters[CNT_CONTINUE] == 0:
         return
     counters[CNT_NEXT_FRONT] = 0
     counters[CNT_LIVE] = 0
     counters[CNT_PROPOSAL] = 0
     counters[CNT_PREV_FACE] = counters[CNT_FACE]
+    counters[CNT_PREV_SEED_FAILED] = counters[CNT_SEED_FAILED]
 
 
 @wp.func
@@ -332,6 +336,7 @@ def seed_triangles(
     points: wp.array[wp.vec3],
     normals: wp.array[wp.vec3],
     point_used: wp.array[wp.bool],
+    seed_failed: wp.array[wp.bool],
     grid_id: wp.uint64,
     radius: wp.float32,
     clustering: wp.float32,
@@ -349,10 +354,11 @@ def seed_triangles(
         return
 
     # Gather the local orphan neighbourhood into scratch so it can be scanned as a double loop.
-    # A point yields to any lower-index orphan it *sees*, so seed fronts start well separated and do
-    # not collide into overlapping sheets before they can glue. It sees the whole neighbourhood only
-    # while that fits in ``MAX_SEED_NEIGHBORS`` -- see the ``break`` below, which is where the rule
-    # stops being exact and why that is the wanted behaviour.
+    # A point yields to any lower-index orphan it *sees* that hasn't already given up
+    # (``seed_failed``, below), so seed fronts start well separated and do not collide into
+    # overlapping sheets before they can glue. It sees the whole neighbourhood only while that
+    # fits in ``MAX_SEED_NEIGHBORS`` -- see the ``break`` below, which is where the rule stops
+    # being exact and why that is the wanted behaviour.
     #
     # ``wp.zeros``, not the ``wp.types.vector(length=K)`` register row that ``neighbors.py``'s k-NN
     # kernels hold their candidates in: measured, both spellings of this kernel end to end on bunny
@@ -377,15 +383,20 @@ def seed_triangles(
     # to completion) was built and measured on that torus, wave-0 seed proposals, baseline against
     # it: **5 -> 1** at ``1.5 *``, **5 -> 1** at ``2.0 *``, and **13 -> 0** at ``3.0 *`` -- where
     # zero seeds means ``end_wave`` sees a seeding wave that committed nothing, raises ``CNT_DONE``
-    # and the whole run returns an empty mesh (3 004 faces before, 0 after).
-    #
-    # The reason is a design gap the truncation happens to paper over: the rule elects **one**
-    # seeder per neighbourhood, and a neighbourhood whose lowest-indexed orphan cannot form a valid
-    # seed triangle is then dead for good -- the next seeding wave sees identical state, fails
-    # identically, and ends the run. Truncating the walk lets several points try, which is why it
-    # is load-bearing. Fixing this properly means letting a *failed* seeder stop suppressing its
-    # neighbourhood (a second wave phase, or dropping the pre-filter and leaning on the vertex
-    # claim, which already serialises colliding seeds), not tightening the guard.
+    # and the whole run returns an empty mesh (3 004 faces before, 0 after). That is what
+    # ``seed_failed`` fixes: the rule elects **one** seeder per neighbourhood, and a neighbourhood
+    # whose lowest-indexed orphan cannot form a valid seed triangle used to be dead for good -- the
+    # next seeding wave saw identical state and failed identically. Marking a failed elected point
+    # releases its neighbourhood: the next-lowest-indexed deferring orphan stops yielding to it and
+    # gets its own turn on a later wave (``end_wave`` now keeps seeding across waves for exactly as
+    # long as new failures are still being discovered -- see the counter there). This is sound
+    # because a point's candidate set only ever *shrinks* across waves (``point_used`` only ever
+    # goes false -> true), so a point that exhausted its current candidates and failed can never
+    # succeed with a strict subset of them later; the one thing marking it forfeits is being
+    # revisited if the *specific* ``MAX_SEED_NEIGHBORS`` window the truncated walk saw would have
+    # shifted to include a different candidate on a later wave, which is a strictly milder cost
+    # than the deadlock this replaces (the point is not lost -- it can still be pivoted onto, or
+    # picked as someone else's candidate, once a nearby seed grows a front to it).
     nbr = wp.zeros(shape=MAX_SEED_NEIGHBORS, dtype=wp.int32)
     count = wp.int32(0)
     query = wp.hash_grid_query(grid_id, points[p], 2.0 * radius)
@@ -394,8 +405,8 @@ def seed_triangles(
         if count >= MAX_SEED_NEIGHBORS:
             break
         if j != p and not point_used[j]:
-            if j < p:
-                return  # a lower-index orphan neighbour will seed this neighbourhood instead
+            if j < p and not seed_failed[j]:
+                return  # a lower-index, still-viable orphan neighbour will seed this instead
             nbr[count] = j
             count += 1
 
@@ -420,6 +431,13 @@ def seed_triangles(
             if ball_is_empty(grid_id, points, center, radius, p, a, b):
                 propose_triangle(p, a, b, front_capacity, counters, out_owner, out_a, out_b, out_c)
                 return
+
+    # No candidate pair among those seen produced a valid seed: release this neighbourhood so a
+    # deferring orphan can try on a later wave, and count it so ``end_wave`` knows the seed-failure
+    # state is still changing and keeps seeding rather than declaring the run done.
+    if not seed_failed[p]:
+        seed_failed[p] = True
+        wp.atomic_add(counters, CNT_SEED_FAILED, 1)
 
 
 @wp.func
@@ -901,8 +919,15 @@ def end_wave(max_waves: wp.int32, counters: wp.array[wp.int32]) -> None:
     # Advance the device-resident wave state and decide whether the loop keeps going.
     #
     # A wave either pivots the current front or seeds orphans; seeding runs whenever the previous
-    # wave committed nothing, which is also the termination test — a stalled pivot followed by a
-    # stalled seed means there is nothing left to do.
+    # wave committed nothing. The termination test used to be exactly that stall (a stalled pivot
+    # followed by one stalled seed wave means there is nothing left to do) -- but a single seeding
+    # wave marking some elected orphans ``seed_failed`` (see ``seed_triangles``) only *releases*
+    # their neighbourhoods for the *next* wave to try, so declaring done the first time a seeding
+    # wave commits nothing would end the run before any of those releases had a chance to matter.
+    # The second progress test (``CNT_SEED_FAILED`` against its snapshot) is what keeps seeding
+    # going for as long as the failure state is still changing, and only declares done once a
+    # seeding wave commits no faces *and* discovers no new failures either -- genuinely nothing
+    # left to try, not just nothing committed this particular wave.
     if counters[CNT_CONTINUE] == 0:
         return
     counters[CNT_FRONT] = counters[CNT_NEXT_FRONT]
@@ -916,14 +941,15 @@ def end_wave(max_waves: wp.int32, counters: wp.array[wp.int32]) -> None:
         # since ``_bpa_run`` checks done before it checks grow.
         counters[CNT_CONTINUE] = 0
         return
-    if counters[CNT_FACE] == counters[CNT_PREV_FACE]:
-        if counters[CNT_SEEDING] != 0:
+    if counters[CNT_FACE] != counters[CNT_PREV_FACE]:
+        counters[CNT_SEEDING] = 0
+    elif counters[CNT_SEEDING] != 0:
+        if counters[CNT_SEED_FAILED] == counters[CNT_PREV_SEED_FAILED]:
             counters[CNT_DONE] = 1
             counters[CNT_CONTINUE] = 0
-        else:
-            counters[CNT_SEEDING] = 1
+        # else: still seeding, and the failure set is still changing -- keep going.
     else:
-        counters[CNT_SEEDING] = 0
+        counters[CNT_SEEDING] = 1
     # Hand control back to the host to compact a front that has accumulated too many retired
     # entries, or because the wave cap was hit. (Growing the budget is the early return above.)
     if counters[CNT_WAVE] >= max_waves:
