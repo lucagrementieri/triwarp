@@ -3960,6 +3960,31 @@ not insensitivity** (§16.4).
   pruning/safety passes in the kernel was a large loss, confirming both are load-bearing rather than
   incidental; and making an eager shuffle lazy was a wash, since its result was almost always consumed
   at only its first element anyway.
+- **A `wp.Stream`-overlap rewrite for any "independent-but-sequential" pair, tree-wide.** A
+  repository-wide sweep for public functions with two kernel-launching branches that have no data
+  dependency between them found five real candidates — `metrics._distances_mesh_to_mesh`'s two
+  `closest_point_on_mesh` calls, `reconstruction.ball_pivoting`'s hash-grid-then-BVH build pair,
+  `smoothing.filter_implicit_fairing`'s cotangent-stiffness/mass-matrix pair (repeated every
+  smoothing iteration), and a same-operator/different-right-hand-side CG solve pair
+  (`heat.extend_scalar`'s two `_solve_scalar` calls). Each was built and measured with two
+  `wp.Stream`s joined by `wait_stream`, against the sequential default-stream form it already has, on
+  an RTX 5090 / Warp 1.17 across 642-163 842 vertices: **0.87-1.07x** — indistinguishable from noise,
+  never a repeatable win. Two structural reasons, not a per-pair fluke: (1) every branch here is
+  host-launch-overhead dominated (§13.1) — device time measured at 0.01-0.19 ms against a
+  0.13-1.4 ms wall time — so there is at most a sliver of device time for a second stream to hide
+  behind, and the `ScopedStream`/`wait_stream` bookkeeping costs about as much as that sliver; (2) a
+  CG solve issues its convergence check as a host readback every `CG_CHECK_EVERY_FALLBACK` (10)
+  iterations, so wrapping a whole solve in one stream context still runs every one of its readbacks
+  to completion before the *next* Python call — the other solve — issues a single kernel: sequential
+  Python calls cannot overlap through streams alone unless the two loops' iterations are interleaved
+  at the call site, which is a rewrite of the iteration, not a stream annotation. **Do not build a
+  `wp.Stream`-overlap convention on the strength of "these two calls have no data dependency" alone**
+  — check the device/wall split first (§13.1, §16.1). For a same-operator, multiple-right-hand-side
+  solve specifically, reach for the existing batched/block-CG machinery
+  (`linalg.solve_spd_columns`'s `_BlockCg2`, §16.8) instead of streams, since it merges the two
+  Krylov subspaces into one iteration rather than trying to run two independent ones concurrently —
+  `heat.extend_scalar` and `heat.transport_tangent_vectors` both currently call `_solve_scalar` twice
+  rather than going through it, which is an open lead unrelated to streams.
 ---
 
 ## 15. Benchmark and measurement traps
@@ -4688,7 +4713,7 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
 - **SHIPPED — block conjugate gradient (`linalg._BlockCg2`) for exactly two columns under
   `preconditioner="diag"`.** Classical block CG, sharing one Krylov subspace across both columns
   instead of solving them independently — reaches `harmonic`/`tutte` at `k=1` and `arap`'s global
-  step, the only two in-repo two-column callers. A modest but real end-to-end win on both devices.
+  step. A modest but real end-to-end win on both devices.
   - **The system the mechanism was first probed on was not the system it actually reaches in
     production, and re-probing on the real one gave a smaller (still real) number.** A more favorable
     system happened to be convenient to capture first, but that system is solved by a different code
@@ -4710,6 +4735,24 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
     devices: solutions agree tightly, and the block form's iteration count is strictly lower in
     every case measured, which the regression test asserts as a strict inequality (a silent fallback
     to independent columns would pass a looser `<=` bound but not the strict one).
+  - **A third caller reaches it: `heat.extend_scalar`'s two right-hand sides (the source indicator
+    and the source values) diffuse through the identical heat system and previously ran as two
+    independent `solve_spd` calls — converted to one `solve_spd_columns` call, which reaches
+    `_BlockCg2` since `heat_operators`'s Jacobi preconditioner is exactly `"diag"`.** Measured back
+    to back in one session (detached-worktree A/B, §15.6) on the `saddle`/`saddle_graded` benchmark
+    fixtures: `extend_scalar` **1.4-1.5x**, and `transport_tangent_vectors` — which calls
+    `extend_scalar` internally for the transported magnitude — **1.2x full / 1.5x amortized**.
+    `log_map` is untouched (it calls `heat_geodesic`, not `extend_scalar`). Numbers and the full
+    story: `benchmarks/test_heat.py`'s module docstring. **One correctness caveat found while
+    verifying it, not introduced by it**: at a mesh fine enough and with enough widely-spread
+    sources that the diffused indicator field underflows toward its float64 resolution floor
+    (verified at 40 962+ vertices, 8 sources), the two implementations' *far-field* values can
+    disagree by orders of magnitude after the `divide_positive` ratio — both converge to the same
+    `tol=1e-8` *relative* residual, but reach it via different iteration paths, and in that regime
+    the absolute per-entry precision is already below what either path can resolve, so the ratio
+    amplifies ordinary CG round-off into a large-looking disagreement. Confirmed pre-existing (not
+    new): on the single- or few-source, moderate-mesh inputs every real caller and test uses
+    (`_HEAT_MESHES` and the `saddle` family), the two implementations agree to float64 round-off.
 
 ### 16.9 The 0.3-5.0 ms loss band, attributed
 

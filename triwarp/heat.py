@@ -848,21 +848,25 @@ def extend_scalar(
 
     if operators is None:
         operators = heat_operators(vertices, faces, t)
-    heat_system, heat_preconditioner = operators[0], operators[1]
+    heat_system = operators[0]
 
-    indicator = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    weighted = wp.zeros(n_vertices, dtype=wp.float64, device=device)
+    # The indicator and the weighted values diffuse through the same operator, so they are one
+    # batched two-column solve (``linalg.solve_spd_columns``) rather than two independent ones: at
+    # exactly two columns with a diagonal preconditioner this reaches ``linalg._BlockCg2``, which
+    # shares one Krylov subspace across both instead of running two -- see that class's Notes.
+    rhs = twt.as_array2d(wp.zeros((2, n_vertices), dtype=wp.float64, device=device), wp.float64)
     wp.launch(
         kernel_heat.seed_source_scalars,
         dim=n_sources,
-        inputs=[sources, values, indicator, weighted],
+        inputs=[sources, values, rhs[0], rhs[1]],
         device=device,
     )
-
-    diffused_indicator = _solve_scalar(
-        heat_system, indicator, n_vertices, device, heat_preconditioner
+    diffused = twt.as_array2d(
+        wp.zeros((2, n_vertices), dtype=wp.float64, device=device), wp.float64
     )
-    diffused_values = _solve_scalar(heat_system, weighted, n_vertices, device, heat_preconditioner)
+    twl.solve_spd_columns(heat_system, rhs, diffused, tol=_CG_TOLERANCE)
+    diffused_indicator, diffused_values = diffused[0], diffused[1]
+
     # The indicator decays away from the sources *and* carries the mesh's scale, so the "there is no
     # source anywhere near here" cutoff is a fraction of its own maximum. One host readback, as in
     # ``transport_tangent_vectors``.
@@ -870,21 +874,6 @@ def extend_scalar(
     extended = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(kernel_heat.divide_positive, diffused_values, diffused_indicator, floor, out=extended)
     return extended
-
-
-def _solve_scalar(
-    system: wps.BsrMatrix[wp.float64],
-    right_hand_side: wp.array[wp.float64],
-    n_vertices: int,
-    device: wp.DeviceLike,
-    preconditioner: wpl.LinearOperator,
-) -> wp.array[wp.float64]:
-    """Diffuse one scalar right-hand side through an already-assembled heat system."""
-    solution = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    twl.solve_spd(
-        system, right_hand_side, solution, tol=_CG_TOLERANCE, preconditioner=preconditioner
-    )
-    return solution
 
 
 def transport_tangent_vectors(

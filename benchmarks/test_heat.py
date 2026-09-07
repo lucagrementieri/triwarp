@@ -157,28 +157,40 @@ The three functions cost different numbers of solves, which is most of what sepa
 pass.
 
 The amortized rows price the operator assembly: ``transport_tangent_vectors`` goes
-**10.87 -> 7.11 ms** on ``saddle`` when the operators are reused, so a third of a transport call is
-assembly. Against the reference the comparison *flips sign* between the two rows -- 14.6x faster at
-``full`` (158 ms), 2.4x slower at ``amortized`` (2.94 ms) -- for the reason the ``heat_geodesic``
-table shows: a factorization is expensive once and cheap thereafter, conjugate gradient is neither.
-Note too that transport barely feels the ``quality`` axis (7.11 against 7.05 ms) where ``log_map``
-feels it 2.7x; the difference is the distance field the log map also solves.
+**11.95 -> 5.75 ms** on ``saddle`` when the operators are reused, so roughly half of a transport
+call is assembly. Against the reference the comparison *flips sign* between the two rows -- 15.7x
+faster at ``full`` (188 ms), 1.8x slower at ``amortized`` (3.2 ms) -- for the reason the
+``heat_geodesic`` table shows: a factorization is expensive once and cheap thereafter, conjugate
+gradient is neither. Note too that transport barely feels the ``quality`` axis (5.75 against
+5.74 ms) where ``log_map`` feels it 2.6x; the difference is the distance field the log map also
+solves.
 
 ``vector_heat_operators`` now caches the vector system's own Jacobi preconditioner too (its fourth
 tuple field), which the amortized row here does not visibly move: `wpl.preconditioner` on this
 system costs ~0.15 ms in isolation (measured directly, 200 calls between two syncs), against the
-~3 ms `diffuse_tangent_field` solve it feeds and the further `extend_scalar` pair the full
+~3 ms `diffuse_tangent_field` solve it feeds and the further `extend_scalar` solve the full
 ``transport_tangent_vectors`` call also pays for -- a real ~7% saving on the vector solve alone,
 diluted below this benchmark's own run-to-run noise once the rest of the call is included. Landed
 for the architectural consistency with ``heat_operators``'s own two cached preconditioners, not for
 a win visible at this level.
 
-Measured on an RTX 5090, ``saddle`` then ``saddle_graded``: ``extend_scalar`` 7.2 / 5.6 ms against
-the reference's 38.3 / 38.1; ``transport_tangent_vectors`` 10.4 ms at ``saddle``; ``log_map`` 26.6 /
-**72.7 ms** against 182 / 188. That last row is the module's real result: triwarp's vector solve
-pays **2.7x** for the worse aspect ratio while the reference's factorization pays nothing -- the
-same iterative-versus-direct trade ``heat_geodesic_conditioning`` shows for the scalar. Assembly
-alone is measured as ``connection_laplacian`` in
+``extend_scalar``'s two right-hand sides (where the sources are, and what they carry) diffuse
+through the identical operator, so they are one batched two-column solve
+(``linalg.solve_spd_columns``) rather than two independent CG calls: at exactly two columns under a
+diagonal preconditioner this reaches ``linalg._BlockCg2``, and ``transport_tangent_vectors``
+inherits the win through its own call to ``extend_scalar``. Measured back to back in one session,
+same fixtures:
+``extend_scalar`` **8.1 -> 5.3 ms** (``saddle``) and **8.0 -> 5.6 ms** (``saddle_graded``),
+1.4-1.5x; ``transport_tangent_vectors`` **14.9 -> 12.0 ms** full and **8.6 -> 5.7 ms** amortized,
+1.2-1.5x. ``log_map`` is untouched by this (it calls `heat_geodesic`, not `extend_scalar`) and its
+own numbers are unchanged within noise.
+
+Measured on an RTX 5090, ``saddle`` then ``saddle_graded``: ``extend_scalar`` 5.9 / 5.4 ms against
+the reference's 51.4 / 47.8; ``transport_tangent_vectors`` 12.1 ms full at ``saddle``; ``log_map``
+31.1 / **81.6 ms** against 223.0 / 218.9. That last row is the module's real result: triwarp's
+vector solve pays **2.6x** for the worse aspect ratio while the reference's factorization pays
+nothing -- the same iterative-versus-direct trade ``heat_geodesic_conditioning`` shows for the
+scalar. Assembly alone is measured as ``connection_laplacian`` in
 [`test_laplacian.py`](test_laplacian.py) -- 1.11 / 1.23 / 2.82 ms over the scale axis -- since the
 operator itself lives in ``triwarp.laplacian``.
 

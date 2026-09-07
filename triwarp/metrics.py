@@ -889,7 +889,17 @@ def _distances_mesh_to_mesh(
     faces_b: wp.array[wp.int32],
     single_directional: bool,
 ) -> _DistancePair | None:
-    """Each mesh's vertices to the other's surface. Vertex-sampled, not a true surface metric."""
+    """
+    Each mesh's vertices to the other's surface. Vertex-sampled, not a true surface metric.
+
+    The two ``closest_point_on_mesh`` calls below have no data dependency between them, and were
+    one of five such pairs across the tree measured against a two-``wp.Stream`` overlap (joined by
+    ``wait_stream``) instead of the sequential default-stream form -- 0.87-1.07x across all five,
+    indistinguishable from noise. See CLAUDE.md §14.9 for the full numbers and the two structural
+    reasons (host-launch-overhead dominance and CG's periodic host-readback check). Kept sequential;
+    do not reintroduce stream overlap here without a call site whose own device share is much
+    larger.
+    """
     if (
         int(vertices_a.shape[0]) == 0
         or int(vertices_b.shape[0]) == 0
