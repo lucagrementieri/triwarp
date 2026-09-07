@@ -410,6 +410,11 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # pass's answer *and* this pass's, so it is in place and ``out_`` would read as write-only.
     ("remesh", "compose_vertex_index"): frozenset({"index"}),
     ("registration", "transform_and_accumulate_cost"): frozenset({"acc"}),
+    # ``rhs`` arrives already holding ``-A_ub x_b`` from ``linalg.assemble_interior_system`` (which
+    # eliminates a quadratic form with no linear term of its own), and this kernel only ever
+    # accumulates the linear term on top -- the same in-place shape as ``acc`` just above, not a
+    # fresh per-call answer.
+    ("smoothing", "add_interior_mass_rhs"): frozenset({"rhs"}),
     # scratch / persistent state
     ("adjacency", "scatter_vertex_faces"): frozenset({"cursor"}),
     # ``min_distance_sq`` is the farthest-point sampler's running distance-to-the-chosen-set:

@@ -1,9 +1,14 @@
 import warp as wp
 
 from triwarp.kernels.array import to_vec3d
+from triwarp.kernels.laplacian import cot_entries_from_l2
 from triwarp.kernels.linalg import free_row, selected_row, solve_normal_equations
 from triwarp.kernels.points import plane_basis
-from triwarp.kernels.predicates import closest_point_on_segment
+from triwarp.kernels.predicates import (
+    closest_point_on_segment,
+    doublearea_from_lengths,
+    squared_edge_lengths,
+)
 from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import corner_triple
 
@@ -25,17 +30,6 @@ mat66d = wp.types.matrix(shape=(6, 6), dtype=wp.float64)
 # ---------------------------------------------------------------------------
 
 
-@wp.func
-def _corner_cotan(p: wp.vec3, q: wp.vec3, o: wp.vec3) -> wp.float32:
-    # Cotangent of the angle at corner ``o`` in triangle ``(o, p, q)``.
-    a = p - o
-    b = q - o
-    cr = wp.length(wp.cross(a, b))
-    if cr <= wp.float32(0.0):
-        return wp.float32(0.0)
-    return wp.dot(a, b) / cr
-
-
 @wp.kernel
 def edge_cotan_add(
     vertices: wp.array[wp.vec3],
@@ -45,15 +39,25 @@ def edge_cotan_add(
 ) -> None:
     # Accumulate each face corner's cotangent into its opposite unique edge; the two incident faces
     # sum to the cotangent edge weight cot(alpha) + cot(beta).
+    #
+    # The per-corner cotangent is ``laplacian.py``'s generic half-cotangent formula (its own
+    # denominator/degenerate-triangle guard, rather than a second independent one derived from the
+    # raw cross product) doubled back to a full cotangent, since this accumulator -- unlike
+    # ``laplacian.cotmatrix`` -- wants ``cot(alpha) + cot(beta)`` rather than the half-cotangent
+    # convention `laplacian.py`'s own docstring explains. ``inverse[f*3+k]`` is the unique edge id
+    # of edge ``(v_k, v_{k+1})`` (``edges.faces_to_edges``'s convention), whose cotangent
+    # contribution from this triangle is the angle *opposite* that edge -- i.e. the angle at the
+    # corner not on it -- which is why the three half-cotangents land rotated by one slot below.
     f = wp.int32(wp.tid())
     v0, v1, v2 = corner_triple(faces, f)
     p0 = vertices[v0]
     p1 = vertices[v1]
     p2 = vertices[v2]
-    cotan0 = _corner_cotan(p0, p1, p2)
-    cotan1 = _corner_cotan(p1, p2, p0)
-    cotan2 = _corner_cotan(p2, p0, p1)
-    add_corner_triple(out_w, inverse, f, cotan0, cotan1, cotan2)
+    l2_0, l2_1, l2_2 = squared_edge_lengths(p0, p1, p2)
+    dbl_area = doublearea_from_lengths(wp.sqrt(l2_0), wp.sqrt(l2_1), wp.sqrt(l2_2))
+    half_cotan0, half_cotan1, half_cotan2 = cot_entries_from_l2(l2_0, l2_1, l2_2, dbl_area)
+    two = wp.float32(2.0)
+    add_corner_triple(out_w, inverse, f, two * half_cotan2, two * half_cotan0, two * half_cotan1)
 
 
 @wp.func
@@ -234,20 +238,22 @@ def add_interior_mass_rhs(
     free_map: wp.array[wp.int32],
     mass: wp.array[wp.float64],
     positions: wp.array[wp.vec3d],
-    out_rhs: wp.array2d[wp.float64],
+    rhs: wp.array2d[wp.float64],
 ) -> None:
     # Add the linear term ``b_u = (M V)_u`` into the reduced right-hand side, which arrives holding
     # only ``-A_ub x_b`` from ``linalg.assemble_interior_system`` (that helper eliminates the pinned
-    # columns of a quadratic form, which has no linear term of its own).
+    # columns of a quadratic form, which has no linear term of its own). ``rhs`` is genuinely
+    # in-place -- an accumulator carrying that prior term in, not a fresh answer -- which is why it
+    # does not carry the ``out_`` prefix reserved for write-only outputs (CLAUDE.md section 2.1).
     v = wp.int32(wp.tid())
     i = free_row(fixed_mask, free_map, v)
     if i < 0:
         return
     m = mass[v]
     p = positions[v]
-    out_rhs[0, i] = out_rhs[0, i] + m * p[0]
-    out_rhs[1, i] = out_rhs[1, i] + m * p[1]
-    out_rhs[2, i] = out_rhs[2, i] + m * p[2]
+    rhs[0, i] = rhs[0, i] + m * p[0]
+    rhs[1, i] = rhs[1, i] + m * p[1]
+    rhs[2, i] = rhs[2, i] + m * p[2]
 
 
 @wp.kernel
@@ -414,7 +420,7 @@ def implicit_laplacian_triplets(
 def scalar_laplacian_step(value: wp.float32, average: wp.float32, lamb: wp.float32) -> wp.float32:
     # Explicit diffusion step on a scalar field: move it a fraction ``lamb`` of the way to the
     # 1-ring average. ``lamb = 1`` replaces the value outright, which is MeshLab's single pass.
-    return value + lamb * (average - value)
+    return wp.lerp(value, average, lamb)
 
 
 @wp.kernel
@@ -590,6 +596,10 @@ def equal_area_position(
         rhs += term * first_position
 
     if no_shrinkage:
+        # ``plane_basis`` renormalizes ``normal`` internally to build the tangent frame; the anchor
+        # projection below must use that same unit vector, since it is only a projection onto the
+        # normal axis when its argument has unit length.
+        unit_normal = wp.normalize(normal)
         axis_x, axis_y = plane_basis(normal)
         basis_x = to_vec3d(axis_x)
         basis_y = to_vec3d(axis_y)
@@ -603,7 +613,7 @@ def equal_area_position(
         trace = planar[0, 0] + planar[1, 1]
         if DOUBLE_EPSILON * wp.abs(trace * trace) >= wp.abs(determinant):
             return current
-        anchor = to_vec3d(normal) * wp.dot(to_vec3d(normal), to_vec3d(current))
+        anchor = to_vec3d(unit_normal) * wp.dot(to_vec3d(unit_normal), to_vec3d(current))
         reduced = rhs - matrix * anchor
         solution = wp.inverse(planar) * wp.vec2d(wp.dot(reduced, basis_x), wp.dot(reduced, basis_y))
         target = anchor + basis_x * solution[0] + basis_y * solution[1]
@@ -740,8 +750,10 @@ def relax_approx_step(
     out_positions: wp.array[wp.vec3],
 ) -> None:
     # Fit a local surface to the vertex's neighbourhood and step toward the point of that surface
-    # above the vertex. A plane needs 3 points and the quadric 6, which is why an under-populated
-    # neighbourhood is left alone rather than fitted to whatever it has.
+    # above the vertex. The floor below is a uniform 6 for both the planar and the quadric fit --
+    # not 3, even though a plane alone needs only that many -- so an under-populated neighbourhood
+    # is left alone rather than fitted to whatever it has; ``smoothing.relax_approx``'s docstring
+    # states this uniform floor as the intended behavior.
     vertex = wp.int32(wp.tid())
     current = positions[vertex]
     begin = neighbor_offsets[vertex]
@@ -838,16 +850,24 @@ def project_to_zero_isoline(
         value_apex = field[apex]
         gap_left = value_apex - field[left]
         gap_right = value_apex - field[right]
-        if gap_left == wp.float64(0.0) or gap_right == wp.float64(0.0):
-            continue
         apex_position = positions[apex]
-        crossing_left = apex_position + (positions[left] - apex_position) * wp.float32(
-            value_apex / gap_left
-        )
-        crossing_right = apex_position + (positions[right] - apex_position) * wp.float32(
-            value_apex / gap_right
-        )
-        candidate = closest_point_on_segment(crossing_left, crossing_right, current)
+        # A gap of exactly zero means ``apex`` and that neighbour already share the same (zero)
+        # field value, so by linearity the whole edge between them -- not one interior point on
+        # it -- lies on the level set; falling through to the crossing formula below would divide
+        # by that zero. Using the edge itself as the candidate segment covers the doubly-degenerate
+        # case too (every corner on the level set) -- some incident edge is still a valid witness.
+        if gap_left == wp.float64(0.0):
+            candidate = closest_point_on_segment(apex_position, positions[left], current)
+        elif gap_right == wp.float64(0.0):
+            candidate = closest_point_on_segment(apex_position, positions[right], current)
+        else:
+            crossing_left = apex_position + (positions[left] - apex_position) * wp.float32(
+                value_apex / gap_left
+            )
+            crossing_right = apex_position + (positions[right] - apex_position) * wp.float32(
+                value_apex / gap_right
+            )
+            candidate = closest_point_on_segment(crossing_left, crossing_right, current)
         distance = wp.length_sq(candidate - current)
         if distance < best_distance:
             best_distance = distance

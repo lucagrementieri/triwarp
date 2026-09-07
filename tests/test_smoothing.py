@@ -33,6 +33,7 @@ from tests.conversions import (
     trimesh_to_warp,
     warp_to_trimesh,
 )
+from triwarp.kernels import smoothing as kernel_smoothing
 
 
 def _meshlab_umbrella(mesh_tm: tm.Trimesh, device: str) -> wps.BsrMatrix[wp.float32]:
@@ -1429,6 +1430,61 @@ def test_smooth_region_boundary_leaves_connectivity_and_the_rest_alone(device: s
         tw.smoothing.smooth_region_boundary(
             vertices_wp, faces_wp, wp.zeros(3, dtype=wp.bool, device=device), 4
         )
+
+
+def test_project_to_zero_isoline_handles_an_exact_field_tie(device: str) -> None:
+    """
+    Regression: an exact field tie used to drop a triangle's candidate crossing outright.
+
+    ``project_to_zero_isoline``'s apex is the corner whose sign differs from the other two; when
+    that apex and one of its neighbours happen to share the exact same field value (both exactly
+    zero, which the harmonic field genuinely can hit at a vertex the region boundary passes through
+    symmetrically), the two used to fall through to ``continue`` rather than recognising that, by
+    linearity, the whole edge between the tied pair lies on the level set.
+
+    Reaching an exact ``0.0`` tie through ``smooth_region_boundary``'s harmonic solve needs an
+    elaborately mirror-symmetric mesh and region (the solve is otherwise never bit-exact), and even
+    then the tied vertex itself never visibly moves -- it is already sitting on the level set, so
+    "stay put" is the right answer whether or not the bug is fixed. What is observable is a *third*
+    free vertex that shares this same triangle without being part of the tied pair: this builds the
+    kernel's inputs directly, the way its docstring specifies them, so the tie is exact by
+    construction rather than by a fragile numerical coincidence.
+    """
+    # Triangle (tied_a, other, tied_b): the first and third corners share field 0.0 exactly, and
+    # the second is some nonzero value -- the ordering that routes through
+    # ``project_to_zero_isoline``'s final branch, where the apex (the third corner) ties with the
+    # first rather than differing from both. ``other`` sits far off the tied edge, so a fixed value
+    # is a poor answer next to the segment's actual closest point, and the difference is a mutation
+    # probe: reverting the fix brings ``continue`` back and ``other`` stops moving.
+    positions_np = np.array([[0.0, 0.0, 0.0], [2.0, 2.0, 2.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    positions_wp = wp.array(positions_np, dtype=wp.vec3, device=device)
+    faces_wp = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+    field_wp = wp.array([0.0, 1.0, 0.0], dtype=wp.float64, device=device)
+    free_wp = wp.array([False, True, False], dtype=wp.bool, device=device)
+    # Only vertex 1 ("other") is free, so only its CSR row is ever read; face 0 is its one
+    # incident face.
+    offsets_wp = wp.array([0, 0, 1, 1], dtype=wp.int32, device=device)
+    vertex_faces_wp = wp.array([0], dtype=wp.int32, device=device)
+    out_wp = wp.empty(3, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_smoothing.project_to_zero_isoline,
+        dim=3,
+        inputs=[
+            positions_wp,
+            faces_wp,
+            offsets_wp,
+            vertex_faces_wp,
+            field_wp,
+            free_wp,
+            1.0,
+            out_wp,
+        ],
+        device=device,
+    )
+    out_np = out_wp.numpy()
+    # The tied edge is the segment from (0, 0, 0) to (0, 1, 0); its closest point to (2, 2, 2) is
+    # the far endpoint (0, 1, 0), not the untouched input position.
+    assert np.allclose(out_np[1], [0.0, 1.0, 0.0], atol=1e-6)
 
 
 def _scalar_spike(mesh_tm: tm.Trimesh) -> np.ndarray:
