@@ -654,19 +654,29 @@ def corner_normals(
 
     # Counter-clockwise about the vertex: ``h -> twins[prev(h)]``, the rotation
     # ``halfedge.vertex_one_rings`` walks. The edge crossed is the one ``prev(h)`` lies on.
+    #
+    # ``closed_loop`` is tracked separately from ``halfedge == corner`` rather than read off it:
+    # the very first step can break on a crease *before* ``halfedge`` is ever reassigned, which
+    # leaves it sitting at its initial value of ``corner`` -- indistinguishable from a genuine full
+    # rotation back to the start if the two were conflated, and that collision silently skipped the
+    # clockwise half whenever a corner's own ``prev`` edge happened to be a crease.
     halfedge = corner
+    closed_loop = wp.bool(False)
     for _ in range(twins.shape[0]):
         crossing = halfedge_prev(halfedge)
         if is_crease_edge(faces, crease_keys_sorted, base, crossing):
             break
         halfedge = twins[crossing]
-        if halfedge < 0 or halfedge == corner:
-            break  # a boundary edge ends the fan; returning to the start means it closed
+        if halfedge < 0:
+            break  # a boundary edge ends the fan
+        if halfedge == corner:
+            closed_loop = wp.bool(True)
+            break  # back at the start: the fan closed and every face is already counted
         total += face_normals[halfedge // 3] * corner_weights[halfedge]
 
     # Clockwise, the inverse rotation ``h -> next(twins[h])``, crossing ``h``'s own edge. Skipped
     # entirely when the fan already closed, since every face is then already counted.
-    if halfedge != corner:
+    if not closed_loop:
         halfedge = corner
         for _ in range(twins.shape[0]):
             if is_crease_edge(faces, crease_keys_sorted, base, halfedge):

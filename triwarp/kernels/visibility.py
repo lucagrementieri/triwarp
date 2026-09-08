@@ -281,6 +281,11 @@ def init_sphere_radii_support(
 
     diff = mesh_vertices[best] - p
     denom = wp.float32(2.0) * wp.dot(diff, n)
+    # `denom` is algebraically `2 * max_proj` (both are `2 * dot(mesh_vertices[best] - p, n)`), so
+    # this guard looks redundant against the one above -- it is not, on float32: the two are
+    # computed by differently-associated expressions (`dot(a, n) - dot(b, n)` above,
+    # `dot(a - b, n)` here), so they can disagree by a rounding error the `max_proj` check already
+    # cleared. Keep both; do not "simplify" by reusing `max_proj` in place of `denom`.
     if wp.abs(denom) < TOLERANCE_PLANAR_CONSTANT:
         out_radii[tid] = wp.inf
         out_not_converged[tid] = False

@@ -1512,7 +1512,7 @@ def extrude_polygon(
         if transform is None:
             transform = wp.mat44(*translation.flatten())
         else:
-            composed = _transform_to_numpy(transform).dot(translation)
+            composed = tw.transform.matrix_to_numpy(transform).dot(translation)
             transform = wp.mat44(*composed.flatten())
     return extrude_triangulation(ring, faces, height, transform=transform)
 
@@ -2177,10 +2177,6 @@ def random_soup(
 
 
 # --- private helpers ---------------------------------------------------------------------
-#
-# ``_transform_to_numpy`` is the one member with a single caller (``extrude_polygon``) and it
-# stays here deliberately: it is the read half of ``_apply_transform`` directly above it, which
-# is reached from seven builders.
 
 
 class _ParametricSpec(NamedTuple):
@@ -2530,16 +2526,6 @@ def _apply_transform(
     return tw.transform.transform_mesh(
         vertices, faces, transform, out_vertices=vertices, out_faces=faces
     )
-
-
-def _transform_to_numpy(transform: wp.mat44 | wp.array[wp.mat44]) -> np.ndarray:
-    """
-    Read a transform parameter back as a host ``(4, 4)`` array.
-
-    Needed for composing the transform with the ``mid_plane`` offset in
-    [`extrude_polygon`][triwarp.creation.extrude_polygon], which is host matrix arithmetic.
-    """
-    return np.array(tw.transform.as_mat44(transform), dtype=np.float64).reshape(4, 4)
 
 
 def _upload_points(points_np: np.ndarray, dtype: type, device: wp.DeviceLike) -> wp.array:

@@ -217,6 +217,47 @@ def test_corner_normals_degenerate_crease_sets_are_exact(
     assert not np.allclose(smooth_np, hard_np, rtol=1e-3, atol=1e-3)
 
 
+def test_corner_normals_ccw_first_step_crease_does_not_skip_clockwise_walk(device: str) -> None:
+    """
+    Not a library comparison: a regression pin for a loop-closure sentinel collision.
+
+    Four faces ring a single shared vertex ``v``, with exactly one crease edge at ``{v, p0}``.
+    Every corner but one reaches the crease partway through its counter-clockwise walk, which
+    correctly leaves ``halfedge != corner`` afterwards and runs the clockwise half too. The fourth
+    corner's *own* ``halfedge_prev`` edge -- the very first one tested -- **is** the crease, so its
+    counter-clockwise loop breaks on the first iteration, before ``halfedge`` is ever reassigned
+    from its initial value of ``corner``. Conflating that with "the fan closed" (which also leaves
+    ``halfedge == corner``) skipped the clockwise walk for exactly that one corner, collapsing its
+    answer to its own face's normal instead of the four-face smooth-group average every other
+    corner at ``v`` gets -- removing a single edge from a 4-face ring around a vertex still leaves
+    every face reachable from every corner by going around the other way.
+    """
+    vertices_np = np.array(
+        [
+            [0.0, 0.0, 0.0],  # v
+            [1.0, 0.0, 0.0],  # p0
+            [0.0, 1.0, 0.0],  # p1
+            [-1.0, 0.0, 0.0],  # p2
+            [0.0, -1.0, 0.0],  # p3
+        ],
+        dtype=np.float32,
+    )
+    # F0=(v,p0,p1), F1=(v,p1,p2), F2=(v,p2,p3), F3=(v,p3,p0) -- each face lists v first, so v's
+    # corner within face i is flat index 3*i, and F3's own ``halfedge_prev`` edge is {p0, v}.
+    faces_np = np.array([0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1], dtype=np.int32)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    crease_wp = wp.array(np.array([[0, 1]], dtype=np.int32), device=device)
+
+    normals_wp = tw.triangles.corner_normals(
+        vertices_wp, faces_wp, crease_wp, weighting="area"
+    ).numpy()
+    # All four faces are wound the same way in the xy-plane, so every one of them has the flat
+    # +z normal -- and every corner at v must agree with it, since none of the four is excluded by
+    # the single crease.
+    corners_at_v = normals_wp[:, 0, :]
+    assert np.allclose(corners_at_v, np.array([0.0, 0.0, 1.0]), rtol=1e-5, atol=1e-5)
+
+
 def test_corner_normals_edge_cases(device: str, unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """Not a library comparison: an empty mesh, and the two argument errors."""
     empty_vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)

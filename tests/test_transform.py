@@ -87,10 +87,27 @@ def test_rotation_matrix_zero_axis_raises() -> None:
         tw.transform.rotation_matrix((0.0, 0.0, 0.0), 1.0)
 
 
+def test_rotation_matrix_nan_axis_raises() -> None:
+    """
+    Not a parity assert: a NaN-valued axis must not silently pass the zero-length guard.
+
+    Every comparison against NaN is False, so a guard spelled ``norm == 0.0`` lets a NaN axis
+    through and fills the whole matrix with NaN instead of raising.
+    """
+    with pytest.raises(ValueError, match="finite, non-zero axis"):
+        tw.transform.rotation_matrix((float("nan"), 0.0, 0.0), 0.5)
+
+
 def test_reflection_matrix_zero_normal_raises() -> None:
     """Not a parity assert: the guard on a degenerate plane normal."""
     with pytest.raises(ValueError, match="non-zero normal"):
         tw.transform.reflection_matrix((0.0, 0.0, 0.0))
+
+
+def test_reflection_matrix_nan_normal_raises() -> None:
+    """Not a parity assert: see ``test_rotation_matrix_nan_axis_raises``, same guard shape."""
+    with pytest.raises(ValueError, match="finite, non-zero normal"):
+        tw.transform.reflection_matrix((float("nan"), 0.0, 0.0))
 
 
 def test_scale_matrix_bad_length_raises() -> None:
@@ -144,6 +161,52 @@ def test_transform_points_accepts_a_device_matrix(device: str) -> None:
         points_wp, wp.array([_ROTATION], dtype=wp.mat44, device=device)
     )
     assert np.allclose(on_device.numpy(), scalar.numpy(), rtol=1e-5, atol=1e-5)
+
+
+def test_transform_points_mismatched_out_length_raises(device: str) -> None:
+    """
+    Not a parity assert: an undersized ``out`` must raise, not silently overrun it.
+
+    ``transform_points``'s device-array-matrix path launches straight into ``out`` with no shape
+    check of its own (unlike the scalar-matrix ``wp.map`` path, which validates internally) --
+    this is the guard that closes that gap for both paths alike.
+    """
+    points_wp = points_to_warp(np.random.default_rng(3).normal(size=(5, 3)), device)
+    with pytest.raises(ValueError, match="out must have length"):
+        tw.transform.transform_points(
+            points_wp, _ROTATION, out=wp.empty(2, dtype=wp.vec3, device=device)
+        )
+    with pytest.raises(ValueError, match="out must have length"):
+        tw.transform.transform_points(
+            points_wp,
+            wp.array([_ROTATION], dtype=wp.mat44, device=device),
+            out=wp.empty(2, dtype=wp.vec3, device=device),
+        )
+
+
+def test_transform_points_mismatched_matrix_array_length_raises(device: str) -> None:
+    """Not a parity assert: the ``(1,)`` device-array contract, checked rather than assumed."""
+    points_wp = points_to_warp(np.random.default_rng(4).normal(size=(5, 3)), device)
+    with pytest.raises(ValueError, match="length-1"):
+        tw.transform.transform_points(
+            points_wp, wp.array([_ROTATION, _ROTATION], dtype=wp.mat44, device=device)
+        )
+
+
+def test_as_mat44_mismatched_length_raises(device: str) -> None:
+    """Not a parity assert: the ``(1,)`` device-array contract, at ``as_mat44`` itself."""
+    with pytest.raises(ValueError, match="length-1"):
+        tw.transform.as_mat44(wp.array([_ROTATION, _ROTATION], dtype=wp.mat44, device=device))
+    with pytest.raises(ValueError, match="length-1"):
+        tw.transform.as_mat44(wp.empty(0, dtype=wp.mat44, device=device))
+
+
+def test_matrix_to_numpy_round_trips_a_scalar_and_a_device_matrix(device: str) -> None:
+    """Not a parity assert: the host readback both forms resolve through, pinned directly."""
+    expected = np.array(_ROTATION, dtype=np.float64).reshape(4, 4)
+    assert np.array_equal(tw.transform.matrix_to_numpy(_ROTATION), expected)
+    on_device = wp.array([_ROTATION], dtype=wp.mat44, device=device)
+    assert np.array_equal(tw.transform.matrix_to_numpy(on_device), expected)
 
 
 def test_transform_vectors_ignores_translation(device: str) -> None:
@@ -208,6 +271,46 @@ def test_transform_normals_singular_matrix_raises(device: str) -> None:
     normals_wp = points_to_warp(np.eye(3), device)
     with pytest.raises(ValueError, match="invertible"):
         tw.transform.transform_normals(normals_wp, tw.transform.scale_matrix((1.0, 1.0, 0.0)))
+
+
+def test_transform_normals_singular_matrix_raises_on_empty_input(device: str) -> None:
+    """
+    Not a parity assert: the singularity check is a property of ``matrix``, not of ``normals``.
+
+    An empty ``normals`` array used to make the early return skip ``normal_matrix`` entirely, so
+    the same singular matrix that raises above was silently accepted whenever there was nothing to
+    transform.
+    """
+    normals_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="invertible"):
+        tw.transform.transform_normals(normals_wp, tw.transform.scale_matrix((1.0, 1.0, 0.0)))
+
+
+def test_transform_vectors_and_normals_accept_a_device_matrix(device: str) -> None:
+    """
+    Triwarp against triwarp: the ``(1,)`` device-array matrix form agrees with the scalar one.
+
+    ``as_mat44``'s docstring has always claimed every entry point accepts the array form;
+    ``transform_vectors``/``transform_normals`` were typed as a scalar ``wp.mat44`` only until this
+    pinned the claim true for them too.
+    """
+    vectors_wp = points_to_warp(np.random.default_rng(5).normal(size=(32, 3)), device)
+    on_device_matrix = wp.array([_ROTATION], dtype=wp.mat44, device=device)
+    assert np.allclose(
+        tw.transform.transform_vectors(vectors_wp, on_device_matrix).numpy(),
+        tw.transform.transform_vectors(vectors_wp, _ROTATION).numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    normals_np = vectors_wp.numpy()
+    normals_np /= np.linalg.norm(normals_np, axis=1, keepdims=True)
+    normals_wp = points_to_warp(normals_np, device)
+    assert np.allclose(
+        tw.transform.transform_normals(normals_wp, on_device_matrix).numpy(),
+        tw.transform.transform_normals(normals_wp, _ROTATION).numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 @pytest.mark.parity("transform_mesh", "trimesh")
@@ -303,6 +406,20 @@ def test_transform_mesh_keeps_volume_positive(icosphere: tuple[tm.Trimesh, wp.Me
     assert tw.measures.volume(vertices_wp, faces_wp) == pytest.approx(before, rel=1e-5)
 
 
+def test_transform_mesh_mismatched_out_faces_length_raises(
+    icosphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """Not a parity assert: an undersized ``out_faces`` must raise, not silently overrun it."""
+    _mesh_tm, mesh_wp = icosphere
+    with pytest.raises(ValueError, match="out_faces must have length"):
+        tw.transform.transform_mesh(
+            mesh_wp.points,
+            mesh_wp.indices,
+            _ROTATION,
+            out_faces=wp.empty(3, dtype=wp.int32, device=mesh_wp.device),
+        )
+
+
 # ---------------------------------------------------------------------------
 # classification
 # ---------------------------------------------------------------------------
@@ -349,6 +466,23 @@ def test_classify_transform_survives_composed_float32_rotations() -> None:
         tw.transform.classify_transform(wp.mat44(*composed.flatten().tolist()))
         == TransformKind.RIGID
     )
+
+
+def test_classify_transform_anisotropic_scale_is_affine_not_singular() -> None:
+    """
+    Not a library comparison: the singularity test must be scale-invariant under anisotropy too.
+
+    A determinant-vs-trace-derived-scale singularity test flags a sufficiently anisotropic (but
+    perfectly invertible) scale as `SINGULAR`, because a non-uniform scale's determinant is always
+    below its isotropic-scale expectation by an amount that grows with the aspect ratio (AM-GM).
+    ``diag(1000, 1, 1)`` is exactly the module's own `AFFINE` example and has determinant 1000 --
+    not remotely singular -- but was misclassified `SINGULAR` before the singular-value-ratio test
+    replaced the determinant-vs-scale one.
+    """
+    anisotropic = tw.transform.scale_matrix((1000.0, 1.0, 1.0))
+    assert tw.transform.classify_transform(anisotropic) == TransformKind.AFFINE
+    # And the normal map, which used the same flawed test independently, must not raise either.
+    tw.transform.normal_matrix(anisotropic)
 
 
 def test_classify_transform_projective_matrix_is_singular() -> None:

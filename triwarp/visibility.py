@@ -227,11 +227,16 @@ def _occlusion_bundle(
 
     device = points.device
     m = int(points.shape[0])
-    out_occlusion = wp.zeros(m, dtype=wp.float32, device=device)
+    # Resolved before the empty-input early return: a mismatched ``normals`` length is a caller
+    # bug independent of how many points there are, and `_resolve_normals_and_radius` handles
+    # `m == 0` on its own (an empty `points` measures the mesh's own box alone).
+    normals, diagonal = _resolve_normals_and_radius(mesh, points, normals, name)
+    # `wp.empty`, not `wp.zeros`: `obscurance` writes `out_occlusion[i]` unconditionally for every
+    # block, so nothing ever reads the zero-fill.
+    out_occlusion = wp.empty(m, dtype=wp.float32, device=device)
     if m == 0:
         return out_occlusion
 
-    normals, diagonal = _resolve_normals_and_radius(mesh, points, normals, name)
     directions = tw.sample.sample_fibonacci_hemisphere(n_rays, device=device)
     # One block per point, lanes over the bundle -- see ``kernel_visibility.BUNDLE_BLOCK`` for why
     # this wins over a thread per point, and why the width is 64.
@@ -350,10 +355,12 @@ def shape_diameter(
 
     device = points.device
     m = int(points.shape[0])
+    # See `_occlusion_bundle`'s identical comment: resolved before the empty-input check so a
+    # mismatched `normals` length is caught even when there is nothing to measure.
+    normals, diagonal = _resolve_normals_and_radius(mesh, points, normals, "shape_diameter")
     if m == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
 
-    normals, diagonal = _resolve_normals_and_radius(mesh, points, normals, "shape_diameter")
     directions = tw.sample.sample_fibonacci_cone(n_rays, cone_angle, device=device)
     # Distances are kept so the trimming pass can revisit them against a mean the first pass had not
     # finished computing; re-tracing instead would double the only expensive part of the kernel.
@@ -479,9 +486,12 @@ def max_tangent_sphere(
         grows outward.
     normals
         ``(m,)`` unit surface normals at ``points``. If ``None``, computed from
-        the closest triangle.
+        the closest triangle. A caller-supplied array is normalized defensively (the default
+        never needs it), since a non-unit normal would silently scale the reported radius.
     threshold
-        Convergence threshold as a fraction of the scene diagonal.
+        Convergence threshold as a fraction of the **mesh's own** bounding-box diagonal, not the
+        (possibly larger) box enclosing the query points too -- a query far outside the mesh
+        should not loosen how tightly the sphere converges.
     max_iter
         Maximum number of shrink iterations.
 
@@ -503,11 +513,24 @@ def max_tangent_sphere(
     require_same_device(mesh=mesh, points=points, normals=normals)
     device = points.device
     m = int(points.shape[0])
+    # Resolved (and, for a caller-supplied array, normalized) before the empty-input early return
+    # and before the AABB reductions below -- a mismatched or non-unit ``normals`` is a property of
+    # ``normals`` alone, and there is no reason to pay for two reductions first only to reject it.
+    normals = _resolve_normals(mesh, points, normals, "max_tangent_sphere")
     if m == 0:
         return (
             wp.empty(0, dtype=wp.vec3, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
         )
+    # Every ray-bundle measure in this module normalizes defensively per-thread (see
+    # `hemisphere_frame`); this path shrinks a sphere along `normals` directly with no such guard,
+    # so a caller-supplied non-unit normal silently scales `sphere_center`'s radius away from what
+    # `step_sphere_shrink`'s own convergence test expects. One `wp.map` fixes it for the whole
+    # iterative loop; `normals_at_closest_faces`'s own output is already unit, so this is a no-op
+    # there, but cheap enough not to special-case.
+    unit_normals = wp.empty(m, dtype=wp.vec3, device=device)
+    wp.map(wp.normalize, normals, out=unit_normals)
+    normals = unit_normals
 
     # One reduction of ``mesh.points``, not two: ``max_t`` needs the box enclosing the mesh *and*
     # the queries, while the convergence threshold is a fraction of the mesh's own diagonal. Taking
@@ -519,13 +542,6 @@ def max_tangent_sphere(
     )
     max_t = float(wp.length(union_upper - union_lower))
     mesh_diagonal = float(wp.length(mesh_upper - mesh_lower))
-
-    if normals is None:
-        normals = normals_at_closest_faces(mesh, points)
-    elif int(normals.shape[0]) != m:
-        raise ValueError(
-            f"normals must have one entry per point, got {normals.shape[0]} for {m} points"
-        )
 
     ray_dirs = normals
     if inwards:
@@ -631,6 +647,32 @@ def max_tangent_sphere(
     return centers, radii
 
 
+def _resolve_normals(
+    mesh: wp.Mesh, points: wp.array[wp.vec3], normals: wp.array[wp.vec3] | None, name: str
+) -> wp.array[wp.vec3]:
+    """
+    Per-point normals: ``normals`` itself when given (length-checked), else the closest face's.
+
+    Split out of [`_resolve_normals_and_radius`][triwarp.visibility._resolve_normals_and_radius]
+    so [`max_tangent_sphere`][triwarp.visibility.max_tangent_sphere] can share the validation and
+    defaulting without also paying for the union-box diagonal it does not use -- it derives its own
+    diagonal from a reduction it performs anyway (see its own docstring note on why).
+
+    Raises
+    ------
+    ValueError
+        If ``normals`` has a different length from ``points``.
+    """
+    m = int(points.shape[0])
+    if normals is None:
+        return normals_at_closest_faces(mesh, points)
+    if int(normals.shape[0]) != m:
+        raise ValueError(
+            f"{name}: normals must have one entry per point, got {normals.shape[0]} for {m} points"
+        )
+    return normals
+
+
 def _resolve_normals_and_radius(
     mesh: wp.Mesh, points: wp.array[wp.vec3], normals: wp.array[wp.vec3] | None, name: str
 ) -> tuple[wp.array[wp.vec3], float]:
@@ -662,11 +704,4 @@ def _resolve_normals_and_radius(
     ValueError
         If ``normals`` has a different length from ``points``.
     """
-    m = int(points.shape[0])
-    if normals is None:
-        normals = normals_at_closest_faces(mesh, points)
-    elif int(normals.shape[0]) != m:
-        raise ValueError(
-            f"{name}: normals must have one entry per point, got {normals.shape[0]} for {m} points"
-        )
-    return normals, enclosing_diagonal(mesh.points, points)
+    return _resolve_normals(mesh, points, normals, name), enclosing_diagonal(mesh.points, points)

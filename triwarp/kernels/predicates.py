@@ -69,6 +69,24 @@ def triangle_normal(a: Any, b: Any, c: Any):
 
 
 @wp.func
+def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
+    # An arbitrary orthonormal in-plane basis for the plane perpendicular to ``normal``. Kernel-
+    # scope mirror of ``triwarp.points.plane_basis``, for callers that hold the normal in device
+    # memory and must not read it back to build the frame -- a general geometric helper with no
+    # point-cloud dependency, which is why it lives here rather than in ``kernels/points.py``: it
+    # is reached from two unrelated kernel modules (``kernels/smoothing.py``,
+    # ``kernels/polyline.py``), the same "reached from a second module" trigger CLAUDE.md section
+    # 3.1 already applied to ``triangle_aabb``/``triangle_double_area``/``circumcircle_diameter``.
+    unit_normal = wp.normalize(normal)
+    axis = wp.vec3(1.0, 0.0, 0.0)
+    if wp.abs(unit_normal[0]) > 0.9:
+        axis = wp.vec3(0.0, 1.0, 0.0)
+    u = wp.normalize(wp.cross(axis, unit_normal))
+    v = wp.cross(unit_normal, u)
+    return u, v
+
+
+@wp.func
 def triangle_double_area(a: Any, b: Any, c: Any) -> wp.Float:
     # Twice the area of triangle ABC: the norm of the edge cross product.
     # Kept undivided because most callers either compare it against zero or fold the half into a

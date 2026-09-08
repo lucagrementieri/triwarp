@@ -133,6 +133,9 @@ def transform_points(
 
     Raises
     ------
+    ValueError
+        If ``out`` is given and its length differs from ``points``, or ``matrix`` is a device
+        array without exactly one entry.
     RuntimeError
         If ``points``, ``matrix`` and ``out`` are not all on one device.
 
@@ -147,12 +150,23 @@ def transform_points(
     [`transform_mesh`][triwarp.transform.transform_mesh]
     """
     require_same_device(points=points, matrix=matrix, out=out)
-    result = (
-        wp.empty(int(points.shape[0]), dtype=wp.vec3, device=points.device) if out is None else out
-    )
+    result = _alloc_or_out(out, int(points.shape[0]), wp.vec3, points.device)
     if int(points.shape[0]) == 0:
         return result
+    if int(result.shape[0]) != int(points.shape[0]):
+        raise ValueError(
+            f"transform_points: out must have length {points.shape[0]}, got {result.shape[0]}"
+        )
     if isinstance(matrix, wp.array):
+        # The one path that never crosses to host: the kernel reads the device pointer directly,
+        # so a fitted (e.g. icp) transform never has to leave the device. `apply_transform_mat44`
+        # reads `matrix[0]` unconditionally, which is why the (1,) shape is checked above rather
+        # than left to a silent partial read.
+        if int(matrix.shape[0]) != 1:
+            raise ValueError(
+                "transform_points: matrix must be a length-1 wp.array[wp.mat44], got shape "
+                f"{tuple(matrix.shape)}"
+            )
         wp.launch(
             kernel_transform.apply_transform_mat44,
             dim=int(points.shape[0]),
@@ -165,7 +179,10 @@ def transform_points(
 
 
 def transform_vectors(
-    vectors: wp.array[wp.vec3], matrix: wp.mat44, *, out: wp.array[wp.vec3] | None = None
+    vectors: wp.array[wp.vec3],
+    matrix: wp.mat44 | wp.array[wp.mat44],
+    *,
+    out: wp.array[wp.vec3] | None = None,
 ) -> wp.array[wp.vec3]:
     """
     Apply the linear block of an affine transform to a buffer of directions, ignoring translation.
@@ -179,7 +196,10 @@ def transform_vectors(
     vectors
         ``(n,)`` directions.
     matrix
-        ``4x4`` transform; its translation column is ignored.
+        ``4x4`` transform; its translation column is ignored. Scalar ``wp.mat44`` or a ``(1,)``
+        ``wp.array[wp.mat44]`` -- unlike [`transform_points`][triwarp.transform.transform_points]
+        there is no on-device kernel for this map, so the array form still costs one host readback
+        (see [`as_mat44`][triwarp.transform.as_mat44]).
     out
         Destination, allocated when ``None``. Pass ``out=vectors`` to transform in place.
 
@@ -190,28 +210,29 @@ def transform_vectors(
 
     Raises
     ------
+    ValueError
+        If ``matrix`` is a device array without exactly one entry.
     RuntimeError
-        If ``vectors`` and ``out`` are not all on one device.
+        If ``vectors``, ``matrix`` and ``out`` are not all on one device.
 
     See Also
     --------
     [`transform_points`][triwarp.transform.transform_points]
     [`transform_normals`][triwarp.transform.transform_normals]
     """
-    require_same_device(vectors=vectors, out=out)
-    result = (
-        wp.empty(int(vectors.shape[0]), dtype=wp.vec3, device=vectors.device)
-        if out is None
-        else out
-    )
+    require_same_device(vectors=vectors, matrix=matrix, out=out)
+    result = _alloc_or_out(out, int(vectors.shape[0]), wp.vec3, vectors.device)
     if int(vectors.shape[0]) == 0:
         return result
-    wp.map(kernel_transform.transform_vector_mat44, vectors, matrix, out=result)
+    wp.map(kernel_transform.transform_vector_mat44, vectors, as_mat44(matrix), out=result)
     return result
 
 
 def transform_normals(
-    normals: wp.array[wp.vec3], matrix: wp.mat44, *, out: wp.array[wp.vec3] | None = None
+    normals: wp.array[wp.vec3],
+    matrix: wp.mat44 | wp.array[wp.mat44],
+    *,
+    out: wp.array[wp.vec3] | None = None,
 ) -> wp.array[wp.vec3]:
     """
     Map unit normals through an affine transform by its inverse transpose, and renormalize.
@@ -226,7 +247,9 @@ def transform_normals(
     normals
         ``(n,)`` normals, unit or zero.
     matrix
-        ``4x4`` transform. Its linear block must be invertible.
+        ``4x4`` transform, scalar or ``(1,)`` device array. Its linear block must be invertible;
+        the host-side inverse this needs (see [`normal_matrix`][triwarp.transform.normal_matrix])
+        is computed once and reused, regardless of ``normals``' length.
     out
         Destination, allocated when ``None``. Pass ``out=normals`` to transform in place.
 
@@ -239,9 +262,10 @@ def transform_normals(
     Raises
     ------
     ValueError
-        If the linear block of ``matrix`` is singular, so no normal map exists.
+        If the linear block of ``matrix`` is singular, so no normal map exists -- checked even
+        when ``normals`` is empty, since the matrix itself is what's invalid.
     RuntimeError
-        If ``normals`` and ``out`` are not all on one device.
+        If ``normals``, ``matrix`` and ``out`` are not all on one device.
 
     Notes
     -----
@@ -254,15 +278,15 @@ def transform_normals(
     [`normal_matrix`][triwarp.transform.normal_matrix]
     [`transform_vectors`][triwarp.transform.transform_vectors]
     """
-    require_same_device(normals=normals, out=out)
-    result = (
-        wp.empty(int(normals.shape[0]), dtype=wp.vec3, device=normals.device)
-        if out is None
-        else out
-    )
+    require_same_device(normals=normals, matrix=matrix, out=out)
+    # Computed before the empty-input early return: the matrix's own invertibility is a property
+    # of `matrix` alone, not of how many normals there are, so a zero-length `normals` must not
+    # silently skip it (it used to, via `normal_matrix`'s only call site sitting below the guard).
+    linear_normal_matrix = normal_matrix(matrix)
+    result = _alloc_or_out(out, int(normals.shape[0]), wp.vec3, normals.device)
     if int(normals.shape[0]) == 0:
         return result
-    wp.map(kernel_transform.transform_normal_mat33, normals, normal_matrix(matrix), out=result)
+    wp.map(kernel_transform.transform_normal_mat33, normals, linear_normal_matrix, out=result)
     return result
 
 
@@ -302,6 +326,9 @@ def transform_mesh(
 
     Raises
     ------
+    ValueError
+        If ``out_vertices`` or ``out_faces`` is given and its length differs from ``vertices`` or
+        ``faces``, or ``matrix`` is a device array without exactly one entry.
     RuntimeError
         If ``vertices``, ``faces``, ``matrix``, ``out_vertices`` and ``out_faces`` are not all on
         one device.
@@ -320,11 +347,11 @@ def transform_mesh(
         out_faces=out_faces,
     )
     new_vertices = transform_points(vertices, matrix, out=out_vertices)
-    new_faces = (
-        wp.empty(int(faces.shape[0]), dtype=wp.int32, device=faces.device)
-        if out_faces is None
-        else out_faces
-    )
+    new_faces = _alloc_or_out(out_faces, int(faces.shape[0]), wp.int32, faces.device)
+    if int(new_faces.shape[0]) != int(faces.shape[0]):
+        raise ValueError(
+            f"transform_mesh: out_faces must have length {faces.shape[0]}, got {new_faces.shape[0]}"
+        )
     n_faces = int(faces.shape[0]) // 3
     if reverses_orientation(matrix):
         if n_faces > 0:
@@ -392,7 +419,7 @@ def rotation_matrix(
     Raises
     ------
     ValueError
-        If ``axis`` has zero length, so no rotation is defined.
+        If ``axis`` is zero-length or not finite, so no rotation is defined.
 
     See Also
     --------
@@ -401,20 +428,21 @@ def rotation_matrix(
     """
     direction = _vec3_host(axis, "axis")
     norm = float(np.linalg.norm(direction))
-    if norm == 0.0:
-        raise ValueError("rotation_matrix requires a non-zero axis")
+    # `not np.isfinite(norm)` rather than only `norm == 0.0`: a NaN- or Inf-valued axis (e.g. one
+    # built from a degenerate cross product upstream) gives a non-finite `norm`, and every
+    # comparison against NaN is False, so `== 0.0` alone would let it through and silently fill the
+    # whole matrix with NaN.
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise ValueError("rotation_matrix requires a finite, non-zero axis")
     direction = direction / norm
     # Rodrigues' rotation formula. Built on the host in float64 and rounded once on the way into
     # the float32 ``wp.mat44``, so composing a handful of these stays inside
     # ``ORTHOGONALITY_RTOL``.
     cos_a, sin_a = math.cos(angle), math.sin(angle)
-    cross = np.array(
-        [
-            [0.0, -direction[2], direction[1]],
-            [direction[2], 0.0, -direction[0]],
-            [-direction[1], direction[0], 0.0],
-        ]
-    )
+    # `np.cross(np.eye(3), direction)`'s row i is `e_i x direction`, which expands to exactly the
+    # skew-symmetric cross-product matrix Rodrigues' formula needs -- no need to spell out the six
+    # signed entries by hand.
+    cross = np.cross(np.eye(3), direction)
     rotation = cos_a * np.eye(3) + sin_a * cross + (1.0 - cos_a) * np.outer(direction, direction)
     return _compose_about(rotation, center)
 
@@ -483,7 +511,7 @@ def reflection_matrix(
     Raises
     ------
     ValueError
-        If ``normal`` has zero length, so no plane is defined.
+        If ``normal`` is zero-length or not finite, so no plane is defined.
 
     See Also
     --------
@@ -492,20 +520,21 @@ def reflection_matrix(
     """
     direction = _vec3_host(normal, "normal")
     norm = float(np.linalg.norm(direction))
-    if norm == 0.0:
-        raise ValueError("reflection_matrix requires a non-zero normal")
+    # See rotation_matrix's identical guard for why this is `not np.isfinite` and not `== 0.0`.
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise ValueError("reflection_matrix requires a finite, non-zero normal")
     direction = direction / norm
     return _compose_about(np.eye(3) - 2.0 * np.outer(direction, direction), center)
 
 
-def normal_matrix(matrix: wp.mat44) -> wp.mat33:
+def normal_matrix(matrix: wp.mat44 | wp.array[wp.mat44]) -> wp.mat33:
     """
     Inverse transpose of a transform's linear block: the map that carries normals.
 
     Parameters
     ----------
     matrix
-        ``4x4`` transform with an invertible linear block.
+        ``4x4`` transform with an invertible linear block, scalar or ``(1,)`` device array.
 
     Returns
     -------
@@ -516,14 +545,19 @@ def normal_matrix(matrix: wp.mat44) -> wp.mat33:
     Raises
     ------
     ValueError
-        If the linear block is singular.
+        If the linear block is singular to within
+        [`ORTHOGONALITY_RTOL`][triwarp.transform.ORTHOGONALITY_RTOL] -- the same tolerance-based
+        test [`classify_transform`][triwarp.transform.classify_transform] uses, not an exact
+        ``det == 0`` check, so a near-singular block (e.g. one axis scaled by ``1e-40``) raises
+        here instead of silently inverting into an overflowing ``wp.mat33``.
 
     See Also
     --------
     [`transform_normals`][triwarp.transform.transform_normals]
+    [`classify_transform`][triwarp.transform.classify_transform]
     """
-    linear = _to_numpy(matrix)[:3, :3]
-    if abs(float(np.linalg.det(linear))) == 0.0:
+    linear = matrix_to_numpy(matrix)[:3, :3]
+    if _is_singular(linear, ORTHOGONALITY_RTOL):
         raise ValueError("normal_matrix requires an invertible linear block, got a singular one")
     return wp.mat33(*np.linalg.inv(linear).T.flatten())
 
@@ -558,8 +592,13 @@ def classify_transform(
 
     Notes
     -----
-    A singular linear block is `TransformKind.AFFINE`: its Gram matrix is singular too, so it
-    fails the similarity test before the determinant sign is consulted.
+    Singularity is decided from the linear block's singular values, not from its determinant: a
+    block is rank-deficient to within ``rtol`` when its smallest singular value is at most an
+    ``rtol`` fraction of its largest -- the reciprocal condition number, which stays correct
+    however anisotropic the block is. A determinant-vs-scale test would not: a non-uniform scale
+    can have an arbitrarily small determinant relative to its trace while remaining perfectly
+    invertible (``diag(1000, 1, 1)`` is `TransformKind.AFFINE`, not singular, despite a determinant
+    500x below its isotropic-scale expectation).
 
     Orientation is **not** part of the answer except at `TransformKind.REFLECTION`, which is the
     unit-scale mirror. A mirroring scale is `TransformKind.SIMILARITY`, so a caller that needs to
@@ -577,7 +616,7 @@ def classify_transform(
     [`TransformKind`][triwarp.transform.TransformKind]
     [`Trimesh.transform`][triwarp.mesh.Trimesh.transform]
     """
-    host = _to_numpy(matrix)
+    host = matrix_to_numpy(matrix)
     linear, offset = host[:3, :3], host[:3, 3]
     # The bottom row has to be [0, 0, 0, 1] for the map to be affine at all. A projective matrix
     # is not merely "some other affine map": ``wp.transform_point`` applies it without the
@@ -586,11 +625,9 @@ def classify_transform(
         return TransformKind.SINGULAR
 
     gram = linear @ linear.T
-    scale_sq = float(np.trace(gram)) / 3.0
+    scale_sq = _scale_sq_from_gram(gram)
     determinant = float(np.linalg.det(linear))
-    # Rank-deficient to working precision. Compared against ``scale ** 3`` rather than against
-    # zero so the test is scale-free: ``det`` of a millimetre-scale rotation is not small.
-    if scale_sq <= 0.0 or abs(determinant) <= rtol * scale_sq**1.5:
+    if _is_singular(linear, rtol):
         return TransformKind.SINGULAR
     if not np.allclose(gram, scale_sq * np.eye(3), rtol=rtol, atol=rtol * scale_sq):
         return TransformKind.AFFINE
@@ -632,17 +669,20 @@ def transform_scale(matrix: wp.mat44 | wp.array[wp.mat44]) -> float:
     --------
     [`classify_transform`][triwarp.transform.classify_transform]
     """
-    linear = _to_numpy(matrix)[:3, :3]
-    return float(math.sqrt(float(np.trace(linear @ linear.T)) / 3.0))
+    linear = matrix_to_numpy(matrix)[:3, :3]
+    return float(math.sqrt(_scale_sq_from_gram(linear @ linear.T)))
 
 
 def as_mat44(matrix: wp.mat44 | wp.array[wp.mat44]) -> wp.mat44:
     """
     Read a transform parameter as a scalar ``wp.mat44``, whichever form it arrives in.
 
-    Every entry point here accepts a ``(1,)`` device array so a fitted transform can be applied
-    without leaving the device, but the host-side decisions -- the orientation flip, the
-    classification, the normal map -- need the value itself. This is the one place it crosses.
+    Every entry point here accepts a ``(1,)`` device array. For
+    [`transform_points`][triwarp.transform.transform_points] and
+    [`transform_mesh`][triwarp.transform.transform_mesh] the array's pointer reaches the kernel
+    directly, so a fitted transform never leaves the device; every other entry point -- the
+    orientation flip, the classification, the normal map, `transform_vectors` -- needs the value on
+    the host regardless of which form it arrives in, and this is the one place it crosses.
 
     Parameters
     ----------
@@ -654,16 +694,62 @@ def as_mat44(matrix: wp.mat44 | wp.array[wp.mat44]) -> wp.mat44:
     wp.mat44
         The matrix as a host value, returned unchanged when it already is one.
 
+    Raises
+    ------
+    ValueError
+        If ``matrix`` is a device array without exactly one entry.
+
     Notes
     -----
     A device array costs one host readback. Every caller here is making a host branch over a whole
-    launch, so the matrix has to cross either way.
+    launch, so the matrix has to cross either way. Calling this more than once on the same
+    unchanged ``matrix`` within one operation (e.g. once for classification, once for the normal
+    map) pays the readback again each time -- resolve it to a host value once and pass that value
+    down instead, the way [`Trimesh.transform`][triwarp.mesh.Trimesh.transform] does.
 
     See Also
     --------
     [`classify_transform`][triwarp.transform.classify_transform]
     """
-    return matrix.list()[0] if isinstance(matrix, wp.array) else matrix
+    if not isinstance(matrix, wp.array):
+        return matrix
+    if int(matrix.shape[0]) != 1:
+        raise ValueError(
+            f"as_mat44 requires a length-1 wp.array[wp.mat44], got shape {tuple(matrix.shape)}"
+        )
+    return matrix.list()[0]
+
+
+def matrix_to_numpy(matrix: wp.mat44 | wp.array[wp.mat44]) -> np.ndarray:
+    """
+    Read a transform parameter back as a host ``(4, 4)`` ``float64`` array.
+
+    For host matrix arithmetic that has no ``wp.mat44`` equivalent -- composing with a NumPy
+    matrix built elsewhere, or reading a row/column out directly. Every decision this module makes
+    on a transform ([`classify_transform`][triwarp.transform.classify_transform],
+    [`reverses_orientation`][triwarp.transform.reverses_orientation],
+    [`normal_matrix`][triwarp.transform.normal_matrix]) goes through this.
+
+    Parameters
+    ----------
+    matrix
+        ``4x4`` transform, scalar or ``(1,)`` device array.
+
+    Returns
+    -------
+    np.ndarray
+        ``(4, 4)`` ``float64`` copy.
+
+    Raises
+    ------
+    ValueError
+        If ``matrix`` is a device array without exactly one entry.
+
+    See Also
+    --------
+    [`as_mat44`][triwarp.transform.as_mat44]
+    """
+    return np.array(as_mat44(matrix), dtype=np.float64).reshape(4, 4)
 
 
 def reverses_orientation(matrix: wp.mat44 | wp.array[wp.mat44]) -> bool:
@@ -692,7 +778,7 @@ def reverses_orientation(matrix: wp.mat44 | wp.array[wp.mat44]) -> bool:
     [`transform_mesh`][triwarp.transform.transform_mesh]
     [`classify_transform`][triwarp.transform.classify_transform]
     """
-    return float(np.linalg.det(_to_numpy(matrix)[:3, :3])) < 0.0
+    return float(np.linalg.det(matrix_to_numpy(matrix)[:3, :3])) < 0.0
 
 
 # --- private helpers -------------------------------------------------------
@@ -722,14 +808,48 @@ def _vec3_host(value: wp.vec3 | Sequence[float], name: str) -> np.ndarray:
     return array
 
 
-def _to_numpy(matrix: wp.mat44 | wp.array[wp.mat44]) -> np.ndarray:
+def _scale_sq_from_gram(gram: np.ndarray) -> float:
     """
-    Host ``(4, 4)`` ``float64`` view of a transform parameter.
+    Mean squared singular value of a linear block, given its Gram matrix ``linear @ linear.T``.
 
-    The single place a transform crosses device to host. Every decision made on it -- the
-    orientation flip, the classification, the normal map -- is a host branch over a whole launch,
-    so the matrix has to cross either way and a scalar ``wp.mat44`` costs nothing. ``list()[0]``
-    is the preferred spelling for a ``wp.array[wp.mat44]``, and is cheaper than reading the buffer
-    through ``.numpy()``.
+    The squared uniform scale for an isotropic block. Shared by
+    [`classify_transform`][triwarp.transform.classify_transform] (which already has ``gram`` in
+    hand) and [`transform_scale`][triwarp.transform.transform_scale] (which builds it fresh) so the
+    two can't silently define "scale" two different ways.
     """
-    return np.array(as_mat44(matrix), dtype=np.float64).reshape(4, 4)
+    return float(np.trace(gram)) / 3.0
+
+
+def _is_singular(linear: np.ndarray, rtol: float) -> bool:
+    """
+    Whether a ``3x3`` linear block is rank-deficient to within ``rtol``, regardless of anisotropy.
+
+    Compares the smallest singular value against the largest -- the reciprocal condition number --
+    rather than the determinant against a trace-derived scale. A non-uniform (anisotropic) scale
+    can have an arbitrarily small determinant relative to its trace while remaining perfectly
+    invertible, so a determinant-vs-scale test flags it as singular once its axes differ enough
+    (``diag(1000, 1, 1)`` at the module's default tolerance); the singular-value ratio stays
+    correct at any anisotropy, and degenerates to the old test's intent for an isotropic block.
+    Shared by [`classify_transform`][triwarp.transform.classify_transform] and
+    [`normal_matrix`][triwarp.transform.normal_matrix], which tested this with an exact ``det == 0``
+    before and so missed every near-singular (rather than exactly singular) block.
+    """
+    singular_values = np.linalg.svd(linear, compute_uv=False)
+    sigma_max = float(singular_values[0])
+    if sigma_max <= 0.0:
+        return True
+    return float(singular_values[-1]) <= rtol * sigma_max
+
+
+def _alloc_or_out(out: wp.array | None, n: int, dtype: type, device: wp.DeviceLike) -> wp.array:
+    """
+    Allocate a fresh ``(n,)`` buffer of ``dtype`` when ``out`` is ``None``, else reuse ``out``.
+
+    Every buffer-op in this module (`transform_points`, `transform_vectors`, `transform_normals`,
+    `transform_mesh`) repeats this exact "allocate-or-reuse, then let the caller check for the
+    empty case" idiom; sharing it here keeps the four from silently drifting on the allocation
+    itself (e.g. a `device=` mistake) while each keeps its own empty-input and length checks, which
+    differ enough between them (a `ValueError` on some, none on others) that folding those in too
+    would obscure rather than simplify.
+    """
+    return wp.empty(n, dtype=dtype, device=device) if out is None else out

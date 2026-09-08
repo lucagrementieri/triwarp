@@ -1643,13 +1643,23 @@ class Trimesh:
         if kind == tw.transform.TransformKind.IDENTITY:
             return self
 
-        new_vertices, new_faces = tw.transform.transform_mesh(self._vertices, self._faces, matrix)
+        # Every use below -- `transform_mesh`'s own `reverses_orientation` check, the explicit one
+        # on the next line, up to four `transform_normals` calls in `_carry_directions`, up to two
+        # `as_mat44` calls in `_carry_box` -- is a host branch over a matrix that does not change
+        # between them. Resolving it once here (paying the one readback `classify_transform`/
+        # `reverses_orientation` already forces when `matrix` is a device array) and passing the
+        # resolved host value down turns what was up to 7-8 independent host syncs of the same 16
+        # floats into exactly one.
+        matrix_host = tw.transform.as_mat44(matrix)
+        new_vertices, new_faces = tw.transform.transform_mesh(
+            self._vertices, self._faces, matrix_host
+        )
         carry = _TRANSFORM_CARRY[kind]
-        if tw.transform.reverses_orientation(matrix):
+        if tw.transform.reverses_orientation(matrix_host):
             carry = carry - _ORIENTATION_DEPENDENT_KEYS
         survived = {key: value for key, value in self._cache.items() if key in carry}
-        self._carry_directions(kind, matrix, survived)
-        self._carry_box(kind, matrix, survived)
+        self._carry_directions(kind, matrix_host, survived)
+        self._carry_box(kind, matrix_host, survived)
         return Trimesh(new_vertices, new_faces, initial_cache=survived)
 
     def _carry_directions(

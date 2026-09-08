@@ -11,10 +11,10 @@ from triwarp.kernels.array import (
     map_probe_single,
     wrap_index,
 )
-from triwarp.kernels.points import plane_basis
 from triwarp.kernels.predicates import (
     closest_point_on_segment,
     orient2d,
+    plane_basis,
     point_to_segment_distance,
     project_out_normal,
     vector_angle,

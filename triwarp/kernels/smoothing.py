@@ -3,10 +3,10 @@ import warp as wp
 from triwarp.kernels.array import to_vec3d
 from triwarp.kernels.laplacian import cot_entries_from_l2
 from triwarp.kernels.linalg import free_row, selected_row, solve_normal_equations
-from triwarp.kernels.points import plane_basis
 from triwarp.kernels.predicates import (
     closest_point_on_segment,
     doublearea_from_lengths,
+    plane_basis,
     squared_edge_lengths,
 )
 from triwarp.kernels.scatter import add_corner_triple

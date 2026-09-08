@@ -761,7 +761,10 @@ def statistical_outlier_mask(
 
     device = neighbor_distance.device
     n = int(neighbor_distance.shape[0])
-    out_mask = wp.zeros(n, dtype=wp.bool, device=device)
+    # `wp.empty`, not `wp.zeros`: every branch below (the `n == 0` return aside) fills every slot
+    # of `out_mask` via a `wp.map` over the full `n`-length row, so nothing ever reads the
+    # zero-fill.
+    out_mask = wp.empty(n, dtype=wp.bool, device=device)
     if n == 0:
         return out_mask
 
@@ -772,7 +775,19 @@ def statistical_outlier_mask(
     wp.map(kernel_array.greater, count, wp.int32(0), out=counted_mask)
     counted = int(tw.reduce.sum(counted_mask))
     if counted < 2:
-        return out_mask  # no deviation to threshold against
+        # Too few counted rows for a cloud deviation, but the docstring's "empty or fully
+        # coincident neighbourhood is an outlier" needs no cloud statistic at all -- that half of
+        # `is_statistical_outlier`'s predicate (`count == 0 or mean_distance <= 0.0`) still applies
+        # per point. `threshold=inf` disables only the distance-based third of it, rather than
+        # returning an all-`False` mask that silently drops the other two.
+        wp.map(
+            kernel_points.is_statistical_outlier,
+            mean_distance,
+            count,
+            wp.float32(math.inf),
+            out=out_mask,
+        )
+        return out_mask
     cloud_mean = float(tw.reduce.sum(mean_distance)) / float(counted)
     deviations = wp.empty(n, dtype=wp.float32, device=device)
     wp.map(
@@ -1485,7 +1500,25 @@ def radial_sort(
     # points are projected to recover an angle. Done on the host since the axes
     # are a single O(1) setup shared by every point.
     if start is None:
-        axis0 = wp.vec3(normal[0], normal[2], -normal[1])
+        # Cross with whichever of x/y `normal` is *less* aligned with, so the cross product is
+        # never near-degenerate (the same construction as `kernels.tangent_space.any_perpendicular`
+        # -- but that one returns a specific unit chirality this needs to preserve exactly at
+        # `normal = +z`, so it's spelled out here rather than called).
+        #
+        # The formula this replaces, `wp.vec3(normal[0], normal[2], -normal[1])`, is a faithful
+        # port of ``trimesh.points.radial_sort``'s own axis0, and both share the same bug: for any
+        # `normal` with a nonzero x-component, `dot(normal, axis0) == normal.x**2 != 0`, so axis0 is
+        # not actually perpendicular to `normal` and carries a leftover component along it into
+        # every point's angle -- exactly zero only at `normal = (0, *, *)`, which is why the
+        # existing regression tests (fixed at `normal = (0, 0, 1)`) never caught it. This
+        # construction is perpendicular to `normal` for every `normal`, and reduces to the replaced
+        # formula's exact axis0/axis1 at `normal = (0, 0, 1)`: `abs(normal[0]) > abs(normal[1])` is
+        # then `0 > 0`, False, so `helper = (1, 0, 0)` and
+        # `cross((0, 0, 1), (1, 0, 0)) == (0, 1, 0)`, matching it bit for bit.
+        helper = wp.vec3(1.0, 0.0, 0.0)
+        if abs(normal[0]) > abs(normal[1]):
+            helper = wp.vec3(0.0, 1.0, 0.0)
+        axis0 = wp.cross(normal, helper)
         axis1 = wp.cross(normal, axis0)
     else:
         unit_normal = wp.normalize(normal)

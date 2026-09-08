@@ -5,11 +5,12 @@ from triwarp.kernels.array import (
     declare_map_signatures,
     map_probe,
     map_probe_single,
+    mat33_column,
     pack_farthest_key,
     pack_nearest_key,
     unpack_ranked_index,
 )
-from triwarp.kernels.predicates import point_plane_dot
+from triwarp.kernels.predicates import point_plane_dot, triangle_normal
 from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, outer_sum_chunk, tile_chunk
 
 
@@ -30,14 +31,6 @@ def is_in_half_space(point: wp.vec3, plane_normal: wp.vec3, plane_origin: wp.vec
     # ``point_plane_distance``: a non-unit normal cannot change the answer and the division cannot
     # change the sign, but it can turn a large dot into an infinity.
     return point_plane_dot(point, plane_normal, plane_origin) > 0.0
-
-
-@wp.func
-def radial_sort_key(point: wp.vec3, origin: wp.vec3, axis0: wp.vec3, axis1: wp.vec3) -> wp.float32:
-    v = point - origin
-    # Negated angle: an ascending radix sort of these keys reproduces trimesh's
-    # descending-angle order (`angles.argsort()[::-1]`).
-    return -wp.atan2(wp.dot(v, axis0), wp.dot(v, axis1))
 
 
 @wp.kernel
@@ -84,8 +77,10 @@ def centered_covariance(
 
     m = outer_sum_chunk(points, center[0], offset, remaining, lane, wp.block_dim())
 
-    # Block-collective, so all nine run outside the ``lane == 0`` guard.
-    total = wp.mat33(wp.float32(0.0))
+    # Block-collective, so all nine run outside the ``lane == 0`` guard. The default constructor,
+    # not an explicit zero-fill: every one of the nine entries is unconditionally overwritten by
+    # the loop below before ``total`` is ever read.
+    total = wp.mat33()
     for r in range(3):
         for c in range(3):
             total[r, c] = wp.tile_sum(wp.tile(m[r, c]))[0]
@@ -120,7 +115,7 @@ def finalize_fit_plane(
     # normal is the singular vector with the smallest singular value
     # (svd3 returns singular values in descending order: last column of u).
     out_centroid[0] = center[0]
-    out_normal[0] = wp.normalize(wp.vec3(u[0, 2], u[1, 2], u[2, 2]))
+    out_normal[0] = wp.normalize(mat33_column(u, 2))
 
 
 # Orientation modes for estimate_point_normals (mirror Open3D's orient methods).
@@ -141,8 +136,8 @@ def finalize_principal_axes(
     # principal axes from widest to narrowest. The rows of the result are those axes, which is the
     # convention that makes ``rotation * p`` the coordinates of ``p`` in the principal frame.
     u, sigma, _v = wp.svd3(m[0])
-    axis0 = wp.normalize(wp.vec3(u[0, 0], u[1, 0], u[2, 0]))
-    axis1 = wp.normalize(wp.vec3(u[0, 1], u[1, 1], u[2, 1]))
+    axis0 = wp.normalize(mat33_column(u, 0))
+    axis1 = wp.normalize(mat33_column(u, 1))
     # Take the third axis from the cross product rather than from ``u``: that forces a proper
     # rotation (determinant +1) whatever sign convention the SVD chose, so the frame is always
     # right-handed and only the first two signs are free.
@@ -195,7 +190,7 @@ def estimate_point_normals(
         return
 
     u, _sigma, _vt = wp.svd3(cov)
-    normal = wp.normalize(wp.vec3(u[0, 2], u[1, 2], u[2, 2]))
+    normal = wp.normalize(mat33_column(u, 2))
 
     # Orientation: flip so the normal points along a per-point reference vector.
     ref = wp.vec3(0.0, 0.0, 0.0)
@@ -435,19 +430,6 @@ def farthest_point_sample_block(
             out_selected[step] = chosen_index
 
 
-@wp.func
-def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
-    # Kernel-scope mirror of ``triwarp.points.plane_basis``, for callers that hold the normal in
-    # device memory and must not read it back to build the frame.
-    unit_normal = wp.normalize(normal)
-    axis = wp.vec3(1.0, 0.0, 0.0)
-    if wp.abs(unit_normal[0]) > 0.9:
-        axis = wp.vec3(0.0, 1.0, 0.0)
-    u = wp.normalize(wp.cross(axis, unit_normal))
-    v = wp.cross(unit_normal, u)
-    return u, v
-
-
 @wp.kernel
 def hull_support_extremes(
     points: wp.array[wp.vec3],
@@ -498,6 +480,15 @@ def hull_support_extremes(
         wp.atomic_min(out_best_min, k, local_min)
 
 
+@wp.func
+def support_slack(best_max: wp.float32, best_min: wp.float32, tolerance: wp.float32) -> wp.float32:
+    # Slack scales with the per-direction support extent so the test is scale-invariant and stays
+    # above the float32 dot-product noise floor. Shared by `mark_hull_support` and
+    # `support_indices`, which both tie-break against it: a future change to the formula (e.g. a
+    # different scale-invariance fix) has one definition to change rather than two that can drift.
+    return tolerance * (best_max - best_min)
+
+
 @wp.kernel
 def mark_hull_support(
     points: wp.array[wp.vec3],
@@ -511,9 +502,7 @@ def mark_hull_support(
     # A hemisphere direction n covers both +n (max, supports the vertex farthest
     # along n) and -n (min, supports the vertex farthest along -n).
     distance = wp.dot(directions[k], points[i])
-    # Slack scales with the per-direction support extent so the test is
-    # scale-invariant and stays above the float32 dot-product noise floor.
-    slack = tolerance * (best_max[k] - best_min[k])
+    slack = support_slack(best_max[k], best_min[k], tolerance)
     if distance >= best_max[k] - slack or distance <= best_min[k] + slack:
         out_mask[i] = True
 
@@ -528,7 +517,7 @@ def support_indices(
     out_support: wp.array[wp.int32],
 ) -> None:
     k, i = wp.tid()
-    slack = tolerance * (best_max[k] - best_min[k])
+    slack = support_slack(best_max[k], best_min[k], tolerance)
     if wp.dot(directions[k], points[i]) >= best_max[k] - slack:
         # Lowest attaining index wins, so the shell is identical across launches even when
         # several points tie for the support along a direction.
@@ -562,11 +551,11 @@ def shell_bounds(
 @wp.func
 def outward_plane(p0: wp.vec3, p1: wp.vec3, p2: wp.vec3, interior: wp.vec3) -> wp.vec4:
     """Unit-normal plane through the triangle, oriented so ``interior`` has negative offset."""
-    normal = wp.cross(p1 - p0, p2 - p0)
-    length = wp.length(normal)
-    if length <= 0.0:
+    # `predicates.triangle_normal` is exactly this triangle's normalize(cross(...)), including the
+    # degenerate-triangle convention (the zero vector) this function's own early return needs.
+    normal = triangle_normal(p0, p1, p2)
+    if wp.length_sq(normal) <= 0.0:
         return wp.vec4(0.0, 0.0, 0.0, 0.0)
-    normal = normal / length
     offset = wp.dot(normal, p0)
     if wp.dot(normal, interior) > offset:
         return wp.vec4(-normal[0], -normal[1], -normal[2], -offset)
@@ -645,6 +634,14 @@ def mark_hull_superset(
     out_mask[i] = keep != 0
 
 
+@wp.func
+def radial_sort_key(point: wp.vec3, origin: wp.vec3, axis0: wp.vec3, axis1: wp.vec3) -> wp.float32:
+    v = point - origin
+    # Negated angle: an ascending radix sort of these keys reproduces trimesh's
+    # descending-angle order (`angles.argsort()[::-1]`).
+    return -wp.atan2(wp.dot(v, axis0), wp.dot(v, axis1))
+
+
 def _declare_map_kernels() -> None:
     """
     Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not three.
@@ -652,12 +649,26 @@ def _declare_map_kernels() -> None:
     See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was
     derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
     here (the shared builtins are declared there).
+
+    Five ops are ``wp.map``'d from ``points.py``; all five are declared. ``is_finite_point``
+    (``point_finite_mask``), ``pack_xy_bits``/``pack_class_z_bits`` (``point_duplicate_mask``'s two
+    packing rounds) and ``radial_sort_key`` (``radial_sort``) are reachable from a length-1 point
+    cloud exactly as ``is_in_half_space`` is, and each forks its own module the first time a call at
+    the other length is seen.
     """
     dense, single = map_probe, map_probe_single
     declare_map_signatures(
         [
             (is_in_half_space, (dense(wp.vec3), wp.vec3(), wp.vec3()), wp.bool),
             (is_in_half_space, (single(wp.vec3), wp.vec3(), wp.vec3()), wp.bool),
+            (is_finite_point, (dense(wp.vec3),), wp.bool),
+            (is_finite_point, (single(wp.vec3),), wp.bool),
+            (pack_xy_bits, (dense(wp.vec3),), wp.int64),
+            (pack_xy_bits, (single(wp.vec3),), wp.int64),
+            (pack_class_z_bits, (dense(wp.int32), dense(wp.vec3)), wp.int64),
+            (pack_class_z_bits, (single(wp.int32), single(wp.vec3)), wp.int64),
+            (radial_sort_key, (dense(wp.vec3), wp.vec3(), wp.vec3(), wp.vec3()), wp.float32),
+            (radial_sort_key, (single(wp.vec3), wp.vec3(), wp.vec3(), wp.vec3()), wp.float32),
         ]
     )
 

@@ -647,6 +647,51 @@ def test_radial_sort(device: str) -> None:
     assert np.allclose(ordered_wp.numpy(), ordered_tm, rtol=1e-5, atol=1e-5)
 
 
+def test_radial_sort_perpendicular_to_a_tilted_normal(device: str) -> None:
+    """
+    Not a library comparison: trimesh shares this defect, so it cannot serve as the oracle here.
+
+    trimesh's own axis0 formula, ``[normal[0], normal[2], -normal[1]]``, is perpendicular to
+    ``normal`` only when ``normal[0] == 0`` -- for any other normal, ``dot(normal, axis0) ==
+    normal.x**2 != 0``, so axis0 carries a leftover component along ``normal`` into every point's
+    angle. ``test_radial_sort`` alone cannot catch this: it fixes ``normal = (0, 0, 1)``, the one
+    case where the defect is exactly zero. This builds points around the maximally-degenerate case,
+    ``normal = (1, 0, 0)`` -- where the old formula's axis0 becomes ``normal`` itself and axis1
+    collapses to the zero vector, so every point's key reads ``atan2(x, 0)`` and the "sort" ties
+    every key to the same value -- and checks the descending order against an independently-built
+    orthonormal frame that has nothing to do with whichever axis pair ``radial_sort`` constructs
+    internally.
+    """
+    rng = np.random.default_rng(9)
+    n = 200
+    theta_np = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    radius_np = rng.uniform(0.1, 2.0, n)
+    # Points confined to the y-z plane, which is perpendicular to normal = (1, 0, 0).
+    points_np = np.column_stack(
+        (np.zeros(n), np.cos(theta_np) * radius_np, np.sin(theta_np) * radius_np)
+    )
+    points_np = points_np[rng.permutation(n)]
+    origin_np = np.array([0.0, 0.0, 0.0])
+    normal_np = np.array([1.0, 0.0, 0.0])
+
+    points_wp = points_to_warp(points_np, device)
+    ordered_wp = tw.radial_sort(
+        points_wp, wp.vec3(*origin_np.tolist()), wp.vec3(*normal_np.tolist())
+    ).numpy()
+
+    # Any right-handed orthonormal pair spanning the plane perpendicular to `normal` gives a
+    # monotonic (if not identical) reparametrization of the true angle around it, so the
+    # *descending cyclic order* is basis-independent -- checked here against a (y, z) pair that
+    # has no relationship to whichever axis0/axis1 `radial_sort` happens to build internally.
+    angles_ref = np.arctan2(ordered_wp[:, 1], ordered_wp[:, 2])
+    deltas = np.diff(np.concatenate([angles_ref, angles_ref[:1]]))
+    deltas = (deltas + np.pi) % (2.0 * np.pi) - np.pi  # wrap into (-pi, pi]
+    # A genuine radial order takes exactly one lap, so every step (however parametrized) has the
+    # same sign; the old, collapsed-key order does not, since every key tied to the same value
+    # leaves the points in their permuted input order instead.
+    assert np.all(deltas > 0.0) or np.all(deltas < 0.0)
+
+
 def test_radial_sort_with_start(device: str) -> None:
     """
     Class A: the same order rotated to begin at a supplied start direction.
@@ -1072,6 +1117,28 @@ def test_statistical_outlier_mask_matches_meshlib(device: str) -> None:
 def test_statistical_outlier_mask_empty(device: str) -> None:
     neighbor_distance_wp = twt.empty_2d((0, 8), wp.float32, device=device)
     assert tw.statistical_outlier_mask(neighbor_distance_wp).shape == (0,)
+
+
+def test_statistical_outlier_mask_flags_coincident_and_empty_rows_below_two_counted(
+    device: str,
+) -> None:
+    """
+    Not a library comparison: the docstring's own guarantee, at the input it used to skip.
+
+    The docstring promises "a point with an empty or fully coincident neighbourhood is marked as
+    an outlier" unconditionally, but the ``counted < 2`` early return (guarding the cloud
+    deviation's ``ddof=1`` division) used to return an all-``False`` mask whenever at most one row
+    in the whole cloud had any finite neighbour distance -- silently dropping that guarantee
+    instead of applying the two-thirds of ``is_statistical_outlier``'s predicate
+    (``count == 0 or mean_distance <= 0.0``) that needs no cloud statistic at all. Three rows here:
+    one fully coincident (every neighbour at distance 0), two fully empty (every slot ``inf``) --
+    every one of the three must read ``True``.
+    """
+    neighbor_distance_wp = wp.array(
+        np.array([[0.0], [np.inf], [np.inf]], dtype=np.float32), device=device
+    )
+    outlier_wp = tw.statistical_outlier_mask(neighbor_distance_wp).numpy()
+    assert np.array_equal(outlier_wp, np.array([True, True, True]))
 
 
 @pytest.mark.parity("radius_outlier_mask", "open3d")

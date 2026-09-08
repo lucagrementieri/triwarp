@@ -250,6 +250,25 @@ def test_ambient_occlusion_empty(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> Non
     assert tw.visibility.ambient_occlusion(mesh_wp, points_wp).shape == (0,)
 
 
+def test_ambient_occlusion_empty_still_validates_normals_length(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a parity assert: an empty ``points`` must not silently skip the ``normals`` length check.
+
+    ``_occlusion_bundle``'s ``m == 0`` early return used to run before
+    ``_resolve_normals_and_radius``, so a caller passing a stale, wrong-length ``normals`` array
+    alongside an empty ``points`` got an empty result back instead of the ``ValueError`` the
+    docstring promises unconditionally.
+    """
+    _mesh_tm, mesh_wp = icosahedron
+    points_wp = wp.zeros(0, dtype=wp.vec3, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="one entry per point"):
+        tw.visibility.ambient_occlusion(
+            mesh_wp, points_wp, normals=wp.zeros(2, dtype=wp.vec3, device=mesh_wp.device)
+        )
+
+
 def test_volumetric_obscurance_is_zero_on_a_convex_mesh(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
@@ -580,6 +599,16 @@ def test_shape_diameter_empty(device: str) -> None:
     assert tw.visibility.shape_diameter(mesh_wp, points_wp).shape == (0,)
 
 
+def test_shape_diameter_empty_still_validates_normals_length(device: str) -> None:
+    """Not a parity assert: see ``test_ambient_occlusion_empty_still_validates_normals_length``."""
+    _sphere_tm, mesh_wp, _normals_wp = _sphere_wp(device, 1.0, subdivisions=1)
+    points_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="one entry per point"):
+        tw.visibility.shape_diameter(
+            mesh_wp, points_wp, normals=wp.zeros(2, dtype=wp.vec3, device=device)
+        )
+
+
 # ---------------------------------------------------------------------------
 # thickness (trimesh reference)
 # ---------------------------------------------------------------------------
@@ -874,6 +903,54 @@ def test_max_tangent_sphere_empty(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> No
     centers_wp, radii_wp = tw.visibility.max_tangent_sphere(mesh_wp, points_wp)
     assert centers_wp.shape == (0,)
     assert radii_wp.shape == (0,)
+
+
+def test_max_tangent_sphere_empty_still_validates_normals_length(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a parity assert: see ``test_ambient_occlusion_empty_still_validates_normals_length``.
+
+    ``max_tangent_sphere``'s ``m == 0`` early return sat *after* its inline normals-length check
+    rather than before it, but reached the same bug from the AABB-reduction side: two ``aabb``
+    passes ran before the check regardless. Both are pinned here.
+    """
+    _, mesh_wp = icosahedron
+    points_wp = wp.empty(0, dtype=wp.vec3, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="one entry per point"):
+        tw.visibility.max_tangent_sphere(
+            mesh_wp, points_wp, normals=wp.zeros(2, dtype=wp.vec3, device=mesh_wp.device)
+        )
+
+
+def test_max_tangent_sphere_normalizes_a_non_unit_normal(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Triwarp against triwarp: a caller-supplied non-unit normal must not silently scale the radius.
+
+    Every ray-bundle measure in this module normalizes its normals defensively (``hemisphere_frame``
+    does it per-thread); the shrinking-sphere path had no equivalent guard, so a normal scaled by
+    2.0 used to move both the sphere's center (``point + normal * radius``) and, through
+    ``step_sphere_shrink``'s convergence test, its radius -- silently, since nothing here documents
+    or checks unit length beyond the docstring's word.
+    """
+    _mesh_tm, mesh_wp = icosahedron
+    points_wp = mesh_wp.points
+    unit_normals_wp = tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices)
+    scaled_normals_wp = wp.empty(
+        int(unit_normals_wp.shape[0]), dtype=wp.vec3, device=mesh_wp.device
+    )
+    wp.map(wp.mul, unit_normals_wp, wp.float32(2.0), out=scaled_normals_wp)
+
+    centers_unit_wp, radii_unit_wp = tw.visibility.max_tangent_sphere(
+        mesh_wp, points_wp, normals=unit_normals_wp
+    )
+    centers_scaled_wp, radii_scaled_wp = tw.visibility.max_tangent_sphere(
+        mesh_wp, points_wp, normals=scaled_normals_wp
+    )
+    assert np.allclose(radii_scaled_wp.numpy(), radii_unit_wp.numpy(), rtol=1e-5, atol=1e-5)
+    assert np.allclose(centers_scaled_wp.numpy(), centers_unit_wp.numpy(), rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])

@@ -175,6 +175,15 @@ def cross2(a: Any, b: Any) -> wp.Float:
 
 
 @wp.func
+def mat33_column(m: wp.mat33, col: wp.int32) -> wp.vec3:
+    # A `wp.mat33`'s column as a `wp.vec3`, so extracting an SVD basis vector (`wp.svd3` returns
+    # its bases as matrix columns) doesn't need three `m[row, col]` reads spelled out at every call
+    # site -- points.py's `finalize_fit_plane`/`finalize_principal_axes`/`estimate_point_normals`
+    # and smoothing.py's `_neighborhood_frame` all did, once each, before this.
+    return wp.vec3(m[0, col], m[1, col], m[2, col])
+
+
+@wp.func
 def to_vec3d(v: wp.vec3) -> wp.vec3d:
     return wp.vec3d(wp.float64(v[0]), wp.float64(v[1]), wp.float64(v[2]))
 
