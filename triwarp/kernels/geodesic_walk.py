@@ -5,7 +5,7 @@ from triwarp.kernels.array import to_vec3, wrap_index
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.predicates import project_out_normal, unit_tangent
 from triwarp.kernels.tangent_space import corner_angle
-from triwarp.kernels.triangles import face_normal
+from triwarp.kernels.triangles import face_normal, local_corner
 
 
 @wp.func
@@ -73,6 +73,25 @@ def unfold_direction(
 
 
 @wp.func
+def emit_walk_point(
+    out_points: wp.array[wp.vec3], write_begin: wp.int32, count: wp.int32, point: wp.vec3
+) -> wp.int32:
+    """
+    Conditionally write ``point`` at the walk's next output slot; return the incremented count.
+
+    ``trace_walk`` / ``descent_walk`` are each a two-pass walk sharing one implementation: a
+    counting pass (``write_begin < 0``, nothing written) sizes the polyline, and a writing pass
+    (``write_begin >= 0``) fills it at ``out_points[write_begin : write_begin + count]``. Every step
+    of both walks conditionally writes one point and advances ``count`` by exactly one, so this is
+    the whole idiom factored once; a plain return (not ``wp.ref``) is enough since nothing else is
+    mutated between the write and the increment.
+    """
+    if write_begin >= wp.int32(0):
+        out_points[write_begin + count] = point
+    return count + wp.int32(1)
+
+
+@wp.func
 def trace_walk(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -96,9 +115,7 @@ def trace_walk(
     remaining = arc_length
 
     count = wp.int32(0)
-    if write_begin >= wp.int32(0):
-        out_points[write_begin] = point
-    count += wp.int32(1)
+    count = emit_walk_point(out_points, write_begin, count, point)
     if remaining <= TOLERANCE_ZERO_CONSTANT or tangential_length <= TOLERANCE_ZERO_CONSTANT:
         return count
 
@@ -115,17 +132,13 @@ def trace_walk(
             break
         if distance >= remaining:
             point = point + remaining * direction
-            if write_begin >= wp.int32(0):
-                out_points[write_begin + count] = point
-            count += wp.int32(1)
+            count = emit_walk_point(out_points, write_begin, count, point)
             remaining = wp.float32(0.0)
             break
 
         point = point + distance * direction
         remaining -= distance
-        if write_begin >= wp.int32(0):
-            out_points[write_begin + count] = point
-        count += wp.int32(1)
+        count = emit_walk_point(out_points, write_begin, count, point)
 
         twin = twins[face * 3 + edge]
         if twin == wp.int32(-1):
@@ -340,10 +353,7 @@ def descend_at_vertex(
     best_slope = wp.float64(0.0)
     for slot in range(face_offsets[v], face_offsets[v + 1]):
         f = vertex_faces[slot]
-        corner = wp.int32(-1)
-        for k in range(3):
-            if faces[f * 3 + k] == v:
-                corner = k
+        corner = local_corner(faces, f, v)
         if corner < 0:
             continue
         gradient = gradients[f]
@@ -429,9 +439,7 @@ def descent_walk(
     count = wp.int32(0)
     vertex = start_vertex
     point = vertices[vertex]
-    if write_begin >= wp.int32(0):
-        out_points[write_begin] = point
-    count += wp.int32(1)
+    count = emit_walk_point(out_points, write_begin, count, point)
 
     # The field value at the last written point, tracked exactly rather than read off ``vertex`` --
     # ``vertex`` goes stale the moment the walk crosses into a second (or third, ...) face without
@@ -461,9 +469,7 @@ def descent_walk(
             vertex = neighbour
             point = vertices[vertex]
             last_value = values[vertex]
-            if write_begin >= wp.int32(0):
-                out_points[write_begin + count] = point
-            count += wp.int32(1)
+            count = emit_walk_point(out_points, write_begin, count, point)
             continue
 
         # --- inside a face -------------------------------------------------------------------
@@ -491,9 +497,7 @@ def descent_walk(
             vertex = lowest
             point = vertices[vertex]
             last_value = values[vertex]
-            if write_begin >= wp.int32(0):
-                out_points[write_begin + count] = point
-            count += wp.int32(1)
+            count = emit_walk_point(out_points, write_begin, count, point)
             face = wp.int32(-1)
             continue
 
@@ -502,9 +506,7 @@ def descent_walk(
         # directional derivative along it is ``-slope`` and the step is a straight line inside one
         # face's affine field.
         last_value -= wp.float64(slope) * wp.float64(distance)
-        if write_begin >= wp.int32(0):
-            out_points[write_begin + count] = point
-        count += wp.int32(1)
+        count = emit_walk_point(out_points, write_begin, count, point)
 
         start = faces[face * 3 + edge]
         end = faces[face * 3 + (edge + 1) % 3]
@@ -514,9 +516,7 @@ def descent_walk(
             reached = start
             if values[end] < values[start]:
                 reached = end
-            if write_begin >= wp.int32(0):
-                out_points[write_begin + count] = vertices[reached]
-            count += wp.int32(1)
+            count = emit_walk_point(out_points, write_begin, count, vertices[reached])
             break
 
         twin = twins[face * 3 + edge]
@@ -547,9 +547,7 @@ def descent_walk(
             vertex = end
         point = vertices[vertex]
         last_value = values[vertex]
-        if write_begin >= wp.int32(0):
-            out_points[write_begin + count] = point
-        count += wp.int32(1)
+        count = emit_walk_point(out_points, write_begin, count, point)
         face = wp.int32(-1)
     return count
 

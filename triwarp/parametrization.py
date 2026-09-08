@@ -239,8 +239,9 @@ def harmonic(
     Raises
     ------
     ValueError
-        If ``k < 1``, or if there are interior vertices but ``boundary_indices`` is empty (the
-        Dirichlet system would be singular).
+        If ``k < 1``, if there are interior vertices but ``boundary_indices`` is empty (the
+        Dirichlet system would be singular), or if ``boundary_indices`` and ``boundary_uv`` have
+        different lengths.
     RuntimeError
         If ``vertices``, ``faces``, ``boundary_indices`` and ``boundary_uv`` are not all on one
         device.
@@ -264,13 +265,9 @@ def harmonic(
     since squaring the operator squares its condition number. For ``k == 1`` a simple Jacobi
     preconditioner is used instead.
     """
-    require_same_device(
-        vertices=vertices, faces=faces, boundary_indices=boundary_indices, boundary_uv=boundary_uv
+    device, n_vertices = _validate_fixed_boundary_call(
+        vertices, faces, boundary_indices, boundary_uv, k, "harmonic"
     )
-    if k < 1:
-        raise ValueError(f"harmonic power k must be >= 1, got {k}.")
-    device = vertices.device
-    n_vertices = int(vertices.shape[0])
     if n_vertices == 0:
         return wp.empty(0, dtype=wp.vec2, device=device)
     laplacian = cotmatrix(vertices, faces, dtype=wp.float64)
@@ -322,7 +319,8 @@ def tutte(
     Raises
     ------
     ValueError
-        If ``k < 1``, or if there are interior vertices but ``boundary_indices`` is empty.
+        If ``k < 1``, if there are interior vertices but ``boundary_indices`` is empty, or if
+        ``boundary_indices`` and ``boundary_uv`` have different lengths.
     RuntimeError
         If ``vertices``, ``faces``, ``boundary_indices`` and ``boundary_uv`` are not all on one
         device.
@@ -333,19 +331,32 @@ def tutte(
     [`graph_laplacian`][triwarp.laplacian.graph_laplacian]
     [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]
     """
-    require_same_device(
-        vertices=vertices, faces=faces, boundary_indices=boundary_indices, boundary_uv=boundary_uv
+    device, n_vertices = _validate_fixed_boundary_call(
+        vertices, faces, boundary_indices, boundary_uv, k, "tutte"
     )
-    if k < 1:
-        raise ValueError(f"tutte power k must be >= 1, got {k}.")
-    device = vertices.device
-    n_vertices = int(vertices.shape[0])
     if n_vertices == 0:
         return wp.empty(0, dtype=wp.vec2, device=device)
     laplacian = graph_laplacian(vertices, faces, dtype=wp.float64)
     return _solve_fixed_boundary(
         laplacian, None, k, n_vertices, boundary_indices, boundary_uv, device
     )
+
+
+def _validate_fixed_boundary_call(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    boundary_indices: wp.array[wp.int32],
+    boundary_uv: wp.array[wp.vec2],
+    k: int,
+    name: str,
+) -> tuple[wp.DeviceLike, int]:
+    """Shared ``harmonic`` / ``tutte`` preamble: device check, ``k`` validation, vertex count."""
+    require_same_device(
+        vertices=vertices, faces=faces, boundary_indices=boundary_indices, boundary_uv=boundary_uv
+    )
+    if k < 1:
+        raise ValueError(f"{name} power k must be >= 1, got {k}.")
+    return vertices.device, int(vertices.shape[0])
 
 
 def _solve_fixed_boundary(
@@ -367,18 +378,21 @@ def _solve_fixed_boundary(
     gradient, keeping the fixed vertices at ``boundary_uv``. ``laplacian`` must be float64:
     ``k > 1`` squares its condition number.
     """
-    q = tw.energies.k_harmonic(laplacian, mass_diag, k=k)
-
-    # A mesh with interior vertices and no fixed boundary is a singular Dirichlet system. Raised up
-    # front: once every vertex is fixed (n_vertices > 0, n_boundary == 0 is impossible here because
-    # n_vertices > 0 implies interior vertices exist) this cannot be satisfied.
+    # A mesh with interior vertices and no fixed boundary is a singular Dirichlet system. Checked
+    # before ``k_harmonic`` assembles the (for k > 1, sparse-matrix-product) operator, since once
+    # every vertex is fixed (n_vertices > 0, n_boundary == 0 is impossible here because n_vertices
+    # > 0 implies interior vertices exist) this cannot be satisfied and the assembly would be
+    # wasted.
     n_boundary = int(boundary_indices.shape[0])
-    if n_boundary == 0:
-        raise ValueError(
-            "harmonic / tutte require at least one fixed boundary vertex; the Dirichlet system is "
-            "otherwise singular."
-        )
+    _require_fixed_vertices(
+        n_boundary,
+        n_vertices,
+        1,
+        "harmonic / tutte require at least one fixed boundary vertex; the Dirichlet system is "
+        "otherwise singular.",
+    )
 
+    q = tw.energies.k_harmonic(laplacian, mass_diag, k=k)
     fixed_mask, fixed_values = _scatter_constraints(
         n_vertices, boundary_indices, boundary_uv, device
     )
@@ -466,8 +480,8 @@ def arap(
     Raises
     ------
     ValueError
-        If ``max_iterations < 1``, if ``tolerance <= 0``, or if there are interior vertices but
-        ``fixed_indices`` is empty.
+        If ``max_iterations < 1``, if ``tolerance <= 0``, if there are interior vertices but
+        ``fixed_indices`` is empty, or if ``fixed_indices`` and ``fixed_uv`` have different lengths.
     RuntimeError
         If ``vertices``, ``faces``, ``fixed_indices``, ``fixed_uv`` and ``uv_init`` are not all on
         one device.
@@ -517,6 +531,18 @@ def arap(
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0:
         return wp.empty(0, dtype=wp.vec2, device=device)
+
+    # Interior vertices with nothing pinned leave the ARAP global system translation-invariant
+    # (singular) -- and since n_vertices > 0, an empty ``fixed_indices`` always means at least one
+    # interior vertex exists. Checked before the cotangent/Laplacian build below (mirroring
+    # harmonic / tutte), so a rejected call doesn't pay for the assembly first.
+    _require_fixed_vertices(
+        int(fixed_indices.shape[0]),
+        n_vertices,
+        1,
+        "arap requires at least one fixed vertex when the mesh has interior vertices; the ARAP "
+        "global system is otherwise singular (translation invariant).",
+    )
     n_faces = int(faces.shape[0]) // 3
 
     # Cotangents computed once and reused by both the Laplacian build and the rest-edge flattening;
@@ -533,7 +559,17 @@ def arap(
 
     out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     if n_interior == 0:
-        # Every vertex pinned: the prescribed positions are the whole answer, no solve.
+        # Every vertex pinned: the prescribed positions are the whole answer, no solve. This is the
+        # same shape `min_quad_with_fixed`'s own `n_free == 0` branch returns (an empty `(n_rhs,
+        # n_free)` solution `scatter_solution` never indexes), but composing through it here would
+        # cost more than it shares: `min_quad_with_fixed` re-derives `free_partition` internally
+        # (arap already has `interior_map`/`n_interior` from its own call, needed by the iterative
+        # loop below regardless) and its single-shot solve has no hook for the warm-started,
+        # loop-reused solver state arap's general path builds -- so reaching it would mean throwing
+        # away work already done, not reusing it. The real waste this early return avoids is
+        # upstream of any solve: `q_uu`/`rhs_const`/`rest_edges`/the CG solver state below are built
+        # only for a loop that would immediately do nothing on an empty system, so skipping them
+        # here is the point, not a shortcut around composition.
         empty_sol = wp.zeros((2, 0), dtype=wp.float64, device=device)
         wp.launch(
             kernel_parametrization.scatter_solution,
@@ -542,14 +578,6 @@ def arap(
             device=device,
         )
         return out_uv
-
-    # Interior vertices with nothing pinned leave the ARAP global system translation-invariant
-    # (singular). Raised up front, mirroring harmonic / tutte.
-    if int(fixed_indices.shape[0]) == 0:
-        raise ValueError(
-            "arap requires at least one fixed vertex when the mesh has interior vertices; the ARAP "
-            "global system is otherwise singular (translation invariant)."
-        )
 
     # Global-step operator: interior block of Q = -L and the constant boundary term -(-L)_ub bc.
     # ``future work``: libigl also supports rotation groups ``G`` (shared rotations across grouped
@@ -641,19 +669,21 @@ def _scatter_constraints(
     [`_solve_fixed_boundary`][triwarp.parametrization._solve_fixed_boundary] and
     [`arap`][triwarp.parametrization.arap]; an empty ``indices`` yields an all-``False`` mask and
     an all-zero value buffer, which each caller rejects on its own terms.
+
+    Raises
+    ------
+    ValueError
+        If ``indices`` and ``uv`` have different lengths -- the scatter kernel below indexes ``uv``
+        at every position up to ``indices.shape[0]``, so a shorter ``uv`` is an out-of-bounds read.
     """
-    fixed_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
-    fixed_values = wp.zeros((2, n_vertices), dtype=wp.float64, device=device)
     n_fixed = int(indices.shape[0])
-    if n_fixed > 0:
-        # Two independent per-pin scatters into different buffers. Kept as separate launches rather
-        # than fused into one, since the cost is negligible against the rest of the call.
-        wp.launch(
-            kernel_parametrization.scatter_boundary_mask,
-            dim=n_fixed,
-            inputs=[indices, fixed_mask],
-            device=device,
+    if int(uv.shape[0]) != n_fixed:
+        raise ValueError(
+            f"indices and uv must have the same length, got {n_fixed} and {int(uv.shape[0])}."
         )
+    fixed_mask = tw.array.indices_to_mask(indices, n_vertices, device=device)
+    fixed_values = wp.zeros((2, n_vertices), dtype=wp.float64, device=device)
+    if n_fixed > 0:
         wp.launch(
             kernel_parametrization.scatter_fixed_uv,
             dim=n_fixed,
@@ -707,7 +737,8 @@ def lscm(
     Raises
     ------
     ValueError
-        If fewer than two vertices are pinned (and the mesh has at least two vertices).
+        If fewer than two vertices are pinned (and the mesh has at least two vertices), or if
+        ``pinned_indices`` and ``pinned_uv`` have different lengths.
     RuntimeError
         If ``vertices``, ``faces``, ``pinned_indices`` and ``pinned_uv`` are not all on one device.
 
@@ -734,10 +765,19 @@ def lscm(
         return wp.empty(0, dtype=wp.vec2, device=device)
 
     n_pinned = int(pinned_indices.shape[0])
-    if n_pinned < 2 and n_pinned < n:
+    _require_fixed_vertices(
+        n_pinned,
+        n,
+        2,
+        "lscm requires at least two pinned vertices to remove the conformal map's "
+        f"similarity-transform null space; got {n_pinned}.",
+    )
+    if int(pinned_uv.shape[0]) != n_pinned:
+        # The scatter kernel below indexes ``pinned_uv`` at every position up to
+        # ``pinned_indices.shape[0]``, so a shorter ``pinned_uv`` is an out-of-bounds read.
         raise ValueError(
-            "lscm requires at least two pinned vertices to remove the conformal map's "
-            f"similarity-transform null space; got {n_pinned}."
+            "pinned_indices and pinned_uv must have the same length, got "
+            f"{n_pinned} and {int(pinned_uv.shape[0])}."
         )
 
     q = tw.energies.lscm_hessian(vertices, faces)
@@ -763,3 +803,20 @@ def lscm(
         device=device,
     )
     return out_uv
+
+
+def _require_fixed_vertices(n_fixed: int, n_vertices: int, min_required: int, message: str) -> None:
+    """
+    Raise ``ValueError(message)`` unless at least ``min_required`` vertices are fixed.
+
+    Waived when the mesh has fewer than ``min_required`` vertices, since it is then impossible to
+    pin that many distinct ones. The shared arithmetic behind three otherwise-differently-worded
+    guards: harmonic / tutte's "at least one fixed boundary vertex" (``min_required=1``, via
+    [`_solve_fixed_boundary`][triwarp.parametrization._solve_fixed_boundary]), arap's "at least one
+    fixed vertex" (``min_required=1``) and lscm's "at least two pinned vertices"
+    (``min_required=2``). Each caller keeps its own message, since the *reason* the count is
+    required differs (a singular Dirichlet system, translation invariance, a similarity-transform
+    null space) even though the arithmetic is identical.
+    """
+    if n_vertices >= min_required and n_fixed < min_required:
+        raise ValueError(message)

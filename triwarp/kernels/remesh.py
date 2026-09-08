@@ -33,6 +33,7 @@ from triwarp.kernels.triangles import (
     face_normal,
     face_normals_and_area,
     face_vertices_vec3d,
+    local_corner,
     triangle_quality,
 )
 from triwarp.kernels.voxels import squared_distance_to_own_cell_center
@@ -1663,16 +1664,6 @@ def clamp_to_surface_band(
     if distance <= max_deviation:
         return vertex
     return closest + offset * (max_deviation / distance)
-
-
-@wp.func
-def local_corner(faces: wp.array[wp.int32], f: wp.int32, vertex: wp.int32) -> wp.int32:
-    # Which corner of face ``f`` holds ``vertex``, or -1. Needed because an edge-length table is
-    # indexed by *corner*, while the flip machinery speaks in vertex indices.
-    for k in range(3):
-        if faces[f * 3 + k] == vertex:
-            return k
-    return wp.int32(-1)
 
 
 @wp.kernel

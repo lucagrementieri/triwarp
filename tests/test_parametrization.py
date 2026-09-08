@@ -107,6 +107,14 @@ def test_map_vertices_to_circle_matches_igl(request, device, mesh_name):
     assert np.allclose(circle_wp.numpy(), circle_igl, rtol=1e-5, atol=1e-5)
 
 
+def test_map_vertices_to_circle_single_vertex_loop(device):
+    """A single-vertex loop has zero perimeter; the arc-length map must not divide 0/0 into NaN."""
+    vertices_wp = wp.array(np.array([[0.0, 0.0, 0.0]]), dtype=wp.vec3, device=device)
+    boundary_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
+    circle_wp = tw.parametrization.map_vertices_to_circle(vertices_wp, boundary_wp)
+    assert np.isfinite(circle_wp.numpy()).all()
+
+
 @pytest.mark.parity(
     "graph_laplacian",
     "igl",
@@ -248,6 +256,16 @@ def test_harmonic_cpu_matches_cuda():
 
     assert np.isfinite(uv["cpu"]).all()
     assert np.allclose(uv["cpu"], uv["cuda:0"], rtol=1e-5, atol=1e-5)
+
+
+def test_harmonic_boundary_uv_length_mismatch_raises(device, hemisphere):
+    # boundary_indices/boundary_uv feed a scatter kernel indexed by boundary_indices' own length;
+    # a shorter boundary_uv would otherwise be an out-of-bounds read.
+    _, mesh_wp = hemisphere
+    boundary_wp = tw.boundary.longest_boundary_loop(mesh_wp.points, mesh_wp.indices)
+    short_uv = wp.zeros(int(boundary_wp.shape[0]) - 1, dtype=wp.vec2, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="same length"):
+        tw.parametrization.harmonic(mesh_wp.points, mesh_wp.indices, boundary_wp, short_uv)
 
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
@@ -452,6 +470,17 @@ def test_arap_empty_fixed_raises(device, hemisphere):
         tw.parametrization.arap(mesh_wp.points, mesh_wp.indices, empty_fixed, empty_uv, uv_init)
 
 
+def test_arap_fixed_uv_length_mismatch_raises(device, hemisphere):
+    # fixed_indices/fixed_uv feed a scatter kernel indexed by fixed_indices' own length; a shorter
+    # fixed_uv would otherwise be an out-of-bounds read.
+    _, mesh_wp = hemisphere
+    boundary_wp = tw.boundary.longest_boundary_loop(mesh_wp.points, mesh_wp.indices)
+    short_uv = wp.zeros(int(boundary_wp.shape[0]) - 1, dtype=wp.vec2, device=mesh_wp.device)
+    uv_init = wp.zeros(int(mesh_wp.points.shape[0]), dtype=wp.vec2, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="same length"):
+        tw.parametrization.arap(mesh_wp.points, mesh_wp.indices, boundary_wp, short_uv, uv_init)
+
+
 def test_arap_bad_iterations_raises(device, hemisphere):
     _, mesh_wp = hemisphere
     boundary_wp = tw.boundary.longest_boundary_loop(mesh_wp.points, mesh_wp.indices)
@@ -590,6 +619,32 @@ def test_lscm_too_few_pins_raises(device, hemisphere, n_pins):
     )
     with pytest.raises(ValueError, match="at least two pinned vertices"):
         tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
+
+
+def test_lscm_waives_pin_count_below_two_vertices(device):
+    # The docstring's "unless the mesh has fewer than two vertices" exemption: a single-vertex,
+    # zero-face mesh with no pins at all must not raise.
+    vertices_wp = wp.array(np.array([[0.0, 0.0, 0.0]]), dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    pins_wp = wp.empty(0, dtype=wp.int32, device=device)
+    pins_uv_wp = wp.empty(0, dtype=wp.vec2, device=device)
+    uv_wp = tw.parametrization.lscm(vertices_wp, faces_wp, pins_wp, pins_uv_wp)
+    assert np.isfinite(uv_wp.numpy()).all()
+
+
+def test_lscm_pinned_uv_length_mismatch_raises(device, hemisphere):
+    # pinned_indices/pinned_uv feed a scatter kernel indexed by pinned_indices' own length; a
+    # shorter pinned_uv would otherwise be an out-of-bounds read.
+    _, mesh_wp = hemisphere
+    loop_np = tw.boundary.longest_boundary_loop(mesh_wp.points, mesh_wp.indices).numpy()
+    pins_wp = wp.array(
+        np.array([loop_np[0], loop_np[len(loop_np) // 2]], dtype=np.int32),
+        dtype=wp.int32,
+        device=mesh_wp.device,
+    )
+    short_uv = wp.zeros(1, dtype=wp.vec2, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="same length"):
+        tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, short_uv)
 
 
 def test_lscm_cpu_matches_cuda():

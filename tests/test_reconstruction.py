@@ -48,6 +48,7 @@ from tests.conversions import (
     points_to_warp_uv,
     warp_to_trimesh,
 )
+from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
 
@@ -407,6 +408,100 @@ def test_estimated_normals_path_runs(device: str):
     assert tw.validation.is_edge_manifold(faces_wp)
     radii = np.linalg.norm(vertices_wp.numpy(), axis=1)
     assert np.allclose(radii, 1.0, rtol=1e-5, atol=1e-5)
+
+
+def test_build_local_triangulations_two_neighbour_ring_no_duplicate(device: str):
+    """
+    A fan with exactly two live neighbours and no boundary gap emits one triangle, not two.
+
+    Direct ``kernel_reconstruction.build_local_triangulations`` launch (bypassing the neighbour
+    query and normal estimation) so the degenerate ring -- ``cycle_prev(i) == cycle_next(i)`` for
+    both of the two live slots -- is reached deterministically rather than by engineering the
+    greedy edge-removal loop's convergence. ``boundary_angle`` near ``2*pi`` keeps this specific
+    two-point ring from being read as a boundary (its two angular gaps sum to ``2*pi``, so neither
+    can exceed the default ``0.9*pi`` threshold, which is what makes the ordinary wrapper unable to
+    reach this branch with only two neighbours -- see the regression-fixture note in
+    ``plans/review.md``).
+    """
+    angle = np.deg2rad(170.0)
+    points_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [np.cos(angle), np.sin(angle), 0.0]], dtype=np.float64
+    )
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    normals_wp = wp.array(np.tile([0.0, 0.0, 1.0], (3, 1)), dtype=wp.vec3, device=device)
+    neighbor_idx_wp = wp.array(
+        np.array([[1, 2, -1]], dtype=np.int32), dtype=wp.int32, device=device
+    )
+    neighbor_dist_wp = wp.array(
+        np.array([[1.0, 1.0, 0.0]], dtype=np.float32), dtype=wp.float32, device=device
+    )
+    out_tris_wp = wp.zeros((1, 3, 3), dtype=wp.int32, device=device)
+    out_valid_wp = wp.zeros((1, 3), dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_reconstruction.build_local_triangulations,
+        dim=1,
+        inputs=[
+            points_wp,
+            normals_wp,
+            neighbor_idx_wp,
+            neighbor_dist_wp,
+            wp.float32(0.0),
+            wp.float32(math.pi / 2.0),
+            wp.float32(2.0 * math.pi - 0.01),
+            out_tris_wp,
+            out_valid_wp,
+        ],
+        device=device,
+    )
+    valid_np = out_valid_wp.numpy()[0]
+    assert np.count_nonzero(valid_np) == 1
+    triangle = out_tris_wp.numpy()[0, np.flatnonzero(valid_np)[0]]
+    assert set(triangle.tolist()) == {0, 1, 2}
+
+
+def test_build_local_triangulations_two_gaps_emits_nothing(device: str):
+    """
+    A fan with two disjoint angular gaps emits no triangle rather than bridging them.
+
+    Direct kernel launch (bypassing the neighbour query): six neighbours in two tight clusters
+    (0-2 degrees and 180-182 degrees) leave two gaps of ~178 degrees each, both past the default
+    ``boundary_angle`` (0.9*pi = 162 degrees). ``border`` can mark only one gap, so before this
+    guard a spurious triangle could connect the two clusters across the other, unregistered one;
+    now the point contributes nothing instead.
+    """
+    angles_deg = [0.0, 1.0, 2.0, 180.0, 181.0, 182.0]
+    points_np = np.array(
+        [[0.0, 0.0, 0.0]]
+        + [[math.cos(math.radians(a)), math.sin(math.radians(a)), 0.0] for a in angles_deg],
+        dtype=np.float64,
+    )
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    normals_wp = wp.array(
+        np.tile([0.0, 0.0, 1.0], (points_np.shape[0], 1)), dtype=wp.vec3, device=device
+    )
+    neighbor_idx_wp = wp.array(
+        np.array([[1, 2, 3, 4, 5, 6]], dtype=np.int32), dtype=wp.int32, device=device
+    )
+    neighbor_dist_wp = wp.array(np.ones((1, 6), dtype=np.float32), dtype=wp.float32, device=device)
+    out_tris_wp = wp.zeros((1, 6, 3), dtype=wp.int32, device=device)
+    out_valid_wp = wp.zeros((1, 6), dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_reconstruction.build_local_triangulations,
+        dim=1,
+        inputs=[
+            points_wp,
+            normals_wp,
+            neighbor_idx_wp,
+            neighbor_dist_wp,
+            wp.float32(0.0),
+            wp.float32(math.pi / 2.0),
+            wp.float32(0.9 * math.pi),
+            out_tris_wp,
+            out_valid_wp,
+        ],
+        device=device,
+    )
+    assert not out_valid_wp.numpy().any()
 
 
 def test_holes_seal_small_hole(device: str):

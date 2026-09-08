@@ -24,15 +24,6 @@ def face_flipped_mask(
 
 
 @wp.kernel
-def scatter_boundary_mask(
-    boundary_indices: wp.array[wp.int32], out_mask: wp.array[wp.bool]
-) -> None:
-    # Mark every fixed (boundary) vertex; interior vertices keep the pre-set ``False``.
-    b = wp.int32(wp.tid())
-    out_mask[boundary_indices[b]] = True
-
-
-@wp.kernel
 def scatter_fixed_uv(
     boundary_indices: wp.array[wp.int32],
     boundary_uv: wp.array[wp.vec2],
@@ -43,6 +34,8 @@ def scatter_fixed_uv(
     # ``c`` and original vertex index ``j``. float64 to match the float64 conjugate-gradient path.
     b = wp.int32(wp.tid())
     i = boundary_indices[b]
+    if i < wp.int32(0) or i >= out_fixed_values.shape[1]:
+        return
     uv = boundary_uv[b]
     out_fixed_values[0, i] = wp.float64(uv[0])
     out_fixed_values[1, i] = wp.float64(uv[1])
@@ -94,6 +87,11 @@ def circle_positions(
     n = cumulative_length.shape[0]
     wrap = wp.length(vertices[boundary[0]] - vertices[boundary[n - 1]])
     total = cumulative_length[n - 1] + wrap
+    if total <= 0.0:
+        # A single-vertex loop, or one whose vertices are all coincident, has zero perimeter --
+        # every ``cumulative_length`` entry is then 0 too, so this is the only guard needed to
+        # avoid the 0/0 that would otherwise silently write NaN into every position.
+        total = wp.float32(1.0)
     frac = cumulative_length[i] * twc.TWO_PI / total
     out_uv[i] = wp.vec2(wp.cos(frac), wp.sin(frac))
 
@@ -110,6 +108,8 @@ def scatter_pinned_stacked(
     # and ``i + n`` (v). ``out_fixed_values`` is ``(1, 2n)`` (single right-hand-side column).
     b = wp.int32(wp.tid())
     i = pinned_indices[b]
+    if i < wp.int32(0) or i >= n_vertices:
+        return
     uv = pinned_uv[b]
     out_fixed_mask[i] = True
     out_fixed_mask[i + n_vertices] = True

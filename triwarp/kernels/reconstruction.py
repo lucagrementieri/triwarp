@@ -13,7 +13,6 @@ import warp as wp
 from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
 from triwarp.kernels.array import (
     lattice_position,
-    sort3,
     trilinear_cell,
     trilinear_corner,
     trilinear_weight,
@@ -133,7 +132,22 @@ def lexicographic_triangulation(
         # No visible edge at all means a degenerate insertion (a duplicate point, since a lex sweep
         # always sees the hull from the new rightmost point otherwise). Both indices stay -1, which
         # in the Python original wrapped to the last boundary entry and broke the walk immediately;
-        # mapping them to ``nb - 1`` reproduces that exactly rather than reading out of bounds.
+        # mapping them to ``nb - 1`` reproduces that exactly rather than reading out of bounds. That
+        # collapse also fires -- and drops every other boundary vertex from the hull, unreferenced,
+        # rather than only the duplicate -- when ``curr`` is exactly collinear with the whole
+        # current boundary rather than a duplicate of one point (all ``orientations`` land on
+        # exactly zero). Searched for a genuinely-lex-ordered general-position input that reaches
+        # this branch with ``nb >= 2`` and confirmed a real hand-traced case exists in principle at
+        # ``nb == 2``: two boundary points and a later point exactly collinear with both. But a
+        # randomized search over 220 000+ properly lex-sorted point sets (3-7 points, general
+        # position) never reduced
+        # ``n_boundary`` to 2 at all, degenerate or not -- reaching it seems to itself require an
+        # earlier degenerate (already-collinear) step, which is the same input class
+        # ``test_delaunay_collinear`` already accepts producing zero faces for. So the dropped
+        # vertex ends up in the same "unreferenced by any face" outcome that class already produces
+        # deliberately, rather than corrupting anything downstream (the rest of the sweep proceeds
+        # correctly against whatever boundary this collapse leaves, degenerate or not). Left as is;
+        # revisit only with a concrete reachable repro, not a hand-traced hypothetical one.
         if right < 0:
             right = nb - 1
         if left < 0:
@@ -192,6 +206,20 @@ def cycle_step(nbr: wp.array[wp.int32], m: wp.int32, i: wp.int32, step: wp.int32
     # explicit direction rather than a ``+1`` and a ``-1`` copy that differed only in their wrap
     # guard -- the fan optimizer removes slots as it goes, so both directions have to skip holes
     # and the skipping is the whole body.
+    #
+    # This is called from `edge_removal_weight` inside `build_local_triangulations`'s O(m) x O(m)
+    # greedy removal loop, so an adversarial removal order (long runs of dead slots) makes one call
+    # O(m) and the whole loop O(m^3) against the O(m^2) shape it otherwise implies -- an
+    # incrementally-maintained doubly-linked `prev`/`next` pair would cap it at O(1)/O(m^2).
+    # Measured instead of assumed
+    # (`benchmarks/test_reconstruction.py::test_triangulate_point_cloud`'s own cloud,
+    # `num_neighbours` swept 8/16/32/64 at fixed point count, RTX 5090, device time only): the
+    # kernel's own cost scales 3.5-4.05x per doubling of `m`, matching the O(m^2) shape the loop
+    # nominally has, not the O(m^3) worst case -- so on this ordinary point cloud, the walk is not
+    # hitting long dead-slot runs and the doubly-linked rewrite would buy little. `m` is capped at
+    # `MAX_NEIGHBOURS` regardless, bounding the absolute worst case. Declined; re-measure before
+    # reopening this if a future caller's removal pattern looks different (e.g. a very anisotropic
+    # or highly clustered cloud).
     j = i
     for _ in range(m):
         j = j + step
@@ -273,14 +301,15 @@ def edge_removal_weight(
     b = points[bv]
     c = points[cv]
     d = points[dv]
+    ab = b - a
+    ac = c - a
+    ad = d - a
 
-    ac_length_sq = wp.length_sq(a - c)
+    ac_length_sq = wp.length_sq(ac)
     if (
-        ac_length_sq > wp.length_sq(b - a)
-        and triangle_aspect_ratio(a, b, c) > CRITICAL_ASPECT_RATIO
+        ac_length_sq > wp.length_sq(ab) and triangle_aspect_ratio(a, b, c) > CRITICAL_ASPECT_RATIO
     ) or (
-        ac_length_sq > wp.length_sq(d - a)
-        and triangle_aspect_ratio(a, c, d) > CRITICAL_ASPECT_RATIO
+        ac_length_sq > wp.length_sq(ad) and triangle_aspect_ratio(a, c, d) > CRITICAL_ASPECT_RATIO
     ):
         # degenerate triangle, longest edge -> remove as fast as possible
         return wp.vec2(FLOAT32_INF_CONSTANT, 0.0)
@@ -307,16 +336,18 @@ def edge_removal_weight(
     if angle_prof > 0.0:
         weight += angle_prof
 
-    norm_val = wp.length(c - a)
+    # ``ac_length_sq`` is already the squared norm of ``ac`` (computed above for the aspect-ratio
+    # guard), so its square root is ``norm_val`` -- no need for a second length computation.
+    norm_val = wp.sqrt(ac_length_sq)
     if norm_val == 0.0:
         return wp.vec2(FLOAT32_INF_CONSTANT, 0.0)
-    plane_dist = wp.abs(wp.dot(n_center, c - a))
+    plane_dist = wp.abs(wp.dot(n_center, ac))
     weight += plane_dist / norm_val
 
     # trusted-normal agreement bonuses
     c_norm = normals[cv]
     weight += 5.0 * (1.0 - wp.dot(n_center, c_norm))
-    tri_norm = wp.normalize(wp.cross(b - a, c - a) + wp.cross(c - a, d - a))
+    tri_norm = wp.normalize(wp.cross(ab, ac) + wp.cross(ac, ad))
     tri_norm_weight = wp.dot(tri_norm, c_norm)
     if tri_norm_weight < 0.0:
         return wp.vec2(FLOAT32_INF_CONSTANT, 0.0)
@@ -370,6 +401,10 @@ def build_local_triangulations(
     m = wp.int32(0)
     for i in range(k):
         if m >= MAX_NEIGHBOURS:
+            # Silent truncation, not a check: this file cannot itself raise (CLAUDE.md section 1.4)
+            # if the caller's ``max_neighbours`` violated the module-level invariant. The wrapper's
+            # ``max_neighbours > MAX_NEIGHBOURS`` guard is what makes this branch unreachable at
+            # the public entry point; a direct launch of this kernel bypasses it.
             break
         nb = neighbor_idx[v, i]
         if nb < 0 or nb == v:
@@ -427,16 +462,30 @@ def build_local_triangulations(
             nbr[i] = nbr[mn]
             nbr[mn] = tn
 
-    # --- boundary detection: first angular gap wider than boundary_angle ---
+    # --- boundary detection: angular gaps wider than boundary_angle ---
     border = wp.int32(-1)
+    gap_count = wp.int32(0)
     for i in range(m):
         if i + 1 < m:
             diff = ang[i + 1] - ang[i]
         else:
             diff = ang[0] + TWO_PI - ang[i]
         if diff > boundary_angle:
-            border = nbr[i]
-            break
+            gap_count += 1
+            if border < 0:
+                border = nbr[i]
+    if gap_count > 1:
+        # Two or more disjoint gaps: this point sits between separate regions of the cloud (a thin
+        # bridge/peninsula, or a point equidistant from two disjoint holes). `border` can only ever
+        # mark one gap, so the others would read as ordinary interior edges below, and a spurious
+        # triangle could bridge the two disconnected regions across an unregistered gap. Rather than
+        # guess which one to keep, this point's fan contributes no triangle this round -- a real fix
+        # needs the fan to carry more than one boundary marker (or split into multiple arcs), which
+        # is a redesign of the boundary representation this function does not attempt. Leaving a
+        # point untriangulated is an accepted outcome elsewhere in the reconstruction pipeline (a
+        # confirmed triangle needs two of its three vertices' fans to agree, so no single point's
+        # fan is required to succeed), and `crit_hole_length` fills the small holes this leaves.
+        return
 
     # --- greedy fan optimisation (linear-scan replacement of the priority queue) ---
     current = m  # inherits m's dynamic-variable type (m is already mutable)
@@ -475,6 +524,12 @@ def build_local_triangulations(
         nxt = cycle_next(nbr, m, i)
         if nxt == i:
             continue
+        if border < 0 and nbr[i] > nbr[nxt] and cycle_prev(nbr, m, i) == nxt:
+            # No boundary gap and exactly two live neighbours remain: the ring is a 2-cycle, so
+            # ``prev(i) == next(i)`` and this wedge and (nxt, i)'s wedge describe the identical
+            # triangle (there is no third live neighbour to make them distinct). Emit it once, from
+            # the lower-indexed neighbour, rather than writing it twice.
+            continue
         bidx = nbr[i]
         cidx = nbr[nxt]
         pb = points[bidx]
@@ -488,19 +543,6 @@ def build_local_triangulations(
             out_tris[v, slot, 2] = cidx
             out_valid[v, slot] = True
             slot += 1
-
-
-# --------------------------------------------------------------------------------------
-# Canonical (sorted) triangle key + oriented copy, for repeated-triangle dedup
-# --------------------------------------------------------------------------------------
-@wp.kernel
-def canonicalize_triangles(tris: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int32]) -> None:
-    t = wp.int32(wp.tid())
-    # sort the three indices ascending (unoriented key)
-    i, j, k = sort3(tris[t, 0], tris[t, 1], tris[t, 2])
-    out_sorted[t, 0] = i
-    out_sorted[t, 1] = j
-    out_sorted[t, 2] = k
 
 
 # ======================================================================================
@@ -581,7 +623,11 @@ def splat_normals(
     weight = wp.float32(1.0)
     if confidence != 0:
         weight = length
-    n = wp.normalize(n)  # unit direction; magnitude carried by ``weight``
+    # Unit direction, reusing ``length`` instead of ``wp.normalize``'s own redundant sqrt; a zero
+    # vector's length is already zero, so it is left unchanged -- the same zero-vector result
+    # ``wp.normalize`` gives that input (magnitude is carried separately by ``weight``).
+    if length > 0.0:
+        n = n / length
 
     g = (points[s] - cube_lower) * inv_cell
     base, next_corner, fractions = trilinear_cell(g, wp.vec3i(res, res, res))
@@ -598,18 +644,17 @@ def splat_normals(
                 wp.atomic_add(out_w, idx, w)
 
 
-@wp.kernel(enable_backward=False)
-def normalize_vector_field(
-    weights: wp.array[wp.float32],
-    out_vx: wp.array[wp.float32],
-    out_vy: wp.array[wp.float32],
-    out_vz: wp.array[wp.float32],
-) -> None:
-    idx = wp.int32(wp.tid())
+@wp.func
+def normalized_field_component(
+    field: wp.array[wp.float32], weights: wp.array[wp.float32], idx: wp.int32
+) -> wp.float32:
+    # One splatted vector-field component divided by its own density weight -- the per-element
+    # operation `normalize_vector_field` used to do as a separate pass. Kept as a `@wp.func` (not a
+    # standalone kernel) so `negative_divergence` can read a normalized value at each of its six
+    # neighbour offsets directly, rather than reading back a value a prior launch wrote: see the
+    # measurement on ``negative_divergence`` below.
     inv = 1.0 / wp.max(weights[idx], POISSON_WEIGHT_EPS)
-    out_vx[idx] = out_vx[idx] * inv
-    out_vy[idx] = out_vy[idx] * inv
-    out_vz[idx] = out_vz[idx] * inv
+    return field[idx] * inv
 
 
 @wp.kernel(enable_backward=False)
@@ -617,27 +662,67 @@ def negative_divergence(
     vx: wp.array[wp.float32],
     vy: wp.array[wp.float32],
     vz: wp.array[wp.float32],
+    weights: wp.array[wp.float32],
     res: wp.int32,
     out_b: wp.array[wp.float32],
 ) -> None:
     i, j, k = wp.tid()
     # Central differences in index space; one-sided at the grid boundary (denominator 1 there).
+    # That denominator is 0, not 1, at res == 1 (every axis's clamp collapses to ip == im), but
+    # reconstruction.screened_poisson validates 3 <= full_depth <= depth <= 10, so the smallest
+    # reachable grid is res = 2**3 + 1 = 9 and no caller in the tree reaches res == 1. Not guarded
+    # here per CLAUDE.md section 4.2 ("no speculative generality") -- add a guard only if a future
+    # caller can legitimately reach res == 1.
     ip = wp.min(i + 1, res - 1)
     im = wp.max(i - 1, 0)
     jp = wp.min(j + 1, res - 1)
     jm = wp.max(j - 1, 0)
     kp = wp.min(k + 1, res - 1)
     km = wp.max(k - 1, 0)
+    # Normalized in place here rather than by a separate `normalize_vector_field` pass over the
+    # whole grid: that pass measured 5.93% of screened_poisson's device time at the default depth=8
+    # (RTX 5090), almost all of it the extra launch plus a full res**3-element write-back of
+    # vx/vy/vz that this function immediately reads back at six neighbour offsets anyway. Fusing
+    # removes one launch and that write-back, at the cost of reading `weights` at the same six
+    # offsets instead of once per node -- a real trade given six values are already read here per
+    # component. `normalized_field_component` reproduces the deleted pass's exact
+    # `field[idx] * (1.0 / max(weight, eps))` operation (a multiply by the reciprocal, not a divide)
+    # so the result is bit-identical to computing it as a separate pass first.
     dx = (
-        vx[poisson_grid_index(ip, j, k, res)] - vx[poisson_grid_index(im, j, k, res)]
+        normalized_field_component(vx, weights, poisson_grid_index(ip, j, k, res))
+        - normalized_field_component(vx, weights, poisson_grid_index(im, j, k, res))
     ) / wp.float32(ip - im)
     dy = (
-        vy[poisson_grid_index(i, jp, k, res)] - vy[poisson_grid_index(i, jm, k, res)]
+        normalized_field_component(vy, weights, poisson_grid_index(i, jp, k, res))
+        - normalized_field_component(vy, weights, poisson_grid_index(i, jm, k, res))
     ) / wp.float32(jp - jm)
     dz = (
-        vz[poisson_grid_index(i, j, kp, res)] - vz[poisson_grid_index(i, j, km, res)]
+        normalized_field_component(vz, weights, poisson_grid_index(i, j, kp, res))
+        - normalized_field_component(vz, weights, poisson_grid_index(i, j, km, res))
     ) / wp.float32(kp - km)
     out_b[poisson_grid_index(i, j, k, res)] = -(dx + dy + dz)
+
+
+@wp.func
+def poisson_neighbor_degree(i: wp.int32, j: wp.int32, k: wp.int32, res: wp.int32) -> wp.float32:
+    # Number of (i, j, k)'s up-to-6 axis-aligned grid neighbours that lie inside [0, res) -- the
+    # diagonal degree of the homogeneous-Neumann 7-point Poisson stencil. Shared so
+    # ``screened_laplacian_matvec``'s operator and ``screened_inverse_diagonal``'s Jacobi
+    # preconditioner can never disagree about which grid nodes are boundary nodes.
+    deg = wp.float32(0.0)
+    if i + 1 < res:
+        deg += 1.0
+    if i - 1 >= 0:
+        deg += 1.0
+    if j + 1 < res:
+        deg += 1.0
+    if j - 1 >= 0:
+        deg += 1.0
+    if k + 1 < res:
+        deg += 1.0
+    if k - 1 >= 0:
+        deg += 1.0
+    return deg
 
 
 @wp.kernel(enable_backward=False)
@@ -655,25 +740,21 @@ def screened_laplacian_matvec(
     i, j, k = wp.tid()
     idx = poisson_grid_index(i, j, k, res)
     xc = x[idx]
-    deg = wp.float32(0.0)
+    deg = poisson_neighbor_degree(i, j, k, res)
+    # Same boundary test as ``poisson_neighbor_degree``, expanded to also gather the live
+    # neighbours' values -- the six bounds checks are free next to the six global loads they guard.
     acc = wp.float32(0.0)
     if i + 1 < res:
-        deg += 1.0
         acc += x[poisson_grid_index(i + 1, j, k, res)]
     if i - 1 >= 0:
-        deg += 1.0
         acc += x[poisson_grid_index(i - 1, j, k, res)]
     if j + 1 < res:
-        deg += 1.0
         acc += x[poisson_grid_index(i, j + 1, k, res)]
     if j - 1 >= 0:
-        deg += 1.0
         acc += x[poisson_grid_index(i, j - 1, k, res)]
     if k + 1 < res:
-        deg += 1.0
         acc += x[poisson_grid_index(i, j, k + 1, res)]
     if k - 1 >= 0:
-        deg += 1.0
         acc += x[poisson_grid_index(i, j, k - 1, res)]
     ax = (deg * xc - acc) + screen * weights[idx] * xc
     out_z[idx] = alpha * ax + beta * y[idx]
@@ -688,19 +769,7 @@ def screened_inverse_diagonal(
 ) -> None:
     i, j, k = wp.tid()
     idx = poisson_grid_index(i, j, k, res)
-    deg = wp.float32(0.0)
-    if i + 1 < res:
-        deg += 1.0
-    if i - 1 >= 0:
-        deg += 1.0
-    if j + 1 < res:
-        deg += 1.0
-    if j - 1 >= 0:
-        deg += 1.0
-    if k + 1 < res:
-        deg += 1.0
-    if k - 1 >= 0:
-        deg += 1.0
+    deg = poisson_neighbor_degree(i, j, k, res)
     d = deg + screen * weights[idx]
     if d <= 0.0:
         d = 1.0

@@ -691,7 +691,20 @@ def _rewrite_loops(
 def _compact_repeats(
     packed: wp.array[wp.int32], loop_offsets: wp.array[wp.int32], n_loops: int
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
-    """Drop positions repeating their cyclic predecessor, which a contracted spur leaves behind."""
+    """
+    Drop positions repeating their cyclic predecessor, which a contracted spur leaves behind.
+
+    Shares its resize-then-scatter-then-remap tail with
+    [`_rewrite_loops`][triwarp.geodesic_walk._rewrite_loops] (both call
+    ``counts_to_offsets``/allocate/launch/slice, then ``_offsets_through``), and the two are kept
+    separate rather than merged: this function has a legitimate optimization
+    ``_rewrite_loops`` does not need -- when ``total == n_positions`` (nothing was dropped) it
+    returns the original buffers unchanged instead of allocating and launching a no-op scatter. A
+    shared helper would either drop that optimization or need an early-exit signal threaded back
+    through it, which is more machinery than the handful of duplicated lines are worth
+    (CLAUDE.md section 2.4: "merge on identity of meaning, not identity of tokens" -- two different
+    amounts of control flow around one similarly-shaped call is not one function).
+    """
     device = packed.device
     n_positions = int(packed.shape[0])
     if n_positions == 0:

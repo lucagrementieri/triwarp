@@ -1,5 +1,6 @@
 import warp as wp
 
+from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels.array import pack_edge_key
 from triwarp.kernels.predicates import vector_angle
 from triwarp.kernels.triangles import corner_triple
@@ -176,8 +177,16 @@ def face_adjacency_projections(
     out_projections: wp.array[wp.float32],
 ) -> None:
     tid = wp.int32(wp.tid())
+    vid_other = face_adjacency_unshared[tid, 1]
+    # ``face_adjacency_unshared`` writes -1 for a degenerate second face (it does not have exactly
+    # one vertex off the shared edge), and that sentinel is not a valid index into ``vertices`` --
+    # reading it would be the out-of-bounds access CLAUDE.md's memory-safety rule forbids. There is
+    # no meaningful projection for a degenerate face, so it reports as never locally convex
+    # (+inf is never < TOLERANCE_MERGE) rather than being read as an arbitrary finite value.
+    if vid_other < wp.int32(0):
+        out_projections[tid] = FLOAT32_INF_CONSTANT
+        return
     normal = face_normals[face_adjacency[tid, 0]]
     origin = vertices[face_adjacency_edges[tid, 0]]
-    vid_other = face_adjacency_unshared[tid, 1]
     vector_other = vertices[vid_other] - origin
     out_projections[tid] = wp.dot(vector_other, normal)

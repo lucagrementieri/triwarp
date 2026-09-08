@@ -550,12 +550,16 @@ def face_adjacency_projections(
     -------
     wp.array[wp.float32]
         Length ``m`` projections on ``faces.device``, one per ``face_adjacency``
-        row. Empty when there are no faces or no adjacency pairs.
+        row. Empty when there are no faces or no adjacency pairs. A row whose second face is
+        degenerate (its
+        [`face_adjacency_unshared`][triwarp.adjacency.face_adjacency_unshared] entry is ``-1``)
+        reads as ``+inf``, so it never registers as convex.
 
     Raises
     ------
     ValueError
-        If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided.
+        If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided, or if a
+        supplied ``face_adjacency_unshared`` has a different row count from ``face_adjacency``.
     RuntimeError
         If ``vertices``, ``faces``, ``face_adjacency``, ``face_adjacency_edges``,
         ``face_adjacency_unshared`` and ``face_normals`` are not all on one device.
@@ -591,17 +595,23 @@ def face_adjacency_projections(
             faces, return_edges=True, n_vertices=int(vertices.shape[0])
         )
     assert face_adjacency_edges is not None
+    m = int(face_adjacency.shape[0])
+    if m == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
 
     if face_adjacency_unshared is None:
         face_adjacency_unshared = tw.adjacency.face_adjacency_unshared(
             faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
         )
+    elif int(face_adjacency_unshared.shape[0]) != m:
+        # A caller-supplied table is otherwise trusted as-is; the kernel below indexes it at every
+        # row up to ``m``, so a shorter table is an out-of-bounds read rather than a wrong answer.
+        raise ValueError(
+            "face_adjacency_unshared row count must match face_adjacency, got "
+            f"{face_adjacency_unshared.shape[0]} and {m}."
+        )
     if face_normals is None:
         face_normals, _ = tw.triangles.face_normals_and_areas(vertices, faces)
-
-    m = int(face_adjacency.shape[0])
-    if m == 0:
-        return wp.empty(0, dtype=wp.float32, device=device)
 
     out_projections = wp.empty(m, dtype=wp.float32, device=device)
     wp.launch(
@@ -664,7 +674,10 @@ def face_adjacency_convex(
     Raises
     ------
     ValueError
-        If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided.
+        If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided, or if a
+        supplied ``face_adjacency_unshared`` has a different row count from ``face_adjacency``
+        (raised by [`face_adjacency_projections`][triwarp.adjacency.face_adjacency_projections],
+        which this function delegates to).
     RuntimeError
         If ``vertices``, ``faces``, ``face_adjacency``, ``face_adjacency_edges``,
         ``face_adjacency_unshared`` and ``face_normals`` are not all on one device.

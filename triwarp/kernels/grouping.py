@@ -2,7 +2,6 @@ import warp as wp
 
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import OverloadTable
-from triwarp.kernels.triangles import row_triple
 
 
 @wp.kernel
@@ -292,16 +291,6 @@ def round_vec3_scaled(
     out_rounded[tid, 0] = wp.int32(wp.round(v[0]))
     out_rounded[tid, 1] = wp.int32(wp.round(v[1]))
     out_rounded[tid, 2] = wp.int32(wp.round(v[2]))
-
-
-@wp.kernel
-def sort_face_indices(faces: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int32]) -> None:
-    tid = wp.int32(wp.tid())
-    i0, i1, i2 = row_triple(faces, tid)
-    s0, s1, s2 = kernel_array.sort3(i0, i1, i2)
-    out_sorted[tid, 0] = s0
-    out_sorted[tid, 1] = s1
-    out_sorted[tid, 2] = s2
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in

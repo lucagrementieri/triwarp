@@ -37,6 +37,7 @@ from triwarp._device import read_scalar, require_same_device
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels import remesh as kernel_remesh
+from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
 if TYPE_CHECKING:
@@ -326,7 +327,7 @@ def _repeated_oriented_triangles(
 
     sorted_keys = twt.empty_2d((n_candidates, 3), wp.int32, device=device)
     wp.launch(
-        kernel_reconstruction.canonicalize_triangles,
+        kernel_triangles.sort_face_indices,
         dim=n_candidates,
         inputs=[candidates, sorted_keys],
         device=device,
@@ -411,7 +412,7 @@ def screened_poisson(
         depth from ``full_depth`` to ``depth``.
     scale
         Ratio between the reconstruction cube's side and the point cloud's largest bounding-box
-        extent (``> 0``); ``1.1`` pads the cloud by 10 %.
+        extent (``>= 1``, so the cube always contains the cloud); ``1.1`` pads the cloud by 10 %.
     point_weight
         Screening weight ``alpha`` tying the iso-surface to the input samples. ``0`` recovers the
         unscreened Poisson reconstruction (a tiny epsilon is still added to keep the operator SPD).
@@ -485,8 +486,12 @@ def screened_poisson(
             "screened_poisson requires 3 <= full_depth <= depth <= 10, got "
             f"full_depth={full_depth}, depth={depth}."
         )
-    if scale <= 0.0:
-        raise ValueError(f"screened_poisson requires scale > 0, got {scale}.")
+    if scale < 1.0:
+        # A cube smaller than the cloud's own bounding box leaves points outside
+        # ``[cube_lower, cube_upper]``; the grid samplers clamp their cell index into range rather
+        # than raising, so those points would silently splat onto the boundary node instead of
+        # being rejected or the cube being grown.
+        raise ValueError(f"screened_poisson requires scale >= 1, got {scale}.")
     if method not in ("dense", "adaptive"):
         raise ValueError(f"screened_poisson method must be 'dense' or 'adaptive', got {method!r}.")
 
@@ -699,17 +704,11 @@ def _poisson_solve_level(
         ],
         device=device,
     )
-    wp.launch(
-        kernel_reconstruction.normalize_vector_field,
-        dim=n_nodes,
-        inputs=[weights, vx, vy, vz],
-        device=device,
-    )
     rhs = wp.empty(n_nodes, dtype=wp.float32, device=device)
     wp.launch(
         kernel_reconstruction.negative_divergence,
         dim=(res, res, res),
-        inputs=[vx, vy, vz, res, rhs],
+        inputs=[vx, vy, vz, weights, res, rhs],
         device=device,
     )
     inv_diag = wp.empty(n_nodes, dtype=wp.float32, device=device)

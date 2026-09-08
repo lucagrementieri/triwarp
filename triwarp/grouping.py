@@ -13,6 +13,7 @@ from triwarp._device import read_scalar
 from triwarp.array import bitcast_from_int, bitcast_to_int, gather, sort_pair_indices
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
+from triwarp.kernels import triangles as kernel_triangles
 
 Scalar = TypeVar("Scalar", bound=wp.Scalar)
 
@@ -491,7 +492,7 @@ def unique_faces(
     faces2d = faces.reshape((-1, 3))
     sorted_faces = twt.empty_2d((n_faces, 3), wp.int32, device=device)
     wp.launch(
-        kernel_grouping.sort_face_indices,
+        kernel_triangles.sort_face_indices,
         dim=n_faces,
         inputs=[faces2d, sorted_faces],
         device=device,

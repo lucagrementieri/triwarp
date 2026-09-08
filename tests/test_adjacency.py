@@ -659,6 +659,72 @@ def test_face_adjacency_projections_empty(device: str) -> None:
     assert projections_wp.shape == (0,)
 
 
+def test_face_adjacency_projections_degenerate_second_face(device: str) -> None:
+    """
+    A degenerate second face's ``-1`` ``face_adjacency_unshared`` entry must not read out of bounds.
+
+    ``vertices[-1]`` would otherwise be read (CLAUDE.md section 12.1); the row reports as ``+inf``
+    instead, so it never registers as locally convex.
+    """
+    vertices_wp = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        dtype=wp.vec3,
+        device=device,
+    )
+    faces_wp = wp.array(np.array([0, 1, 2, 1, 2, 0], dtype=np.int32), dtype=wp.int32, device=device)
+    adjacency_wp = twt.as_array2d(
+        wp.array(np.array([[0, 1]], dtype=np.int32), device=device), wp.int32
+    )
+    adjacency_edges_wp = twt.as_array2d(
+        wp.array(np.array([[1, 2]], dtype=np.int32), device=device), wp.int32
+    )
+    unshared_wp = twt.as_array2d(
+        wp.array(np.array([[0, -1]], dtype=np.int32), device=device), wp.int32
+    )
+    projections_wp = tw.adjacency.face_adjacency_projections(
+        vertices_wp,
+        faces_wp,
+        face_adjacency=adjacency_wp,
+        face_adjacency_edges=adjacency_edges_wp,
+        face_adjacency_unshared=unshared_wp,
+    )
+    assert np.isposinf(projections_wp.numpy()[0])
+
+    convex_wp = tw.adjacency.face_adjacency_convex(
+        vertices_wp,
+        faces_wp,
+        face_adjacency=adjacency_wp,
+        face_adjacency_edges=adjacency_edges_wp,
+        face_adjacency_unshared=unshared_wp,
+    )
+    assert not bool(convex_wp.numpy()[0])
+
+
+def test_face_adjacency_projections_unshared_length_mismatch_raises(device: str) -> None:
+    """A caller-supplied ``face_adjacency_unshared`` shorter than ``face_adjacency`` must raise."""
+    vertices_wp = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        dtype=wp.vec3,
+        device=device,
+    )
+    faces_wp = wp.array(np.array([0, 1, 2, 1, 2, 0], dtype=np.int32), dtype=wp.int32, device=device)
+    adjacency_wp = twt.as_array2d(
+        wp.array(np.array([[0, 1]], dtype=np.int32), device=device), wp.int32
+    )
+    adjacency_edges_wp = twt.as_array2d(
+        wp.array(np.array([[1, 2]], dtype=np.int32), device=device), wp.int32
+    )
+    empty_unshared_wp = twt.empty_2d((0, 2), wp.int32, device=device)
+    with pytest.raises(ValueError, match="row count must match"):
+        tw.adjacency.face_adjacency_projections(
+            vertices_wp,
+            faces_wp,
+            face_adjacency=adjacency_wp,
+            face_adjacency_edges=adjacency_edges_wp,
+            face_adjacency_unshared=empty_unshared_wp,
+        )
+
+
 @pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
 @pytest.mark.parity("face_adjacency_convex", "trimesh")
 def test_face_adjacency_convex(request: pytest.FixtureRequest, mesh_name: str) -> None:

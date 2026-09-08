@@ -207,6 +207,27 @@ def hessian_corner_gradients(
     out_gradients[f * 3 + 2] = g2
 
 
+@wp.func
+def triangle_geometry_f64(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32
+) -> tuple[wp.float64, wp.float64, wp.float64, wp.float64]:
+    """
+    Squared edge lengths and twice the area of face ``f``, promoted to ``float64``.
+
+    The shared geometry preamble of [`voronoi_mass`][triwarp.kernels.energies.voronoi_mass],
+    [`internal_angles_and_sums`][triwarp.kernels.energies.internal_angles_and_sums] and
+    [`curved_hessian_triplets`][triwarp.kernels.energies.curved_hessian_triplets] -- all three load
+    a face's vertices, its three squared edge lengths and its double area before doing their own,
+    unrelated per-corner computation with them. ``squared_edge_lengths`` and
+    ``triangle_double_area`` have no data dependency on each other, so factoring their call order
+    into one place changes neither result; only the caller-specific math after this stays apart.
+    """
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
+    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
+    dbl_area = triangle_double_area(v0, v1, v2)
+    return l2_0, l2_1, l2_2, dbl_area
+
+
 @wp.kernel
 def voronoi_mass(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_mass: wp.array[wp.float64]
@@ -215,9 +236,7 @@ def voronoi_mass(
     # non-obtuse triangles, the 1/2 : 1/4 : 1/4 split on obtuse ones (the obtuse corner gets the
     # half). A degenerate face contributes nothing (igl would emit NaN).
     f = wp.int32(wp.tid())
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
-    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
-    dbl_area = triangle_double_area(v0, v1, v2)
+    l2_0, l2_1, l2_2, dbl_area = triangle_geometry_f64(vertices, faces, f)
     if dbl_area <= wp.float64(0.0):
         return
     cos0, cos1, cos2 = corner_cosines_from_l2(l2_0, l2_1, l2_2)
@@ -339,10 +358,9 @@ def internal_angles_and_sums(
     # separate kernel: it emits no angle sums, takes its third angle as ``PI - a0 - a1``, and zeroes
     # all three angles of a degenerate face instead of letting the acos clamp report 0 / pi.
     f = wp.int32(wp.tid())
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
-    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
+    l2_0, l2_1, l2_2, dbl_area = triangle_geometry_f64(vertices, faces, f)
     zero = wp.float64(0.0)
-    if triangle_double_area(v0, v1, v2) <= zero:
+    if dbl_area <= zero:
         # A coincident-vertex edge (not merely a thin sliver) drives ``corner_cosines_from_l2``'s
         # law-of-cosines division to a genuine 0/0 for the two corners touching it -- ``wp.acos``'s
         # clamp rescues a finite-but-out-of-[-1,1] cosine, not a NaN, and ``add_corner_triple``
@@ -504,8 +522,7 @@ def curved_hessian_triplets(
     f = wp.int32(wp.tid())
     zero = wp.float64(0.0)
     base_out = f * 144
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
-    dbl_area = triangle_double_area(v0, v1, v2)
+    l2_0, l2_1, l2_2, dbl_area = triangle_geometry_f64(vertices, faces, f)
     if dbl_area <= zero:
         # Padding must be a hole, not a value: -1 is out of range for ``bsr_from_triplets``'s
         # ``(n_vertices, n_vertices)`` build and is silently dropped, where row/col 0 would collide
@@ -516,8 +533,7 @@ def curved_hessian_triplets(
             out_cols[base_out + empty] = -1
             out_vals[base_out + empty] = type(out_vals[0])(0.0)
         return
-    # Squared edge lengths, column e opposite corner e (the igl intrinsic convention).
-    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
+    # l2_0/l2_1/l2_2: column e opposite corner e (the igl intrinsic convention).
     # Curvature ingredients per corner c: scaledKappa(F(f,c)) * theta(f,c).
     kv0 = scaled_kappa[faces[f * 3 + 0]] * angles[f, 0]
     kv1 = scaled_kappa[faces[f * 3 + 1]] * angles[f, 1]

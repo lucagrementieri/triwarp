@@ -466,7 +466,8 @@ def oriented_bounding_box(
     The **refinement phase** then takes the best-scoring candidates from up to four mutually distant
     basins and runs ``refine_iterations`` trust-region rounds around each: every round scores a
     low-discrepancy ball of perturbed frames whose angular radius starts at the global grid's
-    covering radius and halves per round, keeping each chain's best. Refinement is monotone (each
+    covering radius and shrinks by a factor of 0.4 per round, keeping each chain's best. Refinement
+    is monotone (each
     chain re-scores its own base), so the answer is never worse than the global phase's and never
     worse than [`aabb`][triwarp.bounds.aabb]; with ``refine_iterations=0`` and ``rotations=1`` it
     reproduces the axis-aligned box exactly.
