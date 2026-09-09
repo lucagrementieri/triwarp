@@ -13,6 +13,7 @@ import warp as wp
 from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
 from triwarp.kernels.array import (
     lattice_position,
+    ravel_index,
     trilinear_cell,
     trilinear_corner,
     trilinear_weight,
@@ -563,7 +564,7 @@ POISSON_WEIGHT_EPS = wp.constant(wp.float32(1e-8))
 @wp.func
 def poisson_grid_index(i: wp.int32, j: wp.int32, k: wp.int32, res: wp.int32) -> wp.int32:
     # Row-major flat index into a res**3 node grid (cube: ny = nz = res).
-    return (i * res + j) * res + k
+    return ravel_index(i, j, k, res, res)
 
 
 @wp.func

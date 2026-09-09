@@ -100,7 +100,8 @@ def procrustes(
     RuntimeError
         If ``a``, ``b`` and ``weights`` are not all on one device.
     ValueError
-        If ``b`` (or a non-empty ``weights``) does not have the same length as ``a``.
+        If ``b`` (or a non-empty ``weights``) does not have the same length as ``a``, or a
+        non-empty ``weights`` sums to zero.
 
     Notes
     -----
@@ -128,6 +129,14 @@ def procrustes(
         if not return_cost:
             return matrix
         return matrix, wp.clone(a), 0.0
+
+    # An all-zero non-empty ``weights`` divides by zero inside the kernel (the accumulated weight
+    # sum is the denominator of every centroid and, with ``scale=True``, of the singular values
+    # too), silently returning a matrix of NaN with no exception. ``icp`` avoids this by checking
+    # the same sum itself and breaking its loop before ever reaching the shared machinery below --
+    # this entry point has no loop to break, so it raises instead.
+    if weights is not None and int(weights.shape[0]) == n and float(tw.reduce.sum(weights)) == 0.0:
+        raise ValueError("weights sum to zero: no point carries any weight")
 
     workspace = _procrustes_workspace(n, device, return_cost=return_cost)
     return _procrustes_into(a, b, weights, reflection, translation, scale, return_cost, workspace)
@@ -539,6 +548,7 @@ def icp_point_to_plane(
     jtj = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
     jtr = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     cost_acc = wp.zeros(1, dtype=wp.float32, device=device)
+    weight_sum_acc = wp.zeros(1, dtype=wp.float32, device=device)
     step = wp.empty(1, dtype=wp.mat44, device=device)
     updated = wp.empty(n, dtype=wp.vec3, device=device)
     total = wp.clone(initial_matrix)
@@ -592,6 +602,7 @@ def icp_point_to_plane(
         jtj.zero_()
         jtr.zero_()
         cost_acc.zero_()
+        weight_sum_acc.zero_()
         wp.launch_tiled(
             kernel_registration.accumulate_point_to_plane,
             dim=kernel_reduce.blocks_1d(n),
@@ -607,10 +618,27 @@ def icp_point_to_plane(
                 jtj,
                 jtr,
                 cost_acc,
+                weight_sum_acc,
             ],
             block_dim=TILE_1D,
             device=device,
         )
+
+        # --- bail out once every in-range correspondence's own robust weight collapsed to zero ---
+        # The ``valid`` guard above only catches a correspondence rejected by *distance*; a Tukey
+        # kernel can drive every remaining correspondence's weight to exactly zero on its own
+        # (``|residual| >= scale``, reachable through an explicit ``robust_scale`` too tight for the
+        # residual distribution, or an earlier iteration's step overshooting far past what a
+        # first-iteration-derived scale anticipated) while ``residual_valid`` -- and so ``valid`` --
+        # still accepts every one of them. Without this, ``jtj``/``jtr`` stay exactly zero, the
+        # damped solve returns a near-identity step, and ``cost`` reads ``0.0`` -- indistinguishable
+        # from a perfect fit -- for the rest of the run. Reproduced with
+        # ``robust_kernel="tukey", robust_scale=1e-9``: every residual exceeds so tight a scale, and
+        # the loop returned the identity transform with ``cost=0.0`` on a cloud still offset by
+        # (1.0, 0.5, -0.3) from its target.
+        if float(read_scalar(weight_sum_acc, 0)) <= 0.0:
+            break
+
         wp.launch(
             kernel_registration.solve_point_to_plane,
             dim=1,

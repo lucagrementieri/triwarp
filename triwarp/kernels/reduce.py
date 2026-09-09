@@ -826,6 +826,17 @@ def outer_sum_chunk(
     return m
 
 
+# The "componentwise ``wp.tile_sum`` reductions, then one lane-0-guarded atomic commit" skeleton
+# that reads ``tile_chunk``/``outer_sum_chunk``'s partial sums out is itself hand-written at three
+# call sites with no shared helper: ``points.centered_covariance`` (9 scalars, above),
+# ``registration.accumulate_procrustes_moments`` (25) and ``accumulate_point_to_plane`` (43). Left
+# unmerged: each loop is over a different fixed component count with no common shape cheap to
+# generalize over (Warp has no variadic tile reduction, so a shared helper would need to take an
+# arbitrary tuple of scalar/vector/matrix quantities), which is more speculative machinery than
+# three call sites justify (CLAUDE.md section 4.2, "no speculative generality"). Revisit if a
+# fourth accumulator of this shape appears.
+
+
 @wp.kernel
 def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.float32]) -> None:
     # Component-wise min and max of a ``wp.vec3`` array, in one launch into one buffer.

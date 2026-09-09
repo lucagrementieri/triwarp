@@ -160,6 +160,18 @@ def estimate_point_normals(
 ) -> None:
     # Per-point normal = eigenvector of the smallest eigenvalue of the neighbourhood
     # covariance (the same choice Open3D's FastEigen3x3 makes).
+    #
+    # ``neighbor_idx``'s shape is validated by the caller, but a value ``>= points.shape[0]`` is
+    # not -- indexing ``points[nb]`` below then reads out of bounds with no exception on CUDA and
+    # corrupts the host heap on CPU (CLAUDE.md section 12.1). Every in-repo caller
+    # (``points.estimate_normals``) builds this table from a *self*-query
+    # (``query_nearest(points, points, k)``), which can only ever produce an in-range index or the
+    # documented ``-1`` sentinel already handled below, so the gap is latent rather than
+    # demonstrated. A guard would cost an unconditional device-wide min/max reduction over the
+    # whole table on every call, to protect against an input shape nothing currently constructs --
+    # the speculative-generality case CLAUDE.md section 4.2 asks to leave unbuilt. Revisit if a
+    # caller ever builds an asymmetric ``neighbor_idx`` (e.g. from
+    # ``query_nearest(other_cloud, points, k)``) for this kernel.
     v = wp.int32(wp.tid())
     k = neighbor_idx.shape[1]
 
@@ -251,6 +263,12 @@ def local_outlier_factor(
     #
     # The LoOP normalization factor lambda cancels here (it scales numerator and denominator
     # alike); it only enters through the cloud-wide nplof the caller divides by.
+    #
+    # Same latent gap as ``estimate_point_normals`` above: ``neighbor_idx[i, s]`` is trusted to be
+    # either ``-1`` or a valid row of ``standard_distance``, and nothing here bounds-checks it. The
+    # one in-repo caller (``points.outlier_probability``) only ever builds this table from a
+    # self-query, so this stays a documented, unguarded assumption rather than a demonstrated bug —
+    # see the longer note there for why a guard is not added speculatively.
     i = wp.int32(wp.tid())
     k = neighbor_idx.shape[1]
     total = wp.float32(0.0)

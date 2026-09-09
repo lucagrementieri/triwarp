@@ -1064,7 +1064,7 @@ def test_closest_point_on_edges_max_dist_and_degenerate(device: str) -> None:
     assert np.all(np.isinf(distance_wp.numpy()))
     assert np.all(edge_id_wp.numpy() == -1)
 
-    with pytest.raises(ValueError, match="two columns"):
+    with pytest.raises(ValueError, match="shape \\(k, 2\\)"):
         tw.proximity.closest_point_on_edges(
             vertices_wp,
             twt.as_array2d(wp.zeros((2, 3), dtype=wp.int32, device=device), wp.int32),

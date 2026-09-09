@@ -152,8 +152,10 @@ def faces_left_of_contour(
 
     Raises
     ------
+    TypeError
+        If ``contour_edges`` is not a rank-2 ``wp.int32`` array.
     ValueError
-        If ``contour_edges`` is not a rank-2 ``wp.int32`` array with two columns.
+        If ``contour_edges`` does not have two columns.
     RuntimeError
         If ``faces``, ``contour_edges`` and ``twins`` are not all on one device.
 
@@ -175,9 +177,7 @@ def faces_left_of_contour(
         Turns the returned mask into a mesh.
     """
     require_same_device(faces=faces, contour_edges=contour_edges, twins=twins)
-    twt.ensure_ndim(contour_edges, 2, dtype=wp.int32)
-    if int(contour_edges.shape[1]) != 2:
-        raise ValueError(f"contour_edges must have shape (k, 2), got {contour_edges.shape}")
+    twt.ensure_edge_pairs(contour_edges, "contour_edges")
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     left = wp.zeros(n_faces, dtype=wp.bool, device=device)

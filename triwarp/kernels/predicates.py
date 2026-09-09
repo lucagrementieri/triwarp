@@ -214,6 +214,22 @@ def is_in_aabb(point: Any, min_bound: Any, max_bound: Any) -> wp.bool:
 
 
 @wp.func
+def is_strictly_inside_aabb(point: Any, min_bound: Any, max_bound: Any) -> wp.bool:
+    # The open-box twin of ``is_in_aabb`` above: every comparison is strict, so a point exactly on
+    # the boundary reports outside rather than inside. Same six-explicit-comparisons shape and the
+    # same reason -- a ``nan`` coordinate reports false either way, where a ``wp.min``-based
+    # shortcut would not.
+    return (
+        point[0] > min_bound[0]
+        and point[0] < max_bound[0]
+        and point[1] > min_bound[1]
+        and point[1] < max_bound[1]
+        and point[2] > min_bound[2]
+        and point[2] < max_bound[2]
+    )
+
+
+@wp.func
 def is_in_obb(point: Any, rotation: Any, min_bound: Any, max_bound: Any) -> wp.bool:
     # Is the point inside an oriented box, boundary included? Exactly ``is_in_aabb`` in box
     # coordinates -- ``rotation`` is the world-to-box frame whose *rows* are the box axes, the

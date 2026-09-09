@@ -190,6 +190,8 @@ def connected_component_labels_from_edges(
 
     Raises
     ------
+    TypeError
+        If ``edges`` is not a rank-2 ``int32`` array.
     ValueError
         If ``edges`` is not ``(m, 2)``, an endpoint is outside ``[0, node_count)``,
         or ``node_count`` is negative.
@@ -266,6 +268,8 @@ def connected_component_parity_from_edges(
 
     Raises
     ------
+    TypeError
+        If ``edges`` is not a rank-2 ``int32`` array.
     ValueError
         If ``edges`` is not ``(m, 2)``, ``signs`` is not length ``m``, ``node_count`` is
         negative, or (with ``validate``) an endpoint is out of range.
@@ -296,9 +300,7 @@ def connected_component_parity_from_edges(
     [`face_orientation_bits`][triwarp.validation.face_orientation_bits]
     """
     require_same_device(edges=edges, signs=signs)
-    twt.ensure_ndim(edges, 2, dtype=wp.int32)
-    if int(edges.shape[1]) != 2:
-        raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
+    twt.ensure_edge_pairs(edges, "edges")
     m = int(edges.shape[0])
     if int(signs.shape[0]) != m:
         raise ValueError(f"signs must have length {m} to match edges, got {int(signs.shape[0])}")
@@ -383,6 +385,8 @@ def successor_cycles(
 
     Raises
     ------
+    TypeError
+        If ``edges`` is not a rank-2 ``int32`` array.
     ValueError
         If ``edges`` is not ``(m, 2)``, ``node_count`` is negative, or (with ``validate``) an
         endpoint is out of range.
@@ -743,6 +747,8 @@ def bfs_from_edges(
 
     Raises
     ------
+    TypeError
+        If ``edges`` is not a rank-2 ``int32`` array.
     ValueError
         If ``edges`` is not ``(m, 2)``, an endpoint is outside ``[0, node_count)``, ``node_count``
         is negative, or ``source`` is out of range.
@@ -1079,9 +1085,7 @@ def _validate_edge_list(edges: twt.Array2dInt32, node_count: int | None, *, vali
     [`minmax`][triwarp.reduce.minmax] plus a host synchronization -- pass it from a caller that
     forwards the same edges to another checked entry point, so the reduction is not paid twice.
     """
-    twt.ensure_ndim(edges, 2, dtype=wp.int32)
-    if int(edges.shape[1]) != 2:
-        raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
+    twt.ensure_edge_pairs(edges, "edges")
 
     if node_count is None:
         return int(tw.array.index_bound(edges))

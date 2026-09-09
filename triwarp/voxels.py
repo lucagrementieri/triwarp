@@ -437,6 +437,14 @@ def pool_by_voxel(
             inputs=[slots, values, largest, pooled],
             device=device,
         )
+        # Only this branch needs it: an empty voxel's slot is seeded at +-inf and never touched by
+        # the atomic min/max above, so it has to be zeroed explicitly. The mean/sum branch below
+        # already writes every voxel (``segment_reduce_vec3`` initializes its running sum to zero
+        # and its loop is a no-op over an empty segment), so a second, unconditional launch there
+        # would rewrite a value that is already correct.
+        wp.launch(
+            kernel_voxels.zero_empty_voxels, dim=n_voxels, inputs=[counts, pooled], device=device
+        )
     else:
         sorted_buckets, order = tw.array.sort_and_argsort(buckets)
         del sorted_buckets
@@ -448,7 +456,6 @@ def pool_by_voxel(
             inputs=[order, values, offsets, counts, pooling == "mean", pooled],
             device=device,
         )
-    wp.launch(kernel_voxels.zero_empty_voxels, dim=n_voxels, inputs=[counts, pooled], device=device)
     return pooled
 
 

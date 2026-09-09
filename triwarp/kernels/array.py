@@ -73,6 +73,15 @@ def wrap_index(i: wp.int32, n: wp.int32) -> wp.int32:
 
 
 @wp.func
+def ravel_index(i: wp.int32, j: wp.int32, k: wp.int32, ny: wp.int32, nz: wp.int32) -> wp.int32:
+    # Row-major flat index into an (nx, ny, nz) box, ``nx`` implicit in ``i``'s own range. Shared by
+    # ``voxels.flat_cell_index`` (a box) and ``reconstruction.poisson_grid_index`` (the cube
+    # specialization ``ny == nz == res``) -- one formula, two domain names for readability at each
+    # call site.
+    return (i * ny + j) * nz + k
+
+
+@wp.func
 def loop_next_slot(
     loop_id: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],

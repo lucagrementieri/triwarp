@@ -255,8 +255,10 @@ def closest_point_on_edges(
 
     Raises
     ------
+    TypeError
+        If ``edges`` is not a rank-2 ``wp.int32`` array.
     ValueError
-        If ``edges`` is not a rank-2 ``wp.int32`` array with two columns.
+        If ``edges`` does not have two columns.
     RuntimeError
         If ``vertices``, ``edges``, ``queries`` and ``bvh`` are not all on one device.
 
@@ -283,9 +285,7 @@ def closest_point_on_edges(
     """
     require_same_device(vertices=vertices, edges=edges, queries=queries, bvh=bvh)
     device = vertices.device
-    twt.ensure_ndim(edges, 2, dtype=wp.int32)
-    if int(edges.shape[1]) != 2:
-        raise ValueError("edges must have two columns")
+    twt.ensure_edge_pairs(edges, "edges")
     m = int(queries.shape[0])
     n_edges = int(edges.shape[0])
 

@@ -174,9 +174,10 @@ def cut_along_edges(
 
     Raises
     ------
+    TypeError
+        If ``edges`` is not a rank-2 ``int32`` array.
     ValueError
-        If ``edges`` is not a rank-2 ``int32`` array with two columns, or ``faces`` is not
-        edge-manifold.
+        If ``edges`` does not have two columns, or ``faces`` is not edge-manifold.
     RuntimeError
         If ``vertices``, ``faces``, ``edges`` and ``twins`` are not all on one device.
 
@@ -195,9 +196,7 @@ def cut_along_edges(
     survive.
     """
     require_same_device(vertices=vertices, faces=faces, edges=edges, twins=twins)
-    twt.ensure_ndim(edges, 2, dtype=wp.int32)
-    if int(edges.shape[1]) != 2:
-        raise ValueError(f"edges must have shape (k, 2), got {edges.shape}")
+    twt.ensure_edge_pairs(edges, "edges")
 
     device = faces.device
     n_halfedges = int(faces.shape[0]) // 3 * 3
@@ -459,8 +458,10 @@ def seam_edge_vertices(
 
     Raises
     ------
+    TypeError
+        If ``face_corners`` is not a rank-2 ``int32`` array.
     ValueError
-        If ``face_corners`` is not a rank-2 ``int32`` array with at least two columns.
+        If ``face_corners`` does not have at least two columns.
     RuntimeError
         If ``faces`` and ``face_corners`` are not all on one device.
 

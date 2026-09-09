@@ -94,6 +94,7 @@ __all__ = [
     "dtype_zero",
     "empty_2d",
     "empty_3d",
+    "ensure_edge_pairs",
     "ensure_ndim",
     "sortable_dtype",
 ]
@@ -130,6 +131,35 @@ def ensure_ndim(arr: wp.array[T], ndim: int, *, dtype: type | None = None) -> wp
     if dtype is not None and arr.dtype != dtype:
         raise TypeError(f"expected dtype {dtype}, got {arr.dtype}")
     return arr
+
+
+def ensure_edge_pairs(arr: wp.array[T], name: str) -> None:
+    """
+    Validate that ``arr`` is a rank-2 ``wp.int32`` array with exactly two columns.
+
+    The shared check every ``(k, 2)`` edge-list argument in the package runs before use, factored
+    because six call sites (``triangles.corner_normals``, ``seams.cut_along_edges``,
+    ``graph.connected_component_parity_from_edges`` and ``graph._validate_edge_list``,
+    ``proximity.closest_point_on_edges``, ``selection.contour_side_mask``) wrote it out by hand,
+    with the same two exceptions and only the parameter name differing between them.
+
+    Parameters
+    ----------
+    arr
+        Array to validate.
+    name
+        Parameter name to use in the raised message.
+
+    Raises
+    ------
+    TypeError
+        If ``arr`` is not a rank-2 ``wp.int32`` array.
+    ValueError
+        If ``arr`` does not have exactly two columns.
+    """
+    ensure_ndim(arr, 2, dtype=wp.int32)
+    if int(arr.shape[1]) != 2:
+        raise ValueError(f"{name} must have shape (k, 2), got {arr.shape}")
 
 
 @overload

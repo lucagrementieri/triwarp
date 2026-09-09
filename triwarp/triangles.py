@@ -183,9 +183,11 @@ def corner_normals(
 
     Raises
     ------
+    TypeError
+        If ``crease_edges`` is given and is not a rank-2 ``wp.int32`` array.
     ValueError
-        If ``crease_edges`` is given and is not a rank-2 ``wp.int32`` array with two columns, or
-        ``weighting`` is not one of the two names above. Also propagated from
+        If ``crease_edges`` is given and does not have two columns, or ``weighting`` is not one of
+        the two names above. Also propagated from
         [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when the mesh is **not edge-manifold**:
         rotating about a vertex is what this computes, and an edge with three faces has no rotation.
         Pass ``twins`` yourself if you have already resolved that.
@@ -229,9 +231,7 @@ def corner_normals(
 
     crease_keys = wp.empty(0, dtype=wp.uint64, device=device)
     if crease_edges is not None:
-        twt.ensure_ndim(crease_edges, 2, dtype=wp.int32)
-        if int(crease_edges.shape[1]) != 2:
-            raise ValueError(f"crease_edges must have shape (k, 2), got {crease_edges.shape}")
+        twt.ensure_edge_pairs(crease_edges, "crease_edges")
         n_creases = int(crease_edges.shape[0])
         if n_creases > 0:
             keys = wp.empty(n_creases, dtype=wp.uint64, device=device)
@@ -449,11 +449,7 @@ def face_signed_volumes(
     if n_faces == 0:
         return volumes
     if apex is None:
-        apex = (
-            wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
-            if vertices.dtype is wp.vec3d
-            else wp.vec3(0.0, 0.0, 0.0)
-        )
+        apex = wp.vec3d(0.0, 0.0, 0.0) if vertices.dtype is wp.vec3d else wp.vec3(0.0, 0.0, 0.0)
     wp.launch(
         kernel_triangles.FACE_SIGNED_VOLUMES[vertices.dtype],
         dim=n_faces,
@@ -535,6 +531,8 @@ def barycentric_to_points(
 
     See Also
     --------
+    [`points_to_barycentric`][triwarp.triangles.points_to_barycentric]
+        The inverse: recovers barycentric coordinates from Cartesian points.
     [`trimesh.triangles.barycentric_to_points`][]
     """
     require_same_device(vertices=vertices, faces=faces, barycentric=barycentric)
@@ -582,21 +580,26 @@ def points_to_barycentric(
 
     Raises
     ------
+    ValueError
+        If ``method`` is not one of the two names above.
     RuntimeError
         If ``vertices``, ``faces`` and ``points`` are not all on one device.
 
     See Also
     --------
+    [`barycentric_to_points`][triwarp.triangles.barycentric_to_points]
+        The inverse: recovers Cartesian points from barycentric coordinates.
     [`trimesh.triangles.points_to_barycentric`][]
     """
     require_same_device(vertices=vertices, faces=faces, points=points)
+    if method == "cramer":
+        kernel = kernel_triangles.points_to_barycentric_cramer
+    elif method == "cross":
+        kernel = kernel_triangles.points_to_barycentric_cross
+    else:
+        raise ValueError(f"method must be 'cramer' or 'cross', got {method!r}")
     f = faces.shape[0] // 3
     out_barycentric = wp.empty(f, dtype=wp.vec3, device=vertices.device)
-    kernel = (
-        kernel_triangles.points_to_barycentric_cramer
-        if method == "cramer"
-        else kernel_triangles.points_to_barycentric_cross
-    )
     wp.launch(
         kernel, dim=f, inputs=[vertices, faces, points, out_barycentric], device=vertices.device
     )

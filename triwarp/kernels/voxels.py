@@ -33,9 +33,10 @@ from triwarp.kernels.array import (
     lattice_position,
     map_probe,
     map_probe_single,
+    ravel_index,
 )
 from triwarp.kernels.predicates import triangle_aabb, triangle_aabb_overlap
-from triwarp.kernels.triangles import face_vertices
+from triwarp.kernels.triangles import face_vertices, write_row_triple
 
 # ---------------------------------------------------------------------------------------------
 # Voxelization
@@ -96,9 +97,22 @@ def voxel_cell_indices(
 ) -> None:
     v = wp.int32(wp.tid())
     cell = voxel_cell(points[v], origin, inverse_size)
-    out_cells[v, 0] = cell[0]
-    out_cells[v, 1] = cell[1]
-    out_cells[v, 2] = cell[2]
+    write_row_triple(out_cells, v, cell[0], cell[1], cell[2])
+
+
+@wp.func
+def triangle_voxel_window_from_vertices(
+    v0: wp.vec3, v1: wp.vec3, v2: wp.vec3, origin: wp.vec3, inverse_size: wp.float32
+) -> tuple[wp.vec3i, wp.vec3i]:
+    # Inclusive lower/upper cell of the exact AABB window of a triangle already in hand. Shared by
+    # the count and test passes below, which MUST enumerate the same window: the second writes into
+    # the slots the first reserved, so a window that disagreed by one cell would write out of range.
+    #
+    # Open3D walks ``round((max - min) / vs) + 2`` cells, a strict superset of this one; a cell
+    # outside the triangle's own AABB cannot overlap the triangle, so the *accepted* sets are
+    # identical and only the number of rejected candidates differs.
+    lower, upper = triangle_aabb(v0, v1, v2)
+    return voxel_cell(lower, origin, inverse_size), voxel_cell(upper, origin, inverse_size)
 
 
 @wp.func
@@ -109,16 +123,12 @@ def triangle_voxel_window(
     origin: wp.vec3,
     inverse_size: wp.float32,
 ) -> tuple[wp.vec3i, wp.vec3i]:
-    # Inclusive lower/upper cell of the exact AABB window of face ``face_index``. Shared by the
-    # count and test passes below, which MUST enumerate the same window: the second writes into the
-    # slots the first reserved, so a window that disagreed by one cell would write out of range.
-    #
-    # Open3D walks ``round((max - min) / vs) + 2`` cells, a strict superset of this one; a cell
-    # outside the triangle's own AABB cannot overlap the triangle, so the *accepted* sets are
-    # identical and only the number of rejected candidates differs.
+    # Gathers the face's own vertices and defers to the vertex-taking form above. Kept separate from
+    # it (rather than folded into one signature) because ``test_triangle_candidates`` below needs
+    # the gathered v0/v1/v2 for its own overlap test right after computing the window, and calling
+    # through this wrapper would gather them a second time to get at them.
     v0, v1, v2 = face_vertices(vertices, faces, face_index)
-    lower, upper = triangle_aabb(v0, v1, v2)
-    return voxel_cell(lower, origin, inverse_size), voxel_cell(upper, origin, inverse_size)
+    return triangle_voxel_window_from_vertices(v0, v1, v2, origin, inverse_size)
 
 
 @wp.kernel
@@ -132,8 +142,14 @@ def count_triangle_candidates(
 ) -> None:
     f = wp.int32(wp.tid())
     lo, hi = triangle_voxel_window(vertices, faces, f, origin, inverse_size)
-    # int64 so a wildly under-sized voxel does not wrap the product into a plausible small count.
-    span = wp.int64(hi[0] - lo[0] + 1) * wp.int64(hi[1] - lo[1] + 1) * wp.int64(hi[2] - lo[2] + 1)
+    # int64 so a wildly under-sized voxel does not wrap the product into a plausible small count --
+    # each axis span widens to int64 *before* the subtraction, not after, so the subtraction itself
+    # cannot already overflow int32 for a triangle whose window is that wide (the convention
+    # ``kernels/graph.py``'s packed labels key uses: widen the operands, not their difference).
+    span_x = wp.int64(hi[0]) - wp.int64(lo[0]) + wp.int64(1)
+    span_y = wp.int64(hi[1]) - wp.int64(lo[1]) + wp.int64(1)
+    span_z = wp.int64(hi[2]) - wp.int64(lo[2]) + wp.int64(1)
+    span = span_x * span_y * span_z
     out_counts[f] = wp.int32(wp.min(span, wp.int64(INT32_MAX_CONSTANT)))
     out_counts_f32[f] = wp.float32(span)
 
@@ -153,9 +169,22 @@ def test_triangle_candidates(
     # magnitude on any real mesh, so a thread-per-triangle launch is load-imbalanced by that same
     # factor. ``binary_search_index`` recovers the owning triangle from the flat work-item id
     # (``wp.lower_bound`` clamps to ``n - 1`` and would misattribute the last window).
+    #
+    # The per-item decode below (``span_y``/``span_z``/``plane``/``i``/``j``/``k``) stays int32,
+    # unlike ``count_triangle_candidates``'s widened axis spans above -- a single axis wide enough
+    # to overflow int32 on its own would still misdecode here, but reaching that needs
+    # ``max_candidates`` raised past its ``2**31`` default (already impractical: the candidate
+    # buffers alone would be tens of GB at that width). Left as a documented residual rather than
+    # widening this hot loop's arithmetic to int64 for a practically unreachable input; revisit only
+    # if a caller legitimately needs a wider ``max_candidates``.
     item = wp.int32(wp.tid())
     f = binary_search_index(offsets, item) - 1
-    lo, hi = triangle_voxel_window(vertices, faces, f, origin, inverse_size)
+    # Gather the face's own vertices once and feed them to both the window (for this item's cell)
+    # and the overlap test below, rather than calling ``triangle_voxel_window`` (which would gather
+    # the same three rows again internally) -- this is the dominant work unit in the kernel, one
+    # gather per (triangle, candidate-cell) work item rather than two.
+    v0, v1, v2 = face_vertices(vertices, faces, f)
+    lo, hi = triangle_voxel_window_from_vertices(v0, v1, v2, origin, inverse_size)
     span_y = hi[1] - lo[1] + 1
     span_z = hi[2] - lo[2] + 1
 
@@ -169,14 +198,8 @@ def test_triangle_candidates(
 
     half = wp.vec3(0.5 * voxel_size, 0.5 * voxel_size, 0.5 * voxel_size)
     center = voxel_cell_center(cell, origin, voxel_size)
-    out_cells[item, 0] = cell[0]
-    out_cells[item, 1] = cell[1]
-    out_cells[item, 2] = cell[2]
-    v0, v1, v2 = face_vertices(vertices, faces, f)
-    if triangle_aabb_overlap(center, half, v0, v1, v2):
-        out_mask[item] = 1
-    else:
-        out_mask[item] = 0
+    write_row_triple(out_cells, item, cell[0], cell[1], cell[2])
+    out_mask[item] = wp.where(triangle_aabb_overlap(center, half, v0, v1, v2), 1, 0)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -358,9 +381,13 @@ def neighborhood_candidates(
 ) -> None:
     v, m = wp.tid()
     row = v * neighbors.shape[0] + m
-    out_cells[row, 0] = voxels[v, 0] + neighbors[m, 0]
-    out_cells[row, 1] = voxels[v, 1] + neighbors[m, 1]
-    out_cells[row, 2] = voxels[v, 2] + neighbors[m, 2]
+    write_row_triple(
+        out_cells,
+        row,
+        voxels[v, 0] + neighbors[m, 0],
+        voxels[v, 1] + neighbors[m, 1],
+        voxels[v, 2] + neighbors[m, 2],
+    )
 
 
 @wp.kernel
@@ -431,7 +458,7 @@ def intersect_occupancy(
 
 @wp.func
 def flat_cell_index(i: wp.int32, j: wp.int32, k: wp.int32, ny: wp.int32, nz: wp.int32) -> wp.int32:
-    return (i * ny + j) * nz + k
+    return ravel_index(i, j, k, ny, nz)
 
 
 @wp.kernel
@@ -511,21 +538,23 @@ def fill_enclosed_cells(
 # ---------------------------------------------------------------------------------------------
 
 
+@wp.func
+def cell_is_occupied(
+    volume: wp.uint64, base: wp.vec3i, i: wp.int32, j: wp.int32, k: wp.int32
+) -> wp.bool:
+    return wp.volume_lookup_index(volume, base[0] + i, base[1] + j, base[2] + k) >= 0
+
+
 @wp.kernel
 def dense_occupancy(volume: wp.uint64, base: wp.vec3i, out_occupancy: wp.array3d[wp.bool]) -> None:
     i, j, k = wp.tid()
-    out_occupancy[i, j, k] = (
-        wp.volume_lookup_index(volume, base[0] + i, base[1] + j, base[2] + k) >= 0
-    )
+    out_occupancy[i, j, k] = cell_is_occupied(volume, base, i, j, k)
 
 
 @wp.kernel
 def dense_field(volume: wp.uint64, base: wp.vec3i, out_field: wp.array3d[wp.float32]) -> None:
     i, j, k = wp.tid()
-    if wp.volume_lookup_index(volume, base[0] + i, base[1] + j, base[2] + k) >= 0:
-        out_field[i, j, k] = 1.0
-    else:
-        out_field[i, j, k] = 0.0
+    out_field[i, j, k] = wp.where(cell_is_occupied(volume, base, i, j, k), 1.0, 0.0)
 
 
 @wp.kernel
@@ -537,13 +566,8 @@ def occupied_cells(
 ) -> None:
     i, j, k = wp.tid()
     row = flat_cell_index(i, j, k, occupancy.shape[1], occupancy.shape[2])
-    out_cells[row, 0] = base[0] + i
-    out_cells[row, 1] = base[1] + j
-    out_cells[row, 2] = base[2] + k
-    if occupancy[i, j, k]:
-        out_mask[row] = 1
-    else:
-        out_mask[row] = 0
+    write_row_triple(out_cells, row, base[0] + i, base[1] + j, base[2] + k)
+    out_mask[row] = wp.where(occupancy[i, j, k], 1, 0)
 
 
 @wp.kernel

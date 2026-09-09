@@ -63,6 +63,22 @@ def row_triple(buffer: wp.array2d[Any], row: wp.int32) -> tuple[Any, Any, Any]:
     return buffer[row, 0], buffer[row, 1], buffer[row, 2]
 
 
+@wp.func
+def write_row_triple(out: wp.array2d[Any], row: wp.int32, a: Any, b: Any, c: Any) -> None:
+    """
+    Write ``(a, b, c)`` into row ``row`` of a rank-2 buffer.
+
+    The write-side counterpart of [`row_triple`][triwarp.kernels.triangles.row_triple], for the
+    rank-2 tables this package stores as ``(n, 3)`` -- the sibling gap
+    [`write_corner_triple`][triwarp.kernels.triangles.write_corner_triple] leaves for the flat
+    3-stride layout. Reached from ``kernels/voxels.py``, which had the identical three-assignment
+    write spelled out at four sites before this existed.
+    """
+    out[row, 0] = a
+    out[row, 1] = b
+    out[row, 2] = c
+
+
 @wp.kernel
 def sort_face_indices(faces: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int32]) -> None:
     """

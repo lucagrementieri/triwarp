@@ -331,6 +331,34 @@ def test_procrustes_weights_length_mismatch(device: str) -> None:
         tw.registration.procrustes(a_wp, b_wp, weights=weights_wp)
 
 
+def test_procrustes_scale_on_duplicated_points(device: str) -> None:
+    """
+    Not a library comparison: a scale fit over a zero-variance cloud has no defined answer.
+
+    This pins that the kernel's own scale-factor sqrt is floored rather than fed a
+    fp-cancellation-driven negative argument and returning NaN.
+
+    Every point of ``a`` (and of ``b``) is identical, so the shifted second moment
+    ``sum |a - p|^2`` is exactly zero for the shift point itself and only cancellation noise for
+    any other point sharing its value -- exactly the zero-or-slightly-negative case the scale
+    floor exists for.
+    """
+    a_wp = points_to_warp(np.full((3, 3), [1.0, 2.0, 3.0], dtype=np.float32), device)
+    b_wp = points_to_warp(np.full((3, 3), [4.0, 5.0, 6.0], dtype=np.float32), device)
+    matrix_wp, _transformed_wp, cost_tw = tw.registration.procrustes(a_wp, b_wp, scale=True)
+    assert np.all(np.isfinite(matrix_wp.numpy()))
+    assert np.isfinite(cost_tw)
+
+
+def test_procrustes_all_zero_weights(device: str) -> None:
+    """An all-zero, non-empty ``weights`` must raise rather than silently return NaN."""
+    a_wp = points_to_warp(np.random.default_rng(24).standard_normal((10, 3)), device)
+    b_wp = points_to_warp(np.random.default_rng(25).standard_normal((10, 3)), device)
+    weights_wp = wp.zeros(10, dtype=wp.float32, device=device)
+    with pytest.raises(ValueError, match="sum to zero"):
+        tw.registration.procrustes(a_wp, b_wp, weights=weights_wp)
+
+
 def test_procrustes_empty(device: str) -> None:
     """``n == 0`` must return the identity, not the NaN a division by zero would give."""
     a_wp = wp.zeros(0, dtype=wp.vec3, device=device)
@@ -1125,5 +1153,36 @@ def test_icp_point_to_plane_max_distance_all_rejected(device: str) -> None:
         source_wp, target_wp, None, target_normals=normals_wp, max_iterations=10, max_distance=1e-6
     )
     assert np.isfinite(matrix_wp.numpy()).all()
+    assert np.allclose(matrix_wp.numpy()[0], np.eye(4), atol=1e-6)
+    assert not np.isfinite(cost_tw)
+
+
+def test_icp_point_to_plane_tukey_all_weights_zero(device: str) -> None:
+    # Not a library comparison: this pins the loop's own bail-out against a Tukey kernel driving
+    # every in-range correspondence's *weight* to zero, a distinct failure mode from the
+    # distance-rejection case above -- ``residual_valid`` (and so the ``valid`` guard) accepts
+    # every correspondence here, since none of them is out of range; it is ``robust_weight`` alone
+    # that zeroes every contribution once ``robust_scale`` is tighter than every residual.
+    rng = np.random.default_rng(23)
+    target_np = rng.standard_normal((100, 3)).astype(np.float32) * 2.0
+    normals_np = target_np / np.linalg.norm(target_np, axis=1, keepdims=True)
+    # A real, nontrivial offset: a correctly converged fit would move every source point.
+    source_np = (target_np + np.array([1.0, 0.5, -0.3], dtype=np.float32)).astype(np.float32)
+    source_wp = points_to_warp(source_np, device)
+    target_wp = points_to_warp(target_np, device)
+    normals_wp = points_to_warp(normals_np, device)
+
+    matrix_wp, _, cost_tw = tw.registration.icp_point_to_plane(
+        source_wp,
+        target_wp,
+        None,
+        target_normals=normals_wp,
+        max_iterations=10,
+        robust_kernel="tukey",
+        robust_scale=1e-9,
+    )
+    # A collapsed-weight bail must report the same "did not converge" signal as an all-rejected
+    # one: an untouched (identity) transform and a non-finite cost, never the spurious cost=0.0 a
+    # zeroed accumulator would otherwise read as a perfect fit.
     assert np.allclose(matrix_wp.numpy()[0], np.eye(4), atol=1e-6)
     assert not np.isfinite(cost_tw)

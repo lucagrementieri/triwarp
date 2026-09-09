@@ -1,5 +1,6 @@
 import warp as wp
 
+from triwarp.kernels.predicates import normalize_or_zero
 from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
 from triwarp.kernels.transform import transform_point_mat44
 
@@ -151,16 +152,17 @@ def accumulate_procrustes_moments(
             mask_n += wp.float32(1.0)
 
     # Every ``wp.tile_sum`` is block-collective, so all 25 run outside the ``lane == 0`` guard and
-    # only the commit is guarded.
+    # only the commit is guarded. The default constructors, not an explicit zero-fill: every
+    # component of each is unconditionally overwritten by the loop below before it is ever read.
     t_w_sum = wp.tile_sum(wp.tile(w_sum))[0]
     t_a_sq = wp.tile_sum(wp.tile(a_sq))[0]
     t_b_sq = wp.tile_sum(wp.tile(b_sq))[0]
     t_mask_n = wp.tile_sum(wp.tile(mask_n))[0]
-    t_a_sum = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    t_b_sum = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    t_mask_a = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    t_mask_b = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    t_cov = wp.mat33(wp.float32(0.0))
+    t_a_sum = wp.vec3()
+    t_b_sum = wp.vec3()
+    t_mask_a = wp.vec3()
+    t_mask_b = wp.vec3()
+    t_cov = wp.mat33()
     for c in range(3):
         t_a_sum[c] = wp.tile_sum(wp.tile(a_sum[c]))[0]
         t_b_sum[c] = wp.tile_sum(wp.tile(b_sum[c]))[0]
@@ -215,9 +217,14 @@ def build_procrustes_matrix(
     bscale = wp.float32(1.0)
     if use_scale:
         # Shifted second-moment identity: sum w |a - centroid|^2 / S_w = sum w |a - p|^2 / S_w
-        # minus |centroid - p|^2.
-        ascale = wp.sqrt(acc[ACC_A_SQ] / ws - wp.length_sq(a_rel))
-        bscale = wp.sqrt(acc[ACC_B_SQ] / ws - wp.length_sq(b_rel))
+        # minus |centroid - p|^2. Mathematically non-negative, but computed as a difference of two
+        # independently tile-reduced sums (CLAUDE.md section 1, non-associative float32
+        # accumulation), so a near-degenerate cloud (tightly clustered, or exactly duplicated
+        # points) can land it at a tiny negative value from cancellation alone -- floored the same
+        # way ``solve_spd6`` below floors its own Cholesky pivot for the identical reason, rather
+        # than feeding ``wp.sqrt`` a negative argument and propagating NaN through the SVD.
+        ascale = wp.sqrt(wp.max(acc[ACC_A_SQ] / ws - wp.length_sq(a_rel), wp.float32(1e-20)))
+        bscale = wp.sqrt(wp.max(acc[ACC_B_SQ] / ws - wp.length_sq(b_rel), wp.float32(1e-20)))
 
     # Shifted cross-moment identity, over the membership-masked subset:
     # H = sum_m outer(b - bc, a - ac)
@@ -245,15 +252,16 @@ def build_procrustes_matrix(
     # (all-positive sigma) and correctly handles reflective optimal solutions.
     # wp.sign is -1 for negative components and +1 otherwise (including at exactly 0).
     d = wp.sign(sigma)
+    R = U * wp.diag(d) * Vt  # noqa: N806
 
     if not use_reflection:
-        # Ensure det(R) = 1 by flipping the last correction factor when needed
-        R_test = U * wp.diag(d) * Vt  # noqa: N806
-        if wp.determinant(R_test) < wp.float32(0.0):
+        # Ensure det(R) = 1 by flipping the last correction factor when needed. Rebuilding ``R``
+        # only on the branch that actually flips ``d`` -- the common, no-flip case reuses the
+        # matrix just computed above instead of recomputing the identical product from the same,
+        # unchanged ``d``.
+        if wp.determinant(R) < wp.float32(0.0):
             d = wp.vec3(d[0], d[1], -d[2])
-
-    D = wp.diag(d)  # noqa: N806
-    R = U * D * Vt  # noqa: N806
+            R = U * wp.diag(d) * Vt  # noqa: N806
 
     s = wp.float32(1.0)
     if use_scale:
@@ -355,16 +363,6 @@ def transform_and_accumulate_cost(
 
 
 @wp.func
-def distance_threshold_weight(
-    distance: wp.float32, triangle_id: wp.int32, max_distance: wp.float32
-) -> wp.float32:
-    """Binary correspondence mask: 1 for a valid, in-range hit, 0 otherwise."""
-    return wp.where(
-        triangle_id >= wp.int32(0) and distance <= max_distance, wp.float32(1.0), wp.float32(0.0)
-    )
-
-
-@wp.func
 def point_to_plane_residual(current: wp.vec3, closest: wp.vec3, normal: wp.vec3) -> wp.float32:
     """Signed point-to-plane residual ``dot(current - closest, normal)``."""
     return wp.dot(current - closest, normal)
@@ -376,6 +374,20 @@ def residual_valid(
 ) -> wp.bool:
     """Whether a correspondence is a valid, in-range hit."""
     return triangle_id >= wp.int32(0) and distance <= max_distance
+
+
+@wp.func
+def distance_threshold_weight(
+    distance: wp.float32, triangle_id: wp.int32, max_distance: wp.float32
+) -> wp.float32:
+    """Binary correspondence mask: 1 for a valid, in-range hit, 0 otherwise."""
+    # Same predicate as ``residual_valid`` -- called rather than re-derived, so the "valid
+    # correspondence" rule has one definition instead of two that a future edit could desync.
+    # ``distance``/``triangle_id`` are transposed relative to ``residual_valid``'s own parameter
+    # order because this one's ``wp.map`` call sites already pass them that way.
+    return wp.where(
+        residual_valid(triangle_id, distance, max_distance), wp.float32(1.0), wp.float32(0.0)
+    )
 
 
 @wp.func
@@ -422,7 +434,7 @@ def point_to_plane_tile(
     remaining: wp.int32,
     lane: wp.int32,
     stride: wp.int32,
-) -> tuple[wp.spatial_matrix, wp.spatial_vector, wp.float32]:
+) -> tuple[wp.spatial_matrix, wp.spatial_vector, wp.float32, wp.float32]:
     # ``lane`` / ``stride`` rather than ``wp.block_dim()`` because this is a ``@wp.func``: the
     # caller is the kernel that knows its own launch shape, and passing the stride in keeps this
     # usable from a serial caller too.
@@ -437,21 +449,33 @@ def point_to_plane_tile(
         wp.float32(0.0),
     )
     cost = wp.float32(0.0)
+    # Sum of the robust weight itself, not the "in-range hit" count ``residual_valid`` already
+    # gates on: a Tukey kernel can drive *every* in-range correspondence's weight to exactly zero
+    # (``r >= scale``, e.g. a ``robust_scale`` too tight for the residual distribution, or a
+    # previous iteration's step overshooting far past what a first-iteration-derived scale
+    # anticipated), which leaves ``jtj``/``jtr``/``cost`` all zero without a single rejection ever
+    # firing. The caller uses this to tell that case apart from genuine convergence.
+    weight_sum = wp.float32(0.0)
     for k in range(lane, count, stride):
         idx = offset + k
-        if triangle_id[idx] < 0 or distance[idx] > max_distance:
+        if not residual_valid(triangle_id[idx], distance[idx], max_distance):
             continue
-        nrm = wp.normalize(normals[idx])
+        # A mesh target's ``normals`` come from ``face_normals_and_areas``, which writes an exact
+        # zero vector for a degenerate face (CLAUDE.md section 12.4) rather than raising -- a plain
+        # ``wp.normalize`` on that entry is ``0/0``, and one poisoned lane's NaN spreads to the
+        # whole block through the ``wp.tile_sum`` commit below. Same guard, same zero tolerance,
+        # as ``transform.transform_normal_mat33``'s identical hazard.
+        nrm = normalize_or_zero(normals[idx], wp.float32(0.0))
         x = source[idx]
-        d = x - target[idx]
-        r = wp.dot(d, nrm)
+        r = point_to_plane_residual(x, target[idx], nrm)
         w = robust_weight(r, robust_scale, robust_kind)
         # Jacobian of the point-to-plane residual: [x x n ; n]
         j = wp.spatial_vector(wp.cross(x, nrm), nrm)
         jtj += w * wp.outer(j, j)
         jtr += (w * r) * j
         cost += w * r * r
-    return jtj, jtr, cost
+        weight_sum += w
+    return jtj, jtr, cost, weight_sum
 
 
 @wp.kernel
@@ -467,16 +491,19 @@ def accumulate_point_to_plane(
     out_jtj: wp.array[wp.spatial_matrix],
     out_jtr: wp.array[wp.spatial_vector],
     out_cost: wp.array[wp.float32],
+    out_weight_sum: wp.array[wp.float32],
 ) -> None:
     # Launched ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``: one block per
-    # ``ITEMS_PER_BLOCK_1D`` correspondences, lanes striding that block's own chunk, and 43
+    # ``ITEMS_PER_BLOCK_1D`` correspondences, lanes striding that block's own chunk, and 44
     # ``wp.tile_sum`` tree reductions committing one atomic set per block.
     #
     # It was every lane walking a ``TILE_1D`` chunk with lane 0 publishing, which put one add per
     # block on each of 43 hot addresses (36 for the normal matrix, 6 for the right-hand side, 1 for
-    # the cost) at ``n / TILE_1D`` blocks. Same finding as ``accumulate_procrustes_moments``: the
-    # redundant lanes were nearly free and the atomic contention was the cost. Interleaved A/B, min
-    # of seven alternating reps on an RTX 5090:
+    # the cost) at ``n / TILE_1D`` blocks -- the measurement below predates ``out_weight_sum``'s
+    # 44th reduction, added afterwards for the all-weights-zero guard below and too small a share
+    # to move the numbers. Same finding as ``accumulate_procrustes_moments``: the redundant lanes
+    # were nearly free and the atomic contention was the cost. Interleaved A/B, min of seven
+    # alternating reps on an RTX 5090:
     #
     #   n              20 000   200 000   1 000 000
     #   every-lane     0.0375   0.1366    0.4601  ms
@@ -496,7 +523,7 @@ def accumulate_point_to_plane(
     if remaining <= 0:
         return
 
-    tile_jtj, tile_jtr, tile_cost = point_to_plane_tile(
+    tile_jtj, tile_jtr, tile_cost, tile_weight_sum = point_to_plane_tile(
         source,
         target,
         normals,
@@ -511,17 +538,13 @@ def accumulate_point_to_plane(
         wp.block_dim(),
     )
 
-    # Block-collective, so every lane runs all 43 and only the commit is guarded.
+    # Block-collective, so every lane runs all 44 and only the commit is guarded. The default
+    # constructors, not an explicit zero-fill: every component of each is unconditionally
+    # overwritten by the loop below before it is ever read.
     total_cost = wp.tile_sum(wp.tile(tile_cost))[0]
-    total_jtj = wp.spatial_matrix(wp.float32(0.0))
-    total_jtr = wp.spatial_vector(
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(0.0),
-    )
+    total_weight_sum = wp.tile_sum(wp.tile(tile_weight_sum))[0]
+    total_jtj = wp.spatial_matrix()
+    total_jtr = wp.spatial_vector()
     for r in range(6):
         total_jtr[r] = wp.tile_sum(wp.tile(tile_jtr[r]))[0]
         for c in range(6):
@@ -531,6 +554,7 @@ def accumulate_point_to_plane(
         wp.atomic_add(out_jtj, 0, total_jtj)
         wp.atomic_add(out_jtr, 0, total_jtr)
         wp.atomic_add(out_cost, 0, total_cost)
+        wp.atomic_add(out_weight_sum, 0, total_weight_sum)
 
 
 @wp.func
