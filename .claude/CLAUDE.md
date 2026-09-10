@@ -1304,7 +1304,10 @@ a targeted per-file run does not — a rename is not done until the whole suite 
   fail 14 correct tests; it leaves `_np` out of its suffix list (290 false positives); and it checks
   only that a label is *present*, never that it is the right one. The rarer defect it also closes is a
   comparison with **no docstring at all**, which ruff cannot see because `D103` is ignored.
-- **Check 21**: a MeshLib name anywhere under `triwarp/` — a *licensing* guard (§7.6).
+- **Check 21**: a MeshLib **or promesh** name anywhere under `triwarp/` — a *licensing* guard
+  (§7.6). Two libraries, one scan, opposite reasons: MeshLib's licence is readable and
+  restricts *use*; promesh's mirror carries no licence file at all, so a "port of" comment
+  cites terms nobody here has checked.
 - **Check 23**: a kernel module whose `@wp.func` is `wp.map`'d from several sites with no
   declaration table (§3.5). Like its `wp.overload` sibling it asserts a table *exists* and never that
   it is complete; the completeness gate is the load census, which is a clock measurement (§15.1).
@@ -1792,6 +1795,10 @@ pymeshfix (measured 435 ms wall against 435 ms `process_time`, ratio 1.00). Mult
 `meshlib` (143 OS threads measured live) and `pytorch3d-cpu` (24 torch threads). GPU —
 `pytorch3d-cuda` only. A `triwarp-cpu` row loses to a threaded reference on any parallel op
 regardless of algorithm, which is §9's "decide on the CUDA number" again.
+
+There are **nine** libraries here and **ten** subsections: the last one, `promesh`, is not one of
+the nine and is not a reference at all — it is a design mirror that nothing installs, and it is
+filed here only because that is where a reader looks for it.
 
 #### libigl (`igl`)
 
@@ -2635,6 +2642,31 @@ triwarp rows once failed to allocate 65 368 bytes on a 32 GB card after an uncap
 restriction and no copyleft. `triwarp/` may name it and may be derived from it with attribution. It
 stays a test and benchmark dependency all the same: nothing in the shipped package imports torch, and
 it must not start, since `torch` is a 2.5 GB install for a library whose whole premise is Warp.
+
+#### promesh — not a reference library, and not citable from `triwarp/`
+
+`reference/promesh/` is a bare source drop, and it is the one mirror here whose terms **cannot be
+read from this repo at all**: no `LICENSE`, no `COPYING`, no `pyproject.toml`. It is also not a
+published package — nothing installs it, `import promesh` fails, and it therefore can never be a
+tested or benchmarked reference, so none of §7.6's machinery applies to it. Treat it as a design
+mirror only, on the same footing as reading MeshLib for an *interface*.
+
+**Nothing under `triwarp/` may name it**, for a reason that is the mirror image of MeshLib's rather
+than the same one: MeshLib's licence is readable and restricts *use*, where promesh's is simply
+unknown — so a "port of" comment cites terms nobody here has checked. Five such references had
+accumulated in `holes.py`, two claiming a port outright (*"the Warp port of promesh's
+`triangulate_boundaries`"*, *"Mirrors promesh's private helper"*). All five were rewritten into the
+algorithm's own vocabulary — the gap-bridging problem of **Barequet & Sharir (1995)**, solved by the
+minimal-perimeter heuristic with a longest-increasing-subsequence monotonicity correction — which is
+what a reader wanted in the first place. **Check 21 covers both libraries in one scan** (keying
+additionally on `promesh` and `triangulate_boundaries`) because the fix is identical either way,
+and its own test pins the *replacement* wording as a negative so a later pass cannot widen the
+pattern back onto the literature's vocabulary.
+
+One mitigating fact worth knowing before re-reading that tree: `reference/promesh/deformation.py`
+attributes its own mollification helper to `kentechx/HoleFillingPy` (**MIT**), so parts of it are
+themselves ports of permissively licensed code — which is why the corroborating citation in
+`kernels/laplacian.triangle_inequality_slack` names that upstream and not promesh.
 
 ### 7.7 Where the reference put the answer
 

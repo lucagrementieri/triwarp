@@ -28,7 +28,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.api_conventions import (
-    _MESHLIB_REFERENCES,
+    _UNCITABLE_REFERENCES,
     DocstringExample,
     _annotation_nodes,
     _asserted_reference_names,
@@ -56,9 +56,9 @@ from tests.api_conventions import (
     library_in_summary_problems,
     map_declaration_problems,
     mask_return_problems,
-    meshlib_reference_problems,
     private_import_problems,
     scan_package,
+    uncitable_reference_problems,
     undocumented_raise_problems,
     warp_suffix_problems,
     warp_version_problems,
@@ -748,34 +748,38 @@ def test_bare_tid_scan_ignores_multi_index_unpacks() -> None:
     assert flagged == ["one_index_bare"]
 
 
-def test_no_meshlib_references_in_the_package() -> None:
+def test_no_uncitable_library_references_in_the_package() -> None:
     """
-    Nothing under ``triwarp/`` names MeshLib -- the library, a function of it, or a source file.
+    Nothing under ``triwarp/`` names a library the shipped package may not cite.
 
-    Not a library comparison: this is a licensing property of triwarp's own source. MeshLib's
-    licence restricts *use* rather than distribution of derivatives, and triwarp ships
-    ``MIT OR Apache-2.0``, so an attribution comment here reads as a claim that a permissively
-    licensed package is derived from a proprietary one. This is check 21, added because the rule
-    has now failed twice: 89 references were removed in one pass across 19 files, and five had
-    accumulated again by the eighth kernels pass -- two of them saying "port of" in the imperative.
-    Naming it in ``tests/`` and ``benchmarks/`` is correct and required, so the scan stops at the
-    package.
+    Not a library comparison: this is a licensing property of triwarp's own source. Two libraries
+    are covered, for opposite reasons. MeshLib's licence restricts *use* rather than distribution
+    of derivatives, and triwarp ships ``MIT OR Apache-2.0``, so an attribution comment here reads
+    as a claim that a permissively licensed package is derived from a proprietary one; the rule has
+    failed twice (89 references removed in one pass across 19 files, five back by the eighth
+    kernels pass, two saying "port of" in the imperative). ``promesh`` is the mirror-image case: it
+    carries **no licence file at all** and is not a published package, so a "port of" claim against
+    it cites terms nobody here can read -- five such references had accumulated in ``holes.py``.
+    Naming MeshLib in ``tests/`` and ``benchmarks/`` is correct and required (a comparison has to
+    say what it compares against), so the scan stops at the package.
     """
-    _fail("MeshLib reference(s) under triwarp/:", meshlib_reference_problems())
+    _fail("uncitable library reference(s) under triwarp/:", uncitable_reference_problems())
 
 
-def test_meshlib_scan_catches_every_shape_it_has_seen_and_not_circumradius() -> None:
+def test_uncitable_scan_catches_every_shape_it_has_seen_and_not_circumradius() -> None:
     r"""
-    Check 21's pattern fires on all five reference shapes and on nothing that merely reads like one.
+    Check 21's pattern fires on every shape seen, and on nothing that merely reads like one.
 
     Not a library comparison: this pins both directions of a licensing scan, the way
     ``test_bare_tid_scan_ignores_multi_index_unpacks`` pins check 22's. Both halves cost a wrong
-    answer once. The five positives are the shapes actually found in the tree -- a C++ source file,
-    a class, a function, the package, an import -- and the four symbols ``CLAUDE.md``'s sentence
-    used to name matched **none** of the file-name ones. The negatives matter because the ``MR``
-    prefix is matched under ``IGNORECASE``: without its ``\b`` it hits *circu-mradius*, and without
-    the scoped ``(?-i:)`` it hits any word starting with "mr". A narrowed pattern is how this rule
-    failed the first two times.
+    answer once. The positives are the shapes actually found in the tree -- a C++ source file, a
+    class, a function, the package, an import, and (for ``promesh``) the two comments that claimed
+    a port -- and the four symbols ``CLAUDE.md``'s sentence used to name matched **none** of the
+    file-name ones. The negatives matter because the ``MR`` prefix is matched under
+    ``IGNORECASE``: without its ``\b`` it hits *circu-mradius*, and without the scoped ``(?-i:)``
+    it hits any word starting with "mr". They also pin the *replacement* wording for the promesh
+    half, so a future pass cannot "fix" this scan by widening it back onto the algorithm's own
+    vocabulary. A narrowed pattern is how this rule failed the first two times.
     """
     caught = [
         "# Fan weight (port of FanOptimizer::calcQueueElement_)",
@@ -783,17 +787,22 @@ def test_meshlib_scan_catches_every_shape_it_has_seen_and_not_circumradius() -> 
         "# MRPointCloudTriangulationHelpers.cpp",
         "positionVertsSmoothlySharpBd: SPD umbrella system",
         "from meshlib import mrmeshpy as mm",
+        # The promesh half: the package, and the one function a comment claimed to port.
+        "(the Warp port of promesh's ``triangulate_boundaries``)",
+        "Mirrors promesh's private helper of the same name.",
     ]
     ignored = [
         "circumradius over twice the inradius",  # the \b, under IGNORECASE
         "the mrunning total",  # the scoped (?-i:), under IGNORECASE
         "MeshLab's ``inradius/circumradius``",  # pymeshlab is GPL and may be named
         "Attene's lightweight repair pipeline",  # pymeshfix may be named too
+        "the gap-bridging problem Barequet and Sharir (1995) pose",  # the replacement wording
+        "a greedy minimal-perimeter correspondence over the two rims",
     ]
     for line in caught:
-        assert _MESHLIB_REFERENCES.search(line) is not None, line
+        assert _UNCITABLE_REFERENCES.search(line) is not None, line
     for line in ignored:
-        assert _MESHLIB_REFERENCES.search(line) is None, line
+        assert _UNCITABLE_REFERENCES.search(line) is None, line
 
 
 def test_repeatedly_mapped_kernel_funcs_declare_their_signatures() -> None:

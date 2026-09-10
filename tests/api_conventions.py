@@ -1742,6 +1742,10 @@ def kernel_scope_ternary_problems() -> list[str]:
 
 # --- check 21 -----------------------------------------------------------------------------------
 
+# Two libraries the shipped package may not cite, in one pattern because the fix is the same for
+# both: say what the code computes, or name the algorithm in the literature's vocabulary. Their
+# *reasons* differ and are worth keeping apart -- MeshLib first, then promesh below.
+#
 # MeshLib's licence restricts *use*, not merely distribution of derivatives, and triwarp ships
 # ``MIT OR Apache-2.0`` -- so ``.claude/CLAUDE.md``'s MeshLib block requires that nothing under
 # ``triwarp/`` name the library at all: not the library, not one of its C++ functions, not one of
@@ -1753,43 +1757,62 @@ def kernel_scope_ternary_problems() -> list[str]:
 # said "port of" in the imperative, which is the sharper half of the defect and carries no ``MR``.
 # Prose mentions in ``tests/`` and ``benchmarks/`` are correct and required -- a comparison has to
 # say what it compares against -- so the scan is scoped to the package.
-_MESHLIB_REFERENCES = re.compile(
+#
+# ``promesh`` is here for a *related but distinct* reason, and the difference is worth stating so
+# the next reader does not merge the two rules. It is not proprietary -- it is
+# **unverifiable**: ``reference/promesh/`` is a bare source drop with no ``LICENSE``, no
+# ``COPYING`` and no ``pyproject.toml``, so its terms cannot be read from this repo at all, and it
+# is not a published package (nothing installs it, so it can never be a comparison row either).
+# Five references had accumulated in ``holes.py``, two of them claiming a *port* ("the Warp port
+# of promesh's ``triangulate_boundaries``", "Mirrors promesh's private helper") -- a derivation
+# claim against terms nobody here has checked, which is the same hazard as the MeshLib half even
+# though the licence story is the opposite. All five were rewritten into the algorithm's own
+# vocabulary (Barequet & Sharir's gap bridging, the minimal-perimeter heuristic, the
+# longest-increasing-subsequence monotonicity correction), which is what a reader wanted anyway.
+_UNCITABLE_REFERENCES = re.compile(
     # The ``MR`` source-file / class prefix is matched case-**sensitively**, inside a scoped
     # ``(?-i:)``, so that ``IGNORECASE`` on the rest cannot turn it into "any word starting with
     # mr". The ``\b`` is what keeps ``circumradius`` from matching it either way.
     r"\bmeshlib\b|\bmrmesh(py|numpy)\b|(?-i:\bMR[A-Z][A-Za-z]{2,})"
     r"|\bFanOptimizer\b|\bbuildLocalTriangulation\b|\bpositionVertsSmoothly"
-    r"|\bcalcQueueElement|\bupdateBorderQueueElement",
+    r"|\bcalcQueueElement|\bupdateBorderQueueElement"
+    r"|\bpromesh\b|\btriangulate_boundaries\b",
     re.IGNORECASE,
 )
 
 
-def meshlib_reference_problems() -> list[str]:
+def uncitable_reference_problems() -> list[str]:
     """
-    Check 21: a MeshLib name -- library, function or source file -- anywhere under ``triwarp/``.
+    Check 21: a name anywhere under ``triwarp/`` that the shipped package may not cite.
 
-    ``.claude/CLAUDE.md``'s MeshLib block: *"Nothing under ``triwarp/`` may name MeshLib at all"*,
-    because its licence restricts use rather than distribution and triwarp ships
+    Two libraries qualify, for opposite reasons, and the check is one scan because the *fix* is
+    identical either way.
+
+    **MeshLib** -- ``.claude/CLAUDE.md``'s MeshLib block: *"Nothing under ``triwarp/`` may name
+    MeshLib at all"*, because its licence restricts use rather than distribution and triwarp ships
     ``MIT OR Apache-2.0``, so an attribution comment collectively reads as a claim that a
     permissively licensed package is derived from a proprietary one. 89 such references were
     removed in one pass across 19 files; five had come back by the eighth kernels pass, two of them
     stating the claim outright ("port of ``FanOptimizer``"). A rule whose enforcement is "someone
     remembers to grep" has now failed once, which is what this check is for.
 
+    **promesh** -- not proprietary but *unverifiable*, and not a published package: its mirror
+    carries no licence file of any kind, and nothing installs it. Five references in ``holes.py``
+    claimed a port from it. See the comment above the pattern.
+
     Describe what the code computes, or name the algorithm in the literature's vocabulary -- which
-    is what section 10 asks for independently and what a reader needed anyway. Reading
-    ``reference/MeshLib`` to understand an operation's *interface* stays allowed; naming it here
-    does not.
+    is what section 10 asks for independently and what a reader needed anyway. Reading either
+    mirror to understand an operation's *interface* stays allowed; naming it here does not.
     """
     problems: list[str] = []
     for path in sorted(_PACKAGE_DIR.rglob("*.py")):
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            match = _MESHLIB_REFERENCES.search(line)
+            match = _UNCITABLE_REFERENCES.search(line)
             if match is None:
                 continue
             problems.append(
-                f"{path.relative_to(_REPO_ROOT)}:{number} names MeshLib "
-                f"('{match.group(0)}') -- say what the code computes, or name the algorithm"
+                f"{path.relative_to(_REPO_ROOT)}:{number} names a library the package may not "
+                f"cite ('{match.group(0)}') -- say what the code computes, or name the algorithm"
             )
     return problems
 

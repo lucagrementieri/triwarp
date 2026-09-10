@@ -2191,9 +2191,9 @@ def _stitch_loops_np(
     """
     Pure-NumPy port of the boundary zippering, used as the CPU reference for the kernels.
 
-    Mirrors ``triwarp.holes.stitch_loops`` (itself the port of promesh's
-    ``triangulate_boundaries``). Perimeters are computed in ``float32`` so the argmin tie-breaks
-    match the Warp kernels. Returns the flat ``(3 * n_faces,)`` face buffer.
+    Mirrors ``triwarp.holes.stitch_loops``'s greedy minimal-perimeter zippering, step for step.
+    Perimeters are computed in ``float32`` so the argmin tie-breaks match the Warp kernels.
+    Returns the flat ``(3 * n_faces,)`` face buffer.
     """
     vertices_a = vertices_a.astype(np.float32)
     vertices_b = vertices_b.astype(np.float32)

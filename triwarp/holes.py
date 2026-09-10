@@ -1599,8 +1599,9 @@ def stitch(
     Extracts the single boundary loop of each mesh
     ([`boundary_loops`][triwarp.boundary.boundary_loops]) and joins them with
     [`stitch_loops`][triwarp.holes.stitch_loops]. Each mesh must have
-    exactly one boundary loop (the promesh assumption); use ``stitch_loops`` directly to
-    join specific loops of multi-boundary meshes. **No smoothing** is applied.
+    exactly one boundary loop -- a restriction of this entry point, not of the seam construction;
+    use ``stitch_loops`` directly to join specific loops of multi-boundary meshes. **No
+    smoothing** is applied.
 
     Parameters
     ----------
@@ -1900,10 +1901,11 @@ def stitch_loops(
     Join two meshes by triangulating the band between one boundary loop on each.
 
     The two rims are zippered into a watertight seam by a greedy, order-preserving correspondence
-    (the Warp port of promesh's ``triangulate_boundaries``): every A-edge is matched to the B
-    vertex minimizing the added-triangle perimeter, the association is rotated so its shortest
-    pair comes first, and a longest-increasing-subsequence correction forces the matching to be
-    monotone (non-self-intersecting). **No smoothing or refinement** is applied — the seam reuses
+    -- the gap-bridging problem Barequet and Sharir (1995) pose, solved here by the standard
+    minimal-perimeter heuristic: every A-edge is matched to the B vertex minimizing the
+    added-triangle perimeter, the association is rotated so its shortest pair comes first, and a
+    longest-increasing-subsequence correction forces the matching to be monotone
+    (non-self-intersecting). **No smoothing or refinement** is applied — the seam reuses
     only the two loops' existing vertices, adding ``len(loop_a) + len(loop_b)`` bridge triangles.
 
     The larger loop is treated as A (the meshes are swapped internally when
@@ -2041,7 +2043,8 @@ def stitch_loops(
     col_roll = shift_b
 
     # Wraparound-group fix: if the lowest-index group is split across the ends of ``edge``, roll
-    # A so the group is contiguous (promesh's correction before the monotonicity pass).
+    # A so the group is contiguous. This has to run *before* the monotonicity pass below, which
+    # reads ``edge`` as a linear sequence and would otherwise see one group as two.
     if edge[-1] == edge[0]:
         trailing = int(np.argmin(np.flip(edge) == edge[0]))
         if trailing > 0:
@@ -2131,8 +2134,8 @@ def _non_increasing_indices(numbers: np.ndarray) -> np.ndarray:
 
     Repeated integers are perturbed by adding ``linspace(0, 1, count, endpoint=False)`` within
     each equal-value group, so a run of equal values is treated as (weakly) increasing and kept.
-    Mirrors promesh's private helper (with a NumPy grouping in place of ``trimesh.grouping.group``
-    to avoid a runtime ``trimesh`` dependency).
+    The equal-value grouping is done in NumPy rather than through ``trimesh.grouping.group``, so
+    that nothing here puts ``trimesh`` on the shipped package's dependency list.
     """
     different = numbers.astype(np.float64)
     order = np.argsort(numbers, kind="stable")
@@ -2151,7 +2154,7 @@ def _longest_increasing_subsequence(numbers: np.ndarray) -> np.ndarray:
 
     Repeated values must be pre-perturbed to distinct values (see
     [`_non_increasing_indices`][triwarp.holes._non_increasing_indices]); the algorithm does
-    not handle ties. Mirrors promesh's private helper of the same name.
+    not handle ties.
     """
     p = np.zeros_like(numbers, dtype=np.int64)
     m = -np.ones(numbers.size + 1, dtype=np.int64)
