@@ -6,9 +6,20 @@ TOLERANCE_MERGE = 1e-8
 TOLERANCE_PLANAR = 1e-5
 TOLERANCE_ZERO = 1e-12
 
-# Intrinsic mollification margin, as a fraction of the longest edge: the triangle inequality is
-# satisfied with this much slack rather than exactly, so a barely-valid triangle still yields a
-# finite cotangent weight. Shared by `laplacian.mollify_intrinsic` and `remesh.intrinsic_delaunay`.
+# Intrinsic mollification margin, as a fraction of the **mean** edge length (not the longest --
+# one long edge on a graded mesh would otherwise inflate the perturbation past anything a
+# degenerate face needs): the triangle inequality is satisfied with this much slack rather than
+# exactly, so a barely-valid triangle still yields a finite cotangent weight. Shared by
+# `laplacian.mollify_intrinsic` and `remesh.intrinsic_delaunay`.
+#
+# The value is bracketed on both sides and neither bound is slack. Too *small* and the single
+# global constant added to every length falls under a float32 length's own resolution, so no
+# stored length changes, the degenerate face stays degenerate and its couplings are still dropped
+# from the operator -- a silent no-op, which conditioning cannot reveal because a dropped face
+# contributes zero and so looks perfectly conditioned. Too *large* and that same global constant
+# perturbs the clean part of the mesh away from the true cotangent operator. ``1e-5`` sits about a
+# decade and a half from each arm; the measured bracket is in
+# `kernels/laplacian.triangle_inequality_slack`.
 TOLERANCE_MOLLIFY = 1e-5
 
 TOLERANCE_MERGE_CONSTANT = wp.float32(TOLERANCE_MERGE)

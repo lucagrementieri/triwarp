@@ -18,11 +18,13 @@ from tests.conftest import MESHES
 from tests.conversions import (
     bsr_to_csr,
     bsr_to_dense,
+    numpy_to_warp,
     points_to_warp,
     trimesh_to_meshlib,
     trimesh_to_pytorch3d,
     trimesh_to_pyvista,
 )
+from triwarp.constants import TOLERANCE_MOLLIFY
 
 # Not ``conftest.MESHES``: this predates that constant and has never carried ``cave_cube``.
 _LAPLACIAN_MESHES = ["icosahedron", "half_torus", "hemisphere"]
@@ -622,6 +624,56 @@ def test_robust_laplacian_keeps_couplings_the_plain_one_drops(sliver_patch: tupl
     assert (np.abs(plain[off_diagonal]) > 0).sum() < (np.abs(robust[off_diagonal]) > 0).sum()
 
 
+def test_robust_laplacian_barely_perturbs_the_rows_it_did_not_need_to(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """
+    Triwarp against triwarp: the price mollification charges the *undegenerate* part of the mesh.
+
+    ``cotmatrix`` carries the oracle here -- it is what
+    ``test_cotmatrix`` pins against ``igl.cotmatrix`` -- and this bounds how far
+    ``robust_laplacian`` may drift from it on the rows that no degenerate face touches.
+
+    ``delta`` is one **global** constant added to every edge length, so ``TOLERANCE_MOLLIFY`` buys
+    a finite cotangent on the bad face by perturbing the whole mesh, and the size of that
+    perturbation is what bounds the constant from *above*. Without this the constant is guarded on
+    one side only: raising it 1000x (to ``1e-2``) leaves the whole of ``test_laplacian``,
+    ``test_heat`` and ``test_remesh`` green, because every other fixture in those files is clean
+    enough that ``delta`` comes out zero and the constant is never exercised at all.
+
+    The bar bites on a 10x raise, not a 3x one: the deviation is linear in epsilon (~0.66 * eps
+    here), so ``3e-5`` sits ~4.4x above the shipped value's measured 6.8e-06 and is crossed once
+    epsilon reaches ~4.5e-5. The companion lower bound is
+    ``test_robust_laplacian_keeps_couplings_the_plain_one_drops``, which fails if the constant is
+    *lowered* until ``delta`` no longer survives float32 storage.
+    """
+    mesh_tm, _ = icosphere_coarse
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64).copy()
+    faces_np = np.asarray(mesh_tm.faces, dtype=np.int32)
+    # Collapse face 0 exactly, by snapping its apex onto the midpoint of its own opposite edge.
+    apex_a, apex_b, apex_c = (int(index) for index in faces_np[0])
+    vertices_np[apex_c] = 0.5 * (vertices_np[apex_a] + vertices_np[apex_b])
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np.reshape(-1), device)
+    n_vertices = len(vertices_np)
+
+    _lengths, delta = tw.laplacian.mollify_intrinsic(vertices_wp, faces_wp)
+    # Non-vacuity: if the collapse did not actually break the inequality there is nothing to price.
+    assert delta > 0.0
+
+    plain = bsr_to_dense(tw.laplacian.cotmatrix(vertices_wp, faces_wp), n_vertices)
+    robust = bsr_to_dense(
+        tw.laplacian.robust_laplacian(vertices_wp, faces_wp, use_intrinsic_delaunay=False),
+        n_vertices,
+    )
+    clean = np.setdiff1d(np.arange(n_vertices), np.unique(faces_np[0]))
+    block = np.ix_(clean, clean)
+    scale = np.abs(plain[block]).max()
+    assert scale > 0.0
+
+    deviation = np.abs(robust[block] - plain[block]).max() / scale
+    assert deviation < 3e-5
+
+
 def test_cotmatrix_entries_are_zero_for_a_zero_area_face(device: str) -> None:
     """
     A collinear triangle yields zero weights, not infinities.
@@ -742,7 +794,19 @@ def test_mollify_intrinsic_restores_the_triangle_inequality(sliver_patch: tuple)
         return np.minimum(np.minimum(a + b - c, b + c - a), c + a - b)
 
     assert worst_slack(original).min() <= 0.0
-    assert worst_slack(mollified.numpy()).min() > 0.0
+    # Against the *documented* margin, not merely against zero. ``> 0.0`` alone passes for any
+    # positive ``delta`` and so cannot tell a correct mollification from one that adds half of what
+    # the inequality needs -- which is exactly the defect this assert was rewritten to catch.
+    # ``mollify_intrinsic`` promises ``epsilon * mean_edge_length``; the slack it delivers is
+    # ``delta`` above the original's, and the float32 sum of two lengths of ~1 with a ~1e-5 delta
+    # is what sets the 5 % slop.
+    #
+    # That slop is also what makes this the *lower* guard on ``TOLERANCE_MOLLIFY``: at 1e-6 the
+    # constant is only ~13 ULP of the mean edge, so rounding the stored sum eats far more than 5 %
+    # of it and this assert fails -- which is the float32 floor
+    # ``kernels/laplacian.triangle_inequality_slack`` documents, caught rather than reasoned about.
+    margin = TOLERANCE_MOLLIFY * float(original.mean())
+    assert worst_slack(mollified.numpy()).min() >= margin * (1.0 - 5e-2)
     # One global constant, added to every length: that is what keeps the operator symmetric. The
     # tolerance is loose because ``delta`` here is ~1e-5 against lengths of ~1, so the sum lands at
     # the edge of float32's resolution.

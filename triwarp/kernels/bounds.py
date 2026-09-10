@@ -3,11 +3,13 @@ import math
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT
+from triwarp.kernels.predicates import TWO_PI_F64
 
 # Super-Fibonacci spiral constants [Alexa 2022]: the two irrational strides whose phase pair
 # equidistributes over SO(3). Held as reciprocals, and multiplied rather than divided by, so the
-# candidate set is bit-comparable with ``igl::super_fibonacci``'s.
-TWO_PI_F64 = wp.constant(wp.float64(2.0 * math.pi))
+# candidate set is bit-comparable with ``igl::super_fibonacci``'s. The full turn they scale is
+# ``kernels/predicates.TWO_PI_F64`` -- one definition, because a second spelling of 2*pi is a
+# second thing to keep in step for no gain.
 SUPER_FIBONACCI_RSQRT2 = wp.constant(wp.float64(1.0 / math.sqrt(2.0)))
 SUPER_FIBONACCI_RPSI = wp.constant(wp.float64(1.0 / 1.533751168755204288118041))
 

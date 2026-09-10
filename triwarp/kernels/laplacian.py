@@ -1,14 +1,9 @@
-import math
-
 import warp as wp
 
 from triwarp.kernels.array import OverloadTable
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.predicates import doublearea_from_lengths, squared_edge_lengths
 from triwarp.kernels.triangles import face_vertices, row_triple
-
-TWO_PI_F64 = wp.constant(wp.float64(2.0 * math.pi))
-
 
 # ``cot_entries_from_l2`` and ``cot_entries_from_edge_lengths`` stay here rather than joining
 # ``squared_edge_lengths`` / ``doublearea_from_lengths`` in ``kernels/predicates.py``: a cotangent
@@ -267,12 +262,43 @@ def triangle_inequality_slack(
 ) -> None:
     # How far this triangle is from satisfying the strict triangle inequality with margin
     # ``epsilon``, expressed as the constant that would have to be added to all three of its edges.
-    # Adding a constant lengthens the two short sides by ``2 * delta`` against the long side's
-    # ``delta``, so half the shortfall is enough.
+    # Adding ``delta`` to all three grows each slack ``a + b - c`` by exactly ``delta`` -- the two
+    # short sides gain ``2 * delta`` and the long side gives ``delta`` of it back -- so the
+    # shortfall is the constant, undivided. Sharp & Crane (2020) eq. 3 states the same rule, and
+    # an independent port of it (kentechx/HoleFillingPy, MIT) computes the identical quantity a
+    # different way -- ``max(2 * max(L) - sum(L)) + delta``, which is ``epsilon - min_f slack_f``
+    # rearranged -- also undivided.
+    #
+    # ``TOLERANCE_MOLLIFY = 1e-5`` was swept here against both of its arms, on a float32 sliver
+    # whose plain operator drops a coupling and on an icosphere(3) with one face collapsed onto
+    # its own opposite edge. Reading ``delta`` in units of one ULP of the mean edge length, and
+    # the perturbation as the relative change to the operator's rows that *no* degenerate face
+    # touches:
+    #
+    #   epsilon   delta/ulp   sliver's coupling   max|cot|   clean-row deviation
+    #     1e-8          0.1   dropped (no-op)         1.0                     0
+    #     3e-8          0.4   dropped (no-op)         1.0                     0
+    #     1e-7          1.3   dropped                 1.0              1.2e-07
+    #     3e-7          4.0   restored              7.2e2              2.4e-07
+    #     1e-6         13.5   restored              4.2e2              3.6e-07
+    #     1e-5        134.9   restored              1.2e2              8.2e-06
+    #     1e-4       1348.9   restored              3.9e1              8.0e-05
+    #     1e-2     134890.1   restored              4.0e0              8.0e-03
+    #
+    # So the left arm is a float32 storage floor, not a numerical-quality one: under ~4 ULP the
+    # added constant does not survive the store and the mollification silently does nothing, which
+    # is the failure the whole function exists to prevent. The right arm is the deviation column,
+    # which grows linearly with epsilon and reaches the ``rtol=1e-4`` the igl
+    # ``intrinsic_delaunay_cotmatrix`` comparison runs at by epsilon = 1e-4. ``1e-5`` is ~1.5
+    # decades clear of both, and is a decade *more* conservative than that port's own 1e-4, which
+    # sits on the right arm. Its neighbours are each worse in one direction: 1e-6 leaves only
+    # 13.5 ULP of headroom over a floor that moves with the mesh's length distribution, and 1e-4
+    # starts eating the parity test's tolerance. A clean mesh yields ``delta == 0`` at every
+    # epsilon probed, so none of this is paid where nothing is degenerate.
     f = wp.int32(wp.tid())
     a, b, c = row_triple(edge_lengths, f)
     worst = wp.max(wp.max(epsilon - (a + b - c), epsilon - (b + c - a)), epsilon - (c + a - b))
-    out_slack[f] = wp.max(worst, 0.0) * 0.5
+    out_slack[f] = wp.max(worst, 0.0)
 
 
 @wp.func

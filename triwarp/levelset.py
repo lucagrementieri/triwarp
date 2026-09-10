@@ -46,17 +46,26 @@ import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.kernels import levelset as kernel_levelset
 
-# Bounds on the automatic ``voxel_size``, both expressed as samples across the mesh's bounding-box
-# diagonal, and both load-bearing rather than defensive.
+# Bounds on the automatic ``voxel_size``, both expressed as a sample count across a span, and both
+# load-bearing rather than defensive. The spans differ, which is the part to read carefully: the
+# floor counts across the mesh's own bounding-box diagonal, the cap across the padded lattice.
 #
 # The **cap** stops a small offset distance on a large mesh from asking for a lattice nobody can
-# allocate: a distance field costs 4 bytes a sample, so 256 per axis is 67 MB.
+# allocate: a distance field costs 4 bytes a sample, so 256 per axis is 67 MB. It is measured
+# against the *padded* extent -- the diagonal plus the two outward margins the offset band needs --
+# rather than against the mesh's own diagonal, because the padding is what actually grows without
+# bound: an outward offset of ten times the diagonal pads by ``distance / spacing`` cells on every
+# side, so a cap that only counts the mesh permits a lattice orders of magnitude past it.
 #
 # The **floor** guards a real failure mode. Tying the spacing to the offset distance alone
 # resolves the *band* the level set sits in but not necessarily what is left of the object: an
 # inward offset of 0.9 on a unit sphere leaves a sphere of radius 0.1, which at a spacing of 0.9/3
 # is smaller than one cell -- so marching cubes finds nothing and the call returns **empty** for a
 # level set that exists. At least 64 samples across the mesh avoids that, for a 64 ** 3 lattice.
+#
+# Where the two conflict -- a large outward offset, where resolving the mesh to 64 samples would
+# blow the allocation -- the **cap wins**, because the floor only buys accuracy where the cap
+# decides whether the call runs at all.
 _MAX_AUTO_RESOLUTION = 256
 _MIN_AUTO_RESOLUTION = 64
 
@@ -91,7 +100,10 @@ def marching_cubes(
     bounds
         ``(lower, upper)`` world-space corners the lattice spans, so ``field[0, 0, 0]`` sits at
         ``lower`` and ``field[nx - 1, ny - 1, nz - 1]`` at ``upper``. When ``None`` the result is in
-        *index* space: vertex coordinates are lattice indices.
+        *index* space: vertex coordinates are lattice indices. The mapping is positional and is not
+        checked, so a pair passed the other way round is honoured rather than rejected: it mirrors
+        the result along every axis it inverts, which flips the winding with it, and a pair whose
+        corners coincide collapses every vertex onto that point.
 
     Returns
     -------
@@ -102,8 +114,10 @@ def marching_cubes(
 
     Raises
     ------
+    TypeError
+        If ``field`` is not a rank-3 ``wp.float32`` array.
     ValueError
-        If ``field`` is not a rank-3 ``wp.float32`` array, or any of its dimensions is below 2.
+        If any of ``field``'s dimensions is below 2.
 
     See Also
     --------
@@ -188,7 +202,8 @@ def offset_mesh(
     Raises
     ------
     ValueError
-        If ``distance`` is zero, ``voxel_size`` is not positive, or ``faces`` is empty.
+        If ``distance`` is zero, ``voxel_size`` is not positive, ``faces`` is empty, or
+        ``voxel_size`` is left to be derived on a mesh whose bounding box has zero extent.
     RuntimeError
         If ``vertices`` and ``faces`` are not all on one device.
 
@@ -205,7 +220,9 @@ def offset_mesh(
     lattice boundary, so the padding is ``ceil(distance / voxel_size) + 2`` cells for an outward
     offset; and the spacing has to resolve the band, which is what ties it to ``distance`` rather
     than to the mesh. Getting either wrong yields a *plausible* surface with a hole in it, which is
-    why they are computed here rather than left to the caller.
+    why they are computed here rather than left to the caller. A derived ``voxel_size`` is also
+    bounded so that the lattice **including its padding** stays allocatable, which coarsens a very
+    large outward offset rather than refusing it; pass ``voxel_size`` to override that.
 
     The output is a resampled surface: its triangulation is the marching-cubes lattice's, not the
     input's, and its vertex count is set by ``voxel_size`` rather than by the input's. Where the
@@ -235,11 +252,18 @@ def offset_mesh(
     if spacing is None:
         diagonal = float(tw.bounds.enclosing_diagonal(vertices))
         # The band sets the spacing, and the two resolution bounds keep it usable: fine enough to
-        # resolve what survives the offset, coarse enough to allocate. See the constants.
-        spacing = min(
-            max(abs(distance) / _SAMPLES_PER_DISTANCE, diagonal / _MAX_AUTO_RESOLUTION),
-            diagonal / _MIN_AUTO_RESOLUTION,
+        # resolve what survives the offset, coarse enough to allocate. The cap is applied last, so
+        # it wins over the floor. See the constants.
+        padded_extent = diagonal + 2.0 * max(distance, 0.0)
+        spacing = max(
+            min(abs(distance) / _SAMPLES_PER_DISTANCE, diagonal / _MIN_AUTO_RESOLUTION),
+            padded_extent / _MAX_AUTO_RESOLUTION,
         )
+        if spacing <= 0.0:
+            raise ValueError(
+                "cannot derive a voxel_size for a mesh whose bounding box has zero extent; "
+                "pass voxel_size explicitly"
+            )
     # Only an outward offset leaves the input's box; an inward one needs just the two cells the
     # field itself wants so that the surface is enclosed.
     pad = 2 + (math.ceil(distance / spacing) if distance > 0.0 else 0)
@@ -320,7 +344,7 @@ def thicken_mesh(
 
     The normals are **angle-weighted** (the pseudonormal), which is the weighting that makes the
     displacement independent of how the incident triangles happen to be subdivided;
-    [`triwarp.vertices`][triwarp.vertices] documents the four choices.
+    [`triwarp.vertices`][triwarp.vertices] documents the three choices.
 
     See Also
     --------

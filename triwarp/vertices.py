@@ -64,6 +64,8 @@ def mean_vertex_normals(
 
     Raises
     ------
+    ValueError
+        If ``face_normals`` does not have one entry per triangle in ``faces``.
     RuntimeError
         If ``faces`` and ``face_normals`` are not all on one device.
 
@@ -75,6 +77,7 @@ def mean_vertex_normals(
         The geometry-aware entry point, which derives a weight table and calls one of these two.
     """
     require_same_device(faces=faces, face_normals=face_normals)
+    _require_face_rows(int(faces.shape[0]) // 3, face_normals=face_normals)
     return _accumulate_and_normalize(
         n_vertices, faces, kernel_scatter.scatter_sum_vec, face_normals
     )
@@ -113,6 +116,8 @@ def weighted_vertex_normals(
 
     Raises
     ------
+    ValueError
+        If ``face_normals`` or ``face_weights`` does not have one row per triangle in ``faces``.
     RuntimeError
         If ``faces``, ``face_normals`` and ``face_weights`` are not all on one device.
 
@@ -124,6 +129,9 @@ def weighted_vertex_normals(
         The geometry-aware entry point, which derives a weight table and calls this.
     """
     require_same_device(faces=faces, face_normals=face_normals, face_weights=face_weights)
+    _require_face_rows(
+        int(faces.shape[0]) // 3, face_normals=face_normals, face_weights=face_weights
+    )
     return _accumulate_and_normalize(
         n_vertices, faces, kernel_scatter.scatter_weighted_sum_vec, face_normals, face_weights
     )
@@ -164,12 +172,19 @@ def _accumulate_and_normalize(
     -------
     wp.array[wp.vec3]
         Length-``n_vertices`` unit normals; zero where the accumulated vector was zero.
+
+    Notes
+    -----
+    The launch ``dim`` is taken from ``faces``, not from ``values``: every array here is indexed by
+    the face, and ``faces`` is the only one of them whose length also bounds the *gather* the
+    scatter kernel does. Callers guarantee the rest agree by calling ``_require_face_rows`` first.
     """
     device = faces.device
+    n_faces = int(faces.shape[0]) // 3
     sums = wp.zeros((n_vertices, 3), dtype=wp.float32, device=device)
     wp.launch(
         scatter_kernel,
-        dim=int(values.shape[0]),
+        dim=n_faces,
         inputs=[values, faces.reshape((-1, 3)), *extra, sums],
         device=device,
     )
@@ -242,8 +257,9 @@ def vertex_normals(
     Raises
     ------
     ValueError
-        If ``weighting`` is not one of the three names, or if ``face_weights`` is passed with
-        ``weighting="mwselr"``.
+        If ``weighting`` is not one of the three names, if ``face_weights`` is passed with
+        ``weighting="mwselr"``, or if a supplied ``face_normals`` / ``face_weights`` does not have
+        one row per triangle in ``faces``.
     RuntimeError
         If ``vertices``, ``faces``, ``face_normals`` and ``face_weights`` are not all on one
         device.
@@ -311,7 +327,8 @@ def vertex_normals(
             face_normals = computed_normals
         if face_weights is None:
             face_weights = computed_areas
-    scaled_normals = wp.empty(int(face_weights.shape[0]), dtype=wp.vec3, device=device)
+    _require_face_rows(n_faces, face_normals=face_normals, face_weights=face_weights)
+    scaled_normals = wp.empty(n_faces, dtype=wp.vec3, device=device)
     wp.map(wp.mul, face_normals, face_weights, out=scaled_normals)
     return mean_vertex_normals(n_vertices, faces, scaled_normals)
 
@@ -346,6 +363,8 @@ def vertex_defects(
 
     Raises
     ------
+    ValueError
+        If ``face_angles`` does not have one row per triangle in ``faces``.
     RuntimeError
         If ``faces`` and ``face_angles`` are not all on one device.
 
@@ -359,11 +378,13 @@ def vertex_defects(
         The angles this sums.
     """
     require_same_device(faces=faces, face_angles=face_angles)
+    n_faces = int(faces.shape[0]) // 3
+    _require_face_rows(n_faces, face_angles=face_angles)
     angle_sum = wp.zeros(n_vertices, dtype=wp.float32, device=faces.device)
     faces2d = faces.reshape((-1, 3))
     wp.launch(
         kernel_scatter.SCATTER_SUM_SCALAR[face_angles.dtype],
-        dim=int(face_angles.shape[0]),
+        dim=n_faces,
         inputs=[face_angles, faces2d, angle_sum],
         device=faces.device,
     )
@@ -371,3 +392,33 @@ def vertex_defects(
     # ``TWO_PI - angle_sum`` would run the same wp.map into a second allocation.
     wp.map(kernel_predicates.angle_defect, angle_sum, out=angle_sum)
     return angle_sum
+
+
+def _require_face_rows(n_faces: int, **named: wp.array) -> None:
+    """
+    Check that every named per-face table has one row per triangle.
+
+    The scatter kernels underneath this module index ``faces``, ``face_normals`` and any weight
+    table by the same face id, so a table of the wrong length is read out of range -- which on the
+    CUDA device is an illegal access that kills the context and on the host is a heap read, never
+    an exception. One comparison of a handful of ``.shape[0]`` values at the public boundary turns
+    that into an ordinary Python error, for a cost unmeasurable next to the launch it precedes.
+
+    Parameters
+    ----------
+    n_faces
+        Triangle count the tables must match, derived from the caller's ``faces`` buffer.
+    named
+        Per-face arrays, keyed by the public argument name they arrived under.
+
+    Raises
+    ------
+    ValueError
+        If any named array's leading dimension is not ``n_faces``.
+    """
+    for name, array in named.items():
+        rows = int(array.shape[0])
+        if rows != n_faces:
+            raise ValueError(
+                f"{name} must have one row per triangle: got {rows} for {n_faces} faces"
+            )
