@@ -117,6 +117,10 @@ def edges_unique(
 
     Raises
     ------
+    TypeError
+        If ``edges_sorted`` is given and is not a rank-2 ``wp.int32`` array.
+    ValueError
+        If ``edges_sorted`` is given and does not have exactly two columns.
     RuntimeError
         If ``faces`` and ``edges_sorted`` are not all on one device.
 
@@ -126,6 +130,8 @@ def edges_unique(
     [`trimesh.Trimesh.edges_unique_inverse`][]
     """
     require_same_device(faces=faces, edges_sorted=edges_sorted)
+    if edges_sorted is not None:
+        twt.ensure_edge_pairs(edges_sorted, "edges_sorted")
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
 
@@ -178,6 +184,10 @@ def edges_unique_inverse(
 
     Raises
     ------
+    TypeError
+        If ``edges_sorted`` is given and is not a rank-2 ``wp.int32`` array.
+    ValueError
+        If ``edges_sorted`` is given and does not have exactly two columns.
     RuntimeError
         If ``faces`` and ``edges_sorted`` are not all on one device.
 
@@ -217,6 +227,10 @@ def edges_unique_length(
 
     Raises
     ------
+    TypeError
+        If ``unique_edges`` is not a rank-2 ``wp.int32`` array.
+    ValueError
+        If ``unique_edges`` does not have exactly two columns.
     RuntimeError
         If ``vertices``, ``faces`` and ``unique_edges`` are not all on one device.
 
@@ -228,7 +242,7 @@ def edges_unique_length(
     if unique_edges is None:
         unique_edges, _ = edges_unique(faces, n_vertices=n_vertices)
 
-    return _edge_lengths(vertices, unique_edges)
+    return _edge_lengths(vertices, unique_edges, "unique_edges")
 
 
 def edges_length(
@@ -254,6 +268,10 @@ def edges_length(
 
     Raises
     ------
+    TypeError
+        If ``edges_in`` is not a rank-2 ``wp.int32`` array.
+    ValueError
+        If ``edges_in`` does not have exactly two columns.
     RuntimeError
         If ``vertices``, ``faces`` and ``edges_in`` are not all on one device.
     """
@@ -261,10 +279,12 @@ def edges_length(
     if edges_in is None:
         edges_in = faces_to_edges(faces)
 
-    return _edge_lengths(vertices, edges_in)
+    return _edge_lengths(vertices, edges_in, "edges_in")
 
 
-def _edge_lengths(vertices: wp.array[wp.vec3], edges: twt.Array2dInt32) -> wp.array[wp.float32]:
+def _edge_lengths(
+    vertices: wp.array[wp.vec3], edges: twt.Array2dInt32, name: str
+) -> wp.array[wp.float32]:
     """
     Euclidean length of every row of an ``(m, 2)`` edge table.
 
@@ -272,7 +292,14 @@ def _edge_lengths(vertices: wp.array[wp.vec3], edges: twt.Array2dInt32) -> wp.ar
     [`edges_length`][triwarp.edges.edges_length], which differ only in which edge table they
     obtain first. Stays a kernel rather than a ``wp.map`` over gathered endpoints: the columns
     of ``edges`` are strided views, and Warp's Python-scope gather ignores a view's stride.
+
+    ``name`` is the *caller's* parameter name, so the shape guard names the keyword the caller
+    actually passed. The guard runs here rather than at the two entry points because the kernel
+    reads columns 0 and 1 unconditionally: a wider table is accepted silently and its third column
+    ignored, where a rank-1 buffer raises at launch -- so only the wide case needs catching, and it
+    needs catching on both paths.
     """
+    twt.ensure_edge_pairs(edges, name)
     m = int(edges.shape[0])
     device = vertices.device
     if m == 0:

@@ -1,6 +1,12 @@
 import warp as wp
 
-from triwarp.kernels.array import pack_ranked_key, update_argmin_pair
+from triwarp.kernels.array import (
+    declare_map_signatures,
+    map_probe,
+    map_probe_single,
+    pack_ranked_key,
+    update_argmin_pair,
+)
 from triwarp.kernels.halfedge import halfedge_destination, halfedge_next
 from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_normal
 from triwarp.kernels.triangles import corner_triple, triangle_cross, write_corner_triple
@@ -296,26 +302,54 @@ def emit_degree3_replacement(
         out_new_faces[slot, k] = halfedge_destination(faces, ring_halfedges[begin + k])
 
 
+@wp.func
+def next_boundary_halfedge(
+    faces: wp.array[wp.int32], twins: wp.array[wp.int32], h: wp.int32
+) -> wp.int32:
+    # The boundary halfedge following ``h`` around the rim, or -1 if the fan does not close.
+    #
+    # Rotate around ``h``'s tip through the faces on ``h``'s own side until an outgoing halfedge
+    # with no twin turns up. That sector is what makes this well defined where a per-*vertex* table
+    # is not: a bowtie rim vertex -- two rim loops pinched at one point, edge-manifold and
+    # consistently wound, so nothing upstream rejects it -- has two outgoing boundary halfedges,
+    # and this picks the one bounding the same sector as ``h`` rather than whichever won a race.
+    # The map is a bijection on boundary halfedges for the same reason, which is what lets the
+    # caller invert it by scatter without an atomic.
+    #
+    # The bound is the face count because a fan cannot be longer than the mesh; it is never
+    # approached, and it is here so a malformed twin table cannot spin forever.
+    g = halfedge_next(h)
+    for _ in range(faces.shape[0] // 3):
+        if twins[g] < 0:
+            return g
+        g = halfedge_next(twins[g])
+    return -1
+
+
 @wp.kernel
 def collect_rim_links(
     faces: wp.array[wp.int32],
     twins: wp.array[wp.int32],
     out_rim_next: wp.array[wp.int32],
     out_rim_prev: wp.array[wp.int32],
-    out_rim_face: wp.array[wp.int32],
 ) -> None:
-    # The rim as a per-vertex linked list, from the halfedges that have no twin. A boundary vertex
-    # of an edge-manifold mesh has exactly one outgoing boundary halfedge, so nothing races: each
-    # slot is written once. ``rim_face`` is the face owning the *outgoing* one, which is the face
-    # whose normal a new triangle at that vertex has to agree with.
+    # The rim as a linked list over *halfedges*, from those that have no twin.
+    #
+    # Keyed by halfedge rather than by vertex deliberately. Edge-manifoldness -- the caller's only
+    # validation -- does not make the rim a set of simple loops through the vertices: at a bowtie
+    # vertex two rim loops pass through one point, so a per-vertex ``next`` / ``prev`` / ``face``
+    # triple has two writers and no answer, and the three slots could be won by different halfedges
+    # so that the fold-over normal gate tested a face not bordering the candidate triangle at all
+    # (measured: ``prev[2]`` read 4 on cpu and 1 on cuda:0 for one five-vertex bowtie). Per
+    # halfedge each slot has exactly one writer, both rim loops keep their own links, and the
+    # bordering faces are read off the halfedges themselves rather than from a third table.
     h = wp.int32(wp.tid())
     if twins[h] >= 0:
         return
-    tail = faces[h]
-    tip = halfedge_destination(faces, h)
-    out_rim_next[tail] = tip
-    out_rim_prev[tip] = tail
-    out_rim_face[tail] = h // 3
+    following = next_boundary_halfedge(faces, twins, h)
+    out_rim_next[h] = following
+    if following >= 0:
+        out_rim_prev[following] = h
 
 
 @wp.kernel
@@ -324,36 +358,40 @@ def straighten_candidate_mask(
     faces: wp.array[wp.int32],
     face_normals: wp.array[wp.vec3],
     rim_next: wp.array[wp.int32],
-    rim_prev: wp.array[wp.int32],
-    rim_face: wp.array[wp.int32],
     min_normal_dot: wp.float32,
     max_aspect_ratio: wp.float32,
     out_candidate: wp.array[wp.bool],
 ) -> None:
-    # A rim vertex whose notch can be closed by one triangle. The rim runs ``prev -> v -> next``
-    # with the surface on its left, so a face attached outside it must carry the halfedges
-    # ``v -> prev`` and ``next -> v`` -- which is the triangle ``(next, v, prev)``, and that winding
-    # is what makes the result consistently oriented rather than merely watertight.
+    # A notch that can be closed by one triangle, indexed by the boundary halfedge *entering* it.
+    # That halfedge runs ``previous -> v`` and its successor runs ``v -> following``, with the
+    # surface on their left, so a face attached outside the rim must carry the halfedges
+    # ``v -> previous`` and ``following -> v`` -- which is the triangle ``(following, v,
+    # previous)``, and that winding is what makes the result consistently oriented rather than
+    # merely watertight.
     #
     # Two gates, both from the caller: the new triangle's normal must agree with the two rim faces
-    # it will border (which is what stops a *convex* corner being folded over), and its aspect ratio
-    # must be finite enough to be worth adding.
-    v = wp.int32(wp.tid())
-    previous = rim_prev[v]
-    following = rim_next[v]
-    if previous < 0 or following < 0 or previous == following:
+    # it will border -- which are the two halfedges' own faces, so no lookup can pair it with the
+    # wrong one -- and its aspect ratio must be finite enough to be worth adding.
+    h = wp.int32(wp.tid())
+    outgoing = rim_next[h]
+    if outgoing < 0:
         return
+    previous = faces[h]
+    v = halfedge_destination(faces, h)
+    following = halfedge_destination(faces, outgoing)
+    if previous == following:
+        return  # a two-edge rim loop spans no notch
     normal = triangle_normal(vertices[following], vertices[v], vertices[previous])
     if wp.length(normal) == 0.0:
         return
-    if wp.dot(normal, face_normals[rim_face[previous]]) < min_normal_dot:
+    if wp.dot(normal, face_normals[h // 3]) < min_normal_dot:
         return
-    if wp.dot(normal, face_normals[rim_face[v]]) < min_normal_dot:
+    if wp.dot(normal, face_normals[outgoing // 3]) < min_normal_dot:
         return
     ratio = triangle_aspect_ratio(vertices[following], vertices[v], vertices[previous])
     if ratio > max_aspect_ratio:
         return
-    out_candidate[v] = True
+    out_candidate[h] = True
 
 
 @wp.kernel
@@ -365,20 +403,25 @@ def emit_straighten_faces(
     cursor: wp.array[wp.int32],
     out_new_faces: wp.array2d[wp.int32],
 ) -> None:
-    # One new face per accepted notch, and only where no rim neighbour with a lower index also
+    # One new face per accepted notch, and only where neither rim neighbour with a lower index also
     # qualifies -- two adjacent notches share a rim edge, so filling both in one pass would attach
-    # two faces to it.
-    v = wp.int32(wp.tid())
-    if not candidate[v]:
+    # two faces to it. Lowest halfedge index wins, which makes the choice deterministic.
+    #
+    # ``rim_next[h]`` is read unguarded because ``candidate[h]`` is set only where it is a real
+    # halfedge; ``rim_prev[h]`` is guarded because a fan that failed to close leaves it unwritten.
+    h = wp.int32(wp.tid())
+    if not candidate[h]:
         return
-    previous = rim_prev[v]
-    following = rim_next[v]
-    if (candidate[previous] and previous < v) or (candidate[following] and following < v):
+    outgoing = rim_next[h]
+    incoming = rim_prev[h]
+    if candidate[outgoing] and outgoing < h:
+        return
+    if incoming >= 0 and candidate[incoming] and incoming < h:
         return
     slot = wp.atomic_add(cursor, 0, 1)
-    out_new_faces[slot, 0] = following
-    out_new_faces[slot, 1] = v
-    out_new_faces[slot, 2] = previous
+    out_new_faces[slot, 0] = halfedge_destination(faces, outgoing)
+    out_new_faces[slot, 1] = halfedge_destination(faces, h)
+    out_new_faces[slot, 2] = faces[h]
 
 
 @wp.kernel
@@ -387,21 +430,53 @@ def flatten_degree3_positions(
     faces: wp.array[wp.int32],
     ring_offsets: wp.array[wp.int32],
     ring_halfedges: wp.array[wp.int32],
-    is_boundary: wp.array[wp.bool],
-    region: wp.array[wp.bool],
+    selected: wp.array[wp.bool],
     out_positions: wp.array[wp.vec3],
 ) -> None:
-    # Move each interior valence-3 vertex to the centroid of its three neighbours -- which lies in
-    # their plane, so the little tetrahedral bump flattens into it. Two such vertices cannot be
-    # neighbours on an edge-manifold mesh (each would need the other's whole ring), so every thread
-    # reads positions no other thread is writing and one pass is enough.
+    # Move each selected vertex to the centroid of its three neighbours -- which lies in their
+    # plane, so the little tetrahedral bump flattens into it.
+    #
+    # ``selected`` is an *independent* set of interior valence-3 vertices, and the independence is
+    # what makes the centroid the answer rather than an approximation of it: two such vertices can
+    # be neighbours (a tetrahedron is four of them, each adjacent to the other three), and moving
+    # both at once puts neither in the other's *new* plane. Doing it anyway maps the regular
+    # tetrahedron to minus a third of itself -- mirrored, every normal flipped and the signed
+    # volume negated, measured -2.667 in and +0.099 out -- which is why the caller runs
+    # ``select_independent_degree3`` first rather than launching this over every candidate.
+    #
+    # The divisor is a literal 3 because ``selected`` implies interior valence 3; the ring walk is
+    # over ``ring_offsets`` all the same, so a stale mask cannot make it read past the ring.
     vertex = wp.int32(wp.tid())
-    begin = ring_offsets[vertex]
-    end = ring_offsets[vertex + 1]
-    if not region[vertex] or not is_interior_degree3(begin, end, is_boundary[vertex]):
+    if not selected[vertex]:
         out_positions[vertex] = positions[vertex]
         return
     total = wp.vec3()
-    for slot in range(begin, end):
+    for slot in range(ring_offsets[vertex], ring_offsets[vertex + 1]):
         total += positions[halfedge_destination(faces, ring_halfedges[slot])]
     out_positions[vertex] = total / wp.float32(3.0)
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not two.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was derived
+    and what forks a ``wp.map`` module; only this module's *own* forking ops belong here (the shared
+    builtins are declared there).
+
+    One op: ``is_interior_degree3``, mapped over ``(ring_offsets[:-1], ring_offsets[1:],
+    is_boundary)`` by both ``repair.remove_degree3_vertices`` and
+    ``repair.flatten_degree3_vertices``. The length-1 row is not speculative -- a ring CSR over a
+    one-vertex mesh makes both offset slices length 1, and the broadcast mask is part of the cache
+    key, so that call would fork the module on first use.
+    """
+    dense, single = map_probe, map_probe_single
+    declare_map_signatures(
+        [
+            (is_interior_degree3, (dense(wp.int32), dense(wp.int32), dense(wp.bool)), wp.bool),
+            (is_interior_degree3, (single(wp.int32), single(wp.int32), single(wp.bool)), wp.bool),
+        ]
+    )
+
+
+_declare_map_kernels()

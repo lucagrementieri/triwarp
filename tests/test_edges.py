@@ -12,6 +12,7 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+import triwarp.typing as twt
 from tests.comparisons import assert_unordered_rows_equal, lexsort_rows
 from tests.conftest import MESHES
 from tests.conversions import (
@@ -510,6 +511,42 @@ def test_edges_length_precomputed(device: str) -> None:
     lengths_via_precomputed = tw.edges.edges_length(vertices_wp, faces_wp, edges_in=edges_in_wp)
     lengths_fresh = tw.edges.edges_length(vertices_wp, faces_wp)
     assert np.allclose(lengths_via_precomputed.numpy(), lengths_fresh.numpy(), rtol=1e-5, atol=1e-5)
+
+
+def test_precomputed_edge_tables_must_be_pairs(device: str) -> None:
+    """
+    Not a library comparison: the shape guard on every precomputed edge-table keyword here.
+
+    ``_edge_lengths``' kernel reads columns 0 and 1 out of whatever rank-2 table it is handed, so a
+    wider one is accepted and its remaining columns silently ignored -- an ``(m, 3)`` *face* buffer
+    passed where an edge list belongs returned plausible lengths rather than raising. A rank-1
+    buffer already failed at launch, so only the wide case ever needed catching, and it needed
+    catching on all three keywords.
+
+    The happy path is asserted alongside so the guard cannot be satisfied by rejecting everything.
+    """
+    rng = np.random.default_rng(11)
+    verts_np = rng.random((30, 3), dtype=np.float32)
+    faces_np = rng.integers(0, 30, size=(10, 3), dtype=np.int32)
+    faces_wp = _faces_np_to_wp(faces_np, device)
+    vertices_wp = points_to_warp(verts_np, device)
+    triples_wp = twt.as_array2d(wp.array(faces_np, dtype=wp.int32, ndim=2, device=device), wp.int32)
+
+    with pytest.raises(ValueError, match=r"unique_edges must have shape \(k, 2\)"):
+        tw.edges.edges_unique_length(vertices_wp, faces_wp, unique_edges=triples_wp)
+    with pytest.raises(ValueError, match=r"edges_in must have shape \(k, 2\)"):
+        tw.edges.edges_length(vertices_wp, faces_wp, edges_in=triples_wp)
+    with pytest.raises(ValueError, match=r"edges_sorted must have shape \(k, 2\)"):
+        tw.edges.edges_unique(faces_wp, edges_sorted=triples_wp)
+
+    # Non-vacuity: the same three keywords still accept the tables they are meant to take.
+    pairs_wp = tw.edges.faces_to_edges(faces_wp, sorted=True)
+    unique_wp, _inverse = tw.edges.edges_unique(faces_wp, edges_sorted=pairs_wp)
+    assert tw.edges.edges_length(vertices_wp, faces_wp, edges_in=pairs_wp).shape[0] == 30
+    assert (
+        tw.edges.edges_unique_length(vertices_wp, faces_wp, unique_edges=unique_wp).shape[0]
+        == unique_wp.shape[0]
+    )
 
 
 def test_edges_length_empty(device: str) -> None:

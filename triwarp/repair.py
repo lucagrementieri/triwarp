@@ -1081,6 +1081,12 @@ def straighten_boundary(
     lowest index wins, deterministically -- and ``iterations`` passes go round again on what is
     left. A pass that closes nothing ends the loop early.
 
+    Edge-manifoldness is not enough to make the rim a set of simple loops: at a *bowtie* rim
+    vertex two loops are pinched at one point, so that vertex has two outgoing boundary halfedges
+    and no single successor. The rim is therefore followed by halfedge rather than by vertex, which
+    gives each loop its own links: both notches at such a vertex are closed, neither is attached
+    across the pinch, and the answer is the same on every device.
+
     Parameters
     ----------
     vertices
@@ -1141,26 +1147,26 @@ def straighten_boundary(
         n_faces = int(faces.shape[0]) // 3
         n_halfedges = 3 * n_faces
         twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
-        rim_next = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
-        rim_prev = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
-        rim_face = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
+        # Keyed by halfedge, not by vertex: a bowtie rim vertex carries two rim loops and has no
+        # single successor, and edge-manifoldness -- all `halfedge_twins` checks -- does not
+        # exclude one. One slot per halfedge gives each loop its own links and one writer each.
+        rim_next = wp.full(n_halfedges, -1, dtype=wp.int32, device=device)
+        rim_prev = wp.full(n_halfedges, -1, dtype=wp.int32, device=device)
         wp.launch(
             kernel_repair.collect_rim_links,
             dim=n_halfedges,
-            inputs=[faces, twins, rim_next, rim_prev, rim_face],
+            inputs=[faces, twins, rim_next, rim_prev],
             device=device,
         )
-        candidate = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+        candidate = wp.zeros(n_halfedges, dtype=wp.bool, device=device)
         wp.launch(
             kernel_repair.straighten_candidate_mask,
-            dim=n_vertices,
+            dim=n_halfedges,
             inputs=[
                 vertices,
                 faces,
                 tw.triangles.face_normals_and_areas(vertices, faces)[0],
                 rim_next,
-                rim_prev,
-                rim_face,
                 wp.float32(min_normal_dot),
                 wp.float32(max_aspect_ratio),
                 candidate,
@@ -1168,10 +1174,13 @@ def straighten_boundary(
             device=device,
         )
         cursor = wp.zeros(1, dtype=wp.int32, device=device)
-        new_faces = twt.empty_2d((n_vertices, 3), wp.int32, device=device)
+        # One notch per boundary halfedge at most, and a pinched rim can carry more of those than
+        # the mesh has vertices, so the bound is the halfedge count. Trimmed to the real count
+        # below, so the slack never leaves this loop.
+        new_faces = twt.empty_2d((n_halfedges, 3), wp.int32, device=device)
         wp.launch(
             kernel_repair.emit_straighten_faces,
-            dim=n_vertices,
+            dim=n_halfedges,
             inputs=[faces, rim_next, rim_prev, candidate, cursor, new_faces],
             device=device,
         )
@@ -1320,6 +1329,7 @@ def flatten_degree3_vertices(
     faces: wp.array[wp.int32],
     region: wp.array[wp.bool] | None = None,
     *,
+    max_iter: int = 8,
     rings: tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.bool]] | None = None,
 ) -> wp.array[wp.vec3]:
     """
@@ -1337,8 +1347,15 @@ def flatten_degree3_vertices(
     holding per-vertex attributes or a face selection can use it and the other one would invalidate
     both.
 
-    One pass is enough and there is no iteration count: two interior valence-3 vertices cannot be
-    neighbours on an edge-manifold mesh, so no move changes another's answer.
+    Two interior valence-3 vertices **can** be neighbours -- a tetrahedron is four of them, each
+    adjacent to the other three -- and moving both at once puts neither in the other's new plane.
+    So a pass flattens a maximal **independent** set of them, lowest index wins, exactly as
+    [`remove_degree3_vertices`][triwarp.repair.remove_degree3_vertices] does, and ``max_iter``
+    passes go round again on the candidates left over. Every vertex lands in its neighbours' plane
+    as it is moved, which is the guarantee the name makes; where two candidates are adjacent the
+    later one sees the earlier one's new position, so the order the passes impose is part of the
+    answer rather than an implementation detail. The loop stops as soon as no candidate is left, so
+    the usual mesh -- where no two candidates touch -- takes one pass and one check.
 
     Parameters
     ----------
@@ -1349,7 +1366,12 @@ def flatten_degree3_vertices(
         fan around a vertex is what this reasons about.
     region
         ``(n_vertices,)`` boolean mask restricting which vertices may be flattened. ``None``
-        flattens every one that qualifies.
+        flattens every one that qualifies. Masked-out vertices are also excluded from the
+        independence rule, since a vertex that cannot move cannot spoil a neighbour's plane.
+    max_iter
+        Cap on the number of passes. Each pass flattens an independent set, so a chain of adjacent
+        candidates needs one pass per link; the default covers any chain length likely in practice
+        -- a tetrahedron, the densest case there is, needs four.
     rings
         Optional precomputed [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] as
         ``(ring_halfedges, offsets, is_boundary)``. Depends on the connectivity alone, so one CSR
@@ -1360,13 +1382,14 @@ def flatten_degree3_vertices(
     Returns
     -------
     wp.array[wp.vec3]
-        Positions on ``vertices.device``, with the qualifying vertices at their neighbours'
-        centroid. Connectivity is untouched, so ``faces`` stays valid.
+        Positions on ``vertices.device``, with the selected vertices at their neighbours' centroid.
+        Connectivity is untouched, so ``faces`` stays valid.
 
     Raises
     ------
     ValueError
-        If ``region`` is not a length-``n_vertices`` ``wp.bool`` array, or propagated from
+        If ``max_iter`` is negative, if ``region`` is not a length-``n_vertices`` ``wp.bool``
+        array, or propagated from
         [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when the mesh is not edge-manifold.
     RuntimeError
         If ``vertices``, ``faces``, ``region`` and ``rings`` are not all on one device.
@@ -1379,13 +1402,15 @@ def flatten_degree3_vertices(
         Relaxes every vertex toward an area objective, where this hard-sets only the valence-3 ones.
     """
     require_same_device(vertices=vertices, faces=faces, region=region, rings=rings)
+    if max_iter < 0:
+        raise ValueError(f"max_iter must be non-negative, got {max_iter}")
     device = faces.device
     n_vertices = int(vertices.shape[0])
-    if n_vertices == 0 or int(faces.shape[0]) == 0:
+    if n_vertices == 0 or int(faces.shape[0]) == 0 or max_iter == 0:
         return wp.clone(vertices)
-    if region is None:
-        region = wp.full(n_vertices, True, dtype=wp.bool, device=device)
-    elif len(region.shape) != 1 or region.shape[0] != n_vertices or region.dtype is not wp.bool:
+    if region is not None and (
+        len(region.shape) != 1 or region.shape[0] != n_vertices or region.dtype is not wp.bool
+    ):
         raise ValueError(
             f"region must be a length-{n_vertices} wp.bool array, got shape {tuple(region.shape)} "
             f"of {region.dtype}"
@@ -1394,14 +1419,55 @@ def flatten_degree3_vertices(
     ring_halfedges, ring_offsets, is_boundary = (
         rings if rings is not None else tw.halfedge.vertex_one_rings(faces, n_vertices=n_vertices)
     )
-    flattened = wp.empty(n_vertices, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_repair.flatten_degree3_positions,
-        dim=n_vertices,
-        inputs=[vertices, faces, ring_offsets, ring_halfedges, is_boundary, region, flattened],
-        device=device,
+    candidate = wp.empty(n_vertices, dtype=wp.bool, device=device)
+    wp.map(
+        kernel_repair.is_interior_degree3,
+        ring_offsets[:-1],
+        ring_offsets[1:],
+        is_boundary,
+        out=candidate,
     )
-    return flattened
+    if region is not None:
+        wp.map(kernel_array.mask_and, candidate, region, out=candidate)
+
+    positions = vertices
+    for iteration in range(max_iter):
+        # Adjacent candidates have to be separated before anything moves -- see the kernel comment
+        # for what flattening both ends of an edge at once does to a tetrahedron. The lowest
+        # remaining index always wins its own conflict, so every pass retires at least one
+        # candidate and the loop cannot spin.
+        selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+        wp.launch(
+            kernel_repair.select_independent_degree3,
+            dim=n_vertices,
+            inputs=[faces, ring_offsets, ring_halfedges, candidate, selected],
+            device=device,
+        )
+        flattened = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+        wp.launch(
+            kernel_repair.flatten_degree3_positions,
+            dim=n_vertices,
+            inputs=[positions, faces, ring_offsets, ring_halfedges, selected, flattened],
+            device=device,
+        )
+        positions = flattened
+        if iteration + 1 == max_iter:
+            break
+        wp.map(kernel_array.mask_and_not, candidate, selected, out=candidate)
+        # One readback per pass beyond the first, and it is the loop's own termination test: how
+        # many candidates are still unflattened is a device-side fact and a Python loop cannot
+        # branch on it otherwise. It is taken *after* the pass rather than before so that a mesh
+        # with no two candidates adjacent -- the usual one -- pays exactly one, and ``max_iter=1``
+        # pays none. The connectivity never changes here, so nothing above the loop is rebuilt.
+        #
+        # Read back and reduced on the host rather than through ``reduce``: a bool mask is one byte
+        # per vertex, so the copy is cheaper than the launches and the scratch allocation a device
+        # reduction costs -- which is the case CLAUDE.md section 14.5 measured and declined
+        # converting. Measured on the whole call, 10 242 vertices, RTX 5090: 0.686-0.696 ms this
+        # way against 0.751-0.755 through ``reduce.sum(astype(...))``, on a 0.524-0.531 ms base.
+        if not bool(candidate.numpy().any()):
+            break
+    return positions
 
 
 def reverse_winding(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:

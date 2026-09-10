@@ -1139,6 +1139,15 @@ def test_straighten_boundary(bench_case: BenchCase) -> None:
     (13.1x ahead) and **1.19 ms** on ``dragon`` against 56.05 (**47.3x**). Both rows carry their own
     structure build, so the ratio is the parallel candidate test against a serial rim walk, and it
     widens with the mesh exactly as that predicts. ``happy_buddha`` reads 1.39 ms.
+
+    The rim walk was re-keyed from vertices to **halfedges** after those numbers were taken,
+    because edge-manifoldness does not make the rim a set of simple loops and the per-vertex tables
+    raced at a bowtie vertex (``kernels/repair.py::collect_rim_links``). It is a correctness fix
+    and it also came out slightly *cheaper*: **0.94x** on the whole call at three passes (0.418 to
+    0.394 ms on a 1 345-vertex hemisphere, interleaved against a detached worktree at the prior
+    revision, min of 30 x 20). Two per-halfedge tables replaced three per-vertex ones plus a face
+    table, and the candidate and emit kernels lost three arguments between them; the fan walk that
+    finds each boundary halfedge's successor is paid only on the rim.
     """
     if bench_case.kind == "meshlib":
 
@@ -1167,16 +1176,26 @@ def test_flatten_degree3_vertices(bench_case: BenchCase) -> None:
     """
     The geometric answer to the same defect ``remove_degree3_vertices`` removes topologically.
 
-    Read against that group directly: both build the same ``vertex_one_rings``, and everything after
-    it differs. This one is a **single** launch over the vertices -- no independent-set pass, no
-    face rewrite, no compaction, and no loop, because two interior valence-3 vertices cannot be
-    neighbours -- so the gap between the two rows is the whole cost of removing rather than moving,
-    and this row should sit at roughly the halfedge build alone (measured at 67 % of the other
-    group's single pass).
+    Read against that group directly: both build the same ``vertex_one_rings`` and both then run
+    the same independent-set pass, and everything after *that* differs -- no face rewrite, no
+    compaction and no loop here, so the gap between the two rows is the whole cost of removing
+    rather than moving, and this row should sit at roughly the halfedge build alone (measured at
+    67 % of the other group's single pass).
 
-    meshlib's ``hardSmoothTetrahedrons`` is the same move on the same set, and the positions agree
-    (``tests/test_repair.py``). It mutates in place, so its mesh is rebuilt per round; the other
-    group's meshlib row times only the *mask*, which is why this one is the like-for-like pair.
+    meshlib's ``hardSmoothTetrahedrons`` is the same move on the same set, vertex for vertex --
+    it sweeps sequentially, reading neighbours it has already moved, and one maximal independent
+    set per pass with lowest index winning reproduces that order exactly (``tests/test_repair.py``,
+    Class A on a tetrahedron where all four vertices are candidates). It mutates in place, so its
+    mesh is rebuilt per round; the other group's meshlib row times only the *mask*, which is why
+    this one is the like-for-like pair.
+
+    The independent-set pass and its loop are not free and did not always exist: measured **1.29x**
+    on the whole call (0.524-0.531 to 0.686-0.696 ms on a 10 242-vertex icosphere, interleaved
+    against a detached worktree at the prior revision, min of 30 x 50). Most of it is the one
+    host readback that terminates the loop; routing that through ``reduce.sum`` instead of a bool
+    readback measured 0.751-0.755. It is a correctness fix rather than a tuning choice -- see
+    ``kernels/repair.py``'s ``flatten_degree3_positions`` for what moving two neighbours at once
+    does to a tetrahedron -- so the number is recorded here rather than weighed against anything.
 
     First measurement, medians on an RTX 5090:
 

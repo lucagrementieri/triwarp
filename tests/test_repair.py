@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import igl
 import numpy as np
 import pymeshlab as ml
@@ -2799,6 +2801,159 @@ def test_straighten_boundary_return_count_shapes(device: str) -> None:
     )
 
 
+def test_straighten_boundary_closes_an_independent_set(device: str) -> None:
+    """
+    Not a library comparison: the one-face-per-rim-edge rule, on a fixture that reaches it.
+
+    Two adjacent notches share a rim edge, so a pass may close only one of them or that edge ends
+    up with three incident faces. **At the documented gates this rule is never exercised**: on
+    ``_ragged_grid`` -- the fixture every other test in this group uses -- pass one produces 10
+    candidates and *zero* adjacent pairs, so the pass converges in one round and ``iterations=6``
+    does nothing. Measured directly off ``straighten_candidate_mask``. A test at those gates
+    therefore says nothing about the rule, and both halves of it can be deleted without failing
+    anything.
+
+    Opening both gates is what reaches it: at ``min_normal_dot=-1.0`` every rim halfedge whose two
+    neighbours differ qualifies, so *every* consecutive pair is adjacent and the rule has to reject
+    half of them. The claim asserted is the invariant it exists for -- no rim edge carries two of
+    the new triangles -- read off the emitted faces, since each is ``(following, v, previous)`` and
+    so uses exactly the two rim edges ``{v, previous}`` and ``{following, v}``.
+
+    Deleting either half of the rule takes this from 12 triangles sharing no rim edge to 18
+    sharing 6. Note the output at these gates is *not* a mesh anyone wants -- the fold-over gate is
+    off, so it attaches triangles that duplicate existing edges -- which is why the assertion is on
+    the rim-edge count and not on manifoldness.
+    """
+    ragged_vertices_wp, ragged_faces_wp, _grid_faces_wp = _ragged_grid(device)
+    n_faces = int(ragged_faces_wp.shape[0]) // 3
+
+    out_wp, added = tw.repair.straighten_boundary(
+        ragged_vertices_wp,
+        ragged_faces_wp,
+        min_normal_dot=-1.0,
+        max_aspect_ratio=1e9,
+        iterations=1,
+        return_count=True,
+    )
+    rim_length = len(tw.boundary.boundary_loops(ragged_vertices_wp, ragged_faces_wp)[0].numpy())
+    assert 0 < added < rim_length  # non-vacuity: candidates existed and the rule rejected some
+
+    used: Counter[frozenset[int]] = Counter()
+    for following, corner, previous in out_wp.numpy().reshape(-1, 3)[n_faces:].tolist():
+        used[frozenset((corner, previous))] += 1
+        used[frozenset((following, corner))] += 1
+    assert used  # non-vacuity: the new faces really do sit on rim edges
+    assert max(used.values()) == 1
+
+
+def test_straighten_boundary_closes_both_loops_at_a_bowtie(device: str) -> None:
+    """
+    Not a library comparison: the rim contract on a mesh edge-manifoldness does not cover.
+
+    Two copies of ``_ragged_grid``, the second turned 180 degrees in plane and welded to the first
+    at a single rim vertex. The result is still edge-manifold -- ``halfedge_twins`` raises nothing,
+    which is ``straighten_boundary``'s only validation -- but that vertex now carries **two** rim
+    loops, so it has two outgoing and two incoming boundary halfedges and no single
+    ``previous -> v -> following``.
+
+    Keyed by vertex, the rim tables have two writers per slot there and the three of them can be
+    won by different halfedges, so the fold-over normal gate ends up testing a face that does not
+    border the candidate triangle: this fixture's ancestor measured **15** triangles added on cpu
+    against **10** on cuda:0, a different answer per device. Keyed by *halfedge* each loop keeps its
+    own links, and the claim asserted here is the strong one -- both loops are restored **whole**,
+    including the notch at the pinch itself on each side, so the count is exactly twice what one
+    grid alone restores and every triangle added is a face of one of the two intact grids.
+
+    A degree guard that merely *skipped* the pinch would pass a device-agreement check and fail
+    this: it costs one notch per loop, giving 18.
+    """
+    ragged_vertices_wp, ragged_faces_wp, grid_faces_wp = _ragged_grid(device)
+    vertices_np = ragged_vertices_wp.numpy()
+    faces_np = ragged_faces_wp.numpy().reshape(-1, 3)
+    n_vertices = len(vertices_np)
+    loop_np = tw.boundary.boundary_loops(ragged_vertices_wp, ragged_faces_wp)[0].numpy()
+    pinch, welded = int(loop_np[0]), int(loop_np[len(loop_np) // 2])
+
+    turned_np = vertices_np.copy()
+    turned_np[:, :2] *= -1
+    turned_np += vertices_np[pinch] - turned_np[welded]
+    kept = [index for index in range(n_vertices) if index != welded]
+    remap = {old: n_vertices + new for new, old in enumerate(kept)}
+    remap[welded] = pinch
+    pinched_vertices_wp, pinched_faces_wp = numpy_to_warp(
+        np.vstack([vertices_np, turned_np[kept]]),
+        np.vstack([faces_np, np.vectorize(remap.get)(faces_np)]).ravel().astype(np.int32),
+        device,
+    )
+    assert tw.validation.is_edge_manifold(pinched_faces_wp)  # non-vacuity: the guard accepts it
+
+    gates = {"min_normal_dot": 0.9, "max_aspect_ratio": 10.0, "iterations": 6}
+    out_wp, added = tw.repair.straighten_boundary(
+        pinched_vertices_wp, pinched_faces_wp, return_count=True, **gates
+    )
+    _clean_wp, clean_added = tw.repair.straighten_boundary(
+        ragged_vertices_wp, ragged_faces_wp, return_count=True, **gates
+    )
+    assert clean_added == 10  # non-vacuity: one grid on its own really is ragged
+    assert added == 2 * clean_added
+
+    added_rows = canonical_winding(out_wp.numpy().reshape(-1, 3)[2 * len(faces_np) :])
+    grid_rows = canonical_winding(grid_faces_wp.numpy().reshape(-1, 3))
+    intact = {tuple(row) for row in grid_rows.tolist()}
+    intact |= {tuple(row) for row in canonical_winding(np.vectorize(remap.get)(grid_rows)).tolist()}
+    assert {tuple(row) for row in added_rows.tolist()} <= intact
+    # One triangle per loop touches the pinch, and both are closed -- the point of keying by
+    # halfedge rather than by vertex.
+    assert sum(1 for row in added_rows.tolist() if pinch in row) == 2
+
+
+@pytest.mark.parity("flatten_degree3_vertices", "meshlib")
+def test_flatten_degree3_vertices_moves_an_independent_set(device: str) -> None:
+    """
+    Class A against ``hardSmoothTetrahedrons`` where every vertex is a candidate at once.
+
+    A tetrahedron is four interior valence-3 vertices each adjacent to the other three -- the
+    densest this case gets, and the counterexample to the "two of them cannot be neighbours" rule
+    this function was once written against. Moving all four from the input positions maps it to
+    minus a third of itself: mirrored, every normal flipped and the signed volume negated from
+    -2.667 to +0.099, a repair returning an inverted mesh.
+
+    Flattening a maximal independent set per pass, lowest index wins, and repeating is not merely
+    *a* fix but exactly meshlib's: it sweeps its vertices sequentially, reading neighbours it has
+    already moved, and the two rules coincide vertex for vertex, because a vertex is selected in
+    the pass after the last of its lower-indexed candidate neighbours -- which is when a sequential
+    index-order sweep would reach it. Measured: identical to **1.19e-07** here and to **0.0** on a
+    subdivided tetrahedron. Four passes, which is what makes ``max_iter`` load-bearing rather than
+    decorative -- at ``max_iter=1`` only one vertex moves.
+
+    Asserted alongside: each moved vertex lands in its three neighbours' plane at the time it
+    moves, and the signed volume does not flip. The all-four pass measured +0.099 against
+    |before| = 2.667, i.e. 3.7 %, so the volume bar separates the two by ~37x.
+    """
+    vertices_np = np.array([[1.0, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]])
+    faces_np = np.array([0, 2, 1, 0, 3, 2, 0, 1, 3, 1, 2, 3], dtype=np.int32)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+
+    flattened_np = tw.repair.flatten_degree3_vertices(vertices_wp, faces_wp).numpy()
+    mesh_ml = trimesh_to_meshlib(tm.Trimesh(vertices_np, faces_np.reshape(-1, 3), process=False))
+    mm.hardSmoothTetrahedrons(mesh_ml)
+    flattened_ml = mn.toNumpyArray(mesh_ml.points)
+    moved_ml = np.linalg.norm(flattened_ml - vertices_np, axis=1) > 1e-6
+    assert int(moved_ml.sum()) == 4  # non-vacuity: the reference moved every vertex
+    assert np.allclose(flattened_np, flattened_ml, rtol=1e-5, atol=1e-5)
+
+    # One pass is one vertex here, which is what the loop exists for.
+    once_np = tw.repair.flatten_degree3_vertices(vertices_wp, faces_wp, max_iter=1).numpy()
+    assert int((np.linalg.norm(once_np - vertices_np, axis=1) > 1e-6).sum()) == 1
+    with pytest.raises(ValueError, match="max_iter must be non-negative"):
+        tw.repair.flatten_degree3_vertices(vertices_wp, faces_wp, max_iter=-1)
+
+    before = tm.Trimesh(vertices_np, faces_np.reshape(-1, 3), process=False).volume
+    after = tm.Trimesh(flattened_np, faces_np.reshape(-1, 3), process=False).volume
+    assert before < -1.0  # non-vacuity: the input really encloses a signed volume
+    assert abs(after) < 1e-3 * abs(before)  # flat is honest here; inverted is not
+
+
 def test_remove_degree3_vertices_return_count_shapes(device: str) -> None:
     """
     Not a library comparison: the two return shapes of the ``return_count`` keyword.
@@ -2949,6 +3104,11 @@ def test_remove_degree3_vertices_is_idempotent_and_area_preserving(device: str) 
 def test_flatten_degree3_vertices_matches_meshlib(device: str) -> None:
     """
     Class A against ``hardSmoothTetrahedrons``: the same vertex moved to the same place.
+
+    One candidate here, and the adjacent-candidate case is
+    ``test_flatten_degree3_vertices_moves_an_independent_set``, which is Class A against the same
+    filter on a tetrahedron -- so the pair agrees on both, and this fixture is not load-bearing for
+    the scope of the claim.
 
     Both find the interior valence-3 vertices and hard-set each to the centroid of its three
     neighbours, so this is an element-wise position comparison. The fixture is an icosahedron with
