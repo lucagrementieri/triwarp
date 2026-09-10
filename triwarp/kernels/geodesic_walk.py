@@ -519,6 +519,32 @@ def descent_walk(
             count = emit_walk_point(out_points, write_begin, count, vertices[reached])
             break
 
+        # The exit landed *on* a corner of that edge, not across it. Hand the walk to the vertex
+        # state, which is the state that can express what happens at a vertex -- and, just as
+        # importantly, re-reads ``last_value`` from ``values`` instead of carrying the accumulated
+        # one across into the next face.
+        #
+        # Both halves matter, and it is the second that this exists for. Carrying on into the twin
+        # face leaves the walk standing on a vertex with no exit edge, so the flat-face fallback
+        # below fires and compares that vertex's own value against a ``last_value`` accumulated
+        # over the preceding steps. The two are the same number up to float drift: measured on an
+        # ``icosphere(3)`` heat field, ``last_value`` came out 1.8e-08 *above* the vertex's value on
+        # cuda:0 and below it on cpu, so the walk continued on one device and stopped as a "local
+        # minimum" on the other -- 2 of 20 paths, at 0.27 and 0.52 of their true geodesic length.
+        # An icosphere routes descents exactly through vertices often enough for this to be
+        # systematic rather than a coincidence.
+        landed = wp.int32(-1)
+        if wp.length(point - vertices[start]) <= length_epsilon:
+            landed = start
+        elif wp.length(point - vertices[end]) <= length_epsilon:
+            landed = end
+        if landed >= wp.int32(0):
+            vertex = landed
+            point = vertices[vertex]
+            last_value = values[vertex]
+            face = wp.int32(-1)
+            continue
+
         twin = twins[face * 3 + edge]
         if twin == wp.int32(-1):
             break  # the descent ran into the mesh boundary

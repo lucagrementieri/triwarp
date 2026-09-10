@@ -361,6 +361,46 @@ def test_geodesic_path_is_never_shorter_than_the_exact_geodesic(
     assert ratio_np.max() < 1.35  # nor absurdly longer: the heat field's accuracy, not the walk's
 
 
+@pytest.mark.parametrize("mesh_name", _PATH_MESHES)
+def test_geodesic_path_reaches_its_source(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Not a library comparison: that the descent terminates *at* the source rather than short of it.
+
+    ``descend_field`` documents four ways a path may legitimately stop early -- a local minimum, a
+    flat face, the mesh boundary, ``max_steps`` -- and on a closed mesh carrying a heat distance
+    field to a single source, none of them applies: the field has exactly one minimum and it is the
+    source. So every path must arrive, and the last point of each is asserted to be the source
+    vertex itself, which the exact-geodesic ratio test only catches indirectly and only when the
+    truncated path is *much* shorter.
+
+    The bug this guards is a float-drift coin flip, so it needs the assert stated this way. The
+    walk tracked the field value at its current point by accumulating ``-slope * distance`` per
+    in-face step rather than re-reading it; when a step landed exactly on a vertex -- which an
+    icosphere's symmetry makes routine -- the walk carried that accumulated value into the next
+    face and the flat-face fallback compared it against the value of the vertex it was standing on.
+    Measured on ``icosphere(3)``: the two agreed to 1.8e-08, the accumulated one landing above on
+    cuda:0 and below on cpu, so 2 of these 20 paths stopped dead on cpu at 0.265 and 0.524 of their
+    true length while cuda:0 completed them. One device, one fixture, deterministic each time.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(np.asarray(mesh_tm.vertices).shape[0])
+    rng = np.random.default_rng(2)
+    targets_np = rng.choice(
+        np.arange(1, n_vertices), min(20, n_vertices - 1), replace=False
+    ).astype(np.int32)
+
+    source_np = np.asarray(mesh_tm.vertices)[0]
+    paths = _paths_to_source(mesh_wp, targets_np)
+    assert len(paths) == len(targets_np)  # non-vacuity: a path came back for every target
+    for target, path in zip(targets_np, paths, strict=True):
+        points_np = path.numpy()
+        assert np.allclose(points_np[0], np.asarray(mesh_tm.vertices)[int(target)], atol=1e-5)
+        assert np.allclose(points_np[-1], source_np, atol=1e-5), (
+            f"path from {int(target)} stopped {np.linalg.norm(points_np[-1] - source_np):.4f} "
+            f"short of the source after {len(points_np)} points"
+        )
+
+
 @pytest.mark.parity("geodesic_path", "potpourri3d")
 def test_geodesic_path_matches_potpourri3d_on_a_sphere(
     icosphere: tuple[tm.Trimesh, wp.Mesh],
