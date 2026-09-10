@@ -107,6 +107,8 @@ def average_onto_vertices(
 
     Raises
     ------
+    ValueError
+        If ``face_values`` does not have one entry per face.
     RuntimeError
         If ``faces`` and ``face_values`` are not all on one device.
 
@@ -120,6 +122,11 @@ def average_onto_vertices(
     require_same_device(faces=faces, face_values=face_values)
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
+    if int(face_values.shape[0]) != n_faces:
+        raise ValueError(
+            f"face_values must have one entry per face, got "
+            f"{face_values.shape[0]} for {n_faces} faces"
+        )
 
     out_sum = wp.zeros(n_vertices, dtype=wp.float32, device=device)
     out_valence = wp.zeros(n_vertices, dtype=wp.float32, device=device)
@@ -173,6 +180,8 @@ def average_from_edges_onto_vertices(
 
     Raises
     ------
+    ValueError
+        If ``edges`` or ``edges_orientation`` is not ``(n_faces, 3)``.
     RuntimeError
         If ``faces``, ``edges``, ``edges_orientation`` and ``edge_values`` are not all on one
         device.
@@ -189,6 +198,14 @@ def average_from_edges_onto_vertices(
     )
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
+    # Both tables are indexed at ``[f, j]`` for every face and corner, so a table built for another
+    # mesh is an out-of-bounds read rather than a wrong answer -- on the CPU device, where a Warp
+    # array is host heap, a silent one.
+    for name, table in (("edges", edges), ("edges_orientation", edges_orientation)):
+        if (int(table.shape[0]), int(table.shape[1])) != (n_faces, 3):
+            raise ValueError(
+                f"{name} must be ({n_faces}, 3), one row per face, got {tuple(table.shape)}"
+            )
 
     out_sum = wp.zeros(n_vertices, dtype=wp.float32, device=device)
     out_valence = wp.zeros(n_vertices, dtype=wp.float32, device=device)
@@ -341,6 +358,8 @@ def transfer_through_operator(
     ------
     ValueError
         If the operator's column count does not match ``values``.
+    RuntimeError
+        If ``values`` and ``operator`` are not on one device.
 
     Examples
     --------
@@ -376,6 +395,7 @@ def transfer_through_operator(
         What to use instead where the edit *can* report an index map -- ``split_edges`` and
         ``subdivide_to_size`` both do, and a gather through their ``index`` is the whole transfer.
     """
+    require_same_device(values=values, operator=operator)
     device = values.device
     n_source = int(values.shape[0])
     n_out = int(operator.nrow)

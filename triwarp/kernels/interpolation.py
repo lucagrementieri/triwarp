@@ -127,7 +127,6 @@ def interpolate_from_points(
         out_values[q] = accumulated / total
 
 
-# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
 @wp.kernel(enable_backward=False)
 def sample_grid_trilinear(
     field: wp.array3d[Any],
@@ -168,6 +167,7 @@ def sample_grid_trilinear(
     out_values[s] = accumulator
 
 
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
 # CLAUDE.md section 4. Measured at 2 overloads across **3** module loads.
 #
 # The dtype set is the one ``transfer_onto_vertices``'s own docstring promises -- "any Warp dtype

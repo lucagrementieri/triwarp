@@ -1,8 +1,17 @@
 """
 Breadth-first search over a CSR adjacency graph.
 
-Two traversal cores:
+Three engines, and ``triwarp.graph.bfs`` picks between the first two by device:
 
+- The **level-synchronous frontier loop** (``bfs_expand_claim`` → ``bfs_count_and_scan`` →
+  ``bfs_scan_and_advance`` → ``bfs_scatter_claims``, four launches a level over a 7-int32 ``state``
+  window, with ``bfs_segment_base`` reading the two-level scan both the counter and the scatter
+  share). It reproduces scipy's FIFO order without a sort: an unvisited neighbor is claimed by its
+  parent's *dequeue rank* via ``atomic_min``, so the first-dequeued parent wins, and each rank
+  emits its own segment in ascending CSR column order. **CUDA only** — ``bfs_count_and_scan``
+  builds its tile from a per-lane value, which fills lane 0 alone on Warp 1.17's CPU backend (see
+  that kernel). It also hands off to the serial drain below once the frontier goes narrow and stops
+  growing, rather than paying four fixed-size launches for a two-node frontier.
 - ``bfs_serial_drain`` — one Warp thread walks the graph from whatever FIFO window it is
   handed, using a dense ``dist`` array as the visited marker (``dist[node] == -1`` ⇒ unvisited).
   Run at ``dim=1`` from a single seeded source (``single_source_bfs_kernel``) it reproduces
@@ -303,7 +312,8 @@ def bfs_segment_base(
     # only job was to materialise the same sum into ``offsets_scan``.
     #
     # Only blocks strictly before rank's own are read, and those are entirely inside the frontier,
-    # so the stale counts past the frontier (see ``bfs_count_claims``) never enter the sum.
+    # so nothing past the frontier enters the sum. ``bfs_count_and_scan`` writes a real zero there
+    # in any case, so the two guards agree rather than one covering for the other.
     if rank <= wp.int32(0):
         return wp.int32(0)
     base = offsets_scan[rank - 1]
@@ -396,8 +406,8 @@ def bfs_scan_and_advance(
     #    ``node_count / BFS_SCAN_BLOCK`` blocks on every level however narrow the frontier — one
     #    dependent global load each, which on a long path graph is the single dominant cost of the
     #    traversal (measured: 161 blocks, ~32 us a level, 20 481 levels). Blocks past the frontier
-    #    are left unscanned; their offsets are never read, exactly as the stale ``counts`` past the
-    #    frontier are not (see ``bfs_count_claims``).
+    #    are left unscanned, and their block sums are never read, because ``bfs_segment_base`` only
+    #    sums blocks strictly inside the frontier.
     # 2. Snapshot the outgoing window into the ``EMIT`` slots, so ``bfs_scatter_claims`` can run
     #    *after* the state has already advanced.
     # 3. Advance the frontier window to the segment the scatter is about to fill, bump the level,

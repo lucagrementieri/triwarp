@@ -270,8 +270,11 @@ def scatter_edge_incidence(
     # counts higher and its faces past the second are dropped, which is what the exactly-2 row
     # grouping behind ``adjacency.face_adjacency`` does with them too.
     #
-    # Launch over ``inverse.shape[0]`` with both outputs zeroed: the count doubles as the write
-    # cursor, which is why this replaces ``count_occurrences`` rather than following it.
+    # Launch over ``inverse.shape[0]`` with ``out_edge_face_count`` zeroed: the count doubles as the
+    # write cursor, which is why this replaces ``count_occurrences`` rather than following it.
+    # ``out_edge_faces`` needs no zeroing and none of the three callers zeroes it -- but that means
+    # a row whose count came back below 2 has an **unwritten** second column (a boundary edge) or
+    # both columns unwritten (an edge no corner named), so read the count first. It is not a zero.
     #
     # It lives here rather than in ``kernels/remesh.py``, where the decimation passes first needed
     # it, because ``homology.tree_cotree`` groups the same rows for the same reason -- one grouping
@@ -332,12 +335,6 @@ def mark_membership_mask(
         out_mask[index] = wp.bool(True)
 
 
-# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 4. Measured over the suite: 6 overloads created across **11** module loads --
-# nearly two rebuilds per overload, this module being reached from 11 wrappers at scattered moments.
-#
-# Each set is the dtypes its call sites actually build, not a menu: ``scatter_add`` accumulates a
-# ``wp.float32`` per-component volume in ``repair`` and a ``wp.vec2d`` tangent field in
 @wp.kernel(enable_backward=False)
 def splat_grid_trilinear(
     points: wp.array[wp.vec3],
@@ -391,6 +388,12 @@ def divide_by_density(
     out_field[i, j, k] = out_field[i, j, k] / wp.max(density[i, j, k], min_weight)
 
 
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. Measured over the suite: 6 overloads created across **11** module loads --
+# nearly two rebuilds per overload, this module being reached from 11 wrappers at scattered moments.
+#
+# Each set is the dtypes its call sites actually build, not a menu: ``scatter_add`` accumulates a
+# ``wp.float32`` per-component volume in ``repair`` and a ``wp.vec2d`` tangent field in
 # ``heat.vector``, and the two mass/curvature scatters follow their wrapper's precision keyword.
 _VALUE_DTYPES = (wp.float32, wp.float64)
 # ``scatter_add`` gets its own, narrower set: it has exactly three call sites -- ``repair.py``'s two
@@ -401,11 +404,12 @@ _SCATTER_ADD_DTYPES = (wp.float32, wp.vec2d)
 
 
 # ``splat_grid_trilinear``'s dtype set is the pair its wrapper
-# [`voxels.splat_onto_grid`][triwarp.voxels.splat_onto_grid] documents and its inverse
-# [`interpolation.sample_grid_trilinear`][triwarp.interpolation.sample_grid_trilinear] registers:
-# ``wp.float32`` for a scalar field and ``wp.vec3`` for a vector one. Not ``wp.float64`` -- the
-# weights and the density lattice are float32, so a float64 field would carry a float32 accuracy
-# floor and the wider dtype would be a promise the kernel cannot keep.
+# [`voxels.splat_onto_grid`][triwarp.voxels.splat_onto_grid] documents and its transpose
+# ``kernels/interpolation.sample_grid_trilinear`` registers (the public reader of that kernel is
+# [`voxels.sample_grid_trilinear`][triwarp.voxels.sample_grid_trilinear], not an ``interpolation``
+# one): ``wp.float32`` for a scalar field and ``wp.vec3`` for a vector one. Not ``wp.float64`` --
+# the weights and the density lattice are float32, so a float64 field would carry a float32
+# accuracy floor and the wider dtype would be a promise the kernel cannot keep.
 _GRID_DTYPES = (wp.float32, wp.vec3)
 
 
