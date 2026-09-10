@@ -598,10 +598,14 @@ def solve_spd_columns(
 
     Notes
     -----
-    ``check_every`` is a pure performance knob — it cannot change the converged answer, only how far
-    past the tolerance the solver may overshoot before it notices. Its device-side default (``0``)
-    scales with how much work a single ``cg`` call does, and the regimes disagree, so read the one
-    that matches the caller:
+    ``check_every`` is a pure performance knob on every path but one — it cannot change the
+    converged answer, only how far past the tolerance the solver may overshoot before it notices.
+    The exception is the exactly-two-column, ``"diag"``-preconditioned path (this module's internal
+    block conjugate gradient): it shares one Krylov subspace across both columns, so a positive
+    ``check_every`` can let a batch of iterations apply a real, coupled update to a column that
+    already crossed its own tolerance before the next readback catches up. Its device-side default
+    (``0``) scales with how much work a single ``cg`` call does, and the regimes disagree, so read
+    the one that matches the caller:
 
     - **Cold single solves** — one ``cg`` call from a zero initial guess, the shape
       ``harmonic`` / ``tutte`` / ``smooth_region`` take. This is the regime the default is set for,
@@ -662,7 +666,7 @@ def spd_column_solver(
     maxiter: int | None = None,
     check_every: int = CG_CHECK_EVERY,
     preconditioner: str = "diag",
-) -> wpl.LinearSolverState:
+) -> wpl.LinearSolverState | _BatchedCg | _BlockCg2:
     """
     Pre-allocated batched conjugate-gradient state, for repeated solves of one operator.
 
@@ -700,9 +704,14 @@ def spd_column_solver(
 
     Returns
     -------
-    ``warp.optim.linear.LinearSolverState``
-        Callable solver state. Substituted operands must match the construction-time shape, dtype,
-        device and batch layout. Each call returns what
+    ``warp.optim.linear.LinearSolverState`` | internal batched state
+        Callable solver state: a single-column solve returns Warp's own
+        ``LinearSolverState``, and a multi-column one returns this module's own ``_BatchedCg`` or
+        (at exactly two columns under ``"diag"``) ``_BlockCg2`` -- a drop-in with the identical
+        call-and-return contract, kept internal because a caller never has to name the difference
+        (see [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]'s "Whose conjugate gradient").
+        Substituted operands must match the construction-time shape, dtype, device and batch
+        layout. Each call returns what
         [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] returns, including its
         ``check_every=0`` device arrays.
 
@@ -903,12 +912,16 @@ def _cg_columns_auto(
     residual, tolerance = _cg_residual_and_tolerance(probe)
     if residual <= tolerance:
         return probe
+    # ``cap`` is the caller's total iteration budget, and the probe above already spent
+    # ``CG_PROBE_ITERATIONS`` of it (this branch is only reached once ``cap > CG_PROBE_ITERATIONS``,
+    # by the early return above) -- so the escalated call, which is a fresh ``wpl.cg`` call with its
+    # own iteration counter, gets what remains rather than the full ``cap`` again.
     return _cg_columns(
         matrix,
         rhs,
         solution,
         tol=tol,
-        maxiter=cap,
+        maxiter=cap - CG_PROBE_ITERATIONS,
         check_every=check_every,
         preconditioner="multigrid",
         run=True,
@@ -1083,12 +1096,11 @@ class _BatchedCg:
         # 1 in the pad, so the fused Jacobi apply there is a no-op on an already-zero residual.
         self._inv_diag = wp.full(self._stride, 1.0, dtype=wp.float64, device=device)
         wp.map(kernel_array.inverse_or_one, wps.bsr_get_diag(matrix), out=self._inv_diag[: self._n])
-        # Per-column views, built once: the matvec is ``n_columns`` ``bsr_mv`` calls against the one
-        # operator, and re-slicing them per iteration would add Python to every CG step and keep the
-        # loop from being captured. They span ``n``, not ``stride``, so nothing writes the pad.
-        self._p_blocks = self._column_views(self._p)
+        # Per-column view of ``r``, built once: ``_initialize`` still seeds and residual-corrects
+        # it one column at a time (a one-time cost, unlike the per-iteration matvec in
+        # ``_iteration``, which reads the flat buffers directly through ``csr_matvec``). Spans
+        # ``n``, not ``stride``, so nothing writes the pad.
         self._r_blocks = self._column_views(self._r)
-        self._ap_blocks = self._column_views(self._ap)
 
     def _column_views(self, flat: wp.array[wp.float64]) -> list[wp.array[wp.float64]]:
         """Split a padded flat vector into its ``n_columns`` blocks of ``n`` live entries."""
@@ -1115,7 +1127,10 @@ class _BatchedCg:
         )
         wp.launch_tiled(
             kernel_cg.cg_dot_finalize,
-            dim=(2, self._n_columns),
+            # ``pairs``, not the kernel's max of 2: the ``r.z`` dot only ever asks for one row, so
+            # launching the second row's blocks (which the kernel's own ``p >= pairs`` guard would
+            # just return out of) is pure waste.
+            dim=(pairs, self._n_columns),
             inputs=[
                 self._partials,
                 wp.int32(self._blocks),
@@ -1129,11 +1144,31 @@ class _BatchedCg:
         )
 
     def _iteration(self) -> None:
-        """One CG step: 4 + ``n_columns`` launches, none of which reads back to the host."""
-        for column in range(self._n_columns):
-            wps.bsr_mv(
-                self._matrix, self._p_blocks[column], self._ap_blocks[column], alpha=1.0, beta=0.0
-            )
+        """One CG step, none of which reads back to the host."""
+        # One launch over every column at once rather than ``n_columns`` separate ``bsr_mv`` calls
+        # against the same operator -- ``kernels/algorithms/multigrid.py::csr_matvec``'s own
+        # measurement (34 launches / 189 us through ``bsr_mv`` against 15 / 85 through this, same
+        # answer) is exactly this call shape, and it already reads this solver's own flat
+        # column-block layout (``_column_views``' ``column * stride + row`` addressing). This
+        # collapses what used to be ``n_columns`` separate matvec launches into exactly one,
+        # regardless of ``n_columns``.
+        wp.launch(
+            kernel_mg.csr_matvec,
+            dim=self._n_columns * self._n,
+            inputs=[
+                wp.int32(self._n),
+                wp.int32(self._stride),
+                wp.int32(self._stride),
+                wp.int32(0),
+                wp.float64(1.0),
+                self._matrix.offsets,
+                self._matrix.columns,
+                self._matrix.values,
+                self._p,
+            ],
+            outputs=[self._ap],
+            device=self._device,
+        )
         # ``carry=True`` performs ``rz_old = rz_new`` here; see ``cg_dot_finalize``.
         self._dot(self._p, self._ap, self._ap, 1, self._p_dot_ap, carry=True)
         step = [
@@ -1191,11 +1226,28 @@ class _BatchedCg:
             outputs=[self._atol_sq],
             device=self._device,
         )
-        # ``r = b - A x`` in place, warm-starting from whatever ``solution`` currently holds.
-        for column in range(self._n_columns):
-            wps.bsr_mv(
-                self._matrix, self._solution[column], self._r_blocks[column], alpha=-1.0, beta=1.0
-            )
+        # ``r -= A x`` in place, warm-starting from whatever ``solution`` currently holds -- one
+        # launch across every column via ``csr_matvec``'s own ``alpha`` rather than ``n_columns``
+        # separate ``bsr_mv`` calls (the same conversion as ``_iteration``'s matvec, applied to this
+        # one-time setup call). ``x_stride`` is ``n``, not ``self._stride``: ``solution`` is the
+        # caller's own unpadded buffer.
+        wp.launch(
+            kernel_mg.csr_matvec,
+            dim=self._n_columns * self._n,
+            inputs=[
+                wp.int32(self._n),
+                wp.int32(self._n),
+                wp.int32(self._stride),
+                wp.int32(1),
+                wp.float64(-1.0),
+                self._matrix.offsets,
+                self._matrix.columns,
+                self._matrix.values,
+                self._solution_flat,
+            ],
+            outputs=[self._r],
+            device=self._device,
+        )
         if self._cycle is None:
             wp.launch(
                 kernel_cg.scaled_diagonal_apply,
@@ -1302,11 +1354,23 @@ class _BlockCg2:
     and ``arap``'s rotation-fitted right-hand side are unrelated functions by construction.
 
     **Launch count, and why the win is smaller than the iteration ratio alone predicts.** One
-    iteration here is 11 launches (two ``bsr_mv``, a Gram-3 partial/finalize pair, a 2x2 alpha
-    solve, the fused x/r/z step, a Gram-5 partial/finalize pair, a 2x2 beta solve that also carries
-    ``rz_old`` forward, the p step, the condition check) against ``_BatchedCg``'s 9 for the same
-    ``n_columns = 2`` system, so the extra launches eat into the iteration-count reduction: the net
-    end-to-end win is noticeably smaller than the iteration ratio alone would suggest.
+    iteration here is 10 launches (one flat matvec across both columns, a Gram-3 partial/finalize
+    pair, a 2x2 alpha solve, the fused x/r/z step, a Gram-5 partial/finalize pair, a 2x2 beta solve
+    that also carries ``rz_old`` forward, the p step, the condition check) against ``_BatchedCg``'s
+    8 for the same ``n_columns = 2`` system, so the extra launches eat into the iteration-count
+    reduction: the net end-to-end win is noticeably smaller than the iteration ratio alone would
+    suggest.
+
+    **``check_every`` is not a pure performance knob here, unlike everywhere else it appears in
+    this module.** There is no per-column analogue of ``_BatchedCg``'s convergence gate
+    (``cg_advance_x_r`` pins a converged column's own ``alpha`` to exactly ``0``):
+    ``block_cg_step_x_r_z`` always applies the full shared 2x2 ``alpha`` / ``beta`` to both
+    columns, so a column that has already crossed its own tolerance keeps absorbing the coupling
+    term from the sibling column's still-active search direction for as long as ``check_every``
+    defers the next readback. This is bounded -- the
+    near-rank-deficiency guard above keeps ``alpha`` / ``beta`` finite -- but it means a larger
+    ``check_every`` can let a nominally-converged column drift further from its answer here than the
+    same setting would on ``_BatchedCg``.
     """
 
     def __init__(
@@ -1337,6 +1401,7 @@ class _BlockCg2:
 
         self._rhs = rhs
         self._solution = solution
+        self._solution_flat = solution.flatten()
 
         dofs = 2 * self._stride
         self._r = wp.zeros(dofs, dtype=wp.float64, device=device)
@@ -1360,9 +1425,10 @@ class _BlockCg2:
         # 1 in the pad, so the fused Jacobi apply there is a no-op on an already-zero residual.
         self._inv_diag = wp.full(self._stride, 1.0, dtype=wp.float64, device=device)
         wp.map(kernel_array.inverse_or_one, wps.bsr_get_diag(matrix), out=self._inv_diag[: self._n])
-        self._p_blocks = _flat_column_views(self._p, 2, self._n, self._stride)
+        # Per-column view of ``r`` only: ``_initialize`` still seeds and residual-corrects it one
+        # column at a time, unlike the per-iteration matvec, which reads the flat buffers directly
+        # through ``csr_matvec``.
         self._r_blocks = _flat_column_views(self._r, 2, self._n, self._stride)
-        self._ap_blocks = _flat_column_views(self._ap, 2, self._n, self._stride)
 
     def _reduce_gram3(
         self, a: wp.array[wp.float64], b: wp.array[wp.float64], out: wp.array[wp.float64]
@@ -1378,7 +1444,7 @@ class _BlockCg2:
             device=self._device,
         )
         wp.launch_tiled(
-            kernel_cg.block_cg_gram3_finalize,
+            kernel_cg.block_cg_finalize_row,
             dim=(3,),
             inputs=[self._gram3_partials, wp.int32(self._blocks)],
             outputs=[out],
@@ -1400,7 +1466,7 @@ class _BlockCg2:
             device=self._device,
         )
         wp.launch_tiled(
-            kernel_cg.block_cg_gram5_finalize,
+            kernel_cg.block_cg_finalize_row,
             dim=(5,),
             inputs=[self._gram5_partials, wp.int32(self._blocks)],
             outputs=[out],
@@ -1409,11 +1475,26 @@ class _BlockCg2:
         )
 
     def _iteration(self) -> None:
-        """One block-CG step: 11 launches, none of which reads back to the host."""
-        for column in range(2):
-            wps.bsr_mv(
-                self._matrix, self._p_blocks[column], self._ap_blocks[column], alpha=1.0, beta=0.0
-            )
+        """One block-CG step: 10 launches, none of which reads back to the host."""
+        # One launch over both columns rather than two ``bsr_mv`` calls against the same operator --
+        # see ``_BatchedCg._iteration``'s identical conversion for the measurement.
+        wp.launch(
+            kernel_mg.csr_matvec,
+            dim=2 * self._n,
+            inputs=[
+                wp.int32(self._n),
+                wp.int32(self._stride),
+                wp.int32(self._stride),
+                wp.int32(0),
+                wp.float64(1.0),
+                self._matrix.offsets,
+                self._matrix.columns,
+                self._matrix.values,
+                self._p,
+            ],
+            outputs=[self._ap],
+            device=self._device,
+        )
         self._reduce_gram3(self._p, self._ap, self._gram3)
         wp.launch(
             kernel_cg.block_cg_solve_alpha,
@@ -1474,11 +1555,26 @@ class _BlockCg2:
             outputs=[self._atol_sq],
             device=self._device,
         )
-        # ``r = b - A x`` in place, warm-starting from whatever ``solution`` currently holds.
-        for column in range(2):
-            wps.bsr_mv(
-                self._matrix, self._solution[column], self._r_blocks[column], alpha=-1.0, beta=1.0
-            )
+        # ``r -= A x`` in place, warm-starting from whatever ``solution`` currently holds -- one
+        # launch across both columns via ``csr_matvec``'s own ``alpha``, the same conversion
+        # ``_BatchedCg._initialize`` uses. ``x_stride`` is ``n``: ``solution`` is unpadded.
+        wp.launch(
+            kernel_mg.csr_matvec,
+            dim=2 * self._n,
+            inputs=[
+                wp.int32(self._n),
+                wp.int32(self._n),
+                wp.int32(self._stride),
+                wp.int32(1),
+                wp.float64(-1.0),
+                self._matrix.offsets,
+                self._matrix.columns,
+                self._matrix.values,
+                self._solution_flat,
+            ],
+            outputs=[self._r],
+            device=self._device,
+        )
         wp.launch(
             kernel_cg.scaled_diagonal_apply,
             dim=2 * self._stride,
@@ -2146,6 +2242,7 @@ class _MultigridCycle:
                 wp.int32(x_stride),
                 wp.int32(y_stride),
                 wp.int32(1 if accumulate else 0),
+                wp.float64(1.0),
                 matrix.offsets,
                 matrix.columns,
                 matrix.values,

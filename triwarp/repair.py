@@ -382,6 +382,8 @@ def remove_duplicated_vertices(
     --------
     [`duplicate_vertex_inverse`][triwarp.repair.duplicate_vertex_inverse]
     [`hash_vector_rows`][triwarp.grouping.hash_vector_rows]
+    [`triwarp.seams.cut_along_edges`][triwarp.seams.cut_along_edges]
+        The inverse operation: welding coincident positions back together closes every cut it makes.
     """
     require_same_device(vertices=vertices, faces=faces)
     inverse = duplicate_vertex_inverse(vertices, epsilon)

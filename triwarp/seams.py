@@ -35,7 +35,6 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import seams as kernel_seams
 
 # Whether the seam predicate compares coordinates rather than texcoord indices. A lookup rather than
@@ -119,16 +118,19 @@ def crease_edges(
         return twt.as_array2d(selected, wp.int32)
     if int(selected.shape[0]) == 0:
         return twt.as_array2d(boundary, wp.int32)
-    return twt.as_array2d(tw.array.concatenate([selected, boundary]), wp.int32)
+    # ``array.concatenate`` takes rank-1 arrays only (CLAUDE.md section 3.4); flatten the two
+    # ``(n, 2)`` row buffers, concatenate, and reshape back rather than handing it a rank-2 array.
+    combined = tw.array.concatenate([selected.flatten(), boundary.flatten()])
+    return twt.as_array2d(combined.reshape((-1, 2)), wp.int32)
 
 
 def cut_along_edges(
-    vertices: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3] | wp.array[wp.vec3d],
     faces: wp.array[wp.int32],
     edges: twt.Array2dInt32,
     *,
     twins: wp.array[wp.int32] | None = None,
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+) -> tuple[wp.array[wp.vec3] | wp.array[wp.vec3d], wp.array[wp.int32]]:
     """
     Split the mesh along an edge set, duplicating vertices so the two sides no longer share them.
 
@@ -146,7 +148,8 @@ def cut_along_edges(
     Parameters
     ----------
     vertices
-        ``(n_vertices,)`` mesh vertex positions.
+        ``(n_vertices,)`` mesh vertex positions, ``wp.vec3`` or ``wp.vec3d``. The output dtype
+        follows.
     faces
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer. Must be **edge-manifold**:
         the cut is defined through halfedge twins, and an edge with three faces has no well-defined
@@ -164,10 +167,11 @@ def cut_along_edges(
 
     Returns
     -------
-    vertices : wp.array[wp.vec3]
-        Positions of the cut mesh, one per surviving corner component. Longer than the input's
-        wherever a vertex was split, and **shorter** when the input had unreferenced vertices — only
-        corners produce output vertices, so an unused vertex disappears.
+    vertices : wp.array[wp.vec3] | wp.array[wp.vec3d]
+        Positions of the cut mesh, one per surviving corner component, in ``vertices``' own dtype.
+        Longer than the input's wherever a vertex was split, and **shorter** when the input had
+        unreferenced vertices — only corners produce output vertices, so an unused vertex
+        disappears.
     faces : wp.array[wp.int32]
         Flat ``3 * n_faces`` triangle index buffer over the new vertices. Same length, same winding
         and same face order as the input; only the indices change.
@@ -208,19 +212,9 @@ def cut_along_edges(
         twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
 
     # Marked edges as a sorted key set, so the kernel tests membership with a binary search rather
-    # than a per-halfedge scan. Keys come from ``pack_edge_key``, the same builder the kernel uses,
-    # which is what makes a row given in either order match.
-    marked_keys = wp.empty(0, dtype=wp.uint64, device=device)
-    n_edges = int(edges.shape[0])
-    if n_edges > 0:
-        keys = wp.empty(n_edges, dtype=wp.uint64, device=device)
-        wp.launch(
-            kernel_grouping.pack_undirected_edge_keys,
-            dim=n_edges,
-            inputs=[edges, wp.uint64(n_vertices), keys],
-            device=device,
-        )
-        marked_keys, _order = tw.array.sort_and_argsort(keys)
+    # than a per-halfedge scan. Keys come from the same builder the kernel uses, which is what makes
+    # a row given in either order match.
+    marked_keys = tw.grouping.sorted_undirected_edge_keys(edges, n_vertices)
 
     union_edges = twt.empty_2d((n_halfedges, 2), wp.int32, device=device)
     count = wp.zeros(1, dtype=wp.int32, device=device)
@@ -240,7 +234,7 @@ def cut_along_edges(
     )
     unique_labels, corner_index = tw.grouping.unique_1d(labels, return_inverse=True)
 
-    out_vertices = wp.empty(int(unique_labels.shape[0]), dtype=wp.vec3, device=device)
+    out_vertices = wp.empty(int(unique_labels.shape[0]), dtype=vertices.dtype, device=device)
     wp.launch(
         kernel_seams.SCATTER_CORNER_VALUES[vertices.dtype],
         dim=n_halfedges,
@@ -325,8 +319,9 @@ def uv_seam_edges(
     ------
     ValueError
         If ``match="index"`` is asked for without ``face_texcoords``; if ``face_texcoords`` is
-        present but not the same length as ``faces``; if ``face_texcoords`` is ``None`` and
-        ``texcoords`` is not length ``3 * n_faces``; or if ``faces`` is not edge-manifold.
+        present but not the same length as ``faces``, or has an entry outside
+        ``[0, texcoords.shape[0])``; if ``face_texcoords`` is ``None`` and ``texcoords`` is not
+        length ``3 * n_faces``; or if ``faces`` is not edge-manifold.
     KeyError
         If ``match`` is neither ``"index"`` nor ``"uv"``.
     RuntimeError
@@ -372,6 +367,17 @@ def uv_seam_edges(
             f"face_texcoords must have one entry per face corner, got "
             f"{int(face_texcoords.shape[0])} for {int(faces.shape[0])} corners"
         )
+    if face_texcoords is not None and int(face_texcoords.shape[0]) > 0:
+        # A caller-supplied pool index, unlike the length check above -- ``classify_uv_halfedges``
+        # indexes ``texcoords`` with it directly, and an out-of-range entry (a stale ``FTC`` after
+        # ``texcoords`` was trimmed, an off-by-one building the pool) is a device-side out-of-bounds
+        # read rather than a Python exception. Caught here rather than left to the kernel.
+        min_index, max_index = tw.reduce.minmax(face_texcoords)
+        if min_index < 0 or max_index >= int(texcoords.shape[0]):
+            raise ValueError(
+                f"face_texcoords entries must be in [0, {int(texcoords.shape[0])}) (texcoords' "
+                f"length), got a range of [{min_index}, {max_index}]"
+            )
     if face_texcoords is None and int(texcoords.shape[0]) != 3 * n_faces:
         raise ValueError(
             f"without face_texcoords, texcoords must be per-corner (length {3 * n_faces}), got "
@@ -532,6 +538,15 @@ def uv_seam_vertex_mask(
 
     Raises
     ------
+    ValueError
+        Delegated from [`uv_seam_edges`][triwarp.seams.uv_seam_edges]: if ``match="index"`` is asked
+        for without ``face_texcoords``, if ``face_texcoords`` is present but not the same length as
+        ``faces`` or has an entry outside ``[0, texcoords.shape[0])``, if ``face_texcoords`` is
+        ``None`` and ``texcoords`` is not length ``3 * n_faces``, or if ``faces`` is not
+        edge-manifold.
+    KeyError
+        Delegated from [`uv_seam_edges`][triwarp.seams.uv_seam_edges]: if ``match`` is neither
+        ``"index"`` nor ``"uv"``.
     RuntimeError
         If ``faces``, ``texcoords`` and ``face_texcoords`` are not all on one device.
 

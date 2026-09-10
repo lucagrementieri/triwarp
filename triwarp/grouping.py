@@ -819,6 +819,41 @@ def hash_indices_rows(
     return hashes
 
 
+def sorted_undirected_edge_keys(edges: twt.Array2dInt32, n_vertices: int) -> wp.array[wp.uint64]:
+    """
+    Sorted packed keys of an undirected edge set, for binary-search membership testing.
+
+    Each row packs to the same key regardless of which endpoint comes first, so a halfedge's own
+    ``(origin, destination)`` key -- built the same way from either order -- can be tested for
+    membership against the result with a binary search, without caring which order a caller's row
+    was given in.
+
+    Parameters
+    ----------
+    edges
+        ``(k, 2)`` vertex-index pairs, in either order per row.
+    n_vertices
+        Total vertex count, used as the packing radix.
+
+    Returns
+    -------
+    wp.array[wp.uint64]
+        Length-``k`` sorted keys on ``edges.device``. Empty when ``edges`` is empty.
+    """
+    device = edges.device
+    n_edges = int(edges.shape[0])
+    if n_edges == 0:
+        return wp.empty(0, dtype=wp.uint64, device=device)
+    keys = wp.empty(n_edges, dtype=wp.uint64, device=device)
+    wp.launch(
+        kernel_grouping.pack_undirected_edge_keys,
+        dim=n_edges,
+        inputs=[edges, wp.uint64(n_vertices), keys],
+        device=device,
+    )
+    return tw.array.sort_and_argsort(keys)[0]
+
+
 def _pack_unique_result(
     unique: wp.array,
     *,

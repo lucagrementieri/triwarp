@@ -21,7 +21,6 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_same_device
-from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import triangles as kernel_triangles
 
 
@@ -232,16 +231,8 @@ def corner_normals(
     crease_keys = wp.empty(0, dtype=wp.uint64, device=device)
     if crease_edges is not None:
         twt.ensure_edge_pairs(crease_edges, "crease_edges")
-        n_creases = int(crease_edges.shape[0])
-        if n_creases > 0:
-            keys = wp.empty(n_creases, dtype=wp.uint64, device=device)
-            wp.launch(
-                kernel_grouping.pack_undirected_edge_keys,
-                dim=n_creases,
-                inputs=[crease_edges, wp.uint64(n_vertices), keys],
-                device=device,
-            )
-            crease_keys = tw.array.sort_and_argsort(keys)[0]
+        if int(crease_edges.shape[0]) > 0:
+            crease_keys = tw.grouping.sorted_undirected_edge_keys(crease_edges, n_vertices)
 
     if face_normals is None or face_areas is None:
         face_normals, face_areas = face_normals_and_areas(vertices, faces)

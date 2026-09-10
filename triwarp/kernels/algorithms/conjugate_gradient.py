@@ -42,6 +42,18 @@ from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND
 CG_TILE = wp.constant(256)
 
 
+@wp.func
+def sum_padded_row(row: wp.array[wp.float64], n_blocks: wp.int32) -> wp.float64:
+    # Cooperative tile-fold sum of one padded row -- the fold every finalize kernel in this module
+    # shares (``cg_dot_finalize`` and ``block_cg_finalize_row`` below). ``row``'s tail past
+    # ``n_blocks`` is zero-padded to a whole number of ``CG_TILE``-wide tiles by whichever partials
+    # kernel wrote it, so this needs no ragged branch.
+    acc = wp.tile_zeros(shape=CG_TILE, dtype=wp.float64)
+    for s in range((n_blocks + CG_TILE - 1) // CG_TILE):
+        acc += wp.tile_load(row, shape=CG_TILE, offset=s * CG_TILE, storage="register")
+    return wp.tile_sum(acc)[0]
+
+
 @wp.kernel
 def cg_dot_partials(
     a: wp.array[wp.float64],
@@ -64,6 +76,12 @@ def cg_dot_partials(
     #
     # The second pair shares its first operand, which is what CG's r.r and r.z want: one pass over
     # ``r`` answers both. ``pairs`` is warp-uniform, so the branch costs nothing.
+    #
+    # A self-dot (``a`` and ``b0`` the same array, as in the initial ``r.r``) loads the identical
+    # tile twice rather than reusing ``tile_a`` for ``tile_b0`` -- doubling the traffic for that one
+    # tile. Not special-cased: it is a per-call setup cost, not per-iteration (the hot per-iteration
+    # dots are ``p.Ap`` and ``r.z``, neither a self-dot), so the win would not show up in any
+    # measured iteration cost, and the branch to detect aliasing would run on every call regardless.
     c, blk, t = wp.tid()
     offset = c * stride + blk * CG_TILE
     tile_a = wp.tile_load(a, shape=CG_TILE, offset=offset, storage="register")
@@ -89,10 +107,11 @@ def cg_dot_finalize(
     out_dots: wp.array2d[wp.float64],
     out_carry: wp.array[wp.float64],
 ) -> None:
-    # Sum one (pair, column) row of partials cooperatively. Launch tiled over ``(2, n_columns)``.
-    # The partial buffer's last axis is padded to a multiple of ``CG_TILE`` and zeroed once at
-    # allocation, so the final tile reads zeros past ``n_blocks`` rather than the next column's
-    # partials -- the tail masking the first stage needs is not needed again here.
+    # Sum one (pair, column) row of partials cooperatively, via ``sum_padded_row`` -- the same fold
+    # ``block_cg_finalize_row`` below shares. Launch tiled over ``(2, n_columns)``. The partial
+    # buffer's last axis is padded to a multiple of ``CG_TILE`` and zeroed once at allocation, so
+    # the final tile reads zeros past ``n_blocks`` rather than the next column's partials -- the
+    # tail masking the first stage needs is not needed again here.
     #
     # ``carry`` folds CG's ``rz_old = rz_new`` copy into this launch, which is legal only for the
     # ``p.Ap`` finalize: it runs after the p update that last read ``rz_old`` and before the x/r
@@ -101,11 +120,7 @@ def cg_dot_finalize(
     p, c, t = wp.tid()
     if p >= pairs:
         return
-    row = partials[p, c]
-    acc = wp.tile_zeros(shape=CG_TILE, dtype=wp.float64)
-    for s in range((n_blocks + CG_TILE - 1) // CG_TILE):
-        acc += wp.tile_load(row, shape=CG_TILE, offset=s * CG_TILE, storage="register")
-    total = wp.tile_sum(acc)[0]
+    total = sum_padded_row(partials[p, c], n_blocks)
     if t == 0:
         out_dots[p, c] = total
         if carry != 0 and p == 0:
@@ -146,9 +161,12 @@ def scaled_diagonal_apply(
     #
     # ``stride`` is the column pitch and ``n`` the row count; one operator serves every column, so
     # the diagonal is indexed *within* the column rather than across the flat vector. They differ
-    # only where the conjugate-gradient state pads each column out to a whole reduction tile, and
-    # the pad is skipped rather than written because that solver reduces over it and needs it zero.
-    # A caller with no padding passes ``n == stride``, which makes the guard unreachable.
+    # wherever the conjugate-gradient state pads each column out to a whole reduction tile, and the
+    # pad is skipped rather than written because that solver reduces over it and needs it zero. That
+    # is reachable from both callers, not only the CG one: the multigrid cycle's *top* level reuses
+    # the outer CG state's own (possibly padded) stride, so ``n < stride`` there too whenever the
+    # system size is not a whole number of tiles -- harmless only because the level's ``b`` is that
+    # same CG state's ``r``, whose pad the CG state already keeps zero.
     #
     # Lives here rather than in ``algorithms/multigrid.py`` because the cycle is a
     # ``preconditioner=`` choice of *this* solver: the dependency runs multigrid -> CG, never back.
@@ -320,12 +338,25 @@ def solve_sym2x2(
     # is not a deflation: a genuinely rank-deficient block degrades toward the regularized system's
     # answer rather than recovering the two-column convergence rate, which is why this stays "a
     # guard against breakdown" rather than "a fix for it" -- see ``_BlockCg2``'s Notes.
+    #
+    # ``det``'s own floor is relative, not the bare ``1e-300`` it might look like it should be.
+    # For an exactly rank-deficient ``G`` (``g00 * g11 == g01 * g01``), expanding the regularized
+    # determinant gives ``det = reg * trace + reg^2 ~= reg * trace`` -- so ``reg * trace`` is
+    # already the expected scale of the worst *legitimate* determinant this guard is meant to
+    # produce, at any problem scale. Flooring at a bare ``1e-300`` instead would let a determinant
+    # that collapsed *below* that expected scale through catastrophic cancellation in
+    # ``rg00 * rg11 - g01 * g01`` (two nearly-equal ``float64`` products subtracted) survive
+    # unfloored, since ``1e-300`` is far beneath it for any ordinarily-scaled system -- and
+    # ``inv_det`` would then overshoot by exactly that missed margin. ``1e-300`` remains only as
+    # the absolute fallback for ``trace == 0`` (a fully zero block), where the relative floor is
+    # itself zero.
     trace = g00 + g11
     reg = BLOCK_CG_REG_EPS * trace
     rg00 = g00 + reg
     rg11 = g11 + reg
     det = rg00 * rg11 - g01 * g01
-    det_safe = wp.max(det, wp.float64(1e-300))
+    det_floor = wp.max(reg * trace, wp.float64(1e-300))
+    det_safe = wp.max(det, det_floor)
     inv_det = wp.float64(1.0) / det_safe
     inv00 = rg11 * inv_det
     inv01 = -g01 * inv_det
@@ -370,23 +401,6 @@ def block_cg_gram3_partials(
 
 
 @wp.kernel
-def block_cg_gram3_finalize(
-    partials: wp.array2d[wp.float64], n_blocks: wp.int32, out_g: wp.array[wp.float64]
-) -> None:
-    # Sum one of the three Gram rows cooperatively. Launch tiled over ``(3,)`` with
-    # ``block_dim=CG_TILE``; the partial buffer's block axis is padded to a multiple of ``CG_TILE``
-    # and zeroed once at allocation (see ``cg_dot_finalize``).
-    row, t = wp.tid()
-    values = partials[row]
-    acc = wp.tile_zeros(shape=CG_TILE, dtype=wp.float64)
-    for s in range((n_blocks + CG_TILE - 1) // CG_TILE):
-        acc += wp.tile_load(values, shape=CG_TILE, offset=s * CG_TILE, storage="register")
-    total = wp.tile_sum(acc)[0]
-    if t == 0:
-        out_g[row] = total
-
-
-@wp.kernel
 def block_cg_gram5_partials(
     r: wp.array[wp.float64],
     z: wp.array[wp.float64],
@@ -399,7 +413,9 @@ def block_cg_gram5_partials(
     # ``r0.z1``, ``r1.z1``, the next iteration's ``beta`` right-hand side). One pass rather than two
     # separate reductions, since all four tiles are already resident. Also (ab)used at setup with
     # ``z = r`` to get the initial ``||b||`` alone -- the three Gram entries that call produces are
-    # discarded.
+    # discarded, and ``tile_z0``/``tile_z1`` alias ``tile_r0``/``tile_r1`` rather than reusing them,
+    # doubling that call's tile traffic. Neither is worth special-casing: it is a one-time setup
+    # call, not the per-iteration one, so there is no iteration cost to recover.
     blk, t = wp.tid()
     offset = blk * CG_TILE
     tile_r0 = wp.tile_load(r, shape=CG_TILE, offset=offset, storage="register")
@@ -420,19 +436,20 @@ def block_cg_gram5_partials(
 
 
 @wp.kernel
-def block_cg_gram5_finalize(
-    partials: wp.array2d[wp.float64], n_blocks: wp.int32, out_g5: wp.array[wp.float64]
+def block_cg_finalize_row(
+    partials: wp.array2d[wp.float64], n_blocks: wp.int32, out_g: wp.array[wp.float64]
 ) -> None:
-    # Sum one of the five rows ``block_cg_gram5_partials`` wrote. Launch tiled over ``(5,)`` with
-    # ``block_dim=CG_TILE``.
+    # Sum one row of a block-CG partial-sum table cooperatively -- the shared fold behind both
+    # ``block_cg_gram3_partials`` (launched at ``dim=(3,)``, the P^T A P / initial-setup Gram) and
+    # ``block_cg_gram5_partials`` (launched at ``dim=(5,)``, the per-iteration residual/Gram pass).
+    # The two callers differ only in the row count, so one kernel serves both. Launch tiled with
+    # ``block_dim=CG_TILE``; the partial buffer's block axis is padded to a multiple of ``CG_TILE``
+    # and zeroed once at allocation. ``sum_padded_row`` is the same fold ``cg_dot_finalize`` above
+    # shares -- three callers, not three copies.
     row, t = wp.tid()
-    values = partials[row]
-    acc = wp.tile_zeros(shape=CG_TILE, dtype=wp.float64)
-    for s in range((n_blocks + CG_TILE - 1) // CG_TILE):
-        acc += wp.tile_load(values, shape=CG_TILE, offset=s * CG_TILE, storage="register")
-    total = wp.tile_sum(acc)[0]
+    total = sum_padded_row(partials[row], n_blocks)
     if t == 0:
-        out_g5[row] = total
+        out_g[row] = total
 
 
 @wp.kernel

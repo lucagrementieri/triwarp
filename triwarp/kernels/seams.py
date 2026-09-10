@@ -8,7 +8,7 @@ from triwarp.kernels.array import (
     cross2,
     pack_edge_key,
 )
-from triwarp.kernels.halfedge import halfedge_next
+from triwarp.kernels.halfedge import halfedge_next, halfedge_prev
 
 
 @wp.kernel
@@ -28,10 +28,17 @@ def corner_union_edges(
     # Both endpoints matter, and getting only one of them wrong is silent: the fan around a vertex
     # is then connected by half its edges and every vertex splits into two.
     #
-    # ``h < twin`` emits each undirected edge once. For the halfedge ``h: u -> v`` with twin
-    # ``t: v -> u``, the corners at ``u`` are ``h`` and ``next(t)``, and the corners at ``v`` are
-    # ``next(h)`` and ``t`` -- the twin runs the other way, so its *following* halfedge is the one
-    # starting where ``h`` does.
+    # ``h < twin`` emits each undirected edge once. ``halfedge_twins`` pairs halfedges by their
+    # *undirected* endpoint set alone (no direction check), so ``twin`` can run either opposite
+    # ``h`` (the consistently-wound case) or the same way as ``h`` (an edge-manifold but
+    # inconsistently-wound mesh -- this module's own ``uv_seam_edges`` Notes name that as a real,
+    # supported divergence, not an excluded input). Both cases have to be handled, or the two
+    # corners unioned belong to two different original vertices.
+    #
+    # For ``h: u -> v``: if ``twin`` runs ``v -> u`` (opposite), the corners at ``u`` are ``h`` and
+    # ``next(twin)`` and the corners at ``v`` are ``next(h)`` and ``twin``. If ``twin`` runs
+    # ``u -> v`` (same direction as ``h``), the corners at ``u`` are ``h`` and ``twin`` themselves,
+    # and at ``v`` are ``next(h)`` and ``next(twin)``.
     h = wp.int32(wp.tid())
     twin = twins[h]
     if twin < 0 or twin < h:
@@ -41,10 +48,18 @@ def corner_union_edges(
     ):
         return
     slot = wp.atomic_add(out_count, 0, 2)
-    out_edges[slot, 0] = h
-    out_edges[slot, 1] = halfedge_next(twin)
-    out_edges[slot + 1, 0] = halfedge_next(h)
-    out_edges[slot + 1, 1] = twin
+    if faces[twin] == faces[h]:
+        # Same-direction twin: each halfedge's own corner is at the shared origin ``u``.
+        out_edges[slot, 0] = h
+        out_edges[slot, 1] = twin
+        out_edges[slot + 1, 0] = halfedge_next(h)
+        out_edges[slot + 1, 1] = halfedge_next(twin)
+    else:
+        # Opposite-direction twin (the consistently-wound case).
+        out_edges[slot, 0] = h
+        out_edges[slot, 1] = halfedge_next(twin)
+        out_edges[slot + 1, 0] = halfedge_next(h)
+        out_edges[slot + 1, 1] = twin
 
 
 @wp.kernel
@@ -59,12 +74,6 @@ def scatter_corner_values(
     # construction and no atomics are needed.
     h = wp.int32(wp.tid())
     out_values[corner_index[h]] = values[faces[h]]
-
-
-@wp.func
-def halfedge_opposite_corner(h: wp.int32) -> wp.int32:
-    # The corner of ``h``'s face that ``h`` does *not* touch -- igl's ``(i + 2) % 3``.
-    return halfedge_next(halfedge_next(h))
 
 
 @wp.func
@@ -126,12 +135,22 @@ def classify_uv_halfedges(
     out_quads[h, 2] = backwards // 3
     out_quads[h, 3] = backwards % 3
 
-    # ``backwards`` runs the other way, so the corner sitting on top of ``forwards``' tail is the
-    # one *following* ``backwards``, and vice versa.
+    # ``halfedge_twins`` pairs ``h``/``twin`` by their undirected endpoint set alone, with no
+    # direction check, so ``backwards`` runs opposite ``forwards`` only on a consistently-wound
+    # mesh -- this module's own Notes name inconsistent winding as a real, supported divergence, not
+    # an excluded input. When it runs the *other* way, the corner sitting on top of ``forwards``'
+    # tail is the one *following* ``backwards``, and vice versa; when it runs the *same* way, that
+    # corner is ``backwards`` itself, and the one on top of ``forwards``' head is the one following
+    # it. ``faces[backwards] == faces[forwards]`` is exactly the same-direction case, since both
+    # then share the same origin vertex.
     tail_forwards = face_texcoords[forwards]
     head_forwards = face_texcoords[halfedge_next(forwards)]
-    tail_backwards = face_texcoords[halfedge_next(backwards)]
-    head_backwards = face_texcoords[backwards]
+    if faces[backwards] == faces[forwards]:
+        tail_backwards = face_texcoords[backwards]
+        head_backwards = face_texcoords[halfedge_next(backwards)]
+    else:
+        tail_backwards = face_texcoords[halfedge_next(backwards)]
+        head_backwards = face_texcoords[backwards]
 
     if match_uv:
         is_seam = texcoords_differ(
@@ -148,8 +167,8 @@ def classify_uv_halfedges(
     # Strictly the same side: a collinear corner is a degenerate UV triangle, not a foldover.
     a = texcoords[tail_forwards]
     b = texcoords[head_forwards]
-    c_forwards = texcoords[face_texcoords[halfedge_opposite_corner(forwards)]]
-    c_backwards = texcoords[face_texcoords[halfedge_opposite_corner(backwards)]]
+    c_forwards = texcoords[face_texcoords[halfedge_prev(forwards)]]
+    c_backwards = texcoords[face_texcoords[halfedge_prev(backwards)]]
     orientation_forwards = cross2(a - c_forwards, b - c_forwards)
     orientation_backwards = cross2(a - c_backwards, b - c_backwards)
     out_is_foldover[h] = (orientation_forwards > 0.0 and orientation_backwards > 0.0) or (
@@ -182,12 +201,12 @@ def face_corner_edge_vertices(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 4. One overload across **2** module loads: the smallest fork in the package, and
-# registered for the same reason the others are -- so that adding a second dtype later cannot
-# quietly reintroduce one.
+# CLAUDE.md section 4. Two overloads across **2** module loads: the smallest fork in the package.
 #
-# ``cut_mesh_from_seams`` scatters the corner *positions* it is splitting, so the value dtype is the
-# vertex dtype and nothing else reaches this kernel.
+# ``triwarp.seams.cut_along_edges`` scatters the corner *positions* it is splitting, so the value
+# dtype is the vertex dtype it was handed -- ``wp.vec3`` or ``wp.vec3d`` -- and nothing else reaches
+# this kernel. Both are registered because the wrapper's own dispatch (``SCATTER_CORNER_VALUES[
+# vertices.dtype]``) can reach either one.
 # The concrete handle keyed by the value dtype -- see
 # [`OverloadTable`][triwarp.kernels.array.OverloadTable].
 SCATTER_CORNER_VALUES: OverloadTable

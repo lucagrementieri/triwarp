@@ -266,26 +266,30 @@ def csr_matvec(
     x_stride: wp.int32,
     y_stride: wp.int32,
     accumulate: wp.int32,
+    alpha: wp.float64,
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
     values: wp.array[wp.float64],
     x: wp.array[wp.float64],
     out_y: wp.array[wp.float64],
 ) -> None:
-    # ``y = A x`` (or ``y += A x``) for **every column at once**, which is the whole reason this
-    # exists rather than ``warp.sparse.bsr_mv``: that takes one vector, so a cycle over three
-    # right-hand sides pays three launches per mat-vec, and the V-cycle is launch-bound at these
-    # sizes. Measured on ``smooth_region``'s operator, three columns, captured: **34 launches and
-    # 189 us per cycle through ``bsr_mv`` against 15 and 85 through this**, with the same answer.
+    # ``y = alpha * A x`` (or ``y += alpha * A x``) for **every column at once**, which is the whole
+    # reason this exists rather than ``warp.sparse.bsr_mv``: that takes one vector, so a cycle over
+    # three right-hand sides pays three launches per mat-vec, and the V-cycle is launch-bound at
+    # these sizes. Measured on ``smooth_region``'s operator, three columns, captured: **34 launches
+    # and 189 us per cycle through ``bsr_mv`` against 15 and 85 through this**, with the same
+    # answer.
     #
     # ``x_stride`` and ``y_stride`` differ whenever the operator is rectangular -- the restriction
     # reads at the fine pitch and writes at the coarse one -- and either may exceed its own row
     # count, since the top level's vectors carry the conjugate-gradient state's tile padding.
     # ``accumulate`` is warp-uniform and folds the prolongation's correction into the same kernel.
+    # ``alpha`` mirrors ``bsr_mv``'s own scale argument -- every caller here passes a compile-time
+    # constant (``1.0`` or ``-1.0``), so it costs one multiply per row rather than a second kernel.
     t = wp.int32(wp.tid())
     column = t // n_rows
     row = t % n_rows
-    total = csr_row_dot(row, column * x_stride, offsets, columns, values, x)
+    total = alpha * csr_row_dot(row, column * x_stride, offsets, columns, values, x)
     slot = column * y_stride + row
     if accumulate != wp.int32(0):
         out_y[slot] += total
