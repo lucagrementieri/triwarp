@@ -28,9 +28,14 @@ def _build_reference_frame(
     tangential, length = unit_tangent(first_neighbor - vertex, normal, TOLERANCE_ZERO_CONSTANT)
     if length > TOLERANCE_ZERO_CONSTANT:
         t1 = tangential
-    # ``normal`` is unit and ``t1`` is a unit vector orthogonal to it, so the cross product is
-    # already unit and needs no normalization.
-    return t1, wp.cross(normal, t1)
+    # The ``normalize`` is *not* redundant, though the arithmetic says it is: ``normal`` is unit
+    # and ``t1`` is orthogonal to it, so the cross product is unit in exact arithmetic and 1 +- an
+    # ULP or so in float32. Dropping it was measured and reverted -- it moves ``PV1`` by up to
+    # 2.7e-04 on ``half_torus``, at exactly the vertices whose two principal curvatures already
+    # agree to 1e-05..7e-04, because that residual is enough to flip which of the pair is the
+    # larger. With it, the whole family is bit-identical on the CPU device across every fixture,
+    # both ``frame_independent`` modes and both fit radii.
+    return t1, wp.normalize(wp.cross(normal, t1))
 
 
 @wp.func

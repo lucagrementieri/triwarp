@@ -423,3 +423,74 @@ def test_principal_directions_are_a_frame_at_an_umbilic_point(
     assert np.ptp(pv2_np) < 0.05
     assert 1.0 <= float(pv1_np.mean()) * sphere_radius <= 1.25
     assert 1.0 <= float(pv2_np.mean()) * sphere_radius <= 1.25
+
+
+@pytest.mark.parametrize("frame_independent", [True, False])
+def test_principal_directions_match_the_analytic_torus(
+    torus: tuple[tm.Trimesh, wp.Mesh], frame_independent: bool
+) -> None:
+    """
+    Class A against a closed form: on a torus the principal directions are the parameter curves.
+
+    Not a library comparison, and that is the point rather than a shortfall. The reference
+    libraries cover this function unevenly: igl is an oracle for ``frame_independent=False`` only
+    (it *is* the symmetrized operator that flag reproduces), and pymeshlab's
+    ``vertex_curvature_principal_dir1_matrix`` is asserted for ``PD1`` alone, because its two
+    directions are ordered differently from triwarp's at 5% of vertices. That left ``PD2`` in the
+    default ``frame_independent=True`` branch -- the output most sensitive to how the second
+    eigenvector is obtained -- with no reference comparison at all. A torus has one.
+
+    A torus of revolution is a principal-coordinate surface: its meridians (around the tube) and
+    its parallels (around the axis) are the lines of curvature everywhere, with curvatures ``1/r``
+    and ``cos(theta) / (R + r cos(theta))``. Those two families are recovered here from the vertex
+    positions alone -- no fit, no library -- so this is an exact oracle for the *directions*, which
+    is what the assert reads. The magnitudes are left to the igl and pymeshlab comparisons above,
+    since the quadric fit's cap bias makes them a weaker claim than the directions.
+
+    Measured: ``min |cos|`` is **1.0000** for both families over all 1024 vertices, in both modes.
+    Before the second direction was derived as a cross product it was 1.0000 for the meridians and
+    **0.0000** for the parallels -- the returned pair failed to contain one of the two lines of
+    curvature at all on some vertices -- which is the regression this pins. The bar is 0.99, and
+    the fixture cannot be vacuous: on this torus the two principal curvatures differ by at least
+    1.79 everywhere, so there is no umbilic vertex for the directions to be arbitrary at.
+    """
+    mesh_tm, mesh_wp = torus
+    major_radius, minor_radius = 1.0, 0.4
+
+    # Recover each vertex's (meridian, parallel) frame from its position. The tube's centre circle
+    # has radius ``major_radius``, so the vector from the nearest point on it is the surface normal
+    # direction, and the two tangents follow from it.
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
+    angle_np = np.arctan2(vertices_np[:, 1], vertices_np[:, 0])
+    axis_np = np.stack(
+        [np.cos(angle_np), np.sin(angle_np), np.zeros_like(angle_np)], axis=1
+    )  # outward radial direction of the centre circle
+    normal_np = vertices_np - major_radius * axis_np
+    normal_np /= np.linalg.norm(normal_np, axis=1, keepdims=True)
+    parallel_np = np.stack([-np.sin(angle_np), np.cos(angle_np), np.zeros_like(angle_np)], axis=1)
+    meridian_np = np.cross(normal_np, parallel_np)
+    meridian_np /= np.linalg.norm(meridian_np, axis=1, keepdims=True)
+
+    # Non-vacuity: no umbilic vertices, so both directions are genuinely determined.
+    cos_theta_np = np.einsum("ij,ij->i", normal_np, axis_np)
+    curvature_gap_np = np.abs(
+        1.0 / minor_radius - cos_theta_np / (major_radius + minor_radius * cos_theta_np)
+    )
+    assert curvature_gap_np.min() > 1.0, "a torus fixture with an umbilic vertex is the wrong one"
+
+    pd1_wp, pd2_wp, _, _ = tw.curvature.principal_curvature(
+        mesh_wp.points, mesh_wp.indices, frame_independent=frame_independent
+    )
+    pd1_np, pd2_np = pd1_wp.numpy(), pd2_wp.numpy()
+    assert np.all(np.linalg.norm(pd1_np, axis=1) > 0.5), "every fit must have produced a frame"
+
+    # The returned pair must *contain* both lines of curvature. Which of PD1/PD2 carries which is
+    # the PV1 >= PV2 ordering's business and flips with the sign of the parallel curvature across
+    # the inner and outer halves of the tube, so each analytic direction is matched against the
+    # better of the two -- an eigenvector is defined up to sign, hence the absolute value.
+    for name, exact_np in (("meridian", meridian_np), ("parallel", parallel_np)):
+        alignment_np = np.maximum(
+            np.abs(np.einsum("ij,ij->i", pd1_np, exact_np)),
+            np.abs(np.einsum("ij,ij->i", pd2_np, exact_np)),
+        )
+        assert alignment_np.min() > 0.99, f"{name}: worst |cos| {alignment_np.min():.4f}"
