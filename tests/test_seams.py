@@ -893,6 +893,32 @@ def test_uv_seam_edges_empty_mesh(device: str) -> None:
     )
 
 
+def test_uv_seam_match_rejects_an_off_menu_mode(device: str) -> None:
+    """
+    Not a library comparison: the ``match`` menu's own guard, on both entry points.
+
+    An unrecognised mode used to reach ``_UV_MATCH_MODES[match]`` and surface as a bare
+    ``KeyError('bogus')`` naming neither the argument nor the two modes -- the one place in the
+    package where an off-menu value did not raise the ``ValueError`` every other menu argument
+    raises. ``uv_seam_vertex_mask`` delegates, so it is checked too: the guard lives in the
+    function the delegation lands in, and only a call through the wrapper shows that.
+    """
+    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
+    corner_uv_wp = points_to_warp_uv(
+        np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32), device
+    )
+    for match in ("bogus", "Index", ""):
+        with pytest.raises(ValueError, match="match must be one of"):
+            tw.seams.uv_seam_edges(faces_wp, corner_uv_wp, n_vertices=3, match=match)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="match must be one of"):
+            tw.seams.uv_seam_vertex_mask(faces_wp, corner_uv_wp, n_vertices=3, match=match)  # type: ignore[arg-type]
+    # Both documented modes still run; ``index`` needs ``face_texcoords`` and is covered above.
+    assert tw.seams.uv_seam_edges(faces_wp, corner_uv_wp, n_vertices=3, match="uv")[0].shape == (
+        0,
+        4,
+    )
+
+
 def test_cut_along_edges_accepts_a_row_in_either_order(
     device: str, unit_box: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:

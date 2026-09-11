@@ -172,9 +172,9 @@ def require_valid_faces(faces: wp.array[wp.int32], n_vertices: int, name: str) -
     either (§7.6) -- so it is a precondition, not a runtime-checked invariant.
 
     Unlike [`require_nonempty_mesh`][triwarp._device.require_nonempty_mesh], this is **not** free:
-    it costs two device reductions and two host readbacks (~0.2-0.6 ms, §13.1), because it has to
-    read the actual index values, not just a shape. That is deliberate: it is meant for the small
-    number of public entry points that are the real trust boundary for a mesh's connectivity -- a
+    it costs a device reduction and a host readback, because it has to read the actual index
+    values, not just a shape. That is deliberate: it is meant for the small number of public entry
+    points that are the real trust boundary for a mesh's connectivity -- a
     freshly loaded file ([`io.load_mesh`][triwarp.io.load_mesh],
     [`io.mesh_from_numpy`][triwarp.io.mesh_from_numpy]) or a freshly repaired one
     ([`repair.make_solid`][triwarp.repair.make_solid]) -- not every downstream helper, which is
@@ -197,8 +197,13 @@ def require_valid_faces(faces: wp.array[wp.int32], n_vertices: int, name: str) -
     """
     if int(faces.shape[0]) == 0:
         return
-    lo = int(tw.reduce.min(faces))
-    hi = int(tw.reduce.max(faces))
+    # One ``minmax`` rather than a ``min`` and a ``max``: both ends come out of the same launch,
+    # the same buffer and the same readback, so asking for both costs nothing over asking for one.
+    # Measured interleaved in one process, min-of-60 at 24.5k / 208k / 3.26M indices (the flat
+    # index buffers of bunny_decimated, bunny and happy_buddha): 1.65 / 1.68 / 1.43x on cuda:0 and
+    # 1.24 / 1.13 / 1.10x on cpu -- a win on both devices, ~0.05 ms of the CUDA call, which at
+    # these sizes is the readback the second reduction used to add rather than any device work.
+    lo, hi = tw.reduce.minmax(faces)
     if lo < 0 or hi >= n_vertices:
         raise ValueError(
             f"{name}: faces must reference vertex indices in [0, {n_vertices}), "

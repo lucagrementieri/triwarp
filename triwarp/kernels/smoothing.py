@@ -757,10 +757,7 @@ def relax_approx_step(
     vertex = wp.int32(wp.tid())
     current = positions[vertex]
     begin = neighbor_offsets[vertex]
-    # ``geodesic_ball`` returns starts without a sentinel, so the last row runs to the buffer's end.
-    end = neighbor_indices.shape[0]
-    if vertex + 1 < neighbor_offsets.shape[0]:
-        end = neighbor_offsets[vertex + 1]
+    end = neighbor_offsets[vertex + 1]  # terminated (n + 1) CSR row bounds from ``geodesic_ball``
     if not region[vertex] or end - begin < 6:
         out_positions[vertex] = current
         return

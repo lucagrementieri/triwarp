@@ -211,7 +211,7 @@ def pack_support_candidate(projection: wp.float32, index: wp.int32) -> wp.uint64
 
 
 @wp.kernel
-def support_argmax_tiled(
+def support_argmax_sliced(
     mesh_vertices: wp.array[wp.vec3],
     n_vertices: wp.int32,
     n_slices: wp.int32,
@@ -224,12 +224,13 @@ def support_argmax_tiled(
     # (projection, index) key, and commits one atomic; the packed key's ordering makes atomic_max
     # the global argmax with the lowest index as tie-break.
     #
-    # Lane-free because the threads partition the **outer** work -- the vertex cloud -- rather than
-    # a sequence one block owns, so there is no `wp.block_dim()` to stride by; on the CPU device,
-    # where `wp.launch_tiled` runs one lane per block through Warp 1.17, that lane would cover
-    # `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 3, and `obscurance` above for the
-    # other side of the rule -- one block per point, striding by `wp.block_dim()`, `wp.tile_sum` on
-    # both devices.
+    # `_sliced`, not `_tiled`, and the name is the contract: this is launched with a plain
+    # `wp.launch` and must stay lane-free, because the threads partition the **outer** work -- the
+    # vertex cloud -- rather than a sequence one block owns, so there is no `wp.block_dim()` to
+    # stride by. On the CPU device, where `wp.launch_tiled` runs one lane per block through
+    # Warp 1.17, that lane would cover `1/block_dim` of the slice. See `.claude/CLAUDE.md`
+    # section 3, and `obscurance` above for the other side of the rule -- one block per point,
+    # striding by `wp.block_dim()`, `wp.tile_sum` on both devices.
     #
     # Converting this to one block per deferred query is the same trade
     # `kernels/points.py::hull_support_extremes` records and it is **declined for the same measured
@@ -240,9 +241,12 @@ def support_argmax_tiled(
     normal = normals[support_indices[q]]
     best = wp.float32(-wp.inf)
     best_index = wp.int32(0)
+    # A strict `>` already resolves a tie to the lowest index, because `idx` ascends: the first
+    # occurrence of a repeated projection is the one that takes `best`, and every later equal one
+    # fails the test. An explicit `idx < best_index` arm would be unreachable.
     for idx in range(j, n_vertices, n_slices):
         projection = wp.dot(mesh_vertices[idx], normal)
-        if projection > best or (projection == best and idx < best_index):
+        if projection > best:
             best = projection
             best_index = idx
     if not wp.isinf(best):

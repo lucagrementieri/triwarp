@@ -548,3 +548,63 @@ def test_discrete_negative_labels(device: str):
     labels_wp = wp.array(np.array([0, -1, 2], dtype=np.int32), dtype=wp.int32, device=device)
     with pytest.raises(ValueError, match="greater than or equal to 0"):
         tw.texture.rasterize_discrete_attribute(uv_wp, faces_wp, labels_wp, 8)
+
+
+def test_rasterize_row_count_mismatch(device: str):
+    """
+    Not a library comparison: an argument-validation guard, which no reference library exposes.
+
+    Both rasterizers document a ``ValueError`` when ``uv`` and ``attribute`` disagree on their row
+    count. Without it the rasterizing kernel indexes the shorter buffer out of range, which on the
+    cpu device is host-heap corruption rather than a wrong answer (CLAUDE.md section 12.1).
+    """
+    uv_np = np.array([[0.5, 0.5], [0.2, 0.2], [0.8, 0.8]], dtype=np.float32)
+    uv_wp = points_to_warp_uv(uv_np, device)
+    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
+    attribute_wp = wp.array(np.zeros((2, 1), dtype=np.float32), dtype=wp.float32, device=device)
+    with pytest.raises(ValueError, match="row count mismatch"):
+        tw.texture.rasterize_attribute(uv_wp, faces_wp, attribute_wp, 8)
+    labels_wp = wp.array(np.zeros(2, dtype=np.int32), dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="row count mismatch"):
+        tw.texture.rasterize_discrete_attribute(uv_wp, faces_wp, labels_wp, 8)
+
+
+def test_remap_uv_out_of_range(device: str):
+    """
+    Not a library comparison: an argument-validation guard, which no reference library exposes.
+
+    Both samplers document the same ``[0, 1]`` ``ValueError`` the rasterizers raise, and
+    ``remap_discrete_attribute_from_uv`` reaches it only *indirectly*, through its
+    ``remap_attribute_from_uv`` call -- so its documented ``Raises`` entry is a claim about a
+    guard it does not itself run, which is exactly the kind that goes stale unnoticed.
+    """
+    uv_wp = points_to_warp_uv(np.array([[0.5, 0.5], [1.5, 0.2]], dtype=np.float32), device)
+    image_wp = wp.zeros((4, 4), dtype=wp.float32, device=device)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        tw.texture.remap_attribute_from_uv(uv_wp, image_wp)
+    class_image_wp = wp.zeros((4, 4), dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        tw.texture.remap_discrete_attribute_from_uv(uv_wp, class_image_wp)
+
+
+def test_remap_rejects_an_off_menu_order(device: str):
+    """
+    Not a library comparison: the ``order`` menu's own guard.
+
+    ``order`` was read as ``SAMPLE_BILINEAR if order == 1 else SAMPLE_NEAREST``, so every value
+    other than ``1`` sampled nearest-neighbour and returned a plausible image -- the failure mode
+    a ``Literal`` annotation hides from a caller whose value arrives through a variable rather
+    than a literal. Both documented orders still run, and they must disagree on this image, or
+    the test would pass against a function that ignored ``order`` entirely.
+    """
+    uv_wp = points_to_warp_uv(np.array([[0.25, 0.25], [0.6, 0.7]], dtype=np.float32), device)
+    image_np = np.arange(16, dtype=np.float32).reshape(4, 4)
+    image_wp = wp.array(image_np, dtype=wp.float32, device=device)
+    for order in (2, -1, 0.5):
+        with pytest.raises(ValueError, match="order must be 0"):
+            tw.texture.remap_attribute_from_uv(uv_wp, image_wp, order=order)  # type: ignore[arg-type]
+    bilinear_np = tw.texture.remap_attribute_from_uv(uv_wp, image_wp, order=1).numpy()
+    nearest_np = tw.texture.remap_attribute_from_uv(uv_wp, image_wp, order=0).numpy()
+    assert np.isfinite(bilinear_np).all()
+    assert np.isfinite(nearest_np).all()
+    assert not np.allclose(bilinear_np, nearest_np)

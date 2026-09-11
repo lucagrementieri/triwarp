@@ -4,22 +4,20 @@ from triwarp.kernels.array import declare_map_signatures, map_probe, map_probe_s
 
 
 @wp.func
-def ray_query_first(
-    mesh_id: wp.uint64, origin: wp.vec3, direction: wp.vec3, max_t: wp.float32
-) -> tuple[wp.bool, wp.int32, wp.vec3]:
-    query = wp.mesh_query_ray(mesh_id, origin, direction, max_t)
-    if query.result:
-        return True, query.face, origin + direction * query.t
-    return False, wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
-
-
-@wp.func
 def first_hit(
     mesh_id: wp.uint64, origin: wp.vec3, direction: wp.vec3, max_t: wp.float32
 ) -> tuple[wp.int32, wp.vec3]:
     # First-hit face index (-1 on miss) and location; ``direction`` need not be unit length.
-    _hit, face, location = ray_query_first(mesh_id, origin, wp.normalize(direction), max_t)
-    return face, location
+    #
+    # The face index carries the hit test -- both consumers already read it that way
+    # (``first_hit_append``'s ``face >= 0`` and ``ray.intersects_first``'s documented ``-1``
+    # sentinel) -- so there is no separate hit flag to keep in step with it. On a miss the
+    # location is the zero vector and no caller reads it.
+    unit_direction = wp.normalize(direction)
+    query = wp.mesh_query_ray(mesh_id, origin, unit_direction, max_t)
+    if query.result:
+        return query.face, origin + unit_direction * query.t
+    return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
 
 
 @wp.kernel
@@ -57,6 +55,13 @@ def longest_ray_distance(
     planar_tol: wp.float32,
 ) -> wp.float32:
     # ``direction`` need not be unit length; the offset walk below assumes a unit ray.
+    #
+    # The 64-step cap bounds how many hits inside ``planar_tol`` of the origin the walk will step
+    # over before giving up, and exhausting it returns ``wp.inf`` -- i.e. reports the ray as
+    # unobstructed when it is not. Reaching that needs 64 surfaces stacked within one
+    # ``planar_tol`` band along one ray, which takes coincident or duplicated geometry rather
+    # than a fine mesh; a caller who has that should dedupe (``repair.merge_vertices``) instead of
+    # raising the cap, since every extra step is a full BVH descent for every ray in the launch.
     unit_direction = wp.normalize(direction)
     t_offset = wp.float32(0.0)
     cur_origin = origin

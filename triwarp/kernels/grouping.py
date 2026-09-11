@@ -56,6 +56,9 @@ def emit_groups(
 
 HASH_MULT_U64 = wp.constant(wp.uint64(11400714819323198485))  # 0x9e3779b97f4a7c15
 
+# Folds the multiplicative hash's high half onto its low half; see ``hash_slot``.
+HASH_FOLD_SHIFT = wp.constant(wp.uint64(32))
+
 VEC3_PACK_PRECISION = wp.constant(wp.uint64(64 // 3))
 VEC3_PACK_SHIFT = wp.constant(wp.uint32(11))
 
@@ -74,6 +77,28 @@ def hash_slot(key: wp.Int, mask: wp.int32) -> wp.int32:
     """Fibonacci hash; mask = capacity-1, capacity must be power-of-2."""
     # wp.cast is same-size only; use constructors for cross-size conversion.
     h = wp.uint64(wp.int64(key)) * HASH_MULT_U64
+    # Fold the product's high half down before masking, or this is not the Fibonacci hash named
+    # above. ``mask`` keeps the *low* bits, and the low bits of a multiplicative hash depend on
+    # nothing but the key's low bits -- the multiplier is odd, so ``key * M mod 2^p`` is a
+    # bijection of ``key mod 2^p`` and every higher bit of the key is discarded. Any key family
+    # holding its entropy above bit ``p`` then collapses onto a handful of probe chains. Measured
+    # on ``unique_rows`` over an axis-aligned 131k-point grid, whose ``pack_vec3`` keys carry the
+    # x bucket in the low 21 bits and y/z above them: 181 distinct start slots and **3959** average
+    # probes per insert (worst chain 49186) against 1.47 with the fold, and 6.57 -> 1.50 on a
+    # random cloud. End to end on ``unique_rows``, min-of-7 with the two builds alternated in
+    # separate processes: 8.62 -> 0.56 ms on a 125k-point grid on cuda:0 (**15.3x**) and 5.84 ->
+    # 2.46 / 77.5 -> 13.5 ms at 22.5k / 122.5k grid points on cpu (2.4-5.7x). A *random* cloud is
+    # flat either way (0.40 -> 0.38 ms, within noise), which is the point: the fold costs nothing
+    # and only the structured key families were paying.
+    #
+    # Probe count only -- no caller depends on the mapping: ``_unique_hash`` sorts the compacted
+    # keys afterwards, ``bfs_visited_insert`` uses the table as a set, and ``remesh``'s claim locks
+    # re-read the slot they wrote. A hash that mixes the high bits cannot also be a bijection on
+    # the low ones, so this gives up the old form's accidental collision-free behaviour on *dense
+    # consecutive* keys (1.00 probes at ``bfs``'s 75% load against 1.52 here) to stop degrading on
+    # every other family -- that same advantage was already gone at 2.50 probes once the ids were
+    # merely strided.
+    h = h ^ (h >> HASH_FOLD_SHIFT)
     return wp.int32(h & wp.uint64(mask))
 
 

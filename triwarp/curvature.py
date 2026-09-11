@@ -46,6 +46,11 @@ def principal_curvature(
     eigendecomposition of the resulting shape operator (Weingarten map), built over a
     sphere-search neighborhood of radius ``radius * avg_edge_length``.
 
+    ``(PD1, PD2)`` is an **orthonormal pair** at every vertex where the fit succeeded, and it is
+    so by construction rather than by luck: principal directions are orthogonal, so only the first
+    is solved for and the second is its quarter turn about the vertex normal. Both are unit and
+    both lie in the tangent plane the fit used.
+
     Parameters
     ----------
     vertices
@@ -74,8 +79,8 @@ def principal_curvature(
     -------
     tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.float32], wp.array[wp.float32]]
         ``(PD1, PD2, PV1, PV2)`` where ``PV1 >= PV2`` at every vertex. Vertices for which
-        the quadric fit failed (fewer than 6 neighbors or degenerate system) have zero
-        directions and zero curvature values.
+        the quadric fit failed (a neighbourhood holding fewer than 5 vertices besides the centre,
+        or a degenerate system) have zero directions and zero curvature values.
 
     Raises
     ------

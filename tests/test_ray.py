@@ -372,6 +372,32 @@ def test_intersects_empty_rays(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     assert tw.ray.longest_ray(mesh_wp, origins_wp, directions_wp).numpy().shape == (0,)
 
 
+@pytest.mark.parametrize("n_origins", [0, 4])
+def test_intersects_rejects_mismatched_shapes(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], n_origins: int
+):
+    """
+    Not a library comparison: an argument-validation guard, which no reference library exposes.
+
+    All four ray queries document a ``ValueError`` for origins and directions of unequal length,
+    and all four raise it -- including on an *empty* origin buffer, which is the arm that pins
+    where the check sits. It used to run after the ``n == 0`` early return, so a mismatched empty
+    call returned an empty answer for a question that has none; with ``n_origins=4`` alone the
+    guard passes wherever it is placed, so the ``0`` arm is the one doing the work.
+    """
+    _, mesh_wp = icosahedron
+    origins_wp = wp.empty(n_origins, dtype=wp.vec3, device=mesh_wp.device)
+    directions_wp = wp.empty(n_origins + 3, dtype=wp.vec3, device=mesh_wp.device)
+    for query in (
+        tw.ray.intersects_first,
+        tw.ray.intersects_any,
+        tw.ray.intersects_location,
+        tw.ray.longest_ray,
+    ):
+        with pytest.raises(ValueError, match="same shape"):
+            query(mesh_wp, origins_wp, directions_wp)
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
 def test_longest_ray(request: pytest.FixtureRequest, mesh_name: str):
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)

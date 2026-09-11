@@ -1,8 +1,10 @@
 import warp as wp
 
+from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.linalg import solve_normal_equations
-from triwarp.kernels.predicates import project_out_normal
+from triwarp.kernels.predicates import unit_tangent
+from triwarp.kernels.tangent_space import any_perpendicular
 
 # Custom fixed-size float64 types for the 5x5 quadric-fit normal equations: the rest of the
 # kernel runs in float32, but the least-squares solve is done in float64 for conditioning.
@@ -19,40 +21,58 @@ def _build_reference_frame(
     vertex: wp.vec3, normal: wp.vec3, first_neighbor: wp.vec3
 ) -> tuple[wp.vec3, wp.vec3]:
     """Return (t1, t2) orthonormal tangent frame with t1 pointing toward first_neighbor."""
-    diff = first_neighbor - vertex
-    t1 = project_out_normal(diff, normal)
-    if wp.length(t1) < wp.float32(1e-6):
-        # fallback: arbitrary perpendicular to normal
-        if wp.abs(normal[0]) < wp.float32(0.9):
-            t1 = wp.vec3(1.0, 0.0, 0.0) - normal * normal[0]
-        else:
-            t1 = wp.vec3(0.0, 1.0, 0.0) - normal * normal[1]
-    t1 = wp.normalize(t1)
-    t2 = wp.cross(normal, t1)
-    t2 = wp.normalize(t2)
-    return t1, t2
+    # Same construction as ``tangent_space.vertex_tangent_frames``: the reference direction is the
+    # neighbour projected into the tangent plane, falling back to an arbitrary perpendicular when
+    # that projection vanishes (the neighbour sits on the normal line through the vertex).
+    t1 = any_perpendicular(normal)
+    tangential, length = unit_tangent(first_neighbor - vertex, normal, TOLERANCE_ZERO_CONSTANT)
+    if length > TOLERANCE_ZERO_CONSTANT:
+        t1 = tangential
+    # ``normal`` is unit and ``t1`` is a unit vector orthogonal to it, so the cross product is
+    # already unit and needs no normalization.
+    return t1, wp.cross(normal, t1)
 
 
 @wp.func
-def _eigvec_sym2(m00: wp.float32, m01: wp.float32, lam: wp.float32, fallback: wp.vec2) -> wp.vec2:
+def _eigvec_2x2(
+    m00: wp.float32, m01: wp.float32, m10: wp.float32, m11: wp.float32, lam: wp.float32
+) -> wp.vec2:
     """
     Return the unit eigenvector of a 2x2 matrix for the eigenvalue ``lam``.
 
     The matrix is ``[[m00, m01], [m10, m11]]`` and the result is expressed in the (t1, t2)
-    tangent-frame basis. Uses the first-row form ``v ~ [m01, lam - m00]``, which is valid for
-    any 2x2 (symmetric or the non-symmetric Weingarten map) since it depends only on the top
-    row. ``fallback`` is returned when that row is degenerate (near-diagonal matrix).
+    tangent-frame basis. ``m - lam*I`` is singular, so its two rows are proportional and each
+    gives the eigenvector as its own perpendicular: row 0 gives ``[m01, lam - m00]`` and row 1
+    gives ``[lam - m11, m10]``. Both forms are valid for any 2x2 (symmetric or the non-symmetric
+    Weingarten map), but either row can vanish on its own, so the longer of the two is taken.
+
+    Picking by *length* rather than against an absolute threshold is what makes a diagonal matrix
+    come out right. There, ``m01 = 0`` and the eigenvalue equals one of the diagonal entries, so
+    for that eigenvalue row 0 is the zero row up to rounding -- a few ULP of ``m00``, far above any
+    fixed epsilon -- and normalizing it returns an arbitrarily-signed ``(0, +-1)`` instead of the
+    correct ``(1, 0)``. Reading row 1 instead recovers it.
+
+    ``(1, 0)`` is returned when both rows vanish, i.e. ``m == lam*I`` (an umbilic point, where
+    every direction is a principal direction and there is nothing to find). That test is taken
+    *relative* to the matrix's own magnitude, because these entries are curvatures and so scale as
+    one over the mesh's: an absolute epsilon would call a large mesh's whole shape operator
+    umbilic. Which arbitrary direction comes back does not matter, because the caller derives the
+    second principal direction from this one rather than solving for it again.
     """
-    v = wp.vec2(m01, lam - m00)
-    if wp.length(v) < wp.float32(1e-14):
-        return fallback
+    row0 = wp.vec2(m01, lam - m00)
+    row1 = wp.vec2(lam - m11, m10)
+    v = wp.where(wp.length_sq(row0) >= wp.length_sq(row1), row0, row1)
+    magnitude = wp.max(wp.abs(m00) + wp.abs(m01), wp.abs(m10) + wp.abs(m11))
+    floor = TOLERANCE_ZERO_CONSTANT * magnitude
+    if wp.length_sq(v) <= floor * floor:
+        return wp.vec2(1.0, 0.0)
     return wp.normalize(v)
 
 
 @wp.func
 def _principal_curvatures_from_monge(
     first_form: wp.vec3, second_form: wp.vec3, frame_independent: wp.bool
-) -> tuple[wp.float32, wp.float32, wp.vec2, wp.vec2]:
+) -> tuple[wp.float32, wp.float32, wp.vec2]:
     """
     Extract principal curvatures and directions from the fundamental forms (Monge patch).
 
@@ -72,9 +92,23 @@ def _principal_curvatures_from_monge(
       which keeps the trace (mean curvature) exact but alters the determinant (eigenvalue spread)
       and makes the result depend on the reference frame.
 
-    Returns (lam0, lam1, ev0, ev1) where lam0 <= lam1 are eigenvalues of ``m``. The caller negates
-    them (libigl's ``c_val = -c_val``). The eigenvectors ev0, ev1 are unit ``wp.vec2`` in the
+    Returns (lam0, lam1, ev0) where lam0 <= lam1 are eigenvalues of ``m``. The caller negates them
+    (libigl's ``c_val = -c_val``). ``ev0`` is ``lam0``'s unit eigenvector as a ``wp.vec2`` in the
     (t1, t2) tangent-frame 2D basis.
+
+    **Only the first eigenvector is returned, deliberately.** Principal directions are orthogonal
+    -- the shape operator is self-adjoint with respect to the first fundamental form -- so the
+    second is the first rotated a quarter turn in the tangent plane, and the caller gets it from a
+    cross product with the vertex normal. Solving for it separately instead costs the guarantee:
+    the two solves see the same numerically degenerate matrix at an umbilic point and can land on
+    the *same* direction, which is the one answer that is wrong however arbitrary the choice is
+    allowed to be. Measured on ``icosphere(3)``, which is umbilic everywhere: 4 of 642 vertices
+    returned ``PD1`` and ``PD2`` exactly parallel (their eigenvalue gap is exactly 0.0 in float32)
+    and 4 more came back 6 degrees from parallel (gap one ULP, 2.4e-07). The non-symmetric
+    ``frame_independent=True`` branch is worse, because its eigenvectors are orthogonal under the
+    first fundamental form rather than in the frame's own coordinates: on the suite's ``half_torus``
+    it put 266 of 544 pairs off perpendicular, up to ``|PD1 . PD2| = 0.57`` -- 35 degrees -- at
+    eigenvalue gaps of order 1, where nothing is degenerate at all.
     """
     e_ff = first_form[0]
     f_ff = first_form[1]
@@ -102,11 +136,8 @@ def _principal_curvatures_from_monge(
     lam0 = half_trace - disc
     lam1 = half_trace + disc
 
-    # Eigenvectors of (m - lam*I)v = 0 → v ~ [m01, lam - m00], with axis fallbacks when degenerate.
-    ev0 = _eigvec_sym2(m00, m01, lam0, wp.vec2(1.0, 0.0))
-    ev1 = _eigvec_sym2(m00, m01, lam1, wp.vec2(0.0, 1.0))
-
-    return lam0, lam1, ev0, ev1
+    # Eigenvector of (m - lam0*I)v = 0. lam1's is the caller's cross product -- see the docstring.
+    return lam0, lam1, _eigvec_2x2(m00, m01, m10, m11, lam0)
 
 
 # ---------------------------------------------------------------------------
@@ -136,16 +167,14 @@ def fit_principal_curvature(
     zero3 = wp.vec3(0.0, 0.0, 0.0)
 
     start = offsets[i]
-    # offsets has length n_vertices (no sentinel); last vertex ends at neighbor_indices end
-    if i + 1 < offsets.shape[0]:
-        end = offsets[i + 1]
-    else:
-        end = neighbor_indices.shape[0]
+    end = offsets[i + 1]  # ``geodesic_ball`` returns the terminated (n + 1) CSR row bounds
     n_nbr = end - start
 
-    if (
-        n_nbr < 5
-    ):  # need at least 5 non-self neighbors for quadric fit; degenerate cases caught by gauss_elim
+    # The ball includes the centre vertex itself, which the fit loop below skips, so a determined
+    # 5-parameter quadric fit needs 6 entries here. Anything short of that leaves the normal
+    # equations rank-deficient and ``solve_normal_equations`` would report it -- this only saves
+    # running a solve whose answer is already known. Remaining degeneracies are caught there.
+    if n_nbr < 6:
         out_pd1[i] = zero3
         out_pd2[i] = zero3
         out_pv1[i] = wp.float32(0.0)
@@ -167,17 +196,20 @@ def fit_principal_curvature(
     # Count neighbors passing projection-plane filter, including self (self always passes,
     # dot=1).
     # Matches libigl's applyProjOnPlane which includes vv[self] because dot(n_i, n_i) = 1 > 0.
+    # The neighbour normal is not normalized here or in the fit loop below: only the *sign* of the
+    # dot product is read, and scaling by a positive length cannot change it.
     n_valid = wp.int32(0)
     for k in range(n_nbr):
         j = neighbor_indices[start + k]
         if j == i:
             n_valid = n_valid + 1  # self always passes
             continue
-        nj = wp.normalize(vertex_normals[j])
-        if wp.dot(nj, normal) > wp.float32(0.0):
+        if wp.dot(vertex_normals[j], normal) > wp.float32(0.0):
             n_valid = n_valid + 1
 
-    # Mirror libigl: only apply filter if it leaves >= 6 AND fewer than the full set
+    # Mirror libigl: only apply the filter if it leaves at least 6 neighbours. libigl also requires
+    # the filtered set to be strictly smaller than the full one, which is not repeated here because
+    # it cannot change the answer -- when every neighbour passes, filtering removes nothing.
     use_filter = n_valid >= 6
 
     # Least-squares quadric fit: accumulate the normal equations AᵀA x = Aᵀb.
@@ -188,8 +220,7 @@ def fit_principal_curvature(
         j = neighbor_indices[start + k]
         if j == i:
             continue  # self contributes (0,0,0) — skip to avoid frame degeneration
-        nj = wp.normalize(vertex_normals[j])
-        if use_filter and wp.dot(nj, normal) <= wp.float32(0.0):
+        if use_filter and wp.dot(vertex_normals[j], normal) <= wp.float32(0.0):
             continue
 
         diff = vertices[j] - vertex
@@ -217,18 +248,12 @@ def fit_principal_curvature(
     d = wp.float32(solution[3])
     e = wp.float32(solution[4])
 
-    # First fundamental form coefficients
+    # First fundamental form coefficients. Its determinant needs no degeneracy guard: it expands
+    # to (1 + d*d)(1 + e*e) - (d*e)^2 = 1 + d*d + e*e, which is >= 1 for every finite fit, so
+    # ``_principal_curvatures_from_monge`` can divide by it unconditionally.
     E_ff = wp.float32(1.0) + d * d  # noqa: N806
     F_ff = d * e  # noqa: N806
     G_ff = wp.float32(1.0) + e * e  # noqa: N806
-    denom = E_ff * G_ff - F_ff * F_ff
-
-    if wp.abs(denom) < wp.float32(1e-14):
-        out_pd1[i] = zero3
-        out_pd2[i] = zero3
-        out_pv1[i] = wp.float32(0.0)
-        out_pv2[i] = wp.float32(0.0)
-        return
 
     # Normal z-component in local frame
     nz = wp.float32(1.0) / wp.sqrt(d * d + e * e + wp.float32(1.0))
@@ -240,18 +265,19 @@ def fit_principal_curvature(
 
     first_form = wp.vec3(E_ff, F_ff, G_ff)
     second_form = wp.vec3(L_ff, M_ff, N_ff)
-    lam0, lam1, ev0, ev1 = _principal_curvatures_from_monge(
-        first_form, second_form, frame_independent
-    )
+    lam0, lam1, ev0 = _principal_curvatures_from_monge(first_form, second_form, frame_independent)
 
     # Negate: the Monge patch height function curves downward for convex surfaces,
     # giving negative eigenvalues; convention is positive curvature for convex.
     k0 = -lam0
     k1 = -lam1
 
-    # Reconstruct global directions from local eigenvectors
+    # Reconstruct the global direction from the local eigenvector, and take the second as its
+    # quarter turn in the tangent plane. (t1, t2, normal) is orthonormal, so the cross product is
+    # already unit; it is also what guarantees the pair is a *frame* rather than two independently
+    # solved vectors that can coincide -- see ``_principal_curvatures_from_monge``.
     dir0 = wp.normalize(t1 * ev0[0] + t2 * ev0[1])
-    dir1 = wp.normalize(t1 * ev1[0] + t2 * ev1[1])
+    dir1 = wp.cross(normal, dir0)
 
     # Assign so that PV1 >= PV2
     if k0 >= k1:

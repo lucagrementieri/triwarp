@@ -38,7 +38,10 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import seams as kernel_seams
 
 # Whether the seam predicate compares coordinates rather than texcoord indices. A lookup rather than
-# a chain of comparisons so an unrecognised mode fails loudly instead of falling into a mode.
+# a chain of comparisons so an unrecognised mode cannot fall into a mode -- but the *membership*
+# test at the call site is what turns it into a ``ValueError`` naming the argument and its options,
+# which is the whole package's answer for an off-menu value; the bare ``KeyError('bogus')`` the
+# lookup raises on its own names neither.
 _UV_MATCH_MODES: dict[str, bool] = {"index": False, "uv": True}
 
 
@@ -321,9 +324,8 @@ def uv_seam_edges(
         If ``match="index"`` is asked for without ``face_texcoords``; if ``face_texcoords`` is
         present but not the same length as ``faces``, or has an entry outside
         ``[0, texcoords.shape[0])``; if ``face_texcoords`` is ``None`` and ``texcoords`` is not
-        length ``3 * n_faces``; or if ``faces`` is not edge-manifold.
-    KeyError
-        If ``match`` is neither ``"index"`` nor ``"uv"``.
+        length ``3 * n_faces``; if ``faces`` is not edge-manifold; or if ``match`` is neither
+        ``"index"`` nor ``"uv"``.
     RuntimeError
         If ``faces``, ``texcoords``, ``face_texcoords`` and ``twins`` are not all on one device.
 
@@ -356,6 +358,8 @@ def uv_seam_edges(
     n_faces = int(faces.shape[0]) // 3
     if match is None:
         match = "index" if face_texcoords is not None else "uv"
+    if match not in _UV_MATCH_MODES:
+        raise ValueError(f"match must be one of {list(_UV_MATCH_MODES)}, got {match!r}")
     match_uv = _UV_MATCH_MODES[match]
     if not match_uv and face_texcoords is None:
         raise ValueError(
@@ -542,11 +546,8 @@ def uv_seam_vertex_mask(
         Delegated from [`uv_seam_edges`][triwarp.seams.uv_seam_edges]: if ``match="index"`` is asked
         for without ``face_texcoords``, if ``face_texcoords`` is present but not the same length as
         ``faces`` or has an entry outside ``[0, texcoords.shape[0])``, if ``face_texcoords`` is
-        ``None`` and ``texcoords`` is not length ``3 * n_faces``, or if ``faces`` is not
-        edge-manifold.
-    KeyError
-        Delegated from [`uv_seam_edges`][triwarp.seams.uv_seam_edges]: if ``match`` is neither
-        ``"index"`` nor ``"uv"``.
+        ``None`` and ``texcoords`` is not length ``3 * n_faces``, if ``faces`` is not
+        edge-manifold, or if ``match`` is neither ``"index"`` nor ``"uv"``.
     RuntimeError
         If ``faces``, ``texcoords`` and ``face_texcoords`` are not all on one device.
 

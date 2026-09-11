@@ -125,6 +125,14 @@ def vertex_field_to_face_field(
     # Average the three corners' tangent vectors into one per-face vector, in world space, so the
     # existing cotangent divergence can integrate it. Each corner's 2D components mean nothing
     # outside its own frame, so they have to be expanded to 3D *before* averaging.
+    #
+    # ``field`` must already be normalized per vertex -- the caller floors the diffused field
+    # against its own maximum and passes the unit directions. That precondition is what makes the
+    # *absolute* ``TOLERANCE_ZERO_CONSTANT`` below correct here, where everywhere else in this
+    # module a diffused field is compared against a relative floor (see ``scale_to_magnitude``):
+    # the sum of three unit vectors carries no coordinate scale, so the test only asks whether the
+    # three corners cancelled. Hand it a raw diffused field and it zeroes whole faces on any mesh
+    # away from unit scale.
     f = wp.int32(wp.tid())
     normal = normals[f]
     total = wp.vec3(0.0, 0.0, 0.0)

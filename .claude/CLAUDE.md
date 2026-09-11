@@ -1144,6 +1144,40 @@ found them: §12.1.
 - **A guard must encode a real limitation.** When the implementation is naturally rank- or
   dtype-agnostic — a flatten/reshape, a generic `@wp.func` — drop the `ensure_ndim` cap and widen the
   annotation instead of validating a restriction that is not there.
+- **A `Literal`-typed *menu* argument is validated at the public boundary and raises `ValueError`
+  naming the argument, the offending value and the options. The annotation is a hint, not a
+  guard.** basedpyright rejects an off-menu *literal*; nothing rejects the same value arriving
+  through a variable, a config dict or a `**kwargs` splat, so a menu read as `A if x == 1 else B`
+  silently answers a different question. This is not a new convention — it is the one the package
+  already had, measured by calling every one of the **43** `Literal`-annotated parameters in
+  `triwarp/*.py` with an off-menu value: **38 already raised** exactly that `ValueError`, and the
+  three that did not are now converted (`texture.remap_attribute_from_uv(order=2)` sampled
+  nearest-neighbour and returned a plausible image; `registration.icp_point_to_plane` and both
+  `seams.uv_seam_*` indexed a mode dict and surfaced a bare `KeyError('bogus')`, naming neither
+  the argument nor the alternatives). Four details worth having:
+    - **Two `Literal` shapes are not menus and need no guard**: the `Literal[True]` /
+      `Literal[False]` pairs on a `return_*` keyword, which are `@overload` stubs over a `bool`
+      where every value is legal, and a rank literal (`wp.array[DType, Literal[3]]`).
+    - **Where the options live in a table, derive the message from it** —
+      `f"match must be one of {list(_UV_MATCH_MODES)}, got {match!r}"` — so it cannot drift from
+      the table. `list(...)` for an *ordered* table (a dict or tuple, so the message reads in the
+      docstring's order) and `sorted(...)` for a `frozenset`, which is what `visibility.thickness`
+      does. Where the branch is an `if` / `elif` chain, spell the names out, as most of the 38 do.
+    - **A delegating wrapper does not repeat the check**; it documents the `ValueError` and lets
+      the function it delegates to raise (§4.3, the same rule as `require_same_device`). **20 of
+      the 43 are that shape** — a private validator (`holes._check_refine`,
+      `reduce._validate_scalar_array`, `voxels._check_iterations`) or another public function
+      (`levelset.offset_mesh` → `signed_distance_grid` → `signed_distance_on_mesh`) — against 23
+      that check in their own body. But the *test* then has to call through the wrapper: that is
+      the only thing that shows the guard is still reached.
+    - **No static check guards this, deliberately.** A permissive scan (does the body mention the
+      parameter?) passes the `order == 1` defect that motivated the rule, and a strict one
+      (does the body contain an `In` / `NotIn` test on it?) flags every delegating wrapper —
+      **20 of 43**, nearly half the sites as allowlist, which §4.5 says is how a check gets
+      switched off. The gate is instead a **probe**: call each menu entry point with an off-menu
+      value and read the exception type. It is ~60 lines, it needs one valid call per entry
+      point, and it is the only thing that distinguishes "raises" from "raises for the wrong
+      reason".
 - **When a function mirrors a NumPy one, mirror its *positional* signature too, and make `device`
   keyword-only.** `array.arange(n, device)` / `arange_step(count, step, device)` were two functions
   covering the one NumPy call whose whole convention is its positional arity —
@@ -3675,7 +3709,7 @@ kernels (~2 µs) per sample against the block's ~1 µs round.
 
 **Declined and annotated with their numbers** (all four already carry a *slice* dimension, so the
 outer dimension is not what starves the device): `points.hull_support_extremes` (2.3x at 5 000 points,
-**0.12-0.60x at 200 000**), `visibility.support_argmax_tiled`, `proximity.winding_number_tiled`
+**0.12-0.60x at 200 000**), `visibility.support_argmax_sliced`, `proximity.winding_number_tiled`
 (2.16x → 1.19x → **1.01x** as the grid fills), `bounds.oriented_box_extents`. CPU flat (1.01-1.06x)
 either way. `ITEMS_PER_SLICE_CUDA` keeps all four consumers. Criterion and tables: §2.3.
 
@@ -4179,6 +4213,15 @@ change permits it** — coarser-grained interleaving is too slow to track noise 
 timescale. And **when the box is not quiet, measure a quantity that is not a clock**: iteration
 counts, launch counts, level counts, candidate counts, `nnz`, and whether a reference mutated its
 input are all deterministic, and can settle a question a noisy clock can't.
+
+**But a failing `nvidia-smi` is not evidence that CUDA is unusable — probe the driver through
+Warp.** NVML is a separate userspace library from the CUDA driver API Warp calls, so a host whose
+`nvidia-smi` dies with `Failed to initialize NVML: Driver/library version mismatch` can still
+report `"cuda:0" : "NVIDIA GeForce RTX 5090" (31 GiB, sm_120, mempool enabled)` from `wp.init()`
+and launch kernels correctly — measured, with the full CUDA suite green in that state. Cost of not
+knowing this: one review pass recorded itself as CPU-only and wrote off its own CUDA evidence. So
+`nvidia-smi` is the *box-is-quiet* check above and nothing more; availability is
+`wp.get_cuda_device_count()` plus one real launch.
 
 **Verify with `print(triwarp.__file__)` before trusting a single number.** Do **not** `uv run` from
 inside the worktree — it resolves that copy as its own project and builds a second virtualenv; use

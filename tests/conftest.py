@@ -457,6 +457,51 @@ def sliver_patch(device: str) -> tuple[np.ndarray, np.ndarray, wp.array, wp.arra
 
 
 @pytest.fixture
+def parabolic_lattice(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """
+    Build a regular 21x21 lattice on ``z = 0.3 * x^2``: curvature aligned with the grid directions.
+
+    The **axis-aligned** fixture, and the curvature-side counterpart to ``unit_box``. Every other
+    curved fixture here is irregular (``icosahedron``, ``icosphere``) or has its parameter lines
+    running obliquely to its curvature (``half_torus``, ``torus``), so nothing else in the suite
+    reaches the case where a per-vertex tangent frame built from a ring halfedge lands *on* a
+    principal direction. That case is not exotic -- it is what a scanned or CAD surface sampled on a
+    lattice looks like -- and it is where a shape operator comes out exactly diagonal, so an
+    eigen-decomposition that reads a fixed row of ``m - lam*I`` silently returns the wrong axis.
+    Measured on this mesh: 41 of 441 vertices on ``cpu`` and 22 on ``cuda:0``, against 0 on all four
+    of the fixtures above.
+
+    A parabolic cylinder rather than a plane, because the two principal curvatures must *differ* --
+    at an umbilic point any tangent pair is a valid answer and a direction test is vacuous. It is
+    developable (``k2 == 0`` everywhere), which is also what makes the expected answer readable by
+    hand: ``PD1`` runs along x and ``PD2`` along y.
+
+    !!! warning
+
+        Both triangles of every quad cell are right-angled, so every diagonal's cotangent weight is
+        exactly zero -- the same caveat [`creation.grid`][triwarp.creation.grid] carries. That makes
+        this fixture unusable as input to a ``potpourri3d`` connection-Laplacian comparison, which
+        drops such an edge's phase entirely (see ``tests/test_tangent.py``).
+    """
+    axis_np = np.linspace(-1.0, 1.0, 21)
+    grid_x_np, grid_y_np = np.meshgrid(axis_np, axis_np, indexing="ij")
+    vertices_np = np.stack(
+        [grid_x_np.ravel(), grid_y_np.ravel(), (0.3 * grid_x_np**2).ravel()], axis=1
+    )
+    # Lower-left corner of each quad cell; both of its triangles are wound counter-clockwise seen
+    # from +z, so the surface normals point up and the fit's sign convention is unambiguous.
+    corner_np = (np.arange(20)[:, None] * 21 + np.arange(20)[None, :]).ravel()
+    faces_np = np.concatenate(
+        [
+            np.stack([corner_np, corner_np + 21, corner_np + 1], axis=1),
+            np.stack([corner_np + 1, corner_np + 21, corner_np + 22], axis=1),
+        ]
+    )
+    lattice = tm.Trimesh(vertices_np, faces_np, process=False)
+    return lattice, trimesh_to_warp(lattice, device)
+
+
+@pytest.fixture
 def t_vertex_patch() -> tuple[np.ndarray, np.ndarray]:
     """
     Two quads stitched at different resolutions, so the left one carries a T-vertex.

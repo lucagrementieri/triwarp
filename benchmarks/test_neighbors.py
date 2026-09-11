@@ -841,7 +841,7 @@ def test_query_geodesic_ball(bench_case: BenchCase) -> None:
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     radius = 5.0 * float(tw.edges.mean_edge_length(vertices, faces))
     _, offsets, _ = bench_case.run(lambda: tw.neighbors.geodesic_ball(vertices, faces, radius))
-    assert offsets.shape == (vertices.shape[0],)
+    assert offsets.shape == (vertices.shape[0] + 1,)
 
 
 @pytest.mark.benchmark(group="closest_pair")

@@ -268,3 +268,158 @@ def test_discrete_gaussian_curvature_ignores_the_current_device(
 
     assert str(gauss_curvature_wp.device) == str(mesh_wp.device)
     assert np.allclose(gauss_curvature_wp.numpy(), gauss_curvature_tm, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("frame_independent", [True, False])
+def test_principal_directions_stay_orthogonal_on_an_axis_aligned_field(
+    parabolic_lattice: tuple[tm.Trimesh, wp.Mesh], frame_independent: bool
+) -> None:
+    """
+    Not a library comparison: ``PD1`` and ``PD2`` must span the tangent plane, never coincide.
+
+    The two principal directions are eigenvectors of a 2x2 shape operator, and on a surface whose
+    curvature aligns with the tangent frame the fit built, that operator comes out **diagonal**.
+    That is the case the curved fixtures never reach and the one where reading the eigenvector off
+    a single fixed row of ``m - lam*I`` fails: for the eigenvalue equal to ``m00`` the top row is
+    the zero row, so it has to be read off the second row instead. ``parabolic_lattice`` reaches it
+    at every vertex whose reference tangent lands on a grid direction, which is what that fixture
+    exists for.
+
+    Measured, and it is the discriminator: before the second-row fallback, **41 of 441** vertices
+    here returned ``PD1 == (0, 1, 0)`` and ``PD2 == (0, -1, 0)`` -- parallel, so the max-curvature
+    direction was 90 degrees off -- and 22 of 441 did on ``cuda:0``, identically for both
+    ``frame_independent`` modes.
+
+    **The orthogonality assert is no longer what catches that**, and the analytic-direction asserts
+    below are, which is worth stating because it is not obvious: the second direction is now a
+    cross product with the normal, so the pair is orthonormal by construction whether or not the
+    *first* direction is right. Mutation-probed by restoring the single-row eigenvector -- both
+    parametrized arms then fail at "PD1 must run along the flat ruling" and nothing else. That is
+    the assert this fixture exists for; orthogonality is the sibling test's job.
+
+    The fixture is checked for non-vacuity two ways: every vertex must produce a frame at all (a
+    failed fit returns zeros and would pass an orthogonality test trivially), and the field must
+    actually be anisotropic, or the directions would be arbitrary at an umbilic point -- which is
+    the sibling case ``test_principal_directions_are_a_frame_at_an_umbilic_point`` covers.
+
+    The directions are also checked against the answer this surface has by hand, which is what
+    says the fix picked the *right* pair of axes rather than merely two different ones. A parabolic
+    cylinder is developable: it bends across the ruling (x) and is flat along it (y). Under the
+    ``PV1 >= PV2`` ordering that makes ``PD1`` the *flat* direction, because the surface curves
+    away from its ``+z`` normal so the bending curvature is the negative one -- the assertions
+    below are the way round they look, not transposed.
+    """
+    _mesh_tm, mesh_wp = parabolic_lattice
+
+    pd1_wp, pd2_wp, pv1_wp, pv2_wp = tw.curvature.principal_curvature(
+        mesh_wp.points, mesh_wp.indices, frame_independent=frame_independent
+    )
+    pd1_np, pd2_np = pd1_wp.numpy(), pd2_wp.numpy()
+
+    # Non-vacuity: zeros are the failed-fit signal and would satisfy orthogonality for free.
+    assert np.all(np.linalg.norm(pd1_np, axis=1) > 0.5)
+    assert np.all(np.linalg.norm(pd2_np, axis=1) > 0.5)
+    # Non-vacuity: at an umbilic point any tangent pair is a valid answer.
+    assert np.abs(pv1_wp.numpy() - pv2_wp.numpy()).min() > 0.1
+
+    dots_np = np.abs(np.einsum("ij,ij->i", pd1_np, pd2_np))
+    assert dots_np.max() < 1e-3, f"worst |PD1 . PD2| {dots_np.max():.3e}"
+
+    # The analytic answer for a developable parabolic cylinder, and it pins which axis is which:
+    # the ruling (y) is flat and the cross-ruling direction (x) carries all the bending. The
+    # ordering is PV1 >= PV2 and this surface curves *away* from its +z normal, so the bending
+    # curvature is the negative one -- PD1 is the flat ruling and PD2 is across it, not the
+    # reverse. The y axis lies in the surface everywhere, so PD1 is exactly it.
+    assert np.abs(pd1_np[:, 1]).min() > 0.99, "PD1 must run along the flat ruling"
+    assert np.abs(pd2_np[:, 1]).max() < 0.05, "PD2 must run across the ruling"
+    assert np.abs(pv1_wp.numpy()).max() < 0.05, "the ruling direction is flat"
+    assert pv2_wp.numpy().max() < -0.4, "the cross-ruling direction carries the bending"
+    # A frame, not just a pair: both directions are unit and both lie in the tangent plane. The
+    # normal is the one the fit itself uses -- the area-weighted vertex normal, which is what
+    # ``principal_curvature`` builds internally -- not trimesh's, which weights differently and
+    # sits 0.010 away on this lattice's boundary vertices. Tangency is a claim about the plane the
+    # function fitted in, so it has to be read against that plane.
+    normal_np = tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices).numpy()
+    assert np.allclose(np.linalg.norm(pd1_np, axis=1), 1.0, atol=1e-5)
+    assert np.allclose(np.linalg.norm(pd2_np, axis=1), 1.0, atol=1e-5)
+    assert np.abs(np.einsum("ij,ij->i", normal_np, pd1_np)).max() < 1e-5
+    assert np.abs(np.einsum("ij,ij->i", normal_np, pd2_np)).max() < 1e-5
+
+
+@pytest.mark.parametrize("radius", [2, 5])
+def test_principal_directions_are_a_frame_at_an_umbilic_point(
+    icosphere: tuple[tm.Trimesh, wp.Mesh], radius: int
+) -> None:
+    """
+    Not a library comparison: at an umbilic point no reference fixes *which* pair is returned.
+
+    A sphere is umbilic everywhere -- the two principal curvatures are equal, so every tangent
+    direction is a principal direction and the shape operator is a multiple of the identity. No
+    oracle can pin ``PD1`` there, which is exactly why
+    ``test_principal_curvature_directions_match_pymeshlab`` refuses ``icosphere`` as a direction
+    fixture (the agreement reads a meaningless 0.62) and picks ``torus`` instead. What is still a
+    contract, and what nothing asserted before, is that the pair is a **frame**: two orthonormal
+    vectors spanning the tangent plane. The helper that answers a degenerate 2x2 returns the
+    reference frame's own two axes, so which frame it is depends on the vertex numbering, but that
+    it is *a* frame does not.
+
+    That makes this the sibling of
+    ``test_principal_directions_stay_orthogonal_on_an_axis_aligned_field``, which covers the
+    opposite end of the same helper: there the two eigenvalues are maximally separated and the
+    eigenvectors are determined, here they coincide and only the invariant survives. The curvature
+    magnitudes are still checked against the sphere's own ``1 / r``, which is the part an umbilic
+    point does determine.
+
+    Mutation-probed by restoring the two independent eigen-solves: both radii then fail, at the
+    orthogonality assert and nowhere else. **Both radii are kept because they are not equally
+    degenerate** -- how much anisotropy the solve sees depends on how much surface the ball covers,
+    and an earlier single-radius version of this test caught that mutation only through the
+    tangency assert, which is a weaker and more incidental guard.
+
+    A quadric fitted over a wide spherical cap also overestimates curvature, and the bias grows
+    monotonically with the ball -- mean ``PV1`` here reads 1.0195 / 1.0407 / 1.1185 / 1.3628 at
+    radius 2 / 3 / 5 / 8 against a true ``1 / r`` of 1.0. That is a property of the method, not a
+    defect, so the magnitude assert is a one-sided bracket rather than a tolerance: the fit never
+    reads *under* a sphere's curvature, and at the default radius it reads 12% over.
+    """
+    mesh_tm, mesh_wp = icosphere
+
+    pd1_wp, pd2_wp, pv1_wp, pv2_wp = tw.curvature.principal_curvature(
+        mesh_wp.points, mesh_wp.indices, radius=radius
+    )
+    pd1_np, pd2_np, pv1_np, pv2_np = (
+        pd1_wp.numpy(),
+        pd2_wp.numpy(),
+        pv1_wp.numpy(),
+        pv2_wp.numpy(),
+    )
+
+    # Non-vacuity: the fixture must actually be umbilic, or this is the anisotropic test again.
+    assert np.abs(pv1_np - pv2_np).max() < 0.05, "icosphere must be umbilic to the fit's accuracy"
+    # Non-vacuity: zeros are the failed-fit signal and satisfy every invariant below for free.
+    assert np.all(np.linalg.norm(pd1_np, axis=1) > 0.5)
+
+    # Orthonormal...
+    assert np.allclose(np.linalg.norm(pd1_np, axis=1), 1.0, atol=1e-5)
+    assert np.allclose(np.linalg.norm(pd2_np, axis=1), 1.0, atol=1e-5)
+    assert np.abs(np.einsum("ij,ij->i", pd1_np, pd2_np)).max() < 1e-3
+    # ...and tangent to the plane the fit used, which is the area-weighted vertex normal.
+    normal_np = tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices).numpy()
+    assert np.abs(np.einsum("ij,ij->i", normal_np, pd1_np)).max() < 1e-5
+    assert np.abs(np.einsum("ij,ij->i", normal_np, pd2_np)).max() < 1e-5
+    # The discrete normal is itself the exact radial one on a sphere, to within the tessellation:
+    # that is what says the frame sits in the *surface's* tangent plane and not merely in a plane
+    # of triwarp's own choosing.
+    radial_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
+    radial_np /= np.linalg.norm(radial_np, axis=1, keepdims=True)
+    assert np.abs(np.einsum("ij,ij->i", radial_np, normal_np)).min() > 0.999
+
+    # The magnitudes an umbilic point does determine: both principal curvatures are 1 / r, the
+    # same at every vertex. Spread measured 0.0040 at radius 2 and 0.0130 at 5, against a 0.05 bar
+    # (12x and 3.8x); the scaled means are 1.0195 and 1.1185, inside the bracket the fit's own
+    # cap bias sets.
+    sphere_radius = float(np.linalg.norm(mesh_tm.vertices, axis=1).mean())
+    assert np.ptp(pv1_np) < 0.05, "a sphere's curvature is the same at every vertex"
+    assert np.ptp(pv2_np) < 0.05
+    assert 1.0 <= float(pv1_np.mean()) * sphere_radius <= 1.25
+    assert 1.0 <= float(pv2_np.mean()) * sphere_radius <= 1.25

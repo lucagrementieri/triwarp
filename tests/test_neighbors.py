@@ -1553,11 +1553,12 @@ def test_geodesic_ball_neighborhoods(mesh_name: str, request: pytest.FixtureRequ
 
     neighbor_indices = neighbor_indices_wp.numpy()
     offsets = offsets_wp.numpy()
-    total = neighbor_indices.shape[0]
     n = vertices_np.shape[0]
+    assert offsets.shape == (n + 1,)
+    assert int(offsets[n]) == neighbor_indices.shape[0]
     for i in range(n):
         start = int(offsets[i])
-        end = int(offsets[i + 1]) if i + 1 < n else total
+        end = int(offsets[i + 1])
         neighbors_wp = {int(x) for x in neighbor_indices[start:end]}
         assert neighbors_wp == set(per_vertex_oracle[i]), f"vertex {i} neighborhood differs"
 
@@ -1611,11 +1612,9 @@ def test_geodesic_ball_matches_meshlib(device: str) -> None:
 
     mesh_ml = trimesh_to_meshlib(sphere_tm)
     for source in range(0, n_vertices, 97):
-        start = int(offsets_np[source])
-        end = (
-            int(offsets_np[source + 1]) if source + 1 < n_vertices else neighbor_indices_np.shape[0]
+        ball_wp = set(
+            neighbor_indices_np[int(offsets_np[source]) : int(offsets_np[source + 1])].tolist()
         )
-        ball_wp = set(neighbor_indices_np[start:end].tolist())
 
         seeds_np = np.arange(n_vertices) == source
         seeds_ml = mm.VertBitSet(numpy_to_meshlib_bitset(seeds_np))
@@ -1642,12 +1641,9 @@ def test_geodesic_ball_neighborhoods_overflow_warns(device: str) -> None:
     radius = 100.0 * float(mesh_tm.scale)
 
     with pytest.warns(UserWarning, match="capacity breaches"):
-        neighbor_indices_wp, offsets_wp, _ = tw.neighbors.geodesic_ball(
-            vertices_wp, faces_wp, radius
-        )
+        _, offsets_wp, _ = tw.neighbors.geodesic_ball(vertices_wp, faces_wp, radius)
     # Clamped, not crashed: every per-vertex count fits within the fixed capacity.
-    counts = np.diff(np.append(offsets_wp.numpy(), neighbor_indices_wp.shape[0]))
-    assert counts.max() <= 512
+    assert np.diff(offsets_wp.numpy()).max() <= 512
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])

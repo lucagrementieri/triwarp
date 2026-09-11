@@ -23,9 +23,14 @@ def intersects_location(
     Return world-space locations where rays hit the mesh surface (first hit per ray).
 
     Uses ``wp.mesh_query_ray`` on the mesh BVH. Ray directions are unitized before
-    querying. Returns only rays that hit within ``max_t`` as sparse ``(m,)`` arrays.
-    Equivalent to compressing the dense output of
+    querying. Returns only rays that hit within ``max_t`` as sparse ``(m,)`` arrays,
+    carrying the same set of hits as the dense output of
     [`intersects_first`][triwarp.ray.intersects_first].
+
+    **Row order is unspecified.** Each hitting ray claims its output slot from an atomic
+    counter, so rows arrive in the order the rays completed rather than in ray order, and two
+    runs over the same input may order them differently. Sort by ``index_ray`` (or read
+    [`intersects_first`][triwarp.ray.intersects_first] instead) when a stable order matters.
 
     Parameters
     ----------
@@ -50,17 +55,19 @@ def intersects_location(
 
     Raises
     ------
+    ValueError
+        If ``ray_origins`` and ``ray_directions`` do not have the same shape.
     RuntimeError
         If ``mesh``, ``ray_origins`` and ``ray_directions`` are not all on one device.
     """
     require_same_device(mesh=mesh, ray_origins=ray_origins, ray_directions=ray_directions)
+    _validate_ray_inputs(ray_origins, ray_directions)
     n = ray_origins.shape[0]
     device = ray_origins.device
     if n == 0:
         empty_int = wp.empty(0, dtype=wp.int32, device=device)
         return wp.empty(0, dtype=wp.vec3, device=device), empty_int, empty_int
 
-    _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
         max_t = enclosing_diagonal(mesh.points, ray_origins)
 
@@ -122,18 +129,24 @@ def intersects_first(
 
     Raises
     ------
+    ValueError
+        If ``ray_origins`` and ``ray_directions`` do not have the same shape.
     RuntimeError
         If ``mesh``, ``ray_origins`` and ``ray_directions`` are not all on one device.
     """
     require_same_device(mesh=mesh, ray_origins=ray_origins, ray_directions=ray_directions)
+    _validate_ray_inputs(ray_origins, ray_directions)
     n = ray_origins.shape[0]
     if n == 0:
         return wp.empty(0, dtype=wp.int32, device=ray_origins.device)
-    _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
         max_t = enclosing_diagonal(mesh.points, ray_origins)
 
     out_triangle_index = wp.empty(n, dtype=wp.int32, device=ray_origins.device)
+    # ``first_hit`` returns ``(face, location)`` and ``wp.map`` wants one ``out=`` per returned
+    # value, so the location is written and dropped. Kept rather than given a face-only
+    # ``@wp.func`` of its own: that would generate a second ``map_*`` module to save one
+    # allocation and an (n,) vec3 store, well under a percent of a call this size.
     locations_scratch = wp.empty(n, dtype=wp.vec3, device=ray_origins.device)
     wp.map(
         kernel_ray.first_hit,
@@ -179,14 +192,16 @@ def intersects_any(
 
     Raises
     ------
+    ValueError
+        If ``ray_origins`` and ``ray_directions`` do not have the same shape.
     RuntimeError
         If ``mesh``, ``ray_origins`` and ``ray_directions`` are not all on one device.
     """
     require_same_device(mesh=mesh, ray_origins=ray_origins, ray_directions=ray_directions)
+    _validate_ray_inputs(ray_origins, ray_directions)
     n = ray_origins.shape[0]
     if n == 0:
         return wp.empty(0, dtype=wp.bool, device=ray_origins.device)
-    _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
         max_t = enclosing_diagonal(mesh.points, ray_origins)
 
@@ -241,14 +256,16 @@ def longest_ray(
 
     Raises
     ------
+    ValueError
+        If ``ray_origins`` and ``ray_directions`` do not have the same shape.
     RuntimeError
         If ``mesh``, ``ray_origins`` and ``ray_directions`` are not all on one device.
     """
     require_same_device(mesh=mesh, ray_origins=ray_origins, ray_directions=ray_directions)
+    _validate_ray_inputs(ray_origins, ray_directions)
     n = ray_origins.shape[0]
     if n == 0:
         return wp.empty(0, dtype=wp.float32, device=ray_origins.device)
-    _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
         max_t = enclosing_diagonal(mesh.points, ray_origins)
 
@@ -265,11 +282,12 @@ def longest_ray(
     return out_distances
 
 
-def _validate_ray_inputs(
-    mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3]
-) -> None:
+def _validate_ray_inputs(ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3]) -> None:
     if ray_origins.shape != ray_directions.shape:
-        raise ValueError("Ray origin and direction don't match!")
+        raise ValueError(
+            "ray_origins and ray_directions must have the same shape: "
+            f"{tuple(ray_origins.shape)} vs {tuple(ray_directions.shape)}"
+        )
 
 
 def contains_points(

@@ -66,6 +66,9 @@ def rasterize_attribute(
 
     Raises
     ------
+    ValueError
+        If ``resolution`` is not positive, if ``uv`` and ``attribute`` disagree on their row
+        count, or if any finite UV lies outside ``[0, 1]``.
     RuntimeError
         If ``uv``, ``faces`` and ``attribute`` are not all on one device.
 
@@ -127,7 +130,9 @@ def rasterize_discrete_attribute(
     Raises
     ------
     ValueError
-        If any entry of ``attribute`` is negative.
+        If any entry of ``attribute`` is negative, if ``resolution`` is not positive, if ``uv``
+        and ``attribute`` disagree on their row count, or if any finite UV lies outside
+        ``[0, 1]``.
     RuntimeError
         If ``uv``, ``faces`` and ``attribute`` are not all on one device.
 
@@ -256,6 +261,8 @@ def remap_attribute_from_uv(
     ------
     TypeError
         If ``image`` is neither rank 2 nor rank 3.
+    ValueError
+        If ``order`` is not ``0`` or ``1``, or if any finite UV lies outside ``[0, 1]``.
     RuntimeError
         If ``uv`` and ``image`` are not all on one device.
 
@@ -264,6 +271,8 @@ def remap_attribute_from_uv(
     [`rasterize_attribute`][triwarp.texture.rasterize_attribute]
     """
     require_same_device(uv=uv, image=image)
+    if order not in (0, 1):
+        raise ValueError(f"order must be 0 (nearest) or 1 (bilinear), got {order!r}")
     if int(image.ndim) == 2:
         height, width = int(image.shape[0]), int(image.shape[1])
         n_channels = 1
@@ -280,6 +289,9 @@ def remap_attribute_from_uv(
     n_vertices = int(uv.shape[0])
     out_values = twt.empty_2d((n_vertices, n_channels), wp.float32, device=device)
     if n_vertices > 0:
+        # ``order`` is rejected above rather than defaulted here: an ``if order == 1 else``
+        # sampled nearest-neighbour for every off-menu value, so a caller whose interpolation
+        # order arrived through a variable got a plausible image and no error.
         mode = kernel_texture.SAMPLE_BILINEAR if order == 1 else kernel_texture.SAMPLE_NEAREST
         wp.launch(
             kernel_texture.sample_texture,
@@ -288,17 +300,6 @@ def remap_attribute_from_uv(
             device=device,
         )
     return twt.as_array2d(out_values, wp.float32)
-
-
-def _check_uv_in_range(uv: wp.array[wp.vec2]) -> None:
-    """Raise if any finite UV lies outside ``[0, 1]`` (non-finite UVs are ignored)."""
-    n_vertices = int(uv.shape[0])
-    if n_vertices == 0:
-        return
-    flag = wp.zeros(1, dtype=wp.int32, device=uv.device)
-    wp.launch(kernel_texture.check_uv_range, dim=n_vertices, inputs=[uv, flag], device=uv.device)
-    if int(read_scalar(flag, 0)) != 0:
-        raise ValueError("UV coordinates must be in the range [0, 1]")
 
 
 def remap_discrete_attribute_from_uv(
@@ -328,6 +329,8 @@ def remap_discrete_attribute_from_uv(
 
     Raises
     ------
+    ValueError
+        If any finite UV lies outside ``[0, 1]``.
     RuntimeError
         If ``uv`` and ``class_image`` are not all on one device.
 
@@ -348,3 +351,30 @@ def remap_discrete_attribute_from_uv(
     # ``sampled`` is ``(n_vertices, 1)`` and contiguous, so ``flatten()`` is a reshape view.
     wp.map(kernel_texture.round_labels, sampled.flatten(), out=out_labels)
     return cast(twt.Array1dInt32, out_labels)
+
+
+def _check_uv_in_range(uv: wp.array[wp.vec2]) -> None:
+    """
+    Raise if any finite UV lies outside ``[0, 1]`` (non-finite UVs are ignored).
+
+    The readback is unavoidable: nothing can raise without bringing the flag back to the host.
+    It is also the dominant cost of the two samplers rather than a rounding error on them --
+    measured on an RTX 5090, 200 calls between two syncs, min of 7:
+    ``remap_attribute_from_uv`` over a 256x256 image costs 0.088 ms with this check and 0.037 ms
+    with it stubbed out, i.e. **57 % of the call, flat** from 642 to 500 000 vertices (both halves
+    are launch-bound, so neither share moves with the mesh). Kept anyway, and the flatness is the
+    reason: an out-of-range UV is not rejected downstream but silently *clamped* to the nearest
+    edge pixel, so dropping the guard trades a raised public-API error for a plausible wrong
+    answer -- the same trade ``_device.require_same_device`` is argued from. If a caller ever
+    samples in a loop, the shape to add is CLAUDE.md section 3.10's ``validate=False`` keyword
+    **with** an in-repo caller passing it, not an unconditional removal; the rasterizers reach
+    this through ``_check_rasterize_inputs`` and pay a far smaller share, since their own work
+    scales with ``resolution ** 2``.
+    """
+    n_vertices = int(uv.shape[0])
+    if n_vertices == 0:
+        return
+    flag = wp.zeros(1, dtype=wp.int32, device=uv.device)
+    wp.launch(kernel_texture.check_uv_range, dim=n_vertices, inputs=[uv, flag], device=uv.device)
+    if int(read_scalar(flag, 0)) != 0:
+        raise ValueError("UV coordinates must be in the range [0, 1]")

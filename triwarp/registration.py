@@ -468,8 +468,9 @@ def icp_point_to_plane(
     Raises
     ------
     ValueError
-        If the target is a point cloud (``target_faces is None``) and ``target_normals`` is not
-        provided, or does not have the same length as ``target_vertices``.
+        If ``robust_kernel`` is not one of the three names, or if the target is a point cloud
+        (``target_faces is None``) and ``target_normals`` is not provided, or does not have the
+        same length as ``target_vertices``.
     RuntimeError
         If ``a``, ``target_vertices``, ``target_faces``, ``target_normals`` and ``initial`` are not
         all on one device.
@@ -490,6 +491,10 @@ def icp_point_to_plane(
     device = a.device
     n = int(a.shape[0])
     is_mesh = _is_mesh_target(target_faces)
+    if robust_kernel not in _ROBUST_KINDS:
+        raise ValueError(
+            f"robust_kernel must be one of {list(_ROBUST_KINDS)}, got {robust_kernel!r}"
+        )
     kind = _ROBUST_KINDS[robust_kernel]
 
     if not is_mesh and target_normals is None:

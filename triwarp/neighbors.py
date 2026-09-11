@@ -1482,9 +1482,9 @@ def geodesic_ball(
     -------
     tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]
         ``(neighbor_indices, offsets, reference_neighbors)``. ``offsets`` is the
-        length-``n_vertices`` exclusive prefix sum of per-vertex neighbor counts (CSR starts);
-        vertex ``i`` owns ``neighbor_indices[offsets[i] : offsets[i + 1]]`` with ``offsets[n]``
-        implied as the total. ``reference_neighbors`` has length ``n_vertices``.
+        length-``n_vertices + 1`` exclusive prefix sum of per-vertex neighbor counts (CSR row
+        bounds); vertex ``i`` owns ``neighbor_indices[offsets[i] : offsets[i + 1]]`` and
+        ``offsets[n_vertices]`` is the total. ``reference_neighbors`` has length ``n_vertices``.
 
     Raises
     ------
@@ -1495,10 +1495,10 @@ def geodesic_ball(
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0:
-        empty = wp.empty(0, dtype=wp.int32, device=device)
+        # A single zero rather than an empty buffer: the CSR row-bounds form is ``n + 1`` long.
         return (
-            empty,
             wp.empty(0, dtype=wp.int32, device=device),
+            wp.zeros(1, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.int32, device=device),
         )
 
@@ -1581,8 +1581,13 @@ def geodesic_ball(
             stacklevel=2,
         )
 
-    offsets = wp.empty(n, dtype=wp.int32, device=device)
-    wp.utils.array_scan(counts, out_array=offsets, inclusive=False)
+    # CSR row bounds in the length-``n + 1`` form. The leading zero from ``wp.zeros`` is the first
+    # exclusive offset and the inclusive scan fills the rest, so ``offsets[n]`` holds the total --
+    # ``array.counts_to_offsets``' convention, open-coded here because that helper reads the total
+    # back to the host and no caller here wants it. The terminator belongs at this producer rather
+    # than in each consumer's kernel: both of them read ``offsets[i + 1]`` as the row end.
+    offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
+    wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
 
     if len(chunk_flats) == 1:
         # Single chunk (n <= chunk): the chunk buffer already is the global CSR neighbor buffer.

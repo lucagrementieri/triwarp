@@ -569,7 +569,7 @@ def max_tangent_sphere(
         n_vert_slices = max(1, (n_verts + ITEMS_PER_QUERY_SLICE - 1) // ITEMS_PER_QUERY_SLICE)
         packed_support = wp.zeros(k, dtype=wp.uint64, device=device)
         wp.launch(
-            kernel_visibility.support_argmax_tiled,
+            kernel_visibility.support_argmax_sliced,
             dim=(k, n_vert_slices),
             inputs=[
                 mesh.points,

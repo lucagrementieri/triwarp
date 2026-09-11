@@ -1186,3 +1186,38 @@ def test_icp_point_to_plane_tukey_all_weights_zero(device: str) -> None:
     # zeroed accumulator would otherwise read as a perfect fit.
     assert np.allclose(matrix_wp.numpy()[0], np.eye(4), atol=1e-6)
     assert not np.isfinite(cost_tw)
+
+
+def test_icp_point_to_plane_rejects_an_off_menu_robust_kernel(device: str) -> None:
+    """
+    Not a library comparison: the ``robust_kernel`` menu's own guard.
+
+    An unrecognised name used to index ``_ROBUST_KINDS`` directly and surface as a bare
+    ``KeyError('bogus')``, which names neither the argument nor the three kernels. All three
+    documented names still run, which is what keeps the guard from being a spelling of
+    "reject everything".
+    """
+    rng = np.random.default_rng(18)
+    target_np = rng.standard_normal((60, 3)).astype(np.float32)
+    normals_np = target_np / np.linalg.norm(target_np, axis=1, keepdims=True)
+    source_wp = points_to_warp(target_np + 0.05, device)
+    target_wp = points_to_warp(target_np, device)
+    normals_wp = points_to_warp(normals_np, device)
+    with pytest.raises(ValueError, match="robust_kernel must be one of"):
+        tw.registration.icp_point_to_plane(
+            source_wp,
+            target_wp,
+            None,
+            target_normals=normals_wp,
+            robust_kernel="bogus",  # type: ignore[arg-type]
+        )
+    for robust_kernel in ("none", "huber", "tukey"):
+        matrix_wp, _, _ = tw.registration.icp_point_to_plane(
+            source_wp,
+            target_wp,
+            None,
+            target_normals=normals_wp,
+            max_iterations=2,
+            robust_kernel=robust_kernel,  # type: ignore[arg-type]
+        )
+        assert np.isfinite(matrix_wp.numpy()).all()
