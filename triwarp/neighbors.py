@@ -1076,22 +1076,51 @@ def _knn_cell_size(
     Hash-grid cell width for a k-NN search starting at ``initial_radius``.
 
     **This width, not the deepening ladder's starting radius, is what actually governs the cost of
-    a hash-grid k-NN search.** Too narrow a cell and a query widens over many rounds; too wide and
-    every cell probe scans far more points than it needs to. The true optimal width depends on how
-    far the query points sit from the data cloud, which the cloud's own density says nothing about
-    -- so there is no cheap, general way to estimate it in advance without a real cost model of the
-    cell walk itself, which does not exist yet. A per-query empirical probe does not help either:
-    a query whose true answer is far outside the initial radius falls back to an exact linear scan
-    of the whole cloud, and a CUDA launch's wall time is set by its slowest thread, so even a small
-    probe subsample is liable to include one such row and cost close to what the full query would.
+    a hash-grid k-NN search.** Too narrow a cell and a query abandons the grid for an exact linear
+    scan of the whole cloud; too wide and every cell probe scans far more points than it needs to.
+    The true optimum depends on how far the query points sit from the data cloud, which the cloud's
+    own density says nothing about -- so this uses a simple, safe default, bounded between one grid
+    period and the cloud's full extent. The failure mode of a bad width is a slower query, never a
+    wrong one: every row still certifies itself, so this value affects speed only.
 
-    Until a proper cost model exists, this uses a simple, safe default -- bounded between one grid
-    period and the cloud's full extent -- rather than trying to estimate the true optimum. The
-    failure mode of a bad width is a slower query, never a wrong one: every row still certifies
-    itself, so this value affects speed only. A block-cooperative k-NN walk (one warp per query,
-    on the model of the cooperative BVH walks used elsewhere) would address the underlying
-    per-thread cost imbalance directly, but is a new kernel family rather than a tuning constant,
-    and has not been attempted here.
+    **An automatic query-aware width was built, measured and declined -- on its cost, not its
+    accuracy. Do not re-propose it without making the probe cheaper.** The missing term really is
+    the query displacement, and a cheap probe recovers it: brute-force the nearest distance for a
+    256-query subsample against a 1 024-point subsample of the cloud, subtract *that subsample's*
+    own expected spacing (``knn_initial_radius(subsample, 1)`` -- without this correction the
+    estimate inherits the subsample's sparsity and over-widens by 3-5x at the near end), and add
+    ``knn_initial_radius(points, k)``. Measured on 40 962 points and 20 000 queries displaced by a
+    fraction of the bounding-box diagonal, RTX 5090, minimum of seven, search time only:
+
+    | displacement | default (k=1 / k=30) | corrected width (k=1 / k=30) |
+    |---|---|---|
+    | 0.00 | 0.285 / 0.616 ms | 0.298 / 0.648 |
+    | 0.01 | 0.286 / 0.619 | 0.305 / 0.673 |
+    | 0.02 | 5.131 / 0.617 | **0.451** / 0.715 |
+    | 0.05 | 5.073 / 7.275 | **0.913 / 1.088** |
+    | 0.10 | 5.017 / 7.163 | **2.590 / 3.671** |
+    | 0.20 | 4.979 / 6.941 | 11.137 / 10.992 |
+
+    So the estimate is sound -- near-neutral where nothing was wrong, **2.0-11.4x** through the
+    middle band, and it beats ``backend="bvh"`` there too. Two things sink it as a *default*. The
+    probe costs **0.27-0.29 ms** of slices, copies, a launch and a reduction, which on its own
+    doubles the 0.285 ms on-surface call that is the benchmarked operating point; and at a
+    displacement of 0.20 it is a 1.6-2.2x loss, because by then abandoning the grid for the linear
+    scan is genuinely the right algorithm and a wide cell is not. A gate for either would have to
+    decide *without* the probe, which is the thing that cannot be done cheaply -- that is this
+    item's original finding, now with the number that sets the bar: **get the probe under ~0.05 ms
+    and it ships.**
+
+    The lever that remains is the public one: pass ``initial_radius=`` when the caller knows the
+    scale, which is what ``metrics.chamfer_points_to_points`` already does by seeding its backward
+    search from the forward half's answer.
+
+    A block-cooperative walk (one warp per query) is separately refuted here. The grid walk itself
+    cannot be split across lanes at all -- ``wp.HashGrid`` exposes no per-cell entry point -- and
+    the linear-scan fallback, which can, is not load-imbalanced in the regime that costs: once the
+    displacement is large enough to trigger it, 77-92 % of rows take it and the launch is uniformly
+    expensive rather than held up by stragglers. The genuinely imbalanced band (8-22 % of rows) is
+    the same middle band the radius fix above already covers more cheaply.
     """
     extent = max(float(max_bound[axis] - min_bound[axis]) for axis in range(3))
     if extent <= 0.0:

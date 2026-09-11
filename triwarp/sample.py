@@ -542,6 +542,18 @@ def _dart_throw_blue_noise(
     See ``kernels/algorithms/blue_noise.py`` for why the result has the same distribution as one
     pass of the serial algorithm. The loop is a handful of rounds over a shrinking work list;
     the one host readback per round is the survivor count, which is also the termination test.
+
+    **The round count is stable, and it is not where the cost is.** Measured on five mesh shapes
+    (icosphere at two resolutions, torus, cylinder, box) across a 55x range of pool sizes, 12 633
+    to 692 820, and output sizes 229 to 12 684: **4 to 6 rounds**, every time, growing
+    logarithmically with the pool as randomized-priority maximal-independent-set theory predicts,
+    and the pool-to-output ratio holding at 54-57. An earlier reading that the round count varies
+    several-fold between clouds does not reproduce. What a round actually costs, from
+    ``wp.timing_begin`` (nothing here graph-captures, so the split is trustworthy): 48 % device at
+    the small end and 69 % at the large one, and of the device half, 87-92 % is two kernels --
+    ``dart_select_minima`` and ``dart_cover_neighbors``, the shell scans themselves. Those two are
+    where any further win has to come from; the loop structure around them is already near its
+    launch floor.
     """
     device = pool_points.device
     n_pool = int(pool_points.shape[0])
@@ -656,9 +668,13 @@ def _dart_throw_blue_noise(
             ],
             device=device,
         )
-        # Survivors of this round, compacted in place. ``array_scan`` is exclusive, so the total
-        # is the last position plus the last flag -- one 8-byte readback serving both the next
-        # launch dimension and the loop's exit test, which the round structure needs regardless.
+        # Survivors of this round, compacted in place. The scan is **inclusive**, so its last
+        # entry is the survivor count outright and one 4-byte read serves both the next launch
+        # dimension and the loop's exit test; ``dart_compact_alive`` writes at ``positions[t] - 1``
+        # to match. The exclusive form needed a second read for the last element's own flag, and a
+        # readback is the most expensive thing in a round -- measured two of them at roughly a
+        # quarter of the whole call at the small end, where the rounds are cheapest and most
+        # numerous relative to the work. This is the shape ``array.flatnonzero`` already uses.
         wp.launch(
             kernel_blue_noise.dart_alive_flags,
             dim=alive_count,
@@ -666,13 +682,9 @@ def _dart_throw_blue_noise(
             device=device,
         )
         wp.utils.array_scan(
-            survivor_flag[:alive_count], out_array=positions[:alive_count], inclusive=False
+            survivor_flag[:alive_count], out_array=positions[:alive_count], inclusive=True
         )
-        # Two 4-byte reads per round size the next generation: the exclusive scan's last entry
-        # plus that element's own flag. The compaction launch needs the count as a slice bound.
-        total = int(read_scalar(positions[:alive_count])) + int(
-            read_scalar(survivor_flag[:alive_count])
-        )
+        total = int(read_scalar(positions[:alive_count]))
         if total > 0:
             wp.launch(
                 kernel_blue_noise.dart_compact_alive,

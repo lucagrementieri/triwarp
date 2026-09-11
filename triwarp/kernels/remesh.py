@@ -1220,7 +1220,7 @@ def satisfies_link_condition(
 
 
 @wp.func
-def collapse_flips_normal(
+def move_flips_normal(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     vertex_face_offsets: wp.array[wp.int32],
@@ -1229,9 +1229,14 @@ def collapse_flips_normal(
     partner: wp.int32,
     target: wp.vec3,
 ) -> wp.bool:
-    # Would moving ``moved`` to ``target`` (and welding it onto ``partner``) invert any face it
-    # still belongs to? The two faces containing *both* endpoints vanish in the collapse and are
-    # skipped; every other incident face keeps its other two corners and must keep its orientation.
+    # Would moving ``moved`` to ``target`` invert any face it still belongs to? Every incident face
+    # keeps its other two corners and must keep its orientation.
+    #
+    # ``partner`` names a vertex whose incident faces are exempt, and it is what makes one helper
+    # serve both callers of this rule. A *collapse* welds ``moved`` onto ``partner``, so the two
+    # faces holding both endpoints vanish and must be skipped; a *smoothing* step moves one vertex
+    # and welds nothing, so it passes ``-1``, which no corner index equals and which therefore
+    # exempts nothing.
     #
     # This is the guard that separates a usable decimator from one that produces self-intersecting
     # geometry, and it is why the vertex-face CSR is built at all.
@@ -1362,11 +1367,12 @@ def collapse_candidates(
     #
     # So the guard is free: the two timing ranges overlap, and rejecting a collapse early removes
     # work downstream. The vertex-face CSR it needs costs 0.124 ms a pass against an 11 ms stage.
-    # ``isotropic_remesh`` still leaves one degenerate face on that input, so this closes part of
-    # what section 16.4 attributed to the smooth pass, not all of it.
-    if collapse_flips_normal(
+    # It also closed what section 16.4 had attributed to the smooth pass: the reason area-weighting
+    # that pass used to fold ``cave_cube`` was this veto's absence, not the weights -- see
+    # ``accumulate_one_ring``.
+    if move_flips_normal(
         vertices, faces, vertex_face_offsets, vertex_faces, r, s, p
-    ) or collapse_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, s, r, p):
+    ) or move_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, s, r, p):
         return
 
     out_survivor[k] = s
@@ -1593,23 +1599,41 @@ def valence_flip_candidates(
 def accumulate_one_ring(
     unique_edges: wp.array2d[wp.int32],
     vertices: wp.array[wp.vec3],
+    vertex_areas: wp.array[wp.float32],
     out_sum: wp.array[wp.vec3],
-    out_degree: wp.array[wp.int32],
+    out_weight: wp.array[wp.float32],
 ) -> None:
-    # Unweighted one-ring centroid. Note this is *not* the area-equalizing relaxation that
-    # Botsch-Kobbelt specify: on a regular graded grid every vertex already sits at the plain
-    # average of its neighbours, so this smoother is at a fixed point and cannot equalize the
-    # sampling. Area-weighting it takes the 99th-percentile aspect ratio on such a patch from 352
-    # to 20, but also makes ``is_watertight`` fail on ``cave_cube`` through a self-intersection at
-    # *every* step size down to lam=0.1, so it needs a fold guard first. See
-    # ``tests/test_remesh.py::test_remesh_emits_no_degenerate_faces``.
+    # The area-equalizing one ring of Botsch-Kobbelt: each neighbour is weighted by its own
+    # barycentric area, so the centroid leans toward the sparsely sampled side of the ring and the
+    # relaxation redistributes sampling density rather than only straightening the surface.
+    #
+    # The *unweighted* centroid this replaced could not: it is a fixed point of a regular graded
+    # grid, which is exactly the input the stage exists for.
+    #
+    # Measured against a baseline worktree, 99th-percentile aspect ratio, three to ten
+    # ``isotropic_remesh`` iterations per fixture: ``icosphere(3)`` **1.308 -> 1.173** and
+    # ``hemisphere`` **1.804 -> 1.496** are the clear wins; a 96x96 graded saddle patch is
+    # 4.211 -> 3.826 at three iterations and 1.575 -> 1.596 at ten, i.e. a wash; ``unit_box``
+    # 1.414 -> 1.706 and ``cave_cube`` 1.414 -> 1.483 are small regressions, because an
+    # already-uniform structured grid is a fixed point of the unweighted smoother and these weights
+    # perturb it. So the gain is on the curved inputs, and the whole call is 1.35x faster
+    # (``icosphere(5)``, three iterations, 22.1-23.1 -> 16.3-16.8 ms) because a better-shaped mesh
+    # gives the split and collapse stages less to do.
+    #
+    # An earlier reading had this change folding ``cave_cube`` into a self-intersection at every
+    # step size down to lam=0.1, and that no longer reproduces at all: with the veto below removed,
+    # ``cave_cube`` stays watertight and self-intersection-free at 8 and 20 iterations, at targets
+    # 0.5x and 0.25x the mean edge, and with ``reproject=False``. What had been folding it was the
+    # missing fold veto in ``collapse_candidates``, since added -- one defect seen from two stages.
     e = wp.int32(wp.tid())
     u = unique_edges[e, 0]
     v = unique_edges[e, 1]
-    wp.atomic_add(out_sum, u, vertices[v])
-    wp.atomic_add(out_degree, u, 1)
-    wp.atomic_add(out_sum, v, vertices[u])
-    wp.atomic_add(out_degree, v, 1)
+    area_u = vertex_areas[u]
+    area_v = vertex_areas[v]
+    wp.atomic_add(out_sum, u, area_v * vertices[v])
+    wp.atomic_add(out_weight, u, area_v)
+    wp.atomic_add(out_sum, v, area_u * vertices[u])
+    wp.atomic_add(out_weight, v, area_u)
 
 
 @wp.func
@@ -1618,18 +1642,60 @@ def tangential_smooth_step(
     code: wp.int32,
     normal: wp.vec3,
     ring_sum: wp.vec3,
-    degree: wp.int32,
+    ring_weight: wp.float32,
     lam: wp.float32,
 ) -> wp.vec3:
-    # Move a free vertex toward its one-ring centroid, but only within the tangent plane, so the
-    # surface is smoothed without being shrunk. Pinned vertices and isolated ones stay put.
+    # Move a free vertex toward its area-weighted one-ring centroid, but only within the tangent
+    # plane, so the surface is smoothed without being shrunk. Pinned vertices, isolated ones and
+    # any vertex whose whole ring is degenerate (zero total area) stay put.
     p = vertex
-    if code != FREE_VERTEX or degree == 0:
+    if code != FREE_VERTEX or ring_weight <= 0.0:
         return p
-    centroid = ring_sum / wp.float32(degree)
+    centroid = ring_sum / ring_weight
     delta = centroid - p
     tangential = project_out_normal(delta, normal)
     return p + lam * tangential
+
+
+@wp.kernel(enable_backward=False)
+def smooth_free_vertices(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    codes: wp.array[wp.int32],
+    normals: wp.array[wp.vec3],
+    ring_sum: wp.array[wp.vec3],
+    ring_weight: wp.array[wp.float32],
+    vertex_face_offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    lam: wp.float32,
+    out_positions: wp.array[wp.vec3],
+) -> None:
+    # One tangential relaxation step, vetoed per vertex by the same fold rule the two collapse
+    # candidates run -- section 2.4's one decision rule, one spelling.
+    #
+    # **It is insurance, and the reason to keep it is that it is free**, not that a fixture needs
+    # it: veto against no-veto measures 16.5-16.9 against 17.1-17.3 ms on ``icosphere(5)`` at three
+    # iterations, two ranges that overlap, and the whole remesh suite passes either way. It fires
+    # on a graded saddle patch and on no other fixture.
+    #
+    # **A convex vertex link cannot fold under this step at all**, which is why the well-shaped
+    # fixtures cannot reach the veto: the target is a convex combination of the one ring, so it
+    # lies inside the link polygon, and a point inside the link cannot invert a fan triangle. It
+    # takes a strongly non-convex link -- a notch of near neighbours opposite far, heavy ones --
+    # which is what ``test_smooth_pass_vetoes_a_move_that_would_fold_a_face`` builds.
+    #
+    # The veto is read against the *current* positions of the whole ring, so a pass that moves
+    # several neighbours at once can in principle still fold; it bounds each move against the
+    # geometry it was computed from, which is what an explicit relaxation can promise. A rejected
+    # vertex simply keeps its position, so the pass can never do worse than not running.
+    v = wp.int32(wp.tid())
+    proposed = tangential_smooth_step(
+        vertices[v], codes[v], normals[v], ring_sum[v], ring_weight[v], lam
+    )
+    if move_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, v, -1, proposed):
+        out_positions[v] = vertices[v]
+        return
+    out_positions[v] = proposed
 
 
 @wp.func
@@ -2502,9 +2568,9 @@ def quadric_collapse_candidates(
         optimum = to_vec3d(vertices[s])
     target = to_vec3(optimum)
 
-    if collapse_flips_normal(
+    if move_flips_normal(
         vertices, faces, vertex_face_offsets, vertex_faces, r, s, target
-    ) or collapse_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, s, r, target):
+    ) or move_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, s, r, target):
         return
 
     out_survivor[k] = s

@@ -213,14 +213,11 @@ def test_remesh_emits_no_degenerate_faces(device: str) -> None:
       into worse slivers and in float32 landed on exactly-zero area: **2 738 of 84 406 faces** on a
       ``saddle_graded``-shaped patch. It now rejects a flip that would create a degenerate triangle
       or increase the worse aspect ratio of the pair.
-    A second, *unfixed* gap this input also exposes: ``_smooth_pass`` computes the **unweighted**
-    one-ring centroid while ``isotropic_remesh``'s Notes promise the area-equalizing form. On a
-    regular graded grid every vertex already sits at the plain average of its neighbours, so the
-    smoother is at a fixed point and cannot equalize the sampling at all. Area-weighting it was
-    measured to take the 99th-percentile aspect ratio here from **352 to 20** -- but it also makes
-    ``is_watertight`` fail on ``cave_cube`` through a self-intersection, at every step size down to
-    ``lam=0.1``, so it needs a fold guard first. Hence this test asserts only the degeneracy and
-    do-no-harm properties, which do hold.
+    The second gap this input exposed -- ``_smooth_pass`` computing the **unweighted** one-ring
+    centroid while ``isotropic_remesh``'s Notes promise the area-equalizing form -- is now closed;
+    see ``test_smooth_pass_is_the_area_weighted_centroid`` for the property and
+    ``kernels/remesh.accumulate_one_ring`` for what it bought. This test keeps asserting only the
+    degeneracy and do-no-harm properties, which is what it is the gate for.
     """
     for label, (vertices_np, faces_np) in (
         ("icosphere", _icosphere_arrays()),
@@ -243,6 +240,134 @@ def test_remesh_emits_no_degenerate_faces(device: str) -> None:
         assert _worst_aspect_ratio(out_vertices_np, out_faces_np) < 2.0 * _worst_aspect_ratio(
             vertices_np, faces_np
         ), label
+
+
+def _area_weighted_ring_centroid(
+    vertices_np: npt.NDArray[np.float64], faces_np: npt.NDArray[np.int32]
+) -> npt.NDArray[np.float64]:
+    """Botsch-Kobbelt's relaxation target: each one-ring neighbour weighted by its own area."""
+    triangles = vertices_np[faces_np]
+    areas = 0.5 * np.linalg.norm(
+        np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1
+    )
+    vertex_area = np.zeros(len(vertices_np))
+    for corner in range(3):
+        np.add.at(vertex_area, faces_np[:, corner], areas / 3.0)
+    edges = undirected_edges(faces_np.reshape(-1, 3))
+    ring_sum = np.zeros_like(vertices_np)
+    ring_weight = np.zeros(len(vertices_np))
+    for u, v in edges:
+        ring_sum[u] += vertex_area[v] * vertices_np[v]
+        ring_weight[u] += vertex_area[v]
+        ring_sum[v] += vertex_area[u] * vertices_np[u]
+        ring_weight[v] += vertex_area[u]
+    centroid = np.zeros_like(vertices_np)
+    live = ring_weight > 0.0
+    centroid[live] = ring_sum[live] / ring_weight[live][:, None]
+    return centroid
+
+
+def test_smooth_pass_is_the_area_weighted_centroid(device: str) -> None:
+    """
+    Not a library comparison: the oracle is the relaxation formula, which no reference exposes.
+
+    ``isotropic_remesh``'s Notes promise the *area-equalizing* tangential relaxation of
+    Botsch-Kobbelt -- each one-ring neighbour weighted by its own barycentric area -- and for a long
+    time the code computed the plain unweighted centroid instead. The two differ only where the
+    sampling is uneven, which is exactly the input the stage exists for and exactly the input the
+    closed, well-shaped fixtures cannot supply, so the gap survived every end-to-end assertion in
+    this file. Hence a direct, hand-computable check on the one pass, on the graded patch.
+
+    The tangential projection is checked at the same time: the relaxed position must differ from the
+    raw centroid only along the vertex normal.
+    """
+    vertices_np, faces_np = _graded_patch(n=48)
+    vertices_wp = points_to_warp(vertices_np, device)
+    faces_wp = wp.array(
+        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
+    )
+    codes_wp, _boundary = tw.remesh._classify(vertices_wp, faces_wp, wp.float32(math.radians(30.0)))
+    relaxed_np = tw.remesh._smooth_pass(vertices_wp, faces_wp, codes_wp).numpy().astype(np.float64)
+
+    positions_np = vertices_wp.numpy().astype(np.float64)
+    free = codes_wp.numpy() == 0
+    assert free.sum() > 1000  # non-vacuity: the pass has a real interior to move
+
+    normals_np = tw.vertices.vertex_normals(vertices_wp, faces_wp).numpy().astype(np.float64)
+    delta = _area_weighted_ring_centroid(positions_np, faces_np) - positions_np
+    expected = positions_np + delta - np.einsum("ij,ij->i", delta, normals_np)[:, None] * normals_np
+
+    assert np.allclose(relaxed_np[free], expected[free], rtol=1e-4, atol=1e-4)
+    # Pinned vertices do not move at all, whatever the ring says.
+    assert np.array_equal(relaxed_np[~free], positions_np[~free])
+    # And the weighting is what is being checked: the *unweighted* centroid is a different answer
+    # here, so a regression to it would fail the comparison above rather than pass it vacuously.
+    unweighted = np.zeros_like(positions_np)
+    degree = np.zeros(len(positions_np))
+    for u, v in undirected_edges(faces_np.reshape(-1, 3)):
+        unweighted[u] += positions_np[v]
+        unweighted[v] += positions_np[u]
+        degree[u] += 1.0
+        degree[v] += 1.0
+    unweighted[degree > 0] /= degree[degree > 0][:, None]
+    assert not np.allclose(
+        unweighted[free], _area_weighted_ring_centroid(positions_np, faces_np)[free], atol=1e-3
+    )
+
+
+def test_smooth_pass_vetoes_a_move_that_would_fold_a_face(device: str) -> None:
+    """
+    Not a library comparison: the fold veto's own contract, on the link shape that can reach it.
+
+    A tangential step to a *convex combination* of the one ring can never leave a **convex** link
+    polygon, so on every well-shaped fixture in this file the veto is unreachable by construction
+    and a test built on one of them would assert nothing. It takes a strongly non-convex link --
+    here a deep notch of three near neighbours opposite three far ones, so the area weights, which
+    the far neighbours dominate, pull the centroid across the notch -- and then the unguarded step
+    inverts three of the six incident faces.
+
+    The vertex must therefore keep its position exactly, which is what ``smooth_free_vertices``
+    promises when ``move_flips_normal`` rejects a proposal.
+    """
+    ring = [
+        (2.1775, 2.9487),
+        (0.7503, 6.7468),
+        (-0.241, 0.0305),
+        (0.425, -0.8692),
+        (0.4578, -0.3791),
+        (6.9468, -1.2066),
+    ]
+    vertices_np = np.array([(0.0, 0.0, 0.0), *[(x, y, 0.0) for x, y in ring]], dtype=np.float64)
+    faces_np = np.ascontiguousarray(
+        [[0, 1 + i, 1 + (i + 1) % len(ring)] for i in range(len(ring))], dtype=np.int32
+    )
+    vertices_wp = points_to_warp(vertices_np, device)
+    faces_wp = wp.array(
+        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
+    )
+    codes_wp, _boundary = tw.remesh._classify(vertices_wp, faces_wp, wp.float32(math.radians(30.0)))
+    assert codes_wp.numpy()[0] == 0  # the centre is FREE, so only the veto can hold it still
+
+    # Non-vacuity: the proposal this pass would otherwise commit really does invert incident faces.
+    centroid = _area_weighted_ring_centroid(vertices_np, faces_np)[0]
+    folded = 0
+    for triangle in faces_np:
+        before = vertices_np[triangle]
+        after = before.copy()
+        after[list(triangle).index(0)] = centroid
+        normal_before = np.cross(before[1] - before[0], before[2] - before[0])
+        normal_after = np.cross(after[1] - after[0], after[2] - after[0])
+        length_after = np.linalg.norm(normal_after)
+        if (
+            length_after == 0.0
+            or np.dot(normal_before / np.linalg.norm(normal_before), normal_after / length_after)
+            < 0.2
+        ):
+            folded += 1
+    assert folded == 3
+
+    relaxed_np = tw.remesh._smooth_pass(vertices_wp, faces_wp, codes_wp).numpy().astype(np.float64)
+    assert np.array_equal(relaxed_np, vertices_wp.numpy().astype(np.float64))
 
 
 @pytest.mark.parity("isotropic_remesh", "meshlib")

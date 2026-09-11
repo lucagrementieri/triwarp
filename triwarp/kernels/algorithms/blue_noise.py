@@ -277,8 +277,10 @@ def dart_cover_neighbors(
 def dart_alive_flags(
     alive: wp.array[wp.int32], state: wp.array[wp.int32], out_flag: wp.array[wp.int32]
 ) -> None:
-    # 0/1 survivor flags over the *work list*, in the dtype ``wp.utils.array_scan`` wants, so the
-    # exclusive scan of them is directly the compaction's write positions.
+    # 0/1 survivor flags over the *work list*, in the dtype ``wp.utils.array_scan`` wants. The
+    # caller scans them **inclusively**, so the last entry is the survivor count and no second
+    # read is needed to recover it -- the same one-tail-read shape ``array.flatnonzero`` uses, and
+    # for the same reason: a host readback costs about as much as the whole rest of a round.
     t = wp.int32(wp.tid())
     out_flag[t] = wp.where(state[alive[t]] == DART_ALIVE, wp.int32(1), wp.int32(0))
 
@@ -291,9 +293,11 @@ def dart_compact_alive(
     out_next: wp.array[wp.int32],
 ) -> None:
     # Next round's work list, from this round's: survivors keep their relative order, so the loop
-    # walks a shrinking prefix instead of the whole pool. ``positions`` is the exclusive scan of the
-    # survivor flags.
+    # walks a shrinking prefix instead of the whole pool. ``positions`` is the **inclusive** scan of
+    # the survivor flags, so a survivor's slot is ``positions[t] - 1``; the caller reads the same
+    # array's last entry as the round's survivor count, which is what makes one readback do the
+    # work of two.
     t = wp.int32(wp.tid())
     i = alive[t]
     if state[i] == DART_ALIVE:
-        out_next[positions[t]] = i
+        out_next[positions[t] - 1] = i

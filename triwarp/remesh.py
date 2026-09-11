@@ -630,37 +630,49 @@ def _smooth_pass(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], codes: wp.array[wp.int32]
 ) -> wp.array[wp.vec3]:
     """
-    One tangential Laplacian smoothing step over free vertices.
+    One area-equalizing tangential relaxation step over free vertices.
 
-    This is the *unweighted* one-ring centroid, which is a documented gap rather than a choice: the
-    area-equalizing form Botsch-Kobbelt specify (and which ``isotropic_remesh``'s Notes describe) is
-    what actually removes anisotropy, and this one cannot -- on a regular graded grid every vertex
-    already sits at the plain average of its neighbours, so the smoother is at a fixed point. See
-    ``accumulate_one_ring`` for the measurement and the blocker.
+    Each neighbour is weighted by its own barycentric area, which is the form Botsch-Kobbelt
+    specify and the one ``isotropic_remesh``'s Notes describe; the plain one-ring centroid this
+    replaced was a fixed point on exactly the graded input the stage exists for. Every proposed
+    move is vetoed if it would invert an incident face, by the same rule the collapse stage runs --
+    see ``kernels/remesh.accumulate_one_ring`` for the quality measurement and
+    ``kernels/remesh.smooth_free_vertices`` for why the veto is load-bearing rather than defensive.
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     normals = tw.vertices.vertex_normals(vertices, faces)
     unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    vertex_areas = tw.laplacian.mass_matrix_entries(vertices, faces)
+    # The same vertex-face CSR the collapse stage builds for its own fold veto, and for the same
+    # reason: ``unique_edges`` above carries a vertex's *neighbours*, never its faces.
+    vertex_faces, face_offsets = tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
 
     ring_sum = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
-    degree = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    ring_weight = wp.zeros(n_vertices, dtype=wp.float32, device=device)
     wp.launch(
         kernel_remesh.accumulate_one_ring,
         dim=int(unique_edges.shape[0]),
-        inputs=[unique_edges, vertices, ring_sum, degree],
+        inputs=[unique_edges, vertices, vertex_areas, ring_sum, ring_weight],
         device=device,
     )
     out_positions = wp.empty(n_vertices, dtype=wp.vec3, device=device)
-    wp.map(
-        kernel_remesh.tangential_smooth_step,
-        vertices,
-        codes,
-        normals,
-        ring_sum,
-        degree,
-        wp.float32(1.0),
-        out=out_positions,
+    wp.launch(
+        kernel_remesh.smooth_free_vertices,
+        dim=n_vertices,
+        inputs=[
+            vertices,
+            faces,
+            codes,
+            normals,
+            ring_sum,
+            ring_weight,
+            face_offsets,
+            vertex_faces,
+            wp.float32(1.0),
+            out_positions,
+        ],
+        device=device,
     )
     return out_positions
 

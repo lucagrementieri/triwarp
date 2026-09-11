@@ -3477,7 +3477,7 @@ on real wrappers, is only worth 1.00-1.02x — not a lever.)*
 | a slice view | 2.8 µs |
 | `array.flatnonzero(200k)` | 115 µs |
 | a cached `wp.map` call (Python overhead above the kernel) | ~11 µs |
-| a host readback | ~0.1 ms |
+| a host readback | ~0.1 ms (but a **second consecutive** one is ~0.02 ms — the 0.1 ms is the pipeline drain the first read already paid; §16.7) |
 | a **replayed** kernel in a captured chain | **1.17 µs** at n=17 689, 1.57 µs at n=163 842, exactly linear from 1 to 12 kernels |
 
 A host-cost model of `allocations × per-call cost + kernels × 9.7 µs` accounts for 84-122% of a
@@ -4469,13 +4469,41 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
 
 ### 16.4 `remesh`
 
-- **OPEN — `isotropic_remesh`'s smooth pass is uniform where its own Notes promise the
-  Botsch-Kobbelt area-equalizing relaxation.** Area-weighting each neighbour by its barycentric area
-  meaningfully improves aspect ratio, but introduces a self-intersection on `cave_cube` that damping
-  and step-clamping don't fix. **Not shipped** — it needs a real fold guard (reject any proposed
-  vertex move that would invert an incident face normal), which is still unwritten. The
-  area-equalizing solve itself exists as `smoothing.equalize_triangle_areas`; trying that against
-  the `cave_cube` failure is the obvious next step and hasn't been done.
+- **SHIPPED — `isotropic_remesh`'s smooth pass is the Botsch-Kobbelt area-equalizing relaxation
+  its Notes promise, with the fold veto the collapse stage already runs.** Each one-ring neighbour
+  is weighted by its own barycentric area (`laplacian.mass_matrix_entries`), and every proposed
+  move is vetoed if it would invert an incident face. `tests/test_remesh.py` passes, and the call is
+  **1.35x faster** end to end (`icosphere(5)`, 3 iterations: 22.1-23.1 → 16.3-16.8 ms, stable over
+  alternating arms) despite the extra launches — the same "a rejected move removes downstream work"
+  effect the collapse veto showed.
+    - **The `cave_cube` blocker this item recorded no longer exists, and it was never the smoothing's
+      fault.** Area-weighting with *no* veto now leaves `cave_cube` watertight and
+      self-intersection-free at every configuration probed — 8 and 20 iterations, target 0.5x and
+      0.25x the mean edge, with `reproject=False` as well — and the whole remesh suite passes
+      without it. What had made it fold was the missing **collapse** fold veto, fixed since (next
+      item); the two readings were one defect seen from two stages.
+    - **The quality gain is real but far smaller than the stale "352 → 20" this item quoted**, which
+      was measured against a baseline that predates that collapse veto. Against today's baseline,
+      99th-percentile aspect ratio: `icosphere(3)` **1.308 → 1.173** and `hemisphere` **1.804 →
+      1.496** (both clear wins), graded patch 4.211 → 3.826 at 3 iterations and 1.575 → 1.596 at 10
+      (a wash), `unit_box` 1.414 → 1.706 and `cave_cube` 1.414 → 1.483 (small regressions, because
+      an already-uniform structured grid is a fixed point of the *unweighted* smoother and the area
+      weights perturb it). Net: better on the curved fixtures, slightly worse on the flat-faced
+      boxes, and it is what the docstring says.
+    - **The veto is kept although nothing in the suite needs it, because it is free and it guards a
+      hazard the sibling stage guards for the same reason** (§2.4's one-rule-one-spelling): veto
+      against no-veto measures 16.5-16.9 against 17.1-17.3 ms, two ranges that overlap. It fires on
+      the graded patch and nowhere else.
+    - **A tangential step to a convex combination of the one ring cannot fold a *convex* vertex
+      link** — the target is inside the link polygon by construction. So every well-shaped fixture
+      in the suite is unable to reach the veto, and a test built on one asserts nothing; the guard's
+      own test needs a deliberately non-convex link (a deep notch of near neighbours opposite far,
+      heavy ones), which is `test_smooth_pass_vetoes_a_move_that_would_fold_a_face`. The weighting
+      itself is pinned by a hand-computable NumPy oracle in
+      `test_smooth_pass_is_the_area_weighted_centroid`, since no reference exposes a single
+      relaxation step.
+    - Not needed after all: `smoothing.equalize_triangle_areas`, which this item named as the
+      obvious next step.
 - **FIXED — the isotropic *collapse* had no fold veto**, where its quadric-decimation sibling did.
   Both kernels deliberately share their core decision helpers precisely because a duplicated
   *decision rule* diverging is the hazard (§2.4); this divergence was exactly that gap, not a
@@ -4585,17 +4613,36 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   be "large" by the sweep's own size axis. **General lesson: a sweep across one axis (size) can look
   like it identifies the real threshold while actually just correlating with the true variable on
   that one benchmark's fixture — vary the fixture's own free parameters before trusting a gate.**
-- **OPEN — no cheap, general, safe cell-width escalation trigger has been found for
-  `neighbors._knn_cell_size`.** An analytic cost model tracks the shape at small perturbations but
-  is unsafe to act on at extremes (it recommends widening even where doing so is a real loss). A
-  cheap empirical probe doesn't work either, for a structural reason: this kernel puts one query per
-  thread and a CUDA launch blocks on its slowest thread, so once a meaningful fraction of the query
-  population is expensive, sampling even a handful of them to decide whether to escalate costs nearly
-  as much as just paying the escalation. **The more promising unexplored lead is structural, not a
-  better formula**: a block-cooperative k-NN walk (one warp per query, on the pattern that already
-  fixed an analogous per-query load imbalance in `mesh_to_mesh_distance` and `ball_pivoting`'s pivot
-  search) would address the per-thread cost directly instead of trying to avoid triggering it — a
-  new kernel family, unattempted here.
+- **REFUTED — there is no cheap automatic cell-width trigger for `neighbors._knn_cell_size`, and
+  both halves of that now have numbers rather than an argument.** The full table, the probe that
+  works and the two reasons it cannot be made unconditional are written at the function itself; the
+  short form:
+    - **The missing term is the query displacement, and a cheap probe does recover it** — brute-force
+      256 queries against a 1 024-point subsample of the cloud, subtract *that subsample's* own
+      spacing (skip this and the estimate inherits the subsample's sparsity and over-widens 3-5x),
+      add `knn_initial_radius`. Worth **2.0-11.4x** through the middle band (queries displaced
+      0.02-0.10 of the diagonal), near-neutral where nothing was wrong, and it beats
+      `backend="bvh"` there too.
+    - **It is declined on the probe's cost, not its accuracy.** The probe is **0.27-0.29 ms** of
+      slices, copies, a launch and a reduction, which on its own doubles the 0.285 ms on-surface
+      call that is the benchmarked operating point; and at displacement 0.20 the wide cell is a
+      1.6-2.2x loss, because abandoning the grid for the linear scan is by then the right
+      algorithm. A gate for either would have to decide *without* the probe. **The bar is now a
+      number: get the probe under ~0.05 ms and it ships.** Meanwhile the lever is the public
+      `initial_radius=`, which `metrics.chamfer_points_to_points` already uses that way.
+    - **The block-cooperative lead this item proposed is refuted twice over.** The grid walk cannot
+      be lane-split at all (§12.2: `wp.HashGrid` has no per-cell entry point), and the linear-scan
+      fallback, which can, is *not* load-imbalanced where it costs: a fallback census over
+      displacements 0.00-0.20 gives 0 % of rows falling back at 0.00-0.01, then 22 / 69 / 84 / 92 %
+      at 0.02 / 0.05 / 0.10 / 0.20 for k=1 (0 / 8 / 54 / 77 % at k=30), so the expensive regime is
+      one where nearly every row takes the scan and the launch is uniformly expensive. The genuinely
+      imbalanced band is the same middle band the radius probe already covers more cheaply. The
+      deepening ladder is also never deep — **at most 2 attempts** at every displacement probed.
+    - Method note worth keeping: `knn_sorted_insert` binary-searches its row's **whole length**, so
+      a probe handing it a row wider than `k` gets silent garbage — a 64-wide scratch row at k=30
+      reported "1 neighbour found, 100 % fallback" and read exactly like a triwarp defect. The row
+      width *is* `k` in production. Confirm a census against an independent oracle (here a
+      `cKDTree` k-th distance) before believing it.
 - **A documented "16x non-monotonic drop" in `query_nearest` was real but mischaracterized** — it
   only appears at `k >= 8` and is hash-grid-specific (the BVH backend is monotonic across the same
   size sweep). Mechanism: once a row's true k-th distance exceeds the grid's widest search radius,
@@ -4708,13 +4755,26 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   looser cover radius doesn't merely change the answer, it can stop the loop from converging at all,
   because the accept step won't take a point while a smaller-priority alive point still covers it.
   Its byte-identity gate is therefore cheap insurance worth keeping.
-- **OPEN — a residual gap to meshlib is partly per-round dispatch cost and partly an unexplained
-  round-count difference, not fully attributed.** A prior guess that the whole gap was fixed
-  per-round GPU dispatch against a tight single-threaded C++ loop turned out to be only part of it —
-  measured dispatch cost accounts for less than half the gap in most cells. **The bigger, still-open
-  lever: round count doesn't track output size** — one cloud can take several times as many rounds
-  as another to reach a comparable sample count, and why is unmeasured. Benchmark the round count
-  itself before trying to change it (§9).
+- **CLOSED — the round count was benchmarked, as this item asked, and the premise was wrong: it is
+  stable at 4-6 whatever the cloud.** Measured over five mesh shapes (icosphere at two resolutions,
+  torus, cylinder, box), a 55x pool-size range (12 633 → 692 820) and a 55x output range (229 →
+  12 684): **4-6 rounds in all fifteen cells**, growing logarithmically with the pool exactly as
+  randomized-priority maximal-independent-set theory predicts, with pool/output holding at 54-57.
+  The "one cloud takes several times as many rounds as another" reading does not reproduce.
+    - **Nor is the remainder per-round dispatch.** From `wp.timing_begin` (nothing here
+      graph-captures, so §15.10 does not apply): **48 % device** at the small end (1.56 of 3.23 ms,
+      52 kernels) and **69 %** at the large (3.81 of 5.56 ms, 58 kernels). Of the device half,
+      **87-92 % is two kernels** — `dart_select_minima` and `dart_cover_neighbors`, the shell scans
+      themselves. Any further win is in those two; the loop around them is near its launch floor.
+    - **SHIPPED off the back of it: one readback per round instead of two**, by scanning the
+      survivor flags **inclusively** (the last entry is then the count outright) and having
+      `dart_compact_alive` write at `positions[t] - 1` — the same shape `array.flatnonzero` already
+      used. Measured **2-3.5 %**, every one of six cells in both reps, output unchanged.
+    - **And it corrects the cost model: a *second consecutive* readback costs ~0.02 ms, not the
+      ~0.1 ms §13.1 quotes.** The 0.1 ms figure is the pipeline drain, which the first read has
+      already paid — which is why removing the second one was worth a few percent and not the ~15 %
+      a naive two-times-0.1-ms estimate predicts. §15.2's "price the candidate directly" applies to
+      readbacks too.
 - **SHIPPED — `points.farthest_point_sample` as one persistent block** — §14.1.
 
 ### 16.8 `linalg`, `smoothing`, `laplacian`
@@ -4750,22 +4810,28 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   if a caller appears that solves the same system many times, and note the connection-Laplacian
   operator can't reach the gate at all yet because the whole hierarchy is scalar-CSR-only and would
   need a block-generalized version first.
-- **OPEN — `robust_laplacian` on one degenerate open patch (Dini's surface, extreme edge-length
-  ratio) still carries a small number of vertices whose off-diagonal weight is negative**, in a way
-  its own claim ("retriangulates until no edge has a negative weight") promises won't happen.
-  **Triaged, not a bug**: it's a documented simplicial limitation of edge-flip-based intrinsic
-  Delaunay triangulation, reached for the first time by this input, split across two distinct causes
-  — a small number of truly unflippable interior edges (the flip target would create a duplicate
-  edge between the same two vertices, so the flip is correctly declined) and a separate, larger
-  handful of *boundary* edges that no flip of any kind could ever fix (a boundary edge has only one
-  opposite angle, so the Delaunay two-angle condition doesn't even apply to it). **General lesson:
-  quoting a `min()` over a set whose members have two different causes can size a proposed fix by
-  100x the wrong number** — the residue's largest-magnitude member here was the *unfixable* boundary
-  case, not the interior one the fix under consideration would actually address. The lever for the
-  interior half (a Delta-complex / signpost data structure, which can represent more than one edge
-  between the same two vertices) is unbuilt. The affected test now asserts the residue is exactly the
-  unflippable set, rather than asserting the property this function was never able to promise on this
-  input.
+- **CLOSED — `robust_laplacian`'s negative-weight residue on Dini's surface is entirely *boundary*
+  edges, which are not Delaunay violations at all; the interior half this item called open is
+  already fixed.** Re-censused on the current code: 4 783 flips, 4 375 edges, 266 of them
+  multi-edges, and **zero** negative interior edges against **10** negative boundary ones
+  (min -29.06). The interior half was closed by the multi-edge support `intrinsic_delaunay` now
+  carries — a flip may create a second, geometrically distinct edge between two already-adjacent
+  vertices, which intrinsically is a different geodesic and not a duplicate — so this item's "the
+  lever for the interior half (a Delta-complex / signpost data structure) is unbuilt" is stale.
+    - **The boundary residue is not a defect and no flip can address it**: a boundary edge has one
+      opposite angle, so the two-angle Delaunay condition has nothing to compare it against, and an
+      obtuse boundary corner is simply an obtuse boundary corner. The only remedy is inserting
+      Steiner points, which `robust_laplacian`'s own contract forbids — its docstring promises the
+      vertex set, and so the matrix's shape and meaning, are unchanged.
+    - Both claims are already pinned by
+      `tests/test_remesh.py::test_intrinsic_delaunay_resolves_interior_violations_via_multi_edges`,
+      which asserts the interior minimum is non-negative *and* that the boundary residue survives,
+      with a non-vacuity check that the fixture really reaches a multi-edge. The public docstring
+      already says "Not *until*" and tells the caller to check the result. Nothing to implement.
+    - **General lesson kept from the original triage** (it is still the useful part): quoting a
+      `min()` over a set whose members have two different causes can size a proposed fix by 100x the
+      wrong number — the residue's largest-magnitude member was the unfixable boundary case, not the
+      interior one the proposed fix addressed.
 - **SHIPPED — `filter_laplacian(implicit_time_integration=True)` and `filter_implicit_fairing` now
   solve their three position components as one batched multi-column solve instead of three separate
   single-column ones — real win (~2-2.8x), bit-identical output.** All three columns share one
