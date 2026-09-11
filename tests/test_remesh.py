@@ -137,14 +137,28 @@ def _valences(faces_np: np.ndarray, n_vertices: int) -> np.ndarray:
 
 
 def _meshlib_remesh_spread(vertices_np: np.ndarray, faces_np: np.ndarray, target: float) -> float:
-    """Coefficient of variation (std / mean) of meshlib remesh at ``target``."""
+    """
+    Coefficient of variation (std / mean) of meshlib remesh at ``target``.
+
+    ``pack()`` is mandatory and skipping it is silent: ``mm.remesh`` retires faces in place, so
+    ``getNumpyFaces`` returns ``last_valid_face_id + 1`` rows rather than ``numValidFaces()``, and
+    the difference is all-zero padding. Measured on ``icosphere(3)`` at half the mean edge: **12 800
+    rows of which 7 696 are ``[0, 0, 0]``**, against 5 104 real faces. Those rows contribute a
+    zero-length edge ``(0, 0)`` to the edge set, which deflates the reference's mean and inflates
+    the very spread this function exists to report -- i.e. it makes the bound below *looser*, in
+    triwarp's favour, which is the direction nothing would notice. The effect happens to be small,
+    because ``np.unique`` collapses all 7 696 padding rows into that one edge: CV **0.2525 ->
+    0.2522**. The fix is for the reading to be right, not because the number moved.
+    """
     mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
     settings = mm.RemeshSettings()
     settings.targetEdgeLen = float(target)
     settings.projectOnOriginalMesh = True
     mm.remesh(mesh_ml, settings)
+    mesh_ml.pack()
     vertices_ml = mn.getNumpyVerts(mesh_ml)
     faces_ml = mn.getNumpyFaces(mesh_ml.topology)
+    assert faces_ml.shape[0] == mesh_ml.topology.numValidFaces()
     lengths_ml = _edge_lengths(vertices_ml, faces_ml)
     return float(lengths_ml.std() / lengths_ml.mean())
 
@@ -371,26 +385,57 @@ def test_smooth_pass_vetoes_a_move_that_would_fold_a_face(device: str) -> None:
 
 
 @pytest.mark.parity("isotropic_remesh", "meshlib")
-def test_remesh_edge_concentration(device: str) -> None:
+@pytest.mark.parametrize(
+    ("mesh_name", "target_scale", "spread_bound"), [("icosphere", 0.5, 0.5), ("graded", 1.0, 0.85)]
+)
+def test_remesh_edge_concentration(
+    device: str, mesh_name: str, target_scale: float, spread_bound: float
+) -> None:
     """
     Class C (a spread statistic): both remeshes hit the requested target, triwarp more tightly.
 
     No correspondence exists -- the two run different stopping rules (a fixed ``iterations`` x five
     parallel passes against a serial local-operation queue), so they return different meshes -- and
     what is comparable is how well each concentrates its edge lengths around the *requested* target.
-    Measured on ``icosphere(3)`` at half the mean edge: triwarp's coefficient of variation is
-    **0.046** against meshlib's **0.220**, both mean lengths land within 2 % of the target, the face
-    counts are 5 000 against 5 284, and the two surfaces sit **0.0072** apart -- a tenth of the
-    target edge length.
+
+    **The graded arm is the one that carries the claim, and a uniform fixture alone cannot.** On an
+    already-uniform sphere every stage of the remesher agrees about what to do, so the comparison
+    measures almost nothing about the stages individually; on a patch whose spacing varies 60x it
+    separates them. Measured over five repetitions on both devices -- identical to four decimals
+    every time, so these bounds are set by the reference drifting, not by run-to-run noise:
+
+    | | ``icosphere(3)`` @ 0.5x | graded patch @ 1.0x |
+    |---|---|---|
+    | triwarp coefficient of variation | 0.0419 | 0.1227 |
+    | meshlib CV (the reference) | 0.2522 | 0.1994 |
+    | ratio, against the bound here | 0.166 vs 0.5 (**3.0x**) | 0.615 vs 0.85 (**1.4x**) |
+    | mean / target | 0.9975 | 1.0029 |
+    | fraction in ``[0.7, 1.4] x`` target | 1.0000 | 0.9941 |
 
     **Bug class excluded:** a remesh that converges to the wrong length scale, or that reaches the
-    mean by mixing very long and very short edges. **Mutation probe, measured:** the *input* mesh
-    has a CV of 0.065 at twice the target length, so a pass that did nothing would fail the mean
-    band outright, and the ``1.5x`` bound against meshlib's spread is 4.8x above the measured ratio
-    (0.046 / 0.220 = 0.21).
+    mean by mixing very long and very short edges rather than by equalizing them.
+
+    **Mutation probe, run by disabling one stage at a time and naming the assert each trips:** the
+    *input* mesh scores a ratio of 1.99 and 0.68 in band, failing both; disabling ``collapse`` gives
+    1.29 and disabling ``split`` 1.37, each failing the spread bound; disabling ``smooth`` fails
+    **both** asserts independently -- ratio 0.928 against the 0.85 bound, and 0.9495 in band against
+    0.95. **The spread bound is the robust half of that pair and the reason it is 0.85 rather than
+    a rounder 1.0**: at 1.0 this test would pass with the area-equalizing relaxation switched off
+    entirely, and the in-band assert alone clears the mutant by 0.0005, which is not a margin. Only
+    ``swap`` can be disabled without tripping anything.
+
+    **And the mean-band assert is vacuous on the graded arm** -- its input already sits at 0.9981 of
+    the target, because grading redistributes edge lengths without changing their mean -- so there
+    the spread bound and the in-band fraction are the whole test. On the icosphere arm it is the
+    other way round: the input sits at 2.0x target, so a do-nothing pass fails the mean outright.
     """
-    sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
-    target = 0.5 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
+    if mesh_name == "icosphere":
+        sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+        reference_vertices, reference_faces = sphere.vertices, sphere.faces
+    else:
+        reference_vertices, reference_faces = _graded_patch(n=48)
+        vertices_wp, faces_wp = numpy_to_warp(reference_vertices, reference_faces, device)
+    target = target_scale * tw.edges.mean_edge_length(vertices_wp, faces_wp)
 
     out_vertices, out_faces = tw.remesh.isotropic_remesh(
         vertices_wp, faces_wp, target_length=target, iterations=10
@@ -399,12 +444,12 @@ def test_remesh_edge_concentration(device: str) -> None:
     faces_np = out_faces.numpy().reshape(-1, 3)
     lengths = _edge_lengths(vertices_np, faces_np)
 
-    assert abs(lengths.mean() / target - 1.0) < 0.2  # mean within 20% of target
-    in_band = np.mean((lengths >= 0.5 * target) & (lengths <= 1.6 * target))
-    assert in_band >= 0.8
-    spread_ml = _meshlib_remesh_spread(sphere.vertices, sphere.faces, target)
+    assert abs(lengths.mean() / target - 1.0) < 0.05  # mean within 5% of target
+    in_band = np.mean((lengths >= 0.7 * target) & (lengths <= 1.4 * target))
+    assert in_band >= 0.95
+    spread_ml = _meshlib_remesh_spread(reference_vertices, reference_faces, target)
     assert 0.0 < spread_ml < 1.0  # non-vacuity: the reference produced a real remesh
-    assert lengths.std() / lengths.mean() <= 1.5 * spread_ml
+    assert lengths.std() / lengths.mean() <= spread_bound * spread_ml
 
 
 def test_remesh_watertight_genus_preserved(device: str) -> None:

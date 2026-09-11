@@ -527,19 +527,22 @@ def test_flip_to_delaunay(bench_case: BenchCase) -> None:
     "measured and tabulated in this function's own docstring: triwarp runs a fixed iterations x "
     "five parallel launches while MeshLab works a serial local-operation queue until the "
     "operations stop paying off, so at iterations=3 and the identical target length the two "
-    "return different meshes with no vertex correspondence -- 39 100 faces against 34 946 on "
-    "saddle, and on saddle_graded triwarp misses the target edge length by 27% (0.73 of target "
-    "against 0.98) and leaves a 99th-percentile "
-    "aspect ratio of 352 against 1.87. That gap is the finding this row exists to report, not a "
-    "tolerance to widen; the quality statistics themselves are asserted against the *input* in "
-    "tests/test_remesh.py, in test_remesh_edge_concentration and "
-    "test_remesh_emits_no_degenerate_faces, rather than against MeshLab. Re-measured after "
-    "isotropic_remesh gained max_deviation, since an absent surface-distance gate used to be one "
-    "listed source of the gap and is no longer absent: passing MeshLab's own checksurfdist default "
-    "(1% of the bbox diagonal, 0.0288 here) changes nothing at all -- byte-identical face counts "
-    "on both fixtures and a 99th-percentile aspect ratio of 375.4 against 375.9 unbounded, because "
-    "on these patches the remesh never moves a vertex that far, so the bound does not bind. The "
-    "stopping rule is the whole of the remaining disagreement, and the parameter is deliberately "
+    "return different meshes with no vertex correspondence -- 35 568 faces against 34 946 on "
+    "saddle, and on saddle_graded 41 604 against 31 414 with triwarp missing the target edge "
+    "length by 15% (0.854 of target against 0.983) and leaving a 99th-percentile aspect ratio of "
+    "8.60 against 1.87. That gap is the finding this row exists to report, not a tolerance to "
+    "widen; the quality statistics themselves are asserted against MeshLib and against the *input* "
+    "in tests/test_remesh.py, in test_remesh_edge_concentration and "
+    "test_remesh_emits_no_degenerate_faces, rather than against MeshLab. The aspect-ratio half of "
+    "that gap used to read 352 against 1.87 and has closed 41x since, in two steps and for one "
+    "reason each: the collapse stage gained the fold veto its quadric sibling already had "
+    "(352 -> 9.13), and the smooth stage became the area-equalizing relaxation its Notes promise "
+    "rather than the plain one-ring centroid (9.13 -> 8.60). The stopping rule is what is left. "
+    "Re-measured once before that, after isotropic_remesh gained max_deviation, since an absent "
+    "surface-distance gate used to be a listed source of the gap: passing MeshLab's own "
+    "checksurfdist default (1% of the bbox diagonal, 0.0288 here) changed nothing at all -- "
+    "byte-identical face counts on both fixtures -- because on these patches the remesh never "
+    "moves a vertex that far, so the bound does not bind. The parameter is therefore deliberately "
     "NOT passed in this row: it would add a closest-point pass per iteration to the timing while "
     "provably changing no output.",
 )
@@ -581,11 +584,11 @@ def test_isotropic_remesh(bench_case: BenchCase) -> None:
     collapse per pass out of 40 934 candidates (5 vertices removed from 17 689 over five passes,
     against 2 761 hashed, at the same wall clock). ``kernels/remesh.py``'s ``scramble_index`` fixes
     it, which is what took ``saddle`` from 39 100 faces at 0.93 to 35 488 at 0.98. It also unmasked
-    the open defect below: with collapse finally committing, the graded patch's worst triangles get
-    worse rather than better. That is not the key's doing -- at ``tests/test_remesh.py``'s target of
-    half the mean edge the raw key leaves **192** float32-degenerate faces on this mesh against the
-    hashed key's **40** -- it is what a collapse stage does on anisotropic input when the smoother
-    downstream of it cannot see the anisotropy.
+    the smoother defect below, since closed: with collapse finally committing, the graded patch's
+    worst triangles got worse rather than better. That is not the key's doing -- at
+    ``tests/test_remesh.py``'s target of half the mean edge the raw key leaves **192**
+    float32-degenerate faces on this mesh against the hashed key's **40** -- it is what a collapse
+    stage does on anisotropic input when the smoother downstream of it cannot see the anisotropy.
 
     Two bugs were found and one fixed by reading this pair against the reference; both were
     pre-existing and invisible to ``tests/test_remesh.py``, which only ever runs the remesher on
@@ -596,18 +599,18 @@ def test_isotropic_remesh(bench_case: BenchCase) -> None:
       **2 738 of 84 406 faces**, with the worst aspect ratio reaching 5.7e6. It now also rejects any
       flip that would create a degenerate triangle or worsen the pair's aspect ratio. That is what
       moved the ``saddle`` row to parity and zeroed the degenerate counts above.
-    * **Open** -- ``_smooth_pass`` computes the *unweighted* one-ring centroid where this module's
-      Notes promise the area-equalizing form. A regular graded grid is valence-perfect (100% of
-      interior vertices have valence exactly 6), already Delaunay, *and* a fixed point of the
-      unweighted Laplacian, so three of the five stages are blind to its anisotropy by construction
-      and only split/collapse act -- reaching a dynamic equilibrium at ~41% short edges (94.8% of
-      them collapsible, so it is not the guards). Area-weighting the smoother was measured to
-      take the 99th-percentile aspect ratio from **352 to 20** and to improve the icospheres too
-      (min angle 45 -> 54 deg), but it makes ``is_watertight`` fail on ``cave_cube`` through a
-      self-intersection at *every* step size down to ``lam=0.1``, so it needs a fold guard before it
-      can land. Not shipped. **This is now the binding defect on the graded row**, not a residual:
-      with the collapse lock key fixed the equilibrium is gone and the aspect figures above are what
-      the unweighted smoother leaves behind.
+    * **Closed** -- ``_smooth_pass`` is now the area-equalizing relaxation this module's Notes
+      promise, weighting each one-ring neighbour by its barycentric area. It had to be: a regular
+      graded grid is valence-perfect (100% of interior vertices have valence exactly 6), already
+      Delaunay, *and* a fixed point of the unweighted Laplacian, so with the plain centroid three
+      of the five stages were blind to its anisotropy by construction and only split/collapse
+      acted. The ``cave_cube`` self-intersection that had blocked this for two rounds was never the
+      smoother's: it was the missing collapse fold veto above, and with that in place the weighting
+      lands with no veto of its own needed (one is kept anyway, because it measures free). The
+      graded row's 99th-percentile aspect ratio against pymeshlab went 352 -> 9.13 on the collapse
+      veto and 9.13 -> 8.60 on this, against pymeshlab's 1.87; what is left is the stopping rule,
+      which is this group's standing D2 exemption. The whole call is also 1.35x faster, since a
+      better-shaped mesh gives split and collapse less to do.
     """
     target = bench_case.mean_edge
     if bench_case.kind == "meshlib":

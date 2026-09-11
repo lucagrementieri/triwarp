@@ -4504,6 +4504,29 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
       relaxation step.
     - Not needed after all: `smoothing.equalize_triangle_areas`, which this item named as the
       obvious next step.
+    - **The parity test that covers this group could not see the change at all, which is the part
+      worth carrying forward.** `test_remesh_edge_concentration` ran on `icosphere(3)` alone, where
+      an already-uniform sampling makes the area weights equal the uniform ones — both arms measured
+      *bit-identically* (CV 0.0419, 5 120 faces, 0.00287 from meshlib). A library comparison on a
+      uniform fixture cannot see a stage whose whole job is anisotropy. It is now parametrized over
+      the uniform sphere **and** a graded patch, and tightened on measured margins: mean-within-20 %
+      → 5 %, in-band `[0.5, 1.6]x` at 80 % → `[0.7, 1.4]x` at 95 %, and the spread bound against
+      meshlib from a single `1.5x` to a per-fixture 0.5x (icosphere, 3.0x margin) and 0.85x (graded,
+      1.4x). Disabling one stage at a time now fails it for `split`, `collapse` **and `smooth`**,
+      where before only `split` did.
+    - **Two defects the recheck turned up, neither caused by this change.** The meshlib reference
+      skipped `pack()` — §7.6's documented trap — and so read **12 800 face rows of which 7 696 were
+      `[0, 0, 0]` padding** against 5 104 real ones, which inflates the reference spread and
+      therefore loosens the bound *in triwarp's favour* (measured small here, CV 0.2525 → 0.2522,
+      but the direction is the one nothing notices). And every measured number in that test's
+      docstring and in the group's `noparity` reason was stale, the worst by 41x: the exemption
+      claimed a graded-patch aspect p99 of **352 against 1.87** where it now reads **8.60** — 352 →
+      9.13 from the collapse fold veto and 9.13 → 8.60 from this change.
+    - **General lesson: a green parity test is evidence only if its fixture can express the
+      difference.** §7.4's vacuity rule is usually read as "check the reference produced a non-empty
+      answer"; this is the same rule about the *input*, and the cheap check is to run the new code
+      and the old against the parity fixture and diff the statistic. Identical output means the
+      test is not covering the change, however green it is.
 - **FIXED — the isotropic *collapse* had no fold veto**, where its quadric-decimation sibling did.
   Both kernels deliberately share their core decision helpers precisely because a duplicated
   *decision rule* diverging is the hazard (§2.4); this divergence was exactly that gap, not a
