@@ -370,3 +370,31 @@ def test_split_empty(device: str) -> None:
     assert vertex_offsets_wp.shape == (0,)
     assert faces_all_wp.shape == (0,)
     assert face_offsets_wp.shape == (0,)
+
+
+def test_concatenate_rejects_mismatched_devices() -> None:
+    """
+    Triwarp against triwarp: a cross-device ``(vertices, faces)`` pair must be rejected.
+
+    Not a library comparison: no reference library shares Warp's device model. This one is not
+    covered by the family test in ``tests/test_array.py`` because the mismatch here is *inside* a
+    sequence argument rather than between two named ones -- ``concatenate`` takes one
+    ``meshes_data`` parameter, so the guard has to descend into it. The failure it prevents is not
+    an exception: the launch device is taken from the first pair's ``vertices`` while the buffer it
+    writes is packed onto its ``faces``' device, so a CPU launch against CUDA pointers segfaults
+    with no Python traceback (CLAUDE.md section 12.1).
+    """
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to construct a mismatch")
+    vertices_wp = wp.zeros(3, dtype=wp.vec3, device="cpu")
+    faces_wp = wp.zeros(3, dtype=wp.int32, device="cuda:0")
+    with pytest.raises(RuntimeError, match="one device"):
+        tw.combine.concatenate([(vertices_wp, faces_wp)])
+    # A mismatch between two *pieces*, which the same descent has to catch.
+    with pytest.raises(RuntimeError, match="one device"):
+        tw.combine.concatenate(
+            [
+                (vertices_wp, wp.zeros(3, dtype=wp.int32, device="cpu")),
+                (wp.zeros(3, dtype=wp.vec3, device="cuda:0"), faces_wp),
+            ]
+        )

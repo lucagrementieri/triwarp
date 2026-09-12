@@ -252,6 +252,8 @@ def pack_1d_arrays(
     ------
     ValueError
         If ``arrays`` is empty, any input is not rank-1, or their ``dtype`` differs.
+    RuntimeError
+        If the segments are not all on one device.
 
     See Also
     --------
@@ -287,6 +289,8 @@ def concatenate(arrays: Sequence[wp.array[DType]], *, copy: bool = True) -> wp.a
     ------
     ValueError
         If ``arrays`` is empty, any input is not rank-1, or their ``dtype`` differs.
+    RuntimeError
+        If the segments are not all on one device.
 
     See Also
     --------
@@ -411,6 +415,14 @@ def _pack_segments(
     """
     if len(arrays) == 0:
         raise ValueError("arrays must be non-empty")
+
+    # The device check belongs here rather than in each public caller because *this* is where the
+    # answer's device is chosen -- ``arrays[0]``'s, arbitrarily. Without it a mixed sequence does
+    # not fail: ``wp.copy`` transfers across devices happily, so the result is a silently migrated
+    # buffer on whichever segment happened to be first, which then decides the device of every
+    # launch built on it downstream. Both callers name the parameter ``arrays``, so the labels in
+    # the message (``arrays[3]``) point at the segment a caller can identify.
+    require_same_device(arrays=list(arrays))
 
     dtype = arrays[0].dtype
     device = arrays[0].device

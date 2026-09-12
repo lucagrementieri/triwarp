@@ -119,22 +119,18 @@ def _stack_columns(data: dict[str, np.ndarray], names: tuple[str, ...]) -> np.nd
 
 
 def _face_normals_from_cell_data(mesh: meshio.Mesh) -> np.ndarray | None:
-    """Read ``nx, ny, nz`` cell data aligned with the triangle cell block, if present."""
-    cell_data = mesh.cell_data
-    if not cell_data:
-        return None
-    tri_index = None
-    for i, block in enumerate(mesh.cells):
-        if block.type == "triangle":
-            tri_index = i
-            break
-    if tri_index is None:
-        return None
+    """Read ``nx, ny, nz`` cell data aligned with the triangle faces, if present."""
+    # ``cell_data_dict[name]["triangle"]`` concatenates every triangle block in the same
+    # order ``cells_dict["triangle"]`` does, so the rows line up with ``faces`` even when a
+    # file splits its triangles across several blocks (gmsh / VTK physical groups). Reading
+    # ``cell_data[name][block_index]`` instead returns only the first block's normals.
+    cell_data_dict = mesh.cell_data_dict
     columns = []
     for name in _NORMAL_COLUMNS:
-        if name not in cell_data:
+        per_type = cell_data_dict.get(name)
+        if per_type is None or "triangle" not in per_type:
             return None
-        columns.append(np.asarray(cell_data[name][tri_index]))
+        columns.append(np.asarray(per_type["triangle"]))
     return np.column_stack(columns)
 
 

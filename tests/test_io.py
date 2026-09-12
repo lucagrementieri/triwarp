@@ -106,6 +106,50 @@ def test_load_mesh_matches_pytorch3d(tmp_path, device):
     assert np.array_equal(mesh_wp.indices.numpy().reshape(-1, 3), faces_p3d.numpy())
 
 
+def test_face_normals_cover_every_triangle_block(monkeypatch, device):
+    """
+    Triwarp against meshio: ``face_normals`` must be row-aligned with ``faces``, block count aside.
+
+    Not a library comparison -- no reference loader exposes triwarp's dict -- so the oracle is
+    meshio's own ``cell_data_dict[name]["triangle"]``, which concatenates the triangle blocks in the
+    same order ``cells_dict["triangle"]`` does. A file that splits its triangles across several
+    blocks is ordinary (gmsh and VTK physical groups do it), and reading ``cell_data[name][i]`` for
+    a single block index instead returns only the first block's normals: two faces, one normal row,
+    no error. The per-block values are made distinct so a short *or* misaligned read fails on value
+    and not only on length.
+
+    The mesh is handed to ``load_mesh_data`` through a patched ``meshio.read`` rather than written
+    out, because no format round-trips both halves of the fixture: meshio's VTK and VTU writers
+    merge the two triangle blocks into one, and its gmsh writer keeps the blocks but drops
+    non-standard ``nx``/``ny``/``nz`` cell data entirely (both measured). Patching the reader keeps
+    the public entry point under test while still delivering the multi-block mesh a real gmsh file
+    would.
+    """
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]], dtype=np.float64
+    )
+    blocks = [("triangle", np.array([[0, 1, 2]])), ("triangle", np.array([[1, 3, 2]]))]
+    normals_np = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    cell_data_mio = {
+        name: [normals_np[:1, k], normals_np[1:, k]] for k, name in enumerate(("nx", "ny", "nz"))
+    }
+    mesh_mio = meshio.Mesh(vertices_np, blocks, cell_data=cell_data_mio)
+    assert len(mesh_mio.cells) == 2, "the fixture must split its triangles across two blocks"
+    monkeypatch.setattr(meshio, "read", lambda _path: mesh_mio)
+
+    data_wp = tw.io.load_mesh_data("unread.msh", device=device)
+
+    faces_mio = mesh_mio.cells_dict["triangle"]
+    normals_mio = np.column_stack(
+        [mesh_mio.cell_data_dict[name]["triangle"] for name in ("nx", "ny", "nz")]
+    )
+    assert faces_mio.shape[0] == 2
+    assert normals_mio.shape == (2, 3)
+    assert np.array_equal(data_wp["faces"].numpy().reshape(-1, 3), faces_mio)
+    assert data_wp["face_normals"].shape[0] == faces_mio.shape[0]
+    assert np.allclose(data_wp["face_normals"].numpy(), normals_mio, rtol=1e-5, atol=1e-5)
+
+
 def test_load_mesh_without_faces_raises(tmp_path, device):
     path = tmp_path / "cloud.ply"
     points_np = np.random.default_rng(0).random((10, 3)).astype(np.float64)

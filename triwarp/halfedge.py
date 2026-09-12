@@ -97,6 +97,50 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
     return twins
 
 
+def require_matching_twins(faces: wp.array[wp.int32], twins: wp.array[wp.int32] | None) -> None:
+    """
+    Raise unless a precomputed twin table has one entry per halfedge of ``faces``.
+
+    The contract behind every ``twins=`` keyword in the package: the table is indexed *by halfedge*
+    (``h = 3 * f + k``), so it is meaningful only for the face buffer it was built from. A table
+    cached from a smaller mesh is not merely stale -- it is short, and the kernels that walk it
+    index past its end, which on the CPU device reads the host heap rather than raising. Public
+    because the functions that take the keyword live in three modules -- here,
+    [`triwarp.tangent_space`][triwarp.tangent_space] and
+    [`triwarp.selection`][triwarp.selection] -- and they must all reject the same call the same way.
+
+    The device half of the same contract is the caller's own
+    ``require_same_device`` call, which covers every argument it received rather than this pair
+    alone.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    twins
+        Candidate [`halfedge_twins`][triwarp.halfedge.halfedge_twins] table, or ``None``.
+
+    Raises
+    ------
+    ValueError
+        If ``twins`` is given and its length is not ``3 * n_faces``.
+
+    See Also
+    --------
+    [`halfedge_twins`][triwarp.halfedge.halfedge_twins]
+        Produces the table.
+    [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]
+    """
+    if twins is None:
+        return
+    n_halfedges = int(faces.shape[0]) // 3 * 3
+    if int(twins.shape[0]) != n_halfedges:
+        raise ValueError(
+            f"twins must have one entry per halfedge, got {twins.shape[0]} for {n_halfedges} "
+            f"halfedges ({n_halfedges // 3} faces)"
+        )
+
+
 def vertex_one_rings(
     faces: wp.array[wp.int32],
     twins: wp.array[wp.int32] | None = None,
@@ -143,18 +187,21 @@ def vertex_one_rings(
     Raises
     ------
     ValueError
-        If a vertex's rotation closes before its whole fan is covered — a pinched,
-        vertex-non-manifold vertex where two fans meet at a single index. Detecting this needs one
-        4-byte readback, so this function always synchronizes once.
+        If ``twins`` is given and does not have one entry per halfedge of ``faces``, or if a
+        vertex's rotation closes before its whole fan is covered — a pinched, vertex-non-manifold
+        vertex where two fans meet at a single index. Detecting the latter needs one 4-byte
+        readback, so this function always synchronizes once.
     RuntimeError
         If ``faces`` and ``twins`` are not all on one device.
 
     See Also
     --------
     [`halfedge_twins`][triwarp.halfedge.halfedge_twins]
+    [`require_matching_twins`][triwarp.halfedge.require_matching_twins]
     [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]
     """
     require_same_device(faces=faces, twins=twins)
+    require_matching_twins(faces, twins)
     device = faces.device
     n_halfedges = int(faces.shape[0]) // 3 * 3
 

@@ -249,6 +249,88 @@ def test_transfer_onto_vertices_vec3_field(device: str):
     assert np.allclose(transferred_wp.numpy(), closest_wp.numpy(), rtol=1e-4, atol=1e-4)
 
 
+def test_transfer_onto_vertices_vec2_field(device: str):
+    """
+    Triwarp against triwarp: a ``wp.vec2`` UV field transfers, and componentwise like two scalars.
+
+    Not a library comparison: pymeshlab's ``transfer_attributes_per_vertex`` moves its own named
+    attributes, not an arbitrary buffer, so there is no reference to hand a bare UV pair to. The
+    oracle is instead the ``wp.float32`` path this module already compares against pymeshlab --
+    the transfer is linear in the field, so a ``vec2`` result must equal its two scalar transfers
+    stacked, exactly.
+
+    The dtype is the point: ``transfer_through_operator`` accepts ``wp.vec2`` and is documented as
+    the one to prefer *when an operator exists*, which makes this the fallback for the same field.
+    It used to raise a bare ``KeyError`` from the overload table instead, while the module's own
+    docstring advertised "any Warp dtype closed under scaling and addition".
+    """
+    source_tm, target_tm = _transfer_meshes(device)
+    source_vertices_wp = points_to_warp(source_tm.vertices, device)
+    source_faces_wp = wp.array(
+        np.ascontiguousarray(source_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+    target_vertices_wp = points_to_warp(target_tm.vertices, device)
+
+    uv_np = np.ascontiguousarray(source_tm.vertices[:, :2], dtype=np.float32)
+    uv_wp = wp.array(uv_np, dtype=wp.vec2, device=device)
+    transferred_wp, _distance = tw.interpolation.transfer_onto_vertices(
+        source_vertices_wp, source_faces_wp, uv_wp, target_vertices_wp
+    )
+    assert transferred_wp.dtype == wp.vec2
+    assert float(np.ptp(transferred_wp.numpy())) > 1e-3, "a constant field compares vacuously"
+
+    for column in range(2):
+        scalar_wp = wp.array(
+            np.ascontiguousarray(uv_np[:, column]), dtype=wp.float32, device=device
+        )
+        scalar_transfer_wp, _distance = tw.interpolation.transfer_onto_vertices(
+            source_vertices_wp, source_faces_wp, scalar_wp, target_vertices_wp
+        )
+        assert np.array_equal(transferred_wp.numpy()[:, column], scalar_transfer_wp.numpy())
+
+
+def test_transfer_onto_vertices_survives_a_sliver_source_face(device: str):
+    """
+    Class B: against the source field's own linear form, which a sliver must not destroy.
+
+    A decimated or reconstructed source mesh -- the input this transfer exists for -- carries
+    slivers, and a face thin enough for Cramer's Gram determinant to cancel to zero in float32 made
+    the transferred value ``nan`` while the returned ``distance`` stayed finite, so the confidence
+    measure a caller checks reported a healthy hit on a poisoned value. The transform naming the
+    class is that the field is linear on the source, so its exact value at the closest point is
+    ``direction . closest`` -- computable without any barycentric solve at all, which is what makes
+    it an independent oracle rather than a restatement of the kernel.
+
+    The source is a single sliver rather than a mesh so the query has no well-shaped face to fall
+    back on; ``height`` is the one that reproduced the ``nan``.
+    """
+    height = 1e-5
+    vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, height, 0.0]], dtype=np.float32)
+    faces_np = np.array([0, 1, 2], dtype=np.int32)
+    direction_np = np.array([0.3, -0.6, 0.74])
+    values_np = np.ascontiguousarray(vertices_np @ direction_np, dtype=np.float32)
+    targets_np = np.array([[0.4, 0.2, 0.1], [0.7, -0.3, 0.0]], dtype=np.float32)
+
+    source_vertices_wp = points_to_warp(vertices_np, device)
+    source_faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    targets_wp = points_to_warp(targets_np, device)
+
+    transferred_wp, distance_wp = tw.interpolation.transfer_onto_vertices(
+        source_vertices_wp, source_faces_wp, values_wp, targets_wp
+    )
+    closest_wp, _distance, face_wp = tw.proximity.closest_point_on_mesh(
+        source_vertices_wp, source_faces_wp, targets_wp
+    )
+    assert np.all(face_wp.numpy() >= 0), "the query must land on the sliver, not miss it"
+    assert np.all(np.isfinite(distance_wp.numpy()))
+    assert np.all(np.isfinite(transferred_wp.numpy()))
+    expected_np = closest_wp.numpy().astype(np.float64) @ direction_np
+    assert np.allclose(transferred_wp.numpy(), expected_np, rtol=1e-4, atol=1e-4)
+
+
 def test_transfer_onto_vertices_misses_stay_zero(device: str):
     """A target beyond ``max_dist`` keeps the zero fill and reports ``inf``."""
     source_tm, _target_tm = _transfer_meshes(device)

@@ -1161,6 +1161,30 @@ def test_read_scalar_returns_a_detached_row_for_a_vector_dtype(device: str) -> N
     assert int(tw._device.read_scalar(counts_wp)) == 6
 
 
+def test_packers_reject_a_cross_device_sequence() -> None:
+    """
+    Triwarp against triwarp: a mixed-device sequence must be rejected, not silently migrated.
+
+    Not a library comparison: no reference library shares Warp's device model. The failure this
+    prevents is not a crash -- unlike ``combine.concatenate``, which launches a kernel and so
+    segfaults on a mismatch, these two only copy, and ``wp.copy`` transfers across devices happily.
+    Measured before the guard: ``concatenate([cpu, cuda])`` returned the right *values* on ``cpu``,
+    silently choosing the answer's device from whichever segment happened to be first and, with it,
+    the device of every launch built on the result downstream.
+
+    Both entry points are covered because the guard lives in the private body they share, so a
+    future caller that stopped delegating would keep passing a test that checked only one.
+    """
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to construct a mismatch")
+    cpu_wp = wp.array(np.arange(3, dtype=np.int32), dtype=wp.int32, device="cpu")
+    cuda_wp = wp.array(np.arange(3, dtype=np.int32), dtype=wp.int32, device="cuda:0")
+    for pack in (tw.array.concatenate, tw.array.pack_1d_arrays):
+        with pytest.raises(RuntimeError, match=r"'arrays\[0\]' is on .+ while 'arrays\[1\]' is on"):
+            pack([cpu_wp, cuda_wp])
+        pack([cpu_wp, cpu_wp])  # a same-device sequence still goes through
+
+
 def test_require_same_device_flags_a_mismatch_and_ignores_none(device: str) -> None:
     """
     Not a library comparison: ``_device.require_same_device`` has no reference-library equivalent.

@@ -10,7 +10,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_same_device
-from triwarp.halfedge import halfedge_twins
+from triwarp.halfedge import halfedge_twins, require_matching_twins
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import selection as kernel_selection
@@ -155,7 +155,8 @@ def faces_left_of_contour(
     TypeError
         If ``contour_edges`` is not a rank-2 ``wp.int32`` array.
     ValueError
-        If ``contour_edges`` does not have two columns.
+        If ``contour_edges`` does not have two columns, or if ``twins`` is given and does not have
+        one entry per halfedge of ``faces``.
     RuntimeError
         If ``faces``, ``contour_edges`` and ``twins`` are not all on one device.
 
@@ -177,6 +178,7 @@ def faces_left_of_contour(
         Turns the returned mask into a mesh.
     """
     require_same_device(faces=faces, contour_edges=contour_edges, twins=twins)
+    require_matching_twins(faces, twins)
     twt.ensure_edge_pairs(contour_edges, "contour_edges")
     device = faces.device
     n_faces = int(faces.shape[0]) // 3

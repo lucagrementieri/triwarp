@@ -3,7 +3,7 @@ from typing import Any
 import warp as wp
 
 from triwarp.kernels.array import OverloadTable, trilinear_cell, trilinear_corner, trilinear_weight
-from triwarp.kernels.triangles import face_vertices, point_barycentric_cramer
+from triwarp.kernels.triangles import face_vertices, point_barycentric_cross
 
 
 @wp.kernel
@@ -38,8 +38,14 @@ def transfer_onto_vertices(
     if f < 0:
         out_distance[i] = wp.float32(wp.INF)
         return
+    #
+    # The barycentric solve is the cross-product form, not ``point_barycentric_cramer``: a source
+    # face thin enough for Cramer's Gram determinant to cancel to zero in float32 would otherwise
+    # write ``nan`` here while ``out_distance[i]`` stayed finite, so the confidence measure this
+    # function returns would report a healthy hit on a poisoned value. Slivers are ordinary in a
+    # decimated or reconstructed source mesh, which is exactly the input this transfer exists for.
     v0, v1, v2 = face_vertices(source_vertices, source_faces, f)
-    bary = point_barycentric_cramer(v0, v1, v2, closest[i])
+    bary = point_barycentric_cross(v0, v1, v2, closest[i])
     a0, a1, a2 = face_vertices(source_values, source_faces, f)
     out_values[i] = a0 * bary[0] + a1 * bary[1] + a2 * bary[2]
 
@@ -168,14 +174,20 @@ def sample_grid_trilinear(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 4. Measured at 2 overloads across **3** module loads.
+# CLAUDE.md section 4.
 #
-# The dtype set is the one ``transfer_onto_vertices``'s own docstring promises -- "any Warp dtype
-# closed under scaling and addition works: ``wp.float32`` for a scalar, ``wp.vec3`` for a normal or
-# a colour" -- so registering exactly those two keeps the code and the documentation agreeing.
-# ``interpolate_from_points`` documents the same pair. ``apply_transfer_operator`` adds ``wp.vec2``,
-# since it is the one that carries a *stored attribute* through a topology edit and a UV pair is one
-# of the things such an attribute is. It cannot add ``wp.float64``: its weights are float32.
+# Field dtypes the three transfer kernels admit, and the whole set: every one of them scales the
+# field by a ``float32`` weight and sums, and Warp requires both operands of that product to share a
+# scalar type, so the admissible fields are exactly the ``float32``-scalar ones this package
+# transfers -- a scalar, a ``wp.vec2`` UV, a ``wp.vec3`` position / normal / colour. The three
+# tables register the same set because a caller who can move a UV through
+# ``transfer_through_operator`` must be able to move it through the closest-point transfer too; the
+# operator path is documented as the preferred one *when an operator exists*, which makes the other
+# two its fallback rather than a narrower API. A ``float64`` field is deliberately absent -- these
+# operators are assembled from ``float32`` vertex data, so carrying one would advertise precision
+# the weights do not have.
+_FIELD_DTYPES = (wp.float32, wp.vec2, wp.vec3)
+
 # The concrete handles keyed by the caller's value dtype -- see
 # [`OverloadTable`][triwarp.kernels.array.OverloadTable].
 APPLY_TRANSFER_OPERATOR: OverloadTable
@@ -198,7 +210,7 @@ def _register_overloads() -> None:
                 wp.array[d],
                 wp.array[d],
             ]
-            for d in (wp.float32, wp.vec2, wp.vec3)
+            for d in _FIELD_DTYPES
         },
     )
     SAMPLE_GRID_TRILINEAR = OverloadTable(
@@ -220,7 +232,7 @@ def _register_overloads() -> None:
                 wp.array[d],
                 wp.array[wp.float32],
             ]
-            for d in (wp.float32, wp.vec3)
+            for d in _FIELD_DTYPES
         },
     )
     INTERPOLATE_FROM_POINTS = OverloadTable(
@@ -234,7 +246,7 @@ def _register_overloads() -> None:
                 wp.float32,
                 wp.array[d],
             ]
-            for d in (wp.float32, wp.vec3)
+            for d in _FIELD_DTYPES
         },
     )
 

@@ -30,7 +30,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_same_device
-from triwarp.halfedge import halfedge_twins, vertex_one_rings
+from triwarp.halfedge import halfedge_twins, require_matching_twins, vertex_one_rings
 from triwarp.kernels import tangent_space as kernel_tangent_space
 
 
@@ -284,6 +284,8 @@ def halfedge_transport_angles(
 
     Raises
     ------
+    ValueError
+        If ``twins`` is given and does not have one entry per halfedge of ``faces``.
     RuntimeError
         If ``vertices``, ``faces``, ``twins`` and ``tangent_angles`` are not all on one device.
 
@@ -291,8 +293,10 @@ def halfedge_transport_angles(
     --------
     [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]
     [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames]
+    [`require_matching_twins`][triwarp.halfedge.require_matching_twins]
     """
     require_same_device(vertices=vertices, faces=faces, twins=twins, tangent_angles=tangent_angles)
+    require_matching_twins(faces, twins)
     device = vertices.device
     n_halfedges = int(faces.shape[0]) // 3 * 3
     rho = wp.empty(n_halfedges, dtype=wp.float32, device=device)

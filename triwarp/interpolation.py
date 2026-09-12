@@ -37,7 +37,15 @@ from triwarp.kernels import interpolation as kernel_interpolation
 from triwarp.kernels import scatter as kernel_scatter
 
 DType = TypeVar("DType")
-"""Element type of a transferred field: any Warp dtype closed under scaling and addition."""
+"""
+Element type of a transferred field: ``wp.float32``, ``wp.vec2`` or ``wp.vec3``.
+
+The set is bounded by the weights, which are ``float32``: Warp requires both operands of a product
+to share a scalar type, so a field whose scalar is not ``float32`` -- a ``float64`` one, say --
+cannot be scaled by them. A dtype outside the set raises ``KeyError`` naming the kernel rather than
+silently recompiling the module (``triwarp.kernels.array.OverloadTable`` -- kernel modules
+are not part of the rendered reference, so this one is not a link).
+"""
 
 
 def average_onto_faces(
@@ -248,8 +256,9 @@ def transfer_onto_vertices(
     source_faces
         Length-``3 * n_source_faces`` ``wp.int32`` source triangle index buffer.
     source_values
-        Length-``n_source`` field on the source vertices. Any Warp dtype closed under scaling and
-        addition works: ``wp.float32`` for a scalar, ``wp.vec3`` for a normal or a colour.
+        Length-``n_source`` field on the source vertices. ``wp.float32`` for a scalar, ``wp.vec2``
+        for a UV pair, ``wp.vec3`` for a normal or a colour; see
+        [`DType`][triwarp.interpolation.DType] for why those three and nothing else.
     target_vertices
         ``(n_target,)`` positions to sample at — usually another mesh's vertices, but any point set
         will do.
@@ -444,8 +453,9 @@ def interpolate_from_points(
     source_points
         ``(n_source,)`` positions the field is known at.
     source_values
-        Length-``n_source`` field on those points. Any Warp dtype closed under scaling and addition
-        works: ``wp.float32`` for a scalar, ``wp.vec3`` for a vector.
+        Length-``n_source`` field on those points. ``wp.float32`` for a scalar, ``wp.vec2`` for a
+        UV pair, ``wp.vec3`` for a vector; see [`DType`][triwarp.interpolation.DType] for why those
+        three and nothing else.
     query_points
         ``(n_query,)`` positions to interpolate at.
     radius

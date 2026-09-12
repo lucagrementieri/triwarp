@@ -28,9 +28,11 @@ from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import texture as kernel_texture
 
-# Owner sentinel: larger than any face index, so wp.atomic_min lets the lowest-index covering
-# face win each pixel. The kernels seed the same slot from ``INT32_MAX_CONSTANT``, so both sides
-# read the one constant rather than two copies of the literal.
+# Owner sentinel: larger than any face index, so the ``wp.atomic_min`` in ``rasterize_owner`` lets
+# the lowest-index covering face win each pixel. It is seeded here and nowhere else -- the kernels
+# never name it, testing ``owner[row, col] != f`` instead, which an uncovered pixel fails for every
+# face -- so this allocation is the whole contract and a caller reading the returned owner map back
+# compares against this value.
 _OWNER_SENTINEL = INT32_MAX
 
 

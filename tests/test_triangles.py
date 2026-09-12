@@ -726,6 +726,114 @@ def test_points_to_barycentric(hemisphere: tuple[tm.Trimesh, wp.Mesh], method: s
     assert np.allclose(barycentric_wp.numpy(), barycentric_igl, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("height", [1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7])
+def test_points_to_barycentric_cross_survives_slivers(device: str, height: float) -> None:
+    """
+    Class B: against a ``float64`` oracle of the same formula, so only the precision differs.
+
+    The two ``method`` values are not interchangeable on a sliver, which
+    ``test_points_to_barycentric`` cannot see because its fixture has no near-degenerate triangle.
+    Cramer's denominator is the Gram determinant ``|e0|^2 |e1|^2 - (e0 . e1)^2``, whose two terms
+    agree to more digits as the corner angle closes; in float32 it cancels to *exactly* zero while
+    the triangle still has positive area, and the row comes back ``nan``. ``"cross"`` forms the same
+    quantity as ``|e0 x e1|^2``, out of products that never cancel.
+
+    The oracle is the cross formula in float64 rather than trimesh or igl because both of those
+    return ``nan`` here too -- the question is which float32 *formulation* survives, and only an
+    exact evaluation of the same geometry can answer it. The sweep is the test: it pins where each
+    method fails, so a change that moved either boundary fails a cell rather than a tolerance.
+    """
+    vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, height, 0.0]], dtype=np.float32)
+    faces_np = np.array([0, 1, 2], dtype=np.int32)
+    point_np = np.array([[0.4, height * 0.5, 0.0]], dtype=np.float32)
+
+    corners = vertices_np.astype(np.float64)
+    e0, e1 = corners[1] - corners[0], corners[2] - corners[0]
+    w = point_np[0].astype(np.float64) - corners[0]
+    normal = np.cross(e0, e1)
+    inverse = 1.0 / np.dot(normal, normal)
+    b1 = np.dot(np.cross(w, e1), normal) * inverse
+    b2 = np.dot(np.cross(e0, w), normal) * inverse
+    oracle_np = np.array([1.0 - b1 - b2, b1, b2])
+    assert_nonconstant(oracle_np, 0.1)  # a constant answer would compare vacuously
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    point_wp = points_to_warp(point_np, device)
+    cross_wp = tw.triangles.points_to_barycentric(vertices_wp, faces_wp, point_wp, method="cross")
+    assert np.allclose(cross_wp.numpy()[0], oracle_np, rtol=1e-4, atol=1e-4)
+
+    cramer_wp = tw.triangles.points_to_barycentric(vertices_wp, faces_wp, point_wp, method="cramer")
+    cramer_np = cramer_wp.numpy()[0]
+    if height >= 1e-3:
+        assert np.allclose(cramer_np, oracle_np, rtol=1e-2, atol=1e-2)
+    else:
+        # Documented in ``points_to_barycentric``: Cramer loses the row entirely below this.
+        assert not np.all(np.isfinite(cramer_np))
+
+
+def test_points_to_barycentric_defaults_to_the_conditioned_method(device: str) -> None:
+    """
+    Triwarp against triwarp: the default ``method`` must be the one that survives a sliver.
+
+    Not a library comparison, and deliberately so -- this pins the one place this function does
+    *not* mirror [`trimesh.triangles.points_to_barycentric`][], whose default is ``"cramer"``. The
+    reason is in the wrapper's own docstring: a decimated or reconstructed mesh carries slivers, so
+    the trimesh default returns a silent ``nan`` on ordinary input. A test is what stops a later
+    pass from "restoring parity" with the reference and reintroducing that.
+
+    Asserted by behaviour rather than by reading the signature's default, so it holds however the
+    dispatch is spelled.
+    """
+    height = 1e-5
+    vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, height, 0.0]], dtype=np.float32)
+    faces_np = np.array([0, 1, 2], dtype=np.int32)
+    point_np = np.array([[0.4, height * 0.5, 0.0]], dtype=np.float32)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    point_wp = points_to_warp(point_np, device)
+
+    default_np = tw.triangles.points_to_barycentric(vertices_wp, faces_wp, point_wp).numpy()
+    cross_np = tw.triangles.points_to_barycentric(
+        vertices_wp, faces_wp, point_wp, method="cross"
+    ).numpy()
+    cramer_np = tw.triangles.points_to_barycentric(
+        vertices_wp, faces_wp, point_wp, method="cramer"
+    ).numpy()
+
+    assert not np.all(np.isfinite(cramer_np)), "the fixture must separate the two methods"
+    assert np.all(np.isfinite(default_np))
+    assert np.array_equal(default_np, cross_np)
+
+
+def test_points_to_barycentric_cross_on_a_zero_area_triangle(device: str) -> None:
+    """
+    Triwarp against triwarp: a triangle with exactly zero area has no barycentric frame.
+
+    Not a library comparison: trimesh and igl both divide by zero here and return a non-finite row,
+    which is the behaviour ``"cramer"`` keeps and the one this asserts it keeps. ``"cross"``
+    instead answers along the triangle's longest edge -- not an approximation, since a zero-area
+    triangle *is* that segment -- so the coordinates stay finite, sum to one, and reconstruct the
+    query point when it lies on the segment.
+    """
+    vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.25, 0.0, 0.0]], dtype=np.float32)
+    faces_np = np.array([0, 1, 2], dtype=np.int32)
+    point_np = np.array([[0.4, 0.0, 0.0]], dtype=np.float32)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    point_wp = points_to_warp(point_np, device)
+
+    cross_np = tw.triangles.points_to_barycentric(
+        vertices_wp, faces_wp, point_wp, method="cross"
+    ).numpy()[0]
+    assert np.all(np.isfinite(cross_np))
+    assert np.isclose(cross_np.sum(), 1.0, rtol=1e-5, atol=1e-5)
+    rebuilt_np = cross_np @ vertices_np.astype(np.float64)
+    assert np.allclose(rebuilt_np, point_np[0], rtol=1e-5, atol=1e-5)
+
+    cramer_np = tw.triangles.points_to_barycentric(
+        vertices_wp, faces_wp, point_wp, method="cramer"
+    ).numpy()[0]
+    assert not np.all(np.isfinite(cramer_np))
+
+
 def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     """
     Class A: the per-triangle closest point against ``trimesh.triangles.closest_point``.

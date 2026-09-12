@@ -46,6 +46,11 @@ def concatenate(
         Combined vertices and reindexed faces on the shared device. An empty sequence carries no
         device to share, so the empty result is allocated on Warp's **current** device.
 
+    Raises
+    ------
+    RuntimeError
+        If the given vertex and face buffers are not all on one device.
+
     See Also
     --------
     [`split`][triwarp.combine.split]
@@ -56,6 +61,7 @@ def concatenate(
         [`trimesh.util.concatenate`][], that one [`numpy.concatenate`][].
     [`trimesh.util.concatenate`][]
     """
+    require_same_device(meshes_data=list(meshes_data))
     if len(meshes_data) == 0:
         return wp.empty(0, dtype=wp.vec3), wp.empty(0, dtype=wp.int32)
 
@@ -182,8 +188,10 @@ def split_batched(
     faces_all : wp.array[wp.int32]
         Every component's reindexed flat faces, concatenated.
     face_offsets : wp.array[wp.int32]
-        Length-``k`` start of each component in ``faces_all`` **in faces, not indices**: component
-        ``g`` owns ``faces_all[3 * face_offsets[g] : 3 * face_offsets[g + 1]]``.
+        Length-``k`` start of each component in ``faces_all`` **in faces, not indices** (no
+        terminator, as for ``vertex_offsets``): component ``g`` owns
+        ``faces_all[3 * face_offsets[g] : 3 * face_offsets[g + 1]]``, and the last component runs
+        to the end of ``faces_all``.
 
     All four arrays are empty (and ``k == 0``) when ``n_faces == 0``.
 

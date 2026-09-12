@@ -232,3 +232,44 @@ def test_vertex_one_rings_empty(device: str) -> None:
     assert offsets_wp.shape == (1,)
     assert ring_wp.shape == (0,)
     assert is_boundary_wp.shape == (0,)
+
+
+def test_require_matching_twins_rejects_a_table_from_another_mesh(request) -> None:
+    """
+    Triwarp against triwarp: a ``twins=`` table built for a different mesh must be rejected.
+
+    Not a library comparison: no reference library exposes a caller-supplied halfedge twin table.
+    The table is indexed *by halfedge*, so one cached from a smaller mesh is short rather than
+    merely stale, and the kernels that walk it (``ring_start_halfedges``, ``write_one_rings``) index
+    past its end -- which on the CPU device reads the host heap silently rather than raising, the
+    hazard CLAUDE.md section 12.1 records. Parametrized over all three public ``twins=`` entry
+    points because the check is one shared validator and a site that skips it is invisible
+    otherwise.
+
+    The accepting arm is asserted too: the matching table must go through, or the guard would pass
+    by rejecting everything.
+    """
+    _, coarse_wp = request.getfixturevalue("icosahedron")
+    _, fine_wp = request.getfixturevalue("icosphere_coarse")
+    coarse_twins_wp = tw.halfedge.halfedge_twins(coarse_wp.indices)
+    fine_twins_wp = tw.halfedge.halfedge_twins(fine_wp.indices)
+    assert int(coarse_twins_wp.shape[0]) < int(fine_twins_wp.shape[0])
+
+    contour_wp = tw.selection.region_boundary_edges(
+        fine_wp.indices,
+        wp.array(
+            np.arange(int(fine_wp.indices.shape[0]) // 3) < 4, dtype=wp.bool, device=fine_wp.device
+        ),
+        oriented=True,
+    )
+    calls = (
+        lambda twins: tw.halfedge.vertex_one_rings(fine_wp.indices, twins=twins),
+        lambda twins: tw.tangent_space.halfedge_transport_angles(
+            fine_wp.points, fine_wp.indices, twins=twins
+        ),
+        lambda twins: tw.selection.faces_left_of_contour(fine_wp.indices, contour_wp, twins=twins),
+    )
+    for call in calls:
+        with pytest.raises(ValueError, match="one entry per halfedge"):
+            call(coarse_twins_wp)
+        call(fine_twins_wp)  # the matching table is accepted
