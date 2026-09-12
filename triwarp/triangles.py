@@ -539,10 +539,7 @@ def barycentric_to_points(
 
 
 def points_to_barycentric(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    points: wp.array[wp.vec3],
-    method: Literal["cross", "cramer"] = "cross",
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], points: wp.array[wp.vec3]
 ) -> wp.array[wp.vec3]:
     """
     Convert Cartesian points to barycentric coordinates, one triangle per row.
@@ -560,33 +557,16 @@ def points_to_barycentric(
     points
         Length-``n_faces`` query positions as ``wp.vec3``, aligned one-to-one with the
         triangles in ``faces``.
-    method
-        ``"cross"`` uses the cross-product-ratio formulation; ``"cramer"`` solves the 2x2 linear
-        system via Cramer's rule. They agree on a well-shaped triangle and **not on a sliver**:
-        Cramer's denominator is the Gram determinant ``|e0|^2 |e1|^2 - (e0 . e1)^2``, whose two
-        terms agree to more digits as the corner angle closes, so in float32 it cancels to exactly
-        zero while the triangle still has positive area and the row comes back ``nan``. ``"cross"``
-        forms the same quantity as ``|e0 x e1|^2``, from products that never cancel.
-
-        **The default is ``"cross"``, which is deliberately not
-        [`trimesh.triangles.points_to_barycentric`][]'s default**, the one other convention this
-        function mirrors. A decimated or reconstructed mesh carries slivers, so the trimesh default
-        would hand a caller who never read this paragraph a silent ``nan`` on ordinary input, and
-        the two cost the same -- both kernels are launch-bound, measured within 2 % of each other
-        from 20 000 to 200 000 triangles. Pass ``"cramer"`` explicitly for a bit-comparable answer.
 
     Returns
     -------
     wp.array[wp.vec3]
         Length-``n_faces`` barycentric coordinates ``(u, v, w)`` on ``vertices.device``. A triangle
-        with exactly zero area has no barycentric frame: ``"cross"`` answers it along the triangle's
-        longest edge (which is what the triangle is), where ``"cramer"`` divides by zero and yields
-        a non-finite row.
+        with exactly zero area has no barycentric frame; it is answered along the triangle's longest
+        edge, which is what such a "triangle" actually is.
 
     Raises
     ------
-    ValueError
-        If ``method`` is not one of the two names above.
     RuntimeError
         If ``vertices``, ``faces`` and ``points`` are not all on one device.
 
@@ -595,18 +575,25 @@ def points_to_barycentric(
     [`barycentric_to_points`][triwarp.triangles.barycentric_to_points]
         The inverse: recovers Cartesian points from barycentric coordinates.
     [`trimesh.triangles.points_to_barycentric`][]
+
+    Notes
+    -----
+    [`trimesh.triangles.points_to_barycentric`][] offers a ``method`` choice between a
+    cross-product ratio and Cramer's rule on the Gram system, and this function deliberately does
+    not: the two are algebraically equal, and the Cramer form is less accurate at every triangle
+    shape and scale measured and more accurate at none, returning wholly wrong *finite* values on
+    the slivers an ordinary decimated mesh carries. The two also cost the same, both being
+    launch-bound, so there was nothing to trade. The measured table is in
+    ``triwarp.kernels.triangles.point_barycentric``.
     """
     require_same_device(vertices=vertices, faces=faces, points=points)
-    if method == "cross":
-        kernel = kernel_triangles.points_to_barycentric_cross
-    elif method == "cramer":
-        kernel = kernel_triangles.points_to_barycentric_cramer
-    else:
-        raise ValueError(f"method must be 'cross' or 'cramer', got {method!r}")
     f = faces.shape[0] // 3
     out_barycentric = wp.empty(f, dtype=wp.vec3, device=vertices.device)
     wp.launch(
-        kernel, dim=f, inputs=[vertices, faces, points, out_barycentric], device=vertices.device
+        kernel_triangles.points_to_barycentric,
+        dim=f,
+        inputs=[vertices, faces, points, out_barycentric],
+        device=vertices.device,
     )
     return out_barycentric
 

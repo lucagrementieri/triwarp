@@ -544,12 +544,20 @@ def barycentric_gram(a: Any, b: Any, c: Any, p: Any) -> tuple[wp.Float, wp.Float
     from one body, which is why it exists: it was written twice, once per dimension, and verified
     equal on the unit triangle at both.
 
-    Undivided, and therefore guard-free, because **the two callers want different degenerate
-    policies and both are right**. A 2-D containment test wants a definite answer for a degenerate
-    triangle so that ``min(b) >= -eps`` rejects it without a separate area check; a 3-D projection
-    wants the division by zero, since an infinite coordinate is the caller's cue and the kernel form
-    has always behaved that way. Neither can be the shared default, so the shared function returns
-    the numbers and each caller decides -- the ``corner_cosines_from_l2`` convention.
+    Undivided, and therefore guard-free, so that a caller can apply its own degenerate policy:
+    [`barycentric_2d`][triwarp.kernels.predicates.barycentric_2d], its one caller today, wants a
+    definite answer for a degenerate triangle so that ``min(b) >= -eps`` rejects it without a
+    separate area check.
+
+    **It had a second caller, a 3-D projection by Cramer's rule, and that one is gone.** The Gram
+    determinant this returns is the ill-conditioned way to write a triangle's squared area: its two
+    terms agree to more digits as the corner angle closes, so the subtraction loses them and the
+    3-D coordinates came back ``nan`` on a sliver that still had positive area.
+    [`point_barycentric`][triwarp.kernels.triangles.point_barycentric] forms the same quantity as
+    ``|e0 x e1|^2`` instead and carries the measured comparison. **Do not reach for this to build a
+    3-D barycentric solve** -- the 2-D containment test is a different use, where ``p`` and the
+    triangle are coplanar by construction and the degenerate case is one the caller wants reported
+    rather than conditioned away.
     """
     e0 = b - a
     e1 = c - a

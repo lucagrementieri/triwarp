@@ -3,7 +3,7 @@ from typing import Any
 import warp as wp
 
 from triwarp.kernels.array import OverloadTable, trilinear_cell, trilinear_corner, trilinear_weight
-from triwarp.kernels.triangles import face_vertices, point_barycentric_cross
+from triwarp.kernels.triangles import face_vertices, point_barycentric
 
 
 @wp.kernel
@@ -39,13 +39,14 @@ def transfer_onto_vertices(
         out_distance[i] = wp.float32(wp.INF)
         return
     #
-    # The barycentric solve is the cross-product form, not ``point_barycentric_cramer``: a source
-    # face thin enough for Cramer's Gram determinant to cancel to zero in float32 would otherwise
-    # write ``nan`` here while ``out_distance[i]`` stayed finite, so the confidence measure this
-    # function returns would report a healthy hit on a poisoned value. Slivers are ordinary in a
-    # decimated or reconstructed source mesh, which is exactly the input this transfer exists for.
+    # ``point_barycentric``'s conditioning is load-bearing here, not incidental: a source face thin
+    # enough for the Gram-determinant form to cancel to zero in float32 would write ``nan`` into the
+    # field while ``out_distance[i]`` stayed finite, so the confidence measure this function returns
+    # would report a healthy hit on a poisoned value. Slivers are ordinary in a decimated or
+    # reconstructed source mesh, which is exactly the input this transfer exists for -- that is the
+    # defect that got the Gram form removed from the package outright.
     v0, v1, v2 = face_vertices(source_vertices, source_faces, f)
-    bary = point_barycentric_cross(v0, v1, v2, closest[i])
+    bary = point_barycentric(v0, v1, v2, closest[i])
     a0, a1, a2 = face_vertices(source_values, source_faces, f)
     out_values[i] = a0 * bary[0] + a1 * bary[1] + a2 * bary[2]
 

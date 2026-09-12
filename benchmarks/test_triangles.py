@@ -237,16 +237,18 @@ def test_face_quality(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="points_to_barycentric")
 @pytest.mark.benchlibs("triwarp", "trimesh", "igl")
-@pytest.mark.parametrize("method", ["cramer", "cross"])
-def test_points_to_barycentric(bench_case: BenchCase, method: str) -> None:
+def test_points_to_barycentric(bench_case: BenchCase) -> None:
     """
     One point per triangle, back to barycentric coordinates: the module's other soup operation.
 
-    triwarp's two ``method`` settings are two formulations of the same solve -- Cramer's rule on the
-    2x2 system against a ratio of cross products -- and they should not differ measurably, which is
-    what the pair checks. trimesh exposes the same choice and gets both ids; ``igl`` has one
-    formulation, so its two rows are identical by construction and sit there as the fixed bar (the
-    same convention as scipy's leaf-size rows in [`test_neighbors.py`](test_neighbors.py)).
+    Each library is timed at its own single formulation, which is what makes the three rows
+    comparable. This row used to be parametrized over triwarp's ``method``, because the package
+    offered Cramer's rule on the 2x2 Gram system alongside the cross-product ratio; that option is
+    gone, having been measured less accurate at every triangle shape and scale and more accurate at
+    none. **The parametrize is not worth keeping for the reference side alone**: the two
+    formulations were measured indistinguishable in cost -- interleaved A/B, min of 30, both at the
+    launch floor, 0.0274 against 0.0275 ms at 20 000 triangles and 0.0273 against 0.0267 at
+    200 000 -- so a second id per library would time the same thing twice under two names.
 
     The query points are the face barycentres, so every one lies in its triangle's plane: this
     measures the in-plane solve rather than a projection.
@@ -255,7 +257,7 @@ def test_points_to_barycentric(bench_case: BenchCase, method: str) -> None:
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         points = _barycentres_wp(bench_case)
         barycentric = bench_case.run(
-            lambda: tw.triangles.points_to_barycentric(vertices, faces, points, method=method)
+            lambda: tw.triangles.points_to_barycentric(vertices, faces, points)
         )
         assert barycentric.shape == (bench_case.n_faces,)
         return
@@ -273,7 +275,7 @@ def test_points_to_barycentric(bench_case: BenchCase, method: str) -> None:
         assert barycentric_igl.shape == (bench_case.n_faces, 3)
         return
     barycentric_tm = bench_case.run(
-        lambda: tm.triangles.points_to_barycentric(triangles_np, points_np, method=method)
+        lambda: tm.triangles.points_to_barycentric(triangles_np, points_np)
     )
     assert barycentric_tm.shape == (bench_case.n_faces, 3)
 

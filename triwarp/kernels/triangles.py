@@ -12,7 +12,6 @@ from triwarp.kernels.array import (
 )
 from triwarp.kernels.halfedge import halfedge_next, halfedge_prev
 from triwarp.kernels.predicates import (
-    barycentric_gram,
     segment_coordinate,
     side_lengths,
     triangle_aabb,
@@ -410,41 +409,36 @@ def barycentric_to_points(
 
 
 @wp.func
-def point_barycentric_cramer(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3, point: wp.vec3) -> wp.vec3:
-    # Barycentric coordinates of ``point`` projected into the plane of triangle (v0, v1, v2). A
-    # degenerate triangle makes the determinant zero and the result infinite, which is the caller's
-    # cue rather than this function's business (the kernel form has always behaved that way) -- so
-    # the division is here and not in the shared ``barycentric_gram``, whose 2-D caller wants the
-    # opposite policy.
-    #
-    # **Its one caller is the public ``method="cramer"``, which exists to mirror trimesh's default;
-    # anything else wants ``point_barycentric_cross`` below.** "Degenerate" understates how early
-    # this one gives up: the Gram determinant's two terms cancel, so it reaches exactly zero --
-    # and the row becomes ``nan`` -- while the triangle still has positive area. The sibling's
-    # docstring carries the measured boundary.
-    n1, n2, denom = barycentric_gram(v0, v1, v2, point)
-    inverse_denominator = 1.0 / denom
-    v = n1 * inverse_denominator
-    w = n2 * inverse_denominator
-    return wp.vec3(1.0 - v - w, v, w)
-
-
-@wp.func
-def point_barycentric_cross(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3, point: wp.vec3) -> wp.vec3:
+def point_barycentric(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3, point: wp.vec3) -> wp.vec3:
     """
-    Barycentric coordinates of ``point`` in triangle ``(v0, v1, v2)``, by cross-product ratios.
+    Barycentric coordinates of ``point`` projected into the plane of triangle ``(v0, v1, v2)``.
 
-    The conditioned alternative to
-    [`point_barycentric_cramer`][triwarp.kernels.triangles.point_barycentric_cramer], and the one to
-    reach for whenever the triangle's shape is not the caller's to choose. **The two are not
-    interchangeable on a sliver**: Cramer's denominator is the Gram determinant
-    ``|e0|^2 |e1|^2 - (e0 . e1)^2``, whose two terms agree to more and more digits as the corner
-    angle closes, so in float32 it cancels to *exactly zero* while the triangle still has positive
-    area -- and the coordinates come back ``nan``. The same quantity written as
-    ``|e0 x e1|^2`` is formed from products that never cancel. Measured on a unit-base triangle of
-    height ``h``, against a float64 oracle: the two agree to 4 digits at ``h = 1e-2``, Cramer has
-    lost 2 digits by ``1e-3`` and returns ``nan`` from ``1e-4`` down, while this form is still exact
-    at ``1e-7``.
+    The denominator is written ``|e0 x e1|^2``, from products that never cancel. **The obvious
+    alternative -- Cramer's rule on the Gram system, whose denominator is the algebraically equal
+    ``|e0|^2 |e1|^2 - (e0 . e1)^2`` -- was a second public ``method`` here and was removed, because
+    it is worse at every triangle shape and scale and better at none.** Its two terms agree to more
+    digits as the corner angle closes, so the subtraction loses them.
+
+    Measured against a ``float128`` oracle, 200 random interior points per cell, over base scales
+    ``1e-3`` / ``1`` / ``1e3`` crossed with unit-base triangle heights ``1`` down to ``1e-5`` --
+    worst absolute coordinate error, flat in the scale:
+
+    | height | this form | Cramer |
+    |---|---|---|
+    | 1 (well shaped) | 1.2e-07 | 1.9e-07 |
+    | 0.1 | 1.3e-07 | 4.6e-06 |
+    | 0.01 | 1.7e-07 | 5.0e-04 |
+    | 1e-3 | 2.0e-07 | 3.7e-02 |
+    | 1e-4 | 1.5e-07 | **2.20**, and ``nan`` in 150 of 200 |
+    | 1e-5 | 9.8e-08 | ``nan`` in 200 of 200 |
+
+    This form sits at ``float32`` eps in all 21 cells; Cramer degrades monotonically and, at
+    ``1e-4``, returns values that are *finite and wholly wrong*, which is worse than the ``nan``
+    below it because nothing downstream can detect it. The breakdown is not a ``float32`` artifact
+    -- the same sweep shows ``float128`` Cramer departing from the exact answer by 1.9e-10 at
+    ``h = 1e-5`` -- so no widening rescues it. The two cost the same: interleaved A/B, min of 30,
+    both at the launch floor, 0.0274 against 0.0275 ms at 20 000 triangles and 0.0273 against
+    0.0267 at 200 000.
 
     Zero area -- a triangle that really is a segment or a point, not merely a thin one -- is
     answered rather than forwarded as an infinity: the coordinates are then taken along the longest
@@ -475,7 +469,7 @@ def point_barycentric_cross(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3, point: wp.vec
 
 
 @wp.kernel
-def points_to_barycentric_cramer(
+def points_to_barycentric(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     points: wp.array[wp.vec3],
@@ -483,19 +477,7 @@ def points_to_barycentric_cramer(
 ) -> None:
     f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices(vertices, faces, f)
-    out_barycentric[f] = point_barycentric_cramer(v0, v1, v2, points[f])
-
-
-@wp.kernel
-def points_to_barycentric_cross(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    points: wp.array[wp.vec3],
-    out_barycentric: wp.array[wp.vec3],
-) -> None:
-    f = wp.int32(wp.tid())
-    v0, v1, v2 = face_vertices(vertices, faces, f)
-    out_barycentric[f] = point_barycentric_cross(v0, v1, v2, points[f])
+    out_barycentric[f] = point_barycentric(v0, v1, v2, points[f])
 
 
 @wp.kernel
