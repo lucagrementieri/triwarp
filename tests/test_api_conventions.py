@@ -37,6 +37,7 @@ from tests.api_conventions import (
     _is_int_expression,
     _is_tid_call,
     _kernel_scope_functions,
+    admonition_placement_problems,
     allocation_device_problems,
     array_annotation_style_problems,
     bare_annotation_problems,
@@ -860,3 +861,27 @@ def test_claude_references_name_a_section_that_exists() -> None:
         "CLAUDE.md cross-reference(s) naming a stale or under-specified section:",
         claude_section_reference_problems(),
     )
+
+
+def test_admonitions_stay_out_of_numpydoc_item_sections() -> None:
+    """
+    A MkDocs ``!!!`` admonition sits in free prose, never between two entries of a section.
+
+    Not a library comparison: this is a property of triwarp's own docstrings. Check 25, and like
+    the section-number check above it is a staleness half rather than a convention half -- every
+    one of the eight sites it was written for reads perfectly in the source and renders wrongly.
+
+    **The failure is griffe's parse, and it was confirmed rather than assumed.** Loading a function
+    whose ``Raises`` block holds an admonition returns *three* raises entries, the middle one
+    carrying the literal string ``!!! note "Some caveat"`` where an exception annotation belongs --
+    so the published page grows a row for a type that does not exist, with the admonition's body as
+    its description, and the warning never renders as a warning. ``mkdocs build --strict`` stays
+    clean throughout, because every cross-reference in the swallowed text still resolves.
+
+    The eight were six ``Raises`` blocks, one ``Returns`` and one more ``Raises``, across
+    ``holes``, ``proximity``, ``sample``, ``smoothing`` and ``voxels`` -- and the clustering is the
+    reusable part: an author writes the caveat where the thought occurs, and the thought occurs
+    while documenting what the function rejects. All eight moved to ``Notes`` with no loss of
+    meaning, which is why the check ships with an empty allowlist and no allowlist machinery.
+    """
+    _fail("docstring section(s) holding a misplaced admonition:", admonition_placement_problems())

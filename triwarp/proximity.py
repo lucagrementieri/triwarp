@@ -393,15 +393,6 @@ def mesh_to_mesh_distance(
     ------
     ValueError
         If ``upper_bound`` is negative.
-
-    !!! note "Witness faces are ambiguous under ties"
-        Two parallel plates have a continuum of closest pairs and any of them is a correct answer,
-        and ties are the common case rather than the exotic one: whenever the closest approach is
-        realised at a *vertex*, every face around that vertex achieves the minimum exactly. The
-        tie-break on ``face_a`` is the lowest index; ``face_b`` is **unspecified** among the faces
-        attaining it, and which one comes back can differ between runs of the identical input even
-        though the squared distance is bit-identical. Compare *distances* against another
-        implementation, and faces only where the configuration is generic.
     RuntimeError
         If ``vertices_a``, ``faces_a``, ``vertices_b`` and ``faces_b`` are not all on one device.
 
@@ -413,6 +404,17 @@ def mesh_to_mesh_distance(
         The zero-distance case in detail: every intersecting pair and the segments they cross on.
     [`face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask]
         The one-mesh analogue of that.
+
+    Notes
+    -----
+    !!! note "Witness faces are ambiguous under ties"
+        Two parallel plates have a continuum of closest pairs and any of them is a correct answer,
+        and ties are the common case rather than the exotic one: whenever the closest approach is
+        realised at a *vertex*, every face around that vertex achieves the minimum exactly. The
+        tie-break on ``face_a`` is the lowest index; ``face_b`` is **unspecified** among the faces
+        attaining it, and which one comes back can differ between runs of the identical input even
+        though the squared distance is bit-identical. Compare *distances* against another
+        implementation, and faces only where the configuration is generic.
     """
     require_same_device(
         vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b

@@ -660,6 +660,15 @@ def resolve_voxel_grid(
         If ``voxel_size`` is passed and is not positive. A derived one never trips this: the
         zero-extent fallback above is what keeps the guard about the caller's argument.
 
+    See Also
+    --------
+    [`voxelize_points`][triwarp.voxels.voxelize_points]
+    [`cell_indices`][triwarp.voxels.cell_indices]
+    [`cluster_decimate`][triwarp.remesh.cluster_decimate]
+    [`sample.resolve_seed`][triwarp.sample.resolve_seed]
+
+    Notes
+    -----
     !!! note "The ``resolve_*`` pattern"
         Both of these -- this and [`sample.resolve_seed`][triwarp.sample.resolve_seed] /
         [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid] -- turn an optional
@@ -671,13 +680,6 @@ def resolve_voxel_grid(
         only the *pairing rule* is worth sharing and
         [`adjacency.require_paired_adjacency`][triwarp.adjacency.require_paired_adjacency] is that
         rule on its own.
-
-    See Also
-    --------
-    [`voxelize_points`][triwarp.voxels.voxelize_points]
-    [`cell_indices`][triwarp.voxels.cell_indices]
-    [`cluster_decimate`][triwarp.remesh.cluster_decimate]
-    [`sample.resolve_seed`][triwarp.sample.resolve_seed]
     """
     if voxel_size is None or origin is None:
         if int(points.shape[0]) == 0:

@@ -2057,3 +2057,83 @@ def claude_section_reference_problems() -> list[str]:
         if key not in seen
     )
     return problems
+
+
+# --- check 25 -----------------------------------------------------------------------------------
+
+# The numpydoc sections that are *item lists*: a header, a rule of dashes, then one entry per line
+# with its description indented under it. An admonition between two entries of one of these is the
+# defect; ``Notes``, ``Examples``, ``Warnings`` and the leading description are free prose and are
+# where an admonition belongs.
+_NUMPYDOC_ITEM_SECTIONS = frozenset(
+    {"Parameters", "Returns", "Yields", "Receives", "Raises", "Warns", "Attributes", "See Also"}
+)
+_SECTION_RULE = re.compile(r"^-{3,}$")
+
+
+def admonition_placement_problems() -> list[str]:
+    """
+    Check 25: a MkDocs ``!!!`` admonition inside a numpydoc *item-list* section.
+
+    griffe parses a numpydoc section by reading each entry's first line as a name -- a parameter
+    name, an exception type -- so an ``!!! note "..."`` header sitting between two entries of a
+    ``Raises`` block becomes an **exception type** on the rendered API page, and the admonition's
+    own body is swallowed as that exception's description. The page grows a row for a type that
+    does not exist and the warning the author wrote never renders as one. Nothing else sees it:
+    ``mkdocs build --strict`` is clean, because every cross-reference in the swallowed text still
+    resolves, and ruff's ``D`` rules do not model section contents.
+
+    It had decayed to **eight** sites across six modules before anyone looked, six of them in the
+    ``Raises`` block of a function whose caveat is genuinely worth reading -- which is the tell
+    that this is a convention people get wrong rather than a rule they flout: an admonition is
+    written where the thought occurs, and the thought occurs while documenting what the function
+    rejects.
+
+    **It ships with no allowlist, deliberately.** Unlike the section-number check above there is no
+    legitimate instance to exempt: an item-list section is a list of items, and every admonition
+    has a correct home one section down (``Notes``) or in the leading description, with no loss of
+    meaning and no reordering of anything a caller reads first. An allowlist here would only ever
+    hold a site nobody had moved yet.
+
+    Scans every module under ``triwarp/``, ``kernels/`` included. Nothing in ``kernels/`` renders,
+    so a hit there is cosmetic rather than a broken page -- but the convention is the same one, the
+    scan is the same scan, and a rule that holds in one half of the tree and not the other is a
+    rule the next reader has to look up.
+
+    **What it deliberately does not catch is the general case, which is any free prose between two
+    entries** -- a plain sentence appended to a ``Returns`` block becomes a third, *nameless*
+    return, confirmed the same way. Only the ``!!!`` form is scanned, because separating stray
+    prose from an entry's own indented continuation needs the indentation rules numpydoc itself is
+    loose about, and a check that guesses there would misfire on correct docstrings. The admonition
+    form is the one that decayed, and it is unambiguous.
+    """
+    problems: list[str] = []
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        site = path.relative_to(_REPO_ROOT)
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # check 12 and the suite itself report an unparseable module
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef):
+                continue
+            docstring = ast.get_docstring(node, clean=False)
+            if docstring is None or "!!!" not in docstring:
+                continue
+            first_line = 1 if isinstance(node, ast.Module) else node.body[0].lineno
+            lines = docstring.splitlines()
+            section: str | None = None
+            for index, line in enumerate(lines):
+                stripped = line.strip()
+                if _SECTION_RULE.fullmatch(stripped) and index:
+                    section = lines[index - 1].strip()
+                    continue
+                if stripped.startswith("!!!") and section in _NUMPYDOC_ITEM_SECTIONS:
+                    name = getattr(node, "name", "<module>")
+                    problems.append(
+                        f"{site}:{first_line + index}: {name}'s {section!r} block holds an "
+                        f"admonition ({stripped.split(chr(34))[0].strip()}) -- griffe reads its "
+                        "header as an entry name, so the page grows a bogus row and the "
+                        "admonition never renders. Move it to Notes or to the description"
+                    )
+    return problems

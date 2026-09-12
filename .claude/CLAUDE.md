@@ -40,7 +40,7 @@ Two conventions that hold throughout:
 3. [Python-scope wrappers](#3-python-scope-wrappers) — layout, `triwarp.typing`, allocation, gather,
    `wp.map`, dtype conversion, `BsrMatrix`, the NumPy policy, device rules, readbacks
 4. [Evolving the public API](#4-evolving-the-public-api) — naming, signatures, docstring agreement,
-   moving/renaming, the 24 mechanical checks
+   moving/renaming, the 25 mechanical checks
 5. [Function ordering within a module](#5-function-ordering-within-a-module)
 6. [Documentation](#6-documentation-mkdocs--mkdocstrings)
 7. [Testing](#7-testing) — conventions, devices, fixtures, the parity gate, shared helpers, the nine
@@ -1296,7 +1296,7 @@ a targeted per-file run does not — a rename is not done until the whole suite 
 
 ### 4.5 The mechanical gate: `tests/api_conventions.py`
 
-**Twenty-four checks**, and they fail the default `pytest` run.
+**Twenty-five checks**, and they fail the default `pytest` run.
 
 - **Eight scan the public surface of `triwarp/` (excluding `kernels/`)**: a summary line naming a
   reference library (1); a `*_mask` producer that does not return `wp.array[wp.bool]` (2); a module
@@ -1375,6 +1375,21 @@ a targeted per-file run does not — a rename is not done until the whole suite 
   in the pass that added it: a reference naming the file in one sentence and the number in the
   next, and a bare `section N` belonging to a *paper* — `kernels/remesh.py` cites "Liepa 2003,
   section 3", and widening the pattern to catch the first misfires on the second.
+- **Check 25**: a MkDocs `!!!` admonition inside a numpydoc **item-list** section — `Parameters`,
+  `Returns`, `Yields`, `Receives`, `Raises`, `Warns`, `Attributes` or `See Also` (§6). griffe reads
+  each entry's first line as a *name*, so an `!!! note "..."` header between two `Raises` entries
+  becomes an exception type: confirmed by loading such a function and getting **three** raises
+  entries, the middle one carrying the literal string where an annotation belongs. The published
+  page grows a row for a type that does not exist, the admonition's body becomes that row's
+  description, and the warning never renders as a warning. Nothing else sees it — `mkdocs build
+  --strict` stays clean, because every cross-reference in the swallowed text still resolves, and
+  ruff's `D` rules do not model section contents. It had decayed to **eight** sites in five modules
+  (`holes`, `proximity`, `sample`, `smoothing`, `voxels`), seven of them in a `Raises` block, and
+  the clustering is the lesson: an author writes the caveat where the thought occurs, and the
+  thought occurs while documenting what the function rejects. **It ships with no allowlist and no
+  allowlist machinery**, because unlike check 24 there is no legitimate instance — every admonition
+  has a correct home in `Notes` or in the leading description, with no loss of meaning and no
+  reordering of anything a caller reads first.
 
 Each check carries a written allowlist — read the reason before adding an entry, and prefer fixing
 the code. **The gate does not replace review**: it cannot tell whether a *new* name is a good one,
@@ -1510,6 +1525,11 @@ under MkDocs.
 - Before adding a new external inventory to `mkdocs.yml`, verify it serves an `objects.inv`
   (`curl -I <url>/objects.inv`).
 - RST admonitions (`.. note::`) don't exist in Markdown — use MkDocs Material's `!!! note`.
+- **An admonition goes in free prose — the leading description, `Notes` or `Examples` — never
+  inside `Parameters` / `Returns` / `Raises` / `See Also` or any other item-list section**
+  (check 25, §4.5). griffe reads each entry's first line as a name, so an admonition header
+  between two `Raises` entries renders as an *exception type* and its body as that type's
+  description. `mkdocs build --strict` cannot see it, and it had reached eight sites.
 - Module-level constants / type aliases without their own docstring are only linkable because
   `show_if_no_docstring: true` is set; don't remove that option without re-checking
   `triwarp/constants.py` and `triwarp/typing.py` cross-refs.

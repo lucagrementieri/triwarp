@@ -630,12 +630,6 @@ def equalize_triangle_areas(
     ValueError
         If ``iterations`` is negative, if ``max_displacement`` is negative, or if ``region`` is not
         a length-``n_vertices`` ``wp.bool`` array.
-
-    !!! note "It equalizes areas, not shapes"
-        Nothing here bounds a triangle's aspect ratio, and a long thin triangle can have exactly the
-        right area. For shape, flip the triangulation
-        ([`flip_by_objective`][triwarp.remesh.flip_by_objective]) or remesh
-        ([`isotropic_remesh`][triwarp.remesh.isotropic_remesh]); this moves vertices only.
     RuntimeError
         If ``vertices``, ``faces``, ``region`` and ``vertex_faces`` are not all on one device.
 
@@ -647,6 +641,14 @@ def equalize_triangle_areas(
         The plain diffusion this is the area-driven alternative to.
     [`isotropic_remesh`][triwarp.remesh.isotropic_remesh]
         Equalizes edge *lengths*, by changing the connectivity as well.
+
+    Notes
+    -----
+    !!! note "It equalizes areas, not shapes"
+        Nothing here bounds a triangle's aspect ratio, and a long thin triangle can have exactly the
+        right area. For shape, flip the triangulation
+        ([`flip_by_objective`][triwarp.remesh.flip_by_objective]) or remesh
+        ([`isotropic_remesh`][triwarp.remesh.isotropic_remesh]); this moves vertices only.
     """
     require_same_device(vertices=vertices, faces=faces, region=region, vertex_faces=vertex_faces)
     device = vertices.device
@@ -851,12 +853,6 @@ def relax_approx(
         If ``iterations`` is negative, if ``dilate_radius`` is not positive, if
         ``max_displacement`` is negative, if ``fit`` is not one of the two names, or if ``region``
         is not a length-``n_vertices`` ``wp.bool`` array.
-
-    !!! note "A vertex with too small a ball does not move"
-        A plane fit needs three independent points and the quadric six, so a vertex whose ball holds
-        fewer than six vertices is left exactly where it is rather than fitted to whatever it has.
-        On a mesh whose edges are longer than ``dilate_radius`` that is *every* vertex and the call
-        returns the input -- check the result moved before concluding the parameters were right.
     RuntimeError
         If ``vertices``, ``faces`` and ``region`` are not all on one device.
 
@@ -867,6 +863,14 @@ def relax_approx(
     [`principal_curvature`][triwarp.curvature.principal_curvature]
         Fits a quadric over the same geodesic balls, to measure rather than to move.
     [`geodesic_ball`][triwarp.neighbors.geodesic_ball]
+
+    Notes
+    -----
+    !!! note "A vertex with too small a ball does not move"
+        A plane fit needs three independent points and the quadric six, so a vertex whose ball holds
+        fewer than six vertices is left exactly where it is rather than fitted to whatever it has.
+        On a mesh whose edges are longer than ``dilate_radius`` that is *every* vertex and the call
+        returns the input -- check the result moved before concluding the parameters were right.
     """
     require_same_device(vertices=vertices, faces=faces, region=region)
     if fit not in ("planar", "quadric"):
@@ -2036,15 +2040,6 @@ def smooth_region_boundary(
     ValueError
         If ``iterations`` is negative, or if ``region`` is not a length-``n_faces`` ``wp.bool``
         array.
-
-    !!! note "It slides vertices; it does not re-cut the rim"
-        The rim can only become as smooth as the *existing* triangulation lets it: a vertex slides
-        to the level set but the rim still passes through the same vertices, so a curve that wants
-        to cross a triangle diagonally cannot. Retriangulating the band first
-        ([`flip_by_objective`][triwarp.remesh.flip_by_objective], or
-        [`split_faces_along_field`][triwarp.intersection.split_faces_along_field] to cut along the
-        level set outright) is the way to get past that, and is deliberately not folded in here --
-        it changes the face buffer, which this promises not to.
     RuntimeError
         If ``vertices``, ``faces``, ``region`` and ``vertex_faces`` are not all on one device.
 
@@ -2056,6 +2051,17 @@ def smooth_region_boundary(
         Smooths inside the rim, holding it fixed.
     [`region_boundary_edges`][triwarp.selection.region_boundary_edges]
         The rim as an edge list, which is what this leaves in a better place.
+
+    Notes
+    -----
+    !!! note "It slides vertices; it does not re-cut the rim"
+        The rim can only become as smooth as the *existing* triangulation lets it: a vertex slides
+        to the level set but the rim still passes through the same vertices, so a curve that wants
+        to cross a triangle diagonally cannot. Retriangulating the band first
+        ([`flip_by_objective`][triwarp.remesh.flip_by_objective], or
+        [`split_faces_along_field`][triwarp.intersection.split_faces_along_field] to cut along the
+        level set outright) is the way to get past that, and is deliberately not folded in here --
+        it changes the face buffer, which this promises not to.
     """
     require_same_device(vertices=vertices, faces=faces, region=region, vertex_faces=vertex_faces)
     if iterations < 0:

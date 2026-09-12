@@ -826,6 +826,14 @@ def resolve_seed(seed: int | None) -> int:
     int
         ``seed`` unchanged when provided, otherwise a random value in ``[0, 2**31)``.
 
+    See Also
+    --------
+    [`sample_surface`][triwarp.sample.sample_surface]
+    [`random_soup`][triwarp.creation.random_soup]
+    [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid]
+
+    Notes
+    -----
     !!! note "The ``resolve_*`` pattern"
         Both of these -- this and [`sample.resolve_seed`][triwarp.sample.resolve_seed] /
         [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid] -- turn an optional
@@ -837,12 +845,6 @@ def resolve_seed(seed: int | None) -> int:
         only the *pairing rule* is worth sharing and
         [`adjacency.require_paired_adjacency`][triwarp.adjacency.require_paired_adjacency] is that
         rule on its own.
-
-    See Also
-    --------
-    [`sample_surface`][triwarp.sample.sample_surface]
-    [`random_soup`][triwarp.creation.random_soup]
-    [`voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid]
     """
     if seed is None:
         return secrets.randbelow(2**31)
