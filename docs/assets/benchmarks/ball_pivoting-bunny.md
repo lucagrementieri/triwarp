@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 | Library | Median |
 |---|---|
 | triwarp (CUDA) | 44.31 ms |

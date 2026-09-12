@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 | Library | Median |
 |---|---|
 | PyTorch3D (CUDA) | 3.07 ms |

@@ -216,6 +216,17 @@ def render_cell(
 
     stem = _slugify(aggregate.cell_label(key))
     table_lines = [
+        # These tables land inside ``docs_dir`` so each one sits beside the chart it describes,
+        # but they are data for the full-results appendix rather than nav pages, and nothing
+        # links to them -- ``docs/benchmarks.md`` embeds only the PNGs. The docs builder has no
+        # whole-file exclusion setting, so the page is built either way; this front matter is
+        # what keeps it out of the search index, where it would otherwise surface a raw
+        # benchmark table for any query matching a mesh or library name.
+        "---",
+        "search:",
+        "  exclude: true",
+        "---",
+        "",
         "| Library | Median |",
         "|---|---|",
         *(

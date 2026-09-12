@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 | Library | Median |
 |---|---|
 | MeshLib | 31.55 ms |

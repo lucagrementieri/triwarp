@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 | Library | Median |
 |---|---|
 | PyVista | 2.83 ms |
