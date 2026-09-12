@@ -14,12 +14,18 @@ from triwarp.kernels.grouping import sorted_run_start
 
 
 @wp.func
-def atomic_add_vec3(out_sum: wp.array2d[wp.float64], row: wp.int32, v: wp.vec3) -> None:
+def atomic_add_vec3(out_sum: wp.array2d[wp.Float], row: wp.int32, v: wp.vec3) -> None:
     # Component-wise atomic accumulation of a wp.vec3 into row ``row`` of a (n, 3) buffer.
     #
-    # **The accumulator is float64 while the values are float32, and that is what makes the sum
-    # reproducible.** A float atomic's summation order is whatever the scheduler hands it, and
-    # float addition is not associative, so a float32 accumulator's answer moves by about one ULP
+    # ``out_sum.dtype(...)`` is the conversion, and it is required rather than cosmetic: Warp does
+    # **not** promote a float32 value into a float64 accumulator, and ``wp.atomic_add`` with the
+    # two mismatched fails at kernel-parse time (probed on Warp 1.17). Reading the array's dtype
+    # in kernel scope costs nothing -- unlike ``type(out_sum[row, 0])(...)``, the other spelling
+    # that works, which loads the element it is about to update just to name its type.
+    #
+    # **Every caller today accumulates at float64 while its values are float32, and that is what
+    # makes the sum reproducible.** A float atomic's summation order is whatever the scheduler
+    # hands it, and float addition is not associative, so a float32 accumulator moves by about a ULP
     # (measured 1.19e-07 on vertex normals) between runs of the identical launch. That is
     # harmless in itself and is not harmless downstream: ``curvature.principal_curvature`` fits an
     # ill-conditioned quadric to these normals and turns it into swings of up to **77 %** of the
@@ -36,9 +42,9 @@ def atomic_add_vec3(out_sum: wp.array2d[wp.float64], row: wp.int32, v: wp.vec3) 
     # win being the launch the fused narrow-and-normalize tail removes (a float32 accumulator could
     # reach ``wp.vec3`` through a zero-copy ``array_cast``, a float64 one cannot), and the loss
     # being the wider atomics once the call stops being launch-bound. The (n, 3) buffer doubles.
-    wp.atomic_add(out_sum, row, 0, wp.float64(v[0]))
-    wp.atomic_add(out_sum, row, 1, wp.float64(v[1]))
-    wp.atomic_add(out_sum, row, 2, wp.float64(v[2]))
+    wp.atomic_add(out_sum, row, 0, out_sum.dtype(v[0]))
+    wp.atomic_add(out_sum, row, 1, out_sum.dtype(v[1]))
+    wp.atomic_add(out_sum, row, 2, out_sum.dtype(v[2]))
 
 
 @wp.kernel
@@ -102,7 +108,7 @@ def scatter_sum_scalar(
 
 @wp.kernel
 def scatter_sum_vec(
-    values: wp.array[wp.vec3], indices: wp.array2d[wp.int32], out_sum: wp.array2d[wp.float64]
+    values: wp.array[wp.vec3], indices: wp.array2d[wp.int32], out_sum: wp.array2d[wp.Float]
 ) -> None:
     tid = wp.int32(wp.tid())
     index = indices[tid]
@@ -116,7 +122,7 @@ def scatter_weighted_sum_vec(
     values: wp.array[wp.vec3],
     indices: wp.array2d[wp.int32],
     weights: wp.array2d[wp.float32],
-    out_sum: wp.array2d[wp.float64],
+    out_sum: wp.array2d[wp.Float],
 ) -> None:
     tid = wp.int32(wp.tid())
     index = indices[tid]
@@ -421,6 +427,12 @@ _VALUE_DTYPES = (wp.float32, wp.float64)
 # -- so the ``wp.float64`` and ``wp.vec3`` rows registered beside them were compile time paid on
 # every rebuild for an overload nothing can reach.
 _SCATTER_ADD_DTYPES = (wp.float32, wp.vec2d)
+# The two vector scatters get a set of **one**, for the same reason: their only caller is
+# ``vertices._accumulate_and_normalize``, which accumulates at ``wp.float64`` so that the summation
+# order the atomics pick cannot reach the answer (see ``atomic_add_vec3``). The kernels stay generic
+# over the accumulator anyway, so a float32 caller is a row here rather than a second kernel -- but
+# registering that row today would be an overload nothing launches, paid for on every rebuild.
+_VECTOR_ACCUMULATOR_DTYPES = (wp.float64,)
 
 
 # ``splat_grid_trilinear``'s dtype set is the pair its wrapper
@@ -443,12 +455,15 @@ SCATTER_ADD: OverloadTable
 SCATTER_FACE_THIRDS: OverloadTable
 SCATTER_OFFSET_SUM: OverloadTable
 SCATTER_SUM_SCALAR: OverloadTable
+SCATTER_SUM_VEC: OverloadTable
+SCATTER_WEIGHTED_SUM_VEC: OverloadTable
 
 
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
     global DIVIDE_BY_DENSITY, SPLAT_GRID_TRILINEAR, SCATTER_ADD
     global SCATTER_FACE_THIRDS, SCATTER_OFFSET_SUM, SCATTER_SUM_SCALAR
+    global SCATTER_SUM_VEC, SCATTER_WEIGHTED_SUM_VEC
     DIVIDE_BY_DENSITY = OverloadTable(
         divide_by_density,
         {d: [wp.array3d[wp.float32], wp.float32, wp.array3d[d]] for d in _GRID_DTYPES},
@@ -485,6 +500,20 @@ def _register_overloads() -> None:
     SCATTER_SUM_SCALAR = OverloadTable(
         scatter_sum_scalar,
         {d: [wp.array2d[d], wp.array2d[wp.int32], wp.array[d]] for d in _VALUE_DTYPES},
+    )
+    SCATTER_SUM_VEC = OverloadTable(
+        scatter_sum_vec,
+        {
+            d: [wp.array[wp.vec3], wp.array2d[wp.int32], wp.array2d[d]]
+            for d in _VECTOR_ACCUMULATOR_DTYPES
+        },
+    )
+    SCATTER_WEIGHTED_SUM_VEC = OverloadTable(
+        scatter_weighted_sum_vec,
+        {
+            d: [wp.array[wp.vec3], wp.array2d[wp.int32], wp.array2d[wp.float32], wp.array2d[d]]
+            for d in _VECTOR_ACCUMULATOR_DTYPES
+        },
     )
 
 

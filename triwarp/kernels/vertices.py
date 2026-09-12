@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.kernels.array import OverloadTable
 from triwarp.kernels.triangles import triangle_cross
 
 
@@ -47,11 +48,9 @@ def max_corner_inverse_edge_length_sq(
 
 
 @wp.kernel
-def normalize_accumulated_rows(
-    sums: wp.array2d[wp.float64], out_normals: wp.array[wp.vec3]
-) -> None:
+def normalize_accumulated_rows(sums: wp.array2d[wp.Float], out_normals: wp.array[wp.vec3]) -> None:
     """
-    Unit-normalize each row of an ``(n, 3)`` ``float64`` accumulator into a ``wp.vec3``.
+    Unit-normalize each row of an ``(n, 3)`` accumulator into a ``wp.vec3``.
 
     The tail of ``vertices._accumulate_and_normalize``, and the reason its accumulator can be
     ``float64`` while its answer is ``float32``: it narrows and normalizes in one pass, where the
@@ -59,13 +58,46 @@ def normalize_accumulated_rows(
     ``wp.utils.array_cast`` reinterpretation plus a ``wp.map(wp.normalize, ...)``. One launch
     instead of two, so the wider accumulator costs nothing here.
 
+    Generic over the accumulator's precision, and paired with
+    ``kernels.scatter.scatter_sum_vec`` / ``scatter_weighted_sum_vec``, which are generic over the
+    same thing -- so the pair takes a second precision as a registration row rather than as a
+    second copy of either kernel. The three components are carried as scalars rather than assembled
+    into a vector because there is no rank-3 vector type to name generically in kernel scope, and
+    the length is the same arithmetic either way.
+
     A zero row -- an unreferenced vertex, or a fan whose contributions cancel -- comes back as the
     zero vector, which is ``wp.normalize``'s own answer for one (its ``kEps`` is 0) and is the
     contract the callers document.
     """
     i = wp.int32(wp.tid())
-    total = wp.vec3d(sums[i, 0], sums[i, 1], sums[i, 2])
-    length = wp.length(total)
-    if length > wp.float64(0.0):
-        total = total / length
-    out_normals[i] = wp.vec3(wp.float32(total[0]), wp.float32(total[1]), wp.float32(total[2]))
+    x = sums[i, 0]
+    y = sums[i, 1]
+    z = sums[i, 2]
+    length = wp.sqrt(x * x + y * y + z * z)
+    if length > sums.dtype(0.0):
+        x = x / length
+        y = y / length
+        z = z / length
+    out_normals[i] = wp.vec3(wp.float32(x), wp.float32(y), wp.float32(z))
+
+
+# The accumulator precision ``vertices._accumulate_and_normalize`` allocates, and the only one
+# registered: float64, so that the order the scatter's atomics pick cannot reach the answer
+# (``kernels.scatter.atomic_add_vec3`` carries the measurement). Mirrors
+# ``kernels/scatter._VECTOR_ACCUMULATOR_DTYPES``, which must list the same set -- the two kernels
+# are launched back to back on one buffer.
+_ACCUMULATOR_DTYPES = (wp.float64,)
+
+NORMALIZE_ACCUMULATED_ROWS: OverloadTable
+
+
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    global NORMALIZE_ACCUMULATED_ROWS
+    NORMALIZE_ACCUMULATED_ROWS = OverloadTable(
+        normalize_accumulated_rows,
+        {d: [wp.array2d[d], wp.array[wp.vec3]] for d in _ACCUMULATOR_DTYPES},
+    )
+
+
+_register_overloads()

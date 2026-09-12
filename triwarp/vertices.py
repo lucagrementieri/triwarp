@@ -30,9 +30,17 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_same_device
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import predicates as kernel_predicates
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import vertices as kernel_vertices
+
+# The precision the vertex-normal accumulator runs at, and the key both of
+# ``_accumulate_and_normalize``'s launches look their kernel up by. ``float64`` so that the order
+# the scatter's atomics happen to pick cannot reach the float32 answer -- the measurement is at
+# ``kernels.scatter.atomic_add_vec3``, and both kernels are generic over this, so moving it is a
+# one-line change here plus a registration row in each kernel module.
+_ACCUMULATOR_DTYPE = wp.float64
 
 
 def mean_vertex_normals(
@@ -79,7 +87,7 @@ def mean_vertex_normals(
     require_same_device(faces=faces, face_normals=face_normals)
     _require_face_rows(int(faces.shape[0]) // 3, face_normals=face_normals)
     return _accumulate_and_normalize(
-        n_vertices, faces, kernel_scatter.scatter_sum_vec, face_normals
+        n_vertices, faces, kernel_scatter.SCATTER_SUM_VEC, face_normals
     )
 
 
@@ -133,14 +141,14 @@ def weighted_vertex_normals(
         int(faces.shape[0]) // 3, face_normals=face_normals, face_weights=face_weights
     )
     return _accumulate_and_normalize(
-        n_vertices, faces, kernel_scatter.scatter_weighted_sum_vec, face_normals, face_weights
+        n_vertices, faces, kernel_scatter.SCATTER_WEIGHTED_SUM_VEC, face_normals, face_weights
     )
 
 
 def _accumulate_and_normalize(
     n_vertices: int,
     faces: wp.array[wp.int32],
-    scatter_kernel: wp.Kernel,
+    scatter_table: kernel_array.OverloadTable,
     values: wp.array[wp.vec3],
     *extra: wp.array,
 ) -> wp.array[wp.vec3]:
@@ -165,9 +173,10 @@ def _accumulate_and_normalize(
         Output length.
     faces
         Flat ``wp.int32`` triangle index buffer; reshaped to ``(f, 3)`` for the scatter.
-    scatter_kernel
-        ``kernels.scatter`` kernel taking ``(values, faces2d, *extra, out_sums)`` -- the face table
-        is the *second* argument in that family, not the last input.
+    scatter_table
+        ``kernels.scatter`` overload table whose kernel takes ``(values, faces2d, *extra,
+        out_sums)`` -- the face table is the *second* argument in that family, not the last input.
+        Both of them are generic over the accumulator's precision, so the table is keyed by it.
     values
         ``(f,)`` per-face vectors to accumulate.
     extra
@@ -187,16 +196,16 @@ def _accumulate_and_normalize(
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
-    sums = wp.zeros((n_vertices, 3), dtype=wp.float64, device=device)
+    sums = wp.zeros((n_vertices, 3), dtype=_ACCUMULATOR_DTYPE, device=device)
     wp.launch(
-        scatter_kernel,
+        scatter_table[_ACCUMULATOR_DTYPE],
         dim=n_faces,
         inputs=[values, faces.reshape((-1, 3)), *extra, sums],
         device=device,
     )
     vec_normals = wp.empty(n_vertices, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_vertices.normalize_accumulated_rows,
+        kernel_vertices.NORMALIZE_ACCUMULATED_ROWS[_ACCUMULATOR_DTYPE],
         dim=n_vertices,
         inputs=[sums, vec_normals],
         device=device,
