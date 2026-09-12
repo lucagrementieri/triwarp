@@ -68,7 +68,9 @@ def homology_generators(
     ------
     ValueError
         If the mesh has a boundary, since a surface with boundary has a different homology basis
-        (every boundary loop contributes one, and the tree-cotree count no longer applies).
+        (every boundary loop contributes one, and the tree-cotree count no longer applies), or if
+        its referenced vertices are not all in one connected component, since the count is then a
+        sum over components that a single pair of spanning trees does not produce.
     RuntimeError
         If ``vertices`` and ``faces`` are not all on one device.
 
@@ -163,12 +165,14 @@ def tree_cotree(
     generator_edges : twt.Array2dInt32
         ``(2 * g, 2)`` the leftover edges, one per homology generator.
     parents : wp.array[wp.int32]
-        Length ``n_vertices`` primal spanning-tree parent of each vertex; ``-1`` at the root.
+        Length ``n_vertices`` primal spanning-tree parent of each vertex; ``-1`` at the root and
+        at every unreferenced vertex, which the tree never reaches. All ``-1`` for a mesh with no
+        edges at all, which has nothing to span and no generators.
 
     Raises
     ------
     ValueError
-        If the mesh has a boundary (see
+        If the mesh has a boundary, or is not connected (see
         [`homology_generators`][triwarp.homology.homology_generators]).
     RuntimeError
         If ``vertices`` and ``faces`` are not all on one device.
@@ -206,37 +210,69 @@ def tree_cotree(
     # The one readback: the closed-surface guard, whose message quotes the boundary-edge count.
     # ``face_count == 2`` is the same exactly-two-corners test the row grouping behind
     # ``face_adjacency`` applied, so a non-manifold edge fails this guard exactly as it did before.
-    n_interior = tw.reduce.sum(interior)
+    # ``reduce.sum`` raises on a zero-length array, so an edgeless mesh answers without it rather
+    # than surfacing that as the boundary ``ValueError`` this function documents.
+    n_interior = tw.reduce.sum(interior) if n_edges > 0 else 0
     if n_interior * 2 != 3 * n_faces:
         raise ValueError(
             "homology_generators requires a closed surface: this mesh has "
             f"{3 * n_faces - 2 * n_interior} boundary edge(s)."
         )
+    if n_edges == 0:
+        # No edges means no faces (a face carries three), so there is nothing to span and nothing
+        # to leave over. Every vertex is its own primal-tree root.
+        return (
+            twt.as_array2d(unique_edges, wp.int32),
+            twt.empty_2d((0, 2), wp.int32, device=device),
+            wp.full(n_vertices, -1, dtype=wp.int32, device=device),
+        )
 
     # Primal spanning tree over the vertex graph. This one stays a breadth-first traversal: the mesh
     # graph's diameter is small, and ``parents`` is the rooted tree the loop tracing walks.
+    #
+    # **The root has to be a referenced vertex, and the graph has to be connected**, because the
+    # generator count is ``n_edges`` minus the two trees' edge counts and a tree that spans less
+    # than its graph hands the difference over as generators. Rooting at vertex 0 unconditionally
+    # is what breaks on an unreferenced one: the "tree" is then a single isolated node with no
+    # edges, and every primal edge becomes a generator (measured: a 128-vertex genus-1 torus with
+    # one unreferenced vertex prepended reported 129 generators instead of 2). ``edges_unique``
+    # returns its rows lexicographically sorted, so the first endpoint of the first row is the
+    # lowest-indexed referenced vertex -- referenced by construction, and deterministic.
     adjacency = tw.graph.edges_to_csr(n_vertices, unique_edges)
-    _, parents, _ = tw.graph.bfs(adjacency, 0)
-
-    in_primal_tree = wp.empty(n_edges, dtype=wp.bool, device=device)
-    candidate = wp.empty(n_edges, dtype=wp.bool, device=device)
-    if n_edges > 0:
-        wp.launch(
-            kernel_homology.primal_tree_edge_mask,
-            dim=n_edges,
-            inputs=[unique_edges, parents, in_primal_tree],
-            device=device,
+    root = int(read_scalar(unique_edges.flatten(), 0))
+    order, parents, _ = tw.graph.bfs(adjacency, root)
+    # The connectivity half of the same requirement, which ``homology_generators``' docstring has
+    # always stated as a precondition and nothing checked. A vertex is referenced exactly when its
+    # adjacency row is non-empty, and ``order`` holds what the traversal reached, so the two counts
+    # agree exactly when the referenced vertices form one component. Unreferenced vertices are
+    # deliberately not counted: they carry no edges, so they cannot change the generator count.
+    referenced = wp.empty(n_vertices, dtype=wp.bool, device=device)
+    wp.map(kernel_array.less, adjacency.offsets[:-1], adjacency.offsets[1:], out=referenced)
+    n_referenced = int(tw.reduce.sum(referenced))
+    if int(order.shape[0]) != n_referenced:
+        raise ValueError(
+            "homology_generators requires a connected surface: the traversal reached "
+            f"{int(order.shape[0])} of {n_referenced} referenced vertices."
         )
-        wp.map(kernel_homology.is_dual_candidate, edge_face_count, in_primal_tree, out=candidate)
+
+    # The edgeless case returned above, so these three no longer need a ``n_edges > 0`` guard.
+    in_primal_tree = wp.empty(n_edges, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_homology.primal_tree_edge_mask,
+        dim=n_edges,
+        inputs=[unique_edges, parents, in_primal_tree],
+        device=device,
+    )
+    candidate = wp.empty(n_edges, dtype=wp.bool, device=device)
+    wp.map(kernel_homology.is_dual_candidate, edge_face_count, in_primal_tree, out=candidate)
 
     in_dual_tree = _dual_spanning_forest(candidate, edge_faces, n_faces)
 
+    # A homology generator is a candidate the cotree left out. Edges the primal tree took are
+    # already excluded from ``candidate``, so this is "in neither tree" on a closed surface --
+    # which is ``array.mask_and_not`` and needs no predicate of its own.
     leftover_mask = wp.empty(n_edges, dtype=wp.bool, device=device)
-    if n_edges > 0:
-        # A homology generator is a candidate the cotree left out. Edges the primal tree
-        # took are already excluded from ``candidate``, so this is "in neither tree" on a
-        # closed surface -- which is ``array.mask_and_not`` and needs no predicate of its own.
-        wp.map(kernel_array.mask_and_not, candidate, in_dual_tree, out=leftover_mask)
+    wp.map(kernel_array.mask_and_not, candidate, in_dual_tree, out=leftover_mask)
     generator_edges = tw.array.gather(unique_edges, tw.array.flatnonzero(leftover_mask))
     return (
         twt.as_array2d(unique_edges, wp.int32),

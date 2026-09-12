@@ -684,6 +684,48 @@ def test_relax_approx_matches_meshlib(device: str, fit: str) -> None:
     assert abs(smoothed_tw - smoothed_ml) < 0.25 * max(smoothed_tw, smoothed_ml)
 
 
+@pytest.mark.parametrize("scale", [3e-4, 1e-4])
+def test_relax_approx_quadric_is_scale_equivariant(device: str, scale: float) -> None:
+    """
+    Triwarp against triwarp: the same relaxation, in units of the mesh, at two mesh scales.
+
+    The oracle sits on the unit-scale side, which ``test_relax_approx_matches_meshlib`` pins
+    against ``relaxApprox``; this only asks that shrinking the mesh does not change the relative
+    move. It did, silently and only for the quadric fit: that fit's design row spans
+    ``[u^2, u v, v^2, u, v, 1]``, so at mesh scale ``h`` the normal matrix's diagonal spans ``h^8``
+    down to ``1`` and the absolute singularity threshold in
+    ``kernels.linalg.solve_normal_equations`` reported well-conditioned neighbourhoods as
+    singular -- the vertex then falls back to the *planar* answer, which is a plausible-looking
+    position and not an error. Measured before the fix, on this fixture and at this radius: the
+    quadric and planar answers were bit-identical at 16 of 642 vertices at ``3e-4`` and at 511 of
+    642 at ``1e-4``, against 0 of 642 at unit scale.
+
+    The planar arm is the control: it solves no normal equations, so it was scale-equivariant all
+    along and stays so here.
+    """
+    mesh_tm = _noisy_icosphere(3, 0.02)
+    unit_wp = trimesh_to_warp(mesh_tm, device)
+    small_tm = mesh_tm.copy()
+    small_tm.vertices = small_tm.vertices * scale
+    small_wp = trimesh_to_warp(small_tm, device)
+
+    moves = {}
+    for fit in ("planar", "quadric"):
+        unit_np = tw.smoothing.relax_approx(
+            unit_wp.points, unit_wp.indices, 0.3, 1, 0.5, fit
+        ).numpy()
+        small_np = tw.smoothing.relax_approx(
+            small_wp.points, small_wp.indices, 0.3 * scale, 1, 0.5, fit
+        ).numpy()
+        moves[fit] = unit_np - np.asarray(mesh_tm.vertices)
+        assert np.allclose(small_np / scale, unit_np, rtol=1e-3, atol=1e-3)
+
+    # Non-vacuity: the two fits must disagree at unit scale, or "the quadric answer" and "the
+    # planar fallback this used to produce" would be the same thing and the assert above could not
+    # tell them apart.
+    assert np.abs(moves["quadric"] - moves["planar"]).max() > 1e-3
+
+
 def test_relax_approx_needs_a_radius_that_reaches(device: str) -> None:
     """
     Not a library comparison: the documented silent no-op, and the argument guards.

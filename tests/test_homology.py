@@ -21,7 +21,7 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import trimesh_to_meshlib
+from tests.conversions import numpy_to_warp, trimesh_to_meshlib
 
 
 def _is_simple_edge_cycle(loop: np.ndarray, edges_tm: set[tuple[int, int]]) -> bool:
@@ -134,6 +134,76 @@ def test_homology_generators_reject_a_boundary(
     _, mesh_wp = hemisphere
     with pytest.raises(ValueError, match="closed surface"):
         tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
+
+
+def test_homology_generators_ignore_an_unreferenced_vertex(
+    torus: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """
+    Not a library comparison: an unreferenced vertex must not change the basis it plays no part in.
+
+    The generator count is ``n_edges`` minus the two spanning trees' edge counts, so a primal tree
+    rooted at a vertex carrying no edges spans one isolated node and hands every primal edge over
+    as a generator. Vertex 0 is the one the root would default to, so prepending an unreferenced
+    vertex is exactly the input that reaches it; measured before the fix, this returned 129
+    generators instead of 2.
+    """
+    mesh_tm, _ = torus
+    vertices_np = np.vstack([[[10.0, 10.0, 10.0]], np.asarray(mesh_tm.vertices)])
+    faces_np = np.asarray(mesh_tm.faces) + 1
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+
+    loops = tw.homology.homology_generators(vertices_wp, faces_wp)
+
+    # Non-vacuity: the unreferenced vertex really is unreferenced, and the surface really is genus
+    # 1 -- ``euler_characteristic`` counts referenced vertices, so it is unmoved by the extra row.
+    assert 0 not in set(faces_np.ravel().tolist())
+    assert tw.measures.euler_characteristic(faces_wp) == 0
+    assert len(loops) == 2
+    edges_tm = {tuple(sorted((int(a) + 1, int(b) + 1))) for a, b in mesh_tm.edges_unique.tolist()}
+    for loop in loops:
+        assert _is_simple_edge_cycle(loop.numpy(), edges_tm)
+
+
+def test_homology_generators_reject_a_disconnected_surface(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """
+    Not a library comparison: the connectivity precondition, which the counting argument needs.
+
+    Two disjoint spheres are each genus 0, so an implementation that honoured the precondition
+    would answer ``[]``; a single primal tree spans only the first component and hands the second's
+    ``V - 1`` edges over as generators (measured: 41 of them). Both components are closed, so the
+    boundary guard cannot see this.
+    """
+    mesh_tm, _ = icosahedron
+    other = mesh_tm.copy()
+    other.apply_translation([5.0, 0.0, 0.0])
+    both = tm.util.concatenate([mesh_tm, other])
+    vertices_wp, faces_wp = numpy_to_warp(np.asarray(both.vertices), np.asarray(both.faces), device)
+
+    # Non-vacuity: the closed-surface guard passes, so connectivity is the only thing left to fail.
+    assert int(tw.boundary.boundary_edges(vertices_wp, faces_wp).shape[0]) == 0
+    with pytest.raises(ValueError, match="connected surface"):
+        tw.homology.homology_generators(vertices_wp, faces_wp)
+
+
+def test_tree_cotree_without_edges(device: str) -> None:
+    """
+    Not a library comparison: the degenerate input the closed-surface guard must answer, not raise.
+
+    A mesh with no faces has no boundary edges either, so it is vacuously closed and the honest
+    answer is an empty decomposition. The boundary-count reduction is what used to raise here, with
+    a ``ValueError`` whose message said the mesh had a boundary.
+    """
+    vertices_wp = wp.zeros(4, dtype=wp.vec3, device=device)
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+
+    unique_edges, generator_edges, parents = tw.homology.tree_cotree(vertices_wp, faces_wp)
+
+    assert unique_edges.shape == (0, 2)
+    assert generator_edges.shape == (0, 2)
+    assert np.array_equal(parents.numpy(), np.full(4, -1, dtype=np.int32))
 
 
 def test_tree_cotree_partitions_the_edges(torus: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:

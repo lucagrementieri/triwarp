@@ -103,7 +103,9 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     Returns
     -------
     wp.vec3
-        Area-weighted mean of per-face centroids. All-``NaN`` when ``faces`` is empty.
+        Area-weighted mean of per-face centroids. All-``NaN`` when the weights sum to zero --
+        an empty ``faces``, or a mesh whose every face is degenerate -- since no weighted mean of
+        the face centroids exists in either case.
 
     Raises
     ------
@@ -145,8 +147,14 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
         )
     # Two unavoidable readbacks: the return type is a host-side wp.vec3, so the sums have to
     # cross to the host to be divided.
-    weighted = out_centroid.numpy()
     total_area = float(read_scalar(out_total_area, 0))
+    if total_area == 0.0:
+        # Every face degenerate: the weights are all zero, so there is no weighted mean. Same
+        # answer as the empty mesh above, and the same shape as ``moments``' zero-volume guard --
+        # a ``ZeroDivisionError`` out of a mesh that is merely degenerate would be a surprise.
+        # Taken before the second readback, which has nothing to divide.
+        return wp.vec3(float("nan"), float("nan"), float("nan"))
+    weighted = out_centroid.numpy()
     return wp.vec3(
         float(weighted[0]) / total_area,
         float(weighted[1]) / total_area,

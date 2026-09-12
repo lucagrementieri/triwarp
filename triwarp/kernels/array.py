@@ -964,6 +964,8 @@ def _declare_map_kernels() -> None:
                 (single(wp.vec3), single(wp.vec3), wp.float32(1), wp.float32(1)),
                 wp.bool,
             ),
+            (less, (dense(wp.float32), wp.float32(1)), wp.bool),
+            (less, (dense(wp.int32), dense(wp.int32)), wp.bool),
             (nonzero_flag, (dense(wp.float32),), wp.int32),
             (nonzero_flag, (dense(wp.int32),), wp.int32),
             (nonzero_flag, (dense(wp.int8),), wp.int32),

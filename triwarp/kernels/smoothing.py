@@ -715,26 +715,32 @@ def apply_push_keeping_volume(
 @wp.func
 def _neighborhood_frame(
     positions: wp.array[wp.vec3], neighbors: wp.array[wp.int32], begin: wp.int32, end: wp.int32
-) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3]:
+) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3, wp.float32]:
     # Principal frame of the neighbourhood point set: its centroid, then the two directions of
     # greatest spread and the one of least. The least-spread direction is the fitted plane's normal,
     # so the same decomposition serves both the planar and the quadric fit.
+    #
+    # The radius comes back with it because the covariance pass already holds every offset whose
+    # length it is, and the quadric fit divides its local coordinates by it -- see the comment at
+    # that fit for why a scale-free fit is a correctness requirement and not a nicety.
     count = wp.float32(end - begin)
     centroid = wp.vec3()
     for slot in range(begin, end):
         centroid += positions[neighbors[slot]]
     centroid /= count
     covariance = wp.mat33()
+    radius = wp.float32(0.0)
     for slot in range(begin, end):
         offset = positions[neighbors[slot]] - centroid
         covariance += wp.outer(offset, offset)
+        radius = wp.max(radius, wp.length(offset))
     _left, _singular, basis = wp.svd3(covariance / count)
     # ``wp.svd3`` orders the singular values descending, so the last column spans the least. Its
     # sign is arbitrary and irrelevant: every use below is a projection along the axis, not a side.
     axis_u = wp.vec3(basis[0, 0], basis[1, 0], basis[2, 0])
     axis_v = wp.vec3(basis[0, 1], basis[1, 1], basis[2, 1])
     axis_w = wp.vec3(basis[0, 2], basis[1, 2], basis[2, 2])
-    return centroid, axis_u, axis_v, axis_w
+    return centroid, axis_u, axis_v, axis_w, radius
 
 
 @wp.kernel
@@ -762,34 +768,54 @@ def relax_approx_step(
         out_positions[vertex] = current
         return
 
-    centroid, axis_u, axis_v, axis_w = _neighborhood_frame(positions, neighbor_indices, begin, end)
+    centroid, axis_u, axis_v, axis_w, radius = _neighborhood_frame(
+        positions, neighbor_indices, begin, end
+    )
     offset = current - centroid
     # Initialized before the branch, per the kernel-scope scoping rule; the planar fit's answer is
     # exactly this, since the plane passes through the neighbourhood centroid.
     height = wp.float32(0.0)
-    if quadric:
+    # A zero radius means every neighbour sits on the centroid: no quadric to fit, and the plane's
+    # answer -- which ``height = 0`` already is -- is the whole of what the neighbourhood says.
+    if quadric and radius > wp.float32(0.0):
         # Least squares over ``w = a u^2 + b u v + c v^2 + d u + e v + f`` in the neighbourhood's
-        # own frame: the fit is a graph over the plane the neighbourhood already lies closest to.
+        # own frame, **in units of the neighbourhood radius**: the fit is a graph over the plane the
+        # neighbourhood already lies closest to.
+        #
+        # The division by the radius is what makes the fit scale-free, and it is a correctness
+        # requirement. The design row spans ``[u^2, u v, v^2, u, v, 1]``, so at mesh scale ``h`` the
+        # normal matrix's diagonal spans ``h^8`` down to ``1`` and ``solve_normal_equations``'
+        # singularity test -- absolute, and necessarily so, since it cannot see the caller's units
+        # -- starts reporting well-conditioned neighbourhoods as singular. That failure is silent:
+        # the vertex falls back to the planar answer with nothing said. Measured before this
+        # division, on a noisy ``icosphere(3)`` at ``dilate_radius=0.3``: 16 of 642 vertices fell
+        # back at mesh scale 3e-4 and **511 of 642 at 1e-4**.
+        inv_radius = wp.float64(1.0) / wp.float64(radius)
         normal_matrix = mat66d()
         normal_rhs = vec6d()
         for slot in range(begin, end):
             local = positions[neighbor_indices[slot]] - centroid
-            u = wp.float64(wp.dot(local, axis_u))
-            v = wp.float64(wp.dot(local, axis_v))
+            u = wp.float64(wp.dot(local, axis_u)) * inv_radius
+            v = wp.float64(wp.dot(local, axis_v)) * inv_radius
             row = vec6d(u * u, u * v, v * v, u, v, wp.float64(1.0))
             normal_matrix += wp.outer(row, row)
-            normal_rhs += row * wp.float64(wp.dot(local, axis_w))
+            normal_rhs += row * (wp.float64(wp.dot(local, axis_w)) * inv_radius)
         coefficients, ok = solve_normal_equations(normal_matrix, normal_rhs)
         if ok:
-            u = wp.float64(wp.dot(offset, axis_u))
-            v = wp.float64(wp.dot(offset, axis_v))
+            # Evaluated in the same units the fit was solved in, then carried back: ``w`` was
+            # divided by the radius alongside ``u`` and ``v``, so the height is multiplied by it.
+            u = wp.float64(wp.dot(offset, axis_u)) * inv_radius
+            v = wp.float64(wp.dot(offset, axis_v)) * inv_radius
             height = wp.float32(
-                coefficients[0] * u * u
-                + coefficients[1] * u * v
-                + coefficients[2] * v * v
-                + coefficients[3] * u
-                + coefficients[4] * v
-                + coefficients[5]
+                wp.float64(radius)
+                * (
+                    coefficients[0] * u * u
+                    + coefficients[1] * u * v
+                    + coefficients[2] * v * v
+                    + coefficients[3] * u
+                    + coefficients[4] * v
+                    + coefficients[5]
+                )
             )
 
     target = current + axis_w * (height - wp.dot(offset, axis_w))

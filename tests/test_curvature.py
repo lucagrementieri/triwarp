@@ -494,3 +494,38 @@ def test_principal_directions_match_the_analytic_torus(
             np.abs(np.einsum("ij,ij->i", pd2_np, exact_np)),
         )
         assert alignment_np.min() > 0.99, f"{name}: worst |cos| {alignment_np.min():.4f}"
+
+
+@pytest.mark.parametrize("scale", [1e-3, 3e-4])
+def test_principal_curvature_is_scale_equivariant(
+    icosphere: tuple[tm.Trimesh, wp.Mesh], scale: float
+) -> None:
+    """
+    Triwarp against triwarp: curvature has units of 1/length, so scaling the mesh scales it back.
+
+    The oracle sits on the unit-scale side, which
+    ``test_principal_curvature`` / ``test_principal_curvature_half_torus`` pin against libigl; this
+    only asks that shrinking the mesh does not change the answer it reports in the mesh's own
+    units. It did: the quadric fit's normal matrix has a diagonal spanning ``h^8`` to ``h^2`` at
+    mesh scale ``h``, so the absolute singularity threshold in
+    ``kernels.linalg.solve_normal_equations`` rejected well-conditioned fits and the kernel's
+    fallback wrote zero curvature -- 42 of 642 vertices at ``1e-3`` and all 642 at ``3e-4``,
+    with nothing raised.
+    """
+    mesh_tm, mesh_wp = icosphere
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
+    faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
+
+    _, _, pv1_unit_wp, pv2_unit_wp = tw.curvature.principal_curvature(
+        points_to_warp(vertices_np, mesh_wp.device), faces_wp, radius=2
+    )
+    _, _, pv1_small_wp, pv2_small_wp = tw.curvature.principal_curvature(
+        points_to_warp(vertices_np * scale, mesh_wp.device), faces_wp, radius=2
+    )
+    pv1_unit_np, pv2_unit_np = pv1_unit_wp.numpy(), pv2_unit_wp.numpy()
+
+    # Non-vacuity: the unit-scale answer is the unit sphere's, so every vertex must carry a real
+    # curvature -- a zero here would make the comparison below one between two fallbacks.
+    assert np.abs(pv1_unit_np).min() > 0.5
+    assert np.allclose(pv1_small_wp.numpy() * scale, pv1_unit_np, rtol=1e-4, atol=1e-4)
+    assert np.allclose(pv2_small_wp.numpy() * scale, pv2_unit_np, rtol=1e-4, atol=1e-4)

@@ -48,6 +48,15 @@ def solve_normal_equations(matrix: Any, rhs: Any) -> tuple[Any, wp.bool]:
     partial-pivot magnitude a Gaussian elimination would test, to within a ``sqrt(n)`` factor -- so
     a single threshold carries across ranks.
 
+    **The threshold is absolute, so the caller owns the system's scale.** A ``@wp.func`` cannot see
+    the units its caller works in, and a relative test is not available either: the normal matrix of
+    a polynomial fit is scaled *inhomogeneously* by its design row (``[u^2, u v, v^2, u, v]``
+    spreads a mesh scale ``h`` over ``h^8`` to ``h^2`` on the diagonal alone), so
+    ``min|R| / max|R|`` moves with ``h`` exactly as ``min|R|`` does. Both callers divide their local
+    coordinates by the neighbourhood radius before accumulating, which makes the matrix they hand
+    over ``O(1)`` whatever the mesh's units; each says so at the site, with what it measured before
+    the division. A new caller that skips it gets a silent ``ok=False`` on a perfectly good system.
+
     **The rank is nowhere in this function, and that is the point.** It was written twice, as a 5x5
     for ``curvature``'s quadric fit and a 6x6 for ``smoothing``'s area-equalizing solve, because the
     singularity test was a ``for k in range(5)`` / ``range(6)`` loop and a generic matrix has no

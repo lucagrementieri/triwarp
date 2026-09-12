@@ -150,6 +150,24 @@ def _principal_curvatures_from_monge(
 # ---------------------------------------------------------------------------
 
 
+@wp.func
+def _write_no_curvature(
+    i: wp.int32,
+    out_pd1: wp.array[wp.vec3],
+    out_pd2: wp.array[wp.vec3],
+    out_pv1: wp.array[wp.float32],
+    out_pv2: wp.array[wp.float32],
+) -> None:
+    # What ``fit_principal_curvature`` writes at a vertex it declines to fit -- too few neighbours,
+    # a neighbourhood of coincident points, or a singular normal matrix. One name for it because
+    # the three exits must stay the same answer: a caller reads a zero ``PV1`` as "no fit here",
+    # and a branch that wrote only part of the four would leave the rest holding another vertex's.
+    out_pd1[i] = wp.vec3()
+    out_pd2[i] = wp.vec3()
+    out_pv1[i] = wp.float32(0.0)
+    out_pv2[i] = wp.float32(0.0)
+
+
 @wp.kernel
 def fit_principal_curvature(
     vertices: wp.array[wp.vec3],
@@ -169,7 +187,6 @@ def fit_principal_curvature(
     Extract principal curvature directions and magnitudes. Matches igl::principal_curvature.
     """
     i = wp.int32(wp.tid())
-    zero3 = wp.vec3(0.0, 0.0, 0.0)
 
     start = offsets[i]
     end = offsets[i + 1]  # ``geodesic_ball`` returns the terminated (n + 1) CSR row bounds
@@ -180,10 +197,7 @@ def fit_principal_curvature(
     # equations rank-deficient and ``solve_normal_equations`` would report it -- this only saves
     # running a solve whose answer is already known. Remaining degeneracies are caught there.
     if n_nbr < 6:
-        out_pd1[i] = zero3
-        out_pd2[i] = zero3
-        out_pv1[i] = wp.float32(0.0)
-        out_pv2[i] = wp.float32(0.0)
+        _write_no_curvature(i, out_pd1, out_pd2, out_pv1, out_pv2)
         return
 
     vertex = vertices[i]
@@ -203,14 +217,31 @@ def fit_principal_curvature(
     # Matches libigl's applyProjOnPlane which includes vv[self] because dot(n_i, n_i) = 1 > 0.
     # The neighbour normal is not normalized here or in the fit loop below: only the *sign* of the
     # dot product is read, and scaling by a positive length cannot change it.
+    #
+    # The same sweep takes the neighbourhood's radius, which the fit below divides its local
+    # coordinates by. That is not a tolerance choice, it is what makes the fit scale-free: the
+    # design row is ``[u^2, u v, v^2, u, v]``, so at mesh scale ``h`` the normal matrix's diagonal
+    # spans ``h^8`` to ``h^2`` and ``solve_normal_equations``' singularity test -- absolute, and
+    # necessarily so, since it cannot see the caller's units -- starts rejecting well-conditioned
+    # fits outright. Measured before this division, on ``icosphere(3)`` at ``radius=2``: 42 of 642
+    # vertices returned zero curvature at mesh scale 1e-3 and **all 642 at 3e-4**, silently.
     n_valid = wp.int32(0)
+    ring_radius = wp.float32(0.0)
     for k in range(n_nbr):
         j = neighbor_indices[start + k]
         if j == i:
             n_valid = n_valid + 1  # self always passes
             continue
+        ring_radius = wp.max(ring_radius, wp.length(vertices[j] - vertex))
         if wp.dot(vertex_normals[j], normal) > wp.float32(0.0):
             n_valid = n_valid + 1
+
+    # Every neighbour coincides with the centre: no frame, no fit, and the normal equations would
+    # be exactly singular. Same answer this kernel gives for a solve that reports singular.
+    if ring_radius <= wp.float32(0.0):
+        _write_no_curvature(i, out_pd1, out_pd2, out_pv1, out_pv2)
+        return
+    inv_radius = wp.float64(1.0) / wp.float64(ring_radius)
 
     # Mirror libigl: only apply the filter if it leaves at least 6 neighbours. libigl also requires
     # the filtered set to be strictly smaller than the full one, which is not repeated here because
@@ -228,10 +259,12 @@ def fit_principal_curvature(
         if use_filter and wp.dot(vertex_normals[j], normal) <= wp.float32(0.0):
             continue
 
+        # Local coordinates in units of the ring radius, per the comment above the sweep that
+        # measured it.
         diff = vertices[j] - vertex
-        u = wp.float64(wp.dot(diff, t1))
-        v_c = wp.float64(wp.dot(diff, t2))
-        w = wp.float64(wp.dot(diff, normal))
+        u = wp.float64(wp.dot(diff, t1)) * inv_radius
+        v_c = wp.float64(wp.dot(diff, t2)) * inv_radius
+        w = wp.float64(wp.dot(diff, normal)) * inv_radius
 
         # row of A: [u², uv, v², u, v]
         r = vec5d(u * u, u * v_c, v_c * v_c, u, v_c)
@@ -240,16 +273,16 @@ def fit_principal_curvature(
 
     solution, ok = solve_normal_equations(ata, atb)
     if not ok:
-        out_pd1[i] = zero3
-        out_pd2[i] = zero3
-        out_pv1[i] = wp.float32(0.0)
-        out_pv2[i] = wp.float32(0.0)
+        _write_no_curvature(i, out_pd1, out_pd2, out_pv1, out_pv2)
         return
 
-    # Cast the float64 solution back to float32 for the rest of the kernel.
-    a = wp.float32(solution[0])
-    b = wp.float32(solution[1])
-    c = wp.float32(solution[2])
+    # Cast the float64 solution back to float32 for the rest of the kernel, undoing the ring-radius
+    # scaling as it goes. With ``u' = u / R`` and ``w' = w / R``, matching ``w = a u^2 + ... + e v``
+    # against ``w' = a' u'^2 + ... + e' v'`` gives the quadratic coefficients a factor ``1 / R`` and
+    # leaves the linear ones alone -- so the Monge form below is in the caller's own units.
+    a = wp.float32(solution[0] * inv_radius)
+    b = wp.float32(solution[1] * inv_radius)
+    c = wp.float32(solution[2] * inv_radius)
     d = wp.float32(solution[3])
     e = wp.float32(solution[4])
 

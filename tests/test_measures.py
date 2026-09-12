@@ -19,6 +19,7 @@ import triwarp as tw
 from tests.conftest import MESHES
 from tests.conversions import (
     faces_igl,
+    numpy_to_warp,
     points_to_warp,
     trimesh_to_meshlib,
     trimesh_to_pymeshlab,
@@ -142,6 +143,28 @@ def test_surface_centroid_empty(device: str):
     centroid_wp = tw.measures.surface_centroid(vertices, faces)
     centroid_wp = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
     assert np.isnan(centroid_wp).all()
+
+
+def test_surface_centroid_all_degenerate(device: str):
+    """
+    Not a library comparison: the other input whose area weights sum to zero.
+
+    An area-weighted mean of nothing is the empty mesh's answer, and a mesh of collinear faces is
+    the same statement with faces present -- it used to be a bare ``ZeroDivisionError``, which the
+    docstring documented nowhere and which no other reduction here raises (``moments`` already
+    guards its zero volume the same way).
+    """
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]]),
+        np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32),
+        device,
+    )
+
+    # Non-vacuity: every face really is degenerate, so the weights really do all vanish.
+    _, areas_wp = tw.triangles.face_normals_and_areas(vertices_wp, faces_wp)
+    assert float(areas_wp.numpy().max()) == 0.0
+    centroid_wp = tw.measures.surface_centroid(vertices_wp, faces_wp)
+    assert np.isnan([centroid_wp.x, centroid_wp.y, centroid_wp.z]).all()
 
 
 @pytest.mark.parity("surface_centroid", "pymeshlab")
