@@ -5,12 +5,27 @@ on:
     branches:
       - main
 
+# Deployment goes through GitHub's native Pages pipeline rather than a force-push to a
+# `gh-pages` branch, so the repository's Pages source must be set to "GitHub Actions"
+# (Settings > Pages > Build and deployment). `id-token: write` is what lets `deploy-pages`
+# authenticate over OIDC; `contents` drops to read because nothing pushes a branch any more.
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
+
+# A queued run waits for the one in flight rather than cancelling it, so a deploy is never
+# interrupted half-published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -35,8 +50,11 @@ jobs:
       - name: Build docs
         run: uv run zensical build --strict
 
-      - name: Deploy docs
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./site
+          path: ./site
+
+      - name: Deploy docs
+        id: deployment
+        uses: actions/deploy-pages@v4
