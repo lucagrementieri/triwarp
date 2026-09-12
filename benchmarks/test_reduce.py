@@ -87,8 +87,8 @@ Those are kernel-time A/Bs, interleaved under one clock state with values verifi
 to end the picture is uneven and worth reading carefully: at ``lucy`` ``max_axis1`` gains **36.7x**,
 ``minmax_global_2d`` **5.5x** and ``sum_scalar`` **2.9x**, but every scalar-returning group at
 ``bunny``-scale moves by less than +/-10% -- which is *within* the cross-session drift band
-CLAUDE.md section 13 warns about, so those cells attribute nothing either way. That is the expected
-shape: ~82 us of such a call was never the kernel, so no kernel change can move it.
+CLAUDE.md section 15.7 warns about, so those cells attribute nothing either way. That is the
+expected shape: ~82 us of such a call was never the kernel, so no kernel change can move it.
 
 One cross-check is worth keeping, because it is what says the rank-2 fix closed the gap rather than
 moved time around: subtract the host floor and ``minmax_global_2d`` at ``lucy`` runs 42.1M elements

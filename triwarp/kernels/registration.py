@@ -218,7 +218,7 @@ def build_procrustes_matrix(
     if use_scale:
         # Shifted second-moment identity: sum w |a - centroid|^2 / S_w = sum w |a - p|^2 / S_w
         # minus |centroid - p|^2. Mathematically non-negative, but computed as a difference of two
-        # independently tile-reduced sums (CLAUDE.md section 1, non-associative float32
+        # independently tile-reduced sums (CLAUDE.md section 12.4, non-associative float32
         # accumulation), so a near-degenerate cloud (tightly clustered, or exactly duplicated
         # points) can land it at a tiny negative value from cancellation alone -- floored the same
         # way ``solve_spd6`` below floors its own Cholesky pivot for the identical reason, rather
@@ -333,7 +333,7 @@ def transform_and_accumulate_cost(
     #
     # No ``prefers_tiled_reduction`` branch, and that is the load-bearing part. The lanes partition
     # a chunk *the block already owns* and take their stride from ``wp.block_dim()``, which is the
-    # case ``.claude/CLAUDE.md`` section 3 says is correct on both devices: on CPU
+    # case ``.claude/CLAUDE.md`` section 2.2 says is correct on both devices: on CPU
     # ``wp.block_dim()`` reads 1, lane 0 walks the whole chunk, and the one-element tile holds that
     # chunk's true total. Measured with ``CUDA_VISIBLE_DEVICES=""``: 1.02-1.03x at every n above,
     # and 1.9e-07 relative error against the float64 reference at n = 200 000 where the atomic

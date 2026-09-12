@@ -23,9 +23,9 @@ test run on any violation:
    function that should have been public, and the alias-on-import (``import _x as x``) is the tell.
 6. **Two modules do not export the same public name**, outside a written allowlist.
 7. **A top-level kernel module is named for the public module it backs**, and vice versa
-   (``.claude/CLAUDE.md`` section 4). This is what stops a wrapper module from being created while
+   (``.claude/CLAUDE.md`` section 3.1). This is what stops a wrapper module from being created while
    its kernels are left behind under the old name.
-8. **A private helper is defined below its first caller** (``.claude/CLAUDE.md`` section 11's
+8. **A private helper is defined below its first caller** (``.claude/CLAUDE.md`` section 5's
    stepdown rule), so a reader never jumps backward to a definition they have not met. The 49 sites
    that predated the check were a staleness-checked debt list, now drained; the single remaining
    entry is a permanent exemption, a helper called at module scope to build a constant.
@@ -59,15 +59,15 @@ test run on any violation:
     executes. This one is the odd member of the family: the scan only *extracts* the blocks, and
     [`tests/test_api_conventions.py`](test_api_conventions.py) runs them against a mesh fixture.
 13. **A kernel output argument is named ``out_*`` and sits at the end of the signature**
-    (``.claude/CLAUDE.md`` section 3). Like check 9 this one scans ``kernels/``, which the others
+    (``.claude/CLAUDE.md`` section 2.1). Like check 9 this one scans ``kernels/``, which the others
     exclude: the first full sweep of the kernel tree found eight genuine outputs wearing plain
     names (four of them literally ``out``, the prefix without the name), three read-only inputs
     wearing the prefix, and two argument classes the convention had no spelling for -- in-place
     arguments and scratch / persistent-state buffers, now exempted in section 3 and carried here
     as ``_KERNEL_OUTPUT_ALLOWLIST``.
 14. **An array annotation is subscript-style** -- ``wp.array[T]``, not the pre-1.12
-    ``wp.array(dtype=T)`` (``.claude/CLAUDE.md`` section 2). Both forms work, so the old one simply
-    accumulated: 176 annotations against 1 644, all of them in the three newest large kernel
+    ``wp.array(dtype=T)`` (``.claude/CLAUDE.md`` section 1.2). Both forms work, so the old one
+    simply accumulated: 176 annotations against 1 644, all of them in the three newest large kernel
     modules, and one file carrying both. Restricted to *annotation* positions, which is what lets
     it scan the whole package -- ``wp.array(dtype=T)`` is a legal allocation expression at Python
     scope and only an annotation makes it the stale spelling.
@@ -78,33 +78,42 @@ test run on any violation:
     carries the load -- ``conftest.py``'s ``STRICT`` mode only bites when the arrays are *not* on
     the launch device, so on a CUDA run the omission is invisible to it.
 16. **A cast inside a kernel is spelled ``wp.int32`` / ``wp.float32``, never bare ``int`` /
-    ``float``** (``.claude/CLAUDE.md`` section 3). They are the same builtins under a different
+    ``float``** (``.claude/CLAUDE.md`` section 1.3). They are the same builtins under a different
     name, with one asymmetry that matters: ``float(...)`` is a *hard compile error* inside a
     ``wp.Float``-generic function, so it silently forecloses genericising that function -- which
     runs against section 14's "prefer dtype-generic ``@wp.func``s". The tree carried 329
     ``int(wp.tid())`` alongside 640 ``wp.int32(...)``, and 46 sites in 41 kernels used *both* on
     the same local. Like checks 9, 13 and 14 this one scans ``kernels/``.
 17. **An integer division inside a kernel is spelled ``//``, never ``/``** (``.claude/CLAUDE.md``
-    section 5). On integers the two are the *same* operation in Warp -- both truncate toward zero,
+    section 1.5). On integers the two are the *same* operation in Warp -- both truncate toward zero,
     where CPython's ``//`` floors -- so this is legibility: ``/`` on two ``int32``s reads as real
     division and truncates only because the operands happen to be integers. A check rather than an
     edit because the defect recurred after the rule was written, and because the scan found four
     sites a textual pass had missed. It types an operand only *by declaration*, which is what makes
     it safe to run on float-heavy code.
 18. **A kernel-scope argument or return is annotated in Warp's types** -- ``wp.bool`` /
-    ``wp.int32`` / ``wp.float32``, not the bare Python names (``.claude/CLAUDE.md`` section 2).
+    ``wp.int32`` / ``wp.float32``, not the bare Python names (``.claude/CLAUDE.md`` section 1.2).
     The third member of the 16/17 family, and the same story: Warp resolves both spellings to the
     same types, so only a scan keeps them from coexisting. The tree carried 11 ``-> bool`` against
     46 ``-> wp.bool`` plus 12 bare parameters, the newest written the day after the pass that
     converted the last batch of casts. It reads ``@wp.kernel`` / ``@wp.func`` signatures only,
     because a kernel *factory* is ordinary Python whose ``int`` parameters are correct.
 19. **A test comparing against a reference library says which class the comparison is**
-    (``.claude/CLAUDE.md`` section 6). The second check that reads ``tests/`` rather than
+    (``.claude/CLAUDE.md`` section 7.4). The second check that reads ``tests/`` rather than
     ``triwarp/``, and it is here because the convention has decayed twice: the lowercase ``class b``
     spelling went 21 -> 0 -> 9, invisible to the grep section 6 prescribes because a human reads it
     the same. It accepts all four label phrases the suite uses, keys on ``ast.Assert`` so a fixture
     unpack is not a hit, and leaves ``_np`` out because it marks inputs as often as oracles. It
     checks that a label is *present*, never that it is the right one.
+24. **A ``.claude/CLAUDE.md`` cross-reference names a section that exists**, and names a
+    *subsection* wherever the chapter has any. The second half is the point: CLAUDE.md's Part I was
+    renumbered and 111 comments kept citing the old chapters, so "section 4" stood at once for
+    ``wp.map`` targets, overload registration, ``wp.launch``'s ``wp.Function`` restriction and
+    ``triplet_buffers``' uninitialized tail. Every one of them still *resolved* -- to "Evolving the
+    public API" -- which is exactly what a resolving check cannot see. Chapters 5, 6, 8, 9, 10 and
+    11 carry no subsection, so a bare number is the only spelling available for them and is
+    accepted; the check reads that from the heading structure rather than a list, so it follows
+    CLAUDE.md if a chapter later gains one.
 
 Why a static scan rather than importing ``triwarp``
 ---------------------------------------------------
@@ -228,7 +237,7 @@ _MODULES_WITHOUT_KERNELS = frozenset({"constants", "io", "mesh", "typing"})
 
 # --- check 8 ------------------------------------------------------------------------------------
 
-# Private helpers that sit above their first caller today. CLAUDE.md section 11 says a helper must
+# Private helpers that sit above their first caller today. CLAUDE.md section 5 says a helper must
 # never appear above the caller it serves, and the package had drifted off that rule wholesale
 # before the check existed -- 49 sites across 15 modules, carried here as an explicit debt list
 # rather than a silent exemption. That list has now been drained: one entry remains, and it is not
@@ -390,7 +399,7 @@ _KERNEL_WRITE_CALLS = frozenset(
 
 # Kernel arguments that are written without the ``out_`` prefix, or that legitimately follow an
 # ``out_`` argument, keyed by ``(kernel module, kernel)``. Two exemption classes, both written into
-# ``.claude/CLAUDE.md`` section 3:
+# ``.claude/CLAUDE.md`` section 2.1:
 #
 # - **In-place**: the argument is both the input and the result -- an ``out_`` prefix would misread
 #   as write-only. ``sort_rows_insertion(data)``, ``orient_ccw(points2d)``,
@@ -1071,7 +1080,7 @@ def _factory_registered(tree: ast.Module, attribute: str) -> frozenset[str]:
     """
     Names passed as the first argument to ``wp.<attribute>(...)`` anywhere in ``tree``.
 
-    A kernel factory (``.claude/CLAUDE.md`` section 2's ``wp.kernel(_k, name=...)``) registers a
+    A kernel factory (``.claude/CLAUDE.md`` section 2.7's ``wp.kernel(_k, name=...)``) registers a
     plain nested ``def`` whose body is Warp's DSL but which carries **no decorator**, so every
     check that enumerates kernel scope by walking ``decorator_list`` is blind to it. That is
     section 4's "a new Warp construct can silently switch off a static check" with the construct
@@ -1175,7 +1184,7 @@ def kernel_output_naming_problems() -> list[str]:
     """
     Check 13: a kernel output argument without the ``out_`` prefix, or not at the signature's end.
 
-    ``.claude/CLAUDE.md`` section 3's naming rule for ``triwarp/kernels/``, with its two written
+    ``.claude/CLAUDE.md`` section 2.1's naming rule for ``triwarp/kernels/``, with its two written
     exemptions (in-place arguments and scratch / persistent-state buffers) carried by
     ``_KERNEL_OUTPUT_ALLOWLIST``. Both directions are checked: a *written* argument must wear the
     prefix, and nothing without the prefix may follow the first argument that wears it.
@@ -1248,7 +1257,7 @@ def array_annotation_style_problems() -> list[str]:
     """
     Check 14: an array annotation spelled ``wp.array(dtype=T)`` rather than ``wp.array[T]``.
 
-    ``.claude/CLAUDE.md`` section 2's subscript style, restricted to *annotation* positions so the
+    ``.claude/CLAUDE.md`` section 1.2's subscript style, restricted to *annotation* positions so the
     scan can cover the whole package: at Python scope ``wp.array(dtype=T)`` is also a legal
     allocation expression, and only in an annotation is it the pre-1.12 spelling.
 
@@ -1363,10 +1372,11 @@ def builtin_cast_problems() -> list[str]:
     """
     Check 16: a bare ``int(...)`` / ``float(...)`` inside a ``@wp.kernel`` or ``@wp.func`` body.
 
-    ``.claude/CLAUDE.md`` section 3: ``wp.int32`` / ``wp.float32`` is the tree's only cast spelling.
-    ``int`` and ``float`` are the same Warp builtins under a different name -- ``int(x)`` compiles
-    only because Warp writes an unconditional ``#define int(x) cast_int(x)`` into every generated
-    module header, ``wp::int(x)`` not being valid C++ -- and the generated code is identical.
+    ``.claude/CLAUDE.md`` section 1.3: ``wp.int32`` / ``wp.float32`` is the tree's only cast
+    spelling. ``int`` and ``float`` are the same Warp builtins under a different name -- ``int(x)``
+    compiles only because Warp writes an unconditional ``#define int(x) cast_int(x)`` into every
+    generated module header, ``wp::int(x)`` not being valid C++ -- and the generated code is
+    identical.
 
     The asymmetry that makes this a rule rather than a preference is ``float``: inside a
     ``wp.Float``-generic function ``total / float(count)`` does not narrow silently, it *fails to
@@ -1512,14 +1522,13 @@ def integer_division_problems() -> list[str]:
     """
     Check 17: an integer ``/`` inside a ``@wp.kernel`` or ``@wp.func`` body.
 
-    ``.claude/CLAUDE.md`` section 5: on integers Warp's ``/`` and ``//`` are the *same* operation --
-    both truncate toward zero, unlike CPython's ``//``, which floors. So this is a legibility rule
-    and not a correctness one: ``/`` on two ``int32``s reads as real division and truncates only
-    because the operands happen to be integers, which means a reader has to recover both types
+    ``.claude/CLAUDE.md`` section 1.5: on integers Warp's ``/`` and ``//`` are the *same* operation
+    -- both truncate toward zero, unlike CPython's ``//``, which floors. So this is a legibility
+    rule and not a correctness one: ``/`` on two ``int32``s reads as real division and truncates
+    only because the operands happen to be integers, which means a reader has to recover both types
     before they know what the line does. Every dividend in this package is a non-negative index,
     where the two conventions coincide; the hazard the spelling creates is *porting* such a line
-    between host Python and kernel scope, where the answer changes silently for a negative
-    dividend.
+    between host Python and kernel scope, where the answer changes silently for a negative dividend.
 
     Why a check rather than a one-off edit: the third pass converted eight sites and wrote the rule
     into ``CLAUDE.md``, and the next module written after it reintroduced two
@@ -1587,12 +1596,12 @@ def bare_annotation_problems() -> list[str]:
     """
     Check 18: a bare ``bool`` / ``int`` / ``float`` annotation in a kernel-scope signature.
 
-    ``.claude/CLAUDE.md`` section 2: kernel arguments and returns are spelled in Warp's types. Warp
-    resolves the bare names to the same ones, so like checks 16 and 17 this is legibility rather
-    than correctness -- and like them, that is exactly why nothing but a scan holds it. The tree
-    carried 11 ``-> bool`` against 46 ``-> wp.bool``, five of them predating the fourth kernel pass
-    and the newest written the day after it, which is section 14's bar for a check: the same defect
-    found twice, in code written after the rule.
+    ``.claude/CLAUDE.md`` section 1.2: kernel arguments and returns are spelled in Warp's types.
+    Warp resolves the bare names to the same ones, so like checks 16 and 17 this is legibility
+    rather than correctness -- and like them, that is exactly why nothing but a scan holds it. The
+    tree carried 11 ``-> bool`` against 46 ``-> wp.bool``, five of them predating the fourth kernel
+    pass and the newest written the day after it, which is section 14's bar for a check: the same
+    defect found twice, in code written after the rule.
 
     The distinction that makes it sound is that it reads *only* ``@wp.kernel`` / ``@wp.func``
     signatures. A kernel **factory** is ordinary Python and its parameters are correctly plain --
@@ -1624,10 +1633,10 @@ def bare_annotation_problems() -> list[str]:
 
 # --- check 19 -----------------------------------------------------------------------------------
 
-# The suffixes ``.claude/CLAUDE.md`` section 6 assigns to reference libraries. ``_np`` is
-# deliberately absent: section 6 gives it to "NumPy/SciPy" and ``tests/parity.py`` counts it, which
-# is right there because a ``parity`` marker has already declared that a second implementation was
-# consulted -- but in the suite at large ``_np`` marks *inputs* at least as often as oracles.
+# The suffixes ``.claude/CLAUDE.md`` section 7.1 assigns to reference libraries. ``_np`` is
+# deliberately absent: section 7.1 gives it to "NumPy/SciPy" and ``tests/parity.py`` counts it,
+# which is right there because a ``parity`` marker has already declared that a second implementation
+# was consulted -- but in the suite at large ``_np`` marks *inputs* at least as often as oracles.
 # Measured: adding it takes this scan from 523 comparison tests to 783 and from 0 problems to 290.
 #
 # ``_gl`` is moderngl's, and this table has to be edited alongside ``tests/parity.py``'s
@@ -1661,10 +1670,10 @@ def comparison_label_problems() -> list[str]:
     """
     Check 19: a test comparing against a reference library says which class the comparison is.
 
-    ``.claude/CLAUDE.md`` section 6 asks for the label and explains what each class means; this only
-    checks that one of the four phrases is present. It cannot check that the label is the *right*
-    one -- that stays a review question, as section 14 says of every naming rule -- and it must not
-    try: a ``_tm`` name inside an ``assert`` is not proof of an oracle.
+    ``.claude/CLAUDE.md`` section 7.4 asks for the label and explains what each class means; this
+    only checks that one of the four phrases is present. It cannot check that the label is the
+    *right* one -- that stays a review question, as section 4.5 says of every naming rule -- and it
+    must not try: a ``_tm`` name inside an ``assert`` is not proof of an oracle.
     ``test_split_single_component`` compares ``split``'s output against ``mesh_tm.vertices``, the
     *input* mesh, which is a round trip; and in
     ``test_split_faces_along_field_positive_side_is_the_clip`` the ``_tm`` names are triwarp results
@@ -1715,10 +1724,10 @@ def kernel_scope_ternary_problems() -> list[str]:
     """
     Check 20: a Python ternary (``a if cond else b``) inside a ``@wp.kernel`` or ``@wp.func`` body.
 
-    ``.claude/CLAUDE.md`` section 5: the tree's spelling for a conditional value at kernel scope is
-    ``wp.where(cond, a, b)``, 33+ sites in 16 kernel modules. A ternary compiles to the same code --
-    Warp lowers ``ast.IfExp`` the same way it lowers a call to ``wp.where`` -- so like checks 16, 17
-    and 18 this is legibility rather than correctness, and like them nothing but a scan holds the
+    ``.claude/CLAUDE.md`` section 1.5: the tree's spelling for a conditional value at kernel scope
+    is ``wp.where(cond, a, b)``, 33+ sites in 16 kernel modules. A ternary compiles to the same code
+    -- Warp lowers ``ast.IfExp`` the same way it lowers a call to ``wp.where`` -- so like checks 16,
+    17 and 18 this is legibility rather than correctness, and like them nothing but a scan holds the
     line. The sixth kernels pass declared this axis at zero and was wrong: two ternaries in
     ``kernels/intersection.py`` (``git log -L`` puts them at a line-length reformat, well before
     that pass) survived it and at least two review passes before. Converting bare ``wp.where``
@@ -1840,7 +1849,7 @@ def bare_tid_problems() -> list[str]:
     """
     Check 22: a single-index ``wp.tid()`` assigned without the declarative ``wp.int32`` cast.
 
-    ``.claude/CLAUDE.md`` section 3 retires every redundant cast and keeps exactly one -- the tid
+    ``.claude/CLAUDE.md`` section 1.3 retires every redundant cast and keeps exactly one -- the tid
     cast -- *because* it is the declarative one: it names the type of the index the whole kernel is
     written against. ``wp.tid()`` already returns ``wp.int32``, so both spellings generate
     identical code and neither the compiler nor the suite can see the difference; this is the fifth
@@ -1905,7 +1914,7 @@ def map_declaration_problems() -> list[str]:
     """
     Check 23: a kernel module that maps its own ``@wp.func`` at two dtypes with no declaration.
 
-    ``.claude/CLAUDE.md`` section 4's ``_register_overloads`` rule, one construct over. ``wp.map``
+    ``.claude/CLAUDE.md`` section 2.5's ``_register_overloads`` rule, one construct over. ``wp.map``
     generates a module named ``map_<unqualified op name>`` and each distinct *call signature* forks
     its hash, so reaching one op at three signatures builds its module three times -- measured
     182 distinct ``map_*`` module loads over 143 ``(module, device, block_dim)`` pairs on one suite
@@ -1941,4 +1950,110 @@ def map_declaration_problems() -> list[str]:
                 f"triwarp/kernels/{module}.py maps '{op}' from {count} call sites and has no "
                 f"_declare_map_kernels() -- see kernels/array.py::declare_map_signatures"
             )
+    return problems
+
+
+# --- check 24 -----------------------------------------------------------------------------------
+
+# A cross-reference into ``.claude/CLAUDE.md``, in every spelling the tree uses: either file name
+# -- ``AGENTS.md`` is a symlink to it and three comments cite it that way -- optionally in single
+# or double backticks and optionally with a ``.claude/`` prefix, then either the word ``section``
+# and a number or a bare ``§`` and a number. ``CLAUDE.md 13.1`` (no connecting word) is a further
+# spelling and is matched too, because it is the same claim with the word dropped.
+#
+# What this cannot see is a reference that names the file in one sentence and the number in the
+# next ("``.claude/CLAUDE.md`` ... which is section 3's point about"). Those exist and were fixed
+# by hand; a regex that matched a bare "section N" anywhere would also match ``kernels/remesh.py``
+# citing "Liepa 2003, section 3", which is a paper and not this file.
+_CLAUDE_SECTION_REFERENCE = re.compile(
+    r"(?:\.claude/)?(?:``|`)?(?:CLAUDE|AGENTS)\.md(?:``|`)?(?:'s)?\s*"
+    r"(?:section\s+|§\s*)?(\d+)(?:\.(\d+))?\b"
+)
+
+# The file itself, and the headings it is the authority for. ``## 7. Testing`` is a chapter,
+# ``### 7.4 The parity gate`` a section.
+_CLAUDE_MD = _REPO_ROOT / ".claude" / "CLAUDE.md"
+_CLAUDE_HEADING = re.compile(r"^#{2,3}\s+(\d+)(?:\.(\d+))?[.\s]", re.MULTILINE)
+
+# Chapter-level references that are deliberately a whole chapter although that chapter *is*
+# subdivided, because the sentence is about its subject as a whole and no single subsection owns
+# it. Keyed by ``(module, "N")`` the way check 9's allowlist is keyed. A chapter with no
+# subsections needs no entry -- the bare number is the only spelling available and the check reads
+# the heading structure rather than a list.
+_CLAUDE_CHAPTER_ALLOWLIST: dict[tuple[str, str], str] = {}
+
+
+def claude_section_reference_problems() -> list[str]:
+    """
+    Check 24: a ``.claude/CLAUDE.md`` cross-reference naming a section that does not exist.
+
+    Two failure modes, and the second is the one that motivated the check. A reference to a
+    subsection that is not a heading in the file is simply broken. A reference to a bare *chapter*
+    number is rejected **when that chapter is subdivided**, even though it resolves, because a
+    chapter number is what let 111 of these rot undetected: CLAUDE.md's Part I was reorganised and a
+    comment citing "section 4" for the ``wp.map`` rule kept resolving -- to "Evolving the public
+    API", which says nothing about ``wp.map``. One number standing for several unrelated sections
+    is exactly what a resolving check cannot see, so where a subsection exists it is the
+    convention.
+
+    **The subdivision test is what keeps this from being a rule half its sites would have to be
+    allowlisted out of.** Six chapters (5, 6, 8, 9, 10, 11) carry no ``###`` heading at all, so a
+    bare number is the only spelling available for them and flagging it would be flagging the
+    correct citation. Reading that from the heading structure rather than from a written list also
+    means the check follows CLAUDE.md if a chapter later gains subsections.
+
+    Scans the same three roots check 9 does. Abstains when ``.claude/CLAUDE.md`` is absent -- it
+    does not ship in the wheel, and a check that cannot read its authority reports nothing rather
+    than guessing.
+    """
+    if not _CLAUDE_MD.is_file():
+        return []
+    text = _CLAUDE_MD.read_text(encoding="utf-8")
+    chapters = {m.group(1) for m in _CLAUDE_HEADING.finditer(text) if m.group(2) is None}
+    sections = {f"{m.group(1)}.{m.group(2)}" for m in _CLAUDE_HEADING.finditer(text) if m.group(2)}
+    subdivided = {section.split(".")[0] for section in sections}
+
+    problems: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for root, prefix in _WARP_VERSION_SCAN_ROOTS:
+        if not root.is_dir():  # neither suite ships in the wheel
+            continue
+        for path in sorted(root.rglob("*.py")):
+            module = path.relative_to(root).with_suffix("").as_posix().replace("/", ".")
+            module = prefix + module.removesuffix(".__init__").lstrip(".")
+            site = path.relative_to(_REPO_ROOT)
+            for lineno, block in _prose_blocks(path.read_text(encoding="utf-8")):
+                for match in _CLAUDE_SECTION_REFERENCE.finditer(block):
+                    line = lineno + block.count("\n", 0, match.start())
+                    chapter, sub = match.group(1), match.group(2)
+                    if sub is not None:
+                        if f"{chapter}.{sub}" not in sections:
+                            problems.append(
+                                f"{site}:{line}: cites CLAUDE.md section {chapter}.{sub}, which "
+                                "is not a heading in .claude/CLAUDE.md -- the file was "
+                                "reorganised, so re-read the sentence and cite the section it "
+                                "now means"
+                            )
+                        continue
+                    key = (module, chapter)
+                    if key in _CLAUDE_CHAPTER_ALLOWLIST:
+                        seen.add(key)
+                        continue
+                    if chapter in chapters and chapter not in subdivided:
+                        continue  # no subsection exists, so the bare number is the citation
+                    detail = (
+                        f"chapter {chapter} is subdivided, so a bare number under-specifies it"
+                        if chapter in chapters
+                        else f"chapter {chapter} is not a heading at all"
+                    )
+                    problems.append(
+                        f"{site}:{line}: cites CLAUDE.md section {chapter} -- {detail}. Cite the "
+                        "subsection (N.M) the sentence actually means, or add a "
+                        "_CLAUDE_CHAPTER_ALLOWLIST entry arguing the whole chapter is the target"
+                    )
+    problems.extend(
+        f"_CLAUDE_CHAPTER_ALLOWLIST entry {key!r} matches nothing in the scanned tree -- drop it"
+        for key in sorted(_CLAUDE_CHAPTER_ALLOWLIST)
+        if key not in seen
+    )
     return problems

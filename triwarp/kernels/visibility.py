@@ -4,7 +4,7 @@ from triwarp.constants import TOLERANCE_PLANAR_CONSTANT
 from triwarp.kernels.tangent_space import any_perpendicular
 
 # Weighting of a ray inside the bundle. Passed as a warp-uniform kernel argument so both schemes
-# share one compiled module (see AGENTS.md section 4 on runtime selection).
+# share one compiled module (see AGENTS.md section 2.7 on runtime selection).
 WEIGHT_COSINE = wp.constant(wp.int32(0))  # Lambert's cosine law: the physical ambient integral
 WEIGHT_UNIFORM = wp.constant(wp.int32(1))  # every direction counts once (libigl's convention)
 
@@ -229,7 +229,7 @@ def support_argmax_sliced(
     # vertex cloud -- rather than a sequence one block owns, so there is no `wp.block_dim()` to
     # stride by. On the CPU device, where `wp.launch_tiled` runs one lane per block through
     # Warp 1.17, that lane would cover `1/block_dim` of the slice. See `.claude/CLAUDE.md`
-    # section 3, and `obscurance` above for the other side of the rule -- one block per point,
+    # section 2.2, and `obscurance` above for the other side of the rule -- one block per point,
     # striding by `wp.block_dim()`, `wp.tile_sum` on both devices.
     #
     # Converting this to one block per deferred query is the same trade

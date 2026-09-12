@@ -1,4 +1,12 @@
-"""Shared numeric tolerances (import from here to avoid circular imports)."""
+"""
+Shared numeric tolerances, sentinel values and tuning constants.
+
+Everything here is imported from this module rather than defined next to its first user, so that
+a value two modules share does not make one of them import the other. Each name is spelled twice
+where both scopes need it: a plain Python number for host-scope arithmetic and a ``wp.<dtype>(...)``
+twin (the ``_CONSTANT`` / ``_F64`` suffixes) for the kernel scope, which fixes the precision the
+value enters kernel arithmetic at.
+"""
 
 import warp as wp
 
@@ -33,7 +41,6 @@ TOLERANCE_ZERO_F64 = wp.float64(TOLERANCE_ZERO)
 INT32_MAX = 2**31 - 1
 INT32_MAX_CONSTANT = wp.int32(INT32_MAX)
 INT64_MAX = 2**63 - 1
-INT64_MAX_CONSTANT = wp.int64(INT64_MAX)
 UINT64_MAX = 2**64 - 1
 UINT64_MAX_CONSTANT = wp.uint64(UINT64_MAX)
 FLOAT32_INF_CONSTANT = wp.INF

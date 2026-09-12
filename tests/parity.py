@@ -81,7 +81,7 @@ _HOLLOW_REASON = re.compile(
     r"^(see\b|n/?a$|todo|tbd|different$|not comparable$|no parity$|timing only$)", re.IGNORECASE
 )
 
-# Reference-variable suffixes mandated by CLAUDE.md section 6, used by the anti-vacuity check.
+# Reference-variable suffixes mandated by CLAUDE.md section 7.1, used by the anti-vacuity check.
 # ``trimesh`` and ``scipy`` also allow ``_np``: several benchmark rows are hand-rolled NumPy
 # stand-ins for cached trimesh properties, and every scipy oracle is plain NumPy in and out.
 #
@@ -623,7 +623,7 @@ def _assigned_names(node: ast.FunctionDef) -> set[str]:
     Every name bound anywhere in a test's body, including tuple targets and comprehensions.
 
     Used only by the anti-vacuity check, which asks whether a ``parity``-marked test names a
-    reference variable at all -- the suffix convention from CLAUDE.md section 6 is the one
+    reference variable at all -- the suffix convention from CLAUDE.md section 7.1 is the one
     machine-readable trace that a second implementation was consulted.
     """
     names: set[str] = set()

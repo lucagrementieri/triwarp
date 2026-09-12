@@ -343,8 +343,8 @@ def test_corner_normals(bench_case: BenchCase, creased: bool) -> None:
     """
     if bench_case.mesh_name in _NON_EDGE_MANIFOLD:
         # Rotating about a vertex needs an edge-manifold mesh. Two scan meshes are not:
-        # ``bunny_decimated``'s 87 duplicated faces (CLAUDE.md section 6) leave 150 edges with three
-        # or more faces, and ``lucy`` has 28. Neither is a size limit -- ``dragon`` is larger.
+        # ``bunny_decimated``'s 87 duplicated faces (CLAUDE.md section 7.6) leave 150 edges with
+        # three or more faces, and ``lucy`` has 28. Neither is a size limit -- ``dragon`` is larger.
         pytest.skip(f"{bench_case.mesh_name} is not edge-manifold, so there is no fan to rotate")
     crease_angle = 0.5
     if bench_case.kind == "meshlib":

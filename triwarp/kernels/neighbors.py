@@ -72,11 +72,11 @@ KNN_ROW_BUCKETS = (1, 4, 8, 16, 32, 64)
 # Which accelerator ``ball_count_in_radius`` / ``ball_collect`` traverse. The ball query is one
 # algorithm — same acceptance rule, same emit protocol — over two broad phases whose query
 # objects are different types with different ``_next`` builtins, so the enumeration cannot be
-# abstracted behind a ``wp.Function`` parameter (CLAUDE.md section 4: ``wp.launch`` cannot pass one
-# as a kernel argument). An int selector can: the branch is warp-uniform, both traversals compile
-# into this one module, and measured on an RTX 5090 (bunny, 20 000 queries, radius 2x and 4x the
-# mean edge) the merged kernels are within noise of the two they replace on the BVH side and
-# 1.05-1.09x *faster* on the hash-grid side, where the counting pass no longer allocates a
+# abstracted behind a ``wp.Function`` parameter (CLAUDE.md section 2.7: ``wp.launch`` cannot pass
+# one as a kernel argument). An int selector can: the branch is warp-uniform, both traversals
+# compile into this one module, and measured on an RTX 5090 (bunny, 20 000 queries, radius 2x and
+# 4x the mean edge) the merged kernels are within noise of the two they replace on the BVH side
+# and 1.05-1.09x *faster* on the hash-grid side, where the counting pass no longer allocates a
 # throwaway per-thread distance slot. On CPU the same hash-grid counting pass gains 1.43-1.84x and
 # the BVH paths lose 1-5%.
 ACCEL_HASHGRID = wp.constant(wp.int32(0))
@@ -98,7 +98,7 @@ ACCEL_BVH = wp.constant(wp.int32(1))
 # ``query_ball_neighbors`` hold at **40** registers and the six row buckets at
 # **42 / 53 / 64 / 92 / 126 / 222**, every one with ``local_memory_size`` **0**, which are the same
 # figures the inline versions reported. And the move is *provably* behaviour-neutral where a
-# float32 extraction would not be (CLAUDE.md section 3 warns that a green suite is not evidence):
+# float32 extraction would not be (CLAUDE.md section 2.4 warns that a green suite is not evidence):
 # neither shared run contains a floating-point expression, so there is no evaluation order for it
 # to disturb.
 
@@ -154,7 +154,7 @@ def query_bvh_ball_neighbors(
 
 # The per-query-box pair, in the order its wrapper appears (section 5). Same walk skeleton as the
 # ball above and a different node test; the count half is a ``wp.map`` over
-# ``aabb_count_in_bounds`` rather than a kernel shim (CLAUDE.md section 4).
+# ``aabb_count_in_bounds`` rather than a kernel shim (CLAUDE.md section 3.5).
 #
 # There was a third pair here, for one warp-uniform half extent, and it is gone: it was exactly
 # this one at ``q -+ h``, returned an identical set, and the corner buffers it saved measured

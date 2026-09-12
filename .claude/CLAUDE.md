@@ -40,7 +40,7 @@ Two conventions that hold throughout:
 3. [Python-scope wrappers](#3-python-scope-wrappers) — layout, `triwarp.typing`, allocation, gather,
    `wp.map`, dtype conversion, `BsrMatrix`, the NumPy policy, device rules, readbacks
 4. [Evolving the public API](#4-evolving-the-public-api) — naming, signatures, docstring agreement,
-   moving/renaming, the 23 mechanical checks
+   moving/renaming, the 24 mechanical checks
 5. [Function ordering within a module](#5-function-ordering-within-a-module)
 6. [Documentation](#6-documentation-mkdocs--mkdocstrings)
 7. [Testing](#7-testing) — conventions, devices, fixtures, the parity gate, shared helpers, the nine
@@ -1296,7 +1296,7 @@ a targeted per-file run does not — a rename is not done until the whole suite 
 
 ### 4.5 The mechanical gate: `tests/api_conventions.py`
 
-**Twenty-three checks**, and they fail the default `pytest` run.
+**Twenty-four checks**, and they fail the default `pytest` run.
 
 - **Eight scan the public surface of `triwarp/` (excluding `kernels/`)**: a summary line naming a
   reference library (1); a `*_mask` producer that does not return `wp.array[wp.bool]` (2); a module
@@ -1358,6 +1358,23 @@ a targeted per-file run does not — a rename is not done until the whole suite 
 - **Check 23**: a kernel module whose `@wp.func` is `wp.map`'d from several sites with no
   declaration table (§3.5). Like its `wp.overload` sibling it asserts a table *exists* and never that
   it is complete; the completeness gate is the load census, which is a clock measurement (§15.1).
+- **Check 24**: a `.claude/CLAUDE.md` cross-reference naming a section that does not exist, **or a
+  bare chapter number where that chapter is subdivided**. The second clause is the one that earns
+  the check, and it is a *staleness* rule rather than a convention one: 111 references across 46
+  files were citing Part I's old numbering, and every one of them still resolved. `section 4` stood
+  simultaneously for §3.5 (`wp.map` targets), §2.5 (overload registration), §2.7 (`wp.launch`
+  cannot pass a `wp.Function`) and §3.7 (`triplet_buffers`' uninitialized tail); `section 6` for
+  four different subsections of §7. One number meaning several sections is exactly what resolution
+  alone cannot see. Chapters 5, 6, 8, 9, 10 and 11 carry no `###` heading, so a bare number is
+  their only citation and is accepted — the check reads that from the file's own headings rather
+  than from a list, which is what keeps `_CLAUDE_CHAPTER_ALLOWLIST` empty (rejecting *every* bare
+  chapter reports 68 sites of which 38 are correct citations — more than half the hits as
+  allowlist, which is how a check gets switched off). It scans `triwarp/`, `tests/` and
+  `benchmarks/`, matches `AGENTS.md` too (a symlink to this file, cited that way at three sites),
+  and abstains when `.claude/CLAUDE.md` is absent. **Two things it cannot see**, both fixed by hand
+  in the pass that added it: a reference naming the file in one sentence and the number in the
+  next, and a bare `section N` belonging to a *paper* — `kernels/remesh.py` cites "Liepa 2003,
+  section 3", and widening the pattern to catch the first misfires on the second.
 
 Each check carries a written allowlist — read the reason before adding an entry, and prefer fixing
 the code. **The gate does not replace review**: it cannot tell whether a *new* name is a good one,

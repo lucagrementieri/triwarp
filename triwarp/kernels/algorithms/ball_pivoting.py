@@ -72,7 +72,7 @@ when it merely lost the claim.
 
 import warp as wp
 
-from triwarp.constants import UINT64_MAX_CONSTANT
+from triwarp.constants import TWO_PI, UINT64_MAX_CONSTANT
 from triwarp.kernels.array import pack_edge_key, tile_argmin
 from triwarp.kernels.grouping import hash_find, hash_find_or_insert
 from triwarp.kernels.predicates import dihedral_angle, triangle_normal
@@ -82,7 +82,6 @@ MAX_SEED_NEIGHBORS = 64
 # Relative slack on the empty-ball test: absorbs float32 round-off so the three defining points
 # (exactly on the ball in exact arithmetic) do not spuriously read as "inside".
 BALL_EPS = wp.constant(wp.float32(1e-4))
-TWO_PI = wp.constant(2.0 * wp.PI)
 
 # ``counters`` slots. Keeping the wave loop's whole control state on device is what lets the loop
 # body run without a host synchronisation, and ultimately inside a captured CUDA graph.

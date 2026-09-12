@@ -953,7 +953,7 @@ def test_icp_mesh_matches_pyvista(device: str, angle: float) -> None:
     reason="MeshLib reaches a mesh target the same way, but its ICP is one call that also "
     "builds the AABB tree it queries, and that tree is cached on the Mesh -- so a row would "
     "time either the build or a warmed query depending on call order, the hazard CLAUDE.md "
-    "section 6 records. Its cloud form already carries the timed row.",
+    "section 7.6 records. Its cloud form already carries the timed row.",
 )
 @pytest.mark.parametrize("mesh_name", ["half_torus", "unit_box"])
 def test_icp_point_to_plane_mesh_matches_meshlib(

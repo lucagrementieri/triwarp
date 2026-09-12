@@ -175,7 +175,7 @@ def sample_grid_trilinear(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 4.
+# CLAUDE.md section 2.5.
 #
 # Field dtypes the three transfer kernels admit, and the whole set: every one of them scales the
 # field by a ``float32`` weight and sums, and Warp requires both operands of that product to share a

@@ -128,7 +128,7 @@ def oriented_box_extents(
     # the loads coalesce, and the threads partition the **outer** work -- the cloud -- rather than a
     # sequence one block owns, so there is no ``wp.block_dim()`` to stride by and a
     # ``wp.tile(...)`` reduction cannot be reached without changing the launch. See
-    # ``.claude/CLAUDE.md`` section 3 for the rule and ``kernels/visibility.py::obscurance`` for a
+    # ``.claude/CLAUDE.md`` section 2.2 for the rule and ``kernels/visibility.py::obscurance`` for a
     # lane-parallel kernel on the other side of it. Converting this one is declined on the
     # measurement ``hull_support_extremes`` carries: the slice dimension is what fills the device,
     # so one block per candidate frame loses 2-8x on a large cloud.

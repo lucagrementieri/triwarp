@@ -201,7 +201,7 @@ def face_corner_edge_vertices(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 4. Two overloads across **2** module loads: the smallest fork in the package.
+# CLAUDE.md section 2.5. Two overloads across **2** module loads: the smallest fork in the package.
 #
 # ``triwarp.seams.cut_along_edges`` scatters the corner *positions* it is splitting, so the value
 # dtype is the vertex dtype it was handed -- ``wp.vec3`` or ``wp.vec3d`` -- and nothing else reaches

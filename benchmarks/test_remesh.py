@@ -177,8 +177,8 @@ def test_subdivide(bench_case: BenchCase) -> None:
 
         This is the third memory-unsafe binding in this wheel, alongside ``igl.loop``'s
         ``free(): invalid pointer`` and ``igl.in_element``'s ``malloc(): invalid size``; see the
-        libigl hazards in ``.claude/CLAUDE.md`` §6. It stays a *tested* reference on the small clean
-        ``icosahedron`` fixture, where 1 200 calls across six processes are clean --
+        libigl hazards in ``.claude/CLAUDE.md`` section 7.6. It stays a *tested* reference on the
+        small clean ``icosahedron`` fixture, where 1 200 calls across six processes are clean --
         ``tests/test_remesh.py::test_subdivide_matches_igl`` keeps the exact class-B comparison.
 
     **pytorch3d** is the third reference and the only GPU one. ``SubdivideMeshes()`` is

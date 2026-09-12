@@ -32,7 +32,7 @@ and to within 5 % on the vertex count.
 **pymeshlab** ``generate_resampled_uniform_mesh`` is MeshLab's offset and is timed at the same cell
 size. Its ``offset`` parameter is passed as ``PureValue``, which is mandatory rather than stylistic:
 as a ``PercentageValue`` it runs from full erosion at 0 % to full dilation at 100 %, so its own
-default is the *zero* offset (CLAUDE.md section 6).
+default is the *zero* offset (CLAUDE.md section 7.6).
 
 open3d has no offset, and neither does trimesh or igl: a level-set offset needs a signed distance
 field on a lattice, and of the six CPU references only these two build one.
@@ -331,7 +331,7 @@ def test_marching_cubes(bench_lib: BenchLibrary, resolution: int) -> None:
 
     ``triwarp-cpu`` reads **23.9 / 221 ms** on the same pair and so loses to meshlib by 9.1x and
     30x. That is the other edge of the same knife and it is not a defect to chase: 143 threads of
-    C++ against Warp's CPU backend is not a comparison of algorithms, and CLAUDE.md section 13's
+    C++ against Warp's CPU backend is not a comparison of algorithms, and CLAUDE.md section 9's
     "decide on the CUDA number" is what governs.
 
     **igl and pyvista bring the group to four implementations of one case table**, which makes it

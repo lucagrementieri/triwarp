@@ -12,7 +12,7 @@ per-launch one, so the factor scales with launch count rather than with work:
   ``tests/test_heat_signed.py --device=cpu`` **166.77 s** against **8.53 s** (19.6x).
 
 Unchanged by ``warp.config.launch_array_access_mode`` (``RELAXED`` 50.34 s, ``CHECKED`` 49.77 s on
-the solver), so it is CUDA presence and not CLAUDE.md section 8's launch guard. Either way a
+the solver), so it is CUDA presence and not CLAUDE.md section 3.9's launch guard. Either way a
 ``triwarp-cpu`` row taken in a CUDA-initialised process is not a slow number, it is a **wrong** one,
 and it reads as triwarp losing to CPU references it actually beats. ``benchmarks/conftest.py`` warns
 when that configuration is selected; this script is the way to avoid it.

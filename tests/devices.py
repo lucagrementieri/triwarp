@@ -8,7 +8,7 @@ single ``pytest --device=both`` pays that on every CPU parametrization. Measured
 ``heat_signed_distance`` call -- same mesh, same code, only ``CUDA_VISIBLE_DEVICES`` differing --
 50.57 s with CUDA visible against **1.40 s** without, and the figure is unchanged by
 ``warp.config.launch_array_access_mode`` (``RELAXED`` 50.34 s, ``CHECKED`` 49.77 s), so it is CUDA
-presence rather than CLAUDE.md section 8's launch guard. Whole-suite consequence: 717 s in one
+presence rather than CLAUDE.md section 3.9's launch guard. Whole-suite consequence: 717 s in one
 process, against ~37.6 s + ~155 s as two.
 
 Both-device coverage earns the second process. It is what caught the ``warp.fem`` ambient-device

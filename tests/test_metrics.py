@@ -250,7 +250,7 @@ def test_chamfer_points_to_mesh_forward_matches_meshlib(
 
     Measured 2.4e-07 max absolute difference over 500 points (1.1e-07 relative), which is triwarp's
     float32 vertex storage against MeshLib's float32 -- see the `getNumpyVerts` note in CLAUDE.md
-    section 6.
+    section 7.6.
 
     Three MeshLib call conventions this depends on, each a documented hazard:
     ``updateMeshData`` stores a raw pointer, so ``mesh_ml`` is bound to a name that outlives every

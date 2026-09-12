@@ -333,7 +333,7 @@ def test_geodesic_path_is_never_shorter_than_the_exact_geodesic(
 
     ``igl.exact_geodesic`` needs **all six** arguments -- a four-argument call binds ``vt`` to
     ``fs`` and returns an empty array rather than raising -- so both face sets are passed
-    explicitly empty (CLAUDE.md section 6).
+    explicitly empty (CLAUDE.md section 7.6).
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)

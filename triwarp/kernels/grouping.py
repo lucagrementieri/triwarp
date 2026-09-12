@@ -319,7 +319,7 @@ def round_vec3_scaled(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 4. Measured over the suite: 7 overloads created across **9** module loads.
+# CLAUDE.md section 2.5. Measured over the suite: 7 overloads created across **9** module loads.
 #
 # These take the caller's *key* dtype, and the two sets differ because the two call paths do.
 # ``mark_group_starts`` is reached from ``grouping.group``, which widens through

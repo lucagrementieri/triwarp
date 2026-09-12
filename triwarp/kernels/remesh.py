@@ -244,7 +244,7 @@ def loop_even_positions(
 # from the same three grids the positions come from and through the same two weight functions. Row
 # ``v`` is the relocated original vertex ``v``; row ``n_vertices + e`` is the odd vertex on unique
 # edge ``e``. Every slot is written -- a zero weight where a rule does not apply -- because
-# ``triplet_buffers`` hands back uninitialized memory (CLAUDE.md section 4).
+# ``triplet_buffers`` hands back uninitialized memory (CLAUDE.md section 3.7).
 @wp.kernel
 def loop_even_self_triplets(
     valence: wp.array[wp.int32],
@@ -1454,7 +1454,7 @@ def claim_collapse_key(
     # guarded against at all. It was two kernels -- ``claim_collapses`` and this -- whose bodies
     # became byte-identical once ``scatter.lock_two_rings`` was extracted and the isotropic path's
     # raw-index key was fixed; the duplicate scan found them the same pass that produced them,
-    # which is section 3's point about a fusion not being done until the shared code has a name.
+    # which is section 2.4's point about a fusion not being done until the shared code has a name.
     # The key is ``scramble_index(k)`` and not ``k`` for the reason that function records at
     # length: a min-key lock over a *spatially monotone* key field has essentially one local
     # minimum, so it commits a single collapse per pass however many candidates there are. This
@@ -2063,7 +2063,7 @@ def cluster_pick_closest(
 
 
 # Objective for ``objective_flip_candidates``. A warp-uniform kernel argument rather than a
-# ``wp.Function``, so both predicates share one compiled module (AGENTS.md section 4).
+# ``wp.Function``, so both predicates share one compiled module (AGENTS.md section 2.7).
 OBJECTIVE_PLANARITY = wp.constant(wp.int32(0))  # improve triangle shape on a near-planar quad
 OBJECTIVE_CURVATURE = wp.constant(wp.int32(1))  # pick whichever diagonal bends the surface less
 OBJECTIVE_T_VERTEX = wp.constant(wp.int32(2))  # break up a sliver whose apex sits on the far edge
@@ -2488,7 +2488,7 @@ def compose_vertex_index(
     # capturable -- instead of a chain of per-pass maps the caller would have to fold itself.
     #
     # ``index`` is genuinely in place: it is both the pass's input and its result, so an ``out_``
-    # prefix would read as write-only (CLAUDE.md section 3's first exemption class).
+    # prefix would read as write-only (CLAUDE.md section 2.1's first exemption class).
     i = wp.int32(wp.tid())
     current = index[i]
     if current >= 0:

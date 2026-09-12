@@ -56,7 +56,7 @@ def sign_with_tolerance(value: wp.Float, tolerance: wp.Float) -> wp.int32:
     #
     # The classifiers pass ``TOLERANCE_MERGE_CONSTANT`` because their public entry points
     # (``slice_mesh_with_plane``, ``clip_mesh_with_field``, ``split_faces_along_field``) expose no
-    # tolerance and, per CLAUDE.md section 14, should not grow one until a caller needs it;
+    # tolerance and, per CLAUDE.md section 4.2, should not grow one until a caller needs it;
     # ``split_mesh_with_plane`` documents a ``tolerance=`` and passes it through. Both spellings are
     # now visible at the call site, which is the whole point.
     if value < -tolerance:
@@ -218,7 +218,7 @@ def lift_vec2(p: wp.vec2, z: wp.float32) -> wp.vec3:
     #
     # The fifth of the vec-conversion family above, and it was written **twice** -- once in
     # ``kernels/creation.py`` with this signature and once in ``kernels/proximity.py`` with the
-    # height hardcoded to zero -- which is the collision ``.claude/CLAUDE.md`` section 4 warns
+    # height hardcoded to zero -- which is the collision ``.claude/CLAUDE.md`` section 3.5 warns
     # about as a hypothetical: ``wp.map``'s cache is keyed by the *unqualified* function name plus
     # the input dtypes, so two same-named ops fork one generated module. The two arities kept it
     # from being a wrong answer, and a warp-debug log of one suite run showed what it did cost --
@@ -642,7 +642,7 @@ def mark_rows_present(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 4. Measured over the suite: 12 overloads created across **13** module loads,
+# CLAUDE.md section 2.5. Measured over the suite: 12 overloads created across **13** module loads,
 # and this module is imported by 25 kernel modules and 15 wrappers, so its rebuilds are felt widely.
 #
 # The index-buffer kernels fill a buffer every caller in the package allocates ``wp.int32``;
@@ -1135,7 +1135,7 @@ def trilinear_cell(coordinate: wp.vec3, shape: wp.vec3i) -> tuple[wp.vec3i, wp.v
     # base is 0 and ``base + 1`` is one slice past the end -- an out-of-bounds access at every one
     # of the four stencil corners on that axis. The fraction there is 0, so the *weight* is 0 and no
     # number is ever wrong; the address is computed and dereferenced regardless, which on the CPU
-    # device is host-heap corruption (CLAUDE.md section 12) and in release mode is silent on both.
+    # device is host-heap corruption (CLAUDE.md section 12.1) and in release mode is silent on both.
     # Handing back ``next_corner`` is what makes that unwriteable rather than merely documented.
     #
     # For any axis with two or more samples ``base <= shape - 2``, so ``next_corner`` is exactly

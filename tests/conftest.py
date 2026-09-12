@@ -363,7 +363,8 @@ def bohemian_dome(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
 # This is the one place in ``tests/`` where a fixture's geometry comes from MeshLib. That is
 # deliberate and it is allowed -- a test dependency is what MeshLib is licensed for, and nothing
 # under ``triwarp/`` names it -- but it goes through ``meshlib_to_trimesh``, which packs the mesh:
-# reading ``getNumpyFaces`` off an unpacked one returns rows of ``[0, 0, 0]`` (CLAUDE.md section 6).
+# reading ``getNumpyFaces`` off an unpacked one returns rows of ``[0, 0, 0]`` (CLAUDE.md
+# section 7.6).
 _TORUS_PRIMARY_RADIUS = 1.0
 _TORUS_RESOLUTION = 16
 
@@ -402,7 +403,7 @@ def torus_spikes(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     512 faces, closed and edge-manifold, with the *only* genuinely spiky vertices in the suite: at a
     1.5-pi angle-sum threshold twelve of its 256 vertices fail, and five at pi. Every clean fixture
     has none, so a spike detector or a spike repair tested on one is asserting an empty answer --
-    which is the trap ``test_ears`` fell into (CLAUDE.md section 6).
+    which is the trap ``test_ears`` fell into (CLAUDE.md section 7.4).
 
     The inner and outer tube radii are what make the needles: 0.1 against 0.5 means alternate rings
     sit far apart radially while their neighbours along the tube are close, so the cone at a wide

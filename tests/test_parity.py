@@ -202,8 +202,8 @@ def test_parity_claims_read_a_reference_variable() -> None:
 
     A marker is a self-assertion, and the likeliest way for one to be wrong is to land on a test
     that only compares triwarp with itself -- a precomputed-argument shortcut, say. The
-    reference-variable suffixes CLAUDE.md section 6 already mandates (``_tm`` / ``_igl`` / ``_pp`` /
-    ``_pml`` / ``_o3d``, plus ``_np`` where the oracle is hand-rolled NumPy) are the one
+    reference-variable suffixes CLAUDE.md section 7.1 already mandates (``_tm`` / ``_igl`` /
+    ``_pp`` / ``_pml`` / ``_o3d``, plus ``_np`` where the oracle is hand-rolled NumPy) are the one
     machine-readable trace that a second implementation was consulted.
 
     This is the most heuristic check here, and the most likely to need adjusting rather than

@@ -200,7 +200,7 @@ def is_in_aabb(point: Any, min_bound: Any, max_bound: Any) -> wp.bool:
     # ``GetPointIndicesWithinBoundingBox`` compares component-wise for exactly this reason.
     #
     # Generic over the scalar type but fixed at three components: a vector has no readable
-    # component count in kernel scope (the same restriction ``.claude/CLAUDE.md`` section 14
+    # component count in kernel scope (the same restriction ``.claude/CLAUDE.md`` section 1.2
     # records for a matrix's ``.shape``), so a rank-free spelling would have to go back through
     # ``wp.min`` and give up the ``nan`` answer.
     return (

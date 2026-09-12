@@ -88,7 +88,7 @@ Two hazards decide every row here, both measured:
   helix at ``maxError=0.1``: ``vertsDeleted`` is **104**, ``points.size()`` is still **128**, and
   ``topology.numValidVerts()`` is **24**. ``totalLength()`` is already correct before packing, so a
   *length* comparison passes unpacked while a *point-count* one silently reads the input's count and
-  reads as a no-op. This is CLAUDE.md section 6's ``getNumpyFaces``-without-``pack()`` rule, in a
+  reads as a no-op. This is CLAUDE.md section 7.6's ``getNumpyFaces``-without-``pack()`` rule, in a
   class that rule does not name.
 
 The three groups that stay triwarp-only, and why it is per-function rather than blanket:

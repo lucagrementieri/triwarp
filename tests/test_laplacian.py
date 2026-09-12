@@ -884,7 +884,7 @@ def test_connection_laplacian_matches_potpourri3d(
 
     The second is the real content. A connection Laplacian is defined only up to a choice of
     reference direction per vertex, and the two libraries choose differently, so **individual
-    entries are not comparable** -- CLAUDE.md section 6's rule about tangent-space quantities.
+    entries are not comparable** -- CLAUDE.md section 7.6's rule about tangent-space quantities.
     What a gauge change cannot touch is a diagonal unitary conjugation's invariants, and two are
     checked here: the entry **magnitudes** ``|L_ij|``, which are the cotangent weights, and the
     **whole spectrum**, since ``L`` is Hermitian and conjugation by a unitary preserves eigenvalues.

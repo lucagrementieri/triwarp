@@ -3514,7 +3514,7 @@ def test_split_edges_all_matches_igl_and_open3d(icosahedron: tuple[tm.Trimesh, w
 
     The named transform is a nearest-neighbour bijection on the vertex set, because the three
     libraries number the inserted midpoints in three different orders -- ``lexsort_rows`` is not
-    usable on float coordinates (CLAUDE.md section 6), and the counts are asserted first so the
+    usable on float coordinates (CLAUDE.md section 7.5), and the counts are asserted first so the
     bijection cannot hide a missing or duplicated vertex. Measured max nearest-neighbour distance
     5.4e-08 against both, i.e. triwarp's float32 storage.
 

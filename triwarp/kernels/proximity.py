@@ -482,7 +482,7 @@ def winding_number_tiled(
     # Lane-free because the threads partition the **outer** work -- the face list -- rather than a
     # sequence one block owns, so there is no `wp.block_dim()` to stride by; on the CPU device,
     # where `wp.launch_tiled` runs one lane per block through Warp 1.17, that lane would cover
-    # `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 3, and
+    # `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 2.2, and
     # `face_to_mesh_distance_tiled` above for the other side of the rule.
     #
     # **The block-per-query rewrite was measured here and declined.** It looked like the strongest
@@ -491,7 +491,7 @@ def winding_number_tiled(
     # interleaved, `min` of 9, agreeing to 6e-07 (a different summation order, not a different
     # answer): **2.16x** at 1 280 faces and 4 096 queries, **1.19x** at 5 120 faces, **1.01x** at
     # 5 120 faces and 65 536 queries. A gain that shrinks with the input is a decline (CLAUDE.md
-    # section 13), and the reason is that this grid is `n_queries x n_face_slices` and already
+    # section 9), and the reason is that this grid is `n_queries x n_face_slices` and already
     # wide; see `kernels/points.py::hull_support_extremes` for the same trade measured to an
     # outright 2-8x loss.
     #

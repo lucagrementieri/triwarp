@@ -466,7 +466,7 @@ def hull_support_extremes(
     # over -- rather than a sequence one block owns, so there is no `wp.block_dim()` for them to
     # stride by and a `wp.tile_max(wp.tile(...))` cannot be reached from here without changing the
     # launch. `wp.launch_tiled` runs one lane per block on the CPU device through Warp 1.17, and
-    # that lane would then cover `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 3;
+    # that lane would then cover `1/block_dim` of the slice. See `.claude/CLAUDE.md` section 2.2;
     # `farthest_point_sample_block` below is the other side of the rule, and reduces with
     # `wp.tile_max` on both devices because its stride *is* `wp.block_dim()`.
     #

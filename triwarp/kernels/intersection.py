@@ -392,7 +392,7 @@ def mark_pair_masks(
     # One mask per mesh from the pair list. Written as a kernel rather than two
     # ``scatter.mark_membership_mask`` calls over ``pairs[:, k]`` because such a column is a
     # *strided* view, and Warp's Python-scope gather reads an index buffer as if contiguous
-    # (CLAUDE.md section 4) -- it would silently mark the wrong faces.
+    # (CLAUDE.md section 3.4) -- it would silently mark the wrong faces.
     i = wp.int32(wp.tid())
     out_mask_a[pairs[i, 0]] = True
     out_mask_b[pairs[i, 1]] = True
@@ -1057,7 +1057,7 @@ def marching_triangles_segments(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 4. Measured at 2 overloads across **4** module loads, on a 15-kernel module.
+# CLAUDE.md section 2.5. Measured at 2 overloads across **4** module loads, on a 15-kernel module.
 #
 # Only the scalar field being contoured is generic: ``marching_triangles`` accepts a ``wp.float32``
 # or ``wp.float64`` per-vertex field (the heat solvers produce the latter), while the geometry it

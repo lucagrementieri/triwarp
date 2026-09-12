@@ -155,7 +155,7 @@ def mis_root_flag(state: wp.int32) -> wp.int32:
     # round cap is reached becomes an aggregate of its own instead of an unaggregated hole. The
     # selection normally settles well inside the cap and the two readings then coincide.
     #
-    # A ``@wp.func`` rather than a kernel because the wrapper maps it (CLAUDE.md section 4). It
+    # A ``@wp.func`` rather than a kernel because the wrapper maps it (CLAUDE.md section 3.5). It
     # returns the flag directly rather than composing ``array.not_equal`` with an
     # ``array_cast(bool -> int32)``, which would be two device passes and a second buffer.
     return wp.where(state != MG_EXCLUDED, wp.int32(1), wp.int32(0))
@@ -164,13 +164,14 @@ def mis_root_flag(state: wp.int32) -> wp.int32:
 @wp.func
 def aggregate_label(state: wp.int32, scan_pos: wp.int32) -> wp.int32:
     # An excluded node has no aggregate; everything else takes the (0-based) index its inclusive
-    # scan position names. A `wp.map` target (CLAUDE.md section 4) rather than a kernel: the body
+    # scan position names. A `wp.map` target (CLAUDE.md section 3.5) rather than a kernel: the body
     # is one indexed assignment reading only `state[i]` / `scan_pos[i]`, the elementwise-map scan's
     # own definition of a trivial kernel. Left un-hoisted (no `return_kernel=True`) at its one call
     # site inside `linalg._multigrid_aggregate`'s per-level loop: hoisting would need a dummy
     # int32 array allocated before the loop just to seed the kernel factory, or threading the
     # cached kernel object through the function's signature, for an ~11 us/level saving against a
-    # setup section already measured at 9-18 ms (CLAUDE.md section 13) -- not where that cost lives.
+    # setup section already measured at 9-18 ms (CLAUDE.md section 13.1) -- not where that cost
+    # lives.
     return wp.where(state != MG_EXCLUDED, scan_pos - wp.int32(1), MG_UNAGGREGATED)
 
 

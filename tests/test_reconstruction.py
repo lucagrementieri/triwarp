@@ -582,7 +582,7 @@ def _poisson_depth(device: str) -> int:
     level, and the CPU backend is not close to CUDA on it.
 
     Measured on Warp 1.16, 642-point cloud, the two depths **interleaved in one process** and read
-    as the minimum of three (CLAUDE.md section 13): depth 5 takes **7.95 s** on CPU against depth
+    as the minimum of three (CLAUDE.md section 15.7): depth 5 takes **7.95 s** on CPU against depth
     6's **68.09 s**, a **8.6x** saving per solve, matching the 8x the grid size predicts. Both are
     ~0.01 s on CUDA.
 
@@ -738,7 +738,7 @@ def test_poisson_screening_improves_fit(device: str):
     Triwarp against triwarp: screening ties the surface to the samples, so the fit cannot worsen.
 
     Also the only test that reconstructs at ``point_weight=0``, which is why the no-degenerate-face
-    invariant is asserted here rather than in a test of its own (CLAUDE.md section 6). That config
+    invariant is asserted here rather than in a test of its own (CLAUDE.md section 7.4). That config
     is ill-conditioned -- the operator is held SPD by a ``1e-4`` floor alone -- and its raw
     marching-cubes output carried 27-64 zero-area triangles, run to run, until
     ``screened_poisson`` grew its ``remove_degenerate_faces`` tail. They are not cosmetic: a

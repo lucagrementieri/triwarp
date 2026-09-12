@@ -317,7 +317,7 @@ def add_constant(length: wp.float32, delta: wp.float32) -> wp.float32:
 
 
 # Concrete overloads, registered at import -- see the long-form rationale in
-# ``triwarp/kernels/reduce.py`` and the rule in CLAUDE.md section 4. In short: these kernels are
+# ``triwarp/kernels/reduce.py`` and the rule in CLAUDE.md section 2.5. In short: these kernels are
 # generic, Warp instantiates an overload on the first launch at each new dtype, and a module's hash
 # covers the instantiated set -- so a lazily-created overload rebuilds the whole module. Measured
 # over the suite: 14 overloads created across **16** distinct module loads.

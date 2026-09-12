@@ -42,6 +42,7 @@ from tests.api_conventions import (
     bare_annotation_problems,
     bare_tid_problems,
     builtin_cast_problems,
+    claude_section_reference_problems,
     comparison_label_problems,
     coverage_location_problems,
     docstring_examples,
@@ -95,7 +96,7 @@ def test_summaries_do_not_name_a_reference_library() -> None:
     A one-line summary says what the function returns, not which C++ call it wraps.
 
     mkdocstrings renders the summary as the entry in the module's API index, so a library name there
-    turns the index into a table of bindings -- the same defect ``.claude/CLAUDE.md`` section 14
+    turns the index into a table of bindings -- the same defect ``.claude/CLAUDE.md`` section 4.1
     already forbids one level in, where it rules that a function is named after what it returns.
     Attribution is wanted and stays: one line down, in ``Notes`` or ``See Also``.
     """
@@ -122,7 +123,7 @@ def test_coverage_lives_beside_its_module() -> None:
     """
     Every module has a ``tests/`` and a ``benchmarks/`` file named for it, and vice versa.
 
-    ``.claude/CLAUDE.md`` section 14's "coverage is per module" rule, made mechanical. The failure
+    ``.claude/CLAUDE.md`` section 4.2's "coverage is per module" rule, made mechanical. The failure
     it catches is a function's tests drifting into a neighbour's file, which is invisible until
     somebody goes looking for them -- and a suite file whose module has been renamed out from under
     it.
@@ -156,10 +157,11 @@ def test_kernel_modules_are_named_for_their_wrapper() -> None:
     """
     ``triwarp/kernels/<module>.py`` backs ``triwarp/<module>.py``, one to one.
 
-    ``.claude/CLAUDE.md`` section 4's rule. It is what stops a wrapper module from being created or
-    renamed while its kernels are left behind under the old name -- the half of a move that compiles
-    fine and is therefore easy to skip. ``predicates`` and ``scatter`` are the shared kernel-side
-    libraries that back no single module; sub-packages mirror a folder and are not checked here.
+    ``.claude/CLAUDE.md`` section 3.1's rule. It is what stops a wrapper module from being created
+    or renamed while its kernels are left behind under the old name -- the half of a move that
+    compiles fine and is therefore easy to skip. ``predicates`` and ``scatter`` are the shared
+    kernel-side libraries that back no single module; sub-packages mirror a folder and are not
+    checked here.
     """
     _fail("kernel/wrapper module name mismatch(es):", kernel_module_problems())
 
@@ -168,7 +170,7 @@ def test_private_helpers_follow_their_callers() -> None:
     """
     A private helper is defined below the public function that calls it (the stepdown rule).
 
-    ``.claude/CLAUDE.md`` section 11: a reader should never need to jump backward to a definition
+    ``.claude/CLAUDE.md`` section 5: a reader should never need to jump backward to a definition
     they have not been introduced to yet. ``_HELPER_ORDER_ALLOWLIST`` carried the 49 sites that
     predated this check as an explicit debt list rather than a silent exemption, and the staleness
     half of it did its job: the list is now drained to a single permanent entry, a helper called at
@@ -247,7 +249,7 @@ def test_kernel_outputs_are_named_and_placed() -> None:
     """
     A kernel argument the kernel writes is named ``out_*``, and every ``out_*`` argument is last.
 
-    ``.claude/CLAUDE.md`` section 3's rule, checked from both sides after the first full sweep of
+    ``.claude/CLAUDE.md`` section 2.1's rule, checked from both sides after the first full sweep of
     ``kernels/`` found eight outputs wearing plain names (four literally ``out``) and three
     read-only inputs wearing the prefix (``claim_collapses`` read a *prior* kernel's outputs under
     their producer's names). In-place arguments and scratch / persistent-state buffers are exempt
@@ -260,7 +262,7 @@ def test_array_annotations_are_subscript_style() -> None:
     """
     An array annotation reads ``wp.array[T]``, never the pre-1.12 ``wp.array(dtype=T)``.
 
-    ``.claude/CLAUDE.md`` section 2. Both spellings compile, so nothing but a check stops the old
+    ``.claude/CLAUDE.md`` section 1.2. Both spellings compile, so nothing but a check stops the old
     one from coming back with the next large module: it survived in ``algorithms/ball_pivoting.py``
     (98 of the 176), ``reconstruction.py`` and ``remesh.py`` long after the convention settled, and
     ``remesh.py`` carried both styles at once -- which is the state that leaves a reader unsure
@@ -273,7 +275,7 @@ def test_kernel_casts_use_the_warp_spelling() -> None:
     """
     A cast inside a kernel reads ``wp.int32(...)`` / ``wp.float32(...)``, never ``int`` / ``float``.
 
-    ``.claude/CLAUDE.md`` section 3. The two spellings are the same Warp builtins and generate
+    ``.claude/CLAUDE.md`` section 1.3. The two spellings are the same Warp builtins and generate
     identical code, so nothing but a check keeps them from coexisting -- the tree carried 329
     ``int(wp.tid())`` against 640 ``wp.int32(...)``, and 46 sites in 41 kernels cast a thread index
     with one spelling and re-cast the same local with the other a few lines later.
@@ -291,7 +293,7 @@ def test_kernel_integer_division_uses_the_floor_spelling() -> None:
     """
     An integer division inside a kernel reads ``//``, never ``/``.
 
-    ``.claude/CLAUDE.md`` section 5. On integers the two are the *same* operation in Warp -- both
+    ``.claude/CLAUDE.md`` section 1.5. On integers the two are the *same* operation in Warp -- both
     truncate toward zero, where CPython's ``//`` floors -- so this is legibility, not correctness:
     ``/`` on two ``int32``s reads as real division and a reader has to recover both operand types
     before they know the line truncates.
@@ -354,7 +356,7 @@ def test_kernel_signatures_use_the_warp_types() -> None:
     """
     A kernel-scope argument or return is annotated ``wp.bool`` / ``wp.int32`` / ``wp.float32``.
 
-    ``.claude/CLAUDE.md`` section 2. Warp resolves the bare names to the same types, so -- as with
+    ``.claude/CLAUDE.md`` section 1.2. Warp resolves the bare names to the same types, so -- as with
     checks 16 and 17 -- nothing but a scan keeps the two spellings from coexisting: the tree carried
     11 ``-> bool`` against 46 ``-> wp.bool``, plus 12 bare ``int`` / ``bool`` parameters, and the
     newest of them was written the day after the kernel pass that converted the last batch of casts.
@@ -414,7 +416,7 @@ def test_kernel_scope_has_no_python_ternary() -> None:
     """
     A ``@wp.kernel`` / ``@wp.func`` body spells a conditional value ``wp.where(cond, a, b)``.
 
-    ``.claude/CLAUDE.md`` section 5. A Python ternary (``a if cond else b``) compiles to the same
+    ``.claude/CLAUDE.md`` section 1.5. A Python ternary (``a if cond else b``) compiles to the same
     code as ``wp.where``, so -- as with checks 16, 17 and 18 -- nothing but a scan keeps the two
     spellings apart. This is check 20, added because the sixth kernels pass reported this axis at
     zero and was wrong: two ternaries in ``kernels/intersection.py`` predate that pass by several
@@ -427,7 +429,7 @@ def test_generic_kernels_register_their_overloads() -> None:
     """
     A ``@wp.kernel`` generic over a dtype has its concrete overloads registered at import.
 
-    ``.claude/CLAUDE.md`` section 4. Warp instantiates a generic kernel's overload lazily, on the
+    ``.claude/CLAUDE.md`` section 2.5. Warp instantiates a generic kernel's overload lazily, on the
     first launch at each new dtype, and a module's hash covers the *instantiated* set -- so a
     lazily-created overload silently rebuilds every kernel in its module. Nothing fails when that
     happens, which is why it needs a check: the whole defect is a cost. Measured before the
@@ -440,7 +442,7 @@ def test_generic_kernels_register_their_overloads() -> None:
     cannot tell whether the registered dtype set is complete**, and no cheap check can: proving that
     means launching the whole dispatch, and a missing dtype announces itself as a rebuild rather
     than a wrong answer. So a suddenly slow test is the symptom to read, per ``.claude/CLAUDE.md``
-    section 13 -- the dtype belongs in the module's ``_register_overloads``.
+    section 15.1 -- the dtype belongs in the module's ``_register_overloads``.
     """
     unregistered = [
         key
@@ -480,7 +482,7 @@ def test_public_functions_document_what_they_raise() -> None:
     """
     A public function with a ``raise`` in its own body documents a ``Raises`` block.
 
-    ``.claude/CLAUDE.md`` section 14's "docstring, signature and body must agree", from the side
+    ``.claude/CLAUDE.md`` section 4.3's "docstring, signature and body must agree", from the side
     where the body says more than the docstring. Delegated validation is not scanned -- 42 public
     functions correctly document a ``Raises`` their shared guard performs.
     """
@@ -566,9 +568,9 @@ def test_reference_comparisons_carry_a_class_label() -> None:
     """
     A test asserting against a reference library says which class the comparison is.
 
-    ``.claude/CLAUDE.md`` section 6, and it is a gate rather than a convention because the
+    ``.claude/CLAUDE.md`` section 7.4, and it is a gate rather than a convention because the
     convention has decayed twice: the lowercase ``class b`` spelling went from 21 occurrences to 0
-    in one pass and back to 9 in the next, invisible to the grep section 6 prescribes because a
+    in one pass and back to 9 in the next, invisible to the grep section 7.4 prescribes because a
     human reads ``class B`` and ``Class B`` the same. It also closes a rarer and worse case --
     ``test_fill_min_weight_matches_meshlib`` carried a ``parity`` marker, compared a class-C
     statistic against MeshLib and had no docstring at all, which ruff cannot see because ``D103``
@@ -701,7 +703,7 @@ def test_single_index_tid_carries_the_declarative_cast() -> None:
     """
     A single-index ``wp.tid()`` is assigned as ``wp.int32(wp.tid())``, the one cast the tree keeps.
 
-    ``.claude/CLAUDE.md`` section 3. ``wp.tid()`` already returns ``wp.int32``, so both spellings
+    ``.claude/CLAUDE.md`` section 1.3. ``wp.tid()`` already returns ``wp.int32``, so both spellings
     generate identical code and the defect is invisible to the compiler and to the suite -- this is
     check 22, the fifth member of the family checks 16, 17, 18 and 20 belong to. It was written
     with the axis at 422 cast against 45 bare, and the drift was per *file* rather than scattered,
@@ -825,4 +827,36 @@ def test_repeatedly_mapped_kernel_funcs_declare_their_signatures() -> None:
     _fail(
         "kernel module(s) mapping an op from several sites with no declaration table:",
         map_declaration_problems(),
+    )
+
+
+def test_claude_references_name_a_section_that_exists() -> None:
+    """
+    A ``.claude/CLAUDE.md`` cross-reference resolves, and names a subsection where one exists.
+
+    Not a library comparison: this is a property of triwarp's own prose. Check 24, and it is the
+    staleness half of the gate rather than a convention half -- the references it catches were all
+    *correct* when they were written and rotted when CLAUDE.md's Part I was renumbered.
+
+    **What makes it a check rather than a grep is the second clause.** A broken ``N.M`` reference
+    is caught by resolution alone, but the 111 sites this was written for were bare *chapter*
+    numbers, every one of which still resolved: "section 4" was standing for section 3.5
+    (``wp.map`` targets), 2.5 (overload registration), 2.7 (``wp.launch`` cannot pass a
+    ``wp.Function``) and 3.7 (``triplet_buffers``' uninitialized tail) at once, and "section 6" for
+    four different subsections of chapter 7. One number meaning several sections is invisible to a
+    resolving check, so the rule is that a subsection is named wherever one exists.
+
+    The exemption is structural rather than written: chapters 5, 6, 8, 9, 10 and 11 have no ``###``
+    heading, so a bare number is their only citation and flagging it would flag the correct
+    spelling. Reading that from the file's own headings is what keeps the allowlist empty -- an
+    allowlist carrying six entries that are really one fact is how a check gets switched off.
+
+    Two things it deliberately cannot see, both fixed by hand in the pass that added it: a
+    reference that names the file in one sentence and the number in the next, and a bare
+    "section N" that belongs to a *paper* rather than to CLAUDE.md (``kernels/remesh.py`` cites
+    "Liepa 2003, section 3"). Widening the pattern to catch the first would misfire on the second.
+    """
+    _fail(
+        "CLAUDE.md cross-reference(s) naming a stale or under-specified section:",
+        claude_section_reference_problems(),
     )

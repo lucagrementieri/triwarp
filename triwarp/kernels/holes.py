@@ -266,7 +266,7 @@ def init_dp_base(
 #
 # **Two values, and the choice is an occupancy question rather than a rim-length one.** The grid is
 # ``(n_loops, max_size - span)``, so a *wide* block only pays when that grid on its own would
-# starve the device -- which is CLAUDE.md section 3's block-per-item rule in a second place, and
+# starve the device -- which is CLAUDE.md section 2.3's block-per-item rule in a second place, and
 # getting it backwards costs 12 %. Measured on an RTX 5090 / Warp 1.17, interleaved, ``min`` of
 # 4-5, with the emitted face buffer **identical at every block size in every row**:
 #
@@ -724,7 +724,7 @@ def global_argmin(
     # On an RTX 5090, two facing fan disks, min of 7, this kernel costs 0.023 / 0.042 / 0.108 ms
     # at rims of 100 / 1 000 / 4 000 against 1.54 / 7.24 / 26.6 ms for the whole ``stitch_loops``
     # call: **1.51 % / 0.58 % / 0.41 %**. It is launch-dominated rather than loop-dominated (a
-    # bare launch is ~32 us, CLAUDE.md section 13), so the serial walk is not what is being paid
+    # bare launch is ~32 us, CLAUDE.md section 13.1), so the serial walk is not what is being paid
     # for, and the share *falls* with rim size -- the saving would be largest exactly where the
     # call is already cheap. The whole alignment path -- this plus ``row_argmin`` plus
     # ``boundary_perimeters`` -- is 4.5 % at 100 and 2.3 % at 4 000.

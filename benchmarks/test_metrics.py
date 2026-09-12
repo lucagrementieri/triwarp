@@ -310,7 +310,7 @@ def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
         # The tree is built lazily on the first query and cached on the Mesh, so it is built and
         # pre-warmed *outside* the timed callable -- the row then prices the query, matching what
         # the triwarp branch does with a wp.Mesh already in hand. Timing the build instead is a
-        # 17-68x different number (CLAUDE.md section 6).
+        # 17-68x different number (CLAUDE.md section 7.6).
         mesh_ml = bench_case.new_mesh_ml()
         projector_ml = mm.PointsToMeshProjector()
         projector_ml.updateMeshData(mesh_ml)

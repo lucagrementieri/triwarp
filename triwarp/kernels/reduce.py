@@ -110,7 +110,7 @@ def _reduce_1d_tiled(tile_reduce, atomic, scalar, name, dtype):
         if remaining <= 0:
             return
 
-        # First chunk seeds the accumulator (both branches assign it -- see CLAUDE.md section 5 on
+        # First chunk seeds the accumulator (both branches assign it -- see CLAUDE.md section 1.4 on
         # Warp's conditional scoping).
         if remaining >= TILE_1D:
             tile = wp.tile_load(values, shape=TILE_1D, offset=base, storage="register")
@@ -361,7 +361,7 @@ _GLOBAL_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64, wp.float32, wp.float
 # A **per-axis** reduction is only ever reached with an index or a geometry dtype: nothing in the
 # package reduces a table of 64-bit keys along an axis, and the six-dtype cross product over these
 # 24 kernels would be 72 more kernels to compile on every rebuild for no call site (CLAUDE.md
-# section 14). A caller who does reduce a ``wp.uint64`` table along an axis pays one fork, once.
+# section 4.2). A caller who does reduce a ``wp.uint64`` table along an axis pays one fork, once.
 _AXIS_DTYPES = (wp.int32, wp.float32, wp.float64)
 
 
@@ -904,9 +904,9 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
 #   catches the first; nothing catches the second, because a missing dtype does not
 #   fail, it just re-forks the chain on its first launch. The symptom is a test or
 #   a script that suddenly takes tens of seconds -- read it as a rebuild and come
-#   back here (CLAUDE.md section 13).
+#   back here (CLAUDE.md section 15.1).
 # - **The dtype set is the one ``triwarp.reduce`` dispatches over**, not every
-#   dtype ``wp.Scalar`` admits (CLAUDE.md section 14, no speculative generality):
+#   dtype ``wp.Scalar`` admits (CLAUDE.md section 4.2, no speculative generality):
 #   an unused overload is compile time paid on every rebuild. The boolean
 #   reductions are ``wp.int32`` only because ``_reduce_bool`` converts the mask
 #   before launching, and ``wp.bool`` is not a ``wp.Scalar`` in any case.

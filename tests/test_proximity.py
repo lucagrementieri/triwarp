@@ -908,7 +908,7 @@ def test_closest_point_on_edges_matches_meshlib(
     ``distSq`` is squared, which is the named transform.
 
     ``upDistLimitSq`` is passed as float32's max rather than ``inf``: an infinite limit segfaults
-    inside MeshLib's projection code (CLAUDE.md section 6), which is a crash rather than an
+    inside MeshLib's projection code (CLAUDE.md section 7.6), which is a crash rather than an
     exception.
     """
     mesh_tm, _ = unit_box

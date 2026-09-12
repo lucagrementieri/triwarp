@@ -15,7 +15,7 @@ error naming the coerced type rather than anything about handles, which is easy 
 conversion.
 
 These are capability probes, not regression tests for triwarp code: they exist so a future
-conversion can check the platform rather than guess. See ``.claude/CLAUDE.md`` §4.
+conversion can check the platform rather than guess. See ``.claude/CLAUDE.md`` section 3.5.
 """
 
 from __future__ import annotations

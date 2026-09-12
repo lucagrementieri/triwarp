@@ -161,7 +161,7 @@ def test_marching_cubes_matches_meshlib(device: str) -> None:
     MeshLib's ``marchingCubes`` marches the same lattice with the same case table, so given the
     identical field the two return the *same mesh* -- 3 744 vertices and 7 484 faces on both sides
     here, agreeing to a two-sided Hausdorff of **1.2e-07**, which is the float32 floor
-    ``getNumpyVerts`` bottoms out at (CLAUDE.md section 6). The transform is the whole content of
+    ``getNumpyVerts`` bottoms out at (CLAUDE.md section 7.6). The transform is the whole content of
     the comparison and it is load-bearing: where triwarp's ``bounds`` lower corner is the position
     of sample ``[0, 0, 0]``, ``params.origin`` is that sample's *cell* corner, so passing the same
     number to both leaves the surfaces a rigid half-voxel apart -- measured at 0.0369, exactly the

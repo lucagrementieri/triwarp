@@ -730,7 +730,7 @@ _declare_map_kernels()
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 4. Measured over the suite: 8 overloads created across **9** module loads.
+# CLAUDE.md section 2.5. Measured over the suite: 8 overloads created across **9** module loads.
 #
 # Every generic argument here is the assembled matrix's value precision, which ``triwarp.energies``
 # exposes as the same public ``dtype`` keyword ``triwarp.laplacian`` does. The float64 inputs the
