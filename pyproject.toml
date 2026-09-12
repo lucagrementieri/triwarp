@@ -63,13 +63,21 @@ io = ["meshio>=5.0"]
 # dependency of triwarp itself.
 bench = ["cairosvg>=2.7", "matplotlib>=3.9", "pytest-benchmark>=5.1", { include-group = "test" }]
 dev = ["basedpyright>=1.39", "ruff>=0.9", "scipy-stubs>=1.17.1.5"]
+# Zensical is the builder; ``mkdocs.yml`` stays the config file, which it reads natively.
+# ``mkdocs``, ``mkdocs-material``, ``mkdocs-literate-nav`` and ``mkdocs-section-index`` are all
+# gone: Zensical implements the latter two itself -- measured, the built site is byte-identical
+# with both packages uninstalled -- so the ``literate-nav`` and ``section-index`` entries left in
+# ``mkdocs.yml``'s ``plugins:`` are read as configuration for Zensical's own implementations,
+# not as a request to load a plugin.
 docs = [
+    # Imported by ``docs/gen_ref_pages.py`` for ``Nav`` alone, a self-contained nav-tree builder.
+    # Deliberately NOT registered in ``mkdocs.yml``'s ``plugins:``: Zensical has no ``gen-files``
+    # support and ignores an unsupported plugin entry silently, which is why that script is a
+    # standalone pre-build step instead.
     "mkdocs-gen-files>=0.5",
-    "mkdocs-literate-nav>=0.6",
-    "mkdocs-material>=9.5",
-    "mkdocs-section-index>=0.3",
-    "mkdocs>=1.6",
     "mkdocstrings[python]>=0.27",
+    # Pre-1.0 and moving fast; the exact version is pinned in ``uv.lock``, as ``warp-lang`` is.
+    "zensical>=0.0.61",
 ]
 test = [
     "embreex>=4.4",

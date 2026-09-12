@@ -4,8 +4,12 @@ Generate API reference pages for every triwarp submodule, grouped by theme.
 This is a standalone pre-build step, not a plugin hook: run it before building or serving the
 docs. It writes real files under ``docs/`` -- ``docs/api/<module>.md`` and ``docs/SUMMARY.md``,
 both gitignored build output -- where it previously handed them to ``gen-files``' virtual
-filesystem. A build run without it produces a site with no API reference at all, which strict
-mode catches as an unresolved cross-reference per API symbol.
+filesystem.
+
+Running it is not optional and the failure mode is quiet: Zensical does not support
+``gen-files`` and ignores an unsupported plugin entry without a warning, so a build run without
+this script first produces a site with no API reference at all. Only ``zensical build --strict``
+reports it, as one unresolved cross-reference per API symbol referenced from a guide page.
 """
 
 import shutil
