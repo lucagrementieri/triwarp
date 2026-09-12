@@ -42,7 +42,7 @@ Two conventions that hold throughout:
 4. [Evolving the public API](#4-evolving-the-public-api) — naming, signatures, docstring agreement,
    moving/renaming, the 25 mechanical checks
 5. [Function ordering within a module](#5-function-ordering-within-a-module)
-6. [Documentation](#6-documentation-mkdocs--mkdocstrings)
+6. [Documentation](#6-documentation-zensical--mkdocstrings)
 7. [Testing](#7-testing) — conventions, devices, fixtures, the parity gate, shared helpers, the nine
    reference libraries
 8. [Tooling and local validation](#8-tooling-and-local-validation)
@@ -1273,7 +1273,7 @@ Five artifacts, every time:
    **every `parity` / `noparity` marker citing it must be updated in the same commit**, and
    `uv run python -m tests.parity` must show the same pair count before and after.
 5. **Its docs entry** in `docs/gen_ref_pages.py` `SECTIONS`, plus every `[`name`][triwarp.old.path]`
-   cross-reference — `mkdocs build --strict` is what finds the ones you missed.
+   cross-reference — `zensical build --strict` is what finds the ones you missed.
 
 **Renaming a *keyword argument* has its own artifact list, and a call-site scan sees none of it.**
 Three sites survived a paren-aware rewrite of all 33 `neighbors` query calls, each invisible for a
@@ -1325,7 +1325,7 @@ a targeted per-file run does not — a rename is not done until the whole suite 
   `n_vertices`. So when a private cross-module helper has to stop being public, first ask whether
   it is really one operation — a validator plus a one-line default is two, and only one of them
   needs to be reachable. Two knock-ons either way: every `[`x`][triwarp.mod.x]` cross-reference to
-  a name that moves into a `_*.py` breaks `mkdocs build --strict` (a private module generates no
+  a name that moves into a `_*.py` breaks `zensical build --strict` (a private module generates no
   page), and a *newly* public validator needs its own `Raises` block (check 11) and a test that
   covers the accepting cases as well as the raise.
 - **Check 10**: an allocation with no `device=` (§3.3). **Check 11**: a public function that raises
@@ -1375,13 +1375,13 @@ a targeted per-file run does not — a rename is not done until the whole suite 
   in the pass that added it: a reference naming the file in one sentence and the number in the
   next, and a bare `section N` belonging to a *paper* — `kernels/remesh.py` cites "Liepa 2003,
   section 3", and widening the pattern to catch the first misfires on the second.
-- **Check 25**: a MkDocs `!!!` admonition inside a numpydoc **item-list** section — `Parameters`,
+- **Check 25**: a `!!!` admonition inside a numpydoc **item-list** section — `Parameters`,
   `Returns`, `Yields`, `Receives`, `Raises`, `Warns`, `Attributes` or `See Also` (§6). griffe reads
   each entry's first line as a *name*, so an `!!! note "..."` header between two `Raises` entries
   becomes an exception type: confirmed by loading such a function and getting **three** raises
   entries, the middle one carrying the literal string where an annotation belongs. The published
   page grows a row for a type that does not exist, the admonition's body becomes that row's
-  description, and the warning never renders as a warning. Nothing else sees it — `mkdocs build
+  description, and the warning never renders as a warning. Nothing else sees it — `zensical build
   --strict` stays clean, because every cross-reference in the swallowed text still resolves, and
   ruff's `D` rules do not model section contents. It had decayed to **eight** sites in five modules
   (`holes`, `proximity`, `sample`, `smoothing`, `voxels`), seven of them in a `Raises` block, and
@@ -1449,15 +1449,47 @@ top-to-bottom sees the same story as the API page.
 
 ---
 
-## 6. Documentation (MkDocs + mkdocstrings)
+## 6. Documentation (Zensical + mkdocstrings)
 
-Docs are built with **MkDocs Material** + **mkdocstrings** (`python` handler,
-`docstring_style: numpy`), configured in `mkdocs.yml`. `docs/gen_ref_pages.py` auto-generates one API
-reference page per public module under `triwarp/` on every build (`triwarp/kernels/` is excluded) — a
-new module needs **no manual nav entry**. Preview with `DISABLE_MKDOCS_2_WARNING=true uv run mkdocs
-serve`; validate with `DISABLE_MKDOCS_2_WARNING=true uv run mkdocs build --strict` (fails on any
-broken cross-reference or unresolved external inventory). The `DISABLE_MKDOCS_2_WARNING` prefix
-silences a promotional banner injected by the `properdocs` transitive dependency.
+Docs are built with **Zensical** + **mkdocstrings** (`python` handler, `docstring_style: numpy`).
+Zensical is the Material for MkDocs team's ground-up replacement for the MkDocs stack, adopted
+because MkDocs has been unmaintained since 2024-08; it reads **`mkdocs.yml`** unchanged, so the
+config filename, `theme: name: material`, the palette and `extra.css` are all as they were.
+
+**Two commands, and the first is not optional:**
+
+```bash
+uv run python docs/gen_ref_pages.py     # ALWAYS first -- materializes docs/api/ + docs/SUMMARY.md
+uv run zensical build --strict          # validate: exits 1 on a broken cross-reference
+uv run zensical serve                   # preview locally
+```
+
+`docs/gen_ref_pages.py` generates one API reference page per public module under `triwarp/`
+(`triwarp/kernels/` is excluded), so a new module needs **no manual nav entry** — but it is a
+**standalone pre-build script, not a plugin hook**, because Zensical has no `gen-files` equivalent
+(`zensical/zensical#51`, still open). Five measured facts about that runtime, each of which fails
+quietly:
+
+- **Zensical ignores an unsupported plugin entry silently — no warning, no error.** A build with
+  `gen-files` still listed in `plugins:` exits 0 and publishes a site with **no API reference at
+  all**. `--strict` is the only thing that reports it, as one unresolved cross-reference per API
+  symbol (measured: 169). Never register `gen-files`; always run the script first.
+- **`--strict` is the cross-reference backstop** §4.4's five-artifact discipline leans on, and it
+  works: it exits 1 on a dangling `[`name`][triwarp.old.path]`. Verified that the four external
+  inventories still resolve under it too.
+- **`zensical serve` watches `docs/` but not `triwarp/*.py`.** A docstring edit does not trigger a
+  rebuild, and forcing one by touching a `docs/` file does not help either — mkdocstrings has the
+  module cached in-process. **Restart `serve` to see a docstring change.**
+- **There is no `exclude_docs:` equivalent.** The `assets/benchmarks/*.md` sidecar tables are kept
+  out of the search index by `search: exclude: true` front matter instead, emitted by
+  `benchmarks/plot_comparison.py`. (`draft: true` was probed and is a no-op.) They are still
+  *built*, as unlinked pages nothing references.
+- **`literate-nav` and `section-index` are implemented natively**, so neither package is installed
+  — measured, the built site is byte-identical without them — and their `plugins:` entries are read
+  as configuration rather than as a request to load a plugin. `mkdocs-gen-files` *is* installed,
+  for its `Nav` helper alone.
+
+`DISABLE_MKDOCS_2_WARNING` is gone: it silenced a banner recommending this exact migration.
 
 **The one-line summary says what the function returns, never which C++ call it wraps.** mkdocstrings
 renders that first line as the function's entry in its module's API index, so a reference library's
@@ -1511,7 +1543,7 @@ not by this scan.
 Docstrings stay **NumPy-style** (`Parameters`/`Returns`/`Raises`/`See Also`), but cross-references use
 **mkdocs-autorefs** link syntax, not Sphinx roles — Sphinx interpreted-text roles (`:func:`, `:attr:`,
 `:meth:`, `:class:`, `:data:`, `:mod:`) have no Markdown equivalent and render as literal, broken text
-under MkDocs.
+in Markdown.
 
 | Target | Syntax | Example |
 |---|---|---|
@@ -1524,12 +1556,12 @@ under MkDocs.
   — numpydoc's old auto-linking of bare `See Also` names does not carry over.
 - Before adding a new external inventory to `mkdocs.yml`, verify it serves an `objects.inv`
   (`curl -I <url>/objects.inv`).
-- RST admonitions (`.. note::`) don't exist in Markdown — use MkDocs Material's `!!! note`.
+- RST admonitions (`.. note::`) don't exist in Markdown — use the `!!! note` admonition syntax.
 - **An admonition goes in free prose — the leading description, `Notes` or `Examples` — never
   inside `Parameters` / `Returns` / `Raises` / `See Also` or any other item-list section**
   (check 25, §4.5). griffe reads each entry's first line as a name, so an admonition header
   between two `Raises` entries renders as an *exception type* and its body as that type's
-  description. `mkdocs build --strict` cannot see it, and it had reached eight sites.
+  description. `zensical build --strict` cannot see it, and it had reached eight sites.
 - Module-level constants / type aliases without their own docstring are only linkable because
   `show_if_no_docstring: true` is set; don't remove that option without re-checking
   `triwarp/constants.py` and `triwarp/typing.py` cross-refs.
@@ -3035,7 +3067,7 @@ notification arrives.
 A foreground command that outruns its timeout is *also* moved to the background and notified the same
 way, so exceeding a timeout is not a reason to start polling either.
 
-**Do not run a timing probe while `pytest` or `mkdocs` is running** — the same reconstruction read
+**Do not run a timing probe while `pytest` or `zensical` is running** — the same reconstruction read
 527-752 ms under contention and 295-400 ms on a quiet box.
 
 ---
@@ -3490,7 +3522,7 @@ Status of every version-stamped workaround, last full re-probe against 1.16 with
   upstream bug nobody else has confirmed, suspect the repro.
 
 **Gates for an upgrade**, all four: the full suite (1953 passed / 1 skipped at the 1.16 bump),
-`basedpyright` 0 errors, `mkdocs build --strict` clean, `tests.parity` with an unchanged pair count.
+`basedpyright` 0 errors, `zensical build --strict` clean, `tests.parity` with an unchanged pair count.
 The `pyproject.toml` specifier stays `warp-lang>=1.15` where no newer-only API is used — the pin
 lives in `uv.lock`.
 
@@ -4379,7 +4411,7 @@ is a much larger, real share and the fix is a genuine win. **Read the fixture, n
 - **`benchmarks/test_meshes.py` is a real gate and the default `pytest` run does not collect it.**
   It self-checks the registry against a topology table every feature mesh must match, and a mesh
   registered without its matching row fails there with a bare `KeyError` while the full suite,
-  `basedpyright`, `mkdocs --strict` and `tests.parity` all stay green. **After touching
+  `basedpyright`, `zensical build --strict` and `tests.parity` all stay green. **After touching
   `benchmarks/meshes.py`, run `pytest benchmarks/test_meshes.py`** (a few seconds) as a fifth gate.
 - **`--benchmark-json` is written at session end, so one pathological row costs the whole module.**
   A newly added reference library lost several modules this way — a size cap that governed every

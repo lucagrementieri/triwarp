@@ -2073,14 +2073,14 @@ _SECTION_RULE = re.compile(r"^-{3,}$")
 
 def admonition_placement_problems() -> list[str]:
     """
-    Check 25: a MkDocs ``!!!`` admonition inside a numpydoc *item-list* section.
+    Check 25: a ``!!!`` admonition inside a numpydoc *item-list* section.
 
     griffe parses a numpydoc section by reading each entry's first line as a name -- a parameter
     name, an exception type -- so an ``!!! note "..."`` header sitting between two entries of a
     ``Raises`` block becomes an **exception type** on the rendered API page, and the admonition's
     own body is swallowed as that exception's description. The page grows a row for a type that
     does not exist and the warning the author wrote never renders as one. Nothing else sees it:
-    ``mkdocs build --strict`` is clean, because every cross-reference in the swallowed text still
+    ``zensical build --strict`` is clean, because every cross-reference in the swallowed text still
     resolves, and ruff's ``D`` rules do not model section contents.
 
     It had decayed to **eight** sites across six modules before anyone looked, six of them in the

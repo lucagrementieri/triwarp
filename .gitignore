@@ -16,7 +16,7 @@ wheels/
 # Virtual environments
 .venv
 
-# MkDocs
+# Docs build output
 site/
 docs/api/
 docs/SUMMARY.md

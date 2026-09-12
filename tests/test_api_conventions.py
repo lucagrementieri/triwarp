@@ -865,7 +865,7 @@ def test_claude_references_name_a_section_that_exists() -> None:
 
 def test_admonitions_stay_out_of_numpydoc_item_sections() -> None:
     """
-    A MkDocs ``!!!`` admonition sits in free prose, never between two entries of a section.
+    A ``!!!`` admonition sits in free prose, never between two entries of a section.
 
     Not a library comparison: this is a property of triwarp's own docstrings. Check 25, and like
     the section-number check above it is a staleness half rather than a convention half -- every
@@ -875,7 +875,7 @@ def test_admonitions_stay_out_of_numpydoc_item_sections() -> None:
     whose ``Raises`` block holds an admonition returns *three* raises entries, the middle one
     carrying the literal string ``!!! note "Some caveat"`` where an exception annotation belongs --
     so the published page grows a row for a type that does not exist, with the admonition's body as
-    its description, and the warning never renders as a warning. ``mkdocs build --strict`` stays
+    its description, and the warning never renders as a warning. ``zensical build --strict`` stays
     clean throughout, because every cross-reference in the swallowed text still resolves.
 
     The eight were six ``Raises`` blocks, one ``Returns`` and one more ``Raises``, across
