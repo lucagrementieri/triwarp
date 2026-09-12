@@ -275,6 +275,166 @@ def test_sample_surface_poisson_disk_high_init_factor(icosahedron: tuple[tm.Trim
     assert fids.shape == (count,)
 
 
+def _two_patch_mesh() -> tuple[np.ndarray, np.ndarray]:
+    """Build a 10x10 patch and a 1x1 patch 60 apart: one component 100x the area of the other."""
+
+    def patch(x0: float, s: float, n: int) -> tuple[np.ndarray, np.ndarray]:
+        vertices = np.array(
+            [[x0 + s * i / n, s * j / n, 0.0] for i in range(n + 1) for j in range(n + 1)],
+            dtype=np.float32,
+        )
+        faces = np.array(
+            [
+                index
+                for i in range(n)
+                for j in range(n)
+                for index in (
+                    i * (n + 1) + j,
+                    i * (n + 1) + j + 1,
+                    (i + 1) * (n + 1) + j,
+                    i * (n + 1) + j + 1,
+                    (i + 1) * (n + 1) + j + 1,
+                    (i + 1) * (n + 1) + j,
+                )
+            ],
+            dtype=np.int32,
+        )
+        return vertices, faces
+
+    near_vertices, near_faces = patch(0.0, 10.0, 4)
+    far_vertices, far_faces = patch(60.0, 1.0, 2)
+    return (
+        np.vstack([near_vertices, far_vertices]),
+        np.concatenate([near_faces, far_faces + len(near_vertices)]),
+    )
+
+
+def test_sample_surface_poisson_disk_keeps_an_isolated_component(device: str):
+    """
+    Class C (per-component share): triwarp against ``pymeshlab``'s Poisson-disk sampler.
+
+    Excludes the bug class "elimination drops a whole component". The share is the only
+    comparable statistic -- MeshLab's filter is parametrized by radius and returns whatever count
+    that yields (132 here for a requested 200), so the counts do not correspond -- but it is the
+    statistic the defect moved, and it moved it to exactly zero.
+
+    Weighted sample elimination deletes each round's local weight maxima. A point with no alive
+    neighbour inside ``r_max`` has weight 0, the *least* crowded state there is, and was flagged a
+    maximum vacuously; and because ``_poisson_edge_weight`` clamps distances below ``r_min``, a
+    cluster of equally crowded points tied exactly and was flagged entire. Together those wiped the
+    small patch on every seed measured, with the returned count still exactly ``count`` -- so
+    nothing about the result's shape or spacing could show it.
+
+    Margin: the far component's area share is 1/101. MeshLab measures 0.0115-0.0152 and triwarp
+    0.0050-0.0150 per seed, mean 0.0100; the band below admits all of those with ~2.5x headroom
+    either way and excludes 0 outright.
+    """
+    vertices_np, faces_np = _two_patch_mesh()
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    count = 200
+    area_share = 1.0 / 101.0
+
+    mesh_set = ml.MeshSet()
+    mesh_set.add_mesh(ml.Mesh(vertices_np.astype(np.float64), faces_np.reshape(-1, 3)))
+    radius = 2.0 * math.sqrt((101.0 / count) / (2.0 * math.sqrt(3.0)))
+    mesh_set.generate_sampling_poisson_disk(radius=ml.PureValue(radius), samplenum=count)
+    points_ml = mesh_set.current_mesh().vertex_matrix()
+    far_ml = int((points_ml[:, 0] > 30.0).sum())
+    # The oracle has to find the component before its share can mean anything.
+    assert far_ml > 0
+    share_ml = far_ml / len(points_ml)
+
+    far_counts = []
+    for seed in range(5):
+        points_wp, _ = tw.sample.sample_surface_poisson_disk(
+            vertices_wp, faces_wp, count, seed=seed
+        )
+        far_counts.append(int((points_wp.numpy()[:, 0] > 30.0).sum()))
+    # Never dropped -- this is the assertion the defect failed, at every seed.
+    assert min(far_counts) >= 1
+
+    share_tw = float(np.mean(far_counts)) / count
+    assert 0.4 * area_share <= share_tw <= 2.5 * area_share
+    assert 0.4 * share_ml <= share_tw <= 2.5 * share_ml
+
+
+def test_find_local_maxima_flags_an_independent_set(device: str):
+    """
+    Not a library comparison: no reference exposes one elimination round, only its end result.
+
+    The round deletes every flagged point at once, which is only sound if no two flagged points
+    are neighbours. Maximality on the weight alone does not give that when weights tie, and ties
+    are systematic rather than rare -- ``_poisson_edge_weight`` clamps any distance below
+    ``r_min`` up to it, so a point's weight is exactly its close-neighbour count times one
+    constant. Ordering on ``(weight, -index)`` restores it. Asserted on a clique of four mutually
+    adjacent points at one weight, plus a neighbourless point, which also pins that a point with
+    no alive neighbour is never flagged.
+
+    Excludes: a whole tied cluster deleted in one round, and the least crowded point deleted
+    first. It does not check *which* member of a tie survives, which the algorithm does not define
+    beyond being reproducible.
+    """
+    # Points 0-3 form a clique at one weight; point 4 is alive with no alive neighbour.
+    neighbour_rows = [[0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 3], [4]]
+    weights_np = np.array([2.0, 2.0, 2.0, 2.0, 0.0], dtype=np.float32)
+    indices_np = np.array([i for row in neighbour_rows for i in row], dtype=np.int32)
+    offsets_np = np.cumsum([0] + [len(row) for row in neighbour_rows]).astype(np.int32)
+
+    weights_wp = wp.array(weights_np, dtype=wp.float32, device=device)
+    indices_wp = wp.array(indices_np, dtype=wp.int32, device=device)
+    offsets_wp = wp.array(offsets_np, dtype=wp.int32, device=device)
+    alive_wp = wp.ones(5, dtype=wp.int32, device=device)
+    is_max_wp = wp.zeros(5, dtype=wp.int32, device=device)
+    wp.launch(
+        tw.kernels.sample.find_local_maxima,
+        dim=5,
+        inputs=[weights_wp, alive_wp, indices_wp, offsets_wp, is_max_wp],
+        device=device,
+    )
+    is_max_np = is_max_wp.numpy()
+
+    # Exactly one of the tied clique, and never the neighbourless point.
+    assert int(is_max_np[:4].sum()) == 1
+    assert int(is_max_np[4]) == 0
+    # The general property, stated over the graph rather than over this fixture's shape.
+    flagged = set(np.flatnonzero(is_max_np).tolist())
+    for i in flagged:
+        assert flagged.isdisjoint(set(neighbour_rows[i]) - {i})
+
+
+def test_sample_fibonacci_sphere_phase_stays_low_discrepancy(device: str):
+    """
+    Class A against a float64 NumPy evaluation of the lattice's own closed form.
+
+    The spiral phase is ``count`` multiples of the golden angle, so it grows without bound in
+    ``count``; accumulating it in float32 lost the low digits the low-discrepancy property lives
+    in. Measured before the fix: azimuth error 1.7e-04 rad at 1 024 rising to 0.21 rad at 1e6, and
+    a minimum neighbour spacing 11 % below the reference's at 100 000. ``count = 100_000`` is
+    asserted because that is where the loss is unambiguous and the test is still cheap; the same
+    hazard and the same float64 fix are documented at
+    ``kernels/bounds.oriented_box_candidate_axes``.
+    """
+    count = 100_000
+    directions_np = tw.sample.sample_fibonacci_sphere(count, device=device).numpy()
+
+    index_np = np.arange(count, dtype=np.float64)
+    z_np = 1.0 - 2.0 * (index_np + 0.5) / count
+    radius_np = np.sqrt(np.maximum(0.0, 1.0 - z_np * z_np))
+    theta_np = math.pi * (3.0 - math.sqrt(5.0)) * index_np
+    expected_np = np.stack(
+        [radius_np * np.cos(theta_np), radius_np * np.sin(theta_np), z_np], axis=1
+    )
+    assert np.allclose(directions_np, expected_np, rtol=1e-5, atol=1e-5)
+
+    # The property the lattice exists for, and the one the float32 phase actually destroyed: the
+    # closest pair must be no tighter than the reference construction's.
+    def min_spacing(points_np: np.ndarray) -> float:
+        distances, _ = cKDTree(points_np).query(points_np, k=2)
+        return float(distances[:, 1].min())
+
+    assert min_spacing(directions_np) >= 0.99 * min_spacing(expected_np)
+
+
 def _blue_noise_radius_for_count(surface_area: float, n: int) -> float:
     return math.sqrt((surface_area * 0.5 / (n * 0.6162910373)) / math.pi)
 

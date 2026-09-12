@@ -6,7 +6,13 @@ from triwarp.kernels.triangles import face_vertices
 
 # Golden angle in radians: pi * (3 - sqrt(5)) ~ 2.399963. Successive multiples of this
 # angle place points on the Fibonacci lattice, the most uniform simple spiral on a sphere.
-GOLDEN_ANGLE = wp.constant(wp.float32(math.pi * (3.0 - math.sqrt(5.0))))
+#
+# Held in float64 because it is multiplied by the sample index: the phase reaches
+# ``2.4 * count`` radians, so at 100 000 directions the argument is ~2.4e5 and a float32
+# argument reduction has already thrown away the low digits that make the spiral
+# low-discrepancy. Same hazard, and the same fix, as
+# ``kernels/bounds.oriented_box_candidate_axes``.
+GOLDEN_ANGLE = wp.constant(wp.float64(math.pi * (3.0 - math.sqrt(5.0))))
 
 
 @wp.kernel
@@ -15,12 +21,21 @@ def fibonacci_lattice(
 ) -> None:
     # z descends uniformly through (1 - z_span, 1); the offset 0.5 centers the samples.
     # z_span = 2 covers the full sphere, z_span = 1 the positive-z hemisphere.
+    #
+    # Only the phase runs in float64, and only the sine and cosine of it are narrowed: ``z`` is a
+    # bounded interpolation that float32 resolves exactly well enough, while ``theta`` grows
+    # without bound in ``count``. Measured against a float64 evaluation, the float32 phase costs
+    # nothing to ~4 096 directions, 11 % of the minimum neighbour spacing at 100 000, and 0.21 rad
+    # of azimuth at 1e6 -- the uniformity this lattice exists for. It costs nothing: the whole
+    # call is launch- and allocation-bound, flat from 64 to 200 000 directions on both devices.
     i = wp.int32(wp.tid())
     count_f = wp.float32(count)
     z = 1.0 - z_span * (wp.float32(i) + 0.5) / count_f
     radius = wp.sqrt(wp.max(0.0, 1.0 - z * z))
-    theta = GOLDEN_ANGLE * wp.float32(i)
-    out_directions[i] = wp.vec3(radius * wp.cos(theta), radius * wp.sin(theta), z)
+    theta = GOLDEN_ANGLE * wp.float64(i)
+    out_directions[i] = wp.vec3(
+        radius * wp.float32(wp.cos(theta)), radius * wp.float32(wp.sin(theta)), z
+    )
 
 
 @wp.kernel
@@ -126,14 +141,31 @@ def find_local_maxima(
     wi = wp.max(weights[i], wp.float32(0.0))
     start = offsets[i]
     end = offsets[i + 1]
-    is_max = wp.int32(1)
+    # Starts at 0, not 1, and only rises once an alive neighbour has been seen: a point with no
+    # alive neighbour inside ``r_max`` carries weight 0, the least crowded state there is, so it is
+    # the *last* point elimination should reach -- not a vacuous maximum. Flagging it deleted the
+    # sole survivor of every isolated patch, wiping small far components off the result entirely.
+    is_max = wp.int32(0)
     for k in range(start, end):
         j = nbr_indices[k]
         if j == i or alive[j] == 0:
             continue
-        if wp.max(weights[j], wp.float32(0.0)) > wi:
+        wj = wp.max(weights[j], wp.float32(0.0))
+        # Ordered on ``(weight, -index)``, so a tie is broken by the smaller index. The tie-break
+        # is what makes the flagged set an *independent* set in the neighbour graph -- two flagged
+        # points can never be neighbours -- which is the property the round-based elimination
+        # assumes when it deletes every flagged point at once. A strict ``>`` alone does not give
+        # it, and the ties are systematic rather than rare: ``_poisson_edge_weight`` clamps any
+        # distance below ``r_min`` up to it, so every neighbour inside ``r_min`` contributes the
+        # identical term and a point's weight is exactly its close-neighbour count times one
+        # constant. A clique of equally crowded points was therefore flagged entire and deleted in
+        # a single round, taking a whole dense cluster out at once. It costs at most one extra
+        # round -- 26 against 26 and 27 on an icosphere(4) at 200 and 2 000 samples -- because
+        # only a tie is decided differently.
+        if wj > wi or (wj == wi and j < i):
             is_max = 0
             break
+        is_max = 1
     out_is_max[i] = is_max
 
 

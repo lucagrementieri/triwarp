@@ -28,8 +28,24 @@ _TRI_DET_TOLERANCE = wp.constant(wp.float32(1.0e-6))
 
 @wp.func
 def project_segment_sq_dist(q: wp.vec3, segment: wp.vec3, length_sq: wp.float32) -> wp.float32:
-    """Squared distance from ``q`` to the segment ``[0, segment]`` (clamped projection)."""
-    s = wp.clamp(wp.dot(q, segment) / length_sq, wp.float32(0.0), wp.float32(1.0))
+    """
+    Squared distance from ``q`` to the segment ``[0, segment]`` (clamped projection).
+
+    ``s`` is computed only for a segment of positive length. A zero-length one is the single point
+    at the origin, so ``q - s * segment`` is ``q`` for *every* ``s`` and the answer is
+    ``length_sq(q)`` however the parameter is chosen -- the guard is therefore exact rather than a
+    tolerance, and it changes no value this function ever returned. What it changes is the
+    *derivative*: the unguarded form evaluates ``0 / 0`` on a triangle with two coincident
+    vertices, and while the forward value survives that (``wp.min`` over a ``wp.vec3`` reduces with
+    ``<``, which a NaN always loses) the adjoint does not, so the caller's whole accumulated
+    gradient came back NaN from one such face. This module is the one differentiated through
+    ``wp.Tape``.
+    """
+    # Initialized before the branch: Warp leaves a branch-local variable readable but uninitialized
+    # when the branch is not taken.
+    s = wp.float32(0.0)
+    if length_sq > wp.float32(0.0):
+        s = wp.clamp(wp.dot(q, segment) / length_sq, wp.float32(0.0), wp.float32(1.0))
     return wp.length_sq(q - s * segment)
 
 

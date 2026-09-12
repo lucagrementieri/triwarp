@@ -141,6 +141,14 @@ def ecl_hook_edge_parity(
     # A component with contradictory signs (a Mobius band, in the orientation application) simply
     # takes whichever branch reached its roots first: the potential does not exist, so no assignment
     # is correct and callers detect the contradiction afterwards by re-testing the edges.
+    #
+    # ``offset`` is masked to bit 0 because it is OR-ed into a word whose upper 31 bits are a node
+    # id: an ``edge_sign`` outside {0, 1} would otherwise corrupt the *parent* half of the packed
+    # word rather than only its parity, silently splitting a joined pair (sign 2 leaves the CAS a
+    # no-op) or, for a negative sign, writing a parent of -1 that the next find reads out of
+    # bounds. Both other terms are single bits already, read back from a packed word, so the edge
+    # sign is the only way a wider value enters. The caller rejects such a sign under ``validate``;
+    # this bounds the damage when that check is skipped.
     root_v = rep_v
     par_v = parity_v
     root_u = wp.int32(0)
@@ -150,7 +158,7 @@ def ecl_hook_edge_parity(
     while repeat:
         repeat = wp.bool(False)
         if root_v != root_u:
-            offset = par_v ^ edge_sign ^ par_u
+            offset = (par_v ^ edge_sign ^ par_u) & 1
             if root_v < root_u:
                 expected = root_u << 1
                 old = wp.atomic_cas(words, root_u, expected, (root_v << 1) | offset)

@@ -37,6 +37,7 @@ from tests.conversions import (
     trimesh_to_pytorch3d,
     trimesh_to_warp,
 )
+from triwarp.kernels import metrics as kernel_metrics
 
 # igl requires float64 vertices / int64 faces; Warp uses float32 / int32, so mesh-surface
 # references diverge from Warp at roughly float32 precision.
@@ -993,3 +994,102 @@ def test_chamfer_points_to_points_loss_empty(device: str) -> None:
     loss_wp = tw.metrics.chamfer_points_to_points_loss(x_wp, y_wp)
     assert loss_wp.shape == (1,)
     assert float(loss_wp.numpy()[0]) == 0.0
+
+
+@wp.kernel
+def _probe_point_triangle_sq_dist(
+    query: wp.array[wp.vec3], triangle: wp.array[wp.vec3], out_dist_sq: wp.array[wp.float32]
+) -> None:
+    out_dist_sq[0] = kernel_metrics.point_triangle_sq_dist(
+        query[0], triangle[0], triangle[1], triangle[2]
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "triangle"),
+    [
+        ("well_shaped", [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        ("two_coincident", [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        ("all_coincident", [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        ("collinear", [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
+    ],
+)
+def test_point_triangle_sq_dist_grad_is_finite_on_degenerate_faces(
+    device: str, name: str, triangle: list[list[float]]
+) -> None:
+    """
+    Not a library comparison: no reference exposes the point-triangle primitive's adjoint.
+
+    ``project_segment_sq_dist`` divides by the segment's squared length, which is exactly zero
+    when a triangle has two coincident vertices. The *value* survives that -- ``wp.min`` over a
+    ``wp.vec3`` reduces with ``<``, which a NaN always loses, so the two sound edges win -- and
+    only the adjoint saw the ``0 / 0``. Since the chamfer loss accumulates with an atomic add, one
+    such face in query range returned NaN for the caller's entire gradient, not just its own term.
+
+    The guard is exact rather than a tolerance: a zero-length segment is the single point at the
+    origin, so ``q - s * segment`` is ``q`` for every ``s`` and the answer is ``length_sq(q)``
+    however the parameter is chosen. Values are asserted unchanged for that reason, alongside
+    finiteness.
+
+    A degenerate triangle is a *kink* of the function, so no two-sided derivative exists there and
+    central differences do not apply; what is asserted instead is the strongest statement available
+    at a kink -- the adjoint lies within the bracket spanned by the two one-sided derivatives. On
+    the well-shaped arm, which is differentiable, that bracket collapses and the check is exact.
+    """
+    triangle_np = np.array(triangle, dtype=np.float64)
+    query_np = np.array([[0.3, 0.3, 1.0]], dtype=np.float64)
+
+    def value(vertices_np: np.ndarray) -> float:
+        triangle_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=device)
+        query_wp = wp.array(query_np.astype(np.float32), dtype=wp.vec3, device=device)
+        out_wp = wp.zeros(1, dtype=wp.float32, device=device)
+        wp.launch(
+            _probe_point_triangle_sq_dist,
+            dim=1,
+            inputs=[query_wp, triangle_wp, out_wp],
+            device=device,
+        )
+        return float(out_wp.numpy()[0])
+
+    triangle_wp = wp.array(
+        triangle_np.astype(np.float32), dtype=wp.vec3, device=device, requires_grad=True
+    )
+    query_wp = wp.array(
+        query_np.astype(np.float32), dtype=wp.vec3, device=device, requires_grad=True
+    )
+    out_wp = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+        wp.launch(
+            _probe_point_triangle_sq_dist,
+            dim=1,
+            inputs=[query_wp, triangle_wp, out_wp],
+            device=device,
+        )
+    tape.backward(loss=out_wp)
+    gradient_np = triangle_wp.grad.numpy().astype(np.float64)
+
+    assert np.isfinite(gradient_np).all()
+    assert np.isfinite(query_wp.grad.numpy()).all()
+
+    # The guard changes no value: the closest point is unmoved in every arm.
+    expected = {
+        "well_shaped": 1.0,
+        "two_coincident": 1.09,
+        "all_coincident": 1.18,
+        "collinear": 1.09,
+    }[name]
+    assert value(triangle_np) == pytest.approx(expected, abs=1e-6)
+
+    step = 1e-4
+    base = value(triangle_np)
+    for vertex in range(3):
+        for axis in range(3):
+            plus_np = triangle_np.copy()
+            plus_np[vertex, axis] += step
+            minus_np = triangle_np.copy()
+            minus_np[vertex, axis] -= step
+            forward = (value(plus_np) - base) / step
+            backward = (base - value(minus_np)) / step
+            low, high = min(forward, backward), max(forward, backward)
+            assert low - 2e-3 <= gradient_np[vertex, axis] <= high + 2e-3

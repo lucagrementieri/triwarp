@@ -288,9 +288,9 @@ def sample_surface_poisson_disk(
     Uses Weighted Sample Elimination (Öztireli & Gross 2012): generates
     ``init_factor * count`` uniform surface samples, then iteratively removes
     the most "crowded" points in parallel rounds until ``count`` remain.
-    Each round deletes all alive local weight-maxima simultaneously — points
-    whose spatial separation exceeds ``r_max`` are independent and eliminated
-    in the same round.
+    Each round deletes all alive local weight-maxima simultaneously. Maximality is decided on
+    ``(weight, -index)``, so no two of them are ever within ``r_max`` of each other and deleting
+    the whole set at once cannot remove a point that a sequential elimination would have kept.
 
     Parameters
     ----------
@@ -382,11 +382,17 @@ def sample_surface_poisson_disk(
             device=device,
         )
 
-        # The alive local maximum is always flagged (the test at ``kernels/sample.py`` is a strict
-        # ``>``, so the greatest alive weight has no greater neighbour), hence no zero-maxima exit.
         n_max = tw.reduce.sum(is_max)
         excess = alive_count - count
-        if n_max <= excess:
+        if n_max == 0:
+            # Nothing is flagged only when no alive point has an alive neighbour inside ``r_max``
+            # -- otherwise the heaviest alive point with a neighbour is flagged, the test being a
+            # strict ``>``. Every remaining point then carries weight 0, so they are equally good
+            # and the round may delete any ``excess`` of them; ranking all of the alive ones keeps
+            # the loop making progress, which the maxima alone no longer guarantee.
+            deleted_mask = _top_maxima_by_weight(alive, weights, excess)
+            n_max = excess
+        elif n_max <= excess:
             deleted_mask = is_max
         else:
             deleted_mask = _top_maxima_by_weight(is_max, weights, excess)
@@ -409,25 +415,31 @@ def sample_surface_poisson_disk(
 
 
 def _top_maxima_by_weight(
-    is_max: wp.array[wp.int32], weights: wp.array[wp.float32], excess: int
+    candidates: wp.array[wp.int32], weights: wp.array[wp.float32], excess: int
 ) -> wp.array[wp.int32]:
     """
-    Mark the ``excess`` heaviest flagged points, so the final round deletes exactly enough.
+    Mark the ``excess`` heaviest flagged points, so a round deletes exactly enough.
 
-    Only the last elimination round needs this -- every earlier one deletes all of its local
-    maxima. It used to read ``is_max`` and ``weights`` back in full and pick the top ``excess`` with
+    Two rounds need it and neither is an ordinary one: the last, where the local maxima outnumber
+    what is left to delete, and a round in which *no* point is a local maximum because every alive
+    point is isolated -- there ``candidates`` is the alive set rather than the maxima. Every other
+    round deletes all of its maxima and never calls this.
+
+    It used to read the flags and ``weights`` back in full and pick the top ``excess`` with
     ``numpy.argsort``, moving ``2 * init_count`` elements across the bus where the rest of the loop
     moves none. Sorting the flagged weights on the device removes both readbacks and the upload.
 
     Ties order differently from ``numpy.argsort``'s quicksort -- ``radix_sort_pairs`` is stable --
-    but the weights are sums of continuous kernel falloffs, so an exact tie between two of them does
-    not arise in practice, and which of two equally-crowded points is dropped is not a property the
-    algorithm defines anyway.
+    and exact ties are common rather than rare: ``_poisson_edge_weight`` clamps any distance below
+    ``r_min`` up to it, so a point whose neighbours are all closer than that carries exactly its
+    neighbour count times one constant. Which of two equally-crowded points is dropped is not a
+    property the algorithm defines, and a stable order at least makes the choice reproducible.
 
     Parameters
     ----------
-    is_max
-        Length-``init_count`` ``0``/``1`` flags marking this round's local weight maxima.
+    candidates
+        Length-``init_count`` ``0``/``1`` flags marking the points this round may delete -- its
+        local weight maxima, or the whole alive set when there are none.
     weights
         Length-``init_count`` crowding weights.
     excess
@@ -438,17 +450,19 @@ def _top_maxima_by_weight(
     wp.array[wp.int32]
         Length-``init_count`` ``0``/``1`` deletion flags with exactly ``excess`` ones.
     """
-    n_pool = int(is_max.shape[0])
-    flagged = flatnonzero(tw.array.astype(is_max, wp.bool))
+    n_pool = int(candidates.shape[0])
+    flagged = flatnonzero(tw.array.astype(candidates, wp.bool))
     # Ascending on the negated weight is descending on the weight, and ``sort_and_argsort`` is the
     # package's one radix-sort spelling.
-    descending = wp.empty(int(flagged.shape[0]), dtype=wp.float32, device=is_max.device)
+    descending = wp.empty(int(flagged.shape[0]), dtype=wp.float32, device=candidates.device)
     wp.map(wp.neg, gather(weights, flagged), out=descending)
     _sorted, order = tw.array.sort_and_argsort(descending)
     # No clone: ``order`` need not outlive this frame (no further sort call reuses its scratch),
     # and ``gather`` only requires a contiguous index array, which a prefix slice already is.
     chosen = gather(flagged, order[:excess])
-    return tw.array.astype(tw.array.indices_to_mask(chosen, n_pool, device=is_max.device), wp.int32)
+    return tw.array.astype(
+        tw.array.indices_to_mask(chosen, n_pool, device=candidates.device), wp.int32
+    )
 
 
 def sample_surface_blue_noise(

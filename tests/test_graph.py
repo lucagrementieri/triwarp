@@ -347,6 +347,40 @@ def test_connected_component_parity_validates_range(device: str) -> None:
         tw.graph.connected_component_parity_from_edges(edges_wp, signs_wp, 5)
 
 
+def test_connected_component_parity_validates_signs(device: str) -> None:
+    """
+    Not a parity assert: an out-of-range ``sign`` is rejected, and is bounded when unchecked.
+
+    The hook packs the parity bit into the low bit of a word whose upper bits are a node id, so a
+    sign outside ``{0, 1}`` lands in the *parent* half. Before the mask in ``ecl_hook_edge_parity``
+    a sign of ``2`` made the union's compare-and-swap write back exactly what it expected, leaving
+    the two endpoints in separate components with no error at all, and a negative sign wrote a
+    parent of ``-1`` that the next find read out of bounds. Both arms are asserted: the checked
+    path raises, and the unchecked path still joins the edge.
+    """
+    edges_wp = wp.array(np.array([[2, 3]], dtype=np.int32), dtype=wp.int32, device=device)
+    for bad in (2, -1, 1 << 20):
+        signs_wp = wp.array(np.array([bad], dtype=np.int32), dtype=wp.int32, device=device)
+        with pytest.raises(ValueError, match="signs must be 0 or 1"):
+            tw.graph.connected_component_parity_from_edges(edges_wp, signs_wp, 6)
+        labels_wp, parity_wp = tw.graph.connected_component_parity_from_edges(
+            edges_wp, signs_wp, 6, validate=False
+        )
+        labels_np = labels_wp.numpy()
+        # The structure is what the mask protects: the edge still joins its endpoints, and only
+        # the sign's low bit reaches the potential.
+        assert labels_np[2] == labels_np[3]
+        assert set(np.unique(parity_wp.numpy()).tolist()) <= {0, 1}
+        assert int(parity_wp.numpy()[3]) == bad & 1
+
+    # A valid sign is untouched by the mask.
+    for good in (0, 1):
+        signs_wp = wp.array(np.array([good], dtype=np.int32), dtype=wp.int32, device=device)
+        labels_wp, parity_wp = tw.graph.connected_component_parity_from_edges(edges_wp, signs_wp, 6)
+        assert labels_wp.numpy()[2] == labels_wp.numpy()[3]
+        assert int(parity_wp.numpy()[3]) == good
+
+
 def test_face_connected_component_labels(request: pytest.FixtureRequest) -> None:
     """
     Class B: the face-side partition against scipy over ``trimesh.face_adjacency``.

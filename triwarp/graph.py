@@ -256,6 +256,7 @@ def connected_component_parity_from_edges(
         ``b``. Endpoints must lie in ``[0, node_count)``. Self-loops are ignored.
     signs
         Length-``m`` ``wp.int32`` parity constraint per edge, ``0`` (equal) or ``1`` (opposite).
+        Any other value is rejected under ``validate``.
     node_count
         Number of nodes ``0 .. node_count - 1``.
     validate
@@ -279,7 +280,8 @@ def connected_component_parity_from_edges(
         If ``edges`` is not a rank-2 ``int32`` array.
     ValueError
         If ``edges`` is not ``(m, 2)``, ``signs`` is not length ``m``, ``node_count`` is
-        negative, or (with ``validate``) an endpoint is out of range.
+        negative, or (with ``validate``) an endpoint is out of range or a sign is not ``0`` or
+        ``1``.
     RuntimeError
         If ``edges`` and ``signs`` are not all on one device.
 
@@ -290,8 +292,10 @@ def connected_component_parity_from_edges(
         rather than raising: ``ecl_hook_parity`` indexes a ``node_count``-element buffer by the
         raw endpoint. On a CUDA device that lands in device memory; on the **CPU** device a Warp
         array is host heap, so it overwrites glibc's allocator metadata and aborts the process
-        later, somewhere unrelated. Pass ``validate=False`` only when the caller produced
-        ``edges`` itself and knows the bound holds.
+        later, somewhere unrelated. An out-of-range **sign** is bounded rather than unsafe — the
+        hook keeps only its low bit — but the answer is then computed for a different constraint
+        than the one passed. Pass ``validate=False`` only when the caller produced ``edges`` and
+        ``signs`` itself and knows both bounds hold.
 
     Notes
     -----
@@ -321,6 +325,12 @@ def connected_component_parity_from_edges(
             raise ValueError(
                 f"edge indices must lie in [0, {node_count}), got min={lowest} max={highest}"
             )
+        # ``signs`` needs the same range check and for the same reason: the hook packs the parity
+        # bit into the low bit of a word whose upper bits are a node id, so a sign outside {0, 1}
+        # is not a tolerable approximation of one -- it addresses a different node.
+        lowest_sign, highest_sign = tw.reduce.minmax(signs)
+        if lowest_sign < 0 or highest_sign > 1:
+            raise ValueError(f"signs must be 0 or 1, got min={lowest_sign} max={highest_sign}")
 
     device = edges.device
     labels = wp.empty(node_count, dtype=wp.int32, device=device)
