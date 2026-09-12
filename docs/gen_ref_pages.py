@@ -1,12 +1,26 @@
-"""Generate API reference pages for every triwarp submodule, grouped by theme."""
+"""
+Generate API reference pages for every triwarp submodule, grouped by theme.
 
+This is a standalone pre-build step, not a plugin hook: run it before building or serving the
+docs. It writes real files under ``docs/`` -- ``docs/api/<module>.md`` and ``docs/SUMMARY.md``,
+both gitignored build output -- where it previously handed them to ``gen-files``' virtual
+filesystem. A build run without it produces a site with no API reference at all, which strict
+mode catches as an unresolved cross-reference per API symbol.
+"""
+
+import shutil
 from pathlib import Path
 
+# ``mkdocs_gen_files`` is imported as a plain library, for ``Nav`` alone -- it is deliberately not
+# registered in ``mkdocs.yml``'s ``plugins:`` list, and must not be. ``Nav`` is a self-contained
+# nav-tree builder with no dependency on the plugin runtime, so reusing it keeps the
+# SECTIONS-to-nav bullet nesting identical to what the ``gen-files`` build produced.
 import mkdocs_gen_files
 
 nav = mkdocs_gen_files.Nav()
 
 root = Path(__file__).parent.parent
+docs_root = Path(__file__).parent
 src = root / "triwarp"
 
 # Curated theme groups. Order within a group matters: it is the docs nav order for that
@@ -101,16 +115,18 @@ if listed != actual:
         f"stale entries (module no longer exists): {sorted(stale)}"
     )
 
+# Clear the previous run's output before writing. The ``gen-files`` plugin held these pages in a
+# virtual filesystem that started empty on every build; real files do not, so without this a
+# module that is renamed or deleted leaves its old page behind as an orphan nothing links to.
+api_root = docs_root / "api"
+shutil.rmtree(api_root, ignore_errors=True)
+api_root.mkdir(parents=True)
+
 for section, modules in SECTIONS.items():
     for module_name in modules:
-        module_path = src.joinpath(*module_name.split(".")).with_suffix(".py")
         doc_path = Path("api", f"{module_name}.md")
         nav[("API Reference", section, module_name)] = doc_path.as_posix()
-
-        with mkdocs_gen_files.open(doc_path, "w") as fd:
-            print(f"::: triwarp.{module_name}", file=fd)
-
-        mkdocs_gen_files.set_edit_path(doc_path, module_path.relative_to(root))
+        (docs_root / doc_path).write_text(f"::: triwarp.{module_name}\n")
 
 # The narrative/guide pages are hand-written under docs/ (not generated), so they're listed here
 # by hand rather than discovered -- this is the one place literate-nav's ordering is authored
@@ -145,7 +161,7 @@ GUIDE_PAGES: list[tuple[str, str] | tuple[str, str, list[tuple[str, str]]]] = [
     ("Benchmarks", "benchmarks.md"),
 ]
 
-with mkdocs_gen_files.open("SUMMARY.md", "w") as nav_file:
+with (docs_root / "SUMMARY.md").open("w") as nav_file:
     nav_file.write("* [Home](index.md)\n")
     for entry in GUIDE_PAGES:
         title, path, *rest = entry
