@@ -285,7 +285,9 @@ def halfedge_transport_angles(
     Raises
     ------
     ValueError
-        If ``twins`` is given and does not have one entry per halfedge of ``faces``.
+        If ``twins`` is given and is not a twin table for ``faces``
+        ([`require_matching_twins`][triwarp.halfedge.require_matching_twins] states what that
+        means, and checking it costs one launch and one readback).
     RuntimeError
         If ``vertices``, ``faces``, ``twins`` and ``tangent_angles`` are not all on one device.
 

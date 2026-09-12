@@ -33,6 +33,14 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
     ``-1`` are exactly the mesh boundary, in the orientation
     [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges] reports.
 
+    The *opposite directions* half of that is a precondition on the mesh and not merely a property
+    of the output: it holds only where the two faces meeting at an edge are wound consistently, so
+    an inconsistently wound or non-orientable mesh is rejected rather than paired up. Every
+    consumer of this table -- the counter-clockwise rotation
+    [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] walks above all -- reads a twin as "the
+    same edge, seen from the other side", and there is no other side to see when both halfedges
+    face the same way.
+
     Undirected edges are matched by packing each sorted endpoint pair into one key
     ([`hash_indices_rows`][triwarp.grouping.hash_indices_rows]), radix-sorting the keys with the
     halfedge index as payload, and pairing up the runs of equal keys — the same mechanism behind
@@ -57,8 +65,10 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
     ------
     ValueError
         If an undirected edge carries three or more halfedges (an edge-non-manifold mesh, where
-        "the" opposite halfedge is not defined). Detecting this needs one 4-byte readback, so this
-        function always synchronizes once.
+        "the" opposite halfedge is not defined), or if both halfedges of an edge traverse it in the
+        *same* direction, which is what an inconsistently wound or non-orientable mesh looks like
+        from here and which leaves the "opposite directions" guarantee above with nothing to mean.
+        Detecting either needs one 8-byte readback, so this function always synchronizes once.
 
     See Also
     --------
@@ -81,33 +91,61 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
     sorted_keys, order = tw.array.sort_and_argsort(keys)
 
-    nonmanifold = wp.zeros(1, dtype=wp.int32, device=device)
+    # Slot 0 counts edge-non-manifold edges, slot 1 edges whose two halfedges run the same way;
+    # one buffer so the two rejections cost one readback between them rather than two.
+    defect_counts = wp.zeros(2, dtype=wp.int32, device=device)
     wp.launch(
         kernel_halfedge.pair_sorted_halfedges,
         dim=n_halfedges,
-        inputs=[sorted_keys, order, twins, nonmanifold],
+        inputs=[faces, sorted_keys, order, twins, defect_counts],
         device=device,
     )
-    n_nonmanifold = int(read_scalar(nonmanifold, 0))
+    n_nonmanifold, n_misoriented = (int(count) for count in defect_counts.numpy())
     if n_nonmanifold > 0:
         raise ValueError(
             f"halfedge_twins requires an edge-manifold mesh: {n_nonmanifold} edge(s) are shared by "
             f"three or more faces."
+        )
+    if n_misoriented > 0:
+        raise ValueError(
+            f"halfedge_twins requires a consistently wound mesh: {n_misoriented} edge(s) are "
+            f"traversed in the same direction by both of their halfedges, so those two halfedges "
+            f"are not opposites of each other. Run make_winding_consistent first; a non-orientable "
+            f"surface has no consistent winding and no halfedge twin table at all."
         )
     return twins
 
 
 def require_matching_twins(faces: wp.array[wp.int32], twins: wp.array[wp.int32] | None) -> None:
     """
-    Raise unless a precomputed twin table has one entry per halfedge of ``faces``.
+    Raise unless a precomputed twin table really is one for ``faces``.
 
-    The contract behind every ``twins=`` keyword in the package: the table is indexed *by halfedge*
-    (``h = 3 * f + k``), so it is meaningful only for the face buffer it was built from. A table
-    cached from a smaller mesh is not merely stale -- it is short, and the kernels that walk it
-    index past its end, which on the CPU device reads the host heap rather than raising. Public
-    because the functions that take the keyword live in three modules -- here,
-    [`triwarp.tangent_space`][triwarp.tangent_space] and
-    [`triwarp.selection`][triwarp.selection] -- and they must all reject the same call the same way.
+    The contract behind every ``twins=`` keyword in the package, checked in both of its halves.
+    The table is indexed *by halfedge* (``h = 3 * f + k``), so it is meaningful only for the face
+    buffer it was built from: a table cached from a smaller mesh is not merely stale -- it is
+    short, and the kernels that walk it index past its end, which on the CPU device reads the host
+    heap rather than raising. And each entry must be the *opposite* halfedge, since that is what
+    every consumer reads it as -- the counter-clockwise rotation
+    [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] walks, the transport angle
+    [`triwarp.tangent_space`][triwarp.tangent_space] pairs across an edge, and the dual edge
+    [`triwarp.selection`][triwarp.selection] floods through. Public because those callers live in
+    three modules and must all reject the same table the same way; only the first of the three
+    reaches the rotation, so a check placed in that walk would leave the other two unguarded.
+
+    What it checks is every entry that *is* present; what it cannot check is an entry that is
+    absent. A ``-1`` claims "this halfedge has no twin", and deciding whether that is true means
+    finding out whether another halfedge spans the same edge -- which is the sort
+    [`halfedge_twins`][triwarp.halfedge.halfedge_twins] does and the work ``twins=`` exists to
+    skip, so demanding it here would make the keyword pointless. A table of nothing but ``-1``
+    therefore passes; it is not silent, because a fabricated boundary shortens the fan and
+    [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] then raises on the ring it could not
+    complete.
+
+    The length half is free. The structural half costs one launch over the halfedges and one
+    readback, and is only ever paid when a table was actually supplied -- again, the path a caller
+    takes to skip an edge build, a hash, a radix sort, a launch and a readback, so verifying the
+    shortcut stays a fraction of what taking it saved. A table this package produced can never
+    fail it, since ``halfedge_twins`` establishes the property by construction.
 
     The device half of the same contract is the caller's own
     ``require_same_device`` call, which covers every argument it received rather than this pair
@@ -123,7 +161,9 @@ def require_matching_twins(faces: wp.array[wp.int32], twins: wp.array[wp.int32] 
     Raises
     ------
     ValueError
-        If ``twins`` is given and its length is not ``3 * n_faces``.
+        If ``twins`` is given and its length is not ``3 * n_faces``, or if any of its entries is
+        not the opposite halfedge of its own index. ``-1`` is a boundary halfedge and is always
+        accepted.
 
     See Also
     --------
@@ -138,6 +178,26 @@ def require_matching_twins(faces: wp.array[wp.int32], twins: wp.array[wp.int32] 
         raise ValueError(
             f"twins must have one entry per halfedge, got {twins.shape[0]} for {n_halfedges} "
             f"halfedges ({n_halfedges // 3} faces)"
+        )
+    if n_halfedges == 0:
+        return
+    device = faces.device
+    mispaired = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_halfedge.count_mispaired_twins,
+        dim=n_halfedges,
+        inputs=[faces, twins, mispaired],
+        device=device,
+    )
+    # Unavoidable: the count only exists on the device, and the whole point is to raise on it
+    # before a consumer walks the table.
+    n_mispaired = int(read_scalar(mispaired, 0))
+    if n_mispaired > 0:
+        raise ValueError(
+            f"twins must hold the opposite halfedge of each halfedge of faces: {n_mispaired} "
+            f"entry/entries do not. A twin must run back along the same edge (so "
+            f"twins[twins[h]] == h and the two endpoints swap), or be -1 on a boundary. Build the "
+            f"table with halfedge_twins for the same face buffer."
         )
 
 
@@ -187,10 +247,11 @@ def vertex_one_rings(
     Raises
     ------
     ValueError
-        If ``twins`` is given and does not have one entry per halfedge of ``faces``, or if a
-        vertex's rotation closes before its whole fan is covered — a pinched, vertex-non-manifold
-        vertex where two fans meet at a single index. Detecting the latter needs one 4-byte
-        readback, so this function always synchronizes once.
+        If ``twins`` is given and is not a twin table for ``faces``
+        ([`require_matching_twins`][triwarp.halfedge.require_matching_twins] states what that
+        means), or if a vertex's rotation closes before its whole fan is covered — a pinched,
+        vertex-non-manifold vertex where two fans meet at a single index. Detecting the latter
+        needs one 4-byte readback, so this function always synchronizes once.
     RuntimeError
         If ``faces`` and ``twins`` are not all on one device.
 

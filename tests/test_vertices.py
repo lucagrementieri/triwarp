@@ -307,17 +307,40 @@ def _compute_max_vertex_normals_np(vertices: np.ndarray, faces: np.ndarray) -> n
     return vertex_normals_np / norms
 
 
-def test_vertex_normals_mwselr(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+@pytest.mark.parametrize("scale", [1.0, 1e-3, 1e3])
+def test_vertex_normals_mwselr(scale: float, half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A against a NumPy transcription of Nelson Max's MWSELR weight.
+
+    **Parametrized over the mesh scale, which is where the weight used to fail silently.** The
+    weight divides by ``||e1||^2 * ||e2||^2``, a length^4 quantity, and the kernel guarded that
+    denominator against the absolute ``TOLERANCE_ZERO`` (1e-12) rather than against zero -- so
+    every corner of a mesh with edges shorter than ~1e-3 was read as degenerate and weighted zero.
+    Measured before the fix at ``scale=1e-3``: all 162 vertex normals of a scaled ``icosphere(2)``
+    came back as the zero vector, while ``"area"`` and ``"angle"`` returned correct unit normals
+    from the same buffers -- so nothing but this parametrization separates the defect from the
+    documented zero-row contract (an unreferenced vertex, or a fan whose contributions cancel).
+    The oracle keys on ``len_sq == 0`` for the same reason, so it is scale-free by construction and
+    the two agree at every scale. ``1e3`` covers the other direction, where the denominator grows
+    rather than shrinks.
+
+    Both entry points are checked at every scale: the derived-normals path and the
+    supplied-``face_normals`` path multiply in the cross-product magnitude at different points, so
+    a scale that broke one need not break the other.
+    """
     mesh_tm, mesh_wp = half_torus
 
-    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
+    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64) * scale
     faces_np = np.array(mesh_tm.faces, dtype=np.int32)
     vertex_normals_np = _compute_max_vertex_normals_np(vertices_np, faces_np)
+    # Non-vacuity: the oracle itself must be unit normals, not the zero rows the defect produced.
+    assert np.allclose(np.linalg.norm(vertex_normals_np, axis=1), 1.0)
 
-    vertices_wp = points_to_warp(mesh_tm.vertices, mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
     vertex_normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices, weighting="mwselr")
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_np, rtol=1e-5, atol=1e-5)
 
+    # Face normals are unit vectors, so they are the same buffer at every scale.
     face_normals_wp = points_to_warp(mesh_tm.face_normals, mesh_wp.device)
     vertex_normals_explicit_wp = tw.vertices.vertex_normals(
         vertices_wp, mesh_wp.indices, weighting="mwselr", face_normals=face_normals_wp

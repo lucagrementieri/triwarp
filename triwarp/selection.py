@@ -155,8 +155,10 @@ def faces_left_of_contour(
     TypeError
         If ``contour_edges`` is not a rank-2 ``wp.int32`` array.
     ValueError
-        If ``contour_edges`` does not have two columns, or if ``twins`` is given and does not have
-        one entry per halfedge of ``faces``.
+        If ``contour_edges`` does not have two columns, or if ``twins`` is given and is not a
+        twin table for ``faces``
+        ([`require_matching_twins`][triwarp.halfedge.require_matching_twins] states what that
+        means, and checking it costs one launch and one readback).
     RuntimeError
         If ``faces``, ``contour_edges`` and ``twins`` are not all on one device.
 
