@@ -1440,15 +1440,9 @@ def extrude_triangulation(
     out_faces = wp.empty((2 * n_faces + 2 * n_boundary) * 3, dtype=wp.int32, device=device)
     # Bottom cap winding is reversed; the top cap keeps it and is offset by one vertex block.
     wp.launch(
-        kernel_creation.offset_cap_faces,
-        dim=n_faces,
-        inputs=[faces, wp.int32(0), True, out_faces[: n_faces * 3]],
-        device=device,
-    )
-    wp.launch(
-        kernel_creation.offset_cap_faces,
-        dim=n_faces,
-        inputs=[faces, wp.int32(n), False, out_faces[n_faces * 3 : 2 * n_faces * 3]],
+        kernel_creation.offset_cap_faces_both,
+        dim=(2, n_faces),
+        inputs=[faces, wp.int32(n), out_faces[: 2 * n_faces * 3]],
         device=device,
     )
     if n_boundary > 0:
@@ -1603,18 +1597,11 @@ def sweep_polygon(
     closed = math.dist(first, last) < TOLERANCE_MERGE
     connect_closed = closed and connect
 
-    normals = wp.empty(n_path, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_creation.sweep_plane_normals,
-        dim=n_path,
-        inputs=[path, connect_closed, normals],
-        device=device,
-    )
     transforms = wp.empty(n_path, dtype=wp.mat44, device=device)
     wp.launch(
         kernel_creation.sweep_transforms,
         dim=n_path,
-        inputs=[path, angles, normals, transforms],
+        inputs=[path, angles, connect_closed, transforms],
         device=device,
     )
 
@@ -1645,20 +1632,9 @@ def sweep_polygon(
     if n_cap > 0:
         base = 2 * n_slices * n_boundary * 3
         wp.launch(
-            kernel_creation.offset_cap_faces,
-            dim=n_cap,
-            inputs=[cap_faces, wp.int32(0), True, faces[base : base + n_cap * 3]],
-            device=device,
-        )
-        wp.launch(
-            kernel_creation.offset_cap_faces,
-            dim=n_cap,
-            inputs=[
-                cap_faces,
-                wp.int32(stride * n_slices),
-                False,
-                faces[base + n_cap * 3 : base + 2 * n_cap * 3],
-            ],
+            kernel_creation.offset_cap_faces_both,
+            dim=(2, n_cap),
+            inputs=[cap_faces, wp.int32(stride * n_slices), faces[base : base + 2 * n_cap * 3]],
             device=device,
         )
 

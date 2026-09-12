@@ -1401,10 +1401,11 @@ def test_log_map_is_invariant_to_mesh_scale(
     Class A: the same surface in different units maps to the same angles, scaled.
 
     ``world_to_tangent_unit``'s vertex-gradient field is an area-weighted *sum* of unit vectors
-    (see ``kernels/heat.py::scatter_face_field_to_vertices``), so its magnitude carries the mesh's
-    coordinate scale *squared* -- against a fixed absolute floor the failure is not an error but a
-    silent collapse of the whole log map to angle zero, because ``log_map_from_angles`` keeps the
-    (correct) radius and reports an arbitrary angle whenever it reads the field as vanished. Every
+    (see ``kernels/heat.py::scatter_unit_gradient_to_vertices``), so its magnitude carries the
+    mesh's coordinate scale *squared* -- against a fixed absolute floor the failure is not an error
+    but a silent collapse of the whole log map to angle zero, because ``log_map_from_angles``
+    keeps the (correct) radius and reports an arbitrary angle whenever it reads the field as
+    vanished. Every
     one of this fixture's 162 vertices reported angle zero at a scale of 1e-7, and 0 do now (the
     source's own row aside, which is forced to angle zero by construction at every scale).
 

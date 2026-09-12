@@ -705,17 +705,11 @@ def _poisson_solve_level(
         device=device,
     )
     rhs = wp.empty(n_nodes, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_reconstruction.negative_divergence,
-        dim=(res, res, res),
-        inputs=[vx, vy, vz, weights, res, rhs],
-        device=device,
-    )
     inv_diag = wp.empty(n_nodes, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_reconstruction.screened_inverse_diagonal,
+        kernel_reconstruction.poisson_level_setup,
         dim=(res, res, res),
-        inputs=[weights, wp.float32(screen), res, inv_diag],
+        inputs=[vx, vy, vz, weights, wp.float32(screen), res, rhs, inv_diag],
         device=device,
     )
 

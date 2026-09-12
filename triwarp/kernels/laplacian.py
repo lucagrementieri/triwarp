@@ -144,27 +144,37 @@ def row_normalize(offsets: wp.array[wp.int32], out_values: wp.array[wp.Float]) -
             out_values[k] = out_values[k] / total
 
 
-@wp.kernel
-def apply_operator(
+# One row of the row-stochastic averaging operator, as a ``@wp.func`` so a consumer can apply it
+# and use the result in the same thread instead of round-tripping an intermediate buffer through
+# global memory and a second launch. Every smoothing filter that iterates ``L`` does exactly that
+# (see ``triwarp/smoothing.py``), so the row apply is the shared run rather than the kernel.
+#
+# Note the precision: the float32 weight is promoted to float64 because the accumulator is a
+# ``wp.vec3d``. ``kernels/smoothing.diffuse_scalar_pass`` walks the same row on a float32 scalar
+# field and accumulates in float32, so it cannot call this -- ``float64 * float32`` does not parse,
+# and the float64-field form that would let one generic serve both was measured at 0.63-0.86x.
+# That comment carries the numbers.
+
+
+@wp.func
+def operator_row(
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
     values: wp.array[wp.float32],
-    v_in: wp.array[wp.vec3d],
-    out_lv: wp.array[wp.vec3d],
-) -> None:
-    i = wp.int32(wp.tid())
+    field: wp.array[wp.vec3d],
+    i: wp.int32,
+) -> wp.vec3d:
     start = offsets[i]
     end = offsets[i + 1]
     if end == start:
         # Isolated vertex (empty row): the averaging operator acts as the identity so the
         # vertex does not drift toward the origin.
-        out_lv[i] = v_in[i]
-        return
+        return field[i]
     acc = wp.vec3d(0.0, 0.0, 0.0)
     for k in range(start, end):
         w = wp.float64(values[k])
-        acc += w * v_in[columns[k]]
-    out_lv[i] = acc
+        acc += w * field[columns[k]]
+    return acc
 
 
 @wp.kernel

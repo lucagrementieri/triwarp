@@ -92,7 +92,7 @@ def cot_row_scales(
     #
     # **The row walk is deliberate, and this is the fourth spelling of "get the diagonal" in the
     # tree.** The other three are ``linalg._multigrid_levels`` (through ``wps.bsr_get_diag``),
-    # ``reconstruction.screened_inverse_diagonal`` and
+    # ``reconstruction.poisson_level_setup`` and
     # ``algorithms/conjugate_gradient.scaled_diagonal_apply``. The single-source-of-truth argument
     # for routing this one through ``wps.bsr_get_diag`` too is real; it was measured and declined.
     # Interleaved A/B in one session on an RTX 5090, ``wps.bsr_get_diag(operator)`` plus a
@@ -178,17 +178,45 @@ def sandwich_row_triplets(
             cursor += 1
 
 
+@wp.func
+def triangle_geometry_f64(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32
+) -> tuple[wp.float64, wp.float64, wp.float64, wp.float64]:
+    """
+    Squared edge lengths and twice the area of face ``f``, promoted to ``float64``.
+
+    The shared geometry preamble of
+    [`hessian_face_terms`][triwarp.kernels.energies.hessian_face_terms],
+    [`internal_angles_and_sums`][triwarp.kernels.energies.internal_angles_and_sums] and
+    [`curved_hessian_triplets`][triwarp.kernels.energies.curved_hessian_triplets] -- all three load
+    a face's vertices, its three squared edge lengths and its double area before doing their own,
+    unrelated per-corner computation with them. ``squared_edge_lengths`` and
+    ``triangle_double_area`` have no data dependency on each other, so factoring their call order
+    into one place changes neither result; only the caller-specific math after this stays apart.
+    """
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
+    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
+    dbl_area = triangle_double_area(v0, v1, v2)
+    return l2_0, l2_1, l2_2, dbl_area
+
+
 @wp.kernel
-def hessian_corner_gradients(
+def hessian_face_terms(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     out_gradients: wp.array[wp.vec3d],
     out_areas: wp.array[wp.float64],
+    out_mass: wp.array[wp.float64],
 ) -> None:
-    # Gradient of each corner's hat function inside its face, ``n x e_c / (2 A)`` with ``e_c`` the
-    # CCW edge opposite corner ``c``. A degenerate face gets zero gradients (it contributes
-    # nothing to the energy) rather than a division by its zero area.
+    # ``hessian_energy``'s two per-face passes in one launch. The corner gradients and the Voronoi
+    # mass lumping are independent quantities over the same faces -- neither reads the other -- so
+    # nothing is shared but the face index and the vertex loads, and running them in one thread
+    # removes a launch and lets the two share those loads.
     f = wp.int32(wp.tid())
+
+    # Gradient of each corner's hat function inside its face, ``n x e_c / (2 A)`` with ``e_c`` the
+    # CCW edge opposite corner ``c``. A degenerate face gets zero gradients (it contributes nothing
+    # to the energy) rather than a division by its zero area.
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     normal = wp.cross(v1 - v0, v2 - v0)
     dbl_area = wp.length(normal)
@@ -206,39 +234,16 @@ def hessian_corner_gradients(
     out_gradients[f * 3 + 1] = g1
     out_gradients[f * 3 + 2] = g2
 
-
-@wp.func
-def triangle_geometry_f64(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32
-) -> tuple[wp.float64, wp.float64, wp.float64, wp.float64]:
-    """
-    Squared edge lengths and twice the area of face ``f``, promoted to ``float64``.
-
-    The shared geometry preamble of [`voronoi_mass`][triwarp.kernels.energies.voronoi_mass],
-    [`internal_angles_and_sums`][triwarp.kernels.energies.internal_angles_and_sums] and
-    [`curved_hessian_triplets`][triwarp.kernels.energies.curved_hessian_triplets] -- all three load
-    a face's vertices, its three squared edge lengths and its double area before doing their own,
-    unrelated per-corner computation with them. ``squared_edge_lengths`` and
-    ``triangle_double_area`` have no data dependency on each other, so factoring their call order
-    into one place changes neither result; only the caller-specific math after this stays apart.
-    """
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
-    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
-    dbl_area = triangle_double_area(v0, v1, v2)
-    return l2_0, l2_1, l2_2, dbl_area
-
-
-@wp.kernel
-def voronoi_mass(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_mass: wp.array[wp.float64]
-) -> None:
     # The ``igl::massmatrix`` MASSMATRIX_TYPE_VORONOI lumping: true Voronoi quad areas on
     # non-obtuse triangles, the 1/2 : 1/4 : 1/4 split on obtuse ones (the obtuse corner gets the
     # half). A degenerate face contributes nothing (igl would emit NaN).
-    f = wp.int32(wp.tid())
-    l2_0, l2_1, l2_2, dbl_area = triangle_geometry_f64(vertices, faces, f)
-    if dbl_area <= wp.float64(0.0):
+    # ``dbl_area`` above is ``wp.length(wp.cross(v1 - v0, v2 - v0))``, which is exactly what
+    # ``triangle_double_area`` computes, so the mass half reuses it rather than re-deriving the
+    # face's geometry -- that shared preamble is the second thing the fusion removes, after the
+    # launch.
+    if dbl_area <= zero:
         return
+    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
     cos0, cos1, cos2 = corner_cosines_from_l2(l2_0, l2_1, l2_2)
     bary0 = cos0 * wp.sqrt(l2_0)
     bary1 = cos1 * wp.sqrt(l2_1)
@@ -367,7 +372,7 @@ def internal_angles_and_sums(
         # would then atomically accumulate that NaN into ``out_angle_sums`` for both of the
         # degenerate edge's vertices, poisoning the Gaussian-curvature correction at every *other*,
         # perfectly valid face sharing one of them. A degenerate face contributes nothing instead,
-        # the same convention ``voronoi_mass``/``hessian_corner_gradients`` already use.
+        # the same convention ``hessian_face_terms`` already uses.
         out_angles[f, 0] = zero
         out_angles[f, 1] = zero
         out_angles[f, 2] = zero

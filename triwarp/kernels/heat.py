@@ -33,21 +33,25 @@ def seed_source_indicator(sources: wp.array[wp.int32], out_u0: wp.array[wp.float
     out_u0[sources[t]] = wp.float64(1.0)
 
 
-@wp.kernel
-def integrated_divergence(
+@wp.func
+def accumulate_face_divergence(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     cot_entries: wp.array2d[wp.float32],
-    field: wp.array[wp.vec3d],
+    f: wp.int32,
+    x: wp.vec3d,
     out_div: wp.array[wp.float64],
 ) -> None:
-    # Cotangent integrated divergence of the per-face vector field, accumulated per vertex.
-    # cot_entries[f, k] = 1/2 cot(angle at corner k); each vertex gets contributions from the two
-    # edges of the triangle incident to it, weighted by the cotangent opposite those edges.
-    f = wp.int32(wp.tid())
+    # Cotangent integrated divergence of one face's vector ``x``, accumulated onto its three
+    # vertices. cot_entries[f, k] = 1/2 cot(angle at corner k); each vertex gets contributions from
+    # the two edges of the triangle incident to it, weighted by the cotangent opposite those edges.
+    #
+    # A ``@wp.func`` taking ``x`` as a value rather than a kernel reading it out of an array,
+    # because the per-face field is always written by the immediately preceding launch and read
+    # only at the producing thread's own face -- so every caller below forms it in a register
+    # instead of round-tripping an ``(n_faces,)`` ``wp.vec3d`` buffer through global memory.
     i0, i1, i2 = corner_triple(faces, f)
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
-    x = field[f]
     c0 = wp.float64(cot_entries[f, 0])
     c1 = wp.float64(cot_entries[f, 1])
     c2 = wp.float64(cot_entries[f, 2])
@@ -59,6 +63,34 @@ def integrated_divergence(
     wp.atomic_add(out_div, i0, d0)
     wp.atomic_add(out_div, i1, d1)
     wp.atomic_add(out_div, i2, d2)
+
+
+@wp.kernel
+def unit_gradient_divergence(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    normals: wp.array[wp.vec3],
+    areas: wp.array[wp.float32],
+    values: wp.array[wp.float64],
+    sign: wp.float64,
+    cot_entries: wp.array2d[wp.float32],
+    out_div: wp.array[wp.float64],
+) -> None:
+    # The field's unit gradient direction times an explicit sign, integrated by the same thread
+    # that forms it. For a distance field the direction is radial: ``sign = -1`` is
+    # ``X = -grad(u)/|grad(u)|``, the direction the heat solve's Poisson stage integrates back into
+    # a distance, and ``sign = +1`` is the direction *away* from the source, which is what
+    # ``scatter_unit_gradient_to_vertices`` scatters for the log map's angle.
+    #
+    # The gradient is deliberately *not* merged into ``triangles.face_gradients`` behind a
+    # ``normalize`` flag: the arithmetic is already shared -- ``face_unit_gradient`` is
+    # ``normalize(face_gradient(...))`` -- so a flag would put a mode argument on that path which
+    # only this module's callers would ever set (§4.2, speculative generality: one caller per
+    # mode). The two also return different quantities: a gradient carries the field's rate of
+    # change, this carries only a direction.
+    f = wp.int32(wp.tid())
+    x = sign * face_unit_gradient(vertices, faces, normals, areas, values, f)
+    accumulate_face_divergence(vertices, faces, cot_entries, f, x, out_div)
 
 
 # --------------------------------------------------------------------------------------
@@ -114,36 +146,37 @@ def splat_curve_normals(
 
 
 @wp.kernel
-def vertex_field_to_face_field(
+def vertex_field_divergence(
+    vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     normals: wp.array[wp.vec3],
     field: wp.array[wp.vec2d],
     basis_x: wp.array[wp.vec3],
     basis_y: wp.array[wp.vec3],
-    out_face_field: wp.array[wp.vec3d],
+    cot_entries: wp.array2d[wp.float32],
+    out_div: wp.array[wp.float64],
 ) -> None:
-    # Average the three corners' tangent vectors into one per-face vector, in world space, so the
-    # existing cotangent divergence can integrate it. Each corner's 2D components mean nothing
-    # outside its own frame, so they have to be expanded to 3D *before* averaging.
+    # The signed heat method's stage 3. Average the three corners' tangent vectors into one
+    # per-face vector, in world space, and integrate it by the same thread so it stays in a
+    # register. Each corner's 2D components mean nothing outside its own frame, so they have to be
+    # expanded to 3D *before* averaging.
     #
     # ``field`` must already be normalized per vertex -- the caller floors the diffused field
     # against its own maximum and passes the unit directions. That precondition is what makes the
-    # *absolute* ``TOLERANCE_ZERO_CONSTANT`` below correct here, where everywhere else in this
-    # module a diffused field is compared against a relative floor (see ``scale_to_magnitude``):
-    # the sum of three unit vectors carries no coordinate scale, so the test only asks whether the
-    # three corners cancelled. Hand it a raw diffused field and it zeroes whole faces on any mesh
-    # away from unit scale.
+    # *absolute* ``TOLERANCE_ZERO_CONSTANT`` correct here, where everywhere else in this module a
+    # diffused field is compared against a relative floor (see ``scale_to_magnitude``): the sum of
+    # three unit vectors carries no coordinate scale, so the test only asks whether the three
+    # corners cancelled. Hand it a raw diffused field and it zeroes whole faces on any mesh away
+    # from unit scale.
     f = wp.int32(wp.tid())
-    normal = normals[f]
     total = wp.vec3(0.0, 0.0, 0.0)
     for k in range(3):
         v = faces[f * 3 + k]
         value = field[v]
         total += wp.float32(value[0]) * basis_x[v] + wp.float32(value[1]) * basis_y[v]
-    tangential, _length = unit_tangent(total, normal, TOLERANCE_ZERO_CONSTANT)
-    out_face_field[f] = wp.vec3d(
-        wp.float64(tangential[0]), wp.float64(tangential[1]), wp.float64(tangential[2])
-    )
+    tangential, _length = unit_tangent(total, normals[f], TOLERANCE_ZERO_CONSTANT)
+    x = wp.vec3d(wp.float64(tangential[0]), wp.float64(tangential[1]), wp.float64(tangential[2]))
+    accumulate_face_divergence(vertices, faces, cot_entries, f, x, out_div)
 
 
 @wp.kernel
@@ -278,51 +311,23 @@ def tangent_to_world(tangent: wp.vec2, basis_x: wp.vec3, basis_y: wp.vec3) -> wp
 
 
 @wp.kernel
-def scatter_face_field_to_vertices(
-    faces: wp.array[wp.int32],
-    face_areas: wp.array[wp.float32],
-    field: wp.array[wp.vec3d],
-    out_vertex_field: wp.array[wp.vec3],
-) -> None:
-    # Area-weighted average of a per-face vector field onto vertices, as a plain scatter-add: the
-    # weights are the same for all three corners so no normalization is needed before projecting.
-    f = wp.int32(wp.tid())
-    area = face_areas[f]
-    value = wp.vec3(
-        wp.float32(field[f][0]) * area,
-        wp.float32(field[f][1]) * area,
-        wp.float32(field[f][2]) * area,
-    )
-    add_corner_triple(out_vertex_field, faces, f, value, value, value)
-
-
-@wp.kernel
-def face_unit_gradients(
+def scatter_unit_gradient_to_vertices(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     normals: wp.array[wp.vec3],
     areas: wp.array[wp.float32],
     values: wp.array[wp.float64],
     sign: wp.float64,
-    out_gradient: wp.array[wp.vec3d],
+    out_vertex_field: wp.array[wp.vec3],
 ) -> None:
-    # The field's unit gradient direction, times an explicit sign. For a distance field this is the
-    # radial direction: `sign=1` is the direction *away* from the source (the log map's angle is
-    # measured against it), `sign=-1` is `X = -grad(u)/|grad(u)|` (the direction the heat solve's
-    # Poisson stage integrates back into a distance).
-    #
-    # One kernel serving both callers, not two: they used to be `face_gradient_normalized` (the
-    # `sign=-1` heat-solve shim) and `face_gradient_unit` (this one, `sign=1`), identical apart from
-    # the sign, and both are launched from `triwarp/heat.py`. Deliberately still not merged with
-    # `triangles.face_gradients` behind a `normalize` flag, though: the arithmetic is already
-    # shared -- this is a one-line launch shim over a `triangles` @wp.func, and
-    # `face_unit_gradient` is `normalize(face_gradient(...))` -- so a flag would save one shim while
-    # putting a mode argument on `laplacian.face_gradients`' path that only this module's callers
-    # would ever set (§14, speculative generality: one caller per mode). The two also return
-    # different quantities: a gradient carries the field's rate of change, this carries only a
-    # direction.
+    # The log map's radial direction -- the unit gradient of the distance field -- formed and
+    # scattered onto vertices by the same thread. The scatter is a plain area-weighted add: the
+    # weights are the same for all three corners, so no normalization is needed before projecting.
     f = wp.int32(wp.tid())
-    out_gradient[f] = sign * face_unit_gradient(vertices, faces, normals, areas, values, f)
+    x = sign * face_unit_gradient(vertices, faces, normals, areas, values, f)
+    area = areas[f]
+    value = wp.vec3(wp.float32(x[0]) * area, wp.float32(x[1]) * area, wp.float32(x[2]) * area)
+    add_corner_triple(out_vertex_field, faces, f, value, value, value)
 
 
 @wp.func
@@ -333,8 +338,9 @@ def world_to_tangent_unit(
     # survives, which is all the log map's angle needs.
     #
     # ``tolerance`` must be relative to ``value``'s own field maximum, not a fixed constant:
-    # ``value`` is an area-weighted *sum* of unit vectors (see ``scatter_face_field_to_vertices``),
-    # so its magnitude carries the mesh's coordinate scale squared and a fixed floor collapses the
+    # ``value`` is an area-weighted *sum* of unit vectors (see
+    # ``scatter_unit_gradient_to_vertices``), so its magnitude carries the mesh's coordinate scale
+    # squared and a fixed floor collapses the
     # whole log map to angle zero on any mesh not near unit scale (confirmed: every one of 162
     # vertices on a unit icosphere scaled by 1e-7).
     tangent = wp.vec2(wp.dot(value, basis_x), wp.dot(value, basis_y))

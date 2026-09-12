@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import to_vec3d
-from triwarp.kernels.laplacian import cot_entries_from_l2
+from triwarp.kernels.laplacian import cot_entries_from_l2, operator_row
 from triwarp.kernels.linalg import free_row, selected_row, solve_normal_equations
 from triwarp.kernels.predicates import (
     closest_point_on_segment,
@@ -309,42 +309,6 @@ def rescale_about_center(position: wp.vec3d, center: wp.vec3d, scale: wp.float64
 
 
 @wp.func
-def laplacian_step(v_prev: wp.vec3d, lv: wp.vec3d, coeff: wp.float64) -> wp.vec3d:
-    # Explicit diffusion step v' = v + coeff * (L·v - v); coeff = +lambda (shrink) or -nu (inflate).
-    # ``wp.lerp`` extrapolates for coeff outside [0, 1], which the inflating step relies on.
-    return wp.lerp(v_prev, lv, coeff)
-
-
-@wp.func
-def neighborhood_average(
-    v_prev: wp.vec3d, lv: wp.vec3d, start: wp.int32, end: wp.int32
-) -> wp.vec3d:
-    # Closed 1-ring average: new_v = (v + deg * L·v) / (deg + 1), where L is the neighbors-only
-    # averaging operator and deg = CSR row length (vertex degree). deg=0 -> new_v = v.
-    deg = wp.float64(end - start)
-    return (v_prev + deg * lv) / (deg + wp.float64(1.0))
-
-
-@wp.func
-def humphrey_residual(lv: wp.vec3d, original: wp.vec3d, q: wp.vec3d, alpha: wp.float64) -> wp.vec3d:
-    # b = L·v - (alpha * original + (1 - alpha) * q), the Humphrey correction term.
-    return lv - wp.lerp(q, original, alpha)
-
-
-@wp.func
-def humphrey_update(lv: wp.vec3d, b: wp.vec3d, lb: wp.vec3d, beta: wp.float64) -> wp.vec3d:
-    # v' = L·v - (beta * b + (1 - beta) * L·b).
-    return lv - wp.lerp(lb, b, beta)
-
-
-@wp.func
-def mut_dif_adil(normal: wp.vec3, v: wp.vec3d, lv: wp.vec3d) -> wp.float64:
-    # adil = 1 / max(1e-12, |N . (V - L.V)|), the reciprocal normal-residual magnitude per vertex.
-    d = wp.abs(wp.dot(to_vec3d(normal), v - lv))
-    return wp.float64(1.0) / wp.max(wp.float64(1e-12), d)
-
-
-@wp.func
 def mut_dif_step(
     v_prev: wp.vec3d, lv: wp.vec3d, adil: wp.float64, mean_adil: wp.float64, lamb: wp.float64
 ) -> wp.vec3d:
@@ -353,6 +317,101 @@ def mut_dif_step(
     # trimesh's ``filter_mut_dif_laplacian`` uses (``np.maximum(..., np.minimum(...))``).
     lamber = wp.max(wp.float64(0.2) * lamb, wp.min(wp.float64(1.0), lamb * adil / mean_adil))
     return wp.lerp(v_prev, lv, lamber)
+
+
+# Each of the five kernels below fuses ``kernels/laplacian.operator_row`` with the step that
+# consumes its result. Every explicit smoothing filter alternates the two, so the pair cost one
+# extra launch and one ``(n_vertices,)`` float64x3 round trip through global memory per pass;
+# applying the row in the consuming thread removes both. Each step is one expression with exactly
+# one caller, so it is written here rather than behind a helper name.
+
+
+@wp.kernel
+def diffuse_vec3_pass(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    positions: wp.array[wp.vec3d],
+    coeff: wp.float64,
+    out_next: wp.array[wp.vec3d],
+) -> None:
+    # Explicit diffusion step v' = v + coeff * (L.v - v); coeff = +lambda (shrink) or -nu
+    # (inflate). ``wp.lerp`` extrapolates for coeff outside [0, 1], which the inflating step of
+    # ``filter_taubin`` relies on.
+    i = wp.int32(wp.tid())
+    lv = operator_row(offsets, columns, values, positions, i)
+    out_next[i] = wp.lerp(positions[i], lv, coeff)
+
+
+@wp.kernel
+def neighborhood_average_pass(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    positions: wp.array[wp.vec3d],
+    out_next: wp.array[wp.vec3d],
+) -> None:
+    # Closed 1-ring average: new_v = (v + deg * L.v) / (deg + 1), where L is the neighbors-only
+    # averaging operator and deg is the CSR row length (the vertex degree). deg = 0 -> new_v = v.
+    i = wp.int32(wp.tid())
+    lv = operator_row(offsets, columns, values, positions, i)
+    deg = wp.float64(offsets[i + 1] - offsets[i])
+    out_next[i] = (positions[i] + deg * lv) / (deg + wp.float64(1.0))
+
+
+@wp.kernel
+def humphrey_residual_pass(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    positions: wp.array[wp.vec3d],
+    original: wp.array[wp.vec3d],
+    alpha: wp.float64,
+    out_lv: wp.array[wp.vec3d],
+    out_b: wp.array[wp.vec3d],
+) -> None:
+    # b = L.v - (alpha * original + (1 - alpha) * q), the Humphrey correction term. ``out_lv`` is
+    # still written because the update pass below reads it; only ``L.b`` disappears.
+    i = wp.int32(wp.tid())
+    lv = operator_row(offsets, columns, values, positions, i)
+    out_lv[i] = lv
+    out_b[i] = lv - wp.lerp(positions[i], original[i], alpha)
+
+
+@wp.kernel
+def humphrey_update_pass(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    lv: wp.array[wp.vec3d],
+    b: wp.array[wp.vec3d],
+    beta: wp.float64,
+    out_next: wp.array[wp.vec3d],
+) -> None:
+    # v' = L.v - (beta * b + (1 - beta) * L.b), with L.b formed here rather than in a buffer.
+    i = wp.int32(wp.tid())
+    lb = operator_row(offsets, columns, values, b, i)
+    out_next[i] = lv[i] - wp.lerp(lb, b[i], beta)
+
+
+@wp.kernel
+def mut_dif_adil_pass(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    positions: wp.array[wp.vec3d],
+    normals: wp.array[wp.vec3],
+    out_lv: wp.array[wp.vec3d],
+    out_adil: wp.array[wp.float64],
+) -> None:
+    # adil = 1 / max(1e-12, |N . (V - L.V)|), the reciprocal normal-residual magnitude per vertex.
+    # ``out_lv`` is still written because ``mut_dif_step_scaled`` reads it after the mean reduction
+    # this pass feeds; what the fusion removes is the separate apply launch, not the buffer.
+    i = wp.int32(wp.tid())
+    lv = operator_row(offsets, columns, values, positions, i)
+    out_lv[i] = lv
+    residual = wp.abs(wp.dot(to_vec3d(normals[i]), positions[i] - lv))
+    out_adil[i] = wp.float64(1.0) / wp.max(wp.float64(1e-12), residual)
 
 
 @wp.kernel
@@ -416,34 +475,61 @@ def implicit_laplacian_triplets(
     out_vals[diag] = wp.float64(1.0) + lamb
 
 
-@wp.func
-def scalar_laplacian_step(value: wp.float32, average: wp.float32, lamb: wp.float32) -> wp.float32:
-    # Explicit diffusion step on a scalar field: move it a fraction ``lamb`` of the way to the
-    # 1-ring average. ``lamb = 1`` replaces the value outright, which is MeshLab's single pass.
-    return wp.lerp(value, average, lamb)
-
-
 @wp.kernel
-def apply_operator_scalar(
+def diffuse_scalar_pass(
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
     values: wp.array[wp.float32],
     field: wp.array[wp.float32],
-    out_average: wp.array[wp.float32],
+    lamb: wp.float32,
+    out_next: wp.array[wp.float32],
 ) -> None:
-    # Scalar counterpart of ``kernels/laplacian.apply_operator``: one row of the row-stochastic
-    # averaging operator against a per-vertex scalar. An isolated vertex (empty row) keeps its own
-    # value, so it neither drifts to zero nor contaminates its (nonexistent) neighbours.
+    # The scalar counterpart of ``diffuse_vec3_pass``: one row of the row-stochastic averaging
+    # operator and the diffusion step that consumes it, in the same thread, so the pass issues one
+    # launch and never materializes the intermediate average. ``lamb = 1`` replaces the value
+    # outright, which is MeshLab's single pass.
+    #
+    # The row is spelled out here rather than sharing ``kernels/laplacian.operator_row``, and the
+    # duplication is deliberate. That helper promotes the float32 weight to float64 because its
+    # accumulator is a ``wp.vec3d``; a scalar field is float32 end to end, and ``float64 *
+    # float32`` is a hard parse error in Warp ("Input types must be the same"), so no single
+    # spelling serves both. Sharing it would mean carrying the field in float64, which was built
+    # and measured: **0.86x on lucy** (14 M vertices, 5.15 -> 5.96 ms) and **0.63x at 655 k**,
+    # because the field is one of four streams the CSR walk reads and doubling its width costs
+    # bandwidth the launch saving cannot repay -- before counting the two conversion passes a
+    # float64 iterate would add per call.
+    #
+    # An isolated vertex (empty row) keeps its own value, so it neither drifts to zero nor
+    # contaminates its (nonexistent) neighbours.
     i = wp.int32(wp.tid())
+    value = field[i]
     start = offsets[i]
     end = offsets[i + 1]
-    if end == start:
-        out_average[i] = field[i]
-        return
-    total = wp.float32(0.0)
-    for k in range(start, end):
-        total += values[k] * field[columns[k]]
-    out_average[i] = total
+    average = value
+    if end > start:
+        total = wp.float32(0.0)
+        for k in range(start, end):
+            total += values[k] * field[columns[k]]
+        average = total
+    out_next[i] = wp.lerp(value, average, lamb)
+
+
+@wp.kernel
+def renormalize_and_reseed(
+    areas: wp.array[wp.float32], accumulated: wp.array[wp.vec3], out_normals: wp.array[wp.vec3]
+) -> None:
+    # One pass's normalization fused with the *next* pass's seed. The two are adjacent across the
+    # loop boundary rather than inside one iteration -- ``accumulate_smoothed_normals`` sits between
+    # the seed and the normalization and scatters across faces, so it needs the whole seeded buffer
+    # and cannot be folded in -- and both halves are per-face, so a pass loop issues two launches
+    # instead of three once the first seed is peeled off the front.
+    #
+    # ``accumulated`` is in place: this thread reads its own slot and immediately overwrites it with
+    # the next pass's seed, so it is both the input and the result.
+    f = wp.int32(wp.tid())
+    normal = wp.normalize(accumulated[f])
+    out_normals[f] = normal
+    accumulated[f] = seed_weighted_normal(normal, areas[f])
 
 
 @wp.kernel

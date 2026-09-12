@@ -290,16 +290,20 @@ def revolve_cap_faces(
 
 
 @wp.kernel
-def offset_cap_faces(
-    cap_faces: wp.array[wp.int32], offset: wp.int32, reverse: wp.bool, out_faces: wp.array[wp.int32]
+def offset_cap_faces_both(
+    cap_faces: wp.array[wp.int32], far_offset: wp.int32, out_faces: wp.array[wp.int32]
 ) -> None:
-    # Shift a cap triangulation onto one end of a revolved / swept / extruded mesh. `reverse`
-    # reverses the winding (trimesh's np.fliplr) so that cap's normals point outward too.
-    t = wp.int32(wp.tid())
+    # Both caps of an extruded or swept solid in one launch. Row 0 is the near cap -- no vertex
+    # offset, winding reversed so its normals point outward -- and row 1 is the far cap, shifted by
+    # ``far_offset`` and keeping the input winding. Every caller writes the two into adjacent
+    # blocks of one buffer, which is what lets a single launch cover them.
+    end, t = wp.tid()
+    n_cap = cap_faces.shape[0] // 3
+    offset = wp.where(end == 0, wp.int32(0), far_offset)
     a = cap_faces[t * 3 + 0] + offset
     b = cap_faces[t * 3 + 1] + offset
     c = cap_faces[t * 3 + 2] + offset
-    write_corner_triple_reversible(out_faces, t, a, b, c, reverse)
+    write_corner_triple_reversible(out_faces, end * n_cap + t, a, b, c, end == 0)
 
 
 @wp.kernel
@@ -340,28 +344,6 @@ def path_tangent(path: wp.array[wp.vec3], i: wp.int32) -> wp.vec3:
     return wp.normalize(segment_displacement(path, i))
 
 
-@wp.kernel
-def sweep_plane_normals(
-    path: wp.array[wp.vec3], connect_closed: wp.bool, out_normals: wp.array[wp.vec3]
-) -> None:
-    # One plane normal per path vertex: the end planes lie along their single adjacent segment,
-    # interior planes bisect the two. trimesh unitizes the sum rather than halving it because
-    # opposing segments can cancel.
-    i = wp.int32(wp.tid())
-    last = path.shape[0] - 1
-    normal = wp.vec3(0.0, 0.0, 0.0)
-    if i == 0:
-        normal = path_tangent(path, 0)
-        if connect_closed:
-            # A closed path averages the first and last planes so the seam has one frame.
-            normal = wp.normalize(normal + path_tangent(path, last - 1))
-    elif i == last:
-        normal = path_tangent(path, last - 1)
-    else:
-        normal = wp.normalize(path_tangent(path, i) + path_tangent(path, i - 1))
-    out_normals[i] = normal
-
-
 @wp.func
 def snap_spherical(value: wp.float32) -> wp.float32:
     if wp.abs(value) < SPHERICAL_SNAP:
@@ -373,17 +355,30 @@ def snap_spherical(value: wp.float32) -> wp.float32:
 def sweep_transforms(
     path: wp.array[wp.vec3],
     angles: wp.array[wp.float32],
-    normals: wp.array[wp.vec3],
+    connect_closed: wp.bool,
     out_transforms: wp.array[wp.mat44],
 ) -> None:
     # The rotation taking Z+ onto normals[i], pre-rolled by angles[i], with path[i] as origin.
     # Unrolled by trimesh from inv(Rz(roll) @ Rx(phi) @ Rz(pi/2 - theta)), so it is the identity
     # for a Z+ normal and needs no matrix inverse at runtime.
     i = wp.int32(wp.tid())
-    normal = normals[i]
-    # A degenerate (near-zero) normal has no direction to convert -- ``sweep_plane_normals``'s own
-    # comment names the case, two consecutive path tangents cancelling at a sharp path reversal --
-    # so leave both angles at the Z+-identity zero rather than computing one, matching trimesh's
+    # One plane normal per path vertex, formed here rather than in a buffer of its own: the end
+    # planes lie along their single adjacent segment, interior planes bisect the two. trimesh
+    # unitizes the sum rather than halving it because opposing segments can cancel.
+    last = path.shape[0] - 1
+    normal = wp.vec3(0.0, 0.0, 0.0)
+    if i == 0:
+        normal = path_tangent(path, 0)
+        if connect_closed:
+            # A closed path averages the first and last planes so the seam has one frame.
+            normal = wp.normalize(normal + path_tangent(path, last - 1))
+    elif i == last:
+        normal = path_tangent(path, last - 1)
+    else:
+        normal = wp.normalize(path_tangent(path, i) + path_tangent(path, i - 1))
+    # A degenerate (near-zero) normal has no direction to convert -- two consecutive path tangents
+    # cancelling at a sharp path reversal, which the branch above can produce -- so leave both
+    # angles at the Z+-identity zero rather than computing one, matching trimesh's
     # ``vector_to_spherical`` (``unitize(..., check_valid=True)`` marks such a row invalid and its
     # spherical angles stay at their zeroed default). Without this, ``wp.acos(0.0) == pi/2`` here
     # would instead rotate local +Z onto +X -- an arbitrary ~90 degree twist, not the identity a

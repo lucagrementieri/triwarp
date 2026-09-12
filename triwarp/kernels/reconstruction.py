@@ -651,64 +651,18 @@ def normalized_field_component(
 ) -> wp.float32:
     # One splatted vector-field component divided by its own density weight -- the per-element
     # operation `normalize_vector_field` used to do as a separate pass. Kept as a `@wp.func` (not a
-    # standalone kernel) so `negative_divergence` can read a normalized value at each of its six
+    # standalone kernel) so `poisson_level_setup` can read a normalized value at each of its six
     # neighbour offsets directly, rather than reading back a value a prior launch wrote: see the
-    # measurement on ``negative_divergence`` below.
+    # measurement in ``poisson_level_setup`` below.
     inv = 1.0 / wp.max(weights[idx], POISSON_WEIGHT_EPS)
     return field[idx] * inv
-
-
-@wp.kernel(enable_backward=False)
-def negative_divergence(
-    vx: wp.array[wp.float32],
-    vy: wp.array[wp.float32],
-    vz: wp.array[wp.float32],
-    weights: wp.array[wp.float32],
-    res: wp.int32,
-    out_b: wp.array[wp.float32],
-) -> None:
-    i, j, k = wp.tid()
-    # Central differences in index space; one-sided at the grid boundary (denominator 1 there).
-    # That denominator is 0, not 1, at res == 1 (every axis's clamp collapses to ip == im), but
-    # reconstruction.screened_poisson validates 3 <= full_depth <= depth <= 10, so the smallest
-    # reachable grid is res = 2**3 + 1 = 9 and no caller in the tree reaches res == 1. Not guarded
-    # here per CLAUDE.md section 4.2 ("no speculative generality") -- add a guard only if a future
-    # caller can legitimately reach res == 1.
-    ip = wp.min(i + 1, res - 1)
-    im = wp.max(i - 1, 0)
-    jp = wp.min(j + 1, res - 1)
-    jm = wp.max(j - 1, 0)
-    kp = wp.min(k + 1, res - 1)
-    km = wp.max(k - 1, 0)
-    # Normalized in place here rather than by a separate `normalize_vector_field` pass over the
-    # whole grid: that pass measured 5.93% of screened_poisson's device time at the default depth=8
-    # (RTX 5090), almost all of it the extra launch plus a full res**3-element write-back of
-    # vx/vy/vz that this function immediately reads back at six neighbour offsets anyway. Fusing
-    # removes one launch and that write-back, at the cost of reading `weights` at the same six
-    # offsets instead of once per node -- a real trade given six values are already read here per
-    # component. `normalized_field_component` reproduces the deleted pass's exact
-    # `field[idx] * (1.0 / max(weight, eps))` operation (a multiply by the reciprocal, not a divide)
-    # so the result is bit-identical to computing it as a separate pass first.
-    dx = (
-        normalized_field_component(vx, weights, poisson_grid_index(ip, j, k, res))
-        - normalized_field_component(vx, weights, poisson_grid_index(im, j, k, res))
-    ) / wp.float32(ip - im)
-    dy = (
-        normalized_field_component(vy, weights, poisson_grid_index(i, jp, k, res))
-        - normalized_field_component(vy, weights, poisson_grid_index(i, jm, k, res))
-    ) / wp.float32(jp - jm)
-    dz = (
-        normalized_field_component(vz, weights, poisson_grid_index(i, j, kp, res))
-        - normalized_field_component(vz, weights, poisson_grid_index(i, j, km, res))
-    ) / wp.float32(kp - km)
-    out_b[poisson_grid_index(i, j, k, res)] = -(dx + dy + dz)
 
 
 @wp.func
 def poisson_neighbor_degree(i: wp.int32, j: wp.int32, k: wp.int32, res: wp.int32) -> wp.float32:
     # Number of (i, j, k)'s up-to-6 axis-aligned grid neighbours that lie inside [0, res) -- the
     # diagonal degree of the homogeneous-Neumann 7-point Poisson stencil. Shared so
-    # ``screened_laplacian_matvec``'s operator and ``screened_inverse_diagonal``'s Jacobi
+    # ``screened_laplacian_matvec``'s operator and ``poisson_level_setup``'s Jacobi
     # preconditioner can never disagree about which grid nodes are boundary nodes.
     deg = wp.float32(0.0)
     if i + 1 < res:
@@ -762,19 +716,63 @@ def screened_laplacian_matvec(
 
 
 @wp.kernel(enable_backward=False)
-def screened_inverse_diagonal(
+def poisson_level_setup(
+    vx: wp.array[wp.float32],
+    vy: wp.array[wp.float32],
+    vz: wp.array[wp.float32],
     weights: wp.array[wp.float32],
     screen: wp.float32,
     res: wp.int32,
+    out_b: wp.array[wp.float32],
     out_inv_diag: wp.array[wp.float32],
 ) -> None:
+    # The two per-node passes a solve level needs, in one launch: the right-hand side and the
+    # Jacobi preconditioner's inverse diagonal. They are independent -- neither reads the other --
+    # and both already read ``weights`` at this node, so fusing removes a launch over the whole
+    # ``res**3`` grid and shares the node index. A level is solved once per octree depth, so this
+    # launch pair ran several times per call.
     i, j, k = wp.tid()
-    idx = poisson_grid_index(i, j, k, res)
+    # Central differences in index space; one-sided at the grid boundary (denominator 1 there).
+    # That denominator is 0, not 1, at res == 1 (every axis's clamp collapses to ip == im), but
+    # reconstruction.screened_poisson validates 3 <= full_depth <= depth <= 10, so the smallest
+    # reachable grid is res = 2**3 + 1 = 9 and no caller in the tree reaches res == 1. Not guarded
+    # here per CLAUDE.md section 4.2 ("no speculative generality") -- add a guard only if a future
+    # caller can legitimately reach res == 1.
+    ip = wp.min(i + 1, res - 1)
+    im = wp.max(i - 1, 0)
+    jp = wp.min(j + 1, res - 1)
+    jm = wp.max(j - 1, 0)
+    kp = wp.min(k + 1, res - 1)
+    km = wp.max(k - 1, 0)
+    # Normalized in place here rather than by a separate `normalize_vector_field` pass over the
+    # whole grid: that pass measured 5.93% of screened_poisson's device time at the default depth=8
+    # (RTX 5090), almost all of it the extra launch plus a full res**3-element write-back of
+    # vx/vy/vz that this function immediately reads back at six neighbour offsets anyway. Fusing
+    # removes one launch and that write-back, at the cost of reading `weights` at the same six
+    # offsets instead of once per node -- a real trade given six values are already read here per
+    # component. `normalized_field_component` reproduces the deleted pass's exact
+    # `field[idx] * (1.0 / max(weight, eps))` operation (a multiply by the reciprocal, not a divide)
+    # so the result is bit-identical to computing it as a separate pass first.
+    dx = (
+        normalized_field_component(vx, weights, poisson_grid_index(ip, j, k, res))
+        - normalized_field_component(vx, weights, poisson_grid_index(im, j, k, res))
+    ) / wp.float32(ip - im)
+    dy = (
+        normalized_field_component(vy, weights, poisson_grid_index(i, jp, k, res))
+        - normalized_field_component(vy, weights, poisson_grid_index(i, jm, k, res))
+    ) / wp.float32(jp - jm)
+    dz = (
+        normalized_field_component(vz, weights, poisson_grid_index(i, j, kp, res))
+        - normalized_field_component(vz, weights, poisson_grid_index(i, j, km, res))
+    ) / wp.float32(kp - km)
+    centre = poisson_grid_index(i, j, k, res)
+    out_b[centre] = -(dx + dy + dz)
+
     deg = poisson_neighbor_degree(i, j, k, res)
-    d = deg + screen * weights[idx]
+    d = deg + screen * weights[centre]
     if d <= 0.0:
         d = 1.0
-    out_inv_diag[idx] = 1.0 / d
+    out_inv_diag[centre] = 1.0 / d
 
 
 @wp.func

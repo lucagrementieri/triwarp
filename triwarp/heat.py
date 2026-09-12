@@ -224,7 +224,7 @@ def heat_operators(
     # operator natively in a single build, avoiding a recast rebuild (see cotmatrix's kernel note).
     laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
 
-    # The divergence kernel this bundle feeds (``kernels/heat.py::integrated_divergence``) is
+    # The divergence kernel this bundle feeds (``kernels/heat.py::unit_gradient_divergence``) is
     # hardcoded ``wp.array2d[wp.float32]`` -- ``cotmatrix`` above accepts either precision because
     # it casts internally, but this tuple's own ``cot_entries`` field is documented and used
     # downstream as float32 only, so a caller-supplied float64 table must be narrowed before it is
@@ -357,22 +357,14 @@ def heat_geodesic(
     heat = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     twl.solve_spd(heat_system, u0, heat, tol=_CG_TOLERANCE, preconditioner=heat_preconditioner)
 
-    # Unit vector field X = -grad(u)/|grad(u)|.
-    field = wp.empty(n_faces, dtype=wp.vec3d, device=device)
-    wp.launch(
-        kernel_heat.face_unit_gradients,
-        dim=n_faces,
-        inputs=[vertices, faces, normals, areas, heat, wp.float64(-1.0), field],
-        device=device,
-    )
-
-    # Integrated divergence b = div(X), then Poisson solve L phi = b, i.e. (-L) phi = -b with the
-    # positive semi-definite operator.
+    # Integrated divergence b = div(X) of the unit field X = -grad(u)/|grad(u)|, then a Poisson
+    # solve L phi = b, i.e. (-L) phi = -b with the positive semi-definite operator. One launch: the
+    # field is formed and integrated per face, so it never occupies an (n_faces,) buffer.
     divergence = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
-        kernel_heat.integrated_divergence,
+        kernel_heat.unit_gradient_divergence,
         dim=n_faces,
-        inputs=[vertices, faces, cot_entries, field, divergence],
+        inputs=[vertices, faces, normals, areas, heat, wp.float64(-1.0), cot_entries, divergence],
         device=device,
     )
     # Flip sign so the Poisson right-hand side matches the positive semi-definite operator ``-L``.
@@ -535,18 +527,20 @@ def heat_signed_distance(
     # Stage 3: integrate the unit field back into a scalar with a Poisson solve. The cotangent
     # weights and face normals come from the same bundle, so the Poisson stage and the diffusion
     # cannot drift apart.
-    face_field = wp.empty(n_faces, dtype=wp.vec3d, device=device)
-    wp.launch(
-        kernel_heat.vertex_field_to_face_field,
-        dim=n_faces,
-        inputs=[faces, face_normals, unit_field, basis_x, basis_y, face_field],
-        device=device,
-    )
     divergence = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
-        kernel_heat.integrated_divergence,
+        kernel_heat.vertex_field_divergence,
         dim=n_faces,
-        inputs=[vertices, faces, cot_entries, face_field, divergence],
+        inputs=[
+            vertices,
+            faces,
+            face_normals,
+            unit_field,
+            basis_x,
+            basis_y,
+            cot_entries,
+            divergence,
+        ],
         device=device,
     )
 
@@ -1108,22 +1102,15 @@ def log_map(
     distance = heat_geodesic(vertices, faces, sources, operators=scalar)
     normals, areas = scalar[6], scalar[7]
     n_faces = int(faces.shape[0]) // 3
-    face_gradient = wp.empty(n_faces, dtype=wp.vec3d, device=device)
-    wp.launch(
-        kernel_heat.face_unit_gradients,
-        dim=n_faces,
-        inputs=[vertices, faces, normals, areas, distance, wp.float64(1.0), face_gradient],
-        device=device,
-    )
     vertex_gradient = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_heat.scatter_face_field_to_vertices,
+        kernel_heat.scatter_unit_gradient_to_vertices,
         dim=n_faces,
-        inputs=[faces, areas, face_gradient, vertex_gradient],
+        inputs=[vertices, faces, normals, areas, distance, wp.float64(1.0), vertex_gradient],
         device=device,
     )
     # ``vertex_gradient`` is an area-weighted *sum* of unit vectors (see
-    # ``scatter_face_field_to_vertices``), so its magnitude carries the mesh's coordinate scale
+    # ``scatter_unit_gradient_to_vertices``), so its magnitude carries the mesh's coordinate scale
     # squared and the floor below it has to be relative to its own maximum -- the same reasoning as
     # ``reference_tolerance`` above, applied to a differently-scaled field.
     gradient_lengths = wp.empty(n_vertices, dtype=wp.float32, device=device)

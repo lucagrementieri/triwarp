@@ -64,7 +64,6 @@ from triwarp import laplacian
 from triwarp._device import require_same_device
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import smoothing as kernel_smoothing
@@ -185,15 +184,10 @@ def filter_laplacian(
             if volume_constraint:
                 _apply_volume_constraint(positions, faces, vol_ini, center_ini)
     else:
-        lv = wp.empty(n, dtype=wp.vec3d, device=device)
         nxt = wp.empty(n, dtype=wp.vec3d, device=device)
         coeff = wp.float64(lamb)
-        step = wp.map(
-            kernel_smoothing.laplacian_step, positions, lv, coeff, out=nxt, return_kernel=True
-        )
         for _ in range(iterations):
-            _apply_operator(operator, positions, lv)
-            wp.launch(step, dim=n, inputs=[positions, lv, coeff], outputs=[nxt], device=device)
+            _diffuse_pass(operator, positions, coeff, nxt)
             positions, nxt = nxt, positions
             if volume_constraint:
                 _apply_volume_constraint(positions, faces, vol_ini, center_ini)
@@ -437,30 +431,29 @@ def filter_humphrey(
 
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     b = wp.empty(n, dtype=wp.vec3d, device=device)
-    lb = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
     alpha64 = wp.float64(alpha)
     beta64 = wp.float64(beta)
-    residual = wp.map(
-        kernel_smoothing.humphrey_residual,
-        lv,
-        original,
-        positions,
-        alpha64,
-        out=b,
-        return_kernel=True,
-    )
-    update = wp.map(
-        kernel_smoothing.humphrey_update, lv, b, lb, beta64, out=nxt, return_kernel=True
-    )
+    rows = (operator.offsets, operator.columns, operator.values)
     for _ in range(iterations):
-        # ``positions`` doubles as the previous-iterate ``q`` (it is only read this pass).
-        _apply_operator(operator, positions, lv)
+        # Two passes rather than four: each applies the operator in the thread that consumes its
+        # row. ``lv`` still crosses between them -- the update needs ``L.v`` *and* ``L.b`` -- but
+        # ``L.b`` never leaves a register. ``positions`` doubles as the previous-iterate ``q`` (it
+        # is only read this pass).
         wp.launch(
-            residual, dim=n, inputs=[lv, original, positions, alpha64], outputs=[b], device=device
+            kernel_smoothing.humphrey_residual_pass,
+            dim=n,
+            inputs=[*rows, positions, original, alpha64],
+            outputs=[lv, b],
+            device=device,
         )
-        _apply_operator(operator, b, lb)
-        wp.launch(update, dim=n, inputs=[lv, b, lb, beta64], outputs=[nxt], device=device)
+        wp.launch(
+            kernel_smoothing.humphrey_update_pass,
+            dim=n,
+            inputs=[*rows, lv, b, beta64],
+            outputs=[nxt],
+            device=device,
+        )
         positions, nxt = nxt, positions
 
     return _as_vec3(positions)
@@ -1042,16 +1035,7 @@ def filter_taubin(
     # identical answer.
     recompute_edges = tw.edges.edges_unique(faces, n_vertices=n)[0] if recompute else None
     positions = _as_vec3d(vertices)
-    lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
-    step = wp.map(
-        kernel_smoothing.laplacian_step,
-        positions,
-        lv,
-        wp.float64(lamb),
-        out=nxt,
-        return_kernel=True,
-    )
     for index in range(iterations):
         pass_operator = (
             laplacian.laplacian(
@@ -1067,11 +1051,8 @@ def filter_taubin(
             if operator is None
             else operator
         )
-        _apply_operator(pass_operator, positions, lv)
         coeff = lamb if index % 2 == 0 else -nu
-        wp.launch(
-            step, dim=n, inputs=[positions, lv, wp.float64(coeff)], outputs=[nxt], device=device
-        )
+        _diffuse_pass(pass_operator, positions, wp.float64(coeff), nxt)
         positions, nxt = nxt, positions
 
     return _as_vec3(positions)
@@ -1132,23 +1113,17 @@ def filter_neighborhood_average(
     # neighbors, matching Open3D's ``adjacency_list``; the directed default is asymmetric there.
     operator = _resolved_operator(vertices, faces, laplacian_operator, symmetric=True)
     positions = _as_vec3d(vertices)
-    lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
-    # CSR row bounds as aligned per-vertex inputs: degree(i) = offsets[i + 1] - offsets[i].
-    starts = operator.offsets[:-1]
-    ends = operator.offsets[1:]
-    step = wp.map(
-        kernel_smoothing.neighborhood_average,
-        positions,
-        lv,
-        starts,
-        ends,
-        out=nxt,
-        return_kernel=True,
-    )
     for _ in range(iterations):
-        _apply_operator(operator, positions, lv)
-        wp.launch(step, dim=n, inputs=[positions, lv, starts, ends], outputs=[nxt], device=device)
+        # The kernel reads its own degree off the CSR row it is already walking:
+        # degree(i) = offsets[i + 1] - offsets[i].
+        wp.launch(
+            kernel_smoothing.neighborhood_average_pass,
+            dim=n,
+            inputs=[operator.offsets, operator.columns, operator.values, positions],
+            outputs=[nxt],
+            device=device,
+        )
         positions, nxt = nxt, positions
 
     return _as_vec3(positions)
@@ -1247,15 +1222,15 @@ def filter_mut_dif_laplacian(
     slope = 0.0
     inv_n = wp.float64(1.0 / n)
     n_blocks = kernel_reduce.blocks_1d(n)
-    adil_kernel = wp.map(
-        kernel_smoothing.mut_dif_adil, normals, positions, lv, out=adil, return_kernel=True
-    )
     for index in range(iterations):
         # The mean diffusion coefficient is reduced on device and consumed by the step kernel
         # directly, so the loop body issues no host synchronisation.
-        _apply_operator(operator, positions, lv)
         wp.launch(
-            adil_kernel, dim=n, inputs=[normals, positions, lv], outputs=[adil], device=device
+            kernel_smoothing.mut_dif_adil_pass,
+            dim=n,
+            inputs=[operator.offsets, operator.columns, operator.values, positions, normals],
+            outputs=[lv, adil],
+            device=device,
         )
         adil_sum.zero_()
         wp.launch_tiled(
@@ -1296,14 +1271,22 @@ def filter_mut_dif_laplacian(
     return _as_vec3(positions)
 
 
-def _apply_operator(
-    operator: wps.BsrMatrix[wp.float32], v_in: wp.array[wp.vec3d], out_lv: wp.array[wp.vec3d]
+def _diffuse_pass(
+    operator: wps.BsrMatrix[wp.float32],
+    positions: wp.array[wp.vec3d],
+    coeff: wp.float64,
+    out_next: wp.array[wp.vec3d],
 ) -> None:
+    # One explicit diffusion pass: the averaging operator applied and the step taken in the same
+    # thread, so no intermediate ``L.v`` buffer is written or read back. Shared by the explicit
+    # branch of `filter_laplacian` and by `filter_taubin`, whose only difference is that its
+    # ``coeff`` alternates sign.
     wp.launch(
-        kernel_laplacian.apply_operator,
-        dim=int(v_in.shape[0]),
-        inputs=[operator.offsets, operator.columns, operator.values, v_in, out_lv],
-        device=v_in.device,
+        kernel_smoothing.diffuse_vec3_pass,
+        dim=int(positions.shape[0]),
+        inputs=[operator.offsets, operator.columns, operator.values, positions, coeff],
+        outputs=[out_next],
+        device=positions.device,
     )
 
 
@@ -2276,20 +2259,16 @@ def filter_scalar_laplacian(
         return out
 
     operator = _resolved_operator(vertices, faces, laplacian_operator, symmetric=True)
-    average = wp.empty(n, dtype=wp.float32, device=device)
     nxt = wp.empty(n, dtype=wp.float32, device=device)
     coeff = wp.float32(lamb)
-    step = wp.map(
-        kernel_smoothing.scalar_laplacian_step, out, average, coeff, out=nxt, return_kernel=True
-    )
     for _ in range(iterations):
         wp.launch(
-            kernel_smoothing.apply_operator_scalar,
+            kernel_smoothing.diffuse_scalar_pass,
             dim=n,
-            inputs=[operator.offsets, operator.columns, operator.values, out, average],
+            inputs=[operator.offsets, operator.columns, operator.values, out, coeff],
+            outputs=[nxt],
             device=device,
         )
-        wp.launch(step, dim=n, inputs=[out, average, coeff], outputs=[nxt], device=device)
         out, nxt = nxt, out
     return out
 
@@ -2387,14 +2366,18 @@ def filter_normals(
     threshold_cos = wp.float32(math.cos(math.radians(threshold)))
 
     accumulated = wp.empty(n_faces, dtype=wp.vec3, device=device)
-    # Both maps are hoisted out of the pass loop: a cached ``wp.map`` call re-resolves its kernel in
+    # The map is hoisted out of the pass loop: a cached ``wp.map`` call re-resolves its kernel in
     # Python every time, which adds up over many passes.
     seed = wp.map(
         kernel_smoothing.seed_weighted_normal, normals, areas, out=accumulated, return_kernel=True
     )
     renormalize = wp.map(wp.normalize, accumulated, out=normals, return_kernel=True)
-    for _ in range(iterations):
-        wp.launch(seed, dim=n_faces, inputs=[normals, areas], outputs=[accumulated], device=device)
+    # Two launches per pass rather than three. A pass is seed -> crease-gated neighbour
+    # accumulation -> normalize, and the scatter in the middle needs the whole seeded buffer, so the
+    # fusable pair is the normalization with the *next* pass's seed. Peeling the first seed off the
+    # front is what puts them next to each other.
+    wp.launch(seed, dim=n_faces, inputs=[normals, areas], outputs=[accumulated], device=device)
+    for index in range(iterations):
         if m > 0:
             wp.launch(
                 kernel_smoothing.accumulate_smoothed_normals,
@@ -2402,7 +2385,18 @@ def filter_normals(
                 inputs=[normals, areas, face_adjacency, threshold_cos, accumulated],
                 device=device,
             )
-        wp.launch(renormalize, dim=n_faces, inputs=[accumulated], outputs=[normals], device=device)
+        if index == iterations - 1:
+            wp.launch(
+                renormalize, dim=n_faces, inputs=[accumulated], outputs=[normals], device=device
+            )
+        else:
+            wp.launch(
+                kernel_smoothing.renormalize_and_reseed,
+                dim=n_faces,
+                inputs=[areas, accumulated],
+                outputs=[normals],
+                device=device,
+            )
     return normals
 
 

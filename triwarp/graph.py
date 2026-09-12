@@ -79,15 +79,22 @@ def edges_to_csr(
     n_entries = 2 * m
     rows = wp.empty(n_entries, dtype=wp.int32, device=device)
     cols = wp.empty(n_entries, dtype=wp.int32, device=device)
-    if m > 0:
-        wp.launch(kernel_graph.edges_to_adjacency, dim=m, inputs=[edges, rows, cols], device=device)
+    # One launch either way: the weighted form emits the structure and the two duplicated values
+    # together, and the unweighted form's values are a fill rather than a launch at all.
     if weights is None:
         data = wp.ones(n_entries, dtype=wp.float32, device=device)
+        if m > 0:
+            wp.launch(
+                kernel_graph.edges_to_adjacency, dim=m, inputs=[edges, rows, cols], device=device
+            )
     else:
         data = wp.empty(n_entries, dtype=wp.float32, device=device)
         if m > 0:
             wp.launch(
-                kernel_graph.duplicate_edge_weights, dim=m, inputs=[weights, data], device=device
+                kernel_graph.edges_to_adjacency_weighted,
+                dim=m,
+                inputs=[edges, weights, rows, cols, data],
+                device=device,
             )
     return wps.bsr_from_triplets(
         node_count, node_count, rows, cols, data, prune_numerical_zeros=False

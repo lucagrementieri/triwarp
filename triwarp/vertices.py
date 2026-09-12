@@ -310,24 +310,25 @@ def vertex_normals(
         if n_faces == 0:
             return wp.zeros(n_vertices, dtype=wp.vec3, device=device)
         # A supplied ``face_normals`` is unit length; a derived one is the raw cross product, and
-        # the weight kernel needs to know which, because the sine it divides out is already in the
-        # cross product's magnitude.
-        unit_face_normals = face_normals is not None
+        # the weight depends on which, because the sine it divides out is already in the cross
+        # product's magnitude. Deriving them takes one launch that produces both answers from a
+        # single cross product; a supplied set takes the weight pass alone.
+        corner_weights = twt.empty_2d((n_faces, 3), wp.float32, device=device)
         if face_normals is None:
             face_normals = wp.empty(n_faces, dtype=wp.vec3, device=device)
             wp.launch(
-                kernel_vertices.face_crosses,
+                kernel_vertices.face_crosses_and_weights,
                 dim=n_faces,
-                inputs=[vertices, faces, face_normals],
+                inputs=[vertices, faces, face_normals, corner_weights],
                 device=device,
             )
-        corner_weights = twt.empty_2d((n_faces, 3), wp.float32, device=device)
-        wp.launch(
-            kernel_vertices.max_vertex_normal_weights,
-            dim=n_faces,
-            inputs=[vertices, faces, unit_face_normals, corner_weights],
-            device=device,
-        )
+        else:
+            wp.launch(
+                kernel_vertices.max_vertex_normal_weights,
+                dim=n_faces,
+                inputs=[vertices, faces, corner_weights],
+                device=device,
+            )
         return weighted_vertex_normals(n_vertices, faces, face_normals, corner_weights)
 
     if weighting == "angle":

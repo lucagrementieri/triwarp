@@ -3,14 +3,19 @@ import warp as wp
 from triwarp.kernels import array as kernel_array
 
 
-@wp.kernel
-def edges_to_adjacency(
-    edges: wp.array2d[wp.int32], out_rows: wp.array[wp.int32], out_cols: wp.array[wp.int32]
+@wp.func
+def write_adjacency_pair(
+    edges: wp.array2d[wp.int32],
+    e: wp.int32,
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
 ) -> None:
-    tid = wp.int32(wp.tid())
-    a = edges[tid, 0]
-    b = edges[tid, 1]
-    base = tid * 2
+    # One undirected edge becomes two directed triplet slots: ``2e`` is ``(a, b)`` and ``2e + 1``
+    # is ``(b, a)``. Both kernels below emit in exactly this layout, which is what lets the
+    # weighted one duplicate the weight into the matching slots.
+    a = edges[e, 0]
+    b = edges[e, 1]
+    base = e * 2
     out_rows[base] = a
     out_cols[base] = b
     out_rows[base + 1] = b
@@ -18,10 +23,24 @@ def edges_to_adjacency(
 
 
 @wp.kernel
-def duplicate_edge_weights(weights: wp.array[wp.float32], out_values: wp.array[wp.float32]) -> None:
-    # One weight per undirected edge becomes the two directed entries ``edges_to_adjacency`` emits,
-    # in its layout: entry ``2e`` is ``(a, b)`` and ``2e + 1`` is ``(b, a)``.
+def edges_to_adjacency(
+    edges: wp.array2d[wp.int32], out_rows: wp.array[wp.int32], out_cols: wp.array[wp.int32]
+) -> None:
+    # The unweighted path, whose values are a ``wp.ones`` fill rather than a launch.
+    write_adjacency_pair(edges, wp.int32(wp.tid()), out_rows, out_cols)
+
+
+@wp.kernel
+def edges_to_adjacency_weighted(
+    edges: wp.array2d[wp.int32],
+    weights: wp.array[wp.float32],
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_values: wp.array[wp.float32],
+) -> None:
+    # The weighted path: the structure and the two duplicated values in one launch.
     e = wp.int32(wp.tid())
+    write_adjacency_pair(edges, e, out_rows, out_cols)
     out_values[e * 2] = weights[e]
     out_values[e * 2 + 1] = weights[e]
 

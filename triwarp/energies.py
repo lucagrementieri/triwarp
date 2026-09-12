@@ -479,16 +479,12 @@ def hessian_energy(
 
     gradients = wp.empty(3 * n_faces, dtype=wp.vec3d, device=device)
     areas = wp.empty(n_faces, dtype=wp.float64, device=device)
-    wp.launch(
-        kernel_energies.hessian_corner_gradients,
-        dim=n_faces,
-        inputs=[vertices, faces, gradients, areas],
-        device=device,
-    )
-
     mass = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
-        kernel_energies.voronoi_mass, dim=n_faces, inputs=[vertices, faces, mass], device=device
+        kernel_energies.hessian_face_terms,
+        dim=n_faces,
+        inputs=[vertices, faces, gradients, areas, mass],
+        device=device,
     )
     inverse_mass = _interior_inverse(vertices, faces, mass)
 

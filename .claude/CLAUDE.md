@@ -57,7 +57,8 @@ Two conventions that hold throughout:
     upgrade discipline
 13. [The cost model (RTX 5090)](#13-the-cost-model-rtx-5090) — host per-call, device/memory, tuning
     constants
-14. [Kernel-shape verdicts](#14-kernel-shape-verdicts) — what wins, what is refuted
+14. [Kernel-shape verdicts](#14-kernel-shape-verdicts) — what wins, what is refuted, and when a
+    producer-consumer fusion pays
 15. [Benchmark and measurement traps](#15-benchmark-and-measurement-traps)
 16. [triwarp component status](#16-triwarp-component-status) — the launch-resolution pass,
     shipped results, open defects, refuted plans
@@ -413,6 +414,18 @@ tolerance.
 
 Watch the signature while fusing: a fused kernel inherits the union of two argument lists, and a
 launch argument costs ~1.0 µs of host time (§2.8, §13.1).
+
+**And price the fused region itself, never the call that contains it — §14.10 is the verdict
+table.** Every such pair measured in this tree is faster fused (1.04-3.46x); what the iteration
+count changes is only whether a benchmark can resolve the win. Attributing through the enclosing
+call declined a real `heat` win on noise once already.
+
+**The converse of rule 1: a helper with one caller is a name, not an abstraction — inline it, then
+look again.** Extracting the shared run is right when the run is *shared*; when a fusion absorbs its
+own producer, the "helper" it leaves behind has a single call site and its only effect is to hide
+the redundancy between the two halves. Inlining three such kernels exposed a doubled vertex load, a
+doubled grid index and a `dbl_area` computed twice by two spellings of the same expression —
+together worth more than the launch the fusion removed (§14.10).
 
 ### 2.5 A generic kernel registers its overloads at import (`wp.overload`)
 
@@ -4051,6 +4064,191 @@ not insensitivity** (§16.4).
   Krylov subspaces into one iteration rather than trying to run two independent ones concurrently —
   `heat.extend_scalar` and `heat.transport_tangent_vectors` both currently call `_solve_scalar` twice
   rather than going through it, which is an open lead unrelated to streams.
+
+### 14.10 Producer-consumer fusion: always fuse; the iteration count only decides whether a benchmark can see it
+
+**Two consecutive launches at the same `dim` where the second reads the first's output only at its
+own thread index are fusible, and the fused kernel is faster — every pair measured in this tree, at
+every size, 1.04-2.65x — because it removes a launch, an allocation and a full round trip of the
+intermediate buffer through global memory.** What varies is not whether the fusion wins but whether
+any *benchmark* can resolve the win, and that is set by the region's share of the call it sits in.
+
+A tree-wide scan found **93** runs of consecutive same-`dim` launches across `triwarp/`, of which
+**89** adjacent pairs passed the index-locality test. The scan is ~120 lines of `ast` (walk each
+wrapper's launches in line order, map each launch's argument expressions onto its kernel's parameter
+names, and ask whether every array the first kernel *writes* is read by the second only at a name
+bound from `wp.tid()`); re-derive it rather than re-reading 93 call sites.
+
+**Measure the region, not the call that contains it** — §15.2's rule, and the one this pass got
+wrong first time round. Time the two launches against the one, with nothing else in the window; a
+whole-call A/B cannot resolve a region worth 0.1 % of a CG-dominated solve, and its noise then reads
+as a verdict. Both worked examples are below, and they landed on opposite sides of the noise floor
+for exactly this reason.
+
+**SHIPPED — the explicit smoothing filters**, where the pair is inside a pass loop so the saving is
+multiplied by the iteration count and the benchmark sees it directly. Every filter alternated
+`kernels/laplacian.apply_operator` (one row of the row-stochastic averaging operator into an
+`(n_vertices,)` `wp.vec3d` buffer) with a per-index step kernel reading that buffer at its own
+vertex. The row apply is now a `@wp.func` (`kernels/laplacian.operator_row`, and
+`operator_row_scalar` for the float32 field — two functions, because the vec3d one promotes the
+float32 weight to float64 and the scalar one does not), and each filter launches one kernel per
+pass. Measured on an RTX 5090, Warp 1.17, 10 passes, operator precomputed, **output bit-identical on
+all nine paths**:
+
+| group | min-ratio |
+|---|---|
+| `filter_scalar_laplacian` | **1.23-2.08x** |
+| `filter_taubin` | **1.17-2.04x** |
+| `filter_humphrey` — four launches per pass to **two** | **1.14-1.79x** |
+| `filter_laplacian_integration` (explicit) | **1.48-1.77x** |
+| `filter_sharpen` | **1.16-1.53x** (delegates to `filter_laplacian`) |
+| `filter_normals` | **1.36-1.40x** |
+| `filter_mut_dif_laplacian` | 1.04-1.33x |
+| `filter_two_step` / `filter_spikes` / `inflate` | 1.01-1.23x (delegates) |
+
+Two details worth carrying forward. `filter_humphrey` applies the operator *twice* per pass and the
+update needs both `L.v` and `L.b`, so only `L.b` disappears — **a fusion can remove one of two
+intermediate buffers and still be worth 1.79x**. And `filter_normals`' fusable pair is not inside an
+iteration at all: its pass is seed → crease-gated neighbour *scatter* → normalize, and the scatter
+needs the whole seeded buffer, so the pair is the normalization with the **next** pass's seed, which
+only becomes adjacent once the first seed is peeled off the front of the loop. **When the middle
+stage of a three-stage pass blocks the obvious fusion, look across the loop boundary.**
+
+**SHIPPED — `heat`, and this one was declined once on a bad measurement before being re-measured and
+landed.** `face_unit_gradients` / `vertex_field_to_face_field` fed `integrated_divergence` /
+`scatter_face_field_to_vertices` at `dim=n_faces`, index-locally, at three sites (`heat_geodesic`,
+`heat_signed_distance`, `log_map`); all three are now one kernel, sharing
+`kernels/heat.accumulate_face_divergence` and `face_field_from_vertex_field`. Priced directly, on
+icospheres from 1 280 to 327 680 faces:
+
+| fused pair | ratio across the size sweep |
+|---|---|
+| `unit_gradient_divergence` | **1.04-2.47x** |
+| `vertex_field_divergence` | **1.38-2.50x** |
+| `scatter_unit_gradient_to_vertices` | **1.49-2.65x** |
+
+**Never slower, at any size.** The ratio falls toward the large end because the region becomes
+bandwidth-bound and the saved launch is a smaller share of it — *not* because the fusion stops
+paying.
+
+**What the first, wrong reading looked like, because the shape recurs.** Attributing through the
+whole call gave 1.021x at 10 242 vertices and 1.006x at 40 962 — read as "a share that falls as the
+input grows", which §9 calls a decline — and a 25-row harness sweep gave 0.987-1.041x, whose sub-1.0
+cells read as possible regressions. Both were artifacts: every caller is dominated by two CG solves,
+so the fused region is **0.14 %** of `log_map[saddle]`, and 0.1 % of a 28 ms call is far under the
+harness's ~1-3 % noise. Re-measured interleaved, the worst cell (`log_map[saddle]`, twice reported
+below 1.0) is a **tie at 0.998-1.000** and the other (`heat_signed_distance[band]`, reported 0.996)
+is **1.004**; the second harness sweep after the rewrite read 22 of 25 cells at or above 1.0, to
+1.12x. **A cell whose region is a fraction of a percent of the call cannot report that region's
+speed — do not let it vote.**
+
+Two deterministic cross-checks that settled it far faster than any clock, and that §15.6 recommends
+for exactly this: the **kernel count** is `base - 1` per fused site (so no solver iteration count
+moved, which was the live worry, since the fusion shifts the answer by 1-3 ulps and a changed
+iteration count would have been a real mechanism for a slowdown); and the **allocation count** is
+strictly lower by one `(n_faces,)` `wp.vec3d` buffer per site. With the same kernels, the same
+iterations and one fewer allocation, there is no mechanism by which the rest of the call can get
+slower — which is what makes the sub-1.0 cells provably noise rather than arguably noise.
+
+**SHIPPED — the straight-line one-shot pairs, eight of them, and the surprise is how large they
+are.** These were first declined as "marginal"; priced directly (interleaved, min-of-mins over five
+process pairs) every one is a substantial win, because a pair that runs once still replaces two
+launches with one and usually shares loads as well:
+
+| fused region | ratio (small / large input) |
+|---|---|
+| `creation` two `offset_cap_faces` launches → one 2-D launch | **3.46x / 3.36x** |
+| `vertices` `face_crosses` + `max_vertex_normal_weights` | **1.94x / 1.96x** |
+| `creation` `sweep_plane_normals` + `sweep_transforms` | **1.89x** |
+| `holes` `loop_centroids` + `cone_faces` | **1.80x** |
+| `holes` `project_loop_to_plane` + `bridge_loop_to_ring` | **1.58x** |
+| `graph` `edges_to_csr`'s weighted structure + values | **1.61x / 1.57x** |
+| `reconstruction` `negative_divergence` + `screened_inverse_diagonal` | **1.62x** |
+| `energies` `hessian_corner_gradients` + `voronoi_mass` | **1.29x / 1.13x** |
+
+**Do not read these off the harness — its noise floor swamps them.** The same benchmark run reported
+`cone[512]` at **0.873x** on a code path the change never touched (`cone` goes through `revolve`),
+so ±13 % is the resolution for these sub-millisecond groups. Price the region (§15.2).
+
+**Two launches of the *same* kernel merge into one wider launch, and that is the biggest win in the
+table.** `offset_cap_faces` ran twice per extruded or swept solid — near cap reversed at offset 0,
+far cap at offset N — into adjacent blocks of one buffer. One `dim=(2, n_cap)` launch with the row
+index selecting the offset and the winding is 3.4x. **Grep for a kernel launched twice in a row with
+different scalar arguments; it is the cheapest fusion there is.**
+
+**Still declined:** `energies.laplacian_smoothing_loss`' `cot_row_scales` (the two launches are in
+*different branches*, not sequential). **And a pair inside a graph-captured loop really is not a
+candidate** — a replayed launch is ~1.17 µs (§14.3), so `polyline.polyline_triangulate`'s
+ear-clipping round saves nothing by losing one of its four.
+
+### A fused kernel is not finished until the duplication *inside* it is gone
+
+**Inline any `@wp.func` the fusion leaves with a single caller, then look for what the inlining
+exposes.** A helper that is not reused is a name, not an abstraction; and while it stays a helper
+the redundancy between the two halves is invisible. This pass inlined **15** — nine created by the
+fusions and six pre-existing step rules (`laplacian_step`, `neighborhood_average`,
+`humphrey_residual`, `humphrey_update`, `mut_dif_adil`, `scalar_laplacian_step`) that stopped being
+`wp.map` targets when their kernels absorbed them. Four survived on real reuse: `operator_row` (5
+call sites), `heat.accumulate_face_divergence` (2), `vertices.write_max_corner_weights` (2),
+`graph.write_adjacency_pair` (2).
+
+**What the inlining then exposed, in three of eight kernels — and it is worth more than the launch:**
+
+- `energies.hessian_face_terms` loaded the face's three vertices **twice** and computed `dbl_area`
+  **twice** by two different spellings. They are the same expression: `triangle_double_area(a, b, c)`
+  *is* `wp.length(wp.cross(b - a, c - a))`, which the gradient half had already formed. Reusing it
+  took the region from **1.15x to 1.29x** at 20 480 faces and from **1.00x — a tie — to 1.13x** at
+  327 680. That fusion would have shipped as "no measurable gain".
+- `reconstruction.poisson_level_setup` computed the centre node's `poisson_grid_index` twice.
+- `holes.extend_rim_to_ring` loaded `loop_vertices[t]` twice.
+
+**The fix is a local, not a new `@wp.func`** — the redundancy is *within* one kernel, so a helper
+would only be a named way to recompute it. Reach for a shared helper when two *kernels* repeat a
+run; an α-renamed statement-run scan over all nine touched modules found none from this work (its
+only hits are the pre-existing `fill_dp_span` / `fill_dp_span_tiled` tiled/serial pair).
+
+**One near-duplicate is deliberate, and removing it was built, measured and reverted.**
+`smoothing.diffuse_scalar_pass` spells out the CSR row walk rather than calling `operator_row`,
+because that one promotes the float32 weight to float64 for a `wp.vec3d` accumulator where a scalar
+field is float32 end to end. Both ways of merging them were tried:
+
+- **Keep float32 storage, accumulate in float64** — the cheap version, no extra bytes. **Does not
+  compile**: `wp.float64(w) * f32_value` is a hard parse error, `Input types must be the same, got
+  ['float64', 'float32']`. This is §12.4's "scalar arguments must be constructed at the input's
+  precision", and it is what makes the two irreducible rather than merely inconvenient.
+- **Carry the field in float64**, which does let one `Any`-generic `operator_row` serve both (seed
+  the accumulator with the first term instead of a typed zero — there is no way to spell "zero of
+  `Any`'s type" in kernel scope, and `0 + a == a` exactly, so it stays bit-identical). Built, and
+  **0.86x on `lucy`** (14 M vertices, 5.15 → 5.96 ms) and **0.63x at 655 k**: the field is one of
+  four streams the CSR walk reads, so doubling its width costs bandwidth no launch saving repays,
+  before counting the two conversion passes a float64 iterate adds per call.
+
+So the duplication stays and the numbers live at the site. **The general point: two kernels that
+differ only in a dtype are not always mergeable, and when the merge costs memory traffic the right
+answer is to duplicate the loop and write down why.** The `Any`-generic form was also reverted on
+§4.2 — with the scalar path gone it had exactly one instantiation.
+
+**Three traps in the scan itself, because a re-run will hit all three.** Index-locality from an AST
+walk is *necessary and not sufficient*: it does not follow `@wp.func` calls, so a kernel reaching a
+neighbour's entry through a helper reads as local (`graph.connected_component_labels`' `ecl_hook`,
+`voxels.fill_cavities`' `flood_hook`); it does not see **intervening host work**, so a pair with a
+`counts_to_offsets` scan between the two launches is reported adjacent and is not fusible
+(`intersection.split_mesh_with_plane`, `voxels.to_boxes`); and a *claim/commit* independent-set pair
+is never fusible however local it looks, because commit must see every claim
+(`remesh._flip_interior_edges`, `intrinsic_delaunay`). Verify each candidate by reading both kernel
+bodies and the wrapper lines between the launches.
+
+**And check what the fusion killed.** Removing the last launcher of a kernel leaves dead code that
+still costs import time (§12.6) — this pass stranded and deleted `kernels/laplacian.apply_operator`,
+`kernels/smoothing.apply_operator_scalar`, `smoothing._apply_operator`, and all four of
+`kernels/heat`'s unfused halves — and it stales the `wp.map` bookkeeping, since a fused step kernel
+is one fewer `wp.map` site (six generated `map_*` modules stopped being built, and check 23's
+allowlist comment for `smoothing` named an op that is no longer mapped at all). **Move the deleted
+kernel's prose onto what survives**: four `kernels/heat` comments carried the `sign` convention, a
+normalization precondition and a deliberate non-merge decision, all of which had to be relocated
+rather than lost, and five references to the deleted names in `triwarp/heat.py` and
+`tests/test_heat.py` had to be repointed.
+
 ---
 
 ## 15. Benchmark and measurement traps
@@ -4110,6 +4308,17 @@ one pass had nearly the same share at the small end and opposite verdicts, which
 revealed: one readback's share of its call *grows* with mesh size, so the fix is worth more the more
 it matters and it landed; a different readback's share *falls* with mesh size, which §9 calls a
 decline, and it was declined. A single operating point would have read the two as the same item.
+
+**The rule fails in *both* directions, and the pessimistic direction is the one that quietly throws
+away real wins.** The failure above is a subtraction that flatters a candidate; the mirror is
+measuring a candidate *through* a call it barely occupies, where the enclosing noise becomes the
+verdict. A `heat` kernel fusion was declined on exactly that: whole-call A/B gave 1.021x then
+1.006x — read as §9's falling share — and a 25-row harness sweep gave 0.987-1.041x, whose sub-1.0
+cells read as regressions. Priced directly, the fused region is **1.04-2.65x at every size and never
+slower**; it is 0.14 % of the call that reported it worst, and 0.1 % of 28 ms is far under harness
+noise. **Before reading a ratio near 1.0 as a verdict, compute the candidate's share of what you
+measured** — under a few percent, the measurement cannot see it and the honest next step is to
+isolate the region, not to declare a decline. §14.10 has the full case.
 
 ### 15.3 Attribute at the benchmarked operating point
 
@@ -4801,6 +5010,14 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
 - **SHIPPED — `points.farthest_point_sample` as one persistent block** — §14.1.
 
 ### 16.8 `linalg`, `smoothing`, `laplacian`
+
+- **SHIPPED — every explicit smoothing filter applies the averaging operator in the thread that
+  consumes its row, one launch per pass instead of two.** `filter_laplacian` (explicit),
+  `filter_taubin`, `filter_neighborhood_average`, `filter_humphrey`, `filter_mut_dif_laplacian`,
+  `filter_scalar_laplacian` and `filter_normals`; 1.05-1.96x, output bit-identical. The shared row
+  apply is `kernels/laplacian.operator_row`. Full table, the `heat` sibling that was measured and
+  and the three ways the candidate scan lies: **§14.10**, which also carries the `heat` sibling —
+  landed after a first, wrong reading declined it on whole-call noise.
 
 - **SHIPPED — `linalg.multigrid_preconditioner`** (aggregation, smoothed prolongator, Galerkin
   hierarchy, batched V-cycle inside the captured CG loop). A real win on ill-conditioned systems: a

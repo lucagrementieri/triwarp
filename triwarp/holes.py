@@ -275,18 +275,19 @@ def fill_cone(
     n_vertices = int(vertices.shape[0])
 
     centroids = wp.empty(n_loops, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_holes.loop_centroids,
-        dim=n_loops,
-        inputs=[vertices, flat_loops, loop_starts, packed.sizes, centroids],
-        device=device,
-    )
-
     fill_faces = wp.empty(3 * total, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_holes.cone_faces,
+        kernel_holes.cone_fill,
         dim=n_loops,
-        inputs=[flat_loops, loop_starts, packed.sizes, wp.int32(n_vertices), fill_faces],
+        inputs=[
+            vertices,
+            flat_loops,
+            loop_starts,
+            packed.sizes,
+            wp.int32(n_vertices),
+            centroids,
+            fill_faces,
+        ],
         device=device,
     )
     return (tw.array.concatenate([vertices, centroids]), tw.array.concatenate([faces, fill_faces]))
@@ -1397,34 +1398,24 @@ def _extend_packed_rims(
     device = faces.device
     total = rims.total
     n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
     extended_vertices = wp.empty(n_vertices + total, dtype=wp.vec3, device=device)
+    extended_faces = wp.empty(3 * (n_faces + 2 * total), dtype=wp.int32, device=device)
     wp.copy(extended_vertices[:n_vertices], vertices)
+    wp.copy(extended_faces[: 3 * n_faces], faces)
     wp.launch(
-        kernel_holes.project_loop_to_plane,
+        kernel_holes.extend_rim_to_ring,
         dim=total,
         inputs=[
             vertices,
             rims.flat_loops,
             rims.loop_id,
-            plane_normal,
-            plane_origins,
-            extended_vertices[n_vertices:],
-        ],
-        device=device,
-    )
-
-    n_faces = int(faces.shape[0]) // 3
-    extended_faces = wp.empty(3 * (n_faces + 2 * total), dtype=wp.int32, device=device)
-    wp.copy(extended_faces[: 3 * n_faces], faces)
-    wp.launch(
-        kernel_holes.bridge_loop_to_ring,
-        dim=total,
-        inputs=[
-            rims.flat_loops,
-            rims.loop_id,
             rims.starts,
             rims.sizes,
+            plane_normal,
+            plane_origins,
             wp.int32(n_vertices),
+            extended_vertices[n_vertices:],
             extended_faces[3 * n_faces :].reshape((2 * total, 3)),
         ],
         device=device,

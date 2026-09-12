@@ -429,6 +429,10 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # accumulates the linear term on top -- the same in-place shape as ``acc`` just above, not a
     # fresh per-call answer.
     ("smoothing", "add_interior_mass_rhs"): frozenset({"rhs"}),
+    # ``filter_normals`` folds one pass's normalization into the next pass's seed, and both act on
+    # the same accumulator slot: the thread reads its own entry and overwrites it in the same
+    # launch, so ``out_`` would misread it as write-only. The answer is ``out_normals``.
+    ("smoothing", "renormalize_and_reseed"): frozenset({"accumulated"}),
     # scratch / persistent state
     ("adjacency", "scatter_vertex_faces"): frozenset({"cursor"}),
     # ``min_distance_sq`` is the farthest-point sampler's running distance-to-the-chosen-set:
@@ -1887,10 +1891,11 @@ _MAP_DECLARATION_ALLOWLIST: frozenset[str] = frozenset(
         "energies",
         # ``abs_deviation`` from two sites, both float32.
         "registration",
-        # ``extract_components`` from three and ``add_scaled_normal`` / ``combine_components`` /
-        # ``laplacian_step`` from two each -- every one of them a single signature, because the
-        # smoothers are float32 throughout and their repeated sites differ in the *buffer*, not
-        # in its dtype, rank or length.
+        # ``extract_components`` from three and ``add_scaled_normal`` / ``combine_components``
+        # from two each -- every one of them a single signature, because the smoothers are float32
+        # throughout and their repeated sites differ in the *buffer*, not in its dtype, rank or
+        # length. (``laplacian_step`` was a fourth until the explicit filters fused their operator
+        # apply into the step kernel and stopped mapping it at all.)
         "smoothing",
     }
 )

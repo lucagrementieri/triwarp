@@ -148,7 +148,7 @@ def write_corner_triple_reversible(
     The one decision several face-emitting kernels share -- write a triple forward, or with its
     first and last corners swapped (trimesh's ``np.fliplr``) -- factored once rather than repeated
     at every call site that computes a per-face orientation flag
-    (``creation.revolve_cap_faces``/``offset_cap_faces``/``write_prism_face``). Still just
+    (``creation.revolve_cap_faces``/``offset_cap_faces_both``/``write_prism_face``). Still just
     ``write_corner_triple`` under either branch, so this is not the permuted "reversed" sibling that
     function's own docstring declines to add: the swap happens once here, at the one place a
     *runtime* flag decides which of the two a caller wanted, not as a second three-atomic body.

@@ -75,16 +75,27 @@ def fan_faces(
 
 
 @wp.kernel
-def cone_faces(
+def cone_fill(
+    vertices: wp.array[wp.vec3],
     flat_loops: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],
     loop_sizes: wp.array[wp.int32],
     n_vertices: wp.int32,
+    out_centroids: wp.array[wp.vec3],
     out_faces: wp.array[wp.int32],
 ) -> None:
+    # One thread per hole: place the loop's apex at its centroid and emit the cone fan around it.
+    # The two were separate launches over the same loops; the fan does not read the centroid (the
+    # apex is an *index*, ``n_vertices + ell``), so nothing is shared but the loop's own bounds --
+    # which is exactly what makes one launch enough.
     ell = wp.int32(wp.tid())
     o = loop_starts[ell]
     s = loop_sizes[ell]
+    acc = wp.vec3(0.0, 0.0, 0.0)
+    for j in range(s):
+        acc = acc + vertices[flat_loops[o + j]]
+    out_centroids[ell] = acc * (1.0 / wp.float32(s))
+
     apex = n_vertices + ell
     # This loop contributes s cone triangles; the cone base equals o (scan of the loop sizes).
     for j in range(s):
@@ -93,23 +104,6 @@ def cone_faces(
         out_faces[3 * t + 0] = apex
         out_faces[3 * t + 1] = flat_loops[nxt]
         out_faces[3 * t + 2] = flat_loops[o + j]
-
-
-@wp.kernel
-def loop_centroids(
-    vertices: wp.array[wp.vec3],
-    flat_loops: wp.array[wp.int32],
-    loop_starts: wp.array[wp.int32],
-    loop_sizes: wp.array[wp.int32],
-    out_centroids: wp.array[wp.vec3],
-) -> None:
-    ell = wp.int32(wp.tid())
-    o = loop_starts[ell]
-    s = loop_sizes[ell]
-    acc = wp.vec3(0.0, 0.0, 0.0)
-    for j in range(s):
-        acc = acc + vertices[flat_loops[o + j]]
-    out_centroids[ell] = acc * (1.0 / wp.float32(s))
 
 
 @wp.func
@@ -1025,33 +1019,6 @@ def mark_loops_with_chords(
 
 
 @wp.kernel
-def project_loop_to_plane(
-    vertices: wp.array[wp.vec3],
-    loop_vertices: wp.array[wp.int32],
-    loop_id: wp.array[wp.int32],
-    plane_normal: wp.vec3,
-    plane_origins: wp.array[wp.vec3],
-    out_positions: wp.array[wp.vec3],
-) -> None:
-    # Each rim vertex's orthogonal projection onto its loop's plane. The *ring* of these is what the
-    # rim is bridged to, so the extension is exactly the ruled surface between the two. The origin
-    # is per loop rather than global because a bottom plane is fitted to each rim separately.
-    #
-    # The shared predicate takes the offset from the origin and returns it, so the origin is
-    # subtracted and added back -- one more subtract than writing the projection out, and a
-    # cancellation the direct form does not have. Not bit-identical to it, and deliberately so: the
-    # disagreement is **3.0e-08 relative** on the extension's own output and stays there whatever
-    # the model's scale or distance from the origin (probed at unit scale, at 1e3 and 1e5 away, and
-    # at scale 100), i.e. it sits at float32 epsilon rather than growing. Face buffers are
-    # unchanged, so nothing topological turns on it, and the off-plane residual is a wash between
-    # the two forms -- neither is the more accurate one.
-    i = wp.int32(wp.tid())
-    point = vertices[loop_vertices[i]]
-    origin = plane_origins[loop_id[i]]
-    out_positions[i] = origin + project_out_normal(point - origin, plane_normal)
-
-
-@wp.kernel
 def loop_extreme_projection(
     vertices: wp.array[wp.vec3],
     loop_vertices: wp.array[wp.int32],
@@ -1075,20 +1042,45 @@ def plane_origin_from_extreme(
 
 
 @wp.kernel
-def bridge_loop_to_ring(
+def extend_rim_to_ring(
+    vertices: wp.array[wp.vec3],
     loop_vertices: wp.array[wp.int32],
     loop_id: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],
     loop_sizes: wp.array[wp.int32],
+    plane_normal: wp.vec3,
+    plane_origins: wp.array[wp.vec3],
     ring_base: wp.int32,
+    out_positions: wp.array[wp.vec3],
     out_faces: wp.array2d[wp.int32],
 ) -> None:
+    # One thread per rim vertex: project it onto its loop's plane and emit the two triangles
+    # bridging its rim edge to the projected ring. The bridge addresses the ring by *index*
+    # (``ring_base + slot``) and never reads a projected position, so the two are independent over
+    # the same rim and one launch covers both.
+    t = wp.int32(wp.tid())
+
+    # The orthogonal projection onto the loop's plane. The *ring* of these is what the rim is
+    # bridged to, so the extension is exactly the ruled surface between the two. The origin is per
+    # loop rather than global because a bottom plane is fitted to each rim separately.
+    #
+    # The shared predicate takes the offset from the origin and returns it, so the origin is
+    # subtracted and added back -- one more subtract than writing the projection out, and a
+    # cancellation the direct form does not have. Not bit-identical to it, and deliberately so: the
+    # disagreement is **3.0e-08 relative** on the extension's own output and stays there whatever
+    # the model's scale or distance from the origin (probed at unit scale, at 1e3 and 1e5 away, and
+    # at scale 100), i.e. it sits at float32 epsilon rather than growing. Face buffers are
+    # unchanged, so nothing topological turns on it, and the off-plane residual is a wash between
+    # the two forms -- neither is the more accurate one.
+    a = loop_vertices[t]
+    point = vertices[a]
+    origin = plane_origins[loop_id[t]]
+    out_positions[t] = origin + project_out_normal(point - origin, plane_normal)
+
     # Two triangles per rim edge, joining it to the corresponding edge of the projected ring. The
     # rim runs with the surface on its left, so the quad ``(a, b, b', a')`` is wound the other way
     # round to keep the extension's outward side the same as the mesh's.
-    t = wp.int32(wp.tid())
     next_slot = loop_next_slot(loop_id, loop_starts, loop_sizes, t)
-    a = loop_vertices[t]
     b = loop_vertices[next_slot]
     projected_a = ring_base + t
     projected_b = ring_base + next_slot
