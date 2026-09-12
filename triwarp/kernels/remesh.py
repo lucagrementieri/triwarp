@@ -2181,6 +2181,23 @@ QUADRIC_SINGULAR_EPS = wp.constant(wp.float64(1e-12))
 # A collapse is rejected when it would turn an incident face's normal by more than this. Zero would
 # allow a face to become exactly degenerate; 0.2 (~78 degrees) still permits real simplification of
 # a curved region while refusing an outright fold.
+#
+# **Not exposed as a keyword, and the census is why.** ``quadric_decimate``'s Notes used to name
+# this guard as "the usual reason a target is not reached", which a veto count refutes: mirroring
+# ``quadric_collapse_candidates``' three early exits over the *terminal* mesh of a decimation that
+# stopped short, on icosphere(3), icosphere(4), a box and a 32-section cylinder crossed with
+# ``feature_angle`` in {30, 45, 60, 90, 180}, **14 of the 20 cells veto every remaining edge on the
+# feature rule and none at all on this one** -- 147/147, 195/195, 186/186 and so on, with zero
+# link-condition and zero normal-flip vetoes. The six cells that do reach the target stop on the
+# target, and the two that show flip vetoes (icosphere(4) and the cylinder at 180 degrees) show
+# 2 of 30 and 7 of 30 against a majority still available.
+#
+# So the knob a caller short of their target actually needs is ``feature_angle``, which already
+# exists: raising it moves the floor monotonically (icosphere(3) at target 20 gives 98 / 68 / 26 /
+# 20 / 20 faces across that sweep). Adding a second one here would be a keyword for a constraint
+# that was measured not to bind, which is the speculative generality section 4.2 forbids. Re-run
+# the census before widening this value -- it is what keeps the output free of inverted,
+# self-intersecting triangles, and nothing in the suite would notice it going soft.
 COLLAPSE_MIN_NORMAL_DOT = wp.constant(wp.float32(0.2))
 
 

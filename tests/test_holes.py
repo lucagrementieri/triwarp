@@ -605,6 +605,59 @@ def test_fillable_loop_mask_chord_is_conservative(device: str) -> None:
     assert tw.holes.fillable_loop_mask(fan_vertices_wp, fan_faces_wp).numpy()[0]
 
 
+def test_fillable_loop_mask_shared_vertex_disqualifies_both_loops(device: str) -> None:
+    """
+    Not a library comparison: the guarantee is triwarp's own wording, not a reference's.
+
+    ``fillable_loop_mask`` documents ``True`` as a *guarantee* -- "a vertex shared by two different
+    rims is the same pinch spread across two loops, and disqualifies both". The pair below is that
+    configuration with one twist: the loop that shares the vertex is itself clean, and the loop it
+    shares with is self-pinched somewhere else. Both are unfillable, because the shared vertex is
+    non-manifold whoever else touches it.
+
+    The loops are supplied rather than derived, and deliberately: ``boundary_loops``' walk merges a
+    shared boundary vertex into a single loop, so the two-loop form is reachable exactly through
+    the ``loops=`` keyword -- which every caller that filters or derives its own rims uses. The
+    control pair, identical except that the second loop is a disjoint triangle's rim, keeps the
+    test from passing on a mask that is simply always ``False``.
+
+    **Bug class excluded:** counting rim ownership over only the loops that survived the self-pinch
+    test, which makes a clean loop sharing a vertex with a pinched one answer ``True``. **Mutation
+    probe, measured against a detached pre-fix worktree:** the shared pair returns
+    ``[False, True]`` there and ``[False, False]`` here, with the control ``[False, True]`` on
+    both.
+    """
+    vertices_np = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [-1.0, 2.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0],
+            [5.0, 1.0, 0.0],
+        ]
+    )
+    faces_np = np.array([[0, 1, 2], [0, 3, 4], [2, 5, 6], [7, 8, 9]], dtype=np.int64)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+
+    def loop(indices: list[int]) -> wp.array:
+        return wp.array(np.array(indices, dtype=np.int32), dtype=wp.int32, device=device)
+
+    pinched = loop([0, 1, 2, 0, 3, 4])  # visits vertex 0 twice: a pinch within itself
+    sharing = loop([2, 5, 6])  # clean, but meets ``pinched`` at vertex 2
+    disjoint = loop([7, 8, 9])  # clean and meets nothing
+
+    shared_np = tw.holes.fillable_loop_mask(vertices_wp, faces_wp, [pinched, sharing]).numpy()
+    control_np = tw.holes.fillable_loop_mask(vertices_wp, faces_wp, [pinched, disjoint]).numpy()
+
+    assert np.array_equal(shared_np, np.array([False, False]))
+    assert np.array_equal(control_np, np.array([False, True]))
+
+
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus", "icosphere_coarse"])
 def test_fillable_loop_mask_on_the_fixtures(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -1086,9 +1139,33 @@ def test_fill_min_weight_preserve_largest(half_torus: tuple[tm.Trimesh, wp.Mesh]
 
 
 def test_fill_min_weight_rejects_unknown_metric(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: the documented ``ValueError`` at all four metric-taking entry points.
+
+    ``fill_loops_min_weight`` is the one that had no guard and surfaced a bare
+    ``KeyError('bogus')`` -- naming neither the argument nor the alternatives -- so it is checked
+    here beside the three that did, through the one shared validator they now all call. The
+    exception type is the claim: a ``pytest.raises(ValueError)`` fails on a ``KeyError``.
+    """
     _, mesh_wp = hemisphere
-    with pytest.raises(ValueError, match="metric must be one of"):
-        tw.holes.fill_min_weight(mesh_wp.points, mesh_wp.indices, metric="bogus")
+    loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
+    assert loops_wp  # non-vacuity: the loop-taking form gets a real loop, not an empty list
+    face_mask_wp = wp.zeros(
+        int(mesh_wp.indices.shape[0]) // 3, dtype=wp.bool, device=mesh_wp.device
+    )
+
+    for call in (
+        lambda: tw.holes.fill_min_weight(mesh_wp.points, mesh_wp.indices, metric="bogus"),
+        lambda: tw.holes.fill_loops_min_weight(
+            mesh_wp.points, mesh_wp.indices, loops_wp, "bogus", False
+        ),
+        lambda: tw.holes.fill_smooth(mesh_wp.points, mesh_wp.indices, metric="bogus"),
+        lambda: tw.holes.refill_region(
+            mesh_wp.points, mesh_wp.indices, face_mask_wp, metric="bogus"
+        ),
+    ):
+        with pytest.raises(ValueError, match="metric must be one of"):
+            call()
 
 
 # ---------------------------------------------------------------------------
@@ -2045,6 +2122,96 @@ def test_stitch_min_weight_rejects_unknown_metric(device: str) -> None:
         tw.holes.stitch_min_weight(va, fa, vb, fb, metric="bogus")
 
 
+@pytest.mark.parametrize(("n_a", "n_b", "offset"), [(9, 13, 0.0), (7, 11, 1.2), (16, 5, 0.6)])
+def test_stitch_min_weight_edge_length_reaches_the_band_optimum(
+    device: str, n_a: int, n_b: int, offset: float
+) -> None:
+    """
+    Not a library comparison: no reference exposes this objective, so the oracle is a host DP.
+
+    ``edge_length_stitch`` is documented as *"summed connection-edge length"*, and that objective
+    has a closed form the test can brute-force in five lines: whichever rim a step advances, the
+    connection edge it introduces is ``(a[i], b[j])`` -- the other two corners of the new band
+    triangle were already joined at the cell it came from -- so
+    ``dp[i, j] = min(dp[i - 1, j], dp[i, j - 1]) + |a_i - b_j|`` over the same aligned, rolled rims
+    the wrapper builds. The band's own total is read back off its triangles: every connection edge
+    is shared by exactly two consecutive band triangles and each triangle has exactly two of them,
+    so half the sum over triangles is the path cost.
+
+    **Bug class excluded:** a DP branch scoring the wrong edge, which is invisible to a
+    watertightness or triangle-count check and to a cost comparison that evaluates *triwarp's own*
+    metric on both answers. **Mutation probe, measured against a detached pre-fix worktree:** with
+    the advance-A branch scoring the A rim edge (a path-independent constant) instead of the
+    connection edge, the band comes back 1.03-1.17x above the optimum and this fails; the same
+    fixtures stay watertight and keep the exact ``n_a + n_b`` triangle count either way.
+    """
+    (va_np, _fa_np, va, fa), (vb_np, _fb_np, vb, fb) = _capsule_halves(
+        device, n_a, n_b, phase=0.7, offset=offset
+    )
+    loop_a = tw.boundary.boundary_loops(va, fa)[0]
+    loop_b = tw.boundary.boundary_loops(vb, fb)[0]
+
+    new_vertices, new_faces = tw.holes.stitch_loops_min_weight(
+        va, fa, loop_a, vb, fb, loop_b, metric="edge_length_stitch"
+    )
+
+    offset_b = int(va.shape[0])
+    band = new_faces.numpy()[int(fa.shape[0]) + int(fb.shape[0]) :].reshape(-1, 3)
+    assert band.shape[0] == n_a + n_b  # non-vacuity: a full band, not a degenerate one
+    positions = new_vertices.numpy()
+    total = 0.0
+    for triangle in band:
+        for u, v in (
+            (triangle[0], triangle[1]),
+            (triangle[1], triangle[2]),
+            (triangle[2], triangle[0]),
+        ):
+            if (u < offset_b) != (v < offset_b):
+                total += float(np.linalg.norm(positions[u] - positions[v]))
+    total *= 0.5
+
+    assert np.isclose(total, _band_edge_length_optimum(va_np, loop_a, vb_np, loop_b), rtol=1e-5)
+
+
+def _band_edge_length_optimum(
+    vertices_a_np: np.ndarray,
+    loop_a: wp.array[wp.int32],
+    vertices_b_np: np.ndarray,
+    loop_b: wp.array[wp.int32],
+) -> float:
+    """
+    Host optimum of the ``edge_length_stitch`` objective over the two rims, by exhaustive DP.
+
+    Mirrors ``holes.stitch_loops_min_weight``'s alignment exactly -- rim A reversed, both rolled to
+    their closest vertex pair (``numpy.argmin`` on the flattened distance matrix is that
+    function's documented tie-break) -- and then walks every monotone staircase. The two cells that
+    would consume a whole rim before touching the other are the kernel's own forbidden cells.
+    """
+    la = loop_a.numpy()[::-1].copy()
+    lb = loop_b.numpy().copy()
+    rim_a, rim_b = vertices_a_np[la], vertices_b_np[lb]
+    distance = np.linalg.norm(rim_a[:, None, :] - rim_b[None, :, :], axis=2)
+    start_a, start_b = np.unravel_index(int(np.argmin(distance)), distance.shape)
+    a_pos = np.roll(rim_a, -int(start_a), axis=0).astype(np.float64)
+    b_pos = np.roll(rim_b, -int(start_b), axis=0).astype(np.float64)
+
+    n_a, n_b = len(la), len(lb)
+    dp = np.full((n_a + 1, n_b + 1), np.inf)
+    dp[0, 0] = 0.0
+    for i in range(n_a + 1):
+        for j in range(n_b + 1):
+            if (i == 0 and j == 0) or (i == n_a and j == 0) or (j == n_b and i == 0):
+                continue
+            step = float(np.linalg.norm(a_pos[i % n_a] - b_pos[j % n_b]))
+            best = np.inf
+            if i >= 1:
+                best = min(best, dp[i - 1, j] + step)
+            if j >= 1:
+                best = min(best, dp[i, j - 1] + step)
+            dp[i, j] = best
+    return float(dp[n_a, n_b])
+
+
 # ---------------------------------------------------------------------------
 # stitch_smooth (MeshLib stitchHolesNicely)
 # ---------------------------------------------------------------------------
@@ -2711,6 +2878,52 @@ def test_bridge_edges_precomputed_rim_keeps_the_chord_check(
     edge_next = (middle, successors[middle])
     with pytest.raises(ValueError, match="non-manifold"):
         tw.holes.bridge_edges(vertices_wp, faces_wp, edge_a, edge_next, boundary_edges=rim_wp)
+
+
+def test_bridge_edges_smooth_opposed_edges_stay_finite(device: str) -> None:
+    """
+    Not a library comparison: meshlib fairs a different curve, so it has no opinion on this input.
+
+    The strip's width direction is interpolated from ``edge_a``'s to ``edge_b``'s and renormalized.
+    When the two edges are wound so those directions are **anti-parallel** the blend passes through
+    the zero vector at the halfway sample, and the strip has to make a half turn whose axis is
+    arbitrary -- a jump discontinuity, not a value. The two coplanar triangles below are that
+    configuration: both edges run along ``+x``, ``edge_a``'s face is below its edge and ``edge_b``'s
+    above, so ``pa0 - pa1`` and ``pb1 - pb0`` are exactly opposed.
+
+    The documented behaviour is a twisted strip, not an error -- the function's own note already
+    says a strip across nearly opposed edges can fold -- so what is pinned here is that every
+    position it returns is finite and that the strip is the full one, not a collapsed fan.
+
+    **Bug class excluded:** a division by the zero-length blend. **Mutation probe, measured against
+    a detached pre-fix worktree:** the unguarded normalization returns **2 NaN rows of 10**, with
+    nothing raised and only a NumPy ``RuntimeWarning`` on stderr.
+    """
+    vertices_np = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.5, -1.0, 0.0],
+            [0.0, 3.0, 0.0],
+            [1.0, 3.0, 0.0],
+            [0.5, 4.0, 0.0],
+        ]
+    )
+    faces_np = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+
+    strip_vertices_wp, strip_faces_wp = tw.holes.bridge_edges_smooth(
+        vertices_wp, faces_wp, (0, 1), (3, 4), 0.5
+    )
+
+    positions_np = strip_vertices_wp.numpy()
+    assert positions_np.shape[0] > vertices_np.shape[0]  # non-vacuity: it really did subdivide
+    assert np.isfinite(positions_np).all()
+    # A full strip, not the collapsed one-segment fan: two triangles per segment.
+    n_new_faces = (int(strip_faces_wp.shape[0]) - int(faces_wp.shape[0])) // 3
+    assert n_new_faces > 2
+    _normals_wp, areas_wp = tw.triangles.face_normals_and_areas(strip_vertices_wp, strip_faces_wp)
+    assert np.isfinite(areas_wp.numpy()).all()
 
 
 @pytest.mark.parity("bridge_edges_smooth", "meshlib")

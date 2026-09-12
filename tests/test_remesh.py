@@ -964,6 +964,43 @@ def test_subdivide_region_to_size_matches_meshlib(device: str) -> None:
     assert np.allclose(out_tm.vertices[: vertices_np.shape[0]], vertices_np, rtol=1e-5, atol=1e-5)
 
 
+def test_subdivide_region_to_size_never_writes_into_the_caller(device: str) -> None:
+    """
+    Not a library comparison: no reference promises anything about the caller's own buffers.
+
+    ``subdivide_region_to_size`` documents ``vertices``/``faces`` as inputs and returns new buffers,
+    which on the path where *nothing* splits means it has to copy them -- and the copy has to happen
+    before the closing Delaunay pass, because ``_flip_region_faces`` rewrites its face buffer in
+    place. The fixture is the smallest input that reaches that path with work to do: a quad whose
+    diagonal is non-Delaunay (vertex 3 sits inside the circumcircle of face 0) and whose longest
+    edge is far under ``max_edge``, so the split loop breaks on its first iteration and the flip
+    pass is the only thing that runs.
+
+    **Bug class excluded:** an in-place write into an argument. **Mutation probe, measured against
+    a detached pre-fix worktree:** with the copy below the flip pass, the caller's own ``faces``
+    goes from ``[0 1 2 0 2 3]`` to ``[2 3 1 0 1 3]`` and this test fails on its first assert. A
+    rectangle does *not* probe it -- every rectangle is cyclic, so its diagonal is a Delaunay tie
+    and nothing flips.
+    """
+    vertices_np = np.array([[0, 0, 0], [1, -1, 0], [2, 0, 0], [1, -0.1, 0]], dtype=np.float64)
+    faces_np = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    region_wp = wp.full(2, True, dtype=wp.bool, device=device)
+    faces_before = faces_wp.numpy().copy()
+    vertices_before = vertices_wp.numpy().copy()
+
+    out_vertices_wp, out_faces_wp, _out_region_wp = tw.remesh.subdivide_region_to_size(
+        vertices_wp, faces_wp, region_wp, max_edge=100.0
+    )
+
+    assert np.array_equal(faces_wp.numpy(), faces_before)
+    assert np.array_equal(vertices_wp.numpy(), vertices_before)
+    assert out_faces_wp.ptr != faces_wp.ptr
+    assert out_vertices_wp.ptr != vertices_wp.ptr
+    # Non-vacuity: the flip pass really had something to do, so the copy was load-bearing.
+    assert not np.array_equal(out_faces_wp.numpy(), faces_before)
+
+
 @pytest.mark.parametrize("voxel_size", [0.1, 0.3])
 @pytest.mark.parametrize("contraction", ["average", "closest"])
 @pytest.mark.parity("cluster_decimate", "open3d")
@@ -1394,6 +1431,63 @@ def test_quadric_decimate_is_monotone_in_the_target(device: str) -> None:
         for ratio in (0.8, 0.4, 0.2, 0.1)
     ]
     assert counts == sorted(counts, reverse=True)
+
+
+def test_quadric_decimate_reaches_a_reachable_target_and_floors_on_feature_angle(
+    device: str,
+) -> None:
+    """
+    Not a library comparison: no reference exposes ``feature_angle``'s effect on the floor.
+
+    Two halves of one ``Notes`` claim, neither of which had a test. **The target is reached
+    exactly whenever it is reachable** -- pinned at 320 faces on ``icosphere(3)``, which is hit on
+    the nose. And **what stops a decimation short is the feature rule, not the normal-flip guard**:
+    at the default ``feature_angle`` a target of 20 stops at 98, because a sphere's own dihedral
+    angles grow as it is coarsened until every edge is sharper than 30 degrees and every vertex is
+    a frozen corner. Raising the angle lowers the floor monotonically and 180 degrees -- where
+    nothing is a feature -- reaches the target exactly.
+
+    Measured by mirroring ``quadric_collapse_candidates``' three early exits over the terminal
+    mesh, on four meshes crossed with five angles: **14 of 20 cells veto every remaining edge on
+    the feature rule and none at all on the normal-flip guard** (147/147 here, 195/195 on
+    ``icosphere(4)``, 186/186 on a cylinder). That census is recorded at ``COLLAPSE_MIN_NORMAL_DOT``
+    in ``kernels/remesh.py``, and it is the argument for *not* exposing that threshold as a second
+    keyword.
+
+    **Bug class excluded:** a floor that moves for a reason other than the parameter the docstring
+    names -- a decimation that silently stopped on the iteration cap, say, would give the same 98
+    at every angle. The angle sweep is what separates the two, and it is asserted as a strict
+    monotone decrease rather than at fixed values, since the exact floor is a property of the
+    input rather than of the contract.
+    """
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+    n_faces = int(faces_wp.shape[0]) // 3
+    assert n_faces == 1280  # non-vacuity: the fixture the floors below were measured on
+
+    # Reachable target, hit exactly.
+    reachable = (
+        int(tw.remesh.quadric_decimate(vertices_wp, faces_wp, target_faces=320)[1].shape[0]) // 3
+    )
+    assert reachable == 320
+
+    # Unreachable at the default angle, and the floor falls as the angle rises.
+    floors = [
+        int(
+            tw.remesh.quadric_decimate(vertices_wp, faces_wp, target_faces=20, feature_angle=angle)[
+                1
+            ].shape[0]
+        )
+        // 3
+        for angle in (30.0, 45.0, 60.0, 180.0)
+    ]
+    assert floors[0] > 20  # the default really does stop short
+    assert floors == sorted(floors, reverse=True)
+    assert len(set(floors)) > 1  # the angle moves it, so the cap is not what binds
+    assert floors[-1] == 20  # nothing is a feature at 180 degrees, so the target is reached
+
+    # The iteration cap is not what stops the default: more passes give the identical mesh.
+    patient = tw.remesh.quadric_decimate(vertices_wp, faces_wp, target_faces=20, max_iter=400)[1]
+    assert int(patient.shape[0]) // 3 == floors[0]
 
 
 def test_quadric_decimate_target_at_or_above_the_input_is_a_copy(device: str) -> None:
@@ -3705,6 +3799,42 @@ def test_split_edges_empty_mask_is_a_copy(icosahedron: tuple[tm.Trimesh, wp.Mesh
     assert np.array_equal(split_f.numpy(), mesh_wp.indices.numpy())
     assert np.allclose(split_v.numpy(), mesh_wp.points.numpy())
     assert np.array_equal(index.numpy(), np.arange(int(mesh_wp.indices.shape[0]) // 3))
+
+
+def test_split_edges_empty_mask_does_not_alias_the_caller_index(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: buffer ownership is triwarp's contract, not a reference's.
+
+    The sibling above pins the *values* on the no-split path; this pins that the third return is
+    the caller's own ``index`` buffer copied rather than handed straight back, so that ownership
+    does not silently depend on whether any edge happened to be flagged.
+
+    **Bug class excluded:** a caller writing into the returned index destroying its own input.
+    **Mutation probe, measured against a detached pre-fix worktree:** returning ``carried``
+    unchanged makes the write below land in ``carry`` as well, failing the last assert.
+    """
+    _mesh_tm, mesh_wp = icosahedron
+    device = mesh_wp.indices.device
+    unique_edges, inverse = tw.edges.edges_unique(mesh_wp.indices)
+    nothing = wp.zeros(int(unique_edges.shape[0]), dtype=wp.bool, device=device)
+    n_faces = int(mesh_wp.indices.shape[0]) // 3
+    carry = tw.array.arange(n_faces, device=device)
+
+    _split_v, _split_f, index = tw.remesh.split_edges(
+        mesh_wp.points,
+        mesh_wp.indices,
+        nothing,
+        unique_edges=unique_edges,
+        inverse=inverse,
+        index=carry,
+        return_index=True,
+    )
+    assert index.ptr != carry.ptr
+    assert np.array_equal(index.numpy(), carry.numpy())
+    index.fill_(-1)
+    assert np.array_equal(carry.numpy(), np.arange(n_faces))
 
 
 def test_split_edges_validation(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

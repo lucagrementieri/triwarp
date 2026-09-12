@@ -77,6 +77,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
+from triwarp.constants import TOLERANCE_ZERO
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import holes as kernel_holes
 from triwarp.kernels import scatter as kernel_scatter
@@ -503,8 +504,7 @@ def fill_min_weight(
     wound (see [`make_winding_consistent`][triwarp.repair.make_winding_consistent]).
     """
     require_same_device(vertices=vertices, faces=faces)
-    if metric not in _METRIC_IDS:
-        raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
+    _check_fill_metric(metric)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.clone(faces)
@@ -560,6 +560,9 @@ def fill_loops_min_weight(
 
     Raises
     ------
+    ValueError
+        If ``metric`` is not one of the names
+        [`fill_min_weight`][triwarp.holes.fill_min_weight] lists.
     RuntimeError
         If ``vertices``, ``faces`` and ``loops`` are not all on one device.
 
@@ -568,6 +571,7 @@ def fill_loops_min_weight(
     [`fill_min_weight`][triwarp.holes.fill_min_weight]
     """
     require_same_device(vertices=vertices, faces=faces, loops=loops)
+    _check_fill_metric(metric)
     if len(loops) == 0:
         return wp.clone(faces)
     return _fill_packed_loops(
@@ -1033,8 +1037,7 @@ def fill_smooth(
     Winding is consistent with the surrounding faces only for a consistently wound input.
     """
     require_same_device(vertices=vertices, faces=faces)
-    if metric not in _METRIC_IDS:
-        raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
+    _check_fill_metric(metric)
     if edge_weights not in ("cotan", "unit"):
         raise ValueError(f"edge_weights must be 'cotan' or 'unit', got {edge_weights!r}")
     _check_refine(refine)
@@ -1164,8 +1167,7 @@ def refill_region(
         One of several ways to produce the mask this takes.
     """
     require_same_device(vertices=vertices, faces=faces, face_mask=face_mask)
-    if metric not in _METRIC_IDS:
-        raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
+    _check_fill_metric(metric)
     _check_refine(refine)
 
     kept_vertices, kept_faces, new_loops = tw.selection.delete_region_keep_boundary(
@@ -1251,12 +1253,6 @@ def extend_hole(
     ------
     TypeError
         If any loop is not a rank-1 ``wp.int32`` array.
-
-    !!! note "The rim may cross the plane"
-        Nothing here checks which side of the plane a rim vertex is on. A rim straddling it gets an
-        extension that folds through the plane, which is geometrically what "project each vertex"
-        means and is almost never wanted -- place the plane clear of the rim, and check with
-        [`bounds.aabb`][triwarp.bounds.aabb] if the input is not yours.
     RuntimeError
         If ``vertices``, ``faces`` and ``loops`` are not all on one device.
 
@@ -1269,6 +1265,14 @@ def extend_hole(
     [`stitch_loops`][triwarp.holes.stitch_loops]
         Bridges two rims that both already exist, where this generates the second one.
     [`boundary_loops`][triwarp.boundary.boundary_loops]
+
+    Notes
+    -----
+    !!! note "The rim may cross the plane"
+        Nothing here checks which side of the plane a rim vertex is on. A rim straddling it gets an
+        extension that folds through the plane, which is geometrically what "project each vertex"
+        means and is almost never wanted -- place the plane clear of the rim, and check with
+        [`bounds.aabb`][triwarp.bounds.aabb] if the input is not yours.
     """
     require_same_device(vertices=vertices, faces=faces, loops=loops)
     packed = _packed_rims(vertices, faces, loops)
@@ -1545,12 +1549,19 @@ def fillable_loop_mask(
     # ``True`` for a loop that has one. ``True`` is a guarantee, so every loop touching a shared
     # vertex answers ``False`` and is kept out of the tables. Counting owners up front rather
     # than resolving collisions in the write loop keeps the answer independent of loop order.
-    owned = [loops_np[index] for index in range(len(loops_np)) if fillable_np[index]]
-    if owned:
-        owner_count = np.bincount(np.concatenate(owned), minlength=n_vertices)
-        for index, loop_np in enumerate(loops_np):
-            if fillable_np[index] and (owner_count[loop_np] > 1).any():
-                fillable_np[index] = False
+    #
+    # The count runs over **every** loop, including the self-pinched ones the pass above already
+    # disqualified. Dropping those first would be counting the wrong thing: a self-pinch is a
+    # non-manifold vertex whoever else touches it, so a clean loop sharing it is exactly as
+    # unfillable as the pinched one, and excluding the pinched loop from the tally made that
+    # clean loop answer ``True``. ``np.unique`` per loop is what keeps a loop's own repeat from
+    # counting as a second owner -- the count is of *owning loops*, not of occurrences.
+    owner_count = np.bincount(
+        np.concatenate([np.unique(loop_np) for loop_np in loops_np]), minlength=n_vertices
+    )
+    for index, loop_np in enumerate(loops_np):
+        if fillable_np[index] and (owner_count[loop_np] > 1).any():
+            fillable_np[index] = False
 
     loop_of_vertex_np = np.full(n_vertices, -1, dtype=np.int32)
     position_np = np.zeros(n_vertices, dtype=np.int32)
@@ -1782,8 +1793,7 @@ def stitch_smooth(
     require_same_device(
         vertices_a=vertices_a, faces_a=faces_a, vertices_b=vertices_b, faces_b=faces_b
     )
-    if metric not in _STITCH_METRIC_IDS:
-        raise ValueError(f"metric must be one of {sorted(_STITCH_METRIC_IDS)}, got {metric!r}")
+    _check_stitch_metric(metric)
     if edge_weights not in ("cotan", "unit"):
         raise ValueError(f"edge_weights must be 'cotan' or 'unit', got {edge_weights!r}")
     _check_refine(refine)
@@ -1830,6 +1840,41 @@ def stitch_smooth(
         refine=refine,
     )
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
+
+
+def _check_fill_metric(metric: str) -> None:
+    """
+    Reject an unknown fill metric, for the four entry points that take one.
+
+    The four reach the engine (``_fill_packed_loops``) by different routes and three of them have
+    paths that never reach it at all -- an empty mesh, a mesh with no hole, an empty loop list --
+    so the check belongs at each boundary rather than at the table lookup. One spelling in one
+    place because the message names the admissible set and has to stay derived from
+    ``_METRIC_IDS``; ``fill_loops_min_weight`` went without it and surfaced a bare ``KeyError``.
+
+    Raises
+    ------
+    ValueError
+        If ``metric`` is not a key of ``_METRIC_IDS``.
+    """
+    if metric not in _METRIC_IDS:
+        raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
+
+
+def _check_stitch_metric(metric: str) -> None:
+    """
+    Reject an unknown stitch metric, for the two entry points that take one.
+
+    The band metrics are a different menu from the fill metrics, so this is a separate table and a
+    separate check; see ``_check_fill_metric`` for why the check sits at the boundary.
+
+    Raises
+    ------
+    ValueError
+        If ``metric`` is not a key of ``_STITCH_METRIC_IDS``.
+    """
+    if metric not in _STITCH_METRIC_IDS:
+        raise ValueError(f"metric must be one of {sorted(_STITCH_METRIC_IDS)}, got {metric!r}")
 
 
 def _check_refine(refine: str) -> None:
@@ -2235,8 +2280,7 @@ def stitch_loops_min_weight(
         faces_b=faces_b,
         loop_b=loop_b,
     )
-    if metric not in _STITCH_METRIC_IDS:
-        raise ValueError(f"metric must be one of {sorted(_STITCH_METRIC_IDS)}, got {metric!r}")
+    _check_stitch_metric(metric)
     n_a = int(loop_a.shape[0])
     n_b = int(loop_b.shape[0])
     if n_a < 3 or n_b < 3:
@@ -2546,13 +2590,6 @@ def bridge_edges_smooth(
         If ``sampling_step`` is not positive, if either edge is not a directed edge of ``faces``
         (checked whatever ``validate`` says, since the strip needs both incident faces), or for any
         of the reasons [`bridge_edges`][triwarp.holes.bridge_edges] raises.
-
-    !!! note "The curve is a cubic, not an optimum"
-        The strip follows one cubic Hermite segment fitted to the two edge midpoints and the two
-        incident-face tangents. Nothing minimizes its bending energy or checks it for
-        self-intersection, so a step far smaller than the span across two nearly opposed edges can
-        fold; run [`fix_self_intersections`][triwarp.repair.fix_self_intersections] if the input
-        pairing is not yours to choose.
     RuntimeError
         If ``vertices`` and ``faces`` are not all on one device.
 
@@ -2562,6 +2599,21 @@ def bridge_edges_smooth(
         The single-quadrilateral form, which adds no vertices.
     [`fill_smooth`][triwarp.holes.fill_smooth]
         The same idea for a whole rim: a patch refined and faired rather than merely spanned.
+
+    Notes
+    -----
+    !!! note "The curve is a cubic, not an optimum"
+        The strip follows one cubic Hermite segment fitted to the two edge midpoints and the two
+        incident-face tangents. Nothing minimizes its bending energy or checks it for
+        self-intersection, so a step far smaller than the span across two nearly opposed edges can
+        fold; run [`fix_self_intersections`][triwarp.repair.fix_self_intersections] if the input
+        pairing is not yours to choose.
+
+    !!! note "Two opposed edges give a half-twisted strip, not an error"
+        The strip's width direction interpolates from ``edge_a``'s to ``edge_b``'s. When the two
+        run opposite ways the interpolation passes through a half turn whose axis is arbitrary, and
+        the strip twists through it at one sample rather than curving smoothly. Reversing one of
+        the two edges is what removes the twist.
     """
     require_same_device(vertices=vertices, faces=faces)
     if sampling_step <= 0.0:
@@ -2621,6 +2673,27 @@ def _bridge_strip(
 
     Host-side NumPy over six positions and a handful of samples -- the strip never scales with the
     mesh, so a kernel here would buy a launch and no parallelism.
+
+    **Slerping the width direction instead of normalizing a lerp was measured and declined.** The
+    two spellings trace the same great-circle arc at different speeds, so adopting slerp would move
+    every sample of every call; what it buys, against the angle between the two edges' width
+    directions, is nothing where callers actually are and a real improvement only in a band nothing
+    reaches:
+
+    | angle apart | ``max|lerp - slerp|``, as a fraction of the width | worst swing, lerp -> slerp |
+    |---|---|---|
+    | 5 deg | 0.00 % | 0.4 -> 0.4 deg |
+    | 30 deg | 0.11 % | 2.6 -> 2.5 deg |
+    | 65 deg (the benchmarked hemisphere pair) | 1.12 % | 10.5 -> 9.3 deg |
+    | 90 deg | 3.55 % | 9.5 -> 7.5 deg |
+    | 170 deg | 40.8 % | 62.3 -> 14.2 deg |
+    | 179 deg | 58.8 % | 87.0 -> 14.9 deg |
+
+    So it perturbs the one pair the suite times by about a percent of the width for no gain, and
+    only pays past ~150 degrees -- where the docstring of the public entry point already tells the
+    caller to reverse one of the two edges instead. **And it does not fix the case that raised the
+    question**: at exactly 180 degrees ``sin(omega)`` is zero, slerp is ``0 / 0``, and the twist
+    axis is as arbitrary as it is here, so the degenerate branch below is needed either way.
     """
     a0, a1, b0, b1 = (int(corners[k]) for k in range(4))
     pa0, pa1, pb0, pb1, pta, ptb = positions_np
@@ -2664,7 +2737,19 @@ def _bridge_strip(
     parameters = np.linspace(0.0, 1.0, n_segments + 1)
     samples = hermite(parameters)
     directions = (1.0 - parameters)[:, None] * width_dir_a + parameters[:, None] * width_dir_b
-    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    # The blend collapses to zero where the two width directions are anti-parallel: the strip has
+    # to make a half turn there and every half turn is as good as another, so the normalized lerp
+    # has a jump discontinuity rather than a value at that sample. Take the limit from the A side.
+    # Without the guard this divides by zero and returns NaN positions -- and a *nearly* opposed
+    # pair is worse still, dividing by round-off to give a finite but arbitrary direction, which is
+    # why the floor is a tolerance and not an equality test. Both operands are unit vectors, so the
+    # norm is in ``[0, 1]`` and an absolute floor is the scale-free test here.
+    norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    fallback = width_dir_a if float(np.linalg.norm(width_dir_a)) > 0.0 else width_dir_b
+    collapsed = norms[:, 0] < TOLERANCE_ZERO
+    directions[collapsed] = fallback
+    norms[collapsed] = max(float(np.linalg.norm(fallback)), TOLERANCE_ZERO)
+    directions /= norms
     half_width = (0.5 * ((1.0 - parameters) * length_a + parameters * length_b))[:, None]
     minus_np = samples - half_width * directions
     plus_np = samples + half_width * directions

@@ -1182,8 +1182,10 @@ def quadric_decimate(
     vertices : wp.array[wp.vec3]
         Simplified vertex positions on ``vertices.device``, compacted from index zero.
     faces : wp.array[wp.int32]
-        Flat ``3 * n_faces`` triangle index buffer. The count is ``<= target_faces`` but not
-        necessarily equal to it — see Notes.
+        Flat ``3 * n_faces`` triangle index buffer. The count is a best effort at ``target_faces``
+        and is **not** bounded by it: a mesh whose remaining edges all fail the link condition or
+        the normal-flip guard stops above the target — see Notes. Read the returned count rather
+        than assuming it.
     vertex_index : wp.array[wp.int32]
         Only when ``return_index`` is ``True``: length ``n_input_vertices``, the **output** vertex
         each input vertex ended up in, or ``-1`` for an input vertex that survives in no output face
@@ -1249,15 +1251,22 @@ def quadric_decimate(
 
     Four consequences to plan around:
 
-    - **The target is usually reached exactly, but is not guaranteed.** A pass is budgeted at half
-      the remaining surplus (an interior collapse removes two faces), shared across its rounds, and
-      the loop stops early when a pass can commit nothing — a mesh whose remaining edges all fail
-      the link condition or the normal-flip guard cannot be reduced further at any ``max_iter``.
-      Check the returned face count if it matters.
-    - Every collapse is checked against a **normal-flip guard**: an incident face whose normal would
-      turn by more than ~78 degrees vetoes it. That is what keeps the output free of the inverted,
-      self-intersecting triangles an unguarded quadric method produces at high reduction ratios, and
-      it is the usual reason a target is not reached.
+    - **The target is reached exactly whenever it is reachable, and it is ``feature_angle`` that
+      decides whether it is.** A pass is budgeted at half the remaining surplus (an interior
+      collapse removes two faces), shared across its rounds, and the loop stops early when a pass
+      can commit nothing. What stops it is almost always the *feature* rule rather than the link
+      condition or the normal-flip guard: a surface's own dihedral angles grow as it is coarsened,
+      so past some face count every edge of a smooth mesh is sharper than ``feature_angle``, every
+      vertex becomes a frozen corner, and no collapse is legal at any ``max_iter``. **That floor is
+      the parameter working, not a limitation to route around** — it is the same rule that keeps a
+      cylinder's rim and a box's creases intact. Raising ``feature_angle`` lowers it; at 180 degrees
+      nothing is a feature and the target is reached. Check the returned face count if it matters.
+    - Every collapse is also checked against a **normal-flip guard**: an incident face whose normal
+      would turn by more than ~78 degrees vetoes it. That is what keeps the output free of the
+      inverted, self-intersecting triangles an unguarded quadric method produces at high reduction
+      ratios. It is **not** usually what stops a decimation short, and is deliberately not exposed
+      as a keyword — see ``COLLAPSE_MIN_NORMAL_DOT`` in ``kernels/remesh.py``, which records the
+      veto census this claim rests on.
     - The independent set is chosen under a **hashed** lock key rather than by cost rank. That looks
       like a detail and is not: on a structured mesh both the edge index and the quadric cost are
       spatially monotone fields, and a monotone key has one local minimum, so either of those keys
@@ -3041,16 +3050,19 @@ def subdivide_region_to_size(
                 current_vertices, current_faces, region_flags, max_angle_change, max_deviation, 8
             )
 
+    # Nothing in the region needed splitting, so ``current_*`` are still the caller's own buffers;
+    # see ``subdivide_to_size``'s tail for why that has to be broken here. ``new_region`` is always
+    # freshly allocated by ``astype``, so only the two mesh buffers are at stake. This has to run
+    # *above* the closing flip pass, not below it: ``_flip_region_faces`` rewrites its face buffer
+    # in place, so cloning afterwards would hand back a copy of an already-mutated input.
+    if current_vertices is vertices:
+        current_vertices, current_faces = wp.clone(vertices), wp.clone(faces)
+
     if delaunay:
         _flip_region_faces(
             current_vertices, current_faces, region_flags, max_angle_change, max_deviation, 50
         )
 
-    # Nothing in the region needed splitting, so ``current_*`` are still the caller's own buffers;
-    # see ``subdivide_to_size``'s tail for why that has to be broken here. ``new_region`` is always
-    # freshly allocated by ``astype``, so only the two mesh buffers are at stake.
-    if current_vertices is vertices:
-        current_vertices, current_faces = wp.clone(vertices), wp.clone(faces)
     new_region = tw.array.astype(region_flags, wp.bool)
     return current_vertices, current_faces, new_region
 
@@ -3363,6 +3375,10 @@ def split_edges(
     three (the quad cut along its shorter diagonal), 3 gives the regular 1-to-4 split, and 0 passes
     through unchanged.
 
+    Every return is freshly allocated and independently owned, on the path where nothing was
+    flagged and the mesh comes back unchanged as much as on the splitting one -- including
+    ``index``, which is a copy of the caller's rather than the array they passed in.
+
     Parameters
     ----------
     vertices
@@ -3466,7 +3482,12 @@ def split_edges(
     offsets, n_split = tw.array.counts_to_offsets(tw.array.astype(split_mask, wp.int32))
     if n_split == 0 or n_faces == 0:
         if return_index:
-            return wp.clone(vertices), wp.clone(faces), carried
+            # ``carried`` is still the caller's own ``index`` buffer when one was supplied, so it
+            # is copied for the same reason ``vertices`` and ``faces`` are: every return of this
+            # function is independently owned on the no-split path exactly as on the splitting one.
+            # When ``index`` was ``None`` the ``arange`` above already allocated it here.
+            owned = wp.clone(carried) if carried is index else carried
+            return wp.clone(vertices), wp.clone(faces), owned
         return wp.clone(vertices), wp.clone(faces)
 
     if split_positions is None:

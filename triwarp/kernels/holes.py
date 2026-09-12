@@ -835,7 +835,13 @@ CAME_B = wp.constant(wp.int32(1))  # reached (i, j) by advancing loop B: from (i
 def stitch_triangle_metric(
     a: wp.vec3, b: wp.vec3, c: wp.vec3, up: wp.vec3, metric_id: wp.int32
 ) -> wp.float32:
-    # Per-band-triangle term of each stitch metric.
+    # Per-band-triangle term of each stitch metric. ``a`` and ``c`` MUST be the two ends of the
+    # *new connection edge* this band triangle introduces (one vertex of each rim) and ``b`` the
+    # remaining, rim-side corner -- ``edge_length_stitch`` is documented as "summed connection-edge
+    # length" and reads exactly that pair. The other two metrics are invariant under any
+    # permutation of the three corners (``triangle_aspect_ratio`` is symmetric, and the vertical
+    # term uses only ``|cross|``, ``|dot(up, cross)|`` and the sum of squared side lengths), so
+    # this ordering rule constrains nothing but the metric that reads it.
     if metric_id == METRIC_EDGE_LENGTH_STITCH:
         return wp.length(c - a)
     if metric_id == METRIC_VERTICAL_STITCH:
@@ -956,12 +962,15 @@ def stitch_dp_diag(
     best = FLOAT32_INF_CONSTANT
     best_came = CAME_NONE
 
-    # Advance loop A: new triangle (a[i-1], b[j], a[i]).
+    # Advance loop A: new triangle (a[i-1], b[j], a[i]). Whichever rim advances, the connection
+    # edge the step introduces is (a[i], b[j]) -- the other two corners were already joined at the
+    # cell this came from -- so both branches pass it as ``stitch_triangle_metric``'s first and
+    # third arguments and the rim-side corner as the second.
     if i >= 1 and out_dp[i - 1, j] < BAD_METRIC:
         a_prev = a_pos[(i - 1) % n_a]
         a_cur = a_pos[i % n_a]
         b_cur = b_pos[j % n_b]
-        w = out_dp[i - 1, j] + stitch_triangle_metric(a_prev, b_cur, a_cur, up, metric_id)
+        w = out_dp[i - 1, j] + stitch_triangle_metric(a_cur, a_prev, b_cur, up, metric_id)
         if complex_edge:
             if out_came[i - 1, j] != CAME_NONE:
                 c_op = stitch_prev_apex(a_pos, b_pos, out_came, n_a, n_b, i - 1, j)
