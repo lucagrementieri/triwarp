@@ -179,11 +179,10 @@ def face_normal(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_ind
     Compute the unit normal of face ``face_index``; the zero vector when the face is degenerate.
 
     The by-index form of [`triangle_normal`][triwarp.kernels.predicates.triangle_normal], which is
-    how most callers want it. Note this is *not*
-    [`face_normals_and_area`][triwarp.kernels.triangles.face_normals_and_area]'s normal: that one
-    leaves the cross product unnormalized below ``TOLERANCE_ZERO_CONSTANT`` and returns the area
-    alongside, where this one goes through ``wp.normalize`` (whose ``kEps`` is 0, so a degenerate
-    face gives exactly the zero vector). Use that one when the area is wanted too.
+    how most callers want it. Identical to the normal
+    [`face_normals_and_area`][triwarp.kernels.triangles.face_normals_and_area] returns -- both
+    normalize whenever the cross product is non-zero and hand back exactly the zero vector when it
+    is not -- so reach for that one when the area is wanted too, and for this one when it is not.
     """
     v0, v1, v2 = face_vertices(vertices, faces, face_index)
     return triangle_normal(v0, v1, v2)
@@ -234,13 +233,25 @@ def face_normals_and_area(
     """
     Return the unit normal and the area of face ``face_index``, in one pass over its corners.
 
-    Leaves the cross product unnormalized below ``TOLERANCE_ZERO_CONSTANT`` rather than zeroing it,
-    which is what separates this from [`face_normal`][triwarp.kernels.triangles.face_normal]; that
-    one goes through ``wp.normalize`` and returns exactly the zero vector for a degenerate face.
+    The normal is [`face_normal`][triwarp.kernels.triangles.face_normal]'s exactly -- unit, or the
+    zero vector for an exactly degenerate face -- and this one returns the area alongside it.
+
+    **The zero test is against zero and not against a tolerance, and that is load-bearing at small
+    mesh scale.** ``|cross|`` scales as ``h^2``, so an absolute floor of
+    ``TOLERANCE_ZERO_CONSTANT`` (which this used to carry) puts *every* face of a mesh at
+    ``h <= 3e-6`` below it and hands back the raw cross product as a "unit" normal, magnitude
+    ``2 * area``. Nothing downstream reads that as an error: ``vertices.vertex_normals`` then
+    area-weights those, squaring the smallness, and ``wp.normalize`` sees a vector whose
+    ``length_sq`` has underflowed ``float32`` to exactly zero -- so every vertex normal on the mesh
+    came back zero, and with them every curvature, every smoothing normal and every sign test built
+    on one. Dividing by ``norm`` is well conditioned for *any* positive ``norm``; at ``norm == 0``
+    the cross product is already the zero vector, so the two branches agree there and the tolerance
+    was never protecting the division. Measured after this change: vertex normals stay unit down to
+    ``h = 1e-9``, where ``float32`` storage of the positions is the next limit.
     """
     normal = triangle_cross(vertices, faces, face_index)
     norm = wp.length(normal)
-    if norm > TOLERANCE_ZERO_CONSTANT:
+    if norm > wp.float32(0.0):
         normal = normal / norm
     area = 0.5 * norm
     return normal, area

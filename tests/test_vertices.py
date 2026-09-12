@@ -325,6 +325,68 @@ def test_vertex_normals_mwselr(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(vertex_normals_explicit_wp.numpy(), vertex_normals_np, rtol=1e-5, atol=1e-5)
 
 
+def test_vertex_normals_are_reproducible(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Triwarp against triwarp: the identical call, eight times, must return the identical buffer.
+
+    No reference library can carry this -- it is a claim about *this* implementation's summation
+    order, not about the quantity -- so the oracle for the values themselves is
+    ``test_vertex_normals_area``, and this only pins repeatability on top of it. A float atomic's
+    order is the scheduler's and float addition is not associative, so the ``float32`` accumulator
+    this used to carry moved by one ULP (1.19e-07) between runs on CUDA while the CPU device was
+    exact. The accumulator is ``float64`` now, which drops the disagreement between two orderings
+    below what the ``float32`` answer can represent.
+
+    Asserted as exact equality deliberately: the old behaviour fails it, a tolerance of 1e-6 would
+    not, and the whole point of the change is that there is nothing left to tolerate. The
+    downstream consumer this was found through is
+    ``test_principal_curvature_is_reproducible``.
+    """
+    _, mesh_wp = half_torus
+
+    runs = [
+        tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices).numpy().copy() for _ in range(8)
+    ]
+
+    # Non-vacuity: an all-zero or constant buffer would compare equal to itself for free.
+    assert np.allclose(np.linalg.norm(runs[0], axis=1), 1.0)
+    assert np.ptp(runs[0], axis=0).max() > 1.0
+    for other in runs[1:]:
+        assert np.array_equal(runs[0], other)
+
+
+@pytest.mark.parametrize("scale", [3e-6, 1e-9])
+def test_vertex_normals_survive_a_small_mesh_scale(
+    icosphere: tuple[tm.Trimesh, wp.Mesh], scale: float
+) -> None:
+    """
+    Class A: a normal is a direction, not a length, so shrinking the mesh must not move it.
+
+    Against ``igl.per_vertex_normals``' area mode, for the reason ``test_vertex_normals_area``
+    gives -- trimesh has no area-weighted mode -- and taken at unit scale, which is where the rest
+    of this file pins it. ``|cross|`` scales as ``h^2``, so an absolute floor on it inside
+    ``kernels.triangles.face_normals_and_area`` put every face of a mesh at ``h <= 3e-6`` below the
+    floor and returned the raw cross product where a unit normal was promised; area-weighting then
+    squared that and ``wp.normalize`` saw a ``float32`` ``length_sq`` underflowed to zero.
+    Measured before the fix: **every** vertex normal came back exactly zero at both scales here,
+    with nothing raised.
+    """
+    mesh_tm, mesh_wp = icosphere
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
+    normals_igl = igl.per_vertex_normals(
+        vertices_np,
+        np.asarray(mesh_tm.faces, dtype=np.int32),
+        igl.PER_VERTEX_NORMALS_WEIGHTING_TYPE_AREA,
+    )
+    vertices_wp = points_to_warp(vertices_np * scale, mesh_wp.device)
+
+    normals_wp = tw.vertices.vertex_normals(vertices_wp, mesh_wp.indices)
+
+    # Non-vacuity: the reference is unit everywhere, so nothing here is comparing two zeros.
+    assert np.allclose(np.linalg.norm(normals_igl, axis=1), 1.0)
+    assert np.allclose(normals_wp.numpy(), normals_igl, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("mesh_name", ["half_torus", "icosahedron"])
 @pytest.mark.parity("vertex_defects", "trimesh", "igl", "meshlib")
 def test_vertex_defects(request: pytest.FixtureRequest, mesh_name: str):

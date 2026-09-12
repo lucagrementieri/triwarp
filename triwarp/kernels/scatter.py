@@ -14,11 +14,31 @@ from triwarp.kernels.grouping import sorted_run_start
 
 
 @wp.func
-def atomic_add_vec3(out_sum: wp.array2d[wp.float32], row: wp.int32, v: wp.vec3) -> None:
+def atomic_add_vec3(out_sum: wp.array2d[wp.float64], row: wp.int32, v: wp.vec3) -> None:
     # Component-wise atomic accumulation of a wp.vec3 into row ``row`` of a (n, 3) buffer.
-    wp.atomic_add(out_sum, row, 0, v[0])
-    wp.atomic_add(out_sum, row, 1, v[1])
-    wp.atomic_add(out_sum, row, 2, v[2])
+    #
+    # **The accumulator is float64 while the values are float32, and that is what makes the sum
+    # reproducible.** A float atomic's summation order is whatever the scheduler hands it, and
+    # float addition is not associative, so a float32 accumulator's answer moves by about one ULP
+    # (measured 1.19e-07 on vertex normals) between runs of the identical launch. That is
+    # harmless in itself and is not harmless downstream: ``curvature.principal_curvature`` fits an
+    # ill-conditioned quadric to these normals and turns it into swings of up to **77 %** of the
+    # returned curvature at near-flat vertices. Widening the accumulator does not fix the ordering
+    # -- nothing here can -- but it drops the disagreement between two orderings to ~1e-16
+    # relative, far below what the float32 result can represent, so the narrowed answer is
+    # reproducible in practice (measured: bit-identical over eight runs where the float32
+    # accumulator moved every time). It is not a *guarantee*: a sum landing within 1e-16 of a
+    # float32 rounding boundary could still round both ways.
+    #
+    # Cost, measured on an RTX 5090 against a detached baseline worktree: the scatter kernel alone
+    # is 0.99-1.22x the float32 one from 82k to 1.3M faces, and ``vertices.vertex_normals`` end to
+    # end is **1.29x faster** at 10k vertices, level at 164k and **1.10x slower** at 655k -- the
+    # win being the launch the fused narrow-and-normalize tail removes (a float32 accumulator could
+    # reach ``wp.vec3`` through a zero-copy ``array_cast``, a float64 one cannot), and the loss
+    # being the wider atomics once the call stops being launch-bound. The (n, 3) buffer doubles.
+    wp.atomic_add(out_sum, row, 0, wp.float64(v[0]))
+    wp.atomic_add(out_sum, row, 1, wp.float64(v[1]))
+    wp.atomic_add(out_sum, row, 2, wp.float64(v[2]))
 
 
 @wp.kernel
@@ -82,7 +102,7 @@ def scatter_sum_scalar(
 
 @wp.kernel
 def scatter_sum_vec(
-    values: wp.array[wp.vec3], indices: wp.array2d[wp.int32], out_sum: wp.array2d[wp.float32]
+    values: wp.array[wp.vec3], indices: wp.array2d[wp.int32], out_sum: wp.array2d[wp.float64]
 ) -> None:
     tid = wp.int32(wp.tid())
     index = indices[tid]
@@ -96,7 +116,7 @@ def scatter_weighted_sum_vec(
     values: wp.array[wp.vec3],
     indices: wp.array2d[wp.int32],
     weights: wp.array2d[wp.float32],
-    out_sum: wp.array2d[wp.float32],
+    out_sum: wp.array2d[wp.float64],
 ) -> None:
     tid = wp.int32(wp.tid())
     index = indices[tid]

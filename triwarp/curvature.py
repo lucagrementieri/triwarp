@@ -93,15 +93,11 @@ def principal_curvature(
     validity mask. The two states it conflates are a failed fit and a genuinely flat vertex, which
     is why the test is worth stating: ``PD1`` is zero only where the fit did not produce a frame.
 
-    **Not reproducible run to run on a CUDA device at near-umbilic vertices.** The vertex normals
-    this builds internally are accumulated with atomics, so their summation order varies and they
-    move by about one ``float32`` ULP between runs; where the two principal curvatures already
-    agree to within that, the perturbation decides which of them is ``PV1``, and the pair is
-    returned swapped. The affected vertices are exactly the ones at which the ordering carries no
-    information -- the two values differ by less than the swap -- and the CPU device is
-    unaffected. A caller that needs a reproducible ordering should pass its own ``face_normals``
-    and ``face_areas`` and compare ``|PV1 - PV2|`` against its own tolerance before relying on
-    which is which.
+    The fit is **ill conditioned at a near-flat vertex**, and that is worth knowing before reading
+    a small curvature as a measurement: a perturbation of the vertex normals far below their own
+    precision moves the returned value there by a large *relative* amount, while barely moving it
+    anywhere the surface actually curves. Compare a small ``PV`` against the mesh's own curvature
+    scale rather than against zero.
     """
     require_same_device(
         vertices=vertices, faces=faces, face_normals=face_normals, face_areas=face_areas

@@ -496,7 +496,35 @@ def test_principal_directions_match_the_analytic_torus(
         assert alignment_np.min() > 0.99, f"{name}: worst |cos| {alignment_np.min():.4f}"
 
 
-@pytest.mark.parametrize("scale", [1e-3, 3e-4])
+def test_principal_curvature_is_reproducible(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Triwarp against triwarp: the consumer that made ``vertex_normals``' summation order visible.
+
+    The oracle for the values is ``test_principal_curvature_frame_independent``; this pins
+    repeatability. The quadric fit is ill conditioned at a near-flat vertex, so it amplified the
+    one-ULP (1.19e-07) run-to-run movement of a ``float32`` atomic accumulator into curvature
+    swings of up to **7.96e-04** absolute and **77 % relative** on this fixture -- at 19 of 544
+    vertices, and not as a swap of ``PV1`` with ``PV2`` (the *sorted* pair moved by the same
+    amount). ``vertices.vertex_normals`` accumulates in ``float64`` now, which is where the fix
+    is; ``test_vertex_normals_are_reproducible`` guards that layer directly.
+    """
+    _, mesh_wp = half_torus
+
+    runs = []
+    for _ in range(8):
+        _, _, pv1_wp, pv2_wp = tw.curvature.principal_curvature(
+            mesh_wp.points, mesh_wp.indices, radius=2
+        )
+        runs.append((pv1_wp.numpy().copy(), pv2_wp.numpy().copy()))
+
+    # Non-vacuity: a constant or all-zero field would compare equal to itself for free.
+    assert np.ptp(runs[0][0]) > 1.0
+    for pv1_np, pv2_np in runs[1:]:
+        assert np.array_equal(runs[0][0], pv1_np)
+        assert np.array_equal(runs[0][1], pv2_np)
+
+
+@pytest.mark.parametrize("scale", [1e-3, 3e-4, 1e-6, 1e-9])
 def test_principal_curvature_is_scale_equivariant(
     icosphere: tuple[tm.Trimesh, wp.Mesh], scale: float
 ) -> None:
@@ -511,6 +539,12 @@ def test_principal_curvature_is_scale_equivariant(
     ``kernels.linalg.solve_normal_equations`` rejected well-conditioned fits and the kernel's
     fallback wrote zero curvature -- 42 of 642 vertices at ``1e-3`` and all 642 at ``3e-4``,
     with nothing raised.
+
+    The two smallest scales pin a *second*, independent break that lived one layer down and is
+    fixed in ``kernels.triangles.face_normals_and_area``: an absolute floor on ``|cross|`` there
+    zeroed every vertex normal at ``h <= 3e-6``, and a zero normal is a zero frame and so a zero
+    curvature. ``test_vertex_normals_survive_a_small_mesh_scale`` is that layer's own guard; this
+    one is the consumer that found it.
     """
     mesh_tm, mesh_wp = icosphere
     vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)

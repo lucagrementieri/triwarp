@@ -149,9 +149,15 @@ def _accumulate_and_normalize(
 
     The shared body of the module's two primitives: the scatter kernel decides whether each face
     contributes its vector once or scaled by a per-corner weight, and the other three public
-    functions reach this through one of them. Accumulation is ``float32`` in an ``(n_vertices, 3)``
-    buffer, which is what the scatter kernels write; the cast to ``wp.vec3`` is a reinterpretation
-    of the same bytes.
+    functions reach this through one of them.
+
+    Accumulation is ``float64`` in an ``(n_vertices, 3)`` buffer even though both the input and the
+    answer are ``float32``, which is what makes the result reproducible run to run on a CUDA device
+    -- a float atomic's summation order is the scheduler's, and a ``float32`` accumulator turns
+    that into about one ULP of movement per run. The reasoning and the measurements are at
+    ``kernels.scatter.atomic_add_vec3``. The narrowing is a real kernel rather than the zero-copy
+    ``wp.utils.array_cast`` reinterpretation a ``float32`` accumulator allowed, and it absorbs the
+    normalization, so this costs one launch fewer than the pair it replaced.
 
     Parameters
     ----------
@@ -181,7 +187,7 @@ def _accumulate_and_normalize(
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
-    sums = wp.zeros((n_vertices, 3), dtype=wp.float32, device=device)
+    sums = wp.zeros((n_vertices, 3), dtype=wp.float64, device=device)
     wp.launch(
         scatter_kernel,
         dim=n_faces,
@@ -189,8 +195,12 @@ def _accumulate_and_normalize(
         device=device,
     )
     vec_normals = wp.empty(n_vertices, dtype=wp.vec3, device=device)
-    wp.utils.array_cast(sums, vec_normals)
-    wp.map(wp.normalize, vec_normals, out=vec_normals)
+    wp.launch(
+        kernel_vertices.normalize_accumulated_rows,
+        dim=n_vertices,
+        inputs=[sums, vec_normals],
+        device=device,
+    )
     return vec_normals
 
 
