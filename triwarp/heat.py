@@ -845,9 +845,8 @@ def extend_scalar(
     heat_system = operators[0]
 
     # The indicator and the weighted values diffuse through the same operator, so they are one
-    # batched two-column solve (``linalg.solve_spd_columns``) rather than two independent ones: at
-    # exactly two columns with a diagonal preconditioner this reaches ``linalg._BlockCg2``, which
-    # shares one Krylov subspace across both instead of running two -- see that class's Notes.
+    # batched two-column solve (``linalg.solve_spd_columns``) rather than two independent ones,
+    # which shares the launches and converges on the worse-behaved of the two columns.
     rhs = twt.as_array2d(wp.zeros((2, n_vertices), dtype=wp.float64, device=device), wp.float64)
     wp.launch(
         kernel_heat.seed_source_scalars,

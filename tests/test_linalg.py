@@ -309,30 +309,30 @@ def test_solve_spd_columns_agrees_across_column_counts(device: str, n_rhs: int) 
     )
 
 
-def test_solve_spd_columns_two_columns_reaches_block_cg(device: str) -> None:
+def test_solve_spd_columns_two_columns_uses_batched_cg(device: str) -> None:
     """
     Triwarp against triwarp: the dispatch itself, not just the answer it produces.
 
-    Exactly two columns under ``"diag"`` must build a ``linalg._BlockCg2``, not
-    ``linalg._BatchedCg`` -- the class the rest of this module's block-CG tests exercise directly.
-    A wrong gate here would still converge to the right answer (both classes solve the same
-    system) and every other test would stay green, which is why the gate needs its own assert.
+    Every multi-column solve under ``"diag"`` builds a ``linalg._BatchedCg``, the two-column case
+    included. A block conjugate gradient sharing one Krylov subspace across exactly two columns
+    was gated in here and removed again (see ``linalg._cg_columns``); a wrong gate would still
+    converge to the right answer, so it needs its own assert rather than relying on a value check.
     """
     matrix_wp, rhs_wp, _dense, _rhs = _spd_system(device, n_rhs=2)
     solution_wp = wp.zeros_like(rhs_wp)
     solver = tw.linalg.spd_column_solver(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
-    assert isinstance(solver, tw.linalg._BlockCg2)
+    assert isinstance(solver, tw.linalg._BatchedCg)
 
 
 @pytest.mark.parametrize("n", [255, 256, 257, 511, 512, 513])
-def test_block_cg_across_the_reduction_tile_boundary(device: str, n: int) -> None:
+def test_solve_spd_columns_two_columns_across_the_tile_boundary(device: str, n: int) -> None:
     """
     Class A, against ``numpy.linalg.solve``.
 
-    Same boundary ``test_solve_spd_columns_across_the_reduction_tile_boundary`` pins for
-    ``_BatchedCg``, run again at ``n_rhs=2`` so it actually reaches ``_BlockCg2`` -- that class
-    computes its own padded ``stride`` rather than sharing ``_BatchedCg``'s, so a mistake in its
-    padding arithmetic is invisible to the ``n_rhs=3`` default every other tile-boundary case uses.
+    Same boundary ``test_solve_spd_columns_across_the_reduction_tile_boundary`` pins, run again at
+    ``n_rhs=2``: the reduction's padded ``stride`` is derived from the column count as well as from
+    ``n``, so an even column count exercises a different padding than the ``n_rhs=3`` default every
+    other tile-boundary case uses.
     """
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device, n=n, n_rhs=2)
     solution_wp = wp.zeros_like(rhs_wp)
@@ -342,75 +342,60 @@ def test_block_cg_across_the_reduction_tile_boundary(device: str, n: int) -> Non
     )
 
 
-def test_block_cg_matches_independent_columns_and_needs_fewer_iterations(device: str) -> None:
+@pytest.mark.parametrize("shift", [1e-3, 1e-7])
+def test_two_column_solve_costs_no_more_iterations_than_its_worst_column(
+    device: str, shift: float
+) -> None:
     """
-    Triwarp against triwarp: ``_BlockCg2``'s shared-subspace iteration against ``_BatchedCg``'s.
+    Not a library comparison: no reference exposes a solver's iteration count.
 
-    Both must converge to the same answer -- they solve the same linear system, just through
-    different Krylov subspaces -- and ``_BlockCg2`` must do it in *at most* as many iterations,
-    which is the mechanism the class exists for (``plans/benchmark-round-11.md`` section 2's probe,
-    reproduced here as a regression guard rather than as the probe's own scipy comparison). A
-    strict improvement is asserted, not just a bound, because a change that silently fell back to
-    running the two columns independently would still pass an ``<=`` check that allowed equality.
+    The guard is against a two-column mechanism that *couples* the columns. ``_BatchedCg`` shares
+    the launches and leaves each column's Krylov subspace its own, so a two-column solve costs
+    exactly the worse of the two single-column solves and can never cost more. A block conjugate
+    gradient over a shared subspace does not have that property -- it was measured at 4 774
+    iterations against 2 230 on an ill-conditioned system while winning on a well-conditioned one,
+    which is why it is gone (``linalg._cg_columns``). The small ``shift`` arm is the
+    ill-conditioned member of the pair and is the one that would catch a reintroduction: a
+    mechanism validated on the well-conditioned arm alone is exactly the failure this pins.
     """
-    matrix_wp, rhs_wp, dense_np, rhs_np = _grid_laplacian_system(device, k=40, n_rhs=2, shift=1e-6)
-    solution_np = np.linalg.solve(dense_np, rhs_np.T).T
+    matrix_wp, rhs_wp, dense_np, rhs_np = _grid_laplacian_system(device, k=40, n_rhs=2, shift=shift)
+    kwargs = {"tol": 1e-10, "maxiter": 40_000, "check_every": 1, "preconditioner": "diag"}
 
-    block_solution = wp.zeros_like(rhs_wp)
-    block_iterations, _residual, _tol = tw.linalg._BlockCg2(
-        matrix_wp,
-        rhs_wp,
-        twt.as_array2d(block_solution, wp.float64),
-        tol=1e-10,
-        maxiter=40_000,
-        check_every=1,
+    both_solution = wp.zeros_like(rhs_wp)
+    both_iterations, _residual, _tol = tw.linalg._BatchedCg(
+        matrix_wp, rhs_wp, twt.as_array2d(both_solution, wp.float64), **kwargs
     )()
 
-    batched_solution = wp.zeros_like(rhs_wp)
-    batched_iterations, _residual, _tol = tw.linalg._BatchedCg(
-        matrix_wp,
-        rhs_wp,
-        twt.as_array2d(batched_solution, wp.float64),
-        tol=1e-10,
-        maxiter=40_000,
-        check_every=1,
-        preconditioner="diag",
-    )()
+    worst_single = 0
+    for column in range(2):
+        single_rhs = wp.array(
+            np.ascontiguousarray(rhs_np[column : column + 1]), dtype=wp.float64, device=device
+        )
+        single_solution = wp.zeros_like(single_rhs)
+        iterations, _residual, _tol = tw.linalg._BatchedCg(
+            matrix_wp,
+            twt.as_array2d(single_rhs, wp.float64),
+            twt.as_array2d(single_solution, wp.float64),
+            **kwargs,
+        )()
+        worst_single = max(worst_single, int(iterations))
 
-    assert np.allclose(block_solution.numpy(), solution_np, rtol=1e-5, atol=1e-5)
-    assert np.allclose(batched_solution.numpy(), solution_np, rtol=1e-5, atol=1e-5)
-    assert block_iterations < batched_iterations, (
-        f"block CG ({block_iterations} it) must need fewer iterations than independent columns "
-        f"({batched_iterations} it) on a shared-subspace-friendly system"
+    assert np.allclose(
+        both_solution.numpy(), np.linalg.solve(dense_np, rhs_np.T).T, rtol=1e-5, atol=1e-5
+    )
+    assert int(both_iterations) == worst_single, (
+        f"a two-column solve took {int(both_iterations)} iterations where its worst column alone "
+        f"takes {worst_single}: the columns are no longer independent"
     )
 
 
-def test_block_cg_multigrid_preconditioner_bypasses_block_cg(device: str) -> None:
+def test_two_identical_columns_do_not_diverge(device: str) -> None:
     """
-    Triwarp against triwarp: two columns under ``preconditioner="multigrid"`` must bypass block CG.
+    Not a library comparison: the degenerate two-column block is the input to pin, not a value.
 
-    ``_BlockCg2`` carries no multigrid variant (see its own Notes), so the dispatch has to keep
-    routing to ``_BatchedCg`` there regardless of the column count.
-    """
-    matrix_wp, rhs_wp, _dense, _rhs = _grid_laplacian_system(device, k=24, n_rhs=2)
-    squared_wp = wps.bsr_mm(matrix_wp, matrix_wp)
-    solution_wp = wp.zeros_like(rhs_wp)
-    solver = tw.linalg.spd_column_solver(
-        squared_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), preconditioner="multigrid"
-    )
-    assert isinstance(solver, tw.linalg._BatchedCg)
-
-
-def test_block_cg_identical_columns_does_not_diverge(device: str) -> None:
-    """
-    Not a library comparison: no reference runs a block Krylov method, so this pins the guard.
-
-    The near-rank-deficiency guard is ``kernels.algorithms.conjugate_gradient.solve_sym2x2``. Two
-    identical right-hand-side columns are the worst case block CG's mechanism can be handed --
-    the two directions are parallel from the very first iteration, not just nearly so -- and the
-    guard's job is only to keep the iteration finite, not to recover a real two-column convergence
-    rate on a degenerate block (see ``_BlockCg2``'s own Notes on that limit). The regression this
-    catches is a ``NaN`` / ``inf`` from an unguarded 2x2 solve, not a tight numerical bound.
+    Two identical right-hand-side columns are the worst case any two-column mechanism can be
+    handed. Under ``_BatchedCg`` they are simply the same solve run twice, so this must return the
+    single-column answer in both rows and nothing may go non-finite.
     """
     matrix_wp, _rhs_wp, dense_np, rhs_np = _spd_system(device, n_rhs=1)
     rhs_two_np = np.concatenate([rhs_np, rhs_np], axis=0)

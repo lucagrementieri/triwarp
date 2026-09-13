@@ -140,6 +140,33 @@ CG_MAXITER_FACTOR = 10
 # docs for the measurements and for the return-type consequence.
 CG_CHECK_EVERY = 0
 
+# Iterations issued per conditional-graph test when ``check_every == 0``. ``wp.capture_while``
+# evaluates its condition on device, which is cheap against a host readback but not free -- the
+# mechanism measures ~4-6 us per evaluation against ~1.2 us for a replayed launch -- so the body
+# it drives is a run of this many iterations rather than one. The cost of the batching is
+# overshoot: up to ``CG_ITERATIONS_PER_CHECK - 1`` iterations run past the point the residual
+# crossed, and past ``maxiter``. Both are bounded and neither is wrong -- ``cg_step_p`` and
+# ``cg_step_x_r_z`` pin a converged column's own ``beta`` / ``alpha`` to exactly zero, so a run-on
+# iteration costs launches and moves nothing -- and ``__call__`` clamps the reported count back to
+# ``maxiter`` so a caller testing the return against the cap it passed still reads what it expects.
+# Swept over 1 / 2 / 4 / 8 on an RTX 5090 / Warp 1.17, interleaved in one process, min of 9,
+# reproduced twice (ratios against K=1):
+#
+#   cell                            K=2     K=4     K=8
+#   heat_geodesic[sphere_small]     0.98    1.02    1.01
+#   heat_geodesic[sphere_med]       1.02    1.00    1.00
+#   heat_geodesic[saddle_graded]    1.02    1.01    1.01
+#   harmonic[saddle_small]          1.03    0.98    0.90
+#   harmonic[saddle]                1.03    1.04    0.96
+#   harmonic[saddle_graded]         1.07    1.11    1.11
+#
+# So the mechanism is real but small -- a geometric mean of 1.028x at K=4 against 1.027x at K=2 --
+# and it is *not* the 1.38x the same batching is worth on ``graph.bfs``'s level loop, because a CG
+# iteration is seven launches where a BFS level is four and the conditional evaluation is a
+# smaller share of it. K=4 is kept for the larger best case; K=8 is a real loss on a short solve,
+# where the overshoot is a bigger fraction and the captured body is longer.
+CG_ITERATIONS_PER_CHECK = 4
+
 # Cadence substituted for ``check_every=0`` on a device without conditional CUDA graphs, where Warp
 # cannot test the residual on device and would otherwise run every solve to ``maxiter``. Warp's own
 # default, and what this module shipped before the device-side check became the default.
@@ -498,8 +525,8 @@ def solve_spd(
         # residual tolerance" into an *absolute* floor of the same numeric value -- a right-hand
         # side whose own norm falls below ``tol`` then "converges" at the untouched initial guess
         # in zero iterations, which looks like a correct answer rather than a failure (CLAUDE.md
-        # section 12.7). ``_BatchedCg`` / ``_BlockCg2`` below already pass an explicit zero for the
-        # same reason.
+        # section 12.7). ``_BatchedCg`` below already passes an explicit zero for the same
+        # reason.
         atol=0.0,
         maxiter=iteration_cap,
         M=wpl.preconditioner(matrix, "diag") if preconditioner is None else preconditioner,
@@ -666,7 +693,7 @@ def spd_column_solver(
     maxiter: int | None = None,
     check_every: int = CG_CHECK_EVERY,
     preconditioner: str = "diag",
-) -> wpl.LinearSolverState | _BatchedCg | _BlockCg2:
+) -> wpl.LinearSolverState | _BatchedCg:
     """
     Pre-allocated batched conjugate-gradient state, for repeated solves of one operator.
 
@@ -706,10 +733,9 @@ def spd_column_solver(
     -------
     ``warp.optim.linear.LinearSolverState`` | internal batched state
         Callable solver state: a single-column solve returns Warp's own
-        ``LinearSolverState``, and a multi-column one returns this module's own ``_BatchedCg`` or
-        (at exactly two columns under ``"diag"``) ``_BlockCg2`` -- a drop-in with the identical
-        call-and-return contract, kept internal because a caller never has to name the difference
-        (see [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]'s "Whose conjugate gradient").
+        ``LinearSolverState``, and a multi-column one returns this module's own ``_BatchedCg``,
+        kept internal because a caller never has to name the difference (see
+        [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]'s "Whose conjugate gradient").
         Substituted operands must match the construction-time shape, dtype, device and batch
         layout. Each call returns what
         [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] returns, including its
@@ -791,8 +817,7 @@ def _cg_columns(
     # Validated rather than left to fall through. Every branch below tests for one name and treats
     # anything else as ``"diag"``, so without this an unrecognised string -- ``"jacobi"``,
     # ``"amg"``, a capitalised ``"Multigrid"`` -- runs a Jacobi solve silently, bit-identically to
-    # ``"diag"`` and with nothing but the clock to tell the caller. At two columns it would also
-    # skip ``_BlockCg2``, whose branch keys on the literal string.
+    # ``"diag"`` and with nothing but the clock to tell the caller.
     if preconditioner not in ("diag", "multigrid"):
         raise ValueError(
             f'{caller}: unknown preconditioner {preconditioner!r}, expected "diag", "multigrid" '
@@ -803,30 +828,28 @@ def _cg_columns(
         # ``warp.optim.linear``'s fast reduction, because there is nothing to batch. See that
         # class's Notes.
         #
-        # Exactly two columns under a plain diagonal preconditioner reach ``_BlockCg2`` instead --
-        # a real iteration-count win (``_BlockCg2``'s own Notes), gated this narrowly because that
-        # is the case it was validated on: ``preconditioner="multigrid"`` is never reached here (see
-        # ``_BlockCg2``'s "No multigrid variant"), and three or more columns (``smooth_region``'s
-        # ``x, y, z``) are handled by ``_BatchedCg`` instead.
-        if n_columns == 2 and preconditioner == "diag":
-            state = _BlockCg2(
-                matrix,
-                rhs,
-                solution,
-                tol=tol,
-                maxiter=iteration_cap,
-                check_every=_supported_check_every(check_every),
-            )
-        else:
-            state = _BatchedCg(
-                matrix,
-                rhs,
-                solution,
-                tol=tol,
-                maxiter=iteration_cap,
-                check_every=_supported_check_every(check_every),
-                preconditioner=preconditioner,
-            )
+        # A block-CG variant that shares one Krylov subspace across exactly two columns
+        # (O'Leary 1980) was built for this branch, shipped, and removed again. It does reduce the
+        # iteration count on a *uniform* mesh -- 140 against 182 and 275 against 355 on the two
+        # saddle patches -- but its iteration costs 10 launches against this one's 8, so the wall
+        # clock is a wash there (1.03x), and on every other system reached in this package it is
+        # neutral or a loss: the same operator on a graded mesh runs 4 774 iterations against 2 230
+        # (0.39x end to end), ``harmonic[hemisphere]`` 234 against 237 (0.88x), and
+        # ``heat.extend_scalar`` returns the identical count on both (1.00x), so that function's
+        # measured win belongs entirely to batching its two solves into one call. Best case +3 %
+        # against a worst case of -159 % is not a mechanism worth a gate, and the ill-conditioned
+        # half is block CG's own documented failure mode -- near-parallel search directions, which
+        # a Tikhonov floor bounds but does not deflate. Do not reintroduce it without deflation and
+        # a measurement on a graded mesh.
+        state = _BatchedCg(
+            matrix,
+            rhs,
+            solution,
+            tol=tol,
+            maxiter=iteration_cap,
+            check_every=_supported_check_every(check_every),
+            preconditioner=preconditioner,
+        )
         return state() if run else state
     operator = replicated_operator(matrix, n_columns)
     if preconditioner == "multigrid":
@@ -1017,16 +1040,15 @@ class _BatchedCg:
     change at all -- ``alpha`` and ``beta`` would then be global rather than per column, which is CG
     on the block system and a different iteration.
 
-    **A further mechanism is shipped, at ``s = 2`` only: sharing the Krylov subspace across
-    columns, not making the per-column reduction cheaper.** This class's "worst-column stopping
-    rule" batches the *launches* but runs each column's iteration mathematically independently --
-    the iteration counts are unchanged versus separate solves. A classical block conjugate gradient
-    (O'Leary 1980), sharing one block Krylov subspace over exactly two columns, reduces the
-    iteration count further on a two-column system. Built as
-    [`_BlockCg2`][triwarp.linalg._BlockCg2], reached only from ``n_columns == 2`` under a literal
-    ``preconditioner="diag"`` (``harmonic``/``tutte`` at ``k = 1``, ``arap``'s global step) -- see
-    that class's Notes for why ``smooth_region``'s ``s = 3`` (x, y, z) stays on this class
-    unchanged: it carries no ``s x s`` generalization, only ``s = 2``.
+    **Sharing the Krylov subspace across columns was tried and removed.** This class's
+    "worst-column stopping rule" batches the *launches* but runs each column's iteration
+    mathematically independently, so the iteration counts are unchanged versus separate solves. A
+    classical block conjugate gradient (O'Leary 1980) over exactly two columns does reduce them --
+    140 against 182 and 275 against 355 on the two uniform saddle patches -- but at 10 launches per
+    iteration against this class's 8 the wall clock is a wash (1.03x), and on a *graded* mesh the
+    two search directions go nearly parallel and the count goes the other way, 4 774 against 2 230
+    (0.39x end to end). See ``_cg_columns`` for the full seven-system measurement and why the
+    mechanism is not gated but gone.
     """
 
     def __init__(
@@ -1116,15 +1138,24 @@ class _BatchedCg:
         carry: bool = False,
     ) -> None:
         """Per-column dots of ``(a, b0)`` and, when ``pairs == 2``, ``(a, b1)``."""
-        tile = int(kernel_cg.CG_TILE)
         wp.launch_tiled(
             kernel_cg.cg_dot_partials,
             dim=(self._n_columns, self._blocks),
             inputs=[a, b0, b1, wp.int32(self._stride), wp.int32(pairs)],
             outputs=[self._partials],
-            block_dim=tile,
+            block_dim=int(kernel_cg.CG_TILE),
             device=self._device,
         )
+        self._dot_finalize(pairs, out_dots, carry=carry)
+
+    def _dot_finalize(self, pairs: int, out_dots: twt.Array2dFloat64, carry: bool = False) -> None:
+        """
+        Second stage of the dot: fold ``self._partials`` per (pair, column).
+
+        Split out of ``_dot`` because the *first* stage has two producers -- the standalone
+        ``cg_dot_partials`` launch, and ``cg_step_x_r_z_dot``, which emits the same partials as a
+        side effect of writing the ``r`` and ``z`` they are taken over.
+        """
         wp.launch_tiled(
             kernel_cg.cg_dot_finalize,
             # ``pairs``, not the kernel's max of 2: the ``r.z`` dot only ever asks for one row, so
@@ -1139,7 +1170,7 @@ class _BatchedCg:
                 self._dots[1],
             ],
             outputs=[out_dots, self._rz_old],
-            block_dim=tile,
+            block_dim=int(kernel_cg.CG_TILE),
             device=self._device,
         )
 
@@ -1180,13 +1211,20 @@ class _BatchedCg:
             self._atol_sq,
         ]
         if self._cycle is None:
-            wp.launch(
-                kernel_cg.cg_step_x_r_z,
-                dim=self._dofs,
+            # Six launches, not seven: the x/r/z update also emits the first stage of its own
+            # ``r.r`` / ``r.z`` reduction, so only the finalize is left to launch. A block-level
+            # partial needs nothing but its own block's data, which is what makes folding a
+            # reduction's first stage into its producer legal.
+            tile = int(kernel_cg.CG_TILE)
+            wp.launch_tiled(
+                kernel_cg.cg_step_x_r_z_dot,
+                dim=(self._n_columns, self._stride // tile),
                 inputs=[*step, self._inv_diag, self._p, self._ap],
-                outputs=[self._solution_flat, self._r, self._z],
+                outputs=[self._solution_flat, self._r, self._z, self._partials],
+                block_dim=tile,
                 device=self._device,
             )
+            self._dot_finalize(2, self._dots)
         else:
             wp.launch(
                 kernel_cg.cg_step_x_r,
@@ -1196,19 +1234,23 @@ class _BatchedCg:
                 device=self._device,
             )
             self._cycle.apply(self._r, self._z)
-        self._dot(self._r, self._r, self._z, 2, self._dots)
+            self._dot(self._r, self._r, self._z, 2, self._dots)
+        # Seven launches, not eight: the round-loop advance rides in ``cg_step_p``'s thread 0
+        # rather than in a ``dim=1`` launch behind it. See that kernel for why no barrier is
+        # needed.
         wp.launch(
             kernel_cg.cg_step_p,
             dim=self._dofs,
-            inputs=[wp.int32(self._stride), self._rz_old, self._dots, self._atol_sq, self._z],
-            outputs=[self._p],
-            device=self._device,
-        )
-        wp.launch(
-            kernel_cg.cg_advance_condition,
-            dim=1,
-            inputs=[wp.int32(self._maxiter), wp.int32(self._n_columns), self._dots, self._atol_sq],
-            outputs=[self._state],
+            inputs=[
+                wp.int32(self._stride),
+                wp.int32(self._maxiter),
+                wp.int32(self._n_columns),
+                self._rz_old,
+                self._dots,
+                self._atol_sq,
+                self._z,
+            ],
+            outputs=[self._p, self._state],
             device=self._device,
         )
 
@@ -1297,9 +1339,17 @@ class _BatchedCg:
             )
         condition = self._state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
         with wp.ScopedCapture(self._device) as capture:
-            wp.capture_while(condition, self._iteration)
+            wp.capture_while(condition, self._iteration_run)
         wp.capture_launch(capture.graph)
         return self._state[0:1], self._dots[0], self._atol_sq
+
+    def _iteration_run(self) -> None:
+        """``CG_ITERATIONS_PER_CHECK`` iterations, the body ``wp.capture_while`` drives."""
+        # Batching them amortizes the conditional-graph evaluation over several iterations; the
+        # iterations themselves are unchanged, and the ones that run past convergence are no-ops
+        # by construction. See ``CG_ITERATIONS_PER_CHECK``.
+        for _ in range(CG_ITERATIONS_PER_CHECK):
+            self._iteration()
 
     def _run_with_host_checks(self, check_every: int) -> None:
         """
@@ -1316,315 +1366,6 @@ class _BatchedCg:
                 self._iteration()
             done += block
             if bool((self._dots.numpy()[0] <= self._atol_sq.numpy()).all()):
-                return
-
-
-class _BlockCg2:
-    """
-    Classical block conjugate gradient (O'Leary 1980) over exactly two columns of one operator.
-
-    Same drop-in return contract as ``_BatchedCg`` -- ``(iterations, residual, tolerance)``, device
-    arrays under ``check_every == 0`` and host scalars otherwise -- and the same worst-column
-    stopping rule, but a different iteration: where ``_BatchedCg`` runs the two columns' Krylov
-    subspaces independently and only shares the *launches*, this class shares one block Krylov
-    subspace across both, so the scalar ``alpha`` / ``beta`` of a two-column CG step become 2x2
-    dense matrices, solved fresh every iteration by ``kernel_cg.solve_sym2x2``.
-
-    Notes
-    -----
-    ``harmonic``'s own ``k = 2`` solve routes through ``preconditioner="auto"`` and clears the
-    multigrid dominance gate, so in production that system is solved with a multigrid V-cycle, never
-    with Jacobi, and this class carries no multigrid variant (see below). The system this class
-    *does* reach is ``harmonic``'s ``k = 1`` interior system, which always takes
-    ``preconditioner="diag"`` and therefore always reaches this class, and that is the system its
-    iteration-count win is sized against.
-
-    **No multigrid variant.** ``_BatchedCg``'s ``preconditioner="multigrid"`` branch is not carried
-    over: ``M^-1`` no longer being a per-column elementwise multiply changes what "one Krylov
-    subspace" even reduces to, and the existing dominance gate already wins more on that class of
-    system than this mechanism has shown anywhere. This class is therefore reached only from
-    ``preconditioner="diag"``, never from ``"auto"`` resolving to a hierarchy -- see
-    ``_cg_columns``. Wiring the two together is future work, not this class.
-
-    **The near-rank-deficiency guard is a floor, not a fix.** ``kernel_cg.solve_sym2x2`` adds a
-    small Tikhonov term to a 2x2 Gram's diagonal before solving it, which keeps the iteration finite
-    when the block's two directions go nearly parallel but does not recover a deflated single-column
-    convergence rate the way a real deflation/restart would. No pathological input has been found in
-    this package's own solves that reaches it -- ``harmonic``/``tutte``'s ``u``, ``v`` boundary data
-    and ``arap``'s rotation-fitted right-hand side are unrelated functions by construction.
-
-    **Launch count, and why the win is smaller than the iteration ratio alone predicts.** One
-    iteration here is 10 launches (one flat matvec across both columns, a Gram-3 partial/finalize
-    pair, a 2x2 alpha solve, the fused x/r/z step, a Gram-5 partial/finalize pair, a 2x2 beta solve
-    that also carries ``rz_old`` forward, the p step, the condition check) against ``_BatchedCg``'s
-    8 for the same ``n_columns = 2`` system, so the extra launches eat into the iteration-count
-    reduction: the net end-to-end win is noticeably smaller than the iteration ratio alone would
-    suggest.
-
-    **``check_every`` is not a pure performance knob here, unlike everywhere else it appears in
-    this module.** There is no per-column analogue of ``_BatchedCg``'s convergence gate
-    (``cg_advance_x_r`` pins a converged column's own ``alpha`` to exactly ``0``):
-    ``block_cg_step_x_r_z`` always applies the full shared 2x2 ``alpha`` / ``beta`` to both
-    columns, so a column that has already crossed its own tolerance keeps absorbing the coupling
-    term from the sibling column's still-active search direction for as long as ``check_every``
-    defers the next readback. This is bounded -- the
-    near-rank-deficiency guard above keeps ``alpha`` / ``beta`` finite -- but it means a larger
-    ``check_every`` can let a nominally-converged column drift further from its answer here than the
-    same setting would on ``_BatchedCg``.
-    """
-
-    def __init__(
-        self,
-        matrix: wps.BsrMatrix[wp.float64],
-        rhs: twt.Array2dFloat,
-        solution: twt.Array2dFloat,
-        *,
-        tol: float,
-        maxiter: int,
-        check_every: int,
-    ) -> None:
-        device = matrix.device
-        self._device = device
-        self._matrix = matrix
-        n_columns, n = int(rhs.shape[0]), int(rhs.shape[1])
-        if n_columns != 2:
-            raise ValueError(f"_BlockCg2 solves exactly two columns, got {n_columns}.")
-        self._n = n
-        self._tol = float(tol)
-        self._maxiter = int(maxiter)
-        self._check_every = int(check_every)
-
-        tile = int(kernel_cg.CG_TILE)
-        self._blocks = (n + tile - 1) // tile
-        self._stride = self._blocks * tile
-        partial_pitch = ((self._blocks + tile - 1) // tile) * tile
-
-        self._rhs = rhs
-        self._solution = solution
-        self._solution_flat = solution.flatten()
-
-        dofs = 2 * self._stride
-        self._r = wp.zeros(dofs, dtype=wp.float64, device=device)
-        self._p = wp.zeros(dofs, dtype=wp.float64, device=device)
-        self._z = wp.zeros(dofs, dtype=wp.float64, device=device)
-        self._ap = wp.zeros(dofs, dtype=wp.float64, device=device)
-
-        self._gram3_partials = wp.zeros((3, partial_pitch), dtype=wp.float64, device=device)
-        self._gram5_partials = wp.zeros((5, partial_pitch), dtype=wp.float64, device=device)
-        self._gram3 = wp.zeros(3, dtype=wp.float64, device=device)
-        self._gram5 = wp.zeros(5, dtype=wp.float64, device=device)
-        self._alpha = wp.zeros(4, dtype=wp.float64, device=device)
-        self._beta = wp.zeros(4, dtype=wp.float64, device=device)
-        self._rz_old = wp.zeros(3, dtype=wp.float64, device=device)
-        self._atol_sq = wp.zeros(2, dtype=wp.float64, device=device)
-        # A view, not a copy: ``_reduce_gram5`` rewrites ``self._gram5`` whole every iteration, so
-        # this slice reflects the fresh residual norms without a separate write.
-        self._residual_sq = self._gram5[0:2]
-        self._state = wp.zeros(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
-
-        # 1 in the pad, so the fused Jacobi apply there is a no-op on an already-zero residual.
-        self._inv_diag = wp.full(self._stride, 1.0, dtype=wp.float64, device=device)
-        wp.map(kernel_array.inverse_or_one, wps.bsr_get_diag(matrix), out=self._inv_diag[: self._n])
-        # Per-column view of ``r`` only: ``_initialize`` still seeds and residual-corrects it one
-        # column at a time, unlike the per-iteration matvec, which reads the flat buffers directly
-        # through ``csr_matvec``.
-        self._r_blocks = _flat_column_views(self._r, 2, self._n, self._stride)
-
-    def _reduce_gram3(
-        self, a: wp.array[wp.float64], b: wp.array[wp.float64], out: wp.array[wp.float64]
-    ) -> None:
-        """``out[0:3] = (a0.b0, a0.b1, a1.b1)``, a symmetric 2x2 Gram's independent entries."""
-        tile = int(kernel_cg.CG_TILE)
-        wp.launch_tiled(
-            kernel_cg.block_cg_gram3_partials,
-            dim=(self._blocks,),
-            inputs=[a, b, wp.int32(self._stride)],
-            outputs=[self._gram3_partials],
-            block_dim=tile,
-            device=self._device,
-        )
-        wp.launch_tiled(
-            kernel_cg.block_cg_finalize_row,
-            dim=(3,),
-            inputs=[self._gram3_partials, wp.int32(self._blocks)],
-            outputs=[out],
-            block_dim=tile,
-            device=self._device,
-        )
-
-    def _reduce_gram5(
-        self, r: wp.array[wp.float64], z: wp.array[wp.float64], out: wp.array[wp.float64]
-    ) -> None:
-        """``out[0:5] = (r0.r0, r1.r1, r0.z0, r0.z1, r1.z1)``."""
-        tile = int(kernel_cg.CG_TILE)
-        wp.launch_tiled(
-            kernel_cg.block_cg_gram5_partials,
-            dim=(self._blocks,),
-            inputs=[r, z, wp.int32(self._stride)],
-            outputs=[self._gram5_partials],
-            block_dim=tile,
-            device=self._device,
-        )
-        wp.launch_tiled(
-            kernel_cg.block_cg_finalize_row,
-            dim=(5,),
-            inputs=[self._gram5_partials, wp.int32(self._blocks)],
-            outputs=[out],
-            block_dim=tile,
-            device=self._device,
-        )
-
-    def _iteration(self) -> None:
-        """One block-CG step: 10 launches, none of which reads back to the host."""
-        # One launch over both columns rather than two ``bsr_mv`` calls against the same operator --
-        # see ``_BatchedCg._iteration``'s identical conversion for the measurement.
-        wp.launch(
-            kernel_mg.csr_matvec,
-            dim=2 * self._n,
-            inputs=[
-                wp.int32(self._n),
-                wp.int32(self._stride),
-                wp.int32(self._stride),
-                wp.int32(0),
-                wp.float64(1.0),
-                self._matrix.offsets,
-                self._matrix.columns,
-                self._matrix.values,
-                self._p,
-            ],
-            outputs=[self._ap],
-            device=self._device,
-        )
-        self._reduce_gram3(self._p, self._ap, self._gram3)
-        wp.launch(
-            kernel_cg.block_cg_solve_alpha,
-            dim=1,
-            inputs=[self._gram3, self._rz_old],
-            outputs=[self._alpha],
-            device=self._device,
-        )
-        wp.launch(
-            kernel_cg.block_cg_step_x_r_z,
-            dim=self._stride,
-            inputs=[
-                wp.int32(self._stride),
-                wp.int32(self._n),
-                self._alpha,
-                self._inv_diag,
-                self._p,
-                self._ap,
-            ],
-            outputs=[self._solution, self._r, self._z],
-            device=self._device,
-        )
-        self._reduce_gram5(self._r, self._z, self._gram5)
-        wp.launch(
-            kernel_cg.block_cg_solve_beta,
-            dim=1,
-            inputs=[self._rz_old, self._gram5],
-            outputs=[self._beta, self._rz_old],
-            device=self._device,
-        )
-        wp.launch(
-            kernel_cg.block_cg_step_p,
-            dim=self._stride,
-            inputs=[wp.int32(self._stride), self._beta, self._z],
-            outputs=[self._p],
-            device=self._device,
-        )
-        wp.launch(
-            kernel_cg.block_cg_advance_condition,
-            dim=1,
-            inputs=[wp.int32(self._maxiter), self._residual_sq, self._atol_sq],
-            outputs=[self._state],
-            device=self._device,
-        )
-
-    def _initialize(self) -> None:
-        """Seed the residual from the caller's operands, then the tolerance, ``z`` and ``p``."""
-        for column in range(2):
-            wp.copy(self._r_blocks[column], self._rhs[column])
-        # ``||b||`` per column, via the same reduction the iteration uses for ``R^T Z`` -- called
-        # with ``z = r`` so its three Gram entries are discarded and only the two self-dots
-        # (``self._gram5[0:2]``) are read.
-        self._reduce_gram5(self._r, self._r, self._gram5)
-        wp.launch(
-            kernel_cg.block_cg_absolute_tolerance,
-            dim=2,
-            inputs=[wp.float64(self._tol * self._tol), self._gram5[0:2]],
-            outputs=[self._atol_sq],
-            device=self._device,
-        )
-        # ``r -= A x`` in place, warm-starting from whatever ``solution`` currently holds -- one
-        # launch across both columns via ``csr_matvec``'s own ``alpha``, the same conversion
-        # ``_BatchedCg._initialize`` uses. ``x_stride`` is ``n``: ``solution`` is unpadded.
-        wp.launch(
-            kernel_mg.csr_matvec,
-            dim=2 * self._n,
-            inputs=[
-                wp.int32(self._n),
-                wp.int32(self._n),
-                wp.int32(self._stride),
-                wp.int32(1),
-                wp.float64(-1.0),
-                self._matrix.offsets,
-                self._matrix.columns,
-                self._matrix.values,
-                self._solution_flat,
-            ],
-            outputs=[self._r],
-            device=self._device,
-        )
-        wp.launch(
-            kernel_cg.scaled_diagonal_apply,
-            dim=2 * self._stride,
-            inputs=[
-                wp.int32(self._stride),
-                wp.int32(self._stride),
-                self._inv_diag,
-                wp.float64(1.0),
-                self._r,
-            ],
-            outputs=[self._z],
-            device=self._device,
-        )
-        self._reduce_gram3(self._r, self._z, self._rz_old)
-        wp.copy(self._p, self._z)
-        self._state.assign([0, 1])
-
-    def __call__(self):
-        """
-        Run the solve, returning ``warp.optim.linear.cg``'s three values on its own terms.
-
-        Device arrays under ``check_every == 0``, host scalars otherwise, exactly as
-        [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] documents.
-        """
-        self._initialize()
-        check_every = self._check_every
-        if check_every == 0 and not self._device.is_cuda:
-            check_every = CG_CHECK_EVERY_FALLBACK
-        if check_every > 0:
-            self._run_with_host_checks(check_every)
-            return (
-                int(read_scalar(self._state, 0)),
-                math.sqrt(float(self._gram5.numpy()[0:2].max())),
-                math.sqrt(float(self._atol_sq.numpy().max())),
-            )
-        condition = self._state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
-        with wp.ScopedCapture(self._device) as capture:
-            wp.capture_while(condition, self._iteration)
-        wp.capture_launch(capture.graph)
-        return self._state[0:1], self._residual_sq, self._atol_sq
-
-    def _run_with_host_checks(self, check_every: int) -> None:
-        """Drive the loop from the host: issue a block of iterations, then read the residual."""
-        done = 0
-        while done < self._maxiter:
-            block = min(check_every, self._maxiter - done)
-            for _ in range(block):
-                self._iteration()
-            done += block
-            if bool((self._gram5.numpy()[0:2] <= self._atol_sq.numpy()).all()):
                 return
 
 
@@ -2354,7 +2095,7 @@ def _warn_if_not_converged(result: tuple[int, float, float], iteration_cap: int,
     That early return is also why the message says "residual norm" and not "squared residual": the
     squared form is what the *device* path carries, and this never reaches it. Every value this
     formats has already had its square root taken -- by ``warp.optim.linear.cg`` on the one-column
-    path, and by ``_BatchedCg`` / ``_BlockCg2`` on the batched ones.
+    path, and by ``_BatchedCg`` on the batched ones.
     """
     iterations, residual, atol = result
     if isinstance(iterations, wp.array):
