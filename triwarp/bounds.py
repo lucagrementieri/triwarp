@@ -26,8 +26,10 @@ import warp as wp
 
 import triwarp as tw
 from triwarp._device import read_scalar, require_same_device
+from triwarp.constants import TILE_1D
 from triwarp.kernels import bounds as kernel_bounds
 from triwarp.kernels import predicates as kernel_predicates
+from triwarp.kernels import reduce as kernel_reduce
 
 # Points reduced per thread by the per-candidate extent reduction in
 # [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box]. Long, and one value for both
@@ -136,10 +138,30 @@ def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | Non
     [`aabb_union`][triwarp.bounds.aabb_union]
     """
     require_same_device(points=points, other=other)
-    lower, upper = aabb(points)
-    if other is not None and int(other.shape[0]) > 0:
-        other_lower, other_upper = aabb(other)
-        lower, upper = aabb_union(lower, upper, other_lower, other_upper)
+    # Both clouds reduce into **one** corner buffer, so the union costs one readback rather than
+    # two boxes and an ``aabb_union``. That is not a trick of this function's:
+    # ``minmax_vec3_chunked`` accumulates with ``wp.atomic_min`` into a buffer the caller seeds,
+    # so a second launch over a
+    # second cloud continues the same reduction. Two readbacks is what this cost before, and
+    # the second of them sat behind a launch, so it drained a pipeline the first had already
+    # drained rather than riding on it.
+    device = points.device
+    corners = wp.full(6, math.inf, dtype=wp.float32, device=device)
+    for cloud in (points, other):
+        if cloud is None or int(cloud.shape[0]) == 0:
+            continue
+        wp.launch(
+            kernel_reduce.minmax_vec3_chunked,
+            dim=(int(cloud.shape[0]) + TILE_1D - 1) // TILE_1D,
+            inputs=[cloud, corners],
+            device=device,
+        )
+    # Slots 3..5 hold the *negated* upper corner; see the kernel. An all-empty input leaves the
+    # seeded ``inf`` in place, so ``upper - lower`` is ``-inf`` componentwise and the length is
+    # ``inf`` -- the documented empty-input answer, reached without a branch.
+    corners_np = corners.numpy()
+    lower = wp.vec3(*corners_np[:3])
+    upper = wp.vec3(*(-corners_np[3:]))
     return float(wp.length(upper - lower))
 
 
