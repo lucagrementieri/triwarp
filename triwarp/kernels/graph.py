@@ -73,18 +73,22 @@ def shortest_path_envelope_pass(
 @wp.kernel
 def envelope_advance_and_check(
     max_iterations: wp.int32,
+    passes: wp.int32,
     out_changed: wp.array[wp.int32],
     out_counter: wp.array[wp.int32],
     out_condition: wp.array[wp.int32],
 ) -> None:
-    # Runs once per relaxation pass, after that pass's labels have already been copied into place:
-    # advances the iteration count, decides whether ``shortest_path_envelope``'s captured
+    # Runs once per *round* of ``passes`` relaxation passes -- the loop body runs two, writing each
+    # into the other's buffer so neither has to be copied back. Advances the iteration count by
+    # that many, decides whether ``shortest_path_envelope``'s captured
     # ``wp.capture_while`` loop should run another pass, and resets ``out_changed`` for the next
-    # one to write into (it is read here as this pass's own answer, and reset in the same launch
-    # for the next -- the same in-place shape as ``bfs``'s ``out_order``). dim=1, so no thread
+    # round to write into. ``out_changed`` only ever goes 0 -> 1 in a pass, so reading it once per
+    # round is the OR over that round's passes -- which is what "did anything move" has to mean.
+    # It is read here as this round's own answer and reset in the same launch for the next -- the
+    # same in-place shape as ``bfs``'s ``out_order``. dim=1, so no thread
     # index -- this is host-side bookkeeping moved onto the device so the whole loop can run as one
     # conditional graph with no per-pass readback.
-    out_counter[0] += 1
+    out_counter[0] += passes
     out_condition[0] = wp.where(out_changed[0] != 0 and out_counter[0] < max_iterations, 1, 0)
     out_changed[0] = 0
 

@@ -1043,6 +1043,17 @@ def shortest_path_envelope(
     max_pass_count_i32 = wp.int32(max_pass_count)
 
     def envelope_pass_body() -> None:
+        # One pass, then a copy of its result back over ``labels``. **Two passes per round, written
+        # into each other's buffer, would remove the copy** -- it is a whole device pass over the
+        # node array and measured ~20 % of this call (1.26x on 2 562 nodes, 1.45x on 40 962) -- and
+        # it is **not portable**: the two devices then disagree. Measured on a 2 562-node sphere
+        # with ``max_iterations`` 1 / 3 / 7, the unrolled body relaxed 16 / 51 / 181 nodes on CUDA
+        # against 6 / 31 / 141 on the CPU device, because the recorded body did not replay as two
+        # passes per round there; even caps agreed exactly. A ``wp.capture_while`` body is not
+        # guaranteed to execute as an indivisible unit across devices, so a loop whose *result
+        # buffer* depends on the body running whole cannot rely on it. A Python-level ping-pong
+        # cannot help either: the body is recorded once and replayed, so rebinding the names would
+        # only take effect at record time.
         wp.launch(
             kernel_graph.shortest_path_envelope_pass,
             dim=node_count,
@@ -1053,7 +1064,7 @@ def shortest_path_envelope(
         wp.launch(
             kernel_graph.envelope_advance_and_check,
             dim=1,
-            inputs=[max_pass_count_i32, changed, counter, condition],
+            inputs=[max_pass_count_i32, wp.int32(1), changed, counter, condition],
             device=device,
         )
 
