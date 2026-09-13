@@ -148,6 +148,21 @@ def triangle_fill_metric(
         return circumcircle_diameter(a, b, c)
     # METRIC_PLANE_NORMALIZED (the default): penalize triangles
     # flipped or tilted > 60 degrees off the hole plane, and thin slivers.
+    #
+    # At source level the three calls below form the same three edge differences twice, take the
+    # same three dot products twice and the same cross product twice -- roughly 38 of ~90 flops in
+    # the innermost function of an ``O(B^3)`` loop. **nvcc already removes all but three of them**,
+    # which is worth knowing because the duplicates sit in *different basic blocks*
+    # (``circumcircle_diameter_sq`` and ``triangle_aspect_ratio`` each carry early returns), so
+    # their elimination needs partial-redundancy elimination rather than local CSE and there was no
+    # reason to assume it. Measured by hand-fusing this branch through
+    # ``predicates.triangle_aspect_ratio_from_sides`` / ``circumdiameter_sq_from_squared_sides``
+    # siblings and diffing the regenerated ``fill_dp_span`` forward entry's
+    # ``*.sm120.ptx``: ``sqrt.rn.f32`` 56 -> 56, ``div.rn.f32`` 57 -> 57, ``fma.rn.f32``
+    # 227 -> 227, ``mul.f32`` 445 -> 445, ``add.f32`` 47 -> 47, ``sub.f32`` 335 -> **332**. Three
+    # subtractions out of ~1 100 arithmetic instructions is not a speed change, and the fused form
+    # is a twenty-line block where this is three named calls -- so it was reverted. Do not
+    # re-propose the fusion without a PTX diff that says something different.
     face_norm = wp.cross(b - a, c - a)
     face_dbl_area_sq = wp.length_sq(face_norm)
     if face_dbl_area_sq == 0.0:
@@ -251,7 +266,8 @@ def init_dp_base(
     b = loop_sizes[ell]
     if i >= b:
         return
-    row = dp_offsets[ell] + i * b
+    base = dp_offsets[ell]
+    row = base + i * b
     for j in range(b):
         out_prev[row + j] = -1
         if j == i + 1:
@@ -329,11 +345,20 @@ class HoleFillTables:
     The hole-filling DP's invariant inputs, bundled so the per-span launches carry one argument.
 
     ``holes._fill_dp`` launches ``fill_dp_span`` once per span -- ``max_B - 2`` times for the whole
-    mesh -- and every one of these thirteen values is the same on every launch. A ``wp.launch``
+    mesh -- and every one of these fifteen values is the same on every launch. A ``wp.launch``
     argument costs ~1.0 us of host time, linearly and on both devices (measured over 2-28
     arguments: 15 us at 2, 41 us at 28), so a 16-argument kernel launched ~510 times on a
-    512-edge rim spent milliseconds marshalling constants. Only ``span`` and the two in-place DP
-    tables stay as arguments, because those are what a launch is actually about.
+    512-edge rim spent milliseconds marshalling constants. Only ``span`` stays an argument.
+
+    **``dp`` and ``prev`` are in here too, and that is a measured decision rather than a tidy
+    one.** They are the launch's in-place *output*, so leaving them as arguments reads better and
+    that is how this struct originally drew the line. But their pointers do not change across the
+    sweep either, and at ~1.0 us per argument per launch a 510-launch rim pays milliseconds for the
+    legibility -- which is the whole of what this DP's cost is, since it is launch-bound at every
+    rim size the benchmark reaches. Moving the two in measured **1.110x** on ``rim_short``
+    (10.738 -> 9.678 ms, min of 15 over five alternating process pairs) and flat within 1 % on
+    ``holes_many`` / ``holes_dense``, whose rims are short enough that the sweep is ~30 launches
+    rather than 510. ``holes._run_hole_dp`` binds them once, right where it binds everything else.
 
     Measured on an RTX 5090, the two spellings of the span loop interleaved in one process over the
     same tables (median/min): **1.56x/1.54x** at 2 loops x 512 (``rim_short``'s shape, 510
@@ -359,6 +384,8 @@ class HoleFillTables:
     rim_opp_pos: wp.array[wp.vec3]
     rim_opp_valid: wp.array[wp.int32]
     char_areas: wp.array[wp.float32]
+    dp: wp.array[wp.float32]
+    prev: wp.array[wp.int32]
     metric_id: wp.int32
     combine_id: wp.int32
     smooth_bd: wp.int32
@@ -367,8 +394,6 @@ class HoleFillTables:
 @wp.func
 def apex_cost(
     tables: HoleFillTables,
-    dp: wp.array[wp.float32],
-    prev: wp.array[wp.int32],
     o: wp.int32,
     b: wp.int32,
     base: wp.int32,
@@ -387,13 +412,29 @@ def apex_cost(
     # face's opposite vertex when ``tables.smooth_bd`` is set.
     k_pos = tables.loop_pos[o + k]
     tri = triangle_fill_metric(a_pos, k_pos, c_pos, plane_normal, char_area, tables.metric_id)
-    val = combine_metric(dp[base + i * b + k], dp[base + k * b + j], tables.combine_id)
+    # The apex loop varies ``k``, which sits in the *column* of child ``(i, k)`` and in the *row*
+    # of child ``(k, j)``, so with the lanes of ``fill_dp_span_tiled`` striding ``k`` one of the
+    # two reads runs at stride ``4 * b`` -- 2 048 bytes on a 512-vertex rim, a transaction per
+    # lane. **Mirroring the tables transposed so that both reads are contiguous was built,
+    # verified byte-identical, and measured as a net loss** (0.917x on ``rim_short``; against the
+    # same struct-resident tables this file ships, 1.095x where the unmirrored form gives 1.150x).
+    # Two reasons it cannot pay here: the DP tables are a few megabytes and sit in L2, so the
+    # "one transaction per lane" is an L2 hit rather than a DRAM fetch; and this DP is
+    # launch-bound, so the mirror's two extra per-interval stores and -- before they moved into
+    # ``HoleFillTables`` -- two extra launch arguments cost more than the coalescing saves. Do not
+    # re-propose it without a rim whose tables exceed L2.
+    left = base + i * b + k
+    right = base + k * b + j
+    val = combine_metric(tables.dp[left], tables.dp[right], tables.combine_id)
     val = combine_metric(val, tri, tables.combine_id)
 
+    # Each ``prev`` entry is bound once: a global load repeated across a branch is not something
+    # the compiler is obliged to common up.
     if k > i + 1:
-        if prev[base + i * b + k] >= 0:
+        left_prev = tables.prev[left]
+        if left_prev >= 0:
             e = fill_edge_term(
-                a_pos, k_pos, tables.loop_pos[o + prev[base + i * b + k]], c_pos, tables.metric_id
+                a_pos, k_pos, tables.loop_pos[o + left_prev], c_pos, tables.metric_id
             )
             val = combine_metric(val, e, tables.combine_id)
     elif tables.smooth_bd != 0 and tables.rim_opp_valid[o + i] != 0:
@@ -401,9 +442,10 @@ def apex_cost(
         val = combine_metric(val, e, tables.combine_id)
 
     if j > k + 1:
-        if prev[base + k * b + j] >= 0:
+        right_prev = tables.prev[right]
+        if right_prev >= 0:
             e = fill_edge_term(
-                k_pos, c_pos, tables.loop_pos[o + prev[base + k * b + j]], a_pos, tables.metric_id
+                k_pos, c_pos, tables.loop_pos[o + right_prev], a_pos, tables.metric_id
             )
             val = combine_metric(val, e, tables.combine_id)
     elif tables.smooth_bd != 0 and tables.rim_opp_valid[o + k] != 0:
@@ -419,9 +461,7 @@ def apex_cost(
 
 
 @wp.kernel(enable_backward=False)
-def fill_dp_span(
-    tables: HoleFillTables, span: wp.int32, dp: wp.array[wp.float32], prev: wp.array[wp.int32]
-) -> None:
+def fill_dp_span(tables: HoleFillTables, span: wp.int32) -> None:
     # One thread per span-``span`` interval (i, j = i + span) of every loop at once; reads only
     # strictly smaller spans, so successive launches (span = 2, 3, ...) are the DP barriers.
     #
@@ -458,8 +498,8 @@ def fill_dp_span(
         # BAD_METRIC total happened to be smaller and emit its own triangle anyway — reusing the
         # very chord that made the child infeasible. Only genuine infinity propagates through
         # ``combine_metric``'s sum/max without being mistaken for "bad but legal".
-        dp[base + i * b + j] = FLOAT32_INF_CONSTANT
-        prev[base + i * b + j] = -1
+        tables.dp[base + i * b + j] = FLOAT32_INF_CONSTANT
+        tables.prev[base + i * b + j] = -1
         return
     o = tables.loop_starts[ell]
     plane_normal = tables.plane_normals[ell]
@@ -470,24 +510,19 @@ def fill_dp_span(
     best_val = FLOAT32_INF_CONSTANT
     best_k = wp.int32(-1)
     for k in range(i + 1, j):
-        val = apex_cost(
-            tables, dp, prev, o, b, base, i, j, k, is_top, a_pos, c_pos, plane_normal, char_area
-        )
+        val = apex_cost(tables, o, b, base, i, j, k, is_top, a_pos, c_pos, plane_normal, char_area)
         update_argmin(best_val, best_k, val, k)
-    dp[base + i * b + j] = best_val
+    tables.dp[base + i * b + j] = best_val
     # Every apex left available required at least one forbidden sub-chord (a genuinely infinite
     # child cost propagates here through the sum/max in ``apex_cost``, never a finite BAD_METRIC),
     # so there is no legal triangulation of this span at all — not merely a bad-looking one.
     if best_val >= FLOAT32_INF_CONSTANT:
-        prev[base + i * b + j] = wp.int32(-1)
-    else:
-        prev[base + i * b + j] = best_k
+        best_k = wp.int32(-1)
+    tables.prev[base + i * b + j] = best_k
 
 
 @wp.kernel(enable_backward=False)
-def fill_dp_span_tiled(
-    tables: HoleFillTables, span: wp.int32, dp: wp.array[wp.float32], prev: wp.array[wp.int32]
-) -> None:
+def fill_dp_span_tiled(tables: HoleFillTables, span: wp.int32) -> None:
     # One *block* per span-``span`` interval, its lanes striding the apex loop. Same DP, same launch
     # count, ``block_dim`` times the parallelism: the serial kernel above puts at most
     # ``n_loops * (max_B - span)`` threads on the machine, which for a single long boundary is a few
@@ -532,8 +567,8 @@ def fill_dp_span_tiled(
     if tables.forbidden[base + i * b + j] != 0:
         # True infinity, not ``BAD_METRIC`` — see the identical branch in ``fill_dp_span``.
         if t == 0:
-            dp[base + i * b + j] = FLOAT32_INF_CONSTANT
-            prev[base + i * b + j] = -1
+            tables.dp[base + i * b + j] = FLOAT32_INF_CONSTANT
+            tables.prev[base + i * b + j] = -1
         return
     o = tables.loop_starts[ell]
     plane_normal = tables.plane_normals[ell]
@@ -544,18 +579,15 @@ def fill_dp_span_tiled(
     best_val = FLOAT32_INF_CONSTANT
     best_k = wp.int32(-1)
     for k in range(i + 1 + t, j, wp.block_dim()):
-        val = apex_cost(
-            tables, dp, prev, o, b, base, i, j, k, is_top, a_pos, c_pos, plane_normal, char_area
-        )
+        val = apex_cost(tables, o, b, base, i, j, k, is_top, a_pos, c_pos, plane_normal, char_area)
         update_argmin(best_val, best_k, val, k)
     block_val, block_k = tile_argmin(best_val, best_k)
     if t == 0:
-        dp[base + i * b + j] = block_val
+        tables.dp[base + i * b + j] = block_val
         # Every remaining apex required a forbidden sub-chord — see ``fill_dp_span``.
         if block_val >= FLOAT32_INF_CONSTANT:
-            prev[base + i * b + j] = wp.int32(-1)
-        else:
-            prev[base + i * b + j] = block_k
+            block_k = wp.int32(-1)
+        tables.prev[base + i * b + j] = block_k
 
 
 @wp.kernel

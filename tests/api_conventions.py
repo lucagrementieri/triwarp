@@ -417,8 +417,13 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # holds, so it is both the input and the result and ``out_`` would read as write-only.
     ("boundary", "sort_boundary_neighbor_slots"): frozenset({"neighbors"}),
     ("combine", "offset_packed_faces"): frozenset({"faces"}),
-    ("holes", "fill_dp_span"): frozenset({"dp", "prev"}),
-    ("holes", "fill_dp_span_tiled"): frozenset({"dp", "prev"}),
+    # ``holes``' two DP tables are in place, and they ride inside ``HoleFillTables`` rather than in
+    # the signature because their pointers are invariant across the whole span sweep and a launch
+    # argument is not free (see that struct's docstring). So the bundle itself is the written
+    # argument here, and ``out_tables`` would misread as write-only -- it is overwhelmingly
+    # read-only inputs.
+    ("holes", "fill_dp_span"): frozenset({"tables"}),
+    ("holes", "fill_dp_span_tiled"): frozenset({"tables"}),
     ("polyline", "orient_ccw"): frozenset({"points2d"}),
     # ``quadric_decimate``'s provenance column, folded one pass at a time: the array is the previous
     # pass's answer *and* this pass's, so it is in place and ``out_`` would read as write-only.

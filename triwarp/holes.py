@@ -763,6 +763,10 @@ def _run_hole_dp(
     one block per span by the whole device; beating both needs a grid-wide barrier, which Warp
     does not expose.
 
+    ``dp`` / ``prev`` are filled in place. They are bound into ``HoleFillTables`` rather than
+    passed per launch, because their pointers are invariant across the sweep and this DP is
+    launch-bound -- see that struct's docstring for the measurement.
+
     ``tiled`` selects the per-span engine: a block per interval with its lanes striding the apex
     loop, or one thread per interval. Both produce byte-identical ``dp`` / ``prev`` on **both**
     devices, so this is a pure cost knob and ``None`` picks whichever is faster on the device at
@@ -802,11 +806,16 @@ def _run_hole_dp(
     tables.rim_opp_pos = rim_opp_pos
     tables.rim_opp_valid = rim_opp_valid
     tables.char_areas = char_areas
+    # The two in-place DP tables live in the bundle too: their pointers are invariant across the
+    # whole span sweep, and at ~1.0 us per launch argument a 510-launch rim pays milliseconds to
+    # keep them in the signature. See ``HoleFillTables``.
+    tables.dp = dp
+    tables.prev = prev
     tables.metric_id = wp.int32(metric_id)
     tables.combine_id = wp.int32(combine_id)
     tables.smooth_bd = wp.int32(1 if smooth_boundary else 0)
     for span in range(2, loops.max_size):
-        inputs = [tables, wp.int32(span), dp, prev]
+        inputs = [tables, wp.int32(span)]
         dim = (loops.n_loops, loops.max_size - span)
         if tiled:
             wp.launch_tiled(
