@@ -1768,6 +1768,7 @@ def intrinsic_delaunay_candidates(
     out_quad: wp.array2d[wp.int32],
     out_new_length: wp.array[wp.float32],
     out_neighbors: wp.array2d[wp.int32],
+    out_face_claim: wp.array[wp.int32],
 ) -> None:
     # Mark the interior edges that violate the local Delaunay condition, and measure what the
     # flipped edge would be -- both from edge lengths only, which is what makes the retriangulation
@@ -1783,6 +1784,13 @@ def intrinsic_delaunay_candidates(
     h = wp.int32(wp.tid())
     out_flip[h] = False
     out_new_length[h] = 0.0
+    # ``out_face_claim`` is the *next* launch's lock table, reset here rather than by a ``fill_``
+    # of its own: it is one third the length of this grid (one entry per face, and this kernel runs
+    # per halfedge), nothing below reads it, and the kernel that does read it is the next launch --
+    # so this is a whole device pass and a host call removed per iteration for one store in a third
+    # of the threads of a kernel that is already resident.
+    if h < out_face_claim.shape[0]:
+        out_face_claim[h] = INT32_MAX_CONSTANT
     h1 = twin[h]
     if h1 < 0 or h1 <= h:
         return  # boundary, or the mirror of a lower-indexed canonical candidate
@@ -1854,7 +1862,12 @@ def intrinsic_delaunay_candidates(
 
 @wp.kernel
 def claim_intrinsic_flips(
-    flip: wp.array[wp.bool], twin: wp.array[wp.int32], out_face_claim: wp.array[wp.int32]
+    flip: wp.array[wp.bool],
+    twin: wp.array[wp.int32],
+    out_face_claim: wp.array[wp.int32],
+    out_remap: wp.array[wp.int32],
+    out_no_remap: wp.array[wp.bool],
+    out_count: wp.array[wp.int32],
 ) -> None:
     # Only a flip's own two faces are claimed -- unlike the vertex-pair-keyed flip loops' shared
     # ``claim_flips``, there is no new-edge hash to also claim, because two flips creating an edge
@@ -1862,6 +1875,15 @@ def claim_intrinsic_flips(
     # ``intrinsic_delaunay_candidates``). The *other* four faces a commit touches (each one's twin
     # pointer, not its connectivity) are handled without a lock, by ``fixup_twin_remap`` below.
     h = wp.int32(wp.tid())
+    # The three buffers ``commit_intrinsic_flips`` expects cleared are cleared here, before the
+    # early return, for the reason ``intrinsic_delaunay_candidates`` clears the claim table: they
+    # are exactly this grid's length (``out_count`` aside), nothing in this kernel reads them, and
+    # the kernel that does is the next launch. Three device memsets and three host calls per
+    # iteration, for one store each in a kernel that is already resident.
+    out_remap[h] = INT32_MAX_CONSTANT
+    out_no_remap[h] = False
+    if h == 0:
+        out_count[0] = 0
     if not flip[h]:
         return
     f0 = h // 3

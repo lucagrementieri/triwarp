@@ -265,10 +265,17 @@ def select_independent_degree3(
     ring_halfedges: wp.array[wp.int32],
     candidate: wp.array[wp.bool],
     out_selected: wp.array[wp.bool],
+    out_count: wp.array[wp.int32],
 ) -> None:
     # Two adjacent candidates share faces, so only one of them can be removed in a pass. The lowest
     # index wins, which makes the choice deterministic and independent of launch order -- the same
     # rule the Delaunay flip pass uses to resolve competing edges.
+    #
+    # ``out_count`` is the size of the selection, which the caller needs to size the replacement
+    # face buffer and to decide whether the pass did anything. Counting it here is one *conditional*
+    # atomic per selected vertex -- contention scales with the (rare) selections, not with the
+    # launch -- against the whole-array cast, reduction and readback the caller would otherwise run
+    # to recover a number this kernel already knows.
     v = wp.int32(wp.tid())
     if not candidate[v]:
         return
@@ -277,6 +284,7 @@ def select_independent_degree3(
         if candidate[neighbour] and neighbour < v:
             return
     out_selected[v] = True
+    wp.atomic_add(out_count, 0, 1)
 
 
 @wp.kernel

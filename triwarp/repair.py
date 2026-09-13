@@ -1272,15 +1272,24 @@ def remove_degree3_vertices(
         raise ValueError(f"max_iter must be non-negative, got {max_iter}")
     device = faces.device
     removed = 0
+    # Scratch hoisted to the pass-0 size and sliced, rather than reallocated per pass: the vertex
+    # count is constant across the loop (compaction is deferred to the end, below) and the face
+    # count only ever shrinks, so one allocation each serves every pass. ``counters`` holds the
+    # selection size in slot 0 and the emit cursor in slot 1; both are zeroed per pass.
+    n_vertices = int(vertices.shape[0])
+    n_faces0 = int(faces.shape[0]) // 3
+    candidate = wp.empty(n_vertices, dtype=wp.bool, device=device)
+    selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    counters = wp.zeros(2, dtype=wp.int32, device=device)
+    dropped_scratch = wp.zeros(n_faces0, dtype=wp.bool, device=device)
+    keep_scratch = wp.empty(n_faces0, dtype=wp.bool, device=device)
     for _ in range(max_iter):
         n_faces = int(faces.shape[0]) // 3
         if n_faces == 0:
             break
-        n_vertices = int(vertices.shape[0])
         ring_halfedges, ring_offsets, is_boundary = tw.halfedge.vertex_one_rings(
             faces, n_vertices=n_vertices
         )
-        candidate = wp.empty(n_vertices, dtype=wp.bool, device=device)
         wp.map(
             kernel_repair.is_interior_degree3,
             ring_offsets[:-1],
@@ -1288,21 +1297,26 @@ def remove_degree3_vertices(
             is_boundary,
             out=candidate,
         )
-        selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+        selected.zero_()
+        counters.zero_()
         wp.launch(
             kernel_repair.select_independent_degree3,
             dim=n_vertices,
-            inputs=[faces, ring_offsets, ring_halfedges, candidate, selected],
+            inputs=[faces, ring_offsets, ring_halfedges, candidate, selected, counters[:1]],
             device=device,
         )
         # One readback per pass, and it is the loop's own termination test: the pass count is what
-        # bounds it, and there is no device-side way to stop a Python loop.
-        n_selected = int(tw.reduce.sum(tw.array.astype(selected, wp.int32)))
+        # bounds it, and there is no device-side way to stop a Python loop. The count comes
+        # straight off ``select_independent_degree3``'s own atomic rather than from a whole-array
+        # cast plus a reduction over ``selected`` -- the kernel that built the selection already
+        # knew its size.
+        n_selected = int(read_scalar(counters, 0))
         if n_selected == 0:
             break
 
-        cursor = wp.zeros(1, dtype=wp.int32, device=device)
-        dropped = wp.zeros(n_faces, dtype=wp.bool, device=device)
+        cursor = counters[1:]
+        dropped = dropped_scratch[:n_faces]
+        dropped.zero_()
         new_faces = twt.empty_2d((n_selected, 3), wp.int32, device=device)
         wp.launch(
             kernel_repair.emit_degree3_replacement,
@@ -1310,7 +1324,7 @@ def remove_degree3_vertices(
             inputs=[faces, ring_offsets, ring_halfedges, selected, cursor, dropped, new_faces],
             device=device,
         )
-        keep = wp.empty(n_faces, dtype=wp.bool, device=device)
+        keep = keep_scratch[:n_faces]
         wp.map(kernel_array.mask_not, dropped, out=keep)
         kept = tw.array.gather(faces.reshape((n_faces, 3)), tw.array.flatnonzero(keep))
         faces = tw.array.concatenate([kept.reshape(-1), new_faces.reshape(3 * n_selected)])
@@ -1431,19 +1445,33 @@ def flatten_degree3_vertices(
         wp.map(kernel_array.mask_and, candidate, region, out=candidate)
 
     positions = vertices
+    # Scratch hoisted out of the loop: the connectivity and the vertex count are both invariant
+    # here, so a pass reuses these rather than allocating. The two position buffers alternate so
+    # the caller's own ``vertices`` is never written -- pass 0 reads it and writes ``buffers[0]``,
+    # pass 1 reads that and writes ``buffers[1]``, and so on.
+    selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    # ``select_independent_degree3`` counts its selection for ``remove_degree3_vertices``; this
+    # caller does not need the number, so the slot is write-only scratch and is never read.
+    selected_count = wp.zeros(1, dtype=wp.int32, device=device)
+    # Allocated on first use, not upfront: the common mesh has no two candidates adjacent, so the
+    # loop runs a single pass and only ever needs one of the two.
+    buffers: dict[int, wp.array[wp.vec3]] = {}
     for iteration in range(max_iter):
         # Adjacent candidates have to be separated before anything moves -- see the kernel comment
         # for what flattening both ends of an edge at once does to a tetrahedron. The lowest
         # remaining index always wins its own conflict, so every pass retires at least one
         # candidate and the loop cannot spin.
-        selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+        selected.zero_()
         wp.launch(
             kernel_repair.select_independent_degree3,
             dim=n_vertices,
-            inputs=[faces, ring_offsets, ring_halfedges, candidate, selected],
+            inputs=[faces, ring_offsets, ring_halfedges, candidate, selected, selected_count],
             device=device,
         )
-        flattened = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+        slot = iteration % 2
+        if slot not in buffers:
+            buffers[slot] = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+        flattened = buffers[slot]
         wp.launch(
             kernel_repair.flatten_degree3_positions,
             dim=n_vertices,
@@ -1461,10 +1489,13 @@ def flatten_degree3_vertices(
         # pays none. The connectivity never changes here, so nothing above the loop is rebuilt.
         #
         # Read back and reduced on the host rather than through ``reduce``: a bool mask is one byte
-        # per vertex, so the copy is cheaper than the launches and the scratch allocation a device
-        # reduction costs -- which is the case CLAUDE.md section 14.5 measured and declined
-        # converting. Measured on the whole call, 10 242 vertices, RTX 5090: 0.686-0.696 ms this
-        # way against 0.751-0.755 through ``reduce.sum(astype(...))``, on a 0.524-0.531 ms base.
+        # per vertex, so the copy is cheaper than the launch a device reduction costs -- which is
+        # the case CLAUDE.md section 14.5 measured and declined converting. Measured on the whole
+        # call, 10 242 vertices, RTX 5090: 0.686-0.696 ms this way against 0.751-0.755 through
+        # ``reduce.sum(astype(...))``, on a 0.524-0.531 ms base. Re-checked after ``reduce`` stopped
+        # widening a mask to ``int32``, which is worth 1.6-1.9x on the reduction itself: the
+        # readback/reduction crossover moved from ~1 M elements to ~0.5 M, and this call is over the
+        # *vertex* count, so it stays on the readback at every registry mesh.
         if not bool(candidate.numpy().any()):
             break
     return positions
@@ -1925,8 +1956,14 @@ def fix_self_intersections(
         bad_mask = tw.validation.face_self_intersecting_mask(current_vertices, current_faces)
         # Two readbacks per pass, and each decides the loop. Deliberately *not* ``tw.reduce.any`` /
         # ``tw.reduce.all``: a device reduction has a roughly fixed cost, while copying a ``bool``
-        # array of length ``n_faces`` is cheaper below roughly a million faces, which covers
-        # ordinary mesh sizes. Revisit if that stops being true for the meshes this runs on.
+        # array is one byte per element, so below the crossover the copy wins. **That crossover
+        # moved** when ``reduce`` stopped widening a mask to ``int32`` before reducing it: measured
+        # on an RTX 5090 / Warp 1.17, ``reduce.any`` against a readback is 1.54x slower at 163 842
+        # elements, 1.15x at 350 000, level at ~524 288, and **1.35x faster at 1 000 000** -- where
+        # before that change it was still 1.18x slower there. So the boundary is ~0.5 M rather than
+        # the ~1 M this used to say. Every mesh this runs on is well under it (the self-intersecting
+        # fixtures are 8 k-164 k faces, ``bunny`` 69 k), so the readback stays; revisit at a mesh
+        # past half a million faces.
         if not bool(bad_mask.numpy().any()):
             break
         region = _dilate_face_mask(

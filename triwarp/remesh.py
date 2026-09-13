@@ -2338,24 +2338,25 @@ def intrinsic_delaunay(
 
     total = 0
     for _ in range(max_iter):
+        # The four per-iteration resets this loop used to issue as `fill_` / `zero_` calls ride in
+        # the two kernels above the launches that read them instead -- ``face_claim`` in the
+        # candidate pass, ``remap`` / ``no_remap`` / ``count`` in the claim pass. Each is a whole
+        # device pass over a buffer that scales with the mesh, sitting immediately next to a launch
+        # at exactly the right ``dim``; see those kernels for why no barrier is needed.
         wp.launch(
             kernel_remesh.intrinsic_delaunay_candidates,
             dim=n_half,
-            inputs=[intrinsic_faces, lengths, twin, flip, quad, new_length, neighbors],
+            inputs=[intrinsic_faces, lengths, twin, flip, quad, new_length, neighbors, face_claim],
             device=device,
         )
         # Independent-set selection over just the flipping pair -- ``claim_intrinsic_flips``'s own
         # docstring says why that is enough here, unlike the vertex-pair-keyed flip loops.
-        face_claim.fill_(INT32_MAX)
         wp.launch(
             kernel_remesh.claim_intrinsic_flips,
             dim=n_half,
-            inputs=[flip, twin, face_claim],
+            inputs=[flip, twin, face_claim, remap, no_remap, count],
             device=device,
         )
-        count.zero_()
-        remap.fill_(INT32_MAX)
-        no_remap.zero_()
         wp.launch(
             kernel_remesh.commit_intrinsic_flips,
             dim=n_half,
