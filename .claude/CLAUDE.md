@@ -910,6 +910,52 @@ faster and bit-identical** (6.77 → 0.205 ms; 112x at `(1024, 1024)`), because 
 followed by the same `float32` store rounds the same way the host build did. Decide by whether the
 elements depend on each other, not by which module the function lives in.
 
+**The census has been taken, and it is the reason not to re-open this.** An AST scan of
+`triwarp/` (excluding `kernels/`, which has none) finds **488 host-side sites**: 329 NumPy calls,
+67 `.numpy()` readbacks, 55 `math.*` and 32 `.tolist()` / `.item()`. Bucketed: 126 metadata and
+marshalling, 81 fixed-size 3x3/4x4/scalar math, 67 readbacks, 55 scalar math, 36 host-sequential,
+32 host converts, 15 module-scope constant tables evaluated once at import, and ~76 lattice and
+template index arithmetic. **Only the last bucket contained anything convertible** (§16.4's
+`parametric_surface`), and the rest are settled by one measurement rather than site by site:
+
+| host op | µs | | device floor | µs |
+|---|---|---|---|---|
+| `np.eye(4)` | 0.76 | | `wp.empty(1)` | 6.1 |
+| 4x4 matmul | 0.72 | | **one `wp.launch(dim=1)`** | **21.5** |
+| 3x3 determinant | 1.65 | | **one host readback** | **21.2** |
+| 3x3 SVD | 6.14 | | | |
+
+A minimum device round trip is ~43 µs against 0.7-6 µs of host arithmetic: a **26-60x loss**, and
+structural rather than an implementation detail. That disposes of 262 of the 488 sites (54 %) at a
+stroke, and the module-scope tables cost nothing per call.
+
+**The crossover, per operation class** (RTX 5090, Warp 1.17, result staying *on the device*; ratio
+numpy/device, >1 = the device wins). Use it to price a conversion before writing one:
+
+| operation | 1e3 | 1e4 | 1e5 | 1e6 | crossover |
+|---|---|---|---|---|---|
+| `cumsum` / scan | 0.38x | **2.6x** | 26x | 251x | ~5 k |
+| `unique` | 0.18x | **2.8x** | 36x | 542x | ~5 k |
+| gather | 0.08x | 0.67x | **6.3x** | 58x | ~30 k |
+| sort | 0.03x | 0.27x | **3.0x** | 31x | ~50 k |
+| sum -> scalar | 0.07x | 0.16x | 0.96x | **10.3x** | ~100 k |
+| elementwise | 0.02x | 0.09x | 0.48x | **14.5x** | ~200 k |
+| flatnonzero | 0.01x | 0.06x | 0.45x | **4.9x** | ~200 k |
+| min/max -> scalars | 0.02x | 0.03x | 0.12x | **2.9x** | ~500 k |
+
+And the *readback* question separately — mask already on the device, caller needs a host bool:
+`mask.numpy().any()` against `reduce.any` measures 0.71x at 100 k, **1.00x at 500 k**, 3.46x at
+1 M, 32x at 16 M, which reproduces §12.4's ~0.5 M crossover exactly. `np.any` short-circuits, so
+its cost depends on the data and not only on `n` — an all-False mask is the worst case and the one
+a convergence loop actually hits; timing a half-True mask makes numpy look 100x better than it is.
+
+**Measured NumPy share of real public calls**, at 320 / 5 120 / 81 920 faces: nine of eleven probed
+sit at **0.6-6 %** with the share flat or falling, which §9 calls a decline. The two above 10 % were
+`creation.uv_sphere` / `capsule` (35-67 %, which is `_revolve_kept_template`, the filter that
+licenses the closed-form fast path — 33-42 µs for profiles up to 64 points against a ~43 µs device
+floor, so a wash below ~256 profile points and declined) and `bounds.oriented_bounding_box`
+(13-18 %, where the NumPy was **not** the cost — §16.4).
+
 Three things are still defects:
 
 - **A public signature or return that names `np.ndarray`**, which forces the dependency on the
@@ -4975,6 +5021,59 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   written decline of the opposite shape and is right — there the buffers are cell-sized while the
   launch is over a shrinking alive count, so there is no same-`dim` launch to fold into.
 
+- **SHIPPED — `creation.parametric_surface`'s lattice runs on the device above 9 216 samples:
+  61x at the benchmark's top resolution, and a *size dispatch* because the device loses below it.**
+  A host-side NumPy audit priced every public call's NumPy share (0.6-6 % for nine of eleven probed,
+  flat or falling — §9 declines) and this was the outlier: **29-42 % and not falling**, 10.5 ms of a
+  24.8 ms call at 512². `_parametric_lattice` is `meshgrid` + ~10 `np.where` passes + `np.unique` +
+  a face assembly over an `n_u * n_v` lattice — a closed-form parallel map with no sequential
+  dependence, which is the exception §3.8 already names and which `grid` and `icosphere` were
+  converted under.
+  - **Measured against a detached baseline worktree** (§15.6), `boy` / `dini` / `klein` / `mobius`
+    at the benchmark's own 40 / 160 / 640: **1.05-1.22x / 2.12-2.34x / 50-61x**. At 640 that is
+    42.7 → 0.70 ms.
+  - **The device path has a flat ~0.66 ms floor and is a 2.4x LOSS below it** — 0.42x at 32², 0.65x
+    at 64², 1.01x at 96², 1.55x at 128². The floor is `unique_1d`'s readback plus `flatnonzero`'s
+    plus eight launches; the host path is quadratic in the resolution. So the shipped form is
+    `_PARAMETRIC_LATTICE_DEVICE_FROM = 9216` with **both** implementations kept, the same shape as
+    §14.7's `_DOWNSAMPLE_DOUBLING_FROM`. **Every resolution the suite and the fixtures use is below
+    the gate**, so the device path is unreachable in an ordinary test run — which is why
+    `test_parametric_lattice_paths_agree` monkeypatches the threshold both ways and compares
+    bit-for-bit, over six surfaces chosen to straddle the gluing rules.
+  - **Gate: 83 device-path cases byte-identical to the baseline** (16 surfaces x 5 resolution pairs,
+    plus `super_ellipsoid` / `super_toroid` / `random_hills`), and 115 host-path cases likewise.
+  - **The one subtle part is the pole anchor, and it is statically derivable — but prove it, do not
+    reason it.** The host form collapses a pole row to `(i_canonical[on_row][0],
+    j_canonical[on_row][0])`, the first surviving sample in C order, which reads as data-dependent.
+    A probe over all 16 specs x 5 resolution pairs shows it is always `(0, 0)` for a `j == 0` or
+    `i == 0` pole, `(0, n_v - 1)` for `j == n_v - 1` and `(n_u - 1, 0)` for `i == n_u - 1`, so the
+    kernel needs no anchor arguments at all. Two orderings in the same function are equally easy to
+    get wrong and are called out at the kernel: the u-seam re-canonicalisation after a v-twist is
+    **unmasked**, and all four pole masks are snapshots of the post-wrap state taken *before* any
+    collapse.
+  - `super_ellipsoid`, `super_toroid` and `random_hills` share the lattice and move with it.
+
+- **SHIPPED — `bounds.oriented_bounding_box`'s refinement selects its chains on the device:
+  1.14-1.51x.** The trust-region loop scored its candidates on the device and then read the whole
+  extent table back **every round** to take a per-chain argmin in numpy and refresh an improved
+  chain with a 36-byte `wp.copy`. Counted at the default `refine_iterations=8`: 18 launches, **38
+  copies, 10 readbacks**, of which 4.5 copies and 1 readback per round were that host loop.
+  `kernels/bounds.oriented_box_select_chains` does the argmin and the update in place, one thread
+  per chain, and the refinement reads back once at the end.
+  - Measured interleaved against a detached baseline, clouds of 2 k to 2 M points: **1.51 / 1.46 /
+    1.32 / 1.14x** at the default, and 1.15-1.58x for the `surface_area` and `diagonal` objectives.
+    The win falls as the cloud grows because the extents kernel comes to dominate, but the
+    *absolute* saving is a flat ~0.55-0.72 ms at every size.
+  - **`refine_iterations=0` is the control and reads 0.98-1.00x at every size** — that path was not
+    touched, which is what makes the rest of the column trustworthy.
+  - The objective moved into the kernel as a warp-uniform int selector (§2.7), so one kernel serves
+    all three. `chains` and `chain_state` are in-place loop state and are allowlisted for check 13
+    rather than given an `out_` prefix (§2.1).
+  - **The NumPy in this function was never the cost, which is the general lesson.** It profiled at
+    13-18 % — the highest in the tree after `parametric_surface` — but that NumPy is over
+    `rotations`-sized candidate tables and is microseconds; the 35 `wp.copy` calls above it were
+    0.52 ms. **Read what the host time actually is before attributing it to NumPy.**
+
 - **SHIPPED — `cone` and `cylinder` are closed-form kernels, not `revolve` compositions: 2.43-2.60x
   at every section count.** Both built a three- or four-point NumPy profile, **uploaded** it, and
   handed it to `revolve` — which **read it straight back**, decided the layout on the host, uploaded
@@ -5067,6 +5166,78 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   - **A scan that keys on line proximity over-counts.** `polyline_radius` looked like three
     reductions over one array and is three *mutually exclusive branches*. Read the function before
     believing the hit.
+- **SHIPPED — `edges_unique` is a host-bound substrate under 57 call sites in 18 modules, and it
+  was paying for two host readbacks it did not need.** Stage-timed on an RTX 5090, Warp 1.17, 200
+  calls between two syncs, min of 7: the whole call measured **0.471 / 0.504 / 0.500 ms** at
+  320 / 5 120 / 81 920 faces — *flat across a 256x face range*, which by §16.1's own method makes it
+  100 % host. The stages summed to 90 % of it: `unique_1d(return_inverse=True)` 0.26 (53 %),
+  `hash_indices_rows(validate=True)` 0.107 (21 %, of which the range check alone is **0.084**),
+  `faces_to_edges` 0.026, `first_occurrence_indices` 0.027, `array.gather` 0.031. Three changes,
+  and the census to re-derive them is `plans/`-local (an AST scan plus a monkeypatched `wp.launch`
+  census — §16.0's "take the census from the runtime").
+  - **The deduplicated rows are already in the keys.** `grouping.hash_indices_rows` packs a sorted
+    `(lo, hi)` row as `lo + hi * base`, and `array.unpack_edge_key` inverts it exactly — its own
+    docstring had named that packing as the shared convention since it was written. So
+    `first_occurrence_indices` plus `array.gather` became one `edges_from_keys` launch, dropping a
+    scatter, a gather and the first-occurrence buffer. **Row order is unchanged and the result is
+    bit-identical**: both forms index by the same unique id, and `edges_sorted` is min-first, so the
+    unpacked `(key % base, key // base)` *is* the row the gather used to fetch.
+  - **`validate` is now a keyword, default `True`, and 27 internal call sites pass `False`.** The
+    range check is a `reduce.minmax` plus a host readback. Keeping it on at the public boundary and
+    off inside the library is what `_device.require_valid_faces`' docstring already prescribed —
+    it is "meant for the small number of public entry points that are the real trust boundary",
+    with every downstream helper "expected to trust the connectivity it was handed the same way
+    every other per-face kernel wrapper in this package already does". `edges_unique` was the one
+    downstream helper paying for a check its own neighbours skip: `laplacian.laplacian_entries`,
+    one of its callers, hands the same `faces` straight to kernels that index `vertices[faces[...]]`
+    unchecked, so the raise was protecting nothing the rest of the call did not already assume.
+    `validation.is_watertight` makes the point sharper still — it *already* ran one stage checked
+    (`is_edge_manifold`) and the next unchecked (`face_adjacency`, whose `_edge_groups` passes
+    `validate=n_vertices is None`), so the guard was not a contract, only an inconsistency. Measured **0.471 → 0.341 ms**, flat at
+    every size (**1.38x**), and every one of those 27 sites gets it.
+  - **`index_bound(X)` followed by a validating hash of `X` reduces the same array twice**, and only
+    the negative half of the second check can ever fire — the bound was *derived* from that array.
+    `array.index_bound` grew a `require_non_negative=` that takes both ends out of the one
+    `reduce.minmax` (free, per `require_valid_faces`' own measurement), so the pairing is now one
+    readback with the same guarantees. Applied at `edges_unique`, both `validation` edge-manifold
+    entry points, `holes._EdgeTable` and `validation.edge_winding_consistent_mask`.
+  - **`grouping.unique_1d` made two byte-identical copies of its sorted keys.** On the
+    `sort_dtype == original_dtype` branch — which every `uint64` edge- or row-key call takes —
+    `unique_values` and the inverse pass's `sorted_dense` are the same `keys_buf` prefix copied out
+    twice. The second allocation and copy are gone.
+  - **Deterministic counts, which is the part a noisy box cannot argue with** (§15.6):
+    `edges_unique` 8 launches / 15 allocations → **7 / 14**, `edges_unique_length` 9 / 16 → 8 / 15,
+    `is_watertight` 30 / 43 → 28 / 43, `vertex_manifold_mask` 17 / 24 → 16 / 24, `cotmatrix`
+    3 / 12 → 3 / 11, and the readbacks those figures do *not* show are the larger half.
+  - **End to end, against a detached baseline worktree** (§15.6; min-of-9 over 200 calls between
+    two syncs, one arm per process on a quiet box, 320 / 5 120 / 81 920 faces):
+
+    | call | ratio |
+    |---|---|
+    | `energies.edge_length_loss` | **1.49 / 1.46 / 1.44x** |
+    | `validation.face_watertight_mask` | 1.19 / 1.20 / 1.14x |
+    | `validation.edge_manifold_mask` | 1.19 / 1.18 / 1.13x |
+    | `validation.is_edge_manifold` | 1.16 / 1.20 / 1.10x |
+    | `edges.edges_unique` (**public default**, `validate=True`) | 1.16 / 1.11 / 1.12x |
+    | `edges.edges_unique_length` | 1.16 / 1.14 / 1.12x |
+    | `validation.vertex_manifold_mask` | 1.14 / 1.13 / 1.10x |
+    | `validation.is_watertight` | 1.15 / 1.11 / 1.06x |
+    | `edges.mean_unique_edge_length` | 1.11 / 1.11 / 1.09x |
+    | `heat.heat_geodesic` | 1.03 / 1.03 / 1.02x |
+    | `laplacian.cotmatrix`, `adjacency.face_adjacency` | 0.98-1.06x (controls — neither reaches `edges_unique`) |
+
+    **Quote the two `edges_unique` numbers separately or the table reads wrong**: 1.09-1.16x is the
+    *public* call, which still validates; the 1.38x above is the `validate=False` path all 27
+    internal callers now take, and the A/B harness deliberately exercises the default so the
+    published default is what gets reported. `edge_length_loss` is the largest because it was
+    paying *both* readbacks — it supplied no `n_vertices`, so it inferred the bound and then had
+    the packing re-check it.
+  - **Five of ten `graph.connected_component_labels_from_edges` call sites still validated**, though
+    that function's own warning names "an adjacency list from `face_adjacency`" as the case to skip
+    it. All five now pass `validate=False` with the reason at the site. A grep for `validate=False`
+    on one line **undercounts** — half the converted sites already wrapped across lines, which is
+    how the census first read 1 of 10 rather than 5 of 10.
+
 ### 16.5 `array`, `graph`, `polyline`, `intersection`
 
 - **`kernels/array.binary_search_index` is `searchsorted(side="right")` and returns `slot + 1` on an
@@ -5388,6 +5559,48 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
 - **SHIPPED — `points.farthest_point_sample` as one persistent block** — §14.1.
 
 ### 16.8 `linalg`, `smoothing`, `laplacian`
+
+- **SHIPPED — `filter_laplacian`'s volume constraint no longer reads the volume back, 1.20-1.68x
+  and growing with the iteration count.** `_apply_volume_constraint` ran
+  `tw.measures.volume(...)` — a reduction that ends in a host readback — then formed
+  `(vol_ini / vol_new) ** (1/3)` in Python and handed it to a `wp.map` as a scalar. That is **one
+  full pipeline drain per smoothing pass** for a cube root of two numbers, inside the one loop
+  whose pass count is the parameter callers turn up. `kernels/smoothing.rescale_to_volume` forms
+  the ratio on the device from a `wp.utils.array_sum(..., out=<device array>)` and applies the same
+  two skip conditions (zero current volume, non-positive ratio → scale 1, a no-op pass).
+  - Measured against a detached baseline worktree (§15.6), min-of-7 over 30 calls between two
+    syncs, on `icosphere(3)` / `icosphere(5)`:
+
+    | iterations | 1 280 faces | 20 480 faces |
+    |---|---|---|
+    | 3 | 1.235x | 1.242x |
+    | **10 (the default)** | **1.445x** | **1.445x** |
+    | 30 | 1.659x | 1.617x |
+
+  - **The tell was a readback census parametrized by the loop count, not a clock**: patching
+    `wp.array.numpy` and calling at `iterations` 1 / 3 / 10 gave **6 / 8 / 15** readbacks, which is
+    a fixed 5 plus one per pass. Now flat at 5. That census is deterministic, so it settles the
+    question on a busy box where a timing would not (§15.6), and it is how to find the rest of this
+    class: `plans/`-local, an `ast` walk for a readback — `.numpy()`, `read_scalar`, or a triwarp
+    wrapper that returns a host scalar — lexically inside a `range`/`while` loop. It reports ~25
+    live sites; most are genuine host branches (a convergence test, a compaction count) that cannot
+    move to the device without changing when the loop stops, which is what makes this one unusual:
+    nothing branched on the value, it was only arithmetic.
+  - **The skip condition has to decline to write, not write an identity — and that distinction was
+    a real regression, caught by an empty-face input and nothing else.** On a mesh with no faces
+    the caller's `center` is the centre of mass of nothing, i.e. `NaN`, so "skip" spelled as a
+    scale of `1.0` is `(p - NaN) * 1 + NaN` and propagates where the host version — which never
+    reached the rescale at all in that case — left the buffer alone. The whole suite was green
+    across it: every fixture has faces. `test_filter_laplacian_leaves_a_faceless_mesh_alone` pins
+    it. **When moving a host-side `if` into a kernel, check what the *skipped* branch used to do
+    with the arguments it never evaluated** — an identity is only an identity for finite operands.
+    The sibling trap in the same edit: `wp.utils.array_sum` writes nothing for an empty input, so
+    its `out=` accumulator must be `wp.zeros`, not `wp.empty` (§3.3).
+  - **Not every per-iteration readback in that report is removable, and `registration.icp_*` is the
+    worked counter-example.** Its `tw.reduce.any(valid)` early-exit genuinely needs the host to
+    decide whether to break, and its second scalar read was already merged into one buffer in an
+    earlier round (§16.1). Check whether the host *branches* on the value before proposing this.
+
 
 - **SHIPPED — the CG iteration's per-launch floor, attacked three ways.** A `_BatchedCg` iteration
   was eight launches at a replayed ~1.17 µs each (§13.1) before any arithmetic, which is most of the
