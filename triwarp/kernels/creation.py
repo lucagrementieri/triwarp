@@ -220,6 +220,125 @@ def revolve_vertex_slot(
     return offsets[j] + s % n_slices
 
 
+@wp.func
+def revolution_point(
+    radius: wp.float32,
+    height: wp.float32,
+    slice_index: wp.int32,
+    n_slices: wp.int32,
+    angle: wp.float32,
+) -> wp.vec3:
+    # One profile point (its 2D x is the revolution radius, its y the height along Z) carried to
+    # slice ``slice_index`` of ``n_slices``. Shared by the general ``revolve`` engine and by the
+    # closed-form solids below, so the three of them cannot drift apart in the last bit.
+    #
+    # theta = np.linspace(0, angle, n_slices + 1)[slice_index] -- written as a fraction of the span
+    # so the final slice lands exactly on ``angle`` instead of accumulating a step.
+    theta = angle * wp.float32(slice_index) / wp.float32(n_slices)
+    return wp.vec3(wp.cos(theta) * radius, wp.sin(theta) * radius, height)
+
+
+@wp.kernel
+def cone_mesh(
+    radius: wp.float32,
+    height: wp.float32,
+    sections: wp.int32,
+    angle: wp.float32,
+    keep_caps: wp.int32,
+    keep_sides: wp.int32,
+    out_vertices: wp.array[wp.vec3],
+    out_faces: wp.array[wp.int32],
+) -> None:
+    # A whole closed cone from six scalars: ``sections + 2`` vertices and ``2 * sections`` faces,
+    # one thread per wedge, no host-side layout and nothing uploaded.
+    #
+    # ``creation.cone`` used to reach this shape through ``revolve``, which is general over an
+    # arbitrary profile and pays for that generality on the host: it builds a three-point profile in
+    # NumPy, uploads it, **reads it straight back** to decide which template triangles survive and
+    # where each (slice, profile point) pair lands, then uploads four more layout tables. The layout
+    # a cone needs is closed form -- the base fan around the axis point, the side fan to the apex --
+    # so the whole prologue collapses to this launch. See ``revolution_point`` for the one shared
+    # piece, which is what keeps the two engines bit-identical.
+    k = wp.int32(wp.tid())
+    # Vertex 0 is the base's axis point, 1..sections the base ring, sections + 1 the apex. The two
+    # axis points are written by one thread rather than by every one: they are a single slot each,
+    # and the profile points they come from lie *on* the axis, where ``revolution_point`` returns
+    # the same value for every slice.
+    out_vertices[1 + k] = revolution_point(radius, 0.0, k, sections, angle)
+    if k == 0:
+        out_vertices[0] = revolution_point(0.0, 0.0, 0, sections, angle)
+        out_vertices[sections + 1] = revolution_point(0.0, height, 0, sections, angle)
+
+    # ``keep_caps`` / ``keep_sides`` are ``revolve``'s own degenerate-area verdict on this
+    # profile's template, decided by the caller through the very function ``revolve`` uses -- so a
+    # one- or two-section cone drops the triangles that collapse onto the axis exactly as the
+    # general engine does, and so does a cone small enough for its caps to fall under the area
+    # tolerance. Emission stays in template order: cap, then side.
+    next_ring = 1 + (k + 1) % sections
+    slot = (keep_caps + keep_sides) * 3 * k
+    if keep_caps != 0:
+        out_faces[slot + 0] = 1 + k
+        out_faces[slot + 1] = 0
+        out_faces[slot + 2] = next_ring
+        slot = slot + 3
+    if keep_sides != 0:
+        out_faces[slot + 0] = 1 + k
+        out_faces[slot + 1] = next_ring
+        out_faces[slot + 2] = sections + 1
+
+
+@wp.kernel
+def cylinder_mesh(
+    radius: wp.float32,
+    half_height: wp.float32,
+    sections: wp.int32,
+    angle: wp.float32,
+    keep_caps: wp.int32,
+    keep_sides: wp.int32,
+    out_vertices: wp.array[wp.vec3],
+    out_faces: wp.array[wp.int32],
+) -> None:
+    # The closed-form counterpart of ``cone_mesh`` for a capped cylinder: ``2 * sections + 2``
+    # vertices and ``4 * sections`` faces, one thread per wedge. Same reasoning -- see
+    # ``cone_mesh``.
+    k = wp.int32(wp.tid())
+    # Vertex 0 is the bottom axis point, 1..sections the bottom ring, sections + 1..2 * sections
+    # the top ring, 2 * sections + 1 the top axis point: the profile's four points in order, each
+    # contributing a whole ring or a single shared slot.
+    out_vertices[1 + k] = revolution_point(radius, -half_height, k, sections, angle)
+    out_vertices[1 + sections + k] = revolution_point(radius, half_height, k, sections, angle)
+    if k == 0:
+        out_vertices[0] = revolution_point(0.0, -half_height, 0, sections, angle)
+        out_vertices[2 * sections + 1] = revolution_point(0.0, half_height, 0, sections, angle)
+
+    bottom = 1 + k
+    bottom_next = 1 + (k + 1) % sections
+    top = 1 + sections + k
+    top_next = 1 + sections + (k + 1) % sections
+    # Bottom cap, the wedge's two side triangles, then the top cap -- the order ``revolve`` emits
+    # them in, which is per slice rather than per band. The two flags are its degenerate-area
+    # verdict; see ``cone_mesh``. Both caps share a radius and a step and both sides split one
+    # rectangle, so each pair stands or falls together and two flags cover the four.
+    slot = (2 * keep_caps + 2 * keep_sides) * 3 * k
+    if keep_caps != 0:
+        out_faces[slot + 0] = bottom
+        out_faces[slot + 1] = 0
+        out_faces[slot + 2] = bottom_next
+        slot = slot + 3
+    if keep_sides != 0:
+        out_faces[slot + 0] = bottom
+        out_faces[slot + 1] = bottom_next
+        out_faces[slot + 2] = top
+        out_faces[slot + 3] = top
+        out_faces[slot + 4] = bottom_next
+        out_faces[slot + 5] = top_next
+        slot = slot + 6
+    if keep_caps != 0:
+        out_faces[slot + 0] = top
+        out_faces[slot + 1] = top_next
+        out_faces[slot + 2] = 2 * sections + 1
+
+
 @wp.kernel
 def revolve_vertices(
     linestring: wp.array[wp.vec2],
@@ -239,10 +358,9 @@ def revolve_vertices(
     if column[i] == i and (s == 0 or not on_axis[i]):
         # theta = np.linspace(0, angle, n_points)[s] -- written as a fraction of the span so the
         # final slice lands exactly on `angle` instead of accumulating a step.
-        theta = angle * wp.float32(s) / wp.float32(n_points - 1)
         p = linestring[i]
         slot = revolve_vertex_slot(s, i, n_slices, column, offsets, on_axis)
-        out_vertices[slot] = wp.vec3(wp.cos(theta) * p[0], wp.sin(theta) * p[0], p[1])
+        out_vertices[slot] = revolution_point(p[0], p[1], s, n_points - 1, angle)
 
 
 @wp.kernel
@@ -816,3 +934,106 @@ def random_hills_vertices(
             -0.5 * (offset[0] * offset[0] / x_variance + offset[1] * offset[1] / y_variance)
         )
     out_vertices[t] = wp.vec3(x, y, amplitude * height)
+
+
+@wp.func
+def revolve_uniform_slot(
+    column: wp.int32,
+    slice_index: wp.int32,
+    n_columns: wp.int32,
+    n_slices: wp.int32,
+    ring_base: wp.int32,
+    axis_first: wp.int32,
+    axis_last: wp.int32,
+) -> wp.int32:
+    # Output slot of one (column, slice) pair under ``revolve_uniform``'s regular layout: an
+    # on-axis end column is a single shared slot, every other column a full ring of ``n_slices``.
+    if column == 0 and axis_first != 0:
+        return 0
+    if column == n_columns - 1 and axis_last != 0:
+        return ring_base + (n_columns - 1 - ring_base) * n_slices
+    return ring_base + (column - ring_base) * n_slices + slice_index
+
+
+@wp.kernel
+def revolve_uniform(
+    profile: wp.array[wp.vec2],
+    n_slices: wp.int32,
+    angle: wp.float32,
+    axis_first: wp.int32,
+    axis_last: wp.int32,
+    wrap: wp.int32,
+    first_segment_faces: wp.int32,
+    faces_per_slice: wp.int32,
+    out_vertices: wp.array[wp.vec3],
+    out_faces: wp.array[wp.int32],
+) -> None:
+    # A whole solid of revolution in one launch, for the profiles whose layout is *regular*: every
+    # column is a full ring except an on-axis point at one or both ends, and every profile segment
+    # contributes two triangles per slice except the ones touching the axis.
+    #
+    # ``creation.revolve`` is general over an arbitrary profile and pays for that on the host --
+    # it reads the profile back off the device, computes a per-column slot table and a surviving
+    # triangle list in NumPy, and uploads three more arrays. Every shape that meets the regularity
+    # test can address the same layout arithmetically instead, which is what this kernel does. The
+    # caller checks regularity against ``revolve``'s own filter and falls back to it when the test
+    # fails, so this is a fast path rather than a second definition of the geometry.
+    #
+    # Launched ``dim=(n_slices, n_columns)`` over the *deduplicated* columns: a closed profile
+    # repeats its first point last, and ``wrap`` says so rather than the profile carrying the
+    # duplicate.
+    #
+    # ``first_segment_faces`` and ``faces_per_slice`` are the caller's own count of what survives,
+    # so a thread can find its slice's block and its segment's place in it without a prefix scan:
+    # only the two end segments can be short, so every interior segment contributes exactly two.
+    s, c = wp.tid()
+    n_columns = profile.shape[0]
+    ring_base = axis_first
+    on_axis_c = (c == 0 and axis_first != 0) or (c == n_columns - 1 and axis_last != 0)
+
+    # --- the vertex this thread owns ---------------------------------------------------------
+    # An on-axis column is one shared slot, written by slice 0 alone: ``revolution_point`` returns
+    # the same value for every slice there, and a single writer keeps it deterministic.
+    if not on_axis_c or s == 0:
+        point = profile[c]
+        slot = wp.int32(0)
+        if c == 0 and axis_first != 0:
+            slot = 0
+        elif c == n_columns - 1 and axis_last != 0:
+            slot = ring_base + (n_columns - 1 - ring_base) * n_slices
+        else:
+            slot = ring_base + (c - ring_base) * n_slices + s
+        out_vertices[slot] = revolution_point(point[0], point[1], s, n_slices, angle)
+
+    # --- the faces of the segment leaving this column ------------------------------------------
+    n_segments = n_columns - 1 + wrap
+    if c >= n_segments:
+        return
+    nxt = (c + 1) % n_columns
+    on_axis_next = (nxt == 0 and axis_first != 0) or (nxt == n_columns - 1 and axis_last != 0)
+
+    slice_next = (s + 1) % n_slices
+    here = revolve_uniform_slot(c, s, n_columns, n_slices, ring_base, axis_first, axis_last)
+    here_next = revolve_uniform_slot(
+        c, slice_next, n_columns, n_slices, ring_base, axis_first, axis_last
+    )
+    there = revolve_uniform_slot(nxt, s, n_columns, n_slices, ring_base, axis_first, axis_last)
+    there_next = revolve_uniform_slot(
+        nxt, slice_next, n_columns, n_slices, ring_base, axis_first, axis_last
+    )
+
+    # Only segment 0 can be short at the front, so every later segment starts two faces on from
+    # where the one before it did.
+    within = wp.int32(0)
+    if c > 0:
+        within = first_segment_faces + 2 * (c - 1)
+    base = (s * faces_per_slice + within) * 3
+    if not on_axis_c:
+        out_faces[base + 0] = here
+        out_faces[base + 1] = here_next
+        out_faces[base + 2] = there
+        base = base + 3
+    if not on_axis_next:
+        out_faces[base + 0] = there
+        out_faces[base + 1] = here_next
+        out_faces[base + 2] = there_next

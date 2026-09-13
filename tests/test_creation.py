@@ -968,6 +968,65 @@ def test_capsule(device: str) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("name", "kwargs", "expect_faces"),
+    [
+        ("annulus", {"r_min": 0.5, "r_max": 1.0, "height": 1.0, "sections": 16}, True),
+        ("annulus", {"r_min": 0.5, "r_max": 1.0, "height": 1.0, "sections": 2}, True),
+        ("annulus", {"r_min": 1e-5, "r_max": 2e-5, "height": 1.0, "sections": 8}, True),
+        (
+            "torus",
+            {"major_radius": 1.0, "minor_radius": 0.3, "major_sections": 16, "minor_sections": 12},
+            True,
+        ),
+        (
+            "torus",
+            {"major_radius": 1.0, "minor_radius": 0.3, "major_sections": 2, "minor_sections": 5},
+            True,
+        ),
+        ("uv_sphere", {"radius": 1.0, "count": (8, 6)}, True),
+        ("uv_sphere", {"radius": 1e-5, "count": (8, 8)}, False),
+        ("capsule", {"radius": 0.5, "height": 2.0, "count": (8, 6)}, True),
+        ("cone", {"radius": 1.0, "height": 2.0, "sections": 16}, True),
+        ("cone", {"radius": 1.0, "height": 2.0, "sections": 2}, True),
+        ("cylinder", {"radius": 1.0, "height": 2.0, "sections": 16}, True),
+        ("cylinder", {"radius": 1.0, "height": 2.0, "sections": 1}, False),
+    ],
+)
+def test_solids_of_revolution_agree_with_the_general_engine(
+    device: str, monkeypatch: pytest.MonkeyPatch, name: str, kwargs: dict, expect_faces: bool
+) -> None:
+    """
+    Triwarp against triwarp: the closed-form path against ``revolve``, which carries the oracle.
+
+    Every solid here has two implementations — a single closed-form launch, and the general
+    profile-revolving engine the reference comparisons elsewhere in this file are written against.
+    They must be **bit-identical**, not merely close: the closed-form path exists only to remove
+    host work, and any drift in the last float32 bit would be a second definition of the geometry
+    rather than a faster route to the same one.
+
+    The parameters deliberately straddle the gate. ``sections`` of 1 and 2 collapse the triangles
+    touching the axis, and a radius of ``1e-5`` puts whole quads under the absolute area tolerance;
+    both make ``creation._revolve_regular`` decline and fall back, which is why they are here — a
+    parametrization that only covered ordinary shapes would never execute the fallback at all.
+
+    ``expect_faces`` says which of those degenerate cases legitimately produce *no* faces, so the
+    comparison cannot pass by both sides being empty without that being the stated intent.
+    """
+    builder = getattr(tw.creation, name)
+    fast_vertices, fast_faces = builder(device=device, **kwargs)
+
+    # Force the general engine for the same call, so both answers come from one process and one
+    # device rather than from a remembered table.
+    monkeypatch.setattr(tw.creation, "_revolve_regular", lambda *a, **k: None)
+    slow_vertices, slow_faces = builder(device=device, **kwargs)
+
+    assert (int(fast_faces.shape[0]) > 0) == expect_faces
+    assert int(fast_vertices.shape[0]) > 0
+    assert np.array_equal(fast_vertices.numpy(), slow_vertices.numpy())
+    assert np.array_equal(fast_faces.numpy(), slow_faces.numpy())
+
+
 @pytest.mark.parity("cylinder", "trimesh")
 def test_cylinder(device: str) -> None:
     """

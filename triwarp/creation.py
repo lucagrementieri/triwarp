@@ -51,6 +51,11 @@ DEFAULT_SECTIONS = 32
 # Absolute tolerance trimesh uses to decide that a revolution angle closes the loop.
 _CLOSED_ANGLE_ATOL = 1e-10
 
+# One full revolution, as the ``wp.float32`` the revolution kernels take. Named so the closed-form
+# solids and ``revolve`` pass bit-identical spans: the angle divides into the slice fraction, so a
+# difference here would move every ring vertex in the last bits.
+_FULL_TURN = wp.float32(2.0 * math.pi)
+
 _UNIT_X = np.array([1.0, 0.0, 0.0])
 _UNIT_Y = np.array([0.0, 1.0, 0.0])
 _UNIT_Z = np.array([0.0, 0.0, 1.0])
@@ -689,6 +694,10 @@ def uv_sphere(
     profile[0] = (0.0, -radius_f)
     profile[-1] = (0.0, radius_f)
 
+    n_sections = _resolve_sections(longitude)
+    fast = _revolve_regular(profile, n_sections, transform, device)
+    if fast is not None:
+        return fast
     return revolve(
         _upload_points(profile, wp.vec2, device), sections=longitude, transform=transform
     )
@@ -892,6 +901,10 @@ def capsule(
     profile[0] = (0.0, -height_f / 2.0 - radius_f)
     profile[-1] = (0.0, height_f / 2.0 + radius_f)
 
+    n_sections = _resolve_sections(longitude)
+    fast = _revolve_regular(profile, n_sections, transform, device)
+    if fast is not None:
+        return fast
     return revolve(
         _upload_points(profile, wp.vec2, device), sections=longitude, transform=transform
     )
@@ -943,11 +956,30 @@ def cylinder(
     [`trimesh.creation.cylinder`][]
     """
     transform, half = _resolve_cylinder_axis(height, segment, transform)
+    n_sections = _resolve_sections(sections)
     radius_f = float(radius)
     profile = np.array(
         [[0.0, -half], [radius_f, -half], [radius_f, half], [0.0, half]], dtype=np.float64
     )
-    return revolve(_upload_points(profile, wp.vec2, device), sections=sections, transform=transform)
+    keep_caps, keep_sides = _closed_form_template(profile, n_sections)
+    vertices = wp.empty(2 * n_sections + 2, dtype=wp.vec3, device=device)
+    n_face_slots = (2 * keep_caps + 2 * keep_sides) * n_sections * 3
+    faces = wp.empty(n_face_slots, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_creation.cylinder_mesh,
+        dim=n_sections,
+        inputs=[
+            wp.float32(radius_f),
+            wp.float32(half),
+            wp.int32(n_sections),
+            _FULL_TURN,
+            wp.int32(keep_caps),
+            wp.int32(keep_sides),
+        ],
+        outputs=[vertices, faces],
+        device=device,
+    )
+    return _apply_transform(vertices, faces, transform)
 
 
 def cone(
@@ -984,8 +1016,26 @@ def cone(
     [`cylinder`][triwarp.creation.cylinder]
     [`trimesh.creation.cone`][]
     """
+    n_sections = _resolve_sections(sections)
     profile = np.array([[0.0, 0.0], [float(radius), 0.0], [0.0, float(height)]], dtype=np.float64)
-    return revolve(_upload_points(profile, wp.vec2, device), sections=sections, transform=transform)
+    keep_caps, keep_sides = _closed_form_template(profile, n_sections)
+    vertices = wp.empty(n_sections + 2, dtype=wp.vec3, device=device)
+    faces = wp.empty((keep_caps + keep_sides) * n_sections * 3, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_creation.cone_mesh,
+        dim=n_sections,
+        inputs=[
+            wp.float32(radius),
+            wp.float32(height),
+            wp.int32(n_sections),
+            _FULL_TURN,
+            wp.int32(keep_caps),
+            wp.int32(keep_sides),
+        ],
+        outputs=[vertices, faces],
+        device=device,
+    )
+    return _apply_transform(vertices, faces, transform)
 
 
 def annulus(
@@ -1049,6 +1099,10 @@ def annulus(
         [[r_min_f, -half], [r_max_f, -half], [r_max_f, half], [r_min_f, half], [r_min_f, -half]],
         dtype=np.float64,
     )
+    n_sections = _resolve_sections(sections)
+    fast = _revolve_regular(profile, n_sections, transform, device)
+    if fast is not None:
+        return fast
     return revolve(_upload_points(profile, wp.vec2, device), sections=sections, transform=transform)
 
 
@@ -1103,6 +1157,10 @@ def torus(
     profile += (float(major_radius), 0.0)
     profile[-1] = profile[0]
 
+    n_sections = _resolve_sections(major_sections)
+    fast = _revolve_regular(profile, n_sections, transform, device)
+    if fast is not None:
+        return fast
     return revolve(
         _upload_points(profile, wp.vec2, device), sections=major_sections, transform=transform
     )
@@ -2469,6 +2527,117 @@ def _segment_to_cylinder(segment: Sequence[Sequence[float]]) -> tuple[wp.mat44, 
     # Compose translation-to-midpoint with the rotation.
     matrix[:3, 3] = segment_np[0] + vector * 0.5
     return wp.mat44(*matrix.flatten()), height
+
+
+def _resolve_sections(sections: int | None) -> int:
+    """Wedge count of a *closed* revolution, defaulted and validated as ``revolve`` does."""
+    n_sections = DEFAULT_SECTIONS if sections is None else int(sections)
+    if n_sections < 1:
+        raise ValueError(f"sections must be at least 1, got {sections}")
+    return n_sections
+
+
+def _revolve_regular(
+    profile_np: np.ndarray,
+    sections: int,
+    transform: wp.mat44 | wp.array[wp.mat44] | None,
+    device: wp.DeviceLike,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]] | None:
+    """
+    Build a solid of revolution in one launch, or return ``None`` when the layout is not regular.
+
+    ``revolve`` is general over an arbitrary profile and decides its layout on the host: it reads
+    the profile back off the device, builds a per-column slot table and a surviving-triangle list
+    in NumPy, and uploads three more arrays. A profile whose columns are all full rings except an
+    on-axis point at one or both ends does not need any of that — the slots and the face blocks are
+    arithmetic — which covers every closed solid this module builds by revolution.
+
+    **Regularity is checked against ``revolve``'s own filter, not asserted.** The surviving template
+    triangles must be exactly "both, except the one touching an axis end", which is what makes the
+    two engines agree; anything else (a profile with an interior on-axis point, a duplicated
+    interior column, geometry small enough for the absolute area tolerance to bite in the middle)
+    returns ``None`` and the caller falls back. See ``kernels/creation.revolve_uniform``.
+
+    ``profile_np`` is the caller's own host profile, closed profiles included: the repeated last
+    point is detected here and dropped, so the kernel addresses deduplicated columns.
+    """
+    if sections < 1 or profile_np.shape[0] < 2:
+        return None
+    wrap = bool(np.allclose(profile_np[0], profile_np[-1], rtol=0.0, atol=0.0))
+    columns_np = profile_np[:-1] if wrap else profile_np
+    n_columns = int(columns_np.shape[0])
+    if n_columns < 2:
+        return None
+    on_axis = columns_np[:, 0] == 0.0
+    # An interior on-axis column would collapse a whole ring into one slot and break the
+    # arithmetic; only the ends are handled.
+    if wrap and bool(on_axis.any()):
+        return None
+    if bool(on_axis[1:-1].any()):
+        return None
+    axis_first, axis_last = bool(on_axis[0]), bool(on_axis[-1])
+
+    n_segments = n_columns - 1 + int(wrap)
+    if n_segments < 1:
+        return None
+    # ``revolve``'s verdict, on ``revolve``'s template, for exactly this profile and step.
+    kept = set(_revolve_kept_template(profile_np, 2.0 * math.pi / float(sections)).tolist())
+    expected: set[int] = set()
+    for segment in range(n_segments):
+        nxt = (segment + 1) % n_columns
+        if not (segment == 0 and axis_first) and not (segment == n_columns - 1 and axis_last):
+            expected.add(2 * segment)
+        if not (nxt == 0 and axis_first) and not (nxt == n_columns - 1 and axis_last):
+            expected.add(2 * segment + 1)
+    if kept != expected:
+        return None
+
+    # Only the two end segments can be short, so the kernel finds any later segment's place from
+    # the first one's count alone.
+    first_segment_faces = sum(1 for template in (0, 1) if template in expected)
+    faces_per_slice = len(expected)
+    n_vertices = (
+        int(axis_first) + (n_columns - int(axis_first) - int(axis_last)) * sections + int(axis_last)
+    )
+    vertices = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    faces = wp.empty(faces_per_slice * sections * 3, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_creation.revolve_uniform,
+        dim=(sections, n_columns),
+        inputs=[
+            _upload_points(columns_np, wp.vec2, device),
+            wp.int32(sections),
+            _FULL_TURN,
+            wp.int32(axis_first),
+            wp.int32(axis_last),
+            wp.int32(wrap),
+            wp.int32(first_segment_faces),
+            wp.int32(faces_per_slice),
+        ],
+        outputs=[vertices, faces],
+        device=device,
+    )
+    return _apply_transform(vertices, faces, transform)
+
+
+def _closed_form_template(profile_np: np.ndarray, n_sections: int) -> tuple[int, int]:
+    """
+    ``(keep_caps, keep_sides)``: which of a solid-of-revolution's template triangles survive.
+
+    The closed-form kernels behind [`cone`][triwarp.creation.cone] and
+    [`cylinder`][triwarp.creation.cylinder] write a fixed layout, so they need
+    [`revolve`][triwarp.creation.revolve]'s degenerate-area verdict as two flags rather than as an
+    index list. It is taken from ``revolve``'s own filter on ``revolve``'s own template — not
+    re-derived — so the two engines cannot disagree about which triangles collapse: at one or two
+    sections the triangles touching the axis have zero area, and on geometry small enough for the
+    absolute tolerance to bite they do too.
+
+    The template is two triangles per profile segment, in segment order. Index 1 is the first
+    segment's surviving triangle (the cap) and index 2 the second's (the side); a cylinder's second
+    cap and second side are the same shapes at the same radius and step, so they share the verdict.
+    """
+    kept = set(_revolve_kept_template(profile_np, 2.0 * math.pi / float(n_sections)).tolist())
+    return int(1 in kept), int(2 in kept)
 
 
 def _align_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
