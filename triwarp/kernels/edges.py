@@ -1,5 +1,6 @@
 import warp as wp
 
+from triwarp.kernels.array import unpack_edge_key
 from triwarp.kernels.predicates import segment_aabb, side_lengths
 
 
@@ -28,6 +29,22 @@ def faces_to_edges(
     _write_edge(out_edges, f, i0, i1, sort)
     _write_edge(out_edges, f + 1, i1, i2, sort)
     _write_edge(out_edges, f + 2, i2, i0, sort)
+
+
+@wp.kernel
+def edges_from_keys(
+    keys: wp.array[wp.uint64], base: wp.uint64, out_edges: wp.array2d[wp.int32]
+) -> None:
+    # ``grouping.hash_indices_rows`` packs a sorted ``(lo, hi)`` row as ``lo + hi * base``, which
+    # ``array.unpack_edge_key`` inverts exactly -- the docstring there names this packing as the
+    # shared convention. So the deduplicated *rows* need not be recovered by gathering the first
+    # corner that produced each key: they are already in the key. That replaces a
+    # ``first_occurrence_indices`` scatter plus an ``array.gather`` with one launch, and drops the
+    # first-occurrence buffer with them.
+    i = wp.int32(wp.tid())
+    lo, hi = unpack_edge_key(keys[i], base)
+    out_edges[i, 0] = lo
+    out_edges[i, 1] = hi
 
 
 @wp.kernel

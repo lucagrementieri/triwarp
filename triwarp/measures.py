@@ -293,6 +293,11 @@ def euler_characteristic(faces: wp.array[wp.int32]) -> int:
         return 0
 
     n_referenced = int(tw.grouping.unique_1d(faces).shape[0])
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=tw.array.index_bound(faces))
+    # The bound is taken here, so ``edges_unique`` re-checking it would reduce the same indices
+    # twice; ``require_non_negative`` keeps the half of that check a derived bound cannot give,
+    # and costs nothing -- both ends come out of the one reduction.
+    unique_edges, _ = tw.edges.edges_unique(
+        faces, n_vertices=tw.array.index_bound(faces, require_non_negative=True), validate=False
+    )
     n_edges = int(unique_edges.shape[0])
     return n_referenced - n_edges + n_faces

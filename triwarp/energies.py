@@ -105,7 +105,12 @@ def edge_length_loss(
     plain mean for one mesh, which is triwarp's only case, so there is no batch weighting to port.
     """
     require_same_device(vertices=vertices, faces=faces)
-    lengths = edges_unique_length(vertices, faces)
+    # The bound is supplied and the range check skipped: both are host readbacks that
+    # serialise the pipeline, and this wrapper trusts its connectivity the same way its
+    # own per-edge kernels below do.
+    lengths = edges_unique_length(
+        vertices, faces, n_vertices=int(vertices.shape[0]), validate=False
+    )
     if int(lengths.shape[0]) == 0:
         return 0.0
     deviations = wp.empty(int(lengths.shape[0]), dtype=wp.float32, device=lengths.device)
@@ -597,14 +602,16 @@ def curved_hessian_energy(
 
     # Reused below for ``edges_unique`` too, so the manifold check costs no extra sort.
     edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    if not tw.validation.is_edge_manifold(faces, edges_sorted=edges_sorted, n_vertices=n_vertices):
+    if not tw.validation.is_edge_manifold(
+        faces, edges_sorted=edges_sorted, n_vertices=n_vertices, validate=False
+    ):
         raise ValueError(
             "mesh must be edge-manifold (every edge shared by at most two faces); the "
             "Crouzeix-Raviart discretization curved_hessian_energy is built on is undefined "
             "otherwise, like igl::curved_hessian_energy, which asserts it"
         )
 
-    unique_edges, inverse = edges_unique(faces, edges_sorted, n_vertices=n_vertices)
+    unique_edges, inverse = edges_unique(faces, edges_sorted, n_vertices=n_vertices, validate=False)
     n_edges = int(unique_edges.shape[0])
 
     angles = wp.empty((n_faces, 3), dtype=wp.float64, device=device)
@@ -751,7 +758,7 @@ def crouzeix_raviart_cotmatrix(
     if n_faces == 0:
         return tw.array.empty_square_bsr(n_edges, dtype, device)
 
-    if not tw.validation.is_edge_manifold(faces, n_vertices=int(vertices.shape[0])):
+    if not tw.validation.is_edge_manifold(faces, n_vertices=int(vertices.shape[0]), validate=False):
         raise ValueError(
             "mesh must be edge-manifold (every edge shared by at most two faces); the "
             "Crouzeix-Raviart discretization is undefined otherwise, like "
@@ -1034,7 +1041,9 @@ def _edge_numbering(
     if (unique_edges is None) != (edge_map is None):
         raise ValueError("pass unique_edges and edge_map together, or neither.")
     if unique_edges is None or edge_map is None:
-        unique_edges, edge_map = edges_unique(faces, n_vertices=int(vertices.shape[0]))
+        unique_edges, edge_map = edges_unique(
+            faces, n_vertices=int(vertices.shape[0]), validate=False
+        )
     return unique_edges, edge_map
 
 

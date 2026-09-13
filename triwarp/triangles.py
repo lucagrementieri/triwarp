@@ -241,11 +241,10 @@ def corner_normals(
         # corner ``3f + k``, the same index the kernel's thread carries.
         corner_weights = face_angles(vertices, faces).reshape(3 * n_faces)
     elif weighting == "area":
-        # One area per face broadcast to its three corners -- a gather rather than a kernel, since
-        # ``arange_repeat`` already builds ``i // 3``.
-        corner_weights = tw.array.gather(
-            face_areas, tw.array.arange_repeat(3 * n_faces, 3, device=device)
-        )
+        # The face's own area, indexed by ``halfedge // 3`` inside the kernel. Broadcasting it to
+        # the three corners here instead cost an ``arange_repeat`` launch and a gather, for a
+        # division the kernel already performs.
+        corner_weights = face_areas
     else:
         raise ValueError(f"weighting must be 'angle' or 'area', got {weighting!r}")
 
@@ -259,6 +258,7 @@ def corner_normals(
             twins,
             face_normals,
             corner_weights,
+            weighting == "angle",
             crease_keys,
             wp.uint64(n_vertices),
             normals,

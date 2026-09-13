@@ -245,11 +245,23 @@ def _apply_volume_constraint(
     rejects with a bare ``TypeError``. There is no scale factor that restores a volume of the
     opposite sign, so the pass is skipped rather than approximated.
     """
-    vol_new = tw.measures.volume(positions, faces)
-    ratio = vol_ini / vol_new if vol_new != 0.0 else 0.0
-    if ratio > 0.0:
-        scale = wp.float64(ratio ** (1.0 / 3.0))
-        wp.map(kernel_smoothing.rescale_about_center, positions, center, scale, out=positions)
+    # The current volume stays on the device. Reading it back to form the ratio in Python cost one
+    # host sync per smoothing pass -- a full pipeline drain for a cube root of two numbers -- and
+    # the pass count is the whole point of this loop. ``rescale_to_volume`` forms the ratio itself
+    # and applies the same two skip conditions.
+    face_volumes = tw.triangles.face_signed_volumes(positions, faces)
+    # ``wp.zeros``, not ``wp.empty``: an empty face buffer leaves ``array_sum`` with nothing to
+    # write, and a garbage "current volume" would scale the mesh by a garbage factor. Zero is also
+    # the honest answer there, and the kernel reads it as "skip".
+    volume_current = wp.zeros(1, dtype=wp.float64, device=positions.device)
+    if int(faces.shape[0]) > 0:
+        wp.utils.array_sum(face_volumes, out=volume_current)
+    wp.launch(
+        kernel_smoothing.rescale_to_volume,
+        dim=int(positions.shape[0]),
+        inputs=[wp.float64(vol_ini), volume_current, center, positions],
+        device=positions.device,
+    )
 
 
 def inflate(
@@ -763,7 +775,7 @@ def relax_keep_volume(
     if flags is None:
         return wp.clone(vertices)
 
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     adjacency = tw.graph.edges_to_csr(n_vertices, unique_edges)
     offsets, columns = adjacency.offsets, adjacency.columns
     positions = wp.clone(vertices)
@@ -1037,7 +1049,9 @@ def filter_taubin(
     # connectivity that never changes -- so the unique-edge set is derived once here rather than
     # inside the loop, which would otherwise repay the same derivation once per iteration for an
     # identical answer.
-    recompute_edges = tw.edges.edges_unique(faces, n_vertices=n)[0] if recompute else None
+    recompute_edges = (
+        tw.edges.edges_unique(faces, n_vertices=n, validate=False)[0] if recompute else None
+    )
     positions = _as_vec3d(vertices)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
     for index in range(iterations):
@@ -1820,7 +1834,7 @@ def _edge_weight_matrix(
     """Symmetric ``(n, n)`` float64 edge-weight matrix (zero diagonal); unit or clamped cotan."""
     device = vertices.device
     n = int(vertices.shape[0])
-    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n)
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
     m = int(unique_edges.shape[0])
     weights = wp.zeros(m, dtype=wp.float32, device=device)
     if edge_weights == "unit":
@@ -2149,8 +2163,11 @@ def _region_rim_vertices(
     free = wp.empty(n_vertices, dtype=wp.bool, device=device)
     wp.map(kernel_array.mask_and, inside, outside, out=free)
 
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
-    labels = tw.graph.connected_component_labels_from_edges(unique_edges, n_vertices)
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
+    # ``validate=False``: ``edges_unique`` packed these rows against ``n_vertices`` itself.
+    labels = tw.graph.connected_component_labels_from_edges(
+        unique_edges, n_vertices, validate=False
+    )
     component_size = wp.zeros(n_vertices, dtype=wp.int32, device=device)
     wp.launch(
         kernel_scatter.count_occurrences,

@@ -206,7 +206,7 @@ def heat_operators(
         )
     if t is None:
         # The unique-edge average, which is what ``igl::heat_geodesics`` uses for its timestep.
-        h = mean_unique_edge_length(vertices, faces)
+        h = mean_unique_edge_length(vertices, faces, validate=False)
         t = h * h
 
     # Per-face half-cotangent weights (float32, O(1) and safe) reused for both the Laplacian and
@@ -768,7 +768,7 @@ def vector_heat_operators(
         # ``igl::heat_geodesics``. The two solvers must agree: ``log_map``'s radius is asserted to
         # *be* the ``heat_geodesic`` distance, so giving them different diffusion times would split
         # a quantity that is supposed to be one number.
-        h = tw.edges.mean_unique_edge_length(vertices, faces)
+        h = tw.edges.mean_unique_edge_length(vertices, faces, validate=False)
         t = h * h
 
     connection = connection_laplacian(vertices, faces)

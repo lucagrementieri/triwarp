@@ -157,9 +157,22 @@ def face_tangent_frames(
     n_faces = int(faces.shape[0]) // 3
     basis_x = wp.empty(n_faces, dtype=wp.vec3, device=device)
     basis_y = wp.empty(n_faces, dtype=wp.vec3, device=device)
-    if normals is None:
-        normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
     if n_faces == 0:
+        if normals is None:
+            normals = wp.empty(0, dtype=wp.vec3, device=device)
+        return basis_x, basis_y, normals
+
+    if normals is None:
+        # Derived here rather than through ``triangles.face_normals_and_areas``: the frame needs one
+        # cross product the producer already forms, and routing through it costs a launch, a round
+        # trip of the normals through global memory and an areas buffer nothing below reads.
+        normals = wp.empty(n_faces, dtype=wp.vec3, device=device)
+        wp.launch(
+            kernel_tangent_space.face_tangent_frames_and_normals,
+            dim=n_faces,
+            inputs=[vertices, faces, basis_x, basis_y, normals],
+            device=device,
+        )
         return basis_x, basis_y, normals
 
     wp.launch(

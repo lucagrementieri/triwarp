@@ -449,7 +449,7 @@ def _edge_incidence(faces: wp.array[wp.int32], n_vertices: int) -> _EdgeIncidenc
     third grouping of the same rows; see ``scatter_edge_incidence`` in ``kernels/scatter.py``.
     """
     device = faces.device
-    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     m = int(unique_edges.shape[0])
     face_count = wp.zeros(m, dtype=wp.int32, device=device)
     edge_faces = twt.empty_2d((m, 2), wp.int32, device=device)
@@ -642,7 +642,7 @@ def _smooth_pass(
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     normals = tw.vertices.vertex_normals(vertices, faces)
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     vertex_areas = tw.laplacian.mass_matrix_entries(vertices, faces)
     # The same vertex-face CSR the collapse stage builds for its own fold veto, and for the same
     # reason: ``unique_edges`` above carries a vertex's *neighbours*, never its faces.
@@ -2429,7 +2429,7 @@ def subdivide(
         # and a caller that mutates a "subdivided" mesh must not reach back into its own input.
         return wp.clone(vertices), wp.clone(faces)
 
-    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     n_unique = int(unique_edges.shape[0])
 
     # Compute midpoint vertex for each unique edge
@@ -2560,7 +2560,7 @@ def subdivide_loop(
             )
         return wp.clone(vertices), wp.clone(faces)
 
-    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     n_unique = int(unique_edges.shape[0])
 
     # How many faces each edge carries, and the sum of the vertices opposite it.
@@ -2812,7 +2812,9 @@ def subdivide_to_size(
     for i in range(max_iter + 1):
         n_vertices = int(current_vertices.shape[0])
 
-        unique_edges, inverse = tw.edges.edges_unique(current_faces, n_vertices=n_vertices)
+        unique_edges, inverse = tw.edges.edges_unique(
+            current_faces, n_vertices=n_vertices, validate=False
+        )
         m = int(unique_edges.shape[0])
         lengths = tw.edges.edges_unique_length(
             current_vertices, current_faces, unique_edges=unique_edges
@@ -2994,7 +2996,9 @@ def subdivide_region_to_size(
         n_faces = int(current_faces.shape[0]) // 3
         n_vertices = int(current_vertices.shape[0])
 
-        unique_edges, inverse = tw.edges.edges_unique(current_faces, n_vertices=n_vertices)
+        unique_edges, inverse = tw.edges.edges_unique(
+            current_faces, n_vertices=n_vertices, validate=False
+        )
         m = int(unique_edges.shape[0])
         lengths = tw.edges.edges_unique_length(
             current_vertices, current_faces, unique_edges=unique_edges
@@ -3306,7 +3310,9 @@ def _vertex_scale_attribute(
         if int(outside.shape[0]) == 0
         else tw.array.gather(faces.reshape((-1, 3)), outside).reshape(-1)
     )
-    unique_edges, _inverse = tw.edges.edges_unique(surrounding, n_vertices=n_vertices)
+    unique_edges, _inverse = tw.edges.edges_unique(
+        surrounding, n_vertices=n_vertices, validate=False
+    )
     lengths = tw.edges.edges_unique_length(vertices, surrounding, unique_edges=unique_edges)
 
     total = wp.zeros(n_vertices, dtype=wp.float32, device=device)
@@ -3463,7 +3469,7 @@ def split_edges(
     edges, corner_edge = (
         (unique_edges, inverse)
         if unique_edges is not None and inverse is not None
-        else tw.edges.edges_unique(faces, n_vertices=n_vertices)
+        else tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     )
     n_edges = int(edges.shape[0])
     if int(split_mask.shape[0]) != n_edges:

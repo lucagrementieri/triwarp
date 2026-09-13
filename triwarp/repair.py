@@ -909,7 +909,9 @@ def split_non_manifold_vertices(
         return wp.empty(0, dtype=wp.vec3, device=vertices.device), faces, empty_index
 
     n_corners = 3 * n_faces
-    _unique_edges, edge_of_corner = tw.edges.edges_unique(faces, n_vertices=int(vertices.shape[0]))
+    _unique_edges, edge_of_corner = tw.edges.edges_unique(
+        faces, n_vertices=int(vertices.shape[0]), validate=False
+    )
     n_unique = int(_unique_edges.shape[0])
 
     forward_count = wp.zeros(n_unique, dtype=wp.int32, device=device)
@@ -1039,7 +1041,11 @@ def collapse_small_triangles(
         # Non-flagged faces emit a self-pair (i0, i0); these are self-loops that leave the
         # connected-components closure unchanged, so all rows can be passed without filtering.
         n_vertices = int(current_vertices.shape[0])
-        labels = tw.graph.connected_component_labels_from_edges(pairs, node_count=n_vertices)
+        # ``validate=False``: the pairs are vertex indices read straight out of the face buffer
+        # this function is repairing, which every kernel around it already indexes unchecked.
+        labels = tw.graph.connected_component_labels_from_edges(
+            pairs, node_count=n_vertices, validate=False
+        )
 
         unique_labels, inverse = unique_1d(labels, return_inverse=True)
         unique_indices = tw.grouping.first_occurrence_indices(inverse, int(unique_labels.shape[0]))

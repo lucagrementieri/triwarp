@@ -667,7 +667,7 @@ def laplacian_entries(
     # Both directed pairs of each unique undirected edge, matching trimesh's ``vertex_neighbors``
     # (every neighbor counted once).
     if edges is None:
-        edges, _ = edges_unique(faces, n_vertices=int(vertices.shape[0]))
+        edges, _ = edges_unique(faces, n_vertices=int(vertices.shape[0]), validate=False)
     elif validate and int(edges.shape[0]) > 0:
         n_vertices = int(vertices.shape[0])
         lowest, highest = tw.reduce.minmax(edges)

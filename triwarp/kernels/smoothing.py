@@ -308,6 +308,40 @@ def rescale_about_center(position: wp.vec3d, center: wp.vec3d, scale: wp.float64
     return (position - center) * scale + center
 
 
+@wp.kernel
+def rescale_to_volume(
+    volume_initial: wp.float64,
+    volume_current: wp.array[wp.float64],
+    center: wp.vec3d,
+    out_positions: wp.array[wp.vec3d],
+) -> None:
+    """
+    Rescale every vertex about ``center`` so the signed volume returns to ``volume_initial``.
+
+    The ratio is formed here rather than on the host because the only reason to read
+    ``volume_current`` back was to compute it: one host readback per smoothing pass, each of which
+    drains the device pipeline, for a cube root of two numbers. The skip conditions are the host
+    version's exactly -- a zero current volume, or a ratio that is not positive, which is an
+    inconsistently wound or non-watertight input whose "volume" no scale factor can restore. Both
+    leave the position untouched rather than approximated.
+
+    **The skip has to be a `return`, not a scale of 1.** On a mesh with no faces the caller's
+    ``center`` is itself ``NaN`` -- a centre of mass over nothing -- and rescaling about it by 1
+    is ``(p - NaN) + NaN``, which propagates rather than cancelling. The host version this replaced
+    never reached the rescale at all in that case, so writing the identity was a real regression
+    and not a cosmetic one.
+    """
+    v = wp.int32(wp.tid())
+    current = volume_current[0]
+    if current == wp.float64(0.0):
+        return
+    ratio = volume_initial / current
+    if ratio <= wp.float64(0.0):
+        return
+    scale = wp.pow(ratio, wp.float64(1.0) / wp.float64(3.0))
+    out_positions[v] = rescale_about_center(out_positions[v], center, scale)
+
+
 @wp.func
 def mut_dif_step(
     v_prev: wp.vec3d, lv: wp.vec3d, adil: wp.float64, mean_adil: wp.float64, lamb: wp.float64

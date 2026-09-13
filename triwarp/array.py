@@ -1301,7 +1301,7 @@ def astype(values: twt.ArrayNd, dtype: type) -> wp.array:
     return out
 
 
-def index_bound(indices: twt.IntArray) -> int:
+def index_bound(indices: twt.IntArray, *, require_non_negative: bool = False) -> int:
     """
     Exclusive upper bound on an index buffer's values, as ``max(indices) + 1``.
 
@@ -1322,16 +1322,34 @@ def index_bound(indices: twt.IntArray) -> int:
     indices
         A ``wp.int32`` index buffer of any shape (e.g. a flat ``faces`` array or a ``(n, 2)``
         edge array).
+    require_non_negative
+        Raise if any index is negative. Free: the minimum comes out of the same reduction, the
+        same buffer and the same host readback as the maximum, so asking for both costs what
+        asking for one does. It exists because the pairing it replaces is not free -- a caller
+        that takes this bound and then hands it to
+        [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] with ``validate=True`` reduces
+        the same array a second time to re-check a bound derived from it, where only the negative
+        half of that check can ever fire. Pass this instead and the packing's ``validate=False``.
 
     Returns
     -------
     int
         ``max(indices) + 1``, or ``0`` when ``indices`` is empty.
+
+    Raises
+    ------
+    ValueError
+        If ``require_non_negative`` is set and any index is negative.
     """
     if int(indices.size) == 0:
         return 0
     # Device-side tiled max: only the 4-byte result crosses to the host, not the whole buffer.
-    return int(tw.reduce.max(indices)) + 1
+    if not require_non_negative:
+        return int(tw.reduce.max(indices)) + 1
+    low, high = tw.reduce.minmax(indices)
+    if low < 0:
+        raise ValueError(f"indices must be non-negative, got a minimum of {int(low)}")
+    return int(high) + 1
 
 
 def indices_to_mask(

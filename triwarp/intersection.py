@@ -942,7 +942,7 @@ def split_mesh_with_plane(
 
     vertex_dots = _plane_dots(vertices, plane_normal, plane_origin)
 
-    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     n_edges = int(unique_edges.shape[0])
     crossed = wp.empty(n_edges, dtype=wp.bool, device=device)
     wp.launch(
@@ -1239,7 +1239,9 @@ def _split_with_vertex_field(
     # what makes the cut watertight rather than a seam of coincident pairs. Sign agreement with the
     # classifier is a correctness requirement, so the mask is built at ``TOLERANCE_MERGE`` -- the
     # dead zone ``classify_faces_for_split`` passes ``sign_with_tolerance`` a few lines above.
-    unique_edges, halfedge_edges = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    unique_edges, halfedge_edges = tw.edges.edges_unique(
+        faces, n_vertices=n_vertices, validate=False
+    )
     crossed = wp.empty(int(unique_edges.shape[0]), dtype=wp.bool, device=device)
     wp.launch(
         kernel_intersections.plane_crossed_edge_mask,

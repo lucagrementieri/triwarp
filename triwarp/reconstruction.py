@@ -332,7 +332,11 @@ def _repeated_oriented_triangles(
         inputs=[candidates, sorted_keys],
         device=device,
     )
-    groups = tw.grouping.group_int_rows(sorted_keys, repetitions, max_value=n_points)
+    # ``sorted_keys`` is a permutation of ``candidates``, whose entries this package produced
+    # as point indices below ``n_points``, so both bounds hold by construction.
+    groups = tw.grouping.group_int_rows(
+        sorted_keys, repetitions, max_value=n_points, validate=False
+    )
     n_groups = int(groups.shape[0])
     if n_groups == 0:
         return twt.empty_2d((0, 3), wp.int32, device=device)

@@ -22,6 +22,7 @@ def is_edge_manifold(
     *,
     edges_sorted: twt.Array2dInt32 | None = None,
     n_vertices: int | None = None,
+    validate: bool = True,
 ) -> bool:
     """
     Whether every undirected mesh edge is shared by a manifold number of faces.
@@ -43,6 +44,11 @@ def is_edge_manifold(
         ``faces``.
     n_vertices
         Optional vertex count (the edge-hash base). When ``None``, inferred from ``faces``.
+    validate
+        Whether to range-check the edge indices before packing them. The check is a
+        ``triwarp.reduce.minmax`` whose host readback serialises the device pipeline. Pass
+        ``False`` only where both bounds are structurally guaranteed -- a face buffer this package
+        produced itself, or one an entry point has already validated.
 
     Returns
     -------
@@ -52,6 +58,8 @@ def is_edge_manifold(
 
     Raises
     ------
+    ValueError
+        If ``validate`` is ``True`` and a face index is negative or reaches the vertex count.
     RuntimeError
         If ``faces`` and ``edges_sorted`` are not all on one device.
 
@@ -77,8 +85,11 @@ def is_edge_manifold(
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     if n_vertices is None:
-        n_vertices = tw.array.index_bound(faces)
-    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
+        # One reduction, not two: the packing's range check would re-derive a bound this call
+        # already took from the same indices, so only its negative half is informative.
+        n_vertices = tw.array.index_bound(faces, require_non_negative=validate)
+        validate = False
+    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=validate)
     _, counts = tw.grouping.unique_1d(keys, return_counts=True)
 
     min_count, max_count = tw.reduce.minmax(cast(twt.Array1dInt32, counts))
@@ -92,6 +103,8 @@ def edge_manifold_mask(
     allow_boundary_edges: bool = True,
     *,
     edges_sorted: twt.Array2dInt32 | None = None,
+    n_vertices: int | None = None,
+    validate: bool = True,
 ) -> wp.array[wp.bool]:
     """
     Per-face flag: whether all three of each face's undirected edges are edge-manifold.
@@ -114,6 +127,14 @@ def edge_manifold_mask(
         Optional precomputed ``(n_faces * 3, 2)`` sorted edges in
         [`faces_to_edges`][triwarp.edges.faces_to_edges] row order (each row min-first). When
         ``None``, built from ``faces``.
+    n_vertices
+        Optional vertex count (the edge-hash base). When ``None``, inferred from ``faces`` with a
+        device-host sync.
+    validate
+        Whether to range-check the edge indices before packing them. The check is a
+        ``triwarp.reduce.minmax`` whose host readback serialises the device pipeline. Pass
+        ``False`` only where both bounds are structurally guaranteed -- a face buffer this package
+        produced itself, or one an entry point has already validated.
 
     Returns
     -------
@@ -122,6 +143,8 @@ def edge_manifold_mask(
 
     Raises
     ------
+    ValueError
+        If ``validate`` is ``True`` and a face index is negative or reaches the vertex count.
     RuntimeError
         If ``faces`` and ``edges_sorted`` are not all on one device.
 
@@ -138,7 +161,12 @@ def edge_manifold_mask(
 
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=tw.array.index_bound(faces))
+    if n_vertices is None:
+        # One reduction, not two: the packing's range check would re-derive a bound this call
+        # already took from the same indices, so only its negative half is informative.
+        n_vertices = tw.array.index_bound(faces, require_non_negative=validate)
+        validate = False
+    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=validate)
     _, inverse, counts = tw.grouping.unique_1d(keys, return_inverse=True, return_counts=True)
 
     n_unique = int(counts.shape[0])
@@ -322,7 +350,11 @@ def _vertex_manifold_flags(
             device=device,
         )
 
-    labels = tw.graph.connected_component_labels_from_edges(corner_edges, node_count=n_corners)
+    # ``validate=False``: both endpoints are corner ids the kernel above just wrote, bounded by
+    # ``n_corners`` by construction.
+    labels = tw.graph.connected_component_labels_from_edges(
+        corner_edges, node_count=n_corners, validate=False
+    )
 
     min_label = wp.full(n_vertices, twt.dtype_max(wp.int32), dtype=wp.int32, device=device)
     manifold = wp.zeros(n_vertices, dtype=wp.bool, device=device)
@@ -650,7 +682,14 @@ def edge_winding_consistent_mask(
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
 
-    edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2)
+    # One reduction for the radix and the negative check together, instead of the inferred
+    # bound plus the packing's own re-reduction of the same rows.
+    edge_groups = tw.grouping.group_int_rows(
+        edges_sorted,
+        length=2,
+        max_value=tw.array.index_bound(faces, require_non_negative=True),
+        validate=False,
+    )
     n_groups = int(edge_groups.shape[0])
     if n_groups == 0:
         return wp.empty(0, dtype=wp.bool, device=device)
@@ -925,7 +964,11 @@ def is_watertight(
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     n_vertices = int(vertices.shape[0])
     if not is_edge_manifold(
-        faces, allow_boundary_edges=False, edges_sorted=edges_sorted, n_vertices=n_vertices
+        faces,
+        allow_boundary_edges=False,
+        edges_sorted=edges_sorted,
+        n_vertices=n_vertices,
+        validate=False,
     ):
         return False
     adjacency, adjacency_edges = tw.adjacency.face_adjacency(
@@ -942,7 +985,10 @@ def is_watertight(
 
 
 def face_watertight_mask(
-    faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None = None
+    faces: wp.array[wp.int32],
+    edges_sorted: twt.Array2dInt32 | None = None,
+    *,
+    n_vertices: int | None = None,
 ) -> wp.array[wp.bool]:
     """
     Per-face flag: whether all three of a face's undirected edges are shared by exactly two faces.
@@ -959,6 +1005,9 @@ def face_watertight_mask(
     edges_sorted
         Optional precomputed ``(n_faces * 3, 2)`` sorted edges forwarded to
         [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask].
+    n_vertices
+        Optional vertex count forwarded as the edge-hash base. When ``None``, inferred from
+        ``faces`` with a device-host sync.
 
     Returns
     -------
@@ -967,6 +1016,8 @@ def face_watertight_mask(
 
     Raises
     ------
+    ValueError
+        If a face index is negative or reaches the vertex count.
     RuntimeError
         If ``faces`` and ``edges_sorted`` are not all on one device.
 
@@ -976,7 +1027,9 @@ def face_watertight_mask(
     [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]
     """
     require_same_device(faces=faces, edges_sorted=edges_sorted)
-    return edge_manifold_mask(faces, edges_sorted=edges_sorted, allow_boundary_edges=False)
+    return edge_manifold_mask(
+        faces, edges_sorted=edges_sorted, allow_boundary_edges=False, n_vertices=n_vertices
+    )
 
 
 def is_volume(

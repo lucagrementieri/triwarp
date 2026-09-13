@@ -1132,6 +1132,36 @@ def test_index_bound_matches_the_index_maximum(
     assert tw.array.index_bound(mesh_wp.indices) == len(mesh_tm.vertices)
 
 
+def test_index_bound_can_check_non_negativity_in_the_same_reduction(device: str) -> None:
+    """
+    Triwarp against triwarp: ``require_non_negative`` adds a guard, not a different bound.
+
+    Not a library comparison: numpy's ``arr.max() + 1`` is the oracle for the bound itself and is
+    checked by ``test_index_bound_matches_the_index_maximum``. What this pins is the pairing the
+    hashing callers rely on -- taking the bound and the negative check out of one reduction, so
+    they can hand ``grouping.hash_indices_rows`` ``validate=False`` without losing the half of its
+    check that a bound derived from the same array cannot provide.
+    """
+    indices_np = np.array([[0, 4], [2, 7], [7, 3]], dtype=np.int32)
+    indices_wp = wp.array(indices_np, dtype=wp.int32, device=device)
+
+    assert tw.array.index_bound(indices_wp) == 8
+    assert tw.array.index_bound(indices_wp, require_non_negative=True) == 8
+
+    negative_wp = wp.array(
+        np.array([[0, 4], [-2, 7], [7, 3]], dtype=np.int32), dtype=wp.int32, device=device
+    )
+    # The plain form is a max and cannot see it; the guarded form is the only one that raises.
+    assert tw.array.index_bound(negative_wp) == 8
+    with pytest.raises(ValueError, match="non-negative"):
+        _ = tw.array.index_bound(negative_wp, require_non_negative=True)
+
+    # An empty buffer has no indices to be out of range, and both forms agree on that.
+    empty_wp = wp.empty((0, 2), dtype=wp.int32, device=device)
+    assert tw.array.index_bound(empty_wp) == 0
+    assert tw.array.index_bound(empty_wp, require_non_negative=True) == 0
+
+
 def test_read_scalar_returns_a_detached_row_for_a_vector_dtype(device: str) -> None:
     """
     Triwarp against triwarp: two reads of one vector array must not alias each other.

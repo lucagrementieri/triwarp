@@ -90,6 +90,8 @@ def edges_unique(
     faces: wp.array[wp.int32],
     edges_sorted: twt.Array2dInt32 | None = None,
     n_vertices: int | None = None,
+    *,
+    validate: bool = True,
 ) -> tuple[twt.Array2dInt32, wp.array[wp.int32]]:
     """
     Return unique undirected edges and their inverse mapping into the sorted edge list.
@@ -107,6 +109,14 @@ def edges_unique(
     n_vertices
         Total number of vertices (used as the hash base). When ``None``, inferred from
         ``edges_sorted`` with a device-host sync.
+    validate
+        Whether to range-check the edge indices before packing them. The check is a
+        ``triwarp.reduce.minmax`` whose host readback serialises the device pipeline, and it is a
+        large share of this call because everything else here is launch overhead. Pass ``False``
+        only where both bounds are structurally guaranteed -- a face buffer this package produced
+        itself, or one an entry point has already validated. A ``False`` that is wrong does not
+        raise: indices at or above ``n_vertices`` collide in the packing and silently group two
+        different edges as one, and a negative index is read as a huge unsigned digit.
 
     Returns
     -------
@@ -120,7 +130,8 @@ def edges_unique(
     TypeError
         If ``edges_sorted`` is given and is not a rank-2 ``wp.int32`` array.
     ValueError
-        If ``edges_sorted`` is given and does not have exactly two columns.
+        If ``edges_sorted`` is given and does not have exactly two columns, or if ``validate`` is
+        ``True`` and an edge index is negative or reaches ``n_vertices``.
     RuntimeError
         If ``faces`` and ``edges_sorted`` are not all on one device.
 
@@ -144,16 +155,26 @@ def edges_unique(
         edges_sorted = faces_to_edges(faces, sorted=True)
 
     if n_vertices is None:
-        n_vertices = tw.array.index_bound(edges_sorted)
+        # Inferring the bound from this very buffer already reduces it, and the packing's own
+        # check would reduce it again to re-test a bound derived from it -- only the negative half
+        # could ever fire. One reduction answers both.
+        n_vertices = tw.array.index_bound(edges_sorted, require_non_negative=validate)
+        validate = False
 
-    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
+    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=validate)
     unique_keys, inverse = tw.grouping.unique_1d(keys, return_inverse=True)
-    n_unique = int(unique_keys.shape[0])
 
-    first_occ = tw.grouping.first_occurrence_indices(inverse, n_unique)
-
-    unique_edges_out = tw.array.gather(edges_sorted, first_occ)
-
+    # The deduplicated rows are recovered from the keys, not by gathering the corner that first
+    # produced each one: the packing is exactly invertible for two columns, so a
+    # ``first_occurrence_indices`` scatter, an ``array.gather`` and the first-occurrence buffer
+    # between them all disappear. Row order is unchanged -- both forms index by the same unique id.
+    unique_edges_out = twt.empty_2d((int(unique_keys.shape[0]), 2), wp.int32, device=device)
+    wp.launch(
+        kernel_edges.edges_from_keys,
+        dim=unique_edges_out.shape[0],
+        inputs=[unique_keys, wp.uint64(n_vertices), unique_edges_out],
+        device=device,
+    )
     return twt.as_array2d(unique_edges_out, wp.int32), inverse
 
 
@@ -204,6 +225,8 @@ def edges_unique_length(
     faces: wp.array[wp.int32],
     unique_edges: twt.Array2dInt32 | None = None,
     n_vertices: int | None = None,
+    *,
+    validate: bool = True,
 ) -> wp.array[wp.float32]:
     """
     Euclidean length of each unique undirected edge.
@@ -219,6 +242,10 @@ def edges_unique_length(
     n_vertices
         Total vertex count passed to [`edges_unique`][triwarp.edges.edges_unique]. Ignored when
         ``unique_edges`` is already provided.
+    validate
+        Forwarded to [`edges_unique`][triwarp.edges.edges_unique] when ``unique_edges`` is built
+        here; ignored when ``unique_edges`` is supplied. Pass ``False`` only where the face
+        indices' range is structurally guaranteed.
 
     Returns
     -------
@@ -230,7 +257,8 @@ def edges_unique_length(
     TypeError
         If ``unique_edges`` is not a rank-2 ``wp.int32`` array.
     ValueError
-        If ``unique_edges`` does not have exactly two columns.
+        If ``unique_edges`` does not have exactly two columns, or if ``validate`` is ``True``,
+        ``unique_edges`` is omitted and a face index is negative or reaches ``n_vertices``.
     RuntimeError
         If ``vertices``, ``faces`` and ``unique_edges`` are not all on one device.
 
@@ -240,7 +268,7 @@ def edges_unique_length(
     """
     require_same_device(vertices=vertices, faces=faces, unique_edges=unique_edges)
     if unique_edges is None:
-        unique_edges, _ = edges_unique(faces, n_vertices=n_vertices)
+        unique_edges, _ = edges_unique(faces, n_vertices=n_vertices, validate=validate)
 
     return _edge_lengths(vertices, unique_edges, "unique_edges")
 
@@ -411,7 +439,9 @@ def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     return tw.reduce.mean(edges_length(vertices, faces))
 
 
-def mean_unique_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
+def mean_unique_edge_length(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, validate: bool = True
+) -> float:
     """
     Mean length of the **unique** undirected edges.
 
@@ -430,6 +460,9 @@ def mean_unique_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int3
         ``(n_vertices,)`` vertex positions.
     faces
         Length-``3 * n_faces`` ``wp.int32`` face index buffer.
+    validate
+        Forwarded to [`edges_unique`][triwarp.edges.edges_unique]. Pass ``False`` only where the
+        face indices' range is structurally guaranteed; it removes a host readback.
 
     Returns
     -------
@@ -438,6 +471,8 @@ def mean_unique_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int3
 
     Raises
     ------
+    ValueError
+        If ``validate`` is ``True`` and a face index is negative or reaches ``n_vertices``.
     RuntimeError
         If ``vertices`` and ``faces`` are not all on one device.
 
@@ -452,4 +487,6 @@ def mean_unique_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int3
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return 0.0
-    return tw.reduce.mean(edges_unique_length(vertices, faces, n_vertices=int(vertices.shape[0])))
+    return tw.reduce.mean(
+        edges_unique_length(vertices, faces, n_vertices=int(vertices.shape[0]), validate=validate)
+    )

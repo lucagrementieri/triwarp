@@ -194,7 +194,7 @@ def tree_cotree(
     # to locate a shared edge's row afterwards. The host ``argsort`` + ``searchsorted`` pair this
     # replaces was doing exactly that lookup, over an ``inverse`` the same ``edges_unique`` call had
     # already returned and thrown away.
-    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     n_edges = int(unique_edges.shape[0])
     edge_face_count = wp.zeros(n_edges, dtype=wp.int32, device=device)
     edge_faces = twt.empty_2d((n_edges, 2), wp.int32, device=device)

@@ -977,8 +977,10 @@ class Trimesh:
         --------
         [`triwarp.adjacency.face_connected_component_labels`][]
         """
+        # ``validate=False``: the rows are face ids ``face_adjacency`` derived as ``e // 3``,
+        # so they are below ``n_faces`` by construction and the check would only add a sync.
         return tw.graph.connected_component_labels_from_edges(
-            self.face_adjacency, node_count=self.n_faces
+            self.face_adjacency, node_count=self.n_faces, validate=False
         )
 
     @_CachedProperty

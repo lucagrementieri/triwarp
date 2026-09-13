@@ -73,8 +73,10 @@ def region_boundary_edges(
     if n_faces == 0:
         return twt.empty_2d((0, 2), wp.int32, device=device)
     if n_vertices is None:
-        n_vertices = tw.array.index_bound(faces)
-    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+        # ``require_non_negative`` is free here and is the half of the packing's range check that a
+        # bound derived from these same indices cannot supply.
+        n_vertices = tw.array.index_bound(faces, require_non_negative=True)
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     m = int(unique_edges.shape[0])
     count = wp.zeros(m, dtype=wp.int32, device=device)
     region_count = wp.zeros(m, dtype=wp.int32, device=device)
@@ -278,8 +280,12 @@ def exclude_fully_selected_components(
     if n_vertices == 0:
         return wp.clone(mask)
     if unique_edges is None:
-        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
-    labels = tw.graph.connected_component_labels_from_edges(unique_edges, node_count=n_vertices)
+        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
+    # ``validate=False``: ``edges_unique`` was given ``n_vertices`` as its packing radix, so every
+    # endpoint it returns is already below it.
+    labels = tw.graph.connected_component_labels_from_edges(
+        unique_edges, node_count=n_vertices, validate=False
+    )
     keep = wp.zeros(n_vertices, dtype=wp.int32, device=device)
     wp.launch(
         kernel_selection.keep_component_scatter,
@@ -918,7 +924,7 @@ def expand_vertex_mask(
     if hops <= 0 or n == 0:
         return wp.clone(mask)
     if unique_edges is None:
-        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
+        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
     m = int(unique_edges.shape[0])
     current = mask
     for _ in range(hops):
@@ -982,7 +988,7 @@ def shrink_vertex_mask(
     if hops <= 0 or n == 0:
         return wp.clone(mask)
     if unique_edges is None:
-        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
+        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
     complement = wp.empty(n, dtype=wp.bool, device=device)
     wp.map(kernel_array.mask_not, mask, out=complement)
     dilated = expand_vertex_mask(faces, complement, hops, unique_edges)

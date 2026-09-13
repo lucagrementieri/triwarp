@@ -327,7 +327,7 @@ class _EdgeTable:
     ) -> None:
         device = faces.device
         n_rows = int(edges_sorted.shape[0])
-        n_vertices = tw.array.index_bound(edges_sorted)
+        n_vertices = tw.array.index_bound(edges_sorted, require_non_negative=True)
         self.vertices = vertices
         self.edges_sorted = edges_sorted
         self.max_index = wp.uint64(n_vertices)
@@ -339,7 +339,9 @@ class _EdgeTable:
             kernel_holes.edge_third_vertex, dim=n_rows, inputs=[faces, self.thirds], device=device
         )
 
-        keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
+        # The bound came from these same rows above, negatives included, so re-reducing
+        # them here would only repeat a check that has already run.
+        keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
         sorted_keys, sorted_rows = tw.array.sort_and_argsort(keys)
         # Cloned: the views alias scratch that must not be shared with a later sort.
         self.sorted_keys = wp.clone(sorted_keys)
@@ -1580,7 +1582,7 @@ def fillable_loop_mask(
             position_np[loop_np] = np.arange(loop_np.shape[0], dtype=np.int32)
 
     if fillable_np.any():
-        unique_edges, _inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+        unique_edges, _inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
         has_chord = wp.zeros(len(loops_np), dtype=wp.bool, device=device)
         wp.launch(
             kernel_holes.mark_loops_with_chords,

@@ -683,6 +683,22 @@ def is_crease_edge(
     )
 
 
+@wp.func
+def corner_weight(
+    weights: wp.array[wp.float32], per_corner: wp.bool, halfedge: wp.int32
+) -> wp.float32:
+    """
+    Weight of corner ``halfedge``, from a per-corner table or a per-face one.
+
+    ``weighting="area"`` has one weight per *face*, and broadcasting it to the face's three corners
+    on the host cost an ``arange_repeat`` launch and a gather -- two launches and two buffers to
+    restate ``halfedge // 3``, which this kernel already computes. The branch is warp-uniform.
+    """
+    if per_corner:
+        return weights[halfedge]
+    return weights[halfedge // 3]
+
+
 @wp.kernel
 def corner_normals(
     vertices: wp.array[wp.vec3],
@@ -690,6 +706,7 @@ def corner_normals(
     twins: wp.array[wp.int32],
     face_normals: wp.array[wp.vec3],
     corner_weights: wp.array[wp.float32],
+    weights_per_corner: wp.bool,
     crease_keys_sorted: wp.array[wp.uint64],
     base: wp.uint64,
     out_corner_normals: wp.array2d[wp.vec3],
@@ -704,7 +721,7 @@ def corner_normals(
     # are what the test pins.
     corner = wp.int32(wp.tid())
     face = corner // 3
-    total = face_normals[face] * corner_weights[corner]
+    total = face_normals[face] * corner_weight(corner_weights, weights_per_corner, corner)
 
     # Counter-clockwise about the vertex: ``h -> twins[prev(h)]``, the rotation
     # ``halfedge.vertex_one_rings`` walks. The edge crossed is the one ``prev(h)`` lies on.
@@ -726,7 +743,9 @@ def corner_normals(
         if halfedge == corner:
             closed_loop = wp.bool(True)
             break  # back at the start: the fan closed and every face is already counted
-        total += face_normals[halfedge // 3] * corner_weights[halfedge]
+        total += face_normals[halfedge // 3] * corner_weight(
+            corner_weights, weights_per_corner, halfedge
+        )
 
     # Clockwise, the inverse rotation ``h -> next(twins[h])``, crossing ``h``'s own edge. Skipped
     # entirely when the fan already closed, since every face is then already counted.
@@ -741,7 +760,9 @@ def corner_normals(
             halfedge = halfedge_next(twin)
             if halfedge == corner:
                 break
-            total += face_normals[halfedge // 3] * corner_weights[halfedge]
+            total += face_normals[halfedge // 3] * corner_weight(
+                corner_weights, weights_per_corner, halfedge
+            )
 
     length = wp.length(total)
     if length > TOLERANCE_ZERO_CONSTANT:

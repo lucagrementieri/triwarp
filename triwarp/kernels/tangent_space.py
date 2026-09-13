@@ -3,6 +3,7 @@ import warp as wp
 from triwarp.constants import PI, TOLERANCE_ZERO_CONSTANT, TWO_PI
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.predicates import unit_tangent
+from triwarp.kernels.triangles import face_normals_and_area
 
 
 @wp.func
@@ -99,6 +100,23 @@ def vertex_tangent_frames(
     out_basis_y[v] = wp.cross(normal, basis_x)
 
 
+@wp.func
+def face_tangent_basis(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32, normal: wp.vec3
+) -> tuple[wp.vec3, wp.vec3]:
+    """
+    Return the in-plane frame ``(basis_x, basis_y)`` of face ``f`` given its unit ``normal``.
+
+    The face's own plane needs no projection: the first edge already lies in it, so ``basis_x`` is
+    just that edge normalized and ``basis_y`` closes the right-handed frame. A degenerate face has
+    no first edge to speak of; ``normalize`` returns zero there (Warp's ``kEps`` is 0) and the
+    cross product follows, so the frame degrades to zeros rather than to NaN.
+    """
+    edge = vertices[faces[f * 3 + 1]] - vertices[faces[f * 3 + 0]]
+    basis_x = wp.normalize(edge)
+    return basis_x, wp.cross(normal, basis_x)
+
+
 @wp.kernel
 def face_tangent_frames(
     vertices: wp.array[wp.vec3],
@@ -107,15 +125,30 @@ def face_tangent_frames(
     out_basis_x: wp.array[wp.vec3],
     out_basis_y: wp.array[wp.vec3],
 ) -> None:
-    # The face's own plane needs no projection: the first edge already lies in it, so ``basis_x`` is
-    # just that edge normalized and ``basis_y`` closes the right-handed frame. A degenerate face has
-    # no first edge to speak of; ``normalize`` returns zero there (Warp's ``kEps`` is 0) and the
-    # cross product follows, so the frame degrades to zeros rather than to NaN.
     f = wp.int32(wp.tid())
-    edge = vertices[faces[f * 3 + 1]] - vertices[faces[f * 3 + 0]]
-    basis_x = wp.normalize(edge)
+    basis_x, basis_y = face_tangent_basis(vertices, faces, f, normals[f])
     out_basis_x[f] = basis_x
-    out_basis_y[f] = wp.cross(normals[f], basis_x)
+    out_basis_y[f] = basis_y
+
+
+@wp.kernel
+def face_tangent_frames_and_normals(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    out_basis_x: wp.array[wp.vec3],
+    out_basis_y: wp.array[wp.vec3],
+    out_normals: wp.array[wp.vec3],
+) -> None:
+    # Same frame as ``face_tangent_frames``, for the caller that has no normals to hand: computing
+    # the normal here costs one cross product and one normalize, against a launch, an
+    # ``(n_faces,)`` round trip through global memory, and the areas buffer that producer writes
+    # and this consumer never reads.
+    f = wp.int32(wp.tid())
+    normal, _area = face_normals_and_area(vertices, faces, f)
+    basis_x, basis_y = face_tangent_basis(vertices, faces, f, normal)
+    out_basis_x[f] = basis_x
+    out_basis_y[f] = basis_y
+    out_normals[f] = normal
 
 
 @wp.func

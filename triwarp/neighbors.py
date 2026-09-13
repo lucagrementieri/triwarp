@@ -1531,7 +1531,7 @@ def geodesic_ball(
             wp.empty(0, dtype=wp.int32, device=device),
         )
 
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
     adjacency = tw.graph.edges_to_csr(n, unique_edges)
     adj_offsets = adjacency.offsets
     adj_columns = adjacency.columns

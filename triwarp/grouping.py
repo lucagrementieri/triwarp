@@ -288,8 +288,15 @@ def _unique_hash(
 
     unique_inverse = None
     if return_inverse:
-        sorted_dense = wp.empty(n_unique, dtype=sort_dtype, device=device)
-        wp.copy(sorted_dense, keys_buf, count=n_unique)
+        if sort_dtype == original_dtype:
+            # ``unique_values`` is already this exact buffer -- the same ``keys_buf`` prefix, copied
+            # out under the caller's dtype, which the sort dtype *is* on this branch. Allocating and
+            # copying it a second time produced two byte-identical arrays; the common key dtypes
+            # here (the ``uint64`` edge and row keys every ``edges_unique`` call packs) all take it.
+            sorted_dense = unique_values
+        else:
+            sorted_dense = wp.empty(n_unique, dtype=sort_dtype, device=device)
+            wp.copy(sorted_dense, keys_buf, count=n_unique)
         # The binary search has to probe in the same space the keys were sorted in.
         data_sorted_space = (
             data if data.dtype == sort_dtype else bitcast_from_int(data_int, sort_dtype, count=n)

@@ -17,6 +17,7 @@ from tests.comparisons import assert_unordered_rows_equal, lexsort_rows
 from tests.conftest import MESHES
 from tests.conversions import (
     meshlib_scalars_to_numpy,
+    numpy_to_warp,
     points_to_warp,
     pyvista_edges_to_indices,
     trimesh_to_meshlib,
@@ -696,3 +697,42 @@ def test_face_edge_lengths_are_the_opposite_edges(
         np.ascontiguousarray(mesh_tm.vertices), np.ascontiguousarray(mesh_tm.faces.astype(np.int64))
     )
     assert np.allclose(lengths, lengths_igl, rtol=1e-5, atol=1e-5)
+
+
+def test_edges_unique_unvalidated_matches_the_validated_answer(device: str) -> None:
+    """
+    ``validate=False`` skips a range check, not any of the work that produces the answer.
+
+    Triwarp against triwarp: the oracle for the row set itself is
+    ``test_edges_unique_matches_trimesh``, and what this pins is that the keyword every internal
+    caller now passes cannot change what those callers see. It also pins the guard the default
+    still provides, on an out-of-range index that would otherwise pack into a colliding key and
+    silently merge two distinct edges.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float32)
+    faces_np = np.asarray(mesh_tm.faces, dtype=np.int32).ravel()
+    _vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    n_vertices = int(vertices_np.shape[0])
+
+    validated, validated_inverse = tw.edges.edges_unique(faces_wp, n_vertices=n_vertices)
+    unvalidated, unvalidated_inverse = tw.edges.edges_unique(
+        faces_wp, n_vertices=n_vertices, validate=False
+    )
+    assert validated.shape[0] > 0
+    assert np.array_equal(unvalidated.numpy(), validated.numpy())
+    assert np.array_equal(unvalidated_inverse.numpy(), validated_inverse.numpy())
+
+    # The default still catches a face index outside ``[0, n_vertices)``.
+    broken_np = faces_np.copy()
+    broken_np[0] = n_vertices + 5
+    broken_wp = wp.array(broken_np, dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="must be less than max_index"):
+        _ = tw.edges.edges_unique(broken_wp, n_vertices=n_vertices)
+
+    # And the inferred-bound path checks the half it can: a negative index.
+    negative_np = faces_np.copy()
+    negative_np[0] = -3
+    negative_wp = wp.array(negative_np, dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="non-negative"):
+        _ = tw.edges.edges_unique(negative_wp)

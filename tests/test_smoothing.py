@@ -2016,3 +2016,25 @@ _REFINE_KWARGS = {
     "natural_smooth": False,
     "edge_weights": "cotangent",
 }
+
+
+def test_filter_laplacian_leaves_a_faceless_mesh_alone(device: str) -> None:
+    """
+    Triwarp against triwarp: the volume constraint must not touch a mesh it cannot measure.
+
+    Not a library comparison: trimesh's ``filter_laplacian`` requires a real mesh, so there is no
+    reference for the degenerate input. The invariant is that a face buffer with no faces leaves
+    every position exactly where it was.
+
+    The regression this pins is specific and was introduced by moving the rescale onto the device:
+    with no faces the mesh has no centre of mass, so the rescale's ``center`` is ``NaN``, and a
+    "skip" spelled as a scale of ``1.0`` is ``(p - NaN) * 1 + NaN`` -- which propagates instead of
+    cancelling. The skip has to decline to write at all.
+    """
+    positions_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    vertices_wp = points_to_warp(positions_np, device)
+    faces_wp = wp.array(np.zeros(0, dtype=np.int32), dtype=wp.int32, device=device)
+
+    smoothed_np = tw.smoothing.filter_laplacian(vertices_wp, faces_wp, iterations=3).numpy()
+    assert np.isfinite(smoothed_np).all()
+    assert np.array_equal(smoothed_np, positions_np)

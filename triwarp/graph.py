@@ -951,7 +951,7 @@ def shortest_path_envelope(
 
     ```python
     n_vertices = int(v.shape[0])
-    edges = tw.edges.edges_unique(f, n_vertices=n_vertices)[0]
+    edges = tw.edges.edges_unique(f, n_vertices=n_vertices, validate=False)[0]
     lengths = tw.edges.edges_unique_length(v, f, edges)
     adjacency = tw.graph.edges_to_csr(n_vertices, edges, lengths)
     seed = wp.full(n_vertices, 1.0e6, dtype=wp.float32, device=v.device)
