@@ -6,16 +6,25 @@ import itertools
 from collections.abc import Sequence
 from typing import TypeVar
 
+import numpy as np
 import warp as wp
 import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
+from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import scatter as kernel_scatter
 
 DType = TypeVar("DType")
+
+# Default tolerances of [`allclose`][triwarp.array.allclose], named because a second caller now
+# applies the same predicate to a pair of points (``polyline.is_closed``) and the two must not
+# drift: "close" has to mean one thing across the package.
+ALLCLOSE_RTOL = 1e-05
+ALLCLOSE_ATOL = 1e-08
 
 # Use a direct-index membership table when the value *span* (max - min + 1, over both inputs) is at
 # most this multiple of |test_elements|.
@@ -443,15 +452,94 @@ def _pack_segments(
         if already_packed is not None:
             return already_packed, offsets
 
-    # One ``wp.copy`` per segment. There is no segmented alternative -- Warp has no array-of-arrays
-    # and a kernel cannot dereference a raw pointer -- and graph capture cannot amortize this loop
-    # either, since the segment pointers change on every call, so a recorded graph could never be
-    # replayed against new segments.
     flat = wp.empty(total, dtype=dtype, device=device)
-    for arr, offset, n in zip(arrays, offsets, sizes, strict=True):
-        if n > 0:
-            wp.copy(flat, arr, dest_offset=offset, count=n)
+    if not _pack_in_one_launch(arrays, sizes, offsets, flat):
+        # One ``wp.copy`` per segment: the fallback, and the right answer below the threshold above
+        # (a copy is ~6 us of host time and a launch is ~10, so a handful of segments never earns
+        # the descriptor). Graph capture cannot amortize this loop either, since the segment
+        # pointers change on every call, so a recorded graph could never be replayed against new
+        # segments.
+        for arr, offset, n in zip(arrays, offsets, sizes, strict=True):
+            if n > 0:
+                wp.copy(flat, arr, dest_offset=offset, count=n)
     return flat, offsets
+
+
+# Segment count from which ``_pack_segments`` builds a descriptor table and copies in one launch
+# instead of one ``wp.copy`` per segment. The two costs are a straight line against a flat one --
+# the loop is ~6 us of host time per segment whatever it holds, the single launch is 0.078-0.094 ms
+# regardless of segment count *or* total size -- so the whole choice is where they cross. Measured
+# on an RTX 5090 / Warp 1.17 with the total held at 2 614 242 elements: 0.27x at 2 segments, 0.68x
+# at 8, **1.89x at 32**, 3.64x at 64, 14.91x at 256, 50.76x at 1 024 and 149.75x at 4 096, with the
+# same shape at totals down to 48 903. 32 is the first swept value on the winning side; 16 is where
+# the lines actually cross, and the threshold is set at the measured point rather than the
+# interpolated one.
+PACK_SEGMENTS_KERNEL_FROM = 32
+
+# Widest per-segment launch dimension ``_pack_segments`` will ask for. The kernel strides by this,
+# so it only bounds the *grid*, never the work: without a cap a 256-way split whose first piece
+# holds nearly all of a 2.6 M-element buffer would launch 670 M threads of which 99.6 % exit at
+# once.
+_PACK_SEGMENTS_MAX_WIDTH = 4096
+
+
+def _pack_in_one_launch(
+    arrays: Sequence[wp.array[DType]],
+    sizes: Sequence[int],
+    offsets: Sequence[int],
+    flat: wp.array[DType],
+) -> bool:
+    """
+    Copy every segment into ``flat`` with a single launch, or return ``False`` if that cannot apply.
+
+    Warp has no array-of-arrays type, but a ``@wp.struct`` may carry a ``wp.array`` field and a
+    ``wp.array`` of *that* is a descriptor table a kernel can index — see
+    ``kernels.array.pack_segment_words`` for the measurement and for why one kernel serves every
+    dtype rather than a table of them. The descriptor is built as a single NumPy structured array
+    through the struct's own ``numpy_dtype()`` and uploaded once, which matters: constructing the
+    256 struct instances one at a time in Python costs 0.62 ms of the 0.71 ms a per-object build
+    takes, and would give most of the win straight back.
+
+    Returns ``False`` — leaving ``flat`` untouched for the caller's copy loop — when there are too
+    few segments to pay for the descriptor, or when the dtype's itemsize is not a multiple of four
+    and so cannot be addressed as whole words.
+    """
+    n_segments = len(arrays)
+    if n_segments < PACK_SEGMENTS_KERNEL_FROM:
+        return False
+    itemsize = int(wp.types.type_size_in_bytes(flat.dtype))
+    if itemsize % 4 != 0:
+        return False
+    words_per_element = itemsize // 4
+    word_counts = np.asarray(sizes, dtype=np.int64) * words_per_element
+    if int(word_counts.max()) == 0:
+        return False
+    record_np = np.zeros(n_segments, dtype=kernel_array.WordSegment.numpy_dtype())
+    record_np["data"]["data"] = np.asarray([arr.ptr or 0 for arr in arrays], dtype=np.uint64)
+    record_np["data"]["shape"][:, 0] = word_counts
+    record_np["data"]["strides"][:, 0] = 4
+    record_np["data"]["ndim"] = 1
+    record_np["offset"] = np.asarray(offsets, dtype=np.int64) * words_per_element
+    record_np["count"] = word_counts
+    descriptor = wp.array(record_np, dtype=kernel_array.WordSegment, device=flat.device, copy=True)
+    # A second, zero-copy handle on the destination, typed as the words the kernel moves. This is
+    # the same reinterpretation ``wp.array.view`` performs, written out because ``view`` refuses a
+    # dtype of a different size and every dtype wider than four bytes needs exactly that.
+    words_flat = wp.array(
+        ptr=flat.ptr,
+        dtype=wp.int32,
+        shape=int(flat.shape[0]) * words_per_element,
+        device=flat.device,
+    )
+    width = min(int(word_counts.max()), _PACK_SEGMENTS_MAX_WIDTH)
+    wp.launch(
+        kernel_array.pack_segment_words,
+        dim=(n_segments, width),
+        inputs=[descriptor, wp.int32(width)],
+        outputs=[words_flat],
+        device=flat.device,
+    )
+    return True
 
 
 def _tiled_span(
@@ -515,8 +603,8 @@ def allclose(
     a: wp.array[wp.Float] | wp.array[wp.vec3],
     b: wp.array[wp.Float] | wp.array[wp.vec3],
     *,
-    rtol: float = 1e-05,
-    atol: float = 1e-08,
+    rtol: float = ALLCLOSE_RTOL,
+    atol: float = ALLCLOSE_ATOL,
 ) -> bool:
     """
     Test whether two arrays are element-wise equal within a tolerance (``numpy.allclose``).
@@ -560,13 +648,20 @@ def allclose(
     if n == 0:
         return True
 
-    mask = wp.empty(n, dtype=wp.bool, device=a.device)
-    if a.dtype == wp.vec3:
-        wp.map(kernel_array.is_close_vec3, a, b, wp.float32(rtol), wp.float32(atol), out=mask)
-    else:
-        scalar = a.dtype
-        wp.map(kernel_array.is_close_scalar, a, b, scalar(rtol), scalar(atol), out=mask)
-    return bool(tw.reduce.all(mask))
+    # The predicate folds into its own reduction: one launch and one four-byte accumulator, rather
+    # than a ``wp.map`` into an ``(n,)`` mask and a whole ``reduce.all`` over it. See
+    # ``kernels/reduce.ALLCLOSE_1D_TILED``, including why it is a table of concrete kernels.
+    tolerance = wp.float32 if a.dtype == wp.vec3 else a.dtype
+    flag = wp.ones(1, dtype=wp.int32, device=a.device)
+    wp.launch_tiled(
+        kernel_reduce.ALLCLOSE_1D_TILED[a.dtype],
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[a, b, tolerance(rtol), tolerance(atol)],
+        outputs=[flag],
+        block_dim=TILE_1D,
+        device=a.device,
+    )
+    return bool(int(read_scalar(flag, 0)) != 0)
 
 
 def sort_and_argsort(

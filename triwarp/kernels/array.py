@@ -1195,3 +1195,61 @@ def trilinear_weight(
         * wp.where(offset_y == 0, 1.0 - fractions[1], fractions[1])
         * wp.where(offset_z == 0, 1.0 - fractions[2], fractions[2])
     )
+
+
+# ---------------------------------------------------------------------------
+# Segmented copy: many separate arrays into one buffer, in a single launch.
+#
+# ``array._pack_segments`` used to issue one ``wp.copy`` per segment, which is a host cost of
+# ~6 us each (CLAUDE.md section 13.1) and therefore linear in the segment count while the data
+# volume is irrelevant -- 1.37 ms to concatenate 256 arrays, whatever they hold. Its own comment
+# said there was no alternative, "Warp has no array-of-arrays and a kernel cannot dereference a
+# raw pointer". **Warp does have an array-of-arrays**: a ``@wp.struct`` may carry a ``wp.array``
+# field, and a ``wp.array`` of that struct is exactly a descriptor table, which ``segments[s].data``
+# indexes from kernel scope. Measured on an RTX 5090 / Warp 1.17, total held at 2 614 242 elements:
+#
+#   segments      2      8     32     64    256    1024    4096
+#   loop (ms)  0.026  0.063  0.172  0.341  1.372   5.187  21.529
+#   kernel     0.094  0.092  0.091  0.094  0.092   0.102   0.144
+#   ratio      0.27x  0.68x  1.89x  3.64x 14.91x  50.76x 149.75x
+#
+# The kernel form is **flat in both the segment count and the data volume** (0.078-0.094 ms at
+# totals from 48 903 to 2 614 242), so the whole choice is a segment-count threshold; see
+# ``array.PACK_SEGMENTS_KERNEL_FROM``.
+#
+# **One kernel serves every dtype**, rather than a table of them. The descriptor's array field is
+# declared ``wp.array[wp.int32]`` and pointed at the segment's storage with a length in 4-byte
+# *words*, and the destination is aliased the same way, so this is a byte copy that never names the
+# caller's dtype -- verified byte-identical for ``int32``, ``float32``, ``float64``, ``vec3`` and
+# ``uint64``. A dtype whose itemsize is not a multiple of 4 (``bool``, ``int8``, ``int16``) cannot
+# be addressed this way and keeps the copy loop.
+# ---------------------------------------------------------------------------
+
+
+@wp.struct
+class WordSegment:
+    """One source segment of a packed copy, addressed as 4-byte words."""
+
+    data: wp.array[wp.int32]
+    offset: wp.int32
+    count: wp.int32
+
+
+@wp.kernel
+def pack_segment_words(
+    segments: wp.array[WordSegment], width: wp.int32, out_flat: wp.array[wp.int32]
+) -> None:
+    # Copy every segment into its slot of ``out_flat``, one launch for all of them.
+    #
+    # Launched ``dim=(n_segments, width)`` with ``width`` the host's ``min(longest, cap)``, and each
+    # thread strides its own segment by ``width``. **The stride is what bounds the grid**: a plain
+    # ``dim=(n_segments, longest)`` is mostly threads that exit immediately whenever the split is
+    # uneven -- 670 M of them for a 256-way split whose first piece holds nearly all of a 2.6 M
+    # buffer. This is an ordinary grid stride and not section 2.2's ``wp.block_dim()`` case: these
+    # lanes do not cooperate, there is no tile here, and every thread of a plain ``wp.launch``
+    # grid runs on both devices, so taking the stride from the grid's own second dimension is
+    # correct on CPU as well.
+    s, t = wp.tid()
+    segment = segments[s]
+    for k in range(t, segment.count, width):
+        out_flat[segment.offset + k] = segment.data[k]
