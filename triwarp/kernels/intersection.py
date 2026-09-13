@@ -970,15 +970,23 @@ def crossing_point(
     return point_from + t * (point_to - point_from)
 
 
+@wp.func
+def edge_key(a: wp.int64, b: wp.int64, base: wp.int64) -> wp.int64:
+    # Order-independent key of the undirected edge ``(a, b)``: injective for vertex indices below
+    # ``base``, which is what lets two faces sharing a crossing agree on it without a unique-edge
+    # table. See ``marching_triangles_segments`` for what it replaced.
+    return wp.min(a, b) * base + wp.max(a, b)
+
+
 @wp.kernel
 def marching_triangles_segments(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     values: wp.array[wp.Float],
-    edge_ids: wp.array[wp.int32],
+    key_base: wp.int64,
     out_valid: wp.array[wp.bool],
     out_segments: wp.array2d[wp.vec3],
-    out_edges: wp.array2d[wp.int32],
+    out_edges: wp.array2d[wp.int64],
 ) -> None:
     # One thread per face. ``values`` is the field with the isovalue already subtracted, and a value
     # of exactly zero counts as positive, so every cut face has exactly one vertex alone in sign and
@@ -1029,10 +1037,22 @@ def marching_triangles_segments(
         value_lone, values[vertex_prev], vertices[vertex_lone], vertices[vertex_prev]
     )
     # Halfedge ``3f + k`` spans local corners ``k`` and ``k + 1``, so the edge from ``lone`` to the
-    # next corner is halfedge ``lone`` and the edge from the previous corner to ``lone`` is halfedge
-    # ``prev_index``; their unique-edge ids are what stitches segments into curves.
-    edge_next = edge_ids[f * 3 + lone]
-    edge_prev = edge_ids[f * 3 + prev_index]
+    # next corner joins ``vertex_lone`` to ``vertex_next``, and the edge from the previous corner to
+    # ``lone`` joins ``vertex_prev`` to ``vertex_lone``. A key that stitches segments into curves
+    # only has to be *equal for the two faces sharing a crossing and distinct otherwise*, and the
+    # sorted vertex pair already is -- so it is computed here rather than looked up in a dense
+    # unique-edge table.
+    #
+    # That table used to be built by ``edges.edges_unique_inverse`` over the whole mesh, which was
+    # **41 % of ``marching_triangles``** (0.536 ms of 1.318 on a 81 920-face sphere) and densified
+    # all 122 880 edges when a level set crosses on the order of a thousand of them. The
+    # densification that ``_link_segments`` genuinely needs now happens there, over the crossing
+    # endpoints alone.
+    #
+    # ``key_base`` is the vertex count, so the pair packs without collision; the caller resolves it
+    # from its own ``n_vertices`` argument.
+    edge_next = edge_key(wp.int64(vertex_lone), wp.int64(vertex_next), key_base)
+    edge_prev = edge_key(wp.int64(vertex_prev), wp.int64(vertex_lone), key_base)
 
     # Orient the segment so the region where the field exceeds the isovalue lies to its left, with
     # the face normal as up. That makes the crossing shared by two faces an outgoing endpoint of one
@@ -1077,10 +1097,10 @@ def _register_overloads() -> None:
                 wp.array[wp.vec3],
                 wp.array[wp.int32],
                 wp.array[d],
-                wp.array[wp.int32],
+                wp.int64,
                 wp.array[wp.bool],
                 wp.array2d[wp.vec3],
-                wp.array2d[wp.int32],
+                wp.array2d[wp.int64],
             ]
             for d in (wp.float32, wp.float64)
         },

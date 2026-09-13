@@ -196,7 +196,7 @@ def marching_triangles(
     segment; a contour running exactly through a vertex therefore yields zero-length segments rather
     than an ambiguous junction.
 
-    Crossings are matched by [`edges_unique_inverse`][triwarp.edges.edges_unique_inverse], then
+    Crossings are matched by the vertex pair of the edge they lie on, then
     linked on the host: the segment list is compacted on device first, so the readback is one
     ``int32`` pair per segment, and the linking itself is a vectorized pointer-doubling ranking over
     the compacted arrays with no per-segment iteration (the same successor-graph shape
@@ -220,9 +220,9 @@ def marching_triangles(
     isovalue
         Level to extract.
     n_vertices
-        Total vertex count, forwarded to
-        [`edges_unique_inverse`][triwarp.edges.edges_unique_inverse] as the hash base. When
-        ``None`` it is inferred there with a host readback.
+        Total vertex count, used as the base that packs a crossed edge's two vertex indices into
+        the key matching it across the two faces that share it. When ``None`` the length of
+        ``vertices`` is used, which bounds every index the faces may reference.
 
     Returns
     -------
@@ -260,14 +260,16 @@ def marching_triangles(
     shifted = wp.empty(int(values.shape[0]), dtype=values.dtype, device=device)
     wp.map(wp.sub, values, values.dtype(isovalue), out=shifted)
 
-    edge_ids = tw.edges.edges_unique_inverse(faces, n_vertices=n_vertices)
+    # The key base only has to exceed every vertex index the faces reference; ``vertices`` is the
+    # buffer they index, so its length is the bound whenever the caller did not give one.
+    key_base = int(n_vertices) if n_vertices is not None else int(vertices.shape[0])
     valid = wp.empty(n_faces, dtype=wp.bool, device=device)
     segments = twt.empty_2d((n_faces, 2), wp.vec3, device=device)
-    segment_edges = twt.empty_2d((n_faces, 2), wp.int32, device=device)
+    segment_edges = twt.empty_2d((n_faces, 2), wp.int64, device=device)
     wp.launch(
         kernel_intersections.MARCHING_TRIANGLES_SEGMENTS[shifted.dtype],
         dim=n_faces,
-        inputs=[vertices, faces, shifted, edge_ids, valid, segments, segment_edges],
+        inputs=[vertices, faces, shifted, wp.int64(key_base), valid, segments, segment_edges],
         device=device,
     )
 
@@ -277,7 +279,7 @@ def marching_triangles(
         return [], []
 
     hit_segments = tw.array.gather(segments, cut_faces)
-    hit_edges = twt.as_array2d(tw.array.gather(segment_edges, cut_faces), wp.int32)
+    hit_edges = twt.as_array2d(tw.array.gather(segment_edges, cut_faces), wp.int64)
 
     slots_np, starts_np, closed = _link_segments(hit_edges.numpy())
 
@@ -306,13 +308,42 @@ def _link_segments(segment_edges: np.ndarray) -> tuple[np.ndarray, np.ndarray, l
     segment so the result does not depend on face order.
 
     **Nothing here iterates per segment.** The successor comes from a lookup table rather than a
-    sort -- an endpoint's unique-edge id indexes "which segment starts here", three ``O(n)`` passes
-    against an ``argsort`` -- and the ordering is two passes of Wyllie pointer doubling, vectorized
-    in NumPy rather than one Python iteration per segment.
+    sort -- an endpoint's densified edge id indexes "which segment starts here", three ``O(n)``
+    passes -- and the ordering is two passes of Wyllie pointer doubling, vectorized in NumPy rather
+    than one Python iteration per segment.
     """
     n = int(segment_edges.shape[0])
-    start_edge = np.ascontiguousarray(segment_edges[:, 0])
-    end_edge = np.ascontiguousarray(segment_edges[:, 1])
+    # The kernel hands back a *sparse* edge key per endpoint -- the crossed edge's packed vertex
+    # pair -- not a dense id, so the lookup table below is indexed through one ``np.unique`` over
+    # the crossing endpoints alone. That densification used to happen on the *device*, over every
+    # edge of the mesh, through ``edges.edges_unique_inverse``: **41 % of ``marching_triangles``**
+    # (0.536 ms of 1.318 on an 81 920-face sphere), and sized by the mesh where a contour crosses
+    # a small fraction of its edges. Here it is ``2n`` values and it grows with the level set
+    # instead. Measured on a 327 680-face sphere against the device pass: **2.35x** at 1 534 curve
+    # points, **1.28x** at 11 924, level at 39 772 -- the crossover is where a contour touches
+    # enough edges for a host sort of them to cost what a device pass over all of them did.
+    #
+    # **A sorted join was tried here instead and is 1.14-1.91x slower** -- ``argsort`` the start
+    # keys, ``searchsorted`` the end keys into them, no densification and no ``owner`` table at
+    # all. Interleaved in one process on the same captured input, both producing the identical
+    # ``successor``: 0.084 / 0.730 / 1.514 ms for this spelling against 0.096 / 1.296 / 2.899 at
+    # 1 534 / 11 924 / 39 772 segments.
+    #
+    # The reason is not the extra gathers (those are 0.09 ms of 2.80) -- it is that the join needs
+    # **two** sort-class passes where this one needs one. Phase-timed at 39 772 segments:
+    # ``np.searchsorted(n into n)`` alone is **1.83 ms**, about what ``np.unique`` over ``2n``
+    # costs (1.34), because a binary search is ``n log n`` *dependent, cache-missing* probes into a
+    # 318 kB array rather than a streaming sort -- the same search into a cache-resident 1 000-entry
+    # array runs 7.6x faster at the identical query count. On top of that ``np.argsort`` is ~5.5x
+    # ``np.sort`` (0.905 against 0.164 at ``n``), because it permutes indices through indirect
+    # comparisons, and the join needs the argsort specifically to recover *which* segment won.
+    #
+    # So densifying is not overhead paid to enable the table: the dense labels make the join itself
+    # a single O(1)-per-element lookup (0.021 ms), which is worth more than the search it avoids.
+    # Do not re-propose the join.
+    dense = np.unique(segment_edges.reshape(-1), return_inverse=True)[1].reshape(-1, 2)
+    start_edge = np.ascontiguousarray(dense[:, 0])
+    end_edge = np.ascontiguousarray(dense[:, 1])
     index = np.arange(n, dtype=np.int64)
 
     # ``owner[e]`` is the segment whose *outgoing* endpoint lies on edge ``e``, so the successor of
