@@ -147,7 +147,9 @@ def test_minmax_2d_axis(device: str, axis: int) -> None:
     assert np.allclose(got_max_wp.numpy(), exp_max_np, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity("any_bool", "numpy")
 def test_any_1d(device: str) -> None:
+    """Class A, against ``numpy.any``, on a mask that is neither all-``True`` nor all-``False``."""
     rng = np.random.default_rng(42)
     mask_np = rng.choice([False, True], size=(100,), replace=True)
     mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
@@ -156,7 +158,9 @@ def test_any_1d(device: str) -> None:
     assert any_wp == any_ref_np
 
 
+@pytest.mark.parity("all_bool", "numpy")
 def test_all_1d(device: str) -> None:
+    """Class A, against ``numpy.all``, on a mask that is neither all-``True`` nor all-``False``."""
     rng = np.random.default_rng(42)
     mask_np = rng.choice([False, True], size=(100,), replace=True)
     mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
@@ -370,7 +374,15 @@ def test_sum_2d_axis(device: str, axis: int) -> None:
     assert np.array_equal(got_wp.numpy(), exp_np)
 
 
+@pytest.mark.parity("sum_bool", "numpy")
 def test_sum_bool_1d(device: str) -> None:
+    """
+    Class A, against ``numpy.ndarray.sum`` over the same mask.
+
+    Counts a ``wp.bool`` mask without widening it to ``int32`` first, so this is the value gate on
+    ``kernels.reduce._reduce_bool_1d_tiled``. The mask is half set, so neither an all-zero nor an
+    all-one shortcut would pass it.
+    """
     rng = np.random.default_rng(42)
     mask_np = rng.choice([False, True], size=(100,), replace=True)
     mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)

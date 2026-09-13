@@ -12,7 +12,7 @@ import warp as wp
 from warp._src.context import builtin_functions as _warp_builtins
 
 from triwarp.constants import TILE_1D, TILE_2D, TILES_PER_BLOCK_1D
-from triwarp.kernels.array import KernelTable
+from triwarp.kernels.array import KernelTable, is_close_scalar, is_close_vec3
 
 _tile_min = _warp_builtins["tile_min"]
 _tile_max = _warp_builtins["tile_max"]
@@ -529,6 +529,56 @@ SUM_2D_COLS_SERIAL = KernelTable(
 # concrete kernel rather than a dtype table.
 # ---------------------------------------------------------------------------
 
+
+def _reduce_bool_1d_tiled(tile_reduce, atomic, scalar, identity, name):
+    """
+    axis=None over a ``wp.bool`` mask, read as bytes instead of through an ``int32`` copy.
+
+    ``wp.Scalar`` does not instantiate for ``wp.bool`` (CLAUDE.md section 12.4), so the factories
+    above cannot serve a mask and the wrapper used to widen one with ``array.astype`` first: an
+    allocation of ``4n`` bytes, a launch, a full read of ``n`` and a full write of ``4n``, after
+    which the reduction read ``4n`` rather than ``n`` -- nine bytes of traffic per mask byte, plus
+    a launch and an allocation, to answer one boolean. This reads the mask directly.
+
+    **The shape differs from ``_reduce_1d_tiled``'s and the difference is forced.** There is no
+    ``wp.tile_load`` of a ``bool`` array, so the block's chunk is walked by the lanes rather than
+    loaded as tiles: each lane strides by ``wp.block_dim()`` -- never by ``TILE_1D``, which is what
+    keeps it correct on the CPU device, where ``wp.launch_tiled`` runs one lane per block and
+    ``wp.block_dim()`` reads 1 (section 2.2) -- accumulates in a register, and the block folds the
+    per-lane values with a single ``wp.tile`` reduction. That is one tile reduction per block where
+    the tile-load form runs ``TILES_PER_BLOCK_1D`` of them, and the strided reads are coalesced
+    (consecutive lanes, consecutive bytes).
+
+    ``identity`` seeds a lane that draws no element: ``0`` for ``sum`` and ``any``, ``1`` for
+    ``all``. The tile-load factory seeds from the block's first chunk instead and so needs none,
+    which it cannot do here because a lane may legitimately have nothing.
+    """
+
+    def _k(values: wp.array[wp.bool], out_result: wp.array[wp.int32]) -> None:
+        i, t = wp.tid()
+        n = values.shape[0]
+        base, remaining = tile_chunk(n, i, ITEMS_PER_BLOCK_1D)
+        if remaining <= 0:
+            return
+        # ``tile_chunk`` reports what is left from ``base`` to the end of the array, not this
+        # block's share of it -- clamping is the caller's job, and the tile-load factory above does
+        # it implicitly through its fixed ``TILES_PER_BLOCK_1D`` loop. This loop is bounded by
+        # ``remaining``, so it has to clamp explicitly or block 0 walks the whole array.
+        remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+        acc = wp.int32(identity)
+        for k in range(t, remaining, wp.block_dim()):
+            acc = scalar(acc, wp.where(values[base + k], wp.int32(1), wp.int32(0)))
+        block_result = tile_reduce(wp.tile(acc))[0]
+        if t == 0:
+            atomic(out_result, 0, block_result)
+
+    return wp.kernel(_k, name=name)
+
+
+sum_bool_1d_tiled = _reduce_bool_1d_tiled(_tile_sum, wp.atomic_add, wp.add, 0, "sum_bool_1d_tiled")
+any_bool_1d_tiled = _reduce_bool_1d_tiled(_tile_max, wp.atomic_max, wp.max, 0, "any_bool_1d_tiled")
+all_bool_1d_tiled = _reduce_bool_1d_tiled(_tile_min, wp.atomic_min, wp.min, 1, "all_bool_1d_tiled")
+
 any_1d_tiled = _reduce_1d_tiled(_tile_max, wp.atomic_max, wp.max, "any_1d_tiled", wp.int32)
 any_2d_rows_tiled = _reduce_2d_axis_tiled(
     _tile_max, wp.atomic_max, wp.max, "any_2d_rows_tiled", True, wp.int32
@@ -929,3 +979,65 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
 # rule in CLAUDE.md section 2.5 is unchanged and still binds every other kernel module -- what
 # changed is that the tables now hand the wrapper the concrete kernel instead of making
 # ``wp.launch`` re-derive it (see the note above ``MIN1D_TILED``).
+
+
+# ---------------------------------------------------------------------------
+# Fused all-close reduction.
+#
+# ``array.allclose`` ran a ``wp.map`` of the element predicate into an ``(n,)`` mask and then a
+# whole ``reduce.all`` over it -- two launches, two allocations, ~11 us of map resolution and a
+# reduction that reads back what the predicate pass already knew. The answer is one boolean, so the
+# predicate folds into its own reduction: one launch, one four-byte accumulator, one readback.
+#
+# **A table of concrete kernels rather than one generic one**, for ``_reduce_1d_tiled``'s reason
+# (CLAUDE.md section 2.7): a generic kernel pays ~12 us of host-side overload resolution on every
+# launch, which on a call this small is most of what the fusion just saved. Registered over exactly
+# the dtypes ``allclose``'s own signature admits -- ``float16`` / ``float32`` / ``float64`` and
+# ``wp.vec3`` -- which is section 2.5's rule, not every dtype the template would accept.
+#
+# The fold is ``wp.min`` over a per-lane 0/1, so "all close" is "the block minimum is 1"; lanes with
+# no element seed 1 (the identity), and the commit is one ``wp.atomic_min`` per block.
+# ---------------------------------------------------------------------------
+
+
+def _allclose_1d_tiled(name, dtype, predicate, tolerance_dtype):
+    """One concrete ``allclose`` kernel: the element predicate folded into its own reduction."""
+
+    def _k(
+        a: wp.array[wp.Scalar],
+        b: wp.array[wp.Scalar],
+        rtol: wp.Scalar,
+        atol: wp.Scalar,
+        out_flag: wp.array[wp.int32],
+    ) -> None:
+        i, lane = wp.tid()
+        offset, remaining = tile_chunk(a.shape[0], i, ITEMS_PER_BLOCK_1D)
+        if remaining <= 0:
+            return
+        # ``tile_chunk`` reports what is left to the end of the array, not this block's share --
+        # see its own docstring, and ``kernels/reduce._reduce_bool_1d_tiled`` for the same clamp.
+        remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+        close = wp.int32(1)
+        for k in range(lane, remaining, wp.block_dim()):
+            slot = offset + k
+            if not predicate(a[slot], b[slot], rtol, atol):
+                close = wp.int32(0)
+        block_close = wp.tile_min(wp.tile(close))[0]
+        if lane == 0:
+            wp.atomic_min(out_flag, 0, block_close)
+
+    _k.__annotations__["a"] = wp.array[dtype]
+    _k.__annotations__["b"] = wp.array[dtype]
+    _k.__annotations__["rtol"] = tolerance_dtype
+    _k.__annotations__["atol"] = tolerance_dtype
+    return wp.kernel(_k, name=name)
+
+
+ALLCLOSE_1D_TILED = KernelTable(
+    "allclose_1d_tiled",
+    {
+        d: _allclose_1d_tiled(f"allclose_1d_tiled_{d.__name__}", d, is_close_scalar, d)
+        for d in (wp.float16, wp.float32, wp.float64)
+    }
+    | {wp.vec3: _allclose_1d_tiled("allclose_1d_tiled_vec3", wp.vec3, is_close_vec3, wp.float32)},
+)

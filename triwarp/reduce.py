@@ -269,12 +269,25 @@ def sum(
         return _launch_vec3_tiled_sum(kernel_reduce.sum_vec3_1d_tiled, n, array.device, [array])
     if array.dtype == wp.bool:
         mask = cast(wp.array[wp.bool], array)
-        mask_i32 = astype(mask, wp.int32)
-        if mask.ndim == 2 and axis is None:
-            mask_i32 = mask_i32.flatten()
-        result = _reduce_scalar(cast(twt.ScalarArray, mask_i32), axis, _SCALAR_REDUCE["sum"])
         if axis is None:
-            return int(cast(int, result))
+            # Counted straight off the mask bytes; see ``_launch_global_bool_tiled`` for why the
+            # ``int32`` widening this used to do is worth removing, and why the ``axis`` branch
+            # below keeps it.
+            flat = mask.flatten() if mask.ndim == 2 else mask
+            if int(flat.shape[0]) == 0:
+                raise ValueError("sum requires a non-empty array.")
+            total = wp.zeros(1, dtype=wp.int32, device=flat.device)
+            wp.launch_tiled(
+                kernel_reduce.sum_bool_1d_tiled,
+                dim=[kernel_reduce.blocks_1d(int(flat.shape[0]))],
+                inputs=[flat, total],
+                block_dim=TILE_1D,
+                device=flat.device,
+            )
+            return int(read_scalar(total, 0))
+        result = _reduce_scalar(
+            cast(twt.ScalarArray, astype(mask, wp.int32)), axis, _SCALAR_REDUCE["sum"]
+        )
         return cast(twt.Array1dInt32, result)
     return cast(
         float | int | twt.Array1dScalar,
@@ -487,6 +500,7 @@ class _ScalarReduceSpec(NamedTuple):
 
 class _BoolReduceSpec(NamedTuple):
     name: str
+    bool_1d: wp.Kernel
     axis_rows_tiled: wp.Kernel
     axis_cols_tiled: wp.Kernel
     axis_rows_serial: wp.Kernel
@@ -549,6 +563,7 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
 _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
     "any": _BoolReduceSpec(
         name="any",
+        bool_1d=kernel_reduce.any_bool_1d_tiled,
         axis_rows_tiled=kernel_reduce.any_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.any_2d_cols_tiled,
         axis_rows_serial=kernel_reduce.any_2d_rows_serial,
@@ -558,6 +573,7 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
     ),
     "all": _BoolReduceSpec(
         name="all",
+        bool_1d=kernel_reduce.all_bool_1d_tiled,
         axis_rows_tiled=kernel_reduce.all_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.all_2d_cols_tiled,
         axis_rows_serial=kernel_reduce.all_2d_rows_serial,
@@ -779,16 +795,21 @@ def _reduce_bool(
         raise ValueError(f"{spec.name} requires a non-empty array.")
 
     if array.ndim == 1:
-        mask_i32 = astype(array, wp.int32)
-        return _launch_global_bool_tiled(mask_i32, spec)
+        return _launch_global_bool_tiled(array, spec)
 
     if array.ndim == 2:
-        mask_i32 = astype(array, wp.int32)
         n_rows, n_cols = int(array.shape[0]), int(array.shape[1])
         if axis is None:
-            return _launch_global_bool_tiled(mask_i32.flatten(), spec)
+            return _launch_global_bool_tiled(array.flatten(), spec)
         if axis not in (0, 1):
             raise ValueError(f"{spec.name} requires axis to be 0, 1, or None for a 2D array.")
+        # The *axis* reductions still widen the mask first. They return a per-row or per-column
+        # array rather than one scalar, so their answer is an ``int32`` buffer that has to be cast
+        # back to ``bool`` on the way out anyway, and the kernels behind them are the shared
+        # ``_reduce_2d_axis_*`` factories -- giving those a bool-input twin would double a family
+        # of four to save one of the two casts. The whole-array path above, which is every in-repo
+        # caller, reads the mask directly.
+        mask_i32 = astype(array, wp.int32)
         n_out, reduced = (n_rows, n_cols) if axis == 1 else (n_cols, n_rows)
         if reduced < TILE_1D:
             # Same rule as _launch_axis_scalar: below TILE_1D the tiled form only amplifies reads.
@@ -812,14 +833,20 @@ def _reduce_bool(
     raise ValueError(f"{spec.name} requires a 1D or 2D array.")
 
 
-def _launch_global_bool_tiled(mask_i32: wp.array[wp.int32], spec: _BoolReduceSpec) -> bool:
-    out = wp.full(1, spec.init_global, dtype=wp.int32, device=mask_i32.device)
-    n = int(mask_i32.shape[0])
+def _launch_global_bool_tiled(mask: wp.array[wp.bool], spec: _BoolReduceSpec) -> bool:
+    # The mask is read as ``wp.bool`` rather than widened to ``int32`` first. ``wp.Scalar`` does
+    # not instantiate for ``wp.bool`` (CLAUDE.md section 12.4), so the shared scalar factories
+    # cannot serve one and this used to run ``array.astype`` -- an allocation of ``4n`` bytes, a
+    # launch, a full read of ``n`` and a full write of ``4n``, after which the reduction read
+    # ``4n`` rather than ``n``. See ``kernels.reduce._reduce_bool_1d_tiled`` for the kernel that
+    # replaces it and why its block shape differs from the tile-load family's.
+    out = wp.full(1, spec.init_global, dtype=wp.int32, device=mask.device)
+    n = int(mask.shape[0])
     wp.launch_tiled(
-        spec.tiled_1d,
+        spec.bool_1d,
         dim=[kernel_reduce.blocks_1d(n)],
-        inputs=[mask_i32, out],
+        inputs=[mask, out],
         block_dim=TILE_1D,
-        device=mask_i32.device,
+        device=mask.device,
     )
     return bool(int(read_scalar(out, 0)) != 0)

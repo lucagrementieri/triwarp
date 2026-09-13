@@ -126,6 +126,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from conftest import BenchCase
 
+_mask_cache: dict[tuple[str, str], wp.array] = {}
 _scalar_cache: dict[tuple[str, str], wp.array[wp.float32]] = {}
 _rows_cache: dict[tuple[str, str], twt.Array2dFloat32] = {}
 _scalar_np_cache: dict[str, np.ndarray] = {}
@@ -213,6 +214,75 @@ def _rows_wp(bench_case: BenchCase) -> twt.Array2dFloat32:
             _rows_np(bench_case), dtype=wp.float32, device=bench_case.device
         )
     return _rows_cache[key]
+
+
+def _mask_wp(bench_case: BenchCase) -> wp.array[wp.bool]:
+    """``(n_vertices,)`` ``wp.bool`` mask — roughly half set, so no predicate short-circuits."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _mask_cache:
+        _mask_cache[key] = wp.array(
+            _scalars_np(bench_case) > float(np.median(_scalars_np(bench_case))),
+            dtype=wp.bool,
+            device=bench_case.device,
+        )
+    return _mask_cache[key]
+
+
+@pytest.mark.benchmark(group="sum_bool")
+@pytest.mark.benchlibs("triwarp", "numpy")
+def test_sum_bool(bench_case: BenchCase) -> None:
+    """
+    Counting a ``wp.bool`` mask, the shape thirteen call sites across the package use.
+
+    Timed separately from ``sum_scalar`` because a mask is **one byte per element** where a float32
+    is four, so this is the one reduction whose traffic is set by the input dtype rather than by the
+    launch floor, and the only one where a host readback of the whole buffer is a serious rival (a
+    bool copy is a quarter the bytes of the float32 one ``sum_scalar`` would need). Callers that
+    reduce a mask once per call are the majority; ``registration.icp`` reduces one per iteration.
+    """
+    if bench_case.kind == "numpy":
+        mask_np = _scalars_np(bench_case) > float(np.median(_scalars_np(bench_case)))
+        total_np = bench_case.run(lambda: int(mask_np.sum()))
+        assert total_np >= 0
+        return
+    mask = _mask_wp(bench_case)
+    total = bench_case.run(lambda: tw.reduce.sum(mask))
+    assert total >= 0
+
+
+@pytest.mark.benchmark(group="any_bool")
+@pytest.mark.benchlibs("triwarp", "numpy")
+def test_any_bool(bench_case: BenchCase) -> None:
+    """
+    ``reduce.any`` over a mask — the predicate shape ``validation`` and ``mesh.Trimesh`` use.
+
+    The mask is half set rather than all-``False``, so neither side can answer from the first
+    element; a benchmark on an all-``False`` mask measures a different question than the callers
+    ask (``is_watertight`` on a watertight mesh is the all-``False`` case, and it is the *cheap*
+    one).
+    """
+    if bench_case.kind == "numpy":
+        mask_np = _scalars_np(bench_case) > float(np.median(_scalars_np(bench_case)))
+        flag_np = bench_case.run(lambda: bool(mask_np.any()))
+        assert isinstance(flag_np, bool)
+        return
+    mask = _mask_wp(bench_case)
+    flag = bench_case.run(lambda: tw.reduce.any(mask))
+    assert isinstance(flag, bool)
+
+
+@pytest.mark.benchmark(group="all_bool")
+@pytest.mark.benchlibs("triwarp", "numpy")
+def test_all_bool(bench_case: BenchCase) -> None:
+    """``reduce.all`` over the same mask — the other half of the predicate pair."""
+    if bench_case.kind == "numpy":
+        mask_np = _scalars_np(bench_case) > float(np.median(_scalars_np(bench_case)))
+        flag_np = bench_case.run(lambda: bool(mask_np.all()))
+        assert isinstance(flag_np, bool)
+        return
+    mask = _mask_wp(bench_case)
+    flag = bench_case.run(lambda: tw.reduce.all(mask))
+    assert isinstance(flag, bool)
 
 
 @pytest.mark.benchmark(group="sum_scalar")
