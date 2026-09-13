@@ -2968,6 +2968,15 @@ The methodology is here; the *numbers* are Part II (§13 cost model, §14 kernel
   comment declined a rewrite and said *"revisit if a benchmark ever puts it on top"*; a
   level-synchronous RDP then took `polyline_simplify` from 84 ms to 0.68 ms and **inverted the
   module's ordering**. Re-read the declines in a module after any big win in it.
+- **A mechanism validated on one member of a fixture pair built to isolate a variable must be
+  measured on the *other* member before it ships.** `saddle`/`saddle_graded`, `sphere`/`tangle`,
+  closed/open, uniform/graded — the pair exists because that variable matters, and a benchmark
+  suite that ships one is telling you which variable a new mechanism has to survive. This is §7.4's
+  vacuity rule ("check the comparison is not vacuous on its fixture") applied to a *benchmark*
+  rather than a test, and it has cost a measured 2.59x regression once: a block conjugate gradient
+  was probed on two well-conditioned saddles, won on both, shipped, and was a **0.386x** loss on the
+  graded saddle of identical connectivity — which is precisely where its own documented failure mode
+  lives (§16.8). The check is cheap: it is one more row in the probe you are already running.
 - **A decline written in one place is not a decline applied everywhere, and the tree's own source is
   the census you should not trust.** `kernels/reduce.py::_reduce_1d_tiled` has documented "the
   generic form is declined here, measured ~18 us per launch" since it was written — and 34 of that
@@ -3205,6 +3214,24 @@ generous box is the trigger and a tight box on a small mesh never gets near 160.
 `bvh_query_sphere` / `bvh_get_group_root` only), so a BVH-pair wavefront means writing our own
 hierarchy — price it as that, not as a rewrite of the query.
 
+A `wp.capture_while` loop body that issues several launches does **not** replay as one unit on both
+devices, so a loop whose *result buffer* depends on the whole body running cannot rely on it.
+
+Measured on Warp 1.17 while removing a per-pass `wp.copy` from `graph.shortest_path_envelope`. The
+copy exists because a Bellman-Ford relaxation reads every label and writes every label, so it needs
+a second buffer and the result has to come back. Unrolling **two** passes into the body, each
+writing into the other's buffer, removes the copy entirely and halves the conditional-graph
+evaluations — worth **1.26x at 2 562 nodes and 1.45x at 40 962**. On a 2 562-node sphere at
+`max_iterations` 1 / 3 / 7 it relaxed 16 / 51 / 181 nodes on CUDA against **6 / 31 / 141** on the
+CPU device; even caps agreed exactly. The CPU path records through `ScopedCapture`'s APIC recording
+(`wp.is_conditional_graph_supported()` is a *machine* query and returns `True` even for a CPU-device
+array, so the capture branch is taken there too) and the body did not replay as two passes per
+round.
+
+Reverted. **The generalisable rule: a Python-level ping-pong cannot help a captured loop either** —
+the body is recorded once and replayed, so rebinding the names only takes effect at record time.
+Between those two, a double-buffered iteration inside `capture_while` keeps its copy.
+
 ### 12.3 `wp.ref[T]` requires concrete types
 
 Verified by compile probes; still broken on 1.16.
@@ -3230,6 +3257,22 @@ Consequence: the shared argmin/argmax/swap helpers in `kernels/array.py` are con
   `wp.bool`** (`TypeError: Function <name> does not support the provided argument types
   warp._src.types.bool`; it does work for `int8` / `int32` / `float32`), so a "works on masks and on
   numbers" wrapper needs a dtype branch, not one generic func.
+  - **Do not answer that branch by widening the mask to `int32` first — write the concrete bool
+    kernel.** `triwarp.reduce`'s `sum` / `any` / `all` opened with `astype(mask, wp.int32)`, which is
+    an allocation of `4n` bytes, a launch, a full read of `n` and a full write of `4n`, after which
+    the reduction read `4n` rather than `n`: **nine bytes of traffic per mask byte**, plus a launch
+    and an allocation, to answer one boolean. A concrete bool-input family measured **1.60-1.94x** on
+    the reduction itself across 8 k-164 k elements. There is no `wp.tile_load` of a `bool` array, so
+    such a kernel cannot take the tile-load shape: its lanes walk the block's chunk striding by
+    `wp.block_dim()` (§2.2, which is also what keeps it right on the CPU device) and the block folds
+    the per-lane registers with a single `wp.tile` reduction — one tile reduction per block where the
+    tile-load form runs `TILES_PER_BLOCK_1D` of them, and the strided reads still coalesce.
+  - **It moves a documented crossover, so re-check the declines that cite one.** The
+    readback-versus-device-reduction crossover for a `wp.bool` mask went from ~1 M elements to
+    **~0.5 M** (`reduce.any` against `mask.numpy().any()`: 1.54x slower at 163 842, 1.15x at
+    350 000, level at 524 288, **1.35x faster at 1 M**, 2.97x at 4 M). Both sites in `repair.py` that
+    carry a written decline of that shape still sit under it and keep their readback — with the new
+    number written in place of the old one, which is the §9 discipline, not a conversion.
 - **Scalar arguments must be constructed at the input's precision**: `wp.map(f, a_float64,
   wp.float32(tol))` will not resolve the generic — use `a.dtype(tol)`. Literals *inside* a generic
   `@wp.func` need `type(x)(...)`.
@@ -3394,8 +3437,8 @@ The `nnz`-is-a-capacity rule and its consequences are §3.7. Three further behav
   **zero iterations** and the untouched initial guess as "converged" — a correct-*looking* silent
   failure, not a flagged one. **FIXED**: every triwarp call site now passes `atol=0.0` explicitly
   alongside `tol=` (`linalg.solve_spd`, `linalg.solve_spd_columns`'s single-column path, and both of
-  `reconstruction`'s direct `wpl.cg` calls) — triwarp's own multi-column paths (`_BatchedCg`,
-  `_BlockCg2`) were never affected, since they compute their stopping threshold with an explicit
+  `reconstruction`'s direct `wpl.cg` calls) — triwarp's own multi-column path (`_BatchedCg`)
+  was never affected, since it computes its stopping threshold with an explicit
   `atol_sq = 0.0` already. This is what let a mesh-scale-dependent right-hand side (as in
   `heat.log_map` at extreme mesh scale) silently return zero instead of solving. Verified free at
   ordinary mesh scale: iteration counts and benchmark timings are unchanged before/after on normal
@@ -3610,14 +3653,52 @@ at 0.07 MB total and 2.42 ms at 268 MB, a 4 000x range:
 | a `wp.array` slice view (`split(copy=False)`) | **3.63 µs** |
 | one whole-buffer `wp.copy`, 48 903 to 2 614 242 elements | **0.010-0.015 ms**, flat |
 
-So the vast majority of a many-segment pack is per-call overhead, not the data volume — **the lever
-is reducing the *number* of segments at the call site**, never the Python bookkeeping around them.
+So the vast majority of a many-segment pack is per-call overhead, not the data volume.
+
+**The lever is a single segmented-copy launch, and the claim that there was none was wrong.**
+`_pack_segments` carried the reasoning *"there is no segmented alternative — Warp has no
+array-of-arrays and a kernel cannot dereference a raw pointer"*. Warp has an array-of-arrays: a
+`@wp.struct` may carry a `wp.array` field, and a `wp.array` of that struct is a descriptor table a
+kernel indexes as `segments[s].data[k]`. One launch over it replaces the whole loop:
+
+| segments (total fixed at 2 614 242) | 2 | 8 | 32 | 64 | 256 | 1 024 | 4 096 |
+|---|---|---|---|---|---|---|---|
+| copy loop | 0.026 ms | 0.063 | 0.172 | 0.341 | 1.372 | 5.187 | 21.529 |
+| one launch | 0.094 | 0.092 | 0.091 | 0.094 | 0.092 | 0.102 | 0.144 |
+| ratio | 0.27x | 0.68x | **1.89x** | 3.64x | **14.91x** | 50.76x | 149.75x |
+
+The launch form is flat in the segment count *and* in the total size (0.078-0.094 ms from 48 903 to
+2 614 242 elements), so the whole choice is a threshold — `array.PACK_SEGMENTS_KERNEL_FROM = 32`.
+End to end it is **5.1-5.7x** on `concatenate` / `pack_1d_arrays` at 256 segments; the gap to the
+14.9x above is the Python-side per-segment validation loop and `require_same_device`, which is the
+§3.9 contract rather than a defect.
+
+Two details decide whether it pays, and the first is most of it:
+
+- **Build the descriptor vectorized.** Constructing the 256 struct instances one at a time costs
+  **0.619 ms** of a 0.714 ms per-object build — it would give the whole win back. One NumPy
+  structured array through the struct's own `numpy_dtype()`, uploaded once, costs **0.081 ms**.
+- **One kernel serves every dtype, not a table of them.** Declare the descriptor's array field
+  `wp.array[wp.int32]` and point it at the segment's storage with a length in 4-byte *words*, and
+  alias the destination the same way (`wp.array(ptr=..., dtype=wp.int32, shape=...)`, because
+  `wp.array.view` refuses a dtype of a different size). It is then a byte copy that never names the
+  caller's dtype — verified byte-identical for `int32`, `float32`, `float64`, `vec3` and `uint64`.
+  A dtype whose itemsize is not a multiple of 4 keeps the loop.
+
+**`split(copy=True)` is not reachable this way** and keeps its 15.06 µs per segment: its outputs are
+`n_segments` *separate arrays*, so the allocations are the return value.
+
 Several alternate spellings were probed and rejected as real losses (a raw-pointer `wp.array` view
 that re-implements `wp.array.__getitem__`'s contract, a shared output buffer for `split(copy=True)`
 that drops half of what the copy promises, dropping `src_offset=`/`count=`, and others) — all written
 at their sites in `triwarp/array.py`. **The NumPy crossover is a segment SIZE (~98 kB), and it does
 not move with the segment count** — a useful rule of thumb when deciding whether to route a packing
 call through NumPy or Warp.
+
+**The general lesson, and it is worth more than the row: a "Warp has no X" comment is a claim to
+probe, not a fact to inherit.** This one had stood through several optimization rounds and was
+quoted as settled. The probe that refuted it is fifteen lines (§10 says the same thing about
+introspecting a builtin before planning around its absence).
 
 **A device reduction costs ~0.10-0.32 ms flat on CUDA regardless of `n`** (launch + 4-byte read),
 while a readback scales with bytes copied — the crossover is wherever the copy exceeds ~0.15 ms
@@ -3735,6 +3816,15 @@ two-stage reduction, not a single accumulator.
    issuing one atomic per 64-element block put far too many blocks on one accumulator address at
    scale; folding several tiles into a register before the atomic recovers most of it. Swept fold
    widths found a middle value that never loses across the whole size range tested.
+
+3. **`tile_chunk` reports what is left to the end of the array, not the block's share of it, and
+   clamping is the caller's job.** Its own docstring says so; the tile-load factories satisfy it
+   *implicitly*, through a fixed `TILES_PER_BLOCK_1D` loop that cannot overrun. A kernel whose loop
+   is bounded by `remaining` instead — any `for k in range(t, remaining, wp.block_dim())` — must
+   write `remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)` or block 0 walks the whole array. It
+   fails loudly for a sum (measured 9 774 961 against 99 737) and **silently for min/max/any/all**,
+   where re-reading elements another block already read is idempotent. Look for it whenever a new
+   reduction kernel does not use `wp.tile_load`.
 
    **The coupling hazard this creates: changing how much work a kernel does per block silently
    breaks any *other* module that launches it directly and computes its own `dim`.** A caller that
@@ -4128,11 +4218,12 @@ not insensitivity** (§16.4).
   at the call site, which is a rewrite of the iteration, not a stream annotation. **Do not build a
   `wp.Stream`-overlap convention on the strength of "these two calls have no data dependency" alone**
   — check the device/wall split first (§13.1, §16.1). For a same-operator, multiple-right-hand-side
-  solve specifically, reach for the existing batched/block-CG machinery
-  (`linalg.solve_spd_columns`'s `_BlockCg2`, §16.8) instead of streams, since it merges the two
-  Krylov subspaces into one iteration rather than trying to run two independent ones concurrently —
-  `heat.extend_scalar` and `heat.transport_tangent_vectors` both currently call `_solve_scalar` twice
-  rather than going through it, which is an open lead unrelated to streams.
+  solve specifically, reach for the existing batched machinery
+  (`linalg.solve_spd_columns`'s `_BatchedCg`, §16.8) instead of streams, since it merges the
+  columns into one *launch* sequence rather than trying to run two independent ones concurrently.
+  (Merging their Krylov *subspaces* as well is a different mechanism, was built, and was removed —
+  §16.8.) `heat.extend_scalar` already goes through it; `heat.transport_tangent_vectors` reaches it
+  through that call.
 
 ### 14.10 Producer-consumer fusion: always fuse; the iteration count only decides whether a benchmark can see it
 
@@ -4660,7 +4751,14 @@ every constrained solve.
 
 **Also host-bound, from a different angle:** ICP's per-iteration cost over 10 iterations on 2 562
 points (1 419 µs) is 343 µs (24 %) of `cost_acc.numpy()` readback and 139 µs of `dim=1` solve launch,
-against only 60 µs (4.2 %) of actual Cholesky.
+against only 60 µs (4.2 %) of actual Cholesky. **Half of that readback is now gone and the 24 % no
+longer holds** — `accumulate_point_to_plane` commits its cost and its weight sum into *one*
+length-2 buffer, so the loop reads both in the sync it was already taking right after that launch
+rather than taking a second one three launches downstream (which drained a pipeline the first had
+already drained, so it was a full sync, not §16.7's cheap ~0.02 ms follow-on read). One fewer
+`zero_()` per iteration rides along. Measured **1.065x / 1.052x** on `sphere_small` / `sphere_med`
+at ten iterations — real, and much smaller than 24 %, because that attribution predates the tiled
+rewrite of the accumulate itself.
 
 ### 16.2 `import triwarp`
 
@@ -4745,7 +4843,7 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   rings when cells are much smaller than the sample spacing, fixed by capping the grid depth rather
   than rounding it.
 
-### 16.4 `remesh`
+### 16.4 `remesh`, `repair`, `creation`, `bounds`
 
 - **SHIPPED — `isotropic_remesh`'s smooth pass is the Botsch-Kobbelt area-equalizing relaxation
   its Notes promise, with the fold veto the collapse stage already runs.** Each one-ring neighbour
@@ -4854,7 +4952,122 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
 - **Edge-length equilibrium is ~1.0x target only when the target is a "nice" ratio of the input
   edge** (midpoint-split quantization); coarser-than-input targets plateau lower.
 
-### 16.5 `array`, `graph`, `polyline`
+- **SHIPPED — `select_independent_degree3` counts its own selection.** `remove_degree3_vertices`
+  recovered the count with `reduce.sum(astype(selected, wp.int32))` — a whole-array cast, a
+  reduction and a readback per pass — for a number the kernel that built the selection already knew,
+  one *conditional* `wp.atomic_add` away (§13.2: contention scales with the rare hits, not with the
+  launch). Its six per-pass allocations are hoisted to the pass-0 size and sliced, which is legal
+  because the vertex count is invariant (compaction is deferred to the end) and the face count only
+  shrinks. Measured **1.109x / 1.083x** on `sphere_med` / `sphere_large`.
+  - **The kernel's other caller pays a launch argument for this and is measured neutral**
+    (`flatten_degree3_vertices`, 0.991x / 1.004x) — correct per §2.4: one decision rule, one kernel.
+  - **Hoisting scratch is not free when the loop usually runs once.** That caller's two ping-pong
+    position buffers, allocated upfront, cost **0.948-0.968x**; allocated lazily they cost nothing.
+    The common mesh has no two adjacent candidates and runs a single pass, so the second buffer was
+    pure overhead. Hoist against the *expected* pass count, not the maximum.
+- **SHIPPED — `intrinsic_delaunay`'s four per-iteration resets ride in the kernels above them.**
+  `face_claim.fill_(INT32_MAX)`, `remap.fill_(INT32_MAX)`, `no_remap.zero_()` and `count.zero_()`
+  were whole device passes over buffers that scale with the mesh, each sitting immediately next to a
+  launch at exactly the right `dim`; they are now stores in `intrinsic_delaunay_candidates` and
+  `claim_intrinsic_flips` (before its early return). Measured **1.029-1.038x** standalone.
+  **The pattern to look for is specific**: a whole-buffer `fill_` / `zero_` whose length equals the
+  `dim` of an *adjacent* launch that does not read it. `sample._dart_throw_blue_noise` carries a
+  written decline of the opposite shape and is right — there the buffers are cell-sized while the
+  launch is over a shrinking alive count, so there is no same-`dim` launch to fold into.
+
+- **SHIPPED — `cone` and `cylinder` are closed-form kernels, not `revolve` compositions: 2.43-2.60x
+  at every section count.** Both built a three- or four-point NumPy profile, **uploaded** it, and
+  handed it to `revolve` — which **read it straight back**, decided the layout on the host, uploaded
+  four more tables (`column`, `offsets`, `on_axis`, `keep`) and ran two launches. The result was a
+  flat host floor independent of the section count: `cone` sat 307x behind open3d at 32 sections and
+  4.2x at 4 096, triwarp flat while the reference scaled. `kernels/creation`'s `cone_mesh` /
+  `cylinder_mesh` write the whole solid from six scalars, one thread per wedge — no upload, no
+  readback, one launch — taking 0.304 ms to **0.091** (3.36x, measured 100 calls between two syncs).
+  - **The shared piece is a `@wp.func`, not a copy.** `revolution_point` carries one profile point
+    to one slice and is called by both new kernels *and* by `revolve_vertices`, so the three cannot
+    drift in the last bit (§2.4); the span is passed as the same `wp.float32(2 pi)` constant for the
+    same reason. That is what makes the result byte-identical rather than merely close.
+  - **Reuse the reference implementation's *filter*, do not re-derive it.** A first version emitted
+    a fixed face layout and differed from `revolve` at `sections` 1 and 2, where the triangles
+    touching the axis collapse — cone: 2 faces against 0 at one section, 4 against 2 at two. The
+    wrappers now call `revolve`'s own `_revolve_kept_template` on their own tiny profile (host
+    arithmetic on 3-4 points, no upload) and pass its verdict as two flags. That also inherits the
+    *absolute* area tolerance, so a cone under ~3e-4 radius drops its caps in both engines.
+    **The general move: when specialising a general routine, call its predicate rather than
+    reimplementing it — the specialisation is the layout, not the rule.**
+  - Gate: byte-identical vertices *and* faces across 69 cases — sections 1/2/3/4/5/7/8/32/33/512
+    and the default, three radius-height pairs, plus the `transform` and `segment` paths.
+  - **The idea generalizes, and it needs one kernel rather than one per shape.** `annulus`,
+    `torus`, `uv_sphere` and `capsule` all revolve a profile whose layout is *regular* — every
+    column a full ring except an optional on-axis point at one or both ends — so
+    `kernels/creation.revolve_uniform` addresses the slots and the face blocks arithmetically from
+    the profile plus five scalars: one launch, no readback, no layout tables. Measured (100 calls
+    between two syncs, min of 7): **annulus 2.12x / 2.08x**, **torus 1.99x / 1.35x**, **uv_sphere
+    1.93x / 1.35x**, **capsule 1.90x / 1.34x** at 32 / 512 sections, with cone and cylinder on the
+    same path at **3.2-3.4x**. The four profile-driven shapes fall off at 512 because their
+    *profile* has ~512 points, so the host profile build and the degenerate-area filter (both
+    `O(P)`) become the floor; cone and cylinder hold 3.2x because their profiles are three and four
+    points whatever the section count.
+  - **The fast path is *checked against the general engine*, not asserted.** `_revolve_regular`
+    asks `_revolve_kept_template` whether the surviving triangles are exactly the regular pattern
+    and returns `None` otherwise — an interior on-axis column, a duplicated interior column, or
+    geometry small enough for the absolute area tolerance to bite in the middle. **The fallback is
+    live**, not defensive: 10 of 27 probed configurations take it. That is the shape to copy when
+    adding a fast path to a general routine — let the general one adjudicate, and measure that both
+    arms are reached.
+  - Gate: byte-identical across **115 cases** (four shapes x eleven section counts x radii, plus
+    minor-section sweeps and tiny-radius cases), plus
+    `tests/test_creation.py::test_solids_of_revolution_agree_with_the_general_engine`, which
+    monkeypatches the fast path off and compares bit-for-bit in one process over 12 configurations
+    chosen to straddle the gate — with an `expect_faces` flag so a degenerate case cannot pass by
+    both sides being empty.
+- **SHIPPED — `bounds.enclosing_diagonal` reduces both clouds into one buffer: 1.66-1.69x.** It
+  computed two boxes — two allocations, two launches, **two readbacks** — and unioned them on the
+  host. `minmax_vec3_chunked` accumulates with `wp.atomic_min` into a buffer the *caller* seeds, so
+  a second launch over a second cloud continues the same reduction: one buffer, one readback, and
+  `aabb_union` leaves the path. The all-empty case still returns `inf` with no branch, because the
+  seeded `inf` survives. `aabb` itself is untouched and is *at* the floor — one launch plus one
+  readback, and it returns host `wp.vec3`s.
+- **SHIPPED — the producer-then-reduce fusion, tree-wide scan and three conversions.** An `ast`
+  scan of `triwarp/*.py` for "a `wp.map` / `wp.launch` writes a buffer, a `tw.reduce.*` within a few
+  statements reduces it to a scalar" finds **33 sites**; each carries one allocation, one launch and
+  ~11 µs of `wp.map` resolution more than it needs. Converted where the reduce is actually a share
+  of the call: `polyline_length` **2.42-2.47x** (and **6.32-6.61x** closed), `polyline_centroid`
+  **3.14-3.25x**, `polyline_radius` **1.44-1.46x** through the centroid it calls, `icp` with a
+  `max_distance` **1.10x** (its guard 1.43x).
+  - **Three mechanisms, and the second is the one that is easy to miss.** Fold the reduction into
+    its producer (`polyline_weighted_midpoint_sums` emits all four numbers a weighted centroid needs
+    in one buffer, replacing a two-output map, two reductions and **two** readbacks). Express a
+    `closed` polyline by **wrapping the index** rather than by `polyline_close`'s whole-buffer copy
+    — that is what takes the closed form from 1.5x to 6.3x, because once the reduction was fused the
+    copy *was* the call. And where the readback must stay (a Python loop cannot branch on a device
+    value), drop the reduction around it: `icp`'s kernel writes the weights the fit needs *and*
+    their sum.
+  - **The summation order changes, and the tree is the more accurate arm.** A lane-strided fold plus
+    `wp.tile_sum` is not the sequential `float32` accumulation `reduce.sum` performs below `TILE_1D`
+    elements. Against a `float64` oracle: relative error **3.18e-09 / 3.75e-08 / 5.01e-08 /
+    2.19e-07** at n = 50 / 1 000 / 100 000 / 1 000 000, against a sequential `float32` sum's
+    9.04e-08 / 3.68e-08 / **3.07e-06** / **3.62e-06**. A tree halves the depth over which rounding
+    compounds, so "this changes the last bits" is not the same as "this is less accurate" — say
+    which, with a number.
+  - **It does cost a reference comparison, and that is the trade to state explicitly.**
+    `tests/test_polyline.py::test_polyline_length_matches_meshlib` asserted bit-identical equality
+    with `mm.calcLength`'s sequential sum and now asserts `rel=1e-6`. Its docstring had predicted
+    the failure (*"a summation-order change would show here first"*) and it caught it on the first
+    run. **A reduction's summation order is part of some functions' contract; check for an exact
+    comparison before fusing one, and if the trade is taken, rewrite the test's reasoning rather
+    than just loosening its number.**
+  - **Declined, with reasons**: the `heat` family (five sites), `energies`, `validation`, `repair`,
+    `voxels`, `reconstruction` and `sample` all spend 1-4 % of the call in the reduce — e.g.
+    `energies.edge_length_loss` is 0.722 ms of which the pair is ~25 µs, the rest being
+    `edges_unique_length`. `array.allclose` *is* the pattern end to end but is generic over three
+    dtypes, so fusing costs a dtype table for a primitive with one in-repo caller. And moving
+    `icp`'s guard after the Procrustes fit — to read the weight sum `ACC_W_SUM` already holds — is
+    **not behaviour preserving**: the guard breaks *before* assigning the returned transform.
+  - **A scan that keys on line proximity over-counts.** `polyline_radius` looked like three
+    reductions over one array and is three *mutually exclusive branches*. Read the function before
+    believing the hit.
+### 16.5 `array`, `graph`, `polyline`, `intersection`
 
 - **`kernels/array.binary_search_index` is `searchsorted(side="right")` and returns `slot + 1` on an
   exact hit.** Picking the wrong one of the three searches is silent and systematic, not a crash — a
@@ -4891,6 +5104,51 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   the remaining cost was already in one non-portable sort, leaving too little headroom to justify a
   device rewrite, and a device version would have regressed the common single-contour case anyway.
 - **`polyline_downsample` is pointer-doubled above 8 192 points on CUDA only** — §14.7.
+
+- **SHIPPED — `marching_triangles` densifies the *level set's* edges, not the mesh's: 1.39-2.54x.**
+  Stage-timed on an 81 920-face sphere, `edges.edges_unique_inverse` was **0.536 ms of 1.318
+  (41 %)**, and the whole call was *flat* between `sphere_small` and `sphere_med` — a mesh-sized
+  pass sitting under a level-set-sized answer. The unique edge *id* was only ever a matching key:
+  the two faces sharing a crossing must agree on it, and nothing downstream needs it dense or
+  small. **The sorted vertex pair is already such a key**, so the segment kernel packs it itself
+  (`kernels/intersection.edge_key`) and the densification `_link_segments` genuinely needs runs
+  there over the crossing endpoints alone — `2n` values instead of 122 880 mesh edges.
+
+  | 327 680-face sphere | curve points | before | after | |
+  |---|---|---|---|---|
+  | plane | 1 534 | 1.784 ms | 0.702 | **2.54x** |
+  | wave12 | 11 924 | 2.503 | 1.798 | **1.39x** |
+  | wave40 | 39 772 | 5.058 | 5.071 | 1.00x |
+
+  - **The trade has a crossover, and naming it is the transferable part.** The host `np.unique`
+    grows with the *level set* where the device pass grew with the *mesh*, so a contour touching a
+    large fraction of the edges gives the win back. It levels out rather than losing, so no gate is
+    needed — but the same swap on a function whose answer is mesh-sized would be a loss.
+  - **DECLINED — replacing the densification with a sorted join, and the *reason* is the reusable
+    part.** `argsort` the start keys, `searchsorted` the end keys into them: no densification, no
+    `owner` table. Interleaved in one process on the same captured input, both producing the
+    identical `successor`, it is **1.14-1.91x slower** — 0.096 / 1.296 / 2.899 ms against
+    0.084 / 0.730 / 1.514 at 1 534 / 11 924 / 39 772 segments.
+
+    It loses because it needs **two sort-class passes where densifying needs one**, not because of
+    the extra gathers (0.09 ms of 2.80). Phase-timed at 39 772 segments: `np.searchsorted(n into
+    n)` is **1.83 ms** on its own, about what `np.unique` over `2n` costs (1.34), because a binary
+    search is `n log n` *dependent, cache-missing* probes into a 318 kB array rather than a
+    streaming sort — the same search into a cache-resident 1 000-entry array is **7.6x** faster at
+    the identical query count. And `np.argsort` is ~5.5x `np.sort` (0.905 against 0.164 at `n`),
+    since it permutes indices through indirect comparisons; the join needs it specifically to
+    recover *which* segment won.
+
+    **The general lesson: densifying is not overhead you pay to enable a lookup table — the dense
+    labels make the join itself O(1) per element (0.021 ms), which buys more than the search they
+    avoid.** `np.searchsorted` reads as "cheap, it is just a binary search" and at these sizes it
+    is a sort-class cost.
+  - Gate: byte-identical points, curve lengths and closed flags across 30 (mesh x field x isovalue)
+    cases. `n_vertices` keeps a real meaning — it is the base the vertex pair packs against — so the
+    public signature is unchanged.
+  - **The general shape to look for**: a helper that densifies or indexes *the whole mesh* feeding
+    a consumer whose answer is a small subset of it. The tell is a call whose cost is flat in the
+    mesh size while the answer is not.
 
 ### 16.6 `proximity`, `metrics`, `neighbors`
 
@@ -5030,6 +5288,39 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   interval DP that tiles the recurrence to cut the launch count by an order of magnitude — worth
   building only if a row appears where it would flip a result, since the launch floor here is
   currently nobody's bottleneck.
+  - **Being launch-bound makes the launch's *arguments* a lever, and that is where the next 1.11x
+    came from.** `dp` and `prev` were launch arguments on a sweep of `max_B - 2` launches — 510 on
+    a 512-vertex rim — at ~1.0 µs each (§13.1), and their pointers are invariant across the sweep.
+    They now ride in the `HoleFillTables` bundle that was already built once. Measured **1.110x** on
+    `fill_min_weight[rim_short]` (10.738 → 9.678 ms), flat within 1 % on `holes_many` /
+    `holes_dense`, whose rims are short enough that the sweep is ~30 launches rather than 510. The
+    bundle's own docstring had drawn the line at "only `span` and the two in-place DP tables stay as
+    arguments, because those are what a launch is actually about" — correct as legibility and worth
+    milliseconds here.
+  - **REFUTED — transposed mirrors of `dp` / `prev` so the apex loop's second read coalesces.**
+    `apex_cost` reads children `(i, k)` and `(k, j)`, and the apex loop varies `k`, which sits in the
+    column of one and the row of the other — so with the tiled kernel's lanes striding `k`, one read
+    runs at stride `4 * b` (2 048 bytes on a 512-vertex rim, a transaction per lane). Mirroring the
+    tables so both reads are stride 1 was built, verified byte-identical, and is **a loss**: 0.917x,
+    and against the same struct-resident tables 1.095x where the unmirrored form gives 1.150x. Two
+    reasons the arithmetic does not carry. The DP tables are a few megabytes and **L2-resident**, so
+    "one transaction per lane" is an L2 hit, not a DRAM fetch — the 32x transaction argument prices
+    bandwidth this kernel is not paying. And the DP is launch-bound, so the mirror's two extra
+    per-interval stores and two extra launch arguments cost more than the coalescing saves. Do not
+    re-propose without a rim whose tables exceed L2.
+  - **REFUTED, by a free PTX diff rather than a measurement — collapsing
+    `triangle_fill_metric`'s duplicated geometry.** Its default branch forms the same three edge
+    differences twice, the same three dot products twice and the same cross product twice, ~38 of
+    ~90 flops, in the innermost function of an `O(B^3)` loop — and the duplicates sit in *different*
+    basic blocks (`circumcircle_diameter_sq` and `triangle_aspect_ratio` each carry early returns),
+    so their removal needs partial-redundancy elimination rather than local CSE and there was no
+    reason to assume it. **nvcc already does it.** Hand-fusing the branch and diffing
+    `fill_dp_span`'s forward entry in the regenerated `*.sm120.ptx`: `sqrt.rn.f32` 56 → 56,
+    `div.rn.f32` 57 → 57, `fma.rn.f32` 227 → 227, `mul.f32` 445 → 445, `add.f32` 47 → 47,
+    `sub.f32` 335 → **332**. Three subtractions out of ~1 100 arithmetic instructions. Reverted —
+    the fused form is twenty lines where the original is three named calls. **The general move is
+    the cheap one: a PTX op-count diff costs no GPU time and no measurement, and it settled this
+    before any clock was read.**
 - **A couple of small preambles in the hole/loop-stitching path are deliberately left unoptimized** —
   their share of the call falls as the input grows, so they're declines rather than wins waiting to
   happen (§9's "a share that falls as the input grows is a decline").
@@ -5076,10 +5367,55 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
       already paid — which is why removing the second one was worth a few percent and not the ~15 %
       a naive two-times-0.1-ms estimate predicts. §15.2's "price the candidate directly" applies to
       readbacks too.
+- **SHIPPED — the whole dart loop runs in cell-sorted index space, 1.69-2.35x and growing with the
+  pool.** `sample._dart_throw_blue_noise` already radix-sorts the pool on its cell key to build the
+  cell list, so `bucket` *is* the cell-order permutation — and the two kernels this section measures
+  at 87-92 % of device time then threw that locality away, reading `j = bucket[k]` and scattering
+  every payload read into the *unsorted* pool. Permuting `pool_points` / `priority` / `point_cell`
+  through `bucket` once at setup makes a cell's members the contiguous run its offsets already
+  name, so the loop variable **is** the point and all three reads are stride 1;
+  `dart_cover_neighbors` stops taking `bucket` at all. Measured 1.685x / 2.009x / 2.353x at
+  5 040 / 20 056 / ~80 000 accepted points, **byte-identical** points *and* face indices across six
+  (mesh, seed) configurations.
+  - **The tie-break is what makes it byte-identical, and getting it wrong would have been
+    invisible.** The rule is "smaller priority, then smaller *pool* index", and renumbering the
+    points changes what "pool index" means — so the comparison still reads `bucket[k] > bucket[i]`,
+    on the priority-tie branch only, which keeps `bucket` out of the hot path. A sorted-space
+    tie-break yields a different-but-valid packing that every count- and spacing-based test passes.
+  - **The output order is restored, not abandoned.** `state` is sorted-indexed, so the survivor mask
+    is permuted back through `scatter_index`'s inversion of `bucket` (one launch) before the
+    compaction, and the returned points stay in pool order as they were.
 - **SHIPPED — `points.farthest_point_sample` as one persistent block** — §14.1.
 
 ### 16.8 `linalg`, `smoothing`, `laplacian`
 
+- **SHIPPED — the CG iteration's per-launch floor, attacked three ways.** A `_BatchedCg` iteration
+  was eight launches at a replayed ~1.17 µs each (§13.1) before any arithmetic, which is most of the
+  cost on a *small* system — `heat_geodesic[sphere_small]` at 2 562 vertices is exactly that shape.
+  - **`cg_advance_condition` folded into `cg_step_p`'s thread 0**, unconditionally: it reads `dots`
+    and `atol_sq`, both written by the finalize *before* the launch, and writes `out_state`, which
+    nothing in `cg_step_p` reads — so no barrier is needed and nothing races. Verified
+    deterministically by counting `wp.launch` + `wp.launch_tiled` around one `_iteration`: **8 → 7**.
+  - **The `r.r` / `r.z` partials folded into the x/r/z update** (`cg_step_x_r_z_dot`), which is
+    §14.10's producer-consumer fusion applied to a reduction's *first* stage — legal precisely
+    because a block-level partial needs only its own block's data. **7 → 6.** It reaches only the
+    `preconditioner="diag"` branch; the multigrid branch's `z` comes from the cycle, not from the
+    update, so there is nothing to fuse there. Its lanes stride by `wp.block_dim()` rather than
+    taking one element each, which is what keeps the CPU device correct (§2.2).
+  - **DECLINED — folding the `p.Ap` partials into `csr_matvec`.** That kernel is shared with the
+    multigrid V-cycle at four sites that want no partials, and making it tiled would expose all of
+    them to the ragged-tail hazard `cg_dot_partials` documents at length (a 129-entry tail cost
+    11.03 µs against a 9-entry tail's 2.32, which alone turned a 1.5x win into a 0.82x loss at
+    nearly the same size). Not worth one launch of six.
+  - **`wp.capture_while` drives a *run* of iterations, not one** (`CG_ITERATIONS_PER_CHECK = 4`).
+    The conditional-graph evaluation costs ~4-6 µs against a replayed launch's ~1.2, and the
+    iterations that run past convergence are no-ops by construction — `cg_step_p` and
+    `cg_step_x_r_z` pin a converged column's `beta` / `alpha` to exactly zero. Swept 1/2/4/8,
+    reproduced twice: geomean **1.028x** at K=4, best cell `harmonic[saddle_graded]` **1.11x**,
+    worst `harmonic[saddle_small]` 0.98x, and K=8 a real 0.90x loss on short solves. **It is not
+    the 1.38x the same batching is worth on `graph.bfs`** (§16.9) — a CG iteration is six or seven
+    launches where a BFS level is four, so the conditional evaluation is a smaller share of it.
+    `maxiter` is clamped inside `cg_step_p` so the reported count stays exact despite the overshoot.
 - **SHIPPED — every explicit smoothing filter applies the averaging operator in the thread that
   consumes its row, one launch per pass instead of two.** `filter_laplacian` (explicit),
   `filter_taubin`, `filter_neighborhood_average`, `filter_humphrey`, `filter_mut_dif_laplacian`,
@@ -5160,49 +5496,60 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
 - **`smoothing`'s two conditional-emit triplet writers must zero-pad their unwritten slots out of
   range, not to zero** — §12.7, a real cost fix (order of magnitude), reached by `holes.fill_smooth`
   through a shared helper so one fix lands on multiple benchmark rows.
-- **SHIPPED — block conjugate gradient (`linalg._BlockCg2`) for exactly two columns under
-  `preconditioner="diag"`.** Classical block CG, sharing one Krylov subspace across both columns
-  instead of solving them independently — reaches `harmonic`/`tutte` at `k=1` and `arap`'s global
-  step. A modest but real end-to-end win on both devices.
-  - **The system the mechanism was first probed on was not the system it actually reaches in
-    production, and re-probing on the real one gave a smaller (still real) number.** A more favorable
-    system happened to be convenient to capture first, but that system is solved by a different code
-    path (multigrid, not this) in production. **General lesson: always re-probe a mechanism on the
-    system the gate you're wiring it into actually reaches, not the one that was convenient to
-    capture first.**
-  - **No multigrid variant was built, deliberately** — the existing dominance-based multigrid gate
-    already wins more on the systems where it would apply than this mechanism has been measured to
-    win anywhere, so the added complexity of a block-CG multigrid variant isn't justified without new
-    evidence. It gates narrowly (exactly two columns, `"diag"` only) rather than trying to
-    generalize speculatively.
-  - **A near-rank-deficiency guard (a small regularization on the shared 2x2 system) keeps the
-    iteration finite when the two columns' search directions go nearly parallel, but does not
-    recover a real two-column convergence rate on a genuinely rank-deficient block** — pinned by a
-    test using two literally identical right-hand sides, the worst case reachable, which asserts
-    finiteness and a correct answer rather than a tight convergence bound. No input in this
-    package's own solves has been found to reach this path for real.
-  - **Verified correct against the independent-column solver on real captured systems**, on both
-    devices: solutions agree tightly, and the block form's iteration count is strictly lower in
-    every case measured, which the regression test asserts as a strict inequality (a silent fallback
-    to independent columns would pass a looser `<=` bound but not the strict one).
-  - **A third caller reaches it: `heat.extend_scalar`'s two right-hand sides (the source indicator
-    and the source values) diffuse through the identical heat system and previously ran as two
-    independent `solve_spd` calls — converted to one `solve_spd_columns` call, which reaches
-    `_BlockCg2` since `heat_operators`'s Jacobi preconditioner is exactly `"diag"`.** Measured back
-    to back in one session (detached-worktree A/B, §15.6) on the `saddle`/`saddle_graded` benchmark
-    fixtures: `extend_scalar` **1.4-1.5x**, and `transport_tangent_vectors` — which calls
-    `extend_scalar` internally for the transported magnitude — **1.2x full / 1.5x amortized**.
-    `log_map` is untouched (it calls `heat_geodesic`, not `extend_scalar`). Numbers and the full
-    story: `benchmarks/test_heat.py`'s module docstring. **One correctness caveat found while
-    verifying it, not introduced by it**: at a mesh fine enough and with enough widely-spread
-    sources that the diffused indicator field underflows toward its float64 resolution floor
-    (verified at 40 962+ vertices, 8 sources), the two implementations' *far-field* values can
-    disagree by orders of magnitude after the `divide_positive` ratio — both converge to the same
-    `tol=1e-8` *relative* residual, but reach it via different iteration paths, and in that regime
-    the absolute per-entry precision is already below what either path can resolve, so the ratio
-    amplifies ordinary CG round-off into a large-looking disagreement. Confirmed pre-existing (not
-    new): on the single- or few-source, moderate-mesh inputs every real caller and test uses
-    (`_HEAT_MESHES` and the `saddle` family), the two implementations agree to float64 round-off.
+- **REMOVED — block conjugate gradient over exactly two columns (`linalg._BlockCg2`), shipped and
+  then retired.** Classical block CG (O'Leary 1980), sharing one Krylov subspace across both
+  columns instead of solving them independently. It was gated to `n_columns == 2` under
+  `preconditioner="diag"` — `harmonic`/`tutte` at `k=1`, `arap`'s global step, `heat.extend_scalar`
+  — and it is gone. The dispatch, the 309-line class and its eight kernels are deleted;
+  `_BatchedCg` handles every multi-column solve again. `linalg._cg_columns` carries the measurement
+  at the site.
+  - **The verdict, measured across every system in this package that reached the gate** (iteration
+    counts are deterministic; wall is interleaved in one process, min of 15):
+
+    | system | diag spread | block it | batched it | block/batched wall |
+    |---|---|---|---|---|
+    | `harmonic[saddle_small]` | 1.24 | 140 | 182 | 1.031x |
+    | `harmonic[saddle]` | 1.24 | 275 | 355 | 1.032x |
+    | `harmonic[hemisphere]` | 1.17 | 234 | 237 | **0.881x** |
+    | `harmonic[saddle_graded]` | 2422 | **4774** | **2230** | **0.386x** |
+    | `extend_scalar[sphere_small]` | 1.04 | 24 | 24 | 1.000x |
+    | `extend_scalar[saddle]` | 4.10 | 31 | 31 | 1.000x |
+    | `extend_scalar[saddle_graded]` | 4102 | 580 | 427 | 0.831x |
+
+    Best case **+3 %**, worst case **−159 %**. Removing it measured **2.318x** end to end on
+    `harmonic[saddle_graded]` (115.868 → 49.975 ms) and 1.075x on `harmonic[hemisphere]`, against a
+    0.97x give-back on the two uniform saddles.
+  - **It was never what made `extend_scalar` faster.** That function returns the *identical*
+    iteration count under both solvers, so `12a5efe`'s batching of its two solves into one call
+    carries its whole 1.79-1.95x — and removing block CG *improved* it further (1.174x on
+    `saddle_graded`), because the removal is a win wherever conditioning is poor.
+  - **The failure mode is the documented one and the Tikhonov floor does not address it.** On a
+    graded mesh the two columns' search directions go nearly parallel, the shared subspace stops
+    buying anything, and the iteration count goes **up** by 2.14x instead of down by 1.3x. A floor
+    on the 2x2 Gram keeps the iteration finite; only deflation/restart would recover the rate.
+  - **Why no gate was written, although a cheap predictor does exist.** The diagonal spread
+    (`max(diag)/min(diag)` over the Jacobi diagonal already built for the preconditioner) separates
+    the cases by three orders of magnitude — 1.17-1.24 on every winning system against 2422/4102 on
+    the losing ones — so the plan's proposed predictor works. It was still declined: a predictor
+    that is perfect is worth at most the +3 % best case, which does not pay for 309 lines, eight
+    kernels and their compile time (§4.2). **A mechanism whose best case is a wash does not need a
+    better gate; it needs removing.**
+  - **The lesson that outlives it, and it is the important one.** `_BlockCg2` was validated on
+    `saddle_small` and `saddle` and shipped without ever being run on `saddle_graded` — the fixture
+    that exists *specifically* to be the ill-conditioned member of an otherwise identical pair
+    (same vertex count, same face array, same boundary loops, worst aspect ratio 1.6 against 4 719).
+    Ill-conditioning is exactly where block CG's documented failure mode lives, and §16.8's own
+    round-11 notes had named it before the build started. **A mechanism validated on one member of
+    a fixture pair built to isolate a variable must be measured on the other member before it
+    ships** — `saddle`/`saddle_graded`, `sphere`/`tangle`, closed/open. The pair exists because the
+    variable matters. That is §7.4's vacuity rule applied to a *benchmark* rather than a test, and
+    it is now §9's rule too.
+  - **The regression guard is deterministic and lives in `tests/test_linalg.py`**:
+    `test_two_column_solve_costs_no_more_iterations_than_its_worst_column`, parametrized over a
+    well- and an ill-conditioned shift, asserts that a two-column solve takes *exactly* the worst
+    single column's iteration count. `_BatchedCg` satisfies that by construction; any mechanism that
+    couples the columns does not. The old guard asserted block CG's count was strictly *lower* and
+    would have caught this had it been parametrized over the ill-conditioned arm.
 
 ### 16.9 The 0.3-5.0 ms loss band, attributed
 
