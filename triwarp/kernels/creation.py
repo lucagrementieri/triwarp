@@ -869,6 +869,130 @@ def surface_super_toroid(u: wp.float32, v: wp.float32, n1: wp.float32, n2: wp.fl
     return wp.vec3(su * (1.0 + 0.5 * cv), cu * (1.0 + 0.5 * cv), 0.5 * sv)
 
 
+@wp.kernel
+def parametric_canonical_keys(
+    n_u: wp.int32,
+    n_v: wp.int32,
+    u_wrap: wp.bool,
+    u_twist: wp.bool,
+    v_wrap: wp.bool,
+    v_twist: wp.bool,
+    pole_j_lo: wp.bool,
+    pole_j_hi: wp.bool,
+    pole_i_lo: wp.bool,
+    pole_i_hi: wp.bool,
+    out_keys: wp.array[wp.int32],
+) -> None:
+    """
+    Identify each lattice sample with the sample that represents its output vertex.
+
+    Writes ``i_canonical * n_v + j_canonical`` per sample, flattened in C order, so that two
+    samples the surface glues together get the same key and ``grouping.unique_1d`` does the welding.
+    This is the gluing rule of ``creation._parametric_lattice`` moved to the device verbatim,
+    including the two orderings that are easy to get wrong: the ``u``-seam re-canonicalisation
+    after a ``v``-twist is *unmasked* (it applies to every sample, not only the seam), and all four
+    pole masks are snapshots of the post-wrap state, taken before any of them collapses anything.
+
+    The pole anchors need no arguments because they are fixed by the rule itself -- a pole on
+    ``j == 0`` or ``i == 0`` collapses to ``(0, 0)``, one on ``j == n_v - 1`` to ``(0, n_v - 1)``,
+    one on ``i == n_u - 1`` to ``(n_u - 1, 0)``. Every flag is warp-uniform, so one kernel serves
+    all sixteen surfaces rather than a factory per surface.
+    """
+    i, j = wp.tid()
+    i_c = i
+    j_c = j
+    if u_wrap and i_c == n_u - 1:
+        if u_twist:
+            j_c = n_v - 1 - j_c
+        i_c = 0
+    if v_wrap:
+        if j_c == n_v - 1:
+            if v_twist:
+                i_c = n_u - 1 - i_c
+            j_c = 0
+        # Unmasked, as in the host form: a v-twist can send any sample back onto the u seam.
+        if u_wrap and i_c == n_u - 1:
+            i_c = 0
+
+    # Masks first, collapses after -- the host builds the whole pole list before applying any of it.
+    on_j_lo = pole_j_lo and j_c == 0
+    on_j_hi = pole_j_hi and j_c == n_v - 1
+    on_i_lo = pole_i_lo and i_c == 0
+    on_i_hi = pole_i_hi and i_c == n_u - 1
+    if on_j_lo:
+        i_c = 0
+        j_c = 0
+    if on_j_hi:
+        i_c = 0
+        j_c = n_v - 1
+    if on_i_lo:
+        i_c = 0
+        j_c = 0
+    if on_i_hi:
+        i_c = n_u - 1
+        j_c = 0
+    out_keys[i * n_v + j] = i_c * n_v + j_c
+
+
+@wp.kernel
+def parametric_samples_from_first(
+    first: wp.array[wp.int32],
+    n_v: wp.int32,
+    u_values: wp.array[wp.float32],
+    v_values: wp.array[wp.float32],
+    out_u: wp.array[wp.float32],
+    out_v: wp.array[wp.float32],
+) -> None:
+    # ``first`` is the flat lattice index of the sample chosen to represent each output vertex, so
+    # its lattice position is one divmod and the parameter values are two gathers. The ``u`` and
+    # ``v`` tables come from the host's ``linspace`` unchanged: both ends of the domain have to be
+    # hit exactly, because several of these maps are singular one ulp outside their rectangle.
+    k = wp.int32(wp.tid())
+    flat = first[k]
+    out_u[k] = u_values[flat // n_v]
+    out_v[k] = v_values[flat % n_v]
+
+
+@wp.kernel
+def parametric_lattice_faces(
+    vertex_index: wp.array[wp.int32],
+    n_u: wp.int32,
+    n_v: wp.int32,
+    out_triangles: wp.array2d[wp.int32],
+    out_keep: wp.array[wp.bool],
+) -> None:
+    """
+    Two triangles per lattice cell, wound against the ``(u, v)`` frame, with degeneracy flagged.
+
+    Thread ``t`` below the cell count emits that cell's ``(a, c, b)`` triangle and the rest emit
+    ``(a, d, c)``, which is the order the host's two stacked ``column_stack`` blocks produced -- the
+    compaction that follows preserves it, so the face buffer is unchanged row for row. A cell
+    touching a pole has two identical corners; that triangle is flagged rather than written out,
+    exactly as the host's non-degenerate mask did.
+    """
+    t = wp.int32(wp.tid())
+    n_cells = (n_u - 1) * (n_v - 1)
+    cell = t
+    if t >= n_cells:
+        cell = t - n_cells
+    i = cell // (n_v - 1)
+    j = cell % (n_v - 1)
+    corner_a = vertex_index[i * n_v + j]
+    corner_b = vertex_index[(i + 1) * n_v + j]
+    corner_c = vertex_index[(i + 1) * n_v + j + 1]
+    corner_d = vertex_index[i * n_v + j + 1]
+    v0 = corner_a
+    v1 = corner_c
+    v2 = corner_b
+    if t >= n_cells:
+        v1 = corner_d
+        v2 = corner_c
+    out_triangles[t, 0] = v0
+    out_triangles[t, 1] = v1
+    out_triangles[t, 2] = v2
+    out_keep[t] = v0 != v1 and v1 != v2 and v2 != v0
+
+
 @wp.func
 def parametric_position(
     kind: wp.int32, u: wp.float32, v: wp.float32, n1: wp.float32, n2: wp.float32

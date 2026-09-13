@@ -99,21 +99,25 @@ RTX 5090 / Warp 1.15, ``--device=cuda``. ``sections`` are 32 / 512 / 4096 unless
 | ``sweep_polygon`` (64-gon, 4k path) | 2.1 ms | 13.6 ms | — |
 
 The parametric-surface groups, whose axis is instead ``u_res = v_res`` at 40 / 160 / 640 (RTX 5090 /
-Warp 1.16), against pyvista rather than trimesh:
+Warp 1.17), against pyvista rather than trimesh:
 
 | case | triwarp-cuda | pyvista |
 |---|---|---|
-| ``parametric_surface`` (``boy``) | 0.43 / 2.0 / 54.3 ms | 2.5 / 20.4 / 1 271 ms |
-| ``parametric_surface`` (``dini``) | 0.33 / 1.7 / 44.4 ms | 2.4 / 16.5 / 1 003 ms |
+| ``parametric_surface`` (``boy``) | 0.28 / 0.64 / 0.70 ms | 2.5 / 20.4 / 1 271 ms |
+| ``parametric_surface`` (``dini``) | 0.25 / 0.65 / 0.84 ms | 2.4 / 16.5 / 1 003 ms |
 | ``super_ellipsoid`` (40 / 640) | 0.38 / 33.9 ms | 3.2 / 1 168 ms |
 | ``super_toroid`` (40 / 640) | 0.37 / 31.4 ms | 3.2 / 706 ms |
 | ``random_hills`` (40 / 640) | 0.42 / 44.3 ms | 3.7 / 1 104 ms |
 
-These are the one family in the module that is **not** flat in resolution, and the slope is
-host-side: at 640 (409k samples) ``_parametric_lattice``'s NumPy is 51 of the 55 ms, against 4 ms
-for the launch. That still leaves triwarp 7-23x ahead of VTK, which pays a per-point evaluation loop
-*and* a distance weld; the win would be far larger with the lattice on the device, and that is where
-this group should be read if it is ever optimized.
+These used to be the one family in the module that was **not** flat in resolution, because the
+slope was host-side: at 640 (409k samples) ``_parametric_lattice``'s NumPy was 51 of the 55 ms
+against 4 ms for the launch. The lattice now runs on the device above
+``creation._PARAMETRIC_LATTICE_DEVICE_FROM`` samples and the family is flat too -- 42.7 -> 0.70 ms
+at 640, **61x**, and 2.26x at 160 -- which takes the gap to VTK from 7-23x to roughly 60-1800x. The
+40 column is unchanged because it sits below the gate: the device path costs a flat ~0.66 ms of
+launches and readbacks whatever the resolution, so it *loses* 2.4x on a small lattice, and the
+dispatch is what keeps both ends. ``super_ellipsoid`` / ``super_toroid`` / ``random_hills`` share
+the lattice and move with it at 640; their 40 columns likewise do not.
 
 The shape to read here is that **triwarp is flat in resolution** — every revolution primitive costs
 the same at 32 sections as at 4096, because the work is two kernel launches over one buffer each.

@@ -1808,3 +1808,50 @@ def test_empty_results(device: str) -> None:
     )
     assert int(solid_v.shape[0]) == 0
     assert int(solid_f.shape[0]) == 0
+
+
+@pytest.mark.parametrize("surface", ["boy", "cross_cap", "klein", "mobius", "dini", "conic_spiral"])
+@pytest.mark.parametrize(("u_resolution", "v_resolution"), [(7, 5), (40, 40), (17, 33)])
+def test_parametric_lattice_paths_agree(
+    device: str, monkeypatch: pytest.MonkeyPatch, surface: str, u_resolution: int, v_resolution: int
+) -> None:
+    """
+    Triwarp against triwarp: the device lattice against the numpy one, which carries the oracle.
+
+    Not a library comparison at this level — the reference comparisons for these surfaces are the
+    pyvista tests elsewhere in this file, and they exercise whichever path the size gate selects.
+    What this pins is that the gate is a *performance* switch and nothing else: the two lattices
+    must be **bit-identical**, because the device path exists only to remove host work and any drift
+    in the last float32 bit would be a second definition of the geometry rather than a faster route
+    to the same one.
+
+    The gate is at ``_PARAMETRIC_LATTICE_DEVICE_FROM`` lattice samples, which every resolution a
+    test or fixture uses sits *below* — so without forcing it the device path would never run in
+    the suite at all. The surfaces straddle the gluing rules the two paths have to agree on: a
+    twisted wrap with two collapsed pole rows (``boy``, ``cross_cap``), a wrap in each direction
+    (``klein``), a twist with a boundary (``mobius``), a plain open patch (``dini``) and a
+    pole on one end only (``conic_spiral``).
+    """
+    forced = tw.creation._PARAMETRIC_LATTICE_DEVICE_FROM
+    monkeypatch.setattr(tw.creation, "_PARAMETRIC_LATTICE_DEVICE_FROM", 1 << 30)
+    host_v, host_f = tw.creation.parametric_surface(
+        surface,  # type: ignore[arg-type]
+        u_resolution,
+        v_resolution,
+        device=device,
+    )
+    host_v_np, host_f_np = host_v.numpy(), host_f.numpy()
+
+    monkeypatch.setattr(tw.creation, "_PARAMETRIC_LATTICE_DEVICE_FROM", 0)
+    device_v, device_f = tw.creation.parametric_surface(
+        surface,  # type: ignore[arg-type]
+        u_resolution,
+        v_resolution,
+        device=device,
+    )
+    assert forced > 0, "the gate must be a positive sample count"
+    # Not vacuous: the lattice really did produce a surface on both sides.
+    assert host_v_np.shape[0] > 0
+    assert host_f_np.shape[0] > 0
+    assert np.array_equal(device_v.numpy(), host_v_np)
+    assert np.array_equal(device_f.numpy(), host_f_np)

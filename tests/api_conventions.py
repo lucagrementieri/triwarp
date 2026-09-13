@@ -325,10 +325,6 @@ _WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
         "deliberate history: names the version in which ``wp.Volume.allocate_by_voxels`` "
         "gained its CPU path, which is why this module is not CUDA-only"
     ),
-    ("benchmarks.test_creation", "1.16"): (
-        "measurement stamp, same as the 1.15 entry above: the parametric-surface table names "
-        "the Warp its numbers were taken on"
-    ),
     ("_device", "1.14"): (
         "deliberate history: the version in which ``wp.launch`` stopped validating a "
         "cross-device argument list (NVIDIA/warp GH-1461), which is why ``require_same_device`` "
@@ -416,6 +412,11 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # ``neighbors`` is sorted in place: this kernel only orders the two slots each vertex already
     # holds, so it is both the input and the result and ``out_`` would read as write-only.
     ("boundary", "sort_boundary_neighbor_slots"): frozenset({"neighbors"}),
+    # The refinement carries its chains across rounds: ``chains`` holds each chain's current frame
+    # and ``chain_state`` its running loss and best box, so both are read, compared against and
+    # conditionally overwritten by every round. They are the loop's state, not its answer -- the
+    # answer is one row read back after the last round -- and ``out_`` would read as write-only.
+    ("bounds", "oriented_box_select_chains"): frozenset({"chains", "chain_state"}),
     ("combine", "offset_packed_faces"): frozenset({"faces"}),
     # ``holes``' two DP tables are in place, and they ride inside ``HoleFillTables`` rather than in
     # the signature because their pointers are invariant across the whole span sweep and a launch

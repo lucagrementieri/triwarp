@@ -151,6 +151,78 @@ def oriented_box_extents(
             wp.atomic_min(out_corners, base + 3 + c, -upper[c])
 
 
+BOX_OBJECTIVE_VOLUME = wp.constant(wp.int32(0))
+BOX_OBJECTIVE_SURFACE_AREA = wp.constant(wp.int32(1))
+BOX_OBJECTIVE_DIAGONAL = wp.constant(wp.int32(2))
+
+
+@wp.func
+def packed_box_sides(corners: wp.array[wp.float32], box: wp.int32) -> wp.vec3:
+    """Side lengths of the box in the six ``[min, -max]`` slots at ``box``."""
+    base = box * 6
+    return wp.vec3(
+        -corners[base + 3] - corners[base],
+        -corners[base + 4] - corners[base + 1],
+        -corners[base + 5] - corners[base + 2],
+    )
+
+
+@wp.func
+def box_objective_loss(sides: wp.vec3, objective: wp.int32) -> wp.float32:
+    """
+    Score a box's sides under one of the three objectives, as ``bounds._objective_losses`` does.
+
+    The branch is warp-uniform -- every thread in the launch is handed the same ``objective`` -- so
+    this is the int-selector form rather than three kernels.
+    """
+    if objective == BOX_OBJECTIVE_VOLUME:
+        return sides[0] * sides[1] * sides[2]
+    if objective == BOX_OBJECTIVE_SURFACE_AREA:
+        return wp.float32(2.0) * (sides[0] * sides[2] + sides[1] * sides[0] + sides[2] * sides[1])
+    return wp.dot(sides, sides)
+
+
+@wp.kernel
+def oriented_box_select_chains(
+    corners: wp.array[wp.float32],
+    axes: wp.array[wp.mat33],
+    count_per_chain: wp.int32,
+    objective: wp.int32,
+    chains: wp.array[wp.mat33],
+    chain_state: wp.array2d[wp.float32],
+) -> None:
+    """
+    Keep each chain's best candidate of this round, in place, without a host round trip.
+
+    One thread per chain; each walks its own ``count_per_chain`` block of scored candidates, takes
+    the argmin of the objective, and overwrites the chain only when the round improved on it --
+    which is what makes the refinement monotone per chain, exactly as the host loop this replaces.
+
+    ``chain_state`` is one row of seven floats per chain: the running loss and the winning box's
+    ``lower`` and ``upper`` corners. Packing them together means the whole refinement reads back
+    once at the end instead of once per round, and the per-chain 36-byte ``wp.copy`` that used to
+    refresh an improved chain disappears with it.
+    """
+    chain = wp.int32(wp.tid())
+    base = chain * count_per_chain
+    best_row = wp.int32(-1)
+    best_loss = chain_state[chain, 0]
+    for k in range(count_per_chain):
+        row = base + k
+        loss = box_objective_loss(packed_box_sides(corners, row), objective)
+        if loss < best_loss:
+            best_loss = loss
+            best_row = row
+    if best_row < 0:
+        return
+    chains[chain] = axes[best_row]
+    chain_state[chain, 0] = best_loss
+    corner_base = best_row * 6
+    for c in range(3):
+        chain_state[chain, 1 + c] = corners[corner_base + c]
+        chain_state[chain, 4 + c] = -corners[corner_base + 3 + c]
+
+
 @wp.kernel
 def packed_box_diagonals(corners: wp.array[wp.float32], out_diagonal: wp.array[wp.float32]) -> None:
     # Decode one axis-aligned box per six ``[min_x, min_y, min_z, -max_x, -max_y, -max_z]`` slots

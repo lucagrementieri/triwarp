@@ -25,6 +25,7 @@ import numpy as np
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import TILE_1D
 from triwarp.kernels import bounds as kernel_bounds
@@ -625,6 +626,11 @@ def oriented_bounding_box(
 # full refinement at the cost of one extra 512-candidate global pass per round.
 _REFINE_CHAINS = 4
 _REFINE_CANDIDATES = 128
+_BOX_OBJECTIVES: dict[str, wp.int32] = {
+    "volume": kernel_bounds.BOX_OBJECTIVE_VOLUME,
+    "surface_area": kernel_bounds.BOX_OBJECTIVE_SURFACE_AREA,
+    "diagonal": kernel_bounds.BOX_OBJECTIVE_DIAGONAL,
+}
 
 
 def _refine_box(
@@ -648,15 +654,20 @@ def _refine_box(
     order = np.argsort(loss_np)
     chains_np = _spread_chain_frames(order, rotations)
     n_chains = chains_np.shape[0]
-    chain_loss = np.full(n_chains, np.inf)
-    chain_lower = np.zeros((n_chains, 3))
-    chain_upper = np.zeros((n_chains, 3))
 
     chains = wp.array(
         np.ascontiguousarray(chains_np, dtype=np.float32), dtype=wp.mat33, device=device
     )
     total = n_chains * _REFINE_CANDIDATES
     axes = wp.empty(total, dtype=wp.mat33, device=device)
+    corners = wp.empty(6 * total, dtype=wp.float32, device=device)
+    # Column 0 is the running per-chain loss, seeded to +inf so the first round always improves;
+    # columns 1..6 are the winning box's corners. One buffer because the refinement reads it back
+    # once, at the end, rather than once per round.
+    chain_state = twt.as_array2d(
+        wp.full((n_chains, 7), math.inf, dtype=wp.float32, device=device), wp.float32
+    )
+    objective_code = _BOX_OBJECTIVES[objective]
 
     # Start at the covering radius of the global grid: the sampled winner is at most about this
     # far from its basin's optimum, and each round halves the radius.
@@ -668,26 +679,48 @@ def _refine_box(
             inputs=[chains, wp.float64(sigma / math.pi), wp.int32(_REFINE_CANDIDATES), axes],
             device=device,
         )
-        lower_np, upper_np = _scored_extents(points, axes, n_slices)
-        round_loss = _objective_losses(upper_np - lower_np, objective).reshape(
-            n_chains, _REFINE_CANDIDATES
+        _score_extents_into(points, axes, n_slices, corners)
+        wp.launch(
+            kernel_bounds.oriented_box_select_chains,
+            dim=n_chains,
+            inputs=[
+                corners,
+                axes,
+                wp.int32(_REFINE_CANDIDATES),
+                objective_code,
+                chains,
+                chain_state,
+            ],
+            device=device,
         )
-        for chain in range(n_chains):
-            best = int(round_loss[chain].argmin())
-            if round_loss[chain, best] < chain_loss[chain]:
-                chain_loss[chain] = round_loss[chain, best]
-                row = chain * _REFINE_CANDIDATES + best
-                wp.copy(chains, axes, dest_offset=chain, src_offset=row, count=1)
-                chain_lower[chain] = lower_np[row]
-                chain_upper[chain] = upper_np[row]
         # 0.4 rather than 0.5: a flat-flush optimum is a *kink*, so the volume error is linear in
         # the final angular resolution, and the 127-frame ball resolves ~sigma/5 per round, so
         # shrinking by 0.4 never outruns what a round can see.
         sigma *= 0.4
 
-    winner = int(chain_loss.argmin())
+    state_np = chain_state.numpy()
+    winner = int(state_np[:, 0].argmin())
     frame_np = read_scalar(chains, winner).astype(np.float64)
-    return frame_np, chain_lower[winner], chain_upper[winner]
+    return (
+        frame_np,
+        state_np[winner, 1:4].astype(np.float64),
+        state_np[winner, 4:].astype(np.float64),
+    )
+
+
+def _score_extents_into(
+    points: wp.array[wp.vec3], axes: wp.array, n_slices: int, corners: wp.array[wp.float32]
+) -> None:
+    """Fill ``corners`` with the cloud's extent in every candidate frame, six packed slots each."""
+    # Seeded rather than allocated so the refinement can reuse one buffer across its rounds; the
+    # kernel only ever ``atomic_min``s into it, so every round must start from ``+inf`` again.
+    corners.fill_(math.inf)
+    wp.launch(
+        kernel_bounds.oriented_box_extents,
+        dim=(int(axes.shape[0]), n_slices),
+        inputs=[points, axes, n_slices, corners],
+        device=points.device,
+    )
 
 
 def _scored_extents(
@@ -695,16 +728,11 @@ def _scored_extents(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extent of the cloud in every candidate frame, read back as ``(lower, upper)`` tables."""
     n_axes = int(axes.shape[0])
-    corners = wp.full(6 * n_axes, math.inf, dtype=wp.float32, device=points.device)
-    wp.launch(
-        kernel_bounds.oriented_box_extents,
-        dim=(n_axes, n_slices),
-        inputs=[points, axes, n_slices, corners],
-        device=points.device,
-    )
-    # One readback per scored batch; the objective and argmin are O(n_axes) host arithmetic over a
-    # buffer far too small to be worth a device pass. Slots 3..5 hold the *negated* upper corner;
-    # see the kernel.
+    corners = wp.empty(6 * n_axes, dtype=wp.float32, device=points.device)
+    _score_extents_into(points, axes, n_slices, corners)
+    # The global phase reads this back because its consumer is host-side: the loss table is sorted
+    # and spread into chains in numpy. The *refinement* does not -- it scores and selects on the
+    # device and reads one row at the end. Slots 3..5 hold the negated upper corner; see the kernel.
     corners_np = corners.numpy().reshape(n_axes, 6)
     return corners_np[:, :3], -corners_np[:, 3:]
 

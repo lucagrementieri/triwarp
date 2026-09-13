@@ -2140,7 +2140,9 @@ def random_hills(
     """
     if float(x_variance) <= 0.0 or float(y_variance) <= 0.0:
         raise ValueError(f"variances must be positive, got {(x_variance, y_variance)}")
-    sample_u, sample_v, faces = _parametric_samples(_RANDOM_HILLS_SPEC, u_resolution, v_resolution)
+    sample_u, sample_v, faces = _parametric_samples(
+        _RANDOM_HILLS_SPEC, u_resolution, v_resolution, device
+    )
     generator = np.random.default_rng(tw.sample.resolve_seed(seed))
     centers = generator.uniform(
         low=(_RANDOM_HILLS_SPEC.u_range[0], _RANDOM_HILLS_SPEC.v_range[0]),
@@ -2148,7 +2150,7 @@ def random_hills(
         size=(max(int(n_hills), 0), 2),
     )
 
-    vertices = wp.empty(sample_u.shape[0], dtype=wp.vec3, device=device)
+    vertices = wp.empty(int(sample_u.shape[0]), dtype=wp.vec3, device=device)
     wp.launch(
         kernel_creation.random_hills_vertices,
         dim=int(vertices.shape[0]),
@@ -2157,8 +2159,8 @@ def random_hills(
             wp.float32(x_variance),
             wp.float32(y_variance),
             wp.array(centers, dtype=wp.vec2, device=device),
-            wp.array(sample_u, dtype=wp.float32, device=device),
-            wp.array(sample_v, dtype=wp.float32, device=device),
+            sample_u,
+            sample_v,
             vertices,
         ],
         device=device,
@@ -2339,6 +2341,11 @@ _SUPER_TOROID_SPEC = _ParametricSpec(
 # form -- so its ``kind`` selects nothing and the lattice is a plain grid.
 _RANDOM_HILLS_SPEC = _ParametricSpec(wp.int32(-1), (-10.0, 10.0), (-10.0, 10.0))
 
+# Lattice samples at or above which the device lattice beats the numpy one. The device path costs a
+# flat ~0.66 ms of launches, allocations and two readbacks whatever the resolution; the host path is
+# quadratic in it. Measured at 96 squared = 9 216 (1.01x), 80 squared (0.82x), 112 squared (1.28x).
+_PARAMETRIC_LATTICE_DEVICE_FROM = 9216
+
 
 def _parametric_surface(
     spec: _ParametricSpec,
@@ -2355,28 +2362,30 @@ def _parametric_surface(
     # lattice and letting the identified samples race for the slot would not (a twisted seam and a
     # collapsed pole row reach the same point through different expressions, so they agree only to
     # rounding).
-    sample_u, sample_v, faces = _parametric_samples(spec, u_resolution, v_resolution)
-    vertices = wp.empty(sample_u.shape[0], dtype=wp.vec3, device=device)
+    sample_u, sample_v, faces = _parametric_samples(spec, u_resolution, v_resolution, device)
+    vertices = wp.empty(int(sample_u.shape[0]), dtype=wp.vec3, device=device)
     wp.map(
         kernel_creation.parametric_position,
         spec.kind,
-        wp.array(sample_u, dtype=wp.float32, device=device),
-        wp.array(sample_v, dtype=wp.float32, device=device),
+        sample_u,
+        sample_v,
         wp.float32(n1),
         wp.float32(n2),
         out=vertices,
     )
-    return vertices, wp.array(faces, dtype=wp.int32, device=device)
+    return vertices, faces
 
 
 def _parametric_samples(
-    spec: _ParametricSpec, u_resolution: int, v_resolution: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    spec: _ParametricSpec, u_resolution: int, v_resolution: int, device: wp.DeviceLike
+) -> tuple[wp.array[wp.float32], wp.array[wp.float32], wp.array[wp.int32]]:
     """
     Per-output-vertex ``(u, v)`` parameter values and the face buffer, for one surface's lattice.
 
-    The parameter values are computed here rather than in the kernel so that both ends of the
-    domain are hit exactly: several of these maps are singular one ulp outside their rectangle.
+    The parameter *tables* are built here rather than in the kernel so that both ends of the domain
+    are hit exactly: several of these maps are singular one ulp outside their rectangle. They are
+    length ``n_u`` and ``n_v``, not one entry per sample, so the gather that spreads them over the
+    lattice happens on the device.
     """
     n_u, n_v = int(u_resolution), int(v_resolution)
     if n_u < 2 or n_v < 2:
@@ -2390,13 +2399,42 @@ def _parametric_samples(
         raise ValueError(f"u_resolution must be at least 3 on a wrapped axis, got {n_u}")
     if spec.v_wrap and not spec.v_twist and n_v < 3:
         raise ValueError(f"v_resolution must be at least 3 on a wrapped axis, got {n_v}")
-    sample_ij, faces = _parametric_lattice(spec, n_u, n_v)
-    sample_u = np.linspace(*spec.u_range, n_u)[sample_ij[:, 0]]
-    sample_v = np.linspace(*spec.v_range, n_v)[sample_ij[:, 1]]
-    return sample_u, sample_v, faces
+    # The lattice is a closed-form parallel map, so the device wins it outright once there is
+    # enough of it -- and loses below that to its own launch and readback floor, which is flat where
+    # the host cost is quadratic in the resolution. Measured on an RTX 5090, Warp 1.17, "boy" at
+    # 32..192 squared: the device path is 0.64-0.68 ms at every one of them while the host path goes
+    # 0.27 -> 2.21 ms, crossing at 96 squared. Both produce byte-identical vertices and faces.
+    if n_u * n_v >= _PARAMETRIC_LATTICE_DEVICE_FROM:
+        first, faces = _parametric_lattice_device(spec, n_u, n_v, device)
+        n_vertices = int(first.shape[0])
+        sample_u = wp.empty(n_vertices, dtype=wp.float32, device=device)
+        sample_v = wp.empty(n_vertices, dtype=wp.float32, device=device)
+        wp.launch(
+            kernel_creation.parametric_samples_from_first,
+            dim=n_vertices,
+            inputs=[
+                first,
+                wp.int32(n_v),
+                wp.array(np.linspace(*spec.u_range, n_u), dtype=wp.float32, device=device),
+                wp.array(np.linspace(*spec.v_range, n_v), dtype=wp.float32, device=device),
+                sample_u,
+                sample_v,
+            ],
+            device=device,
+        )
+        return sample_u, sample_v, faces
+
+    sample_ij, faces_np = _parametric_lattice_host(spec, n_u, n_v)
+    return (
+        wp.array(np.linspace(*spec.u_range, n_u)[sample_ij[:, 0]], dtype=wp.float32, device=device),
+        wp.array(np.linspace(*spec.v_range, n_v)[sample_ij[:, 1]], dtype=wp.float32, device=device),
+        wp.array(faces_np, dtype=wp.int32, device=device),
+    )
 
 
-def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.ndarray, np.ndarray]:
+def _parametric_lattice_host(
+    spec: _ParametricSpec, n_u: int, n_v: int
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Choose one lattice sample per output vertex, and build the face buffer, for one surface.
 
@@ -2405,10 +2443,13 @@ def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.n
     surface glues, and evaluating only the representative keeps the result bit-exact -- and
     ``faces`` is triwarp's flat triangle buffer.
 
-    Pure host-side index arithmetic, in the same spirit as [`grid`][triwarp.creation.grid]: no
-    position is consulted and no tolerance appears anywhere, so the topology is exact and
-    independent of resolution, dtype and device. Welding by *distance* instead would (a) make every
-    one of these meshes depend on
+    The small-lattice half of the dispatch in
+    [`_parametric_samples`][triwarp.creation._parametric_samples]; its device twin is
+    ``_parametric_lattice_device``, which produces the identical answer and wins above
+    ``_PARAMETRIC_LATTICE_DEVICE_FROM`` samples. Pure index arithmetic, in the same spirit as
+    [`grid`][triwarp.creation.grid]: no position is consulted and no tolerance appears anywhere, so
+    the topology is exact and independent of resolution, dtype and device. Welding by *distance*
+    instead would (a) make every one of these meshes depend on
     [`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices], which several of them
     exist to test, and (b) glue the accidental self-intersections of an immersed surface -- which is
     what VTK does, merging 40 lattice points of Catalan's minimal surface that the map does not
@@ -2490,6 +2531,83 @@ def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.n
         & (triangles[:, 2] != triangles[:, 0])
     )
     return sample_ij, np.ascontiguousarray(triangles[nondegenerate].reshape(-1), dtype=np.int32)
+
+
+def _parametric_lattice_device(
+    spec: _ParametricSpec, n_u: int, n_v: int, device: wp.DeviceLike
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Choose one lattice sample per output vertex, and build the face buffer, for one surface.
+
+    Returns ``(first, faces)`` where ``first`` is the flat lattice index of the sample representing
+    each output vertex -- several samples land on one vertex wherever the surface glues, and
+    evaluating only the representative keeps the result bit-exact -- and ``faces`` is triwarp's flat
+    triangle buffer.
+
+    The large-lattice half of the dispatch in
+    [`_parametric_samples`][triwarp.creation._parametric_samples]; ``_parametric_lattice_host``
+    is its numpy twin and returns the identical answer. Pure index arithmetic, in the same spirit
+    as [`grid`][triwarp.creation.grid]: no position is consulted and no tolerance appears anywhere,
+    so the topology is exact and independent of resolution, dtype and device. Welding by *distance*
+    instead would (a) make every one of these meshes depend on
+    [`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices], which several of them
+    exist to test, and (b) glue the accidental self-intersections of an immersed surface -- which is
+    what VTK does, merging 40 lattice points of Catalan's minimal surface that the map does not
+    identify, because two sheets happen to cross there.
+    """
+    if spec.u_twist and spec.v_twist:
+        raise ValueError("a surface twisted in both directions is not supported")
+
+    # A pole is a boundary row the map collapses to a single point. A *wrapped* boundary has
+    # already identified its two extreme rows, so a pole on either of them is one pole on the
+    # surviving row -- which is why Boy and the cross-cap keep 1 483 vertices rather than losing a
+    # second row's worth. The kernel takes the four resolved masks, not the eight spec flags.
+    pole_j_lo = (spec.pole_v_min or spec.pole_v_max) if spec.v_wrap else spec.pole_v_min
+    pole_j_hi = False if spec.v_wrap else spec.pole_v_max
+    pole_i_lo = (spec.pole_u_min or spec.pole_u_max) if spec.u_wrap else spec.pole_u_min
+    pole_i_hi = False if spec.u_wrap else spec.pole_u_max
+
+    keys = wp.empty(n_u * n_v, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_creation.parametric_canonical_keys,
+        dim=(n_u, n_v),
+        inputs=[
+            wp.int32(n_u),
+            wp.int32(n_v),
+            spec.u_wrap,
+            spec.u_twist,
+            spec.v_wrap,
+            spec.v_twist,
+            pole_j_lo,
+            pole_j_hi,
+            pole_i_lo,
+            pole_i_hi,
+            keys,
+        ],
+        device=device,
+    )
+    # ``unique_1d``'s inverse numbers the vertices in sorted-key order, which is what
+    # ``numpy.unique`` returned too, and ``first_occurrence_indices`` is its ``return_index``: the
+    # lowest flat lattice index in each group. ``validate=False`` because the keys are
+    # ``i * n_v + j`` over the lattice this function just addressed.
+    unique_keys, inverse = tw.grouping.unique_1d(keys, return_inverse=True)
+    n_vertices = int(unique_keys.shape[0])
+    first = tw.grouping.first_occurrence_indices(inverse, n_vertices)
+
+    # One cell per lattice square -- wrapping reuses vertices rather than adding cells, so the count
+    # is ``(n_u - 1) * (n_v - 1)`` however the boundary glues. A cell touching a pole has two
+    # identical corners, so it contributes one triangle instead of two.
+    n_triangles = 2 * (n_u - 1) * (n_v - 1)
+    triangles = twt.empty_2d((n_triangles, 3), wp.int32, device=device)
+    keep = wp.empty(n_triangles, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_creation.parametric_lattice_faces,
+        dim=n_triangles,
+        inputs=[inverse, wp.int32(n_u), wp.int32(n_v), triangles, keep],
+        device=device,
+    )
+    kept = tw.array.gather(triangles, tw.array.flatnonzero(keep))
+    return first, kept.reshape(-1)
 
 
 def _resolve_cylinder_axis(
