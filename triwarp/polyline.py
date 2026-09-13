@@ -45,6 +45,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
+from triwarp.array import ALLCLOSE_ATOL, ALLCLOSE_RTOL
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import polyline as kernel_polyline
@@ -66,8 +67,9 @@ def is_closed(polyline: wp.array[wp.vec3]) -> bool:
     """
     Whether a polyline is closed (its first and last points coincide).
 
-    The endpoint comparison runs on-device via [`allclose`][triwarp.array.allclose], so no array
-    is copied to the host.
+    The endpoint comparison runs on-device — one thread, one flag, one four-byte readback — so no
+    array is copied to the host. It applies the same tolerance predicate
+    [`allclose`][triwarp.array.allclose] does, through the same kernel-side function.
 
     Parameters
     ----------
@@ -86,7 +88,21 @@ def is_closed(polyline: wp.array[wp.vec3]) -> bool:
     [`polyline_close`][triwarp.polyline.polyline_close]
     """
     n = int(polyline.shape[0])
-    return n >= 2 and tw.array.allclose(polyline[0:1], polyline[n - 1 : n])
+    if n < 2:
+        return False
+    # One launch rather than ``allclose`` over two one-element slices: that spelling is a
+    # ``wp.map`` into a mask plus a whole reduction over it, and it measured **0.118 ms to compare
+    # six floats** -- nine times what cloning the entire polyline costs. See
+    # ``kernels/polyline.endpoints_coincide``.
+    flag = wp.empty(1, dtype=wp.int32, device=polyline.device)
+    wp.launch(
+        kernel_polyline.endpoints_coincide,
+        dim=1,
+        inputs=[polyline, wp.float32(ALLCLOSE_RTOL), wp.float32(ALLCLOSE_ATOL)],
+        outputs=[flag],
+        device=polyline.device,
+    )
+    return bool(int(read_scalar(flag, 0)) != 0)
 
 
 def polyline_open(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
@@ -162,15 +178,27 @@ def polyline_length(polyline: wp.array[wp.vec3], *, closed: bool = False) -> flo
     [`cumulative_arc_length`][triwarp.polyline.cumulative_arc_length]
         The same lengths, unreduced.
     """
-    if closed:
-        polyline = polyline_close(polyline)
     device = polyline.device
-    n_segments = int(polyline.shape[0]) - 1
+    n_points = int(polyline.shape[0])
+    # ``closed`` adds the segment from the last point back to the first, which the kernel reaches
+    # by wrapping its index -- no ``polyline_close`` copy of the whole buffer for one segment.
+    n_segments = n_points if closed else n_points - 1
     if n_segments < 1:
         return 0.0
-    lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
-    wp.map(kernel_polyline.segment_length, polyline[:-1], polyline[1:], out=lengths)
-    return float(tw.reduce.sum(lengths))
+    # Summed where the segment lengths are computed, rather than through an ``(n - 1,)`` scratch
+    # buffer and a separate reduction over it -- one launch, one allocation and one readback
+    # instead of two of each. See ``kernels/polyline.polyline_total_length``, including why the
+    # answer's last bits move.
+    total = wp.zeros(1, dtype=wp.float32, device=device)
+    wp.launch_tiled(
+        kernel_polyline.polyline_total_length,
+        dim=kernel_reduce.blocks_1d(n_segments),
+        inputs=[polyline, wp.int32(n_segments)],
+        outputs=[total],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    return float(read_scalar(total, 0))
 
 
 def polyline_centroid(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.vec3:
@@ -205,22 +233,27 @@ def polyline_centroid(polyline: wp.array[wp.vec3], *, closed: bool = False) -> w
     [`polyline_radius`][triwarp.polyline.polyline_radius]
         Both default their plane to this centroid.
     """
-    if closed:
-        polyline = polyline_close(polyline)
     device = polyline.device
-    n_segments = int(polyline.shape[0]) - 1
+    n_points = int(polyline.shape[0])
+    # ``closed`` is the wrap-around segment, which the kernel reaches by index rather than by a
+    # ``polyline_close`` copy of the whole buffer -- as in ``polyline_length``.
+    n_segments = n_points if closed else n_points - 1
     if n_segments < 1:
         raise ValueError("polyline_centroid requires at least two points")
-    midpoints = wp.empty(n_segments, dtype=wp.vec3, device=device)
-    lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
-    wp.map(
-        kernel_polyline.segment_midpoint_and_length,
-        polyline[:-1],
-        polyline[1:],
-        out=[midpoints, lengths],
+    # One launch and one readback for all four sums, rather than a two-output ``wp.map`` into two
+    # scratch buffers followed by a weighted reduction and a plain one over them. See
+    # ``kernels/polyline.polyline_weighted_midpoint_sums``.
+    sums = wp.zeros(4, dtype=wp.float32, device=device)
+    wp.launch_tiled(
+        kernel_polyline.polyline_weighted_midpoint_sums,
+        dim=kernel_reduce.blocks_1d(n_segments),
+        inputs=[polyline, wp.int32(n_segments)],
+        outputs=[sums],
+        block_dim=TILE_1D,
+        device=device,
     )
-    weighted = tw.reduce.weighted_sum(midpoints, lengths)
-    return weighted / float(tw.reduce.sum(lengths))
+    sums_np = sums.numpy()
+    return wp.vec3(*sums_np[:3]) / float(sums_np[3])
 
 
 def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:

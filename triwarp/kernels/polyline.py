@@ -6,6 +6,7 @@ from triwarp.kernels.array import (
     binary_search_index,
     cross2,
     declare_map_signatures,
+    is_close_vec3,
     lowbias32,
     map_probe,
     map_probe_single,
@@ -1017,3 +1018,109 @@ def _declare_map_kernels() -> None:
 
 
 _declare_map_kernels()
+
+
+@wp.kernel
+def polyline_total_length(
+    points: wp.array[wp.vec3], n_segments: wp.int32, out_total: wp.array[wp.float32]
+) -> None:
+    # Arc length of an open polyline in one launch: the per-segment lengths are summed where they
+    # are computed instead of being written to a buffer a separate reduction then reads back in.
+    # That is CLAUDE.md section 14.10's producer-consumer fusion applied to a reduction's producer
+    # -- ``polyline_length`` ran a ``wp.map`` into an ``(n - 1,)`` scratch array and then
+    # ``reduce.sum`` over it: two launches, two allocations and ~11 us of ``wp.map`` resolution for
+    # an answer that is one number.
+    #
+    # **This changes the summation order and therefore the last bits of the answer.** A lane-strided
+    # fold plus a ``wp.tile_sum`` tree is not the left-to-right sum ``reduce.sum`` happens to
+    # perform below ``TILE_1D`` elements, so the result no longer matches a sequential ``float32``
+    # accumulation exactly. That is a deliberate trade, and it is why
+    # ``tests/test_polyline.py::test_polyline_length_matches_meshlib`` compares with a tolerance
+    # rather than with ``==``; a tree sum is in fact the *more* accurate of the two, since it
+    # halves the depth over which rounding accumulates.
+    #
+    # Launched ``wp.launch_tiled(dim=kernel_reduce.blocks_1d(n_segments), block_dim=TILE_1D)``:
+    # one block per ``ITEMS_PER_BLOCK_1D`` segments, lanes striding that block's own chunk by
+    # ``wp.block_dim()`` (section 2.2, which is what keeps the single-lane CPU device correct), a
+    # ``wp.tile_sum`` fold and one atomic per block.
+    #
+    # ``n_segments`` rather than ``points.shape[0] - 1``, because the closing segment of a *closed*
+    # polyline is expressed by wrapping the index here rather than by handing this kernel a copy of
+    # the buffer with its first point appended. That copy was an allocation and a full-buffer
+    # ``wp.copy`` for one extra segment, and it dominated the closed form once the reduction itself
+    # was fused.
+    i, lane = wp.tid()
+    offset, remaining = tile_chunk(n_segments, i, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    # ``tile_chunk`` reports what is left to the end of the array, not this block's share of it --
+    # see its own docstring, and ``kernels/reduce._reduce_bool_1d_tiled`` for the same clamp.
+    remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+    n_points = points.shape[0]
+    total = wp.float32(0.0)
+    for k in range(lane, remaining, wp.block_dim()):
+        start = offset + k
+        total += segment_length(points[start], points[(start + 1) % n_points])
+    block_total = wp.tile_sum(wp.tile(total))[0]
+    if lane == 0:
+        wp.atomic_add(out_total, 0, block_total)
+
+
+@wp.kernel
+def polyline_weighted_midpoint_sums(
+    points: wp.array[wp.vec3], n_segments: wp.int32, out_sums: wp.array[wp.float32]
+) -> None:
+    # Both sums a length-weighted centroid needs, in one launch: ``sum(midpoint * length)`` in
+    # slots 0..2 and ``sum(length)`` in slot 3.
+    #
+    # ``polyline_centroid`` ran a two-output ``wp.map`` into an ``(n - 1,)`` midpoint buffer and an
+    # ``(n - 1,)`` length buffer, then ``reduce.weighted_sum`` over the pair and ``reduce.sum`` over
+    # the lengths -- three launches, three allocations and **two** host readbacks for four numbers,
+    # of which the second readback drained a pipeline the first had already drained. One buffer,
+    # one readback. The same lane-strided shape and the same closed-polyline index wrap as
+    # ``polyline_total_length``; see it for both, including why the last bits of the sums move.
+    i, lane = wp.tid()
+    offset, remaining = tile_chunk(n_segments, i, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+    n_points = points.shape[0]
+    weighted = wp.vec3(0.0, 0.0, 0.0)
+    total = wp.float32(0.0)
+    for k in range(lane, remaining, wp.block_dim()):
+        start = offset + k
+        midpoint, length = segment_midpoint_and_length(
+            points[start], points[(start + 1) % n_points]
+        )
+        weighted += midpoint * length
+        total += length
+    # Block-collective, so every lane runs all four and only the commit is guarded.
+    sum_x = wp.tile_sum(wp.tile(weighted[0]))[0]
+    sum_y = wp.tile_sum(wp.tile(weighted[1]))[0]
+    sum_z = wp.tile_sum(wp.tile(weighted[2]))[0]
+    sum_w = wp.tile_sum(wp.tile(total))[0]
+    if lane == 0:
+        wp.atomic_add(out_sums, 0, sum_x)
+        wp.atomic_add(out_sums, 1, sum_y)
+        wp.atomic_add(out_sums, 2, sum_z)
+        wp.atomic_add(out_sums, 3, sum_w)
+
+
+@wp.kernel
+def endpoints_coincide(
+    polyline: wp.array[wp.vec3], rtol: wp.float32, atol: wp.float32, out_flag: wp.array[wp.int32]
+) -> None:
+    # Whether a polyline's first and last points coincide, as one thread and one flag.
+    #
+    # ``polyline.is_closed`` asked this through ``array.allclose`` over two one-element slices,
+    # which is a ``wp.map`` into a mask plus a whole reduction over it plus the readback --
+    # **0.118 ms to compare six floats**, against 0.013 ms to clone the entire 4 096-point buffer
+    # it is asked about. The readback stays (the answer decides a host-side branch, and the shape
+    # of what ``polyline_close`` returns); everything around it does not.
+    #
+    # The same ``rtol``/``atol`` predicate ``array.allclose`` applies, through the same
+    # ``@wp.func``, so the two cannot disagree about what "coincide" means.
+    n = polyline.shape[0]
+    out_flag[0] = wp.where(
+        is_close_vec3(polyline[0], polyline[n - 1], rtol, atol), wp.int32(1), wp.int32(0)
+    )

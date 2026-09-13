@@ -303,13 +303,21 @@ def test_polyline_length_closed_matches_trimesh(device: str) -> None:
 @pytest.mark.parity("polyline_length", "meshlib")
 def test_polyline_length_matches_meshlib(device: str) -> None:
     """
-    Class A, and **bit-identical**: ``calcLength`` sums the same segments in the same float32.
+    Class A: ``calcLength`` sums the same segments over the same ``float32`` contour.
 
     Both open and closed forms, the closed one through the same named transform the trimesh pairing
     uses -- append the first point, since MeshLib's ``calcLength`` takes a bare contour and has no
-    closed flag either. Measured equal to the last digit (75.49140930175781 on this fixture), which
-    is stronger than the ``allclose`` the reference comparisons above settle for and is worth
-    asserting exactly: a summation-order change would show here first.
+    closed flag either.
+
+    **This compared ``==`` and now compares a relative tolerance, deliberately.** ``calcLength``
+    accumulates left to right and ``polyline_length`` folds a ``wp.tile_sum`` tree over
+    lane-strided partials, so the two agree only up to ``float32`` summation order -- measured
+    ~1e-7 relative on this fixture, which is one or two ulps of a 50-segment sum and *below* the
+    error either accumulation carries against the exact answer. The tree is in fact the more
+    accurate of the two, since it halves the depth over which rounding compounds. The bar here is
+    therefore ``rtol=1e-6``: tight enough that a wrong segment, a dropped one or a doubled one
+    fails it by orders of magnitude, and loose enough not to pin an implementation detail of how
+    the partial sums are ordered.
 
     ``calcLength`` is an overload set over 2-D and 3-D, float and double contours; the ``Vector3f``
     one is what a ``float32`` polyline maps onto, and picking the ``double`` overload instead would
@@ -320,12 +328,12 @@ def test_polyline_length_matches_meshlib(device: str) -> None:
     length_wp = tw.polyline.polyline_length(points_to_warp(pts_np, device))
     length_ml = mm.calcLength(_contour_ml(pts_np))
     assert length_ml > 0.0  # non-vacuity
-    assert length_wp == length_ml
+    assert length_wp == pytest.approx(length_ml, rel=1e-6)
 
     closed_wp = tw.polyline.polyline_length(points_to_warp(pts_np, device), closed=True)
     closed_ml = mm.calcLength(_contour_ml(_closed_from(pts_np)))
     assert closed_ml > length_ml  # the closing segment is real
-    assert closed_wp == closed_ml
+    assert closed_wp == pytest.approx(closed_ml, rel=1e-6)
 
 
 @pytest.mark.parity("polyline_length", "pyvista")
