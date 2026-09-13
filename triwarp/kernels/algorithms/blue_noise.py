@@ -203,6 +203,14 @@ def dart_select_minima(
     # of the two" argument that keeps two acceptances apart has no exception. The pass writes only
     # its own slot, and the only state it reads of others is "not yet covered" — which this pass
     # never sets — so it is race-free and its output depends only on the round's input state.
+    #
+    # **Every index in this kernel is a cell-sorted one.** ``sample._dart_throw_blue_noise``
+    # permutes the pool through the very sort that built the cell list, so a cell's members are the
+    # contiguous run ``[cell_offsets[c], cell_offsets[c + 1])`` and the loop variable ``k`` *is*
+    # the point. That makes the three payload reads below stride 1 where they were a scatter into
+    # the unsorted pool, and it takes ``bucket`` out of the hot path -- it is read only on the
+    # priority-tie branch, which is what preserves the *original* pool index as the tie-break so
+    # the accepted set is unchanged by the renumbering.
     t = wp.int32(wp.tid())
     i = alive[t]
     my_key = priority[i]
@@ -217,13 +225,12 @@ def dart_select_minima(
         if cell_min_priority[c] > my_key:
             continue
         for k in range(cell_offsets[c], cell_offsets[c + 1]):
-            j = bucket[k]
-            if j == i or out_state[j] == DART_COVERED:
+            if k == i or out_state[k] == DART_COVERED:
                 continue
-            other = priority[j]
-            if other > my_key or (other == my_key and j > i):
+            other = priority[k]
+            if other > my_key or (other == my_key and bucket[k] > bucket[i]):
                 continue
-            if wp.length_sq(pool_points[j] - p) < rr:
+            if wp.length_sq(pool_points[k] - p) < rr:
                 return
     out_state[i] = DART_ACCEPTED
     # Summary for the covering sweep that follows: this cell now holds a point accepted *this*
@@ -236,7 +243,6 @@ def dart_cover_neighbors(
     pool_points: wp.array[wp.vec3],
     point_cell: wp.array[wp.int32],
     cell_neighbors: wp.array2d[wp.int32],
-    bucket: wp.array[wp.int32],
     cell_offsets: wp.array[wp.int32],
     alive: wp.array[wp.int32],
     cell_accepted: wp.array[wp.bool],
@@ -264,11 +270,12 @@ def dart_cover_neighbors(
         # same round, and this thread was already alive then, so it would not still be alive now.
         if not cell_accepted[c]:
             continue
+        # Cell-sorted indices throughout, as in ``dart_select_minima``: ``k`` is the point, so
+        # both reads are stride 1 and ``bucket`` is not needed here at all (no tie-break).
         for k in range(cell_offsets[c], cell_offsets[c + 1]):
-            j = bucket[k]
-            if out_state[j] != DART_ACCEPTED:
+            if out_state[k] != DART_ACCEPTED:
                 continue
-            if wp.length_sq(pool_points[j] - p) < rr:
+            if wp.length_sq(pool_points[k] - p) < rr:
                 out_state[i] = DART_COVERED
                 return
 

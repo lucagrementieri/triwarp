@@ -41,6 +41,7 @@ from triwarp._device import read_scalar, require_same_device
 from triwarp.array import arange, flatnonzero, gather
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
+from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
 from triwarp.neighbors import query_ball_with_offsets
 from triwarp.triangles import face_normals_and_areas
@@ -606,6 +607,14 @@ def _dart_throw_blue_noise(
         inputs=[grid_coords, wp.int32(grid_w), unique_keys, point_cell],
         device=device,
     )
+    # **The whole dart loop runs in cell-sorted index space from here on.** ``bucket`` is already
+    # the cell-order permutation, so permuting the payload through it once makes each cell's
+    # members the contiguous run its offsets name -- after which the two sweeps that dominate this
+    # call read their neighbours at stride 1 instead of scattering into the unsorted pool for every
+    # candidate of every one of ``DART_SHELL_CELLS`` cells. ``bucket`` itself survives only as the
+    # original-index tie-break (see ``dart_select_minima``) and as the map back at the end.
+    sorted_points = gather(pool_points, bucket)
+    sorted_cell = gather(point_cell, bucket)
     cell_neighbors = twt.empty_2d(
         (n_cells, kernel_blue_noise.DART_SHELL_CELLS), wp.int32, device=device
     )
@@ -616,10 +625,17 @@ def _dart_throw_blue_noise(
         device=device,
     )
 
-    priority = wp.empty(n_pool, dtype=wp.uint32, device=device)
+    # Drawn in *original* index space and then permuted, not drawn in sorted space: the priority a
+    # point holds is what decides the packing, so it has to stay the same function of the seed and
+    # the point rather than of where the sort happened to put it.
+    priority_unsorted = wp.empty(n_pool, dtype=wp.uint32, device=device)
     wp.launch(
-        kernel_array.random_priorities, dim=n_pool, inputs=[wp.int32(seed), priority], device=device
+        kernel_array.random_priorities,
+        dim=n_pool,
+        inputs=[wp.int32(seed), priority_unsorted],
+        device=device,
     )
+    priority = gather(priority_unsorted, bucket)
     state = wp.zeros(n_pool, dtype=wp.int32, device=device)
 
     # Per-cell summaries that let each round's two sweeps skip a shell cell whole; see the kernel
@@ -645,16 +661,16 @@ def _dart_throw_blue_noise(
         wp.launch(
             kernel_blue_noise.dart_cell_min_priority,
             dim=alive_count,
-            inputs=[priority, point_cell, view, cell_min_priority],
+            inputs=[priority, sorted_cell, view, cell_min_priority],
             device=device,
         )
         wp.launch(
             kernel_blue_noise.dart_select_minima,
             dim=alive_count,
             inputs=[
-                pool_points,
+                sorted_points,
                 priority,
-                point_cell,
+                sorted_cell,
                 cell_neighbors,
                 bucket,
                 cell_offsets,
@@ -670,10 +686,9 @@ def _dart_throw_blue_noise(
             kernel_blue_noise.dart_cover_neighbors,
             dim=alive_count,
             inputs=[
-                pool_points,
-                point_cell,
+                sorted_points,
+                sorted_cell,
                 cell_neighbors,
-                bucket,
                 cell_offsets,
                 view,
                 cell_accepted,
@@ -711,7 +726,14 @@ def _dart_throw_blue_noise(
 
     accepted_mask = wp.empty(n_pool, dtype=wp.bool, device=device)
     wp.map(kernel_array.equal, state, kernel_blue_noise.DART_ACCEPTED, out=accepted_mask)
-    kept = flatnonzero(accepted_mask)
+    # ``state`` is indexed by sorted position, so the mask is too; permuting it back to pool order
+    # before the compaction is what keeps the returned points in the pool's own order rather than
+    # the cell sort's. ``scatter_index`` inverts ``bucket`` in one launch.
+    inverse_bucket = wp.empty(n_pool, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_scatter.scatter_index, dim=n_pool, inputs=[bucket, inverse_bucket], device=device
+    )
+    kept = flatnonzero(gather(accepted_mask, inverse_bucket))
     if int(kept.shape[0]) == 0:
         return empty
     return gather(pool_points, kept), gather(pool_faces, kept)
