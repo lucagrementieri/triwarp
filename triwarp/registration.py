@@ -130,16 +130,29 @@ def procrustes(
             return matrix
         return matrix, wp.clone(a), 0.0
 
+    workspace = _procrustes_workspace(n, device, return_cost=return_cost)
+    weighted = weights is not None and int(weights.shape[0]) == n
+    result = _procrustes_into(
+        a, b, weights, reflection, translation, scale, return_cost, workspace, weighted
+    )
+
     # An all-zero non-empty ``weights`` divides by zero inside the kernel (the accumulated weight
     # sum is the denominator of every centroid and, with ``scale=True``, of the singular values
-    # too), silently returning a matrix of NaN with no exception. ``icp`` avoids this by checking
-    # the same sum itself and breaking its loop before ever reaching the shared machinery below --
-    # this entry point has no loop to break, so it raises instead.
-    if weights is not None and int(weights.shape[0]) == n and float(tw.reduce.sum(weights)) == 0.0:
+    # too), silently returning a matrix of NaN with no exception. The fit *above* already
+    # accumulates that sum, so the check reads it back rather than running a reduction over
+    # ``weights`` first -- the fit it would have skipped is two launches, against a launch, an
+    # allocation and a host sync for the reduction. Its NaN output is discarded by the raise.
+    if not return_cost:
+        matrix = cast(wp.array[wp.mat44], result)
+        if weighted and float(read_scalar(workspace["acc"], kernel_registration.ACC_W_SUM)) == 0.0:
+            raise ValueError("weights sum to zero: no point carries any weight")
+        return matrix
+    matrix, transformed, cost, weight_sum = cast(
+        tuple[wp.array[wp.mat44], wp.array[wp.vec3], float, float], result
+    )
+    if weighted and weight_sum == 0.0:
         raise ValueError("weights sum to zero: no point carries any weight")
-
-    workspace = _procrustes_workspace(n, device, return_cost=return_cost)
-    return _procrustes_into(a, b, weights, reflection, translation, scale, return_cost, workspace)
+    return matrix, transformed, cost
 
 
 _ROBUST_KINDS: dict[str, int] = {"none": 0, "huber": 1, "tukey": 2}
@@ -264,7 +277,14 @@ def icp(
         wp.empty(n, dtype=wp.float32, device=device) if max_distance is not None else None
     )
     workspace = _procrustes_workspace(n, device, return_cost=True)
+    # The second ping-pong slot; see ``_ProcrustesWorkspace`` and the fit call below.
+    workspace["spare_matrix"] = wp.empty(1, dtype=wp.mat44, device=device)
+    workspace["spare_transformed"] = wp.empty(n, dtype=wp.vec3, device=device)
 
+    # Both ping-pong views built once: ``_slot`` assembles a dict, and doing that per iteration is
+    # ~1.5 us of pure Python on a loop whose whole iteration is ~95.
+    slots = (_slot(workspace, 0), _slot(workspace, 1))
+    parity = 0
     old_cost = math.inf
     for _ in range(max_iterations):
         distance, triangle_id = _correspondences(
@@ -286,15 +306,39 @@ def icp(
                 wp.float32(max_distance),
                 out=weights,
             )
-            # Readback: the loop's own early-exit test, no cheaper than the sum it reads.
-            if float(tw.reduce.sum(weights)) == 0.0:
-                break
 
-        total, transformed, cost = cast(
-            tuple[wp.array[wp.mat44], wp.array[wp.vec3], float],
-            _procrustes_into(a, closest, weights, reflection, translation, scale, True, workspace),
+        # The fit runs *before* the "every correspondence was rejected" test, not after, because
+        # the test's own quantity is one of the moments the fit accumulates (``ACC_W_SUM``) and
+        # riding on its readback is one host sync per iteration instead of two. The cost of
+        # inverting the order is one wasted fit on the terminal iteration -- two launches against
+        # a launch, an allocation and a sync every iteration.
+        #
+        # **The answer is unchanged, and the ping-pong is what makes that true.** A fit writes the
+        # workspace's ``matrix`` and ``transformed`` in place, so running one more would otherwise
+        # overwrite the last *good* result with the degenerate one (an all-zero weight sum is the
+        # denominator of every centroid, so it fits a matrix of NaN). Alternating the slot leaves
+        # the previous fit's buffers untouched, and ``total`` / ``transformed`` / ``cost`` are only
+        # rebound once the fit is known to be sound -- exactly what breaking before the fit used to
+        # guarantee.
+        new_total, new_transformed, new_cost, weight_sum = cast(
+            tuple[wp.array[wp.mat44], wp.array[wp.vec3], float, float],
+            _procrustes_into(
+                a,
+                closest,
+                weights,
+                reflection,
+                translation,
+                scale,
+                True,
+                slots[parity],
+                max_distance is not None,
+            ),
         )
+        if max_distance is not None and weight_sum == 0.0:
+            break
+        total, transformed, cost = new_total, new_transformed, new_cost
         current = transformed
+        parity ^= 1
         if old_cost - cost < threshold:
             break
         old_cost = cost
@@ -308,6 +352,12 @@ class _ProcrustesWorkspace(TypedDict):
     acc: wp.array[wp.float32]
     matrix: wp.array[wp.mat44]
     transformed: wp.array[wp.vec3] | None
+    # The second half of a ping-pong, allocated only by ``icp``. A fit writes ``matrix`` and
+    # ``transformed`` *in place*, so a caller that keeps the previous fit's answer while running
+    # one more -- which is what lets ``icp`` decide "was that fit degenerate?" from the
+    # accumulator the fit itself filled -- needs somewhere else for the new one to land.
+    spare_matrix: wp.array[wp.mat44] | None
+    spare_transformed: wp.array[wp.vec3] | None
     uniform_weights: wp.array[wp.float32]
 
 
@@ -319,6 +369,8 @@ def _procrustes_workspace(
         "acc": wp.empty(kernel_registration.PROCRUSTES_ACC_SIZE, dtype=wp.float32, device=device),
         "matrix": wp.empty(1, dtype=wp.mat44, device=device),
         "transformed": wp.empty(n, dtype=wp.vec3, device=device) if return_cost else None,
+        "spare_matrix": None,
+        "spare_transformed": None,
         "uniform_weights": _uniform_weights(device),
     }
 
@@ -340,6 +392,27 @@ def _uniform_weights(device: wp.DeviceLike) -> wp.array[wp.float32]:
     return _UNIFORM_WEIGHTS[key]
 
 
+def _slot(workspace: _ProcrustesWorkspace, parity: int) -> _ProcrustesWorkspace:
+    """
+    One half of the ping-pong: the same workspace with its output buffers swapped on odd ``parity``.
+
+    A Procrustes fit writes ``matrix`` and ``transformed`` **in place**, so a caller that wants to
+    run one more fit while still holding the previous one's answer has to send the new one
+    somewhere else. Only ``icp`` does; every other caller leaves the spare slots ``None`` and gets
+    this workspace back unchanged. The accumulator is deliberately *shared* between the slots --
+    it is rewritten from scratch by every fit and read back before the next one starts.
+    """
+    if parity == 0 or workspace["spare_transformed"] is None:
+        return workspace
+    return {
+        **workspace,
+        "matrix": cast(wp.array[wp.mat44], workspace["spare_matrix"]),
+        "transformed": workspace["spare_transformed"],
+        "spare_matrix": workspace["matrix"],
+        "spare_transformed": workspace["transformed"],
+    }
+
+
 def _procrustes_into(
     a: wp.array[wp.vec3],
     b: wp.array[wp.vec3],
@@ -349,7 +422,8 @@ def _procrustes_into(
     scale: bool,
     return_cost: bool,
     workspace: _ProcrustesWorkspace,
-) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float] | wp.array[wp.mat44]:
+    need_weight_sum: bool = False,
+) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float, float] | wp.array[wp.mat44]:
     """Run one Procrustes fit into caller-owned buffers. See ``procrustes`` for the semantics."""
     n = int(a.shape[0])
     device = a.device
@@ -388,9 +462,25 @@ def _procrustes_into(
         device=device,
     )
     # One readback for the whole accumulator; ICP's convergence test needs the cost on the host,
-    # and an extra device-side pass would cost more than the readback.
-    cost = float(read_scalar(acc, int(kernel_registration.ACC_COST)))
-    return out_matrix, out_transformed, cost
+    # and an extra device-side pass would cost more than the readback. ``ACC_W_SUM`` rides along in
+    # the same transfer: ``icp``'s "every correspondence was rejected" guard needs it, and reading
+    # it here rather than reducing the weight array separately is one host sync per iteration
+    # instead of two -- but only when ``need_weight_sum`` says a caller wants it.
+    cost_slot = int(kernel_registration.ACC_COST)
+    if not need_weight_sum:
+        return out_matrix, out_transformed, float(read_scalar(acc, cost_slot)), 0.0
+    # Both scalars in *one* transfer when the caller wants both. Two ``read_scalar`` calls measured
+    # worse than this (1.011 against 0.950 ms on a ten-iteration fit) even though the second read
+    # rides on a drained pipeline, and one ``read_scalar`` is better than this when only the cost
+    # is wanted, because ``.numpy()`` allocates a host array where ``read_scalar`` reuses a cached
+    # scratch. Hence the flag rather than one spelling for both callers.
+    acc_np = acc.numpy()
+    return (
+        out_matrix,
+        out_transformed,
+        float(acc_np[cost_slot]),
+        float(acc_np[int(kernel_registration.ACC_W_SUM)]),
+    )
 
 
 def icp_point_to_plane(
@@ -552,8 +642,11 @@ def icp_point_to_plane(
     )
     jtj = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
     jtr = wp.zeros(1, dtype=wp.spatial_vector, device=device)
-    cost_acc = wp.zeros(1, dtype=wp.float32, device=device)
-    weight_sum_acc = wp.zeros(1, dtype=wp.float32, device=device)
+    # One buffer for both scalars the loop reads back, not two: they are written by the same
+    # launch, so reading them together costs one host sync per iteration where reading them at
+    # their two natural points cost two -- and the second of those sat three launches downstream,
+    # so it drained a pipeline the first had already drained rather than riding on it.
+    scalar_acc = wp.zeros(kernel_registration.ICP_SCALAR_ACC_SIZE, dtype=wp.float32, device=device)
     step = wp.empty(1, dtype=wp.mat44, device=device)
     updated = wp.empty(n, dtype=wp.vec3, device=device)
     total = wp.clone(initial_matrix)
@@ -606,8 +699,7 @@ def icp_point_to_plane(
         # --- assemble and solve the linearized point-to-plane system ---
         jtj.zero_()
         jtr.zero_()
-        cost_acc.zero_()
-        weight_sum_acc.zero_()
+        scalar_acc.zero_()
         wp.launch_tiled(
             kernel_registration.accumulate_point_to_plane,
             dim=kernel_reduce.blocks_1d(n),
@@ -622,8 +714,7 @@ def icp_point_to_plane(
                 wp.float32(scale_value if scale_value is not None else 0.0),
                 jtj,
                 jtr,
-                cost_acc,
-                weight_sum_acc,
+                scalar_acc,
             ],
             block_dim=TILE_1D,
             device=device,
@@ -641,8 +732,15 @@ def icp_point_to_plane(
         # ``robust_kernel="tukey", robust_scale=1e-9``: every residual exceeds so tight a scale, and
         # the loop returned the identity transform with ``cost=0.0`` on a cloud still offset by
         # (1.0, 0.5, -0.3) from its target.
-        if float(read_scalar(weight_sum_acc, 0)) <= 0.0:
+        # Both scalars in one readback -- ``.numpy()`` on the two-element buffer rather than two
+        # ``read_scalar`` calls, which is the one shape that helper does not cover (it returns a
+        # single element). ``cost`` is the *post-accumulate* cost the convergence test below needs
+        # and this launch is what wrote it, so reading it here rather than at the end of the
+        # iteration reads the identical value. Measured 1.052-1.065x on a 10-iteration fit.
+        scalars = scalar_acc.numpy()
+        if float(scalars[kernel_registration.ICP_WEIGHT_SUM]) <= 0.0:
             break
+        cost = float(scalars[kernel_registration.ICP_COST])
 
         wp.launch(
             kernel_registration.solve_point_to_plane,
@@ -662,7 +760,6 @@ def icp_point_to_plane(
         transformed = current
         wp.map(wp.mul, step, total, out=total)
 
-        cost = float(read_scalar(cost_acc, 0))
         if iteration > 0 and old_cost - cost < threshold:
             break
         old_cost = cost

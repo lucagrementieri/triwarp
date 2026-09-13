@@ -30,6 +30,13 @@ ACC_MASK_N = wp.constant(24)  # count of w > 0
 ACC_COST = wp.constant(25)  # weighted mean squared residual
 PROCRUSTES_ACC_SIZE = 26
 
+# Point-to-plane accumulator's two scalars, in one buffer for the same reason the moments above
+# share one: ``icp_point_to_plane`` reads both back every iteration, ``accumulate_point_to_plane``
+# writes both, and one buffer is one host sync instead of two.
+ICP_COST = wp.constant(0)  # sum w r^2
+ICP_WEIGHT_SUM = wp.constant(1)  # sum w
+ICP_SCALAR_ACC_SIZE = 2
+
 
 @wp.func
 def procrustes_shifts(
@@ -390,6 +397,43 @@ def distance_threshold_weight(
     )
 
 
+@wp.kernel
+def distance_threshold_weights_and_count(
+    distance: wp.array[wp.float32],
+    triangle_id: wp.array[wp.int32],
+    max_distance: wp.float32,
+    out_weights: wp.array[wp.float32],
+    out_count: wp.array[wp.float32],
+) -> None:
+    # ``distance_threshold_weight`` over the whole correspondence array *and* its sum, in one
+    # launch. ``registration.icp`` needs both every iteration -- the weights feed the Procrustes
+    # fit, the sum is the loop's "every correspondence was rejected" early exit -- and ran them as
+    # a ``wp.map`` followed by ``reduce.sum``, which is two launches, two allocations and ~11 us of
+    # map resolution per iteration for a number this pass already has in registers. Measured at
+    # ~39 us per iteration for the pair against ~14 for this kernel plus the readback that has to
+    # stay (a Python loop cannot branch on a device value).
+    #
+    # The lane-strided fold and the ``wp.block_dim()`` stride are ``kernels/reduce``'s, so the
+    # single-lane CPU device stays correct (CLAUDE.md section 2.2). The sum is a ``float32`` tree
+    # rather than a sequential accumulation, so its last bits differ from ``reduce.sum``'s -- which
+    # is immaterial to a caller that only asks whether it is zero, and the count is a sum of exact
+    # 0.0 and 1.0 values in any case.
+    i, lane = wp.tid()
+    offset, remaining = tile_chunk(distance.shape[0], i, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+    total = wp.float32(0.0)
+    for k in range(lane, remaining, wp.block_dim()):
+        slot = offset + k
+        weight = distance_threshold_weight(distance[slot], triangle_id[slot], max_distance)
+        out_weights[slot] = weight
+        total += weight
+    block_total = wp.tile_sum(wp.tile(total))[0]
+    if lane == 0:
+        wp.atomic_add(out_count, 0, block_total)
+
+
 @wp.func
 def abs_deviation(value: wp.float32, center: wp.float32) -> wp.float32:
     """Absolute deviation ``|value - center|`` (median-absolute-deviation building block)."""
@@ -490,8 +534,7 @@ def accumulate_point_to_plane(
     robust_scale: wp.float32,
     out_jtj: wp.array[wp.spatial_matrix],
     out_jtr: wp.array[wp.spatial_vector],
-    out_cost: wp.array[wp.float32],
-    out_weight_sum: wp.array[wp.float32],
+    out_scalars: wp.array[wp.float32],
 ) -> None:
     # Launched ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``: one block per
     # ``ITEMS_PER_BLOCK_1D`` correspondences, lanes striding that block's own chunk, and 44
@@ -553,8 +596,13 @@ def accumulate_point_to_plane(
     if lane == 0:
         wp.atomic_add(out_jtj, 0, total_jtj)
         wp.atomic_add(out_jtr, 0, total_jtr)
-        wp.atomic_add(out_cost, 0, total_cost)
-        wp.atomic_add(out_weight_sum, 0, total_weight_sum)
+        # One length-2 buffer, not two length-1 ones: ``icp_point_to_plane`` reads both of these
+        # scalars back per iteration and they are written by this one launch, so sharing a buffer
+        # lets it take one host sync where it used to take two -- the second of which sat three
+        # launches downstream and so drained a pipeline the first had already drained.
+        # ``ICP_COST`` = 0, ``ICP_WEIGHT_SUM`` = 1.
+        wp.atomic_add(out_scalars, ICP_COST, total_cost)
+        wp.atomic_add(out_scalars, ICP_WEIGHT_SUM, total_weight_sum)
 
 
 @wp.func
