@@ -53,8 +53,10 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
     faces
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
     n_vertices
-        Total vertex count, used as the key radix. When ``None`` it is inferred with
-        [`array.index_bound`][triwarp.array.index_bound], which costs a host readback.
+        Total vertex count. It is only ever the key radix here, so passing it is an optimization
+        rather than a requirement: when ``None`` the keys pack against
+        [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR], which bounds every
+        ``int32`` index without a reduction and orders the keys the same way.
 
     Returns
     -------
@@ -82,11 +84,11 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
     if n_halfedges == 0:
         return twins
 
-    if n_vertices is None:
-        n_vertices = tw.array.index_bound(faces)
-
     # Edge rows are built from face indices, so they are non-negative and below the vertex count by
-    # construction: the range check would only add a readback.
+    # construction: the range check would only add a readback. And ``n_vertices`` is the packing
+    # radix and nothing else -- no buffer here is sized by it -- so when the caller does not supply
+    # one the pair radix serves instead of inferring the tight bound, which is a device reduction
+    # plus a host readback measured at 61.5 us against a 291.2 us call.
     edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
     sorted_keys, order = tw.array.sort_and_argsort(keys)

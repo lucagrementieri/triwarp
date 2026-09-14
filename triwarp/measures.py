@@ -210,8 +210,8 @@ def moments(
     centre of mass (verified against a translated mesh, not assumed). This function returns the
     decoded forms, so the transform between the two is ``m1 / m0``.
 
-    Three host readbacks are unavoidable here: all three returns are host-side values, so the ten
-    accumulated sums have to cross the device boundary to be combined.
+    One host readback is unavoidable here: all three returns are host-side values, so the ten
+    accumulated sums have to cross the device boundary to be combined. They cross together.
 
     See Also
     --------
@@ -227,26 +227,27 @@ def moments(
     if n_faces == 0:
         return 0.0, wp.vec3(float("nan"), float("nan"), float("nan")), wp.mat33d()
 
-    volumes = wp.empty(n_faces, dtype=wp.float64, device=device)
-    first = wp.empty(n_faces, dtype=wp.vec3d, device=device)
-    squares = wp.empty(n_faces, dtype=wp.vec3d, device=device)
-    products = wp.empty(n_faces, dtype=wp.vec3d, device=device)
-    wp.launch(
-        kernel_measures.moment_integrands,
-        dim=n_faces,
-        inputs=[vertices, faces, volumes, first, squares, products],
+    # One launch and one readback for all ten integrals: the kernel reduces over faces itself and
+    # commits into a single ``(10,)`` accumulator, so there are no per-face buffers to allocate and
+    # no per-group reduction to launch. ``wp.zeros`` rather than ``wp.empty`` because the kernel
+    # accumulates into it.
+    totals = wp.zeros(10, dtype=wp.float64, device=device)
+    chunk_faces = _moment_chunk_faces(n_faces)
+    wp.launch_tiled(
+        kernel_measures.moment_integrals,
+        dim=[(n_faces + chunk_faces - 1) // chunk_faces],
+        inputs=[vertices, faces, chunk_faces, totals],
+        block_dim=TILE_1D,
         device=device,
     )
 
-    # Four device reductions, each returning its total to the host: every return here is a
-    # host-side value, so ten sums have to cross -- but only the ten, not the per-face integrands.
-    # ``wp.utils.array_sum`` reduces a ``wp.vec3d`` array componentwise, so the three vector groups
-    # need no kernel of their own. Reading them with ``.numpy().sum(axis=0)`` instead would copy
-    # the whole ``(n_faces,)`` ``vec3d`` buffers to the host just to add them there.
-    total_volume = float(wp.utils.array_sum(volumes))
-    first_moment = np.asarray(list(wp.utils.array_sum(first)), dtype=np.float64)
-    integral_squares = np.asarray(list(wp.utils.array_sum(squares)), dtype=np.float64)
-    integral_products = np.asarray(list(wp.utils.array_sum(products)), dtype=np.float64)
+    # Every return here is a host-side value, so the ten sums have to cross the device boundary --
+    # but only the ten, and in one readback rather than one per group.
+    totals_np = totals.numpy()
+    total_volume = float(totals_np[0])
+    first_moment = totals_np[1:4]
+    integral_squares = totals_np[4:7]
+    integral_products = totals_np[7:10]
 
     center = first_moment / total_volume if total_volume != 0.0 else np.full(3, np.nan)
 
@@ -263,6 +264,30 @@ def moments(
         inertia = inertia - shift
 
     return total_volume, wp.vec3(*center), wp.mat33d(*inertia.ravel())
+
+
+# Blocks to aim for in ``moment_integrals``' grid. Below it the chunk stays one tile wide, so the
+# device fills; above it the chunk doubles instead, so the ten contended ``float64`` accumulator
+# slots do not collect an atomic from every one of tens of thousands of blocks. 1 280 is where the
+# measured table at the kernel crosses over -- it is the block count a 64-face chunk gives at
+# 81 920 faces, the size at which a wider chunk first stops losing.
+_MOMENT_TARGET_BLOCKS = 1280
+# Widest chunk worth using: past this the grid stops filling the device before contention is the
+# problem, and the measured table is flat from here on.
+_MOMENT_MAX_CHUNK_FACES = 8 * TILE_1D
+
+
+def _moment_chunk_faces(n_faces: int) -> int:
+    """
+    Faces one block of [`kernels.measures.moment_integrals`] reduces, from the mesh size.
+
+    Doubles from one tile until the grid is no wider than ``_MOMENT_TARGET_BLOCKS``, then stops.
+    The measured device times this is derived from are tabulated at the kernel.
+    """
+    chunk = TILE_1D
+    while chunk < _MOMENT_MAX_CHUNK_FACES and -(-n_faces // chunk) > _MOMENT_TARGET_BLOCKS:
+        chunk *= 2
+    return chunk
 
 
 def euler_characteristic(faces: wp.array[wp.int32]) -> int:

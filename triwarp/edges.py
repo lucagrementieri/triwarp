@@ -21,6 +21,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.array import arange_repeat
+from triwarp.constants import INDEX_RADIX_PAIR
 from triwarp.kernels import edges as kernel_edges
 
 
@@ -107,8 +108,12 @@ def edges_unique(
         Optional precomputed ``(n_faces * 3, 2)`` sorted edges (each row min-first).
         When ``None``, built from ``faces``.
     n_vertices
-        Total number of vertices (used as the hash base). When ``None``, inferred from
-        ``edges_sorted`` with a device-host sync.
+        Total number of vertices (used as the hash base, and as the radix the unique rows are
+        unpacked with). When ``None`` and ``validate`` is ``True`` it is inferred from
+        ``edges_sorted`` with a device-host sync -- the same reduction that runs the range check.
+        When ``None`` and ``validate`` is ``False`` the keys pack against
+        [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR] instead, which bounds
+        every ``int32`` index with no reduction at all and leaves the row order unchanged.
     validate
         Whether to range-check the edge indices before packing them. The check is a
         ``triwarp.reduce.minmax`` whose host readback serialises the device pipeline, and it is a
@@ -155,11 +160,18 @@ def edges_unique(
         edges_sorted = faces_to_edges(faces, sorted=True)
 
     if n_vertices is None:
-        # Inferring the bound from this very buffer already reduces it, and the packing's own
-        # check would reduce it again to re-test a bound derived from it -- only the negative half
-        # could ever fire. One reduction answers both.
-        n_vertices = tw.array.index_bound(edges_sorted, require_non_negative=validate)
-        validate = False
+        if validate:
+            # Inferring the bound from this very buffer already reduces it, and the packing's own
+            # check would reduce it again to re-test a bound derived from it -- only the negative
+            # half could ever fire. One reduction answers both.
+            n_vertices = tw.array.index_bound(edges_sorted, require_non_negative=True)
+            validate = False
+        else:
+            # Nothing is being checked, so the only thing the count would be used for is the
+            # radix -- and the pair radix bounds every ``int32`` without reducing the rows to find
+            # out. Row order is unchanged; ``edges_from_keys`` below unpacks against whichever
+            # radix packed them.
+            n_vertices = INDEX_RADIX_PAIR
 
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=validate)
     unique_keys, inverse = tw.grouping.unique_1d(keys, return_inverse=True)
@@ -241,7 +253,9 @@ def edges_unique_length(
         Optional precomputed unique edges ``(m, 2)``. When ``None``, computed from ``faces``.
     n_vertices
         Total vertex count passed to [`edges_unique`][triwarp.edges.edges_unique]. Ignored when
-        ``unique_edges`` is already provided.
+        ``unique_edges`` is already provided. When ``None`` it is taken from ``vertices`` rather
+        than inferred from ``faces``, which would cost a host readback for a count this function
+        was already handed.
     validate
         Forwarded to [`edges_unique`][triwarp.edges.edges_unique] when ``unique_edges`` is built
         here; ignored when ``unique_edges`` is supplied. Pass ``False`` only where the face
@@ -268,6 +282,12 @@ def edges_unique_length(
     """
     require_same_device(vertices=vertices, faces=faces, unique_edges=unique_edges)
     if unique_edges is None:
+        # ``vertices.shape[0]`` when the caller gave no count: ``edges_unique`` would otherwise
+        # infer it from ``faces`` with ``array.index_bound``, a device reduction plus a host
+        # readback measured at 61.5 us, for a number every caller of *this* function already holds
+        # in the array it passed. It is also the bound ``validate`` is documented against.
+        if n_vertices is None:
+            n_vertices = int(vertices.shape[0])
         unique_edges, _ = edges_unique(faces, n_vertices=n_vertices, validate=validate)
 
     return _edge_lengths(vertices, unique_edges, "unique_edges")

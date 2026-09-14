@@ -468,6 +468,21 @@ def complement_flag(a: wp.bool) -> wp.int32:
     return wp.where(a, wp.int32(0), wp.int32(1))
 
 
+@wp.kernel
+def bool_flags(mask: wp.array[wp.bool], out_flags: wp.array[wp.int32]) -> None:
+    # ``1`` / ``0`` per mask entry: the ``int32`` a ``wp.utils.array_scan`` needs from a ``wp.bool``
+    # buffer, which it cannot read directly.
+    #
+    # A plain kernel rather than ``wp.utils.array_cast``, which produces the identical bytes: that
+    # utility resolves a generic cast kernel per call and measured 20.3-21.0 us against this one's
+    # 11.0-11.3, flat from 1 024 to 1 000 000 elements, so the difference is its host-side
+    # resolution and not the copy. ``wp.map`` is not the spelling either -- ``wp.Scalar`` does not
+    # instantiate for ``wp.bool`` (CLAUDE.md section 12.4), which is why ``nonzero_flag`` below
+    # covers every dtype except this one.
+    i = wp.int32(wp.tid())
+    out_flags[i] = wp.where(mask[i], 1, 0)
+
+
 @wp.func
 def nonzero_flag(value: wp.Scalar) -> wp.int32:
     # ``1`` for any non-zero value, ``0`` otherwise: the scan input that lets ``flatnonzero``

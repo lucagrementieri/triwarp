@@ -324,8 +324,9 @@ def _needs_unoriented_boundary_walk(directed: twt.Array2dInt32, n_vertices: int)
     orientability problem, and a gate reading only out-degree would incorrectly send it down the
     undirected fallback.
 
-    One 8-byte host readback. Both flags come from one pass over the boundary and one over the
-    vertices, rather than two separate max-reductions.
+    One 8-byte host readback, and one pass over the boundary edges. Neither flag needs a pass over
+    the *vertices*: only a boundary vertex ever has a non-zero degree, and the thread that pushes
+    one past its threshold learns so from the value its own ``wp.atomic_add`` returns.
     """
     device = directed.device
     degrees = twt.as_array2d(wp.zeros((n_vertices, 2), dtype=wp.int32, device=device), wp.int32)
@@ -333,13 +334,7 @@ def _needs_unoriented_boundary_walk(directed: twt.Array2dInt32, n_vertices: int)
     wp.launch(
         kernel_boundary.count_boundary_degrees,
         dim=int(directed.shape[0]),
-        inputs=[directed, degrees],
-        device=device,
-    )
-    wp.launch(
-        kernel_boundary.flag_boundary_degree_defects,
-        dim=n_vertices,
-        inputs=[degrees, flags],
+        inputs=[directed, degrees, flags],
         device=device,
     )
     has_seam, has_pinch = (int(flag) for flag in flags.numpy())
@@ -1004,8 +999,9 @@ def ears(
         [`faces_to_edges`][triwarp.edges.faces_to_edges] with ``sorted=True``. Built from
         ``faces`` when ``None``.
     n_vertices
-        Total number of vertices (used as the row-hash base). When ``None``, inferred from
-        ``edges_sorted`` with a device-host sync.
+        Total number of vertices, used as the row-hash base and nothing else. When ``None`` the
+        rows pack against [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR],
+        which bounds every ``int32`` index without a device-host sync and groups them identically.
 
     Returns
     -------
@@ -1033,9 +1029,8 @@ def ears(
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
 
-    if n_vertices is None:
-        n_vertices = tw.array.index_bound(edges_sorted)
-
+    # ``n_vertices`` reaches nothing but the edge-key radix below, so an unsupplied one is left
+    # unsupplied rather than inferred with a device reduction and a host readback.
     boundary_rows = _boundary_rows(n_vertices, edges_sorted)
     edge_boundary = tw.array.indices_to_mask(boundary_rows, n_faces * 3, device=device)
 
@@ -1055,6 +1050,11 @@ def ears(
     return ear, ear_opp
 
 
-def _boundary_rows(n_vertices: int, edges_sorted: twt.Array2dInt32) -> wp.array[wp.int32]:
-    """Row indices of the triangle edges appearing exactly once — the boundary edges."""
+def _boundary_rows(n_vertices: int | None, edges_sorted: twt.Array2dInt32) -> wp.array[wp.int32]:
+    """
+    Row indices of the triangle edges appearing exactly once — the boundary edges.
+
+    ``n_vertices`` is only the radix the edge rows are packed against, so ``None`` is legal and
+    means "pack against the pair radix" rather than reducing the rows to find their maximum.
+    """
     return tw.grouping.group_int_rows(edges_sorted, 1, n_vertices, validate=False).flatten()

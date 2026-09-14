@@ -757,58 +757,26 @@ def sphere_cap(
         raise ValueError(f"subdivisions must be non-negative, got {subdivisions}")
 
     n_rings = 2 ** int(subdivisions)
-    # ``ring_start[r]`` is where ring r's ``6 * r`` vertices begin; ring 0 is the single apex.
-    ring_start = [0] + [1 + 3 * r * (r - 1) for r in range(1, n_rings + 1)]
+    n_vertices = 1 + 3 * n_rings * (n_rings + 1)
+    n_faces = 6 * n_rings * n_rings
 
-    vertices_np = np.empty((1 + 3 * n_rings * (n_rings + 1), 3), dtype=np.float64)
-    vertices_np[0] = (0.0, 0.0, radius)
-    for r in range(1, n_rings + 1):
-        theta = angle * r / n_rings
-        phi = 2.0 * math.pi * np.arange(6 * r) / (6 * r)
-        vertices_np[ring_start[r] : ring_start[r] + 6 * r] = np.column_stack(
-            (
-                radius * math.sin(theta) * np.cos(phi),
-                radius * math.sin(theta) * np.sin(phi),
-                np.full(6 * r, radius * math.cos(theta)),
-            )
-        )
-
-    # Stitch ring r-1 to ring r: six sectors, and in each the outer ring carries one more vertex
-    # than the inner one. That extra vertex is what turns the strip into ``2 * r - 1`` triangles --
-    # ``6 * r`` outward-pointing (one per outer edge) and ``6 * (r - 1)`` inward-pointing (one per
-    # inner edge) -- rather than an even fan, and it is why the total lands on exactly ``6 * n **
-    # 2``.
-    faces_np = np.empty((6 * n_rings * n_rings, 3), dtype=np.int32)
-    written = 0
-    for r in range(1, n_rings + 1):
-        outer_base, inner_base = ring_start[r], ring_start[r - 1]
-        inner_count = 6 * (r - 1) if r > 1 else 1
-        outer_index = np.arange(6 * r)
-        sector, step = np.divmod(outer_index, r)
-        faces_np[written : written + 6 * r] = np.column_stack(
-            (
-                outer_base + outer_index,
-                outer_base + (outer_index + 1) % (6 * r),
-                inner_base + (sector * (r - 1) + step) % inner_count,
-            )
-        )
-        written += 6 * r
-        if r > 1:
-            inner_index = np.arange(inner_count)
-            sector, step = np.divmod(inner_index, r - 1)
-            faces_np[written : written + inner_count] = np.column_stack(
-                (
-                    inner_base + inner_index,
-                    outer_base + (sector * r + step + 1) % (6 * r),
-                    inner_base + (inner_index + 1) % inner_count,
-                )
-            )
-            written += inner_count
-
-    return (
-        _upload_points(vertices_np, wp.vec3, device),
-        wp.array(np.ascontiguousarray(faces_np.reshape(-1)), dtype=wp.int32, device=device),
+    # Both buffers are written entirely on the device from the two counts and three scalars. The
+    # lattice is a closed form in the vertex and triangle index -- no ring depends on the one
+    # before it -- which is the case CLAUDE.md section 3.8 sanctions for a template whose output
+    # scales with a resolution parameter, and the same conversion ``grid``, ``icosphere`` and
+    # ``parametric_surface`` already took. The host build it replaces looped over rings in Python
+    # and was quadratic in the ring count: 0.20 / 0.80 / 4.56 / 12.68 ms at ``subdivisions``
+    # 3 / 5 / 7 / 8 on an RTX 5090, against a flat device cost.
+    vertices_wp = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_creation.sphere_cap_vertices,
+        dim=n_vertices,
+        inputs=[wp.int32(n_rings), wp.float64(angle), wp.float64(radius), vertices_wp],
+        device=device,
     )
+    faces_wp = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+    wp.launch(kernel_creation.sphere_cap_faces, dim=n_faces, inputs=[faces_wp], device=device)
+    return vertices_wp, faces_wp
 
 
 def capsule(

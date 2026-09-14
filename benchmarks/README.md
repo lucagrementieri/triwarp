@@ -543,7 +543,7 @@ the port is the newer code:
 |---|---|---|---|
 | `face_quality` | `test_triangles` | `compute_scalar_by_aspect_ratio_per_face` | 34 µs against 445 µs, flat across `quality` on both sides |
 | `outlier_probability` | `test_points` | `compute_selection_point_cloud_outliers` (LoOP) | 2.6 ms against 0.66 ms at `sphere_small` — the k-NN table dominates, see `test_neighbors` |
-| `platonic_solids`, `grid`, `sphere_cap` | `test_creation` | `create_{tetrahedron,octahedron,dodecahedron,grid,sphere_cap}` | fixed-cost ties on the tables; 2.2 ms against 12.5 ms on a subdiv-6 cap |
+| `platonic_solids`, `grid`, `sphere_cap` | `test_creation` | `create_{tetrahedron,octahedron,dodecahedron,grid,sphere_cap}` | fixed-cost ties on the tables; the cap is flat in resolution where MeshLab's per-vertex loop is not |
 | `filter_scalar_laplacian` | `test_smoothing` | `apply_scalar_smoothing_per_vertex` | 0.41 ms against 7.4 ms on `bunny_decimated` |
 | `shortest_path_envelope` | `test_graph` | `apply_scalar_saturation_per_vertex` | 0.17 ms against 5.3 ms on a spike-seeded Lipschitz projection |
 | `transfer_onto_vertices` | `test_vertices` | `transfer_attributes_per_vertex` | closest-point plus barycentric blend, against a serial closest-point walk |

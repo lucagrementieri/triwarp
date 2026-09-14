@@ -439,7 +439,20 @@ def successor_cycles(
     # Already range-checked above, so the downstream call skips the second reduction and host sync.
     labels = connected_component_labels_from_edges(edges, node_count=node_count, validate=False)
 
-    cycle_nodes = tw.grouping.unique_1d(edges.flatten())
+    # The distinct endpoints, ascending. A membership mask plus ``flatnonzero`` rather than
+    # ``unique_1d`` over the flattened pairs: both return the sorted distinct values, and the range
+    # check above has already guaranteed every endpoint indexes the mask, but this one is a zeroed
+    # buffer, a scatter and a scan where that one is a hash table, a compaction, a radix sort and
+    # two host readbacks. Measured 122 us against 176 -- flat in ``node_count`` from 2 562 to
+    # 1 000 000 on an RTX 5090, with byte-identical output at every size.
+    node_mask = wp.zeros(node_count, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_scatter.mark_membership_mask,
+        dim=2 * m,
+        inputs=[edges.flatten(), wp.int32(node_count), node_mask],
+        device=device,
+    )
+    cycle_nodes = tw.array.flatnonzero(node_mask)
     n_nodes = int(cycle_nodes.shape[0])
 
     label_min = wp.full(node_count, node_count, dtype=wp.int32, device=device)

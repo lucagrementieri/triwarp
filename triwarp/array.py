@@ -1172,10 +1172,11 @@ def flatnonzero(values: wp.array[wp.bool] | wp.array[wp.Scalar]) -> wp.array[wp.
 
     flags = wp.empty(n, dtype=wp.int32, device=device)
     if values.dtype == wp.bool:
-        # ``array_cast`` already yields exactly 0/1 from a mask, and ``wp.Scalar`` does not
-        # instantiate for ``wp.bool`` anyway. For every other dtype the cast would copy the
-        # *values*, and the scan below would then sum them instead of counting them.
-        wp.utils.array_cast(values, flags)
+        # A mask needs its own kernel: ``wp.Scalar`` does not instantiate for ``wp.bool``, so
+        # ``nonzero_flag`` cannot serve one. For every other dtype the plain cast that kernel
+        # replaces would copy the *values*, and the scan below would then sum them instead of
+        # counting them.
+        wp.launch(kernel_array.bool_flags, dim=n, inputs=[values, flags], device=device)
     else:
         wp.map(kernel_array.nonzero_flag, values, out=flags)
 
@@ -1433,7 +1434,7 @@ def mask_to_compact_ranks(
     if invert:
         wp.map(kernel_array.complement_flag, mask, out=flags)
     else:
-        wp.utils.array_cast(mask, flags)
+        wp.launch(kernel_array.bool_flags, dim=n, inputs=[mask, flags], device=device)
     return counts_to_offsets(flags)
 
 

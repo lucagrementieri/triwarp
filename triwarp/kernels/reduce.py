@@ -877,14 +877,21 @@ def outer_sum_chunk(
 
 
 # The "componentwise ``wp.tile_sum`` reductions, then one lane-0-guarded atomic commit" skeleton
-# that reads ``tile_chunk``/``outer_sum_chunk``'s partial sums out is itself hand-written at three
+# that reads ``tile_chunk``/``outer_sum_chunk``'s partial sums out is itself hand-written at five
 # call sites with no shared helper: ``points.centered_covariance`` (9 scalars, above),
-# ``registration.accumulate_procrustes_moments`` (25) and ``accumulate_point_to_plane`` (43). Left
-# unmerged: each loop is over a different fixed component count with no common shape cheap to
-# generalize over (Warp has no variadic tile reduction, so a shared helper would need to take an
-# arbitrary tuple of scalar/vector/matrix quantities), which is more speculative machinery than
-# three call sites justify (CLAUDE.md section 4.2, "no speculative generality"). Revisit if a
-# fourth accumulator of this shape appears.
+# ``points.accumulate_counted_mean`` (2), ``measures.moment_integrals`` (10),
+# ``registration.accumulate_procrustes_moments`` (25) and ``accumulate_point_to_plane`` (43).
+#
+# Still left unmerged, and the two accumulators added since this note first said "revisit if a
+# fourth appears" are why rather than why not. Each loop is over a different fixed component count
+# with no common shape cheap to generalize over -- Warp has no variadic tile reduction, so a shared
+# helper would have to take an arbitrary tuple of scalar/vector/matrix quantities -- and the
+# *bodies* turn out to differ in more than the count: ``moment_integrals`` needed its chunk width
+# as a launch argument because its per-element arithmetic is heavy enough to have a real occupancy
+# crossover, where every other member is cheap enough to take ``ITEMS_PER_BLOCK_1D`` unexamined.
+# A helper general over both would be more speculative machinery than five call sites justify
+# (CLAUDE.md section 4.2). What *is* shared is already factored: ``tile_chunk`` and the clamp rule
+# it documents, which is the part that goes wrong.
 
 
 @wp.kernel

@@ -494,9 +494,25 @@ def test_hash_indices_rows_unvalidated(device: str) -> None:
     assert np.array_equal(unvalidated_wp.numpy(), validated_wp.numpy())
     assert np.array_equal(unvalidated_wp.numpy(), _pack_indices_rows_np(indices_np, max_index))
 
-    # Without a radix there is nothing to skip to, so the combination is rejected up front.
+    # Two columns need no radix at all: every int32 reinterpreted as uint32 is below
+    # INDEX_RADIX_PAIR, so packing against it is injective without reducing the rows. The keys are
+    # different numbers from the tight radix's, but they have to induce the same *order* -- both
+    # are monotone lexicographic in (row[1], row[0]) -- which is what every caller relies on.
+    pair_wp = tw.grouping.hash_indices_rows(indices_wp, validate=False)
+    assert np.array_equal(
+        pair_wp.numpy(), _pack_indices_rows_np(indices_np, tw.constants.INDEX_RADIX_PAIR)
+    )
+    assert np.array_equal(
+        np.argsort(pair_wp.numpy(), kind="stable"), np.argsort(validated_wp.numpy(), kind="stable")
+    )
+    # Non-vacuity: the fixture really does contain rows that differ only in the second column, so
+    # the order assertion above is testing the radix and not a coincidence of a 64-row sample.
+    assert len(np.unique(indices_np[:, 1])) > 1
+
+    # A wider row still needs one, because its radix has to keep ``radix ** w`` inside a uint64.
+    wide_wp = wp.array(rng.integers(0, max_index, size=(64, 3), dtype=np.int32), device=device)
     with pytest.raises(ValueError, match="validate=False requires an explicit max_index"):
-        _ = tw.grouping.hash_indices_rows(indices_wp, validate=False)
+        _ = tw.grouping.hash_indices_rows(wide_wp, validate=False)
 
 
 def test_hash_indices_rows_empty(device: str) -> None:

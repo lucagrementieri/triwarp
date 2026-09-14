@@ -83,32 +83,31 @@ def build_dart_successors(
 
 @wp.kernel
 def count_boundary_degrees(
-    directed_edges: wp.array2d[wp.int32], out_degrees: wp.array2d[wp.int32]
+    directed_edges: wp.array2d[wp.int32],
+    out_degrees: wp.array2d[wp.int32],
+    out_flags: wp.array[wp.int32],
 ) -> None:
     # Column 0: how many boundary edges *leave* each vertex. Column 1: how many touch it at all.
     # One out-edge and two incidences is the well-behaved case. Two out-edges is the seam of a
     # non-orientable surface, where ``succ[tail] = head`` silently drops an edge. Four incidences
     # is a pinch point, where two loops meet and no 2-regular walk exists at all -- the two are
     # different defects and only the first one has a better answer available.
+    #
+    # The two defect bits are stamped here rather than by a second pass over the degree table:
+    # ``wp.atomic_add`` returns the value the slot held *before* the increment, so the thread that
+    # pushes a vertex past the threshold is the one that knows it. That retires a launch whose
+    # ``dim`` was the whole vertex count for an answer that is two bits -- boundary vertices are
+    # the only ones whose degrees are ever non-zero, and there are ``2 * n_edges`` of those.
+    # Slot 0 is "some vertex has two out-edges", slot 1 is "some vertex has more than two
+    # incidences", and the caller reads both in one 8-byte transfer.
     e = wp.int32(wp.tid())
     tail = directed_edges[e, 0]
     head = directed_edges[e, 1]
-    wp.atomic_add(out_degrees, tail, 0, 1)
-    wp.atomic_add(out_degrees, tail, 1, 1)
-    wp.atomic_add(out_degrees, head, 1, 1)
-
-
-@wp.kernel
-def flag_boundary_degree_defects(
-    degrees: wp.array2d[wp.int32], out_flags: wp.array[wp.int32]
-) -> None:
-    # Reduce the per-vertex degrees to two bits, so the caller pays one 8-byte readback rather than
-    # two full max-reductions: slot 0 is "some vertex has two out-edges" (a non-orientable seam)
-    # and slot 1 is "some vertex has more than two incidences" (a pinch point).
-    v = wp.int32(wp.tid())
-    if degrees[v, 0] > 1:
+    if wp.atomic_add(out_degrees, tail, 0, 1) >= 1:
         out_flags[0] = 1
-    if degrees[v, 1] > 2:
+    if wp.atomic_add(out_degrees, tail, 1, 1) >= 2:
+        out_flags[1] = 1
+    if wp.atomic_add(out_degrees, head, 1, 1) >= 2:
         out_flags[1] = 1
 
 

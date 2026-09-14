@@ -378,16 +378,16 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     # float32 catastrophic cancellation.
     cov = centered_covariance(points, center=center)
 
-    # Pass 3: SVD of the 3x3 covariance and centroid/normal extraction (single thread).
-    out_centroid = wp.empty(1, dtype=wp.vec3, device=device)
-    out_normal = wp.empty(1, dtype=wp.vec3, device=device)
+    # Pass 3: SVD of the 3x3 covariance and centroid/normal extraction (single thread). Both
+    # results land in one buffer and cross to the host in one readback: they are two rows of three
+    # floats, so what a second readback would buy is nothing and what it costs is another
+    # synchronization.
+    out_plane = wp.empty(2, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_points.finalize_fit_plane,
-        dim=1,
-        inputs=[center, cov, out_centroid, out_normal],
-        device=device,
+        kernel_points.finalize_fit_plane, dim=1, inputs=[center, cov, out_plane], device=device
     )
-    return (out_normal.list()[0], out_centroid.list()[0])
+    normal, centroid_out = out_plane.numpy()
+    return (wp.vec3(*normal), wp.vec3(*centroid_out))
 
 
 def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
@@ -500,16 +500,17 @@ def principal_axes(points: wp.array[wp.vec3]) -> tuple[wp.mat33, wp.vec3, wp.vec
 
     center = centroid(points)
     scatter = centered_covariance(points, center=center)
-    out_rotation = wp.empty(1, dtype=wp.mat33, device=device)
-    out_eigenvalues = wp.empty(1, dtype=wp.vec3, device=device)
-    out_centroid = wp.empty(1, dtype=wp.vec3, device=device)
+    # All three results in one buffer, read back once: fifteen floats is less than a single
+    # readback's fixed cost, so three of them bought three synchronizations and nothing else.
+    out_frame = wp.empty(5, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_points.finalize_principal_axes,
         dim=1,
-        inputs=[center, scatter, out_rotation, out_eigenvalues, out_centroid],
+        inputs=[center, scatter, out_frame],
         device=device,
     )
-    return (out_rotation.list()[0], out_eigenvalues.list()[0], out_centroid.list()[0])
+    frame = out_frame.numpy()
+    return (wp.mat33(*frame[:3].ravel()), wp.vec3(*frame[3]), wp.vec3(*frame[4]))
 
 
 def estimate_normals(
@@ -771,9 +772,21 @@ def statistical_outlier_mask(
     mean_distance, _rms, count = _neighbor_distance_moments(neighbor_distance)
     # Cloud mean and (ddof=1) deviation over the *counted* rows only, exactly as Open3D divides by
     # its ``valid_distances``. Empty rows contribute zero to both sums, so a plain reduction works.
-    counted_mask = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_array.greater, count, wp.int32(0), out=counted_mask)
-    counted = int(tw.reduce.sum(counted_mask))
+    #
+    # The row count and the distance total come back together, from one kernel and one readback:
+    # they are both reductions over the same pass's outputs, and the mask that used to carry the
+    # count between them existed only to be counted. The third reduction below cannot join them --
+    # it needs ``cloud_mean``, which is what these two produce.
+    counted_totals = wp.zeros(2, dtype=wp.float64, device=device)
+    wp.launch_tiled(
+        kernel_points.accumulate_counted_mean,
+        dim=[kernel_reduce.blocks_1d(n)],
+        inputs=[count, mean_distance, counted_totals],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    counted_np = counted_totals.numpy()
+    counted = int(counted_np[0])
     if counted < 2:
         # Too few counted rows for a cloud deviation, but the docstring's "empty or fully
         # coincident neighbourhood is an outlier" needs no cloud statistic at all -- that half of
@@ -788,7 +801,7 @@ def statistical_outlier_mask(
             out=out_mask,
         )
         return out_mask
-    cloud_mean = float(tw.reduce.sum(mean_distance)) / float(counted)
+    cloud_mean = float(counted_np[1]) / float(counted)
     deviations = wp.empty(n, dtype=wp.float32, device=device)
     wp.map(
         kernel_points.centered_square_if_counted,

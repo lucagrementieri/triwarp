@@ -2,6 +2,7 @@ import warp as wp
 
 from triwarp.constants import TILE_1D
 from triwarp.kernels.predicates import triangle_double_area
+from triwarp.kernels.reduce import tile_chunk
 from triwarp.kernels.triangles import face_vertices, face_vertices_vec3d
 
 
@@ -97,18 +98,49 @@ def centroid_sliced(
 
 
 @wp.kernel
-def moment_integrands(
+def moment_integrals(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    out_volume: wp.array[wp.float64],
-    out_first: wp.array[wp.vec3d],
-    out_squares: wp.array[wp.vec3d],
-    out_products: wp.array[wp.vec3d],
+    chunk_faces: wp.int32,
+    out_totals: wp.array[wp.float64],
 ) -> None:
-    # Per-face contribution to the mass integrals of the solid bounded by the mesh, taking each
-    # face with the origin as a tetrahedron. Everything accumulates in float64: the second moments
-    # scale as length^5, so a float32 sum over a large mesh loses the answer's low digits well
-    # before the reduction finishes.
+    # The ten mass integrals of the solid bounded by the mesh, summed over faces, into one
+    # ``(10,)`` accumulator: volume, then the three first moments, the three second moments and the
+    # three products, in the order ``measures.moments`` reads them back.
+    #
+    # The reduction is *in* this kernel rather than four ``wp.utils.array_sum`` calls over four
+    # per-face buffers, which is what it used to be. Those cost 160.6 us of a 260.0 us call on an
+    # RTX 5090 and returned their totals through four separate host readbacks, and the per-face
+    # buffers themselves were 80 bytes a face -- 6.5 MB at 81 920 faces -- written once and read
+    # once. Fused, the whole function is one launch, one ten-element allocation and one readback.
+    #
+    # Launched ``wp.launch_tiled(dim=[ceil(n_faces / chunk_faces)], block_dim=TILE_1D)``: one block
+    # per ``chunk_faces`` faces, lanes striding that block's own chunk by ``wp.block_dim()``, ten
+    # ``wp.tile_sum`` tree reductions and ten atomics per block. Striding by ``wp.block_dim()``
+    # rather than a constant is what makes it correct on the CPU device too, where
+    # ``wp.launch_tiled`` gives a block one lane (``.claude/CLAUDE.md`` section 2.2) -- the same
+    # form as ``points.centered_covariance`` and unlike ``centroid_tiled`` above, whose lanes
+    # partition the outer work and which therefore needs a device pair.
+    #
+    # ``chunk_faces`` is a launch argument, not the ``ITEMS_PER_BLOCK_1D`` constant the rest of the
+    # chunked-accumulate family bakes in, because this body has a real crossover and that family's
+    # single value is on the wrong side of it for every mesh the package actually meets. The
+    # integrand is ~80 ``float64`` flops per face -- far heavier than an outer product -- so a wide
+    # chunk starves the device, while a narrow one puts too many blocks on ten contended addresses.
+    # Kernel device time on an RTX 5090, microseconds:
+    #
+    #   faces        1 280   20 480   81 920   327 680   1 310 720
+    #   chunk    64   14.2     15.3     35.0     121.6       434.3
+    #   chunk   128   19.6     19.4     32.0     109.1       345.9
+    #   chunk   256   32.1     30.1     31.9      94.1       305.1
+    #   chunk   512   54.9     52.8     52.5      91.2       296.1
+    #
+    # A runtime width measured identical to a ``wp.constant`` one at every entry above, so nothing
+    # is lost by choosing it on the host -- see ``measures._moment_chunk_faces`` for the rule.
+    #
+    # Everything accumulates in float64: the second moments scale as length^5, so a float32 sum
+    # over a large mesh loses the answer's low digits well before the reduction finishes. The tree
+    # fold also halves the depth over which rounding compounds against the serial sum it replaced.
     #
     # For the tetrahedron (0, a, b, c) with det = dot(a, cross(b, c)):
     #   ∫dV      = det / 6
@@ -116,25 +148,31 @@ def moment_integrands(
     #   ∫x^2 dV  = det * (a.x^2 + b.x^2 + c.x^2 + a.x b.x + a.x c.x + b.x c.x) / 60
     #   ∫xy dV   = det * (2(a.x a.y + b.x b.y + c.x c.y)
     #                     + a.x b.y + b.x a.y + a.x c.y + c.x a.y + b.x c.y + c.x b.y) / 120
-    f = wp.int32(wp.tid())
-    a, b, c = face_vertices_vec3d(vertices, faces, f)
-    det = wp.dot(a, wp.cross(b, c))
+    chunk, lane = wp.tid()
+    offset, remaining = tile_chunk(faces.shape[0] // 3, chunk, chunk_faces)
+    if remaining <= 0:
+        return
+    # ``tile_chunk`` reports what is left to the end, not this block's share of it, so the ragged
+    # last chunk has to be clamped or block 0 walks the whole mesh.
+    count = wp.min(remaining, chunk_faces)
 
-    out_volume[f] = det / wp.float64(6.0)
-    out_first[f] = det * (a + b + c) / wp.float64(24.0)
-    out_squares[f] = (
-        det
-        * wp.vec3d(
+    volume = wp.float64(0.0)
+    first = wp.vec3d()
+    squares = wp.vec3d()
+    products = wp.vec3d()
+    for k in range(lane, count, wp.block_dim()):
+        a, b, c = face_vertices_vec3d(vertices, faces, offset + k)
+        det = wp.dot(a, wp.cross(b, c))
+
+        volume = volume + det / wp.float64(6.0)
+        first = first + det * (a + b + c) / wp.float64(24.0)
+        squares = squares + det * wp.vec3d(
             a[0] * a[0] + b[0] * b[0] + c[0] * c[0] + a[0] * b[0] + a[0] * c[0] + b[0] * c[0],
             a[1] * a[1] + b[1] * b[1] + c[1] * c[1] + a[1] * b[1] + a[1] * c[1] + b[1] * c[1],
             a[2] * a[2] + b[2] * b[2] + c[2] * c[2] + a[2] * b[2] + a[2] * c[2] + b[2] * c[2],
-        )
-        / wp.float64(60.0)
-    )
-    # (xy, xz, yz), in the same order the wrapper reads them back.
-    out_products[f] = (
-        det
-        * wp.vec3d(
+        ) / wp.float64(60.0)
+        # (xy, xz, yz), in the same order the wrapper reads them back.
+        products = products + det * wp.vec3d(
             wp.float64(2.0) * (a[0] * a[1] + b[0] * b[1] + c[0] * c[1])
             + a[0] * b[1]
             + b[0] * a[1]
@@ -156,6 +194,16 @@ def moment_integrands(
             + c[1] * a[2]
             + b[1] * c[2]
             + c[1] * b[2],
-        )
-        / wp.float64(120.0)
-    )
+        ) / wp.float64(120.0)
+
+    # Block-collective, so all ten run outside the ``lane == 0`` guard.
+    totals = wp.vector(length=10, dtype=wp.float64)
+    totals[0] = wp.tile_sum(wp.tile(volume))[0]
+    for j in range(3):
+        totals[1 + j] = wp.tile_sum(wp.tile(first[j]))[0]
+        totals[4 + j] = wp.tile_sum(wp.tile(squares[j]))[0]
+        totals[7 + j] = wp.tile_sum(wp.tile(products[j]))[0]
+
+    if lane == 0:
+        for j in range(10):
+            wp.atomic_add(out_totals, j, totals[j])

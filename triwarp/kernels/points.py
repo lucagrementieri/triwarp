@@ -34,6 +34,47 @@ def is_in_half_space(point: wp.vec3, plane_normal: wp.vec3, plane_origin: wp.vec
 
 
 @wp.kernel
+def accumulate_counted_mean(
+    count: wp.array[wp.int32], mean_distance: wp.array[wp.float32], out_totals: wp.array[wp.float64]
+) -> None:
+    # ``(rows with at least one neighbour, sum of their mean distances)`` into one ``(2,)``
+    # accumulator, for ``points.statistical_outlier_mask``'s cloud mean.
+    #
+    # One kernel rather than a ``wp.map`` building a ``count > 0`` mask and two ``reduce.sum``
+    # calls over it and over ``mean_distance``. The mask existed only to be counted, so it went
+    # with them: a map, an ``n``-length allocation and two reductions -- each of which is a launch,
+    # an allocation and a host readback -- measured 136 us of a 346 us call on an RTX 5090, where
+    # this is one launch and one readback of sixteen bytes.
+    #
+    # ``float64`` slots, not ``float32``: slot 0 is a *count*, and a float32 stops representing
+    # consecutive integers at 2 ** 24, which a large cloud reaches. Summing the distances at the
+    # wider precision is free alongside it and strictly better than the float32 tree it replaces.
+    #
+    # An empty row contributes zero to both sums, which is what lets the cloud mean be a plain
+    # reduction: ``neighbor_distance_moments`` writes a zero mean for a row it counted nothing in.
+    chunk, lane = wp.tid()
+    offset, remaining = tile_chunk(count.shape[0], chunk, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    # ``tile_chunk`` reports what is left to the end of the array, not this block's share of it.
+    n_rows = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+
+    counted = wp.float64(0.0)
+    total = wp.float64(0.0)
+    for k in range(lane, n_rows, wp.block_dim()):
+        if count[offset + k] > 0:
+            counted = counted + wp.float64(1.0)
+            total = total + wp.float64(mean_distance[offset + k])
+
+    # Block-collective, so both run outside the ``lane == 0`` guard.
+    counted_sum = wp.tile_sum(wp.tile(counted))[0]
+    total_sum = wp.tile_sum(wp.tile(total))[0]
+    if lane == 0:
+        wp.atomic_add(out_totals, 0, counted_sum)
+        wp.atomic_add(out_totals, 1, total_sum)
+
+
+@wp.kernel
 def centered_covariance(
     points: wp.array[wp.vec3], center: wp.array[wp.vec3], out_cov: wp.array[wp.mat33]
 ) -> None:
@@ -104,18 +145,19 @@ def finalize_fit_line(m: wp.array[wp.mat33], out_axis: wp.array[wp.vec3]) -> Non
 
 @wp.kernel
 def finalize_fit_plane(
-    center: wp.array[wp.vec3],
-    m: wp.array[wp.mat33],
-    out_centroid: wp.array[wp.vec3],
-    out_normal: wp.array[wp.vec3],
+    center: wp.array[wp.vec3], m: wp.array[wp.mat33], out_plane: wp.array[wp.vec3]
 ) -> None:
+    # One output buffer rather than two, because both entries cross to the host together and a
+    # readback costs far more than the row of it that is read: slot 0 is the normal, slot 1 the
+    # centroid, in the order ``fit_plane`` returns them.
+    #
     # plane origin is the centroid of the point set; the covariance matrix of
     # the centred points was accumulated into m.
     u, _sigma, _v = wp.svd3(m[0])
     # normal is the singular vector with the smallest singular value
     # (svd3 returns singular values in descending order: last column of u).
-    out_centroid[0] = center[0]
-    out_normal[0] = wp.normalize(mat33_column(u, 2))
+    out_plane[0] = wp.normalize(mat33_column(u, 2))
+    out_plane[1] = center[0]
 
 
 # Orientation modes for estimate_point_normals (mirror Open3D's orient methods).
@@ -126,12 +168,12 @@ ORIENT_CAMERA = wp.constant(wp.int32(2))  # point toward a camera location
 
 @wp.kernel
 def finalize_principal_axes(
-    center: wp.array[wp.vec3],
-    m: wp.array[wp.mat33],
-    out_rotation: wp.array[wp.mat33],
-    out_eigenvalues: wp.array[wp.vec3],
-    out_centroid: wp.array[wp.vec3],
+    center: wp.array[wp.vec3], m: wp.array[wp.mat33], out_frame: wp.array[wp.vec3]
 ) -> None:
+    # One ``(5,)`` output buffer rather than three, because all three results cross to the host
+    # together: rows 0-2 are the rotation's rows, row 3 the eigenvalues, row 4 the centroid --
+    # the order ``principal_axes`` returns them in. Three separate readbacks measured 95.6 us
+    # against 22.7 for one.
     # ``wp.svd3`` returns singular values in descending order, so the columns of ``u`` are the
     # principal axes from widest to narrowest. The rows of the result are those axes, which is the
     # convention that makes ``rotation * p`` the coordinates of ``p`` in the principal frame.
@@ -142,11 +184,11 @@ def finalize_principal_axes(
     # rotation (determinant +1) whatever sign convention the SVD chose, so the frame is always
     # right-handed and only the first two signs are free.
     axis2 = wp.cross(axis0, axis1)
-    out_rotation[0] = wp.mat33(
-        axis0[0], axis0[1], axis0[2], axis1[0], axis1[1], axis1[2], axis2[0], axis2[1], axis2[2]
-    )
-    out_eigenvalues[0] = sigma
-    out_centroid[0] = center[0]
+    out_frame[0] = axis0
+    out_frame[1] = axis1
+    out_frame[2] = axis2
+    out_frame[3] = sigma
+    out_frame[4] = center[0]
 
 
 @wp.kernel

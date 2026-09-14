@@ -286,6 +286,11 @@ def icp(
     slots = (_slot(workspace, 0), _slot(workspace, 1))
     parity = 0
     old_cost = math.inf
+    # Built on first use rather than here, for the reason in ``icp_point_to_plane``: a cached
+    # ``wp.map`` call re-resolves its op and signature every iteration, and its inputs come back
+    # from ``_correspondences``, whose mesh and cloud branches return different buffers. They are
+    # the same objects on every iteration, so one construction serves the loop.
+    threshold_weight: wp.Kernel | None = None
     for _ in range(max_iterations):
         distance, triangle_id = _correspondences(
             mesh,
@@ -299,12 +304,21 @@ def icp(
         )
 
         if max_distance is not None and weights is not None:
-            wp.map(
-                kernel_registration.distance_threshold_weight,
-                distance,
-                triangle_id,
-                wp.float32(max_distance),
-                out=weights,
+            if threshold_weight is None:
+                threshold_weight = wp.map(
+                    kernel_registration.distance_threshold_weight,
+                    distance,
+                    triangle_id,
+                    wp.float32(max_distance),
+                    out=weights,
+                    return_kernel=True,
+                )
+            wp.launch(
+                threshold_weight,
+                dim=n,
+                inputs=[distance, triangle_id, wp.float32(max_distance)],
+                outputs=[weights],
+                device=device,
             )
 
         # The fit runs *before* the "every correspondence was rejected" test, not after, because
@@ -651,6 +665,23 @@ def icp_point_to_plane(
     updated = wp.empty(n, dtype=wp.vec3, device=device)
     total = wp.clone(initial_matrix)
 
+    # The per-iteration maps are hoisted to their kernels. A cached ``wp.map`` call still resolves
+    # its op and input signature in Python on every call -- measured 23.7-24.8 us against 12.6-13.2
+    # for the launch it wraps -- so two of them is ~21 us of a ~200 us iteration. End to end that
+    # is 1.02-1.06x at 3 000 source points and 3 or 10 iterations, which is small and free.
+    #
+    # Measure this kind of change with ``threshold=0.0``, or the reading is fiction: with the
+    # convergence break live the two arms stop at *different* iterations and the ratio reported
+    # 1.86x, none of which was the hoist. The plateau is also not bit-reproducible -- the
+    # point-to-plane normal equations are accumulated with ``float32`` atomics, so two runs of the
+    # identical build disagree in the last digits once the cost stops moving.
+    #
+    # ``residual_valid`` is built on first use rather than here because the buffers it maps over
+    # come back from ``_correspondences``, whose mesh and cloud branches return different arrays;
+    # they are the same objects every iteration, so one construction still serves the whole loop.
+    accumulate_step = wp.map(wp.mul, step, total, out=total, return_kernel=True)
+    residual_valid: wp.Kernel | None = None
+
     for iteration in range(max_iterations):
         # --- correspondence + target normals ---
         distance, triangle_id = _correspondences(
@@ -680,12 +711,21 @@ def icp_point_to_plane(
         # reports ``cost=0.0`` -- indistinguishable from a perfect fit -- instead of stopping with
         # the last real cost (or ``math.inf`` if nothing ever matched).
         if valid is not None:
-            wp.map(
-                kernel_registration.residual_valid,
-                triangle_id,
-                distance,
-                wp.float32(max_d),
-                out=valid,
+            if residual_valid is None:
+                residual_valid = wp.map(
+                    kernel_registration.residual_valid,
+                    triangle_id,
+                    distance,
+                    wp.float32(max_d),
+                    out=valid,
+                    return_kernel=True,
+                )
+            wp.launch(
+                residual_valid,
+                dim=n,
+                inputs=[triangle_id, distance, wp.float32(max_d)],
+                outputs=[valid],
+                device=device,
             )
             if not tw.reduce.any(valid):
                 break
@@ -758,7 +798,7 @@ def icp_point_to_plane(
         )
         current, updated = updated, current
         transformed = current
-        wp.map(wp.mul, step, total, out=total)
+        wp.launch(accumulate_step, dim=1, inputs=[step, total], outputs=[total], device=device)
 
         if iteration > 0 and old_cost - cost < threshold:
             break

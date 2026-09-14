@@ -370,11 +370,13 @@ def test_grid(bench_lib: BenchLibrary, count: int) -> None:
 @pytest.mark.parametrize("subdivisions", [3, 6])
 def test_sphere_cap(bench_lib: BenchLibrary, subdivisions: int) -> None:
     """
-    The concentric-ring lattice, whose cost is a Python loop over ``2 ** subdivisions`` rings.
+    The concentric-ring lattice: one thread per vertex and one per triangle, both closed forms.
 
-    Unlike the revolution primitives this one is *not* flat in resolution on the triwarp side: the
-    ring loop is host-side NumPy and grows linearly in the ring count, so read the slope here as the
-    prologue's rather than the device's. MeshLab's own generator is a per-vertex C++ loop.
+    Flat in resolution on the triwarp side, like the revolution primitives. It was not: the lattice
+    was a host-side NumPy loop over ``2 ** subdivisions`` rings and grew quadratically in the ring
+    count, so the slope here used to be the prologue's rather than the device's. MeshLab's own
+    generator is a per-vertex C++ loop and still carries that slope, which is what widens the gap
+    with ``subdivisions``.
     """
     n_faces = 6 * (2**subdivisions) ** 2
     if bench_lib.kind == "pymeshlab":

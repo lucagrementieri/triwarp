@@ -1161,3 +1161,116 @@ def revolve_uniform(
         out_faces[base + 0] = there
         out_faces[base + 1] = here_next
         out_faces[base + 2] = there_next
+
+
+@wp.func
+def cap_ring_start(ring: wp.int32) -> wp.int32:
+    # First vertex slot of a spherical cap's concentric ring ``ring``, which carries ``6 * ring``
+    # vertices. Ring 0 is the single apex and sits at slot 0; every later ring starts at the
+    # running total ``1 + 3 * ring * (ring - 1)``, which is why ring 0 is not that formula's value
+    # at zero -- it would read 1, the *first* rim vertex, and quietly wind every apex triangle
+    # around its neighbour instead.
+    return wp.where(ring == 0, 0, 1 + 3 * ring * (ring - 1))
+
+
+@wp.func
+def cap_ring_of(vertex: wp.int32) -> wp.int32:
+    # Inverse of ``cap_ring_start`` for ``vertex >= 1``: the largest ``ring`` whose block starts at
+    # or before ``vertex``. Solving ``3 r^2 - 3 r + 1 <= v`` gives
+    # ``r <= (3 + sqrt(12 v - 3)) / 6``, and the two corrections below turn that float64 estimate
+    # into the exact integer -- each runs
+    # at most once, and they are what makes this safe at a ring count where the square root's last
+    # bit could land either side of a block boundary.
+    # Every literal carries its precision: a bare float literal is ``wp.float32`` in kernel scope
+    # and mixing one into a ``float64`` expression is a parse error (CLAUDE.md section 1.2).
+    estimate = (wp.float64(3.0) + wp.sqrt(wp.float64(12 * vertex - 3))) / wp.float64(6.0)
+    ring = wp.int32(estimate)
+    if ring < 1:
+        ring = 1
+    while cap_ring_start(ring + 1) <= vertex:
+        ring = ring + 1
+    while cap_ring_start(ring) > vertex:
+        ring = ring - 1
+    return ring
+
+
+@wp.func
+def cap_strip_of(face: wp.int32) -> wp.int32:
+    # Which ring-to-ring strip owns triangle ``face``. Strip ``r`` joins ring ``r - 1`` to ring
+    # ``r`` and contributes ``6 * r`` outward triangles followed by ``6 * (r - 1)`` inward ones, so
+    # the strips end at ``6 * r^2`` and strip ``r`` starts at ``6 * (r - 1)^2``. Same shape as
+    # ``cap_ring_of``: a float64 estimate and two at-most-once corrections.
+    strip = wp.int32(wp.sqrt(wp.float64(face) / wp.float64(6.0))) + 1
+    if strip < 1:
+        strip = 1
+    while 6 * strip * strip <= face:
+        strip = strip + 1
+    while 6 * (strip - 1) * (strip - 1) > face:
+        strip = strip - 1
+    return strip
+
+
+@wp.kernel
+def sphere_cap_vertices(
+    n_rings: wp.int32, angle: wp.float64, radius: wp.float64, out_vertices: wp.array[wp.vec3]
+) -> None:
+    # One thread per vertex of the concentric-ring cap lattice. Ring ``r`` sits at polar angle
+    # ``angle * r / n_rings`` and carries ``6 * r`` vertices evenly spaced in azimuth, so a thread
+    # recovers its own ring from its slot rather than being told: the whole lattice is a closed
+    # form in the vertex index, which is what lets it replace a host loop over rings whose cost was
+    # quadratic in the ring count.
+    #
+    # float64 throughout and stored to ``wp.vec3``, matching the host build this replaces: the
+    # rounding happens once, in the same place, at the store.
+    v = wp.int32(wp.tid())
+    if v == 0:
+        out_vertices[0] = wp.vec3(0.0, 0.0, wp.float32(radius))
+        return
+    ring = cap_ring_of(v)
+    step = v - cap_ring_start(ring)
+
+    theta = angle * wp.float64(ring) / wp.float64(n_rings)
+    phi = wp.float64(2.0) * wp.float64(wp.PI) * wp.float64(step) / wp.float64(6 * ring)
+    ring_radius = radius * wp.sin(theta)
+    out_vertices[v] = wp.vec3(
+        wp.float32(ring_radius * wp.cos(phi)),
+        wp.float32(ring_radius * wp.sin(phi)),
+        wp.float32(radius * wp.cos(theta)),
+    )
+
+
+@wp.kernel
+def sphere_cap_faces(out_faces: wp.array[wp.int32]) -> None:
+    # One thread per triangle. Strip ``r`` stitches ring ``r - 1`` to ring ``r``, and because the
+    # outer ring carries exactly one more vertex per sector than the inner one the strip is
+    # ``6 * r`` outward-pointing triangles (one per outer edge) followed by ``6 * (r - 1)``
+    # inward-pointing ones (one per inner edge), rather than an even fan. That is why the total
+    # lands on exactly ``6 * n_rings ** 2``, and it is the order the buffer is written in, so a
+    # thread's triangle is a closed form in its own index.
+    f = wp.int32(wp.tid())
+    strip = cap_strip_of(f)
+    local = f - 6 * (strip - 1) * (strip - 1)
+
+    outer_base = cap_ring_start(strip)
+    inner_base = cap_ring_start(strip - 1)
+    outer_count = 6 * strip
+    # Ring 0 is the lone apex, not a ring of ``6 * 0`` vertices, so the inner ring of strip 1 has
+    # one member and every sector's inner index wraps onto it.
+    inner_count = 6 * (strip - 1)
+    if strip == 1:
+        inner_count = 1
+
+    base = 3 * f
+    if local < outer_count:
+        sector = local // strip
+        step = local % strip
+        out_faces[base + 0] = outer_base + local
+        out_faces[base + 1] = outer_base + (local + 1) % outer_count
+        out_faces[base + 2] = inner_base + (sector * (strip - 1) + step) % inner_count
+    else:
+        inner = local - outer_count
+        sector = inner // (strip - 1)
+        step = inner % (strip - 1)
+        out_faces[base + 0] = inner_base + inner
+        out_faces[base + 1] = outer_base + (sector * strip + step + 1) % outer_count
+        out_faces[base + 2] = inner_base + (inner + 1) % inner_count

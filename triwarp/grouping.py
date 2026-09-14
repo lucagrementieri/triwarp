@@ -11,6 +11,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar
 from triwarp.array import bitcast_from_int, bitcast_to_int, gather, sort_pair_indices
+from triwarp.constants import INDEX_RADIX_PAIR
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import triangles as kernel_triangles
@@ -103,12 +104,13 @@ def group_int_rows(
     max_value
         Optional exclusive upper bound on entries and radix for row hashing; passed
         through to [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] as ``max_index``. If
-        ``None``, inferred
-        from ``max(data) + 1``.
+        ``None``, inferred from ``max(data) + 1`` -- or, with ``validate=False`` on a row of at most
+        two columns, taken as
+        [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR] with no reduction.
     validate
         Forwarded to [`hash_indices_rows`][triwarp.grouping.hash_indices_rows]. ``False`` skips the
-        range-check reduction (and its host readback) and requires ``max_value``; see the warning
-        there before using it.
+        range-check reduction (and its host readback); it requires ``max_value`` for a row of more
+        than two columns. See the warning there before using it.
 
     Returns
     -------
@@ -255,7 +257,14 @@ def _unique_hash(
 
     # Phase 3: compact unique keys, their occurrence counts, and the identity permutation the sort
     # below pairs with them -- all three in one pass over the table.
-    keys_compact = wp.empty(n_unique, dtype=key_dtype, device=device)
+    #
+    # ``keys_compact`` is allocated at the *sort's* double width and the kernel writes its leading
+    # half, so the radix sort below can ping-pong in this same buffer. Sizing it to ``n_unique``
+    # and widening afterwards meant ``bitcast_from_int`` allocated the double-width buffer and
+    # copied the keys into it -- an allocation and a full copy of the compacted keys, measured at
+    # 13.4 us, to move bytes that could have been written here in the first place.
+    sort_dtype = twt.sortable_dtype(original_dtype)
+    keys_compact = wp.empty(2 * n_unique, dtype=key_dtype, device=device)
     cnts_compact = wp.empty(n_unique, dtype=wp.int32, device=device)
     perm_buf = wp.empty(2 * n_unique, dtype=wp.int32, device=device)
     wp.launch(
@@ -266,9 +275,15 @@ def _unique_hash(
     )
 
     # Phase 4: sort only the n_unique keys (typically n_unique << n), in a dtype that orders them
-    # the way the caller's dtype does rather than by their reinterpreted bit pattern.
-    sort_dtype = twt.sortable_dtype(original_dtype)
-    keys_buf = bitcast_from_int(keys_compact, sort_dtype, count=2 * n_unique)
+    # the way the caller's dtype does rather than by their reinterpreted bit pattern. Reading the
+    # keys under that dtype is a reinterpreting *view* whenever it is the same width as the integer
+    # they were compacted as -- which every key dtype this package packs takes -- and a real
+    # widening copy only for a caller whose dtype is too narrow for Warp to sort at all.
+    keys_buf = (
+        keys_compact.view(sort_dtype)
+        if wp.types.type_size_in_bytes(sort_dtype) == wp.types.type_size_in_bytes(key_dtype)
+        else bitcast_from_int(keys_compact, sort_dtype, count=2 * n_unique)
+    )
     wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
 
     if sort_dtype == original_dtype:
@@ -746,7 +761,10 @@ def hash_indices_rows(
         ``max_index`` is given, every entry must satisfy ``entry < max_index``.
     max_index
         Optional exclusive upper bound on entries and radix for packing; must be
-        positive when provided. If ``None``, set to ``max(data) + 1`` after validation.
+        positive when provided. If ``None``, set to ``max(data) + 1`` after validation -- or, when
+        ``validate`` is ``False`` and ``data`` has at most two columns, to
+        [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR], which bounds every
+        ``int32`` and so needs no reduction at all.
     validate
         When ``True`` (default), a ``triwarp.reduce.minmax`` over ``data`` checks that entries are
         non-negative and below ``max_index``. That reduction ends in a host readback, which
@@ -754,6 +772,12 @@ def hash_indices_rows(
         remeshing loop. Pass ``False``, together with an explicit ``max_index``, to skip it when the
         bound is already guaranteed by construction (mesh edge rows are built from face indices, so
         they are non-negative and below the vertex count by definition).
+
+        For a row of **two** columns ``max_index`` may then be left ``None`` as well, which packs
+        against [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR] and removes the
+        bound-inferring reduction too -- the right spelling wherever the count exists only to be
+        this radix. It is not available for a wider row, whose radix has to keep ``radix ** w``
+        inside a ``uint64``.
 
         **A caller that derived its ``max_index`` from
         [`index_bound`][triwarp.array.index_bound] has *not* thereby made this
@@ -773,8 +797,9 @@ def hash_indices_rows(
     Raises
     ------
     ValueError
-        If ``max_index`` is not positive, if ``validate=False`` is passed without a ``max_index``,
-        or -- when validating -- if ``data`` is negative or reaches ``max_index``.
+        If ``max_index`` is not positive, if ``validate=False`` is passed without a ``max_index``
+        for a row of more than two columns, or -- when validating -- if ``data`` is negative or
+        reaches ``max_index``.
 
     Warnings
     --------
@@ -798,9 +823,18 @@ def hash_indices_rows(
     if max_index is not None and max_index <= 0:
         raise ValueError(f"max_index must be positive, got {max_index}")
     n = int(data.shape[0])
+    width = int(data.shape[1])
     if not validate:
         if max_index is None:
-            raise ValueError("validate=False requires an explicit max_index (the radix to use).")
+            if width > 2:
+                raise ValueError(
+                    "validate=False requires an explicit max_index (the radix to use) for a row "
+                    f"wider than two columns, got width {width}."
+                )
+            # Two columns need no bound at all: every ``int32`` reinterpreted as ``uint32`` is
+            # below ``INDEX_RADIX_PAIR``, so packing against it is injective without reducing the
+            # data, and it orders rows exactly as a tighter radix would.
+            max_index = INDEX_RADIX_PAIR
     elif n > 0:
         # The min/max is a device reduction with a host readback, so it serialises the pipeline.
         # It is unavoidable when the radix has to be inferred, and skippable via validate=False

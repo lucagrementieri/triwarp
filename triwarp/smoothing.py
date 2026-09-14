@@ -564,8 +564,10 @@ def filter_spikes(
         # the sum would mean scattering the same corner angles a second time.
         wp.map(kernel_array.greater, defects, wp.float32(2.0 * math.pi - min_angle_sum), out=spikes)
         # One readback per pass, and it is the stopping test: whether any vertex is still a spike is
-        # a device-side fact that a Python loop cannot branch on otherwise.
-        n_spikes = int(tw.reduce.sum(tw.array.astype(spikes, wp.int32)))
+        # a device-side fact that a Python loop cannot branch on otherwise. ``reduce.sum`` counts a
+        # ``wp.bool`` mask directly, so widening it to ``int32`` first would allocate ``4n`` bytes
+        # and run an ``array_cast`` for nothing -- measured 105.1 against 53.3 us (1.97x).
+        n_spikes = int(tw.reduce.sum(spikes))
         if n_spikes == 0:
             break
         smoothed = filter_neighborhood_average(
