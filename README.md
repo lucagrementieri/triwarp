@@ -20,7 +20,7 @@ and falls back to CPU otherwise — same code, same results.
 
 - **One dependency.** The runtime depends on `warp-lang` alone; NumPy is only needed to move
   data in and out.
-- **Broad coverage.** 50 public modules and over 400 functions spanning primitives, topology,
+- **Broad coverage.** 50 public modules and over 480 functions spanning primitives, topology,
   repair, remeshing, spatial queries, discrete differential operators, geodesics, sampling,
   surface reconstruction, and registration.
 - **Stays on the device.** Functions take Warp arrays and return Warp arrays, so pipelines
@@ -29,8 +29,9 @@ and falls back to CPU otherwise — same code, same results.
   (normals, adjacency, boundary loops, manifoldness and watertightness predicates, BVH) for
   when an object API is more convenient than free functions.
 - **Fully typed** (`py.typed`), documented per module at
-  <https://lucagrementieri.github.io/triwarp/>, and validated function-by-function against the
-  established CPU geometry-processing libraries (see below).
+  <https://lucagrementieri.github.io/triwarp/>, and validated function-by-function against eleven
+  reference implementations — nine established geometry-processing libraries plus SciPy and
+  NumPy (see below).
 
 ## Learn more
 
@@ -45,7 +46,7 @@ and falls back to CPU otherwise — same code, same results.
 - **[Performance](https://lucagrementieri.github.io/triwarp/performance/)** — why the GPU path is
   fast, and how to check any speed claim yourself.
 
-## One GPU library instead of six
+## One GPU library instead of nine
 
 Mesh processing in Python has long meant stitching together several excellent — but mostly
 CPU-bound and stylistically different — libraries. triwarp consolidates the functionality it needs
@@ -56,16 +57,25 @@ from each of them behind a single GPU-accelerated API:
 | [trimesh](https://github.com/mikedh/trimesh) | Mesh bookkeeping: edges, adjacency, boundary, validation, primitives, sampling, proximity | `edges`, `adjacency`, `boundary`, `validation`, `creation`, `sample`, `proximity`, the `Trimesh` class |
 | [libigl](https://libigl.github.io/) ([Python bindings](https://github.com/libigl/libigl-python-bindings)) | Discrete differential geometry: cotangent Laplacians, mass matrices, curvature, parametrization, exact/heat geodesics | `laplacian`, `energies`, `curvature`, `parametrization`, `heat` |
 | [Open3D](https://www.open3d.org/) | Point clouds, registration, and surface reconstruction: ICP, screened Poisson, ball pivoting | `points`, `registration`, `reconstruction` |
-| [potpourri3d](https://github.com/nmwsharp/potpourri3d) (geometry-central) | The heat-method family: vector heat, parallel transport, log maps, signed distance, tangent frames | `heat`, `tangent_space` |
 | [MeshLab](https://www.meshlab.net/) ([PyMeshLab](https://github.com/cnr-isti-vislab/PyMeshLab)) | Mesh editing filters: isotropic remeshing, decimation, smoothing, hole filling, uniform resampling | `remesh`, `smoothing`, `holes`, `repair` |
-| [PyTorch3D](https://pytorch3d.org/) | Batched neighbour and Chamfer primitives, and the mesh regularization losses | `metrics`, `neighbors`, `registration`, `energies` |
+| [PyVista](https://pyvista.org/) (VTK) | The VTK toolkit: feature edges, cell-quality metrics, contouring and clipping, point location, arc-length and polyline measures, voxelization | `edges`, `triangles`, `intersection`, `levelset`, `proximity`, `polyline`, `voxels` |
+| [MeshLib](https://meshlib.io/) | Minimum-weight hole filling and stitching, self-intersection repair, voxel offsets and booleans, projection queries, spike and outlier detection | `holes`, `repair`, `levelset`, `voxels`, `proximity`, `points` |
+| [PyMeshFix](https://github.com/pyvista/pymeshfix) (MeshFix / TMesh) | The repair pipeline end to end: a broken digitised surface in, one watertight solid out | `repair`, `holes`, `validation` |
+| [potpourri3d](https://github.com/nmwsharp/potpourri3d) (geometry-central) | The heat-method family: vector heat, parallel transport, log maps, signed distance, tangent frames | `heat`, `tangent_space` |
+| [PyTorch3D](https://pytorch3d.org/) | Batched neighbour and Chamfer primitives, the mesh regularization losses, cubify and marching cubes | `metrics`, `neighbors`, `energies`, `registration`, `levelset`, `voxels` |
+
+[SciPy](https://scipy.org/)'s `spatial.KDTree` and `sparse.csgraph` (covered by `neighbors`,
+`graph` and `proximity`) and NumPy's array primitives (`array`, `reduce`, `grouping`, `linalg`)
+round the set out to the eleven reference implementations the suite measures against.
 
 These libraries are not runtime dependencies — they are **test oracles**. Every triwarp
 function ships with a regression test comparing its output against the corresponding reference
 implementation, and a parity gate in the test suite fails the build if a benchmarked
-implementation pair is neither value-tested nor explicitly exempted with a written reason. When
-triwarp and a reference disagree by definition rather than tolerance, the test says so and
-documents the measured difference.
+implementation pair is neither value-tested nor explicitly exempted with a written reason. The
+benchmark suite spans 351 groups and 587 `(group, library)` pairs: 557 are claimed by a value
+test, 30 carry a written and categorised exemption, and none are left uncovered. When triwarp and
+a reference disagree by definition rather than tolerance, the test says so and documents the
+measured difference.
 
 ## Install
 
@@ -163,17 +173,10 @@ close, stray debris to drop — see the
 
 ## Status
 
-triwarp is pre-1.0 (`0.x`): the test suite is extensive (nearly 2,000 tests, a nine-library parity
-gate) and the library is safe to build on, but a public signature may still shift a positional
-argument to a keyword or gain a required parameter between minor versions until 1.0.
-
-**Known limitation:**
-[`reconstruction.ball_pivoting`](https://lucagrementieri.github.io/triwarp/api/reconstruction/)
-intermittently raises a CUDA `700` ("illegal memory access") when reconstructing several different
-point clouds back to back in one long-running process — pre-existing on each cloud in isolation,
-and traced to CUDA's async memory pool reusing a block while a kernel is still reading it, not to
-a bug in the reconstruction itself. Workaround until it's resolved upstream:
-`wp.set_mempool_enabled(wp.get_device("cuda:0"), False)` around the call.
+triwarp is pre-1.0 (`0.x`): the test suite is extensive (over 3,400 tests per device, an
+eleven-library parity gate with no uncovered pair) and the library is safe to build on, but a
+public signature may still shift a positional argument to a keyword or gain a required parameter
+between minor versions until 1.0.
 
 ## Development
 
@@ -190,7 +193,8 @@ uv run python docs/gen_ref_pages.py && uv run zensical serve   # preview the doc
 ```
 
 The test environment installs the reference stack (trimesh, libigl, Open3D, potpourri3d,
-PyMeshLab, PyVista, MeshLib, PyMeshFix, PyTorch3D, and more) so the comparison suite runs in full.
+PyMeshLab, PyVista, MeshLib, PyMeshFix, PyTorch3D, SciPy, and more) so the comparison suite runs
+in full.
 Benchmarks live in `benchmarks/` and use `pytest-benchmark`; PyTorch3D is the one reference with
 CUDA kernels of its own, so it is also the suite's only GPU-against-GPU comparison.
 
