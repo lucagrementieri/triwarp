@@ -753,7 +753,12 @@ At **Python scope**, Warp supports **gather** with integer indexing: `view = src
   **silently ignores a view's stride** — no exception. `payload[edges[:, 0]]` returns the flattened
   buffer's leading entries (`[0, 10, 1, 11, …]`), not column 0. A contiguous *prefix* slice
   (`arr[:n]`) is safe; a column (`arr[:, k]`) or step slice (`arr[::2]`) is not — `wp.copy` it into
-  a dense buffer first. Measurements: §12.1. This is why `kernels/edges.py:edge_lengths` stays a
+  a dense buffer first. **Both halves of that sentence are load-bearing, and the tree got the first
+  one backwards once**: `remesh._keep_longest_edges` wrote `gather(eligible, wp.clone(order[:k]))`
+  with a comment citing this rule, where `order[:k]` is a prefix and needs no clone at all —
+  measured 47.7 against 31.9 µs for the gather (**1.50x**), byte-identical. When a clone-of-slice
+  cites this rule, check which kind of slice it is; `adjacency.face_adjacency` and
+  `reconstruction._seed_candidates` clone a `[:, 0]` column and are the case it exists for. Measurements: §12.1. This is why `kernels/edges.py:edge_lengths` stays a
   kernel. **When converting a gather, verify values, not just that it runs and is faster**: the
   corrupt version reads a contiguous prefix and is measurably *faster* than the correct one.
 - **Indexed assignment** (`arr[indices] = value`) is **not** supported on `wp.array` at Python scope
@@ -1098,6 +1103,14 @@ found them: §12.1.
   any dtype, so `arr[k : k + 1].numpy()[0]` and `arr.numpy()[k]` are both it, spelled slower
   (27.8 against 15.7 µs on CUDA); the sites converted in this pass were `creation.sweep_polygon`'s
   two path endpoints, `bounds`' two winning frames and `reconstruction`'s two face counters.
+- **That is a *single*-value rule, and it inverts at two.** A readback's cost is almost all fixed,
+  so **one `.numpy()` of a small buffer beats two `read_scalar` calls** — measured 20.4 µs for a
+  2-element `.numpy()` against 29.7 for two tail reads. So a function returning several small
+  device values should write them into *one* buffer and read it once, which is what
+  `points.fit_plane` / `principal_axes`, `measures.moments` and `registration.icp_point_to_plane`'s
+  scalar accumulator all do (1.27-3.00x, §16.4). The rule only reverses once the buffer is large
+  enough for the copy to matter: `.numpy()` of 61 440 `int32` is 36.6 µs against `read_scalar`'s
+  14.7, so a *tail* read of a mesh-sized array stays `read_scalar`.
 
 ---
 
@@ -3313,6 +3326,16 @@ Consequence: the shared argmin/argmax/swap helpers in `kernels/array.py` are con
     `wp.block_dim()` (§2.2, which is also what keeps it right on the CPU device) and the block folds
     the per-lane registers with a single `wp.tile` reduction — one tile reduction per block where the
     tile-load form runs `TILES_PER_BLOCK_1D` of them, and the strided reads still coalesce.
+  - **And once it exists, widening a mask before a whole-array reduction is a measured loss, not
+    merely redundant.** `int(reduce.sum(astype(mask, wp.int32)))` against `int(reduce.sum(mask))`
+    measures **105.1 against 53.3 µs, 1.97x** — an allocation of `4n` bytes and an `array_cast`
+    launch for a count the reduction already knows how to take. Two sites carried it
+    (`smoothing.filter_spikes`, `remesh.subdivide_region_to_size`, the second inside its pass
+    loop) and both are converted. The `counts_to_offsets(astype(mask, wp.int32))` sites are *not*
+    the same defect — `wp.utils.array_scan` genuinely cannot read a `wp.bool` buffer — but they
+    are no longer an `array_cast` either: `kernels/array.bool_flags` is a plain kernel writing the
+    same 0/1 bytes at **11.0-11.3 µs against `array_cast`'s 20.3-21.0**, flat from 1 024 to
+    1 000 000 elements, and `flatnonzero` / `mask_to_compact_ranks` / `remesh._compact` all use it.
   - **It moves a documented crossover, so re-check the declines that cite one.** The
     readback-versus-device-reduction crossover for a `wp.bool` mask went from ~1 M elements to
     **~0.5 M** (`reduce.any` against `mask.numpy().any()`: 1.54x slower at 163 842, 1.15x at
@@ -3637,19 +3660,33 @@ on real wrappers, is only worth 1.00-1.02x — not a lever.)*
 
 | primitive (correct regime) | cost |
 |---|---|
-| `wp.launch` | **9.7 µs**, independent of `dim` |
-| `wp.empty` | 4.5 µs, flat in size |
-| `wp.zeros` | 7.6 µs |
-| `wp.full` | 8.6 µs |
-| `arr.fill_` | 3.1 µs |
-| `wp.copy` | 5.2 µs |
-| `wp.clone` | 10.8 µs |
+| `wp.launch` / `wp.launch_tiled` | **11.8 / 12.2 µs**, independent of `dim` |
+| `wp.empty` | 6.1 µs, flat in size (`wp.empty(0)` 2.0) |
+| `wp.zeros` | 9.3 µs |
+| `wp.full` | 9.3 µs |
+| `arr.fill_` / `arr.zero_` | 3.2 / 2.5 µs |
+| `wp.copy` | 4.5 µs |
+| `wp.clone` | 13.3 µs |
 | `wp.array(numpy)` | 16.1 µs |
-| a slice view | 2.8 µs |
-| `array.flatnonzero(200k)` | 115 µs |
+| a slice view | 3.0 µs |
+| **`wp.utils.array_cast`** | **20.8-22.1 µs — 1.8x a plain launch** |
+| `wp.utils.array_scan` | 7.1 µs |
+| **`wp.utils.array_sum`** | **39.8 µs — 3.4x a plain launch** |
+| `wp.utils.radix_sort_pairs` | 15.6 (int32) / 18.6 (int64) µs at `n = 1`; 64.3 / 86.1 at 61 440 |
+| `array.flatnonzero(200k)` | 115 µs (97 after the `array_cast` removal below) |
 | a cached `wp.map` call (Python overhead above the kernel) | ~11 µs |
-| a host readback | ~0.1 ms (but a **second consecutive** one is ~0.02 ms — the 0.1 ms is the pipeline drain the first read already paid; §16.7) |
+| a host readback | ~0.1 ms *queued*, **14.3 µs isolated** — the 0.1 ms is the pipeline drain in front of it, not its own cost (§16.7), so price it by what is queued |
+| `wp.synchronize_device` | 1.1 µs |
 | a **replayed** kernel in a captured chain | **1.17 µs** at n=17 689, 1.57 µs at n=163 842, exactly linear from 1 to 12 kernels |
+
+The launch and allocation rows were re-measured on Warp 1.17 (400 calls between two syncs, min of 9)
+and each is 20-25 % above what this table carried from an earlier version; the cost model below is
+still accurate because every term moved together. **The three rows in bold are the ones that change
+decisions**, and all three were being reached for as though they were free: `wp.utils.array_sum` is
+3.4x a launch, which is why four of them were 62 % of `measures.moments` (§16.4);
+`wp.utils.array_cast` is 1.8x a launch for a copy a plain kernel does identically, which is why
+`flatnonzero` stopped using it; and an *isolated* readback is 14.3 µs rather than 0.1 ms, so a
+function that already synchronized is not paying 0.1 ms for its second read.
 
 A host-cost model of `allocations × per-call cost + kernels × 9.7 µs` accounts for 84-122% of a
 wrapper's measured host time, verified on seven wrappers spanning 0.3-2.9 ms.
@@ -4526,6 +4563,15 @@ noise. **Before reading a ratio near 1.0 as a verdict, compute the candidate's s
 measured** — under a few percent, the measurement cannot see it and the honest next step is to
 isolate the region, not to declare a decline. §14.10 has the full case.
 
+**A loop with a convergence break reports the break point, not the change.** An
+`icp_point_to_plane` hoist read **1.86x** end to end and was worth **1.02-1.06x**: the two arms
+stopped at different iterations, and nothing else about the 874 µs "saving" was real. Two directly
+measured maps at ~10.5 µs each on a ~200 µs iteration was the whole of it. **Pin the iteration
+count before timing an iterative solver** — `threshold=0.0` here — or the ratio is fiction. The
+same call is also not bit-reproducible once converged (the point-to-plane normal equations
+accumulate through `float32` atomics), so two runs of the identical build disagree in the last
+digits; a value gate on it has to compare a *trajectory* and expect the plateau to wobble.
+
 ### 15.3 Attribute at the benchmarked operating point
 
 **A profiled share is a share at one point on the parameter axis, and it can reverse an
@@ -4592,6 +4638,22 @@ the target function, its constant's comment *and its benchmark docstring* for a 
 before accepting it.** Several attempts at a predictor tried different properties of the *solve*
 (size, iteration count, convergence-rate extrapolation) and all failed the same way; the property
 that actually separates the cases was a property of the *operator*, never tried (§16.8).
+
+**Two refutations from the host-cost sweep, both cheap to re-derive and both wrong-looking-right:**
+
+- **Narrowing edge/row keys to 32 bits to halve the radix sort.** `radix_sort_pairs` really is
+  1.3-4.1x cheaper for `int32` than `int64` in isolation (72.8 against 17.8 µs at n = 4 096;
+  148.1 against 81.8 at 1 M). End to end `unique_1d(return_inverse=True)` on `uint32` keys measures
+  **0.91-1.01x** against `uint64` across icospheres 2-6 — no better, sometimes worse — because
+  `uint32` is outside `_unique_hash`'s native `(int32, int64)` set and picks up a `bitcast_to_int`
+  copy, and because the call is host-bound anyway. The lever was never the key *width*; it was the
+  reduction *around* the packing (§16.4).
+- **Replacing `map_sorted_inverse`'s binary search with a hash-slot lookup.** Recording each
+  element's table slot at insert time and resolving the inverse as `inv_perm[scan_pos[slot] - 1]`
+  trades `log2(n_unique)` dependent probes for three. Stage-profiled, `map_sorted_inverse` is
+  **13 µs of `unique_1d`'s 254.9** — under 5 % best case, against an extra `n`-sized `int32` buffer
+  and a wider `hash_insert`. Not built. **Stage-profile before optimising a stage**; the obvious
+  suspect here is 5 % and the radix sort's *host floor* is 19 µs of it.
 
 ### 15.6 A/B without `git stash`
 
@@ -4753,6 +4815,24 @@ the table and mechanism are §13.1, the rule is §2.5, the factory guidance §2.
   arm turned both apparent losses into real wins.
 
 ### 16.1 Where triwarp's benchmark losses actually are
+
+**The whole mid-level surface is host-bound, and the cheapest way to see it is the flatness
+census.** 44 public functions timed at 320 faces and at 81 920 faces — a 256x range — on an
+RTX 5090, Warp 1.17: **43 of 44 came out flat within 1.25x**, one (`bounds.oriented_bounding_box`)
+at 1.28x, and **none above 3x**. `validation.is_watertight` is 1 870 → 2 070 µs, `vertex_one_rings`
+490 → 512, `grouping.unique_rows` 454 → 451, `measures.moments` 250 → 256. Corroborated
+independently by `wp.timing_begin` on `grouping.unique_1d` (no capture in that path, so §15.10 does
+not apply): **wall 254.9 µs against 46.9 µs of device time — 82 % host**, over 10 device ops.
+
+Two consequences, and they set the shape of every optimization in this package:
+
+- **There is usually no kernel to make faster.** The currency is the *count* of Warp API calls, and
+  §13.1's table is the price list. A `cProfile` of `tw.reduce.sum(bool)` measures 52.0 µs of which
+  the raw `wp.zeros(1)` + `launch_tiled` + `read_scalar` sequence is **50.1 µs**: about 2 µs is
+  triwarp's own Python. Micro-optimising wrapper code is not a lever; removing Warp calls is.
+- **Flatness across the mesh size is the measurement to take first**, before any profiler. It costs
+  two timings, it needs no instrumentation, and it cannot be fooled by graph capture the way a
+  device/wall split can (§15.10).
 
 **Six of the ten biggest losses are 92-99 % host-side launch/allocation cost, not slow kernels.**
 Device time from `wp.timing_begin(cuda_filter=wp.TIMING_KERNEL | wp.TIMING_MEMSET, synchronize=True)`,
@@ -5238,6 +5318,71 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
     on one line **undercounts** — half the converted sites already wrapped across lines, which is
     how the census first read 1 of 10 rather than 5 of 10.
 
+- **SHIPPED — a two-column index row needs no bound at all, so the reduction that infers one is
+  removable outright.** `grouping.hash_indices_rows` packs a row as `sum(digit[i] * radix ** i)`,
+  so *any* radix above every entry is injective — and **every `int32` reinterpreted as `uint32` is
+  below `2 ** 32`**, which two columns always fit inside a `uint64`. The packing is also monotone
+  lexicographic in `(row[1], row[0])` for every valid radix, so a wider one leaves
+  `unique_1d`'s sorted row order untouched. `constants.INDEX_RADIX_PAIR` is that radix, and
+  `validate=False` with no `max_index` now means "use it" for a row of at most two columns (a
+  wider row still raises: its radix has to keep `radix ** w` inside a `uint64`).
+
+  Measured at 61 440 rows: `hash_indices_rows` **112.3 → 24.1 µs (4.7x)**, with byte-identical
+  unique rows in byte-identical order (30 720 of them). End to end on the sites that took it:
+  `halfedge.halfedge_twins` **1.29x** (308.1 → 238.8 µs), `edges.edges_unique(validate=False)`
+  **1.28x**, `boundary.ears` **1.26x**.
+
+  **What it does *not* reach is the more useful half of the finding.** Most callers' reduction is
+  not only the radix — it is also the negative-index guard, and `hash_indices_rows`' own docstring
+  already said so at four sites. So `unique_rows`, `group_int_rows` and `edges_unique`'s *public*
+  default keep theirs and are unchanged (1.00-1.02x); only a caller whose count reaches nothing but
+  the radix converts. **Before assuming a bound is free to widen, ask what else it is: in
+  `validation.is_vertex_manifold` it is the *length* of the per-vertex mask** (unreferenced
+  vertices are deliberately `False`), so passing `vertices.shape[0]` there would change the answer
+  on a mesh with trailing spares — that sub-item was planned, measured against the semantics and
+  refuted.
+
+- **SHIPPED — `measures.moments` reduces inside its integrand kernel: 3.00x.** It launched one
+  kernel writing four `(n_faces,)` buffers (80 bytes a face, 6.5 MB at 81 920) and then four
+  `wp.utils.array_sum` calls, each with its own host readback, to extract ten scalars. The four
+  reductions were **160.6 µs of a 260.0 µs call**. `kernels.measures.moment_integrals` now folds
+  them: lane-strided over its block's chunk, ten `wp.tile_sum` trees, ten atomics per block, one
+  `(10,)` accumulator and one readback. Measured 269.6 → 89.9 µs at 20 480 faces, **2.6-3.0x from
+  80 to 327 680 faces**, and **1.6-2.4x on the CPU device** as well. Accuracy improved: against a
+  sorted `float64` serial sum the tree is **6.4e-16** relative at 81 920 faces.
+    - **Its chunk width is a launch argument, not `ITEMS_PER_BLOCK_1D`, and that is the
+      generalisable part.** The per-face integrand is ~80 `float64` flops — far heavier than the
+      outer product in `points.centered_covariance` — so the family's single 1 024-element chunk
+      starves the device: 434.3 µs at 1 310 720 faces against 296.1 for a 512-element chunk, while
+      at 1 280 faces the ordering reverses (14.2 against 54.9). `measures._moment_chunk_faces`
+      doubles the chunk from one tile until the grid is no wider than 1 280 blocks. **A runtime
+      width measured identical to a `wp.constant` one**, so nothing is lost by choosing it on the
+      host — which is worth knowing before baking any chunk constant into a kernel.
+    - `kernels/reduce.py`'s note about this skeleton being hand-written at three sites is updated:
+      it is five now, and the two added are the reason it is still not factored — the *bodies*
+      differ in more than the component count.
+
+- **SHIPPED — a function returning several small device values reads them back once.**
+  `points.principal_axes` **1.48x** (252.9 → 170.5 µs) and `fit_plane` **1.27x**: three and two
+  `dim=1` outputs, written by one kernel, were read with three and two separate `.list()` calls —
+  95.6 µs against 22.7 for a single `.numpy()` of the packed buffer (§3.10).
+  `points.statistical_outlier_mask` is the same finding one level up at **1.40x** (378.5 → 270.8):
+  two of its three reductions ran over one pass's outputs, and the `wp.map` that built a mask
+  purely to be counted went with them.
+
+- **SHIPPED — `creation.sphere_cap` is a kernel: flat at ~52 µs against a quadratic host loop.**
+  The last template still assembled on the host, and the one §3.8's exception covers — a closed-form
+  parallel map with no sequential dependence. Measured 71 / 216 / 784 / 1 771 / 4 531 / 12 702 µs at
+  `subdivisions` 0 / 3 / 5 / 6 / 7 / 8, against **51.7 / 49.9 / 51.8 / 51.9 / 51.4 / 55.4** —
+  **1.4x to 229x**, and the device path wins at *every* size, so unlike `_parametric_lattice` it
+  needs no size gate. Gate: **byte-identical vertices and faces across 128 cases** (both devices,
+  subdivisions 0-7, four angles, two radii).
+    - The one subtlety is the inverse: a thread recovers its ring from its vertex index by solving
+      `3 r^2 - 3 r + 1 <= v`, and the ring *starts* are `1 + 3 r (r - 1)` **except ring 0**, which
+      is the lone apex at slot 0 rather than that formula's 1. Getting that wrong wound every
+      apex triangle around its neighbour instead — caught by the byte-identity gate and by nothing
+      else, since the mesh stayed watertight, correctly wound and the right size.
+
 ### 16.5 `array`, `graph`, `polyline`, `intersection`
 
 - **`kernels/array.binary_search_index` is `searchsorted(side="right")` and returns `slot + 1` on an
@@ -5320,6 +5465,29 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   - **The general shape to look for**: a helper that densifies or indexes *the whole mesh* feeding
     a consumer whose answer is a small subset of it. The tell is a call whose cost is flat in the
     mesh size while the answer is not.
+
+- **SHIPPED — `graph.successor_cycles` finds its node set with a mask, not `unique_1d`: 1.05x on
+  it, and the mechanism is worth more than the row.** It took the distinct endpoints with
+  `unique_1d(edges.flatten())`; a zeroed `node_count` mask, a `mark_membership_mask` scatter and
+  `flatnonzero` return the *same sorted distinct values* for a fraction of the work, because the
+  range check the function already ran guarantees every endpoint indexes the mask. Measured
+  **122 against 176 µs, flat in `node_count` from 2 562 to 1 000 000**, byte-identical at every
+  size. **`unique_1d` is a hash table, a compaction, a radix sort and two readbacks; where the
+  values are known-bounded indices, a mask is the cheaper spelling of the same answer.**
+
+- **`boundary.boundary_loops` is ~1.95 ms and flat, and this pass took only 1.05x of it.** Recorded
+  because the attribution is the useful part: on a one-loop hemisphere it issues **36 launches, 48
+  `wp.empty`, 11 `wp.zeros`, 16 `wp.copy` and 7 readbacks, identical at 656 / 10 304 / 41 088
+  faces**. The largest single piece is `successor_cycles`' pointer-doubling loop — `ceil(log2 n)`
+  launches of one kernel with swapped buffers, 14 of them here, ~257 µs — and **both mechanisms
+  for removing it are already refuted**: a CUDA graph cannot be reused across calls because the
+  round count varies, so it is §14.3's record-and-replay-once at 0.84x, and a single persistent
+  block is the shape §14.9 refuted for `graph.bfs`. What did convert: the node set above, and
+  `_needs_unoriented_boundary_walk`'s second launch, which scanned the whole vertex count to reduce
+  a degree table to two bits and is now stamped by the value each `wp.atomic_add` returns (only a
+  boundary vertex ever has a non-zero degree). Gate: **32 cases byte-identical on both devices**,
+  including `mobius` — the fixture that actually takes the non-orientable branch the probe guards,
+  without which the gate is vacuous (§7.4).
 
 ### 16.6 `proximity`, `metrics`, `neighbors`
 
