@@ -8,7 +8,7 @@
 [![Docs](https://img.shields.io/badge/docs-lucagrementieri.github.io%2Ftriwarp-blue)](https://lucagrementieri.github.io/triwarp/)
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/lucagrementieri/208b2ea8a3b764ca7c10d82195533738/raw/triwarp-coverage.json)](#development)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
-[![Status](https://img.shields.io/badge/status-alpha-orange)](#status)
+[![Status](https://img.shields.io/badge/status-beta-yellow)](#status)
 
 **triwarp puts mesh processing on the GPU.** Geometry, topology, repair, remeshing, spatial
 queries, discrete differential operators, geodesics, point-cloud reconstruction, and
