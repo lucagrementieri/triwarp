@@ -18,8 +18,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@v7
+      # Pinned to an exact version, unlike every other action here: astral-sh stopped
+      # publishing moving major tags after `v7`, so `@v10` does not resolve.
+      #
+      # `enable-cache` is load-bearing in *this* workflow, where elsewhere it only restates
+      # the default: setup-uv's default is `auto`, which turns caching off for tag pushes --
+      # the only event that triggers this file.
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
       - run: uv python install
@@ -91,7 +97,7 @@ jobs:
           fi
           cat RELEASE_NOTES.md
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: |
@@ -111,7 +117,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: .
@@ -125,12 +131,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: .
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           body_path: RELEASE_NOTES.md
