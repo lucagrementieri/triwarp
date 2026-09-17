@@ -70,7 +70,8 @@ The first public release. Everything below is new, because there is no prior tag
 ### Notes
 
 - Requires Python 3.11 or newer and `warp-lang` 1.17 or newer. The 1.17 floor is load-bearing:
-  `neighbors` and `proximity` call `wp.bvh_query_sphere`, which does not exist before it.
+  `neighbors` and `proximity` call `wp.bvh_query_sphere`, which does not exist before it. CI
+  installs and smoke-tests the wheel on 3.11, 3.12, 3.13 and 3.14.
 - The only runtime dependencies are `warp-lang` and `numpy`; `numpy` adds nothing to an install,
   since `warp-lang` already requires it unconditionally.
 - Every function runs on CUDA when a GPU is present and on Warp's CPU backend otherwise. The
