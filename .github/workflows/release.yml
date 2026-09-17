@@ -1,0 +1,136 @@
+name: release
+
+# Tag-triggered, deliberately: the tag is the release trigger *and* the version record, and the
+# `build` job's first step refuses to go any further if the two disagree. Nothing here reads the
+# version from git -- `pyproject.toml`'s `[project] version` stays the single source of truth,
+# and the tag is checked against it rather than derived from it.
+#
+# The maintainer checklist this automates is `.github/RELEASING.md`.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv python install
+
+      # A forgotten version bump would otherwise re-publish the previous version under a new tag,
+      # or -- worse -- succeed on PyPI under a filename that can never be re-uploaded. Fail here
+      # instead, before anything leaves the runner.
+      - name: Tag must match pyproject version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(uv run --no-project --with tomli python -c "
+          import tomli
+          print(tomli.load(open('pyproject.toml', 'rb'))['project']['version'])
+          ")"
+          echo "tag=$tag pyproject=$version"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag does not match pyproject.toml version $version"
+            exit 1
+          fi
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      # Catches a long-description that will not render on PyPI, which is otherwise only visible
+      # after the upload that cannot be undone.
+      - name: Check package metadata
+        run: uvx twine check dist/*
+
+      # The end-user configuration: a bare interpreter, no CUDA, no reference libraries, no dev
+      # tooling. Kept minimal on purpose -- the regression suite is `test.yml`; this asserts the
+      # artifact about to be published is importable and can run a kernel.
+      - name: CPU-only smoke test of the built wheel
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --upgrade pip
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/python -c "
+          import os, triwarp as tw
+          # The version the wheel actually reports, checked against the tag being released.
+          expected = os.environ['GITHUB_REF_NAME'].lstrip('v')
+          assert tw.__version__ == expected, (tw.__version__, expected)
+          vertices, faces = tw.creation.icosphere(subdivisions=2)
+          assert faces.shape[0] == 960, faces.shape
+          mesh = tw.Trimesh(vertices, faces)
+          assert mesh.is_watertight
+          assert mesh.euler_characteristic == 2
+          print('ok: triwarp', tw.__version__, '--', vertices.shape[0], 'vertices on', vertices.device)
+          "
+
+      # The body of the GitHub Release, cut from the changelog section matching this tag, so the
+      # release notes and the changelog cannot drift. Fails loudly if the section is missing --
+      # a tag with no changelog entry is a release-checklist step that was skipped.
+      - name: Extract the changelog section for this version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Stop at the next level-2 heading of ANY shape, and at the link-reference block --
+          # not just at the next `## [`. Guarding only on `## [` lets a prose section such as
+          # `## Versioning and stability` fall through and drags the rest of the file into the
+          # release notes, which is exactly what an earlier draft of this step did.
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]"  { found = 1; next }
+            found && /^## /          { exit }
+            found && /^\[[^]]+\]: /  { exit }
+            found                    { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section"
+            exit 1
+          fi
+          cat RELEASE_NOTES.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/
+            RELEASE_NOTES.md
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC) rather than a stored `PYPI_API_TOKEN`: no long-lived credential
+    # in the repository to rotate or leak. Configure once at
+    # https://pypi.org/manage/account/publishing/ for this repository, this workflow filename
+    # and this environment name, before the first tag is pushed.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/triwarp
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: .
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: .
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: RELEASE_NOTES.md

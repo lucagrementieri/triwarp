@@ -17,6 +17,23 @@ required — every function also runs on Warp's CPU backend, same code, same res
 I/O via [meshio](https://github.com/nschloe/meshio) is an optional extra:
 `pip install triwarp[io]`.
 
+### Platform support
+
+triwarp ships as a pure-Python `py3-none-any` wheel; everything platform-specific lives in
+`warp-lang`, which brings its own compiled backend. What differs between the rows below is how
+much of it is *verified*, not how much of it is meant to work.
+
+| Platform | Status |
+|---|---|
+| **Linux + CUDA** | The developed and measured target. Every performance figure in these docs is this configuration, and the full test suite plus the eleven-library comparison suite run here on every release. |
+| **Linux, CPU only** | Fully supported and correctness-tested on every change, via Warp's CPU backend. Not performance-tuned: the CPU backend runs a launch grid far less parallel than a GPU does, and tuning decisions in triwarp are made on the CUDA measurement. |
+| **macOS** | Untested. `warp-lang` supports macOS on the CPU backend (there is no CUDA, and Metal is not a Warp backend), so triwarp is expected to work, but nothing verifies it. |
+| **Windows** | Untested. Same position as macOS: `warp-lang` supports it, triwarp is not checked against it. |
+
+The untested rows are a statement about coverage, not a warning — if triwarp works or fails for
+you on either, a short [issue](https://github.com/lucagrementieri/triwarp/issues) saying so is
+what would move them up the table.
+
 ## The five-minute mental model
 
 triwarp has no scene graph, no viewer, and no mandatory mesh object. A mesh is two

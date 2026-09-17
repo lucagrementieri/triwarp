@@ -93,6 +93,10 @@ Requires Python ≥ 3.11 and `warp-lang` ≥ 1.17. A CUDA-capable GPU is recomme
 required — every function also runs on Warp's CPU backend. Mesh file I/O via
 [meshio](https://github.com/nschloe/meshio) is an optional extra: `pip install triwarp[io]`.
 
+Tested on **Linux**, with and without CUDA. The wheel is pure Python and `warp-lang` supports
+macOS and Windows, so triwarp is expected to work there, but neither is verified — see
+[Platform support](https://lucagrementieri.github.io/triwarp/getting-started/#platform-support).
+
 ## Quickstart
 
 ```python
@@ -176,7 +180,8 @@ close, stray debris to drop — see the
 triwarp is pre-1.0 (`0.x`): the test suite is extensive (over 3,400 tests per device, an
 eleven-library parity gate with no uncovered pair) and the library is safe to build on, but a
 public signature may still shift a positional argument to a keyword or gain a required parameter
-between minor versions until 1.0.
+between minor versions until 1.0. Released versions are recorded in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Development
 
@@ -197,6 +202,10 @@ PyMeshLab, PyVista, MeshLib, PyMeshFix, PyTorch3D, SciPy, and more) so the compa
 in full.
 Benchmarks live in `benchmarks/` and use `pytest-benchmark`; PyTorch3D is the one reference with
 CUDA kernels of its own, so it is also the suite's only GPU-against-GPU comparison.
+
+Bug reports, reproductions and pull requests are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development loop, the bar a pull request has to clear,
+and where the internal engineering reference lives.
 
 ## Links
 

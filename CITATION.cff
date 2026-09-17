@@ -1,0 +1,33 @@
+# Machine-readable citation metadata. GitHub renders a "Cite this repository" button from this
+# file, and the BibTeX block in README.md is the same record by hand -- keep the two in step, and
+# bump `version` and `date-released` here as part of the release checklist.
+cff-version: 1.2.0
+message: "If triwarp is useful in your research, please cite it."
+type: software
+title: "triwarp: GPU-accelerated triangular mesh processing on NVIDIA Warp"
+abstract: >-
+  triwarp is a GPU-accelerated triangular mesh processing library built on NVIDIA Warp. It
+  provides geometry, topology, repair, remeshing, spatial queries, discrete differential
+  operators, geodesics, point-cloud reconstruction and registration as array-in / array-out
+  functions that keep data resident on the device, with a trimesh-inspired API and a regression
+  suite validating each function against established CPU reference implementations.
+authors:
+  - family-names: "Grementieri"
+    given-names: "Luca"
+    email: "luca.grementieri@ens-paris-saclay.fr"
+repository-code: "https://github.com/lucagrementieri/triwarp"
+url: "https://lucagrementieri.github.io/triwarp/"
+license:
+  - MIT
+  - Apache-2.0
+version: "0.1.0"
+date-released: "2026-09-17"
+keywords:
+  - mesh
+  - triangle-mesh
+  - geometry-processing
+  - computational-geometry
+  - gpu
+  - cuda
+  - warp
+  - 3d

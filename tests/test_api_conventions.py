@@ -687,6 +687,10 @@ def test_dir_lists_the_whole_surface_before_it_is_touched() -> None:
     Not a library comparison. Without the module ``__dir__``, a lazy package lists only what some
     earlier caller happened to touch, which is what makes one hard to explore interactively.
     Subprocessed for the same reason as the first test: in-process, everything is already resolved.
+
+    ``__version__`` is expected alongside ``__all__`` rather than inside it: it resolves through
+    the same lazy ``__getattr__`` and should be discoverable interactively, but it is not part of
+    the star-import surface, so ``__all__`` is the wrong place for it.
     """
     probe = textwrap.dedent(
         """
@@ -697,7 +701,7 @@ def test_dir_lists_the_whole_surface_before_it_is_touched() -> None:
     completed = subprocess.run(
         [sys.executable, "-c", probe], capture_output=True, text=True, check=True
     )
-    assert sorted(completed.stdout.split()) == sorted(tw.__all__)
+    assert sorted(completed.stdout.split()) == sorted([*tw.__all__, "__version__"])
 
 
 def test_single_index_tid_carries_the_declarative_cast() -> None:

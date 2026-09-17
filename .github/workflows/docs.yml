@@ -1,9 +1,13 @@
 name: docs
 
+# Release tags trigger a rebuild as well as pushes to `main`, so the published site is never one
+# commit behind a release when `main` has not moved since the last doc-affecting change.
 on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
 # Deployment goes through GitHub's native Pages pipeline rather than a force-push to a
 # `gh-pages` branch, so the repository's Pages source must be set to "GitHub Actions"

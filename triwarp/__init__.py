@@ -144,7 +144,7 @@ _LAZY_SUBMODULES = frozenset(__all__) - {"Trimesh"}
 
 def __getattr__(name: str) -> object:
     """
-    Resolve a submodule, or ``Trimesh``, on first access (:pep:`562`).
+    Resolve a submodule, ``Trimesh``, or ``__version__`` on first access (:pep:`562`).
 
     The result is cached in this module's namespace, so only the first access reaches here and
     every later ``triwarp.<name>`` is an ordinary attribute lookup.
@@ -157,16 +157,30 @@ def __getattr__(name: str) -> object:
     Returns
     -------
     object
-        The imported submodule, or the ``Trimesh`` class.
+        The imported submodule, the ``Trimesh`` class, or the installed version string.
 
     Raises
     ------
     AttributeError
-        If ``name`` is not a public submodule or ``Trimesh``. Raising this rather than letting an
-        ``ImportError`` escape is what keeps ``hasattr`` and ``getattr(..., default)`` working.
+        If ``name`` is not a public submodule, ``Trimesh`` or ``__version__``. Raising this rather
+        than letting an ``ImportError`` escape is what keeps ``hasattr`` and
+        ``getattr(..., default)`` working.
     """
-    if name == "Trimesh":
-        value: object = importlib.import_module("triwarp.mesh").Trimesh
+    if name == "__version__":
+        # Read from the installed distribution metadata rather than duplicated as a literal, so
+        # ``pyproject.toml``'s ``[project] version`` stays the single source of truth. Resolved
+        # here rather than at module scope for the same reason everything else is: an eager
+        # ``importlib.metadata`` import costs every caller who never asks for the version.
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            value: object = version("triwarp")
+        except PackageNotFoundError:
+            # Running from a source tree that was never installed. A sentinel is friendlier than
+            # an exception from an attribute every packaging tool probes.
+            value = "0.0.0+unknown"
+    elif name == "Trimesh":
+        value = importlib.import_module("triwarp.mesh").Trimesh
     elif name in _LAZY_SUBMODULES:
         value = importlib.import_module(f"triwarp.{name}")
     else:
@@ -185,6 +199,9 @@ def __dir__() -> list[str]:
     Returns
     -------
     list of str
-        Every name in ``__all__``, sorted.
+        Every name in ``__all__``, plus ``__version__``, sorted.
     """
-    return sorted(__all__)
+    # ``__version__`` is named here rather than added to ``__all__``: it is resolvable through
+    # ``__getattr__`` and should be discoverable interactively, but it is not part of the
+    # star-import surface.
+    return sorted([*__all__, "__version__"])

@@ -1,0 +1,178 @@
+name: test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+# A superseded run on the same branch is cancelled; `main` is exempt so a push that triggers a
+# release is never half-verified.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The four cheap gates. These mirror `.claude/CLAUDE.md` section 8's local "done" list exactly,
+  # so a green CI means the same thing a green local run does. They are separate jobs rather
+  # than steps of one so a formatting failure still reports the type-check result.
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv python install
+      # `dev` carries ruff; nothing else is imported to lint.
+      - run: uv sync --group dev
+      - name: ruff format
+        run: uv run ruff format --check triwarp tests benchmarks
+      - name: ruff check
+        run: uv run ruff check triwarp tests benchmarks
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv python install
+      # `--extra io` is load-bearing, not tidiness: `triwarp/io.py` imports `meshio` under
+      # `if TYPE_CHECKING:`, which basedpyright resolves even though the runtime import is lazy.
+      # Without it the gate reports a spurious `reportMissingImports` and fails green-looking
+      # code -- the failure mode section 8 already warns about for a dev-only environment.
+      - run: uv sync --group dev --extra io
+      # basedpyright reads `venv = ".venv"` / `venvPath = "."` from pyproject.toml, which is
+      # where `uv sync` puts the environment, so no interpreter flag is needed here.
+      - name: basedpyright
+        run: uv run basedpyright
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --group docs
+      # Zensical has no `gen-files` equivalent and ignores an unsupported plugin entry silently,
+      # so this step is what puts `docs/api/` and `docs/SUMMARY.md` on disk. Skipping it builds a
+      # site with no API reference at all, which only `--strict` reports -- as one unresolved
+      # cross-reference per API symbol.
+      - name: Generate API reference pages
+        run: uv run python docs/gen_ref_pages.py
+      # The mechanical backstop for the five artifacts a moved or renamed public function has to
+      # take with it (section 4.4): `--strict` exits 1 on a dangling `[name][triwarp.old.path]`.
+      - name: Build docs
+        run: uv run zensical build --strict
+
+  # ---------------------------------------------------------------------------
+  # The packaging gate, across every Python the classifiers claim.
+  #
+  # This is the one thing a `uv sync --all-groups` environment never exercises: an end user
+  # installs a wheel into a bare interpreter with no CUDA, no reference libraries and no dev
+  # tooling. `import triwarp` has been found to regress in exactly that configuration before
+  # (section 16.2 -- the lazy `__init__` guard runs `import triwarp` in a subprocess for the
+  # same reason), so it is checked on every push rather than only at release time.
+  # ---------------------------------------------------------------------------
+  wheel:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Build the wheel and sdist
+        run: uv build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install the wheel into a bare interpreter
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --upgrade pip
+          /tmp/smoke/bin/pip install dist/*.whl
+      # No CUDA on a GitHub runner, so this is the CPU backend by construction. The assertions
+      # are deliberately minimal -- one allocation, one kernel launch, one derived quantity --
+      # because the real regression suite is the `pytest-cpu` job below; this one is about the
+      # wheel, not the geometry.
+      - name: Smoke-test the installed wheel
+        run: |
+          /tmp/smoke/bin/python -c "
+          import triwarp as tw
+          # Reads the installed distribution metadata, so it can only be checked from a real
+          # install -- in a source tree it falls back to a sentinel.
+          assert tw.__version__ != '0.0.0+unknown', tw.__version__
+          vertices, faces = tw.creation.icosphere(subdivisions=2)
+          assert faces.shape[0] == 960, faces.shape
+          mesh = tw.Trimesh(vertices, faces)
+          assert mesh.is_watertight
+          assert mesh.euler_characteristic == 2
+          print('ok: triwarp', tw.__version__, '--', vertices.shape[0], 'vertices on', vertices.device)
+          "
+      - name: Check py.typed shipped
+        run: unzip -l dist/*.whl | grep -q 'triwarp/py.typed'
+
+  # ---------------------------------------------------------------------------
+  # The CPU regression suite.
+  #
+  # Runs on 3.11 alone, not the full classifier matrix: the reference stack this needs is nine
+  # libraries deep and includes pytorch3d compiled from source, so a three-way matrix pays that
+  # build three times to re-run device-independent geometry assertions. Per-interpreter coverage
+  # is the `wheel` job above; this job is about the library's answers, which do not vary by
+  # Python version.
+  #
+  # This does NOT replace the GPU-side discipline in section 7.2 -- the two-process
+  # `python -m tests.devices` runner and the full nine-reference parity suite still run on the
+  # maintainer's CUDA box before a tag (see `.github/RELEASING.md`). CI's job is to catch a
+  # CPU-only regression on every PR.
+  # ---------------------------------------------------------------------------
+  pytest-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The reference stack is large (a CUDA torch wheel, Open3D, PyMeshLab, MeshLib) and the
+      # runner image ships ~14 GB of tooling this job never touches.
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv python install
+
+      # The documented two-step install, and both steps are required. pytorch3d's `setup.py`
+      # imports torch at build time to locate its headers and pick the CPU or CUDA extension, so
+      # it is built with `no-build-isolation` and torch has to already be present. uv keys the
+      # built wheel on the resolved git commit, so a warm `~/.cache/uv` makes the second step
+      # near-instant and the ~90 s compile is paid once per pin bump.
+      #
+      # No CUDA toolkit is installed here, so pytorch3d builds its CPU-only extension. That is
+      # correct for this job: `benchmarks/conftest.py` gates the `pytorch3d-cuda` row on actually
+      # launching a kernel, and the CPU rows are what a CPU test run compares against anyway.
+      - name: Install dependencies (torch first, then build pytorch3d against it)
+        run: |
+          uv sync --all-groups --no-install-package pytorch3d
+          uv sync --all-groups
+
+      # `--device=cpu` rather than `--device=both`: there is no CUDA here, so `both` would only
+      # add the `slow_cpu`-marked tests, which are ~280 s of screened-Poisson solves whose claim
+      # is device-independent and already covered on the maintainer's box.
+      - name: pytest (CPU device)
+        run: uv run pytest --device=cpu -q
