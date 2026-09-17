@@ -44,6 +44,19 @@ uv run basedpyright                            # 0 errors expected
 uv run pytest                                  # one device
 ```
 
+CI additionally measures coverage on its CPU run and fails below a floor, so if you are adding or
+moving code in the wrapper layer, check it the way CI will:
+
+```bash
+uv run pytest --device=cpu --cov=triwarp --cov-report=term
+```
+
+The measurement covers `triwarp/*.py` and deliberately not `triwarp/kernels/`. A `@wp.kernel`
+body is compiled from its AST rather than called, so coverage.py records every line of it as
+unexecuted no matter how often the kernel runs — including it would report a number that means
+nothing. New wrapper code therefore needs its Python-visible branches exercised: the argument
+validation, the `Literal` menu arms, the empty-input early returns.
+
 Two more that need a CUDA machine and are the maintainer's release gate rather than a per-PR
 requirement — run them if you have the hardware:
 

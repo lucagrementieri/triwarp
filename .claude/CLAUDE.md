@@ -2964,6 +2964,33 @@ the gates (§8, §12.10), and commit when asked, not on your own initiative. And
 discipline that depends on a clean tree is unaffected — an A/B against a prior revision uses a
 **detached worktree**, never `git stash` and never a branch checkout in the live tree (§15.6).
 
+### Coverage — `pytest --cov`, and `kernels/` is omitted on purpose
+
+`pytest-cov` is in the `test` group and configured in `pyproject.toml`'s `[tool.coverage.run]`.
+CI's CPU job measures it, publishes the figure to a Gist that shields.io renders as the README
+badge, and *then* enforces the floor — in that order, deliberately, because gating first would
+abort a regressing `main` build before the badge updated and freeze it at the last good number.
+Three things about it that are decisions rather than defaults:
+
+- **`triwarp/kernels/` is omitted, and this is measured, not tidiness.** A `@wp.kernel` /
+  `@wp.func` body is never *called* as Python, so coverage.py reports a kernel that runs on every
+  test as entirely unexecuted — the numbers are §12.6. Never "fix" a low kernel-module figure by
+  writing tests at it; the same module tree basedpyright and `docs/gen_ref_pages.py` already
+  exclude, for the adjacent reason.
+- **The badge is the CPU wrapper layer.** No GPU on a runner, so every `device.is_cuda` branch and
+  everything behind `_device.prefers_tiled_reduction` is unreachable there. Do **not** raise the
+  floor to chase those lines — they are §7.2's two-process `tests.devices` job.
+- **There is no `exclude_also`, and the two obvious candidates were tried and refuted.** All 88
+  `@overload` stubs write `...` on the `def` line — which *does* execute at import — and there is
+  not one bare `...` line under `triwarp/`; and coverage.py 7.16 already excludes an
+  `if TYPE_CHECKING:` block by itself (`analysis2` reports 2 excluded lines in `triwarp/io.py`
+  under an empty config). Both patterns moved the statement count by exactly **0**. A pattern that
+  matches nothing is worse than none, because it reads as a caveat someone has already handled —
+  verify an exclusion by diffing the statement count, not by reading the regex.
+
+Coverage is a gate on the *wrapper* layer's branches — validation, `Literal` menus (§4.2), empty
+input early returns. It says nothing about whether a comparison is vacuous, which is §7.4's job.
+
 ---
 
 ## 9. Performance work: measure before you change
@@ -3448,6 +3475,33 @@ Rules: §1.3, §1.5, §1.6.
 - **`wp.config.verbose = True` is deprecated in Warp 1.17** — it prints a deprecation notice to
   stderr, which is noise in exactly the output you are grepping. Use
   `wp.config.log_level = wp.LOG_DEBUG`; the log lines themselves are unchanged.
+- **coverage.py cannot see a kernel body, so `triwarp/kernels/` is omitted from the coverage
+  measurement.** Same root cause as the import-cost bullet above: `@wp.kernel` / `@wp.func` parse
+  the function's AST and codegen C++, and the Python function object is never called, so the
+  tracer records a kernel that runs on every test as entirely unexecuted. Measured on
+  `tests/test_edges.py` (53 tests, CPU device): the wrapper `triwarp/edges.py` reports **96 %**
+  against `triwarp/kernels/edges.py`'s **35 %**, and the missing ranges are exactly the
+  `@wp.func` and `@wp.kernel` bodies — `_write_edge`'s lines 11-16, `faces_to_edges`' 24-31 —
+  every one of which ran on all 53. The figure is not a pessimistic reading of kernel testing, it
+  is unrelated to it. Tree-wide over the whole CPU suite (3 397 passed, 28 skipped, Warp 1.17), in
+  *line* coverage so the two halves compare directly: the wrapper layer is **96.02 %**
+  (10 949 / 11 403 statements) against `kernels/`'s **24.29 %** (2 890 / 11 896), so *including*
+  kernels would publish **59.40 %** — a number that measures nothing and would invite exactly the
+  wrong work. With branch coverage on, which is what ships, the wrapper layer reads **93.79 %**
+  and that is the figure CI's `coverage report --fail-under=90` gates — a deliberately loose
+  floor, ~3.8 points of slack, set as a regression alarm rather than a target. The gate is a
+  *separate step after* the badge publish, so a regression on `main` still moves the badge before
+  it fails the build; gating inside the pytest step would freeze the badge at the last good
+  number.
+- **A second coverage artifact, from the same root cause one level out: `wp.map` leaves
+  unparseable filenames.** `warp._src.utils.map` builds its generated kernel with `exec` and names
+  the module after the *call site* — `warp/_src/context.py` spells it `f"{basename}:{lineno}"` —
+  so a code object turns up whose filename is `triwarp/points.py:153`. coverage.py tries to read
+  that as a path and emits one `couldnt-parse` warning per generated module: **72** over a full
+  suite run, contributing no lines to the report. Omitting `*.py:*` removes all 72 and changes no
+  count (11 403 / 454 / 3 320 either way), since no real source file has a colon in its name. It
+  only reproduces on a *whole-suite* run — three single-file runs produced zero — so do not try to
+  reproduce it on one test module. Configured in `pyproject.toml`; the rule is §8.
 - **`wp.constant(x)` is `return x` after an `is_value(x)` check — on Warp 1.17 it is an identity
   function, not a declaration.** A bare module-level global with no `wp.constant()` and no typed
   constructor compiles and runs correctly from kernel scope on both devices, because Warp's codegen

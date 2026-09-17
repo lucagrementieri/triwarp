@@ -13,6 +13,14 @@ wheels/
 .pytest_cache/
 .ruff_cache/
 
+# Coverage artifacts. `.coverage` is the local data file and `coverage.xml` is what the CI job
+# hands to Codecov; both are written into the repo root by a `pytest --cov` run.
+.coverage
+.coverage.*
+coverage.json
+coverage.xml
+htmlcov/
+
 # Virtual environments
 .venv
 

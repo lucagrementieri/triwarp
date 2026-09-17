@@ -174,5 +174,86 @@ jobs:
       # `--device=cpu` rather than `--device=both`: there is no CUDA here, so `both` would only
       # add the `slow_cpu`-marked tests, which are ~280 s of screened-Poisson solves whose claim
       # is device-independent and already covered on the maintainer's box.
-      - name: pytest (CPU device)
-        run: uv run pytest --device=cpu -q
+      #
+      # Coverage rides along on this one run rather than getting a job of its own -- the suite is
+      # the expensive part and instrumenting it costs a few percent, where a second job would pay
+      # for the whole nine-library reference install again.
+      #
+      # Two things this number is not, both worth knowing before reading the badge:
+      #
+      #   * It is not kernel coverage. `triwarp/kernels/` is omitted in `pyproject.toml`'s
+      #     `[tool.coverage.run]`, because a `@wp.kernel` body executes on the device and never
+      #     under coverage.py's tracer -- measured at 35 % for a kernel module whose every line
+      #     ran on all 53 of its tests. The gate is over the Python wrapper layer, which is where
+      #     the dispatch, validation and shape logic actually lives.
+      #   * It is not CUDA coverage. There is no GPU on a runner, so every `device.is_cuda`
+      #     branch and the tiled-reduction paths behind `_device.prefers_tiled_reduction` are
+      #     unreachable here. Those are covered by the maintainer's two-process
+      #     `python -m tests.devices` run before a tag (see `.github/RELEASING.md`).
+      #
+      # Coverage is reported here but NOT gated here -- the floor is a separate step below, after
+      # the badge has been published. Ordering matters: if the threshold failed this step, a real
+      # coverage regression on `main` would abort before the badge updated, leaving it frozen at
+      # the last good number. A badge that silently stops moving is worse than one showing a drop.
+      - name: pytest (CPU device, with coverage)
+        run: >
+          uv run pytest --device=cpu -q
+          --cov=triwarp
+          --cov-report=term
+          --cov-report=json
+
+      # `percent_covered_display` already honours `precision = 2` from pyproject.toml, so the
+      # badge reads the same figure the terminal report printed.
+      - name: Read the coverage percentage
+        id: coverage
+        run: |
+          set -euo pipefail
+          pct=$(uv run python -c "
+          import json
+          print(json.load(open('coverage.json'))['totals']['percent_covered_display'])
+          ")
+          # An empty value here would publish a blank badge rather than fail, so refuse it.
+          test -n "$pct"
+          echo "percent=$pct" >> "$GITHUB_OUTPUT"
+          echo "Total coverage: $pct%"
+
+      # The badge, written to a Gist that shields.io renders through its `endpoint` API. Free, and
+      # nothing leaves GitHub.
+      #
+      # Setup, once: create a secret Gist containing a file named `triwarp-coverage.json` (any
+      # placeholder content), put its id in `gistID` below, then create a personal access token
+      # with the single `gist` scope and add it as the `GIST_TOKEN` repository secret.
+      #
+      # `main` pushes only. A pull request must not move the published badge -- it reports the
+      # branch, not the shipped state -- and a fork PR cannot read the secret anyway, so without
+      # this condition every outside contribution would fail the job on a missing token.
+      #
+      # The colour is interpolated across `minColorRange`..`maxColorRange`; the window is set
+      # around the real measurement rather than 0..100, or every plausible result paints the same
+      # green and the colour carries no information.
+      - name: Publish the coverage badge
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: schneegans/dynamic-badges-action@v1.7.0
+        with:
+          auth: ${{ secrets.GIST_TOKEN }}
+          gistID: 208b2ea8a3b764ca7c10d82195533738
+          filename: triwarp-coverage.json
+          label: coverage
+          message: ${{ steps.coverage.outputs.percent }}%
+          valColorRange: ${{ steps.coverage.outputs.percent }}
+          minColorRange: 88
+          maxColorRange: 97
+
+      # The gate, and the last thing in the job so the badge is already published when it fires.
+      #
+      # It is a ratchet, not a target: the measured figure on this configuration is **93.79 %** --
+      # 11 403 statements with 454 missed and 3 320 branch exits with 460 missed, over 3 397
+      # passed / 28 skipped -- so a floor of 90 leaves 3.79 points, roughly 558 statements, of
+      # slack. Deliberately loose, because a gate that trips on an honest work-in-progress module
+      # is a gate someone switches off. Raise it when the headroom gets wide; do not lower it
+      # without saying why in the commit.
+      #
+      # `coverage report` re-reads the `.coverage` pytest-cov just wrote and the same
+      # `[tool.coverage.report]` settings, so this cannot disagree with the number above.
+      - name: Enforce the coverage floor
+        run: uv run coverage report --fail-under=90

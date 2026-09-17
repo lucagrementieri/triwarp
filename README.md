@@ -6,6 +6,7 @@
 [![PyPI](https://img.shields.io/pypi/v/triwarp)](https://pypi.org/project/triwarp/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://pypi.org/project/triwarp/)
 [![Docs](https://img.shields.io/badge/docs-lucagrementieri.github.io%2Ftriwarp-blue)](https://lucagrementieri.github.io/triwarp/)
+[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/lucagrementieri/208b2ea8a3b764ca7c10d82195533738/raw/triwarp-coverage.json)](#development)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
 [![Status](https://img.shields.io/badge/status-alpha-orange)](#status)
 
@@ -195,7 +196,16 @@ uv run ruff format triwarp tests && uv run ruff check triwarp tests
 uv run basedpyright             # type checking (0 errors expected)
 
 uv run python docs/gen_ref_pages.py && uv run zensical serve   # preview the docs locally
+
+uv run pytest --device=cpu --cov=triwarp        # coverage, the way CI measures it
 ```
+
+The coverage badge measures the Python wrapper layer on the CPU backend, which is what CI can
+run, and is refreshed by the `main` build. It deliberately excludes `triwarp/kernels/`: a
+`@wp.kernel` body is compiled from its AST and executed on the device, never called as Python, so
+coverage.py reports every line of a constantly-running kernel as unexecuted. Device-side behaviour
+is covered instead by running the suite on both backends (`uv run python -m tests.devices`), which
+is a two-process job and needs a GPU.
 
 The test environment installs the reference stack (trimesh, libigl, Open3D, potpourri3d,
 PyMeshLab, PyVista, MeshLib, PyMeshFix, PyTorch3D, SciPy, and more) so the comparison suite runs
