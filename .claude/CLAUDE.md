@@ -3825,6 +3825,16 @@ Two details decide whether it pays, and the first is most of it:
 **`split(copy=True)` is not reachable this way** and keeps its 15.06 µs per segment: its outputs are
 `n_segments` *separate arrays*, so the allocations are the return value.
 
+**Re-proposed and declined again, with the split measured**: at 256 segments over 2 614 242
+elements `copy=True` is 4.305 ms against `copy=False`'s 0.903, so the clone residue is **13.29 µs
+a segment** — the row above, confirmed. The segmented-copy kernel *could* fill one buffer and hand
+back 256 views of it, but `split`'s own comment already settles why it does not: a shared
+allocation means holding one segment pins the whole buffer, **the opposite of what `copy=True`
+promises**, and `copy=False` already exists for a caller who wants views. Adding it as a third
+`copy=` mode instead has no in-repo caller (§4.2) and would not move the benchmark row, which
+calls `copy=True`. So this is a *contract* floor, not a cost one — and the general lesson is
+§15.5's: the refutation was written at the site the item proposed changing.
+
 Several alternate spellings were probed and rejected as real losses (a raw-pointer `wp.array` view
 that re-implements `wp.array.__getitem__`'s contract, a shared output buffer for `split(copy=True)`
 that drops half of what the copy promises, dropping `src_offset=`/`count=`, and others) — all written
@@ -4317,6 +4327,13 @@ not insensitivity** (§16.4).
   a per-level dispatch cost only matters if the level body actually runs** — `graph.bfs` already
   hands off to the cheap serial path once the frontier stops growing, so on a graph shaped like that,
   "fuse the level's kernels" is a no-op fix for a stage that never executes.
+    - **That has a number now, and it is worth quoting because `bfs[ribbon_long]` is the suite's
+      largest single loss row and keeps attracting level-loop proposals.** Instrumented at the
+      handoff: on `ribbon_long` (40 962 nodes, depth 20 480) the parallel level loop runs **3
+      levels and emits 6 nodes — 0.0 %**; the other 40 956 are the serial drain, which is ~95 % of
+      that row's 23 ms and is one thread by design. Nothing done to the level loop can move it.
+      For contrast the loop *does* run on blob-shaped graphs — `sphere_med` 187 levels / 99.8 %,
+      `handles_64` 143 levels / 100 % — and those calls are 3.5 ms total.
 - **A persistent one-block-per-loop tiled kernel for the Liepa hole-fill DP.** Built, byte-identical,
   and it loses at every rim size tried, worse as the rim grows — the DP's total work outgrows what
   one SM can do serially long before the existing many-small-launches design's launch overhead
@@ -5424,6 +5441,37 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   two of its three reductions ran over one pass's outputs, and the `wp.map` that built a mask
   purely to be counted went with them.
 
+- **SHIPPED — `_revolve_regular`'s screen is vectorized and capped at a 2 048-point profile,
+  closing a 0.65-0.74x regression at `uv_sphere[sections=2048 / 4096]`.** The closed-form
+  revolution path (the "annulus 2.12x / torus 1.99x / uv_sphere 1.93x" entry above) was validated
+  at 32 and 512 sections and is a **loss** above them — that entry's own documented failure mode
+  arriving at the third point on the axis.
+  - **The screen, not the kernel, was the whole cost.** `wp.timing_begin` shows both arms running
+    the *same* two kernels for the same device time at `sections=4096` — so the fast path was
+    **declining**, and the screen's `O(P)` work was pure overhead on top of the general engine. It
+    declines correctly: at a fine profile revolved into many sections the polar triangles fall
+    under `revolve`'s absolute `TOLERANCE_MERGE` area test, so more of them drop than the regular
+    layout expects. That is the "geometry small enough for the absolute area tolerance to bite"
+    case the helper's docstring already names, and the large-`P` regime is where it lives.
+  - **Vectorizing the screen moved the crossover 4x and is a strict win.** It built its expected
+    template as a Python `set` over `n_segments` and compared sets; both sides are now
+    `np.flatnonzero` masks compared with `np.array_equal`. Measured on regular profiles, fast
+    against general: P = 2 049 went **0.87x → 1.22x** and P = 4 097 **0.70x → 1.10x**, with
+    P <= 1 025 unchanged at 1.25-1.53x.
+  - **The cap is a bet, and the asymmetry sets it.** The win when the screen succeeds is a flat
+    ~0.15 ms (the general engine's layout tables, three uploads and second launch); the loss when
+    it declines is the screen itself, which grows: 0.164 / 0.182 / 0.220 / 0.299 / 0.353 / 0.678 /
+    1.337 ms at P = 64 / 256 / 512 / 1 024 / 2 048 / 4 096 / 8 192. At 2 048 the downside is
+    ~2.4x the upside and the path still measures 1.19-1.22x; at 4 096 it is ~4.5x and every shape
+    probed declined. `_REVOLVE_REGULAR_MAX_PROFILE = 2048`.
+  - Result: `uv_sphere[sections=2048]` **0.65x → 1.04x** and `[4096]` **0.74x → 1.00x**, while
+    `torus` / `capsule` / `annulus` / `uv_sphere` at P <= 2 048 keep 1.26-1.52x. Gate: vertices and
+    faces byte-identical against the general engine at every point of the sweep.
+  - **The residual duplication is recorded rather than fixed.** On a decline the template is
+    computed twice — once by the screen, once by `revolve` — ~1.15 ms at P = 8 192. Removing it
+    needs the template threaded through `revolve`, whose signature is public and may not name an
+    `np.ndarray` (§3.8); the cap makes it moot below 2 048 and it is not worth a public-signature
+    change above.
 - **SHIPPED — `creation.sphere_cap` is a kernel: flat at ~52 µs against a quadratic host loop.**
   The last template still assembled on the host, and the one §3.8's exception covers — a closed-form
   parallel map with no sequential dependence. Measured 71 / 216 / 784 / 1 771 / 4 531 / 12 702 µs at
@@ -5782,6 +5830,101 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
 
 ### 16.8 `linalg`, `smoothing`, `laplacian`
 
+- **REMOVED — batching several CG iterations per conditional-graph test (`CG_ITERATIONS_PER_CHECK
+  = 4`), shipped and then retired.** `wp.capture_while` evaluates its condition on device at
+  ~4-6 µs against ~1.2 µs for a replayed launch, so driving a *run* of iterations per test
+  amortizes that. The cost is overshoot: up to `K - 1` iterations run past the point the residual
+  crossed, and that is a **fixed** number of launches whose *share* is set by how long the solve
+  is. Long solves therefore win a little and short ones lose a lot.
+
+  | cell | K=2 | K=4 (shipped) | K=8 |
+  |---|---|---|---|
+  | `heat_geodesic[sphere_small / med / saddle_graded]` | 1.00x | 0.97-1.00x | 0.98-1.00x |
+  | `harmonic[saddle_small]` | 1.05x | 1.00x | 0.93x |
+  | `harmonic[saddle]` | 1.05x | 1.04x | 0.98x |
+  | `harmonic[saddle_graded]` | 1.10x | **1.13x** | 1.12x |
+  | `spd_column_solver_amortized[saddle x50]` | 0.83x | **0.60x** | 0.38x |
+  | `arap[hemisphere iterations=10]` | 0.90x | 0.72x | 0.51x |
+  | `filter_laplacian_integration[saddle implicit]` | 0.87x | 0.67x | 0.47x |
+  | **geomean over all ten cells** | **0.981** | **0.903** | **0.789** |
+
+  End to end against a detached baseline worktree, `spd_column_solver_amortized[saddle x50]`
+  **64.6 → 39.0 ms (1.66x)**, `arap[hemisphere]` **17.1 → 12.3 (1.38x)**,
+  `filter_laplacian_integration[saddle implicit]` **15.9 → 10.8 (1.47x)**, against
+  `harmonic[saddle_graded]` 41.7 → 46.1 (0.90x) and `spd_amortized[saddle once]` 0.92x. So K=1 is
+  the best value on every summary statistic, and it is the same removal argument block CG got:
+  best case +13 % on one cell, worst case −40 % on three.
+    - **The sweep that justified K=4 could not express the failure mode, and that is the lesson.**
+      It measured `heat_geodesic` and `harmonic` only — and **three of those six cells never reach
+      the captured loop at all**, their launch count reading 58 at every K, so half the set was
+      structurally unable to respond to the knob. None of the remaining three is a *short* solve.
+      This is §9's fixture-pair rule one level out: a tuning constant swept over cells that cannot
+      respond is swept over nothing, and the cheap check is to **read the launch count beside the
+      ratio** — a cell whose launch count does not move under the knob is not evidence about it.
+    - **The three losing cells are short by construction.** `x50` re-solves the same right-hand
+      side, so calls 2..50 are already converged and every batched iteration past the first is a
+      pure no-op (`cg_step_p` and `cg_step_x_r_z` pin a converged column's `beta` / `alpha` to
+      zero); both other rows warm-start an inner solve. A fixed overshoot is a large fraction of a
+      short solve and a rounding error on a long one — so **the axis is the solve's own length**,
+      which nothing cheap knows in advance, which is why this is a removal and not a gate.
+    - **It also exonerates block CG.** Three CG cells regressed together in the round that shipped
+      both changes, and the measured K=4 ratios (0.60x / 0.72x / 0.67x) reproduce the reported
+      regressions (0.60x / 0.78x / 0.73x) exactly. `_BlockCg2`'s retirement owns none of it.
+    - The `maxiter` clamp in `cg_step_p` now never fires and is kept anyway: it costs a `wp.min`
+      and any scheme that reintroduces a run of iterations per test brings the overshoot back.
+- **SHIPPED — `filter_mut_dif_laplacian`'s volume constraint runs on the device too, 1.32-1.67x
+  and growing with the iteration count.** The sibling `filter_laplacian` conversion below had left
+  this one alone: its pass loop still called `measures.volume` — a reduction ending in a host
+  readback — and formed `slope * (vol_ini - vol)` in Python. `kernels/smoothing.mut_dif_volume_slope`
+  calibrates the finite-difference slope on device and `mut_dif_volume_correct` applies the
+  offset, so the loop issues no host synchronisation at all.
+  - **Readbacks are the deterministic half and settle it without a clock** (§15.6): 4 / 13 / 33 at
+    1 / 10 / 30 iterations → **1 / 1 / 1**, flat. The one that remains is `eps`, computed once
+    before the loop.
+  - Measured against a detached baseline worktree, min of 9, `icosphere(3)` / `icosphere(5)`:
+    1.33x / 1.32x at 3 iterations, 1.54x / 1.39x at 10, **1.66x / 1.67x at 30**.
+  - **Unlike `rescale_to_volume` the correction kernel writes unconditionally, because the host
+    version it replaces did.** At a zero slope the host applied an offset of exactly zero rather
+    than skipping, and `v + 0 * N` is the same value for every finite `N` — so matching the host
+    here means *not* adding the `return` that the rescale needed. The skip-versus-identity
+    question has to be answered from the code being replaced, not from the sibling.
+  - The three volumes are summed by `wp.utils.array_sum` — deliberately the *same* reduction, not
+    `measures.volume`'s tiled one — because the correction is a difference of two nearly equal
+    volumes and mixing two summation orders would surface there magnified. Against the previous
+    implementation the output moves by **4.2e-17 at unit scale**.
+  - The run both constraints share is now `smoothing._accumulate_signed_volume`.
+- **DECLINED — capturing the multigrid MIS loop to drop its per-round readback. The ceiling is
+  ~0.49 ms.** `_multigrid_aggregate`'s loop runs four launches and one `read_scalar(undecided)` per
+  round and breaks early; measured, it takes **10 rounds** and the whole aggregation is
+  **4.2-5.6 ms, 17-24 % of the preconditioner build** and nearly flat in the matrix size
+  (2.46 ms at n = 40 962 against 1.73 at n = 3 922), which is the host-bound signature. But the
+  census is **46 launches and 11 readbacks per build**, so replaying them at §13.1's 1.17 µs
+  instead of 11.8 caps the saving at **0.49 ms — 2.0-2.1 % of a 24 ms build**, and the build is
+  itself a fraction of `smooth_region[bunny]`'s 73.8 ms. Against a medium rewrite with a
+  documented reverted precedent (§12.2's `shortest_path_envelope`) and a device-infinite-loop
+  hazard where the 32-round cap is today a host `range`.
+    - **The blocker does have a clean fix, recorded so the next reader need not re-derive it**:
+      the odd `state` ping-pong is removable outright, because `mis_decide` reads only `state[i]`
+      — never a neighbour's — so it can write in place. The two `mis_propagate` swaps are an even
+      number and are already replay-safe.
+    - **Two shortcut probes for this both produced garbage, one silently, and the silent one is
+      the warning.** Monkeypatching `read_scalar` across the whole build to "remove the readbacks"
+      reported a **71 %** saving: it was also faking `n_aggregates`, building a degenerate
+      hierarchy that was cheap because it was wrong. Narrowing the patch to
+      `_multigrid_aggregate` then produced `CUDA error 700`, because that same readback lives
+      *inside* it. §15.8 exactly — and the first version never raised. **A probe that fakes a
+      readback is faking every readback that reaches it; gate it on a deterministic property of
+      the result** (here the per-level `n_aggregates`) before reading its clock.
+- **KEPT, with the number — `smoothing.inflate`'s inherited volume constraint costs 1.90-1.96x and
+  is load-bearing, not incidental.** Each step ends in `filter_laplacian(..., iterations=1)`, whose
+  `volume_constraint` defaults to `True`, so an inflate pass pays a full volume pass nobody asked
+  for. Measured: `inflate(pressure=0.05, iterations=10)` is 6.80 against 3.47 ms on `sphere_med`
+  and 6.52 against 3.44 on `hemisphere`. **It stays** because the constraint restores the volume
+  the *smoothing half-step* removed — without it the net inflation is less than `pressure` asks
+  for, so removing it changes what the parameter means rather than only what it costs (positions
+  move 0.0011-0.0090 at a scale of 1.28). Exposing it as a keyword was considered and declined
+  under §4.2: no in-repo caller wants it off.
+
 - **SHIPPED — `filter_laplacian`'s volume constraint no longer reads the volume back, 1.20-1.68x
   and growing with the iteration count.** `_apply_volume_constraint` ran
   `tw.measures.volume(...)` — a reduction that ends in a host readback — then formed
@@ -5842,15 +5985,11 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
     them to the ragged-tail hazard `cg_dot_partials` documents at length (a 129-entry tail cost
     11.03 µs against a 9-entry tail's 2.32, which alone turned a 1.5x win into a 0.82x loss at
     nearly the same size). Not worth one launch of six.
-  - **`wp.capture_while` drives a *run* of iterations, not one** (`CG_ITERATIONS_PER_CHECK = 4`).
-    The conditional-graph evaluation costs ~4-6 µs against a replayed launch's ~1.2, and the
-    iterations that run past convergence are no-ops by construction — `cg_step_p` and
-    `cg_step_x_r_z` pin a converged column's `beta` / `alpha` to exactly zero. Swept 1/2/4/8,
-    reproduced twice: geomean **1.028x** at K=4, best cell `harmonic[saddle_graded]` **1.11x**,
-    worst `harmonic[saddle_small]` 0.98x, and K=8 a real 0.90x loss on short solves. **It is not
-    the 1.38x the same batching is worth on `graph.bfs`** (§16.9) — a CG iteration is six or seven
-    launches where a BFS level is four, so the conditional evaluation is a smaller share of it.
-    `maxiter` is clamped inside `cg_step_p` so the reported count stays exact despite the overshoot.
+  - **`wp.capture_while` drives one iteration per test.** Driving a *run* of them was shipped as
+    `CG_ITERATIONS_PER_CHECK = 4` and has since been **removed** — the table and the reason are at
+    the top of this section. Short version: the overshoot is a fixed number of launches, so its
+    share is set by the solve's length, and the original sweep's cells were all long solves or
+    could not respond to the knob at all.
 - **SHIPPED — every explicit smoothing filter applies the averaging operator in the thread that
   consumes its row, one launch per pass instead of two.** `filter_laplacian` (explicit),
   `filter_taubin`, `filter_neighborhood_average`, `filter_humphrey`, `filter_mut_dif_laplacian`,
@@ -6031,9 +6170,22 @@ and launch elimination will not touch it:
   `bfs_scan_and_advance` 2.9, the last at `dim=1`). Capture is already worth **3.7-5.0x** there
   (3.53 ms against 13.3 uncaptured), and `wp.capture_while`'s own per-iteration overhead is only
   ~4-6 µs against a captured fixed chain's 1.0-2.1 (measured on a 142-iteration synthetic; batching
-  K bodies per conditional check is worth at most 1.38x there, best at K = 4, and nothing here).
+  K bodies per conditional check was worth at most 1.38x there, best at K = 4).
   **So the level loop is real work and the only lever is fewer levels or fewer kernels per level**,
-  which is §14.9's standing conclusion. The primal tree cannot take the dual side's Boruvka
+  which is §14.9's standing conclusion.
+
+  **SHIPPED since, at K = 2 (`graph._BFS_LEVELS_PER_CHECK`), and the real-graph win is much
+  smaller than the synthetic's 1.38x.** Measured interleaved in one process, min of 11, `order`
+  and `distances` byte-identical at K = 1 / 2 / 4 / 8: `sphere_med` **1.069x**, `handles_64`
+  **1.044x** (this row's own fixture), `handles_1` 1.030x, `sphere_small` 0.999x, `ribbon_long`
+  0.996x. K = 4 costs 0.91x on `sphere_small` and K = 8 costs 0.71x, so K = 2 is the value that
+  loses nowhere — the same short-run asymmetry that *removed* the equivalent batching from CG
+  (§16.8), except milder here, because a BFS level past the stopping point still does useful work
+  where a converged CG iteration is a pure no-op. Overshoot is output-neutral by construction: a
+  level past an exhausted frontier advances an empty window, and a level past the narrow-frontier
+  escape does one more parallel level before the serial drain resumes from wherever it stopped.
+  **Two general points: the same mechanism can be a win in one loop and a 0.60x loss in another,
+  so price it per loop; and a synthetic's ratio for it did not survive contact with a real graph.** The primal tree cannot take the dual side's Boruvka
   treatment — `tree_cotree` reads the dual tree as a *set* but walks the primal one's rooted
   `parents`, and rooting a forest in parallel is a different problem; `homology.py` says so at the
   site. Second-largest piece after that is `_device.read_scalar`, 11 calls for 0.154 ms.
@@ -6046,8 +6198,19 @@ Two related notes: `homology_generators[handles_64]` spends 4.43 of 10.9 ms in t
 `_loop_through_tree` walks (128 generators, mean loop 110), which a NumPy binary-lifting LCA would
 vectorize; and `combine.split`'s cost scales with **component count**, not mesh size — ~0.64 ms of
 host work per returned submesh against 0.29 ms (open3d) and 0.23 ms (trimesh), so on a mesh with 94
-scan floaters triwarp is 78 ms where it wins 34-120x on few-component meshes. The per-component
-allocation/launch sequence needs batching; the labelling is fine.
+scan floaters triwarp is 78 ms where it wins 34-120x on few-component meshes.
+
+**That last item's prescription — "the per-component allocation/launch sequence needs batching" —
+is stale, and the correction is the transferable part: the batching it asked for shipped, as
+`combine.split_batched`.** Re-censused on `parts_1024`, `split` issues **24 launches, exactly what
+`split_batched` issues**, so no per-component launch sequence is left to batch; `split` delegates
+to it and then slices. What remains is 8.70 against 1.60 ms, and the 7.09 ms residue is **3.46 µs
+per returned array** over 2 048 of them — §13.1's measured 3.63 µs for a `wp.array` slice view.
+Building those 2 048 view objects *is* the return value, so the only thing that removes it is not
+returning them, which is what `split_batched` is and what `split`'s own `See Also` already points
+a caller at. `split[parts_1024]` is a **floor** row, not an open one. **Before batching a
+"per-component wrapper chain", count its launches against the batched sibling — a published
+attribution can outlive its own fix.**
 
 ### 16.10 Where triwarp wins big (for context when reading a loss)
 

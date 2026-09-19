@@ -347,14 +347,14 @@ def cg_step_p(
     #
     # ``out_state`` is the round-loop state array (``array.LOOP_ROUND`` / ``LOOP_CONDITION``), the
     # iteration count in the first slot. The loop runs while *any* column is still above its own
-    # tolerance -- the worst-case rule the batching exists for -- and stops at ``maxiter``.
+    # tolerance -- the worst-case rule a batched multi-column solve needs -- and stops at
+    # ``maxiter``.
     if i == 0:
-        # Clamped at ``maxiter`` rather than free-running. The device-side loop issues a *run* of
-        # iterations per conditional test (``linalg.CG_ITERATIONS_PER_CHECK``), so without the
-        # clamp the count could report up to that many past the cap a caller passed -- and a
-        # caller that tests the returned count against its own cap is how a non-convergence
-        # warning gets raised. The iterations past the cap still execute; they are no-ops, because
-        # ``keep`` is already 0 and every column's ``beta`` / ``alpha`` is pinned to zero.
+        # Clamped at ``maxiter`` rather than free-running, so the reported count can never exceed
+        # the cap a caller passed -- a caller that tests the returned count against its own cap is
+        # how a non-convergence warning gets raised. The device-side loop runs one iteration per
+        # conditional test, so today the clamp never fires; it is kept because any scheme that
+        # issues a *run* of iterations per test brings the overshoot back, and it costs a ``min``.
         round_index = wp.min(out_state[LOOP_ROUND] + 1, maxiter)
         out_state[LOOP_ROUND] = round_index
         keep = wp.int32(0)

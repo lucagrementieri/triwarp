@@ -26,6 +26,24 @@ from triwarp.kernels.algorithms import connected_components as kernel_connected_
 # from a sphere, average degree 6.0). Frontier width is observable and is what actually decides.
 _BFS_ESCAPE_FRONTIER = 32
 
+# Levels issued per conditional-graph test in the level-synchronous loop. ``wp.capture_while``
+# evaluates its condition on device at a few microseconds against ~1 us for a replayed launch, so
+# driving a short *run* of levels per test amortizes that over the run. Overshoot is the cost: up
+# to ``K - 1`` levels run past the point the loop would have stopped. That is output-neutral here
+# rather than merely bounded -- a level past an exhausted frontier advances an empty window and
+# emits nothing, and a level past the *escape* does one more parallel level of real work before
+# the serial drain resumes from wherever it left off, which is the same traversal either way.
+# ``order`` and ``distances`` are byte-identical at K = 1, 2, 4 and 8 on every graph swept.
+#
+# Two is the value that loses nowhere: it gains a few percent on the deep blob-shaped graphs whose
+# level loop actually runs, and is a tie on the shallow ones, where 4 and 8 both cost real time.
+#
+# **It does nothing for a long thin graph, which is the shape it looks like it should help.** Such
+# a graph's level loop runs a handful of levels and emits a handful of nodes before the
+# narrow-frontier escape hands off; nearly all of its cost is the serial drain below, which is one
+# thread by design. A per-level dispatch cost only matters if the level body actually runs.
+_BFS_LEVELS_PER_CHECK = 2
+
 
 def edges_to_csr(
     node_count: int, edges: twt.Array2dInt32, weights: wp.array[wp.float32] | None = None
@@ -670,7 +688,7 @@ def bfs(
         device=device,
     )
 
-    def bfs_level_body() -> None:
+    def bfs_level() -> None:
         wp.launch(
             kernel_bfs.bfs_expand_claim,
             dim=node_count,
@@ -719,6 +737,11 @@ def bfs(
             ],
             device=device,
         )
+
+    def bfs_level_body() -> None:
+        """``_BFS_LEVELS_PER_CHECK`` levels: the body ``wp.capture_while`` drives per test."""
+        for _ in range(_BFS_LEVELS_PER_CHECK):
+            bfs_level()
 
     # CUDA only: ``bfs_count_and_scan`` builds its tile with ``wp.tile``, which fills lane 0 alone
     # on the CPU backend. On CPU the level loop is skipped entirely and the serial kernel below

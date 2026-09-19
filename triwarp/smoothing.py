@@ -249,13 +249,8 @@ def _apply_volume_constraint(
     # host sync per smoothing pass -- a full pipeline drain for a cube root of two numbers -- and
     # the pass count is the whole point of this loop. ``rescale_to_volume`` forms the ratio itself
     # and applies the same two skip conditions.
-    face_volumes = tw.triangles.face_signed_volumes(positions, faces)
-    # ``wp.zeros``, not ``wp.empty``: an empty face buffer leaves ``array_sum`` with nothing to
-    # write, and a garbage "current volume" would scale the mesh by a garbage factor. Zero is also
-    # the honest answer there, and the kernel reads it as "skip".
     volume_current = wp.zeros(1, dtype=wp.float64, device=positions.device)
-    if int(faces.shape[0]) > 0:
-        wp.utils.array_sum(face_volumes, out=volume_current)
+    _accumulate_signed_volume(positions, faces, volume_current)
     wp.launch(
         kernel_smoothing.rescale_to_volume,
         dim=int(positions.shape[0]),
@@ -1231,15 +1226,29 @@ def filter_mut_dif_laplacian(
     if face_normals is None or face_areas is None:
         face_normals, face_areas = face_normals_and_areas(vertices, faces)
     normals = mean_vertex_normals(n, faces, face_normals)
-    vol_ini = tw.measures.volume(positions, faces) if volume_constraint else 0.0
     eps = 0.01 * float(tw.reduce.max(face_areas)) ** 0.5 if volume_constraint else 0.0
 
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     adil = wp.empty(n, dtype=wp.float64, device=device)
     adil_sum = wp.zeros(1, dtype=wp.float64, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
-    probe = wp.empty(n, dtype=wp.vec3d, device=device) if volume_constraint else None
-    slope = 0.0
+    # The three volumes the constraint needs, kept on the device for the whole loop: the input's
+    # (fixed), this pass's, and the eps-probe's, with the calibrated slope beside them. Reading any
+    # of them back cost a full pipeline drain per smoothing pass -- and the pass count is the whole
+    # point of this loop -- for arithmetic the two kernels below do themselves.
+    #
+    # All three are summed by ``wp.utils.array_sum``, deliberately the *same* reduction rather than
+    # ``measures.volume``'s tiled one: the correction is ``slope * (vol_ini - vol)``, a difference
+    # of two nearly equal volumes, so mixing two summation orders would show up there magnified
+    # rather than in the last bits.
+    constraint = None
+    if volume_constraint:
+        probe = wp.empty(n, dtype=wp.vec3d, device=device)
+        vol_ini, vol_cur, vol_probe, slope = (
+            wp.zeros(1, dtype=wp.float64, device=device) for _ in range(4)
+        )
+        _accumulate_signed_volume(positions, faces, vol_ini)
+        constraint = (probe, vol_ini, vol_cur, vol_probe, slope)
     inv_n = wp.float64(1.0 / n)
     n_blocks = kernel_reduce.blocks_1d(n)
     for index in range(iterations):
@@ -1268,8 +1277,9 @@ def filter_mut_dif_laplacian(
             device=device,
         )
         positions, nxt = nxt, positions
-        if volume_constraint:
-            vol = tw.measures.volume(positions, faces)
+        if constraint is not None:
+            probe, vol_ini, vol_cur, vol_probe, slope = constraint
+            _accumulate_signed_volume(positions, faces, vol_cur)
             if index == 0:
                 wp.map(
                     kernel_smoothing.add_scaled_normal,
@@ -1278,17 +1288,41 @@ def filter_mut_dif_laplacian(
                     wp.float64(eps),
                     out=probe,
                 )
-                vol2 = tw.measures.volume(probe, faces)
-                slope = eps / (vol2 - vol) if vol2 != vol else 0.0
-            wp.map(
-                kernel_smoothing.add_scaled_normal,
-                positions,
-                normals,
-                wp.float64(slope * (vol_ini - vol)),
-                out=positions,
+                _accumulate_signed_volume(probe, faces, vol_probe)
+                wp.launch(
+                    kernel_smoothing.mut_dif_volume_slope,
+                    dim=1,
+                    inputs=[vol_cur, vol_probe, wp.float64(eps), slope],
+                    device=device,
+                )
+            wp.launch(
+                kernel_smoothing.mut_dif_volume_correct,
+                dim=n,
+                inputs=[normals, vol_ini, vol_cur, slope],
+                outputs=[positions],
+                device=device,
             )
 
     return _as_vec3(positions)
+
+
+def _accumulate_signed_volume(
+    positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], out_volume: wp.array[wp.float64]
+) -> None:
+    """
+    Sum the mesh's per-face signed tetrahedron volumes into the caller's length-1 ``out_volume``.
+
+    The device-resident half of [`measures.volume`][triwarp.measures.volume], shared by the two
+    volume constraints in this module so that neither reads a volume back to do arithmetic on it.
+    ``out_volume`` is the caller's because the iterative constraint hoists it out of its pass loop.
+
+    ``wp.utils.array_sum`` writes nothing at all for an empty face buffer, so ``out_volume`` is
+    zeroed first rather than left holding whatever it held: zero is the honest volume of a mesh
+    with no faces, and it is what both consumers read as "no correction".
+    """
+    out_volume.zero_()
+    if int(faces.shape[0]) > 0:
+        wp.utils.array_sum(tw.triangles.face_signed_volumes(positions, faces), out=out_volume)
 
 
 def _diffuse_pass(

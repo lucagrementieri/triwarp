@@ -381,9 +381,6 @@ def test_query_nearest_bvh_k1(bench_case: BenchCase) -> None:
     if bench_case.kind == "pytorch3d":
         _run_pytorch3d_knn(bench_case, 1)
         return
-    if bench_case.kind == "pytorch3d":
-        _run_pytorch3d_knn(bench_case, 1)
-        return
     if bench_case.kind == "triwarp":
         points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
         indices, _distances = bench_case.run(
@@ -459,9 +456,6 @@ def test_query_nearest_bvh_k7(bench_case: BenchCase) -> None:
     a different claim than the four here.
     """
     skip_larger_than(bench_case, "dragon")
-    if bench_case.kind == "pytorch3d":
-        _run_pytorch3d_knn(bench_case, 7)
-        return
     if bench_case.kind == "pytorch3d":
         _run_pytorch3d_knn(bench_case, 7)
         return
@@ -787,9 +781,6 @@ def test_query_ball_hashgrid(bench_case: BenchCase, grid_bins: int) -> None:
     """
     skip_larger_than(bench_case, "bunny", "the neighbour count grows cubically with the radius")
     radius = _RADIUS_SCALES[0] * bench_case.mean_edge
-    if bench_case.kind == "pytorch3d":
-        _run_pytorch3d_ball(bench_case, radius)
-        return
     if bench_case.kind == "pytorch3d":
         _run_pytorch3d_ball(bench_case, radius)
         return

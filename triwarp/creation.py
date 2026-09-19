@@ -2314,6 +2314,16 @@ _RANDOM_HILLS_SPEC = _ParametricSpec(wp.int32(-1), (-10.0, 10.0), (-10.0, 10.0))
 # quadratic in it. Measured at 96 squared = 9 216 (1.01x), 80 squared (0.82x), 112 squared (1.28x).
 _PARAMETRIC_LATTICE_DEVICE_FROM = 9216
 
+# Longest profile ``_revolve_regular`` will screen. The screen is ``O(P)`` in the profile length
+# while the fast path's win is flat in it -- the general engine's layout tables, three uploads and
+# second launch -- so the bet is symmetric at a short profile and lopsided at a long one. A decline
+# is not a rare path either: a fine profile revolved into many sections makes the polar triangles
+# smaller than ``revolve``'s absolute area tolerance, which drops more of them than the regular
+# layout expects, and that is exactly the large-``P`` regime. At this cap the downside is ~2.4x the
+# upside and the fast path still wins ~1.2x; at twice it the downside is ~4.5x and every shape
+# probed declined. Above the cap the general engine runs unscreened.
+_REVOLVE_REGULAR_MAX_PROFILE = 2048
+
 
 def _parametric_surface(
     spec: _ParametricSpec,
@@ -2647,7 +2657,7 @@ def _revolve_regular(
     ``profile_np`` is the caller's own host profile, closed profiles included: the repeated last
     point is detected here and dropped, so the kernel addresses deduplicated columns.
     """
-    if sections < 1 or profile_np.shape[0] < 2:
+    if sections < 1 or not 2 <= profile_np.shape[0] <= _REVOLVE_REGULAR_MAX_PROFILE:
         return None
     wrap = bool(np.allclose(profile_np[0], profile_np[-1], rtol=0.0, atol=0.0))
     columns_np = profile_np[:-1] if wrap else profile_np
@@ -2666,22 +2676,27 @@ def _revolve_regular(
     n_segments = n_columns - 1 + int(wrap)
     if n_segments < 1:
         return None
-    # ``revolve``'s verdict, on ``revolve``'s template, for exactly this profile and step.
-    kept = set(_revolve_kept_template(profile_np, 2.0 * math.pi / float(sections)).tolist())
-    expected: set[int] = set()
-    for segment in range(n_segments):
-        nxt = (segment + 1) % n_columns
-        if not (segment == 0 and axis_first) and not (segment == n_columns - 1 and axis_last):
-            expected.add(2 * segment)
-        if not (nxt == 0 and axis_first) and not (nxt == n_columns - 1 and axis_last):
-            expected.add(2 * segment + 1)
-    if kept != expected:
+    # ``revolve``'s verdict, on ``revolve``'s template, for exactly this profile and step. The
+    # template holds two triangles per segment in segment order, so the regular layout is a mask
+    # over ``2 * n_segments`` and the comparison is an array equality rather than a set one --
+    # both sides come out of ``np.flatnonzero``, so both are sorted and the orders agree. Built
+    # with NumPy rather than a Python loop because this runs on every call and the profile length
+    # is the axis that grows -- on a fine profile the loop and its two sets dominated the screen.
+    kept_np = _revolve_kept_template(profile_np, 2.0 * math.pi / float(sections))
+    segment_np = np.arange(n_segments)
+    next_np = (segment_np + 1) % n_columns
+    expected_np = np.empty(2 * n_segments, dtype=bool)
+    expected_np[0::2] = ~((segment_np == 0) & axis_first) & ~(
+        (segment_np == n_columns - 1) & axis_last
+    )
+    expected_np[1::2] = ~((next_np == 0) & axis_first) & ~((next_np == n_columns - 1) & axis_last)
+    if not np.array_equal(kept_np, np.flatnonzero(expected_np).astype(np.int32)):
         return None
 
     # Only the two end segments can be short, so the kernel finds any later segment's place from
     # the first one's count alone.
-    first_segment_faces = sum(1 for template in (0, 1) if template in expected)
-    faces_per_slice = len(expected)
+    first_segment_faces = int(expected_np[0]) + int(expected_np[1])
+    faces_per_slice = int(expected_np.sum())
     n_vertices = (
         int(axis_first) + (n_columns - int(axis_first) - int(axis_last)) * sections + int(axis_last)
     )

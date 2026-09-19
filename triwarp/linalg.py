@@ -140,32 +140,17 @@ CG_MAXITER_FACTOR = 10
 # docs for the measurements and for the return-type consequence.
 CG_CHECK_EVERY = 0
 
-# Iterations issued per conditional-graph test when ``check_every == 0``. ``wp.capture_while``
-# evaluates its condition on device, which is cheap against a host readback but not free -- the
-# mechanism measures ~4-6 us per evaluation against ~1.2 us for a replayed launch -- so the body
-# it drives is a run of this many iterations rather than one. The cost of the batching is
-# overshoot: up to ``CG_ITERATIONS_PER_CHECK - 1`` iterations run past the point the residual
-# crossed, and past ``maxiter``. Both are bounded and neither is wrong -- ``cg_step_p`` and
-# ``cg_step_x_r_z`` pin a converged column's own ``beta`` / ``alpha`` to exactly zero, so a run-on
-# iteration costs launches and moves nothing -- and ``__call__`` clamps the reported count back to
-# ``maxiter`` so a caller testing the return against the cap it passed still reads what it expects.
-# Swept over 1 / 2 / 4 / 8 on an RTX 5090 / Warp 1.17, interleaved in one process, min of 9,
-# reproduced twice (ratios against K=1):
-#
-#   cell                            K=2     K=4     K=8
-#   heat_geodesic[sphere_small]     0.98    1.02    1.01
-#   heat_geodesic[sphere_med]       1.02    1.00    1.00
-#   heat_geodesic[saddle_graded]    1.02    1.01    1.01
-#   harmonic[saddle_small]          1.03    0.98    0.90
-#   harmonic[saddle]                1.03    1.04    0.96
-#   harmonic[saddle_graded]         1.07    1.11    1.11
-#
-# So the mechanism is real but small -- a geometric mean of 1.028x at K=4 against 1.027x at K=2 --
-# and it is *not* the 1.38x the same batching is worth on ``graph.bfs``'s level loop, because a CG
-# iteration is seven launches where a BFS level is four and the conditional evaluation is a
-# smaller share of it. K=4 is kept for the larger best case; K=8 is a real loss on a short solve,
-# where the overshoot is a bigger fraction and the captured body is longer.
-CG_ITERATIONS_PER_CHECK = 4
+# Batching several iterations per conditional-graph test was tried and removed; do not
+# reintroduce it without a *short* solve in the sweep. ``wp.capture_while`` evaluates its condition
+# on device at a few microseconds against ~1 us for a replayed launch, so running a run of
+# iterations per test amortizes that -- but it also overshoots by up to ``K - 1`` iterations past
+# the point the residual crossed, and that overshoot is a fixed number of launches whose *share*
+# is set by how long the solve is. Long solves therefore win a little and short ones lose a lot:
+# the best cell gained ~13 % while three others lost 28-40 %, and every summary statistic put the
+# unbatched loop ahead. A converged iteration here is a pure no-op -- ``cg_step_p`` and
+# ``cg_step_x_r_z`` pin a converged column's ``beta`` / ``alpha`` to exactly zero -- so the
+# overshoot buys nothing at all, unlike the equivalent batching in ``graph.bfs``'s level loop,
+# where an extra level still does useful work and a small batch is kept.
 
 # Cadence substituted for ``check_every=0`` on a device without conditional CUDA graphs, where Warp
 # cannot test the residual on device and would otherwise run every solve to ``maxiter``. Warp's own
@@ -1338,18 +1323,12 @@ class _BatchedCg:
                 math.sqrt(float(self._atol_sq.numpy().max())),
             )
         condition = self._state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
+        # One iteration per conditional-graph test, not a batched run of them: see the note above
+        # ``CG_CHECK_EVERY`` for the sweep that removed the batching.
         with wp.ScopedCapture(self._device) as capture:
-            wp.capture_while(condition, self._iteration_run)
+            wp.capture_while(condition, self._iteration)
         wp.capture_launch(capture.graph)
         return self._state[0:1], self._dots[0], self._atol_sq
-
-    def _iteration_run(self) -> None:
-        """``CG_ITERATIONS_PER_CHECK`` iterations, the body ``wp.capture_while`` drives."""
-        # Batching them amortizes the conditional-graph evaluation over several iterations; the
-        # iterations themselves are unchanged, and the ones that run past convergence are no-ops
-        # by construction. See ``CG_ITERATIONS_PER_CHECK``.
-        for _ in range(CG_ITERATIONS_PER_CHECK):
-            self._iteration()
 
     def _run_with_host_checks(self, check_every: int) -> None:
         """

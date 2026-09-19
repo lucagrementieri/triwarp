@@ -472,6 +472,52 @@ def add_scaled_normal(v_prev: wp.vec3d, normal: wp.vec3, scale: wp.float64) -> w
     return v_prev + scale * to_vec3d(normal)
 
 
+@wp.kernel
+def mut_dif_volume_slope(
+    volume_base: wp.array[wp.float64],
+    volume_probe: wp.array[wp.float64],
+    eps: wp.float64,
+    out_slope: wp.array[wp.float64],
+) -> None:
+    # dim=1. The finite-difference slope d(offset)/d(volume), calibrated once from the first pass's
+    # volume and the volume of the same mesh offset by ``eps`` along its normals. Formed here rather
+    # than on the host because the only reason to read the two volumes back was to divide them --
+    # one pipeline drain per calibration, and the correction below needs them on the device anyway.
+    #
+    # A zero denominator means the probe displacement did not change the volume at all (a mesh with
+    # no faces, or normals orthogonal to every face), and the host version this replaces answered
+    # that with a slope of exactly zero rather than an infinity. So does this -- as a branch and
+    # not a ``wp.where``, which evaluates both arms and would divide by the zero before discarding
+    # the result.
+    _ = wp.int32(wp.tid())
+    delta = volume_probe[0] - volume_base[0]
+    if delta == wp.float64(0.0):
+        out_slope[0] = wp.float64(0.0)
+        return
+    out_slope[0] = eps / delta
+
+
+@wp.kernel
+def mut_dif_volume_correct(
+    normals: wp.array[wp.vec3],
+    volume_initial: wp.array[wp.float64],
+    volume_current: wp.array[wp.float64],
+    slope: wp.array[wp.float64],
+    out_positions: wp.array[wp.vec3d],
+) -> None:
+    # Offset every vertex along its normal by ``slope * (volume_initial - volume_current)``, the
+    # first-order correction that walks the smoothed mesh's volume back toward the input's. All
+    # three scalars are device-resident, so a smoothing pass issues no host synchronisation.
+    #
+    # Unlike ``rescale_to_volume`` this writes unconditionally, because the host version it
+    # replaces did: at a zero slope it applied an offset of exactly zero rather than skipping, and
+    # ``v + 0 * N`` is the same value for every finite ``N``. The two therefore agree on a
+    # degenerate mesh as well as on an ordinary one, which is the property that matters.
+    v = wp.int32(wp.tid())
+    offset = slope[0] * (volume_initial[0] - volume_current[0])
+    out_positions[v] = add_scaled_normal(out_positions[v], normals[v], offset)
+
+
 @wp.func
 def extract_components(v: wp.vec3d) -> tuple[wp.float64, wp.float64, wp.float64]:
     return v[0], v[1], v[2]
