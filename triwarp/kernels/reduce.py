@@ -76,6 +76,32 @@ def blocks_1d(n: int) -> int:
     return (n + items - 1) // items
 
 
+def chunks_1d(n: int) -> int:
+    """
+    Launch width for [`minmax_vec3_chunked`][triwarp.kernels.reduce.minmax_vec3_chunked].
+
+    That kernel is the *unfolded* kind: one plain thread per ``TILE_1D`` points, walked serially,
+    with no tile load and no ``TILES_PER_BLOCK_1D`` fold. So its grid is ``n / TILE_1D`` and
+    [`blocks_1d`][triwarp.kernels.reduce.blocks_1d] -- which divides by
+    ``TILE_1D * TILES_PER_BLOCK_1D`` -- is **wrong** for it by a factor of
+    ``TILES_PER_BLOCK_1D``, dropping fifteen sixteenths of the cloud from the box. The two helpers
+    exist so that choosing between them is a visible decision rather than an open-coded division
+    that has to be re-derived against the kernel's body.
+
+    Parameters
+    ----------
+    n
+        Number of elements in the 1-D array being reduced.
+
+    Returns
+    -------
+    int
+        Chunk count to pass as ``dim`` to ``wp.launch``.
+    """
+    width = TILE_1D
+    return (n + width - 1) // width
+
+
 # ---------------------------------------------------------------------------
 # Kernel factories.
 #
@@ -908,7 +934,9 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
     # fills and two readbacks, and at this size the reduction is entirely host-latency-bound.
     #
     # One thread per ``TILE_1D`` points, so the atomics see a few hundred contenders per address
-    # rather than one per point.
+    # rather than one per point. Launch it with
+    # [`chunks_1d`][triwarp.kernels.reduce.chunks_1d] and not ``blocks_1d``: this kernel does not
+    # fold ``TILES_PER_BLOCK_1D`` tiles, so the two differ by that factor.
     offset, remaining = tile_chunk(points.shape[0], wp.int32(wp.tid()), TILE_1D)
     if remaining <= 0:
         return

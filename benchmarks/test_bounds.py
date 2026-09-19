@@ -191,11 +191,14 @@ def test_enclosing_diagonal(bench_case: BenchCase) -> None:
     """
     The default search radius every mesh query derives, over the mesh *and* the query points.
 
-    Two clouds rather than one, so against the ``aabb`` group above this is two box
-    reductions and therefore two host readbacks; the row answers whether the default costs twice
-    the single-cloud reduction or whether the second readback disappears into the first launch's
-    latency. Every ``max_dist=None`` call in ``proximity``, ``ray``,
-    ``visibility`` and ``registration`` pays exactly this.
+    Two clouds rather than one, so against the ``aabb`` group above this is a second launch into
+    the same six-slot buffer -- not a second box and not a second readback. The row answers what
+    that launch costs on top of the single-cloud reduction. Every ``max_dist=None`` call in
+    ``proximity``, ``ray``, ``visibility`` and ``registration`` pays exactly this.
+
+    Reducing a concatenation of the two clouds instead was measured and declined: 0.88-0.95x from
+    1e3 to 4e6 points, because the union is an allocation and a copy of both clouds against one
+    launch that is flat in its ``dim``.
 
     igl's ``bounding_box_diagonal`` takes one point set, so its side is fed the stacked cloud --
     which makes its row also price the ``vstack`` a caller would need, and that copy is the point:
@@ -375,12 +378,12 @@ def test_oriented_bounding_box(bench_case: BenchCase) -> None:
     The sampled-plus-refined minimum-volume box: ``_ROTATIONS`` global frames, then eight rounds.
 
     Cost is ``rotations * n_vertices`` point transforms for the global phase plus eight 512-frame
-    refinement rounds of device-side frame generation, extent scoring and one table readback
-    (~0.24 ms per round; measured back to back on a 36k cloud, 0.45 ms sampled against ~2.4 ms
-    refined). The row
-    times the *default*, refinement included, because that is what a caller gets -- and what the
-    quality bands in ``tests/test_bounds.py`` are measured against; igl walks the same global
-    candidates over a CPU ``parallel_for`` with no refinement phase.
+    refinement rounds of device-side frame generation, extent scoring and selection. The whole
+    search runs on the device and reads back one row at the end, so what this row times is device
+    work plus a fixed launch chain -- measured on a 36k cloud, 0.29 ms sampled against 1.03 ms
+    refined. The row times the *default*, refinement included, because that is what a caller gets
+    -- and what the quality bands in ``tests/test_bounds.py`` are measured against; igl walks the
+    same global candidates over a CPU ``parallel_for`` with no refinement phase.
 
     The CPU references run into hundreds of milliseconds on ``bunny`` and take ``rounds=3`` for it,
     the same allowance the other second-scale rows in the suite use.

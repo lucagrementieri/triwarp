@@ -3,6 +3,7 @@ import math
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT
+from triwarp.kernels.array import tile_argmin
 from triwarp.kernels.predicates import TWO_PI_F64
 
 # Super-Fibonacci spiral constants [Alexa 2022]: the two irrational strides whose phase pair
@@ -170,7 +171,7 @@ def packed_box_sides(corners: wp.array[wp.float32], box: wp.int32) -> wp.vec3:
 @wp.func
 def box_objective_loss(sides: wp.vec3, objective: wp.int32) -> wp.float32:
     """
-    Score a box's sides under one of the three objectives, as ``bounds._objective_losses`` does.
+    Score a box's sides under one of the three objectives ``oriented_bounding_box`` exposes.
 
     The branch is warp-uniform -- every thread in the launch is handed the same ``objective`` -- so
     this is the int-selector form rather than three kernels.
@@ -180,6 +181,151 @@ def box_objective_loss(sides: wp.vec3, objective: wp.int32) -> wp.float32:
     if objective == BOX_OBJECTIVE_SURFACE_AREA:
         return wp.float32(2.0) * (sides[0] * sides[2] + sides[1] * sides[0] + sides[2] * sides[1])
     return wp.dot(sides, sides)
+
+
+# Width of a chain-state row: the running loss, then the winning box's ``lower`` and ``upper``
+# corners, then its frame. One row is everything a finished chain has to say, so the whole search
+# reads back once at the end rather than once per round.
+BOX_STATE_COLUMNS = 16
+
+# Two frames belong to the same basin when the rotation taking one to the other is under 0.2 rad.
+# Tested as a trace rather than an angle: ``wp.ddot`` of two rotations is ``1 + 2 cos(theta)`` and
+# ``acos`` is decreasing, so the comparison needs no inverse trig and no clamp.
+BOX_SEED_SAME_BASIN_TRACE = wp.constant(wp.float32(1.0 + 2.0 * math.cos(0.2)))
+
+
+@wp.func
+def write_chain_state(
+    out_state: wp.array2d[wp.float32],
+    chain: wp.int32,
+    loss: wp.float32,
+    corners: wp.array[wp.float32],
+    box: wp.int32,
+    frame: wp.mat33,
+) -> None:
+    # One chain's whole answer, into one ``BOX_STATE_COLUMNS``-wide row. Shared by the two kernels
+    # that write it -- the seeding pass and each refinement round -- because the column layout is a
+    # contract between them and the wrapper that unpacks it, and three copies of an offset table is
+    # how one of them ends up reading the frame out of the corners' slots.
+    out_state[chain, 0] = loss
+    base = box * 6
+    for c in range(3):
+        out_state[chain, 1 + c] = corners[base + c]
+        out_state[chain, 4 + c] = -corners[base + 3 + c]  # slots 3..5 hold the negated upper corner
+    for r in range(3):
+        for c in range(3):
+            out_state[chain, 7 + 3 * r + c] = frame[r, c]
+
+
+@wp.kernel
+def oriented_box_losses(
+    corners: wp.array[wp.float32], objective: wp.int32, out_loss: wp.array[wp.float32]
+) -> None:
+    # Score every candidate's box under the requested objective, one thread per candidate. Keeps
+    # the ``(n_candidates, 6)`` extent table on the device, where the only consumers -- the seeding
+    # walk below and each refinement round -- already live.
+    box = wp.int32(wp.tid())
+    out_loss[box] = box_objective_loss(packed_box_sides(corners, box), objective)
+
+
+@wp.kernel
+def oriented_box_seed_chains(
+    loss: wp.array[wp.float32],
+    axes: wp.array[wp.mat33],
+    corners: wp.array[wp.float32],
+    window: wp.int32,
+    n_chains: wp.int32,
+    out_chains: wp.array[wp.mat33],
+    out_state: wp.array2d[wp.float32],
+) -> None:
+    """
+    Choose the refinement's starting frames: the loss table's head, greedily spread across basins.
+
+    Adjacent spiral candidates score adjacently, so the best few are usually one basin sampled
+    several times; walking the leading ``window`` of them and keeping only frames at least 0.2 rad
+    apart gives the chains *different* basins to descend. The first pick is the global argmin, which
+    is what keeps the refined answer from ever losing to the sampled one.
+
+    Launched ``wp.launch_tiled(dim=1)``: one block, whose lanes stride the loss table by
+    ``wp.block_dim()`` and fold with [`tile_argmin`][triwarp.kernels.array.tile_argmin]. On the CPU
+    device that stride is 1, so the single lane walks the whole table and each fold is a
+    one-element tile holding its own answer.
+
+    A single walk covers both halves of the rule. The shortfall fill -- take the leading candidates
+    the spread rejected, in order -- can only run when the walk reached the end of the window with
+    fewer than ``n_chains`` picks, so everything it rejected is still a legal fallback and can be
+    banked on the way past rather than re-enumerated.
+    """
+    _block, lane = wp.tid()
+    n_boxes = loss.shape[0]
+
+    picked = wp.vec4i(-1, -1, -1, -1)
+    reserve = wp.vec3i(-1, -1, -1)  # rejects, oldest first: at most ``n_chains - 1`` are ever used
+    n_picked = wp.int32(0)
+    n_reserve = wp.int32(0)
+    # The walk's cursor, as the (loss, index) pair already taken. Ordering by the index as well as
+    # the loss is what makes a run of equal losses advance instead of returning its first member
+    # for ever, and it settles ties by candidate rather than by lane.
+    taken_loss = wp.float32(-FLOAT32_INF_CONSTANT)
+    taken_box = wp.int32(-1)
+
+    for _round in range(window):
+        # The next candidate in ascending (loss, index) order. ``<`` rather than ``<=`` inside the
+        # lane so the lowest index wins there too; ``tile_argmin`` applies the same rule across
+        # lanes, and returns the ``-1`` seed when no lane found anything left to take.
+        best_loss = wp.float32(FLOAT32_INF_CONSTANT)
+        best_box = wp.int32(-1)
+        for box in range(lane, n_boxes, wp.block_dim()):
+            value = loss[box]
+            if (
+                value > taken_loss or (value == taken_loss and box > taken_box)
+            ) and value < best_loss:
+                best_loss = value
+                best_box = box
+        taken_loss, taken_box = tile_argmin(best_loss, best_box)
+        if taken_box < 0:
+            break
+
+        candidate = axes[taken_box]
+        same_basin = wp.int32(0)
+        for q in range(n_picked):
+            if wp.ddot(candidate, axes[picked[q]]) > BOX_SEED_SAME_BASIN_TRACE:
+                same_basin = wp.int32(1)
+        if same_basin == 0:
+            picked[n_picked] = taken_box
+            n_picked += 1
+        elif n_reserve < 3:
+            reserve[n_reserve] = taken_box
+            n_reserve += 1
+        if n_picked >= n_chains:
+            break
+
+    for q in range(n_reserve):
+        if n_picked < n_chains:
+            picked[n_picked] = reserve[q]
+            n_picked += 1
+    # Fewer distinct candidates than chains -- only reachable below ``rotations = n_chains``.
+    # Repeat the last pick rather than leave a chain holding an unwritten frame; the duplicates
+    # converge to the same place and the final argmin keeps one of them.
+    for c in range(1, n_chains):
+        if picked[c] < 0:
+            picked[c] = picked[c - 1]
+
+    if lane == 0:
+        for c in range(n_chains):
+            # The clamp is unreachable once the fill and the padding above have run -- ``picked[0]``
+            # is always set for a non-empty table, and the pad propagates it. It is here because
+            # the alternative to a range check on an index that reached a *global* read through two
+            # conditional fills is an out-of-bounds load, and nothing downstream would report one:
+            # a chain seeded from garbage simply loses the final argmin, so the answer still comes
+            # out right (measured -- disabling the pad leaves every test in the file passing).
+            box = wp.max(picked[c], 0)
+            frame = axes[box]
+            out_chains[c] = frame
+            # ``+inf`` rather than the seed's own loss, so the first refinement round always
+            # improves on it and each chain stays monotone. The corners and frame are real: they
+            # are what a caller asking for no refinement gets back.
+            write_chain_state(out_state, c, FLOAT32_INF_CONSTANT, corners, box, frame)
 
 
 @wp.kernel
@@ -196,12 +342,10 @@ def oriented_box_select_chains(
 
     One thread per chain; each walks its own ``count_per_chain`` block of scored candidates, takes
     the argmin of the objective, and overwrites the chain only when the round improved on it --
-    which is what makes the refinement monotone per chain, exactly as the host loop this replaces.
+    which is what makes the refinement monotone per chain.
 
-    ``chain_state`` is one row of seven floats per chain: the running loss and the winning box's
-    ``lower`` and ``upper`` corners. Packing them together means the whole refinement reads back
-    once at the end instead of once per round, and the per-chain 36-byte ``wp.copy`` that used to
-    refresh an improved chain disappears with it.
+    ``chain_state`` is one [`write_chain_state`][triwarp.kernels.bounds.write_chain_state] row per
+    chain, so the whole refinement reads back once at the end instead of once per round.
     """
     chain = wp.int32(wp.tid())
     base = chain * count_per_chain
@@ -215,12 +359,9 @@ def oriented_box_select_chains(
             best_row = row
     if best_row < 0:
         return
-    chains[chain] = axes[best_row]
-    chain_state[chain, 0] = best_loss
-    corner_base = best_row * 6
-    for c in range(3):
-        chain_state[chain, 1 + c] = corners[corner_base + c]
-        chain_state[chain, 4 + c] = -corners[corner_base + 3 + c]
+    frame = axes[best_row]
+    chains[chain] = frame
+    write_chain_state(chain_state, chain, best_loss, corners, best_row, frame)
 
 
 @wp.kernel

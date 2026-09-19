@@ -26,8 +26,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar, require_same_device
-from triwarp.constants import TILE_1D
+from triwarp._device import require_same_device
 from triwarp.kernels import bounds as kernel_bounds
 from triwarp.kernels import predicates as kernel_predicates
 from triwarp.kernels import reduce as kernel_reduce
@@ -147,12 +146,10 @@ def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | Non
     """
     require_same_device(points=points, other=other)
     # Both clouds reduce into **one** corner buffer, so the union costs one readback rather than
-    # two boxes and an ``aabb_union``. That is not a trick of this function's:
-    # ``minmax_vec3_chunked`` accumulates with ``wp.atomic_min`` into a buffer the caller seeds,
-    # so a second launch over a
-    # second cloud continues the same reduction. Two readbacks is what this cost before, and
-    # the second of them sat behind a launch, so it drained a pipeline the first had already
-    # drained rather than riding on it.
+    # two boxes and an ``aabb_union``: ``minmax_vec3_chunked`` accumulates with ``wp.atomic_min``
+    # into a buffer the caller seeds, so a second launch over a second cloud continues the same
+    # reduction. Reducing a concatenation instead is slower -- the union buffer is an allocation
+    # and a copy of both clouds, against one launch that is flat in its ``dim``.
     device = points.device
     corners = wp.full(6, math.inf, dtype=wp.float32, device=device)
     for cloud in (points, other):
@@ -160,7 +157,7 @@ def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | Non
             continue
         wp.launch(
             kernel_reduce.minmax_vec3_chunked,
-            dim=(int(cloud.shape[0]) + TILE_1D - 1) // TILE_1D,
+            dim=kernel_reduce.chunks_1d(int(cloud.shape[0])),
             inputs=[cloud, corners],
             device=device,
         )
@@ -550,11 +547,9 @@ def oriented_bounding_box(
 
     Notes
     -----
-    Host traffic: the ``(rotations, 6)`` extent table (its objective and ``argmin`` are
-    ``O(rotations)`` host arithmetic over a buffer far too small to be worth a device pass), the
-    36 bytes of the winning frame, and one ``(512, 6)`` table per refinement round. The
-    refinement frames are generated and composed **on the device**, so the chains live on
-    the device and the extent tables are the only per-round traffic.
+    The whole search runs on the device: candidate frames, extents, the objective, the argmin that
+    picks the chains, the perturbed frames each round composes, and the per-chain selection. One
+    row of the winning chain comes back at the end, and that is the only host traffic.
 
     **The result is a converged local minimum, not a certified global one.** Certifying the true
     minimum-volume box requires the exact-arithmetic search over the convex hull's face and edge
@@ -615,25 +610,64 @@ def oriented_bounding_box(
     )
 
     n_slices = max(1, (n + ITEMS_PER_CANDIDATE_SLICE - 1) // ITEMS_PER_CANDIDATE_SLICE)
-    lower_np, upper_np = _scored_extents(points, axes, n_slices)
-    loss_np = _objective_losses(upper_np - lower_np, objective)
-    best = int(loss_np.argmin())
+    corners = wp.empty(6 * rotations, dtype=wp.float32, device=device)
+    _score_extents_into(points, axes, n_slices, corners)
 
-    if refine_iterations == 0:
-        rotation_np = read_scalar(axes, best)
-        return (wp.mat33(*rotation_np.ravel()), wp.vec3(*lower_np[best]), wp.vec3(*upper_np[best]))
-
-    frame_np, lower_best, upper_best = _refine_box(
-        points, rotations, objective, refine_iterations, loss_np, n_slices
+    loss = wp.empty(rotations, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_bounds.oriented_box_losses,
+        dim=rotations,
+        inputs=[corners, _BOX_OBJECTIVES[objective], loss],
+        device=device,
     )
-    return (wp.mat33(*frame_np.ravel()), wp.vec3(*lower_best), wp.vec3(*upper_best))
+    # One chain when there is nothing to refine: the seeding walk's first pick is the global
+    # argmin, so it stops after a single round and the row it writes is already the answer.
+    n_chains = 1 if refine_iterations == 0 else _REFINE_CHAINS
+    chains = wp.empty(n_chains, dtype=wp.mat33, device=device)
+    chain_state = twt.as_array2d(
+        wp.empty((n_chains, kernel_bounds.BOX_STATE_COLUMNS), dtype=wp.float32, device=device),
+        wp.float32,
+    )
+    wp.launch_tiled(
+        kernel_bounds.oriented_box_seed_chains,
+        dim=(1,),
+        inputs=[
+            loss,
+            axes,
+            corners,
+            wp.int32(min(_REFINE_WINDOW, rotations)),
+            wp.int32(n_chains),
+            chains,
+            chain_state,
+        ],
+        block_dim=_SEED_BLOCK_DIM,
+        device=device,
+    )
+
+    if refine_iterations > 0:
+        _refine_box(points, rotations, objective, refine_iterations, n_slices, chains, chain_state)
+    return _best_chain(chain_state)
 
 
 # Refinement geometry: up to four chains cover distinct basins of the sampled landscape (a
 # near-symmetric shape has several near-tied optima), and 128 frames per chain per round keeps a
-# full refinement at the cost of one extra 512-candidate global pass per round.
+# full refinement at the cost of one extra 512-candidate global pass per round. Four is also the
+# ceiling: ``oriented_box_seed_chains`` carries its picks in a ``wp.vec4i``.
 _REFINE_CHAINS = 4
 _REFINE_CANDIDATES = 128
+
+# Leading candidates the seeding walk considers. Adjacent spiral candidates score adjacently, so
+# the best few are usually one basin sampled several times and a window this wide is what gives the
+# spread test distinct basins to find; beyond it the losses are too far above the winner's to be
+# worth a chain.
+_REFINE_WINDOW = 32
+
+# The seeding walk is a single block, so this is its whole width -- and the walk is dominated by
+# the scan rather than by its per-round ``tile_argmin`` pair, so it wants a wide one: measured
+# 45.8 / 26.7 / 19.3 / 19.4 / 20.8 us at 32 / 64 / 128 / 256 / 512, with the chains identical at
+# every width. 256 rather than the 128 that ties with it because it is Warp's default, so the
+# module is not loaded a second time for a second ``block_dim`` (section 2.5).
+_SEED_BLOCK_DIM = 256
 _BOX_OBJECTIVES: dict[str, wp.int32] = {
     "volume": kernel_bounds.BOX_OBJECTIVE_VOLUME,
     "surface_area": kernel_bounds.BOX_OBJECTIVE_SURFACE_AREA,
@@ -646,39 +680,28 @@ def _refine_box(
     rotations: int,
     objective: str,
     refine_iterations: int,
-    loss_np: np.ndarray,
     n_slices: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    chains: wp.array[wp.mat33],
+    chain_state: twt.Array2dFloat32,
+) -> None:
     """
-    Trust-region refinement of the sampled winner(s): shrink a low-discrepancy ball per round.
+    Trust-region refinement of the seeded chains: shrink a low-discrepancy ball per round.
 
-    Chains start from the best sampled candidates of mutually distant basins (greedy spread over
-    the top of the loss table) and live on the device. The same extent kernel as the global phase
-    scores them, the per-chain argmin stays host arithmetic over the already-read-back table, and
-    an improved chain is refreshed with a 36-byte device copy; the last delta is the identity,
-    which is what makes the refinement monotone per chain.
+    The chains live on the device throughout. Each round generates a ball of perturbed frames
+    around every chain, scores them with the same extent kernel as the global phase, and keeps each
+    chain's best in place; the last delta of every ball is the identity, which re-scores the base
+    and is what makes a chain monotone. Nothing is read back until the caller unpacks the winning
+    row.
     """
     device = points.device
-    order = np.argsort(loss_np)
-    chains_np = _spread_chain_frames(order, rotations)
-    n_chains = chains_np.shape[0]
-
-    chains = wp.array(
-        np.ascontiguousarray(chains_np, dtype=np.float32), dtype=wp.mat33, device=device
-    )
+    n_chains = int(chains.shape[0])
     total = n_chains * _REFINE_CANDIDATES
     axes = wp.empty(total, dtype=wp.mat33, device=device)
     corners = wp.empty(6 * total, dtype=wp.float32, device=device)
-    # Column 0 is the running per-chain loss, seeded to +inf so the first round always improves;
-    # columns 1..6 are the winning box's corners. One buffer because the refinement reads it back
-    # once, at the end, rather than once per round.
-    chain_state = twt.as_array2d(
-        wp.full((n_chains, 7), math.inf, dtype=wp.float32, device=device), wp.float32
-    )
     objective_code = _BOX_OBJECTIVES[objective]
 
     # Start at the covering radius of the global grid: the sampled winner is at most about this
-    # far from its basin's optimum, and each round halves the radius.
+    # far from its basin's optimum, and each round shrinks the radius.
     sigma = 2.0 * (math.pi**2 / max(rotations, 2)) ** (1.0 / 3.0)
     for _ in range(refine_iterations):
         wp.launch(
@@ -706,15 +729,6 @@ def _refine_box(
         # shrinking by 0.4 never outruns what a round can see.
         sigma *= 0.4
 
-    state_np = chain_state.numpy()
-    winner = int(state_np[:, 0].argmin())
-    frame_np = read_scalar(chains, winner).astype(np.float64)
-    return (
-        frame_np,
-        state_np[winner, 1:4].astype(np.float64),
-        state_np[winner, 4:].astype(np.float64),
-    )
-
 
 def _score_extents_into(
     points: wp.array[wp.vec3], axes: twt.ArrayNd, n_slices: int, corners: wp.array[wp.float32]
@@ -731,99 +745,14 @@ def _score_extents_into(
     )
 
 
-def _scored_extents(
-    points: wp.array[wp.vec3], axes: twt.ArrayNd, n_slices: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Extent of the cloud in every candidate frame, read back as ``(lower, upper)`` tables."""
-    n_axes = int(axes.shape[0])
-    corners = wp.empty(6 * n_axes, dtype=wp.float32, device=points.device)
-    _score_extents_into(points, axes, n_slices, corners)
-    # The global phase reads this back because its consumer is host-side: the loss table is sorted
-    # and spread into chains in numpy. The *refinement* does not -- it scores and selects on the
-    # device and reads one row at the end. Slots 3..5 hold the negated upper corner; see the kernel.
-    corners_np = corners.numpy().reshape(n_axes, 6)
-    return corners_np[:, :3], -corners_np[:, 3:]
-
-
-def _objective_losses(sides_np: np.ndarray, objective: str) -> np.ndarray:
-    """Score each candidate's box sides under the requested objective."""
-    if objective == "volume":
-        return sides_np.prod(axis=1)
-    if objective == "surface_area":
-        return 2.0 * (sides_np * np.roll(sides_np, 1, axis=1)).sum(axis=1)
-    return np.square(sides_np).sum(axis=1)
-
-
-def _spread_chain_frames(order: np.ndarray, rotations: int) -> np.ndarray:
+def _best_chain(chain_state: twt.Array2dFloat32) -> tuple[wp.mat33, wp.vec3, wp.vec3]:
     """
-    Pick the refinement chains' starting frames: the loss table's head, greedily spread.
+    Unpack the best chain's row -- the search's one host readback.
 
-    Adjacent spiral candidates score adjacently, so the top of the table is usually one basin
-    sampled several times; the greedy pass keeps only heads at least 0.2 rad apart so the chains
-    explore *different* basins. Falls back to the plain head when the spread exhausts the window.
-
-    Runs once per [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box] call (before the
-    refinement loop, not inside it) on at most 32 candidates picking `_REFINE_CHAINS`, so it is
-    Python-call-overhead bound rather than compute bound.
+    Seeding writes every chain's loss as ``+inf`` and refinement replaces it, so with no refinement
+    this picks the single seeded row and with refinement the chain that descended furthest. The
+    column layout is ``kernels/bounds.write_chain_state``'s.
     """
-    head = order[: min(32, rotations)]
-    head_frames = _spiral_frames(head, rotations)
-    flat = head_frames.reshape(head_frames.shape[0], 9)
-    # angle < 0.2 rad  <=>  trace > 1 + 2*cos(0.2), since acos is decreasing and every trace here
-    # already lies in the valid [-1, 3] range for a rotation-matrix pair -- no clip needed.
-    trace_threshold = 1.0 + 2.0 * math.cos(0.2)
-    picked = [0]
-    for i in range(1, flat.shape[0]):
-        if len(picked) == _REFINE_CHAINS:
-            break
-        candidate = flat[i]
-        far = True
-        for j in picked:
-            if candidate @ flat[j] > trace_threshold:
-                far = False
-                break
-        if far:
-            picked.append(i)
-    for i in range(1, flat.shape[0]):
-        if len(picked) == _REFINE_CHAINS:
-            break
-        if i not in picked:
-            picked.append(i)
-    return np.ascontiguousarray(head_frames[picked], dtype=np.float64)
-
-
-def _spiral_frames(indices: np.ndarray, rotations: int) -> np.ndarray:
-    """
-    Reproduce ``oriented_box_candidate_axes`` on the host for a handful of indices.
-
-    Same float64 phase math and the same world-to-box transpose as the kernel; recomputing beats
-    reading the frames back one 36-byte gather at a time.
-    """
-    n_spiral = rotations - 1
-    quats = np.zeros((len(indices), 4))
-    quats[:, 3] = 1.0
-    spiral = np.asarray(indices) < n_spiral
-    s = np.asarray(indices, dtype=np.float64)[spiral] + 0.5
-    phase = 2.0 * math.pi * s
-    alpha = phase / math.sqrt(2.0)
-    beta = phase / 1.533751168755204288118041
-    height = s / float(max(n_spiral, 1))
-    radius = np.sqrt(height)
-    radius_conjugate = np.sqrt(1.0 - height)
-    quats[spiral] = np.stack(
-        [
-            radius * np.sin(alpha),
-            radius * np.cos(alpha),
-            radius_conjugate * np.sin(beta),
-            radius_conjugate * np.cos(beta),
-        ],
-        axis=1,
-    )
-    x, y, z, w = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
-    return np.array(
-        [
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-        ]
-    ).transpose(2, 1, 0)
+    state_np = chain_state.numpy()
+    row = state_np[int(state_np[:, 0].argmin())]
+    return (wp.mat33(*row[7:16]), wp.vec3(*row[1:4]), wp.vec3(*row[4:7]))

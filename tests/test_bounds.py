@@ -949,6 +949,89 @@ def test_oriented_bounding_box_refinement_is_monotone(
     assert refined <= volume(32768, 0) * (1.0 + 1e-6)
 
 
+@pytest.mark.parametrize("rotations", [1, 2, 3, 4, 33])
+def test_oriented_bounding_box_refines_from_fewer_candidates_than_chains(
+    rotations: int, device: str
+) -> None:
+    """
+    Refinement is reachable below ``_REFINE_CHAINS`` candidates, and still never loses to the AABB.
+
+    Triwarp against triwarp -- no reference refines a sampled box, and the oracle here is the
+    axis-aligned box the candidate set is built to contain. The counts straddle two boundaries the
+    rest of the file never reaches: the chain seeding has fewer distinct candidates than chains to
+    give them below four, so it pads by repeating a pick, and ``_REFINE_WINDOW`` bounds the walk at
+    33. Every other refinement test runs the 4 096 default, where neither branch is taken.
+
+    What this covers is that those counts produce a *valid, refined* box, not the padding line
+    itself: a chain seeded from a bad frame loses the final argmin, so the answer survives it
+    (verified by disabling the pad, which leaves every test in this file passing). The padding is
+    there so the seeding never hands the refinement an unwritten frame, and the kernel clamps that
+    read besides.
+    """
+    rng = np.random.default_rng(31)
+    cloud_np = (rng.standard_normal((2_000, 3)) @ np.diag([4.0, 1.0, 0.3])).astype(np.float32)
+    cloud_wp = points_to_warp(cloud_np, device)
+
+    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(
+        cloud_wp, rotations, refine_iterations=8
+    )
+
+    assert np.allclose(_frame_np(rotation_wp) @ _frame_np(rotation_wp).T, np.eye(3), atol=1e-5)
+    volume_wp = float(np.prod(np.ptp(_bounds_np(lower_wp, upper_wp), axis=0)))
+    volume_aabb = float(np.prod(np.ptp(_bounds_np(*tw.bounds.aabb(cloud_wp)), axis=0)))
+    assert volume_wp <= volume_aabb * (1.0 + 1e-6)
+    # Non-vacuity: this cloud is tilted, so refinement has something to find even from one
+    # candidate -- otherwise every count would pass by returning the axis-aligned box.
+    assert volume_wp < volume_aabb * 0.95
+    assert np.isclose(
+        volume_wp, _achieved_loss(cloud_np, _frame_np(rotation_wp), "volume"), rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize("seed_device", ["cpu", "cuda:0"])
+def test_oriented_bounding_box_chain_seeding_agrees_across_devices(seed_device: str) -> None:
+    """
+    Triwarp against triwarp: the single-block chain seeding must pick the same frames on the CPU.
+
+    ``oriented_box_seed_chains`` is the module's only ``wp.launch_tiled`` kernel, and the ``device``
+    fixture returns ``cuda:0`` whenever CUDA is present, so without an explicit parametrize its CPU
+    path is never executed. There ``wp.launch_tiled`` runs one lane per block and ``wp.block_dim()``
+    reads 1, so the lone lane walks the whole loss table and every ``tile_argmin`` folds a
+    one-element tile -- which is correct precisely because the walk strides by ``wp.block_dim()``
+    rather than by a constant.
+
+    CUDA carries the oracle: it is the device every other test in this file runs on.
+    """
+    if seed_device == "cuda:0" and wp.get_cuda_device_count() == 0:
+        pytest.skip("no CUDA device")
+    rng = np.random.default_rng(37)
+    cloud_np = (rng.standard_normal((1_500, 3)) @ np.diag([3.0, 1.5, 0.4])).astype(np.float32)
+
+    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(
+        points_to_warp(cloud_np, seed_device), 512, refine_iterations=0
+    )
+
+    # The sampled phase is a pure argmin over a loss table, so the claim is that both devices pick
+    # the *same candidate*, not merely a similar box -- two different candidates of a 512-frame
+    # spiral are O(1) apart, so a tolerance this tight can only pass for one of them. It cannot be
+    # bit-equality: ``oriented_box_candidate_axes`` fuses its ``quat_to_matrix`` multiply-adds on
+    # CUDA and not on the CPU, so the candidate set itself differs by 1.19e-07 before any search
+    # runs (measured, and the same on both sides of this change).
+    reference_wp = points_to_warp(cloud_np, "cpu")
+    rotation_cpu, lower_cpu, upper_cpu = tw.bounds.oriented_bounding_box(
+        reference_wp, 512, refine_iterations=0
+    )
+    assert np.allclose(_frame_np(rotation_wp), _frame_np(rotation_cpu), rtol=0, atol=1e-6)
+    assert np.allclose(
+        _bounds_np(lower_wp, upper_wp), _bounds_np(lower_cpu, upper_cpu), rtol=0, atol=1e-5
+    )
+    # Non-vacuity: the search must have improved on the axis-aligned box it also contains.
+    assert (
+        _achieved_loss(cloud_np, _frame_np(rotation_wp), "volume")
+        < _achieved_loss(cloud_np, np.eye(3), "volume") * 0.99
+    )
+
+
 def test_oriented_bounding_box_empty_cloud(device: str) -> None:
     """An empty cloud gives the identity frame and the same inverted box ``aabb`` returns."""
     empty_wp = wp.zeros(0, dtype=wp.vec3, device=device)
@@ -967,6 +1050,6 @@ def test_oriented_bounding_box_rejects_bad_arguments(device: str) -> None:
     with pytest.raises(ValueError, match="rotations must be >= 1"):
         tw.bounds.oriented_bounding_box(points_wp, 0)
     with pytest.raises(ValueError, match="objective must be"):
-        tw.bounds.oriented_bounding_box(points_wp, 8, "perimeter")  # type: ignore[arg-type]
+        tw.bounds.oriented_bounding_box(points_wp, 8, "perimeter")
     with pytest.raises(ValueError, match="refine_iterations must be >= 0"):
         tw.bounds.oriented_bounding_box(points_wp, 8, refine_iterations=-1)

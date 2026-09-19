@@ -633,7 +633,7 @@ def _launch_global_vec3_minmax(array: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.ve
     corners = wp.full(6, math.inf, dtype=wp.float32, device=array.device)
     wp.launch(
         kernel_reduce.minmax_vec3_chunked,
-        dim=(n + TILE_1D - 1) // TILE_1D,
+        dim=kernel_reduce.chunks_1d(n),
         inputs=[array, corners],
         device=array.device,
     )

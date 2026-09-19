@@ -1501,6 +1501,14 @@ only that it does not break a convention the package already holds to.
   `@wp.struct`, the first `wp.ref`, the first tile intrinsic), grep `tests/api_conventions.py` for
   checks that pattern-match on AST node types and ask whether the new construct is invisible to them.
   A green suite after a refactor is equally consistent with "still covered" and "no longer looked at".
+  **A plain `@wp.func` extraction does it too**, which is the cheaper and likelier version of the
+  same failure: check 13 resolves store targets syntactically, so moving a kernel's writes into a
+  helper it passes the buffer to removes that buffer from the check's view entirely. Landed doing
+  exactly that to `bounds.oriented_box_select_chains`' `chain_state` — caught, as before, only by
+  the staleness half reporting the allowlist entry as matching nothing. **So §2.4's "extract the
+  shared run" and this check are in tension, and the extraction wins**: the entry comes out and the
+  convention goes on binding the parameter unenforced. Worth knowing before reading a clean check-13
+  run as coverage of a module that factors its stores.
 - **Keep writing checks with a staleness half.** The tell that caught the struct case was check 13
   complaining that two allowlist entries no longer matched anything.
 
@@ -5509,6 +5517,62 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
     13-18 % — the highest in the tree after `parametric_surface` — but that NumPy is over
     `rotations`-sized candidate tables and is microseconds; the 35 `wp.copy` calls above it were
     0.52 ms. **Read what the host time actually is before attributing it to NumPy.**
+  - **That last sentence was right about the method and wrong about this function, and the
+    correction is the next entry.** "Microseconds" was an estimate, not a measurement; the block is
+    234 µs.
+
+- **SHIPPED — `bounds.oriented_bounding_box`'s global phase scores, ranks and seeds on the device:
+  1.23-1.32x, and the whole search is now one readback.** The entry above moved the *refinement*
+  loop onto the device and left the global phase host-side, on the reasoning — written into the
+  function's own `Notes` — that a `(rotations, 6)` table is "far too small to be worth a device
+  pass". Measured, that block is **234.2 µs and flat in the cloud size**, so its share falls while
+  its cost does not: 14.0 % of the call at 8 171 points, 12.1 % at 35 947, 7.3 % at 200 000.
+  - Where it went: `corners.numpy()` (98 KB) 28.7 µs, `_objective_losses` 63.6, `np.argsort` 28.5,
+    `_spread_chain_frames` 33.3, the `wp.array(chains_np)` upload 19.5.
+  - **`_objective_losses` was 63.6 µs, of which 47.7 is `sides.prod(axis=1)` alone** on a
+    `(4096, 3)` array — numpy reducing over a length-3 axis, where `s[:,0]*s[:,1]*s[:,2]` is
+    bitwise identical and ~2 µs. A further 13.6 µs was the strided `up - lo`, since
+    `corners_np[:, :3]` has stride 24 (15.04 µs strided against 1.47 contiguous). **A numpy
+    reduction over a short trailing axis is a pathological shape, not a cheap one** — worth
+    checking before pricing any host-side table op by its element count.
+  - Now two kernels — `oriented_box_losses`, then a single-block `oriented_box_seed_chains` that
+    walks the loss table in ascending `(loss, index)` order with `tile_argmin` and runs the same
+    0.2 rad basin spread — and four private helpers deleted. Measured against a detached worktree,
+    three alternating process pairs, min of 9 x 25: **1.324 / 1.302 / 1.232x** at
+    8 171 / 35 947 / 200 000 points. That is 307-327 µs, **more than the 234 µs the block itself
+    cost**, because the readback also drained the pipeline in front of it.
+  - **Deterministic half**: readbacks per call **2 → 1** without refinement and **3 → 1** with it,
+    uploads **1 → 0**.
+  - **The host helper it deleted was a second implementation of a kernel** — §2.4's duplicated
+    decision rule across the host/device boundary. `_spiral_frames` reproduced
+    `oriented_box_candidate_axes`' spiral in numpy so the refinement could start from a frame
+    without reading one back, and the two were never bit-identical: the host narrowed *after*
+    building the matrix, the kernel narrows the quaternion first. So the refinement descended from
+    a frame fractionally different from the one that had been scored. That is why 76 of 105 refined
+    configurations move by ±3e-7 relative, symmetrically — 37 better, 33 worse. It is the fix
+    landing, not drift.
+  - **Two of 105 unrefined configurations select a different frame, and both are genuine ties.**
+    `wp.dot` sums in a different order than `np.square(...).sum(axis=1)`, so the two loss tables
+    differ by about one ulp; on a rotationally symmetric needle **three candidates attain the exact
+    minimum** and a 1-ulp difference picks another of them. Achieved loss agrees to 1e-6. The suite
+    survives it because `test_oriented_bounding_box_matches_igl` compares the *achieved objective*
+    rather than the frame — the right shape for any test of a search whose answer can tie.
+  - **The seeding block is 45.8 / 26.7 / 19.3 / 19.4 / 20.8 µs at `block_dim` 32 / 64 / 128 / 256 /
+    512**, chains identical at every width: it is scan-bound, not reduction-bound, so it wants a
+    wide block. 256 rather than the 128 that ties with it, because 256 is Warp's default and a
+    second `block_dim` loads the whole module a second time (§2.5).
+  - **The padding that fills a chain when there are fewer candidates than chains is not gated by
+    any value test, and cannot be**: a chain seeded from a bad frame simply loses the final argmin,
+    so disabling the pad leaves every test in `tests/test_bounds.py` passing. What it actually
+    prevents is an `axes[-1]` load, so the kernel clamps the index at the read as well (§12.1 —
+    range-check at the access, not downstream of it). **A guard whose only failure mode is an
+    out-of-bounds read needs the check, not a test.**
+  - **Declined for now: a global farthest-first seed** — 4 rounds of "best candidate ≥ 0.2 rad from
+    every chain picked so far" over all 4 096, rather than a 32-wide window — measured **29.0 µs
+    against the faithful walk's 66.7** and box volumes of 1.00000 / 1.00158 / 0.96190 / 0.99553 on
+    four shapes, i.e. better on average. The 1.00158 would eat half the 0.3 % margin
+    `test_oriented_bounding_box_refinement_is_monotone` documents on the icosahedron, so it needs
+    its own evaluation across `MESHES` rather than riding on a change that alters no answer.
 
 - **SHIPPED — `cone` and `cylinder` are closed-form kernels, not `revolve` compositions: 2.43-2.60x
   at every section count.** Both built a three- or four-point NumPy profile, **uploaded** it, and
@@ -5563,6 +5627,26 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   `aabb_union` leaves the path. The all-empty case still returns `inf` with no branch, because the
   seeded `inf` survives. `aabb` itself is untouched and is *at* the floor — one launch plus one
   readback, and it returns host `wp.vec3`s.
+    - **REFUTED — concatenating the two clouds and reducing once instead.** Interleaved in one
+      process, min of 15 x 60 reps, `n` + 10 000 query points: **0.881 / 0.898 / 0.947 / 0.939 /
+      0.914x** at n = 1 000 / 8 171 / 35 947 / 437 645 / 4 000 000. A 6-14 % loss at every size,
+      because the union is a `wp.empty` plus two `wp.copy` of the whole data — 48 MB at 4 M points
+      — to remove one `wp.launch`, which is 11.8 µs *flat in its `dim`* (§13.1). There is no second
+      readback to remove; the entry above already took it out.
+    - **The negated upper corner is orthogonal to that question**, which is worth writing down
+      because the two look connected. It exists so a single `wp.full(6, inf)` seeds both ends and
+      every update is an `atomic_min`; concatenating does not touch it. Unpacking it would need a
+      two-value seed (`wp.empty` plus two slice `fill_`s, 12.5 µs against `wp.full`'s 9.3, and the
+      pattern §3.3 forbids) and would fork a packing **four** readers share —
+      `minmax_vec3_chunked`, `oriented_box_extents`, `scatter_group_bounds`,
+      `packed_box_diagonals`.
+    - **A §15.7 instance with a number**: the *first*, non-interleaved pass of this A/B reported
+      concatenation **winning 1.037x** at 437 645. Interleaving the arms under one clock state
+      flipped it to 0.939x. Timing all of A then all of B was enough to invert a 10 % verdict on a
+      110 µs call.
+    - Both launches now take their `dim` from `kernel_reduce.chunks_1d`, the §13.2 counterpart to
+      `blocks_1d` for the *unfolded* `TILE_1D` kernels: two sites had open-coded the division, and
+      `blocks_1d` is wrong for `minmax_vec3_chunked` by a factor of `TILES_PER_BLOCK_1D`.
 - **SHIPPED — the producer-then-reduce fusion, tree-wide scan and three conversions.** An `ast`
   scan of `triwarp/*.py` for "a `wp.map` / `wp.launch` writes a buffer, a `tw.reduce.*` within a few
   statements reduces it to a scalar" finds **33 sites**; each carries one allocation, one launch and
