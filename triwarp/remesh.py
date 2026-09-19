@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import Literal, NamedTuple, overload
+from typing import Any, Literal, NamedTuple, overload
 
 import warp as wp
 import warp.sparse as wps
@@ -1356,7 +1356,7 @@ class _DecimationBuffers:
         self._track_index = track_index
         self._graph = None
         self._passes = 0
-        self._retain: list = []
+        self._retain: list[Any] = []
         self.n_faces = int(faces.shape[0]) // 3
         self.n_vertices = int(vertices.shape[0])
         self.n_corners = 3 * self.n_faces
@@ -1696,7 +1696,7 @@ class _DecimationBuffers:
             prune_numerical_zeros=False,
         )
 
-    def _compact(self, remap: wp.array[wp.int32], dummy: wp.int32) -> list[wp.array]:
+    def _compact(self, remap: wp.array[wp.int32], dummy: wp.int32) -> list[twt.ArrayNd]:
         """
         Rebuild the face and vertex buffers in place, publishing both new counts to ``state``.
 
@@ -1803,7 +1803,7 @@ def _run_collapse_rounds(
     positions: wp.array[wp.vec3],
     count: wp.array[wp.int32],
     surplus: wp.array[wp.int32],
-) -> list[wp.array]:
+) -> list[twt.ArrayNd]:
     """
     Commit independent sets of collapses against one scoring, until a round finds nothing new.
 

@@ -989,10 +989,29 @@ class BenchLibrary:
         ``lucy`` pytorch3d rows were then measured **uncapped** with it in place and the module runs
         107 passed / exit 0 with zero allocation failures, so the size cap that was going to
         accompany this was dropped rather than shipped -- it would have cost four real comparisons.
+
+        **A ``pytorch3d`` row also opts out of torch's sparse-tensor invariant checks**, before the
+        timed region. torch validates nothing by default and warns once per process that it is
+        doing so, which is the only warning a benchmark run raises; opting out explicitly silences
+        it while leaving the row timing exactly what it timed before. Out rather than in because
+        the checks cost **1.04-1.07x** of a sparse construction (measured interleaved on a
+        40 962-vertex ``ops.laplacian``) and ``ops.laplacian`` / ``cot_laplacian`` /
+        ``norm_laplacian`` / ``mesh_laplacian_smoothing`` all build a COO tensor inside the call
+        being timed -- so leaving them on would charge the reference for validation triwarp's row
+        does not perform, in the one module (``test_laplacian``) whose whole point is a
+        like-for-like race between two sparse assemblies. ``tests/conftest.py`` opts *in*, where
+        there is no clock to bias and a malformed tensor should raise rather than segfault.
         """
         device = self.device
         needs_cuda_sync = device is not None and device.startswith("cuda")
         needs_torch_sync = needs_cuda_sync and self.kind == "pytorch3d"
+        if self.kind == "pytorch3d":
+            # Guarded on the kind so this stays inside the lazy-import discipline the rest of this
+            # file keeps: a run with no pytorch3d row never reaches it and never pays the ~4 s
+            # torch import. Idempotent, so once per row is fine.
+            import torch
+
+            torch.sparse.check_sparse_tensor_invariants.disable()
 
         def target(*args: Any) -> Any:
             result = fn(*args)

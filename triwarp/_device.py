@@ -272,7 +272,7 @@ def _named_devices(name: str, value: Any) -> list[tuple[str, Any]]:
 
 # One scratch buffer per dtype for ``read_scalar`` below, allocated on first use and reused for the
 # life of the process. A single element each, so the whole table is a few dozen bytes.
-_SCALAR_SCRATCH: dict[type, wp.array] = {}
+_SCALAR_SCRATCH: dict[type, wp.array[Any]] = {}
 
 
 def read_scalar(arr: wp.array[Any], index: int = -1) -> Any:

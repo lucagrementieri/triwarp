@@ -411,7 +411,10 @@ def _unoriented_boundary_cycles(
         dart_edges, 2 * n_vertices, validate=False
     )
     darts_np = flat_darts.numpy()
-    bounds_np = np.append(dart_offsets.numpy(), darts_np.shape[0])
+    # ``wp.array.numpy()`` carries no return annotation, so pyright infers a shape-typed
+    # ``ndarray[tuple[()], ...]`` whose ``.shape`` indexes out of range. Runtime rank is 1.
+    n_darts = darts_np.shape[0]  # pyright: ignore[reportGeneralTypeIssues]
+    bounds_np = np.append(dart_offsets.numpy(), n_darts)
     loops_np = [
         darts_np[start:stop] // 2
         for start, stop in itertools.pairwise(bounds_np)
@@ -759,7 +762,7 @@ def _launch_loop_measure(
     starts: wp.array[wp.int32],
     sizes: wp.array[wp.int32],
     n_loops: int,
-) -> wp.array:
+) -> twt.ArrayNd:
     """
     One segmented launch over every packed loop at once, shared by both measures and both forms.
 

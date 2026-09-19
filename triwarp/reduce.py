@@ -594,7 +594,7 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
 
 
 def _launch_vec3_tiled_sum(
-    kernel: wp.Kernel, n: int, device: wp.DeviceLike, inputs: list[wp.array]
+    kernel: wp.Kernel, n: int, device: wp.DeviceLike, inputs: list[twt.ArrayNd]
 ) -> wp.vec3:
     """
     Shared boilerplate behind ``sum``'s and ``weighted_sum``'s ``wp.vec3`` branches.

@@ -2774,7 +2774,7 @@ def _apply_transform(
     )
 
 
-def _upload_points(points_np: np.ndarray, dtype: type, device: wp.DeviceLike) -> wp.array:
+def _upload_points(points_np: np.ndarray, dtype: type, device: wp.DeviceLike) -> twt.ArrayNd:
     """
     Upload an ``(n, 2)`` or ``(n, 3)`` host point table as a ``wp.vec2`` / ``wp.vec3`` buffer.
 

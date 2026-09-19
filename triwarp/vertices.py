@@ -150,7 +150,7 @@ def _accumulate_and_normalize(
     faces: wp.array[wp.int32],
     scatter_table: kernel_array.OverloadTable,
     values: wp.array[wp.vec3],
-    *extra: wp.array,
+    *extra: twt.ArrayNd,
 ) -> wp.array[wp.vec3]:
     """
     Scatter per-face vectors onto their corners and unit-normalize the sums.
@@ -414,7 +414,7 @@ def vertex_defects(
     return angle_sum
 
 
-def _require_face_rows(n_faces: int, **named: wp.array) -> None:
+def _require_face_rows(n_faces: int, **named: twt.ArrayNd) -> None:
     """
     Check that every named per-face table has one row per triangle.
 

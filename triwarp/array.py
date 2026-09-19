@@ -786,7 +786,7 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
 
 def triplet_buffers(
     n_triplets: int, dtype: type, device: wp.DeviceLike
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array]:
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], twt.ArrayNd]:
     """
     Uninitialized ``(rows, cols, values)`` COO buffers for one ``bsr_from_triplets`` build.
 
@@ -1249,7 +1249,7 @@ def gather(
     return out
 
 
-def astype(values: twt.ArrayNd, dtype: type) -> wp.array:
+def astype(values: twt.ArrayNd, dtype: type) -> twt.ArrayNd:
     """
     Element-wise dtype conversion, shape and rank preserved (``numpy.ndarray.astype``).
 

@@ -69,7 +69,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import Literal
+from typing import Literal, overload
 
 import numpy as np
 import warp as wp
@@ -1091,6 +1091,32 @@ def fill_smooth(
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
 
 
+@overload
+def refill_region(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_mask: wp.array[wp.bool],
+    metric: str = "plane_normalized",
+    *,
+    triangulate_only: bool = False,
+    max_edge: float | None = None,
+    smooth_curvature: bool = True,
+    refine: Literal["max_edge", "density"] = "max_edge",
+    return_patch: Literal[False] = False,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]: ...
+@overload
+def refill_region(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_mask: wp.array[wp.bool],
+    metric: str = "plane_normalized",
+    *,
+    triangulate_only: bool = False,
+    max_edge: float | None = None,
+    smooth_curvature: bool = True,
+    refine: Literal["max_edge", "density"] = "max_edge",
+    return_patch: Literal[True],
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]: ...
 def refill_region(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],

@@ -31,6 +31,7 @@ from types import CodeType  # noqa: E402
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
+import torch  # noqa: E402
 import trimesh as tm  # noqa: E402
 import warp as wp  # noqa: E402
 from meshlib import mrmeshpy as mm  # noqa: E402
@@ -50,6 +51,26 @@ from triwarp.mesh import _CachedProperty  # noqa: E402
 # is no mismatch to reject and only check 15's static scan sees it.
 if hasattr(wp.config, "launch_array_access_mode"):  # warp >= 1.14
     wp.config.launch_array_access_mode = wp.config.LaunchArrayAccessMode.STRICT
+
+# Opt **in** to torch's sparse-tensor invariant checks, explicitly. torch validates nothing by
+# default and says so once per process -- "Sparse invariant checks are implicitly disabled. Memory
+# errors (e.g. SEGFAULT) will occur when operating on a sparse tensor which violates the
+# invariants ... explicitly opt in or out" -- which is this suite's only warning on a CPU run. It
+# is raised from inside pytorch3d's ``laplacian_matrices.py``, where it builds the COO tensors
+# ``test_laplacian`` and ``test_energies`` compare against, so nothing triwarp passes it changes
+# whether it fires: the notice is about torch's global state, not about our input.
+#
+# *In* is the right half of the choice here, for the same reason STRICT is above. This suite holds
+# nine reference libraries to their published behaviour and several of them are documented to be
+# memory-unsafe on ordinary input, while pytorch3d specifically is pinned to upstream ``main`` --
+# so a malformed tensor from a future pin should surface as an exception naming the invariant it
+# broke, not as a SIGSEGV with no Python frame. Measured cost of the checks, interleaved in one
+# process on a 40 962-vertex ``ops.laplacian``: **1.04-1.07x** of the sparse construction, in the
+# handful of tests that build one.
+#
+# ``benchmarks/conftest.py`` opts *out* instead, and that is not an inconsistency: a timed
+# pytorch3d row must not be charged for validation triwarp's row does not perform.
+torch.sparse.check_sparse_tensor_invariants.enable()
 
 
 def pytest_configure(config: pytest.Config) -> None:

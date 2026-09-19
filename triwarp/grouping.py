@@ -16,7 +16,11 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import triangles as kernel_triangles
 
-Scalar = TypeVar("Scalar", bound=wp.Scalar)
+# Unbounded on purpose: ``wp.Scalar`` is itself a ``typing.TypeVar`` rather than a class or a
+# union, so ``bound=wp.Scalar`` bounds a type variable by a type variable -- invalid, and it
+# never constrained anything. The admissible dtypes are the ones ``unique_1d``'s docstring
+# names and its overloads spell out.
+Scalar = TypeVar("Scalar")
 
 
 def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
@@ -391,11 +395,11 @@ def unique_rows(
     data: twt.Array2dFloat32, *, return_inverse: Literal[True], return_counts: Literal[True]
 ) -> tuple[twt.Array2dFloat32, wp.array[wp.int32], wp.array[wp.int32]]: ...
 def unique_rows(
-    data: wp.array, *, return_inverse: bool = False, return_counts: bool = False
+    data: twt.ArrayNd, *, return_inverse: bool = False, return_counts: bool = False
 ) -> (
-    wp.array
-    | tuple[wp.array, wp.array[wp.int32]]
-    | tuple[wp.array, wp.array[wp.int32], wp.array[wp.int32]]
+    twt.ArrayNd
+    | tuple[twt.ArrayNd, wp.array[wp.int32]]
+    | tuple[twt.ArrayNd, wp.array[wp.int32], wp.array[wp.int32]]
 ):
     """
     Find unique rows of a 2D Warp array (``numpy.unique`` along axis 0).
@@ -533,7 +537,7 @@ def unique_faces(
 
 
 def _unique_rows_core(
-    data: wp.array, *, return_counts: bool
+    data: twt.ArrayNd, *, return_counts: bool
 ) -> tuple[wp.array[wp.uint64], wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32] | None]:
     """
     Shared core of [`unique_rows`][triwarp.grouping.unique_rows]: hash, dedup, find first index.
@@ -545,11 +549,13 @@ def _unique_rows_core(
     each representative's original vertex order. Requires ``data.shape[0] > 0``.
     """
     row_keys = hash_rows(data)
-    keys_result = unique_1d(row_keys, return_inverse=True, return_counts=return_counts)
+    # Call under a literal in each branch rather than unpacking one union-typed result: the
+    # ``return_counts`` overloads of ``unique_1d`` cannot discriminate a runtime bool, so the
+    # single-call form hands back a union nothing can narrow.
     if return_counts:
-        unique_keys, inverse, counts = keys_result
+        unique_keys, inverse, counts = unique_1d(row_keys, return_inverse=True, return_counts=True)
     else:
-        unique_keys, inverse = keys_result
+        unique_keys, inverse = unique_1d(row_keys, return_inverse=True, return_counts=False)
         counts = None
     # The class count is the length of the unique-key array ``unique_1d`` just returned; recovering
     # it as ``reduce.max(inverse) + 1`` would be a whole reduction launch and a host sync for a
@@ -896,14 +902,14 @@ def sorted_undirected_edge_keys(edges: twt.Array2dInt32, n_vertices: int) -> wp.
 
 
 def _pack_unique_result(
-    unique: wp.array,
+    unique: twt.ArrayNd,
     *,
     inverse: wp.array[wp.int32] | None = None,
     counts: wp.array[wp.int32] | None = None,
 ) -> (
-    wp.array
-    | tuple[wp.array, wp.array[wp.int32]]
-    | tuple[wp.array, wp.array[wp.int32], wp.array[wp.int32]]
+    twt.ArrayNd
+    | tuple[twt.ArrayNd, wp.array[wp.int32]]
+    | tuple[twt.ArrayNd, wp.array[wp.int32], wp.array[wp.int32]]
 ):
     """Assemble the ``(unique[, inverse][, counts])`` return tuple shared by the unique_* family."""
     if inverse is not None and counts is not None:

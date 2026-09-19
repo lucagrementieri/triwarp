@@ -44,6 +44,7 @@ from enum import StrEnum
 import numpy as np
 import warp as wp
 
+import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import transform as kernel_transform
@@ -841,7 +842,9 @@ def _is_singular(linear: np.ndarray, rtol: float) -> bool:
     return float(singular_values[-1]) <= rtol * sigma_max
 
 
-def _alloc_or_out(out: wp.array | None, n: int, dtype: type, device: wp.DeviceLike) -> wp.array:
+def _alloc_or_out(
+    out: twt.ArrayNd | None, n: int, dtype: type, device: wp.DeviceLike
+) -> twt.ArrayNd:
     """
     Allocate a fresh ``(n,)`` buffer of ``dtype`` when ``out`` is ``None``, else reuse ``out``.
 

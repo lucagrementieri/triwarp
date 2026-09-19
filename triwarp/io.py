@@ -12,7 +12,10 @@ from triwarp._device import require_nonempty_mesh, require_valid_faces
 from triwarp.mesh import Trimesh
 
 if TYPE_CHECKING:
-    import meshio
+    # meshio ships neither a ``py.typed`` marker nor stubs, and there is no ``types-meshio``
+    # on PyPI. It is an optional dependency reached through ``_import_meshio`` alone, so the
+    # untyped surface is confined to this module.
+    import meshio  # pyright: ignore[reportMissingTypeStubs]
 
 # Per-vertex / per-face attribute column names as written by common mesh formats.
 _NORMAL_COLUMNS = ("nx", "ny", "nz")
@@ -136,7 +139,7 @@ def _face_normals_from_cell_data(mesh: meshio.Mesh) -> np.ndarray | None:
 
 def _import_meshio():
     try:
-        import meshio
+        import meshio  # pyright: ignore[reportMissingTypeStubs]
     except ImportError as exc:
         raise ImportError(
             "triwarp.io requires meshio. Install it with `pip install triwarp[io]`."

@@ -18,11 +18,14 @@ from triwarp.kernels import registration as kernel_registration
 from triwarp.kernels import transform as kernel_transform
 
 
-# The ``return_cost=True`` overload comes first because it is the *default*: overload resolution
-# picks the first match, so listing ``Literal[False]`` first would type the bare
+# ``return_cost`` is keyword-only, and that is what lets the overload set be unambiguous. The
+# ``Literal[True]`` overload must come first because ``True`` is the runtime default and overload
+# resolution picks the first match -- listing ``Literal[False]`` first would type the bare
 # ``procrustes(a, b)`` call as returning the matrix alone, when it in fact returns the three-tuple.
-# The default cannot simply be dropped from the ``False`` overload -- ``return_cost`` follows
-# defaulted parameters, so a non-default there is a syntax error.
+# While ``return_cost`` was positional it also had to carry a default in the ``False`` overload
+# (a non-defaulted parameter cannot follow defaulted ones), which made a no-argument call match
+# both overloads with incompatible return types. Keyword-only removes the default, and with it
+# the overlap.
 @overload
 def procrustes(
     a: wp.array[wp.vec3],
@@ -31,6 +34,7 @@ def procrustes(
     reflection: bool = True,
     translation: bool = True,
     scale: bool = True,
+    *,
     return_cost: Literal[True] = True,
 ) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float]: ...
 @overload
@@ -41,7 +45,8 @@ def procrustes(
     reflection: bool = True,
     translation: bool = True,
     scale: bool = True,
-    return_cost: Literal[False] = False,
+    *,
+    return_cost: Literal[False],
 ) -> wp.array[wp.mat44]: ...
 @overload
 def procrustes(
@@ -51,6 +56,7 @@ def procrustes(
     reflection: bool = True,
     translation: bool = True,
     scale: bool = True,
+    *,
     return_cost: bool = True,
 ) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float] | wp.array[wp.mat44]: ...
 def procrustes(
@@ -60,6 +66,7 @@ def procrustes(
     reflection: bool = True,
     translation: bool = True,
     scale: bool = True,
+    *,
     return_cost: bool = True,
 ) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float] | wp.array[wp.mat44]:
     """
@@ -82,7 +89,7 @@ def procrustes(
     scale:
         Allow uniform scaling.
     return_cost:
-        When ``True`` (default) also return the transformed points and cost.
+        Keyword-only. When ``True`` (the default) also return the transformed points and cost.
 
     Returns
     -------
@@ -305,13 +312,18 @@ def icp(
 
         if max_distance is not None and weights is not None:
             if threshold_weight is None:
-                threshold_weight = wp.map(
-                    kernel_registration.distance_threshold_weight,
-                    distance,
-                    triangle_id,
-                    wp.float32(max_distance),
-                    out=weights,
-                    return_kernel=True,
+                # ``cast`` because Warp's stub does not narrow ``wp.map`` on ``return_kernel``:
+                # it returns the output-array union whatever the flag says.
+                threshold_weight = cast(
+                    wp.Kernel,
+                    wp.map(
+                        kernel_registration.distance_threshold_weight,
+                        distance,
+                        triangle_id,
+                        wp.float32(max_distance),
+                        out=weights,
+                        return_kernel=True,
+                    ),
                 )
             wp.launch(
                 threshold_weight,
@@ -712,13 +724,17 @@ def icp_point_to_plane(
         # the last real cost (or ``math.inf`` if nothing ever matched).
         if valid is not None:
             if residual_valid is None:
-                residual_valid = wp.map(
-                    kernel_registration.residual_valid,
-                    triangle_id,
-                    distance,
-                    wp.float32(max_d),
-                    out=valid,
-                    return_kernel=True,
+                # See ``icp``: Warp's ``wp.map`` stub does not narrow on ``return_kernel``.
+                residual_valid = cast(
+                    wp.Kernel,
+                    wp.map(
+                        kernel_registration.residual_valid,
+                        triangle_id,
+                        distance,
+                        wp.float32(max_d),
+                        out=valid,
+                        return_kernel=True,
+                    ),
                 )
             wp.launch(
                 residual_valid,

@@ -113,6 +113,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from typing import Any
 
 import numpy as np
 import warp as wp
@@ -420,9 +421,9 @@ def assemble_interior_system(
 
 
 def solve_spd(
-    matrix: wps.BsrMatrix,
-    rhs: wp.array,
-    solution: wp.array,
+    matrix: wps.BsrMatrix[Any],
+    rhs: twt.ArrayNd,
+    solution: twt.ArrayNd,
     *,
     tol: float = CG_TOLERANCE,
     maxiter: int | None = None,
@@ -977,7 +978,7 @@ def _offdiagonal_dominance(matrix: wps.BsrMatrix[wp.float64]) -> float:
     return float(tw.reduce.max(ratios))
 
 
-def _cg_residual_and_tolerance(result: tuple) -> tuple[float, float]:
+def _cg_residual_and_tolerance(result: tuple[Any, ...]) -> tuple[float, float]:
     """
     Unwrap a conjugate-gradient result's worst-column residual norm and tolerance as host floats.
 
@@ -1411,9 +1412,9 @@ def replicated_operator(
     # Python-level array constructions to a solve — enough to erase the batching win outright, and
     # enough to keep the iteration from being captured as a CUDA graph. The cache is keyed on the
     # full memory layout, so a different buffer (or a re-slice of one) never aliases a stale view.
-    block_views: dict[tuple[int, tuple[int, ...], tuple[int, ...]], list[wp.array]] = {}
+    block_views: dict[tuple[int, tuple[int, ...], tuple[int, ...]], list[twt.ArrayNd]] = {}
 
-    def blocks(array: wp.array) -> list[wp.array]:
+    def blocks(array: twt.ArrayNd) -> list[twt.ArrayNd]:
         key = (array.ptr, tuple(array.shape), tuple(array.strides))
         views = block_views.get(key)
         if views is None:
@@ -1421,7 +1422,7 @@ def replicated_operator(
             block_views[key] = views
         return views
 
-    def matvec(x: wp.array, y: wp.array, z: wp.array, alpha: float, beta: float) -> None:
+    def matvec(x: twt.ArrayNd, y: twt.ArrayNd, z: twt.ArrayNd, alpha: float, beta: float) -> None:
         x_blocks, y_blocks, z_blocks = blocks(x), blocks(y), blocks(z)
         for column in range(n_columns):
             base.matvec(x_blocks[column], y_blocks[column], z_blocks[column], alpha, beta)
@@ -1522,7 +1523,7 @@ def multigrid_preconditioner(
     levels, coarse_inverse = hierarchy
     cycle = _MultigridCycle(levels, coarse_inverse, n_columns=n_columns, stride=n)
 
-    def matvec(x: wp.array, y: wp.array, z: wp.array, alpha: float, beta: float) -> None:
+    def matvec(x: twt.ArrayNd, y: twt.ArrayNd, z: twt.ArrayNd, alpha: float, beta: float) -> None:
         if alpha != 1.0 or beta != 0.0:
             raise ValueError(
                 "multigrid_preconditioner's operator only implements z = M x "
@@ -1625,7 +1626,7 @@ class _MultigridLevel:
 
 def _multigrid_hierarchy(
     matrix: wps.BsrMatrix[wp.float64], seed: int
-) -> tuple[list[_MultigridLevel], wp.array] | None:
+) -> tuple[list[_MultigridLevel], twt.ArrayNd] | None:
     """
     Coarsen ``matrix`` until a level is small enough to invert densely.
 
@@ -1853,7 +1854,7 @@ def _multigrid_prune(matrix: wps.BsrMatrix[wp.float64]) -> wps.BsrMatrix[wp.floa
     return wps.bsr_compress(matrix, prune_numerical_zeros=True)
 
 
-def _multigrid_dense_inverse(matrix: wps.BsrMatrix[wp.float64]) -> wp.array | None:
+def _multigrid_dense_inverse(matrix: wps.BsrMatrix[wp.float64]) -> twt.ArrayNd | None:
     """
     Pseudo-inverse of the coarsest operator as a dense ``(n, n)`` device array, or ``None``.
 

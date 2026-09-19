@@ -134,7 +134,9 @@ def _lexicographic_triangulation(points: wp.array[wp.vec2]) -> np.ndarray:
     NumPy, where it is one vectorised call.
     """
     points_np = points.numpy().astype(np.float64)
-    n = points_np.shape[0]
+    # See ``boundary._loop_owner_labels``: ``wp.array.numpy()`` has no return annotation and
+    # pyright infers an empty shape tuple for it. Runtime rank is 2.
+    n = points_np.shape[0]  # pyright: ignore[reportGeneralTypeIssues]
     order_np = np.lexsort((points_np[:, 1], points_np[:, 0])).astype(np.int32)
 
     # A triangulation of n points has 2n - 2 - h <= 2n - 5 triangles; 2n is the guard capacity.
@@ -1083,29 +1085,31 @@ def resample_uniform(
     pad = 3.0 * voxel_size + max(offset, 0.0)
     grid_lower = wp.vec3(lower[0] - pad, lower[1] - pad, lower[2] - pad)
     grid_upper = wp.vec3(upper[0] + pad, upper[1] + pad, upper[2] + pad)
-    resolution = wp.vec3i(
+    # Carry the extents as plain ints and build the ``wp.vec3i`` once, where the launch needs it:
+    # a ``wp.vec3i`` has to be unpacked with ``int(...)`` at every use anyway.
+    n_x, n_y, n_z = (
+        max(2, math.ceil((grid_upper[axis] - grid_lower[axis]) / voxel_size) + 1)
+        for axis in range(3)
+    )
+    resolution = wp.vec3i(n_x, n_y, n_z)
+    spacing = wp.vec3(
         *(
-            max(2, math.ceil((grid_upper[axis] - grid_lower[axis]) / voxel_size) + 1)
-            for axis in range(3)
+            (grid_upper[axis] - grid_lower[axis]) / float(extent - 1)
+            for axis, extent in enumerate((n_x, n_y, n_z))
         )
     )
-    spacing = wp.vec3(
-        *((grid_upper[axis] - grid_lower[axis]) / float(resolution[axis] - 1) for axis in range(3))
-    )
 
-    n_points = int(resolution[0]) * int(resolution[1]) * int(resolution[2])
+    n_points = n_x * n_y * n_z
     points = wp.empty(n_points, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_reconstruction.lattice_points,
-        dim=(int(resolution[0]), int(resolution[1]), int(resolution[2])),
+        dim=(n_x, n_y, n_z),
         inputs=[resolution, grid_lower, spacing, points],
         device=device,
     )
     field = tw.proximity.signed_distance_on_mesh(vertices, faces, points, sign_mode=sign_mode)
     out_vertices, out_faces = tw.levelset.marching_cubes(
-        twt.as_array3d(
-            field.reshape((int(resolution[0]), int(resolution[1]), int(resolution[2]))), wp.float32
-        ),
+        twt.as_array3d(field.reshape((n_x, n_y, n_z)), wp.float32),
         iso=offset,
         bounds=(grid_lower, grid_upper),
     )

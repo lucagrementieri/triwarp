@@ -30,6 +30,7 @@ that one solves a vector-heat system -- and geodesic *distance* by the heat meth
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import warp as wp
 
@@ -804,7 +805,7 @@ def _length_epsilon(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> f
 
 
 def _trace(
-    kernel: wp.Kernel, inputs: list, n_rays: int, device: wp.DeviceLike
+    kernel: wp.Kernel, inputs: list[Any], n_rays: int, device: wp.DeviceLike
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
     Run a tracing kernel twice: once to count each ray's points, once to write them.

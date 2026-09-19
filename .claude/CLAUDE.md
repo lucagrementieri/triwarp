@@ -2794,6 +2794,23 @@ the suite ran. Fifteen hazards, all measured:
   `utils.torus`, by contrast, takes the **minor** radius first and builds its vertex table in a
   Python double loop, so it needs a real parameter mapping and its benchmark column is a per-vertex
   Python floor.
+- **Every `laplacian_matrices` entry point builds a COO tensor, which makes torch warn once per
+  process — and the two suites answer it in opposite directions on purpose.** torch validates no
+  sparse-tensor invariant by default and says so the first time one is built (*"Memory errors (e.g.
+  SEGFAULT) will occur ... explicitly opt in or out"*, raised from `ATen/Context.cpp`). It is a
+  statement about torch's global state, not about our input, so §7.7's "read the reference's source
+  at the warned line and solve for what input makes it fire" does not apply — no input silences it,
+  only an explicit choice. It was the **only** warning a CPU test run raised and the only one a
+  benchmark run raised. `tests/conftest.py` calls
+  `torch.sparse.check_sparse_tensor_invariants.enable()`, beside the `STRICT` launch mode and for
+  the same reason: pytorch3d is pinned to upstream `main`, and a malformed tensor from a future pin
+  should raise naming the invariant rather than land as a SIGSEGV with no Python frame (§12.1 on
+  what misattributing one costs). `BenchLibrary.run` calls `disable()` on a `pytorch3d` row
+  instead, because the checks cost **1.04-1.07x** of a sparse construction (interleaved, one
+  process, 40 962-vertex `ops.laplacian`) and `laplacian` / `cot_laplacian` / `norm_laplacian` /
+  `mesh_laplacian_smoothing` all build theirs *inside* the timed call — charging the reference for
+  validation triwarp's row does not perform would bias `test_laplacian`, the one module whose point
+  is a like-for-like race between two sparse assemblies.
 
 **Its CPU rows are Θ(N²) on anything with a neighbour query**, because `_C` carries no spatial
 structure on *either* device. Measured: `knn_points` 299.8 / 1 189.5 / 4 562.8 ms and

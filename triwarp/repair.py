@@ -71,7 +71,7 @@ mkdocstrings renders beside it -- so they are
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import Literal, overload
 
 import numpy as np
 import warp as wp
@@ -265,6 +265,17 @@ def _fill_any_boundary(
     return tw.holes.fill_min_weight(vertices, faces)
 
 
+@overload
+def remove_unreferenced_vertices(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    return_inverse: Literal[False] = False,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]: ...
+@overload
+def remove_unreferenced_vertices(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, return_inverse: Literal[True]
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]: ...
 def remove_unreferenced_vertices(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, return_inverse: bool = False
 ) -> (
@@ -1200,6 +1211,22 @@ def straighten_boundary(
     return (faces, added) if return_count else faces
 
 
+@overload
+def remove_degree3_vertices(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    max_iter: int = 8,
+    return_count: Literal[False] = False,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]: ...
+@overload
+def remove_degree3_vertices(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    max_iter: int = 8,
+    return_count: Literal[True],
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], int]: ...
 def remove_degree3_vertices(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],

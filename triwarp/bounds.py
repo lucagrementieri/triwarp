@@ -610,8 +610,6 @@ def oriented_bounding_box(
     best = int(loss_np.argmin())
 
     if refine_iterations == 0:
-        # The winning frame alone, 36 bytes through the shared readback scratch, so the pure
-        # sampled path stays bit-comparable with the device-generated candidate set.
         rotation_np = read_scalar(axes, best)
         return (wp.mat33(*rotation_np.ravel()), wp.vec3(*lower_np[best]), wp.vec3(*upper_np[best]))
 
@@ -709,7 +707,7 @@ def _refine_box(
 
 
 def _score_extents_into(
-    points: wp.array[wp.vec3], axes: wp.array, n_slices: int, corners: wp.array[wp.float32]
+    points: wp.array[wp.vec3], axes: twt.ArrayNd, n_slices: int, corners: wp.array[wp.float32]
 ) -> None:
     """Fill ``corners`` with the cloud's extent in every candidate frame, six packed slots each."""
     # Seeded rather than allocated so the refinement can reuse one buffer across its rounds; the
@@ -724,7 +722,7 @@ def _score_extents_into(
 
 
 def _scored_extents(
-    points: wp.array[wp.vec3], axes: wp.array, n_slices: int
+    points: wp.array[wp.vec3], axes: twt.ArrayNd, n_slices: int
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extent of the cloud in every candidate frame, read back as ``(lower, upper)`` tables."""
     n_axes = int(axes.shape[0])

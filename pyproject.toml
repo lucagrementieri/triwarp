@@ -4,10 +4,12 @@ build-backend = "setuptools.build_meta"
 requires = ["setuptools>=77", "wheel"]
 
 [project]
-authors = [{ name = "Luca Grementieri", email = "luca.grementieri@ens-paris-saclay.fr" }]
+authors = [
+    { name = "Luca Grementieri", email = "luca.grementieri@ens-paris-saclay.fr" },
+]
 description = "Triangular mesh library based on NVIDIA Warp"
 license = "MIT OR Apache-2.0"
-license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
 name = "triwarp"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,8 +25,8 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
-    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -54,7 +56,7 @@ keywords = [
 # ``numpy`` is core, not optional: 16 of the modules ``triwarp/__init__.py`` imports eagerly use it
 # for host-side metadata math. It adds nothing to an install, since ``warp-lang`` itself declares an
 # unconditional ``Requires-Dist: numpy`` and ``import warp`` loads it before triwarp gets a say.
-dependencies = ["warp-lang>=1.17", "numpy>=1.20"]
+dependencies = ["numpy>=1.20", "warp-lang>=1.17"]
 
 [project.urls]
 Documentation = "https://lucagrementieri.github.io/triwarp/"
@@ -70,7 +72,12 @@ io = ["meshio>=5.0"]
 # ``aggregate.py`` text tables: rasterizing a vendored SVG logo to a fixed-size PNG once
 # (``benchmarks/assets/logos/render.py``) and drawing the comparison charts. Neither is a runtime
 # dependency of triwarp itself.
-bench = ["cairosvg>=2.7", "matplotlib>=3.9", "pytest-benchmark>=5.1", { include-group = "test" }]
+bench = [
+    "cairosvg>=2.7",
+    "matplotlib>=3.9",
+    "pytest-benchmark>=5.1",
+    { include-group = "test" },
+]
 dev = ["basedpyright>=1.39", "ruff>=0.9", "scipy-stubs>=1.17.1.5"]
 # Zensical is the builder; ``mkdocs.yml`` stays the config file, which it reads natively.
 # ``mkdocs``, ``mkdocs-material``, ``mkdocs-literate-nav`` and ``mkdocs-section-index`` are all
@@ -218,7 +225,7 @@ branch = true
 # tries to parse that as a path, fails, and emits one ``couldnt-parse`` warning per generated
 # module: 72 of them over a full suite run, none contributing a line to the report. No real source
 # file has a colon in its name, so this omits exactly the synthetic ones.
-omit = ["triwarp/kernels/*", "*.py:*"]
+omit = ["*.py:*", "triwarp/kernels/*"]
 source = ["triwarp"]
 
 [tool.coverage.report]
@@ -292,10 +299,10 @@ split-on-trailing-comma = false
 "meshlib.mrmeshpy" = "mm"
 numpy = "np"
 open3d = "o3d"
-pyvista = "pv"
 "pytorch3d.loss" = "p3d_loss"
 "pytorch3d.ops" = "p3d_ops"
 "pytorch3d.structures" = "p3d_structures"
+pyvista = "pv"
 trimesh = "tm"
 warp = "wp"
 
@@ -321,30 +328,32 @@ typeCheckingMode = "standard"
 venv = ".venv"
 venvPath = "."
 
-# Warp's Python-scope stubs are weak: wp.empty(dtype=wp.float32) is typed as
-# returning array[float]; the twt.Array2d* aliases (wp.array[dtype, Literal[2]])
-# are not assignable to Warp's array[Unknown, int]; BsrMatrix.offsets/.columns/
-# .values exist at runtime but not in the stub; wp.max/wp.mean/wp.__getitem__
-# overloads don't match. Every type-flow rule that touches a Warp array therefore
-# fires on false positives. These are disabled so the residual diagnostics are
-# actionable rather than drowned out. Trade-off: genuine wrapper type errors of
-# these kinds are also silenced.
+# Warp's Python-scope stubs are weak: wp.empty(dtype=wp.float32) is typed as returning
+# array[float] whatever dtype it was handed; the twt.Array2d* aliases
+# (wp.array[dtype, Literal[2]]) are not assignable to Warp's array[Unknown, int];
+# BsrMatrix.offsets/.columns/.values exist at runtime but not in the stub; vec_t's
+# __getitem__ is typed as returning "_wp_scalar_type_ | vec_t" rather than a scalar; and
+# wp.array.numpy() carries no return annotation at all. So the type-flow rules that touch a
+# Warp array fire almost entirely on false positives, and the five expensive ones below stay
+# off so the residual diagnostics are actionable rather than drowned out.
+#
+# Each "none" carries the error count it is actually buying, measured by re-enabling it alone
+# against this config. Re-measure after a warp-lang upgrade -- a stub fix turns one of these
+# into a cheap re-enable, and nothing else will tell you.
+#
+#   reportArgumentType         1172   wp.empty/zeros lose their dtype, so every wrapper->wrapper
+#                                     array argument mismatches. Never actionable.
+#   reportAttributeAccessIssue  127   BsrMatrix.offsets/.columns/.values/.nrow, absent from the
+#                                     stub. graph.py annotates its own sites inline.
+#   reportCallIssue              85   same dtype-blindness reaching overloaded triwarp callees.
+#   reportReturnType             63   a wrapper returning a buffer it allocated with wp.empty.
+#   reportOperatorIssue          23   vec_t.__getitem__'s union under arithmetic (18 sites), and
+#                                     reduce.sum's dtype-blind input widening its return (4).
 reportArgumentType = "none"
-reportAssignmentType = "none"
 reportAttributeAccessIssue = "none"
 reportCallIssue = "none"
-reportGeneralTypeIssues = "none"
-reportInconsistentOverload = "none"
-reportIndexIssue = "none"
-reportInvalidTypeForm = "none"
-reportMissingTypeArgument = "none"
 reportOperatorIssue = "none"
-reportOverlappingOverload = "none"
 reportReturnType = "none"
 
-# warp-lang and igl ship no py.typed marker / stubs.
-reportMissingTypeStubs = "none"
-
-# Keep as an error: catches the Warp §5 gotcha (a variable defined only inside an
-# `if` branch reads as uninitialized when the branch isn't taken).
-reportPossiblyUnboundVariable = "error"
+reportMissingTypeArgument = "error"
+reportMissingTypeStubs = "error"
