@@ -2970,9 +2970,11 @@ uv run basedpyright
 
 - **`triwarp/kernels/` is excluded.** The Warp kernel DSL is not modeled by any stubs and is
   inherently un-typecheckable. Do not try to make kernels type-clean or add `# pyright: ignore` there.
-- **Warp-stub type-flow rules are disabled** (`reportArgumentType`, `reportCallIssue`,
-  `reportAttributeAccessIssue`, `reportIndexIssue`, `reportOperatorIssue`,
-  `reportGeneralTypeIssues` — but **not** `reportReturnType`, which is on; see below).
+- **Warp-stub type-flow rules are disabled** — and the list is exactly three:
+  `reportArgumentType`, `reportAttributeAccessIssue` and `reportOperatorIssue`. **`reportReturnType`
+  and `reportCallIssue` are both ON** (see below); `reportIndexIssue` and `reportGeneralTypeIssues`
+  are *not* disabled either and run at `standard`'s default — this paragraph named them for a while
+  after `pyproject.toml` had stopped doing so, so read the config, not the prose.
   Warp's Python-scope stubs are weak (`wp.empty` typed as returning a
   bare `warp.array`, i.e. `array[Unknown, int]`; `wp.array.__getitem__` typing every *slice* as
   `indexedarray | array`; `warp.sparse` returning `BsrMatrix[BlockType[...]]` from `bsr_diag` /
@@ -2998,6 +3000,40 @@ uv run basedpyright
       `linalg._cg_columns` carried no return annotation at all, so three callers' declared
       returns were unchecked. Fourteen more were ordinary defects (a `tuple(... for _ in
       range(3))` whose arity a fixed-length annotation cannot see, etc.).
+    - **`reportCallIssue` is the second exception and is now ON, at a cost of 44 fixes.** It
+      only ever fires where the callee is **overloaded** — the identical defect against a
+      non-overloaded callee lands in `reportArgumentType` and stays invisible, which is why
+      `polyline.polyline_radius` could pass one buffer to `reduce.mean` (overloaded, resolves via
+      its `wp.array[wp.bool]` arm) and to `reduce.median` (not overloaded, silent) on consecutive
+      lines. Of the 44: **34 were `triwarp.reduce` calls**, failing only because the overloads
+      pinned the rank while their callers use the package's usual rankless `wp.array[dtype]`
+      spelling. The fix is a convention worth knowing — **accept wide, return narrow**: a
+      *parameter* takes the `Any`-ranked `twt.ArrayNd*` family, a *return* keeps the
+      `Literal`-ranked `twt.Array1d*` / `Array2d*` aliases. The dtype still discriminates, so the
+      overload set stays resolvable; only the rank check is given up, and only where the callee
+      never depended on it. `reduce`'s `axis=` overloads deliberately keep `Array2dScalar`,
+      because an axis reduction really is rank-2-only.
+    - **Widening an overload's parameters makes `wp.empty` bind *silently* instead of erroring,
+      so the two halves are one commit.** `wp.empty`/`wp.zeros` return `array[Unknown, int]`, and
+      `Unknown` satisfies every arm — so once the rank stops rejecting it, such an argument picks
+      the **first** overload and `reduce.max` on a `float64` buffer infers `int`. Measured: 13 of
+      the 34 were that shape. The fix is [`twt.empty_1d`][triwarp.typing.empty_1d], which carries
+      both dtype and rank; reach for it whenever a buffer feeds `reduce`. Where the buffer is also
+      *returned* from a `wp.array[dtype]`-annotated function it cannot be converted at all
+      (`NDim` is invariant, so the return would break) — `heat.heat_geodesic`'s `phi` is that
+      case, and takes a `cast` at the call instead. **Check what a buffer is returned as before
+      converting its allocation.**
+    - **Two smaller findings the pass surfaced.** `reduce`'s public overloads declared only
+      int32/float32/float64 while `kernel_reduce._GLOBAL_DTYPES` is
+      `(int32, int64, uint32, uint64, float32, float64)` — so a `wp.int64` reduction was supported
+      at runtime and undeclared, with two in-repo callers relying on it; the global overloads now
+      span it and the `axis` ones deliberately do not (`_AXIS_DTYPES` is the three narrow dtypes).
+      And a `wp.vec3`/`wp.mat44` value can never satisfy `wp.normalize` / `wp.transform_point`:
+      their stubs annotate the `Vector`/`Matrix` hint shells, which nothing concrete derives from
+      (`wp.vec3` is `vec3f`, based on `ctypes.Array`). A value coming *out* of another builtin
+      resolves, because `wp.cross` is declared as returning `Vector[...]`; one held in a variable
+      never does. Those five sites carry `# pyright: ignore[reportCallIssue]`, which
+      `reportUnnecessaryTypeIgnoreComment` will flag the day the stubs are fixed.
     - **The narrowings are two shapes, and only one of them is a `cast`.** A Python-scope *slice*
       is always a dense `wp.array` — `wp.array.__getitem__` carries no annotations, so pyright
       infers `indexedarray | array` from its body — and `twt.as_dense` narrows it with a real

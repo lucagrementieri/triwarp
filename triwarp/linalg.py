@@ -995,7 +995,7 @@ def _offdiagonal_dominance(matrix: wps.BsrMatrix[wp.float64]) -> float:
     """
     n_rows = int(matrix.nrow)
     device = matrix.values.device
-    ratios = wp.empty(n_rows, dtype=wp.float64, device=device)
+    ratios = twt.empty_1d(n_rows, wp.float64, device=device)
     wp.launch(
         kernel_linalg.offdiagonal_dominance_rows,
         dim=n_rows,

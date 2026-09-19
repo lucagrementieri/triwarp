@@ -492,7 +492,7 @@ def mollify_intrinsic(
     # this function's own), not the max: a single long edge on a graded mesh would otherwise inflate
     # delta far past what any degenerate face on the rest of the mesh actually needs.
     scale = float(reduce_mean(edge_lengths))
-    slack = wp.empty(n_faces, dtype=wp.float32, device=device)
+    slack = twt.empty_1d(n_faces, wp.float32, device=device)
     wp.launch(
         kernel_laplacian.triangle_inequality_slack,
         dim=n_faces,

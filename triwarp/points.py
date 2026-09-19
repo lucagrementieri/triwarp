@@ -412,7 +412,11 @@ def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
     # 9.31 us); hand-written components are 2.63 us (13.6x, agreeing to 6e-08) but fork the one
     # tangent-frame rule into a second spelling beside ``kernels/predicates.plane_basis``, which is
     # the duplicated-decision-rule hazard this package treats as a correctness risk.
-    unit_normal = wp.normalize(normal)
+    # ``wp.normalize``'s stub takes the ``Vector`` hint shell, which no concrete Warp type derives
+    # from (``wp.vec3`` is ``vec3f``, based on ``ctypes.Array``), so a vector held in a variable can
+    # never satisfy it. A value straight out of ``wp.cross`` does, which is why the two calls
+    # below need no marker.
+    unit_normal = wp.normalize(normal)  # pyright: ignore[reportCallIssue]
     axis = wp.vec3(1.0, 0.0, 0.0)
     if abs(unit_normal[0]) > 0.9:
         axis = wp.vec3(0.0, 1.0, 0.0)
@@ -1544,8 +1548,9 @@ def radial_sort(
         axis0 = wp.cross(normal, helper)
         axis1 = wp.cross(normal, axis0)
     else:
-        unit_normal = wp.normalize(normal)
-        unit_start = wp.normalize(start)
+        # The ``wp.normalize`` stub gap, as in ``plane_basis`` above.
+        unit_normal = wp.normalize(normal)  # pyright: ignore[reportCallIssue]
+        unit_start = wp.normalize(start)  # pyright: ignore[reportCallIssue]
         if abs(1.0 - abs(wp.dot(unit_normal, unit_start))) < TOLERANCE_ZERO:
             raise ValueError("start must not be parallel with normal")
         axis0 = wp.cross(unit_start, unit_normal)

@@ -1745,15 +1745,20 @@ class Trimesh:
         # ``wp.transform_point`` is Python-scope builtin dispatch (~9 us). Doing it as a NumPy
         # ``3x3 @ v + t`` was measured at 4.92 us and declined: 4 us on a cache-carry path, for a
         # spelling that hides what the line means.
+        # ``wp.transform_point``'s stub takes the ``Vector``/``Matrix`` hint shells, which no
+        # concrete Warp type derives from (``wp.vec3`` is ``vec3f``, based on ``ctypes.Array``), so
+        # a value held in a variable can never satisfy it.
         if (centroid := self._cache.get("centroid")) is not None and kind != "affine":
-            survived["centroid"] = wp.transform_point(
+            survived["centroid"] = wp.transform_point(  # pyright: ignore[reportCallIssue]
                 tw.transform.as_mat44(matrix), cast("wp.vec3", centroid)
             )
         if kind != "translation":
             return
         if (bounds := self._cache.get("bounds")) is not None:
             lower, upper = cast("tuple[wp.vec3, wp.vec3]", bounds)
-            offset = wp.transform_point(tw.transform.as_mat44(matrix), wp.vec3(0.0, 0.0, 0.0))
+            offset = wp.transform_point(  # pyright: ignore[reportCallIssue]
+                tw.transform.as_mat44(matrix), wp.vec3(0.0, 0.0, 0.0)
+            )
             survived["bounds"] = (lower + offset, upper + offset)
 
     def invert(self) -> Trimesh:

@@ -390,7 +390,9 @@ def heat_geodesic(
     # A device reduction rather than ``phi.numpy().min()``: ``phi`` is float64, so a readback moves
     # 8 B per vertex across the bus to produce one scalar, which dominates on a large mesh even
     # though a host reduction wins on a small one.
-    offset = float(twr.min(phi))
+    # ``phi`` is handed back as ``wp.array[wp.float64]``, so it cannot be allocated through
+    # ``empty_1d`` (``NDim`` is invariant); the cast is what tells the overload set its dtype.
+    offset = float(twr.min(cast(twt.ArrayNdFloat64, phi)))
     wp.map(wp.sub, phi, wp.float64(offset), out=phi)
     return phi
 
@@ -517,7 +519,7 @@ def heat_signed_distance(
     diffused = tw.heat.diffuse_tangent_field(
         vector_system, source, preconditioner=vector_preconditioner
     )
-    diffused_lengths = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    diffused_lengths = twt.empty_1d(n_vertices, wp.float64, device=device)
     wp.map(wp.length, diffused, out=diffused_lengths)
     diffused_maximum = tw.reduce.max(diffused_lengths)
 
@@ -864,7 +866,7 @@ def extend_scalar(
         wp.zeros((2, n_vertices), dtype=wp.float64, device=device), wp.float64
     )
     twl.solve_spd_columns(heat_system, rhs, diffused, tol=_CG_TOLERANCE)
-    diffused_indicator, diffused_values = diffused[0], diffused[1]
+    diffused_indicator, diffused_values = twt.as_dense(diffused[0]), twt.as_dense(diffused[1])
 
     # The indicator decays away from the sources *and* carries the mesh's scale, so the "there is no
     # source anywhere near here" cutoff is a fraction of its own maximum. One host readback, as in
@@ -989,7 +991,7 @@ def transport_tangent_vectors(
     # Both questions below are asked relative to the field, because the field's length carries the
     # mesh's scale. One host readback here (``reduce.max`` returns a Python scalar) is negligible
     # next to the three conjugate-gradient solves this function has already run.
-    lengths = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    lengths = twt.empty_1d(n_vertices, wp.float64, device=device)
     wp.map(wp.length, direction, out=lengths)
     maximum = tw.reduce.max(lengths)
 
@@ -1098,7 +1100,7 @@ def log_map(
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.map(kernel_array.to_vec2, transported_raw, out=transported)
 
-    reference_lengths = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    reference_lengths = twt.empty_1d(n_vertices, wp.float64, device=device)
     wp.map(wp.length, transported_raw, out=reference_lengths)
     reference_tolerance = wp.float32(_RELATIVE_ZERO * tw.reduce.max(reference_lengths))
 
@@ -1118,7 +1120,7 @@ def log_map(
     # ``scatter_unit_gradient_to_vertices``), so its magnitude carries the mesh's coordinate scale
     # squared and the floor below it has to be relative to its own maximum -- the same reasoning as
     # ``reference_tolerance`` above, applied to a differently-scaled field.
-    gradient_lengths = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    gradient_lengths = twt.empty_1d(n_vertices, wp.float32, device=device)
     wp.map(wp.length, vertex_gradient, out=gradient_lengths)
     gradient_tolerance = wp.float32(_RELATIVE_ZERO * tw.reduce.max(gradient_lengths))
 

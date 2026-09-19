@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import numpy as np
+import numpy.typing as npt
 import warp as wp
 import warp.sparse as wps
 
@@ -515,7 +516,11 @@ def _pack_in_one_launch(
     word_counts = np.asarray(sizes, dtype=np.int64) * words_per_element
     if int(word_counts.max()) == 0:
         return False
-    record_np = np.zeros(n_segments, dtype=kernel_array.WordSegment.numpy_dtype())
+    # ``Struct.numpy_dtype()`` is unannotated and builds a plain ``dict``, where numpy's
+    # ``zeros`` wants the ``_DTypeDict`` TypedDict; ``np.dtype`` is the documented way to
+    # turn that mapping into a real structured dtype.
+    record_dtype = np.dtype(cast("npt.DTypeLike", kernel_array.WordSegment.numpy_dtype()))
+    record_np = cast("npt.NDArray[np.void]", np.zeros(n_segments, dtype=record_dtype))
     record_np["data"]["data"] = np.asarray([arr.ptr or 0 for arr in arrays], dtype=np.uint64)
     record_np["data"]["shape"][:, 0] = word_counts
     record_np["data"]["strides"][:, 0] = 4
@@ -1051,7 +1056,11 @@ def isin(
         return _reshaped(_isin_lookup_mask(elements_flat, test_elements, max_index, 0), elements)
 
     lo_elements, hi_elements = tw.reduce.minmax(elements_flat)
-    lo_test, hi_test = tw.reduce.minmax(test_elements)
+    # ``test_elements`` is ``wp.array[wp.Int]``, whose dtype is a TypeVar rather than a concrete
+    # integer type, so it matches no overload; ``elements_flat`` needs no cast because ``ArrayNd``
+    # is already dtype-agnostic. The annotation is kept as ``wp.Int`` -- it documents the integer
+    # constraint that makes this reduction meaningful.
+    lo_test, hi_test = tw.reduce.minmax(cast(twt.ArrayNdInt, test_elements))
     offset = min(int(lo_elements), int(lo_test))
     span = max(int(hi_elements), int(hi_test)) - offset + 1
     if span <= _ISIN_MASK_SIZE_FACTOR * k:

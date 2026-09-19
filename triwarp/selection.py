@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal, overload
+from typing import Literal, cast, overload
 
 import numpy as np
+import numpy.typing as npt
 import warp as wp
 
 import triwarp as tw
@@ -717,11 +718,14 @@ def delete_region_keep_boundary(
     input_boundary = {
         (int(row[0]), int(row[1])) for row in tw.boundary.boundary_edges(vertices, faces).numpy()
     }
-    to_input_np = vertex_index.numpy()
+    # ``wp.array.numpy()`` is unannotated; both the table and the index below are int32
+    # vertex indices, and without the annotation neither can serve as a numpy index.
+    to_input_np = cast("npt.NDArray[np.int32]", vertex_index.numpy())
 
     new_loops: list[wp.array[wp.int32]] = []
     for loop in kept_loops:
-        cycle_np = to_input_np[loop.numpy()]
+        loop_np = cast("npt.NDArray[np.int32]", loop.numpy())
+        cycle_np = to_input_np[loop_np]
         rolled_np = np.roll(cycle_np, -1)
         if all(
             (min(int(a), int(b)), max(int(a), int(b))) in input_boundary

@@ -337,25 +337,24 @@ venvPath = "."
 # BsrMatrix.offsets/.columns/.values exist at runtime but not in the stub; vec_t's
 # __getitem__ is typed as returning "_wp_scalar_type_ | vec_t" rather than a scalar; and
 # wp.array.numpy() carries no return annotation at all. So the type-flow rules that touch a
-# Warp array fire almost entirely on false positives, and the four expensive ones below stay
+# Warp array fire almost entirely on false positives, and the three expensive ones below stay
 # off so the residual diagnostics are actionable rather than drowned out.
 #
-# Each "none" carries the error count it is actually buying, measured by re-enabling it alone
-# against this config. Re-measure after a warp-lang upgrade -- a stub fix turns one of these
-# into a cheap re-enable, and nothing else will tell you.
+# Each "none" carries the error count it is actually buying, measured by re-enabling it alone.
+# These three were measured at ba4f7d8 and have NOT been re-measured since -- a24bc72 and the
+# reportCallIssue pass below both moved the tree under them, so read them as upper bounds.
+# Re-measure after a warp-lang upgrade -- a stub fix turns one of these into a cheap re-enable,
+# and nothing else will tell you.
 #
 #   reportArgumentType         1172   wp.empty/zeros lose their dtype, so every wrapper->wrapper
 #                                     array argument mismatches. Never actionable.
 #   reportAttributeAccessIssue  127   BsrMatrix.offsets/.columns/.values/.nrow, absent from the
 #                                     stub. graph.py annotates its own sites inline.
-#   reportCallIssue              85   same dtype-blindness reaching overloaded triwarp callees.
 #   reportOperatorIssue          23   vec_t.__getitem__'s union under arithmetic (18 sites), and
 #                                     reduce.sum's dtype-blind input widening its return (4).
 reportArgumentType = "none"
 reportAttributeAccessIssue = "none"
-reportCallIssue = "none"
-reportOperatorIssue = "none"
-
 reportMissingTypeArgument = "error"
 reportMissingTypeStubs = "error"
+reportOperatorIssue = "none"
 reportUnnecessaryTypeIgnoreComment = "error"

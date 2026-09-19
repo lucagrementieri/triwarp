@@ -1454,7 +1454,7 @@ def closest_pair(points: wp.array[wp.vec3]) -> tuple[int, int, float]:
         raise ValueError("closest_pair needs at least two points")
 
     indices, distances = query_nearest(points, points, k=2, backend="bvh")
-    keys = wp.empty(n, dtype=wp.int64, device=points.device)
+    keys = twt.empty_1d(n, wp.int64, device=points.device)
     wp.launch(
         kernel_points.nearest_pair_keys, dim=n, inputs=[distances, keys], device=points.device
     )

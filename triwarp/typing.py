@@ -47,6 +47,23 @@ if TYPE_CHECKING:
     ArrayNdInt32: TypeAlias = wp.array[wp.int32, Any]
     ArrayNd: TypeAlias = wp.array[Any, Any]
 
+    # The parameter-position family. ``NDim`` is invariant, so ``wp.array[wp.float32]`` -- this
+    # package's usual rank-1 spelling, and what ``wp.empty`` and most public signatures produce --
+    # is ``array[float32, int]`` and is not assignable to ``Array1dFloat32``
+    # (``array[float32, Literal[1]]``) in either direction. A callee that pins the rank therefore
+    # rejects its own callers. The rule these exist to express: **accept wide, return narrow** --
+    # a parameter takes the ``ArrayNd*`` form, a return keeps the ``Literal``-ranked one, so a
+    # caller may hand over either spelling while the value it gets back still carries its rank.
+    # The dtype is still discriminated, which is what keeps an overload set resolvable.
+    ArrayNdInt64: TypeAlias = wp.array[wp.int64, Any]
+    ArrayNdUInt32: TypeAlias = wp.array[wp.uint32, Any]
+    ArrayNdUInt64: TypeAlias = wp.array[wp.uint64, Any]
+    ArrayNdFloat32: TypeAlias = wp.array[wp.float32, Any]
+    ArrayNdFloat64: TypeAlias = wp.array[wp.float64, Any]
+    ArrayNdFloat: TypeAlias = ArrayNdFloat32 | ArrayNdFloat64
+    ArrayNdInt: TypeAlias = ArrayNdInt32 | ArrayNdInt64 | ArrayNdUInt32 | ArrayNdUInt64
+    ArrayNdScalar: TypeAlias = ArrayNdInt | ArrayNdFloat
+
     # The six scalar dtypes ``warp.utils.radix_sort_pairs`` accepts as keys, which is what
     # ``sortable_dtype`` returns. It cannot be spelled ``type[wp.Scalar]``: ``wp.Scalar`` is a
     # ``TypeVar``, so using it in both the parameter and the return position would claim the
@@ -80,6 +97,14 @@ else:
     ScalarArray = wp.array
     ArrayNdInt32 = wp.array
     ArrayNd = wp.array
+    ArrayNdInt64 = wp.array
+    ArrayNdUInt32 = wp.array
+    ArrayNdUInt64 = wp.array
+    ArrayNdFloat32 = wp.array
+    ArrayNdFloat64 = wp.array
+    ArrayNdFloat = wp.array
+    ArrayNdInt = wp.array
+    ArrayNdScalar = wp.array
     SortableDType = type
 
 __all__ = [
@@ -99,7 +124,15 @@ __all__ = [
     "Array3dBool",
     "Array3dFloat32",
     "ArrayNd",
+    "ArrayNdFloat",
+    "ArrayNdFloat32",
+    "ArrayNdFloat64",
+    "ArrayNdInt",
     "ArrayNdInt32",
+    "ArrayNdInt64",
+    "ArrayNdScalar",
+    "ArrayNdUInt32",
+    "ArrayNdUInt64",
     "FloatArray",
     "IntArray",
     "ScalarArray",

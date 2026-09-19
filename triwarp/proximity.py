@@ -531,7 +531,7 @@ def mesh_to_mesh_distance(
                 device=device,
                 block_dim=_QUERY_TILE_WIDTH,
             )
-    keys = wp.empty(n_faces_a, dtype=wp.int64, device=device)
+    keys = twt.empty_1d(n_faces_a, wp.int64, device=device)
     wp.launch(
         kernel_proximity.face_distance_keys,
         dim=n_faces_a,

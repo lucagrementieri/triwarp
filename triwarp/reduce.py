@@ -16,14 +16,20 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reduce as kernel_reduce
 
 
+# The global overloads take the rank-agnostic ``ArrayNd*`` aliases so a caller holding this
+# package's usual ``wp.array[dtype]`` spelling resolves: ``NDim`` is invariant, so pinning the
+# rank here rejects it (triwarp.typing, "accept wide, return narrow"). The integer arm spans
+# ``kernel_reduce._GLOBAL_DTYPES``, which is wider than int32. The ``axis`` overload stays on
+# ``Array2dScalar`` deliberately -- an axis reduction is rank-2 only and ``_AXIS_DTYPES`` is only
+# the three narrow dtypes, so the rank and the dtype are both real constraints there.
 @overload
-def min(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> int: ...
+def min(array: twt.ArrayNdInt, *, axis: None = ...) -> int: ...
 @overload
-def min(array: twt.Array1dFloat | twt.Array2dFloat, *, axis: None = ...) -> float: ...
+def min(array: twt.ArrayNdFloat, *, axis: None = ...) -> float: ...
 @overload
 def min(array: twt.Array2dScalar, *, axis: Literal[0, 1]) -> twt.Array1dScalar: ...
 def min(
-    array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None
+    array: twt.ArrayNdScalar, *, axis: Literal[0, 1] | None = None
 ) -> float | int | twt.Array1dScalar:
     """
     Minimum of ``array``.
@@ -59,13 +65,13 @@ def min(
 
 
 @overload
-def max(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> int: ...
+def max(array: twt.ArrayNdInt, *, axis: None = ...) -> int: ...
 @overload
-def max(array: twt.Array1dFloat | twt.Array2dFloat, *, axis: None = ...) -> float: ...
+def max(array: twt.ArrayNdFloat, *, axis: None = ...) -> float: ...
 @overload
 def max(array: twt.Array2dScalar, *, axis: Literal[0, 1]) -> twt.Array1dScalar: ...
 def max(
-    array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None
+    array: twt.ArrayNdScalar, *, axis: Literal[0, 1] | None = None
 ) -> float | int | twt.Array1dScalar:
     """
     Maximum of ``array``.
@@ -101,11 +107,9 @@ def max(
 
 
 @overload
-def minmax(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> tuple[int, int]: ...
+def minmax(array: twt.ArrayNdInt, *, axis: None = ...) -> tuple[int, int]: ...
 @overload
-def minmax(
-    array: twt.Array1dFloat | twt.Array2dFloat, *, axis: None = ...
-) -> tuple[float, float]: ...
+def minmax(array: twt.ArrayNdFloat, *, axis: None = ...) -> tuple[float, float]: ...
 @overload
 def minmax(array: wp.array[wp.vec3], *, axis: None = ...) -> tuple[wp.vec3, wp.vec3]: ...
 @overload
@@ -113,7 +117,7 @@ def minmax(
     array: twt.Array2dScalar, *, axis: Literal[0, 1]
 ) -> tuple[twt.Array1dScalar, twt.Array1dScalar]: ...
 def minmax(
-    array: twt.ScalarArray | wp.array[wp.vec3], *, axis: Literal[0, 1] | None = None
+    array: twt.ArrayNdScalar | wp.array[wp.vec3], *, axis: Literal[0, 1] | None = None
 ) -> (
     tuple[float, float]
     | tuple[int, int]
@@ -210,9 +214,9 @@ def any(array: wp.array[wp.bool], *, axis: Literal[0, 1] | None = None) -> wp.ar
 @overload
 def sum(array: wp.array[wp.vec3], *, axis: None = ...) -> wp.vec3: ...
 @overload
-def sum(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> int: ...
+def sum(array: twt.ArrayNdInt, *, axis: None = ...) -> int: ...
 @overload
-def sum(array: twt.Array1dFloat | twt.Array2dFloat, *, axis: None = ...) -> float: ...
+def sum(array: twt.ArrayNdFloat, *, axis: None = ...) -> float: ...
 @overload
 def sum(array: twt.Array2dScalar, *, axis: Literal[0, 1]) -> twt.Array1dScalar: ...
 @overload
@@ -220,7 +224,7 @@ def sum(array: wp.array[wp.bool], *, axis: None = ...) -> int: ...
 @overload
 def sum(array: wp.array[wp.bool], *, axis: Literal[0, 1]) -> twt.Array1dInt32: ...
 def sum(
-    array: twt.ScalarArray | wp.array[wp.bool] | wp.array[wp.vec3],
+    array: twt.ArrayNdScalar | wp.array[wp.bool] | wp.array[wp.vec3],
     *,
     axis: Literal[0, 1] | None = None,
 ) -> float | int | twt.Array1dScalar | twt.Array1dInt32 | wp.vec3:
@@ -298,13 +302,13 @@ def sum(
 @overload
 def mean(array: wp.array[wp.vec3], *, axis: None = ...) -> wp.vec3: ...
 @overload
-def mean(array: twt.ScalarArray | wp.array[wp.bool], *, axis: None = ...) -> float: ...
+def mean(array: twt.ArrayNdScalar | wp.array[wp.bool], *, axis: None = ...) -> float: ...
 @overload
 def mean(
     array: twt.Array2dScalar | wp.array[wp.bool], *, axis: Literal[0, 1]
 ) -> twt.Array1dFloat32: ...
 def mean(
-    array: twt.ScalarArray | wp.array[wp.bool] | wp.array[wp.vec3],
+    array: twt.ArrayNdScalar | wp.array[wp.bool] | wp.array[wp.vec3],
     *,
     axis: Literal[0, 1] | None = None,
 ) -> float | twt.Array1dFloat32 | wp.vec3:
@@ -342,23 +346,29 @@ def mean(
         rank-1 (or ``wp.vec3``) input, or ``axis`` is not ``0``, ``1``, or ``None`` for a
         rank-2 input.
     """
-    if array.dtype == wp.vec3:
-        return cast(wp.vec3, sum(array, axis=axis)) / float(int(array.size))
-    total = sum(array, axis=axis)
+    # ``axis`` is narrowed before ``sum`` is called: each of its overloads pins ``axis`` to one
+    # side, so the union cannot resolve against any of them. The axis path below casts to
+    # ``Array2dScalar`` unconditionally, which is a no-op at runtime -- a ``wp.vec3`` array falls
+    # through it into ``sum``, which raises "supports only axis=None". That rule belongs to ``sum``
+    # alone; restating it here would be a second copy of one decision.
     if axis is None:
+        if array.dtype == wp.vec3:
+            vectors = cast("wp.array[wp.vec3]", array)
+            return cast(wp.vec3, sum(vectors)) / float(int(array.size))
+        total = sum(cast(twt.ArrayNdScalar, array))
         return float(total) / float(int(array.size))
-    sums = cast(twt.Array1dScalar, total)
+    sums = cast(twt.Array1dScalar, sum(cast(twt.Array2dScalar, array), axis=axis))
     out = astype(sums, wp.float32)
     wp.map(wp.div, out, wp.float32(array.shape[axis]), out=out)
     return cast(twt.Array1dFloat32, out)
 
 
 @overload
-def weighted_sum(values: twt.Array1dFloat32, weights: twt.Array1dFloat32) -> float: ...
+def weighted_sum(values: twt.ArrayNdFloat32, weights: twt.ArrayNdFloat32) -> float: ...
 @overload
-def weighted_sum(values: wp.array[wp.vec3], weights: twt.Array1dFloat32) -> wp.vec3: ...
+def weighted_sum(values: wp.array[wp.vec3], weights: twt.ArrayNdFloat32) -> wp.vec3: ...
 def weighted_sum(
-    values: twt.Array1dFloat32 | wp.array[wp.vec3], weights: twt.Array1dFloat32
+    values: twt.ArrayNdFloat32 | wp.array[wp.vec3], weights: twt.ArrayNdFloat32
 ) -> float | wp.vec3:
     """
     Weighted sum ``sum_i weights[i] * values[i]``.

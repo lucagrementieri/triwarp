@@ -892,7 +892,7 @@ def polyline_radius(
     if normal is None:
         normal = polyline_normal(polyline)
 
-    distances = wp.empty(n_segments, dtype=wp.float32, device=device)
+    distances = twt.empty_1d(n_segments, wp.float32, device=device)
     wp.map(
         kernel_polyline.radius_segment_distances,
         polyline[:-1],

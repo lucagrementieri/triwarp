@@ -72,6 +72,7 @@ from collections.abc import Sequence
 from typing import Literal, cast, overload
 
 import numpy as np
+import numpy.typing as npt
 import warp as wp
 
 import triwarp as tw
@@ -667,7 +668,7 @@ def _fill_packed_loops(
         # *Which* loops the primary metric failed on is decided on device and fed straight back in
         # as the re-run's active mask, so the fallback is one more batched pass rather than a branch
         # per loop. Loops the primary metric handled keep their ``prev`` rows.
-        retry = wp.empty(loops.n_loops, dtype=wp.int32, device=device)
+        retry = twt.empty_1d(loops.n_loops, wp.int32, device=device)
         wp.launch(
             kernel_holes.flag_bad_triangulations,
             dim=loops.n_loops,
@@ -1573,7 +1574,10 @@ def fillable_loop_mask(
     # wants two entries for one vertex, and the pinch is what disqualifies it. Its size is bounded
     # by the *boundary* rather than by the mesh.
     sizes = [int(loop.shape[0]) for loop in loops]
-    flat_np = tw.array.concatenate(list(loops), copy=False).numpy()
+    # ``wp.array.numpy()`` carries no return annotation, so the loop slices below would be a
+    # partially-unknown ndarray and could not serve as an integer index. Runtime dtype is
+    # int32: these are vertex indices.
+    flat_np = cast("npt.NDArray[np.int32]", tw.array.concatenate(list(loops), copy=False).numpy())
     bounds = np.cumsum([0, *sizes])
     loops_np = [flat_np[bounds[index] : bounds[index + 1]] for index in range(len(sizes))]
     fillable_np = np.ones(len(loops_np), dtype=bool)

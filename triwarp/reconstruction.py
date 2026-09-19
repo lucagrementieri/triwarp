@@ -590,7 +590,7 @@ def _poisson_iso_value(
     """
     if not confidence:
         return tw.reduce.mean(sampled)
-    lengths = wp.empty(int(normals.shape[0]), dtype=wp.float32, device=normals.device)
+    lengths = twt.empty_1d(int(normals.shape[0]), wp.float32, device=normals.device)
     wp.map(wp.length, normals, out=lengths)
     total_weight = tw.reduce.sum(lengths)
     if total_weight <= 0.0:
