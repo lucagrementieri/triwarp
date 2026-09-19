@@ -22,11 +22,11 @@ def test_edges_to_csr_roundtrip(device: str) -> None:
     node_count = 3
     edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
     adjacency = tw.graph.edges_to_csr(node_count, edges_wp)
-    offsets = adjacency.offsets.numpy()  # pyright: ignore[reportAttributeAccessIssue]
-    indices = adjacency.columns.numpy()  # pyright: ignore[reportAttributeAccessIssue]
+    offsets = adjacency.offsets.numpy()
+    indices = adjacency.columns.numpy()
 
-    assert adjacency.nrow == node_count  # pyright: ignore[reportAttributeAccessIssue]
-    assert adjacency.ncol == node_count  # pyright: ignore[reportAttributeAccessIssue]
+    assert adjacency.nrow == node_count
+    assert adjacency.ncol == node_count
     assert adjacency.block_shape == (1, 1)
     assert offsets[0] == 0
     assert offsets[-1] == len(indices)
@@ -695,7 +695,7 @@ def test_successor_cycles_empty(device: str) -> None:
     assert sizes_wp.shape == (0,)
 
 
-def _mesh_vertex_edges(mesh_wp: wp.Mesh) -> tuple[wp.array, int]:
+def _mesh_vertex_edges(mesh_wp: wp.Mesh) -> tuple[twt.Array2dInt32, int]:
     """Return the unique undirected vertex edges and vertex count for a Warp mesh."""
     n = int(mesh_wp.points.shape[0])
     unique_edges, _ = tw.edges.edges_unique(mesh_wp.indices, n_vertices=n)

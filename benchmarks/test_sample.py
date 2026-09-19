@@ -285,7 +285,7 @@ def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -
             tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False),
             _POOL_FACTOR * target,
             seed=_SEED,
-        )
+        )[:2]
         cloud_ml = mn.pointCloudFromPoints(np.ascontiguousarray(pool_np, dtype=np.float64))
         settings_ml = mm.UniformSamplingSettings()
         settings_ml.distance = radius

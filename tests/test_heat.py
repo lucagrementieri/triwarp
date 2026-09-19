@@ -308,8 +308,8 @@ def test_heat_geodesic_multi_source_matches_igl(
     the reduction over several sources wrong -- the field is not a sum but a minimum.
     """
     mesh_tm, mesh_wp = icosahedron
-    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)  # type: ignore[attr-defined]
-    faces_np = np.array(mesh_tm.faces, dtype=np.int64)  # type: ignore[attr-defined]
+    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.array(mesh_tm.faces, dtype=np.int64)
     sources_np = np.array([0, len(vertices_np) // 2], dtype=np.int64)
     sources_wp = wp.array(sources_np.astype(np.int32), dtype=wp.int32, device=mesh_wp.device)
 
@@ -321,8 +321,8 @@ def test_heat_geodesic_multi_source_matches_igl(
 
 def test_heat_geodesic_approximates_exact(device: str, icosahedron: tuple[object, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
-    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)  # type: ignore[attr-defined]
-    faces_np = np.array(mesh_tm.faces, dtype=np.int64)  # type: ignore[attr-defined]
+    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.array(mesh_tm.faces, dtype=np.int64)
     n_vertices = len(vertices_np)
     empty = np.array([], dtype=np.int64)
     sources_np = np.array([0], dtype=np.int64)
@@ -934,17 +934,17 @@ def test_heat_signed_distance_empty(device: str) -> None:
 
 def _solver_pp(mesh_tm: object) -> pp3d.MeshVectorHeatSolver:
     return pp3d.MeshVectorHeatSolver(
-        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),  # type: ignore[attr-defined]
-        np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),  # type: ignore[attr-defined]
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),
         use_intrinsic_delaunay=False,
     )
 
 
 def _frames(mesh_wp: wp.Mesh) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    return tuple(  # type: ignore[return-value]
-        basis.numpy()
-        for basis in tw.tangent_space.vertex_tangent_frames(mesh_wp.points, mesh_wp.indices)
+    basis_x, basis_y, normal = tw.tangent_space.vertex_tangent_frames(
+        mesh_wp.points, mesh_wp.indices
     )
+    return basis_x.numpy(), basis_y.numpy(), normal.numpy()
 
 
 def _to_world(tangent: np.ndarray, basis_x: np.ndarray, basis_y: np.ndarray) -> np.ndarray:
@@ -1521,7 +1521,7 @@ def test_diffuse_tangent_field_solves_its_own_system(
     path that produced it. Measured residual 1.5e-09 against a unit source.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    n_vertices = int(mesh_tm.vertices.shape[0])  # type: ignore[attr-defined]
+    n_vertices = int(mesh_tm.vertices.shape[0])
     vector_system, _scalar, _frames, _preconditioner = tw.heat.vector_heat_operators(
         mesh_wp.points, mesh_wp.indices
     )

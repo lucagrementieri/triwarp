@@ -1181,7 +1181,7 @@ def test_backend_and_accelerator_must_agree(device: str) -> None:
         with pytest.raises(ValueError, match="contradicts the accelerator"):
             query(points_wp, points_wp, accelerator=grid, backend="bvh", **extra)
         with pytest.raises(ValueError, match='backend must be "hashgrid" or "bvh"'):
-            query(points_wp, points_wp, backend="kdtree", **extra)  # pyright: ignore[reportArgumentType]
+            query(points_wp, points_wp, backend="kdtree", **extra)
 
         # An accelerator on its own, and a matching pair, are both fine.
         query(points_wp, points_wp, accelerator=bvh, **extra)
@@ -1692,7 +1692,7 @@ def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgr
         found_ml: list[tuple[int, float]] = []
 
         def collect(result_ml: object, *_args: object, found=found_ml) -> mm.Processing:
-            found.append((int(result_ml.vId), float(result_ml.distSq)))  # type: ignore[attr-defined]
+            found.append((int(result_ml.vId), float(result_ml.distSq)))
             return mm.Processing.Continue
 
         ball_ml = mm.Ball3f()
@@ -1722,7 +1722,7 @@ def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgr
     tie_found: list[int] = []
 
     def collect_tie(result_ml: object, *_args: object) -> mm.Processing:
-        tie_found.append(int(result_ml.vId))  # type: ignore[attr-defined]
+        tie_found.append(int(result_ml.vId))
         return mm.Processing.Continue
 
     tie_ball_ml = mm.Ball3f()

@@ -170,7 +170,7 @@ def test_laplacian_smoothing_loss_methods_are_three_quantities(
     assert tw.energies.edge_length_loss(empty_vertices_wp, empty_faces_wp) == 0.0
     assert tw.energies.normal_consistency_loss(empty_vertices_wp, empty_faces_wp) == 0.0
     with pytest.raises(ValueError, match="method must be"):
-        tw.energies.laplacian_smoothing_loss(mesh_wp.points, mesh_wp.indices, "cotan")  # type: ignore[arg-type]
+        tw.energies.laplacian_smoothing_loss(mesh_wp.points, mesh_wp.indices, "cotan")
 
 
 @pytest.mark.parametrize("k", [1, 2, 3])

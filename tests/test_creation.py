@@ -124,7 +124,7 @@ def _build_parametric(
         return tw.creation.super_toroid(
             u_resolution=resolution, v_resolution=resolution, device=device
         )
-    return tw.creation.parametric_surface(surface, resolution, resolution, device=device)  # type: ignore[arg-type]
+    return tw.creation.parametric_surface(surface, resolution, resolution, device=device)
 
 
 class _Topology(NamedTuple):
@@ -1675,7 +1675,7 @@ def test_parametric_surface_topology_is_resolution_independent(device: str, surf
 
 def test_parametric_surface_invalid(device: str) -> None:
     with pytest.raises(ValueError, match="unknown kind"):
-        tw.creation.parametric_surface("klein_bottle", device=device)  # type: ignore[arg-type]
+        tw.creation.parametric_surface("klein_bottle", device=device)
     with pytest.raises(ValueError, match="at least 2"):
         tw.creation.parametric_surface("mobius", 1, 40, device=device)
     with pytest.raises(ValueError, match="at least 2"):
@@ -1702,12 +1702,7 @@ def test_parametric_surface_rejects_resolution_2_on_a_wrapped_axis(
     at any resolution, which the topology tests above cover.
     """
     with pytest.raises(ValueError, match="at least 3"):
-        tw.creation.parametric_surface(
-            surface,  # type: ignore[arg-type]
-            u_resolution,
-            v_resolution,
-            device=device,
-        )
+        tw.creation.parametric_surface(surface, u_resolution, v_resolution, device=device)
     # The twisted wrap is the control: a flip keeps the two rows distinct, so 2 stays admissible.
     _vertices_wp, faces_wp = tw.creation.parametric_surface("mobius", 2, 40, device=device)
     assert int(faces_wp.shape[0]) > 0
@@ -1734,7 +1729,7 @@ def test_super_ellipsoid_unit_exponents_are_a_sphere(device: str) -> None:
 
 def test_super_ellipsoid_invalid(device: str) -> None:
     with pytest.raises(ValueError, match="radii must be"):
-        tw.creation.super_ellipsoid(radii=(1.0, 1.0), device=device)  # type: ignore[arg-type]
+        tw.creation.super_ellipsoid(radii=(1.0, 1.0), device=device)
 
 
 def test_super_toroid_unit_exponents_are_a_torus(device: str) -> None:
@@ -1835,19 +1830,13 @@ def test_parametric_lattice_paths_agree(
     forced = tw.creation._PARAMETRIC_LATTICE_DEVICE_FROM
     monkeypatch.setattr(tw.creation, "_PARAMETRIC_LATTICE_DEVICE_FROM", 1 << 30)
     host_v, host_f = tw.creation.parametric_surface(
-        surface,  # type: ignore[arg-type]
-        u_resolution,
-        v_resolution,
-        device=device,
+        surface, u_resolution, v_resolution, device=device
     )
     host_v_np, host_f_np = host_v.numpy(), host_f.numpy()
 
     monkeypatch.setattr(tw.creation, "_PARAMETRIC_LATTICE_DEVICE_FROM", 0)
     device_v, device_f = tw.creation.parametric_surface(
-        surface,  # type: ignore[arg-type]
-        u_resolution,
-        v_resolution,
-        device=device,
+        surface, u_resolution, v_resolution, device=device
     )
     assert forced > 0, "the gate must be a positive sample count"
     # Not vacuous: the lattice really did produce a surface on both sides.

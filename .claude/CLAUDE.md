@@ -3040,8 +3040,20 @@ uv run basedpyright
       their stubs annotate the `Vector`/`Matrix` hint shells, which nothing concrete derives from
       (`wp.vec3` is `vec3f`, based on `ctypes.Array`). A value coming *out* of another builtin
       resolves, because `wp.cross` is declared as returning `Vector[...]`; one held in a variable
-      never does. Those five sites carry `# pyright: ignore[reportCallIssue]`, which
-      `reportUnnecessaryTypeIgnoreComment` will flag the day the stubs are fixed.
+      never does. **The fix is a `TYPE_CHECKING`-only redeclaration that binds the builtin itself
+      at runtime** — `triwarp/typing.py` now carries `normalize` / `cross` / `dot` /
+      `transform_point`, each `wp.<name>` in the `else` branch (verified: `twt.normalize is
+      wp.normalize`), so a call costs exactly what it did and the kernel source is untouched. It
+      is not a blanket `Any`: returning a `vec2` from a `-> vec3` function still errors, and with
+      `reportArgumentType` on a mixed-width `cross` still errors. Four spellings were probed and
+      **all four fail**: `cast("Vector[Float, Any]", v)` on the argument (`Float` is a TypeVar,
+      meaningless there), an annotated local (`vec3` is not assignable to `Vector`), declaring the
+      *parameter* as the shell, and — for `transform_point` — widening only the point, since the
+      `mat44` fails `Transformation[Float]` independently. `n: Any = v` does pass and was
+      declined: it erases every check on the name. **Fixing one builtin pushes the gap to the
+      next** — narrowing `normalize` to `wp.vec3` immediately broke `wp.dot`, which is why `dot`
+      is in that table too. The staleness signal moved with the fix: when upstream takes concrete
+      types, delete the block, and the `_V` TypeVar with it.
     - **The narrowings are two shapes, and only one of them is a `cast`.** A Python-scope *slice*
       is always a dense `wp.array` — `wp.array.__getitem__` carries no annotations, so pyright
       infers `indexedarray | array` from its body — and `twt.as_dense` narrows it with a real
@@ -3072,8 +3084,30 @@ Prerelease pins need `--prerelease allow`; trimesh is pinned `>=5.0.0rc1` becaus
 `trimesh.remesh.subdivide_to_size` (the reference for `triwarp.remesh.subdivide_to_size`) only exists
 in the 5.0.0rc prereleases — stable 4.x is the older T-junction "soup" variant.
 
-Running basedpyright in a dev-only env yields spurious `reportMissingImports` on `meshio` and other
-test-group packages.
+**`include` covers `triwarp`, `tests` and `benchmarks`, so a dev-only env is no longer merely
+noisy — it is unusable.** `uv sync --group dev` alone yields hundreds of `reportMissingImports`
+across the reference stack, not the handful `meshio` used to produce. Either `uv sync --all-groups`
+before running the bare command, or run `uv run basedpyright triwarp`, which is what CI's fast
+`typecheck` job does — an explicit path overrides `include`. The wide gate runs in `pytest-cpu`,
+the only job whose environment already has all nine reference libraries.
+
+`tests/` and `benchmarks/` are checked under a per-directory `executionEnvironments` block that
+concedes the five rules the reference stack and `wp.array.numpy()` make unactionable there
+(`reportMissingTypeStubs`, `reportMissingTypeArgument`, `reportCallIssue`,
+`reportGeneralTypeIssues`, `reportIndexIssue`), each carrying its measured count in the config.
+**An execution environment's `root` re-bases import resolution**, so each entry needs
+`extraPaths = ["."]` — without it 240 imports break (`triwarp` x98, `tests.conversions` x47) and
+the conceded stub errors are merely replaced by `reportMissingImports`.
+
+Widening `include` cost 938 errors, which the `executionEnvironments` block took to 151 and the
+fixes below to 0. `triwarp/` measured 0 at every one of those tiers, so widening cannot regress
+the shipped package's gate. Of the 151: **73 were ignore comments the checker itself called
+unnecessary** — the tree carried 83 directives and 74 of them sat in `tests/`/`benchmarks/`, which
+nothing had ever checked, so they suppressed nothing and most were wrong about the error they
+named. The tree now carries **3**, each verified load-bearing by
+`reportUnnecessaryTypeIgnoreComment`. **Set the rule set first and then delete what the checker
+flags** — the unnecessary count is a function of the rules (74 -> 69 -> 73 across the tiers
+measured), so a list taken before the config lands is the wrong list.
 
 **`plans/` is gitignored** — plan documents are local working notes and never appear in a commit.
 
@@ -6072,6 +6106,47 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   otherwise take the whole launch quadratic. It costs nothing at mesh valences (2.65x against
   insertion's 2.48-2.60x, i.e. marginally *better*). Above a few hundred neighbours in one row the
   answer is `edges_to_csr`.
+- **REFUTED — a streaming QR on the design matrix for `curvature.principal_curvature`'s quadric
+  fit. It is 1.8 million times more accurate and 2.1-3.6x slower, and the accuracy lands only
+  where the answer is already meaningless.** `fit_principal_curvature` accumulates the normal
+  equations `AtA` and solves them, so it works at `cond(A)^2`; a Givens QR maintained over `R` and
+  `Q^T b` as each design row arrives works at `cond(A)`. Ground truth for the accuracy half is the
+  **exact rational** least-squares solution of each vertex's own `float64` design matrix
+  (`fractions.Fraction`), which isolates the algorithm's error from the input's. On `half_torus`,
+  544 fittable vertices, `cond(A)` median **3.12** and max **1.1e6**:
+
+  | | normal equations | streaming QR |
+  |---|---|---|
+  | max abs error vs exact | 2.71e-06 | **1.51e-12** |
+  | median abs error vs exact | 2.22e-16 | 3.33e-16 (QR marginally *worse*) |
+  | max permutation spread | 2.61e-06 | **6.07e-12** |
+
+  So QR does not make the fit order-*independent*, it makes it **430 000x less order-sensitive** —
+  worth stating precisely, because "robust to ordering" overclaims it. And exactly **one vertex of
+  544** has a normal-equation error above 1e-6; its `|PV1|` is 0.0215 against a field median of
+  **1.161**, i.e. 1.9 % of the typical curvature, which is the regime `principal_curvature`'s own
+  docstring tells callers not to read as a measurement.
+
+  Timed as a real kernel (unrolled rank-5, `R` and `Q^T b` in registers) against the shipped one on
+  identical precomputed balls: **0.280x** on `half_torus` (avg row 42.5), **0.460-0.486x** on
+  icospheres 3-6 (avg row 16.1), with `PV1` **0 of 40 962 differing** on every icosphere. End to
+  end that is `principal_curvature` at **0.63x** on `half_torus` (the fit is 23 % of the call) and
+  0.95x on `icosphere6` (4.7 %). The per-row cost is the mechanism: normal equations do one
+  `wp.outer` (25 FMAs) plus 5, where QR annihilates 5 entries against `R`, each needing a
+  **`float64` `sqrt`** — no fast path on the GPU — plus ~2(5-j) FMAs. **The penalty grows with the
+  neighbourhood size, which is backwards**: the large-radius call is both the expensive one and the
+  one a robustness fix would be for.
+- **REFUTED with it, and the cheaper idea is the more instructive one: symmetric Jacobi (diagonal)
+  scaling of the normal equations buys nothing.** Five `sqrt` and ten multiplies *once per vertex*
+  rather than per row, so it is free — and measured on the same 544 vertices it is **0.9x**, a
+  hair *worse* (max error 2.878e-06 against 2.71e-06, permutation spread 3.537e-06 against
+  2.612e-06, median identical to the ULP). That is the diagnosis, not just a null result: the
+  ill-conditioning is **genuine near-rank-deficiency of the neighbourhood** in the tangent plane,
+  not a column-scaling imbalance — the fit already divides its local coordinates by the ring
+  radius (`kernels/curvature.py`), which removes the scale-induced part, and a diagonal
+  preconditioner cannot touch what is left. **So there is no cheap fix and the expensive one only
+  helps where the answer is noise**; the canonical row order from
+  `edges_to_neighbor_lists(sort_rows=True)` is the whole of what this needed.
 - **A tie that is exact in float32 is not a tie in the oracle's float64, and an exact set compare
   then pins the adjacency's column order rather than the answer.** On `half_torus` vertex 384,
   candidates 387 and 413 sit 2.2e-16 apart in float64 and are **bit-identical in float32**, both

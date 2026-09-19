@@ -1031,7 +1031,7 @@ def test_polyline_radius_closed_default_plane_differs_from_open(device: str) -> 
 def test_polyline_radius_rejects_unknown_reduction(device: str) -> None:
     pts_np = _random_open_polyline(81)
     with pytest.raises(ValueError, match="unsupported reduction"):
-        tw.polyline.polyline_radius(points_to_warp(pts_np, device), "sum")  # type: ignore[arg-type]
+        tw.polyline.polyline_radius(points_to_warp(pts_np, device), "sum")
 
 
 def test_polyline_radius_two_points_raises_its_own_message(device: str) -> None:

@@ -196,7 +196,7 @@ def test_marching_cubes_matches_meshlib(device: str) -> None:
         params_ml.lessInside = True
         params_ml.origin = mm.Vector3f(origin, origin, origin)
         mesh_ml = mm.marchingCubes(volume_ml, params_ml)
-        return mn.getNumpyVerts(mesh_ml), mn.getNumpyFaces(mesh_ml.topology)
+        return np.asarray(mn.getNumpyVerts(mesh_ml)), np.asarray(mn.getNumpyFaces(mesh_ml.topology))
 
     vertices_ml_np, faces_ml_np = march_ml(-1.0 - spacing / 2)
     assert faces_ml_np.shape[0] > 0

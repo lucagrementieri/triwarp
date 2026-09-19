@@ -992,7 +992,9 @@ def test_closest_point_on_edges_matches_pytorch3d(device: str) -> None:
     scalar_p3d = float(
         p3d_loss.point_mesh_edge_distance(mesh_p3d, points_to_pytorch3d(queries_np, device=device))
     )
-    edges_p3d = mesh_p3d.edges_packed().cpu().numpy()
+    edges_t = mesh_p3d.edges_packed()
+    assert edges_t is not None
+    edges_p3d = edges_t.cpu().numpy()
 
     starts_np = np.asarray(mesh_tm.vertices[edges_p3d[:, 0]], dtype=np.float64)
     directions_np = np.asarray(mesh_tm.vertices[edges_p3d[:, 1]], dtype=np.float64) - starts_np
@@ -1090,7 +1092,7 @@ def test_normals_at_closest_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> No
 
 def test_normals_at_closest_faces_surface(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
-    points_np, face_ids_np = tm.sample.sample_surface(mesh_tm, 24, seed=3)
+    points_np, face_ids_np = tm.sample.sample_surface(mesh_tm, 24, seed=3)[:2]
     expected_normals_np = mesh_tm.face_normals[face_ids_np].astype(np.float32)
 
     points_wp = points_to_warp(points_np, mesh_wp.device)
@@ -1399,10 +1401,7 @@ def test_signed_distance_on_mesh_rejects_unknown_sign_mode(
     points_wp = wp.empty(4, dtype=wp.vec3, device=mesh_wp.device)
     with pytest.raises(ValueError, match="sign_mode"):
         tw.proximity.signed_distance_on_mesh(
-            mesh_wp.points,
-            mesh_wp.indices,
-            points_wp,
-            sign_mode="nearest",  # pyright: ignore[reportArgumentType]
+            mesh_wp.points, mesh_wp.indices, points_wp, sign_mode="nearest"
         )
 
 
@@ -1491,7 +1490,7 @@ def test_signed_distance_on_mesh_coplanar(request: pytest.FixtureRequest, mesh_n
 
 def test_signed_distance_on_mesh_on_surface(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
-    surface_np, _face_idx = tm.sample.sample_surface(mesh_tm, 50)
+    surface_np, _face_idx = tm.sample.sample_surface(mesh_tm, 50)[:2]
     surface_wp = points_to_warp(surface_np, mesh_wp.device)
     signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, surface_wp)
     signed_np = signed_wp.numpy()

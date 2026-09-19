@@ -105,9 +105,13 @@ def test_concatenate_matches_pytorch3d(request: pytest.FixtureRequest, device: s
     meshes_wp = [numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device) for mesh_tm in meshes_tm]
     vertices_wp, faces_wp = tw.combine.concatenate(meshes_wp)
 
-    assert joined_p3d.verts_packed().shape[0] == sum(len(m.vertices) for m in meshes_tm)
-    assert np.array_equal(vertices_wp.numpy(), joined_p3d.verts_packed().numpy())
-    assert np.array_equal(faces_wp.numpy().reshape(-1, 3), joined_p3d.faces_packed().numpy())
+    verts_p3d = joined_p3d.verts_packed()
+    faces_p3d = joined_p3d.faces_packed()
+    assert verts_p3d is not None
+    assert faces_p3d is not None
+    assert verts_p3d.shape[0] == sum(len(m.vertices) for m in meshes_tm)
+    assert np.array_equal(vertices_wp.numpy(), verts_p3d.numpy())
+    assert np.array_equal(faces_wp.numpy().reshape(-1, 3), faces_p3d.numpy())
 
 
 def test_concatenate_single_mesh(request: pytest.FixtureRequest) -> None:

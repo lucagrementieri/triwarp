@@ -36,7 +36,10 @@ def _scale_by(value: wp.vec3, factor: wp.float32) -> wp.vec3:
 def _snap_to_mesh(point: wp.vec3, mesh_id: wp.uint64, max_dist: wp.float32) -> wp.vec3:
     query = wp.mesh_query_point_no_sign(mesh_id, point, max_dist)
     if query.result:
-        return wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+        # Warp's own stub inconsistency: the builtin is declared to return ``vec3f`` while
+        # ``wp.vec3`` re-exports a separate declaration of the same runtime class
+        # (``wp.vec3 is wp.vec3f``). Kernel DSL is why ``triwarp/kernels`` is excluded outright.
+        return wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)  # pyright: ignore[reportReturnType]
     return point
 
 

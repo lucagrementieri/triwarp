@@ -185,7 +185,9 @@ def test_vertex_normals_match_pytorch3d(icosphere: tuple[tm.Trimesh, wp.Mesh]) -
     """
     mesh_tm, mesh_wp = icosphere
     device = str(mesh_wp.points.device)
-    normals_p3d = trimesh_to_pytorch3d(mesh_tm, device).verts_normals_packed().cpu().numpy()
+    normals_t = trimesh_to_pytorch3d(mesh_tm, device).verts_normals_packed()
+    assert normals_t is not None
+    normals_p3d = normals_t.cpu().numpy()
     normals_wp = tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices)
     angle_wp = tw.vertices.vertex_normals(mesh_wp.points, mesh_wp.indices, weighting="angle")
 

@@ -99,6 +99,7 @@ def _tangled_boxes() -> tm.Trimesh:
     second_tm = first_tm.copy()
     second_tm.apply_translation([0.5, 0.5, 0.5])
     tangled_tm = tm.util.concatenate([first_tm, second_tm])
+    assert isinstance(tangled_tm, tm.Trimesh)
     tangled_tm.merge_vertices()
     return tangled_tm
 

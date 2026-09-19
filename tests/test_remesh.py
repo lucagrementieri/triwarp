@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import igl
 import numpy as np
@@ -1133,7 +1134,7 @@ def test_cluster_decimate_invalid(device: str) -> None:
     with pytest.raises(ValueError, match="voxel_size > 0"):
         tw.remesh.cluster_decimate(vertices_wp, faces_wp, voxel_size=0.0)
     with pytest.raises(ValueError, match="contraction must be"):
-        tw.remesh.cluster_decimate(vertices_wp, faces_wp, contraction="quadric")  # type: ignore[arg-type]
+        tw.remesh.cluster_decimate(vertices_wp, faces_wp, contraction="quadric")
 
 
 def test_cluster_decimate_empty(device: str) -> None:
@@ -2057,9 +2058,9 @@ def test_flip_by_objective_invalid(device: str) -> None:
     """
     _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
     with pytest.raises(ValueError, match="objective must be"):
-        tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="delaunay")  # type: ignore[arg-type]
+        tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="delaunay")
     with pytest.raises(ValueError, match="metric must be one of"):
-        tw.remesh.flip_by_objective(vertices_wp, faces_wp, metric="aspect_ratio")  # type: ignore[arg-type]
+        tw.remesh.flip_by_objective(vertices_wp, faces_wp, metric="aspect_ratio")
     with pytest.raises(ValueError, match="planar_angle must be in"):
         tw.remesh.flip_by_objective(vertices_wp, faces_wp, planar_angle=200.0)
 
@@ -2315,7 +2316,7 @@ def test_subdivide(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     vertices_np = mesh_tm.vertices.astype(np.float32)
     faces_np = mesh_tm.faces.astype(np.int32)
 
-    new_v_tm, new_f_tm = tm.remesh.subdivide(vertices_np.astype(np.float64), faces_np)
+    new_v_tm, new_f_tm = tm.remesh.subdivide(vertices_np.astype(np.float64), faces_np)[:2]
     new_v_tm = new_v_tm.astype(np.float32)
 
     new_v_wp, new_f_wp = tw.remesh.subdivide(mesh_wp.points, mesh_wp.indices)
@@ -2828,8 +2829,11 @@ def test_subdivide_to_size_reference_regular(icosahedron: tuple[tm.Trimesh, wp.M
     new_v_np = new_v_wp.numpy()
     new_f_np = new_f_wp.numpy().reshape(-1, 3)
 
-    ref_v, ref_f, ref_index = tm.remesh.subdivide_to_size(
-        mesh_tm.vertices, mesh_tm.faces, max_edge, return_index=True
+    # ``subdivide_to_size`` returns two values or three depending on ``return_index``, and
+    # trimesh declares no overloads, so the arity is asserted here rather than inferred.
+    ref_v, ref_f, ref_index = cast(
+        "tuple[npt.NDArray[np.float64], npt.NDArray[np.int64], npt.NDArray[np.int64]]",
+        tm.remesh.subdivide_to_size(mesh_tm.vertices, mesh_tm.faces, max_edge, return_index=True),
     )
 
     assert new_v_np.shape[0] == ref_v.shape[0]
@@ -2919,8 +2923,13 @@ def test_subdivide_to_size_reference_mixed(device: str) -> None:
     new_v_np = new_v_wp.numpy()
     new_f_np = new_f_wp.numpy().reshape(-1, 3)
 
-    ref_v, ref_f, ref_index = tm.remesh.subdivide_to_size(
-        mesh_tm.vertices, mesh_tm.faces, max_edge, max_iter=1, return_index=True
+    # ``subdivide_to_size`` returns two values or three depending on ``return_index``, and
+    # trimesh declares no overloads, so the arity is asserted here rather than inferred.
+    ref_v, ref_f, ref_index = cast(
+        "tuple[npt.NDArray[np.float64], npt.NDArray[np.int64], npt.NDArray[np.int64]]",
+        tm.remesh.subdivide_to_size(
+            mesh_tm.vertices, mesh_tm.faces, max_edge, max_iter=1, return_index=True
+        ),
     )
 
     assert new_v_np.shape[0] == ref_v.shape[0]

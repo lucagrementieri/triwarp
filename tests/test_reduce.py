@@ -233,7 +233,7 @@ def test_scalar_reduce_2d_invalid_axis_raises(device: str) -> None:
     values_wp = wp.array([[1, 2], [3, 4]], dtype=wp.int32, device=device)
     for fn in (tw_reduce.min, tw_reduce.max, tw_reduce.minmax, tw_reduce.sum):
         with pytest.raises(ValueError, match="requires axis to be 0, 1, or None"):
-            fn(values_wp, axis=2)  # pyright: ignore[reportArgumentType]
+            fn(values_wp, axis=2)
 
 
 def test_bool_reduce_2d_invalid_axis_raises(device: str) -> None:
@@ -241,7 +241,7 @@ def test_bool_reduce_2d_invalid_axis_raises(device: str) -> None:
     mask_wp = wp.array([[True, False], [False, True]], dtype=wp.bool, device=device)
     for fn in (tw_reduce.any, tw_reduce.all):
         with pytest.raises(ValueError, match="requires axis to be 0, 1, or None"):
-            fn(mask_wp, axis=2)  # pyright: ignore[reportArgumentType]
+            fn(mask_wp, axis=2)
 
 
 @pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])

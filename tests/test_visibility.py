@@ -237,7 +237,7 @@ def test_ambient_occlusion_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> N
     with pytest.raises(ValueError, match="n_rays >= 1"):
         tw.visibility.ambient_occlusion(mesh_wp, mesh_wp.points, n_rays=0)
     with pytest.raises(ValueError, match="weight must be"):
-        tw.visibility.ambient_occlusion(mesh_wp, mesh_wp.points, weight="lambert")  # type: ignore[arg-type]
+        tw.visibility.ambient_occlusion(mesh_wp, mesh_wp.points, weight="lambert")
     with pytest.raises(ValueError, match="one entry per point"):
         tw.visibility.ambient_occlusion(
             mesh_wp, mesh_wp.points, normals=wp.zeros(2, dtype=wp.vec3, device=mesh_wp.device)
@@ -625,7 +625,7 @@ def test_thickness_max_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     fixture where it would not, and is not silently making this test vacuous here.
     """
     mesh_tm, mesh_wp = icosahedron
-    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=7)
+    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=7)[:2]
     normals_np = mesh_tm.face_normals[face_ids]
 
     points_wp = points_to_warp(points_np, mesh_wp.device)
@@ -653,7 +653,7 @@ def test_thickness_ray(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     test per branch, so neither row rests on the other branch's comparison.
     """
     mesh_tm, mesh_wp = icosahedron
-    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=13)
+    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=13)[:2]
     normals_np = mesh_tm.face_normals[face_ids]
 
     points_wp = points_to_warp(points_np, mesh_wp.device)
@@ -753,7 +753,7 @@ def test_max_tangent_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     that sliding, not by a disagreement about the definition. 20 of 20 points finite.
     """
     mesh_tm, mesh_wp = icosahedron
-    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=42)
+    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=42)[:2]
     normals_np = mesh_tm.face_normals[face_ids]
 
     points_wp = points_to_warp(points_np, mesh_wp.device)
@@ -805,7 +805,7 @@ def test_max_tangent_sphere_reach_matches_trimesh(cave_cube: tuple[tm.Trimesh, w
     the normal is a distinct failure from a wrong radius.
     """
     mesh_tm, mesh_wp = cave_cube
-    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 1024, seed=42)
+    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 1024, seed=42)[:2]
     normals_np = mesh_tm.face_normals[face_ids]
 
     points_wp = points_to_warp(points_np, mesh_wp.device)

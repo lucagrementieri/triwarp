@@ -119,7 +119,7 @@ def _warm_start(bench_case: BenchCase) -> wp.array[wp.vec2]:
 def _igl_boundary(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """``(vertices, faces_i64, loop)`` for the libigl branches."""
     faces_np = bench_case.faces_np.astype(np.int64)
-    return bench_case.vertices_np, faces_np, igl.boundary_loop(faces_np)
+    return bench_case.vertices_np, faces_np, np.asarray(igl.boundary_loop(faces_np))
 
 
 @pytest.mark.benchmark(group="map_vertices_to_circle")
@@ -253,7 +253,7 @@ def test_arap(bench_case: BenchCase, iterations: int) -> None:
             data = igl.ARAPData()
             data.max_iter = iterations
             igl.arap_precomputation(vertices_np, faces_np, 2, loop_np.astype(np.int32), data)
-            return igl.arap_solve(circle_np, data, uv_init_np)
+            return np.asarray(igl.arap_solve(circle_np, data, uv_init_np))
 
         uv_igl = bench_case.run(run)
         assert uv_igl.shape[0] == vertices_np.shape[0]

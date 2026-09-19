@@ -54,7 +54,9 @@ def _overlapping_spheres_tm() -> tm.Trimesh:
     first_tm = tm.creation.icosphere(subdivisions=2)
     second_tm = tm.creation.icosphere(subdivisions=2)
     second_tm.apply_translation([1.2, 0.0, 0.0])
-    return tm.util.concatenate([first_tm, second_tm])
+    joined_tm = tm.util.concatenate([first_tm, second_tm])
+    assert isinstance(joined_tm, tm.Trimesh)
+    return joined_tm
 
 
 def _spaced_bowls_tm(count: int, gap: float = 3.0) -> tm.Trimesh:
@@ -79,7 +81,9 @@ def _spaced_bowls_tm(count: int, gap: float = 3.0) -> tm.Trimesh:
         shell_tm = bowl_tm.copy()
         shell_tm.apply_translation([gap * index, 0.0, 0.0])
         shells_tm.append(shell_tm)
-    return tm.util.concatenate(shells_tm)
+    joined_tm = tm.util.concatenate(shells_tm)
+    assert isinstance(joined_tm, tm.Trimesh)
+    return joined_tm
 
 
 def _assert_is_a_solid(vertices_wp: wp.array, faces_wp: wp.array) -> tm.Trimesh:
@@ -1600,7 +1604,9 @@ def _three_shells_tm() -> tm.Trimesh:
     dense_tm.apply_translation([5.0, 0.0, 0.0])
     wide_tm = tm.creation.icosphere(subdivisions=1, radius=10.0)
     wide_tm.apply_translation([0.0, 40.0, 0.0])
-    return tm.util.concatenate([small_tm, dense_tm, wide_tm])
+    joined_tm = tm.util.concatenate([small_tm, dense_tm, wide_tm])
+    assert isinstance(joined_tm, tm.Trimesh)
+    return joined_tm
 
 
 def _assert_same_surviving_mesh(
@@ -1801,7 +1807,7 @@ def test_remove_small_components_requires_exactly_one_criterion(
     mesh_tm = _three_shells_tm()
     vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
     with pytest.raises(ValueError, match="exactly one"):
-        tw.repair.remove_small_components(vertices_wp, faces_wp, **kwargs)  # type: ignore[arg-type]
+        tw.repair.remove_small_components(vertices_wp, faces_wp, **kwargs)
 
 
 # --------------------------------------------------------------------------------------
@@ -2643,7 +2649,7 @@ def test_fix_self_intersections_leaves_a_clean_mesh_alone(
     assert np.allclose(same_vertices_wp.numpy(), vertices_wp.numpy())
 
     with pytest.raises(ValueError, match="method must be"):
-        tw.repair.fix_self_intersections(vertices_wp, faces_wp, method="nonsense")  # type: ignore[arg-type]
+        tw.repair.fix_self_intersections(vertices_wp, faces_wp, method="nonsense")
     with pytest.raises(ValueError, match="max_expand"):
         tw.repair.fix_self_intersections(vertices_wp, faces_wp, max_expand=-1)
     with pytest.raises(ValueError, match="max_iter"):
@@ -2995,9 +3001,7 @@ def test_remove_tunnels_count_is_unconditional(torus: tuple[tm.Trimesh, wp.Mesh]
     assert len(result) == 3
     assert isinstance(result[2], int)
     with pytest.raises(TypeError):
-        tw.repair.remove_tunnels(  # pyright: ignore[reportCallIssue]
-            mesh_wp.points, mesh_wp.indices, 1e-9, return_count=True
-        )
+        tw.repair.remove_tunnels(mesh_wp.points, mesh_wp.indices, 1e-9, return_count=True)
 
 
 def _mesh_with_a_degree3_vertex(bump: float = 0.0) -> tm.Trimesh:

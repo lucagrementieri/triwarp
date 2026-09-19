@@ -126,7 +126,7 @@ def test_half_a_precomputed_pair_raises_even_on_an_empty_mesh(
         (faces_wp,) if function is tw.adjacency.face_adjacency_unshared else (vertices_wp, faces_wp)
     )
     with pytest.raises(ValueError, match="both be provided or both omitted"):
-        function(*args, adjacency_wp)  # type: ignore[operator]
+        function(*args, adjacency_wp)
 
 
 @pytest.mark.parametrize("mesh_name", _ADJACENCY_MESHES)
@@ -894,7 +894,7 @@ def test_face_connected_component_labels_matches_igl(
 def _face_labels_ml(components_ml: object, n_faces: int) -> np.ndarray:
     """Decode MeshLib's vector of ``FaceBitSet`` components into a per-face label array."""
     labels_np = np.full(n_faces, -1, dtype=np.int64)
-    for label, component_ml in enumerate(components_ml):  # type: ignore[call-overload]
+    for label, component_ml in enumerate(components_ml):
         labels_np[meshlib_bitset_to_numpy(component_ml, n_faces)] = label
     return labels_np
 

@@ -338,7 +338,7 @@ def test_transfer_through_operator(bench_case: BenchCase) -> None:
         )
         return operator
 
-    n_out = int(build().nrow)  # type: ignore[attr-defined]
+    n_out = int(build().nrow)
     transferred = bench_case.run(
         lambda operator: tw.interpolation.transfer_through_operator(values, operator), setup=build
     )

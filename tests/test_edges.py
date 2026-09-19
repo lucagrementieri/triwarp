@@ -325,8 +325,12 @@ def test_edges_unique_and_inverse_match_pytorch3d(
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh_p3d = trimesh_to_pytorch3d(mesh_tm)
-    edges_p3d = mesh_p3d.edges_packed().numpy()
-    face_edges_p3d = mesh_p3d.faces_packed_to_edges_packed().numpy()
+    edges_t = mesh_p3d.edges_packed()
+    face_edges_t = mesh_p3d.faces_packed_to_edges_packed()
+    assert edges_t is not None
+    assert face_edges_t is not None
+    edges_p3d = edges_t.numpy()
+    face_edges_p3d = face_edges_t.numpy()
 
     n_vertices = int(mesh_wp.points.shape[0])
     unique_edges_wp, inverse_wp = tw.edges.edges_unique(mesh_wp.indices)

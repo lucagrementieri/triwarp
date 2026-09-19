@@ -566,7 +566,7 @@ def test_sample_surface_blue_noise_matches_open3d_pymeshlab_and_igl(
     """
     mesh_tm, mesh_wp = icosahedron
     radius = _blue_noise_radius_for_count(float(mesh_tm.area), 300)
-    dense_np, _face_index = tm.sample.sample_surface(mesh_tm, 20_000, seed=3)
+    dense_np, _face_index = tm.sample.sample_surface(mesh_tm, 20_000, seed=3)[:2]
 
     points_wp, _face_index_wp = tw.sample.sample_surface_blue_noise(
         mesh_wp.points, mesh_wp.indices, radius, seed=11

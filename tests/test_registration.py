@@ -510,6 +510,7 @@ def test_icp_point_cloud_matches_pytorch3d(device: str) -> None:
     matrix_np = matrix_wp.numpy()[0]
 
     assert bool(solution_p3d.converged)
+    assert solution_p3d.rmse is not None
     assert float(solution_p3d.rmse[0]) < 1e-5
     assert cost < 1e-9
     assert np.allclose(
@@ -1205,11 +1206,7 @@ def test_icp_point_to_plane_rejects_an_off_menu_robust_kernel(device: str) -> No
     normals_wp = points_to_warp(normals_np, device)
     with pytest.raises(ValueError, match="robust_kernel must be one of"):
         tw.registration.icp_point_to_plane(
-            source_wp,
-            target_wp,
-            None,
-            target_normals=normals_wp,
-            robust_kernel="bogus",  # type: ignore[arg-type]
+            source_wp, target_wp, None, target_normals=normals_wp, robust_kernel="bogus"
         )
     for robust_kernel in ("none", "huber", "tukey"):
         matrix_wp, _, _ = tw.registration.icp_point_to_plane(
@@ -1218,6 +1215,6 @@ def test_icp_point_to_plane_rejects_an_off_menu_robust_kernel(device: str) -> No
             None,
             target_normals=normals_wp,
             max_iterations=2,
-            robust_kernel=robust_kernel,  # type: ignore[arg-type]
+            robust_kernel=robust_kernel,
         )
         assert np.isfinite(matrix_wp.numpy()).all()

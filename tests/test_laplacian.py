@@ -829,9 +829,9 @@ def _dense_blocks_2x2(matrix: object, n_vertices: int) -> np.ndarray:
     matrix; the row-offset walk is the same, and is still the only safe way in (``values`` is
     allocated at the triplet count).
     """
-    offsets = matrix.offsets.numpy()  # type: ignore[attr-defined]
-    columns = matrix.columns.numpy()  # type: ignore[attr-defined]
-    values = matrix.values.numpy()  # type: ignore[attr-defined]
+    offsets = matrix.offsets.numpy()
+    columns = matrix.columns.numpy()
+    values = matrix.values.numpy()
     dense = np.zeros((2 * n_vertices, 2 * n_vertices))
     for row in range(n_vertices):
         for slot in range(offsets[row], offsets[row + 1]):
@@ -1081,7 +1081,9 @@ def test_laplacian_operator(
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
-    operator_tm = tms.laplacian_calculation(mesh_tm, equal_weight=equal_weight).tocsr()
+    operator_coo_tm = tms.laplacian_calculation(mesh_tm, equal_weight=equal_weight)
+    assert operator_coo_tm is not None
+    operator_tm = operator_coo_tm.tocsr()
     operator_wp = bsr_to_csr(
         tw.laplacian.laplacian(mesh_wp.points, mesh_wp.indices, equal_weight=equal_weight)
     )
@@ -1200,7 +1202,7 @@ def test_operators_float64_match_float32(request: pytest.FixtureRequest, mesh_na
     for builder in builders:
         matrix_f32 = builder(points, indices)
         matrix_f64 = builder(points, indices, dtype=wp.float64)
-        assert matrix_f64.values.dtype == wp.float64  # pyright: ignore[reportAttributeAccessIssue]
+        assert matrix_f64.values.dtype == wp.float64
         dense_f32 = bsr_to_csr(matrix_f32).toarray()
         dense_f64 = bsr_to_csr(matrix_f64).toarray()
         assert dense_f64.shape == dense_f32.shape

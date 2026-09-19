@@ -182,12 +182,11 @@ def test_trace_from_vertex_stops_at_the_boundary(
     # Aim from every boundary vertex along the outward direction with a long reach: each ray must
     # stop at the rim rather than wrap around or leave the surface.
     _, _, is_boundary_wp = tw.halfedge.vertex_one_rings(
-        mesh_wp.indices,
-        n_vertices=len(mesh_tm.vertices),  # type: ignore[attr-defined]
+        mesh_wp.indices, n_vertices=len(mesh_tm.vertices)
     )
     boundary = np.flatnonzero(is_boundary_wp.numpy()).astype(np.int32)
-    centroid = np.asarray(mesh_tm.vertices).mean(axis=0)  # type: ignore[attr-defined]
-    outward = np.asarray(mesh_tm.vertices)[boundary] - centroid  # type: ignore[attr-defined]
+    centroid = np.asarray(mesh_tm.vertices).mean(axis=0)
+    outward = np.asarray(mesh_tm.vertices)[boundary] - centroid
     outward *= 100.0 / np.linalg.norm(outward, axis=1, keepdims=True)
 
     points_wp, offsets_wp = tw.geodesic_walk.trace_from_vertex(
@@ -199,7 +198,7 @@ def test_trace_from_vertex_stops_at_the_boundary(
 
     scale = float(
         np.linalg.norm(np.asarray(mesh_tm.vertices).max(0) - np.asarray(mesh_tm.vertices).min(0))
-    )  # type: ignore[attr-defined]
+    )
     assert offsets_wp.numpy()[-1] < len(boundary) * 64  # nothing ran to the step cap
     distance_tm = np.abs(
         tm.proximity.signed_distance(mesh_tm, points_wp.numpy().astype(np.float64))

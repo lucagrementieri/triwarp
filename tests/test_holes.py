@@ -1350,7 +1350,7 @@ def test_fill_small_requires_exactly_one_threshold(
     """The documented ``ValueError``, in both directions: no threshold and two."""
     _mesh_tm, mesh_wp = hemisphere
     with pytest.raises(ValueError, match="exactly one"):
-        tw.holes.fill_small(mesh_wp.points, mesh_wp.indices, **kwargs)  # type: ignore[arg-type]
+        tw.holes.fill_small(mesh_wp.points, mesh_wp.indices, **kwargs)
 
 
 @pytest.mark.parity(
@@ -3129,7 +3129,7 @@ def test_join_closest_components_respects_its_bounds(
     vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
     n_faces = int(faces_wp.shape[0]) // 3
 
-    joined_wp = tw.holes.join_closest_components(vertices_wp, faces_wp, **kwargs)  # type: ignore[arg-type]
+    joined_wp = tw.holes.join_closest_components(vertices_wp, faces_wp, **kwargs)
 
     assert int(joined_wp.shape[0]) // 3 == n_faces + 2 * expected_joins
 

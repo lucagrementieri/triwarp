@@ -1,10 +1,14 @@
 """
-Warp array type aliases and runtime rank checks for Python wrappers.
+Warp array type aliases, runtime rank checks, and typed vector builtins for Python wrappers.
 
 Use these aliases in ``triwarp`` Python APIs instead of ``wp.array2d[dtype]``, which
 static checkers treat as Warp annotation objects (no ``.shape`` / indexing).
 
 Kernels should continue to use ``wp.array2d[dtype]`` in ``@wp.kernel`` signatures.
+
+[`normalize`][triwarp.typing.normalize], [`cross`][triwarp.typing.cross] and
+[`transform_point`][triwarp.typing.transform_point] are the Warp builtins of those names,
+re-exported unchanged so that a vector held in a variable resolves against them.
 """
 
 from __future__ import annotations
@@ -106,6 +110,43 @@ else:
     ArrayNdInt = wp.array
     ArrayNdScalar = wp.array
     SortableDType = type
+
+
+# Warp's stubs annotate these three against the ``Vector`` / ``Matrix`` hint shells, which no
+# concrete Warp type derives from (``wp.vec3`` is ``vec3f``, based on ``ctypes.Array``), so a vector
+# held in a variable can never satisfy them -- only a value coming straight out of another builtin
+# does. The redeclarations below describe the same functions over the concrete vector types; at
+# runtime each name *is* the Warp builtin the ``else`` branch binds, so a call costs exactly what it
+# always did. Drop them once the upstream stubs take concrete types, and drop the ``_V`` TypeVar
+# with them.
+# They are deliberately absent from ``__all__``: mkdocstrings reads the runtime ``else``
+# branch, where each is a bare alias rather than a documented function, so an entry here
+# would advertise a page section that cannot render. They stay importable as ``twt.<name>``.
+_V = TypeVar("_V", wp.vec2, wp.vec3, wp.vec4)
+
+if TYPE_CHECKING:
+
+    def normalize(v: _V) -> _V:
+        """Vector of unit length along ``v``, at ``v``'s own precision."""
+        ...
+
+    def cross(a: _V, b: _V) -> _V:
+        """Cross product of two vectors of the same type."""
+        ...
+
+    def dot(a: _V, b: _V) -> float:
+        """Dot product of two vectors of the same type."""
+        ...
+
+    def transform_point(matrix: wp.mat44, point: wp.vec3) -> wp.vec3:
+        """``point`` carried through the affine transform ``matrix``, translation included."""
+        ...
+
+else:
+    normalize = wp.normalize
+    cross = wp.cross
+    dot = wp.dot
+    transform_point = wp.transform_point
 
 __all__ = [
     "Array1dFloat",

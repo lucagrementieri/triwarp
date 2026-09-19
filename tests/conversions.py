@@ -562,7 +562,7 @@ def meshlib_scalars_to_numpy(scalars_ml: object) -> np.ndarray:
     [`meshlib_bitset_to_numpy`][tests.conversions.meshlib_bitset_to_numpy], because their size is
     *not* always the element domain.
     """
-    return np.fromiter(iter(scalars_ml), np.float64, scalars_ml.size())  # type: ignore[attr-defined]
+    return np.fromiter(iter(scalars_ml), np.float64, scalars_ml.size())
 
 
 def meshlib_indices_to_numpy(indices_ml: object) -> np.ndarray:
@@ -579,7 +579,7 @@ def meshlib_indices_to_numpy(indices_ml: object) -> np.ndarray:
     An invalid id comes back as ``-1``, which is what ``VertId()`` holds by default, so the result
     is signed rather than unsigned on purpose.
     """
-    return np.fromiter((int(index_ml) for index_ml in indices_ml), np.int64, indices_ml.size())  # type: ignore[attr-defined]
+    return np.fromiter((int(index_ml) for index_ml in indices_ml), np.int64, indices_ml.size())
 
 
 def meshlib_bitset_to_numpy(bitset_ml: object, size: int) -> np.ndarray:
@@ -905,9 +905,13 @@ def pytorch3d_to_numpy(meshes_p3d: p3d_structures.Meshes) -> tuple[np.ndarray, n
     whose constructor arguments the caller never saw. ``detach()`` because several entry points
     return tensors carrying a grad graph, which ``numpy()`` refuses.
     """
+    verts_t = meshes_p3d.verts_packed()
+    faces_t = meshes_p3d.faces_packed()
+    assert verts_t is not None
+    assert faces_t is not None
     return (
-        meshes_p3d.verts_packed().detach().cpu().numpy().astype(np.float64),
-        meshes_p3d.faces_packed().detach().cpu().numpy().astype(np.int64),
+        verts_t.detach().cpu().numpy().astype(np.float64),
+        faces_t.detach().cpu().numpy().astype(np.int64),
     )
 
 
@@ -936,9 +940,9 @@ def bsr_to_dense(matrix: object, n_vertices: int) -> np.ndarray:
     ``values`` arrays directly reads that scratch and is flaky by construction; the row offsets are
     the only safe way in.
     """
-    offsets = matrix.offsets.numpy()  # type: ignore[attr-defined]
-    columns = matrix.columns.numpy()  # type: ignore[attr-defined]
-    values = matrix.values.numpy()  # type: ignore[attr-defined]
+    offsets = matrix.offsets.numpy()
+    columns = matrix.columns.numpy()
+    values = matrix.values.numpy()
     dense = np.zeros((n_vertices, n_vertices))
     for row in range(n_vertices):
         for slot in range(offsets[row], offsets[row + 1]):
@@ -956,15 +960,10 @@ def bsr_to_csr(matrix: object) -> sp.csr_matrix:
     on the larger fixtures. Reads through the row offsets for the same reason ``bsr_to_dense`` does:
     ``values`` is allocated at the triplet count and its tail is uninitialized scratch.
     """
-    nrow = int(matrix.nrow)  # type: ignore[attr-defined]
-    ncol = int(matrix.ncol)  # type: ignore[attr-defined]
+    nrow = int(matrix.nrow)
+    ncol = int(matrix.ncol)
     return sp.csr_matrix(
-        (
-            matrix.values.numpy(),  # type: ignore[attr-defined]
-            matrix.columns.numpy(),  # type: ignore[attr-defined]
-            matrix.offsets.numpy(),  # type: ignore[attr-defined]
-        ),
-        shape=(nrow, ncol),
+        (matrix.values.numpy(), matrix.columns.numpy(), matrix.offsets.numpy()), shape=(nrow, ncol)
     )
 
 

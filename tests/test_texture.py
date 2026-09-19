@@ -602,7 +602,7 @@ def test_remap_rejects_an_off_menu_order(device: str):
     image_wp = wp.array(image_np, dtype=wp.float32, device=device)
     for order in (2, -1, 0.5):
         with pytest.raises(ValueError, match="order must be 0"):
-            tw.texture.remap_attribute_from_uv(uv_wp, image_wp, order=order)  # type: ignore[arg-type]
+            tw.texture.remap_attribute_from_uv(uv_wp, image_wp, order=order)
     bilinear_np = tw.texture.remap_attribute_from_uv(uv_wp, image_wp, order=1).numpy()
     nearest_np = tw.texture.remap_attribute_from_uv(uv_wp, image_wp, order=0).numpy()
     assert np.isfinite(bilinear_np).all()

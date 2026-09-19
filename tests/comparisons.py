@@ -399,8 +399,8 @@ def symmetric_chamfer(mesh_a: tm.Trimesh, mesh_b: tm.Trimesh, n_samples: int = 4
         this one stays for the tests whose thresholds are calibrated against its floor.
     """
     rng = np.random.default_rng(0)
-    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=int(rng.integers(1 << 30)))
-    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=int(rng.integers(1 << 30)))
+    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=int(rng.integers(1 << 30)))[:2]
+    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=int(rng.integers(1 << 30)))[:2]
     a_to_b = cKDTree(sample_b).query(sample_a)[0].mean()
     b_to_a = cKDTree(sample_a).query(sample_b)[0].mean()
     return float(0.5 * (a_to_b + b_to_a))
@@ -459,8 +459,8 @@ def symmetric_surface_distance(
         Worst-case distance between two bare point sets, when there is no surface to query.
     """
     rng = np.random.default_rng(0)
-    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=int(rng.integers(1 << 30)))
-    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=int(rng.integers(1 << 30)))
+    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=int(rng.integers(1 << 30)))[:2]
+    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=int(rng.integers(1 << 30)))[:2]
     a_to_b = tm.proximity.closest_point(mesh_b, sample_a)[1]
     b_to_a = tm.proximity.closest_point(mesh_a, sample_b)[1]
     mean = 0.5 * (float(a_to_b.mean()) + float(b_to_a.mean()))
@@ -563,8 +563,8 @@ def hausdorff_surface_two_sided(
     """
     mesh_a = tm.Trimesh(vertices_a, faces_a, process=False)
     mesh_b = tm.Trimesh(vertices_b, faces_b, process=False)
-    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=0)
-    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=1)
+    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=0)[:2]
+    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=1)[:2]
     a_to_b = np.abs(tm.proximity.signed_distance(mesh_b, sample_a)).max()
     b_to_a = np.abs(tm.proximity.signed_distance(mesh_a, sample_b)).max()
     return float(max(a_to_b, b_to_a))

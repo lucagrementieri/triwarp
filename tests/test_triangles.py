@@ -273,7 +273,7 @@ def test_corner_normals_edge_cases(device: str, unit_box: tuple[tm.Trimesh, wp.M
             twt.as_array2d(wp.zeros((2, 3), dtype=wp.int32, device=device), wp.int32),
         )
     with pytest.raises(ValueError, match="weighting must be"):
-        tw.triangles.corner_normals(vertices_wp, faces_wp, weighting="sine")  # type: ignore[arg-type]
+        tw.triangles.corner_normals(vertices_wp, faces_wp, weighting="sine")
 
 
 @pytest.mark.parity("face_normals_and_areas", "open3d")
@@ -630,7 +630,7 @@ def test_face_quality_degenerate(sliver_patch: tuple[np.ndarray, np.ndarray, wp.
 def test_face_quality_unknown_metric(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     _mesh_tm, mesh_wp = icosahedron
     with pytest.raises(ValueError, match="unknown metric"):
-        tw.triangles.face_quality(mesh_wp.points, mesh_wp.indices, metric="skewness")  # type: ignore[arg-type]
+        tw.triangles.face_quality(mesh_wp.points, mesh_wp.indices, metric="skewness")
 
 
 @pytest.mark.parametrize("with_degenerate", [False, True], ids=["clean", "with_degenerate"])

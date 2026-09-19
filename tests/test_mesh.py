@@ -775,7 +775,7 @@ def test_cached_properties_are_frozen(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -
     _mesh_tm, mesh_wp = icosahedron
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
     with pytest.raises(AttributeError):
-        mesh.face_normals = mesh.face_normals  # type: ignore[misc]
+        mesh.face_normals = mesh.face_normals
 
 
 def test_invalidate_clears_cache_and_recomputes(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

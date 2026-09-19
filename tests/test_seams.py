@@ -909,9 +909,9 @@ def test_uv_seam_match_rejects_an_off_menu_mode(device: str) -> None:
     )
     for match in ("bogus", "Index", ""):
         with pytest.raises(ValueError, match="match must be one of"):
-            tw.seams.uv_seam_edges(faces_wp, corner_uv_wp, n_vertices=3, match=match)  # type: ignore[arg-type]
+            tw.seams.uv_seam_edges(faces_wp, corner_uv_wp, n_vertices=3, match=match)
         with pytest.raises(ValueError, match="match must be one of"):
-            tw.seams.uv_seam_vertex_mask(faces_wp, corner_uv_wp, n_vertices=3, match=match)  # type: ignore[arg-type]
+            tw.seams.uv_seam_vertex_mask(faces_wp, corner_uv_wp, n_vertices=3, match=match)
     # Both documented modes still run; ``index`` needs ``face_texcoords`` and is covered above.
     assert tw.seams.uv_seam_edges(faces_wp, corner_uv_wp, n_vertices=3, match="uv")[0].shape == (
         0,

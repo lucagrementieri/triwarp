@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from typing import cast
 
 import numpy as np
+import numpy.typing as npt
 import warp as wp
 
 import triwarp as tw
@@ -419,10 +420,11 @@ def _unoriented_boundary_cycles(
     flat_darts, dart_offsets, _dart_sizes = tw.graph.successor_cycles(
         dart_edges, 2 * n_vertices, validate=False
     )
-    darts_np = flat_darts.numpy()
     # ``wp.array.numpy()`` carries no return annotation, so pyright infers a shape-typed
-    # ``ndarray[tuple[()], ...]`` whose ``.shape`` indexes out of range. Runtime rank is 1.
-    n_darts = darts_np.shape[0]  # pyright: ignore[reportGeneralTypeIssues]
+    # ``ndarray[tuple[()], ...]`` whose ``.shape`` indexes out of range and whose slices below
+    # type-check only by accident. The cast names the rank-1 int32 buffer this actually is.
+    darts_np = cast("npt.NDArray[np.int32]", flat_darts.numpy())
+    n_darts = darts_np.shape[0]
     bounds_np = np.append(dart_offsets.numpy(), n_darts)
     loops_np = [
         darts_np[start:stop] // 2

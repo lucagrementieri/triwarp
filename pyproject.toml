@@ -322,7 +322,7 @@ exclude = [
     # triwarp/kernels/ is inherently un-typecheckable. Excluded wholesale.
     "triwarp/kernels",
 ]
-include = ["triwarp"]
+include = ["triwarp", "tests", "benchmarks"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
 venv = ".venv"
@@ -358,3 +358,47 @@ reportMissingTypeArgument = "error"
 reportMissingTypeStubs = "error"
 reportOperatorIssue = "none"
 reportUnnecessaryTypeIgnoreComment = "error"
+
+# ``tests/`` and ``benchmarks/`` are checked too, but not against the same bar. Two things are
+# true there and nowhere else: they import all nine reference libraries of section 7.6, none of
+# which ships stubs and none of which ever will; and they read Warp arrays back through
+# ``.numpy()`` constantly, which carries no return annotation. Those are the same stub gaps the
+# three ``"none"`` rules above already concede for ``triwarp/`` -- conceded here in the two extra
+# places the reference stack reaches. The gate for the shipped package is unchanged: measured,
+# ``triwarp/`` reports 0 errors under this config exactly as it did under ``include = ["triwarp"]``.
+#
+# ``extraPaths`` is load-bearing, not tidiness: an execution environment's ``root`` re-bases import
+# resolution, so without it 240 imports break (``triwarp`` x98, ``tests.conversions`` x47) and the
+# stub errors below are merely replaced by ``reportMissingImports``.
+#
+# Each "none" carries the error count it is actually buying, measured by re-enabling it alone:
+#
+#   reportMissingTypeStubs      308   the nine reference libraries -- meshlib 98, igl 63, open3d
+#                                     46, pymeshlab 35, pytorch3d 43, potpourri3d 14, pymeshfix 4.
+#                                     Stays "error" at the root, so triwarp/'s meshio guard holds.
+#   reportMissingTypeArgument   150   bare wp.array / np.ndarray in test helper signatures.
+#   reportCallIssue             154   numpy scalar __getitem__ unions, and Warp builtins whose
+#                                     stubs take the Vector/Matrix hint shells (see triwarp/typing).
+#   reportGeneralTypeIssues     103   wp.array.numpy()'s missing return annotation, read as
+#                                     ndarray[tuple[()], ...] whose .shape indexes out of range.
+#   reportIndexIssue             77   __getitem__ on numpy scalar types (intp, complex, _Buffer).
+[[tool.basedpyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["."]
+reportCallIssue = "none"
+reportGeneralTypeIssues = "none"
+reportIndexIssue = "none"
+reportMissingTypeArgument = "none"
+reportMissingTypeStubs = "none"
+
+[[tool.basedpyright.executionEnvironments]]
+root = "benchmarks"
+extraPaths = ["."]
+reportCallIssue = "none"
+reportGeneralTypeIssues = "none"
+reportIndexIssue = "none"
+reportMissingTypeArgument = "none"
+reportMissingTypeStubs = "none"
+
+[[tool.basedpyright.executionEnvironments]]
+root = "."

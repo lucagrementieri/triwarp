@@ -296,7 +296,7 @@ def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "pytorch3d":
         mesh_p3d = bench_case.mesh_p3d
-        mesh_p3d.verts_packed(), mesh_p3d.faces_packed()  # warm the cached derivations
+        _ = mesh_p3d.verts_packed(), mesh_p3d.faces_packed()  # warm the cached derivations
         cloud_p3d = p3d_structures.Pointclouds(
             points=[points_torch_from_numpy(_clouds_np(bench_case)[1], bench_case.torch_device)[0]]
         )

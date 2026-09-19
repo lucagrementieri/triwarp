@@ -821,7 +821,7 @@ def test_parametric_surface(bench_lib: BenchLibrary, surface: str, resolution: i
         return
     device = bench_lib.device
     _, faces_wp = bench_lib.run(
-        lambda: tw.creation.parametric_surface(surface, resolution, resolution, device=device)  # type: ignore[arg-type]
+        lambda: tw.creation.parametric_surface(surface, resolution, resolution, device=device)
     )
     assert int(faces_wp.shape[0]) // 3 > 0
 

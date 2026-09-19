@@ -857,7 +857,9 @@ def test_filter_taubin_recompute_matches_pytorch3d(device: str, iterations: int)
     smoothed_p3d = p3d_ops.taubin_smoothing(
         trimesh_to_pytorch3d(mesh_tm), lambd=0.53, mu=-0.53, num_iter=iterations
     )
-    vertices_p3d = smoothed_p3d.verts_packed().cpu().numpy()
+    verts_t = smoothed_p3d.verts_packed()
+    assert verts_t is not None
+    vertices_p3d = verts_t.cpu().numpy()
 
     recomputed_wp = tw.smoothing.filter_taubin(
         mesh_wp.points,

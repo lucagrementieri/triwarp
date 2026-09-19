@@ -349,7 +349,7 @@ def _handles(holes_per_side: int, max_edge: float = 0.195, span: float = 16.0) -
     homology basis can see: same footprint, same tessellation scale, same wall-to-slab proportion.
     """
     slab = tm.creation.box(extents=[span, span, 1.0])
-    vertices, faces = tm.remesh.subdivide_to_size(slab.vertices, slab.faces, max_edge=max_edge)
+    vertices, faces = tm.remesh.subdivide_to_size(slab.vertices, slab.faces, max_edge=max_edge)[:2]
     step = span / holes_per_side
     tunnels = []
     for i in range(holes_per_side):

@@ -25,9 +25,10 @@ its consumers in [`triwarp.levelset`][triwarp.levelset], and ``screened_poisson`
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
+import numpy.typing as npt
 import warp as wp
 import warp.optim.linear as wpl
 
@@ -133,10 +134,11 @@ def _lexicographic_triangulation(points: wp.array[wp.vec2]) -> np.ndarray:
     on the CPU device, single-threaded; see that kernel for why. Only the lex sort stays in
     NumPy, where it is one vectorised call.
     """
-    points_np = points.numpy().astype(np.float64)
-    # See ``boundary._loop_owner_labels``: ``wp.array.numpy()`` has no return annotation and
-    # pyright infers an empty shape tuple for it. Runtime rank is 2.
-    n = points_np.shape[0]  # pyright: ignore[reportGeneralTypeIssues]
+    # See ``boundary._unoriented_boundary_cycles``: ``wp.array.numpy()`` has no return annotation
+    # and pyright infers an empty shape tuple for it. The cast names the ``(n, 2)`` float64 buffer
+    # the ``.astype`` produces.
+    points_np = cast("npt.NDArray[np.float64]", points.numpy().astype(np.float64))
+    n = points_np.shape[0]
     order_np = np.lexsort((points_np[:, 1], points_np[:, 0])).astype(np.int32)
 
     # A triangulation of n points has 2n - 2 - h <= 2n - 5 triangles; 2n is the guard capacity.

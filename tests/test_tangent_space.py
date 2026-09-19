@@ -23,8 +23,8 @@ def _vector_heat_solver_pp(mesh_tm: object) -> pp3d.MeshVectorHeatSolver:
     # ``use_intrinsic_delaunay=False`` so both sides discretize the same triangulation; potpourri3d
     # defaults to flipping to an intrinsic Delaunay triangulation first.
     return pp3d.MeshVectorHeatSolver(
-        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),  # type: ignore[attr-defined]
-        np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),  # type: ignore[attr-defined]
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),
         use_intrinsic_delaunay=False,
     )
 

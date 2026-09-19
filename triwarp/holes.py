@@ -943,6 +943,44 @@ def _unpack_loops(loops: _PackedLoops) -> list[wp.array[wp.int32]]:
     ]
 
 
+@overload
+def fill_smooth(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    metric: str = "plane_normalized",
+    *,
+    triangulate_only: bool = False,
+    max_edge: float | None = None,
+    max_edge_splits: int = 1000,
+    max_angle_change_after_flip: float = math.radians(30.0),
+    smooth_curvature: bool = True,
+    natural_smooth: bool = False,
+    edge_weights: str = "cotan",
+    preserve_largest_hole: bool = False,
+    resolve_multiple_edges: bool = True,
+    smooth_boundary: bool = True,
+    refine: Literal["max_edge", "density"] = "max_edge",
+    return_patch: Literal[False] = False,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]: ...
+@overload
+def fill_smooth(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    metric: str = "plane_normalized",
+    *,
+    triangulate_only: bool = False,
+    max_edge: float | None = None,
+    max_edge_splits: int = 1000,
+    max_angle_change_after_flip: float = math.radians(30.0),
+    smooth_curvature: bool = True,
+    natural_smooth: bool = False,
+    edge_weights: str = "cotan",
+    preserve_largest_hole: bool = False,
+    resolve_multiple_edges: bool = True,
+    smooth_boundary: bool = True,
+    refine: Literal["max_edge", "density"] = "max_edge",
+    return_patch: Literal[True],
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]: ...
 def fill_smooth(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -1747,6 +1785,44 @@ def stitch_min_weight(
     )
 
 
+@overload
+def stitch_smooth(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    metric: str = "complex_stitch",
+    up_dir: tuple[float, float, float] | None = None,
+    *,
+    triangulate_only: bool = False,
+    max_edge: float | None = None,
+    max_edge_splits: int = 1000,
+    max_angle_change_after_flip: float = math.radians(30.0),
+    smooth_curvature: bool = True,
+    natural_smooth: bool = False,
+    edge_weights: str = "cotan",
+    refine: Literal["max_edge", "density"] = "max_edge",
+    return_patch: Literal[False] = False,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]: ...
+@overload
+def stitch_smooth(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    metric: str = "complex_stitch",
+    up_dir: tuple[float, float, float] | None = None,
+    *,
+    triangulate_only: bool = False,
+    max_edge: float | None = None,
+    max_edge_splits: int = 1000,
+    max_angle_change_after_flip: float = math.radians(30.0),
+    smooth_curvature: bool = True,
+    natural_smooth: bool = False,
+    edge_weights: str = "cotan",
+    refine: Literal["max_edge", "density"] = "max_edge",
+    return_patch: Literal[True],
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]: ...
 def stitch_smooth(
     vertices_a: wp.array[wp.vec3],
     faces_a: wp.array[wp.int32],

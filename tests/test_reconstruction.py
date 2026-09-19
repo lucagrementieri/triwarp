@@ -60,7 +60,7 @@ def _meshlib_triangulate(
     params_ml = mm.TriangulationParameters()
     params_ml.numNeighbours = num_neighbours
     mesh_ml = mm.triangulatePointCloud(cloud_ml, params_ml)
-    return mn.getNumpyVerts(mesh_ml), mn.getNumpyFaces(mesh_ml.topology)
+    return np.asarray(mn.getNumpyVerts(mesh_ml)), np.asarray(mn.getNumpyFaces(mesh_ml.topology))
 
 
 def _sphere_cloud(subdivisions: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1112,8 +1112,8 @@ def test_resample_uniform_matches_pymeshlab(
     assert np.isclose(np.abs(out_tm.volume), np.abs(pml_tm.volume), rtol=0.05)
 
     # Two-sided Hausdorff between the surfaces, within a cell.
-    sample_wp, _face = tm.sample.sample_surface(out_tm, 4000, seed=0)
-    sample_pml, _face_pml = tm.sample.sample_surface(pml_tm, 4000, seed=1)
+    sample_wp, _face = tm.sample.sample_surface(out_tm, 4000, seed=0)[:2]
+    sample_pml, _face_pml = tm.sample.sample_surface(pml_tm, 4000, seed=1)[:2]
     assert np.abs(tm.proximity.signed_distance(pml_tm, sample_wp)).max() < 0.5 * voxel_size
     assert np.abs(tm.proximity.signed_distance(out_tm, sample_pml)).max() < 0.5 * voxel_size
 
@@ -1168,8 +1168,8 @@ def test_resample_uniform_matches_igl(device: str, icosphere: tuple[tm.Trimesh, 
     assert out_tm.is_watertight
     assert np.isclose(np.abs(out_tm.volume), np.abs(mesh_igl.volume), rtol=0.05)
 
-    sample_wp, _face_wp = tm.sample.sample_surface(out_tm, 4000, seed=0)
-    sample_igl, _face_igl = tm.sample.sample_surface(mesh_igl, 4000, seed=1)
+    sample_wp, _face_wp = tm.sample.sample_surface(out_tm, 4000, seed=0)[:2]
+    sample_igl, _face_igl = tm.sample.sample_surface(mesh_igl, 4000, seed=1)[:2]
     assert np.abs(tm.proximity.signed_distance(mesh_igl, sample_wp)).max() < 0.25 * voxel_size
     assert np.abs(tm.proximity.signed_distance(out_tm, sample_igl)).max() < 0.25 * voxel_size
 

@@ -460,7 +460,9 @@ def test_solve_spd_warns_when_it_runs_out_of_iterations(device: str) -> None:
     n = 64
     rows, cols, values = [], [], []
     for i in range(n):
-        rows.append(i), cols.append(i), values.append(2.0)
+        rows.append(i)
+        cols.append(i)
+        values.append(2.0)
         if i + 1 < n:
             rows += [i, i + 1]
             cols += [i + 1, i]

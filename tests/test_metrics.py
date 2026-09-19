@@ -706,6 +706,8 @@ def test_chamfer_points_to_points_loss_grad(
     )
     tape.backward(loss=loss_wp)
 
+    assert x_wp.grad is not None
+    assert y_wp.grad is not None
     assert np.allclose(loss_wp.numpy()[0], loss_np, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
     assert np.allclose(x_wp.grad.numpy(), grad_x_np, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
     assert np.allclose(y_wp.grad.numpy(), grad_y_np, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
@@ -754,6 +756,10 @@ def test_chamfer_points_to_points_loss_grad_matches_pytorch3d(
     )
     tape.backward(loss=loss_wp)
 
+    assert x_wp.grad is not None
+    assert y_wp.grad is not None
+    assert x_t.grad is not None
+    assert y_t.grad is not None
     assert np.allclose(loss_wp.numpy()[0], loss_p3d.item(), rtol=1e-5, atol=1e-6)
     assert np.allclose(x_wp.grad.numpy(), x_t.grad.cpu().numpy(), rtol=1e-4, atol=1e-5)
     assert np.allclose(y_wp.grad.numpy(), y_t.grad.cpu().numpy(), rtol=1e-4, atol=1e-5)
@@ -802,6 +808,8 @@ def test_chamfer_points_to_mesh_loss_grad(
     )
     tape.backward(loss=loss_wp)
 
+    assert points_wp.grad is not None
+    assert verts_wp.grad is not None
     assert np.allclose(loss_wp.numpy()[0], loss_np, rtol=_FD_RTOL, atol=_FD_ATOL)
     assert np.allclose(points_wp.grad.numpy(), grad_points_np, rtol=_FD_RTOL, atol=_FD_ATOL)
     assert np.allclose(verts_wp.grad.numpy(), grad_verts_np, rtol=_FD_RTOL, atol=_FD_ATOL)
@@ -853,7 +861,9 @@ def test_chamfer_points_to_mesh_loss_grad_matches_pytorch3d(device: str, reducti
     points_packed = pcls_p3d.points_packed()
     points_first_idx = pcls_p3d.cloud_to_packed_first_idx()
     max_points = pcls_p3d.num_points_per_cloud().max().item()
-    tris = meshes_p3d.verts_packed()[meshes_p3d.faces_packed()]
+    verts_packed = meshes_p3d.verts_packed()
+    assert verts_packed is not None
+    tris = verts_packed[meshes_p3d.faces_packed()]
     tris_first_idx = meshes_p3d.mesh_to_faces_packed_first_idx()
     point_to_face = p3d_point_mesh_distance.point_face_distance(
         points_packed, points_first_idx, tris, tris_first_idx, max_points
@@ -870,6 +880,10 @@ def test_chamfer_points_to_mesh_loss_grad_matches_pytorch3d(device: str, reducti
     )
     tape.backward(loss=loss_wp)
 
+    assert points_wp.grad is not None
+    assert verts_wp.grad is not None
+    assert points_t.grad is not None
+    assert verts_t.grad is not None
     assert np.allclose(loss_wp.numpy()[0], loss_p3d.item(), rtol=1e-5, atol=1e-6)
     assert np.allclose(points_wp.grad.numpy(), points_t.grad.cpu().numpy(), rtol=1e-4, atol=1e-5)
     assert np.allclose(verts_wp.grad.numpy(), verts_t.grad.cpu().numpy(), rtol=1e-4, atol=1e-5)
@@ -926,6 +940,8 @@ def test_chamfer_mesh_to_mesh_loss_grad(
     )
     tape.backward(loss=loss_wp)
 
+    assert verts_a_wp.grad is not None
+    assert verts_b_wp.grad is not None
     assert np.allclose(loss_wp.numpy()[0], loss_np, rtol=_FD_RTOL, atol=_FD_ATOL)
     assert np.allclose(verts_a_wp.grad.numpy(), grad_a_np, rtol=_FD_RTOL, atol=_FD_ATOL)
     if not single_directional:
@@ -985,7 +1001,7 @@ def test_chamfer_loss_rejects_max_reduction(device: str) -> None:
     x_wp = points_to_warp(np.zeros((3, 3), dtype=np.float32), device)
     y_wp = points_to_warp(np.ones((3, 3), dtype=np.float32), device)
     with pytest.raises(ValueError, match="mean"):
-        tw.metrics.chamfer_points_to_points_loss(x_wp, y_wp, point_reduction="max")  # type: ignore[arg-type]
+        tw.metrics.chamfer_points_to_points_loss(x_wp, y_wp, point_reduction="max")
 
 
 def test_chamfer_points_to_points_loss_empty(device: str) -> None:
@@ -1067,6 +1083,8 @@ def test_point_triangle_sq_dist_grad_is_finite_on_degenerate_faces(
             device=device,
         )
     tape.backward(loss=out_wp)
+    assert triangle_wp.grad is not None
+    assert query_wp.grad is not None
     gradient_np = triangle_wp.grad.numpy().astype(np.float64)
 
     assert np.isfinite(gradient_np).all()

@@ -64,7 +64,7 @@ def _section_points_ml(mesh_ml: mm.Mesh, section_ml: object) -> np.ndarray:
                 mesh_ml.edgePoint(point_ml).y,
                 mesh_ml.edgePoint(point_ml).z,
             ]
-            for point_ml in section_ml  # type: ignore[union-attr]
+            for point_ml in section_ml
         ]
     )
 
@@ -615,7 +615,7 @@ def test_marching_triangles_open_curve_ends_on_the_boundary(
     hemisphere: tuple[object, wp.Mesh], device: str
 ) -> None:
     mesh_tm, mesh_wp = hemisphere
-    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)  # type: ignore[attr-defined]
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
     # The hemisphere's rim is a single loop, so a level set of x has to run into it.
     values_np = np.ascontiguousarray(vertices_np[:, 0])
     isovalue = float(values_np.mean())
@@ -672,8 +672,8 @@ def test_marching_triangles_level_set_is_the_piecewise_linear_one(
     icosahedron: tuple[object, wp.Mesh], device: str
 ) -> None:
     mesh_tm, mesh_wp = icosahedron
-    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)  # type: ignore[attr-defined]
-    faces_np = np.asarray(mesh_tm.faces)  # type: ignore[attr-defined]
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.asarray(mesh_tm.faces)
     values_np = np.ascontiguousarray(vertices_np[:, 2])
     isovalue = 0.1234
     values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
@@ -692,7 +692,7 @@ def test_marching_triangles_level_set_is_the_piecewise_linear_one(
 def test_marching_triangles_no_crossing(icosahedron: tuple[object, wp.Mesh], device: str) -> None:
     mesh_tm, mesh_wp = icosahedron
     values_wp = wp.array(
-        np.ascontiguousarray(np.asarray(mesh_tm.vertices)[:, 2]),  # type: ignore[attr-defined]
+        np.ascontiguousarray(np.asarray(mesh_tm.vertices)[:, 2]),
         dtype=wp.float64,
         device=mesh_wp.device,
     )
@@ -1756,6 +1756,8 @@ def test_split_faces_along_field_matches_pyvista_clip_scalar_both(
     mesh_pv = trimesh_to_pyvista(mesh_tm)
     mesh_pv.point_data["height"] = np.ascontiguousarray(mesh_tm.vertices[:, 2])
     below_pv, above_pv = mesh_pv.clip_scalar(scalars="height", value=isovalue, both=True)
+    assert above_pv is not None
+    assert below_pv is not None
 
     # Non-vacuity: an isovalue outside the field's range would leave one side empty and every
     # comparison below trivially true. Note a clipped side can carry *more* cells than the whole

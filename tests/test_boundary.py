@@ -506,6 +506,8 @@ def test_boundary_loops_copy_detaches_from_packed_buffer(
     for view_wp, copy_wp in zip(views, copies, strict=True):
         assert np.array_equal(view_wp.numpy(), copy_wp.numpy())
     if len(views) > 1:
+        assert views[0].ptr is not None
+        assert views[1].ptr is not None
         assert views[0].ptr != views[1].ptr
         # Adjacent views share one allocation; the copies do not.
         assert views[1].ptr - views[0].ptr == 4 * int(views[0].shape[0])
@@ -871,4 +873,4 @@ def test_loop_measures_empty(device: str) -> None:
 
 
 def _boundary_indices_tm(mesh_tm: tm.Trimesh) -> np.ndarray:
-    return tm_grouping.group_rows(mesh_tm.edges_sorted, require_count=1)
+    return np.asarray(tm_grouping.group_rows(mesh_tm.edges_sorted, require_count=1))

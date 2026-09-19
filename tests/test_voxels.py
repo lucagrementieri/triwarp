@@ -1755,4 +1755,8 @@ def _bounds_of(grid: wp.Volume) -> tuple[tuple[int, int, int], tuple[int, int, i
     rows = tw.voxels.cells(grid).numpy()
     lower = rows.min(axis=0)
     upper = rows.max(axis=0)
-    return tuple(int(x) for x in lower), tuple(int(x) for x in upper - lower + 1)
+    extent = upper - lower + 1
+    return (
+        (int(lower[0]), int(lower[1]), int(lower[2])),
+        (int(extent[0]), int(extent[1]), int(extent[2])),
+    )
