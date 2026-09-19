@@ -5,5 +5,5 @@ search:
 
 | Library | Median |
 |---|---|
-| PyTorch3D (CUDA) | 3.07 ms |
-| triwarp (CUDA) | 3.28 ms |
+| triwarp (CUDA) | 20.42 ms |
+| MeshLib | 120.45 ms |

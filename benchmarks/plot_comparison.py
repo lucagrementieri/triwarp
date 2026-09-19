@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -59,17 +60,43 @@ from assets.logos import registry
 # library on one operation) are exactly the case a linear axis hides.
 LOG_SCALE_RATIO = 15.0
 
-# One curated cell per area, picked from a real benchmark run for being both visually clean (a
-# clear ranking, no all-declined rows) and broad (topology, DDG, geodesics, reconstruction,
-# editing, measures) -- see plans/release.md section 4.4. Keys are exactly the `CellKey` shape
-# `aggregate.load` produces: (module, group, mesh_name, rest).
+# The curated documentation set. Three things pick a cell, in this order:
+#
+# 1. **Breadth.** How many independent reference libraries compute the same quantity. A cell with
+#    five of them is a field comparison; a cell with one is a duel, and a reader cannot tell a
+#    fast library from a slow opponent.
+# 2. **Relevance.** The operations callers actually come here for -- proximity and signed
+#    distance, ball and k-NN queries, surface reconstruction, sampling, decimation.
+# 3. **Honesty.** Three of the ten are ties or losses, and they are chosen to be *informative*
+#    rather than token: `query_nearest_bvh_k1` is the same family as the two query wins above it
+#    and shows where the crossover is, and `quadric_decimate[saddle_graded]` is a five-reference
+#    cell triwarp loses to MeshLib's serial decimator.
+#
+# **These must be rendered from a `--bench-all-libs` run.** `_known_slow_libraries.json` skips any
+# reference already measured losing by >2x and ranking third-or-worse -- a sound optimization for
+# the development loss table (it recovers 43 of the suite's 50 minutes of timed regions) and
+# exactly wrong for these charts, because the libraries it drops are the ones triwarp beats most
+# widely. Measured on round 13: the default sweep has **15** cells with three or more references
+# and triwarp leads **1**; the same suite with `--bench-all-libs` has **206** and triwarp leads
+# **140**. Rendering this list against a default sweep silently produces two-bar charts.
 HERO_CELLS: list[aggregate.CellKey] = [
-    ("test_edges", "faces_to_edges", "dragon", ()),
-    ("test_laplacian", "cotmatrix", "dragon", ()),
-    ("test_heat", "heat_geodesic", "sphere_small", (("setup", "full"),)),
-    ("test_remesh", "quadric_decimate", "saddle_graded", (("target_ratio", "0.1"),)),
+    # -- wins, widest field first --------------------------------------------------------------
+    ("test_proximity", "signed_distance_on_mesh", "bunny", (("sign_mode", "parity"),)),
+    ("test_bounds", "oriented_bounding_box", "dragon", ()),
+    ("test_sample", "blue_noise", "bunny", (("radius_scale", "0.5"),)),
+    ("test_neighbors", "query_nearest_bvh_k7", "bunny", ()),
+    ("test_proximity", "winding_number", "bunny_decimated", (("n_queries", "10000"),)),
+    ("test_neighbors", "query_ball_bvh", "bunny", (("radius_scale", "4.0"),)),
     ("test_reconstruction", "ball_pivoting", "bunny", ()),
-    ("test_bounds", "aabb", "bunny_decimated", ()),
+    (
+        "test_reconstruction",
+        "screened_poisson",
+        "bunny_decimated",
+        (("depth", "7"), ("method", "dense")),
+    ),
+    # -- a tie and a loss, both with a wide field ----------------------------------------------
+    ("test_neighbors", "query_nearest_bvh_k1", "bunny", ()),
+    ("test_remesh", "quadric_decimate", "saddle_graded", (("target_ratio", "0.1"),)),
 ]
 
 
@@ -261,11 +288,19 @@ def render_cell(
         # real `ax.barh` call would, so both bounds are set explicitly here -- an unset right
         # bound silently left every bar at matplotlib's default (0, 1) axes view once, which
         # rendered every bar the same width regardless of its actual value.
+        # The right bound has to clear the *longest bar's direct label*, not just the bar. On a
+        # log axis a constant multiplier reserves a constant number of decades, but the label
+        # needs a constant fraction of the axis *width* -- so the headroom is computed from the
+        # cell's own decade span, or a six-library cell spanning 245x silently clips its slowest
+        # label ("658.63 m" for 658.63 ms). Widening it costs nothing: the bars are unchanged and
+        # only whitespace grows.
         if use_log:
             ax.set_xscale("log")
-            ax.set_xlim(min(values_ms) * 0.5, max(values_ms) * 1.6)
+            decades = math.log10(max(values_ms) / min(values_ms)) or 1.0
+            # ~11 % of the plotted width, which fits the longest label this formatter emits.
+            ax.set_xlim(min(values_ms) * 0.5, max(values_ms) * 10 ** (0.11 * (decades + 0.3)))
         else:
-            ax.set_xlim(0, max(values_ms) * 1.22)
+            ax.set_xlim(0, max(values_ms) * 1.30)
         ax.invert_yaxis()  # fastest at the top
         ax.set_yticks([])
         for spine in ("top", "right", "left"):
