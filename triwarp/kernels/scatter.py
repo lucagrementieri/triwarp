@@ -303,8 +303,8 @@ def scatter_edge_incidence(
     # both columns unwritten (an edge no corner named), so read the count first. It is not a zero.
     #
     # It lives here rather than in ``kernels/remesh.py``, where the decimation passes first needed
-    # it, because ``homology.tree_cotree`` groups the same rows for the same reason -- one grouping
-    # answering "how many faces meet along this edge, and which" for the whole package.
+    # it, because ``homology.homology_generators`` groups the same rows for the same reason -- one
+    # grouping answering "how many faces meet along this edge, and which" for the whole package.
     c = wp.int32(wp.tid())
     e = inverse[c]
     slot = wp.atomic_add(out_edge_face_count, e, 1)

@@ -11,38 +11,9 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
 from triwarp.array import arange
-from triwarp.constants import INT32_MAX
 from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels import scatter as kernel_scatter
-from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
-
-# Frontier width at which the level-synchronous BFS hands the rest of the traversal to one serial
-# thread. A level costs a fixed amount of launch overhead whatever its frontier, while the serial
-# walk costs a small amount per node, so the two break even once the frontier is narrow.
-#
-# Frontier width, not node count, decides this: node count alone cannot separate a small graph
-# from a large one whose frontier still narrows early (a long thin ribbon, average degree 4.0,
-# from a sphere, average degree 6.0). Frontier width is observable and is what actually decides.
-_BFS_ESCAPE_FRONTIER = 32
-
-# Levels issued per conditional-graph test in the level-synchronous loop. ``wp.capture_while``
-# evaluates its condition on device at a few microseconds against ~1 us for a replayed launch, so
-# driving a short *run* of levels per test amortizes that over the run. Overshoot is the cost: up
-# to ``K - 1`` levels run past the point the loop would have stopped. That is output-neutral here
-# rather than merely bounded -- a level past an exhausted frontier advances an empty window and
-# emits nothing, and a level past the *escape* does one more parallel level of real work before
-# the serial drain resumes from wherever it left off, which is the same traversal either way.
-# ``order`` and ``distances`` are byte-identical at K = 1, 2, 4 and 8 on every graph swept.
-#
-# Two is the value that loses nowhere: it gains a few percent on the deep blob-shaped graphs whose
-# level loop actually runs, and is a tie on the shallow ones, where 4 and 8 both cost real time.
-#
-# **It does nothing for a long thin graph, which is the shape it looks like it should help.** Such
-# a graph's level loop runs a handful of levels and emits a handful of nodes before the
-# narrow-frontier escape hands off; nearly all of its cost is the serial drain below, which is one
-# thread by design. A per-level dispatch cost only matters if the level body actually runs.
-_BFS_LEVELS_PER_CHECK = 2
 
 
 def edges_to_csr(
@@ -83,7 +54,7 @@ def edges_to_csr(
 
     See Also
     --------
-    [`bfs`][triwarp.graph.bfs]
+    [`bfs_multi_source`][triwarp.graph.bfs_multi_source]
     [`shortest_path_envelope`][triwarp.graph.shortest_path_envelope]
     """
     require_same_device(edges=edges, weights=weights)
@@ -555,268 +526,6 @@ def successor_cycles(
     return flat_cycles, offsets, cycle_sizes
 
 
-def bfs(
-    adjacency: wps.BsrMatrix[wp.Scalar], source: int
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
-    """
-    Single-source breadth-first search over a sparse CSR adjacency matrix.
-
-    The discovery order, parent tree, and distances match
-    [`scipy.sparse.csgraph.breadth_first_order`][] exactly when the adjacency columns are sorted
-    ascending per row (as produced by [`edges_to_csr`][triwarp.graph.edges_to_csr]). This mirrors
-    ``igl::bfs``, additionally returning the BFS level of each node.
-
-    Two engines, chosen by the *observed frontier width* rather than by any property of the graph
-    known up front. The traversal starts level-synchronous and parallel, and hands over to a single
-    serial thread as soon as its frontier is both narrow and no longer growing: a level costs the
-    same four fixed-size launches whatever it carries, so once the frontier is a handful of nodes
-    the serial walk is cheaper per node than the launches are per level. On a graph that stays wide
-    the handover never fires; on one whose frontier is narrow from the start (a path) it fires
-    almost immediately. Order-exactness survives it by construction — the parallel path builds the
-    same explicit FIFO the serial one drains, so the serial engine just continues from where the
-    queue got to.
-
-    Parameters
-    ----------
-    adjacency
-        Square undirected adjacency in 1x1-block ``warp.sparse.BsrMatrix`` form. Each nonzero
-        ``(i, j)`` denotes an edge between nodes ``i`` and ``j``; for undirected graphs both
-        ``(i, j)`` and ``(j, i)`` should be present (as from
-        [`edges_to_csr`][triwarp.graph.edges_to_csr]).
-    source
-        Start node, in ``[0, node_count)``.
-
-    Returns
-    -------
-    order
-        ``wp.array[wp.int32]`` of the reachable nodes in BFS discovery order; length equals the
-        number of nodes reachable from ``source`` (matches scipy's ``node_array``).
-    parents
-        Length ``node_count`` on ``adjacency.device``. ``parents[i]`` is the predecessor of ``i``
-        in the BFS tree; ``-1`` for ``source`` and for unreachable nodes (scipy uses ``-9999``).
-    distances
-        Length ``node_count``. ``distances[i]`` is the BFS level (hop count) of ``i`` from
-        ``source``; ``-1`` for unreachable nodes.
-
-    Raises
-    ------
-    ValueError
-        If ``adjacency`` is not square, does not use 1x1 blocks, or ``source`` is out of range.
-
-    See Also
-    --------
-    [`bfs_from_edges`][triwarp.graph.bfs_from_edges]
-    [`bfs_multi_source`][triwarp.graph.bfs_multi_source]
-    [`connected_component_labels`][triwarp.graph.connected_component_labels]
-    [`scipy.sparse.csgraph.breadth_first_order`][]
-
-    Notes
-    -----
-    !!! note "A long, narrow graph (e.g. a thin ribbon) hits a ceiling here"
-
-        Once the frontier narrows, the traversal hands the rest of the walk to a single serial
-        thread, so a graph that stays narrow for most of its diameter costs close to one thread's
-        full pointer-chasing walk over it. This is a genuine memory-throughput limit rather than a
-        tuning gap: the per-node cost is dominated by dependent loads with no independent work left
-        to hide behind them, and a cooperative block-synchronized rewrite is *slower* here because
-        a narrow frontier's per-level barriers cost more than the work they protect. A host (CPU)
-        fallback is not used either, since it would mean copying the whole CSR structure and the
-        result back across the bus, a different contract from the one this function has. So on a
-        very long, narrow graph this function will not beat
-        ``scipy.sparse.csgraph.breadth_first_order``, whose single-threaded walk has no such
-        transfer cost.
-
-        On a moderately wide frontier the parallel engine's per-level cost is dominated by its
-        fixed launch overhead rather than by graph size, so narrowing the grid is not a useful
-        lever there; the remaining launches per level are already at the minimum the algorithm's
-        synchronization points allow.
-    """
-    node_count, offsets, columns = _validate_square_csr(adjacency)
-    if source < 0 or source >= node_count:
-        raise ValueError(f"source must be in [0, {node_count}), got {source}")
-
-    device = adjacency.device
-
-    parents = wp.full(node_count, -1, dtype=wp.int32, device=device)
-    distances = wp.full(node_count, -1, dtype=wp.int32, device=device)
-    order_buffer = wp.empty(node_count, dtype=wp.int32, device=device)
-
-    reached = wp.zeros(1, dtype=wp.int32, device=device)
-    if device.is_cpu:
-        # The Warp CPU backend executes kernels serially anyway, so the frontier loop buys nothing
-        # there at any size and the single-thread traversal is trivially order-exact.
-        wp.launch(
-            kernel_bfs.single_source_bfs_kernel,
-            dim=1,
-            inputs=[wp.int32(source), offsets, columns, order_buffer, parents, distances, reached],
-            device=device,
-        )
-        return wp.clone(order_buffer[: int(read_scalar(reached, 0))]), parents, distances
-
-    # Level-synchronous frontier BFS that reproduces scipy's FIFO discovery order exactly,
-    # sort-free: unvisited neighbors are claimed with the parent dequeue rank via atomic_min
-    # (first-dequeued parent wins, matching scipy's predecessor), per-rank owned counts are
-    # scanned into rank-major segment offsets, and each rank scatters its owned nodes in
-    # ascending CSR column order — (rank, ascending node id), the same order the former int64
-    # claim-key radix sort produced. The whole loop runs on device via ``wp.capture_while``
-    # (kernels launch at fixed dim=node_count and early-exit on the device-side frontier size),
-    # so the only host sync is the final window readback; when conditional CUDA graphs are
-    # unavailable, ``capture_while`` itself falls back to direct execution with one pinned
-    # 4-byte condition readback per level.
-    #
-    # The loop also *stops early* once the frontier narrows (``_BFS_ESCAPE_FRONTIER``) and hands
-    # its half-built FIFO to the serial kernel above, which is what keeps a long-diameter graph
-    # from paying four fixed-size launches for a two-node frontier, tens of thousands of times.
-    # ``int(...)`` because ``BFS_SCAN_BLOCK`` is a typed ``wp.int32`` constant, and ``//`` on a
-    # ``wp.int32`` at host scope raises ``TypeError`` rather than dividing.
-    scan_block = int(kernel_bfs.BFS_SCAN_BLOCK)
-    n_blocks = (node_count + scan_block - 1) // scan_block
-    padded = n_blocks * scan_block
-    claim_rank = wp.full(node_count, INT32_MAX, dtype=wp.int32, device=device)
-    offsets_scan = wp.empty(padded, dtype=wp.int32, device=device)
-    block_sums = wp.empty(n_blocks, dtype=wp.int32, device=device)
-    # state = [frontier start, frontier end, level to emit, loop condition,
-    #          emit start, emit end, emit level] -- the last three are the window
-    # ``bfs_scatter_claims`` works on, snapshotted by ``bfs_scan_and_advance`` before it advances
-    # the live one. See ``kernels/algorithms/bfs.py`` for why the update runs before the scatter.
-    state = wp.zeros(kernel_bfs.BFS_STATE_SIZE, dtype=wp.int32, device=device)
-    state.assign([0, 1, 1, 1, 0, 1, 1])
-    wp.launch(
-        kernel_bfs.bfs_seed,
-        dim=1,
-        inputs=[wp.int32(source), order_buffer, distances],
-        device=device,
-    )
-
-    def bfs_level() -> None:
-        wp.launch(
-            kernel_bfs.bfs_expand_claim,
-            dim=node_count,
-            inputs=[offsets, columns, order_buffer, state, distances, claim_rank],
-            device=device,
-        )
-        # Count and scan share a launch (see the kernel), and the scan is a capture-safe
-        # fixed-buffer one: wp.utils.array_scan allocates temp storage internally, which a
-        # conditional graph body rejects ("Conditional body graph contains an unsupported
-        # operation (memory allocation)"), so ``bfs_count_and_scan`` avoids it with a fixed buffer.
-        wp.launch_tiled(
-            kernel_bfs.bfs_count_and_scan,
-            dim=[n_blocks],
-            inputs=[
-                offsets,
-                columns,
-                order_buffer,
-                state,
-                distances,
-                claim_rank,
-                offsets_scan,
-                block_sums,
-            ],
-            block_dim=scan_block,
-            device=device,
-        )
-        wp.launch(
-            kernel_bfs.bfs_scan_and_advance,
-            dim=1,
-            inputs=[offsets_scan, wp.int32(_BFS_ESCAPE_FRONTIER), block_sums, state],
-            device=device,
-        )
-        wp.launch(
-            kernel_bfs.bfs_scatter_claims,
-            dim=node_count,
-            inputs=[
-                offsets,
-                columns,
-                state,
-                claim_rank,
-                offsets_scan,
-                block_sums,
-                order_buffer,
-                parents,
-                distances,
-            ],
-            device=device,
-        )
-
-    def bfs_level_body() -> None:
-        """``_BFS_LEVELS_PER_CHECK`` levels: the body ``wp.capture_while`` drives per test."""
-        for _ in range(_BFS_LEVELS_PER_CHECK):
-            bfs_level()
-
-    # CUDA only: ``bfs_count_and_scan`` builds its tile with ``wp.tile``, which fills lane 0 alone
-    # on the CPU backend. On CPU the level loop is skipped entirely and the serial kernel below
-    # walks from the seed — the same kernel the escape path already hands off to, so the answer is
-    # identical rather than degraded, and one CPU core doing the walk is the faster engine there
-    # anyway.
-    if device.is_cuda:
-        condition = state[3:4]
-        if wp.is_conditional_graph_supported():
-            with wp.ScopedCapture(device) as capture:
-                wp.capture_while(condition, bfs_level_body)
-            wp.capture_launch(capture.graph)
-        else:
-            wp.capture_while(condition, bfs_level_body)
-
-    # One readback of the FIFO window tells both things there are to know: an empty window means
-    # the traversal ran out of frontier, a non-empty one means it escaped and the serial kernel
-    # takes over from exactly there.
-    window = state[:2].numpy()
-    head, tail = int(window[0]), int(window[1])
-    if head < tail:
-        wp.launch(
-            kernel_bfs.resume_bfs_kernel,
-            dim=1,
-            inputs=[state, offsets, columns, order_buffer, parents, distances, reached],
-            device=device,
-        )
-        tail = int(read_scalar(reached, 0))
-    return wp.clone(order_buffer[:tail]), parents, distances
-
-
-def bfs_from_edges(
-    edges: twt.Array2dInt32, source: int, node_count: int | None = None
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
-    """
-    Single-source BFS from an undirected edge list.
-
-    Builds a CSR adjacency via [`edges_to_csr`][triwarp.graph.edges_to_csr] and delegates
-    to [`bfs`][triwarp.graph.bfs].
-
-    Parameters
-    ----------
-    edges
-        ``(m, 2)`` ``wp.int32`` edge list. Each row ``(a, b)`` connects nodes ``a`` and ``b``
-        (undirected; order does not matter).
-    source
-        Start node, in ``[0, node_count)``.
-    node_count
-        Number of nodes ``0 .. node_count - 1``. When ``None``, inferred as ``max(edges) + 1`` if
-        ``m > 0``, else ``0``.
-
-    Returns
-    -------
-    tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]
-        ``(order, parents, distances)`` as in [`bfs`][triwarp.graph.bfs], on ``edges.device``.
-
-    Raises
-    ------
-    TypeError
-        If ``edges`` is not a rank-2 ``int32`` array.
-    ValueError
-        If ``edges`` is not ``(m, 2)``, an endpoint is outside ``[0, node_count)``, ``node_count``
-        is negative, or ``source`` is out of range.
-
-    See Also
-    --------
-    [`bfs`][triwarp.graph.bfs]
-    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
-    """
-    node_count = _validate_edge_list(edges, node_count, validate=True)
-
-    adjacency = edges_to_csr(node_count, edges)
-    return bfs(adjacency, source)
-
-
 def bfs_multi_source(
     adjacency: wps.BsrMatrix[wp.Scalar], sources: wp.array[wp.int32]
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
@@ -829,8 +538,6 @@ def bfs_multi_source(
     and emits each source's component from one label-sorted node array. Source ``sources[k]``
     owns ``neighbors[offsets[k] : offsets[k + 1]]``, listed with the source itself first and
     the remaining nodes in ascending index order. There is no reachable-set capacity limit.
-    For BFS discovery order, parents, and distances of a single source, use
-    [`bfs`][triwarp.graph.bfs].
 
     Parameters
     ----------
@@ -857,12 +564,12 @@ def bfs_multi_source(
 
     See Also
     --------
-    [`bfs`][triwarp.graph.bfs]
+    [`connected_component_labels`][triwarp.graph.connected_component_labels]
     [`geodesic_ball`][triwarp.neighbors.geodesic_ball]
     """
     require_same_device(adjacency=adjacency, sources=sources)
-    # This one traverses through ``bfs`` rather than the CSR buffers directly, so it wants only
-    # the validation and the node count.
+    # This one goes through the component labelling rather than the CSR buffers directly, so it
+    # wants only the validation and the node count.
     node_count, _, _ = _validate_square_csr(adjacency)
 
     device = adjacency.device
@@ -1006,8 +713,8 @@ def shortest_path_envelope(
 
     One relaxation kernel per pass, so a pass is a pure function of the previous labels and the
     answer does not depend on thread interleaving. The pass count is data-dependent; on CUDA the
-    whole pass loop runs as one device-side conditional graph (``wp.capture_while``, as
-    [`bfs`][triwarp.graph.bfs] already does), so the convergence check costs no host readback at
+    whole pass loop runs as one device-side conditional graph (``wp.capture_while``), so the
+    convergence check costs no host readback at
     all rather than the one-per-pass a naive early exit would need — see the ``linalg`` note on
     ``check_every`` for why that per-pass sync would otherwise be the expensive part. The CPU
     backend, which has no conditional-graph capture, still checks with a plain readback per pass.
@@ -1019,7 +726,6 @@ def shortest_path_envelope(
     See Also
     --------
     [`edges_to_csr`][triwarp.graph.edges_to_csr]
-    [`bfs`][triwarp.graph.bfs]
     [`heat_geodesic`][triwarp.heat.heat_geodesic]
     [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]
     [`scipy.sparse.csgraph.dijkstra`][]
@@ -1047,7 +753,7 @@ def shortest_path_envelope(
     changed = wp.zeros(1, dtype=wp.int32, device=device)
 
     if not device.is_cuda:
-        # No conditional-graph capture on the CPU backend (see `bfs`'s identical device split);
+        # No conditional-graph capture on the CPU backend, so the pass loop runs on the host;
         # the plain per-pass loop below, with its one 4-byte readback per pass, is already the
         # cheapest thing a CPU launch can do here.
         for _ in range(max_pass_count):
@@ -1063,7 +769,7 @@ def shortest_path_envelope(
                 break
         return labels
 
-    # CUDA: the whole pass loop runs on-device via ``wp.capture_while`` (as ``bfs`` does), so the
+    # CUDA: the whole pass loop runs on-device via ``wp.capture_while``, so the
     # only host sync in the common case is none at all -- each pass's convergence check and
     # iteration cap are folded into ``envelope_advance_and_check``, which runs after the relax
     # kernel and the label copy below.

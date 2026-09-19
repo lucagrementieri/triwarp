@@ -85,7 +85,7 @@ def envelope_advance_and_check(
     # round to write into. ``out_changed`` only ever goes 0 -> 1 in a pass, so reading it once per
     # round is the OR over that round's passes -- which is what "did anything move" has to mean.
     # It is read here as this round's own answer and reset in the same launch for the next -- the
-    # same in-place shape as ``bfs``'s ``out_order``. dim=1, so no thread
+    # same in-place shape a traversal's emitted order buffer has. dim=1, so no thread
     # index -- this is host-side bookkeeping moved onto the device so the whole loop can run as one
     # conditional graph with no per-pass readback.
     out_counter[0] += passes

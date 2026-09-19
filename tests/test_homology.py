@@ -128,6 +128,44 @@ def test_homology_generators_are_not_contractible(
         assert len(components) == 1
 
 
+def test_homology_generators_are_reproducible(
+    genus_two: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """
+    Triwarp against triwarp: the docstring promises a reproducible basis, so pin it.
+
+    Both spanning trees are built by parallel claims, and a basis that depended on which thread got
+    there first would still pass every invariant in this file -- the loops would be simple, closed
+    and non-contractible, just different ones. What makes it deterministic is that each claim is
+    resolved by an extremum rather than by arrival: the primal tree takes the lowest-indexed
+    frontier vertex (``wp.atomic_min`` on the parent) and the dual forest the lowest-indexed
+    incident edge. Four runs, because a race that loses once in two is not one worth shipping.
+
+    ``genus_two`` rather than the torus so there are four generators to disagree about, and the
+    loops are compared *elementwise*: a count-only check passes on any valid basis, which is
+    exactly what this is written to exclude.
+
+    Mutation probe: replacing the ``wp.atomic_min`` claim with a plain racy write fails **this
+    test's elementwise comparison and nothing else** -- the other fifteen tests in this file stay
+    green, because the loops stay simple, closed, non-contractible and correctly counted. That is
+    the whole argument for the test existing.
+    """
+    _, mesh_wp = genus_two
+    runs = [
+        [
+            loop.numpy().tolist()
+            for loop in tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
+        ]
+        for _ in range(4)
+    ]
+
+    # Non-vacuity: an empty basis would compare equal to itself four times over.
+    assert len(runs[0]) == 4
+    assert all(len(loop) >= 3 for loop in runs[0])
+    for run in runs[1:]:
+        assert run == runs[0]
+
+
 def test_homology_generators_reject_a_boundary(
     hemisphere: tuple[tm.Trimesh, wp.Mesh], device: str
 ) -> None:
@@ -188,48 +226,44 @@ def test_homology_generators_reject_a_disconnected_surface(
         tw.homology.homology_generators(vertices_wp, faces_wp)
 
 
-def test_tree_cotree_without_edges(device: str) -> None:
+def test_homology_generators_without_edges(device: str) -> None:
     """
     Not a library comparison: the degenerate input the closed-surface guard must answer, not raise.
 
     A mesh with no faces has no boundary edges either, so it is vacuously closed and the honest
-    answer is an empty decomposition. The boundary-count reduction is what used to raise here, with
-    a ``ValueError`` whose message said the mesh had a boundary.
+    answer is an empty basis. The boundary-count reduction is what used to raise here, with a
+    ``ValueError`` whose message said the mesh had a boundary. Distinct from
+    [`test_homology_generators_empty`], which has no vertices either: this one reaches the
+    edge-count early return with a populated vertex buffer.
     """
     vertices_wp = wp.zeros(4, dtype=wp.vec3, device=device)
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
 
-    unique_edges, generator_edges, parents = tw.homology.tree_cotree(vertices_wp, faces_wp)
-
-    assert unique_edges.shape == (0, 2)
-    assert generator_edges.shape == (0, 2)
-    assert np.array_equal(parents.numpy(), np.full(4, -1, dtype=np.int32))
+    assert tw.homology.homology_generators(vertices_wp, faces_wp) == []
 
 
-def test_tree_cotree_partitions_the_edges(torus: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:
+def test_homology_generators_satisfy_the_tree_cotree_identity(
+    torus: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
     """
     Not a library comparison: the counting identity a tree-cotree decomposition must satisfy.
 
     ``E = (V - 1) + (F - 1) + 2g`` is the whole point of the construction, and trimesh contributes
-    only ``V`` and ``F``. An implementation mislabelling one edge would break the identity, which no
-    reference implementation is needed to state.
+    only ``V`` and ``F``. An implementation mislabelling one edge -- letting the primal tree take an
+    edge the cotree already has, or leaving one in neither -- breaks the identity, which no
+    reference implementation is needed to state. It is the invariant that covers the decomposition
+    now that it is internal to [`homology_generators`], and it bites on the spanning trees where the
+    Euler-characteristic count in this file bites on the genus.
     """
     mesh_tm, mesh_wp = torus
-    unique_edges, generator_edges, parents = tw.homology.tree_cotree(
-        mesh_wp.points, mesh_wp.indices
-    )
+    loops = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
 
     n_vertices = len(mesh_tm.vertices)
     n_faces = len(mesh_tm.faces)
-    n_edges = int(unique_edges.shape[0])
-    # The decomposition is a partition: primal tree (V - 1 edges), dual tree (F - 1), generators.
-    assert int(generator_edges.shape[0]) == n_edges - (n_vertices - 1) - (n_faces - 1)
-    # Every vertex but the root has a parent, i.e. the primal tree spans the mesh.
-    assert int((parents.numpy() < 0).sum()) == 1
-    # And each generator edge is a real edge of the mesh.
-    edges_tm = {tuple(sorted(edge)) for edge in mesh_tm.edges_unique.tolist()}
-    for edge in generator_edges.numpy():
-        assert tuple(sorted(edge.tolist())) in edges_tm
+    n_edges = int(tw.edges.edges_unique(mesh_wp.indices, n_vertices=n_vertices)[0].shape[0])
+    # Non-vacuity: the fixture really is genus 1, so the identity is not 0 == 0.
+    assert len(loops) == 2
+    assert len(loops) == n_edges - (n_vertices - 1) - (n_faces - 1)
 
 
 def test_homology_generators_empty(device: str) -> None:

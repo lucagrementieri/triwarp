@@ -95,9 +95,9 @@ def hash_slot(key: wp.Int, mask: wp.int32) -> wp.int32:
     # keys afterwards, ``bfs_visited_insert`` uses the table as a set, and ``remesh``'s claim locks
     # re-read the slot they wrote. A hash that mixes the high bits cannot also be a bijection on
     # the low ones, so this gives up the old form's accidental collision-free behaviour on *dense
-    # consecutive* keys (1.00 probes at ``bfs``'s 75% load against 1.52 here) to stop degrading on
-    # every other family -- that same advantage was already gone at 2.50 probes once the ids were
-    # merely strided.
+    # consecutive* keys (1.00 probes at ``bfs_visited_insert``'s 75% load against 1.52 here) to
+    # stop degrading on every other family -- that same advantage was already gone at 2.50 probes
+    # once the ids were merely strided.
     h = h ^ (h >> HASH_FOLD_SHIFT)
     return wp.int32(h & wp.uint64(mask))
 

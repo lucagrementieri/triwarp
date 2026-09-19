@@ -21,14 +21,17 @@ walk along real mesh edges that visits no vertex twice.
 
 from __future__ import annotations
 
-import numpy as np
+from collections.abc import Callable
+
 import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
+from triwarp.constants import INT32_MAX, TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import homology as kernel_homology
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import scatter as kernel_scatter
 
 
@@ -46,7 +49,9 @@ def homology_generators(
     The loops are a *basis*, not canonical: any generating set is as valid as any other, and this
     one falls out of the spanning trees the construction happens to build. They are also as long
     and as jagged as those trees, which is what
-    [`shorten_loop`][triwarp.geodesic_walk.shorten_loop] is for.
+    [`shorten_loop`][triwarp.geodesic_walk.shorten_loop] is for. The basis is **reproducible**, and
+    the same on every device: the primal tree resolves competing claims by lowest vertex index and
+    the dual forest by lowest edge index, so neither depends on the order the threads ran in.
 
     Parameters
     ----------
@@ -62,7 +67,7 @@ def homology_generators(
     -------
     list[wp.array[wp.int32]]
         One ``wp.int32`` array of vertex indices per generator, on ``faces.device``. Empty for a
-        sphere.
+        sphere, and for a mesh with no faces.
 
     Raises
     ------
@@ -78,225 +83,181 @@ def homology_generators(
     --------
     [`shorten_loop`][triwarp.geodesic_walk.shorten_loop]
         Shortens these loops within their homotopy class, keeping them on mesh edges.
-    [`tree_cotree`][triwarp.homology.tree_cotree]
     [`euler_characteristic`][triwarp.measures.euler_characteristic]
+        Fixes how many loops there are: ``2 * g == 2 - chi``.
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
     require_same_device(vertices=vertices, faces=faces)
     device = faces.device
     n_vertices = int(vertices.shape[0])
-    if n_vertices == 0 or int(faces.shape[0]) == 0:
-        return []
-
-    unique_edges, generator_edges, parents = tree_cotree(vertices, faces)
-    del unique_edges
-    generators = generator_edges.numpy()
-    if len(generators) == 0:
-        return []
-
-    parents_np = parents.numpy()
-    loops = [_loop_through_tree(int(a), int(b), parents_np) for a, b in generators]
-    packed = wp.array(np.concatenate(loops), dtype=wp.int32, device=device)
-    starts_np = np.cumsum([0, *(len(loop) for loop in loops[:-1])], dtype=np.int32)
-    offsets = wp.array(starts_np, dtype=wp.int32, device=device)
-    return tw.array.split(packed, offsets, copy=copy)
-
-
-def _loop_through_tree(start: int, end: int, parents: np.ndarray) -> np.ndarray:
-    """
-    Close an edge into a loop through the spanning tree: ``start -> root``, ``root -> end``, edge.
-
-    The two root paths share a suffix above their lowest common ancestor, and that shared part is
-    dropped: otherwise the "loop" would walk up it and straight back down, a contractible spur that
-    says nothing about the surface's topology.
-    """
-    path_start = [start]
-    while parents[path_start[-1]] >= 0:
-        path_start.append(int(parents[path_start[-1]]))
-    path_end = [end]
-    while parents[path_end[-1]] >= 0:
-        path_end.append(int(parents[path_end[-1]]))
-
-    shared = 0
-    while (
-        shared + 1 <= len(path_start)
-        and shared + 1 <= len(path_end)
-        and path_start[-1 - shared] == path_end[-1 - shared]
-    ):
-        shared += 1
-    # Keep the lowest common ancestor once: it is a real corner of the loop.
-    trimmed_start = path_start[: len(path_start) - shared + 1]
-    trimmed_end = path_end[: len(path_end) - shared]
-    return np.array(trimmed_start + trimmed_end[::-1], dtype=np.int32)
-
-
-def tree_cotree(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> tuple[twt.Array2dInt32, twt.Array2dInt32, wp.array[wp.int32]]:
-    """
-    Tree-cotree decomposition: the edges a primal and a dual spanning tree both leave alone.
-
-    Three pieces of structure, and the building block behind
-    [`homology_generators`][triwarp.homology.homology_generators]:
-
-    1. a breadth-first spanning tree of the **vertex** graph, whose ``parents`` the loop tracing
-       walks,
-    2. a spanning **forest** of the **dual** (face-adjacency) graph, restricted to dual edges whose
-       primal edge is not already in the vertex tree,
-    3. whatever edges belong to neither — exactly ``2 * g`` of them on a closed genus-``g`` surface.
-
-    The dual side is a forest rather than a traversal because only its edge *set* is read, never its
-    shape. That matters for cost as well as tidiness: the dual graph restricted to non-primal-tree
-    edges is already nearly a tree, so a breadth-first traversal of it would run its diameter, which
-    can be very large, and ``graph.bfs`` costs one pass of kernels per level whatever the node
-    count. A Boruvka forest instead needs only ``O(log n_faces)`` rounds.
-
-    Parameters
-    ----------
-    vertices
-        ``(n_vertices,)`` mesh vertex positions. Only the count is used.
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
-
-    Returns
-    -------
-    unique_edges : twt.Array2dInt32
-        ``(n_edges, 2)`` undirected edges, as [`edges_unique`][triwarp.edges.edges_unique] returns.
-    generator_edges : twt.Array2dInt32
-        ``(2 * g, 2)`` the leftover edges, one per homology generator.
-    parents : wp.array[wp.int32]
-        Length ``n_vertices`` primal spanning-tree parent of each vertex; ``-1`` at the root and
-        at every unreferenced vertex, which the tree never reaches. All ``-1`` for a mesh with no
-        edges at all, which has nothing to span and no generators.
-
-    Raises
-    ------
-    ValueError
-        If the mesh has a boundary, or is not connected (see
-        [`homology_generators`][triwarp.homology.homology_generators]).
-    RuntimeError
-        If ``vertices`` and ``faces`` are not all on one device.
-
-    See Also
-    --------
-    [`homology_generators`][triwarp.homology.homology_generators]
-    [`bfs`][triwarp.graph.bfs]
-    [`edges_unique`][triwarp.edges.edges_unique]
-    """
-    require_same_device(vertices=vertices, faces=faces)
-    device = faces.device
-    n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
+    if n_vertices == 0 or n_faces == 0:
+        return []
 
     # One grouping of the edge rows answers everything: ``inverse`` maps each face corner to its
     # unique edge, and one scatter over it fills both the per-edge face count and the two incident
-    # faces. That is the whole dual graph, indexed by unique edge -- which is why nothing here needs
-    # to locate a shared edge's row afterwards. The host ``argsort`` + ``searchsorted`` pair this
-    # replaces was doing exactly that lookup, over an ``inverse`` the same ``edges_unique`` call had
-    # already returned and thrown away.
+    # faces. That is the whole dual graph, indexed by unique edge — which is why nothing here needs
+    # to locate a shared edge's row afterwards.
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     n_edges = int(unique_edges.shape[0])
+    if n_edges == 0:
+        # A face carries three edges, so no edges means no faces: vacuously closed, nothing to span
+        # and nothing left over.
+        return []
     edge_face_count = wp.zeros(n_edges, dtype=wp.int32, device=device)
     edge_faces = twt.empty_2d((n_edges, 2), wp.int32, device=device)
-    if n_edges > 0:
-        wp.launch(
-            kernel_scatter.scatter_edge_incidence,
-            dim=int(inverse.shape[0]),
-            inputs=[inverse, edge_face_count, edge_faces],
-            device=device,
-        )
-    interior = wp.empty(n_edges, dtype=wp.bool, device=device)
-    wp.map(kernel_array.equal, edge_face_count, wp.int32(2), out=interior)
-    # The one readback: the closed-surface guard, whose message quotes the boundary-edge count.
-    # ``face_count == 2`` is the same exactly-two-corners test the row grouping behind
-    # ``face_adjacency`` applied, so a non-manifold edge fails this guard exactly as it did before.
-    # ``reduce.sum`` raises on a zero-length array, so an edgeless mesh answers without it rather
-    # than surfacing that as the boundary ``ValueError`` this function documents.
-    n_interior = tw.reduce.sum(interior) if n_edges > 0 else 0
+    wp.launch(
+        kernel_scatter.scatter_edge_incidence,
+        dim=int(inverse.shape[0]),
+        inputs=[inverse, edge_face_count, edge_faces],
+        device=device,
+    )
+
+    # Both preconditions are counting questions, and both are answered on the device into one
+    # three-slot buffer that is read back once, after the primal tree: a guard that raises does not
+    # need to raise early, and a separate readback apiece would serialise the pipeline twice more.
+    counts = wp.zeros(kernel_homology.COUNT_SIZE, dtype=wp.int32, device=device)
+    offsets, columns = _vertex_adjacency(unique_edges, n_vertices, edge_face_count, counts)
+    parents, distances = _primal_spanning_tree(offsets, columns, unique_edges)
+    wp.launch_tiled(
+        kernel_homology.count_reached_and_referenced,
+        dim=kernel_reduce.blocks_1d(n_vertices),
+        inputs=[offsets, distances, counts],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    n_interior, n_reached, n_referenced = (int(value) for value in counts.numpy())
     if n_interior * 2 != 3 * n_faces:
         raise ValueError(
             "homology_generators requires a closed surface: this mesh has "
             f"{3 * n_faces - 2 * n_interior} boundary edge(s)."
         )
-    if n_edges == 0:
-        # No edges means no faces (a face carries three), so there is nothing to span and nothing
-        # to leave over. Every vertex is its own primal-tree root.
-        return (
-            twt.as_array2d(unique_edges, wp.int32),
-            twt.empty_2d((0, 2), wp.int32, device=device),
-            wp.full(n_vertices, -1, dtype=wp.int32, device=device),
-        )
-
-    # Primal spanning tree over the vertex graph. This one stays a breadth-first traversal: the mesh
-    # graph's diameter is small, and ``parents`` is the rooted tree the loop tracing walks.
-    #
-    # **The root has to be a referenced vertex, and the graph has to be connected**, because the
-    # generator count is ``n_edges`` minus the two trees' edge counts and a tree that spans less
-    # than its graph hands the difference over as generators. Rooting at vertex 0 unconditionally
-    # is what breaks on an unreferenced one: the "tree" is then a single isolated node with no
-    # edges, and every primal edge becomes a generator (measured: a 128-vertex genus-1 torus with
-    # one unreferenced vertex prepended reported 129 generators instead of 2). ``edges_unique``
-    # returns its rows lexicographically sorted, so the first endpoint of the first row is the
-    # lowest-indexed referenced vertex -- referenced by construction, and deterministic.
-    adjacency = tw.graph.edges_to_csr(n_vertices, unique_edges)
-    root = int(read_scalar(unique_edges.flatten(), 0))
-    order, parents, _ = tw.graph.bfs(adjacency, root)
-    # The connectivity half of the same requirement, which ``homology_generators``' docstring has
-    # always stated as a precondition and nothing checked. A vertex is referenced exactly when its
-    # adjacency row is non-empty, and ``order`` holds what the traversal reached, so the two counts
-    # agree exactly when the referenced vertices form one component. Unreferenced vertices are
-    # deliberately not counted: they carry no edges, so they cannot change the generator count.
-    referenced = wp.empty(n_vertices, dtype=wp.bool, device=device)
-    wp.map(kernel_array.less, adjacency.offsets[:-1], adjacency.offsets[1:], out=referenced)
-    n_referenced = int(tw.reduce.sum(referenced))
-    if int(order.shape[0]) != n_referenced:
+    if n_reached != n_referenced:
         raise ValueError(
             "homology_generators requires a connected surface: the traversal reached "
-            f"{int(order.shape[0])} of {n_referenced} referenced vertices."
+            f"{n_reached} of {n_referenced} referenced vertices."
         )
 
-    # The edgeless case returned above, so these three no longer need a ``n_edges > 0`` guard.
-    in_primal_tree = wp.empty(n_edges, dtype=wp.bool, device=device)
+    # A generator is an edge in neither tree. ``candidate`` starts as the edges the cotree is
+    # allowed to cross — interior, and not already claimed by the primal tree — and the forest pass
+    # removes the ones it took, so the leftovers need no predicate of their own.
+    candidate = wp.empty(n_edges, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_homology.primal_tree_edge_mask,
+        kernel_homology.dual_candidate_mask,
         dim=n_edges,
-        inputs=[unique_edges, parents, in_primal_tree],
+        inputs=[unique_edges, edge_face_count, parents, candidate],
         device=device,
     )
-    candidate = wp.empty(n_edges, dtype=wp.bool, device=device)
-    wp.map(kernel_homology.is_dual_candidate, edge_face_count, in_primal_tree, out=candidate)
-
     in_dual_tree = _dual_spanning_forest(candidate, edge_faces, n_faces)
+    wp.map(kernel_array.mask_and_not, candidate, in_dual_tree, out=candidate)
+    generator_edge_ids = tw.array.flatnonzero(candidate)
+    if int(generator_edge_ids.shape[0]) == 0:
+        return []
+    return _trace_generator_loops(generator_edge_ids, unique_edges, parents, distances, copy=copy)
 
-    # A homology generator is a candidate the cotree left out. Edges the primal tree took are
-    # already excluded from ``candidate``, so this is "in neither tree" on a closed surface --
-    # which is ``array.mask_and_not`` and needs no predicate of its own.
-    leftover_mask = wp.empty(n_edges, dtype=wp.bool, device=device)
-    wp.map(kernel_array.mask_and_not, candidate, in_dual_tree, out=leftover_mask)
-    generator_edges = tw.array.gather(unique_edges, tw.array.flatnonzero(leftover_mask))
-    return (
-        twt.as_array2d(unique_edges, wp.int32),
-        twt.as_array2d(generator_edges, wp.int32),
-        parents,
+
+def _vertex_adjacency(
+    unique_edges: twt.Array2dInt32,
+    n_vertices: int,
+    edge_face_count: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    CSR ``(offsets, columns)`` of the undirected vertex graph, and the interior-edge count with it.
+
+    Built by counting degrees and scattering through a per-vertex cursor rather than by handing
+    ``2 * n_edges`` triplets to ``warp.sparse.bsr_from_triplets``. The rows the edges are already
+    unique, so there is nothing for the sort-and-merge to do, and the level loop that consumes this
+    resolves ties by vertex index rather than by column position — so the rows do not need to come
+    out sorted. Callers that need sorted rows must sort them.
+
+    ``counts`` is the shared three-slot accumulator; this fills only
+    ``COUNT_INTERIOR_EDGES``, which rides along because the degree pass is already reading every
+    edge.
+    """
+    device = unique_edges.device
+    n_edges = int(unique_edges.shape[0])
+    degree = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    wp.launch_tiled(
+        kernel_homology.vertex_degrees_and_interior_count,
+        dim=kernel_reduce.blocks_1d(n_edges),
+        inputs=[unique_edges, edge_face_count, degree, counts],
+        block_dim=TILE_1D,
+        device=device,
     )
+    # The open-coded scan rather than ``array.counts_to_offsets``: that one reads its total back
+    # unconditionally, and the total here is ``2 * n_edges``, which is already known.
+    offsets = wp.zeros(n_vertices + 1, dtype=wp.int32, device=device)
+    wp.utils.array_scan(degree, out_array=offsets[1:], inclusive=True)
+    # ``degree`` has done its job and becomes the scatter's write cursor, which saves an allocation
+    # and is why the scatter takes both it and ``offsets``.
+    degree.zero_()
+    columns = wp.empty(2 * n_edges, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_homology.scatter_adjacency,
+        dim=n_edges,
+        inputs=[unique_edges, offsets, degree, columns],
+        device=device,
+    )
+    return offsets, columns
+
+
+def _primal_spanning_tree(
+    offsets: wp.array[wp.int32], columns: wp.array[wp.int32], unique_edges: twt.Array2dInt32
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Rooted spanning tree of the vertex graph as ``(parents, distances)``.
+
+    A breadth-first level loop, pushed from the frontier, two launches per level and no host
+    synchronization at all. ``parents`` holds
+    [`NO_PARENT`][triwarp.kernels.homology.NO_PARENT] at the root and at every unreferenced vertex,
+    which the tree never reaches; ``distances`` holds the depth, or ``-1`` for the same vertices.
+
+    The depth is kept although a spanning tree does not need it: it is what lets
+    [`_trace_generator_loops`][triwarp.homology._trace_generator_loops] size a loop without walking
+    it, and the level loop writes it either way.
+    """
+    device = unique_edges.device
+    n_vertices = int(offsets.shape[0]) - 1
+    parents = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
+    distances = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
+    state = wp.zeros(kernel_homology.BFS_STATE_SIZE, dtype=wp.int32, device=device)
+    # Level 1 is the first to claim; nothing claimed yet; the condition starts true so the loop
+    # runs at least once.
+    state.assign([1, 0, 1])
+    wp.launch(kernel_homology.bfs_seed, dim=1, inputs=[unique_edges, distances], device=device)
+
+    def level() -> None:
+        wp.launch(
+            kernel_homology.bfs_push_level,
+            dim=n_vertices,
+            inputs=[offsets, columns, state, parents, distances],
+            device=device,
+        )
+        wp.launch(kernel_homology.bfs_advance, dim=1, inputs=[state], device=device)
+
+    _run_device_loop(
+        device, state[kernel_homology.BFS_CONDITION : kernel_homology.BFS_CONDITION + 1], level
+    )
+    return parents, distances
 
 
 def _dual_spanning_forest(
     candidate: wp.array[wp.bool], edge_faces: twt.Array2dInt32, n_faces: int
 ) -> wp.array[wp.bool]:
     """
-    Build a spanning forest of the dual graph over the ``candidate`` edges, as a per-edge mask.
+    Spanning forest of the dual graph over the ``candidate`` edges, as a per-edge mask.
 
     Boruvka: each round hands every component its lowest-indexed incident candidate edge, accepts
     those edges and unions the components, so the component count at least halves per round and the
-    loop finishes in ``O(log n_faces)`` of them.
+    loop finishes in ``O(log n_faces)`` of them. Four launches per round and no host
+    synchronization; the round cap in the state word only bounds a loop the halving argument
+    already bounds, since a captured loop that runs away hangs the device.
 
-    A **forest** is all [`tree_cotree`][triwarp.homology.tree_cotree] needs — it reads the dual tree
-    as a set, and the loop tracing walks the *primal* parents — so the dual side has no root and no
-    parent pointers, and its shape is free to choose. The breadth-first shape is the expensive one
-    here: the dual graph restricted to non-primal-tree edges is already nearly a tree, so its
-    diameter is enormous, and ``graph.bfs`` costs one pass of kernels per level whatever the node
-    count.
+    A **forest** is all the decomposition needs — the cotree is read as a set, and the loop tracing
+    walks the *primal* parents — so the dual side has no root and no parent pointers, and its shape
+    is free to choose. Breadth-first is the expensive shape here: the dual graph restricted to
+    non-primal-tree edges is already nearly a tree, so its diameter is enormous.
     """
     device = candidate.device
     n_candidates = int(candidate.shape[0])
@@ -306,19 +267,18 @@ def _dual_spanning_forest(
     labels = tw.array.arange(n_faces, device=device)
     roots = wp.empty(n_faces, dtype=wp.int32, device=device)
     proposal = wp.empty(n_faces, dtype=wp.int32, device=device)
-    merges = wp.zeros(1, dtype=wp.int32, device=device)
-    # The round count is a cap, not a schedule: the readback below exits as soon as a round merges
-    # nothing, which happens once every component is spanned. ``bit_length`` is ``ceil(log2)`` plus
-    # one, so the cap can only be reached by a logic error.
-    for _ in range(max(1, n_faces.bit_length()) + 1):
-        merges.zero_()
+    state = wp.zeros(kernel_homology.FOREST_STATE_SIZE, dtype=wp.int32, device=device)
+    # One merge pending so the first round runs, and ``bit_length`` is ``ceil(log2)`` plus one, so
+    # the cap can only be reached by a logic error.
+    state.assign([1, max(1, n_faces.bit_length()) + 1, 1])
+
+    def round_of_boruvka() -> None:
         wp.launch(
-            kernel_homology.forest_snapshot_roots,
+            kernel_homology.forest_round_setup,
             dim=n_faces,
-            inputs=[labels, roots],
+            inputs=[labels, roots, proposal, state],
             device=device,
         )
-        proposal.fill_(int(kernel_homology.FOREST_NO_PROPOSAL))
         wp.launch(
             kernel_homology.forest_propose,
             dim=n_candidates,
@@ -328,10 +288,77 @@ def _dual_spanning_forest(
         wp.launch(
             kernel_homology.forest_link,
             dim=n_candidates,
-            inputs=[candidate, edge_faces, roots, proposal, labels, in_forest, merges],
+            inputs=[candidate, edge_faces, roots, proposal, labels, in_forest, state],
             device=device,
         )
-        # One 4-byte readback per round, and there is no bound on the rounds without it.
-        if int(read_scalar(merges, 0)) == 0:
-            break
+        wp.launch(kernel_homology.forest_advance, dim=1, inputs=[state], device=device)
+
+    _run_device_loop(
+        device,
+        state[kernel_homology.FOREST_CONDITION : kernel_homology.FOREST_CONDITION + 1],
+        round_of_boruvka,
+    )
     return in_forest
+
+
+def _trace_generator_loops(
+    generator_edge_ids: wp.array[wp.int32],
+    unique_edges: twt.Array2dInt32,
+    parents: wp.array[wp.int32],
+    distances: wp.array[wp.int32],
+    *,
+    copy: bool,
+) -> list[wp.array[wp.int32]]:
+    """
+    Close each generator edge into a loop through the primal tree, on the device.
+
+    Two launches and a scan: one thread per generator finds the apex (the lowest common ancestor of
+    the edge's endpoints) and the loop's length from the two depths, the lengths scan into offsets,
+    and a second thread per generator fills its slice from both ends. The grid is ``2 * g`` wide and
+    so tiny, but so is the work — the alternative is one Python walk per generator over a
+    ``parents`` array read back in full.
+    """
+    device = unique_edges.device
+    n_generators = int(generator_edge_ids.shape[0])
+    apex = wp.empty(n_generators, dtype=wp.int32, device=device)
+    lengths = wp.empty(n_generators, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_homology.generator_loop_lengths,
+        dim=n_generators,
+        inputs=[generator_edge_ids, unique_edges, parents, distances, apex, lengths],
+        device=device,
+    )
+    # The total-terminated form: ``write_generator_loops`` reads ``offsets[g + 1]`` as its slice's
+    # end, and the total is the packed length, so one call answers both.
+    offsets, total = tw.array.counts_to_offsets(lengths, include_total=True)
+    loops = wp.empty(total, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_homology.write_generator_loops,
+        dim=n_generators,
+        inputs=[generator_edge_ids, unique_edges, parents, apex, offsets, loops],
+        device=device,
+    )
+    return tw.array.split(loops, offsets[:n_generators], copy=copy)
+
+
+def _run_device_loop(
+    device: wp.Device, condition: wp.array[wp.int32], body: Callable[[], None]
+) -> None:
+    """
+    Run ``body`` until the device-side ``condition`` word reads zero, without a host readback.
+
+    Both iterations in this module write their own continuation flag, so on CUDA the whole loop is
+    one captured conditional graph — the per-round readback each used to take drains the pipeline
+    that round's launches just filled. The fallback is an ordinary Python loop with one four-byte
+    read per round, which is what runs on the CPU device and wherever conditional graphs are
+    unavailable; both forms test *after* the body, so ``condition`` must start non-zero.
+    """
+    if device.is_cuda and wp.is_conditional_graph_supported():
+        with wp.ScopedCapture(device) as capture:
+            wp.capture_while(condition, body)
+        wp.capture_launch(capture.graph)
+        return
+    while True:
+        body()
+        if int(read_scalar(condition, 0)) == 0:
+            return

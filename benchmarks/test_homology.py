@@ -14,31 +14,24 @@ trees with no loops to trace at all -- and ``handles_64`` is 128 traces on top o
 
 Measured medians (RTX 5090, ``--device=cuda``)
 ----------------------------------------------
-| mesh | genus | ``homology_generators`` | ``tree_cotree`` | meshlib |
-|---|---|---|---|---|
-| ``sphere_med`` | 0 | **5.96 ms** | 5.84 ms | 7.38 ms |
-| ``handles_1`` | 1 | **5.76 ms** | 5.27 ms | 5.52 ms |
-| ``handles_64`` | 64 | **12.07 ms** | 5.98 ms | 5.99 ms |
+| mesh | genus | ``homology_generators`` | meshlib |
+|---|---|---|---|
+| ``sphere_med`` | 0 | **2.66 ms** | 7.38 ms |
+| ``handles_1`` | 1 | **2.42 ms** | 5.52 ms |
+| ``handles_64`` | 64 | **3.13 ms** | 5.99 ms |
 
-**This table replaces one that read 51.8 / 50.4 / 65.1 ms in the triwarp column, and both of that
-table's findings have gone with it.** The re-measurement is trustworthy because meshlib's column is
-unchanged within noise (7.38 / 5.52 / 5.99 against 7.6 / 5.5 / 6.0), which is what says the two
-sessions are comparable and the 8.7x is triwarp's own. What earned it is *not* attributed here --
-nothing in this module changed, so it came from something shared, and a guess in a benchmark
-docstring is worse than the gap.
+triwarp leads on all three -- 2.8x, 2.3x and 1.9x -- where it was level with meshlib at genus 1 and
+2.01x behind at genus 64. The fused rewrite is worth **2.03 / 2.15 / 3.26x** against the previous
+implementation on the same box in one interleaved session, and the ratio rises with the genus
+because the tracing it replaced was the part that scaled: 128 loops were walked one at a time in
+Python over a ``parents`` array read back in full, and they are now two launches and a scan.
 
-**The decomposition is no longer the whole cost.** At genus 1 the trees are 5.27 ms of 5.76, but at
-genus 64 they are 5.98 of 12.07 -- so 128 loop traces cost 6.1 ms against 0.49 ms for two, and half
-the work at high genus is now tracing. That is the reverse of the old reading, and it is the same
-6 ms of tracing as before: the trees fell around it.
-
-**And the trees are flat in the genus after all** -- 5.84 / 5.27 / 5.98 ms -- which is what they
-should be, since neither BFS knows how many edges will be left over. The old table's 15 % rise was
-an artifact of whatever made the trees fifty milliseconds; there is no finding there to chase.
-
-triwarp is now **1.24x faster** than meshlib at genus 0, level with it at genus 1 (1.04x) and
-**2.01x behind** at genus 64 -- where the gap is the per-loop tracing, not the decomposition. The
-previous claim that this was the module's largest standing gap no longer holds.
+**The axis still separates the two halves of the algorithm**, but they no longer separate in the
+clock the way they did. The spread across a 64x genus range is 2.42 to 3.13 ms, against 5.76 to
+12.07 before, so the decomposition dominates again and the tracing is a few hundred microseconds of
+it. There is no longer a ``tree_cotree`` group to read this one against: the decomposition stopped
+being a public entry point when it stopped being reachable except through this function, and the
+attribution it existed for is in ``triwarp/kernels/homology.py``'s module docstring.
 
 References
 ----------
@@ -79,12 +72,12 @@ def _mesh_ml(bench_case: BenchCase) -> mm.Mesh:
 @pytest.mark.benchlibs("triwarp", "meshlib")
 def test_homology_generators(bench_case: BenchCase) -> None:
     """
-    The full basis: spanning tree, cotree, then one loop trace per generator.
+    The full basis: spanning tree, cotree, then one loop trace per generator, in one call.
 
-    Read against [`test_tree_cotree`] below, which stops before the tracing: the gap between the two
-    groups is what the loops cost -- 0.49 ms at genus 1 and **6.1 ms** at genus 64, against 5.3-6.0
-    for the trees themselves. So at high genus the tracing is half the call, which is the opposite
-    of what this group used to say; see the module docstring for why the older numbers are gone.
+    The genus axis prices the tracing, which is the half that scales with it -- 2.42 ms at genus 1
+    against 3.13 at genus 64, for 126 more loops. It used to be 0.49 ms against 6.1, a Python walk
+    per generator over a ``parents`` array read back in full; it is now two launches and a scan, so
+    the decomposition is the cost again at every genus this axis reaches.
     """
     expected = {"sphere_med": 0, "handles_1": 2, "handles_64": 128}[bench_case.mesh_name]
     if bench_case.kind == "meshlib":
@@ -95,30 +88,3 @@ def test_homology_generators(bench_case: BenchCase) -> None:
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     loops = bench_case.run(lambda: tw.homology.homology_generators(vertices, faces))
     assert len(loops) == expected
-
-
-@pytest.mark.benchmark(group="tree_cotree")
-@pytest.mark.benchaxis("genus")
-@pytest.mark.benchlibs("triwarp")
-def test_tree_cotree(bench_case: BenchCase) -> None:
-    """
-    The decomposition alone, without tracing a single loop -- and it is where the time goes.
-
-    triwarp-only by construction, not by omission: MeshLib exposes the finished basis and no
-    intermediate, so there is nothing to compare a spanning tree against. It is here to attribute
-    ``homology_generators``' cost, and it does -- 5.27 of 5.76 ms at genus 1, but only 5.98 of 12.07
-    at genus 64.
-
-    It is **flat** along this axis -- 5.84 / 5.27 / 5.98 ms at genus 0 / 1 / 64 -- which is what it
-    should be, since neither BFS knows how many edges will be left over. An earlier reading of this
-    same group was ten times larger and *not* flat, and the separate group is what makes the
-    difference visible: the non-flatness was in the trees, and it went away with the ten times.
-    """
-    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    edges, generators, parents = bench_case.run(lambda: tw.homology.tree_cotree(vertices, faces))
-    assert int(edges.shape[0]) > 0
-    assert int(parents.shape[0]) == bench_case.n_vertices
-    assert (
-        int(generators.shape[0])
-        == {"sphere_med": 0, "handles_1": 2, "handles_64": 128}[bench_case.mesh_name]
-    )

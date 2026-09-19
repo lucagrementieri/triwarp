@@ -10,27 +10,9 @@ Two axes, matching the two ways a graph algorithm gets slow:
   that is a separate claim from the component sweep and it is load-bearing elsewhere in the
   package, so it is regression-covered rather than measured once (see
   ``test_connected_component_labels_depth``).
-* **diameter** for ``bfs``. This is the one that hurts, and the only group in the suite that still
-  loses to a CPU reference after being worked on. The traversal is level-synchronous under
-  ``wp.capture_while`` -- **one iteration per BFS level**, seven launches at a grid size CUDA
-  graphs bake in -- so a graph's *depth* sets the launch count and its size does not. It measured
-  **5.06 ms on ``sphere_med`` (diameter ~130) against 367 ms on ``ribbon_long`` (diameter
-  20 481)** at an identical 40 962 vertices: 73x, from a property no face count records. Bounding
-  the serial block scan to the frontier and handing narrow frontiers to a serial resume brings that
-  to **4.0 ms and 23 ms**, a 5.8x spread -- but scipy does the ribbon in 0.68 ms, so this group
-  stays a loss by 34x. **It is now a closed item rather than an open one: the single-block
-  ``launch_tiled(dim=[1])`` traversal engine was written, is order-exact, and is a 2.2x loss.**
-  The serial drain is memory-op *throughput* bound on one thread (481 ns/node against 524 ns for
-  fifteen independent loads), so there is no latency to hide (software pipelining measured 1.05x)
-  and a ribbon's ~2-node frontier means block barriers cost more than the level's work
-  (``tile_scan_exclusive`` alone is 353 ns against 962 ns for the whole level). Full measurements in
-  the ``Notes`` of [`triwarp.graph.bfs`][triwarp.graph.bfs].
-
-* **diameter again, but weighted**, for ``shortest_path_envelope``. Same shape as ``bfs`` and
-  for the
-  same reason -- one launch per relaxation pass, and the pass count is the diameter of the region
-  that violates the bound -- but the work per pass sweeps the whole CSR rather than a frontier, so
-  there is no serial-drain handover to make and no order to be exact about. Seeded from a single
+* **diameter**, for ``shortest_path_envelope`` -- one launch per relaxation pass, and the pass
+  count is the diameter of the region that violates the bound. The work per pass sweeps the whole
+  CSR rather than a frontier, so there is no narrow-frontier handover to make. Seeded from a single
   spike, the worst case on purpose: the cap has to cross the whole mesh, so read the row as an upper
   bound rather than a typical one. Capped at ``bunny_decimated`` for that reason.
 
@@ -45,7 +27,7 @@ on the same ``components`` axis.
 References
 ----------
 The scipy references sit in the ``scipy`` library slot: ``scipy.sparse.csgraph
-.breadth_first_order`` is the exact-order oracle the triwarp ``bfs`` docstring promises to match
+.breadth_first_order`` is the reachable-set oracle the multi-source group checks against
 (and the backend trimesh itself uses for graph traversals), and ``connected_components`` is its
 labelling counterpart.
 
@@ -86,7 +68,7 @@ import scipy.sparse as sp
 import warp as wp
 import warp.sparse as wps
 from meshlib import mrmeshpy as mm
-from scipy.sparse.csgraph import breadth_first_order, dijkstra
+from scipy.sparse.csgraph import dijkstra
 
 import triwarp as tw
 from conftest import BenchCase, skip_larger_than
@@ -285,24 +267,6 @@ def test_face_connected_component_labels_depth(bench_case: BenchCase) -> None:
     assert labels.shape == (n_faces,)
 
 
-@pytest.mark.benchmark(group="bfs")
-@pytest.mark.benchaxis("diameter")
-@pytest.mark.benchlibs("triwarp", "scipy")
-def test_bfs(bench_case: BenchCase) -> None:
-    """Level-synchronous frontier BFS with a serial escape once the frontier narrows: 5.8x here."""
-    if bench_case.kind == "triwarp":
-        adjacency = _adjacency(bench_case)
-        order, _, _ = bench_case.run(lambda: tw.graph.bfs(adjacency, 0), rounds=_ROUNDS)
-        assert order.shape[0] >= 1
-    else:  # scipy exact-order oracle (see the module docstring)
-        graph = _scipy_graph(bench_case)
-        order, _ = bench_case.run(
-            lambda: breadth_first_order(graph, 0, directed=False, return_predecessors=True),
-            rounds=_ROUNDS,
-        )
-        assert order.shape[0] >= 1
-
-
 @pytest.mark.benchmark(group="bfs_multi_source")
 @pytest.mark.benchaxis("components")
 @pytest.mark.benchlibs("triwarp", "scipy")
@@ -317,7 +281,7 @@ def test_bfs_multi_source(bench_case: BenchCase, n_sources: int) -> None:
     magnitude apart.
 
     scipy's ``csgraph.dijkstra(unweighted=True, min_only=True)`` is the multi-source reduction in
-    one call, and it is the reference the sibling ``bfs`` group's ``breadth_first_order`` cannot
+    one call, and it is the reference a per-source ``breadth_first_order`` loop cannot
     be: that one takes a single source, so ``k`` of them would be ``k`` calls. Read the two rows as
     different answers to the same question -- scipy returns one distance *field* over the whole
     vertex set where triwarp returns the packed reachable *sets*, so at ``parts_1024`` triwarp's

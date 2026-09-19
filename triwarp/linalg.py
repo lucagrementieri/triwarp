@@ -149,7 +149,7 @@ CG_CHECK_EVERY = 0
 # the best cell gained ~13 % while three others lost 28-40 %, and every summary statistic put the
 # unbatched loop ahead. A converged iteration here is a pure no-op -- ``cg_step_p`` and
 # ``cg_step_x_r_z`` pin a converged column's ``beta`` / ``alpha`` to exactly zero -- so the
-# overshoot buys nothing at all, unlike the equivalent batching in ``graph.bfs``'s level loop,
+# overshoot buys nothing at all, unlike the equivalent batching in a breadth-first level loop,
 # where an extra level still does useful work and a small batch is kept.
 
 # Cadence substituted for ``check_every=0`` on a device without conditional CUDA graphs, where Warp

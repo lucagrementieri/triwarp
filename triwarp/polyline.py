@@ -1010,8 +1010,8 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     Notes
     -----
     The round loop runs **on device**, driven by ``wp.capture_while`` over a device-side condition
-    exactly as [`bfs`][triwarp.graph.bfs] drives its levels, so the whole clip costs one graph
-    launch and one readback (the final face count) rather than a readback per round.
+    exactly as the level loops elsewhere in this package drive theirs, so the whole clip costs
+    one graph launch and one readback (the final face count) rather than a readback per round.
 
     **The prologue is fused.** The plane frame
     ([`polyline_normal`][triwarp.polyline.polyline_normal], its internal

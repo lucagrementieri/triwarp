@@ -1720,7 +1720,7 @@ return `(mesh_tm: tm.Trimesh, mesh_wp: wp.Mesh)` via `tests.conversions.trimesh_
 | `hemisphere`, `half_torus` | Curved or open surfaces |
 | `boy_surface` | Closed, watertight and **non-orientable**, χ = 1 — the `False` branch of `is_orientable` / `face_orientation_bits`, and `make_winding_consistent`'s impossible one |
 | `mobius` | Non-orientable *with* a boundary: the same three predicates, one loop of 78 edges, χ = 0 |
-| `bohemian_dome` | Closed genus 1 that self-intersects — `homology_generators` / `tree_cotree` at genus 1, and `is_self_intersecting` on a *closed* input |
+| `bohemian_dome` | Closed genus 1 that self-intersects — `homology_generators` at genus 1, and `is_self_intersecting` on a *closed* input |
 
 The last three are built by `creation.parametric_surface` and are the only inputs in the suite that
 are non-orientable or that have an odd Euler characteristic. A boolean predicate asserted only on the
@@ -1792,7 +1792,8 @@ docstring says so in those words: *"Not a library comparison: <why none exists>"
 the invariant excludes. That is a fifth label beside A-D, not a class-D exemption — D is for a
 *benchmarked* pair whose results are genuinely incomparable and needs a `noparity` entry; this is for
 a quantity with no counterpart to benchmark. `halfedge_twins` (no reference has a halfedge
-structure), `homology.tree_cotree` (nothing computes a basis) and `geodesic_walk`'s arc-length checks
+structure), `homology.homology_generators`' tree-cotree counting identity (nothing computes a
+basis) and `geodesic_walk`'s arc-length checks
 are the shape of it.
 
 **Classify every comparison, and say which class it is in the docstring:**
@@ -4318,7 +4319,9 @@ not insensitivity** (§16.4).
 
 ### 14.9 Refuted, with the code written — do not re-propose
 
-- **A single-block cooperative BFS drain for `graph.bfs`.** Built, verified byte-identical, and it
+- **A single-block cooperative BFS drain for the old `graph.bfs`.** *(`graph.bfs` has since been
+  deleted — §16.9 — so this is history rather than a live decline; the lesson below is not.)*
+  Built, verified byte-identical, and it
   loses badly against the existing serial engine. The serial drain is memory-throughput bound on one
   thread, not latency bound, so neither software pipelining nor a register-vector batch of loads
   helped; and on a narrow, non-growing frontier (a long thin "ribbon" graph) the per-level work is
@@ -4327,8 +4330,8 @@ not insensitivity** (§16.4).
   a per-level dispatch cost only matters if the level body actually runs** — `graph.bfs` already
   hands off to the cheap serial path once the frontier stops growing, so on a graph shaped like that,
   "fuse the level's kernels" is a no-op fix for a stage that never executes.
-    - **That has a number now, and it is worth quoting because `bfs[ribbon_long]` is the suite's
-      largest single loss row and keeps attracting level-loop proposals.** Instrumented at the
+    - **That has a number now, and it is why `bfs[ribbon_long]` — for as long as it was the
+      suite's largest single loss row — was not a row any triwarp call could reach.** Instrumented at the
       handoff: on `ribbon_long` (40 962 nodes, depth 20 480) the parallel level loop runs **3
       levels and emits 6 nodes — 0.0 %**; the other 40 956 are the serial drain, which is ~95 % of
       that row's 23 ms and is one thread by design. Nothing done to the level loop can move it.
@@ -6142,7 +6145,7 @@ Attributed per row before touching any of it (97 rows, 158.1 ms by gap). Top gro
 | `is_watertight` | 5.88 | 2 | documented scope mismatch (meshlib reads a cached `isClosed`) |
 | `cotmatrix` | 5.87 | 2 | **closed** as a scope mismatch (§16.6) |
 | `fillable_loop_mask` | 5.67 | 3 | `edges_unique` at 62-66 %; deleting the chord test outright still leaves ~0.4 ms |
-| `homology_generators` | 4.94 | 1 | **attributed** — `graph.bfs` is 3.57 of `tree_cotree`'s 6.09 ms and is ~100 % device (§15.10) |
+| `homology_generators` | 4.94 | 1 | **CLOSED** — fused to one function, 2.03-3.26x, and `graph.bfs` deleted (below) |
 | `lscm` | 4.83 | 1 | the ill-conditioned-solve family |
 | `pack_1d_arrays` | 4.02 | 3 | the per-segment floor |
 | `marching_triangles` | 3.98 | 2 | **not real** — a median artifact at `rounds=3` (§15.4) |
@@ -6164,39 +6167,60 @@ and launch elimination will not touch it:
   0.31. Same shape as §12.7's batched-dot finding, on the *unbatched* path — `wpl.cg`, not
   `_BatchedCg`. A CG iteration here is ~36 µs of which two dots are ~10, and every kernel in it is
   latency-bound at ~5 µs over 40 962 rows.
-- **`homology_generators`** = `tree_cotree` (6.09 ms) + ~5.0 ms of Python loop tracing. Of the
-  `tree_cotree` half, **`graph.bfs` is 3.57 ms and is ~100 % device** — 4 kernels x 142 levels at
-  26.1 µs a level (`bfs_scatter_claims` 8.6, `bfs_expand_claim` 7.6, `bfs_count_and_scan` 7.0,
-  `bfs_scan_and_advance` 2.9, the last at `dim=1`). Capture is already worth **3.7-5.0x** there
-  (3.53 ms against 13.3 uncaptured), and `wp.capture_while`'s own per-iteration overhead is only
-  ~4-6 µs against a captured fixed chain's 1.0-2.1 (measured on a 142-iteration synthetic; batching
-  K bodies per conditional check was worth at most 1.38x there, best at K = 4).
-  **So the level loop is real work and the only lever is fewer levels or fewer kernels per level**,
-  which is §14.9's standing conclusion.
-
-  **SHIPPED since, at K = 2 (`graph._BFS_LEVELS_PER_CHECK`), and the real-graph win is much
-  smaller than the synthetic's 1.38x.** Measured interleaved in one process, min of 11, `order`
-  and `distances` byte-identical at K = 1 / 2 / 4 / 8: `sphere_med` **1.069x**, `handles_64`
-  **1.044x** (this row's own fixture), `handles_1` 1.030x, `sphere_small` 0.999x, `ribbon_long`
-  0.996x. K = 4 costs 0.91x on `sphere_small` and K = 8 costs 0.71x, so K = 2 is the value that
-  loses nowhere — the same short-run asymmetry that *removed* the equivalent batching from CG
-  (§16.8), except milder here, because a BFS level past the stopping point still does useful work
-  where a converged CG iteration is a pure no-op. Overshoot is output-neutral by construction: a
-  level past an exhausted frontier advances an empty window, and a level past the narrow-frontier
-  escape does one more parallel level before the serial drain resumes from wherever it stopped.
-  **Two general points: the same mechanism can be a win in one loop and a 0.60x loss in another,
-  so price it per loop; and a synthetic's ratio for it did not survive contact with a real graph.** The primal tree cannot take the dual side's Boruvka
-  treatment — `tree_cotree` reads the dual tree as a *set* but walks the primal one's rooted
-  `parents`, and rooting a forest in parallel is a different problem; `homology.py` says so at the
-  site. Second-largest piece after that is `_device.read_scalar`, 11 calls for 0.154 ms.
+- **CLOSED — `homology_generators` is one fused function and **2.03-3.26x** faster, and the row's
+  whole attribution has been superseded.** What this bullet used to record: 6.09 ms of
+  `tree_cotree` plus ~5.0 ms of Python loop tracing, of which `graph.bfs` was 3.57 ms and ~100 %
+  device — 4 kernels x 142 levels at 26.1 µs a level (`bfs_scatter_claims` 8.6,
+  `bfs_expand_claim` 7.6, `bfs_count_and_scan` 7.0, `bfs_scan_and_advance` 2.9, the last at
+  `dim=1`) — and it concluded "the only lever is fewer levels or fewer kernels per level". The
+  second half of that was right and the framing was wrong: the lever was **what the level was
+  computing for**, not how many kernels it took to compute it.
+    - **The one in-tree consumer never read a discovery order.** `tree_cotree` unpacked
+      `order, parents, _` and used `order` for its `.shape[0]` alone (a connectivity count) —
+      while `bfs_count_and_scan` + `bfs_scan_and_advance`, **9.9 of the 26.1 µs**, existed only to
+      compact claims into scipy's FIFO order. Replacing the FIFO tie-break with a
+      `wp.atomic_min` on the parent keeps the tree deterministic, drops the level to two kernels,
+      and — because the tie-break no longer reads column position — removes the requirement that
+      the adjacency be *column-sorted*, which is what let the CSR build drop
+      `bsr_from_triplets` (a radix sort of `2 * n_edges` triplets plus a `wp.ones` values array)
+      for a degree count, a scan and a cursor scatter.
+    - **The Python tracing went to the device for roughly all of it.** `distances` — the depth
+      array the level loop wrote anyway, and the half worth *keeping* when the order was cut —
+      sizes each generator's loop as `depth(a) + depth(b) - 2 * depth(lca) + 1` without walking
+      it, so the tracing is one kernel for the apex and lengths, a `counts_to_offsets`, and one
+      kernel filling each slice from both ends. 128 host walks over a fully read-back `parents`
+      became two launches.
+    - **Readbacks 24 → 3.** The root is read on the device by the seed kernel; the closed-surface
+      and connectivity guards fold into one three-slot buffer read once (a guard that raises does
+      not need to raise *early*); and both iterations — the BFS levels and the Boruvka rounds —
+      write their own device-side condition word, so `wp.capture_while` drives them with no
+      per-round drain at all. The Boruvka round additionally folded its `proposal.fill_` and
+      `merges.zero_()` into the snapshot kernel that was already at `dim=n_faces`.
+    - Measured against a detached baseline worktree (§15.6), three process pairs, min of 25 each:
+      `sphere_med` (genus 0) 5.419 → **2.663 ms (2.03x)**, `handles_1` 5.208 → **2.423 (2.15x)**,
+      `handles_64` 10.201 → **3.132 (3.26x)**. Generator counts identical (0 / 2 / 128). The
+      basis *itself* differs — the atomic-min tree is not the FIFO tree, so total loop length goes
+      14 095 → 15 521 on `handles_64` (~10 % longer loops, same count); a homology basis is not
+      unique and the suite's invariants cover it, but a caller feeding `shorten_loop` pays that.
+    - **`graph.bfs` and `graph.bfs_from_edges` are deleted**, along with the level-synchronous and
+      serial-drain engines in `kernels/algorithms/bfs.py` (`bfs_multi_source` is a different
+      algorithm — component labelling — and stays). They had no other consumer, and reproducing
+      `scipy.sparse.csgraph.breadth_first_order` exactly is a promise nothing in the package
+      needed. **The `bfs` benchmark group goes with them, which retires `bfs[ribbon_long]` — the
+      suite's largest single loss row at 22.46 ms / 30.07x.** That row was never reachable from
+      any triwarp call: §14.9 measured its level loop running 3 levels and emitting 6 nodes of
+      40 962, the rest being a one-thread serial drain. Deleting the entry point is the honest
+      close, not a win.
+    - **The transferable rule: before optimizing a traversal, read what its caller unpacks.** Two
+      of the four kernels per level, the sorted-column requirement on the adjacency, the radix
+      sort that requirement forced, and the serial-drain engine were all downstream of an
+      ordering guarantee that exactly one caller took and immediately discarded.
 - **`delaunay_triangulation`** is the one that is genuinely host, and its host half is the
   *designed* one: the single-thread CPU seed kernel, 5.2 ms in `invoke` plus 2.8 in
   `_lexicographic_triangulation` of an 18.1 ms call at n = 20 000. Already recorded in the
   benchmark's own docstring as the fixed design (a CUDA thread is 66x worse at it).
 
-Two related notes: `homology_generators[handles_64]` spends 4.43 of 10.9 ms in the Python
-`_loop_through_tree` walks (128 generators, mean loop 110), which a NumPy binary-lifting LCA would
-vectorize; and `combine.split`'s cost scales with **component count**, not mesh size — ~0.64 ms of
+One related note (the `homology_generators` tracing half is closed above): `combine.split`'s cost scales with **component count**, not mesh size — ~0.64 ms of
 host work per returned submesh against 0.29 ms (open3d) and 0.23 ms (trimesh), so on a mesh with 94
 scan floaters triwarp is 78 ms where it wins 34-120x on few-component meshes.
 

@@ -36,13 +36,15 @@ Two examples of what this buys, both measured on an RTX 5090:
 | group | control | perturbed | spread |
 |---|---|---|---|
 | `combine.concatenate`, F = 81 920 fixed | 8 pieces **0.23 ms** | 512 pieces **5.7 ms** | **25×** |
-| `graph.bfs`, V = 40 962 fixed | sphere Ø ≈ 130 **4.0 ms** | ribbon Ø = 20 481 **23 ms** | **5.8×** |
+| `homology_generators`, F ≈ 90 000 fixed | genus 0 **2.66 ms** | genus 64 **3.13 ms** | **1.2×** |
 
-Neither is visible to a face-count sweep, and `bfs` still *loses to scipy* at the far end of its
-axis (0.68 ms on the ribbon) even after the spread came down from 73×. `concatenate` came down from
-48× (0.39 → 19.0 ms) by collapsing its per-piece index renumbering into one launch; what is left is
-one `wp.copy` per input buffer, which Warp cannot batch — there is no gather across separate
-allocations — so the residual slope is real and bounded below by the piece count.
+Neither is visible to a face-count sweep. `concatenate` came down from 48× (0.39 → 19.0 ms) by
+collapsing its per-piece index renumbering into one launch; what is left is one `wp.copy` per input
+buffer, which Warp cannot batch — there is no gather across separate allocations — so the residual
+slope is real and bounded below by the piece count. The genus row is the other outcome an axis can
+report: it read **2.1×** while 128 generator loops were traced one at a time on the host, and
+flattened to 1.2× once the tracing moved to the device — the axis is what showed which half of the
+algorithm the genus actually drove.
 
 Four more entries have already been retired from this table by the fixes they prompted, and all
 four are kept in their modules as worked examples of what the axis rule is for:
