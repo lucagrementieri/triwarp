@@ -60,9 +60,12 @@ def scatter_neighbor_lists(
     # siblings rather than one kernel.
     #
     # ``cursor`` is zeroed per-node scratch, not an output: each node's slots are handed out by the
-    # atomic, so the column order within a row is thread order and **not sorted**. That is
-    # deliberate and is what this build costs less than ``bsr_from_triplets`` for; a caller that
-    # needs sorted rows must sort them, or use ``graph.edges_to_csr``.
+    # atomic, so the column order within a row is thread order and **not sorted** -- nor stable,
+    # so two runs return different permutations. That is deliberate and is what this build costs
+    # less than ``bsr_from_triplets`` for. ``graph.edges_to_neighbor_lists(sort_rows=True)`` pins
+    # it with one ``array.sort_segments`` launch, which makes the buffer identical to
+    # ``graph.edges_to_csr``'s; that is what ``neighbors.geodesic_ball`` asks for, because it emits
+    # its BFS queue in visit order.
     e = wp.int32(wp.tid())
     a = edges[e, 0]
     b = edges[e, 1]

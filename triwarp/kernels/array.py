@@ -425,6 +425,40 @@ def sort_rows_insertion(data: wp.array2d[wp.Scalar]) -> None:
 
 
 @wp.kernel
+def sort_segments(offsets: wp.array[wp.int32], data: wp.array[wp.int32]) -> None:
+    # One thread per segment, in-place ascending sort of ``data[offsets[s] : offsets[s + 1]]``.
+    # The ragged sibling of ``sort_rows_insertion``, and the two differ in exactly one thing: a
+    # rank-2 row's width is a *shape*, so that kernel can be a plain insertion sort and the wide
+    # case escapes to ``segmented_sort_pairs`` on a host-side branch (``array.sort_rows``). A
+    # segment's width is *data*, known only per thread, so there is no host branch to make -- which
+    # is why this one is a shell sort rather than the insertion sort it degenerates into. For the
+    # vertex valences its caller sorts the gap loop runs twice and costs a couple of comparisons;
+    # what it buys is that a single high-degree segment cannot take the whole launch quadratic,
+    # since the launch waits for its slowest thread.
+    #
+    # Measured on an RTX 5090, Warp 1.17, as the whole ``edges_to_neighbor_lists`` build against
+    # ``edges_to_csr``, byte-identical at every point: on meshes **2.61-2.65x** (against
+    # 2.48-2.60x for the plain insertion sort, so the gap loop is free at a vertex valence), and on
+    # a star graph 1.97x / 2.59x / 2.25x / **1.82x** at hub degree 6 / 32 / 128 / 256, crossing to
+    # **0.78x at 512** and 0.07x at 4 096. That crossover is the reason the caller chooses.
+    segment = wp.int32(wp.tid())
+    start = offsets[segment]
+    width = offsets[segment + 1] - start
+    gap = wp.int32(1)
+    while gap < width // 3:
+        gap = 3 * gap + 1
+    while gap >= 1:
+        for i in range(gap, width):
+            value = data[start + i]
+            j = i
+            while j >= gap and data[start + j - gap] > value:
+                data[start + j] = data[start + j - gap]
+                j = j - gap
+            data[start + j] = value
+        gap = gap // 3
+
+
+@wp.kernel
 def gather_vec_skip_negative(
     source: wp.array[wp.vec3], index: wp.array[wp.int32], out_gathered: wp.array[wp.vec3]
 ) -> None:

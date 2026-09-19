@@ -5898,26 +5898,70 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   that row falls back to an exact O(n) linear scan, and how much of the cloud falls in that tail
   scales with n — so `backend="bvh"` is the workaround at moderate k on a uniform cloud, the opposite
   of what the earlier reading implied.
-- **REFUTED — `neighbors.geodesic_ball` cannot take `graph.edges_to_neighbor_lists`, and the
-  reason is reproducibility, not correctness of the ball.** The cheap CSR builder was measured at
-  **1.19-1.27x** on this call and reverted: it hands out each row's slots with `wp.atomic_add`, so
-  the order within a row is thread-arrival order and differs **run to run** — measured **11 of 11
-  repeats differing** on a 2 562-vertex icosphere against **0 of 5** for `edges_to_csr`. The ball
-  is a geometric predicate and is unaffected, and `geodesic_ball_reference_neighbors` takes the
-  minimum over the whole row so it is unaffected too; what breaks is that `per_source_bfs_collect`
-  emits `queue[:count]` in *visit* order, so a permuted row permutes the output, and
-  `curvature.principal_curvature`'s ill-conditioned quadric fit amplifies that — the same
-  mechanism its own `test_principal_curvature_is_reproducible` records at up to 77 % relative from
-  one ULP. **The full suite caught it; no targeted run did**, which is the argument for running the
-  whole suite before believing a reuse.
+- **SHIPPED — `neighbors.geodesic_ball` takes `graph.edges_to_neighbor_lists(sort_rows=True)`:
+  **1.16-1.27x** on the ball, **1.11-1.21x** on `curvature.principal_curvature`, and
+  byte-identical output. This supersedes a REFUTED entry that was over-conservative, and the
+  correction is the transferable part.** That entry declined the cheap builder because its rows are handed out by
+  `wp.atomic_add` and so differ **run to run** (measured 7 of 7 repeats), which broke
+  `test_principal_curvature_is_reproducible`'s `np.array_equal`. The reproducibility break was
+  real. What the entry did *not* do was measure how far the answer actually moved, and it is
+  nowhere near what the revert implied:
+    - **The ball's answer never changed at all.** On `half_torus` at `radius=2`, **0 of 544** rows
+      differ in count, **0 of 544** differ as a *set*, and `reference_neighbors` — which frames
+      every fit — is identical at all 544. Only the order moved, at 531 of 544 rows.
+    - **The curvature moved by 1.3e-06 absolute on a field of range 4.06**, at 13 of 544 vertices,
+      max 5.5e-04 relative, zero sign flips. Against the *historic* defect the reproducibility
+      test was written for — `float32` vertex-normal atomics, **7.96e-04 absolute and 77 %
+      relative at 19 of 544** — that is ~600x smaller absolutely and ~1 400x relatively.
+    - **The mechanism is the fit's accumulation order and nothing else**, proved by holding the
+      set fixed: permuting each row of `edges_to_csr`'s *own* output — sorting it, reversing it,
+      shuffling it — moves `PV1` by the same 1.1e-06 / 6.3e-06 / 4.1e-06 at 27 / 29 / 26
+      vertices. `fit_principal_curvature` accumulates `ata += wp.outer(r, r)` along the row in
+      `float64`; every other order-sensitive-looking step is order-free (`ring_radius` is a max,
+      `n_valid` a count, the frame a minimum). The affected vertices are exactly the ill
+      conditioned ones: `cond(AtA)` there is **4.7e9 to 1.2e12** against a **median of 9.76** over
+      the mesh, and their `|PV1|` sits in the **0th-6th percentile** of the field. That is the
+      regime `principal_curvature`'s own docstring already tells callers not to read as a
+      measurement.
+    - **So the fix was never to decline the builder — it was to make its rows canonical.** One
+      extra launch (`array.sort_segments`, a per-row shell sort) makes the output **exactly**
+      `edges_to_csr`'s buffer, at **2.6x** its cost on every mesh probed — which is *more* than
+      the unsorted form was worth end to end, since the sort is one launch against the radix sort
+      of `2 * m` triplets it replaces. Measured one arm per process against a detached baseline
+      worktree, min of 11 over 20 calls between two syncs, three process pairs, icospheres 3-6 and
+      `half_torus`: `geodesic_ball` **1.158-1.271x**, `principal_curvature` **1.111-1.214x**, with
+      `edges.edges_unique` carried through the same runs as an untouched control at **0.964-1.018x**.
+      Gate: **238/238 arrays byte-identical** across 7 meshes, 3 radii, 2 curvature radii and both
+      devices.
+    - **An in-process monkeypatch of the adjacency builder overstated all of it — 1.16-1.67x and
+      1.15-1.41x against the worktree's 1.16-1.27x and 1.11-1.21x.** Substituting a Python shim
+      object for the `BsrMatrix` in one arm only is §9's "a probe that instruments the thing it
+      measures" in its cheapest disguise: the shim is not what ships, and the arms were no longer
+      alike. It was the right tool for deciding *whether* to build this and the wrong one for
+      quoting a number. §15.6's detached worktree is the authority.
+    - **The general lesson: "it broke a bit-exactness test" and "it changed the answer" are
+      different findings, and only the second justifies a revert.** Measure the magnitude before
+      concluding, then look for a third option that keeps the gain — here, canonicalising the
+      thing that varied rather than abandoning it.
+- **The per-row sort is O(d^1.3) on one thread, so it is for a bounded-degree graph and the
+  crossover is measured.** Star graph, whole builder against `edges_to_csr`: **1.97x / 2.59x /
+  2.25x / 1.82x** at hub degree 6 / 32 / 128 / 256, then **0.78x at 512**, 0.34x at 1 024 and
+  **0.07x at 4 096** — byte-identical at every one. A shell sort rather than the insertion sort
+  `sort_rows_insertion` uses, because a segment's width is *data*, so there is no host-side branch
+  to escape to `segmented_sort_pairs` the way `array.sort_rows` does, and one high-degree row would
+  otherwise take the whole launch quadratic. It costs nothing at mesh valences (2.65x against
+  insertion's 2.48-2.60x, i.e. marginally *better*). Above a few hundred neighbours in one row the
+  answer is `edges_to_csr`.
 - **A tie that is exact in float32 is not a tie in the oracle's float64, and an exact set compare
   then pins the adjacency's column order rather than the answer.** On `half_torus` vertex 384,
   candidates 387 and 413 sit 2.2e-16 apart in float64 and are **bit-identical in float32**, both
   outside the radius, so exactly one is backfilled to `min_count` and no correct tie-break exists
-  at the precision the device works in. `test_geodesic_ball_neighborhoods` was passing on a
-  coincidence of sorted columns. It now splits the claim — the in-ball set exactly, the backfill up
-  to the multiset of float32 distances at `atol=0` — and two size-preserving mutations fail on the
-  *in-ball* assert, not merely on the size.
+  at the precision the device works in. `test_geodesic_ball_neighborhoods` compares per-row *sets*
+  against a host oracle whose `heapq` breaks that tie its own way, so it passes on the adjacency's
+  column order agreeing with the oracle's — which `sort_rows=True` now guarantees by construction
+  where it used to be a coincidence. A stricter form was written (in-ball set exactly, backfill up
+  to the multiset of float32 distances at `atol=0`) and reverted with the rest of that round; it is
+  the right shape if this ever needs tightening, but nothing currently depends on it.
 - **`k`, not `n`, is what's still slow in the k-NN path** — insertion cost is super-linear in k
   because the candidate row lives in global memory and both the shift-insert and the reset touch it
   in full on every deepening attempt. This is what `points.statistical_outlier_mask` and

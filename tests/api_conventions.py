@@ -409,6 +409,7 @@ _KERNEL_WRITE_CALLS = frozenset(
 _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # in-place
     ("array", "sort_rows_insertion"): frozenset({"data"}),
+    ("array", "sort_segments"): frozenset({"data"}),
     # ``neighbors`` is sorted in place: this kernel only orders the two slots each vertex already
     # holds, so it is both the input and the result and ``out_`` would read as write-only.
     ("boundary", "sort_boundary_neighbor_slots"): frozenset({"neighbors"}),

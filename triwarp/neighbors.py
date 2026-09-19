@@ -1491,10 +1491,11 @@ def geodesic_ball(
 
     The traversal runs entirely on device. Vertex adjacency is built as a CSR graph via
     [`edges_unique`][triwarp.edges.edges_unique] +
-    [`edges_to_csr`][triwarp.graph.edges_to_csr], then a single-pass BFS collects each ball into
-    its per-source queue row (the queue prefix *is* the result) and a scan + gather compacts the
-    rows into the CSR neighbor buffer. Each source uses fixed-capacity scratch of
-    ``_PER_SOURCE_MAX_NEIGHBORS`` neighbors (``triwarp.kernels.algorithms.bfs``, currently 512);
+    [`edges_to_neighbor_lists`][triwarp.graph.edges_to_neighbor_lists] with sorted rows, then a
+    single-pass BFS collects each ball into its per-source queue row (the queue prefix *is* the
+    result) and a scan + gather compacts the rows into the CSR neighbor buffer. Each source uses
+    fixed-capacity scratch of ``_PER_SOURCE_MAX_NEIGHBORS`` neighbors
+    (``triwarp.kernels.algorithms.bfs``, currently 512);
     if a vertex collects more than that the surplus is dropped and a warning is emitted.
 
     !!! note
@@ -1538,15 +1539,17 @@ def geodesic_ball(
             wp.empty(0, dtype=wp.int32, device=device),
         )
 
-    # ``edges_to_csr``, and **not** the cheaper ``graph.edges_to_neighbor_lists``, whose row order
-    # is not reproducible between runs. The ball is a geometric predicate and would be unaffected,
-    # but the traversal below emits its queue in visit order, so a permuted adjacency row permutes
-    # the output -- and ``curvature.principal_curvature``, which consumes this, amplifies that
-    # through an ill-conditioned quadric fit. Sorted columns are load-bearing here.
+    # ``sort_rows=True`` is load-bearing, not tidiness. The ball is a geometric predicate and is
+    # order-independent, but the traversal below emits its queue in *visit* order, so a permuted
+    # adjacency row permutes the returned row -- and ``curvature.principal_curvature``, which
+    # consumes this, accumulates its quadric's normal equations along that row, so a permutation
+    # moves its answer at the near-flat vertices where the fit is ill conditioned. Sorted rows make
+    # this builder's output identical to ``graph.edges_to_csr``'s, for a fraction of its cost; a
+    # mesh vertex's valence is far below the degree where the per-row sort stops paying.
     unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
-    adjacency = tw.graph.edges_to_csr(n, unique_edges)
-    adj_offsets = adjacency.offsets
-    adj_columns = adjacency.columns
+    adj_columns, adj_offsets = tw.graph.edges_to_neighbor_lists(
+        n, unique_edges, validate=False, sort_rows=True
+    )
 
     reference_neighbors = wp.empty(n, dtype=wp.int32, device=device)
     wp.launch(

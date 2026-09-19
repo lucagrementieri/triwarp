@@ -108,6 +108,71 @@ def test_edges_to_neighbor_lists_agrees_with_edges_to_csr(
         assert sorted(neighbors[lo:hi].tolist()) == sorted(columns[lo:hi].tolist())
 
 
+@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "hemisphere", "unit_box"])
+def test_edges_to_neighbor_lists_sorted_rows_are_edges_to_csr_exactly(
+    mesh_name: str, request: pytest.FixtureRequest
+) -> None:
+    """
+    Triwarp against triwarp: ``sort_rows=True`` is ``edges_to_csr``'s structure, bit for bit.
+
+    ``edges_to_csr`` carries the oracle (``igl.adjacency_list``, above). This is the stronger of
+    the two claims the sibling test makes about the cheap builder -- not "the same rows up to a
+    permutation" but *the same buffer* -- because that is what
+    [`neighbors.geodesic_ball`][triwarp.neighbors.geodesic_ball] relies on: it emits its BFS queue
+    in visit order, so a permuted adjacency row permutes its result, and
+    ``curvature.principal_curvature`` then moves at the near-flat vertices where its quadric fit is
+    ill conditioned.
+
+    The second half is the property the default ``sort_rows=False`` does **not** have: repeating
+    the call returns the identical buffer. Without it the atomic cursor hands the slots out in
+    thread-arrival order and every repeat differs.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_wp.points.shape[0])
+    faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
+    edges_wp, _ = tw.edges.edges_unique(faces_wp, n_vertices=n_vertices)
+
+    neighbors_wp, offsets_wp = tw.graph.edges_to_neighbor_lists(
+        n_vertices, edges_wp, sort_rows=True
+    )
+    adjacency = tw.graph.edges_to_csr(n_vertices, edges_wp)
+    neighbors = neighbors_wp.numpy()
+
+    # Not a regular fixture, and not an empty one: a constant degree hides a misplaced row.
+    degrees = np.diff(offsets_wp.numpy())
+    assert int(degrees.max()) > int(degrees.min()) > 0
+
+    assert np.array_equal(offsets_wp.numpy(), adjacency.offsets.numpy())
+    assert np.array_equal(neighbors, adjacency.columns.numpy())
+
+    for _ in range(4):
+        repeat_wp, _ = tw.graph.edges_to_neighbor_lists(n_vertices, edges_wp, sort_rows=True)
+        assert np.array_equal(repeat_wp.numpy(), neighbors)
+
+
+def test_edges_to_neighbor_lists_sorts_a_wide_row(device: str) -> None:
+    """
+    Triwarp against triwarp: the per-row sort is a shell sort, so its gap loop needs a wide row.
+
+    Every mesh fixture has a vertex valence of a handful, where the gap sequence collapses to one
+    pass and the kernel is a plain insertion sort -- so the fixtures above exercise none of the
+    gapped passes. A star graph puts one row of 1 000 neighbours through all of them.
+    """
+    degree = 1000
+    edges_np = np.stack(
+        [np.zeros(degree, dtype=np.int32), np.arange(1, degree + 1, dtype=np.int32)], axis=1
+    )
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+
+    neighbors_wp, offsets_wp = tw.graph.edges_to_neighbor_lists(
+        degree + 1, edges_wp, sort_rows=True
+    )
+    offsets = offsets_wp.numpy()
+    assert int(offsets[1]) == degree  # the hub row is the wide one
+    hub = neighbors_wp.numpy()[: int(offsets[1])]
+    assert np.array_equal(hub, np.arange(1, degree + 1, dtype=np.int32))
+
+
 def test_edges_to_neighbor_lists_rejects_an_out_of_range_endpoint(device: str) -> None:
     """The guard that keeps an unchecked index off a raw ``degree[a]`` write (section 12.1)."""
     edges_wp = wp.array(np.array([[0, 1], [1, 5]], dtype=np.int32), dtype=wp.int32, device=device)

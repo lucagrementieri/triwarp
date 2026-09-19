@@ -92,7 +92,7 @@ def edges_to_csr(
 
 
 def edges_to_neighbor_lists(
-    node_count: int, edges: twt.Array2dInt32, *, validate: bool = True
+    node_count: int, edges: twt.Array2dInt32, *, validate: bool = True, sort_rows: bool = False
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
     """
     Per-node neighbour lists of an undirected edge list, packed as ``(neighbors, offsets)``.
@@ -116,12 +116,20 @@ def edges_to_neighbor_lists(
         When ``False``, skip the range check on ``edges`` and its host readback. See the warning
         below. Follows the same convention as
         [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges].
+    sort_rows
+        When ``True``, sort each row ascending in one extra launch, which makes the result
+        **exactly** [`edges_to_csr`][triwarp.graph.edges_to_csr]'s structure and lifts the
+        reproducibility warning below. One thread sorts one row, so the launch waits for the
+        widest one and the cost grows faster than linearly in the largest degree: this is for a
+        bounded-degree graph such as a mesh vertex graph, and a row of a few hundred neighbours
+        already loses to [`edges_to_csr`][triwarp.graph.edges_to_csr] outright.
 
     Returns
     -------
     neighbors : wp.array[wp.int32]
-        Length ``2 * m`` node indices grouped by node. The order within a row is **not specified
-        and not reproducible** — see the warning below.
+        Length ``2 * m`` node indices grouped by node. Ascending within a row when ``sort_rows``
+        is ``True``; otherwise the order is **not specified and not reproducible** — see the
+        warning below.
     offsets : wp.array[wp.int32]
         Length ``node_count + 1`` row offsets on ``edges.device``.
 
@@ -148,24 +156,27 @@ def edges_to_neighbor_lists(
 
     Warning
     -------
-    !!! warning "Row order is not reproducible between runs"
+    !!! warning "At the default ``sort_rows=False`` the row order is not reproducible between runs"
         Each row's slots are handed out with ``wp.atomic_add``, so the order within a row is
         thread-arrival order: it is neither sorted nor stable, and two calls on the same input
         return different permutations. The row *contents* are exact and ``offsets`` is identical
         every time; only the order inside a row moves.
 
         A consumer is safe when it reduces over the whole row (a minimum, a sum, a relaxation) or
-        breaks its ties by node or edge index. It is **not** safe when it emits in traversal order,
-        or when it feeds an ill-conditioned fit that a permutation can perturb — use
-        [`edges_to_csr`][triwarp.graph.edges_to_csr], whose rows are sorted and stable, as
-        [`neighbors.geodesic_ball`][triwarp.neighbors.geodesic_ball] does.
+        breaks its ties by node or edge index. It is **not** safe when it emits in traversal
+        order, or when it feeds an ill-conditioned fit that a permutation can perturb. Both of
+        those want ``sort_rows=True``, which pins the order for one extra launch;
+        [`edges_to_csr`][triwarp.graph.edges_to_csr] is the answer instead when a row can hold
+        hundreds of neighbours, or when the caller wants weights or sparse linear algebra.
 
     Notes
     -----
-    **Rows are unsorted, and that is the whole reason this exists beside
-    [`edges_to_csr`][triwarp.graph.edges_to_csr].** Going through ``bsr_from_triplets`` radix-sorts
-    ``2 * m`` triplets and carries a ``float32`` value array a structure-only traversal never
-    reads; counting and filling does neither.
+    **The fill is a counting sort with no sort in it, and that is the whole reason this exists
+    beside [`edges_to_csr`][triwarp.graph.edges_to_csr].** Going through ``bsr_from_triplets``
+    radix-sorts ``2 * m`` triplets and carries a ``float32`` value array a structure-only traversal
+    never reads; counting and filling does neither, and even with ``sort_rows=True`` -- whose
+    per-row sort is over one node's neighbours rather than the whole edge list -- the result is the
+    same structure for a fraction of the work on a bounded-degree graph.
 
     See Also
     --------
@@ -202,6 +213,10 @@ def edges_to_neighbor_lists(
         inputs=[edges, offsets, degree, neighbors],
         device=device,
     )
+    if sort_rows:
+        wp.launch(
+            kernel_array.sort_segments, dim=node_count, inputs=[offsets, neighbors], device=device
+        )
     return neighbors, offsets
 
 
