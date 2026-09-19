@@ -41,14 +41,21 @@ LOOP_STATE_SIZE = 2
 LOOP_PROGRESS = wp.constant(wp.int32(2))
 LOOP_ADVANCE_STATE_SIZE = 3
 
-# The length-1 condition view ``wp.capture_while`` polls, as a **plain** slice, and it is a
-# measured cost rather than a tidiness: slicing a ``wp.array`` with the ``wp.int32`` constants
-# above (``state[LOOP_CONDITION : LOOP_CONDITION + 1]``) routes the bound arithmetic through Warp's
+# The length-1 slot views the wrappers take, as **plain** slices, and they are a measured cost
+# rather than a tidiness: slicing a ``wp.array`` with the ``wp.int32`` constants above
+# (``state[LOOP_CONDITION : LOOP_CONDITION + 1]``) routes the bound arithmetic through Warp's
 # Python-scope builtin dispatch, which runs ``inspect.signature().bind()`` per operand -- measured
 # **38.98 us against 3.22** for the identical view taken with plain ints (RTX 5090, Warp 1.17,
 # 20 000 slices between two syncs, min of 7). Every round loop in the package took one or two of
-# these per call. Derived from the constant rather than written out, so the two cannot drift.
+# these per call. Derived from the constants rather than written out, so the two cannot drift.
+#
+# A *partially* typed slice pays too, so both bounds have to be unwrapped: re-measured on the same
+# box, ``arr[K : K + 1]`` is 39.4 us, ``arr[K : 2]`` 27.3 and ``arr[0 : K]`` 15.7, against 3.16 for
+# plain ints. ``__getitem__`` itself forms ``stop - start`` and ``strides * start`` internally, so
+# one Warp-typed bound is three dispatches, not one. The general rule and the whole cost table are
+# in ``.claude/CLAUDE.md`` section 13.1.
 LOOP_CONDITION_VIEW = slice(int(LOOP_CONDITION), int(LOOP_CONDITION) + 1)
+LOOP_PROGRESS_VIEW = slice(int(LOOP_PROGRESS), int(LOOP_PROGRESS) + 1)
 
 
 @wp.kernel

@@ -1074,7 +1074,11 @@ def resample_uniform(
         return wp.clone(vertices), wp.clone(faces)
 
     lower, upper = tw.bounds.aabb(vertices)
-    diagonal = float(wp.length(upper - lower))
+    # ``math.dist`` rather than ``float(wp.length(upper - lower))``: a Warp operator and a
+    # Warp builtin at Python scope each route through builtin dispatch, measured 14.68 us
+    # against 3.02 (4.9x). It computes in float64 where ``wp.length`` is float32, i.e. ~2e-8
+    # relative and the correctly-rounded answer for float32 corners. Section 13.1.
+    diagonal = math.dist(lower, upper)
     if voxel_size is None:
         voxel_size = 0.01 * diagonal
     if voxel_size <= 0.0:

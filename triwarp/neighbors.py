@@ -245,7 +245,9 @@ def query_bvh_ball(
     )
 
     segment_bounds, total_hits = tw.array.counts_to_offsets(hit_counts, include_total=True)
-    offsets = segment_bounds if include_total else twt.as_dense(segment_bounds[:m])
+    # One view of the row-offset window, used both as the return value and as the launch argument.
+    row_offsets = twt.as_dense(segment_bounds[:m])
+    offsets = segment_bounds if include_total else row_offsets
     if total_hits == 0:
         return wp.empty(0, dtype=wp.int32, device=device), offsets
 
@@ -253,7 +255,7 @@ def query_bvh_ball(
     wp.launch(
         kernel_neighbors.query_bvh_ball_neighbors,
         dim=m,
-        inputs=[queries, bvh.id, wp.float32(radius), segment_bounds[:m], candidate_indices_flat],
+        inputs=[queries, bvh.id, wp.float32(radius), row_offsets, candidate_indices_flat],
         device=device,
     )
 
@@ -348,7 +350,9 @@ def query_bvh_box(
     )
 
     segment_bounds, total_hits = tw.array.counts_to_offsets(hit_counts, include_total=True)
-    offsets = segment_bounds if include_total else twt.as_dense(segment_bounds[:m])
+    # One view of the row-offset window, used both as the return value and as the launch argument.
+    row_offsets = twt.as_dense(segment_bounds[:m])
+    offsets = segment_bounds if include_total else row_offsets
     if total_hits == 0:
         return wp.empty(0, dtype=wp.int32, device=device), offsets
 
@@ -356,7 +360,7 @@ def query_bvh_box(
     wp.launch(
         kernel_neighbors.query_bvh_box_neighbors,
         dim=m,
-        inputs=[query_lower, query_upper, bvh.id, segment_bounds[:m], candidate_indices_flat],
+        inputs=[query_lower, query_upper, bvh.id, row_offsets, candidate_indices_flat],
         device=device,
     )
 

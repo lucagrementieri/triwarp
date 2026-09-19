@@ -64,6 +64,7 @@ See Also
 
 from __future__ import annotations
 
+import math
 from typing import Literal, TypeVar, cast
 
 import numpy as np
@@ -687,7 +688,11 @@ def resolve_voxel_grid(
             diagonal = 1.0
         else:
             lower, upper = tw.bounds.aabb(points)
-            diagonal = float(wp.length(upper - lower))
+            # ``math.dist`` rather than ``float(wp.length(upper - lower))``: a Warp operator and a
+            # Warp builtin at Python scope each route through builtin dispatch, measured 14.68 us
+            # against 3.02 (4.9x). It computes in float64 where ``wp.length`` is float32, i.e. ~2e-8
+            # relative and the correctly-rounded answer for float32 corners. Section 13.1.
+            diagonal = math.dist(lower, upper)
             # A single point -- or any cloud whose points are all coincident -- has a zero-extent
             # box and so carries no scale to derive a cell width from. Take the same unit diagonal
             # the empty cloud takes: one point belongs in one cell whatever the width, so there is

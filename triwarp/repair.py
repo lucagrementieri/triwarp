@@ -1160,7 +1160,11 @@ def straighten_boundary(
         return (faces, 0) if return_count else faces
 
     added = 0
+    # One emit cursor for the whole loop, zeroed per pass rather than reallocated: a four-byte
+    # buffer per iteration is an allocation where a memset does.
+    cursor = wp.zeros(1, dtype=wp.int32, device=device)
     for _ in range(iterations):
+        cursor.zero_()
         n_faces = int(faces.shape[0]) // 3
         n_halfedges = 3 * n_faces
         twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
@@ -1190,7 +1194,6 @@ def straighten_boundary(
             ],
             device=device,
         )
-        cursor = wp.zeros(1, dtype=wp.int32, device=device)
         # One notch per boundary halfedge at most, and a pinched rim can carry more of those than
         # the mesh has vertices, so the bound is the halfedge count. Trimmed to the real count
         # below, so the slack never leaves this loop.

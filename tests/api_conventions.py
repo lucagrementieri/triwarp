@@ -2152,3 +2152,145 @@ def admonition_placement_problems() -> list[str]:
                         "admonition never renders. Move it to Notes or to the description"
                     )
     return problems
+
+
+# --- check 26 -----------------------------------------------------------------------------------
+
+# Warp's scalar, vector and matrix constructors. A value built by one of these is a
+# ``warp._src.types`` instance, *not* a Python number, and its operators route through Warp's
+# Python-scope builtin dispatch. ``wp.constant`` is deliberately absent: on Warp 1.17 it is
+# ``return x`` after a validity check, so ``wp.constant(7)`` is a plain ``int`` and only
+# ``wp.constant(wp.int32(7))`` is Warp-typed -- the check unwraps it and looks at what is inside.
+_WARP_TYPED_CONSTRUCTORS: frozenset[str] = frozenset(
+    {f"{kind}{bits}" for kind in ("int", "uint", "float") for bits in (8, 16, 32, 64)}
+    | {f"vec{n}{suffix}" for n in (2, 3, 4) for suffix in ("", "b", "h", "i", "l", "f", "d")}
+    | {f"mat{n}{n}{suffix}" for n in (2, 3, 4) for suffix in ("", "f", "d")}
+    | {"quat", "quatf", "quatd", "transform", "transformf", "transformd", "spatial_vector"}
+)
+
+# Nothing legitimate does host arithmetic on a Warp-typed constant, so this ships empty. Before
+# adding an entry, check the two spellings that are *not* defects and need no exemption: passing
+# the constant straight into ``wp.launch(inputs=[...])`` / ``wp.map(...)`` / ``fill_(...)`` as a
+# kernel scalar, and ``int(CONST)`` / ``float(CONST)``, which unwraps it for ~0.08 us.
+_WARP_HOST_ARITHMETIC_ALLOWLIST: dict[tuple[str, str], str] = {}
+
+
+def _warp_typed_constant_names(tree: ast.Module) -> set[str]:
+    """Module-level names bound to a Warp *typed* constructor, unwrapping ``wp.constant``."""
+    names: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        value = node.value
+        # ``wp.constant(wp.int32(0))`` -- look through the wrapper at its payload.
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "constant"
+            and value.args
+        ):
+            value = value.args[0]
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr in _WARP_TYPED_CONSTRUCTORS
+        ):
+            names.add(target.id)
+    return names
+
+
+def _warp_typed_use(
+    node: ast.expr, local: set[str], aliases: dict[str, str], constants: dict[str, set[str]]
+) -> str | None:
+    """Name the Warp-typed constant ``node`` refers to, bare or through a module alias."""
+    if isinstance(node, ast.Name) and node.id in local:
+        return node.id
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        origin = aliases.get(node.value.id)
+        if origin and node.attr in constants.get(origin, set()):
+            return f"{node.value.id}.{node.attr}"
+    return None
+
+
+def warp_host_arithmetic_problems() -> list[str]:
+    """
+    Check 26: a Warp-typed constant used in Python-scope arithmetic or as a slice bound.
+
+    A ``wp.int32`` / ``wp.float32`` / ``wp.vec3`` instance is not a Python number. Its ``__add__``
+    and friends are ``warp._src.types.scalar_base``'s, which call ``warp.add(self, y)`` -- Warp's
+    Python-scope builtin dispatch, an ``inspect.signature().bind()`` per operand. Measured on an
+    RTX 5090 with Warp 1.17: **~10 us per binary op against 0.027 for a Python float**, and a
+    ``wp.array`` slice taken with such bounds is **39.4 us against 3.16**, because
+    ``wp.array.__getitem__`` forms ``stop - start`` and ``strides * start`` internally, so one
+    Warp-typed bound is three dispatches rather than one.
+
+    The defect is silent, which is why it needs a scan: the answer is correct, the compiler sees
+    nothing, and the suite sees nothing. Its siblings are not -- ``//`` and ``%`` on a Warp scalar
+    raise ``TypeError``, and ``wp.zeros(wp.int32(n))`` raises too -- so arithmetic and slicing are
+    the whole of the hazard.
+
+    **Scope is deliberately narrow.** Uses are read in the wrapper layer (``triwarp/*.py``, which
+    holds no kernel bodies at all) and at *module scope* in ``kernels/``; a kernel or ``@wp.func``
+    body is where these constants are supposed to be used and is never read. The check also stops
+    at constants: extending it to ``wp.length`` / ``wp.cross`` calls would flag mostly legitimate
+    sites, which is how a check gets switched off.
+    """
+    problems: list[str] = []
+    constants: dict[str, set[str]] = {}
+    trees: dict[str, tuple[Path, ast.Module]] = {}
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # check 12 and the suite itself report an unparseable module
+        module = path.stem
+        constants[module] = _warp_typed_constant_names(tree)
+        trees[str(path)] = (path, tree)
+
+    for key, (path, tree) in trees.items():
+        del key
+        in_kernels = path.parent != _PACKAGE_DIR and "kernels" in path.parts
+        local = set(constants.get(path.stem, set()))
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                origin = node.module.rsplit(".", 1)[-1]
+                for alias in node.names:
+                    if alias.name in constants.get(origin, set()):
+                        local.add(alias.asname or alias.name)
+                    elif alias.name in constants:
+                        aliases[alias.asname or alias.name] = alias.name
+
+        # In ``kernels/`` only module-scope statements are host code; everything inside a function
+        # there is a kernel body, a ``@wp.func``, or a factory that builds one.
+        roots: list[ast.AST] = list(tree.body) if in_kernels else [tree]
+        for root in roots:
+            if in_kernels and isinstance(root, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for node in ast.walk(root):
+                operands: list[ast.expr] = []
+                if isinstance(node, ast.BinOp):
+                    operands = [node.left, node.right]
+                elif isinstance(node, ast.Slice):
+                    operands = [b for b in (node.lower, node.upper, node.step) if b is not None]
+                else:
+                    continue
+                for operand in operands:
+                    name = _warp_typed_use(operand, local, aliases, constants)
+                    if name is None:
+                        continue
+                    site = path.relative_to(_REPO_ROOT)
+                    if (str(site), name) in _WARP_HOST_ARITHMETIC_ALLOWLIST:
+                        continue
+                    kind = "slice bound" if isinstance(node, ast.Slice) else "arithmetic operand"
+                    problems.append(
+                        f"{site}:{node.lineno}: {name} is a Warp-typed constant used as a "
+                        f"Python-scope {kind} -- that routes through Warp's builtin dispatch "
+                        f"(~10 us per op, 39.4 us for a slice against 3.16). Unwrap it with "
+                        f"int(...), or derive a plain module-level value the way "
+                        f"kernels/array.py's LOOP_CONDITION_VIEW does"
+                    )
+    return problems

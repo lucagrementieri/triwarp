@@ -101,7 +101,14 @@ def aabb_union(
     [`aabb`][triwarp.bounds.aabb]
     [`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal]
     """
-    return wp.min(a_min, b_min), wp.max(a_max, b_max)
+    # Componentwise ``min`` / ``max`` in plain Python rather than ``wp.min`` / ``wp.max``: this
+    # function does no device work at all, so Warp's Python-scope builtin dispatch was its entire
+    # cost -- measured 21.38 us against 2.75 for this spelling (7.6x), byte-identical. A ``wp.vec3``
+    # indexes to a native ``float``, which is what makes the plain builtins applicable.
+    return (
+        wp.vec3(min(a_min[0], b_min[0]), min(a_min[1], b_min[1]), min(a_min[2], b_min[2])),
+        wp.vec3(max(a_max[0], b_max[0]), max(a_max[1], b_max[1]), max(a_max[2], b_max[2])),
+    )
 
 
 def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | None = None) -> float:
@@ -160,10 +167,13 @@ def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | Non
     # Slots 3..5 hold the *negated* upper corner; see the kernel. An all-empty input leaves the
     # seeded ``inf`` in place, so ``upper - lower`` is ``-inf`` componentwise and the length is
     # ``inf`` -- the documented empty-input answer, reached without a branch.
+    #
+    # Taken in NumPy, on the buffer the readback already produced, rather than through two
+    # ``wp.vec3`` constructions and ``wp.length``: every Warp operator and builtin at *Python*
+    # scope routes through Warp's builtin dispatch (``inspect.signature().bind()`` per operand),
+    # measured 19.07 us for the Warp spelling against 1.42 here. Section 13.1 has the table.
     corners_np = corners.numpy()
-    lower = wp.vec3(*corners_np[:3])
-    upper = wp.vec3(*(-corners_np[3:]))
-    return float(wp.length(upper - lower))
+    return float(np.linalg.norm(-corners_np[3:] - corners_np[:3]))
 
 
 def points_in_aabb(

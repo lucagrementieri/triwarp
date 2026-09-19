@@ -349,12 +349,18 @@ def sample_surface_poisson_disk(
     surface_area = float(wp.utils.array_sum(areas))
 
     # 3. Poisson disk radii (Öztireli & Gross 2012 constants)
-    alpha = wp.float32(8.0)
-    beta = wp.float32(0.65)
-    gamma = wp.float32(1.5)
+    #
+    # Plain Python floats, not ``wp.float32``: these are *host* arithmetic, and a Warp scalar's
+    # operators route through Warp's Python-scope builtin dispatch (~10 us per binary op, against
+    # 0.03 for a float -- see ``kernels/array.py``'s slot views and section 13.1). The wrapping
+    # bought nothing even numerically, since ``wp.float32(x)`` only stores ``x`` and rounds when it
+    # is marshalled into a launch, which ``wp.launch`` does for a plain float anyway.
+    alpha = 8.0
+    beta = 0.65
+    gamma = 1.5
     ratio = float(count) / float(init_count)
-    r_max = wp.float32(2.0 * math.sqrt((surface_area / count) / (2.0 * math.sqrt(3.0))))
-    r_min = wp.float32(r_max * beta * (1.0 - ratio**gamma))
+    r_max = 2.0 * math.sqrt((surface_area / count) / (2.0 * math.sqrt(3.0)))
+    r_min = r_max * beta * (1.0 - ratio**gamma)
 
     # 4. Neighbor lists (GPU, computed once for the full initial pool)
     nbr_idx, nbr_dists, offsets = query_ball_with_offsets(
@@ -704,21 +710,26 @@ def _dart_throw_blue_noise(
         # readback is the most expensive thing in a round -- measured two of them at roughly a
         # quarter of the whole call at the small end, where the rounds are cheapest and most
         # numerous relative to the work. This is the shape ``array.flatnonzero`` already uses.
+        #
+        # The two windows are viewed once per round. ``alive_count`` shrinks every round so they
+        # are not loop-invariant, but taking each twice and three times inside one round was five
+        # ``wp.array.__getitem__`` calls where two do; and ``read_scalar`` takes its own one-element
+        # slice internally, so handing it the index rather than a pre-sliced view drops a sixth.
+        alive_flags = survivor_flag[:alive_count]
+        alive_positions = positions[:alive_count]
         wp.launch(
             kernel_blue_noise.dart_alive_flags,
             dim=alive_count,
-            inputs=[view, state, survivor_flag[:alive_count]],
+            inputs=[view, state, alive_flags],
             device=device,
         )
-        wp.utils.array_scan(
-            survivor_flag[:alive_count], out_array=positions[:alive_count], inclusive=True
-        )
-        total = int(read_scalar(positions[:alive_count]))
+        wp.utils.array_scan(alive_flags, out_array=alive_positions, inclusive=True)
+        total = int(read_scalar(positions, alive_count - 1))
         if total > 0:
             wp.launch(
                 kernel_blue_noise.dart_compact_alive,
                 dim=alive_count,
-                inputs=[view, state, positions[:alive_count], next_alive[:total]],
+                inputs=[view, state, alive_positions, next_alive[:total]],
                 device=device,
             )
             alive, next_alive = next_alive, alive

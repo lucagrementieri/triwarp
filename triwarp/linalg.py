@@ -1110,6 +1110,13 @@ class _BatchedCg:
             (2, self._n_columns, partial_pitch), dtype=wp.float64, device=device
         )
         self._dots = wp.zeros((2, self._n_columns), dtype=wp.float64, device=device)
+        # The two rows of ``_dots``, viewed once. ``_dots`` is allocated here and never rebound, so
+        # both views are valid for the solver's whole life -- and re-taking one costs ~3 us of
+        # ``wp.array.__getitem__`` every time. ``_dot_finalize`` runs once per CG iteration on the
+        # host-check path, where that measured **2.00 slices per iteration**; on the CUDA capture
+        # path the body is recorded once and replayed, so there it is per *solve* instead.
+        self._dots_rz = twt.as_dense(self._dots[0])
+        self._dots_carry = twt.as_dense(self._dots[1])
         self._p_dot_ap = wp.zeros((2, self._n_columns), dtype=wp.float64, device=device)
         self._rz_old = wp.zeros(self._n_columns, dtype=wp.float64, device=device)
         self._atol_sq = wp.zeros(self._n_columns, dtype=wp.float64, device=device)
@@ -1182,7 +1189,7 @@ class _BatchedCg:
                 wp.int32(self._blocks),
                 wp.int32(pairs),
                 wp.int32(1 if carry else 0),
-                self._dots[1],
+                self._dots_carry,
             ],
             outputs=[out_dots, self._rz_old],
             block_dim=int(kernel_cg.CG_TILE),
@@ -1328,7 +1335,7 @@ class _BatchedCg:
             self._cycle.apply(self._r, self._z)
         self._dot(self._r, self._r, self._z, 2, self._dots)
         wp.copy(self._p, self._z)
-        wp.copy(self._rz_old, self._dots[1])
+        wp.copy(self._rz_old, self._dots_carry)
         self._state.assign([0, 1])
 
     def __call__(self):
@@ -1349,7 +1356,7 @@ class _BatchedCg:
             self._run_with_host_checks(check_every)
             return (
                 int(read_scalar(self._state, 0)),
-                math.sqrt(float(self._dots.numpy()[0].max())),
+                math.sqrt(float(self._dots_rz.numpy().max())),
                 math.sqrt(float(self._atol_sq.numpy().max())),
             )
         condition = self._state[kernel_array.LOOP_CONDITION_VIEW]
@@ -1358,7 +1365,7 @@ class _BatchedCg:
         with wp.ScopedCapture(self._device) as capture:
             wp.capture_while(condition, self._iteration)
         wp.capture_launch(capture.graph)
-        return self._state[0:1], self._dots[0], self._atol_sq
+        return self._state[0:1], self._dots_rz, self._atol_sq
 
     def _run_with_host_checks(self, check_every: int) -> None:
         """
@@ -1368,13 +1375,23 @@ class _BatchedCg:
         next multiple of the cadence -- a caller that reads the returned iteration count against
         the cap it passed is how a non-convergence warning gets raised.
         """
+        # ``_atol_sq`` is written once by ``_initialize`` and never touched again, so it is read
+        # back on the first check only: the test was taking *two* readbacks per block where one is
+        # a loop constant. It is read **after** ``_dots_rz`` rather than before the loop, and the
+        # order is the whole point -- the first read of a block drains the queue that block's
+        # launches just filled (~0.1 ms) and a second one straight after it is ~0.02 ms, so
+        # hoisting it above the loop would buy its own drain and lose on a single-block solve.
         done = 0
+        atol_sq_np = None
         while done < self._maxiter:
             block = min(check_every, self._maxiter - done)
             for _ in range(block):
                 self._iteration()
             done += block
-            if bool((self._dots.numpy()[0] <= self._atol_sq.numpy()).all()):
+            residual_np = self._dots_rz.numpy()
+            if atol_sq_np is None:
+                atol_sq_np = self._atol_sq.numpy()
+            if bool((residual_np <= atol_sq_np).all()):
                 return
 
 

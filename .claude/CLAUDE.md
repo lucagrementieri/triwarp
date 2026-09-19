@@ -40,7 +40,7 @@ Two conventions that hold throughout:
 3. [Python-scope wrappers](#3-python-scope-wrappers) — layout, `triwarp.typing`, allocation, gather,
    `wp.map`, dtype conversion, `BsrMatrix`, the NumPy policy, device rules, readbacks
 4. [Evolving the public API](#4-evolving-the-public-api) — naming, signatures, docstring agreement,
-   moving/renaming, the 25 mechanical checks
+   moving/renaming, the 26 mechanical checks
 5. [Function ordering within a module](#5-function-ordering-within-a-module)
 6. [Documentation](#6-documentation-zensical--mkdocstrings)
 7. [Testing](#7-testing) — conventions, devices, fixtures, the parity gate, shared helpers, the nine
@@ -982,7 +982,13 @@ Three things are still defects:
   inputs `Sequence[Sequence[float]]` when the body is a duck-typed `np.asanyarray`, which is
   *widening*. The one sanctioned exception is `triwarp/io.py`, where meshio hands back `np.ndarray`
   unconditionally and NumPy-in is `mesh_from_numpy`'s entire purpose.
-- **NumPy standing in for a Warp Python-scope equivalent that exists.** `wp.full`, `arr[k:].fill_()`,
+- **NumPy standing in for a Warp Python-scope equivalent that exists** — *but price the operation
+  first, because §13.1 measured this rule running the other way for several of them.* A Warp builtin
+  called at Python scope is a builtin *dispatch*, so `wp.length` is 13-14x `np.linalg.norm`,
+  `wp.min`/`wp.max` on a `vec3` 37x `np.minimum`, `wp.inverse` 3.2x `np.linalg.inv` and `vec3 - vec3`
+  17x, while `wp.cross` genuinely beats `np.cross` by 1.3x. What this bullet is really about — not
+  forcing a host round trip, and not naming `np.ndarray` in a public signature — is unaffected.
+  `wp.full`, `arr[k:].fill_()`,
   `wp.array([wp.mat44(...)])`, `wp.determinant`, `wp.inverse`, `wp.transpose` and `wp.svd3` all work
   at Python scope (verified on 1.16) and need no host buffer; `arr.list()[0]` gives a row-indexable
   `wp.mat44` from a `wp.array[wp.mat44]`. `math.pi` / `float("nan")` / `float("inf")` beat `np.pi` /
@@ -1369,7 +1375,7 @@ a targeted per-file run does not — a rename is not done until the whole suite 
 
 ### 4.5 The mechanical gate: `tests/api_conventions.py`
 
-**Twenty-five checks**, and they fail the default `pytest` run.
+**Twenty-six checks**, and they fail the default `pytest` run.
 
 - **Eight scan the public surface of `triwarp/` (excluding `kernels/`)**: a summary line naming a
   reference library (1); a `*_mask` producer that does not return `wp.array[wp.bool]` (2); a module
@@ -1463,6 +1469,23 @@ a targeted per-file run does not — a rename is not done until the whole suite 
   allowlist machinery**, because unlike check 24 there is no legitimate instance — every admonition
   has a correct home in `Notes` or in the leading description, with no loss of meaning and no
   reordering of anything a caller reads first.
+
+- **Check 26**: a Warp-typed module constant used at Python scope as an **arithmetic operand or a
+  slice bound**. `wp.int32(0)` is a `warp._src.types.int32`, not a Python `int`, and its `+ - *`
+  route through Warp's builtin dispatch — ~10 µs an operation, and **39.4 µs against 3.16** for a
+  `wp.array` slice taken with such bounds, since `__getitem__` forms `stop - start` and
+  `strides * start` itself (§13.1). It is the sixth member of the checks 16/17/18/20/22 family: the
+  spelling is legal, the answer is right, and nothing but a scan sees it. **Scope is deliberately
+  narrow on three axes**, each of which keeps it from becoming an allowlist. It reads uses only in
+  the wrapper layer (`triwarp/*.py`, which holds no kernel bodies) and at *module scope* in
+  `kernels/`, never a kernel or `@wp.func` body, which is where these constants belong. It keys on
+  *constants*, not on `wp.length` / `wp.cross` calls, where §13.1 shows most hits would be
+  legitimate — `wp.cross` beats `np.cross`. And it looks *through* `wp.constant`, because
+  `wp.constant(7)` is a plain `int` (§12.6) and only `wp.constant(wp.int32(7))` is Warp-typed. It
+  ships with an **empty** allowlist; the two correct spellings need no exemption, since a constant
+  forwarded to `wp.launch(inputs=[...])` is neither a `BinOp` nor a `Slice`, and `int(CONST)` is an
+  `ast.Call` operand. The wider class — vector arithmetic, and explicit Python-scope builtins — is
+  not statically decidable and is covered by the runtime census in §15.11 instead.
 
 Each check carries a written allowlist — read the reason before adding an entry, and prefer fixing
 the code. **The gate does not replace review**: it cannot tell whether a *new* name is a good one,
@@ -3498,6 +3521,13 @@ All measured on Warp 1.16 (probe scripts written to a file — Warp refuses `exe
   `@wp.func` parameter, to a `wp.Scalar`-generic parameter, and into a kernel-scope slice; all
   spellings compile and agree.
 - **`//` is not CPython's `//`** — §1.5 has the table.
+- **None of this describes *Python* scope, where the same spellings behave oppositely.** In a kernel
+  `wp.int32(x)` is a cast that costs nothing; at Python scope it is a *constructor* for a
+  `warp._src.types.int32`, whose arithmetic then routes through Warp's builtin dispatch at ~10 µs an
+  operation (§13.1). Three consequences worth carrying across the boundary: `//` and `%` on such a
+  value **raise `TypeError`** rather than truncating; `wp.float32(x)` does **not** round, since
+  `scalar_base.__init__` is `self.value = x`; and `int(x)` / `float(x)` are the *unwrap*, costing
+  ~0.08 µs, which is the fix rather than the defect. Check 26 (§4.5) scans for it.
 
 Rules: §1.3, §1.5, §1.6.
 
@@ -3791,6 +3821,69 @@ on real wrappers, is only worth 1.00-1.02x — not a lever.)*
 | a host readback | ~0.1 ms *queued*, **14.3 µs isolated** — the 0.1 ms is the pipeline drain in front of it, not its own cost (§16.7), so price it by what is queued |
 | `wp.synchronize_device` | 1.1 µs |
 | a **replayed** kernel in a captured chain | **1.17 µs** at n=17 689, 1.57 µs at n=163 842, exactly linear from 1 to 12 kernels |
+
+**A Warp-typed value is not a Python number, and its operators are ~370x a Python float's.** This
+is a *second* per-call cost model, orthogonal to the table above, and it is the one nothing in this
+package had priced. `warp._src.types.scalar_base.__add__` is `return warp.add(self, y)` — Warp's
+Python-scope **builtin dispatch**, `Function.__call__` -> `call_builtin` -> `call_builtin_from_desc`
+-> `inspect.signature().bind()`. Measured on an RTX 5090, Warp 1.17, 20 000 reps, min of 7:
+
+| operation at Python scope | Warp | plain / NumPy | ratio |
+|---|---|---|---|
+| `wp.int32` / `wp.float32` `+` `-` `*` | **9.9-10.1 µs** | 0.027 µs | ~370x |
+| `wp.int32` `<` `==` | 0.11-0.17 µs | 0.028 µs | 6x — immaterial |
+| `wp.int32(x)` construct, `int(x)` unwrap | 0.08-0.10 µs | — | free |
+| `wp.int32 // %`, `wp.zeros(wp.int32(n))` | **`TypeError`** | — | fails loudly |
+| `arr[K : K + 1]`, both bounds Warp-typed | **39.4 µs** | 3.16 µs | **12.4x** |
+| `arr[K : 2]` / `arr[0 : K]`, one bound | 27.3 / 15.7 µs | | 8.6x / 5.0x |
+| `wp.length(v)` | 9.05 µs | 0.63-0.71 µs | 13-14x |
+| `wp.min` / `wp.max` on `vec3` | 10.73 µs | 0.29 µs | 37x |
+| `wp.inverse(mat44)` | 9.01 µs | 2.85 µs | 3.2x |
+| `wp.normalize(v)` | 8.41 µs | — | |
+| **`wp.cross(a, b)`** | 9.31 µs | **12.37 µs** | **0.75x — Warp wins** |
+| `vec3 - vec3` | 4.07 µs | 0.24 µs | 17x |
+
+Four things this settles, and the first is why the hazard is narrower than it looks:
+
+- **Only `+ - *` and the explicit builtins are silent.** `//` and `%` on a Warp scalar raise, and
+  `wp.zeros(wp.int32(n))` raises `'int32' object is not iterable`, so those cannot hide. Comparison
+  and construction are effectively free. **Arithmetic and array slicing are the whole of it**, which
+  is what makes **check 26** (§4.5) a clean scan with no legitimate instance.
+- **A slice is three dispatches, not one**, because `wp.array.__getitem__` forms `stop - start` and
+  `int(strides) * start` internally — so a *partially* typed slice still costs 5-8x, and a scan has
+  to read `arr[K:]` and `arr[:K]` as well as the symmetric form.
+- **`wp.constant(x)` does not make a value Warp-typed and `wp.float32(x)` does not round it.**
+  `wp.constant(7)` is a plain `int` (§12.6) and `scalar_base.__init__` is `self.value = x`, so
+  `wp.float32(2.0 * math.sqrt(...))` keeps every float64 digit and only rounds when it is marshalled
+  into a launch — which `wp.launch` does for a plain float anyway. Wrapping a host intermediate buys
+  nothing and costs ~10 µs per subsequent operation.
+- **Vector arithmetic takes a different path and is a smaller, separate hazard.** `vec_t.__sub__` is
+  `_binary_op(self, warp.sub, y, vec_t)`, which for two same-typed vectors runs a Python component
+  loop rather than dispatching — 4 µs, and **invisible to the `Function.__call__` census** in
+  §15.11.
+
+**The cheap replacements, measured.** `float(wp.length(upper - lower))` -> `math.dist(lower, upper)`
+is **14.68 -> 3.02 µs (4.9x)**, and a `wp.vec3` indexes to a native Python `float`, which is what
+makes `math.dist` and the plain `min` / `max` builtins applicable to one at all. `wp.min(a, b),
+wp.max(c, d)` -> componentwise `wp.vec3(min(...), ...)` is **21.38 -> 2.75 µs (7.6x)** and
+byte-identical. **Quote the end-to-end number beside the expression's**, because a public wrapper
+adds its own floor: interleaved against a detached baseline worktree, three process pairs,
+`bounds.aabb_union` measures **19.9-20.6 -> 5.6-5.7 µs (3.55x)** rather than 7.6x, the difference
+being `require_same_device` and the Python call itself, and `bounds.enclosing_diagonal` at 200 000
+points measures **99.2-100.1 -> 76.8-77.7 µs (1.29x)**. `points.plane_basis`, untouched, was
+carried through the same runs as a control and stayed flat at 1.00x. Where the NumPy buffer is already in hand the win is larger — `bounds.aabb`'s
+corners are a readback, so `enclosing_diagonal`'s two `wp.vec3` constructions plus subtraction plus
+`wp.length` (19.07 µs) become one `np.linalg.norm` (1.42 µs, **13.4x**). **`math.dist` computes in
+float64 where `wp.length` is float32**, a ~2.2e-08 relative shift and the correctly-rounded answer
+for float32 corners; that is inside every tolerance in the suite but it is not byte-identical, so
+gate such a change by running both devices rather than by byte-comparison.
+
+**And this partly contradicts §3.8.** That section lists "NumPy standing in for a Warp Python-scope
+equivalent that exists" as a defect. For `length`, `min` / `max`, `inverse` and vector arithmetic the
+measurement runs the other way by 3-37x, because those are *host* operations either way and Warp's
+route to them is a builtin dispatch. §3.8's rule stands for what it was written about — not forcing
+a NumPy round trip or naming `np.ndarray` in a public signature — and `wp.cross` remains the genuine
+case where Warp wins. **Decide per operation, from the table, not from the rule's direction.**
 
 The launch and allocation rows were re-measured on Warp 1.17 (400 calls between two syncs, min of 9)
 and each is 20-25 % above what this table carried from an earlier version; the cost model below is
@@ -4967,6 +5060,48 @@ trust the sweep**: it cannot be fooled by where the kernels were issued from.
 a `.numpy()` readback's wall time is the queue depth in front of it (§14.6), not its own cost; and
 once enough launches are pending, the driver's launch queue fills and `wp.launch` itself blocks —
 a device-bound signature that can look like marshalling cost if read naively.
+
+### 15.11 Census the host calls by monkeypatching Warp, not by grepping
+
+A whole class of per-call cost is invisible to a static scan, because it depends on *runtime types*
+(is this value a `wp.int32` or an `int`?) and on *how often a line runs* (once per call, or once per
+iteration?). Two monkeypatch censuses answer both, and they are the tool §13.1's dispatch table and
+§16's per-call attributions were derived with. Neither needs a benchmark.
+
+**Census 1 — Python-scope builtin dispatch.** Patch `warp._src.context.Function.__call__`, walk out
+of `/warp/_src/` frames to the first triwarp frame, and count by `file:line`. Record the operator
+dunder on the way out (the first `/warp/_src/types.py` frame's `co_name`): `via=__mul__` is
+*arithmetic on a Warp-typed value* and a defect, `via=None` is an explicit `wp.length(...)` /
+`wp.cross(...)` call and a judgement call. Run it under `pytest tests -q`.
+
+**Census 2 — host-call counts by call site.** Patch `wp.array.__getitem__`, `wp.array.numpy`,
+`wp.zeros`, `wp.empty`, `warp._src.utils.map` and attribute the same way. Suite-wide over
+`tests/` on CUDA this measured **216 911 `wp.empty`, 52 816 slices, 44 755 readbacks, 34 433
+`wp.zeros` and 6 566 `wp.map`** — about 2.4 s of a 68 s run at §13.1's prices.
+
+**Read the *slope*, not the count.** A suite-wide total cannot tell a line that runs once per call
+from one that runs once per iteration. Run the same function at two iteration counts and difference
+the per-site counts: that isolates the loop-invariant repeats, and it is what found
+`linalg._dot_finalize`'s `self._dots[1]` at **2.00 slices per CG iteration** and
+`smoothing.filter_implicit_fairing`'s column views at 6 per pass. It is also what **refuted** several
+statically-derived claims in the same round — `filter_taubin`, `filter_humphrey` and the blue-noise
+rounds showed *no* per-iteration growth, having been fused already by §14.10.
+
+**Four caveats, every one of which produced a wrong reading before it was understood:**
+
+- **A census only sees what runs, so it is a two-device job** (§7.2). The CUDA pass reported 27
+  sites and could not see `graph.shortest_path_envelope`'s slice at all, because it sits inside
+  `if not device.is_cuda:`; the CPU pass found it immediately.
+- **It can misattribute a *Warp-internal* call to the triwarp caller.** The frame walk stops at the
+  first non-Warp frame, so a builtin that Warp itself calls inside `wp.MarchingCubes.extract_*`
+  is charged to the `triwarp/levelset.py` line that called it. **Read the source line before
+  believing a hit** — that one is not a triwarp defect.
+- **Vector arithmetic is invisible to census 1** (§13.1): `vec_t.__sub__` goes through `_binary_op`,
+  not `Function.__call__`. A clean census does not mean no Warp-typed arithmetic.
+- **A capture hides a loop from census 2 the way it hides kernels from `wp.timing_begin`**
+  (§15.10). With `check_every == 0` on CUDA, `_BatchedCg._iteration` runs *once*, at graph-record
+  time, so its per-site counts are per *solve*; the same code on the host-check path runs per
+  iteration. Take the slope on the path you mean to price.
 
 ---
 

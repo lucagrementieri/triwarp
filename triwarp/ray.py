@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import warp as wp
 
 import triwarp as tw
@@ -360,7 +362,11 @@ def contains_points(
     # corners, and the parity kernel needs both them and the diagonal, so compute the AABB once
     # and derive the diagonal from it directly.
     mesh_min, mesh_max = aabb(mesh.points)
-    max_dist = float(wp.length(mesh_max - mesh_min))
+    # ``math.dist`` rather than ``float(wp.length(upper - lower))``: a Warp operator and a
+    # Warp builtin at Python scope each route through builtin dispatch, measured 14.68 us
+    # against 3.02 (4.9x). It computes in float64 where ``wp.length`` is float32, i.e. ~2e-8
+    # relative and the correctly-rounded answer for float32 corners. Section 13.1.
+    max_dist = math.dist(mesh_min, mesh_max)
     out_contains = wp.empty(n, dtype=wp.bool, device=points.device)
     wp.launch(
         kernel_proximity.contains_points_sign_parity,

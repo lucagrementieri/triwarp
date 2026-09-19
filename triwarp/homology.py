@@ -195,10 +195,10 @@ def _primal_spanning_tree(
     n_vertices = int(offsets.shape[0]) - 1
     parents = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
     distances = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
-    state = wp.zeros(kernel_array.LOOP_ADVANCE_STATE_SIZE, dtype=wp.int32, device=device)
     # Level 1 is the first to claim; the condition starts true because ``wp.capture_while`` reads
-    # it before the first round; nothing claimed yet.
-    state.assign([1, 1, 0])
+    # it before the first round; nothing claimed yet. Allocated holding those values rather than
+    # zeroed and then assigned -- the zeroing is thrown away and the assign is a second upload.
+    state = wp.array([1, 1, 0], dtype=wp.int32, device=device)
     wp.launch(
         kernel_scatter.scatter_index, dim=1, inputs=[unique_edges[0], distances], device=device
     )
@@ -245,9 +245,9 @@ def _dual_spanning_forest(
     labels = tw.array.arange(n_faces, device=device)
     roots = wp.empty(n_faces, dtype=wp.int32, device=device)
     proposal = wp.empty(n_faces, dtype=wp.int32, device=device)
-    state = wp.zeros(kernel_array.LOOP_ADVANCE_STATE_SIZE, dtype=wp.int32, device=device)
-    # The condition starts true because ``wp.capture_while`` reads it before the first round.
-    state.assign([0, 1, 0])
+    # The condition starts true because ``wp.capture_while`` reads it before the first round;
+    # allocated holding that seed rather than zeroed and then assigned.
+    state = wp.array([0, 1, 0], dtype=wp.int32, device=device)
     # The component count at least halves per round, so ``bit_length`` -- ``ceil(log2)`` plus one --
     # caps a loop the halving argument already bounds; it can only be reached by a logic error.
     max_rounds = wp.int32(max(1, n_faces.bit_length()) + 1)

@@ -767,13 +767,16 @@ def shortest_path_envelope(
     relaxed = wp.empty(node_count, dtype=wp.float32, device=device)
     # The shared round-loop state word (``kernels/array.py``): the relaxation pass raises
     # ``LOOP_PROGRESS`` and ``array.loop_advance`` publishes the condition against the pass cap.
-    state = wp.zeros(kernel_array.LOOP_ADVANCE_STATE_SIZE, dtype=wp.int32, device=device)
-
+    # Allocated inside each branch because the two seed it differently -- the host loop tests
+    # ``LOOP_PROGRESS`` itself and needs no condition, while the captured loop must start with a
+    # non-zero one. Allocating zeroed above and re-seeding below would be an allocation plus a
+    # whole second upload of the same twelve bytes.
     if not device.is_cuda:
+        state = wp.zeros(kernel_array.LOOP_ADVANCE_STATE_SIZE, dtype=wp.int32, device=device)
         # No conditional-graph capture on the CPU backend, so the pass loop runs on the host;
         # the plain per-pass loop below, with its one 4-byte readback per pass, is already the
         # cheapest thing a CPU launch can do here.
-        progress = state[kernel_array.LOOP_PROGRESS : kernel_array.LOOP_PROGRESS + 1]
+        progress = state[kernel_array.LOOP_PROGRESS_VIEW]
         for _ in range(max_pass_count):
             progress.zero_()
             wp.launch(
@@ -804,7 +807,7 @@ def shortest_path_envelope(
     # across devices, so a loop whose result buffer depends on it cannot rely on it. The numbers and
     # the ping-pong corollary are at ``kernels/graph.shortest_path_envelope_pass``.
     # ``wp.capture_while`` reads the condition before the first round, so it starts non-zero.
-    state.assign([0, 1, 0])
+    state = wp.array([0, 1, 0], dtype=wp.int32, device=device)
     max_pass_count_i32 = wp.int32(max_pass_count)
 
     def envelope_pass_body() -> None:

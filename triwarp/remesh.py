@@ -479,7 +479,11 @@ def _collapse_pass(
     than re-sampled, which keeps the whole loop free of closest-point queries.
     """
     device = vertices.device
+    # One pass-scoped commit counter for the whole loop, zeroed per pass: reallocating a four-byte
+    # buffer every pass is an allocation where a memset does.
+    count = wp.zeros(1, dtype=wp.int32, device=device)
     for _ in range(max_passes):
+        count.zero_()
         n_vertices = int(vertices.shape[0])
         n_faces = int(faces.shape[0]) // 3
         if n_faces == 0:
@@ -541,7 +545,6 @@ def _collapse_pass(
         )
         remap = tw.array.arange(n_vertices, device=device)
         positions = wp.clone(vertices)
-        count = wp.zeros(1, dtype=wp.int32, device=device)
         wp.launch(
             kernel_remesh.commit_collapses,
             dim=m,
@@ -1371,8 +1374,9 @@ class _DecimationBuffers:
         wp.copy(self.vertices, vertices, count=self.n_vertices)
         self.faces = wp.empty(self.n_corners, dtype=wp.int32, device=device)
         wp.copy(self.faces, faces, count=self.n_corners)
-        self.state = wp.zeros(3, dtype=wp.int32, device=device)
-        self.state.assign([self.n_faces, self.n_vertices, 0])
+        # Allocated holding its seed rather than zeroed and then assigned: the zeroing is
+        # discarded and the assign is a second upload of the same twelve bytes.
+        self.state = wp.array([self.n_faces, self.n_vertices, 0], dtype=wp.int32, device=device)
 
         n = self.n_corners
         self._keys = wp.empty(2 * n, dtype=wp.uint64, device=device)

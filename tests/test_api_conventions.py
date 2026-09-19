@@ -62,6 +62,7 @@ from tests.api_conventions import (
     scan_package,
     uncitable_reference_problems,
     undocumented_raise_problems,
+    warp_host_arithmetic_problems,
     warp_suffix_problems,
     warp_version_problems,
 )
@@ -889,3 +890,38 @@ def test_admonitions_stay_out_of_numpydoc_item_sections() -> None:
     meaning, which is why the check ships with an empty allowlist and no allowlist machinery.
     """
     _fail("docstring section(s) holding a misplaced admonition:", admonition_placement_problems())
+
+
+def test_warp_typed_constants_stay_out_of_host_arithmetic() -> None:
+    """
+    A ``wp.int32`` constant is a kernel argument, never an operand of Python-scope arithmetic.
+
+    Not a library comparison: this is a property of triwarp's own source. Check 26, and it belongs
+    to the same family as checks 16, 17, 18, 20 and 22 -- the spelling is legal, the answer is
+    correct, and nothing but a scan sees it.
+
+    **The cost is measured, not assumed.** ``warp._src.types.scalar_base.__add__`` is
+    ``return warp.add(self, y)``, which is Warp's Python-scope builtin dispatch and runs
+    ``inspect.signature().bind()`` per operand: ~10 us against 0.027 for a Python float on an
+    RTX 5090 with Warp 1.17. A ``wp.array`` slice taken with such bounds is worse than one
+    dispatch, because ``__getitem__`` forms ``stop - start`` and ``strides * start`` itself --
+    39.4 us for two Warp-typed bounds, 27.3 for the start alone, 15.7 for the stop alone, against
+    3.16 for plain ints. That is what ``kernels/array.py``'s ``LOOP_CONDITION_VIEW`` /
+    ``LOOP_PROGRESS_VIEW`` exist to avoid, and ``graph.shortest_path_envelope`` is the site that
+    survived the first conversion of the seven.
+
+    **The probe that shows it bites**, run against ``triwarp/graph.py`` and reverted: restoring
+    ``state[LOOP_PROGRESS : LOOP_PROGRESS + 1]`` reports two problems (one per bound), the
+    one-sided ``state[LOOP_PROGRESS :]`` reports one, and a bare ``LOOP_PROGRESS * 2`` reports one.
+    The correct spellings stay silent -- ``int(LOOP_CONDITION) + 1`` is an ``ast.Call`` operand,
+    and a constant forwarded to ``wp.launch(inputs=[...])`` is neither a ``BinOp`` nor a ``Slice``.
+
+    Its two deliberate blind spots: a Warp *vector*'s arithmetic goes through ``_binary_op``, a
+    Python component loop rather than builtin dispatch (~4 us, a different and smaller hazard), and
+    an explicit ``wp.length(...)`` / ``wp.cross(...)`` call at Python scope costs the same ~10 us
+    but is often the right spelling -- ``np.cross`` is measurably *slower* than ``wp.cross`` -- so
+    flagging those would make most of the hits legitimate. The runtime census in CLAUDE.md
+    section 15.11 is what covers the wider class; this check covers the part with no legitimate
+    instance.
+    """
+    _fail("Warp-typed constant(s) in Python-scope arithmetic:", warp_host_arithmetic_problems())

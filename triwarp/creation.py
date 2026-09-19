@@ -1457,10 +1457,12 @@ def extrude_triangulation(
         faces = flipped
 
     bottom = wp.empty(2 * n, dtype=wp.vec3, device=device)
-    wp.map(kernel_array.lift_vec2, vertices, wp.float32(0.0), out=bottom[:n])
+    # One view of the lower block, written by the map and then read by the boundary walk.
+    lower_block = bottom[:n]
+    wp.map(kernel_array.lift_vec2, vertices, wp.float32(0.0), out=lower_block)
     wp.map(kernel_array.lift_vec2, vertices, wp.float32(height_f), out=bottom[n:])
 
-    boundary = tw.boundary.oriented_boundary_edges(bottom[:n].contiguous(), faces)
+    boundary = tw.boundary.oriented_boundary_edges(lower_block.contiguous(), faces)
     n_boundary = int(boundary.shape[0])
 
     out_faces = wp.empty((2 * n_faces + 2 * n_boundary) * 3, dtype=wp.int32, device=device)
@@ -1730,11 +1732,15 @@ def truncated_prisms(
 
     out_vertices = wp.empty(6 * n_faces, dtype=wp.vec3, device=device)
     out_faces = wp.empty(24 * n_faces, dtype=wp.int32, device=device)
+    # Inverted in NumPy, on the matrix that is already in hand, rather than with ``wp.inverse``:
+    # a Warp builtin at Python scope routes through builtin dispatch, 9.01 us against 2.85 here,
+    # and the two agree to 1.2e-07 (``wp.inverse`` works in float32). Section 13.1.
     to_plane = wp.mat44(*transform_np.flatten())
+    from_plane = wp.mat44(*np.linalg.inv(transform_np).flatten())
     wp.launch(
         kernel_creation.truncated_prism_geometry,
         dim=n_faces,
-        inputs=[vertices, faces, to_plane, wp.inverse(to_plane), out_vertices, out_faces],
+        inputs=[vertices, faces, to_plane, from_plane, out_vertices, out_faces],
         device=device,
     )
     return out_vertices, out_faces

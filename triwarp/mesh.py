@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import Generic, NoReturn, TypeVar, cast, overload
 
@@ -669,7 +670,11 @@ class Trimesh:
             The same quantity under trimesh's name for it (no Sphinx inventory entry to link).
         """
         lower, upper = self.bounds
-        return float(wp.length(upper - lower))
+        # ``math.dist`` rather than ``float(wp.length(upper - lower))``: a Warp operator and a
+        # Warp builtin at Python scope each route through builtin dispatch, measured 14.68 us
+        # against 3.02 (4.9x). It computes in float64 where ``wp.length`` is float32, i.e. ~2e-8
+        # relative and the correctly-rounded answer for float32 corners. Section 13.1.
+        return math.dist(lower, upper)
 
     @_CachedProperty
     def vertex_normals(self) -> wp.array[wp.vec3]:
@@ -1737,6 +1742,9 @@ class Trimesh:
         """
         if kind == "singular":
             return
+        # ``wp.transform_point`` is Python-scope builtin dispatch (~9 us). Doing it as a NumPy
+        # ``3x3 @ v + t`` was measured at 4.92 us and declined: 4 us on a cache-carry path, for a
+        # spelling that hides what the line means.
         if (centroid := self._cache.get("centroid")) is not None and kind != "affine":
             survived["centroid"] = wp.transform_point(
                 tw.transform.as_mat44(matrix), cast("wp.vec3", centroid)

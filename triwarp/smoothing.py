@@ -166,7 +166,11 @@ def filter_laplacian(
         solver = twl.spd_column_solver(
             system, components, solutions, tol=twl.CG_TOLERANCE, maxiter=10 * n
         )
+        # Both column lists are viewed once: ``components`` / ``solutions`` are allocated above and
+        # never rebound, so re-slicing them inside the pass loop is ~3 us of
+        # ``wp.array.__getitem__`` per view per pass and nothing else.
         component_rows = [components[column] for column in range(3)]
+        solution_rows = [solutions[column] for column in range(3)]
         for _ in range(iterations):
             wp.map(kernel_smoothing.extract_components, positions, out=component_rows)
             # Seed each column with its own right-hand side, which here *is* the current position
@@ -176,9 +180,9 @@ def filter_laplacian(
             solver()
             wp.map(
                 kernel_smoothing.combine_components,
-                solutions[0],
-                solutions[1],
-                solutions[2],
+                solution_rows[0],
+                solution_rows[1],
+                solution_rows[2],
                 out=positions,
             )
             if volume_constraint:
@@ -362,10 +366,13 @@ def inflate(
         out=positions,
         return_kernel=True,
     )
+    # Allocated once beside the hoisted kernel, for the same reason: the vertex count is fixed, and
+    # the buffer is dead by the end of the pass that writes it, so a fresh one each pass is an
+    # allocation per iteration and nothing else.
+    displaced = wp.empty(n_vertices, dtype=wp.vec3, device=device)
     for step in range(iterations):
         amount = pressure * (step + 1) / iterations if gradual else pressure
         normals = tw.vertices.vertex_normals(positions, faces)
-        displaced = wp.empty(n_vertices, dtype=wp.vec3, device=device)
         wp.launch(
             step_kernel,
             dim=n_vertices,
@@ -1415,7 +1422,12 @@ def filter_implicit_fairing(
     components = _component_columns(n, device)
     rhs = _component_columns(n, device)
     solutions = _component_columns(n, device)
+    # All three column lists are viewed once. The buffers are allocated here and never rebound --
+    # only the *operator* is rebuilt each pass, which is what the note in the loop is about -- so
+    # re-slicing them per pass was ~6 views of ~3 us each, per iteration, buying nothing.
     component_rows = [components[column] for column in range(3)]
+    rhs_rows = [rhs[column] for column in range(3)]
+    solution_rows = [solutions[column] for column in range(3)]
 
     # Boundary topology is fixed for the whole flow, so the partition is built once. ``None`` means
     # "solve over every vertex" -- either the caller asked for the unconstrained flow, or the mesh
@@ -1437,7 +1449,7 @@ def filter_implicit_fairing(
         # Right-hand side b = M V, formed before ``bsr_axpy`` mutates the mass matrix.
         wp.map(kernel_smoothing.extract_components, positions, out=component_rows)
         for column in range(3):
-            wp.map(wp.mul, mass, components[column], out=rhs[column])
+            wp.map(wp.mul, mass, component_rows[column], out=rhs_rows[column])
 
         # A = M - lamb L (SPD: L has a negative diagonal, so subtracting it adds to the diagonal).
         system = wps.bsr_axpy(x=stiffness, y=wps.bsr_diag(diag=mass), alpha=-float(lamb), beta=1.0)
@@ -1451,9 +1463,9 @@ def filter_implicit_fairing(
             twl.solve_spd_columns(system, rhs, solutions, tol=twl.CG_TOLERANCE, maxiter=10 * n)
             wp.map(
                 kernel_smoothing.combine_components,
-                solutions[0],
-                solutions[1],
-                solutions[2],
+                solution_rows[0],
+                solution_rows[1],
+                solution_rows[2],
                 out=positions,
             )
             continue
