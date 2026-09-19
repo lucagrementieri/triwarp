@@ -4792,6 +4792,15 @@ knowing this: one review pass recorded itself as CPU-only and wrote off its own 
 `nvidia-smi` is the *box-is-quiet* check above and nothing more; availability is
 `wp.get_cuda_device_count()` plus one real launch.
 
+**torch reports the same mismatch as a test warning, and it is the suite's only one on a CUDA
+run.** `torch.cuda.__init__` calls `_raw_device_count_nvml()` and warns `UserWarning: Can't
+initialize NVML` when that library is the mismatched one, so a CUDA run of `tests/` ends in
+`2 warnings` where the CPU run — which CI runs, and which has no GPU to ask about — ends in none.
+It is the box, not the tree: nothing in triwarp or in the reference stack raises it, no code change
+silences it, and reloading the NVIDIA kernel modules (or rebooting) is the whole remedy. Do not
+filter it — it is the one standing signal that this host's NVML is out of step, and the paragraph
+above is what that costs when it goes unnoticed.
+
 **Verify with `print(triwarp.__file__)` before trusting a single number.** Do **not** `uv run` from
 inside the worktree — it resolves that copy as its own project and builds a second virtualenv; use
 `.venv/bin/python` directly.
