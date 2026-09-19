@@ -1919,7 +1919,7 @@ def _run_collapse_rounds(
             device=device,
         )
 
-    condition = round_state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
+    condition = round_state[kernel_array.LOOP_CONDITION_VIEW]
     # The caller is already capturing, so this nests: a conditional graph becomes an inner
     # ``while`` node of the pass graph rather than a graph captured and launched on its own.
     wp.capture_while(condition, round_body)

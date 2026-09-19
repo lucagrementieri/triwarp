@@ -42,6 +42,87 @@ def test_edges_to_csr_roundtrip(device: str) -> None:
         assert set(row.tolist()) == neighbors[v]
 
 
+@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "hemisphere", "unit_box"])
+def test_edges_to_neighbor_lists_matches_igl(
+    mesh_name: str, request: pytest.FixtureRequest
+) -> None:
+    """
+    Class B (a named transform): ``igl.adjacency_list`` is a list of lists, this is packed.
+
+    igl returns one Python list per vertex, already ascending; ``edges_to_neighbor_lists`` returns
+    ``(neighbors, offsets)`` with **arbitrary order within a row**, which is the documented
+    difference and the whole reason it is cheaper than
+    [`edges_to_csr`][triwarp.graph.edges_to_csr]. Sorting each row is the transform.
+
+    The fixtures span closed/open and curved/faceted, and every one of them is **irregular**: the
+    assert below pins the maximum degree strictly above the minimum, because on a mesh where every
+    row has the same width a misplaced row is invisible to a row-by-row compare. ``icosahedron`` is
+    excluded for exactly that reason — all twelve of its vertices have degree 5.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_wp.points.shape[0])
+    faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
+    edges_wp, _ = tw.edges.edges_unique(faces_wp, n_vertices=n_vertices)
+
+    neighbors_wp, offsets_wp = tw.graph.edges_to_neighbor_lists(n_vertices, edges_wp)
+    neighbors, offsets = neighbors_wp.numpy(), offsets_wp.numpy()
+    adjacency_igl = igl.adjacency_list(np.asarray(mesh_tm.faces, dtype=np.int64))
+
+    assert offsets.shape == (n_vertices + 1,)
+    assert int(offsets[0]) == 0
+    assert int(offsets[-1]) == neighbors.shape[0] == 2 * int(edges_wp.shape[0])
+    degrees = np.diff(offsets)
+    # Not a regular fixture: a constant degree would make a row-swap invisible.
+    assert int(degrees.max()) > int(degrees.min()) > 0
+
+    for v in range(n_vertices):
+        row = sorted(neighbors[int(offsets[v]) : int(offsets[v + 1])].tolist())
+        assert row == sorted(int(x) for x in adjacency_igl[v]), f"vertex {v} row differs"
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+def test_edges_to_neighbor_lists_agrees_with_edges_to_csr(
+    mesh_name: str, request: pytest.FixtureRequest
+) -> None:
+    """
+    Triwarp against triwarp: the two adjacency builders describe the same graph.
+
+    ``edges_to_csr`` carries the oracle — it is the one with a reference comparison
+    (``igl.adjacency_list``, above, and scipy through ``connected_component_labels``). This pins
+    the cheap unsorted builder to it so the two cannot drift, which is the claim every caller that
+    switched between them relies on.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_wp.points.shape[0])
+    faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
+    edges_wp, _ = tw.edges.edges_unique(faces_wp, n_vertices=n_vertices)
+
+    neighbors_wp, offsets_wp = tw.graph.edges_to_neighbor_lists(n_vertices, edges_wp)
+    adjacency = tw.graph.edges_to_csr(n_vertices, edges_wp)
+
+    assert np.array_equal(offsets_wp.numpy(), adjacency.offsets.numpy())
+    neighbors, offsets = neighbors_wp.numpy(), offsets_wp.numpy()
+    columns = adjacency.columns.numpy()
+    for v in range(n_vertices):
+        lo, hi = int(offsets[v]), int(offsets[v + 1])
+        assert sorted(neighbors[lo:hi].tolist()) == sorted(columns[lo:hi].tolist())
+
+
+def test_edges_to_neighbor_lists_rejects_an_out_of_range_endpoint(device: str) -> None:
+    """The guard that keeps an unchecked index off a raw ``degree[a]`` write (section 12.1)."""
+    edges_wp = wp.array(np.array([[0, 1], [1, 5]], dtype=np.int32), dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="edge indices must lie in"):
+        tw.graph.edges_to_neighbor_lists(3, edges_wp)
+
+
+def test_edges_to_neighbor_lists_empty(device: str) -> None:
+    """No edges means every row is empty, and the offsets are still the ``n + 1`` CSR form."""
+    edges_wp = wp.zeros((0, 2), dtype=wp.int32, device=device)
+    neighbors_wp, offsets_wp = tw.graph.edges_to_neighbor_lists(4, edges_wp)
+    assert neighbors_wp.shape[0] == 0
+    assert np.array_equal(offsets_wp.numpy(), np.zeros(5, dtype=np.int32))
+
+
 @pytest.mark.parity("connected_component_labels", "scipy")
 def test_connected_component_labels_random(device: str) -> None:
     """

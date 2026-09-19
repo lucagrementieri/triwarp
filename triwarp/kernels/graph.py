@@ -46,19 +46,60 @@ def edges_to_adjacency_weighted(
 
 
 @wp.kernel
+def scatter_neighbor_lists(
+    edges: wp.array2d[wp.int32],
+    offsets: wp.array[wp.int32],
+    cursor: wp.array[wp.int32],
+    out_neighbors: wp.array[wp.int32],
+) -> None:
+    # Both directed entries of each undirected edge, into the CSR row the counting pass sized --
+    # the payload half of ``graph.edges_to_neighbor_lists``. The same ``offsets[row] +
+    # wp.atomic_add(cursor, row, 1)`` counting-sort fill as
+    # [`scatter_vertex_faces`][triwarp.kernels.adjacency.scatter_vertex_faces]; what differs is the
+    # payload, which is the *other endpoint* here and the owning face there, so the two are
+    # siblings rather than one kernel.
+    #
+    # ``cursor`` is zeroed per-node scratch, not an output: each node's slots are handed out by the
+    # atomic, so the column order within a row is thread order and **not sorted**. That is
+    # deliberate and is what this build costs less than ``bsr_from_triplets`` for; a caller that
+    # needs sorted rows must sort them, or use ``graph.edges_to_csr``.
+    e = wp.int32(wp.tid())
+    a = edges[e, 0]
+    b = edges[e, 1]
+    out_neighbors[offsets[a] + wp.atomic_add(cursor, a, 1)] = b
+    out_neighbors[offsets[b] + wp.atomic_add(cursor, b, 1)] = a
+
+
+@wp.kernel
 def shortest_path_envelope_pass(
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
     weights: wp.array[wp.float32],
     labels: wp.array[wp.float32],
     out_labels: wp.array[wp.float32],
-    out_changed: wp.array[wp.int32],
+    out_state: wp.array[wp.int32],
 ) -> None:
     # One Bellman-Ford relaxation of ``q_i <= q_j + w(i, j)``, one thread per node, pulling from the
     # neighbours' labels of the *previous* round -- so the pass is a pure function of ``labels`` and
     # the result does not depend on how the threads interleave. Labels only ever go down, so the
-    # iteration is monotone and converges in at most (graph diameter) passes; ``out_changed`` is the
-    # host's early-exit signal. (VCG ``UpdateQuality::VertexSaturate`` is this loop.)
+    # iteration is monotone and converges in at most (graph diameter) passes.
+    # (VCG ``UpdateQuality::VertexSaturate`` is this loop.)
+    #
+    # **Two passes per round, written into each other's buffer, would remove the wrapper's
+    # ``wp.copy``** -- it is a whole device pass over the node array and measured ~20 % of that call
+    # (1.26x on 2 562 nodes, 1.45x on 40 962) -- and it is **not portable**: the two devices then
+    # disagree. Measured on a 2 562-node sphere with ``max_iterations`` 1 / 3 / 7, the unrolled body
+    # relaxed 16 / 51 / 181 nodes on CUDA against 6 / 31 / 141 on the CPU device, because the
+    # recorded body did not replay as two passes per round there; even caps agreed exactly. A
+    # ``wp.capture_while`` body is not guaranteed to execute as an indivisible unit across devices,
+    # so a loop whose *result buffer* depends on the body running whole cannot rely on it. A
+    # Python-level ping-pong cannot help either: the body is recorded once and replayed, so
+    # rebinding the names would only take effect at record time.
+    #
+    # ``out_state`` is the shared round-loop word of ``kernels/array.py``; raising
+    # ``LOOP_PROGRESS`` is this pass's "something moved", which the closing ``array.loop_advance``
+    # turns into the next round's condition and clears. A plain store, not an atomic: the slot only
+    # ever goes 0 -> 1 within a round, so every writer writes the same value.
     i = wp.int32(wp.tid())
     best = labels[i]
     for k in range(offsets[i], offsets[i + 1]):
@@ -67,30 +108,7 @@ def shortest_path_envelope_pass(
             best = relaxed
     out_labels[i] = best
     if best < labels[i]:
-        out_changed[0] = 1
-
-
-@wp.kernel
-def envelope_advance_and_check(
-    max_iterations: wp.int32,
-    passes: wp.int32,
-    out_changed: wp.array[wp.int32],
-    out_counter: wp.array[wp.int32],
-    out_condition: wp.array[wp.int32],
-) -> None:
-    # Runs once per *round* of ``passes`` relaxation passes -- the loop body runs two, writing each
-    # into the other's buffer so neither has to be copied back. Advances the iteration count by
-    # that many, decides whether ``shortest_path_envelope``'s captured
-    # ``wp.capture_while`` loop should run another pass, and resets ``out_changed`` for the next
-    # round to write into. ``out_changed`` only ever goes 0 -> 1 in a pass, so reading it once per
-    # round is the OR over that round's passes -- which is what "did anything move" has to mean.
-    # It is read here as this round's own answer and reset in the same launch for the next -- the
-    # same in-place shape a traversal's emitted order buffer has. dim=1, so no thread
-    # index -- this is host-side bookkeeping moved onto the device so the whole loop can run as one
-    # conditional graph with no per-pass readback.
-    out_counter[0] += passes
-    out_condition[0] = wp.where(out_changed[0] != 0 and out_counter[0] < max_iterations, 1, 0)
-    out_changed[0] = 0
+        out_state[kernel_array.LOOP_PROGRESS] = 1
 
 
 @wp.kernel

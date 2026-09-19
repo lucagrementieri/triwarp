@@ -11,14 +11,16 @@ search that has to reproduce ``scipy.sparse.csgraph.breadth_first_order`` spends
 compacting its claims into a FIFO in ``(rank, ascending node id)`` order -- a tiled block scan plus
 a serial advance, measured at 9.9 us of a 26.1 us level against 16.2 for the claim/commit pair that
 actually builds the tree. Nothing downstream of a spanning tree reads a discovery order, so the
-scan is gone and the level is ``bfs_push_level`` plus a one-thread ``bfs_advance``.
+scan is gone and the level is ``bfs_push_level`` plus a one-thread
+[`loop_advance`][triwarp.kernels.array.loop_advance].
 
 **What replaces the order as the tie-break is ``wp.atomic_min`` on the parent**, and it buys two
 things beyond the launch. The tree stays deterministic -- ``parents[w]`` is the lowest-indexed
 frontier vertex adjacent to ``w``, whatever order the threads ran in -- and the *adjacency* no
-longer has to be column-sorted for that to hold, which is what lets the wrapper build the CSR with
-a counting pass and a cursor scatter instead of routing 2 * n_edges triplets through
-``warp.sparse.bsr_from_triplets``' radix sort.
+longer has to be column-sorted for that to hold, which is what lets the wrapper reach for
+[`edges_to_neighbor_lists`][triwarp.graph.edges_to_neighbor_lists] -- a counting pass and a cursor
+scatter -- instead of routing 2 * n_edges triplets through ``warp.sparse.bsr_from_triplets``' radix
+sort.
 
 ``bfs_push_level`` races on ``out_distances`` deliberately: two frontier vertices claiming the same
 neighbour both store the same ``level``, so the write is idempotent, and the ``seen == level`` arm
@@ -33,9 +35,10 @@ non-primal-tree edges is *already nearly a tree*, so its diameter is enormous. M
 benchmark meshes, a dual traversal ran **765-891 levels** against the primal's 116-192. Boruvka
 needs ``O(log F)`` rounds instead. Each round gives every component its minimum-index incident
 candidate edge, accepts those edges and unions the components; the union-find core is
-[`find_representative`][triwarp.kernels.algorithms.connected_components.find_representative],
-imported rather than re-derived, so the forest and ``graph.connected_component_labels`` share one
-implementation of the pointer-jumping find.
+[`find_representative`][triwarp.kernels.algorithms.connected_components.find_representative] and
+[`ecl_hook_edge`][triwarp.kernels.algorithms.connected_components.ecl_hook_edge], imported rather
+than re-derived, so the forest and ``graph.connected_component_labels`` share one implementation of
+the pointer-jumping find and of the CAS hook.
 
 **Why the accepted set is a forest.** Edge *indices* are distinct, so "minimum incident index" is a
 strict total order on the candidate edges, and the classical Boruvka argument applies: a cycle among
@@ -44,13 +47,15 @@ from an immutable ``roots`` snapshot taken before any union, which is what makes
 here -- deciding against a ``label`` array that other threads are mutating would let one component
 accept two edges in a round and could close a cycle.
 
-**Both loops carry their own condition so the wrapper can capture them.** A per-round host readback
-drains the pipeline the round's launches just filled, and there were about thirty of them across the
-two loops; each loop now writes a device-side condition word that ``wp.capture_while`` reads, and
-the wrapper synchronizes three times in the whole call. The Boruvka loop additionally counts its
-rounds down in ``FOREST_ROUNDS``: the merge count alone is a sound termination argument, but a
-captured loop that fails it hangs the device rather than returning a wrong answer, so the cap is
-cheap insurance rather than a schedule.
+**Both loops carry their own condition so the wrapper can capture them**, and both do it through
+the package's shared round-loop slot table rather than one of their own -- ``array.LOOP_ROUND`` /
+``LOOP_CONDITION`` / ``LOOP_PROGRESS``, closed by ``array.loop_advance`` and driven by
+``_device.run_device_loop``. A per-round host readback drains the pipeline the round's launches
+just filled, and there were about thirty of them across the two loops; the wrapper now synchronizes
+three times in the whole call. Each loop passes its own round cap: the merge count and the claim
+flag are each a sound termination argument on their own, but a captured loop that fails one hangs
+the device rather than returning a wrong answer, so the cap is cheap insurance rather than a
+schedule.
 
 **The tracing is two kernels and a scan where it used to be a Python loop per generator.** Each
 generator edge ``(a, b)`` closes into a loop through the tree as ``a -> lca(a, b) -> b``, and its
@@ -63,8 +68,9 @@ cut: the tracer needs the depths to size a loop without walking it.
 
 import warp as wp
 
-from triwarp.constants import INT32_MAX
+from triwarp.constants import INT32_MAX, TILE_1D
 from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_representative
+from triwarp.kernels.array import LOOP_PROGRESS, LOOP_ROUND
 from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
 
 # One past the largest edge index any proposal can hold, so ``wp.atomic_min`` starts empty. The
@@ -77,21 +83,6 @@ FOREST_NO_PROPOSAL = wp.constant(wp.int32(INT32_MAX))
 # without a special case for the root.
 NO_PARENT = wp.constant(wp.int32(INT32_MAX))
 
-# Slots of the primal level loop's state word. ``BFS_CHANGED`` is set by any thread that claimed a
-# vertex this level and cleared by the next ``bfs_advance``, which copies it into ``BFS_CONDITION``
-# -- the word ``wp.capture_while`` polls. Two slots rather than one because the condition has to
-# survive the clear.
-BFS_LEVEL = 0
-BFS_CHANGED = 1
-BFS_CONDITION = 2
-BFS_STATE_SIZE = 3
-
-# Slots of the Boruvka round's state word, same convention.
-FOREST_MERGES = 0
-FOREST_ROUNDS = 1
-FOREST_CONDITION = 2
-FOREST_STATE_SIZE = 3
-
 # Slots of the one buffer that carries every host-visible count out of the decomposition, read back
 # once. Slot 0 is filled over the edges and slots 1-2 over the vertices, by two different kernels,
 # which is why they share a buffer rather than each owning one: the readback is the cost, not the
@@ -100,74 +91,6 @@ COUNT_INTERIOR_EDGES = 0
 COUNT_REACHED = 1
 COUNT_REFERENCED = 2
 COUNT_SIZE = 3
-
-
-@wp.kernel
-def vertex_degrees_and_interior_count(
-    unique_edges: wp.array2d[wp.int32],
-    edge_face_count: wp.array[wp.int32],
-    out_degree: wp.array[wp.int32],
-    out_counts: wp.array[wp.int32],
-) -> None:
-    # Two unrelated answers off one pass over the unique edges, because the pass is the cost: the
-    # per-vertex degree that sizes the adjacency CSR, and the number of interior edges that the
-    # closed-surface guard compares against ``3 * n_faces``.
-    #
-    # The interior count is a block fold rather than a conditional ``wp.atomic_add`` per edge
-    # because on a closed mesh *every* edge is interior, so the conditional atomic is the
-    # unconditional one and it serializes the whole launch on one address.
-    chunk, lane = wp.tid()
-    offset, remaining = tile_chunk(unique_edges.shape[0], chunk, ITEMS_PER_BLOCK_1D)
-    if remaining <= 0:
-        return
-    # ``tile_chunk`` reports what is left to the end of the array, not this block's share of it.
-    n_rows = wp.min(remaining, ITEMS_PER_BLOCK_1D)
-
-    interior = wp.int32(0)
-    for k in range(lane, n_rows, wp.block_dim()):
-        e = offset + k
-        wp.atomic_add(out_degree, unique_edges[e, 0], 1)
-        wp.atomic_add(out_degree, unique_edges[e, 1], 1)
-        if edge_face_count[e] == 2:
-            interior = interior + 1
-
-    # Block-collective, so it runs outside the ``lane == 0`` guard.
-    interior_total = wp.tile_sum(wp.tile(interior))[0]
-    if lane == 0:
-        wp.atomic_add(out_counts, COUNT_INTERIOR_EDGES, interior_total)
-
-
-@wp.kernel
-def scatter_adjacency(
-    unique_edges: wp.array2d[wp.int32],
-    offsets: wp.array[wp.int32],
-    cursor: wp.array[wp.int32],
-    out_columns: wp.array[wp.int32],
-) -> None:
-    # Both directed entries of each undirected edge, into the CSR row the counting pass sized.
-    # ``cursor`` is zeroed per-vertex scratch, not an output: each vertex's rows are handed out by
-    # ``wp.atomic_add`` on it, so the column order within a row is thread order and **not sorted**.
-    # That is deliberate and is what this build costs less than ``bsr_from_triplets`` for -- the
-    # level loop's ``wp.atomic_min`` tie-break does not read the column order, so nothing downstream
-    # needs it sorted. A future caller that does need sorted rows must sort them, not assume them.
-    e = wp.int32(wp.tid())
-    a = unique_edges[e, 0]
-    b = unique_edges[e, 1]
-    out_columns[offsets[a] + wp.atomic_add(cursor, a, 1)] = b
-    out_columns[offsets[b] + wp.atomic_add(cursor, b, 1)] = a
-
-
-@wp.kernel
-def bfs_seed(unique_edges: wp.array2d[wp.int32], out_distances: wp.array[wp.int32]) -> None:
-    # Root the primal tree at the lowest-indexed *referenced* vertex, read on the device rather
-    # than handed in, which is one host readback the call no longer takes.
-    #
-    # Rooting at vertex 0 unconditionally is the bug this replaces: on a mesh whose vertex 0 carries
-    # no edges the "tree" is a single isolated node, every primal edge becomes a generator, and the
-    # count comes back enormous rather than wrong-looking. ``edges_unique`` returns its rows
-    # lexicographically sorted, so the first endpoint of the first row is the lowest-indexed
-    # referenced vertex -- referenced by construction, and deterministic.
-    out_distances[unique_edges[0, 0]] = 0
 
 
 @wp.kernel
@@ -183,6 +106,10 @@ def bfs_push_level(
     # is a tiled scan per level and the early exit is one coalesced load, and the launch is the same
     # width either way.
     #
+    # ``state`` is the shared round-loop word of ``kernels/array.py``: this reads the level to claim
+    # from ``LOOP_ROUND`` and raises ``LOOP_PROGRESS``, which the closing ``array.loop_advance``
+    # turns into the next round's condition. A plain store, not an atomic -- one address, one value.
+    #
     # The visit test admits ``seen == level`` as well as an unvisited vertex, and that arm is
     # load-bearing rather than defensive. Two frontier vertices may reach the same neighbour in one
     # level; whichever gets there first stores ``level``, and without this arm the other would read
@@ -190,7 +117,7 @@ def bfs_push_level(
     # thread ran first. Both stores write the same value, so the race on ``out_distances`` itself is
     # idempotent.
     v = wp.int32(wp.tid())
-    level = state[BFS_LEVEL]
+    level = state[LOOP_ROUND]
     if out_distances[v] != level - 1:
         return
     for k in range(offsets[v], offsets[v + 1]):
@@ -199,18 +126,7 @@ def bfs_push_level(
         if seen < 0 or seen == level:
             out_distances[w] = level
             wp.atomic_min(out_parents, w, v)
-            state[BFS_CHANGED] = 1
-
-
-@wp.kernel
-def bfs_advance(out_state: wp.array[wp.int32]) -> None:
-    # Publish this level's claim flag as the loop condition, clear it, and step the level. One
-    # thread, and the only reason the level loop is two launches rather than one: the flag has to be
-    # cleared between levels and a thread of the pushing kernel cannot do it without racing the
-    # threads still setting it.
-    out_state[BFS_CONDITION] = out_state[BFS_CHANGED]
-    out_state[BFS_CHANGED] = 0
-    out_state[BFS_LEVEL] = out_state[BFS_LEVEL] + 1
+            state[LOOP_PROGRESS] = 1
 
 
 @wp.kernel
@@ -251,6 +167,7 @@ def dual_candidate_mask(
     edge_face_count: wp.array[wp.int32],
     parents: wp.array[wp.int32],
     out_candidate: wp.array[wp.bool],
+    out_counts: wp.array[wp.int32],
 ) -> None:
     # Whether the cotree may cross this dual edge: an interior edge (exactly two incident faces)
     # that the primal tree did not already claim. Non-manifold edges count higher than 2 and are
@@ -261,33 +178,66 @@ def dual_candidate_mask(
     # The primal-tree test and the candidate test were two kernels and an intermediate mask. An
     # undirected edge belongs to a rooted spanning tree exactly when one endpoint is the other's
     # parent, and ``NO_PARENT`` matches neither endpoint, so the root needs no special case.
-    e = wp.int32(wp.tid())
-    a = unique_edges[e, 0]
-    b = unique_edges[e, 1]
-    in_primal_tree = parents[b] == a or parents[a] == b
-    out_candidate[e] = edge_face_count[e] == 2 and not in_primal_tree
+    #
+    # **The closed-surface guard's interior-edge count rides along**, because ``edge_face_count[e]
+    # == 2`` is already this kernel's own predicate -- so the count is the fold of a value the
+    # thread computed anyway, and the guard needs no pass of its own. The same fused-fold trade
+    # ``kernels/points.py::accumulate_counted_mean`` prices at 136 us of a 346 us call.
+    #
+    # A block fold rather than a conditional ``wp.atomic_add`` per edge, because on a closed mesh
+    # *every* edge is interior -- so the conditional atomic is the unconditional one and it
+    # serializes the whole launch on one address.
+    #
+    # **One tile per block, not ``ITEMS_PER_BLOCK_1D``**, and that is the whole difference between
+    # this being free and being a regression: the reduce module's fold width gives each lane 16
+    # elements, which is right for a kernel whose *only* output is the reduction, and wrong here
+    # because this one also writes a mask entry per edge. At 140 000 edges the wide fold runs 137
+    # blocks -- under one per SM on a 170-SM device -- against 2 188 blocks of one edge per lane.
+    # Section 2.3's occupancy rule: a kernel that already has a per-element dimension must not
+    # collapse it into ``block_dim`` lanes. One atomic per 64 edges is still one per block, which
+    # is the shape section 13.2 asks for.
+    chunk, lane = wp.tid()
+    offset, remaining = tile_chunk(unique_edges.shape[0], chunk, TILE_1D)
+    if remaining <= 0:
+        return
+    # ``tile_chunk`` reports what is left to the end of the array, not this block's share of it.
+    n_rows = wp.min(remaining, TILE_1D)
+
+    interior = wp.int32(0)
+    for k in range(lane, n_rows, wp.block_dim()):
+        e = offset + k
+        a = unique_edges[e, 0]
+        b = unique_edges[e, 1]
+        is_interior = edge_face_count[e] == 2
+        in_primal_tree = parents[b] == a or parents[a] == b
+        out_candidate[e] = is_interior and not in_primal_tree
+        if is_interior:
+            interior = interior + 1
+
+    # Block-collective, so it runs outside the ``lane == 0`` guard.
+    interior_total = wp.tile_sum(wp.tile(interior))[0]
+    if lane == 0:
+        wp.atomic_add(out_counts, COUNT_INTERIOR_EDGES, interior_total)
 
 
 @wp.kernel
 def forest_round_setup(
-    labels: wp.array[wp.int32],
-    out_roots: wp.array[wp.int32],
-    out_proposal: wp.array[wp.int32],
-    out_state: wp.array[wp.int32],
+    labels: wp.array[wp.int32], out_roots: wp.array[wp.int32], out_proposal: wp.array[wp.int32]
 ) -> None:
-    # Open a Boruvka round: freeze this round's component of every node, empty the proposal slots
-    # and reset the merge counter. ``find_representative`` path-compresses ``labels`` as it goes, so
-    # the snapshot doubles as the round's flatten pass.
+    # Open a Boruvka round: freeze this round's component of every node and empty the proposal
+    # slots. ``find_representative`` path-compresses ``labels`` as it goes, so the snapshot doubles
+    # as the round's flatten pass.
     #
-    # The proposal fill and the counter reset used to be two host-side ``fill_`` / ``zero_`` calls
-    # per round. They are stores here because this kernel already runs at ``dim=n_faces`` and
-    # touches ``out_proposal``'s every element anyway.
+    # The snapshot line alone is
+    # [`ecl_flatten`][triwarp.kernels.algorithms.connected_components.ecl_flatten] verbatim; what
+    # this adds is the proposal fill, which used to be a host-side ``fill_`` call per round and is a
+    # store here because the kernel already runs at ``dim=n_faces`` and touches every element of
+    # ``out_proposal`` anyway. The round's merge flag is *not* reset here -- ``array.loop_advance``
+    # clears it when it closes the round, which is the only point at which the round's claim has
+    # already been tested.
     f = wp.int32(wp.tid())
     out_roots[f] = find_representative(labels, f)
     out_proposal[f] = FOREST_NO_PROPOSAL
-    if f == 0:
-        out_state[FOREST_MERGES] = 0
-        out_state[FOREST_ROUNDS] = out_state[FOREST_ROUNDS] - 1
 
 
 @wp.func
@@ -345,6 +295,10 @@ def forest_link(
     # same edge, and one edge may be the choice of two components at once; either way the union runs
     # once per accepted edge and the second attempt finds the roots already equal.
     #
+    # ``LOOP_PROGRESS`` is raised by a plain store rather than counted with ``wp.atomic_add``:
+    # nothing reads the merge *count*, only whether the round merged anything, and a round that
+    # merged nothing means every component is spanned -- which is the loop's real exit.
+    #
     # The union is ``ecl_hook_edge`` verbatim rather than a second copy of its CAS retry: it takes a
     # representative and a node, so handing it the two roots this round snapshotted costs one
     # already-compressed find. Its termination argument (parents monotonically non-increasing, so
@@ -356,18 +310,8 @@ def forest_link(
     if proposal[root_a] != e and proposal[root_b] != e:
         return
     out_in_forest[e] = True
-    wp.atomic_add(out_state, FOREST_MERGES, 1)
+    out_state[LOOP_PROGRESS] = 1
     ecl_hook_edge(labels, root_a, root_b)
-
-
-@wp.kernel
-def forest_advance(out_state: wp.array[wp.int32]) -> None:
-    # Publish the round's merge count as the loop condition, gated by the round cap. A round that
-    # merged nothing means every component is spanned, which is the real exit; the cap only matters
-    # if the halving argument is ever violated, where it turns a hung device into a wrong answer the
-    # partition identity in ``tests/test_homology.py`` catches.
-    keep_going = wp.where(out_state[FOREST_ROUNDS] > 0, out_state[FOREST_MERGES], wp.int32(0))
-    out_state[FOREST_CONDITION] = keep_going
 
 
 @wp.func

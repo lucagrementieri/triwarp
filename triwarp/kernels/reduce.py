@@ -877,10 +877,11 @@ def outer_sum_chunk(
 
 
 # The "componentwise ``wp.tile_sum`` reductions, then one lane-0-guarded atomic commit" skeleton
-# that reads ``tile_chunk``/``outer_sum_chunk``'s partial sums out is itself hand-written at five
+# that reads ``tile_chunk``/``outer_sum_chunk``'s partial sums out is itself hand-written at seven
 # call sites with no shared helper: ``points.centered_covariance`` (9 scalars, above),
 # ``points.accumulate_counted_mean`` (2), ``measures.moment_integrals`` (10),
-# ``registration.accumulate_procrustes_moments`` (25) and ``accumulate_point_to_plane`` (43).
+# ``registration.accumulate_procrustes_moments`` (25), ``accumulate_point_to_plane`` (43),
+# ``homology.count_reached_and_referenced`` (2) and ``homology.dual_candidate_mask`` (1).
 #
 # Still left unmerged, and the two accumulators added since this note first said "revisit if a
 # fourth appears" are why rather than why not. Each loop is over a different fixed component count
@@ -888,7 +889,10 @@ def outer_sum_chunk(
 # helper would have to take an arbitrary tuple of scalar/vector/matrix quantities -- and the
 # *bodies* turn out to differ in more than the count: ``moment_integrals`` needed its chunk width
 # as a launch argument because its per-element arithmetic is heavy enough to have a real occupancy
-# crossover, where every other member is cheap enough to take ``ITEMS_PER_BLOCK_1D`` unexamined.
+# crossover, and ``homology.dual_candidate_mask`` takes ``TILE_1D`` rather than
+# ``ITEMS_PER_BLOCK_1D`` because it *also* writes one mask entry per element, so the wide fold
+# would throw its per-element dimension away (measured 137 blocks against 2 188 at 140 000 edges).
+# The rest are cheap enough to take ``ITEMS_PER_BLOCK_1D`` unexamined.
 # A helper general over both would be more speculative machinery than five call sites justify
 # (CLAUDE.md section 4.2). What *is* shared is already factored: ``tile_chunk`` and the clamp rule
 # it documents, which is the part that goes wrong.

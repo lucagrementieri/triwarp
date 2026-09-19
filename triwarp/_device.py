@@ -16,6 +16,7 @@ bearing at the public boundary.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -74,6 +75,52 @@ def prefers_tiled_reduction(device: wp.DeviceLike) -> bool:
     [`items_per_slice`][triwarp._device.items_per_slice]
     """
     return wp.get_device(device).is_cuda
+
+
+def run_device_loop(
+    device: wp.DeviceLike, condition: wp.array[wp.int32], body: Callable[[], None]
+) -> None:
+    """
+    Run ``body`` until the device-side ``condition`` word reads zero, without a host readback.
+
+    A loop whose body writes its own continuation flag runs on CUDA as one captured conditional
+    graph, so the per-round readback it would otherwise take -- which drains the pipeline that
+    round's launches just filled -- disappears entirely. Graph capture needs a CUDA stream, so the
+    CPU device falls back to ``wp.capture_while``'s direct execution, which is the same loop with
+    one four-byte read per round.
+
+    ``wp.capture_while`` evaluates ``condition`` **before** each round, including the first, so it
+    must be seeded non-zero or the loop runs zero rounds. The shared slot table and the
+    [`loop_advance`][triwarp.kernels.array.loop_advance] kernel that writes it are in
+    ``triwarp/kernels/array.py``.
+
+    Parameters
+    ----------
+    device
+        Warp device (or device string) the loop's launches run on.
+    condition
+        Length-1 ``wp.int32`` view of the state word's condition slot, on ``device``.
+    body
+        Issues one round's launches. It is *recorded once* on CUDA and replayed, so it must not
+        rebind buffers between rounds -- a Python-level ping-pong has no effect on the replayed
+        loop, and a body whose result depends on running as an indivisible unit is not portable
+        (see [`shortest_path_envelope`][triwarp.graph.shortest_path_envelope]).
+
+    See Also
+    --------
+    [`prefers_tiled_reduction`][triwarp._device.prefers_tiled_reduction]
+    """
+    resolved = wp.get_device(device)
+    # ``wp.is_conditional_graph_supported`` is a *machine* query, so it answers ``True`` on a box
+    # with a GPU even when this loop's arrays are on the CPU device; the ``is_cuda`` test is what
+    # actually decides. A caller already inside a capture must not call this at all -- it nests by
+    # calling ``wp.capture_while`` directly, as ``remesh._quadric_collapse_rounds`` does.
+    if resolved.is_cuda and wp.is_conditional_graph_supported():
+        with wp.ScopedCapture(resolved) as capture:
+            wp.capture_while(condition, body)
+        wp.capture_launch(capture.graph)
+        return
+    wp.capture_while(condition, body)
 
 
 def items_per_slice(device: wp.DeviceLike) -> int:

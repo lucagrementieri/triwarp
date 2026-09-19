@@ -44,7 +44,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar, require_same_device
+from triwarp._device import read_scalar, require_same_device, run_device_loop
 from triwarp.array import ALLCLOSE_ATOL, ALLCLOSE_RTOL
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
@@ -740,15 +740,8 @@ def polyline_simplify(
                 device=device,
             )
 
-        condition = state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
-        # Graph capture needs a CUDA stream, so the CPU device takes the direct-execution branch
-        # even when the driver supports conditional nodes.
-        if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():
-            with wp.ScopedCapture(device) as capture:
-                wp.capture_while(condition, split_round)
-            wp.capture_launch(capture.graph)
-        else:
-            wp.capture_while(condition, split_round)
+        condition = state[kernel_array.LOOP_CONDITION_VIEW]
+        run_device_loop(device, condition, split_round)
 
     indices = tw.array.flatnonzero(keep_mask)
     return tw.array.gather(polyline, indices), indices
@@ -1131,15 +1124,8 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
             device=device,
         )
 
-    condition = state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
-    # Graph capture needs a CUDA stream, so the CPU device takes the direct-execution branch even
-    # when the driver supports conditional nodes.
-    if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():
-        with wp.ScopedCapture(device) as capture:
-            wp.capture_while(condition, clip_round)
-        wp.capture_launch(capture.graph)
-    else:
-        wp.capture_while(condition, clip_round)
+    condition = state[kernel_array.LOOP_CONDITION_VIEW]
+    run_device_loop(device, condition, clip_round)
 
     count = int(read_scalar(out_count, 0))
     return twt.as_array2d(out_faces[0:count], wp.int32)

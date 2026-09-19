@@ -1352,7 +1352,7 @@ class _BatchedCg:
                 math.sqrt(float(self._dots.numpy()[0].max())),
                 math.sqrt(float(self._atol_sq.numpy().max())),
             )
-        condition = self._state[kernel_array.LOOP_CONDITION : kernel_array.LOOP_CONDITION + 1]
+        condition = self._state[kernel_array.LOOP_CONDITION_VIEW]
         # One iteration per conditional-graph test, not a batched run of them: see the note above
         # ``CG_CHECK_EVERY`` for the sweep that removed the batching.
         with wp.ScopedCapture(self._device) as capture:

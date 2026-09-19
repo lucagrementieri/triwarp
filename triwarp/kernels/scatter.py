@@ -79,6 +79,11 @@ def scatter_valence_from_sorted_edge_keys(
     # *materialized* unique-edge rows. Anything holding those rows has already run a grouping pass,
     # and that pass sorted these very keys -- so the rows were being re-derived to reach a number
     # the sorted buffer already carries, which left the row form with no caller at all.
+    #
+    # The distinction is the *keys*, not the rows: a caller that holds only the rows has nothing to
+    # run this on, and reaches ``count_occurrences`` over the flattened pair buffer instead, which
+    # is what ``graph.edges_to_neighbor_lists`` does. Prefer this one wherever the sorted keys are
+    # still in hand; it reads half as many entries and needs no separate degree buffer pass.
     # ``remesh``'s flip loop is the case that made it visible: its topology rebuild radix-sorts the
     # keys every pass, and recovering valence through ``edges.edges_unique`` grouped the identical
     # corner rows a *third* time, after ``_classify`` and after the rebuild's own sort.

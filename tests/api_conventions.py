@@ -423,13 +423,15 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # argument is not free (see that struct's docstring). So the bundle itself is the written
     # argument here, and ``out_tables`` would misread as write-only -- it is overwhelmingly
     # read-only inputs.
-    # ``scatter_adjacency``'s ``cursor`` is the per-vertex write head the CSR fill hands out with
+    # ``scatter_neighbor_lists``' ``cursor`` is the per-node write head the CSR fill hands out with
     # ``wp.atomic_add``: caller-allocated scratch, zeroed before the launch and meaningless after
-    # it, so ``out_`` would advertise it as the answer. ``bfs_push_level``'s ``state`` is the level
-    # loop's persistent word -- the level to claim and the claim flag -- carried across launches and
-    # both read and written every level, which is the ``forest_link`` case one kernel down.
+    # it, so ``out_`` would advertise it as the answer -- the same role, and the same exemption, as
+    # ``adjacency.scatter_vertex_faces``' argument of that name. ``bfs_push_level``'s ``state`` is
+    # the level loop's persistent word -- the level to claim and the claim flag -- carried across
+    # launches and both read and written every level, which is the ``forest_link`` case one kernel
+    # down.
+    ("graph", "scatter_neighbor_lists"): frozenset({"cursor"}),
     ("homology", "bfs_push_level"): frozenset({"state"}),
-    ("homology", "scatter_adjacency"): frozenset({"cursor"}),
     ("holes", "fill_dp_span"): frozenset({"tables"}),
     ("holes", "fill_dp_span_tiled"): frozenset({"tables"}),
     ("polyline", "orient_ccw"): frozenset({"points2d"}),

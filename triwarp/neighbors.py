@@ -1534,6 +1534,11 @@ def geodesic_ball(
             wp.empty(0, dtype=wp.int32, device=device),
         )
 
+    # ``edges_to_csr``, and **not** the cheaper ``graph.edges_to_neighbor_lists``, whose row order
+    # is not reproducible between runs. The ball is a geometric predicate and would be unaffected,
+    # but the traversal below emits its queue in visit order, so a permuted adjacency row permutes
+    # the output -- and ``curvature.principal_curvature``, which consumes this, amplifies that
+    # through an ill-conditioned quadric fit. Sorted columns are load-bearing here.
     unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
     adjacency = tw.graph.edges_to_csr(n, unique_edges)
     adj_offsets = adjacency.offsets

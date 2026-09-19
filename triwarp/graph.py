@@ -9,8 +9,9 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar, require_same_device
+from triwarp._device import read_scalar, require_same_device, run_device_loop
 from triwarp.array import arange
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
@@ -88,6 +89,120 @@ def edges_to_csr(
     return wps.bsr_from_triplets(
         node_count, node_count, rows, cols, data, prune_numerical_zeros=False
     )
+
+
+def edges_to_neighbor_lists(
+    node_count: int, edges: twt.Array2dInt32, *, validate: bool = True
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Per-node neighbour lists of an undirected edge list, packed as ``(neighbors, offsets)``.
+
+    The same adjacency [`edges_to_csr`][triwarp.graph.edges_to_csr] carries, as two plain
+    ``wp.int32`` buffers instead of a ``warp.sparse.BsrMatrix``: node ``v``'s neighbours are
+    ``neighbors[offsets[v] : offsets[v + 1]]``. Built by counting degrees and filling through a
+    per-node cursor, so there is no sort and no value array — reach for it when a traversal reads
+    the structure alone, and for [`edges_to_csr`][triwarp.graph.edges_to_csr] when the answer needs
+    weights, sorted rows or sparse linear algebra.
+
+    Parameters
+    ----------
+    node_count
+        Number of nodes ``0 .. node_count - 1``, i.e. the number of CSR rows.
+    edges
+        ``(m, 2)`` ``wp.int32`` edge rows on the target device. Each row ``(a, b)`` contributes
+        ``b`` to ``a``'s list and ``a`` to ``b``'s; a repeated row appears twice in both, so
+        deduplicate with [`edges_unique`][triwarp.edges.edges_unique] first when that matters.
+    validate
+        When ``False``, skip the range check on ``edges`` and its host readback. See the warning
+        below. Follows the same convention as
+        [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges].
+
+    Returns
+    -------
+    neighbors : wp.array[wp.int32]
+        Length ``2 * m`` node indices grouped by node. The order within a row is **not specified
+        and not reproducible** — see the warning below.
+    offsets : wp.array[wp.int32]
+        Length ``node_count + 1`` row offsets on ``edges.device``.
+
+    Raises
+    ------
+    TypeError
+        If ``edges`` is not a rank-2 ``int32`` array.
+    ValueError
+        If ``edges`` is not ``(m, 2)``, an endpoint is outside ``[0, node_count)``, or
+        ``node_count`` is negative.
+
+    Warning
+    -------
+    !!! warning "``validate=False`` trades a guard for a synchronization"
+        The range check reduces the whole ``(m, 2)`` edge buffer, so it costs a device
+        synchronization on a path that otherwise has none. Pass ``validate=False`` **only** when
+        the caller produced ``edges`` itself and knows the bound holds. With an out-of-range index
+        the unchecked path writes out of bounds rather than raising: the degree count and the fill
+        both index a ``node_count``-element buffer by the raw endpoint. On a CUDA device that lands
+        in device memory; on the **CPU** device a Warp array is host heap, so it overwrites glibc's
+        allocator metadata and aborts the process later, somewhere unrelated. This is a sharper
+        edge than [`edges_to_csr`][triwarp.graph.edges_to_csr] has, where an out-of-range triplet
+        is dropped silently by ``warp.sparse``.
+
+    Warning
+    -------
+    !!! warning "Row order is not reproducible between runs"
+        Each row's slots are handed out with ``wp.atomic_add``, so the order within a row is
+        thread-arrival order: it is neither sorted nor stable, and two calls on the same input
+        return different permutations. The row *contents* are exact and ``offsets`` is identical
+        every time; only the order inside a row moves.
+
+        A consumer is safe when it reduces over the whole row (a minimum, a sum, a relaxation) or
+        breaks its ties by node or edge index. It is **not** safe when it emits in traversal order,
+        or when it feeds an ill-conditioned fit that a permutation can perturb — use
+        [`edges_to_csr`][triwarp.graph.edges_to_csr], whose rows are sorted and stable, as
+        [`neighbors.geodesic_ball`][triwarp.neighbors.geodesic_ball] does.
+
+    Notes
+    -----
+    **Rows are unsorted, and that is the whole reason this exists beside
+    [`edges_to_csr`][triwarp.graph.edges_to_csr].** Going through ``bsr_from_triplets`` radix-sorts
+    ``2 * m`` triplets and carries a ``float32`` value array a structure-only traversal never
+    reads; counting and filling does neither.
+
+    See Also
+    --------
+    [`edges_to_csr`][triwarp.graph.edges_to_csr]
+    [`triwarp.adjacency.vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency]
+        The same counting-sort fill for the vertex-to-face relation.
+    ``igl.adjacency_list``
+    """
+    node_count = _validate_edge_list(edges, node_count, validate=validate)
+    device = edges.device
+    m = int(edges.shape[0])
+
+    offsets = wp.zeros(node_count + 1, dtype=wp.int32, device=device)
+    neighbors = wp.empty(2 * m, dtype=wp.int32, device=device)
+    if m == 0 or node_count == 0:
+        return neighbors, offsets
+
+    # An ``(m, 2)`` edge buffer flattened *is* the entry -> node map, so one histogram over it is
+    # every node's degree. ``count_occurrences``' own docstring names this as what it is for.
+    degree = wp.zeros(node_count, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_scatter.count_occurrences, dim=2 * m, inputs=[edges.flatten(), degree], device=device
+    )
+    # Deliberately NOT tw.array.counts_to_offsets: that helper always reads the total back, and
+    # this function never needs it (it is 2 * m, known on the host). The same decline
+    # ``adjacency.vertex_face_adjacency`` and ``halfedge.vertex_one_rings`` already write down.
+    wp.utils.array_scan(degree, out_array=offsets[1:], inclusive=True)
+    # ``degree`` has done its job and becomes the fill's write cursor, which saves an allocation
+    # and is why the scatter takes both it and ``offsets``.
+    degree.zero_()
+    wp.launch(
+        kernel_graph.scatter_neighbor_lists,
+        dim=m,
+        inputs=[edges, offsets, degree, neighbors],
+        device=device,
+    )
+    return neighbors, offsets
 
 
 def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[wp.int32]:
@@ -650,29 +765,32 @@ def shortest_path_envelope(
 
     max_pass_count = max_iterations or node_count
     relaxed = wp.empty(node_count, dtype=wp.float32, device=device)
-    changed = wp.zeros(1, dtype=wp.int32, device=device)
+    # The shared round-loop state word (``kernels/array.py``): the relaxation pass raises
+    # ``LOOP_PROGRESS`` and ``array.loop_advance`` publishes the condition against the pass cap.
+    state = wp.zeros(kernel_array.LOOP_ADVANCE_STATE_SIZE, dtype=wp.int32, device=device)
 
     if not device.is_cuda:
         # No conditional-graph capture on the CPU backend, so the pass loop runs on the host;
         # the plain per-pass loop below, with its one 4-byte readback per pass, is already the
         # cheapest thing a CPU launch can do here.
+        progress = state[kernel_array.LOOP_PROGRESS : kernel_array.LOOP_PROGRESS + 1]
         for _ in range(max_pass_count):
-            changed.zero_()
+            progress.zero_()
             wp.launch(
                 kernel_graph.shortest_path_envelope_pass,
                 dim=node_count,
-                inputs=[offsets, columns, weights, labels, relaxed, changed],
+                inputs=[offsets, columns, weights, labels, relaxed, state],
                 device=device,
             )
             labels, relaxed = relaxed, labels
-            if int(read_scalar(changed, 0)) == 0:
+            if int(read_scalar(progress, 0)) == 0:
                 break
         return labels
 
     # CUDA: the whole pass loop runs on-device via ``wp.capture_while``, so the
     # only host sync in the common case is none at all -- each pass's convergence check and
-    # iteration cap are folded into ``envelope_advance_and_check``, which runs after the relax
-    # kernel and the label copy below.
+    # iteration cap are folded into ``array.loop_advance``, the package's shared round-closing
+    # kernel, which runs after the relax kernel and the label copy below.
     #
     # Buffer *swapping* (the CPU path's ``labels, relaxed = relaxed, labels``) cannot be captured:
     # a conditional graph replays the exact pointers its body recorded the one time it was traced,
@@ -680,8 +798,13 @@ def shortest_path_envelope(
     # replayed pass would keep reading and writing the same two buffers in the same direction.
     # ``wp.copy`` moves this pass's answer into ``labels`` in place instead, which is itself just a
     # device memcpy and captures fine (no allocation, no host sync, unlike ``wp.utils.array_scan``).
-    counter = wp.zeros(1, dtype=wp.int32, device=device)
-    condition = wp.ones(1, dtype=wp.int32, device=device)
+    #
+    # Unrolling two passes per round into each other's buffer would remove that copy and is **not
+    # portable** -- a ``wp.capture_while`` body is not guaranteed to replay as an indivisible unit
+    # across devices, so a loop whose result buffer depends on it cannot rely on it. The numbers and
+    # the ping-pong corollary are at ``kernels/graph.shortest_path_envelope_pass``.
+    # ``wp.capture_while`` reads the condition before the first round, so it starts non-zero.
+    state.assign([0, 1, 0])
     max_pass_count_i32 = wp.int32(max_pass_count)
 
     def envelope_pass_body() -> None:
@@ -699,23 +822,15 @@ def shortest_path_envelope(
         wp.launch(
             kernel_graph.shortest_path_envelope_pass,
             dim=node_count,
-            inputs=[offsets, columns, weights, labels, relaxed, changed],
+            inputs=[offsets, columns, weights, labels, relaxed, state],
             device=device,
         )
         wp.copy(labels, relaxed)
         wp.launch(
-            kernel_graph.envelope_advance_and_check,
-            dim=1,
-            inputs=[max_pass_count_i32, wp.int32(1), changed, counter, condition],
-            device=device,
+            kernel_array.loop_advance, dim=1, inputs=[max_pass_count_i32, state], device=device
         )
 
-    if wp.is_conditional_graph_supported():
-        with wp.ScopedCapture(device) as capture:
-            wp.capture_while(condition, envelope_pass_body)
-        wp.capture_launch(capture.graph)
-    else:
-        wp.capture_while(condition, envelope_pass_body)
+    run_device_loop(device, state[kernel_array.LOOP_CONDITION_VIEW], envelope_pass_body)
     return labels
 
 

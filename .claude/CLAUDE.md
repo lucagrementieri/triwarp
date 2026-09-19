@@ -3901,6 +3901,34 @@ at their sites in `triwarp/array.py`. **The NumPy crossover is a segment SIZE (~
 not move with the segment count** — a useful rule of thumb when deciding whether to route a packing
 call through NumPy or Warp.
 
+**Warp-typed arithmetic at Python scope costs ~36 µs a time, and the tree was paying it in every
+captured round loop.** Indexing a `wp.array` with the `wp.int32` constants from
+`kernels/array.py`'s slot table — `state[LOOP_CONDITION : LOOP_CONDITION + 1]`, the spelling every
+`wp.capture_while` driver used — routes the bound arithmetic through Warp's Python-scope builtin
+dispatch, which runs `inspect.signature().bind()` per operand. Measured on an RTX 5090, Warp 1.17,
+20 000 slices between two syncs, min of 7:
+
+| spelling | cost |
+|---|---|
+| `state[LOOP_CONDITION : LOOP_CONDITION + 1]` | **38.98 µs** |
+| `state[1:2]` | **3.22 µs** |
+| `LOOP_CONDITION + 1` alone (`wp.int32` arithmetic) | 10.09 µs |
+| `int(LOOP_CONDITION) + 1` | 0.073 µs |
+
+Fixed by `kernels/array.LOOP_CONDITION_VIEW`, a plain `slice` **derived** from the constant so the
+two cannot drift, at all seven sites (`polyline` ×2, `remesh`, `linalg`, `graph`, `homology` ×2).
+It was worth 36 µs per loop driven — `homology_generators` drives two — and it is the reason a
+`wp.constant` is safe to *read* in kernel scope and expensive to *compute with* on the host. §12.6
+already records that a typed constant is unusable in host arithmetic (`//` raises); this is the
+other half, where it works and is slow. **Before doing arithmetic on a `wp.constant` at Python
+scope, wrap it in `int()` or derive a plain value once at import.**
+
+Two more rows from the same round, both flat and both worth not re-deriving: `state.assign([0, 1,
+0])` is **10.18 µs** against **30.29 µs** for the three separate `wp.zeros(1)` / `wp.ones(1)`
+buffers it replaced, so packing a loop's state into one word is a saving as well as a convention;
+and a `wp.array` *view* (a slice or a `flatten()`) costs ~3 µs to construct, which is why a seed
+launch should take one row view rather than a flattened prefix of it.
+
 **The general lesson, and it is worth more than the row: a "Warp has no X" comment is a claim to
 probe, not a fact to inherit.** This one had stood through several optimization rounds and was
 quoted as settled. The probe that refuted it is fifteen lines (§10 says the same thing about
@@ -4039,6 +4067,22 @@ two-stage reduction, not a single accumulator.
    the fold happens to be idempotent for those, and wrong only for `sum`. Fixed by exporting the
    block-count helper for callers to reuse. **`grep` for direct launches of a kernel before changing
    its per-block contract.**
+
+**A fused fold's tuning variable is the fold width, and a kernel that *also* writes per element
+must keep its per-element dimension in the grid.** Folding a counting reduction into a kernel that
+already computes the same predicate is free arithmetic — but launching it at the reduce module's
+`blocks_1d` grain is not, because `ITEMS_PER_BLOCK_1D` is 1 024, so each block owns 1 024 elements
+and the grid collapses. Measured on `homology.dual_candidate_mask`, which writes one `wp.bool` per
+edge *and* folds the interior-edge count: at 140 964 edges the wide fold is **137 blocks — under
+one per SM on a 170-SM device** — against 2 188 blocks at one tile per block. The narrow form
+launches `dim = ceil(n / TILE_1D)` with `tile_chunk(n, chunk, TILE_1D)`, which keeps one element
+per lane and still commits one atomic per block, the shape §13.2 asks for. Whole-call effect of
+getting it wrong: 0.92-0.95x, recovered to parity by the one-token change of the fold width.
+
+This is §2.3's occupancy rule reaching a kernel that is *not* a block-per-item candidate: the test
+is not "does this kernel have an outer dimension" but "does anything other than the reduction need
+one thread per element". A pure reduction takes the wide fold; a reduction fused onto a map does
+not.
 
 **Two more shape facts:** `wp.tile(vec3)` decomposes to a scalar tile, so tile-reduce a vec3 per
 component or pack it; and `wp.array.view(wp.float32)` on a vec3 array gives a zero-copy `(n, 3)` view
@@ -5719,6 +5763,26 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   that row falls back to an exact O(n) linear scan, and how much of the cloud falls in that tail
   scales with n — so `backend="bvh"` is the workaround at moderate k on a uniform cloud, the opposite
   of what the earlier reading implied.
+- **REFUTED — `neighbors.geodesic_ball` cannot take `graph.edges_to_neighbor_lists`, and the
+  reason is reproducibility, not correctness of the ball.** The cheap CSR builder was measured at
+  **1.19-1.27x** on this call and reverted: it hands out each row's slots with `wp.atomic_add`, so
+  the order within a row is thread-arrival order and differs **run to run** — measured **11 of 11
+  repeats differing** on a 2 562-vertex icosphere against **0 of 5** for `edges_to_csr`. The ball
+  is a geometric predicate and is unaffected, and `geodesic_ball_reference_neighbors` takes the
+  minimum over the whole row so it is unaffected too; what breaks is that `per_source_bfs_collect`
+  emits `queue[:count]` in *visit* order, so a permuted row permutes the output, and
+  `curvature.principal_curvature`'s ill-conditioned quadric fit amplifies that — the same
+  mechanism its own `test_principal_curvature_is_reproducible` records at up to 77 % relative from
+  one ULP. **The full suite caught it; no targeted run did**, which is the argument for running the
+  whole suite before believing a reuse.
+- **A tie that is exact in float32 is not a tie in the oracle's float64, and an exact set compare
+  then pins the adjacency's column order rather than the answer.** On `half_torus` vertex 384,
+  candidates 387 and 413 sit 2.2e-16 apart in float64 and are **bit-identical in float32**, both
+  outside the radius, so exactly one is backfilled to `min_count` and no correct tie-break exists
+  at the precision the device works in. `test_geodesic_ball_neighborhoods` was passing on a
+  coincidence of sorted columns. It now splits the claim — the in-ball set exactly, the backfill up
+  to the multiset of float32 distances at `atol=0` — and two size-preserving mutations fail on the
+  *in-ball* assert, not merely on the size.
 - **`k`, not `n`, is what's still slow in the k-NN path** — insertion cost is super-linear in k
   because the candidate row lives in global memory and both the shift-insert and the reset touch it
   in full on every deepening attempt. This is what `points.statistical_outlier_mask` and
@@ -6318,3 +6382,52 @@ because large meshes win 10-260x (`n_vertices` on `lucy` 259x).
 **A third independent implementation is what makes an outlier legible**; trimesh alone is slow enough
 everywhere that a 3x triwarp regression still looks like a win against it. That is the argument for
 carrying nine references.
+
+### 16.11 The homology de-duplication pass, and what a shared convention costs
+
+`homology_generators`' fusion round (§16.9's `homology_generators` entry) left twelve kernels in
+`kernels/homology.py`, several of which were a second spelling of something the package already
+had. Swept against the shared libraries and resolved; **output byte-identical throughout — 286
+arrays across five meshes and both devices, gated after every step**, which is available as a gate
+precisely because both of the algorithm's tie-breaks are by index (`wp.atomic_min` on the parent,
+lowest edge index in the forest) and so cannot see a row permutation.
+
+What was reused rather than kept:
+
+- **`bfs_seed` was `scatter.scatter_index` at `dim=1`** — `out[index[0]] = 0` with
+  `unique_edges[0]` as the index. Deleted.
+- **The degree half of `vertex_degrees_and_interior_count` was `scatter.count_occurrences`** over
+  the flattened `(m, 2)` rows. That kernel's own docstring names the use case, and
+  `kernels/scatter.py` records that a *row* form of it was once retired for having no caller — this
+  is the caller, through the promoted CSR builder.
+- **Two bespoke loop-state slot tables became the shared `LOOP_ROUND` / `LOOP_CONDITION`**, with the
+  extra slot **appended** as `kernels/remesh.py` already did, and three `dim=1` advance kernels
+  (homology's two and `graph.envelope_advance_and_check`) became one `array.loop_advance`.
+- **The private unsorted-CSR builder became `graph.edges_to_neighbor_lists`**, beside
+  `edges_to_csr`.
+- **`_run_device_loop` became `_device.run_device_loop`**, converting the three verbatim copies at
+  `polyline` ×2 and `graph`, whose fallback it also had wrong (a hand-rolled `while` testing after
+  the body, where `wp.capture_while` tests before).
+
+**Cost, measured interleaved against a detached worktree, min-of-mins over 20 alternating process
+pairs:** `homology_generators` **0.981-0.987x**, `shortest_path_envelope` **1.008-1.028x**,
+everything else unchanged. Accepted deliberately. The 1.4 % is attributed, not residual:
+`array.loop_advance` is ~0.23 µs/round dearer than the three-statement kernel it replaced (~0.7 %
+of the call — the number is at that kernel), moving the interior-edge count ahead of the guard
+readback costs the mask kernel's overlap with the host's graph recording (~0.7 %), and the CSR
+region plus the two reshaped kernels are **+6 µs of a 3 100 µs call (0.2 %)**. Launches, device
+allocations (37) and readbacks are equal to the baseline and the launch-argument count is one
+lower.
+
+**Two method notes, both of which cost a round to learn:**
+
+- **A whole-call A/B cannot resolve a region worth 0.2 % of the call, and read the sign backwards
+  twice.** §15.2's pessimistic direction. The verdicts that held came from the deterministic
+  counts, from timing the changed kernels alone (15.1 → 16.1 µs and 13.64 → 15.0 µs at m = 140 964)
+  and from timing the captured loop alone (1 252-1 265 → 1 286-1 295 µs over three process pairs).
+  A cProfile `context.py:allocate` delta of **+33 per call** was an artifact of aggregating two
+  same-named functions; instrumenting `CudaMempoolAllocator.allocate` directly gave **37.0 per call
+  in both arms**.
+- **A row in the A/B that the change does not touch is the control that licenses the rest.** Once
+  `geodesic_ball` was reverted its row read 0.998-1.006x, which is what established that the
+  harness *could* resolve parity and that homology's 0.98 was therefore real rather than drift.

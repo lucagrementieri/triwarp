@@ -9,7 +9,7 @@ from triwarp.constants import INT32_MAX_CONSTANT
 # ``dim=1`` kernel updates at the end of each round, so ``wp.capture_while`` can drive the rounds
 # with no host readback. Slot 0 counts rounds -- read against a cap, which is what bounds a loop
 # whose progress test could otherwise stall -- and slot 1 is the condition; the wrapper hands
-# ``wp.capture_while`` the view ``state[LOOP_CONDITION : LOOP_CONDITION + 1]``.
+# ``wp.capture_while`` the view ``state[LOOP_CONDITION_VIEW]``.
 #
 # The condition is written by a **plain store**, never an atomic: it is one address taking one
 # value, so there is nothing to serialize even where every thread of a wide launch may write it
@@ -18,16 +18,75 @@ from triwarp.constants import INT32_MAX_CONSTANT
 # zero rounds. Seed it with ``wp.array([0, 1])`` / ``assign([0, 1])``, or from the same ``dim=1``
 # kernel that resets the rest of the pass (``remesh.reset_collapse_rounds``).
 #
-# Four loops share this: the level-synchronous Ramer-Douglas-Peucker and the ear-clipping rounds in
-# ``kernels/polyline.py``, the conjugate gradient's iteration test, and ``kernels/remesh.py``'s
-# collapse rounds -- which needs a third slot for the previous round's commit count and **appends**
-# it, so the shared two keep their numbers. ``kernels/algorithms/bfs.py`` deliberately does not:
-# its seven slots are a frontier window (``start``, ``tail``) rather than a round counter, so slot 0
-# does not mean the same thing and renumbering it would buy a coincidence of indices, not a shared
-# convention.
+# Six loops share this, in two shapes. **Arm-at-the-front**: a round's first kernel clears the
+# condition and a later one raises it, so two slots are enough -- the level-synchronous
+# Ramer-Douglas-Peucker and the ear-clipping rounds in ``kernels/polyline.py``, the conjugate
+# gradient's iteration test, and ``kernels/remesh.py``'s collapse rounds, which needs a third slot
+# for the previous round's commit count and **appends** it so the shared two keep their numbers.
+# **Publish-at-the-back**: the round raises ``LOOP_PROGRESS`` and a closing ``loop_advance`` turns
+# it into the condition, which is what a loop with a *round cap* needs, since the cap is only known
+# once the round index has been stepped -- ``graph.shortest_path_envelope``'s relaxation passes and
+# both of ``kernels/homology.py``'s (the breadth-first level loop and the Boruvka forest rounds).
+# ``kernels/algorithms/bfs.py`` deliberately shares neither: its seven slots are a frontier window
+# (``start``, ``tail``) rather than a round counter, so slot 0 does not mean the same thing and
+# renumbering it would buy a coincidence of indices, not a shared convention.
+#
+# The condition is written by a **plain store**, never an atomic: it is one address taking one
+# value, so there is nothing to serialize even where every thread of a wide launch may write it
+# (``polyline.rdp_split_spans``, ``homology.forest_link``).
 LOOP_ROUND = wp.constant(wp.int32(0))
 LOOP_CONDITION = wp.constant(wp.int32(1))
 LOOP_STATE_SIZE = 2
+# Appended by the publish-at-the-back shape, so the shared two keep their numbers.
+LOOP_PROGRESS = wp.constant(wp.int32(2))
+LOOP_ADVANCE_STATE_SIZE = 3
+
+# The length-1 condition view ``wp.capture_while`` polls, as a **plain** slice, and it is a
+# measured cost rather than a tidiness: slicing a ``wp.array`` with the ``wp.int32`` constants
+# above (``state[LOOP_CONDITION : LOOP_CONDITION + 1]``) routes the bound arithmetic through Warp's
+# Python-scope builtin dispatch, which runs ``inspect.signature().bind()`` per operand -- measured
+# **38.98 us against 3.22** for the identical view taken with plain ints (RTX 5090, Warp 1.17,
+# 20 000 slices between two syncs, min of 7). Every round loop in the package took one or two of
+# these per call. Derived from the constant rather than written out, so the two cannot drift.
+LOOP_CONDITION_VIEW = slice(int(LOOP_CONDITION), int(LOOP_CONDITION) + 1)
+
+
+@wp.kernel
+def loop_advance(max_rounds: wp.int32, out_state: wp.array[wp.int32]) -> None:
+    # dim=1. Close a device-side round: step the round index, publish whether another round should
+    # run, and re-arm the progress flag for the next one. Host-side bookkeeping moved onto the
+    # device so the whole loop is one ``wp.capture_while`` graph with no per-round readback.
+    #
+    # The progress flag has to be *cleared here* rather than by the round's own first kernel,
+    # because ``wp.capture_while`` reads the condition after the body -- so a round's claim and the
+    # test of that claim must sit in the same body, which is what makes this the closing kernel and
+    # not the opening one. Seed ``LOOP_CONDITION`` non-zero, since the condition is read before the
+    # first round as well.
+    #
+    # ``max_rounds`` bounds a loop whose progress test is already a sound termination argument on
+    # its own; it is cheap insurance, because a captured loop that fails that argument hangs the
+    # device rather than returning a wrong answer.
+    #
+    # **This is not free, and the number is the price of the merge.** It replaced three bespoke
+    # ``dim=1`` advance kernels -- homology's two and one in ``kernels/graph.py``, all now gone --
+    # and it
+    # runs inside the *replayed* body of every captured round loop -- so its one extra compare and
+    # select over the three-statement form each of those had costs **~0.23 us per round**. On
+    # ``homology_generators``' 140-level primal tree that is 1 252-1 265 us against 1 286-1 295
+    # (2.6 % of the loop, ~1 % of the whole call), measured over three process pairs on an RTX 5090,
+    # Warp 1.17. Carrying the stepped round index in a local rather than re-reading
+    # ``out_state[LOOP_ROUND]`` for the cap test was tried and measured flat, so the plainer
+    # spelling stays; nvcc forwards the store. The merge was taken with that cost known -- three
+    # near-identical bookkeeping kernels drifting apart is the more expensive failure -- but a
+    # caller adding a *hot* round loop should price this against a bespoke advance first.
+    #
+    # Carrying the stepped round index in a local instead of re-reading ``out_state[LOOP_ROUND]``
+    # for the cap test was tried and measured **flat** (1283 against 1287 us on a 140-level
+    # captured loop), so the plainer spelling stays.
+    out_state[LOOP_ROUND] = out_state[LOOP_ROUND] + 1
+    keep_going = out_state[LOOP_PROGRESS] != 0 and out_state[LOOP_ROUND] < max_rounds
+    out_state[LOOP_CONDITION] = wp.where(keep_going, wp.int32(1), wp.int32(0))
+    out_state[LOOP_PROGRESS] = 0
 
 
 @wp.func
