@@ -420,7 +420,11 @@ def successor_cycles(
     m = int(edges.shape[0])
     if m == 0 or node_count == 0:
         # Three *distinct* empty allocations, so callers may write into them independently.
-        return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
 
     next_node = wp.full(node_count, -1, dtype=wp.int32, device=device)
     wp.launch(kernel_graph.scatter_successor, dim=m, inputs=[edges, next_node], device=device)
@@ -472,7 +476,11 @@ def successor_cycles(
     cycle_nodes = tw.array.gather(cycle_nodes, tw.array.flatnonzero(keep_mask))
     n_nodes = int(cycle_nodes.shape[0])
     if n_nodes == 0:
-        return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
 
     # Pointer-jumping list ranking (Wyllie): O(log L) rounds of pointer doubling replace the
     # per-node successor walk, whose total work was quadratic in the cycle length.

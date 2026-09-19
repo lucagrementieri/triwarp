@@ -39,6 +39,7 @@ live in [`triwarp.laplacian`][triwarp.laplacian], tangent frames in
 from __future__ import annotations
 
 import itertools
+from typing import cast
 
 import numpy as np
 import warp as wp
@@ -245,17 +246,21 @@ def heat_operators(
 
     # Heat system (M - t L). ``bsr_axpy`` overwrites the mass matrix in place (no longer needed).
     mass_diag = wps.bsr_diag(diag=mass)
-    heat_system = wps.bsr_axpy(x=laplacian, y=mass_diag, alpha=-float(t), beta=1.0)
+    heat_system = cast(
+        "wps.BsrMatrix[wp.float64]",
+        wps.bsr_axpy(x=laplacian, y=mass_diag, alpha=-float(t), beta=1.0),
+    )
     # Poisson operator ``-L`` and the two Jacobi preconditioners: mesh-only, so they belong here
     # rather than in every solve. See Notes.
-    poisson_system = wps.bsr_axpy(x=laplacian, alpha=-1.0)
+    poisson_system = cast("wps.BsrMatrix[wp.float64]", wps.bsr_axpy(x=laplacian, alpha=-1.0))
     return (
         heat_system,
         wpl.preconditioner(heat_system, "diag"),
         laplacian,
         poisson_system,
         wpl.preconditioner(poisson_system, "diag"),
-        cot_entries,
+        # Narrowed to float32 by the block above, whichever precision it arrived in.
+        cast(twt.Array2dFloat32, cot_entries),
         normals,
         areas,
     )
@@ -670,7 +675,7 @@ _RESOLVED_FRACTION = 1e-7
 
 
 VectorHeatOperators = tuple[
-    wps.BsrMatrix[wp.float64],
+    wps.BsrMatrix[wp.mat22d],
     HeatOperators,
     tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]],
     wpl.LinearOperator,
@@ -775,8 +780,9 @@ def vector_heat_operators(
     mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
     mass_blocks = wp.empty(n_vertices, dtype=wp.mat22d, device=device)
     wp.map(kernel_heat.block_mass, mass, out=mass_blocks)
-    vector_system = wps.bsr_axpy(
-        x=connection, y=wps.bsr_diag(diag=mass_blocks), alpha=float(t), beta=1.0
+    vector_system = cast(
+        "wps.BsrMatrix[wp.mat22d]",
+        wps.bsr_axpy(x=connection, y=wps.bsr_diag(diag=mass_blocks), alpha=float(t), beta=1.0),
     )
     if scalar_operators is None:
         scalar_operators = heat_operators(vertices, faces, t)

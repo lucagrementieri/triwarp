@@ -51,10 +51,38 @@ def test_dtype_min() -> None:
         assert np.isneginf(twt.dtype_min(wp_dt))
 
 
-def test_empty_2d_shape(device: str) -> None:
-    arr: twt.Array2dInt32 = twt.empty_2d((0, 2), wp.int32, device=device)
-    assert arr.shape == (0, 2)
-    assert arr.ndim == 2
+_ALLOCATOR_DTYPES = [wp.int32, wp.float32, wp.float64, wp.bool, wp.vec3, wp.mat33]
+
+
+@pytest.mark.parametrize("dtype_wp", _ALLOCATOR_DTYPES)
+@pytest.mark.parametrize("shape", [(5,), (0,), (3, 4), (0, 2), (2, 3, 4)])
+def test_the_empty_family_is_one_allocator_at_three_ranks(
+    device: str, shape: tuple[int, ...], dtype_wp: type
+) -> None:
+    """
+    Not a library comparison: no reference exposes a rank-fixing allocator.
+
+    The three entry points differ only in the rank they fix, so every dtype must work at every
+    rank -- they used to admit three different dtype sets (1d int32/float32/float64, 2d plus
+    ``vec3``, 3d only float32/bool), which was an artifact of hand-written overload tables rather
+    than a real restriction. Parametrizing one test over the cross product is what keeps them from
+    drifting apart again. Excludes: nothing about the *contents*, which are deliberately
+    uninitialized.
+    """
+    allocate = {1: twt.empty_1d, 2: twt.empty_2d, 3: twt.empty_3d}[len(shape)]
+    arr = allocate(shape[0] if len(shape) == 1 else shape, dtype_wp, device=device)
+    assert arr.shape == shape
+    assert arr.ndim == len(shape)
+    assert arr.dtype == dtype_wp
+    assert str(arr.device) == device
+
+
+def test_the_empty_family_rejects_a_shape_of_the_wrong_rank(device: str) -> None:
+    """The rank each entry point fixes is checked against ``shape``, not merely annotated."""
+    with pytest.raises(ValueError, match="2D shape must have length 2"):
+        twt.empty_2d((2, 3, 4), wp.int32, device=device)
+    with pytest.raises(ValueError, match="3D shape must have length 3"):
+        twt.empty_3d((2, 3), wp.int32, device=device)
 
 
 def test_dtype_zero_splits_int_and_float_like_python(device: str) -> None:

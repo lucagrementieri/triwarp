@@ -328,13 +328,16 @@ typeCheckingMode = "standard"
 venv = ".venv"
 venvPath = "."
 
-# Warp's Python-scope stubs are weak: wp.empty(dtype=wp.float32) is typed as returning
-# array[float] whatever dtype it was handed; the twt.Array2d* aliases
-# (wp.array[dtype, Literal[2]]) are not assignable to Warp's array[Unknown, int];
+# Warp's Python-scope stubs are weak: wp.empty returns a bare warp.array, i.e.
+# array[Unknown, int], whatever dtype and rank it was handed; array's NDim parameter is
+# invariant, so the twt.Array2d* aliases (wp.array[dtype, Literal[2]]) and Warp's own
+# array[Unknown, int] are not assignable to one another in either direction;
+# wp.array.__getitem__ carries no annotations, so every slice infers as
+# "indexedarray | array"; warp.sparse's bsr_* builders return BsrMatrix[BlockType[...]];
 # BsrMatrix.offsets/.columns/.values exist at runtime but not in the stub; vec_t's
 # __getitem__ is typed as returning "_wp_scalar_type_ | vec_t" rather than a scalar; and
 # wp.array.numpy() carries no return annotation at all. So the type-flow rules that touch a
-# Warp array fire almost entirely on false positives, and the five expensive ones below stay
+# Warp array fire almost entirely on false positives, and the four expensive ones below stay
 # off so the residual diagnostics are actionable rather than drowned out.
 #
 # Each "none" carries the error count it is actually buying, measured by re-enabling it alone
@@ -346,14 +349,12 @@ venvPath = "."
 #   reportAttributeAccessIssue  127   BsrMatrix.offsets/.columns/.values/.nrow, absent from the
 #                                     stub. graph.py annotates its own sites inline.
 #   reportCallIssue              85   same dtype-blindness reaching overloaded triwarp callees.
-#   reportReturnType             63   a wrapper returning a buffer it allocated with wp.empty.
 #   reportOperatorIssue          23   vec_t.__getitem__'s union under arithmetic (18 sites), and
 #                                     reduce.sum's dtype-blind input widening its return (4).
 reportArgumentType = "none"
 reportAttributeAccessIssue = "none"
 reportCallIssue = "none"
 reportOperatorIssue = "none"
-reportReturnType = "none"
 
 reportMissingTypeArgument = "error"
 reportMissingTypeStubs = "error"

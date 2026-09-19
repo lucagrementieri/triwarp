@@ -32,6 +32,8 @@ arriving from libigl, where ``cotmatrix`` and ``crouzeix_raviart_cotmatrix`` sit
 
 from __future__ import annotations
 
+from typing import cast, overload
+
 import warp as wp
 import warp.sparse as wps
 
@@ -133,6 +135,14 @@ def face_gradients(
     return gradients
 
 
+@overload
+def cotmatrix_entries(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type[wp.float32] = wp.float32
+) -> twt.Array2dFloat32: ...
+@overload
+def cotmatrix_entries(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type[wp.float64]
+) -> twt.Array2dFloat64: ...
 def cotmatrix_entries(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float32
 ) -> twt.Array2dFloat:
@@ -188,6 +198,14 @@ def cotmatrix_entries(
     return twt.as_array2d(out_cot, dtype)
 
 
+@overload
+def cotmatrix_entries_intrinsic(
+    edge_lengths: twt.Array2dFloat32, dtype: type[wp.float32] = wp.float32
+) -> twt.Array2dFloat32: ...
+@overload
+def cotmatrix_entries_intrinsic(
+    edge_lengths: twt.Array2dFloat32, dtype: type[wp.float64]
+) -> twt.Array2dFloat64: ...
 def cotmatrix_entries_intrinsic(
     edge_lengths: twt.Array2dFloat32, dtype: type = wp.float32
 ) -> twt.Array2dFloat:
@@ -237,12 +255,34 @@ def cotmatrix_entries_intrinsic(
     return twt.as_array2d(out_cot, dtype)
 
 
+@overload
+def cotmatrix(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    cot_entries: twt.Array2dFloat | None = None,
+    dtype: type[wp.float32] = wp.float32,
+) -> wps.BsrMatrix[wp.float32]: ...
+@overload
+def cotmatrix(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    cot_entries: twt.Array2dFloat | None,
+    dtype: type[wp.float64],
+) -> wps.BsrMatrix[wp.float64]: ...
+@overload
+def cotmatrix(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    cot_entries: twt.Array2dFloat | None = None,
+    *,
+    dtype: type[wp.float64],
+) -> wps.BsrMatrix[wp.float64]: ...
 def cotmatrix(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     cot_entries: twt.Array2dFloat | None = None,
     dtype: type = wp.float32,
-) -> wps.BsrMatrix[wp.float32]:
+) -> wps.BsrMatrix[wp.float32] | wps.BsrMatrix[wp.float64]:
     """
     Cotangent stiffness matrix of the mesh: the discrete Laplace-Beltrami operator.
 
@@ -853,16 +893,35 @@ def graph_laplacian(
     degree = wp.empty(n_vertices, dtype=dtype, device=device)
     ones = wp.ones(n_vertices, dtype=dtype, device=device)
     wps.bsr_mv(adjacency, ones, degree, alpha=1.0, beta=0.0)
-    return wps.bsr_axpy(x=adjacency, y=wps.bsr_diag(diag=degree), alpha=1.0, beta=-1.0)
+    return cast(
+        "wps.BsrMatrix[wp.float32]",
+        wps.bsr_axpy(x=adjacency, y=wps.bsr_diag(diag=degree), alpha=1.0, beta=-1.0),
+    )
 
 
+@overload
+def mass_matrix_entries(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    dtype: type[wp.float32] = wp.float32,
+    *,
+    face_areas: wp.array[wp.float32] | None = None,
+) -> wp.array[wp.float32]: ...
+@overload
+def mass_matrix_entries(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    dtype: type[wp.float64],
+    *,
+    face_areas: wp.array[wp.float32] | None = None,
+) -> wp.array[wp.float64]: ...
 def mass_matrix_entries(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     dtype: type = wp.float32,
     *,
     face_areas: wp.array[wp.float32] | None = None,
-) -> twt.Array1dFloat:
+) -> wp.array[wp.float32] | wp.array[wp.float64]:
     """
     Per-vertex barycentric lumped mass: a third of each incident triangle's area.
 
@@ -890,7 +949,7 @@ def mass_matrix_entries(
 
     Returns
     -------
-    twt.Array1dFloat
+    wp.array[wp.float32] | wp.array[wp.float64]
         Length-``n_vertices`` diagonal on ``vertices.device``.
 
     Raises
@@ -979,6 +1038,7 @@ def mass_matrix(
     Matches ``igl::massmatrix`` under ``MASSMATRIX_TYPE_BARYCENTRIC``.
     """
     require_same_device(vertices=vertices, faces=faces, face_areas=face_areas)
-    return wps.bsr_diag(
-        diag=mass_matrix_entries(vertices, faces, dtype=dtype, face_areas=face_areas)
+    return cast(
+        "wps.BsrMatrix[wp.float32]",
+        wps.bsr_diag(diag=mass_matrix_entries(vertices, faces, dtype=dtype, face_areas=face_areas)),
     )

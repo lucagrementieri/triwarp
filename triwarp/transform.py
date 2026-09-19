@@ -40,6 +40,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from enum import StrEnum
+from typing import cast
 
 import numpy as np
 import warp as wp
@@ -718,7 +719,7 @@ def as_mat44(matrix: wp.mat44 | wp.array[wp.mat44]) -> wp.mat44:
         raise ValueError(
             f"as_mat44 requires a length-1 wp.array[wp.mat44], got shape {tuple(matrix.shape)}"
         )
-    return matrix.list()[0]
+    return cast(wp.mat44, matrix.list()[0])
 
 
 def matrix_to_numpy(matrix: wp.mat44 | wp.array[wp.mat44]) -> np.ndarray:

@@ -349,10 +349,10 @@ def remap_discrete_attribute_from_uv(
     sampled = remap_attribute_from_uv(uv, float_image, order=0)
 
     n_vertices = int(uv.shape[0])
-    out_labels = wp.empty(n_vertices, dtype=wp.int32, device=device)
+    out_labels = twt.empty_1d(n_vertices, wp.int32, device=device)
     # ``sampled`` is ``(n_vertices, 1)`` and contiguous, so ``flatten()`` is a reshape view.
     wp.map(kernel_texture.round_labels, sampled.flatten(), out=out_labels)
-    return cast(twt.Array1dInt32, out_labels)
+    return out_labels
 
 
 def _check_uv_in_range(uv: wp.array[wp.vec2]) -> None:

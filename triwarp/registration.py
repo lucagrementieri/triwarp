@@ -278,8 +278,8 @@ def icp(
     # the Procrustes workspace — the fit is latency-bound, so its ~10 per-call allocations would
     # otherwise dominate an iteration that is already down to a handful of launches.
     closest = wp.empty(n, dtype=wp.vec3, device=device)
-    distance_mesh = wp.empty(n, dtype=wp.float32, device=device)
-    triangle_id_mesh = wp.empty(n, dtype=wp.int32, device=device)
+    distance_mesh = twt.empty_1d(n, wp.float32, device=device)
+    triangle_id_mesh = twt.empty_1d(n, wp.int32, device=device)
     weights: wp.array[wp.float32] | None = (
         wp.empty(n, dtype=wp.float32, device=device) if max_distance is not None else None
     )
@@ -658,8 +658,8 @@ def icp_point_to_plane(
     # a caller-provided initial transform. The per-iteration cost read stays: it is the
     # stopping criterion (a 4-byte transfer).
     closest = wp.empty(n, dtype=wp.vec3, device=device)
-    distance_mesh = wp.empty(n, dtype=wp.float32, device=device)
-    triangle_id_mesh = wp.empty(n, dtype=wp.int32, device=device)
+    distance_mesh = twt.empty_1d(n, wp.float32, device=device)
+    triangle_id_mesh = twt.empty_1d(n, wp.int32, device=device)
     normals = wp.empty(n, dtype=wp.vec3, device=device)
     # Only allocated when correspondences can actually be rejected -- see the all-rejected guard
     # below, which needs a buffer to reduce over.
@@ -881,11 +881,11 @@ def _correspondences(
     target_vertices: wp.array[wp.vec3],
     target_index: _TargetIndex | None,
     current: wp.array[wp.vec3],
-    query_max: wp.float32,
+    query_max: float,
     closest: wp.array[wp.vec3],
-    distance_mesh: wp.array[wp.float32],
-    triangle_id_mesh: wp.array[wp.int32],
-) -> tuple[wp.array[wp.float32], wp.array[wp.int32]]:
+    distance_mesh: twt.Array1dFloat32,
+    triangle_id_mesh: twt.Array1dInt32,
+) -> tuple[twt.Array1dFloat32, twt.Array1dInt32]:
     """
     Match every source position against the target, writing the matched point into ``closest``.
 
@@ -990,7 +990,7 @@ def _resolve_icp_target(
     current: wp.array[wp.vec3],
     max_distance: float | None,
     caller: str,
-) -> tuple[wp.Mesh | None, wp.float32, _TargetIndex | None]:
+) -> tuple[wp.Mesh | None, float, _TargetIndex | None]:
     """
     Build the loop-invariant search state for whichever target kind was supplied.
 
@@ -1014,11 +1014,11 @@ def _resolve_icp_target(
 
     Returns
     -------
-    tuple[wp.Mesh | None, wp.float32, _TargetIndex | None]
+    tuple[wp.Mesh | None, float, _TargetIndex | None]
         ``(mesh, query_max, target_index)``.
     """
     if not _is_mesh_target(target_faces):
-        return None, wp.float32(0.0), _target_index(target_vertices)
+        return None, 0.0, _target_index(target_vertices)
 
     assert target_faces is not None
     require_nonempty_mesh(target_faces, caller)

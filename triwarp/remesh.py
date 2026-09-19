@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import Any, Literal, NamedTuple, overload
+from typing import Any, Literal, NamedTuple, cast, overload
 
 import warp as wp
 import warp.sparse as wps
@@ -2566,7 +2566,10 @@ def subdivide_loop(
             return (
                 wp.clone(vertices),
                 wp.clone(faces),
-                wps.bsr_identity(n_vertices, wp.float32, device=device),
+                cast(
+                    "wps.BsrMatrix[wp.float32]",
+                    wps.bsr_identity(n_vertices, wp.float32, device=device),
+                ),
             )
         return wp.clone(vertices), wp.clone(faces)
 

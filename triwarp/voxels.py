@@ -64,7 +64,7 @@ See Also
 
 from __future__ import annotations
 
-from typing import Literal, TypeVar
+from typing import Literal, TypeVar, cast
 
 import numpy as np
 import warp as wp
@@ -989,7 +989,7 @@ def splat_onto_grid(
         raise ValueError(f"min_weight must be positive, got {min_weight}")
     dims = (int(shape[0]), int(shape[1]), int(shape[2]))
     device = points.device
-    field = wp.zeros(dims, dtype=values.dtype, device=device)
+    field = cast("wp.array[DType, Literal[3]]", wp.zeros(dims, dtype=values.dtype, device=device))
     density = twt.as_array3d(wp.zeros(dims, dtype=wp.float32, device=device), wp.float32)
     if int(points.shape[0]) == 0:
         return field, density

@@ -55,6 +55,7 @@ home, and there is no third candidate -- so it stays, and this sentence is why.
 """
 
 import math
+from typing import cast
 
 import warp as wp
 
@@ -283,7 +284,7 @@ def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
     # Pass 2: SVD of the 3x3 matrix and axis extraction (single thread).
     out_axis = wp.empty(1, dtype=wp.vec3, device=device)
     wp.launch(kernel_points.finalize_fit_line, dim=1, inputs=[gram, out_axis], device=device)
-    return out_axis.list()[0]
+    return cast(wp.vec3, out_axis.list()[0])
 
 
 def centered_covariance(
@@ -409,8 +410,8 @@ def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
     axis = wp.vec3(1.0, 0.0, 0.0)
     if abs(unit_normal[0]) > 0.9:
         axis = wp.vec3(0.0, 1.0, 0.0)
-    u = wp.normalize(wp.cross(axis, unit_normal))
-    v = wp.cross(unit_normal, u)
+    u = cast(wp.vec3, wp.normalize(wp.cross(axis, unit_normal)))
+    v = cast(wp.vec3, wp.cross(unit_normal, u))
     return u, v
 
 

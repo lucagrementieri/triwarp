@@ -686,8 +686,21 @@ Kernels in `triwarp/kernels/` keep `wp.array2d[dtype]` unchanged. Optional 2D ar
   `twt.Array2dFloat32`, etc. for rank-2 results.
 - For **2D** outputs allocate with `twt.empty_2d((rows, cols), wp.int32, device=...)` — the dtype is
   an argument, not part of the name. `twt.empty_3d` is the rank-3 counterpart.
+  **`empty_1d` / `empty_2d` / `empty_3d` are one allocator at three ranks: each carries its
+  `dtype` argument straight into its return type through a `TypeVar`, so every Warp element type
+  works at every rank and there is no per-dtype overload table to extend.** They had one, and it
+  had drifted into three different dtype sets (1d scalars only, 2d plus `wp.vec3`, 3d only
+  `float32`/`bool`) that reflected who happened to need what rather than any real restriction.
+  The same holds for `as_array2d` / `as_array3d`. **Do not answer "this allocator does not accept
+  my dtype" by adding an overload** — if one is ever needed again, the reason will be a *runtime*
+  restriction, and it belongs in the shared `_empty_ranked` body with the rest of the validation.
 - For **1D** outputs keep `wp.empty(n, dtype=..., device=input.device)` when all elements will be
-  written by the kernel (avoid unnecessary zero-initialization).
+  written by the kernel (avoid unnecessary zero-initialization). **`twt.empty_1d(n, dtype,
+  device=...)` is for the modules whose signatures carry the rank** — `reduce`, `metrics`,
+  `neighbors`, where a `k=1` or an `axis=` collapses a rank and so the `twt.Array1d*` aliases
+  are load-bearing. It is not a general replacement: `wp.array[dtype]` is this package's usual
+  rank-1 spelling and `wp.empty` already satisfies it, so reaching for `empty_1d` there buys
+  nothing and, because `NDim` is **invariant**, actively breaks the assignment (§8).
 - Return rank-2 buffers as `return twt.as_array2d(arr, wp.int32)` so callers get a checked,
   correctly typed value.
 - **Always pass `device=` to every allocation** (`wp.zeros` / `empty` / `ones` / `full` / `array`) —
@@ -2935,14 +2948,41 @@ uv run basedpyright
 - **`triwarp/kernels/` is excluded.** The Warp kernel DSL is not modeled by any stubs and is
   inherently un-typecheckable. Do not try to make kernels type-clean or add `# pyright: ignore` there.
 - **Warp-stub type-flow rules are disabled** (`reportArgumentType`, `reportCallIssue`,
-  `reportReturnType`, `reportAttributeAccessIssue`, `reportIndexIssue`, `reportOperatorIssue`,
-  `reportGeneralTypeIssues`). Warp's Python-scope stubs are weak (`wp.empty` typed as returning
-  `array[float]`; the `twt.Array2d*` aliases not assignable to `array[Unknown, int]`;
-  `BsrMatrix.offsets/.columns/.values` absent from the stub), so these rules fire almost entirely on
-  false positives. **Consequence: basedpyright will *not* catch genuine argument/return/index type
-  errors in wrappers** — rely on the §7 regression tests for correctness, not the type checker. It
-  also cannot see a cross-module private call that goes through an attribute path
+  `reportAttributeAccessIssue`, `reportIndexIssue`, `reportOperatorIssue`,
+  `reportGeneralTypeIssues` — but **not** `reportReturnType`, which is on; see below).
+  Warp's Python-scope stubs are weak (`wp.empty` typed as returning a
+  bare `warp.array`, i.e. `array[Unknown, int]`; `wp.array.__getitem__` typing every *slice* as
+  `indexedarray | array`; `warp.sparse` returning `BsrMatrix[BlockType[...]]` from `bsr_diag` /
+  `bsr_axpy` / `bsr_compress`; `BsrMatrix.offsets/.columns/.values` absent from the stub), so these
+  rules fire almost entirely on false positives. **Consequence: basedpyright will *not* catch
+  genuine argument or index type errors in wrappers** — rely on the §7 regression tests for
+  correctness, not the type checker. Returns are the exception and are checked. It also cannot
+  see a cross-module private call that goes through an attribute path
   (`tw.holes._mean_rim_edge_length`).
+    - **`reportReturnType` is the exception and is now ON — it is the one of the seven worth
+      paying for.** `wp.empty`'s element type is `Unknown`, which is assignable to *anything*, so
+      a `wp.empty` return already satisfies a `wp.array[wp.int32]` annotation and **the dtype is
+      never what fails**; believing otherwise costs a wasted pass. What fails is **`NDim`, which
+      is invariant**: `wp.array[wp.float32]` and `twt.Array1dFloat32` (`array[float32,
+      Literal[1]]`) are not assignable to one another in *either* direction, so the package's two
+      rank-1 spellings cannot mix in one return. Enabling it reported 56 and cost 42 narrowings,
+      and it earned them by catching **five annotations that were simply wrong about what the
+      code returns, none of them reachable by any test**: `laplacian.cotmatrix(dtype=wp.float64)`
+      / `cotmatrix_entries` / `mass_matrix_entries` each declared their `float32` return whatever
+      dtype they were handed; `heat.VectorHeatOperators` declared a `BsrMatrix[wp.float64]` for a
+      system assembled from 2x2 tangent blocks (`wp.mat22d`); `registration._resolve_icp_target`
+      declared `wp.float32` for a Python `float` its own consumer re-wrapped; and
+      `linalg._cg_columns` carried no return annotation at all, so three callers' declared
+      returns were unchecked. Fourteen more were ordinary defects (a `tuple(... for _ in
+      range(3))` whose arity a fixed-length annotation cannot see, etc.).
+    - **The narrowings are two shapes, and only one of them is a `cast`.** A Python-scope *slice*
+      is always a dense `wp.array` — `wp.array.__getitem__` carries no annotations, so pyright
+      infers `indexedarray | array` from its body — and `twt.as_dense` narrows it with a real
+      `isinstance`, because `wp.indexedarray` is **not** a `wp.array` subclass. Reach for it at a
+      slice; a gather (`src[indices]`) genuinely *is* an `indexedarray` (§3.4) and is
+      materialized with `wp.copy` instead. Everything else — `warp.sparse`'s
+      `BsrMatrix[BlockType[...]]`, `wp.array.list()`, `wp.normalize`/`wp.cross` — is a plain
+      `cast`. Counts live in `pyproject.toml`'s comment; re-measure after a `warp-lang` upgrade.
 - **`reportPossiblyUnboundVariable` is kept as an error** — it catches §1.4's conditional-scope
   gotcha. When it fires on a *correlated* condition (two separate `if is_mesh:` blocks), fix it the
   way `triwarp/registration.py` does: initialize to `None` before the branch and

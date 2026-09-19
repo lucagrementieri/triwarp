@@ -394,7 +394,9 @@ def split(
     # disjoint views into it, because a shared allocation would mean holding one segment pins the
     # whole buffer alive -- the opposite of what ``copy=True`` promises.
     segments = [
-        array[begin:end] if end > begin else wp.empty(0, dtype=array.dtype, device=array.device)
+        twt.as_dense(array[begin:end])
+        if end > begin
+        else wp.empty(0, dtype=array.dtype, device=array.device)
         for begin, end in itertools.pairwise(bounds)
     ]
     return [wp.clone(segment) for segment in segments] if copy else segments
@@ -588,7 +590,7 @@ def _tiled_span(
     start, remainder = divmod(int(arrays[0].ptr) - int(base.ptr), stride)
     if remainder or start < 0 or start + total > int(base.shape[0]):
         return None
-    return base[start : start + total]
+    return twt.as_dense(base[start : start + total])
 
 
 def _view_base(arr: wp.array[DType]) -> wp.array[DType]:
@@ -719,7 +721,7 @@ def sort_and_argsort(
     wp.copy(keys_buffer, keys, count=n)
     order_buffer = sort_pair_indices(n, fill_value, device)
     wp.utils.radix_sort_pairs(keys_buffer, order_buffer, count=n)
-    return keys_buffer[:n], order_buffer[:n]
+    return twt.as_dense(keys_buffer[:n]), twt.as_dense(order_buffer[:n])
 
 
 def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
@@ -1500,7 +1502,7 @@ def counts_to_offsets(
     # rest, so ``buffer[n]`` is the total and ``buffer[:n]`` the exclusive offsets.
     buffer = wp.zeros(n + 1, dtype=wp.int32, device=device)
     wp.utils.array_scan(counts, out_array=buffer[1:], inclusive=True)
-    return buffer if include_total else buffer[:n], int(read_scalar(buffer))
+    return buffer if include_total else twt.as_dense(buffer[:n]), int(read_scalar(buffer))
 
 
 def remap_indices(indices: wp.array[wp.int32], remap: wp.array[wp.int32]) -> wp.array[wp.int32]:

@@ -1447,7 +1447,7 @@ def _slice_class_partition(
         # Warp rejects a zero-length slice outright, so an empty class gets its own empty buffer.
         if count == 0:
             return wp.empty(0, dtype=wp.int32, device=device)
-        return indices[start : start + count]
+        return twt.as_dense(indices[start : start + count])
 
     starts = [sum(class_counts[:block_index]) for block_index in range(n_classes)]
     return [block(start, count) for start, count in zip(starts, class_counts, strict=True)], (

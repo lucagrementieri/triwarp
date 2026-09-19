@@ -38,7 +38,7 @@ without that duplicate, which is the form
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import Literal, cast
 
 import warp as wp
 
@@ -127,7 +127,7 @@ def polyline_open(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
     n = int(polyline.shape[0])
     if not is_closed(polyline):
         return polyline
-    return polyline[0 : n - 1]
+    return twt.as_dense(polyline[0 : n - 1])
 
 
 def polyline_close(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
@@ -299,7 +299,7 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
         device=device,
     )
     wp.map(wp.normalize, out_normal, out=out_normal)
-    return out_normal.list()[0]
+    return cast(wp.vec3, out_normal.list()[0])
 
 
 def polyline_point_distance(
@@ -788,7 +788,9 @@ def polyline_resample(
     if closed:
         # ``num_points + 1`` samples of the closed polyline, minus the duplicated seam point, so the
         # result has ``num_points`` *distinct* points and is a clean cyclic ring.
-        return polyline_resample(polyline_close(polyline), num_points + 1)[0:num_points]
+        return twt.as_dense(
+            polyline_resample(polyline_close(polyline), num_points + 1)[0:num_points]
+        )
     device = polyline.device
     n = int(polyline.shape[0])
     if n == 0:
@@ -945,7 +947,7 @@ def polyline_angles(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.
         # One angle per *original* point: closing appends a duplicate of the first, whose angle is
         # the first's, so the tail is dropped rather than returned twice.
         n_original = int(polyline.shape[0])
-        return polyline_angles(polyline_close(polyline))[0:n_original]
+        return twt.as_dense(polyline_angles(polyline_close(polyline))[0:n_original])
     device = polyline.device
     n = int(polyline.shape[0])
     if n < 2:

@@ -764,10 +764,10 @@ def _chamfer(
 
 def _square(distances: wp.array[wp.float32]) -> twt.Array1dFloat32:
     n = int(distances.shape[0])
-    squared = wp.empty(n, dtype=wp.float32, device=distances.device)
+    squared = twt.empty_1d(n, wp.float32, device=distances.device)
     if n > 0:
         wp.map(kernel_array.square_scalar, distances, out=squared)
-    return cast(twt.Array1dFloat32, squared)
+    return squared
 
 
 def _reduce(distances: twt.Array1dFloat32, point_reduction: _PointReduction) -> float:
@@ -802,11 +802,8 @@ def _empty_chamfer(
     if point_reduction is not None:
         return 0.0
     if single_directional:
-        return cast(twt.Array1dFloat32, wp.empty(0, dtype=wp.float32, device=device))
-    return (
-        cast(twt.Array1dFloat32, wp.empty(0, dtype=wp.float32, device=device)),
-        cast(twt.Array1dFloat32, wp.empty(0, dtype=wp.float32, device=device)),
-    )
+        return twt.empty_1d(0, wp.float32, device=device)
+    return (twt.empty_1d(0, wp.float32, device=device), twt.empty_1d(0, wp.float32, device=device))
 
 
 # The three geometry dispatches below are each shared by a ``chamfer_*`` and a ``hausdorff_*``
@@ -829,7 +826,7 @@ def _distances_points_to_points(
         d_backward = tw.neighbors.query_nearest(
             x, y, k=1, initial_radius=_backward_radius(d_forward)
         )[1]
-    return d_forward, d_backward
+    return cast(_DistancePair, (d_forward, d_backward))
 
 
 def _distances_points_to_mesh(
@@ -849,7 +846,7 @@ def _distances_points_to_mesh(
         d_backward = tw.neighbors.query_nearest(
             points, vertices, k=1, initial_radius=_backward_radius(d_forward)
         )[1]
-    return d_forward, d_backward
+    return cast(_DistancePair, (d_forward, d_backward))
 
 
 def _backward_radius(d_forward: twt.Array1dFloat32) -> float | None:

@@ -71,7 +71,7 @@ mkdocstrings renders beside it -- so they are
 from __future__ import annotations
 
 import math
-from typing import Literal, overload
+from typing import Literal, cast, overload
 
 import numpy as np
 import warp as wp
@@ -2180,7 +2180,7 @@ def remove_tunnels(
         vertices, faces, twt.as_array2d(cut_edges, wp.int32)
     )
     return (
-        cut_vertices,
+        cast("wp.array[wp.vec3]", cut_vertices),
         tw.holes.fill_min_weight(cut_vertices, cut_faces, metric=metric),
         len(selected),
     )

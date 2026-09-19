@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeVar, cast, overlo
 import warp as wp
 
 T = TypeVar("T")
+DType = TypeVar("DType")
+NDim = TypeVar("NDim", bound=int)
 
 if TYPE_CHECKING:
     Array1dInt32: TypeAlias = wp.array[wp.int32, Literal[1]]
@@ -104,9 +106,11 @@ __all__ = [
     "SortableDType",
     "as_array2d",
     "as_array3d",
+    "as_dense",
     "dtype_max",
     "dtype_min",
     "dtype_zero",
+    "empty_1d",
     "empty_2d",
     "empty_3d",
     "ensure_edge_pairs",
@@ -177,21 +181,13 @@ def ensure_edge_pairs(arr: wp.array[T], name: str) -> None:
         raise ValueError(f"{name} must have shape (k, 2), got {arr.shape}")
 
 
-@overload
-def as_array2d(arr: wp.array[T], dtype: type[wp.int32]) -> Array2dInt32: ...
-@overload
-def as_array2d(arr: wp.array[T], dtype: type[wp.float32]) -> Array2dFloat32: ...
-@overload
-def as_array2d(arr: wp.array[T], dtype: type[wp.float64]) -> Array2dFloat64: ...
-@overload
-def as_array2d(arr: wp.array[T], dtype: type[wp.vec3]) -> Array2dVec3: ...
-def as_array2d(arr: wp.array[T], dtype: type) -> Array2dInt32 | Array2dFloat | Array2dVec3:
+def as_array2d(arr: wp.array[T], dtype: type[DType]) -> wp.array[DType, Literal[2]]:
     """
     Validate and narrow a Warp array to the rank-2 alias for ``dtype``.
 
     One function for what used to be ``as_array2d_int32`` / ``as_array2d_float32`` /
-    ``as_array2d_float``: the dtype selects the return alias through overloads, so a call site keeps
-    the narrow type it had -- ``as_array2d(x, wp.int32)`` is an
+    ``as_array2d_float``: the ``dtype`` argument carries the element type into the return, so a
+    call site keeps the narrow type it had -- ``as_array2d(x, wp.int32)`` is an
     [`Array2dInt32`][triwarp.typing.Array2dInt32], not a union.
 
     Parameters
@@ -199,27 +195,22 @@ def as_array2d(arr: wp.array[T], dtype: type) -> Array2dInt32 | Array2dFloat | A
     arr
         Warp array expected to be rank-2 with element type ``dtype``.
     dtype
-        Expected element type: ``wp.int32``, ``wp.float32``, ``wp.float64`` or ``wp.vec3``.
+        Expected element type.
 
     Returns
     -------
-    Array2dInt32 | Array2dFloat32 | Array2dFloat64 | Array2dVec3
-        ``arr`` unchanged, narrowed to the checked alias.
+    wp.array
+        ``arr`` unchanged, narrowed to ``wp.array[dtype, Literal[2]]``.
 
     Raises
     ------
     TypeError
         If ``arr`` is not rank-2 with element type ``dtype``.
     """
-    ensure_ndim(arr, 2, dtype=dtype)
-    return cast(Array2dInt32 | Array2dFloat, arr)
+    return _as_ranked(arr, 2, dtype)
 
 
-@overload
-def as_array3d(arr: wp.array[T], dtype: type[wp.float32]) -> Array3dFloat32: ...
-@overload
-def as_array3d(arr: wp.array[T], dtype: type[wp.bool]) -> Array3dBool: ...
-def as_array3d(arr: wp.array[T], dtype: type) -> Array3dFloat32 | Array3dBool:
+def as_array3d(arr: wp.array[T], dtype: type[DType]) -> wp.array[DType, Literal[3]]:
     """
     Validate and narrow a Warp array to the rank-3 alias for ``dtype``.
 
@@ -230,20 +221,65 @@ def as_array3d(arr: wp.array[T], dtype: type) -> Array3dFloat32 | Array3dBool:
     arr
         Warp array expected to be rank-3 with scalar type ``dtype``.
     dtype
-        Expected scalar type: ``wp.float32`` or ``wp.bool``.
+        Expected scalar type.
 
     Returns
     -------
-    Array3dFloat32 | Array3dBool
-        ``arr`` unchanged, narrowed to the checked alias.
+    wp.array
+        ``arr`` unchanged, narrowed to ``wp.array[dtype, Literal[3]]``.
 
     Raises
     ------
     TypeError
         If ``arr`` is not rank-3 with scalar type ``dtype``.
     """
-    ensure_ndim(arr, 3, dtype=dtype)
-    return cast(Array3dFloat32 | Array3dBool, arr)
+    return _as_ranked(arr, 3, dtype)
+
+
+def _as_ranked(arr: wp.array[T], ndim: int, dtype: type[DType]) -> wp.array[DType, Any]:
+    """Shared body of the ``as_array*`` pair: check the rank and the dtype, then narrow to both."""
+    ensure_ndim(arr, ndim, dtype=dtype)
+    return cast("wp.array[DType, Any]", arr)
+
+
+def as_dense(view: wp.array[DType, NDim] | wp.indexedarray[DType, NDim]) -> wp.array[DType, NDim]:
+    """
+    Narrow a Python-scope index expression to the dense array a slice of one always is.
+
+    ``wp.array.__getitem__`` carries no annotations, so basedpyright infers its return from the two
+    branches of the body and every subscript comes back as ``indexedarray | array`` -- including a
+    plain slice, which can only ever produce the dense arm (§3.4: an ``indexedarray`` is what an
+    *integer-array* key yields, and a slice is not one). This narrows the union back, and unlike a
+    bare ``cast`` it checks: ``wp.indexedarray`` is not a subclass of ``wp.array``, so the
+    ``isinstance`` genuinely discriminates rather than restating the assumption.
+
+    Use it on a slice. A gather (``src[indices]``) is an ``indexedarray`` by design and is
+    materialized with ``wp.copy`` instead, not narrowed here.
+
+    Parameters
+    ----------
+    view
+        Result of a Python-scope subscript of a ``wp.array``.
+
+    Returns
+    -------
+    wp.array
+        ``view`` unchanged, typed as the dense array it is.
+
+    Raises
+    ------
+    TypeError
+        If ``view`` is a ``wp.indexedarray`` -- that is, if the subscript was a gather rather than
+        a slice.
+
+    See Also
+    --------
+    [`as_array2d`][triwarp.typing.as_array2d]
+    [`triwarp.array.gather`][]
+    """
+    if not isinstance(view, wp.array):
+        raise TypeError(f"expected a dense wp.array slice, got {type(view).__name__}")
+    return view
 
 
 @overload
@@ -361,98 +397,126 @@ def sortable_dtype(dtype: type[wp.Scalar]) -> SortableDType:
     return wp.int64 if wide else wp.int32
 
 
-@overload
+def empty_1d(
+    n: int, dtype: type[DType], *, device: wp.DeviceLike = None
+) -> wp.array[DType, Literal[1]]:
+    """
+    Allocate an uninitialized rank-1 Warp array of the given element type.
+
+    The rank-1 member of the ``empty_*`` family, and the checked replacement for
+    ``cast(twt.Array1dFloat32, wp.empty(n, dtype=wp.float32, device=...))``. ``wp.empty`` is
+    annotated as returning ``warp.array`` -- element type unknown and rank unspecified -- and the
+    rank is what a caller cannot recover afterwards: ``NDim`` is invariant, so
+    ``wp.array[wp.float32]`` and [`Array1dFloat32`][triwarp.typing.Array1dFloat32] are not
+    assignable to one another in either direction. A ``cast`` is an unchecked assertion of both;
+    this fixes the rank by construction and carries ``dtype`` through to the return.
+
+    Prefer plain ``wp.empty`` where the surrounding annotations are ``wp.array[dtype]``, which is
+    this package's usual rank-1 spelling and which ``wp.empty`` already satisfies -- the aliases
+    are for the modules that carry the rank in their signatures ([`triwarp.reduce`][],
+    [`triwarp.metrics`][], [`triwarp.neighbors`][]).
+
+    Parameters
+    ----------
+    n
+        Length of the allocated array.
+    dtype
+        Element type. Any Warp scalar, vector or matrix type; a call site holding a runtime
+        ``dtype`` gets ``wp.array[Unknown, Literal[1]]``, which still carries the rank.
+    device
+        Target Warp device.
+
+    Returns
+    -------
+    wp.array
+        Uninitialized length-``n`` array of element type ``dtype`` on ``device``.
+
+    See Also
+    --------
+    [`empty_2d`][triwarp.typing.empty_2d]
+    [`empty_3d`][triwarp.typing.empty_3d]
+    """
+    return _empty_ranked((n,), 1, dtype, device)
+
+
 def empty_2d(
-    shape: tuple[int, int] | list[int], dtype: type[wp.int32], *, device: wp.DeviceLike = None
-) -> Array2dInt32: ...
-@overload
-def empty_2d(
-    shape: tuple[int, int] | list[int], dtype: type[wp.float32], *, device: wp.DeviceLike = None
-) -> Array2dFloat32: ...
-@overload
-def empty_2d(
-    shape: tuple[int, int] | list[int], dtype: type[wp.float64], *, device: wp.DeviceLike = None
-) -> Array2dFloat64: ...
-@overload
-def empty_2d(
-    shape: tuple[int, int] | list[int], dtype: type[wp.vec3], *, device: wp.DeviceLike = None
-) -> Array2dVec3: ...
-def empty_2d(
-    shape: tuple[int, int] | list[int], dtype: type, *, device: wp.DeviceLike = None
-) -> Array2dInt32 | Array2dFloat | Array2dVec3:
+    shape: tuple[int, int] | list[int], dtype: type[DType], *, device: wp.DeviceLike = None
+) -> wp.array[DType, Literal[2]]:
     """
     Allocate an uninitialized rank-2 Warp array of the given element type.
 
-    One function for what used to be ``empty_int32_2d`` / ``empty_float32_2d`` / ``empty_float_2d``.
-    The dtype selects the return alias through overloads, so a call site keeps the narrow type it
-    had rather than falling back to a union.
+    The rank-2 member of the ``empty_*`` family; see [`empty_1d`][triwarp.typing.empty_1d] for why
+    the rank has to be fixed at the allocation rather than asserted afterwards.
 
     Parameters
     ----------
     shape
         ``(rows, cols)`` shape of the allocated array.
     dtype
-        Element type: ``wp.int32``, ``wp.float32``, ``wp.float64`` or ``wp.vec3``. The last is
-        what an ``(m, 2)`` table of segment endpoints wants, and it has an overload like the
-        scalars do -- ``triwarp.intersection``'s two public segment returns are the callers.
+        Element type. ``wp.vec3`` is what an ``(m, 2)`` table of segment endpoints wants --
+        ``triwarp.intersection``'s two public segment returns are the callers.
     device
         Target Warp device.
 
     Returns
     -------
-    Array2dInt32 | Array2dFloat32 | Array2dFloat64 | Array2dVec3
+    wp.array
         Uninitialized ``(rows, cols)`` array of element type ``dtype`` on ``device``.
+
+    Raises
+    ------
+    ValueError
+        If ``shape`` does not have length 2.
+
+    See Also
+    --------
+    [`empty_1d`][triwarp.typing.empty_1d]
+    [`empty_3d`][triwarp.typing.empty_3d]
     """
-    return cast(Array2dInt32 | Array2dFloat, wp.empty(_shape_2d(shape), dtype=dtype, device=device))
+    return _empty_ranked(shape, 2, dtype, device)
 
 
-def _shape_2d(shape: tuple[int, int] | list[int]) -> tuple[int, int]:
-    dims = tuple(int(x) for x in shape)
-    if len(dims) != 2:
-        raise ValueError(f"2D shape must have length 2, got {shape!r}")
-    return (dims[0], dims[1])
-
-
-@overload
 def empty_3d(
-    shape: tuple[int, int, int] | list[int],
-    dtype: type[wp.float32],
-    *,
-    device: wp.DeviceLike = None,
-) -> Array3dFloat32: ...
-@overload
-def empty_3d(
-    shape: tuple[int, int, int] | list[int], dtype: type[wp.bool], *, device: wp.DeviceLike = None
-) -> Array3dBool: ...
-def empty_3d(
-    shape: tuple[int, int, int] | list[int], dtype: type, *, device: wp.DeviceLike = None
-) -> Array3dFloat32 | Array3dBool:
+    shape: tuple[int, int, int] | list[int], dtype: type[DType], *, device: wp.DeviceLike = None
+) -> wp.array[DType, Literal[3]]:
     """
-    Allocate an uninitialized rank-3 Warp array of the given scalar type.
+    Allocate an uninitialized rank-3 Warp array of the given element type.
 
-    The rank-3 counterpart of [`empty_2d`][triwarp.typing.empty_2d].
+    The rank-3 member of the ``empty_*`` family; see [`empty_1d`][triwarp.typing.empty_1d] for why
+    the rank has to be fixed at the allocation rather than asserted afterwards.
 
     Parameters
     ----------
     shape
         ``(nx, ny, nz)`` shape of the allocated array.
     dtype
-        Scalar type: ``wp.float32`` or ``wp.bool``.
+        Element type.
     device
         Target Warp device.
 
     Returns
     -------
-    Array3dFloat32 | Array3dBool
-        Uninitialized ``(nx, ny, nz)`` array of scalar type ``dtype`` on ``device``.
+    wp.array
+        Uninitialized ``(nx, ny, nz)`` array of element type ``dtype`` on ``device``.
+
+    Raises
+    ------
+    ValueError
+        If ``shape`` does not have length 3.
+
+    See Also
+    --------
+    [`empty_1d`][triwarp.typing.empty_1d]
+    [`empty_2d`][triwarp.typing.empty_2d]
     """
-    return cast(
-        Array3dFloat32 | Array3dBool, wp.empty(_shape_3d(shape), dtype=dtype, device=device)
-    )
+    return _empty_ranked(shape, 3, dtype, device)
 
 
-def _shape_3d(shape: tuple[int, int, int] | list[int]) -> tuple[int, int, int]:
-    dims = tuple(int(x) for x in shape)
-    if len(dims) != 3:
-        raise ValueError(f"3D shape must have length 3, got {shape!r}")
-    return (dims[0], dims[1], dims[2])
+def _empty_ranked(
+    shape: tuple[int, ...] | list[int], ndim: int, dtype: type[DType], device: wp.DeviceLike
+) -> wp.array[DType, Any]:
+    """Shared body of the ``empty_*`` family: check the rank of ``shape``, then allocate at it."""
+    dims = tuple(int(extent) for extent in shape)
+    if len(dims) != ndim:
+        raise ValueError(f"{ndim}D shape must have length {ndim}, got {shape!r}")
+    return cast("wp.array[DType, Any]", wp.empty(dims, dtype=dtype, device=device))

@@ -245,7 +245,7 @@ def query_bvh_ball(
     )
 
     segment_bounds, total_hits = tw.array.counts_to_offsets(hit_counts, include_total=True)
-    offsets = segment_bounds if include_total else segment_bounds[:m]
+    offsets = segment_bounds if include_total else twt.as_dense(segment_bounds[:m])
     if total_hits == 0:
         return wp.empty(0, dtype=wp.int32, device=device), offsets
 
@@ -348,7 +348,7 @@ def query_bvh_box(
     )
 
     segment_bounds, total_hits = tw.array.counts_to_offsets(hit_counts, include_total=True)
-    offsets = segment_bounds if include_total else segment_bounds[:m]
+    offsets = segment_bounds if include_total else twt.as_dense(segment_bounds[:m])
     if total_hits == 0:
         return wp.empty(0, dtype=wp.int32, device=device), offsets
 
@@ -742,7 +742,7 @@ def _ball_with_offsets(
     segment_bounds, total_neighbors = tw.array.counts_to_offsets(
         neighbor_counts, include_total=True
     )
-    offsets = segment_bounds if include_total else segment_bounds[:m]
+    offsets = segment_bounds if include_total else twt.as_dense(segment_bounds[:m])
     if total_neighbors == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
@@ -1185,7 +1185,10 @@ def _shape_nearest(
             cast(twt.Array1dFloat32, neighbor_distances.reshape(-1)),
         )
     if single_query:
-        return neighbor_indices[0], neighbor_distances[0]
+        return (
+            cast(twt.Array1dInt32, neighbor_indices[0]),
+            cast(twt.Array1dFloat32, neighbor_distances[0]),
+        )
     return twt.as_array2d(neighbor_indices, wp.int32), twt.as_array2d(
         neighbor_distances, wp.float32
     )

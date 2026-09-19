@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
+from typing import cast
 
 import numpy as np
 import warp as wp
@@ -274,7 +275,11 @@ def boundary_loops_batched(
     device = faces.device
     if n_faces == 0:
         # Three *distinct* empty allocations, so callers may write into them independently.
-        return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
 
     n_vertices = int(vertices.shape[0])
     if edges_sorted is None:
@@ -284,7 +289,11 @@ def boundary_loops_batched(
     rows = _boundary_rows(n_vertices, edges_sorted)
     n_boundary_edges = int(rows.shape[0])
     if n_boundary_edges == 0:
-        return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
 
     if edges is None:
         edges = tw.edges.faces_to_edges(faces)
@@ -421,7 +430,11 @@ def _unoriented_boundary_cycles(
         if darts_np[start] % 2 == 0
     ]
     if not loops_np:
-        return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
 
     sizes_np = np.array([loop.shape[0] for loop in loops_np], dtype=np.int32)
     return (
@@ -1060,4 +1073,7 @@ def _boundary_rows(n_vertices: int | None, edges_sorted: twt.Array2dInt32) -> wp
     ``n_vertices`` is only the radix the edge rows are packed against, so ``None`` is legal and
     means "pack against the pair radix" rather than reducing the rows to find their maximum.
     """
-    return tw.grouping.group_int_rows(edges_sorted, 1, n_vertices, validate=False).flatten()
+    return cast(
+        "wp.array[wp.int32]",
+        tw.grouping.group_int_rows(edges_sorted, 1, n_vertices, validate=False).flatten(),
+    )

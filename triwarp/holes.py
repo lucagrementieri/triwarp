@@ -69,7 +69,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import Literal, overload
+from typing import Literal, cast, overload
 
 import numpy as np
 import warp as wp
@@ -937,7 +937,9 @@ def fill_small(
 
 def _unpack_loops(loops: _PackedLoops) -> list[wp.array[wp.int32]]:
     """Per-loop **views** into the packed buffer, for the callers that still want a list."""
-    return [loops.flat_loops[loops.loop_slice(index)] for index in range(loops.n_loops)]
+    return [
+        twt.as_dense(loops.flat_loops[loops.loop_slice(index)]) for index in range(loops.n_loops)
+    ]
 
 
 def fill_smooth(
@@ -3062,7 +3064,7 @@ def _rows_present(
         inputs=[rows, query_wp, present],
         device=device,
     )
-    return present.list()
+    return cast("list[bool]", present.list())
 
 
 def _bridge_triangles(

@@ -46,7 +46,7 @@ they are read by a human or by an optimizer's stopping rule, not solved with.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, cast
 
 import warp as wp
 import warp.sparse as wps
@@ -342,7 +342,7 @@ def k_harmonic(
     require_same_device(laplacian=laplacian, mass=mass)
     if k < 1:
         raise ValueError(f"harmonic power k must be >= 1, got {k}.")
-    negated = wps.bsr_axpy(x=laplacian, alpha=-1.0)
+    negated = cast("wps.BsrMatrix[wp.float32]", wps.bsr_axpy(x=laplacian, alpha=-1.0))
     if k == 1:
         return negated
 
@@ -836,7 +836,10 @@ def crouzeix_raviart_massmatrix(
     unique_edges, edge_map = _edge_numbering(vertices, faces, unique_edges, edge_map)
     n_edges = int(unique_edges.shape[0])
 
-    return wps.bsr_diag(diag=_cr_mass_diagonal(vertices, faces, edge_map, n_edges, dtype))
+    return cast(
+        "wps.BsrMatrix[wp.float32]",
+        wps.bsr_diag(diag=_cr_mass_diagonal(vertices, faces, edge_map, n_edges, dtype)),
+    )
 
 
 def _cr_mass_diagonal(

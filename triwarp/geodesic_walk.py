@@ -686,7 +686,7 @@ def _rewrite_loops(
         ],
         device=device,
     )
-    return rewritten[:total], _offsets_through(positions, loop_offsets)
+    return twt.as_dense(rewritten[:total]), _offsets_through(positions, loop_offsets)
 
 
 def _compact_repeats(
@@ -734,7 +734,7 @@ def _compact_repeats(
         inputs=[packed, counts, positions, kept],
         device=device,
     )
-    return kept[:total], _offsets_through(positions, loop_offsets)
+    return twt.as_dense(kept[:total]), _offsets_through(positions, loop_offsets)
 
 
 def _offsets_through(

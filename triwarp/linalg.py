@@ -113,7 +113,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Any
+from typing import Any, Literal, cast, overload
 
 import numpy as np
 import warp as wp
@@ -519,7 +519,7 @@ def solve_spd(
         check_every=_supported_check_every(check_every),
     )
     _warn_if_not_converged(result, iteration_cap, name)
-    return result
+    return cast("tuple[int, float, float]", result)
 
 
 def solve_spd_columns(
@@ -762,6 +762,32 @@ def spd_column_solver(
     )
 
 
+@overload
+def _cg_columns(
+    matrix: wps.BsrMatrix[wp.float64],
+    rhs: twt.Array2dFloat,
+    solution: twt.Array2dFloat,
+    *,
+    tol: float,
+    maxiter: int | None,
+    check_every: int,
+    preconditioner: str,
+    run: Literal[True],
+    caller: str,
+) -> tuple[int, float, float]: ...
+@overload
+def _cg_columns(
+    matrix: wps.BsrMatrix[wp.float64],
+    rhs: twt.Array2dFloat,
+    solution: twt.Array2dFloat,
+    *,
+    tol: float,
+    maxiter: int | None,
+    check_every: int,
+    preconditioner: str,
+    run: Literal[False],
+    caller: str,
+) -> wpl.LinearSolverState | _BatchedCg: ...
 def _cg_columns(
     matrix: wps.BsrMatrix[wp.float64],
     rhs: twt.Array2dFloat,
@@ -773,7 +799,7 @@ def _cg_columns(
     preconditioner: str,
     run: bool,
     caller: str,
-):
+) -> tuple[int, float, float] | wpl.LinearSolverState | _BatchedCg:
     """
     Batched conjugate gradient over the columns of ``rhs`` -- the shared body of the two solvers.
 
@@ -836,24 +862,27 @@ def _cg_columns(
             check_every=_supported_check_every(check_every),
             preconditioner=preconditioner,
         )
-        return state() if run else state
+        return cast("tuple[int, float, float]", state()) if run else state
     operator = replicated_operator(matrix, n_columns)
     if preconditioner == "multigrid":
         apply_inverse = multigrid_preconditioner(matrix, n_columns)
     else:
         apply_inverse = replicated_operator(wpl.preconditioner(matrix, "diag"), n_columns)
-    return wpl.cg(
-        operator,
-        rhs.flatten(),
-        solution.flatten(),
-        tol=tol,
-        # See the identical comment in solve_spd (CLAUDE.md section 12.7): an omitted atol here
-        # silently becomes atol := tol, an absolute floor of the "relative" tolerance value.
-        atol=0.0,
-        maxiter=iteration_cap,
-        M=apply_inverse,
-        check_every=_supported_check_every(check_every),
-        run=run,
+    return cast(
+        "tuple[int, float, float] | wpl.LinearSolverState",
+        wpl.cg(
+            operator,
+            rhs.flatten(),
+            solution.flatten(),
+            tol=tol,
+            # See the identical comment in solve_spd (CLAUDE.md section 12.7): an omitted atol
+            # here silently becomes atol := tol, an absolute floor of the "relative" tolerance.
+            atol=0.0,
+            maxiter=iteration_cap,
+            M=apply_inverse,
+            check_every=_supported_check_every(check_every),
+            run=run,
+        ),
     )
 
 
@@ -866,7 +895,7 @@ def _cg_columns_auto(
     cap: int,
     check_every: int,
     caller: str,
-):
+) -> tuple[int, float, float]:
     """
     Run Jacobi under ``CG_PROBE_ITERATIONS``, then escalate if it has not converged.
 
@@ -1353,7 +1382,7 @@ def _flat_column_views(
     flat: wp.array[wp.float64], n_columns: int, n: int, stride: int
 ) -> list[wp.array[wp.float64]]:
     """Split a padded flat ``n_columns * stride`` vector into its ``n_columns`` blocks of ``n``."""
-    return [flat[c * stride : c * stride + n] for c in range(n_columns)]
+    return [twt.as_dense(flat[c * stride : c * stride + n]) for c in range(n_columns)]
 
 
 def replicated_operator(
@@ -1418,7 +1447,9 @@ def replicated_operator(
         key = (array.ptr, tuple(array.shape), tuple(array.strides))
         views = block_views.get(key)
         if views is None:
-            views = [array[column * n : (column + 1) * n] for column in range(n_columns)]
+            views = [
+                twt.as_dense(array[column * n : (column + 1) * n]) for column in range(n_columns)
+            ]
             block_views[key] = views
         return views
 
@@ -1851,7 +1882,7 @@ def _multigrid_prune(matrix: wps.BsrMatrix[wp.float64]) -> wps.BsrMatrix[wp.floa
         (``bsr_mm(...)`` / ``bsr_axpy(...)``) that nothing else holds. **A caller that still needs
         the unpruned matrix must copy it first.**
     """
-    return wps.bsr_compress(matrix, prune_numerical_zeros=True)
+    return cast("wps.BsrMatrix[wp.float64]", wps.bsr_compress(matrix, prune_numerical_zeros=True))
 
 
 def _multigrid_dense_inverse(matrix: wps.BsrMatrix[wp.float64]) -> twt.ArrayNd | None:

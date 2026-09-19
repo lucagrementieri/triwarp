@@ -610,7 +610,7 @@ def _launch_vec3_tiled_sum(
         block_dim=TILE_1D,
         device=device,
     )
-    return out_vec.list()[0]
+    return cast(wp.vec3, out_vec.list()[0])
 
 
 def _launch_global_vec3_minmax(array: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
@@ -746,13 +746,13 @@ def _launch_axis_scalar(
         # thread per output, direct write, no init fill, avoids that.
         serial = (spec.axis_rows_serial if axis == 1 else spec.axis_cols_serial)[array.dtype]
         if spec.dual_axis:
-            out_min = wp.empty(n_out, dtype=array.dtype, device=array.device)
-            out_max = wp.empty(n_out, dtype=array.dtype, device=array.device)
+            out_min = twt.empty_1d(n_out, array.dtype, device=array.device)
+            out_max = twt.empty_1d(n_out, array.dtype, device=array.device)
             wp.launch(serial, dim=n_out, inputs=[array, out_min, out_max], device=array.device)
-            return cast(twt.Array1dScalar, out_min), cast(twt.Array1dScalar, out_max)
-        out = wp.empty(n_out, dtype=array.dtype, device=array.device)
+            return out_min, out_max
+        out = twt.empty_1d(n_out, array.dtype, device=array.device)
         wp.launch(serial, dim=n_out, inputs=[array, out], device=array.device)
-        return cast(twt.Array1dScalar, out)
+        return out
 
     tiled = (spec.axis_rows_tiled if axis == 1 else spec.axis_cols_tiled)[array.dtype]
     n_tiles = (reduced + TILE_1D - 1) // TILE_1D
