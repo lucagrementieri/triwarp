@@ -1,5 +1,5 @@
 """
-Benchmarks for ``triwarp.graph``: connected components, BFS, and the weighted envelope.
+Benchmarks for ``triwarp.graph``: connected components and the weighted envelope.
 
 Two axes, matching the two ways a graph algorithm gets slow:
 
@@ -26,10 +26,9 @@ on the same ``components`` axis.
 
 References
 ----------
-The scipy references sit in the ``scipy`` library slot: ``scipy.sparse.csgraph
-.breadth_first_order`` is the reachable-set oracle the multi-source group checks against
-(and the backend trimesh itself uses for graph traversals), and ``connected_components`` is its
-labelling counterpart.
+The scipy reference sits in the ``scipy`` library slot: ``scipy.sparse.csgraph
+.connected_components`` is the labelling oracle for both component groups (and the backend
+trimesh itself uses for graph traversals).
 
 Neither **trimesh** nor **open3d** appears: both functions take an abstract CSR adjacency matrix,
 and open3d exposes no graph-traversal API over one -- its connectivity work is mesh-bound
@@ -39,8 +38,7 @@ and open3d exposes no graph-traversal API over one -- its connectivity work is m
 ``igl.connected_components`` accepts a ``scipy.sparse`` adjacency matrix directly -- the same
 argument ``connected_component_labels`` takes -- and ``igl.facet_components(F)`` is the dual-graph
 labelling ``face_connected_component_labels`` computes. So both labellings have a second
-implementation and the face one, which had none at all, now has two. igl has no BFS that returns a
-visit *order*, so it stays out of the ``bfs`` groups where scipy is the exact-order oracle.
+implementation and the face one, which had none at all, now has two.
 
 **pymeshlab** answers two groups. ``shortest_path_envelope``'s reference is
 ``apply_scalar_saturation_per_vertex``, which is the same relaxation read as a Lipschitz cap on a
@@ -54,8 +52,7 @@ that returns a label array. The closest thing that runs the component pass *with
 or deleting anything is ``compute_selection_by_small_disconnected_components_per_face`` at
 ``nbfaceratio=0.0`` -- it labels every component and then thresholds against a fraction of the
 largest one, selecting nothing. So the row is "label everything, then one threshold pass", against
-triwarp's "label everything". It is also mesh-bound rather than CSR-bound, which is why it cannot
-appear in the ``bfs`` groups at all; the labelling is the only graph work MeshLab exposes.
+triwarp's "label everything". The labelling is the only graph work MeshLab exposes.
 """
 
 from __future__ import annotations
@@ -68,18 +65,9 @@ import scipy.sparse as sp
 import warp as wp
 import warp.sparse as wps
 from meshlib import mrmeshpy as mm
-from scipy.sparse.csgraph import dijkstra
 
 import triwarp as tw
 from conftest import BenchCase, skip_larger_than
-
-# Source counts for the multi-source traversal. The output is a packed CSR of every reachable set,
-# so on a single-component mesh its size is sources x V and the pair shows that directly.
-_N_SOURCES = [16, 256]
-_SOURCE_SEED = 3
-
-# The long-diameter BFS runs into hundreds of milliseconds a call.
-_ROUNDS = 3
 
 _adjacency_cache: dict[tuple[str, str], wps.BsrMatrix] = {}
 _scipy_cache: dict[str, sp.csr_matrix] = {}
@@ -97,7 +85,7 @@ def _adjacency(bench_case: BenchCase) -> wps.BsrMatrix:
 
 
 def _scipy_graph(bench_case: BenchCase) -> sp.csr_matrix:
-    """Build the same adjacency as a scipy CSR matrix, for the exact-order BFS oracle."""
+    """Build the same adjacency as a scipy CSR matrix, for the component-labelling oracle."""
     if bench_case.mesh_name not in _scipy_cache:
         faces = bench_case.faces_np
         edges = np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
@@ -176,8 +164,8 @@ def test_connected_component_labels_depth(bench_case: BenchCase) -> None:
     The depth-robustness gate: ECL-CC on a graph of diameter 130 against one of diameter 20 481.
 
     Pointer jumping has no level loop, so this pair should read **flat** -- measured at 0.08 ms on
-    both. That is not a self-evident property (every level-synchronous traversal in the package
-    fails it, which is what the ``bfs`` group below shows), and it is the premise the parity
+    both. That is not a self-evident property -- every level-synchronous traversal in the package
+    fails it, ``shortest_path_envelope`` below included -- and it is the premise the parity
     union-find in ``validation.face_orientation_bits`` rests on. A slope appearing here is the
     regression that would invalidate it.
 
@@ -267,51 +255,6 @@ def test_face_connected_component_labels_depth(bench_case: BenchCase) -> None:
     assert labels.shape == (n_faces,)
 
 
-@pytest.mark.benchmark(group="bfs_multi_source")
-@pytest.mark.benchaxis("components")
-@pytest.mark.benchlibs("triwarp", "scipy")
-@pytest.mark.parametrize("n_sources", _N_SOURCES)
-def test_bfs_multi_source(bench_case: BenchCase, n_sources: int) -> None:
-    """
-    Packed reachable sets from many sources at once.
-
-    On the component axis this is a coverage sweep as much as a timing one: on ``sphere_med`` every
-    source reaches all 40 962 vertices, so the output is ``sources x V``, while on ``parts_1024``
-    each source is trapped in its own 42-vertex sphere. Same call, output sizes three orders of
-    magnitude apart.
-
-    scipy's ``csgraph.dijkstra(unweighted=True, min_only=True)`` is the multi-source reduction in
-    one call, and it is the reference a per-source ``breadth_first_order`` loop cannot
-    be: that one takes a single source, so ``k`` of them would be ``k`` calls. Read the two rows as
-    different answers to the same question -- scipy returns one distance *field* over the whole
-    vertex set where triwarp returns the packed reachable *sets*, so at ``parts_1024`` triwarp's
-    output is three orders of magnitude smaller and scipy's is unchanged.
-    """
-    if bench_case.kind == "scipy":
-        graph_np = _scipy_graph(bench_case)
-        rng = np.random.default_rng(_SOURCE_SEED)
-        sources_np = rng.integers(0, bench_case.n_vertices, size=n_sources).astype(np.int32)
-        distances_np = bench_case.run(
-            lambda: dijkstra(graph_np, unweighted=True, indices=sources_np, min_only=True),
-            rounds=_ROUNDS,
-        )
-        assert distances_np.shape == (bench_case.n_vertices,)
-        return
-
-    adjacency = _adjacency(bench_case)
-    rng = np.random.default_rng(_SOURCE_SEED)
-    sources = wp.array(
-        rng.integers(0, bench_case.n_vertices, size=n_sources).astype(np.int32),
-        dtype=wp.int32,
-        device=bench_case.device,
-    )
-    neighbors, offsets = bench_case.run(
-        lambda: tw.graph.bfs_multi_source(adjacency, sources), rounds=_ROUNDS
-    )
-    assert offsets.shape == (n_sources,)
-    assert neighbors.shape[0] >= n_sources
-
-
 _weighted_cache: dict[tuple[str, str], wps.BsrMatrix] = {}
 
 
@@ -345,7 +288,8 @@ def test_shortest_path_envelope(bench_case: BenchCase) -> None:
     Capped at ``bunny_decimated`` on both sides. The spike seed makes every pass matter, so the
     triwarp row is ``diameter`` launches deep and the MeshLab row is a serial flood over the same
     region -- neither says anything new at larger scale that the two smallest meshes do not. The
-    weighted adjacency is an input and is built outside the timed callable, like ``bfs``'s.
+    weighted adjacency is an input and is built outside the timed callable, like the unweighted
+    one the labelling groups take.
     """
     skip_larger_than(bench_case, "bunny_decimated", "a spike-seeded relaxation is diameter-deep")
     n_vertices = bench_case.n_vertices

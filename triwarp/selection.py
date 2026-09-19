@@ -448,7 +448,7 @@ def submeshes_from_face_groups(
         Length-``k`` ``wp.int32`` start of each group in ``group_face_indices``, ascending, with
         ``group_offsets[0] == 0`` — the repo's no-terminator CSR convention (as in
         [`pack_1d_arrays`][triwarp.array.pack_1d_arrays] and
-        [`bfs_multi_source`][triwarp.graph.bfs_multi_source]). Groups must be non-empty.
+        [`successor_cycles`][triwarp.graph.successor_cycles]). Groups must be non-empty.
 
     Returns
     -------

@@ -54,7 +54,7 @@ def edges_to_csr(
 
     See Also
     --------
-    [`bfs_multi_source`][triwarp.graph.bfs_multi_source]
+    [`connected_component_labels`][triwarp.graph.connected_component_labels]
     [`shortest_path_envelope`][triwarp.graph.shortest_path_envelope]
     """
     require_same_device(edges=edges, weights=weights)
@@ -524,114 +524,6 @@ def successor_cycles(
     )
 
     return flat_cycles, offsets, cycle_sizes
-
-
-def bfs_multi_source(
-    adjacency: wps.BsrMatrix[wp.Scalar], sources: wp.array[wp.int32]
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
-    """
-    Reachable sets for many sources, packed as a CSR buffer.
-
-    The reachable set of an unbounded traversal is the source's connected component, so this
-    labels components once
-    ([`connected_component_labels`][triwarp.graph.connected_component_labels])
-    and emits each source's component from one label-sorted node array. Source ``sources[k]``
-    owns ``neighbors[offsets[k] : offsets[k + 1]]``, listed with the source itself first and
-    the remaining nodes in ascending index order. There is no reachable-set capacity limit.
-
-    Parameters
-    ----------
-    adjacency
-        Square undirected adjacency in 1x1-block ``warp.sparse.BsrMatrix`` form.
-    sources
-        Length-``k`` ``wp.int32`` start nodes, each in ``[0, node_count)``.
-
-    Returns
-    -------
-    neighbors
-        Flat ``wp.array[wp.int32]`` of reachable nodes for all sources, concatenated in source
-        order (CSR column buffer).
-    offsets
-        Length-``k`` exclusive prefix sum of per-source counts (CSR starts); source ``k`` owns
-        ``neighbors[offsets[k] : offsets[k + 1]]`` with ``offsets[k_total]`` implied as the total.
-
-    Raises
-    ------
-    ValueError
-        If ``adjacency`` is not square, does not use 1x1 blocks, or a source is out of range.
-    RuntimeError
-        If ``adjacency`` and ``sources`` are not on the same device.
-
-    See Also
-    --------
-    [`connected_component_labels`][triwarp.graph.connected_component_labels]
-    [`geodesic_ball`][triwarp.neighbors.geodesic_ball]
-    """
-    require_same_device(adjacency=adjacency, sources=sources)
-    # This one goes through the component labelling rather than the CSR buffers directly, so it
-    # wants only the validation and the node count.
-    node_count, _, _ = _validate_square_csr(adjacency)
-
-    device = adjacency.device
-    k = int(sources.shape[0])
-    if k == 0:
-        empty = wp.empty(0, dtype=wp.int32, device=device)
-        return empty, wp.empty(0, dtype=wp.int32, device=device)
-
-    # Unlike the two edge-buffer range checks in this module, this one stays on the host:
-    # ``sources`` is ``k`` seeds, not a mesh-sized buffer, so a plain host-side check is cheaper
-    # than a device reduction launch at any realistic ``k``.
-    sources_np = sources.numpy()
-    if sources_np.min() < 0 or int(sources_np.max()) >= node_count:
-        raise ValueError(
-            f"source indices must lie in [0, {node_count}), "
-            f"got min={sources_np.min()} max={sources_np.max()}"
-        )
-
-    # The reachable set of an unbounded BFS is exactly the source's connected component, so a
-    # single component labeling plus one stable key sort replaces the per-source traversals —
-    # with no per-thread scratch and no reachable-set capacity cap.
-    labels = connected_component_labels(adjacency)
-    n = int(node_count)
-    # This is ``sort_and_argsort``'s body, not a call to it: that helper takes an already-built
-    # length-``n`` key array and copies it into its own ``2n`` scratch, where the keys here can be
-    # written directly into the scratch's first half by the packing kernel below, at n's cost in
-    # ``wp.int64`` one ``wp.copy`` cheaper.
-    keys_buffer = wp.empty(2 * n, dtype=wp.int64, device=device)
-    node_ids = tw.array.sort_pair_indices(n, -1, device)
-    wp.launch(
-        kernel_graph.pack_label_node_keys,
-        dim=n,
-        inputs=[labels, wp.int64(n), keys_buffer],
-        device=device,
-    )
-    wp.utils.radix_sort_pairs(keys_buffer, node_ids, count=n)
-    sorted_keys = wp.clone(keys_buffer[:n])
-    sorted_nodes = wp.clone(node_ids[:n])
-    node_rank = wp.empty(n, dtype=wp.int32, device=device)
-    wp.launch(kernel_scatter.scatter_index, dim=n, inputs=[sorted_nodes, node_rank], device=device)
-
-    segment_start = wp.empty(k, dtype=wp.int32, device=device)
-    counts = wp.empty(k, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_graph.component_segment_bounds,
-        dim=k,
-        inputs=[sources, labels, sorted_keys, wp.int64(n), segment_start, counts],
-        device=device,
-    )
-    # Host readback: only the device knows the total, and it sizes the neighbour buffer. One scan
-    # and one 4-byte read give both -- reconstructing it as ``offsets[k - 1] + counts[k - 1]`` cost
-    # two separate readbacks, so two full device synchronizations, for the same number.
-    offsets, total = tw.array.counts_to_offsets(counts)
-
-    neighbors = wp.empty(total, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_graph.emit_component_neighbors,
-        dim=total,
-        inputs=[sources, sorted_nodes, node_rank, segment_start, offsets, neighbors],
-        device=device,
-    )
-    return neighbors, offsets
 
 
 def shortest_path_envelope(

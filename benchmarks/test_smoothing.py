@@ -80,8 +80,8 @@ The last group leaves positions alone and runs over a per-vertex **scalar** fiel
 ``filter_scalar_laplacian`` against ``apply_scalar_smoothing_per_vertex``, on the **scale** axis and
 a fixed number of SpMV passes. Its old neighbour here, the Lipschitz projection of the same kind of
 field, moved to [`test_graph.py`](test_graph.py) as ``shortest_path_envelope`` with the function:
-it is a weighted graph relaxation whose pass count is data-dependent, a different cost shape,
-and it now sits next to ``bfs``. The filter needs the scalar attribute to exist on the MeshSet,
+it is a weighted graph relaxation whose pass count is data-dependent, a different cost shape
+from a fixed pass budget. The filter needs the scalar attribute to exist on the MeshSet,
 so this row rebuilds it (the filter mutates the attribute in place).
 """
 

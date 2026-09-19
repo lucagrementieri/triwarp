@@ -220,7 +220,6 @@ def pack_1d_arrays(
         first.** Fifteen public functions hand back such a pair —
         [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched],
         [`successor_cycles`][triwarp.graph.successor_cycles],
-        [`bfs_multi_source`][triwarp.graph.bfs_multi_source],
         [`query_ball_with_offsets`][triwarp.neighbors.query_ball_with_offsets],
         [`geodesic_ball`][triwarp.neighbors.geodesic_ball],
         [`vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency],

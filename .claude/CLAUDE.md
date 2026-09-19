@@ -1020,8 +1020,9 @@ Three things are still defects:
   `holes._mean_rim_edge_length` was reading back the entire vertex buffer while `_loop_perimeters`,
   three hundred lines up in its own file, already computed the answer on the device. **Decide these
   on the CUDA measurement and accept the CPU regression** (§9), but keep the host path where the
-  buffer never scales with the mesh, as `graph.bfs_multi_source`'s `k`-element source check does. The
-  seven-site A/B and its four rejections are §14.5.
+  buffer never scales with the mesh — a `k`-element argument check, a per-segment offset list —
+  rather than with the vertex or face count. The seven-site A/B and its four rejections are
+  §14.5.
 
 ### 3.9 Device checks and the launch-device memory-safety rule
 
@@ -6202,12 +6203,15 @@ and launch elimination will not touch it:
       basis *itself* differs — the atomic-min tree is not the FIFO tree, so total loop length goes
       14 095 → 15 521 on `handles_64` (~10 % longer loops, same count); a homology basis is not
       unique and the suite's invariants cover it, but a caller feeding `shorten_loop` pays that.
-    - **`graph.bfs` and `graph.bfs_from_edges` are deleted**, along with the level-synchronous and
-      serial-drain engines in `kernels/algorithms/bfs.py` (`bfs_multi_source` is a different
-      algorithm — component labelling — and stays). They had no other consumer, and reproducing
+    - **`graph.bfs`, `graph.bfs_from_edges` and `graph.bfs_multi_source` are deleted**, along with
+      the level-synchronous and serial-drain engines in `kernels/algorithms/bfs.py` and the three
+      kernels exclusive to the multi-source form (`pack_label_node_keys`,
+      `component_segment_bounds`, `emit_component_neighbors`). None had an in-tree consumer once
+      the homology decomposition stopped calling one, and reproducing
       `scipy.sparse.csgraph.breadth_first_order` exactly is a promise nothing in the package
-      needed. **The `bfs` benchmark group goes with them, which retires `bfs[ribbon_long]` — the
-      suite's largest single loss row at 22.46 ms / 30.07x.** That row was never reachable from
+      needed. `kernels/algorithms/bfs.py` keeps only `per_source_bfs_collect`, the geodesic-ball
+      engine `neighbors` launches, which never went through the public surface at all. **The `bfs` and `bfs_multi_source` benchmark groups go with them, which retires
+      `bfs[ribbon_long]` — the suite's largest single loss row at 22.46 ms / 30.07x.** That row was never reachable from
       any triwarp call: §14.9 measured its level loop running 3 levels and emitting 6 nodes of
       40 962, the rest being a one-thread serial drain. Deleting the entry point is the honest
       close, not a win.
