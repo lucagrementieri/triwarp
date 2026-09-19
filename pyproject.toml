@@ -357,3 +357,4 @@ reportReturnType = "none"
 
 reportMissingTypeArgument = "error"
 reportMissingTypeStubs = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
