@@ -478,7 +478,7 @@ def geodesic_path(
     require_same_device(
         vertices=vertices, faces=faces, source=source, targets=targets, operators=operators
     )
-    distance = tw.heat.heat_geodesic(vertices, faces, source, t, operators)  # type: ignore[arg-type]
+    distance = tw.heat.heat_geodesic(vertices, faces, source, t, operators)
     return descend_field(vertices, faces, distance, targets, stop_value=0.0, max_steps=max_steps)
 
 

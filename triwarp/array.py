@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import numpy as np
 import warp as wp
@@ -828,7 +828,10 @@ def triplet_buffers(
     return rows, cols, values
 
 
-def empty_square_bsr(n_rows: int, dtype: type, device: wp.DeviceLike) -> wps.BsrMatrix[wp.float32]:
+# ``BsrMatrix[Any]``, not ``BsrMatrix[wp.float32]``: ``dtype`` is a runtime argument and the
+# seven callers pass ``wp.float64`` and ``wp.mat22d`` as well as a variable, so a concrete
+# parameter here is simply wrong for most of them. No overload can narrow a runtime ``type``.
+def empty_square_bsr(n_rows: int, dtype: type, device: wp.DeviceLike) -> wps.BsrMatrix[Any]:
     """
     Zero-nnz ``(n_rows, n_rows)`` operator, the ``n_faces == 0`` return several assemblers share.
 

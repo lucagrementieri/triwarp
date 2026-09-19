@@ -636,7 +636,7 @@ def shortest_path_envelope(
     if node_count == 0:
         return labels
 
-    weights = adjacency.values  # pyright: ignore[reportAttributeAccessIssue]
+    weights = adjacency.values
     if int(weights.shape[0]) > 0 and float(tw.reduce.min(weights)) < 0.0:
         raise ValueError("adjacency weights must be non-negative for the envelope to converge")
 
@@ -720,18 +720,19 @@ def _validate_square_csr(
     """
     Check a CSR adjacency is square with scalar blocks, and unpack what the traversals need.
 
-    The shared entry check of every function here that takes a prebuilt adjacency. The
-    ``pyright: ignore`` comments live here rather than at each call site: Warp's stub omits
-    ``BsrMatrix.offsets`` / ``.columns``.
+    The shared entry check of every function here that takes a prebuilt adjacency. Warp's stub
+    omits ``BsrMatrix.nrow`` / ``.ncol`` / ``.offsets`` / ``.columns``, all of which exist at
+    runtime; ``reportAttributeAccessIssue`` is off package-wide for that reason (see
+    ``pyproject.toml``), so the reads below need no per-site marker.
     """
-    node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
-    ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
+    node_count = adjacency.nrow
+    ncol = adjacency.ncol
     if ncol != node_count:
         raise ValueError(f"adjacency must be square, got shape ({node_count}, {ncol})")
     if adjacency.block_shape != (1, 1):
         raise ValueError(f"adjacency must use 1x1 blocks, got block_shape {adjacency.block_shape}")
-    offsets = adjacency.offsets  # pyright: ignore[reportAttributeAccessIssue]
-    columns = adjacency.columns  # pyright: ignore[reportAttributeAccessIssue]
+    offsets = adjacency.offsets
+    columns = adjacency.columns
     return int(node_count), offsets, columns
 
 

@@ -44,6 +44,19 @@ if TYPE_CHECKING:
     # everywhere else -- this one deliberately gives up the rank check.
     ArrayNdInt32: TypeAlias = wp.array[wp.int32, Any]
     ArrayNd: TypeAlias = wp.array[Any, Any]
+
+    # The six scalar dtypes ``warp.utils.radix_sort_pairs`` accepts as keys, which is what
+    # ``sortable_dtype`` returns. It cannot be spelled ``type[wp.Scalar]``: ``wp.Scalar`` is a
+    # ``TypeVar``, so using it in both the parameter and the return position would claim the
+    # function is dtype-preserving, and widening a narrow dtype is the whole point of it.
+    SortableDType: TypeAlias = (
+        type[wp.int32]
+        | type[wp.int64]
+        | type[wp.uint32]
+        | type[wp.uint64]
+        | type[wp.float32]
+        | type[wp.float64]
+    )
 else:
     Array1dInt32 = wp.array
     Array1dFloat32 = wp.array
@@ -65,6 +78,7 @@ else:
     ScalarArray = wp.array
     ArrayNdInt32 = wp.array
     ArrayNd = wp.array
+    SortableDType = type
 
 __all__ = [
     "Array1dFloat",
@@ -87,6 +101,7 @@ __all__ = [
     "FloatArray",
     "IntArray",
     "ScalarArray",
+    "SortableDType",
     "as_array2d",
     "as_array3d",
     "dtype_max",
@@ -304,7 +319,7 @@ def dtype_zero(dtype: type[wp.Scalar]) -> int | float:
     return 0.0
 
 
-def sortable_dtype(dtype: type[wp.Scalar]) -> type[wp.Scalar]:
+def sortable_dtype(dtype: type[wp.Scalar]) -> SortableDType:
     """
     Same-width dtype that ``warp.utils.radix_sort_pairs`` accepts, preserving ``dtype``'s order.
 
@@ -328,7 +343,7 @@ def sortable_dtype(dtype: type[wp.Scalar]) -> type[wp.Scalar]:
 
     Returns
     -------
-    type[wp.Scalar]
+    SortableDType
         ``dtype`` itself when Warp can already sort it, otherwise the narrowest same-signedness,
         same-kind dtype it can (``float32`` / ``float64``, ``uint32`` / ``uint64``, ``int32`` /
         ``int64``), chosen by whether ``dtype`` is wider than four bytes.
