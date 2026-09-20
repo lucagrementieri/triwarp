@@ -3465,6 +3465,46 @@ Rules: §1.3, §1.5, §1.6.
   count (11 403 / 454 / 3 320 either way), since no real source file has a colon in its name. It
   only reproduces on a *whole-suite* run — three single-file runs produced zero — so do not try to
   reproduce it on one test module. Configured in `pyproject.toml`; the rule is §8.
+- **A `@wp.func` is not inlined at codegen — Warp emits a real `static CUDA_CALLABLE` function and
+  calls it, and the inlining is nvcc's.** The tree says "inlined at codegen, so this costs nothing"
+  in several places (§2.4 among them) and the *conclusion* holds — every extraction measured here
+  compiled to byte-identical or smaller SASS — but the mechanism is the compiler's, not Warp's, so
+  it is a claim to verify rather than a guarantee to assume. A tuple return additionally emits a
+  `wp::copy` per component into the out-parameters, which nvcc also elides.
+- **Proving a `@wp.func` extraction is cost-neutral is free, needs no clock, and is the right tool
+  on a busy box (§15.6).** Warp caches the generated `.cu` *and* the compiled `.ptx` per module
+  under `~/.cache/warp/<version>/wp_<module>_<hash>/`, so the whole recipe is: load the module on
+  `cuda:0` in each arm (the new tree, and a detached worktree — §15.6), read the module hash off
+  `list(warp._src.context.get_module(name).hashers.values())[0].get_hash()`, pick that hash's cache
+  directory, and count instructions per `.visible .entry` in the PTX. Strip the per-kernel
+  `_<8 hex>_cuda_kernel_` infix or the changed kernels will not match across arms, and read only
+  the `_forward` entries.
+    - **Go one step further to SASS, because ptxas folds most of what a PTX diff reports.** Four
+      kernels that moved in PTX (−18, −8, +1, −1) were byte-identical in SASS; two real changes
+      survived. `ptxas -arch=sm_120 -O3` plus `nvdisasm -c` is the whole pipeline, out of
+      `/usr/local/cuda-12.8/bin` (not on `PATH`). That toolchain's ptxas is one PTX version behind
+      Warp's bundled NVRTC, which fails as `Unsupported .version 8.8`; rewriting the `.version`
+      line to `8.7` assembles fine for this instruction set.
+    - **Count `nvdisasm -c` lines on an address regex of `/*[0-9a-f]{4,}*/`, not `{4}`, or the
+      count silently saturates at 4 096.** SASS addresses are 16 bytes apart, so the comment
+      switches to five hex digits at `0x10000` and a four-digit pattern stops matching there. The
+      tell is two *different* kernels reporting exactly 4 096 — which is what a
+      `face_to_mesh_distance` / `_tiled` pair did, hiding their real 10 512 and 11 448 behind a
+      false tie. A truncating counter fails toward "identical", i.e. toward the answer an
+      extraction wants to hear.
+    - **Compare the `_forward` entries and expect the `_backward` ones to move.** A `@wp.func`
+      extraction that is exactly free forward still reshuffles the generated adjoint: across five
+      modules, 103 of 103 forward entries were identical and four backward ones shifted by −320 to
+      +32. That is not evidence of a cost, because nothing outside `kernels/metrics.py` is
+      differentiated (§2.6) — but a diff that reads every entry reports it as one.
+- **Warp lowers a kernel-scope `not` on a bool as a *select*, not by flipping the comparison, so a
+  boolean `@wp.func` imposes a polarity on its callers and the complement costs a select per call.**
+  Measured on `voxels.count_box_faces`, whose six-row stencil loop unrolls: sharing the neighbour
+  probe as `-> wp.bool` and writing `if not probe(...)` cost **48 SASS instructions**, where sharing
+  it as `-> wp.int32` (the grid slot) and leaving each caller its own `< 0` / `>= 0` is exactly
+  free. Counting the complement and subtracting (`6 - covered`) was tried and is *worse* (+88).
+  **So a shared predicate over a sentinel returns the sentinel, not a boolean**, which is what
+  `voxels.cell_slot` / `point_slot` already did and the reason to follow them.
 - **`wp.constant(x)` is `return x` after an `is_value(x)` check — on Warp 1.17 it is an identity
   function, not a declaration.** A bare module-level global with no `wp.constant()` and no typed
   constructor compiles and runs correctly from kernel scope on both devices, because Warp's codegen

@@ -1,9 +1,8 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
-from triwarp.kernels.predicates import triangle_double_area
 from triwarp.kernels.reduce import tile_chunk
-from triwarp.kernels.triangles import face_vertices, face_vertices_vec3d
+from triwarp.kernels.triangles import face_area_weighted_centroid, face_vertices_vec3d
 
 
 @wp.kernel
@@ -41,19 +40,15 @@ def centroid_tiled(
     # same four slots. Measured 1.75x on ``surface_centroid``, which also loses an allocation and
     # a launch argument.
     #
-    # The area comes from ``triangle_double_area`` over the corners already in registers, not from
-    # ``face_normals_and_area``: that helper re-enters ``face_vertices`` through ``triangle_cross``,
-    # so the pair loaded all three corners twice, and it also normalizes a face normal this kernel
-    # then binds to ``_`` and discards. The expression is the same one either way
-    # (``0.5 * |cross(v1 - v0, v2 - v0)|``), so the areas are bit-identical.
+    # The per-face contribution is ``triangles.face_area_weighted_centroid``, shared with
+    # ``centroid_sliced`` below so the two paths cannot drift; see it for why the area is taken
+    # from the corners this kernel already holds.
     i, t = wp.tid()
     f = i * TILE_1D + t
     contrib = wp.vec3(0.0, 0.0, 0.0)
     area = wp.float32(0.0)
     if f < n_faces:
-        v0, v1, v2 = face_vertices(vertices, faces, f)
-        area = 0.5 * triangle_double_area(v0, v1, v2)
-        contrib = (v0 + v1 + v2) * (area / 3.0)
+        contrib, area = face_area_weighted_centroid(vertices, faces, f)
     sum_x = wp.tile_sum(wp.tile(contrib[0]))
     sum_y = wp.tile_sum(wp.tile(contrib[1]))
     sum_z = wp.tile_sum(wp.tile(contrib[2]))
@@ -84,15 +79,15 @@ def centroid_sliced(
     # each tile. It was invisible on a symmetric mesh, whose every-Nth-face centroid is still the
     # true centroid.
     #
-    # Same corner-loading note as `centroid_tiled` above: the area is taken from the corners this
-    # loop already holds.
+    # The per-face contribution is the same shared ``triangles.face_area_weighted_centroid``
+    # `centroid_tiled` folds, which is what makes the two paths the same reduction over the same
+    # summands and their disagreement purely one of summation order.
     j = wp.int32(wp.tid())
     total = wp.vec3(0.0, 0.0, 0.0)
     area_total = wp.float32(0.0)
     for f in range(j, n_faces, n_slices):
-        v0, v1, v2 = face_vertices(vertices, faces, f)
-        area = 0.5 * triangle_double_area(v0, v1, v2)
-        total = total + (v0 + v1 + v2) * (area / 3.0)
+        contrib, area = face_area_weighted_centroid(vertices, faces, f)
+        total = total + contrib
         area_total = area_total + area
     wp.atomic_add(out_totals, 0, total[0])
     wp.atomic_add(out_totals, 1, total[1])

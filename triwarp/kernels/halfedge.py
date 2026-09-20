@@ -47,6 +47,17 @@ def halfedge_destination(faces: wp.array[wp.int32], h: wp.int32) -> wp.int32:
     return faces[h + wp.int32(1)]
 
 
+@wp.func
+def halfedge_endpoints(faces: wp.array[wp.int32], h: wp.int32) -> tuple[wp.int32, wp.int32]:
+    # Halfedge ``h`` as the directed vertex pair ``(origin, destination)`` it runs along, which
+    # puts its own face on the left because a face's corners run counter-clockwise.
+    #
+    # Named because ``faces[h]`` being the origin is a *convention*, and a caller that reads one
+    # endpoint through ``halfedge_destination`` and the other by indexing ``faces`` directly is
+    # spelling half of it out by hand.
+    return faces[h], halfedge_destination(faces, h)
+
+
 @wp.kernel
 def pair_sorted_halfedges(
     faces: wp.array[wp.int32],

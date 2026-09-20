@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.array import loop_next_slot, pack_ranked_key
+from triwarp.kernels.array import loop_rim_edge, pack_ranked_key
 
 
 @wp.kernel
@@ -123,9 +123,7 @@ def loop_perimeters(
     # Segmented ``polyline_length(closed=True)``: the arc length of every loop in one launch, so
     # ``preserve_largest_hole`` costs one readback instead of two per loop.
     t = wp.int32(wp.tid())
-    ell = loop_id[t]
-    a = vertices[flat_loops[t]]
-    c = vertices[flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, t)]]
+    ell, a, c = loop_rim_edge(flat_loops, loop_id, loop_starts, loop_sizes, vertices, t)
     wp.atomic_add(out_perimeter, ell, wp.length(c - a))
 
 
@@ -143,9 +141,7 @@ def loop_directed_areas(
     # Origin-independent because the cross products of a *closed* ring cancel the shift, so no
     # centroid pass is needed -- and accumulated per segment in one launch, like the perimeter.
     t = wp.int32(wp.tid())
-    ell = loop_id[t]
-    a = vertices[flat_loops[t]]
-    c = vertices[flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, t)]]
+    ell, a, c = loop_rim_edge(flat_loops, loop_id, loop_starts, loop_sizes, vertices, t)
     wp.atomic_add(out_directed_area, ell, wp.float32(0.5) * wp.cross(a, c))
 
 

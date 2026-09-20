@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.predicates import normalize_or_zero
-from triwarp.kernels.proximity import closest_point_query
+from triwarp.kernels.proximity import write_closest_point_query
 from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
 from triwarp.kernels.transform import transform_point_mat44
 
@@ -108,8 +108,6 @@ def accumulate_procrustes_moments(
     # there too.
     #
     # A zero-length ``weights`` means uniform weights, which is what ``icp`` passes: the
-    # alternative is a ``wp.full(n, 1.0)`` allocation *and* fill on every iteration, for a value
-    # the kernel can just assume.
     # alternative is a ``wp.full(n, 1.0)`` allocation *and* fill on every iteration, for a value
     # the kernel can just assume.
     chunk, lane = wp.tid()
@@ -393,10 +391,9 @@ def mesh_correspondence_pass(
     # this against a run with the convergence break live: the two arms then stop at different
     # iterations and the ratio is fiction.
     tid = wp.int32(wp.tid())
-    closest, distance, face = closest_point_query(mesh_id, points[tid], query_max)
-    out_closest[tid] = closest
-    out_distance[tid] = distance
-    out_face[tid] = face
+    distance, face = write_closest_point_query(
+        mesh_id, points, query_max, tid, out_closest, out_distance, out_face
+    )
     out_normals[tid] = correspondence_normal(normal_source, face)
     out_valid[tid] = residual_valid(face, distance, max_distance)
 
@@ -416,12 +413,12 @@ def mesh_correspondence_weight_pass(
     # binary distance gate its Procrustes fit weights by. The sibling of
     # ``mesh_correspondence_pass``, which serves the point-to-plane loop and additionally gathers
     # a target normal -- the two differ by that gather and by whether the gate is reported as a
-    # weight or as a mask, so they stay two kernels over one shared query.
+    # weight or as a mask, so they stay two kernels over the one shared
+    # ``write_closest_point_query``.
     tid = wp.int32(wp.tid())
-    closest, distance, face = closest_point_query(mesh_id, points[tid], query_max)
-    out_closest[tid] = closest
-    out_distance[tid] = distance
-    out_face[tid] = face
+    distance, face = write_closest_point_query(
+        mesh_id, points, query_max, tid, out_closest, out_distance, out_face
+    )
     out_weights[tid] = distance_threshold_weight(distance, face, max_distance)
 
 

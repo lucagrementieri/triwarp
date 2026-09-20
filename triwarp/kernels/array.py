@@ -146,6 +146,31 @@ def loop_next_slot(
 
 
 @wp.func
+def loop_rim_edge(
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    values: wp.array[Any],
+    slot: wp.int32,
+) -> tuple[wp.int32, Any, Any]:
+    # The rim edge leaving packed slot ``slot``: which loop owns it, and the two per-vertex values
+    # at its ends -- the far one found through ``loop_next_slot`` above, so it wraps inside its own
+    # loop rather than into the next one's.
+    #
+    # The per-segment prologue of every segmented loop reduction: ``boundary.loop_perimeters``,
+    # ``boundary.loop_directed_areas`` and ``holes.loop_rim_metrics`` each opened with these same
+    # three statements and differ only in what they fold the edge into. Generic over the value
+    # dtype the way ``triangles.face_vertices`` is, so a float64 rim reduction needs no second
+    # spelling. The three kernels compile to byte-identical SASS with it, so it is free.
+    return (
+        loop_id[slot],
+        values[flat_loops[slot]],
+        values[flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, slot)]],
+    )
+
+
+@wp.func
 def update_argmin(
     best_value: wp.ref[wp.float32], best_index: wp.ref[wp.int32], value: wp.float32, index: wp.int32
 ):
@@ -1049,6 +1074,20 @@ def complement_rank_index(index: wp.int32) -> wp.uint32:
 
 
 @wp.func
+def float_order_bits(value: wp.float32) -> wp.uint64:
+    # A **non-negative** float reinterpreted as the high half of a sortable integer key. The
+    # IEEE-754 bits of a non-negative float increase monotonically with the value, so comparing
+    # these bits as an unsigned integer is comparing the floats -- which is the whole trick behind
+    # ``pack_farthest_key`` and ``pack_nearest_key`` below, and it is *only* valid because both
+    # take a distance. A negative input orders backwards and silently.
+    #
+    # Named for the same reason ``complement_rank_index`` is: the convention is what a second
+    # packer has to get right, and an expression repeated once per packer is one that can drift
+    # from its precondition.
+    return wp.uint64(wp.uint32(wp.cast(value, wp.int32)))
+
+
+@wp.func
 def pack_farthest_key(distance_sq: wp.float32, index: wp.int32) -> wp.int64:
     # One int64 whose ``wp.atomic_max`` is "largest distance, lowest index on a tie". The IEEE-754
     # bits of a non-negative float increase monotonically with the value, so the high half orders
@@ -1056,7 +1095,7 @@ def pack_farthest_key(distance_sq: wp.float32, index: wp.int32) -> wp.int64:
     # index compares *larger*. Both halves are non-negative, so the whole key is, which is what
     # makes ``-1`` a sentinel below every real candidate. ``unpack_ranked_index`` inverts the
     # low half.
-    distance_bits = wp.uint64(wp.uint32(wp.cast(distance_sq, wp.int32)))
+    distance_bits = float_order_bits(distance_sq)
     rank = wp.uint64(complement_rank_index(index))
     return wp.int64((distance_bits << wp.uint64(32)) | rank)
 
@@ -1095,11 +1134,11 @@ def unpack_ranked_index(key: wp.int64) -> wp.int32:
 @wp.func
 def pack_nearest_key(distance: wp.float32, index: wp.int32) -> wp.int64:
     # The ``min``-ordered twin of ``pack_farthest_key``: one int64 whose minimum is "smallest
-    # distance, lowest index on a tie". Same monotone IEEE-754 high half (valid because a distance
-    # is non-negative), but the index is stored plainly rather than complemented, because a
+    # distance, lowest index on a tie". Same ``float_order_bits`` high half (valid because a
+    # distance is non-negative), but the index is stored plainly rather than complemented, because a
     # *smaller* index must now compare *smaller*. The key stays non-negative, so it needs no
     # sentinel.
-    distance_bits = wp.uint64(wp.uint32(wp.cast(distance, wp.int32)))
+    distance_bits = float_order_bits(distance)
     return wp.int64((distance_bits << wp.uint64(32)) | wp.uint64(wp.uint32(index)))
 
 

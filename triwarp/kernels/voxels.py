@@ -27,7 +27,7 @@ from triwarp.constants import INT32_MAX_CONSTANT
 from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_representative
 from triwarp.kernels.array import binary_search_index, lattice_position, ravel_index
 from triwarp.kernels.predicates import triangle_aabb, triangle_aabb_overlap
-from triwarp.kernels.triangles import face_vertices, write_row_triple
+from triwarp.kernels.triangles import face_vertices, row_triple, write_row_triple
 
 # ---------------------------------------------------------------------------------------------
 # Voxelization
@@ -408,19 +408,47 @@ def zero_empty_voxels(counts: wp.array[wp.int32], out_values: wp.array[wp.vec3])
 # ---------------------------------------------------------------------------------------------
 
 
+@wp.func
+def neighbor_cell(
+    cells: wp.array2d[wp.int32], v: wp.int32, offsets: wp.array2d[wp.int32], m: wp.int32
+) -> wp.vec3i:
+    # Cell ``v`` displaced by stencil row ``m``. The four kernels in the two sections below -- the
+    # morphology candidates and completeness passes, and the box-face count and emit passes --
+    # all walk a stencil this way and wrote the three component sums out longhand; one statement
+    # of it rather than four; all four compile to byte-identical SASS, so it is free.
+    i, j, k = row_triple(cells, v)
+    di, dj, dk = row_triple(offsets, m)
+    return wp.vec3i(i + di, j + dj, k + dk)
+
+
+@wp.func
+def neighbor_slot(
+    volume: wp.uint64,
+    cells: wp.array2d[wp.int32],
+    v: wp.int32,
+    offsets: wp.array2d[wp.int32],
+    m: wp.int32,
+) -> wp.int32:
+    # Grid row of cell ``v``'s stencil neighbour ``m``, or ``-1`` when that neighbour is empty --
+    # the probe the completeness, count and emit passes below each run once per stencil row.
+    #
+    # It returns the *slot* rather than a boolean, which is ``cell_slot``'s convention above and is
+    # load-bearing here: the three callers want opposite polarities, and Warp lowers a ``not`` on a
+    # bool as a select rather than by flipping the comparison, so a boolean helper makes one of
+    # them pay an extra select per unrolled stencil row (measured: 48 SASS instructions on
+    # ``count_box_faces`` at sm_120). Handing back the slot lets each caller keep the comparison it
+    # already had, and the shared arithmetic still has one home.
+    cell = neighbor_cell(cells, v, offsets, m)
+    return wp.volume_lookup_index(volume, cell[0], cell[1], cell[2])
+
+
 @wp.kernel
 def neighborhood_candidates(
     voxels: wp.array2d[wp.int32], neighbors: wp.array2d[wp.int32], out_cells: wp.array2d[wp.int32]
 ) -> None:
     v, m = wp.tid()
-    row = v * neighbors.shape[0] + m
-    write_row_triple(
-        out_cells,
-        row,
-        voxels[v, 0] + neighbors[m, 0],
-        voxels[v, 1] + neighbors[m, 1],
-        voxels[v, 2] + neighbors[m, 2],
-    )
+    cell = neighbor_cell(voxels, v, neighbors, m)
+    write_row_triple(out_cells, v * neighbors.shape[0] + m, cell[0], cell[1], cell[2])
 
 
 @wp.kernel
@@ -444,10 +472,7 @@ def neighborhood_complete(
     v = wp.int32(wp.tid())
     complete = wp.int32(1)
     for m in range(neighbors.shape[0]):
-        i = voxels[v, 0] + neighbors[m, 0]
-        j = voxels[v, 1] + neighbors[m, 1]
-        k = voxels[v, 2] + neighbors[m, 2]
-        if wp.volume_lookup_index(volume, i, j, k) < 0:
+        if neighbor_slot(volume, voxels, v, neighbors, m) < 0:
             complete = wp.int32(0)
     out_flags[v] = wp.where(interior, complete, 1 - complete)
 
@@ -579,6 +604,9 @@ def fill_enclosed_cells(
 def cell_is_occupied(
     volume: wp.uint64, base: wp.vec3i, i: wp.int32, j: wp.int32, k: wp.int32
 ) -> wp.bool:
+    # The dense-conversion counterpart of ``neighbor_slot``: these kernels index by their own
+    # ``wp.tid()`` triple rather than through a stencil table, and want the boolean rather than the
+    # row, so the offset arithmetic is a lattice one and does not go through ``neighbor_cell``.
     return wp.volume_lookup_index(volume, base[0] + i, base[1] + j, base[2] + k) >= 0
 
 
@@ -653,10 +681,7 @@ def count_box_faces(
         return
     exposed = wp.int32(0)
     for d in range(6):
-        i = voxels[v, 0] + neighbors[d, 0]
-        j = voxels[v, 1] + neighbors[d, 1]
-        k = voxels[v, 2] + neighbors[d, 2]
-        if wp.volume_lookup_index(volume, i, j, k) < 0:
+        if neighbor_slot(volume, voxels, v, neighbors, d) < 0:
             exposed += 1
     out_counts[v] = exposed
 
@@ -676,10 +701,7 @@ def emit_box_faces(
     v = wp.int32(wp.tid())
     quad = offsets[v]
     for d in range(6):
-        i = voxels[v, 0] + neighbors[d, 0]
-        j = voxels[v, 1] + neighbors[d, 1]
-        k = voxels[v, 2] + neighbors[d, 2]
-        if cull_internal and wp.volume_lookup_index(volume, i, j, k) >= 0:
+        if cull_internal and neighbor_slot(volume, voxels, v, neighbors, d) >= 0:
             continue
         a = corners[v, face_corners[d, 0]]
         b = corners[v, face_corners[d, 1]]

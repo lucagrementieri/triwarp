@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import OverloadTable, declare_map_signatures, map_probe, to_vec3d
-from triwarp.kernels.halfedge import halfedge_destination
+from triwarp.kernels.halfedge import halfedge_endpoints
 from triwarp.kernels.predicates import (
     corner_cosines_from_l2,
     squared_edge_lengths,
@@ -492,7 +492,8 @@ def curved_pair_terms(
 def halfedge_orientation(faces: wp.array[wp.int32], halfedge: wp.int32) -> wp.float64:
     # +1 when the halfedge runs from the smaller vertex index to the larger, i.e. agrees with the
     # min-first row ``edges_unique`` stores for its edge.
-    if faces[halfedge] < halfedge_destination(faces, halfedge):
+    origin, destination = halfedge_endpoints(faces, halfedge)
+    if origin < destination:
         return wp.float64(1.0)
     return wp.float64(-1.0)
 

@@ -7,7 +7,7 @@ from triwarp.kernels.array import (
     pack_directed_key,
     pack_edge_key,
 )
-from triwarp.kernels.halfedge import halfedge_destination
+from triwarp.kernels.halfedge import halfedge_endpoints
 from triwarp.kernels.triangles import corner_triple
 
 
@@ -108,8 +108,10 @@ def oriented_edges_from_halfedges(
 ) -> None:
     # A halfedge read as a directed vertex pair, which puts its own face on the left.
     i = wp.int32(wp.tid())
-    out_edges[i, 0] = faces[halfedges[i]]
-    out_edges[i, 1] = halfedge_destination(faces, halfedges[i])
+    # Bound to locals first: Warp cannot assign a multi-return straight into array elements.
+    tail, tip = halfedge_endpoints(faces, halfedges[i])
+    out_edges[i, 0] = tail
+    out_edges[i, 1] = tip
 
 
 @wp.kernel
@@ -193,8 +195,7 @@ def open_dual_edges_and_seeds(
     # blocking test and the seeding all come from `twins`, which is one hash-and-group pass instead
     # of that plus a second key sort over every halfedge and a mask-compact over every dual edge.
     h = wp.int32(wp.tid())
-    tail = faces[h]
-    tip = halfedge_destination(faces, h)
+    tail, tip = halfedge_endpoints(faces, h)
     forward = pack_directed_key(tail, tip, base)
     along_contour = binary_search_sorted_contains(contour_keys_sorted, forward)
     if along_contour:

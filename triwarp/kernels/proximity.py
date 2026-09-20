@@ -45,6 +45,31 @@ def closest_point_query(
     return p, max_dist, wp.int32(-1)
 
 
+@wp.func
+def write_closest_point_query(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    max_dist: wp.float32,
+    tid: wp.int32,
+    out_closest: wp.array[wp.vec3],
+    out_distance: wp.array[wp.float32],
+    out_face: wp.array[wp.int32],
+) -> tuple[wp.float32, wp.int32]:
+    # ``closest_point_query`` plus the three-slot publication every caller performs on its answer,
+    # returning the two components a fused caller then re-reads from registers rather than from the
+    # buffers it just wrote.
+    #
+    # The publication protocol, not just the query, is what the three kernels share:
+    # ``closest_point_on_mesh`` below and ``registration``'s two ICP correspondence passes wrote
+    # the identical four statements, and the two ICP ones already carried a comment saying they
+    # were "two kernels over one shared query" -- which only a shared function can keep true.
+    closest, distance, face = closest_point_query(mesh_id, points[tid], max_dist)
+    out_closest[tid] = closest
+    out_distance[tid] = distance
+    out_face[tid] = face
+    return distance, face
+
+
 @wp.kernel
 def closest_point_on_mesh(
     mesh_id: wp.uint64,
@@ -55,10 +80,7 @@ def closest_point_on_mesh(
     out_face: wp.array[wp.int32],
 ) -> None:
     tid = wp.int32(wp.tid())
-    closest, distance, face = closest_point_query(mesh_id, points[tid], max_dist)
-    out_closest[tid] = closest
-    out_distance[tid] = distance
-    out_face[tid] = face
+    write_closest_point_query(mesh_id, points, max_dist, tid, out_closest, out_distance, out_face)
 
 
 @wp.kernel
@@ -175,6 +197,65 @@ def face_pair_distance_sq(
     return triangle_triangle_distance_sq(a0, a1, a2, b0, b1, b2)
 
 
+@wp.func
+def query_face_broad_phase(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32, upper_bound: wp.float32
+) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3, wp.vec3, wp.vec3, wp.vec3]:
+    # One query face's three corners, its own AABB, and that box grown by ``upper_bound`` -- which
+    # is the box handed to the traversal, and the reason the ungrown one is returned beside it:
+    # ``face_pair_distance_sq`` prunes on the *ungrown* gap, so a caller needs both.
+    #
+    # Shared by the two kernels below, which differ only in who walks the candidates.
+    a0, a1, a2 = kernel_triangles.face_vertices(vertices, faces, f)
+    lower, upper = triangle_aabb(a0, a1, a2)
+    margin = wp.vec3(upper_bound, upper_bound, upper_bound)
+    return a0, a1, a2, lower, upper, lower - margin, upper + margin
+
+
+@wp.func
+def update_nearest_face_pair(
+    a0: wp.vec3,
+    a1: wp.vec3,
+    a2: wp.vec3,
+    lower: wp.vec3,
+    upper: wp.vec3,
+    target_vertices: wp.array[wp.vec3],
+    target_faces: wp.array[wp.int32],
+    target_lower: wp.array[wp.vec3],
+    target_upper: wp.array[wp.vec3],
+    candidate: wp.int32,
+    best: wp.float32,
+    witness: wp.int32,
+    global_best_sq: wp.array[wp.float32],
+) -> tuple[wp.float32, wp.int32]:
+    # One candidate, tested and folded into the walker's running best: the new ``(best, witness)``,
+    # and the publication into ``global_best_sq`` that lets every other walker prune against it.
+    #
+    # This is the *decision rule*, not just the arithmetic, and that is why it is named. The two
+    # kernels below wrote it out identically -- the prune limit is ``wp.min(local, global)``, the
+    # update is strictly ``<`` so the lowest-index candidate wins a tie, and the publication is
+    # relaxed by ``_GLOBAL_BEST_RELAX`` for the reason this module's header documents. A copy of a
+    # three-part rule like that is a copy that drifts, and the module header's argument for the
+    # relaxation is a claim only a shared function can keep true for both walkers.
+    distance_sq = face_pair_distance_sq(
+        a0,
+        a1,
+        a2,
+        lower,
+        upper,
+        target_vertices,
+        target_faces,
+        target_lower,
+        target_upper,
+        candidate,
+        wp.min(best, global_best_sq[0]),
+    )
+    if distance_sq < best:
+        wp.atomic_min(global_best_sq, 0, distance_sq * _GLOBAL_BEST_RELAX)
+        return distance_sq, candidate
+    return best, witness
+
+
 @wp.kernel
 def face_to_mesh_distance(
     query_vertices: wp.array[wp.vec3],
@@ -214,22 +295,22 @@ def face_to_mesh_distance(
     # the ``wp.Mesh``'s *own* BVH over its faces, so the caller builds no second structure.
     target_bvh = wp.mesh_get_bvh(target_mesh)
     f = wp.int32(wp.tid())
-    a0, a1, a2 = kernel_triangles.face_vertices(query_vertices, query_faces, f)
-    lower, upper = triangle_aabb(a0, a1, a2)
-    margin = wp.vec3(upper_bound, upper_bound, upper_bound)
+    a0, a1, a2, lower, upper, grown_lower, grown_upper = query_face_broad_phase(
+        query_vertices, query_faces, f, upper_bound
+    )
 
     best = FLOAT32_INF_CONSTANT
     witness = wp.int32(-1)
     seen = wp.int32(0)
     overflowed = wp.bool(False)
-    query = wp.bvh_query_aabb(target_bvh, lower - margin, upper + margin)
+    query = wp.bvh_query_aabb(target_bvh, grown_lower, grown_upper)
     candidate = wp.int32(0)
     while wp.bvh_query_next(query, candidate):
         seen += 1
         if seen > candidate_cap:
             overflowed = wp.bool(True)
             break
-        distance_sq = face_pair_distance_sq(
+        best, witness = update_nearest_face_pair(
             a0,
             a1,
             a2,
@@ -240,12 +321,10 @@ def face_to_mesh_distance(
             target_lower,
             target_upper,
             candidate,
-            wp.min(best, global_best_sq[0]),
+            best,
+            witness,
+            global_best_sq,
         )
-        if distance_sq < best:
-            best = distance_sq
-            witness = candidate
-            wp.atomic_min(global_best_sq, 0, best * _GLOBAL_BEST_RELAX)
     out_distance_sq[f] = best
     out_witness[f] = witness
     if overflowed:
@@ -286,13 +365,13 @@ def face_to_mesh_distance_tiled(
     slot = wp.int32(wp.tid())
     f = overflow[slot]
     n_target_faces = target_faces.shape[0] // 3
-    a0, a1, a2 = kernel_triangles.face_vertices(query_vertices, query_faces, f)
-    lower, upper = triangle_aabb(a0, a1, a2)
-    margin = wp.vec3(upper_bound, upper_bound, upper_bound)
+    a0, a1, a2, lower, upper, grown_lower, grown_upper = query_face_broad_phase(
+        query_vertices, query_faces, f, upper_bound
+    )
 
     best = FLOAT32_INF_CONSTANT
     witness = wp.int32(-1)
-    query = wp.tile_bvh_query_aabb(target_bvh, lower - margin, upper + margin)
+    query = wp.tile_bvh_query_aabb(target_bvh, grown_lower, grown_upper)
     while wp.tile_query_valid(query):
         candidate = wp.untile(wp.tile_bvh_query_next(query))
         # A lane with no candidate this step gets -1; the tile is block-wide, so it cannot simply
@@ -308,7 +387,7 @@ def face_to_mesh_distance_tiled(
         # reads uninitialised shared memory as a primitive index. ``compute-sanitizer`` names this
         # kernel and this load, reading wildly out of range, on a large straggler set.
         if candidate >= 0 and candidate < n_target_faces:
-            distance_sq = face_pair_distance_sq(
+            best, witness = update_nearest_face_pair(
                 a0,
                 a1,
                 a2,
@@ -319,12 +398,10 @@ def face_to_mesh_distance_tiled(
                 target_lower,
                 target_upper,
                 candidate,
-                wp.min(best, global_best_sq[0]),
+                best,
+                witness,
+                global_best_sq,
             )
-            if distance_sq < best:
-                best = distance_sq
-                witness = candidate
-                wp.atomic_min(global_best_sq, 0, best * _GLOBAL_BEST_RELAX)
     # The witness must not depend on which lane happened to see it, which is what
     # ``tile_argmin``'s second stage is for. When no lane found a candidate every lane still holds
     # ``(inf, -1)``, so it returns -1 and no fixup is needed here.
@@ -607,12 +684,8 @@ def face_containing_point_2d(
         return
 
     face = query.face
-    barycentric = barycentric_2d(
-        vertices[faces[face * 3 + 0]],
-        vertices[faces[face * 3 + 1]],
-        vertices[faces[face * 3 + 2]],
-        p,
-    )
+    c0, c1, c2 = kernel_triangles.face_vertices(vertices, faces, face)
+    barycentric = barycentric_2d(c0, c1, c2, p)
     if wp.min(barycentric[0], wp.min(barycentric[1], barycentric[2])) >= -barycentric_epsilon:
         out_face[tid] = face
 

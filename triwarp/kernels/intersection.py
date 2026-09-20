@@ -637,6 +637,23 @@ def face_edge_crossing(
 
 
 @wp.func
+def cut_face_context(
+    face_indices: wp.array[wp.int32], face_signs: wp.array2d[wp.int32], tid: wp.int32
+) -> tuple[wp.int32, wp.int32, wp.int32, wp.int32, wp.int32]:
+    # The cut face work item ``tid`` owns: its face index, the base of its corner triple in the
+    # flat face buffer, and its three corner signs.
+    #
+    # The prologue all four emit kernels below open with -- they differ in *which* corner the signs
+    # single out and in what they write, never in how they find the face. Shared rather than
+    # repeated so ``face_signs``' row layout and the ``3 * f`` corner convention have one
+    # statement each. Three of the four compile to byte-identical SASS and
+    # ``emit_split_cut_corner`` to 8 instructions fewer, so it is free or better.
+    face_index = face_indices[tid]
+    s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
+    return face_index, face_index * wp.int32(3), s0, s1, s2
+
+
+@wp.func
 def emit_cut_vertices(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -691,9 +708,7 @@ def emit_quad_cut(
     out_new_faces: wp.array2d[wp.int32],
 ) -> None:
     tid = wp.int32(wp.tid())
-    face_index = face_indices[tid]
-    base = face_index * wp.int32(3)
-    s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
+    face_index, base, s0, s1, s2 = cut_face_context(face_indices, face_signs, tid)
     outside = find_corner_with_sign(s0, s1, s2, SLICE_SIGN_OUTSIDE)
     inside_a = (outside + wp.int32(1)) % wp.int32(3)
     inside_b = (outside + wp.int32(2)) % wp.int32(3)
@@ -726,9 +741,7 @@ def emit_tri_cut(
     out_new_faces: wp.array2d[wp.int32],
 ) -> None:
     tid = wp.int32(wp.tid())
-    face_index = face_indices[tid]
-    base = face_index * wp.int32(3)
-    s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
+    face_index, base, s0, s1, s2 = cut_face_context(face_indices, face_signs, tid)
     inside = find_corner_with_sign(s0, s1, s2, SLICE_SIGN_INSIDE)
     v_inside = faces[base + inside]
     corner_a = (inside + wp.int32(1)) % wp.int32(3)
@@ -840,9 +853,7 @@ def emit_split_cut_edges(
     # Windings match ``emit_tri_cut`` and ``emit_quad_cut``, which emit these same triangles one
     # side at a time; the difference is that both sides are kept here.
     tid = wp.int32(wp.tid())
-    face_index = face_indices[tid]
-    base = face_index * wp.int32(3)
-    s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
+    face_index, base, s0, s1, s2 = cut_face_context(face_indices, face_signs, tid)
     lone = find_unique_sign_vertex(s0, s1, s2)
     next_corner = (lone + wp.int32(1)) % wp.int32(3)
     last_corner = (lone + wp.int32(2)) % wp.int32(3)
@@ -884,14 +895,12 @@ def emit_split_cut_corner(
     # the opposite edge: two triangles, no quad. Emitting three the other kernel's way would put a
     # zero-area sliver in the output, which is the only reason this class exists separately.
     tid = wp.int32(wp.tid())
-    face_index = face_indices[tid]
-    base = face_index * wp.int32(3)
-    _s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
-    on_level = wp.int32(0)  # corner 0 by elimination: exactly one of the three is zero here
-    if s1 == wp.int32(0):
-        on_level = wp.int32(1)
-    elif s2 == wp.int32(0):
-        on_level = wp.int32(2)
+    face_index, base, s0, s1, s2 = cut_face_context(face_indices, face_signs, tid)
+    # Exactly one of the three corners is on the level set here, which is the precondition
+    # ``find_corner_with_sign`` states: it tests corners 0 and 1 and falls through to 2, which
+    # agrees with the by-elimination chain this replaces on every input that satisfies it. One
+    # spelling of "which corner carries this sign" in the file, not two that can drift apart.
+    on_level = find_corner_with_sign(s0, s1, s2, SLICE_SIGN_ON_PLANE)
     next_corner = (on_level + wp.int32(1)) % wp.int32(3)
     last_corner = (on_level + wp.int32(2)) % wp.int32(3)
     crossing = split_edge_vertex(halfedge_edges, edge_vertex_rank, vertex_base, base + next_corner)

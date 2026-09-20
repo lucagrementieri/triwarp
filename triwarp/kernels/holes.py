@@ -7,6 +7,7 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import (
     declare_map_signatures,
     loop_next_slot,
+    loop_rim_edge,
     map_probe,
     map_probe_single,
     pack_nearest_key,
@@ -14,6 +15,7 @@ from triwarp.kernels.array import (
     update_argmin,
 )
 from triwarp.kernels.array import wrap_index as _wrap
+from triwarp.kernels.halfedge import halfedge_prev
 from triwarp.kernels.predicates import (
     circumcircle_diameter,
     dihedral_angle,
@@ -235,9 +237,7 @@ def loop_rim_metrics(
     # per-loop equivalents are ``tw.reduce.max`` over a gathered rim and
     # ``tw.polyline.polyline_normal``, each of which costs a host synchronization per loop.
     t = wp.int32(wp.tid())
-    ell = loop_id[t]
-    a = vertices[flat_loops[t]]
-    c = vertices[flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, t)]]
+    ell, a, c = loop_rim_edge(flat_loops, loop_id, loop_starts, loop_sizes, vertices, t)
     wp.atomic_max(out_max_edge_sq, ell, wp.length_sq(c - a))
     wp.atomic_add(out_normal, ell, wp.cross(a, c))
 
@@ -731,11 +731,12 @@ def flag_bad_triangulations(
 
 @wp.kernel
 def edge_third_vertex(faces: wp.array[wp.int32], out_third: wp.array[wp.int32]) -> None:
-    # Third vertex per faces_to_edges row: edge k of face f is (v_k, v_{k+1}), third is v_{k+2}.
+    # Third vertex per faces_to_edges row: edge ``k`` of face ``f`` is ``(v_k, v_{k+1})``, so the
+    # third corner is ``v_{k+2}`` -- which under the ``h = 3f + k`` numbering both buffers already
+    # use is the origin of the *previous* halfedge, hence ``halfedge_prev`` rather than a second
+    # spelling of the same face-local cycle.
     r = wp.int32(wp.tid())
-    f = r // 3
-    k = r % 3
-    out_third[r] = faces[f * 3 + (k + 2) % 3]
+    out_third[r] = faces[halfedge_prev(r)]
 
 
 @wp.kernel

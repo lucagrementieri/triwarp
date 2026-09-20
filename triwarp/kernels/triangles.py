@@ -550,9 +550,26 @@ def closest_point(
 @wp.func
 def face_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32) -> wp.vec3:
     # Barycentre of face ``f``: the mean of its three corners.
-    return (
-        vertices[faces[f * 3 + 0]] + vertices[faces[f * 3 + 1]] + vertices[faces[f * 3 + 2]]
-    ) / 3.0
+    v0, v1, v2 = face_vertices(vertices, faces, f)
+    return (v0 + v1 + v2) / 3.0
+
+
+@wp.func
+def face_area_weighted_centroid(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32
+) -> tuple[wp.vec3, wp.float32]:
+    # One face's contribution to a *surface* centroid: its barycentre scaled by its area, and that
+    # area. Summing the pair over the mesh and dividing gives the area-weighted mean, which is what
+    # distinguishes a surface centroid from the plain mean of ``face_centroid`` above.
+    #
+    # Both are returned because every caller needs both and the area is already in registers.
+    # ``triangle_double_area`` over the corners already loaded rather than
+    # ``face_normals_and_area``, which re-enters ``face_vertices`` through ``triangle_cross`` and
+    # normalizes a normal a centroid reduction then discards; the expression is the same one either
+    # way (``0.5 * |cross(v1 - v0, v2 - v0)|``), so the areas are bit-identical.
+    v0, v1, v2 = face_vertices(vertices, faces, f)
+    area = 0.5 * triangle_double_area(v0, v1, v2)
+    return (v0 + v1 + v2) * (area / 3.0), area
 
 
 @wp.kernel

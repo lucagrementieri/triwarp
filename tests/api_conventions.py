@@ -439,11 +439,18 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ("selection", "open_dual_edges_and_seeds"): frozenset({"cursor"}),
     ("repair", "emit_degree3_replacement"): frozenset({"cursor"}),
     ("repair", "emit_straighten_faces"): frozenset({"cursor"}),
-    # A running minimum other threads publish and read: neither an input nor the answer, and the
-    # per-face results are the ``out_`` arguments beside it. ``counter`` and ``overflow`` are the
-    # work list the capped first pass hands the tiled second one -- scratch, not the answer.
-    ("proximity", "face_to_mesh_distance"): frozenset({"global_best_sq", "counter", "overflow"}),
-    ("proximity", "face_to_mesh_distance_tiled"): frozenset({"global_best_sq"}),
+    # ``counter`` and ``overflow`` are the work list the capped first pass hands the tiled second
+    # one -- scratch, not the answer.
+    #
+    # ``global_best_sq`` -- the running minimum the two passes publish into and prune against -- is
+    # the same exemption class and is deliberately **not** listed: both kernels now reach it only
+    # through ``update_nearest_face_pair``, and this check resolves store targets syntactically, so
+    # a buffer written inside a shared ``@wp.func`` is outside its view entirely. An entry for it
+    # would be reported as matching nothing. That is CLAUDE.md section 4.5's documented tension
+    # between this check and section 2.4's "extract the shared run", resolved the way it prescribes:
+    # the extraction wins and the parameter goes on being scratch, unenforced. Do not re-add the
+    # entry -- if the write ever comes back into a kernel body, add it again then.
+    ("proximity", "face_to_mesh_distance"): frozenset({"counter", "overflow"}),
     ("grouping", "hash_insert"): frozenset({"slot_counts"}),
     # ``values`` is the matrix whose rows this scales -- input and result in the same buffer, since
     # the prolongation smoother's ``-w D^-1 (A P0)`` is a row scaling of a product that has just

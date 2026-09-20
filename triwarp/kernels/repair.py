@@ -164,17 +164,14 @@ def write_face_winding(
     faces: wp.array[wp.int32], f: wp.int32, reversed_winding: wp.bool, out_faces: wp.array[wp.int32]
 ) -> None:
     """Copy face ``f``'s corners, swapping corners 1 and 2 when ``reversed_winding``."""
-    base = f * wp.int32(3)
-    i0 = faces[base]
-    i1 = faces[base + wp.int32(1)]
-    i2 = faces[base + wp.int32(2)]
-    out_faces[base] = i0
+    # Corner 0 is kept and 1 and 2 swap, which is a *different* reversal from
+    # ``triangles.write_corner_triple_reversible``'s ``np.fliplr`` -- see that function's docstring
+    # for why the two conventions are deliberately not merged behind one flag. The read and the
+    # write still go through the shared triple helpers rather than three hand-written offsets each.
+    i0, i1, i2 = corner_triple(faces, f)
     if reversed_winding:
-        out_faces[base + wp.int32(1)] = i2
-        out_faces[base + wp.int32(2)] = i1
-    else:
-        out_faces[base + wp.int32(1)] = i1
-        out_faces[base + wp.int32(2)] = i2
+        i1, i2 = i2, i1
+    write_corner_triple(out_faces, f, i0, i1, i2)
 
 
 @wp.kernel
@@ -215,7 +212,8 @@ def halfedge_orientation_slots(
 ) -> None:
     # Per unique edge: how many half-edges traverse it each way, and which corner they belong to.
     #
-    # Corner ``c = 3f + j`` is the half-edge ``(fv[j], fv[j + 1])``. ``unique_edges`` rows are
+    # Corner ``c = 3f + j`` is the half-edge ``(faces[c], halfedge_destination(faces, c))`` -- the
+    # shared face-local cycle rather than a second spelling of it here. ``unique_edges`` rows are
     # sorted min-first, so a half-edge is "forward" when it runs low index to high. A
     # *consistently oriented manifold* edge has exactly one of each; anything else -- two forward
     # (a flipped neighbour), three or more of either (a non-manifold edge), or one alone (a
@@ -223,9 +221,7 @@ def halfedge_orientation_slots(
     # keeps the write deterministic.
     c = wp.int32(wp.tid())
     e = edge_of_corner[c]
-    f = c // 3
-    j = c % 3
-    if faces[c] < faces[f * 3 + (j + 1) % 3]:
+    if faces[c] < halfedge_destination(faces, c):
         wp.atomic_add(out_forward_count, e, 1)
         wp.atomic_max(out_forward_corner, e, c)
     else:
