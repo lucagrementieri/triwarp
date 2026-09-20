@@ -159,18 +159,17 @@ def reverse_face_winding(faces: wp.array[wp.int32], out_faces: wp.array[wp.int32
     write_corner_triple(out_faces, f, c, b, a)
 
 
-@wp.kernel
-def flip_faces_masked(
-    faces: wp.array[wp.int32], flip: wp.array[wp.int32], out_faces: wp.array[wp.int32]
+@wp.func
+def write_face_winding(
+    faces: wp.array[wp.int32], f: wp.int32, reversed_winding: wp.bool, out_faces: wp.array[wp.int32]
 ) -> None:
-    """Copy ``faces`` to ``out_faces``, reversing winding (swap corners 1,2) where ``flip > 0``."""
-    f = wp.int32(wp.tid())
+    """Copy face ``f``'s corners, swapping corners 1 and 2 when ``reversed_winding``."""
     base = f * wp.int32(3)
     i0 = faces[base]
     i1 = faces[base + wp.int32(1)]
     i2 = faces[base + wp.int32(2)]
     out_faces[base] = i0
-    if flip[f] > wp.int32(0):
+    if reversed_winding:
         out_faces[base + wp.int32(1)] = i2
         out_faces[base + wp.int32(2)] = i1
     else:
@@ -178,10 +177,31 @@ def flip_faces_masked(
         out_faces[base + wp.int32(2)] = i2
 
 
-@wp.func
-def negative_volume_flag(volume: wp.float32) -> wp.int32:
-    """Flag a face for flipping when its component's signed volume is negative (inward)."""
-    return wp.where(volume < wp.float32(0.0), wp.int32(1), wp.int32(0))
+@wp.kernel
+def flip_faces_masked(
+    faces: wp.array[wp.int32], flip: wp.array[wp.int32], out_faces: wp.array[wp.int32]
+) -> None:
+    """Copy ``faces`` to ``out_faces``, reversing winding (swap corners 1,2) where ``flip > 0``."""
+    f = wp.int32(wp.tid())
+    write_face_winding(faces, f, flip[f] > wp.int32(0), out_faces)
+
+
+@wp.kernel
+def flip_faces_by_component_volume(
+    faces: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    component_volume: wp.array[wp.float32],
+    out_faces: wp.array[wp.int32],
+) -> None:
+    # ``make_volume(multibody=True)``'s orientation pass: a face is reversed when the component it
+    # belongs to encloses a negative signed volume, i.e. is wound inward.
+    #
+    # The component's volume is read through this face's own label rather than gathered into a
+    # per-face buffer first: the Python-scope form was an ``indexedarray`` view, a ``wp.map`` to
+    # materialise a face-sized flag array, and then this pass to consume it -- two launches and a
+    # buffer for a value one indirection away. Measured 1.15x on ``make_volume(multibody=True)``.
+    f = wp.int32(wp.tid())
+    write_face_winding(faces, f, component_volume[labels[f]] < wp.float32(0.0), out_faces)
 
 
 @wp.kernel
@@ -258,6 +278,30 @@ def is_interior_degree3(ring_start: wp.int32, ring_end: wp.int32, on_boundary: w
     return not on_boundary and ring_end - ring_start == 3
 
 
+@wp.func
+def wins_degree3_conflict(
+    faces: wp.array[wp.int32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    candidate: wp.array[wp.bool],
+    v: wp.int32,
+) -> wp.bool:
+    # Two adjacent candidates share faces, so only one of them can be removed in a pass. The lowest
+    # index wins, which makes the choice deterministic and independent of launch order -- the same
+    # rule the Delaunay flip pass uses to resolve competing edges.
+    #
+    # Shared by the two kernels below rather than written twice: ``remove_degree3_vertices`` wants
+    # the selection on its own, ``flatten_degree3_vertices`` wants it fused with the move it
+    # implies, and this is the rule both are deciding.
+    if not candidate[v]:
+        return False
+    for slot in range(ring_offsets[v], ring_offsets[v + 1]):
+        neighbour = halfedge_destination(faces, ring_halfedges[slot])
+        if candidate[neighbour] and neighbour < v:
+            return False
+    return True
+
+
 @wp.kernel
 def select_independent_degree3(
     faces: wp.array[wp.int32],
@@ -267,22 +311,14 @@ def select_independent_degree3(
     out_selected: wp.array[wp.bool],
     out_count: wp.array[wp.int32],
 ) -> None:
-    # Two adjacent candidates share faces, so only one of them can be removed in a pass. The lowest
-    # index wins, which makes the choice deterministic and independent of launch order -- the same
-    # rule the Delaunay flip pass uses to resolve competing edges.
-    #
     # ``out_count`` is the size of the selection, which the caller needs to size the replacement
     # face buffer and to decide whether the pass did anything. Counting it here is one *conditional*
     # atomic per selected vertex -- contention scales with the (rare) selections, not with the
     # launch -- against the whole-array cast, reduction and readback the caller would otherwise run
     # to recover a number this kernel already knows.
     v = wp.int32(wp.tid())
-    if not candidate[v]:
+    if not wins_degree3_conflict(faces, ring_offsets, ring_halfedges, candidate, v):
         return
-    for slot in range(ring_offsets[v], ring_offsets[v + 1]):
-        neighbour = halfedge_destination(faces, ring_halfedges[slot])
-        if candidate[neighbour] and neighbour < v:
-            return
     out_selected[v] = True
     wp.atomic_add(out_count, 0, 1)
 
@@ -335,11 +371,16 @@ def next_boundary_halfedge(
 
 
 @wp.kernel
-def collect_rim_links(
+def collect_rim_links_and_candidates(
+    vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     twins: wp.array[wp.int32],
+    face_normals: wp.array[wp.vec3],
+    min_normal_dot: wp.float32,
+    max_aspect_ratio: wp.float32,
     out_rim_next: wp.array[wp.int32],
     out_rim_prev: wp.array[wp.int32],
+    out_candidate: wp.array[wp.bool],
 ) -> None:
     # The rim as a linked list over *halfedges*, from those that have no twin.
     #
@@ -351,6 +392,17 @@ def collect_rim_links(
     # (measured: the two devices disagreed on one five-vertex bowtie). Per halfedge each slot has
     # exactly one writer, both rim loops keep their own links, and the bordering faces are read off
     # the halfedges themselves rather than from a third table.
+    #
+    # The notch test below rides in this same pass. It reads ``rim_next`` only at its own
+    # halfedge, which this thread has just computed and still holds in ``following`` -- so run
+    # apart it cost a launch and a full round trip of the link table through global memory to
+    # recover a successor that never had to leave a register. ``out_rim_prev`` is still scattered
+    # for the emit pass that follows, which genuinely does need every link written.
+    #
+    # Output byte-identical, and the wall clock is **flat** within run-to-run noise: a pass is a
+    # halfedge-twin build plus a handful of launches around one readback, so the host was already
+    # waiting on the device. What this buys is a launch and a round trip of the link table, not a
+    # measurable speed-up -- worth having, not worth quoting.
     h = wp.int32(wp.tid())
     if twins[h] >= 0:
         return
@@ -358,18 +410,6 @@ def collect_rim_links(
     out_rim_next[h] = following
     if following >= 0:
         out_rim_prev[following] = h
-
-
-@wp.kernel
-def straighten_candidate_mask(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    face_normals: wp.array[wp.vec3],
-    rim_next: wp.array[wp.int32],
-    min_normal_dot: wp.float32,
-    max_aspect_ratio: wp.float32,
-    out_candidate: wp.array[wp.bool],
-) -> None:
     # A notch that can be closed by one triangle, indexed by the boundary halfedge *entering* it.
     # That halfedge runs ``previous -> v`` and its successor runs ``v -> following``, with the
     # surface on their left, so a face attached outside the rim must carry the halfedges
@@ -380,8 +420,7 @@ def straighten_candidate_mask(
     # Two gates, both from the caller: the new triangle's normal must agree with the two rim faces
     # it will border -- which are the two halfedges' own faces, so no lookup can pair it with the
     # wrong one -- and its aspect ratio must be finite enough to be worth adding.
-    h = wp.int32(wp.tid())
-    outgoing = rim_next[h]
+    outgoing = following
     if outgoing < 0:
         return
     previous = faces[h]
@@ -433,12 +472,13 @@ def emit_straighten_faces(
 
 
 @wp.kernel
-def flatten_degree3_positions(
+def select_and_flatten_degree3(
     positions: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     ring_offsets: wp.array[wp.int32],
     ring_halfedges: wp.array[wp.int32],
-    selected: wp.array[wp.bool],
+    candidate: wp.array[wp.bool],
+    out_selected: wp.array[wp.bool],
     out_positions: wp.array[wp.vec3],
 ) -> None:
     # Move each selected vertex to the centroid of its three neighbours -- which lies in their
@@ -454,10 +494,21 @@ def flatten_degree3_positions(
     #
     # The divisor is a literal 3 because ``selected`` implies interior valence 3; the ring walk is
     # over ``ring_offsets`` all the same, so a stale mask cannot make it read past the ring.
+    # The selection and the move it implies, in one pass. They are the same thread's decision about
+    # the same vertex, so running them apart cost a launch and a full round trip of the selection
+    # mask through global memory to tell this kernel what the previous one had just decided. No
+    # ``out_count`` here, unlike ``select_independent_degree3``: this caller's loop reads the
+    # remaining candidate count instead, and the positions are written for *every* vertex because
+    # the caller ping-pongs two buffers and an unwritten slot would hold an iteration-old value.
+    #
+    # Measured 1.12x on ``flatten_degree3_vertices`` at 3 413 flattened vertices, byte-identical.
+    # The ring walk is done twice in the taken branch -- once to decide, once to average -- and
+    # that is still cheaper than writing the mask out and reading it back.
     vertex = wp.int32(wp.tid())
-    if not selected[vertex]:
+    if not wins_degree3_conflict(faces, ring_offsets, ring_halfedges, candidate, vertex):
         out_positions[vertex] = positions[vertex]
         return
+    out_selected[vertex] = True
     total = wp.vec3()
     for slot in range(ring_offsets[vertex], ring_offsets[vertex + 1]):
         total += positions[halfedge_destination(faces, ring_halfedges[slot])]

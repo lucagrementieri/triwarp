@@ -299,8 +299,14 @@ def vertex_one_rings(
         device=device,
     )
     starts = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    wp.map(kernel_halfedge.select_ring_start, boundary_start, interior_start, out=starts)
-    wp.map(kernel_halfedge.has_boundary_halfedge, boundary_start, out=is_boundary)
+    # One map, two outputs: the start and the boundary flag are the same comparison on the same
+    # buffer, so a second pass would only re-read it to re-decide what the first already knew.
+    wp.map(
+        kernel_halfedge.ring_start_and_boundary,
+        boundary_start,
+        interior_start,
+        out=[starts, is_boundary],
+    )
 
     incomplete = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(

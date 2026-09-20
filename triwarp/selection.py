@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Literal, cast, overload
+from typing import Literal, overload
 
-import numpy as np
-import numpy.typing as npt
 import warp as wp
 
 import triwarp as tw
@@ -294,9 +292,15 @@ def exclude_fully_selected_components(
         inputs=[mask, labels, keep],
         device=device,
     )
-    kept_per_vertex = keep[labels]  # Python-scope gather: component-keep flag per vertex
     out = wp.empty(n_vertices, dtype=wp.bool, device=device)
-    wp.map(kernel_selection.keep_selected, mask, kept_per_vertex, out=out)
+    # One launch reads the component-keep flag through the vertex's own label; a Python-scope
+    # gather would allocate and fill a per-vertex copy of it for a second launch to consume.
+    wp.launch(
+        kernel_selection.keep_selected_by_component,
+        dim=n_vertices,
+        inputs=[mask, labels, keep, out],
+        device=device,
+    )
     return out
 
 
@@ -522,6 +526,9 @@ def submeshes_from_face_groups(
 
     # Group starts from a histogram plus an exclusive scan rather than ``flatnonzero`` on the run
     # starts: no host synchronisation, and an empty group still gets a (zero-length) entry.
+    # Fusing the map above into the count below is declined: the count reads the map's output at
+    # its own slot, so it would fuse, but it is one launch on a path that already runs a sort and
+    # a scan, and both buffers the map writes are read again further down.
     group_counts = wp.zeros(k, dtype=wp.int32, device=device)
     wp.launch(
         kernel_selection.count_group_slots,
@@ -707,33 +714,55 @@ def delete_region_keep_boundary(
     if int(kept_faces.shape[0]) == 0:
         return kept_vertices, kept_faces, []
 
-    kept_loops = tw.boundary.boundary_loops(kept_vertices, kept_faces)
-    if not kept_loops:
+    flat_loops, loop_offsets, loop_sizes = tw.boundary.boundary_loops_batched(
+        kept_vertices, kept_faces
+    )
+    n_loops = int(loop_offsets.shape[0])
+    if n_loops == 0:
         return kept_vertices, kept_faces, []
 
-    # Undirected input boundary edges, as a host-side set in *input* indices -- the loops are mapped
-    # into that space to be classified, since the submesh renumbered them. Computed *after* the loop
-    # trace and only when there is something to classify: on a closed input this pass answers
-    # nothing.
-    input_boundary = {
-        (int(row[0]), int(row[1])) for row in tw.boundary.boundary_edges(vertices, faces).numpy()
-    }
-    # ``wp.array.numpy()`` is unannotated; both the table and the index below are int32
-    # vertex indices, and without the annotation neither can serve as a numpy index.
-    to_input_np = cast("npt.NDArray[np.int32]", vertex_index.numpy())
+    # Classify every loop at once on the device. The input's own boundary edges become a sorted
+    # key table, each loop's edges are packed the same way and searched in it, and a loop whose
+    # every edge is present is the input's rim rather than one the deletion opened. Computed only
+    # when there is something to classify: on a closed input this pass answers nothing.
+    #
+    # Done on the host this was a readback per loop plus a Python membership test per rim edge, so
+    # its cost grew with the *loop count* as much as with the mesh -- and both tables it needed
+    # (the boundary edges and the submesh-to-input vertex map) crossed the bus whole to build a
+    # ``set`` and an index array the device could search in place.
+    input_boundary = tw.boundary.boundary_edges(vertices, faces)
+    base = wp.uint64(int(vertices.shape[0]))
+    boundary_keys = wp.empty(int(input_boundary.shape[0]), dtype=wp.uint64, device=device)
+    wp.launch(
+        kernel_grouping.pack_directed_index_keys,
+        dim=int(input_boundary.shape[0]),
+        inputs=[input_boundary, base, boundary_keys],
+        device=device,
+    )
+    # ``boundary_edges`` rows are min-first, so the directed packing above is the undirected key
+    # ``pack_edge_key`` rebuilds for each rim edge.
+    boundary_keys = tw.array.sort_and_argsort(boundary_keys)[0]
 
-    new_loops: list[wp.array[wp.int32]] = []
-    for loop in kept_loops:
-        loop_np = cast("npt.NDArray[np.int32]", loop.numpy())
-        cycle_np = to_input_np[loop_np]
-        rolled_np = np.roll(cycle_np, -1)
-        if all(
-            (min(int(a), int(b)), max(int(a), int(b))) in input_boundary
-            for a, b in zip(cycle_np, rolled_np, strict=True)
-        ):
-            continue  # every edge was already a rim: this loop is the input's, not the deletion's
-        new_loops.append(loop)
-    return kept_vertices, kept_faces, new_loops
+    is_input_rim = wp.empty(n_loops, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_selection.loops_are_input_rims,
+        dim=n_loops,
+        inputs=[
+            flat_loops,
+            loop_offsets,
+            loop_sizes,
+            vertex_index,
+            boundary_keys,
+            base,
+            is_input_rim,
+        ],
+        device=device,
+    )
+    # One readback, of one flag per loop, where the host form read every loop back separately.
+    keep_loop = is_input_rim.numpy()
+    loops = tw.array.split(flat_loops, loop_offsets)
+    kept = [loop for loop, rim in zip(loops, keep_loop, strict=True) if not rim]
+    return kept_vertices, kept_faces, kept
 
 
 def submesh_from_vertex_indices(

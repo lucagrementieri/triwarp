@@ -414,7 +414,21 @@ def triangle_pair_segments(
     target_faces: wp.array[wp.int32],
     pairs: wp.array2d[wp.int32],
     out_segments: wp.array2d[wp.vec3],
+    out_valid: wp.array[wp.bool],
 ) -> None:
+    # The segment *and* whether it is a real one, in a pass that already knows both.
+    #
+    # These were two launches, and the second read ``out_segments`` back to measure it. That was
+    # a latent hazard as well as a cost: this kernel writes the row only when the narrow phase
+    # succeeds and the buffer is ``wp.empty``, so a rejected pair had its length test applied to
+    # uninitialised memory, where two values far enough apart would pass it and emit a segment
+    # for a pair that does not intersect. **Not a defect anyone has observed** -- a fresh pool
+    # allocation reads back as zeros here, so both arms agree segment-for-segment on grazing and
+    # deeply interpenetrating sphere pairs alike -- but it depended on the allocator rather than
+    # on the geometry. Deciding validity where the narrow phase decides it makes the rejected
+    # rows unreadable instead of merely unlikely to survive. The removed launch measures flat on
+    # ``mesh_with_mesh`` -- the call is dominated by the broad phase -- so this is a correctness
+    # argument, not a speed one.
     tid = wp.int32(wp.tid())
     qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, pairs[tid, 0])
     ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, pairs[tid, 1])
@@ -422,14 +436,7 @@ def triangle_pair_segments(
     if valid:
         out_segments[tid, 0] = p0
         out_segments[tid, 1] = p1
-
-
-@wp.kernel
-def segment_nondegenerate(segments: wp.array2d[wp.vec3], out_valid: wp.array[wp.bool]) -> None:
-    tid = wp.int32(wp.tid())
-    p0 = segments[tid, 0]
-    p1 = segments[tid, 1]
-    out_valid[tid] = wp.length(p1 - p0) > TOLERANCE_MERGE_CONSTANT
+    out_valid[tid] = valid and wp.length(p1 - p0) > TOLERANCE_MERGE_CONSTANT
 
 
 @wp.func
@@ -611,27 +618,30 @@ def canonical_edge_crossing(
     return edge_level_crossing(vertices[a], vertices[b], values[a], values[b])
 
 
-@wp.kernel
-def edge_level_crossings(
+@wp.func
+def face_edge_crossing(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    face_indices: wp.array[wp.int32],
     vertex_values: wp.array[wp.float32],
-    out_points: wp.array2d[wp.vec3],
-) -> None:
-    # The three edge crossings of one cut face, from the per-vertex field the classifier already
-    # signed -- so the plane case reuses the dot products rather than recomputing them per edge.
-    tid = wp.int32(wp.tid())
-    face_index = face_indices[tid]
-    i0, i1, i2 = kernel_triangles.corner_triple(faces, face_index)
-    out_points[tid, 0] = canonical_edge_crossing(vertices, vertex_values, i0, i1)
-    out_points[tid, 1] = canonical_edge_crossing(vertices, vertex_values, i1, i2)
-    out_points[tid, 2] = canonical_edge_crossing(vertices, vertex_values, i2, i0)
+    face_index: wp.int32,
+    edge: wp.int32,
+) -> wp.vec3:
+    # Where the level set crosses edge ``edge`` of a face, from the per-vertex field the classifier
+    # already signed -- so the plane case reuses those dot products rather than recomputing them.
+    # Edge ``e`` joins corner ``e`` to corner ``e + 1``, which is the numbering the two emit
+    # kernels' ``edge_a`` / ``edge_b`` are expressed in.
+    base = face_index * wp.int32(3)
+    return canonical_edge_crossing(
+        vertices, vertex_values, faces[base + edge], faces[base + (edge + wp.int32(1)) % 3]
+    )
 
 
 @wp.func
 def emit_cut_vertices(
-    edge_points: wp.array2d[wp.vec3],
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    vertex_values: wp.array[wp.float32],
+    face_index: wp.int32,
     cut: wp.int32,
     edge_0: wp.int32,
     edge_1: wp.int32,
@@ -644,20 +654,38 @@ def emit_cut_vertices(
     # Every cut face emits exactly two, whichever side is alone in sign: a quad cut splits into two
     # triangles and a corner cut into one, but both are bounded by the same two edge crossings. So
     # the slot is a function of the thread alone and neither kernel needs a counter -- which is the
-    # invariant this function exists to state, and the reason ``2 * cut`` is now computed once
-    # rather than seventeen times across the two callers.
+    # invariant this function exists to state, and the reason ``2 * cut`` is computed once rather
+    # than seventeen times across the two callers.
+    #
+    # The crossings are computed here rather than read from a table a previous launch filled. That
+    # table cost a launch, an ``(n_cut, 3)`` ``vec3`` allocation and a full round trip of it
+    # through global memory -- and it computed **three** crossings per cut face where every caller
+    # of this function uses exactly two, so the fused form does less arithmetic as well as less
+    # traffic. ``canonical_edge_crossing`` interpolates from the lower-numbered endpoint, so a
+    # crossing is bitwise identical however many times and from whichever face it is evaluated;
+    # that is what keeps the rim weldable and what makes recomputing it here free of consequence.
+    #
+    # Measured, output byte-identical (including ``cap=True``, which welds the rim and so depends
+    # on that bitwise equality): 1.09x on ``clip_mesh_with_field``, 1.11x on
+    # ``slice_mesh_with_plane`` and 1.03x on ``split_mesh_with_plane``, two launches and two
+    # allocations fewer. Predicted from the launch count alone it looked like 2 %; the extra came
+    # from the arithmetic, since the tabulating pass computed three crossings per cut face to be
+    # read for two.
     slot = wp.int32(2) * cut
-    out_new_verts[slot] = edge_points[cut, edge_0]
-    out_new_verts[slot + wp.int32(1)] = edge_points[cut, edge_1]
+    out_new_verts[slot] = face_edge_crossing(vertices, faces, vertex_values, face_index, edge_0)
+    out_new_verts[slot + wp.int32(1)] = face_edge_crossing(
+        vertices, faces, vertex_values, face_index, edge_1
+    )
     return vertex_base + slot, vertex_base + slot + wp.int32(1)
 
 
 @wp.kernel
 def emit_quad_cut(
+    vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     face_indices: wp.array[wp.int32],
     face_signs: wp.array2d[wp.int32],
-    edge_points: wp.array2d[wp.vec3],
+    vertex_values: wp.array[wp.float32],
     vertex_base: wp.int32,
     out_new_verts: wp.array[wp.vec3],
     out_new_faces: wp.array2d[wp.int32],
@@ -673,7 +701,9 @@ def emit_quad_cut(
     v_b = faces[base + inside_b]
     edge_a = (outside + wp.int32(2)) % wp.int32(3)
     edge_b = outside
-    new_i0, new_i1 = emit_cut_vertices(edge_points, tid, edge_a, edge_b, vertex_base, out_new_verts)
+    new_i0, new_i1 = emit_cut_vertices(
+        vertices, faces, vertex_values, face_index, tid, edge_a, edge_b, vertex_base, out_new_verts
+    )
     # The quad becomes two triangles, in the same pair of rows the two vertices went into.
     row = wp.int32(2) * tid
     out_new_faces[row, 0] = v_a
@@ -686,10 +716,11 @@ def emit_quad_cut(
 
 @wp.kernel
 def emit_tri_cut(
+    vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     face_indices: wp.array[wp.int32],
     face_signs: wp.array2d[wp.int32],
-    edge_points: wp.array2d[wp.vec3],
+    vertex_values: wp.array[wp.float32],
     vertex_base: wp.int32,
     out_new_verts: wp.array[wp.vec3],
     out_new_faces: wp.array2d[wp.int32],
@@ -704,7 +735,9 @@ def emit_tri_cut(
     corner_b = (inside + wp.int32(2)) % wp.int32(3)
     edge_0 = inside
     edge_1 = corner_b
-    new_i0, new_i1 = emit_cut_vertices(edge_points, tid, edge_0, edge_1, vertex_base, out_new_verts)
+    new_i0, new_i1 = emit_cut_vertices(
+        vertices, faces, vertex_values, face_index, tid, edge_0, edge_1, vertex_base, out_new_verts
+    )
     # The corner stays one triangle, so this kernel writes one face row per cut, not two.
     out_new_faces[tid, 0] = v_inside
     # ``classify_faces_for_slice`` routes both a genuine two-crossing cut (both neighbours
@@ -994,8 +1027,8 @@ def marching_triangles_segments(
     # before the sign test below, not after: ``NaN >= 0.0`` is ``False`` under IEEE-754, so it would
     # otherwise land in the same bucket as a genuine negative value, pass as a "lone corner" against
     # two real opposite-signed neighbours, and feed ``crossing_point`` a ``NaN`` that reaches the
-    # returned curve with no filter anywhere downstream (unlike ``mesh_with_mesh``'s
-    # ``segment_nondegenerate``).
+    # returned curve with no filter anywhere downstream (unlike ``mesh_with_mesh``, whose
+    # ``triangle_pair_segments`` rejects a degenerate segment as it writes it).
     if wp.isnan(d0) or wp.isnan(d1) or wp.isnan(d2):
         out_valid[f] = False
         return

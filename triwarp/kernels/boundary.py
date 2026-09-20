@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.array import loop_next_slot
+from triwarp.kernels.array import loop_next_slot, pack_ranked_key
 
 
 @wp.kernel
@@ -147,3 +147,22 @@ def loop_directed_areas(
     a = vertices[flat_loops[t]]
     c = vertices[flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, t)]]
     wp.atomic_add(out_directed_area, ell, wp.float32(0.5) * wp.cross(a, c))
+
+
+@wp.kernel
+def longest_loop_key(
+    loop_starts: wp.array[wp.int32], loop_sizes: wp.array[wp.int32], out_best: wp.array[wp.int64]
+) -> None:
+    # The longest packed loop, as one ``wp.atomic_max`` over ``pack_ranked_key``. The low half
+    # carries the loop's *start* rather than its index, which is what lets a single readback of
+    # this key give the caller both halves of the answer -- a second read of ``loop_starts`` at
+    # the winning index would otherwise cost as much again as the reduction. Starts increase with
+    # the loop index, so "lowest start on a tie" is "lowest index on a tie" and the packer's
+    # tie-break is the one a host-side first-maximum scan would have produced.
+    #
+    # Against unpacking the loops and scanning them on the host, output identical: a wash at 7
+    # rims -- where the reduction's launch costs about what the handful of array views it removes
+    # did -- 1.8x on the whole public call at 384, and 4.1x on a mesh with several thousand. The
+    # win grows with the rim count because the host form was linear in it and this is not.
+    ell = wp.int32(wp.tid())
+    wp.atomic_max(out_best, 0, pack_ranked_key(loop_sizes[ell], loop_starts[ell]))

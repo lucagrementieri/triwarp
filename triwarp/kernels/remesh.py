@@ -329,6 +329,14 @@ def loop_opposite_triplets(
         out_values[slot] = opposite_weight
 
 
+@wp.func
+def hysteresis_bands(sizing: wp.float32) -> tuple[wp.float32, wp.float32]:
+    # The Botsch-Kobbelt collapse-below / split-above pair for one vertex's target length. Both
+    # bands from one read: asked for separately they are two passes over the same field for two
+    # scalings of the same number.
+    return 4.0 / 5.0 * sizing, 4.0 / 3.0 * sizing
+
+
 @wp.kernel
 def build_midpoint_index(
     long_mask: wp.array[wp.bool],
@@ -351,6 +359,12 @@ def fill_edge_midpoints(
     offsets: wp.array[wp.int32],
     out_mid: wp.array[wp.vec3],
 ) -> None:
+    # Shares its guard and its ``offsets[e]`` load with ``build_midpoint_index`` above, and the
+    # two launch at the same width -- **and the fusion is measured and declined.** The midpoint
+    # fill runs only on the branch where the caller supplied no ``split_positions``, where
+    # ``build_midpoint_index`` runs always, so one kernel would have to carry the write under a
+    # flag; and the pair is three launches of thirty-eight in ``subdivide_to_size``, about 1.5 %
+    # of that call and falling with the mesh. The duplicated guard is two instructions.
     e = wp.int32(wp.tid())
     if long_mask[e]:
         out_mid[offsets[e]] = edge_midpoint(vertices, unique_edges, e)

@@ -11,8 +11,7 @@ def centroid_tiled(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     n_faces: wp.int32,
-    out_weighted_centroid: wp.array[wp.float32],
-    out_total_area: wp.array[wp.float32],
+    out_totals: wp.array[wp.float32],
 ) -> None:
     # CUDA path, launched via wp.launch_tiled with block_dim=TILE_1D: each lane computes one face's
     # area-weighted centroid contribution, the block reduces each component cooperatively with
@@ -35,6 +34,13 @@ def centroid_tiled(
     # portability is not free either -- `blocks_1d(n)` would give the CPU path far fewer,
     # single-lane blocks than `slice_count`'s threads -- so the device pair stays.
     #
+    # One ``(4,)`` accumulator rather than a ``(3,)`` and a ``(1,)``: slots 0-2 are the
+    # area-weighted centroid sum and slot 3 the area sum. The wrapper's return is a host-side
+    # ``wp.vec3``, so both have to cross the bus -- and a readback's cost is almost all fixed, so
+    # one read of four floats beats two reads of three and one. ``centroid_sliced`` writes the
+    # same four slots. Measured 1.75x on ``surface_centroid``, which also loses an allocation and
+    # a launch argument.
+    #
     # The area comes from ``triangle_double_area`` over the corners already in registers, not from
     # ``face_normals_and_area``: that helper re-enters ``face_vertices`` through ``triangle_cross``,
     # so the pair loaded all three corners twice, and it also normalizes a face normal this kernel
@@ -53,10 +59,10 @@ def centroid_tiled(
     sum_z = wp.tile_sum(wp.tile(contrib[2]))
     area_sum = wp.tile_sum(wp.tile(area))
     if t == 0:
-        wp.tile_atomic_add(out_weighted_centroid, sum_x, (0,))
-        wp.tile_atomic_add(out_weighted_centroid, sum_y, (1,))
-        wp.tile_atomic_add(out_weighted_centroid, sum_z, (2,))
-        wp.tile_atomic_add(out_total_area, area_sum, (0,))
+        wp.tile_atomic_add(out_totals, sum_x, (0,))
+        wp.tile_atomic_add(out_totals, sum_y, (1,))
+        wp.tile_atomic_add(out_totals, sum_z, (2,))
+        wp.tile_atomic_add(out_totals, area_sum, (3,))
 
 
 @wp.kernel
@@ -65,8 +71,7 @@ def centroid_sliced(
     faces: wp.array[wp.int32],
     n_faces: wp.int32,
     n_slices: wp.int32,
-    out_weighted_centroid: wp.array[wp.float32],
-    out_total_area: wp.array[wp.float32],
+    out_totals: wp.array[wp.float32],
 ) -> None:
     # Portable path: one thread per face slice walks a strided slice, accumulates locally and
     # commits four atomics. Lane-free, so it is correct on the CPU device where `centroid_tiled`
@@ -89,10 +94,10 @@ def centroid_sliced(
         area = 0.5 * triangle_double_area(v0, v1, v2)
         total = total + (v0 + v1 + v2) * (area / 3.0)
         area_total = area_total + area
-    wp.atomic_add(out_weighted_centroid, 0, total[0])
-    wp.atomic_add(out_weighted_centroid, 1, total[1])
-    wp.atomic_add(out_weighted_centroid, 2, total[2])
-    wp.atomic_add(out_total_area, 0, area_total)
+    wp.atomic_add(out_totals, 0, total[0])
+    wp.atomic_add(out_totals, 1, total[1])
+    wp.atomic_add(out_totals, 2, total[2])
+    wp.atomic_add(out_totals, 3, area_total)
 
 
 @wp.kernel

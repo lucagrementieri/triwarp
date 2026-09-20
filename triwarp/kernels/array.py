@@ -419,20 +419,6 @@ def sort_segments(offsets: wp.array[wp.int32], data: wp.array[wp.int32]) -> None
         gap = gap // 3
 
 
-@wp.kernel
-def gather_vec_skip_negative(
-    source: wp.array[wp.vec3], index: wp.array[wp.int32], out_gathered: wp.array[wp.vec3]
-) -> None:
-    # Gather vectors by index, writing a zero vector wherever the index is negative
-    # (missing-correspondence sentinel).
-    i = wp.int32(wp.tid())
-    f = index[i]
-    if f >= 0:
-        out_gathered[i] = source[f]
-    else:
-        out_gathered[i] = wp.vec3(0.0, 0.0, 0.0)
-
-
 @wp.func
 def masked_at(mask: wp.array[wp.bool], index: wp.int32) -> wp.bool:
     # The mask's value at ``index``, reading ``False`` for an index outside it rather than off the

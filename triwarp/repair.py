@@ -1151,23 +1151,22 @@ def straighten_boundary(
         # exclude one. One slot per halfedge gives each loop its own links and one writer each.
         rim_next = wp.full(n_halfedges, -1, dtype=wp.int32, device=device)
         rim_prev = wp.full(n_halfedges, -1, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_repair.collect_rim_links,
-            dim=n_halfedges,
-            inputs=[faces, twins, rim_next, rim_prev],
-            device=device,
-        )
         candidate = wp.zeros(n_halfedges, dtype=wp.bool, device=device)
+        # One launch: a halfedge's notch test needs only the successor this same thread computes,
+        # so linking the rim and classifying it are one pass rather than two with the link table
+        # written out and read back between them.
         wp.launch(
-            kernel_repair.straighten_candidate_mask,
+            kernel_repair.collect_rim_links_and_candidates,
             dim=n_halfedges,
             inputs=[
                 vertices,
                 faces,
+                twins,
                 tw.triangles.face_normals_and_areas(vertices, faces)[0],
-                rim_next,
                 wp.float32(min_normal_dot),
                 wp.float32(max_aspect_ratio),
+                rim_next,
+                rim_prev,
                 candidate,
             ],
             device=device,
@@ -1464,9 +1463,6 @@ def flatten_degree3_vertices(
     # the caller's own ``vertices`` is never written -- pass 0 reads it and writes ``buffers[0]``,
     # pass 1 reads that and writes ``buffers[1]``, and so on.
     selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
-    # ``select_independent_degree3`` counts its selection for ``remove_degree3_vertices``; this
-    # caller does not need the number, so the slot is write-only scratch and is never read.
-    selected_count = wp.zeros(1, dtype=wp.int32, device=device)
     # Allocated on first use, not upfront: the common mesh has no two candidates adjacent, so the
     # loop runs a single pass and only ever needs one of the two.
     buffers: dict[int, wp.array[wp.vec3]] = {}
@@ -1476,20 +1472,17 @@ def flatten_degree3_vertices(
         # remaining index always wins its own conflict, so every pass retires at least one
         # candidate and the loop cannot spin.
         selected.zero_()
-        wp.launch(
-            kernel_repair.select_independent_degree3,
-            dim=n_vertices,
-            inputs=[faces, ring_offsets, ring_halfedges, candidate, selected, selected_count],
-            device=device,
-        )
         slot = iteration % 2
         if slot not in buffers:
             buffers[slot] = wp.empty(n_vertices, dtype=wp.vec3, device=device)
         flattened = buffers[slot]
+        # One launch: choosing the independent set and moving the vertices it chose are the same
+        # thread's decision about the same vertex, so a second pass would only re-read the mask
+        # the first had just written to learn what it already knew.
         wp.launch(
-            kernel_repair.flatten_degree3_positions,
+            kernel_repair.select_and_flatten_degree3,
             dim=n_vertices,
-            inputs=[positions, faces, ring_offsets, ring_halfedges, selected, flattened],
+            inputs=[positions, faces, ring_offsets, ring_halfedges, candidate, selected, flattened],
             device=device,
         )
         positions = flattened
@@ -1699,13 +1692,12 @@ def make_volume(
             inputs=[signed_volumes, labels, accum],
             device=device,
         )
-        flip = wp.empty(n_faces, dtype=wp.int32, device=device)
-        # ``accum[labels]`` gathers each face's component volume (Python-scope gather).
-        wp.map(kernel_repair.negative_volume_flag, accum[labels], out=flip)
+        # One launch: each face reads its own component's signed volume through its label, where
+        # gathering that into a per-face flag buffer first cost a map, a launch and the buffer.
         wp.launch(
-            kernel_repair.flip_faces_masked,
+            kernel_repair.flip_faces_by_component_volume,
             dim=n_faces,
-            inputs=[faces, flip, out_faces],
+            inputs=[faces, labels, accum, out_faces],
             device=device,
         )
         return out_faces

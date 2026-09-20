@@ -164,19 +164,22 @@ def ring_start_halfedges(
 
 
 @wp.func
-def select_ring_start(boundary_start: wp.int32, interior_start: wp.int32) -> wp.int32:
-    # Prefer the boundary halfedge; ``INT32_MAX`` means "no candidate of this kind".
+def ring_start_and_boundary(
+    boundary_start: wp.int32, interior_start: wp.int32
+) -> tuple[wp.int32, wp.bool]:
+    # Both answers the ring walk needs about a vertex, from the one pair of candidates: where to
+    # start, and whether the vertex is on a boundary. They are two reads of ``boundary_start``
+    # and one comparison apart, so asking for them separately costs a second pass over the same
+    # buffer to re-derive a test the first pass already made.
+    #
+    # Start: prefer the boundary halfedge; ``INT32_MAX`` means "no candidate of this kind".
+    # Boundary: a vertex lies on one exactly when an outgoing halfedge has no twin.
+    start = wp.int32(-1)
     if boundary_start != INT32_MAX_CONSTANT:
-        return boundary_start
-    if interior_start != INT32_MAX_CONSTANT:
-        return interior_start
-    return wp.int32(-1)
-
-
-@wp.func
-def has_boundary_halfedge(boundary_start: wp.int32) -> wp.bool:
-    # A vertex lies on a boundary exactly when one of its outgoing halfedges has no twin.
-    return boundary_start != INT32_MAX_CONSTANT
+        start = boundary_start
+    elif interior_start != INT32_MAX_CONSTANT:
+        start = interior_start
+    return start, boundary_start != INT32_MAX_CONSTANT
 
 
 @wp.kernel

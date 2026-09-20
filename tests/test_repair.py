@@ -2812,7 +2812,8 @@ def test_straighten_boundary_closes_an_independent_set(device: str) -> None:
     up with three incident faces. **At the documented gates this rule is never exercised**: on
     ``_ragged_grid`` -- the fixture every other test in this group uses -- pass one produces 10
     candidates and *zero* adjacent pairs, so the pass converges in one round and ``iterations=6``
-    does nothing. Measured directly off ``straighten_candidate_mask``. A test at those gates
+    does nothing. Measured directly off the notch test in
+    ``collect_rim_links_and_candidates``. A test at those gates
     therefore says nothing about the rule, and both halves of it can be deleted without failing
     anything.
 

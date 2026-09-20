@@ -1083,7 +1083,8 @@ def test_straighten_boundary(bench_case: BenchCase) -> None:
 
     The rim walk is keyed on **halfedges** rather than on vertices, because edge-manifoldness does
     not make the rim a set of simple loops and the per-vertex tables raced at a bowtie vertex
-    (``kernels/repair.py::collect_rim_links``). It is a correctness fix and it also came out
+    (``kernels/repair.py::collect_rim_links_and_candidates``). It is a correctness fix and it
+    also came out
     slightly *cheaper*: two per-halfedge tables replaced three per-vertex ones plus a face table,
     and the candidate and emit kernels lost three arguments between them; the fan walk that finds
     each boundary halfedge's successor is paid only on the rim.
@@ -1131,7 +1132,7 @@ def test_flatten_degree3_vertices(bench_case: BenchCase) -> None:
     The independent-set pass and its loop are not free: they cost roughly a third of the call, most
     of it the one host readback that terminates the loop (routing that through ``reduce.sum``
     instead of a bool readback is dearer still). It is a correctness fix rather than a tuning
-    choice -- see ``kernels/repair.py``'s ``flatten_degree3_positions`` for what moving two
+    choice -- see ``kernels/repair.py``'s ``select_and_flatten_degree3`` for what moving two
     neighbours at once does to a tetrahedron -- so the cost is recorded rather than weighed.
 
     triwarp wins the group by more than an order of magnitude at every size. Against

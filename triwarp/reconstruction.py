@@ -850,6 +850,9 @@ def _screened_poisson_adaptive(
             out=positions,
         )
         unit_normals = wp.empty(n, dtype=wp.vec3, device=device)
+        # These maps are independent and the same width, so they would merge into one
+        # multi-output call -- declined because it saves one launch on a function whose body is a
+        # finite-element Poisson solve, which is orders of magnitude more work.
         wp.map(wp.normalize, normals, out=unit_normals)
         if confidence:
             measures = wp.empty(n, dtype=wp.float32, device=device)

@@ -298,40 +298,64 @@ def icp(
     # from ``_correspondences``, whose mesh and cloud branches return different buffers. They are
     # the same objects on every iteration, so one construction serves the loop.
     threshold_weight: wp.Kernel | None = None
+    # A mesh target gated by distance is the one configuration where the correspondence query and
+    # the weight it feeds are the same pass: both read one source point's own hit, so the gate
+    # rides in the query rather than paying a launch and a round trip to re-read a face index and
+    # a distance the query had in registers.
+    fused_mesh_weights = mesh is not None and max_distance is not None and weights is not None
     for _ in range(max_iterations):
-        distance, triangle_id = _correspondences(
-            mesh,
-            target_vertices,
-            target_index,
-            current,
-            query_max,
-            closest,
-            distance_mesh,
-            triangle_id_mesh,
-        )
-
-        if max_distance is not None and weights is not None:
-            if threshold_weight is None:
-                # ``cast`` because Warp's stub does not narrow ``wp.map`` on ``return_kernel``:
-                # it returns the output-array union whatever the flag says.
-                threshold_weight = cast(
-                    wp.Kernel,
-                    wp.map(
-                        kernel_registration.distance_threshold_weight,
-                        distance,
-                        triangle_id,
-                        wp.float32(max_distance),
-                        out=weights,
-                        return_kernel=True,
-                    ),
-                )
+        if fused_mesh_weights:
+            assert mesh is not None
+            assert weights is not None
             wp.launch(
-                threshold_weight,
+                kernel_registration.mesh_correspondence_weight_pass,
                 dim=n,
-                inputs=[distance, triangle_id, wp.float32(max_distance)],
-                outputs=[weights],
+                inputs=[
+                    mesh.id,
+                    current,
+                    wp.float32(query_max),
+                    wp.float32(max_distance),
+                    closest,
+                    distance_mesh,
+                    triangle_id_mesh,
+                    weights,
+                ],
                 device=device,
             )
+            distance, triangle_id = distance_mesh, triangle_id_mesh
+        else:
+            distance, triangle_id = _correspondences(
+                mesh,
+                target_vertices,
+                target_index,
+                current,
+                query_max,
+                closest,
+                distance_mesh,
+                triangle_id_mesh,
+            )
+            if max_distance is not None and weights is not None:
+                if threshold_weight is None:
+                    # ``cast`` because Warp's stub does not narrow ``wp.map`` on ``return_kernel``:
+                    # it returns the output-array union whatever the flag says.
+                    threshold_weight = cast(
+                        wp.Kernel,
+                        wp.map(
+                            kernel_registration.distance_threshold_weight,
+                            distance,
+                            triangle_id,
+                            wp.float32(max_distance),
+                            out=weights,
+                            return_kernel=True,
+                        ),
+                    )
+                wp.launch(
+                    threshold_weight,
+                    dim=n,
+                    inputs=[distance, triangle_id, wp.float32(max_distance)],
+                    outputs=[weights],
+                    device=device,
+                )
 
         # The fit runs *before* the "every correspondence was rejected" test, not after, because
         # the test's own quantity is one of the moments the fit accumulates (``ACC_W_SUM``) and
@@ -623,7 +647,7 @@ def icp_point_to_plane(
         and target_normals is not None
         and int(target_normals.shape[0]) != int(target_vertices.shape[0])
     ):
-        # ``target_normals`` feeds ``gather_vec_skip_negative`` below, indexed by a nearest-vertex
+        # ``target_normals`` feeds ``cloud_correspondence_pass`` below, indexed by a nearest-vertex
         # id that ranges over ``target_vertices``; a shorter buffer is an out-of-bounds read on
         # both devices (CLAUDE.md §12.1), not merely a wrong answer.
         raise ValueError(
@@ -661,11 +685,11 @@ def icp_point_to_plane(
     distance_mesh = twt.empty_1d(n, wp.float32, device=device)
     triangle_id_mesh = twt.empty_1d(n, wp.int32, device=device)
     normals = wp.empty(n, dtype=wp.vec3, device=device)
-    # Only allocated when correspondences can actually be rejected -- see the all-rejected guard
-    # below, which needs a buffer to reduce over.
-    valid: wp.array[wp.bool] | None = (
-        wp.empty(n, dtype=wp.bool, device=device) if max_distance is not None else None
-    )
+    # Written every iteration by the correspondence pass, which decides it from a face index and
+    # a distance it already holds -- so there is nothing to save by making it conditional. Only
+    # the all-rejected *guard* below is conditional, because only a finite ``max_distance`` can
+    # reject anything.
+    valid = wp.empty(n, dtype=wp.bool, device=device)
     jtj = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
     jtr = wp.zeros(1, dtype=wp.spatial_vector, device=device)
     # One buffer for both scalars the loop reads back, not two: they are written by the same
@@ -677,9 +701,10 @@ def icp_point_to_plane(
     updated = wp.empty(n, dtype=wp.vec3, device=device)
     total = wp.clone(initial_matrix)
 
-    # The per-iteration maps are hoisted to their kernels. A cached ``wp.map`` call still resolves
-    # its op and input signature in Python on every call -- roughly twice the launch it wraps -- so
-    # two of them is a few percent of an iteration. Small and free.
+    # The correspondence step is one launch, not three: the closest-point query, the target-normal
+    # gather and the distance gate all read one source point's own correspondence, so the second
+    # and third used to pay a launch and a round trip through global memory to re-read a face
+    # index the first had in a register. See ``kernel_registration.mesh_correspondence_pass``.
     #
     # Measure this kind of change with ``threshold=0.0``, or the reading is fiction: with the
     # convergence break live the two arms stop at *different* iterations, which inflated the
@@ -688,61 +713,58 @@ def icp_point_to_plane(
     # atomics, so two runs of the identical build disagree in the last digits once the cost stops
     # moving.
     #
-    # ``residual_valid`` is built on first use rather than here because the buffers it maps over
-    # come back from ``_correspondences``, whose mesh and cloud branches return different arrays;
-    # they are the same objects every iteration, so one construction still serves the whole loop.
     accumulate_step = wp.map(wp.mul, step, total, out=total, return_kernel=True)
-    residual_valid: wp.Kernel | None = None
+    # One gather either way: for a mesh target the correspondence indexes the face normals, for a
+    # cloud it indexes the target's own per-vertex normals.
+    normal_source = face_normals if mesh is not None else target_normals
+    assert normal_source is not None
 
     for iteration in range(max_iterations):
-        # --- correspondence + target normals ---
-        distance, triangle_id = _correspondences(
-            mesh,
-            target_vertices,
-            target_index,
-            current,
-            query_max,
-            closest,
-            distance_mesh,
-            triangle_id_mesh,
-        )
-        # One gather either way: for a mesh target ``triangle_id`` indexes the face normals, for a
-        # cloud it indexes the target's own per-vertex normals.
-        normal_source = face_normals if mesh is not None else target_normals
-        assert normal_source is not None
-        wp.launch(
-            kernel_array.gather_vec_skip_negative,
-            dim=n,
-            inputs=[normal_source, triangle_id, normals],
-            device=device,
-        )
+        # --- correspondence + target normals + distance gate ---
+        if mesh is not None:
+            wp.launch(
+                kernel_registration.mesh_correspondence_pass,
+                dim=n,
+                inputs=[
+                    mesh.id,
+                    current,
+                    wp.float32(query_max),
+                    normal_source,
+                    wp.float32(max_d),
+                    closest,
+                    distance_mesh,
+                    triangle_id_mesh,
+                    normals,
+                    valid,
+                ],
+                device=device,
+            )
+            distance, triangle_id = distance_mesh, triangle_id_mesh
+        else:
+            distance, triangle_id = _correspondences(
+                mesh,
+                target_vertices,
+                target_index,
+                current,
+                query_max,
+                closest,
+                distance_mesh,
+                triangle_id_mesh,
+            )
+            wp.launch(
+                kernel_registration.cloud_correspondence_pass,
+                dim=n,
+                inputs=[normal_source, triangle_id, distance, wp.float32(max_d), normals, valid],
+                device=device,
+            )
 
         # --- bail out once no correspondence survives the distance gate ---
         # Mirrors ``icp``'s ``sum(weights) == 0`` check: without it, every accumulator below stays
         # at its zeroed initial value, the damped 6x6 solve returns a zero step, and the loop
         # reports ``cost=0.0`` -- indistinguishable from a perfect fit -- instead of stopping with
-        # the last real cost (or ``math.inf`` if nothing ever matched).
-        if valid is not None:
-            if residual_valid is None:
-                # See ``icp``: Warp's ``wp.map`` stub does not narrow on ``return_kernel``.
-                residual_valid = cast(
-                    wp.Kernel,
-                    wp.map(
-                        kernel_registration.residual_valid,
-                        triangle_id,
-                        distance,
-                        wp.float32(max_d),
-                        out=valid,
-                        return_kernel=True,
-                    ),
-                )
-            wp.launch(
-                residual_valid,
-                dim=n,
-                inputs=[triangle_id, distance, wp.float32(max_d)],
-                outputs=[valid],
-                device=device,
-            )
+        # the last real cost (or ``math.inf`` if nothing ever matched). Only a finite
+        # ``max_distance`` can reject a correspondence, so only then is there anything to test.
+        if max_distance is not None:
             if not tw.reduce.any(valid):
                 break
 

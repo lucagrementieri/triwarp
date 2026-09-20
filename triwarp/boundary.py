@@ -32,7 +32,8 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_same_device
+from triwarp._device import read_scalar, require_same_device
+from triwarp.constants import INT32_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import boundary as kernel_boundary
 
@@ -909,12 +910,30 @@ def longest_boundary_loop(
     ``igl.boundary_loop``
     """
     require_same_device(vertices=vertices, faces=faces, edges_sorted=edges_sorted, edges=edges)
-    flat_loops, offsets, _loop_sizes = boundary_loops_batched(vertices, faces, edges_sorted, edges)
-    loops = tw.array.split(flat_loops, offsets)
-    if not loops:
-        return wp.empty(0, dtype=wp.int32, device=faces.device)
-    # Only the winner is materialized: the other loops stay views into the packed buffer.
-    return wp.clone(max(loops, key=lambda loop: int(loop.shape[0])))
+    device = faces.device
+    flat_loops, offsets, loop_sizes = boundary_loops_batched(vertices, faces, edges_sorted, edges)
+    n_loops = int(offsets.shape[0])
+    if n_loops == 0:
+        return wp.empty(0, dtype=wp.int32, device=device)
+    # The sizes are already on the device, so the winner is an argmax there rather than a Python
+    # scan: unpacking the loops first would read the offsets back, build one array view per loop,
+    # and then recover from those views exactly the lengths ``loop_sizes`` already holds -- a cost
+    # linear in the rim count for an answer that is one loop. ``-1`` is below every packed key, so
+    # the reduction needs no separate seeding pass.
+    best = wp.array([wp.int64(-1)], dtype=wp.int64, device=device)
+    wp.launch(
+        kernel_boundary.longest_loop_key,
+        dim=n_loops,
+        inputs=[offsets, loop_sizes, best],
+        device=device,
+    )
+    # One readback, because the key carries the winner's start in its low half as well as its
+    # length in its high half -- see the kernel.
+    key = int(read_scalar(best, 0))
+    start = INT32_MAX - (key & 0xFFFFFFFF)
+    size = key >> 32
+    # Only the winner is materialized: the rest of the packed buffer is never copied.
+    return wp.clone(flat_loops[start : start + size])
 
 
 def boundary_vertex_indices(

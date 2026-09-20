@@ -993,23 +993,21 @@ def transport_tangent_vectors(
     wp.map(wp.length, direction, out=lengths)
     maximum = tw.reduce.max(lengths)
 
-    scaled = wp.empty(n_vertices, dtype=wp.vec2d, device=device)
+    # One map for the whole tail: the rescale, the narrowing to the field's storage precision and
+    # the resolution test all read one vertex's own data, so running them apart costs two extra
+    # launches and a full round trip of the rescaled float64 field. Both floors are relative to
+    # the same maximum and mean different things -- see the kernel func.
+    transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
+    resolved = wp.empty(n_vertices, dtype=wp.bool, device=device)
     wp.map(
-        kernel_heat.scale_to_magnitude,
+        kernel_heat.transported_and_resolved,
         direction,
         extended,
+        lengths,
         wp.float64(_RELATIVE_ZERO * maximum),
-        out=scaled,
+        wp.float64(_RESOLVED_FRACTION * maximum),
+        out=[transported, resolved],
     )
-    transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.map(kernel_array.to_vec2, scaled, out=transported)
-
-    # Same field and the same relative comparison as ``scale_to_magnitude``' floor above, at a
-    # *higher* floor: that one asks "did this vanish?" and must stay below every genuine value,
-    # this one asks "can this be told from round-off?" and must stay above it. So a vertex can be
-    # reported unresolved while still carrying a full-length vector, which is the cut-locus case.
-    resolved = wp.empty(n_vertices, dtype=wp.bool, device=device)
-    wp.map(kernel_array.greater, lengths, wp.float64(_RESOLVED_FRACTION * maximum), out=resolved)
     return transported, resolved
 
 
@@ -1095,11 +1093,12 @@ def log_map(
     transported_raw = _diffuse_from_sources(
         vector_system, sources, reference, n_vertices, device, preconditioner=vector_preconditioner
     )
+    # One map over ``transported_raw``, two outputs: the narrowed vector and its length are two
+    # reads of the same entry, so a second pass would only re-read the field to measure what the
+    # first already had in registers.
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.map(kernel_array.to_vec2, transported_raw, out=transported)
-
     reference_lengths = twt.empty_1d(n_vertices, wp.float64, device=device)
-    wp.map(wp.length, transported_raw, out=reference_lengths)
+    wp.map(kernel_heat.narrow_and_length, transported_raw, out=[transported, reference_lengths])
     reference_tolerance = wp.float32(_RELATIVE_ZERO * tw.reduce.max(reference_lengths))
 
     # Radial direction: the unit gradient of the distance field, averaged onto vertices and

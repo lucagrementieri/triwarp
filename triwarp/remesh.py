@@ -253,6 +253,11 @@ def isotropic_remesh(
         # One readback, on a buffer the caller just built: a non-positive entry makes the split
         # stage diverge (every edge over-long), so it is worth catching here rather than at
         # ``max_iter``.
+        #
+        # Two reductions over one buffer, and merging them into a single min-and-sum kernel is
+        # declined: this runs once per call on the optional sizing-field path, against a call that
+        # issues hundreds of launches per iteration, so the pair is well under a percent of it and
+        # a new reduction kernel would exist for one site.
         smallest = float(tw.reduce.min(field))
         if smallest <= 0.0:
             raise ValueError(
@@ -382,8 +387,9 @@ def _length_bands(
         return low, high
     low = wp.empty(n_vertices, dtype=wp.float32, device=device)
     high = wp.empty(n_vertices, dtype=wp.float32, device=device)
-    wp.map(wp.mul, sizing, wp.float32(4.0 / 5.0), out=low)
-    wp.map(wp.mul, sizing, wp.float32(4.0 / 3.0), out=high)
+    # One map, two outputs: both bands are one scale of the same entry, so a second pass would
+    # only re-read the sizing field to multiply it by the other constant.
+    wp.map(kernel_remesh.hysteresis_bands, sizing, out=[low, high])
     return low, high
 
 
@@ -536,6 +542,13 @@ def _collapse_pass(
 
         # 64-bit because the lock key is: see ``kernel_remesh.scramble_index`` for why it has to
         # be injective, and what committing two collapses into overlapping 1-rings costs.
+        #
+        # **Folding this launch into the candidate kernel above is declined**, on the same
+        # measurement as the flip engine's equivalent in ``_flip_interior_edges``: the claim reads
+        # ``survivor[k]`` / ``removed[k]`` at its own thread and the ``wp.full`` between them is
+        # sized by a host-known count, so it would fuse -- but a pass is a topology rebuild plus a
+        # handful of launches around one readback, and this is one of them. The claim/commit pair
+        # after it is not fusible at all.
         claim = wp.full(n_vertices, INT64_MAX, dtype=wp.int64, device=device)
         wp.launch(
             kernel_remesh.claim_collapse_key,
@@ -745,6 +758,19 @@ def _flip_interior_edges(
 
         # Independent-set selection: a flip commits only if it wins both incident faces and the
         # hashed slot of its new edge (prevents two disjoint flips creating the same edge).
+        #
+        # **Folding this launch into the candidate kernels above is measured and declined.** It
+        # passes the index-locality test -- ``claim_flips`` reads ``flip[k]``, ``quad[k, *]`` and
+        # ``adjacency[k, *]`` at its own thread, and the two ``fill_`` calls touch buffers the
+        # candidate kernel never reads, so they would simply move ahead of a fused launch. What
+        # it is not is worth it. A pass is seven launches, and ``flip_to_delaunay`` converges in
+        # one or two passes on an ordinary mesh rather than running its iteration cap, so this
+        # launch is 2 % of the call at 1 280 faces and less at 20 480 -- a share that falls as
+        # the mesh grows. Against that, every one of the four candidate kernels decides
+        # ``out_flip`` at two or three separate exits (``objective_flip_candidates`` at three),
+        # so each would have to be restructured around a single exit for the claim to hang off,
+        # in predicate code where a mistake silently changes which edges flip. The claim/commit
+        # pair below is not fusible at all (a commit must see every claim).
         topology.face_claim.fill_(INT32_MAX)
         topology.edge_claim.fill_(INT32_MAX)
         wp.launch(

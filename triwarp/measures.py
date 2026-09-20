@@ -30,7 +30,7 @@ import numpy as np
 import warp as wp
 
 import triwarp as tw
-from triwarp._device import prefers_tiled_reduction, read_scalar, require_same_device, slice_count
+from triwarp._device import prefers_tiled_reduction, require_same_device, slice_count
 from triwarp.constants import TILE_1D
 from triwarp.kernels import measures as kernel_measures
 
@@ -127,13 +127,14 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     if f == 0:
         return wp.vec3(float("nan"), float("nan"), float("nan"))
     device = vertices.device
-    out_centroid = wp.zeros(3, dtype=wp.float32, device=device)
-    out_total_area = wp.zeros(1, dtype=wp.float32, device=device)
+    # One accumulator, read once: slots 0-2 hold the area-weighted centroid sum and slot 3 the
+    # area sum. See the kernel.
+    totals = wp.zeros(4, dtype=wp.float32, device=device)
     if prefers_tiled_reduction(device):
         wp.launch_tiled(
             kernel_measures.centroid_tiled,
             dim=[(f + TILE_1D - 1) // TILE_1D],
-            inputs=[vertices, faces, wp.int32(f), out_centroid, out_total_area],
+            inputs=[vertices, faces, wp.int32(f), totals],
             block_dim=TILE_1D,
             device=device,
         )
@@ -142,19 +143,19 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
         wp.launch(
             kernel_measures.centroid_sliced,
             dim=n_slices,
-            inputs=[vertices, faces, wp.int32(f), wp.int32(n_slices), out_centroid, out_total_area],
+            inputs=[vertices, faces, wp.int32(f), wp.int32(n_slices), totals],
             device=device,
         )
-    # Two unavoidable readbacks: the return type is a host-side wp.vec3, so the sums have to
-    # cross to the host to be divided.
-    total_area = float(read_scalar(out_total_area, 0))
+    # One unavoidable readback: the return type is a host-side wp.vec3, so the sums have to cross
+    # to the host to be divided, and the kernel put all four of them in one buffer to do it in a
+    # single sync.
+    weighted = totals.numpy()
+    total_area = float(weighted[3])
     if total_area == 0.0:
         # Every face degenerate: the weights are all zero, so there is no weighted mean. Same
         # answer as the empty mesh above, and the same shape as ``moments``' zero-volume guard --
         # a ``ZeroDivisionError`` out of a mesh that is merely degenerate would be a surprise.
-        # Taken before the second readback, which has nothing to divide.
         return wp.vec3(float("nan"), float("nan"), float("nan"))
-    weighted = out_centroid.numpy()
     return wp.vec3(
         float(weighted[0]) / total_area,
         float(weighted[1]) / total_area,

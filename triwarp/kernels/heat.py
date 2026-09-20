@@ -16,6 +16,7 @@ which is why they are one module rather than three.
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.kernels.array import to_vec2
 from triwarp.kernels.linalg import free_row
 from triwarp.kernels.predicates import normalize_or_zero, unit_tangent
 from triwarp.kernels.scatter import add_corner_triple
@@ -303,6 +304,40 @@ def scale_to_magnitude(direction: wp.vec2d, magnitude: wp.float64, floor: wp.flo
     # O(1) angle; and redoing the ring accumulation in float64 while still storing float32 leaves it
     # at 9.9e-09, so it is the angles' storage precision rather than the accumulation order.
     return magnitude * normalize_or_zero(direction, floor)
+
+
+@wp.func
+def narrow_and_length(v: wp.vec2d) -> tuple[wp.vec2, wp.float64]:
+    # A tangent field narrowed to its storage precision, and the length of the *unnarrowed* entry.
+    # ``log_map`` wants both of one diffused reference field; they are one load apart, so asking
+    # for them separately costs a second pass over the field to measure what the first had in
+    # registers. The length is taken in float64 on purpose -- it feeds a relative floor against
+    # the field's own maximum, which is a float64 reduction.
+    return to_vec2(v), wp.length(v)
+
+
+@wp.func
+def transported_and_resolved(
+    direction: wp.vec2d,
+    magnitude: wp.float64,
+    length: wp.float64,
+    floor: wp.float64,
+    resolved_floor: wp.float64,
+) -> tuple[wp.vec2, wp.bool]:
+    # The whole tail of ``transport_tangent_vectors`` in one pass: rescale the diffused direction
+    # to its extended magnitude, narrow it to the field's storage precision, and report whether
+    # this vertex's direction can be told from round-off.
+    #
+    # The two floors are deliberately different and both relative to the same field maximum --
+    # ``floor`` asks "did this vanish?" and must sit below every genuine value, ``resolved_floor``
+    # asks "can this be told from round-off?" and must sit above it -- so a vertex can be reported
+    # unresolved while still carrying a full-length vector, which is the cut-locus case. See
+    # ``scale_to_magnitude`` for why neither may be absolute.
+    #
+    # Fused because the float64 rescale, the narrowing and the comparison are three reads of one
+    # vertex's own data: run apart they cost two extra launches and a full round trip of the
+    # rescaled float64 field through global memory, purely to hand it to a cast.
+    return (to_vec2(scale_to_magnitude(direction, magnitude, floor)), length > resolved_floor)
 
 
 @wp.func

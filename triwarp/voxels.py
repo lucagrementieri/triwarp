@@ -65,7 +65,6 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_same_device
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import interpolation as kernel_interpolation
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import voxels as kernel_voxels
@@ -412,11 +411,14 @@ def pool_by_voxel(
     slots = _point_slots(grid, points)
     # One sentinel bucket past the last voxel collects the points that fall outside the grid.
     counts = wp.zeros(n_voxels + 1, dtype=wp.int32, device=device)
-    buckets = wp.empty(n_points, dtype=wp.int32, device=device)
+    # Only the mean/sum branch sorts by bucket; the min/max branch reads nothing from this launch
+    # but ``counts``, so it asks for no per-point buckets and allocates none.
+    sorts_by_bucket = pooling not in ("min", "max")
+    buckets = wp.empty(n_points if sorts_by_bucket else 0, dtype=wp.int32, device=device)
     wp.launch(
         kernel_voxels.bucket_point_slots,
         dim=n_points,
-        inputs=[slots, wp.int32(n_voxels), buckets, counts],
+        inputs=[slots, wp.int32(n_voxels), sorts_by_bucket, buckets, counts],
         device=device,
     )
 
@@ -829,7 +831,12 @@ def occupancy_at_points(grid: wp.Volume, points: wp.array[wp.vec3]) -> wp.array[
     mask = wp.empty(n_points, dtype=wp.bool, device=points.device)
     if n_points == 0:
         return mask
-    wp.map(kernel_voxels.is_present, _point_slots(grid, points), out=mask)
+    wp.launch(
+        kernel_voxels.point_occupancy,
+        dim=n_points,
+        inputs=[grid.id, points, True, mask],
+        device=points.device,
+    )
     return mask
 
 
@@ -877,7 +884,12 @@ def occupancy_at_cells(grid: wp.Volume, cells: twt.Array2dInt32) -> wp.array[wp.
     mask = wp.empty(n_cells, dtype=wp.bool, device=cells.device)
     if n_cells == 0:
         return mask
-    wp.map(kernel_voxels.is_present, _cell_slots(grid, cells), out=mask)
+    wp.launch(
+        kernel_voxels.cell_occupancy,
+        dim=n_cells,
+        inputs=[grid.id, cells, True, mask],
+        device=cells.device,
+    )
     return mask
 
 
@@ -1847,11 +1859,11 @@ def surface_voxels(grid: wp.Volume, *, connectivity: Literal[6, 18, 26] = 6) -> 
     the set is empty by definition.
     """
     voxel_size, origin = grid_transform(grid)
-    interior = _interior_flags(grid, connectivity)
-    if interior is None:
+    # ``interior=False`` asks the neighbourhood kernel for the complement it already computes,
+    # rather than launching a second pass to negate the flags it just wrote.
+    boundary = _interior_flags(grid, connectivity, interior=False)
+    if boundary is None:
         return _empty_grid(voxel_size, origin, grid.device)
-    boundary = wp.empty(int(interior.shape[0]), dtype=wp.int32, device=grid.device)
-    wp.map(kernel_voxels.flip_flag, interior, out=boundary)
     return _grid_from_flagged_cells(grid, boundary)
 
 
@@ -2264,11 +2276,16 @@ def _select_cells(
     n_cells = int(rows.shape[0])
     if n_cells == 0:
         return _empty_grid(voxel_size, origin, rows.device)
-    mask = occupancy_at_cells(b, rows)
-    if not present:
-        complement = wp.empty(n_cells, dtype=wp.bool, device=rows.device)
-        wp.map(kernel_array.mask_not, mask, out=complement)
-        mask = complement
+    # ``present`` rides into the kernel rather than inverting its answer afterwards: membership
+    # and its complement are the same probe, so the difference costs a selector instead of a
+    # second launch over a mask the first one just wrote.
+    mask = wp.empty(n_cells, dtype=wp.bool, device=rows.device)
+    wp.launch(
+        kernel_voxels.cell_occupancy,
+        dim=n_cells,
+        inputs=[b.id, rows, present, mask],
+        device=rows.device,
+    )
     keep = tw.array.flatnonzero(mask)
     return from_cells(twt.as_array2d(tw.array.gather(rows, keep), wp.int32), voxel_size, origin)
 
@@ -2382,8 +2399,15 @@ def _check_iterations(connectivity: int, iterations: int) -> None:
         raise ValueError(f"iterations must be non-negative, got {iterations}")
 
 
-def _interior_flags(grid: wp.Volume, connectivity: int) -> wp.array[wp.int32] | None:
-    """Per-voxel 1 / 0 flag: is the whole neighbourhood occupied? ``None`` for an empty grid."""
+def _interior_flags(
+    grid: wp.Volume, connectivity: int, *, interior: bool = True
+) -> wp.array[wp.int32] | None:
+    """
+    Per-voxel 1 / 0 flag: is the whole neighbourhood occupied? ``None`` for an empty grid.
+
+    ``interior=False`` returns the complement -- the surface set -- which the kernel writes
+    directly, so the two callers differ by a selector rather than by a pass.
+    """
     if connectivity not in _CONNECTIVITY_RANK:
         raise ValueError(f"connectivity must be 6, 18 or 26, got {connectivity!r}")
     voxels = cells(grid)
@@ -2394,7 +2418,13 @@ def _interior_flags(grid: wp.Volume, connectivity: int) -> wp.array[wp.int32] | 
     wp.launch(
         kernel_voxels.neighborhood_complete,
         dim=n_voxels,
-        inputs=[grid.id, voxels, _stencil(connectivity, grid.device, include_self=False), flags],
+        inputs=[
+            grid.id,
+            voxels,
+            _stencil(connectivity, grid.device, include_self=False),
+            interior,
+            flags,
+        ],
         device=grid.device,
     )
     return flags

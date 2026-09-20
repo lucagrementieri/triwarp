@@ -5,6 +5,7 @@ from triwarp.kernels.array import (
     binary_search_sorted_contains,
     masked_at,
     pack_directed_key,
+    pack_edge_key,
 )
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.triangles import corner_triple
@@ -148,6 +149,22 @@ def keep_selected(selected: wp.bool, keep_flag: wp.int32) -> wp.bool:
 
 
 @wp.kernel
+def keep_selected_by_component(
+    mask: wp.array[wp.bool],
+    labels: wp.array[wp.int32],
+    keep: wp.array[wp.int32],
+    out_mask: wp.array[wp.bool],
+) -> None:
+    # The per-vertex answer read straight through the vertex's own component label. Done at
+    # Python scope this was a gather -- an ``indexedarray`` view, a cloud-sized allocation and a
+    # launch to materialise it -- handed to a second launch that then compared it against
+    # ``mask``. Both reads are at this thread's own index, so the intermediate never needed to
+    # exist.
+    v = wp.int32(wp.tid())
+    out_mask[v] = keep_selected(mask[v], keep[labels[v]])
+
+
+@wp.kernel
 def keep_component_scatter(
     mask: wp.array[wp.bool], labels: wp.array[wp.int32], out_keep: wp.array[wp.int32]
 ) -> None:
@@ -203,3 +220,44 @@ def mark_labels_of_seeds(
     f = wp.int32(wp.tid())
     if seeds[f]:
         out_label_seeded[labels[f]] = True
+
+
+@wp.kernel
+def loops_are_input_rims(
+    flat_loops: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    to_input: wp.array[wp.int32],
+    input_boundary_keys: wp.array[wp.uint64],
+    base: wp.uint64,
+    out_is_input_rim: wp.array[wp.bool],
+) -> None:
+    # Per loop: was *every* one of its edges already a boundary edge of the input mesh? A loop for
+    # which that holds is the input's own rim surfacing in the submesh rather than a rim the
+    # deletion opened, which is what ``delete_region_keep_boundary`` filters on.
+    #
+    # ``to_input`` maps a submesh vertex back to its input index, because the submesh renumbered
+    # them and ``input_boundary_keys`` is a sorted table in input indices.
+    #
+    # One thread per *loop*, walking its own rim, rather than one per rim vertex with a segment
+    # label: boundary loops are few and short, which is the regime
+    # ``kernels/array.segment_owner_labels`` names as the one where the per-segment shape wins --
+    # and it needs no owner array, no total-terminated offsets and no scan to build them. The
+    # early exit is what makes it cheap in the common case, since a loop the deletion opened
+    # usually fails on one of its first edges.
+    #
+    # Measured against the host form, same loops: 1.58x on the whole public call at 46 rims and
+    # 3.08x at 217 -- the win grows with the rim count, because what it removes is a readback per
+    # rim. Flat on the CPU device, where ``wp.array.numpy()`` is a zero-copy view and the host
+    # form was never paying for the transfers.
+    ell = wp.int32(wp.tid())
+    start = loop_starts[ell]
+    size = loop_sizes[ell]
+    is_rim = wp.int32(1)
+    for k in range(size):
+        a = to_input[flat_loops[start + k]]
+        b = to_input[flat_loops[start + (k + 1) % size]]
+        if not binary_search_sorted_contains(input_boundary_keys, pack_edge_key(a, b, base)):
+            is_rim = wp.int32(0)
+            break
+    out_is_input_rim[ell] = is_rim != 0

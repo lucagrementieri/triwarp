@@ -28,6 +28,23 @@ from triwarp.kernels.predicates import (
 _GLOBAL_BEST_RELAX = wp.float32(1.0 + 1e-4)
 
 
+@wp.func
+def closest_point_query(
+    mesh_id: wp.uint64, p: wp.vec3, max_dist: wp.float32
+) -> tuple[wp.vec3, wp.float32, wp.int32]:
+    # One point's closest point on the mesh, its distance and the face carrying it; a miss returns
+    # the query point, ``max_dist`` and ``-1``, so the sentinel convention lives in one place.
+    #
+    # Named rather than left inline in the kernel below because ``registration``'s ICP loop fuses
+    # this query with the passes that consume its answer, and a cross-reference in prose is a
+    # claim only a shared function can keep true.
+    query = wp.mesh_query_point_no_sign(mesh_id, p, max_dist)
+    if query.result:
+        closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+        return closest, wp.length(p - closest), query.face
+    return p, max_dist, wp.int32(-1)
+
+
 @wp.kernel
 def closest_point_on_mesh(
     mesh_id: wp.uint64,
@@ -38,17 +55,10 @@ def closest_point_on_mesh(
     out_face: wp.array[wp.int32],
 ) -> None:
     tid = wp.int32(wp.tid())
-    p = points[tid]
-    query = wp.mesh_query_point_no_sign(mesh_id, p, max_dist)
-    if query.result:
-        closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
-        out_closest[tid] = closest
-        out_distance[tid] = wp.length(p - closest)
-        out_face[tid] = query.face
-    else:
-        out_closest[tid] = p
-        out_distance[tid] = max_dist
-        out_face[tid] = wp.int32(-1)
+    closest, distance, face = closest_point_query(mesh_id, points[tid], max_dist)
+    out_closest[tid] = closest
+    out_distance[tid] = distance
+    out_face[tid] = face
 
 
 @wp.kernel

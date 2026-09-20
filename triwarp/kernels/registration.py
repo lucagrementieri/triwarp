@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.predicates import normalize_or_zero
+from triwarp.kernels.proximity import closest_point_query
 from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
 from triwarp.kernels.transform import transform_point_mat44
 
@@ -337,6 +338,16 @@ def residual_valid(
 
 
 @wp.func
+def correspondence_normal(source: wp.array[wp.vec3], index: wp.int32) -> wp.vec3:
+    # The target normal a correspondence points at, or the zero vector where there is none.
+    # ``source`` is the face-normal table for a mesh target and the per-vertex one for a cloud,
+    # which is why the two ICP passes below differ only in what they hand it.
+    if index >= 0:
+        return source[index]
+    return wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.func
 def distance_threshold_weight(
     distance: wp.float32, triangle_id: wp.int32, max_distance: wp.float32
 ) -> wp.float32:
@@ -351,38 +362,85 @@ def distance_threshold_weight(
 
 
 @wp.kernel
-def distance_threshold_weights_and_count(
-    distance: wp.array[wp.float32],
-    triangle_id: wp.array[wp.int32],
+def mesh_correspondence_pass(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    query_max: wp.float32,
+    normal_source: wp.array[wp.vec3],
     max_distance: wp.float32,
-    out_weights: wp.array[wp.float32],
-    out_count: wp.array[wp.float32],
+    out_closest: wp.array[wp.vec3],
+    out_distance: wp.array[wp.float32],
+    out_face: wp.array[wp.int32],
+    out_normals: wp.array[wp.vec3],
+    out_valid: wp.array[wp.bool],
 ) -> None:
-    # ``distance_threshold_weight`` over the whole correspondence array *and* its sum, in one
-    # launch. ``registration.icp`` needs both every iteration -- the weights feed the Procrustes
-    # fit, the sum is the loop's "every correspondence was rejected" early exit -- and ran them as
-    # a ``wp.map`` followed by ``reduce.sum``, which is two launches, two allocations and the map's
-    # own host-side resolution per iteration for a number this pass already has in registers.
+    # One ICP iteration's whole correspondence step against a mesh target: the closest-point
+    # query, the target normal it points at, and whether it survives the distance gate.
     #
-    # The lane-strided fold and the ``wp.block_dim()`` stride are ``kernels/reduce``'s, so the
-    # single-lane CPU device stays correct (CLAUDE.md section 2.2). The sum is a ``float32`` tree
-    # rather than a sequential accumulation, so its last bits differ from ``reduce.sum``'s -- which
-    # is immaterial to a caller that only asks whether it is zero, and the count is a sum of exact
-    # 0.0 and 1.0 values in any case.
-    i, lane = wp.tid()
-    offset, remaining = tile_chunk(distance.shape[0], i, ITEMS_PER_BLOCK_1D)
-    if remaining <= 0:
-        return
-    remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
-    total = wp.float32(0.0)
-    for k in range(lane, remaining, wp.block_dim()):
-        slot = offset + k
-        weight = distance_threshold_weight(distance[slot], triangle_id[slot], max_distance)
-        out_weights[slot] = weight
-        total += weight
-    block_total = wp.tile_sum(wp.tile(total))[0]
-    if lane == 0:
-        wp.atomic_add(out_count, 0, block_total)
+    # The three ran as three launches at the same width, and the second and third read nothing
+    # but what the first had just written at their own index -- so each paid a launch and a full
+    # round trip through global memory to re-read a face index this pass holds in a register.
+    # Inside a loop that runs up to ``max_iterations`` times, that is the launch count of the
+    # iteration rather than a one-off: measured, it takes a 13-iteration point-to-plane run from
+    # 82 launches to 56, output byte-identical on the CPU device (the CUDA plateau is not
+    # bit-reproducible on its own -- see ``accumulate_point_to_plane``).
+    #
+    # **The wall clock is flat all the same, and that is the honest reading**: this loop reads a
+    # scalar back every iteration for its convergence test, so the host is already waiting on the
+    # device rather than the other way round, and the launches it issues were overlapping with
+    # work. What the fusion buys here is the two ``(n,)`` round trips through global memory and a
+    # third of the launch count -- worth having, and not a speedup to quote. Do not re-measure
+    # this against a run with the convergence break live: the two arms then stop at different
+    # iterations and the ratio is fiction.
+    tid = wp.int32(wp.tid())
+    closest, distance, face = closest_point_query(mesh_id, points[tid], query_max)
+    out_closest[tid] = closest
+    out_distance[tid] = distance
+    out_face[tid] = face
+    out_normals[tid] = correspondence_normal(normal_source, face)
+    out_valid[tid] = residual_valid(face, distance, max_distance)
+
+
+@wp.kernel
+def mesh_correspondence_weight_pass(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    query_max: wp.float32,
+    max_distance: wp.float32,
+    out_closest: wp.array[wp.vec3],
+    out_distance: wp.array[wp.float32],
+    out_face: wp.array[wp.int32],
+    out_weights: wp.array[wp.float32],
+) -> None:
+    # ``registration.icp``'s mesh-target correspondence step: the closest-point query and the
+    # binary distance gate its Procrustes fit weights by. The sibling of
+    # ``mesh_correspondence_pass``, which serves the point-to-plane loop and additionally gathers
+    # a target normal -- the two differ by that gather and by whether the gate is reported as a
+    # weight or as a mask, so they stay two kernels over one shared query.
+    tid = wp.int32(wp.tid())
+    closest, distance, face = closest_point_query(mesh_id, points[tid], query_max)
+    out_closest[tid] = closest
+    out_distance[tid] = distance
+    out_face[tid] = face
+    out_weights[tid] = distance_threshold_weight(distance, face, max_distance)
+
+
+@wp.kernel
+def cloud_correspondence_pass(
+    normal_source: wp.array[wp.vec3],
+    index: wp.array[wp.int32],
+    distance: wp.array[wp.float32],
+    max_distance: wp.float32,
+    out_normals: wp.array[wp.vec3],
+    out_valid: wp.array[wp.bool],
+) -> None:
+    # The cloud-target tail of ``mesh_correspondence_pass``: the nearest-neighbour search is a
+    # ``neighbors.query_nearest`` call rather than a kernel here, so only the two passes that
+    # consume its answer fuse. Both read one correspondence at their own index.
+    tid = wp.int32(wp.tid())
+    i = index[tid]
+    out_normals[tid] = correspondence_normal(normal_source, i)
+    out_valid[tid] = residual_valid(i, distance[tid], max_distance)
 
 
 @wp.func

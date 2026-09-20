@@ -459,18 +459,22 @@ def mesh_with_mesh(
     n_hit = int(hit_pairs.shape[0])
 
     segments = twt.empty_2d((n_hit, 2), wp.vec3, device=device)
+    seg_valid = wp.empty(n_hit, dtype=wp.bool, device=device)
+    # One launch: the degeneracy test rides in the kernel that computes the segment, which both
+    # removes a pass over the segment buffer and keeps the test off the rows that pass never
+    # wrote -- see the kernel.
     wp.launch(
         kernel_intersections.triangle_pair_segments,
         dim=n_hit,
-        inputs=[query_vertices, query_faces, target_vertices, target_faces, hit_pairs, segments],
-        device=device,
-    )
-
-    seg_valid = wp.empty(n_hit, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_intersections.segment_nondegenerate,
-        dim=n_hit,
-        inputs=[segments, seg_valid],
+        inputs=[
+            query_vertices,
+            query_faces,
+            target_vertices,
+            target_faces,
+            hit_pairs,
+            segments,
+            seg_valid,
+        ],
         device=device,
     )
 
@@ -1328,6 +1332,10 @@ def _clip_with_vertex_field(
         inputs=[faces, vertex_dots, face_classes, face_signs],
         device=device,
     )
+    # Folding this into ``classify_faces_for_slice`` above is declined for the same reason as the
+    # cut pair below: it is one launch of six in ``slice_mesh_with_plane``, and it runs only on
+    # the plane path, so a merged kernel would carry a sentinel for the field path that has no
+    # plane to tie-break against.
     if plane_normal is not None:
         wp.launch(
             kernel_intersections.resolve_on_plane_faces,
@@ -1365,22 +1373,19 @@ def _clip_with_vertex_field(
     ):
         if n_cut == 0:
             continue
-        edge_points = wp.empty((n_cut, 3), dtype=wp.vec3, device=device)
-        wp.launch(
-            kernel_intersections.edge_level_crossings,
-            dim=n_cut,
-            inputs=[vertices, faces, face_indices, vertex_dots, edge_points],
-            device=device,
-        )
+        # One launch per class: each cut face's emit thread evaluates the two edge crossings it
+        # needs from ``vertex_dots`` directly. A separate pass used to tabulate all three into an
+        # ``(n_cut, 3)`` buffer for this one to read two of back -- see ``emit_cut_vertices``.
         n_emitted = faces_per_cut * n_cut
         wp.launch(
             emit,
             dim=n_cut,
             inputs=[
+                vertices,
                 faces,
                 face_indices,
                 face_signs,
-                edge_points,
+                vertex_dots,
                 wp.int32(vertex_base),
                 all_vertices[vertex_base : vertex_base + 2 * n_cut],
                 all_faces[face_base : face_base + 3 * n_emitted].reshape((n_emitted, 3)),
