@@ -552,6 +552,83 @@ def fill_dp_span_tiled(tables: HoleFillTables, span: wp.int32) -> None:
         tables.prev[base + i * b + j] = block_k
 
 
+@wp.kernel(enable_backward=False)
+def traceback_fill_triangles(
+    flat_loops: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    dp_offsets: wp.array[wp.int32],
+    triangle_offsets: wp.array[wp.int32],
+    prev: wp.array[wp.int32],
+    stack: wp.array[wp.vec2i],
+    out_counts: wp.array[wp.int32],
+    out_triangles: wp.array2d[wp.int32],
+) -> None:
+    # One thread per loop, walking its own predecessor table: interval ``(i, j)`` splits at apex
+    # ``k = prev[i, j]`` into triangle ``(i, j, k)`` -- reversed rim winding, matching ``fan_faces``
+    # -- and sub-intervals ``(i, k)``, ``(k, j)``. An apex of ``-1`` marks an interval no legal
+    # triangulation covers (a forbidden chord, or a pinched rim), and is skipped, so a loop emits
+    # *at most* ``B - 2`` triangles and the caller compacts on ``out_counts``.
+    #
+    # The walk is depth-first with ``(k, j)`` taken before ``(i, k)``, which is what fixes the
+    # emitted order -- the same order for the same table on either device.
+    #
+    # ``stack`` is caller-owned scratch, one slot per packed loop vertex, so loop ``ell`` owns
+    # ``stack[loop_starts[ell] : + B]``. That is exactly enough: the walk starts one deep and each
+    # emitted triangle nets one entry, so the depth never passes ``B - 1``.
+    ell = wp.int32(wp.tid())
+    b = loop_sizes[ell]
+    if b < 3:
+        out_counts[ell] = 0
+        return
+    o = loop_starts[ell]
+    base = dp_offsets[ell]
+    tri = triangle_offsets[ell]
+    stack[o] = wp.vec2i(0, b - 1)
+    top = wp.int32(1)
+    n = wp.int32(0)
+    while top > 0:
+        top -= 1
+        interval = stack[o + top]
+        i = interval[0]
+        j = interval[1]
+        if j - i >= 2:
+            k = prev[base + i * b + j]
+            if k >= 0:
+                out_triangles[tri + n, 0] = flat_loops[o + i]
+                out_triangles[tri + n, 1] = flat_loops[o + j]
+                out_triangles[tri + n, 2] = flat_loops[o + k]
+                n += 1
+                stack[o + top] = wp.vec2i(i, k)
+                top += 1
+                stack[o + top] = wp.vec2i(k, j)
+                top += 1
+    out_counts[ell] = n
+
+
+@wp.kernel
+def compact_fill_triangles(
+    counts: wp.array[wp.int32],
+    padded_offsets: wp.array[wp.int32],
+    packed_ends: wp.array[wp.int32],
+    padded: wp.array2d[wp.int32],
+    out_triangles: wp.array2d[wp.int32],
+) -> None:
+    # Close the gaps a skipped apex left in the padded per-loop triangle blocks. ``packed_ends`` is
+    # the *inclusive* scan of ``counts``, so a loop's packed block ends there and begins
+    # ``counts[ell]`` earlier -- the same buffer the caller read its total from, rather than a
+    # second exclusive scan of it.
+    ell, t = wp.tid()
+    count = counts[ell]
+    if t >= count:
+        return
+    dst = packed_ends[ell] - count + t
+    src = padded_offsets[ell] + t
+    out_triangles[dst, 0] = padded[src, 0]
+    out_triangles[dst, 1] = padded[src, 1]
+    out_triangles[dst, 2] = padded[src, 2]
+
+
 @wp.kernel
 def flag_bad_triangulations(
     loop_sizes: wp.array[wp.int32],
@@ -893,17 +970,20 @@ def set_dp_origin(out_dp: wp.array2d[wp.float32]) -> None:
 @wp.struct
 class StitchTables:
     """
-    The stitch DP's invariant inputs, bundled so the per-diagonal launches carry one argument.
+    The stitch DP's invariant inputs, bundled so the sweep's launches carry one argument.
 
-    ``holes._stitch_halves`` launches ``stitch_dp_diag`` once per anti-diagonal -- ``n_a + n_b``
-    times -- and every one of these ten values is the same on every launch. Only ``diag`` and the
-    two in-place DP tables vary. This is ``HoleFillTables``' argument exactly, in the same file and
-    on the same shape of loop; see that struct's docstring for the per-argument cost model and for
-    why the struct must be built **once**, outside the loop.
+    ``holes._run_stitch_dp`` launches one of the two kernels below repeatedly -- once per
+    tile-diagonal, or once per anti-diagonal for the reference schedule -- and every one of these
+    ten values is the same on every launch. Only the diagonal index and the two in-place DP tables
+    vary. This is ``HoleFillTables``' argument exactly, in the same file and on the same shape of
+    loop; see that struct's docstring for the per-argument cost model and for why the struct must
+    be built **once**, outside the loop.
 
     Not graph capture: recording a graph costs at least what issuing the launches costs, so capture
-    pays only on a sequence that is *replayed*, and this loop runs once per call. Measured at this
-    launch count, capture-and-replay-once is a loss where a bundle is a substantial win.
+    pays only on a sequence that is *replayed*, and this loop runs once per call. Measured at the
+    diagonal schedule's launch count, capture-and-replay-once is a loss where a bundle is a
+    substantial win. The tiled schedule then removed most of those launches outright, which is the
+    one thing capture could not do here.
     """
 
     a_pos: wp.array[wp.vec3]
@@ -918,32 +998,31 @@ class StitchTables:
     n_b: wp.int32
 
 
-@wp.kernel(enable_backward=False)
-def stitch_dp_diag(
+@wp.func
+def stitch_dp_cell(
     tables: StitchTables,
-    diag: wp.int32,
+    i: wp.int32,
+    j: wp.int32,
     out_dp: wp.array2d[wp.float32],
     out_came: wp.array2d[wp.int32],
-) -> None:
-    # One thread per cell (i, j) on anti-diagonal ``diag = i + j``; each reads only the previous
-    # diagonal, so launching diag = 1, 2, ... in order are the DP barriers. dp[i, j] = min cost of
-    # the band consuming i edges of A and j edges of B from the aligned start (cell (0, 0)).
+) -> tuple[wp.float32, wp.int32]:
+    # One cell of the stitch grid DP: ``dp[i, j]`` is the min cost of the band consuming ``i``
+    # edges of A and ``j`` edges of B from the aligned start at cell (0, 0), and ``came[i, j]``
+    # says which rim the last step advanced. It reads *only* ``(i - 1, j)`` and ``(i, j - 1)``,
+    # which is what lets the two kernels below schedule it differently and still agree cell for
+    # cell -- one thread per anti-diagonal cell, or one block per tile of the grid.
+    #
+    # The caller owns cell (0, 0) and must not call here for it. The cost is returned rather than
+    # stored so that neither schedule has to decide where the answer goes.
     a_pos = tables.a_pos
     b_pos = tables.b_pos
     up = tables.up
     metric_id = tables.metric_id
     n_a = tables.n_a
     n_b = tables.n_b
-    i_lo = wp.max(0, diag - n_b)
-    i = i_lo + wp.int32(wp.tid())
-    j = diag - i
-    if i > n_a or j < 0 or j > n_b or (i == 0 and j == 0):
-        return
     # Never let a full ring come from one loop before touching the other.
     if (i == n_a and j == 0) or (j == n_b and i == 0):
-        out_dp[i, j] = BAD_METRIC
-        out_came[i, j] = CAME_NONE
-        return
+        return BAD_METRIC, CAME_NONE
 
     complex_edge = metric_id == METRIC_COMPLEX_STITCH
     best = FLOAT32_INF_CONSTANT
@@ -983,17 +1062,172 @@ def stitch_dp_diag(
                 w = w + stitch_edge_metric(b_prev, b_cur, tables.b_opp[(j - 1) % n_b], a_cur)
         update_argmin(best, best_came, w, CAME_B)
 
+    return best, best_came
+
+
+@wp.kernel(enable_backward=False)
+def stitch_dp_diag(
+    tables: StitchTables,
+    diag: wp.int32,
+    out_dp: wp.array2d[wp.float32],
+    out_came: wp.array2d[wp.int32],
+) -> None:
+    # One thread per cell (i, j) on anti-diagonal ``diag = i + j``; each reads only the previous
+    # diagonal, so launching diag = 1, 2, ... in order are the DP barriers.
+    #
+    # This is the reference schedule and the one the CPU device takes. ``stitch_dp_tile`` below
+    # computes the identical cells in a different order -- the difference is *only* where the
+    # barriers come from, a launch boundary here against a block barrier there -- and
+    # ``tests/test_holes.py::test_stitch_dp_tile_matches_diagonal`` pins the two to each other.
+    i_lo = wp.max(0, diag - tables.n_b)
+    i = i_lo + wp.int32(wp.tid())
+    j = diag - i
+    if i > tables.n_a or j < 0 or j > tables.n_b or (i == 0 and j == 0):
+        return
+    best, best_came = stitch_dp_cell(tables, i, j, out_dp, out_came)
     out_dp[i, j] = best
     out_came[i, j] = best_came
 
 
+# Side of the square grid tile ``stitch_dp_tile`` gives one block, and the block's lane count with
+# it. The tiled schedule trades launches for block barriers: a ``(n_a + 1) x (n_b + 1)`` grid takes
+# ``2 * ceil(n / TILE)`` launches instead of ``n_a + n_b``, and each block pays ``2 * TILE - 1``
+# barriers for the ``TILE^2`` cells it covers.
+#
+# **32 because that is one warp, and the barrier is the cost.** Swept 16/32/64/128/256 against the
+# diagonal schedule on both devices at rims of 128 to 2 048: CUDA takes 11.0-13.3x and peaks at 32
+# at every size, falling to ~10x at 64 and ~8.5x at 256 -- which is Warp's ``tile_reduce_impl``
+# taking its ``warp_count == 1`` fast path (a ballot and a shuffle, no shared round trip: 126 ns
+# against 325 at 64 lanes). The CPU device also prefers the tiled schedule, 2.4-7.8x, but peaks at
+# 64; 32 costs it ~4% and one constant is worth that, so this is deliberately *not* device-split.
+#
+# One consequence of 32 being a single warp: the block needs no barrier at all at this width, so
+# removing the ``wp.tile_sum`` below still passes here. Probe that guard at 64 lanes or more, where
+# it fails every run.
+STITCH_DP_TILE = 32
+
+
+@wp.kernel(enable_backward=False)
+def stitch_dp_tile(
+    tables: StitchTables,
+    block_diag: wp.int32,
+    bi_lo: wp.int32,
+    tile: wp.int32,
+    out_dp: wp.array2d[wp.float32],
+    out_came: wp.array2d[wp.int32],
+) -> None:
+    # One *block* per ``tile x tile`` square of the grid, all the squares on one tile-diagonal
+    # ``block_diag = bi + bj`` per launch. A square depends only on the squares above and to the
+    # left of it, which sat on the previous tile-diagonal and so finished in the previous launch;
+    # inside the square the same dependency makes its own anti-diagonals sequential, and *those*
+    # barriers are block-local rather than launches. That is the whole point: the grid needs
+    # ``n_a + n_b`` sequential steps either way, and this pays for all but ``2 * ceil(n / tile)``
+    # of them with a block barrier at a few hundred nanoseconds instead of a launch at ~12 us.
+    #
+    # ``wp.tile_sum`` over a per-lane value is the barrier. Warp exposes no bare ``__syncthreads``
+    # (§10 has no barrier builtin), and a block-collective reduction both synchronises and orders
+    # the global writes the next diagonal reads -- verified by removing it, which fails every run
+    # at 64 lanes and above and, at 32, passes only because one warp needs no barrier at all.
+    #
+    # **The lane stride is ``wp.block_dim()``, not ``tile``.** They agree on CUDA, where the launch
+    # passes ``tile`` as its ``block_dim``. On the CPU device ``wp.launch_tiled`` runs one lane per
+    # block through Warp 1.17, so the runtime value reads 1 and that single lane walks every row of
+    # each anti-diagonal in turn -- correct, because the cells of one anti-diagonal are independent
+    # of each other. With the constant it would compute one cell in ``tile`` and leave the rest of
+    # the square at its fill value.
+    blk, t = wp.tid()
+    bi = bi_lo + blk
+    i0 = bi * tile
+    j0 = (block_diag - bi) * tile
+    n_a = tables.n_a
+    n_b = tables.n_b
+    for d in range(2 * tile - 1):
+        di = t
+        while di < tile:
+            dj = d - di
+            if dj >= 0 and dj < tile:
+                i = i0 + di
+                j = j0 + dj
+                # The grid is ``(n_a + 1) x (n_b + 1)``, so the last tile of each axis is partial;
+                # and cell (0, 0) is the seed the driver wrote, not a cell to compute.
+                if i <= n_a and j <= n_b and (i != 0 or j != 0):
+                    best, best_came = stitch_dp_cell(tables, i, j, out_dp, out_came)
+                    out_dp[i, j] = best
+                    out_came[i, j] = best_came
+            di += wp.block_dim()
+        # Block barrier: every lane must see this anti-diagonal's writes before reading them as
+        # the next one's predecessors. The sum itself is discarded.
+        _ = wp.tile_sum(wp.tile(wp.float32(t)))[0]
+
+
 @wp.kernel
-def mark_loops_with_chords(
+def count_loop_vertices(
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    n_vertices: wp.int32,
+    out_counts: wp.array[wp.int32],
+    out_fillable: wp.array[wp.bool],
+) -> None:
+    # How many packed loop slots each mesh vertex occupies, across *every* loop at once. The
+    # range test is fused in rather than left to the caller because ``out_counts`` is indexed by
+    # the value read here: a loop naming a vertex the mesh does not have would otherwise scatter
+    # outside the histogram, which on the CPU device is host-heap corruption rather than a wrong
+    # answer. Such a loop cannot be triangulated over mesh vertices either, so it is cleared.
+    t = wp.int32(wp.tid())
+    v = flat_loops[t]
+    if v < 0 or v >= n_vertices:
+        out_fillable[loop_id[t]] = False
+        return
+    wp.atomic_add(out_counts, v, 1)
+
+
+@wp.kernel
+def clear_shared_loops(
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    vertex_counts: wp.array[wp.int32],
+    out_fillable: wp.array[wp.bool],
+) -> None:
+    # One occurrence count answers both pinch tests at once. A vertex holding two packed slots is
+    # visited twice by one loop (that loop is pinched at it) or once by each of two loops (both
+    # are pinched there), and in either case every loop touching it is unfillable -- so
+    # "occupies more than one slot" is exactly the union of the two conditions, and no per-loop
+    # distinct-vertex pass is needed to separate them. Idempotent writes, so no atomics.
+    t = wp.int32(wp.tid())
+    v = flat_loops[t]
+    if v >= 0 and v < vertex_counts.shape[0] and vertex_counts[v] > 1:
+        out_fillable[loop_id[t]] = False
+
+
+@wp.kernel
+def scatter_fillable_loop_slots(
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    fillable: wp.array[wp.bool],
+    out_loop_of_vertex: wp.array[wp.int32],
+    out_position_in_loop: wp.array[wp.int32],
+) -> None:
+    # Which loop owns each mesh vertex and where along it, for the chord test below. Only a loop
+    # still marked fillable writes, which is what makes the two tables single-valued: such a loop
+    # holds one slot per vertex and shares none with another, so no two threads reach the same
+    # entry.
+    t = wp.int32(wp.tid())
+    ell = loop_id[t]
+    if not fillable[ell]:
+        return
+    v = flat_loops[t]
+    out_loop_of_vertex[v] = ell
+    out_position_in_loop[v] = t - loop_starts[ell]
+
+
+@wp.kernel
+def clear_loops_with_chords(
     unique_edges: wp.array2d[wp.int32],
     loop_of_vertex: wp.array[wp.int32],
     position_in_loop: wp.array[wp.int32],
     loop_sizes: wp.array[wp.int32],
-    out_has_chord: wp.array[wp.bool],
+    out_fillable: wp.array[wp.bool],
 ) -> None:
     # A *chord* is a mesh edge joining two vertices of one boundary loop that are not neighbours
     # along it. A min-weight fill triangulates over the loop's own vertices, so it can propose that
@@ -1011,7 +1245,7 @@ def mark_loops_with_chords(
     if gap < 0:
         gap = -gap
     if gap != 1 and gap != size - 1:
-        out_has_chord[loop] = True
+        out_fillable[loop] = False
 
 
 @wp.kernel

@@ -6,9 +6,12 @@ The module has the highest non-``N`` sensitivity in the package and this pair se
 independent drivers:
 
 * **Loop length**, cubed. ``fill_min_weight`` runs a minimum-weight triangulation DP over a
-  ``B x B`` table per loop, filled by ``B - 2`` *sequential* kernel launches and read back to the
-  host for the traceback. Total work is ``sum(B_i^3)`` and no batching can remove it: this is the
-  real cost the module exists to pay.
+  ``B x B`` table per loop, filled by ``B - 2`` *sequential* kernel launches, then traced back one
+  thread per loop without the table ever leaving the device. Total work is ``sum(B_i^3)`` and no
+  batching can remove it: this is the real cost the module exists to pay. At ``rim_short`` the span
+  sweep's host launch cost and its device time are now within ~20% of each other and overlap, so
+  removing launches there is worth at most that gap -- read "launch-bound" as a claim about the
+  *many-rim* end, where the sweep is one launch and everything else is fixed cost.
 
   Most of what *can* be removed already was. Widening the per-span launch from one thread per
   interval to one *block* per interval, its lanes striding the apex loop, is worth several-fold on
@@ -19,7 +22,9 @@ independent drivers:
   loops. Per loop it would be a ``.numpy()`` readback, a forbidden-chord pass over the whole mesh
   and its own span launches, so many three-vertex holes -- where the DP itself is one triangle per
   hole -- cost *more* than the genuinely expensive long-rim point. Batching also runs
-  ``rim_short``'s two rims concurrently.
+  ``rim_short``'s two rims concurrently. The last per-loop host term was the traceback, a Python
+  stack walk per rim over a read-back predecessor table; on ``holes_many`` it alone was 22% of the
+  call, and moving it onto the device took the whole group 1.21x.
 
 That is why the axis meshes are *small*: face count is not the variable, and sizing these meshes up
 would only add DP table entries that the ``B^3`` term already dominates. The two points differ by
@@ -456,13 +461,21 @@ def _stitch_pair_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
 @pytest.mark.benchlibs("triwarp", "meshlib")
 def test_stitch_min_weight(bench_case: BenchCase) -> None:
     """
-    Grid DP over the two rims: an La x Lb table filled by La + Lb sequential launches.
+    Grid DP over the two rims: an La x Lb table whose cells are La + Lb sequential steps deep.
 
     meshlib is the only reference in the package that has this operation at all -- ``stitchHoles``
     is a real two-loop minimum-weight stitch where trimesh and pymeshlab have nothing, which is why
     it is also the oracle in tests/test_holes.py::test_stitch_min_weight_matches_meshlib. The
     four-argument overload is used deliberately (see section 6): the two-argument one finds the
     rims itself, and timing that would fold hole detection into the DP.
+
+    **This row used to be launch-bound and is not any more.** The grid's ``La + Lb`` sequential
+    steps were one kernel launch each -- 2 049 of them at 1 024-vertex rims, 24.6 ms of a 29 ms
+    call against 7.0 ms of device time. They are now block barriers inside a tiled schedule, one
+    launch per tile-diagonal, with a byte-identical band: **this row moved 2.9x** and the gain
+    grows with the rim, reaching 6.9x on the DP-only call at twice these rims. What is left is the
+    DP's own cells plus the fixed preamble the rims share with ``stitch``, so read this against
+    that group rather than against its own history.
     """
     if bench_case.kind == "meshlib":
         vertices_np, faces_np = _stitch_pair_np(bench_case)
@@ -506,17 +519,22 @@ def test_fillable_loop_mask(bench_case: BenchCase) -> None:
     left is the chord sweep, which is a pass over every unique edge and so tracks the mesh -- there
     is no smaller correct version of that test, and it is the half meshlib does not do at all.
 
-    **Attributed per stage, the two benchmarked rows are floor rows.**
-    They are **``edges_unique``** -- the shared unique/group stack, which has its own group and its
-    own floor, and which is flat here across the face range, so it is that stack's fixed cost rather
-    than this function's. Nothing local can move them: even deleting the chord test outright leaves
-    a floor an order of magnitude above meshlib's cached-topology arithmetic. Two things were taken
-    because they were free rather than because they showed up: the rim concatenation now re-uses the
-    buffer ``boundary_loops`` already packed (``copy=False``, see
+    **Attributed per stage, every benchmarked row is now a floor row.**
+    The floor is **``edges_unique``** -- the shared unique/group stack, which has its own group and
+    its own floor, and which is flat here across the face range, so it is that stack's fixed cost
+    rather than this function's. Nothing local can move it: even deleting the chord test outright
+    leaves a floor an order of magnitude above meshlib's cached-topology arithmetic. Two things were
+    taken because they were free rather than because they showed up: the rim concatenation now
+    re-uses the buffer ``boundary_loops`` already packed (``copy=False``, see
     ``benchmarks/test_boundary.py::test_loop_perimeters``), and an ``index_bound`` readback is gone
-    because ``vertices`` already states the bound. ``dragon``'s remainder is a **Python loop
-    over 407 rims** building two vertex-indexed tables, which is the one stage here with an
-    algorithm left in it and the reason that row is not a floor row.
+    because ``vertices`` already states the bound.
+
+    ``dragon``'s remainder used to be a Python loop over its 407 rims building two vertex-indexed
+    tables, and that was the one stage here with an algorithm left in it. It is gone: the pinch
+    tests are one per-vertex slot count on the device and the tables are scattered by a kernel, so
+    the whole predicate is readback-free and the many-rim row is 2.4x what it was while the
+    few-rim rows are unchanged. What that removes is a *loop-count* term, which is why it does not
+    show on ``bunny``.
     """
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()
@@ -550,6 +568,13 @@ def test_extend_hole(bench_case: BenchCase) -> None:
     size -- and it is structural rather than clever: the extension is two launches over the rim
     while meshlib inserts the faces into a halfedge structure one at a time. On the largest mesh the
     two whole-mesh copies dominate everything the rim does.
+
+    !!! note "This row hoists the rims out, so it misses one axis the default path has"
+        Passing ``loops`` is what keeps the row measuring the extension rather than
+        ``boundary_loops``, and it is the right call -- but it also hands the function a *list*, so
+        the row cannot see the cost of deriving that list. On the ``loops=None`` default the rims
+        come from ``boundary_loops_batched`` and are never split into one array per rim; a 407-rim
+        scan mesh measured 1.65x from that alone, and the gap grows with the rim count.
     """
     height = float(bench_case.vertices_np[:, 2].max()) + 1.0
     if bench_case.kind == "meshlib":

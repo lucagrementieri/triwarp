@@ -34,6 +34,7 @@ from tests.conversions import (
     warp_to_trimesh,
 )
 from triwarp.holes import _non_increasing_indices
+from triwarp.kernels import holes as kernel_holes
 
 
 # Open-surface fixtures that actually have a boundary to fill.
@@ -2077,6 +2078,47 @@ def test_stitch_min_weight_watertight(device: str, n_a: int, n_b: int, metric: s
     assert tw.validation.is_winding_consistent(new_faces)
     filled_tm = warp_to_trimesh(new_vertices, new_faces)
     assert filled_tm.is_watertight
+
+
+@pytest.mark.parametrize(("n_a", "n_b"), [(8, 8), (40, 37), (64, 33)])
+@pytest.mark.parametrize("metric", STITCH_METRICS)
+@pytest.mark.parametrize("tile", [32, 64])
+def test_stitch_dp_tile_matches_diagonal(
+    monkeypatch: pytest.MonkeyPatch, device: str, n_a: int, n_b: int, metric: str, tile: int
+) -> None:
+    """
+    Triwarp against triwarp: the tiled band DP must emit the **identical band** as the diagonal one.
+
+    ``stitch_dp_diag`` carries the oracle here -- it is the straight reading of the recurrence, one
+    launch per anti-diagonal -- and ``stitch_dp_tile`` is the fast schedule that has to agree with
+    it. Both call the same ``stitch_dp_cell``, so the only thing that can differ is *ordering*: the
+    tiled kernel replaces all but ``2 * ceil(n / tile)`` of the launch barriers with a block
+    barrier, and a missing or mis-placed one would let a cell read a predecessor that a lane in
+    another warp had not written yet. Nothing else in this file would see that -- the band would
+    still be watertight, still ``n_a + n_b`` triangles, and still plausible.
+
+    **``tile`` is parametrized because the shipped value cannot fail.** At 32 the block is a single
+    warp and needs no barrier at all: deleting the ``wp.tile_sum`` leaves this green at 32 and
+    fails it on every run at 64. So the 64 arm is the one that pins the barrier, and the 32 arm
+    pins the value actually shipped. The three ``(n_a, n_b)`` pairs cover a grid inside one tile, a
+    grid of several whole-and-partial tiles, and one that is partial on one axis only.
+    """
+    monkeypatch.setattr(kernel_holes, "STITCH_DP_TILE", tile)
+    (_, _, va, fa), (_, _, vb, fb) = _capsule_halves(device, n_a, n_b, phase=0.3)
+
+    original = tw.holes._run_stitch_dp
+    bands = {}
+    for tiled in (True, False):
+        monkeypatch.setattr(
+            tw.holes,
+            "_run_stitch_dp",
+            lambda *args, _tiled=tiled, **kwargs: original(*args, **kwargs, tiled=_tiled),
+        )
+        _, faces = tw.holes.stitch_min_weight(va, fa, vb, fb, metric=metric)
+        bands[tiled] = faces.numpy()[int(fa.shape[0]) + int(fb.shape[0]) :]
+
+    assert bands[True].shape[0] == 3 * (n_a + n_b), "fixture produced no band to compare"
+    assert np.array_equal(bands[True], bands[False])
 
 
 @pytest.mark.parity("stitch_min_weight", "meshlib")

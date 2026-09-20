@@ -467,6 +467,11 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # -- that is ``out_keep``.
     ("polyline", "rdp_split_spans"): frozenset({"span_lo", "span_hi", "state"}),
     ("sample", "subtract_deleted_contributions"): frozenset({"weights"}),
+    # The min-weight fill's traceback walks each rim's predecessor table with an explicit stack of
+    # pending intervals -- caller-allocated because the walk is one thread over a ``B``-deep
+    # problem, so it cannot be a kernel local. Neither an input nor the answer, which is
+    # ``out_triangles`` beside ``out_counts``.
+    ("holes", "traceback_fill_triangles"): frozenset({"stack"}),
     ("visibility", "shape_diameter"): frozenset({"scratch"}),
 }
 

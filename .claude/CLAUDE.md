@@ -58,8 +58,8 @@ Two conventions that hold throughout:
     upgrade discipline
 13. [The cost model (RTX 5090)](#13-the-cost-model-rtx-5090) — host per-call, device/memory, tuning
     constants
-14. [Kernel-shape verdicts](#14-kernel-shape-verdicts) — what wins, what is refuted, and when a
-    producer-consumer fusion pays
+14. [Kernel-shape verdicts](#14-kernel-shape-verdicts) — what wins, what is refuted, when a
+    producer-consumer fusion pays, and when a launch buys less than a block barrier
 15. [Benchmark and measurement traps](#15-benchmark-and-measurement-traps)
 16. [triwarp component status](#16-triwarp-component-status) — open defects, refuted plans, and
     the rules the optimization rounds left behind
@@ -1611,12 +1611,26 @@ CPU work is ~36x slower once CUDA has been initialised in the process** (§12.1)
 level is an order of magnitude on a CPU-heavy file and the same on the whole suite. **Never reach
 for `--device=both` on a GPU box to get CPU coverage** — use the runner.
 
-**Run the runner before calling a change done**, not just the default `pytest`. Both-device coverage
-is what caught the `warp.fem` ambient-device leak in `reconstruction._screened_poisson_adaptive` —
-broken for CPU input on any box with a GPU, and invisible to a CUDA-only run (the devices matched)
-*and* to a `CUDA_VISIBLE_DEVICES=""` run (`warp.fem` then defaults to CPU too). That defect class
-needs CUDA present *and* the arrays on the host, which is a configuration neither single-device run
-reaches. `wp.ScopedDevice(device)` is the fix when a dependency picks the device for us.
+**While developing, run `--device=cuda` only.** The CPU pass is roughly three times the wall clock
+of the CUDA one on the whole suite and **CI runs it on every push**, so a CPU regression is caught
+there; paying for it locally after each edit buys a slower loop and nothing else. Iterate on
+`uv run python -m pytest tests/test_<module>.py -q --device=cuda`, and let the runner below be
+something you reach for deliberately rather than reflexively.
+
+**Reach for `tests.devices` when the change is device-dependent by construction**, not on every
+edit: a `launch_tiled` kernel (§12.2), a `_device.prefers_tiled_reduction` branch, a device-gated
+constant (§13.3), anything that takes `device=` from a dependency, or a kernel whose lanes
+cooperate. Both-device coverage is what caught the `warp.fem` ambient-device leak in
+`reconstruction._screened_poisson_adaptive` — broken for CPU input on any box with a GPU, and
+invisible to a CUDA-only run (the devices matched) *and* to a `CUDA_VISIBLE_DEVICES=""` run
+(`warp.fem` then defaults to CPU too). That defect class needs CUDA present *and* the arrays on the
+host, which is a configuration neither single-device run reaches. `wp.ScopedDevice(device)` is the
+fix when a dependency picks the device for us.
+
+**The CPU device does still earn a local run for one thing: it is the deterministic oracle.** Float
+atomics serialize there, so a byte-for-byte A/B against a baseline compares cleanly on CPU and is
+noise on CUDA wherever a reduction order can move (§16.12). That is a *measurement* use, on the one
+comparison that needs it, not a gate to re-run after every edit.
 
 **A test that costs more than ~15 s on CPU wears `@pytest.mark.slow_cpu(<measured seconds>)`**, which
 skips it when it would run on `cpu` unless `--device=both`. Four `screened_poisson` tests carry it
@@ -4197,6 +4211,11 @@ A direct GPU factorization and the conditioning-flatness evidence are §16.8.
 
 ### 14.9 Refuted, with the code written — do not re-propose
 
+**Read §14.11 first.** Two of the entries below are single-block rewrites of a whole problem, and
+one reader in three takes them as "cooperative kernels lose here". The distinction that decides it
+is *tiling*: putting the whole sequential problem on one block loses, and keeping the grid full
+while trading a launch for a block barrier is the biggest win in this package.
+
 - **A single-block cooperative BFS drain.** Built, byte-identical, and a large loss. The serial
   drain is memory-throughput bound on one thread, not latency bound, so neither software pipelining
   nor a register-vector batch of loads helped; and on a narrow, non-growing frontier the per-level
@@ -4324,6 +4343,44 @@ normalization precondition and a deliberate non-merge decision, all of which had
 rather than lost.
 
 ---
+
+### 14.11 Blocked wavefront: trade a launch for a block barrier, keeping the grid full
+
+**A dependency chain of `N` sequential steps does not need `N` launches.** Where the chain is over
+a *grid* rather than a scalar — a 2-D DP whose cell reads only the cells above and to the left, the
+classic shape — tiling it into `T x T` squares and launching one tile-diagonal at a time leaves
+only `2 * ceil(N / T)` launches. Every other step becomes a block-local barrier. Measured on
+`stitch_loops_min_weight`'s band DP: **2 049 launches to 65, 11.0-13.3x on the DP sweep and up to
+6.94x on the whole public call**, byte-identical (§16.12).
+
+**It is the opposite of §14.9's two refuted rewrites, and the difference is the grid.** Those put a
+whole sequential problem on **one** block, so the device ran at one SM and the barrier cost bought
+nothing; this keeps one block per tile and as many tiles as the diagonal holds, so the concurrency
+is what it was and only the *synchronisation* got cheaper. **Ask which one a proposal is before
+citing either precedent.**
+
+The conditions, all four of which the band DP meets:
+
+- **The dependency is local and directional** — cell `(i, j)` reads `(i-1, j)` and `(i, j-1)` and
+  nothing farther. That is what makes a tile depend only on its up and left neighbours, so a
+  tile-diagonal's tiles are mutually independent.
+- **The per-step work is small next to a launch.** At ~12 µs a launch against ~126 ns for a
+  32-lane `wp.tile_sum` barrier (§13.1, §13.2), the trade is worth ~95x per step before any
+  other effect.
+- **Warp exposes no barrier, so a block-collective reduction is it.** `wp.tile_sum(wp.tile(x))[0]`
+  synchronises *and* orders the global writes the next step reads. **Probe that by removing it**:
+  it fails only at 64 lanes and above, because one warp needs no barrier, so a test at the shipped
+  32 cannot see a barrier that is gone.
+- **The schedule must be provably value-neutral**, which means keeping the cell body in one
+  `@wp.func` both kernels call and pinning the fast schedule to the simple one byte-for-byte
+  (§2.4). Build the comparison against **one** set of inputs: rebuilding them per arm compares two
+  different problems wherever anything upstream uses a float atomic, which read as a dozen
+  mismatches here and were the probe's own fixture (§12.10).
+
+**Where to look for the next one:** a Python loop issuing one launch per step whose `dim` is a
+*slice* of a 2-D table. The fill DP's span sweep is the same shape and is named as unbuilt in
+§16.6 — its recurrence is over intervals rather than a grid, so the tiling is different, and its
+launch cost no longer dominates its device time, which is why it is still unbuilt rather than next.
 
 ## 15. Benchmark and measurement traps
 
@@ -5047,6 +5104,11 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   passed on a sweep of hundreds of launches. Remaining lever, unbuilt: a blocked interval DP that
   tiles the recurrence to cut the launch count by an order of magnitude — worth building only if a
   row appears where it would flip a result.
+    - **Re-measured, and "launch-bound" now overstates the ceiling at the long-rim point.** On
+      `rim_short` the 510-launch span sweep reads 6.06 ms wall against 5.13 ms of device time, so
+      the host launch cost and the kernels overlap almost exactly and removing *every* launch
+      would buy ~16 %. Price a blocked DP against that gap, not against the whole sweep. The
+      claim still holds where it was written — the many-rim end, where the sweep is one launch.
     - **REFUTED — transposed mirrors of the DP tables so the apex loop's second read coalesces.**
       Built, byte-identical, and a loss. The tables are L2-resident, so "one transaction per lane" is
       an L2 hit and the 32x transaction argument prices bandwidth this kernel is not paying; and the
@@ -5278,3 +5340,101 @@ recording. Accept it deliberately, with launches, allocations and readbacks held
   artifact of aggregating two same-named functions; instrumenting the allocator directly gave the
   same count in both arms.
 - **A row in the A/B that the change does not touch is the control that licenses the rest.**
+
+### 16.12 `holes`
+
+- **A packed engine fed by the split form pays the loop count twice, and nothing in the signature
+  says so.** `triwarp.holes` builds every stage on `_PackedLoops`, but two of the three places that
+  derive rims from a mesh took `boundary_loops` — which is `split` over
+  `boundary_loops_batched`'s buffer — and then concatenated the per-loop views straight back.
+  At ~3 µs to build a view and ~6 µs to copy a segment (§13.1) that round trip is linear in the
+  rim count on both sides: measured **37.3 ms against `_hole_loops`' 2.15 ms** on an 8 192-rim
+  sphere, for the identical answer. Both now go through one `_boundary_loops_packed` helper, worth
+  **2.0-2.1x at 512 rims and 15-16x at 8 192** on `extend_hole` / `build_bottom` and nothing at 2
+  rims. **The tell is a wrapper that calls the split form and packs the result** — grep for
+  `boundary_loops(` next to `pack_1d_arrays` / `concatenate`. The third, `_single_boundary_loops`,
+  keeps the split deliberately: the whole `stitch*` family requires *exactly one* rim per mesh, so
+  a many-rim input raises rather than paying, and §4.2 says an axis with no caller is not built.
+    - **The benchmark could not see it**, because `test_extend_hole` and `test_fillable_loop_mask`
+      hoist `boundary_loops` out of the timed callable and pass `loops` — correctly, since the
+      derivation is not the op. A hoist that removes a *cost* also removes an *axis*; say so in the
+      row's docstring when the default path does not take the hoisted route.
+- **`fillable_loop_mask`'s two pinch tests are one per-vertex occurrence count**, not a
+  distinct-vertex test per loop plus an owner tally over their unions. A vertex holding two packed
+  loop slots is visited twice by one rim or once by each of two, and every rim touching it is
+  unfillable either way — so `count > 1` is exactly the union of the two conditions. That is
+  §2.4's duplicated *decision rule* one level up: two host passes, each with its own `np.unique`,
+  expressing one rule. The whole predicate is now readback-free (it returned a `wp.array[wp.bool]`
+  already and was building it from NumPy). **The predicate itself measures 25.7x on two
+  65 536-vertex rims** (22.3 ms -> 0.87) and **3.9x at 512 rims**; end to end, where
+  `boundary_loops_batched`'s flat ~2.1 ms floor is the rest of the call, that reads **9.0x**,
+  **3.2x**, **32.4x** at 8 192 rims and **2.2x** on a 407-rim scan mesh. `np.unique` alone was
+  85 % of the long-rim call — 21.4 ms of 25.1 — which is §3.8's "NumPy reducing a full
+  readback" wearing a set operation's clothes.
+    - The range guard is fused into the counting kernel rather than left to the caller, because the
+      histogram is indexed by the value read (§12.1). An out-of-range rim now answers `False` where
+      the host form raised an undocumented `IndexError` from NumPy's own indexing.
+- **The min-weight DP's traceback runs on the device, one thread per rim.** The host form read the
+  whole `sum(B^2)` predecessor table back to reach `sum(B)` of its entries and then built the
+  triangles a Python tuple at a time: **0.765 ms at two 512-rims and 0.804 ms at 512 three-rims**,
+  the latter 22 % of the whole call. The device walk is **2.9x / 5.8x** on those, taking
+  `fill_min_weight` 1.24x and `fill_small` 1.26x at the many-rim point. It is byte-identical — the
+  DFS takes `(k, j)` before `(i, k)` exactly as the Python stack did — and that is checked on 611
+  CPU outputs, not inferred.
+    - **A rim can emit fewer than `B - 2` triangles** (a forbidden chord, or a pinch, leaves
+      `prev = -1`), so each rim writes into its own padded block and reports a count. The single
+      readback is the packed total, which sizes the return *and* tells the caller whether any rim
+      fell short — so the compaction launch only runs when one did.
+    - Its stack is caller-allocated scratch, one slot per packed rim vertex: the walk starts one
+      deep and each emitted triangle nets one entry, so the depth never passes `B - 1`.
+- **`fill_min_weight`'s triangulation is not bit-reproducible on a degenerate rim, and never was.**
+  `loop_rim_metrics` accumulates each rim's Newell normal with float32 `wp.atomic_add`, so the
+  normal varies in its last bits run to run (measured: 2 distinct results over 30 launches on one
+  input), and on a rim whose metric has exact ties — a pinched non-manifold rim, or two rims of
+  equal perimeter under `preserve_largest_hole` — that flips which triangulation wins.
+  `_PackedLoops.perimeters` has the same shape and gave 15 distinct values over 30 calls on a
+  cylinder whose two rims are equal. **Consequence for any A/B on this module: gate on the CPU
+  device**, where the atomics serialize and 611 outputs compare byte-for-byte, and do not read a
+  CUDA difference on a degenerate fixture as a regression.
+- **SHIPPED — the stitch band DP is a blocked wavefront, and a launch traded for a block barrier
+  is worth ~40x here.** It was the module's one launch-bound row: `n_a + n_b` anti-diagonals, one
+  launch each, **2 049 launches and 24.6 ms of a 29 ms call against 7.0 ms of device time** at two
+  1 024-vertex rims. `StitchTables` had already collapsed the per-launch argument cost and graph
+  capture is refuted for a sequence issued once (§14.3), so the launches themselves had to go.
+  `stitch_dp_tile` gives one **block** a `32 x 32` square of the grid and launches one
+  tile-diagonal at a time, so all but `2 * ceil(n / 32)` of the sequential steps become block-local
+  barriers. Measured on the DP sweep alone: **11.0-13.3x on CUDA** at rims of 128 to 2 048 and
+  **2.4-7.8x on CPU**. End to end and byte-identical: `stitch_loops_min_weight` **1.76x at 64-rims
+  rising to 6.94x at 1 024**, `stitch_min_weight` 1.29-4.14x behind its `boundary_loops` floor,
+  CPU 1.18-2.35x; the benchmark row, which is a harness number and not comparable with those
+  (§15.4), reads **2.9x** and turns a 1.2x loss to meshlib into a 3.6x win. The host side was never
+  the lever — `came.numpy()` is 0.27 ms for a 4.2 MB table and the band traceback is sequential.
+    - **`wp.tile_sum(wp.tile(x))[0]` is the barrier, because Warp exposes none** (§10, §13.2). It
+      orders global writes across warps, which is not a thing to assume: **probed by removing it**,
+      and a 2-D wavefront then fails 8/8 runs at 64, 128 and 256 lanes and passes 8/8 at 32.
+    - **32 lanes is the optimum and it is also the width at which the barrier cannot be tested.**
+      A 32-lane block is one warp, so it needs no barrier at all — which is exactly why it is
+      fastest (`tile_reduce_impl`'s `warp_count == 1` fast path, 126 ns against 325 at 64, §12.6)
+      and exactly why `test_stitch_dp_tile_matches_diagonal` parametrizes `tile` over 32 **and**
+      64. Deleting the barrier leaves the 32 arm green and fails the 64 arm on every run. **A
+      tuning constant that makes a correctness mechanism unobservable needs the test to cover a
+      value it does not ship.**
+    - **The tiled schedule wins on the CPU device too, so it is the default on both** — unlike the
+      fill DP's tiled engine, which CPU declines. There the lanes are the win and CPU has one; here
+      the win is the launch count, which CPU pays for as well. Its own optimum is 64 rather than 32
+      (4 % apart), which §13.3 calls inside the tolerance, so the constant is deliberately not
+      device-split.
+    - **There is no crossover to gate on**: the tiled form is ahead at every rim from 10 vertices
+      (7.1x CUDA, 11.6x CPU) to 2 048. `stitch_dp_diag` stays as the reference schedule the test
+      compares against, reached through `_run_stitch_dp(tiled=False)`.
+    - **A `@wp.struct` type cannot be annotated**, because the decorator rebinds the name to a
+      `Struct` *value* — so a helper taking a bundle names `warp._src.codegen.StructInstance`
+      instead, and basedpyright's `reportGeneralTypeIssues` is what says so.
+- **Every other NumPy site in the module was priced and kept.** The `stitch_loops` monotonicity
+  correction (a longest-increasing-subsequence over the association array), the band traceback and
+  `bridge_edges_smooth`'s Hermite strip are host-*sequential* or fixed-size, which is §3.8's
+  sanctioned bucket; `_PackedLoops`' cumsums and uploads are 0.10-0.16 ms even at 8 192 rims.
+- **The floor under every entry point here is `boundary_loops_batched`, at a flat 1.9-2.1 ms**
+  whatever the mesh — which is `triwarp.boundary`'s own floor and is recorded as closed (§16.5).
+  `fill_fan[holes_many]` is 2.2 ms of which 2.1 is that call, so a filler row at the small end is
+  measuring `boundary`, not `holes`.

@@ -67,8 +67,12 @@ from collections.abc import Sequence
 from typing import Literal, cast, overload
 
 import numpy as np
-import numpy.typing as npt
 import warp as wp
+
+# ``@wp.struct`` rebinds the decorated name to a ``Struct`` *value*, so the class itself is not
+# annotatable and a helper taking a bundle has to name the instance's base instead. Private on
+# Warp 1.17; an upgrade that moves it fails at import rather than silently.
+from warp._src.codegen import StructInstance
 
 import triwarp as tw
 import triwarp.typing as twt
@@ -135,12 +139,6 @@ class _PackedLoops:
         """Host slice of ``flat_loops`` (and of any other length-``total`` buffer) for a loop."""
         start = int(self.starts_np[index])
         return slice(start, start + int(self.sizes_np[index]))
-
-    def dp_block(self, table_np: np.ndarray, index: int) -> np.ndarray:
-        """``(B, B)`` view of one loop's block inside a host copy of a ragged DP table."""
-        start = int(self.dp_offsets_np[index])
-        size = int(self.sizes_np[index])
-        return table_np[start : start + size * size].reshape(size, size)
 
 
 def fill_fan(
@@ -422,8 +420,9 @@ def fill_min_weight(
     **every hole is solved in the same launches**: the per-loop ``B x B`` tables are packed into one
     ragged buffer, so the launch count is ``max(B) - 1`` for the whole mesh rather than ``B - 1``
     per hole, and the chord test, the plane normals and the min-area fallback decision are likewise
-    one pass each. Only the ``O(B)`` traceback is host-side, over a single predecessor buffer. A
-    mesh with many small holes therefore costs about what one hole costs.
+    one pass each. The traceback runs on the device too, one thread per rim, so the predecessor
+    table never crosses the bus. A mesh with many small holes therefore costs about what one hole
+    costs.
 
     Each span launch puts a **block** on every interval rather than a thread, with the block's lanes
     striding the apex loop and a two-stage tile reduction picking the winner: the interval grid is
@@ -592,9 +591,10 @@ def _fill_packed_loops(
     The engine behind [`fill_loops_min_weight`][triwarp.holes.fill_loops_min_weight]. Everything
     before the traceback is batched across loops — one Newell-normal and longest-edge pass, one
     chord pass over the mesh, one ragged ``dp`` / ``prev`` pair, one launch per span rather than
-    per (loop, span),
-    and a device-side min-area retry mask instead of a host branch per loop. What is left on the
-    host is the ``O(B)`` traceback, which reads *one* packed predecessor table.
+    per (loop, span), a device-side min-area retry mask instead of a host branch per loop, and a
+    one-thread-per-loop traceback that keeps the predecessor table on the device. What is left on
+    the host is two scalar reads: whether any loop needs the fallback metric, and how many fill
+    triangles there are to return.
 
     ``edges_sorted`` lets a caller that already built the sorted edge rows hand them over.
     ``fill_min_weight`` does; ``fill_small`` and ``fill_smooth`` deliberately do **not**, and it is
@@ -692,43 +692,80 @@ def _fill_packed_loops(
                 prev,
             )
 
-    prev_np = prev.numpy()
-    flat_np = loops.flat_loops.numpy()
-    triangles: list[tuple[int, int, int]] = []
-    for index in range(loops.n_loops):
-        triangles.extend(
-            _traceback_triangles(loops.dp_block(prev_np, index), flat_np[loops.loop_slice(index)])
-        )
-
-    if len(triangles) == 0:
+    fill_faces = _traceback_fill_faces(loops, prev)
+    if fill_faces is None:
         return wp.clone(faces)
-    fill_faces = wp.array(
-        np.asarray(triangles, dtype=np.int32).reshape(-1), dtype=wp.int32, device=device
-    )
     return tw.array.concatenate([faces, fill_faces])
 
 
-def _traceback_triangles(prev_np: np.ndarray, loop_np: np.ndarray) -> list[tuple[int, int, int]]:
+def _traceback_fill_faces(
+    loops: _PackedLoops, prev: wp.array[wp.int32]
+) -> wp.array[wp.int32] | None:
     """
-    Extract the ``B - 2`` fill triangles from the DP predecessor table.
+    Walk every loop's DP predecessor table into one flat fill-face buffer, or ``None`` if empty.
 
-    Each interval ``(i, j)`` splits at apex ``k = prev[i, j]`` into triangle ``(i, j, k)`` (reversed
-    rim winding, matching ``fan_faces``) and sub-intervals ``(i, k)``, ``(k, j)``. An apex of ``-1``
-    (an unfillable interval, e.g. a fully pinched hole) is skipped.
+    One thread per loop, so the ``O(B)`` walk each rim needs runs where its table already is
+    instead of crossing the bus: the host form read the whole ``sum(B^2)`` predecessor table back
+    to reach ``sum(B)`` of its entries, then built the triangles a Python tuple at a time.
+
+    Each loop writes into its own ``B - 2`` slots of a padded buffer and reports how many it
+    actually used, which is fewer exactly where an interval had no legal apex. The single readback
+    is the packed total, which sizes the return -- and it doubles as the test for whether any loop
+    fell short, so the compaction pass only runs when one did.
     """
-    triangles: list[tuple[int, int, int]] = []
-    stack = [(0, int(loop_np.shape[0]) - 1)]
-    while stack:
-        i, j = stack.pop()
-        if j - i < 2:
-            continue
-        k = int(prev_np[i, j])
-        if k < 0:
-            continue
-        triangles.append((int(loop_np[i]), int(loop_np[j]), int(loop_np[k])))
-        stack.append((i, k))
-        stack.append((k, j))
-    return triangles
+    device = loops.device
+    triangle_sizes_np = np.maximum(loops.sizes_np - 2, 0)
+    n_padded = int(triangle_sizes_np.sum())
+    if n_padded == 0:
+        return None
+    triangle_offsets = wp.array(
+        np.concatenate([[0], np.cumsum(triangle_sizes_np)[:-1]]).astype(np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+    counts = twt.empty_1d(loops.n_loops, wp.int32, device=device)
+    padded = wp.empty(3 * n_padded, dtype=wp.int32, device=device)
+    # The walk's pending intervals: one slot per packed rim vertex, which is exactly enough
+    # (see ``traceback_fill_triangles``), and caller-allocated because a kernel local cannot be
+    # sized by a runtime rim length.
+    stack = wp.empty(loops.total, dtype=wp.vec2i, device=device)
+    wp.launch(
+        kernel_holes.traceback_fill_triangles,
+        dim=loops.n_loops,
+        inputs=[
+            loops.flat_loops,
+            loops.starts,
+            loops.sizes,
+            loops.dp_offsets,
+            triangle_offsets,
+            prev,
+            stack,
+            counts,
+            padded.reshape((n_padded, 3)),
+        ],
+        device=device,
+    )
+    packed_ends = twt.empty_1d(loops.n_loops, wp.int32, device=device)
+    wp.utils.array_scan(counts, packed_ends, inclusive=True)
+    n_triangles = int(read_scalar(packed_ends, index=-1))
+    if n_triangles == 0:
+        return None
+    if n_triangles == n_padded:
+        return padded
+    fill_faces = wp.empty(3 * n_triangles, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_holes.compact_fill_triangles,
+        dim=(loops.n_loops, int(triangle_sizes_np.max())),
+        inputs=[
+            counts,
+            triangle_offsets,
+            packed_ends,
+            padded.reshape((n_padded, 3)),
+            fill_faces.reshape((n_triangles, 3)),
+        ],
+        device=device,
+    )
+    return fill_faces
 
 
 def _run_hole_dp(
@@ -1449,18 +1486,16 @@ def _packed_rims(
 
     The packed form is ``_PackedLoops`` -- the same one the fill engine consumes -- rather than a
     second bookkeeping type of its own. The extension kernels read exactly its ``flat_loops`` /
-    ``loop_id`` / ``starts`` / ``sizes``, and the two were building all four the same way from the
-    same ``pack_1d_arrays`` call. Its DP fields go unused here, which costs one host cumsum and one
-    ``n_loops``-long upload.
+    ``loop_id`` / ``starts`` / ``sizes``, and the two were building all four the same way. Its DP
+    fields go unused here, which costs one host cumsum and one ``n_loops``-long upload.
+
+    A rim set that is present but entirely empty is "nothing to extend" and answers ``None``, which
+    is why this does not simply return
+    [`_packed_loop_argument`][triwarp.holes._packed_loop_argument]'s result: that helper keeps an
+    empty loop, since a per-loop answer still owes it an entry.
     """
-    if loops is None:
-        loops = tw.boundary.boundary_loops(vertices, faces)
-    loops = list(loops)
-    for loop in loops:
-        twt.ensure_ndim(loop, 1, dtype=wp.int32)
-    if not loops or all(int(loop.shape[0]) == 0 for loop in loops):
-        return None
-    return _pack_loops(loops)
+    rims = _packed_loop_argument(vertices, faces, loops)
+    return None if rims is None or rims.total == 0 else rims
 
 
 def _extend_packed_rims(
@@ -1555,7 +1590,9 @@ def fillable_loop_mask(
     loops
         The boundary loops to test. When ``None`` they are computed with
         [`boundary_loops`][triwarp.boundary.boundary_loops]; pass them when you already have them,
-        since the returned mask is indexed by their order and a caller almost always needs both.
+        since the returned mask is indexed by their order and a caller almost always needs both. A
+        loop naming a vertex outside ``vertices`` answers ``False``: it cannot be triangulated over
+        mesh vertices, and the two vertex-indexed tables below have no entry for it.
 
     Returns
     -------
@@ -1582,82 +1619,60 @@ def fillable_loop_mask(
     """
     require_same_device(vertices=vertices, faces=faces, loops=loops)
     device = faces.device
-    if loops is None:
-        loops = tw.boundary.boundary_loops(vertices, faces)
-    loops = list(loops)
-    for loop in loops:
-        twt.ensure_ndim(loop, 1, dtype=wp.int32)
-    if not loops:
+    packed = _packed_loop_argument(vertices, faces, loops)
+    if packed is None:
         return wp.empty(0, dtype=wp.bool, device=device)
 
     # ``vertices`` is the domain, so its length is the bound ``index_bound`` would go to the
     # device to re-derive. An unreferenced vertex only widens the two tables below, which are
     # indexed by vertex id.
     n_vertices = int(vertices.shape[0])
-    # **One** readback for all the loops, not one each: they are concatenated on the device first,
-    # and the sizes are already on the host. A scan mesh carries dozens of rims, so a per-loop
-    # readback would cost a sync apiece.
-    #
-    # A readback at all because the position table cannot be built on the device: a pinched loop
-    # wants two entries for one vertex, and the pinch is what disqualifies it. Its size is bounded
-    # by the *boundary* rather than by the mesh.
-    sizes = [int(loop.shape[0]) for loop in loops]
-    # ``wp.array.numpy()`` carries no return annotation, so the loop slices below would be a
-    # partially-unknown ndarray and could not serve as an integer index. Runtime dtype is
-    # int32: these are vertex indices.
-    flat_np = cast("npt.NDArray[np.int32]", tw.array.concatenate(list(loops), copy=False).numpy())
-    bounds = np.cumsum([0, *sizes])
-    loops_np = [flat_np[bounds[index] : bounds[index + 1]] for index in range(len(sizes))]
-    fillable_np = np.ones(len(loops_np), dtype=bool)
-    for index, loop_np in enumerate(loops_np):
-        if np.unique(loop_np).shape[0] != loop_np.shape[0]:
-            fillable_np[index] = False  # pinched within itself, and would corrupt the table below
-
-    # A vertex on two different rims is a pinch *between* loops: filling either one leaves that
-    # vertex non-manifold. It also cannot be represented in the two vertex-indexed tables below,
-    # which hold one owner apiece -- so writing the loops in order would let the later loop
-    # silently overwrite the earlier one's ownership and hide the earlier one's chords, returning
-    # ``True`` for a loop that has one. ``True`` is a guarantee, so every loop touching a shared
-    # vertex answers ``False`` and is kept out of the tables. Counting owners up front rather
-    # than resolving collisions in the write loop keeps the answer independent of loop order.
-    #
-    # The count runs over **every** loop, including the self-pinched ones the pass above already
-    # disqualified. Dropping those first would be counting the wrong thing: a self-pinch is a
-    # non-manifold vertex whoever else touches it, so a clean loop sharing it is exactly as
-    # unfillable as the pinched one, and excluding the pinched loop from the tally made that
-    # clean loop answer ``True``. ``np.unique`` per loop is what keeps a loop's own repeat from
-    # counting as a second owner -- the count is of *owning loops*, not of occurrences.
-    owner_count = np.bincount(
-        np.concatenate([np.unique(loop_np) for loop_np in loops_np]), minlength=n_vertices
-    )
-    for index, loop_np in enumerate(loops_np):
-        if fillable_np[index] and (owner_count[loop_np] > 1).any():
-            fillable_np[index] = False
-
-    loop_of_vertex_np = np.full(n_vertices, -1, dtype=np.int32)
-    position_np = np.zeros(n_vertices, dtype=np.int32)
-    for index, loop_np in enumerate(loops_np):
-        if fillable_np[index]:
-            loop_of_vertex_np[loop_np] = index
-            position_np[loop_np] = np.arange(loop_np.shape[0], dtype=np.int32)
-
-    if fillable_np.any():
-        unique_edges, _inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
-        has_chord = wp.zeros(len(loops_np), dtype=wp.bool, device=device)
+    fillable = wp.full(packed.n_loops, value=True, dtype=wp.bool, device=device)
+    if packed.total > 0:
+        # A vertex on two different rims is a pinch *between* loops, and a vertex a single rim
+        # visits twice is a pinch *within* one: filling either leaves that vertex non-manifold,
+        # and a clean loop sharing a pinched vertex is exactly as unfillable as the pinched one.
+        # Both read off the same per-vertex slot count, so the two disqualifications are one pass
+        # rather than a distinct-vertex test per loop and an owner tally over their unions.
+        counts = wp.zeros(n_vertices, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_holes.mark_loops_with_chords,
-            dim=int(unique_edges.shape[0]),
+            kernel_holes.count_loop_vertices,
+            dim=packed.total,
+            inputs=[packed.flat_loops, packed.loop_id, wp.int32(n_vertices), counts, fillable],
+            device=device,
+        )
+        wp.launch(
+            kernel_holes.clear_shared_loops,
+            dim=packed.total,
+            inputs=[packed.flat_loops, packed.loop_id, counts, fillable],
+            device=device,
+        )
+        # Only a surviving loop is written into the vertex-indexed tables, which is what keeps
+        # them single-valued: it owns one slot per vertex and shares none, so the scatter has no
+        # collision to resolve and the answer does not depend on loop order.
+        loop_of_vertex = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
+        position = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_holes.scatter_fillable_loop_slots,
+            dim=packed.total,
             inputs=[
-                unique_edges,
-                wp.array(loop_of_vertex_np, dtype=wp.int32, device=device),
-                wp.array(position_np, dtype=wp.int32, device=device),
-                wp.array(np.array(sizes, dtype=np.int32), dtype=wp.int32, device=device),
-                has_chord,
+                packed.flat_loops,
+                packed.loop_id,
+                packed.starts,
+                fillable,
+                loop_of_vertex,
+                position,
             ],
             device=device,
         )
-        fillable_np &= ~has_chord.numpy()
-    return wp.array(fillable_np, dtype=wp.bool, device=device)
+        unique_edges, _inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
+        wp.launch(
+            kernel_holes.clear_loops_with_chords,
+            dim=int(unique_edges.shape[0]),
+            inputs=[unique_edges, loop_of_vertex, position, packed.sizes, fillable],
+            device=device,
+        )
+    return fillable
 
 
 def stitch(
@@ -2109,9 +2124,9 @@ def stitch_loops(
 
     **This is the fast one, and that is the reason to keep it.** It is metric-free and makes one
     O(N·M) pass, where
-    [`stitch_loops_min_weight`][triwarp.holes.stitch_loops_min_weight] fills the same size table
-    with ``N + M`` sequential launches along the anti-diagonals, and that gap widens with rim size.
-    The DP is never the cheaper option -- prefer it for the seam it produces, not for speed.
+    [`stitch_loops_min_weight`][triwarp.holes.stitch_loops_min_weight] has to fill the same size
+    table under a dependency that makes it ``N + M`` sequential steps. The DP is never the cheaper
+    option -- prefer it for the seam it produces, not for speed.
     """
     require_same_device(
         vertices_a=vertices_a,
@@ -2337,9 +2352,9 @@ def stitch_loops_min_weight(
 
     The two rims are aligned at their closest vertex pair and zippered by the band of
     ``len(loop_a) + len(loop_b)`` triangles that minimizes a stitch metric, found by a grid dynamic
-    program over the two loops (``dp[i, j]`` = best band consuming ``i`` A-edges and ``j`` B-edges;
-    each anti-diagonal is one parallel kernel launch). Reuses only the
-    loops' existing vertices. The metric-free greedy
+    program over the two loops (``dp[i, j]`` = best band consuming ``i`` A-edges and ``j`` B-edges,
+    each cell reading only the two before it, so the grid is filled one anti-diagonal at a time).
+    Reuses only the loops' existing vertices. The metric-free greedy
     [`stitch_loops`][triwarp.holes.stitch_loops] remains available.
 
     Parameters
@@ -2443,13 +2458,7 @@ def stitch_loops_min_weight(
     tables.metric_id = wp.int32(metric_id)
     tables.n_a = wp.int32(n_a)
     tables.n_b = wp.int32(n_b)
-    for diag in range(1, n_a + n_b + 1):
-        wp.launch(
-            kernel_holes.stitch_dp_diag,
-            dim=min(diag, n_a) - max(0, diag - n_b) + 1,
-            inputs=[tables, wp.int32(diag), dp, came],
-            device=device,
-        )
+    _run_stitch_dp(tables, n_a, n_b, dp, came, device)
     came_np = came.numpy()
 
     band = _stitch_band_triangles(came_np, la, lb, n_a, n_b, offset)
@@ -2458,6 +2467,58 @@ def stitch_loops_min_weight(
     )
     band_faces = wp.array(band.reshape(-1), dtype=wp.int32, device=device)
     return combined_vertices, tw.array.concatenate([combined_faces, band_faces])
+
+
+def _run_stitch_dp(
+    tables: StructInstance,
+    n_a: int,
+    n_b: int,
+    dp: twt.Array2dFloat32,
+    came: twt.Array2dInt32,
+    device: wp.DeviceLike,
+    tiled: bool | None = None,
+) -> None:
+    """
+    Fill the ``(n_a + 1) x (n_b + 1)`` band tables in place, seeded at cell ``(0, 0)``.
+
+    A cell reads only the cells above and to the left of it, so the grid needs ``n_a + n_b``
+    sequential steps whichever way it is cut. ``tiled`` chooses where those steps' barriers come
+    from, and it is a pure cost knob -- both schedules compute the same cells with the same
+    ``stitch_dp_cell``, so ``dp`` and ``came`` come out byte-identical and ``None`` simply picks
+    whichever is faster on the device at hand.
+
+    * ``False`` walks one anti-diagonal per launch: ``n_a + n_b`` of them, each a barrier. This is
+      the reference schedule, kept because it is the one the tiled kernel has to agree with.
+    * ``True`` gives one **block** a ``tile x tile`` square and launches one tile-diagonal at a
+      time, so all but ``2 * ceil(n / tile)`` of the barriers become block-local. That is the whole
+      cost of this DP -- the per-cell work is small and the sweep was launch-bound -- and it is the
+      default on **both** devices, unlike the fill DP's tiled engine: the CPU device runs one lane
+      per block, so its gain is the launch count alone rather than the lanes, and it still takes it.
+    """
+    if tiled is None:
+        tiled = True
+    if not tiled:
+        for diag in range(1, n_a + n_b + 1):
+            wp.launch(
+                kernel_holes.stitch_dp_diag,
+                dim=min(diag, n_a) - max(0, diag - n_b) + 1,
+                inputs=[tables, wp.int32(diag), dp, came],
+                device=device,
+            )
+        return
+    tile = kernel_holes.STITCH_DP_TILE
+    rows = -(-(n_a + 1) // tile)
+    cols = -(-(n_b + 1) // tile)
+    for block_diag in range(rows + cols - 1):
+        bi_lo = max(0, block_diag - cols + 1)
+        bi_hi = min(block_diag, rows - 1)
+        wp.launch_tiled(
+            kernel_holes.stitch_dp_tile,
+            dim=bi_hi - bi_lo + 1,
+            inputs=[tables, wp.int32(block_diag), wp.int32(bi_lo), wp.int32(tile), dp, came],
+            block_dim=tile,
+            device=device,
+        )
 
 
 def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tuple[int, int]:
@@ -3233,12 +3294,11 @@ def _hole_loops(
     [`polyline_length`][triwarp.polyline.polyline_length] call per loop (two synchronizations
     each).
     """
-    flat_loops, offsets, _sizes = tw.boundary.boundary_loops_batched(vertices, faces, edges_sorted)
-    if int(offsets.shape[0]) == 0:
+    packed = _boundary_loops_packed(vertices, faces, edges_sorted)
+    if packed is None:
         return None
 
-    starts_np = offsets.numpy().astype(np.int64)
-    sizes_np = np.diff(np.append(starts_np, int(flat_loops.shape[0])))
+    flat_loops, sizes_np = packed
     keep_np = sizes_np >= 3
     if preserve_largest_hole and bool(keep_np.any()):
         all_loops = _PackedLoops(flat_loops, sizes_np)
@@ -3251,7 +3311,10 @@ def _hole_loops(
     if keep_np.all():
         return _PackedLoops(flat_loops, sizes_np)
 
-    # Compaction is one gather over the dropped loops' slots, not one copy per surviving loop.
+    # Compaction is one gather over the dropped loops' slots, not one copy per surviving loop. The
+    # starts are scanned here rather than beside the sizes above because this is the only branch
+    # that reads them, and a mesh whose rims are all fillable is the common one.
+    starts_np = np.concatenate([[0], np.cumsum(sizes_np)[:-1]])
     keep_index_np = np.concatenate(
         [
             np.arange(start, start + size)
@@ -3262,3 +3325,48 @@ def _hole_loops(
         keep_index_np.astype(np.int32), dtype=wp.int32, device=flat_loops.device
     )
     return _PackedLoops(tw.array.gather(flat_loops, keep_index_wp), sizes_np[keep_np])
+
+
+def _boundary_loops_packed(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    edges_sorted: twt.Array2dInt32 | None = None,
+) -> tuple[wp.array[wp.int32], np.ndarray] | None:
+    """
+    Every boundary loop of a mesh as one packed buffer plus its host sizes, or ``None`` if none.
+
+    The packed buffer is [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]'s
+    own, handed on unsplit; the sizes come from the single offsets readback the ragged indexing
+    needs anyway.
+    """
+    flat_loops, offsets, _sizes = tw.boundary.boundary_loops_batched(vertices, faces, edges_sorted)
+    if int(offsets.shape[0]) == 0:
+        return None
+    starts_np = offsets.numpy().astype(np.int64)
+    return flat_loops, np.diff(np.append(starts_np, int(flat_loops.shape[0])))
+
+
+def _packed_loop_argument(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    loops: Sequence[wp.array[wp.int32]] | None,
+) -> _PackedLoops | None:
+    """
+    Pack a public ``loops=`` argument, or the mesh's own boundary loops when it is ``None``.
+
+    ``None`` goes through [`_boundary_loops_packed`][triwarp.holes._boundary_loops_packed] rather
+    than [`boundary_loops`][triwarp.boundary.boundary_loops]: the latter splits that same buffer
+    into one ``wp.array`` view per loop only for this to concatenate them straight back, and both
+    halves cost a host call per loop -- so the round trip scales with the *loop count*, the one
+    axis a packed engine exists to make free.
+
+    Returns ``None`` when there is no loop at all. A caller that also rejects all-empty loops
+    tests ``total`` itself, since an empty loop is still an entry in a per-loop answer.
+    """
+    if loops is None:
+        packed = _boundary_loops_packed(vertices, faces)
+        return None if packed is None else _PackedLoops(*packed)
+    loops = list(loops)
+    for loop in loops:
+        twt.ensure_ndim(loop, 1, dtype=wp.int32)
+    return _pack_loops(loops) if loops else None
