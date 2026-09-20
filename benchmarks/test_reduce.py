@@ -1,115 +1,90 @@
 """
 Benchmarks for ``triwarp.reduce``.
 
-This is the module every other one is built on, so what matters here is the *floor*: a whole-array
-reduction of a few hundred thousand elements is far too small to saturate a modern GPU, which means
-these numbers are dominated by launch latency and — for the reductions that return a Python scalar
-— by the device-to-host readback that ends them. That readback is why the full-array variants cannot
-be much faster than they are, and why callers inside iterative loops are expected to keep values on
-device instead (see the ``check_every`` discussion in ``triwarp/linalg.py``).
+This is the module every other one is built on, so what matters is the *floor*: a whole-array
+reduction of a few hundred thousand elements is far too small to saturate a modern GPU, so these
+numbers are dominated by launch latency and — for the reductions returning a Python scalar — by the
+readback that ends them. That readback is why the full-array variants cannot be much faster than
+they are, and why callers inside iterative loops keep values on device instead (the ``check_every``
+discussion in ``triwarp/linalg.py``).
 
 Three shapes are timed:
 
 * **Tiled full-array reductions** (``sum``, ``mean``, ``minmax``) — a block reduction into an atomic
-  accumulator, then one readback. ``minmax`` produces both extrema in a single pass, so timing it
-  next to a bare ``min`` is what justifies its existence.
-* **Axis reductions** (``sum(axis=0)``, ``max(axis=1)``) — no readback at all: the result stays on
-  device as an array. These are the fair measure of the reduction kernel itself, uncontaminated by
-  the host sync, and the row/column split shows the coalescing difference between reducing along
-  and across the contiguous axis. Note the two are *not* the same kernel: ``max(axis=1)`` on an
-  ``(n, 3)`` table reduces a 3-wide extent and takes the one-thread-per-row serial path, while
-  ``sum(axis=0)`` reduces the long extent into 3 outputs and stays tiled. Timing both directions is
-  what pins that dispatch, and it is worth 49x in one direction and 89x in the other (see below).
-* **Sort-based** (``median``) — the outlier. It radix-sorts a *copy* of the values with
-  ``warp.utils.radix_sort_pairs`` and reads the middle element, so it is an O(n log n) full sort
-  where every other function here is a single O(n) pass, and it allocates. Expect a large constant
-  factor against ``mean``.
+  accumulator, then one readback. ``minmax`` produces both extrema in one pass, so timing it next to
+  a bare ``min`` is what justifies its existence.
+* **Axis reductions** (``sum(axis=0)``, ``max(axis=1)``) — no readback: the result stays on device.
+  These measure the kernel itself, uncontaminated by the host sync, and the row/column split shows
+  the coalescing difference. The two are *not* the same kernel: ``max(axis=1)`` on an ``(n, 3)``
+  table reduces a 3-wide extent and takes the one-thread-per-row serial path where ``sum(axis=0)``
+  stays tiled. Timing both directions is what pins that dispatch.
+* **Sort-based** (``median``) — the outlier: it radix-sorts a *copy* and reads the middle element,
+  so it is O(n log n) and allocates where everything else here is one O(n) pass.
 
-``vec3`` overloads (``sum`` / ``mean`` over ``wp.array[wp.vec3]``) are timed alongside the scalar
-ones because they are the ones real callers hit — centroids and normal averages — and they exercise
-a different tile accumulator (``wp.vec3`` atomics rather than scalar).
+``vec3`` overloads are timed alongside the scalar ones because they are what real callers hit
+(centroids, normal averages) and they exercise a different tile accumulator.
 
-Inputs
-------
-Derived from the registry meshes so the sizes track the rest of the suite: the ``wp.vec3`` vertex
-buffer directly, its flattened ``(n_vertices, 3)`` float32 view for the axis cases, and a scalar
-per-vertex array for the 1D cases. Buffers are built once per (mesh, device) and reused, so the
-timed region holds only the reduction.
+Inputs derive from the registry meshes so the sizes track the rest of the suite, and are built once
+per (mesh, device) so the timed region holds only the reduction.
 
 References
 ----------
-``reduce`` is an array primitive, not a geometry operation, so the natural reference is **NumPy**
-itself: every group here also times the equivalent host reduction over an already-resident float32
-NumPy buffer holding the same values. Read those rows for what they are — the host-side floor, not
-a like-for-like kernel race. A device-side reduction that returns a Python scalar pays a flat
-launch + readback latency that NumPy never pays, so NumPy *should* win at small sizes and the
-question each row answers is *where the crossover sits* and whether the device side stays flat past
-it. trimesh, libigl and open3d expose no array-reduction API at all.
+``reduce`` is an array primitive, so the natural reference is **NumPy**: every group also times the
+equivalent host reduction over an already-resident float32 buffer. Read those rows as the host-side
+floor, not a like-for-like kernel race — a device reduction returning a Python scalar pays a flat
+launch-plus-readback latency NumPy never pays, so NumPy *should* win at small sizes and the question
+each row answers is where the crossover sits and whether the device side stays flat past it.
+trimesh, libigl and open3d expose no array-reduction API.
 
-What the comparison actually says, so nobody has to re-derive it from the table: **the split is by
-return type, not by size or by dtype.** The groups that hand back a device array or a ``wp.vec3``
-— both axis groups and both ``vec3`` groups — are ahead of NumPy at every mesh in the registry,
-though only narrowly at ``bunny_decimated`` (1.1-1.6x, and ``mean_vec3`` there is close enough that
-a single outlier round inverts its *mean* while its min and median stay ahead — read the min) and
-by 80-200x at ``lucy``. The groups that hand back a *Python scalar* (``sum_scalar``, ``min_scalar``,
-``minmax_scalar``, ``median``) lose to NumPy below roughly half a million elements and win above it:
-``min_scalar`` is 60x slower than NumPy on ``bunny_decimated`` and 11x faster on ``lucy``.
+**The split is by return type, not by size or dtype.** The groups handing back a device array or a
+``wp.vec3`` (both axis groups, both ``vec3`` groups) are ahead of NumPy at every mesh — narrowly at
+the smallest, where a single outlier round can invert a *mean* while the min and median stay ahead,
+so read the min — and by two orders of magnitude at ``lucy``. The groups handing back a *Python
+scalar* lose below roughly half a million elements and win above it.
 
-That crossover is a host cost, and the split was measured rather than assumed: ~35 µs of launch
-marshalling, ~30 µs for the 4-byte readback and ~17 µs to allocate and fill the output buffer —
-**~82 µs before a single element is touched**, against NumPy's 1.6 µs for the whole 8k reduction.
-Only the ``sync`` term scales with n. So a scalar-returning reduction cannot win at small n no
-matter what the kernel does, which is why callers inside iterative loops are expected to keep values
-on device instead (see the ``check_every`` discussion in ``triwarp/linalg.py``).
+That crossover is a host cost, measured rather than assumed: launch marshalling, the 4-byte readback
+and the output allocation are tens of microseconds before a single element is touched, and only the
+``sync`` term scales with ``n``. So a scalar-returning reduction cannot win at small ``n`` whatever
+the kernel does.
 
-Three kernel defects were found while chasing that floor, all since fixed. None was *exposed* by the
-NumPy rows — triwarp was already ahead in those groups — but all three were found by asking the
-question these rows invite, namely whether the tiling is earning its keep. Two are the same bug in
-different clothes:
+Three kernel defects were found by asking the question these rows invite — whether the tiling is
+earning its keep — and all are fixed. None was *exposed* by the NumPy rows, since triwarp was
+already ahead in those groups. Two are the same bug in different clothes:
 
-- **Tiling below one tile is pure loss.** The tiled axis kernels never reach their ``wp.tile_load``
-  branch when the reduced extent is under ``TILE_1D``, so all 64 lanes of every block redundantly
-  walked the same 3-element row — a 64-fold read amplification. One thread per output row is **49x**
-  faster on a ``(14M, 3)`` table, and the wrapper now dispatches on the reduced extent. Note the
-  converse holds too: the same table on ``axis=0`` has 3 outputs, where serial is **89x slower**, so
-  the dispatch key is the reduced extent and not the axis.
-- **The same thing again, one rank up.** A rank-2 ``axis=None`` reduction tiles ``TILE_2D`` squares,
-  which an ``(n, 3)`` vertex table or ``(m, 2)`` edge table clips exactly as above. Flattening a
-  contiguous narrow table to the 1-D kernel is **5.95x** on ``(14M, 3)`` and **6.18x** on
-  ``(8M, 2)``, versus 1.02x on ``(40k, 128)`` where the tile branch does fire — which is why the
-  test is on the trailing extent, not just on contiguity.
-- **One atomic per tile does not scale.** The global 1-D reductions ran ~9x off the memory-bandwidth
-  floor at 14M elements because one ``atomic_add`` per 64-element block put 219k blocks on a single
-  accumulator address. Folding ``TILES_PER_BLOCK_1D`` tiles into a register first is **4.9x** faster
-  and lands within 2x of bandwidth.
+- **Tiling below one tile is pure loss.** With the reduced extent under ``TILE_1D`` the
+  ``wp.tile_load`` branch is never reached and every lane of every block redundantly walks the same
+  short row. One thread per output row is an order of magnitude faster on a tall narrow table. The
+  converse holds — the same table on ``axis=0`` has three outputs, where serial is worse by as much
+  — so the dispatch key is the **reduced extent**, not the axis.
+- **The same thing one rank up.** A rank-2 ``axis=None`` reduction tiles ``TILE_2D`` squares, which
+  an ``(n, 3)`` vertex or ``(m, 2)`` edge table clips exactly as above. Flattening a contiguous
+  narrow table to the 1-D kernel is several times faster, and flat on a genuinely wide table where
+  the tile branch does fire — which is why the test is on the trailing extent, not just contiguity.
+- **One atomic per tile does not scale.** One ``atomic_add`` per tile puts hundreds of thousands of
+  blocks on a single accumulator address; folding ``TILES_PER_BLOCK_1D`` tiles into a register first
+  lands within a small factor of bandwidth.
 
 Those are kernel-time A/Bs, interleaved under one clock state with values verified each round. End
-to end the picture is uneven and worth reading carefully: at ``lucy`` ``max_axis1`` gains **36.7x**,
-``minmax_global_2d`` **5.5x** and ``sum_scalar`` **2.9x**, but every scalar-returning group at
-``bunny``-scale moves by less than +/-10% -- which is *within* the cross-session drift band
-CLAUDE.md section 15.7 warns about, so those cells attribute nothing either way. That is the
-expected shape: ~82 us of such a call was never the kernel, so no kernel change can move it.
+to end the picture is uneven and worth reading carefully: the large-mesh cells of the axis and
+rank-2 groups gain as much as the kernel A/B predicts, but every scalar-returning group at
+feature-mesh scale moves by less than the cross-session drift band (CLAUDE.md section 15.7), so
+those cells attribute nothing either way. That is the expected shape — tens of microseconds of such
+a call was never the kernel, so no kernel change can move it.
 
-One cross-check is worth keeping, because it is what says the rank-2 fix closed the gap rather than
-moved time around: subtract the host floor and ``minmax_global_2d`` at ``lucy`` runs 42.1M elements
-at 7.0 ns per thousand, against 7.3 for the rank-1 ``minmax_scalar`` on 14.0M. The two paths agree
-on throughput now; before the fix the rank-2 one was 3.7x worse per element.
+One cross-check is worth keeping, because it says the rank-2 fix closed the gap rather than moved
+time around: subtract the host floor and the rank-2 and rank-1 paths now agree on throughput per
+element, where before the fix rank-2 was several times worse.
 
-**pymeshlab** is the one exception and lands in the ``median`` group.
-``get_scalar_statistics_per_vertex`` reduces a per-vertex scalar attribute to ``{min, max, avg, med,
-stddev, variance}`` — so it is genuinely the same work, over the same input (the scalar is seeded
-from the vertices' ``z`` with ``compute_scalar_by_function_per_vertex(q='z')``, which reproduces
-``_scalars_wp`` exactly). Two things follow:
+**pymeshlab** is the one exception and lands in ``median``.
+``get_scalar_statistics_per_vertex`` reduces a per-vertex scalar to ``{min, max, avg, med, stddev,
+variance}`` over the same input (seeded from ``z`` with ``compute_scalar_by_function_per_vertex``,
+which reproduces ``_scalars_wp`` exactly). It answers six questions in one call, so its number is an
+*upper* bound for any one of them and a *lower* bound for all of them; it appears once, in
+``median``, because the percentile is the part that needs a sort and so dominates both sides. It is
+read-only, so the MeshSet is shared and only the attribute seeding sits outside the timed callable.
 
-- **It answers six questions in one call**, so its single number is simultaneously the reference for
-  ``median``, ``minmax_scalar``, ``min_scalar`` and a scalar mean — an *upper* bound for each one
-  taken alone and a *lower* bound for computing all of them. It appears once, in ``median``, because
-  the percentile is the part that needs a sort and therefore the part that dominates both sides.
-- **It is read-only** (it returns a dict and touches nothing), so the MeshSet is shared and only the
-  attribute seeding sits outside the timed callable.
-
-The NumPy rows are the only ones that are *always* comparable: every group computes exactly the
-reduction its NumPy call computes, so each pair is a class-A parity claim in
+The NumPy rows are the only ones *always* comparable: every group computes exactly the reduction its
+NumPy call computes, so each pair is a class-A parity claim in
 [`tests/test_reduce.py`](../tests/test_reduce.py) with no transform in between.
 """
 
@@ -334,8 +309,8 @@ def test_weighted_sum(bench_case: BenchCase) -> None:
     ``sum(values * weights)`` in one pass: the reduction every surface integral bottoms out in.
 
     The weights here are the per-face areas and the values a per-face scalar, which is exactly what
-    VTK's ``integrate_data`` computes for a cell array -- measured equal to 8 significant digits
-    (``tests/test_reduce.py``). Both are *inputs*: the areas are built once per mesh outside the
+    VTK's ``integrate_data`` computes for a cell array -- measured equal (``tests/test_reduce.py``).
+    Both are *inputs*: the areas are built once per mesh outside the
     timed region, on both sides, so the row measures the reduction and not a cross-product pass.
 
     The pyvista row does more than the other two by construction -- ``integrate_data`` integrates

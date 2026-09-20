@@ -358,11 +358,11 @@ def _unoriented_boundary_cycles(
     Boundary cycles of a mesh whose winding cannot orient them: walk the undirected edges instead.
 
     A manifold boundary is 2-regular whether or not the surface is orientable, so the cycles exist
-    even where a *consistent direction* for them does not. The walk runs on **darts**: dart
-    ``2 * v + s`` means "at vertex ``v``, arrived from neighbour slot ``s``", and its successor
-    leaves by the other slot. That is a genuine successor graph by construction -- every dart has
-    exactly one out-edge -- so [`successor_cycles`][triwarp.graph.successor_cycles] handles it
-    unchanged, at twice the node count.
+    even where a *consistent direction* for them does not. The walk runs on **darts**: dart ``2 * v
+    + s`` means "at vertex ``v``, arrived from neighbour slot ``s``", and its successor leaves by
+    the other slot. That is a genuine successor graph by construction -- every dart has exactly one
+    out-edge -- so [`successor_cycles`][triwarp.graph.successor_cycles] handles it unchanged, at
+    twice the node count.
 
     Each undirected cycle therefore comes back **twice**, once per direction, over disjoint dart
     sets. The two mirrors share their lowest vertex ``v`` but start at darts ``2v`` and ``2v + 1``,
@@ -370,19 +370,17 @@ def _unoriented_boundary_cycles(
     ascending, that direction is "leave the lowest vertex toward its larger neighbour" -- an
     arbitrary but *reproducible* choice, which is the honest answer when no winding defines one.
 
-    On the Moebius fixture this returns the single 78-vertex cycle the surface actually has: all 78
-    boundary vertices have boundary-degree 2, and the walk closes with every consecutive pair a
-    real boundary edge. Two references get it wrong in different ways and neither is worth
-    matching -- ``igl.boundary_loop_all`` cuts that cycle into ``1 + 39 + 38`` open chains (each
-    has exactly one consecutive pair that is *not* a boundary edge) and
-    ``longest_boundary_loop`` reports the longest of them as 39, while a half-edge hole ring walks
-    the band's *double* cover and reads 156.
+    On a Moebius band this returns the single cycle the surface actually has, with every consecutive
+    pair a real boundary edge. Two references get it wrong in different ways and neither is worth
+    matching: ``igl.boundary_loop_all`` cuts that cycle into open chains, each with one consecutive
+    pair that is *not* a boundary edge, and a half-edge hole ring walks the band's *double* cover
+    and reads twice the length.
 
     The mirror filter and the re-pack run on the host, over a buffer bounded by the **boundary**
     rather than by the mesh, and only ever on a non-orientable surface. Two things make that the
     right side of the fence rather than an unfinished port. The host loop is over *cycles*, not over
-    darts -- twice the boundary-loop count, so **two** iterations on the Moebius fixture -- and each
-    iteration's body is a vectorized slice, not a per-element Python step. And the device
+    darts -- twice the boundary-loop count, so two iterations on a Moebius band -- and each
+    iteration's body is a vectorized slice rather than a per-element Python step. And the device
     alternative is a segment compaction (a keep mask, a ``counts_to_offsets`` scan and a gather)
     that only pays for itself on a mesh with many boundary loops that is also non-orientable.
     """
@@ -883,8 +881,8 @@ def longest_boundary_loop(
     Ordered vertex-index loop along the longest mesh boundary.
 
     The name carries the *longest*, because the plural
-    [`boundary_loops`][triwarp.boundary.boundary_loops] returns every one and the two used to differ
-    by a single character.
+    [`boundary_loops`][triwarp.boundary.boundary_loops] returns every one and two public names
+    differing by a single character are a defect even when both are correct.
 
     Parameters
     ----------

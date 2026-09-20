@@ -95,7 +95,7 @@ def test_group(bench_case: BenchCase) -> None:
     equal -- reached by an ``argsort`` plus a NumPy segment walk instead. Both sides are handed the
     edge inverse -- built outside the timed callable on both branches, and on the host for the
     reference so that its input does not come from the code under test -- so this row is the
-    grouping alone. Capped at ``bunny``: the reference measured 123 ms at 327 680 faces.
+    grouping alone. Capped at ``bunny``, past which the reference's segment walk is unaffordable.
     """
     if bench_case.kind == "triwarp":
         inverse = _edge_inverse(bench_case)

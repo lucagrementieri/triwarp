@@ -16,86 +16,76 @@ Two layers:
 ``cg`` calls costs the ``sum`` of the per-column iteration counts, and every CG iteration then
 launches ``k`` separate sets of reduction and AXPY kernels.
 [`replicated_operator`][triwarp.linalg.replicated_operator] instead presents the *same* operator as
-``k`` independent subproblems over one flat ``k * n`` vector: the solver then advances all columns
+``k`` independent subproblems over one flat ``k * n`` vector: the solver advances all columns
 together and stops on the worst-case residual, so the cost becomes ``max`` of the per-column
-iteration counts with one set of vector kernels per iteration. The sparse matrix is never
-replicated in memory — the ``matvec`` issues ``k`` ``bsr_mv`` calls against the single operator.
+iteration counts with one set of vector kernels per iteration. The sparse matrix is never replicated
+in memory -- the ``matvec`` issues ``k`` ``bsr_mv`` calls against the single operator.
 
 **Whose conjugate gradient.** One column goes to ``warp.optim.linear.cg``; more than one goes to
 this module's own ``_BatchedCg``, which runs the same iteration and the same stopping rule. The
-split is not a preference — it is the one input for which Warp's reduction degrades: batching is
-expressed to Warp as ``batch_offsets``, and that is exactly what makes its dot-product reduction
-take a per-column path whose cost grows with the vector length rather than staying flat. Reducing
-per column with a real two-stage tree keeps the batching and drops that cost; see ``_BatchedCg``
-for the mechanism.
+split is not a preference -- it is the one input for which Warp's reduction degrades: batching is
+expressed to Warp as ``batch_offsets``, and that is what makes its dot-product reduction take a
+per-column path whose cost grows with the vector length rather than staying flat. Reducing per
+column with a real two-stage tree keeps the batching and drops that cost.
 
 **Determinism.** Build each operator natively at its final dtype in a *single*
 ``warp.sparse.bsr_from_triplets`` and never recast or rebuild it. A rebuild re-sorts and
-duplicate-accumulates an order the CSR already has, which is wasted work; and if the rebuild's
-triplet buffers are ever sized off ``BsrMatrix.nnz`` (a stale *capacity*, not the true entry count —
-see ``nnz_sync()``) the buffers' tail reaches ``bsr_from_triplets`` uninitialized. Nothing here
-recasts an operator, and ``Q_uu`` is assembled as a CSR *directly*, without any triplet build, so it
-carries an exact ``nnz``.
+duplicate-accumulates an order the CSR already has; and if the rebuild's triplet buffers are ever
+sized off ``BsrMatrix.nnz`` (a stale *capacity*, not the true entry count -- see ``nnz_sync()``) the
+buffers' tail reaches ``bsr_from_triplets`` uninitialized. ``Q_uu`` is assembled as a CSR
+*directly*, without any triplet build, so it carries an exact ``nnz``.
 
 **Why Jacobi.** Every solve here preconditions with ``warp.optim.linear.preconditioner(A, "diag")``.
 On a cotangent Laplacian a preconditioner costing ``k`` mat-vecs per iteration cuts the iteration
-count by only about ``sqrt(k)``, so total work scales as ``k / sqrt(k) = sqrt(k)`` — single-level
-preconditioning loses on this operator class, and only a multilevel method escapes it. IC(0) would
-help if it were available, but Warp has no sparse triangular solve — ``warp.sparse`` exposes only
-``bsr_from_triplets`` and ``warp.optim.linear`` only the Krylov methods and a diagonal
-preconditioner — and no parallel substitute for a triangular solve keeps its advantage: a fully
-parallel Jacobi-sweep approximation, an exact apply parallelized by graph coloring (whose
-uncoalesced access and extra launches eat most of its own iteration win), and natural-ordering
-level sets (whose level count swings wildly with the input's vertex numbering) are all worse than
-Jacobi in practice. Chebyshev as a single-level preconditioner is a further alternative and is also
-worse; Chebyshev as the multigrid V-cycle's *smoother* is a separate question — see
-``_MULTIGRID_SWEEPS`` — and neither decline covers the other.
+count by only about ``sqrt(k)``, so total work scales as ``sqrt(k)`` -- single-level preconditioning
+loses on this operator class, and only a multilevel method escapes it. IC(0) would help if it were
+available, but Warp has no sparse triangular solve, and no parallel substitute keeps its advantage:
+a Jacobi-sweep approximation, an exact apply parallelized by graph coloring (whose uncoalesced
+access and extra launches eat most of its iteration win), and natural-ordering level sets (whose
+level count swings wildly with the input's vertex numbering) are all worse than Jacobi in practice.
+Chebyshev as a single-level preconditioner is also worse; Chebyshev as the V-cycle's *smoother* is a
+separate question -- see ``_MULTIGRID_SWEEPS`` -- and neither decline covers the other.
 
 Two further obstacles are specific to this repository. Obtuse triangles give negative cotangent
-weights (``triwarp/kernels/laplacian.py``), so ``-L`` is often not the M-matrix that IC(0) existence
-requires; and both [`heat_geodesic`][triwarp.heat.heat_geodesic] and
+weights, so ``-L`` is often not the M-matrix IC(0) existence requires; and both
+[`heat_geodesic`][triwarp.heat.heat_geodesic] and
 [`heat_signed_distance`][triwarp.heat.heat_signed_distance] solve a ``-L`` with a genuine constant
 null space, where IC(0) hits a zero pivot on the last row of every connected component.
 
 **The multilevel option** is [`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner]:
-smoothed aggregation, the one scheme that breaks the conjugate-gradient iteration count's growth
-with problem size rather than paying it down by a constant factor. It is not the default, and the
-reason is the *setup* rather than the cycle: building the hierarchy (one aggregation, one power
-iteration, a ``bsr_transposed`` and three ``bsr_mm`` per level) has a real fixed cost, so the
-V-cycle wins exactly where the solve it replaces is long enough to amortize that setup, and loses
-on a well-conditioned or already-fast-converging system. See
-[`CG_MULTIGRID_DOMINANCE`][triwarp.linalg.CG_MULTIGRID_DOMINANCE] for how the gate decides which
-systems clear that bar.
+smoothed aggregation, the one scheme that breaks the iteration count's growth with problem size
+rather than paying it down by a constant factor. It is not the default, and the reason is the
+*setup* rather than the cycle: building the hierarchy (one aggregation, one power iteration, a
+``bsr_transposed`` and three ``bsr_mm`` per level) has a real fixed cost, so the V-cycle wins
+exactly where the solve it replaces is long enough to amortize that setup and loses on a
+well-conditioned or already-fast-converging system. See
+[`CG_MULTIGRID_DOMINANCE`][triwarp.linalg.CG_MULTIGRID_DOMINANCE] for how the gate decides.
 
-A GPU sparse direct solver (cuDSS through ``nvmath-python`` and CuPy) was also considered and
-declined for the same reason the multilevel preconditioner is gated: its cost is a host-side
-symbolic factorization plan that is flat regardless of how well-conditioned the system is, so it
-wins exactly on the systems the multigrid gate already routes to a hierarchy and loses everywhere
-CG converges quickly. It would also add an optional CUDA-only dependency, and a direct solver is
-singular on the empty rows CG tolerates (unreferenced free vertices, which a caller would have to
-pin and restore). One idea from that investigation is worth keeping in mind for a future factor-
-once, solve-many caller: reusing a factorization plan across solves of one sparsity pattern is
-comparatively cheap, so a caller that resolves the same operator repeatedly (as ``arap`` already
-does with its own preconditioner) is the shape that would benefit.
+A GPU sparse direct solver (cuDSS through ``nvmath-python`` and CuPy) was considered and declined
+for the same reason the multilevel preconditioner is gated: its cost is a host-side symbolic
+factorization plan, flat regardless of conditioning, so it wins exactly on the systems the multigrid
+gate already routes to a hierarchy and loses everywhere CG converges quickly. It would also add an
+optional CUDA-only dependency, and a direct solver is singular on the empty rows CG tolerates
+(unreferenced free vertices, which a caller would have to pin and restore). Reusing a factorization
+plan across solves of one sparsity pattern is comparatively cheap, so a caller that resolves the
+same operator repeatedly (as ``arap`` already does with its own preconditioner) is the shape that
+would benefit.
 
-Nothing cheap predicts in advance which side of the multigrid-vs-Jacobi line a system falls on,
+Nothing cheap predicts in advance which side of the multigrid-versus-Jacobi line a system falls on,
 which is why ``preconditioner="auto"`` uses a capped Jacobi probe rather than a heuristic predictor
-of the iteration count; see [`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS].
-
-The aggregation keeps a strength-of-connection threshold (``_MULTIGRID_THETA``) rather than every
+of the iteration count; see [`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS]. The
+aggregation keeps a strength-of-connection threshold (``_MULTIGRID_THETA``) rather than every
 off-diagonal, because on a graded (anisotropic) patch keeping every off-diagonal aggregates across
 the weak direction and the hierarchy converges far more slowly.
 
 **Routing through ``"auto"`` decides from the operator, not the caller**, and the axis that matters
 is conditioning: only a system whose off-diagonal dominance clears
 [`CG_MULTIGRID_DOMINANCE`][triwarp.linalg.CG_MULTIGRID_DOMINANCE] benefits from a hierarchy. A plain
-Laplacian (``tutte``, `min_quad_with_fixed` on a raw cotangent matrix) and `lscm`'s coupled u/v
+Laplacian (``tutte``, ``min_quad_with_fixed`` on a raw cotangent matrix) and ``lscm``'s coupled u/v
 system sit below that bar and a forced hierarchy regresses them, where a *squared* operator
-(`harmonic` at ``k >= 2``) sits comfortably above it. So
+(``harmonic`` at ``k >= 2``) sits comfortably above it. So
 [`harmonic`][triwarp.parametrization.harmonic] passes ``"auto"`` at ``k >= 2`` and ``"diag"`` below,
-and
-[`min_quad_with_fixed`][triwarp.linalg.min_quad_with_fixed] keeps ``"diag"`` as its default rather
-than becoming a second ``"auto"`` caller.
+and [`min_quad_with_fixed`][triwarp.linalg.min_quad_with_fixed] keeps ``"diag"`` as its default.
 
 !!! warning "``harmonic`` at ``k=2`` on a strongly graded patch may not converge under Jacobi"
     A ``k=2`` biharmonic operator on a strongly graded patch can be outside what
@@ -104,7 +94,7 @@ than becoming a second ``"auto"`` caller.
     nothing but a ``UserWarning`` to say so, producing a visibly wrong UV map. A caller who needs
     that combination should pass a stronger preconditioner and check the warning.
 
-That heat system ``M - tL`` [`heat_geodesic`][triwarp.heat.heat_geodesic] solves needs no
+The heat system ``M - tL`` that [`heat_geodesic`][triwarp.heat.heat_geodesic] solves needs no
 multilevel help of its own: it converges in a small, size-independent number of iterations, because
 ``t = h**2`` makes it a small perturbation of the mass matrix.
 """
@@ -143,15 +133,14 @@ CG_CHECK_EVERY = 0
 
 # Batching several iterations per conditional-graph test was tried and removed; do not
 # reintroduce it without a *short* solve in the sweep. ``wp.capture_while`` evaluates its condition
-# on device at a few microseconds against ~1 us for a replayed launch, so running a run of
-# iterations per test amortizes that -- but it also overshoots by up to ``K - 1`` iterations past
-# the point the residual crossed, and that overshoot is a fixed number of launches whose *share*
-# is set by how long the solve is. Long solves therefore win a little and short ones lose a lot:
-# the best cell gained ~13 % while three others lost 28-40 %, and every summary statistic put the
-# unbatched loop ahead. A converged iteration here is a pure no-op -- ``cg_step_p`` and
-# ``cg_step_x_r_z`` pin a converged column's ``beta`` / ``alpha`` to exactly zero -- so the
-# overshoot buys nothing at all, unlike the equivalent batching in a breadth-first level loop,
-# where an extra level still does useful work and a small batch is kept.
+# on device at several times the cost of a replayed launch, so running a run of iterations per test
+# amortizes that -- but it also overshoots by up to ``K - 1`` iterations past the point the residual
+# crossed, and that overshoot is a fixed number of launches whose *share* is set by how long the
+# solve is. Long solves therefore win a little and short ones lose a lot, and every summary
+# statistic put the unbatched loop ahead. A converged iteration here is a pure no-op --
+# ``cg_step_p`` and ``cg_step_x_r_z`` pin a converged column's ``beta`` / ``alpha`` to exactly zero
+# -- so the overshoot buys nothing at all, unlike the equivalent batching in a breadth-first level
+# loop, where an extra level still does useful work and a small batch is kept.
 
 # Cadence substituted for ``check_every=0`` on a device without conditional CUDA graphs, where Warp
 # cannot test the residual on device and would otherwise run every solve to ``maxiter``. Warp's own
@@ -533,6 +522,7 @@ def solve_spd_columns(
     preconditioner: str = "diag",
 ) -> tuple[int, float, float]:
     """
+
     Solve one symmetric positive-definite operator against several right-hand-side columns.
 
     Single batched conjugate-gradient call: all ``n_rhs`` columns advance together and convergence
@@ -554,6 +544,7 @@ def solve_spd_columns(
         back instead. Warp's own behaviour in that case is to run every solve to ``maxiter`` —
         ``CG_MAXITER_FACTOR * n`` iterations of guaranteed waste — so substituting the cadence is
         the only usable reading of the request.
+
 
     Parameters
     ----------
@@ -611,39 +602,36 @@ def solve_spd_columns(
 
     Notes
     -----
-    ``check_every`` is a pure performance knob on every path but one — it cannot change the
+    ``check_every`` is a pure performance knob on every path but one -- it cannot change the
     converged answer, only how far past the tolerance the solver may overshoot before it notices.
-    The exception is the exactly-two-column, ``"diag"``-preconditioned path (this module's internal
-    block conjugate gradient): it shares one Krylov subspace across both columns, so a positive
-    ``check_every`` can let a batch of iterations apply a real, coupled update to a column that
-    already crossed its own tolerance before the next readback catches up. Its device-side default
-    (``0``) scales with how much work a single ``cg`` call does, and the regimes disagree, so read
-    the one that matches the caller:
+    The exception is the exactly-two-column, ``"diag"``-preconditioned path: it shares one Krylov
+    subspace across both columns, so a positive ``check_every`` can let a batch of iterations apply
+    a real, coupled update to a column that already crossed its own tolerance. Its device-side
+    default (``0``) scales with how much work a single ``cg`` call does, and the regimes disagree,
+    so read the one that matches the caller:
 
-    - **Cold single solves** — one ``cg`` call from a zero initial guess, the shape
-      ``harmonic`` / ``tutte`` / ``smooth_region`` take. This is the regime the default is set for,
-      and it is a clear win there.
-    - **Warm-started solves inside an iteration loop** — ``arap``, whose right-hand side changes
-      every iteration so each solve still runs tens of CG iterations from the previous answer. The
-      default is neutral to mildly positive here.
-    - **Repeated near-converged solves over one [`spd_column_solver`]
-      [triwarp.linalg.spd_column_solver] state** — the same right-hand side re-solved back to back,
-      so every call after the first converges in one or two iterations. Here the device-side check's
-      fixed per-call cost dominates a solve that short, so it is a real loss; pass a positive
-      ``check_every`` to a state driven that way.
+    - **Cold single solves** -- one ``cg`` call from a zero initial guess, the shape ``harmonic`` /
+      ``tutte`` / ``smooth_region`` take. The regime the default is set for, and a clear win there.
+    - **Warm-started solves inside an iteration loop** -- ``arap``, whose right-hand side changes
+      every
+      iteration so each solve still runs tens of CG iterations from the previous answer. Neutral to
+      mildly positive.
+    - **Repeated near-converged solves over one
+      [`spd_column_solver`][triwarp.linalg.spd_column_solver] state** -- the same right-hand side
+      re-solved back to back, so every call after the first converges in one or two iterations. Here
+      the device-side check's fixed per-call cost dominates a solve that short, so it is a real
+      loss; pass a positive ``check_every`` to a state driven that way.
     - **Raising ``check_every`` well above the default is a loss in every regime**: the readback it
-      saves is cheap, while the extra iterations it can cause on top of the tolerance are real work
-      — the smaller the solve, the worse the trade.
+      saves is cheap, while the extra iterations it can cause are real work -- the smaller the
+      solve, the worse the trade.
 
     The *preconditioner* is not a knob worth turning beyond ``"diag"`` / ``"multigrid"`` /
-    ``"auto"`` above: IC(0) and Chebyshev both come out a wash or a loss against the Jacobi
-    preconditioner used here. See "Why Jacobi" in the [`triwarp.linalg`][triwarp.linalg] module
-    documentation.
-
-    The *per-iteration* cost of batching was a separate lever and has been taken: with more than one
-    column this runs triwarp's own conjugate gradient rather than ``warp.optim.linear``'s, because
-    Warp's reduction degrades on precisely the batched input the worst-case stopping rule needs. See
-    "Whose conjugate gradient" in the [`triwarp.linalg`][triwarp.linalg] module documentation.
+    ``"auto"``: IC(0) and Chebyshev both come out a wash or a loss against Jacobi. See "Why Jacobi"
+    in the [`triwarp.linalg`][triwarp.linalg] module documentation. The *per-iteration* cost of
+    batching was a separate lever and has been taken: with more than one column this runs triwarp's
+    own conjugate gradient rather than ``warp.optim.linear``'s, because Warp's reduction degrades on
+    precisely the batched input the worst-case stopping rule needs -- see "Whose conjugate gradient"
+    there.
 
     See Also
     --------
@@ -842,17 +830,14 @@ def _cg_columns(
         #
         # A block-CG variant that shares one Krylov subspace across exactly two columns
         # (O'Leary 1980) was built for this branch, shipped, and removed again. It does reduce the
-        # iteration count on a *uniform* mesh -- 140 against 182 and 275 against 355 on the two
-        # saddle patches -- but its iteration costs 10 launches against this one's 8, so the wall
-        # clock is a wash there (1.03x), and on every other system reached in this package it is
-        # neutral or a loss: the same operator on a graded mesh runs 4 774 iterations against 2 230
-        # (0.39x end to end), ``harmonic[hemisphere]`` 234 against 237 (0.88x), and
-        # ``heat.extend_scalar`` returns the identical count on both (1.00x), so that function's
-        # measured win belongs entirely to batching its two solves into one call. Best case +3 %
-        # against a worst case of -159 % is not a mechanism worth a gate, and the ill-conditioned
-        # half is block CG's own documented failure mode -- near-parallel search directions, which
-        # a Tikhonov floor bounds but does not deflate. Do not reintroduce it without deflation and
-        # a measurement on a graded mesh.
+        # iteration count on a *uniform* mesh, but its iteration costs two more launches than this
+        # one's, so the wall clock is a wash there, and on every other system reached in this
+        # package it is neutral or a loss -- worst on a *graded* mesh, where the count goes the
+        # other way by a factor of two. A best case of a few percent against a worst case of more
+        # than double is not a mechanism worth a gate, and the ill-conditioned half is block CG's
+        # own documented failure mode: near-parallel search directions, which a Tikhonov floor
+        # bounds but does not deflate. Do not reintroduce it without deflation and a measurement on
+        # a graded mesh.
         state = _BatchedCg(
             matrix,
             rhs,
@@ -1026,6 +1011,7 @@ def _cg_residual_and_tolerance(result: tuple[Any, ...]) -> tuple[float, float]:
 
 class _BatchedCg:
     """
+
     Jacobi-preconditioned conjugate gradient over the columns of one operator.
 
     Same iteration as ``warp.optim.linear.cg`` and the same stopping rule -- every column runs
@@ -1033,6 +1019,7 @@ class _BatchedCg:
     multi-column path, down to the ``(iterations, residual, tolerance)`` return contract. Callable
     like ``warp.optim.linear``'s solver state: the buffers are allocated once and every call
     re-reads ``rhs`` and warm-starts from whatever ``solution`` currently holds.
+
 
     Notes
     -----
@@ -1045,25 +1032,20 @@ class _BatchedCg:
 
     Two fusions ride along and are free. The Jacobi apply is an elementwise multiply of the ``r``
     that ``cg_step_x_r_z`` has just written, so it happens in a register rather than in its own
-    launch; and the ``rz_old = rz_new`` copy folds into the ``p.Ap`` finalize, which is the one
-    point in the iteration after the ``p`` update that last read ``rz_old`` and before the x/r
-    update that reads it next.
+    launch; and the ``rz_old = rz_new`` copy folds into the ``p.Ap`` finalize, the one point in the
+    iteration after the ``p`` update that last read ``rz_old`` and before the x/r update that reads
+    it next.
 
     **What was tried and is not here.** Solving the columns as separate unbatched ``cg`` calls also
-    reaches the tree reduction, but it pays a second copy of every other kernel in the iteration
-    and loses. And dropping ``batch_offsets`` to get the tree from a single call is not a tuning
-    change at all -- ``alpha`` and ``beta`` would then be global rather than per column, which is CG
-    on the block system and a different iteration.
-
-    **Sharing the Krylov subspace across columns was tried and removed.** This class's
-    "worst-column stopping rule" batches the *launches* but runs each column's iteration
-    mathematically independently, so the iteration counts are unchanged versus separate solves. A
-    classical block conjugate gradient (O'Leary 1980) over exactly two columns does reduce them --
-    140 against 182 and 275 against 355 on the two uniform saddle patches -- but at 10 launches per
-    iteration against this class's 8 the wall clock is a wash (1.03x), and on a *graded* mesh the
-    two search directions go nearly parallel and the count goes the other way, 4 774 against 2 230
-    (0.39x end to end). See ``_cg_columns`` for the full seven-system measurement and why the
-    mechanism is not gated but gone.
+    reaches the tree reduction, but it pays a second copy of every other kernel in the iteration and
+    loses. Dropping ``batch_offsets`` to get the tree from a single call is not a tuning change at
+    all -- ``alpha`` and ``beta`` would then be global rather than per column, which is CG on the
+    block system and a different iteration. And **sharing the Krylov subspace across columns was
+    tried and removed**: this class batches the *launches* but runs each column's iteration
+    mathematically independently, so the counts are unchanged versus separate solves, where a
+    classical block conjugate gradient (O'Leary 1980) over two columns reduces them on a uniform
+    mesh at two more launches per iteration -- a wash there, and worse on a *graded* mesh, where the
+    two search directions go nearly parallel and the count goes the other way.
     """
 
     def __init__(
@@ -1111,9 +1093,9 @@ class _BatchedCg:
         )
         self._dots = wp.zeros((2, self._n_columns), dtype=wp.float64, device=device)
         # The two rows of ``_dots``, viewed once. ``_dots`` is allocated here and never rebound, so
-        # both views are valid for the solver's whole life -- and re-taking one costs ~3 us of
-        # ``wp.array.__getitem__`` every time. ``_dot_finalize`` runs once per CG iteration on the
-        # host-check path, where that measured **2.00 slices per iteration**; on the CUDA capture
+        # both views are valid for the solver's whole life -- and re-taking one costs a few
+        # microseconds of ``wp.array.__getitem__`` every time. ``_dot_finalize`` runs once per CG
+        # iteration on the host-check path, so that was two slices an iteration; on the CUDA capture
         # path the body is recorded once and replayed, so there it is per *solve* instead.
         self._dots_rz = twt.as_dense(self._dots[0])
         self._dots_carry = twt.as_dense(self._dots[1])
@@ -1199,12 +1181,10 @@ class _BatchedCg:
     def _iteration(self) -> None:
         """One CG step, none of which reads back to the host."""
         # One launch over every column at once rather than ``n_columns`` separate ``bsr_mv`` calls
-        # against the same operator -- ``kernels/algorithms/multigrid.py::csr_matvec``'s own
-        # measurement (34 launches / 189 us through ``bsr_mv`` against 15 / 85 through this, same
-        # answer) is exactly this call shape, and it already reads this solver's own flat
-        # column-block layout (``_column_views``' ``column * stride + row`` addressing). This
-        # collapses what used to be ``n_columns`` separate matvec launches into exactly one,
-        # regardless of ``n_columns``.
+        # against the same operator -- ``kernels/algorithms/multigrid.py::csr_matvec`` measures that
+        # trade on exactly this call shape, and it already reads this solver's own flat
+        # column-block layout (``_column_views``' ``column * stride + row`` addressing). One matvec
+        # launch per cycle regardless of ``n_columns``.
         wp.launch(
             kernel_mg.csr_matvec,
             dim=self._n_columns * self._n,
@@ -1379,8 +1359,8 @@ class _BatchedCg:
         # back on the first check only: the test was taking *two* readbacks per block where one is
         # a loop constant. It is read **after** ``_dots_rz`` rather than before the loop, and the
         # order is the whole point -- the first read of a block drains the queue that block's
-        # launches just filled (~0.1 ms) and a second one straight after it is ~0.02 ms, so
-        # hoisting it above the loop would buy its own drain and lose on a single-block solve.
+        # launches just filled and a second one straight after it is nearly free, so hoisting it
+        # above the loop would buy its own drain and lose on a single-block solve.
         done = 0
         atol_sq_np = None
         while done < self._maxiter:
@@ -1488,6 +1468,7 @@ def multigrid_preconditioner(
     matrix: wps.BsrMatrix[wp.float64], n_columns: int = 1, *, seed: int = 0
 ) -> wpl.LinearOperator:
     """
+
     Smoothed-aggregation multigrid preconditioner for a symmetric positive-semi-definite operator.
 
     A single-level preconditioner cannot break conjugate gradient's growth in the mesh size -- see
@@ -1500,6 +1481,7 @@ def multigrid_preconditioner(
     The returned operator acts on length-``n_columns * n`` vectors laid out as ``n_columns``
     contiguous blocks, exactly as [`replicated_operator`][triwarp.linalg.replicated_operator] does,
     so it drops into ``M=`` beside a Jacobi preconditioner without any other change.
+
 
     Parameters
     ----------
@@ -1537,10 +1519,9 @@ def multigrid_preconditioner(
     **The setup is host cost and it is per *level*, not per unknown, so it cannot be cut by making
     the operator smaller.** A level's cost is dominated by host-side overhead in
     ``warp.sparse.bsr_mm``, which makes device-to-host readbacks to size its output and so costs
-    roughly the same regardless of the level's size. That is Warp's, not this package's, so "make
-    the hierarchy cheap enough to run unconditionally" is not a lever available here; the reachable
-    version is to build **fewer levels**, which is what this module's ``_MULTIGRID_MAX_COARSE`` is
-    set for.
+    roughly the same regardless of the level's size. That is Warp's, not this package's, so the
+    reachable lever is to build **fewer levels**, which is what ``_MULTIGRID_MAX_COARSE`` is set
+    for.
 
     Coarsening stops at 128 rows, or earlier if a level fails to shrink; the coarsest operator is
     then inverted densely on the host, which is exact and is a single launch inside the cycle where
@@ -1551,11 +1532,11 @@ def multigrid_preconditioner(
 
     !!! warning "That fallback is silent, and the strength threshold can trigger it"
         A stalled hierarchy is indistinguishable from a weak one at the call site: the solve simply
-        runs at its Jacobi iteration count. ``_MULTIGRID_THETA`` is what decides how easily it
-        happens -- raising it makes more off-diagonals weak, and past some threshold an operator can
-        stop coarsening entirely and come back at *exactly* the Jacobi count. So an aggregation
-        change that "did nothing" should be checked against the level count before it is read as a
-        change that did not help.
+        runs at its Jacobi iteration count. ``_MULTIGRID_THETA`` decides how easily it happens --
+        raising it makes more off-diagonals weak, and past some threshold an operator can stop
+        coarsening entirely and come back at *exactly* the Jacobi count. So an aggregation change
+        that "did nothing" should be checked against the level count before it is read as a change
+        that did not help.
 
     See Also
     --------
@@ -1739,8 +1720,8 @@ def _multigrid_aggregate(
     theta = wp.float64(_MULTIGRID_THETA)
     # ``sqrt(|A_ii|)`` per row, so the strength test below is a product rather than a square root
     # per edge. One ``(n,)`` buffer and one map, read by both walks. The ``diagonal`` argument is
-    # the caller's -- the hierarchy needs the same extraction for the smoother, and extracting it
-    # here as well is what this used to do.
+    # the caller's, because the hierarchy needs the same extraction for the smoother and must not
+    # repeat it here.
     scaled_diagonal = wp.empty(n, dtype=wp.float64, device=device)
     wp.map(kernel_array.sqrt_abs, diagonal, out=scaled_diagonal)
 

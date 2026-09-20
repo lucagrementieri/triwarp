@@ -566,8 +566,8 @@ def successor_cycles(
     # ``unique_1d`` over the flattened pairs: both return the sorted distinct values, and the range
     # check above has already guaranteed every endpoint indexes the mask, but this one is a zeroed
     # buffer, a scatter and a scan where that one is a hash table, a compaction, a radix sort and
-    # two host readbacks. Measured 122 us against 176 -- flat in ``node_count`` from 2 562 to
-    # 1 000 000 on an RTX 5090, with byte-identical output at every size.
+    # two host readbacks. Measured faster at every size, flat in ``node_count``, with
+    # byte-identical output.
     node_mask = wp.zeros(node_count, dtype=wp.bool, device=device)
     wp.launch(
         kernel_scatter.mark_membership_mask,
@@ -668,6 +668,7 @@ def shortest_path_envelope(
     adjacency: wps.BsrMatrix[wp.float32], values: wp.array[wp.float32], max_iterations: int = 0
 ) -> wp.array[wp.float32]:
     """
+
     Lower every node's value onto the shortest-path envelope ``min_u (values[u] + d(u, v))``.
 
     Two readings of one relaxation, and both are worth knowing because they are the same call:
@@ -689,6 +690,7 @@ def shortest_path_envelope(
     MeshLab's ``gradientthr`` is not a parameter here because it is a property of the *graph*: its
     cap is ``|p_i - p_j| / gradientthr``, so dividing the edge lengths by it when building
     ``adjacency`` reproduces it exactly, and the same weights then serve any other slope.
+
 
     Parameters
     ----------
@@ -734,24 +736,23 @@ def shortest_path_envelope(
 
     Notes
     -----
-    **The answer is Dijkstra's; the method is Bellman-Ford.** A priority queue is inherently
-    serial — it processes one node per pop — so this relaxes *every* node against its neighbours in
+    **The answer is Dijkstra's; the method is Bellman-Ford.** A priority queue is inherently serial
+    -- it processes one node per pop -- so this relaxes *every* node against its neighbours in
     parallel and repeats until nothing improves. Shortest-path distances are unique, so the two
-    agree on the result; what differs is the cost model — ``O(diameter)`` launches over the whole
+    agree on the result; what differs is the cost model -- ``O(diameter)`` launches over the whole
     CSR here against ``O(E log V)`` sequential work there. The name is the result, per this
     package's naming rule, not the algorithm.
 
     One relaxation kernel per pass, so a pass is a pure function of the previous labels and the
     answer does not depend on thread interleaving. The pass count is data-dependent; on CUDA the
     whole pass loop runs as one device-side conditional graph (``wp.capture_while``), so the
-    convergence check costs no host readback at
-    all rather than the one-per-pass a naive early exit would need — see the ``linalg`` note on
-    ``check_every`` for why that per-pass sync would otherwise be the expensive part. The CPU
-    backend, which has no conditional-graph capture, still checks with a plain readback per pass.
+    convergence check costs no host readback at all rather than the one-per-pass a naive early exit
+    would need. The CPU backend, which has no conditional-graph capture, still checks with a plain
+    readback per pass.
 
-    For distance *across* a surface rather than along its edges — shorter, and what "geodesic"
-    usually means — use [`heat_geodesic`][triwarp.heat.heat_geodesic]. The edge-graph
-    distance is an upper bound on it.
+    For distance *across* a surface rather than along its edges -- shorter, and what "geodesic"
+    usually means -- use [`heat_geodesic`][triwarp.heat.heat_geodesic]. The edge-graph distance is
+    an upper bound on it.
 
     See Also
     --------
@@ -828,12 +829,11 @@ def shortest_path_envelope(
     def envelope_pass_body() -> None:
         # One pass, then a copy of its result back over ``labels``. **Two passes per round, written
         # into each other's buffer, would remove the copy** -- it is a whole device pass over the
-        # node array and measured ~20 % of this call (1.26x on 2 562 nodes, 1.45x on 40 962) -- and
-        # it is **not portable**: the two devices then disagree. Measured on a 2 562-node sphere
-        # with ``max_iterations`` 1 / 3 / 7, the unrolled body relaxed 16 / 51 / 181 nodes on CUDA
-        # against 6 / 31 / 141 on the CPU device, because the recorded body did not replay as two
-        # passes per round there; even caps agreed exactly. A ``wp.capture_while`` body is not
-        # guaranteed to execute as an indivisible unit across devices, so a loop whose *result
+        # node array and a real fraction of this call -- and it is **not portable**: the two devices
+        # then disagree. Measured with the unrolled body, the CPU device relaxed strictly fewer
+        # nodes per round than CUDA at every cap, because the recorded body did not replay as two
+        # passes per round there. A ``wp.capture_while`` body is not guaranteed to execute as an
+        # indivisible unit across devices, so a loop whose *result
         # buffer* depends on the body running whole cannot rely on it. A Python-level ping-pong
         # cannot help either: the body is recorded once and replayed, so rebinding the names would
         # only take effect at record time.

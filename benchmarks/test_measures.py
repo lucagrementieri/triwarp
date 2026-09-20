@@ -7,18 +7,14 @@ That is the axis these rows measure: not the arithmetic, which is trivially para
 how many crossings the *shape of the return type* forces. Read ``surface_centroid`` (two crossings)
 against ``moments`` (four, for ten sums) -- the gap is nearly all latency.
 
-What this axis is **not** is a licence to copy arrays. ``moments`` used to read its three ``vec3d``
-integrand buffers back with ``.numpy().sum(axis=0)``, which is not a crossing per return value but
-72 bytes *per face* moved to be added on the host, and it is why this module's docstring used to
-record triwarp losing the row to igl outright. Four ``wp.utils.array_sum`` calls (it reduces a
-``vec3d`` array componentwise, so no kernel was needed) leave the count of crossings unchanged at
-four and the bytes crossed at 80: measured back-to-back in one process, ``moments`` went
-**3.18 ms -> 0.376 ms on bunny (8.5x)** and **35.2 -> 0.84 on dragon (42x)**, which turns the row
-into a win -- min-of-10 **443 us against igl's 806** on bunny and **5.32 ms against 9.04** on
-dragon. It still loses ``bunny_decimated`` (367 us against 180), where four launches plus four
-4-byte reads are the floor and igl's 16 k faces fit in cache. Read the **min** in this group, not
-the median: with the igl and trimesh rows sharing the process the triwarp medians here run up to
-18x its own min (measured 8 062 us against a 443 us min on bunny), the same instability
+What this axis is **not** is a licence to copy arrays. Reducing the ``vec3d`` integrand buffers
+with ``.numpy().sum(axis=0)`` is not a crossing per return value but 72 bytes *per face* moved to be
+added on the host; ``wp.utils.array_sum`` (which reduces a ``vec3d`` array componentwise, so no
+kernel is needed) keeps the crossings at four and the bytes crossed at 80, and is what turns this
+row from a loss into a win against igl. It still loses the smallest scan mesh, where four launches
+plus four 4-byte reads are the floor and igl's faces fit in cache. Read the **min** in this group,
+not the median: with the igl and trimesh rows sharing the process the triwarp medians here run an
+order of magnitude above its own min, the same instability
 [`test_holes.py`](test_holes.py) documents for its DP rows.
 
 ``get_geometric_measures`` is pymeshlab's reference for the centroid and it does *more*: one
@@ -55,7 +51,7 @@ def test_surface_centroid(bench_case: BenchCase) -> None:
     type is a host-side ``wp.vec3`` -- and the baseline ``moments`` below is read against, since
     that one pays three for ten sums. Also the row that covers *both* reduction kernels:
     ``centroid_tiled`` on CUDA and ``centroid_sliced`` on CPU, picked by
-    ``_device.prefers_tiled_reduction``, measured 1.67x apart at 327k faces.
+    ``_device.prefers_tiled_reduction``.
 
     meshlib's ``findCenterFromFaces`` is this exact quantity and nothing more -- unlike the
     pymeshlab row above, which returns five measures at once. Note it has a sibling,
@@ -115,24 +111,15 @@ def test_moments(bench_case: BenchCase) -> None:
 
     There is no open3d row, measured rather than assumed: ``get_volume`` validates before it
     integrates, and the validation is the same brute-force ``IsWatertight`` composition its
-    ``is_watertight`` row times -- **13.8 s on a watertight 82k-face sphere** whose integral is
-    microseconds. A row here would re-time ``is_watertight`` under this group's name (the same
-    trap the validation module documents for ``is_volume``), and it raises outright on the
-    non-watertight sweep meshes.
-
-    **This row used to be a loss and no longer is**, and the reason is worth keeping: the old
-    3.19 ms on ``bunny`` against igl's 1.23 was read as confirming the readback account, when four
-    crossings of 80 bytes cannot cost 3 ms. Three of them were ``.numpy().sum(axis=0)`` over the
-    per-face ``vec3d`` integrands -- 72 bytes per face, not per return -- so the row was timing a
-    5 MB copy that the latency story made look expected. Now **443 us against igl's 806** on
-    ``bunny`` and **5.32 ms against 9.04** on ``dragon`` (mins; see the module docstring on why the
-    medians here are unusable), with ``bunny_decimated`` still lost at 367 us against 180 because
-    four launches plus four 4-byte reads are the floor.
+    ``is_watertight`` row times -- seconds, on a mesh whose integral is microseconds. A row here
+    would re-time ``is_watertight`` under this group's name (the same trap the validation module
+    documents for ``is_volume``), and it raises outright on the non-watertight sweep meshes.
 
     The lesson the group is kept for: **a plausible cost model is not a measurement.** "Readback-
-    bound" was true and still hid a bytes-moved bug for as long as nobody checked which of the two
-    the number was. A caller wanting only the volume should still call
-    [`volume`][triwarp.measures.volume], which pays one crossing.
+    bound" was true of this row and still hid a bytes-moved bug -- three ``.numpy().sum(axis=0)``
+    reductions over the per-face ``vec3d`` integrands, 72 bytes per face rather than per return --
+    for as long as nobody checked which of the two the number was. A caller wanting only the volume
+    should still call [`volume`][triwarp.measures.volume], which pays one crossing.
     """
     if bench_case.kind == "pyvista":
         mesh_pv = bench_case.mesh_pv

@@ -1,7 +1,7 @@
 """
 Unstructured point-cloud geometry: fitting, second moments and normal estimation.
 
-No connectivity here -- everything takes a bare ``(n,)`` array of positions. Two groups:
+No connectivity here -- everything takes a bare ``(n,)`` array of positions. Four groups:
 
 - **Whole-cloud fits.** [`centroid`][triwarp.points.centroid],
   [`covariance`][triwarp.points.covariance] and
@@ -10,27 +10,25 @@ No connectivity here -- everything takes a bare ``(n,)`` array of positions. Two
   dominant and weakest eigenvector off them. [`gram_matrix`][triwarp.points.gram_matrix] is the
   uncentered form, for callers that want to center differently.
 - **Per-point.** [`estimate_normals`][triwarp.points.estimate_normals] fits a plane to each point's
-  k-nearest neighbourhood, which is how an unoriented cloud acquires normals before
-  reconstruction. [`outlier_probability`][triwarp.points.outlier_probability] and
-  [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask] score the same
-  neighbourhood for isolation, which is how a scanned cloud loses its stragglers *before* the
-  normals are fitted. [`plane_basis`][triwarp.points.plane_basis] and
-  [`radial_sort`][triwarp.points.radial_sort] then let a caller work in the tangent plane it
-  defines.
+  k-nearest neighbourhood, which is how an unoriented cloud acquires normals before reconstruction.
+  [`outlier_probability`][triwarp.points.outlier_probability] and
+  [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask] score the same neighbourhood
+  for isolation, which is how a scanned cloud loses its stragglers *before* the normals are fitted.
+  [`plane_basis`][triwarp.points.plane_basis] and [`radial_sort`][triwarp.points.radial_sort] then
+  let a caller work in the tangent plane it defines.
 - **Cleanup and subsampling.** Four masks and one selector, all returning indices or
-  ``wp.array[wp.bool]`` rather than a copied cloud, so a caller pays for the gather only if it
-  wants one: [`point_finite_mask`][triwarp.points.point_finite_mask] and
+  ``wp.array[wp.bool]`` rather than a copied cloud, so a caller pays for the gather only if it wants
+  one: [`point_finite_mask`][triwarp.points.point_finite_mask] and
   [`point_duplicate_mask`][triwarp.points.point_duplicate_mask] are the two exact predicates,
   [`radius_outlier_mask`][triwarp.points.radius_outlier_mask] and
   [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask] the two density ones (an
   absolute floor and a cloud-relative threshold), and
   [`farthest_point_sample`][triwarp.points.farthest_point_sample] picks an exact count spread over
-  the cloud's support. Run the exact predicates first: they are cheap and they remove the inputs
-  the others are ill-defined on.
-
+  the cloud's support. Run the exact predicates first: they are cheap and they remove the inputs the
+  others are ill-defined on.
 - **Approximate hull vertices.** Which points are convex-hull vertices, without building a hull.
-  Both entry points are exact-hull-free and run in a fixed number of parallel launches, and both
-  are one-sided -- but in *opposite* directions, which is what the names say:
+  Both entry points are exact-hull-free and run in a fixed number of parallel launches, and both are
+  one-sided -- but in *opposite* directions:
 
     - [`convex_subset_mask`][triwarp.points.convex_subset_mask] (and its point-returning form
       [`convex_subset`][triwarp.points.convex_subset]) accumulates *positive* certificates: a
@@ -40,7 +38,7 @@ No connectivity here -- everything takes a bare ``(n,)`` array of positions. Two
     - [`convex_superset_mask`][triwarp.points.convex_superset_mask] accumulates *negative*
       certificates: a tetrahedron of hull points strictly containing a point proves that point is
       interior. It keeps everything it cannot rule out, so the result is **never smaller** than the
-      hull-vertex set -- a conservative filter, suitable as a prefilter before an exact hull.
+      hull-vertex set -- a conservative prefilter before an exact hull.
 
   Neither computes hull connectivity; for that use an exact hull library
   ([`scipy.spatial.ConvexHull`][] or the qhull-backed mesh packages).
@@ -48,10 +46,9 @@ No connectivity here -- everything takes a bare ``(n,)`` array of positions. Two
 Normals from [`estimate_normals`][triwarp.points.estimate_normals] are *unoriented* -- a plane fit
 cannot pick a side. See [`triwarp.repair`][triwarp.repair] for orientation propagation.
 
-One member here takes no cloud at all: [`vector_angle`][triwarp.points.vector_angle] is the
-unsigned angle between two ``wp.vec3`` arrays. It is geometry rather than array structure, so
-[`triwarp.array`][triwarp.array] ("NumPy-style structural and elementwise ops") is no better a
-home, and there is no third candidate -- so it stays, and this sentence is why.
+One member here takes no cloud at all: [`vector_angle`][triwarp.points.vector_angle] is the unsigned
+angle between two ``wp.vec3`` arrays, geometry rather than array structure, so
+[`triwarp.array`][triwarp.array] is no better a home.
 """
 
 import math
@@ -239,11 +236,9 @@ def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
 
     The result is ``normalize(S @ V)`` over the SVD of the **uncentered** point matrix -- a sum of
     all three right singular vectors weighted by their singular values. It is **not** the first
-    principal axis, and the two
-    part company as soon as the cloud is neither strongly elongated nor centred on the origin:
-    measured against the leading eigenvector of the covariance, ``|dot|`` is 1.000 on a 1000:1
-    needle but **0.939** on a 3:1:0.2 cloud and **0.812** once that cloud is offset from the origin.
-    For the principal frame, use
+    principal axis, and the two part company as soon as the cloud is neither strongly elongated nor
+    centred on the origin: they agree on a needle and diverge visibly on a merely anisotropic cloud,
+    more so once it is offset from the origin. For the principal frame, use
     [`principal_axes`][triwarp.points.principal_axes].
 
     Parameters
@@ -406,12 +401,12 @@ def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
         ``(u, v)`` unit vectors perpendicular to each other and to ``normal``, such that
         ``(u, v, normalize(normal))`` is right-handed.
     """
-    # These four Warp builtins are Python-scope, so each pays ~9 us of builtin dispatch (~36 us for
-    # the function, which does no device work). Both alternatives were measured and declined: NumPy
-    # is a wash at 33.9 us, because ``np.cross`` is itself slower than ``wp.cross`` (12.37 against
-    # 9.31 us); hand-written components are 2.63 us (13.6x, agreeing to 6e-08) but fork the one
-    # tangent-frame rule into a second spelling beside ``kernels/predicates.plane_basis``, which is
-    # the duplicated-decision-rule hazard this package treats as a correctness risk.
+    # These four Warp builtins are Python-scope, so each pays builtin dispatch and the function --
+    # which does no device work -- is entirely that. Both alternatives were measured and declined:
+    # NumPy is a wash, because ``np.cross`` is itself slower than ``wp.cross``; hand-written
+    # components are an order of magnitude cheaper but fork the one tangent-frame rule into a second
+    # spelling beside ``kernels/predicates.plane_basis``, which is the duplicated-decision-rule
+    # hazard this package treats as a correctness risk.
     # ``twt.normalize`` / ``twt.cross`` are those same builtins, re-exported over the concrete
     # vector types so a vector held in a variable resolves against them.
     unit_normal = twt.normalize(normal)
@@ -892,13 +887,12 @@ def radius_outlier_mask(
 
     Notes
     -----
-    The counts are exact, and the rule is the reference's — but Open3D's own
+    The counts are exact, and the rule is the reference's -- but Open3D's own
     ``remove_radius_outlier`` shares one ``KDTreeFlann`` across an OpenMP loop and its radius search
-    is not thread-safe under that sharing, so it returns a *different answer run to run*: measured
-    three distinct keep sets (43 / 44 / 45 points) over eight repetitions of one 500-point cloud,
-    differing by one or two points each time. Querying the same tree serially reproduces this
-    function exactly on that cloud. Expect a comparison against the filter to disagree on a handful
-    of borderline points, and do not read that as a difference in the criterion.
+    is not thread-safe under that sharing, so it returns a *different answer run to run*, differing
+    by a point or two between repetitions of the same cloud. Querying the same tree serially
+    reproduces this function exactly. Expect a comparison against the filter to disagree on a
+    handful of borderline points, and do not read that as a difference in the criterion.
 
     Examples
     --------
@@ -1146,31 +1140,29 @@ def convex_subset_mask(
     """
     Approximate the convex-hull vertices of a point cloud as a boolean mask.
 
-    For any direction ``n``, the point maximizing ``⟨n, p⟩`` is a vertex of the
-    convex hull, and the point minimizing it is the hull vertex farthest along
-    ``-n``. A single dot-product sweep over the points therefore yields the two
-    hull vertices supporting ``+n`` and ``-n``. Directions are drawn on the
+    For any direction ``n``, the point maximizing ``⟨n, p⟩`` is a vertex of the convex hull, and the
+    point minimizing it is the hull vertex farthest along ``-n``. A single dot-product sweep
+    therefore yields the two hull vertices supporting ``+n`` and ``-n``. Directions are drawn on the
     positive-``z`` hemisphere with the deterministic Fibonacci spiral
-    ([`sample_fibonacci_hemisphere`][triwarp.sample.sample_fibonacci_hemisphere]);
-    because the hemisphere and its reflection tile the full sphere, taking both
-    the max and min per direction covers all ``2 * n_directions`` antipodal
-    orientations at half the dot-product cost of sampling the full sphere.
+    ([`sample_fibonacci_hemisphere`][triwarp.sample.sample_fibonacci_hemisphere]); because the
+    hemisphere and its reflection tile the full sphere, taking both the max and min per direction
+    covers all ``2 * n_directions`` antipodal orientations at half the cost of sampling the full
+    sphere.
 
-    The extrema are computed by one thread per ``(direction, point slice)``, each reducing a
-    strided slice of [`ITEMS_PER_SLICE_CUDA`][triwarp.constants.ITEMS_PER_SLICE_CUDA] points
+    The extrema are computed by one thread per ``(direction, point slice)``, each reducing a strided
+    slice of [`ITEMS_PER_SLICE_CUDA`][triwarp.constants.ITEMS_PER_SLICE_CUDA] points
     (``ITEMS_PER_SLICE_CPU`` on the CPU device) and committing one atomic, then a second pass marks
     the maximizers and minimizers. At most roughly ``2 * n_directions`` points (plus ties) can be
     marked.
 
     !!! warning "The result is an inner approximation, not a superset"
 
-        Marking a point requires a *certificate* -- a sampled direction it is extremal
-        along -- so a hull vertex with no such direction is **dropped**. The mask is
-        therefore a subset of the hull boundary, never a conservative superset of the
-        hull vertices; see Notes for the exact guarantee and how to raise recall. When
-        losing a hull vertex is unacceptable, use
-        [`convex_superset_mask`][triwarp.points.convex_superset_mask], which errs the
-        other way by construction.
+        Marking a point requires a *certificate* -- a sampled direction it is extremal along -- so a
+        hull vertex with no such direction is **dropped**. The mask is therefore a subset of the
+        hull boundary, never a conservative superset of the hull vertices; see Notes for the exact
+        guarantee and how to raise recall. When losing a hull vertex is unacceptable, use
+        [`convex_superset_mask`][triwarp.points.convex_superset_mask], which errs the other way by
+        construction.
 
     Parameters
     ----------
@@ -1195,26 +1187,22 @@ def convex_subset_mask(
 
     Notes
     -----
-    **What is guaranteed.** Every marked point lies on the convex-hull *boundary*, to
-    within the ``tolerance`` slack. That is the invariant that holds for every input.
-    The stronger statement -- every marked point is a hull *vertex* -- holds only when
-    no support direction ties, which is the generic case for a cloud in general
-    position but fails on structured data: on a 5x5 grid over each face of a cube
-    (98 points, 8 hull vertices) the mask returns 14 points at any ``n_directions``,
-    the 8 corners plus 6 face-edge midpoints that tie with a corner along a face
-    normal. Raising ``tolerance`` widens that effect deliberately.
+    **What is guaranteed.** Every marked point lies on the convex-hull *boundary*, to within the
+    ``tolerance`` slack. That is the invariant that holds for every input. The stronger statement --
+    every marked point is a hull *vertex* -- holds only when no support direction ties, which is the
+    generic case for a cloud in general position but fails on structured data: on a grid over each
+    face of a cube the mask also returns the face-edge midpoints that tie with a corner along a face
+    normal, at any ``n_directions``. Raising ``tolerance`` widens that effect deliberately.
 
-    **What is not guaranteed.** A hull vertex is recovered only when a sampled
-    direction falls inside its *normal cone*, so recall degrades with the flatness of
-    the hull around a vertex, not with the point count. On 500 standard-normal points
-    (31 hull vertices) the recovered fraction measures 0.61 at ``n_directions=32``,
-    0.81 at 128, 0.87 at 256, 0.94 at 512 and 1.00 at 16384; the four vertices missed
-    at 256 have normal cones spanning 3e-5 to 2e-3 of the sphere, so 512 antipodal
-    orientations are expected to hit them 0.02 to 1.1 times. Increasing
-    ``n_directions`` is the only knob that raises recall -- ``tolerance`` trades
-    precision for it and is not a substitute. When *all* hull vertices are required,
-    use an exact hull ([`scipy.spatial.ConvexHull`][] and the qhull-backed mesh
-    libraries): no setting of these parameters makes this function conservative.
+    **What is not guaranteed.** A hull vertex is recovered only when a sampled direction falls
+    inside its *normal cone*, so recall degrades with the flatness of the hull around a vertex, not
+    with the point count. On 500 standard-normal points (31 hull vertices) the recovered fraction
+    measures 0.61 at ``n_directions=32``, 0.87 at 256 and 1.00 at 16384; the vertices missed at 256
+    have normal cones spanning a few parts in ten thousand of the sphere or less. Increasing
+    ``n_directions`` is the only knob that raises recall -- ``tolerance`` trades precision for it
+    and is not a substitute. When *all* hull vertices are required, use an exact hull
+    ([`scipy.spatial.ConvexHull`][] and the qhull-backed mesh libraries): no setting of these
+    parameters makes this function conservative.
 
     See Also
     --------
@@ -1540,9 +1528,9 @@ def radial_sort(
         helper = wp.vec3(1.0, 0.0, 0.0)
         if abs(normal[0]) > abs(normal[1]):
             helper = wp.vec3(0.0, 1.0, 0.0)
-        # ~9 us each of Python-scope builtin dispatch, once per call against a per-point device
-        # sort; NumPy is no cheaper here (``np.cross`` is 12.37 us against ``wp.cross``'s 9.31).
-        # Same decline as ``plane_basis`` above, and for the same chirality reason.
+        # Python-scope builtin dispatch, once per call against a per-point device sort; NumPy is no
+        # cheaper here, ``np.cross`` being slower than ``wp.cross``. Same decline as ``plane_basis``
+        # above, and for the same chirality reason.
         axis0 = twt.cross(normal, helper)
         axis1 = twt.cross(normal, axis0)
     else:

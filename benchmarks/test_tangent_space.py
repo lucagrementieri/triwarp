@@ -10,12 +10,12 @@ Three groups over two axes:
 * **scale** for the frames and the transport angles, which are per-vertex and per-halfedge
   arithmetic with no walk in them.
 
-Measured on an RTX 5090: ``halfedge_tangent_angles`` goes **615 us -> 19.4 ms, a 31.6x spread**, on
-the valence axis -- more exposed than ``vertex_one_rings``'s 9.9x on the same two meshes, because
-it walks the ring twice (once to total the corner angles, once to lay them out) and the hub's walk
-is serial both times. ``vertex_tangent_frames`` runs 765 / 727 / 984 us over the scale axis against
-potpourri3d's 2.70 / 63.1 / 373 ms, and ``halfedge_transport_angles`` 28 / 27 / 31 us, flat: given
-the polar angles it is one read per halfedge and nothing else.
+``halfedge_tangent_angles`` spreads by more than an order of magnitude on the valence axis -- more
+exposed than ``vertex_one_rings`` on the same two meshes, because it walks the ring twice (once to
+total the corner angles, once to lay them out) and the hub's walk is serial both times.
+``vertex_tangent_frames`` is flat over the scale axis where potpourri3d is superlinear, and
+``halfedge_transport_angles`` is flat too: given the polar angles it is one read per halfedge and
+nothing else.
 
 potpourri3d is the reference, but note what its row includes: its tangent frames are a by-product of
 constructing ``MeshVectorHeatSolver``, which also builds the halfedge mesh, the cotangent Laplacian

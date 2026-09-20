@@ -421,19 +421,18 @@ def symmetric_surface_distance(
 
     !!! note "Why the chamfer's floor is what it is"
         For two independent uniform samples at density ``n / area`` the mean nearest-neighbour
-        distance is ``0.5 * sqrt(area / n)`` -- on a unit sphere at ``n_samples=4000`` that predicts
-        0.0280 and ``symmetric_chamfer(m, m)`` measures 0.0279. The chamfer was reporting its own
-        sample spacing. Measured on the same pair of Poisson reconstructions: this function scores
-        **0.00000** for a mesh against itself and **0.0043** for the real disagreement, where the
-        chamfer scored 0.0279 and 0.0281 -- a signal of 0.0002 riding on a floor of 0.0279.
+        distance is ``0.5 * sqrt(area / n)``, which is what ``symmetric_chamfer(m, m)`` reports for
+        a mesh against itself -- its own sample spacing. On a pair of Poisson reconstructions this
+        function scores **0** for a mesh against itself against the chamfer's floor, so the real
+        disagreement is a signal rather than a perturbation of one.
 
     Returns both statistics from one sampling pass because they fail differently and each is blind
-    to the other's bug class: a **local** defect barely moves the mean (a dent over 677 of 32 552
-    vertices measured 0.0023 mean, *below* the 0.0043 two implementations honestly differ by) while
-    tripling the max to 0.0504; a **global** scale error moves both. Assert whichever the test's
-    claim is about, and say which in the docstring.
+    to the other's bug class: a **local** defect barely moves the mean -- a dent over 2 % of the
+    vertices scores *below* the level at which two honest implementations differ -- while tripling
+    the max; a **global** scale error moves both. Assert whichever the test's claim is about, and
+    say which in the docstring.
 
-    Costs ~100 ms per call at the default ``n_samples`` -- an exact surface query, not a tree
+    Expensive per call at the default ``n_samples`` -- an exact surface query, not a tree
     lookup -- so it is affordable per test but not inside a loop.
 
     Parameters

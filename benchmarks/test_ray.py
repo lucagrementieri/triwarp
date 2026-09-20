@@ -35,9 +35,9 @@ row, and the same thing triwarp's rows do by holding a ``wp.Mesh``. The ray clou
 constructions, comparable to the query itself, so it is cached per mesh.
 
 **open3d**'s ``RaycastingScene`` is Embree, which makes these the closest thing in the suite to a
-fair fight on ray casting -- and it has **one method per group**, not one method for all three. An
-earlier version of this section said the opposite ("``cast_rays`` returns a dense record ... so it
-is the ``intersects_location`` row three times over"), which read only one of five methods:
+fair fight on ray casting -- and it has **one method per group**, not one method for all three.
+Reading only ``cast_rays`` makes it look like one dense record serving all of them; it is five
+methods:
 
 - ``test_occlusions`` is a genuine **any-hit** traversal and answers nothing else, which is what
   ``intersects_any`` is for and what MeshLib's row is only an upper bound on

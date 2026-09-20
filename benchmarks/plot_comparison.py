@@ -56,8 +56,8 @@ import aggregate
 from assets.logos import registry
 
 # The threshold a cell's max/min ratio is compared against to choose log over linear -- see the
-# module docstring. CLAUDE.md's own measured ranges (85-260x between the fastest and slowest
-# library on one operation) are exactly the case a linear axis hides.
+# module docstring. The two-orders-of-magnitude ranges this suite routinely measures between the
+# fastest and slowest library on one operation are exactly the case a linear axis hides.
 LOG_SCALE_RATIO = 15.0
 
 # The curated documentation set. Three things pick a cell, in this order:
@@ -73,12 +73,12 @@ LOG_SCALE_RATIO = 15.0
 #    cell triwarp loses to MeshLib's serial decimator.
 #
 # **These must be rendered from a `--bench-all-libs` run.** `_known_slow_libraries.json` skips any
-# reference already measured losing by >2x and ranking third-or-worse -- a sound optimization for
-# the development loss table (it recovers 43 of the suite's 50 minutes of timed regions) and
+# reference already measured losing by more than 2x and ranking third-or-worse -- a sound
+# optimization for the development loss table (it recovers most of the suite's timed regions) and
 # exactly wrong for these charts, because the libraries it drops are the ones triwarp beats most
-# widely. Measured on round 13: the default sweep has **15** cells with three or more references
-# and triwarp leads **1**; the same suite with `--bench-all-libs` has **206** and triwarp leads
-# **140**. Rendering this list against a default sweep silently produces two-bar charts.
+# widely. Measured, the default sweep has a handful of cells with three or more references where the
+# full sweep has hundreds. Rendering this list against a default sweep silently produces two-bar
+# charts.
 HERO_CELLS: list[aggregate.CellKey] = [
     # -- wins, widest field first --------------------------------------------------------------
     ("test_proximity", "signed_distance_on_mesh", "bunny", (("sign_mode", "parity"),)),
@@ -291,8 +291,8 @@ def render_cell(
         # The right bound has to clear the *longest bar's direct label*, not just the bar. On a
         # log axis a constant multiplier reserves a constant number of decades, but the label
         # needs a constant fraction of the axis *width* -- so the headroom is computed from the
-        # cell's own decade span, or a six-library cell spanning 245x silently clips its slowest
-        # label ("658.63 m" for 658.63 ms). Widening it costs nothing: the bars are unchanged and
+        # cell's own decade span, or a wide six-library cell silently clips its slowest label
+        # ("658.63 m" for 658.63 ms). Widening it costs nothing: the bars are unchanged and
         # only whitespace grows.
         if use_log:
             ax.set_xscale("log")

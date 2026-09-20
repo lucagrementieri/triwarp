@@ -289,7 +289,7 @@ def icp(
     workspace["spare_transformed"] = wp.empty(n, dtype=wp.vec3, device=device)
 
     # Both ping-pong views built once: ``_slot`` assembles a dict, and doing that per iteration is
-    # ~1.5 us of pure Python on a loop whose whole iteration is ~95.
+    # a percent or two of pure Python on the loop.
     slots = (_slot(workspace, 0), _slot(workspace, 1))
     parity = 0
     old_cost = math.inf
@@ -344,8 +344,8 @@ def icp(
         # overwrite the last *good* result with the degenerate one (an all-zero weight sum is the
         # denominator of every centroid, so it fits a matrix of NaN). Alternating the slot leaves
         # the previous fit's buffers untouched, and ``total`` / ``transformed`` / ``cost`` are only
-        # rebound once the fit is known to be sound -- exactly what breaking before the fit used to
-        # guarantee.
+        # rebound once the fit is known to be sound, which is what breaking before the fit
+        # guarantees.
         new_total, new_transformed, new_cost, weight_sum = cast(
             tuple[wp.array[wp.mat44], wp.array[wp.vec3], float, float],
             _procrustes_into(
@@ -496,10 +496,10 @@ def _procrustes_into(
     if not need_weight_sum:
         return out_matrix, out_transformed, float(read_scalar(acc, cost_slot)), 0.0
     # Both scalars in *one* transfer when the caller wants both. Two ``read_scalar`` calls measured
-    # worse than this (1.011 against 0.950 ms on a ten-iteration fit) even though the second read
-    # rides on a drained pipeline, and one ``read_scalar`` is better than this when only the cost
-    # is wanted, because ``.numpy()`` allocates a host array where ``read_scalar`` reuses a cached
-    # scratch. Hence the flag rather than one spelling for both callers.
+    # worse than this even though the second read rides on a drained pipeline, and one
+    # ``read_scalar`` is better than this when only the cost is wanted, because ``.numpy()``
+    # allocates a host array where ``read_scalar`` reuses a cached scratch. Hence the flag rather
+    # than one spelling for both callers.
     acc_np = acc.numpy()
     return (
         out_matrix,
@@ -678,15 +678,15 @@ def icp_point_to_plane(
     total = wp.clone(initial_matrix)
 
     # The per-iteration maps are hoisted to their kernels. A cached ``wp.map`` call still resolves
-    # its op and input signature in Python on every call -- measured 23.7-24.8 us against 12.6-13.2
-    # for the launch it wraps -- so two of them is ~21 us of a ~200 us iteration. End to end that
-    # is 1.02-1.06x at 3 000 source points and 3 or 10 iterations, which is small and free.
+    # its op and input signature in Python on every call -- roughly twice the launch it wraps -- so
+    # two of them is a few percent of an iteration. Small and free.
     #
     # Measure this kind of change with ``threshold=0.0``, or the reading is fiction: with the
-    # convergence break live the two arms stop at *different* iterations and the ratio reported
-    # 1.86x, none of which was the hoist. The plateau is also not bit-reproducible -- the
-    # point-to-plane normal equations are accumulated with ``float32`` atomics, so two runs of the
-    # identical build disagree in the last digits once the cost stops moving.
+    # convergence break live the two arms stop at *different* iterations, which inflated the
+    # reported ratio by more than an order of magnitude over the real effect. The plateau is also
+    # not bit-reproducible -- the point-to-plane normal equations are accumulated with ``float32``
+    # atomics, so two runs of the identical build disagree in the last digits once the cost stops
+    # moving.
     #
     # ``residual_valid`` is built on first use rather than here because the buffers it maps over
     # come back from ``_correspondences``, whose mesh and cloud branches return different arrays;
@@ -792,7 +792,7 @@ def icp_point_to_plane(
         # ``read_scalar`` calls, which is the one shape that helper does not cover (it returns a
         # single element). ``cost`` is the *post-accumulate* cost the convergence test below needs
         # and this launch is what wrote it, so reading it here rather than at the end of the
-        # iteration reads the identical value. Measured 1.052-1.065x on a 10-iteration fit.
+        # iteration reads the identical value.
         scalars = scalar_acc.numpy()
         if float(scalars[kernel_registration.ICP_WEIGHT_SUM]) <= 0.0:
             break

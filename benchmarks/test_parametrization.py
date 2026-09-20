@@ -1,74 +1,56 @@
 """
 Benchmarks for ``triwarp.parametrization``.
 
-Two axes, because these solvers have two independent cost drivers and mesh size is neither of
-them outright:
+Two axes, because these solvers have two independent cost drivers and mesh size is neither outright:
 
-* **patch** -- ``saddle_small`` / ``saddle`` / ``hemisphere``, the disk-topology inputs these
-  solvers are actually for, flat and curved, spanning 8 978 to 41 088 faces. This is the size
-  sweep, restricted to meshes that *have* a single boundary loop to pin.
-* **quality** -- ``saddle`` against ``saddle_graded``. Same vertices, same faces, same boundary,
-  same everything except the spacing along one axis, which pushes the worst triangle aspect ratio
-  from 1.6 to 4 719. Cotangent weights go large and the free-block condition number goes with them,
-  so the conjugate-gradient iteration count moves while nothing else does. That is the cleanest
-  available measurement of conditioning cost, and it is invisible to any face-count sweep.
+* **patch** — ``saddle_small`` / ``saddle`` / ``hemisphere``, the disk-topology inputs these solvers
+  are actually for, flat and curved. This is the size sweep, restricted to meshes that *have* a
+  single boundary loop to pin.
+* **quality** — ``saddle`` against ``saddle_graded``: same vertices, faces and boundary, differing
+  only in the spacing along one axis, which pushes the worst aspect ratio from 1.6 to 4 719.
+  Cotangent weights go large and the free-block condition number with them, so the CG iteration
+  count moves while nothing else does. That is the cleanest available measurement of conditioning
+  cost, and it is invisible to any face-count sweep.
 
-Setup that is *not* part of the measured operation is precomputed and cached: the boundary loop,
-its circle map, and the harmonic warm start ARAP iterates from. What remains inside the timed
-callable is what the function itself does -- operator assembly plus the CG solve -- because that is
-what the batched-CG work targets.
-
-``harmonic`` / ``lscm`` / ``arap`` solve with ``warp.optim.linear.cg``, which returned NaN on the
-Warp CPU backend through 1.15 and made the ``triwarp-cpu`` variant unrunnable. It converges there
-now, so those rows are timed rather than skipped -- CPU CG is correct, not fast, and the ratio is
-the point.
+Setup that is *not* part of the measured operation is precomputed and cached: the boundary loop, its
+circle map, and the harmonic warm start ARAP iterates from. What stays inside the timed callable is
+operator assembly plus the CG solve, because that is what the batched-CG work targets.
 
 References
 ----------
-**libigl** now runs on every mesh in both axes, which it did not on the previous mesh set. It goes
-through a direct LDLT factorization of the cotangent system, and that failed outright on the
-scanned registry meshes (``RuntimeError: Failed to compute harmonic map`` / ``igl::lscm failed``):
-they are not disk topology and their cotangent Laplacian is not positive definite on the free set.
-The patch and quality meshes are disk topology by construction, so the comparison is drawn on
-exactly the meshes triwarp is measured on rather than on a small subset. This also makes the
-quality axis a genuine A/B between an iterative and a direct solver: CG pays for conditioning in
-iterations, LDLT pays for it in fill-in, and they do not have to move together.
+**libigl** runs on every mesh in both axes. It goes through a direct LDLT factorization of the
+cotangent system, which fails outright on the scanned registry meshes (``Failed to compute harmonic
+map`` / ``igl::lscm failed``): they are not disk topology and their cotangent Laplacian is not
+positive definite on the free set. The patch and quality meshes are disk topology by construction,
+so the comparison is drawn on exactly the meshes triwarp is measured on. That also makes the quality
+axis a genuine A/B between an iterative and a direct solver: CG pays for conditioning in iterations,
+LDLT in fill-in, and they need not move together.
 
-``rim_long`` is deliberately **not** used here. It is an annulus, and pinning only one of its rims
-leaves ARAP free to fold: triwarp returns 32 767 flipped faces out of 131 072, disagrees with
-libigl by 0.35 regardless of CG tolerance (the two land on different local minima of a non-convex
-energy), and burns 8 200 CG iterations per solve on the resulting near-singular system. Timing
-that measures a pathology, not the algorithm.
+``rim_long`` is deliberately **not** used. It is an annulus, and pinning only one of its rims leaves
+ARAP free to fold: triwarp returns 32 767 flipped faces out of 131 072, disagrees with libigl by
+0.35 regardless of CG tolerance (the two land on different local minima of a non-convex energy), and
+burns 8 200 CG iterations per solve on the resulting near-singular system. Timing that measures a
+pathology, not the algorithm.
 
-**open3d** has no mesh parametrization at all -- no harmonic map, no LSCM, no ARAP, and no
-boundary circle map.
-
-**pymeshlab** covers ``harmonic`` and ``lscm``, and its own filter descriptions say why it is a
-*second* reference rather than a third implementation: both
-``compute_texcoord_parametrization_harmonic`` and
-``compute_texcoord_parametrization_least_squares_conformal_maps`` state that they use "the original
-code provided in the libigl library". So they wrap the same solver the ``igl`` rows call directly,
-and the gap between the two is MeshLab's own boundary detection, attribute plumbing and MeshSet
-build rather than a different algorithm. That is worth having -- it prices what a *library wrapper*
-adds over the bare call -- but it is not independent evidence, and it should not be read as such.
+**open3d** has no mesh parametrization at all. **pymeshlab** covers ``harmonic`` and ``lscm``, and
+its own filter descriptions say why it is a *second* reference rather than a third implementation:
+both state that they use "the original code provided in the libigl library". So they wrap the solver
+the ``igl`` rows call directly, and the gap between them is MeshLab's boundary detection, attribute
+plumbing and MeshSet build rather than a different algorithm. Worth having — it prices what a
+*library wrapper* adds over the bare call — but not independent evidence, and it should not be read
+as such.
 
 **Its ``harm_function`` parameter is documented as triwarp's ``k`` (1 harmonic, 2 biharmonic) and is
-a no-op in pymeshlab 2025.7.** Measured on ``saddle_small``: ``harm_function=1``, ``2`` and ``3``
-return **bit-identical** texture coordinates (max deviation exactly 0.0), and identical timings
-(94.4 / 92.7 ms on ``hemisphere``) where libigl's own ``k=2`` costs 4.3x its ``k=1``. So the
-harmonic order axis does not map, and the pymeshlab row appears at ``k=1`` only. Do not re-derive
-this: a row that tracked triwarp's ``k=2`` here would be silently reporting the ``k=1`` solve.
+a no-op in pymeshlab 2025.7**: ``harm_function=1``, ``2`` and ``3`` return **bit-identical** texture
+coordinates at identical cost, where libigl's own ``k=2`` costs several times its ``k=1``. So the
+harmonic order axis does not map and the pymeshlab row appears at ``k=1`` only. A row tracking
+triwarp's ``k=2`` would be silently reporting the ``k=1`` solve.
 
 LSCM takes no parameters at all: MeshLab pins the boundary condition itself rather than accepting a
-pin set, so unlike triwarp's two-pin call there is nothing to match there.
-
-**It rejects closed meshes outright**, with ``PyMeshLabException: Harmonic Parametrization can be
-applied only on meshes ...`` -- a boundary loop is required. Both axes here are disk-topology by
-construction, so that is a documented hazard rather than a skip, but it is the reason a pymeshlab
-parametrization row can never move to the scan sweep or the ``scale`` axis.
-
-Both filters rewrite the per-vertex texture coordinates, so the MeshSet is rebuilt per round; on the
-``patch`` axis the build is 2-5 ms against rows of 18-335 ms.
+pin set, so unlike triwarp's two-pin call there is nothing to match. And **it rejects closed meshes
+outright** — a boundary loop is required — which is why a pymeshlab parametrization row can never
+move to the scan sweep or the ``scale`` axis. Both filters rewrite the per-vertex texture
+coordinates, so the MeshSet is rebuilt per round; on the ``patch`` axis that build is a small share.
 """
 
 from __future__ import annotations

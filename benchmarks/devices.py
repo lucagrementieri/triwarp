@@ -6,13 +6,12 @@ CPU pass is spawned with ``CUDA_VISIBLE_DEVICES=""``. The variable is the whole 
 work costs more once CUDA has been initialised in the process**, and the charge behaves like a
 per-launch one, so the factor scales with launch count rather than with work:
 
-- a few big kernels -- ``edges_unique`` on ``bunny_decimated``, **11.22 ms** against **8.76 ms**
-  hidden (1.28x; its three siblings 1.40-1.41x);
-- an iterative solver -- ``heat_signed_distance``, **50.57 s** against **1.40 s** on one call, and
-  ``tests/test_heat_signed.py --device=cpu`` **166.77 s** against **8.53 s** (19.6x).
+- a few big kernels -- ``edges_unique`` barely notices, a few tens of percent;
+- an iterative solver pays more than an order of magnitude, and so does a whole test module built
+  on one.
 
-Unchanged by ``warp.config.launch_array_access_mode`` (``RELAXED`` 50.34 s, ``CHECKED`` 49.77 s on
-the solver), so it is CUDA presence and not CLAUDE.md section 3.9's launch guard. Either way a
+Unchanged by ``warp.config.launch_array_access_mode``, so it is CUDA presence and not CLAUDE.md
+section 3.9's launch guard. Either way a
 ``triwarp-cpu`` row taken in a CUDA-initialised process is not a slow number, it is a **wrong** one,
 and it reads as triwarp losing to CPU references it actually beats. ``benchmarks/conftest.py`` warns
 when that configuration is selected; this script is the way to avoid it.

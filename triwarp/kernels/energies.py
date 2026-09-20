@@ -94,22 +94,14 @@ def cot_row_scales(
     # tree.** The other three are ``linalg._multigrid_levels`` (through ``wps.bsr_get_diag``),
     # ``reconstruction.poisson_level_setup`` and
     # ``algorithms/conjugate_gradient.scaled_diagonal_apply``. The single-source-of-truth argument
-    # for routing this one through ``wps.bsr_get_diag`` too is real; it was measured and declined.
-    # Interleaved A/B in one session on an RTX 5090, ``wps.bsr_get_diag(operator)`` plus a
-    # two-output ``wp.map`` against this launch, min of three alternating pairs:
-    #
-    #   n              162      642      2 562    10 242
-    #   row walk       0.0183   0.0161   0.0164   0.0164  ms
-    #   builtin + map  0.1131   0.1046   0.1035   0.1045  ms   -> 6.2x / 6.5x / 6.3x / 6.4x slower
-    #
-    # ~0.09 ms flat, from an allocation and two launches against one, on a function
-    # ``energies.laplacian_smoothing_loss`` calls once. The values agree **exactly** at every size
-    # (``np.allclose`` on both outputs), which also settles the one substantive worry: the walk
-    # assumes the diagonal is *present* in the pattern, and it is not load-bearing -- an absent
-    # diagonal leaves ``diagonal`` at zero and takes the same undefined-averaging fallback that
-    # ``bsr_get_diag``'s own zero would. So the walk costs ~6 cached loads instead of 1 and buys a
-    # launch; ``bsr_get_diag`` remains the right spelling wherever the diagonal is wanted as an
-    # *array*, which is what ``linalg`` wants and this kernel does not.
+    # for routing this one through ``wps.bsr_get_diag`` too is real; it was measured and declined,
+    # at several times this launch's cost, flat in the system size -- an allocation and two launches
+    # against one, on a function ``energies.laplacian_smoothing_loss`` calls once. The values agree
+    # **exactly**, which also settles the one substantive worry: the walk assumes the diagonal is
+    # *present* in the pattern, and that is not load-bearing -- an absent diagonal leaves
+    # ``diagonal`` at zero and takes the same undefined-averaging fallback ``bsr_get_diag``'s own
+    # zero would. So the walk costs a handful of cached loads instead of one and buys a launch;
+    # ``bsr_get_diag`` remains the right spelling wherever the diagonal is wanted as an *array*.
     i = wp.int32(wp.tid())
     diagonal = wp.float32(0.0)
     for slot in range(offsets[i], offsets[i + 1]):
@@ -769,9 +761,9 @@ def _register_overloads() -> None:
     # ``cot_entries`` and the matrix precision are *independent* templates:
     # ``crouzeix_raviart_cotmatrix`` takes ``cot_entries`` as ``twt.Array2dFloat`` beside a
     # separate ``dtype`` keyword, and the kernel casts the entries to the matrix precision, so
-    # this is a genuine 2x2 rather than a diagonal. Measured on Warp 1.17 before the second row
-    # existed: the first float64-entries/float32-matrix launch recompiled this whole module and
-    # took 80.3 s and returned the right answer -- the silent cost CLAUDE.md section 2.5 names.
+    # this is a genuine 2x2 rather than a diagonal. Registering only the diagonal made the first
+    # float64-entries/float32-matrix launch recompile this whole module, taking over a minute and
+    # returning the right answer -- the silent cost CLAUDE.md section 2.5 names.
     CROUZEIX_RAVIART_COTMATRIX_TRIPLETS = OverloadTable(
         crouzeix_raviart_cotmatrix_triplets,
         {

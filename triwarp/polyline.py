@@ -3,9 +3,7 @@ Open and closed 3D polyline operations.
 
 **The ``polyline_`` prefix.** Where a name carries the module's own token, the token comes
 **first** -- ``polyline_length``, ``polyline_open``, ``polyline_resample``,
-``polyline_triangulate`` -- so the whole family sorts and completes together. The measures used to
-take the prefix while the operations took it as a suffix, which put one convention in two places
-for no reason.
+``polyline_triangulate`` -- so the whole family sorts and completes together.
 
 A function that does *not* need the token does not gain one:
 [`is_closed`][triwarp.polyline.is_closed] and
@@ -91,9 +89,8 @@ def is_closed(polyline: wp.array[wp.vec3]) -> bool:
     if n < 2:
         return False
     # One launch rather than ``allclose`` over two one-element slices: that spelling is a
-    # ``wp.map`` into a mask plus a whole reduction over it, and it measured **0.118 ms to compare
-    # six floats** -- nine times what cloning the entire polyline costs. See
-    # ``kernels/polyline.endpoints_coincide``.
+    # ``wp.map`` into a mask plus a whole reduction over it, which costs several times what cloning
+    # the entire polyline does, to compare six floats. See ``kernels/polyline.endpoints_coincide``.
     flag = wp.empty(1, dtype=wp.int32, device=polyline.device)
     wp.launch(
         kernel_polyline.endpoints_coincide,
@@ -627,6 +624,7 @@ def polyline_simplify(
     polyline: wp.array[wp.vec3], tol: float, *, closed: bool = False
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
+
     Simplify a polyline with the Ramer-Douglas-Peucker algorithm.
 
     Drops interior vertices whose perpendicular distance to the chord spanning a kept sub-range is
@@ -636,6 +634,7 @@ def polyline_simplify(
     boundary loop) rather than one thread's walk of the whole tree. The accepted set is identical
     either way, since breadth-first and depth-first evaluation of the same recursion accept the
     same points.
+
 
     Parameters
     ----------
@@ -664,8 +663,7 @@ def polyline_simplify(
     many levels the split tree has, the loop itself costs one graph launch and no readback. The one
     host synchronisation in the call is the compaction that follows it, where
     [`flatnonzero`][triwarp.array.flatnonzero] reads back the kept count in order to size
-    ``indices``. The accepted index set is identical to a single-thread recursive evaluation of the
-    same recursion, since breadth-first and depth-first evaluation accept the same points.
+    ``indices``.
 
     **The depth is bounded by the accepted count, not by ``n``, and that is why there is no round
     cap and no serial fallback here.** Every root-to-leaf path of the split tree accepts one point
@@ -674,13 +672,13 @@ def polyline_simplify(
     its *turn count* rather than ``n``, while a power curve, a geometric staircase and a decaying
     sawtooth are all shallower than a boundary loop.
 
-    This is deliberately **one algorithm on both devices, with no serial fallback and no
-    host-driven loop for small inputs**: the fixed cost of graph capture, the keep-mask compaction
-    and the round loop itself all scale with the tree depth rather than with ``n``, so a size-gated
-    fallback would add a second implementation (and the test that its accepted set agrees with this
-    one's) without a reliable win. On the CPU backend a ``dim=n`` launch runs as a single lane, so
-    each round costs ``O(n)`` sequential work rather than the host's ``O(n log n)`` recursive total
-    -- the device is the target, so this is recorded rather than branched on.
+    This is deliberately **one algorithm on both devices, with no serial fallback and no host-driven
+    loop for small inputs**: the fixed cost of graph capture, the keep-mask compaction and the round
+    loop itself all scale with the tree depth rather than with ``n``, so a size-gated fallback would
+    add a second implementation (and the test that its accepted set agrees with this one's) without
+    a reliable win. On the CPU backend a ``dim=n`` launch runs as a single lane, so each round costs
+    ``O(n)`` sequential work rather than the host's ``O(n log n)`` recursive total -- the device is
+    the target, so this is recorded rather than branched on.
 
     See Also
     --------
@@ -956,9 +954,8 @@ def polyline_angles(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.
         # cyclic successor, which is the turning angle at vertex ``i + 1`` (mod ``n_segments``),
         # not at vertex ``i``. So ``raw`` is the answer rotated one slot ahead of the vertex it
         # belongs to; roll it back by one (last element first) to index it by vertex instead of by
-        # segment, then repeat the first (rolled) entry for the duplicated closing point, the same
-        # way the un-rotated form used to repeat ``raw[0]``. The open branch below already applies
-        # the equivalent shift by prepending a zero.
+        # segment, then repeat the first (rolled) entry for the duplicated closing point. The open
+        # branch below already applies the equivalent shift by prepending a zero.
         last = raw[n_segments - 1 : n_segments]
         return tw.array.concatenate([last, raw[0 : n_segments - 1], last])
     zero = wp.zeros(1, dtype=wp.float32, device=device)
@@ -970,24 +967,24 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     Triangulate the simple planar polygon bounded by a closed 3D polyline (ear clipping).
 
     The polyline is treated as the boundary of a simple polygon, which is filled with triangles
-    whose vertices are the polyline vertices themselves — no new (Steiner) points are introduced.
-    A simple ``n``-gon yields ``n - 2`` non-overlapping triangles that cover the polygon. The loop
-    is first projected onto its best-fit plane (via
-    [`polyline_normal`][triwarp.polyline.polyline_normal]) so any planar loop works, not only
-    ones lying in the ``xy`` plane.
+    whose vertices are the polyline vertices themselves -- no new (Steiner) points are introduced. A
+    simple ``n``-gon yields ``n - 2`` non-overlapping triangles that cover the polygon. The loop is
+    first projected onto its best-fit plane (via
+    [`polyline_normal`][triwarp.polyline.polyline_normal]) so any planar loop works, not only ones
+    lying in the ``xy`` plane.
 
     The implementation is a GPU-parallel port of ``ear_clipping.cpp`` from libigl: convex polygons
     use a single fan, while non-convex polygons clip a maximal independent set of ears per round
     until the polygon is exhausted. Returned faces are consistently wound counter-clockwise with
-    respect to the loop's turning direction; the exact set of triangles may differ from a
-    sequential ear clip, but every triangulation of a simple polygon has ``n - 2`` faces.
+    respect to the loop's turning direction; the exact set of triangles may differ from a sequential
+    ear clip, but every triangulation of a simple polygon has ``n - 2`` faces.
 
     Every launch in the round loop is ``dim=n``, so the cost is set by the **round count**, and the
     round count by how many ears the independent-set rule can retire at once. Competing ears are
     ranked by a bijective hash of their ring index rather than by the index itself, which is what
     keeps that logarithmic: under the raw index an alternating star lets the ear at ``i - 2``
     suppress the ear at ``i`` for every ``i``, so one ear is clipped per round and the loop runs its
-    full ``n``-round cap, where the hash keeps the round count near ``log2(n)``.
+    full ``n``-round cap.
 
     Parameters
     ----------
@@ -1005,25 +1002,23 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     Notes
     -----
     The round loop runs **on device**, driven by ``wp.capture_while`` over a device-side condition
-    exactly as the level loops elsewhere in this package drive theirs, so the whole clip costs
-    one graph launch and one readback (the final face count) rather than a readback per round.
+    exactly as the level loops elsewhere in this package drive theirs, so the whole clip costs one
+    graph launch and one readback (the final face count) rather than a readback per round.
 
     **The prologue is fused.** The plane frame
     ([`polyline_normal`][triwarp.polyline.polyline_normal], its internal
     [`polyline_close`][triwarp.polyline.polyline_close] closure test, and
     [`polyline_centroid`][triwarp.polyline.polyline_centroid]) is built as one accumulation pass,
-    one single-thread finalize and one projection, living in device memory and never crossing to
-    the host -- rather than as three separate host-scope reductions each ending in its own
-    readback. Three readbacks are left in the whole function, every one of them structural:
-    ``polyline_open``'s [`is_closed`][triwarp.polyline.is_closed], which decides ``n`` and
-    therefore every launch dimension; the reflex count that selects the convex fan fast path, which
-    is the last one a convex loop pays; and the face count above, which sizes the returned slice.
+    one single-thread finalize and one projection, living in device memory and never crossing to the
+    host. Three readbacks are left in the whole function, every one of them structural:
+    ``polyline_open``'s [`is_closed`][triwarp.polyline.is_closed], which decides ``n`` and therefore
+    every launch dimension; the reflex count that selects the convex fan fast path, which is the
+    last one a convex loop pays; and the face count above, which sizes the returned slice.
 
     When conditional graph nodes are unavailable (CPU, or a CUDA driver below 12.4)
-    ``wp.capture_while`` executes the same loop directly with one pinned 4-byte readback per round,
-    which is the behaviour this loop had throughout. Verified equal: the CPU fallback and the
-    captured CUDA loop produce the same triangulation up to row order on a 64-point star, and that
-    row order was never stable on CUDA either — ``clip_selected`` appends through an atomic.
+    ``wp.capture_while`` executes the same loop directly with one pinned 4-byte readback per round.
+    The CPU fallback and the captured CUDA loop produce the same triangulation up to row order, and
+    that row order was never stable on CUDA either -- ``clip_selected`` appends through an atomic.
 
     See Also
     --------

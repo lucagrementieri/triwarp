@@ -429,47 +429,25 @@ def face_self_intersecting_mask(
     Broad phase builds a ``warp.Mesh`` and queries each triangle's AABB for candidate overlaps;
     narrow phase runs Moller's interval test on each candidate pair (skipping pairs that share a
     vertex), and both faces of every intersecting pair are flagged.
-    [`is_self_intersecting`][triwarp.validation.is_self_intersecting] is ``True`` iff any entry
-    of this mask is ``True``.
+    [`is_self_intersecting`][triwarp.validation.is_self_intersecting] is ``True`` iff any entry of
+    this mask is ``True``. A pair that is coplanar, or that touches without crossing, is not an
+    intersection.
 
-    A pair that is coplanar, or that touches without crossing, is not an intersection.
+    **The narrow phase runs in ``float64`` on the ``float32`` vertices**, and it is load-bearing
+    rather than caution. Widening is lossless, so the geometry is unchanged; what the precision buys
+    is the decisions -- the sign of a plane distance and the overlap of two intervals. Audited face
+    for face against an independent ``float64`` Moller implementation over seven self-intersecting
+    surfaces, it is exact on five, and on the other two it matches a second library and differs from
+    the reference by at most four faces, every one of them a vertex lying *on* the other triangle's
+    plane -- a tolerance choice rather than a fact. In ``float32`` the same audit read dozens of
+    false positives and false negatives on one surface alone. It costs a few percent of the call.
 
-    **The narrow phase runs in ``float64`` on the ``float32`` vertices**, and the reason is worth
-    knowing rather than taking as caution: widening is lossless, so the geometry is unchanged, and
-    what the precision buys is the decisions -- the sign of a plane distance and the overlap of two
-    intervals. Audited face for face against an independent ``float64`` Moller implementation over
-    the six self-intersecting parametric surfaces plus a self-intersecting torus, at a
-    scale-relative tolerance of ``1e-9``:
-
-    | input | reference | this | second library | pymeshfix |
-    |---|---|---|---|---|
-    | ``boy`` | 177 | **177** | 177 | 436 (cut) |
-    | ``klein`` | 203 | **203** | 203 | **203** |
-    | ``bohemian_dome`` | 161 | **161** | 161, 1 wrong either way | 168 |
-    | ``figure8_klein`` | 174 | **174** | 190, 16 wrong | 336 (cut) |
-    | ``torus`` (16x16) | 64 | **64** | 64 | **64** |
-    | ``cross_cap`` | 73 | 74 | 74 | 336 (cut) |
-    | ``roman`` | 154 | 158 | 158 | 514 (cut) |
-
-    Exact on five of seven, and identical to the second library on the other two -- where both
-    differ from the reference by 4 faces or fewer, all of them a vertex lying *on* the other
-    triangle's plane, which is a tolerance choice rather than a fact. In ``float32`` the same audit
-    read 20 false positives and 88 false negatives on ``roman`` alone, 2 and 4 on the torus, and 1
-    false negative on the dome. The cost is ~4 % of this call (the narrow phase is 6-8 % of it and
-    doubles).
-
-    The pymeshfix column is the newest and it reads two ways at once. Where it analyses the mesh it
-    was handed, it agrees **exactly** -- 203 on ``klein``, 64 on the torus -- and on the tangency
-    class it lands 7 faces away, the same order as every other implementation. The four rows marked
-    *(cut)* are not disagreements: its loader repairs connectivity before anything else and cuts the
-    orientation-reversing seam of a non-orientable surface, taking ``boy`` from 1 483 to 1 559
-    vertices at an unchanged 2 964 faces. That leaves two coincident sheets where the surface had
-    one, and every face along the cut then genuinely does intersect. So a comparison against it has
-    to establish that the load changed nothing before it means anything.
-
-    Where a comparison against another library is wanted on the singular-curve class (``roman``,
-    ``cross_cap``), compare **counts, not sets**: which faces sit exactly on a tangency is the part
-    no two implementations agree on.
+    Where a comparison against another library is wanted on that tangency class, compare **counts,
+    not sets**: which faces sit exactly on a tangency is the part no two implementations agree on.
+    And a library whose loader repairs connectivity first may cut the orientation-reversing seam of
+    a non-orientable surface, leaving two coincident sheets where the surface had one -- after which
+    every face along the cut genuinely does intersect. Establish that the load changed nothing
+    before reading such a comparison.
 
     Parameters
     ----------

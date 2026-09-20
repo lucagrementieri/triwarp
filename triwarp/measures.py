@@ -268,9 +268,9 @@ def moments(
 
 # Blocks to aim for in ``moment_integrals``' grid. Below it the chunk stays one tile wide, so the
 # device fills; above it the chunk doubles instead, so the ten contended ``float64`` accumulator
-# slots do not collect an atomic from every one of tens of thousands of blocks. 1 280 is where the
-# measured table at the kernel crosses over -- it is the block count a 64-face chunk gives at
-# 81 920 faces, the size at which a wider chunk first stops losing.
+# slots do not collect an atomic from every one of tens of thousands of blocks. This is where the
+# measured table at the kernel crosses over -- the block count at which a wider chunk first stops
+# losing.
 _MOMENT_TARGET_BLOCKS = 1280
 # Widest chunk worth using: past this the grid stops filling the device before contention is the
 # problem, and the measured table is flat from here on.

@@ -81,23 +81,18 @@ def hash_slot(key: wp.Int, mask: wp.int32) -> wp.int32:
     # above. ``mask`` keeps the *low* bits, and the low bits of a multiplicative hash depend on
     # nothing but the key's low bits -- the multiplier is odd, so ``key * M mod 2^p`` is a
     # bijection of ``key mod 2^p`` and every higher bit of the key is discarded. Any key family
-    # holding its entropy above bit ``p`` then collapses onto a handful of probe chains. Measured
-    # on ``unique_rows`` over an axis-aligned 131k-point grid, whose ``pack_vec3`` keys carry the
-    # x bucket in the low 21 bits and y/z above them: 181 distinct start slots and **3959** average
-    # probes per insert (worst chain 49186) against 1.47 with the fold, and 6.57 -> 1.50 on a
-    # random cloud. End to end on ``unique_rows``, min-of-7 with the two builds alternated in
-    # separate processes: 8.62 -> 0.56 ms on a 125k-point grid on cuda:0 (**15.3x**) and 5.84 ->
-    # 2.46 / 77.5 -> 13.5 ms at 22.5k / 122.5k grid points on cpu (2.4-5.7x). A *random* cloud is
-    # flat either way (0.40 -> 0.38 ms, within noise), which is the point: the fold costs nothing
-    # and only the structured key families were paying.
+    # holding its entropy above bit ``p`` then collapses onto a handful of probe chains: on an
+    # axis-aligned grid, whose ``pack_vec3`` keys carry the x bucket in the low bits and y/z above
+    # them, that is thousands of probes per insert against the fold's ~1.5, and an order of
+    # magnitude end to end on ``unique_rows``. A *random* cloud is flat either way, which is the
+    # point: the fold costs nothing and only the structured key families were paying.
     #
     # Probe count only -- no caller depends on the mapping: ``_unique_hash`` sorts the compacted
     # keys afterwards, ``bfs_visited_insert`` uses the table as a set, and ``remesh``'s claim locks
     # re-read the slot they wrote. A hash that mixes the high bits cannot also be a bijection on
     # the low ones, so this gives up the old form's accidental collision-free behaviour on *dense
-    # consecutive* keys (1.00 probes at ``bfs_visited_insert``'s 75% load against 1.52 here) to
-    # stop degrading on every other family -- that same advantage was already gone at 2.50 probes
-    # once the ids were merely strided.
+    # consecutive* keys to stop degrading on every other family -- and that advantage was already
+    # gone once the ids were merely strided.
     h = h ^ (h >> HASH_FOLD_SHIFT)
     return wp.int32(h & wp.uint64(mask))
 
@@ -194,8 +189,8 @@ def hash_insert(
     # `out_occupied` is a zero-filled 0/1 array, the dtype `wp.utils.array_scan` wants, so the scan
     # of it gives the compaction's write positions directly. Every thread landing in a slot stores
     # the same 1, which is why the unsynchronized store is benign; writing it here rather than in a
-    # second pass over the whole `mask + 2` table saves that pass -- measured 30 us of a 313 us
-    # `unique_1d(100k)`, where the table is 2.6x the input.
+    # second pass over the whole `mask + 2` table saves that pass, which is a real share of
+    # ``unique_1d`` since the table is several times the input.
     i = wp.int32(wp.tid())
     key = data[i]
     slot = mask + 1
@@ -221,8 +216,8 @@ def compact_from_table(
     # ``n_unique`` outright.
     #
     # ``out_perm`` is the identity permutation the radix sort pairs with the keys. Writing it here
-    # replaces an ``arange`` launch of its own, measured at 30 us -- as much as the sort it feeds.
-    # Only the leading ``n_unique`` entries are written; the rest of the buffer is the sort's
+    # replaces an ``arange`` launch of its own, which cost about as much as the sort it feeds. Only
+    # the leading ``n_unique`` entries are written; the rest of the buffer is the sort's
     # double-buffer scratch, which it fills before reading.
     h = wp.int32(wp.tid())
     if occupied[h] == wp.int32(1):
@@ -319,7 +314,7 @@ def round_vec3_scaled(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 2.5. Measured over the suite: 7 overloads created across **9** module loads.
+# CLAUDE.md section 2.5.
 #
 # These take the caller's *key* dtype, and the two sets differ because the two call paths do.
 # ``mark_group_starts`` is reached from ``grouping.group``, which widens through
@@ -334,11 +329,8 @@ _TABLE_DTYPES = (wp.int32, wp.int64)
 
 
 # The concrete handles keyed by the caller's key dtype -- see
-# [`OverloadTable`][triwarp.kernels.array.OverloadTable]. Measured end to end on this module's own
-# consumers, interleaved and min-of-12 on an RTX 5090: ``unique_1d(200k, return_inverse=True)``
-# 305.0 -> 266.4 us (**1.15x**), ``unique_rows`` over an icosphere(6) edge table 612.4 -> 548.9
-# (1.12x), ``edges_unique`` 683.7 -> 647.8 (1.055x), ``group(200k, 2)`` 273.9 -> 261.6 (1.047x) --
-# roughly 12 us per generic launch removed, and this path issues two or three of them.
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable]. Worth a few percent to fifteen percent on
+# this module's own consumers, since each of them issues two or three generic launches.
 MARK_GROUP_STARTS: OverloadTable
 HASH_INSERT: OverloadTable
 COMPACT_FROM_TABLE: OverloadTable

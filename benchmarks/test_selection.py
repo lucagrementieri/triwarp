@@ -39,12 +39,11 @@ Two differences to read the rows against, neither of them correctable:
 
 The MeshSet is *shared* here rather than rebuilt per round, which is the exception to the rule in
 ``BenchCase.new_meshset_pml``: these filters touch only the selected bit, and their cost does not
-depend on how much is selected (measured flat at 0.86-1.21 ms over 120 consecutive dilatations
-carrying ``sphere_med`` from 0.9% to 86% selected). Rebuilding instead would put a 22 ms MeshSet
-build on a 1 ms filter and flatten the slope this group exists to measure. It reads
-**1.03 -> 7.45 ms** for 1 -> 8 dilatations and **1.19 -> 9.54 ms** for 1 -> 8 erosions -- slopes of
-7.3x and 8.0x, i.e. the reference confirms independently that a hop is constant work. triwarp runs
-0.061 -> 0.30 ms and 0.13 -> 0.39 ms against it, so 17x and 9x at one hop and 25x at eight.
+depend on how much is selected (measured flat over 120 consecutive dilatations carrying
+``sphere_med`` from a fraction of a percent to most of the faces selected). Rebuilding instead would
+put a MeshSet build an order of magnitude dearer than the filter on top of it and flatten the slope
+this group exists to measure. Both reference slopes are linear in the hop count, confirming
+independently that a hop is constant work; triwarp is an order of magnitude ahead throughout.
 
 trimesh's ``graph.connected_component_labels`` could reproduce
 ``exclude_fully_selected_components`` in several steps, but not as one call, so that group remains a
@@ -255,8 +254,7 @@ def test_submesh_from_face_indices(bench_case: BenchCase, unique_indices: bool) 
     sequence is the largest single slowness path the axis set has surfaced.
 
     Three references, and all three do the same two things triwarp does -- gather the faces and
-    **compact** the vertex buffer (measured: 89 of 162 vertices on a spatial half of
-    ``icosphere(2)``, from all three). So the rows are like-for-like on the work; what differs is
+    **compact** the vertex buffer. So the rows are like-for-like on the work; what differs is
     the interface, in two ways that both cost something. open3d takes a *mask* rather than an index
     list, so building one is part of its row -- an ``O(n_faces)`` scatter against triwarp's
     ``O(len(indices))`` gather. And open3d returns **no vertex map**, where triwarp's
@@ -367,13 +365,13 @@ def test_delete_region_keep_boundary(bench_case: BenchCase) -> None:
     ``tests/test_selection.py`` pins the two to the same survivor count and the same loop lengths.
     It mutates its mesh, so the row gets a fresh one per round.
 
-    First measurement, medians on an RTX 5090 at ``sphere_med``: triwarp-cuda **3.3 ms** against
-    meshlib's **0.40** -- **8.4x behind**, and attributed rather than left open. Of a 4.85 ms call,
-    ``boundary_loops`` on the survivor is **3.1 ms**, the submesh extraction 0.9, the input's rim
-    pass 0.46 and the host-side loop classification **0.04**. So the composition is not the problem
-    and neither is the host code: the loop trace is, and it is a function of its own with its own
-    group. Read this row's ratio as a statement about ``boundary_loops``. Note also a 1.7x
-    run-to-run spread measured on unchanged code here, so read medians across sessions with care.
+    An order of magnitude behind meshlib, and attributed rather than left open: ``boundary_loops``
+    on the survivor is the majority of the call, the submesh extraction and the input's rim pass
+    make up most of the rest, and the host-side loop classification is negligible. So the
+    composition is not the problem and neither is the host code: the loop trace is, and it is a
+    function of its own with its own group. Read this row's ratio as a statement about
+    ``boundary_loops``. Note also a substantial run-to-run spread on unchanged code here, so read
+    medians across sessions with care.
     """
     if bench_case.kind == "meshlib":
         _mask_wp, mask_np = _cap_region(bench_case)
@@ -435,7 +433,7 @@ def test_region_boundary_edges(bench_case: BenchCase) -> None:
 
     pyvista has no seam filter and reaches the same edges by **construction**: extract the region as
     a sub-surface, then take that surface's boundary edges. So its row is doing strictly more -- a
-    cell extraction and a surface pass before the edge walk, 6.8 ms here -- and its answer is a
+    cell extraction and a surface pass before the edge walk -- and its answer is a
     superset, since a region touching the mesh's own rim contributes those edges too. The transform
     is subtracting them, and at that it is exact (``tests/test_selection.py``).
     """
@@ -491,21 +489,18 @@ def test_faces_left_of_contour(bench_case: BenchCase) -> None:
     directed ``EdgeId`` rather than an ``(k, 2)`` array; that vector is assembled outside the timed
     callable too, since it is a Python loop over ``findEdge`` and would otherwise be the row.
 
-    First measurement, medians on an RTX 5090 at ``sphere_med`` (81 920 faces, a 320-edge contour):
-    **1.11 ms** against meshlib's **0.085**, so 13.1x behind. Two things about that number.
+    An order of magnitude behind meshlib on a mesh with a short contour. Two things about that.
 
     It is **not** a like-for-like: meshlib is handed a ``MeshTopology`` built outside its row and
     floods from the seeds with a serial BFS, while triwarp builds the halfedge structure inside its
-    row and labels *every* component before gathering. Attributed at this size --
-    ``halfedge_twins`` 0.31 ms, the fused seed-and-block pass 0.33, and
-    ``connected_component_labels_from_edges`` **0.40**, which is 55 % of the call with ``twins``
-    supplied (0.73 ms). The labelling is the algorithm, and the way to beat it would be a
-    device-side frontier BFS, which this package has measured before as a 2.2x loss.
+    row and labels *every* component before gathering. ``connected_component_labels_from_edges`` is
+    most of the call once ``twins`` is supplied: the labelling is the algorithm, and the way to beat
+    it would be a device-side frontier BFS, which this package has measured as a loss.
 
-    The first implementation was 1.49 ms and went through ``face_adjacency`` plus a separate key
-    sort over every halfedge plus a mask-compact over every dual edge. Folding the dual graph, the
-    blocking test and the seeding into one pass over ``twins`` was **1.34x** -- less than the 1.77x
-    the stage timings projected, which is the usual direction for a projection built by subtraction.
+    The dual graph, the blocking test and the seeding are one pass over ``twins`` rather than a
+    ``face_adjacency`` call plus a key sort over every halfedge plus a mask-compact over every dual
+    edge -- a real win, and less than the stage timings projected, which is the usual direction for
+    a projection built by subtraction.
     """
     region_np = _seed_face_region(bench_case)
     n_faces = bench_case.n_faces

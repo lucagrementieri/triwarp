@@ -971,8 +971,8 @@ def test_connection_laplacian_is_symmetric_psd_and_a_rotation_per_block(
     The three properties its docstring promises, and the one comparison the gauge permits.
 
     A single ``2 x 2`` block is gauge-dependent -- it re-expresses a vector in the neighbour's
-    frame, and that frame is fixed by a convention no reference library shares -- so §6 rules out
-    an element-wise oracle here (see ``test_tangent_space.py``, where the holonomy around a face is
+    frame, and that frame is fixed by a convention no reference library shares -- so §6 rules out an
+    element-wise oracle here (see ``test_tangent_space.py``, where the holonomy around a face is
     what can be compared). What is gauge-*invariant* is the block's spectral norm: the rotation is
     orthogonal, so ``‖block‖`` must be the cotangent weight itself, whatever frame it maps between.
     Measured on ``icosphere_coarse``: agreement with ``|cotmatrix|`` to 5.7e-07, exact symmetry, a
@@ -981,11 +981,9 @@ def test_connection_laplacian_is_symmetric_psd_and_a_rotation_per_block(
     The PSD clause is a dense ``np.linalg.eigvalsh`` on a ``2n x 2n`` matrix, and replacing it with
     a Cholesky of ``A + eps*I`` was measured and declined. It reports the *margin* (7.6e-02 above),
     which a factorization does not, and it is no longer expensive: with ``conftest.py`` capping
-    OpenBLAS to 8 threads the three parametrizations cost **0.43 / 0.06 / 0.01 s**, where at the
-    uncapped 48 this was the most expensive non-Poisson test in the suite on both devices (12.37 s
-    on CUDA, 32.56 s on CPU). The 1 284-square ``eigvalsh`` behind ``half_torus`` alone measured
-    2 897.9 ms at 48 threads against 59.7 ms at 8 -- the cost was the thread count, not the
-    algorithm.
+    OpenBLAS to 8 threads this stopped being the most expensive non-Poisson test in the suite on
+    either device. The ``eigvalsh`` behind ``half_torus`` alone is orders of magnitude slower at one
+    thread per core than at eight -- the cost is the thread count, not the algorithm.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = int(mesh_tm.vertices.shape[0])

@@ -2502,25 +2502,22 @@ def test_fix_self_intersections_local_clears_them(
 
     No reference does this **repair** the way this does -- MeshLib's ``localFixSelfIntersections``
     subdivides and relaxes rather than cutting and refilling, and on this very input it makes the
-    problem *worse*: measured with this file's own detector, 64 intersecting faces in and **128**
-    out, while subdividing 512 faces into 2 512, where this leaves **0**. So the *outputs* are not
-    comparable, and the claim about them is the contract: the intersecting faces are gone, the
-    result is watertight, and the surface did not run away from the input.
-
-    (That number was recorded as "281" for several rounds. It is 128 in this detector's units, and
-    the direction is the part worth keeping: MeshLib's local fixer is not a weaker version of this
-    repair, it is a different operation that does not converge on this input. It *does* clear a
-    self-intersecting torus built the other way -- see the ``tangle`` axis in
-    ``benchmarks/test_repair.py`` -- so its behaviour is fixture-dependent and neither reading
-    generalizes.)
+    problem *worse*: by this file's own detector it doubles the intersecting faces while
+    quintupling the face count, where this leaves **0**. So the *outputs* are not comparable, and
+    the claim about them is the contract: the intersecting faces are gone, the result is
+    watertight, and the surface did not run away from the input. MeshLib's local fixer is not a
+    weaker version of this repair, it is a different operation that does not converge on this
+    input -- it *does* clear a self-intersecting torus built the other way (the ``tangle`` axis in
+    ``benchmarks/test_repair.py``), so its behaviour is fixture-dependent and neither reading
+    generalizes.
 
     What *is* a library comparison is the contract's own predicate. Asserting it with
     [`face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask] alone would
     check triwarp's repair against triwarp's detector, so a shared bug in the detector passes both
     sides -- and that detector is exactly the one MeshLib and pymeshfix are already the oracles for
-    one group over. Both are therefore counted here, before and after: measured **64 / 64 / 64**
-    intersecting faces on the input and **0 / 0 / 0** after the repair, at both dilation budgets.
-    Agreement on the *input* is what makes the assertion non-vacuous -- the fixture's 64 is
+    one group over. Both are therefore counted here, before and after: all three agree on the
+    input's intersecting-face count and on zero after the repair, at both dilation budgets.
+    Agreement on the *input* is what makes the assertion non-vacuous -- the fixture's count is
     confirmed by two independent implementations rather than asserted against itself.
 
     Only meshlib is *claimed* here, because it is the pair this group times and a test may name a
@@ -2531,16 +2528,16 @@ def test_fix_self_intersections_local_clears_them(
     and is worth knowing if one of them ever fails alone. MeshLib is passed
     ``touchIsIntersection=False``, triwarp's convention; pymeshfix has no such switch and counts a
     *touching* pair, so its zero is the **stronger** statement -- and where the two conventions
-    diverge they differ by a lot rather than a little (measured elsewhere in this file: 97 of 1 054
-    faces against 0). The cut-and-refill leaves no touching pair, so they coincide here.
+    diverge they differ by a lot rather than a little (elsewhere in this file, dozens of faces
+    against zero). The cut-and-refill leaves no touching pair, so they coincide here.
 
     The Hausdorff bound is the one that stops a trivial pass: deleting the whole mesh also has no
     self-intersections. It is two-sided against the input and must stay within a fraction of the
     bounding-box diagonal -- the repair cuts a band out and refills it, so it moves the surface
     locally and nowhere else.
 
-    Both dilation budgets are run because they take different amounts of surface with them (measured
-    1 036 faces at ``max_expand=1`` and 588 at 2, from 512) and both must land clean.
+    Both dilation budgets are run because they take different amounts of surface with them, and
+    both must land clean.
     """
     mesh_tm, mesh_wp = torus_self_intersecting
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices

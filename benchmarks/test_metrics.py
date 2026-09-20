@@ -72,10 +72,9 @@ _MESHLIB_FLT_MAX = 3.4028234663852886e38
 
 
 # pytorch3d's ``_C`` carries no spatial structure on either device, so both cloud rows here are
-# Theta(N^2) and the CPU one is unaffordable past a feature mesh. Measured: ``knn_points`` 299.8 /
-# 1 189.5 / 4 562.8 ms and ``chamfer_distance`` 557.8 / 2 319.1 / 9 077.1 ms at 10 k / 20 k / 40 k
-# points -- 3.84-4.16x per doubling, so ``dragon`` at ~435 k extrapolates to ~9 minutes *per round*
-# and ``--benchmark-json`` is written at session end, which would cost the whole file's rows.
+# Theta(N^2) and the CPU one is unaffordable past a feature mesh: it quadruples per doubling, so a
+# scan mesh extrapolates to minutes *per round*, and ``--benchmark-json`` is written at session end,
+# which would cost the whole file's rows.
 
 
 def _clouds_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
@@ -159,8 +158,8 @@ def test_chamfer_points_to_points(bench_case: BenchCase, single_directional: boo
     convention this module documents -- same squared distances, same mean-of-two-directions, pinned
     at 7.02e-08 in ``tests/test_metrics.py::test_chamfer_points_to_points_matches_pytorch3d``. It
     has no spatial structure on either device, which makes this the group where its crossover is
-    sharpest: measured 3.39 ms against triwarp-cuda's 5.36 at 20 000 points (**0.63x**, a loss for
-    triwarp) and 108.12 against 1.19 at 200 000 (**90x**). Read the two rows as one curve; see the
+    sharpest: it wins at 20 000 points and loses by nearly two orders of magnitude at 200 000. Read
+    the two rows as one curve; see the
     ``LIBRARIES`` block in [`conftest.py`](conftest.py) for why half of that swing is triwarp's own
     search-radius heuristic. ``single_directional=True`` maps onto its ``single_directional=True``
     exactly, so the parametrize axis is shared rather than emulated.
@@ -278,8 +277,9 @@ def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
 
     **MeshLib's row is the forward half too**, and is the multi-threaded one -- so it is the fair
     fight of the two references. Its AABB tree is built and pre-warmed outside the timed callable,
-    because the tree is cached on the ``Mesh`` and a cold first query measures 17-68x a warm one;
-    that matches the triwarp branch, which is handed a ``wp.Mesh`` it does not rebuild. Its
+    because the tree is cached on the ``Mesh`` and a cold first query is one to two orders of
+    magnitude above a warm one; that matches the triwarp branch, which is handed a ``wp.Mesh`` it
+    does not rebuild. Its
     ``distSq`` output is exactly triwarp's ``point_reduction=None`` array, compared element-wise in
     ``tests/test_metrics.py``.
 
@@ -309,8 +309,8 @@ def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
         cloud_np = _clouds_np(bench_case)[1]
         # The tree is built lazily on the first query and cached on the Mesh, so it is built and
         # pre-warmed *outside* the timed callable -- the row then prices the query, matching what
-        # the triwarp branch does with a wp.Mesh already in hand. Timing the build instead is a
-        # 17-68x different number (CLAUDE.md section 7.6).
+        # the triwarp branch does with a wp.Mesh already in hand. Timing the build instead is one to
+        # two orders of magnitude different (CLAUDE.md section 7.6).
         mesh_ml = bench_case.new_mesh_ml()
         projector_ml = mm.PointsToMeshProjector()
         projector_ml.updateMeshData(mesh_ml)

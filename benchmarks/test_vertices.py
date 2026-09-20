@@ -4,21 +4,21 @@ Benchmarks for ``triwarp.vertices``: the vertex-normal weightings and the angle 
 Two axes, because the module has two different kinds of function:
 
 * **scan sweep** for ``n_vertices`` and ``mean_vertex_normals`` -- one pass over ``3F`` indices,
-  pure throughput, and the place ``lucy`` (28M faces) earns its keep: before the device-reduce fix
-  ``n_vertices`` copied the whole 336 MB face buffer to the host just to take a max.
+  pure throughput, and the place ``lucy`` (28M faces) earns its keep: a host-side ``n_vertices``
+  copies the whole face buffer across the bus just to take a max.
 * **valence** for everything that *accumulates* per vertex. All of these do ``3F`` atomic adds
   into ``V`` slots, so in principle a mesh with a few very-high-valence hubs serializes where a
   regular one does not. ``fan_hub`` is the extreme: identical vertex *and* face count to
   ``sphere_med``, but its cone apex and base centre have valence 40 960 against a uniform 6.
 
-``average_onto_vertices`` and ``transfer_onto_vertices`` used to live here and are now in
-[`test_interpolation.py`](test_interpolation.py), where ``triwarp.interpolation`` does; their group
-names are unchanged, since the group name is the cross-suite key every ``parity`` marker cites.
+``average_onto_vertices`` and ``transfer_onto_vertices`` live in
+[`test_interpolation.py`](test_interpolation.py), where ``triwarp.interpolation`` does, under group
+names that name *this* module — the group name is the cross-suite key every ``parity`` marker cites,
+so it does not move with the file.
 
-Measured medians (RTX 5090, ``--device=cuda``): ``vertex_normals`` 0.22 ms against
-0.39 ms, ``average_onto_vertices`` 0.1 ms against 0.2 ms. **Under 2x** -- which is the useful
-result. Two vertices absorbing 40 960 atomics each cost less than doubling, so CUDA's atomic
-aggregation is doing its job and contention is not a hot spot worth engineering around. The axis
+Across the contention axis both groups stay **under 2x** -- which is the useful result. Two vertices
+absorbing tens of thousands of atomics each cost less than doubling, so CUDA's atomic aggregation is
+doing its job and contention is not a hot spot worth engineering around. The axis
 stays because it is the only thing that would catch a regression here (a switch to
 sort-and-segment-reduce, say, would show up as a large swing), not because it currently hurts.
 
@@ -37,8 +37,8 @@ libraries.
 **pymeshlab**'s ``weightmode`` enum is what makes it useful here: ``compute_normal_per_vertex``
 implements four weighting schemes behind one filter, two of which are exactly triwarp's --
 ``'Simple Average'`` is ``mean_vertex_normals`` and ``'By Area'`` is
-``vertex_normals``, so the pair also isolates what the area weight costs on the
-reference's side (1.15 -> 1.34 ms). Both write only the vertex-normal attribute and are idempotent,
+``vertex_normals``, so the pair also isolates what the area weight costs on the reference's side.
+Both write only the vertex-normal attribute and are idempotent,
 so they run against the shared MeshSet with no build inside the timed region.
 
 **libigl** answers ``vertex_defects`` (``igl.gaussian_curvature`` is the pointwise angle defect, not
@@ -46,9 +46,9 @@ the ball-integrated measure of the same name) and **trimesh** answers it too, so
 module's only three-way one.
 
 The reference **agrees with this module's headline result independently**: across the valence axis
-it reads 1.34 against 1.22 ms for the area-weighted normals -- i.e. also flat, and if anything
-marginally *faster* on the hub mesh. Two implementations with nothing in common both saying valence
-is not a cost driver here is a stronger statement than triwarp's own under-2x spread was on its own.
+it is also flat, and if anything marginally *faster* on the hub mesh. Two implementations with
+nothing in common both saying valence is not a cost driver here is a stronger statement than
+triwarp's own under-2x spread on its own.
 """
 
 from __future__ import annotations
@@ -151,9 +151,9 @@ def test_vertex_normals(bench_case: BenchCase) -> None:
     tests/test_vertices.py::test_vertex_normals_match_pytorch3d), but it is a **memoized accessor
     on an immutable container**, so unlike every other row here the ``Meshes`` has to be built
     *inside* the timed callable -- reading it twice on a shared object prices nothing. That means
-    the row carries the container construction as well: measured on ``fan_hub``, the build is
-    0.287 ms of a 3.693 ms round on the host (**8 %**) and 0.251 of 0.746 ms on CUDA (**34 %**), so
-    read the CUDA row in particular as an upper bound on the scatter rather than as the scatter.
+    the row carries the container construction as well -- a small share on the host and about a
+    third of the round on CUDA -- so read the CUDA row in particular as an upper bound on the
+    scatter rather than as the scatter.
     """
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "pytorch3d":
@@ -194,7 +194,7 @@ def test_vertex_normals(bench_case: BenchCase) -> None:
         assert np.isfinite(result).any()
     else:
         # open3d writes the normals into the mesh, but recomputes them on every call rather than
-        # caching (measured: identical cost on the second call), so the shared mesh is reusable.
+        # caching (identical cost on the second call), so the shared mesh is reusable.
         mesh_o3d = bench_case.mesh_o3d
         result_o3d = bench_case.run(mesh_o3d.compute_vertex_normals)
         assert np.asarray(result_o3d.vertex_normals).shape == (n_vertices, 3)
@@ -227,7 +227,7 @@ def test_vertex_defects(bench_case: BenchCase) -> None:
 
     meshlib's ``mn.getNumpyGaussianCurvature`` is the batched form and the one to use: its
     per-vertex ``mm.discreteGaussianCurvature`` gives bit-identical values but needs a Python loop,
-    which measured 49-67x slower on 642 vertices and would time the loop rather than MeshLib.
+    which is orders of magnitude slower and would time the loop rather than MeshLib.
     """
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()

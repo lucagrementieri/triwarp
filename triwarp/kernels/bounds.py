@@ -61,8 +61,8 @@ def oriented_box_refine_axes(
 ) -> None:
     # One trust-region ball of perturbed frames per chain: the Super-Fibonacci sample of SO(3),
     # geodesically shrunk toward the identity (each rotation angle scaled by ``sigma / pi``),
-    # composed onto the chain's base frame in place of the host einsum + 18 KB upload the
-    # refinement loop used to pay per round. Same float64 phase math as
+    # composed onto the chain's base frame in place of the host einsum and upload the refinement
+    # loop used to pay per round. Same float64 phase math as
     # ``oriented_box_candidate_axes`` above; the last delta of every chain is the identity, which
     # re-scores the base and keeps each chain monotone.
     i = wp.int32(wp.tid())
@@ -132,7 +132,7 @@ def oriented_box_extents(
     # ``.claude/CLAUDE.md`` section 2.2 for the rule and ``kernels/visibility.py::obscurance`` for a
     # lane-parallel kernel on the other side of it. Converting this one is declined on the
     # measurement ``hull_support_extremes`` carries: the slice dimension is what fills the device,
-    # so one block per candidate frame loses 2-8x on a large cloud.
+    # so one block per candidate frame loses badly on a large cloud.
     k, j = wp.tid()
     n_points = points.shape[0]
     frame = axes[k]
@@ -318,7 +318,7 @@ def oriented_box_seed_chains(
             # the alternative to a range check on an index that reached a *global* read through two
             # conditional fills is an out-of-bounds load, and nothing downstream would report one:
             # a chain seeded from garbage simply loses the final argmin, so the answer still comes
-            # out right (measured -- disabling the pad leaves every test in the file passing).
+            # out right and no test would fail.
             box = wp.max(picked[c], 0)
             frame = axes[box]
             out_chains[c] = frame

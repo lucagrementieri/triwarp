@@ -10,16 +10,16 @@ attack. ``flatnonzero`` sweeps selectivity for the same reason -- the scan is ob
 only the scatter's output size moves.
 
 **That question has been answered and the axis was the right one: rising, steeply, and the
-per-segment overhead is not attackable.** The packing family's cost is a per-*segment* host
-constant -- 6.02 µs a ``wp.copy``, 15.06 µs a ``wp.clone``, 3.63 µs a ``wp.array`` view -- while
-the same total moved in one call costs 0.015 ms whatever its size, so the rows are flat over a
-4 000x range of bytes and linear in the segment count. The break-even against NumPy is a segment
-size of **~98 kB**, and it does not move with the count. ``_SEGMENT_COUNTS`` brackets it: ``few``
-on ``dragon`` is 2.6 MB a segment and wins 0.05-0.19x, ``many`` on ``bunny_decimated`` is 0.76 kB
-a segment and loses up to 71.89x. Both numbers are the same statement about segment size, which is
-why the loss half of that bracket is not a work item -- see ``test_concatenate`` and ``test_split``
-for the sweeps and for the levers (graph capture, a shared output buffer, raw view construction)
-that were measured and declined.
+per-segment overhead is not attackable.** The packing family's cost is a per-*segment* host constant
+-- a few microseconds a ``wp.copy``, more for a ``wp.clone``, less for a ``wp.array`` view -- while
+the same total moved in one call is flat in its size, so the rows are flat over a four-orders-of-
+magnitude range of bytes and linear in the segment count. The break-even against NumPy is a segment
+size of **about 100 kB**, and it does not move with the count. ``_SEGMENT_COUNTS`` brackets it:
+``few`` on ``dragon`` is megabytes a segment and wins by an order of magnitude, ``many`` on
+``bunny_decimated`` is under a kilobyte a segment and loses by two. Both are the same statement
+about segment size, which is why the loss half of that bracket is not a work item -- see
+``test_concatenate`` and ``test_split`` for the sweeps and for the levers (graph capture, a shared
+output buffer, raw view construction) that were measured and declined.
 
 ``sort_and_argsort`` and ``gather`` are the two primitives on the hot path of nearly every other
 module (``grouping.group``, ``adjacency.face_adjacency``, every submesh extraction), so they are
@@ -27,17 +27,14 @@ timed on mesh-derived buffers at whatever size the suite is running.
 
 References
 ----------
-**NumPy is the reference, on the same grounds ``benchmarks/test_reduce.py`` argues at length.** An
-earlier version of this paragraph said the opposite -- that "timing NumPy would generally compare a
-host implementation against a device one" -- and cited ``test_reduce.py`` as agreeing, which it does
-not: that module carries a numpy row on all ten of its groups and treats the host/device asymmetry
-as *the question* rather than as a reason not to ask it. A device primitive that hands back a Python
-value pays a launch and a readback NumPy never pays, so NumPy should win at small sizes and each row
-answers where the crossover sits.
+**NumPy is the reference, on the same grounds ``benchmarks/test_reduce.py`` argues at length.**
+The host/device asymmetry is *the question* rather than a reason not to ask it: a device primitive
+that hands back a Python value pays a launch and a readback NumPy never pays, so NumPy should win at
+small sizes and each row answers where the crossover sits.
 
-``test_reduce`` also measured the answer, and it transfers: **the split is by return type, not by
-size.** The groups here that hand back a device array (``concatenate_arrays``, ``gather``,
-``sort_and_argsort``) have no host synchronisation to pay and should track bandwidth;
+``test_reduce``'s answer transfers: **the split is by return type, not by size.** The groups here
+that hand back a device array (``concatenate_arrays``, ``gather``, ``sort_and_argsort``) have no
+host synchronisation to pay and should track bandwidth;
 ``flatnonzero`` and ``split_array`` end in a 4-byte tail readback and an ``offsets`` transfer
 respectively, so they carry the flat host cost that sets the crossover. ``pack_1d_arrays`` is the
 pair to read ``concatenate_arrays`` against: the offsets are host metadata on both sides.
@@ -154,48 +151,30 @@ def test_concatenate(bench_case: BenchCase, n_segments: int) -> None:
     """
     One buffer from many, at two segment counts with the total element count held fixed.
 
-    **triwarp charges per segment, NumPy charges per byte, and that one sentence predicts every
-    row in this group to within 5 %.** Measured on an RTX 5090, sweeping the segment size with the
-    count fixed at 256, and the count with the total fixed at ``dragon``'s 2 614 242 elements:
+    **triwarp charges per segment below the kernel threshold, NumPy charges per byte, and that
+    predicts every row here.** Under ``array.PACK_SEGMENTS_KERNEL_FROM`` the pack is one ``wp.copy``
+    per segment at a few microseconds each, so its cost is **flat over four orders of magnitude of
+    bytes** and the data movement is a percent of the row. NumPy's column is a host ``memcpy`` and
+    rises with the bytes, so the break-even is a **segment size of about 100 kB and it does not move
+    with the segment count**: ``few`` on ``dragon`` is megabytes a segment and triwarp wins by an
+    order of magnitude, ``many`` on ``bunny_decimated`` is under a kilobyte a segment.
 
-    | kB per segment | triwarp | numpy | ratio | | segments | triwarp | numpy | ratio |
-    |---|---|---|---|---|---|---|---|---|
-    | 32.8 | 1.592 ms | 0.567 | 2.81x | | 2 | 0.033 ms | 0.639 | **0.05x** |
-    | 65.5 | 1.667 | 1.115 | 1.50x | | 16 | 0.199 | 0.655 | **0.30x** |
-    | **98.3** | 1.701 | 1.837 | **0.93x** | | 64 | 0.407 | 0.665 | 0.61x |
-    | 131.1 | 1.686 | 4.666 | 0.36x | | 256 | 1.651 | 0.668 | 2.47x |
-    | 196.6 | 1.741 | 8.409 | 0.21x | | 1 024 | 6.346 | 0.734 | 8.64x |
+    Above that threshold the loop is replaced by **one segmented-copy launch** over a ``@wp.struct``
+    descriptor table, which is flat in both the segment count and the total size -- so the two
+    points of this axis straddle the dispatch as well as the NumPy crossover.
 
-    The left column is **flat over a 6x range of bytes** -- and stays flat over 4 000x, 1.46 ms
-    at 0.07 MB total and 2.42 ms at 268 MB -- because the cost is 256 ``warp.copy`` calls at
-    **6.02 µs** each. Copying the same 2 614 242 elements in *one* ``warp.copy`` is **0.015 ms**,
-    so the data movement is 1 % of the row and 99 % is per-call host cost. NumPy's column is a
-    host ``memcpy`` and rises with the bytes.
-
-    So the break-even is a **segment size of ~98 kB (~24 576 ``int32``), and it does not move with
-    the segment count** -- 1.01x at 64 segments, 0.93x at 256. Every ratio in this group is
-    ``98 kB / segment size``: the ``dragon`` ``many`` row's segments are 40.8 kB, predicting 2.40x
-    against a measured **2.47x**. That is why the axis is a segment *count* at a fixed total and why
-    the two points bracket the crossover rather than sitting on one side of it: ``few`` on
-    ``dragon`` is 2.6 MB a segment and triwarp wins it **0.09x**, ``many`` on ``bunny_decimated`` is
-    0.76 kB a segment and loses 71.89x. Both are the same statement about segment size.
-
-    **Two levers were measured and both are declined**, so this row is a floor and not a to-do.
-    Graph capture: recording the copy loop and replaying it once is **0.84-0.88x** at 256, 1 024 and
-    4 096 segments -- a loss at every count, because a pack's pointers change per call so the
-    recording is never reused; replaying an *existing* graph is 7.7-8.5x, which is the number that
-    makes capture look attractive and is unreachable here. And a segmented gather kernel is not
-    available: Warp has no array-of-arrays and a kernel cannot dereference a raw pointer.
+    **Graph capture is declined and this row is a floor for it**: recording the copy loop and
+    replaying it once is a loss at every count, because a pack's pointers change per call so the
+    recording is never reused. Replaying an *existing* graph is the several-fold win that makes
+    capture look attractive, and it is unreachable here.
 
     **pytorch3d**'s ``padded_to_packed`` is the same concatenation from the other direction: it
-    reads a dense ``(n_segments, max_size)`` block and writes the flat buffer, so it is the *only*
-    reference here that does it in one device kernel rather than per segment -- which is exactly the
-    lever the two declined ones above are not. It is not free of a cost model of its own: the padded
-    block is ``n_segments * max_size`` elements whatever the true lengths, so at ``many`` on an
-    uneven split it moves more memory than there is data, and the block is built outside the timed
-    callable because it is the input. Read the row as "what a segmented gather would cost if Warp
-    had one"; ``tests/test_array.py::test_the_packing_family_matches_pytorch3d`` pins the two forms
-    to byte equality.
+    reads a dense ``(n_segments, max_size)`` block and writes the flat buffer in one device kernel.
+    It is not free of a cost model of its own -- the padded block is ``n_segments * max_size``
+    elements whatever the true lengths, so at ``many`` on an uneven split it moves more memory than
+    there is data -- and the block is built outside the timed callable because it is the input.
+    ``tests/test_array.py::test_the_packing_family_matches_pytorch3d`` pins the two forms to byte
+    equality.
     """
     if bench_case.kind == "pytorch3d":
         segments_np = _segments_np(bench_case, n_segments)
@@ -236,12 +215,12 @@ def test_pack_1d_arrays(bench_case: BenchCase, n_segments: int) -> None:
     comparison: the offsets are host metadata on both sides, so this pair isolates the *transfer* of
     them from their computation.
 
-    The gap turns out to be **0.027 ms and flat in everything** -- the segment count, the segment
+    The gap turns out to be a constant and **flat in everything** -- the segment count, the segment
     size and the mesh -- because it is one ``warp.array(list)`` upload of at most a few hundred
     ``int32``. So this group is ``concatenate_arrays`` plus a constant, and its crossover is that
-    group's: read the cost model there, not here. At ``many`` the offsets are 1.7 % of the row
-    (1.615 against 1.585 ms on ``bunny_decimated``); at ``few`` they are 45 % (0.071 against 0.039),
-    which is the honest reading of a row that is four ``warp.copy`` calls in total.
+    group's: read the cost model there, not here. At ``many`` the offsets are a rounding error on
+    the row; at ``few`` they are nearly half of it, which is the honest reading of a row that is
+    four ``warp.copy`` calls in total.
     """
     if bench_case.kind == "numpy":
         segments_np = _segments_np(bench_case, n_segments)
@@ -278,29 +257,20 @@ def test_split(bench_case: BenchCase, n_segments: int, copy: bool) -> None:
     a copy is one ``np.copy`` per piece -- so the ``views`` / ``copies`` pair reads across both
     libraries and the ratio between the pairs is the readback triwarp cannot avoid.
 
-    **Both modes are per-segment constants, and the readback is not one of them.** Measured on an
-    RTX 5090 at 256 segments, and flat from 48 903 to 2 614 242 total elements:
+    **Both modes are per-segment constants, and the readback is not one of them** -- it is a couple
+    of percent of the ``views`` row. What the row actually prices is Python-side ``warp.array``
+    construction, and ``copies`` is that plus one allocation and one copy per piece. The crossover
+    is the same segment size ``concatenate_arrays`` measures, and the ``copies`` rows invert on the
+    group's own axis, winning at ``few``.
 
-    | stage | cost | per segment |
-    |---|---|---|
-    | ``offsets.numpy()`` readback | 0.026 ms | -- (one transfer, whatever the count) |
-    | the slice comprehension (``views``) | 0.930 | **3.63 µs** a ``warp.array`` view |
-    | the ``warp.clone`` loop (``copies``) | 3.855 | **15.06 µs** = a 10 µs alloc plus a 6 µs copy |
-
-    So the readback the docstring above blames is **2.6 % of the ``views`` row**; what the row
-    actually prices is Python-side ``warp.array`` construction, and ``copies`` is that plus one
-    allocation and one copy per piece. The crossover is the same segment size
-    ``concatenate_arrays`` measures (~98 kB), and the ``copies`` rows invert on the group's own
-    axis: ``dragon`` at ``few`` is **0.19x**, a win.
-
-    **Two levers were measured and both are declined.** Allocating **one** buffer, filling it with a
-    single ``warp.copy`` and returning disjoint views of *that* is **3.93-4.02x** at 256-4 096
-    segments -- but it is then no longer the operation NumPy's column performs (``np.copy`` per
-    piece is an independent allocation each), so it would win the row by doing less, and it would
-    silently drop half of what ``copy=True`` is documented to promise: a segment could no longer be
-    held without keeping the whole buffer alive. Building the views with a raw
-    ``warp.array(ptr=...)`` instead of ``flat[a:b]`` is **1.57-1.69x** (3.71 -> 2.19 µs a segment)
-    and is declined in ``triwarp/array.py`` at the site, with the reason.
+    **Two levers are declined.** Allocating **one** buffer, filling it with a
+    single ``warp.copy`` and returning disjoint views of *that* is several times faster -- but it is
+    then no longer the operation NumPy's column performs (``np.copy`` per piece is an independent
+    allocation each), so it would win the row by doing less, and it would silently drop half of what
+    ``copy=True`` is documented to promise: a segment could no longer be held without keeping the
+    whole buffer alive. Building the views with a raw ``warp.array(ptr=...)`` instead of
+    ``flat[a:b]`` is a smaller win and is declined in ``triwarp/array.py`` at the site, with the
+    reason.
     """
     if bench_case.kind == "numpy":
         segments_np = _segments_np(bench_case, n_segments)
@@ -392,9 +362,10 @@ def test_index_bound(bench_case: BenchCase) -> None:
     """
     A max-reduce over ``3F`` indices; the scan sweep is here for ``lucy``'s 84M of them.
 
-    Below roughly ``10 ** 3`` indices this row reports the ~340 µs wrapper floor and nothing else
+    Below roughly ``10 ** 3`` indices this row reports the wrapper floor and nothing else
     (see ``test_creation::test_box``), so the small end of the axis loses to ``faces.max()`` by up
-    to two orders of magnitude while ``lucy`` wins by 259x. Read the whole axis, not one point: the
+    to two orders of magnitude while the largest mesh wins by as much. Read the whole axis, not one
+    point: the
     crossover, not either endpoint, is what this group establishes.
     """
     if bench_case.kind == "triwarp":

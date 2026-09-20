@@ -229,8 +229,8 @@ def corner_normals(
         # ``vertices.shape[0]`` rather than ``index_bound(faces)``: this count is only the radix
         # the edge keys below are packed against, so any bound above the largest index is equally
         # correct, and a mesh with trailing unreferenced vertices simply packs against a slightly
-        # wider one. Inferring the tight bound is a device reduction plus a host readback measured
-        # at 61.5 us -- 1.21x of the whole call.
+        # wider one. Inferring the tight bound is a device reduction plus a host readback, which is
+        # a fifth of the whole call.
         n_vertices = int(vertices.shape[0])
     if twins is None:
         twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)

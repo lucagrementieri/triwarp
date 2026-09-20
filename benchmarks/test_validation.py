@@ -4,88 +4,68 @@ Benchmarks for ``triwarp.validation``: the topological predicates.
 Three axes, one per predicate family, because these functions fail to scale for three unrelated
 reasons and a face-count sweep separates none of them.
 
-* **valence** for ``is_vertex_manifold``. It solves a miniature connected-components problem in
+* **valence** for ``is_vertex_manifold``: it solves a miniature connected-components problem in
   every vertex's one-ring, so its cost is the valence *distribution*, not the vertex count.
-* **diameter** for ``face_orientation_bits``. This is the group that justified the axis. The Z2
-  orientation bits used to be *propagated* across the face-adjacency graph, one launch per level,
-  so a long strip cost O(V) rounds where a blob cost O(log V): **7.7 ms on ``sphere_med`` against
-  633 ms on ``ribbon_long``**, 82x at an identical vertex count, with the direction reversing
-  against trimesh (16.8 ms -> 7.8 ms on the same pair). Entirely invisible to the scan registry,
-  whose meshes are all compact blobs. The bits are now *solved* by a parity-carrying union-find in
-  three launches, which measures **0.92 ms and 0.77 ms** -- flat, and a win over trimesh at both
-  ends. The axis is kept because flatness here is exactly what must not regress.
-* **overlap** for ``is_watertight`` / ``is_volume``. Both compose an edge-count test with a
+* **diameter** for ``face_orientation_bits``, the group that justified the axis. *Propagating* the
+  Z2 bits across the face-adjacency graph costs one launch per level, so a long strip is O(V) rounds
+  where a blob is O(log V) — two orders of magnitude apart at identical vertex count, with the
+  direction reversing against trimesh, and entirely invisible to the scan registry, whose meshes are
+  all compact blobs. The bits are *solved* instead, by a parity-carrying union-find in three
+  launches, flat across the axis. The axis is kept because that flatness must not regress.
+* **overlap** for ``is_watertight`` / ``is_volume``: both compose an edge-count test with a
   self-intersection test over a BVH, so what matters is collision density, not size.
-
-Measured medians (RTX 5090, ``--device=cuda``)
-----------------------------------------------
-| group | ``sphere_med`` | perturbed | note |
-|---|---|---|---|
-| ``is_vertex_manifold`` | 1.9 ms | 2.0 ms (``fan_hub``) | valence is not a hot spot |
-| ``face_orientation_bits`` | 0.92 ms | 0.77 ms (``ribbon_long``) | flat (was 7.7 -> 633 ms) |
-| ``is_watertight`` | 3.7 ms | 3.5 ms (``tangle_2``) | flat; the references are not |
 
 References
 ----------
-**open3d** is the exact definitional equivalent for ``is_watertight`` -- triwarp's docstring
-defines itself against ``open3d.geometry.TriangleMesh.is_watertight`` (edge-manifold without
-boundary, plus vertex-manifold and no self-intersection). It is also, measured, **13.6 s on
-``sphere_med`` and 3.5 s on ``tangle_2``**: roughly 3 700x slower than triwarp, and *faster on the
-harder mesh*, because its self-intersection test is a brute-force scan that early-exits on the
-first hit and so pays full price only when the mesh is clean. Both points are worth having on the
-record, so open3d runs here at ``rounds=1`` rather than being dropped; that one group is about
-35 s of the suite's wall clock and it is the reason for the cap.
+**open3d** is the exact definitional equivalent for ``is_watertight`` — triwarp's docstring defines
+itself against ``TriangleMesh.is_watertight`` (edge-manifold without boundary, plus vertex-manifold
+and no self-intersection). It is also **seconds** per call, three to four orders of magnitude
+behind, and *faster on the harder mesh*, because its self-intersection test is a brute-force scan
+that early-exits on the first hit and so pays full price only when the mesh is clean. Both points
+are worth having on the record, so open3d runs here at ``rounds=1`` rather than being dropped; that
+group is a large share of the suite's wall clock and is the reason for the cap.
 
-**libigl**'s ``is_vertex_manifold`` is the reference for the valence group (89.8 ms on
-``sphere_med``, and safe on ``fan_hub`` at 92.8 ms -- unlike ``igl.principal_curvature``, which
-takes 110 s on the same mesh; see [`test_curvature.py`](test_curvature.py)).
+**libigl**'s ``is_vertex_manifold`` is the reference for the valence group, and it is flat and safe
+on ``fan_hub`` — unlike ``igl.principal_curvature``, which takes minutes on the same mesh (see
+[`test_curvature.py`](test_curvature.py)).
 
-open3d also covers both manifoldness groups directly: ``is_edge_manifold`` shares triwarp's
+open3d also covers both manifoldness groups: ``is_edge_manifold`` shares triwarp's
 ``allow_boundary_edges`` switch with identical semantics on both settings, and
-``is_vertex_manifold`` agrees with triwarp everywhere except vertices sitting *on* a non-manifold
-edge -- open3d tests whether the incident faces are edge-connected at all, triwarp and igl whether
-they form a manifold fan, so three faces sharing one edge pass open3d and fail the other two
-(measured on a three-faces-one-edge probe; the parity tests state the input class).
+``is_vertex_manifold`` agrees everywhere except vertices sitting *on* a non-manifold edge — open3d
+tests whether the incident faces are edge-connected at all, triwarp and igl whether they form a
+manifold fan, so three faces sharing one edge pass open3d and fail the other two.
 
-**trimesh** rebuilds its mesh inside the timed callable because it caches derived properties.
-Note its ``is_watertight`` is edge-manifold-only, so it is timing context rather than an
-equivalent computation. It has no ``is_vertex_manifold`` in 5.0; ``tm.repair.fix_winding`` is the
-closest analogue of the orientation propagation and is timed against it.
+**trimesh** rebuilds its mesh inside the timed callable because it caches derived properties; note
+its ``is_watertight`` is edge-manifold-only, so it is timing context rather than an equivalent
+computation. It has no ``is_vertex_manifold`` in 5.0; ``tm.repair.fix_winding`` is the closest
+analogue of the orientation propagation and is timed against it.
 
 There is no open3d ``is_volume``: its closest composition (``is_watertight() and is_orientable()``)
 short-circuits on the first check, so it would time ``is_watertight`` under a different name.
 
-**pymeshlab** covers all three groups, and it answers the watertightness question in a way neither
-other reference does: ``get_topological_measures`` returns
-``{boundary_edges, connected_components_number, edges_number, faces_number, genus,
-is_mesh_two_manifold, non_two_manifold_edges, non_two_manifold_vertices, ...}`` -- **one call for
-every predicate this module exposes plus the genus and the Euler characteristic**. So its row is
-simultaneously the reference for ``is_watertight`` and ``is_volume``, an *upper* bound for each one
-alone.
+**pymeshlab** covers all three groups and answers watertightness in a way neither other reference
+does: ``get_topological_measures`` returns boundary edges, component count, genus, two-manifoldness
+and the non-manifold edge and vertex counts — **one call for every predicate this module exposes
+plus the genus and the Euler characteristic** — so its row is simultaneously the reference for
+``is_watertight`` and ``is_volume``, an *upper* bound for each alone.
 
 It does *not* include the self-intersection test, which is half of triwarp's and open3d's
-definition, so the honest composition is both calls together: ``get_topological_measures`` (51.7 ms
-on ``sphere_med``) plus ``compute_selection_by_self_intersections_per_face`` (105.9 ms), timed as
-one callable at **140.8 ms**. Which is the useful number here, because open3d computes the *same*
-composition in **13.8 s** -- so 98x of open3d's cost is its brute-force self-intersection scan, and
-nothing about the definition requires it.
-
-Both pymeshlab rows are also **flat across the overlap axis in the same direction as everything
-else** (140.8 -> 65.6 ms watertight, 130.7 -> 65.6 is_volume, i.e. *faster* on the self-intersecting
-mesh), which is the third independent confirmation that collision density is not what drives this
-predicate.
+definition, so the honest composition is both calls together: ``get_topological_measures`` plus
+``compute_selection_by_self_intersections_per_face``, timed as one callable. That is the useful
+number, because open3d computes the *same* composition two orders of magnitude slower — so nearly
+all of open3d's cost is its brute-force self-intersection scan, and nothing about the definition
+requires it. Both pymeshlab rows are also **flat across the overlap axis in the same direction as
+everything else**, if anything *faster* on the self-intersecting mesh, which is the third
+independent confirmation that collision density is not what drives this predicate.
 
 For the valence group, ``compute_selection_by_non_manifold_per_vertex`` is the direct equivalent of
-``is_vertex_manifold`` -- a per-vertex one-ring test writing a bool selection array, exactly
-triwarp's shape. It reads 18.0 ms on ``sphere_med`` and 13.6 on ``fan_hub``: flat, like triwarp (1.8
-/ 2.2) and like libigl (100 / 107), so all three agree the valence distribution is not a hot spot.
-Both selection filters touch only the selected bit, so they share the MeshSet;
-``get_topological_measures`` is read-only.
+``is_vertex_manifold`` and is flat across the valence axis, like triwarp and libigl, so all three
+agree the valence distribution is not a hot spot. Both selection filters touch only the selected
+bit, so they share the MeshSet; ``get_topological_measures`` is read-only.
 
-``face_orientation_bits`` has no pymeshlab equivalent that returns the *bits*:
+``face_orientation_bits`` has no pymeshlab equivalent returning the *bits*:
 ``meshing_re_orient_faces_coherently`` applies them and is benchmarked in
-[`test_repair.py`](test_repair.py) against ``make_winding_consistent``, which is the function that
-consumes them.
+[`test_repair.py`](test_repair.py) against ``make_winding_consistent``, which consumes them.
 """
 
 from __future__ import annotations
@@ -299,31 +279,26 @@ def test_face_self_intersecting_mask(bench_case: BenchCase) -> None:
     they hold, and MeshLib's ``isClosed`` never runs it at all. So the composite group prices three
     clauses on one side and one on the other, and only this group prices the clause they share.
 
-    meshlib's ``findSelfCollidingTrianglesBS`` returns the same per-face set (asserted face for face
-    in ``tests/test_validation.py``) from an AABB tree over the faces, multi-threaded -- read it
-    against ``triwarp-cuda``. ``touchIsIntersection=False`` is the setting that matches triwarp and
-    is passed explicitly; the tree is built lazily on first use, so the mesh is constructed outside
-    the timed callable and the row prices the query.
+    meshlib's ``findSelfCollidingTrianglesBS`` returns the same per-face set from an AABB tree over
+    the faces, multi-threaded -- read it against ``triwarp-cuda``. ``touchIsIntersection=False`` is
+    the setting that matches triwarp and is passed explicitly; the tree is built lazily on first
+    use, so the mesh is constructed outside the timed callable and the row prices the query.
 
-    pymeshfix's ``select_intersecting_triangles`` returns the same set exactly -- 12 of 24 faces on
-    two interpenetrating boxes, 72 of 640 on two translated icospheres, 0 on a clean one, all
-    asserted in ``tests/test_validation.py`` -- from a uniform grid broad phase rather than a tree,
-    single-threaded. It is the one pymeshfix row in this file, because it is the one where the
-    operation clears the 30 % share the load leaves: measured **49 %** on ``bunny_decimated``
-    (64.2 ms of query against 67.9 ms of load) and **50 %** on ``bunny`` (435.3 against 439.6). The
-    load is inside the timed callable and cannot be moved out -- a ``PyTMesh`` takes exactly one
-    ``load_array`` -- so read this row as query-plus-load and halve it for the query alone.
-    ``tris_per_cell`` is its broad-phase bucket size and was measured not to change the answer at
-    10 / 50 / 200.
+    pymeshfix's ``select_intersecting_triangles`` returns the same set exactly, from a uniform grid
+    broad phase rather than a tree, single-threaded. It is the one pymeshfix row in this file,
+    because it is the one where the operation clears the 30 % share the load leaves -- the query and
+    the load are about equal on both meshes. The load is inside the timed callable and cannot be
+    moved out (a ``PyTMesh`` takes exactly one ``load_array``), so read this row as query-plus-load
+    and halve it for the query alone. ``tris_per_cell`` is its broad-phase bucket size and was
+    measured not to change the answer at any value probed.
 
     open3d and pymeshlab are the fourth and fifth implementations of the same predicate, and having
     five is worth the rows because this is the clause ``is_watertight`` reduces and the
-    post-condition ``fix_self_intersections`` is verified by. Both agree on the face *set*: measured
-    84 distinct faces on two icospheres offset 0.7, from open3d's ``(103, 2)`` colliding **pairs**
-    and from MeshLab's per-face bool selection. Two shape differences to read the rows through --
-    open3d returns pairs, so its output is larger than a mask and ``np.unique`` is the reduction
-    (that reduction is *outside* the timed callable, as triwarp's mask needs none); and MeshLab
-    mutates ``current_mesh()``, so its MeshSet is rebuilt per round.
+    post-condition ``fix_self_intersections`` is verified by. Both agree on the face *set*, reached
+    from open3d's colliding **pairs** and from MeshLab's per-face bool selection. Two shape
+    differences to read the rows through: open3d returns pairs, so its output is larger than a mask
+    and ``np.unique`` is the reduction (outside the timed callable, as triwarp's mask needs none);
+    and MeshLab mutates ``current_mesh()``, so its MeshSet is rebuilt per round.
     """
     if bench_case.kind == "open3d":
         mesh_o3d = bench_case.mesh_o3d

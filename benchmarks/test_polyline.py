@@ -1,112 +1,86 @@
 """
 Benchmarks for ``triwarp.polyline``.
 
-The module has 27 public functions over one data shape — an ordered ``(n,)`` array of ``wp.vec3``
-— and they fall into four cost classes. One representative of each is timed rather than all 27,
-because within a class the kernels differ only in the per-segment expression:
+The module has 27 public functions over one data shape — an ordered ``(n,)`` array of ``wp.vec3`` —
+falling into four cost classes. One representative of each is timed rather than all 27, because
+within a class the kernels differ only in the per-segment expression:
 
 * **Whole-polyline reductions** (``polyline_length``, ``polyline_centroid``, ``polyline_normal``,
-  ``polyline_radius``) — one pass over the segments into a scalar. Launch-latency bound at these
-  sizes; ``polyline_radius`` is the most expensive of them because it projects every segment onto
-  a plane and finds each segment's closest point before reducing.
-* **Per-vertex maps** (``polyline_angles``, ``cumulative_arc_length``) — one value per vertex,
-  purely local. ``polyline_angles`` is the ``wp.acos`` path.
-* **Resampling** (``polyline_upsample``, ``polyline_resample``, ``polyline_downsample``) — an
-  output whose length is data-dependent, so these pay a scan plus a host readback of the output
-  size before the write pass. The interpolation itself is the ``wp.lerp`` inner loop.
-* **Simplification** (``polyline_simplify``) — Ramer-Douglas-Peucker, evaluated
+  ``polyline_radius``) — one pass into a scalar, launch-latency bound at these sizes.
+  ``polyline_radius`` is the dearest: it projects every segment onto a plane and finds each
+  segment's closest point before reducing.
+* **Per-vertex maps** (``polyline_angles``, ``cumulative_arc_length``) — one purely local value per
+  vertex.
+* **Resampling** (``polyline_upsample`` / ``resample`` / ``downsample``) — a data-dependent output
+  length, so a scan plus a host readback of the size before the write pass.
+* **Simplification** (``polyline_simplify``) — Ramer-Douglas-Peucker evaluated
   **level-synchronously**: one round of four ``dim=n`` launches per level of the split tree, driven
-  by ``wp.capture_while`` so no round costs a readback. The cost is therefore the tree's *depth*,
-  about ``log2(n)`` on a mesh boundary loop. This group is why: it used to be the module's
-  deliberate serial outlier — a single-thread stack-based kernel, since Warp forbids recursion —
-  and *that* framing is what kept it there. Warp cannot express the recursion, but it can express
-  the recursion's **levels**, and the two accept the same points, because breadth-first and
-  depth-first evaluation of one split tree differ only in order. Measured 80.47 -> 1.11 ms on
-  ``rim_long``, **72x**, with the accepted set identical; ``polyline_simplify``'s Notes carry the
-  full table, the two rows that lose, and why the depth is bounded by the accepted count.
+  by ``wp.capture_while`` so no round costs a readback. The cost is the tree's *depth*, about
+  ``log2(n)`` on a boundary loop. Warp cannot express the recursion but can express its **levels**,
+  and the two accept the same points, because breadth-first and depth-first evaluation of one split
+  tree differ only in order — worth nearly two orders of magnitude on the longest rim against a
+  single-thread stack kernel. Its Notes carry the rows that lose and why the depth is bounded by
+  the accepted count.
 
-``polyline_point_distance`` is timed separately from the rest because it is the only function whose
-cost is the product of two sizes (query points x segments) rather than a function of the polyline
-alone.
+``polyline_point_distance`` is timed separately as the only function whose cost is a product of two
+sizes (query points x segments).
 
-``triangulate_polygon`` is the remaining exception, and the module's worked example of a cost
-that is not where it looks. It delegates to ``polyline.polyline_triangulate``, a **parallel**
-multi-round ear clipper — every launch in the round loop is ``dim=n``, and a round clips a whole
-*independent set* of ears at once. What is serial is the **round count**: a round costs four
-``dim=n`` launches whatever it clips, so the only thing that matters is how many ears survive per
-round. Since the round loop moved onto the device (``wp.capture_while``, so no readback per round)
-that costs 14 µs a round at 64 points, and the group measures **2.2 / 4.5 ms** against 4.5 / 6.9
-before — 2.07x and 1.53x.
+``triangulate_polygon`` is the module's worked example of a cost that is not where it looks. It
+delegates to a **parallel** multi-round ear clipper: every launch is ``dim=n`` and a round clips a
+whole *independent set* of ears. What is serial is the **round count** — a round costs four launches
+whatever it clips — and the round loop runs on the device (``wp.capture_while``), worth up to 2x.
 
-Read the residual against its attribution rather than against the round loop, because the round loop
-is no longer the cost: at 64 points the clip itself is 0.22 ms of the 2.2, and **1.05 ms is the
-prologue** — ``polyline_open``'s ``is_closed`` (0.24), ``polyline_normal`` (0.35) and
-``polyline_centroid`` (0.25), three reductions that each end in a host readback because their result
-is a Python-scope ``wp.vec3``, plus the reflex-count readback. That share is *flat in n*, so it is
-the whole gap to trimesh's 0.12 ms at 64 points and none of it at 1 024.
+Read the residual against its attribution rather than against the round loop, which is no longer the
+cost: at a small ring the clip is a tenth of the call and **most of the rest is the prologue** —
+``polyline_open``'s ``is_closed``, ``polyline_normal`` and ``polyline_centroid``, three reductions
+each ending in a readback because their result is a Python-scope ``wp.vec3``, plus the reflex-count
+readback. That share is *flat in n*, so it is the whole gap to trimesh at a small ring and none of
+it at a large one.
 
-The round *count* is what this group caught first. ``select_independent`` used to rank competing
-ear candidates by their raw ring index, which on an alternating star lets ear ``i - 2`` suppress
-ear ``i`` for every ``i``, so exactly **one** ear was clipped per round and the loop ran to its
-``n`` cap: 6.1 ms at 64 points and **141 ms** at 1 024, growing as ``n^1.12`` (rounds proportional
-to ``n`` times a slowly growing per-round cost) rather than the ``O(L^2)`` a serial clipper would
-give. Ranking by a bijective hash of the ring index makes it the textbook maximal-independent-set
-rule, which retires a constant fraction per round: 16 and 30 rounds, the latter instead of 1 022.
+The round *count* is what this group caught first: ranking competing ear candidates by raw ring
+index lets ear ``i - 2`` suppress ear ``i`` on an alternating star, so exactly **one** ear is
+clipped per round and the loop runs to its ``n`` cap. ``select_independent`` ranks by a bijective
+hash instead — the textbook maximal-independent-set rule — and retires a constant fraction per
+round.
 
-Axis: **polyline** -- longest boundary loop of 268, 528 and 65 536 vertices. Polylines come from
-**mesh boundary loops**, not from mesh geometry, and the axis is a loop-length sweep rather than a
-face-count one: nothing here reads a face. The scan meshes are excluded on the same grounds --
-they are near-closed surfaces whose holes are a handful of vertices each, so they would measure
-launch latency and nothing else.
+Axis: **polyline**, a loop-length sweep rather than a face-count one, since nothing here reads a
+face. Polylines are mesh *boundary loops*; the scan meshes are excluded because they are near-closed
+surfaces whose holes are a handful of vertices each, so they would measure launch latency alone. The
+longest loop of each mesh is gathered into a dense buffer once per (mesh, device) and reused, so the
+timed region holds only the polyline function.
 
-The longest loop of each mesh is gathered into a dense ``wp.vec3`` buffer once per (mesh, device)
-and reused across rounds, so the timed region contains only the polyline function itself.
-
-Two groups carry a second sweep, on the parameter that drives them rather than on length:
-``polyline_simplify`` on its tolerance (which sets the depth of its split tree, and so its round
-count) and
-``polyline_point_distance`` on the query count (the other half of its two-size product).
+Two groups carry a second sweep on the parameter that drives them: ``polyline_simplify`` on its
+tolerance (which sets the tree depth and so the round count) and ``polyline_point_distance`` on the
+query count.
 
 References
 ----------
-**meshlib and pyvista are the module's baselines**, and between them they cover every group here
-except the two per-vertex maps. MeshLib's ``Polyline3`` is a complete polyline library --
-``totalLength``, ``averageEdgeLength``, ``loopDirArea``, ``splitEdge``,
-``findProjectionOnPolyline``, ``subdividePolyline``, ``decimatePolyline``, ``pack`` -- and VTK
-reaches the same operations through a single-cell ``PolyData``. An earlier version of this section
-said no CPU baseline was registered at all, which was already false of three groups when it was
-written.
-
-Two hazards decide every row here, both measured:
+**meshlib and pyvista are the baselines** and between them cover every group except the two
+per-vertex maps. MeshLib's ``Polyline3`` is a complete polyline library; VTK reaches the same
+operations through a single-cell ``PolyData``. Two hazards decide every row:
 
 * **The single line cell.** ``pv.lines_from_points`` gives one two-point cell *per segment*, and
-  every polyline filter then restarts at each of them -- ``compute_arc_length`` reports 0.0638 for
-  a 200-point helix whose length is 12.7049, and ``decimate_polyline`` is a **no-op at every
-  reduction**. ``_polyline_pv`` builds one cell for that reason; a row built the other way would
-  time the right filter on the wrong input and read as a suspiciously fast reference.
-* **``pack()`` is mandatory after a decimation, and skipping it is silent.** Measured on a 128-point
-  helix at ``maxError=0.1``: ``vertsDeleted`` is **104**, ``points.size()`` is still **128**, and
-  ``topology.numValidVerts()`` is **24**. ``totalLength()`` is already correct before packing, so a
-  *length* comparison passes unpacked while a *point-count* one silently reads the input's count and
-  reads as a no-op. This is CLAUDE.md section 7.6's ``getNumpyFaces``-without-``pack()`` rule, in a
-  class that rule does not name.
+  every polyline filter then restarts at each — ``compute_arc_length`` reports orders of magnitude
+  short and ``decimate_polyline`` is a **no-op at every reduction**. ``_polyline_pv`` builds one
+  cell for that reason; a row built the other way times the right filter on the wrong input and
+  reads as a suspiciously fast reference.
+* **``pack()`` is mandatory after a decimation, and skipping it is silent.** ``vertsDeleted``
+  reports the deletions while ``points.size()`` is unchanged and only ``topology.numValidVerts()``
+  reflects them. ``totalLength()`` is already correct before packing, so a *length* comparison
+  passes unpacked while a *point-count* one silently reads the input's count and reads as a no-op.
+  CLAUDE.md section 7.6's ``getNumpyFaces``-without-``pack()`` rule, in a class it does not name.
 
-The three groups that stay triwarp-only, and why it is per-function rather than blanket:
+Three groups stay triwarp-only, per function rather than blanket: **``polyline_radius``** (no
+reference computes it — ``findCenterFromPoints`` is a centroid and ``findMaxProjectionOnPolyline``
+is ``polyline_point_distance``'s question, which already carries its rows); **``polyline_angles``**
+(MeshLib has ``edgeVector`` only, so a reference row would time a Python loop); and
+``polyline_triangulate``, whose sibling ``triangulate_polygon`` carries trimesh while the clipper
+itself carries meshlib and pyvista.
 
-* **``polyline_radius``** -- no reference computes it. ``Polyline3.findCenterFromPoints`` is a
-  centroid and ``findMaxProjectionOnPolyline`` projects points *onto* a polyline, which is
-  ``polyline_point_distance``'s question and already carries its rows.
-* **``polyline_angles``** -- three-point turning angles. MeshLib has ``edgeVector`` only, so a
-  reference row would time a Python loop over the segments.
-* **``polyline_triangulate``**'s sibling ``triangulate_polygon`` carries trimesh; the ear clipper
-  itself carries meshlib and pyvista.
-
-trimesh, libigl and open3d remain unregistered here, and each for its own reason: trimesh models
-polylines as ``Path3D`` entities rather than arrays and its only simplification is
-``merge_colinear`` (a colinear-run merge, a different algorithm with a different output); libigl's
-``igl.upsample`` is *mesh* subdivision and its C++ ``ramer_douglas_peucker`` is not bound; and
-open3d's ``LineSet`` stores unordered segments with no ordering, length, resampling or
-simplification operation at all.
+trimesh, libigl and open3d are unregistered, each for its own reason: trimesh models polylines as
+``Path3D`` entities and its only simplification is a colinear-run merge; libigl's ``igl.upsample``
+is *mesh* subdivision and its C++ ``ramer_douglas_peucker`` is not bound; and open3d's ``LineSet``
+stores unordered segments with no ordering, length, resampling or simplification at all.
 """
 
 from __future__ import annotations
@@ -303,8 +277,8 @@ def test_polyline_length(bench_case: BenchCase) -> None:
 
     pyvista's ``compute_arc_length`` **does more**: it writes the *cumulative* length at every
     point and the total is its last entry, where both other rows return the scalar directly. So read
-    its row as a per-point pass rather than as a reduction -- and it is still cheap, 0.21 / 0.21 /
-    0.88 ms across the axis, because VTK walks one line cell.
+    its row as a per-point pass rather than as a reduction -- and it is still cheap across the axis,
+    because VTK walks one line cell.
     """
     if bench_case.kind == "pyvista":
         line_pv = _polyline_pv(bench_case)
@@ -338,10 +312,10 @@ def test_polyline_normal(bench_case: BenchCase) -> None:
     ``segment_length`` and reduces through ``triwarp.reduce``, so it was always a proper block
     reduction, while this one accumulated one ``wp.atomic_add`` per thread into a single
     ``wp.vec3`` slot -- every thread in the launch contending for one address, and the reduction
-    serialized. Measured, converting it to the lane-strided form
-    (``kernels/polyline.py::accumulate_newell_normal`` carries the table): **1.32x** at 4 096
-    vertices, **19.6x** at 65 536 and **71.8x** at 262 144, with the answer three orders of
-    magnitude more accurate against a float64 reference. So the representative had the *good*
+    serialized. Converting it to the lane-strided form
+    (``kernels/polyline.py::accumulate_newell_normal``) is worth one to two orders of magnitude at
+    the point counts this axis reaches, with the answer three orders of magnitude more accurate
+    against a float64 reference. So the representative had the *good*
     shape and the class member it stood in for did not, which is what a one-row class cannot show.
     ``polyline_centroid`` stays unrepresented: it reaches ``triwarp.reduce`` the way
     ``polyline_length`` does.
@@ -412,9 +386,9 @@ def test_upsample_polyline(bench_case: BenchCase) -> None:
 
     meshlib's ``subdividePolyline`` takes the same ``maxEdgeLen`` and makes the same guarantee, but
     it **bisects** where triwarp splits each segment into equal pieces, so at a target that is not
-    a power-of-two fraction of the input spacing it overshoots -- measured on a 128-point helix at
-    half the spacing, 509 points against triwarp's 254, because one halving leaves 0.0502 against a
-    cap of 0.05 and forces a second. Both satisfy the cap; read the row as a cost at a *shared
+    a power-of-two fraction of the input spacing it overshoots -- roughly doubling the point count,
+    because one halving leaves it a hair over the cap and forces a second. Both satisfy the cap;
+    read the row as a cost at a *shared
     post-condition* rather than at a shared output size (``tests/test_polyline.py``).
 
     It mutates, so the ``Polyline3`` is rebuilt inside the timed callable, and ``maxEdgeSplits`` is
@@ -492,22 +466,20 @@ def test_simplify_polyline(bench_case: BenchCase, tolerance_fraction: float) -> 
     """
     Ramer-Douglas-Peucker, one round of four ``dim=n`` launches per level of the split tree.
 
-    This group used to carry the sentence *"the one group in the package where triwarp is expected
-    to lose"*, and it is worth leaving a marker where that was: the expectation was load-bearing,
-    not descriptive. It rested on Warp forbidding recursion, which is true, and on the conclusion
-    that the split is therefore serial, which is not -- a level-synchronous evaluation accepts the
-    same points and turned the ``rim_long`` rows from 80.47 ms into 1.11. Read the two ``saddle``
-    rows as floor rows now (the graph capture is ~0.16 ms of a ~0.6 ms call), not as the outlier.
+    Warp forbidding recursion does *not* make the split serial: a level-synchronous evaluation
+    accepts the same points and is nearly two orders of magnitude ahead of a stack kernel on the
+    longest rim. Read the two ``saddle`` rows as floor rows, the graph capture being a large share
+    of a sub-millisecond call, rather than as outliers.
 
     Neither reference is Ramer-Douglas-Peucker, and **neither is driven by triwarp's tolerance**,
     which is the thing to know before reading the ratio: both are given the *reduction* triwarp's
     tolerance produces, so the rows price three ways of removing the same number of points.
 
-    Driving them by their own error parameter was tried and rejected on a measurement.
-    ``decimatePolyline``'s ``maxError`` is a collapse cost, **not** a deviation bound: on a 40-point
-    random walk at a tolerance of 0.8134 its output sits **1.9187** from the input, 2.4x the number
-    it was given, where triwarp's and pyvista's sit at 0.3730. So a tolerance-matched pair would be
-    two different amounts of work under one parameter name.
+    Driving them by their own error parameter was rejected on a measurement.
+    ``decimatePolyline``'s ``maxError`` is a collapse cost, **not** a deviation bound: on a random
+    walk its output sits several times further from the input than the tolerance it was given, where
+    triwarp's and pyvista's stay well inside it. So a tolerance-matched pair would be two different
+    amounts of work under one parameter name.
 
     * **meshlib** ``decimatePolyline`` at ``maxDeletedVertices`` = triwarp's deletion count, with
       ``maxError`` opened up so the count is what binds. ``optimizeVertexPos`` is turned off for the
@@ -569,10 +541,10 @@ def test_distance_to_polyline(bench_case: BenchCase, n_queries: int) -> None:
     the row's output is one array wider than what it is timed against; the distance is a host
     subtraction and is left out deliberately.
 
-    **rim_long is skipped for pyvista**, measured: its locator degrades on a 65 536-segment single
-    cell to 4 963.9 ms at 4 096 queries and **104 125 ms** at 65 536, against 24.8 / 382.7 ms on the
-    268-segment loop. That is the shape of the axis this group exists to show, and one row of it
-    would cost more than the rest of the module put together.
+    **rim_long is skipped for pyvista**: its locator degrades catastrophically on a
+    65 536-segment single cell, by orders of magnitude against a short loop. That is the shape of
+    the axis this group exists to show, and one row of it would cost more than
+    the rest of the module put together.
     """
     if bench_case.kind == "pyvista":
         if bench_case.mesh_name == "rim_long":
@@ -703,11 +675,12 @@ def test_triangulate_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
     fast path and never reaches the ear loop (its row is in [`test_creation.py`](test_creation.py)).
     A star ring forces it. Each round is fully parallel (four ``dim=n`` launches) and the round loop
     itself runs on device, so what this group measures is **how many rounds the independent-set rule
-    needs**: 16 and 30, against 62 and 1 022 before the ranking hash.
+    needs**: a few dozen either way, against a count proportional to the ring size before the
+    ranking hash.
 
-    At ``ring_size=64`` that is no longer the dominant term -- the clip is 0.22 ms of a 2.2 ms call
-    and the flat plane-fitting prologue is 1.05 -- so read the small point as a floor row and the
-    large one as a rounds ratio. No open3d counterpart.
+    At a small ring that is no longer the dominant term -- the clip is a tenth of the call and the
+    flat plane-fitting prologue is most of the rest -- so read the small point as a floor row and
+    the large one as a rounds ratio. No open3d counterpart.
     """
     if bench_lib.kind == "triwarp":
         ring_wp = _star_wp(ring_size, str(bench_lib.device))

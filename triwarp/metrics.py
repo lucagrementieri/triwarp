@@ -891,11 +891,10 @@ def _distances_mesh_to_mesh(
 
     The two ``closest_point_on_mesh`` calls below have no data dependency between them, and were
     one of five such pairs across the tree measured against a two-``wp.Stream`` overlap (joined by
-    ``wait_stream``) instead of the sequential default-stream form -- 0.87-1.07x across all five,
-    indistinguishable from noise. See CLAUDE.md §14.9 for the full numbers and the two structural
-    reasons (host-launch-overhead dominance and CG's periodic host-readback check). Kept sequential;
-    do not reintroduce stream overlap here without a call site whose own device share is much
-    larger.
+    ``wait_stream``) instead of the sequential default-stream form -- indistinguishable from noise
+    on all five. See CLAUDE.md section 14.9 for the two structural reasons (host-launch-overhead
+    dominance and CG's periodic host-readback check). Kept sequential; do not reintroduce stream
+    overlap here without a call site whose own device share is much larger.
     """
     if (
         int(vertices_a.shape[0]) == 0
@@ -934,11 +933,11 @@ def _accumulate_chamfer_terms(tape: wp.Tape | None, terms: list[Callable[[], Non
 
     Each of the three ``chamfer_*_loss`` entry points builds ``terms`` as one zero-argument closure
     per direction it accumulates (one when ``single_directional``, two otherwise) and hands them
-    here instead of each writing its own ``_record`` closure -- which is what let all three drop the
-    ``nearest_yx: ... | None = None`` / ``assert nearest_yx is not None`` dance they used to repeat:
-    a closure already captures whichever assignment it was built from, so there is nothing to
-    narrow. Recording is opt-in because a ``wp.Tape`` context is only wanted when the caller intends
-    to backpropagate; passing ``tape=None`` still runs every term, just untaped.
+    here instead of each writing its own ``_record`` closure. A closure already captures whichever
+    assignment it was built from, so no caller needs an ``| None`` placeholder and a narrowing
+    assertion for the direction it did not take. Recording is opt-in because a ``wp.Tape`` context
+    is only wanted when the caller intends to backpropagate; passing ``tape=None`` still runs every
+    term, just untaped.
     """
 
     def _record() -> None:

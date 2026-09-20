@@ -85,10 +85,10 @@ _ORIENTATION_DEPENDENT_KEYS: frozenset[str] = frozenset(
         "face_angles",  # per-corner table, permuted
         "cotmatrix_entries",  # likewise -- the assembled `cotmatrix` is a sum and survives
         # Gauge is built from a reference halfedge, which moves -- and `basis_y = normal x basis_x`
-        # flips with the winding. Measured against recomputation after a mirror: `basis_x` 1.1-1.9,
-        # `basis_y` 1.7, where the frame's own normal is 4e-07 because it is mapped by the inverse
-        # transpose. Dropping the triple here is also what keeps `_carry_directions` from rotating
-        # it, which is why that helper tests `survived` rather than the cache.
+        # flips with the winding, so after a mirror a carried frame is nowhere near the recomputed
+        # one while the frame's own normal still agrees, being mapped by the inverse transpose.
+        # Dropping the triple here is also what keeps `_carry_directions` from rotating it, which is
+        # why that helper tests `survived` rather than the cache.
         "vertex_tangent_frames",
         "laplacian_operator",  # directed adjacency, asymmetric at an open boundary
         "faces_unique_edges",  # a view of `edges_unique_inverse`; carrying it alone would stale
@@ -117,10 +117,10 @@ _AFFINE_CARRY: frozenset[str] = _TOPOLOGY_KEYS | frozenset(
 # an isometry does. It is the one entry in this set that `transform` **rotates** rather than
 # carrying verbatim (see the header's note and `_carry_directions`), and membership here is
 # load-bearing twice over: it is also what subjects the frame to the `_ORIENTATION_DEPENDENT_KEYS`
-# subtraction, which a mirror needs -- measured, a reflected frame's `basis_x` sits 1.1 to 1.9 away
-# from the recomputed one, where the *normal* agrees to 4e-07 because `transform_normals` maps it
-# by the inverse transpose. Not one rung further down either: an affine map tilts the tangent plane
-# by an amount that depends on the surface, measured 0.77 on `basis_x` and 2.6e-02 on the normal.
+# subtraction, which a mirror needs -- a reflected frame's `basis_x` is nowhere near the recomputed
+# one, where the *normal* still agrees because `transform_normals` maps it by the inverse
+# transpose. Not one rung further down either: an affine map tilts the tangent plane by an amount
+# that depends on the surface, so neither the frame nor the normal survives it.
 _SIMILARITY_CARRY: frozenset[str] = _AFFINE_CARRY | frozenset(
     {
         "face_angles",
@@ -149,9 +149,8 @@ _ISOMETRY_CARRY: frozenset[str] = _SIMILARITY_CARRY | frozenset(
 # The mass properties -- `volume`, `center_mass`, `moment_inertia` -- are in **no** set, and the
 # reason is not the obvious one. Each is an integral over the tetrahedra from the origin to every
 # face, which telescopes to an origin-independent answer only when the surface is *closed*. On an
-# open mesh they are origin-dependent, so a translation changes all three: measured 2.3e-01 on
-# `volume` and 8.7e-01 on `moment_inertia` over a hemisphere moved by (1.5, -2, 0.5), against
-# 2.4e-07 and 6.3e-08 for the same move on a closed sphere. Carrying them would need the stratum
+# open mesh they are origin-dependent, so a translation changes all three, where the same move on a
+# closed surface leaves them alone to float32 rounding. Carrying them would need the stratum
 # to depend on `is_watertight`, which is a device readback and a second axis through every set;
 # recomputing them is three readbacks and always right.
 
@@ -270,41 +269,36 @@ class Trimesh:
     A triangle mesh with lazily cached derived quantities.
 
     Holds a ``vertices``/``faces`` pair (the same flat-``int32`` convention used throughout
-    `triwarp`) and computes derived geometry, topology, and validity predicates on first
-    access, caching the result. `Trimesh` is frozen: there are no setters, so a cached value
-    can never silently go stale from a Python-level mutation. Composition rather than
-    inheritance is used for the ``warp.Mesh`` BVH — building it eagerly on every mesh would
-    waste GPU memory on meshes that never issue a ray or proximity query, so it is built lazily
-    behind [`warp_mesh`][triwarp.mesh.Trimesh.warp_mesh] on first use instead.
+    `triwarp`) and computes derived geometry, topology and validity predicates on first access,
+    caching the result. `Trimesh` is frozen: there are no setters, so a cached value can never
+    silently go stale from a Python-level mutation. The ``warp.Mesh`` BVH is held by composition
+    rather than inheritance and built lazily behind [`warp_mesh`][triwarp.mesh.Trimesh.warp_mesh],
+    since building it eagerly would waste GPU memory on meshes that never issue a ray or proximity
+    query.
 
-    Every cached property returns the same object on each access — an array, a tuple of arrays or
-    a sparse matrix, aliased across repeated accesses and (for `warp_mesh`) with the mesh's own
-    `vertices`/`faces` buffers — so callers must not mutate a returned buffer in place. That
-    matters most where they are passed *into* the free functions as precomputed arguments: a
-    wrapper that rewrites such a buffer copies it first
-    ([`filter_normals`][triwarp.smoothing.filter_normals] is the one that does). If a buffer is
-    deliberately mutated in place by a kernel, call
-    [`invalidate`][triwarp.mesh.Trimesh.invalidate] afterward to drop every cached value
-    (including the BVH); otherwise use
-    [`with_vertices`][triwarp.mesh.Trimesh.with_vertices] /
-    [`with_faces`][triwarp.mesh.Trimesh.with_faces], which return a new `Trimesh` and carry
-    forward whichever cached values are still valid.
+    Every cached property returns the same object on each access -- an array, a tuple of arrays or a
+    sparse matrix, aliased across repeated accesses and (for `warp_mesh`) with the mesh's own
+    `vertices`/`faces` buffers -- so callers must not mutate a returned buffer in place. That
+    matters most where they are passed *into* the free functions as precomputed arguments: a wrapper
+    that rewrites such a buffer copies it first. If a buffer is deliberately mutated in place by a
+    kernel, call [`invalidate`][triwarp.mesh.Trimesh.invalidate] afterward to drop every cached
+    value (including the BVH); otherwise use [`with_vertices`][triwarp.mesh.Trimesh.with_vertices] /
+    [`with_faces`][triwarp.mesh.Trimesh.with_faces], which return a new `Trimesh` and carry forward
+    whichever cached values are still valid.
 
     Scalar-valued properties (`area`, `centroid`, `bounds`, `enclosing_diagonal`,
-    `mean_edge_length`, `euler_characteristic`, and every `is_*` predicate) synchronize the result
-    from device to host on first access; the synchronized Python value is then cached like any
-    other property.
+    `mean_edge_length`, `euler_characteristic`, and every `is_*` predicate) synchronize from device
+    to host on first access; the synchronized Python value is then cached like any other.
 
     Most of these are also what the free functions accept as an optional precomputed argument, so
     the cache is worth more than the repeat accesses on this class: pass `edges_sorted`,
-    `face_adjacency`, `halfedge_twins`, `vertex_one_rings`, `vertex_face_adjacency`,
-    `face_normals` / `face_areas`, `cotmatrix_entries`, `bounds`, `laplacian_operator` or an
-    operator bundle into the wrapper that takes it and the whole assembly is skipped. The discrete
-    operators at the bottom of the class (`cotmatrix` through `vector_heat_operators`) are the
-    heaviest of these and the reason a solver run over one mesh should go through a `Trimesh`.
-
-    Caching pays off most when the same mesh is reused across many calls, and least where a single
-    solve dominates the cost of any one call.
+    `face_adjacency`, `halfedge_twins`, `vertex_one_rings`, `vertex_face_adjacency`, `face_normals`
+    / `face_areas`, `cotmatrix_entries`, `bounds`, `laplacian_operator` or an operator bundle into
+    the wrapper that takes it and the whole assembly is skipped. The discrete operators at the
+    bottom of the class (`cotmatrix` through `vector_heat_operators`) are the heaviest of these and
+    the reason a solver run over one mesh should go through a `Trimesh`. Caching pays off most when
+    the same mesh is reused across many calls, and least where a single solve dominates the cost of
+    any one call.
 
     Parameters
     ----------
@@ -671,9 +665,9 @@ class Trimesh:
         """
         lower, upper = self.bounds
         # ``math.dist`` rather than ``float(wp.length(upper - lower))``: a Warp operator and a
-        # Warp builtin at Python scope each route through builtin dispatch, measured 14.68 us
-        # against 3.02 (4.9x). It computes in float64 where ``wp.length`` is float32, i.e. ~2e-8
-        # relative and the correctly-rounded answer for float32 corners. Section 13.1.
+        # Warp builtin at Python scope each route through builtin dispatch, several times dearer.
+        # It computes in float64 where ``wp.length`` is float32, i.e. the correctly-rounded answer
+        # for float32 corners. Section 13.1.
         return math.dist(lower, upper)
 
     @_CachedProperty
@@ -1565,13 +1559,12 @@ class Trimesh:
         """
         Return a new `Trimesh` under an affine transform, carrying forward whatever survives it.
 
-        `Trimesh` is frozen, so this returns a new instance rather than moving this one -- and
-        that is the *fast* path, not merely the safe one. How much of the cache survives is
-        decided by what the transform preserves
-        ([`classify_transform`][triwarp.transform.classify_transform]), and for a rigid motion
-        that is everything expensive: angles, areas, the cotangent table and the assembled
-        [`cotmatrix`][triwarp.mesh.Trimesh.cotmatrix] are all isometry invariants, so only the
-        directions and the bounding box are touched.
+        `Trimesh` is frozen, so this returns a new instance rather than moving this one -- and that
+        is the *fast* path, not merely the safe one. How much of the cache survives is decided by
+        what the transform preserves ([`classify_transform`][triwarp.transform.classify_transform]),
+        and for a rigid motion that is everything expensive: angles, areas, the cotangent table and
+        the assembled [`cotmatrix`][triwarp.mesh.Trimesh.cotmatrix] are all isometry invariants, so
+        only the directions and the bounding box are touched.
 
         | transform | recomputed on the new mesh |
         |---|---|
@@ -1580,15 +1573,15 @@ class Trimesh:
         | similarity | the above, plus the length and area quantities |
         | affine | everything but connectivity |
 
-        Face winding is reversed when ``matrix`` mirrors, which keeps normals outward and costs
-        the orientation-dependent caches on top of the row above --
+        Face winding is reversed when ``matrix`` mirrors, which keeps normals outward and costs the
+        orientation-dependent caches on top of the row above --
         [`vertex_one_rings`][triwarp.mesh.Trimesh.vertex_one_rings], the directed edge tables and
         the per-corner tables among them.
 
         Carrying the cache forward is cheaper than transforming the buffers and rebuilding a
-        `Trimesh` around them whenever the mesh is reused for further queries: the saving is a
-        count of assembly launches skipped, so it is worth reaching for on a mesh carried through
-        a sequence of poses, and worth little on a mesh transformed once and used once.
+        `Trimesh` around them whenever the mesh is reused for further queries: the saving is a count
+        of assembly launches skipped, so it is worth reaching for on a mesh carried through a
+        sequence of poses, and worth little on a mesh transformed once and used once.
 
         Parameters
         ----------
@@ -1688,9 +1681,9 @@ class Trimesh:
         **The two normal branches test `self._cache` and the frame branch tests `survived`, and
         that asymmetry is deliberate.** `survived` is the carry set after the
         `_ORIENTATION_DEPENDENT_KEYS` subtraction, so testing it is what stops a *mirror* from
-        rotating a gauge that a mirror does not preserve: measured, a reflected `basis_x` sits 1.1
-        to 1.9 from the recomputed one. The normals need no such gate -- `transform_normals` maps
-        them by the inverse transpose, which is already correct under a reflection (4e-07). So do
+        rotating a gauge that a mirror does not preserve. The normals need no such gate --
+        `transform_normals` maps them by the inverse transpose, which is already correct under a
+        reflection. So do
         not "simplify" the frame branch to read `self._cache` like its siblings; it would silently
         carry a mirrored frame. Mutation-probed: that edit fails the reflection arm of
         `test_transform_rotates_the_tangent_frames_where_it_can` on every fixture, closed and open
@@ -1742,9 +1735,9 @@ class Trimesh:
         """
         if kind == "singular":
             return
-        # ``wp.transform_point`` is Python-scope builtin dispatch (~9 us). Doing it as a NumPy
-        # ``3x3 @ v + t`` was measured at 4.92 us and declined: 4 us on a cache-carry path, for a
-        # spelling that hides what the line means.
+        # ``wp.transform_point`` is Python-scope builtin dispatch. Doing it as a NumPy
+        # ``3x3 @ v + t`` is measurably cheaper and declined: a few microseconds on a cache-carry
+        # path, for a spelling that hides what the line means.
         # ``twt.transform_point`` is that same builtin, re-exported over the concrete vector and
         # matrix types so a value held in a variable resolves against it.
         if (centroid := self._cache.get("centroid")) is not None and kind != "affine":

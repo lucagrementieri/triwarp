@@ -1696,11 +1696,11 @@ def test_voxels_imports_warp_fem_lazily():
     """
     ``warp.fem`` is imported inside [`voxel_corners`][triwarp.voxels.voxel_corners], not at scope.
 
-    That import costs ~0.15 s, which every caller of the module would otherwise pay.
+    That import is a real fixed cost every caller of the module would otherwise pay.
 
-    Checked statically rather than through ``sys.modules``: ``triwarp/kernels/curvature.py``
-    imports ``warp.fem.linalg`` at module scope, which drags the whole ``warp.fem`` package in
-    regardless of what this module does, so a runtime probe could never fail.
+    Checked statically rather than through ``sys.modules``: ``triwarp/kernels/curvature.py`` imports
+    ``warp.fem.linalg`` at module scope, which drags the whole ``warp.fem`` package in regardless of
+    what this module does, so a runtime probe could never fail.
     """
     import ast
     import inspect

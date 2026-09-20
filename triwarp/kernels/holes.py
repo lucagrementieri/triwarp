@@ -49,10 +49,9 @@ MAX_MIN_ANGLE_SIN = wp.constant(wp.float32(0.86602540378443864676))
 
 
 # One convention for a loop's extent, and this is it: ``loop_starts[ell]`` and
-# ``loop_sizes[ell]``, both uploaded once by ``holes._PackedLoops``. The kernels below used to
-# split -- three of them re-derived the size from ``loop_starts``, a ``total`` and an ``n_loops``
-# through a ``loop_size`` helper, while the rest read the size array directly -- which meant one
-# file answered the same question two ways and a new kernel could pick a third.
+# ``loop_sizes[ell]``, both uploaded once by ``holes._PackedLoops``. Kernels here must not
+# re-derive the size from a ``total`` and an ``n_loops``, or the file answers one question two
+# ways and a new kernel picks a third.
 
 
 @wp.kernel
@@ -155,14 +154,10 @@ def triangle_fill_metric(
     # which is worth knowing because the duplicates sit in *different basic blocks*
     # (``circumcircle_diameter_sq`` and ``triangle_aspect_ratio`` each carry early returns), so
     # their elimination needs partial-redundancy elimination rather than local CSE and there was no
-    # reason to assume it. Measured by hand-fusing this branch through
-    # ``predicates.triangle_aspect_ratio_from_sides`` / ``circumdiameter_sq_from_squared_sides``
-    # siblings and diffing the regenerated ``fill_dp_span`` forward entry's
-    # ``*.sm120.ptx``: ``sqrt.rn.f32`` 56 -> 56, ``div.rn.f32`` 57 -> 57, ``fma.rn.f32``
-    # 227 -> 227, ``mul.f32`` 445 -> 445, ``add.f32`` 47 -> 47, ``sub.f32`` 335 -> **332**. Three
-    # subtractions out of ~1 100 arithmetic instructions is not a speed change, and the fused form
-    # is a twenty-line block where this is three named calls -- so it was reverted. Do not
-    # re-propose the fusion without a PTX diff that says something different.
+    # reason to assume it. Confirmed by hand-fusing this branch and diffing the regenerated PTX:
+    # three subtractions out of ~1 100 arithmetic instructions, which is not a speed change, and
+    # the fused form is a twenty-line block where this is three named calls. Do not re-propose the
+    # fusion without a PTX diff that says something different.
     face_norm = wp.cross(b - a, c - a)
     face_dbl_area_sq = wp.length_sq(face_norm)
     if face_dbl_area_sq == 0.0:
@@ -283,40 +278,22 @@ def init_dp_base(
 # **Two values, and the choice is an occupancy question rather than a rim-length one.** The grid is
 # ``(n_loops, max_size - span)``, so a *wide* block only pays when that grid on its own would
 # starve the device -- which is CLAUDE.md section 2.3's block-per-item rule in a second place, and
-# getting it backwards costs 12 %. Measured on an RTX 5090 / Warp 1.17, interleaved, ``min`` of
-# 4-5, with the emitted face buffer **identical at every block size in every row**:
-#
-# | case | ``n_loops`` | ``max_size`` | 32 -> 128 |
-# |---|---|---|---|
-# | one wavy rim | 1 | 128 | **0.93x** |
-# | one wavy rim | 1 | 197 | 1.00 |
-# | one wavy rim | 1 | 380 | 1.06 |
-# | one wavy rim | 1 | 590 | 1.17 |
-# | one wavy rim | 1 | 1024 | **1.45** |
-# | ``rim_short`` (the benchmarked shape) | 2 | 512 | **1.13** |
-# | capped tubes | 1 | 512 | 1.01 |
-# | capped tubes | 8 | 512 | 1.03 |
-# | capped tubes | 32 | 512 | **0.93** |
-# | capped tubes | 128 | 512 | **0.89** |
-# | ``happy_buddha``, a scattered 1/5 region | 99 | 3025 | **0.88** |
-# | ``holes_many`` | 512 | 3 | 1.02 |
-#
-# So the wide block is worth 1.13-1.45x at one or two long rims and **loses 0.88-0.93x from ~32
-# rims up**, whatever the rim length -- the 99-rim ``happy_buddha`` row has the *longest* spans here
-# and is the worst loss, which is what rules out keying on ``max_size``. Hence both conditions in
+# getting it backwards costs over 10 %. Measured with the emitted face buffer identical at every
+# block size: the wide block wins at one or two long rims and **loses from a few dozen rims up,
+# whatever the rim length** -- the case with the longest spans and a hundred of them is the worst
+# loss, which is what rules out keying on rim length alone. Hence both conditions in
 # ``hole_dp_block``: a long rim for the lanes to have work, and few enough rims that the grid needs
-# them. Within the winning corner the size of the win is mesh-dependent (1.01x on a capped tube
-# against 1.13x on ``rim_short`` at the same shape), so treat the table as a floor, not a formula.
+# them. Within the winning corner the size of the win is mesh-dependent, so treat the thresholds as
+# a floor rather than a formula.
 #
 # Two notes on method, each of which reversed a conclusion here. The previous reading of this knob,
-# **"measured flat between 32 and 128"** (19.0/20.1 at 32 against 19.6/23.9 at 128 on
-# ``rim_short``), was taken on Warp 1.16 and no longer holds on 1.17 -- re-probe a tuning constant
-# after an upgrade rather than trusting the comment. And a first version of this cut keyed on
-# ``max_size`` alone; it was caught by an A/B on a *scattered* deleted region, not by the benchmark
-# rows, so a many-rim case belongs in any future sweep of it. The old tie-break reason still stands
-# on its own terms -- a single-warp block takes the ``warp_count == 1`` fast path in Warp's
-# ``tile_reduce_impl``, 126 ns per ``tile_min`` against 325 at 64 and 369 at 128 -- it is simply
-# outweighed when the grid is narrow and the apex loop long.
+# "flat between 32 and 128", was taken on Warp 1.16 and no longer holds on 1.17 -- re-probe a tuning
+# constant after an upgrade rather than trusting the comment. And a first version of this cut keyed
+# on the rim length alone; it was caught by an A/B on a *scattered* deleted region, not by the
+# benchmark rows, so a many-rim case belongs in any future sweep of it. The old tie-break reason
+# still stands on its own terms -- a single-warp block takes the ``warp_count == 1`` fast path in
+# Warp's ``tile_reduce_impl`` -- it is simply outweighed when the grid is narrow and the apex loop
+# long.
 HOLE_DP_BLOCK = 32
 HOLE_DP_BLOCK_LONG = 128
 # Longest rim at or above which the wide block can pay (measured flat for both at exactly 256)...
@@ -346,32 +323,24 @@ class HoleFillTables:
 
     ``holes._fill_dp`` launches ``fill_dp_span`` once per span -- ``max_B - 2`` times for the whole
     mesh -- and every one of these fifteen values is the same on every launch. A ``wp.launch``
-    argument costs ~1.0 us of host time, linearly and on both devices (measured over 2-28
-    arguments: 15 us at 2, 41 us at 28), so a 16-argument kernel launched ~510 times on a
-    512-edge rim spent milliseconds marshalling constants. Only ``span`` stays an argument.
+    argument costs about a microsecond of host time, linearly and on both devices, so a
+    16-argument kernel launched hundreds of times spent milliseconds marshalling constants. Only
+    ``span`` stays an argument.
 
     **``dp`` and ``prev`` are in here too, and that is a measured decision rather than a tidy
     one.** They are the launch's in-place *output*, so leaving them as arguments reads better and
     that is how this struct originally drew the line. But their pointers do not change across the
-    sweep either, and at ~1.0 us per argument per launch a 510-launch rim pays milliseconds for the
-    legibility -- which is the whole of what this DP's cost is, since it is launch-bound at every
-    rim size the benchmark reaches. Moving the two in measured **1.110x** on ``rim_short``
-    (10.738 -> 9.678 ms, min of 15 over five alternating process pairs) and flat within 1 % on
-    ``holes_many`` / ``holes_dense``, whose rims are short enough that the sweep is ~30 launches
-    rather than 510. ``holes._run_hole_dp`` binds them once, right where it binds everything else.
+    sweep either, and this DP is launch-bound at every rim size the benchmark reaches, so the
+    legibility costs a real fraction of a long-rim call. Moving the two in is a clear win on a long
+    rim and flat on a short one, whose sweep is a few dozen launches rather than hundreds.
+    ``holes._run_hole_dp`` binds them once, right where it binds everything else.
 
-    Measured on an RTX 5090, the two spellings of the span loop interleaved in one process over the
-    same tables (median/min): **1.56x/1.54x** at 2 loops x 512 (``rim_short``'s shape, 510
-    launches), **1.82x/1.85x** at 64 x 32 (``holes_many``'s, 30 launches), 1.85x/1.93x at 2 x 128
-    and 1.19x/1.17x at 1 x 1024. The saving works out at 9.5-11.9 us per launch against the 12 us
-    the twelve dropped arguments predict.
+    Build it ONCE in the wrapper and reuse it: construction is not free, and doing it per launch
+    would give most of the saving back.
 
-    A cross-*session* before/after had read this as a 1.36x win on the long rims and an 8% *loss* on
-    the short ones; the loss was drift in the surrounding work, which is what interleaving in one
-    clock state is for.
-
-    Build it ONCE in the wrapper and reuse it: construction costs ~2.6 us, which would give most
-    of the saving back if it were done per launch.
+    A cross-*session* before/after read this as a win on the long rims and a loss on the short ones;
+    the loss was drift in the surrounding work, which is what interleaving in one clock state is
+    for.
     """
 
     loop_pos: wp.array[wp.vec3]
@@ -414,15 +383,12 @@ def apex_cost(
     tri = triangle_fill_metric(a_pos, k_pos, c_pos, plane_normal, char_area, tables.metric_id)
     # The apex loop varies ``k``, which sits in the *column* of child ``(i, k)`` and in the *row*
     # of child ``(k, j)``, so with the lanes of ``fill_dp_span_tiled`` striding ``k`` one of the
-    # two reads runs at stride ``4 * b`` -- 2 048 bytes on a 512-vertex rim, a transaction per
-    # lane. **Mirroring the tables transposed so that both reads are contiguous was built,
-    # verified byte-identical, and measured as a net loss** (0.917x on ``rim_short``; against the
-    # same struct-resident tables this file ships, 1.095x where the unmirrored form gives 1.150x).
-    # Two reasons it cannot pay here: the DP tables are a few megabytes and sit in L2, so the
+    # two reads is strided by the table's row length -- a transaction per lane. **Mirroring the
+    # tables transposed so that both reads are contiguous was built, verified byte-identical, and
+    # measured as a net loss.** Two reasons it cannot pay here: the DP tables sit in L2, so the
     # "one transaction per lane" is an L2 hit rather than a DRAM fetch; and this DP is
-    # launch-bound, so the mirror's two extra per-interval stores and -- before they moved into
-    # ``HoleFillTables`` -- two extra launch arguments cost more than the coalescing saves. Do not
-    # re-propose it without a rim whose tables exceed L2.
+    # launch-bound, so the mirror's two extra per-interval stores cost more than the coalescing
+    # saves. Do not re-propose it without a rim whose tables exceed L2.
     left = base + i * b + k
     right = base + k * b + j
     val = combine_metric(tables.dp[left], tables.dp[right], tables.combine_id)
@@ -535,24 +501,20 @@ def fill_dp_span_tiled(tables: HoleFillTables, span: wp.int32) -> None:
     # with. They differ on the CPU device, where ``wp.launch_tiled`` runs exactly one lane
     # per block through Warp 1.17 and ``wp.block_dim()`` reads 1. With the constant, lane 0 was the
     # only lane running and it stepped by 32, so the DP minimized over every 32nd apex and returned
-    # a valid-looking, equal-count, *wrong* triangulation -- measured on ``_star_tube``, 42 of 44
-    # triangles differed from the serial engine. With the runtime value the single CPU lane strides
-    # by 1, covers every apex, and the two tile reductions below degenerate to one-element tiles
-    # that return that lane's own answer. Byte-identical to ``fill_dp_span`` on both devices.
-    #
-    # Measured on an RTX 5090, Warp 1.16, a 400-vertex loop, three alternating pairs: the runtime
-    # stride costs nothing (min 10.07 / 10.25 / 10.19 ms against 9.98 / 10.23 / 9.77 for the
-    # constant; medians 10.38 against 10.60). The loop body is an ``apex_cost`` call, so there was
-    # never much for a compile-time step to unroll.
+    # a valid-looking, equal-count, *wrong* triangulation. With the runtime value the single CPU
+    # lane strides by 1, covers every apex, and the two tile reductions below degenerate to
+    # one-element tiles that return that lane's own answer. Byte-identical to ``fill_dp_span`` on
+    # both devices, and the runtime stride costs nothing on CUDA -- the loop body is an
+    # ``apex_cost`` call, so there was never much for a compile-time step to unroll.
     #
     # **The tie-break is the contract, not the cost.** ``update_argmin`` takes the *smallest* apex
     # ``k`` at equal cost, and that choice decides the emitted triangles, so a differently-tied
-    # reduction is a valid, equal-cost, *different* filling — which every metric/count test in the
+    # reduction is a valid, equal-cost, *different* filling -- which every metric/count test in the
     # suite passes. The two-stage reduction below reproduces it exactly and without any float
     # bit-packing: the block minimum of the cost, then the block minimum of ``k`` over just the
     # lanes that attained it. A lane's own ``update_argmin`` already holds the smallest ``k`` at its
-    # own minimum, so the pair is (min cost, min k attaining it) — which is what an ascending strict
-    # ``<`` scan returns. Lanes with no apex, and an all-non-finite interval, both leave
+    # own minimum, so the pair is (min cost, min k attaining it) -- which is what an ascending
+    # strict ``<`` scan returns. Lanes with no apex, and an all-non-finite interval, both leave
     # ``(inf, -1)`` and agree with the serial kernel there too.
     ell, i, t = wp.tid()
     # Every guard below is warp-uniform (it reads only ``ell``, ``i`` and ``span``), so the whole
@@ -752,14 +714,10 @@ def global_argmin(
     #
     # One lane walking ``n_a`` elements looks like the antipattern it usually is, and folding it
     # into ``row_argmin`` -- which would reduce each row's winner into a packed
-    # ``pack_nearest_key`` atomic and drop this launch entirely -- was measured and **declined**.
-    # On an RTX 5090, two facing fan disks, min of 7, this kernel costs 0.023 / 0.042 / 0.108 ms
-    # at rims of 100 / 1 000 / 4 000 against 1.54 / 7.24 / 26.6 ms for the whole ``stitch_loops``
-    # call: **1.51 % / 0.58 % / 0.41 %**. It is launch-dominated rather than loop-dominated (a
-    # bare launch is ~32 us, CLAUDE.md section 13.1), so the serial walk is not what is being paid
-    # for, and the share *falls* with rim size -- the saving would be largest exactly where the
-    # call is already cheap. The whole alignment path -- this plus ``row_argmin`` plus
-    # ``boundary_perimeters`` -- is 4.5 % at 100 and 2.3 % at 4 000.
+    # ``pack_nearest_key`` atomic and drop this launch entirely -- was measured and **declined**. It
+    # is a fraction of a percent of the whole ``stitch_loops`` call at every rim size, it is
+    # launch-dominated rather than loop-dominated, and its share *falls* with rim size, so the
+    # saving would be largest exactly where the call is already cheap.
     best_row = wp.int32(0)
     best_val = val_min[0]
     for i in range(1, n_a):
@@ -937,18 +895,15 @@ class StitchTables:
     """
     The stitch DP's invariant inputs, bundled so the per-diagonal launches carry one argument.
 
-    ``holes._stitch_halves`` launches ``stitch_dp_diag`` once per anti-diagonal --
-    ``n_a + n_b`` times, so 400 launches for two 200-vertex rims -- and every one of these ten
-    values is the same on every launch. Only ``diag`` and the two in-place DP tables vary. This is
-    ``HoleFillTables``' argument exactly, in the same file and on the same shape of loop; see that
-    struct's docstring for the measured per-argument cost model and for why the struct must be
-    built **once**, outside the loop.
-
-    The measurement for *this* kernel is recorded at its launch site in ``holes._stitch_halves``.
+    ``holes._stitch_halves`` launches ``stitch_dp_diag`` once per anti-diagonal -- ``n_a + n_b``
+    times -- and every one of these ten values is the same on every launch. Only ``diag`` and the
+    two in-place DP tables vary. This is ``HoleFillTables``' argument exactly, in the same file and
+    on the same shape of loop; see that struct's docstring for the per-argument cost model and for
+    why the struct must be built **once**, outside the loop.
 
     Not graph capture: recording a graph costs at least what issuing the launches costs, so capture
-    pays only on a sequence that is *replayed*, and this loop runs once per call. Measured at 400
-    launches, capture-and-replay-once is a 0.84x loss where a bundle is a 1.88x win.
+    pays only on a sequence that is *replayed*, and this loop runs once per call. Measured at this
+    launch count, capture-and-replay-once is a loss where a bundle is a substantial win.
     """
 
     a_pos: wp.array[wp.vec3]
@@ -1108,11 +1063,9 @@ def extend_rim_to_ring(
     # The shared predicate takes the offset from the origin and returns it, so the origin is
     # subtracted and added back -- one more subtract than writing the projection out, and a
     # cancellation the direct form does not have. Not bit-identical to it, and deliberately so: the
-    # disagreement is **3.0e-08 relative** on the extension's own output and stays there whatever
-    # the model's scale or distance from the origin (probed at unit scale, at 1e3 and 1e5 away, and
-    # at scale 100), i.e. it sits at float32 epsilon rather than growing. Face buffers are
-    # unchanged, so nothing topological turns on it, and the off-plane residual is a wash between
-    # the two forms -- neither is the more accurate one.
+    # disagreement sits at float32 epsilon and stays there whatever the model's scale or distance
+    # from the origin, rather than growing. Face buffers are unchanged, so nothing topological turns
+    # on it, and the off-plane residual is a wash between the two forms.
     a = loop_vertices[t]
     point = vertices[a]
     origin = plane_origins[loop_id[t]]

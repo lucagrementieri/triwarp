@@ -462,14 +462,14 @@ def mesh_to_mesh_distance(
     # Seeded at the bound the vertex query already paid for, so every thread prunes against it from
     # its first candidate instead of waiting for some other thread to publish one.
     #
-    # Seeded at *exactly* ``upper_bound ** 2`` this is wrong, and that is why it used to be ``inf``:
-    # the prune skips a candidate whose box gap is ``>=`` the limit, so when the bound *is* the
-    # answer -- two spheres whose closest points are vertices -- the very pair achieving it is
-    # skipped and the result comes back ``inf``. The relative bump is what keeps that pair, and
-    # ``1e-4`` rather than an ulp because ``upper_bound`` comes from ``mesh_query_point_no_sign``,
-    # which is documented off by up to 2.1e-5; the margin is ~5x that and ~800 float32 ulps, and it
-    # weakens the prune by nothing measurable. ``max`` covers touching meshes, where the bound is
-    # ``0`` and any positive limit keeps the exactly-zero-gap pair.
+    # Seeded at *exactly* ``upper_bound ** 2`` this is wrong: the prune skips a candidate whose box
+    # gap is ``>=`` the limit, so when the bound *is* the answer -- two spheres whose closest points
+    # are vertices -- the very pair achieving it is skipped and the result comes back ``inf``. The
+    # relative bump is what keeps that pair, and it is a relative ``1e-4`` rather than an ulp
+    # because ``upper_bound`` comes from ``mesh_query_point_no_sign``, whose own accuracy is
+    # documented at a few times 1e-5; the margin clears that by several times and weakens the prune
+    # by nothing measurable. ``max`` covers touching meshes, where the bound is ``0`` and any
+    # positive limit keeps the exactly-zero-gap pair.
     global_best_sq = wp.full(
         1,
         max(upper_bound * upper_bound * (1.0 + 1e-4), _MIN_POSITIVE_FLOAT32),

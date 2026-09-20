@@ -242,13 +242,11 @@ def test_points_to_barycentric(bench_case: BenchCase) -> None:
     One point per triangle, back to barycentric coordinates: the module's other soup operation.
 
     Each library is timed at its own single formulation, which is what makes the three rows
-    comparable. This row used to be parametrized over triwarp's ``method``, because the package
-    offered Cramer's rule on the 2x2 Gram system alongside the cross-product ratio; that option is
-    gone, having been measured less accurate at every triangle shape and scale and more accurate at
-    none. **The parametrize is not worth keeping for the reference side alone**: the two
-    formulations were measured indistinguishable in cost -- interleaved A/B, min of 30, both at the
-    launch floor, 0.0274 against 0.0275 ms at 20 000 triangles and 0.0273 against 0.0267 at
-    200 000 -- so a second id per library would time the same thing twice under two names.
+    comparable. Cramer's rule on the 2x2 Gram system is not offered alongside the cross-product
+    ratio: it measured less accurate at every triangle shape and scale and more accurate at none.
+    **The parametrize is not worth keeping for the reference side alone** either — the two
+    formulations are indistinguishable in cost, both at the launch floor at every size, so a second
+    id per library would time the same thing twice under two names.
 
     The query points are the face barycentres, so every one lies in its triangle's plane: this
     measures the in-plane solve rather than a projection.
@@ -327,17 +325,10 @@ def test_corner_normals(bench_case: BenchCase, creased: bool) -> None:
     times the computation only: its ``Vector_std_array_Vector3f_3_FaceId`` result has no bulk
     readback (indexing it is a double Python loop), which is a test-side cost, not a timed one.
 
-    First measurement, medians on an RTX 5090, smooth / creased:
-
-    | mesh | faces | triwarp-cuda | meshlib |
-    |---|---|---|---|
-    | ``bunny`` | 69 630 | 0.62 / 0.79 ms | **0.35 / 0.35** (1.8-2.2x ahead) |
-    | ``happy_buddha`` | 1 087 716 | **1.27 / 1.51 ms** | (capped) |
-    | ``dragon`` | 871 414 | **1.16 / 1.12 ms** | 5.15 / 5.48 (4.5-4.9x behind) |
-
-    The crossover is the point: meshlib wins at 70k faces and loses by 4.5x at 871k, because its
-    row is a single-threaded per-corner walk while triwarp's is ~0.6 ms of fixed wrapper cost
-    (``halfedge_twins``, the face normals and the angles) plus a walk that barely shows. Below the
+    The crossover is the point: meshlib wins at the small end and loses by several times at the
+    large one, because its row is a single-threaded per-corner walk while triwarp's is a fixed
+    wrapper cost (``halfedge_twins``, the face normals and the angles) plus a walk that barely
+    shows. Below the
     crossover this group is measuring the prologue, not the walk -- which is also why the creased
     and smooth columns are within noise of each other on the large meshes.
     """

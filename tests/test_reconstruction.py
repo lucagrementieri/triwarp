@@ -581,17 +581,15 @@ def _poisson_depth(device: str) -> int:
     solve is over the ``2 ** depth`` cubed node grid **whatever the cloud size**, so it octuples per
     level, and the CPU backend is not close to CUDA on it.
 
-    Measured on Warp 1.16, 642-point cloud, the two depths **interleaved in one process** and read
-    as the minimum of three (CLAUDE.md section 15.7): depth 5 takes **7.95 s** on CPU against depth
-    6's **68.09 s**, a **8.6x** saving per solve, matching the 8x the grid size predicts. Both are
-    ~0.01 s on CUDA.
+    Measured with the two depths **interleaved in one process** and read as the minimum of three
+    (CLAUDE.md section 15.7), dropping a level is an **8.6x** saving per CPU solve, matching the 8x
+    the grid size predicts. Both are negligible on CUDA.
 
     !!! warning "Quote the ratio, not the wall clock"
-        This box's CPU timings swing ~40 % with background load: the same depth-6 solve measured
-        68 s here, 99 s in a sequential sweep and 71-307 s inside different full-suite runs. The
-        *ratio* is stable because both sides move together, which is exactly why section 13 asks
-        for an interleaved A/B rather than two numbers taken apart. Do not re-derive a suite total
-        from these.
+        This box's CPU timings swing ~40 % with background load, and the same depth-6 solve has been
+        seen to spread more than fourfold across full-suite runs. The *ratio* is stable because both
+        sides move together, which is exactly why section 13 asks for an interleaved A/B rather than
+        two numbers taken apart.
 
     Depth 4 is not an option: 2 144 faces is too coarse to resolve the torus hole.
 
@@ -599,9 +597,11 @@ def _poisson_depth(device: str) -> int:
     which is why the level is a helper and not a blanket edit:
 
     - ``test_poisson_sphere_watertight_manifold`` -- the depth-5 surface self-intersects, so it is
-      not watertight on *either* device, and the radius tolerances are sized to a depth-6 cell;
+      not
+      watertight on *either* device, and the radius tolerances are sized to a depth-6 cell;
     - ``test_poisson_matches_open3d_metric`` and ``..._pymeshlab_metric`` -- the class-C margin
-      falls from 3.4x / 3.7x to **2.64x / 2.44x**, under section 6's 3x floor.
+      falls
+      from 3.4x / 3.7x to **2.64x / 2.44x**, under section 6's 3x floor.
 
     Keep the *reference* libraries at whatever depth their own comment specifies -- open3d and
     pymeshlab return identical output at 5 and 6 on this cloud and are pinned to 5 on both devices,
@@ -640,25 +640,15 @@ def _open3d_poisson(points_np: np.ndarray, normals_np: np.ndarray, depth: int) -
 
     ``n_threads`` defaults to ``-1``, meaning one thread per core, and on this 642-point cloud
     Kazhdan's solver is far below its parallel break-even: the barriers dominate and the wall clock
-    grows monotonically with the thread count from the first doubling. Measured on this box at
-    ``depth=5``, one setting per process, and the answer does not move -- **7 976 faces at every
-    setting**:
+    grows monotonically with the thread count from the first doubling, reaching well over a
+    hundredfold at the default. Measured one setting per process, and the answer does not move --
+    **7 976 faces at every setting**.
 
-    ===========  =========
-    n_threads    wall
-    ===========  =========
-    1            **0.575 s**
-    2            2.350 s
-    4            8.621 s
-    8            34.469 s
-    -1 (default) **78.395 s**
-    ===========  =========
-
-    At one thread the *CPU* time is 0.257 s, so 0.575 s is essentially the floor and no thread count
-    can beat it by much -- pinning costs nothing even on an idle box. Unpinned, this test measured
-    36.99 s inside the suite and 44.92 s in a re-run twenty minutes later; the spread is the reason
-    for the pin, not the mean. The pymeshlab twin has the same defect and a much worse constant --
-    see ``test_poisson_matches_pymeshlab_metric``.
+    At one thread the CPU time is within a factor of two of the wall clock, so one thread is
+    essentially the floor and no thread count can beat it by much; pinning costs nothing even on an
+    idle box. Unpinned, this test also spread by a fifth between two runs twenty minutes apart --
+    the spread is the reason for the pin, not the mean. The pymeshlab twin has the same defect and a
+    much worse constant; see ``test_poisson_matches_pymeshlab_metric``.
     """
     pcd = points_to_open3d(points_np, normals_np)
     mesh_o3d, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
@@ -724,9 +714,9 @@ def test_poisson_matches_open3d_metric(device: str):
     )
     mesh_tw = warp_to_trimesh(vertices_wp, faces_wp)
     # depth=5 on the reference side, not 6: on this 642-point cloud open3d returns the *same*
-    # 7 976 faces at both depths (measured) for 0.28 s instead of 0.85 s, so the extra octree
-    # level is cost without an answer. Only the reference drops -- triwarp stays at depth 6, pinned
-    # on both devices per the docstring, where it resolves 32 552 faces in 0.01 s either way.
+    # 7 976 faces at both depths (measured) at a third of the cost, so the extra octree level is
+    # cost without an answer. Only the reference drops -- triwarp stays at depth 6, pinned on both
+    # devices per the docstring, where it resolves 32 552 faces either way.
     mesh_o3d = _open3d_poisson(points_np, normals_np, depth=5)
     mean_distance, _ = symmetric_surface_distance(mesh_tw, mesh_o3d)
     assert mean_distance < 0.015
@@ -819,13 +809,12 @@ def test_poisson_matches_pymeshlab_metric(device: str):
     # ``print_filter_parameter_list`` reports ``threads : int = 48`` on this box -- the default is
     # ``hardware_concurrency`` -- and on a 642-point cloud the solver is far below its parallel
     # break-even, so the wall clock grows monotonically with the thread count while the answer does
-    # not move (7 976 faces at every setting): 2.250 s at 1, 2.680 s at 2, 7.444 s at 4, 122.279 s
-    # at 8, and over 115 s at the 48 default. Unpinned this test measured **261 s** inside the suite
-    # and **540 s** in a re-run twenty minutes later, against 0.019 s for the triwarp solve it is
-    # comparing -- so its cost was a function of how busy the machine was, not of anything either
-    # implementation does. One thread costs ~3.4 s of CPU, which bounds the worst case; a global
-    # ``OMP_NUM_THREADS`` cap does *not* help here, because MeshLab's filter sets its own thread
-    # count from this parameter and overrides the environment (measured: unchanged at >115 s).
+    # not move (7 976 faces at every setting) -- roughly fiftyfold from one thread to the 48
+    # default. Unpinned, this test also doubled between two runs twenty minutes apart, against a
+    # triwarp solve four orders of magnitude cheaper, so its cost was a function of how busy the
+    # machine was rather than of anything either implementation does. One thread's CPU time bounds
+    # the worst case; a global ``OMP_NUM_THREADS`` cap does *not* help, because MeshLab's filter
+    # sets its own thread count from this parameter and overrides the environment (measured).
     meshset_pml.generate_surface_reconstruction_screened_poisson(depth=5, threads=1)
     mesh_current = meshset_pml.current_mesh()
     mesh_pml = tm.Trimesh(
@@ -1545,7 +1534,7 @@ def test_ball_pivoting_matches_pymeshlab(device: str):
     **The reference's ``clustering`` parameter is load-bearing and its zero is not "off".** At
     ``clustering=0`` the filter returns **0 faces**; 20% is MeshLab's default and the seed-triangle
     spacing floor the algorithm needs. ``benchmarks/test_reconstruction.py`` passed 0 and so timed a
-    filter that reconstructed nothing (9.6 ms for no output, against 2.7 ms for the real thing);
+    filter that reconstructed nothing, and took *longer* doing it than the real thing;
     that row now passes the default.
 
     **Bug class excluded:** a front that closes the surface at the wrong scale or drifts off the

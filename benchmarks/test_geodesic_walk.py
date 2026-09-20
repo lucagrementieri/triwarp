@@ -24,10 +24,10 @@ ray-count one. Two things to keep in mind when reading its rows: it traces a sin
 -- is inside the timed callable, matching this suite's convention for reference setup. triwarp's row
 likewise includes its own ``halfedge_twins`` and one-ring prologue.
 
-That construction is the *dominant* term once the mesh is large: at 1 024 rays it measures 142 ms of
-build against 9.6 ms of tracing on ``sphere_med`` and 857 ms against 10.7 ms on ``sphere_large``. So
-on the ``scale`` axis the reference row is essentially a build benchmark, and the per-ray comparison
-lives in the ``trace_rays`` ray-count sweep where the build is amortized across up to 4 096 rays.
+That construction is the *dominant* term once the mesh is large -- an order of magnitude or more
+over the tracing itself -- so on the ``scale`` axis the reference row is essentially a build
+benchmark, and the per-ray comparison lives in the ``trace_rays`` ray-count sweep where the build is
+amortized across up to 4 096 rays.
 
 **trimesh**, **libigl**, **open3d** and **scipy** have nothing comparable: tracing a straightest
 geodesic needs an unfolding walk across edges, and none of them exposes one. ``igl`` does join
@@ -138,12 +138,11 @@ def test_trace_from_face(bench_case: BenchCase) -> None:
     ``trace_geodesic_from_vertex`` the ``trace_rays`` group already times -- same tracer object,
     same barycentric start convention -- so this group takes the same reference rather than none.
 
-    **On this axis the reference row is its own construction.** Measured at 1 024 rays: the halfedge
-    build is 142 ms against 9.6 ms of tracing on ``sphere_med`` and **857 ms against 10.7 ms** on
-    ``sphere_large``, so the potpourri3d row is 99% build at the top of the scale sweep. That is the
-    suite's convention for reference setup (see the module docstring) and it is the honest number
-    for a caller who has no tracer in hand -- but read it as "what geometry-central charges to be
-    ready", and read the ``trace_rays`` ray-count sweep for the per-ray cost.
+    **On this axis the reference row is its own construction**: the halfedge build dwarfs the
+    tracing, so the potpourri3d row is almost entirely build at the top of the scale sweep. That is
+    the suite's convention for reference setup (see the module docstring) and it is the honest
+    number for a caller who has no tracer in hand -- but read it as "what geometry-central charges
+    to be ready", and read the ``trace_rays`` ray-count sweep for the per-ray cost.
     """
     n_rays = 1024
     rng = np.random.default_rng(1)
@@ -208,21 +207,13 @@ def test_geodesic_path(bench_case: BenchCase, n_paths: int) -> None:
     Both take one query per call, so their rows include a Python loop -- read them as the cost of
     *that* API shape.
 
-    First measurement, medians on an RTX 5090 at ``sphere_med`` (40 962 vertices):
+    The amortization is the whole row: **4 096 paths cost about twice what one costs**, because the
+    heat solve is shared and only the walks scale. Against that, potpourri3d is linear in the path
+    count and igl is flat but far off, since MMP propagates windows over the whole surface whatever
+    is asked of it.
 
-    | paths | triwarp-cuda | potpourri3d | igl |
-    |---|---|---|---|
-    | 1 | **17.3 ms** | 106.0 | 2 095 |
-    | 64 | **25.1** | 693.2 | 2 152 |
-    | 4 096 | **34.3** | (capped) | (capped) |
-
-    The amortization is the whole row: **4 096 paths cost twice what one costs**, because the heat
-    solve is shared and only the walks scale. Against that, potpourri3d is linear in the path count
-    (6.1x behind at one path, 27.6x at 64, and extrapolating to ~44 s at 4 096) and igl is flat but
-    100x off, since MMP propagates windows over the whole surface whatever is asked of it.
-
-    triwarp's 17.3 ms at *one* path is almost entirely the factorization, not the walk -- which is
-    the honest caveat on the left column and the reason ``operators=`` exists on the wrapper.
+    triwarp's cost at *one* path is almost entirely the factorization, not the walk -- which is the
+    honest caveat on the left column and the reason ``operators=`` exists on the wrapper.
     """
     device = bench_case.device
     rng = np.random.default_rng(4)
@@ -281,29 +272,21 @@ def test_shorten_loop(bench_case: BenchCase) -> None:
     Shortening a homology basis, on the one axis in either registry that has a genus.
 
     The loops come from [`test_homology_generators`]'s own call and are built **outside** the timed
-    callable on both sides, so this group times the shortening and not the basis -- which matters,
-    because that basis costs 50-65 ms and would swamp it (see ``benchmarks/test_homology.py``).
+    callable on both sides, so this group times the shortening and not the basis, which would
+    otherwise swamp it (see ``benchmarks/test_homology.py``).
 
     potpourri3d's ``find_geodesic_loop`` is the reference and answers **one loop per call**, so its
     row is linear in the genus by construction; the solver build is inside its callable, matching
     this suite's convention for reference setup, and triwarp's row likewise carries its own
     ``halfedge_twins`` and one-ring prologue. The two do not compute the same curve -- this one
-    stays on mesh edges, that one flips its way into face interiors -- so read the row against
-    ``tests/test_geodesic_walk.py``'s measured 1.066-1.578x length gap, not as a like-for-like.
+    stays on mesh edges, that one flips its way into face interiors -- so read the row against the
+    length gap ``tests/test_geodesic_walk.py`` pins, not as a like-for-like.
 
-    First measurement, medians on an RTX 5090 at ~90 000 faces:
-
-    | mesh | generators | triwarp-cuda | potpourri3d |
-    |---|---|---|---|
-    | ``handles_1`` | 2 | **1.90 ms** | 95.6 (50.3x) |
-    | ``handles_64`` | 128 | **9.50 ms** | 212.5 (22.4x) |
-
-    Both columns are dominated by their fixed cost at genus 1 and by the loops at genus 64, and the
-    *marginal* numbers are the ones worth keeping: 126 extra loops cost triwarp 7.6 ms (0.060 ms
-    each) and potpourri3d 116.9 ms (0.928 ms each), a **15x** per-loop gap on top of a build that is
-    ~94 ms against ~1.8. This is the first row in this family where triwarp is ahead --
-    ``homology_generators``, which produces the input, is 6.9-10.9x *behind* meshlib -- so the two
-    groups together say the basis is the module's bottleneck and shortening it is not.
+    Both columns are dominated by their fixed cost at genus 1 and by the loops at genus 64, so the
+    *marginal* per-loop cost is the number worth keeping; triwarp is well ahead on it. This is the
+    first row in this family where triwarp is ahead -- ``homology_generators``, which produces the
+    input, is behind meshlib -- so the two groups together say the basis is the module's bottleneck
+    and shortening it is not.
     """
     if _GENERATORS[bench_case.mesh_name] == 0:
         pytest.skip(f"{bench_case.mesh_name} is genus 0: there is no loop to shorten")

@@ -363,9 +363,9 @@ def contains_points(
     # and derive the diagonal from it directly.
     mesh_min, mesh_max = aabb(mesh.points)
     # ``math.dist`` rather than ``float(wp.length(upper - lower))``: a Warp operator and a
-    # Warp builtin at Python scope each route through builtin dispatch, measured 14.68 us
-    # against 3.02 (4.9x). It computes in float64 where ``wp.length`` is float32, i.e. ~2e-8
-    # relative and the correctly-rounded answer for float32 corners. Section 13.1.
+    # Warp builtin at Python scope each route through builtin dispatch, several times dearer. It
+    # computes in float64 where ``wp.length`` is float32, i.e. the correctly-rounded answer for
+    # float32 corners. Section 13.1.
     max_dist = math.dist(mesh_min, mesh_max)
     out_contains = wp.empty(n, dtype=wp.bool, device=points.device)
     wp.launch(

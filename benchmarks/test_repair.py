@@ -1,86 +1,67 @@
 """
 Benchmarks for ``triwarp.repair``.
 
-Axis: **defect count** for three of the four groups, and **diameter** for the fourth. Repair
-functions are the clearest case in the package of cost that a face count cannot predict -- they
-are all "find the broken things and fix them", so the number of broken things is the driver and
-the mesh they are embedded in is nearly irrelevant. Every defect group therefore runs on
-``sphere_med`` and sweeps the *injected defect count*, holding the mesh fixed:
+Axis: **defect count** for three of the four groups, **diameter** for the fourth. Repair functions
+are the clearest case in the package of cost a face count cannot predict — they all "find the broken
+things and fix them", so the number of broken things is the driver and the mesh they sit in is
+nearly irrelevant. Every defect group runs on ``sphere_med`` and sweeps the *injected defect count*:
 
-* ``resolve_duplicated_faces`` -- 0% against 10% cancelling flipped pairs.
-* ``remove_non_manifold_faces`` -- 0 against 1 024 extra faces, each one making its three edges
-  3-incident. This one also loops: removing faces can create *new* non-manifold edges, so a
-  pathological input uses all ``max_iter`` rounds where a clean one exits after the first test.
-* ``remove_duplicated_vertices`` -- run on an *unwelded* soup (every face owning its own three
-  vertices, the state a freshly loaded STL is in), sweeping ``epsilon``. The two values are two
-  code paths rather than two thresholds: positive ``epsilon`` snaps coordinates to
-  ``round(v / epsilon)``, while ``0`` buckets by the high bits of the float32 representation --
-  a *relative* cell about 2.4e-4 wide, not an equality test.
+* ``resolve_duplicated_faces`` — 0 % against 10 % cancelling flipped pairs.
+* ``remove_non_manifold_faces`` — 0 against 1 024 extra faces, each making its three edges
+  3-incident. This one loops: removing faces can create *new* non-manifold edges, so a pathological
+  input uses all ``max_iter`` rounds where a clean one exits after the first test.
+* ``remove_duplicated_vertices`` — on an *unwelded* soup (every face owning its own three vertices,
+  the state a freshly loaded STL is in), sweeping ``epsilon``. The two values are two code paths
+  rather than two thresholds: positive ``epsilon`` snaps to ``round(v / epsilon)``, while ``0``
+  buckets by the high bits of the float32 representation — a *relative* cell about 2.4e-4 wide, not
+  an equality test.
 
-``make_winding_consistent`` is the exception and gets the **diameter** axis instead: its cost is a
-property of the face-adjacency graph, not of the defect count. It used to *propagate* the
-orientation bits one level per round and measured **7.4 ms on ``sphere_med`` against 642 ms on
-``ribbon_long``** at an identical vertex count -- 87x, while trimesh's equivalent went the other
-way, 16.8 ms to 7.8 ms. It now measures **1.0 ms and 0.85 ms**: flat, and faster than trimesh at
-both ends. Same finding, and same fix, as ``face_orientation_bits`` in
-[`test_validation.py`](test_validation.py), which is the machinery underneath it.
+``make_winding_consistent`` gets the **diameter** axis instead: its cost is a property of the
+face-adjacency graph, not the defect count. A formulation that *propagates* the orientation bits one
+level per round is two orders of magnitude slower on the high-diameter mesh than on the compact one
+at identical vertex count, where trimesh's equivalent goes the other way; the shipped union-find
+form is flat across the axis and faster than trimesh at both ends. Same finding and same fix as
+``face_orientation_bits`` in [`test_validation.py`](test_validation.py), the machinery underneath.
+pymeshlab settles what that axis was really measuring: its serial face-to-face visit is *faster* on
+the high-diameter mesh too. So graph diameter is not intrinsically expensive for this problem; it
+was expensive only for the level-propagating formulation.
 
-pymeshlab settles what that axis was really measuring: its serial face-to-face visit reads
-**53.9 ms on ``sphere_med`` against 33.1 ms on ``ribbon_long``** -- also *faster* on the
-high-diameter mesh, the same direction trimesh goes. So graph diameter is not intrinsically
-expensive for this problem; it was expensive only for the level-propagating formulation triwarp
-used to have.
-
-The two *geometric* defect groups sit on the **quality** axis instead of a defect sweep, because
-their defects are not injectable: ``face_defective_mask`` and ``flip_t_vertices`` look for thin and
-folded triangles, and ``saddle_graded`` already has them by construction (worst aspect ratio 4 719
-against ``saddle``'s 1.6). ``face_defective_mask`` is a fixed number of passes over the adjacency
-whatever it finds, so it should be flat across that axis; ``flip_t_vertices`` is a flip loop and
-should *not* be, since only the graded mesh gives it work to do. That contrast is the point of the
-pair -- and it is now split across two files: the mask moved to ``triwarp.validation`` with the
-other per-element detectors, so its row lives in ``benchmarks/test_validation.py``.
+The two *geometric* defect groups sit on **quality** instead of a defect sweep, because their
+defects are not injectable: ``flip_t_vertices`` looks for thin and folded triangles and
+``saddle_graded`` already has them by construction, where ``saddle`` gives it nothing to do.
 
 References
 ----------
-**open3d**'s ``remove_duplicated_triangles`` solves the same "deduplicate a face array" problem
-with a hash set over index triples, against triwarp's sort-based grouping. It is a comparison of
-dedup *machinery*, not of results -- the semantics differ twice over:
+**open3d**'s ``remove_duplicated_triangles`` solves the same "deduplicate a face array" problem with
+a hash set over index triples against triwarp's sort-based grouping. It compares dedup *machinery*,
+not results — the semantics differ twice over: open3d keeps one representative of each duplicate
+group where triwarp applies a signed-count rule that drops cancelling ``(+1, -1)`` pairs outright,
+and open3d's hash is **orientation-sensitive**, so on this deliberately-flipped input it removes
+nothing and returns the face count unchanged. The hash pass over all ``n`` triples still runs, which
+is the cost being compared; the assertion below only checks the count did not grow. Open3D mutates
+in place and the operation is idempotent, so its mesh is rebuilt inside the timed callable.
+**trimesh**'s ``repair.fix_winding`` is the orientation reference; it has no non-manifold face
+removal.
 
-1. open3d keeps one representative of each duplicate group, while triwarp applies a signed-count
-   rule that drops cancelling ``(+1, -1)`` pairs outright;
-2. open3d's hash is **orientation-sensitive** (measured: it collapses ``[0,1,2]`` against
-   ``[0,1,2]`` but not against ``[2,1,0]``), so on this deliberately-flipped input it removes
-   nothing and returns the face count unchanged. The hash pass over all ``n`` triples still runs,
-   which is the cost being compared; the assertion below only checks the count did not grow.
+**pymeshlab** is the only library covering *all four* groups, and the first reference of any kind
+for ``remove_non_manifold_faces`` — neither trimesh nor open3d nor libigl removes non-manifold faces
+at all:
 
-Open3D mutates in place and the operation is idempotent, so its mesh is rebuilt inside the timed
-callable (rounds 2..n would otherwise dedup an already-deduped mesh). ``remove_duplicated_vertices``
-is its counterpart for the vertex group. **trimesh**'s ``repair.fix_winding`` is the orientation
-reference; it has no non-manifold face removal.
+* ``meshing_repair_non_manifold_edges(method='Remove Faces')`` is the same idea, greedier: for each
+  non-manifold edge MeshLab iteratively deletes the *smallest-area* incident face until the edge is
+  2-manifold, where triwarp drops every face on an over-incident edge and re-tests.
+* ``meshing_remove_duplicate_faces`` is orientation-*insensitive*, so unlike open3d's hash it does
+  see the flipped copies — but it keeps one representative rather than cancelling pairs.
+* ``meshing_remove_duplicate_vertices`` and ``meshing_merge_close_vertices(threshold=...)`` are
+  exactly triwarp's two code paths, so this is the one group where the ``epsilon`` sweep maps across
+  libraries one-for-one.
+* ``meshing_re_orient_faces_coherently`` is a serial face-to-face visit against triwarp's parity
+  union-find, precisely the contrast the ``diameter`` axis exposes.
 
-**pymeshlab** is the only library in the set that covers *all four* groups, and it is the first
-reference of any kind for ``remove_non_manifold_faces`` -- neither trimesh nor open3d nor libigl
-removes non-manifold faces at all:
-
-* ``remove_non_manifold_faces`` -> ``meshing_repair_non_manifold_edges(method='Remove Faces')``.
-  The same idea, greedier: for each non-manifold edge MeshLab iteratively deletes the
-  *smallest-area* incident face until the edge is 2-manifold, where triwarp drops every face on an
-  over-incident edge and re-tests.
-* ``resolve_duplicated_faces`` -> ``meshing_remove_duplicate_faces``. Orientation-*insensitive*
-  (same vertex set, any order), so unlike open3d's hash it does see the flipped copies -- but it
-  keeps one representative rather than cancelling ``(+1, -1)`` pairs.
-* ``remove_duplicated_vertices`` -> ``meshing_remove_duplicate_vertices`` and
-  ``meshing_merge_close_vertices(threshold=...)``: exactly triwarp's two code paths, exact
-  coordinate equality and a tolerance. So this is the one group where the ``epsilon`` sweep maps
-  across libraries one-for-one.
-* ``make_winding_consistent`` -> ``meshing_re_orient_faces_coherently``. A serial face-to-face
-  visit against triwarp's parity union-find, precisely the contrast the ``diameter`` axis exposes.
-
-Every one of them rewrites the topology, so the MeshSet is built inside the timed callable from the
-*defect-injected* arrays rather than from the registry mesh, and each row carries that build. It is
-a large share at this size: 16.4 ms of the 17.8 ms a clean ``remove_duplicate_faces`` costs, and
-38.8 of the 134 ms the unwelded soup's dedup costs (the soup carries 245 760 vertices). Subtract it
-before quoting a ratio.
+Every one rewrites the topology, so the MeshSet is built inside the timed callable from the
+*defect-injected* arrays rather than the registry mesh, and each row carries that build — a large
+share at this size, most of a clean ``remove_duplicate_faces`` row and a third of the unwelded
+soup's dedup. Subtract it before quoting a ratio.
 """
 
 from __future__ import annotations
@@ -258,21 +239,13 @@ def test_make_solid(bench_case: BenchCase) -> None:
     and the composite runs the self-intersection loop over all of it.
 
     ``clean_from_arrays`` is pymeshfix's headline and this is the one group where its row is timed
-    rather than declared, because the operation clears the load by a wide margin: measured
-    **73 %** of the round on ``bunny_decimated`` (250.0 ms total against 67.9 ms of load) and
-    **68 %** on ``bunny`` (1 387.1 against 439.6). The load still cannot leave the timed callable --
-    a ``PyTMesh`` takes exactly one ``load_array`` -- so read the row as pipeline-plus-load and
-    subtract accordingly.
+    rather than declared, because the operation clears the load by a wide margin -- around 70 % of
+    the round on both meshes. The load still cannot leave the timed callable -- a ``PyTMesh`` takes
+    exactly one ``load_array`` -- so read the row as pipeline-plus-load and subtract accordingly.
 
-    First measurement, medians on an RTX 5090:
-
-    | mesh | triwarp-cuda | pymeshfix |
-    |---|---|---|
-    | ``bunny_decimated`` | **22.9 ms** | 212.9 (9.3x) |
-    | ``bunny`` | **30.4 ms** | 1 279.0 (42.0x) |
-
-    The gap widens with the mesh because the composite's per-stage cost is a fixed chain of wrapper
-    calls plus device passes, where the reference is sequential C++ throughout. Read it knowing what
+    triwarp wins the group by an order of magnitude and the gap widens with the mesh, because the
+    composite's per-stage cost is a fixed chain of wrapper calls plus device passes where the
+    reference is sequential C++ throughout. Read it knowing what
     dominates triwarp's side, which is **not** kernel time: a dozen wrapper chains inside a
     convergence loop, each a handful of launches. Anything spent optimizing this belongs in the
     refill chain and the self-intersection loop, exactly as the ``fix_self_intersections`` group's
@@ -323,14 +296,14 @@ def test_remove_small_components(bench_case: BenchCase) -> None:
     pymeshlab's ``meshing_remove_connected_component_by_face_number`` is the same operation with
     the same inclusive bound (``tests/test_repair.py`` compares the answers at 80 and 81 on a
     fixture built to straddle it); it mutates ``current_mesh()``, so the MeshSet is built inside the
-    timed callable and the row carries the ~0.47 us/vertex build. open3d has no filter -- its
+    timed callable and the row carries the per-vertex build. open3d has no filter -- its
     ``cluster_connected_triangles`` returns the per-triangle cluster id plus each cluster's triangle
     count and area, and the mask and the removal are the caller's, which is what the row times; it
     also mutates, so its mesh is rebuilt per round too.
 
-    pymeshfix is **not** a row here: ``remove_smallest_components`` is 9-12 % of a round behind a
-    load that cannot be hoisted out of it (6.7 ms against 67.9 ms on ``bunny_decimated``, 60.5
-    against 439.6 on ``bunny``), so the number would be the load. Its rule is nonetheless what
+    pymeshfix is **not** a row here: ``remove_smallest_components`` is a tenth or so of a round
+    behind a load that cannot be hoisted out of it, so the number would be the load. Its rule is
+    nonetheless what
     ``keep_largest`` defaults to, and ``tests/test_repair.py`` pins that.
     """
     min_faces = 2
@@ -389,9 +362,9 @@ def test_remove_non_manifold_faces(bench_case: BenchCase, extra: int) -> None:
     Iterated edge-sort and manifold test: a clean mesh exits in one round, a broken one loops.
 
     **open3d's ``remove_non_manifold_edges`` is deliberately not a second row.** It uses the same
-    greedier rule MeshLab does -- measured on an ``icosphere(2)`` carrying one extra face on an
-    existing edge, it deletes **one** face (321 -> 320) where triwarp drops all three on that edge
-    (321 -> 318). Both land edge-manifold, so only the post-condition is shared, and a second
+    greedier rule MeshLab does -- on a mesh carrying one extra face on an existing edge it deletes
+    that **one** face where triwarp drops all three on that edge. Both land edge-manifold, so only
+    the post-condition is shared, and a second
     incomparable timing row would say nothing the exemption above does not. What open3d *does*
     supply is that post-condition: it and igl both flip False -> True with triwarp on every input in
     ``tests/test_repair.py``, which is where this group's real coverage now sits -- before that, the
@@ -435,9 +408,8 @@ def test_split_nonmanifold(bench_case: BenchCase, extra: int) -> None:
     nodes, so it barely moves between the two cases. ``igl.split_nonmanifold`` is sequential by
     construction -- it explodes the mesh to ``3 * n_faces`` singleton vertices and greedily re-
     merges pairs, re-testing manifoldness after each candidate, with the source calling its own
-    inner check "Omega(m) and probably O(m log m) or worse" -- and it does move: measured
-    standalone at 84 ms clean against 122 ms with the duplicates on an 81 920-face sphere. It
-    takes ``rounds=3``.
+    inner check "Omega(m) and probably O(m log m) or worse" -- and it does move, measurably, between
+    the clean and the duplicated input. It takes ``rounds=3``.
 
     The two libraries agree on the split exactly for a bowtie vertex, a same-wound fan of three
     faces on one edge, a flipped face and a boundary, but **not on this group's defect**: for a
@@ -752,26 +724,20 @@ def test_make_volume(bench_case: BenchCase) -> None:
 
     pyvista's ``compute_normals(consistent_normals=True, auto_orient_normals=True)`` is the one
     other library that performs *this* operation, and the distinction is worth stating precisely
-    because two libraries have an obviously-named filter that does something else. Measured on an
-    ``icosphere(2)``, signed volume, target +4.047045:
-
-    | input | pyvista | open3d ``orient_triangles`` | pymeshlab ``re_orient_faces_coherently`` |
-    |---|---|---|---|
-    | 20 of 320 faces reversed (inconsistent) | **+4.047045** | +4.047045 | -4.047045 |
-    | every face reversed (consistent, inward) | **+4.047045** | **-4.047045** | -4.047045 |
-
-    The second row is the whole difference. ``orient_triangles`` and
+    because two libraries have an obviously-named filter that does something else. Probed on two
+    inputs -- a *locally* inconsistent mesh and a consistently **inward** one -- only pyvista
+    recovers a positive signed volume from both. ``orient_triangles`` and
     ``meshing_re_orient_faces_coherently`` make the winding *coherent*; on a locally inconsistent
     mesh that recovers the majority orientation and looks like this operation, and on a
     consistently **inward** mesh -- the state ``make_volume`` exists for -- open3d leaves it inward
     and pymeshlab always does. So both belong to ``make_winding_consistent`` and only pyvista is a
-    row here. A comparison probed on the inconsistent input alone reads all three as agreeing, which
-    is exactly what an earlier version of this decision concluded.
+    row here -- note that a comparison probed on the inconsistent input alone reads all three as
+    agreeing.
 
     pyvista is not identical either, on an input class the scan meshes do not contain: on a
     **multi-shell** mesh it turns each shell outward *from itself*, so a cavity's contribution adds
-    where triwarp's subtracts -- measured 1.0010 against 0.9990 on ``tests/conftest.py``'s
-    ``cave_cube``. Every registry mesh here is a single open shell, so the row is unaffected; the
+    where triwarp's subtracts. Every registry mesh here is a single open shell, so the row is
+    unaffected; the
     divergence is pinned in ``tests/test_repair.py``.
 
     The scan meshes are open, so every side takes the "not watertight, return unchanged" path and
@@ -849,10 +815,10 @@ def test_remove_degenerate_faces(bench_case: BenchCase) -> None:
 
     All three find the same faces (``tests/test_repair.py``).
 
-    **open3d is deliberately absent, and the reason is a measured criterion difference rather than a
-    cost.** ``remove_degenerate_triangles`` removes triangles that *reference a vertex twice*, not
-    triangles of zero area: on an exactly collinear face -- (0,0,0), (0.5,0,0), (1,0,0), degenerate
-    in float64 -- it removes **nothing** (3 faces in, 3 out) where trimesh flags it and pymeshlab
+    **open3d is deliberately absent, and the reason is a criterion difference rather than a cost.**
+    ``remove_degenerate_triangles`` removes triangles that *reference a vertex twice*, not
+    triangles of zero area: on an exactly collinear face it removes **nothing** where trimesh flags
+    it and pymeshlab
     drops it. On a repeated-index face all three agree, which is why an injected-degeneracy probe
     using ``[0, 0, 1]`` reads as agreement and hides this. Timing it here would price a
     strictly narrower predicate under this group's name.
@@ -888,49 +854,40 @@ def test_fix_self_intersections(bench_case: BenchCase, method: str) -> None:
     """
     Repair a genuine self-intersection, by cutting-and-refilling or by rebuilding.
 
-    The two methods are different costs of different kinds and the parametrize is what keeps them
+    The two methods are different costs of different kinds and the parametrize keeps them
     attributable. ``local`` is a detect-dilate-delete-refill loop whose cost is the *damage*: the
     detector runs on the whole mesh but the DP runs on the rims, so it tracks the intersecting band
     rather than the face count. ``voxel`` is a signed distance field plus a marching pass, so its
-    cost is the *lattice* and it does not care what was wrong -- visible in its output, which is
-    ~55 500 faces from both the 8 192-face and the 163 840-face input.
+    cost is the *lattice* and it does not care what was wrong -- visible in its output, which is the
+    same face count from a 20x-larger input.
 
     Why the ``tangle`` axis and not two welded spheres
     --------------------------------------------------
-    This group ran for four rounds on ``sphere_med`` concatenated with a shifted copy of itself,
-    and **the meshlib ``local`` cell was timing a no-op**: that construction is two components, and
+    This group ran for four rounds on ``sphere_med`` concatenated with a shifted copy of itself, and
+    **the meshlib ``local`` cell was timing a no-op**: that construction is two components, and
     ``mm.localFixSelfIntersections`` returns a multi-component mesh unchanged -- byte-identical
-    buffers, all 1 176 colliding faces intact, at every configuration probed (CLAUDE.md section 7.6
-    carries the sweep). The row read as this suite's largest single loss, 5.02x and 127.8 ms,
-    against a call that returned its argument.
+    buffers, every colliding face intact, at every configuration probed (CLAUDE.md section 7.6
+    carries the sweep). The row read as this suite's largest single loss against a call that
+    returned its argument.
 
-    ``tangle_torus`` is a self-intersecting **single** component, so both libraries do real work
-    and the comparison is like-for-like for the first time. It is also a *size* axis rather than
-    one point, because this is a crossover and a single row would report whichever side of it the
-    mesh landed on. Harness medians:
+    ``tangle_torus`` is a self-intersecting **single** component, so both libraries do real work and
+    the comparison is like-for-like for the first time. It is also a *size* axis rather than one
+    point, because this is a crossover and a single row would report whichever side of it the mesh
+    landed on: the serial C++ fixer leads by several-fold at the small end and is level at the large
+    one, while the voxel path wins throughout.
 
-    | faces | triwarp ``local`` | meshlib ``local`` | triwarp ``voxel`` | meshlib ``voxel`` |
-    |---|---|---|---|---|
-    | 8 192 | 46.2 ms | **14.7** (3.14x) | **8.7** | 50.6 (5.81x) |
-    | 163 840 | 188.3 | **183.0** (1.03x) | **18.6** | 88.6 (4.77x) |
-
-    So the serial C++ fixer leads by 3.14x at the small end and holds only 1.03x at the large one,
-    while the voxel path wins 4.8-5.8x throughout.
-
-    **Read the ``local`` parity at 163 840 faces with its quality caveat, which runs the other
-    way.** Measured on this axis' own inputs, with triwarp's detector applied to both outputs: at
-    8 192 faces both reach **0** intersecting from 256, but at 163 840 triwarp leaves **20** from
-    884 where MeshLib reaches 0. So the large cell is 1.03x for a slightly *less* complete repair,
-    not a clean tie -- and the two are still different algorithms (MeshLib subdivides the affected
-    band and relaxes it, 163 840 -> 164 416 faces; this cuts the band out and refills the rim,
-    163 840 -> 162 254). ``max_iter`` is what closes triwarp's residue and the function's Notes
-    carry that table.
+    **Read the ``local`` parity at the large end with its quality caveat, which runs the other
+    way.** On this axis' own inputs, with triwarp's detector applied to both outputs: at the small
+    end both clear every intersection, but at the large one triwarp leaves a residue where MeshLib
+    reaches zero. So the large cell is a tie for a slightly *less* complete repair -- and the two
+    are still different algorithms (MeshLib subdivides the affected band and relaxes it, growing the
+    face count; this cuts the band out and refills the rim, shrinking it). ``max_iter`` is what
+    closes triwarp's residue, and the function's Notes carry that table.
 
     The post-condition is what
     ``tests/test_repair.py::test_fix_self_intersections_local_clears_them`` claims, and it uses
-    MeshLib as a **detector** rather than as a fixer -- which is the sound way to consult it here,
-    since on that test's own 16x16 fixture the MeshLib *fixer* makes things worse (64 intersecting
-    faces in, **128** out, while subdividing 512 faces into 2 512).
+    MeshLib as a **detector** rather than as a fixer -- the sound way to consult it here, since on
+    that test's own fixture the MeshLib *fixer* doubles the intersecting face count.
     """
     vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
     diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
@@ -1023,17 +980,11 @@ def test_remove_tunnels(bench_case: BenchCase) -> None:
     read against ``benchmarks/test_homology.py`` and ``test_geodesic_walk.py::test_shorten_loop``:
     those two time the first and second stages of this call.
 
-    First measurement, medians on an RTX 5090, with the two upstream groups from the same session:
-
-    | mesh | removed | ``remove_tunnels`` | basis | shorten | cut + fill |
-    |---|---|---|---|---|---|
-    | ``handles_1`` | 1 | **14.9 ms** | 5.8 | 1.7 | 7.4 |
-    | ``handles_64`` | 1 | **90.8 ms** | 12.1 | 9.1 | 69.6 |
-
-    So the **cut and fill dominate**, and increasingly: half the call at genus 1 and more than three
-    quarters at genus 64, where the basis and the shortening together are 21 of 91 ms. That is worth
-    stating because the obvious reading of the chain is the reverse -- the basis is the expensive
-    thing in its own group and the shortening is the new code -- and neither is where the time goes.
+    Against the two upstream groups the **cut and fill dominate**, and increasingly: about half the
+    call at genus 1 and more than three quarters at genus 64, where the
+    basis and the shortening together are a small minority. That is worth stating because the
+    obvious reading of the chain is the reverse -- the basis is the expensive thing in its own group
+    and the shortening is the new code -- and neither is where the time goes.
     Note both rows eliminate **one** tunnel: the loops kept per call are vertex-disjoint, so
     ``handles_64``'s 128 overlapping generators still yield one, and its extra cost is the larger
     basis and the longer loops rather than more cutting.
@@ -1078,19 +1029,11 @@ def test_remove_degree3_vertices(bench_case: BenchCase) -> None:
     like-for-like is that meshlib is handed a ``MeshTopology`` built outside its row and triwarp
     builds a halfedge structure inside its own.
 
-    First measurement, medians on an RTX 5090:
-
-    | mesh | triwarp-cuda | meshlib (mask only) |
-    |---|---|---|
-    | ``bunny`` | 2.47 ms | 0.042 (58.7x) |
-    | ``dragon`` | 4.96 ms | 0.336 (14.8x) |
-    | ``happy_buddha`` | 6.64 ms | (capped) |
-
-    Attributed on a clean ``icosphere(6)`` at 81 920 faces, where nothing is removed: **0.84 ms for
-    one pass**, of which ``vertex_one_rings`` is 0.56 (67 %) and the vertex-count readback 0.09. So
-    the floor is the halfedge build, and a scan mesh's several milliseconds are that floor times the
-    number of passes -- removing one valence-3 vertex can expose another, so the loop runs until it
-    finds none.
+    Attributed on a clean mesh, where nothing is removed, two thirds of one pass is
+    ``vertex_one_rings`` and most of the rest is the vertex-count readback. So the floor is the
+    halfedge build, and a scan mesh's several milliseconds are that floor times the number of
+    passes -- removing one valence-3 vertex can expose another, so the loop runs until it finds
+    none. meshlib's row times only the *mask* and is correspondingly far cheaper.
 
     **The asymmetry with meshlib's prebuilt ``MeshTopology`` is not a hoist waiting to happen**,
     which is worth saying because it reads like one. ``vertex_one_rings`` takes an optional
@@ -1099,9 +1042,8 @@ def test_remove_degree3_vertices(bench_case: BenchCase) -> None:
     The only genuinely wasted build is the last pass's, which finds nothing, and knowing that in
     advance is the question the pass exists to answer.
 
-    Moving the vertex compaction out of the loop was tried and is **flat** (2.47 against
-    2.36 ms, within noise at three passes); it is kept because it is strictly less work, not because
-    it showed up.
+    Moving the vertex compaction out of the loop was tried and is **flat** at the pass counts a scan
+    mesh reaches; it is kept because it is strictly less work, not because it showed up.
     """
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()
@@ -1135,19 +1077,16 @@ def test_straighten_boundary(bench_case: BenchCase) -> None:
     timed callable the way ours is. Both take the same two gates by the same definitions and agree
     exactly on a ragged planar rim (``tests/test_repair.py``).
 
-    First measurement, medians on an RTX 5090: **0.70 ms** on ``bunny`` against meshlib's 9.20
-    (13.1x ahead) and **1.19 ms** on ``dragon`` against 56.05 (**47.3x**). Both rows carry their own
-    structure build, so the ratio is the parallel candidate test against a serial rim walk, and it
-    widens with the mesh exactly as that predicts. ``happy_buddha`` reads 1.39 ms.
+    triwarp wins the group by more than an order of magnitude and by more the larger the mesh. Both
+    rows carry their own structure build, so the ratio is the parallel candidate test against a
+    serial rim walk, and it widens with the mesh exactly as that predicts.
 
-    The rim walk was re-keyed from vertices to **halfedges** after those numbers were taken,
-    because edge-manifoldness does not make the rim a set of simple loops and the per-vertex tables
-    raced at a bowtie vertex (``kernels/repair.py::collect_rim_links``). It is a correctness fix
-    and it also came out slightly *cheaper*: **0.94x** on the whole call at three passes (0.418 to
-    0.394 ms on a 1 345-vertex hemisphere, interleaved against a detached worktree at the prior
-    revision, min of 30 x 20). Two per-halfedge tables replaced three per-vertex ones plus a face
-    table, and the candidate and emit kernels lost three arguments between them; the fan walk that
-    finds each boundary halfedge's successor is paid only on the rim.
+    The rim walk is keyed on **halfedges** rather than on vertices, because edge-manifoldness does
+    not make the rim a set of simple loops and the per-vertex tables raced at a bowtie vertex
+    (``kernels/repair.py::collect_rim_links``). It is a correctness fix and it also came out
+    slightly *cheaper*: two per-halfedge tables replaced three per-vertex ones plus a face table,
+    and the candidate and emit kernels lost three arguments between them; the fan walk that finds
+    each boundary halfedge's successor is paid only on the rim.
     """
     if bench_case.kind == "meshlib":
 
@@ -1179,8 +1118,8 @@ def test_flatten_degree3_vertices(bench_case: BenchCase) -> None:
     Read against that group directly: both build the same ``vertex_one_rings`` and both then run
     the same independent-set pass, and everything after *that* differs -- no face rewrite, no
     compaction and no loop here, so the gap between the two rows is the whole cost of removing
-    rather than moving, and this row should sit at roughly the halfedge build alone (measured at
-    67 % of the other group's single pass).
+    rather than moving, and this row should sit at roughly the halfedge build alone -- which is
+    about two thirds of the other group's single pass.
 
     meshlib's ``hardSmoothTetrahedrons`` is the same move on the same set, vertex for vertex --
     it sweeps sequentially, reading neighbours it has already moved, and one maximal independent
@@ -1189,26 +1128,17 @@ def test_flatten_degree3_vertices(bench_case: BenchCase) -> None:
     mesh is rebuilt per round; the other group's meshlib row times only the *mask*, which is why
     this one is the like-for-like pair.
 
-    The independent-set pass and its loop are not free and did not always exist: measured **1.29x**
-    on the whole call (0.524-0.531 to 0.686-0.696 ms on a 10 242-vertex icosphere, interleaved
-    against a detached worktree at the prior revision, min of 30 x 50). Most of it is the one
-    host readback that terminates the loop; routing that through ``reduce.sum`` instead of a bool
-    readback measured 0.751-0.755. It is a correctness fix rather than a tuning choice -- see
-    ``kernels/repair.py``'s ``flatten_degree3_positions`` for what moving two neighbours at once
-    does to a tetrahedron -- so the number is recorded here rather than weighed against anything.
+    The independent-set pass and its loop are not free: they cost roughly a third of the call, most
+    of it the one host readback that terminates the loop (routing that through ``reduce.sum``
+    instead of a bool readback is dearer still). It is a correctness fix rather than a tuning
+    choice -- see ``kernels/repair.py``'s ``flatten_degree3_positions`` for what moving two
+    neighbours at once does to a tetrahedron -- so the cost is recorded rather than weighed.
 
-    First measurement, medians on an RTX 5090:
-
-    | mesh | triwarp-cuda | meshlib |
-    |---|---|---|
-    | ``bunny`` | 0.774 ms | 9.30 (12.0x) |
-    | ``dragon`` | 1.39 ms | 53.73 (38.6x) |
-    | ``happy_buddha`` | 1.47 ms | (capped) |
-
-    Against ``remove_degree3_vertices``' 2.47 / 4.96 / 6.64 ms on the same three meshes, this is
-    **3.2 to 4.5x cheaper** -- the ratio the docstring predicts, since that group repeats the shared
-    halfedge build once per pass and this one runs it once. ``bunny`` reads high for its size
-    because it is the first mesh in the selection and carries the module's compile.
+    triwarp wins the group by more than an order of magnitude at every size. Against
+    ``remove_degree3_vertices`` on the same meshes this is several times cheaper -- the ratio the
+    docstring predicts, since that group repeats the shared halfedge build once per pass and this
+    one runs it once. The first mesh in a selection reads high for its size, because it carries the
+    module's compile.
     """
     if bench_case.kind == "meshlib":
 

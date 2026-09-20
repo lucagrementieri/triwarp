@@ -2,24 +2,16 @@
 Precision-generic geometric predicates and the small triangle quantities they share.
 
 These are the standard triangle quantities -- double area, circumcircle and minimum-enclosing-
-circle diameters, aspect ratio, dihedral angle -- and they were duplicated three times before this
-module existed: a ``float32`` set in ``kernels/reconstruction.py``, a byte-equivalent ``float64``
-set in ``kernels/remesh.py``, and a third partial copy in ``kernels/holes.py``. Each
-`@wp.func` here is generic over the scalar type, so one definition instantiates at whatever
-precision the calling kernel uses.
+circle diameters, aspect ratio, dihedral angle. Each `@wp.func` here is generic over the scalar
+type, so one definition instantiates at whatever precision the calling kernel uses; before this
+module existed the same quantities were duplicated per precision across three kernel modules.
 
-The later arrivals are the same defect one level out: ``triangle_aabb`` came from
-``kernels/intersection.py`` and ``triangle_double_area`` / ``circumcircle_diameter`` from
-``kernels/holes.py``, where a general triangle quantity had ended up inside a module that owns an
-*algorithm* and other modules were importing the algorithm to reach the geometry.
-``point_plane_dot`` and ``triangle_aabb_overlap`` (with its ``axis_interval_projection`` /
-``unit_axis`` / ``plane_box_overlap`` / ``edge_axes_separate`` helpers) followed from the same
-place and for the same reason: they were the last two edges of the whole ``kernels/`` import graph
-running from an algorithm module to a geometric predicate, with ``kernels/points.py`` and
-``kernels/voxels.py`` importing the mesh-slicing algorithm to reach a plane dot and a
-separating-axis test.
+The rule that keeps arrivals coming here is CLAUDE.md section 3.1's: a general geometric quantity
+must not live in a module that owns an *algorithm*, or unrelated modules import the algorithm to
+reach the geometry. ``triangle_aabb``, ``triangle_double_area``, ``circumcircle_diameter``,
+``point_plane_dot`` and ``triangle_aabb_overlap`` all arrived that way.
 
-Degenerate inputs return [`float_inf`][triwarp.kernels.predicates.float_inf] — an actual infinity,
+Degenerate inputs return [`float_inf`][triwarp.kernels.predicates.float_inf] -- an actual infinity,
 so callers detect the case with ``wp.isinf`` rather than by comparing against a magic large value.
 
 !!! note
@@ -124,11 +116,7 @@ def side_lengths(a: Any, b: Any, c: Any) -> tuple[wp.Float, wp.Float, wp.Float]:
     # Three ``wp.length`` calls rather than three square roots of that one: ``length`` is a single
     # ``sqrt`` of the same sum, so the composed spelling would add nothing but a name. The two
     # exist as a pair because the callers genuinely split -- an intrinsic law-of-cosines form wants
-    # the squares, a radius ratio or an aspect ratio wants the lengths -- and the reason for
-    # naming this one at all is that four modules had written it out (``triangle_aspect_ratio``
-    # here, ``triangles.triangle_radius_ratio``, ``holes.min_triangle_angle_sin``, and
-    # ``edges.face_edge_lengths``' three stores), which is one square root away from the
-    # duplication that put ``squared_edge_lengths`` in this file.
+    # the squares, a radius ratio or an aspect ratio wants the lengths.
     return wp.length(b - c), wp.length(c - a), wp.length(a - b)
 
 
@@ -346,14 +334,11 @@ def vector_angle(a: Any, b: Any) -> wp.Float:
     # ``acos`` has an infinite derivative at +-1, so for nearly-parallel vectors -- the *common*
     # case here: two coplanar faces across an edge, a straight run of a polyline, two near-collinear
     # endpoint normals -- it amplifies the round-off already in the dot product, while the cross
-    # product carries the small angle directly. Measured at a true separation of 1e-7 rad in
-    # float64: this form returns 1.0e-07, ``acos`` returns 9.996e-08, four digits already gone.
-    # Against a float64 reference on float32 face normals, worst error over all adjacent face pairs:
-    # 1.3e-06 -> 7.6e-08 on an icosphere(3), and 3.5e-04 -> 4.7e-08 on a 64-section cylinder, whose
-    # cap fans are coplanar. That 3.5e-04 is *past* the 1e-5 the parity tests compare at, so the old
-    # spelling was one fixture away from failing rather than merely less tidy.
-    # It is also scale-free, so callers may pass unnormalized vectors (``tris_angle_profit`` passes
-    # raw cross products) and a zero-length input gives ``atan2(0, 0) == 0`` rather than the
+    # product carries the small angle directly. Against a float64 reference on float32 face normals
+    # the acos form's worst error over a coplanar cap fan lands *past* the 1e-5 the parity tests
+    # compare at, so the old spelling was one fixture away from failing rather than merely less
+    # tidy. It is also scale-free, so callers may pass unnormalized vectors (``tris_angle_profit``
+    # passes raw cross products) and a zero-length input gives ``atan2(0, 0) == 0`` rather than the
     # spurious pi/2 that ``acos`` of a zeroed ``normalize`` returns.
     return wp.atan2(wp.length(wp.cross(a, b)), wp.dot(a, b))
 
@@ -541,21 +526,19 @@ def barycentric_gram(a: Any, b: Any, c: Any, p: Any) -> tuple[wp.Float, wp.Float
     ``(det - n1 - n2, n1, n2) / det``, and when ``p`` is out of plane they are those of its
     orthogonal projection into the triangle's plane. **Dimension-generic** -- ``wp.length_sq`` and
     ``wp.dot`` say nothing about the ambient dimension, so this serves ``wp.vec2`` and ``wp.vec3``
-    from one body, which is why it exists: it was written twice, once per dimension, and verified
-    equal on the unit triangle at both.
+    from one body, which is why it exists.
 
     Undivided, and therefore guard-free, so that a caller can apply its own degenerate policy:
     [`barycentric_2d`][triwarp.kernels.predicates.barycentric_2d], its one caller today, wants a
     definite answer for a degenerate triangle so that ``min(b) >= -eps`` rejects it without a
     separate area check.
 
-    **It had a second caller, a 3-D projection by Cramer's rule, and that one is gone.** The Gram
-    determinant this returns is the ill-conditioned way to write a triangle's squared area: its two
-    terms agree to more digits as the corner angle closes, so the subtraction loses them and the
-    3-D coordinates came back ``nan`` on a sliver that still had positive area.
+    **Do not reach for this to build a 3-D barycentric solve.** The Gram determinant is the
+    ill-conditioned way to write a triangle's squared area: its two terms agree to more digits as
+    the corner angle closes, so the subtraction loses them and the coordinates come back ``nan`` on
+    a sliver that still has positive area.
     [`point_barycentric`][triwarp.kernels.triangles.point_barycentric] forms the same quantity as
-    ``|e0 x e1|^2`` instead and carries the measured comparison. **Do not reach for this to build a
-    3-D barycentric solve** -- the 2-D containment test is a different use, where ``p`` and the
+    ``|e0 x e1|^2`` instead. The 2-D containment test is a different use, where ``p`` and the
     triangle are coplanar by construction and the degenerate case is one the caller wants reported
     rather than conditioned away.
     """
@@ -662,38 +645,27 @@ def triangles_intersect(
     # Do two triangles cross transversally? Moller's interval test: each triangle is cut by the
     # other's plane into an interval along the planes' intersection line, and they intersect exactly
     # when those two intervals overlap. Coplanar and merely touching configurations are **not**
-    # intersections here, which is the "contact is not intersection" convention and the one
+    # intersections here, which is the "contact is not intersection" convention
     # ``validation.face_self_intersecting_mask`` documents.
     #
-    # This replaced an 11-axis separating-axis test, and the reason is exactness rather than speed.
-    # SAT over two triangles is only exact while every axis is non-degenerate, and an edge-edge
-    # cross product **vanishes for parallel edges** -- which a regular grid is full of. The old code
-    # projected onto the zero axis anyway, where every interval collapses to ``[0, 0]`` and the test
-    # reads "overlapping", so a pair separated only along such an axis was reported as intersecting.
-    # Measured against an exact float64 arbiter: **64 false positives of 128 flagged faces** on a
-    # 16x16 self-intersecting torus (where the reference and the arbiter agree exactly on 64), and
-    # **42 of the 45** faces the old code flagged on ``bohemian_dome`` that the reference did not.
-    # Both were
-    # previously recorded as a "tangential contact divergence"; most of it was this.
+    # **Not a separating-axis test, and the reason is exactness rather than speed.** SAT over two
+    # triangles is only exact while every axis is non-degenerate, and an edge-edge cross product
+    # **vanishes for parallel edges** -- which a regular grid is full of. Projecting onto the zero
+    # axis collapses every interval to ``[0, 0]``, which reads as "overlapping", so a pair separated
+    # only along such an axis is reported as intersecting: against an exact float64 arbiter that was
+    # half the flagged faces on a self-intersecting torus. This is slightly *slower* than the SAT
+    # (a data-dependent edge loop in ``plane_crossing_span`` against straight-line arithmetic), and
+    # that is the right trade: both sit on the launch floor at real candidate counts, and the faster
+    # one was answering a different question.
     #
-    # It is **0.86x** the SAT's speed, measured interleaved on an RTX 5090 over three
-    # self-intersecting parametric surfaces (35.9 / 35.6 / 35.7 us against 31.0 / 30.6 / 30.7 at
-    # 46-54k candidate pairs), and that is the right trade: both sit on the launch floor -- 5 us at
-    # 50 000 pairs -- and the faster one was answering a different question. The cost is the
-    # data-dependent edge loop in ``plane_crossing_span``, where SAT is straight-line arithmetic.
-    # **The arithmetic is float64 on float32 inputs**, and that is the load-bearing choice here.
-    # Widening a float32 is lossless, so this is the same geometry; what the extra precision buys is
-    # the *decisions* -- the sign of a plane distance, and the comparison of two intervals. Audited
-    # pair by pair over the 13 011 broad-phase candidates of the Roman surface: the float32 kernel
-    # agreed with this same algorithm in float64 on 97.6 % of them, while a float32 *reference* with
-    # a different association order agreed with that kernel on 99.6 %. Those two numbers together
-    # are what say the residual was arithmetic and not logic.
-    #
-    # It costs **2.1x on this kernel** (48 against 22 us at ~52k candidate pairs, measured
-    # interleaved on three self-intersecting surfaces) and **~4 % end to end**, because the narrow
-    # phase is only 6-8 % of ``face_self_intersecting_mask``'s wall clock -- the BVH build, the
-    # broad phase and the scan are the rest. That is the trade, and its docstring records what the
-    # accuracy buys.
+    # **The arithmetic is float64 on float32 inputs**, and that is load-bearing. Widening a float32
+    # is lossless, so this is the same geometry; what the extra precision buys is the *decisions* --
+    # the sign of a plane distance, and the comparison of two intervals. Audited pair by pair over a
+    # self-intersecting surface's broad-phase candidates, the float32 kernel disagreed with this
+    # same algorithm in float64 several times more often than two float32 implementations with
+    # different association orders disagreed with each other, which is what says the residual was
+    # arithmetic and not logic. It roughly doubles this kernel and is a few percent end to end, the
+    # narrow phase being a small share of ``face_self_intersecting_mask``.
     return _triangles_intersect_d(
         kernel_array.to_vec3d(a0),
         kernel_array.to_vec3d(a1),
@@ -827,12 +799,8 @@ def triangle_triangle_distance_sq(
     # time on the common disjoint-triangle path (the intersection test itself already widens and
     # discards its own copies), so the intersection test runs on these corners via
     # ``_triangles_intersect_d`` instead of going through the ``wp.vec3``-taking wrapper. This is a
-    # duplication fix, not a measured speedup: min-of-30 timings of ``mesh_to_mesh_distance``'s own
-    # disjoint-heavy benchmark (bunny/bunny_decimated, near/far separations) before and after this
-    # change, each in its own process, land within ~1-3% of each other -- session-to-session noise
-    # (§15.7 of ``.claude/CLAUDE.md``), not a resolvable effect either way. The kernel's cost is the
-    # broad-phase BVH walk and the fifteen edge/point distance solves, not six scalar-to-scalar
-    # casts, so that null result is what the cost model predicts.
+    # duplication fix and not a measured speedup -- the kernel's cost is the broad-phase BVH walk
+    # and the fifteen edge/point distance solves, not six scalar casts.
     p0 = kernel_array.to_vec3d(a0)
     p1 = kernel_array.to_vec3d(a1)
     p2 = kernel_array.to_vec3d(a2)

@@ -22,18 +22,16 @@ Three knobs are swept on top of it, each isolating a different lever:
   ``wp.capture_while``, with no readback at all. Skipping checks trades syncs for possibly-wasted
   iterations, and which side wins is a measurement, not a derivation -- read this sweep together
   with the mesh pair, because on a well-conditioned system the syncs dominate and on a badly
-  conditioned one they should not. It is this group that flipped the default: against the former
-  ``10`` the on-device row measured 22.8 vs 31.7 ms on ``saddle`` and 104.7 vs 154.1 ms on
-  ``saddle_graded``, 28-32 % on both.
+  conditioned one they should not. It is this group that set the default: against a fixed check
+  interval the on-device row is markedly cheaper on both meshes.
 * **repeat count** -- ``spd_column_solver`` preallocates its temporaries and batch layout for reuse,
   which is what ``parametrization.arap`` builds outside its iteration loop. One solve against fifty
   is the amortization question: if ``x50`` lands near 50x ``once``, the preallocation is not earning
   its API surface.
 
-Everything runs in **float64**, the operator dtype these entry points require. This module used to
-be **CUDA-only** because ``warp.optim.linear.cg`` returned NaN on the Warp CPU backend through 1.15;
-it converges there now (measured 20 iterations to a 1.9e-08 residual against ``numpy.linalg.solve``
-on a 64x64 SPD system), so the ``triwarp-cpu`` variant is timed rather than skipped.
+Everything runs in **float64**, the operator dtype these entry points require. ``triwarp-cpu`` is
+timed as well as ``triwarp-cuda``: ``warp.optim.linear.cg`` converges on the Warp CPU backend,
+verified against ``numpy.linalg.solve`` on a small SPD system.
 
 References
 ----------
@@ -43,23 +41,20 @@ a Dirichlet-constrained solve of the same cotangent system ``min_quad_with_fixed
 two answer the same question by opposite means -- MeshLab factors the free-free block directly,
 triwarp runs batched CG on it.
 
-That makes it worth more than a timing row: it is the **conditioning control**. Measured on the axis
-meshes (RTX 5090 host) it runs **38.2 ms on ``saddle`` and 39.6 ms on ``saddle_graded``** -- flat --
-against triwarp's **14.2 -> 72.5 ms** at 1% pinned. So triwarp wins by 2.7x on the well-conditioned
-mesh and loses by **1.8x** on the graded one, and the entire spread is its CG iteration count rather
-than anything intrinsic about the problem: a direct factorization of the identical system does not
-care. It is the same observation the potpourri3d rows make in
+That makes it worth more than a timing row: it is the **conditioning control**. It is flat across
+the axis meshes where triwarp spreads several-fold at 1% pinned, so triwarp wins on the
+well-conditioned mesh and loses on the graded one, and the entire spread is its CG iteration count
+rather than anything intrinsic about the problem: a direct factorization of the identical system
+does not care. It is the same observation the potpourri3d rows make in
 [`test_heat_distance.py`](test_heat_distance.py) and libigl's LDLT makes in
 [`test_parametrization.py`](test_parametrization.py).
 
-Those triwarp figures moved a long way when ``assemble_interior_system`` stopped routing an
-already-sorted CSR through ``bsr_from_triplets``, and the *shape* of the move is the interesting
-part. At 1% pinned this group went 33.7 -> 14.2 ms (``saddle``) and 82.9 -> 72.5 (``graded``); at
-50% pinned it went **30.1 -> 3.1** and **29.4 -> 4.7**, a 6-10x. The triplet build cost ``q.nnz``
-regardless of how much of ``Q`` survived, and it left ``q_uu.nnz`` at ``q.nnz`` as well -- an upper
-bound 3.5x the true count on a lightly-pinned system -- so every CG mat-vec was dimensioned for the
-*unreduced* matrix too. That is why the pin50pct rows, where the free block is smallest, gained the
-most: they were the rows paying most for work proportional to the wrong matrix.
+``assemble_interior_system`` deliberately does **not** route its already-sorted CSR through
+``bsr_from_triplets``: that build costs ``q.nnz`` regardless of how much of ``Q`` survives and
+leaves ``q_uu.nnz`` at ``q.nnz``, an upper bound well above the true count on a lightly-pinned
+system, so every CG mat-vec is dimensioned for the *unreduced* matrix too. Avoiding it is worth
+around 2x at 1% pinned and an order of magnitude at 50%, where the free block is smallest and so the
+overcounting is worst.
 
 Two limits on it, both structural. MeshLab pins **exactly two vertices** (``point1`` / ``point2``
 with scalar values), so it has no fixed-fraction axis at all and appears only in the ``pin1pct``
@@ -211,7 +206,7 @@ def test_min_quad_with_fixed(bench_case: BenchCase, fixed_fraction: float) -> No
         if fixed_fraction != min(_FIXED_FRACTIONS):
             pytest.skip("MeshLab's harmonic field pins exactly two vertices: no fraction axis")
         # Geometry-preserving with ``colorize=False`` (it writes only the vertex scalar), so the
-        # shared MeshSet is sound and the ~9 ms build stays out of a ~40 ms row.
+        # shared MeshSet is sound and its build stays out of the row.
         meshset_pml = bench_case.meshset_pml
         point1, point2 = _harmonic_endpoints_pml(bench_case)
         bench_case.run(
@@ -261,13 +256,12 @@ def test_multigrid_preconditioner(bench_case: BenchCase) -> None:
     Hierarchy *setup* only: the cost that decides whether a call site should ask for the V-cycle.
 
     The solve-side win is not timed here -- it lands in the ``smooth_region`` group, the one
-    operator class in the package where it pays (2.46x end to end on ``bunny``). What this row
+    operator class in the package where it pays. What this row
     measures is the other half of that trade, and why the switch is per call site and not a default:
     building the hierarchy is one aggregation, one power iteration, a ``bsr_transposed`` and three
     ``bsr_mm`` per level, and at these sizes every one of those is a *fixed* per-call cost rather
-    than a function of the operator. Measured 12-17 ms, which is why
-    ``smoothing.smooth_region_fixed_rim`` (0.48-0.53x) and ``parametrization.harmonic`` at ``k=1``
-    (0.43-1.13x) decline it: their whole solve is shorter than this row.
+    than a function of the operator -- which is why ``smoothing.smooth_region_fixed_rim`` and
+    ``parametrization.harmonic`` at ``k=1`` decline it: their whole solve is shorter than this row.
 
     Read against the ``solve_spd_columns`` group above, whose two rows are the *same* operator's
     solve. A setup that grew with the mesh rather than sitting near-flat would change the decision
@@ -276,11 +270,11 @@ def test_multigrid_preconditioner(bench_case: BenchCase) -> None:
     **This group gets worse as the aggregation gets better, so never read a loss here alone.** It
     times the setup and nothing else, and ``linalg._MULTIGRID_THETA`` trades setup for iterations:
     raising it removes weak edges, which makes aggregates smaller and can add a level, and a level
-    is 5-8 ms whatever its size. Measured at the shipped 0.05 against 0.0, ``saddle_graded``'s
-    setup is **17.9 -> 25.4 ms** (1.42x, one extra level) while the same operator's
-    ``smooth_region`` solve is **91.4 -> 76.6**, so the 7.5 ms is bought twice over. That constant's
-    comment carries the whole setup-plus-solve table; a round that reads this row's regression
-    without it will re-propose lowering theta, which was measured and is a 1.12x total loss.
+    costs a fixed amount whatever its size. At the shipped theta against zero, the setup is dearer
+    by one level while the same operator's ``smooth_region`` solve is cheaper by more than that, so
+    the extra level is bought twice over. That constant's comment carries the setup-plus-solve
+    reasoning; a round that reads this row's regression without it will re-propose lowering theta,
+    which is a total loss.
     """
     operator = _operator(bench_case)
     preconditioner = bench_case.run(lambda: tw.linalg.multigrid_preconditioner(operator))
@@ -303,8 +297,9 @@ def test_spd_column_solver_amortized(bench_case: BenchCase, repeats: int) -> Non
     Unlike ``arap``, this group re-solves the *same* right-hand side, so calls 2..50 are essentially
     no-ops -- which makes it the sharpest probe in the suite of per-call solver overhead. It is what
     caught the one regime where the default ``check_every=0`` loses: the conditional-graph loop
-    costs ~0.5 ms a call whatever it does, so this row runs 2x slower than at ``check_every=10``
-    while every other solver group got faster. See the ``check_every`` notes on
+    costs a fixed fraction of a millisecond a call whatever it does, so this row runs twice as slow
+    as at ``check_every=10`` while every other solver group got faster. See the ``check_every``
+    notes on
     ``triwarp.linalg.solve_spd_columns``.
     """
     operator, rhs = _operator(bench_case), _rhs(bench_case)

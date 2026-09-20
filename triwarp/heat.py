@@ -3,29 +3,27 @@ Heat-diffusion methods on triangle meshes.
 
 Three solvers that share one idea: diffuse a quantity over the surface for a short time ``t``, then
 recover the answer from the *direction* of the resulting field rather than its magnitude. Short-time
-heat flow approximates the geodesic kernel, so a single sparse solve carries information that a
+heat flow approximates the geodesic kernel, so a single sparse solve carries information a
 combinatorial shortest-path search would have to walk edge by edge. Each solver differs only in what
 it diffuses and how it reads the result back:
 
 - **Geodesic distance.** [`heat_geodesic`][triwarp.heat.heat_geodesic] diffuses a scalar indicator
   from source vertices, normalizes its gradient, and integrates that unit field back with a Poisson
-  solve. This is the heat method of Crane et al. (``igl::heat_geodesics``,
+  solve. The heat method of Crane et al. (``igl::heat_geodesics``,
   ``potpourri3d.MeshHeatMethodDistanceSolver``).
 - **Signed distance to curves.** [`heat_signed_distance`][triwarp.heat.heat_signed_distance]
   diffuses the normals of a set of oriented curves, then solves a Poisson problem against that field
-  to get a *signed* distance whose zero set is the curves
-  (``potpourri3d.MeshSignedHeatSolver``).
+  to get a *signed* distance whose zero set is the curves (``potpourri3d.MeshSignedHeatSolver``).
 - **Vector-valued transport.**
   [`transport_tangent_vectors`][triwarp.heat.transport_tangent_vectors],
   [`extend_scalar`][triwarp.heat.extend_scalar] and [`log_map`][triwarp.heat.log_map] diffuse
   *tangent vectors* through the connection Laplacian, which transports each vector into its
   neighbour's frame before differencing (``potpourri3d.MeshVectorHeatSolver``).
 
-The three are one module rather than three because they are one family and because two of them
-cannot be separated: the vector solvers import [`heat_operators`][triwarp.heat.heat_operators]
-and [`heat_geodesic`][triwarp.heat.heat_geodesic],
-[`VectorHeatOperators`][triwarp.heat.VectorHeatOperators] embeds the scalar method's operator
-tuple, and [`log_map`][triwarp.heat.log_map]'s radius *is* ``heat_geodesic``'s answer.
+The three are one module because two of them cannot be separated: the vector solvers import
+[`heat_operators`][triwarp.heat.heat_operators] and [`heat_geodesic`][triwarp.heat.heat_geodesic],
+[`VectorHeatOperators`][triwarp.heat.VectorHeatOperators] embeds the scalar method's operator tuple,
+and [`log_map`][triwarp.heat.log_map]'s radius *is* ``heat_geodesic``'s answer.
 
 All three run in ``float64``, because the diffused field decays exponentially and underflows
 ``float32``. They run on either device.
@@ -75,8 +73,8 @@ _CG_TOLERANCE = 1e-8
 # never below a fixed absolute floor. Every field this module normalizes this way -- the signed
 # heat method's diffused direction field, the vector heat method's transported direction and its
 # source indicator -- carries the mesh's scale as ~1/scale, so an absolute cutoff silently zeroes
-# most of the field on a mesh measured in millimetres (confirmed: 111 of 162 vertices on a unit
-# icosphere scaled by 1e-6, all resolved relative to the field's own maximum). It is deliberately
+# most of the field on a mesh measured in millimetres, all of which is resolved when the cutoff is
+# taken relative to the field's own maximum. It is deliberately
 # far below the round-off floor (~1e-08 of the maximum): see ``kernels/heat.py`` for why nothing
 # here can separate noise from signal.
 _RELATIVE_ZERO = 1e-12
@@ -168,9 +166,9 @@ def heat_operators(
     Notes
     -----
     The Poisson operator and both Jacobi preconditioners are here because they satisfy this
-    function's own contract — they depend on the mesh alone — and
-    [`heat_geodesic`][triwarp.heat.heat_geodesic] used to rebuild all three on every call, which is
-    unnecessary work whenever the mesh is unchanged across several solves. It is *only* those
+    function's own contract — they depend on the mesh alone — so
+    [`heat_geodesic`][triwarp.heat.heat_geodesic] need not rebuild all three on every call, which
+    is unnecessary work whenever the mesh is unchanged across several solves. It is *only* those
     three — the solver **state** is deliberately not cached, because a ``warp.optim.linear`` state
     captures its right-hand-side and solution buffers at construction, which would make these
     operators stateful and unsafe to share between two concurrent solves. The remaining lever for
@@ -669,8 +667,8 @@ def _solve_poisson_shifted(
 # --------------------------------------------------------------------------------------
 
 # Below this fraction of the direction field's maximum, a transported direction cannot be told from
-# the round-off the solve leaves where the transported copies cancel, measured at 8.7e-09 of the
-# maximum. A decade above that, and the *only* thing it drives is the mask
+# the round-off the solve leaves where the transported copies cancel. It sits about a decade above
+# that floor, and the *only* thing it drives is the mask
 # ``transport_tangent_vectors`` returns alongside its vectors -- no value is zeroed by it, so
 # flagging a marginal vertex costs the caller nothing.
 _RESOLVED_FRACTION = 1e-7
@@ -891,20 +889,20 @@ def transport_tangent_vectors(
     Three solves, following the vector heat method: the connection Laplacian diffuses the source
     vectors (which preserves their *directions* well but smears their magnitudes), while a scalar
     extension of the source magnitudes supplies the length. The result at each vertex is the source
-    vector carried along the shortest path to it — the field a "drag this arrow across the surface"
-    tool needs. Matches ``potpourri3d.MeshVectorHeatSolver.transport_tangent_vectors``, which
-    returns the vectors alone.
+    vector carried along the shortest path to it. Matches
+    ``potpourri3d.MeshVectorHeatSolver.transport_tangent_vectors``, which returns the vectors alone.
 
     The second return exists because the vectors are not self-describing: a zero is ambiguous and a
     *non*-zero one is not always meaningful. A vertex is unresolved when the diffused direction that
-    reached it is shorter than ``1e-07`` of the field's maximum — a decade above the round-off left
-    where the transported copies cancel, measured at ``8.7e-09`` of the maximum. Below that line a
-    direction cannot be told from noise, and the mask says so rather than the value being altered:
-    no vector here is changed by it. Three situations it separates:
+    reached it is shorter than ``1e-07`` of the field's maximum -- about a decade above the
+    round-off left where the transported copies cancel. Below that line a direction cannot be told
+    from noise, and the mask says so rather than the value being altered: no vector here is changed
+    by it. Three situations it separates:
 
-    * **Nothing reached the vertex** — another connected component, or short-time diffusion
+    * **Nothing reached the vertex** -- another connected component, or short-time diffusion
       underflowing. Unresolved, and the vector is zero.
-    * **The cut locus** — several shortest paths arrive and their copies cancel. Unresolved, but the
+    * **The cut locus** -- several shortest paths arrive and their copies cancel. Unresolved, but
+      the
       vector may still have *full length*, pointing wherever the round-off landed. This is the case
       that differs between CPU and CUDA, and the one a caller cannot otherwise detect.
     * **An ordinary vertex.** Resolved.
@@ -962,7 +960,7 @@ def transport_tangent_vectors(
         is left is round-off rather than a direction. This is not a pathological case: the corner of
         a cube shell diagonally opposite the source receives three copies 120 degrees apart whose
         sum is *exactly* zero, for every source vector and every diffusion time. What comes back is
-        then decided by the arithmetic — on CUDA enough round-off survives to be scaled up to full
+        then decided by the arithmetic -- on CUDA enough round-off survives to be scaled up to full
         length in an arbitrary direction, while on CPU the same point can cancel to exactly zero and
         read as unreached. ``resolved`` is ``False`` on both, and is the only way to tell.
     """

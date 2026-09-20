@@ -32,22 +32,11 @@ grouping), ``boundary_loops`` (pointer-jumping list ranking plus per-loop host w
 ``vector_heat_operators`` (three sparse assemblies, and the priciest of the lot). Timing all of them
 would just re-run the rest of the suite through a different door.
 
-Cold cost of every property, measured on ``icosphere(5)`` (20 480 faces) on an RTX 5090, minimum of
-five fresh instances, for the record this module exists to keep:
-
-| property | ms | property | ms |
-|---|---|---|---|
-| ``vector_heat_operators`` | **7.20** | ``cotmatrix`` | 0.655 |
-| ``is_watertight`` | 4.23 | ``vertex_one_rings`` | 0.587 |
-| ``heat_operators`` | 2.91 | ``halfedge_twins`` | 0.277 |
-| ``vertex_tangent_frames`` | 1.27 | ``warp_mesh`` | 0.248 |
-| ``laplacian_operator`` | 0.665 | ``mass_matrix_entries`` | 0.151 |
-| | | ``vertex_face_adjacency`` | 0.121 |
-| | | ``bounds`` | 0.089 |
-
-So the operator group at the bottom of the class is where the cache pays, and ``is_watertight`` is
-no longer the priciest property -- it was when it was written, and the two heat bundles arrived
-after it.
+Ranked by cold cost, the properties fall into two groups an order of magnitude apart: the operator
+bundles (``vector_heat_operators``, ``heat_operators``, ``vertex_tangent_frames``) plus
+``is_watertight`` at the top, and the connectivity and bounds properties
+(``halfedge_twins``, ``warp_mesh``, ``mass_matrix_entries``, ``vertex_face_adjacency``, ``bounds``)
+at the bottom. The operator bundles are where the cache pays.
 
 References
 ----------

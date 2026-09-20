@@ -11,9 +11,7 @@ positions (and, for the surface terms, the mesh vertices).
 Each term accumulates a *scaled* contribution into a length-1 loss accumulator via
 ``wp.atomic_add`` (which has a well-defined adjoint), so ``"sum"`` and ``"mean"``
 reductions differ only by the ``scale`` passed from Python scope. Following the
-``pytorch3d`` convention the distances are **squared** Euclidean distances -- measured at
-7.02e-08 relative against ``pytorch3d.loss.chamfer_distance``, in
-``tests/test_metrics.py::test_chamfer_points_to_points_matches_pytorch3d``.
+``pytorch3d`` convention the distances are **squared** Euclidean distances.
 """
 
 import warp as wp
@@ -109,12 +107,12 @@ def chamfer_nn_term_tiled(
     The CPU device MUST use
     [`chamfer_nn_term_sliced`][triwarp.kernels.metrics.chamfer_nn_term_sliced] instead:
     ``wp.launch_tiled`` runs exactly one lane per block there, so this block reduction would see
-    one point per tile and the loss would come out roughly 64x too small.
+    one point per tile and the loss would come out a whole tile-width too small.
 
     The lane-strided ``ITEMS_PER_BLOCK_1D`` fold that would make this portable is declined for the
-    reason measured on its sibling [`centroid_tiled`][triwarp.kernels.measures.centroid_tiled]:
-    flat (0.98-1.01x), because one accumulator slot at ``n / TILE_1D`` blocks is nowhere near the
-    contention where the fold starts paying.
+    reason measured on its sibling [`centroid_tiled`][triwarp.kernels.measures.centroid_tiled]: it
+    is flat, because one accumulator slot at ``n / TILE_1D`` blocks is nowhere near the contention
+    where the fold starts paying.
     """
     i, t = wp.tid()
     idx = i * TILE_1D + t
@@ -144,8 +142,7 @@ def chamfer_nn_term_sliced(
     carry adjoints, so the kernel stays differentiable under ``wp.Tape``. Lane-free, so it is
     correct on the CPU device where
     [`chamfer_nn_term_tiled`][triwarp.kernels.metrics.chamfer_nn_term_tiled] is not; it gives up
-    the block shuffle-reduce and measures 1.57x slower on CUDA at 500k points (19.0 -> 29.7 us),
-    which is why both exist.
+    the block shuffle-reduce and is measurably slower on CUDA, which is why both exist.
     """
     j = wp.int32(wp.tid())
     total = wp.float32(0.0)

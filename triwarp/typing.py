@@ -259,10 +259,9 @@ def as_array2d(arr: wp.array[T], dtype: type[DType]) -> wp.array[DType, Literal[
     """
     Validate and narrow a Warp array to the rank-2 alias for ``dtype``.
 
-    One function for what used to be ``as_array2d_int32`` / ``as_array2d_float32`` /
-    ``as_array2d_float``: the ``dtype`` argument carries the element type into the return, so a
-    call site keeps the narrow type it had -- ``as_array2d(x, wp.int32)`` is an
-    [`Array2dInt32`][triwarp.typing.Array2dInt32], not a union.
+    One function rather than a per-dtype family: the ``dtype`` argument carries the element type
+    into the return, so a call site keeps the narrow type it had -- ``as_array2d(x, wp.int32)`` is
+    an [`Array2dInt32`][triwarp.typing.Array2dInt32], not a union.
 
     Parameters
     ----------

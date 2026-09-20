@@ -430,6 +430,7 @@ def arap(
     tolerance: float = 1e-7,
 ) -> wp.array[wp.vec2]:
     """
+
     As-rigid-as-possible (ARAP) parametrization with fixed vertices.
 
     Minimizes the ARAP energy of the 2D parametrization by local/global alternation, starting from
@@ -445,6 +446,7 @@ def arap(
     [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]. Inspect the result
     for inverted triangles with
     [`face_flipped_indices`][triwarp.parametrization.face_flipped_indices].
+
 
     Parameters
     ----------
@@ -496,25 +498,23 @@ def arap(
 
     Notes
     -----
-    Uses the *elements* ARAP energy (one rotation per triangle), libigl's default for the flat
-    ``dim = 2`` parametrization case; the covariance scatter is built per corner of the flattened
-    mesh, which is why the ``SPOKES`` / ``SPOKES_AND_RIMS`` (per-vertex) energies do not apply here.
-    The half-cotangent weights ``c_e`` come from
+    Uses the *elements* ARAP energy (one rotation per triangle), libigl's default for the flat ``dim
+    = 2`` parametrization case; the covariance scatter is built per corner of the flattened mesh,
+    which is why the ``SPOKES`` / ``SPOKES_AND_RIMS`` (per-vertex) energies do not apply here. The
+    half-cotangent weights ``c_e`` come from
     [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries] with no clamping (matching libigl),
     and the closest 2D rotation is the closed form ``theta = atan2(S10 - S01, S00 + S11)`` of
-    ``igl::fit_rotations_planar`` (libigl's scale-invariant ``S /= max|S|`` normalization is
-    unnecessary for ``atan2`` and is skipped). The cotangent operator and the two conjugate-gradient
-    solves run in float64 for determinism while the UV field is stored ``float32`` between
-    iterations (module convention); the ~1e-7/iteration drift is well under the pinned-boundary
-    tolerance for the default iteration count.
+    ``igl::fit_rotations_planar``. The cotangent operator and the two conjugate-gradient solves run
+    in float64 for determinism while the UV field is stored ``float32`` between iterations (module
+    convention); the resulting per-iteration drift is well under the pinned-boundary tolerance for
+    the default iteration count.
 
     **Why ``tolerance`` defaults to ``1e-7`` and not ``1e-8``.** Unlike
     [`harmonic`][triwarp.parametrization.harmonic] or [`lscm`][triwarp.parametrization.lscm], whose
     single solve *is* the answer, ARAP's global solves are inner steps of a truncated outer
     iteration, so solving more accurately than the outer iteration's own truncation error wastes
     work without changing the result. Pass ``tolerance=1e-8`` for stricter per-iteration solves;
-    going looser than the default risks the inner error exceeding the outer truncation error on
-    large meshes, which is why ``1e-7`` rather than something looser is the default.
+    going looser risks the inner error exceeding the outer truncation error on large meshes.
     """
     require_same_device(
         vertices=vertices,

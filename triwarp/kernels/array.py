@@ -13,10 +13,10 @@ from triwarp.constants import INT32_MAX_CONSTANT
 #
 # The condition is written by a **plain store**, never an atomic: it is one address taking one
 # value, so there is nothing to serialize even where every thread of a wide launch may write it
-# (``polyline.rdp_split_spans``). **The condition must be seeded non-zero before the loop starts**:
-# ``wp.capture_while`` evaluates it *before* the first round, so a plain ``wp.zeros`` state runs
-# zero rounds. Seed it with ``wp.array([0, 1])`` / ``assign([0, 1])``, or from the same ``dim=1``
-# kernel that resets the rest of the pass (``remesh.reset_collapse_rounds``).
+# (``polyline.rdp_split_spans``, ``homology.forest_link``). **It must be seeded non-zero before the
+# loop starts**: ``wp.capture_while`` evaluates it *before* the first round, so a plain
+# ``wp.zeros`` state runs zero rounds. Seed with ``wp.array([0, 1])`` / ``assign([0, 1])``, or from
+# the same ``dim=1`` kernel that resets the rest of the pass (``remesh.reset_collapse_rounds``).
 #
 # Six loops share this, in two shapes. **Arm-at-the-front**: a round's first kernel clears the
 # condition and a later one raises it, so two slots are enough -- the level-synchronous
@@ -28,12 +28,7 @@ from triwarp.constants import INT32_MAX_CONSTANT
 # once the round index has been stepped -- ``graph.shortest_path_envelope``'s relaxation passes and
 # both of ``kernels/homology.py``'s (the breadth-first level loop and the Boruvka forest rounds).
 # ``kernels/algorithms/bfs.py`` deliberately shares neither: its seven slots are a frontier window
-# (``start``, ``tail``) rather than a round counter, so slot 0 does not mean the same thing and
-# renumbering it would buy a coincidence of indices, not a shared convention.
-#
-# The condition is written by a **plain store**, never an atomic: it is one address taking one
-# value, so there is nothing to serialize even where every thread of a wide launch may write it
-# (``polyline.rdp_split_spans``, ``homology.forest_link``).
+# (``start``, ``tail``) rather than a round counter, so slot 0 does not mean the same thing.
 LOOP_ROUND = wp.constant(wp.int32(0))
 LOOP_CONDITION = wp.constant(wp.int32(1))
 LOOP_STATE_SIZE = 2
@@ -41,19 +36,14 @@ LOOP_STATE_SIZE = 2
 LOOP_PROGRESS = wp.constant(wp.int32(2))
 LOOP_ADVANCE_STATE_SIZE = 3
 
-# The length-1 slot views the wrappers take, as **plain** slices, and they are a measured cost
-# rather than a tidiness: slicing a ``wp.array`` with the ``wp.int32`` constants above
-# (``state[LOOP_CONDITION : LOOP_CONDITION + 1]``) routes the bound arithmetic through Warp's
-# Python-scope builtin dispatch, which runs ``inspect.signature().bind()`` per operand -- measured
-# **38.98 us against 3.22** for the identical view taken with plain ints (RTX 5090, Warp 1.17,
-# 20 000 slices between two syncs, min of 7). Every round loop in the package took one or two of
-# these per call. Derived from the constants rather than written out, so the two cannot drift.
-#
-# A *partially* typed slice pays too, so both bounds have to be unwrapped: re-measured on the same
-# box, ``arr[K : K + 1]`` is 39.4 us, ``arr[K : 2]`` 27.3 and ``arr[0 : K]`` 15.7, against 3.16 for
-# plain ints. ``__getitem__`` itself forms ``stop - start`` and ``strides * start`` internally, so
-# one Warp-typed bound is three dispatches, not one. The general rule and the whole cost table are
-# in ``.claude/CLAUDE.md`` section 13.1.
+# The length-1 slot views the wrappers take, as **plain** slices, which is a measured cost rather
+# than tidiness: slicing a ``wp.array`` with the ``wp.int32`` constants above routes the bound
+# arithmetic through Warp's Python-scope builtin dispatch, an order of magnitude dearer than the
+# identical view taken with plain ints, and every round loop in the package took one or two per
+# call. Both bounds have to be unwrapped -- ``__getitem__`` forms ``stop - start`` and
+# ``strides * start`` itself, so one Warp-typed bound is three dispatches. Derived from the
+# constants rather than written out, so the two cannot drift. See ``.claude/CLAUDE.md`` section
+# 13.1.
 LOOP_CONDITION_VIEW = slice(int(LOOP_CONDITION), int(LOOP_CONDITION) + 1)
 LOOP_PROGRESS_VIEW = slice(int(LOOP_PROGRESS), int(LOOP_PROGRESS) + 1)
 
@@ -74,22 +64,14 @@ def loop_advance(max_rounds: wp.int32, out_state: wp.array[wp.int32]) -> None:
     # its own; it is cheap insurance, because a captured loop that fails that argument hangs the
     # device rather than returning a wrong answer.
     #
-    # **This is not free, and the number is the price of the merge.** It replaced three bespoke
-    # ``dim=1`` advance kernels -- homology's two and one in ``kernels/graph.py``, all now gone --
-    # and it
-    # runs inside the *replayed* body of every captured round loop -- so its one extra compare and
-    # select over the three-statement form each of those had costs **~0.23 us per round**. On
-    # ``homology_generators``' 140-level primal tree that is 1 252-1 265 us against 1 286-1 295
-    # (2.6 % of the loop, ~1 % of the whole call), measured over three process pairs on an RTX 5090,
-    # Warp 1.17. Carrying the stepped round index in a local rather than re-reading
+    # **This is not free.** It replaced three bespoke ``dim=1`` advance kernels and runs inside the
+    # *replayed* body of every captured round loop, so its one extra compare and select over the
+    # three-statement form each of those had costs a fraction of a percent of a whole call. The
+    # merge was taken with that known -- three near-identical bookkeeping kernels drifting apart is
+    # the more expensive failure -- but a caller adding a *hot* round loop should price this against
+    # a bespoke advance first. Carrying the stepped round index in a local rather than re-reading
     # ``out_state[LOOP_ROUND]`` for the cap test was tried and measured flat, so the plainer
-    # spelling stays; nvcc forwards the store. The merge was taken with that cost known -- three
-    # near-identical bookkeeping kernels drifting apart is the more expensive failure -- but a
-    # caller adding a *hot* round loop should price this against a bespoke advance first.
-    #
-    # Carrying the stepped round index in a local instead of re-reading ``out_state[LOOP_ROUND]``
-    # for the cap test was tried and measured **flat** (1283 against 1287 us on a 140-level
-    # captured loop), so the plainer spelling stays.
+    # spelling stays; nvcc forwards the store.
     out_state[LOOP_ROUND] = out_state[LOOP_ROUND] + 1
     keep_going = out_state[LOOP_PROGRESS] != 0 and out_state[LOOP_ROUND] < max_rounds
     out_state[LOOP_CONDITION] = wp.where(keep_going, wp.int32(1), wp.int32(0))
@@ -114,17 +96,15 @@ def sign_with_tolerance(value: wp.Float, tolerance: wp.Float) -> wp.int32:
     # **The dead zone is an argument and not a constant on purpose, and every pipeline that uses
     # this twice must use the same one both times.** A plane cut asks the question in two places --
     # which side is each *vertex* on, and does the plane cross each *edge*'s interior -- and the two
-    # answers have to agree or the classifier flags a face the edge pass does not split. This lived
-    # for a while as two functions, a fixed-``TOLERANCE_MERGE`` ``tolerance_sign`` for the
-    # classifiers and this one for the edge mask, which put the coupling beyond the reach of a
-    # reader of either: ``intersection.split_faces_along_field`` had to hardcode ``TOLERANCE_MERGE``
-    # at its edge mask to match a classifier whose dead zone was invisible from the call site.
+    # answers have to agree or the classifier flags a face the edge pass does not split. Splitting
+    # it into a fixed-tolerance variant for the classifiers and this one for the edge mask puts that
+    # coupling beyond the reach of a reader of either.
     #
     # The classifiers pass ``TOLERANCE_MERGE_CONSTANT`` because their public entry points
     # (``slice_mesh_with_plane``, ``clip_mesh_with_field``, ``split_faces_along_field``) expose no
     # tolerance and, per CLAUDE.md section 4.2, should not grow one until a caller needs it;
     # ``split_mesh_with_plane`` documents a ``tolerance=`` and passes it through. Both spellings are
-    # now visible at the call site, which is the whole point.
+    # visible at the call site, which is the whole point.
     if value < -tolerance:
         return wp.int32(-1)
     if value > tolerance:
@@ -159,10 +139,8 @@ def loop_next_slot(
     # next loop's.
     #
     # Named because five kernels across ``boundary`` and ``holes`` had written this arithmetic out,
-    # in three spellings that a duplicate scan keying on statement text cannot connect: with the
-    # size in a local, with the size inlined into the ``wrap_index`` call, and with ``begin`` /
-    # ``size`` / ``next_slot`` in place of ``o`` / ``b``. Every one of them is one edge of a rim,
-    # and getting the wrap wrong silently joins two different holes.
+    # in three spellings a duplicate scan keying on statement text cannot connect. Every one of them
+    # is one edge of a rim, and getting the wrap wrong silently joins two different holes.
     begin = loop_starts[loop_id[slot]]
     return begin + wrap_index(slot - begin + 1, loop_sizes[loop_id[slot]])
 
@@ -173,9 +151,8 @@ def update_argmin(
 ):
     # Running min-with-index update in place. Callers must be compiled with
     # ``enable_backward=False`` (``wp.ref`` helpers have no adjoint). Concrete ``float32``:
-    # ``wp.ref[wp.Scalar]`` generics do not instantiate through Warp 1.17 -- re-probed there,
-    # still a ``WarpCodegenError`` at kernel parse ("Couldn't find function overload") -- so float64
-    # sites keep a hand-written loop; the index/tag stays ``int32``.
+    # ``wp.ref[wp.Scalar]`` generics do not instantiate through Warp 1.17 (a ``WarpCodegenError`` at
+    # kernel parse), so float64 sites keep a hand-written loop; the index/tag stays ``int32``.
     if value < best_value:
         best_value = value
         best_index = index  # noqa: F841 — writes through the wp.ref parameter
@@ -225,18 +202,14 @@ def tile_argmin(value: wp.Float, index: wp.int32) -> tuple[wp.Float, wp.int32]:
     #
     # The two-stage form is what makes the winner independent of *which* lane saw it, and that is
     # the whole reason this is one function rather than three: a block reduction hands back a value
-    # and not the lane that held it, so recovering the index is a second reduction with a tie-break,
-    # and the three sites that need it (the hole-filling DP's apex choice, ball pivoting's pivot
-    # search, ``proximity``'s straggler faces) were writing that rule out by hand in three
-    # spellings. A duplicated *decision rule* diverges silently where duplicated arithmetic only
-    # reads badly -- and it had: one of the three carried a trailing ``INT32_MAX -> -1`` fixup that
-    # cannot fire, since at least one lane always attains the minimum and therefore contributes its
-    # own index, and when no lane found anything every lane holds the caller's sentinel already.
+    # and not the lane that held it, so recovering the index is a second reduction with a tie-break
+    # -- a *decision rule*, which diverges silently where duplicated arithmetic only reads badly.
+    # Three sites need it: the hole-filling DP's apex choice, ball pivoting's pivot search and
+    # ``proximity``'s straggler faces.
     #
     # No ``wp.ref``, so unlike ``update_argmin`` this imposes no ``enable_backward=False`` on its
-    # callers. Verified generic on Warp 1.17 at ``float32`` and ``float64``, on both devices, at
-    # ``block_dim`` 1 / 32 / 64 / 256 -- including the CPU device, where ``wp.launch_tiled`` runs
-    # one lane per block and both tiles hold that lane's own pair.
+    # callers. Correct on the CPU device too, where ``wp.launch_tiled`` runs one lane per block and
+    # both tiles hold that lane's own pair.
     block_value = wp.tile_min(wp.tile(value))[0]
     attained = wp.where(value == block_value, index, INT32_MAX_CONSTANT)
     return block_value, wp.tile_min(wp.tile(attained))[0]
@@ -253,8 +226,7 @@ def cross2(a: Any, b: Any) -> wp.Float:
 def mat33_column(m: wp.mat33, col: wp.int32) -> wp.vec3:
     # A `wp.mat33`'s column as a `wp.vec3`, so extracting an SVD basis vector (`wp.svd3` returns
     # its bases as matrix columns) doesn't need three `m[row, col]` reads spelled out at every call
-    # site -- points.py's `finalize_fit_plane`/`finalize_principal_axes`/`estimate_point_normals`
-    # and smoothing.py's `_neighborhood_frame` all did, once each, before this.
+    # site.
     return wp.vec3(m[0, col], m[1, col], m[2, col])
 
 
@@ -282,17 +254,13 @@ def to_vec2(v: wp.vec2d) -> wp.vec2:
 def lift_vec2(p: wp.vec2, z: wp.float32) -> wp.vec3:
     # 2D point -> 3D at a fixed height: trimesh's ``util.stack_3D`` plus a z offset.
     #
-    # The fifth of the vec-conversion family above, and it was written **twice** -- once in
-    # ``kernels/creation.py`` with this signature and once in ``kernels/proximity.py`` with the
-    # height hardcoded to zero -- which is the collision ``.claude/CLAUDE.md`` section 3.5 warns
-    # about as a hypothetical: ``wp.map``'s cache is keyed by the *unqualified* function name plus
-    # the input dtypes, so two same-named ops fork one generated module. The two arities kept it
-    # from being a wrong answer, and a warp-debug log of one suite run showed what it did cost --
-    # ``Module map_lift_vec2`` loading at two distinct hashes on ``cuda:0``.
+    # The fifth of the vec-conversion family above, and one definition rather than two on purpose:
+    # ``wp.map``'s cache is keyed by the *unqualified* function name plus the input dtypes
+    # (``.claude/CLAUDE.md`` section 3.5), so two same-named ops in two kernel modules fork one
+    # generated module and load it at two hashes.
     #
     # ``z`` stays a parameter because ``creation.extrude_triangulation`` genuinely lifts to a
-    # height; the four zero-lifting call sites pass ``wp.float32(0.0)`` explicitly, which all but
-    # one of them already did.
+    # height; the zero-lifting call sites pass ``wp.float32(0.0)`` explicitly.
     return wp.vec3(p[0], p[1], z)
 
 
@@ -330,16 +298,14 @@ def divide_if_positive(value: wp.Float, divisor: wp.Float) -> wp.Float:
 def arange(out_indices: wp.array[wp.Int]) -> None:
     # The ``start == 0, step == 1`` fast path of ``array.arange``, kept beside the general affine
     # form because it is the only one any in-repo caller reaches and it marshals two fewer
-    # arguments -- ~2 us of the ~26 us the whole 200k-element call costs (CLAUDE.md 13.1).
+    # arguments.
     #
     # ``wp.tile_arange`` was measured here and **declined**, on two counts. It cannot express this
-    # kernel at all: its bounds are read at *codegen* (``tile_arange_value_func`` computes the tile
-    # length from them), so a runtime ``block * TILE`` start is a parse error and the only
-    # expressible form is a constant tile shifted by a ``tile_map(wp.add, ...)`` over a broadcast
-    # scalar. Measured that way against this kernel, values identical, min of 9 interleaved reps of
-    # 100 launches at ``block_dim=256``: **0.85x at 1 024, 0.91x at 200 192 and 0.998x at
-    # 13 999 872** -- a loss below the bandwidth limit and a wash at it, because writing
-    # ``out[i] = i`` is a pure streaming store with no reuse for a tile to exploit.
+    # kernel at all: its bounds are read at *codegen*, so a runtime ``block * TILE`` start is a
+    # parse error and the only expressible form is a constant tile shifted by a ``tile_map`` over a
+    # broadcast scalar. Measured that way, values identical, it is a loss below the bandwidth limit
+    # and a wash at it, because writing ``out[i] = i`` is a pure streaming store with no reuse for a
+    # tile to exploit.
     i = wp.int32(wp.tid())
     out_indices[i] = i
 
@@ -434,13 +400,8 @@ def sort_segments(offsets: wp.array[wp.int32], data: wp.array[wp.int32]) -> None
     # is why this one is a shell sort rather than the insertion sort it degenerates into. For the
     # vertex valences its caller sorts the gap loop runs twice and costs a couple of comparisons;
     # what it buys is that a single high-degree segment cannot take the whole launch quadratic,
-    # since the launch waits for its slowest thread.
-    #
-    # Measured on an RTX 5090, Warp 1.17, as the whole ``edges_to_neighbor_lists`` build against
-    # ``edges_to_csr``, byte-identical at every point: on meshes **2.61-2.65x** (against
-    # 2.48-2.60x for the plain insertion sort, so the gap loop is free at a vertex valence), and on
-    # a star graph 1.97x / 2.59x / 2.25x / **1.82x** at hub degree 6 / 32 / 128 / 256, crossing to
-    # **0.78x at 512** and 0.07x at 4 096. That crossover is the reason the caller chooses.
+    # since the launch waits for its slowest thread. It beats ``edges_to_csr`` up to a few hundred
+    # neighbours in one row and loses badly above that, which is why the caller chooses.
     segment = wp.int32(wp.tid())
     start = offsets[segment]
     width = offsets[segment + 1] - start
@@ -492,13 +453,11 @@ def shifted_index(value: wp.Scalar, offset: wp.Scalar, last: wp.Scalar) -> wp.in
     # The range test runs in the value's **own** dtype and the narrowing to ``int32`` runs after
     # it, and that order is the whole reason ``last`` is an argument. Narrowing first is exact only
     # while the difference is known to fit, and the caller that establishes that -- ``array.isin``
-    # inferring the span with two ``reduce.minmax`` reductions -- is precisely the caller a
-    # supplied ``max_index`` exists to skip. On that path a 64-bit value far above the table used
-    # to wrap into a valid slot and read as *present*: ``isin([2**32 + 5, 7], [5, 7],
-    # max_index=100)`` answered ``[True, True]`` where numpy answers ``[False, True]``, on both the
-    # element side and the ``wp.map`` over the test values. Testing ``value`` rather than the
-    # difference cannot overflow, and it leaves ``value - offset`` bounded by the table's own
-    # length, so the cast below is exact by construction rather than by precondition.
+    # inferring the span with two ``reduce.minmax`` reductions -- is precisely the caller a supplied
+    # ``max_index`` exists to skip; on that path a 64-bit value far above the table wraps into a
+    # valid slot and reads as *present*. Testing ``value`` rather than the difference cannot
+    # overflow, and it leaves ``value - offset`` bounded by the table's own length, so the cast
+    # below is exact by construction rather than by precondition.
     #
     # ``last`` rather than a span: ``offset + span`` is not always representable at the top of a
     # dtype, where ``offset + span - 1`` is the largest value the table holds and therefore always
@@ -545,9 +504,8 @@ def isin_lookup_sorted(
 def mask_not(a: wp.bool) -> wp.bool:
     # Mask complement -- for a caller holding the region to *delete* and needing the one to keep,
     # among others. Warp exposes no ``logical_not`` builtin (``wp.invert`` is the bitwise
-    # complement, which is wrong for a ``wp.bool``), so this one-liner is what ``wp.map`` needs,
-    # and it is the tree's only spelling of it: a second copy under a second name lived in
-    # ``kernels/selection.py`` for a week, carrying this same paragraph.
+    # complement, which is wrong for a ``wp.bool``), so this one-liner is what ``wp.map`` needs, and
+    # it is the tree's only spelling of it.
     return not a
 
 
@@ -573,12 +531,11 @@ def bool_flags(mask: wp.array[wp.bool], out_flags: wp.array[wp.int32]) -> None:
     # ``1`` / ``0`` per mask entry: the ``int32`` a ``wp.utils.array_scan`` needs from a ``wp.bool``
     # buffer, which it cannot read directly.
     #
-    # A plain kernel rather than ``wp.utils.array_cast``, which produces the identical bytes: that
-    # utility resolves a generic cast kernel per call and measured 20.3-21.0 us against this one's
-    # 11.0-11.3, flat from 1 024 to 1 000 000 elements, so the difference is its host-side
-    # resolution and not the copy. ``wp.map`` is not the spelling either -- ``wp.Scalar`` does not
-    # instantiate for ``wp.bool`` (CLAUDE.md section 12.4), which is why ``nonzero_flag`` below
-    # covers every dtype except this one.
+    # A plain kernel rather than ``wp.utils.array_cast``, which produces the identical bytes but
+    # resolves a generic cast kernel per call and measures about twice as slow, flat in the element
+    # count -- so the difference is its host-side resolution and not the copy. ``wp.map`` is not the
+    # spelling either: ``wp.Scalar`` does not instantiate for ``wp.bool`` (CLAUDE.md section 12.4),
+    # which is why ``nonzero_flag`` below covers every dtype except this one.
     i = wp.int32(wp.tid())
     out_flags[i] = wp.where(mask[i], 1, 0)
 
@@ -593,13 +550,11 @@ def nonzero_flag(value: wp.Scalar) -> wp.int32:
 
 
 # The comparison family below is the tree's spelling for a thresholding ``wp.map``, and it is worth
-# saying so here because it kept being re-spelled: ``seams.crease_edge_mask``,
-# ``smoothing.is_spike_defect`` and ``heat/vector.is_resolved`` were each a private ``a > b`` under
-# a domain name while ``greater`` already had six adopters. What those three carried that was worth
-# keeping was never the comparison -- it was *which quantity* and *which threshold* their caller
-# chose, and that argument now sits in the wrapper that chooses it, where a user of the public
-# function reads it. Reach for a named predicate when it computes something (``is_positive_finite``,
-# ``is_close_scalar``); reach for these when it is a comparison.
+# saying so here because it kept being re-spelled under domain names. What such a private predicate
+# carries that is worth keeping is never the comparison -- it is *which quantity* and *which
+# threshold* its caller chose, and that argument belongs in the wrapper that chooses it, where a
+# user of the public function reads it. Reach for a named predicate when it computes something
+# (``is_positive_finite``, ``is_close_scalar``); reach for these when it is a comparison.
 @wp.func
 def greater(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
     return a > b
@@ -716,20 +671,17 @@ def map_sorted_inverse(
     # ``numpy.unique(return_inverse=True)``: each element's position in the sorted unique output,
     # which is ``searchsorted(sorted_unique, x, side="left")``. Every key searched for came out of
     # that same unique set, so on an ordered dtype the left search lands on the exact slot and the
-    # equality below always holds -- for an integer key this is the identical answer the older
-    # ``binary_search_index(...) - 1`` spelling gave, since for a key that is present
-    # ``side="right" - 1 == side="left"``.
+    # equality below always holds.
     #
     # **The two lines that are not cosmetic are the ``side="left"`` search and the equality, and
     # both are the ``NaN`` case.** Warp's float radix sort puts ``NaN`` last and every comparison
     # against it is false, so a binary search whose midpoint lands in that tail is steered by a
-    # predicate that never fires. ``side="right"`` is steered *into* the tail and reported the last
-    # slot for every finite value -- measured on Warp 1.17, ``[3.5, 1.25, 3.5, nan, 1.25]`` gave
-    # ``[2, 0, 2, 2, 0]`` where numpy gives ``[1, 0, 1, 2, 0]``, a silent wrong answer on
-    # ``grouping.unique_1d``'s documented float path. ``side="left"`` is steered *away* from it and
-    # is correct for every finite value; what it then gets wrong is ``NaN`` itself, which lands at
-    # slot 0 -- and that is exactly what the equality catches, ``NaN`` comparing unequal to
-    # everything including itself, since the only slot a ``NaN`` can belong to is the last one.
+    # predicate that never fires. ``side="right"`` is steered *into* the tail and reports the last
+    # slot for every finite value -- a silent wrong answer on ``grouping.unique_1d``'s documented
+    # float path. ``side="left"`` is steered *away* from it and is correct for every finite value;
+    # what it then gets wrong is ``NaN`` itself, which lands at slot 0 -- and that is exactly what
+    # the equality catches, ``NaN`` comparing unequal to everything including itself, since the only
+    # slot a ``NaN`` can belong to is the last one.
     i = wp.int32(wp.tid())
     value = data[i]
     n = wp.int32(sorted_unique.shape[0])
@@ -756,19 +708,14 @@ def mark_rows_present(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 2.5. Measured over the suite: 12 overloads created across **13** module loads,
-# and this module is imported by 25 kernel modules and 15 wrappers, so its rebuilds are felt widely.
+# CLAUDE.md section 2.5. This module is imported by 25 kernel modules and 15 wrappers, so its
+# rebuilds are felt widely.
 #
 # The index-buffer kernels fill a buffer every caller in the package allocates ``wp.int32``;
 # ``wp.Int`` in their annotation is the template, not a menu. Their three wrappers
-# (``array.arange``, ``arange_repeat``, ``sort_pair_indices``) used to expose a ``dtype=`` keyword
-# that contradicted this: it type-checked, ran the per-dtype range validation, and then died in
-# ``OverloadTable.__getitem__`` for every value but the default. The keyword is gone rather than
-# the set widened -- nothing can have depended on an argument that only ever accepted one value,
-# where widening would compile three more overloads per kernel on every rebuild for no caller
-# (CLAUDE.md sections 2.5 and 4.2). So this tuple is now an exact statement of the public surface
-# rather than a restriction of it, and a second width belongs here only alongside a wrapper that
-# offers one.
+# (``array.arange``, ``arange_repeat``, ``sort_pair_indices``) expose no ``dtype=`` keyword, so this
+# tuple is an exact statement of the public surface rather than a restriction of it: a second width
+# belongs here only alongside a wrapper that offers one (sections 2.5 and 4.2).
 #
 # The two search kernels take the caller's *key* dtype, whose surface is the one
 # ``sortable_dtype`` maps onto.
@@ -777,11 +724,10 @@ _INDEX_DTYPES = (wp.int32,)
 # its key surface stops at the integers.
 _KEY_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64)
 # ``map_sorted_inverse`` reaches further: its sole caller
-# ``grouping.unique_1d(return_inverse=True)`` launches it in ``twt.sortable_dtype(data.dtype)``,
-# and ``unique_1d`` accepts *any* scalar dtype --
-# its own docstring documents the float ``NaN`` slot semantics for exactly this path. So the float
-# rows are reachable public API, and omitting them recompiled ``triwarp.kernels.array`` (imported by
-# 25 kernel modules and 15 wrappers) on the first float call.
+# ``grouping.unique_1d(return_inverse=True)`` launches it in ``twt.sortable_dtype(data.dtype)``, and
+# ``unique_1d`` accepts *any* scalar dtype -- its own docstring documents the float ``NaN`` slot
+# semantics for exactly this path. So the float rows are reachable public API, and omitting them
+# rebuilds this widely imported module on the first float call.
 _SORT_KEY_DTYPES = (*_KEY_DTYPES, wp.float32, wp.float64)
 
 
@@ -815,12 +761,8 @@ class OverloadTable(KernelTable):
 
     ``wp.launch`` on a generic kernel runs ``infer_argument_types`` over the whole argument list
     and *then* looks the overload up, on **every** call -- and that inference is the cost, not the
-    lookup. Measured on Warp 1.17 / RTX 5090, 100 launches between two synchronization points:
-    ``triangles.face_signed_volumes`` (three generic parameters) costs **26.6 us** launched
-    generically and **12.2 us** launched through the handle ``wp.overload`` already returned, with
-    bit-identical output -- **2.17x, 14.3 us a launch**.
-    A kernel generic in one array dtype costs about 12 us of the same overhead, against a ~12 us
-    concrete launch floor: a generic launch is roughly *twice* the host cost of a concrete one.
+    lookup. A generic launch is roughly *twice* the host cost of a concrete one, and more again
+    when several parameters are generic.
 
     Nothing new is compiled. ``_register_overloads`` was already creating these overloads at import
     for the reason in ``.claude/CLAUDE.md`` section 2.5 (a lazily instantiated overload rebuilds the
@@ -831,10 +773,9 @@ class OverloadTable(KernelTable):
 
     A missing key raises rather than falling back to the generic kernel. Falling back would work
     and would be *slow in the way section 2.5 exists to prevent* -- the first launch at an
-    unregistered dtype rebuilds the module, measured at 80.3 s for one
-    ``energies.crouzeix_raviart_cotmatrix_triplets`` call -- so an unregistered dtype is a
-    registration gap to fix, and this turns it from a clock reading into an error naming the
-    kernel.
+    unregistered dtype rebuilds the whole module, which can take a minute -- so an unregistered
+    dtype is a registration gap to fix, and this turns it from a clock reading into an error naming
+    the kernel.
     """
 
     def __init__(self, kernel: wp.Kernel, signatures: Mapping[Any, Sequence[Any]]) -> None:
@@ -846,9 +787,8 @@ class OverloadTable(KernelTable):
 
 # The concrete handles ``wp.overload`` hands back, keyed by the caller's dtype -- see
 # [`OverloadTable`][triwarp.kernels.array.OverloadTable] for why a wrapper launches through these
-# rather than through the generic kernel above it (measured 2.17x on a launch, and nothing extra is
-# compiled). Declared here so a type checker sees them at module scope; ``_register_overloads``
-# fills them in at import.
+# rather than through the generic kernel above it. Declared here so a type checker sees them at
+# module scope; ``_register_overloads`` fills them in at import.
 ARANGE: OverloadTable
 ARANGE_AFFINE: OverloadTable
 ARANGE_REPEAT: OverloadTable
@@ -880,14 +820,12 @@ def _register_overloads() -> None:
         map_sorted_inverse,
         {d: [wp.array[d], wp.array[d], wp.array[wp.int32]] for d in _SORT_KEY_DTYPES},
     )
-    # ``sort_rows_insertion`` sorts a rank-2 table in place. Its only caller is ``array.sort_rows``
-    # -- not ``unique_rows``, which an earlier version of this comment claimed and which sorts no
-    # rows -- so the set is that wrapper's annotation, ``Array2dInt32 | Array2dFloat32``. The
-    # ``wp.float64`` entry that used to sit here was reachable through no annotation and, worse,
-    # made the accepted dtypes depend on the row width: this kernel is generic, so a float64 table
-    # sorted silently while the wide-row fallback (``segmented_sort_pairs``, int32/float32 keys
-    # only) raised from inside Warp. ``sort_rows`` now rejects the dtype up front and this set
-    # matches it.
+    # ``sort_rows_insertion`` sorts a rank-2 table in place. Its only caller is ``array.sort_rows``,
+    # so the set is that wrapper's annotation, ``Array2dInt32 | Array2dFloat32``. A ``wp.float64``
+    # entry here would make the accepted dtypes depend on the row width: this kernel is generic, so
+    # a float64 table would sort silently while the wide-row fallback (``segmented_sort_pairs``,
+    # int32/float32 keys only) raised from inside Warp. ``sort_rows`` rejects the dtype up front and
+    # this set matches it.
     SORT_ROWS_INSERTION = OverloadTable(
         sort_rows_insertion, {d: [wp.array2d[d]] for d in (wp.int32, wp.float32)}
     )
@@ -896,70 +834,38 @@ def _register_overloads() -> None:
 _register_overloads()
 
 
-# ``wp.map`` has the same lazy-instantiation property ``_register_overloads`` exists for, and
-# nothing accounted for it. A ``wp.map(op, ...)`` call generates a Warp module named
-# ``map_<unqualified op name>``, each distinct *call signature* forks that module's hash, and a
-# module's hash covers the set of kernels instantiated in it -- so reaching one op at three
-# signatures builds its module three times, each build containing every kernel accumulated so far.
+# ``wp.map`` has the same lazy-instantiation property ``_register_overloads`` exists for, and the
+# same fix: a ``wp.map(op, ...)`` call generates a module named ``map_<unqualified op name>``, each
+# distinct *call signature* forks its hash, and a module's hash covers the kernels instantiated in
+# it. Declaring the signatures up front with ``return_kernel=True`` reaches the final module
+# directly for milliseconds of import. The chain is order-dependent, so this is a developer-loop
+# tax rather than a one-time install cost (CLAUDE.md section 3.5).
 #
-# Measured on Warp 1.17: ``wp.mul`` at float32, then vec3, then float64 in a fresh cache logs
-# ``Module hash changed, recompiling: map_mul`` twice and compiles 245 + 43 + 43 ms, where the
-# final hash alone is one 253 ms build. **Declaration is not compilation** -- exactly as for
-# ``wp.overload`` -- so declaring the signatures up front with ``return_kernel=True`` reaches the
-# final module directly: those three cost 1.8 ms of declarations plus one 253 ms build, and the
-# other two launch for free with correct values. Over the eight longest chains, interleaved in one
-# session: **cold cache 1 365-1 485 -> 647-665 ms (2.1x)**, **warm cache 114.9 -> 97.1 ms (1.18x)**,
-# both including what the declarations themselves cost.
+# **The fork axis is not only the dtype, and that is the part that is not guessable.**
+# ``warp._src.utils.map`` keys its cache on ``(is_array, type(input).__name__, dtype, ndim,
+# broadcast_mask)`` per input, where ``broadcast_mask`` is ``tuple(d == 1 for d in shape)``. Three
+# things fork a module that a dtype census cannot see: a **length-1** array (the commonest axis in
+# the tree -- it is how every reduction-into-a-scalar wrapper calls ``wp.map``); an
+# **``indexedarray``**, i.e. a Python-scope gather view; and the **rank**.
 #
-# **The reason it matters past a cold cache is the reason ``_register_overloads`` gives: the chain
-# is order-dependent.** A process reaching the signatures in a different order walks intermediate
-# hashes that were never compiled, so changing *which* tests you select re-pays it; and a
-# ``map_*`` module over a triwarp ``@wp.func`` is invalidated by any edit to that func's module.
-# It is a developer-loop tax, not a one-time install cost.
+# **The table is what the wrappers' dispatch reaches, not what the ops admit** (no speculative
+# generality). Generate it by monkeypatching ``wp.map`` over a full ``tests/`` run and recording
+# Warp's own cache key, so a new signature is a measurement rather than a guess; only ops that
+# actually fork are listed. **The gate is the load count**: distinct
+# ``(map_* module, hash, device, block_dim)`` loads against distinct ``(module, device, block_dim)``
+# pairs, whose floor is one module per op per device. A non-zero excess names the op that reopened
+# a chain.
 #
-# **The fork axis is not only the dtype, and this is the part that is not guessable.**
-# ``warp._src.utils.map`` keys its cache on, per input, ``(is_array, type(input).__name__,
-# dtype, ndim, broadcast_mask)`` where ``broadcast_mask`` is ``tuple(d == 1 for d in shape)``. So
-# three things fork a module that a dtype census cannot see:
+# **Placement is decided by the shape of the imports.** Several of the longest chains are Warp
+# *builtins*, so one generated module is shared across several wrapper modules and every
+# declaration for it must run before the *first* launch from any of them; those live here, because
+# this module is reached first. Ops belonging to a single kernel module are declared at that
+# module's own bottom — they *cannot* be declared here, since those modules import this one.
 #
-#   * a **length-1** array, because its mask differs -- and that is not an edge case here, it is
-#     how every reduction-into-a-scalar wrapper calls ``wp.map`` (``polyline_normal`` maps
-#     ``wp.normalize`` over its one-element accumulator). Measured over one suite run: **12** ops
-#     fork on this axis *alone* and five more fork on it in addition to a dtype.
-#   * an **``indexedarray``**, i.e. a Python-scope gather view (``wp.map(pred, table[indices],
-#     ...)``, the composition section 4 sanctions). Two ``greater_equal`` sites.
-#   * the **rank**, which is why a rank-2 input is its own signature.
-#
-# **The table is what the wrappers' dispatch actually reaches, not what the ops admit** -- section
-# 14, no speculative generality, and the same rule as for ``wp.overload``. It was generated by
-# monkeypatching ``wp.map`` over a full ``tests/`` run and recording Warp's own cache key for every
-# call, so a new signature is a measurement rather than a guess: re-run that census rather than
-# adding a row by hand. Only ops that actually fork are listed -- 103 of the 127 the tree maps
-# reach one signature, and declaring those would be import cost for nothing.
-#
-# **The gate is the load count, and it is at its floor.** One full suite run under
-# ``wp.config.log_level = logging.DEBUG``, before and after, counting distinct
-# ``(map_* module, hash, device, block_dim)`` loads against distinct ``(module, device,
-# block_dim)`` pairs: **182 over 143 (39 redundant) -> 143 over 143 (0)**. 143 is the floor -- one
-# module per op per device -- so re-running that census is how a future author checks a new
-# ``wp.map`` site did not reopen a chain, and a non-zero count names the op that did.
-#
-# **Placement, which the shape of the imports decides.** Six of the longest chains are Warp
-# *builtins* (``wp.mul``, ``wp.div``, ``wp.neg``, ``wp.length``, ``wp.add``, ``wp.sub``, plus
-# ``wp.normalize``), so one generated module is shared across several wrapper modules and every
-# declaration for it must run before the *first* launch from any of them -- a per-wrapper
-# declaration would fork again the moment a process imported only one of them. Those live here,
-# with this module's own ``@wp.func``s, because this module is imported by 25 kernel modules and
-# 15 wrappers and is therefore reached first. The other eight forking ops belong to a single
-# kernel module each and are declared at that module's own bottom: they *cannot* be declared here
-# (``kernels/polyline.py`` and the rest import this module, so naming their funcs would be a
-# cycle) and they do not need to be, having one owner.
-#
-# One thing this costs that is worth naming, because it looks like a regression and is not: the
-# first ``wp.zeros`` below forces ``wp.init()``, so ``import triwarp.kernels.array`` goes from
-# 18 ms to ~300 ms. Measured interleaved, a process that imports a wrapper *and does one call* is
-# unchanged (415-417 ms against 399-495 ms) -- the runtime init is moved earlier, not added -- and
-# ``import triwarp`` itself stays at 0.2 ms, since PEP 562 keeps it from importing any of this.
+# One cost that looks like a regression and is not: the first ``wp.zeros`` below forces
+# ``wp.init()``, so ``import triwarp.kernels.array`` alone gets much slower. A process that imports
+# a wrapper *and does one call* is unchanged, and ``import triwarp`` is untouched because PEP 562
+# keeps it from importing any of this.
 
 
 def map_probe(dtype: type) -> wp.array:
@@ -1085,10 +991,9 @@ def _declare_map_kernels() -> None:
             (nonzero_flag, (dense(wp.int8),), wp.int32),
             # One row per dtype in ``kernels/array._KEY_DTYPES``, which is the set
             # ``array.isin`` -- ``shifted_index``'s only caller -- can reach after it widens
-            # sub-32-bit dtypes. ``int64`` was missing and forked the module on first use: a probe
-            # on an ``int64`` input logged ``map_shifted_index ... (compiled)``, which is exactly
-            # the cost CLAUDE.md section 3.5 exists to remove and which check 23 cannot see,
-            # because the table's *existence* is all it asserts.
+            # sub-32-bit dtypes. A dtype missing here forks the module on first use, which is
+            # exactly the cost CLAUDE.md section 3.5 exists to remove and which check 23 cannot
+            # see, because the table's *existence* is all it asserts.
             (shifted_index, (dense(wp.int32), wp.int32(1), wp.int32(1)), wp.int32),
             (shifted_index, (dense(wp.int64), wp.int64(1), wp.int64(1)), wp.int32),
             (shifted_index, (dense(wp.uint32), wp.uint32(1), wp.uint32(1)), wp.int32),
@@ -1103,21 +1008,19 @@ _declare_map_kernels()
 @wp.func
 def lowbias32(x: wp.uint32) -> wp.uint32:
     # The ``lowbias32`` finalizer: a **bijection** on uint32 whose output is decorrelated from its
-    # input. Two properties, and the tree needs both -- each of its callers needed one of them and
-    # wrote the mixer out for itself.
+    # input. Two properties, and the tree needs both.
     #
     # *Bijective*, so distinct inputs never collide: a priority drawn as ``lowbias32(index)`` is a
     # strict total order on the indices with no tie to break, which is what
     # ``polyline.ear_outranks`` relies on (its index tiebreak is dead code kept only in case the
     # mixer is ever swapped).
     #
-    # *Decorrelating*, and this is load-bearing for any parallel independent-set pass. ``edges_
-    # unique`` orders edges lexicographically by endpoint index, which on a structured mesh is
-    # spatially *monotone*, and a monotone key field has essentially one local minimum -- so a
-    # min-key lock commits a single winner per pass however many candidates there are. Measured on
-    # ``saddle_graded``: locking by raw edge index yields **1** winner out of 51 546 candidates, and
-    # locking by quadric cost yields 23 (that field is smoothly graded there, so it is monotone
-    # too). Hashing the index restores the expected ~candidates/valence.
+    # *Decorrelating*, and this is load-bearing for any parallel independent-set pass.
+    # ``edges_unique`` orders edges lexicographically by endpoint index, which on a structured mesh
+    # is spatially *monotone*, and a monotone key field has essentially one local minimum -- so a
+    # min-key lock commits a single winner per pass however many candidates there are. Hashing the
+    # index restores the expected ~candidates/valence. Locking by a smoothly graded *cost* field
+    # instead has the same defect, for the same reason.
     #
     # For a random order that a caller can *vary*, use ``random_priorities`` instead: it takes a
     # seed. This one is a pure function of the index, so it needs no state and is reproducible
@@ -1192,15 +1095,13 @@ def pack_ranked_key(value: wp.int32, index: wp.int32) -> wp.int64:
 @wp.func
 def unpack_ranked_index(key: wp.int64) -> wp.int32:
     # The index out of a ``pack_farthest_key`` / ``pack_ranked_key`` key -- the inverse of the
-    # complement both use in their low half, so one decoder serves both.
+    # complement both use in their low half, so one decoder serves both. It lives here, beside its
+    # packers, because a pack/unpack pair in two modules is a pair that cannot be read.
     #
-    # It lives here, beside its packers, because a pack/unpack pair in two modules is a pair that
-    # cannot be read: this was in ``kernels/points.py`` while both packers were here, three hundred
-    # lines from either. Note the alternative a caller may prefer:
-    # ``repair.mark_largest_group_mask`` never unpacks at all, it *recomputes* the key and tests it
-    # against the reduced maximum, keeping the winner on the device instead of pulling it back to
-    # pick a row. Unpack when the host needs the index (a greedy loop's next seed); recompute when
-    # only the device does.
+    # Note the alternative a caller may prefer: ``repair.mark_largest_group_mask`` never unpacks at
+    # all, it *recomputes* the key and tests it against the reduced maximum, keeping the winner on
+    # the device instead of pulling it back to pick a row. Unpack when the host needs the index (a
+    # greedy loop's next seed); recompute when only the device does.
     low = wp.int32(wp.uint32(wp.uint64(key) & wp.uint64(4294967295)))
     return wp.int32(complement_rank_index(low))
 
@@ -1314,21 +1215,15 @@ def trilinear_weight(
 # ---------------------------------------------------------------------------
 # Segmented copy: many separate arrays into one buffer, in a single launch.
 #
-# ``array._pack_segments`` used to issue one ``wp.copy`` per segment, which is a host cost of
-# ~6 us each (CLAUDE.md section 13.1) and therefore linear in the segment count while the data
-# volume is irrelevant -- 1.37 ms to concatenate 256 arrays, whatever they hold. Its own comment
-# said there was no alternative, "Warp has no array-of-arrays and a kernel cannot dereference a
-# raw pointer". **Warp does have an array-of-arrays**: a ``@wp.struct`` may carry a ``wp.array``
-# field, and a ``wp.array`` of that struct is exactly a descriptor table, which ``segments[s].data``
-# indexes from kernel scope. Measured on an RTX 5090 / Warp 1.17, total held at 2 614 242 elements:
+# ``array._pack_segments`` issues one ``wp.copy`` per segment on the small-segment path, a host
+# cost linear in the segment count and independent of the data volume. **Warp does have an
+# array-of-arrays**, contrary to a long-standing comment there: a ``@wp.struct`` may carry a
+# ``wp.array`` field, and a ``wp.array`` of that struct is exactly a descriptor table, which
+# ``segments[s].data`` indexes from kernel scope.
 #
-#   segments      2      8     32     64    256    1024    4096
-#   loop (ms)  0.026  0.063  0.172  0.341  1.372   5.187  21.529
-#   kernel     0.094  0.092  0.091  0.094  0.092   0.102   0.144
-#   ratio      0.27x  0.68x  1.89x  3.64x 14.91x  50.76x 149.75x
-#
-# The kernel form is **flat in both the segment count and the data volume** (0.078-0.094 ms at
-# totals from 48 903 to 2 614 242), so the whole choice is a segment-count threshold; see
+# The kernel form is **flat in both the segment count and the data volume**, where the copy loop is
+# linear in the segment count, so the two cross at a couple of dozen segments and the kernel wins by
+# orders of magnitude above that. The whole choice is therefore a segment-count threshold; see
 # ``array.PACK_SEGMENTS_KERNEL_FROM``.
 #
 # **One kernel serves every dtype**, rather than a table of them. The descriptor's array field is

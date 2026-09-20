@@ -14,13 +14,11 @@ NanoVDB voxel ``i`` covering world ``[origin + i * s, origin + (i + 1) * s)``, s
 deliberate.** Every kernel *downstream* of a built grid -- ``point_cell``,
 ``cell_center_positions``, ``corner_positions`` -- goes through ``wp.volume_world_to_index`` /
 ``wp.volume_index_to_world``, so the convention above is read off the object that defines it
-instead of re-implemented. The
-*voxelization* kernels -- ``voxel_cell``, ``voxel_cell_indices``, ``triangle_voxel_window`` -- run
-before any volume exists: they produce the cells ``Volume.allocate_by_voxels`` then builds a grid
-from, so there is no volume id to pass and the ``(origin, voxel_size)`` scalar form is required
-rather than preferred. Measured perf-neutral either way (1.08x for the builtin at 200k voxels,
-1.005x at 2M -- both launch-dominated at ~28 us), so this is a single-source-of-truth split and not
-a speed one.
+instead of re-implemented. The *voxelization* kernels -- ``voxel_cell``, ``voxel_cell_indices``,
+``triangle_voxel_window`` -- run before any volume exists: they produce the cells
+``Volume.allocate_by_voxels`` then builds a grid from, so there is no volume id to pass and the
+``(origin, voxel_size)`` scalar form is required rather than preferred. Measured perf-neutral either
+way, so this is a single-source-of-truth split and not a speed one.
 """
 
 import warp as wp
@@ -213,9 +211,8 @@ def cell_center_positions(
 ) -> None:
     # NanoVDB centres voxel ``i`` *on* index-space coordinate ``i``, so the integer cell coordinate
     # maps straight to the cell centre and the volume's own transform supplies the half-voxel shift
-    # the module docstring describes. Measured against the hand-rolled
-    # ``origin + (cell + 0.5) * voxel_size``: max abs difference 3.58e-07 over 3 929 voxels, i.e.
-    # float32 rounding and no convention disagreement.
+    # the module docstring describes. It agrees with the hand-rolled
+    # ``origin + (cell + 0.5) * voxel_size`` to float32 rounding, i.e. no convention disagreement.
     v = wp.int32(wp.tid())
     out_centers[v] = wp.volume_index_to_world(
         volume,
@@ -273,9 +270,9 @@ def pack_cell_keys(
     # ``lower`` / ``upper`` are the two three-element buffers ``reduce.minmax(cells, axis=0)``
     # returns, read here rather than passed in as ``wp.vec3i`` / ``wp.uint64`` scalars: every lane
     # wants the same six values, so they are broadcast loads out of L2, and taking them by value
-    # would instead cost the wrapper two host readbacks. Measured on ``voxels.cells`` at
-    # ``order="sorted"``, values byte-identical: 1.32x at 1e3 voxels, 1.27x at 4.8e4, 1.23x at
-    # 4.4e5 -- the call is host-bound at every size, so removing host work is the whole win.
+    # would instead cost the wrapper two host readbacks. Byte-identical values, and worth about a
+    # quarter of ``voxels.cells`` at every size -- the call is host-bound throughout, so removing
+    # host work is the whole win.
     v = wp.int32(wp.tid())
     lo = wp.int32(0)
     hi = upper[0]

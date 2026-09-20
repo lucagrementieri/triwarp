@@ -1,15 +1,14 @@
 """
 Run the suite on both devices, as two processes, because one process cannot do it cheaply.
 
-``uv run python -m tests.devices`` runs a CUDA pass and then a CPU pass, and the CPU pass is
-spawned with ``CUDA_VISIBLE_DEVICES=""``. That environment variable is the whole point of the
-runner: **Warp's CPU work is ~36x slower once CUDA has been initialised in the process**, so a
-single ``pytest --device=both`` pays that on every CPU parametrization. Measured on one
+``uv run python -m tests.devices`` runs a CUDA pass and then a CPU pass, and the CPU pass is spawned
+with ``CUDA_VISIBLE_DEVICES=""``. That environment variable is the whole point of the runner:
+**Warp's CPU work is ~36x slower once CUDA has been initialised in the process**, so a single
+``pytest --device=both`` pays that on every CPU parametrization. Measured on one
 ``heat_signed_distance`` call -- same mesh, same code, only ``CUDA_VISIBLE_DEVICES`` differing --
-50.57 s with CUDA visible against **1.40 s** without, and the figure is unchanged by
-``warp.config.launch_array_access_mode`` (``RELAXED`` 50.34 s, ``CHECKED`` 49.77 s), so it is CUDA
-presence rather than CLAUDE.md section 3.9's launch guard. Whole-suite consequence: 717 s in one
-process, against ~37.6 s + ~155 s as two.
+and the figure is unchanged by ``warp.config.launch_array_access_mode`` at ``RELAXED`` or
+``CHECKED``, so it is CUDA presence rather than CLAUDE.md section 3.9's launch guard. Whole-suite
+consequence: roughly 4x, one process against two.
 
 Both-device coverage earns the second process. It is what caught the ``warp.fem`` ambient-device
 leak in ``reconstruction._screened_poisson_adaptive`` -- broken for CPU input on any box with a GPU,
@@ -22,8 +21,8 @@ Usage
     CUDA pass, then a CUDA-hidden CPU pass with the ``slow_cpu`` tests skipped. The everyday
     both-device check.
 ``uv run python -m tests.devices --slow-cpu``
-    Same, but the CPU pass runs ``--device=both``, which in a CUDA-hidden process means "all of
-    CPU, skip nothing" -- the ``slow_cpu`` Poisson tests included.
+    Same, but the CPU pass runs ``--device=both``, which in a CUDA-hidden process means "all of CPU,
+    skip nothing" -- the ``slow_cpu`` Poisson tests included.
 ``uv run python -m tests.devices -- -x -k grouping``
     Everything after ``--`` is forwarded to both pytest invocations.
 

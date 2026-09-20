@@ -89,15 +89,14 @@ def shortest_path_envelope_pass(
     # (VCG ``UpdateQuality::VertexSaturate`` is this loop.)
     #
     # **Two passes per round, written into each other's buffer, would remove the wrapper's
-    # ``wp.copy``** -- it is a whole device pass over the node array and measured ~20 % of that call
-    # (1.26x on 2 562 nodes, 1.45x on 40 962) -- and it is **not portable**: the two devices then
-    # disagree. Measured on a 2 562-node sphere with ``max_iterations`` 1 / 3 / 7, the unrolled body
-    # relaxed 16 / 51 / 181 nodes on CUDA against 6 / 31 / 141 on the CPU device, because the
-    # recorded body did not replay as two passes per round there; even caps agreed exactly. A
-    # ``wp.capture_while`` body is not guaranteed to execute as an indivisible unit across devices,
-    # so a loop whose *result buffer* depends on the body running whole cannot rely on it. A
-    # Python-level ping-pong cannot help either: the body is recorded once and replayed, so
-    # rebinding the names would only take effect at record time.
+    # ``wp.copy``** -- it is a whole device pass over the node array and worth a real fraction of
+    # that call -- and it is **not portable**: the two devices then disagree. Measured with the
+    # unrolled body, the CPU device relaxed strictly fewer nodes per round than CUDA at every cap,
+    # because the recorded body did not replay as two passes per round there; even caps agreed
+    # exactly. A ``wp.capture_while`` body is not guaranteed to execute as an indivisible unit
+    # across devices, so a loop whose *result buffer* depends on the body running whole cannot rely
+    # on it. A Python-level ping-pong cannot help either: the body is recorded once and replayed,
+    # so rebinding the names would only take effect at record time.
     #
     # ``out_state`` is the shared round-loop word of ``kernels/array.py``; raising
     # ``LOOP_PROGRESS`` is this pass's "something moved", which the closing ``array.loop_advance``

@@ -75,27 +75,19 @@ def test_offset_mesh(bench_case: BenchCase, divisor: int) -> None:
     """
     Outward level-set offset at a matched cell width: field sampling plus one marching-cubes pass.
 
-    Every side gets the identical absolute cell and the identical absolute offset, so the row is a
-    comparison of two field-and-march implementations rather than of two parameter conventions. The
-    lattice includes the padding the offset needs -- ``ceil(distance / cell) + 2`` cells on every
-    side, or the level set is clipped by the boundary -- which at four cells of offset is a
-    noticeable fraction of the box and is paid by triwarp's row alone (both references pad
-    internally).
+    Every side gets the identical absolute cell and the identical absolute offset, so the row
+    compares two field-and-march implementations rather than two parameter conventions. The lattice
+    includes the padding the offset needs -- ``ceil(distance / cell) + 2`` cells on every side, or
+    the level set is clipped by the boundary -- which at four cells of offset is a noticeable
+    fraction of the box and is paid by triwarp's row alone (both references pad internally).
 
     Read the two divisors as a slope. 2x the resolution is **8x the samples**, and triwarp's row
     grows only **2.8x** -- the samples are independent queries, so a lattice this size does not
     saturate the GPU and the wall clock tracks occupancy rather than work. The reference rows grow
-    2.2x (meshlib) and 1.6x (pymeshlab) for the same reason on their own cores.
+    2.2x (meshlib) and 1.6x (pymeshlab) for the same reason on their own cores, and sit an order of
+    magnitude and two orders behind respectively.
 
-    First measurement, medians on an RTX 5090, ``bunny`` at 1/64 and 1/128 of the diagonal:
-
-    | | 1/64 | 1/128 |
-    |---|---|---|
-    | triwarp-cuda | **4.94 ms** | **13.99 ms** |
-    | meshlib | 50.5 (10.2x) | 109.8 (7.8x) |
-    | pymeshlab | 1 206 (244x) | 1 875 (134x) |
-
-    Read meshlib's *median*, not its mean: its OpenVDB band build has a 49-347 ms spread here.
+    Read meshlib's *median*, not its mean: its OpenVDB band build spreads sevenfold here.
     """
     cell, distance = _cell_and_offset(bench_case, divisor)
 
@@ -149,21 +141,17 @@ def test_thicken_mesh(bench_case: BenchCase) -> None:
     how same: identical counts, volumes equal to five decimals, and identical face sets under a
     vertex bijection. That makes this the cleanest row in the module -- two implementations of one
     algorithm, no parameter mapping in between. Its ``ThickenParams`` is built outside the timed
-    callable and its mesh is fresh per round, since the call mutates nothing but the params
-    object is an input.
+    callable and its mesh is fresh per round, since the call mutates nothing but the params object
+    is an input.
 
     The thickness is 1 % of the bounding-box diagonal, which is small enough that neither side folds
-    (the shell would self-intersect past the local curvature radius, and a shell that folds is not
-    the same amount of work).
+    (a shell that self-intersects past the local curvature radius is not the same amount of work).
 
-    First measurement, medians on an RTX 5090, and the reference is **capped at ``sphere_med``**
-    because of what it shows: triwarp-cuda **0.78 / 0.70 / 1.03 ms** at ``sphere_small`` /
-    ``sphere_med`` / ``sphere_large`` -- flat, because at these sizes it is three launches against
-    the launch floor -- against meshlib's **6.5 ms / 266 ms / 4.21 s**. That is 8x, 382x and 4 000x,
-    and the slope is the story rather than any single ratio: the reference is superlinear where
-    this is flat, which for two implementations of the same construction means the cost is not
-    the construction. Whatever else ``makeThickMesh`` does at 1 M faces, it is not what its own
-    6.5 ms at 2 562 predicts.
+    **The reference is capped at ``sphere_med`` because of what the slope shows.** triwarp is flat
+    across the ``scale`` axis -- three launches against the launch floor -- where meshlib is
+    superlinear, so the gap runs from single-figure to four orders of magnitude over that axis. For
+    two implementations of the same construction that means the reference's cost is not the
+    construction.
     """
     thickness = 0.01 * float(
         np.linalg.norm(bench_case.vertices_np.max(axis=0) - bench_case.vertices_np.min(axis=0))
@@ -206,12 +194,11 @@ def test_signed_distance_grid(bench_case: BenchCase, divisor: int) -> None:
     built once outside the timed callable on both sides, so each row prices the queries. It is taken
     *from the function under test* rather than re-derived, so neither side gets a different lattice.
 
-    First measurement, medians on an RTX 5090, ``bunny``: triwarp-cuda **4.48 / 8.53 ms** against
-    open3d's **25.7 / 171.1** at 1/64 and 1/128, i.e. 5.7x and 20x. The two slopes are the whole
-    row: open3d's 6.7x for 8x the samples is a saturated CPU doing the work, triwarp's 1.9x is a GPU
-    that was not full at the coarser lattice. Subtracting these from ``offset_mesh`` prices the
-    extraction: **0.28 ms** of marching at 1/64 against **5.3 ms** at 1/128, so past a certain
-    resolution the offset is dominated by ``MarchingCubes`` rather than by the field.
+    The two slopes are the whole row. For 8x the samples open3d grows 6.7x -- a saturated CPU doing
+    the work -- where triwarp grows 1.9x, a GPU that was not full at the coarser lattice, so the gap
+    widens several-fold across the resolution pair. Subtracting these from ``offset_mesh`` prices
+    the extraction, which grows an order of magnitude over the same pair: past a certain resolution
+    the offset is dominated by ``MarchingCubes`` rather than by the field.
     """
     cell, _distance = _cell_and_offset(bench_case, divisor)
 
@@ -307,56 +294,39 @@ def test_marching_cubes(bench_lib: BenchLibrary, resolution: int) -> None:
     """
     Extract one iso-surface from a dense lattice: the module's second **mesh-free** group.
 
-    It takes ``bench_lib`` rather than ``bench_case`` for the reason ``delaunay_triangulation``
-    does -- the input is a field, not a mesh, so the work is sized by a plain ``parametrize`` and
-    the registry's ``--size`` axis has nothing to act on. Both rows march the identical analytic
-    torus SDF, built once per resolution outside the timed region.
+    It takes ``bench_lib`` rather than ``bench_case`` for the reason ``delaunay_triangulation`` does
+    -- the input is a field, not a mesh, so the work is sized by a plain ``parametrize``. All rows
+    march the identical analytic torus SDF, built once per resolution outside the timed region.
 
-    **MeshLib's ``marchingCubes`` is the same algorithm on the same case table**, and the parity
-    test in ``tests/test_levelset.py`` pins that hard: at 48^3 the two return the same vertex
-    and face *counts* and agree to a two-sided Hausdorff of 1.2e-07, on the vertices and on the
-    triangle centroids alike. So this is one of the suite's cleanest comparisons -- two
-    implementations of one function, not two algorithms answering one question. The named transform
-    the test carries is a convention rather than a cost: ``params.origin`` addresses the voxel
-    *centre*, so it is handed ``lower - spacing / 2``, and ``lessInside=True`` is what makes its
-    winding match triwarp's outside-positive field convention.
+    **Five implementations of one case table**, which makes this the best-referenced function in the
+    package. MeshLib's ``marchingCubes`` is the same algorithm and the parity test pins it hard
+    (same vertex and face counts, two-sided Hausdorff 1.2e-07), so this is one of the suite's
+    cleanest comparisons -- two implementations of one function, not two algorithms answering one
+    question. The named transform the test carries is a convention rather than a cost:
+    ``params.origin`` addresses the voxel *centre*, so it is handed ``lower - spacing / 2``, and
+    ``lessInside=True`` is what matches triwarp's outside-positive winding.
 
-    It is also the fairest CPU-versus-GPU row this module has, for the reason MeshLib was given a
-    seat in the first place: it is the suite's only **multi-threaded** CPU reference, so a
-    ``triwarp-cuda`` ratio against it is a real one. First measurement, in-harness medians on an
-    RTX 5090 -- triwarp-cuda **0.420 / 0.762 ms** over the resolution pair against meshlib's
-    **2.60 / 7.36 ms**, i.e. **6.2x** at 64^3 widening to **9.7x** at 128^3. Both are far sublinear
-    in the lattice (1.8x and 2.8x for 8x the cells), which is the shape to watch: read a regression
-    here as the *slope* steepening rather than the absolute number moving.
+    It is also the fairest CPU-versus-GPU row this module has, since MeshLib is the suite's only
+    **multi-threaded** CPU reference. Both are far sublinear in the lattice, which is the shape to
+    watch: read a regression here as the *slope* steepening rather than the absolute number moving.
+    ``triwarp-cpu`` loses to meshlib by an order of magnitude, which is the other edge of the same
+    knife and not a defect to chase -- a hundred-odd threads of C++ against Warp's CPU backend is
+    not a comparison of algorithms, and CLAUDE.md section 9's "decide on the CUDA number" governs.
 
-    ``triwarp-cpu`` reads **23.9 / 221 ms** on the same pair and so loses to meshlib by 9.1x and
-    30x. That is the other edge of the same knife and it is not a defect to chase: 143 threads of
-    C++ against Warp's CPU backend is not a comparison of algorithms, and CLAUDE.md section 9's
-    "decide on the CUDA number" is what governs.
+    Each remaining reference has a lattice convention that has to be got right or the row marches a
+    shifted field:
 
-    **igl and pyvista bring the group to four implementations of one case table**, which makes it
-    the best-referenced function in the package -- and each has a lattice convention that has to be
-    got right or the row marches a shifted field:
+    * ``igl.marching_cubes(S, GV, nx, ny, nz, iso)`` takes the sample *positions* explicitly in
+      **Fortran order** and returns **three** values (a 2-tuple unpack raises ``ValueError``).
+    * ``pv.ImageData(...).contour([iso])`` addresses samples on grid **nodes**, so its ``origin`` is
+      the bounds' lower corner *directly* -- the opposite of MeshLib's voxel-centre convention. It
+      needs the field in Fortran order too.
+    * **pytorch3d is the only one needing no convention fix at all**: ``return_local_coords=False``
+      emits lattice indices, exactly what ``marching_cubes`` returns without ``bounds``. It is also
+      the only reference here with GPU kernels. Note the import -- it is **not** re-exported from
+      ``pytorch3d.ops``, only from ``pytorch3d.ops.marching_cubes``.
 
-    * ``igl.marching_cubes(S, GV, nx, ny, nz, iso)`` takes the sample *positions* explicitly and
-      wants them in **Fortran order**, and it returns **three** values (a 2-tuple unpack raises
-      ``ValueError``). The lattice is built once per resolution, outside the timed region.
-    * ``pv.ImageData(dimensions=..., origin=..., spacing=...).contour([iso])`` addresses samples on
-      grid **nodes**, so its ``origin`` is the bounds' lower corner *directly* -- the opposite of
-      MeshLib's voxel-centre convention two paragraphs up. It needs the field flattened in
-      **Fortran** order too, and ``contour`` is VTK's own marching cubes.
-
-    All four return the same surface: at 24^3 on a unit-sphere SDF, igl and pyvista both give
-    **1 128** vertices and **2 252** faces with a mean radius of **0.999226** to six digits, and the
-    meshlib agreement above is a two-sided Hausdorff of 1.2e-07 (``tests/test_levelset.py``).
-
-    **pytorch3d brings it to five, and it is the only one that needs no convention fix at all**:
-    ``return_local_coords=False`` makes it emit lattice indices, which is exactly what
-    ``marching_cubes`` returns without ``bounds``, so its row marches the identical field with no
-    origin or ordering to get wrong -- and it is the only reference here with GPU kernels.
-    ``tests/test_levelset.py::test_marching_cubes_matches_pytorch3d`` pins it at **0.0** on sorted
-    coordinates. Note the import: it is **not** re-exported from ``pytorch3d.ops``, only from
-    ``pytorch3d.ops.marching_cubes``.
+    All of them return the same surface, pinned in ``tests/test_levelset.py``.
     """
     if bench_lib.kind == "pytorch3d":
         field_p3d = torch.as_tensor(_marching_field_np(resolution), device=bench_lib.torch_device)[

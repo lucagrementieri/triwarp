@@ -102,6 +102,7 @@ def isotropic_remesh(
     max_deviation: float | None = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
+
     Isotropic explicit remeshing (Botsch-Kobbelt split / collapse / flip / smooth / reproject).
 
     GPU port of the classic incremental isotropic remesher (PyMeshLab's
@@ -120,6 +121,7 @@ def isotropic_remesh(
     purpose — see its own entry below.
 
     Inputs are cloned and never mutated.
+
 
     Parameters
     ----------
@@ -196,13 +198,13 @@ def isotropic_remesh(
     [`transfer_onto_vertices`][triwarp.interpolation.transfer_onto_vertices], rather than
     transported through the split / collapse operations. The field is a property of the input
     geometry, so re-sampling keeps it exact under an arbitrary sequence of operations where
-    transport would accumulate error; the cost is one closest-point query per vertex per stage (two
-    per iteration with both ``split`` and ``collapse`` on). Inside a single stage the field *is*
-    transported, because there the correspondence is known exactly: a split midpoint takes the mean
-    of the endpoints it splits, and a collapse compacts the bands alongside the vertices.
+    transport would accumulate error; the cost is one closest-point query per vertex per stage.
+    Inside a single stage the field *is* transported, because there the correspondence is known
+    exactly: a split midpoint takes the mean of the endpoints it splits, and a collapse compacts the
+    bands alongside the vertices.
 
     A **constant** field is not quite the scalar path: the two agree on the face buffer exactly and
-    on positions to within float rounding. The gap is float rounding in the threshold alone — the
+    on positions to within float rounding. The gap is float rounding in the threshold alone -- the
     array path forms ``4/3 * t`` per vertex in ``float32`` where the scalar path forms it in Python
     ``float64`` and narrows once. Pass a scalar when the target is uniform; it is also one
     closest-point query per stage cheaper.
@@ -213,17 +215,16 @@ def isotropic_remesh(
     past the bound mid-iteration needs the flip stage's own gate as well
     ([`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay] takes one).
 
-    How tightly the bound holds is worth stating, because it is set by
-    ``wp.mesh_query_point_no_sign`` rather than by this function. Against that query — the one the
-    clamp is implemented with, and the one ``reproject`` has always used — the result is within the
-    bound almost exactly. Against an independent closest-point query, the bound controls deviation
-    proportionally, but at a bound near Warp's own query accuracy it becomes approximate rather
-    than hard, because the two queries can disagree by a small absolute amount and iterating the
-    clamp does not converge further (Warp's answer is a fixed point). Ask for a bound comfortably
-    above the scale of a single-precision closest-point query, or scale the model up.
+    How tightly the bound holds is set by ``wp.mesh_query_point_no_sign`` rather than by this
+    function. Against that query -- the one the clamp is implemented with -- the result is within
+    the bound almost exactly. Against an independent closest-point query, the bound controls
+    deviation proportionally, but at a bound near Warp's own query accuracy it becomes approximate
+    rather than hard, because the two queries can disagree by a small absolute amount and iterating
+    the clamp does not converge further (Warp's answer is a fixed point). Ask for a bound
+    comfortably above the scale of a single-precision closest-point query, or scale the model up.
 
-    The remaining limitation, stated because the parameter that used to advertise it is gone:
-    PyMeshLab's ``selectedonly`` has no equivalent here, and a region-restricted refinement is
+    One limitation worth stating: PyMeshLab's ``selectedonly`` has no equivalent here, and a
+    region-restricted refinement is
     [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size] rather than a mode of this
     function.
     """
@@ -500,10 +501,9 @@ def _collapse_pass(
         codes, _boundary = _classify(vertices, faces, feature, incidence)
         csr = tw.graph.edges_to_csr(n_vertices, unique_edges)
         # The vertex-face CSR exists only for ``collapse_candidates``' fold veto, which needs the
-        # faces incident to a vertex where ``csr`` above has only its neighbours. One build is
-        # 0.124 ms against ~11 ms for the five-pass stage on a 133x133 graded saddle patch, and the
-        # veto's own per-candidate work does not show above run-to-run noise -- the numbers, and
-        # the quality it buys, are at the veto itself in ``kernels/remesh.collapse_candidates``.
+        # faces incident to a vertex where ``csr`` above has only its neighbours. It is about a
+        # percent of the collapse stage, and the veto's own per-candidate work does not show above
+        # run-to-run noise -- see the veto itself in ``kernels/remesh.collapse_candidates``.
         vertex_faces, face_offsets = tw.adjacency.vertex_face_adjacency(
             faces, n_vertices=n_vertices
         )
@@ -1139,6 +1139,7 @@ def quadric_decimate(
     | tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]
 ):
     """
+
     Simplify to a target face count by quadric-error edge collapses (Garland-Heckbert).
 
     The decimation to reach for when the requirement is a **face budget** rather than an edge
@@ -1153,6 +1154,7 @@ def quadric_decimate(
     where the surviving vertex is placed. Cheap collapses are the ones that barely move the surface,
     so the flat regions go first and the features last — the property that makes this the standard
     method.
+
 
     Parameters
     ----------
@@ -1220,68 +1222,57 @@ def quadric_decimate(
     **This is a batched-parallel greedy method, not the textbook serial one, and the difference is
     visible in the output.** Textbook QEM pops one edge at a time from a global priority queue,
     which is inherently sequential. Here each pass scores every edge, ranks the candidates by cost,
-    and commits the cheapest *independent set* of them — two collapses may commit together only if
+    and commits the cheapest *independent set* of them -- two collapses may commit together only if
     their closed 1-rings are disjoint. So the sequence of collapses differs from a serial run's and
     the resulting triangulation is not the same mesh, even though both are driven by the same
-    metric. Compare the two by deviation from the input rather than by equality.
-
-    In exchange the *quality* is competitive with the sequential method despite the different
-    collapse order: committing an independent set spreads the error over the surface where draining
-    a priority queue concentrates it, and a max-norm error measure rewards that.
+    metric. Compare the two by deviation from the input rather than by equality. In exchange the
+    *quality* is competitive: committing an independent set spreads the error over the surface where
+    draining a priority queue concentrates it, and a max-norm error measure rewards that.
 
     A pass commits **several independent sets against one scoring**, not one. A single hashed-key
-    round takes on the order of ``m / 50`` of the candidates, because each winner locks the closed
-    1-rings of both its endpoints, and rebuilding the geometry between rounds is comparatively
-    expensive. So the pass retires only the candidates the previous round's commits actually
-    invalidated — those whose closed 1-rings touch a collapsed neighbourhood, for which the cached
-    quadric, cost, target position, link condition and normal-flip verdict are the only things that
-    went stale — and runs another round until one finds nothing new.
-
-    That round loop runs **entirely on device**, as one ``wp.capture_while`` graph — see
-    ``_run_collapse_rounds`` — which removes the host readback that would otherwise happen once per
-    round.
+    round takes a small fraction of the candidates, because each winner locks the closed 1-rings of
+    both its endpoints, and rebuilding the geometry between rounds is comparatively expensive. So
+    the pass retires only the candidates the previous round's commits invalidated -- those whose
+    closed 1-rings touch a collapsed neighbourhood -- and runs another round until one finds nothing
+    new. That round loop runs **entirely on device**, as one ``wp.capture_while`` graph.
 
     The per-pass rebuild cost is dominated by the number of wrapper calls it issues rather than by
-    the mesh size, which is why it shares its edge grouping (an ``_EdgeIncidence``) with
-    ``_classify`` instead of letting each re-derive it, and why ``_DecimationBuffers`` goes further
-    still and replays the whole rebuild as one captured graph with fixed-width buffers and live
-    sizes carried in a device array. Read that class before changing anything here.
-
-    **``return_index`` costs nothing when it is off and next to nothing when it is on.** The two
-    provenance maps are folded per pass by two launches and one copy, and the branch that adds them
-    is evaluated when the pass is *issued*, so the captured graph a CUDA run replays does not even
-    contain it.
+    the mesh size, which is why it shares its edge grouping with ``_classify`` instead of letting
+    each re-derive it, and why ``_DecimationBuffers`` replays the whole rebuild as one captured
+    graph with fixed-width buffers and live sizes carried in a device array. Read that class before
+    changing anything here. ``return_index`` costs nothing when off and next to nothing when on: the
+    two provenance maps are folded per pass by two launches and one copy, and the branch is
+    evaluated when the pass is *issued*, so the captured graph does not contain it.
 
     Four consequences to plan around:
 
     - **The target is reached exactly whenever it is reachable, and it is ``feature_angle`` that
-      decides whether it is.** A pass is budgeted at half the remaining surplus (an interior
-      collapse removes two faces), shared across its rounds, and the loop stops early when a pass
-      can commit nothing. What stops it is almost always the *feature* rule rather than the link
-      condition or the normal-flip guard: a surface's own dihedral angles grow as it is coarsened,
-      so past some face count every edge of a smooth mesh is sharper than ``feature_angle``, every
-      vertex becomes a frozen corner, and no collapse is legal at any ``max_iter``. **That floor is
-      the parameter working, not a limitation to route around** — it is the same rule that keeps a
-      cylinder's rim and a box's creases intact. Raising ``feature_angle`` lowers it; at 180 degrees
-      nothing is a feature and the target is reached. Check the returned face count if it matters.
+      decides
+      whether it is.** A pass is budgeted at half the remaining surplus (an interior collapse
+      removes two faces), shared across its rounds, and the loop stops early when a pass can commit
+      nothing. What stops it is almost always the *feature* rule rather than the link condition or
+      the normal-flip guard: a surface's own dihedral angles grow as it is coarsened, so past some
+      face count every edge of a smooth mesh is sharper than ``feature_angle``, every vertex becomes
+      a frozen corner, and no collapse is legal at any ``max_iter``. **That floor is the parameter
+      working, not a limitation to route around** -- it is the same rule that keeps a cylinder's rim
+      and a box's creases intact. Raising ``feature_angle`` lowers it; at 180 degrees nothing is a
+      feature and the target is reached. Check the returned face count if it matters.
     - Every collapse is also checked against a **normal-flip guard**: an incident face whose normal
-      would turn by more than ~78 degrees vetoes it. That is what keeps the output free of the
-      inverted, self-intersecting triangles an unguarded quadric method produces at high reduction
-      ratios. It is **not** usually what stops a decimation short, and is deliberately not exposed
-      as a keyword — see ``COLLAPSE_MIN_NORMAL_DOT`` in ``kernels/remesh.py``, which records the
-      veto census this claim rests on.
+      would turn too far vetoes it. That is what keeps the output free of the inverted,
+      self-intersecting triangles an unguarded quadric method produces at high reduction ratios. It
+      is **not** usually what stops a decimation short, and is deliberately not exposed as a keyword
+      -- see ``COLLAPSE_MIN_NORMAL_DOT`` in ``kernels/remesh.py``, which records the veto census
+      this claim rests on.
     - The independent set is chosen under a **hashed** lock key rather than by cost rank. That looks
       like a detail and is not: on a structured mesh both the edge index and the quadric cost are
-      spatially monotone fields, and a monotone key has one local minimum, so either of those keys
-      would commit only a single collapse per pass. See ``scramble_index`` in
-      ``kernels/remesh.py``.
-    - **The output is not bit-reproducible on a mesh with tied costs, and never was.** The
-      vertex-face incidence CSR is built by an atomic counting scatter, so a row's order varies run
-      to run; where two candidate edges tie on cost, which one the sort keeps varies with it. On a
-      mesh with many tied costs this can move the two-sided Hausdorff distance noticeably between
-      otherwise identical runs, so **treat the max-norm as a band, not a value** — the mean
-      deviation is far more stable. Compare a change to this function on the mean, or on many
-      repeats.
+      spatially monotone fields, and a monotone key has one local minimum, so either would commit
+      only a single collapse per pass. See ``scramble_index`` in ``kernels/remesh.py``.
+    - **The output is not bit-reproducible on a mesh with tied costs.** The vertex-face incidence
+      CSR is
+      built by an atomic counting scatter, so a row's order varies run to run; where two candidate
+      edges tie on cost, which one the sort keeps varies with it. On a mesh with many ties this can
+      move the two-sided Hausdorff distance noticeably between otherwise identical runs, so **treat
+      the max-norm as a band, not a value** -- the mean deviation is far more stable.
     """
     require_same_device(vertices=vertices, faces=faces)
     n_faces = int(faces.shape[0]) // 3
@@ -2477,6 +2468,7 @@ def subdivide_loop(
     | tuple[wp.array[wp.vec3], wp.array[wp.int32], wps.BsrMatrix[wp.float32]]
 ):
     """
+
     Subdivide a mesh with one pass of Loop subdivision.
 
     Same 1-to-4 split as [`subdivide`][triwarp.remesh.subdivide] -- identical face table, identical
@@ -2497,6 +2489,7 @@ def subdivide_loop(
     fallbacks are conservative rather than arbitrary: an edge with three or more incident faces
     takes the midpoint rule, and a vertex where one or three-plus boundary edges meet -- or one with
     no edges at all -- keeps its position.
+
 
     Parameters
     ----------
@@ -2535,8 +2528,7 @@ def subdivide_loop(
     vertex does not: an odd vertex is an affine combination of four inputs and an even vertex of its
     whole 1-ring, so no index map can express it, and an attribute cannot otherwise be carried
     through this function at all. The operator is the honest form, it is the standard prolongation
-    object (``kernels/algorithms/multigrid.py`` builds one for a different purpose), and it costs
-    nothing unless asked for.
+    object, and it costs nothing unless asked for.
 
     The operator is assembled from the same three grids and through the same two weight functions
     (``kernels/remesh.loop_odd_weights`` / ``loop_even_weights``) that the position kernels use, so
@@ -3033,7 +3025,7 @@ def subdivide_region_to_size(
 
         # Only the *count* is wanted here -- for the stopping test, the budget and the running
         # total. ``split_edges`` derives the per-edge vertex slots from ``long_mask`` itself.
-        # ``reduce.sum`` counts a ``wp.bool`` mask directly (1.97x against widening it first).
+        # ``reduce.sum`` counts a ``wp.bool`` mask directly, which is faster than widening it.
         n_long = int(tw.reduce.sum(long_mask))
 
         if n_long == 0:
@@ -3114,8 +3106,8 @@ def _keep_longest_edges(
     # Ascending on the negated length is descending on the length, and ``sort_and_argsort`` is the
     # package's one radix-sort spelling. ``order[:remaining]`` is a contiguous *prefix* slice, which
     # is the case CLAUDE.md section 3.4 says a gather may index through directly -- it is a column
-    # (``arr[:, k]``) or a step slice whose stride Warp ignores. Cloning it dense first measured
-    # 47.7 against 31.9 us for the gather (1.50x) with byte-identical output.
+    # (``arr[:, k]``) or a step slice whose stride Warp ignores. Cloning it dense first is a
+    # measurable loss on the gather for byte-identical output.
     descending = wp.empty(int(eligible.shape[0]), dtype=wp.float32, device=device)
     wp.map(wp.neg, tw.array.gather(lengths, eligible), out=descending)
     _sorted, order = tw.array.sort_and_argsort(descending)

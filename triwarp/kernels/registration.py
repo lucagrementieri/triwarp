@@ -92,32 +92,23 @@ def accumulate_procrustes_moments(
     # ``ITEMS_PER_BLOCK_1D`` points, lanes striding that block's own chunk, and 25 ``wp.tile_sum``
     # tree reductions committing **one** atomic set per block.
     #
-    # This was every lane walking the block's whole ``TILE_1D`` chunk with only lane 0 publishing,
-    # and the note here claimed the 64-fold redundant arithmetic was free because all lanes read
-    # the same ``a[offset + k]`` and the loads broadcast out of one cache line. **That claim is
-    # correct, and the redundancy was never the cost.** Measured by keeping this grid and giving
-    # each lane exactly one element -- which removes the redundancy and changes nothing else --
-    # the gain is 1.03x / 1.02x / 1.13x / 1.03x at n = 5k / 20k / 200k / 1M. What cost was the
-    # *atomic contention*: 25 hot addresses taking one add per block at ``n / TILE_1D`` blocks.
-    # Folding ``TILES_PER_BLOCK_1D`` tiles into each block cuts the block count 16x, and that is
-    # the whole win. Interleaved A/B in one session on an RTX 5090, min of seven alternating reps:
+    # **The 64-fold redundant lane arithmetic is not the cost, and never was**: all lanes read the
+    # same ``a[offset + k]`` and the loads broadcast out of one cache line, so giving each lane
+    # exactly one element instead is worth a few percent at every size. What costs is the *atomic
+    # contention* -- 25 hot addresses taking one add per block -- so the lever is the fold width.
+    # Folding ``TILES_PER_BLOCK_1D`` tiles into each block cuts the block count sixteenfold: flat at
+    # small ``n``, an order of magnitude at a million points.
     #
-    #   n              5 000    20 000   200 000   1 000 000
-    #   every-lane     0.0186   0.0167   0.0749    0.3094  ms
-    #   lane-strided   0.0180   0.0166   0.0181    0.0290  ms
-    #   speed-up       1.03x    1.01x    4.14x     10.67x
-    #
-    # The tree is also *more* accurate, as in ``accumulate_cost``: against a float64 reference over
-    # the whole accumulator it sits at 2.35e-07 / 4.42e-07 at n = 200 000 / 1 000 000 where the
-    # serialized form sits at 7.30e-07 / 1.21e-06.
+    # The tree is also *more* accurate than the serialized form, as in ``accumulate_cost``.
     #
     # No ``prefers_tiled_reduction`` branch: the lanes partition a chunk the block already owns and
     # stride by ``wp.block_dim()``, which reads 1 on CPU, so lane 0 walks the whole chunk and the
-    # one-element tiles hold its true totals. Measured with ``CUDA_VISIBLE_DEVICES=""``:
-    # 0.98-1.02x at every n above, and 8.56e-08 against float64 at n = 200 000 where the serialized
-    # form sits at 1.52e-06.
+    # one-element tiles hold its true totals. The CPU clock is flat and the accuracy win holds
+    # there too.
     #
     # A zero-length ``weights`` means uniform weights, which is what ``icp`` passes: the
+    # alternative is a ``wp.full(n, 1.0)`` allocation *and* fill on every iteration, for a value
+    # the kernel can just assume.
     # alternative is a ``wp.full(n, 1.0)`` allocation *and* fill on every iteration, for a value
     # the kernel can just assume.
     chunk, lane = wp.tid()
@@ -292,60 +283,22 @@ def transform_and_accumulate_cost(
     acc: wp.array[wp.float32],
     out_transformed: wp.array[wp.vec3],
 ) -> None:
-    # Apply the fitted transform to ``a``, publish the moved points for the caller, and reduce the
-    # weighted mean squared residual against ``b`` into the packed accumulator's cost slot -- one
-    # pass, one launch. A zero-length ``weights`` means uniform, which is what ``icp`` passes: the
-    # alternative is a ``wp.full(n, 1.0)`` allocation *and* fill on every iteration, for a value
-    # the kernel can just assume.
+    # Apply the fitted transform to ``a``, publish the moved points, and reduce the weighted mean
+    # squared residual against ``b`` into the packed accumulator's cost slot -- one pass, one
+    # launch. A zero-length ``weights`` means uniform, which is what ``icp`` passes: the alternative
+    # is a ``wp.full(n, 1.0)`` allocation *and* fill every iteration for a value the kernel assumes.
     #
-    # Launched ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``: one block per
-    # ``ITEMS_PER_BLOCK_1D`` residuals, lanes striding that block's own chunk, one atomic per block
-    # instead of one per point.
+    # The reduction is the lane-strided single-slot form of CLAUDE.md section 13.2, striding by
+    # ``wp.block_dim()`` so it needs no ``prefers_tiled_reduction`` branch.
     #
-    # **Two separate findings, and the second one only became true because of the first.**
-    #
-    # The reduction was one ``wp.atomic_add`` per thread to a *constant* slot, which serializes the
-    # whole reduction on one address, and it runs once per ICP iteration over the caller's whole
-    # cloud. Interleaved A/B in one session on an RTX 5090, min of three alternating pairs, the
-    # reset hoisted out of the timing loop (it is a launch of its own and dominates at small n):
-    #
-    #   n         5 000    20 000   200 000   1 000 000
-    #   atomic    0.0149   0.0270   0.2542    1.2594  ms
-    #   tiled     0.0168   0.0165   0.0153    0.0167  ms
-    #   speed-up  0.89x    1.64x    16.6x     75.6x
-    #
-    # The tiled form is flat because its grid is ``n / 1024``; the 5 000 row is a small loss and is
-    # the occupancy trade (five blocks), which ``icp`` never sits at -- it is benchmarked at the
-    # scan-mesh point counts. The reduction is also *more accurate*, which is the opposite of what
-    # a different summation order usually costs: relative to a float64 reference at n = 1 000 000
-    # the tree sits at **2.9e-07** where the serialized atomic sits at **1.9e-04**.
-    #
-    # Then the transform *became* worth fusing in. It was a separate ``apply_transform_mat44``
-    # launch at ``dim=n`` immediately above, and fusing it was declined on the measurement that the
-    # pair cost 0.054 / 0.282 ms at n = 20 000 / 200 000 of which this reduction was 70 % / 94 % --
-    # so a launch was 6 % of the pair at worst. Flattening the reduction to a launch floor
-    # inverted that: the pair is now two launch floors and removing one is 40 % of it.
-    #
-    #   pair, n        20 000   200 000   1 000 000
-    #   two launches   0.0270   0.0292    0.0290  ms
-    #   fused          0.0168   0.0170    0.0184  ms
-    #   speed-up       1.61x    1.72x     1.58x
-    #
-    # ``acc[ACC_COST]`` and every element of ``out_transformed`` are **bit-identical** across the
-    # two forms (max |delta| exactly 0.0 at all three sizes), because the fusion only removes a
-    # round trip of ``out_transformed`` through global memory -- each lane now keeps the point it
-    # just transformed in a register instead of storing it and reading it back one launch later.
-    # ``apply_transform_mat44`` keeps its three other callers and is unchanged; the shared
-    # arithmetic is its own ``transform_point_mat44`` helper, called here rather than copied.
-    #
-    # No ``prefers_tiled_reduction`` branch, and that is the load-bearing part. The lanes partition
-    # a chunk *the block already owns* and take their stride from ``wp.block_dim()``, which is the
-    # case ``.claude/CLAUDE.md`` section 2.2 says is correct on both devices: on CPU
-    # ``wp.block_dim()`` reads 1, lane 0 walks the whole chunk, and the one-element tile holds that
-    # chunk's true total. Measured with ``CUDA_VISIBLE_DEVICES=""``: 1.02-1.03x at every n above,
-    # and 1.9e-07 relative error against the float64 reference at n = 200 000 where the atomic
-    # form sits at 1.1e-05. ``measures.centroid_tiled`` needs a ``_sliced`` sibling because *its*
-    # lanes partition the outer work at a constant stride; this family is the other form.
+    # **The transform only became worth fusing in once the reduction was flat.** As one
+    # ``wp.atomic_add`` per thread to a constant slot the reduction dominated the pair and the
+    # fusion was declined on that; at a launch floor the pair is two floors and removing one is most
+    # of it (CLAUDE.md section 13.2's "re-read the declines either side"). Output is
+    # **bit-identical**: the fusion only removes a round trip of ``out_transformed`` through global
+    # memory, each lane keeping the point it just transformed in a register.
+    # ``apply_transform_mat44`` keeps its three other callers; the shared arithmetic is its own
+    # ``transform_point_mat44`` helper, called here rather than copied.
     chunk, lane = wp.tid()
     offset, remaining = tile_chunk(a.shape[0], chunk, ITEMS_PER_BLOCK_1D)
     if remaining <= 0:
@@ -408,10 +361,8 @@ def distance_threshold_weights_and_count(
     # ``distance_threshold_weight`` over the whole correspondence array *and* its sum, in one
     # launch. ``registration.icp`` needs both every iteration -- the weights feed the Procrustes
     # fit, the sum is the loop's "every correspondence was rejected" early exit -- and ran them as
-    # a ``wp.map`` followed by ``reduce.sum``, which is two launches, two allocations and ~11 us of
-    # map resolution per iteration for a number this pass already has in registers. Measured at
-    # ~39 us per iteration for the pair against ~14 for this kernel plus the readback that has to
-    # stay (a Python loop cannot branch on a device value).
+    # a ``wp.map`` followed by ``reduce.sum``, which is two launches, two allocations and the map's
+    # own host-side resolution per iteration for a number this pass already has in registers.
     #
     # The lane-strided fold and the ``wp.block_dim()`` stride are ``kernels/reduce``'s, so the
     # single-lane CPU device stays correct (CLAUDE.md section 2.2). The sum is a ``float32`` tree
@@ -542,25 +493,14 @@ def accumulate_point_to_plane(
     #
     # It was every lane walking a ``TILE_1D`` chunk with lane 0 publishing, which put one add per
     # block on each of 43 hot addresses (36 for the normal matrix, 6 for the right-hand side, 1 for
-    # the cost) at ``n / TILE_1D`` blocks -- the measurement below predates ``out_weight_sum``'s
-    # 44th reduction, added afterwards for the all-weights-zero guard below and too small a share
-    # to move the numbers. Same finding as ``accumulate_procrustes_moments``: the redundant lanes
-    # were nearly free and the atomic contention was the cost. Interleaved A/B, min of seven
-    # alternating reps on an RTX 5090:
-    #
-    #   n              20 000   200 000   1 000 000
-    #   every-lane     0.0375   0.1366    0.4601  ms
-    #   lane-strided   0.0273   0.0293    0.0478  ms
-    #   speed-up       1.38x    4.66x     9.64x
-    #
-    # 43 reductions is a much larger fixed cost per block than the moments kernel's 25, which is
-    # why this trails it at n = 20 000 and catches up once the fold has enough to amortize.
+    # the cost) at ``n / TILE_1D`` blocks. Same finding as ``accumulate_procrustes_moments``: the
+    # redundant lanes were nearly free and the atomic contention was the cost, worth an order of
+    # magnitude at a million correspondences. 43 reductions is a much larger fixed cost per block
+    # than the moments kernel's 25, which is why this trails it at small ``n`` and catches up once
+    # the fold has enough to amortize.
     #
     # The tree is the *more* accurate arm on every component, which matters here because ``out_jtj``
-    # is the matrix ``solve_point_to_plane`` factorizes. Against a float64 reference at
-    # n = 200 000 / 1 000 000: normal matrix 3.71e-07 / 1.08e-06 against the serialized form's
-    # 1.14e-06 / 1.51e-06, right-hand side 3.70e-07 / 3.77e-07 against 1.80e-06 / 2.82e-06, cost
-    # 6.71e-08 / 4.19e-07 against 6.16e-07 / 1.48e-06.
+    # is the matrix ``solve_point_to_plane`` factorizes.
     i, lane = wp.tid()
     offset, remaining = tile_chunk(source.shape[0], i, ITEMS_PER_BLOCK_1D)
     if remaining <= 0:
@@ -598,8 +538,8 @@ def accumulate_point_to_plane(
         wp.atomic_add(out_jtr, 0, total_jtr)
         # One length-2 buffer, not two length-1 ones: ``icp_point_to_plane`` reads both of these
         # scalars back per iteration and they are written by this one launch, so sharing a buffer
-        # lets it take one host sync where it used to take two -- the second of which sat three
-        # launches downstream and so drained a pipeline the first had already drained.
+        # lets it take one host sync rather than two -- a second read placed further downstream
+        # drains a pipeline the first had already drained.
         # ``ICP_COST`` = 0, ``ICP_WEIGHT_SUM`` = 1.
         wp.atomic_add(out_scalars, ICP_COST, total_cost)
         wp.atomic_add(out_scalars, ICP_WEIGHT_SUM, total_weight_sum)

@@ -129,9 +129,9 @@ N_PUNCHED_HOLES = 512
 _PUNCH_SEED = 0
 
 # Holes in ``holes_dense``: the same sphere as ``holes_many`` with 16x the loops, for the costs
-# whose axis is the loop count itself (per-loop host readbacks). 8 192 is near the ceiling the
-# vertex-disjoint greedy punch can reach on the 40 962-vertex sphere, and it matches the ~9k-loop
-# scale where the per-loop form of the rim measurement was measured at hundreds of milliseconds.
+# whose axis is the loop count itself (per-loop host readbacks). It is near the ceiling the
+# vertex-disjoint greedy punch can reach on this sphere, and it is the scale at which the per-loop
+# form of the rim measurement ran to hundreds of milliseconds.
 N_DENSE_HOLES = 8_192
 
 # Grid resolutions for the saddle patches: ``k x k`` vertices give ``2 * (k - 1) ** 2`` faces.
@@ -155,9 +155,8 @@ def _tangled_torus(major_sections: int, minor_sections: int) -> _Arrays:
     if both sides are to do work. ``minor_radius > major_radius`` is the whole trick: the tube
     sweeps through the axis and the inner wall crosses the outer one in a band.
 
-    Self-intersection scales with the resolution rather than with the radii -- measured 256 / 478 /
-    884 intersecting faces at 64x64 / 160x128 / 320x256, so ~3 % of the surface at the small end
-    and ~0.5 % at the large one.
+    Self-intersection scales with the resolution rather than with the radii -- a few percent of the
+    surface at the small end and a fraction of a percent at the large one.
     """
     mesh = tm.creation.torus(1.0, 1.5, major_sections=major_sections, minor_sections=minor_sections)
     return (
@@ -340,10 +339,10 @@ def _handles(holes_per_side: int, max_edge: float = 0.195, span: float = 16.0) -
     ``triwarp.homology`` needs a closed surface with handles or it has nothing to find.
 
     Built in the order that makes the face count a smooth knob: subdivide the slab *first*, then cut
-    the holes. Cutting first and subdividing after quantizes the count in powers of four (measured
-    46 976 faces across an entire range of edge lengths, because the slab's six big faces subdivide
-    together), which makes matching the two ends of the axis impossible. This way both ends take the
-    identical ``max_edge`` and land within 5 % of each other and of the control's 81 920.
+    the holes. Cutting first and subdividing after quantizes the count in powers of four, because
+    the slab's six big faces subdivide together, which makes matching the two ends of the axis
+    impossible. This way both ends take the identical ``max_edge`` and land within a few percent of
+    each other and of the control.
 
     The hole radius scales with the spacing, so the two ends differ in genus and in nothing else a
     homology basis can see: same footprint, same tessellation scale, same wall-to-slab proportion.

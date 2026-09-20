@@ -1,79 +1,71 @@
 """
 Benchmarks for ``triwarp.intersection``.
 
-Four functions on two different cost shapes:
+Four functions on two cost shapes:
 
 * ``mesh_with_plane`` / ``slice_mesh_with_plane`` / ``clip_mesh_with_field`` — one pass over the
-  faces, a per-vertex scalar, then a compaction of the (few) faces the level set actually crosses.
-  Memory-bound and dominated by the full-mesh sweep, not by the segment count: a plane meets
-  O(sqrt(n_faces)) triangles but every face is still classified. The last two run the *same* engine
-  (the plane's signed distance is one such scalar), so their triwarp rows should track each other —
-  measured 794 vs 859 µs on ``bunny`` — and a divergence means the shared path changed under one of
-  them. ``clip_mesh_with_field``'s ``cap=True`` case is a different shape: the ``O(B^3)`` min-weight
-  fill of the section loop dominates the clip by 60x (55 ms against 0.86 ms on ``bunny``), so read
-  that case as a ``holes.fill_min_weight`` measurement on a long rim.
+  faces, a per-vertex scalar, then a compaction of the few faces the level set crosses.
+  Memory-bound and dominated by the full-mesh sweep rather than the segment count: a plane meets
+  ``O(sqrt(n_faces))`` triangles but every face is still classified. The last two run the *same*
+  engine (a plane's signed distance is one such scalar), so their triwarp rows track each other and
+  a divergence means the shared path changed under one of them. ``clip_mesh_with_field``'s
+  ``cap=True`` case is a different shape: the ``O(B ** 3)`` min-weight fill of the section loop
+  dominates the clip by orders of magnitude, so read it as a ``holes.fill_min_weight`` measurement
+  on a long rim.
 * ``mesh_with_mesh`` — the only quadratic-ish one. A ``wp.Mesh`` BVH is built over the smaller mesh
   and every triangle of the other supplies an AABB query, so the cost tracks the number of
   *candidate* pairs (capped per query triangle by ``max_triangle_collisions``) rather than the face
   count. This is the benchmark that moves when the separating-axis narrow phase changes.
 * ``segments_with_plane`` — a pure ``wp.map`` over independent segments; the array-primitive
-  baseline for the module.
+  baseline.
 
 References
 ----------
-**trimesh** is the reference for three of the four: ``mesh_plane``, ``slice_faces_plane`` and
-``plane_lines``. Its ``Trimesh`` is rebuilt inside the timed callable for ``mesh_plane`` because
-``triangles`` / ``face_normals`` are cached properties that would make rounds 2..n measure only the
-plane arithmetic. ``slice_faces_plane`` and ``plane_lines`` take raw arrays and need no rebuild.
+**trimesh** covers three of the four (``mesh_plane``, ``slice_faces_plane``, ``plane_lines``). Its
+``Trimesh`` is rebuilt inside the timed callable for ``mesh_plane`` because ``triangles`` /
+``face_normals`` are cached properties that would make rounds 2..n measure only the plane
+arithmetic; the other two take raw arrays.
 
-**mesh_with_mesh has no *trimesh* or *open3d* reference.** trimesh's mesh-mesh intersection is not
-in ``trimesh.intersections`` at all — it routes through the optional ``python-fcl`` collision
-backend, which reports *whether* pairs collide rather than returning the intersection curve, and is
-not a declared dependency. open3d's boolean operations require the (also optional) ``open3d.t``
-tensor backend with a coupled remesh, so neither is an apples-to-apples baseline for "return the
-intersection segments". The two that are: **meshlib**'s ``findIntersectionContours``, which links
-the crossing into ordered contours, and **pyvista**'s ``intersection``
+**``mesh_with_mesh`` has no trimesh or open3d reference.** trimesh's mesh-mesh intersection routes
+through the optional ``python-fcl`` collision backend, which reports *whether* pairs collide rather
+than returning the curve, and open3d's booleans need the optional tensor backend with a coupled
+remesh. The two that do answer it: **meshlib**'s ``findIntersectionContours``, which links the
+crossing into ordered contours, and **pyvista**'s ``intersection``
 (``vtkIntersectionPolyDataFilter``), which returns the same unordered segment soup triwarp does and
-therefore pins the value as well as the cost (36 = 36 segments and a bit-identical curve length in
-``tests/test_intersection.py``).
+therefore pins the value as well as the cost.
 
-**pymeshlab** has the right filter and cannot run it here. ``generate_polyline_from_planar_section``
-does exactly what ``mesh_with_plane`` does and more (it *orders* the segments into a polyline), and
-it works on the synthetic meshes -- but it raises ``PyMeshLabException: Failed to apply filter`` on
-**every scan mesh**, at any ``planeaxis``, ``planeoffset`` or ``relativeto`` (probed on
-``bunny_decimated`` with both ``'Z Axis'`` and ``'Custom Axis'``). That is the same non-manifold
-boundary the libigl and potpourri3d references run into elsewhere in the suite, and this module's
-groups are all on the scan sweep, so there is nowhere for the row to move. Recorded rather than
-skipped, so it is not re-derived.
+**pymeshlab** has the right filter and cannot run it here.
+``generate_polyline_from_planar_section`` does what ``mesh_with_plane`` does and more (it *orders*
+the segments), and works on the synthetic meshes — but raises ``Failed to apply filter`` on **every
+scan mesh**, at any ``planeaxis``, ``planeoffset`` or ``relativeto``. That is the same non-manifold
+boundary the libigl and potpourri3d references hit elsewhere, and this module's groups are all on
+the scan sweep, so there is nowhere for the row to move. Recorded rather than skipped so it is not
+re-derived.
 
-**libigl** has no plane-section or mesh-mesh intersection binding in the Python package, so it is
-absent from the ``mesh_with_*`` and ``segments_with_plane`` groups. It *does* have the isocontour
-operation, though -- an earlier version of this docstring claimed ``igl.ray_mesh_intersect`` was its
-only intersection entry point, which was wrong: ``igl.isolines(V, F, S, vals)`` is precisely what
-``marching_triangles`` computes, and it is a row in both of that function's groups.
+**libigl** has no plane-section or mesh-mesh binding, so it is absent from those groups. It *does*
+have the isocontour operation: ``igl.isolines`` is precisely ``marching_triangles``, and it is a row
+in both of that function's groups.
 
-**pyvista** (VTK 9.6) answers ``clip_mesh_with_field``'s uncapped case through
-``PolyData.clip_scalar``, over the identical per-vertex field so the two do the same work.
-``invert=False`` is passed explicitly: its default keeps the side *below* the value. Its capped
-counterpart ``clip_closed_surface`` cannot be timed here at all — it validates the mesh first and
-raises on any open edge, which every scan mesh has; the capped comparison therefore lives in
-``tests/test_intersection.py`` on a closed synthetic mesh, and the capped benchmark case is
-triwarp-only.
+**pyvista** answers ``clip_mesh_with_field``'s uncapped case through ``PolyData.clip_scalar`` over
+the identical per-vertex field. ``invert=False`` is passed explicitly: its default keeps the side
+*below* the value. Its capped counterpart ``clip_closed_surface`` cannot be timed here at all — it
+validates the mesh first and raises on any open edge, which every scan mesh has — so the capped
+comparison lives in ``tests/test_intersection.py`` on a closed synthetic mesh and the capped
+benchmark case is triwarp-only.
 
 Caps
 ----
-``mesh_with_mesh`` is capped at ``bunny``: the broad phase allocates
-``max_triangle_collisions`` candidate slots per query triangle, so the pair buffer alone is
-``16 * n_faces`` ints before the narrow phase filters it. ``clip_mesh_with_field``'s pyvista row is
-capped there too, VTK's clip being a single-threaded per-cell sweep.
+``mesh_with_mesh`` stops at ``bunny``: the broad phase allocates ``max_triangle_collisions``
+candidate slots per query triangle, so the pair buffer alone is ``16 * n_faces`` ints before the
+narrow phase filters it. ``clip_mesh_with_field``'s pyvista row stops there too, VTK's clip being a
+single-threaded per-cell sweep.
 
 Geometry
 --------
-Every plane cuts through the middle of the mesh — the origin is the vertex-bounding-box centre and
-the normal is a fixed off-axis direction — so the section is a full cross-section rather than a
-near-miss that would exit early. ``mesh_with_mesh`` intersects the mesh with a copy of itself
-translated by a fraction of its own extent, which guarantees a large, genuinely overlapping
-intersection curve on every mesh.
+Every plane cuts through the middle of the mesh — origin at the vertex-bounding-box centre, a fixed
+off-axis normal — so the section is a full cross-section rather than a near-miss that would exit
+early. ``mesh_with_mesh`` intersects the mesh with a copy translated by a fraction of its own
+extent, which guarantees a large, genuinely overlapping curve on every mesh.
 """
 
 from __future__ import annotations
@@ -362,28 +354,16 @@ def test_split_faces_along_field(bench_case: BenchCase) -> None:
     tuple; it is the same VTK sweep as the clip's row plus the second half's output, and it is
     capped at ``bunny`` for the same reason -- a single-threaded per-cell sweep.
 
-    First measurement, medians on an RTX 5090, with the uncapped ``clip_mesh_with_field`` row from
-    the same session:
+    Costing a few times the clip is understood and is the price of keeping both sides: the clip's
+    work scales with the *cut* (a plane meets ``O(sqrt(n_faces))`` triangles) while the split adds
+    an ``edges_unique`` pass over the whole mesh to give each crossed edge one shared crossing
+    vertex. That pass alone is about half the split at every size.
 
-    | mesh | split | clip | split / clip | pyvista |
-    |---|---|---|---|---|
-    | ``bunny_decimated`` | **1.69 ms** | 0.80 | 2.1x | 6.68 (4.0x behind) |
-    | ``bunny`` | **1.57 ms** | 0.76 | 2.1x | 24.54 (15.7x behind) |
-    | ``dragon`` | **3.86 ms** | 1.27 | 3.0x | (capped) |
-    | ``happy_buddha`` | **4.04 ms** | 1.14 | 3.6x | (capped) |
-    | ``lucy`` | **80.71 ms** | 6.85 | **11.8x** | (capped) |
-
-    The 2-3x over the clip is understood and is the price of keeping both sides: the clip's work
-    scales with the *cut* (a plane meets ``O(sqrt(n_faces))`` triangles) while the split adds an
-    ``edges_unique`` pass over the whole mesh to give each crossed edge one shared crossing vertex.
-    Measured on icospheres at 82k / 328k / 1.31M faces, that pass is 0.86 / 1.50 / 2.69 ms -- 49 to
-    60 % of the split -- and the ratio runs 2.39 / 2.37 / 3.56.
-
-    **``lucy``'s 11.8x is not explained by that** and is left as a finding rather than a guess: the
-    synthetic sweep says ~3.6x at four times ``lucy``'s scale, so size is not the answer and the
-    cause is something about that mesh. Restricting the edge pass to the crossed faces is the
-    obvious fix for the general 2-3x either way, since the pairing only needs the halfedges the
-    level set actually meets.
+    **``lucy``'s much larger ratio is not explained by that** and is left as a finding rather than
+    a guess: a synthetic sweep four times past ``lucy``'s scale stays near the general ratio, so
+    size is not the answer and the cause is something about that mesh. Restricting the edge pass to
+    the crossed faces is the obvious fix for the general ratio either way, since the pairing only
+    needs the halfedges the level set actually meets.
     """
     if bench_case.kind == "pyvista":
         skip_larger_than(bench_case, "bunny", "VTK's clip is a single-threaded per-cell sweep")
@@ -460,9 +440,9 @@ def test_mesh_with_mesh(bench_case: BenchCase, offset_fraction: float) -> None:
     pyvista's ``intersection`` returns the same *unordered* segment soup triwarp does, which is what
     makes it the value reference for this group as well as a cost one. Note what its ``grazing`` row
     measures: at 0.60 of the diagonal the two copies do not touch at all, so VTK does its broad
-    phase, logs ``No Intersection between objects`` and returns **0** line cells -- 333 ms against
-    577 for the ``deep`` case on ``bunny``, i.e. most of the cost is the traversal rather than the
-    crossing. Only the ``deep`` case can assert a non-empty answer, and only it does.
+    phase, logs ``No Intersection between objects`` and returns **0** line cells -- at well over
+    half the ``deep`` case's cost, i.e. most of the cost is the traversal rather than the crossing.
+    Only the ``deep`` case can assert a non-empty answer, and only it does.
     """
     skip_larger_than(bench_case, "bunny", "broad phase allocates 16 candidate slots per triangle")
     if bench_case.kind == "pyvista":
@@ -517,25 +497,17 @@ def test_mesh_collision_pairs(bench_case: BenchCase, offset_fraction: float) -> 
     -- CLAUDE.md section 7.6 records it reporting 2 600 hits for a 320-cell mesh against its own
     copy -- so its row is a cost comparison only, and the noparity entry says so.
 
-    First measurement, medians on an RTX 5090, ``bunny`` against a shifted copy of itself, and the
-    two offsets disagree about who wins:
-
-    | | triwarp-cuda | meshlib | |
-    |---|---|---|---|
-    | `deep` | **0.96 ms** | 4.28 ms | 4.5x |
-    | `grazing` | 0.44 | **0.014** | 31x behind |
-
-    That is the fixed-width broad phase showing through. triwarp allocates 16 candidate slots per
-    query triangle whatever the geometry, so its cost barely moves between the two offsets (0.44 to
-    0.96 ms); MeshLib descends two trees and exits almost immediately when there is nothing to find
-    (0.014 ms), then pays for the pairs when there is (4.28). So the ratio here is a question about
-    *early exit*, not about the narrow phase -- and the ``grazing`` row is the one to watch if that
-    ever changes.
+    The ``deep`` / ``grazing`` pair is the fixed-width broad phase showing through. triwarp
+    allocates a fixed number of candidate slots per query triangle whatever the geometry, so its
+    cost barely moves between the two offsets; MeshLib descends two trees and exits almost
+    immediately when there is nothing to find, then pays for the pairs when there is. So the ratio
+    here is a question about *early exit*, not about the narrow phase -- and the ``grazing`` row is
+    the one to watch if that ever changes.
     """
     skip_larger_than(bench_case, "bunny", "broad phase allocates 16 candidate slots per triangle")
     if bench_case.kind == "pyvista":
-        # VTK's OBB collision does not survive ``bunny`` here: measured 45-140 ms at 1-5k faces and
-        # no return inside a 40-minute cap on two 70k-face copies overlapping deeply, which is the
+        # VTK's OBB collision does not survive ``bunny`` here: it answers at a few thousand faces
+        # and does not return at all on two 70k-face copies overlapping deeply, which is the
         # quadratic blow-up an OBB tree hits when most boxes overlap. Capped where it still answers.
         skip_larger_than(
             bench_case, "bunny_decimated", "VTK's OBB collision does not return on 70k x 70k"

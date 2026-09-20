@@ -44,17 +44,14 @@ def prefers_tiled_reduction(device: wp.DeviceLike) -> bool:
 
     **This is a known platform limitation, not a bug awaiting a report.** ``wp.launch`` documents
     ``block_dim`` as "always 1 for cpu devices" and ``launch_tiled`` forces it, so ``wp.tile(x)``
-    correctly forms a one-element tile there; Warp's tiles guide states the consequence outright.
-    Upstream tracks closing the gap in two open issues -- NVIDIA/warp#1480 (*CPU/GPU parity for all
-    tile code*, which names ``wp.tile(lane_value)`` followed by reductions or scans as an affected
-    pattern) and NVIDIA/warp#1638 (*Add efficient CPU block execution with fibers*, the request to
-    honour ``block_dim > 1`` on CPU). The branch becomes removable only once CPU blocks run more
-    than one logical thread.
+    correctly forms a one-element tile there. Upstream tracks closing the gap in NVIDIA/warp#1480
+    (*CPU/GPU parity for all tile code*, which names ``wp.tile(lane_value)`` followed by reductions
+    or scans as an affected pattern) and NVIDIA/warp#1638 (*Add efficient CPU block execution with
+    fibers*). The branch becomes removable only once CPU blocks run more than one logical thread.
 
     The portable form instead gives each thread a strided slice and one atomic, which is correct on
-    both devices but gives up the block shuffle-reduce, which costs real CUDA time once the input
-    is large enough to exceed the launch overhead. Below roughly 100k elements both forms sit at the
-    launch floor and the difference is negligible.
+    both devices but gives up the block shuffle-reduce, costing real CUDA time once the input
+    exceeds the launch overhead. Below roughly 100k elements both forms sit at the launch floor.
 
     So: tiles on CUDA, slices on CPU. Reductions with *many* accumulators do not need this -- one
     per query already fills the device, and there the portable form is the faster one on CUDA too,
@@ -246,10 +243,8 @@ def require_valid_faces(faces: wp.array[wp.int32], n_vertices: int, name: str) -
         return
     # One ``minmax`` rather than a ``min`` and a ``max``: both ends come out of the same launch,
     # the same buffer and the same readback, so asking for both costs nothing over asking for one.
-    # Measured interleaved in one process, min-of-60 at 24.5k / 208k / 3.26M indices (the flat
-    # index buffers of bunny_decimated, bunny and happy_buddha): 1.65 / 1.68 / 1.43x on cuda:0 and
-    # 1.24 / 1.13 / 1.10x on cpu -- a win on both devices, ~0.05 ms of the CUDA call, which at
-    # these sizes is the readback the second reduction used to add rather than any device work.
+    # Measured a win on both devices at every size -- what it removes is the second reduction's own
+    # readback rather than any device work.
     lo, hi = tw.reduce.minmax(faces)
     if lo < 0 or hi >= n_vertices:
         raise ValueError(

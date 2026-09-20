@@ -264,9 +264,9 @@ def _unique_hash(
     #
     # ``keys_compact`` is allocated at the *sort's* double width and the kernel writes its leading
     # half, so the radix sort below can ping-pong in this same buffer. Sizing it to ``n_unique``
-    # and widening afterwards meant ``bitcast_from_int`` allocated the double-width buffer and
-    # copied the keys into it -- an allocation and a full copy of the compacted keys, measured at
-    # 13.4 us, to move bytes that could have been written here in the first place.
+    # and widening afterwards means ``bitcast_from_int`` allocates the double-width buffer and
+    # copies the keys into it -- an allocation and a full copy, to move bytes that could have been
+    # written here in the first place.
     sort_dtype = twt.sortable_dtype(original_dtype)
     keys_compact = wp.empty(2 * n_unique, dtype=key_dtype, device=device)
     cnts_compact = wp.empty(n_unique, dtype=wp.int32, device=device)

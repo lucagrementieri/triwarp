@@ -361,12 +361,10 @@ def _check_uv_in_range(uv: wp.array[wp.vec2]) -> None:
 
     The readback is unavoidable: nothing can raise without bringing the flag back to the host.
     It is also the dominant cost of the two samplers rather than a rounding error on them --
-    measured on an RTX 5090, 200 calls between two syncs, min of 7:
-    ``remap_attribute_from_uv`` over a 256x256 image costs 0.088 ms with this check and 0.037 ms
-    with it stubbed out, i.e. **57 % of the call, flat** from 642 to 500 000 vertices (both halves
-    are launch-bound, so neither share moves with the mesh). Kept anyway, and the flatness is the
-    reason: an out-of-range UV is not rejected downstream but silently *clamped* to the nearest
-    edge pixel, so dropping the guard trades a raised public-API error for a plausible wrong
+    measured at over half the call, and **flat** in the mesh size, both halves being launch-bound.
+    Kept anyway, and the flatness is the reason: an out-of-range UV is not rejected downstream but
+    silently *clamped* to the nearest edge pixel, so dropping the guard trades a raised public-API
+    error for a plausible wrong
     answer -- the same trade ``_device.require_same_device`` is argued from. If a caller ever
     samples in a loop, the shape to add is CLAUDE.md section 3.10's ``validate=False`` keyword
     **with** an in-repo caller passing it, not an unconditional removal; the rasterizers reach

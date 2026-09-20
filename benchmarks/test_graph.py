@@ -20,9 +20,9 @@ The vertex-adjacency CSR matrix is prebuilt (untimed, cached per mesh/device) so
 isolate the graph algorithms from the edge sort that produces them -- including
 ``shortest_path_envelope``'s length-weighted one, whose weights are ``edges_unique_length``.
 
-``combine.split`` used to live here because it is the other component-count-driven function in the
-package. It now sits in [`test_combine.py`](test_combine.py) with the rest of ``triwarp.combine``,
-on the same ``components`` axis.
+``combine.split`` is the other component-count-driven function in the package and sits in
+[`test_combine.py`](test_combine.py) with the rest of ``triwarp.combine``, on the same
+``components`` axis.
 
 References
 ----------
@@ -34,7 +34,7 @@ Neither **trimesh** nor **open3d** appears: both functions take an abstract CSR 
 and open3d exposes no graph-traversal API over one -- its connectivity work is mesh-bound
 (``cluster_connected_triangles``), which is what ``split`` uses over in ``test_combine``.
 
-**libigl does take that argument**, which the paragraph above used to be read as ruling out.
+**libigl does take that argument**, despite the paragraph above.
 ``igl.connected_components`` accepts a ``scipy.sparse`` adjacency matrix directly -- the same
 argument ``connected_component_labels`` takes -- and ``igl.facet_components(F)`` is the dual-graph
 labelling ``face_connected_component_labels`` computes. So both labellings have a second
@@ -163,8 +163,8 @@ def test_connected_component_labels_depth(bench_case: BenchCase) -> None:
     """
     The depth-robustness gate: ECL-CC on a graph of diameter 130 against one of diameter 20 481.
 
-    Pointer jumping has no level loop, so this pair should read **flat** -- measured at 0.08 ms on
-    both. That is not a self-evident property -- every level-synchronous traversal in the package
+    Pointer jumping has no level loop, so this pair reads **flat** across the two diameters. That
+    is not a self-evident property -- every level-synchronous traversal in the package
     fails it, ``shortest_path_envelope`` below included -- and it is the premise the parity
     union-find in ``validation.face_orientation_bits`` rests on. A slope appearing here is the
     regression that would invalidate it.
@@ -204,15 +204,14 @@ def test_face_connected_component_labels_depth(bench_case: BenchCase) -> None:
 
     This is the build-plus-ECL-CC pair ``validation.face_orientation_bits`` actually calls.
 
-    Measured at 1.33 ms (sphere) against 1.26 ms (ribbon) -- the edge sort dominates and neither
-    half of it is depth-sensitive.
+    Flat across the two diameters as well -- the edge sort dominates and neither half of it is
+    depth-sensitive.
 
     Both references are **build-included**, which is what makes them fair here: triwarp's row times
     the dual-graph construction *and* the labelling, so a reference handed a prebuilt matrix would
-    be pricing half the work. An earlier version of this docstring read that as "no scipy
-    counterpart", which was an argument about the timed region rather than about the comparison --
-    the answer is to put the reference's build inside its own callable, not to leave the group
-    unreferenced.
+    be pricing half the work. "No scipy counterpart" is an argument about the timed region rather
+    than about the comparison -- the answer is to put the reference's build inside its own callable,
+    not to leave the group unreferenced.
 
     - **igl** ``facet_components(F)`` is the direct counterpart: faces in, per-face labels out, dual
       graph built internally.

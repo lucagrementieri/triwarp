@@ -4,88 +4,70 @@ Benchmarks for ``triwarp.texture``.
 Two inverse pairs, with opposite cost drivers:
 
 * **Rasterize** (``rasterize_attribute``, ``rasterize_discrete_attribute``) — scatter: one thread
-  per triangle walks the pixels its UV-space bounding box covers and interpolates the attribute
-  barycentrically at each pixel center. Cost is *total covered area in pixels*, so it scales with
-  ``resolution**2`` far more strongly than with the face count, and it is sensitive to UV-space
-  triangle size: many small triangles amortize the per-triangle setup badly, a few large ones fill
-  efficiently. The discrete variant does strictly more work per pixel (it accumulates per-label
-  weights and takes an argmax instead of a single lerp).
+  per triangle walks the pixels its UV-space bounding box covers and interpolates barycentrically.
+  Cost is *total covered area in pixels*, so it scales with ``resolution ** 2`` far more strongly
+  than with the face count, and it is sensitive to UV-space triangle size — many small triangles
+  amortize the per-triangle setup badly. The discrete variant does strictly more per pixel: it
+  accumulates per-label weights and takes an argmax instead of one lerp.
 * **Remap** (``remap_attribute_from_uv``, ``remap_discrete_attribute_from_uv``) — gather: one thread
-  per *vertex* does a single bilinear (``order=1``) or nearest (``order=0``) texture fetch. Cost is
-  the vertex count, essentially independent of resolution beyond cache behaviour, so these are
-  ~2 orders of magnitude cheaper than the rasterizers and are launch-latency bound on the smaller
-  meshes. ``order=1`` is the ``wp.lerp`` path; ``order=0`` is the same gather without the blend, so
-  timing both isolates the interpolation cost.
+  per *vertex*, one bilinear (``order=1``) or nearest (``order=0``) fetch. Cost is the vertex count,
+  essentially independent of resolution beyond cache behaviour, so these are two orders of magnitude
+  cheaper and are launch-latency bound on the smaller meshes. Timing both orders isolates the
+  interpolation from the gather.
 
-Axis: the **scan sweep** for the face-count half, plus a **resolution** sweep of 512 against 2048
-on every group. Those are the module's two independent sizes and they pull in opposite directions,
-so pinning either one hides half the story: the rasterizers should show a ~16x step across the
-resolution pair (4x the pixels each way) and the remappers should show none at all beyond cache
-effects. A rasterizer that fails to scale quadratically, or a remapper that *does*, is the signal
-this pair is here to produce.
+Axis: the **scan sweep** for the face-count half, plus a **resolution** sweep of 512 against 2048 on
+every group. Those are the module's two independent sizes and they pull in opposite directions, so
+pinning either hides half the story: the rasterizers should show a ~16x step across the resolution
+pair and the remappers none at all beyond cache effects. A rasterizer that fails to scale
+quadratically, or a remapper that does, is the signal this pair exists to produce.
 
 UV coordinates
 --------------
-The scan meshes carry no UV map, and computing a real one per case is not viable here — an LSCM or
-harmonic parametrization needs disk topology (the scan meshes are near-closed) and would dominate
-the measurement by orders of magnitude, timing the solver instead of the rasterizer.
+The scan meshes carry no UV map, and computing a real one per case is not viable: an LSCM or
+harmonic parametrization needs disk topology (these are near-closed) and would time the solver
+rather than the rasterizer.
 
-So UVs are the **vertices' xy coordinates normalized to the unit square**. This is a projection, not
-an injective parametrization: on a closed mesh the front and back surfaces land on the same pixels
-and the rasterizer's documented "lowest face index wins" rule resolves the overlap. That is
-deliberate and it does not distort what is being measured — the rasterizer's cost is the number of
-(triangle, covered pixel) pairs it visits, which a projection produces just as faithfully as a true
-atlas, and the overlap additionally exercises the contention path that a real atlas would not. It
-*would* matter for a correctness comparison, which is why the parity tests in
-``tests/test_texture.py`` use synthetic injective UVs instead.
+So UVs are the **vertices' xy coordinates normalized to the unit square** — a projection, not an
+injective parametrization, so on a closed mesh front and back land on the same pixels and the
+documented "lowest face index wins" rule resolves the overlap. That does not distort what is
+measured: the rasterizer's cost is the number of (triangle, covered pixel) pairs, which a projection
+produces just as faithfully, and the overlap additionally exercises the contention path a real atlas
+would not. It *would* matter for a correctness comparison, which is why the parity tests use
+synthetic injective UVs instead.
 
 References
 ----------
-**No CPU baseline is registered yet, and the reason is scope rather than absence.** Neither
-trimesh, libigl nor open3d has a UV-space attribute rasterizer or sampler: trimesh's
-``visual.texture`` only
-stores and looks up existing image textures, libigl has no rasterization module in its Python
-bindings, and open3d's legacy geometry exposes UVs as mesh data without any bake or resample
-operation.
+**No CPU baseline is registered, and the reason is scope rather than absence.** Neither trimesh,
+libigl nor open3d has a UV-space attribute rasterizer or sampler.
 
-**pymeshlab does have both directions**, though, and an earlier version of this section did not say
-so. Forward: ``transfer_attributes_to_texture_per_vertex`` bakes a per-vertex attribute into a
-texture image, with ``compute_texmap_from_color`` and ``generate_sampling_texel`` beside it.
-Inverse:
-``compute_color_from_texture_per_vertex`` and ``transfer_texture_to_color_per_vertex``
-sample an image back onto the vertices. So all five groups here have a counterpart.
+**pymeshlab has both directions** — ``transfer_attributes_to_texture_per_vertex`` forward,
+``compute_color_from_texture_per_vertex`` inverse — so all five groups have a counterpart. What
+keeps them from being rows, and from being parity oracles, was probed rather than assumed, and the
+blocker is narrower than "the output is an image": **``pymeshlab.Image`` is write-only from
+Python**, its whole public surface being ``width``, ``height`` and ``save``, so neither direction
+has an in-memory route.
 
-What keeps them from being rows -- and from being *parity* oracles -- was probed rather than
-assumed, and the blocker is narrower and harder than "the output is an image". It is that
-**``pymeshlab.Image`` is write-only from Python**: its entire public surface is ``width``,
-``height`` and ``save``, with no array constructor and no pixel accessor. So neither
-direction has an in-memory route.
-
-* **Forward.** The bake's result can only leave Python as a file, so a comparison goes through an
-  8-bit PNG. For a ``float32`` attribute raster that makes the quantization a *difference* between
-  the two sides rather than something both share, which is a class-D shape rather than a tolerance.
-* **Inverse.** The sampler needs a texture *attached to the mesh*, and there is no way to attach one
-  from an array either -- only to load a mesh file that references an image file
-  (``texture_number()`` is 0 for any ``ml.Mesh`` built from matrices). That path does work, and it
-  reveals a second convention: **MeshLab samples with wrap addressing.** Measured on a 32-column
-  ramp texture whose column ``j`` holds ``8j``, vertices at UV ``u = 1.0`` come back as **0**
-  where the texel is 248 -- ``u = 1`` wraps to column 0 -- while an interior sample at
-  ``(0.5, 0.5)`` reads 128 correctly. On a *random* texture that makes all four UV corners
+* **Forward.** The bake can only leave Python as a file, so a comparison goes through an 8-bit PNG.
+  For a ``float32`` raster that makes the quantization a *difference* between the two sides rather
+  than something both share — a class-D shape rather than a tolerance.
+* **Inverse.** The sampler needs a texture *attached to the mesh*, and there is no array route to
+  that either, only loading a mesh file that references an image file. That path does work, and
+  reveals a second convention: **MeshLab samples with wrap addressing.** On a 32-column ramp
+  texture, vertices at ``u = 1.0`` come back as 0 where the texel is 248 — ``u = 1`` wraps to column
+  0 — while an interior sample reads correctly. On a *random* texture that makes all four UV corners
   return the same value, which reads as a broken oracle rather than an addressing rule.
 
-So the inverse pair is reachable, at 8 bits and on strictly interior UVs, at the cost of writing an
-OBJ, an MTL and a PNG per case; the forward pair is not reachable at array level at all. Both are
-recorded here so the next pass starts from the numbers. Its parameter surface is also large -- the
-bake takes a texture size, a sampling density and an interpolation mode that do not map one-to-one
-onto ``resolution`` and ``order`` -- but that is the smaller obstacle of the two.
+So the inverse pair is reachable at 8 bits and on strictly interior UVs, at the cost of writing an
+OBJ, an MTL and a PNG per case; the forward pair is not reachable at array level at all. Its
+parameter surface is also large — the bake takes a texture size, a sampling density and an
+interpolation mode that do not map one-to-one onto ``resolution`` and ``order`` — but that is the
+smaller obstacle.
 
-The references the *correctness* tests use are not benchmarkable baselines either. The forward
-rasterizers are checked against a **moderngl (OpenGL)** reference, which times GPU driver and
-context overhead rather than an algorithm, and the inverse samplers against
-``scipy.ndimage.map_coordinates``, which samples a plain grid with no notion of UV or mesh
-topology — it is the right correctness oracle for the interpolation and the wrong baseline for the
-operation as a whole. So these are before/after self-comparisons, which is what the ``wp.lerp`` and
-component-reduction batches touching this module need.
+The references the *correctness* tests use are not benchmarkable baselines either: the forward
+rasterizers are checked against **moderngl (OpenGL)**, which would time driver and context overhead
+rather than an algorithm, and the inverse samplers against ``scipy.ndimage.map_coordinates``, which
+samples a plain grid with no notion of UV or mesh topology — the right correctness oracle for the
+interpolation and the wrong baseline for the operation. So these are before/after self-comparisons.
 """
 
 from __future__ import annotations

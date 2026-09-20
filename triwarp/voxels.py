@@ -2,12 +2,12 @@
 Sparse voxel grids: voxelize a mesh or a cloud, test membership, reshape, and mesh the result.
 
 The grid is a ``warp.Volume`` -- a NanoVDB *index* grid -- rather than a triwarp value type, and
-every function here either produces one or consumes one. Four properties of that grid shape the
-rest of the module:
+every function here either produces one or consumes one. Four properties of that grid shape the rest
+of the module:
 
 - **The builder is the dedup.** ``Volume.allocate_by_voxels`` collapses repeated cells as it builds,
-  so no function here ever calls
-  [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows] first.
+  so no function here ever calls [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows]
+  first.
 - **The volume's linear index is the row index of its cell array.** ``wp.volume_lookup_index``
   returns exactly the row [`cells`][triwarp.voxels.cells] puts that voxel in, so a per-voxel payload
   is a plain ``wp.array`` of length ``n_voxels`` and membership costs one ``O(1)`` probe.
@@ -32,10 +32,8 @@ nothing with it but the ``(lower, upper)`` ``bounds`` convention
 [`grid_points`][triwarp.voxels.grid_points] produces the sample positions,
 [`splat_onto_grid`][triwarp.voxels.splat_onto_grid] accumulates a scattered field onto them and
 [`sample_grid_trilinear`][triwarp.voxels.sample_grid_trilinear] reads one back. The last two are
-transposes of each other and are kept **together**: they share the world-to-lattice map, and
-splitting the pair across modules -- the gather reads like one of
-[`triwarp.interpolation`][triwarp.interpolation]'s transfer verbs -- would put that map behind a
-private import and let the two halves drift a half-cell apart.
+transposes of each other and share the world-to-lattice map, so they are kept together rather than
+split across modules where the two halves could drift a half-cell apart.
 [`interpolate_from_points`][triwarp.interpolation.interpolate_from_points] carries the
 cross-reference from the other side.
 
@@ -49,12 +47,6 @@ cross-reference from the other side.
     - **A full dense box**: ``from_dense(wp.full(shape, True), s, o)``, which is Open3D's
       ``VoxelGrid.create_dense``. Two calls with no gotcha between them, and a wrapper would
       allocate the identical dense lattice.
-
-    The set algebra, morphological closing and opening, and resampling that this note used to list
-    *are* wrapped now -- [`union`][triwarp.voxels.union],
-    [`intersection`][triwarp.voxels.intersection], [`difference`][triwarp.voxels.difference],
-    [`closing`][triwarp.voxels.closing], [`opening`][triwarp.voxels.opening] and
-    [`revoxelize`][triwarp.voxels.revoxelize].
 
 See Also
 --------
@@ -630,8 +622,7 @@ def resolve_voxel_grid(
     bounding-box diagonal, anchored half a cell below the box. That anchor is Open3D's, and keeping
     it in one place is what lets ``voxelize_points``,
     [`voxel_down_sample`][triwarp.voxels.voxel_down_sample] and
-    [`cluster_decimate`][triwarp.remesh.cluster_decimate] agree cell for cell -- they used to say so
-    in two comments instead.
+    [`cluster_decimate`][triwarp.remesh.cluster_decimate] agree cell for cell.
 
     Public because [`cluster_decimate`][triwarp.remesh.cluster_decimate] lives in another module and
     needs the same convention; it is pure host arithmetic over one
@@ -689,9 +680,9 @@ def resolve_voxel_grid(
         else:
             lower, upper = tw.bounds.aabb(points)
             # ``math.dist`` rather than ``float(wp.length(upper - lower))``: a Warp operator and a
-            # Warp builtin at Python scope each route through builtin dispatch, measured 14.68 us
-            # against 3.02 (4.9x). It computes in float64 where ``wp.length`` is float32, i.e. ~2e-8
-            # relative and the correctly-rounded answer for float32 corners. Section 13.1.
+            # Warp builtin at Python scope each route through builtin dispatch, several times
+            # dearer. It computes in float64 where ``wp.length`` is float32, i.e. the
+            # correctly-rounded answer for float32 corners. Section 13.1.
             diagonal = math.dist(lower, upper)
             # A single point -- or any cloud whose points are all coincident -- has a zero-extent
             # box and so carries no scale to derive a cell width from. Take the same unit diagonal

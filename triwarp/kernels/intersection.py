@@ -265,9 +265,7 @@ def triangle_intersection_segment(
     # for two triangles whose planes meet at a small dihedral angle, this cross product subtracts
     # two float32 products that can agree to more digits than float32 carries, underflowing to the
     # exact zero vector even though the true magnitude -- and the float64 broad-phase test that
-    # already accepted the pair -- is nonzero. Confirmed reproducing a dropped segment (a genuinely
-    # crossing pair, tilted ~1e-7 rad about a generic, non-axis-aligned axis) before this fix;
-    # see plans/review.md item 6c.
+    # already accepted the pair -- is nonzero, which drops a genuinely crossing pair's segment.
     da0 = kernel_array.to_vec3d(a0)
     da1 = kernel_array.to_vec3d(a1)
     da2 = kernel_array.to_vec3d(a2)
@@ -400,19 +398,14 @@ def mark_pair_masks(
 
 # Launched over ``filter_intersecting_pairs``'s survivors, so ``triangle_intersection_segment``
 # below recomputes each pair's normals, edge vectors and plane-distance projections that
-# ``triangles_intersect`` already derived one launch earlier (plans/review.md item 6). Measured
-# on an RTX 5090, Warp 1.17, min of 7 interleaved reps, ``wp.timing_begin`` device time for the
-# whole ``mesh_with_mesh`` call at its own benchmarked "deep" self-offset: this kernel is
-# **7.9-8.1%** of the call on ``bunny_decimated`` (2 608 pairs, 0.0226 of 0.286 ms) and ``bunny``
-# (5 861 pairs, 0.0243 of 0.301 ms) alike -- flat across a 2.3x face-count range, not a falling
-# share. But it bounds the *maximum* possible saving from eliminating the redundancy, since not
-# all of this kernel's own time is the shared prefix (the segment extraction's ordering and
-# division are unique to it); the broad-phase AABB query kernels are 71-72% of the same call and
-# dominate it regardless. And ``filter_intersecting_pairs`` also backs two call sites that never
-# need a segment at all (``mesh_collision_pairs``, ``validation.face_self_intersecting_mask``), so
-# a single fused kernel would need a caller-selected tail rather than a clean merge. Declined on
-# that basis: a single-digit percent of an already sub-millisecond call is not worth a
-# shared-output kernel reached from three call sites with two different needs.
+# ``triangles_intersect`` already derived one launch earlier. **Fusing the two is declined.** This
+# kernel is a single-digit percentage of the whole ``mesh_with_mesh`` call, flat across the face
+# count rather than a falling share, and that figure *bounds* the saving rather than being it,
+# since the segment extraction's ordering and division are unique to it; the broad-phase AABB query
+# kernels are the overwhelming majority of the same call. And ``filter_intersecting_pairs`` backs
+# two call sites that never need a segment at all (``mesh_collision_pairs``,
+# ``validation.face_self_intersecting_mask``), so a single fused kernel would need a
+# caller-selected tail rather than a clean merge.
 @wp.kernel
 def triangle_pair_segments(
     query_vertices: wp.array[wp.vec3],
@@ -716,11 +709,11 @@ def emit_tri_cut(
     out_new_faces[tid, 0] = v_inside
     # ``classify_faces_for_slice`` routes both a genuine two-crossing cut (both neighbours
     # strictly outside) and "one neighbour sits exactly on the level set" into this same class --
-    # they share ``signs_asum == 2`` and can't be told apart there (see plans/review.md item 6a).
-    # An on-plane neighbour is not a real crossing: reuse its existing vertex directly rather than
-    # interpolating a near-duplicate a hair's breadth away from it. Whichever of ``new_i0`` /
-    # ``new_i1`` is unused in that case is simply left unreferenced -- the caller's
-    # ``remove_unreferenced_vertices`` sweeps it up, so no buffer accounting changes.
+    # they share ``signs_asum == 2`` and cannot be told apart there. An on-plane neighbour is not a
+    # real crossing: reuse its existing vertex directly rather than interpolating a near-duplicate a
+    # hair's breadth away from it. Whichever of ``new_i0`` / ``new_i1`` is unused in that case is
+    # simply left unreferenced -- the caller's ``remove_unreferenced_vertices`` sweeps it up, so no
+    # buffer accounting changes.
     if face_signs[face_index, corner_a] == SLICE_SIGN_ON_PLANE:
         out_new_faces[tid, 1] = faces[base + corner_a]
         out_new_faces[tid, 2] = new_i1
@@ -1002,8 +995,7 @@ def marching_triangles_segments(
     # otherwise land in the same bucket as a genuine negative value, pass as a "lone corner" against
     # two real opposite-signed neighbours, and feed ``crossing_point`` a ``NaN`` that reaches the
     # returned curve with no filter anywhere downstream (unlike ``mesh_with_mesh``'s
-    # ``segment_nondegenerate``). Confirmed reproducing a `[nan, nan, nan]` point in a returned
-    # curve from field values ``[NaN, 1.0, -1.0]`` before this guard; see plans/review.md item 6c.
+    # ``segment_nondegenerate``).
     if wp.isnan(d0) or wp.isnan(d1) or wp.isnan(d2):
         out_valid[f] = False
         return
@@ -1042,12 +1034,9 @@ def marching_triangles_segments(
     # only has to be *equal for the two faces sharing a crossing and distinct otherwise*, and the
     # sorted vertex pair already is -- so it is computed here rather than looked up in a dense
     # unique-edge table.
-    #
-    # That table used to be built by ``edges.edges_unique_inverse`` over the whole mesh, which was
-    # **41 % of ``marching_triangles``** (0.536 ms of 1.318 on a 81 920-face sphere) and densified
-    # all 122 880 edges when a level set crosses on the order of a thousand of them. The
-    # densification that ``_link_segments`` genuinely needs now happens there, over the crossing
-    # endpoints alone.
+    # A dense unique-edge table would densify *every* mesh edge where a level set crosses a small
+    # fraction of them; the densification ``_link_segments`` genuinely needs happens there instead,
+    # over the crossing endpoints alone.
     #
     # ``key_base`` is the vertex count, so the pair packs without collision; the caller resolves it
     # from its own ``n_vertices`` argument.
@@ -1077,7 +1066,7 @@ def marching_triangles_segments(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 2.5. Measured at 2 overloads across **4** module loads, on a 15-kernel module.
+# CLAUDE.md section 2.5.
 #
 # Only the scalar field being contoured is generic: ``marching_triangles`` accepts a ``wp.float32``
 # or ``wp.float64`` per-vertex field (the heat solvers produce the latter), while the geometry it

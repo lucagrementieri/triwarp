@@ -11,56 +11,49 @@ module used to hold:
 - **The minimum distance is exact, not approximate.** Two accepted points cannot be within ``r`` of
   each other: within one round the larger-priority one of the pair would have seen the smaller and
   declined, and across rounds the later one would already have been discarded by the earlier one's
-  ``r``-ball. Measured closest pair on three fixtures: ``1.000 r``, on the nose.
+  ``r``-ball.
 - **The result is maximal**, so the uncovered gap is bounded: a survivor is by definition a point no
-  accepted point covers, so the loop cannot stop while an ``r``-gap remains. Measured worst gap
-  1.08-1.10 ``r``, *tighter* than MeshLab's hierarchical dart throwing (1.11-1.19) and Open3D's
-  sample elimination (1.20-1.22) at the same parameter.
+  accepted point covers, so the loop cannot stop while an ``r``-gap remains. The measured worst gap
+  is *tighter* than MeshLab's hierarchical dart throwing and Open3D's sample elimination at the same
+  parameter.
 - **It is the serial algorithm's distribution.** Accepting local priority minima and discarding
   their balls, repeatedly, visits the pool in exactly priority order, so the output is what
-  sequential dart throwing over a uniformly random order gives — parallel, not approximate.
+  sequential dart throwing over a uniformly random order gives -- parallel, not approximate.
   And because each pass writes only its own thread's slot and reads only states it cannot itself
   change, a round is a deterministic function of its input state: same seed, same samples.
 
 The round count is what makes it fast. The smallest-priority point still in play is always a local
-minimum, so every round accepts something, and each acceptance discards a whole ``r``-ball — ~90
-points on the 30x-oversampled pool ``igl::blue_noise`` sizes — which empties the pool in a handful
-of rounds where an active-list walk needed ~100. Against the Bridson implementation on
-``bunny_decimated``: **260 -> 44 ms at the 2k-sample radius (6.0x) and 568 -> 54 ms at half that
-radius (10.6x)**, at 1-3 % more samples.
+minimum, so every round accepts something, and each acceptance discards a whole ``r``-ball -- which
+empties the pool in a handful of rounds where an active-list walk needed a hundred or so, for a
+several-fold end-to-end win at a slightly higher sample count.
 
 Background grid cells are ``r`` on a side, so a ``3x3x3`` neighbourhood contains every point within
 ``r`` and both sweeps are 27 cells. Bridson's, by contrast, had to enumerate a ``9x9x9`` shell per
-active parent per round to find its ``[r, 2r]`` annulus — 729 cells against 27, which together with
+active parent per round to find its ``[r, 2r]`` annulus -- 729 cells against 27, which together with
 the round count is the whole difference.
 
 **Most of those 27 cells cannot affect the answer, and one word per cell says which.** Each sweep
-vetoes a candidate on a single property of the points in a neighbouring cell — an acceptance for the
-covering sweep, a smaller priority for the selection sweep — so a per-cell summary of that property
-decides the whole cell without loading a point from it. Two summaries are rebuilt per round, at a
-cost of two fills and one atomic pass over the work list; they remove work whose outcome was already
-determined, so the accepted set is identical by construction rather than by tolerance. Measured at
-the radii ``benchmarks/test_sample.py`` scores: the covering summary alone is **1.51x / 2.06x**, the
-selection summary alone 1.06-1.08x, and the two together **1.70x / 1.72x / 2.33x**, with a
-byte-identical ``state`` array in all four combinations.
+vetoes a candidate on a single property of the points in a neighbouring cell -- an acceptance for
+the covering sweep, a smaller priority for the selection sweep -- so a per-cell summary of that
+property decides the whole cell without loading a point from it. Two summaries are rebuilt per
+round, at a cost of two fills and one atomic pass over the work list; they remove work whose outcome
+was already determined, so the accepted set is identical by construction rather than by tolerance,
+and together they are worth roughly 2x.
 
 **And those summaries are why the obvious next step is not one.** The membership lists are built
 once over the whole pool and never compacted, so as rounds retire points the sweeps walk lists that
-are mostly dead: measured over the benchmarked runs, the entries scanned exceed the live ones by
-**1.89-2.97x**. Compacting the covered entries out is provably answer-preserving -- the selection
-sweep skips a ``DART_COVERED`` vetoer explicitly and the covering sweep only ever matches
-``DART_ACCEPTED``, so the dropped entries are exactly the ones both already walked past -- and it
-was built, byte-gated and **refuted**: 0.91-0.94x on all four rows, with identical points and face
-indices.
+are mostly dead -- entries scanned exceed live ones severalfold. Compacting the covered entries out
+is provably answer-preserving (the selection sweep skips a ``DART_COVERED`` vetoer explicitly and
+the covering sweep only ever matches ``DART_ACCEPTED``, so the dropped entries are exactly the ones
+both already walked past) and it was built, byte-gated and **refuted** as a small loss.
 
-The reason is the summaries above, and it is worth stating because the 2.97x looks compelling from
-the alive counts alone. A per-cell summary skips a cell *without loading a point from it*, so the
+The reason is the summaries above, and it is worth stating because the dead-entry ratio looks
+compelling on its own. A per-cell summary skips a cell *without loading a point from it*, so the
 inner loop only ever runs on cells that genuinely hold a smaller-priority alive point or a fresh
-acceptance -- and those cells are mostly live, so there is little dead weight left to remove.
-Measured on ``bunny`` at half the radius, rebuilding on halving: ``dart_select_minima`` 31.94 ->
-30.97 ms (**3 %**), ``dart_cover_neighbors`` 10.46 -> 9.33 (11 %), device total 45.87 -> 44.53 --
-against **+185 launches and +74 readbacks** of host cost, which is the whole loss. Occupancy stopped
-being the cost when the summaries landed; do not re-derive this from the alive counts.
+acceptance -- and those cells are mostly live, so there is little dead weight left to remove. The
+device time barely moves and the compaction's own launches and readbacks are the whole loss.
+Occupancy stopped being the cost when the summaries landed; do not re-derive this from the alive
+counts.
 """
 
 import warp as wp

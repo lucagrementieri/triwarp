@@ -61,62 +61,23 @@ def segment_midpoint_and_length(start: wp.vec3, end: wp.vec3) -> tuple[wp.vec3, 
 
 @wp.kernel
 def accumulate_newell_normal(polyline: wp.array[wp.vec3], out_normal: wp.array[wp.vec3]) -> None:
-    # Newell's method sums cross products of consecutive vertices (position vectors),
-    # cross(V_i, V_{i + 1}), over the ``n - 1`` pairs of a *closed* polyline whose last vertex
-    # duplicates its first -- which folds the wrap-around edge into this same sum, and is what
-    # ``polyline_normal`` appends before launching.
+    # Newell's method sums cross(V_i, V_{i + 1}) over the ``n - 1`` pairs of a *closed* polyline
+    # whose last vertex duplicates its first, which folds the wrap-around edge into the same sum --
+    # what ``polyline_normal`` appends before launching.
     #
-    # This kernel and the two below are the lane-strided single-slot reduction: launched with
-    # ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``, one block per
-    # ``ITEMS_PER_BLOCK_1D`` elements, lanes striding that block's own chunk by
-    # ``wp.block_dim()``, one atomic per block. All three were one ``wp.atomic_add`` per thread to
-    # a *constant* slot, which serializes the entire reduction on one address. Interleaved A/B in
-    # one session on an RTX 5090, min of three alternating pairs, and the values against a float64
-    # reference of the same sum:
+    # This kernel and the two below are the lane-strided single-slot reduction of CLAUDE.md section
+    # 13.2: ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``, lanes striding their own
+    # block's chunk by ``wp.block_dim()``, one atomic per block. Striding by ``wp.block_dim()`` is
+    # what makes it correct on both devices, so there is no ``prefers_tiled_reduction`` branch.
+    # Only an *unconditional* atomic belongs in this shape; ``count_reflex`` below is the
+    # counter-example and is deliberately left alone.
     #
-    #   n                          4 096    65 536   262 144
-    #   newell_normal    atomic    0.0187   0.2482   0.9880  ms
-    #                    tiled     0.0142   0.0127   0.0138  ms   -> 1.32x / 19.6x / 71.8x
-    #   turning_angle    atomic    0.0113   0.0843   0.3319  ms
-    #                    tiled     0.0135   0.0141   0.0121  ms   -> 0.84x / 5.97x / 27.4x
-    #   loop_frame       atomic    0.0310   0.4390   1.6174  ms
-    #                    tiled     0.0163   0.0150   0.0155  ms   -> 1.90x / 29.3x / 104x
-    #
-    # ``rim_long`` is 1 << 16 = 65 536 vertices per rim and is the ``polyline`` group's asymptotic
-    # fixture, so the middle column is the benchmarked point. The 4 096 turning-angle row is a
-    # small loss and is the occupancy trade: four blocks on 170 SMs.
-    #
-    # The reduction is also **three orders of magnitude more accurate**, which is the opposite of
-    # what a different summation order usually costs -- at n = 262 144 the tree sits at 2.6e-07 /
-    # 3.5e-07 / 4.7e-07 relative against float64 where the serialized atomics sit at 1.4e-03 /
-    # 5.3e-06 / 1.4e-03.
-    #
-    # **No ``prefers_tiled_reduction`` branch.** The lanes partition a chunk the block already
-    # owns and take their stride from ``wp.block_dim()``, which section 3 of
-    # ``.claude/CLAUDE.md`` says is correct on both devices: on CPU ``wp.block_dim()`` reads 1,
-    # lane 0 walks the whole chunk, and the one-element tile holds that chunk's true total.
-    # Measured with ``CUDA_VISIBLE_DEVICES=""``: 0.79-1.00x on the clock, and the same accuracy
-    # win (4.3e-07 against 2.6e-04 for the Newell normal at n = 65 536).
-    #
-    # A ``wp.vec3`` accumulator is summed component-wise because ``wp.tile(wp.vec3)`` does not
-    # parse (verified on Warp 1.17: ``Error while parsing function``), which is the same reason
-    # ``measures.centroid_tiled`` takes three ``wp.tile_sum`` calls.
-    #
-    # Only an *unconditional* atomic belongs in this shape. A compaction cursor, a
-    # "did anything change" flag or a rare-event counter -- ``count_reflex`` two hundred lines
-    # down, ``boundary.find_ears``, ``remesh.commit_flips`` -- contends in proportion to its
-    # **hits** rather than to the launch, so converting one would add a block reduction to a
-    # kernel that atomically adds a handful of times. Leave those alone.
-    #
-    # The four-statement prologue below (``wp.tid()``, ``tile_chunk``, the guard, the clamp) is
-    # repeated in all four converted kernels and the statement-run scan pairs them; it is **not**
-    # extractable and the reason is structural rather than a judgement call. ``wp.tid()`` may only
-    # be called from a ``@wp.kernel`` (section 1), and the third statement is an early ``return``
-    # that a ``@wp.func`` cannot perform for its caller -- so a helper would have to return a
-    # validity flag and every call site would regain the guard it was meant to lose. Same verdict
-    # and same reason as ``holes.fill_dp_span``'s written decline. What *is* shared is the number
-    # the four of them have to agree on, and that is named: ``reduce.ITEMS_PER_BLOCK_1D``, read by
-    # ``blocks_1d`` at the launch and by ``tile_chunk`` here.
+    # The ``wp.vec3`` accumulator is summed component-wise because ``wp.tile(wp.vec3)`` does not
+    # parse (Warp 1.17), the same reason ``measures.centroid_tiled`` takes three ``wp.tile_sum``
+    # calls. The four-statement prologue the four converted kernels share is not extractable:
+    # ``wp.tid()`` is kernel-only and the guard is an early ``return`` a ``@wp.func`` cannot perform
+    # for its caller. What *is* shared is ``reduce.ITEMS_PER_BLOCK_1D``, read by ``blocks_1d`` at
+    # the launch and by ``tile_chunk`` here.
     chunk, lane = wp.tid()
     n_pairs = polyline.shape[0] - 1
     offset, remaining = tile_chunk(n_pairs, chunk, ITEMS_PER_BLOCK_1D)
@@ -211,26 +172,18 @@ def plane_normal(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> tuple[wp.vec3, wp.bool]:
     Returns whichever of ``b x (a + c)`` and ``b x (a - c)`` has the larger magnitude, which stays
     well-defined when ``a`` and ``c`` are nearly parallel or anti-parallel.
 
-    The degeneracy test is scale-free: it reads ``sin²`` of the angle between ``b`` and the chosen
+    The degeneracy test is scale-free: it reads ``sin^2`` of the angle between ``b`` and the chosen
     sum/difference (``length_sq(normal) / (length_sq(b) * length_sq(reference))``), not an absolute
     cross-product magnitude. ``length_sq(normal)`` scales as the *4th power* of the coordinate
-    scale (``b`` and the reference vector each contribute a factor of length, twice over once
-    squared), so comparing it to a fixed absolute epsilon -- what this replaced -- silently
-    reclassified an ordinary, non-collinear bend as degenerate once the polyline's coordinates
-    dropped a couple of orders of magnitude below 1: reproduced on a regular octagon inscribed at
-    radius ``r``, the arc fit was exact down to ``r = 5e-2`` and fully collapsed to the straight
-    chord at ``r = 3e-2`` and below, tracking `length_sq(normal)` crossing the old fixed
-    ``CURVATURE_EPS`` exactly at that boundary (see plans/review.md item 7's ``endpoint_normals``
-    finding). ``scale`` still needs a floor against a genuinely zero-length ``b`` or reference
-    vector, which makes the ratio vacuously small (or an outright ``0 < 0`` if ``normal`` is zero
-    too) regardless of angle -- but the floor has to be an *exact*-zero test, not another fixed
-    epsilon: ``scale`` is ``length_sq(b) * length_sq(reference)``, the same 4th-power quantity the
-    ratio exists to stop comparing against a fixed constant, so reusing ``CURVATURE_EPS`` here
-    reintroduces the identical scale dependence one line down -- measured directly: the octagon
-    repro above still failed identically with a ``scale < CURVATURE_EPS`` floor, because the
-    floor fired instead of the ratio at every scale below the same old boundary. A duplicated
-    (bit-identical) point makes ``b`` or ``reference`` the exact zero vector, at any coordinate
-    scale, which is what the floor below actually tests for.
+    scale, so comparing it to a fixed absolute epsilon silently reclassifies an ordinary
+    non-collinear bend as degenerate once the polyline's coordinates drop a couple of orders of
+    magnitude below 1, collapsing a fitted arc to its straight chord.
+
+    ``scale`` still needs a floor against a genuinely zero-length ``b`` or reference vector, which
+    makes the ratio vacuously small regardless of angle -- but the floor has to be an *exact*-zero
+    test and not another fixed epsilon, since ``scale`` is the same 4th-power quantity the ratio
+    exists to stop comparing against a constant. A duplicated (bit-identical) point makes ``b`` or
+    ``reference`` the exact zero vector at any coordinate scale, which is what the floor tests for.
     """
     n1 = wp.cross(b, a + c)
     n2 = wp.cross(b, a - c)
@@ -346,9 +299,9 @@ def greedy_downsample_mask(
     # moves the reference the next one is measured from.
     #
     # **Kept for short polylines only**, and it is `polyline_downsample`'s
-    # ``_DOWNSAMPLE_DOUBLING_FROM`` that decides. The walk is ~60 ns a point, so it is the cheapest
-    # thing available until the point count pays for the ``2 log2(n) + 1`` launches the parallel
-    # form below costs; the numbers and the crossover are on that constant.
+    # ``_DOWNSAMPLE_DOUBLING_FROM`` that decides. The walk is a few tens of nanoseconds a point, so
+    # it is the cheapest thing available until the point count pays for the ``2 log2(n) + 1``
+    # launches the parallel form below costs; the crossover is on that constant.
     n = cumulative_lengths.shape[0]
     out_keep[0] = True
     last = cumulative_lengths[0]
@@ -483,8 +436,7 @@ def rdp_begin_round(
     #
     # ``state`` is read-and-incremented round-index/loop-condition scratch carried across launches
     # by the caller (the same buffer ``rdp_split_spans`` takes under this name), not a fresh
-    # per-call answer -- it does not wear the ``out_`` prefix for that reason (see plans/review.md
-    # item 7a).
+    # per-call answer -- it does not wear the ``out_`` prefix for that reason.
     i = wp.int32(wp.tid())
     if i == 0:
         state[LOOP_ROUND] = state[LOOP_ROUND] + 1
@@ -564,12 +516,11 @@ def rdp_split_spans(
     #
     # It is **defensive and measured to be unreachable**, which is worth saying because the obvious
     # reason to expect otherwise is wrong: a non-finite coordinate does *not* produce it, because
-    # ``wp.atomic_max`` does not propagate ``NaN`` (measured ``atomic_max(-1, NaN, 25) == 25.0`` on
-    # both devices). So either some point wrote a real maximum, and that same point then satisfies
-    # the ``>=`` in ``rdp_span_argmax`` and resolves the index; or every interior distance was
-    # ``NaN``, the accumulator keeps the ``-1.0`` it was armed with, and the tolerance test above
-    # settles the span first. Seven non-finite shapes -- interior, endpoint, all-``NaN``, ``inf`` --
-    # give byte-identical answers with the two comparisons deleted.
+    # ``wp.atomic_max`` does not propagate ``NaN`` (verified on both devices). So either some point
+    # wrote a real maximum, and that same point then satisfies the ``>=`` in ``rdp_span_argmax``
+    # and resolves the index; or every interior distance was ``NaN``, the accumulator keeps the
+    # ``-1.0`` it was armed with, and the tolerance test above settles the span first. Every
+    # non-finite shape probed gives byte-identical answers with the two comparisons deleted.
     if span_max[lo] <= squared_tolerance or split <= lo or split >= hi:
         span_lo[i] = RDP_SETTLED  # the whole span is within tolerance, so its interior drops
         return
@@ -667,20 +618,13 @@ def is_ear_at(
     # This walk is O(active ring size) per convex candidate corner (a reflex one returns above,
     # in O(1)), so the round with the most active convex candidates -- always round 0 on a ring
     # that is not fully convex, since ``compute_ears`` is launched at ``dim=n`` -- costs O(n) per
-    # thread across up to n threads: O(n^2) total device work (plans/review.md item 7). Measured
-    # on a synthetic pathological ring built to maximize it -- a near-circular polygon of n points
-    # with one vertex pulled inward (so ~n-1 of the n corners are convex ear candidates that each
-    # walk the whole remaining ring, while the single dent forces the ear-clip path instead of the
-    # O(1) convex fan) -- ``polyline_triangulate`` stays close to linear in wall-clock time up to
-    # the GPU's own thread-level parallelism (1.86-1.95x per doubling of n from 8 192 to 131 072,
-    # RTX 5090, Warp 1.17: 15.2 / 28.3 / 53.8 / 103.2 / 201.6 ms), because up to that many resident
-    # threads the O(n) total work is hidden behind the O(n) longest single thread. Past it, the
-    # true O(n^2) total work stops being hidden and the ratio jumps to 3.0-3.4x per doubling
-    # (690.1 ms at n=262 144, 2 068.4 ms at n=524 288). Every polyline this package's own benchmark
-    # axis exercises (the longest boundary loop measured is 65 536) sits inside the near-linear
-    # regime; a fix would need a spatially-accelerated ear test (a real data structure over the
-    # active ring, not a topological linked-list walk) rather than a tuning constant, so this is
-    # left as a documented, measured limitation rather than rewritten.
+    # thread across up to n threads: **O(n^2) total device work**. Measured on a ring built to
+    # maximize it, ``polyline_triangulate`` stays close to linear in wall clock while the device
+    # still has spare resident threads to hide the O(n) longest thread behind, and turns quadratic
+    # past that point. Every polyline this package's own benchmark axis exercises sits inside the
+    # near-linear regime; a fix would need a spatially accelerated ear test (a real data structure
+    # over the active ring, not a topological linked-list walk) rather than a tuning constant, so
+    # this is left as a documented limitation rather than rewritten.
     a = left[i]
     b = right[i]
     if a == b or a == i or b == i:
@@ -722,9 +666,8 @@ def accumulate_loop_frame(
     # ``polyline_centroid`` (``closed=False``) computes and what this function has always used.
     #
     # Lane-strided single-slot reduction -- see ``accumulate_newell_normal`` for the shape and why
-    # no device branch is needed. This is the largest of the three wins, at 1.90x / 29.3x / 104x
-    # for n = 4 096 / 65 536 / 262 144, because it carried *three* unconditional atomics per
-    # element and so three times the contention.
+    # no device branch is needed. This is the largest of the three wins, because it carried *three*
+    # unconditional atomics per element and so three times the contention.
     chunk, lane = wp.tid()
     n = polyline.shape[0]
     offset, remaining = tile_chunk(n, chunk, ITEMS_PER_BLOCK_1D)
@@ -784,9 +727,8 @@ def project_polyline_to_plane(
 @wp.kernel
 def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_total: wp.array[wp.float32]) -> None:
     # Cyclic signed exterior angle at each vertex; the sum's sign gives the loop orientation.
-    # Lane-strided single-slot reduction -- see ``accumulate_newell_normal`` for the shape, its
-    # measured table (0.84x / 5.97x / 27.4x at n = 4 096 / 65 536 / 262 144) and why no device
-    # branch is needed.
+    # Lane-strided single-slot reduction -- see ``accumulate_newell_normal`` for the shape and why
+    # no device branch is needed.
     chunk, lane = wp.tid()
     n = points2d.shape[0]
     offset, remaining = tile_chunk(n, chunk, ITEMS_PER_BLOCK_1D)
@@ -959,8 +901,7 @@ def ear_loop_continue(
     # -- the same bound the host-driven form got from iterating ``range(n)``.
     #
     # ``state`` is read-and-incremented round-index/loop-condition scratch carried across launches,
-    # not a fresh per-call answer -- see ``rdp_begin_round``'s identical naming (plans/review.md
-    # item 7a).
+    # not a fresh per-call answer -- see ``rdp_begin_round``'s identical naming.
     state[LOOP_ROUND] = state[LOOP_ROUND] + 1
     if count[0] < target and state[LOOP_ROUND] < max_rounds:
         state[LOOP_CONDITION] = wp.int32(1)
@@ -983,14 +924,11 @@ def _declare_map_kernels() -> None:
     # is an ordinary input rather than a corner: ``polyline_centroid`` and ``polyline_radius``
     # accept one, their guard being ``n_segments < 1``.
     #
-    # ``segment_midpoint_and_length`` and ``radius_segment_distances`` were missing from this list
-    # and the cost is what section 15 predicts. Measured on the CPU device by walking an 8-point
-    # polyline and then a 2-point one through ``polyline_centroid`` / ``polyline_radius`` /
-    # ``polyline_length`` with Warp's debug log on: ``Module hash changed, recompiling`` for
-    # ``map_segment_midpoint_and_length`` (**1 620 ms**) and ``map_radius_segment_distances``
-    # (**196 ms**), while ``map_segment_length`` -- the one that was declared -- held. Three ops on
-    # one call path, the declared one steady and the two undeclared ones rebuilding, is the
-    # controlled version of that finding.
+    # Two of the three were missing from this list and the cost is what section 15 predicts:
+    # walking an 8-point polyline and then a 2-point one through ``polyline_centroid`` /
+    # ``polyline_radius`` / ``polyline_length`` with Warp's debug log on logs
+    # ``Module hash changed, recompiling`` for exactly the undeclared ops, seconds apiece, while
+    # the declared one holds.
     dense, single = map_probe, map_probe_single
     center, normal = wp.vec3(), wp.vec3()
     declare_map_signatures(
@@ -1028,8 +966,8 @@ def polyline_total_length(
     # are computed instead of being written to a buffer a separate reduction then reads back in.
     # That is CLAUDE.md section 14.10's producer-consumer fusion applied to a reduction's producer
     # -- ``polyline_length`` ran a ``wp.map`` into an ``(n - 1,)`` scratch array and then
-    # ``reduce.sum`` over it: two launches, two allocations and ~11 us of ``wp.map`` resolution for
-    # an answer that is one number.
+    # ``reduce.sum`` over it: two launches, two allocations and the map's own host-side resolution
+    # for an answer that is one number.
     #
     # **This changes the summation order and therefore the last bits of the answer.** A lane-strided
     # fold plus a ``wp.tile_sum`` tree is not the left-to-right sum ``reduce.sum`` happens to
@@ -1113,10 +1051,10 @@ def endpoints_coincide(
     # Whether a polyline's first and last points coincide, as one thread and one flag.
     #
     # ``polyline.is_closed`` asked this through ``array.allclose`` over two one-element slices,
-    # which is a ``wp.map`` into a mask plus a whole reduction over it plus the readback --
-    # **0.118 ms to compare six floats**, against 0.013 ms to clone the entire 4 096-point buffer
-    # it is asked about. The readback stays (the answer decides a host-side branch, and the shape
-    # of what ``polyline_close`` returns); everything around it does not.
+    # which is a ``wp.map`` into a mask plus a whole reduction over it plus the readback -- more
+    # expensive than cloning the entire buffer it is asked about, to compare six floats. The
+    # readback stays (the answer decides a host-side branch, and the shape of what
+    # ``polyline_close`` returns); everything around it does not.
     #
     # The same ``rtol``/``atol`` predicate ``array.allclose`` applies, through the same
     # ``@wp.func``, so the two cannot disagree about what "coincide" means.

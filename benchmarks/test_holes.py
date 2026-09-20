@@ -8,33 +8,29 @@ independent drivers:
 * **Loop length**, cubed. ``fill_min_weight`` runs a minimum-weight triangulation DP over a
   ``B x B`` table per loop, filled by ``B - 2`` *sequential* kernel launches and read back to the
   host for the traceback. Total work is ``sum(B_i^3)`` and no batching can remove it: this is the
-  real cost the module exists to pay. Two loops of 512 measure **20-35 ms**.
+  real cost the module exists to pay.
 
-  It measured **157 ms** until the per-span launch went from one thread per interval to one *block*
-  per interval, its lanes striding the apex loop: the grid was ``n_loops * (max_B - span)`` wide, so
-  two long rims put at most ~1 024 threads on a 170-SM part and the whole ``B^3`` term ran at 0.3 %
-  of the machine. Same launch count, same DP, byte-identical triangulation (see
-  ``fill_dp_span_tiled``). Measured by running this module twice in one session with only the engine
-  switched: ``fill_min_weight[rim_short]`` **168.6 -> 35.0 ms (4.8x)**, its two
-  ``_chords`` rows **7.6x** and **5.5x**, and ``[holes_many]`` **20.9 -> 7.0 (3.0x)**. An isolated
-  in-process timer on the same fixtures reads 173.8 -> 19.7 and 18.4 -> 4.4, so read the ratio, not
-  the absolute -- this group's median moves by up to 80 % between runs of the *same* code depending
-  on which reference rows share the process.
-* **Loop count**, which should cost nothing and used to cost everything. Every loop paid a
-  ``.numpy()`` readback, its own forbidden-chord pass over the whole mesh and its own span
-  launches, so 512 three-vertex holes -- where the DP itself is one triangle per hole -- ran to
-  **376 ms**, *more* than the genuinely expensive ``rim_short``. Batching the DP across loops took
-  that to **4.2 ms** (90x) and, because it also runs ``rim_short``'s two rims concurrently, took
-  that point from 273 to 157 ms as a side effect.
+  Most of what *can* be removed already was. Widening the per-span launch from one thread per
+  interval to one *block* per interval, its lanes striding the apex loop, is worth several-fold on
+  the long rims: the grid is ``n_loops * (max_B - span)`` wide, so two long rims put ~1 024 threads
+  on the machine and the whole ``B^3`` term ran at a fraction of a percent of it. Same launch
+  count, same DP, byte-identical triangulation (see ``fill_dp_span_tiled``).
+* **Loop count**, which should cost nothing and does so only because the DP is batched across
+  loops. Per loop it would be a ``.numpy()`` readback, a forbidden-chord pass over the whole mesh
+  and its own span launches, so many three-vertex holes -- where the DP itself is one triangle per
+  hole -- cost *more* than the genuinely expensive long-rim point. Batching also runs
+  ``rim_short``'s two rims concurrently.
 
-That is why the axis meshes are *small*: ``rim_short`` is 1 024 faces and ``holes_many`` is 81 408.
-Face count is not the variable, and sizing these meshes up would only add DP table entries that the
-``B^3`` term already dominates. The two points now differ by ~5x in the right direction, which is
-what the axis is for -- the inversion is what said the per-loop sequence was the bug. (The gap was
-37x before the per-span launch was widened to a block per interval; that change is worth ~4.8x on
-the long rims and ~3.0x on the short ones, so it narrows the axis without inverting it.)
-``fill_fan`` runs on the wider **loops** axis instead, because it has no DP and so can afford
-``rim_long``'s 65 536-vertex rims -- it is the floor this module's cost is measured against.
+That is why the axis meshes are *small*: face count is not the variable, and sizing these meshes up
+would only add DP table entries that the ``B^3`` term already dominates. The two points differ by
+several-fold in the right direction, which is what the axis is for -- an *inversion* there is the
+tell that a per-loop sequence has crept back in. ``fill_fan`` runs on the wider **loops** axis
+instead, because it
+has no DP and so can afford ``rim_long``'s much longer rims -- it is the floor this module's cost is
+measured against.
+
+This group's median moves substantially between runs of the *same* code depending on which
+reference rows share the process, so read ratios rather than absolutes here.
 
 One cost the ``loops_dp`` pair cannot see is the default subdivision-target derivation inside
 ``fill_smooth``: its axis is the raw loop *count*, and 512 loops is too few for it to register
@@ -56,14 +52,12 @@ measured.
 **pymeshlab**'s ``meshing_close_holes`` is a third algorithm again -- an ear-clipping fill with an
 optional self-intersection check (``selfintersection=True`` by default, left on) rather than a
 minimum-weight DP. One parameter matters and it is a trap: **``maxholesize`` is an edge count with a
-default of 30**, so on ``rim_short``'s two 512-edge rims the filter closes *nothing* and returns in
-0.66 ms with ``{'closed_holes': 0}``. Lifting it to 10^6 is what makes the axis points comparable at
-all, and it moves ``rim_short`` from 0.66 to 64.9 ms while leaving ``holes_many`` at 38.5 (from
-36.9, where 30 edges was already enough for a three-edge hole). The dict it returns is what makes
-that checkable, and the assertion below reads it.
+default of 30**, so on the long-rim axis point the filter closes *nothing* and returns immediately
+with ``{'closed_holes': 0}``. Lifting it is what makes the axis points comparable at all; the dict
+it returns is what makes that checkable, and the assertion below reads it.
 
-Note what the axis then says: the reference spends **1.7x** on two 512-edge rims what it spends on
-512 three-edge holes, against triwarp's 37x. That is the ``B^3`` term -- MeshLab's ear clipping is
+Note what the axis then says: the reference's two axis points are close together where triwarp's
+differ by more than an order of magnitude. That is the ``B^3`` term -- MeshLab's ear clipping is
 quadratic at worst, so it does not pay it, and its rows are the honest price of *not* computing a
 minimum-weight triangulation.
 """
@@ -183,9 +177,9 @@ def test_fill_min_weight(bench_case: BenchCase) -> None:
         return
     if bench_case.kind == "pymeshlab":
         # ``maxholesize`` is an *edge count* cap, and its default of 30 would silently close nothing
-        # on ``rim_short``'s two 512-edge rims -- measured at 0.66 ms for zero holes closed. Lifting
-        # it is what makes the two axis points comparable at all, and the returned dict is asserted
-        # on so a future default change cannot quietly turn this row back into a no-op.
+        # on ``rim_short``'s two 512-edge rims, returning immediately. Lifting it is what makes the
+        # two axis points comparable at all, and the returned dict is asserted on so a future
+        # default change cannot quietly turn this row back into a no-op.
         statistics_pml = bench_case.run(
             lambda: bench_case.new_meshset_pml().meshing_close_holes(maxholesize=1_000_000),
             rounds=_ROUNDS,
@@ -318,37 +312,21 @@ def test_refill_region(bench_case: BenchCase, triangulate_only: bool) -> None:
     same vertex count, face count and volume in ``triangulateOnly`` mode. It mutates, so it gets a
     fresh mesh per round, and its region bitset is built in ``setup`` -- it is the input.
 
-    First measurement, medians on an RTX 5090, ``bunny`` with a fifth of its faces deleted:
-    triwarp-cuda **22.0 ms** against meshlib's **18.6** for ``dp_only`` (1.19x behind) and **58.4**
-    against **30.9** refined (1.9x). Both sides are dominated by the rim DP and the refinement here,
-    which is why this row is close where ``delete_region_keep_boundary``'s is 8x -- that group
+    Both sides are dominated by the rim DP and the refinement here, which is why this row is close
+    to meshlib where ``delete_region_keep_boundary``'s is an order of magnitude behind -- that group
     isolates the extraction, and the extraction is the part triwarp does slowly.
 
-    **The launch count grows with the longest rim, not per rim and not per component**, and the
-    reading that it does is what a capture of this chain was once proposed on. Attributed per stage
-    at this row's own operating point (CUDA, wall / launches):
-
-    | stage | ``bunny_decimated`` | ``bunny`` | ``dragon`` |
-    |---|---|---|---|
-    | ``delete_region_keep_boundary`` | 5.4 ms / 108 | 5.2 / 109 | 22.0 / 378 |
-    | the min-weight DP | 11.1 / 426 | 19.8 / 792 | 30.3 / 1 212 |
-    | ``subdivide_region_to_size`` | 15.3 / 429 | 11.5 / 315 | 13.2 / 240 |
-    | ``smooth_region_fixed_rim`` | 5.5 / 77 | 5.0 / 77 | 5.1 / 77 |
-    | ``smooth_region`` | 17.0 / 133 | 17.1 / 133 | 15.3 / 133 |
-
-    The DP's count is ``2 * (max_rim - 2)`` -- one launch per triangulation span across *all* loops
-    (``holes._run_hole_dp`` batches them) and a second sweep for the ``min_area`` retry -- so it
-    tracks the longest rim: 197, 380 and 590 vertices on the three meshes. The two smoothing rows
-    are flat at 77 and 133 launches because their systems are the patch's, not the mesh's.
+    **The launch count grows with the longest rim, not per rim and not per component.** The DP's
+    count is ``2 * (max_rim - 2)`` -- one launch per triangulation span across *all* loops
+    (``holes._run_hole_dp`` batches them) and a second sweep for the ``min_area`` retry. The two
+    smoothing rows are flat in the launch count because their systems are the patch's, not the
+    mesh's.
 
     **A capture is refuted for all three stages that could take one, each for its own reason.** The
     DP sweep is device-bound at a large rim; ``smooth_region``'s solve is *already* one captured CG
-    graph (11.9 of its 12.1 ms on ``bunny``, ~1 100 Jacobi iterations on the normal equations, where
-    the V-cycle measures 19.2 against 15.3 and ``"auto"`` correctly declines it); and the flip and
-    subdivision loops have data-dependent trip counts with a host readback each round and run
-    **once** per call, which is round 6's measured 0.84x for recording-and-replaying-once rather
-    than its 4.29x for a replay. ``repair.fix_self_intersections[local]``'s 3 419 launches are three
-    of these chains -- its ``max_iter=3`` loop -- and not per-component work.
+    graph (nearly all of that stage, and ``"auto"`` correctly declines the V-cycle for it); and the
+    flip and subdivision loops have data-dependent trip counts with a host readback each round and
+    run **once** per call, which is the record-and-replay-once *loss* rather than the replay win.
     """
     if bench_case.kind == "meshlib":
         _mask_wp, mask_np = _cap_region(bench_case)
@@ -385,9 +363,9 @@ def test_fill_smooth_target_edge(bench_case: BenchCase, derive_target: bool) -> 
     measurement's axis is the loop *count* -- not the rim length, and not the mesh size -- which
     the ``loops_dp`` meshes cap at 512, too few to register against the DP. The ``loops_dense``
     axis holds the vertex buffer fixed and multiplies the loop count by 16, and the gap between
-    the ``derived`` and ``explicit`` rows is exactly the derivation. Interleaved A/B at 8 192
-    loops on CUDA: within noise (100.3 against 101.7 ms min), against ~0.4 s of per-loop
-    ``.numpy()`` readbacks in the form it replaced -- the regression this group exists to catch,
+    the ``derived`` and ``explicit`` rows is exactly the derivation. Interleaved A/B at the top of
+    the axis: within noise, against hundreds of milliseconds of per-loop ``.numpy()`` readbacks in
+    the form it replaced -- the regression this group exists to catch,
     and one that lands in the *min* (deterministic host cost), where this box's occasional 3x
     clock-state excursions do not. ``explicit`` passes the mesh's mean edge length, which on a
     punched sphere is the value the derivation returns anyway, so the refine stage does identical
@@ -523,39 +501,20 @@ def test_fillable_loop_mask(bench_case: BenchCase) -> None:
     matching in ``tests/test_holes.py``). So the row is a **partial** comparison on the reference
     side and does strictly less work -- read it as a floor, not as a like-for-like.
 
-    First measurement, medians on an RTX 5090:
-
-    | mesh | triwarp-cuda | meshlib (pinch only) |
-    |---|---|---|
-    | ``bunny_decimated`` | 1.09 ms | 0.10 (10.7x) |
-    | ``bunny`` | 1.17 ms | 0.20 (5.8x) |
-    | ``dragon`` | 7.14 ms | 0.87 (8.2x) |
-    | ``lucy`` | 102.1 ms | (capped) |
-
-    The first version read each rim back separately and measured **14.09 ms** on ``dragon``; the
-    rims are concatenated on the device now and read in one transfer, which was **1.97x**. What is
+    The first version read each rim back separately; the rims are concatenated on the device now and
+    read in one transfer, which was worth about 2x. What is
     left is the chord sweep, which is a pass over every unique edge and so tracks the mesh -- there
     is no smaller correct version of that test, and it is the half meshlib does not do at all.
 
-    **Attributed per stage, which says the two benchmarked rows are floor rows and ``dragon`` is
-    not.** Medians on an RTX 5090:
-
-    | stage | ``bunny_decimated`` | ``bunny`` | ``dragon`` |
-    |---|---|---|---|
-    | whole call | 1.061 ms | 1.120 | 5.385 |
-    | ``edges_unique`` (the chord sweep) | **0.703 (66 %)** | **0.690 (62 %)** | 2.094 (39 %) |
-    | the per-rim host tables | 0.033 | 0.046 | **2.180 (40 %)** |
-    | concatenating the rims | 0.043 | 0.046 | 0.199 |
-
-    So the two benchmarked rows are **``edges_unique``** -- the shared unique/group stack, which has
-    its own group and its own floor, and which is flat here across a 4.3x face range, so it is that
-    stack's fixed cost rather than this function's. Nothing local can move them: even deleting the
-    chord test outright leaves ~0.4 ms against meshlib's 0.03-0.19 ms of cached-topology
-    arithmetic. Two things were taken because they were free rather than because they showed up:
-    the rim concatenation now re-uses the buffer ``boundary_loops`` already packed (``copy=False``,
-    see ``benchmarks/test_boundary.py::test_loop_perimeters``), worth **1.39x on ``dragon``**, and
-    an ``index_bound`` readback is gone because ``vertices`` already states the bound -- 0.096
-    ms, flat in the mesh, so 8 % of the small rows. ``dragon``'s remaining 40 % is a **Python loop
+    **Attributed per stage, the two benchmarked rows are floor rows.**
+    They are **``edges_unique``** -- the shared unique/group stack, which has its own group and its
+    own floor, and which is flat here across the face range, so it is that stack's fixed cost rather
+    than this function's. Nothing local can move them: even deleting the chord test outright leaves
+    a floor an order of magnitude above meshlib's cached-topology arithmetic. Two things were taken
+    because they were free rather than because they showed up: the rim concatenation now re-uses the
+    buffer ``boundary_loops`` already packed (``copy=False``, see
+    ``benchmarks/test_boundary.py::test_loop_perimeters``), and an ``index_bound`` readback is gone
+    because ``vertices`` already states the bound. ``dragon``'s remainder is a **Python loop
     over 407 rims** building two vertex-indexed tables, which is the one stage here with an
     algorithm left in it and the reason that row is not a floor row.
     """
@@ -587,12 +546,10 @@ def test_extend_hole(bench_case: BenchCase) -> None:
     round. The two agree exactly on the face and vertex counts and on the plane the new rim lands in
     (``tests/test_holes.py``).
 
-    First measurement, medians on an RTX 5090: **0.254 ms** on ``bunny`` against meshlib's 8.54
-    (**33.6x ahead**), 0.256 against 8.79 on ``bunny_decimated``, and **2.34 ms** on ``dragon``
-    against 53.57 (**22.9x**). The largest margin in this module, and it is structural rather than
-    clever: the extension is two launches over the rim while meshlib inserts the faces into a
-    halfedge structure one at a time. ``lucy`` reads 962 ms, where the two whole-mesh copies
-    dominate everything the rim does.
+    The largest margin in this module -- well over an order of magnitude ahead of meshlib at every
+    size -- and it is structural rather than clever: the extension is two launches over the rim
+    while meshlib inserts the faces into a halfedge structure one at a time. On the largest mesh the
+    two whole-mesh copies dominate everything the rim does.
     """
     height = float(bench_case.vertices_np[:, 2].max()) + 1.0
     if bench_case.kind == "meshlib":
@@ -633,18 +590,10 @@ def test_build_bottom(bench_case: BenchCase) -> None:
     batched launch set. The two agree on the counts and on where each base plane lands
     (``tests/test_holes.py``).
 
-    First measurement, medians on an RTX 5090:
-
-    | mesh | triwarp-cuda | meshlib |
-    |---|---|---|
-    | ``bunny`` | 0.419 ms | 12.31 (29.4x) |
-    | ``bunny_decimated`` | 0.438 ms | 11.09 (25.3x) |
-    | ``dragon`` | 1.74 ms | 67.59 (38.9x) |
-
-    Read against ``extend_hole``'s 0.254 / 0.256 / 2.34 ms on the same meshes: the plane fit adds
-    **0.16 ms** on the two bunnies and is *negative* on ``dragon`` (1.74 against 2.34), which is
-    session drift rather than a saving -- the two share every launch but the atomic-min pass and one
-    map over the loops, both of which track the rim. The fit is not the cost, which is what this row
+    Read against ``extend_hole`` on the same meshes: the plane fit adds a fraction of a millisecond
+    on the small ones and reads *negative* on the largest, which is session drift rather than a
+    saving -- the two share every launch but the atomic-min pass and one map over the loops, both of
+    which track the rim. The fit is not the cost, which is what this row
     was written to establish.
     """
     if bench_case.kind == "meshlib":
@@ -738,19 +687,10 @@ def test_bridge_edges_smooth(bench_case: BenchCase) -> None:
     never match exactly and the comparison is on the strips as surfaces
     (``tests/test_holes.py``).
 
-    First measurement, medians on an RTX 5090:
-
-    | mesh | triwarp-cuda | meshlib |
-    |---|---|---|
-    | ``bunny`` | 1.43 ms | 13.46 (9.4x) |
-    | ``bunny_decimated`` | 1.91 ms | 8.88 (4.7x) |
-    | ``dragon`` | 2.43 ms | 69.97 (28.9x) |
-    | ``lucy`` | 21.66 ms | (no rim pair) |
-
-    Against ``bridge_edges`` on the same pairs -- 0.886 / 0.948 / 8.66 / 22.52 ms -- the strip costs
-    **0.5 to 1.0 ms** and does not track the mesh, which is the flatness this row is here to check.
-    ``dragon`` is the one to read: the strip is *cheaper* there than on ``bunny`` in absolute terms
-    while the shared validation is 8.7 ms, so the two halves are cleanly separated.
+    Against ``bridge_edges`` on the same pairs, the strip costs well under a millisecond and does
+    not track the mesh, which is the flatness this row is here to check. The largest mesh is the one
+    to read: the strip is *cheaper* there than on a small one in absolute terms while the shared
+    validation dominates, so the two halves are cleanly separated.
     """
     corners = bench_case.faces_np.reshape(-1, 3)
     directed = np.concatenate([corners[:, [0, 1]], corners[:, [1, 2]], corners[:, [2, 0]]], axis=0)
@@ -791,50 +731,38 @@ def test_join_closest_components(bench_case: BenchCase) -> None:
     """
     Greedy nearest-link agglomeration over *open* shells: the driver, not the bridge.
 
-    **The axis is the join count, and the face count is very nearly free.** Measured at a fixed
-    ~81 900 faces, triwarp runs **9.0 / 37.2 / 152.7 ms** at 4 / 16 / 64 components -- 4.1x for
-    each 4x of components, i.e. linear in the ``k - 1`` joins. Holding the *components* fixed and
-    cutting the mesh instead barely moves it: 64 shells cost 148 ms at 81 856 faces and 150 ms at
-    20 416 (isolated probe, so read the ratio not the absolute), a 4x face reduction for 1 %. That
-    is the shape the function's own Notes
-    predict -- each round rebuilds the component labelling and the rim table from the updated face
-    buffer, and each of those is a fixed chain of wrapper calls whose launch overhead dominates the
-    per-face work at these sizes.
+    **The axis is the join count, and the face count is very nearly free.** At a fixed face count
+    triwarp is linear in the ``k - 1`` joins; holding the components fixed and cutting the mesh
+    instead barely moves it, a 4x face reduction costing a percent. That is the shape the function's
+    own Notes predict -- each round rebuilds the component labelling and the rim table from the
+    updated face buffer, and each is a fixed chain of wrapper calls whose launch overhead dominates
+    the per-face work at these sizes.
 
-    So this group exists to watch the **round count times the per-round chain**, and anything that
-    moves it will be a launch removed from that chain rather than a faster kernel. One such change
-    is already in: the pair selection and ``bridge_edges``' rim check used to build the same
-    oriented boundary table twice per round, which was 13.5-15 % of the call.
+    So this group watches the **round count times the per-round chain**, and anything that moves it
+    will be a launch removed from that chain rather than a faster kernel. One such change is already
+    in: the pair selection and ``bridge_edges``' rim check used to build the same oriented boundary
+    table twice per round, which was a seventh or so of the call.
 
     A closed lattice cannot serve this. ``parts_64`` returns **0 bridges** -- a shell with no
     boundary has nothing to bridge to and is left alone by design -- so the ``components`` axis
     would time a no-op, which is why ``open_components`` exists and drops one face per shell.
-
-    First measurement, harness medians on an RTX 5090:
-
-    | mesh | triwarp-cuda | pymeshfix |
-    |---|---|---|
-    | ``open_parts_4`` | **9.0 ms** | 377.7 (42.0x) |
-    | ``open_parts_16`` | **37.2 ms** | 968.7 (26.0x) |
-    | ``open_parts_64`` | **152.7 ms** | 3 065.5 (20.1x) |
 
     The ratio *narrows* with the join count because triwarp's per-round chain is the launch-bound
     part while MeshFix's is sequential C++ over a halfedge structure it already holds -- the gap is
     widest where triwarp's fixed overhead is amortized least.
 
     pymeshfix's row is timed rather than declared because the operation clears its load by a wide
-    margin, which is the ~30 % rule in ``conftest``'s LIBRARIES block: **51.4 % / 75.9 / 90.6** of
-    the round at 4 / 16 / 64 components (load 152.3 / 229.2 / 284.3 ms). That split is an isolated
-    measurement, since the harness can only time the whole callable -- the load cannot leave it, a
-    ``PyTMesh`` taking exactly one ``load_array``. So read the row as join-plus-load and subtract
-    accordingly, most of all at the 4-component point, where the load is over half of it and the
-    42.0x above correspondingly overstates the algorithmic gap.
+    margin, which is the ~30 % rule in ``conftest``'s LIBRARIES block -- from half the round at the
+    fewest components to nearly all of it at the most. That split is an isolated measurement, since
+    the harness can only time the whole callable: the load cannot leave it, a ``PyTMesh`` taking
+    exactly one ``load_array``. So read the row as join-plus-load and subtract accordingly, most of
+    all at the few-component point, where the load is over half of it and the reported ratio
+    correspondingly overstates the algorithmic gap.
 
     Both sides add exactly ``2 * (k - 1)`` faces and no vertices, which is what the assertions
-    check: a driver that fanned a rim or joined the wrong number of shells fails on the count.
-    ``tests/test_holes.py::test_join_closest_components_matches_pymeshfix`` is the parity claim and
-    compares the same counts, because the two pick different incident edges to bridge and so need
-    not produce the same two triangles.
+    check: a driver that fanned a rim or joined the wrong number of shells fails on the count. The
+    parity claim compares the same counts, because the two pick different incident edges to bridge
+    and so need not produce the same two triangles.
     """
     n_faces = bench_case.n_faces
     n_components = _OPEN_COMPONENT_COUNTS[bench_case.mesh_name]

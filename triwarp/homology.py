@@ -178,7 +178,7 @@ def _primal_spanning_tree(
     which the tree never reaches; ``distances`` holds the depth, or ``-1`` for the same vertices.
 
     **The root is the lowest-indexed *referenced* vertex, read on the device rather than handed in**
-    -- one host readback the call no longer takes. Rooting at vertex 0 unconditionally is the bug
+    -- one host readback the call does not take. Rooting at vertex 0 unconditionally is the bug
     that avoids: on a mesh whose vertex 0 carries no edges the "tree" is a single isolated node,
     every primal edge becomes a generator, and the count comes back enormous rather than
     wrong-looking. [`edges_unique`][triwarp.edges.edges_unique] returns its rows lexicographically

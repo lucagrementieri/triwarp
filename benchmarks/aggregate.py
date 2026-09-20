@@ -7,25 +7,19 @@ against the *minimum* median over the non-triwarp libraries in the cell.
 The median is the comparison statistic, but it is not self-certifying: pytest-benchmark's
 ``rounds`` drops to 3 for the slowest groups, and at n=3 the median *is* the middle sample, so a
 single one-off (a Warp module load, a scheduler hiccup) lands on it and cannot be averaged out.
-One round's only apparent regression -- ``marching_triangles[sphere_large]`` at a reported
-3.25x -- was exactly that: min=3.092, med=9.770, max=9.777 over 3 rounds, i.e. the floor had not
-moved at all while two of three samples carried ~6.7 ms of one-off cost. A whole bisect was
-planned against it.
+One round's only apparent regression was exactly that: the *minimum* had not moved at all while two
+of three samples carried a one-off cost. A whole bisect was planned against it.
 
 So ``--suspect`` prints every cell whose median exceeds its own minimum by more than a factor,
 and it should be read *before* the loss table. On the triwarp side it is a cheap guard rather than
-a common problem: over one round's 1 437 triwarp cells exactly **two** exceeded 1.5x, and only one
-of those mattered.
+a common problem: over a whole round's triwarp cells only a couple exceed the threshold.
 
 It flags *reference* cells too, and those tilt the table the other way -- an inflated reference
-median makes triwarp look better than it is. One round had several, led by
-``bvh_from_points[bunny-igl-4]`` at **7.72x** (min 28.704 ms, median 221.460) and four
-``query_nearest_*[bunny-igl]`` rows at 2.2-3.1x. Before reading a *win* against one of those as
-real, check the reference's own min.
+median makes triwarp look better than it is, and the worst offenders are the references whose cost
+is dominated by Python object churn. Before reading a *win* against one of those as real, check the
+reference's own min.
 
-This module is the single source of truth for that grouping logic -- it replaces five
-near-identical copies that had accumulated under ``plans/benchmark-round-{7..11}-data/`` (byte
-identical from round 9 onward; the two before that differed only in a docstring). Both consumers
+This module is the single source of truth for that grouping logic, and both consumers
 share it: this file's own CLI keeps the plain-text loss table
 (``uv run python -m benchmarks.aggregate <json_dir>``), and ``benchmarks/plot_comparison.py``
 imports ``load()`` directly rather than re-parsing JSON.

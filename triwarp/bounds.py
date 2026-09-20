@@ -102,7 +102,7 @@ def aabb_union(
     """
     # Componentwise ``min`` / ``max`` in plain Python rather than ``wp.min`` / ``wp.max``: this
     # function does no device work at all, so Warp's Python-scope builtin dispatch was its entire
-    # cost -- measured 21.38 us against 2.75 for this spelling (7.6x), byte-identical. A ``wp.vec3``
+    # cost, and the plain spelling is several times cheaper and byte-identical. A ``wp.vec3``
     # indexes to a native ``float``, which is what makes the plain builtins applicable.
     return (
         wp.vec3(min(a_min[0], b_min[0]), min(a_min[1], b_min[1]), min(a_min[2], b_min[2])),
@@ -168,7 +168,7 @@ def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | Non
     # Taken in NumPy, on the buffer the readback already produced, rather than through two
     # ``wp.vec3`` constructions and ``wp.length``: every Warp operator and builtin at *Python*
     # scope routes through Warp's builtin dispatch (``inspect.signature().bind()`` per operand),
-    # measured 19.07 us for the Warp spelling against 1.42 here. Section 13.1 has the table.
+    # an order of magnitude dearer than this. Section 13.1 has the cost model.
     corners_np = corners.numpy()
     return float(np.linalg.norm(-corners_np[3:] - corners_np[:3]))
 
@@ -488,6 +488,7 @@ def oriented_bounding_box(
     refine_iterations: int = 8,
 ) -> tuple[wp.mat33, wp.vec3, wp.vec3]:
     """
+
     Smallest bounding box over sampled orientations, sharpened by local refinement, and its frame.
 
     The box is searched, not solved, in two phases. The **global phase** scores ``rotations``
@@ -509,6 +510,7 @@ def oriented_bounding_box(
     point that provably cannot touch the box, so both phases run on the few hull-candidate
     survivors and the cost stops growing with the cloud (the box is identical: the mask keeps
     every hull vertex and the extents are order-independent reductions over them).
+
 
     Parameters
     ----------
@@ -548,8 +550,8 @@ def oriented_bounding_box(
     Notes
     -----
     The whole search runs on the device: candidate frames, extents, the objective, the argmin that
-    picks the chains, the perturbed frames each round composes, and the per-chain selection. One
-    row of the winning chain comes back at the end, and that is the only host traffic.
+    picks the chains, the perturbed frames each round composes, and the per-chain selection. One row
+    of the winning chain comes back at the end, and that is the only host traffic.
 
     **The result is a converged local minimum, not a certified global one.** Certifying the true
     minimum-volume box requires the exact-arithmetic search over the convex hull's face and edge
@@ -557,15 +559,14 @@ def oriented_bounding_box(
     What the sampling-plus-refinement search gives up is the *certificate*, not the volume: the
     global phase lands in the optimum's basin whenever the grid's covering radius resolves it,
     refinement converges within the basin, and the refined default ties or beats hull-based
-    reference methods on volume across a range of test shapes (tilted/stretched icosahedron, cube
-    shell, hemisphere, half torus).
-    A pathological cloud whose optimum basin is narrower than the covering radius of ``rotations``
-    samples can still hide its box from this search; raise ``rotations`` if the input is a
-    near-symmetric polyhedron far from any sampled orientation.
+    reference methods on volume across a range of test shapes. A pathological cloud whose optimum
+    basin is narrower than the covering radius of ``rotations`` samples can still hide its box from
+    this search; raise ``rotations`` if the input is a near-symmetric polyhedron far from any
+    sampled orientation.
 
-    Neither hull-based reference is an oracle for the minimum either: on a stretched icosahedron
-    the refined search returns **less** volume than both, because the hull-face-flush restriction
-    misses optima whose box touches only edges and vertices.
+    Neither hull-based reference is an oracle for the minimum either: on a stretched icosahedron the
+    refined search returns **less** volume than both, because the hull-face-flush restriction misses
+    optima whose box touches only edges and vertices.
 
     See Also
     --------
@@ -663,10 +664,10 @@ _REFINE_CANDIDATES = 128
 _REFINE_WINDOW = 32
 
 # The seeding walk is a single block, so this is its whole width -- and the walk is dominated by
-# the scan rather than by its per-round ``tile_argmin`` pair, so it wants a wide one: measured
-# 45.8 / 26.7 / 19.3 / 19.4 / 20.8 us at 32 / 64 / 128 / 256 / 512, with the chains identical at
-# every width. 256 rather than the 128 that ties with it because it is Warp's default, so the
-# module is not loaded a second time for a second ``block_dim`` (section 2.5).
+# the scan rather than by its per-round ``tile_argmin`` pair, so it wants a wide one: the sweep is
+# flat from here up, with the chains identical at every width. 256 rather than the 128 that ties
+# with it because it is Warp's default, so the module is not loaded a second time for a second
+# ``block_dim`` (section 2.5).
 _SEED_BLOCK_DIM = 256
 _BOX_OBJECTIVES: dict[str, wp.int32] = {
     "volume": kernel_bounds.BOX_OBJECTIVE_VOLUME,

@@ -24,8 +24,8 @@ Five functions, three shapes of work, and the split is what the rows are for.
   ``thickness`` run over the mesh's *own* vertices rather than a 10 000-point subsample, and it
   exists for one reason: it is the only shape MeshLib can be timed in. Its
   ``computeRayThicknessAtVertices`` takes no query set -- it answers at every vertex, in parallel
-  over all cores -- so a row against the subsampled group would price a different number of queries
-  (3.6x more on ``bunny``), the reason section 6 bars ``findNClosestPointsPerPoint`` from
+  over all cores -- so a row against the subsampled group would price a different number of
+  queries, the reason section 6 bars ``findNClosestPointsPerPoint`` from
   ``query_nearest_bvh_k7``. Read it against ``thickness_interior`` for the per-query cost and
   against MeshLib for the one fair CPU-versus-GPU comparison this module has.
 
@@ -36,8 +36,8 @@ MeshLab's
 is a benchmark gap rather than an API one. Recorded in ``benchmarks/README.md``.
 
 Two caveats for reading the pymeshlab rows. ``compute_scalar_by_shape_diameter_function_per_vertex``
-is the most expensive per-vertex filter MeshLab ships (674 ms on ``bunny``) and its
-``cone_amplitude`` parameter is a **no-op** in the 2025.07 build -- byte-identical output at 90 and
+is the most expensive per-vertex filter MeshLab ships and its ``cone_amplitude`` parameter is a
+**no-op** in the 2025.07 build -- byte-identical output at 90 and
 120 degrees -- so its cone is whatever it is. Both filters write only the vertex scalar attribute,
 so the MeshSet is shared rather than rebuilt per call. Open3D has no equivalent for anything here.
 
@@ -205,9 +205,8 @@ def test_thickness_interior(bench_case: BenchCase, method: Literal["ray", "max_s
     ``trimesh.proximity.thickness`` is the reference, and it is the one that fits *this* group
     rather than ``thickness_at_vertices``: it takes a **query set** and a ``method=`` switch with
     the same two values, which is exactly what MeshLib's whole-vertex-buffer form cannot do and why
-    that second group had to exist. ``tests/test_visibility.py`` already carried the Class-A
-    comparison for both branches -- the module docstring used to say Open3D had no equivalent and
-    then never mention that trimesh is the oracle for two of the five functions here.
+    that second group had to exist. ``tests/test_visibility.py`` carries the Class-A comparison for
+    both branches; trimesh is the oracle for two of the five functions here.
 
     **Read the per-query cost, not the row.** trimesh runs at ``_N_QUERIES_TM`` queries against
     triwarp's 10 000, because its ``max_sphere`` branch is a Python loop over closest-point queries;
@@ -267,9 +266,9 @@ def test_thickness_at_vertices(bench_case: BenchCase) -> None:
     query set, so it can be asked at every vertex here *and* at the subsample in
     ``thickness_interior`` -- which makes the pair of groups readable as one query-count axis with
     the same reference on both ends, the thing MeshLib's no-query-set form cannot provide. Its
-    normals are its own ``vertex_normals``, the angle-weighted convention both other rows use.
-    Single-threaded over embree at ~5 us/vertex (measured 15.2 ms at 2 562 vertices and 52.4 ms at
-    10 242), so it is capped at ``bunny``.
+    normals are its own ``vertex_normals``, the angle-weighted convention both other rows use. It is
+    single-threaded over embree and cleanly linear in the vertex count, so it is capped at
+    ``bunny``.
     """
     if bench_case.kind == "trimesh":
         skip_larger_than(bench_case, "bunny", "trimesh casts one ray per vertex on one core")

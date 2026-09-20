@@ -27,8 +27,8 @@ whole bounding box, the sparse side only for the occupied cells. ``voxel.ops.mul
 NumPy array. It shares trimesh's input verbatim, so the ``dilate`` group reads as one sparse GPU
 grid against two dense CPU passes over the identical occupancy. Its bitset **mutates**, so the row
 rebuilds it every round -- through ``pedantic``'s untimed ``setup`` rather than inside the timed
-callable, the one row in the suite that needs the distinction (0.30 ms to load against a 0.22 ms
-dilation on ``bunny``; ``BenchLibrary.run`` says why).
+callable, the one row in the suite that needs the distinction -- the load costs more than the
+dilation it precedes, so folding it in would report the load (``BenchLibrary.run`` says why).
 
 **libigl** covers the two lattice functions, ``grid`` and ``unique_sparse_voxel_corners``. Both are
 single-core C++ over the same integer arithmetic, so they read as a bandwidth comparison.
@@ -43,14 +43,14 @@ What has no group, and why
 ``from_cells``, ``grid_transform``, ``cell_indices``, ``cell_centers``,
 ``occupancy_at_cells``, ``erode``, ``surface_voxels``, ``to_dense``, ``from_dense`` and
 ``to_field`` are each one launch over the voxel set with no allocation of their
-own, so a row would time the ~340 µs wrapper floor rather than the operation. Most are measured
-anyway through a group that calls them: ``fill_cavities`` and ``fill_orthographic`` both go through
+own, so a row would time the wrapper floor rather than the operation. Most are covered anyway
+through a group that calls them: ``fill_cavities`` and ``fill_orthographic`` both go through
 ``to_dense`` / ``from_dense``, and ``surface_voxels`` runs the same probe kernel as ``erode``.
 
-``cells`` was on that list and has been taken off it, because for ``order="sorted"`` the wrapper
-floor *is* the operation at every size measured -- 322 µs at 1e3 voxels and 380 µs at 4.4e5, a
-1.2x spread over a 440x input -- so "the row would time the floor" is a reason to keep the row
-rather than to drop it. That is what caught the two host readbacks the bound stage used to make.
+``cells`` is the exception, because for ``order="sorted"`` the wrapper floor *is* the operation at
+every size -- flat over three orders of magnitude of voxel counts -- so "the row would time the
+floor" is a reason to keep the row rather than to drop it. That is what caught the two host
+readbacks the bound stage used to make.
 
 ``surface_voxels`` has no reference row either: ``trimesh.voxel.morphology.surface`` exists, but it
 is the ``erode`` complement on a dense array and would measure the same thing the ``dilate`` row
@@ -131,8 +131,8 @@ def test_voxelize_mesh(bench_case: BenchCase, divisor: int) -> None:
     ``dimensions`` the divisor implies rather than a cell width: it is sized by grid extent, not by
     pitch. It fills the interior, so read it against triwarp's ``mode="solid"`` cost rather than the
     surface row timed here -- the containment relation between the two answers is pinned in
-    ``tests/test_voxels.py``. Measured 502 ms at 64 cubed on an 82k-face mesh, so it is capped at
-    ``bunny``.
+    ``tests/test_voxels.py``. It runs to hundreds of milliseconds at the coarse lattice, so it is
+    capped at ``bunny``.
     """
     voxel_size = _voxel_size(bench_case, divisor)
     origin = bench_case.vertices_np.min(axis=0) - 0.5 * voxel_size
@@ -142,7 +142,7 @@ def test_voxelize_mesh(bench_case: BenchCase, divisor: int) -> None:
         # row does strictly more than the surface rows: it evaluates a signed distance within
         # ``surfaceOffset`` voxels of the surface instead of accepting or rejecting each cell. The
         # offset is left at its default of 3 voxels, which is the band width the geometry
-        # comparison in ``tests/test_voxels.py`` is measured at. It takes a ``MeshPart`` over a mesh
+        # comparison in ``tests/test_voxels.py`` is checked at. It takes a ``MeshPart`` over a mesh
         # it does not own, so the mesh is held in a name for the row's lifetime.
         skip_larger_than(bench_case, "bunny", "the band is rasterized on the CPU")
         mesh_ml = bench_case.new_mesh_ml()
@@ -207,9 +207,9 @@ def test_voxelize_points(bench_case: BenchCase) -> None:
     """
     Pure ``N``: bin a cloud and deduplicate, with the pitch pinned so only the point count moves.
 
-    This is where the grid build itself is regression-guarded — measured at 0.64 ms per million
-    cells on an RTX 5090 against 1.51 ms for the equivalent ``grouping.unique_rows`` dedup, which
-    is the measurement the whole module's data structure choice rests on.
+    This is where the grid build itself is regression-guarded: it is markedly cheaper than the
+    equivalent ``grouping.unique_rows`` dedup, which is what the module's data structure choice
+    rests on.
     """
     voxel_size = _voxel_size(bench_case, _MORPHOLOGY_DIVISOR)
     if bench_case.kind == "open3d":
@@ -283,9 +283,8 @@ def test_cells(bench_case: BenchCase, order: str) -> None:
 
     No reference row: open3d's ``get_voxels`` returns a Python list of ``Voxel`` objects, so a row
     would time the object churn rather than the readout. This is the one group here whose axis is
-    not really the mesh -- both orders stay **host-bound at every voxel count measured** (322 to
-    380 us from 1e3 to 4.4e5 voxels), which is why the group exists at all: it is where a wrapper
-    -floor change shows up.
+    not really the mesh -- both orders stay **host-bound at every voxel count** -- which is why the
+    group exists at all: it is where a wrapper-floor change shows up.
     """
     voxel_size = _voxel_size(bench_case, _MORPHOLOGY_DIVISOR)
     grid = tw.voxels.voxelize_points(bench_case.vertices_wp, voxel_size)
@@ -346,13 +345,13 @@ def _voxel_mask_ml(occupancy_np: np.ndarray) -> mm.VoxelBitSet:
     The benchmark-side twin of ``tests.conversions.numpy_to_meshlib_bitset`` (the two suites do not
     import each other). ``BitSet.fromBlocks`` takes the packed ``uint64`` blocks through a
     ``std_vector_unsigned_long``, which is why this is one ``np.packbits`` and not a per-cell
-    ``set()`` loop -- 0.30 ms rather than 85 ms on ``bunny``'s dense box. ``VolumeIndexer`` decodes
+    ``set()`` loop -- two orders of magnitude cheaper. ``VolumeIndexer`` decodes
     ``x + dims.x * y + dims.x * dims.y * z``, so ``x`` runs fastest and the array flattens with
     ``order="F"``; ``fromBlocks`` rounds up to whole blocks, so the size is trimmed back after.
 
     This is ``setup`` work, not timed work: ``expandVoxelsMask`` **mutates** the bitset, so every
-    round needs a fresh one, and at 0.30 ms against a 0.22 ms dilation, building it inside the timed
-    callable would report the load instead of the morphology.
+    round needs a fresh one, and since the load costs more than the dilation, building it inside the
+    timed callable would report the load instead of the morphology.
     """
     packed_np = np.packbits(occupancy_np.ravel(order="F"), bitorder="little")
     packed_np = np.pad(packed_np, (0, (-packed_np.size) % 8)).view(np.uint64)
@@ -373,8 +372,9 @@ def test_dilate(bench_case: BenchCase) -> None:
     """
     Grow the set by one shell: a ``(k + 1) * n_voxels`` candidate buffer against dense ndimage.
 
-    The candidate buffer is what to watch here — it is 27 ``vec3`` per voxel at
-    ``connectivity=26``, 324 MB at a million voxels, and the reason 6 is the default. trimesh's
+    The candidate buffer is what to watch here -- it is 27 ``vec3`` per voxel at
+    ``connectivity=26``, hundreds of megabytes at a million voxels, and the reason 6 is the default.
+    trimesh's
     reference is ``scipy.ndimage.binary_dilation`` over the *dense* bounding box, so the two sides
     scale with different quantities and the gap widens with sparsity.
 
@@ -477,9 +477,9 @@ def test_to_boxes(bench_case: BenchCase) -> None:
     so the comparison is like for like.
 
     pyvista reaches the same answer through ``glyph(geom=pv.Cube(), scale=False, orient=False)``,
-    which is VTK's template-instancing filter and so belongs with trimesh on the unwelded side --
-    measured **exactly 12 triangles per centre** after ``.triangulate()`` (2 244 quads from 374
-    centres), the same ``12 n`` ``multibox`` emits. ``scale=False`` and ``orient=False`` are both
+    which is VTK's template-instancing filter and so belongs with trimesh on the unwelded side:
+    **exactly 12 triangles per centre** after ``.triangulate()``, the same ``12 n`` ``multibox``
+    emits. ``scale=False`` and ``orient=False`` are both
     load-bearing: left at their defaults the filter reads a scalar and a vector array off the cloud
     and would size and rotate each cube. The ``.triangulate()`` is inside the row because without it
     the output is quads and the counts are not comparable with either other side.
@@ -521,7 +521,7 @@ def test_voxel_corners(bench_case: BenchCase) -> None:
     igl's ``unique_sparse_voxel_corners`` builds all ``8 n`` candidate subscripts, packs each into
     an ``int64`` code and runs ``igl::unique`` over them. triwarp builds none of that: the nanogrid
     geometry derives its vertex grid from the cell grid, and the per-cell indices are eight ``O(1)``
-    probes. The geometry construction (~1.2 ms at 179k voxels) is the fixed cost on this row.
+    probes. The geometry construction is the fixed cost on this row.
     """
     voxel_size = _voxel_size(bench_case, _MORPHOLOGY_DIVISOR)
     if bench_case.kind == "igl":

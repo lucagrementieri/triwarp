@@ -404,7 +404,7 @@ def face_adjacency_unshared(
     # Both branches end in one launch over ``m`` adjacency rows writing one ``(m, 2)`` buffer, so
     # the two differ only in the kernel and the table it reads. Resolving that first, and letting a
     # single ``m == 0`` return cover an empty mesh, an empty adjacency and an empty supplied table
-    # alike, is what keeps the empty case to *one* allocation: deriving used to build an empty
+    # alike, is what keeps the empty case to *one* allocation rather than building an empty
     # ``edge_groups`` only to size an empty output off it.
     if face_adjacency is None:
         edge_groups = _edge_groups(faces, None, n_vertices) if int(faces.shape[0]) >= 3 else None
@@ -580,10 +580,9 @@ def face_adjacency_projections(
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     # The pairing check runs *before* the empty-mesh guard, so a caller who passed only one half
-    # of the pair is told about it whatever the mesh is -- the four wrappers that take this pair
-    # used to disagree about that, two validating first and two returning empty first. The
-    # *resolve* stays below the guard, because on an empty mesh it would allocate two empty tables
-    # nothing reads.
+    # of the pair is told about it whatever the mesh is, and the four wrappers that take this pair
+    # agree about that. The *resolve* stays below the guard, because on an empty mesh it would
+    # allocate two empty tables nothing reads.
     require_paired_adjacency(face_adjacency, face_adjacency_edges)
     if n_faces == 0:
         return wp.empty(0, dtype=wp.float32, device=device)

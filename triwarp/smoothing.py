@@ -8,15 +8,15 @@ Most of the module moves *geometry*: [`filter_laplacian`][triwarp.smoothing.filt
 [`filter_mut_dif_laplacian`][triwarp.smoothing.filter_mut_dif_laplacian] and
 [`filter_implicit_fairing`][triwarp.smoothing.filter_implicit_fairing] all diffuse vertex positions
 through the same row-stochastic 1-ring operator, differing in the time integration and in what they
-do to counteract shrinkage. [`smooth_region`][triwarp.smoothing.smooth_region]
-and its sharp-boundary variant instead solve a Dirichlet problem over a *region*, holding the rest
-of the mesh fixed.
+do to counteract shrinkage. [`smooth_region`][triwarp.smoothing.smooth_region] and its
+sharp-boundary variant instead solve a Dirichlet problem over a *region*, holding the rest of the
+mesh fixed.
 
-Three functions break that pattern by working on the *normal* field instead of positions, which is
-what lets them keep a crease sharp: [`filter_normals`][triwarp.smoothing.filter_normals] diffuses
-face normals with a crease gate, [`filter_two_step`][triwarp.smoothing.filter_two_step] then refits
-the vertices to them, and [`filter_sharpen`][triwarp.smoothing.filter_sharpen] runs the
-whole idea backwards to *sharpen*.
+Three functions work on the *normal* field instead of positions, which is what lets them keep a
+crease sharp: [`filter_normals`][triwarp.smoothing.filter_normals] diffuses face normals with a
+crease gate, [`filter_two_step`][triwarp.smoothing.filter_two_step] then refits the vertices to
+them, and [`filter_sharpen`][triwarp.smoothing.filter_sharpen] runs the whole idea backwards to
+*sharpen*.
 
 A second group relaxes toward something *other* than a Laplacian residual, which is what lets each
 member fix a failure the filters above cannot see:
@@ -31,21 +31,19 @@ confined to where it is wanted and kept within a tolerance of the surface it sta
 [`smooth_region_boundary`][triwarp.smoothing.smooth_region_boundary] completes the region trio by
 smoothing the region's *rim curve*, where the two above it smooth across the rim or inside it.
 
-**The verb tracks the mechanism, not the group**, which is why that second group spans three of
-them. ``filter_*`` runs a fixed operator to a schedule -- an assembled Laplacian, a normal-field
-pass, a windowed Taubin pair -- so the answer is a function of the operator and the iteration count.
-``relax_*`` iterates against a *geometric* objective and re-derives its target every pass, which is
-why those take a ``max_displacement`` bound: there is nothing in the mechanism that keeps the result
-near the input. ``equalize_triangle_areas`` and ``smooth_region*`` name their objective outright
-because there is only one of each. By that axis
+**The verb tracks the mechanism, not the group.** ``filter_*`` runs a fixed operator to a schedule
+-- an assembled Laplacian, a normal-field pass, a windowed Taubin pair -- so the answer is a
+function of the operator and the iteration count. ``relax_*`` iterates against a *geometric*
+objective and re-derives its target every pass, which is why those take a ``max_displacement``
+bound: nothing in the mechanism keeps the result near the input. ``equalize_triangle_areas`` and
+``smooth_region*`` name their objective outright because there is only one of each. By that axis
 [`filter_spikes`][triwarp.smoothing.filter_spikes] is correctly a ``filter_*``: it runs the same
-fixed 1-ring operator the filters above it do, and only its *selection* is geometric. It sits in the
-paragraph above because its selection is what makes it useful, not because it is a relaxation.
+fixed 1-ring operator, and only its *selection* is geometric.
 
 [`filter_scalar_laplacian`][triwarp.smoothing.filter_scalar_laplacian] runs the same operator over a
 per-vertex **scalar** field rather than positions. Capping how fast such a field may vary along an
-edge — the other half of turning a raw scalar into a usable sizing field — is not a smoothing filter
-at all but a one-sided Lipschitz projection, and lives in
+edge -- the other half of turning a raw scalar into a usable sizing field -- is not a smoothing
+filter at all but a one-sided Lipschitz projection, and lives in
 [`shortest_path_envelope`][triwarp.graph.shortest_path_envelope].
 """
 
@@ -167,7 +165,7 @@ def filter_laplacian(
             system, components, solutions, tol=twl.CG_TOLERANCE, maxiter=10 * n
         )
         # Both column lists are viewed once: ``components`` / ``solutions`` are allocated above and
-        # never rebound, so re-slicing them inside the pass loop is ~3 us of
+        # never rebound, so re-slicing them inside the pass loop is a few microseconds of
         # ``wp.array.__getitem__`` per view per pass and nothing else.
         component_rows = [components[column] for column in range(3)]
         solution_rows = [solutions[column] for column in range(3)]
@@ -568,7 +566,7 @@ def filter_spikes(
         # One readback per pass, and it is the stopping test: whether any vertex is still a spike is
         # a device-side fact that a Python loop cannot branch on otherwise. ``reduce.sum`` counts a
         # ``wp.bool`` mask directly, so widening it to ``int32`` first would allocate ``4n`` bytes
-        # and run an ``array_cast`` for nothing -- measured 105.1 against 53.3 us (1.97x).
+        # and run an ``array_cast`` for nothing, at roughly twice the cost.
         n_spikes = int(tw.reduce.sum(spikes))
         if n_spikes == 0:
             break
@@ -1424,7 +1422,7 @@ def filter_implicit_fairing(
     solutions = _component_columns(n, device)
     # All three column lists are viewed once. The buffers are allocated here and never rebound --
     # only the *operator* is rebuilt each pass, which is what the note in the loop is about -- so
-    # re-slicing them per pass was ~6 views of ~3 us each, per iteration, buying nothing.
+    # re-slicing them per pass was half a dozen views an iteration, buying nothing.
     component_rows = [components[column] for column in range(3)]
     rhs_rows = [rhs[column] for column in range(3)]
     solution_rows = [solutions[column] for column in range(3)]
@@ -1799,17 +1797,15 @@ def smooth_region(
     # of range. That is harmless to ``bsr_mm`` and ``bsr_transposed``, which treat the field as a
     # bound rather than as a count, but nothing downstream may be sized off it (section 3.7).
     #
-    # The transpose used to be a second ``bsr_from_triplets`` over the same triplets with the two
-    # index arrays swapped, plus three ``wp.clone``s to feed it. ``bsr_transposed`` is exact on an
-    # operand of this shape and says in one call what the swap said in five lines.
+    # ``bsr_transposed`` is exact on an operand of this shape and says in one call what a second
+    # ``bsr_from_triplets`` over the same triplets with the index arrays swapped, plus three
+    # ``wp.clone``s to feed it, says in five lines.
     #
-    # **Not a speed change, and the number is here so it is not re-proposed as one.** Interleaved
-    # against the swapped-triplet build at the benchmark's own operating point (the top quarter by
-    # z of an icosphere, min of 4 rounds of 10), it is 1.16x / 1.14x / 1.09x on the step at 2 562 /
-    # 10 242 / 40 962 vertices -- which is 0.41% / 0.19% / 0.05% of the whole call, a share that
-    # *falls* as the mesh grows and is therefore a decline by section 9's rule. What it buys is one
-    # concept fewer and three fewer buffers; the assembled system is bit-identical at all three
-    # sizes (max |delta| exactly 0.0 over the sorted values, same nnz).
+    # **Not a speed change, and this is here so it is not re-proposed as one.** Interleaved against
+    # the swapped-triplet build it is a small win on the step itself and a fraction of a percent of
+    # the whole call, a share that *falls* as the mesh grows and is therefore a decline by section
+    # 9's rule. What it buys is one concept fewer and three fewer buffers; the assembled system is
+    # bit-identical.
     m_matrix = wps.bsr_from_triplets(n_rows, n_free, rows, cols, vals, prune_numerical_zeros=False)
     mt_matrix = wps.bsr_transposed(m_matrix)
     system = wps.bsr_mm(mt_matrix, m_matrix)

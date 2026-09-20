@@ -24,9 +24,9 @@ rather than a loud one:
 
 The first two agree on everything but the translation, so a normal pushed through
 [`transform_vectors`][triwarp.transform.transform_vectors] is *correct under any isometry* and
-tilts off the surface under a shear or a non-uniform scale -- measured 37 degrees off on a
-``diag(2, 1, 1)`` scale of the plane ``x + y = 0``. Only unit scale hides it, which is why the
-distinction gets its own entry point.
+tilts off the surface under a shear or a non-uniform scale -- tens of degrees off under an
+ordinary axis scale. Only unit scale hides it, which is why the distinction gets its own entry
+point.
 
 See Also
 --------
@@ -283,7 +283,7 @@ def transform_normals(
     require_same_device(normals=normals, matrix=matrix, out=out)
     # Computed before the empty-input early return: the matrix's own invertibility is a property
     # of `matrix` alone, not of how many normals there are, so a zero-length `normals` must not
-    # silently skip it (it used to, via `normal_matrix`'s only call site sitting below the guard).
+    # silently skip it.
     linear_normal_matrix = normal_matrix(matrix)
     result = _alloc_or_out(out, int(normals.shape[0]), wp.vec3, normals.device)
     if int(normals.shape[0]) == 0:

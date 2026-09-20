@@ -348,9 +348,9 @@ def collect_rim_links(
     # vertex two rim loops pass through one point, so a per-vertex ``next`` / ``prev`` / ``face``
     # triple has two writers and no answer, and the three slots could be won by different halfedges
     # so that the fold-over normal gate tested a face not bordering the candidate triangle at all
-    # (measured: ``prev[2]`` read 4 on cpu and 1 on cuda:0 for one five-vertex bowtie). Per
-    # halfedge each slot has exactly one writer, both rim loops keep their own links, and the
-    # bordering faces are read off the halfedges themselves rather than from a third table.
+    # (measured: the two devices disagreed on one five-vertex bowtie). Per halfedge each slot has
+    # exactly one writer, both rim loops keep their own links, and the bordering faces are read off
+    # the halfedges themselves rather than from a third table.
     h = wp.int32(wp.tid())
     if twins[h] >= 0:
         return
@@ -448,9 +448,9 @@ def flatten_degree3_positions(
     # what makes the centroid the answer rather than an approximation of it: two such vertices can
     # be neighbours (a tetrahedron is four of them, each adjacent to the other three), and moving
     # both at once puts neither in the other's *new* plane. Doing it anyway maps the regular
-    # tetrahedron to minus a third of itself -- mirrored, every normal flipped and the signed
-    # volume negated, measured -2.667 in and +0.099 out -- which is why the caller runs
-    # ``select_independent_degree3`` first rather than launching this over every candidate.
+    # tetrahedron to a mirrored fraction of itself -- every normal flipped and the signed volume
+    # negated -- which is why the caller runs ``select_independent_degree3`` first rather than
+    # launching this over every candidate.
     #
     # The divisor is a literal 3 because ``selected`` implies interior valence 3; the ring walk is
     # over ``ring_offsets`` all the same, so a stale mask cannot make it read past the ring.

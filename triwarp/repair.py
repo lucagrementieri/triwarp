@@ -14,16 +14,15 @@ Five defects are visible in the index buffer alone, and each has a remover:
 
 A sixth remover answers a different question -- not *which elements are wrong* but *which parts of
 the mesh are not the mesh*: [`remove_small_components`][triwarp.repair.remove_small_components]
-drops face-connected components that are too small, by face count, area or bounding-box diameter.
-It is the first step of every repair pipeline, and the debris it removes is not defective in
-itself.
+drops face-connected components that are too small, by face count, area or bounding-box diameter. It
+is the first step of every repair pipeline, and the debris it removes is not defective in itself.
 
 Two further defects need geometry rather than topology to detect, so they are found by a threshold
 rather than a rule: [`validation.face_defective_mask`][triwarp.validation.face_defective_mask] flags
-faces that are too thin, misoriented against their neighbourhood, or folded back over it -- it lives
-with the other per-element detectors. [`remove_folded_faces`][triwarp.repair.remove_folded_faces]
-deletes the folded ones and [`flip_t_vertices`][triwarp.repair.flip_t_vertices] flips away the
-slivers a T-junction leaves behind.
+faces that are too thin, misoriented against their neighbourhood, or folded back over it.
+[`remove_folded_faces`][triwarp.repair.remove_folded_faces] deletes the folded ones and
+[`flip_t_vertices`][triwarp.repair.flip_t_vertices] flips away the slivers a T-junction leaves
+behind.
 
 The verb predicts the return shape, and that is a rule rather than a coincidence:
 
@@ -36,36 +35,24 @@ The verb predicts the return shape, and that is a rule rather than a coincidence
   property-fixers beside it ([`make_winding_consistent`][triwarp.repair.make_winding_consistent],
   [`make_volume`][triwarp.repair.make_volume],
   [`make_normals_outward`][triwarp.repair.make_normals_outward]) return ``faces``.
-- **``reverse_winding``** is the one verb outside that scheme, and it obeys the same shape rule
-  for the same reason: it rewrites only the index buffer, so it returns ``faces``. It is not a
-  ``make_*`` because it establishes no property -- it flips orientation unconditionally, where the
-  three ``make_*`` fixers decide face by face.
+- **``reverse_winding``** is the one verb outside that scheme and obeys the same shape rule for the
+  same reason: it rewrites only the index buffer, so it returns ``faces``. It is not a ``make_*``
+  because it establishes no property -- it flips orientation unconditionally, where the three
+  ``make_*`` fixers decide face by face.
 - **A verb that only *moves* vertices** returns the positions alone, since neither buffer of indices
   changes: [`flatten_degree3_vertices`][triwarp.repair.flatten_degree3_vertices] is the only one,
   and it is here rather than in [`triwarp.smoothing`][triwarp.smoothing] -- whose every member has
   that same signature -- because it is the gentler half of a pair with
   [`remove_degree3_vertices`][triwarp.repair.remove_degree3_vertices]: same defect, same test, one
-  answering it by deleting the vertex and one by flattening the bump. Splitting the pair across two
-  modules to satisfy the shape rule would cost more than the exception does.
-- **``*_mask``** are detectors: they return a ``wp.array[wp.bool]`` and mutate nothing. The one this
-  module used to hold now lives in [`triwarp.validation`][triwarp.validation].
+  answering it by deleting the vertex and one by flattening the bump.
+- **``*_mask``** are detectors: they return a ``wp.array[wp.bool]`` and mutate nothing; they live in
+  [`triwarp.validation`][triwarp.validation].
 
-Two names carry a verb of their own and follow one of the rules anyway, which is worth saying so the
-list does not read as exhaustive. [`flip_t_vertices`][triwarp.repair.flip_t_vertices] is named for
-the ``make_*`` pattern rather than the ``remove_*`` one because it removes nothing: it flips the
-long edge of each sliver a T-junction leaves, so the face count is unchanged and only ``faces``
-comes back. [`straighten_boundary`][triwarp.repair.straighten_boundary] is the same shape under a
-geometric verb. And [`fix_self_intersections`][triwarp.repair.fix_self_intersections],
-[`split_non_manifold_vertices`][triwarp.repair.split_non_manifold_vertices],
-[`collapse_small_triangles`][triwarp.repair.collapse_small_triangles] and
-[`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces] all change the element count
-and all return what the first rule says.
-
-There is no ``eliminate_*``. Two functions used to spell it that way and both opened their own
-summary line with the word *"Remove"* -- one verb in the name and another in the sentence
-mkdocstrings renders beside it -- so they are
-[`remove_degree3_vertices`][triwarp.repair.remove_degree3_vertices] and
-[`remove_tunnels`][triwarp.repair.remove_tunnels].
+[`flip_t_vertices`][triwarp.repair.flip_t_vertices] is named for the ``make_*`` pattern rather than
+the ``remove_*`` one because it removes nothing: it flips the long edge of each sliver a T-junction
+leaves, so the face count is unchanged and only ``faces`` comes back.
+[`straighten_boundary`][triwarp.repair.straighten_boundary] is the same shape under a geometric
+verb.
 """
 
 from __future__ import annotations
@@ -86,8 +73,8 @@ from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
 
 # Lattice resolution for ``fix_self_intersections(method="voxel")``, in samples across the mesh's
-# bounding-box diagonal. 128 is the same order as ``offset.offset_mesh``'s automatic floor and costs
-# a 128 ** 3 field (8 MB); a caller who needs the surface resolved finer passes ``voxel_size``.
+# bounding-box diagonal. The same order as ``offset.offset_mesh``'s automatic floor, and the field
+# it allocates is cubic in it; a caller who needs the surface resolved finer passes ``voxel_size``.
 _VOXEL_REBUILD_RESOLUTION = 128
 
 
@@ -103,45 +90,42 @@ def make_solid(
     """
     Turn a broken digitised surface into a single watertight solid.
 
-    The composite this module's pieces exist to make possible, and the operation a caller reaching
-    for "repair" usually means: debris removed, holes closed, degeneracies collapsed and
-    self-intersections cut out and refilled, alternating until nothing is left to fix. Every stage
-    is a public function here or in [`triwarp.holes`][triwarp.holes]; what this adds is the order
-    and the loop, which is where the difficulty actually is -- closing a hole can create a
-    self-intersection, and cutting one out reopens a hole.
+    The composite this module's pieces exist to make possible: debris removed, holes closed,
+    degeneracies collapsed and self-intersections cut out and refilled, alternating until nothing is
+    left to fix. Every stage is a public function here or in [`triwarp.holes`][triwarp.holes]; what
+    this adds is the order and the loop, which is where the difficulty actually is -- closing a hole
+    can create a self-intersection, and cutting one out reopens a hole.
 
     The stages, in order:
 
-    0. The connectivity repair the reference implementation performs inside its *loader*, and which
-       therefore does not look like a stage at all until it is missing:
+    0. The connectivity repair that does not look like a stage at all until it is missing:
        [`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices],
        [`make_winding_consistent`][triwarp.repair.make_winding_consistent] and
        [`split_non_manifold_vertices`][triwarp.repair.split_non_manifold_vertices]. Without it a
        mesh whose defect is a non-manifold *edge* comes back with the right Euler characteristic and
        one component and is still not watertight, because no later stage looks at edge manifoldness.
-    1. ``keep_largest`` -> [`remove_small_components`][triwarp.repair.remove_small_components],
-       so the scan debris goes before anything expensive runs on it.
+    1. ``keep_largest`` -> [`remove_small_components`][triwarp.repair.remove_small_components], so
+      the
+       scan debris goes before anything expensive runs on it.
     2. ``join_components`` ->
-       [`holes.join_closest_components`][triwarp.holes.join_closest_components], for an input whose
-       pieces are meant to be one surface rather than a largest piece plus rubbish. Mutually useful
-       with ``keep_largest`` rather than exclusive: keep the big piece *and* weld what is left.
+      [`holes.join_closest_components`][triwarp.holes.join_closest_components],
+       for an input whose pieces are meant to be one surface rather than a largest piece plus
+       rubbish. Mutually useful with ``keep_largest`` rather than exclusive: keep the big piece
+       *and* weld what is left.
     3. [`holes.fill_min_weight`][triwarp.holes.fill_min_weight] if any boundary remains.
     4. Up to ``max_iter`` rounds of
        [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces] and
        [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles], then
-       [`fix_self_intersections`][triwarp.repair.fix_self_intersections] at
-       ``max_iter=inner_iter``. The loop exits as soon as a round changes nothing.
+       [`fix_self_intersections`][triwarp.repair.fix_self_intersections] at ``max_iter=inner_iter``.
+       The loop exits as soon as a round changes nothing.
     5. A final fill if stage 4 reopened a boundary -- which it routinely does, since cutting an
        intersecting region out is what opens one. Nothing geometric runs after it, and that is not
        an omission: filling a 3-vertex rim produces one sliver, a degeneracy pass deletes the sliver
-       and reopens the rim, and the two trade the same faces indefinitely if run again after the
-       fill.
+       and reopens the rim, and the two trade the same faces indefinitely.
 
     Under ``keep_largest`` the component filter runs **inside** stage 4 as well as at the top, and
     that is not belt and braces: cutting an intersecting band out can disconnect the surface, so the
-    extra piece does not exist yet when stage 1 looks. For example, on a torus whose inner wall
-    crosses itself, the intersection repair alone can leave two closed shells where the input was
-    one.
+    extra piece does not exist yet when stage 1 looks.
 
     !!! warning "It returns the best it managed, not a guarantee"
         There is no success flag, deliberately. Convergence is not guaranteed for any input -- a
@@ -149,19 +133,13 @@ def make_solid(
         this returns a *partly* repaired surface rather than looping harder or raising. Ask
         [`validation.is_watertight`][triwarp.validation.is_watertight] if the answer matters.
 
-        ``join_components`` is where that bites in practice, and the failure mode is worth knowing
-        because it is not a bug in any stage: welding several shells leaves **one** rim spanning all
-        of them, and if that rim is badly non-planar the minimum-weight patch across it
-        self-intersects, so stage 4 cuts the patch out and undoes the join. For example, three
-        hemispherical bowls joined at coplanar rims converge to one solid, but the same bowls
-        tilted 45 degrees relative to each other come back as **three separate shells**. Rims that
-        are far from coplanar want
+        ``join_components`` is where that bites in practice: welding several shells leaves **one**
+        rim spanning all of them, and if that rim is badly non-planar the minimum-weight patch
+        across it self-intersects, so stage 4 cuts the patch out and undoes the join. Hemispherical
+        bowls joined at coplanar rims converge to one solid; the same bowls tilted relative to each
+        other come back as separate shells. Rims far from coplanar want
         [`holes.stitch_loops`][triwarp.holes.stitch_loops] or a per-pair
         [`holes.bridge_edges`][triwarp.holes.bridge_edges] followed by a targeted fill, not this.
-
-        The reference implementation prints a diagnostic here and its own caller reports that
-        diagnostic **inverted**, which is worth knowing only as a reason not to trust a boolean of
-        this shape from anywhere: read the mesh.
 
     Parameters
     ----------
@@ -830,6 +808,7 @@ def split_non_manifold_vertices(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
     """
+
     Make a mesh manifold and orientable by duplicating vertices, keeping every face.
 
     The non-lossy counterpart of
@@ -846,6 +825,7 @@ def split_non_manifold_vertices(
     flipped face is cut free of its neighbours rather than reoriented (that is
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]'s job, and running it first
     leaves less to split).
+
 
     Parameters
     ----------
@@ -880,8 +860,8 @@ def split_non_manifold_vertices(
 
     Remove degenerate faces first, with
     [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]: a triangle with a repeated
-    index has two corners at one vertex that no edge can join, so it survives as two copies of
-    that vertex and the face stays degenerate.
+    index has two corners at one vertex that no edge can join, so it survives as two copies of that
+    vertex and the face stays degenerate.
 
     The implementation is a connected-components pass over a graph of ``3 * n_faces`` corner nodes
     rather than a per-vertex star walk: one kernel counts each edge's half-edges by direction, a
@@ -890,18 +870,16 @@ def split_non_manifold_vertices(
     does the merging. ``igl::split_nonmanifold`` instead explodes the mesh to ``3 * n_faces``
     singleton vertices and greedily re-merges pairs, re-testing manifoldness after each candidate --
     order-dependent and sequential by construction. The two agree exactly on a manifold mesh, a
-    bowtie vertex, a consistently-wound fan of three faces on one edge (both split it into three),
-    a flipped face and an open boundary.
+    bowtie vertex, a consistently-wound fan of three faces on one edge, a flipped face and an open
+    boundary.
 
     **They differ on one input class, by design.** Where an edge carries one half-edge in one
     direction and *several* in the other -- which is what a duplicated face produces -- igl keeps
-    one arbitrarily chosen pair joined, while this splits every copy: 18 vertices against igl's 15
-    on an icosahedron with one face duplicated, and 8 527 against 8 320 on ``bunny_decimated``,
-    whose 87 duplicated faces are its only non-manifoldness. Both results are edge- and
+    one arbitrarily chosen pair joined, while this splits every copy. Both results are edge- and
     vertex-manifold with the input's face count; this one is order-independent and makes no
     arbitrary choice. Note that
     [`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces] is not a way around the
-    difference: libigl's cancellation rules it implements cover a ``+1``/``-1`` imbalance, so a face
+    difference: the cancellation rules it implements cover a ``+1``/``-1`` imbalance, so a face
     duplicated in the *same* orientation makes it raise rather than dropping the copy.
 
     See Also
@@ -1525,13 +1503,9 @@ def flatten_degree3_vertices(
         # pays none. The connectivity never changes here, so nothing above the loop is rebuilt.
         #
         # Read back and reduced on the host rather than through ``reduce``: a bool mask is one byte
-        # per vertex, so the copy is cheaper than the launch a device reduction costs -- which is
-        # the case CLAUDE.md section 14.5 measured and declined converting. Measured on the whole
-        # call, 10 242 vertices, RTX 5090: 0.686-0.696 ms this way against 0.751-0.755 through
-        # ``reduce.sum(astype(...))``, on a 0.524-0.531 ms base. Re-checked after ``reduce`` stopped
-        # widening a mask to ``int32``, which is worth 1.6-1.9x on the reduction itself: the
-        # readback/reduction crossover moved from ~1 M elements to ~0.5 M, and this call is over the
-        # *vertex* count, so it stays on the readback at every registry mesh.
+        # per vertex, so below about half a million elements the copy is cheaper than the launch a
+        # device reduction costs (CLAUDE.md section 14.5). This call is over the *vertex* count, so
+        # it stays on the readback at every registry mesh.
         if not bool(candidate.numpy().any()):
             break
     return positions
@@ -1872,6 +1846,7 @@ def fix_self_intersections(
     voxel_size: float | None = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
+
     Remove a mesh's self-intersections, either locally or by rebuilding it.
 
     triwarp could *detect* a self-intersection
@@ -1886,6 +1861,7 @@ def fix_self_intersections(
       A level set cannot self-intersect, so this always terminates and resamples everything --
       including the parts that were fine. Read the qualification in the Notes: the level set is
       clean, its *triangulation* can still carry an artifact at an ambiguous marching-cubes cell.
+
 
     Parameters
     ----------
@@ -1930,29 +1906,25 @@ def fix_self_intersections(
     region whose rim cannot be triangulated without crossing something, or one that grows to swallow
     the mesh, leaves intersections behind; the loop stops at ``max_iter`` and returns what it has.
     For ``"voxel"``: the level set is clean, but Warp's ``MarchingCubes`` can emit a touching or
-    non-manifold pair at an ambiguous cell, and that is resolution-dependent: a finer lattice can
-    introduce a handful of such faces where a coarser one has none. So check with
+    non-manifold pair at an ambiguous cell, and that is resolution-dependent -- a finer lattice can
+    introduce a handful of such faces where a coarser one has none. Check with
     [`triwarp.validation.is_self_intersecting`][triwarp.validation.is_self_intersecting] when it
-    matters. Stating this is better than a loop that cannot terminate, and better than a promise the
-    extraction does not keep.
+    matters.
 
     **What the ``"local"`` method is for.** It clears a *shallow* self-intersection outright -- a
     torus whose tube passes through itself can be fully cleared at either dilation budget -- and
     only reduces a *deep* one, such as two icospheres overlapping by a third of their diameter. That
-    is the method's shape rather than a tuning failure. Cutting out a lens-shaped overlap leaves a
+    is the method's shape rather than a tuning failure: cutting out a lens-shaped overlap leaves a
     rim whose minimum-weight patch runs back through the other shell, so the pass converges only
     where the damage is a band. Reach for ``"voxel"`` when two closed pieces genuinely
-    interpenetrate: a level set has no notion of two shells.
+    interpenetrate -- a level set has no notion of two shells.
 
-    **On that input class the result is nondeterministic and ``max_iter`` is not a quality knob**,
-    which "only reduces" does not by itself tell you. Past a certain point, raising it does not
-    reduce the residual intersections further while the face count climbs past the input's -- each
-    pass is refilling a rim that the next one cuts out again. Repeated runs on the same input can
-    also produce a slightly different result, from the refill chain's own atomic-ordering
-    nondeterminism (as in
-    [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]), so that variation is not
-    a regression. Do not raise ``max_iter`` hoping for convergence on a deep interpenetration; the
-    answer is ``"voxel"``.
+    **On that input class the result is nondeterministic and ``max_iter`` is not a quality knob.**
+    Past a certain point, raising it does not reduce the residual intersections further while the
+    face count climbs past the input's -- each pass refills a rim the next one cuts out again.
+    Repeated runs on one input can also differ, from the refill chain's own atomic-ordering
+    nondeterminism, so that variation is not a regression. Do not raise ``max_iter`` hoping for
+    convergence on a deep interpenetration; the answer is ``"voxel"``.
 
     The two methods differ in what they preserve, not in quality. ``"local"`` keeps the input's
     triangulation everywhere it did not cut, so a per-vertex attribute survives outside the patch;
@@ -1992,14 +1964,9 @@ def fix_self_intersections(
         bad_mask = tw.validation.face_self_intersecting_mask(current_vertices, current_faces)
         # Two readbacks per pass, and each decides the loop. Deliberately *not* ``tw.reduce.any`` /
         # ``tw.reduce.all``: a device reduction has a roughly fixed cost, while copying a ``bool``
-        # array is one byte per element, so below the crossover the copy wins. **That crossover
-        # moved** when ``reduce`` stopped widening a mask to ``int32`` before reducing it: measured
-        # on an RTX 5090 / Warp 1.17, ``reduce.any`` against a readback is 1.54x slower at 163 842
-        # elements, 1.15x at 350 000, level at ~524 288, and **1.35x faster at 1 000 000** -- where
-        # before that change it was still 1.18x slower there. So the boundary is ~0.5 M rather than
-        # the ~1 M this used to say. Every mesh this runs on is well under it (the self-intersecting
-        # fixtures are 8 k-164 k faces, ``bunny`` 69 k), so the readback stays; revisit at a mesh
-        # past half a million faces.
+        # array is one byte per element, so below the crossover -- about half a million elements --
+        # the copy wins. Every mesh this runs on is well under it, so the readback stays; revisit at
+        # a mesh past half a million faces.
         if not bool(bad_mask.numpy().any()):
             break
         region = _dilate_face_mask(

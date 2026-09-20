@@ -45,8 +45,8 @@ COLLAPSE_COMMITS = wp.constant(wp.int32(2))
 COLLAPSE_STATE_SIZE = 3
 
 # Delaunay / Delone edge-flip constants. The flip predicate runs in float64 deliberately:
-# circumcircle diameters of near-degenerate triangles have too large a rounding error in float32,
-# which sends the flip loop non-terminating.
+# circumcircle diameters of near-degenerate triangles round too coarsely in float32, which sends
+# the flip loop non-terminating.
 DELONE_CRITICAL_DOT = wp.constant(wp.float64(-0.9))
 DELONE_EPS = wp.constant(wp.float64(1e-7))
 NO_ANGLE_CHANGE_LIMIT = wp.constant(wp.float64(6.283185307179586))  # 2*pi (NoAngleChangeLimit)
@@ -174,10 +174,8 @@ def loop_odd_weights(edge_face_count: wp.int32) -> tuple[wp.float32, wp.float32]
     # Loop's odd (edge) stencil as weights: 3/8 on each endpoint and 1/8 on each opposite vertex for
     # an interior edge, the midpoint rule otherwise. A boundary edge (one face) or a non-manifold
     # one (three or more) has no well-defined pair of opposite vertices, so both fall back together.
-    #
-    # Shared by the position kernel and the interpolation-operator triplet kernels: the rule is one
-    # decision and lives in one place, since a copy that drifted would put the operator and the
-    # positions ``subdivide_loop`` returns onto different surfaces.
+    # Shared by the position kernel and the interpolation-operator triplet kernels, so the operator
+    # and the positions ``subdivide_loop`` returns cannot describe different surfaces.
     if edge_face_count == 2:
         return LOOP_ODD_ENDPOINT, LOOP_ODD_OPPOSITE
     return wp.float32(0.5), wp.float32(0.0)
@@ -188,9 +186,8 @@ def loop_even_weights(
     valence: wp.int32, boundary_count: wp.int32
 ) -> tuple[wp.float32, wp.float32, wp.int32]:
     # Loop's even (original) stencil as (self weight, neighbour weight, mode); see the LOOP_EVEN_*
-    # constants for the mode. Warren's beta -- 3/16 at valence 3 and 3/(8n) above it -- which is the
-    # variant ``igl::loop`` uses, not Loop's original trigonometric weight. Shared for the same
-    # reason as ``loop_odd_weights``.
+    # constants for the mode. Warren's beta -- 3/16 at valence 3 and 3/(8n) above it -- the variant
+    # ``igl::loop`` uses, not Loop's original weight. Shared as ``loop_odd_weights`` is.
     if boundary_count == 2:
         # Boundary vertex: 3/4 of itself, 1/8 of each neighbour *along the boundary*. Its interior
         # neighbours do not enter, which is what keeps a shared boundary curve identical on both
@@ -894,12 +891,9 @@ def _resolve_flip_quad_in_region(
     # edge with either incident face outside the region is not flippable, for the same reason a
     # missing apex is not.
     #
-    # Region-restricted rather than universal, because two of the four candidate kernels genuinely
-    # have no region to restrict to. ``valence_flip_candidates`` is whole-mesh *by construction* --
-    # its only caller, ``remesh._valence_flip_pass``, is reached from ``isotropic_remesh`` and takes
-    # no ``region`` parameter, where ``delone`` and ``objective`` both go through ``_flip_setup`` --
-    # and ``incircle_flip_candidates`` triangulates a planar point set. That asymmetry reads as an
-    # oversight until someone opens the wrapper, which is why it is written down here.
+    # Region-restricted rather than universal because two of the four candidate kernels have no
+    # region to restrict to: ``valence_flip_candidates`` is whole-mesh by construction (its only
+    # caller takes no ``region``) and ``incircle_flip_candidates`` triangulates a planar point set.
     f0 = adjacency[k, 0]
     if region_flags[f0] == 0 or region_flags[adjacency[k, 1]] == 0:
         return wp.int32(-1), wp.int32(-1), wp.int32(-1), wp.int32(-1)
@@ -1017,9 +1011,7 @@ def flip_claim_won(
     #
     # Shared by ``commit_flips`` and ``update_flipped_lengths``, which must agree *exactly* on which
     # candidates commit: the second rewrites the edge-length rows of the faces the first rewrites
-    # the connectivity of, so a divergence between two copies of this guard would leave the two
-    # tables describing different meshes. That is why it is one function rather than two identical
-    # seven-statement runs.
+    # the connectivity of, so a divergence would leave the two tables describing different meshes.
     if not flip[k]:
         return wp.int32(-1), wp.int32(-1), False
     f0 = adjacency[k, 0]
@@ -1108,15 +1100,9 @@ def collapse_survivor(
     # Which endpoint of edge ``(u, v)`` survives the collapse, which one is removed, and whether
     # the survivor's position is pinned or free -- the feature rule alone, with no geometry in it.
     #
-    # One rule, two decimators. ``collapse_candidates`` and ``quadric_collapse_candidates`` were
-    # each carrying their own copy, expressed through a ``reject`` flag in one and early returns in
-    # the other, and the second's comment claimed it "mirrors ``collapse_candidates``" -- a claim
-    # only a shared function can keep true. They were in fact equivalent; nothing but this stopped
-    # the next edit to either from silently diverging.
-    #
-    # The genuine difference between the two is what they do with ``COLLAPSE_FREE``: one takes the
-    # midpoint, the other minimizes the summed quadric. That is the only thing their comments
-    # should now claim to share.
+    # One rule, two decimators: ``collapse_candidates`` and ``quadric_collapse_candidates`` differ
+    # only in what they do with ``COLLAPSE_FREE`` -- one takes the midpoint, the other minimizes the
+    # summed quadric.
     cu = codes[u]
     cv = codes[v]
     if cu == CORNER_VERTEX and cv == CORNER_VERTEX:
@@ -1210,9 +1196,8 @@ def satisfies_link_condition(
     # for a boundary edge. A third shared neighbour means the edge closes a tetrahedral loop the
     # collapse would pinch shut.
     #
-    # Both collapse-candidate kernels test this, and it is a *decision rule* rather than an
-    # arithmetic run: two copies can diverge into accepting an edge in one decimator and rejecting
-    # it in the other, which is a correctness hazard the duplicate scans do not rank as one.
+    # Shared by both collapse-candidate kernels because it is a *decision rule*: two copies could
+    # diverge into accepting an edge in one decimator and rejecting it in the other.
     required = 2
     if is_boundary:
         required = 1
@@ -1351,25 +1336,11 @@ def collapse_candidates(
 
     # The fold veto, last because every test above rejects more cheaply. Spelled exactly as
     # ``quadric_collapse_candidates`` spells it -- both directions, unconditionally -- because this
-    # is a *decision rule* shared by two decimators, and two spellings of one rule is the hazard
-    # section 2.4 names rather than the duplicated arithmetic.
+    # is a *decision rule* shared by two decimators (AGENTS.md section 2.4).
     #
-    # It was absent here for a long time while the quadric decimator had it, which was a gap and
-    # not a variant: the link condition is topological and the band walks above bound *lengths*, so
-    # nothing else here notices a collapse that inverts an incident face. Measured against a
-    # baseline worktree on a 133x133 graded saddle patch, three reps per arm, both arms
-    # deterministic on this fixture:
-    #
-    #   ``_collapse_pass`` (5 passes): zero-area faces **1 -> 0**, minimum face area
-    #   **0.0 -> 3.9e-12**, aspect p99 6260.79 -> 5882.00, time 11.09-11.58 ms -> 9.77-12.34 ms.
-    #   ``isotropic_remesh(iterations=3)``: aspect p99 **3100-3116 -> 2007.16**, a 1.55x
-    #   improvement against a baseline that itself drifts only ~0.5% run to run.
-    #
-    # So the guard is free: the two timing ranges overlap, and rejecting a collapse early removes
-    # work downstream. The vertex-face CSR it needs costs 0.124 ms a pass against an 11 ms stage.
-    # It also closed what section 16.4 had attributed to the smooth pass: the reason area-weighting
-    # that pass used to fold ``cave_cube`` was this veto's absence, not the weights -- see
-    # ``accumulate_one_ring``.
+    # Nothing else here notices a collapse that inverts an incident face: the link condition is
+    # topological and the band walks above bound *lengths*. It is effectively free, because
+    # rejecting a collapse early removes more downstream work than the vertex-face CSR costs.
     if move_flips_normal(
         vertices, faces, vertex_face_offsets, vertex_faces, r, s, p
     ) or move_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, s, r, p):
@@ -1391,12 +1362,8 @@ def wins_key_everywhere(
 ) -> wp.bool:
     # Does ``key`` win at every vertex of the two closed 1-rings? The read half of
     # ``scatter.lock_two_rings``, and the same table: ``locks`` is a minimum over candidates
-    # *including this one*, so the test is equality rather than ``<=``.
-    #
-    # Equality is only a sound win test because ``scramble_index`` is injective; it was not, and
-    # two candidates sharing a key both passed this. This rule was also written out inline three
-    # times before it was one function, and the copies had already diverged: the improvement that
-    # hashed the key reached one of them and not the other.
+    # *including this one*, so the test is equality rather than ``<=``. Equality is a sound win test
+    # only because ``scramble_index`` is injective.
     if locks[s] != key or locks[r] != key:
         return False
     for i in range(offsets[s], offsets[s + 1]):
@@ -1413,27 +1380,18 @@ def scramble_index(index: wp.int32) -> wp.int64:
     # Spatially incoherent *and injective* lock key for the independent-set pass, from the
     # candidate's own index. Two separate properties, and the selection needs both.
     #
-    # **Incoherent**, which is the load-bearing detail of the whole parallel selection.
-    # ``edges_unique`` orders edges lexicographically by endpoint index, which on any structured
-    # mesh is *spatially monotone* -- and a monotone key field has essentially one local minimum, so
-    # a min-key lock commits a single collapse per pass however many candidates there are. Measured
-    # on ``saddle_graded``: locking by raw edge index yields exactly **1** winner out of 51 546
-    # candidates, and locking by quadric cost yields 23 (the cost field is smoothly graded there, so
-    # it is monotone too). Hashing the index breaks the correlation and restores the expected
-    # ~candidates/valence winners. That is what the high half carries: ``array.lowbias32`` with the
-    # top bit cleared, so the key stays non-negative and ``INT64_MAX`` remains usable as the
-    # unclaimed sentinel. The measurement behind the hash is recorded there, on the shared function.
+    # **Incoherent**: ``edges_unique`` orders edges lexicographically by endpoint index, which on
+    # any structured mesh is spatially monotone -- and a monotone key field has one local
+    # minimum, so a min-key lock commits a single collapse per pass however many candidates there
+    # are. The high half is ``array.lowbias32`` with the top bit cleared, so the key stays
+    # non-negative and ``INT64_MAX`` remains usable as the unclaimed sentinel.
     #
-    # **Injective**, which is why the key is 64 bits and not the natural 32. ``wins_key_everywhere``
+    # **Injective**, which is why the key is 64 bits and not the natural 32: ``wins_key_everywhere``
     # tests equality against a neighbourhood minimum, so two candidates sharing a key both win and
-    # both commit -- overlapping 1-rings, which is a corrupted mesh rather than a worse one. A
-    # masked ``lowbias32`` is exactly 2-to-1, and at scan-mesh candidate counts the collision rate
-    # is ~m^2 / 2^32, i.e. not negligible. Appending the index in the low half restores injectivity
-    # without disturbing the ordering the high half provides, so every candidate that used to win
-    # uniquely still does and only a tie changes -- from "both commit" to "the lower index takes
-    # it". This is what lets both paths run **one** lock pass: the quadric path used to follow this
-    # with a second, raw-index lock (``claim_collapse_index``) purely to break such a tie, and the
-    # isotropic path never did, which was the asymmetry that made the collision reachable at all.
+    # both commit -- overlapping 1-rings, a corrupted mesh rather than a worse one. A masked
+    # ``lowbias32`` is exactly 2-to-1, so the index goes in the low half, which disturbs nothing but
+    # a tie: that now goes to the lower index instead of to both. It is also what lets both collapse
+    # paths run **one** lock pass rather than following it with a second, raw-index one.
     hashed = wp.int64(lowbias32(wp.uint32(index)) & wp.uint32(0x7FFFFFFF))
     return (hashed << wp.int64(32)) | wp.int64(index)
 
@@ -1446,39 +1404,15 @@ def claim_collapse_key(
     columns: wp.array[wp.int32],
     out_min_key: wp.array[wp.int64],
 ) -> None:
-    # The winning (smallest scrambled) key over the closed 1-rings of both endpoints.
+    # The winning (smallest scrambled) key over the closed 1-rings of both endpoints. Both collapse
+    # paths launch this same kernel exactly once and read the answer the same way.
     #
-    # **Both collapse paths launch this same kernel**, exactly once each, and read the answer the
-    # same way -- ``scramble_index`` being injective is what removed the quadric path's second,
-    # raw-index lock pass, which existed only to break a key collision the isotropic path never
-    # guarded against at all. It was two kernels -- ``claim_collapses`` and this -- whose bodies
-    # became byte-identical once ``scatter.lock_two_rings`` was extracted and the isotropic path's
-    # raw-index key was fixed; the duplicate scan found them the same pass that produced them,
-    # which is section 2.4's point about a fusion not being done until the shared code has a name.
-    # The key is ``scramble_index(k)`` and not ``k`` for the reason that function records at
-    # length: a min-key lock over a *spatially monotone* key field has essentially one local
-    # minimum, so it commits a single collapse per pass however many candidates there are. This
-    # kernel locked by the raw edge index until it was measured -- on ``saddle`` at a 2x band,
-    # 40 934 candidates yielded exactly **1** winner against 608 hashed, and five passes of
-    # ``_collapse_pass`` removed **5** vertices of 17 689 against 2 761, at the same wall clock
-    # (10.6 against 10.7 ms) because a pass is dominated by its rebuild rather than by its commits.
-    # A flat ``creation.grid`` shows it without the lift and is what
-    # ``test_collapse_pass_commits_a_useful_fraction_on_a_structured_patch`` asserts against.
-    #
-    # Two things measured with the change, interleaved over five alternating pairs at
-    # ``iterations=3``, that the next reader will want. **Where it helps:** on ``saddle`` at
-    # ``target = mean_edge`` the achieved-over-requested edge length goes 0.93 -> 0.98, the face
-    # count 39 100 -> 35 488 (the input is 34 848) and the worst aspect ratio 136 -> 2.6, for 2.9 %
-    # more wall clock. On the icospheres at half the mean edge -- the whole of
-    # ``tests/test_remesh.py`` -- the output is *identical* either way, because there the split
-    # stage does the work and collapse commits nothing under either key. That is why the suite
-    # passed against the broken version. **Where it does not:** on ``saddle_graded`` the target
-    # tracking improves the same way (0.73 -> 0.85, 64 867 -> 40 893 faces) but the worst triangles
-    # get worse (99th-pct aspect 177 -> 7 440, three float32-degenerate faces against none). That
-    # is not this key's defect -- at the tests' target the *raw* key leaves 192 degenerate faces
-    # against the hashed key's 40 -- it is the unweighted ``_smooth_pass`` that
-    # ``benchmarks/test_remesh.py::test_isotropic_remesh`` already records as open, unmasked here by
-    # a collapse stage that finally commits. It needs a fold guard, not a different lock key.
+    # The key is ``scramble_index(k)`` and not ``k`` for the reason that function records: a min-key
+    # lock over a *spatially monotone* key field has essentially one local minimum, so it commits a
+    # single collapse per pass however many candidates there are. Hashing it is what makes the
+    # collapse stage track its target size on a structured mesh, which
+    # ``test_collapse_pass_commits_a_useful_fraction_on_a_structured_patch`` asserts against; the
+    # icosphere fixtures cannot see it, because there the split stage does all the work.
     k = wp.int32(wp.tid())
     s = survivor[k]
     if s < 0:
@@ -1559,9 +1493,8 @@ def valence_flip_candidates(
     # Shape guard. Convexity makes the flip *legal* but says nothing about the shape of what it
     # produces, and the valence objective below is blind to geometry: on a graded mesh it will
     # happily turn two slivers into two worse ones, which in float32 lands on exactly-zero area.
-    # (Measured on ``saddle_graded``: the swap stage alone produced 3 992 zero-area faces out of
-    # 92 100, and none survive this guard. ``delone_flip_candidates`` has its own deviation and
-    # aspect gates; this is the equivalent for the valence objective.)
+    # ``delone_flip_candidates`` has its own deviation and aspect gates; this is the equivalent for
+    # the valence objective.
     #
     # ``triangle_aspect_ratio`` is circumradius / 2 * inradius and returns +inf for a degenerate
     # triangle, so the two tests below read as "never create a degenerate triangle" and "never make
@@ -1608,23 +1541,9 @@ def accumulate_one_ring(
     # relaxation redistributes sampling density rather than only straightening the surface.
     #
     # The *unweighted* centroid this replaced could not: it is a fixed point of a regular graded
-    # grid, which is exactly the input the stage exists for.
-    #
-    # Measured against a baseline worktree, 99th-percentile aspect ratio, three to ten
-    # ``isotropic_remesh`` iterations per fixture: ``icosphere(3)`` **1.308 -> 1.173** and
-    # ``hemisphere`` **1.804 -> 1.496** are the clear wins; a 96x96 graded saddle patch is
-    # 4.211 -> 3.826 at three iterations and 1.575 -> 1.596 at ten, i.e. a wash; ``unit_box``
-    # 1.414 -> 1.706 and ``cave_cube`` 1.414 -> 1.483 are small regressions, because an
-    # already-uniform structured grid is a fixed point of the unweighted smoother and these weights
-    # perturb it. So the gain is on the curved inputs, and the whole call is 1.35x faster
-    # (``icosphere(5)``, three iterations, 22.1-23.1 -> 16.3-16.8 ms) because a better-shaped mesh
-    # gives the split and collapse stages less to do.
-    #
-    # An earlier reading had this change folding ``cave_cube`` into a self-intersection at every
-    # step size down to lam=0.1, and that no longer reproduces at all: with the veto below removed,
-    # ``cave_cube`` stays watertight and self-intersection-free at 8 and 20 iterations, at targets
-    # 0.5x and 0.25x the mean edge, and with ``reproject=False``. What had been folding it was the
-    # missing fold veto in ``collapse_candidates``, since added -- one defect seen from two stages.
+    # grid, which is exactly the input the stage exists for. Area weighting improves the curved
+    # fixtures, perturbs an already-uniform structured grid slightly, and speeds the whole call up
+    # either way, because a better-shaped mesh gives the split and collapse stages less to do.
     e = wp.int32(wp.tid())
     u = unique_edges[e, 0]
     v = unique_edges[e, 1]
@@ -1671,12 +1590,11 @@ def smooth_free_vertices(
     out_positions: wp.array[wp.vec3],
 ) -> None:
     # One tangential relaxation step, vetoed per vertex by the same fold rule the two collapse
-    # candidates run -- section 2.4's one decision rule, one spelling.
+    # candidates run -- AGENTS.md section 2.4's one decision rule, one spelling.
     #
     # **It is insurance, and the reason to keep it is that it is free**, not that a fixture needs
-    # it: veto against no-veto measures 16.5-16.9 against 17.1-17.3 ms on ``icosphere(5)`` at three
-    # iterations, two ranges that overlap, and the whole remesh suite passes either way. It fires
-    # on a graded saddle patch and on no other fixture.
+    # it: veto against no-veto is within noise and the whole remesh suite passes either way. It
+    # fires on a graded saddle patch and on no other fixture.
     #
     # **A convex vertex link cannot fold under this step at all**, which is why the well-shaped
     # fixtures cannot reach the veto: the target is a convex combination of the one ring, so it
@@ -2117,11 +2035,9 @@ def objective_flip_candidates(
     #
     # Fourteen arguments and **deliberately not bundled into a ``@wp.struct``**, unlike
     # ``holes.stitch_dp_diag`` and ``holes.fill_dp_span``, which have the same width. Those launch
-    # once per DP cell-diagonal or span -- hundreds of times, with nothing else in the loop. This
-    # one launches once per *flip round*, and a round rebuilds the whole face adjacency around it:
-    # measured on a noisy icosphere(4), ``flip_to_delaunay`` converges in **2** rounds at 514 us
-    # each, so the nine bundleable arguments bound the saving at 18 us, **1.75 %** of the call. The
-    # width alone is not the criterion; the launch count around it is.
+    # hundreds of times with nothing else in the loop; this one launches once per *flip round*, and
+    # a round rebuilds the whole face adjacency around it, so a bundle would save a fraction of a
+    # percent. The width alone is not the criterion; the launch count around it is.
     k = wp.int32(wp.tid())
     out_flip[k] = wp.bool(False)
     a, b, c, d = _resolve_flip_quad_in_region(
@@ -2204,21 +2120,11 @@ QUADRIC_SINGULAR_EPS = wp.constant(wp.float64(1e-12))
 # allow a face to become exactly degenerate; 0.2 (~78 degrees) still permits real simplification of
 # a curved region while refusing an outright fold.
 #
-# **Not exposed as a keyword, and the census is why.** ``quadric_decimate``'s Notes used to name
-# this guard as "the usual reason a target is not reached", which a veto count refutes: mirroring
-# ``quadric_collapse_candidates``' three early exits over the *terminal* mesh of a decimation that
-# stopped short, on icosphere(3), icosphere(4), a box and a 32-section cylinder crossed with
-# ``feature_angle`` in {30, 45, 60, 90, 180}, **14 of the 20 cells veto every remaining edge on the
-# feature rule and none at all on this one** -- 147/147, 195/195, 186/186 and so on, with zero
-# link-condition and zero normal-flip vetoes. The six cells that do reach the target stop on the
-# target, and the two that show flip vetoes (icosphere(4) and the cylinder at 180 degrees) show
-# 2 of 30 and 7 of 30 against a majority still available.
-#
-# So the knob a caller short of their target actually needs is ``feature_angle``, which already
-# exists: raising it moves the floor monotonically (icosphere(3) at target 20 gives 98 / 68 / 26 /
-# 20 / 20 faces across that sweep). Adding a second one here would be a keyword for a constraint
-# that was measured not to bind, which is the speculative generality section 4.2 forbids. Re-run
-# the census before widening this value -- it is what keeps the output free of inverted,
+# **Not exposed as a keyword.** A veto census over decimations that stopped short of their target
+# has the *feature* rule vetoing every remaining edge in most cases and this one vetoing none, so
+# the knob a caller short of their target needs is ``feature_angle``, which already exists; a second
+# one here would be a keyword for a constraint measured not to bind (section 4.2). Re-run that
+# census before widening this value -- it is what keeps the output free of inverted,
 # self-intersecting triangles, and nothing in the suite would notice it going soft.
 COLLAPSE_MIN_NORMAL_DOT = wp.constant(wp.float32(0.2))
 
@@ -2423,8 +2329,8 @@ def edge_csr_triplets(
     # ``graph.edges_to_csr``'s symmetric triplet expansion, with the padded rows sent out of range
     # instead of to the dummy vertex. ``warp.sparse.bsr_from_triplets`` drops an out-of-range index
     # silently, which is what is wanted here -- pointing them all at the dummy instead makes tens of
-    # thousands of triplets collide on **one** entry, and its accumulation atomic then serializes:
-    # measured 4.25 ms of a 4.82 ms pass on ``saddle``, 88 % of it, against 0.03 ms once dropped.
+    # thousands of triplets collide on **one** entry, whose accumulation atomic then serializes and
+    # dominates the pass.
     e = wp.int32(wp.tid())
     a = e * 2
     if e >= state[DECIMATION_EDGES]:

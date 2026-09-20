@@ -1,93 +1,74 @@
 """
 Benchmarks for ``triwarp.bounds``: the axis-aligned box, its diagonal, and the oriented box.
 
-Axis: the **scan sweep**, because that is the only thing the axis-aligned groups can be driven by --
-a component-wise min/max over ``V`` has no topology and no parameters, so vertex count is the whole
-story. ``oriented_bounding_box`` has a second axis of its own, the candidate count, and it is held
-*fixed* at ``_ROTATIONS`` here so the sweep still reads as a sweep; see that group's docstring.
+Axis: the **scan sweep**, the only thing the axis-aligned groups can be driven by — a component-wise
+min/max over ``V`` has no topology and no parameters. ``oriented_bounding_box`` has a second axis of
+its own, the candidate count, held *fixed* at ``_ROTATIONS`` here so the sweep still reads as a
+sweep.
 
-This module exists for one reason beyond coverage: ``aabb`` is on the hot path of *every*
-k-NN query (``neighbors.query_*`` calls it to size the hash grid), and it is the clearest example in
-the suite of a row that is **host-latency-bound at the small end and bandwidth-bound at the large
-end**. Below roughly ``10 ** 3`` vertices it reports the ~340 µs wrapper floor rather than the
-reduction (the same floor ``test_creation::test_box`` measures), so a NumPy ``min``/``max`` pair
-wins by orders of magnitude there and loses at ``lucy``. The row is here for the crossover; neither
-endpoint means anything on its own. That is also why ``bounds.aabb`` does not use the generic
-[`reduce.minmax`][triwarp.reduce.minmax] path -- it writes both corners into one six-element buffer
-so the host pays a single readback.
+This module exists for one reason beyond coverage: ``aabb`` is on the hot path of *every* k-NN query
+(``neighbors.query_*`` calls it to size the hash grid), and it is the clearest example in the suite
+of a row that is **host-latency-bound at the small end and bandwidth-bound at the large end**. Below
+roughly ``10 ** 3`` vertices it reports the wrapper floor rather than the reduction, so a NumPy
+``min``/``max`` pair wins by orders of magnitude there and loses at ``lucy``. The row is here for
+the crossover; neither endpoint means anything alone. That is also why ``aabb`` does not use the
+generic [`reduce.minmax`][triwarp.reduce.minmax] path — it writes both corners into one six-element
+buffer so the host pays a single readback.
 
 References
 ----------
 **trimesh** has no ``bounds`` function, only the cached ``Trimesh.bounds`` property, so the row runs
-the uncached formula behind it (``vstack((v.min(0), v.max(0)))``) rather than timing a cache lookup.
+the uncached formula behind it rather than timing a cache lookup. **open3d**'s
+``get_axis_aligned_bounding_box`` is its own reduction over the same vertices.
 
-**open3d**'s ``get_axis_aligned_bounding_box`` is its own reduction over the same vertices and
-returns an object with ``get_min_bound`` / ``get_max_bound``.
+**libigl** answers both groups and in both returns *more* than was asked for: ``igl.bounding_box``
+builds the box as geometry (8 corners and 12 triangles), so its row includes constructing a mesh
+triwarp never materialises, and ``igl.bounding_box_diagonal`` computes the box internally. Read both
+as upper bounds.
 
-**libigl** answers both groups, and in both cases it returns *more* than the number asked for:
-``igl.bounding_box(V)`` builds the box as geometry -- 8 corner vertices and the 12 triangles of its
-hull -- so its row includes constructing a mesh triwarp never materialises, and
-``igl.bounding_box_diagonal(V)`` computes the box internally, exactly as
-[`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal] does on triwarp's side. Read both as
-upper bounds.
-
-For the **oriented** box, the references answer it a different way and the rows say which:
-``igl.oriented_bounding_box`` searches the *same* global candidate set triwarp's first phase does
-(Super-Fibonacci over ``SO(3)``, identity appended) but has no refinement phase, so triwarp's row
-carries ~3-5 ms of trust-region rounds igl's does not -- rounds that buy the quality the
-``tests/test_bounds.py`` bands pin (the sampled-only phase is reachable with
-``refine_iterations=0`` and measured 0.45 ms on a 36k cloud back to back against ~2.4 refined).
+For the **oriented** box the references answer it a different way. ``igl.oriented_bounding_box``
+searches the *same* global candidate set triwarp's first phase does (Super-Fibonacci over ``SO(3)``,
+identity appended) but has no refinement phase, so triwarp's row carries trust-region rounds igl's
+does not — rounds that buy the quality the ``tests/test_bounds.py`` bands pin, and that are several
+times the sampled-only phase reachable with ``refine_iterations=0``.
 ``trimesh.bounds.oriented_bounds`` and open3d's ``get_minimal_oriented_bounding_box`` are the
-*other* algorithm family -- convex hull, then the minimal box flush with each hull face -- so their
+*other* algorithm family — convex hull, then the minimal box flush with each hull face — so their
 rows price a hull triwarp never builds and their cost does not scale with the candidate count at
-all. Read them as the cost of that approach rather than as the same work done slower: on ``bunny``
-trimesh reads 98.4 ms against igl's 60.6 at 4 096 candidates, even though the hull collapses 35 947
-points to 1 564, because the caliper search then runs over all 3 124 hull faces serially.
+all. Read them as the cost of that approach rather than the same work done slower: trimesh is dearer
+than igl on a scan mesh even though the hull collapses the cloud by an order of magnitude, because
+the caliper search then runs over every hull face serially.
 
-One measured warning about igl's row, in the spirit of the ``igl.octree`` finding in
-``test_neighbors``: ``igl.oriented_bounding_box`` is threaded (``igl::parallel_for`` over the
-candidates) and its cost depends on the state of that thread pool. The same call at the same count
-measured 203 ms standalone against 60.6 ms in-harness, a 3.4x spread, so quote the in-harness
-median and nothing else.
+One warning about igl's row, in the spirit of the ``igl.octree`` finding in ``test_neighbors``:
+``igl.oriented_bounding_box`` is threaded and its cost depends on the state of that thread pool —
+the same call at the same count spreads several-fold between a standalone probe and the harness, so
+quote the in-harness median and nothing else.
 
 ``aabb_union`` gets no row: it is four ``wp.vec3`` component-wise minima at Python scope with no
-device work at all, so a row would time the interpreter. It is covered in ``tests/test_bounds.py``.
+device work, so a row would time the interpreter.
 
-The module's other half runs the opposite way -- points against a box that already exists -- and
-its three groups (``points_in_aabb``, ``crop_points``, ``crop_mesh``) share one shape: triwarp is
-**flat** in the input and open3d is **linear**, so each row is a *crossover* and not a ratio. The
-flat readings are the host launch floor -- three to five launches plus the one readback that sizes
-the output -- so nothing on triwarp's side is bandwidth-bound anywhere in this sweep, and a change
-here will show up as a slope long before it shows up as a level.
+The module's other half runs the opposite way — points against a box that already exists — and its
+three groups (``points_in_aabb``, ``crop_points``, ``crop_mesh``) share one shape: triwarp is
+**flat** in the input and open3d **linear**, so each row is a *crossover* and not a ratio. The flat
+readings are the host launch floor (three to five launches plus the one readback that sizes the
+output), so nothing on triwarp's side is bandwidth-bound anywhere in this sweep and a change will
+show up as a slope long before it shows up as a level. The crossover sits near 40 000 vertices for
+the two point groups and below 2 562 for the mesh crop, which is the one row worth reading as a win.
+Every row here is sub-10 ms and therefore clock-state bimodal (see ``benchmarks/README.md``), so
+treat the *crossover* as the finding and not any single ratio.
 
-In-harness medians on an RTX 5090 against open3d's one core, at 2 562 / 40 962 / 163 842 vertices:
+``crop_points`` is the ``points_in_aabb`` row plus a gather, kept rather than declined because
+open3d answers it through a *different* entry point (``PointCloud.crop`` rather than
+``get_point_indices_within_bounding_box``) whose extra work — materializing the survivors — is the
+same extra work triwarp does, so the two rows bracket it on both sides. Check a change against the
+gather's own cost, timed **interleaved** in one process, rather than against the difference of two
+medians from separate rows: it is one ``wp.copy`` launch and flat over the whole size range.
 
-| group | triwarp-cuda (µs) | open3d (µs) | triwarp / open3d |
-|---|---|---|---|
-| ``points_in_aabb`` | 271 / 230 / 301 | 15 / 243 / 991 | 0.06x / 1.06x / **3.29x** |
-| ``crop_points`` | 333 / 344 / 314 | 17 / 219 / 830 | 0.05x / 0.64x / **2.65x** |
-| ``crop_mesh`` | 1 108 / 1 000 / 1 037 | 186 / 3 014 / 13 718 | 0.17x / 3.02x / **13.2x** |
-
-So the crossover sits near 40 000 vertices for the two point groups and somewhere below 2 562 for
-the mesh crop, which is the one row that is worth reading as a win. Every row here is sub-10 ms and
-therefore clock-state bimodal (see ``benchmarks/README.md``), so treat the *crossover* as the
-finding and not any single ratio; the small-sphere columns are the launch floor being reported and
-mean nothing beyond "open3d has no floor".
-
-``crop_points`` is the ``points_in_aabb`` row plus a gather, and the row is kept rather than
-declined because open3d answers it through a *different* entry point (``PointCloud.crop`` rather
-than ``get_point_indices_within_bounding_box``) whose extra work -- materializing the survivors --
-is the same extra work triwarp does, so the two rows bracket it on both sides. The gather's own cost
-is the number to check a change against rather than the difference of two medians from separate
-rows: measured **interleaved** in one process, a flat 36-42 µs over the whole 64x size range, which
-is one ``wp.copy`` launch and matches section 13's launch cost model.
-
-The two ``*_mask`` entry points get **no** rows: each is its group's row minus the
-``flatnonzero`` that sizes the index buffer, so a row would re-time the same ``wp.map`` under a
-fourth and fifth name. They are covered in ``tests/test_bounds.py``.
+The two ``*_mask`` entry points get **no** rows: each is its group's row minus the ``flatnonzero``
+that sizes the index buffer, so a row would re-time the same ``wp.map`` under a fourth and fifth
+name.
 
 **No reference other than open3d answers the query half**, which was checked rather than assumed:
-trimesh has no box crop for either a cloud or a mesh, and pyvista's ``clip_box`` is a *clip* -- it
+trimesh has no box crop for either a cloud or a mesh, and pyvista's ``clip_box`` is a *clip* — it
 splits the straddling cells and introduces vertices the input never had, so it answers a different
 question (its ``crinkle=True`` mode keeps whole cells, which is ``face_mode="any"`` and not the
 all-corners rule these groups time).
@@ -196,9 +177,9 @@ def test_enclosing_diagonal(bench_case: BenchCase) -> None:
     that launch costs on top of the single-cloud reduction. Every ``max_dist=None`` call in
     ``proximity``, ``ray``, ``visibility`` and ``registration`` pays exactly this.
 
-    Reducing a concatenation of the two clouds instead was measured and declined: 0.88-0.95x from
-    1e3 to 4e6 points, because the union is an allocation and a copy of both clouds against one
-    launch that is flat in its ``dim``.
+    Reducing a concatenation of the two clouds instead is declined -- a loss at every size --
+    because the union is an allocation and a copy of both clouds against one launch that is flat in
+    its ``dim``.
 
     igl's ``bounding_box_diagonal`` takes one point set, so its side is fed the stacked cloud --
     which makes its row also price the ``vstack`` a caller would need, and that copy is the point:
@@ -279,8 +260,8 @@ def test_points_in_aabb(bench_case: BenchCase) -> None:
     Read this row as a **crossover, not a ratio**. triwarp is flat -- one ``wp.map``, one
     ``array_cast``, one scan, one 4-byte readback and one scatter, none of which the vertex count
     moves at these sizes -- while open3d walks the cloud once on one core and grows linearly, so
-    open3d wins by 17.6x at 2 562 vertices and loses by 3.29x at 163 842. Neither endpoint means
-    anything alone; the sweep is the measurement.
+    open3d wins by an order of magnitude at the small end and loses by several times at the large
+    one. Neither endpoint means anything alone; the sweep is the measurement.
 
     open3d's ``get_point_indices_within_bounding_box`` returns exactly this index list and is
     compared against it element-wise in ``tests/test_bounds.py``. The ``Vector3dVector`` its box
@@ -308,7 +289,7 @@ def test_crop_points(bench_case: BenchCase) -> None:
     """
     The selection plus the gather that materializes it -- ``points_in_aabb`` with the copy included.
 
-    The gather is a flat 0.036-0.042 ms over a 64x size range (one ``wp.copy`` launch), so this row
+    The gather is flat over the whole size range (one ``wp.copy`` launch), so this row
     should track the ``points_in_aabb`` row at a constant offset and any *slope* appearing here is
     the finding. Both sides materialize: open3d's ``PointCloud.crop`` runs the same index query as
     the group above and then copies the survivors through ``SelectByIndex``, and triwarp returns
@@ -337,8 +318,8 @@ def test_crop_mesh(bench_case: BenchCase) -> None:
     """
     The vertex query, the all-corners face reduction, and the compaction that reindexes from zero.
 
-    The module's widest gap and the one worth watching: **13.2x at 163 842 vertices** (1.04 ms
-    against 13.72) where the two point groups manage 2.65-3.29x, because the mesh crop is where the
+    The module's widest gap and the one worth watching: an order of magnitude at the top of the
+    sweep, where the two point groups manage a few times, because the mesh crop is where the
     work stops being one comparison per point -- the face reduction and the vertex compaction both
     scale, and open3d does them serially. It is also flat on triwarp's side across the whole sweep,
     which says the four-launch chain is still host-bound at 327 680 faces and that a change here
@@ -347,7 +328,7 @@ def test_crop_mesh(bench_case: BenchCase) -> None:
     This is the row that pins the mask-input route through
     [`triwarp.selection.submesh_from_vertex_mask`][triwarp.selection.submesh_from_vertex_mask]:
     the crop hands it a mask, which reduces onto faces directly rather than going back through
-    ``isin``, and that route measured 1.96x on CUDA in isolation. Reading this row against the
+    ``isin``, and that route is about 2x on CUDA in isolation. Reading this row against the
     ``submesh`` groups in ``benchmarks/test_selection.py`` is how a regression in either is
     attributed.
 
@@ -380,27 +361,27 @@ def test_oriented_bounding_box(bench_case: BenchCase) -> None:
     Cost is ``rotations * n_vertices`` point transforms for the global phase plus eight 512-frame
     refinement rounds of device-side frame generation, extent scoring and selection. The whole
     search runs on the device and reads back one row at the end, so what this row times is device
-    work plus a fixed launch chain -- measured on a 36k cloud, 0.29 ms sampled against 1.03 ms
-    refined. The row times the *default*, refinement included, because that is what a caller gets
-    -- and what the quality bands in ``tests/test_bounds.py`` are measured against; igl walks the
-    same global candidates over a CPU ``parallel_for`` with no refinement phase.
+    work plus a fixed launch chain, of which the refinement is the larger part. The row times the
+    *default*, refinement included, because that is what a caller gets -- and what the quality
+    bands in ``tests/test_bounds.py`` are checked against; igl walks the same global candidates over
+    a CPU ``parallel_for`` with no refinement phase.
 
     The CPU references run into hundreds of milliseconds on ``bunny`` and take ``rounds=3`` for it,
     the same allowance the other second-scale rows in the suite use.
 
     **pyvista's row is PCA of the points**, a single fixed orientation rather than a search -- so it
     is the floor of this group by construction and the only reference here that triwarp should beat
-    on *quality* as well (measured 0.84x its volume on a tilted half_torus).
+    on *quality* as well.
 
     open3d times ``get_minimal_oriented_bounding_box`` -- its hull-based approximate minimizer,
     the same algorithm family as trimesh's row -- not ``get_oriented_bounding_box``, whose PCA box
-    does not minimize anything (measured 12.9% above triwarp's volume on the tilted half_torus
-    where the minimal box sits within 2%). Like both other references it is insensitive to
+    does not minimize anything and sits measurably above triwarp's volume on a tilted fixture where
+    the minimal box is close to it. Like both other references it is insensitive to
     ``_ROTATIONS`` by construction.
     """
     if bench_case.kind == "pyvista":
-        # PCA of the points: one fixed orientation, so it is a floor and not a minimizer (measured
-        # up to 19% above triwarp's volume in tests/test_bounds.py).
+        # PCA of the points: one fixed orientation, so it is a floor and not a minimizer (the
+        # volume gap is pinned in tests/test_bounds.py).
         mesh_pv = bench_case.mesh_pv
         box_pv = bench_case.run(lambda: mesh_pv.oriented_bounding_box(as_composite=False), rounds=3)
         assert box_pv.volume > 0.0

@@ -1,11 +1,11 @@
 """
 Regenerate ``benchmarks/_known_slow_libraries.json`` from a full benchmark round's JSON output.
 
-The full suite spends most of its wall clock on reference libraries, not on triwarp: round 10
-measured 50.4 minutes of pytest-benchmark's own timed regions across the suite, of which
-**43.4 minutes (86 %)** was reference-library rows rather than triwarp's own. Most of that buys
-nothing -- a library that is already 10x or 1000x slower than triwarp on one cell does not become
-more informative by being timed again on the next mesh size. ``benchmarks/conftest.py``'s
+The full suite spends most of its wall clock on reference libraries, not on triwarp: measured, the
+overwhelming majority of pytest-benchmark's own timed regions across the suite is reference-library
+rows rather than triwarp's own. Most of that buys nothing -- a library that is already orders of
+magnitude slower than triwarp on one cell does not become more informative by being timed again on
+the next mesh size. ``benchmarks/conftest.py``'s
 ``bench_case`` / ``bench_lib`` fixtures skip a reference-library row outright when this table says
 so, the same way ``skip_larger_than`` skips one by hand at a handful of call sites -- except this
 table is generated rather than written by hand, because 668 sites is too many to place
@@ -21,11 +21,11 @@ individually.
 
 This is deliberately **per-library, not per-cell**: a cell with three references where only the
 third is a decisive loss keeps the other two. A stronger, per-*cell* policy -- if even the single
-fastest reference already loses to triwarp by 5x, skip every reference for that cell outright --
-was measured (``plans/benchmark-round-10.md``) to save a comparable amount (30.9 of 43.4 minutes)
-precisely because it also catches the single-reference cells this per-library policy cannot touch,
-but is not the default here: it was still being evaluated, not adopted, when this table was cut.
-Re-run ``plans/benchmark-round-10-data/`` style analysis before raising ``--ratio`` past that.
+fastest reference already loses to triwarp by a wide margin, skip every reference for that cell
+outright -- was measured to save a comparable amount, precisely because it also catches the
+single-reference cells this per-library policy cannot touch, but it is not the default here: it was
+still being evaluated, not adopted, when this table was cut. Re-run that analysis before raising
+``--ratio`` past this one.
 
 **Staleness.** This table is a snapshot, not a live measurement -- a future optimization could
 flip a skipped cell back into a genuinely close race, and this script would not know until someone

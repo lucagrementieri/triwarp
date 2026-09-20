@@ -14,10 +14,10 @@ Three axes, because the module holds three different kinds of function:
   owns.
 * **neighbourhood size** for ``interpolate_from_points``, whose kernel is one pass over the CSR a
   ball query returns -- so the row is really the query's output size, and the radius is derived from
-  the mean edge length to hold the neighbour count fixed across meshes. Measured 0.73 / 2.35 ms on
-  ``bunny`` at 8 / 64 neighbours, against pyvista's 27 / 97 ms; and 18 ms on ``dragon`` at 64. The
-  64-neighbour case is capped at ``happy_buddha`` because the CSR is ``n_queries * neighborhood``
-  pairs and lucy would ask for 5.0 GB.
+  the mean edge length to hold the neighbour count fixed across meshes; triwarp leads pyvista by
+  well over an order of magnitude at both widths. The 64-neighbour case is capped at
+  ``happy_buddha`` because the CSR is ``n_queries * neighborhood`` pairs and lucy would ask for
+  several gigabytes.
 
 ``average_onto_vertices`` and ``transfer_onto_vertices`` were previously timed in
 [`test_vertices.py`](test_vertices.py). They moved here with their group names unchanged, because
@@ -42,7 +42,8 @@ mean of ``average_onto_vertices``, and ``transfer_attributes_per_vertex(qualityt
 the barycentric pull. Both read and write mesh *attributes* rather than taking arrays, so each row
 seeds the input attribute and reads the output one; the transfer needs **two** meshes in the set and
 writes into the second, so that row builds a fresh two-mesh MeshSet inside the timed callable --
-twice the ~0.47 µs/vertex build cost, which at ``bunny`` is 34 ms before any transfer happens.
+twice the per-vertex build cost, which on a scan mesh is most of the row before any transfer
+happens.
 
 **pyvista**'s ``DataSet.interpolate`` is ``interpolate_from_points``'s reference: a
 ``vtkPointInterpolator`` with a ``vtkGaussianKernel``, given the identical radius and sharpness, so
@@ -322,10 +323,9 @@ def test_transfer_through_operator(bench_case: BenchCase) -> None:
     invariant-only claim (the operator reproduces the pass's own positions) rather than a library
     comparison, and this group contributes no parity pair by construction.
 
-    First measurement, medians on an RTX 5090: **118 us** on ``bunny`` and **120** on
-    ``bunny_decimated`` -- flat, because the row is one CSR pass and the field is small next to the
-    launch floor. ``transfer_onto_vertices`` on the same ``bunny`` field is **814 us**, so the
-    operator is ~7x cheaper *and* exact where the projection is lossy; the projection's advantage is
+    Flat across the mesh pair, because the row is one CSR pass and the field is small next to the
+    launch floor. ``transfer_onto_vertices`` on the same field is several times dearer, so the
+    operator is cheaper *and* exact where the projection is lossy; the projection's advantage is
     that it needs no operator, which is the trade the two docstrings state.
     """
     skip_larger_than(bench_case, "bunny", "one Loop pass quadruples the face count")
@@ -364,9 +364,9 @@ def test_interpolate_from_points(bench_case: BenchCase, neighborhood: int) -> No
     radius = float(np.sqrt(neighborhood / np.pi)) * _mean_edge_length(bench_case)
     if neighborhood > 8:
         # The ball query materializes ``n_queries * neighborhood`` (index, distance) pairs before
-        # the kernel reduces them: 8 bytes each, so lucy at 64 asks for 5.0 GB and the allocation
-        # fails outright. The cap is on the *product*, not on the mesh.
-        skip_larger_than(bench_case, "happy_buddha", "a 64-neighbour CSR over lucy needs 5.0 GB")
+        # the kernel reduces them: 8 bytes each, so lucy at 64 asks for several gigabytes and the
+        # allocation fails outright. The cap is on the *product*, not on the mesh.
+        skip_larger_than(bench_case, "happy_buddha", "a 64-neighbour CSR over lucy is gigabytes")
     if bench_case.kind == "pyvista":
         skip_larger_than(bench_case, "bunny", "VTK's point interpolator is a serial locator walk")
         source_pv = pv.PolyData(np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64))

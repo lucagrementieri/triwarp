@@ -43,8 +43,8 @@ def accumulate_counted_mean(
     # One kernel rather than a ``wp.map`` building a ``count > 0`` mask and two ``reduce.sum``
     # calls over it and over ``mean_distance``. The mask existed only to be counted, so it went
     # with them: a map, an ``n``-length allocation and two reductions -- each of which is a launch,
-    # an allocation and a host readback -- measured 136 us of a 346 us call on an RTX 5090, where
-    # this is one launch and one readback of sixteen bytes.
+    # an allocation and a host readback -- against one launch and one sixteen-byte readback here,
+    # which is a large fraction of the whole call.
     #
     # ``float64`` slots, not ``float32``: slot 0 is a *count*, and a float32 stops representing
     # consecutive integers at 2 ** 24, which a large cloud reaches. Summing the distances at the
@@ -86,26 +86,18 @@ def centered_covariance(
     # ``reduce`` and imported from there, and what is left is a point-cloud statistic whose only
     # callers are ``points``' own ``gram_matrix`` / ``fit_line`` / ``fit_plane``. ``triwarp.reduce``
     # is axis-parametrized array reductions in NumPy's vocabulary; a mat33 of second moments is not
-    # one of those (§11, the machinery half outranks the subject half).
+    # one of those (section 11, the machinery half outranks the subject half).
+    #
     # Launched ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``: one block per
     # ``ITEMS_PER_BLOCK_1D`` points, lanes striding that block's own chunk, nine ``wp.tile_sum``
     # tree reductions, one ``wp.mat33`` atomic per block.
     #
-    # It was every lane walking a ``TILE_1D`` chunk with lane 0 publishing its own copy, which put
-    # one add per block on each of nine hot addresses at ``n / TILE_1D`` blocks. The redundant lane
-    # arithmetic was not the cost -- the block count was; the same finding as
-    # ``registration.accumulate_procrustes_moments``, where removing the redundancy alone was
-    # measured at 1.02-1.13x. Interleaved A/B, min of seven alternating reps on an RTX 5090:
-    #
-    #   n              5 000    20 000   200 000   1 000 000
-    #   every-lane     0.0176   0.0169   0.0411    0.1663  ms
-    #   lane-strided   0.0173   0.0164   0.0147    0.0169  ms
-    #   speed-up       1.02x    1.03x    2.80x     9.82x
-    #
-    # Nine reductions is the cheapest accumulator in this family to amortize, which is why it turns
-    # over sooner than the 25- and 43-slot ``registration`` pair. Against a float64 reference the
-    # tree is 1.24e-07 / 5.64e-07 at n = 200 000 / 1 000 000 where the serialized form is
-    # 6.07e-07 / **3.56e-06**.
+    # **The redundant lane arithmetic is not the cost -- the block count is**, the same finding as
+    # ``registration.accumulate_procrustes_moments``: what costs is one add per block on each of
+    # nine hot addresses, so the lever is the fold width. Flat at small ``n``, an order of magnitude
+    # at a million points. Nine reductions is the cheapest accumulator in this family to amortize,
+    # which is why it turns over sooner than the 25- and 43-slot ``registration`` pair. The tree is
+    # also the more accurate of the two, by about an order of magnitude at large ``n``.
     #
     # No ``prefers_tiled_reduction`` branch, for the reason in ``.claude/CLAUDE.md`` section 2.2:
     # the lanes partition a chunk the block already owns and stride by ``wp.block_dim()``, which
@@ -172,8 +164,8 @@ def finalize_principal_axes(
 ) -> None:
     # One ``(5,)`` output buffer rather than three, because all three results cross to the host
     # together: rows 0-2 are the rotation's rows, row 3 the eigenvalues, row 4 the centroid --
-    # the order ``principal_axes`` returns them in. Three separate readbacks measured 95.6 us
-    # against 22.7 for one.
+    # the order ``principal_axes`` returns them in. One readback of five rows is several times
+    # cheaper than three readbacks of one.
     # ``wp.svd3`` returns singular values in descending order, so the columns of ``u`` are the
     # principal axes from widest to narrowest. The rows of the result are those axes, which is the
     # convention that makes ``rotation * p`` the coordinates of ``p`` in the principal frame.
@@ -408,32 +400,18 @@ def nearest_pair_keys(
 # persistent block, so this is the whole launch's width and there is nothing else to tune.
 #
 # **Three brackets, and the middle one is what a Warp 1.17 re-probe added.** The original reading
-# was taken on Warp 1.16 against the capture-and-replay loop this kernel replaced (two replayed
-# kernels per sample, ~2 us each) and sampled only 256 and 1024, which is why it read as two
-# brackets split at 4 096. Re-measured on an RTX 5090 / Warp 1.17 over 128 / 256 / 512 / 1024,
-# interleaved, med/min of 11, with the selected index buffer **identical at every width in every
-# row** (so this is a pure cost choice) -- median ms at ``count = 1024``:
+# was taken on Warp 1.16 against the capture-and-replay loop this kernel replaced and sampled only
+# two widths, which is why it read as two brackets. A finer sweep -- interleaved, with the selected
+# index buffer **identical at every width in every row**, so this is a pure cost choice -- shows a
+# third bracket in between that the coarse one straddled: a small cloud wants a narrow block, a
+# large one wants the widest, and there is a real middle band that wants 512.
 #
-# |       n |    128 |    256 |    512 |   1024 | best |
-# |---------|--------|--------|--------|--------|------|
-# |     642 |   0.75 | **0.67** |   0.79 |   1.07 |  256 |
-# |   1 024 |   0.82 | **0.71** |   0.78 |   1.13 |  256 |
-# |   2 048 |   1.21 | **0.92** |   0.93 |   1.28 |  tie |
-# |   2 562 |   1.47 |   1.10 | **1.05** |   1.37 |  512 |
-# |   3 072 |   1.59 |   1.14 | **1.07** |   1.42 |  512 |
-# |   4 096 |   5.40 |   1.35 | **1.21** |   1.56 |  512 |
-# |   5 120 |   7.56 |   1.54 | **1.33** |   1.67 |  512 |
-# |   6 144 |   8.85 |   4.32 |   2.68 | **1.77** | 1024 |
-# |  10 242 |  13.43 |   7.12 |   4.12 | **3.01** | 1024 |
-# |  40 962 |  51.79 |  26.44 |  14.01 | **8.50** | 1024 |
-# | 163 842 | 204.96 | 103.73 |  53.72 | **30.31** | 1024 |
+# The brackets are **not** an artefact of ``count``: re-run at a quarter of the sample count, the
+# best width is the same at every size. Against the two-bracket dispatch this replaces the win is
+# largest exactly at the old crossover, where a cloud that wants 512 lanes was handed 1 024. 2 048
+# is where 256 and 512 measure a tie, which is what makes it a safe boundary in either direction.
 #
-# The brackets are **not** an artefact of ``count``: re-run at ``count = 256`` the best width is the
-# same at every size (642 -> 256, 2 562 and 4 096 -> 512, 6 144 and 40 962 -> 1024).
-#
-# Against the two-bracket dispatch this replaces, the win is 1.05x at 2 562 and **1.29x at exactly
-# 4 096**, where the old crossover handed a cloud that wants 512 lanes to 1 024. 2 048 is where 256
-# and 512 measure a tie, which is what makes it a safe boundary in either direction.
+# A constant whose sweep sampled only two values has not been shown to be a two-bracket problem.
 FARTHEST_BLOCK_SMALL = 256
 FARTHEST_BLOCK_MID = 512
 FARTHEST_BLOCK_MID_FROM = 2048
@@ -457,13 +435,12 @@ def farthest_point_sample_block(
     #
     # Why a single block wins here where it loses elsewhere (``kernels/holes.py::
     # fill_dp_span_tiled`` measured the opposite): a round is ``n`` distance updates, which one SM
-    # finishes in about a
-    # microsecond, and the alternative -- one launch per round, even replayed from a captured graph
-    # -- paid ~2 us of launch per kernel with the device idle. So the per-round cost is what moved,
-    # 3.6x on 2 562 points and 2.2-2.5x on 10k-41k (see ``FARTHEST_BLOCK_SMALL``). The tie-break is
-    # the shipped one: ``pack_farthest_key`` orders equal distances towards the lower index, and the
-    # block max over those keys is the same maximum whatever lane holds it, so the selection is
-    # reproducible and matches the reference's strict ``>`` arg-max.
+    # finishes in about a microsecond, and the alternative -- one launch per round, even replayed
+    # from a captured graph -- paid more than that in launch cost with the device idle. So the
+    # per-round cost is what moved. The tie-break is the shipped one: ``pack_farthest_key`` orders
+    # equal distances towards the lower index, and the block max over those keys is the same maximum
+    # whatever lane holds it, so the selection is reproducible and matches the reference's strict
+    # ``>`` arg-max.
     #
     # ``min_distance_sq`` is caller-allocated scratch, initialized here rather than by ``wp.full``
     # so the wrapper is one launch. The stride is ``wp.block_dim()`` rather than the constant so the
@@ -513,20 +490,13 @@ def hull_support_extremes(
     # `wp.tile_max` on both devices because its stride *is* `wp.block_dim()`.
     #
     # **Converting this to one block per direction was measured and refuted**, which is worth
-    # recording because the analogous rewrite of `kernels/visibility.py::obscurance` measured
-    # 3.2-11.8x and the shapes look alike. They are not: `obscurance` launched `dim = n_points` with
-    # no second dimension, so the outer dimension alone was starving the device (8 171 threads),
-    # while this kernel's *slice* dimension is what fills it. Collapsing that into `block_dim` lanes
-    # leaves one block per direction. Measured on an RTX 5090, interleaved, `min` of 11, answers
-    # bit-identical:
-    #
-    # | points  | grid here      | block per direction        |
-    # |---------|----------------|----------------------------|
-    # |   5 000 | 13 x 40        | 2.3x faster                |
-    # | 200 000 | 13 x 1 563     | **0.12-0.60x -- a 2-8x loss** |
-    #
-    # The win is at the size where the call is already 0.056 ms and the loss where it matters, which
-    # is section 13's decline shape exactly. Do not re-propose it from the comment above.
+    # recording because the analogous rewrite of `kernels/visibility.py::obscurance` was a large win
+    # and the shapes look alike. They are not: `obscurance` launched `dim = n_points` with no second
+    # dimension, so the outer dimension alone was starving the device, while this kernel's *slice*
+    # dimension is what fills it. Collapsing that into `block_dim` lanes leaves one block per
+    # direction: measured with answers bit-identical, that is a win on a small cloud -- where the
+    # call is already microseconds -- and a several-fold **loss** on a large one, which is section
+    # 13's decline shape exactly. Do not re-propose it from the comment above.
     local_max = wp.float32(-FLOAT32_INF_CONSTANT)
     local_min = wp.float32(FLOAT32_INF_CONSTANT)
     for i in range(j, n_p, n_slices):

@@ -67,17 +67,16 @@ def closest_point_on_edges(
 ) -> None:
     # The wireframe counterpart of ``closest_point_on_mesh``, and the reason it is a hand-written
     # traversal rather than a ``wp.mesh_query_point_no_sign`` over degenerate triangles: that query
-    # **rejects** a zero-area triangle outright. Re-measured on Warp 1.17, 200 segments as
-    # ``(a, b, b)`` triangles and 64 queries: ``result`` is false for 64 of 64 on both devices, so
-    # that shortcut answers nothing at all rather than answering approximately.
+    # **rejects** a zero-area triangle outright, on both devices, so that shortcut answers nothing
+    # at all rather than answering approximately.
     #
     # 1.17's ``wp.mesh_query_sphere`` *does* handle them -- it falls back to a closest-point-on-
-    # longest-edge test, and the same probe finds a hit for 64 of 64 rows at r=0.3. It is still not
-    # the shortcut, for two reasons: it answers "which faces meet this ball", not "which point is
-    # nearest", so the deepening loop and the ``closest_point_on_segment`` narrow phase below both
-    # stay; and reaching it would mean carrying a ``wp.Mesh`` of degenerate triangles in place of
-    # the ``wp.Bvh`` over edge bounds, which is the same broad phase through a heavier object. What
-    # 1.17 did buy this kernel is the sphere query on the BVH it already has, below.
+    # longest-edge test. It is still not the shortcut, for two reasons: it answers "which faces meet
+    # this ball", not "which point is nearest", so the deepening loop and the
+    # ``closest_point_on_segment`` narrow phase below both stay; and reaching it would mean carrying
+    # a ``wp.Mesh`` of degenerate triangles in place of the ``wp.Bvh`` over edge bounds, which is
+    # the same broad phase through a heavier object. What 1.17 did buy this kernel is the sphere
+    # query on the BVH it already has, below.
     #
     # Iterative deepening, sharing ``complete_radius`` / ``deepen_radius`` with the k-NN kernels
     # next door: a scan of the **ball** of radius ``r`` about ``q`` enumerates every edge whose
@@ -196,14 +195,13 @@ def face_to_mesh_distance(
     # not the answer, since it only ever skips pairs that cannot beat a distance already achieved.
     #
     # **``candidate_cap`` is what makes this the first of two passes.** The traversal is wildly
-    # unbalanced: measured on ``bunny`` against a translated copy, **98.2 %** of query faces have no
-    # candidate at all and **0.5 %** carry half of the 2.0 M candidate tests, the busiest walking
-    # **3 428** of them alone. So a thread that is still going after ``candidate_cap`` candidates
-    # stops, appends its face to ``overflow``, and lets ``face_to_mesh_distance_tiled`` re-walk it
-    # with a whole block. Pass a cap of ``INT32_MAX`` to disable the split and settle every face
-    # here, which is what the CPU device does -- ``wp.launch_tiled`` runs one lane per block there.
-    # ``wp.mesh_get_bvh`` (Warp 1.17) hands back the ``wp.Mesh``'s *own* BVH over its faces, so the
-    # caller builds no second structure -- see the wrapper for the measured share.
+    # unbalanced: the overwhelming majority of query faces have no candidate at all, and a fraction
+    # of a percent carry half of the candidate tests. So a thread that is still going after
+    # ``candidate_cap`` candidates stops, appends its face to ``overflow``, and lets
+    # ``face_to_mesh_distance_tiled`` re-walk it with a whole block. Pass a cap of ``INT32_MAX`` to
+    # disable the split and settle every face here, which is what the CPU device does --
+    # ``wp.launch_tiled`` runs one lane per block there. ``wp.mesh_get_bvh`` (Warp 1.17) hands back
+    # the ``wp.Mesh``'s *own* BVH over its faces, so the caller builds no second structure.
     target_bvh = wp.mesh_get_bvh(target_mesh)
     f = wp.int32(wp.tid())
     a0, a1, a2 = kernel_triangles.face_vertices(query_vertices, query_faces, f)
@@ -297,9 +295,8 @@ def face_to_mesh_distance_tiled(
         # CLAUDE.md section 12.2 for the read of Warp's own source; the short version is that
         # ``tile_bvh.h`` counts results with an unconditional ``atomicAdd`` and guards only the
         # *write* against a ``block_dim * 5`` capacity, so once a round overruns it the consumer
-        # reads uninitialised shared memory as a primitive index. Measured here: 7 007 straggler
-        # faces of ``lucy`` against a translated copy read **12.26 GB past the nearest
-        # allocation**, ``compute-sanitizer`` naming this kernel and this load.
+        # reads uninitialised shared memory as a primitive index. ``compute-sanitizer`` names this
+        # kernel and this load, reading wildly out of range, on a large straggler set.
         if candidate >= 0 and candidate < n_target_faces:
             distance_sq = face_pair_distance_sq(
                 a0,
@@ -332,12 +329,11 @@ def face_to_mesh_distance_tiled(
     # here is the *running global minimum* -- which, by the time this pass runs, is frequently the
     # answer itself, published by this very face in the grid pass. Its re-walk then prunes every
     # candidate including the pair that achieved it, comes back ``inf``, and overwrites the right
-    # answer with it. Measured before the fix: ``mesh_to_mesh_distance`` between two unit sheets
-    # 0.3 apart returned **inf** on CUDA from **512 faces** up -- every face overflows the cap, so
-    # every face is re-walked -- where the cpu device, which runs no second pass at all, returned
-    # 0.300000. This is the identical bound-is-the-answer trap the ``global_best_sq`` seeding in
-    # the wrapper documents, one level down: there the fix is a relative bump on the seed, here it
-    # is keeping what the first pass already found.
+    # answer with it: two close parallel sheets returned ``inf`` on CUDA at every size where every
+    # face overflows the cap, while the cpu device, which runs no second pass at all, returned the
+    # right distance. This is the identical bound-is-the-answer trap the ``global_best_sq`` seeding
+    # in the wrapper documents, one level down: there the fix is a relative bump on the seed, here
+    # it is keeping what the first pass already found.
     #
     # It is also what makes this pass **safe against the ``wp.tile_bvh_query_aabb`` result-buffer
     # overrun** the guard above can only half-fix (CLAUDE.md section 12.2): a round that silently
@@ -487,13 +483,11 @@ def winding_number_tiled(
     #
     # **The block-per-query rewrite was measured here and declined.** It looked like the strongest
     # candidate in the tree -- the query dimension is already the outer one and the walk covers
-    # every face -- and the gain evaporates as the grid fills. Measured on an RTX 5090,
-    # interleaved, `min` of 9, agreeing to 6e-07 (a different summation order, not a different
-    # answer): **2.16x** at 1 280 faces and 4 096 queries, **1.19x** at 5 120 faces, **1.01x** at
-    # 5 120 faces and 65 536 queries. A gain that shrinks with the input is a decline (CLAUDE.md
-    # section 9), and the reason is that this grid is `n_queries x n_face_slices` and already
-    # wide; see `kernels/points.py::hull_support_extremes` for the same trade measured to an
-    # outright 2-8x loss.
+    # every face -- and the gain evaporates as the grid fills: a real win on a small mesh with few
+    # queries, and nothing at all once the query count is large. A gain that shrinks with the input
+    # is a decline (CLAUDE.md section 9), and the reason is that this grid is
+    # `n_queries x n_face_slices` and already wide; see `kernels/points.py::hull_support_extremes`
+    # for the same trade measured to an outright loss.
     #
     # Note this is *not* why `winding_number` above exists -- that is the public `tiled=False`
     # exact-sum reference, with its own benchmark group, and no conversion here would retire it.
@@ -589,14 +583,12 @@ def face_containing_point_2d(
     # The candidate is sufficient rather than merely plausible: a point inside some triangle is at
     # distance zero from it, so the closest triangle is a containing one whenever any exists.
     #
-    # The two-stage form is not redundant. Accepting on the query radius alone was measured to
-    # misclassify ~0.2% of random queries on a 3 979-triangle Delaunay mesh -- the closest-point
-    # distance for an in-plane point is not exactly zero in float32, so a radius tight enough to
-    # reject points just outside the triangulation also rejects points just inside it, and no radius
-    # separates the two (73 / 28 / 6 interior points missed at 1e-7 / 1e-6 / 1e-5 of the bounding
-    # diagonal, against 0 / 14 / 59 exterior points falsely accepted at 1e-5 / 1e-4 / 1e-3). The
-    # barycentric test is a sign test on the query's own coordinates, ~1000x sharper, so the radius
-    # only has to be loose enough to find the candidate.
+    # The two-stage form is not redundant. Accepting on the query radius alone misclassifies a
+    # fraction of a percent of random queries -- the closest-point distance for an in-plane point is
+    # not exactly zero in float32, so a radius tight enough to reject points just outside the
+    # triangulation also rejects points just inside it, and **no radius separates the two**. The
+    # barycentric test is a sign test on the query's own coordinates, orders of magnitude sharper,
+    # so the radius only has to be loose enough to find the candidate.
     tid = wp.int32(wp.tid())
     p = points[tid]
     out_face[tid] = wp.int32(-1)

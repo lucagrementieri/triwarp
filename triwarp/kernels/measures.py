@@ -25,16 +25,15 @@ def centroid_tiled(
     # kernel. See `centroid_sliced` and `_device.prefers_tiled_reduction`.
     #
     # **Rewriting it into the lane-strided `ITEMS_PER_BLOCK_1D` fold was measured and declined**,
-    # and the number is worth keeping: the same rewrite is worth 2.8-10.7x on the `registration`
-    # and `points` accumulators (`.claude/CLAUDE.md` section 13.2). Built as
+    # and the reason is worth keeping, because the same rewrite is worth several-fold on the
+    # `registration` and `points` accumulators (`.claude/CLAUDE.md` section 13.2). Built as
     # `tile_chunk(n_faces, chunk, ITEMS_PER_BLOCK_1D)` plus a `wp.block_dim()` stride -- which would
-    # also make it portable and retire `centroid_sliced` -- it measures **0.98-1.01x** at 1 280 /
-    # 20 480 / 81 920 / 327 680 faces, the areas agreeing to 1.5e-07: flat everywhere. The fold pays
-    # on *atomic contention*, and contention here is `blocks x slots`: 5 120 blocks x 4 slots is
-    # ~2e4 atomics at 327k faces, where the accumulators that won were at ~1e5 (3 125 blocks x 25 or
-    # 43 slots at 200k-1M points). Below that the launch floor hides it. With no CUDA win to pay for
-    # it the portability is not free either -- `blocks_1d(n)` would give the CPU path `n / 1024`
-    # single-lane blocks against `slice_count`'s `n / 32` threads -- so the device pair stays.
+    # also make it portable and retire `centroid_sliced` -- it measures flat at every mesh size. The
+    # fold pays on *atomic contention*, and contention here is `blocks x slots`: four slots is an
+    # order of magnitude short of the accumulators that won, which carry twenty-five and
+    # forty-three. Below that the launch floor hides it. With no CUDA win to pay for it the
+    # portability is not free either -- `blocks_1d(n)` would give the CPU path far fewer,
+    # single-lane blocks than `slice_count`'s threads -- so the device pair stays.
     #
     # The area comes from ``triangle_double_area`` over the corners already in registers, not from
     # ``face_normals_and_area``: that helper re-enters ``face_vertices`` through ``triangle_cross``,
@@ -71,15 +70,14 @@ def centroid_sliced(
 ) -> None:
     # Portable path: one thread per face slice walks a strided slice, accumulates locally and
     # commits four atomics. Lane-free, so it is correct on the CPU device where `centroid_tiled`
-    # is not; it gives up the block shuffle-reduce and measures 1.67x slower on CUDA at 327k faces
-    # (16.0 -> 26.7 us), which is why both exist.
+    # is not; it gives up the block shuffle-reduce and is measurably slower on CUDA at a large face
+    # count, which is why both exist.
     #
-    # The bug this sibling exists to prevent, since the sentence naming it was lost in an edit and
-    # only its second half survived: running `centroid_tiled` on the CPU device silently averaged
-    # **every TILE_1D-th face** rather than every face, because `wp.launch_tiled` gives that device
-    # one lane per block, so `t` is always 0 and `f = i * TILE_1D + t` skips the rest of each tile.
-    # It was invisible on a symmetric mesh, whose every-Nth-face centroid is still the true
-    # centroid.
+    # The bug this sibling exists to prevent: running `centroid_tiled` on the CPU device silently
+    # averaged **every TILE_1D-th face** rather than every face, because `wp.launch_tiled` gives
+    # that device one lane per block, so `t` is always 0 and `f = i * TILE_1D + t` skips the rest of
+    # each tile. It was invisible on a symmetric mesh, whose every-Nth-face centroid is still the
+    # true centroid.
     #
     # Same corner-loading note as `centroid_tiled` above: the area is taken from the corners this
     # loop already holds.
@@ -104,50 +102,34 @@ def moment_integrals(
     chunk_faces: wp.int32,
     out_totals: wp.array[wp.float64],
 ) -> None:
-    # The ten mass integrals of the solid bounded by the mesh, summed over faces, into one
-    # ``(10,)`` accumulator: volume, then the three first moments, the three second moments and the
-    # three products, in the order ``measures.moments`` reads them back.
+    # The ten mass integrals of the solid bounded by the mesh, summed over faces into one ``(10,)``
+    # accumulator: volume, the three first moments, the three second moments and the three
+    # products, in the order ``measures.moments`` reads them back.
     #
     # The reduction is *in* this kernel rather than four ``wp.utils.array_sum`` calls over four
-    # per-face buffers, which is what it used to be. Those cost 160.6 us of a 260.0 us call on an
-    # RTX 5090 and returned their totals through four separate host readbacks, and the per-face
-    # buffers themselves were 80 bytes a face -- 6.5 MB at 81 920 faces -- written once and read
-    # once. Fused, the whole function is one launch, one ten-element allocation and one readback.
+    # per-face buffers, which is four host readbacks over 80 bytes a face written once and read
+    # once. Launched ``wp.launch_tiled(dim=[ceil(n_faces / chunk_faces)], block_dim=TILE_1D)``,
+    # lanes striding their own block's chunk by ``wp.block_dim()`` so it is correct on the CPU
+    # device too (CLAUDE.md section 2.2) -- the same form as ``points.centered_covariance``, and
+    # unlike ``centroid_tiled`` above, whose lanes partition the outer work and which therefore
+    # needs a device pair.
     #
-    # Launched ``wp.launch_tiled(dim=[ceil(n_faces / chunk_faces)], block_dim=TILE_1D)``: one block
-    # per ``chunk_faces`` faces, lanes striding that block's own chunk by ``wp.block_dim()``, ten
-    # ``wp.tile_sum`` tree reductions and ten atomics per block. Striding by ``wp.block_dim()``
-    # rather than a constant is what makes it correct on the CPU device too, where
-    # ``wp.launch_tiled`` gives a block one lane (``.claude/CLAUDE.md`` section 2.2) -- the same
-    # form as ``points.centered_covariance`` and unlike ``centroid_tiled`` above, whose lanes
-    # partition the outer work and which therefore needs a device pair.
-    #
-    # ``chunk_faces`` is a launch argument, not the ``ITEMS_PER_BLOCK_1D`` constant the rest of the
-    # chunked-accumulate family bakes in, because this body has a real crossover and that family's
-    # single value is on the wrong side of it for every mesh the package actually meets. The
-    # integrand is ~80 ``float64`` flops per face -- far heavier than an outer product -- so a wide
-    # chunk starves the device, while a narrow one puts too many blocks on ten contended addresses.
-    # Kernel device time on an RTX 5090, microseconds:
-    #
-    #   faces        1 280   20 480   81 920   327 680   1 310 720
-    #   chunk    64   14.2     15.3     35.0     121.6       434.3
-    #   chunk   128   19.6     19.4     32.0     109.1       345.9
-    #   chunk   256   32.1     30.1     31.9      94.1       305.1
-    #   chunk   512   54.9     52.8     52.5      91.2       296.1
-    #
-    # A runtime width measured identical to a ``wp.constant`` one at every entry above, so nothing
-    # is lost by choosing it on the host -- see ``measures._moment_chunk_faces`` for the rule.
+    # ``chunk_faces`` is a launch argument rather than the ``ITEMS_PER_BLOCK_1D`` constant the rest
+    # of the family bakes in, because this body has a real crossover the family's single value sits
+    # on the wrong side of: the integrand is ~80 ``float64`` flops per face, so a wide chunk starves
+    # the device on a small mesh while a narrow one puts too many blocks on ten contended addresses
+    # on a large one. A runtime width measures identical to a ``wp.constant`` one; see
+    # ``measures._moment_chunk_faces``.
     #
     # Everything accumulates in float64: the second moments scale as length^5, so a float32 sum
-    # over a large mesh loses the answer's low digits well before the reduction finishes. The tree
-    # fold also halves the depth over which rounding compounds against the serial sum it replaced.
+    # over a large mesh loses the answer's low digits before the reduction finishes.
     #
     # For the tetrahedron (0, a, b, c) with det = dot(a, cross(b, c)):
-    #   ∫dV      = det / 6
-    #   ∫x dV    = det * (a.x + b.x + c.x) / 24
-    #   ∫x^2 dV  = det * (a.x^2 + b.x^2 + c.x^2 + a.x b.x + a.x c.x + b.x c.x) / 60
-    #   ∫xy dV   = det * (2(a.x a.y + b.x b.y + c.x c.y)
-    #                     + a.x b.y + b.x a.y + a.x c.y + c.x a.y + b.x c.y + c.x b.y) / 120
+    #   int dV     = det / 6
+    #   int x dV   = det * (a.x + b.x + c.x) / 24
+    #   int x^2 dV = det * (a.x^2 + b.x^2 + c.x^2 + a.x b.x + a.x c.x + b.x c.x) / 60
+    #   int xy dV  = det * (2(a.x a.y + b.x b.y + c.x c.y)
+    #                       + a.x b.y + b.x a.y + a.x c.y + c.x a.y + b.x c.y + c.x b.y) / 120
     chunk, lane = wp.tid()
     offset, remaining = tile_chunk(faces.shape[0] // 3, chunk, chunk_faces)
     if remaining <= 0:

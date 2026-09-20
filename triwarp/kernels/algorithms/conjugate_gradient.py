@@ -7,9 +7,8 @@ Drives every multi-column SPD solve in ``triwarp/linalg.py`` -- ``harmonic`` / `
 attaches ``batch_offsets`` so the solve converges on its worst column, and that is exactly the input
 for which Warp's ``TiledDot`` takes its **direct batched** reduction, one block per (column,
 subproblem). Every lane of that one block then reduces ``n / tile_size`` entries serially, so the
-dot costs *O(n)*: measured 4.55 / 9.51 / 18.66 / **66.15** us at n = 4 356 / 17 161 / 40 962 /
-163 842, against 5.09-6.06 us flat for the tiled tree Warp uses when there is nothing to batch. Two
-dots run per iteration, which is why they were 19 us of a 41 us iteration at ``harmonic``'s size.
+dot costs *O(n)* where the unbatched tiled tree is flat -- and two dots run per iteration, which
+made them roughly half of an iteration at a typical system size.
 
 The reduction here is a real two-stage tree that stays per column, so the batching is kept and the
 cost is not. Two fusions ride along, both free: the Jacobi apply is an elementwise multiply of the
@@ -20,9 +19,9 @@ iteration between the ``p`` update that last read ``rz_old`` and the x/r update 
 **A block conjugate gradient (O'Leary 1980) sharing one Krylov subspace across exactly two columns
 lived here and was removed.** It advanced both columns against one shared subspace, the scalar
 ``alpha`` / ``beta`` becoming 2x2 dense matrices solved fresh every iteration. It does cut the
-iteration count on a uniform mesh, but its iteration costs 10 launches against this one's 8 and on
+iteration count on a uniform mesh, but its iteration costs more launches than this one's and on
 an ill-conditioned system the count goes the other way -- see ``_cg_columns`` in
-``triwarp/linalg.py`` for the seven-system measurement that retired it.
+``triwarp/linalg.py`` for the measurement that retired it.
 """
 
 import warp as wp
@@ -67,10 +66,9 @@ def cg_dot_partials(
     # ``stride`` is the column pitch, which the wrapper pads to a multiple of ``CG_TILE`` and
     # zero-fills past ``n``, so every block here is a whole tile and there is no ragged branch.
     # That padding is not tidiness: the tail used to run a serial dependent loop over ``stride - n``
-    # entries, which every lane of that block executed, and the whole launch waits for it. Measured
-    # at ``block_dim=256``: a 9-entry tail cost 2.32 us and a 129-entry tail **11.03 us**, so the
-    # dot's cost swung 4.7x on the arithmetic of ``n mod 256`` -- and that alone turned a 1.5x win
-    # on ``saddle`` into a 0.82x loss on ``hemisphere``, at nearly the same size.
+    # entries, which every lane of that block executed, and the whole launch waits for it -- so the
+    # dot's cost swung severalfold on the arithmetic of ``n mod block_dim``, enough to turn a real
+    # win on one mesh into a loss on another of nearly the same size.
     #
     # The second pair shares its first operand, which is what CG's r.r and r.z want: one pass over
     # ``r`` answers both. ``pairs`` is warp-uniform, so the branch costs nothing.
@@ -266,14 +264,14 @@ def cg_step_x_r_z_dot(
     # Launch ``wp.launch_tiled(dim=(n_columns, stride // CG_TILE), block_dim=CG_TILE)``: ``stride``
     # is padded to a whole number of ``CG_TILE`` tiles and zero-filled past ``n``, so every block
     # owns exactly one tile and there is no ragged branch -- the same contract ``cg_dot_partials``
-    # relies on, and for the same measured reason (a ragged tail there swung the dot's cost 4.7x).
+    # relies on, and for the same measured reason.
     #
     # **The lanes stride by ``wp.block_dim()``, not by 1.** On CUDA ``block_dim()`` is ``CG_TILE``
     # and the loop runs once per lane, which is the one-element-per-lane shape this wants. On the
     # CPU device ``wp.launch_tiled`` runs a single lane per block and ``wp.block_dim()`` reads 1
     # (section 2.2), so that lane walks the whole tile and the ``wp.tile`` reductions below
     # degenerate to one-element tiles holding its own totals. Writing ``local = blk * CG_TILE + t``
-    # instead would leave 63 of every 64 entries unwritten there.
+    # instead would leave all but one entry per tile unwritten there.
     c, blk, t = wp.tid()
     acc_rr = wp.float64(0.0)
     acc_rz = wp.float64(0.0)

@@ -334,8 +334,8 @@ def trimesh_to_pyvista(mesh: tm.Trimesh) -> pv.PolyData:
     Wrap a ``tm.Trimesh`` as a ``pyvista.PolyData``, preserving float64 positions exactly.
 
     Goes through ``PolyData.from_regular_faces`` rather than the padded ``[3, i, j, k]`` cell array
-    the ``PolyData(points, faces)`` constructor wants: building that padding costs 2.34 ms on a
-    40 962-vertex mesh against **0.184 ms** for the classmethod, and it is the floor under every
+    the ``PolyData(points, faces)`` constructor wants: building that padding is an order of
+    magnitude dearer than the classmethod, and it is the floor under every
     pyvista benchmark row.
 
     pyvista round-trips float64 exactly (measured error ``0.0`` on ``[1/3, pi, e]``), so where a
@@ -494,7 +494,7 @@ def numpy_to_meshlib_bitset(flags_np: np.ndarray) -> mm.BitSet:
     The bulk inverse of [`meshlib_bitset_to_numpy`][tests.conversions.meshlib_bitset_to_numpy], and
     the reason neither direction needs a Python loop. ``BitSet.fromBlocks`` is bound and takes the
     raw ``uint64`` blocks, so ``np.packbits`` fills the whole set in one call -- measured 258x
-    faster than a per-cell ``set()`` loop at 110 592 voxels (0.33 ms against 84.9 ms), which is the
+    faster than a per-cell ``set()`` loop by more than two orders of magnitude, which is the
     difference between a benchmarkable reference and one whose row would time the load.
 
     Two mechanical points. ``bitorder="little"`` is not optional: the block's bit *i* is index

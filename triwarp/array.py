@@ -457,8 +457,8 @@ def _pack_segments(
     flat = wp.empty(total, dtype=dtype, device=device)
     if not _pack_in_one_launch(arrays, sizes, offsets, flat):
         # One ``wp.copy`` per segment: the fallback, and the right answer below the threshold above
-        # (a copy is ~6 us of host time and a launch is ~10, so a handful of segments never earns
-        # the descriptor). Graph capture cannot amortize this loop either, since the segment
+        # (a copy is cheaper than a launch, so a handful of segments never earns the descriptor).
+        # Graph capture cannot amortize this loop either, since the segment
         # pointers change on every call, so a recorded graph could never be replayed against new
         # segments.
         for arr, offset, n in zip(arrays, offsets, sizes, strict=True):
@@ -469,13 +469,10 @@ def _pack_segments(
 
 # Segment count from which ``_pack_segments`` builds a descriptor table and copies in one launch
 # instead of one ``wp.copy`` per segment. The two costs are a straight line against a flat one --
-# the loop is ~6 us of host time per segment whatever it holds, the single launch is 0.078-0.094 ms
-# regardless of segment count *or* total size -- so the whole choice is where they cross. Measured
-# on an RTX 5090 / Warp 1.17 with the total held at 2 614 242 elements: 0.27x at 2 segments, 0.68x
-# at 8, **1.89x at 32**, 3.64x at 64, 14.91x at 256, 50.76x at 1 024 and 149.75x at 4 096, with the
-# same shape at totals down to 48 903. 32 is the first swept value on the winning side; 16 is where
-# the lines actually cross, and the threshold is set at the measured point rather than the
-# interpolated one.
+# the loop is a few microseconds of host time per segment whatever it holds, the single launch is
+# flat in the segment count *and* in the total size -- so the whole choice is where they cross, and
+# above it the launch wins by orders of magnitude. The lines cross around half this value; the
+# threshold is set at the first swept point on the winning side rather than the interpolated one.
 PACK_SEGMENTS_KERNEL_FROM = 32
 
 # Widest per-segment launch dimension ``_pack_segments`` will ask for. The kernel strides by this,
@@ -499,8 +496,8 @@ def _pack_in_one_launch(
     ``kernels.array.pack_segment_words`` for the measurement and for why one kernel serves every
     dtype rather than a table of them. The descriptor is built as a single NumPy structured array
     through the struct's own ``numpy_dtype()`` and uploaded once, which matters: constructing the
-    256 struct instances one at a time in Python costs 0.62 ms of the 0.71 ms a per-object build
-    takes, and would give most of the win straight back.
+    struct instances one at a time in Python is almost the whole cost of a per-object build, and
+    would give most of the win straight back.
 
     Returns ``False`` — leaving ``flat`` untouched for the caller's copy loop — when there are too
     few segments to pay for the descriptor, or when the dtype's itemsize is not a multiple of four
@@ -762,8 +759,8 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     # compare-and-swap needs none of it.
     #
     # The dtype guard is here rather than at the wide branch because without it the two paths
-    # disagree: the insertion kernel is generic, so a ``float64`` table used to sort silently at
-    # ``w <= SORT_ROWS_INSERTION_MAX_COLS`` and raise ``RuntimeError: Unsupported data type:
+    # disagree: the insertion kernel is generic, so without it a ``float64`` table sorts silently
+    # at ``w <= SORT_ROWS_INSERTION_MAX_COLS`` and raises ``RuntimeError: Unsupported data type:
     # float64`` from inside Warp one column later. Support that turns on the row width is worse
     # than no support.
     if data.dtype not in (wp.int32, wp.float32):
@@ -952,6 +949,7 @@ def isin(
     elements: twt.ArrayNd, test_elements: wp.array[wp.Int], *, max_index: int | None = None
 ) -> wp.array[wp.bool]:
     """
+
     Test whether each element appears in ``test_elements`` (``numpy.isin`` for integers).
 
     Works for every Warp integer dtype -- ``int8`` through ``int64``, ``uint8`` through ``uint64``
@@ -962,6 +960,7 @@ def isin(
     indexed by ``value - min`` (fast for dense mesh indices). Otherwise ``test_elements`` is sorted
     and each query is a binary search, which keeps memory bounded when the values are sparse in
     their dtype.
+
 
     Parameters
     ----------
@@ -1012,13 +1011,12 @@ def isin(
     [`sortable_dtype`][triwarp.typing.sortable_dtype] rule) before either strategy runs: Warp's
     radix sort does not accept them, and neither does the tiled min/max reduction the span needs.
 
-    There is no ``assume_unique``, and it is worth saying why rather than leaving its absence to
-    look like an omission: [`numpy.isin`][] gains from one because the ``numpy.in1d`` sort path
-    behind it calls [`numpy.unique`][] on both arrays first, and neither strategy here dedups
-    anything -- the table is an idempotent scatter and the binary search is over the sorted keys as
-    given. Duplicates on either side are already free. What the two
-    strategies *do* pay for is inferring the value span, which is why the guarantee this takes is a
-    bound rather than a uniqueness claim.
+    There is no ``assume_unique``, and its absence is deliberate rather than an omission:
+    [`numpy.isin`][] gains from one because the sort path behind it calls [`numpy.unique`][] on both
+    arrays first, and neither strategy here dedups anything -- the table is an idempotent scatter
+    and the binary search is over the sorted keys as given, so duplicates on either side are already
+    free. What the two strategies *do* pay for is inferring the value span, which is why the
+    guarantee this takes is a bound rather than a uniqueness claim.
 
     Without ``max_index``: two host readbacks, one min/max reduction per input, which is what
     selects the strategy and anchors the table.

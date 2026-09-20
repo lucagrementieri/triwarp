@@ -152,8 +152,8 @@ def row_normalize(offsets: wp.array[wp.int32], out_values: wp.array[wp.Float]) -
 # Note the precision: the float32 weight is promoted to float64 because the accumulator is a
 # ``wp.vec3d``. ``kernels/smoothing.diffuse_scalar_pass`` walks the same row on a float32 scalar
 # field and accumulates in float32, so it cannot call this -- ``float64 * float32`` does not parse,
-# and the float64-field form that would let one generic serve both was measured at 0.63-0.86x.
-# That comment carries the numbers.
+# and the float64-field form that would let one generic serve both was measured as a loss. That
+# comment carries the reasoning.
 
 
 @wp.func
@@ -279,32 +279,16 @@ def triangle_inequality_slack(
     # different way -- ``max(2 * max(L) - sum(L)) + delta``, which is ``epsilon - min_f slack_f``
     # rearranged -- also undivided.
     #
-    # ``TOLERANCE_MOLLIFY = 1e-5`` was swept here against both of its arms, on a float32 sliver
-    # whose plain operator drops a coupling and on an icosphere(3) with one face collapsed onto
-    # its own opposite edge. Reading ``delta`` in units of one ULP of the mean edge length, and
-    # the perturbation as the relative change to the operator's rows that *no* degenerate face
-    # touches:
-    #
-    #   epsilon   delta/ulp   sliver's coupling   max|cot|   clean-row deviation
-    #     1e-8          0.1   dropped (no-op)         1.0                     0
-    #     3e-8          0.4   dropped (no-op)         1.0                     0
-    #     1e-7          1.3   dropped                 1.0              1.2e-07
-    #     3e-7          4.0   restored              7.2e2              2.4e-07
-    #     1e-6         13.5   restored              4.2e2              3.6e-07
-    #     1e-5        134.9   restored              1.2e2              8.2e-06
-    #     1e-4       1348.9   restored              3.9e1              8.0e-05
-    #     1e-2     134890.1   restored              4.0e0              8.0e-03
-    #
-    # So the left arm is a float32 storage floor, not a numerical-quality one: under ~4 ULP the
-    # added constant does not survive the store and the mollification silently does nothing, which
-    # is the failure the whole function exists to prevent. The right arm is the deviation column,
-    # which grows linearly with epsilon and reaches the ``rtol=1e-4`` the igl
-    # ``intrinsic_delaunay_cotmatrix`` comparison runs at by epsilon = 1e-4. ``1e-5`` is ~1.5
-    # decades clear of both, and is a decade *more* conservative than that port's own 1e-4, which
-    # sits on the right arm. Its neighbours are each worse in one direction: 1e-6 leaves only
-    # 13.5 ULP of headroom over a floor that moves with the mesh's length distribution, and 1e-4
-    # starts eating the parity test's tolerance. A clean mesh yields ``delta == 0`` at every
-    # epsilon probed, so none of this is paid where nothing is degenerate.
+    # **``TOLERANCE_MOLLIFY = 1e-5`` sits between two arms, both of which were swept.** Below a few
+    # ULP of the mean edge length the added constant does not survive the float32 store and the
+    # mollification silently does nothing, which is the failure the whole function exists to
+    # prevent -- so the left arm is a *storage* floor rather than a numerical-quality one, and it
+    # moves with the mesh's length distribution. On the right, the perturbation this introduces into
+    # rows no degenerate face touches grows linearly with epsilon and reaches the tolerance the igl
+    # ``intrinsic_delaunay_cotmatrix`` parity test runs at around 1e-4. ``1e-5`` is more than a
+    # decade clear of both, and a decade more conservative than that port's own 1e-4, which sits on
+    # the right arm. A clean mesh yields ``delta == 0`` at every epsilon, so none of this is paid
+    # where nothing is degenerate.
     f = wp.int32(wp.tid())
     a, b, c = row_triple(edge_lengths, f)
     worst = wp.max(wp.max(epsilon - (a + b - c), epsilon - (b + c - a)), epsilon - (c + a - b))
@@ -319,8 +303,7 @@ def add_constant(length: wp.float32, delta: wp.float32) -> wp.float32:
 # Concrete overloads, registered at import -- see the long-form rationale in
 # ``triwarp/kernels/reduce.py`` and the rule in CLAUDE.md section 2.5. In short: these kernels are
 # generic, Warp instantiates an overload on the first launch at each new dtype, and a module's hash
-# covers the instantiated set -- so a lazily-created overload rebuilds the whole module. Measured
-# over the suite: 14 overloads created across **16** distinct module loads.
+# covers the instantiated set -- so a lazily-created overload rebuilds the whole module.
 #
 # ``triwarp.laplacian`` exposes the precision as a public ``dtype`` keyword documented as "may be
 # float32 or float64", so both are reachable for every kernel here.
@@ -328,11 +311,10 @@ _MATRIX_DTYPES = (wp.float32, wp.float64)
 
 
 # The concrete handles keyed by the caller's dtype -- see
-# [`OverloadTable`][triwarp.kernels.array.OverloadTable]. Measured interleaved, min of 12, on an
-# icosphere(6): ``laplacian.cotmatrix`` 372.7 -> 339.6 us (**1.10x**) and ``laplacian.laplacian``
-# 380.6 -> 348.5 (1.09x), from removing one generic launch each. ``COTMATRIX_TRIPLETS`` keys on the
-# pair ``(entry dtype, matrix dtype)`` because those two templates are independent, exactly as the
-# registration already was.
+# [`OverloadTable`][triwarp.kernels.array.OverloadTable]; worth about a tenth of
+# ``laplacian.cotmatrix`` / ``laplacian.laplacian``, from removing one generic launch each.
+# ``COTMATRIX_TRIPLETS`` keys on the pair ``(entry dtype, matrix dtype)`` because those two
+# templates are independent, exactly as the registration already was.
 COTMATRIX_ENTRIES: OverloadTable
 COTMATRIX_ENTRIES_INTRINSIC: OverloadTable
 ROW_NORMALIZE: OverloadTable

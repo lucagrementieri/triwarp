@@ -359,9 +359,9 @@ def test_kernel_signatures_use_the_warp_types() -> None:
     A kernel-scope argument or return is annotated ``wp.bool`` / ``wp.int32`` / ``wp.float32``.
 
     ``.claude/CLAUDE.md`` section 1.2. Warp resolves the bare names to the same types, so -- as with
-    checks 16 and 17 -- nothing but a scan keeps the two spellings from coexisting: the tree carried
-    11 ``-> bool`` against 46 ``-> wp.bool``, plus 12 bare ``int`` / ``bool`` parameters, and the
-    newest of them was written the day after the kernel pass that converted the last batch of casts.
+    checks 16 and 17 -- nothing but a scan keeps the two spellings from coexisting: about a fifth
+    of the tree's return annotations were the bare form when this was written, plus a dozen bare
+    ``int`` / ``bool`` parameters.
 
     Only ``@wp.kernel`` / ``@wp.func`` signatures are read, which is what keeps it honest: a kernel
     *factory* is ordinary Python and its parameters are correctly plain (``reduce.blocks_1d``,
@@ -632,9 +632,9 @@ def test_importing_triwarp_pulls_in_no_kernel_modules() -> None:
     already imported what it needs.
 
     A single eager ``from triwarp.mesh import Trimesh`` in ``__init__.py`` is enough to fail this,
-    which is exactly what it is for: that one line used to cost 0.60 s of ``import triwarp``, and
-    Python imports a parent package before its child, so it cost the same 0.59 s for
-    ``import triwarp.edges`` too.
+    which is exactly what it is for: that one line costs the better part of a second of
+    ``import triwarp``, and Python imports a parent package before its child, so it costs the same
+    for ``import triwarp.edges`` too.
     """
     probe = textwrap.dedent(
         """
@@ -782,8 +782,8 @@ def test_uncitable_scan_catches_every_shape_it_has_seen_and_not_circumradius() -
     ``test_bare_tid_scan_ignores_multi_index_unpacks`` pins check 22's. Both halves cost a wrong
     answer once. The positives are the shapes actually found in the tree -- a C++ source file, a
     class, a function, the package, an import, and (for ``promesh``) the two comments that claimed
-    a port -- and the four symbols ``CLAUDE.md``'s sentence used to name matched **none** of the
-    file-name ones. The negatives matter because the ``MR`` prefix is matched under
+    a port. A pattern keyed on a handful of named symbols matches **none** of the file-name ones,
+    which is why this one is wider. The negatives matter because the ``MR`` prefix is matched under
     ``IGNORECASE``: without its ``\b`` it hits *circu-mradius*, and without the scoped ``(?-i:)``
     it hits any word starting with "mr". They also pin the *replacement* wording for the promesh
     half, so a future pass cannot "fix" this scan by widening it back onto the algorithm's own
@@ -820,9 +820,9 @@ def test_repeatedly_mapped_kernel_funcs_declare_their_signatures() -> None:
     Not a library comparison: this is a property of triwarp's own module-hash chains. ``wp.map``
     names its generated module after the *unqualified* op and forks its hash per call signature, so
     an op reached at three signatures builds its module three times, each build containing every
-    kernel accumulated so far. Measured over one suite run before the tables existed: **182**
-    distinct ``map_*`` module loads over **143** ``(module, device, block_dim)`` pairs -- 39
-    redundant builds, 100-250 ms each cold -- and **143 over 143** afterwards, which is the floor.
+    kernel accumulated so far. Over one suite run without the tables that is dozens of redundant
+    cold builds; with them the load count sits at the floor of one per
+    ``(module, device, block_dim)`` pair.
 
     This is check 23, and it is the same *kind* of check as
     ``test_generic_kernels_register_their_overloads``: it asserts a module which needs a table has
@@ -902,13 +902,11 @@ def test_warp_typed_constants_stay_out_of_host_arithmetic() -> None:
 
     **The cost is measured, not assumed.** ``warp._src.types.scalar_base.__add__`` is
     ``return warp.add(self, y)``, which is Warp's Python-scope builtin dispatch and runs
-    ``inspect.signature().bind()`` per operand: ~10 us against 0.027 for a Python float on an
-    RTX 5090 with Warp 1.17. A ``wp.array`` slice taken with such bounds is worse than one
-    dispatch, because ``__getitem__`` forms ``stop - start`` and ``strides * start`` itself --
-    39.4 us for two Warp-typed bounds, 27.3 for the start alone, 15.7 for the stop alone, against
-    3.16 for plain ints. That is what ``kernels/array.py``'s ``LOOP_CONDITION_VIEW`` /
-    ``LOOP_PROGRESS_VIEW`` exist to avoid, and ``graph.shortest_path_envelope`` is the site that
-    survived the first conversion of the seven.
+    ``inspect.signature().bind()`` per operand -- two to three orders of magnitude a Python float's
+    operator. A ``wp.array`` slice taken with such bounds is worse than one dispatch, because
+    ``__getitem__`` forms ``stop - start`` and ``strides * start`` itself, so a symmetric slice is
+    three. That is what ``kernels/array.py``'s ``LOOP_CONDITION_VIEW`` / ``LOOP_PROGRESS_VIEW``
+    exist to avoid.
 
     **The probe that shows it bites**, run against ``triwarp/graph.py`` and reverted: restoring
     ``state[LOOP_PROGRESS : LOOP_PROGRESS + 1]`` reports two problems (one per bound), the
@@ -917,9 +915,9 @@ def test_warp_typed_constants_stay_out_of_host_arithmetic() -> None:
     and a constant forwarded to ``wp.launch(inputs=[...])`` is neither a ``BinOp`` nor a ``Slice``.
 
     Its two deliberate blind spots: a Warp *vector*'s arithmetic goes through ``_binary_op``, a
-    Python component loop rather than builtin dispatch (~4 us, a different and smaller hazard), and
-    an explicit ``wp.length(...)`` / ``wp.cross(...)`` call at Python scope costs the same ~10 us
-    but is often the right spelling -- ``np.cross`` is measurably *slower* than ``wp.cross`` -- so
+    Python component loop rather than builtin dispatch (a different and smaller hazard), and an
+    explicit ``wp.length(...)`` / ``wp.cross(...)`` call at Python scope costs a dispatch too but
+    is often the right spelling -- ``np.cross`` is measurably *slower* than ``wp.cross`` -- so
     flagging those would make most of the hits legitimate. The runtime census in CLAUDE.md
     section 15.11 is what covers the wider class; this check covers the part with no legitimate
     instance.

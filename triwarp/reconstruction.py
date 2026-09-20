@@ -1077,9 +1077,9 @@ def resample_uniform(
 
     lower, upper = tw.bounds.aabb(vertices)
     # ``math.dist`` rather than ``float(wp.length(upper - lower))``: a Warp operator and a
-    # Warp builtin at Python scope each route through builtin dispatch, measured 14.68 us
-    # against 3.02 (4.9x). It computes in float64 where ``wp.length`` is float32, i.e. ~2e-8
-    # relative and the correctly-rounded answer for float32 corners. Section 13.1.
+    # Warp builtin at Python scope each route through builtin dispatch, several times dearer. It
+    # computes in float64 where ``wp.length`` is float32, i.e. the correctly-rounded answer for
+    # float32 corners. Section 13.1.
     diagonal = math.dist(lower, upper)
     if voxel_size is None:
         voxel_size = 0.01 * diagonal
@@ -1137,6 +1137,7 @@ def ball_pivoting(
     crit_hole_length: float = 0.0,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
+
     Ball-pivoting surface reconstruction from an oriented point cloud (interpolating).
 
     GPU-native, wave-parallel port of the ball-pivoting algorithm (PyMeshLab's
@@ -1155,6 +1156,7 @@ def ball_pivoting(
     guard (an edge already shared by two triangles never gains a third). The result is passed
     through the standard cleanup tail (deduplicate, drop degenerate / non-manifold faces, orient
     outward, optionally fill small holes).
+
 
     Parameters
     ----------
@@ -1209,17 +1211,17 @@ def ball_pivoting(
     The triangulation is **reproducible at an explicit ``radius``**: repeated runs on one device and
     build return the same set of triangles, because a wave resolves competing proposals by a key
     packed from their own vertices and the wave counter rather than by the order they reached an
-    atomic counter — device state the loop advances deterministically, so the ordering varies
+    atomic counter -- device state the loop advances deterministically, so the ordering varies
     between waves (which keeps a front edge from being starved by a globally fixed key) without
     varying between runs. Three caveats on how far that reaches:
 
     * the default ``radius <= 0`` is **not** covered. The auto-guess averages the nearest-neighbour
       spacings with a device reduction whose summation order is not fixed, so two calls on one cloud
-      can guess radii a few ULP apart — enough to tip a borderline pivot and change the triangle
+      can guess radii a few ULP apart -- enough to tip a borderline pivot and change the triangle
       set. Pass ``radius`` explicitly wherever the result has to be reproducible;
-    * the face buffer's *row order* is not pinned — ``commit_triangles`` appends with a
-      ``wp.atomic_add`` — so compare reconstructions as a set of triangles, not buffer-to-buffer;
-    * neither is the *winding* of a component that the cleanup tail cannot orient by volume, since
+    * the face buffer's *row order* is not pinned -- ``commit_triangles`` appends with a
+      ``wp.atomic_add`` -- so compare reconstructions as a set of triangles, not buffer-to-buffer;
+    * neither is the *winding* of a component the cleanup tail cannot orient by volume, since
       [`make_winding_consistent`][triwarp.repair.make_winding_consistent] seeds each connected
       component from an arbitrary face. Compare with the row entries sorted, or orient both sides
       first.
@@ -1228,13 +1230,11 @@ def ball_pivoting(
 
     The result is **interpolating and edge-manifold**, and on a densely, uniformly sampled closed
     surface it is watertight in practice: a subdivided icosphere reconstructs to exactly ``2 v - 4``
-    faces with no boundary edge at all, and ``bunny`` (a real scan, so genuinely open in places)
-    comes out at 1.97 faces per referenced vertex with 1.7% boundary edges. Watertightness is not
-    *guaranteed* — the wave-parallel front has no per-vertex fan structure to align colliding
-    sheets with, so pathological sampling can still leave a seam. Regions sampled too sparsely for
-    the ball to rest are left as holes by construction (widen ``radius`` or set
-    ``crit_hole_length``); for an implicit surface that is watertight by construction use
-    [`screened_poisson`][triwarp.reconstruction.screened_poisson].
+    faces with no boundary edge at all. Watertightness is not *guaranteed* -- the wave-parallel
+    front has no per-vertex fan structure to align colliding sheets with, so pathological sampling
+    can still leave a seam. Regions sampled too sparsely for the ball to rest are left as holes by
+    construction (widen ``radius`` or set ``crit_hole_length``); for an implicit surface that is
+    watertight by construction use [`screened_poisson`][triwarp.reconstruction.screened_poisson].
     """
     require_same_device(points=points, normals=normals)
     device = points.device

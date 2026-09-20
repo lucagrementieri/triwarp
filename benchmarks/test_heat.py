@@ -1,210 +1,109 @@
 """
 Benchmarks for the three heat-diffusion solvers of ``triwarp.heat``.
 
-One module because they are one family and share the property this suite is really measuring: each
-is two or three conjugate-gradient solves against a cotangent or connection Laplacian, so each is
-sensitive to the *conditioning* of that operator in a way every factorizing reference is not. That
-finding turns up three times below -- ``heat_geodesic_conditioning``, ``heat_signed_distance`` on
-the quality axis, and ``log_map`` -- and it is the same finding each time.
+One module because they are one family and share the property this suite really measures: each is
+two or three conjugate-gradient solves against a cotangent or connection Laplacian, so each is
+sensitive to the *conditioning* of that operator in a way every factorizing reference is not.
+**That is the module's whole subject**, and the ``quality`` axis is how it is measured — ``saddle``
+against ``saddle_graded`` holds vertices, faces and connectivity fixed and only worsens the aspect
+ratio, which no face-count registry can express. Bad aspect ratios and obtuse angles (which send
+cotangent weights negative) inflate the condition number and so the iteration count directly, and
+the finding recurs at ``heat_geodesic_conditioning``, at ``heat_signed_distance`` and at
+``log_map``.
 
-Geodesic distance (``heat_operators`` / ``heat_geodesic``)
-=========================================================
-Two axes, and the second is the interesting one:
+Geodesic distance
+=================
+Axes: **scale**, the clean size sweep across two orders of magnitude of faces, and **quality**.
 
-* **scale** -- the clean size sweep, 5 120 to 327 680 faces.
-* **quality** -- ``saddle`` against ``saddle_graded``: identical vertices, faces and connectivity,
-  worst aspect ratio 1.6 against 4 719. Measured at 19.6 ms and 67.0 ms, so **3.4x for a change
-  that no face-count registry can express**. The heat method is two conjugate-gradient solves, and
-  CG iteration count is a function of the cotangent Laplacian's condition number: bad aspect
-  ratios and obtuse angles (which make cotangent weights go negative) inflate it directly. This
-  group is the module's real subject.
+The method (Crane et al.) is three stages, two of which are sparse solves and dominate: diffuse heat
+from the sources for a short time ``t``, normalize the gradient into a unit field pointing away from
+them, then integrate that field back with a Poisson solve. It runs in ``float64`` — the diffused
+heat decays exponentially and underflows ``float32``, collapsing the far field — which on a consumer
+GPU means the solves run at the device's much lower double-precision rate. Inherent to the method,
+not a tuning choice.
 
-The method (Crane et al.) is three stages, and the timing is dominated by the two of them that
-are sparse linear solves: diffuse heat from the sources for a short time ``t``, normalize the
-resulting gradient into a unit field pointing away from the sources, then integrate that field
-back into a distance function with a Poisson solve. The per-face gradient normalization in between
-is a single cheap pass.
+``geodesic_ball`` is **not** here: it lives in ``triwarp.neighbors`` and is timed as
+``query_geodesic_ball`` in [`test_proximity.py`](test_proximity.py).
 
-The whole computation runs in ``float64`` (the diffused heat decays exponentially and underflows
-``float32``, collapsing the far field), which on a consumer GPU means the solves run at the
-device's much lower double-precision rate. That is inherent to the method, not a tuning choice.
+Four references, three of them the same method a different way. **libigl**'s ``heat_geodesics``
+runs on every mesh in both axes, making the quality axis a direct iterative-versus-direct
+comparison; on a scan mesh ``heat_geodesics_precompute`` raises ``Precomputation failed`` because it
+factors the cotangent and Poisson systems directly. **potpourri3d** (geometry-central) is
+constructed with ``use_robust=False`` so all three sides discretize the same triangulation — its
+default mollifies and flips to an intrinsic Delaunay triangulation first, which is more work and a
+different operator — and it also ships **fast marching**, timed as its own group, which triwarp has
+no equivalent of by design. **pymeshlab**'s
+``compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex`` states the two properties
+this module is built around in its own documentation ("very sensitive to triangulation", "first run
+takes longer as factorization has to be built"), so it is the only reference whose amortized row
+needs no API gymnastics; sources go in as a vertex selection. It is the third independent
+confirmation of the quality axis's point — dead flat across the pair, like the other two direct
+solvers — and it ships a **second, unrelated** algorithm for the same task, a Dijkstra-style front
+over the edge graph, timed in ``fast_marching_distance``. **trimesh** and **open3d** have no
+geodesic distance of any kind.
 
-``geodesic_ball`` is **not** benchmarked here -- it lives in ``triwarp.neighbors`` and is timed as
-``query_geodesic_ball`` in [`test_proximity.py`](test_proximity.py), next to the other neighborhood
-queries it belongs with.
+All three libraries split this into mesh-dependent setup (assembly, and for the references a
+factorization) and a per-source solve, and the ``heat_geodesic`` group reports both points:
+``setup=full`` puts the setup **inside** the timed callable, which is what a caller computing one
+field pays — timing a back-substitution against a full iterative solve would compare nothing — and
+``setup=amortized`` hoists it out. On triwarp's side that is a real API path (``heat_operators`` fed
+back through ``heat_geodesic(..., operators=...)``), not a benchmark-only shortcut. The other groups
+report ``full`` only. A single source vertex throughout: the method's cost is essentially
+independent of the number of sources, which change only the right-hand side.
 
-References
-----------
-**libigl** implements the same method (``igl::heat_geodesics``) and now runs on every mesh in both
-axes. It previously could not: on every scan mesh ``igl.heat_geodesics_precompute`` raises
-``RuntimeError: heat_geodesics: Precomputation failed.`` -- it factors the cotangent and Poisson
-systems directly (Cholesky) at precompute time, and those factorizations fail on the scan meshes.
-The synthetic meshes are manifold by construction and it succeeds on all of them, measured at
-0.10-0.65 s.
+Signed distance to curves
+=========================
+The axis is the **source curve**, not the mesh: the mesh sets the solve size (fixed at
+``sphere_med``) while the curve sets how much of the surface the source touches. ``ring`` is one
+vertex's one-ring — the smallest curve that is closed, edge-connected and separating — and ``band``
+a full latitude band of them, hundreds of segments. That contrast asks whether the cost is in the
+*source*, which scales with the curve, or in the three solves, which do not. **The solves** — the
+longer curve is if anything *cheaper*, because a source spread over the surface converges in fewer
+iterations than a point-like one, and the splat does not register.
 
-That makes the quality axis a direct iterative-versus-direct comparison.
-
-**potpourri3d** (geometry-central) implements the same method a third way, and is constructed with
-``use_robust=False`` so all three sides discretize the same triangulation -- its default mollifies
-and flips to an intrinsic Delaunay triangulation first, which is more work and a different operator.
-It also ships **fast marching** (``MeshFastMarchingDistanceSolver``), a different algorithm for the
-same task, timed as its own group; triwarp has no equivalent by design.
-
-**pymeshlab** implements the same method a *fourth* way
-(``compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex``), and its own documentation
-states the two properties this module is built around: "as this implementation does not use
-intrinsic triangulation it is very sensitive to triangulation" -- the same caveat the ``quality``
-axis exists to measure -- and "first run takes longer as factorization has to be built", which is
-exactly the ``setup=full`` / ``setup=amortized`` split. So it is the only reference whose amortized
-row needs no API gymnastics: calling the filter twice on the same MeshSet *is* the amortized path.
-Sources go in as a vertex selection (``compute_selection_by_condition_per_vertex(condselect='(vi ==
-0)')``, i.e. vertex 0, the same source the other three libraries get).
-
-Measured, it is the third independent confirmation of the ``quality`` axis's point: **71.4 against
-71.1 ms** across ``saddle`` / ``saddle_graded`` -- dead flat, like the other two direct solvers --
-while triwarp goes 22.4 -> 68.7 ms. Three factorizing implementations all insensitive to a
-conditioning change that costs triwarp's CG 3x is about as clear as this suite gets.
-
-It also ships a **second, unrelated** algorithm for the same task --
-``compute_scalar_by_geodesic_distance_from_given_point_per_vertex``, a Dijkstra-style front over the
-edge graph rather than a PDE solve -- which is timed in the ``fast_marching_distance`` group
-alongside potpourri3d's, since that group exists to price the non-PDE alternatives.
-
-**trimesh** has no geodesic distance of any kind (``trimesh.graph`` offers only combinatorial
-traversal over the edge graph, not a distance field on the surface). **open3d** has none either --
-its legacy geometry module stops at normals and clustering. Neither appears in this module.
-
-Setup, full and amortized
--------------------------
-All three libraries split this computation into mesh-dependent setup (operator assembly, and for
-the references a factorization) and a per-source solve, and both references advertise that split:
-"repeated solves are fast after initial setup". The ``heat_geodesic`` group reports both points:
-
-* ``setup=full`` -- the setup is **inside** the timed callable, which is what a caller computing
-  one field pays. Timing only ``heat_geodesics_solve`` here would compare a back-substitution
-  against a full iterative solve.
-* ``setup=amortized`` -- the setup is hoisted out, so only the solve is timed. On triwarp's side
-  that is a real API path (``heat_operators`` passed back through
-  ``heat_geodesic(..., operators=...)``), not a benchmark-only shortcut, so the rows compare like
-  with like.
-
-The other groups report ``full`` only.
-
-Sources
--------
-A single source vertex (index ``0``) for every case. The heat method's cost is essentially
-independent of the number of sources -- they only change the right-hand side, not the matrix or
-the iteration structure -- so one source keeps the comparison simple and matches how
-``igl::heat_geodesics`` is normally driven.
-
-Signed distance to curves (``heat_signed_distance``)
-====================================================
-
-The axis is the **source curve**, not the mesh: the mesh sets the solve size (fixed here at
-``sphere_med``) while the curve sets how much of the surface the source touches. Two points along
-it, both built from the mesh itself so the comparison is reproducible:
-
-* ``ring`` -- one vertex's one-ring, six segments. The smallest curve that is closed, edge-connected
-  and separating.
-* ``band`` -- a full latitude band of one-rings chained together, hundreds of segments.
-
-That contrast asks the question the splat stage raises: is the cost in the *source*, which scales
-with the curve, or in the three solves, which do not? On an RTX 5090 the answer is the solves --
-**81.0 ms for 6 segments against 71.3 ms for 370** -- the longer curve is if anything *cheaper*,
-because a source spread over the surface converges in fewer conjugate-gradient iterations than a
-point-like one. The splat itself does not register. potpourri3d runs 1 060 / 1 017 ms over the same
-two points, so 13x either way.
-
-The three stages are a vector diffusion on the connection Laplacian (a ``2 x 2``-block CG), a
+The stages are a vector diffusion on the connection Laplacian (a ``2 x 2``-block CG), a
 normalization, and a Poisson solve; ``zero_set`` makes that last one a *constrained* solve through
-the machinery behind ``linalg.min_quad_with_fixed``, which is why both level-set modes are timed.
-That constraint is not free: **80.6 ms against 17.3 ms** for ``none``, i.e. extracting the free-free
-block and solving it costs 4.7x what one unconstrained solve does.
+the machinery behind ``linalg.min_quad_with_fixed``, which is why both level-set modes are timed —
+extracting the free-free block costs several times one unconstrained solve.
 
-On the ``quality`` axis triwarp goes 40.3 -> 125.8 ms (**3.1x**) while potpourri3d stays at 525 ->
-519 ms. Three conjugate-gradient solves feel a bad aspect ratio three times over; a factorization
-does not feel it at all. Same finding as ``heat_geodesic_conditioning`` and ``log_map`` -- the third
-place in the suite where it turns up.
-
-References
-----------
-**potpourri3d** is the only reference (``MeshSignedHeatSolver``), and two of its properties shape
-its row: the solver is constructed inside the timed callable per this suite's convention (a halfedge
-mesh plus two factorizations), and it requires every curve segment to lie within one face, which is
-why the curves here are edge paths. **trimesh**, **libigl**, **open3d** and **scipy** have no signed
+**potpourri3d** is the only reference (``MeshSignedHeatSolver``), constructed inside the timed
+callable per this suite's convention, and it requires every curve segment to lie within one face,
+which is why the curves here are edge paths. trimesh, libigl, open3d and scipy have no signed
 distance *on a surface* at all — trimesh's ``proximity.signed_distance`` signs against a closed
-volume, a different question, already benchmarked in [`test_proximity.py`](test_proximity.py).
+volume, a different question already benchmarked in [`test_proximity.py`](test_proximity.py).
 
 Vector transport, scalar extension and the log map
 =================================================
+Everything here is conjugate gradient, so **quality** is again the axis that matters; ``scale`` is
+reported alongside for the assembly cost, and ``transport_tangent_vectors`` carries a
+``setup=full`` / ``setup=amortized`` layer with the operators hoisted out on both sides.
 
-The connection Laplacian these run on, and the three solvers built on it.
-
-Everything here is conjugate gradient, so **quality** is the axis that matters: ``saddle`` against
-``saddle_graded`` holds vertices, faces and connectivity fixed and only worsens the aspect ratio,
-which is what sets the iteration count. ``heat_geodesic_conditioning`` already shows 3.4x for the
-scalar solve on those two meshes; these groups ask whether the vector solve behaves the same way.
-``scale`` is reported alongside for the assembly cost, and ``transport_tangent_vectors`` carries a
-``setup=full``/``setup=amortized`` layer -- with the operators hoisted out on both sides, since
-``vector_heat_operators`` is a real API path and ``MeshVectorHeatSolver`` is an object -- so the
-question "what does a *second* solve on the same mesh cost?" is measured rather than argued.
-
-The three functions cost different numbers of solves, which is most of what separates them:
-
-* ``extend_scalar`` -- two scalar solves.
-* ``transport_tangent_vectors`` -- one ``2 x 2``-block vector solve plus an ``extend_scalar``.
-* ``log_map`` -- a vector solve, a full ``heat_geodesic`` (two more scalar solves) and a gradient
+The three cost different numbers of solves, which is most of what separates them: ``extend_scalar``
+two scalar solves, ``transport_tangent_vectors`` one ``2 x 2``-block vector solve plus an
+``extend_scalar``, and ``log_map`` a vector solve plus a full ``heat_geodesic`` plus a gradient
 pass.
 
-The amortized rows price the operator assembly: ``transport_tangent_vectors`` goes
-**11.95 -> 5.75 ms** on ``saddle`` when the operators are reused, so roughly half of a transport
-call is assembly. Against the reference the comparison *flips sign* between the two rows -- 15.7x
-faster at ``full`` (188 ms), 1.8x slower at ``amortized`` (3.2 ms) -- for the reason the
-``heat_geodesic`` table shows: a factorization is expensive once and cheap thereafter, conjugate
-gradient is neither. Note too that transport barely feels the ``quality`` axis (5.75 against
-5.74 ms) where ``log_map`` feels it 2.6x; the difference is the distance field the log map also
-solves.
+**The comparison against the reference flips sign between the two amortized rows** — triwarp far
+ahead at ``full`` and behind at ``amortized`` — for the reason the ``heat_geodesic`` rows show: a
+factorization is expensive once and cheap thereafter, conjugate gradient is neither. Transport
+barely feels the quality axis where ``log_map`` feels it several times over, the difference being
+the distance field the log map also solves; **``log_map`` is the module's real result**.
 
-``vector_heat_operators`` now caches the vector system's own Jacobi preconditioner too (its fourth
-tuple field), which the amortized row here does not visibly move: `wpl.preconditioner` on this
-system costs ~0.15 ms in isolation (measured directly, 200 calls between two syncs), against the
-~3 ms `diffuse_tangent_field` solve it feeds and the further `extend_scalar` solve the full
-``transport_tangent_vectors`` call also pays for -- a real ~7% saving on the vector solve alone,
-diluted below this benchmark's own run-to-run noise once the rest of the call is included. Landed
-for the architectural consistency with ``heat_operators``'s own two cached preconditioners, not for
-a win visible at this level.
+Two implementation notes this level cannot see. ``vector_heat_operators`` caches the vector system's
+own Jacobi preconditioner, which is a real saving on the vector solve alone and diluted below noise
+once the rest of the call is included — landed for consistency with ``heat_operators``, not for a
+win visible here. And ``extend_scalar``'s two right-hand sides diffuse through the identical
+operator, so they are one batched two-column solve rather than two independent CG calls, which
+``transport_tangent_vectors`` inherits and ``log_map`` does not (it calls ``heat_geodesic``).
 
-``extend_scalar``'s two right-hand sides (where the sources are, and what they carry) diffuse
-through the identical operator, so they are one batched two-column solve
-(``linalg.solve_spd_columns``) rather than two independent CG calls: at exactly two columns under a
-diagonal preconditioner this reaches ``linalg._BlockCg2``, and ``transport_tangent_vectors``
-inherits the win through its own call to ``extend_scalar``. Measured back to back in one session,
-same fixtures:
-``extend_scalar`` **8.1 -> 5.3 ms** (``saddle``) and **8.0 -> 5.6 ms** (``saddle_graded``),
-1.4-1.5x; ``transport_tangent_vectors`` **14.9 -> 12.0 ms** full and **8.6 -> 5.7 ms** amortized,
-1.2-1.5x. ``log_map`` is untouched by this (it calls `heat_geodesic`, not `extend_scalar`) and its
-own numbers are unchanged within noise.
+Assembly alone is measured as ``connection_laplacian`` in
+[`test_laplacian.py`](test_laplacian.py), since the operator lives in ``triwarp.laplacian``.
 
-Measured on an RTX 5090, ``saddle`` then ``saddle_graded``: ``extend_scalar`` 5.9 / 5.4 ms against
-the reference's 51.4 / 47.8; ``transport_tangent_vectors`` 12.1 ms full at ``saddle``; ``log_map``
-31.1 / **81.6 ms** against 223.0 / 218.9. That last row is the module's real result: triwarp's
-vector solve pays **2.6x** for the worse aspect ratio while the reference's factorization pays
-nothing -- the same iterative-versus-direct trade ``heat_geodesic_conditioning`` shows for the
-scalar. Assembly alone is measured as ``connection_laplacian`` in
-[`test_laplacian.py`](test_laplacian.py) -- 1.11 / 1.23 / 2.82 ms over the scale axis -- since the
-operator itself lives in ``triwarp.laplacian``.
-
-References
-----------
-**potpourri3d** is the only reference for any of this, and its solvers are constructed inside the
-timed callable per this suite's convention -- which for ``MeshVectorHeatSolver`` means building a
-halfedge mesh and factoring both the cotangent and connection Laplacians. It is constructed with
-``use_intrinsic_delaunay=False`` so the discretization matches triwarp's. Note that it cannot run on
-``cave_cube`` at all: its right-angle diagonals give zero cotangent weights and geometry-central's
-factorization fails there (see ``tests/test_heat_vector.py``). No group here uses that mesh.
-
-**trimesh**, **libigl** and **open3d** have no tangent-space machinery, so nothing else appears
-here.
+**potpourri3d** is again the only reference, constructed inside the timed callable — which for
+``MeshVectorHeatSolver`` means a halfedge mesh and factoring both Laplacians — with
+``use_intrinsic_delaunay=False`` so the discretization matches. It cannot run on ``cave_cube`` at
+all: its right-angle diagonals give zero cotangent weights and geometry-central's factorization
+fails there, so no group uses that mesh. trimesh, libigl and open3d have no tangent-space machinery.
 """
 
 from __future__ import annotations
@@ -370,7 +269,7 @@ def test_heat_geodesic(bench_case: BenchCase, setup: str) -> None:
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp", "igl", "potpourri3d", "pymeshlab")
 def test_heat_geodesic_conditioning(bench_case: BenchCase) -> None:
-    """The same field on the same connectivity, well- and ill-conditioned: 3.4x for triwarp."""
+    """The same field and connectivity, well- and ill-conditioned: several times the cost."""
     _run_case(bench_case)
 
 
@@ -404,13 +303,12 @@ def test_fast_marching_distance(bench_case: BenchCase) -> None:
     exact windows -- the only one that is exact rather than first-order -- and **meshlib's
     ``computeSurfaceDistances``** is a fourth Eikonal front, the only one of the four that is
     multi-threaded. Its accuracy is measured against triwarp's heat method and against the exact
-    great-circle field in ``tests/test_heat_distance.py``: 1.4 % worst deviation against triwarp's
-    1.6 %, so this row is a like-for-like cost for a like-for-like answer.
+    great-circle field in ``tests/test_heat_distance.py``, where it matches triwarp's own worst
+    deviation, so this row is a like-for-like cost for a like-for-like answer.
 
-    **igl is capped at ``sphere_small`` with ``rounds=1``, and the numbers say why.** Measured on
-    icospheres at one source with every vertex as a target: **57 ms at 2 562 vertices, 839 ms at
-    10 242, 20.9 s at 40 962** -- roughly 15-25x per 4x step, so ``sphere_med`` alone would cost
-    ~21 s a round and ``sphere_large`` minutes. Window propagation is the price of exactness, and
+    **igl is capped at ``sphere_small`` with ``rounds=1``, and the slope says why.** At one source
+    with every vertex as a target it rises by well over an order of magnitude per 4x step, so the
+    next mesh up is already impractical per round. Window propagation is the price of exactness, and
     that slope is the most useful thing this row records.
 
     Its call is also the one signature trap in the module: ``exact_geodesic(V, F, VS, FS, VT, FT)``
@@ -420,8 +318,8 @@ def test_fast_marching_distance(bench_case: BenchCase) -> None:
     if bench_case.kind == "meshlib":
         # ``startVertices`` is a VertBitSet over the vertex domain -- there is no index-list
         # overload -- and it is the input, so it is built outside the timed callable. The mesh is
-        # read-only here and cached; ``maxVertUpdates`` stays at its default of 3, which is the
-        # accuracy setting the correctness comparison was measured at.
+        # read-only here and cached; ``maxVertUpdates`` stays at its default of 3, the accuracy
+        # setting the correctness comparison uses.
         mesh_ml = _mesh_ml(bench_case)
         starts_ml = mm.VertBitSet()
         starts_ml.resize(mesh_ml.points.size(), False)

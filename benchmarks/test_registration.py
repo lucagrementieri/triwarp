@@ -54,19 +54,18 @@ and cached outside the timed region.
 
 The nearest-neighbour search dominates every ICP number here; the 6x6 solve and the tiled reductions
 are a small fraction of the total, so the number to read for a kernel change is the before/after
-delta on a *fixed* mesh, not the absolute time. Two things the absolute times do say, both measured
-on ``bunny`` (35 947 target points, 20 000 source points, 10 iterations):
+delta on a *fixed* mesh, not the absolute time. Two things the two targets do say:
 
-* The **mesh** target is still the faster of the two — 4.0 ms versus 7.9 ms — because it rides
-  Warp's built-in ``wp.mesh_query_point_no_sign`` and never touches the k-NN path at all.
-* The **point-cloud** target used to be 48x slower than that (191 ms), because
-  [`query_nearest`][triwarp.neighbors.query_nearest] searched the whole cloud on every
-  call: with ``max_radius=inf`` it clamped the query cube to the scene diagonal, so the BVH pruned
-  nothing. It now deepens iteratively from a density estimate, and the target's BVH, bounds and
-  radius are hoisted out of the loop, which moved point-cloud ICP from ~10x *slower* than open3d's
-  serial ``KDTreeFlann`` to ~2.3x faster (7.9 ms versus 18.0 ms). The residual gap to the mesh
-  target is per-iteration ``procrustes`` latency, not the search — which is why
-  ``icp_point_to_plane``, whose iteration has no ``procrustes`` call, lands at 5.6 ms.
+* The **mesh** target is the faster of the two, because it rides Warp's built-in
+  ``wp.mesh_query_point_no_sign`` and never touches the k-NN path at all.
+* The **point-cloud** target is within a small factor of it, and is only so because
+  [`query_nearest`][triwarp.neighbors.query_nearest] deepens iteratively from a density estimate
+  and the target's BVH, bounds and radius are hoisted out of the loop. With ``max_radius=inf`` it
+  clamps the query cube to the scene diagonal instead, the BVH prunes nothing, and the search costs
+  one to two orders of magnitude more -- enough to lose to open3d's serial ``KDTreeFlann`` rather
+  than to beat it. The residual gap to the mesh target is per-iteration ``procrustes`` latency, not
+  the search, which is why ``icp_point_to_plane``, whose iteration has no ``procrustes`` call,
+  lands between the two.
 """
 
 from __future__ import annotations
@@ -330,10 +329,10 @@ def test_icp_point_cloud(bench_case: BenchCase) -> None:
     ``knn_points`` -- no tree, no grid -- so its cost is quadratic in the cloud size per iteration
     on either device, and only the CUDA row is registered (see ``LIBRARIES`` in
     [`conftest.py`](conftest.py)); the host row was retired after it failed to finish a
-    ``sphere_large`` ICP in 926 s. ``estimate_scale=False`` matches triwarp's default;
+    ``sphere_large`` ICP at all. ``estimate_scale=False`` matches triwarp's default;
     ``max_iterations`` is matched to the other rows, but note the *actual* count is each library's
     own convergence rule, so a row that converges early is reporting fewer iterations rather than a
-    faster one -- which is the same caveat this group's rotation axis exists to expose.
+    faster one -- the same caveat this group's rotation axis exists to expose.
     """
     if bench_case.kind == "pytorch3d":
         source_p3d = points_torch_from_numpy(_source_np(bench_case)[0], bench_case.torch_device)

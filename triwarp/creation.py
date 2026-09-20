@@ -765,8 +765,8 @@ def sphere_cap(
     # before it -- which is the case CLAUDE.md section 3.8 sanctions for a template whose output
     # scales with a resolution parameter, and the same conversion ``grid``, ``icosphere`` and
     # ``parametric_surface`` already took. The host build it replaces looped over rings in Python
-    # and was quadratic in the ring count: 0.20 / 0.80 / 4.56 / 12.68 ms at ``subdivisions``
-    # 3 / 5 / 7 / 8 on an RTX 5090, against a flat device cost.
+    # and was quadratic in the ring count, against a flat device cost -- so the device path wins at
+    # every resolution and needs no size gate.
     vertices_wp = wp.empty(n_vertices, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_creation.sphere_cap_vertices,
@@ -1733,8 +1733,8 @@ def truncated_prisms(
     out_vertices = wp.empty(6 * n_faces, dtype=wp.vec3, device=device)
     out_faces = wp.empty(24 * n_faces, dtype=wp.int32, device=device)
     # Inverted in NumPy, on the matrix that is already in hand, rather than with ``wp.inverse``:
-    # a Warp builtin at Python scope routes through builtin dispatch, 9.01 us against 2.85 here,
-    # and the two agree to 1.2e-07 (``wp.inverse`` works in float32). Section 13.1.
+    # a Warp builtin at Python scope routes through builtin dispatch and is several times dearer,
+    # and the two agree to float32 rounding (``wp.inverse`` works in float32). Section 13.1.
     to_plane = wp.mat44(*transform_np.flatten())
     from_plane = wp.mat44(*np.linalg.inv(transform_np).flatten())
     wp.launch(
@@ -2316,8 +2316,8 @@ _SUPER_TOROID_SPEC = _ParametricSpec(
 _RANDOM_HILLS_SPEC = _ParametricSpec(wp.int32(-1), (-10.0, 10.0), (-10.0, 10.0))
 
 # Lattice samples at or above which the device lattice beats the numpy one. The device path costs a
-# flat ~0.66 ms of launches, allocations and two readbacks whatever the resolution; the host path is
-# quadratic in it. Measured at 96 squared = 9 216 (1.01x), 80 squared (0.82x), 112 squared (1.28x).
+# flat floor of launches, allocations and two readbacks whatever the resolution; the host path is
+# quadratic in it, and the two cross here.
 _PARAMETRIC_LATTICE_DEVICE_FROM = 9216
 
 # Longest profile ``_revolve_regular`` will screen. The screen is ``O(P)`` in the profile length
@@ -2325,9 +2325,9 @@ _PARAMETRIC_LATTICE_DEVICE_FROM = 9216
 # second launch -- so the bet is symmetric at a short profile and lopsided at a long one. A decline
 # is not a rare path either: a fine profile revolved into many sections makes the polar triangles
 # smaller than ``revolve``'s absolute area tolerance, which drops more of them than the regular
-# layout expects, and that is exactly the large-``P`` regime. At this cap the downside is ~2.4x the
-# upside and the fast path still wins ~1.2x; at twice it the downside is ~4.5x and every shape
-# probed declined. Above the cap the general engine runs unscreened.
+# layout expects, and that is exactly the large-``P`` regime. At this cap the fast path still wins
+# and the downside is bounded; at twice it every shape probed declined. Above the cap the general
+# engine runs unscreened.
 _REVOLVE_REGULAR_MAX_PROFILE = 2048
 
 
@@ -2385,9 +2385,8 @@ def _parametric_samples(
         raise ValueError(f"v_resolution must be at least 3 on a wrapped axis, got {n_v}")
     # The lattice is a closed-form parallel map, so the device wins it outright once there is
     # enough of it -- and loses below that to its own launch and readback floor, which is flat where
-    # the host cost is quadratic in the resolution. Measured on an RTX 5090, Warp 1.17, "boy" at
-    # 32..192 squared: the device path is 0.64-0.68 ms at every one of them while the host path goes
-    # 0.27 -> 2.21 ms, crossing at 96 squared. Both produce byte-identical vertices and faces.
+    # the host cost is quadratic in the resolution. Both paths produce byte-identical vertices and
+    # faces, so the gate is purely a cost choice; see ``_PARAMETRIC_LATTICE_DEVICE_FROM``.
     if n_u * n_v >= _PARAMETRIC_LATTICE_DEVICE_FROM:
         first, faces = _parametric_lattice_device(spec, n_u, n_v, device)
         n_vertices = int(first.shape[0])

@@ -4,19 +4,15 @@ Benchmarks for ``triwarp.sample``: uniform surface sampling and blue-noise selec
 The radius targets ~2,000 samples (same helper formula as ``tests/test_sample.py``). Capped at
 ``bunny``.
 
-**This group is 95 % device-bound, and reading that correctly is what closed it.** The Bridson
-active-list implementation that used to be here measured 260 ms on ``bunny_decimated`` at the 2k
-radius with 246 ms of it in kernels across 98 rounds -- 69 % in one kernel (``bridson_propose``) and
-28 % in the pruning pass behind it. Four micro-optimizations of that hot kernel had already been
-tried and every one lost, because the cost was structural: an active parent must enumerate a
-``9x9x9`` shell of background cells every round to find a child in its ``[r, 2r]`` annulus, and the
-round count is set by how the front advances rather than by the work. Replacing it with
-randomized-priority selection over the whole pool -- 27 cells, a handful of rounds -- is **6.0x at
-the 2k radius and 10.6x at half of it**, with *tighter* coverage than either reference. A fifth
-micro-optimization was measured on the way out and is worth recording as a null: making the shell
-permutation lazy (a partial Fisher-Yates, drawing only the prefix the loop consumes, where the
-eager one shuffled up to 728 entries to use the first) is a **wash**, so the shuffle was never
-the cost either.
+**This group is overwhelmingly device-bound, and reading that correctly is what closed it.** A
+Bridson active-list sampler spends nearly all of its time in kernels across ~100 rounds, and four
+micro-optimizations of its hot kernel all lost because the cost is structural: an active parent must
+enumerate a ``9x9x9`` shell of background cells every round to find a child in its ``[r, 2r]``
+annulus, and the round count is set by how the front advances rather than by the work.
+Randomized-priority selection over the whole pool — 27 cells, a handful of rounds — is **an order of
+magnitude**, with *tighter* coverage than either reference. A fifth micro-optimization is worth
+recording as a null: making the shell permutation lazy (a partial Fisher-Yates drawing only the
+prefix the loop consumes) is a **wash**, so the shuffle was never the cost either.
 
 **open3d**'s ``sample_points_poisson_disk`` is the reference: the same blue-noise / Poisson-disk
 surface sampling problem, parametrized by sample *count* rather than by radius, so it is given
@@ -32,21 +28,19 @@ identical parameter and the radius sweep this group is built around maps across 
 algorithm is Corsini et al.'s *hierarchical* dart throwing and igl's is Bridson active-list dart
 throwing -- **four implementations, four schemes, one parametrization**, with triwarp's randomized-
 priority selection and open3d's sample elimination as the other two. MeshLab is the closest of the
-three in output: same exact minimum distance, coverage within 3 %. It pushes the sample cloud onto
+three in output: same exact minimum distance, coverage within a few percent. It pushes the sample
+cloud onto
 the MeshSet as a new mesh, so the set is rebuilt per round.
 
 **libigl is where this port came from, and the row inverted when the algorithm changed.** The
 ``30x`` oversampling factor ``sample_surface_blue_noise`` draws its pool at is
-``igl::blue_noise``'s, and while triwarp ran Bridson too, igl was *faster*: 78.4 ms against 98.5 on
-``bunny`` at ``4 * mean_edge``.
-After ``ae26e8f`` the same pair reads **18.0 ms against 73.8** — and the margin
-**grows as the radius falls** (4.1x at ``4 * mean_edge``, 5.4x at the 2k radius, 9.0x at half of it,
-24x on ``bunny_decimated`` at half), because igl's serial cost is per accepted sample where
-triwarp's is per round. igl also returns 2-7% *fewer* samples at the same radius, so the ratios are
-a lower bound per sample delivered — and its *quality* is the best of the three references
-(``tests/test_sample.py`` measures its coverage gap at 1.073 r against triwarp's 1.103 and MeshLab's
-1.112), so this is not speed bought with quality on either side. It gets ``rounds=3``: 278 ms at the
-2k radius on ``bunny`` and 1 196 at half of it.
+``igl::blue_noise``'s, and while triwarp ran Bridson too, igl was *faster*. With
+randomized-priority selection triwarp leads, and the margin **grows as the radius falls** -- from a
+few times at a wide radius to more than an order of magnitude at a narrow one -- because igl's
+serial cost is per accepted sample where triwarp's is per round. igl also returns a few percent
+*fewer* samples at the same radius, so the ratios are a lower bound per sample delivered -- and its
+*quality* is the best of the three references (``tests/test_sample.py`` measures the coverage gaps),
+so this is not speed bought with quality on either side. It gets ``rounds=3``.
 
 MeshLab's uniform ``generate_sampling_montecarlo`` is deliberately **not** a row in ``blue_noise``:
 it is not a blue-noise sampler at all (no minimum-distance guarantee), so it would be a floor
@@ -132,35 +126,32 @@ def test_sample_surface(bench_case: BenchCase, count: int) -> None:
 
     All three libraries take the same two parameters (a count and a seed) and return the same two
     things (positions and the face index each sample landed on), so this is the module's one group
-    where nothing has to be matched up -- ``igl.random_points_on_mesh(n, V, F, seed)`` and
-    ``tm.sample.sample_surface(mesh, n, seed=)`` are the same call as triwarp's.
+    where nothing has to be matched up -- ``igl.random_points_on_mesh`` and
+    ``tm.sample.sample_surface`` are the same call as triwarp's.
 
     The axis is the count, and it separates the two sides cleanly: **the references are linear in it
-    and triwarp is flat.** Measured on ``bunny``, medians: igl 21.1 -> 55.2 ms and trimesh
-    25.8 -> 55.0 from 10k to 100k, against triwarp's **260.8 -> 252.8 µs** — a decade more samples
-    for no more time, because at these counts triwarp's row is the two launches and the area CDF
-    rather than the sampling. So read this group as 80-200x, and read the *slope* as the statement:
-    the crossover where triwarp's per-sample cost becomes visible is above 100 000 samples.
+    and triwarp is flat** -- a decade more samples for no more time, because at these counts
+    triwarp's row is the two launches and the area CDF rather than the sampling. So read the *slope*
+    as the statement: the crossover where triwarp's per-sample cost becomes visible is above a
+    hundred thousand samples.
 
     open3d's ``sample_points_uniformly`` and MeshLab's ``generate_sampling_montecarlo`` are the same
     operation but return a bare point cloud with no face index, so they would need a closest-point
     decode before they could be asserted against the area law -- a transform on the *reference* to
     make it comparable, which is what the two references above avoid.
 
-    trimesh rebuilds its ``tm.Trimesh`` inside the timed callable, as the other trimesh rows in the
-    suite do, because the area CDF is cached on the mesh object and reusing it would time a
-    lookup.
+    trimesh rebuilds its ``tm.Trimesh`` inside the timed callable, as the other trimesh rows do,
+    because the area CDF is cached on the mesh object and reusing it would time a lookup.
 
-    **pytorch3d**'s ``sample_points_from_meshes`` is the same area-weighted sampler and the only
-    GPU one, so it is where the flatness above is tested against another parallel implementation
-    rather than against a serial baseline. It returns positions alone -- the face index is internal
-    -- so unlike igl and trimesh it needs no decode but also cannot be asserted against the area
-    law directly; ``tests/test_sample.py::test_sample_surface_matches_pytorch3d`` compares the two
-    clouds distributionally and pins the area law on triwarp's own face indices. Its ``Meshes``
-    memoizes the per-face areas it samples from, so it is built **inside** the timed callable and
-    the row carries that derivation, which is the same thing trimesh's row does with its area CDF.
-    One hard limit: it draws the face index with ``torch.multinomial``, which refuses more than
-    2^24 categories, so ``lucy`` (28 055 742 faces) raises rather than sampling and is skipped.
+    **pytorch3d**'s ``sample_points_from_meshes`` is the same area-weighted sampler and the only GPU
+    one, so it is where the flatness above is tested against another parallel implementation rather
+    than a serial baseline. It returns positions alone -- the face index is internal -- so unlike
+    igl and trimesh it needs no decode but also cannot be asserted against the area law directly;
+    the parity test compares the two clouds distributionally and pins the area law on triwarp's own
+    face indices. Its ``Meshes`` memoizes the per-face areas it samples from, so it is built
+    **inside** the timed callable and the row carries that derivation, the same thing trimesh's row
+    does with its area CDF. One hard limit: it draws the face index with ``torch.multinomial``,
+    which refuses more than 2^24 categories, so ``lucy`` raises rather than sampling and is skipped.
     """
     if bench_case.kind == "pytorch3d":
         # ``torch.multinomial`` refuses more than 2^24 categories, and the face buffer *is* the
@@ -209,48 +200,37 @@ def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -
     Maximal Poisson-disk selection from a dense pool, on a background grid sized by the radius.
 
     Halving the radius is 8x the cells and 4x the output, so the pair should show a large,
-    superlinear step -- and on ``bunny_decimated`` it is now a *flat* one (24.6 -> 25.1 ms), because
-    the round count does not grow with it there and the per-cell summaries that prune each round's
-    shell sweep prune hardest exactly where the cells are most numerous (2.30x at half the radius on
-    ``bunny`` against 1.71x at the full one). open3d is parametrized by *count* rather than radius,
-    so its two rows are matched to the sample count each radius implies rather than to the radius.
+    superlinear step -- and on ``bunny_decimated`` it is a *flat* one, because the round count does
+    not grow with it there and the per-cell summaries that prune each round's shell sweep prune
+    hardest exactly where the cells are most numerous. open3d is parametrized by *count* rather than
+    radius, so its two rows are matched to the sample count each radius implies.
 
-    **The flatness is ``bunny_decimated``'s alone, and the variable is the round count.**
-    Re-profiled at both radii after the summaries landed:
-
-    | row | rounds | whole call | ``dart_select_minima`` | ``dart_cover_neighbors`` |
-    |---|---|---|---|---|
-    | ``bunny_decimated`` r1 | 46 | 25.6 ms | 11.8 (46 %) | 4.3 |
-    | ``bunny_decimated`` rhalf | 39 | 25.8 | 12.0 (47 %) | 5.4 |
-    | ``bunny`` r1 | 51 | 28.2 | 13.5 (48 %) | 4.9 |
-    | ``bunny`` rhalf | **88** | **58.4** | 32.1 (55 %) | 10.7 |
-
-    The pool build is 1 % of every row, so this group times the selection almost alone. What sets a
-    row apart is how fast the work list decays, and ``bunny`` at half the radius *stalls*: its alive
-    count runs 1 073 115 -> 754 036 -> 577 814 -> ... -> 285 941 by round 10 and is still 187 240 at
-    round 20, where ``bunny_decimated`` at the same pool size is down to 54 385 and 11 061. The cost
-    is spread across those mid-size rounds and **not** in a tail -- rounds with fewer than 1 000
-    alive points are 1.6-6.7 % of the selection time on every row -- so a tail-specific engine has
-    nothing to collect.
+    **The flatness is ``bunny_decimated``'s alone, and the variable is the round count.** The pool
+    build is a rounding error on every row, so this group times the selection almost alone. What
+    sets a row apart is how fast the work list decays, and ``bunny`` at half the radius *stalls*:
+    its alive count is still a sixth of the pool after twenty rounds, where ``bunny_decimated`` at
+    the same pool size is down to a hundredth. The cost is spread across those mid-size rounds and
+    **not** in a tail -- rounds with a handful of alive points are a few percent of the selection
+    time on every row -- so a tail-specific engine has nothing to collect.
 
     Two mechanisms are already refuted here and must not be re-proposed: inverting the covering
-    sweep to a scatter (built, byte-gated, 1.71x dense and **0.88x** at the radius the row is
-    scored at) and compacting the dead entries out of the per-cell membership lists (built,
-    byte-gated, **0.91-0.94x** -- the summaries had already removed the work it targets; see
-    ``kernels/algorithms/blue_noise.py`` for both numbers and the reason).
+    sweep to a scatter (built, byte-gated, a win on a dense pool and a **loss** at the radius the
+    row is scored at) and compacting the dead entries out of the per-cell membership lists (built,
+    byte-gated, a small loss -- the summaries had already removed the work it targets; see
+    ``kernels/algorithms/blue_noise.py`` for both).
 
     **libigl is the reference this port was written from** -- ``sample_surface_blue_noise`` still
     sizes its pool at the ``30x`` oversampling factor ``igl::blue_noise`` uses -- and it takes the
     radius directly, so it and MeshLab both receive triwarp's own parameter. It is Bridson
-    active-list dart throwing, which is what triwarp *was* before ``ae26e8f``: four schemes across
-    four libraries on one parametrization.
+    active-list dart throwing, which is what triwarp *was*: four schemes across four libraries on
+    one parametrization.
 
     **meshlib is the fifth, and the only one that thins a point cloud rather than a surface.** Its
-    row therefore gets the dense pool that every one of these algorithms builds internally,
-    supplied as its input and *not* timed -- which makes it the one row that prices the selection
-    alone, where the other four each carry their own pool construction. Read the gap between it
-    and triwarp as selection-against-selection, and the gap between triwarp and igl or MeshLab as
-    the whole pipeline. ``UniformSamplingSettings.distance`` is the radius, given the same value.
+    row therefore gets the dense pool that every one of these algorithms builds internally, supplied
+    as its input and *not* timed -- which makes it the one row that prices the selection alone,
+    where the other four each carry their own pool construction. Read the gap between it and triwarp
+    as selection-against-selection, and the gap between triwarp and igl or MeshLab as the whole
+    pipeline. ``UniformSamplingSettings.distance`` is the radius, given the same value.
     """
     skip_larger_than(bench_case, "bunny")
     # Halving the radius quadruples the samples that fit (area / radius^2).

@@ -2,53 +2,48 @@
 Closing mesh boundary holes, and stitching two open meshes along a rim.
 
 Every boundary of a triangle mesh is an ordered vertex loop
-([`boundary_loops`][triwarp.boundary.boundary_loops], the analog of
-``trimesh.repair.fill_holes``'s ``nx.cycle_basis`` and ``igl::boundary_loop_all``). Each loop
-of ``B`` vertices is sealed with a purely topological triangulation — **no smoothing or
-refinement**:
+([`boundary_loops`][triwarp.boundary.boundary_loops], the analog of ``trimesh.repair.fill_holes``'s
+``nx.cycle_basis`` and ``igl::boundary_loop_all``). Each loop of ``B`` vertices is sealed with a
+purely topological triangulation -- **no smoothing or refinement**:
 
-- [`fill_fan`][triwarp.holes.fill_fan] fans ``B - 2`` triangles from the loop's
-  first vertex, reusing only existing vertices (``trimesh.repair.fill_holes(use_fan=True)``).
-- [`fill_cone`][triwarp.holes.fill_cone] inserts one centroid vertex per hole
-  and cones ``B`` triangles onto it (``igl::topological_hole_fill``,
+- [`fill_fan`][triwarp.holes.fill_fan] fans ``B - 2`` triangles from the loop's first vertex,
+  reusing only existing vertices (``trimesh.repair.fill_holes(use_fan=True)``).
+- [`fill_cone`][triwarp.holes.fill_cone] inserts one centroid vertex per hole and cones ``B``
+  triangles onto it (``igl::topological_hole_fill``,
   ``trimesh.repair.stitch(insert_vertices=True)``).
-- [`fill_min_weight`][triwarp.holes.fill_min_weight] instead computes the
-  **minimum-weight triangulation** of each loop (the Liepa/Klincsek interval DP): the ``B - 2``
-  triangles over the existing loop vertices that minimize a
-  geometric metric (plane-normalized circumcircle by default, with a min-area fallback), avoiding
-  chords that would duplicate existing mesh edges. This is the robust, general-purpose filler for
-  non-convex and non-planar holes; it adds no vertices.
+- [`fill_min_weight`][triwarp.holes.fill_min_weight] computes the **minimum-weight triangulation**
+  of each loop (the Liepa/Klincsek interval DP): the ``B - 2`` triangles over the existing loop
+  vertices that minimize a geometric metric (plane-normalized circumcircle by default, with a
+  min-area fallback), avoiding chords that would duplicate existing mesh edges. This is the robust,
+  general-purpose filler for non-convex and non-planar holes; it adds no vertices.
 
-Because ``boundary_loops`` orders each loop following the face-winding direction of the
-boundary half-edges, a fill triangle sharing a rim edge is emitted **reversed** on that edge so
-its winding is consistent with the adjacent original face. This assumes the input mesh is
-consistently wound; run [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
-first on meshes with mixed winding.
+Because ``boundary_loops`` orders each loop following the face-winding direction of the boundary
+half-edges, a fill triangle sharing a rim edge is emitted **reversed** on that edge so its winding
+is consistent with the adjacent original face. This assumes the input mesh is consistently wound;
+run [`make_winding_consistent`][triwarp.repair.make_winding_consistent] first on meshes with mixed
+winding.
 
 Joining **two** open meshes across one boundary loop each is the same family and lives here too:
 [`stitch`][triwarp.holes.stitch] and its variants, over the loop-level engines
 [`stitch_loops`][triwarp.holes.stitch_loops] and
 [`stitch_loops_min_weight`][triwarp.holes.stitch_loops_min_weight]. It is the *same* minimum-weight
-machinery -- the same interval DP, the same rim bookkeeping and the same metric vocabulary --
-applied to a band between two rims rather than a cap over one, which is why the two halves share a
-module rather than a private import list.
+machinery -- the same interval DP, rim bookkeeping and metric vocabulary -- applied to a band
+between two rims rather than a cap over one.
 
 For a smooth, well-graded patch, [`fill_smooth`][triwarp.holes.fill_smooth] and
-[`stitch_smooth`][triwarp.holes.stitch_smooth] run a three-stage pipeline on top of the
-min-weight fill/stitch: the patch is refined to a
-target edge length with Delaunay edge flips
+[`stitch_smooth`][triwarp.holes.stitch_smooth] run a three-stage pipeline on top of the min-weight
+fill/stitch: the patch is refined to a target edge length with Delaunay edge flips
 ([`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]) and its new interior
-vertices are smoothed into the surrounding surface — a sharp-boundary umbrella solve
-([`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim])
-followed by a cross-boundary least-squares solve
-([`smooth_region`][triwarp.smoothing.smooth_region]), with an optional
-``natural_smooth`` collar that blends the patch into the neighbouring surface.
+vertices are smoothed into the surrounding surface -- a sharp-boundary umbrella solve
+([`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim]) followed by a
+cross-boundary least-squares solve ([`smooth_region`][triwarp.smoothing.smooth_region]), with an
+optional ``natural_smooth`` collar that blends the patch into the neighbouring surface.
 
 Not every boundary wants closing. [`extend_hole`][triwarp.holes.extend_hole] and
-[`build_bottom`][triwarp.holes.build_bottom] *extrude* a rim -- out to a plane you place, or down
-to a base fitted under each rim's own lowest point -- which leaves the mesh open with a planar rim
-that a min-weight fill then closes without folding; that two-step is how a scanned shell becomes a
-printable solid. And [`bridge_edges`][triwarp.holes.bridge_edges] and
+[`build_bottom`][triwarp.holes.build_bottom] *extrude* a rim -- out to a plane you place, or down to
+a base fitted under each rim's own lowest point -- which leaves the mesh open with a planar rim that
+a min-weight fill then closes without folding; that two-step is how a scanned shell becomes a
+printable solid. [`bridge_edges`][triwarp.holes.bridge_edges] and
 [`bridge_edges_smooth`][triwarp.holes.bridge_edges_smooth] are the *local* form of stitching: they
 join one boundary edge to another with a small patch or a curved strip, leaving the rest of both
 boundaries open, which is what joins two tubes at a chosen seam or adds a handle where the rim
@@ -59,10 +54,10 @@ with one rim, for a filler to close afterwards.
 
 The return shape follows from that: a filler that only triangulates existing rim vertices returns
 ``faces`` alone, while one that inserts a vertex -- a cone's apex, a refined patch's interior, an
-extrusion's projected ring -- returns ``(vertices, faces)``, because the position buffer grew too.
+extrusion's projected ring -- returns ``(vertices, faces)``.
 
-Every filler returns a buffer **independent of** ``faces``, including on the no-op path where
-there was no hole to fill, so a caller may write into the result without disturbing its input.
+Every filler returns a buffer **independent of** ``faces``, including on the no-op path where there
+was no hole to fill, so a caller may write into the result without disturbing its input.
 """
 
 from __future__ import annotations
@@ -603,11 +598,10 @@ def _fill_packed_loops(
 
     ``edges_sorted`` lets a caller that already built the sorted edge rows hand them over.
     ``fill_min_weight`` does; ``fill_small`` and ``fill_smooth`` deliberately do **not**, and it is
-    not an oversight to fix. Threading it there was measured and declined: the rebuild is 0.75-0.96%
-    of ``fill_small`` and 0.11-0.16% of ``fill_smooth``, and the share *falls* with mesh size (0.96
-    / 0.89 / 0.75% at 1 240 / 4 960 / 19 840 faces), which section 9 calls a decline rather than a
-    small win -- the saving would be largest exactly where the call is already cheap, and threading
-    a derived buffer adds a stays-in-sync-with-``faces`` obligation for it.
+    not an oversight to fix. Threading it there was measured and declined: the rebuild is well under
+    a percent of either call and the share *falls* with mesh size, which section 9 calls a decline
+    rather than a small win -- the saving would be largest exactly where the call is already cheap,
+    and threading a derived buffer adds a stays-in-sync-with-``faces`` obligation for it.
     """
     device = faces.device
     if edges_sorted is None:
@@ -810,8 +804,8 @@ def _run_hole_dp(
     tables.rim_opp_valid = rim_opp_valid
     tables.char_areas = char_areas
     # The two in-place DP tables live in the bundle too: their pointers are invariant across the
-    # whole span sweep, and at ~1.0 us per launch argument a 510-launch rim pays milliseconds to
-    # keep them in the signature. See ``HoleFillTables``.
+    # whole span sweep, and at about a microsecond per launch argument a long rim's hundreds of
+    # launches pay milliseconds to keep them in the signature. See ``HoleFillTables``.
     tables.dp = dp
     tables.prev = prev
     tables.metric_id = wp.int32(metric_id)
@@ -1518,43 +1512,39 @@ def fillable_loop_mask(
     per loop, so the policy is the caller's rather than a flag's:
 
     * **A repeated vertex.** A rim that visits one vertex twice is pinched there, and any
-      triangulation of it folds through that pinch. A vertex shared by two *different* rims is the
-      same pinch spread across two loops, and disqualifies both.
+      triangulation
+      of it folds through that pinch. A vertex shared by two *different* rims is the same pinch
+      spread across two loops, and disqualifies both.
     * **A chord.** Two loop vertices that are *not* neighbours along the rim but are already joined
-      by a mesh edge. The fill may propose that pair as a fill edge, and the mesh already has one,
-      so that edge ends up with three faces. This is what
+      by
+      a mesh edge. The fill may propose that pair as a fill edge, and the mesh already has one, so
+      that edge ends up with three faces. This is what
       ``fill_min_weight(resolve_multiple_edges=True)`` repairs *after* the fact, and a ``True`` here
       is exactly the case where that repair has nothing to do.
 
-    !!! note "Conservative on the chord, and not the reference predicate"
+    !!! note "Conservative on the chord"
         The chord test is **sufficient, not necessary**: a chord-free loop cannot produce a
         duplicated edge whatever the dynamic program chooses, but a loop *with* a chord may still
         fill cleanly if the program happens to avoid it. A four-vertex rim with one diagonal already
-        present is the smallest example -- there are two triangulations and only one of them
-        collides. So read ``False`` as "check the result", not as "cannot be filled".
+        present is the smallest example -- there are two triangulations and only one collides. So
+        read ``False`` as "check the result", not as "cannot be filled".
 
-        It is also **not** a port of the reference predicate that flags faces *complicating* a
-        hole, which measures something else: on that same square it flags **no** face. And the
-        reference's third predicate, whether a loop is the "outer" one, is deliberately absent --
-        which boundary of an open surface is outer is a property of an embedding, not of the mesh,
-        so there is nothing intrinsic to compute. The practical form of that question, *which rim
-        is the big one*, is already
-        answered by ``fill_min_weight(preserve_largest_hole=True)`` and by
+        Whether a loop is the "outer" one is deliberately absent: which boundary of an open surface
+        is outer is a property of an embedding, not of the mesh. The practical form of that
+        question, *which rim is the big one*, is answered by
+        ``fill_min_weight(preserve_largest_hole=True)`` and by
         [`loop_perimeters`][triwarp.boundary.loop_perimeters].
 
     !!! warning "A known gap: a seam *and* a pinch at the same vertex"
-        The repeated-vertex check above catches a pinch because
+        The repeated-vertex check catches a pinch because
         [`boundary_loops`][triwarp.boundary.boundary_loops]'s underlying walk represents it as a
-        loop that visits one vertex twice. But when that same vertex also sits on a non-orientable
-        seam, the walk has no 2-regular path to fall back on at all and instead silently *drops*
-        one of the vertex's two outgoing boundary edges (see
-        ``triwarp.boundary._needs_unoriented_boundary_walk``'s docstring) -- so the loop this
-        function sees is simply **shorter** than the true rim, with
-        no repeated vertex to flag. Such a loop can pass this mask as fillable while not actually
-        closing along real mesh edges. No fixture in this package's test suite combines a seam and
-        a pinch at one vertex, so this gap is documented rather than guarded against; closing it
-        needs [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched] itself to detect
-        and report the dropped edge, which is a separate, larger change.
+        loop that visits one vertex twice. But when that vertex also sits on a non-orientable seam,
+        the walk has no 2-regular path to fall back on and instead silently *drops* one of the
+        vertex's two outgoing boundary edges -- so the loop this function sees is simply **shorter**
+        than the true rim, with no repeated vertex to flag. Such a loop can pass this mask as
+        fillable while not actually closing along real mesh edges. Closing the gap needs
+        [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched] itself to detect and
+        report the dropped edge.
 
     Parameters
     ----------
@@ -2744,8 +2734,8 @@ def bridge_edges_smooth(
     # check; the one-segment case falls through to the flat patch below, which checks its own.
     #
     # The rim table is built here rather than inside each check so the one-segment path does not
-    # rebuild it: nothing between the two calls touches ``faces``, and that rebuild measured
-    # 22.5-23.7% of that path (0.38 ms of 1.60-1.71 ms, flat from 1 240 to 20 440 faces).
+    # rebuild it: nothing between the two calls touches ``faces``, and that rebuild is most of a
+    # quarter of that path, flat in the mesh size.
     rim = tw.boundary.oriented_boundary_edges(vertices, faces) if validate else None
     _check_bridge_edges(vertices, faces, (a0, a1), (b0, b1), (), validate, rim)
 
@@ -3001,7 +2991,7 @@ def join_closest_components(
         # The rim table the pair was chosen from is the one ``bridge_edges`` would rebuild to check
         # it against, over the same unchanged ``current``. Handing it over keeps the docstring's
         # "recomputes ... the boundary edges ... each round" true at one rebuild per round rather
-        # than two -- measured 13.5-15% of this call, and the share does not fall with mesh size.
+        # than two -- a seventh or so of this call, and the share does not fall with mesh size.
         current = bridge_edges(vertices, current, pair[0], pair[1], boundary_edges=pair[2])
         joins += 1
 

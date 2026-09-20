@@ -367,8 +367,8 @@ def descend_at_vertex(
         # it turns the same way from the first edge as the second does, and the same way from the
         # second as the first does. A weaker test -- rejecting only a direction negative against
         # *both* edges -- lets through a face whose descent leaves through the vertex itself, and
-        # then the walk finds no exit edge and stops after one point. Measured: that mistake left 38
-        # of 40 paths one point long.
+        # then the walk finds no exit edge and stops after one point, which truncated nearly every
+        # path to a single point.
         first = vertices[faces[f * 3 + (corner + 1) % 3]] - vertices[v]
         second = vertices[faces[f * 3 + (corner + 2) % 3]] - vertices[v]
         wedge = wp.dot(wp.cross(first, second), normal_of)
@@ -527,12 +527,10 @@ def descent_walk(
         # Both halves matter, and it is the second that this exists for. Carrying on into the twin
         # face leaves the walk standing on a vertex with no exit edge, so the flat-face fallback
         # below fires and compares that vertex's own value against a ``last_value`` accumulated
-        # over the preceding steps. The two are the same number up to float drift: measured on an
-        # ``icosphere(3)`` heat field, ``last_value`` came out 1.8e-08 *above* the vertex's value on
-        # cuda:0 and below it on cpu, so the walk continued on one device and stopped as a "local
-        # minimum" on the other -- 2 of 20 paths, at 0.27 and 0.52 of their true geodesic length.
-        # An icosphere routes descents exactly through vertices often enough for this to be
-        # systematic rather than a coincidence.
+        # over the preceding steps. The two are the same number up to float drift, so the walk
+        # continued on one device and stopped as a "local minimum" on the other, truncating a
+        # fraction of the paths partway along. An icosphere routes descents exactly through
+        # vertices often enough for this to be systematic rather than a coincidence.
         landed = wp.int32(-1)
         if wp.length(point - vertices[start]) <= length_epsilon:
             landed = start

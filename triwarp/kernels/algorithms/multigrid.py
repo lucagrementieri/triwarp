@@ -2,11 +2,11 @@
 Smoothed-aggregation algebraic multigrid: the setup passes and the V-cycle.
 
 **Why a hierarchy at all.** Jacobi-preconditioned conjugate gradient's iteration count grows with
-the mesh: on the least-squares operator ``smoothing.smooth_region`` builds it measures 1 753
-iterations at 2 043 unknowns and 6 521 at 8 987 -- 3.7x the count for 4.4x the size. A multigrid
-V-cycle attacks the low-frequency error the smoother cannot see, so the count stops growing; the
-whole item is whether one cycle costs less than the iterations it removes, which is a *launch*
-question on this hardware and not an arithmetic one. See ``triwarp.linalg`` for the measurement.
+the mesh, roughly in proportion to the unknown count on the least-squares operator
+``smoothing.smooth_region`` builds. A multigrid V-cycle attacks the low-frequency error the smoother
+cannot see, so the count stops growing; the whole item is whether one cycle costs less than the
+iterations it removes, which is a *launch* question on this hardware and not an arithmetic one. See
+``triwarp.linalg`` for the gate.
 
 **Aggregation is the only part that is not a library call**, and it is a parallel maximal
 independent set, which this package already runs twice on device (``sample.dart_select_minima``'s
@@ -20,21 +20,20 @@ two-hop ball, which is the Bell/Dalton/Olson formulation.
 
 Measured against ``pyamg``'s serial ``standard_aggregation`` on the same operator, same smoother,
 same cycle and same coarse solve -- the comparison that decides whether the parallel aggregation
-gives anything up: **288 iterations against 269** at 2 043 unknowns and **554 against 495** at
-8 987, i.e. 7-12 % more. That is the price of the parallelism and it is small.
+gives anything up -- it costs about a tenth more iterations. That is the price of the parallelism
+and it is small.
 
 The rest is ``warp.sparse``: the tentative prolongator is one entry per row (the constant
 near-nullspace vector, normalized per aggregate), the smoothed prolongator is
 ``P = (I - w D^-1 A) P0`` through one ``bsr_mm`` and one ``bsr_axpy``, and the coarse operator is
-the Galerkin product ``P^T A P``. Operator complexity comes out at **1.02-1.03**, so the coarse
-levels are nearly free and a cycle's cost is its fine level.
+the Galerkin product ``P^T A P``. Operator complexity comes out just above 1, so the coarse levels
+are nearly free and a cycle's cost is its fine level.
 
 The per-level inverse diagonal is ``array.inverse_or_one`` mapped over the operator's diagonal,
 not a copy of the conjugate gradient's: the quantity is the same one the Jacobi preconditioner
 needs, down to mapping a zero diagonal to 1 rather than to infinity -- which the least-squares
-operators here rely on, since they carry empty rows (297 of 8 987 on ``bunny``) for free vertices
-no equation reaches. The strength test's ``sqrt(|A_ii|)`` is ``array.sqrt_abs`` over the same
-diagonal.
+operators here rely on, since they carry empty rows for free vertices no equation reaches. The
+strength test's ``sqrt(|A_ii|)`` is ``array.sqrt_abs`` over the same diagonal.
 """
 
 import warp as wp
@@ -169,9 +168,8 @@ def aggregate_label(state: wp.int32, scan_pos: wp.int32) -> wp.int32:
     # own definition of a trivial kernel. Left un-hoisted (no `return_kernel=True`) at its one call
     # site inside `linalg._multigrid_aggregate`'s per-level loop: hoisting would need a dummy
     # int32 array allocated before the loop just to seed the kernel factory, or threading the
-    # cached kernel object through the function's signature, for an ~11 us/level saving against a
-    # setup section already measured at 9-18 ms (CLAUDE.md section 13.1) -- not where that cost
-    # lives.
+    # cached kernel object through the function's signature, for a per-level saving three orders of
+    # magnitude below the setup it sits in.
     return wp.where(state != MG_EXCLUDED, scan_pos - wp.int32(1), MG_UNAGGREGATED)
 
 
@@ -277,9 +275,8 @@ def csr_matvec(
     # ``y = alpha * A x`` (or ``y += alpha * A x``) for **every column at once**, which is the whole
     # reason this exists rather than ``warp.sparse.bsr_mv``: that takes one vector, so a cycle over
     # three right-hand sides pays three launches per mat-vec, and the V-cycle is launch-bound at
-    # these sizes. Measured on ``smooth_region``'s operator, three columns, captured: **34 launches
-    # and 189 us per cycle through ``bsr_mv`` against 15 and 85 through this**, with the same
-    # answer.
+    # these sizes -- measured at less than half the launches and less than half the time per cycle,
+    # with the same answer.
     #
     # ``x_stride`` and ``y_stride`` differ whenever the operator is rectangular -- the restriction
     # reads at the fine pitch and writes at the coarse one -- and either may exceed its own row
@@ -309,10 +306,10 @@ def power_step(
 ) -> None:
     # ``y = D^-1 A x``: one whole step of the power iteration that estimates the spectral radius, in
     # one launch. It differs from ``csr_matvec`` above only in folding the diagonal scale in and in
-    # being single-column -- and that fusion is the point, because the setup is launch-bound: the
-    # step used to be a ``bsr_mv`` plus a ``scaled_diagonal_apply``, and an uncaptured ``bsr_mv``
-    # costs ~0.1 ms whatever its nnz. Writing a second buffer rather than updating ``x`` in place is
-    # what lets it be one launch; the caller swaps the two.
+    # being single-column -- and that fusion is the point, because the setup is launch-bound: as a
+    # ``bsr_mv`` plus a ``scaled_diagonal_apply`` it is two launches, and an uncaptured ``bsr_mv``
+    # costs a fixed host price whatever its nnz. Writing a second buffer rather than updating ``x``
+    # in place is what lets it be one launch; the caller swaps the two.
     i = wp.int32(wp.tid())
     out_y[i] = inv_diag[i] * csr_row_dot(i, wp.int32(0), offsets, columns, values, x)
 

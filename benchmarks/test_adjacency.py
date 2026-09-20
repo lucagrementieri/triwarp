@@ -43,7 +43,7 @@ the threshold. Both are *cached properties*, so the ``Trimesh`` is rebuilt insid
 -- otherwise rounds 2..n would return a memoized array and measure nothing. That rebuild also pays
 trimesh's own ``face_adjacency`` construction, which is the honest comparison since the triwarp side
 builds its adjacency inside the timed region too. Both rows are capped at ``bunny``; the projection
-reference measured 276 ms at 327 680 faces against triwarp's 1.03 ms. **libigl** has no
+reference is two orders of magnitude behind triwarp at the top of the scale axis. **libigl** has no
 local-convexity binding, so igl is absent from these two.
 """
 
@@ -89,8 +89,8 @@ def test_face_adjacency(bench_case: BenchCase, known_radix: bool) -> None:
     side -- so the row is a fair cost comparison and the parity assert carries the pair-extraction
     transform (``tests/test_adjacency.py``). Note the array form is the one to use: the
     ``triangle_triangle_adjacency_lists`` variant is the same computation returning
-    ``list[list[int]]`` and costs 321 ms on ``bunny`` against 4.25 for this one, i.e. it would price
-    nanobind rather than the algorithm.
+    ``list[list[int]]`` and costs two orders of magnitude more, i.e. it would price nanobind rather
+    than the algorithm.
     """
     if bench_case.kind == "triwarp":
         faces_wp = bench_case.faces_wp
@@ -285,8 +285,8 @@ def test_face_adjacency_projections(bench_case: BenchCase) -> None:
     like-for-like. It is a cached property, so the mesh is rebuilt inside the timed callable exactly
     as ``face_adjacency_convex``'s row does, which means both sides pay for the adjacency the
     projection needs; that is the honest comparison here, since the adjacency is what dominates.
-    Capped at ``bunny``: the reference is single-core NumPy and measured 276 ms at 327 680 faces
-    against triwarp's 1.03 ms.
+    Capped at ``bunny``: the reference is single-core NumPy and is two orders of magnitude behind
+    triwarp at the top of the scale axis.
     """
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp

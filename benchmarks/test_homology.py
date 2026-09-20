@@ -12,24 +12,15 @@ What the axis separates is the two halves of the algorithm: building the spannin
 cotree, against *tracing* one walk per generator. ``sphere_med`` at genus 0 is the floor -- the
 trees with no loops to trace at all -- and ``handles_64`` is 128 traces on top of the same work.
 
-Measured medians (RTX 5090, ``--device=cuda``)
-----------------------------------------------
-| mesh | genus | ``homology_generators`` | meshlib |
-|---|---|---|---|
-| ``sphere_med`` | 0 | **2.66 ms** | 7.38 ms |
-| ``handles_1`` | 1 | **2.42 ms** | 5.52 ms |
-| ``handles_64`` | 64 | **3.13 ms** | 5.99 ms |
-
-triwarp leads on all three -- 2.8x, 2.3x and 1.9x -- where it was level with meshlib at genus 1 and
-2.01x behind at genus 64. The fused rewrite is worth **2.03 / 2.15 / 3.26x** against the previous
-implementation on the same box in one interleaved session, and the ratio rises with the genus
-because the tracing it replaced was the part that scaled: 128 loops were walked one at a time in
-Python over a ``parents`` array read back in full, and they are now two launches and a scan.
+triwarp leads meshlib at every genus, where it was level at genus 1 and behind at genus 64. The
+fused rewrite is worth two to three times the previous implementation, and the ratio rises with the
+genus because the tracing it replaced was the part that scaled: the loops were walked one at a time
+in Python over a ``parents`` array read back in full, and they are now two launches and a scan.
 
 **The axis still separates the two halves of the algorithm**, but they no longer separate in the
-clock the way they did. The spread across a 64x genus range is 2.42 to 3.13 ms, against 5.76 to
-12.07 before, so the decomposition dominates again and the tracing is a few hundred microseconds of
-it. There is no longer a ``tree_cotree`` group to read this one against: the decomposition stopped
+clock: the spread across a 64x genus range is small, so the decomposition dominates and the tracing
+is a fraction of it. There is no longer a ``tree_cotree`` group to read this one against: the
+decomposition stopped
 being a public entry point when it stopped being reachable except through this function, and the
 attribution it existed for is in ``triwarp/kernels/homology.py``'s module docstring.
 
@@ -74,10 +65,10 @@ def test_homology_generators(bench_case: BenchCase) -> None:
     """
     The full basis: spanning tree, cotree, then one loop trace per generator, in one call.
 
-    The genus axis prices the tracing, which is the half that scales with it -- 2.42 ms at genus 1
-    against 3.13 at genus 64, for 126 more loops. It used to be 0.49 ms against 6.1, a Python walk
-    per generator over a ``parents`` array read back in full; it is now two launches and a scan, so
-    the decomposition is the cost again at every genus this axis reaches.
+    The genus axis prices the tracing, the half that scales with it, and the spread over a 64x
+    genus range is small: the trace is two launches and a scan rather than a Python walk per
+    generator over a ``parents`` array read back in full, so the decomposition is the cost at every
+    genus this axis reaches.
     """
     expected = {"sphere_med": 0, "handles_1": 2, "handles_64": 128}[bench_case.mesh_name]
     if bench_case.kind == "meshlib":

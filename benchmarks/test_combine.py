@@ -6,22 +6,12 @@ Neither family scales with face count, and this pair is the sharpest example in 
 functions whose cost lives entirely somewhere else -- in the number of pieces going in or coming
 out.
 
-``split`` is one labelling pass plus one stable radix sort -- both O(F) and both fast -- followed
-by a **batched compaction of every component at once**. Measured at a fixed 81 920 faces:
-
-| components | triwarp-cuda | trimesh | open3d |
-|---|---|---|---|
-| 1 | **2.5 ms** | 36.6 ms | 68.1 ms |
-| 64 | 3.1 ms | 37.1 ms | 76.4 ms |
-| 1024 | **9.4 ms** | 183 ms | 290 ms |
-
-3.7x across the axis and a win at every point (19-31x). It did not start that way: until commit
-``f57d3f0`` the compaction was a **host loop calling ``submesh_from_face_indices`` once per
-component**, which measured 2.55 / 41.4 / 669 ms -- 262x across the axis, and a 3x *loss* to
-trimesh at a thousand components. This group is what surfaced that, and no face-count sweep would
-have: the scan registry's meshes happen to differ in component count by accident
-(``bunny_decimated`` has 94 scan floaters, ``bunny`` has 1), which is how the effect was originally
-noticed at all. The residual slope is what is left of the per-component cost.
+``split`` is one labelling pass plus one stable radix sort -- both O(F) and both fast -- and it is
+nearly flat across the component axis and a win at every point. The axis is what keeps it that
+way: a **host loop calling ``submesh_from_face_indices`` once per component** spreads by two orders
+of magnitude across it and ends as a *loss* to trimesh at a thousand components, and no face-count
+sweep would see that -- the scan registry's meshes differ in component count only by accident. The
+residual slope is what is left of the per-component cost.
 
 ``stitch_min_weight`` runs a grid dynamic program over the two rims: an O(La x Lb) table filled by
 O(La + Lb) *sequential* anti-diagonal launches, then a host traceback. So it is sized by rim
@@ -39,9 +29,9 @@ each cluster's faces is part of what an open3d user pays, exactly as scipy is fo
 **pymeshlab**'s ``generate_splitting_by_connected_components`` is the third, and the cheapest to
 state: one filter call does both halves and *pushes one new mesh per component* onto the MeshSet, so
 the component count is read straight off ``mesh_number()``. It is also the group's sharpest
-reference, because it has the same per-component host cost triwarp used to have -- measured **42 /
-133 / 1 630 ms** across the axis, a **39x spread** against triwarp's 3.7x. That is the shape the
-batched compaction removed, reproduced independently.
+reference, because it carries a per-component host cost: it spreads by more than an order of
+magnitude across the axis where triwarp's batched compaction is nearly flat. That is the shape the
+axis exists to detect, reproduced independently.
 
 Neither trimesh, open3d nor pymeshlab has an equivalent of ``stitch`` / ``stitch_min_weight``:
 joining two open meshes along their boundary loops with a minimum-weight triangulation is not in any
@@ -101,7 +91,7 @@ def _mesh_ml(bench_case: BenchCase) -> mm.Mesh:
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
 def test_split(bench_case: BenchCase) -> None:
     """
-    Label, sort, then one batched compaction of every component: 3.7x across the axis.
+    Label, sort, then one batched compaction of every component: nearly flat across the axis.
 
     meshlib's row stops at the labelling: ``getAllComponents`` returns one ``FaceBitSet`` per
     component and ``cloneRegion`` -- which needs an ``ObjectMesh`` wrapper -- is what would extract
@@ -242,11 +232,10 @@ def test_concatenate(bench_case: BenchCase, copies: int) -> None:
     The inverse of ``split``, and the same shape of cost: work proportional to the *input count*.
 
     Total face count is held at ``sphere_med``'s 81 920 and only the number of pieces changes, so
-    any slope here is per-mesh overhead rather than data movement. Measured **0.23 ms at 8 pieces
-    and 5.7 ms at 512**, down from 0.39 / 19.0 ms: the index renumbering used to be one ``wp.map``
-    per input mesh (~32 us of host-side marshalling each) and is now a single launch over the
-    packed buffer. The 25x that remains is two ``wp.copy`` calls per piece -- Warp has no gather
-    across separate allocations, so the packing itself cannot be batched.
+    any slope here is per-mesh overhead rather than data movement. The index renumbering is a
+    single launch over the packed buffer rather than one ``wp.map`` per input mesh, which is most of
+    the slope; what remains is two ``wp.copy`` calls per piece, because Warp has no gather across
+    separate allocations and the packing itself cannot be batched.
 
     **pytorch3d**'s ``join_meshes_as_scene`` is this operation exactly -- concatenate the vertex
     buffers, shift each piece's indices by the running count -- and

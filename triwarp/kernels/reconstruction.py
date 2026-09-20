@@ -56,9 +56,9 @@ def lexicographic_triangulation(
 ) -> None:
     # One thread, deliberately: this is a hull sweep whose every step depends on the previous
     # boundary, so there is nothing to parallelise. It is launched on the **CPU** device for the
-    # same reason -- measured on 20 000 points, the identical sweep costs 352 ms as the Python loop
-    # this replaces, 93 ms in a single CUDA thread, and 1.40 ms here. A single GPU thread is the
-    # wrong tool and the numbers say so by a factor of 66.
+    # same reason -- the identical sweep is two orders of magnitude cheaper on one CPU thread than
+    # on one CUDA thread, and cheaper again than the Python loop it replaces. A single GPU thread is
+    # the wrong tool and the numbers say so.
     #
     # ``out_counts`` carries [faces written, faces wanted]. They differ only when a degenerate input
     # (duplicate or collinear points) drives the visible arc past the 2n bound a real triangulation
@@ -133,22 +133,17 @@ def lexicographic_triangulation(
         # No visible edge at all means a degenerate insertion (a duplicate point, since a lex sweep
         # always sees the hull from the new rightmost point otherwise). Both indices stay -1, which
         # in the Python original wrapped to the last boundary entry and broke the walk immediately;
-        # mapping them to ``nb - 1`` reproduces that exactly rather than reading out of bounds. That
-        # collapse also fires -- and drops every other boundary vertex from the hull, unreferenced,
-        # rather than only the duplicate -- when ``curr`` is exactly collinear with the whole
-        # current boundary rather than a duplicate of one point (all ``orientations`` land on
-        # exactly zero). Searched for a genuinely-lex-ordered general-position input that reaches
-        # this branch with ``nb >= 2`` and confirmed a real hand-traced case exists in principle at
-        # ``nb == 2``: two boundary points and a later point exactly collinear with both. But a
-        # randomized search over 220 000+ properly lex-sorted point sets (3-7 points, general
-        # position) never reduced
-        # ``n_boundary`` to 2 at all, degenerate or not -- reaching it seems to itself require an
-        # earlier degenerate (already-collinear) step, which is the same input class
-        # ``test_delaunay_collinear`` already accepts producing zero faces for. So the dropped
-        # vertex ends up in the same "unreferenced by any face" outcome that class already produces
-        # deliberately, rather than corrupting anything downstream (the rest of the sweep proceeds
-        # correctly against whatever boundary this collapse leaves, degenerate or not). Left as is;
-        # revisit only with a concrete reachable repro, not a hand-traced hypothetical one.
+        # mapping them to ``nb - 1`` reproduces that exactly rather than reading out of bounds.
+        #
+        # That collapse also fires -- and drops every other boundary vertex from the hull,
+        # unreferenced, rather than only the duplicate -- when ``curr`` is exactly collinear with
+        # the whole current boundary. A hand-traced general-position case exists in principle at
+        # ``n_boundary == 2``, but a large randomized search over properly lex-sorted point sets
+        # never reduced ``n_boundary`` to 2 at all: reaching it seems to require an earlier
+        # degenerate step, which is the same input class ``test_delaunay_collinear`` already accepts
+        # producing zero faces for. So the dropped vertex ends up in the "unreferenced by any face"
+        # outcome that class already produces deliberately. Left as is; revisit only with a concrete
+        # reachable repro, not a hand-traced hypothetical one.
         if right < 0:
             right = nb - 1
         if left < 0:
@@ -212,15 +207,12 @@ def cycle_step(nbr: wp.array[wp.int32], m: wp.int32, i: wp.int32, step: wp.int32
     # greedy removal loop, so an adversarial removal order (long runs of dead slots) makes one call
     # O(m) and the whole loop O(m^3) against the O(m^2) shape it otherwise implies -- an
     # incrementally-maintained doubly-linked `prev`/`next` pair would cap it at O(1)/O(m^2).
-    # Measured instead of assumed
-    # (`benchmarks/test_reconstruction.py::test_triangulate_point_cloud`'s own cloud,
-    # `num_neighbours` swept 8/16/32/64 at fixed point count, RTX 5090, device time only): the
-    # kernel's own cost scales 3.5-4.05x per doubling of `m`, matching the O(m^2) shape the loop
-    # nominally has, not the O(m^3) worst case -- so on this ordinary point cloud, the walk is not
-    # hitting long dead-slot runs and the doubly-linked rewrite would buy little. `m` is capped at
-    # `MAX_NEIGHBOURS` regardless, bounding the absolute worst case. Declined; re-measure before
-    # reopening this if a future caller's removal pattern looks different (e.g. a very anisotropic
-    # or highly clustered cloud).
+    # Measured instead of assumed, sweeping `num_neighbours` at a fixed point count: the kernel's
+    # own cost scales with the O(m^2) shape the loop nominally has, not the O(m^3) worst case, so on
+    # an ordinary point cloud the walk is not hitting long dead-slot runs and the doubly-linked
+    # rewrite would buy little. `m` is capped at `MAX_NEIGHBOURS` regardless, bounding the absolute
+    # worst case. Declined; re-measure before reopening this if a future caller's removal pattern
+    # looks different (e.g. a very anisotropic or highly clustered cloud).
     j = i
     for _ in range(m):
         j = j + step
@@ -384,13 +376,12 @@ def build_local_triangulations(
     # sort's ``mn``, the fan scan's ``i``), which spills a vector to local memory anyway, and
     # ``edge_removal_weight`` / ``cycle_prev`` / ``cycle_next`` take them as ``wp.array``, so the
     # vector form would additionally need ``wp.ref`` variants of all three. Measured on the clean
-    # case of the same class — ``algorithms/ball_pivoting.seed_triangles``, one 64-wide row with no
-    # helper passing — the register row is 0.994x (min) / 1.000x (median) end to end, i.e. no gain
-    # to trade that complexity for.
+    # case of the same class -- ``algorithms/ball_pivoting.seed_triangles``, one 64-wide row with no
+    # helper passing -- the register row gives nothing end to end, so there is no gain to trade that
+    # complexity for.
     #
     # And ``wp.fixedarray`` is not a third option: its own docstring says it is "only used during
-    # codegen, and for type hints" -- it *is* the codegen type of a kernel-scope ``wp.zeros``, not a
-    # separate storage class. So the choice here is registers or the stack, and both are measured.
+    # codegen, and for type hints" -- it *is* the codegen type of a kernel-scope ``wp.zeros``.
     nbr = wp.zeros(shape=MAX_NEIGHBOURS, dtype=wp.int32)
     ang = wp.zeros(shape=MAX_NEIGHBOURS, dtype=wp.float32)
 
@@ -745,12 +736,11 @@ def poisson_level_setup(
     kp = wp.min(k + 1, res - 1)
     km = wp.max(k - 1, 0)
     # Normalized in place here rather than by a separate `normalize_vector_field` pass over the
-    # whole grid: that pass measured 5.93% of screened_poisson's device time at the default depth=8
-    # (RTX 5090), almost all of it the extra launch plus a full res**3-element write-back of
-    # vx/vy/vz that this function immediately reads back at six neighbour offsets anyway. Fusing
-    # removes one launch and that write-back, at the cost of reading `weights` at the same six
-    # offsets instead of once per node -- a real trade given six values are already read here per
-    # component. `normalized_field_component` reproduces the deleted pass's exact
+    # whole grid: that pass was a few percent of ``screened_poisson``'s device time, almost all of
+    # it the extra launch plus a full res**3-element write-back of vx/vy/vz that this function
+    # immediately reads back at six neighbour offsets anyway. Fusing removes one launch and that
+    # write-back, at the cost of reading `weights` at the same six offsets instead of once per node.
+    # `normalized_field_component` reproduces the deleted pass's exact
     # `field[idx] * (1.0 / max(weight, eps))` operation (a multiply by the reciprocal, not a divide)
     # so the result is bit-identical to computing it as a separate pass first.
     dx = (

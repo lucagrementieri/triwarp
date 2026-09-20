@@ -351,8 +351,8 @@ def sample_surface_poisson_disk(
     # 3. Poisson disk radii (Öztireli & Gross 2012 constants)
     #
     # Plain Python floats, not ``wp.float32``: these are *host* arithmetic, and a Warp scalar's
-    # operators route through Warp's Python-scope builtin dispatch (~10 us per binary op, against
-    # 0.03 for a float -- see ``kernels/array.py``'s slot views and section 13.1). The wrapping
+    # operators route through Warp's Python-scope builtin dispatch, hundreds of times a plain
+    # float's (see ``kernels/array.py``'s slot views and section 13.1). The wrapping
     # bought nothing even numerically, since ``wp.float32(x)`` only stores ``x`` and rounds when it
     # is marshalled into a launch, which ``wp.launch`` does for a plain float anyway.
     alpha = 8.0
@@ -432,9 +432,10 @@ def _top_maxima_by_weight(
     point is isolated -- there ``candidates`` is the alive set rather than the maxima. Every other
     round deletes all of its maxima and never calls this.
 
-    It used to read the flags and ``weights`` back in full and pick the top ``excess`` with
+    Sorting the flagged weights on the device is what keeps the loop free of readbacks: the host
+    alternative reads the flags and ``weights`` back in full and picks the top ``excess`` with
     ``numpy.argsort``, moving ``2 * init_count`` elements across the bus where the rest of the loop
-    moves none. Sorting the flagged weights on the device removes both readbacks and the upload.
+    moves none.
 
     Ties order differently from ``numpy.argsort``'s quicksort -- ``radix_sort_pairs`` is stable --
     and exact ties are common rather than rare: ``_poisson_edge_weight`` clamps any distance below
@@ -564,16 +565,14 @@ def _dart_throw_blue_noise(
     pass of the serial algorithm. The loop is a handful of rounds over a shrinking work list;
     the one host readback per round is the survivor count, which is also the termination test.
 
-    **The round count is stable, and it is not where the cost is.** Measured on five mesh shapes
-    (icosphere at two resolutions, torus, cylinder, box) across a 55x range of pool sizes, 12 633
-    to 692 820, and output sizes 229 to 12 684: **4 to 6 rounds**, every time, growing
-    logarithmically with the pool as randomized-priority maximal-independent-set theory predicts,
-    and the pool-to-output ratio holding at 54-57. An earlier reading that the round count varies
-    several-fold between clouds does not reproduce. What a round actually costs, from
-    ``wp.timing_begin`` (nothing here graph-captures, so the split is trustworthy): 48 % device at
-    the small end and 69 % at the large one, and of the device half, 87-92 % is two kernels --
-    ``dart_select_minima`` and ``dart_cover_neighbors``, the shell scans themselves. Those two are
-    where any further win has to come from; the loop structure around them is already near its
+    **The round count is stable, and it is not where the cost is.** Measured over five mesh shapes
+    and a fifty-fold range of pool sizes it is always a handful of rounds, growing logarithmically
+    with the pool as randomized-priority maximal-independent-set theory predicts, and the
+    pool-to-output ratio barely moves. What a round actually costs, from ``wp.timing_begin``
+    (nothing here graph-captures, so the split is trustworthy): roughly half to two thirds device,
+    and the overwhelming majority of the device half is two kernels -- ``dart_select_minima`` and
+    ``dart_cover_neighbors``, the shell scans themselves. Those two are where any further win has to
+    come from; the loop structure around them is already near its
     launch floor.
     """
     device = pool_points.device
@@ -707,9 +706,9 @@ def _dart_throw_blue_noise(
         # entry is the survivor count outright and one 4-byte read serves both the next launch
         # dimension and the loop's exit test; ``dart_compact_alive`` writes at ``positions[t] - 1``
         # to match. The exclusive form needed a second read for the last element's own flag, and a
-        # readback is the most expensive thing in a round -- measured two of them at roughly a
-        # quarter of the whole call at the small end, where the rounds are cheapest and most
-        # numerous relative to the work. This is the shape ``array.flatnonzero`` already uses.
+        # readback is the most expensive thing in a round -- two of them are a substantial share of
+        # the whole call at the small end, where the rounds are cheapest and most numerous relative
+        # to the work. This is the shape ``array.flatnonzero`` already uses.
         #
         # The two windows are viewed once per round. ``alive_count`` shrinks every round so they
         # are not loop-invariant, but taking each twice and three times inside one round was five

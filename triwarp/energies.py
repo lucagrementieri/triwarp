@@ -15,25 +15,22 @@ Four families, and the first is the only one that returns a number rather than a
   [`triwarp.metrics`][triwarp.metrics], which hosts the data terms they pair with, because their
   machinery is this module's: ``laplacian_smoothing_loss``'s two cotangent variants consume
   [`cotmatrix`][triwarp.laplacian.cotmatrix] and
-  [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries], which is exactly the import set
-  the quadratic forms below use.
-
+  [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries].
 - **Smoothness energies over vertices.** [`k_harmonic`][triwarp.energies.k_harmonic] is the
   integrated ``k``-harmonic form -- ``k = 1`` is Dirichlet, ``k = 2`` the biharmonic operator behind
   smooth interpolation -- and it distorts a field near the boundary, because clamping a biharmonic
   solve there is not a natural condition. [`hessian_energy`][triwarp.energies.hessian_energy] and
   [`curved_hessian_energy`][triwarp.energies.curved_hessian_energy] are the alternatives that do
-  not: both integrate a squared Hessian instead, so linear (respectively, locally linear)
-  functions sit exactly in the null space, boundary or not.
+  not: both integrate a squared Hessian instead, so linear (respectively, locally linear) functions
+  sit exactly in the null space, boundary or not.
 - **The edge-based Crouzeix-Raviart pair.**
   [`crouzeix_raviart_cotmatrix`][triwarp.energies.crouzeix_raviart_cotmatrix] and
   [`crouzeix_raviart_massmatrix`][triwarp.energies.crouzeix_raviart_massmatrix] put the degrees of
   freedom on edge midpoints rather than vertices, which is the nonconforming-FEM discretization
   ``curved_hessian_energy`` is built on. They are the siblings of
-  [`cotmatrix`][triwarp.laplacian.cotmatrix] and [`mass_matrix`][triwarp.laplacian.mass_matrix] --
-  a reader arriving from libigl, where all four sit together, should start there.
-- **The LSCM operator.** [`lscm_hessian`][triwarp.energies.lscm_hessian] is the
-  ``(2n, 2n)`` form behind the least-squares conformal map, and
+  [`cotmatrix`][triwarp.laplacian.cotmatrix] and [`mass_matrix`][triwarp.laplacian.mass_matrix].
+- **The LSCM operator.** [`lscm_hessian`][triwarp.energies.lscm_hessian] is the ``(2n, 2n)`` form
+  behind the least-squares conformal map, and
   [`vector_area_matrix`][triwarp.energies.vector_area_matrix] is the boundary term that couples its
   two coordinate blocks. [`lscm`][triwarp.parametrization.lscm] is the solve; these are what it
   minimizes.
@@ -294,11 +291,10 @@ def k_harmonic(
     numerically robust for ``k > 2`` — the entries grow as the k-th power of the inverse mesh
     size — so high powers want a float64 ``laplacian``.
 
-    **Named for the operator, not the map.** This used to be ``laplacian.harmonic_integrated``,
-    which put a second unrelated "harmonic" in the package beside
-    [`harmonic`][triwarp.parametrization.harmonic] — a *map* into the plane, not an operator. The
-    two are related (``harmonic`` minimizes this form with the boundary pinned) but they are not
-    interchangeable, and neither docstring named the other.
+    **Named for the operator, not the map.** The unrelated
+    [`harmonic`][triwarp.parametrization.harmonic] is a *map* into the plane rather than an
+    operator; the two are related (``harmonic`` minimizes this form with the boundary pinned) but
+    they are not interchangeable.
 
     Each power is assembled by one triplet pass over matching CSR rows —
     ``(A M^-1 B)_ij = sum_t A_ti M_t^-1 B_tj`` with both operands symmetric — followed by a single

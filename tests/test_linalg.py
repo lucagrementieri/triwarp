@@ -21,14 +21,14 @@ def _spd_system(device: str, n: int = 64, n_rhs: int = 3, seed: int = 11):
     """
     Build an SPD operator with ``n_rhs`` right-hand sides, plus its NumPy form to solve.
 
-    The operator is **dense** -- ``n**2`` triplets, 263 169 of them at the ``n = 513`` the boundary
-    test reaches -- and a banded rewrite was measured and declined. Once ``conftest.py`` caps
-    OpenBLAS's thread pool the whole eight-parametrization family of
-    [`test_solve_spd_columns_across_the_reduction_tile_boundary`] costs **0.22 s** (0.14 s of it the
-    first launch's kernel load, then 0.01-0.02 s per row), so there is nothing left to win and a
-    banded operator would only make the reference solve less obviously right. Before that cap the
-    same family was 9 of the CPU suite's 80 slowest rows -- but the cost was OpenBLAS at 48 threads
-    (``np.linalg.solve`` at n=256 measured 385 ms against 0.64 ms at 8), not the triplet count.
+    The operator is **dense** -- ``n ** 2`` triplets, 263 169 of them at the ``n = 513`` the
+    boundary test reaches -- and a banded rewrite was measured and declined. Once ``conftest.py``
+    caps OpenBLAS's thread pool the whole eight-parametrization family of
+    [`test_solve_spd_columns_across_the_reduction_tile_boundary`] is dominated by the first launch's
+    kernel load, so there is nothing left to win and a banded operator would only make the reference
+    solve less obviously right. Before that cap the same family was 9 of the CPU suite's 80 slowest
+    rows -- but the cost was OpenBLAS at 48 threads (``np.linalg.solve`` is orders of magnitude
+    slower there), not the triplet count.
     """
     rng = np.random.default_rng(seed)
     dense_np = rng.standard_normal((n, n))

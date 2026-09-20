@@ -1,88 +1,68 @@
 """
 Benchmarks for ``triwarp.smoothing``.
 
-Four groups over two axes, chosen because this module has two genuinely different cost regimes and
-the switch between them is a keyword argument rather than a mesh property:
+Four groups over two axes, because this module has two genuinely different cost regimes and the
+switch between them is a keyword argument rather than a mesh property:
 
-* ``filter_mut_dif_laplacian`` on **scale** -- the explicit branch. One sparse mat-vec per
-  iteration plus a diffusion-coefficient recomputation, so cost is ``iterations x nnz``: linear,
-  predictable, and the reason this group carries the reference comparison. It is also the filter
-  whose loop synced a full-array host sum per iteration before the device-mean fix.
-* ``filter_laplacian`` on **quality**, sweeping ``implicit_time_integration`` -- the regime change.
+* ``filter_mut_dif_laplacian`` on **scale** — the explicit branch. One sparse mat-vec per iteration
+  plus a diffusion-coefficient recomputation, so cost is ``iterations * nnz``: linear, predictable,
+  and the reason this group carries the reference comparison.
+* ``filter_laplacian`` on **quality**, sweeping ``implicit_time_integration`` — the regime change.
   Explicit is the same cheap SpMV loop; **implicit is a full preconditioned CG solve per
   iteration**, whose count depends on the cotangent system's conditioning. Running that on
   ``saddle`` against ``saddle_graded`` (identical connectivity, worst aspect ratio 1.6 against
-  4 719) puts the two regimes and the two conditionings in one table, which is where the cost of
-  choosing implicit actually becomes visible.
+  4 719) puts both regimes and both conditionings in one table, which is where the cost of choosing
+  implicit becomes visible.
+* ``filter_taubin`` and ``filter_humphrey`` on **scale** — the two shrinkage-controlled variants of
+  the same loop, each a small constant multiple of ``filter_laplacian``.
 
-* ``filter_taubin`` and ``filter_humphrey`` on **scale** -- the two shrinkage-controlled variants of
-  the same SpMV loop. Taubin alternates a shrinking and an inflating pass, Humphrey adds a
-  push-back toward the original positions; both cost a small constant multiple of
-  ``filter_laplacian``, and both existed unbenchmarked until pymeshlab gave them a reference.
-
-``iterations`` is deliberately not swept. In the explicit branch it is exactly linear by
-construction, so a second point measures multiplication; in the implicit branch the interesting
-variation is *within* an iteration, which the quality axis already supplies.
-
-The Laplacian operator is precomputed outside the timed callable wherever the signature accepts
-one, so the timing isolates the iteration loop from operator assembly (which
-[`test_laplacian.py`](test_laplacian.py) covers).
+``iterations`` is deliberately not swept: in the explicit branch it is exactly linear by
+construction, and in the implicit branch the interesting variation is *within* an iteration, which
+the quality axis already supplies. The Laplacian operator is precomputed outside the timed callable
+wherever the signature accepts one, so the timing isolates the loop from the assembly that
+[`test_laplacian.py`](test_laplacian.py) covers.
 
 References
 ----------
-**open3d**'s ``filter_smooth_laplacian`` runs the same number of uniform-weight Laplacian
-iterations, so it is the reference for the ``novol`` case. It has no volume-constraint variant
-(``filter_smooth_taubin`` alternates two Laplacian passes to limit shrinkage, which is a different
-scheme), so the ``vol`` case stays triwarp/trimesh only. Open3D returns a new mesh, so the shared
-mesh is reusable across rounds. **trimesh** mutates in place and is rebuilt inside the timed
-callable.
+**open3d**'s ``filter_smooth_laplacian`` runs the same number of uniform-weight iterations, so it is
+the reference for the ``novol`` case; it has no volume-constraint variant, so ``vol`` stays
+triwarp/trimesh only. Open3D returns a new mesh so the shared one is reusable; **trimesh** mutates
+in place and is rebuilt inside the timed callable. Neither has an implicit smoother, so that half of
+the ``quality`` group is a triwarp-only before/after.
 
-Neither has an implicit / backward-Euler smoother at all, so the implicit half of the ``quality``
-group is a triwarp-only before/after comparison.
-
-**pymeshlab** carries four of MeshLab's ``apply_coord_*`` smoothers and is what gives this module a
-second independent implementation of each explicit scheme:
-
-* ``filter_mut_dif_laplacian`` -> ``apply_coord_laplacian_smoothing_scale_dependent``: the *same*
-  scheme, Desbrun et al.'s scale-dependent umbrella, which is the mutual-diffusion filter.
-* ``filter_laplacian_integration`` -> ``apply_coord_laplacian_smoothing(cotangentweight=False)``:
-  the same uniform-weight explicit loop. MeshLab has no implicit variant, so it appears in the
-  ``explicit`` row only.
-* ``filter_taubin`` -> ``apply_coord_taubin_smoothing``: the same lambda-mu alternation, at
-  MeshLab's ``mu=-0.53`` against triwarp's ``nu=0.5``.
-* ``filter_humphrey`` -> ``apply_coord_hc_laplacian_smoothing``: Vollmer et al.'s HC, but **not
-  parameter-comparable** -- see below.
+**pymeshlab** carries four of MeshLab's ``apply_coord_*`` smoothers, giving each explicit scheme a
+second independent implementation: ``apply_coord_laplacian_smoothing_scale_dependent`` is the same
+Desbrun scale-dependent umbrella as ``filter_mut_dif_laplacian``;
+``apply_coord_laplacian_smoothing(cotangentweight=False)`` the same uniform explicit loop (MeshLab
+has no implicit variant, so it appears in the ``explicit`` row only);
+``apply_coord_taubin_smoothing`` the same lambda-mu alternation at MeshLab's ``mu=-0.53`` against
+triwarp's ``nu=0.5``; and ``apply_coord_hc_laplacian_smoothing`` Vollmer's HC, but **not
+parameter-comparable**.
 
 Two caveats govern every row:
 
-- **Every one of them mutates the coordinates**, so the MeshSet is rebuilt inside the timed callable
-  and the row carries the build. That is a large fraction at these sizes: on ``bunny`` the build is
-  16.8 of the 48.2 ms a ten-step Laplacian costs, so **35% of that row is not smoothing**. Subtract
-  the build (0.47 us/vertex) before quoting a ratio. - **HC Laplacian exposes no parameters at all**
-  -- no step count, no ``alpha``/``beta`` -- so its row is a *single* filter call against triwarp's
-  ten iterations, and its output does not match ``filter_humphrey`` at any of the 8 x 11 x 11
-  ``(iterations, alpha, beta)`` combinations probed (best max-coordinate deviation 0.019 on a mesh
-  carrying 0.016 of noise). MeshLab's HC is a different formulation of Vollmer's scheme, not
-  triwarp's with other constants. It is a per-pass cost reference and nothing more: it is
-  deliberately **not** used as a test oracle in ``tests/test_smoothing.py``, where trimesh remains
-  the only HC check.
+- **All of them mutate the coordinates**, so the MeshSet is rebuilt inside the timed callable and
+  the row carries the build — about a third of a ten-step Laplacian row on a scan mesh, so subtract
+  it before quoting a ratio.
+- **HC Laplacian exposes no parameters at all** — no step count, no ``alpha``/``beta`` — so its row
+  is a *single* filter call against triwarp's ten iterations, and its output matches
+  ``filter_humphrey`` at none of the 8 x 11 x 11 ``(iterations, alpha, beta)`` combinations probed.
+  MeshLab's HC is a different formulation of Vollmer's scheme, not triwarp's with other constants.
+  It is a per-pass cost reference and deliberately **not** a test oracle; trimesh remains the only
+  HC check.
 
-``filter_two_step`` is the module's other regime change, and the one on the **quality** axis for a
-different reason from ``filter_laplacian``: it is *three* nested loops (outer passes x normal
-diffusion x vertex fitting, 3 x 20 x 20 at MeshLab's defaults), so its cost is a fixed 1 200 passes
-over the adjacency whatever the mesh, and the axis is there to confirm that triangle shape does not
-change it. ``filter_normals`` times the inner half alone, which is what separates the normal
-diffusion from the fitting solve. Both have pymeshlab references at the same four parameters;
-``apply_coord_two_steps_smoothing`` rewrites the coordinates, so that row carries the MeshSet build
-like the other ``apply_coord_*`` rows.
+``filter_two_step`` is on **quality** for a different reason from ``filter_laplacian``: it is
+*three* nested loops (outer passes x normal diffusion x vertex fitting, 3 x 20 x 20 at MeshLab's
+defaults), so its cost is a fixed 1 200 passes over the adjacency whatever the mesh, and the axis
+confirms that triangle shape does not change it. ``filter_normals`` times the inner half alone,
+separating the normal diffusion from the fitting solve. Both have pymeshlab references at the same
+four parameters.
 
 The last group leaves positions alone and runs over a per-vertex **scalar** field:
-``filter_scalar_laplacian`` against ``apply_scalar_smoothing_per_vertex``, on the **scale** axis and
-a fixed number of SpMV passes. Its old neighbour here, the Lipschitz projection of the same kind of
-field, moved to [`test_graph.py`](test_graph.py) as ``shortest_path_envelope`` with the function:
-it is a weighted graph relaxation whose pass count is data-dependent, a different cost shape
-from a fixed pass budget. The filter needs the scalar attribute to exist on the MeshSet,
-so this row rebuilds it (the filter mutates the attribute in place).
+``filter_scalar_laplacian`` against ``apply_scalar_smoothing_per_vertex``, on **scale** at a fixed
+pass count. Its old neighbour, the Lipschitz projection of the same kind of field, moved to
+[`test_graph.py`](test_graph.py) as ``shortest_path_envelope`` with the function — a weighted graph
+relaxation whose pass count is data-dependent is a different cost shape from a fixed budget.
 """
 
 from __future__ import annotations
@@ -246,10 +226,10 @@ def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> 
     care about aspect ratio) and the implicit pair should not (CG does). A flat implicit pair would
     mean the solve is not actually conditioning-bound, which is worth knowing either way.
 
-    pymeshlab confirms the explicit half independently -- 19.2 against 19.8 ms across the mesh pair,
-    flat to within noise, against triwarp's 0.57 / 0.50 ms (34x and 40x) -- which is the same
-    statement its harmonic-field row makes in [`test_linalg.py`](test_linalg.py) about where the
-    conditioning cost actually lives.
+    pymeshlab confirms the explicit half independently: it is flat across the mesh pair to within
+    noise where triwarp is orders of magnitude faster and equally flat -- the same statement its
+    harmonic-field row makes in [`test_linalg.py`](test_linalg.py) about where the conditioning cost
+    actually lives.
     """
     if bench_case.kind == "meshlib":
         if implicit:
@@ -348,18 +328,18 @@ def test_filter_taubin(bench_case: BenchCase) -> None:
 
     **MeshLab's ``stepsmoothnum`` and open3d's ``number_of_iterations`` count lambda-mu pairs, not
     half-steps**, where triwarp and trimesh do one half-step per ``iterations`` and alternate. So
-    both get ``_ITERATIONS // 2``: passing ``_ITERATIONS`` to both, as this row originally did for
-    MeshLab, timed twice the passes. The MeshLab mapping is pinned exactly (5e-08) in
+    both get ``_ITERATIONS // 2``: passing ``_ITERATIONS`` to both times twice the passes. The
+    MeshLab mapping is pinned exactly in
     ``tests/test_smoothing.py::test_filter_taubin_matches_pymeshlab``; open3d's cannot be (see the
     exemption above).
 
     **pytorch3d is deliberately absent, and it is the one reference here that agrees with triwarp.**
     ``ops.taubin_smoothing`` rebuilds its inverse-distance operator from the current positions every
-    half-pass, and ``filter_taubin(recompute=True)`` matches it to **2.4e-07** -- so this is not a
+    half-pass, and ``filter_taubin(recompute=True)`` matches it closely -- so this is not a
     D2 exemption, it is a pair whose *tested* configuration is not this row's. Timing it here would
-    race ten sparse assemblies against one under a single group name: the recompute path measures
-    **~23x** this row (0.49 -> 11.06 ms at 10 passes on CUDA, its own docstring carries the sweep),
-    which is the whole ratio rather than a caveat on it. The comparison lives in
+    race ten sparse assemblies against one under a single group name: the recompute path is an order
+    of magnitude dearer than this row, which is the whole ratio rather than a caveat on it. The
+    comparison lives in
     ``tests/test_smoothing.py::test_filter_taubin_recompute_matches_pytorch3d`` as a
     ``benchmarked=False`` claim.
     """
@@ -474,14 +454,9 @@ def test_filter_implicit_fairing(bench_case: BenchCase) -> None:
     ``pin_boundary=False`` is deliberately **not** a row here. The unconstrained flow pulls the rim
     inward until the triangles there collapse, and past two passes the system is effectively
     singular: the conjugate gradient runs to its ``maxiter`` cap and returns its last iterate, so
-    timing it measures a failed solve. Measured once, at ``iterations=10``, for the record:
-
-    * ``saddle`` -- 0.54 s pinned against **67 s** free, a 124x gap;
-    * ``saddle_graded`` -- 1.74 s pinned against **66 s** free, 38x.
-
-    Those rows also cost nine minutes of suite time to measure divergence at high precision, which
-    is not worth having. Finiteness in the free case is itself recent: the collapse used to drive
-    ``cot_entries_from_l2``'s division by ``4 * dbl_area`` to ``inf`` and the result came back NaN.
+    timing it measures a failed solve -- orders of magnitude dearer than the pinned row, and
+    minutes of suite time spent measuring divergence at high precision. A collapsing free case can
+    drive ``cot_entries_from_l2``'s division by ``4 * dbl_area`` to ``inf`` and return NaN.
     """
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     with warnings.catch_warnings():
@@ -726,40 +701,26 @@ def test_smooth_region(bench_case: BenchCase) -> None:
     Solve the umbrella-Laplacian Dirichlet system on a free region: a sparse solve, not a filter.
 
     Read against the ``filter_*`` groups above, which apply a fixed number of explicit passes: this
-    one solves to a fixpoint, so its cost is a linear solve over the free set and is driven by
-    that set's size and shape rather than by an iteration count. The free region is the top quarter
-    of the mesh by z on both sides, so the two solve the same system.
+    one solves to a fixpoint, so its cost is a linear solve over the free set and is driven by that
+    set's size and shape rather than by an iteration count. The free region is the top quarter of
+    the mesh by z on both sides, so the two solve the same system.
 
     meshlib's ``positionVertsSmoothly`` is that same system with the same unit edge weights
     (``EdgeWeights.Unit``, ``VertexMass.Unit``), factorized where triwarp iterates -- the answers
-    agree to 1e-4 (``tests/test_smoothing.py``). It mutates the mesh in place and returns nothing,
-    so its mesh is rebuilt inside the timed callable and the row carries the build.
+    agree to 1e-4. It mutates the mesh in place and returns nothing, so its mesh is rebuilt inside
+    the timed callable and the row carries the build.
 
-    **Both rows now reach a multigrid V-cycle, and they did not always**, which is the thing to
-    know before reading a change in either. ``smooth_region`` asks for ``preconditioner="auto"``,
-    and ``"auto"`` gates on the assembled operator's off-diagonal dominance crossed with a size
-    floor: these two systems read 3.00 and 2.51 against a 2.15 threshold, so both build a hierarchy
-    outright and neither runs a Jacobi probe. Measured when that gate landed, whole call,
-    interleaved: **``bunny_decimated`` 70.1 -> 34.7 ms (2.02x)** and **``bunny`` 137.1 -> 76.2
-    (1.80x)**. See ``linalg.CG_MULTIGRID_DOMINANCE`` for the 29 systems behind the threshold.
+    **Both rows reach a multigrid V-cycle**, which is the thing to know before reading a change in
+    either. ``smooth_region`` asks for ``preconditioner="auto"``, and ``"auto"`` gates on the
+    assembled operator's off-diagonal dominance crossed with a size floor: both systems clear the
+    dominance threshold outright, so each builds a hierarchy and neither runs a Jacobi probe, worth
+    roughly 2x on both rows. See ``linalg.CG_MULTIGRID_DOMINANCE`` for the systems behind the
+    threshold.
 
-    **The history matters because this pair used to be the asymmetry check and is not any more.**
-    Before the gate, ``bunny`` escalated (6 541 Jacobi iterations, past the 2 000 cap) and
-    ``bunny_decimated`` did not (1 784, inside it), so a change that moved one row and not the other
-    was diagnostic: sweeping ``linalg._MULTIGRID_THETA`` over ``0 - 0.15`` moved ``bunny`` 161.7 ->
-    153.4 ms and left ``bunny_decimated`` flat to three digits, because the aggregation never ran
-    there. That reading is now **stale in both directions** -- theta moves both rows, and a row that
-    stops moving means the *gate* changed rather than the coarsening. ``linalg.CG_PROBE_ITERATIONS``
-    still describes the probe, which is what a system the gate declines falls through to.
-
-    ``bunny_decimated`` was 5.5x behind for as long as it stayed on Jacobi, and that was a
-    documented policy choice rather than a slow solver: it converged inside the cap although a
-    V-cycle measured
-    2.29x on its system, and lowering the cap to collect that would have regressed small
-    well-conditioned solves by up to 2.8x. The gate collects it without the trade, because it asks
-    the operator instead of the iteration count. Raising ``linalg._MULTIGRID_MAX_COARSE`` to 384 was
-    worth 1.15x on ``bunny``'s solve before that (147.8 -> 139.2 ms), and seeding from the current
-    positions rather than ``wp.zeros`` 1.04-1.06x before that again.
+    **This pair is not the asymmetry check it once was.** Sweeping ``linalg._MULTIGRID_THETA`` now
+    moves both rows, and a row that stops moving means the *gate* changed rather than the
+    coarsening. ``linalg.CG_PROBE_ITERATIONS`` describes the probe a system the gate declines falls
+    through to.
     """
     skip_larger_than(
         bench_case,
@@ -845,23 +806,17 @@ def test_inflate(bench_case: BenchCase) -> None:
     triwarp-only, and not by omission. MeshLib's ``inflate`` is the only reference that has one and
     it cannot be timed here: with every vertex selected -- the operation this performs -- it
     collapses the mesh to a point at every pressure probed, because its implicit solve takes the
-    *unselected* vertices as its boundary condition. Measured numbers are in
-    ``tests/test_smoothing.py``.
+    *unselected* vertices as its boundary condition. The evidence is in ``tests/test_smoothing.py``.
 
     Restricting it to a *region* does not rescue the row, and the reason is sharper than "it solves
     a different problem": **its displacement is insensitive to the parameter that should drive it.**
-    Measured on ``icosphere(3)`` (volume 4.15274) with a 61-vertex cap selected, ``InflateSettings``
-    otherwise at its defaults -- pressure ``+0.1`` x mean edge gives max displacement 0.221164 and
-    volume 4.01012, ``-0.1`` gives 0.231235 and 4.00390, ``+0.01`` gives 0.225696 and 4.00732,
-    ``+1.0`` gives 0.175928 and 4.03818. A 100x pressure range and a sign flip move the surface less
-    than the runs differ from each other, and the volume *falls* in every case where positive
-    pressure must raise it. What the row would be timing is the ``preSmooth`` pass.
+    Over two orders of magnitude of pressure and a sign flip, with a cap selected, the surface moves
+    less than the runs differ from each other and the volume *falls* where positive pressure must
+    raise it. What the row would be timing is the ``preSmooth`` pass.
 
-    First measurement, medians on an RTX 5090 at the default 3 passes: **4.59 ms**
-    (``bunny_decimated``), **5.16** (``bunny``), **5.51** (``dragon``), **5.72**
-    (``happy_buddha``), **127.1** (``lucy``). Flat from 40k to 1.09M faces, so the three passes are
-    launch-bound rather than data-bound at this scale -- and ``lucy``'s 25x jump at a comparable
-    face count is the same unexplained outlier ``split_faces_along_field`` records on that mesh.
+    triwarp's own row is flat from a feature mesh up to a million faces, so the three passes are
+    launch-bound rather than data-bound at this scale -- and ``lucy``'s jump at a comparable face
+    count is the same unexplained outlier ``split_faces_along_field`` records on that mesh.
     """
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     pressure = 0.1 * bench_case.mean_edge
@@ -875,32 +830,23 @@ def test_filter_spikes(bench_case: BenchCase) -> None:
     """
     Detect and flatten needle vertices: per pass, the corner angles, a defect scatter and one map.
 
-    This docstring used to open *"on a clean mesh this is a detector -- one pass finds nothing and
-    the loop stops"*, and conclude from it that the row was ``face_angles`` plus the scatter. Both
-    halves were wrong, and the second one hid a 2.6x, so the correction is worth keeping:
+    This is **not** a detector that stops after one pass on a clean mesh, and reading it that way
+    hid a real win. Two things to know:
 
-    * **The loop runs its full ten passes on both ``bunny`` meshes, and it is their *unreferenced*
-      vertices that do it.** A vertex with no incident face has an angle sum of ``0``, so it is a
-      spike under any threshold, and averaging its (empty) 1-ring never moves it -- measured spikes
-      per pass on ``bunny``: ``1116, 1114, 1113, 1113, ...`` against exactly **1 113** unreferenced
-      vertices, and on ``bunny_decimated`` ``26, 25, 25, ...`` against 25. ``dragon`` has none and
-      does not converge either, honestly: ``789 -> 407`` over the ten. So the row is a *ten-pass*
-      row everywhere in this registry, and ``flattened`` over-reports by ten times the unreferenced
-      count.
-    * **Two thirds of it was rebuilding an operator that never changes.** Each pass called
+    * **The loop runs its full pass budget on any mesh with *unreferenced* vertices.** A vertex with
+      no incident face has an angle sum of ``0``, so it is a spike under any threshold, and
+      averaging its (empty) 1-ring never moves it -- the per-pass spike count converges to exactly
+      the unreferenced count and stays there. So the row is a full-budget row everywhere in this
+      registry, and ``flattened`` over-reports by the pass count times the unreferenced count.
+    * **Most of it was rebuilding an operator that never changes.** Each pass called
       ``filter_neighborhood_average``, which builds the uniform 1-ring operator per call -- and at
-      ``equal_weight=True`` that operator reads no positions, so ten builds produced ten
-      byte-identical matrices. Attributed on ``bunny_decimated`` (RTX 5090, medians): the whole call
-      19.6 ms, of which the ten builds are **13.0** at 1.27 ms each, against ``face_angles`` 0.04,
-      ``vertex_defects`` 0.11, the count-plus-readback 0.16 and the averaging step itself 0.24, all
-      per pass. A build being flat in the mesh is what made the *row* flat in the mesh -- 15.65 ms
-      at 16 301 faces against 15.16 at 69 630, which is the signature that named this a work item.
+      ``equal_weight=True`` that operator reads no positions, so every pass produced a
+      byte-identical matrix. The build being flat in the mesh is what made the *row* flat in the
+      mesh, which is the signature that named this a work item.
 
-    Hoisting the build turned both small rows from losses into wins: ``bunny`` **15.16 -> 6.68 ms**
-    against meshlib's 9.65 (2.09x behind -> **1.44x ahead**), ``bunny_decimated`` 7.13 against 9.79,
-    ``dragon`` 8.81 against 61.67 (**7.0x**), with ``happy_buddha`` 9.26 and ``lucy`` 100.8. The
-    residual is still nearly flat below a million faces, which is the ten passes' remaining fixed
-    cost -- read it as floor now rather than as an algorithm.
+    Hoisting the build turned both small rows from losses into wins and is worth several-fold on the
+    large ones. The residual is still nearly flat below a million faces, which is the passes'
+    remaining fixed cost -- read it as floor now rather than as an algorithm.
 
     meshlib mutates in place, so its mesh is rebuilt per round the way the other ``repair`` rows do.
     Both sides are pinned against each other on a genuinely spiky mesh in
@@ -942,21 +888,11 @@ def test_equalize_triangle_areas(bench_case: BenchCase) -> None:
 
     meshlib's ``equalizeTriAreas`` is the same solve, threaded across vertices and mutating in
     place, so its mesh is rebuilt per round -- and the positions agree **exactly**
-    (``tests/test_smoothing.py``), which is what makes the ratio below a fair one.
+    (``tests/test_smoothing.py``), which is what makes the ratio a fair one. triwarp wins it by more
+    than an order of magnitude at every size.
 
-    First measurement, medians on an RTX 5090, ten passes:
-
-    | mesh | triwarp-cuda | meshlib |
-    |---|---|---|
-    | ``bunny`` | 0.481 ms | 14.67 (30.5x) |
-    | ``bunny_decimated`` | 0.523 ms | 11.78 (22.5x) |
-    | ``dragon`` | 3.05 ms | 122.3 (40.2x) |
-    | ``happy_buddha`` | 3.70 ms | (capped) |
-    | ``lucy`` | 111.5 ms | (capped) |
-
-    ``bunny`` reads *slower* than the 12x larger ``dragon`` because it is the first mesh in the
-    selection and carries the module's compile; read the three large rows against each other, where
-    the scaling is clean (3.05 / 3.70 / 111.5 at 0.87M / 1.09M / 28M faces).
+    The first mesh in a selection carries the module's compile and therefore reads slower than it
+    is; read the large rows against each other, where the scaling is clean.
     """
     if bench_case.kind == "meshlib":
 
@@ -987,23 +923,14 @@ def test_relax_keep_volume(bench_case: BenchCase) -> None:
     ``filter_laplacian``'s and anything else means the adjacency build (hoisted out of the loop
     here, as there) has moved.
 
-    meshlib's ``relaxKeepVolume`` is the same two-pass formulation, and the positions agree to
-    1.9e-09 (``tests/test_smoothing.py``). It mutates in place, so its mesh is rebuilt per round.
+    meshlib's ``relaxKeepVolume`` is the same two-pass formulation, and the positions agree closely
+    (``tests/test_smoothing.py``). It mutates in place, so its mesh is rebuilt per round. triwarp
+    wins it by most of an order of magnitude, by more the larger the mesh.
 
-    First measurement, medians on an RTX 5090, ten passes:
-
-    | mesh | triwarp-cuda | meshlib |
-    |---|---|---|
-    | ``bunny`` | 1.72 ms | 14.53 (8.4x) |
-    | ``bunny_decimated`` | 1.80 ms | 12.12 (6.7x) |
-    | ``dragon`` | 3.93 ms | 130.4 (33.2x) |
-    | ``happy_buddha`` | 4.34 ms | (capped) |
-    | ``lucy`` | 119.8 ms | (capped) |
-
-    Against ``equalize_triangle_areas`` on the same passes and meshes -- 0.481 / 0.523 / 3.05 / 3.70
-    / 111.5 ms -- the two are within 30 % from ``dragon`` up. That is the cost model working out:
-    two cheap ring passes here against one ring pass with a 3x3 float64 solve there, so neither the
-    solve nor the extra launch dominates and both rows are bandwidth on the adjacency.
+    Against ``equalize_triangle_areas`` on the same passes and meshes the two are within a third of
+    each other once the mesh is large. That is the cost model working out: two cheap ring passes
+    here against one ring pass with a 3x3 float64 solve there, so neither the solve nor the extra
+    launch dominates and both rows are bandwidth on the adjacency.
     """
     if bench_case.kind == "meshlib":
 
@@ -1037,25 +964,17 @@ def test_relax_approx(bench_case: BenchCase) -> None:
 
     The radius is 3 % of the bounding-box diagonal, which is the scale at which a ball holds enough
     vertices to fit on every mesh in the registry. It is not scale-free and there is no default:
-    meshlib's own ``surfaceDilateRadius`` default of ``0`` is a measured no-op (``tests``), so the
-    two rows would otherwise not be timing the same work at all.
+    meshlib's own ``surfaceDilateRadius`` default of ``0`` is a no-op (``tests``), so the two rows
+    would otherwise not be timing the same work at all.
 
     ``fit="planar"`` on both sides. The quadric adds a 6x6 QR per vertex per pass and is a separate
     measurement, not a variation of this one.
 
-    First measurement, medians on an RTX 5090, one pass:
-
-    | mesh | triwarp-cuda | meshlib |
-    |---|---|---|
-    | ``bunny`` | 6.42 ms | 39.10 (6.1x) |
-    | ``bunny_decimated`` | 2.16 ms | 12.98 (6.0x) |
-    | ``dragon`` | 202.5 ms | 4 665 (23.0x) |
-    | ``happy_buddha`` | 149.1 ms | (capped) |
-
-    **This is the only row in the module whose cost is superlinear**, and the ball is why: 202 ms on
-    ``dragon`` against 6.4 on ``bunny`` is 31x for 12x the faces, because a fixed 3 % radius holds
-    more vertices as the mesh refines. That is the thing to watch on any change here -- a regression
-    in the *fit* would move all four rows together, and one in the ball would move only these two.
+    **This is the only row in the module whose cost is superlinear**, and the ball is why: it grows
+    faster than the face count, because a fixed 3 % radius holds more vertices as the mesh refines.
+    That is the thing to watch on any change here -- a regression in the *fit* would move all four
+    rows together, and one in the ball would move only the large two. triwarp wins the row at every
+    size, by more the larger the mesh.
     """
     skip_larger_than(
         bench_case,
@@ -1104,54 +1023,29 @@ def test_smooth_region_boundary(bench_case: BenchCase) -> None:
 
     meshlib's ``smoothRegionBoundary`` additionally flips the band's interior edges before each
     solve, which this port does not do -- so its row carries connectivity work triwarp's does not,
-    and the two are pinned on the *moved set* and the rim length rather than element-wise
-    (``tests/test_smoothing.py``). It mutates in place, so its mesh is rebuilt per round.
+    and the two are pinned on the *moved set* and the rim length rather than element-wise. It
+    mutates in place, so its mesh is rebuilt per round.
 
-    First measurement, medians on an RTX 5090, four passes:
+    The module's one **loss** against meshlib, and the reason is visible in the shape: triwarp is
+    flat across the mesh pair while meshlib tracks the mesh, so the row is four conjugate-gradient
+    solves and their fixed per-call cost rather than anything proportional.
 
-    | mesh | triwarp-cuda | meshlib |
-    |---|---|---|
-    | ``bunny`` | 15.03 ms | 16.85 (1.12x) |
-    | ``bunny_decimated`` | 14.77 ms | 11.89 (**0.81x**) |
-
-    The only **loss** among this pass's new rows, and the reason is visible in the shape: triwarp is
-    flat from 16k to 69k faces while meshlib tracks the mesh, so the row is four conjugate-gradient
-    solves and their fixed per-call cost rather than anything proportional. Against
-    ``smooth_region``'s 159.7 ms on ``bunny`` over the same region it is **10.6x cheaper**, which is
-    the band being thin -- exactly what this group was written to check.
-
-    **Round 7's T4 paired this row with ``filter_spikes`` on that flatness and asked for it to be
-    read once that one landed. It was, and the signature is the same while the mechanism is not.**
-    ``filter_spikes`` turned out to be one *topology* operator built ten times, and hoisting it was
-    2.6x. Here the rebuild is neither hoistable nor the cost. Attributed per pass on an RTX 5090:
-
-    | | ``bunny_decimated`` | ``bunny`` |
-    |---|---|---|
-    | whole call, 4 passes | 14.77 ms | 14.89 |
-    | one pass | 2.81 | 3.06 |
-    | ...``cotmatrix`` + ``bsr_scale`` | 0.455 (**16 %**) | 0.570 (**19 %**) |
-    | ...``min_quad_with_fixed`` | 2.18 (**78 %**) | 2.24 (**73 %**) |
-
-    The rebuild really is unhoistable, which is now measured rather than trusted: the sparsity
-    pattern is the topology and does not move, but between the input positions and the output ones
-    the cotangent weights differ by up to **105.5** and **353.1** in absolute value, because a pass
-    moves the rim band the weights are computed from. So the paragraph above stands.
+    **The flatness looks like ``filter_spikes``' hoistable operator rebuild and is not.** There the
+    rebuild is one *topology* operator built every pass; here the operator's sparsity pattern is the
+    topology and does not move, but its cotangent weights do, so the rebuild is neither hoistable
+    nor the cost -- it is well under a quarter of a pass, and the reduced solve is most of the rest.
 
     **What the row actually prices is the conjugate-gradient launch floor on a tiny system.** The
-    free set is the band, 182 of 8 171 vertices and 390 of 35 947 -- 1.1-2.2 % -- so the reduced
-    system is **182 x 182 with 562 nonzeros** and **390 x 390 with 1 174**, and solving it takes
-    **24 and 26 iterations at ~48-52 µs each**. That is per-iteration launch cost, not arithmetic
-    (see the memory of a CG iteration as 9 kernels and ~23 µs whatever the ``nnz``), and it is why
-    the row is flat in a mesh 4.3x larger: the band barely grows. The remaining ~20 % of the call is
-    the prologue -- the two masks, ``vertex_face_adjacency`` and the clone -- which is likewise
-    band-sized or built once.
+    free set is the band, a couple of percent of the mesh, so the reduced system is a few hundred
+    unknowns and solving it takes a couple of dozen iterations whose cost is per-iteration *launch*
+    rather than arithmetic. That is why the row is flat in a mesh several times larger: the band
+    barely grows. The rest of the call is the prologue, which is likewise band-sized or built once.
 
-    So T4's residual 3.3 ms here is **not** ``filter_spikes``' item and does not yield to its fix.
-    Nor does the preconditioner work: ``linalg``'s hierarchy setup alone is 12-17 ms, ten times this
-    entire solve, and ``"auto"``'s probe would spend its Jacobi iterations before paying it (see
-    ``linalg.py``, where routing the fixed-boundary solves that way is refuted at systems two orders
-    larger than this one). Anything that moves this row has to remove *launches per iteration* or
-    iterations, not operator builds.
+    The preconditioner work does not reach it either: ``linalg``'s hierarchy setup alone is several
+    times this entire solve, and ``"auto"``'s probe would spend its Jacobi iterations before paying
+    it (see ``linalg.py``, where routing the fixed-boundary solves that way is refuted at systems
+    orders larger than this one). Anything that moves this row has to remove *launches per
+    iteration* or iterations, not operator builds.
     """
     skip_larger_than(
         bench_case,

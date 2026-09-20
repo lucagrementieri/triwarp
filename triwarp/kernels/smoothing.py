@@ -574,10 +574,9 @@ def diffuse_scalar_pass(
     # accumulator is a ``wp.vec3d``; a scalar field is float32 end to end, and ``float64 *
     # float32`` is a hard parse error in Warp ("Input types must be the same"), so no single
     # spelling serves both. Sharing it would mean carrying the field in float64, which was built
-    # and measured: **0.86x on lucy** (14 M vertices, 5.15 -> 5.96 ms) and **0.63x at 655 k**,
-    # because the field is one of four streams the CSR walk reads and doubling its width costs
-    # bandwidth the launch saving cannot repay -- before counting the two conversion passes a
-    # float64 iterate would add per call.
+    # and measured as a **loss** at every size, because the field is one of four streams the CSR
+    # walk reads and doubling its width costs bandwidth the launch saving cannot repay -- before
+    # counting the two conversion passes a float64 iterate would add per call.
     #
     # An isolated vertex (empty row) keeps its own value, so it neither drifts to zero nor
     # contaminates its (nonexistent) neighbours.
@@ -953,9 +952,8 @@ def relax_approx_step(
         # normal matrix's diagonal spans ``h^8`` down to ``1`` and ``solve_normal_equations``'
         # singularity test -- absolute, and necessarily so, since it cannot see the caller's units
         # -- starts reporting well-conditioned neighbourhoods as singular. That failure is silent:
-        # the vertex falls back to the planar answer with nothing said. Measured before this
-        # division, on a noisy ``icosphere(3)`` at ``dilate_radius=0.3``: 16 of 642 vertices fell
-        # back at mesh scale 3e-4 and **511 of 642 at 1e-4**.
+        # the vertex falls back to the planar answer with nothing said, and on a small enough mesh
+        # nearly every vertex does.
         inv_radius = wp.float64(1.0) / wp.float64(radius)
         normal_matrix = mat66d()
         normal_rhs = vec6d()

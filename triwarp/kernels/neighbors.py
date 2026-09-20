@@ -30,55 +30,33 @@ RADIUS_GROWTH = wp.constant(wp.float32(2.0))
 # keeps the ``K`` nearest (a superset of the ``k`` nearest) and writes out only the first ``k``
 # slots; a ``k`` past the largest bucket falls back to the global-memory row kernels.
 #
-# Measured on an RTX 5090 against the global-memory row, bunny / 20 000 queries: 1.09x at k=1,
-# 1.5x at k=7, 1.9x at k=16, 2.9x at k=30, 7.8x at k=64. 64 is the last bucket because that is
-# where the curve turns, not because the gain runs out: a 96-wide row spills (2 x K registers) and
-# drops back to 1.66x, so a bucket past 64 would buy little and no in-repo caller asks for one.
-#
-# That spill used to be inferred from the timing curve. Warp 1.17's
-# ``wp.get_cuda_kernel_properties`` measures it directly, and it confirms the shape while pinning
-# where the wall is: the six shipped buckets report ``register_count``
-# **42 / 53 / 64 / 92 / 126 / 222** with ``local_memory_size`` **0** at every one, so nothing
-# in the shipped set spills. A 96-wide row extrapolates past the
-# 255-register-per-thread hardware limit from there, which is what forces its spill -- the bucket
-# list ends where the register file does, not at an arbitrary cut.
+# The register row beats the global-memory one at every bucket, by more the wider the row.
+# **64 is the last bucket because that is where the curve turns, not because the gain runs out**: a
+# row costs ``2 * K`` registers, and ``wp.get_cuda_kernel_properties`` reports the six shipped
+# buckets at 42-222 registers with ``local_memory_size`` **0** at every one, so nothing shipped
+# spills. A 96-wide row extrapolates past the 255-register-per-thread hardware limit and must
+# spill, which drops it back below the k=64 gain -- the bucket list ends where the register file
+# does, not at an arbitrary cut, and no in-repo caller asks for more.
 #
 # **``cuda_max_registers`` does not move that wall, and it was measured rather than assumed.**
-# 1.17's per-kernel register cap is the obvious lever for trading occupancy against pressure, so
-# the shipped buckets were rebuilt under it (1M points, 100k queries, results identical at every
-# cap). It loses everywhere, and the mechanism is in the ``local_memory_size`` column: capping
-# below the natural count does not make the kernel leaner, it makes it *spill*.
+# Capping below a kernel's natural register count does not make it leaner, it makes it *spill*:
+# rebuilt under every cap, the shipped buckets report non-zero ``local_memory_size`` and run
+# several times slower, with results identical. That is also the answer to the 96-bucket question
+# above. The buckets stay uncapped.
 #
-#   | bucket | cap | regs | lmem | vs shipped |
-#   |--------|-----|------|------|------------|
-#   | 32 | none | 126 | 0 | 3.263 ms |
-#   | 32 | 64 | 64 | 352 | **0.28x** |
-#   | 32 | 96 | 96 | 80 | **0.71x** |
-#   | 32 | 128 | 119 | 0 | 1.01x (a no-op: above the natural count) |
-#   | 64 | none | 222 | 0 | 6.478 ms |
-#   | 64 | 64 | 64 | 624 | **0.12x** |
-#   | 64 | 128 | 128 | 608 | **0.15x** |
-#   | 64 | 168 | 168 | 128 | **0.80x** |
-#
-# So a spilled row is 1.25-12x slower here, which is also the answer to the 96-bucket question
-# above: a 96-wide row must spill whatever the cap says, and spilling is precisely what this table
-# prices. The buckets stay uncapped.
-#
-# The buckets are not free: they cost ``2 x len(KNN_ROW_BUCKETS)`` generated kernels, which take
-# this module's cold-cache compile from 3.9 s to ~12 s (once per Warp version and arch) and its
-# warm per-process load from 2.4 ms to ~5 ms.
+# The buckets are not free: they cost ``2 x len(KNN_ROW_BUCKETS)`` generated kernels, which roughly
+# triples this module's cold-cache compile (once per Warp version and arch) and doubles its warm
+# per-process load.
 KNN_ROW_BUCKETS = (1, 4, 8, 16, 32, 64)
 
 # Which accelerator ``ball_count_in_radius`` / ``ball_collect`` traverse. The ball query is one
-# algorithm — same acceptance rule, same emit protocol — over two broad phases whose query
+# algorithm -- same acceptance rule, same emit protocol -- over two broad phases whose query
 # objects are different types with different ``_next`` builtins, so the enumeration cannot be
 # abstracted behind a ``wp.Function`` parameter (CLAUDE.md section 2.7: ``wp.launch`` cannot pass
 # one as a kernel argument). An int selector can: the branch is warp-uniform, both traversals
-# compile into this one module, and measured on an RTX 5090 (bunny, 20 000 queries, radius 2x and
-# 4x the mean edge) the merged kernels are within noise of the two they replace on the BVH side
-# and 1.05-1.09x *faster* on the hash-grid side, where the counting pass no longer allocates a
-# throwaway per-thread distance slot. On CPU the same hash-grid counting pass gains 1.43-1.84x and
-# the BVH paths lose 1-5%.
+# compile into this one module, and the merged kernels measure within noise of the two they replace
+# on the BVH side and slightly faster on the hash-grid side, where the counting pass no longer
+# allocates a throwaway per-thread distance slot.
 ACCEL_HASHGRID = wp.constant(wp.int32(0))
 ACCEL_BVH = wp.constant(wp.int32(1))
 
@@ -87,20 +65,15 @@ ACCEL_BVH = wp.constant(wp.int32(1))
 #
 # Taking the query is what Warp 1.17 made possible and it is the whole point of these two: a
 # ``wp.BvhQuery`` is the common type over the aabb / sphere / capsule query kinds, and a
-# ``@wp.func`` may take one as a parameter and another may return one (both verified -- a helper
-# that constructs and returns a query, walked by a second helper, compiles and runs). Before that,
-# a walk was pinned to the constructor that opened it, so every query kind carried its own copy of
-# these four lines: the count walk existed twice, once here for the box and once inside
-# ``ball_count_in_radius`` for the ball.
+# ``@wp.func`` may take one as a parameter and another may return one. Before that, a walk was
+# pinned to the constructor that opened it, so every query kind carried its own copy of these four
+# lines.
 #
 # ``@wp.func`` calls inline at codegen, so this is free -- confirmed rather than assumed, with
-# ``wp.get_cuda_kernel_properties`` across the extraction: ``query_ball_count`` and
-# ``query_ball_neighbors`` hold at **40** registers and the six row buckets at
-# **42 / 53 / 64 / 92 / 126 / 222**, every one with ``local_memory_size`` **0**, which are the same
-# figures the inline versions reported. And the move is *provably* behaviour-neutral where a
-# float32 extraction would not be (CLAUDE.md section 2.4 warns that a green suite is not evidence):
-# neither shared run contains a floating-point expression, so there is no evaluation order for it
-# to disturb.
+# ``wp.get_cuda_kernel_properties`` reporting identical register counts and zero local memory
+# across the extraction. And the move is *provably* behaviour-neutral where a float32 extraction
+# would not be (CLAUDE.md section 2.4 warns that a green suite is not evidence): neither shared run
+# contains a floating-point expression, so there is no evaluation order for it to disturb.
 
 
 @wp.func
@@ -129,11 +102,11 @@ def bvh_walk_emit(query: wp.BvhQuery, base: wp.int32, out_indices: wp.array[wp.i
 # The ball-shaped broad phase over bounds, and it is *not* a tighter spelling of the box one below.
 # ``wp.bvh_query_sphere`` prunes on an exact sphere-AABB squared distance where
 # ``wp.bvh_query_aabb`` prunes on a box overlap, and on Warp 1.17 the box traversal is far the more
-# expensive of the two *per candidate returned* -- measured 6.5-15x, isolated with the box's own
-# *inscribed* cube (half extent ``r / sqrt(3)``, so strictly fewer candidates than the ball) still
-# costing 6.5x the ball query. So the ball trims candidates *and* walks more cheaply, and a caller
-# whose predicate is a ball wants this pair rather than the box pair plus a narrow phase. Both
-# counts are exact against a brute-force oracle; CLAUDE.md section 12.8 has the numbers.
+# expensive of the two *per candidate returned* -- isolated with the box's own *inscribed* cube
+# (half extent ``r / sqrt(3)``, so strictly fewer candidates than the ball), it still costs several
+# times the ball query. So the ball trims candidates *and* walks more cheaply, and a caller whose
+# predicate is a ball wants this pair rather than the box pair plus a narrow phase. Both counts are
+# exact against a brute-force oracle; CLAUDE.md section 12.8 records the verdict.
 @wp.func
 def ball_count_in_bounds(bvh_id: wp.uint64, q: wp.vec3, radius: wp.float32) -> wp.int32:
     # Broad-phase hits of the ball: every bound whose AABB comes within ``radius`` of ``q``.
@@ -157,9 +130,8 @@ def query_bvh_ball_neighbors(
 # ``aabb_count_in_bounds`` rather than a kernel shim (CLAUDE.md section 3.5).
 #
 # There was a third pair here, for one warp-uniform half extent, and it is gone: it was exactly
-# this one at ``q -+ h``, returned an identical set, and the corner buffers it saved measured
-# **0.950-1.031x** -- no saving, one size the wrong way -- against a query several milliseconds
-# long. Do not reintroduce it without a number bigger than that.
+# this one at ``q -+ h``, returned an identical set, and the corner buffers it saved measured flat
+# against a query several milliseconds long. Do not reintroduce it without a number.
 @wp.func
 def aabb_count_in_bounds(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3) -> wp.int32:
     # Broad-phase hits of the box.
@@ -198,34 +170,27 @@ def ball_count_in_radius(
     #
     # The two query objects are deliberately *differently named*: a Warp variable's type is fixed by
     # its first assignment, so binding one ``query`` name to a hash-grid query in one branch and a
-    # BVH query in the other does not compile (verified — Warp raises at parse time). Do not "tidy"
-    # them into a single name. Warp 1.17's ``wp.BvhQuery`` common type lifted this *between BVH
-    # kinds* -- a box query and a sphere query can share one variable, measured -- but a hash-grid
-    # query is still not a ``BvhQuery``, so these two stay apart.
+    # BVH query in the other does not compile. Do not "tidy" them into a single name. Warp 1.17's
+    # ``wp.BvhQuery`` common type lifted this *between BVH kinds* -- a box query and a sphere query
+    # can share one variable -- but a hash-grid query is still not a ``BvhQuery``.
     #
     # **The predicate is the squared one, on both branches, and that is a decision rather than a
     # style.** ``wp.bvh_query_sphere`` prunes on an exact sphere-AABB squared-distance test, and on
     # this BVH -- built by ``neighbors.bvh_from_points`` as ``wp.Bvh(points, points)``, so every
     # leaf bound is a degenerate point -- that test *is* the point-in-ball test. There is no narrow
-    # phase left to write. Measured on an RTX 5090, interleaved A/B against the cube-plus-
-    # ``wp.length`` form this replaced: **1.22x** at 200k points / 20k queries / r=0.01 (0.8
-    # neighbours a row), **1.74x** at r=0.02, **2.87x** at r=0.05 (99.1 a row), and 1.50 / 2.06 /
-    # 2.77x at 1M points / 100k queries -- monotone in the neighbour count, and 1.14-1.38x on the
-    # CPU device at the same six points, so it wins on both.
+    # phase left to write, and it beats the cube-plus-``wp.length`` form it replaced by more the
+    # denser the neighbourhood, on both devices.
     #
     # The hash-grid branch is spelled ``wp.length_sq`` to *match* it. ``wp.length(d) <= radius`` and
     # ``wp.length_sq(d) <= radius * radius`` are not the same predicate in float32 -- ``sqrt`` and
-    # ``radius * radius`` round independently -- and measured over one candidate stream at 1M
-    # points / 100k queries the sphere query agrees with the squared form on **0 of 100 000 rows**
-    # and with the sqrt form on all but **1**, which differs by one neighbour, identically on CPU
-    # and CUDA. So leaving the grid on ``wp.length`` would make ``backend="hashgrid"`` and
-    # ``backend="bvh"`` answer differently at the boundary, which is the one-predicate-one-spelling
-    # defect section 3 of CLAUDE.md names; ``test_the_two_backends_agree`` is the gate.
+    # ``radius * radius`` round independently -- and the sphere query agrees with the squared form
+    # on every row and with the sqrt form on all but a handful, identically on CPU and CUDA. So
+    # leaving the grid on ``wp.length`` would make ``backend="hashgrid"`` and ``backend="bvh"``
+    # answer differently at the boundary, which is the one-predicate-one-spelling defect section 3
+    # of CLAUDE.md names; ``test_the_two_backends_agree`` is the gate.
     #
-    # An earlier pass measured the two spellings as speed-flat (0.997-1.003x) and kept the sqrt
-    # because it is the one the wrapper's "inclusive at exactly ``radius``" docstring means. That
-    # measurement still holds for the *narrow phase* -- what changed is that the squared form is now
-    # what the tighter broad phase speaks, so the choice buys 1.2-2.9x instead of nothing.
+    # The two spellings are speed-flat as a *narrow* phase, which is why an earlier pass kept the
+    # sqrt form; what changed is that the squared form is now what the tighter broad phase speaks.
     c = wp.int32(0)
     j = wp.int32(0)
     if accel == ACCEL_HASHGRID:
@@ -325,7 +290,7 @@ def knn_sorted_insert(
     # ``searchsorted(side="right")``, so its ``values[mid] > value`` probe never fires -- all the
     # way to ``left = n``. It returns ``n``, and ``array_shift_insert`` writes ``row[n]``: one
     # element past the caller's ``k``-wide row, i.e. into the next query's row, or past the whole
-    # ``(m, k)`` allocation for the last query. Measured on both devices with a canary row that no
+    # ``(m, k)`` allocation for the last query. Confirmed on both devices with a canary row that no
     # thread was launched over: it comes back holding the NaN and the offending point index.
     #
     # It is reachable from the public surface at ``k > 64`` (below that the register-row kernels
@@ -442,14 +407,13 @@ def query_bvh_nearest_neighbors(
     r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
     r = wp.min(initial_radius, r_hard)
     # This kernel used to carry a note saying it may hold exactly one ``wp.bvh_query_*`` call site,
-    # because "``bvh_query`` declares ``__shared__ int stack[32 * WP_TILE_BLOCK_DIM]`` (32 KB at
-    # block_dim=256), so a second textual call site would ask for 64 KB and fail to compile".
-    # **That was never true of the plain query.** In ``warp/native/bvh.h`` the ``__shared__``
-    # declaration sits inside the *tiled* constructor; ``wp.bvh_query_aabb`` / ``_sphere`` use a
-    # per-thread ``int stack[BVH_QUERY_STACK_SIZE]`` in local storage. Measured: a kernel with two
-    # plain call sites compiles and runs at block_dim=256 on Warp 1.16, and one with four does on
-    # 1.17 (``register_count`` 45, ``local_memory_size`` 0). The single call site here is now just
-    # what the loop needs, not a constraint -- so a future edit needing a second one may add it.
+    # because ``bvh_query`` declares a large ``__shared__`` stack and a second textual call site
+    # would double it and fail to compile. **That was never true of the plain query.** In
+    # ``warp/native/bvh.h`` the ``__shared__`` declaration sits inside the *tiled* constructor;
+    # ``wp.bvh_query_aabb`` / ``_sphere`` use a per-thread ``int stack[BVH_QUERY_STACK_SIZE]`` in
+    # local storage. Verified: a kernel with four plain call sites compiles and runs at
+    # block_dim=256 on Warp 1.17 with zero local memory. The single call site here is just what the
+    # loop needs, not a constraint -- so a future edit needing a second one may add it.
     for attempt in range(MAX_SEARCH_ATTEMPTS):
         if attempt == MAX_SEARCH_ATTEMPTS - 1:
             r = r_hard  # forced-complete final attempt: exact whatever the growth did
@@ -467,48 +431,28 @@ def query_bvh_nearest_neighbors(
 # Register-row k-NN kernel factories.
 #
 # ``query_bvh_nearest_neighbors`` above keeps its candidate row in the *output* arrays, so every
-# accepted candidate pays a binary search plus two shift passes over global memory, and the row is
-# re-zeroed there on every deepening attempt. Measured on bunny at k=32: 225 candidates enumerated
-# per query against 2 305 shifted row elements, i.e. the row traffic — not the geometry — is the
-# call. Holding the row in a ``wp.types.vector(length=K)`` value type puts it in registers, which
-# is why these kernels exist and why ``K`` has to be a compile-time constant.
+# accepted candidate pays a binary search plus two shift passes over global memory and the row is
+# re-zeroed on every deepening attempt: at a wide ``k`` the row, not the geometry, is the call.
+# Holding it in a ``wp.types.vector(length=K)`` puts it in registers, which is why these kernels
+# exist and why ``K`` must be a compile-time constant. A ``wp.zeros(shape=K)`` stack array is a
+# **2x loss** instead, because nothing promotes it to registers (CLAUDE.md section 2.9).
 #
-# A ``wp.zeros(shape=K)`` stack array does not work here — measured a **2x loss** against the global
-# row, because nothing promotes it to registers.
+# Everything the row touches **once per query or per attempt** is factored into the generated
+# ``@wp.func`` set below. The **per-candidate insert alone stays inline**, three times, and the
+# split is measured: passing the row to a ``wp.ref`` helper is a large loss on **CPU** at the wide
+# buckets, passing it by value a far larger loss on **CUDA**, and the once-per-attempt helpers are
+# flat on both. Do not "finish" this dedup by moving the insert too.
 #
-# Everything the row touches **once per query or per attempt** — the reset, the k-th read, the
-# output write — is factored into the generated ``@wp.func`` set below, which both factories share.
-# The
-# **per-candidate insert alone stays written out inline**, three times, and the split is measured
-# rather than assumed (Warp 1.16, RTX 5090, 200k points / 200k queries on CUDA, 20k / 20k on CPU,
-# variants interleaved in one loop, ``min`` of 9 reps, all bit-identical in indices and distances):
-#
-#   | insert spelling                            | k=1   | k=7   | k=32  | k=64   |
-#   |--------------------------------------------|-------|-------|-------|--------|
-#   | ``wp.ref`` helper, CUDA                    | 1.00x | 1.00x | 1.00x | 1.00x  |
-#   | ``wp.ref`` helper, **CPU**                 | 0.95x | 1.00x | 1.55x | 2.23x  |
-#   | by value, returning the pair, **CUDA**     | 1.01x | 0.99x | 5.13x | 10.24x |
-#   | by value, returning the pair, CPU          | 0.96x | 1.04x | 1.03x | 1.07x  |
-#
-# So the two spellings fail on opposite devices, and the once-per-attempt helpers (same ``wp.ref``
-# parameters, crossed 1x per attempt instead of 1x per candidate) are flat on **both**: 0.99-1.01x
-# CUDA, 0.97-1.00x CPU at every bucket. Do not "finish" this dedup by moving the insert too.
-#
-# The contract the copies must hold is the *distance* row, not the tie-break. Like the shipped
-# kernel's ``binary_search_index`` (``searchsorted(side="right")``), the carry below walks past
-# equals before displacing, and ``placed`` then shifts the rest of the row down mechanically — a
-# plain stable insertion, which is why it matches the global row index-for-index. But that match is
-# incidental and ``placed`` is **not** load-bearing: without it the carry skips a slot holding an
-# equal distance and displaces further down instead, which permutes *which* of several equidistant
-# points fills a slot and leaves every distance bit-identical (measured — deleting the flag from all
-# three carries passes the tie test at every bucket on both backends). Callers are told exactly that
-# much; ``query_nearest``'s docstring declares the identity of a tied neighbour unspecified.
+# The contract the copies must hold is the *distance* row, not the tie-break. ``placed`` is **not**
+# load-bearing: without it the carry skips a slot holding an equal distance and displaces further
+# down, which permutes *which* of several equidistant points fills a slot and leaves every distance
+# bit-identical — and ``query_nearest``'s docstring declares a tied neighbour's identity
+# unspecified.
 #
 # So the guard on an edit here is a *tied* fixture, not a second implementation to diff against:
 # ``tests/test_neighbors.py::test_query_nearest_ties`` runs every ``KNN_ROW_BUCKETS`` size against
 # ``scipy.spatial.KDTree`` on an integer lattice, where a query has dozens of exactly tied
-# neighbours and a carry that mishandles the run keeps a farther point. Verified as a live gate:
-# shortening the shift chain by one slot fails all 12 cases. Edit the carry and run it.
+# neighbours. Verified live: shortening the shift chain by one slot fails every case.
 # ---------------------------------------------------------------------------------------------
 
 
@@ -599,29 +543,14 @@ def _bvh_nearest_row_kernel(row_size: int, name: str):
         # traversal is the only part duplicated, and the reason it is duplicated is the row type.
         #
         # **The sphere query is a win at most buckets and a small loss at one, and which one moves
-        # with the cloud.** Interleaved A/B against the cube form, one process, RTX 5090, medians
-        # (the minima agree to 0.01x), every cell byte-identical in the index rows:
-        #
-        # | k (bucket) | 200k pts / 20k queries | 1M pts / 100k queries |
-        # |---|---|---|
-        # | 1 (1) | 1.14x | 1.73x |
-        # | 7 (8) | 1.21x | 1.80x |
-        # | 16 (16) | 1.58x | 1.41x |
-        # | 30 (32) | 1.28x | **0.90x** |
-        # | 64 (64) | **0.94x** | 1.61x |
-        #
-        # The loss is *not* any of the three things it looks like, each checked: the deepening
-        # sequence is unchanged (mean attempts 1.000 / 1.292 / 2.000 at k=8 / 30 / 64, identical
-        # for both enumerations -- the certificate compares the k-th *distance*, which no
-        # enumeration shape can move), the new ``complete_radius`` is not implicated (a
-        # sphere-query build carrying the old Chebyshev radius measures 11.22 ms against this
-        # one's 11.31 at k=30, i.e. noise), and nothing spills -- ``wp.get_cuda_kernel_properties``
-        # reports ``local_memory_size`` 0 at every bucket and *fewer* registers for the sphere form
-        # at five of six (42/53/64/92/126/222 against 46/55/67/96/127/218). What is left is the
-        # per-node arithmetic: the exact sphere-AABB test costs more per node than a slab test, and
-        # at the bucket where row-insertion traffic and traversal cost balance, the ~1.91x
-        # candidate saving stops covering it. Kept, because the benchmarked groups are k1 / k7 /
-        # k64 and eight of ten cells win.
+        # with the cloud** -- eight of ten measured cells win, every one byte-identical in the
+        # index rows. The loss is *not* any of the three things it looks like, each checked: the
+        # deepening sequence is unchanged (the certificate compares the k-th *distance*, which no
+        # enumeration shape can move), the ball ``complete_radius`` is not implicated, and nothing
+        # spills (``local_memory_size`` 0 at every bucket, and *fewer* registers for the sphere form
+        # at five of six). What is left is the per-node arithmetic: the exact sphere-AABB test costs
+        # more per node than a slab test, and at the bucket where row-insertion traffic and
+        # traversal cost balance, the ~1.91x candidate saving stops covering it.
         for attempt in range(MAX_SEARCH_ATTEMPTS):
             if attempt == MAX_SEARCH_ATTEMPTS - 1:
                 r = r_hard  # forced-complete final attempt: exact whatever the growth did
@@ -889,11 +818,11 @@ def query_weighted_nearest_neighbors(
     # The test is spelled ``best + max_weight <= r`` and **not** the algebraically identical
     # ``best <= r - max_weight``, because the deepening step sets ``r`` to ``best + max_weight``: in
     # float32 the subtracted form can then fail against the very radius it just asked for, when
-    # ``best`` is large next to ``max_weight`` and the addition rounds. Measured on a 437k-point
-    # cloud with the queries 6.6 spacings off the surface: the subtracted form stalled at a fixed
-    # radius for the full 16-attempt budget on 0.1% of queries, each of which then paid the
-    # forced-complete final scan -- 437 757 candidates against a mean of 651. Computing the same
-    # expression on both sides makes the loop exact, and it is what keeps the worst case bounded.
+    # ``best`` is large next to ``max_weight`` and the addition rounds. Measured with the queries
+    # several spacings off the surface, the subtracted form stalled at a fixed radius for the whole
+    # attempt budget on a fraction of a percent of queries, each of which then paid the
+    # forced-complete scan over the entire cloud. Computing the same expression on both sides makes
+    # the loop exact, and it is what keeps the worst case bounded.
     tid = wp.int32(wp.tid())
     q = queries[tid]
 
@@ -957,7 +886,7 @@ def query_geodesic_ball_collect(
     out_overflow: wp.array[wp.int32],
 ) -> None:
     # Scratch lives in wrapper-allocated global-memory pools (one row per thread of the current
-    # chunk) instead of ~8 KB of per-thread local arrays; the wrapper pre-fills the visited pool
+    # chunk) instead of kilobytes of per-thread local arrays; the wrapper pre-fills the visited pool
     # with -1 before each launch. Single pass: after this kernel the thread's queue row holds
     # the collected set (``queue_pool[t][:out_counts[chunk_start + t]]``) ready to gather.
     t = wp.int32(wp.tid())

@@ -14,18 +14,17 @@ those callers is reconstructing from a cloud, they are extracting a level set.
 normal direction, in the only way that stays well defined where the surface curves back on itself:
 through the signed distance field, whose level set at ``d`` is exactly the set of points at distance
 ``d`` -- so it is ``marching_cubes`` over a shifted SDF. That is why an offset lives here rather
-than in [`triwarp.remesh`][triwarp.remesh] -- it is not a vertex displacement, and its output
-topology is not the input's. A sphere offset inward past its radius vanishes; a thin plate offset
-outward merges into one shell. Both are correct, and no per-vertex method produces either.
+than in [`triwarp.remesh`][triwarp.remesh]: it is not a vertex displacement, and its output topology
+is not the input's. A sphere offset inward past its radius vanishes; a thin plate offset outward
+merges into one shell. Both are correct, and no per-vertex method produces either.
 
 [`thicken_mesh`][triwarp.levelset.thicken_mesh] is the *topology-preserving* counterpart and the one
-member here that is **not** a level-set operation -- it earns its place by being the contrast. For
-the common case where an open surface has to become a solid of known thickness and the input's own
-triangulation should survive, it extrudes along the vertex normals and closes the rim, so the output
-is the input plus a copy plus a band. Nothing is resampled and no field is built, which is exactly
-what ``offset_mesh`` cannot promise and exactly why the two are shelved together: the choice between
-them is the choice between keeping the triangulation and keeping the distance. It can self-intersect
-where the thickness exceeds the local radius of curvature, and it does not guard against that --
+member here that is **not** a level-set operation. Where an open surface has to become a solid of
+known thickness and the input's own triangulation should survive, it extrudes along the vertex
+normals and closes the rim, so the output is the input plus a copy plus a band -- nothing is
+resampled and no field is built. The choice between the two is the choice between keeping the
+triangulation and keeping the distance. It can self-intersect where the thickness exceeds the local
+radius of curvature, and it does not guard against that --
 [`triwarp.validation.face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask]
 names the condition exactly, and repairing it is a separate operation.
 
@@ -51,7 +50,7 @@ from triwarp.kernels import levelset as kernel_levelset
 # floor counts across the mesh's own bounding-box diagonal, the cap across the padded lattice.
 #
 # The **cap** stops a small offset distance on a large mesh from asking for a lattice nobody can
-# allocate: a distance field costs 4 bytes a sample, so 256 per axis is 67 MB. It is measured
+# allocate: a distance field costs 4 bytes a sample, so the memory is cubic in it. It is measured
 # against the *padded* extent -- the diagonal plus the two outward margins the offset band needs --
 # rather than against the mesh's own diagonal, because the padding is what actually grows without
 # bound: an outward offset of ten times the diagonal pads by ``distance / spacing`` cells on every

@@ -25,23 +25,20 @@ def atomic_add_vec3(out_sum: wp.array2d[wp.Float], row: wp.int32, v: wp.vec3) ->
     #
     # **Every caller today accumulates at float64 while its values are float32, and that is what
     # makes the sum reproducible.** A float atomic's summation order is whatever the scheduler
-    # hands it, and float addition is not associative, so a float32 accumulator moves by about a ULP
-    # (measured 1.19e-07 on vertex normals) between runs of the identical launch. That is
-    # harmless in itself and is not harmless downstream: ``curvature.principal_curvature`` fits an
-    # ill-conditioned quadric to these normals and turns it into swings of up to **77 %** of the
-    # returned curvature at near-flat vertices. Widening the accumulator does not fix the ordering
-    # -- nothing here can -- but it drops the disagreement between two orderings to ~1e-16
-    # relative, far below what the float32 result can represent, so the narrowed answer is
-    # reproducible in practice (measured: bit-identical over eight runs where the float32
-    # accumulator moved every time). It is not a *guarantee*: a sum landing within 1e-16 of a
-    # float32 rounding boundary could still round both ways.
+    # hands it, and float addition is not associative, so a float32 accumulator moves by about a
+    # ULP between runs of the identical launch. That is harmless in itself and not harmless
+    # downstream: ``curvature.principal_curvature`` fits an ill-conditioned quadric to these normals
+    # and turns it into swings of most of the returned curvature at near-flat vertices. Widening the
+    # accumulator does not fix the ordering -- nothing here can -- but it drops the disagreement
+    # between two orderings far below what the float32 result can represent, so the narrowed answer
+    # is reproducible in practice. It is not a *guarantee*: a sum landing within an eps of a float32
+    # rounding boundary could still round both ways.
     #
-    # Cost, measured on an RTX 5090 against a detached baseline worktree: the scatter kernel alone
-    # is 0.99-1.22x the float32 one from 82k to 1.3M faces, and ``vertices.vertex_normals`` end to
-    # end is **1.29x faster** at 10k vertices, level at 164k and **1.10x slower** at 655k -- the
-    # win being the launch the fused narrow-and-normalize tail removes (a float32 accumulator could
-    # reach ``wp.vec3`` through a zero-copy ``array_cast``, a float64 one cannot), and the loss
-    # being the wider atomics once the call stops being launch-bound. The (n, 3) buffer doubles.
+    # Cost: the scatter kernel itself is within noise of the float32 one, and
+    # ``vertices.vertex_normals`` end to end wins on a small mesh -- the fused narrow-and-normalize
+    # tail removes a launch, since a float32 accumulator could reach ``wp.vec3`` through a zero-copy
+    # ``array_cast`` and a float64 one cannot -- and loses slightly on a large one, where the wider
+    # atomics start to show. The (n, 3) buffer doubles.
     wp.atomic_add(out_sum, row, 0, out_sum.dtype(v[0]))
     wp.atomic_add(out_sum, row, 1, out_sum.dtype(v[1]))
     wp.atomic_add(out_sum, row, 2, out_sum.dtype(v[2]))
@@ -420,8 +417,8 @@ def divide_by_density(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 2.5. Measured over the suite: 6 overloads created across **11** module loads --
-# nearly two rebuilds per overload, this module being reached from 11 wrappers at scattered moments.
+# CLAUDE.md section 2.5. This module is reached from 11 wrappers at scattered moments, so it forked
+# nearly twice per overload before registration.
 #
 # Each set is the dtypes its call sites actually build, not a menu: ``scatter_add`` accumulates a
 # ``wp.float32`` per-component volume in ``repair`` and a ``wp.vec2d`` tangent field in
@@ -452,8 +449,7 @@ _GRID_DTYPES = (wp.float32, wp.vec3)
 
 # The concrete handles keyed by the caller's value dtype -- see
 # [`OverloadTable`][triwarp.kernels.array.OverloadTable]. This module's kernels are one launch of a
-# short wrapper each, which is where the ~12 us a generic launch costs is worth the most: the
-# ``voxels.splat_onto_grid`` pair alone is two of them on a 0.13-0.21 ms call.
+# short wrapper each, which is where a generic launch's host-side resolution is worth the most.
 DIVIDE_BY_DENSITY: OverloadTable
 SPLAT_GRID_TRILINEAR: OverloadTable
 SCATTER_ADD: OverloadTable

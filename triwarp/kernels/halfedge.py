@@ -67,18 +67,17 @@ def pair_sorted_halfedges(
     # sort key is built from the *sorted* endpoint pair, so it identifies the undirected edge and
     # says nothing about which way either halfedge crosses it -- and on a mesh that is not
     # consistently wound, the two halfedges of an edge can both run ``a -> b``. Pairing those still
-    # satisfies ``twins[twins[h]] == h``, which is why nothing downstream noticed: what breaks is
-    # the *orientation* half of the contract ``halfedge_twins`` documents, and with it the CCW
-    # rotation ``h -> twins[prev(h)]`` that ``write_one_rings`` walks. Measured on the shipped
-    # ``boy_surface`` fixture (closed, edge- and vertex-manifold, non-orientable): 39 edges paired
-    # this way, after which ``vertex_one_rings`` *succeeded* and returned 227 ring entries whose
-    # halfedge does not originate at the owning vertex and 74 halfedges appearing in two rings at
-    # once -- so ``halfedge_tangent_angles`` summed corner angles belonging to other vertices and
-    # raced two threads onto one ``out_angles`` slot. On ``mobius`` the corrupted walk instead
-    # closed early and the wrapper reported a "pinch point" on a mesh that has none.
+    # satisfies ``twins[twins[h]] == h``, so nothing downstream notices; what breaks is the
+    # *orientation* half of the contract ``halfedge_twins`` documents, and with it the CCW rotation
+    # ``h -> twins[prev(h)]`` that ``write_one_rings`` walks. On a closed, edge- and
+    # vertex-manifold but *non-orientable* mesh that leaves ``vertex_one_rings`` succeeding while
+    # returning ring entries whose halfedge does not originate at the owning vertex, and halfedges
+    # appearing in two rings at once -- so ``halfedge_tangent_angles`` sums corner angles belonging
+    # to other vertices and races two threads onto one slot, or the walk closes early and the
+    # wrapper reports a "pinch point" on a mesh that has none.
     #
     # Two halfedges of one undirected edge run the same way exactly when they share an origin, so
-    # the test is one gather and no geometry. Two further inputs it now rejects, both correctly: an
+    # the test is one gather and no geometry. Two further inputs it rejects, both correctly: an
     # exactly *duplicated* face, whose three edges each carry two halfedges pointing the same way
     # (a reversed duplicate is a consistently wound degenerate surface and is still accepted); and
     # a face with a repeated vertex, whose self-edge ``a -> a`` has no opposite direction to find.
@@ -127,11 +126,8 @@ def count_mispaired_twins(
     # ``faces.shape[0] - 1`` there would pass a check against the face length and then send
     # ``halfedge_destination`` one past the end -- the very read this guard exists to stop.
     #
-    # Cost, since the wrapper argues it is cheap and the number does not belong in a rendered
-    # docstring: RTX 5090, Warp 1.17, 100 calls between two syncs, min of 9 --
-    # ``require_matching_twins`` measures **0.048 ms at 3 840 halfedges and 0.052 at 61 440**
-    # against **0.215 / 0.226 ms** for the ``halfedge_twins`` rebuild it lets the caller skip, a
-    # flat **0.22-0.23x**. Both are launch-bound at these sizes, which is why neither moves.
+    # It is cheap, which is what the wrapper claims: a small fraction of the ``halfedge_twins``
+    # rebuild it lets the caller skip, flat in the halfedge count because both are launch-bound.
     h = wp.int32(wp.tid())
     twin = twins[h]
     if twin < wp.int32(0):

@@ -9,25 +9,23 @@ so at least the globally-lowest-priority triangle always commits and the loop ca
 
 The priority is ``proposal_key``, a packing of the proposal's own source edge with a salt drawn from
 the wave counter, which is what makes a run **reproducible**: *which* triangles get committed no
-longer depends on the order threads reach an atomic, only the order they are written down in does
-(see below). The salt is what keeps that from also being *slow* -- a key fixed for the whole run
-starves the same front edges wave after wave, which measured 2.2x the waves. See
-that function for why the key is unique within a wave, and ``commit_triangles`` for the one other
-place arrival order used to leak in (the triangle-budget check). Measured on an irregularly sampled
-torus, four runs of one build now commit the same 3 269 triangles with the same winding, where
-before they produced 2 980 / 3 036 / 3 042 / 3 089 faces.
+longer depends on the order threads reach an atomic, only the order they are written down in does.
+The salt is what keeps that from also being *slow* -- a key fixed for the whole run starves the same
+front edges wave after wave and roughly doubles the wave count. See that function for why the key is
+unique within a wave, and ``commit_triangles`` for the one other place arrival order used to leak in
+(the triangle-budget check).
 
 Two things this deliberately does *not* pin, so compare a run as a **set** of triangles rather than
 buffer to buffer. ``CNT_FACE`` is still a ``wp.atomic_add``, so the face buffer's row order remains
 arrival-ordered; determinizing it would mean sorting the whole buffer for a property no caller has
 asked for. And ``reconstruction.ball_pivoting``'s cleanup tail loses the winding again, because
-``repair.make_winding_consistent`` seeds each connected component from an arbitrary face — measured
-on the same fixture, and a defect in that module rather than this one.
+``repair.make_winding_consistent`` seeds each connected component from an arbitrary face -- a defect
+in that module rather than this one.
 
 Persistent state
 ----------------
 Everything the algorithm needs lives in device buffers that survive the whole run, so a wave costs
-launches only — no allocations, no host readbacks, and nothing is re-derived from scratch:
+launches only -- no allocations, no host readbacks, and nothing is re-derived from scratch:
 
 * **Edge table.** An open-addressed hash keyed by the undirected edge (``edge_key``), holding the
   incident-face count, the single incident face's directed orientation (``edge_src`` / ``edge_tgt``
@@ -48,22 +46,22 @@ launches only — no allocations, no host readbacks, and nothing is re-derived f
 Border edges
 ------------
 ``pivot_front_edges`` retires a front edge whose search found no candidate (Open3D's
-``BallPivotingEdgeType::Border``) and never looks at it again. Measured on ``bunny``, 96% of all
-pivots in a run were re-tests of edges already known to be dead, rising to 100% in the tail.
+``BallPivotingEdgeType::Border``) and never looks at it again. Without that, the overwhelming
+majority of pivots in a run are re-tests of edges already known to be dead.
 
 Retiring them is **output-preserving, not an approximation**, because every rejection in the
 candidate loop is monotone in the wave index:
 
 * the geometric tests (``compute_ball_center``, ``is_compatible``, ``ball_is_empty``, the crease
   and clustering guards) depend only on the fixed points, normals and radius;
-* availability is sticky-false — a vertex that is used and has no incident boundary edge can never
+* availability is sticky-false -- a vertex that is used and has no incident boundary edge can never
   gain another triangle, since seeding needs an unused point and pivoting needs an available
   candidate, so it can never become available again;
 * the interior-edge guard only ever tightens: faces are appended and never removed, so an edge's
   face count only grows.
 
 So the set of valid candidates for a given front edge shrinks monotonically. Two consequences are
-used here: an edge with no candidate can be retired, and — the other half of the same theorem — a
+used here: an edge with no candidate can be retired, and -- the other half of the same theorem -- a
 **cached** best candidate is still the argmin as long as it is still valid, so an edge that found
 one but lost the vertex claim (most of them, every wave) is re-checked in O(1) instead of
 re-searched over its whole neighbourhood. An edge is retired only when the *search* failed, never
@@ -116,20 +114,10 @@ class BpaEdgeTable:
 
     Every wave launches ``pivot_front_edges`` (27 arguments before this, 19 after) and
     ``commit_triangles`` (20, now 13), and both carried the whole table; seven functions here
-    thread it. Measured on a 35k-point cloud, one run issues **1412 launches carrying 15 442
-    arguments** before the bundle and 11 658 after, at a measured ~1.0 us of host time per
-    ``wp.launch`` argument.
-
-    Measured directly, both wave shapes interleaved in one process with trivial kernel bodies so
-    only marshalling is timed: over 235 waves, **15.12 -> 11.32 ms (min), 1.34x**, which is
-    **1.08 us per dropped argument** and agrees with the independent per-argument law.
-
-    It had to be measured that way, because at the time BPA was **run-to-run nondeterministic**:
-    three runs of one build on the same cloud produced 44 179 / 44 243 / 44 208 faces with
-    1412 / 1412 / 1364 launches, so the end-to-end row was not timing the same reconstruction
-    twice. ``proposal_key`` has since removed that, and a run now commits the same triangle set
-    every time — but the isolated measurement is still the right one for a launch-path change,
-    since the end-to-end row is 300+ ms of pivot search around ~11 ms of marshalling.
+    thread it. A ``wp.launch`` argument costs roughly a microsecond of host time, and a run issues
+    over a thousand launches, so the bundle is worth a measurable fraction of the wave loop's
+    marshalling -- though only a small fraction of the whole call, which is dominated by the pivot
+    search.
 
     Bound once by ``_BpaState`` and rebound only when ``grow`` reallocates (``_bind_edge_table``
     is called from ``_allocate_budget``, which is the only place the arrays are replaced).
@@ -210,37 +198,25 @@ def ball_is_empty(
     # True when no point other than the three defining ones lies strictly inside the ball.
     #
     # Compared squared, matching ``candidate_is_viable``'s clustering test. The two spellings are
-    # not the same predicate in float32 -- the ``neighbors`` narrow-phase measurement found 10 rows
-    # of 200k where they disagree at the boundary -- so a module that used both could accept a
-    # point as a candidate and reject the same distance as an occupancy, and the ball radius is one
-    # of the two distances BPA is entirely built out of.
+    # not the same predicate in float32, so a module that used both could accept a point as a
+    # candidate and reject the same distance as an occupancy -- and the ball radius is one of the
+    # two distances BPA is entirely built out of. The argument is consistency, not speed: the swap
+    # measures flat.
     #
-    # **The argument is consistency, not speed, and the speed was measured to say so.** Whole
-    # ``ball_pivoting`` call, icosphere(4) cloud (2 562 points) at ``1.5 * mean_edge``, both
-    # spellings alternated over six separate processes (``bpa-intermittent-illegal-access`` rules
-    # out looping reconstructions in one process), 15 reps each: median-of-medians 21.5 ms squared
-    # against 23.7 ms unsquared, but min-of-mins 19.7 against 17.0 -- the two orderings disagree, so
-    # this is flat inside the run-to-run spread, matching the 0.997-1.003x the ``neighbors``
-    # narrow-phase decline measured for the same swap. Face count 5 120 either way.
-    #
-    # **``wp.bvh_query_sphere`` (Warp 1.17) was built here and reverted: it is a 1.75x loss.** It
+    # **``wp.bvh_query_sphere`` (Warp 1.17) was built here and reverted: it is a large loss.** It
     # looks like the ideal fit -- the point BVH's bounds are degenerate, so an exact sphere-AABB
     # test at the shrunk radius *is* this predicate, with no narrow phase and no second radius,
     # where the grid must query at ``radius`` and filter at ``threshold`` because a cell walk
-    # cannot express either radius exactly. It was also *correct*: the flat face buffer came back
-    # equal element for element on the gate below. It is simply slower. Measured on the same
-    # icosphere(4) cloud, one reconstruction per process, three alternating pairs -- **16.20 /
-    # 15.74 / 15.54 ms** (min) on the grid against **27.61 / 27.99 / 28.12** on the sphere query.
+    # cannot express either radius exactly. It was also *correct*, returning an equal face buffer.
+    # It is simply slower, because this is a *small-radius, well-centred* query, which is the hash
+    # grid's best case and not the BVH's: the grid was built with cell width ``radius``, so a probe
+    # reaches its cells by address arithmetic and stops, while the BVH pays a root-to-leaf descent
+    # per call and there are millions of calls.
     #
-    # The reason is that this is a *small-radius, well-centred* query, which is the hash grid's
-    # best case and not the BVH's: the grid was built with cell width ``radius``, so a probe here
-    # reaches 27 cells by address arithmetic and stops, while the BVH pays a ~11-level root descent
-    # per call and there are millions of calls. **Do not read the 2.4-8.9x that
-    # ``pivot_front_edges`` gets from ``wp.tile_bvh_query_aabb`` as transferring to here** (see the
-    # ``warp-hashgrid-no-per-cell-entry`` note): that win is a *block-cooperative* walk over a
-    # ``2 * radius`` reach with ~88 candidates to split across 32 lanes, and every part of that
-    # description is load-bearing. The ~1.91x candidate saving a ball enumeration does deliver is
-    # not worth a tree descent at this radius.
+    # **Do not read the win ``pivot_front_edges`` gets from ``wp.tile_bvh_query_aabb`` as
+    # transferring to here**: that one is a *block-cooperative* walk over a ``2 * radius`` reach
+    # with enough candidates to split across 32 lanes, and every part of that description is
+    # load-bearing.
     threshold = radius - BALL_EPS * radius
     threshold_sq = threshold * threshold
     query = wp.hash_grid_query(grid_id, center, radius)
@@ -281,14 +257,8 @@ def push_front_edge(
     # Overflow is *recoverable*, which is why this drops rather than clamps: the front list is a
     # cache of the edge hash table, not the source of truth, and ``_BpaState.grow`` rebuilds it from
     # that table with ``collect_front_from_table``. So a dropped entry is restored by the same host
-    # round-trip that doubles the budget, and raising ``CNT_GROW`` is what asks for it.
-    #
-    # This is hardening, **not** a fix for the intermittent ``CUDA error 700`` ``ball_pivoting``
-    # used to show on a multi-cloud run: instrumenting an overflow counter here measured it at
-    # **0**, with the front peaking near 0.1 % of capacity, so these scatters were cleared as the
-    # cause. (That fault was since root-caused elsewhere -- the host-side front-buffer swap parity
-    # in ``_bpa_run``.) The counter itself is gone: nothing ever read it and nothing cleared it,
-    # and ``CNT_GROW`` beside it is the signal the host acts on.
+    # round-trip that doubles the budget, and raising ``CNT_GROW`` is what asks for it. In practice
+    # the front peaks at a fraction of a percent of capacity and this never fires; it is hardening.
     position = wp.atomic_add(counters, CNT_NEXT_FRONT, 1)
     if position < capacity:
         out_front[position] = slot
@@ -353,49 +323,32 @@ def seed_triangles(
         return
 
     # Gather the local orphan neighbourhood into scratch so it can be scanned as a double loop.
-    # A point yields to any lower-index orphan it *sees* that hasn't already given up
+    # A point yields to any lower-index orphan it *sees* that has not already given up
     # (``seed_failed``, below), so seed fronts start well separated and do not collide into
-    # overlapping sheets before they can glue. It sees the whole neighbourhood only while that
-    # fits in ``MAX_SEED_NEIGHBORS`` -- see the ``break`` below, which is where the rule stops
-    # being exact and why that is the wanted behaviour.
+    # overlapping sheets before they can glue.
     #
-    # ``wp.zeros``, not the ``wp.types.vector(length=K)`` register row that ``neighbors.py``'s k-NN
-    # kernels hold their candidates in: measured, both spellings of this kernel end to end on bunny
-    # at radius 2x the mean edge, the register row is 0.994x (min) / 1.000x (median) — no gain. The
-    # k-NN row wins because every access to it is an unrolled compile-time slot; every access here
-    # is a runtime index (``nbr[count]``, ``nbr[i0]``, ``nbr[i1]``), and a runtime index into a
-    # vector spills it to local memory, which is where ``wp.zeros`` already puts it.
-    #
-    # And ``wp.fixedarray`` is not a third option: its own docstring says it is "only used during
-    # codegen, and for type hints" -- it *is* the codegen type of a kernel-scope ``wp.zeros``, not a
-    # separate storage class. So the choice here is registers or the stack, and both are measured.
+    # ``wp.zeros``, not the ``wp.types.vector(length=K)`` register row ``neighbors.py`` uses:
+    # measured, the register row gives nothing here. It wins only when every access is an unrolled
+    # compile-time slot, and every access here is a runtime index, which spills the vector to local
+    # memory — where ``wp.zeros`` already puts it. ``wp.fixedarray`` is not a third option: its own
+    # docstring says it is "only used during codegen, and for type hints", and it *is* the codegen
+    # type of a kernel-scope ``wp.zeros``.
     #
     # **The ``break`` bounds the walk and not just the candidate list, so the "lowest-index orphan
-    # seeds" rule above is enforced only while the neighbourhood fits in ``MAX_SEED_NEIGHBORS``.
-    # That is deliberate, it was measured, and tightening it is a regression.** Past 64 stored
-    # neighbours the scan stops before it can see a lower-indexed orphan, so adjacent points both
-    # seed -- and the neighbourhoods a real run has are past it routinely: at
-    # ``radius = 2 * mean_edge``, 65.6 % of the 2 048-point torus's points have 64 or more unused
-    # neighbours within ``2 * radius`` on the first seeding wave, and 100 % do at ``3 *``.
+    # seeds" rule holds only while the neighbourhood fits in ``MAX_SEED_NEIGHBORS``. That is
+    # deliberate and tightening it is a regression.** Past that many stored neighbours the scan
+    # stops before it can see a lower-indexed orphan, so adjacent points both seed — and real
+    # neighbourhoods are past it routinely at the radii a run uses. The exact form (bound the store,
+    # let the walk run to completion) was built and measured: it collapses the wave-0 seed count to
+    # one or zero, and zero seeds makes ``end_wave`` raise ``CNT_DONE`` on an empty mesh.
     #
-    # The exact form (bound the store with ``if count < MAX_SEED_NEIGHBORS`` and let the walk run
-    # to completion) was built and measured on that torus, wave-0 seed proposals, baseline against
-    # it: **5 -> 1** at ``1.5 *``, **5 -> 1** at ``2.0 *``, and **13 -> 0** at ``3.0 *`` -- where
-    # zero seeds means ``end_wave`` sees a seeding wave that committed nothing, raises ``CNT_DONE``
-    # and the whole run returns an empty mesh (3 004 faces before, 0 after). That is what
-    # ``seed_failed`` fixes: the rule elects **one** seeder per neighbourhood, and a neighbourhood
-    # whose lowest-indexed orphan cannot form a valid seed triangle used to be dead for good -- the
-    # next seeding wave saw identical state and failed identically. Marking a failed elected point
-    # releases its neighbourhood: the next-lowest-indexed deferring orphan stops yielding to it and
-    # gets its own turn on a later wave (``end_wave`` now keeps seeding across waves for exactly as
-    # long as new failures are still being discovered -- see the counter there). This is sound
-    # because a point's candidate set only ever *shrinks* across waves (``point_used`` only ever
-    # goes false -> true), so a point that exhausted its current candidates and failed can never
-    # succeed with a strict subset of them later; the one thing marking it forfeits is being
-    # revisited if the *specific* ``MAX_SEED_NEIGHBORS`` window the truncated walk saw would have
-    # shifted to include a different candidate on a later wave, which is a strictly milder cost
-    # than the deadlock this replaces (the point is not lost -- it can still be pivoted onto, or
-    # picked as someone else's candidate, once a nearby seed grows a front to it).
+    # ``seed_failed`` is what keeps the rule from deadlocking: it elects **one** seeder per
+    # neighbourhood, so a neighbourhood whose lowest-indexed orphan cannot form a valid seed
+    # triangle would otherwise be dead for good — the next wave sees identical state and fails
+    # identically. Marking a failed elected point releases its neighbourhood to the next-lowest
+    # deferring orphan (``end_wave`` keeps seeding while new failures are still being discovered).
+    # Sound because a point's candidate set only ever *shrinks* across waves (``point_used`` only
+    # goes false -> true), so a point that exhausted its candidates cannot succeed with a subset.
     nbr = wp.zeros(shape=MAX_SEED_NEIGHBORS, dtype=wp.int32)
     count = wp.int32(0)
     query = wp.hash_grid_query(grid_id, points[p], 2.0 * radius)
@@ -539,19 +492,18 @@ def pivot_front_edges(
     out_c: wp.array[wp.int32],
 ) -> None:
     # **One block per front edge, one warp per block.** The pivot search is a neighbourhood walk per
-    # edge, and a wave has only a few hundred live edges (median 312 on ``bunny_decimated``), so
-    # thread-per-edge left the device idle: the wave cost was nearly flat in the front size,
-    # 0.425 ms at a front under 64 against 1.636 at 1024-4096. A warp an edge is what fills it.
+    # edge, and a wave has only a few hundred live edges, so thread-per-edge left the device idle:
+    # the wave cost was nearly flat in the front size. A warp an edge is what fills it.
     #
     # The candidate walk therefore runs on the **BVH**, not the hash grid: Warp's hash grid exposes
     # only a sequential per-thread iterator with no per-cell entry point, so its walk cannot be
-    # split across lanes — and the walk is 70-73 % of a query's cost. ``tile_bvh_query_aabb``
-    # hands one candidate per lane per step instead. Measured on this query shape, 2.4-8.9x over
-    # the hash grid at the front sizes a wave actually has. (A *serial* BVH walk is 1.8x
-    # **slower** than the hash grid, so the win is the cooperation, not the tree.)
+    # split across lanes -- and the walk is most of a query's cost. ``tile_bvh_query_aabb`` hands
+    # one candidate per lane per step instead, which is several-fold faster at the front sizes a
+    # wave actually has. (A *serial* BVH walk is slower than the hash grid, so the win is the
+    # cooperation, not the tree.)
     #
     # The box the BVH returns is a different superset of the true candidate set than the grid's
-    # cells were — both are supersets, and ``candidate_prefilter`` plus ``compute_ball_center``'s
+    # cells were -- both are supersets, and ``candidate_prefilter`` plus ``compute_ball_center``'s
     # ``inf`` do the actual rejecting, so the accepted set is unchanged.
     #
     # ``ball_is_empty`` inside ``candidate_accepted`` stays a per-lane serial hash-grid query: at
@@ -587,10 +539,10 @@ def pivot_front_edges(
         tri_norm = triangle_normal(p_src, p_tgt, points[opp])
 
         # Re-validate the cached argmin first. It stays the argmin while it stays valid (the
-        # candidate set only shrinks), and ~75-80% of front edges lose the vertex claim each wave
-        # and come back here unchanged, so this is the difference from a full neighbourhood search.
-        # Every lane evaluates it on identical data — the loads broadcast, so the redundancy is
-        # free — and only lane 0 acts on the result.
+        # candidate set only shrinks), and most front edges lose the vertex claim each wave and come
+        # back here unchanged, so this is the difference from a full neighbourhood search. Every
+        # lane evaluates it on identical data -- the loads broadcast, so the redundancy is free --
+        # and only lane 0 acts on the result.
         cached = edges.cand[slot]
         if cached >= 0 and candidate_prefilter(
             points, p_src, p_tgt, src, tgt, opp, cached, min_cluster_sq, point_used, boundary_degree
@@ -631,34 +583,24 @@ def pivot_front_edges(
         # **out-of-range** primitive indices whenever one traversal round finds more primitives
         # than its shared result buffer holds: ``warp/native/tile_bvh.h`` counts them with an
         # unconditional ``atomicAdd`` and guards only the *write* against
-        # ``result_buffer_capacity = WP_TILE_BLOCK_DIM * 5`` (160 lanes-wide here), then reads
+        # ``result_buffer_capacity = WP_TILE_BLOCK_DIM * 5``, then reads
         # ``buffer[counter - block_size + lane]`` -- past the written region once the counter has
-        # overrun it, so a lane gets uninitialised shared memory as an index. Diagnosed on
-        # ``proximity.face_to_mesh_distance_tiled``, the tree's only other consumer of this
-        # builtin, where ``compute-sanitizer`` named it as a read **12.26 GB past the nearest
-        # allocation**; a garbage index is positive far more often than not, so the ``>= 0`` test
-        # alone lets it through to ``points[c]``.
+        # overrun it, so a lane gets uninitialised shared memory as an index. A garbage index is
+        # positive far more often than not, so the ``>= 0`` test alone lets it through to
+        # ``points[c]``; ``compute-sanitizer`` names it as a wildly out-of-range read on the tree's
+        # other consumer of this builtin.
         #
         # **It is not the long-open intermittent ``CUDA error 700`` recorded against this function**
-        # (CLAUDE.md section 16.3), which was the obvious guess -- same builtin, same block width --
-        # and was tested rather than assumed: that section's own repro (three *different* clouds in
-        # one process) faults **6 of 6** with this guard in place and 6 of 6 without, on the same
-        # third cloud. So the guard rules the tile-BVH garbage-index path *out* as that defect's
-        # cause, which is the useful half of the result; section 16.3's remaining leads stand.
+        # (CLAUDE.md section 16.3), which was the obvious guess and was tested rather than assumed:
+        # that section's own repro faults with the guard in place exactly as often as without. So
+        # the guard rules the tile-BVH garbage-index path *out* as that defect's cause.
         #
         # Guarding is still right here, and cheap: the overflow is a property of the builtin and the
-        # query, not of the caller, so this walk is exposed to the same corruption whenever a round
-        # overruns. What it cannot do is recover the primitives the overflow *dropped* -- that
-        # defect is upstream's -- so a guarded round can still return a slightly incomplete
-        # candidate set.
-        #
-        # It is output-neutral **by construction**, which is the only argument available: an index
-        # ``>= n_points`` is never a primitive of this BVH, so the test can reject nothing the walk
-        # was entitled to return. A measured claim is not available and should not be attempted --
-        # this function's output is still run-to-run nondeterministic (``make_winding_consistent``
-        # seeds each component from an arbitrary face, section 16.3), and the control proves the
-        # comparison is blind: two *baseline* runs of one 40 000-point cloud differ from each other
-        # in the face count, 69 346 against 69 347, before any change is applied.
+        # query, not of the caller. What it cannot do is recover the primitives the overflow
+        # *dropped* -- that half is upstream's -- so a guarded round can still return a slightly
+        # incomplete candidate set. It is output-neutral **by construction**, which is the only
+        # argument available: an index ``>= n_points`` is never a primitive of this BVH, so the test
+        # can reject nothing the walk was entitled to return.
         n_points = points.shape[0]
         query = wp.tile_bvh_query_aabb(bvh_id, mp - wp.vec3(reach), mp + wp.vec3(reach))
         while wp.tile_query_valid(query):
@@ -691,13 +633,12 @@ def pivot_front_edges(
                     # ``acos(a . b)``, and here that is a correctness matter rather than a tidy-up:
                     # the candidate that *wins* is the one nearest coplanar with the current
                     # triangle, which is exactly where acos has an infinite derivative. Measured
-                    # against a float64 reference on float32 directions, error at a true angle of
-                    # 1e-3 / 1e-5 / 1e-7 rad: acos 2.3e-05 / 1.0e-05 / 1.0e-07, atan2 4.2e-11 /
-                    # 2.5e-13 / 1.2e-15. At 1e-5 and below the acos error *equals the angle* -- it
-                    # returns zero, so every candidate closer than ~1e-5 rad ranked identically and
-                    # the winner fell out of float32 rounding. The two forms agree to 7.6e-12 over
-                    # 200k random pairs otherwise, and this one is also cheaper: the cross product
-                    # is the same one the sign test needed.
+                    # against a float64 reference on float32 directions, acos's absolute error
+                    # *equals* the angle below ~1e-5 rad -- it returns zero, so every candidate
+                    # closer than that ranked identically and the winner fell out of float32
+                    # rounding, where atan2 stays accurate to many more digits. The two forms agree
+                    # elsewhere, and this one is also cheaper: the cross product is the same one the
+                    # sign test needed.
                     angle = dihedral_angle(a_dir, b_dir, axis)
                     if angle < 0.0:
                         angle += TWO_PI
@@ -738,57 +679,45 @@ def wave_salt(wave: wp.int32) -> wp.int32:
 @wp.func
 def proposal_key(a: wp.int32, b: wp.int32, salt: wp.int32) -> wp.uint64:
     # Priority of a proposed triangle, and the whole reason a run is reproducible: it is derived
-    # from the proposal's own vertices, not from the order it reached ``propose_triangle``. The
-    # slot that call hands out comes from a ``wp.atomic_add``, so it is the arrival order of a
-    # thousand-block launch; making it the claim priority made *which* triangle won a contested
-    # vertex a function of GPU scheduling, and the loser's front edge is retried a wave later
-    # against mutated state, so the difference compounded into a different mesh (measured 44 179 /
-    # 44 243 / 44 208 faces over three runs of one build) rather than a permuted one.
+    # from the proposal's own vertices, not from the order it reached ``propose_triangle``. That
+    # call's slot comes from a ``wp.atomic_add``, i.e. the arrival order of a thousand-block
+    # launch, so using it as the claim priority makes *which* triangle wins a contested vertex a
+    # function of GPU scheduling — and the loser's front edge is retried a wave later against
+    # mutated state, so the difference compounds into a different mesh rather than a permuted one.
     #
-    # ``a`` and ``b`` are the proposal's *source edge* -- the pivoting front edge ``(src, tgt)``,
-    # or a seeding point and its first partner -- and that pair is unique among one wave's
-    # proposals, which is what makes this a total order on them:
+    # ``a`` and ``b`` are the proposal's *source edge* — the pivoting front edge ``(src, tgt)``, or
+    # a seeding point and its first partner — and that pair is unique among one wave's proposals,
+    # which is what makes this a total order on them:
     #
-    # * a pivot wave proposes at most once per live front edge, and a front edge *is* one slot of
-    #   a table keyed by the undirected pair, so no two share ``{src, tgt}``;
-    # * a seed wave proposes at most once per seeding point ``p``, and ``seed_triangles`` seeds
-    #   only a point that is the lowest-indexed unused point of the neighbourhood it *scanned*, so
-    #   ``p`` is the smaller of its pair and distinct seeds give distinct pairs;
-    # * the two never share a wave -- ``pivot_front_edges`` proposes nothing while ``CNT_SEEDING``.
+    # * a pivot wave proposes at most once per live front edge, and a front edge *is* one slot of a
+    #   table keyed by the undirected pair, so no two share ``{src, tgt}``;
+    # * a seed wave proposes at most once per seeding point ``p``, and ``seed_triangles`` seeds only
+    #   a point that is the lowest-indexed unused point of the neighbourhood it *scanned*, so ``p``
+    #   is the smaller of its pair and distinct seeds give distinct pairs;
+    # * the two never share a wave — ``pivot_front_edges`` proposes nothing while ``CNT_SEEDING``.
     #
     # The second bullet is exact only while a neighbourhood fits in ``MAX_SEED_NEIGHBORS``; past
-    # that the scan is truncated deliberately (the measurement is at ``seed_triangles``), and two
-    # points ``p1``, ``p2`` can each seed with the other as partner, giving one key twice. **That
-    # degrades rather than corrupting**, which is why the truncation is affordable: both proposals
-    # then win the claim and commit, they share exactly the edge ``(p1, p2)``, and
-    # ``register_face_edge`` folds them correctly anyway -- ``hash_find_or_insert`` publishes
-    # through a single ``atomic_cas`` so both threads converge on one slot, and the ``atomic_add``
-    # hands ``previous == 0`` to one and ``1`` to the other, so the edge is inserted once, pushed
-    # to the front once, and its boundary degree nets to zero. The pair is a manifold pair, which
-    # is what a shared edge should be. What is *not* preserved in that case is the per-wave
-    # vertex-disjointness ``register_face_edge`` states above; the state stays consistent because
-    # every transition it makes is an atomic read-modify-write.
+    # that the scan is truncated deliberately (see ``seed_triangles``) and two points can each seed
+    # with the other as partner, giving one key twice. **That degrades rather than corrupting**,
+    # which is what makes the truncation affordable: both proposals win and commit, they share
+    # exactly the edge ``(p1, p2)``, and ``register_face_edge`` folds them correctly —
+    # ``hash_find_or_insert`` publishes through a single ``atomic_cas`` so both threads converge on
+    # one slot, and the ``atomic_add`` hands ``previous == 0`` to one and ``1`` to the other, so the
+    # edge is inserted once, pushed once, and its boundary degree nets to zero. What is *not*
+    # preserved is the per-wave vertex-disjointness ``register_face_edge`` states above; the state
+    # stays consistent because every transition it makes is an atomic read-modify-write.
     #
-    # ``salt`` rotates that order **per wave**, and it is what keeps the ordering from being global.
-    # An order fixed for the whole run starves a high-key front edge: it loses every contested
-    # vertex it ever enters, is retried, and loses again, so a wave commits a smaller independent
-    # set than a per-wave order gives. Measured over three trees in one session, worktree A/B on
-    # ``bunny_decimated`` / ``bunny``: the arrival-order predecessor ran 80 / 152 waves, a globally
-    # fixed key 208 / 304, and this salted key 96 / 176 -- 1.70x / 1.35x of wall clock recovered
-    # against the fixed key, at an unchanged face count. Salting gives none of that back to the
-    # scheduler: the salt is a function of ``CNT_WAVE``, device state the wave loop advances
-    # deterministically, so a run remains reproducible call to call.
+    # ``salt`` rotates that order **per wave**, which is what keeps the ordering from being global.
+    # An order fixed for the whole run starves a high-key front edge — it loses every contested
+    # vertex it enters, is retried, and loses again, so a wave commits a smaller independent set, at
+    # roughly double the waves for an unchanged face count. It gives nothing back to the scheduler:
+    # the salt is a function of ``CNT_WAVE``, device state the wave loop advances deterministically.
     #
-    # Xoring both halves preserves the injectivity the total order needs: ``{a, b}`` is recoverable
-    # from ``(min ^ salt, max ^ salt)``, so distinct source edges still give distinct keys within a
-    # wave. The salt is masked to 31 bits precisely so this cannot break the bound below.
-    #
-    # A bit pack rather than ``pack_edge_key``'s ``lo + hi * base``, so that neither kernel
-    # computing it has to carry the point count as an argument and so it cannot overflow: point
-    # indices are ``int32`` and the salt cannot set their sign bit, so the key stays under 2^63 and
-    # well below the unclaimed sentinel.
-    # Spelled as a multiply because that is the same operation on ``uint64`` as a 32-bit shift and
-    # reads as the pack it is.
+    # Xoring both halves preserves the injectivity the total order needs, and the salt is masked to
+    # 31 bits so it cannot set a sign bit. A bit pack rather than ``pack_edge_key``'s
+    # ``lo + hi * base``, so neither kernel computing it carries the point count as an argument and
+    # the key stays under 2^63; spelled as a multiply because that is the same operation on
+    # ``uint64`` as a 32-bit shift and reads as the pack it is.
     lo = wp.uint64(wp.uint32(wp.min(a, b) ^ salt))
     hi = wp.uint64(wp.uint32(wp.max(a, b) ^ salt))
     return hi * wp.uint64(4294967296) + lo
@@ -876,7 +805,7 @@ def commit_triangles(
     # See ``claim_triangle_vertices``: the proposal counter overshoots its list on overflow.
     proposals = wp.min(counters[CNT_PROPOSAL], front_capacity)
     # The triangle budget is tested for the *whole* wave rather than per triangle, because a
-    # partial commit would hand the last slots out in ``wp.atomic_add`` arrival order — the one
+    # partial commit would hand the last slots out in ``wp.atomic_add`` arrival order -- the one
     # thing this design does not let the answer depend on. Declining every proposal is also the
     # cheaper recovery: nothing is mutated, so each front edge keeps its cached candidate and the
     # same wave is re-proposed unchanged once the host has doubled the budget.
@@ -885,7 +814,7 @@ def commit_triangles(
     # every thread reads the same value. Reading ``CNT_FACE`` here would race the ``atomic_add``
     # below and let a late thread decline a wave the early ones already committed to.
     #
-    # It is conservative — most proposals lose the claim and never needed a slot — but the budget
+    # It is conservative -- most proposals lose the claim and never needed a slot -- but the budget
     # starts at ``4 n + 16`` against a run that commits about ``2 n``, so this is the growth tail
     # and not the common path. Bounding the wave this way is also what lets the scatter below drop
     # its own range check: committed triangles are at most ``proposals``.

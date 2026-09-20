@@ -1,10 +1,10 @@
 """
 Per-source breadth-first collection over a CSR adjacency graph.
 
-``per_source_bfs_collect`` — one thread per source over caller-provided global-memory scratch rows
+``per_source_bfs_collect`` -- one thread per source over caller-provided global-memory scratch rows
 (a FIFO queue whose emitted prefix is the discovery order, an open-addressing visited hash set, and
 a small nearest-fallback pool). With a finite ``radius`` it enqueues only neighbors within
-``radius`` of the center (and backfills the nearest out-of-ball vertices up to ``min_count``) — the
+``radius`` of the center (and backfills the nearest out-of-ball vertices up to ``min_count``) -- the
 geodesic-ball query behind [`triwarp.neighbors.geodesic_ball`][triwarp.neighbors.geodesic_ball].
 Its nearest-fallback pool scans with the shared ``wp.ref`` argmin/argmax helpers, so any kernel
 calling it must be decorated ``@wp.kernel(enable_backward=False)`` (see ``triwarp.kernels.array``).
@@ -12,9 +12,9 @@ calling it must be decorated ``@wp.kernel(enable_backward=False)`` (see ``triwar
 **This module used to carry two whole-graph engines besides**: a level-synchronous frontier loop
 that reproduced ``scipy.sparse.csgraph.breadth_first_order``'s FIFO order without a sort, and a
 one-thread serial drain it handed off to once the frontier went narrow. Both existed for a public
-``graph.bfs``, whose only in-tree consumer was the homology decomposition — which reads a spanning
+``graph.bfs``, whose only in-tree consumer was the homology decomposition -- which reads a spanning
 tree's ``parents`` and depths and never a discovery order. Reproducing scipy's order cost a tiled
-block scan and a serial advance per level, 9.9 us of a 26.1 us level, so the decomposition now
+block scan and a serial advance per level, more than a third of the level, so the decomposition now
 carries its own two-kernel level loop in ``triwarp.kernels.homology`` and the order-exact engines
 are gone. Anything needing scipy's exact visit order should call scipy.
 """

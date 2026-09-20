@@ -5,118 +5,83 @@ The point cloud is a registry mesh's own vertices with area-weighted vertex norm
 (no sampling RNG), consistently oriented, and it scales with the mesh. Both are precomputed and
 cached: they are the *input*, not part of the operation being timed.
 
-**open3d** is the reference for ball pivoting:
-``create_from_point_cloud_ball_pivoting`` (Bernardini's BPA, given the identical radius). It takes
-an oriented ``PointCloud``; open3d gets the same points and computes its own area-weighted vertex
-normals, which is the same quantity triwarp's
+**open3d** is the reference for ball pivoting
+(``create_from_point_cloud_ball_pivoting``, Bernardini's BPA at the identical radius); it gets the
+same points and computes its own area-weighted normals, the same quantity
 [`vertex_normals`][triwarp.vertices.vertex_normals] produces.
 
-**pymeshlab** is the third BPA implementation, and the reason it is worth a row is that
-``generate_surface_reconstruction_ball_pivoting`` is VCGlib's original BPA (Bernardini was
-co-authored out of that lab), so its row and open3d's price two wrappers over one lineage and only
-triwarp's is a different program. It is given the identical absolute radius via ``PureValue`` (the
-``0%`` default autoguesses one, which would compare two different parameters) with ``clustering=0``
-to disable the merge-nearby-vertices step triwarp does not do. The filter pushes its output as a new
-layer without touching the cloud, so the cloud MeshSet is cached; ``set_current_mesh(0)`` inside the
-callable restores the layer the previous round's push moved away from.
+**pymeshlab** is the third BPA implementation, and worth a row because
+``generate_surface_reconstruction_ball_pivoting`` is VCGlib's original BPA — so its row and open3d's
+price two wrappers over one lineage and only triwarp's is a different program. It gets the
+identical absolute radius via ``PureValue`` (the ``0%`` default autoguesses one, which would
+compare two different parameters) with ``clustering=0`` to disable a merge step triwarp does not do.
+The filter
+pushes its output as a new layer without touching the cloud, so the cloud MeshSet is cached;
+``set_current_mesh(0)`` inside the callable restores the layer the previous round's push moved away
+from.
 
-**Screened Poisson is timed for triwarp alone.** Both CPU references wrap Kazhdan's own solver, and
-between them they cost **6 322 s -- 73 % of the whole benchmark suite** -- to re-measure a reference
-triwarp beats 15-25x, with ``[dragon-open3d-*]`` alone running 93 minutes without completing a
-round. The rows are **removed**, not capped, and the agreement they were the parity evidence for is
-checked in ``tests/test_reconstruction.py`` instead, at a size a correctness test can afford. What
-remains here is a triwarp-only regression row over ``method`` x ``depth``.
+**Screened Poisson is timed for triwarp alone.** Both CPU references wrap Kazhdan's own solver and
+between them cost the **majority of the whole suite's wall clock** to re-measure a reference triwarp
+beats by more than an order of magnitude, with the largest cell running well over an hour without
+completing a round. The rows are **removed**, not capped, and the agreement they were the parity
+evidence for is checked in ``tests/test_reconstruction.py`` at a size a correctness test can afford.
+What remains is a triwarp-only regression row over ``method`` x ``depth``.
 
-**The pymeshlab cloud is not quite the same cloud**, and that is forced rather than chosen. It drops
-every point whose area-weighted normal is exactly zero -- the unreferenced vertices every scan mesh
-carries, **47 of bunny_decimated's 8 171 and 1 113 of bunny's 35 947** -- leaving it 0.6% / 3.1%
-smaller than the one triwarp and open3d reconstruct from. That was originally forced by the
-screened-Poisson filter, which rejects a cloud carrying any null normal outright (``Failed to apply
-filter: Filter requires correct per vertex normals``), and it is kept now that only the BPA row uses
-the cloud so the reference's input stays the documented one. The alternative, ``preclean=True``,
-moves the same cleaning *inside* the timed filter, which is worse: it puts a pass triwarp does not
-run into the measured region.
+**The pymeshlab cloud is not quite the same cloud**, and that is forced rather than chosen: it drops
+every point whose area-weighted normal is exactly zero — the unreferenced vertices every scan mesh
+carries — because the screened-Poisson filter rejects a cloud carrying any null normal outright. The
+cleaning is kept for the BPA row so the reference's input stays the documented one; the alternative,
+``preclean=True``, moves the same cleaning *inside* the timed filter, which is worse.
 
 ``generate_surface_reconstruction_vcg`` was tried as a *fourth* algorithm and **rejected**: it
-returns **zero faces** on this input at every voxel size probed (``PureValue`` 0.02 / 0.05 / 0.10),
-reporting ``Mesh Saved 'plymcout.ply': 0 vertices, 0 faces``. It reconstructs from all *visible*
-layers through a temporary ``.vmi`` file and did not produce geometry from a single oriented cloud;
-a row that silently measures a no-op is worse than no row.
+returns **zero faces** on this input at every voxel size probed. A row that silently measures a
+no-op is worse than no row.
 
-``triangulate_point_cloud`` has **meshlib** and nothing else. Its nearest open3d and pymeshlab
-analogues (``create_from_point_cloud_alpha_shape``, ``generate_alpha_shape``) are a different
-algorithm solving the problem a different way, so timing them against each other would compare
-algorithm choices rather than implementations -- where ``triangulatePointCloud`` is the same local
-fan optimization at the same ``numNeighbours``, and on a clean uniform cloud the two return the
-identical face set (``tests/test_reconstruction.py``). It takes an oriented ``PointCloud``, so its
-row gets the same points and the same precomputed normals every other row here does.
+``triangulate_point_cloud`` has **meshlib** and nothing else. The nearest open3d and pymeshlab
+analogues are alpha shapes — a different algorithm, so timing them would compare algorithm choices
+rather than implementations — where ``triangulatePointCloud`` is the same local fan optimization at
+the same ``numNeighbours`` and returns the identical face set on a clean uniform cloud.
 
-What the open3d comparison showed when it was added (medians, RTX 5090, ``depth=8``,
-``radius = 1.5 * mean_edge``):
+``ball_pivoting`` is built around a **persistent front** — an edge hash table plus a compacted
+boundary-edge list, mutated in place and never re-derived from the triangle soup. Three things pay
+for it: retiring provably-dead front edges (under a per-wave rebuild most pivots are re-searches of
+edges already known to be impossible), caching each front edge's best candidate so the majority that
+lose a vertex claim re-validate in O(1), and dropping the per-wave ``edges_unique`` + sort + three
+readbacks a rebuild needs. It also reconstructs a **much better surface** — far fewer faces per
+referenced vertex, an order of magnitude fewer boundary edges — because a per-wave rebuild lets
+colliding fronts triangulate a neighbourhood in overlapping layers, which cleanup then tears back
+into open patches.
 
-- ``screened_poisson`` is a clear win — 134 ms (dense) against open3d's 2.0-2.3 s, so **15-25x
-  faster** on both meshes. That measurement is why the reference rows are gone: it is settled, and
-  re-establishing it cost 73 % of the suite's wall clock every run.
-- ``ball_pivoting`` used to be the outlier of this module at 580 ms / 1085 ms against open3d's
-  100 ms / 445 ms. Rebuilding it around a **persistent front** — an edge hash table plus a
-  compacted boundary-edge list, mutated in place by ``commit_triangles`` and never re-derived from
-  the triangle soup — took it to **121 ms / 214 ms**, i.e. from 2.4x slower to **2.1x faster** on
-  ``bunny``. Three things paid for that: retiring provably-dead front edges (96% of all pivots in
-  a run were re-searches of edges already known to be impossible), caching each front edge's best
-  candidate so the ~73% that lose the vertex claim each wave re-validate in O(1), and dropping the
-  per-wave ``edges_unique`` + sort + three readbacks the front rebuild needed.
+What is left is ``pivot_front_edges``, nearly all of the kernel time, and it is *occupancy*-bound:
+a wave has a few hundred live front edges doing serial dependent work on a device with hundreds of
+thousands of thread slots, which is why the smaller mesh is behind.
 
-  It also reconstructs a **much better surface**: 1.97 faces per referenced vertex against 3.08,
-  and 1.7% boundary edges against 23.6%. The old per-wave rebuild was letting colliding fronts
-  triangulate a neighbourhood in overlapping layers, which cleanup then tore back into open
-  patches. The run-to-run spread collapsed with it (148 ms StdDev -> 3 ms).
+A warp per edge is the answer, and the *index* is what constrains it: Warp's hash grid exposes only
+a sequential per-thread iterator with no per-cell entry point, so its walk — most of a query's cost
+— cannot be split across lanes. Warp's **BVH** can be, through ``tile_bvh_query_aabb``, and that is
+several-fold over the hash grid at the front sizes a wave has. (A *serial* BVH walk is slower than
+the hash grid, so the win is the cooperation and not the tree; a hand-rolled hashed cell grid would
+be a further several-fold this kernel's own ceiling cannot spend.) So ``pivot_front_edges`` runs one
+block per front edge, one warp per block, walking the BVH cooperatively, with the empty-ball test
+left as a per-lane serial hash-grid query — at that point each lane tests a different ball, so there
+is nothing to cooperate on and the speedup comes from running 32-way concurrently. Worth nearly 5x
+on both meshes, and it takes the group from several times behind pymeshlab to several times ahead.
 
-  What is left is ``pivot_front_edges`` (90.8% of kernel time) and it is *occupancy*-bound, not
-  throughput-bound: a wave has a few hundred live front edges, so a few hundred threads do
-  serial, dependent hash-grid work on a device with 350k thread slots. ``bunny_decimated`` is
-  still behind for exactly that reason — it is too small to fill the GPU — while ``bunny``,
-  four times larger, fares much better.
+Sizing notes:
 
-  **A warp per edge was the next step, and it landed.** The wave cost used to be nearly flat in the
-  front size (0.425 ms at a front under 64 against 1.636 at 1024-4096 — a 250x range of work for
-  4.3x of cost), which is the signature of a device left idle: a wave has only a few hundred live
-  edges. The per-edge work is ~215 point tests (the outer query enumerates 87.6 candidates, 59.0
-  pass the prefilter, 8.93 run the acceptance test, each walking a second ball of 14.2 points).
+- ``ball_pivoting`` uses ``1.5 * mean_edge``. The ``4 * n + 16`` triangle budget doubles on demand,
+  so a larger multiple completes; it is not benchmarked, because a ball that wide searches a much
+  larger neighbourhood per pivot and measures a different thing.
+- ``screened_poisson`` in ``dense`` mode is dominated by the ``2 ** depth`` cubed node grid rather
+  than the point count, so it costs the same on ``bunny_decimated`` and ``bunny``; ``adaptive`` does
+  scale with the cloud. Both run at the default ``depth=8``.
 
-  What blocked the obvious fix was the *index*, not the kernel: Warp's hash grid exposes only a
-  sequential per-thread iterator with no per-cell entry point, so its walk — **70-73%** of a query's
-  cost — cannot be split across lanes. Warp's **BVH** can be, through ``tile_bvh_query_aabb``, and
-  that turned out to be 2.4-8.9x over the hash grid at the front sizes a wave actually has. (A
-  *serial* BVH walk is 1.8x **slower** than the hash grid, so the win is the cooperation, not the
-  tree; and a hand-rolled hashed cell grid would be a further 2.2-5.5x that this kernel's own
-  ceiling cannot spend.)
-
-  So ``pivot_front_edges`` now runs one block per front edge, one warp per block, walking the BVH
-  cooperatively, with the empty-ball test left as a per-lane serial hash-grid query — at that point
-  each lane is testing a different ball, so there is nothing to cooperate on, and it gets its
-  speedup from running 32-way concurrently instead. Measured back to back in one session:
-  **116.7 -> 25.9 ms on ``bunny_decimated`` and 203.4 -> 41.6 ms on ``bunny`` (4.5x / 4.9x)**,
-  taking the group from 3.78x behind pymeshlab to **1.34x ahead**, and from 1.54x behind to
-  **3.65x ahead**.
-
-Sizing notes measured on an RTX 5090 before the baseline was captured:
-
-- ``ball_pivoting`` uses ``1.5 * mean_edge`` as its radius. A larger multiple used to overflow the
-  ``4 * n + 16`` triangle budget and raise; the budget now doubles on demand (rehashing the edge
-  table and rebuilding the front from it), so 2.5x completes. It is still not benchmarked, because
-  a ball that wide searches a much larger neighbourhood per pivot and measures a different thing.
-- ``screened_poisson`` in ``dense`` mode is dominated by the ``2^depth`` cubed node grid, not by the
-  point count — it costs the same on ``bunny_decimated`` and ``bunny``. The ``adaptive`` mode does
-  scale with the cloud. Both are timed at the default ``depth=8``.
-
-Everything is capped at ``bunny``, and the cap is load-bearing rather than tidy: point-cloud
-triangulation and ball pivoting are superlinear in the cloud size. It was the CPU screened-Poisson
-references that made it non-negotiable -- ``test_screened_poisson[dragon-open3d-*]`` was measured
-running **93 minutes without completing a single round** before it was killed, more wall clock than
-the other 40 benchmark modules combined -- and those rows are now removed outright rather than
-capped. The cap stays for the algorithms that are still timed against a reference. This is a
-deliberate coverage gap -- the optimizations these benchmarks gate are host-sync and
-launch-overhead fixes, which show up at these sizes.
+Everything is capped at ``bunny``, and the cap is load-bearing: point-cloud triangulation and ball
+pivoting are superlinear in the cloud size. The CPU screened-Poisson references made it
+non-negotiable — one cell ran over an hour without completing a round — and those rows are now
+removed outright rather than capped. The cap stays for the algorithms still timed against a
+reference. This is a deliberate coverage gap: the optimizations these benchmarks gate are host-sync
+and launch-overhead fixes, which show up at these sizes.
 """
 
 from __future__ import annotations
@@ -276,22 +241,20 @@ def test_delaunay_triangulation(bench_lib: BenchLibrary, n_points: int) -> None:
     both references see, built once per size outside the timed region).
 
     !!! note "This row was the suite's largest loss, and both halves of it are now compiled"
-        **The seed.** 370 ms against scipy's 45.8 at 20 000 points, of which 337.8 ms (91.3 %) was
-        the host-side seed -- a pure-Python sweep doing ~460 000 ``_orient2d`` calls (n insertions
-        x a ~23-vertex hull boundary) while the device did 2.33 ms of work. Porting that sweep to a
-        single-thread Warp **CPU** kernel took the row to 36.2 ms. The CPU device is not a
-        concession: the identical sweep measures 352 ms in Python, 93 ms in one **CUDA** thread and
-        1.40 ms in one CPU thread, so a single GPU thread is the wrong tool by a factor of 66.
+        **The seed.** The overwhelming majority of the row was a host-side pure-Python sweep doing
+        hundreds of thousands of ``_orient2d`` calls while the device did almost nothing. Porting
+        that sweep to a single-thread Warp **CPU** kernel took an order of magnitude off it. The CPU
+        device is not a concession: the identical sweep is two orders of magnitude cheaper on one
+        CPU thread than on one **CUDA** thread, so a single GPU thread is the wrong tool.
 
         **The flip loop**, which then dominated the small row. Its cost was not the launch count
-        the first reading blamed: at 962 us of host time per pass, 442 went to
-        [`face_adjacency`][triwarp.adjacency.face_adjacency] and 186 to a *second* radix sort of
-        the same edge keys ``face_adjacency`` had already sorted internally, against ~1.2 ms of
-        device work for the whole 37-pass loop. Since a flip leaves the vertex, face and
-        interior-edge counts alone, that whole working set is invariant and is now built once into
-        fixed buffers by one sort and five launches. **36.1 -> 18.7 ms (1.93x)** at 20 000 points,
-        a 2.4x win over scipy, and **18.7 -> 7.2 ms (2.61x)** at 2 000. See
-        [`delaunay_triangulation`][triwarp.reconstruction.delaunay_triangulation].
+        the first reading blamed: most of the host time per pass went to
+        [`face_adjacency`][triwarp.adjacency.face_adjacency] and to a *second* radix sort of the
+        same edge keys ``face_adjacency`` had already sorted internally, against a fraction of that
+        in device work for the whole loop. Since a flip leaves the vertex, face and interior-edge
+        counts alone, that whole working set is invariant and is built once into fixed buffers by
+        one sort and five launches -- worth about 2x at the large end and more at the small one.
+        See [`delaunay_triangulation`][triwarp.reconstruction.delaunay_triangulation].
 
     The three implementations answer the same question by different means: triwarp seeds a
     sequential lexicographic incremental triangulation and then drives its **parallel** edge-flip
@@ -358,10 +321,9 @@ def test_ball_pivoting(bench_case: BenchCase) -> None:
         # ``0%`` autoguesses one, which would compare two different algorithms' parameters).
         #
         # ``clustering`` stays at MeshLab's default 20%: at ``0`` the filter reconstructs
-        # **nothing** -- measured 0 faces against 1 277 at the default, on the same cloud and the
-        # same radius -- and returns in 9.6 ms against 2.7 ms, so this row previously timed a
-        # failure and read *slower* for it. The clustering fraction is a seed-triangle spacing
-        # floor, not an optional post-pass. At the default the two agree: 1 277 faces against
+        # **nothing** on the same cloud and the same radius, and takes *longer* doing it, so this
+        # a row at ``0`` therefore times a failure and reads slower for it. The clustering fraction
+        # is a seed-triangle spacing floor, not an optional post-pass. At the default the two agree:
         # triwarp's 1 280, asserted in
         # tests/test_reconstruction.py::test_ball_pivoting_matches_pymeshlab.
         cloud_pml = _cloud_meshset_pml(bench_case)
@@ -411,16 +373,15 @@ def test_ball_pivoting(bench_case: BenchCase) -> None:
 def test_screened_poisson(
     bench_case: BenchCase, method: Literal["dense", "adaptive"], depth: int
 ) -> None:
-    # **The CPU Poisson rows were removed, deliberately.** The open3d and pymeshlab rows went rather
-    # both wrap Kazhdan's CPU solver, and between them they were **6 322 s -- 73 % of the whole
-    # benchmark suite** -- while measuring a reference triwarp had already beaten 15-25x. open3d's
-    # ``create_from_point_cloud_poisson`` is 7.5 s per call at depth 9 on ``bunny``'s 35 947 points,
-    # and at ``dragon``'s 437 645 the rows ran **93 minutes without completing a single round** (GPU
-    # idle, 42 cores saturated) before being killed. The comparison itself is not lost: it lives in
+    # **The CPU Poisson rows were removed, deliberately.** open3d and pymeshlab both wrap Kazhdan's
+    # CPU solver, and between them they were the majority of the whole benchmark suite's wall clock
+    # while measuring a reference triwarp had already beaten by more than an order of magnitude:
+    # seconds per call at the default depth, and well over an hour without completing a round on the
+    # largest cloud. The comparison itself is not lost: it lives in
     # ``tests/test_reconstruction.py``, which still checks both references for agreement at a size a
     # correctness test can afford. What is left here is triwarp against meshlib, which is a
     # *different* implicit reconstructor (see the exemption above) and, unlike the two Kazhdan
-    # wrappers, cheap enough to keep -- measured in tens of milliseconds where they were seconds.
+    # wrappers, cheap enough to keep.
     skip_larger_than(
         bench_case, "bunny", "screened Poisson above bunny dominates the suite (93 min at dragon)"
     )
@@ -478,25 +439,22 @@ def test_resample_uniform(bench_case: BenchCase, cell_fraction: float) -> None:
 
     Both rows get the identical absolute cell size, derived from the mesh's own bounding-box
     diagonal on the host so neither side computes its own. The pair is a slope check: halving the
-    cell is 8x the lattice on both sides, and on ``bunny`` triwarp measures **9.9 to 13.5 ms** for
-    it -- a 1.4x rise against an 8x lattice, so the field evaluation is *not* what dominates and the
-    fixed marching and cleanup passes are. MeshLab rises 206 to 292 ms over the same step, also
-    sublinear. Read a regression here as the slope steepening rather than the absolute number
-    moving.
+    cell is 8x the lattice on both sides, and triwarp rises only slightly for it, so the field
+    evaluation is *not* what dominates and the fixed marching and cleanup passes are. MeshLab is
+    sublinear over the same step too. Read a regression here as the slope steepening rather than the
+    absolute number moving.
 
     MeshLab's ``offset`` parameter is passed as ``PureValue(0.0)``: as a ``PercentageValue`` it runs
     from full erosion at 0% to full dilation at 100%, so its own 50% default is the *zero* offset
-    and ``PercentageValue(0)`` would erode the mesh away (measured: a unit sphere down to radius
-    0.30).
+    and ``PercentageValue(0)`` would erode the mesh away.
 
     **libigl's ``offset_surface`` is the same operation at ``isolevel=0``** -- sample the signed
     distance field on a grid, march it -- and its ``signed_distance_type`` is given
     ``PSEUDONORMAL``, the mode ``tests/test_proximity.py`` establishes agrees with triwarp's default
     sign to 8e-8. Its resolution parameter ``s`` is a *cell count along the longest axis*, not a
     length, so it receives ``round(longest_extent / voxel_size)`` -- the named transform that puts
-    all three rows on the identical lattice. In-harness on ``bunny_decimated`` it reads 29.7 and
-    40.3 ms over the cell pair and on ``bunny`` 117 and 119, so it is sublinear in the lattice like
-    the other two and needs no cap of its own beyond the group's.
+    all three rows on the identical lattice. In-harness it is sublinear in the lattice like the
+    other two and needs no cap of its own beyond the group's.
     """
     diagonal = float(
         np.linalg.norm(bench_case.vertices_np.max(axis=0) - bench_case.vertices_np.min(axis=0))

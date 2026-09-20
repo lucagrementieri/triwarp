@@ -275,8 +275,8 @@ def sum(
         mask = cast(wp.array[wp.bool], array)
         if axis is None:
             # Counted straight off the mask bytes; see ``_launch_global_bool_tiled`` for why the
-            # ``int32`` widening this used to do is worth removing, and why the ``axis`` branch
-            # below keeps it.
+            # ``int32`` widening is worth avoiding here, and why the ``axis`` branch below keeps
+            # it.
             flat = mask.flatten() if mask.ndim == 2 else mask
             if int(flat.shape[0]) == 0:
                 raise ValueError("sum requires a non-empty array.")
@@ -846,10 +846,10 @@ def _reduce_bool(
 def _launch_global_bool_tiled(mask: wp.array[wp.bool], spec: _BoolReduceSpec) -> bool:
     # The mask is read as ``wp.bool`` rather than widened to ``int32`` first. ``wp.Scalar`` does
     # not instantiate for ``wp.bool`` (CLAUDE.md section 12.4), so the shared scalar factories
-    # cannot serve one and this used to run ``array.astype`` -- an allocation of ``4n`` bytes, a
-    # launch, a full read of ``n`` and a full write of ``4n``, after which the reduction read
-    # ``4n`` rather than ``n``. See ``kernels.reduce._reduce_bool_1d_tiled`` for the kernel that
-    # replaces it and why its block shape differs from the tile-load family's.
+    # cannot serve one, and the ``array.astype`` alternative is an allocation of ``4n`` bytes, a
+    # launch, a full read of ``n`` and a full write of ``4n``, after which the reduction reads
+    # ``4n`` rather than ``n``. See ``kernels.reduce._reduce_bool_1d_tiled`` for the concrete bool
+    # kernel and why its block shape differs from the tile-load family's.
     out = wp.full(1, spec.init_global, dtype=wp.int32, device=mask.device)
     n = int(mask.shape[0])
     wp.launch_tiled(

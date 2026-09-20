@@ -4,137 +4,77 @@ Benchmarks for ``triwarp.points``.
 The point cloud is a registry mesh's own vertices — deterministic, and it scales with the mesh. The
 functions here fall into two groups:
 
-* **Tiled reductions** — ``fit_line`` and ``fit_plane`` accumulate a 3x3 scatter matrix with
-  ``outer_sum_chunk`` and finish with a single-thread ``wp.svd3``. Both end in a host readback of
-  the resulting axis / normal, so the numbers include one synchronisation by construction.
+* **Tiled reductions** — ``fit_line`` and ``fit_plane`` accumulate a 3x3 scatter matrix and finish
+  with a single-thread ``wp.svd3``. Both end in a host readback, so the numbers include one
+  synchronisation by construction.
 * **Element-wise maps and sorts** — ``point_plane_distance`` and ``vector_angle`` are one
-  ``wp.map`` each (the cheapest thing in this module, so they are the most sensitive to launch
-  overhead), and ``radial_sort`` is a key kernel plus a radix sort.
+  ``wp.map`` each (the cheapest thing here, so the most sensitive to launch overhead), and
+  ``radial_sort`` is a key kernel plus a radix sort.
 
-``estimate_normals`` is timed twice, because the public function takes the neighbour table as an
-*input*:
+Where a neighbour table is an *input* of triwarp's function, the group is timed twice — the kernel
+alone on a cached table, and the table plus the kernel. Only the second is a fair cross-library
+comparison, since every reference builds its own k-d tree per call. That covers
+``estimate_normals`` / ``estimate_normals_knn`` and both outlier groups.
 
-* ``estimate_normals`` — the PCA kernel alone, on a cached ``(n, k)`` table. This is the
-  measurement to read for a change to the covariance / SVD kernel.
-* ``estimate_normals_knn`` — [`query_nearest`][triwarp.neighbors.query_nearest] plus the
-  kernel, which is the whole of what open3d's ``estimate_normals`` does (it builds a ``KDTreeFlann``
-  internally on every call), so it is the only fair cross-library comparison.
+``farthest_point_sample`` is the one to read carefully: its greedy loop is ``Theta(count)``
+*dependent* rounds, so as one launch each it is thousands of launches and essentially no kernel
+time. It runs instead as one persistent block, which wins against open3d at the small end where the
+launch-bound form loses. The count is still the axis — it is the number of rounds — but a round
+costs block time rather than a launch.
 
 References
 ----------
-**trimesh** covers everything except normal estimation: ``trimesh.points.point_plane_distance``,
-``trimesh.points.major_axis``, ``trimesh.points.plane_fit``, ``trimesh.points.radial_sort`` and
-``trimesh.geometry.vector_angle`` are the exact functions triwarp's are ports of.
+**trimesh** covers everything except normal estimation: ``point_plane_distance``, ``major_axis``,
+``plane_fit``, ``radial_sort`` and ``geometry.vector_angle`` are the functions triwarp's are ports
+of. **open3d** is the reference for ``estimate_normals`` (``KDTreeSearchParamKNN``, the same
+k-nearest PCA estimator) and for both outlier filters — those additionally *copy* the survivors
+into a new cloud where triwarp returns a mask, so those rows are upper bounds.
 
-**open3d** is the reference for ``estimate_normals``: ``PointCloud.estimate_normals`` with
-``KDTreeSearchParamKNN`` is the same k-nearest PCA estimator (its ``FastEigen3x3`` picks the
-smallest-eigenvalue eigenvector, as triwarp's ``wp.svd3`` path does).
-
-**pymeshlab** covers three: ``compute_normal_for_point_clouds(k=)`` is the same k-nearest PCA
-estimator at the same ``k`` (and it exists for exactly this case -- a dataset with no faces -- so
-its input is a *face-less* MeshSet); ``compute_matrix_by_fitting_to_plane`` is the ``fit_plane``
-counterpart, reporting the fitted normal and the average fitting error. That one has a
-precondition: it raises ``Cannot compute rotation: there is no selection`` unless something is
-selected, so ``set_selection_all`` runs first, untimed -- it is how the filter is told "fit all the
-points", not part of the fit. It also builds a rotation matrix onto a target plane, which triwarp
-does not, so its row is an upper bound. Third, ``compute_selection_point_cloud_outliers`` is the
-LoOP score behind ``outlier_probability``, at the same ``knearest``.
-
-The outlier groups are timed the same way as ``estimate_normals_knn``: the neighbour table is an
-*input* of triwarp's functions and is built inside the timed callable, because both references build
-their own k-d tree per call and there would otherwise be nothing to compare. ``open3d`` covers the
-statistical variant (``remove_statistical_outlier``) and the radius one (``remove_radius_outlier``),
-both of which additionally *copy* the surviving points into a new cloud -- triwarp returns a mask,
-so those rows are upper bounds.
-
-Three groups have no triwarp-side neighbour table to hoist, because they take the cloud directly:
-``radius_outlier_mask``, ``point_duplicate_mask`` and ``farthest_point_sample``. Medians on
-``sphere_med`` (40 962 points, RTX 5090, CUDA against open3d's one core):
-
-| group | triwarp | open3d | ratio |
-|---|---|---|---|
-| ``radius_outlier_mask`` at 2 / 4 mean edges | 0.233 / 0.361 ms | 14.6 / 19.2 ms | 63x / 53x |
-| ``point_duplicate_mask`` | 1.40 ms | 6.18 ms | 4.4x (15x on ``sphere_large``) |
-| ``farthest_point_sample`` at 64 / 1024 | 1.92 / 32.3 ms | 2.94 / 41.9 ms | 1.5x / 1.3x |
-
-The last row is the one to read carefully, and it is stale by two rewrites. Those numbers are from
-when the greedy loop was ``Theta(count)`` *launches* over the whole cloud -- ~2 000 launches of
-marshalling and essentially no kernel time at ``count = 1024``. Capturing one round and replaying it
-took the row to 21.1 / 4.32 ms (``sphere_med`` / ``sphere_small``), and the whole sweep is now **one
-persistent block** (``kernels/points.py::farthest_point_sample_block``): 9.5-10.1 / 1.11 ms, so
-``sphere_small`` at ``count = 1024`` reads 1.11 against open3d's 2.28 and wins where the
-launch-bound
-form lost 4x. The count is still the axis -- it is the number of dependent rounds -- but a round now
-costs about a microsecond of block time rather than a launch.
-
-MeshLab has nothing for ``fit_line`` / ``major_axis``, ``point_plane_distance``, ``vector_angle`` or
-``radial_sort``: those are array primitives rather than filters.
-
-**libigl** has no equivalent for anything in this module — it is a mesh library, and its
-point-cloud entry points (``igl.fit_plane`` does not exist in the Python bindings) are not exposed.
+**pymeshlab** covers three. ``compute_normal_for_point_clouds(k=)`` is the same estimator and
+exists for exactly this case, so its input is a *face-less* MeshSet.
+``compute_matrix_by_fitting_to_plane`` is the ``fit_plane`` counterpart; it raises ``Cannot compute
+rotation: there is no selection`` unless something is selected, so ``set_selection_all`` runs
+first, untimed — that is how the filter is told "fit all the points", not part of the fit. It also
+builds a rotation onto a target plane, which triwarp does not, so its row is an upper bound. Third,
+``compute_selection_point_cloud_outliers`` is the LoOP score behind ``outlier_probability``.
+MeshLab has nothing for the array primitives (``fit_line``, ``point_plane_distance``,
+``vector_angle``, ``radial_sort``). **libigl** has no point-cloud entry points at all.
 
 Caps
 ----
-Both ``estimate_normals`` groups are capped at ``bunny``. The neighbour table is what costs: at
-``k = 30`` triwarp's k-NN kernel is the dominant term (see
-[`test_neighbors.py`](test_neighbors.py), which times that kernel on its own), and open3d's serial
+Both ``estimate_normals`` groups stop at ``bunny``: the neighbour table is what costs at ``k = 30``
+(that kernel is timed on its own in [`test_neighbors.py`](test_neighbors.py)) and open3d's serial
 ``KDTreeFlann`` scales the same way.
 
-``fit_line``'s **trimesh** case is capped at ``bunny`` as well, and for a different reason:
-``trimesh.points.major_axis`` calls ``numpy.linalg.svd`` on the ``(n, 3)`` point matrix with the
-default ``full_matrices=True``, so it materializes the full ``(n, n)`` left-singular matrix — 1.39
-**TiB** for dragon's 437,645 points, which raises ``numpy._core._exceptions._ArrayMemoryError``. The
-triwarp side never forms that matrix (it accumulates a 3x3 Gram matrix and calls ``wp.svd3`` on it),
-so it runs the full registry. ``fit_plane`` needs no such cap — ``trimesh.points.plane_fit`` does
-not take the full-matrices path.
-
-Everything else in the module runs the full registry.
+``fit_line``'s **trimesh** case stops there for an unrelated reason: ``points.major_axis`` calls
+``numpy.linalg.svd`` on the ``(n, 3)`` matrix with the default ``full_matrices=True``, so it
+materializes the full ``(n, n)`` left-singular matrix and raises ``_ArrayMemoryError`` on a scan
+mesh. Triwarp accumulates a 3x3 Gram matrix instead and runs the full registry. ``plane_fit`` does
+not take that path and needs no cap.
 
 Approximate hull
 ----------------
-``convex_subset_mask`` / ``convex_subset`` / ``convex_superset_mask`` moved here with the ``convex``
-module's point-cloud half. For each of ``n_directions`` Fibonacci hemisphere directions, one thread
-per strided slice of the cloud reduces the support function and one atomic per thread combines the
-slices, then a second pass marks the extrema. Cost is ``n_points * n_directions``, so this is the
-compute-bound case in the file. ``convex_subset`` is the mask plus a ``flatnonzero`` and a gather,
-so its delta over the mask is the compaction cost. (This sweep used to be a ``TILE_1D``-wide
-``wp.tile_max`` / ``wp.tile_min`` block reduction. It is lane-free now because ``wp.launch_tiled``
-runs exactly one lane per block on Warp 1.17's CPU backend, which made every tiled formulation
-silently wrong there; the replacement also measured 1.0-2.7x *faster* on CUDA, the gap widening
-with ``n_points * n_directions``.) ``convex_superset_mask`` adds a second cost shape: after the same
-support sweep over an icosphere's directions, one pass tests every point against the
-``20 * 4 ** subdivisions`` tetrahedra spanned by the resulting shell, and there every thread reads
-the same tetrahedron's face planes at the same time, so the plane table is broadcast out of cache
-and the arithmetic dominates.
+``convex_subset_mask`` / ``convex_subset`` / ``convex_superset_mask`` are the compute-bound cases
+here: cost is ``n_points * n_directions`` for the support sweep, and ``convex_superset_mask`` adds
+a pass testing every point against the tetrahedra spanned by the resulting shell, where every
+thread reads the same plane table and the arithmetic dominates. ``convex_subset`` is the mask plus
+a ``flatnonzero`` and a gather, so its delta over the mask is the compaction cost.
 
-**The baselines compute a different (and stronger) result**, and that is the point of the comparison
-rather than a flaw in it. ``trimesh.Trimesh.convex_hull`` and
-``open3d.geometry.TriangleMesh.compute_convex_hull`` both run **qhull**, producing the exact hull as
-a *mesh* -- full connectivity, exact vertex set. ``convex_subset`` produces only an approximate
-*vertex subset* (a support sweep over finitely many directions, which misses hull vertices whose
-normal cone no sampled direction enters). So this is not a parity comparison: it is the
-quantification of what the approximation buys, which is the reason the function exists.
-``convex_subset_mask``'s own docstring documents the accuracy side of that trade -- including the
-measured recall per ``n_directions`` and the normal-cone sizes that explain it; this is the cost
-side. The argument is about the *operation*, so ``convex_subset`` and ``convex_subset_mask`` take
-the same three qhull rows.
+**The baselines compute a different and stronger result**, which is the point of the comparison
+rather than a flaw in it. trimesh, open3d and pymeshlab all run **qhull**, producing the exact hull
+as a mesh; ``convex_subset`` produces an approximate vertex *subset*. So this is not parity — it
+quantifies what the approximation buys, which is why the function exists. Three qhull rows rather
+than one because the argument is about the operation, and because a second and third wrapper around
+the same computation is the only way to tell whether trimesh's number is qhull or trimesh.
 
-**scipy** is registered for ``convex_superset_mask`` only, and there it is a genuine parity row
-rather than a bar. That filter exists to run *before* an exact hull, so ``scipy.spatial.ConvexHull``
-on the same cloud is exactly the cost it has to be cheap against, and its output provably contains
-that hull's vertex set (asserted in ``tests/test_points.py``). The ratio is the number that decides
-whether the prefilter is worth running: on ``dragon`` it measured 2.4 ms at ``subdivisions=1`` and
-7.6 ms at 3, against 145 ms for the hull itself -- 60x and 19x -- and the gap widens with the point
-count, because the filter is linear where qhull is not. For the two approximate-hull groups scipy
-would only be a third timing of the qhull already covered by trimesh and Open3D, so it stays out of
-those. **pymeshlab**'s ``generate_convex_hull`` is qhull a third time, so it adds no new algorithm
--- what it adds is a *second* wrapper cost around the same computation, which is the only way to
-tell whether trimesh's number is qhull or trimesh. **libigl** has no convex-hull binding in the
-Python package, so igl is absent from all three.
+**scipy** is registered for ``convex_superset_mask`` alone, and there it is a genuine parity row:
+that filter exists to run *before* an exact hull, so ``scipy.spatial.ConvexHull`` on the same cloud
+is exactly the cost it must be cheap against, and its output provably contains that hull's vertex
+set. The ratio is what decides whether the prefilter is worth running, and it widens with the point
+count because the filter is linear where qhull is not. **libigl** has no hull binding.
 
-The hull cases take the mesh's own vertices as the point cloud, so they scale with the registry mesh
-sizes. ``n_directions`` and ``subdivisions`` are each swept over two values spanning their useful
-range; both costs are close to linear in the direction count, so two points fix the line.
+``n_directions`` and ``subdivisions`` are each swept over two values spanning their useful range;
+both costs are close to linear in the direction count, so two points fix the line.
 """
 
 from __future__ import annotations
@@ -164,9 +104,9 @@ _KNN = 30
 _KNN_SWEEP = [8, 64]
 
 # The trimesh references here are single-threaded host passes and one of them is far worse than
-# single-threaded: ``tm.points.fit_line`` measured **22 s a call** on ``bunny``'s 35 947 points
-# against 8 s for the whole 11-round case on ``bunny_decimated``'s 8 171. That one reference was 91%
-# of this module's wall clock, so every host branch is capped at the smallest scan mesh -- the ratio
+# single-threaded: ``tm.points.fit_line`` takes tens of seconds a call on a scan mesh, and that one
+# reference was most of this module's wall clock. So every host branch is capped at the smallest
+# scan mesh -- the ratio
 # against triwarp is four orders of magnitude and needs no larger input to establish.
 _HOST_CAP_REASON = "host reference is a single-threaded pass; capped at bunny_decimated"
 
@@ -235,14 +175,13 @@ def test_point_plane_distance(bench_case: BenchCase) -> None:
     Signed point-to-plane distance of every point: a single ``wp.map`` over the cloud.
 
     The thinnest kernel in the module, so it is the module's floor row: below roughly ``10 ** 3``
-    points it reports the ~340 µs wrapper floor rather than the map (see
-    ``test_creation::test_box``), and being a ~50 µs GPU row it also has the widest run-to-run
-    spread in the suite -- measured at 46x on unchanged code across two processes. Only read it as
-    part of its axis.
+    points it reports the wrapper floor rather than the map (see ``test_creation::test_box``), and
+    being a tens-of-microseconds GPU row it also has the widest run-to-run spread in the suite --
+    more than an order of magnitude on unchanged code across two processes. Only read it as part of
+    its axis.
 
     pyvista's ``compute_implicit_distance`` evaluates VTK's plane implicit function over the cloud,
-    which is the same signed dot product -- measured 1.27e-07 from the exact float64 answer
-    against triwarp's 2.11e-07, i.e. both at their own storage precision
+    which is the same signed dot product -- both sides land at their own storage precision
     (``tests/test_points.py``). It needs
     a ``pv.Plane`` **large enough to span the cloud**: the implicit function is unbounded but the
     plane object carries an extent, and it is also the reason this row builds the plane outside the
@@ -366,11 +305,10 @@ def test_half_space_mask(bench_case: BenchCase) -> None:
     point on the plane, and the packed bitset is a 64x narrower write than a ``wp.bool`` array --
     both worth knowing before reading the ratio.
 
-    First measurement: at ``bunny_decimated`` meshlib is **23.8 us** against triwarp-cuda's
-    **69.7 us**, i.e. the GPU row is 2.9x *behind* -- which is this module's wrapper floor rather
-    than the map, exactly as ``point_plane_distance`` warns. At ``dragon`` triwarp-cuda is 66 us for
-    a cloud 60x larger, so the floor is the whole story below ~10^5 points and the axis is the only
-    honest way to read either row.
+    On a small cloud the GPU row is several times *behind* meshlib -- which is this module's wrapper
+    floor rather than the map, exactly as ``point_plane_distance`` warns. On a cloud two orders of
+    magnitude larger triwarp costs the same, so the floor is the whole story below about 10^5 points
+    and the axis is the only honest way to read either row.
 
     pyvista reaches the mask through the same ``compute_implicit_distance`` the
     ``point_plane_distance`` row times, plus one host threshold -- so read the two pyvista rows as
@@ -592,7 +530,7 @@ def test_estimate_normals_knn(bench_case: BenchCase) -> None:
     meshlib's ``makeUnorientedNormals`` searches by **radius** where the other three take a
     neighbour count, so its row is given the radius that holds ``_KNN`` points at this cloud's
     density (2 mean spacings) rather than a count; the two see the same neighbourhood only where the
-    cloud is uniform, which is what the agreement in ``tests/test_points.py`` is measured on. It is
+    cloud is uniform, which is what the agreement in ``tests/test_points.py`` is checked on. It is
     also the only row here that returns a *new* array rather than writing into the cloud, so nothing
     is mutated and one cloud serves every round.
 
@@ -748,11 +686,10 @@ def test_point_duplicate_mask(bench_case: BenchCase) -> None:
     the tree is dropped per round the way the ``nearest_neighbor_distance`` row drops it, rather
     than being reused across rounds and pricing the query alone.
 
-    First measurement, medians on an RTX 5090: at ``sphere_large`` triwarp-cuda **2.57 ms** against
-    meshlib's **7.43** and open3d's **30.0**, but at ``sphere_small`` triwarp is **1.47 ms** where
-    both references are under 0.33 -- the two hash builds and two sorts have a fixed cost the
-    reference searches do not, so this group's ratio *inverts* below a few thousand points. That is
-    the shape to watch here rather than the large-cloud number.
+    At the large end triwarp leads both references by several times, but at the small end it is
+    several times behind them -- the two hash builds and two sorts have a fixed cost the reference
+    searches do not, so this group's ratio *inverts* below a few thousand points. That is the shape
+    to watch here rather than the large-cloud number.
     """
     if bench_case.kind == "meshlib":
         cloud_ml = _cloud_ml(bench_case)  # held in a name: MeshLib's trees point into it
@@ -799,9 +736,8 @@ def test_farthest_point_sample(bench_case: BenchCase, count: int) -> None:
 
     **pytorch3d**'s ``sample_farthest_points`` runs the identical greedy loop with CUDA kernels of
     its own, so it is the one row here that is not a serial C++ baseline -- and the ratio is the
-    narrowest and the flattest of its four: measured 14.35 against triwarp's 5.43 ms at 20 000
-    points and 104.93 against 35.99 at 200 000, i.e. **2.64x and 2.92x**, where its brute-force
-    k-NN swings from 0.70x to 85x over the same range because it has no structure to build.
+    narrowest and the flattest of its four, holding at roughly 3x across the point-count axis where
+    its brute-force k-NN swings by two orders of magnitude because it has no structure to build.
     ``random_start_point=False`` pins its start to index 0, which is triwarp's default, and it
     returns both the points and the indices where triwarp returns indices alone.
     """

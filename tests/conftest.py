@@ -3,24 +3,16 @@ from __future__ import annotations
 import os
 
 # Cap the reference libraries' thread pools **before** NumPy is imported, because OpenBLAS reads
-# these at library load and never again. The default is one thread per core, and on this box's 48
-# that is not a mild pessimisation -- it is a cliff. Measured on an otherwise idle machine, median
-# of five, against the same call at 8 threads:
-#
-#   call                      default (48)   8 threads   1 thread
-#   np.linalg.solve, n=256      385.26 ms      0.64 ms     0.63 ms
-#   np.linalg.solve, n=513      878.02 ms      1.81 ms     2.92 ms
-#   np.linalg.eigvalsh, 1284^2  2897.9 ms     59.70 ms   151.30 ms
-#
-# So 8 is 485-600x faster than the default on the dense solves this suite's linear-algebra
-# references are built from, and 49x on the eigendecomposition behind
-# ``test_connection_laplacian_is_symmetric_psd_and_a_rotation_per_block``. It is not a contention
-# artifact: the numbers above were taken with the machine idle. Eight rather than one because the
-# eigendecomposition genuinely parallelises (59.7 ms against 151.3 ms) while the solves do not care.
+# these at library load and never again. One thread per core is not a mild pessimisation on a
+# many-core box -- it is a cliff: a small dense ``np.linalg.solve`` runs two to three orders of
+# magnitude slower at one thread per core than at eight, and the eigendecomposition behind
+# ``test_connection_laplacian_is_symmetric_psd_and_a_rotation_per_block`` an order of magnitude.
+# Not a contention artifact -- the same holds on an idle machine. Eight rather than one because the
+# eigendecomposition genuinely parallelises where the solves do not care.
 #
 # This cap does **not** reach a library that sets its own count. MeshLab's screened-Poisson filter
 # takes a ``threads`` parameter defaulting to ``hardware_concurrency`` and overrides the
-# environment (measured: unchanged at >115 s under ``OMP_NUM_THREADS=2``), which is why
+# environment, which is why
 # ``tests/test_reconstruction.py`` pins that one at its call site instead. ``meshlib`` is
 # deliberately left alone by name -- it is the suite's one legitimately multi-threaded reference --
 # but it uses its own pool rather than OpenMP, so these variables do not touch it either.
@@ -82,17 +74,17 @@ def pytest_configure(config: pytest.Config) -> None:
         "every benchmarked pair. Pass benchmarked=False with a written reason= where the pair is "
         "compared here but deliberately not timed.",
     )
-    # The cut is at 15 s, measured, and it is four tests. On a full CPU-only run of tests/ (432.6 s
-    # total) the whole ``screened_poisson`` family is 342.0 s -- 79 % -- and these four alone are
-    # 277.6 s (64 %). Each is one ~90 s depth-6 Poisson solve that costs under a second on CUDA, so
-    # skipping the ``cpu`` half of them leaves ~155 s of CPU work and loses no claim: the answers
-    # are device-independent, ``test_poisson_cpu_matches_cuda`` pins the two devices to each other
-    # at depth 4, and eleven more Poisson tests still run on CPU at depth 5 (``_poisson_depth``).
+    # The cut is at 15 s, measured, and it is four tests. On a full CPU-only run the whole
+    # ``screened_poisson`` family is ~80 % of the wall clock and these four alone are ~two thirds of
+    # it. Each is one depth-6 Poisson solve that costs under a second on CUDA, so skipping their
+    # ``cpu`` half cuts the CPU run by more than half and loses no claim: the answers are
+    # device-independent, ``test_poisson_cpu_matches_cuda`` pins the two devices to each other at
+    # depth 4, and eleven more Poisson tests still run on CPU at depth 5 (``_poisson_depth``).
     #
-    # Read the seconds in the marker as an order of magnitude, not a contract. The same four
-    # measured 259 s inside the full suite and 380 s as their own ``-k`` selection in one session --
-    # 1.47x apart, with the ranking inverted -- so this box's CPU timings swing far too much for a
-    # threshold to be re-derived by rerunning. What is stable is the shape: one depth-6 solve each.
+    # Read the seconds in the marker as an order of magnitude, not a contract: the same four swing
+    # widely between a full-suite run and their own ``-k`` selection, with the ranking inverted, so
+    # a threshold cannot be re-derived by rerunning. What is stable is the shape: one depth-6
+    # solve each.
     config.addinivalue_line(
         "markers",
         "slow_cpu(seconds): this test costs the stated measured seconds on the CPU device, so its "
@@ -110,20 +102,12 @@ def _selected_devices(config: pytest.Config) -> list[str]:
     having -- it is what caught the ``warp.fem`` device leak in ``_screened_poisson_adaptive`` and
     the module-scope ``wp.array`` in ``test_grouping`` -- but it must not be bought *inside one
     process*, because **CPU work is ~36x slower once CUDA has been initialised**. Measured on one
-    ``heat_signed_distance`` call, same mesh, same code, only ``CUDA_VISIBLE_DEVICES`` differing:
-
-    ===============  =============  ==================
-    launch mode      CUDA visible   ``CUDA_VISIBLE_DEVICES=""``
-    ===============  =============  ==================
-    ``STRICT``       50.57 s        **1.40 s**
-    ``RELAXED``      50.34 s        **1.40 s**
-    ``CHECKED``      49.77 s        --
-    ===============  =============  ==================
-
-    So it is CUDA *presence*, not section 8's launch-access guard, and the guard is free to stay
-    ``STRICT``. In-process ``--device=both`` measured 717 s for the whole suite where the two
-    passes run separately cost ~37.6 s + ~155 s; ``uv run python -m tests.devices`` is the runner
-    that spawns them, and the CPU one sets ``CUDA_VISIBLE_DEVICES=""`` for exactly this reason.
+    ``heat_signed_distance`` call, same mesh, same code, only ``CUDA_VISIBLE_DEVICES`` differing,
+    and unchanged across all three ``launch_array_access_mode`` settings: so it is CUDA *presence*,
+    not section 8's launch-access guard, and the guard is free to stay ``STRICT``. Whole-suite
+    consequence is roughly 4x, in-process ``--device=both`` against the two passes run separately;
+    ``uv run python -m tests.devices`` is the runner that spawns them, and the CPU one sets
+    ``CUDA_VISIBLE_DEVICES=""`` for exactly this reason.
 
     ``both`` stays meaningful and is not the slow trap it sounds like: it means "every device this
     process can see, and skip nothing". In a CUDA-hidden process that is precisely "all of CPU,
@@ -262,9 +246,8 @@ def icosphere(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     it itself, and several of the callers this replaced depend on the sphere being centred.
 
     Function-scoped like every fixture here, so mutating ``mesh_tm.vertices`` in a test is safe.
-    Session scoping was re-measured and declined: this fixture costs **1.15 ms** (0.97 ms of
-    trimesh build plus 0.18 ms of ``wp.Mesh``), so all of the suite's fixture construction is
-    ~3 s of a 67 s run.
+    Session scoping is declined: the fixture is a trimesh build plus a ``wp.Mesh``, so all of the
+    suite's fixture construction is a few percent of a run.
 
     **The 41 remaining inline ``tm.creation.icosphere`` sites are not migration debt**, which was
     checked rather than assumed: a classifier over all of them found **0** a fixture could take
@@ -289,7 +272,7 @@ def icosphere_coarse(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     Build the same sphere at ``subdivisions=2``: 162 vertices, 320 faces.
 
     A quarter the faces of ``icosphere`` and still genuinely curved. Prefer it wherever the test's
-    claim does not need the resolution -- a reference call that costs 100 ms on 1 280 faces is the
+    claim does not need the resolution: a serial reference call over the larger sphere is the
     difference between a fast suite and a slow one, and most of these comparisons are about
     correctness rather than about mesh size.
     """

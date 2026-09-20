@@ -23,8 +23,8 @@ unusable as an oracle -- sorting dissolves it, and
 ``tests/test_edges.py::test_edges_unique_matches_potpourri3d`` asserts the two edge sets are equal.
 It has no counterpart for the directed, per-corner or length variants.
 
-**libigl does have a length variant**, which this paragraph used to omit while making the claim
-above about potpourri3d: ``igl.edge_lengths(V, F)`` is the same ``(n_faces, 3)`` per-corner table
+**libigl does have a length variant**: ``igl.edge_lengths(V, F)`` is the same ``(n_faces, 3)``
+per-corner table
 ``face_edge_lengths`` returns, in the same column order, so that group is a direct comparison rather
 than an unreferenced one. (``igl.squared_edge_lengths`` is bound as well and would pair with a
 squared entry point; triwarp has none, so there is no row for it.) igl still has no *unique*-edge
@@ -109,8 +109,8 @@ def _run_edges_pytorch3d(bench_case, *, inverse: bool = False) -> None:
     Not an optimization to hoist: both are **memoized accessors on an immutable container**, so a
     shared ``Meshes`` would have rounds 2..n read a cached tensor and the row would report ~0. That
     makes it the only reference here whose row carries a container construction; the build is one
-    ``torch.as_tensor`` pair over arrays already in the right dtype, measured 0.287 ms on a
-    40 962-vertex mesh against a 3.7 ms normals derivation, so it is a small share of a grouping
+    ``torch.as_tensor`` pair over arrays already in the right dtype, an order of magnitude under
+    the normals derivation beside it, so it is a small share of a grouping
     pass rather than the row.
     """
     import pytorch3d.structures as p3d_structures
@@ -419,10 +419,9 @@ def test_face_edge_lengths(bench_case: BenchCase) -> None:
     The table alone: one pass, three lengths per face, no reduction.
 
     ``igl.edge_lengths(V, F)`` returns the identical ``(n_faces, 3)`` per-corner table in the same
-    column order -- measured agreeing to 3.7e-08 (triwarp's float32 vertex buffer) on icosphere(2),
-    where every column permutation differs by 0.045, so the match is the convention and not a
-    coincidence. The one row in this module where igl has a *length* entry point; the module
-    docstring used to say no reference did.
+    column order, agreeing to triwarp's float32 vertex buffer where every column permutation differs
+    by orders of magnitude more, so the match is the convention and not a coincidence. This is the
+    one row in this module where igl has a *length* entry point.
     """
     if bench_case.kind == "igl":
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np

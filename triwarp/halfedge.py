@@ -87,8 +87,8 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
     # Edge rows are built from face indices, so they are non-negative and below the vertex count by
     # construction: the range check would only add a readback. And ``n_vertices`` is the packing
     # radix and nothing else -- no buffer here is sized by it -- so when the caller does not supply
-    # one the pair radix serves instead of inferring the tight bound, which is a device reduction
-    # plus a host readback measured at 61.5 us against a 291.2 us call.
+    # one the pair radix serves instead of inferring the tight bound, which would be a device
+    # reduction plus a host readback for a fifth of this call.
     edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
     sorted_keys, order = tw.array.sort_and_argsort(keys)
@@ -122,36 +122,35 @@ def require_matching_twins(faces: wp.array[wp.int32], twins: wp.array[wp.int32] 
     """
     Raise unless a precomputed twin table really is one for ``faces``.
 
-    The contract behind every ``twins=`` keyword in the package, checked in both of its halves.
-    The table is indexed *by halfedge* (``h = 3 * f + k``), so it is meaningful only for the face
-    buffer it was built from: a table cached from a smaller mesh is not merely stale -- it is
-    short, and the kernels that walk it index past its end, which on the CPU device reads the host
-    heap rather than raising. And each entry must be the *opposite* halfedge, since that is what
-    every consumer reads it as -- the counter-clockwise rotation
+    The contract behind every ``twins=`` keyword in the package, checked in both of its halves. The
+    table is indexed *by halfedge* (``h = 3 * f + k``), so it is meaningful only for the face buffer
+    it was built from: a table cached from a smaller mesh is not merely stale -- it is short, and
+    the kernels that walk it index past its end, which on the CPU device reads the host heap rather
+    than raising. And each entry must be the *opposite* halfedge, since that is what every consumer
+    reads it as -- the counter-clockwise rotation
     [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] walks, the transport angle
     [`triwarp.tangent_space`][triwarp.tangent_space] pairs across an edge, and the dual edge
     [`triwarp.selection`][triwarp.selection] floods through. Public because those callers live in
-    three modules and must all reject the same table the same way; only the first of the three
-    reaches the rotation, so a check placed in that walk would leave the other two unguarded.
+    three modules and must all reject the same table the same way; only the first reaches the
+    rotation, so a check placed in that walk would leave the other two unguarded.
 
     What it checks is every entry that *is* present; what it cannot check is an entry that is
     absent. A ``-1`` claims "this halfedge has no twin", and deciding whether that is true means
     finding out whether another halfedge spans the same edge -- which is the sort
-    [`halfedge_twins`][triwarp.halfedge.halfedge_twins] does and the work ``twins=`` exists to
-    skip, so demanding it here would make the keyword pointless. A table of nothing but ``-1``
-    therefore passes; it is not silent, because a fabricated boundary shortens the fan and
+    [`halfedge_twins`][triwarp.halfedge.halfedge_twins] does and the work ``twins=`` exists to skip,
+    so demanding it here would make the keyword pointless. A table of nothing but ``-1`` therefore
+    passes; it is not silent, because a fabricated boundary shortens the fan and
     [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] then raises on the ring it could not
     complete.
 
     The length half is free. The structural half costs one launch over the halfedges and one
-    readback, and is only ever paid when a table was actually supplied -- again, the path a caller
-    takes to skip an edge build, a hash, a radix sort, a launch and a readback, so verifying the
-    shortcut stays a fraction of what taking it saved. A table this package produced can never
-    fail it, since ``halfedge_twins`` establishes the property by construction.
+    readback, and is only ever paid when a table was actually supplied -- the path a caller takes to
+    skip an edge build, a hash, a radix sort, a launch and a readback, so verifying the shortcut
+    stays a fraction of what taking it saved. A table this package produced can never fail it, since
+    ``halfedge_twins`` establishes the property by construction.
 
-    The device half of the same contract is the caller's own
-    ``require_same_device`` call, which covers every argument it received rather than this pair
-    alone.
+    The device half of the same contract is the caller's own ``require_same_device`` call, which
+    covers every argument it received rather than this pair alone.
 
     Parameters
     ----------

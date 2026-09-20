@@ -162,11 +162,11 @@ def test_cut_along_edges(bench_case: BenchCase, cut_fraction: float) -> None:
     vertices against 32 on a cut cube; see ``tests/test_seams.py``), which is what makes the third
     row worth having.
 
-    **The two sides slope in opposite directions across the fraction**, and that is the finding this
-    row adds: measured on ``sphere_large``, triwarp goes 2.90 -> 2.12 ms from ``0.25`` to ``1.0``
-    (faster when everything is cut, because the components pass has nothing left to contract) while
-    igl goes 34.4 -> 61.9 (slower, because its per-corner walk pays for each new vertex it emits).
-    So the contraction really is triwarp's cost here, and it is not a cost igl has.
+    **The two sides slope in opposite directions across the fraction**, and that is the finding
+    this row adds: triwarp gets *faster* from ``0.25`` to ``1.0`` (the components pass has nothing
+    left to contract when everything is cut) while igl gets slower (its per-corner walk pays for
+    each new vertex it emits). So the contraction really is triwarp's cost here, and it is not a
+    cost igl has.
     """
     if bench_case.kind == "igl":
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np

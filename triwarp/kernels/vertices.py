@@ -14,20 +14,19 @@ def max_corner_inverse_edge_length_sq(
     **The zero test is against zero and not against a tolerance**, for the same reason
     [`face_normals_and_area`][triwarp.kernels.triangles.face_normals_and_area] states at length:
     this denominator scales as ``h^4``, so an absolute floor of ``TOLERANCE_ZERO_CONSTANT``
-    (1e-12, which this used to carry) rejects *every* corner of a mesh whose edges are shorter
-    than ``1e-3`` and hands back a weight of zero for all of them. Measured before the change:
-    ``vertex_normals(weighting="mwselr")`` returned 162 zero rows of 162 on an ``icosphere(2)``
-    scaled to edge length 2.8e-04, while ``"area"`` and ``"angle"`` returned correct unit normals
-    from the same buffers -- and the zero-row contract those callers document covers an
+    (which this used to carry) rejects *every* corner of a small enough mesh and hands back a
+    weight of zero for all of them -- so ``vertex_normals(weighting="mwselr")`` returned an
+    all-zero table on a cleanly scaled sphere while ``"area"`` and ``"angle"`` returned correct
+    unit normals from the same buffers, and the zero-row contract those callers document covers an
     unreferenced vertex or a cancelling fan, not a clean sphere. ``1 / denom`` is well conditioned
     for any positive ``denom``, so the tolerance was never protecting the division; at
     ``denom == 0`` the corner is exactly degenerate and both branches want zero.
 
     The remaining range is ``float32``'s, not this test's, and the single test covers both ends:
-    ``denom`` underflows to zero below an edge of ~1e-10, which this branch reads as degenerate,
-    and overflows to infinity above ~1e+09, where ``1 / inf`` is the same zero the other branch
-    returns. Position storage is ``float32``, so the small end sits below the scale at which the
-    corner coordinates carry any digits at all.
+    ``denom`` underflows to zero below a very short edge, which this branch reads as degenerate,
+    and overflows to infinity above a very long one, where ``1 / inf`` is the same zero the other
+    branch returns. Position storage is ``float32``, so the small end sits below the scale at which
+    the corner coordinates carry any digits at all.
     """
     e1 = vertices[i1] - vertices[i0]
     e2 = vertices[i2] - vertices[i0]

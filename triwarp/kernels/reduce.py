@@ -122,11 +122,11 @@ def _reduce_1d_tiled(tile_reduce, atomic, scalar, name, dtype):
     keeps the kernel generic over ``wp.Scalar`` without the wrapper having to pass a per-dtype
     identity value in. Every subsequent chunk folds in with ``scalar``.
 
-    ``dtype`` widens the template past ``wp.Scalar`` — ``wp.vec3`` is the one in use, for the vec3
+    ``dtype`` widens the template past ``wp.Scalar`` -- ``wp.vec3`` is the one in use, for the vec3
     sum, whose ``wp.add`` fold and ``wp.atomic_add`` commit work component-wise. It is a *codegen*
     parameter, so each instantiation is a concrete kernel: annotating ``wp.array[Any]`` and letting
-    one kernel serve both dtypes also works, but measured ~18 us per launch of host-side overload
-    resolution (0.59x at 10 000 elements, 0.94x at 10M), so the generic form is declined here.
+    one kernel serve both dtypes also works and is declined, because a generic kernel pays Warp's
+    host-side overload resolution on every launch.
     """
 
     def _k(values: wp.array[wp.Scalar], out_result: wp.array[wp.Scalar]) -> None:
@@ -281,8 +281,7 @@ def _reduce_2d_tiled(tile_reduce, atomic, scalar, name, dtype):
 # compile one of them into a strided walk regardless. Each instantiation is therefore exactly the
 # specialised kernel it was hand-written as -- one source of truth, two compiled kernels. Verified
 # as such: against the four hand-written rows/cols kernels this replaced, output arrays are equal
-# element-for-element and the timings are flat (0.99-1.01x on an RTX 5090 over a (20k, 512) table
-# and a (4M, 3) one, both axes, tiled and serial).
+# element-for-element and the timings are flat on both axes, tiled and serial.
 
 
 @wp.func
@@ -341,12 +340,12 @@ def _reduce_2d_axis_tiled(tile_reduce, atomic, scalar, name, rows, dtype):
 
 
 # When the reduced extent is narrower than ``TILE_1D`` the tiled kernels above never take their
-# ``tile_load`` branch — all ``TILE_1D`` lanes of every block redundantly run the serial remainder
-# loop, a ``TILE_1D``-fold read amplification (measured 6.6 ms -> 0.13 ms for ``max(axis=1)`` on a
-# ``(14M, 3)`` table, 49x). These serial variants launch one plain thread per *output* element and
-# write directly: no tiles, no atomics, and no init fill needed on the output buffer. The wrapper
-# picks them whenever ``reduced extent < TILE_1D``; past that the tiled kernels stay (a tall
-# ``(n, 3)`` table reduced along axis=0 has only 3 outputs — 3 serial threads would be 89x slower).
+# ``tile_load`` branch -- all ``TILE_1D`` lanes of every block redundantly run the serial remainder
+# loop, a ``TILE_1D``-fold read amplification and a large measured loss. These serial variants
+# launch one plain thread per *output* element and write directly: no tiles, no atomics, and no
+# init fill needed on the output buffer. The wrapper picks them whenever ``reduced extent <
+# TILE_1D``; past that the tiled kernels stay, since a tall ``(n, 3)`` table reduced along axis=0
+# has only 3 outputs and 3 serial threads would be far slower.
 
 
 def _reduce_2d_axis_serial(scalar, name, rows, dtype):
@@ -398,11 +397,9 @@ _AXIS_DTYPES = (wp.int32, wp.float32, wp.float64)
 # One concrete kernel per dtype, and the tables are what the wrapper launches. The factories have
 # always been able to bake the dtype in -- ``sum_vec3_1d_tiled`` and the weighted sums below always
 # did -- and leaving the rest at the ``wp.Scalar`` template made every launch pay Warp's host-side
-# ``infer_argument_types`` over the whole argument list. Measured on Warp 1.17 / RTX 5090, 100
-# launches between two synchronization points: ``sum1d_tiled`` at 25.2-25.8 us generic against
-# 13.6-14.5 concrete -- **1.77-1.88x, ~12 us a launch** -- and every scalar-returning reduction in
-# the package issues one. Nothing extra is compiled: these are the same instantiations
-# ``_register_overloads`` was already creating for the same dtype sets.
+# ``infer_argument_types`` over the whole argument list, which roughly doubles a small reduction's
+# host cost and every scalar-returning reduction in the package issues one. Nothing extra is
+# compiled: these are the same instantiations ``_register_overloads`` was already creating.
 MIN1D_TILED = KernelTable(
     "min1d_tiled",
     {
@@ -640,8 +637,7 @@ def _minmax_1d_tiled(name, dtype):
 
     A factory for the reason in [`_reduce_1d_tiled`][triwarp.kernels.reduce._reduce_1d_tiled]: a
     ``wp.Scalar`` template would make every launch pay Warp's host-side overload resolution,
-    measured on Warp 1.17 at 25.2-25.8 us against 13.6-14.5 for the concrete kernel
-    (**1.77-1.88x, ~12 us a launch**).
+    roughly doubling the host cost of a call this small.
     """
 
     def _k(values: wp.array[wp.Scalar], out_minmax: wp.array[wp.Scalar]) -> None:
@@ -858,15 +854,13 @@ MINMAX_2D_COLS_SERIAL = KernelTable(
 # reductions, so the file has one way of generating a 1-D reduction.
 #
 # Folding ``TILES_PER_BLOCK_1D`` tiles per block is what these three gained by
-# moving onto the template. Measured against one tile per block, on an RTX 5090:
-# weighted ``float32`` 1.25x at 1M elements and 3.34x at 10M, weighted ``vec3``
-# 1.95x and 4.14x, the unweighted ``vec3`` sum 2.08x and 5.43x. Below ~200k the
-# fold has too few blocks to fill *that* device and costs ~10 us (0.66-0.81x at
-# 10k) -- the trade the scalar reductions have made unconditionally since they
-# were written. On CPU there is no such crossover: one lane per block means the
-# fold is strictly fewer blocks for the same work, and it wins 1.27-1.55x
-# (weighted ``float32``), 1.67-2.06x (weighted ``vec3``) and 1.50-1.96x (the
-# ``vec3`` sum) at every size from 10k to 10M.
+# moving onto the template: several-fold at a million elements and more above
+# that, because it is the block count reaching the accumulator that is the
+# contended quantity. Below a few hundred thousand the fold has too few blocks to
+# fill the device and costs a few microseconds -- the trade the scalar reductions
+# have made unconditionally since they were written. On CPU there is no such
+# crossover: one lane per block means the fold is strictly fewer blocks for the
+# same work, and it wins at every size.
 # ---------------------------------------------------------------------------
 
 sum_vec3_1d_tiled = _reduce_1d_tiled(
@@ -909,17 +903,14 @@ def outer_sum_chunk(
 # ``registration.accumulate_procrustes_moments`` (25), ``accumulate_point_to_plane`` (43),
 # ``homology.count_reached_and_referenced`` (2) and ``homology.dual_candidate_mask`` (1).
 #
-# Still left unmerged, and the two accumulators added since this note first said "revisit if a
-# fourth appears" are why rather than why not. Each loop is over a different fixed component count
-# with no common shape cheap to generalize over -- Warp has no variadic tile reduction, so a shared
-# helper would have to take an arbitrary tuple of scalar/vector/matrix quantities -- and the
-# *bodies* turn out to differ in more than the count: ``moment_integrals`` needed its chunk width
-# as a launch argument because its per-element arithmetic is heavy enough to have a real occupancy
-# crossover, and ``homology.dual_candidate_mask`` takes ``TILE_1D`` rather than
-# ``ITEMS_PER_BLOCK_1D`` because it *also* writes one mask entry per element, so the wide fold
-# would throw its per-element dimension away (measured 137 blocks against 2 188 at 140 000 edges).
-# The rest are cheap enough to take ``ITEMS_PER_BLOCK_1D`` unexamined.
-# A helper general over both would be more speculative machinery than five call sites justify
+# Deliberately unmerged. Each loop is over a different fixed component count with no common shape
+# cheap to generalize over -- Warp has no variadic tile reduction, so a shared helper would have to
+# take an arbitrary tuple of scalar/vector/matrix quantities -- and the *bodies* differ in more than
+# the count: ``moment_integrals`` needs its chunk width as a launch argument because its
+# per-element arithmetic is heavy enough to have a real occupancy crossover, and
+# ``homology.dual_candidate_mask`` takes ``TILE_1D`` rather than ``ITEMS_PER_BLOCK_1D`` because it
+# *also* writes one mask entry per element, so the wide fold would throw its per-element dimension
+# away. A helper general over both would be more speculative machinery than the call sites justify
 # (CLAUDE.md section 4.2). What *is* shared is already factored: ``tile_chunk`` and the clamp rule
 # it documents, which is the part that goes wrong.
 
@@ -930,7 +921,7 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
     #
     # ``out_corners`` is ``[min_x, min_y, min_z, -max_x, -max_y, -max_z]``, *negating* the upper
     # half so a single ``wp.full(6, inf)`` initializes both and every update is an
-    # ``atomic_min``. The alternative — separate min and max buffers — needs two allocations, two
+    # ``atomic_min``. The alternative -- separate min and max buffers -- needs two allocations, two
     # fills and two readbacks, and at this size the reduction is entirely host-latency-bound.
     #
     # One thread per ``TILE_1D`` points, so the atomics see a few hundred contenders per address
@@ -957,60 +948,37 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
 # ---------------------------------------------------------------------------
 # Concrete overloads, registered at import.
 #
-# Every kernel above annotated ``wp.Scalar`` is *generic*, and Warp instantiates
-# an overload lazily -- on the first launch at each new dtype. A module's hash
-# covers the set of instantiated overloads, so that first launch changes the hash
-# and recompiles **every** kernel in this file. Measured on an RTX 5090, Warp
-# 1.16: 14.2 s per fork, 10.4 s of it nvcc, and reducing ``int32`` axis=0, then
-# ``int32`` axis=1, then ``float32`` axis=0 paid it three times over -- 40+
-# kernels rebuilt to gain one. Worse, the chain is *order-dependent*: a caller
-# reaching the dtypes in a different order walks links that were never compiled,
-# so the cost came back on every change of test selection (``tests/test_reduce.py``
-# alone: 1 561 s on a fresh selection against 1.30 s repeating it).
+# Every kernel above annotated ``wp.Scalar`` would be *generic*, and Warp instantiates an overload
+# lazily, on the first launch at each new dtype — which changes the module hash and recompiles
+# every kernel in this file. Registering every (kernel, dtype) pair the wrapper's dispatch can
+# reach gives the module one hash for its whole lifetime. Registration is not compilation, so it
+# costs milliseconds of import and nothing on a process that never reduces anything (CLAUDE.md
+# section 2.5).
 #
-# Registering every (kernel, dtype) pair the wrapper's dispatch can reach gives
-# the module one hash for its whole lifetime: one compile ever, then one cached
-# load per process. Registration is not compilation -- ``wp.overload`` builds the
-# overload's ``Adjoint`` and nothing else -- so this costs milliseconds of import
-# and nothing at all on a process that never reduces anything. Measured over the
-# whole suite: 66 distinct ``(hash, block_dim)`` loads of this module before,
-# **3** after (the two block_dim variants plus CPU's), and ``pytest`` end to end
-# 1 033 s -> 190 s with ``tests/test_reduce.py`` itself 535 s -> 2.0 s.
-#
-# The trade is honest about one thing: the *single* compile is now bigger, since
-# the module holds ~110 concrete kernels rather than the ~40 a lazy fork built.
-# It measured 80 s of nvcc per block_dim variant, paid once and then cached
-# (a warm cached load is 59-75 ms). That is the cost of editing this file, not of
-# using it -- and against 66 forks of 14.2 s it is not close. If it ever does
-# become the bottleneck, the escape is to give each generated kernel its own
-# module with ``@wp.kernel(module="unique")``, the way ``warp.sparse`` does, so
-# a rebuild touches one kernel instead of all of them.
+# The trade is honest about one thing: the *single* compile is bigger, since the module holds ~110
+# concrete kernels rather than the ~40 a lazy fork built. That is the cost of editing this file,
+# not of using it, and it is cached. If it ever becomes the bottleneck, the escape is
+# ``@wp.kernel(module="unique")`` per generated kernel, the way ``warp.sparse`` does, so a rebuild
+# touches one kernel instead of all of them.
 #
 # Two rules for keeping it that way:
 #
-# - **A new generic kernel in this file must be added to a group below, and a new
-#   dtype to the right tuple.** ``test_generic_kernels_register_their_overloads``
-#   catches the first; nothing catches the second, because a missing dtype does not
-#   fail, it just re-forks the chain on its first launch. The symptom is a test or
-#   a script that suddenly takes tens of seconds -- read it as a rebuild and come
-#   back here (CLAUDE.md section 15.1).
-# - **The dtype set is the one ``triwarp.reduce`` dispatches over**, not every
-#   dtype ``wp.Scalar`` admits (CLAUDE.md section 4.2, no speculative generality):
-#   an unused overload is compile time paid on every rebuild. The boolean
-#   reductions are ``wp.int32`` only because ``_reduce_bool`` converts the mask
-#   before launching, and ``wp.bool`` is not a ``wp.Scalar`` in any case.
+# - **A new generic kernel here must be added to a group below, and a new dtype to the right
+#   tuple.** ``test_generic_kernels_register_their_overloads`` catches the first; nothing catches
+#   the second, because a missing dtype does not fail — it re-forks the chain on its first launch.
+#   The symptom is a test or a script that suddenly takes tens of seconds; read it as a rebuild
+#   (CLAUDE.md section 15.1).
+# - **The dtype set is the one ``triwarp.reduce`` dispatches over**, not every dtype ``wp.Scalar``
+#   admits: an unused overload is compile time paid on every rebuild. The boolean reductions are
+#   ``wp.int32`` only because ``_reduce_bool`` converts the mask first, and ``wp.bool`` is not a
+#   ``wp.Scalar`` in any case.
 #
-# ``block_dim`` forks the hash independently of the dtypes and is deliberately
-# left forked. It is not the same pathology: the values in use are fixed by *this
-# package's* launch code -- ``TILE_1D`` for the ``wp.launch_tiled`` reductions and
-# Warp's 256 default for the plain ones, plus 1 on CPU, where Warp pins it -- so
-# they are a bounded set of two or three variants, not a chain whose length grows
-# with what a caller happens to reduce first. Collapsing them by passing
-# ``block_dim=TILE_1D`` at the plain-launch sites was measured and declined: it
-# costs 0.60x on ``max(axis=1)`` over a ``(4M, 3)`` table and 0.67x on
-# ``max(axis=0)`` over ``(3, 4M)``, buying only ``minmax_vec3_chunked`` at 100k
-# (1.63x, 14 us) and nothing at all by 14M (0.97x) -- an RTX 5090, min of 20
-# interleaved reps.
+# ``block_dim`` forks the hash independently and is deliberately left forked. It is not the same
+# pathology: the values in use are fixed by *this package's* launch code — ``TILE_1D`` for the
+# ``wp.launch_tiled`` reductions, Warp's 256 default for the plain ones, 1 on CPU — so they are a
+# bounded set, not a chain whose length grows with what a caller reduces first. Collapsing them by
+# passing ``block_dim=TILE_1D`` at the plain-launch sites was measured and declined: a substantial
+# loss on the per-axis reductions and nothing at scale.
 # ---------------------------------------------------------------------------
 
 # Nothing in this module is generic any more, so there is no ``_register_overloads`` here: every
@@ -1024,14 +992,15 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
 # Fused all-close reduction.
 #
 # ``array.allclose`` ran a ``wp.map`` of the element predicate into an ``(n,)`` mask and then a
-# whole ``reduce.all`` over it -- two launches, two allocations, ~11 us of map resolution and a
-# reduction that reads back what the predicate pass already knew. The answer is one boolean, so the
-# predicate folds into its own reduction: one launch, one four-byte accumulator, one readback.
+# whole ``reduce.all`` over it -- two launches, two allocations, the map's own host-side resolution
+# and a reduction that reads back what the predicate pass already knew. The answer is one boolean,
+# so the predicate folds into its own reduction: one launch, one four-byte accumulator, one
+# readback.
 #
 # **A table of concrete kernels rather than one generic one**, for ``_reduce_1d_tiled``'s reason
-# (CLAUDE.md section 2.7): a generic kernel pays ~12 us of host-side overload resolution on every
-# launch, which on a call this small is most of what the fusion just saved. Registered over exactly
-# the dtypes ``allclose``'s own signature admits -- ``float16`` / ``float32`` / ``float64`` and
+# (CLAUDE.md section 2.7): a generic kernel pays host-side overload resolution on every launch,
+# which on a call this small is most of what the fusion just saved. Registered over exactly the
+# dtypes ``allclose``'s own signature admits -- ``float16`` / ``float32`` / ``float64`` and
 # ``wp.vec3`` -- which is section 2.5's rule, not every dtype the template would accept.
 #
 # The fold is ``wp.min`` over a per-lane 0/1, so "all close" is "the block minimum is 1"; lanes with

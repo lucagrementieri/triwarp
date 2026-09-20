@@ -11,16 +11,16 @@ Two axes, and they measure different things:
   is the group to watch: a 40 960-halfedge serial walk in a single thread is the shape that made
   ``igl.principal_curvature`` take 110 s on this same mesh.
 
-Measured on an RTX 5090: ``halfedge_twins`` runs 314 / 311 / 532 us over the scale axis (the first
-two sit on the suite's ~340 us host-side floor, so that axis is reporting launch overhead until
-``sphere_large``), while ``vertex_one_rings`` goes **804 us -> 7.97 ms, a 9.9x spread**, on the
-valence axis at pinned ``V`` and ``F``. That spread is inherent rather than a defect: the rotation
+``halfedge_twins`` sits on the suite's host-side floor over most of the scale axis, so that axis is
+reporting launch overhead until the largest mesh, while ``vertex_one_rings`` spreads by an order of
+magnitude on the valence axis at pinned ``V`` and ``F``. That spread is inherent rather than a
+defect: the rotation
 around a vertex is a linked walk, so a valence-``k`` hub is ``k`` dependent steps that no amount of
 parallelism removes. It is recorded here so a future change that makes it *worse* is visible.
 
 ``vertex_one_rings_scale`` re-times the same walk with twins precomputed over uniform valence-6
-meshes: 252 / 267 / 255 us across a 64x face-count range, i.e. flat and launch-bound. With the
-valence group that is the whole cost model here -- ring width matters, mesh size does not.
+meshes, and is flat and launch-bound across a 64x face-count range. With the valence group that is
+the whole cost model here -- ring width matters, mesh size does not.
 
 Both are pure connectivity, so the vertex positions never enter and there is nothing to compare
 against another library's *geometry*.

@@ -1,128 +1,93 @@
 """
 Static scan of the public API's shape: names, summaries, file layout and module boundaries.
 
-Nineteen conventions the package holds to, each one a defect class that was actually found rather
-than an aesthetic preference. They are checked by an ``ast`` scan of ``triwarp/`` (excluding
-``kernels/``, ``__init__.py`` and private ``_*.py`` modules) plus a listing of ``tests/`` and
-``benchmarks/``, and [`tests/test_api_conventions.py`](test_api_conventions.py) fails the default
-test run on any violation:
+Each check is a defect class that was actually found rather than an aesthetic preference. They run
+as an ``ast`` scan of ``triwarp/`` (excluding ``kernels/``, ``__init__.py`` and private ``_*.py``
+modules) plus a listing of ``tests/`` and ``benchmarks/``, and
+[`tests/test_api_conventions.py`](test_api_conventions.py) fails the default test run on any
+violation. The authoritative list with its reasoning is ``.claude/CLAUDE.md`` section 4.5; what
+follows is the one-line claim each check makes, so a failure message reads in context.
 
 1. **A one-line summary says what the function returns, not which C++ call it wraps.** mkdocstrings
    renders the summary as the entry in the module's API index, so a library name there turns the
-   index into a table of bindings. Attribution is wanted -- in a ``Notes`` block or a ``See Also``,
-   one line down.
-2. **A ``*_mask`` producer returns a boolean array.** The suffix is a family, and a member that
-   returns something else makes the family unreadable. A function that *consumes* a mask (it takes a
-   ``*mask`` parameter) is named for its input and is exempt.
+   index into a table of bindings. Attribution is wanted -- one line down, in ``Notes`` or ``See
+   Also``.
+2. **A ``*_mask`` producer returns a boolean array.** A function that *consumes* a mask is named
+   for its input and is exempt.
 3. **A module summary does not end in "(Warp)" or "on NVIDIA Warp".** The whole package is Warp.
 4. **Every module has a test file and a benchmark file named for it**, and every ``test_*.py`` in
-   either suite corresponds to a module -- ``tests/test_holes.py`` for ``triwarp/holes.py``. The
-   package is flat, so the mapping is the module name and nothing else; the dotted-path transform
-   this used to carry existed for ``triwarp/heat/``, the one subpackage, and went with it.
+   either suite corresponds to a module. The package is flat, so the mapping is the module name.
 5. **A private name stays inside its module.** A ``_helper`` imported across a module boundary is a
-   function that should have been public, and the alias-on-import (``import _x as x``) is the tell.
+   function that should have been public, and the alias-on-import is the tell.
 6. **Two modules do not export the same public name**, outside a written allowlist.
-7. **A top-level kernel module is named for the public module it backs**, and vice versa
-   (``.claude/CLAUDE.md`` section 3.1). This is what stops a wrapper module from being created while
-   its kernels are left behind under the old name.
-8. **A private helper is defined below its first caller** (``.claude/CLAUDE.md`` section 5's
-   stepdown rule), so a reader never jumps backward to a definition they have not met. The 49 sites
-   that predated the check were a staleness-checked debt list, now drained; the single remaining
-   entry is a permanent exemption, a helper called at module scope to build a constant.
-9. **A Warp-version claim names a version at least as new as the installed ``warp-lang``.** This is
-   the one check that reads outside ``triwarp/``, and it exists because an upgrade left twelve
-   workarounds citing Warp 1.13-1.15 for a year. The local API mirrors carry a version stamp, so a
-   stale *mirror* is catchable; nothing caught a stale *justification*. Unlike checks 1-8 this one
-   also
-   scans ``kernels/``, where five of those twelve lived -- and ``tests/`` and ``benchmarks/``, which
-   is where the rot ran deepest. It scanned neither until eleven ``warp.optim.linear.cg`` skips had
-   survived the 1.16 fix that made CPU ``cg`` converge, two of them naming versions 1.14-1.15 in
-   the anchored spelling this check is built to read. A skip is worse than a stale comment: the
-   comment
-   misinforms, the skip silently deletes coverage, and on a box with CUDA the deleted branch is the
-   one nobody runs. The check abstains on ``.md`` -- it reads Python prose blocks -- so a claim in
-   ``benchmarks/README.md`` still needs a human.
-10. **A Python-scope allocation names the device it allocates on.** ``wp.zeros`` / ``empty`` /
-    ``ones`` / ``full`` / ``array`` without ``device=`` land on Warp's *current* device, not on the
-    device of the arrays they are about to be used with. The suite never catches it, because a test
-    runs with its arrays' device as the current device and the omitted argument then resolves
-    correctly by accident; it surfaces only under ``wp.ScopedDevice``. Found twice now, in two
-    different call families, so it is mechanical from here.
+7. **A top-level kernel module is named for the public module it backs**, and vice versa (section
+   3.1). This is what stops a wrapper from being created while its kernels stay under the old name.
+8. **A private helper is defined below its first caller** (section 5's stepdown rule), so a reader
+   never jumps backward to a definition they have not met.
+9. **A Warp-version claim names a version at least as new as the installed ``warp-lang``.** It also
+   scans ``kernels/``, ``tests/`` and ``benchmarks/``, because a stale ``pytest.skip`` is worse than
+   a stale comment: the comment misinforms, the skip silently deletes coverage, and on a box with
+   CUDA the deleted branch is the one nobody runs. It abstains on ``.md``.
+10. **A Python-scope allocation names the device it allocates on.** Without ``device=`` a buffer
+    lands on Warp's *current* device rather than the device of the arrays it is about to be used
+    with. The suite never catches it, because a test runs with its arrays' device current and the
+    omission then resolves correctly by accident.
 11. **A public function that raises documents a ``Raises`` block.** Only a *direct* ``raise`` in the
-    function's own body counts: 42 public functions delegate their validation to a helper that
-    raises, which is correct and is not scanned. The tell that this was drift rather than a policy
-    was that in five of the eleven sites the very next function in the same file documented its own
-    raise, and in one of them a *private* helper did while its public caller did not.
-12. **A fenced ``python`` docstring example runs.** Two of the package's four examples raised when
-    executed -- both by calling a Warp array where the code had written a NumPy expression -- and
-    neither ``ast.parse`` nor any reviewer had noticed, because an example is documentation nobody
-    executes. This one is the odd member of the family: the scan only *extracts* the blocks, and
-    [`tests/test_api_conventions.py`](test_api_conventions.py) runs them against a mesh fixture.
-13. **A kernel output argument is named ``out_*`` and sits at the end of the signature**
-    (``.claude/CLAUDE.md`` section 2.1). Like check 9 this one scans ``kernels/``, which the others
-    exclude: the first full sweep of the kernel tree found eight genuine outputs wearing plain
-    names (four of them literally ``out``, the prefix without the name), three read-only inputs
-    wearing the prefix, and two argument classes the convention had no spelling for -- in-place
-    arguments and scratch / persistent-state buffers, now exempted in section 3 and carried here
-    as ``_KERNEL_OUTPUT_ALLOWLIST``.
-14. **An array annotation is subscript-style** -- ``wp.array[T]``, not the pre-1.12
-    ``wp.array(dtype=T)`` (``.claude/CLAUDE.md`` section 1.2). Both forms work, so the old one
-    simply accumulated: 176 annotations against 1 644, all of them in the three newest large kernel
-    modules, and one file carrying both. Restricted to *annotation* positions, which is what lets
-    it scan the whole package -- ``wp.array(dtype=T)`` is a legal allocation expression at Python
-    scope and only an annotation makes it the stale spelling.
+    function's own body counts; the many functions delegating validation to a shared guard are
+    correct and are not scanned.
+12. **A fenced ``python`` docstring example runs.** The odd member of the family: the scan only
+    *extracts* the blocks and [`tests/test_api_conventions.py`](test_api_conventions.py) executes
+    them against a mesh fixture, because an example's defect is a runtime one that ``ast.parse``
+    cannot see.
+13. **A kernel output argument is named ``out_*`` and sits at the end of the signature** (section
+    2.1). Two argument classes are exempt and carried in ``_KERNEL_OUTPUT_ALLOWLIST``: in-place
+    arguments, and scratch / persistent-state buffers.
+14. **An array annotation is subscript-style** -- ``wp.array[T]``, not ``wp.array(dtype=T)``
+    (section 1.2). Restricted to *annotation* positions, which is what lets it scan the whole
+    package: ``wp.array(dtype=T)`` is a legal allocation at Python scope.
 15. **A ``wp.launch`` / ``wp.launch_tiled`` names the device it launches on.** The memory-safety
-    guard of the family: an omitted ``device=`` resolves to Warp's *current* device, and with CPU
-    arrays that runs the kernel on ``cuda:0`` over host pointers, returns the right answer, and
-    corrupts the heap when those arrays are freed mid-kernel. This is the half of the guard that
-    carries the load -- ``conftest.py``'s ``STRICT`` mode only bites when the arrays are *not* on
-    the launch device, so on a CUDA run the omission is invisible to it.
+    guard of the family: an omitted ``device=`` runs a kernel on ``cuda:0`` over host pointers,
+    returns the right answer, and corrupts the heap when those arrays are freed mid-kernel. This is
+    the half that carries the load -- ``conftest.py``'s ``STRICT`` mode only bites when the arrays
+    are *not* on the launch device, so on a CUDA run the omission is invisible to it.
 16. **A cast inside a kernel is spelled ``wp.int32`` / ``wp.float32``, never bare ``int`` /
-    ``float``** (``.claude/CLAUDE.md`` section 1.3). They are the same builtins under a different
-    name, with one asymmetry that matters: ``float(...)`` is a *hard compile error* inside a
-    ``wp.Float``-generic function, so it silently forecloses genericising that function -- which
-    runs against section 14's "prefer dtype-generic ``@wp.func``s". The tree carried 329
-    ``int(wp.tid())`` alongside 640 ``wp.int32(...)``, and 46 sites in 41 kernels used *both* on
-    the same local. Like checks 9, 13 and 14 this one scans ``kernels/``.
-17. **An integer division inside a kernel is spelled ``//``, never ``/``** (``.claude/CLAUDE.md``
-    section 1.5). On integers the two are the *same* operation in Warp -- both truncate toward zero,
-    where CPython's ``//`` floors -- so this is legibility: ``/`` on two ``int32``s reads as real
-    division and truncates only because the operands happen to be integers. A check rather than an
-    edit because the defect recurred after the rule was written, and because the scan found four
-    sites a textual pass had missed. It types an operand only *by declaration*, which is what makes
-    it safe to run on float-heavy code.
-18. **A kernel-scope argument or return is annotated in Warp's types** -- ``wp.bool`` /
-    ``wp.int32`` / ``wp.float32``, not the bare Python names (``.claude/CLAUDE.md`` section 1.2).
-    The third member of the 16/17 family, and the same story: Warp resolves both spellings to the
-    same types, so only a scan keeps them from coexisting. The tree carried 11 ``-> bool`` against
-    46 ``-> wp.bool`` plus 12 bare parameters, the newest written the day after the pass that
-    converted the last batch of casts. It reads ``@wp.kernel`` / ``@wp.func`` signatures only,
-    because a kernel *factory* is ordinary Python whose ``int`` parameters are correct.
-19. **A test comparing against a reference library says which class the comparison is**
-    (``.claude/CLAUDE.md`` section 7.4). The second check that reads ``tests/`` rather than
-    ``triwarp/``, and it is here because the convention has decayed twice: the lowercase ``class b``
-    spelling went 21 -> 0 -> 9, invisible to the grep section 6 prescribes because a human reads it
-    the same. It accepts all four label phrases the suite uses, keys on ``ast.Assert`` so a fixture
+    ``float``** (section 1.3). Same builtins under a different name, with one asymmetry that
+    matters: ``float(...)`` is a *hard compile error* inside a ``wp.Float``-generic function, so it
+    silently forecloses genericising that function.
+17. **An integer division inside a kernel is spelled ``//``, never ``/``** (section 1.5). On
+    integers the two are the *same* operation in Warp, so this is legibility: ``/`` on two
+    ``int32``s reads as real division and truncates only because the operands happen to be integers.
+    It types an operand only *by declaration*, which is what makes it safe on float-heavy code.
+18. **A kernel-scope argument or return is annotated in Warp's types** (section 1.2). It reads
+    ``@wp.kernel`` / ``@wp.func`` signatures only, because a kernel *factory* is ordinary Python
+    whose ``int`` parameters are correct.
+19. **A test comparing against a reference library says which class the comparison is** (section
+    7.4). It accepts all four label phrases the suite uses, keys on ``ast.Assert`` so a fixture
     unpack is not a hit, and leaves ``_np`` out because it marks inputs as often as oracles. It
     checks that a label is *present*, never that it is the right one.
+20. **A conditional value in kernel scope is ``wp.where``, not a Python ternary** (section 1.5).
+21. **Nothing under ``triwarp/`` names MeshLib or promesh** -- a licensing guard (section 7.6).
+22. **A single-index ``wp.tid()`` is cast** (section 1.3).
+23. **A ``@wp.func`` reached by ``wp.map`` from several call sites has a declaration table**
+    (section 3.5).
 24. **A ``.claude/CLAUDE.md`` cross-reference names a section that exists**, and names a
-    *subsection* wherever the chapter has any. The second half is the point: CLAUDE.md's Part I was
-    renumbered and 111 comments kept citing the old chapters, so "section 4" stood at once for
-    ``wp.map`` targets, overload registration, ``wp.launch``'s ``wp.Function`` restriction and
-    ``triplet_buffers``' uninitialized tail. Every one of them still *resolved* -- to "Evolving the
-    public API" -- which is exactly what a resolving check cannot see. Chapters 5, 6, 8, 9, 10 and
-    11 carry no subsection, so a bare number is the only spelling available for them and is
-    accepted; the check reads that from the heading structure rather than a list, so it follows
-    CLAUDE.md if a chapter later gains one.
+    *subsection* wherever the chapter has any. The second half is the point: a bare chapter number
+    still *resolves*, which is exactly what a resolving check cannot see. Chapters with no
+    subsection are accepted bare, read from the heading structure rather than a list.
+25. **No ``!!!`` admonition sits inside a numpydoc item-list section** (section 6). griffe reads
+    each entry's first line as a name, so an admonition header between two ``Raises`` entries
+    renders as an exception type.
+26. **A Warp-typed module constant is not used as a Python-scope arithmetic operand or slice
+    bound** (section 4.5). Its operators route through Warp's builtin dispatch.
 
 Why a static scan rather than importing ``triwarp``
 ---------------------------------------------------
 Importing would make the verdict depend on Warp's module cache and on which optional dependencies
 resolve, and would say nothing about files (checks 4 and 7) at all. A scan reads the tree as
-written, so its answer is the same in every environment and in every pytest invocation. Check 9
-needs the installed Warp version and takes it from ``importlib.metadata`` rather than
-``warp.config.version``, so even that one imports nothing. Check 12 is the single exception and it
-is deliberate: an example's defect is a *runtime* one, so nothing short of running it finds it, and
+written, so its answer is the same in every environment and every pytest invocation. Check 9 needs
+the installed Warp version and takes it from ``importlib.metadata`` rather than
+``warp.config.version``, so even that one imports nothing. Check 12 is the single exception,
+deliberately: an example's defect is a *runtime* one, so nothing short of running it finds it, and
 the extraction half stays here so the execution half has no parsing to do.
 """
 
@@ -196,11 +161,11 @@ _MODULES_WITHOUT_BENCHMARKS = frozenset(
 # whose public form does extra work, a string-to-kernel-flag table shared so two modules cannot
 # disagree about one enum's spellings, and one pass a caller must skip.
 #
-# Six further entries used to sit here, all ``combine`` -> ``holes``, and none of them was ever an
-# exemption worth keeping: they existed because the minimum-weight interval DP that fills one hole
-# is the same DP that stitches two rims, and the two halves lived in different modules. Moving the
-# stitch family into ``holes`` deleted all six at once. A cluster of entries sharing one (importer,
-# owner) pair is that shape of defect -- read it as a misplaced family before writing the seventh.
+# A cluster of entries sharing one (importer, owner) pair is a *misplaced family* rather than six
+# exemptions: six such entries once sat here, all ``combine`` -> ``holes``, because the
+# minimum-weight interval DP that fills one hole is the same DP that stitches two rims and the two
+# halves lived in different modules. Moving the stitch family into ``holes`` deleted all six at
+# once. Read a cluster that way before writing the next entry.
 _PRIVATE_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
     ("reduce", "array._sorted_copy"): (
         "reduce.median needs a sorted copy, and array.sort_and_argsort is the public form -- which "
@@ -256,9 +221,9 @@ _MODULES_WITHOUT_KERNELS = frozenset({"constants", "io", "mesh", "typing"})
 
 # A Warp version claim, and the spelling is the convention: the word **Warp** immediately before
 # the number. Anything looser is unusable here -- this package writes measured ratios in the same
-# shape ("within 1.25x of best", "1.06 ms", "1.13x on CUDA at both sizes"), and a bare ``1.N`` token
-# matched 30 of them against 3 real claims when this check was first written. So a version claim
-# says "Warp 1.17", never "through 1.17" with the word three lines up.
+# shape ("within 1.25x of best", "1.13x on CUDA at both sizes"), so a bare ``1.N`` token matches an
+# order of magnitude more ratios than real claims. A version claim says "Warp 1.17", never
+# "through 1.17" with the word three lines up.
 _WARP_VERSION_CLAIM = re.compile(r"\bWarp\s+1\.(\d+)(?:\.(\d+))?\b")
 
 # Version claims that deliberately record history rather than describe the installed Warp. Keyed by
@@ -267,17 +232,9 @@ _WARP_VERSION_CLAIM = re.compile(r"\bWarp\s+1\.(\d+)(?:\.(\d+))?\b")
 # ``triwarp/`` are keyed by their dotted name, everything else by its path
 # (``tests.api_conventions``, ``benchmarks.test_creation``).
 _WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
-    ("tests.api_conventions", "1.13"): (
-        "deliberate history: this check's own rationale, naming the range of versions the twelve "
-        "stale workarounds cited -- the thing it was written to stop"
-    ),
-    ("benchmarks.test_creation", "1.15"): (
-        "deliberate history: a measurement stamp on a recorded benchmark table, naming the Warp "
-        "the numbers below it were taken on. Re-stamping without re-measuring would be a lie"
-    ),
     # ---------------------------------------------------------------------------------------
-    # Added by the Warp 1.17 upgrade (``plans/warp_upgrade.md``). Every entry below is one of
-    # two things, and neither is a claim about the installed Warp:
+    # Added by the Warp 1.17 upgrade. Every entry below is one of two things, and neither is a
+    # claim about the installed Warp:
     #
     # * a **measurement stamp** on a recorded table -- the ratios were taken on 1.16 and were
     #   not re-run, so re-stamping them to 1.17 would assert a measurement nobody made. Re-run
@@ -295,31 +252,9 @@ _WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
         "measurement stamp: the runtime-vs-constant stride A/B on a 400-vertex loop was taken "
         "on 1.16 and not re-run"
     ),
-    ("kernels.linalg", "1.16"): (
-        "measurement stamp: the import-cost numbers (0.24-0.29 s against 0.008-0.010 s) were "
-        "taken on 1.16 and not re-run"
-    ),
-    ("kernels.neighbors", "1.16"): (
-        "two of a kind: the insert-spelling table was measured on 1.16 and not re-run, and the "
-        "note refuting the 'one bvh_query call site per kernel' claim deliberately names 1.16 "
-        "as the version the two-call-site probe *also* passed on -- that A/B is the evidence "
-        "the constraint was never real, so the older version is the load-bearing half"
-    ),
     ("kernels.points", "1.16"): (
         "measurement stamp: the ``count = 1024`` capture-and-replay comparison was taken on "
         "1.16 and not re-run"
-    ),
-    ("kernels.reduce", "1.16"): (
-        "measurement stamp: the 66-module-load rebuild measurement that motivates this file's "
-        "overload registration was taken on 1.16 and not re-run"
-    ),
-    ("kernels.visibility", "1.16"): (
-        "measurement stamp: the ``ambient_occlusion`` block-per-point table was taken on 1.16 "
-        "and not re-run"
-    ),
-    ("tests.test_reconstruction", "1.16"): (
-        "measurement stamp: the screened-Poisson CPU depth timings behind the ``slow_cpu`` "
-        "marker were taken on 1.16 and not re-run"
     ),
     ("tests.test_voxels", "1.16"): (
         "deliberate history: names the version in which ``wp.Volume.allocate_by_voxels`` "
@@ -1875,12 +1810,11 @@ def bare_tid_problems() -> list[str]:
     written against. ``wp.tid()`` already returns ``wp.int32``, so both spellings generate
     identical code and neither the compiler nor the suite can see the difference; this is the fifth
     member of the family checks 16, 17, 18 and 20 belong to, and like them nothing but a scan holds
-    the line. Measured over ``kernels/`` when it was written: 422 cast against 45 bare, 90.4 % to
-    9.6 %, and the drift was *per file* rather than scattered -- 13 sites in ``intersection.py``, 9
-    in ``triangles.py`` -- which is the signature of a convention that was never checked.
-    ``intersection.py`` was the sharpest case: ``emit_quad_cut`` and ``emit_tri_cut`` opened bare
-    while ``emit_split_cut_edges`` and ``emit_split_cut_corner``, four kernels emitting the same
-    family of triangles in one file, opened with the cast.
+    the line. When it was written ``kernels/`` was about 90 % cast and 10 % bare, and the drift was
+    *per file* rather than scattered -- which is the signature of a convention that was never
+    checked. ``intersection.py`` was the sharpest case: ``emit_quad_cut`` and ``emit_tri_cut``
+    opened bare while ``emit_split_cut_edges`` and ``emit_split_cut_corner``, four kernels emitting
+    the same family of triangles in one file, opened with the cast.
 
     A **multi-index** unpack (``i, j = wp.tid()``) cannot carry a cast and is out of scope by
     construction, which is the one thing that would make this misfire -- 61 such sites are correct
@@ -1937,10 +1871,9 @@ def map_declaration_problems() -> list[str]:
 
     ``.claude/CLAUDE.md`` section 2.5's ``_register_overloads`` rule, one construct over. ``wp.map``
     generates a module named ``map_<unqualified op name>`` and each distinct *call signature* forks
-    its hash, so reaching one op at three signatures builds its module three times -- measured
-    182 distinct ``map_*`` module loads over 143 ``(module, device, block_dim)`` pairs on one suite
-    run, i.e. 39 redundant builds at 100-250 ms each cold. ``kernels/array.py``'s
-    ``declare_map_signatures`` block carries the whole reasoning, the fork axes and the numbers.
+    its hash, so reaching one op at three signatures builds its module three times -- dozens of
+    redundant cold builds over one suite run. ``kernels/array.py``'s ``declare_map_signatures``
+    block carries the whole reasoning and the fork axes.
 
     This is the same *kind* of check as ``test_generic_kernels_register_their_overloads``: it
     asserts only that a module which needs a declaration table **has** one, never that the table
@@ -2177,7 +2110,7 @@ _WARP_TYPED_CONSTRUCTORS: frozenset[str] = frozenset(
 # Nothing legitimate does host arithmetic on a Warp-typed constant, so this ships empty. Before
 # adding an entry, check the two spellings that are *not* defects and need no exemption: passing
 # the constant straight into ``wp.launch(inputs=[...])`` / ``wp.map(...)`` / ``fill_(...)`` as a
-# kernel scalar, and ``int(CONST)`` / ``float(CONST)``, which unwraps it for ~0.08 us.
+# kernel scalar, and ``int(CONST)`` / ``float(CONST)``, which unwraps it for nothing.
 _WARP_HOST_ARITHMETIC_ALLOWLIST: dict[tuple[str, str], str] = {}
 
 
@@ -2227,11 +2160,10 @@ def warp_host_arithmetic_problems() -> list[str]:
 
     A ``wp.int32`` / ``wp.float32`` / ``wp.vec3`` instance is not a Python number. Its ``__add__``
     and friends are ``warp._src.types.scalar_base``'s, which call ``warp.add(self, y)`` -- Warp's
-    Python-scope builtin dispatch, an ``inspect.signature().bind()`` per operand. Measured on an
-    RTX 5090 with Warp 1.17: **~10 us per binary op against 0.027 for a Python float**, and a
-    ``wp.array`` slice taken with such bounds is **39.4 us against 3.16**, because
-    ``wp.array.__getitem__`` forms ``stop - start`` and ``strides * start`` internally, so one
-    Warp-typed bound is three dispatches rather than one.
+    Python-scope builtin dispatch, an ``inspect.signature().bind()`` per operand -- **two to three
+    orders of magnitude a Python float's operator**. A ``wp.array`` slice taken with such bounds is
+    worse still, because ``wp.array.__getitem__`` forms ``stop - start`` and ``strides * start``
+    internally, so one Warp-typed bound is three dispatches rather than one.
 
     The defect is silent, which is why it needs a scan: the answer is correct, the compiler sees
     nothing, and the suite sees nothing. Its siblings are not -- ``//`` and ``%`` on a Warp scalar

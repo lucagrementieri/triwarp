@@ -30,11 +30,10 @@ def _build_reference_frame(
         t1 = tangential
     # The ``normalize`` is *not* redundant, though the arithmetic says it is: ``normal`` is unit
     # and ``t1`` is orthogonal to it, so the cross product is unit in exact arithmetic and 1 +- an
-    # ULP or so in float32. Dropping it was measured and reverted -- it moves ``PV1`` by up to
-    # 2.7e-04 on ``half_torus``, at exactly the vertices whose two principal curvatures already
-    # agree to 1e-05..7e-04, because that residual is enough to flip which of the pair is the
-    # larger. With it, the whole family is bit-identical on the CPU device across every fixture,
-    # both ``frame_independent`` modes and both fit radii.
+    # ULP or so in float32. Dropping it was measured and reverted -- that residual is enough to flip
+    # which of two nearly equal principal curvatures is the larger, which moves ``PV1`` visibly at
+    # exactly the vertices where the pair is close. With it, the whole family is bit-identical on
+    # the CPU device across every fixture, both ``frame_independent`` modes and both fit radii.
     return t1, wp.normalize(wp.cross(normal, t1))
 
 
@@ -89,7 +88,7 @@ def _principal_curvatures_from_monge(
         m = [[L*G - M*F,  m01      ],
              [M*E - L*F,  N*E - M*F]] / (E*G - F*F)
 
-    * ``frame_independent=True`` (textbook): ``m01 = (M*G - N*F) / (E*G - F*F)`` — the true
+    * ``frame_independent=True`` (textbook): ``m01 = (M*G - N*F) / (E*G - F*F)`` -- the true
       generalized eigenvalue problem ``II*v = lam*I*v``. The eigenvalues are surface invariants and
       do not depend on the chosen tangent frame.
     * ``frame_independent=False``: ``m01 = M*E - L*F`` (reuses the lower-left term), reproducing
@@ -107,13 +106,11 @@ def _principal_curvatures_from_monge(
     cross product with the vertex normal. Solving for it separately instead costs the guarantee:
     the two solves see the same numerically degenerate matrix at an umbilic point and can land on
     the *same* direction, which is the one answer that is wrong however arbitrary the choice is
-    allowed to be. Measured on ``icosphere(3)``, which is umbilic everywhere: 4 of 642 vertices
-    returned ``PD1`` and ``PD2`` exactly parallel (their eigenvalue gap is exactly 0.0 in float32)
-    and 4 more came back 6 degrees from parallel (gap one ULP, 2.4e-07). The non-symmetric
-    ``frame_independent=True`` branch is worse, because its eigenvectors are orthogonal under the
-    first fundamental form rather than in the frame's own coordinates: on the suite's ``half_torus``
-    it put 266 of 544 pairs off perpendicular, up to ``|PD1 . PD2| = 0.57`` -- 35 degrees -- at
-    eigenvalue gaps of order 1, where nothing is degenerate at all.
+    allowed to be. On a sphere, umbilic everywhere, that returns exactly parallel principal
+    directions at a handful of vertices. The non-symmetric ``frame_independent=True`` branch is
+    worse, because its eigenvectors are orthogonal under the first fundamental form rather than in
+    the frame's own coordinates: on a torus it puts half the pairs visibly off perpendicular at
+    eigenvalue gaps where nothing is degenerate at all.
     """
     e_ff = first_form[0]
     f_ff = first_form[1]
@@ -223,8 +220,8 @@ def fit_principal_curvature(
     # design row is ``[u^2, u v, v^2, u, v]``, so at mesh scale ``h`` the normal matrix's diagonal
     # spans ``h^8`` to ``h^2`` and ``solve_normal_equations``' singularity test -- absolute, and
     # necessarily so, since it cannot see the caller's units -- starts rejecting well-conditioned
-    # fits outright. Measured before this division, on ``icosphere(3)`` at ``radius=2``: 42 of 642
-    # vertices returned zero curvature at mesh scale 1e-3 and **all 642 at 3e-4**, silently.
+    # fits outright. Without the division a small enough mesh returns zero curvature everywhere,
+    # silently.
     n_valid = wp.int32(0)
     ring_radius = wp.float32(0.0)
     for k in range(n_nbr):

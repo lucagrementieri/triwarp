@@ -238,16 +238,15 @@ def face_normals_and_area(
 
     **The zero test is against zero and not against a tolerance, and that is load-bearing at small
     mesh scale.** ``|cross|`` scales as ``h^2``, so an absolute floor of
-    ``TOLERANCE_ZERO_CONSTANT`` (which this used to carry) puts *every* face of a mesh at
-    ``h <= 3e-6`` below it and hands back the raw cross product as a "unit" normal, magnitude
-    ``2 * area``. Nothing downstream reads that as an error: ``vertices.vertex_normals`` then
-    area-weights those, squaring the smallness, and ``wp.normalize`` sees a vector whose
-    ``length_sq`` has underflowed ``float32`` to exactly zero -- so every vertex normal on the mesh
-    came back zero, and with them every curvature, every smoothing normal and every sign test built
-    on one. Dividing by ``norm`` is well conditioned for *any* positive ``norm``; at ``norm == 0``
-    the cross product is already the zero vector, so the two branches agree there and the tolerance
-    was never protecting the division. Measured after this change: vertex normals stay unit down to
-    ``h = 1e-9``, where ``float32`` storage of the positions is the next limit.
+    ``TOLERANCE_ZERO_CONSTANT`` (which this used to carry) puts *every* face of a small enough mesh
+    below it and hands back the raw cross product as a "unit" normal of magnitude ``2 * area``.
+    Nothing downstream reads that as an error: ``vertices.vertex_normals`` then area-weights those,
+    squaring the smallness, and ``wp.normalize`` sees a vector whose ``length_sq`` has underflowed
+    ``float32`` to exactly zero -- so every vertex normal on the mesh comes back zero, and with them
+    every curvature, every smoothing normal and every sign test built on one. Dividing by ``norm``
+    is well conditioned for *any* positive ``norm``; at ``norm == 0`` the cross product is already
+    the zero vector, so the two branches agree there and the tolerance was never protecting the
+    division.
     """
     normal = triangle_cross(vertices, faces, face_index)
     norm = wp.length(normal)
@@ -280,10 +279,9 @@ def angles(
     # ``vector_angle`` is atan2(|a x b|, a . b) and is scale-free, so the edges go in unnormalized
     # (three ``wp.normalize`` calls fewer) -- and a sliver, whose angles sit near 0 and pi, is
     # precisely where the ``acos(a . b)`` this replaces amplified the round-off already in the dot
-    # product. Worst corner-angle error against a float64 reference on the same float32 vertex
-    # buffer: 2.0e-07 -> 1.3e-07 on an icosphere(3), 6.9e-07 -> 9.6e-08 on a 64-section cylinder,
-    # and **5.4e-06 -> 1.1e-07** at 256 sections, where the old form was closing on the 1e-5 the
-    # parity tests compare at. The gain grows with sliverness, which is the point.
+    # product. Against a float64 reference on the same float32 vertex buffer the gain grows with
+    # sliverness, and on a finely sectioned cylinder the old form was closing on the 1e-5 the parity
+    # tests compare at.
     #
     # It also removes the spurious pi/2 that ``acos`` of a zeroed ``normalize`` returned for a
     # zero-length edge; the degeneracy guard below now fires on the angle itself rather than on
@@ -419,26 +417,13 @@ def point_barycentric(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3, point: wp.vec3) -> 
     it is worse at every triangle shape and scale and better at none.** Its two terms agree to more
     digits as the corner angle closes, so the subtraction loses them.
 
-    Measured against a ``float128`` oracle, 200 random interior points per cell, over base scales
-    ``1e-3`` / ``1`` / ``1e3`` crossed with unit-base triangle heights ``1`` down to ``1e-5`` --
-    worst absolute coordinate error, flat in the scale:
-
-    | height | this form | Cramer |
-    |---|---|---|
-    | 1 (well shaped) | 1.2e-07 | 1.9e-07 |
-    | 0.1 | 1.3e-07 | 4.6e-06 |
-    | 0.01 | 1.7e-07 | 5.0e-04 |
-    | 1e-3 | 2.0e-07 | 3.7e-02 |
-    | 1e-4 | 1.5e-07 | **2.20**, and ``nan`` in 150 of 200 |
-    | 1e-5 | 9.8e-08 | ``nan`` in 200 of 200 |
-
-    This form sits at ``float32`` eps in all 21 cells; Cramer degrades monotonically and, at
-    ``1e-4``, returns values that are *finite and wholly wrong*, which is worse than the ``nan``
-    below it because nothing downstream can detect it. The breakdown is not a ``float32`` artifact
-    -- the same sweep shows ``float128`` Cramer departing from the exact answer by 1.9e-10 at
-    ``h = 1e-5`` -- so no widening rescues it. The two cost the same: interleaved A/B, min of 30,
-    both at the launch floor, 0.0274 against 0.0275 ms at 20 000 triangles and 0.0273 against
-    0.0267 at 200 000.
+    Measured against a ``float128`` oracle over a wide sweep of base scales and triangle heights,
+    this form sits at ``float32`` eps in every cell, flat in the scale, where Cramer degrades
+    monotonically with sliverness: at a height around ``1e-4`` of the base it returns values that
+    are *finite and wholly wrong*, which is worse than the ``nan`` it gives below that because
+    nothing downstream can detect it. The breakdown is not a ``float32`` artifact -- the same sweep
+    shows ``float128`` Cramer departing from the exact answer too -- so no widening rescues it. The
+    two cost the same, both at the launch floor.
 
     Zero area -- a triangle that really is a segment or a point, not merely a thin one -- is
     answered rather than forwarded as an infinity: the coordinates are then taken along the longest
@@ -638,8 +623,8 @@ def face_gradients(
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 2.5. One generic kernel, but measured at **5** module loads over the suite, and
-# this module backs 15 kernel modules and 2 wrappers, so each rebuild is widely felt.
+# CLAUDE.md section 2.5. This module backs 15 kernel modules and 2 wrappers, so each rebuild is
+# widely felt.
 #
 # The vertex precision and the volume precision move together: ``face_signed_volumes`` reads a
 # ``wp.vec3`` cloud into ``wp.float32`` volumes or a ``wp.vec3d`` one into ``wp.float64``, never a
@@ -647,9 +632,8 @@ def face_gradients(
 # The concrete handle keyed by the vertex dtype -- see
 # [`OverloadTable`][triwarp.kernels.array.OverloadTable]. This kernel is the tree's clearest case:
 # it is generic in *three* parameters (the vertex array, the apex vector and the output scalar), and
-# resolution cost scales with that count. Measured on an RTX 5090, Warp 1.17, 100 launches between
-# two synchronization points at 81 920 faces: **26.6 us generic against 12.2 us through the handle,
-# 2.17x**, output bit-identical.
+# resolution cost scales with that count, so launching through the handle roughly halves its host
+# cost with the output bit-identical.
 FACE_SIGNED_VOLUMES: OverloadTable
 
 

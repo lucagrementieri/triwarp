@@ -9,9 +9,9 @@ only consumer reads ``parents`` and ``distances`` and nothing else.
 **The primal tree is a two-kernel level loop, not an order-exact traversal.** A breadth-first
 search that has to reproduce ``scipy.sparse.csgraph.breadth_first_order`` spends most of a level
 compacting its claims into a FIFO in ``(rank, ascending node id)`` order -- a tiled block scan plus
-a serial advance, measured at 9.9 us of a 26.1 us level against 16.2 for the claim/commit pair that
-actually builds the tree. Nothing downstream of a spanning tree reads a discovery order, so the
-scan is gone and the level is ``bfs_push_level`` plus a one-thread
+a serial advance, more than a third of the level's cost against the claim/commit pair that actually
+builds the tree. Nothing downstream of a spanning tree reads a discovery order, so the scan is gone
+and the level is ``bfs_push_level`` plus a one-thread
 [`loop_advance`][triwarp.kernels.array.loop_advance].
 
 **What replaces the order as the tie-break is ``wp.atomic_min`` on the parent**, and it buys two
@@ -31,10 +31,10 @@ has to take part in. Dropping that arm loses the minimum and makes the tree thre
 reads the cotree as a *set* -- the generators are the edges in neither tree -- and the loop tracing
 walks the **primal** parents. So the dual side has no root and no parent pointers, and its shape is
 free to choose. Breadth-first is the one shape that is expensive here: the dual graph restricted to
-non-primal-tree edges is *already nearly a tree*, so its diameter is enormous. Measured on the
-benchmark meshes, a dual traversal ran **765-891 levels** against the primal's 116-192. Boruvka
-needs ``O(log F)`` rounds instead. Each round gives every component its minimum-index incident
-candidate edge, accepts those edges and unions the components; the union-find core is
+non-primal-tree edges is *already nearly a tree*, so its diameter is enormous -- on the benchmark
+meshes a dual traversal runs several times the primal's level count. Boruvka needs ``O(log F)``
+rounds instead. Each round gives every component its minimum-index incident candidate edge, accepts
+those edges and unions the components; the union-find core is
 [`find_representative`][triwarp.kernels.algorithms.connected_components.find_representative] and
 [`ecl_hook_edge`][triwarp.kernels.algorithms.connected_components.ecl_hook_edge], imported rather
 than re-derived, so the forest and ``graph.connected_component_labels`` share one implementation of
@@ -57,7 +57,7 @@ flag are each a sound termination argument on their own, but a captured loop tha
 the device rather than returning a wrong answer, so the cap is cheap insurance rather than a
 schedule.
 
-**The tracing is two kernels and a scan where it used to be a Python loop per generator.** Each
+**The tracing is two kernels and a scan rather than a Python loop per generator.** Each
 generator edge ``(a, b)`` closes into a loop through the tree as ``a -> lca(a, b) -> b``, and its
 length is ``depth(a) + depth(b) - 2 * depth(lca) + 1`` -- so ``generator_loop_lengths`` finds the
 apex, the wrapper scans the lengths into offsets, and ``write_generator_loops`` fills each loop's
@@ -181,21 +181,19 @@ def dual_candidate_mask(
     #
     # **The closed-surface guard's interior-edge count rides along**, because ``edge_face_count[e]
     # == 2`` is already this kernel's own predicate -- so the count is the fold of a value the
-    # thread computed anyway, and the guard needs no pass of its own. The same fused-fold trade
-    # ``kernels/points.py::accumulate_counted_mean`` prices at 136 us of a 346 us call.
+    # thread computed anyway, and the guard needs no pass of its own.
     #
     # A block fold rather than a conditional ``wp.atomic_add`` per edge, because on a closed mesh
     # *every* edge is interior -- so the conditional atomic is the unconditional one and it
     # serializes the whole launch on one address.
     #
     # **One tile per block, not ``ITEMS_PER_BLOCK_1D``**, and that is the whole difference between
-    # this being free and being a regression: the reduce module's fold width gives each lane 16
-    # elements, which is right for a kernel whose *only* output is the reduction, and wrong here
-    # because this one also writes a mask entry per edge. At 140 000 edges the wide fold runs 137
-    # blocks -- under one per SM on a 170-SM device -- against 2 188 blocks of one edge per lane.
-    # Section 2.3's occupancy rule: a kernel that already has a per-element dimension must not
-    # collapse it into ``block_dim`` lanes. One atomic per 64 edges is still one per block, which
-    # is the shape section 13.2 asks for.
+    # this being free and being a regression: the reduce module's fold width gives each lane a dozen
+    # or so elements, which is right for a kernel whose *only* output is the reduction, and wrong
+    # here because this one also writes a mask entry per edge -- the wide fold collapses the grid to
+    # under one block per SM. Section 2.3's occupancy rule: a kernel that already has a per-element
+    # dimension must not collapse it into ``block_dim`` lanes. One atomic per tile is still one per
+    # block, which is the shape section 13.2 asks for.
     chunk, lane = wp.tid()
     offset, remaining = tile_chunk(unique_edges.shape[0], chunk, TILE_1D)
     if remaining <= 0:

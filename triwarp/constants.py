@@ -25,8 +25,8 @@ TOLERANCE_ZERO = 1e-12
 # stored length changes, the degenerate face stays degenerate and its couplings are still dropped
 # from the operator -- a silent no-op, which conditioning cannot reveal because a dropped face
 # contributes zero and so looks perfectly conditioned. Too *large* and that same global constant
-# perturbs the clean part of the mesh away from the true cotangent operator. ``1e-5`` sits about a
-# decade and a half from each arm; the measured bracket is in
+# perturbs the clean part of the mesh away from the true cotangent operator. ``1e-5`` sits more
+# than a decade from each arm; the bracket is measured in
 # `kernels/laplacian.triangle_inequality_slack`.
 TOLERANCE_MOLLIFY = 1e-5
 
@@ -99,8 +99,8 @@ ITEMS_PER_SLICE_CPU = 32
 # ``(row[1], row[0])`` for every radix above the largest entry, so a wider one leaves the sorted
 # row order of ``grouping.unique_1d`` unchanged. That is what lets a caller whose bound is only
 # ever the packing's radix (and not, say, the length of an output buffer) skip the reduction
-# entirely -- measured on ``grouping.hash_indices_rows``, 61 440 rows: 112.3 us inferring the
-# bound against 24.1 us packing against this one.
+# entirely -- measured on ``grouping.hash_indices_rows``, packing against this radix is several
+# times cheaper than inferring the tight bound first.
 #
 # Three or more columns cannot use it: ``radix ** w`` has to fit ``uint64``, which caps a
 # three-column radix near ``2.6e6``.

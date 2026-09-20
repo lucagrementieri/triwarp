@@ -3,68 +3,59 @@ Benchmarks for ``triwarp.proximity`` hot paths.
 
 Covers winding number, signed distance, tangent spheres and geodesic-ball queries. The AABB
 reduction moved to [`test_bounds.py`](test_bounds.py), where ``triwarp.bounds`` lives.
-``winding_number`` is O(n_queries x n_faces) even in the tiled variant, so ``lucy`` is skipped;
-the pinned serial (``tiled=False``) path is additionally capped at ``bunny`` because one thread
-per query walking every face takes minutes beyond that.
+``winding_number`` is O(n_queries x n_faces) even in the tiled variant, so ``lucy`` is skipped; the
+pinned serial (``tiled=False``) path is additionally capped at ``bunny`` because one thread per
+query walking every face takes minutes beyond that.
 
 Read ``winding_number`` and ``signed_distance_on_mesh[winding]`` together: both answer an
 inside/outside question from solid angle, but the first accumulates it exactly over every face while
 the second lets Warp's BVH traversal approximate it and keeps only the sign. The gap between them is
 the cost of needing the winding *value* rather than just its sign.
 
-Open3D has no equivalent for anything in this module: it has no
-generalized winding number — its inside/outside test is raycasting-based
-(``RaycastingScene.compute_occupancy``), a different algorithm answering a coarser question — and no
-tangent-sphere, local-thickness or geodesic-ball query at all.
+Open3D has no equivalent for anything in this module: no generalized winding number -- its
+inside/outside test is raycasting-based, a different algorithm answering a coarser question -- and
+no tangent-sphere, local-thickness or geodesic-ball query at all.
 
 ``signed_distance_on_mesh`` has **two** references, and they are the only two that exist: libigl's
 ``igl.signed_distance``, whose ``sign_type`` axis maps onto triwarp's ``sign_mode`` one-for-one, and
-pymeshlab's, whose sign rule is a third algorithm and therefore appears once. See
-``test_signed_distance_on_mesh`` for the igl mapping and its numbers.
+pymeshlab's, whose sign rule is a third algorithm and therefore appears once.
 
 **One thing libigl's signed distance does that no assert may ignore:** for both winding-based sign
 types it returns ``(1 - 2w) * d`` rather than ``sign(1 - 2w) * d``, with ``w`` the *continuous*
 winding number. So its magnitude is only ``|d|`` where ``w`` is exactly 0 or 1, and near the surface
-it is scaled down — measured on ``bunny_decimated``, ``|S|`` deviates from the pseudonormal type's
-by **2.7e-2 of the bbox diagonal** for both ``WINDING_NUMBER`` and ``FAST_WINDING_NUMBER``, while
-the pseudonormal type agrees with triwarp to **8e-8**. That is why the parity oracle in
-``tests/test_proximity.py`` is the pseudonormal type and why the winding row here is a *cost*
-comparison only.
+it is scaled down -- measured on ``bunny_decimated``, ``|S|`` deviates from the pseudonormal type's
+by **2.7e-2 of the bbox diagonal** for both winding types, while the pseudonormal type agrees with
+triwarp to **8e-8**. That is why the parity oracle is the pseudonormal type and why the winding row
+here is a *cost* comparison only.
 
-**And the Barnes-Hut approximation does pay**, which is worth recording because a 5 000-query probe
-had suggested otherwise. At this module's 10 000 queries on ``bunny``, ``igl.fast_winding_number``
-is **76.5 ms against ``igl.winding_number``'s 272.5** (25.1 against 65.5 on ``bunny_decimated``) —
-3.6x and 2.6x — for a maximum winding deviation of 0.004. It is not a row of its own because triwarp
-exposes no approximate-winding entry point to put on the other side of it (``winding_number`` is the
-exact sum; the Barnes-Hut walk exists only inside
-``signed_distance_on_mesh(sign_mode="winding")``), but it is the number to weigh a fast-winding port
-against.
+**And the Barnes-Hut approximation does pay**, which is worth recording because a smaller probe had
+suggested otherwise. At this module's query count ``igl.fast_winding_number`` is 2.6-3.6x
+``igl.winding_number`` for a maximum winding deviation of 0.004. It is not a row of its own because
+triwarp exposes no approximate-winding entry point to put opposite it (``winding_number`` is the
+exact sum; the Barnes-Hut walk exists only inside ``signed_distance_on_mesh(sign_mode="winding")``),
+but it is the number to weigh a fast-winding port against.
 
-``compute_scalar_by_distance_from_another_mesh_per_vertex(signeddist=True)`` (MeshLab's Distance
-from Reference Mesh) measures every vertex of one mesh against another, so the query points go in as
-a second, face-less mesh and the answer comes back on their vertex scalar attribute. Three things to
-read its row against:
+``compute_scalar_by_distance_from_another_mesh_per_vertex(signeddist=True)`` measures every vertex
+of one mesh against another, so the query points go in as a second, face-less mesh and the answer
+comes back on their vertex scalar attribute. Three things to read its row against:
 
 - **Its sign is a third algorithm.** MeshLab takes the dot product with the reference normal at the
-  closest point — neither triwarp's 5-ray parity test nor its Barnes-Hut winding accumulation. So it
-  appears once rather than twice, in the ``parity`` row.
-- **Its per-query cost grows with the reference mesh.** At a fixed 10 000 queries it costs
-  **206 / 627 / 7 678 ms** on bunny_decimated / bunny / dragon — 20, 63 and 768 µs per query — while
-  being cleanly linear in the query count at a fixed mesh (69 ms at 1 k, 642 at 10 k, 6 125 at 100 k
-  on bunny). A closest-point query that is *not* sublinear in the face count is the opposite of what
-  triwarp's BVH does — measured **95x** and **235x** against it on bunny_decimated and bunny, a
-  ratio that widens with the mesh — which is why it is capped at ``bunny`` with ``rounds=3`` rather
-  than allowed to spend 85 s on dragon.
+  closest point -- neither triwarp's 5-ray parity test nor its Barnes-Hut winding accumulation. So
+  it appears once rather than twice, in the ``parity`` row.
+- **Its per-query cost grows with the reference mesh**, an order of magnitude across the scan sweep
+  at a fixed query count, while being cleanly linear in the query count at a fixed mesh. A
+  closest-point query that is *not* sublinear in the face count is the opposite of what triwarp's
+  BVH does -- two orders of magnitude against it, widening with the mesh -- which is why it is
+  capped at ``bunny`` with ``rounds=3``.
 - It writes only the vertex scalar, so the two-mesh MeshSet is built once and shared.
 
-``shape_diameter`` is the one group in this module whose reference is *not* faster than a
-millisecond and not close either: ``compute_scalar_by_shape_diameter_function_per_vertex`` is the
-most expensive per-vertex filter MeshLab ships (674 ms on ``bunny``), because it traces 64 rays from
-every vertex on one core. That is exactly the shape of work a GPU should win outright, which is why
-the port exists. Two caveats for reading its row: its ``cone_amplitude`` parameter is a **no-op** in
-the 2025.07 build (byte-identical output at 90 and 120 degrees), so its cone is whatever it is, and
-it writes only the vertex scalar, so the MeshSet is shared. The ``rays`` sweep is the axis, not the
-mesh: the cost is exactly linear in it on both sides, and the pair pins that.
+``shape_diameter`` is the one group whose reference is nowhere near a millisecond:
+``compute_scalar_by_shape_diameter_function_per_vertex`` is the most expensive per-vertex filter
+MeshLab ships, because it traces 64 rays from every vertex on one core. That is exactly the shape of
+work a GPU should win outright, which is why the port exists. Two caveats: its ``cone_amplitude``
+parameter is a **no-op** in the 2025.07 build (byte-identical output at 90 and 120 degrees), so its
+cone is whatever it is, and it writes only the vertex scalar, so the MeshSet is shared. The ``rays``
+sweep is the axis, not the mesh: the cost is exactly linear in it on both sides.
 """
 
 from __future__ import annotations
@@ -154,9 +145,9 @@ def test_winding_number(bench_case: BenchCase, n_queries: int) -> None:
     """
     Exact winding number: no BVH, every query sums over every face.
 
-    The one genuinely ``O(queries x faces)`` function in the module, so both sizes are swept --
-    the mesh by the registry and the query count here. A 10x step in queries that is not a 10x
-    step in time would mean the launch is not saturating the device.
+    The one genuinely ``O(queries x faces)`` function in the module, so both sizes are swept -- the
+    mesh by the registry and the query count here. A 10x step in queries that is not a 10x step in
+    time would mean the launch is not saturating the device.
 
     **pyvista answers the reduced question**: ``select_interior_points`` returns the inside/outside
     *bool* rather than the winding number itself, which is what ``ray.contains_points`` returns and
@@ -165,21 +156,20 @@ def test_winding_number(bench_case: BenchCase, n_queries: int) -> None:
     two other rows deliberately do not.
 
     Its ``check_surface=False`` is **required, not a shortcut**: the filter validates first and
-    raises ``RuntimeError: Surface is not closed`` on every scan mesh in the registry --
-    ``bunny_decimated`` has 273 open edges and ``bunny`` 223 -- so with the check on there is no
-    mesh here the row can run at all. Disabling it times the ray casting itself (156 / 296 ms per
-    10 000 queries on those two), which is the comparable work; the *answer* on an open surface is
-    undefined by VTK's own documentation, which is why the value comparison lives in
-    ``tests/test_ray.py`` on a closed fixture and this row asserts only the shape.
+    raises ``RuntimeError: Surface is not closed`` on every scan mesh in the registry, so with the
+    check on there is no mesh here the row can run at all. Disabling it times the ray casting
+    itself, which is the comparable work; the *answer* on an open surface is undefined by VTK's own
+    documentation, which is why the value comparison lives in ``tests/test_ray.py`` on a closed
+    fixture and this row asserts only the shape.
 
     **meshlib answers a Barnes-Hut approximation of it**, and that is the whole reason its row is
     interesting here: ``FastWindingNumber(mesh).calcFromVector`` walks the mesh's AABB tree and
     replaces a distant subtree by a dipole, so unlike triwarp's and igl's rows it is *not*
     ``O(queries x faces)`` and should not follow the product. ``beta=20`` is the accuracy at which
-    it agrees with the exact sum to 1e-05 (``tests/test_proximity.py``); its own default of 2 is 24x
-    looser, so a row at the default would be timing a coarser answer. The tree build is inside the
-    timed callable because ``FastWindingNumber`` is constructed per call, which is the same
-    no-hoisting situation igl's AABB tree and triwarp's ``wp.Mesh`` are in.
+    it agrees with the exact sum to 1e-05; its own default of 2 is 24x looser, so a row at the
+    default would be timing a coarser answer. The tree build is inside the timed callable because
+    ``FastWindingNumber`` is constructed per call, the same no-hoisting situation igl's AABB tree
+    and triwarp's ``wp.Mesh`` are in.
     """
     skip_larger_than(bench_case, "happy_buddha", "O(queries x faces): lucy is untenable")
     if n_queries > _N_QUERIES:
@@ -259,50 +249,43 @@ def test_closest_point_on_mesh(bench_case: BenchCase) -> None:
     The unsigned closest-point query, without the sign work the group below pays for.
 
     Read against ``signed_distance_on_mesh``: both walk a BVH to the nearest triangle, and the
-    difference between the two groups is what signing costs -- five perturbed parity rays or a
-    winding traversal on triwarp's side, a projection-normal test on MeshLib's. That comparison is
-    the reason this group exists separately rather than being folded into the signed one.
+    difference between the groups is what signing costs -- five perturbed parity rays or a winding
+    traversal on triwarp's side, a projection-normal test on MeshLib's. That comparison is why this
+    group exists separately rather than being folded into the signed one.
 
-    meshlib's batched form is ``PointsToMeshProjector``: ``updateMeshData`` hands it the mesh and
-    ``findProjections`` fills a ``std_vector_MeshProjectionResult``. The per-query
-    ``findProjection`` free function gives identical distances (``tests/test_proximity.py``) but
-    would time a Python loop. The mesh is built and the AABB tree pre-warmed outside the timed
-    callable, so the row prices the traversal -- the ``new_mesh_ml`` rule for a query row.
+    meshlib's batched form is ``PointsToMeshProjector``; the per-query ``findProjection`` free
+    function gives identical distances but would time a Python loop. The mesh is built and the AABB
+    tree pre-warmed outside the timed callable, so the row prices the traversal -- the
+    ``new_mesh_ml`` rule for a query row. Two ways to crash this call rather than get an exception:
+    ``upDistLimitSq`` must be ``FLT_MAX``, not ``inf``, and **the projector keeps a raw pointer to
+    the mesh it was given**, so a temporary leaves it reading freed memory -- Open3D's
+    ``from_legacy`` hazard in a second library.
 
-    Two ways to crash this call rather than get an exception, both measured. ``upDistLimitSq`` must
-    be ``FLT_MAX``, not ``inf`` -- an infinite limit segfaults inside ``findProjections``. And
-    **the projector keeps a raw pointer to the mesh it was given**, so
-    ``updateMeshData(build_a_mesh())`` on a temporary leaves it reading freed memory and crashes on
-    a cloud this size; the mesh has to be held in a name that outlives every query, which is
-    Open3D's ``from_legacy`` hazard in a second library.
+    pyvista's ``find_closest_cell`` is the third batched form, through a ``vtkStaticCellLocator``.
+    It is the most *accurate* reference in the group -- against ``igl.point_mesh_squared_distance``
+    it agrees to float64 rounding on both distance and point -- but it returns the closest **point**
+    and the cell, never the distance, so its row is that much wider than what it is timed against
+    and the subtraction stays outside the timed callable. Its locator is built lazily and cached, so
+    it is pre-warmed rather than timed, like MeshLib's AABB tree.
 
-    pyvista's ``find_closest_cell`` is the third batched form of the same query, through a
-    ``vtkStaticCellLocator``. It is the most *accurate* reference in the group -- against
-    ``igl.point_mesh_squared_distance`` it agrees to 4.4e-16 on both the distance and the point --
-    but it returns the closest **point** and the cell, never the distance, so its row is that much
-    wider than what it is timed against and the subtraction stays out of the timed callable. Its
-    locator is built lazily and cached on the ``PolyData``, so it is pre-warmed here rather than
-    timed, the same rule MeshLib's AABB tree gets above.
-
-    **The per-query cost is not flat in the mesh, and the knee is between 1 M and 28 M faces.**
-    This group holds its query count fixed, so the effect shows up in a *caller* instead --
-    ``mesh_to_mesh_distance``, which used to derive its bound by querying at every vertex of one
-    mesh. Measured there, with the ``wp.Mesh`` build separated out: **26.5 ns** per query at 36k
-    queries against ``bunny``, **5.4** at 438k / ``dragon``, **10.2** at 544k / ``happy_buddha`` and
-    **58.3** at 14 M / ``lucy`` -- while the build itself stays linear (0.26 / 0.97 / 1.05 /
-    31.61 ms). The first number is launch overhead at a small dim; the last is a cache cliff, the
-    BVH having stopped fitting. It is worth knowing before reading any large-mesh row that ends in a
+    **The per-query cost is not flat in the mesh, and the knee is between the million- and
+    ten-million-face meshes.** This group holds its query count fixed, so the effect shows up in a
+    *caller* instead. With the ``wp.Mesh`` build separated out, the per-query cost falls from the
+    small meshes (launch overhead at a small dim) to a minimum in the middle and then rises by an
+    order of magnitude on the largest: a cache cliff, the BVH having stopped fitting. The build
+    stays linear throughout. Worth knowing before reading any large-mesh row that ends in a
     closest-point query as an algorithm result.
 
-    That cliff is why the caller no longer queries every vertex: 14 M of them cost 93 % of its call
-    to prune a traversal worth 0.8 % of it, and a subsample bounds the answer just as soundly
-    (``proximity._BOUND_SAMPLE_TARGET`` carries the sweep). This group is the one that still prices
-    the unsampled query, which is what keeps that cliff visible.
+    That cliff is why ``mesh_to_mesh_distance`` does not derive its bound by querying at every
+    vertex: on the largest mesh that was nearly all of its call, to prune a traversal worth a
+    fraction of a percent of it, and a subsample bounds the answer just as soundly
+    (``proximity._BOUND_SAMPLE_TARGET`` carries the sweep). This group still prices the unsampled
+    query, which is what keeps that cliff visible.
     """
     if bench_case.kind == "pyvista":
-        # 160 / 376 / 906 ms per 10 000-query call on bunny_decimated / bunny / dragon: VTK's
-        # locator is single-threaded, so this is capped where the suite's other host rows are.
-        skip_larger_than(bench_case, "bunny", "VTK's locator is single-threaded (906 ms at dragon)")
+        # Superlinear across the scan sweep: VTK's locator is single-threaded, so this is capped
+        # where the suite's other host rows are.
+        skip_larger_than(bench_case, "bunny", "VTK's locator is single-threaded")
         mesh_pv = bench_case.mesh_pv
         queries_np = _query_points_np(bench_case)
         mesh_pv.find_closest_cell(queries_np[:1], return_closest_point=True)  # pre-warm
@@ -392,18 +375,16 @@ def test_closest_point_on_edges(bench_case: BenchCase) -> None:
     ``PolyData`` is exact for this query (probed: 0.0 distance error, every cell id matching a
     brute-force argmin), and its locator is pre-warmed rather than timed, as in the surface group.
     MeshLib's ``findProjectionOnMeshEdges`` is the other exact reference and is deliberately absent:
-    it answers one query per call, so a row would time a Python loop over 10 000 queries rather than
-    the traversal (``tests/test_proximity.py`` carries it as a ``benchmarked=False`` claim).
+    it answers one query per call, so a row would time a Python loop rather than the traversal
+    (``tests/test_proximity.py`` carries it as a ``benchmarked=False`` claim).
 
-    First measurement, medians on an RTX 5090 at 10 000 queries: triwarp-cuda **2.94 ms** on
-    ``bunny`` against pyvista's **68.3** (23x), and 12.1 / 32.2 / 89.9 ms at ``dragon`` /
-    ``happy_buddha`` / ``lucy`` -- the slope is the crease *count*, not the face count. The
-    number to read it against is ``closest_point_on_mesh``'s **2.21 ms** on the same queries and
-    the same mesh: this query is **1.33x slower over a set ~30x smaller**, so the hand-written
-    deepening loop is
-    losing to Warp's built-in mesh traversal rather than to the geometry. A query far from every
-    crease pays several empty scans before the radius reaches anything, which is where that gap
-    lives and what a future ``initial_radius`` estimate (the k-NN path already has one) would close.
+    Two readings. triwarp leads pyvista by well over an order of magnitude, and the slope across the
+    scan sweep is the crease *count* rather than the face count. And the number to read it against
+    is ``closest_point_on_mesh`` on the same queries and mesh: **this query is slower over an edge
+    set some thirty times smaller**, so the hand-written deepening loop is losing to Warp's built-in
+    mesh traversal rather than to the geometry. A query far from every crease pays several empty
+    scans before the radius reaches anything, which is where that gap lives and what a future
+    ``initial_radius`` estimate (the k-NN path already has one) would close.
     """
     edges_np = _crease_edges_np(bench_case)
     n_edges = int(edges_np.shape[0])
@@ -444,34 +425,31 @@ def test_signed_distance_on_mesh(
 
     ``"winding"`` walks the BVH accumulating solid angle (Barnes-Hut, ``accuracy=2.0``) instead of
     casting 5 perturbed parity rays, and needs a ``wp.Mesh`` carrying the per-node solid-angle
-    expansion — so the ``wp.Mesh`` build inside the timed region differs between the two, which is
+    expansion -- so the ``wp.Mesh`` build inside the timed region differs between the two, which is
     intentional: it is part of what the mode costs. Both include that build because
-    ``signed_distance_on_mesh`` constructs its own mesh (it takes vertex/face arrays, not a
-    ``wp.Mesh``), so there is no way for a caller to hoist it.
+    ``signed_distance_on_mesh`` constructs its own mesh, so there is no way for a caller to hoist
+    it.
 
-    **libigl is the only reference whose sign axis maps onto both of triwarp's modes**, which is
-    why it appears twice where pymeshlab appears once: ``SIGNED_DISTANCE_TYPE_PSEUDONORMAL``
-    against ``"parity"`` and ``SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER`` against ``"winding"`` —
-    the second is the same Barnes-Hut family triwarp's mode is. Its AABB tree is built per call, as
+    **libigl is the only reference whose sign axis maps onto both of triwarp's modes**, which is why
+    it appears twice where pymeshlab appears once: ``SIGNED_DISTANCE_TYPE_PSEUDONORMAL`` against
+    ``"parity"`` and ``SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER`` against ``"winding"`` -- the
+    second is the same Barnes-Hut family triwarp's mode is. Its AABB tree is built per call, as
     triwarp's ``wp.Mesh`` is, and it gets ``rounds=3`` like the pymeshlab row.
 
     **open3d's row is Embree**: ``RaycastingScene.compute_signed_distance`` signs by ray parity, so
-    it pairs with ``"parity"`` only, and it shares triwarp's sign convention exactly (negative
-    inside; probed to 1.8e-7 agreement on an icosphere before the row landed). The scene build sits
-    inside the timed callable for the same no-hoisting reason triwarp's ``wp.Mesh`` build does.
+    it pairs with ``"parity"`` only, and it shares triwarp's sign convention exactly. The scene
+    build sits inside the timed callable for the same no-hoisting reason.
 
     **pyvista's row is an exact SDF and the closest match in the set**:
     ``compute_implicit_distance`` (``vtkImplicitPolyDataDistance``) shares triwarp's sign convention
-    -- negative inside -- and agrees to 1.5e-07 with a correlation of 1.0000000 and identical signs
-    on 2 000 queries, which is why it is the parity oracle for this group. One row only: it has a
-    single sign rule.
+    and agrees to 1.5e-07 with identical signs on 2 000 queries, which is why it is the parity
+    oracle for this group. One row only: it has a single sign rule.
 
-    In-harness medians at 10 000 queries, igl rows run in isolation: **64 / 150 ms on
-    ``bunny_decimated`` and 394 / 520 on ``bunny``** against triwarp's 6.3 / 6.6 and 4.3 / 4.0 — so
-    10-100x, and note that **the mode ratio disagrees between the two sides**: igl's winding sign
-    costs 2.3x its pseudonormal one where triwarp's two modes are within 1.3x of each other,
-    because the solid-angle walk rides the BVH traversal triwarp is already doing. Read igl's
-    *medians* here, not its minima: the pseudonormal row spreads 225-399 ms on ``bunny``.
+    Two things to read off the rows. The references are one to two orders of magnitude behind, and
+    **the mode ratio disagrees between the two sides** -- igl's winding sign costs over twice its
+    pseudonormal one where triwarp's two modes are within a third of each other, because the
+    solid-angle walk rides the BVH traversal triwarp is already doing. Read igl's *medians* here,
+    not its minima: its pseudonormal row spreads nearly twofold on the larger mesh.
     """
     if bench_case.kind == "pyvista":
         if sign_mode != "parity":
@@ -679,79 +657,49 @@ def test_mesh_to_mesh_distance(bench_case: BenchCase, offset: float) -> None:
     """
     Clearance between a mesh and a translated copy of itself, at two separations.
 
-    The **separation is the axis**, and the direction it runs in was a surprise worth recording.
-    The bound derived from the vertex query grows with the gap, so each face's query box grows with
-    it -- which predicts that a distant pair is the expensive one. Measured, it is the **cheap**
-    one: 8.78 ms against 12.89 on ``bunny``, and 5.32 against 11.46 on ``dragon``. Once the
-    running
-    minimum prunes by box-to-box gap, a large true clearance means almost every candidate is
-    rejected on that lower bound immediately, while a tight clearance leaves many pairs genuinely
-    close and each one has to be measured.
+    The **separation is the axis**, and it runs the opposite way to the obvious prediction. The
+    bound derived from the vertex query grows with the gap, yet a distant pair is the **cheap** one
+    on every mesh: once the running minimum prunes by box-to-box gap, a large true clearance rejects
+    almost every candidate on that lower bound immediately, while a tight one leaves many pairs
+    genuinely close and each has to be measured.
 
-    meshlib's ``findDistance`` is a BVH-versus-BVH descent with a running bound, which prunes with
-    information this two-phase form only has once the second phase starts; and it is multi-threaded.
-    So this is the row where a sequential-pruning algorithm is expected to compete well against a
-    wavefront, which the plan predicted up front (§13's CUDA-decided judgement: record the ratio and
-    keep it). Both rows build their own acceleration structure inside the callable.
+    meshlib's ``findDistance`` is a BVH-versus-BVH descent with a running bound -- pruning with
+    information this two-phase form only has once the second phase starts -- and it is
+    multi-threaded. So this is the row where a sequential-pruning algorithm is expected to compete
+    well against a wavefront. Both rows build their own acceleration structure inside the callable.
 
-    First measurement, medians on an RTX 5090, near / far:
+    Two things to read off the rows. They are **nearly flat in the face count up to about a
+    million**, so over that range the cost is the candidate count and not the mesh;
+    ``bunny_decimated`` is the slowest per face because its duplicated faces manufacture
+    near-zero-gap candidates no bound can prune. And the two prunes inside the kernel are what make
+    the numbers reportable at all: without them the same rows are an order of magnitude dearer.
 
-    | mesh | faces | triwarp-cuda | meshlib |
-    |---|---|---|---|
-    | ``bunny_decimated`` | 39 993 | 7.71 / 4.46 ms | **0.36 / 0.37** (21.7x / 12.0x) |
-    | ``bunny`` | 69 630 | 12.89 / 8.78 ms | **1.13 / 1.46** (11.4x / 6.0x) |
-    | ``dragon`` | 871 414 | 11.46 / 5.32 ms | (capped) |
-    | ``happy_buddha`` | 1 087 716 | 7.90 / 7.25 ms | (capped) |
-    | ``lucy`` | | 882.8 / 795.9 ms | (capped) |
-
-    Two things that table says. It is **nearly flat in the face count up to ~1 M** -- 40k costs more
-    than 871k -- so over that range the cost is the candidate count, not the mesh;
-    ``bunny_decimated`` is the slowest per face because its 87 duplicated faces manufacture
-    near-zero-gap candidates that no bound can prune. And the two prunes inside the kernel are what
-    make the numbers reportable at all: without them the same rows read 144.6 / 252.3 ms on
-    ``bunny``, so they are worth **11.2x** near and **29.1x** far.
-
-    **``lucy`` is not flat and the reason is a different function.** 26x ``happy_buddha``'s faces
-    costs 114x the time, and attributed per stage that is almost entirely the *bound*, not this
-    group's own query:
-
-    | stage | ``bunny`` near | ``happy_buddha`` near | ``lucy`` near |
-    |---|---|---|---|
-    | ``closest_point_on_mesh`` (the bound) | 1.19 ms | **6.50** | **840.22** |
-    | ``face_aabb_bounds`` | 0.03 | 0.03 | 0.83 |
-    | ``bvh_from_bounds`` | 0.23 | 1.04 | 30.77 |
-    | ``face_to_mesh_distance`` (the query) | **8.29** | 0.40 | 94.57 |
-
-    Inside that bound the ``wp.Mesh`` build is linear (0.26 / 0.97 / 1.05 / 31.61 ms across
-    ``bunny`` / ``dragon`` / ``happy_buddha`` / ``lucy``) and the **queries** are the cliff: 26.5 ns
-    each at 36k queries, 5.4 at 438k, 10.2 at 544k and **58.3 at 14 M**, a 5.7x rise per query once
-    the BVH stops fitting in cache. So the superlinearity belongs to ``closest_point_on_mesh``, is a
-    memory-hierarchy effect rather than an algorithm defect, and is *not* the thing a
-    BVH-versus-BVH rewrite of this function would fix.
+    **The largest mesh is not flat and the reason is a different function.** Per stage it is almost
+    entirely the *bound*; inside that bound the ``wp.Mesh`` build is linear and the **queries** are
+    the cliff, once the BVH stops fitting in cache. So the superlinearity belongs to
+    ``closest_point_on_mesh``, is a memory-hierarchy effect rather than an algorithm defect, and is
+    *not* what a BVH-versus-BVH rewrite of this function would fix.
 
     **The stage split inverts with size, which is where any future work has to be aimed.** The query
-    dominates exactly where the gap is -- the ``bunny_decimated`` and ``bunny`` rows, the only ones
-    meshlib is not capped out of -- and by ``happy_buddha`` the bound is 74 % of the call and the
-    query is 0.40 ms. So a cheaper bound (a subsampled vertex query is still sound: the minimum over
-    any *subset* of A's vertices is still an upper bound on the surface distance) only moves rows
-    that contribute no gap, and a faster query only moves the small ones.
+    dominates exactly where the gap is -- the small-mesh rows, the only ones meshlib is not capped
+    out of -- and on the large ones the bound is most of the call. So a cheaper bound (a subsampled
+    vertex query is still sound: the minimum over any *subset* of A's vertices is still an upper
+    bound) only moves rows that contribute no gap, and a faster query only moves the small ones.
 
-    **The query half has since been done, and it was a load-balancing problem rather than the
-    pruning problem it read as.** Counted on ``bunny``: the broad phase makes 2.01 M candidate
-    tests of which **0.16 %** survive the box prune, so the leaf test is not the cost -- but
-    **98.2 %** of query faces return no candidate at all, 0.5 % carry half the traversal, and the
-    busiest face walks **3 428** candidates alone. The walk now runs as a capped thread pass plus a
-    warp per straggler (``proximity._QUERY_CANDIDATE_CAP``), worth **3.1-10.2x** end to end on the
-    four rows here with the distance and ``face_a`` identical. Two levers were measured and
-    declined on the way: ``block_dim`` (256, the default, wins at every value from 32) and
-    tightening the query margin -- the vertex bound *is* the answer to all 16 digits on all four
-    rows, so there is nothing to tighten and the query is confirming a distance the bound already
-    found.
+    **The query half is a load-balancing problem rather than the pruning problem it reads as.**
+    Counted on a scan mesh: a tiny fraction of the broad phase's candidates survive the box prune,
+    so the leaf test is not the cost -- but the overwhelming majority of query faces return no
+    candidate at all, a fraction of a percent carry half the traversal, and the busiest face walks
+    thousands alone. The walk runs as a capped thread pass plus a warp per straggler
+    (``proximity._QUERY_CANDIDATE_CAP``), worth several-fold end to end with the distance and
+    ``face_a`` identical. Two levers declined on the way: ``block_dim`` (256, the default, wins at
+    every value from 32) and tightening the query margin -- the vertex bound *is* the answer to full
+    precision on all four rows, so the query only confirms a distance the bound already found.
 
     A BVH-pair wavefront remains the one change that would also delete the bound phase, and it is
     **larger than it looks**: Warp exposes ``bvh_query_aabb`` / ``bvh_query_ray`` and no
-    node-by-node traversal, so a pair descent means building our own hierarchy rather than
-    reusing ``wp.Bvh``.
+    node-by-node traversal, so a pair descent means building our own hierarchy rather than reusing
+    ``wp.Bvh``.
     """
     if bench_case.kind == "meshlib":
         skip_larger_than(bench_case, "bunny", "findDistance is a serial descent per pair")

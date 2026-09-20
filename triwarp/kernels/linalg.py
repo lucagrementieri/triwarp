@@ -7,8 +7,7 @@ entries per free row, then fill them -- rather than a COO emission handed to
 ``warp.sparse.bsr_from_triplets``. The input rows come out of a CSR, so they are already row-major,
 already column-sorted and already duplicate-free, and ``free_map`` is monotone, so the extracted
 row is sorted by construction: the sort and duplicate-accumulation a triplet build performs are pure
-waste here. Measured on ``benchmarks/test_linalg.py``'s ``saddle`` case, that build was **20.7 ms in
-a single launch, 91 % of all device time** in ``min_quad_with_fixed``.
+waste here, and that build was the overwhelming majority of ``min_quad_with_fixed``'s device time.
 
 The module's other half, the batched conjugate-gradient iteration that solves the system this
 assembles, lives in ``triwarp.kernels.algorithms.conjugate_gradient``.
@@ -28,9 +27,8 @@ import warp as wp
 # Warp's own Householder QR. From ``warp._src.fem.linalg`` rather than the public
 # ``warp.fem.linalg``: both bind the same two ``@wp.func``s, which inline here and trigger no fem
 # codegen, but the public path executes ``warp/fem/__init__.py`` and eagerly loads the whole fem
-# package -- measured on **Warp 1.16** at 0.24-0.29 s against 0.008-0.010 s, and 1.49 s against
-# 1.18 s for ``import triwarp`` end to end. ``kernels/reduce.py`` reaches into ``warp._src`` on the
-# same terms.
+# package, which is two orders of magnitude dearer to import and shows up in ``import triwarp``.
+# ``kernels/reduce.py`` reaches into ``warp._src`` on the same terms.
 from warp._src.fem.linalg import householder_qr_decomposition, solve_triangular
 
 
@@ -54,8 +52,8 @@ def solve_normal_equations(matrix: Any, rhs: Any) -> tuple[Any, wp.bool]:
     spreads a mesh scale ``h`` over ``h^8`` to ``h^2`` on the diagonal alone), so
     ``min|R| / max|R|`` moves with ``h`` exactly as ``min|R|`` does. Both callers divide their local
     coordinates by the neighbourhood radius before accumulating, which makes the matrix they hand
-    over ``O(1)`` whatever the mesh's units; each says so at the site, with what it measured before
-    the division. A new caller that skips it gets a silent ``ok=False`` on a perfectly good system.
+    over ``O(1)`` whatever the mesh's units; each says so at the site. A new caller that skips it
+    gets a silent ``ok=False`` on a perfectly good system.
 
     **The rank is nowhere in this function, and that is the point.** It was written twice, as a 5x5
     for ``curvature``'s quadric fit and a 6x6 for ``smoothing``'s area-equalizing solve, because the
@@ -63,16 +61,11 @@ def solve_normal_equations(matrix: Any, rhs: Any) -> tuple[Any, wp.bool]:
     readable rank in kernel scope -- ``r.shape[0]`` is a ``WarpCodegenAttributeError`` at parse time
     on Warp 1.17. ``wp.min(wp.abs(wp.get_diag(r)))`` asks the identical question ("is some
     diagonal below tolerance") with no loop and no rank, which is what let the two collapse into
-    one. Verified against ``numpy.linalg.solve`` at both ranks: max abs error 4.163e-17 at 5 and
-    5.551e-17 at 6, with the singular case reporting ``ok=False`` at both.
-
-    The two predicates were also compared directly, 810 finite matrices per rank -- 200 well
-    conditioned, 200 near-singular spanning fourteen orders of magnitude of conditioning, and one
-    exactly rank-deficient per column -- and they agree on **every** one. They part on exactly two
-    inputs, and in the safe direction: a matrix carrying a ``nan`` or an ``inf`` entry passed the
-    old loop (``wp.abs(nan) < tol`` is False, so no iteration rejected it) and now reports
-    ``ok=False``. So a degenerate 1-ring that used to yield a ``nan`` fit silently now takes the
-    caller's fallback, which is what both callers already do for a singular system.
+    one. Verified against ``numpy.linalg.solve`` at both ranks, and the two singularity predicates
+    compared directly over hundreds of matrices per rank spanning fourteen orders of conditioning:
+    they agree on every finite one, and part only on a matrix carrying a ``nan`` or an ``inf``,
+    which the old loop passed (``wp.abs(nan) < tol`` is False, so no iteration rejected it) and this
+    reports ``ok=False`` -- the safe direction, and the fallback both callers already take.
     """
     q, r = householder_qr_decomposition(matrix)
     if wp.min(wp.abs(wp.get_diag(r))) < wp.float64(1e-14):
@@ -166,13 +159,12 @@ def interior_row_counts(
     # The nest re-reads the row once per right-hand side, which looks like an ``n_rhs``-fold read
     # amplification worth inverting (scan the row once into an ``n_rhs``-wide register vector).
     # Measured before building it, and it is not: this kernel is launched **once** per
-    # ``min_quad_with_fixed``, one of 15 launches in a 1.6 ms solve, and ``n_rhs`` is **1** for the
+    # ``min_quad_with_fixed``, one of fifteen launches in the solve, and ``n_rhs`` is **1** for the
     # default call -- so the inner loop runs a single iteration and there is nothing to invert. The
     # callers that pass more are ``lscm`` (2) and a vector-valued ``harmonic`` (3), where the whole
-    # pass is still one launch against a conjugate-gradient solve whose iteration count is what the
-    # benchmark's 12.6x spread between 50%- and 1%-pinned actually measures. A register vector would
-    # also need a compile-time ``MAX_RHS`` cap, which is a new documented limitation bought for
-    # nothing.
+    # pass is still one launch against a conjugate-gradient solve whose iteration count dominates. A
+    # register vector would also need a compile-time ``MAX_RHS`` cap, which is a new documented
+    # limitation bought for nothing.
     for c in range(fixed_values.shape[0]):
         acc = wp.float64(0.0)
         for e in range(start, end):

@@ -284,8 +284,8 @@ def edges_unique_length(
     if unique_edges is None:
         # ``vertices.shape[0]`` when the caller gave no count: ``edges_unique`` would otherwise
         # infer it from ``faces`` with ``array.index_bound``, a device reduction plus a host
-        # readback measured at 61.5 us, for a number every caller of *this* function already holds
-        # in the array it passed. It is also the bound ``validate`` is documented against.
+        # readback, for a number every caller of *this* function already holds in the array it
+        # passed. It is also the bound ``validate`` is documented against.
         if n_vertices is None:
             n_vertices = int(vertices.shape[0])
         unique_edges, _ = edges_unique(faces, n_vertices=n_vertices, validate=validate)
@@ -421,9 +421,8 @@ def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
         [`mean_unique_edge_length`][triwarp.edges.mean_unique_edge_length] counts each edge once,
         matching ``igl::avg_edge_length`` and MeshLab's ``avg_edge_length``. The two agree exactly
         on a closed manifold mesh -- every edge has two incident faces there, so the doubling is
-        uniform -- and diverge on anything with a boundary or a non-manifold edge: measured
-        **0.452405 against 0.449910** on an open half-torus and **0.293087 against 0.291590** on a
-        hemisphere.
+        uniform -- and diverge by a fraction of a percent on anything with a boundary or a
+        non-manifold edge.
 
         Reach for this one when reproducing libigl's curvature; reach for the unique-edge one when
         reproducing anything else, including the heat method's timestep.
