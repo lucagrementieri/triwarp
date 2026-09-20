@@ -3,7 +3,7 @@ import warp as wp
 from triwarp.constants import PI, TOLERANCE_ZERO_CONSTANT, TWO_PI
 from triwarp.kernels.array import to_vec3, wrap_index
 from triwarp.kernels.halfedge import halfedge_destination
-from triwarp.kernels.predicates import project_out_normal, unit_tangent
+from triwarp.kernels.predicates import project_out_normal, unit_tangent, world_to_tangent
 from triwarp.kernels.tangent_space import corner_angle
 from triwarp.kernels.triangles import face_normal, local_corner
 
@@ -180,7 +180,8 @@ def start_direction_at_vertex(
         return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
 
     # Polar angle of the direction in the vertex's tangent frame, in [0, 2*pi).
-    angle = wp.atan2(wp.dot(direction, basis_y[vertex]), wp.dot(direction, basis_x[vertex]))
+    tangent = world_to_tangent(direction, basis_x[vertex], basis_y[vertex])
+    angle = wp.atan2(tangent[1], tangent[0])
     if angle < wp.float32(0.0):
         angle += TWO_PI
 

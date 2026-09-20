@@ -9,18 +9,31 @@ solves need double precision.
 
 Three sections, in the order their wrappers appear: the scalar heat method's diffusion and gradient
 normalization, the signed method's curve seeding and level-set constraints, and the vector method's
-transport, extension and log map. They share `face_unit_gradient` and the ``float64`` convention,
-which is why they are one module rather than three.
+transport, extension and log map. They share `face_unit_gradient`, `tangent_to_world` and the
+``float64`` convention, which is why they are one module rather than three.
 """
 
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.array import to_vec2
+from triwarp.kernels.array import to_vec2, to_vec2d
 from triwarp.kernels.linalg import free_row
-from triwarp.kernels.predicates import normalize_or_zero, unit_tangent
+from triwarp.kernels.predicates import normalize_or_zero, unit_tangent, world_to_tangent
 from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import corner_triple, face_unit_gradient, face_vertices_vec3d
+
+
+@wp.func
+def tangent_to_world(tangent: wp.vec2, basis_x: wp.vec3, basis_y: wp.vec3) -> wp.vec3:
+    # A tangent vector's world-space direction, in the vertex's own (orthonormal) frame. The
+    # inverse of [`predicates.world_to_tangent`][triwarp.kernels.predicates.world_to_tangent], and
+    # here rather than beside it because ``triwarp.heat`` publishes this half as a ``wp.map`` op.
+    #
+    # Above the section headers because two of the three solvers reach it: the signed method
+    # expands each corner's tangent field to 3D before averaging, and the vector method's public
+    # wrapper maps it over a whole transported field.
+    return tangent[0] * basis_x + tangent[1] * basis_y
+
 
 # --------------------------------------------------------------------------------------
 # Scalar heat method: geodesic distance (Crane et al. 2013)
@@ -136,13 +149,7 @@ def splat_curve_normals(
             continue
         curve_normal = wp.cross(normal, tangential)
         wp.atomic_add(
-            out_field,
-            v,
-            weight
-            * wp.vec2d(
-                wp.float64(wp.dot(curve_normal, basis_x[v])),
-                wp.float64(wp.dot(curve_normal, basis_y[v])),
-            ),
+            out_field, v, weight * to_vec2d(world_to_tangent(curve_normal, basis_x[v], basis_y[v]))
         )
 
 
@@ -173,8 +180,7 @@ def vertex_field_divergence(
     total = wp.vec3(0.0, 0.0, 0.0)
     for k in range(3):
         v = faces[f * 3 + k]
-        value = field[v]
-        total += wp.float32(value[0]) * basis_x[v] + wp.float32(value[1]) * basis_y[v]
+        total += tangent_to_world(to_vec2(field[v]), basis_x[v], basis_y[v])
     tangential, _length = unit_tangent(total, normals[f], TOLERANCE_ZERO_CONSTANT)
     x = wp.vec3d(wp.float64(tangential[0]), wp.float64(tangential[1]), wp.float64(tangential[2]))
     accumulate_face_divergence(vertices, faces, cot_entries, f, x, out_div)
@@ -340,11 +346,6 @@ def transported_and_resolved(
     return (to_vec2(scale_to_magnitude(direction, magnitude, floor)), length > resolved_floor)
 
 
-@wp.func
-def tangent_to_world(tangent: wp.vec2, basis_x: wp.vec3, basis_y: wp.vec3) -> wp.vec3:
-    return tangent[0] * basis_x + tangent[1] * basis_y
-
-
 @wp.kernel
 def scatter_unit_gradient_to_vertices(
     vertices: wp.array[wp.vec3],
@@ -378,8 +379,7 @@ def world_to_tangent_unit(
     # squared and a fixed floor collapses the
     # whole log map to angle zero on any mesh not near unit scale (confirmed: every one of 162
     # vertices on a unit icosphere scaled by 1e-7).
-    tangent = wp.vec2(wp.dot(value, basis_x), wp.dot(value, basis_y))
-    return normalize_or_zero(tangent, tolerance)
+    return normalize_or_zero(world_to_tangent(value, basis_x, basis_y), tolerance)
 
 
 @wp.kernel

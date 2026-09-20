@@ -12,7 +12,7 @@ import warp as wp
 from warp._src.context import builtin_functions as _warp_builtins
 
 from triwarp.constants import TILE_1D, TILE_2D, TILES_PER_BLOCK_1D
-from triwarp.kernels.array import KernelTable, is_close_scalar, is_close_vec3
+from triwarp.kernels.array import KernelTable, atomic_min_packed_box, is_close_scalar, is_close_vec3
 
 _tile_min = _warp_builtins["tile_min"]
 _tile_max = _warp_builtins["tile_max"]
@@ -940,9 +940,7 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
         lower = wp.min(lower, p)  # wp.min / wp.max on a vector are component-wise
         upper = wp.max(upper, p)
 
-    for c in range(3):
-        wp.atomic_min(out_corners, c, lower[c])
-        wp.atomic_min(out_corners, 3 + c, -upper[c])
+    atomic_min_packed_box(out_corners, wp.int32(0), lower, upper)
 
 
 # ---------------------------------------------------------------------------

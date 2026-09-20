@@ -3,7 +3,7 @@ import math
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT
-from triwarp.kernels.array import tile_argmin
+from triwarp.kernels.array import atomic_min_packed_box, tile_argmin
 from triwarp.kernels.predicates import TWO_PI_F64
 
 # Super-Fibonacci spiral constants [Alexa 2022]: the two irrational strides whose phase pair
@@ -15,6 +15,37 @@ SUPER_FIBONACCI_RSQRT2 = wp.constant(wp.float64(1.0 / math.sqrt(2.0)))
 SUPER_FIBONACCI_RPSI = wp.constant(wp.float64(1.0 / 1.533751168755204288118041))
 
 
+@wp.func
+def super_fibonacci_quat(i: wp.int32, n: wp.int32) -> wp.vec4d:
+    """
+    Draw the ``i``-th of ``n`` Super-Fibonacci quaternions [Alexa 2022], as ``(x, y, z, w)``.
+
+    The low-discrepancy sample of SO(3) both axis kernels below draw from, which each had spelled
+    out: the sampled candidate set, and the deltas a refinement round shrinks toward the identity.
+    One definition because the sequence is a *contract* between them -- the refinement's
+    monotonicity argument rests on its last element being the identity rotation -- and a drifted
+    stride or a permuted component order would still return plausible frames.
+
+    Returned in float64 and narrowed by the caller: the phases reach ``2 * pi * n`` (~6e4 radians at
+    igl's default), where float32 argument reduction has already lost four digits of the angle and
+    the low-discrepancy property with it. The constants are reciprocals multiplied rather than
+    divided by, so the candidate set stays bit-comparable with ``igl::super_fibonacci``'s.
+    """
+    s = wp.float64(i) + wp.float64(0.5)
+    phase = TWO_PI_F64 * s
+    alpha = phase * SUPER_FIBONACCI_RSQRT2
+    beta = phase * SUPER_FIBONACCI_RPSI
+    height = s / wp.float64(n)
+    radius = wp.sqrt(height)
+    radius_conjugate = wp.sqrt(wp.float64(1.0) - height)
+    return wp.vec4d(
+        radius * wp.sin(alpha),
+        radius * wp.cos(alpha),
+        radius_conjugate * wp.sin(beta),
+        radius_conjugate * wp.cos(beta),
+    )
+
+
 @wp.kernel
 def oriented_box_candidate_axes(n_rotations: wp.int32, out_axes: wp.array[wp.mat33]) -> None:
     # Candidate box orientations, as world -> box frames whose *rows* are the box axes.
@@ -23,30 +54,15 @@ def oriented_box_candidate_axes(n_rotations: wp.int32, out_axes: wp.array[wp.mat
     # SO(3) ``igl::oriented_bounding_box`` searches — with the identity as the **last** candidate,
     # so a returned box can never be worse than the axis-aligned one and ``n_rotations = 1`` reduces
     # to exactly the axis-aligned reduction.
-    #
-    # The phase math runs in float64 and only the resulting quaternion is narrowed. The arguments
-    # reach ``2 * pi * n_rotations`` (~6e4 radians at igl's default), where float32 argument
-    # reduction has already lost four digits of the angle and the low-discrepancy property with it.
     i = wp.int32(wp.tid())
     n_spiral = n_rotations - 1
     if i >= n_spiral:
         out_axes[i] = wp.identity(n=3, dtype=wp.float32)
         return
 
-    s = wp.float64(i) + wp.float64(0.5)
-    phase = TWO_PI_F64 * s
-    alpha = phase * SUPER_FIBONACCI_RSQRT2
-    beta = phase * SUPER_FIBONACCI_RPSI
-    height = s / wp.float64(n_spiral)
-    radius = wp.sqrt(height)
-    radius_conjugate = wp.sqrt(wp.float64(1.0) - height)
+    q = super_fibonacci_quat(i, n_spiral)
     rotation = wp.quat_to_matrix(
-        wp.quat(
-            wp.float32(radius * wp.sin(alpha)),
-            wp.float32(radius * wp.cos(alpha)),
-            wp.float32(radius_conjugate * wp.sin(beta)),
-            wp.float32(radius_conjugate * wp.cos(beta)),
-        )
+        wp.quat(wp.float32(q[0]), wp.float32(q[1]), wp.float32(q[2]), wp.float32(q[3]))
     )
     # The quaternion names a box -> world rotation; the extent reduction wants world -> box.
     out_axes[i] = wp.transpose(rotation)
@@ -62,9 +78,10 @@ def oriented_box_refine_axes(
     # One trust-region ball of perturbed frames per chain: the Super-Fibonacci sample of SO(3),
     # geodesically shrunk toward the identity (each rotation angle scaled by ``sigma / pi``),
     # composed onto the chain's base frame in place of the host einsum and upload the refinement
-    # loop used to pay per round. Same float64 phase math as
-    # ``oriented_box_candidate_axes`` above; the last delta of every chain is the identity, which
-    # re-scores the base and keeps each chain monotone.
+    # loop used to pay per round. Draws the same
+    # [`super_fibonacci_quat`][triwarp.kernels.bounds.super_fibonacci_quat] sequence
+    # ``oriented_box_candidate_axes`` samples, so the last delta of every chain is the identity --
+    # which re-scores the base and keeps each chain monotone.
     i = wp.int32(wp.tid())
     count = count_per_chain
     chain = i // count
@@ -74,17 +91,11 @@ def oriented_box_refine_axes(
         out_axes[i] = base
         return
 
-    s = wp.float64(p) + wp.float64(0.5)
-    phase = TWO_PI_F64 * s
-    alpha = phase * SUPER_FIBONACCI_RSQRT2
-    beta = phase * SUPER_FIBONACCI_RPSI
-    height = s / wp.float64(count - 1)
-    radius = wp.sqrt(height)
-    radius_conjugate = wp.sqrt(wp.float64(1.0) - height)
-    qx = radius * wp.sin(alpha)
-    qy = radius * wp.cos(alpha)
-    qz = radius_conjugate * wp.sin(beta)
-    qw = radius_conjugate * wp.cos(beta)
+    delta_quat = super_fibonacci_quat(p, count - 1)
+    qx = delta_quat[0]
+    qy = delta_quat[1]
+    qz = delta_quat[2]
+    qw = delta_quat[3]
     if qw < wp.float64(0.0):  # same rotation, angle in [0, pi]
         qx = -qx
         qy = -qy
@@ -146,10 +157,7 @@ def oriented_box_extents(
 
     # A slice past the end of the cloud contributes nothing.
     if upper[0] > -FLOAT32_INF_CONSTANT:
-        base = k * 6
-        for c in range(3):
-            wp.atomic_min(out_corners, base + c, lower[c])
-            wp.atomic_min(out_corners, base + 3 + c, -upper[c])
+        atomic_min_packed_box(out_corners, k, lower, upper)
 
 
 BOX_OBJECTIVE_VOLUME = wp.constant(wp.int32(0))
@@ -376,12 +384,7 @@ def packed_box_diagonals(corners: wp.array[wp.float32], out_diagonal: wp.array[w
     # comes out negative. That reads as **zero** rather than as ``nan``, which is what lets a caller
     # threshold the whole array uniformly instead of masking the empty slots first.
     box = wp.int32(wp.tid())
-    base = box * 6
-    extent = wp.vec3(
-        -corners[base + 3] - corners[base],
-        -corners[base + 4] - corners[base + 1],
-        -corners[base + 5] - corners[base + 2],
-    )
+    extent = packed_box_sides(corners, box)
     if extent[0] < wp.float32(0.0):
         out_diagonal[box] = wp.float32(0.0)
     else:

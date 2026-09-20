@@ -504,6 +504,29 @@ def unit_tangent(vector: Any, normal: Any, tolerance: Any) -> tuple[Any, wp.Floa
 
 
 @wp.func
+def world_to_tangent(value: Any, basis_x: Any, basis_y: Any):
+    # A world-space vector's components in a vertex's (orthonormal) tangent basis.
+    #
+    # Sits beside ``project_out_normal`` / ``unit_tangent`` because it is the third member of the
+    # same family: those two take a vector *to* the tangent plane, this one names it *in* the
+    # plane's own coordinates. Three callers had the two dot products spelled out --
+    # ``heat.splat_curve_normals`` (widened to float64 for the vector-diffusion source),
+    # ``heat.world_to_tangent_unit`` (normalized) and ``geodesic_walk.start_direction_at_vertex``
+    # (read as a polar angle) -- and the component *order* is the decision they share: it fixes
+    # the sign of every angle taken against the frame, and a transposed copy still returns a
+    # plausible tangent vector.
+    #
+    # No normalization and no tolerance: each caller floors against a different thing (a relative
+    # fraction of its own field maximum, or nothing at all), so the guard is theirs. Generic over
+    # the precision for the usual reason -- the callers hold float32 frames and want a float32
+    # result, and widening is ``array.to_vec2d`` afterwards rather than a second body.
+    #
+    # The inverse is [`heat.tangent_to_world`][triwarp.kernels.heat.tangent_to_world], which stays
+    # in the module that publishes it as a ``wp.map`` op.
+    return wp.vector(wp.dot(value, basis_x), wp.dot(value, basis_y))
+
+
+@wp.func
 def normalize_or_zero(v: Any, tolerance: Any):
     length = wp.length(v)
     if length <= tolerance:

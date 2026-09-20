@@ -4,6 +4,7 @@ import warp as wp
 
 from triwarp.kernels.array import (
     OverloadTable,
+    atomic_min_packed_box,
     binary_search_index,
     trilinear_cell,
     trilinear_corner,
@@ -329,12 +330,11 @@ def scatter_group_bounds(
     # needs ``n_groups == n_faces``. A group no face names keeps its ``inf`` seed, which
     # [`packed_box_diagonals`][triwarp.kernels.bounds.packed_box_diagonals] reads as empty.
     f = wp.int32(wp.tid())
-    base = groups[f] * 6
+    group = groups[f]
     for c in range(3):
+        # One point is its own degenerate box, so it reduces into both halves of the packing.
         position = vertices[faces[f * 3 + c]]
-        for k in range(3):
-            wp.atomic_min(out_corners, base + k, position[k])
-            wp.atomic_min(out_corners, base + 3 + k, -position[k])
+        atomic_min_packed_box(out_corners, group, position, position)
 
 
 @wp.kernel

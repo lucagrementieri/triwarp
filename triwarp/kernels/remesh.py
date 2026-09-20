@@ -35,6 +35,8 @@ from triwarp.kernels.triangles import (
     face_vertices_vec3d,
     local_corner,
     triangle_quality,
+    write_corner_triple,
+    write_row_triple,
 )
 from triwarp.kernels.voxels import squared_distance_to_own_cell_center
 
@@ -412,9 +414,7 @@ def _write_tri(
     valid: wp.bool,
     src: wp.int32,
 ) -> None:
-    out_faces[slot, 0] = tri[0]
-    out_faces[slot, 1] = tri[1]
-    out_faces[slot, 2] = tri[2]
+    write_row_triple(out_faces, slot, tri[0], tri[1], tri[2])
     out_valid[slot] = valid
     out_slot_index[slot] = src
 
@@ -1057,6 +1057,29 @@ def claim_flips(
     wp.atomic_min(out_edge_claim, slot, k)
 
 
+@wp.func
+def write_flipped_quad(
+    out_faces: wp.array[wp.int32],
+    f0: wp.int32,
+    f1: wp.int32,
+    a: wp.int32,
+    b: wp.int32,
+    c: wp.int32,
+    d: wp.int32,
+) -> None:
+    # Rewrite the two faces of a flipped quad ``(a, b, c, d)``: the new diagonal is b-d, so the
+    # faces become ``(a, b, d)`` and ``(c, d, b)``, which is the pair that preserves the original
+    # winding.
+    #
+    # One winding convention, named once rather than spelled out by each of the two kernels that
+    # commits a flip (the extrinsic ``commit_flips`` and the intrinsic ``commit_intrinsic_flips``).
+    # A duplicated *decision* rather than duplicated arithmetic: a permuted copy still writes two
+    # well-formed triangles covering the same quad, so the mesh stays manifold and only its
+    # orientation quietly inverts along the flipped edges.
+    write_corner_triple(out_faces, f0, a, b, d)
+    write_corner_triple(out_faces, f1, c, d, b)
+
+
 @wp.kernel
 def commit_flips(
     flip: wp.array[wp.bool],
@@ -1079,13 +1102,7 @@ def commit_flips(
     b = quad[k, 1]
     c = quad[k, 2]
     d = quad[k, 3]
-    # New diagonal b-d: faces become (a, b, d) and (c, d, b), preserving winding.
-    out_faces[f0 * 3 + 0] = a
-    out_faces[f0 * 3 + 1] = b
-    out_faces[f0 * 3 + 2] = d
-    out_faces[f1 * 3 + 0] = c
-    out_faces[f1 * 3 + 1] = d
-    out_faces[f1 * 3 + 2] = b
+    write_flipped_quad(out_faces, f0, f1, a, b, c, d)
     wp.atomic_add(out_count, 0, 1)
 
 
@@ -1896,15 +1913,10 @@ def commit_intrinsic_flips(
     old_h_ab = f1 * 3 + corner_f1_c
     old_h_bc = f1 * 3 + corner_f1_a
 
-    # New diagonal b-d: faces become (a, b, d) and (c, d, b), preserving winding -- matching
-    # ``commit_flips``. Each new corner's opposite edge is one of: the new diagonal, or one of the
-    # four edges just measured above.
-    faces[f0 * 3 + 0] = a
-    faces[f0 * 3 + 1] = b
-    faces[f0 * 3 + 2] = d
-    faces[f1 * 3 + 0] = c
-    faces[f1 * 3 + 1] = d
-    faces[f1 * 3 + 2] = b
+    # The winding is ``write_flipped_quad``'s, shared with ``commit_flips``; what is intrinsic
+    # here is the length table below it -- each new corner's opposite edge is either the new
+    # diagonal or one of the four edges just measured above.
+    write_flipped_quad(faces, f0, f1, a, b, c, d)
 
     edge_lengths[f0, 0] = diagonal
     edge_lengths[f0, 1] = first_apex0
@@ -2399,14 +2411,13 @@ def compact_faces(
     if f == 0:
         out_state[DECIMATION_FACES] = kept
     if flags[f] != 0:
-        slot = (ranks[f] - 1) * 3
-        out_faces[slot + 0] = remapped[f * 3 + 0]
-        out_faces[slot + 1] = remapped[f * 3 + 1]
-        out_faces[slot + 2] = remapped[f * 3 + 2]
+        # Reads row ``f`` of ``remapped`` and writes row ``ranks[f] - 1`` of ``out_faces``: two
+        # different row bases, which is the whole hazard here and why both are named rather than
+        # spelled as ``* 3 + k``.
+        a, b, c = corner_triple(remapped, f)
+        write_corner_triple(out_faces, ranks[f] - 1, a, b, c)
     if f >= kept:
-        out_faces[f * 3 + 0] = dummy_vertex
-        out_faces[f * 3 + 1] = dummy_vertex
-        out_faces[f * 3 + 2] = dummy_vertex
+        write_corner_triple(out_faces, f, dummy_vertex, dummy_vertex, dummy_vertex)
 
 
 @wp.kernel

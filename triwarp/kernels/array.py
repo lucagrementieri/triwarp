@@ -128,6 +128,31 @@ def ravel_index(i: wp.int32, j: wp.int32, k: wp.int32, ny: wp.int32, nz: wp.int3
 
 
 @wp.func
+def atomic_min_packed_box(
+    out_corners: wp.array[wp.float32], box: wp.int32, lower: wp.vec3, upper: wp.vec3
+) -> None:
+    # Reduce one axis-aligned box into the six ``float32`` slots at ``box``, packed
+    # ``[min_x, min_y, min_z, -max_x, -max_y, -max_z]``: *negating* the upper half is what lets a
+    # single ``wp.full(inf)`` seed both ends and makes every update one ``wp.atomic_min``.
+    #
+    # A layout convention rather than an arithmetic run, which is why it is named here in the leaf
+    # library and not at any one of its writers -- ``bounds.oriented_box_extents`` (one box per
+    # candidate frame), ``reduce.minmax_vec3_chunked`` (the whole cloud into box 0) and
+    # ``scatter.scatter_group_bounds`` (one box per face group, which passes a single point as both
+    # corners). Three writers of one packing that several readers then decode is exactly the shape
+    # that goes silently wrong when one copy drifts: a transposed or un-negated half still runs and
+    # still returns a plausible box. Same reason ``ravel_index`` above is shared.
+    #
+    # The reader is [`packed_box_sides`][triwarp.kernels.bounds.packed_box_sides], which stays with
+    # the module that scores boxes; a slot nothing reduced into keeps its ``+inf`` seed in both
+    # halves and so decodes to a negative extent.
+    base = box * wp.int32(6)
+    for c in range(3):
+        wp.atomic_min(out_corners, base + c, lower[c])
+        wp.atomic_min(out_corners, base + 3 + c, -upper[c])
+
+
+@wp.func
 def loop_next_slot(
     loop_id: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],

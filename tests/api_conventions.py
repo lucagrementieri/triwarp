@@ -380,11 +380,18 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # pass's answer *and* this pass's, so it is in place and ``out_`` would read as write-only.
     ("remesh", "compose_vertex_index"): frozenset({"index"}),
     # ``intrinsic_delaunay``'s halfedge-twin flip engine mutates the mesh it was handed rather than
-    # producing a fresh one each round: ``faces`` and ``edge_lengths`` are the caller's own
-    # connectivity and metric, read pre-flip and overwritten in the same launch, and ``twin`` is the
-    # incrementally-maintained twin table every round both reads and updates. ``out_`` would misread
-    # all three as write-only.
-    ("remesh", "commit_intrinsic_flips"): frozenset({"faces", "edge_lengths", "twin"}),
+    # producing a fresh one each round: ``edge_lengths`` is the caller's own metric, read pre-flip
+    # and overwritten in the same launch, and ``twin`` is the incrementally-maintained twin table
+    # every round both reads and updates. ``out_`` would misread either as write-only.
+    #
+    # ``faces`` is the same kind of in-place argument and is deliberately *not* listed: the kernel
+    # now hands it to ``remesh.write_flipped_quad`` instead of storing into it directly, so this
+    # check -- which resolves store targets syntactically -- no longer sees it written at all and
+    # an entry here would match nothing. That is CLAUDE.md section 4.5's tension between the
+    # shared-run extraction and a syntactic scan, resolved the way that section resolves it: the
+    # extraction wins and the convention goes on binding the parameter unenforced. The staleness
+    # half is what reported it, which is the argument for keeping that half.
+    ("remesh", "commit_intrinsic_flips"): frozenset({"edge_lengths", "twin"}),
     # The other half of the same round's twin-table update: every halfedge not touched directly by
     # ``commit_intrinsic_flips`` reads and, where its neighbor moved, corrects its own twin pointer.
     ("remesh", "fixup_twin_remap"): frozenset({"twin"}),
