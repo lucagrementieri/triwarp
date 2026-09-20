@@ -4084,10 +4084,34 @@ Recording costs at least what issuing the launches costs, because capture interc
 | replay of an already-recorded sequence | **4.29x** |
 
 That last row is where capture's reputation comes from and it is unreachable without a *repeated*
-sequence. **Do not reach for capture on a once-through Python loop** — the hole-fill span loop and
-the stitch DP's diagonal loop are each recorded and replayed exactly once, which is the 0.84x row,
-and the packing family reproduces it (a pack's segment pointers change every call, so the recording
-is never reused; an earlier claim of a crossover at ~1024 segments **does not reproduce**).
+sequence. **Do not reach for capture on a once-through Python loop** — recording the whole of it
+and replaying once is the 0.84x row, and the packing family reproduces it (a pack's segment
+pointers change every call, so the recording is never reused; an earlier claim of a crossover at
+~1024 segments **does not reproduce**).
+
+**But a sequence that is not repeated can often be *made* repeated, and that is the lever this
+table hides.** A long chain of launches that differ only in a loop counter is not an identical
+sequence — until the counter moves onto the device. Then a *group* of the chain is recorded once
+and replayed to cover the whole of it, with a `dim=1` kernel stepping the counter as the graph's
+last node (replays serialize on the stream, so the group's kernels have all read the old value
+before it moves). Measured on the hole-fill span sweep, whose launches differed in one `wp.int32`:
+**510 sequential launches cost 6.45 ms issued and 1.10 ms as an 8-launch group replayed 64 times,
+5.9x**, recording included. Three things make it work, and the first two are what to check next
+time:
+
+- **The grid must be fixed across replays**, so the recorded group is sized for the *first* group
+  and over-covers every later one. That is free here — a span kernel's cost is flat in its unused
+  grid width (0.91-1.02x for the same sweep issued at maximal width, device-bound and host-bound
+  alike) — but it is only free where the surplus threads exit on a guard they would reach anyway.
+- **The group size is a shallow optimum**, because recording costs one ordinary launch per span in
+  it while a small group pays one extra counter kernel per replay: 8 won at every rim length
+  probed, 64 and up lose.
+- **It has an upper bound, and it is not the chain length.** Once the kernels cover their own
+  launches the host was never the critical path and replay only adds the counter kernel — a
+  2-4 % loss. The gate is the *device work each launch carries* (§16.6), not how many there are.
+
+**`wp.capture_begin` is available on CUDA only**, so a captured path always needs the plain loop as
+its CPU sibling — which doubles as the byte-identity reference a schedule change has to pass.
 
 **Where capture pays, it pays large**, and what made `quadric_decimate`'s pass legal is that the
 pass is **flat in the mesh size**, so replaying every pass at the pass-0 width costs ~1.01x. A
@@ -4101,7 +4125,9 @@ inside a capture is fine.
 
 **The unexplored lever is the reverse:** a *repeated* wrapper loop issuing an identical sequence
 that is not yet captured, and `wp.capture_if` (a device-side conditional, unused here) for a stage
-that currently spends a host readback deciding.
+that currently spends a host readback deciding. **And the manufactured-repetition trick above is
+worth a sweep of its own** — grep for a Python `for`/`while` whose body is one launch and whose
+only per-iteration argument is the loop variable.
 
 ### 14.4 Tile solves: the crossover is K ≥ 16-32
 
@@ -4231,6 +4257,15 @@ while trading a launch for a block barrier is the biggest win in this package.
   conclusion as the BFS drain from the opposite direction** — one design had too little work per
   level for a block, this one far too much. The only design that would beat both is whole-GPU work
   between cheap level barriers, i.e. a grid-wide barrier, which Warp does not expose (§12.2).
+    - **And the *blocked* interval DP over the same recurrence is refuted too, by arithmetic
+      rather than by building it** (§16.6). Its schedule is sound — tiles on one tile-diagonal are
+      mutually independent — but a tile-diagonal holds `B/tile` tiles where a plain span level
+      already launches `B - span` blocks, and that width is what fills the device. **The general
+      form: merging `C` dependency levels into one kernel caps the block count at ~`B/C` and
+      multiplies the work by ~`C/2`, so it pays only where the unmerged levels were themselves
+      under-occupied.** That is the test to apply before citing §14.11 for a new DP. What *did*
+      remove the fill sweep's launch cost left the level structure alone and made the launches
+      cheaper instead (§14.3).
 - **Tile solves at triwarp's own problem size** — §14.4. **A Chebyshev smoother** — §14.8.
 - **Voxel aggregation for the multigrid hierarchy**: the geometrically-natural aggregation blows up
   operator complexity far more than the algebraic one already shipped, and a cheaper unsmoothed
@@ -4378,9 +4413,13 @@ The conditions, all four of which the band DP meets:
   mismatches here and were the probe's own fixture (§12.10).
 
 **Where to look for the next one:** a Python loop issuing one launch per step whose `dim` is a
-*slice* of a 2-D table. The fill DP's span sweep is the same shape and is named as unbuilt in
-§16.6 — its recurrence is over intervals rather than a grid, so the tiling is different, and its
-launch cost no longer dominates its device time, which is why it is still unbuilt rather than next.
+*slice* of a 2-D table. **But check the untiled schedule's occupancy first — that is what decides
+it, and the fill DP is the counter-example.** Its span sweep is the same *shape*, and tiling it is
+refuted (§14.9, §16.6): a span level already launches `B - span` blocks, so a tile-diagonal's
+`B/tile` tiles throw away the very parallelism this DP's diagonals never had. The stitch DP won
+because an anti-diagonal of O(1)-work cells was under-occupied *before* tiling, so the launch count
+was all there was to pay. Where a chain's levels are already wide, the launches get cheaper by being
+recorded rather than restructured (§14.3).
 
 ## 15. Benchmark and measurement traps
 
@@ -5099,21 +5138,40 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
   reported loss for several rounds was a reference call that no-opped on that fixture, returning its
   input byte-for-byte while every collision remained — and a benchmark assert of "produced some
   output" cannot see it.
-- **The hole-filling DP is launch-bound at every rim size the benchmark reaches**, so the launch's
-  *arguments* are a lever: invariant tables ride in the `HoleFillTables` bundle rather than being
-  passed on a sweep of hundreds of launches. Remaining lever, unbuilt: a blocked interval DP that
-  tiles the recurrence to cut the launch count by an order of magnitude — worth building only if a
-  row appears where it would flip a result.
-    - **Re-measured, and "launch-bound" now overstates the ceiling at the long-rim point.** On
-      `rim_short` the 510-launch span sweep reads 6.06 ms wall against 5.13 ms of device time, so
-      the host launch cost and the kernels overlap almost exactly and removing *every* launch
-      would buy ~16 %. Price a blocked DP against that gap, not against the whole sweep. The
-      claim still holds where it was written — the many-rim end, where the sweep is one launch.
+- **The hole-filling DP's span sweep is a chain of launches whose count is a floor — but they no
+  longer have to be *issued*.** Invariant tables ride in the `HoleFillTables` bundle rather than
+  being passed on a sweep of hundreds of launches, and the sweep itself is now **recorded once and
+  replayed** (§14.3). At `rim_short`: **1.36x** on the benchmark row and **1.26x** on an isolated
+  probe of the public call (§15.4 — the two are not comparable, so both are labelled), 1.5x on the
+  sweep alone, flat at `holes_many`, and flat wherever the gate below declines. The launch *count*
+  is unchanged — what changed is the price of each one.
+    - **"Launch-bound" overstated the ceiling at the long-rim point, and that ceiling is what the
+      capture spends.** On `rim_short` the 510-launch sweep read 6.06 ms wall against 5.13 ms of
+      device time — overlapping, so removing *every* launch was worth ~16 %. It is now 1.5x on the
+      sweep. The claim still holds where it was written — the many-rim end, where the sweep is one
+      launch and `boundary`'s floor is everything.
+    - **REFUTED, with the arithmetic — a blocked interval DP.** It was carried here for rounds as
+      "unbuilt, would cut the launch count by an order of magnitude". It cannot pay, and the reason
+      is occupancy rather than effort. Tiles on one tile-diagonal *are* mutually independent (cell
+      `(i,j)` reads only `(i,k)` and `(k,j)`, both at a tile-diagonal ≤ its own), so the schedule
+      is sound — but a diagonal holds only `B/tile` tiles against the `B - span` blocks a plain
+      span level already launches, and that level width *is* what fills the device. Any scheme
+      merging `C` levels bounds the block count at ~`B/C` and multiplies work by ~`C/2`. This is
+      §14.9's persistent-block result from the other side, and the contrast with §14.11's stitch DP
+      is the lesson: **tiling wins where the untiled schedule was *also* under-occupied, and loses
+      where it was not.** The fill DP's levels are wide and cheap; the stitch DP's diagonals are
+      narrow and trivially cheap.
+    - **Per-span device time is nearly flat across a 127x work range** (7.1 µs at span 2 against
+      10.4 at span 500, block 128; a null kernel at the same grid is 3.0). So "device time" here is
+      mostly per-kernel fixed cost, not computation — which is why the sweep responds to the
+      *number* of kernels and not to their shape, and why `block_dim` 32/64/128/256 sweeps to 128
+      and stays there.
     - **REFUTED — transposed mirrors of the DP tables so the apex loop's second read coalesces.**
       Built, byte-identical, and a loss. The tables are L2-resident, so "one transaction per lane" is
       an L2 hit and the 32x transaction argument prices bandwidth this kernel is not paying; and the
-      DP being launch-bound, two extra stores and two extra launch arguments cost more than the
-      coalescing saves. Do not re-propose without a rim whose tables exceed L2.
+      coalescing it buys was hidden under the sweep's launch cost where the two extra stores and
+      two extra launch arguments were not. Recording the sweep removes the first half and leaves
+      the second, so it does not reopen this. Do not re-propose without a rim whose tables exceed L2.
     - **REFUTED by a free PTX diff rather than a measurement — collapsing `triangle_fill_metric`'s
       duplicated geometry.** Its default branch recomputes ~40 % of its flops in *different* basic
       blocks, so removal needs partial-redundancy elimination rather than local CSE and there was no

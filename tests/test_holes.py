@@ -1028,6 +1028,77 @@ def test_fill_dp_span_tiled_matches_serial(
     assert np.array_equal(fills[True], fills[False])
 
 
+@pytest.mark.parametrize("metric", FILL_METRICS)
+@pytest.mark.parametrize("n_rim", [64, 66])
+def test_fill_dp_captured_matches_plain(
+    monkeypatch: pytest.MonkeyPatch, device: str, metric: str, n_rim: int
+) -> None:
+    """
+    Triwarp against triwarp: the recorded span sweep must emit the **identical face set**.
+
+    The plain per-span loop carries the oracle -- it is what the CPU device runs and what every
+    reference comparison in this file is written against. The recorded form differs only in where
+    the span comes from (``HoleFillTables.span_base`` plus a per-launch offset, stepped on the
+    device between groups) and in launching each group at the *first* group's grid width, so any
+    drift in either shows up here as a different triangulation rather than a different cost. As in
+    ``test_fill_dp_span_tiled_matches_serial``, equal totals would not be enough: the DP's
+    tie-break picks the triangles.
+
+    ``n_rim`` is the mechanism parameter. 64 leaves ``62 % HOLE_DP_GRAPH_SPANS`` spans over, so the
+    last replay runs past the final span and is absorbed by the kernel's own ``span >= b`` guard;
+    66 divides exactly and never reaches that branch. Both must give the same answer as the loop.
+
+    Skipped on the CPU device, which has no stream to record and always takes the plain loop.
+    """
+    if not wp.get_device(device).is_cuda:
+        pytest.skip("graph capture needs a CUDA stream; the CPU device runs the plain span loop")
+    vertices_np, faces_np = _star_tube(n_rim)
+    vertices_wp = points_to_warp(vertices_np, device)
+    faces_wp = wp.array(
+        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
+    )
+    n_orig = int(faces_wp.shape[0])
+    # The shipped gate must actually choose the recorded path here, or the arms below agree
+    # because they are the same path twice.
+    assert kernel_holes.hole_dp_captures(n_rim, 2)
+
+    original = tw.holes._run_hole_dp
+    fills = {}
+    for captured in (True, False):
+        monkeypatch.setattr(
+            tw.holes,
+            "_run_hole_dp",
+            lambda *args, _c=captured, **kwargs: original(*args, **kwargs, captured=_c),
+        )
+        fills[captured] = tw.holes.fill_min_weight(vertices_wp, faces_wp, metric=metric).numpy()[
+            n_orig:
+        ]
+
+    assert fills[False].shape[0] > 3 * 3, "fixture produced no fill to compare"
+    assert np.array_equal(fills[True], fills[False])
+
+
+def test_hole_dp_captures_is_bounded_at_both_ends(device: str) -> None:
+    """
+    Not a library comparison: the sweep's launch schedule has no counterpart to compare against.
+
+    Pins the *shape* of the gate rather than its constants. A short sweep must decline, because
+    recording costs one ordinary launch per span in the group and is wasted beside a sequence of
+    the same order. A sweep whose spans each carry heavy device work must decline too, and that is
+    the half a reader is likely to drop: it is not a bound on rim length but on
+    ``n_loops * max_size ** 2``, so growing the rim *count* at a fixed length has to turn the gate
+    off exactly as growing the length does.
+    """
+    del device  # the gate is host-side arithmetic and reads no device
+    short, light = 8, 64
+    assert not kernel_holes.hole_dp_captures(short, 1), "a sweep of a few spans must decline"
+    assert kernel_holes.hole_dp_captures(light, 1), "the fixture the capture test uses must pass"
+    heavy_length = kernel_holes.HOLE_DP_CAPTURE_MAX_WORK
+    assert not kernel_holes.hole_dp_captures(heavy_length, 1), "one very long rim must decline"
+    # Same rim length, more rims: the work bound has to see this and a length bound cannot.
+    assert not kernel_holes.hole_dp_captures(light, kernel_holes.HOLE_DP_CAPTURE_MAX_WORK)
+
+
 def test_fill_min_weight_optimal_vs_fan(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = hemisphere
     # Single-loop fixture: the DP minimizes the plane-normalized objective over all triangulations,

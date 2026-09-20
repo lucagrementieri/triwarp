@@ -783,23 +783,40 @@ def _run_hole_dp(
     dp: wp.array[wp.float32],
     prev: wp.array[wp.int32],
     tiled: bool | None = None,
+    captured: bool | None = None,
 ) -> None:
     """
     Fill the ragged ``dp`` / ``prev`` tables for every loop flagged in ``active``, in place.
 
-    One launch per triangulation span **across all loops**, so the launch count is
-    ``max(B) - 1`` for the whole mesh rather than ``B - 1`` per hole. The launch count is the
-    floor on this engine: a *blocked* interval DP that tiled the ``(i, j)`` plane could cut it
-    further, but that is a new kernel with in-tile sequencing rather than a knob, and it is
-    unbuilt. Folding the spans into one persistent block per loop -- lanes striding the
-    ``(interval, apex)`` pairs, a tile reduction as the level barrier -- was tried and loses,
-    because the cubic apex-evaluation work then runs on a single SM instead of being spread across
-    one block per span by the whole device; beating both needs a grid-wide barrier, which Warp
-    does not expose.
+    One launch per triangulation span **across all loops**, so the sequence is ``max(B) - 2``
+    long for the whole mesh rather than ``B - 1`` per hole. That length is the floor: the spans are
+    a dependency chain and each one's parallelism is its ``(n_loops, max_B - span)`` grid, which is
+    what fills the device, so merging levels into one kernel trades exactly that away. Folding the
+    spans into one persistent block per loop was tried and loses for that reason, and a *blocked*
+    interval DP loses for it too -- tiles on one tile-diagonal are independent, but there are only
+    ``B / tile`` of them, against the ``B - span`` blocks a plain span level already has. Beating
+    either needs a grid-wide barrier, which Warp does not expose.
+
+    **What the chain does not have to be is a chain of *issued* launches**, and that is what
+    ``captured`` is. Every span launch differs from the next in one integer, so putting that
+    integer on the device (``HoleFillTables.span_base``) makes them identical, and one group of
+    ``HOLE_DP_GRAPH_SPANS`` is then recorded once and replayed to cover the sweep. Replaying costs
+    a fraction of issuing, so the host stops being the critical path and the sweep falls back to
+    the device time the kernels were already taking underneath it. The recorded group's grid is
+    sized for the *first* group, which over-covers every later one -- correct, because a thread
+    whose span has outrun its loop returns at the first guard, and nearly free, because the span
+    kernel's cost is flat in the grid's unused width. The same guard absorbs the final group's
+    overshoot past the last span, so no remainder group is needed.
+
+    ``None`` asks [`hole_dp_captures`][triwarp.kernels.holes.hole_dp_captures], which wants the
+    sweep long enough that recording it is cheap beside it *and* light enough per span that the
+    host was the critical path at all -- the second bound is why this is not simply a rim-length
+    test. The CPU device has no graph to record and always takes the plain loop. ``captured``
+    exists so a test can force either and compare them, and the two must agree byte for byte.
 
     ``dp`` / ``prev`` are filled in place. They are bound into ``HoleFillTables`` rather than
-    passed per launch, because their pointers are invariant across the sweep and this DP is
-    launch-bound -- see that struct's docstring for the measurement.
+    passed per launch, because their pointers are invariant across the sweep -- see that struct's
+    docstring.
 
     ``tiled`` selects the per-span engine: a block per interval with its lanes striding the apex
     loop, or one thread per interval. Both produce byte-identical ``dp`` / ``prev`` on **both**
@@ -815,8 +832,13 @@ def _run_hole_dp(
     32nd apex instead.
     """
     device = loops.device
+    resolved = wp.get_device(device)
     if tiled is None:
-        tiled = not wp.get_device(device).is_cpu
+        tiled = not resolved.is_cpu
+    n_spans = loops.max_size - 2
+    if captured is None:
+        # Only CUDA has a graph to record; the rest of the decision is the kernel module's.
+        captured = resolved.is_cuda and kernel_holes.hole_dp_captures(loops.max_size, loops.n_loops)
     # One of two lane counts, picked from the rim count *and* the longest rim -- see
     # ``kernels/holes.hole_dp_block``, whose table shows why both matter. Read once here rather
     # than per span so the whole sweep shares one module hash.
@@ -827,6 +849,9 @@ def _run_hole_dp(
         inputs=[loops.sizes, loops.dp_offsets, active, dp, prev],
         device=device,
     )
+    if n_spans <= 0:
+        # Every rim is a triangle or smaller, so the base table is already the whole answer.
+        return
     # Built once, outside the loop: every field is invariant across spans, and a wp.launch argument
     # costs host time whatever it holds. Rebuilding it per span would give the saving straight back.
     tables = kernel_holes.HoleFillTables()
@@ -845,12 +870,17 @@ def _run_hole_dp(
     # launches pay milliseconds to keep them in the signature. See ``HoleFillTables``.
     tables.dp = dp
     tables.prev = prev
+    # The first span of the group a launch belongs to; the launch argument is the offset within it.
+    # Allocated holding its value rather than filled afterwards, and the plain loop below is simply
+    # one group covering every span, so both paths read the same convention.
+    tables.span_base = wp.full(1, 2, dtype=wp.int32, device=device)
     tables.metric_id = wp.int32(metric_id)
     tables.combine_id = wp.int32(combine_id)
     tables.smooth_bd = wp.int32(1 if smooth_boundary else 0)
-    for span in range(2, loops.max_size):
-        inputs = [tables, wp.int32(span)]
-        dim = (loops.n_loops, loops.max_size - span)
+
+    def issue(offset: int, width: int) -> None:
+        inputs = [tables, wp.int32(offset)]
+        dim = (loops.n_loops, width)
         if tiled:
             wp.launch_tiled(
                 kernel_holes.fill_dp_span_tiled,
@@ -861,6 +891,24 @@ def _run_hole_dp(
             )
         else:
             wp.launch(kernel_holes.fill_dp_span, dim=dim, inputs=inputs, device=device)
+
+    if not captured:
+        for span in range(2, loops.max_size):
+            issue(span - 2, loops.max_size - span)
+        return
+    group = kernel_holes.HOLE_DP_GRAPH_SPANS
+    with wp.ScopedCapture(resolved) as capture:
+        for offset in range(group):
+            # Sized for the first group, which is the widest any later one needs.
+            issue(offset, max(n_spans - offset, 1))
+        wp.launch(
+            kernel_holes.advance_span_base,
+            dim=1,
+            inputs=[wp.int32(group), tables.span_base],
+            device=device,
+        )
+    for _ in range((n_spans + group - 1) // group):
+        wp.capture_launch(capture.graph)
 
 
 def _pack_loops(loops: list[wp.array[wp.int32]]) -> _PackedLoops:

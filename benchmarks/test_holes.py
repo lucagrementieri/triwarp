@@ -6,11 +6,16 @@ The module has the highest non-``N`` sensitivity in the package and this pair se
 independent drivers:
 
 * **Loop length**, cubed. ``fill_min_weight`` runs a minimum-weight triangulation DP over a
-  ``B x B`` table per loop, filled by ``B - 2`` *sequential* kernel launches, then traced back one
-  thread per loop without the table ever leaving the device. Total work is ``sum(B_i^3)`` and no
-  batching can remove it: this is the real cost the module exists to pay. At ``rim_short`` the span
-  sweep's host launch cost and its device time are now within ~20% of each other and overlap, so
-  removing launches there is worth at most that gap -- read "launch-bound" as a claim about the
+  ``B x B`` table per loop, filled by ``B - 2`` *sequential* steps, then traced back one thread per
+  loop without the table ever leaving the device. Total work is ``sum(B_i^3)`` and no batching can
+  remove it: this is the real cost the module exists to pay.
+
+  The *steps* are a dependency chain and their count is a floor, but they no longer have to be
+  issued launches. At ``rim_short`` the sweep's host launch cost had come to within ~20% of its
+  device time, overlapping it, which bounded what removing launches could ever buy -- and the
+  sweep now spends that bound: one group of spans is recorded and replayed, taking this row 1.36x
+  and leaving ``holes_many`` flat, with the reference columns unmoved across the two sessions as
+  the control. Read the remaining "launch-bound" phrasing in this module as a claim about the
   *many-rim* end, where the sweep is one launch and everything else is fixed cost.
 
   Most of what *can* be removed already was. Widening the per-span launch from one thread per

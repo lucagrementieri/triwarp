@@ -303,6 +303,60 @@ HOLE_DP_LONG_RIM = 256
 HOLE_DP_WIDE_GRID_LOOPS = 4
 
 
+# Spans per recorded CUDA graph in ``holes._run_hole_dp``, and the two bounds on when recording
+# one pays at all.
+#
+# The span sweep is a chain of ``max_B - 2`` launches differing only in which span they compute,
+# and through the middle of its range the *host* is the critical path: at a 512-vertex rim its 510
+# launches cost more wall than the kernels they issue, which overlap underneath them. Moving the
+# span onto the device (``HoleFillTables.span_base``) makes the launches identical, so one group of
+# ``HOLE_DP_GRAPH_SPANS`` can be recorded once and replayed over the whole sweep -- and a replayed
+# launch costs a fraction of an issued one.
+#
+# **The group size is a shallow optimum and the two bounds are not.** Swept over the real sweep
+# at four rim lengths, 8 won at every one and 16 came within a few percent; 64 and up lose,
+# because recording costs one ordinary launch per span in the group. Both bounds below were
+# measured the same way, interleaved in one clock state, with the emitted face buffer
+# byte-identical throughout.
+#
+# The lower bound is the sweep length, because recording is paid once against a sequence it has to
+# be short beside -- this is the "record and replay once" case, which loses outright:
+#
+#     spans   6     10    14    22    30    46    62
+#     ratio   0.57x 0.73x 0.84x 0.99x 1.20x 1.32x 1.44x
+#
+# The upper bound is the *device work a span launch carries*, which is what decides whether the
+# host was ever the critical path: a span level evaluates ``n_loops * (B - span) * (span - 1)``
+# apex candidates, so ``n_loops * B^2`` is that count up to a constant. Past the crossover the
+# kernels already cover their own launches and replaying them only adds the per-group advance. The
+# quantity separates rim *length* from rim *count* correctly, which is why it is not a bound on B:
+#
+#     n_loops*B^2   0.52M 0.59M 0.82M 0.88M 0.99M 1.05M 1.18M 1.57M 1.61M
+#     ratio         1.44x 1.34x 1.25x 1.07x 1.07x 1.03x 0.99x 0.91x 0.96x
+#
+# Two readings that are *not* the cause of the far end and were each measured away rather than
+# assumed: the replayed group's over-wide grid is free (0.91-1.02x for the same sweep issued at
+# maximal width, device-bound and host-bound alike), and the group size does not rescue it (every
+# size from 8 to 128 loses at 2 rims of 1 024).
+HOLE_DP_GRAPH_SPANS = 8
+HOLE_DP_CAPTURE_FROM = 32
+HOLE_DP_CAPTURE_MAX_WORK = 1_000_000
+
+
+def hole_dp_captures(max_size: int, n_loops: int) -> bool:
+    """
+    Whether the span sweep over ``n_loops`` rims whose longest is ``max_size`` should be recorded.
+
+    Long enough that recording it is short beside the sequence it replaces, and light enough per
+    span that the host was the critical path to begin with. See the tables above; the caller adds
+    the device test, since only CUDA has a graph to record.
+    """
+    return (
+        max_size - 2 >= HOLE_DP_CAPTURE_FROM
+        and n_loops * max_size * max_size <= HOLE_DP_CAPTURE_MAX_WORK
+    )
+
+
 def hole_dp_block(max_size: int, n_loops: int) -> int:
     """
     Lanes per block for a DP sweep over ``n_loops`` rims whose longest is ``max_size``.
@@ -321,19 +375,28 @@ class HoleFillTables:
     """
     The hole-filling DP's invariant inputs, bundled so the per-span launches carry one argument.
 
-    ``holes._fill_dp`` launches ``fill_dp_span`` once per span -- ``max_B - 2`` times for the whole
-    mesh -- and every one of these fifteen values is the same on every launch. A ``wp.launch``
-    argument costs about a microsecond of host time, linearly and on both devices, so a
-    16-argument kernel launched hundreds of times spent milliseconds marshalling constants. Only
-    ``span`` stays an argument.
+    ``holes._run_hole_dp`` runs ``fill_dp_span`` once per span -- ``max_B - 2`` times for the whole
+    mesh -- and every one of these values is the same on every launch. A ``wp.launch`` argument
+    costs about a microsecond of host time, linearly and on both devices, so a 16-argument kernel
+    launched hundreds of times spent milliseconds marshalling constants. Only the span offset
+    stays an argument.
 
     **``dp`` and ``prev`` are in here too, and that is a measured decision rather than a tidy
     one.** They are the launch's in-place *output*, so leaving them as arguments reads better and
     that is how this struct originally drew the line. But their pointers do not change across the
-    sweep either, and this DP is launch-bound at every rim size the benchmark reaches, so the
-    legibility costs a real fraction of a long-rim call. Moving the two in is a clear win on a long
-    rim and flat on a short one, whose sweep is a few dozen launches rather than hundreds.
+    sweep either, and wherever the host is the sweep's critical path that legibility costs a real
+    fraction of the call. Moving the two in is a clear win on a long rim and flat on a short one,
+    whose sweep is a few dozen launches rather than hundreds. It still pays where the sweep is
+    *recorded* rather than issued, because recording marshals each launch exactly once as an
+    ordinary one, and on the CPU device, which never records at all.
     ``holes._run_hole_dp`` binds them once, right where it binds everything else.
+
+    **``span_base`` is here for a different reason, and it is what lets the sweep be captured.**
+    The per-span launches differ in exactly one thing -- which span they are -- so moving that one
+    value onto the device makes consecutive launches *identical*, and an identical sequence is the
+    one thing CUDA graph capture pays for. The launch argument is then the offset within the
+    recorded group and ``span_base[0]`` is the group's first span, stepped on the device by
+    [`advance_span_base`][triwarp.kernels.holes.advance_span_base]. See ``holes._run_hole_dp``.
 
     Build it ONCE in the wrapper and reuse it: construction is not free, and doing it per launch
     would give most of the saving back.
@@ -355,6 +418,7 @@ class HoleFillTables:
     char_areas: wp.array[wp.float32]
     dp: wp.array[wp.float32]
     prev: wp.array[wp.int32]
+    span_base: wp.array[wp.int32]
     metric_id: wp.int32
     combine_id: wp.int32
     smooth_bd: wp.int32
@@ -386,9 +450,11 @@ def apex_cost(
     # two reads is strided by the table's row length -- a transaction per lane. **Mirroring the
     # tables transposed so that both reads are contiguous was built, verified byte-identical, and
     # measured as a net loss.** Two reasons it cannot pay here: the DP tables sit in L2, so the
-    # "one transaction per lane" is an L2 hit rather than a DRAM fetch; and this DP is
-    # launch-bound, so the mirror's two extra per-interval stores cost more than the coalescing
-    # saves. Do not re-propose it without a rim whose tables exceed L2.
+    # "one transaction per lane" is an L2 hit rather than a DRAM fetch; and the coalescing it buys
+    # was hidden under the sweep's launch cost, while the mirror's two extra per-interval stores
+    # are not. Recording the sweep (``HOLE_DP_GRAPH_SPANS``) removes the first half of that and
+    # leaves the second, so it does not reopen the question. Do not re-propose it without a rim
+    # whose tables exceed L2.
     left = base + i * b + k
     right = base + k * b + j
     val = combine_metric(tables.dp[left], tables.dp[right], tables.combine_id)
@@ -427,7 +493,7 @@ def apex_cost(
 
 
 @wp.kernel(enable_backward=False)
-def fill_dp_span(tables: HoleFillTables, span: wp.int32) -> None:
+def fill_dp_span(tables: HoleFillTables, span_offset: wp.int32) -> None:
     # One thread per span-``span`` interval (i, j = i + span) of every loop at once; reads only
     # strictly smaller spans, so successive launches (span = 2, 3, ...) are the DP barriers.
     #
@@ -447,6 +513,9 @@ def fill_dp_span(tables: HoleFillTables, span: wp.int32) -> None:
     # arithmetic already moved: ``apex_cost`` went from 19 parameters to 14 when the tables became
     # ``HoleFillTables``.
     ell, i = wp.tid()
+    # The span is the group's base plus this launch's offset within it, so that every launch of a
+    # recorded group is byte-identical bar one integer -- see ``HoleFillTables.span_base``.
+    span = tables.span_base[0] + span_offset
     if tables.active[ell] == 0:
         return
     b = tables.loop_sizes[ell]
@@ -488,7 +557,7 @@ def fill_dp_span(tables: HoleFillTables, span: wp.int32) -> None:
 
 
 @wp.kernel(enable_backward=False)
-def fill_dp_span_tiled(tables: HoleFillTables, span: wp.int32) -> None:
+def fill_dp_span_tiled(tables: HoleFillTables, span_offset: wp.int32) -> None:
     # One *block* per span-``span`` interval, its lanes striding the apex loop. Same DP, same launch
     # count, ``block_dim`` times the parallelism: the serial kernel above puts at most
     # ``n_loops * (max_B - span)`` threads on the machine, which for a single long boundary is a few
@@ -517,6 +586,8 @@ def fill_dp_span_tiled(tables: HoleFillTables, span: wp.int32) -> None:
     # strict ``<`` scan returns. Lanes with no apex, and an all-non-finite interval, both leave
     # ``(inf, -1)`` and agree with the serial kernel there too.
     ell, i, t = wp.tid()
+    # As in ``fill_dp_span``: the group's base span plus this launch's offset within the group.
+    span = tables.span_base[0] + span_offset
     # Every guard below is warp-uniform (it reads only ``ell``, ``i`` and ``span``), so the whole
     # block returns together and the tile reductions never run in divergent control flow.
     if tables.active[ell] == 0:
@@ -550,6 +621,21 @@ def fill_dp_span_tiled(tables: HoleFillTables, span: wp.int32) -> None:
         if block_val >= FLOAT32_INF_CONSTANT:
             block_k = wp.int32(-1)
         tables.prev[base + i * b + j] = block_k
+
+
+@wp.kernel(enable_backward=False)
+def advance_span_base(step: wp.int32, out_span_base: wp.array[wp.int32]) -> None:
+    # dim=1. Close a recorded group of span launches by moving the base on to the next group's
+    # first span. It is the last node of the graph ``holes._run_hole_dp`` records, so every span
+    # kernel of the group has already read the old base by the time it runs, and consecutive
+    # replays serialize on the stream -- which is the whole reason the step cannot instead be
+    # folded into the last span kernel, whose blocks read the base at their own start and would
+    # race it.
+    #
+    # Deliberately not ``array.loop_advance``: that closes a ``wp.capture_while`` round and writes
+    # a condition and a progress flag this sweep has neither of -- its own docstring asks a hot
+    # round loop to price a bespoke advance first, and this is one.
+    out_span_base[0] = out_span_base[0] + step
 
 
 @wp.kernel(enable_backward=False)
