@@ -164,19 +164,62 @@ def rasterize_labels(
             out_labels[row, col] = best_label
 
 
+@wp.func
+def _uv_out_of_range(uv: wp.vec2) -> wp.bool:
+    """Return whether a *finite* UV lies outside ``[0, 1]`` (a non-finite one is never flagged)."""
+    u = uv[0]
+    w = uv[1]
+    if wp.isfinite(u) and wp.isfinite(w):
+        return u < 0.0 or u > 1.0 or w < 0.0 or w > 1.0
+    return False
+
+
 @wp.kernel
 def check_uv_range(uv: wp.array[wp.vec2], out_flag: wp.array[wp.int32]) -> None:
     """Set ``out_flag[0] = 1`` if any finite UV lies outside ``[0, 1]``."""
     v = wp.int32(wp.tid())
-    u = uv[v][0]
-    w = uv[v][1]
-    if wp.isfinite(u) and wp.isfinite(w):
-        if u < 0.0 or u > 1.0 or w < 0.0 or w > 1.0:
-            wp.atomic_max(out_flag, 0, wp.int32(1))
+    if _uv_out_of_range(uv[v]):
+        wp.atomic_max(out_flag, 0, wp.int32(1))
+
+
+@wp.kernel
+def check_uv_range_and_labels(
+    uv: wp.array[wp.vec2], labels: wp.array[wp.int32], out_flags: wp.array[wp.int32]
+) -> None:
+    """
+    Set ``out_flags[0] = 1`` for an out-of-range finite UV and ``out_flags[1] = 1`` for a label < 0.
+
+    ``check_uv_range`` plus the discrete rasterizer's own label test, over the same vertices: the
+    two validations share a launch and, more to the point, one two-slot readback, where running
+    them apart cost a device reduction and a readback each.
+    """
+    v = wp.int32(wp.tid())
+    if _uv_out_of_range(uv[v]):
+        wp.atomic_max(out_flags, 0, wp.int32(1))
+    if labels[v] < 0:
+        wp.atomic_max(out_flags, 1, wp.int32(1))
 
 
 SAMPLE_NEAREST = wp.constant(wp.int32(0))
 SAMPLE_BILINEAR = wp.constant(wp.int32(1))
+
+
+@wp.func
+def _texel_coordinate(
+    u: wp.float32, w: wp.float32, height: wp.int32, width: wp.int32
+) -> tuple[wp.float32, wp.float32]:
+    """Continuous ``(row, col)`` of a UV: ``row = (1 - v) * H - 0.5``, ``col = u * W - 0.5``."""
+    return (1.0 - w) * wp.float32(height) - 0.5, u * wp.float32(width) - 0.5
+
+
+@wp.func
+def _nearest_texel(
+    row: wp.float32, col: wp.float32, height: wp.int32, width: wp.int32
+) -> tuple[wp.int32, wp.int32]:
+    """Return the edge-clamped texel nearest a continuous ``(row, col)``."""
+    r = wp.clamp(wp.int32(wp.floor(row + 0.5)), wp.int32(0), height - 1)
+    c = wp.clamp(wp.int32(wp.floor(col + 0.5)), wp.int32(0), width - 1)
+    return r, c
 
 
 @wp.kernel
@@ -197,11 +240,9 @@ def sample_texture(
         for k in range(n_channels):
             out_values[v, k] = NAN_F32
         return
-    row = (1.0 - w) * wp.float32(height) - 0.5
-    col = u * wp.float32(width) - 0.5
+    row, col = _texel_coordinate(u, w, height, width)
     if mode == SAMPLE_NEAREST:
-        r = wp.clamp(wp.int32(wp.floor(row + 0.5)), wp.int32(0), height - 1)
-        c = wp.clamp(wp.int32(wp.floor(col + 0.5)), wp.int32(0), width - 1)
+        r, c = _nearest_texel(row, col, height, width)
         for k in range(n_channels):
             out_values[v, k] = image[r, c, k]
     else:
@@ -219,10 +260,25 @@ def sample_texture(
             out_values[v, k] = wp.lerp(top, bottom, fr)
 
 
-@wp.func
-def round_labels(sampled: wp.float32) -> wp.int32:
-    # Round a nearest-sampled float label back to int32; a non-finite value (a NaN UV that hit no
-    # texel) maps to -1.
-    if wp.isfinite(sampled):
-        return wp.int32(wp.round(sampled))
-    return wp.int32(-1)
+@wp.kernel
+def sample_class_image(
+    uv: wp.array[wp.vec2], class_image: wp.array2d[wp.int32], out_labels: wp.array[wp.int32]
+) -> None:
+    """
+    Read an ``int32`` class image nearest-neighbour at each vertex UV; ``-1`` for an Inf / NaN UV.
+
+    ``sample_texture``'s ``SAMPLE_NEAREST`` branch over integer storage, sharing its texel helpers,
+    so the labels are read as they are rather than through a ``float32`` copy of the whole image
+    and a rounding pass back -- which also keeps a label above ``2**24`` exact.
+    """
+    v = wp.int32(wp.tid())
+    u = uv[v][0]
+    w = uv[v][1]
+    if not wp.isfinite(u) or not wp.isfinite(w):
+        out_labels[v] = wp.int32(-1)
+        return
+    height = class_image.shape[0]
+    width = class_image.shape[1]
+    row, col = _texel_coordinate(u, w, height, width)
+    r, c = _nearest_texel(row, col, height, width)
+    out_labels[v] = class_image[r, c]

@@ -32,6 +32,7 @@ from __future__ import annotations
 import math
 from typing import Literal
 
+import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -42,10 +43,12 @@ from triwarp._device import (
     require_nonempty_mesh,
     require_same_device,
 )
-from triwarp.constants import INT32_MAX
+from triwarp.constants import INT32_MAX, INT64_MAX, TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
+from triwarp.kernels import neighbors as kernel_neighbors
 from triwarp.kernels import proximity as kernel_proximity
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.triangles import face_normals_and_areas
 
@@ -531,24 +534,23 @@ def mesh_to_mesh_distance(
                 device=device,
                 block_dim=_QUERY_TILE_WIDTH,
             )
-    keys = twt.empty_1d(n_faces_a, wp.int64, device=device)
-    wp.launch(
-        kernel_proximity.face_distance_keys,
-        dim=n_faces_a,
-        inputs=[distance_sq, keys],
+    # One launch reduces the packed ``(distance_sq, face_a)`` key -- low half the winning face, high
+    # half its squared distance's own float32 bits -- and a second writes that face's witness beside
+    # it, so all three answers come back in one 16-byte readback.
+    result = wp.full(2, INT64_MAX, dtype=wp.int64, device=device)
+    wp.launch_tiled(
+        kernel_neighbors.nearest_key_argmin,
+        dim=kernel_reduce.blocks_1d(n_faces_a),
+        inputs=[distance_sq, result],
+        block_dim=TILE_1D,
         device=device,
     )
-    # The key's low 32 bits are the winning face, so one reduction and one 8-byte read give both the
-    # distance and the argmin -- no second pass over the candidates.
-    best_face_a = int(tw.reduce.min(keys)) & 0xFFFFFFFF
-    # Two 4-byte reads, not two ``.numpy()`` calls: each of those copies the *whole* per-face array
-    # to the host to index one element, which matters increasingly on a large mesh where the copy
-    # would dominate.
-    return (
-        math.sqrt(float(read_scalar(distance_sq, best_face_a))),
-        best_face_a,
-        int(read_scalar(witness, best_face_a)),
+    wp.launch(
+        kernel_neighbors.nearest_key_partner, dim=1, inputs=[result, witness, result], device=device
     )
+    key, face_b = (int(value) for value in result.numpy())
+    best_distance_sq = np.array([key >> 32], dtype=np.uint32).view(np.float32)[0]
+    return math.sqrt(float(best_distance_sq)), key & 0xFFFFFFFF, face_b
 
 
 def normals_at_closest_faces(
@@ -606,23 +608,24 @@ def normals_at_closest_faces(
     if m == 0:
         return wp.empty(0, dtype=wp.vec3, device=device)
     if int(mesh.indices.shape[0]) == 0:
-        # closest_point_on_mesh's own n_faces == 0 branch leaves out_face at -1 for every query,
-        # which the miss-clamp below would map to face 0 of a face_normals array that has no face
-        # 0 -- an out-of-bounds Python-scope gather (array.gather bounds-checks nothing) that
-        # segfaults rather than raising. Match closest_point_on_mesh's own convention instead.
+        # Every query misses a mesh with no faces, and the kernel below maps a miss to face 0 -- of
+        # a face_normals array that has no face 0, an out-of-bounds read that segfaults rather than
+        # raising. Match closest_point_on_mesh's own zero-face convention instead.
         nan = float("nan")
         return wp.full(m, wp.vec3(nan, nan, nan), dtype=wp.vec3, device=device)
 
-    _closest, _distance, out_face = closest_point_on_mesh(
-        mesh.points, mesh.indices, points, max_dist=max_dist, mesh=mesh
-    )
-    # A miss leaves ``-1``, which would gather out of bounds; clamping to face 0 costs one map
-    # over ``m`` and keeps the read in range.
-    hit_face = wp.empty(m, dtype=wp.int32, device=device)
-    wp.map(wp.max, out_face, wp.int32(0), out=hit_face)
     if face_normals is None:
         face_normals, _areas = face_normals_and_areas(mesh.points, mesh.indices)
-    return tw.array.gather(face_normals, hit_face)
+    if max_dist is None:
+        max_dist = tw.bounds.enclosing_diagonal(mesh.points, points)
+    out_normals = wp.empty(m, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_proximity.normals_at_closest_faces,
+        dim=m,
+        inputs=[mesh.id, points, wp.float32(max_dist), face_normals, out_normals],
+        device=device,
+    )
+    return out_normals
 
 
 def signed_distance_on_mesh(

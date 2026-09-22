@@ -576,6 +576,22 @@ def bool_flags(mask: wp.array[wp.bool], out_flags: wp.array[wp.int32]) -> None:
     out_flags[i] = wp.where(mask[i], 1, 0)
 
 
+def _astype_kernel(name: str, source: type, target: type) -> wp.Kernel:
+    """Build one concrete ``out[i] = target(values[i])`` kernel: ``wp.utils.array_cast``'s body."""
+
+    # ``wp.utils.array_cast`` launches its own ``Any``-generic ``_array_cast_kernel``, so every
+    # ``array.astype`` paid Warp's host-side overload resolution on top of the launch -- about
+    # twice a concrete launch, flat in the element count (the reason ``bool_flags`` above exists).
+    # The body is that kernel's, so the bytes are identical; only the dispatch changes.
+    def _k(values: wp.array[wp.Scalar], out_values: wp.array[wp.Scalar]) -> None:
+        i = wp.int32(wp.tid())
+        out_values[i] = out_values.dtype(values[i])
+
+    _k.__annotations__["values"] = wp.array[source]
+    _k.__annotations__["out_values"] = wp.array[target]
+    return wp.kernel(_k, name=name)
+
+
 @wp.func
 def nonzero_flag(value: wp.Scalar) -> wp.int32:
     # ``1`` for any non-zero value, ``0`` otherwise: the scan input that lets ``flatnonzero``
@@ -821,6 +837,24 @@ class OverloadTable(KernelTable):
         )
 
 
+# The conversions ``array.astype`` launches as concrete kernels, keyed ``(source, target)``. The set
+# is a census rather than a menu: instrumenting ``wp.utils.array_cast`` over the full test suite,
+# these four pairs are 97 % of the ``astype`` calls (the masks every compaction widens, the
+# ``float32`` areas an energy or mass assembly promotes, and the narrowing back to a mask). A pair
+# outside the table falls through to ``wp.utils.array_cast``, which is correct and merely pays the
+# generic dispatch; that is Warp's own module, so the fall-through forks nothing of this one.
+# ``(wp.bool, wp.int32)`` is ``bool_flags`` itself -- identical bytes, one kernel.
+ASTYPE = KernelTable(
+    "astype",
+    {
+        (wp.bool, wp.int32): bool_flags,
+        (wp.int32, wp.bool): _astype_kernel("astype_int32_bool", wp.int32, wp.bool),
+        (wp.int32, wp.float32): _astype_kernel("astype_int32_float32", wp.int32, wp.float32),
+        (wp.float32, wp.float64): _astype_kernel("astype_float32_float64", wp.float32, wp.float64),
+    },
+)
+
+
 # The concrete handles ``wp.overload`` hands back, keyed by the caller's dtype -- see
 # [`OverloadTable`][triwarp.kernels.array.OverloadTable] for why a wrapper launches through these
 # rather than through the generic kernel above it. Declared here so a type checker sees them at
@@ -975,11 +1009,6 @@ def _declare_map_kernels() -> None:
             (wp.length, (single(wp.vec2d),), wp.float64),
             (wp.length, (dense(wp.vec3),), wp.float32),
             (wp.mul, (dense(wp.float32), wp.float32(1)), wp.float32),
-            (wp.mul, (dense(wp.float64), dense(wp.float64)), wp.float64),
-            (wp.mul, (dense(wp.mat44), dense(wp.mat44)), wp.mat44),
-            (wp.mul, (single(wp.mat44), single(wp.mat44)), wp.mat44),
-            (wp.mul, (dense(wp.vec3d), wp.float64(1)), wp.vec3d),
-            (wp.mul, (dense(wp.vec3), dense(wp.float32)), wp.vec3),
             (wp.neg, (dense(wp.float32),), wp.float32),
             (wp.neg, (dense(wp.float64),), wp.float64),
             (wp.neg, (dense(wp.vec3),), wp.vec3),

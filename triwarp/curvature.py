@@ -23,7 +23,6 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.kernels import curvature as kernel_curvature
-from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.vertices import vertex_defects
 from triwarp.vertices import vertex_normals as _vertex_normals
@@ -105,9 +104,11 @@ def principal_curvature(
     device = vertices.device
     n_vertices = int(vertices.shape[0])
 
-    # Compute vertex normals via face normals
+    # Area-weighted vertex normals. The pair is used only when both halves were supplied, which is
+    # the documented contract; otherwise ``vertex_normals`` derives both inside its own scatter and
+    # no per-face table is written.
     if face_normals is None or face_areas is None:
-        face_normals, face_areas = tw.triangles.face_normals_and_areas(vertices, faces)
+        face_normals = face_areas = None
     vertex_normals = _vertex_normals(
         vertices, faces, face_normals=face_normals, face_weights=face_areas
     )
@@ -296,17 +297,25 @@ def discrete_mean_curvature(
     if m == 0:
         return wp.zeros(n_points, dtype=wp.float32, device=device)
 
-    angles = tw.adjacency.face_adjacency_angles(vertices, faces, face_adjacency=face_adjacency)
-    convex = tw.adjacency.face_adjacency_convex(
-        vertices, faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
-    )
-
+    # Per adjacent pair: the dihedral angle signed by convexity, and the shared edge's bounds for
+    # the BVH -- one launch over the pairs, reading one set of face normals.
+    face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
+    signed_angles = wp.empty(m, dtype=wp.float32, device=device)
     edge_lower = wp.empty(m, dtype=wp.vec3, device=device)
     edge_upper = wp.empty(m, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_edges.edge_aabb_bounds,
+        kernel_curvature.face_pair_dihedrals,
         dim=m,
-        inputs=[vertices, face_adjacency_edges, edge_lower, edge_upper],
+        inputs=[
+            vertices,
+            faces,
+            face_normals,
+            face_adjacency,
+            face_adjacency_edges,
+            signed_angles,
+            edge_lower,
+            edge_upper,
+        ],
         device=device,
     )
 
@@ -328,8 +337,7 @@ def discrete_mean_curvature(
                 points,
                 vertices,
                 face_adjacency_edges,
-                angles,
-                convex,
+                signed_angles,
                 candidate_edges,
                 offsets,
                 wp.float32(radius),

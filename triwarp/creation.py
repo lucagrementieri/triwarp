@@ -392,11 +392,12 @@ def grid(
 
     Notes
     -----
-    Both buffers are written **closed-form on the device**, one thread per vertex and one per quad
-    cell, rather than assembled on the host. Positions come out **bit-identical** to a NumPy
-    build: the kernel does the same arithmetic in ``float64`` before the ``float32`` store, and
-    phrases each sample as ``extent * (k / (n - 1))`` so the far edge lands on the extent exactly,
-    matching what ``numpy.linspace`` needs its endpoint special case for.
+    Both buffers are written **closed-form on the device**, in one launch of one thread per vertex
+    that also writes the quad cell it is the lower corner of, rather than assembled on the host.
+    Positions come out **bit-identical** to a NumPy build: the kernel does the same arithmetic in
+    ``float64`` before the ``float32`` store, and phrases each sample as ``extent * (k / (n - 1))``
+    so the far edge lands on the extent exactly, matching what ``numpy.linspace`` needs its
+    endpoint special case for.
     """
     nx, ny = int(count[0]), int(count[1])
     if nx < 2 or ny < 2:
@@ -406,8 +407,9 @@ def grid(
         raise ValueError(f"extents must be non-negative, got {extents}")
 
     vertices = wp.empty(nx * ny, dtype=wp.vec3, device=device)
+    faces = wp.empty(6 * (nx - 1) * (ny - 1), dtype=wp.int32, device=device)
     wp.launch(
-        kernel_creation.grid_vertices,
+        kernel_creation.grid_mesh,
         dim=(nx, ny),
         inputs=[
             wp.int32(nx),
@@ -417,15 +419,7 @@ def grid(
             wp.float64(-0.5 * width if center else 0.0),
             wp.float64(-0.5 * height if center else 0.0),
         ],
-        outputs=[vertices],
-        device=device,
-    )
-    faces = wp.empty(6 * (nx - 1) * (ny - 1), dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_creation.grid_faces,
-        dim=(nx - 1, ny - 1),
-        inputs=[wp.int32(ny)],
-        outputs=[faces],
+        outputs=[vertices, faces],
         device=device,
     )
     return _apply_transform(vertices, faces, transform)
@@ -604,9 +598,15 @@ def icosphere(
     table = wp.array(_ICOSPHERE_FACE_TABLE, dtype=wp.int32, device=device)
     corners = _upload_points(_ICOSAHEDRON_VERTICES, wp.vec3, device)
     vertices = wp.empty(10 * 4**levels + 2, dtype=wp.vec3, device=corners.device)
-    # The 12 base corners occupy the first block of the numbering, so scaling them to `radius` is
-    # the whole of level 0.
-    wp.map(kernel_creation.project_to_radius, corners, radius_f, out=vertices[:12])
+    faces = wp.empty(20 * n * n * 3, dtype=wp.int32, device=vertices.device)
+    # The face buffer and level 0 -- the 12 base corners, which occupy the first block of the
+    # numbering, scaled to `radius` -- in one launch; each level after that refines the last.
+    wp.launch(
+        kernel_creation.icosphere_base,
+        dim=(20, n, n),
+        inputs=[table, corners, wp.int32(n), radius_f, vertices, faces],
+        device=vertices.device,
+    )
     for level in range(1, levels + 1):
         wp.launch(
             kernel_creation.icosphere_generation,
@@ -614,14 +614,6 @@ def icosphere(
             inputs=[table, wp.int32(n), wp.int32(1 << level), radius_f, vertices],
             device=vertices.device,
         )
-
-    faces = wp.empty(20 * n * n * 3, dtype=wp.int32, device=vertices.device)
-    wp.launch(
-        kernel_creation.icosphere_faces,
-        dim=(20, n, n),
-        inputs=[table, wp.int32(n), faces],
-        device=vertices.device,
-    )
     return vertices, faces
 
 
@@ -768,14 +760,13 @@ def sphere_cap(
     # and was quadratic in the ring count, against a flat device cost -- so the device path wins at
     # every resolution and needs no size gate.
     vertices_wp = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_creation.sphere_cap_vertices,
-        dim=n_vertices,
-        inputs=[wp.int32(n_rings), wp.float64(angle), wp.float64(radius), vertices_wp],
+        kernel_creation.sphere_cap_mesh,
+        dim=max(n_vertices, n_faces),
+        inputs=[wp.int32(n_rings), wp.float64(angle), wp.float64(radius), vertices_wp, faces_wp],
         device=device,
     )
-    faces_wp = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
-    wp.launch(kernel_creation.sphere_cap_faces, dim=n_faces, inputs=[faces_wp], device=device)
     return vertices_wp, faces_wp
 
 
@@ -1290,24 +1281,14 @@ def revolve(
             device=device,
         )
     if cap_faces is not None and n_cap > 0:
+        # Both end caps in one launch, the near one then the far one in adjacent blocks.
         base = n_slices * n_keep * 3
-        for slice_index, reverse, offset in (
-            (0, False, base),
-            (n_kept_slices - 1, True, base + n_cap * 3),
-        ):
-            wp.launch(
-                kernel_creation.revolve_cap_faces,
-                dim=n_cap,
-                inputs=[
-                    cap_faces,
-                    wp.int32(slice_index),
-                    reverse,
-                    wp.int32(n_kept_slices),
-                    *layout,
-                    faces[offset : offset + n_cap * 3],
-                ],
-                device=device,
-            )
+        wp.launch(
+            kernel_creation.revolve_cap_faces,
+            dim=(2, n_cap),
+            inputs=[cap_faces, wp.int32(n_kept_slices), *layout, faces[base:]],
+            device=device,
+        )
 
     return _apply_transform(vertices, faces, transform)
 
@@ -1456,13 +1437,17 @@ def extrude_triangulation(
         )
         faces = flipped
 
+    # Both layers, ``z = 0`` then ``z = height``, in one launch.
     bottom = wp.empty(2 * n, dtype=wp.vec3, device=device)
-    # One view of the lower block, written by the map and then read by the boundary walk.
-    lower_block = bottom[:n]
-    wp.map(kernel_array.lift_vec2, vertices, wp.float32(0.0), out=lower_block)
-    wp.map(kernel_array.lift_vec2, vertices, wp.float32(height_f), out=bottom[n:])
+    wp.launch(
+        kernel_creation.lift_vec2_layers,
+        dim=(2, n),
+        inputs=[vertices, wp.float32(height_f), bottom],
+        device=device,
+    )
 
-    boundary = tw.boundary.oriented_boundary_edges(lower_block.contiguous(), faces)
+    # The lower layer is a contiguous prefix, so the boundary walk reads it as a view.
+    boundary = tw.boundary.oriented_boundary_edges(twt.as_dense(bottom[:n]), faces)
     n_boundary = int(boundary.shape[0])
 
     out_faces = wp.empty((2 * n_faces + 2 * n_boundary) * 3, dtype=wp.int32, device=device)

@@ -26,7 +26,7 @@ def project_to_radius(v: wp.vec3, radius: wp.float32) -> wp.vec3:
 
 
 @wp.kernel
-def grid_vertices(
+def grid_mesh(
     nx: wp.int32,
     ny: wp.int32,
     width: wp.float64,
@@ -34,9 +34,13 @@ def grid_vertices(
     origin_x: wp.float64,
     origin_y: wp.float64,
     out_vertices: wp.array[wp.vec3],
+    out_faces: wp.array[wp.int32],
 ) -> None:
-    # The (nx, ny) lattice of a flat patch in the z = 0 plane, row-major with X the slow axis, one
-    # thread per vertex.
+    # A whole flat patch in the z = 0 plane from six scalars, one thread per vertex: the (nx, ny)
+    # lattice row-major with X the slow axis, and -- from every thread that is also the lower corner
+    # of a quad cell, i.e. all but the last row and column -- that cell's two triangles. Both
+    # buffers are closed form in the thread index, so one launch writes them, as ``cone_mesh`` and
+    # ``cylinder_mesh`` do for theirs.
     #
     # Written as ``extent * (k / (n - 1))`` rather than ``k * (extent / (n - 1))``: the fraction is
     # exactly 1 at the last sample, so the far edge lands on the extent without the endpoint
@@ -48,14 +52,11 @@ def grid_vertices(
     # ``wp.float32(...)``, not ``wp.cast``: the latter is a same-size bit reinterpretation and
     # fails to compile on a float64 source ("source and destination must have the same size").
     out_vertices[i * ny + j] = wp.vec3(wp.float32(x), wp.float32(y), wp.float32(0.0))
-
-
-@wp.kernel
-def grid_faces(ny: wp.int32, out_faces: wp.array[wp.int32]) -> None:
-    # The two triangles of one quad cell, one thread per cell, wound counter-clockwise seen from
-    # +Z. With X the slow axis a cell's corners are ``corner``, ``corner + ny`` (next X) and
-    # ``+ 1`` (next Y), and cell ``(i, j)`` owns face slots ``2 * (i * (ny - 1) + j)`` and the next.
-    i, j = wp.tid()
+    if i >= nx - 1 or j >= ny - 1:
+        return
+    # The cell's two triangles, wound counter-clockwise seen from +Z. Its corners are ``corner``,
+    # ``corner + ny`` (next X) and ``+ 1`` (next Y), and cell ``(i, j)`` owns face slots
+    # ``2 * (i * (ny - 1) + j)`` and the next.
     corner = i * ny + j
     slot = (i * (ny - 1) + j) * 6
     out_faces[slot + 0] = corner
@@ -168,15 +169,28 @@ def icosphere_generation(
 
 
 @wp.kernel
-def icosphere_faces(
-    table: wp.array2d[wp.int32], n: wp.int32, out_faces: wp.array[wp.int32]
+def icosphere_base(
+    table: wp.array2d[wp.int32],
+    corners: wp.array[wp.vec3],
+    n: wp.int32,
+    radius: wp.float32,
+    out_vertices: wp.array[wp.vec3],
+    out_faces: wp.array[wp.int32],
 ) -> None:
-    # The ``n ** 2`` sub-triangles of one base face, one per thread over the full ``n x n`` block.
-    # The ``n (n + 1) / 2`` upward triangles are the threads with ``i + j < n``; the rest of the
-    # block is remapped by ``(i, j) -> (n - 1 - i, n - 1 - j)`` onto the ``n (n - 1) / 2``
-    # downward ones, which is a bijection -- so every thread writes exactly one triangle and no
-    # prefix-sum over rows is needed.
+    # Everything of the icosphere that no refinement level depends on, in the one launch that runs
+    # before them: the whole face buffer, and the 12 base corners scaled to ``radius`` -- level 0
+    # of the vertex buffer, which every ``icosphere_generation`` launch then refines from. The
+    # corners are written by the threads at ``(f, 0, 0)`` for ``f < 12``, one each.
+    #
+    # The faces: the ``n ** 2`` sub-triangles of one base face, one per thread over the full
+    # ``n x n`` block. The ``n (n + 1) / 2`` upward triangles are the threads with ``i + j < n``;
+    # the rest of the block is remapped by ``(i, j) -> (n - 1 - i, n - 1 - j)`` onto the
+    # ``n (n - 1) / 2`` downward ones, which is a bijection -- so every thread writes exactly one
+    # triangle and no prefix-sum over rows is needed. The face buffer reads no vertex, which is
+    # what lets it run ahead of the refinement.
     f, i, j = wp.tid()
+    if i == 0 and j == 0 and f < ICOSAHEDRON_VERTICES:
+        out_vertices[f] = project_to_radius(corners[f], radius)
     slot = (f * n * n + i * n + j) * 3
     if i + j < n:
         out_faces[slot + 0] = icosphere_vertex_index(table, n, f, i + 1, j)
@@ -390,21 +404,24 @@ def revolve_faces(
 @wp.kernel
 def revolve_cap_faces(
     cap_faces: wp.array[wp.int32],
-    slice_index: wp.int32,
-    reverse: wp.bool,
     n_slices: wp.int32,
     column: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     on_axis: wp.array[wp.bool],
     out_faces: wp.array[wp.int32],
 ) -> None:
-    # Place a profile triangulation on one end slice of a partial revolution. `reverse` reverses the
-    # winding (trimesh's np.fliplr) so the far cap faces outward too.
-    t = wp.int32(wp.tid())
+    # Place a profile triangulation on both end slices of a partial revolution, in one launch: row
+    # 0 is the near cap on slice 0, row 1 the far cap on the last slice, written into adjacent
+    # blocks of ``out_faces`` -- the shape ``offset_cap_faces_both`` takes for the extruded solids.
+    # The far cap's winding is reversed (trimesh's np.fliplr) so it faces outward too.
+    end, t = wp.tid()
+    n_cap = cap_faces.shape[0] // 3
+    slice_index = wp.where(end == 0, wp.int32(0), n_slices - 1)
+    reverse = end == 1
     a = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 0], n_slices, column, offsets, on_axis)
     b = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 1], n_slices, column, offsets, on_axis)
     c = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 2], n_slices, column, offsets, on_axis)
-    write_corner_triple_reversible(out_faces, t, a, b, c, reverse)
+    write_corner_triple_reversible(out_faces, end * n_cap + t, a, b, c, reverse)
 
 
 @wp.kernel
@@ -422,6 +439,18 @@ def offset_cap_faces_both(
     b = cap_faces[t * 3 + 1] + offset
     c = cap_faces[t * 3 + 2] + offset
     write_corner_triple_reversible(out_faces, end * n_cap + t, a, b, c, end == 0)
+
+
+@wp.kernel
+def lift_vec2_layers(
+    vertices: wp.array[wp.vec2], height: wp.float32, out_vertices: wp.array[wp.vec3]
+) -> None:
+    # Both vertex layers of an extrusion in one launch: row 0 at ``z = 0`` into the first ``n``
+    # slots, row 1 at ``z = height`` into the next ``n``. It is ``array.lift_vec2`` at two heights,
+    # which were two ``wp.map`` calls over the same input.
+    layer, i = wp.tid()
+    z = wp.where(layer == 0, wp.float32(0.0), height)
+    out_vertices[layer * vertices.shape[0] + i] = lift_vec2(vertices[i], z)
 
 
 @wp.kernel
@@ -1210,11 +1239,11 @@ def cap_strip_of(face: wp.int32) -> wp.int32:
     return strip
 
 
-@wp.kernel
-def sphere_cap_vertices(
-    n_rings: wp.int32, angle: wp.float64, radius: wp.float64, out_vertices: wp.array[wp.vec3]
-) -> None:
-    # One thread per vertex of the concentric-ring cap lattice. Ring ``r`` sits at polar angle
+@wp.func
+def sphere_cap_vertex(
+    v: wp.int32, n_rings: wp.int32, angle: wp.float64, radius: wp.float64
+) -> wp.vec3:
+    # Vertex ``v`` of the concentric-ring cap lattice. Ring ``r`` sits at polar angle
     # ``angle * r / n_rings`` and carries ``6 * r`` vertices evenly spaced in azimuth, so a thread
     # recovers its own ring from its slot rather than being told: the whole lattice is a closed
     # form in the vertex index, which is what lets it replace a host loop over rings whose cost was
@@ -1222,32 +1251,29 @@ def sphere_cap_vertices(
     #
     # float64 throughout and stored to ``wp.vec3``, matching the host build this replaces: the
     # rounding happens once, in the same place, at the store.
-    v = wp.int32(wp.tid())
     if v == 0:
-        out_vertices[0] = wp.vec3(0.0, 0.0, wp.float32(radius))
-        return
+        return wp.vec3(0.0, 0.0, wp.float32(radius))
     ring = cap_ring_of(v)
     step = v - cap_ring_start(ring)
 
     theta = angle * wp.float64(ring) / wp.float64(n_rings)
     phi = wp.float64(2.0) * wp.float64(wp.PI) * wp.float64(step) / wp.float64(6 * ring)
     ring_radius = radius * wp.sin(theta)
-    out_vertices[v] = wp.vec3(
+    return wp.vec3(
         wp.float32(ring_radius * wp.cos(phi)),
         wp.float32(ring_radius * wp.sin(phi)),
         wp.float32(radius * wp.cos(theta)),
     )
 
 
-@wp.kernel
-def sphere_cap_faces(out_faces: wp.array[wp.int32]) -> None:
-    # One thread per triangle. Strip ``r`` stitches ring ``r - 1`` to ring ``r``, and because the
+@wp.func
+def write_sphere_cap_face(f: wp.int32, out_faces: wp.array[wp.int32]) -> None:
+    # Triangle ``f`` of the cap. Strip ``r`` stitches ring ``r - 1`` to ring ``r``, and because the
     # outer ring carries exactly one more vertex per sector than the inner one the strip is
     # ``6 * r`` outward-pointing triangles (one per outer edge) followed by ``6 * (r - 1)``
     # inward-pointing ones (one per inner edge), rather than an even fan. That is why the total
     # lands on exactly ``6 * n_rings ** 2``, and it is the order the buffer is written in, so a
     # thread's triangle is a closed form in its own index.
-    f = wp.int32(wp.tid())
     strip = cap_strip_of(f)
     local = f - 6 * (strip - 1) * (strip - 1)
 
@@ -1274,3 +1300,23 @@ def sphere_cap_faces(out_faces: wp.array[wp.int32]) -> None:
         out_faces[base + 0] = inner_base + inner
         out_faces[base + 1] = outer_base + (sector * strip + step + 1) % outer_count
         out_faces[base + 2] = inner_base + (inner + 1) % inner_count
+
+
+@wp.kernel
+def sphere_cap_mesh(
+    n_rings: wp.int32,
+    angle: wp.float64,
+    radius: wp.float64,
+    out_vertices: wp.array[wp.vec3],
+    out_faces: wp.array[wp.int32],
+) -> None:
+    # The whole cap in one launch over ``max(n_vertices, n_faces)`` threads: thread ``t`` writes
+    # vertex ``t`` and triangle ``t`` where each exists. Neither buffer reads the other, and both
+    # are closed form in the index, so the two were separate launches only by habit. The faces
+    # outnumber the vertices from two rings on (``6 r^2`` against ``3 r^2 + 3 r + 1``), and a
+    # single ring is the one size where the vertices are the longer buffer.
+    t = wp.int32(wp.tid())
+    if t < out_vertices.shape[0]:
+        out_vertices[t] = sphere_cap_vertex(t, n_rings, angle, radius)
+    if t < out_faces.shape[0] // 3:
+        write_sphere_cap_face(t, out_faces)

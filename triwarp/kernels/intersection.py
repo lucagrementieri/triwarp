@@ -494,12 +494,35 @@ def face_level_set_signs(
     return s0 + s1 + s2, wp.abs(s0) + wp.abs(s1) + wp.abs(s2)
 
 
+@wp.func
+def write_class_flags(
+    face_class: wp.int32,
+    f: wp.int32,
+    n_faces: wp.int32,
+    n_classes: wp.int32,
+    out_flags: wp.array[wp.int32],
+) -> None:
+    # Selection flags for every kept class at once, as ``n_classes`` blocks of ``n_faces`` in one
+    # buffer. Scanning that buffer once compacts all the classes into one index array with the
+    # blocks contiguous, so the whole partition costs one scan and one host readback rather than one
+    # of each per class. Class ``c`` maps to block ``c - 1``; class 0 is "not selected". Every face
+    # writes all of its slots, which is what keeps the buffer from needing a memset first.
+    #
+    # Called from the classifiers themselves rather than from a pass of its own, so a class and
+    # its flags come out of one launch -- the flags read nothing but the class the same thread just
+    # decided. ``n_classes`` is an argument so the clip's three kept classes and the split's four
+    # share it.
+    for block in range(n_classes):
+        out_flags[block * n_faces + f] = wp.where(face_class == block + 1, wp.int32(1), wp.int32(0))
+
+
 @wp.kernel
 def classify_faces_for_slice(
     faces: wp.array[wp.int32],
     vertex_dots: wp.array[wp.float32],
     out_classes: wp.array[wp.int32],
     out_signs: wp.array2d[wp.int32],
+    out_flags: wp.array[wp.int32],
 ) -> None:
     f = wp.int32(wp.tid())
     signs_sum, signs_asum = face_level_set_signs(faces, vertex_dots, f, out_signs)
@@ -517,6 +540,7 @@ def classify_faces_for_slice(
         else:
             face_class = SLICE_CLASS_CUT_TRI
     out_classes[f] = face_class
+    write_class_flags(face_class, f, faces.shape[0] // 3, SLICE_CLASSES, out_flags)
 
 
 @wp.func
@@ -540,40 +564,21 @@ def resolve_on_plane_faces(
     faces: wp.array[wp.int32],
     plane_normal: wp.vec3,
     out_classes: wp.array[wp.int32],
+    out_flags: wp.array[wp.int32],
 ) -> None:
+    # Runs after ``classify_faces_for_slice`` has written the classes *and* their flags, so a face
+    # it moves has to move its flag too. ``ON_PLANE`` is not a kept class and carries no flag, and
+    # ``DROP`` carries none either, so only a face resolved to ``INSIDE`` gains one -- in block 0,
+    # at ``f``, which is what ``write_class_flags`` would have written for it.
     f = wp.int32(wp.tid())
     if out_classes[f] != SLICE_CLASS_ON_PLANE:
         return
     is_below, degenerate = on_plane_face_side(vertices, faces, plane_normal, f)
     if not degenerate and is_below:
         out_classes[f] = SLICE_CLASS_INSIDE
+        out_flags[f] = wp.int32(1)
     else:
         out_classes[f] = SLICE_CLASS_DROP
-
-
-@wp.kernel
-def slice_class_flags(
-    classes: wp.array[wp.int32],
-    n_faces: wp.int32,
-    n_classes: wp.int32,
-    out_flags: wp.array[wp.int32],
-) -> None:
-    # Selection flags for all three kept classes at once, as three ``n_faces``-long blocks of one
-    # buffer. Scanning that buffer once compacts the three classes into one index array with the
-    # blocks contiguous, so the whole partition costs one scan and one host readback rather than
-    # three of each. Every thread writes all three of its slots, which is what keeps the buffer
-    # from needing a memset first. ``n_classes`` is an argument rather than a module constant so
-    # that the both-sides split, which keeps four classes where the clip keeps three, shares it.
-    f = wp.int32(wp.tid())
-    face_class = classes[f]
-    for block in range(n_classes):
-        # ``wp.int32(0)``, not ``0``: the loop bound is now an argument rather than a module
-        # constant, so the loop is dynamic and a bare literal is a constant Warp refuses to
-        # mutate inside one.
-        flag = wp.int32(0)
-        if face_class == block + 1:
-            flag = wp.int32(1)
-        out_flags[block * n_faces + f] = flag
 
 
 @wp.kernel
@@ -772,7 +777,7 @@ def emit_tri_cut(
 
 
 # Face classes for the both-sides split. Numbered from 1 contiguously because
-# ``slice_class_flags`` maps class ``c`` to block ``c - 1``; class 0 is "not selected", which this
+# ``write_class_flags`` maps class ``c`` to block ``c - 1``; class 0 is "not selected", which this
 # taxonomy never needs since a split keeps every face.
 SPLIT_CLASS_POSITIVE = wp.constant(wp.int32(1))
 SPLIT_CLASS_NEGATIVE = wp.constant(wp.int32(2))
@@ -787,43 +792,46 @@ def classify_faces_for_split(
     vertex_dots: wp.array[wp.float32],
     out_classes: wp.array[wp.int32],
     out_signs: wp.array2d[wp.int32],
+    out_flags: wp.array[wp.int32],
 ) -> None:
     # Four classes rather than the clip's three, because a split keeps both sides and so has to
     # tell the two *uncut* sides apart -- and because a face with one corner exactly on the level
     # set splits into two triangles, not three. The sign convention is ``face_level_set_signs``'.
     f = wp.int32(wp.tid())
     signs_sum, signs_asum = face_level_set_signs(faces, vertex_dots, f, out_signs)
+    face_class = SPLIT_CLASS_CUT_CORNER
     if signs_sum == -signs_asum:
         # Every corner on the positive side, or all three exactly on the level set -- which counts
         # as positive, so the face is kept whole rather than cut along itself.
-        out_classes[f] = SPLIT_CLASS_POSITIVE
+        face_class = SPLIT_CLASS_POSITIVE
     elif signs_sum == signs_asum:
-        out_classes[f] = SPLIT_CLASS_NEGATIVE
+        face_class = SPLIT_CLASS_NEGATIVE
     elif signs_asum == wp.int32(3):
-        out_classes[f] = SPLIT_CLASS_CUT_EDGES
-    else:
-        # One corner exactly on the level set and the other two on opposite sides: a single edge
-        # crossing, joined to that corner.
-        out_classes[f] = SPLIT_CLASS_CUT_CORNER
+        face_class = SPLIT_CLASS_CUT_EDGES
+    # Otherwise one corner is exactly on the level set and the other two on opposite sides: a
+    # single edge crossing, joined to that corner -- the ``CUT_CORNER`` default above.
+    out_classes[f] = face_class
+    write_class_flags(face_class, f, faces.shape[0] // 3, SPLIT_CLASSES, out_flags)
 
 
 @wp.kernel
-def level_set_edge_vertices(
-    vertices: wp.array[wp.vec3],
-    unique_edges: wp.array2d[wp.int32],
-    crossed_edge_indices: wp.array[wp.int32],
-    vertex_dots: wp.array[wp.float32],
-    out_points: wp.array[wp.vec3],
+def emit_split_uncut_faces(
+    faces: wp.array[wp.int32],
+    uncut_indices: wp.array[wp.int32],
+    n_positive: wp.int32,
+    out_new_faces: wp.array2d[wp.int32],
+    out_positive: wp.array[wp.bool],
 ) -> None:
-    # One crossing point per crossed *edge*, not per crossed face-corner. That is what makes the
-    # split watertight: both faces sharing the edge address the same new vertex, where a per-face
-    # crossing would leave two coincident copies and a seam of loose edges (which is exactly why
-    # ``clip_mesh_with_field(cap=True)`` has to weld before it can fill).
-    i = wp.int32(wp.tid())
-    e = crossed_edge_indices[i]
-    out_points[i] = canonical_edge_crossing(
-        vertices, vertex_dots, unique_edges[e, 0], unique_edges[e, 1]
-    )
+    # The faces no cut touches, copied through with their side label. ``uncut_indices`` is the
+    # partition's index buffer, whose first two blocks are the positive and then the negative
+    # faces, so row ``k`` belongs to the positive side exactly when ``k < n_positive`` -- both
+    # blocks in one launch, reading the buffer from its start rather than through a view per block.
+    k = wp.int32(wp.tid())
+    i0, i1, i2 = kernel_triangles.corner_triple(faces, uncut_indices[k])
+    out_new_faces[k, 0] = i0
+    out_new_faces[k, 1] = i1
+    out_new_faces[k, 2] = i2
+    out_positive[k] = k < n_positive
 
 
 @wp.func
@@ -922,6 +930,7 @@ def plane_crossed_edge_mask(
     vertex_dots: wp.array[wp.float32],
     tolerance: wp.float32,
     out_crossed: wp.array[wp.bool],
+    out_flags: wp.array[wp.int32],
 ) -> None:
     # An edge needs a new vertex only when the plane passes through its *interior*: an endpoint
     # already in the plane (within ``tolerance``) serves as the crossing itself, so splitting there
@@ -938,7 +947,11 @@ def plane_crossed_edge_mask(
     b = unique_edges[e, 1]
     sign_a = kernel_array.sign_with_tolerance(vertex_dots[a], tolerance)
     sign_b = kernel_array.sign_with_tolerance(vertex_dots[b], tolerance)
-    out_crossed[e] = sign_a * sign_b < wp.int32(0)
+    crossed = sign_a * sign_b < wp.int32(0)
+    out_crossed[e] = crossed
+    # The same verdict as the ``0`` / ``1`` count the caller scans for each crossing's slot, so the
+    # mask needs no conversion pass before the scan.
+    out_flags[e] = wp.where(crossed, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
@@ -950,9 +963,15 @@ def plane_edge_crossing_points(
     vertex_dots: wp.array[wp.float32],
     out_points: wp.array[wp.vec3],
 ) -> None:
-    # ``remesh.fill_edge_midpoints`` with the plane crossing in place of the midpoint. One point per
-    # *unique edge* rather than per cut face, which is what makes the split crack-free where
-    # ``_clip_with_vertex_field`` is cracked: the two faces sharing the edge read one index.
+    # ``remesh.fill_edge_midpoints`` with the level-set crossing in place of the midpoint. One point
+    # per *unique edge* rather than per cut face, which is what makes the split crack-free where
+    # ``_clip_with_vertex_field`` is cracked: the two faces sharing the edge address the same new
+    # vertex, where a per-face crossing would leave two coincident copies and a seam of loose edges
+    # (which is exactly why ``clip_mesh_with_field(cap=True)`` has to weld before it can fill).
+    #
+    # Launched over every unique edge and gated on the mask, writing each crossing at the slot the
+    # exclusive scan of that mask gave it -- so neither split needs the crossed edges' own index
+    # list, which would be a second compaction of the mask the scan already compacted.
     e = wp.int32(wp.tid())
     if crossed[e]:
         out_points[offsets[e]] = canonical_edge_crossing(
@@ -1139,6 +1158,12 @@ def _register_overloads() -> None:
 
 
 _register_overloads()
+
+
+@wp.func
+def shift_to_float32(value: wp.float64, isovalue: wp.float64) -> wp.float32:
+    """Re-zero a ``float64`` field value at ``isovalue`` in its own precision, then narrow it."""
+    return wp.float32(value - isovalue)
 
 
 @wp.func

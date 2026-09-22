@@ -45,7 +45,9 @@ What has no group, and why
 ``to_field`` are each one launch over the voxel set with no allocation of their
 own, so a row would time the wrapper floor rather than the operation. Most are covered anyway
 through a group that calls them: ``fill_cavities`` and ``fill_orthographic`` both go through
-``to_dense`` / ``from_dense``, and ``surface_voxels`` runs the same probe kernel as ``erode``.
+``to_dense`` (and ``fill_orthographic`` through ``from_dense``, whose candidate pass
+``fill_cavities`` fuses into its own last kernel), and ``surface_voxels`` runs the same probe kernel
+as ``erode``.
 
 ``cells`` is the exception, because for ``order="sorted"`` the wrapper floor *is* the operation at
 every size -- flat over three orders of magnitude of voxel counts -- so "the row would time the

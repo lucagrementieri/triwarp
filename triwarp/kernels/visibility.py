@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_PLANAR_CONSTANT
+from triwarp.kernels.proximity import closest_point_query
 from triwarp.kernels.tangent_space import any_perpendicular
 
 # Weighting of a ray inside the bundle. Passed as a warp-uniform kernel argument so both schemes
@@ -302,12 +303,12 @@ def sphere_center(point: wp.vec3, normal: wp.vec3, radius: wp.float32) -> wp.vec
 
 @wp.kernel
 def step_sphere_shrink(
+    mesh_id: wp.uint64,
     points: wp.array[wp.vec3],
     normals: wp.array[wp.vec3],
-    n_points: wp.array[wp.vec3],
-    n_dists: wp.array[wp.float32],
     centers: wp.array[wp.vec3],
     old_radii: wp.array[wp.float32],
+    max_t: wp.float32,
     convergence_threshold: wp.float32,
     not_converged: wp.array[wp.bool],
     out_radii: wp.array[wp.float32],
@@ -317,6 +318,14 @@ def step_sphere_shrink(
     # Every lane writes all three outputs (converged lanes pass their state through), so the
     # wrapper can ping-pong two preallocated buffer sets instead of cloning per iteration, and
     # extra launches on a fully converged state are harmless no-ops.
+    #
+    # The closest-point query of the current centre runs *here*, after the convergence test, rather
+    # than as a ``closest_point_on_mesh`` launch ahead of this one: the step reads that query's
+    # answer only at its own index, so the fusion removes a launch per iteration and three
+    # ``m``-sized buffers the answer made a round trip through -- and a lane that has already
+    # converged no longer pays a BVH query whose answer it would ignore. The query and its miss
+    # convention are ``proximity.closest_point_query``'s, so the values are the ones the separate
+    # pass wrote.
     tid = wp.int32(wp.tid())
     p = points[tid]
     center = centers[tid]
@@ -326,15 +335,16 @@ def step_sphere_shrink(
         out_not_converged[tid] = False
         return
 
+    nearest, nearest_distance, _face = closest_point_query(mesh_id, center, max_t)
     dist_to_start = wp.length(center - p)
 
-    if wp.abs(n_dists[tid] - dist_to_start) < TOLERANCE_PLANAR_CONSTANT:
+    if wp.abs(nearest_distance - dist_to_start) < TOLERANCE_PLANAR_CONSTANT:
         out_radii[tid] = old_radii[tid]
         out_centers[tid] = center
         out_not_converged[tid] = False
         return
 
-    diff = n_points[tid] - p
+    diff = nearest - p
     denom = wp.float32(2.0) * wp.dot(diff, normals[tid])
     if wp.abs(denom) < TOLERANCE_PLANAR_CONSTANT:
         out_radii[tid] = old_radii[tid]

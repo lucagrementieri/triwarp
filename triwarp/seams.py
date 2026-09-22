@@ -355,56 +355,22 @@ def uv_seam_edges(
     require_same_device(
         faces=faces, texcoords=texcoords, face_texcoords=face_texcoords, twins=twins
     )
-    n_faces = int(faces.shape[0]) // 3
-    if match is None:
-        match = "index" if face_texcoords is not None else "uv"
-    if match not in _UV_MATCH_MODES:
-        raise ValueError(f"match must be one of {list(_UV_MATCH_MODES)}, got {match!r}")
-    match_uv = _UV_MATCH_MODES[match]
-    if not match_uv and face_texcoords is None:
-        raise ValueError(
-            "match='index' needs face_texcoords: without it every corner has its own texcoord "
-            "index and every interior edge would be reported as a seam. Pass match='uv'."
-        )
-    if face_texcoords is not None and int(face_texcoords.shape[0]) != int(faces.shape[0]):
-        raise ValueError(
-            f"face_texcoords must have one entry per face corner, got "
-            f"{int(face_texcoords.shape[0])} for {int(faces.shape[0])} corners"
-        )
-    if face_texcoords is not None and int(face_texcoords.shape[0]) > 0:
-        # A caller-supplied pool index, unlike the length check above -- ``classify_uv_halfedges``
-        # indexes ``texcoords`` with it directly, and an out-of-range entry (a stale ``FTC`` after
-        # ``texcoords`` was trimmed, an off-by-one building the pool) is a device-side out-of-bounds
-        # read rather than a Python exception. Caught here rather than left to the kernel.
-        min_index, max_index = tw.reduce.minmax(face_texcoords)
-        if min_index < 0 or max_index >= int(texcoords.shape[0]):
-            raise ValueError(
-                f"face_texcoords entries must be in [0, {int(texcoords.shape[0])}) (texcoords' "
-                f"length), got a range of [{min_index}, {max_index}]"
-            )
-    if face_texcoords is None and int(texcoords.shape[0]) != 3 * n_faces:
-        raise ValueError(
-            f"without face_texcoords, texcoords must be per-corner (length {3 * n_faces}), got "
-            f"{int(texcoords.shape[0])}"
-        )
-
+    match_uv = _validate_uv_inputs(faces, texcoords, face_texcoords, match)
     device = faces.device
-    if n_faces == 0:
+    n_halfedges = int(faces.shape[0]) // 3 * 3
+    if n_halfedges == 0:
         return (
             twt.empty_2d((0, 4), wp.int32, device=device),
             twt.empty_2d((0, 2), wp.int32, device=device),
             twt.empty_2d((0, 4), wp.int32, device=device),
         )
-    if face_texcoords is None:
-        face_texcoords = tw.array.arange(3 * n_faces, device=device)
-
-    n_halfedges = 3 * n_faces
     if twins is None:
         twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
-    is_seam = wp.empty(n_halfedges, dtype=wp.bool, device=device)
-    is_boundary = wp.empty(n_halfedges, dtype=wp.bool, device=device)
-    is_foldover = wp.empty(n_halfedges, dtype=wp.bool, device=device)
-    quads = twt.empty_2d((n_halfedges, 4), wp.int32, device=device)
+
+    # Row ``k`` flags class ``k + 1`` (seam, boundary, foldover). One inclusive scan over the
+    # flattened table numbers all three blocks, and the per-class totals come back in one read.
+    flags = twt.empty_2d((3, n_halfedges), wp.int32, device=device)
+    counts = wp.zeros(3, dtype=wp.int32, device=device)
     wp.launch(
         kernel_seams.classify_uv_halfedges,
         dim=n_halfedges,
@@ -412,31 +378,30 @@ def uv_seam_edges(
             faces,
             twins,
             face_texcoords,
+            face_texcoords is not None,
             texcoords,
             match_uv,
             wp.float32(tolerance * tolerance),
-            is_seam,
-            is_boundary,
-            is_foldover,
-            quads,
+            flags,
+            counts,
         ],
         device=device,
     )
-
-    boundary_halfedges = tw.array.flatnonzero(is_boundary)
-    boundaries = twt.empty_2d((int(boundary_halfedges.shape[0]), 2), wp.int32, device=device)
-    if int(boundary_halfedges.shape[0]) > 0:
+    inclusive = twt.empty_2d((3, n_halfedges), wp.int32, device=device)
+    wp.utils.array_scan(flags.flatten(), out_array=inclusive.flatten(), inclusive=True)
+    # One readback sizes all three outputs.
+    n_seams, n_boundaries, n_foldovers = (int(count) for count in counts.numpy())
+    seams = twt.empty_2d((n_seams, 4), wp.int32, device=device)
+    boundaries = twt.empty_2d((n_boundaries, 2), wp.int32, device=device)
+    foldovers = twt.empty_2d((n_foldovers, 4), wp.int32, device=device)
+    if n_seams + n_boundaries + n_foldovers > 0:
         wp.launch(
-            kernel_seams.boundary_face_corners,
-            dim=int(boundary_halfedges.shape[0]),
-            inputs=[boundary_halfedges, boundaries],
+            kernel_seams.scatter_uv_halfedges,
+            dim=n_halfedges,
+            inputs=[faces, twins, flags, inclusive, counts, seams, boundaries, foldovers],
             device=device,
         )
-    return (
-        twt.as_array2d(tw.array.gather(quads, tw.array.flatnonzero(is_seam)), wp.int32),
-        twt.as_array2d(boundaries, wp.int32),
-        twt.as_array2d(tw.array.gather(quads, tw.array.flatnonzero(is_foldover)), wp.int32),
-    )
+    return seams, boundaries, foldovers
 
 
 def seam_edge_vertices(
@@ -543,8 +508,8 @@ def uv_seam_vertex_mask(
     Raises
     ------
     ValueError
-        Delegated from [`uv_seam_edges`][triwarp.seams.uv_seam_edges]: if ``match="index"`` is asked
-        for without ``face_texcoords``, if ``face_texcoords`` is present but not the same length as
+        As for [`uv_seam_edges`][triwarp.seams.uv_seam_edges]: if ``match="index"`` is asked for
+        without ``face_texcoords``, if ``face_texcoords`` is present but not the same length as
         ``faces`` or has an entry outside ``[0, texcoords.shape[0])``, if ``face_texcoords`` is
         ``None`` and ``texcoords`` is not length ``3 * n_faces``, if ``faces`` is not
         edge-manifold, or if ``match`` is neither ``"index"`` nor ``"uv"``.
@@ -558,16 +523,81 @@ def uv_seam_vertex_mask(
     [`triwarp.array.indices_to_mask`][triwarp.array.indices_to_mask]
     """
     require_same_device(faces=faces, texcoords=texcoords, face_texcoords=face_texcoords)
+    match_uv = _validate_uv_inputs(faces, texcoords, face_texcoords, match)
+    device = faces.device
     if n_vertices is None:
         n_vertices = tw.array.index_bound(faces)
-    seams, boundaries, _foldovers = uv_seam_edges(
-        faces, texcoords, face_texcoords, match=match, tolerance=tolerance, n_vertices=n_vertices
+    mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    n_halfedges = int(faces.shape[0]) // 3 * 3
+    if n_halfedges == 0 or n_vertices == 0:
+        return mask
+    twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
+    # The same per-halfedge classification ``uv_seam_edges`` compacts, marked straight onto the
+    # vertices: a seam row's endpoints are its halfedge's own, so no row needs to exist.
+    wp.launch(
+        kernel_seams.mark_uv_seam_vertices,
+        dim=n_halfedges,
+        inputs=[
+            faces,
+            twins,
+            face_texcoords,
+            face_texcoords is not None,
+            texcoords,
+            match_uv,
+            wp.float32(tolerance * tolerance),
+            include_boundary,
+            mask,
+        ],
+        device=device,
     )
-    blocks = [seams, boundaries] if include_boundary else [seams]
-    endpoints = [
-        seam_edge_vertices(faces, block).flatten() for block in blocks if int(block.shape[0]) > 0
-    ]
-    if not endpoints:
-        return wp.zeros(n_vertices, dtype=wp.bool, device=faces.device)
-    marked = endpoints[0] if len(endpoints) == 1 else tw.array.concatenate(endpoints)
-    return tw.array.indices_to_mask(marked, n_vertices, device=faces.device)
+    return mask
+
+
+def _validate_uv_inputs(
+    faces: wp.array[wp.int32],
+    texcoords: wp.array[wp.vec2],
+    face_texcoords: wp.array[wp.int32] | None,
+    match: Literal["index", "uv"] | None,
+) -> bool:
+    """
+    Check the texcoord arguments both UV entry points take, and resolve ``match`` to a bool.
+
+    Returns whether the seam predicate compares coordinates (``True``) rather than texcoord
+    indices. Shared by [`uv_seam_edges`][triwarp.seams.uv_seam_edges] and
+    [`uv_seam_vertex_mask`][triwarp.seams.uv_seam_vertex_mask], whose ``Raises`` blocks document
+    what this rejects.
+    """
+    n_faces = int(faces.shape[0]) // 3
+    if match is None:
+        match = "index" if face_texcoords is not None else "uv"
+    if match not in _UV_MATCH_MODES:
+        raise ValueError(f"match must be one of {list(_UV_MATCH_MODES)}, got {match!r}")
+    match_uv = _UV_MATCH_MODES[match]
+    if not match_uv and face_texcoords is None:
+        raise ValueError(
+            "match='index' needs face_texcoords: without it every corner has its own texcoord "
+            "index and every interior edge would be reported as a seam. Pass match='uv'."
+        )
+    if face_texcoords is not None and int(face_texcoords.shape[0]) != int(faces.shape[0]):
+        raise ValueError(
+            f"face_texcoords must have one entry per face corner, got "
+            f"{int(face_texcoords.shape[0])} for {int(faces.shape[0])} corners"
+        )
+    if face_texcoords is not None and int(face_texcoords.shape[0]) > 0:
+        # A caller-supplied pool index, unlike the length check above -- ``classify_uv_halfedge``
+        # indexes ``texcoords`` with it directly, and an out-of-range entry (a stale ``FTC`` after
+        # ``texcoords`` was trimmed, an off-by-one building the pool) is a device-side out-of-bounds
+        # read rather than a Python exception. Caught here rather than left to the kernel.
+        min_index, max_index = tw.reduce.minmax(face_texcoords)
+        if min_index < 0 or max_index >= int(texcoords.shape[0]):
+            raise ValueError(
+                f"face_texcoords entries must be in [0, {int(texcoords.shape[0])}) (texcoords' "
+                f"length), got a range of [{min_index}, {max_index}]"
+            )
+    if face_texcoords is None and int(texcoords.shape[0]) != 3 * n_faces:
+        raise ValueError(
+            f"without face_texcoords, texcoords must be per-corner (length {3 * n_faces}), got "
+            f"{int(texcoords.shape[0])}"
+        )
+
+    return match_uv

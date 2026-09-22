@@ -7,7 +7,6 @@ from triwarp.kernels.array import (
     map_probe_single,
     mat33_column,
     pack_farthest_key,
-    pack_nearest_key,
     unpack_ranked_index,
 )
 from triwarp.kernels.predicates import point_plane_dot, triangle_normal
@@ -384,16 +383,6 @@ def pack_class_z_bits(class_id: wp.int32, point: wp.vec3) -> wp.int64:
     class_bits = wp.uint64(wp.uint32(class_id))
     z_bits = wp.uint64(wp.uint32(zero_normalized_bits(point[2])))
     return wp.int64((class_bits << wp.uint64(32)) | z_bits)
-
-
-@wp.kernel
-def nearest_pair_keys(
-    nearest_distances: wp.array2d[wp.float32], out_keys: wp.array[wp.int64]
-) -> None:
-    # One key per point, over column 1 of a ``k=2`` self-query table: column 0 is the point itself.
-    # The thread index is the payload, which is what keeps this a kernel rather than a ``wp.map``.
-    i = wp.int32(wp.tid())
-    out_keys[i] = pack_nearest_key(nearest_distances[i, 1], i)
 
 
 # Lanes per block for ``farthest_point_sample_block``, keyed on the cloud size. The kernel is one

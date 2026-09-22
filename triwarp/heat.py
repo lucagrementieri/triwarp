@@ -362,17 +362,16 @@ def heat_geodesic(
 
     # Integrated divergence b = div(X) of the unit field X = -grad(u)/|grad(u)|, then a Poisson
     # solve L phi = b, i.e. (-L) phi = -b with the positive semi-definite operator. One launch: the
-    # field is formed and integrated per face, so it never occupies an (n_faces,) buffer.
-    divergence = wp.zeros(n_vertices, dtype=wp.float64, device=device)
+    # field is formed and integrated per face, so it never occupies an (n_faces,) buffer. The kernel
+    # integrates ``-X`` and so accumulates ``-b`` directly: the divergence is linear in the field
+    # and negation is exact, so this is the negated sum without a pass to negate it.
+    neg_divergence = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
         kernel_heat.unit_gradient_divergence,
         dim=n_faces,
-        inputs=[vertices, faces, normals, areas, heat, wp.float64(-1.0), cot_entries, divergence],
+        inputs=[vertices, faces, normals, areas, heat, cot_entries, neg_divergence],
         device=device,
     )
-    # Flip sign so the Poisson right-hand side matches the positive semi-definite operator ``-L``.
-    neg_divergence = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.map(wp.neg, divergence, out=neg_divergence)
 
     phi = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     twl.solve_spd(
@@ -1110,7 +1109,7 @@ def log_map(
     wp.launch(
         kernel_heat.scatter_unit_gradient_to_vertices,
         dim=n_faces,
-        inputs=[vertices, faces, normals, areas, distance, wp.float64(1.0), vertex_gradient],
+        inputs=[vertices, faces, normals, areas, distance, vertex_gradient],
         device=device,
     )
     # ``vertex_gradient`` is an area-weighted *sum* of unit vectors (see

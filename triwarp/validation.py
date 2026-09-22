@@ -169,15 +169,11 @@ def edge_manifold_mask(
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=validate)
     _, inverse, counts = tw.grouping.unique_1d(keys, return_inverse=True, return_counts=True)
 
-    n_unique = int(counts.shape[0])
-    edge_ok = wp.empty(n_unique, dtype=wp.bool, device=device)
-    wp.map(kernel_validation.edge_manifold, counts, wp.bool(allow_boundary_edges), out=edge_ok)
-
     out_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
     wp.launch(
         kernel_validation.face_edge_manifold_mask,
         dim=n_faces,
-        inputs=[inverse, edge_ok, out_mask],
+        inputs=[inverse, counts, wp.bool(allow_boundary_edges), out_mask],
         device=device,
     )
     return out_mask
@@ -1178,29 +1174,30 @@ def face_defective_mask(
 
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
-    out_bad = wp.zeros(n_faces, dtype=wp.bool, device=device)
+    # ``wp.empty``: the mask kernel writes every face on every path.
+    out_bad = wp.empty(n_faces, dtype=wp.bool, device=device)
     if n_faces == 0:
         return out_bad
 
+    # A disabled criterion's tables are ``None``: the kernel never reads them, see its comment.
     quality = (
         tw.triangles.face_quality(vertices, faces, metric="radius_ratio")
         if min_quality is not None
-        else wp.full(n_faces, 1.0, dtype=wp.float32, device=device)
+        else None
     )
-    if face_normals is None:
-        face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
-    neighbor_sum = wp.zeros(n_faces, dtype=wp.vec3, device=device)
-    max_angle = wp.zeros(n_faces, dtype=wp.float32, device=device)
+    neighbor_sum = None
+    max_angle = None
     if max_normal_angle is not None or max_fold_angle is not None:
+        if face_normals is None:
+            face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
+        neighbor_sum = wp.zeros(n_faces, dtype=wp.vec3, device=device)
+        max_angle = wp.zeros(n_faces, dtype=wp.float32, device=device)
         adjacency = tw.adjacency.face_adjacency(faces, n_vertices=int(vertices.shape[0]))
         if int(adjacency.shape[0]) > 0:
-            angles = tw.adjacency.face_adjacency_angles(
-                vertices, faces, face_adjacency=adjacency, face_normals=face_normals
-            )
             wp.launch(
                 kernel_validation.accumulate_neighbor_normals,
                 dim=int(adjacency.shape[0]),
-                inputs=[face_normals, adjacency, angles, neighbor_sum, max_angle],
+                inputs=[face_normals, adjacency, neighbor_sum, max_angle],
                 device=device,
             )
 

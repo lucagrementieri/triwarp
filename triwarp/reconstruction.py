@@ -307,42 +307,39 @@ def triangulate_point_cloud(
         return wp.clone(points), wp.empty(0, dtype=wp.int32, device=device)
     candidates = twt.as_array2d(tw.array.gather(out_tris.reshape((n * k, 3)), kept), wp.int32)
 
-    # Repeated oriented triangles: t3 (3 reps) preferred, then t2 (2 reps).
-    t3 = _repeated_oriented_triangles(candidates, n, 3)
-    t2 = _repeated_oriented_triangles(candidates, n, 2)
+    # Repeated oriented triangles: t3 (3 reps) preferred, then t2 (2 reps). Both group the
+    # candidates by the same unoriented key -- the row's three indices sorted, then hashed -- so
+    # that key is built once for the pair.
+    sorted_keys = twt.empty_2d((int(candidates.shape[0]), 3), wp.int32, device=device)
+    wp.launch(
+        kernel_triangles.sort_face_indices,
+        dim=int(candidates.shape[0]),
+        inputs=[candidates, sorted_keys],
+        device=device,
+    )
+    # ``sorted_keys`` permutes each row of ``candidates``, whose entries this package produced as
+    # point indices below ``n``, so the hash's bound holds by construction.
+    row_keys = tw.grouping.hash_indices_rows(sorted_keys, n, validate=False)
+    t3 = _repeated_oriented_triangles(candidates, row_keys, 3)
+    t2 = _repeated_oriented_triangles(candidates, row_keys, 2)
 
     return _assemble_faces(points, t3, t2, crit_hole_length)
 
 
 def _repeated_oriented_triangles(
-    candidates: twt.Array2dInt32, n_points: int, repetitions: int
+    candidates: twt.Array2dInt32, row_keys: wp.array[wp.uint64], repetitions: int
 ) -> twt.Array2dInt32:
     """
     Keep one oriented representative per candidate triangle repeated exactly ``repetitions`` times.
 
-    Candidate triangles are grouped by their sorted (unoriented) vertex key; groups of the
-    requested size contribute their first oriented triangle. This is the trusted-normal case: the
-    orientation is taken from the candidates rather than propagated.
+    Candidate triangles are grouped by their unoriented key -- ``row_keys``, one integer per row
+    of ``candidates`` identifying its vertex set; groups of the requested size contribute their
+    first oriented triangle. This is the trusted-normal case: the orientation is taken from the
+    candidates rather than propagated.
     """
     device = candidates.device
-    n_candidates = int(candidates.shape[0])
-    if n_candidates < repetitions:
-        return twt.empty_2d((0, 3), wp.int32, device=device)
-
-    sorted_keys = twt.empty_2d((n_candidates, 3), wp.int32, device=device)
-    wp.launch(
-        kernel_triangles.sort_face_indices,
-        dim=n_candidates,
-        inputs=[candidates, sorted_keys],
-        device=device,
-    )
-    # ``sorted_keys`` is a permutation of ``candidates``, whose entries this package produced
-    # as point indices below ``n_points``, so both bounds hold by construction.
-    groups = tw.grouping.group_int_rows(
-        sorted_keys, repetitions, max_value=n_points, validate=False
-    )
-    n_groups = int(groups.shape[0])
-    if n_groups == 0:
+    groups = tw.grouping.group(row_keys, repetitions)
+    if int(groups.shape[0]) == 0:
         return twt.empty_2d((0, 3), wp.int32, device=device)
 
     return twt.as_array2d(tw.array.gather(candidates, wp.clone(groups[:, 0])), wp.int32)

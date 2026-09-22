@@ -41,7 +41,6 @@ from triwarp._device import read_scalar, require_same_device
 from triwarp.array import arange, flatnonzero, gather
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
-from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
 from triwarp.neighbors import query_ball_with_offsets
 from triwarp.triangles import face_normals_and_areas
@@ -380,16 +379,20 @@ def sample_surface_poisson_disk(
     # 6. Parallel round-based elimination
     alive_count = init_count
     is_max = wp.zeros(init_count, dtype=wp.int32, device=device)
+    # The round's maxima count, accumulated by the flagging pass itself and re-zeroed once read.
+    max_count = wp.zeros(1, dtype=wp.int32, device=device)
 
     while alive_count > count:
         wp.launch(
             kernel_sample.find_local_maxima,
             dim=init_count,
-            inputs=[weights, alive, nbr_idx, offsets, is_max],
+            inputs=[weights, alive, nbr_idx, offsets, is_max, max_count],
             device=device,
         )
 
-        n_max = tw.reduce.sum(is_max)
+        # The one readback per round: every branch below depends on the count.
+        n_max = int(read_scalar(max_count, 0))
+        max_count.zero_()
         excess = alive_count - count
         if n_max == 0:
             # Nothing is flagged only when no alive point has an alive neighbour inside ``r_max``
@@ -414,9 +417,8 @@ def sample_surface_poisson_disk(
         )
         alive_count -= n_max
 
-    # 7. GPU gather: convert alive mask to bool, get indices, copy selected rows
-    alive_bool = tw.array.astype(alive, wp.bool)
-    indices = flatnonzero(alive_bool)
+    # 7. GPU gather: the 0/1 alive flags are already what ``flatnonzero`` reads
+    indices = flatnonzero(alive)
 
     return gather(init_points, indices), gather(init_face_indices, indices)
 
@@ -459,7 +461,7 @@ def _top_maxima_by_weight(
         Length-``init_count`` ``0``/``1`` deletion flags with exactly ``excess`` ones.
     """
     n_pool = int(candidates.shape[0])
-    flagged = flatnonzero(tw.array.astype(candidates, wp.bool))
+    flagged = flatnonzero(candidates)
     # Ascending on the negated weight is descending on the weight, and ``sort_and_argsort`` is the
     # package's one radix-sort spelling.
     descending = wp.empty(int(flagged.shape[0]), dtype=wp.float32, device=candidates.device)
@@ -605,21 +607,21 @@ def _dart_throw_blue_noise(
     n_cells = int(unique_keys.shape[0])
     cell_offsets, _ = tw.array.counts_to_offsets(counts, include_total=True)
 
-    point_cell = wp.empty(n_pool, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_blue_noise.init_point_cells,
-        dim=n_pool,
-        inputs=[grid_coords, wp.int32(grid_w), unique_keys, point_cell],
-        device=device,
-    )
     # **The whole dart loop runs in cell-sorted index space from here on.** ``bucket`` is already
     # the cell-order permutation, so permuting the payload through it once makes each cell's
     # members the contiguous run its offsets name -- after which the two sweeps that dominate this
     # call read their neighbours at stride 1 instead of scattering into the unsorted pool for every
     # candidate of every one of ``DART_SHELL_CELLS`` cells. ``bucket`` itself survives only as the
-    # original-index tie-break (see ``dart_select_minima``) and as the map back at the end.
+    # original-index tie-break (see ``dart_select_minima``) and as the map back at the end. The
+    # per-point cell table is born sorted, read off the sorted keys.
     sorted_points = gather(pool_points, bucket)
-    sorted_cell = gather(point_cell, bucket)
+    sorted_cell = wp.empty(n_pool, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_blue_noise.sorted_point_cells,
+        dim=n_pool,
+        inputs=[sorted_keys, unique_keys, sorted_cell],
+        device=device,
+    )
     cell_neighbors = twt.empty_2d(
         (n_cells, kernel_blue_noise.DART_SHELL_CELLS), wp.int32, device=device
     )
@@ -658,17 +660,22 @@ def _dart_throw_blue_noise(
     alive_count = n_pool
     rr = wp.float32(radius * radius)
 
+    # The first round's priority summary is built here; every later one is folded into the
+    # compaction that produces its work list (see ``dart_compact_alive``). Fills rather than a reset
+    # kernel: a memset is cheaper than a full launch.
+    cell_min_priority.fill_(kernel_blue_noise.DART_NO_PRIORITY)
+    wp.launch(
+        kernel_blue_noise.dart_cell_min_priority,
+        dim=n_pool,
+        inputs=[priority, sorted_cell, alive, cell_min_priority],
+        device=device,
+    )
     while alive_count > 0:
         view = alive[:alive_count]
-        # Two fills rather than a reset kernel: a memset is cheaper than a full launch.
-        cell_min_priority.fill_(kernel_blue_noise.DART_NO_PRIORITY)
         cell_accepted.fill_(False)
-        wp.launch(
-            kernel_blue_noise.dart_cell_min_priority,
-            dim=alive_count,
-            inputs=[priority, sorted_cell, view, cell_min_priority],
-            device=device,
-        )
+        # The survivor flags are written by the covering sweep itself, as each thread's last word
+        # on its point's state this round.
+        alive_flags = survivor_flag[:alive_count]
         wp.launch(
             kernel_blue_noise.dart_select_minima,
             dim=alive_count,
@@ -699,6 +706,7 @@ def _dart_throw_blue_noise(
                 cell_accepted,
                 rr,
                 state,
+                alive_flags,
             ],
             device=device,
         )
@@ -714,36 +722,39 @@ def _dart_throw_blue_noise(
         # are not loop-invariant, but taking each twice and three times inside one round was five
         # ``wp.array.__getitem__`` calls where two do; and ``read_scalar`` takes its own one-element
         # slice internally, so handing it the index rather than a pre-sliced view drops a sixth.
-        alive_flags = survivor_flag[:alive_count]
         alive_positions = positions[:alive_count]
-        wp.launch(
-            kernel_blue_noise.dart_alive_flags,
-            dim=alive_count,
-            inputs=[view, state, alive_flags],
-            device=device,
-        )
         wp.utils.array_scan(alive_flags, out_array=alive_positions, inclusive=True)
         total = int(read_scalar(positions, alive_count - 1))
         if total > 0:
+            cell_min_priority.fill_(kernel_blue_noise.DART_NO_PRIORITY)
             wp.launch(
                 kernel_blue_noise.dart_compact_alive,
                 dim=alive_count,
-                inputs=[view, state, alive_positions, next_alive[:total]],
+                inputs=[
+                    view,
+                    state,
+                    alive_positions,
+                    priority,
+                    sorted_cell,
+                    next_alive[:total],
+                    cell_min_priority,
+                ],
                 device=device,
             )
             alive, next_alive = next_alive, alive
         alive_count = total
 
-    accepted_mask = wp.empty(n_pool, dtype=wp.bool, device=device)
-    wp.map(kernel_array.equal, state, kernel_blue_noise.DART_ACCEPTED, out=accepted_mask)
-    # ``state`` is indexed by sorted position, so the mask is too; permuting it back to pool order
-    # before the compaction is what keeps the returned points in the pool's own order rather than
-    # the cell sort's. ``scatter_index`` inverts ``bucket`` in one launch.
-    inverse_bucket = wp.empty(n_pool, dtype=wp.int32, device=device)
+    # ``state`` is indexed by sorted position; scattering the accepted flags through ``bucket``
+    # permutes them back to pool order, which is what keeps the returned points in the pool's own
+    # order rather than the cell sort's.
+    accepted_mask = wp.zeros(n_pool, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_scatter.scatter_index, dim=n_pool, inputs=[bucket, inverse_bucket], device=device
+        kernel_blue_noise.dart_accepted_pool_mask,
+        dim=n_pool,
+        inputs=[state, bucket, accepted_mask],
+        device=device,
     )
-    kept = flatnonzero(gather(accepted_mask, inverse_bucket))
+    kept = flatnonzero(accepted_mask)
     if int(kept.shape[0]) == 0:
         return empty
     return gather(pool_points, kept), gather(pool_faces, kept)

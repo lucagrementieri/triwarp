@@ -338,9 +338,9 @@ def test_require_matching_twins_rejects_a_table_from_another_mesh(request) -> No
 
     Not a library comparison: no reference library exposes a caller-supplied halfedge twin table.
     The table is indexed *by halfedge*, so one cached from a smaller mesh is short rather than
-    merely stale, and the kernels that walk it (``ring_start_halfedges``, ``write_one_rings``) index
-    past its end -- which on the CPU device reads the host heap silently rather than raising, the
-    hazard CLAUDE.md section 12.1 records. Parametrized over all three public ``twins=`` entry
+    merely stale, and the kernels that walk it (``ring_degrees_and_starts``, ``write_one_rings``)
+    index past its end -- which on the CPU device reads the host heap silently rather than raising,
+    the hazard CLAUDE.md section 12.1 records. Parametrized over all three public ``twins=`` entry
     points because the check is one shared validator and a site that skips it is invisible
     otherwise.
 

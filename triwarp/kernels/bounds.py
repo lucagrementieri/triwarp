@@ -46,15 +46,34 @@ def super_fibonacci_quat(i: wp.int32, n: wp.int32) -> wp.vec4d:
     )
 
 
+@wp.func
+def seed_packed_box(out_corners: wp.array[wp.float32], box: wp.int32) -> None:
+    """
+    Reset box ``box``'s six ``[min, -max]`` slots to ``+inf``, the empty box every update narrows.
+
+    Called by the two kernels that write a round's candidate frames, one thread per candidate, so
+    each candidate's accumulator is reset by the thread that writes its frame -- rather than by a
+    whole-buffer ``fill_`` before every
+    [`oriented_box_extents`][triwarp.kernels.bounds.oriented_box_extents] launch.
+    """
+    base = box * 6
+    for c in range(6):
+        out_corners[base + c] = FLOAT32_INF_CONSTANT
+
+
 @wp.kernel
-def oriented_box_candidate_axes(n_rotations: wp.int32, out_axes: wp.array[wp.mat33]) -> None:
-    # Candidate box orientations, as world -> box frames whose *rows* are the box axes.
+def oriented_box_candidate_axes(
+    n_rotations: wp.int32, out_axes: wp.array[wp.mat33], out_corners: wp.array[wp.float32]
+) -> None:
+    # Candidate box orientations, as world -> box frames whose *rows* are the box axes, each with
+    # its extent accumulator seeded (``seed_packed_box``).
     #
     # The set is the Super-Fibonacci spiral [Alexa 2022] — the same low-discrepancy sampling of
     # SO(3) ``igl::oriented_bounding_box`` searches — with the identity as the **last** candidate,
     # so a returned box can never be worse than the axis-aligned one and ``n_rotations = 1`` reduces
     # to exactly the axis-aligned reduction.
     i = wp.int32(wp.tid())
+    seed_packed_box(out_corners, i)
     n_spiral = n_rotations - 1
     if i >= n_spiral:
         out_axes[i] = wp.identity(n=3, dtype=wp.float32)
@@ -74,6 +93,7 @@ def oriented_box_refine_axes(
     angle_scale: wp.float64,
     count_per_chain: wp.int32,
     out_axes: wp.array[wp.mat33],
+    out_corners: wp.array[wp.float32],
 ) -> None:
     # One trust-region ball of perturbed frames per chain: the Super-Fibonacci sample of SO(3),
     # geodesically shrunk toward the identity (each rotation angle scaled by ``sigma / pi``),
@@ -81,8 +101,10 @@ def oriented_box_refine_axes(
     # loop used to pay per round. Draws the same
     # [`super_fibonacci_quat`][triwarp.kernels.bounds.super_fibonacci_quat] sequence
     # ``oriented_box_candidate_axes`` samples, so the last delta of every chain is the identity --
-    # which re-scores the base and keeps each chain monotone.
+    # which re-scores the base and keeps each chain monotone. Each candidate's extent accumulator is
+    # seeded here too (``seed_packed_box``), since this round's extents reuse last round's buffer.
     i = wp.int32(wp.tid())
+    seed_packed_box(out_corners, i)
     count = count_per_chain
     chain = i // count
     p = i % count
@@ -132,8 +154,9 @@ def oriented_box_extents(
 ) -> None:
     # Extent of the cloud in every candidate frame: six slots per candidate, packed
     # ``[min_x, min_y, min_z, -max_x, -max_y, -max_z]`` exactly as ``kernels/reduce.py``'s
-    # ``minmax_vec3_chunked`` packs its one box, so a single ``wp.full(inf)`` seeds both ends
-    # and every update is an ``atomic_min``.
+    # ``minmax_vec3_chunked`` packs its one box, so a single ``+inf`` seed covers both ends and
+    # every update is an ``atomic_min``. The seed is written by the kernel that produced ``axes``
+    # (``seed_packed_box``).
     #
     # Strided slice rather than a contiguous chunk, and lane-free, for the same two reasons as
     # ``kernels/points.py::hull_support_extremes``: consecutive threads read consecutive points so

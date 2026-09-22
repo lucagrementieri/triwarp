@@ -133,7 +133,12 @@ def find_local_maxima(
     nbr_indices: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     out_is_max: wp.array[wp.int32],
+    out_count: wp.array[wp.int32],
 ) -> None:
+    # ``out_count[0]`` accumulates the number of flagged points -- the round's one host-visible
+    # quantity -- as a conditional atomic on the flag this thread already holds, rather than a
+    # device reduction re-reading the whole ``out_is_max`` mask afterwards. The caller zeroes it
+    # before each round.
     i = wp.int32(wp.tid())
     if alive[i] == 0:
         out_is_max[i] = 0
@@ -167,6 +172,8 @@ def find_local_maxima(
             break
         is_max = 1
     out_is_max[i] = is_max
+    if is_max != 0:
+        wp.atomic_add(out_count, 0, 1)
 
 
 @wp.func

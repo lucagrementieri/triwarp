@@ -690,6 +690,26 @@ def test_flatnonzero_rejects_rank2(device: str) -> None:
         tw.array.flatnonzero(values_wp)
 
 
+@pytest.mark.parametrize("first", [False, True])
+def test_flatnonzero_matches_numpy_across_scan_blocks(device: str, first: bool) -> None:
+    """
+    Class A: ``flatnonzero`` equals ``numpy.flatnonzero`` on a mask wide enough to scan in blocks.
+
+    The flags are scanned in place and each selection is recovered as a step between neighbouring
+    scan values, so the two things this pins are the in-place scan across many CUDA scan tiles and
+    the first element, which has no left neighbour -- hence both values of ``mask[0]``. The
+    mask-to-ranks form shares the in-place scan and is checked against the same mask.
+    """
+    rng = np.random.default_rng(29)
+    mask_np = rng.random(1_000_003) < 0.4
+    mask_np[0] = first
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    assert np.array_equal(tw.array.flatnonzero(mask_wp).numpy(), np.flatnonzero(mask_np))
+    ranks_wp, count = tw.array.mask_to_compact_ranks(mask_wp)
+    assert count == int(mask_np.sum())
+    assert np.array_equal(ranks_wp.numpy(), np.cumsum(mask_np) - mask_np)
+
+
 @pytest.mark.parametrize("n", [16, 257], ids=["small", "large"])
 def test_flatnonzero_indices_to_mask_round_trip(device: str, n: int) -> None:
     """
@@ -944,6 +964,11 @@ def test_astype_matches_numpy(device: str) -> None:
     assert np.array_equal(tw.array.astype(flags_wp, wp.bool).numpy(), flags_np.astype(bool))
     bool_wp = wp.array(flags_np.astype(bool), dtype=wp.bool, device=device)
     assert np.array_equal(tw.array.astype(bool_wp, wp.int32).numpy(), flags_np)
+
+    counts_wp = wp.array(flags_np * 7, dtype=wp.int32, device=device)
+    assert np.array_equal(
+        tw.array.astype(counts_wp, wp.float32).numpy(), (flags_np * 7).astype(np.float32)
+    )
 
     rows_np = rng.integers(0, 50, (16, 3)).astype(np.int32)
     rows_wp = wp.array(rows_np, dtype=wp.int32, device=device)

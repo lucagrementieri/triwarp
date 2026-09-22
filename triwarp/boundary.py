@@ -36,6 +36,7 @@ from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import boundary as kernel_boundary
+from triwarp.kernels import halfedge as kernel_halfedge
 
 
 def boundary_edges(
@@ -133,9 +134,7 @@ def _boundary_edges_impl(
     rows = _boundary_rows(int(vertices.shape[0]), edges_sorted)
     if not oriented:
         return twt.as_array2d(tw.array.gather(edges_sorted, rows), wp.int32)
-    if edges is None:
-        edges = tw.edges.faces_to_edges(faces)
-    return twt.as_array2d(tw.array.gather(edges, rows), wp.int32)
+    return _directed_edge_rows(faces, edges, rows)
 
 
 def boundary_loops(
@@ -297,9 +296,7 @@ def boundary_loops_batched(
             wp.empty(0, dtype=wp.int32, device=device),
         )
 
-    if edges is None:
-        edges = tw.edges.faces_to_edges(faces)
-    directed = twt.as_array2d(tw.array.gather(edges, rows), wp.int32)
+    directed = _directed_edge_rows(faces, edges, rows)
 
     if _needs_unoriented_boundary_walk(directed, n_vertices):
         return _unoriented_boundary_cycles(
@@ -309,6 +306,30 @@ def boundary_loops_batched(
     # ``faces``, so the range check would only re-derive a bound the caller already guarantees —
     # at the cost of a device synchronization.
     return tw.graph.successor_cycles(directed, n_vertices, validate=False)
+
+
+def _directed_edge_rows(
+    faces: wp.array[wp.int32], edges: twt.Array2dInt32 | None, rows: wp.array[wp.int32]
+) -> twt.Array2dInt32:
+    """
+    Return the directed edges at ``rows`` of ``faces_to_edges(faces)``, without that table.
+
+    Row ``h`` of the directed edge table is halfedge ``h``, so the selected rows are read straight
+    off ``faces``; a caller-supplied ``edges`` table is gathered from instead.
+    """
+    if edges is not None:
+        return twt.as_array2d(tw.array.gather(edges, rows), wp.int32)
+    device = faces.device
+    n_rows = int(rows.shape[0])
+    directed = twt.empty_2d((n_rows, 2), wp.int32, device=device)
+    if n_rows > 0:
+        wp.launch(
+            kernel_halfedge.halfedge_vertex_pairs,
+            dim=n_rows,
+            inputs=[faces, None, False, rows, directed],
+            device=device,
+        )
+    return directed
 
 
 def _needs_unoriented_boundary_walk(directed: twt.Array2dInt32, n_vertices: int) -> bool:

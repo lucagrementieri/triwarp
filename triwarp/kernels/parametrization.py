@@ -27,18 +27,30 @@ def face_flipped_mask(
 def scatter_fixed_uv(
     boundary_indices: wp.array[wp.int32],
     boundary_uv: wp.array[wp.vec2],
+    out_fixed_mask: wp.array[wp.bool],
     out_fixed_values: wp.array2d[wp.float64],
 ) -> None:
     # Scatter the prescribed boundary positions into a ``(2, n_vertices)`` buffer (row 0 = u,
     # row 1 = v) so the system-assembly kernel can look up ``bc[c, j]`` by right-hand-side column
     # ``c`` and original vertex index ``j``. float64 to match the float64 conjugate-gradient path.
+    #
+    # The fixed-vertex mask is marked in the same pass -- the ``array.indices_to_mask`` of the same
+    # indices, whose out-of-range rule (skip negative and ``>= n``) is the one applied here -- as
+    # ``scatter_pinned_stacked`` does for LSCM's stacked layout.
     b = wp.int32(wp.tid())
     i = boundary_indices[b]
     if i < wp.int32(0) or i >= out_fixed_values.shape[1]:
         return
     uv = boundary_uv[b]
+    out_fixed_mask[i] = wp.bool(True)
     out_fixed_values[0, i] = wp.float64(uv[0])
     out_fixed_values[1, i] = wp.float64(uv[1])
+
+
+@wp.func
+def fixed_uv(fixed_values: wp.array2d[wp.float64], i: wp.int32) -> wp.vec2:
+    # The prescribed position of fixed vertex ``i``, narrowed from the ``(2, n_vertices)`` buffer.
+    return wp.vec2(wp.float32(fixed_values[0, i]), wp.float32(fixed_values[1, i]))
 
 
 @wp.kernel
@@ -55,7 +67,7 @@ def scatter_solution(
     # free branch is then never taken, so the empty ``sol`` is never indexed.
     i = wp.int32(wp.tid())
     if fixed_mask[i]:
-        out_uv[i] = wp.vec2(wp.float32(fixed_values[0, i]), wp.float32(fixed_values[1, i]))
+        out_uv[i] = fixed_uv(fixed_values, i)
     else:
         ri = free_map[i]
         out_uv[i] = wp.vec2(wp.float32(sol[0, ri]), wp.float32(sol[1, ri]))
@@ -264,15 +276,25 @@ def gather_interior_uv(
     fixed_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],
     uv: wp.array[wp.vec2],
+    fixed_values: wp.array2d[wp.float64],
     out_sol: wp.array2d[wp.float64],
+    out_uv: wp.array[wp.vec2],
 ) -> None:
     # Seed the conjugate-gradient warm start with the current interior UV (dim = n_vertices):
     # interior vertex ``i`` writes its UV into the two rows (u, v) of ``out_sol`` at the compact
-    # free index; boundary vertices are skipped. ``out_sol`` is (2, n_interior).
+    # free index. ``out_sol`` is (2, n_interior), and every row is written, because ``free_map`` is
+    # a bijection of the free vertices onto it.
+    #
+    # It also writes the first working UV field, which is ``scatter_solution`` of the seed it just
+    # wrote: a fixed vertex takes its prescribed position, a free one reads back its own seed --
+    # ``uv[i]`` itself, since a ``float32`` widened to ``float64`` and narrowed again is exact. So
+    # the thread never reads a row another thread wrote, and the separate launch is not needed.
     i = wp.int32(wp.tid())
     ri = free_row(fixed_mask, free_map, i)
     if ri < 0:
+        out_uv[i] = fixed_uv(fixed_values, i)
         return
     p = uv[i]
     out_sol[0, ri] = wp.float64(p[0])
     out_sol[1, ri] = wp.float64(p[1])
+    out_uv[i] = p

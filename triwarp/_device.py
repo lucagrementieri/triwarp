@@ -372,7 +372,14 @@ def read_scalar(arr: wp.array[Any], index: int = -1) -> Any:
     if scratch is None:
         scratch = wp.empty(1, dtype=arr.dtype, device="cpu")
         _SCALAR_SCRATCH[arr.dtype] = scratch
-    wp.copy(scratch, arr[slot : slot + 1])
+    # An offset copy rather than a copy of ``arr[slot : slot + 1]``: the one-element slice is a
+    # whole ``wp.array`` construction to name four bytes ``wp.copy`` can address directly. The
+    # offset path needs a contiguous source -- a strided one would be staged whole across devices
+    # -- so a strided view keeps the slice, which is contiguous by construction.
+    if arr.ndim == 1 and arr.is_contiguous:
+        wp.copy(scratch, arr, src_offset=slot, count=1)
+    else:
+        wp.copy(scratch, arr[slot : slot + 1])
     return _detached(scratch.numpy()[0])
 
 

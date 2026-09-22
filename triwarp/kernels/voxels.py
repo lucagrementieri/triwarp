@@ -246,6 +246,18 @@ def cell_occupancy(
     out_mask[v] = (cell_slot(volume, cells, v) >= 0) == present
 
 
+@wp.kernel
+def cell_occupancy_flags(
+    volume: wp.uint64, cells: wp.array2d[wp.int32], present: wp.bool, out_flags: wp.array[wp.int32]
+) -> None:
+    # ``cell_occupancy``'s test written as the ``int32`` 0/1 flags ``Volume.allocate_by_voxels``
+    # takes as its ``point_mask``, which is the whole difference between the two: a set operation
+    # that rebuilds a grid from the kept cells hands the flags to the builder with the unfiltered
+    # cell array, so no compaction pass, readback or gathered copy stands between them.
+    v = wp.int32(wp.tid())
+    out_flags[v] = wp.where((cell_slot(volume, cells, v) >= 0) == present, 1, 0)
+
+
 @wp.func
 def point_cell(volume: wp.uint64, position: wp.vec3) -> wp.vec3i:
     # NanoVDB centres voxel ``i`` on index-space coordinate ``i``, so the cell containing a point
@@ -397,10 +409,15 @@ def pool_extremum_vec3(
 
 
 @wp.kernel
-def zero_empty_voxels(counts: wp.array[wp.int32], out_values: wp.array[wp.vec3]) -> None:
+def seed_extremum_voxels(
+    counts: wp.array[wp.int32], limit: wp.vec3, out_values: wp.array[wp.vec3]
+) -> None:
+    # The starting value of the min / max pooling: ``limit`` (+-inf) where a point will land, 0 in
+    # an empty voxel. An empty voxel's slot is never touched by ``pool_extremum_vec3``'s atomics, so
+    # seeding it at its final answer up front is what spares a second pass zeroing it afterwards --
+    # ``counts`` is already known before the atomics run.
     v = wp.int32(wp.tid())
-    if counts[v] == 0:
-        out_values[v] = wp.vec3(0.0, 0.0, 0.0)
+    out_values[v] = wp.where(counts[v] == 0, wp.vec3(0.0, 0.0, 0.0), limit)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -492,10 +509,16 @@ def fill_axis_span(
     occupancy: wp.array3d[wp.bool],
     axis: wp.int32,
     length: wp.int32,
+    accumulate: wp.bool,
     out_filled: wp.array3d[wp.bool],
 ) -> None:
     # One thread per line along ``axis``: mark every cell between the first and the last occupied
     # one. trimesh's ``ops.fill_orthographic`` intersects the three axes' results.
+    #
+    # ``accumulate`` (warp-uniform) intersects into ``out_filled`` rather than overwriting it, so
+    # the three axis passes write one lattice and need no separate intersection pass between them.
+    # That read is race-free: every cell lies on exactly one line per axis, so the thread that
+    # reads a cell here is the only one writing it in this launch.
     a, b = wp.tid()
     first = wp.int32(-1)
     last = wp.int32(-1)
@@ -507,15 +530,10 @@ def fill_axis_span(
             last = t
     for t in range(length):
         cell = span_cell(axis, a, b, t)
-        out_filled[cell[0], cell[1], cell[2]] = first >= 0 and t >= first and t <= last
-
-
-@wp.kernel
-def intersect_occupancy(
-    a: wp.array3d[wp.bool], b: wp.array3d[wp.bool], out_and: wp.array3d[wp.bool]
-) -> None:
-    i, j, k = wp.tid()
-    out_and[i, j, k] = a[i, j, k] and b[i, j, k]
+        inside = first >= 0 and t >= first and t <= last
+        if accumulate:
+            inside = inside and out_filled[cell[0], cell[1], cell[2]]
+        out_filled[cell[0], cell[1], cell[2]] = inside
 
 
 @wp.func
@@ -579,20 +597,43 @@ def mark_outside_roots(
     out_outside[labels[flat_cell_index(i, j, k, ny, nz)]] = True
 
 
+@wp.func
+def write_dense_candidate(
+    row: wp.int32,
+    base: wp.vec3i,
+    i: wp.int32,
+    j: wp.int32,
+    k: wp.int32,
+    occupied: wp.bool,
+    out_cells: wp.array2d[wp.int32],
+    out_mask: wp.array[wp.int32],
+) -> None:
+    # One node of a dense lattice as a candidate for ``Volume.allocate_by_voxels``: its world cell
+    # ``base + (i, j, k)`` and the 0/1 ``point_mask`` flag saying whether to keep it. The three
+    # kernels that end a dense pass in a grid build write it this way, so a lattice's occupancy
+    # never has to be stored as a lattice of its own just to be read back by ``occupied_cells``.
+    write_row_triple(out_cells, row, base[0] + i, base[1] + j, base[2] + k)
+    out_mask[row] = wp.where(occupied, 1, 0)
+
+
 @wp.kernel
-def fill_enclosed_cells(
+def enclosed_cell_candidates(
     occupancy: wp.array3d[wp.bool],
     labels: wp.array[wp.int32],
     outside: wp.array[wp.bool],
-    out_filled: wp.array3d[wp.bool],
+    base: wp.vec3i,
+    out_cells: wp.array2d[wp.int32],
+    out_mask: wp.array[wp.int32],
 ) -> None:
+    # The flood fill's answer -- an occupied cell, or an empty one whose component does not reach
+    # the padded shell -- written as grid-build candidates directly: ``occupied_cells``' output
+    # with the filled value computed in a register rather than read from a filled lattice.
     i, j, k = wp.tid()
-    if occupancy[i, j, k]:
-        out_filled[i, j, k] = True
-        return
-    out_filled[i, j, k] = not outside[
-        labels[flat_cell_index(i, j, k, occupancy.shape[1], occupancy.shape[2])]
-    ]
+    row = flat_cell_index(i, j, k, occupancy.shape[1], occupancy.shape[2])
+    filled = occupancy[i, j, k]
+    if not filled:
+        filled = not outside[labels[row]]
+    write_dense_candidate(row, base, i, j, k, filled, out_cells, out_mask)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -631,8 +672,28 @@ def occupied_cells(
 ) -> None:
     i, j, k = wp.tid()
     row = flat_cell_index(i, j, k, occupancy.shape[1], occupancy.shape[2])
-    write_row_triple(out_cells, row, base[0] + i, base[1] + j, base[2] + k)
-    out_mask[row] = wp.where(occupancy[i, j, k], 1, 0)
+    write_dense_candidate(row, base, i, j, k, occupancy[i, j, k], out_cells, out_mask)
+
+
+@wp.kernel
+def resampled_cell_candidates(
+    volume: wp.uint64,
+    lower: wp.vec3,
+    step: wp.vec3,
+    shape: wp.vec3i,
+    base: wp.vec3i,
+    out_cells: wp.array2d[wp.int32],
+    out_mask: wp.array[wp.int32],
+) -> None:
+    # One cell of a new lattice, kept when the old grid holds its centre: ``lattice_points``,
+    # ``point_occupancy`` and ``occupied_cells`` over the same ``(i, j, k)`` in one pass, so neither
+    # the centre lattice nor its occupancy is ever stored. The centre is ``lattice_position`` of the
+    # node lattice whose node 0 is the first new cell's centre -- the same call ``lattice_points``
+    # makes -- and the probe is ``point_slot``, the one ``point_occupancy`` makes.
+    i, j, k = wp.tid()
+    row = flat_cell_index(i, j, k, shape[1], shape[2])
+    occupied = point_slot(volume, lattice_position(lower, step, i, j, k)) >= 0
+    write_dense_candidate(row, base, i, j, k, occupied, out_cells, out_mask)
 
 
 @wp.kernel

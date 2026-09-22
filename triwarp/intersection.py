@@ -941,15 +941,16 @@ def split_mesh_with_plane(
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     n_edges = int(unique_edges.shape[0])
     crossed = wp.empty(n_edges, dtype=wp.bool, device=device)
+    crossed_flags = wp.empty(n_edges, dtype=wp.int32, device=device)
     wp.launch(
         kernel_intersections.plane_crossed_edge_mask,
         dim=n_edges,
-        inputs=[unique_edges, vertex_dots, wp.float32(tolerance), crossed],
+        inputs=[unique_edges, vertex_dots, wp.float32(tolerance), crossed, crossed_flags],
         device=device,
     )
     # ``split_edges`` scans the mask itself; this scan exists because the crossing points must be
     # written at the slots that scan assigns, which is the ordering it documents for them.
-    offsets, n_crossed = tw.array.counts_to_offsets(tw.array.astype(crossed, wp.int32))
+    offsets, n_crossed = tw.array.counts_to_offsets(crossed_flags)
 
     crossing_points = wp.empty(n_crossed, dtype=wp.vec3, device=device)
     if n_crossed > 0:
@@ -1180,19 +1181,20 @@ def _shifted_field(
     """
     Re-zero the field at ``isovalue``, in the vertex buffer's precision.
 
-    Shifted in the field's own dtype (``wp.map`` preserves it, as in ``marching_triangles``), then
-    narrowed once: every classifier and crossing kernel downstream works in ``float32``, which is
-    what the vertex buffer carries, so narrowing earlier would lose the subtraction's precision and
-    narrowing later would mean doing it per face.
+    Shifted in the field's own dtype, then narrowed once, in the same element-wise op: every
+    classifier and crossing kernel downstream works in ``float32``, which is what the vertex buffer
+    carries, so narrowing earlier would lose the subtraction's precision and narrowing later would
+    mean doing it per face.
     """
     device = values.device
-    shifted = wp.empty(int(values.shape[0]), dtype=values.dtype, device=device)
-    wp.map(wp.sub, values, values.dtype(isovalue), out=shifted)
+    shifted = wp.empty(int(values.shape[0]), dtype=wp.float32, device=device)
     if values.dtype is wp.float32:
-        return shifted
-    narrowed = wp.empty(int(values.shape[0]), dtype=wp.float32, device=device)
-    wp.utils.array_cast(shifted, narrowed)
-    return narrowed
+        wp.map(wp.sub, values, values.dtype(isovalue), out=shifted)
+    else:
+        # Subtracted in ``float64`` and narrowed in the same op, so the wide intermediate is never
+        # stored and never cast in a pass of its own.
+        wp.map(kernel_intersections.shift_to_float32, values, wp.float64(isovalue), out=shifted)
+    return shifted
 
 
 def _plane_dots(
@@ -1214,16 +1216,19 @@ def _split_with_vertex_field(
 
     face_classes = wp.empty(n_faces, dtype=wp.int32, device=device)
     face_signs = twt.empty_2d((n_faces, 3), wp.int32, device=device)
+    class_flags = wp.empty(
+        kernel_intersections.SPLIT_CLASSES * n_faces, dtype=wp.int32, device=device
+    )
     wp.launch(
         kernel_intersections.classify_faces_for_split,
         dim=n_faces,
-        inputs=[faces, vertex_dots, face_classes, face_signs],
+        inputs=[faces, vertex_dots, face_classes, face_signs, class_flags],
         device=device,
     )
-    blocks, counts = _slice_class_partition(
-        face_classes, n_faces, kernel_intersections.SPLIT_CLASSES
+    blocks, counts, class_indices = _slice_class_partition(
+        class_flags, n_faces, kernel_intersections.SPLIT_CLASSES
     )
-    positive_idx, negative_idx, edges_idx, corner_idx = blocks
+    _, _, edges_idx, corner_idx = blocks
     n_positive, n_negative, n_edges, n_corner = counts
     if n_edges + n_corner == 0:
         # Nothing crossed, so the mesh is untouched and only the side labels are new.
@@ -1238,27 +1243,29 @@ def _split_with_vertex_field(
     unique_edges, halfedge_edges = tw.edges.edges_unique(
         faces, n_vertices=n_vertices, validate=False
     )
-    crossed = wp.empty(int(unique_edges.shape[0]), dtype=wp.bool, device=device)
+    n_unique_edges = int(unique_edges.shape[0])
+    crossed = wp.empty(n_unique_edges, dtype=wp.bool, device=device)
+    crossed_flags = wp.empty(n_unique_edges, dtype=wp.int32, device=device)
     wp.launch(
         kernel_intersections.plane_crossed_edge_mask,
-        dim=int(unique_edges.shape[0]),
-        inputs=[unique_edges, vertex_dots, TOLERANCE_MERGE, crossed],
+        dim=n_unique_edges,
+        inputs=[unique_edges, vertex_dots, TOLERANCE_MERGE, crossed, crossed_flags],
         device=device,
     )
-    edge_vertex_rank, n_new = tw.array.mask_to_compact_ranks(crossed)
-    crossed_edge_indices = tw.array.flatnonzero(crossed)
+    edge_vertex_rank, n_new = tw.array.counts_to_offsets(crossed_flags)
 
     n_uncut = n_positive + n_negative
     n_emitted = n_uncut + 3 * n_edges + 2 * n_corner
     all_vertices = wp.empty(n_vertices + n_new, dtype=wp.vec3, device=device)
     wp.copy(all_vertices[:n_vertices], vertices)
     wp.launch(
-        kernel_intersections.level_set_edge_vertices,
-        dim=n_new,
+        kernel_intersections.plane_edge_crossing_points,
+        dim=n_unique_edges,
         inputs=[
             vertices,
             unique_edges,
-            crossed_edge_indices,
+            crossed,
+            edge_vertex_rank,
             vertex_dots,
             all_vertices[n_vertices:],
         ],
@@ -1268,16 +1275,15 @@ def _split_with_vertex_field(
     all_faces = wp.empty(3 * n_emitted, dtype=wp.int32, device=device)
     positive = wp.empty(n_emitted, dtype=wp.bool, device=device)
     face_rows = all_faces.reshape((n_emitted, 3))
-    for offset, count, index_block, side in (
-        (0, n_positive, positive_idx, True),
-        (n_positive, n_negative, negative_idx, False),
-    ):
-        if count == 0:
-            continue
-        # Not ``tw.array.gather``: the destination is a slice of a larger buffer, and gather
-        # allocates its own.
-        wp.copy(face_rows[offset : offset + count], faces.reshape((-1, 3))[index_block])
-        positive[offset : offset + count].fill_(side)
+    if n_uncut > 0:
+        # Both uncut blocks at once: they are the head of the partition's index buffer, positive
+        # first, and each row carries its side.
+        wp.launch(
+            kernel_intersections.emit_split_uncut_faces,
+            dim=n_uncut,
+            inputs=[faces, class_indices, wp.int32(n_positive), face_rows, positive],
+            device=device,
+        )
 
     face_base = n_uncut
     for count, index_block, emit, rows_per_cut in (
@@ -1326,25 +1332,29 @@ def _clip_with_vertex_field(
 
     face_classes = wp.empty(n_faces, dtype=wp.int32, device=device)
     face_signs = twt.empty_2d((n_faces, 3), wp.int32, device=device)
+    class_flags = wp.empty(
+        kernel_intersections.SLICE_CLASSES * n_faces, dtype=wp.int32, device=device
+    )
     wp.launch(
         kernel_intersections.classify_faces_for_slice,
         dim=n_faces,
-        inputs=[faces, vertex_dots, face_classes, face_signs],
+        inputs=[faces, vertex_dots, face_classes, face_signs, class_flags],
         device=device,
     )
     # Folding this into ``classify_faces_for_slice`` above is declined for the same reason as the
-    # cut pair below: it is one launch of six in ``slice_mesh_with_plane``, and it runs only on
-    # the plane path, so a merged kernel would carry a sentinel for the field path that has no
-    # plane to tie-break against.
+    # cut pair below: it is one launch of the handful in ``slice_mesh_with_plane``, and it runs only
+    # on the plane path, so a merged kernel would carry a sentinel for the field path that has no
+    # plane to tie-break against. It patches the class flags as well as the classes, so the
+    # partition below reads the resolved ones.
     if plane_normal is not None:
         wp.launch(
             kernel_intersections.resolve_on_plane_faces,
             dim=n_faces,
-            inputs=[vertices, faces, plane_normal, face_classes],
+            inputs=[vertices, faces, plane_normal, face_classes, class_flags],
             device=device,
         )
-    (inside_idx, quad_idx, tri_idx), (n_in, n_quad, n_tri) = _slice_class_partition(
-        face_classes, n_faces, kernel_intersections.SLICE_CLASSES
+    (inside_idx, quad_idx, tri_idx), (n_in, n_quad, n_tri), _ = _slice_class_partition(
+        class_flags, n_faces, kernel_intersections.SLICE_CLASSES
     )
 
     if n_quad + n_tri == 0:
@@ -1400,26 +1410,20 @@ def _clip_with_vertex_field(
 
 
 def _slice_class_partition(
-    face_classes: wp.array[wp.int32], n_faces: int, n_classes: int
-) -> tuple[list[wp.array[wp.int32]], list[int]]:
+    flags: wp.array[wp.int32], n_faces: int, n_classes: int
+) -> tuple[list[wp.array[wp.int32]], list[int], wp.array[wp.int32]]:
     """
-    Split the classified faces into the inside, cut-quad and cut-tri index arrays.
+    Split the classified faces into one index array per kept class.
 
-    The three classes are disjoint, so their selection flags live as three blocks of one buffer and
-    one inclusive scan compacts all of them: block ``b``'s indices land contiguously, and the
-    running totals at the block ends give the three counts in a single 12-byte readback. Each
-    returned array is a contiguous view of one buffer, ascending in face index like the
-    [`flatnonzero`][triwarp.array.flatnonzero] calls it replaces.
+    The classes are disjoint, so their selection flags live as ``n_classes`` blocks of one buffer,
+    which the classifier writes alongside the classes themselves, and one inclusive scan compacts
+    all of them: block ``b``'s indices land contiguously, and the running totals at the block ends
+    give the counts in a single small readback. Each returned array is a contiguous view of one
+    buffer, ascending in face index like the [`flatnonzero`][triwarp.array.flatnonzero] calls it
+    replaces; that buffer is returned too, for a caller that wants several leading blocks at once.
     """
-    device = face_classes.device
+    device = flags.device
     blocked = n_classes * n_faces
-    flags = wp.empty(blocked, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_intersections.slice_class_flags,
-        dim=n_faces,
-        inputs=[face_classes, wp.int32(n_faces), wp.int32(n_classes), flags],
-        device=device,
-    )
     inclusive = wp.empty(blocked, dtype=wp.int32, device=device)
     wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
     counts = wp.empty(n_classes, dtype=wp.int32, device=device)
@@ -1447,6 +1451,5 @@ def _slice_class_partition(
         return twt.as_dense(indices[start : start + count])
 
     starts = [sum(class_counts[:block_index]) for block_index in range(n_classes)]
-    return [block(start, count) for start, count in zip(starts, class_counts, strict=True)], (
-        class_counts
-    )
+    blocks = [block(start, count) for start, count in zip(starts, class_counts, strict=True)]
+    return blocks, class_counts, indices

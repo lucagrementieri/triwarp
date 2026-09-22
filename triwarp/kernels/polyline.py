@@ -60,17 +60,22 @@ def segment_midpoint_and_length(start: wp.vec3, end: wp.vec3) -> tuple[wp.vec3, 
 
 
 @wp.kernel
-def accumulate_newell_normal(polyline: wp.array[wp.vec3], out_normal: wp.array[wp.vec3]) -> None:
-    # Newell's method sums cross(V_i, V_{i + 1}) over the ``n - 1`` pairs of a *closed* polyline
-    # whose last vertex duplicates its first, which folds the wrap-around edge into the same sum --
-    # what ``polyline_normal`` appends before launching.
+def accumulate_newell_normal(
+    polyline: wp.array[wp.vec3], is_loop: wp.array[wp.int32], out_normal: wp.array[wp.vec3]
+) -> None:
+    # Newell's method sums cross(V_i, V_{i + 1}) over the edges of a loop. ``is_loop`` is
+    # ``endpoints_coincide``'s flag for this same buffer: a polyline whose last vertex duplicates
+    # its first already carries the wrap-around edge as pair ``n - 2`` and sums ``n - 1`` pairs,
+    # while an open one gets the closing edge by wrapping the index, as pair ``n - 1``. Reading the
+    # flag here rather than on the host is what lets ``polyline_normal`` skip both the closure
+    # readback and the ``polyline_close`` copy it used to sum over; the pairs, their chunks and
+    # therefore the answer are bit for bit the ones that copy produced.
     #
     # This kernel and the two below are the lane-strided single-slot reduction of CLAUDE.md section
     # 13.2: ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``, lanes striding their own
     # block's chunk by ``wp.block_dim()``, one atomic per block. Striding by ``wp.block_dim()`` is
     # what makes it correct on both devices, so there is no ``prefers_tiled_reduction`` branch.
-    # Only an *unconditional* atomic belongs in this shape; ``count_reflex`` below is the
-    # counter-example and is deliberately left alone.
+    # Only an *unconditional* atomic belongs in this shape.
     #
     # The ``wp.vec3`` accumulator is summed component-wise because ``wp.tile(wp.vec3)`` does not
     # parse (Warp 1.17), the same reason ``measures.centroid_tiled`` takes three ``wp.tile_sum``
@@ -79,7 +84,8 @@ def accumulate_newell_normal(polyline: wp.array[wp.vec3], out_normal: wp.array[w
     # for its caller. What *is* shared is ``reduce.ITEMS_PER_BLOCK_1D``, read by ``blocks_1d`` at
     # the launch and by ``tile_chunk`` here.
     chunk, lane = wp.tid()
-    n_pairs = polyline.shape[0] - 1
+    n = polyline.shape[0]
+    n_pairs = n - is_loop[0]
     offset, remaining = tile_chunk(n_pairs, chunk, ITEMS_PER_BLOCK_1D)
     if remaining <= 0:
         return
@@ -87,7 +93,7 @@ def accumulate_newell_normal(polyline: wp.array[wp.vec3], out_normal: wp.array[w
     local = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
     for k in range(lane, count, wp.block_dim()):
         i = offset + k
-        local += wp.cross(polyline[i], polyline[i + 1])
+        local += wp.cross(polyline[i], polyline[wrap_index(i + 1, n)])
     sum_x = wp.tile_sum(wp.tile(local[0]))[0]
     sum_y = wp.tile_sum(wp.tile(local[1]))[0]
     sum_z = wp.tile_sum(wp.tile(local[2]))[0]
@@ -96,14 +102,42 @@ def accumulate_newell_normal(polyline: wp.array[wp.vec3], out_normal: wp.array[w
 
 
 @wp.kernel
-def cyclic_segment_angles(polyline: wp.array[wp.vec3], out_angles: wp.array[wp.float32]) -> None:
-    # dim == n_points - 1: angle between segment i and the cyclically next segment.
-    i = wp.int32(wp.tid())
-    n_segments = polyline.shape[0] - 1
-    s0 = segment_displacement(polyline, i)
-    s1 = segment_displacement(polyline, (i + 1) % n_segments)
-    # ``vector_angle`` is scale-free, so the segments go in unnormalized.
-    out_angles[i] = vector_angle(s0, s1)
+def vertex_turning_angles(
+    polyline: wp.array[wp.vec3],
+    wrap_open: wp.int32,
+    is_loop: wp.array[wp.int32],
+    out_angles: wp.array[wp.float32],
+) -> None:
+    # One angle per vertex, written in its final slot: the angle between the segment arriving at
+    # vertex ``j`` and the one leaving it, with segment ``k`` running from ``polyline[k]`` to
+    # ``polyline[(k + 1) % n]``.
+    #
+    # ``is_loop`` is ``endpoints_coincide``'s flag for this buffer, read on the device so no
+    # closure readback sits between the flag and this launch. A loop has ``n - 1`` segments and its
+    # two ends are one vertex, so both take the angle between the last segment and the first; an
+    # open polyline's ends have no angle and get 0. ``wrap_open`` is the caller's ``closed=True``
+    # on a polyline whose ends do *not* coincide: the closing segment is reached by wrapping the
+    # index -- ``n`` segments, and only vertex 0 closes -- which reproduces bit for bit what the
+    # same kernel would compute over a ``polyline_close`` copy, without making the copy.
+    j = wp.int32(wp.tid())
+    n = polyline.shape[0]
+    loop = is_loop[0] != 0
+    n_segments = n - 1
+    if wrap_open != 0 and not loop:
+        n_segments = n
+    before = j - 1
+    after = j
+    angle = wp.float32(0.0)
+    if j == 0 or (j == n - 1 and n_segments == n - 1):
+        before = n_segments - 1
+        after = 0
+    if (j != 0 and j != n - 1) or n_segments == n or loop:
+        # ``vector_angle`` is scale-free, so the segments go in unnormalized.
+        angle = vector_angle(
+            polyline[(before + 1) % n] - polyline[before],
+            polyline[(after + 1) % n] - polyline[after],
+        )
+    out_angles[j] = angle
 
 
 @wp.kernel
@@ -300,8 +334,10 @@ def greedy_downsample_mask(
     #
     # **Kept for short polylines only**, and it is `polyline_downsample`'s
     # ``_DOWNSAMPLE_DOUBLING_FROM`` that decides. The walk is a few tens of nanoseconds a point, so
-    # it is the cheapest thing available until the point count pays for the ``2 log2(n) + 1``
-    # launches the parallel form below costs; the crossover is on that constant.
+    # it is the cheapest thing available until the point count pays for the ``log2(n) + 1``
+    # launches the parallel form below costs; the crossover is on that constant. It was measured
+    # when a doubling round took two launches rather than ``double_greedy_orbit``'s one, so it is
+    # conservative until re-probed.
     n = cumulative_lengths.shape[0]
     out_keep[0] = True
     last = cumulative_lengths[0]
@@ -316,11 +352,13 @@ def greedy_successors(
     cumulative_lengths: wp.array[wp.float32],
     step_size: wp.float32,
     out_successor: wp.array[wp.int32],
+    out_keep: wp.array[wp.bool],
 ) -> None:
     # The greedy walk's step function, for every point at once: ``out_successor[i]`` is the point
     # the walk would keep next *if* it had just kept ``i``, or ``n`` when the polyline ends first.
-    # The walk is then the orbit of 0 under this map, which ``spread_reached`` below enumerates in
-    # ``log2(n)`` rounds instead of ``n`` steps.
+    # The walk is then the orbit of 0 under this map, which ``double_greedy_orbit`` below
+    # enumerates in ``log2(n)`` rounds instead of ``n`` steps. Thread 0 also seeds that orbit --
+    # the walk always keeps the first point -- so the caller's zeroed mask needs no separate write.
     #
     # A hand-written lower bound rather than ``array.binary_search_index_left`` because the
     # predicate has to be **the serial kernel's, character for character**: ``cum[mid] - base`` and
@@ -329,6 +367,8 @@ def greedy_successors(
     # non-decreasing, which is what makes the search valid at all.
     i = wp.int32(wp.tid())
     n = cumulative_lengths.shape[0]
+    if i == 0:
+        out_keep[0] = True
     base = cumulative_lengths[i]
     lo = i + 1
     hi = n
@@ -342,45 +382,45 @@ def greedy_successors(
 
 
 @wp.kernel
-def square_successors(successor: wp.array[wp.int32], out_successor: wp.array[wp.int32]) -> None:
-    # One pointer-doubling round: ``succ^(2k)`` from ``succ^k``. ``n`` is the absorbing state (the
-    # walk has run off the end) and stays absorbing.
+def double_greedy_orbit(
+    successor: wp.array[wp.int32],
+    reached: wp.array[wp.bool],
+    out_squared: wp.array[wp.int32],
+    out_keep: wp.array[wp.bool],
+) -> None:
+    # One pointer-doubling round, both halves in one launch. Given ``successor`` holding
+    # ``succ^(2^k)`` and ``reached`` holding ``{succ^t(0) : t < 2^k}``:
     #
-    # Ping-ponged rather than written in place, and that is load-bearing: in place a thread could
-    # read a slot another thread had already doubled, giving ``succ^(a + b)`` for uncontrolled
-    # ``a``, ``b`` -- which breaks the round count's guarantee below.
+    # **Spread.** Mark ``succ^(t + 2^k)(0)`` for each reached point, so the set covers
+    # ``t < 2^(k + 1)``. ``ceil(log2(n + 1))`` rounds therefore cover the whole orbit, whatever its
+    # length -- the walk advances by at least ``step_size`` each time, so the orbit is at most ``n``
+    # long. ``reached`` and ``out_keep`` are **the same buffer**, updated in place, and that is safe
+    # *and* deliberate. Every write is ``True``, so a lost update is impossible; a thread that
+    # happens to see a mark written this round propagates one extra hop, which can only mark
+    # another point of the same orbit (``succ`` of an orbit point is one). So intermediate rounds
+    # are nondeterministic in *which* extra points they mark and the final answer is not, because
+    # the round count alone guarantees completeness.
+    #
+    # **Square.** ``succ^(2^(k + 1))`` from ``succ^(2^k)``, for the next round. ``n`` is the
+    # absorbing state (the walk has run off the end) and stays absorbing. Ping-ponged rather than
+    # written in place, and that is load-bearing: in place a thread could read a slot another
+    # thread had already doubled, giving ``succ^(a + b)`` for uncontrolled ``a``, ``b`` -- which
+    # breaks the round count's guarantee above.
+    #
+    # The two halves share a launch because neither reads what the other writes this round: the
+    # spread reads ``successor``, which the square only reads too, and the square never touches the
+    # mask. They were two ``dim=n`` launches per round.
     i = wp.int32(wp.tid())
     n = successor.shape[0]
     j = successor[i]
+    if reached[i] and j < n:
+        out_keep[j] = True
     # ``wp.where`` evaluates both arms (it is not a short-circuiting ternary), so indexing
     # ``successor[j]`` directly is an out-of-bounds read once ``j`` has reached the absorbing
     # state ``n`` -- the read value is discarded either way, but it is a real OOB and aborts under
     # ``wp.config.mode = "debug"``. Clamp the index before the load rather than after.
     safe_j = wp.min(j, n - wp.int32(1))
-    out_successor[i] = wp.where(j >= n, n, successor[safe_j])
-
-
-@wp.kernel
-def spread_reached(
-    successor: wp.array[wp.int32], reached: wp.array[wp.bool], out_keep: wp.array[wp.bool]
-) -> None:
-    # One round of doubling the *reached set*: given ``successor`` holding ``succ^(2^k)`` and
-    # ``reached`` holding ``{succ^t(0) : t < 2^k}``, mark ``succ^(t + 2^k)(0)`` for each of them, so
-    # the set covers ``t < 2^(k + 1)``. ``ceil(log2(n + 1))`` rounds therefore cover the whole
-    # orbit, whatever its length -- the walk advances by at least ``step_size`` each time, so the
-    # orbit is at most ``n`` long.
-    #
-    # ``reached`` and ``out_keep`` are **the same buffer**, updated in place, and unlike the
-    # doubling above that is safe *and* deliberate. Every write is ``True``, so a lost update is
-    # impossible; a thread that happens to see a mark written this round propagates one extra hop,
-    # which can only mark another point of the same orbit (``succ`` of an orbit point is one).
-    # So intermediate rounds are nondeterministic in *which* extra points they mark and the final
-    # answer is not, because the round count alone guarantees completeness.
-    i = wp.int32(wp.tid())
-    if reached[i]:
-        j = successor[i]
-        if j < successor.shape[0]:
-            out_keep[j] = True
+    out_squared[i] = wp.where(j >= n, n, successor[safe_j])
 
 
 RDP_LINE_EPS = wp.constant(wp.float32(1.0e-7))  # libigl FLOAT_EPS: degenerate-segment threshold
@@ -699,36 +739,48 @@ def accumulate_loop_frame(
 
 
 @wp.kernel
-def finalize_loop_frame(
+def project_polyline_to_plane(
+    polyline: wp.array[wp.vec3],
     normal: wp.array[wp.vec3],
     weighted_midpoint: wp.array[wp.vec3],
     total_length: wp.array[wp.float32],
-    out_frame: wp.array[wp.vec3],
-) -> None:
-    # Single thread: turn the three accumulators into the plane frame, on device. ``out_frame`` is
-    # ``[center, u, v]``, which ``project_polyline_to_plane`` reads directly -- so the frame never
-    # crosses to the host at all.
-    u, v = plane_basis(normal[0])
-    out_frame[0] = weighted_midpoint[0] / total_length[0]
-    out_frame[1] = u
-    out_frame[2] = v
-
-
-@wp.kernel
-def project_polyline_to_plane(
-    polyline: wp.array[wp.vec3], frame: wp.array[wp.vec3], out_points2d: wp.array[wp.vec2]
+    out_points2d: wp.array[wp.vec2],
 ) -> None:
     # dim == n. The device-frame counterpart of mapping ``project_to_plane_2d`` over host-scope
-    # ``wp.vec3`` uniforms.
+    # ``wp.vec3`` uniforms: each thread turns ``accumulate_loop_frame``'s three sums into the plane
+    # frame itself -- the centre and ``plane_basis``' ``(u, v)`` -- so the frame never crosses to
+    # the host and no single-thread launch has to build it first. Every thread evaluates the same
+    # expressions on the same three values, so all of them hold the one frame, bit for bit.
     i = wp.int32(wp.tid())
-    out_points2d[i] = project_to_plane_2d(polyline[i], frame[0], frame[1], frame[2])
+    u, v = plane_basis(normal[0])
+    center = weighted_midpoint[0] / total_length[0]
+    out_points2d[i] = project_to_plane_2d(polyline[i], center, u, v)
+
+
+@wp.func
+def mirror_y(p: wp.vec2) -> wp.vec2:
+    # The reflection ``orient_ccw`` applies to a clockwise loop, shared so the reflex count taken
+    # before it and the points written by it are the same values.
+    return wp.vec2(p[0], -p[1])
 
 
 @wp.kernel
-def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_total: wp.array[wp.float32]) -> None:
-    # Cyclic signed exterior angle at each vertex; the sum's sign gives the loop orientation.
-    # Lane-strided single-slot reduction -- see ``accumulate_newell_normal`` for the shape and why
-    # no device branch is needed.
+def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_sums: wp.array[wp.float32]) -> None:
+    # Cyclic signed exterior angle at each vertex into ``out_sums[0]``; the sum's sign gives the
+    # loop orientation. Lane-strided single-slot reduction -- see ``accumulate_newell_normal`` for
+    # the shape and why no device branch is needed.
+    #
+    # The same pass counts the reflex vertices, so the convex test needs no launch of its own --
+    # and counts them twice, because which loop gets tested is not known until the total is:
+    # ``orient_ccw`` mirrors a clockwise loop in ``y`` afterwards. Slot 1 counts the clockwise turns
+    # of the loop as it stands and slot 2 those of its mirror image, each evaluated on exactly the
+    # operands ``orient_ccw`` would leave behind (a mirror is ``(x, -y)``, exact in float32), so
+    # the caller's pick -- slot 1 when the total is ``>= 0``, the comparison ``orient_ccw`` makes --
+    # is the count of the oriented loop, bit for bit. ``-orient2d`` of the unmirrored loop is *not*
+    # a substitute: with FMA contraction on CUDA the two roundings differ, and near-collinear
+    # vertices of a fine convex ring then read as reflex. The counts are ``float32`` so all three
+    # share one buffer and one readback, which is exact for the only question asked of them: a sum
+    # of non-negative whole numbers is zero only when every term is.
     chunk, lane = wp.tid()
     n = points2d.shape[0]
     offset, remaining = tile_chunk(n, chunk, ITEMS_PER_BLOCK_1D)
@@ -736,6 +788,8 @@ def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_total: wp.array[wp
         return
     count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     local = wp.float32(0.0)
+    reflex = wp.float32(0.0)
+    reflex_mirrored = wp.float32(0.0)
     for k in range(lane, count, wp.block_dim()):
         i = offset + k
         current = points2d[i]
@@ -744,9 +798,18 @@ def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_total: wp.array[wp
         d1 = nxt - current
         d2 = after - nxt
         local += wp.atan2(cross2(d1, d2), wp.dot(d1, d2))
+        # The turn at vertex ``i + 1``, whose ring neighbours are ``current`` and ``after``.
+        if orient2d(current, nxt, after) < 0:
+            reflex += wp.float32(1.0)
+        if orient2d(mirror_y(current), mirror_y(nxt), mirror_y(after)) < 0:
+            reflex_mirrored += wp.float32(1.0)
     total = wp.tile_sum(wp.tile(local))[0]
+    total_reflex = wp.tile_sum(wp.tile(reflex))[0]
+    total_reflex_mirrored = wp.tile_sum(wp.tile(reflex_mirrored))[0]
     if lane == 0:
-        wp.atomic_add(out_total, 0, total)
+        wp.atomic_add(out_sums, 0, total)
+        wp.atomic_add(out_sums, 1, total_reflex)
+        wp.atomic_add(out_sums, 2, total_reflex_mirrored)
 
 
 @wp.kernel
@@ -758,20 +821,7 @@ def orient_ccw(points2d: wp.array[wp.vec2], turning_angle: wp.array[wp.float32])
     if turning_angle[0] >= 0.0:
         return
     i = wp.int32(wp.tid())
-    p = points2d[i]
-    points2d[i] = wp.vec2(p[0], -p[1])
-
-
-@wp.kernel
-def count_reflex(points2d: wp.array[wp.vec2], out_count: wp.array[wp.int32]) -> None:
-    # Pre-clip the ring is trivial, so use direct cyclic neighbours. Convex polygon <=> 0 reflex.
-    i = wp.int32(wp.tid())
-    n = points2d.shape[0]
-    prev = points2d[wrap_index(i - 1, n)]
-    cur = points2d[i]
-    nxt = points2d[(i + 1) % n]
-    if orient2d(prev, cur, nxt) < 0:
-        wp.atomic_add(out_count, 0, 1)
+    points2d[i] = mirror_y(points2d[i])
 
 
 @wp.kernel

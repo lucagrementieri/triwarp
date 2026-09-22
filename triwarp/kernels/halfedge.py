@@ -59,6 +59,31 @@ def halfedge_endpoints(faces: wp.array[wp.int32], h: wp.int32) -> tuple[wp.int32
 
 
 @wp.kernel
+def halfedge_vertex_pairs(
+    faces: wp.array[wp.int32],
+    halfedges: wp.array[wp.int32],
+    indirect: wp.bool,
+    halfedge_rows: wp.array[wp.int32],
+    out_edges: wp.array2d[wp.int32],
+) -> None:
+    # Selected halfedges read as directed vertex pairs, which puts each one's own face on the left.
+    # Row ``i`` is halfedge ``halfedges[halfedge_rows[i]]`` when ``indirect``; otherwise
+    # ``halfedges`` is ``None`` and never read, and ``halfedge_rows`` holds the halfedge indices
+    # themselves. Those are the two forms a caller holds them in -- a per-edge halfedge table
+    # indexed by selected rows, or a list of halfedges -- served without materialising the gather
+    # first. Row ``h`` of ``edges.faces_to_edges`` is halfedge ``h``, so this is also that
+    # table's rows at ``halfedge_rows``, without building the table.
+    i = wp.int32(wp.tid())
+    h = halfedge_rows[i]
+    if indirect:
+        h = halfedges[h]
+    # Bound to locals first: Warp cannot assign a multi-return straight into array elements.
+    tail, tip = halfedge_endpoints(faces, h)
+    out_edges[i, 0] = tail
+    out_edges[i, 1] = tip
+
+
+@wp.kernel
 def pair_sorted_halfedges(
     faces: wp.array[wp.int32],
     sorted_keys: wp.array[wp.uint64],
@@ -157,56 +182,60 @@ def count_mispaired_twins(
 
 
 @wp.kernel
-def ring_start_halfedges(
+def ring_degrees_and_starts(
     faces: wp.array[wp.int32],
     twins: wp.array[wp.int32],
-    out_interior_start: wp.array[wp.int32],
-    out_boundary_start: wp.array[wp.int32],
+    out_degrees: wp.array[wp.int32],
+    out_starts: wp.array2d[wp.int32],
 ) -> None:
-    # Per vertex the lowest-indexed outgoing halfedge, tracked twice: over all of them, and over the
-    # twin-less (boundary) ones alone. A boundary vertex must start its CCW walk at its boundary
-    # halfedge — the clockwise-most edge of its fan — or the walk covers only part of the fan.
-    # ``atomic_min`` makes both picks deterministic regardless of thread order.
+    # One thread per halfedge, answering both per-vertex questions the ring walk needs before it
+    # can start: the ring size (every face contributes exactly one outgoing halfedge per corner, so
+    # it is how often the vertex appears in the flat face buffer) and the lowest-indexed outgoing
+    # halfedge, tracked twice -- row 0 over all of them, row 1 over the twin-less (boundary) ones
+    # alone. A boundary vertex must start its CCW walk at its boundary halfedge -- the
+    # clockwise-most edge of its fan -- or the walk covers only part of the fan. ``atomic_min``
+    # makes both picks deterministic regardless of thread order.
+    #
+    # Both halves are a scatter over the same ``faces[h]`` index, so they share one pass rather
+    # than a ``scatter.count_occurrences`` launch of their own over the same buffer.
+    # ``out_degrees`` arrives zeroed and ``out_starts`` filled with ``INT32_MAX``.
     h = wp.int32(wp.tid())
     origin = faces[h]
-    wp.atomic_min(out_interior_start, origin, h)
+    wp.atomic_add(out_degrees, origin, 1)
+    wp.atomic_min(out_starts, 0, origin, h)
     if twins[h] == wp.int32(-1):
-        wp.atomic_min(out_boundary_start, origin, h)
-
-
-@wp.func
-def ring_start_and_boundary(
-    boundary_start: wp.int32, interior_start: wp.int32
-) -> tuple[wp.int32, wp.bool]:
-    # Both answers the ring walk needs about a vertex, from the one pair of candidates: where to
-    # start, and whether the vertex is on a boundary. They are two reads of ``boundary_start``
-    # and one comparison apart, so asking for them separately costs a second pass over the same
-    # buffer to re-derive a test the first pass already made.
-    #
-    # Start: prefer the boundary halfedge; ``INT32_MAX`` means "no candidate of this kind".
-    # Boundary: a vertex lies on one exactly when an outgoing halfedge has no twin.
-    start = wp.int32(-1)
-    if boundary_start != INT32_MAX_CONSTANT:
-        start = boundary_start
-    elif interior_start != INT32_MAX_CONSTANT:
-        start = interior_start
-    return start, boundary_start != INT32_MAX_CONSTANT
+        wp.atomic_min(out_starts, 1, origin, h)
 
 
 @wp.kernel
 def write_one_rings(
-    starts: wp.array[wp.int32],
+    starts: wp.array2d[wp.int32],
     twins: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     out_halfedges: wp.array[wp.int32],
+    out_is_boundary: wp.array[wp.bool],
     out_incomplete: wp.array[wp.int32],
 ) -> None:
     # Rotate counter-clockwise through the outgoing halfedges at one vertex: ``h -> twin(prev(h))``
     # steps from edge ``v->a`` to edge ``v->b`` within the CCW-oriented face ``(v, a, b)``. The walk
     # is bounded by the vertex's known ring size, so a pinched (vertex-non-manifold) vertex — where
     # the rotation closes early on one of its fans — is reported instead of silently truncated.
+    #
+    # ``starts`` is ``ring_degrees_and_starts``' two candidate rows, resolved at this thread's own
+    # vertex. Start: prefer the boundary halfedge; ``INT32_MAX`` means "no candidate of this kind".
+    # Boundary: a vertex lies on one exactly when an outgoing halfedge has no twin, which is the
+    # same comparison -- so ``out_is_boundary`` is written here, for every vertex, isolated ones
+    # included, rather than by a pass of its own over the same row.
     v = wp.int32(wp.tid())
-    start = starts[v]
+    boundary_start = starts[1, v]
+    interior_start = starts[0, v]
+    on_boundary = boundary_start != INT32_MAX_CONSTANT
+    out_is_boundary[v] = on_boundary
+    start = wp.int32(-1)
+    if on_boundary:
+        start = boundary_start
+    elif interior_start != INT32_MAX_CONSTANT:
+        start = interior_start
     if start == wp.int32(-1):
         return
     begin = offsets[v]

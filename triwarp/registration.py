@@ -685,21 +685,28 @@ def icp_point_to_plane(
     distance_mesh = twt.empty_1d(n, wp.float32, device=device)
     triangle_id_mesh = twt.empty_1d(n, wp.int32, device=device)
     normals = wp.empty(n, dtype=wp.vec3, device=device)
-    # Written every iteration by the correspondence pass, which decides it from a face index and
-    # a distance it already holds -- so there is nothing to save by making it conditional. Only
-    # the all-rejected *guard* below is conditional, because only a finite ``max_distance`` can
-    # reject anything.
-    valid = wp.empty(n, dtype=wp.bool, device=device)
-    jtj = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
-    jtr = wp.zeros(1, dtype=wp.spatial_vector, device=device)
-    # One buffer for both scalars the loop reads back, not two: they are written by the same
-    # launch, so reading them together costs one host sync per iteration where reading them at
-    # their two natural points cost two -- and the second of those sat three launches downstream,
-    # so it drained a pipeline the first had already drained rather than riding on it.
-    scalar_acc = wp.zeros(kernel_registration.ICP_SCALAR_ACC_SIZE, dtype=wp.float32, device=device)
+    # Two accumulator sets, ping-ponged: an iteration accumulates into one while its solve zeroes
+    # the other for the next, so the loop issues no memset. Only the first set needs a zeroed start.
+    # ``scalars`` holds both values the loop reads back -- written by the same launch, so one host
+    # sync per iteration rather than two.
+    accumulators = (
+        (
+            wp.zeros(1, dtype=wp.spatial_matrix, device=device),
+            wp.zeros(1, dtype=wp.spatial_vector, device=device),
+            wp.zeros(kernel_registration.ICP_SCALAR_ACC_SIZE, dtype=wp.float32, device=device),
+        ),
+        (
+            wp.empty(1, dtype=wp.spatial_matrix, device=device),
+            wp.empty(1, dtype=wp.spatial_vector, device=device),
+            wp.empty(kernel_registration.ICP_SCALAR_ACC_SIZE, dtype=wp.float32, device=device),
+        ),
+    )
     step = wp.empty(1, dtype=wp.mat44, device=device)
     updated = wp.empty(n, dtype=wp.vec3, device=device)
-    total = wp.clone(initial_matrix)
+    # The running transform ping-pongs too, since the solve composes into the buffer it does not
+    # read. ``initial_matrix`` is already this call's own copy, so writing into it on alternate
+    # iterations never touches a caller's array.
+    total, spare_total = initial_matrix, wp.empty(1, dtype=wp.mat44, device=device)
 
     # The correspondence step is one launch, not three: the closest-point query, the target-normal
     # gather and the distance gate all read one source point's own correspondence, so the second
@@ -713,14 +720,16 @@ def icp_point_to_plane(
     # atomics, so two runs of the identical build disagree in the last digits once the cost stops
     # moving.
     #
-    accumulate_step = wp.map(wp.mul, step, total, out=total, return_kernel=True)
     # One gather either way: for a mesh target the correspondence indexes the face normals, for a
     # cloud it indexes the target's own per-vertex normals.
     normal_source = face_normals if mesh is not None else target_normals
     assert normal_source is not None
 
+    parity = 0
     for iteration in range(max_iterations):
-        # --- correspondence + target normals + distance gate ---
+        jtj, jtr, scalar_acc = accumulators[parity]
+        next_jtj, next_jtr, next_scalars = accumulators[parity ^ 1]
+        # --- correspondence + target normals ---
         if mesh is not None:
             wp.launch(
                 kernel_registration.mesh_correspondence_pass,
@@ -730,43 +739,25 @@ def icp_point_to_plane(
                     current,
                     wp.float32(query_max),
                     normal_source,
-                    wp.float32(max_d),
                     closest,
                     distance_mesh,
                     triangle_id_mesh,
                     normals,
-                    valid,
                 ],
                 device=device,
             )
             distance, triangle_id = distance_mesh, triangle_id_mesh
         else:
-            distance, triangle_id = _correspondences(
-                mesh,
-                target_vertices,
-                target_index,
-                current,
-                query_max,
-                closest,
-                distance_mesh,
-                triangle_id_mesh,
+            assert target_index is not None
+            triangle_id, distance = tw.neighbors.query_nearest(
+                target_vertices, current, 1, **target_index
             )
             wp.launch(
                 kernel_registration.cloud_correspondence_pass,
                 dim=n,
-                inputs=[normal_source, triangle_id, distance, wp.float32(max_d), normals, valid],
+                inputs=[target_vertices, normal_source, triangle_id, closest, normals],
                 device=device,
             )
-
-        # --- bail out once no correspondence survives the distance gate ---
-        # Mirrors ``icp``'s ``sum(weights) == 0`` check: without it, every accumulator below stays
-        # at its zeroed initial value, the damped 6x6 solve returns a zero step, and the loop
-        # reports ``cost=0.0`` -- indistinguishable from a perfect fit -- instead of stopping with
-        # the last real cost (or ``math.inf`` if nothing ever matched). Only a finite
-        # ``max_distance`` can reject a correspondence, so only then is there anything to test.
-        if max_distance is not None:
-            if not tw.reduce.any(valid):
-                break
 
         # --- resolve robust scale on the first iteration ---
         if kind != 0 and scale_value is None:
@@ -775,9 +766,6 @@ def icp_point_to_plane(
             )
 
         # --- assemble and solve the linearized point-to-plane system ---
-        jtj.zero_()
-        jtr.zero_()
-        scalar_acc.zero_()
         wp.launch_tiled(
             kernel_registration.accumulate_point_to_plane,
             dim=kernel_reduce.blocks_1d(n),
@@ -798,36 +786,48 @@ def icp_point_to_plane(
             device=device,
         )
 
-        # --- bail out once every in-range correspondence's own robust weight collapsed to zero ---
-        # The ``valid`` guard above only catches a correspondence rejected by *distance*; a Tukey
-        # kernel can drive every remaining correspondence's weight to exactly zero on its own
-        # (``|residual| >= scale``, reachable through an explicit ``robust_scale`` too tight for the
-        # residual distribution, or an earlier iteration's step overshooting far past what a
-        # first-iteration-derived scale anticipated) while ``residual_valid`` -- and so ``valid`` --
-        # still accepts every one of them. Without this, ``jtj``/``jtr`` stay exactly zero, the
-        # damped solve returns a near-identity step, and ``cost`` reads ``0.0`` -- indistinguishable
-        # from a perfect fit -- for the rest of the run. Reproduced with
-        # ``robust_kernel="tukey", robust_scale=1e-9``: every residual exceeds so tight a scale, and
-        # the loop returned the identity transform with ``cost=0.0`` on a cloud still offset by
+        # --- bail out once no correspondence carries any weight ---
+        # The weight sum is over the correspondences that survive the ``max_distance`` gate, so it
+        # is zero when that gate rejected every one -- without this, every accumulator stays zero,
+        # the damped 6x6 solve returns a zero step, and the loop reports ``cost=0.0``,
+        # indistinguishable from a perfect fit, instead of stopping with the last real cost (or
+        # ``math.inf`` if nothing ever matched). It is equally zero when a Tukey kernel drove every
+        # in-range correspondence's own robust weight to exactly zero (``|residual| >= scale``,
+        # reachable through an explicit ``robust_scale`` too tight for the residual distribution,
+        # or an earlier iteration's step overshooting far past what a first-iteration-derived scale
+        # anticipated): reproduced with ``robust_kernel="tukey", robust_scale=1e-9``, which
+        # otherwise returned the identity transform with ``cost=0.0`` on a cloud still offset by
         # (1.0, 0.5, -0.3) from its target.
+        #
         # Both scalars in one readback -- ``.numpy()`` on the two-element buffer rather than two
         # ``read_scalar`` calls, which is the one shape that helper does not cover (it returns a
         # single element). ``cost`` is the *post-accumulate* cost the convergence test below needs
-        # and this launch is what wrote it, so reading it here rather than at the end of the
-        # iteration reads the identical value.
+        # and this launch is what wrote it.
         scalars = scalar_acc.numpy()
         if float(scalars[kernel_registration.ICP_WEIGHT_SUM]) <= 0.0:
             break
         cost = float(scalars[kernel_registration.ICP_COST])
 
+        # --- solve, compose into the running transform, and zero the next accumulator set ---
         wp.launch(
             kernel_registration.solve_point_to_plane,
             dim=1,
-            inputs=[jtj, jtr, wp.float32(damping), step],
+            inputs=[
+                jtj,
+                jtr,
+                wp.float32(damping),
+                total,
+                step,
+                spare_total,
+                next_jtj,
+                next_jtr,
+                next_scalars,
+            ],
             device=device,
         )
+        total, spare_total = spare_total, total
 
-        # --- apply the incremental step and compose into the running transform ---
+        # --- apply the incremental step ---
         wp.launch(
             kernel_transform.apply_transform_mat44,
             dim=n,
@@ -836,7 +836,7 @@ def icp_point_to_plane(
         )
         current, updated = updated, current
         transformed = current
-        wp.launch(accumulate_step, dim=1, inputs=[step, total], outputs=[total], device=device)
+        parity ^= 1
 
         if iteration > 0 and old_cost - cost < threshold:
             break
@@ -914,7 +914,7 @@ def _correspondences(
     Writes the matched point of every source position into ``closest``. A mesh target runs the BVH
     closest-point kernel into the caller's preallocated buffers; a cloud target runs the k-NN query,
     which returns its own, so the returned pair is the caller's buffers in the first case and fresh
-    views in the second -- both loops rebind rather than assuming.
+    views in the second -- the loop rebinds rather than assuming.
 
     Parameters
     ----------

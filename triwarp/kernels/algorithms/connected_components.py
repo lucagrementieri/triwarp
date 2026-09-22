@@ -4,7 +4,8 @@ ECL-CC connected components (init + single-pass CAS hook + pointer-jumping flatt
 Two variants over the same union-find core:
 
 - the plain one (``ecl_init_parent`` / ``ecl_hook`` / ``ecl_flatten``) labels components from a CSR
-  adjacency, one thread per node with the row's representative hoisted across it;
+  adjacency, one thread per node with the row's representative hoisted across it -- or, through
+  ``ecl_hook_edges``, straight from an edge list, one thread per edge, with no CSR to build;
 - the **parity** one (``ecl_init_parent_parity`` / ``ecl_hook_parity`` / ``ecl_flatten_parity``)
   carries a Z2 potential alongside the labelling, from a signed edge list, one thread per edge.
   See ``find_representative_parity`` for the packing that makes it work.
@@ -85,6 +86,30 @@ def ecl_hook(
         u = indices[j]
         if v > u:
             rep_v = ecl_hook_edge(parents, rep_v, u)
+
+
+@wp.kernel
+def ecl_hook_edges(edges: wp.array2d[wp.int32], parents: wp.array[wp.int32]) -> None:
+    # Edge-parallel hook over an ``(m, 2)`` edge list, from an identity ``parents``: the plain
+    # variant's counterpart of ``ecl_hook_parity``, and the reason ``graph``'s edge-list entry point
+    # needs no adjacency matrix. Building the CSR ``ecl_hook`` walks cost a triplet emission, a
+    # ``bsr_from_triplets`` radix sort and its compaction -- most of the call -- only to hand every
+    # edge back to this same ``ecl_hook_edge``. Each thread's retry loop exits only once its two
+    # endpoints share a tree, so after this one launch the forest spans every edge.
+    #
+    # The answer is the CSR path's exactly, not merely the same partition: every union points the
+    # larger root at the smaller, so each tree's root is its smallest node and ``ecl_flatten``
+    # labels every component by its minimum node id whichever order the unions ran in. The CSR
+    # path's ``ecl_init_parent`` pre-hook is only a head start on those unions and changes no root.
+    #
+    # Unlike ``ecl_hook``, there is no per-row owner to serialize on, so a hub vertex costs one
+    # thread per incident edge rather than one thread walking them all.
+    e = wp.int32(wp.tid())
+    a = edges[e, 0]
+    b = edges[e, 1]
+    if a == b:
+        return
+    ecl_hook_edge(parents, find_representative(parents, a), b)
 
 
 @wp.kernel

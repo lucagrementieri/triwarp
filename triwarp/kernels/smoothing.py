@@ -524,6 +524,16 @@ def extract_components(v: wp.vec3d) -> tuple[wp.float64, wp.float64, wp.float64]
 
 
 @wp.func
+def seed_and_mass_weight_components(
+    v: wp.vec3d, mass: wp.float64
+) -> tuple[wp.float64, wp.float64, wp.float64, wp.float64, wp.float64, wp.float64]:
+    # ``extract_components`` twice over, once as is and once weighted by the lumped mass: the
+    # implicit-fairing pass seeds its solve with the positions and solves against ``M V``, and both
+    # are per-vertex, so one map writes the three seed rows and the three right-hand-side rows.
+    return v[0], v[1], v[2], mass * v[0], mass * v[1], mass * v[2]
+
+
+@wp.func
 def combine_components(x: wp.float64, y: wp.float64, z: wp.float64) -> wp.vec3d:
     return wp.vec3d(x, y, z)
 
@@ -645,14 +655,16 @@ def fit_vertices_to_normals(
     faces: wp.array[wp.int32],
     face_normals: wp.array[wp.vec3],
     out_delta: wp.array[wp.vec3],
-    out_count: wp.array[wp.float32],
 ) -> None:
     # One gradient step of the vertex-fitting half of two-step smoothing (Ohtake et al.): each
     # incident face wants its corner to lie in the plane through the face centroid with the
     # *filtered* normal, and the correction is the component of that offset along the normal.
     #
-    # Summed per vertex and divided by the incident-face count by the caller, which is the step size
-    # that makes the iteration a contraction without a tuning constant.
+    # Summed per vertex and divided by the incident-face count in ``apply_fit_step_and_reset``,
+    # which is the step size that makes the iteration a contraction without a tuning constant. The
+    # count is the topology's, so the caller takes it once with ``scatter.count_occurrences``
+    # rather than re-accumulating it here every fit iteration -- a sum of ones is exact in any
+    # order, so the step is unchanged to the bit.
     f = wp.int32(wp.tid())
     i0, i1, i2 = corner_triple(faces, f)
     normal = face_normals[f]
@@ -660,14 +672,22 @@ def fit_vertices_to_normals(
     for k in range(3):
         v = faces[f * 3 + k]
         wp.atomic_add(out_delta, v, normal * wp.dot(normal, centroid - vertices[v]))
-        wp.atomic_add(out_count, v, 1.0)
 
 
-@wp.func
-def apply_fit_step(position: wp.vec3, delta: wp.vec3, count: wp.float32) -> wp.vec3:
-    if count <= 0.0:
-        return position
-    return position + delta / count
+@wp.kernel
+def apply_fit_step_and_reset(
+    counts: wp.array[wp.int32], out_positions: wp.array[wp.vec3], out_delta: wp.array[wp.vec3]
+) -> None:
+    # Move each vertex by its mean correction, then zero its accumulator for the next fit
+    # iteration. The reset rides here because this is the one thread that reads the slot, and it
+    # reads it before overwriting it -- so the fit loop issues two launches per iteration where a
+    # separate ``zero_`` in front of each scatter made three. ``out_positions`` and ``out_delta``
+    # are both in place.
+    i = wp.int32(wp.tid())
+    count = counts[i]
+    if count > 0:
+        out_positions[i] = out_positions[i] + out_delta[i] / wp.float32(count)
+    out_delta[i] = wp.vec3(0.0, 0.0, 0.0)
 
 
 @wp.func

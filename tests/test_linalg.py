@@ -447,6 +447,34 @@ def test_spd_column_solver_check_every_reused_across_calls(device: str) -> None:
     assert np.allclose(solution_wp.numpy(), solution_np, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("check_every", [0, 5])
+def test_spd_column_solver_reads_a_rewritten_rhs_on_every_call(
+    device: str, check_every: int
+) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``, for a right-hand side rewritten between two calls.
+
+    The state records its device-side loop once and replays it on every later call, and it
+    captures ``rhs`` at construction; both are only correct if each call re-reads the buffer. A
+    second call against the *same* right-hand side cannot show that -- it is already converged,
+    and a replay that ignored the new values would still return the old, correct answer -- so the
+    second right-hand side here differs, and the call must run iterations to reach it.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device)
+    solution_wp = wp.zeros_like(rhs_wp)
+    solver = tw.linalg.spd_column_solver(
+        matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), check_every=check_every
+    )
+    solver()
+    second_np = np.roll(rhs_np, 1, axis=1) - 0.5 * rhs_np
+    rhs_wp.assign(np.ascontiguousarray(second_np))
+    iterations, _, _ = solver()
+    # Device arrays under ``check_every=0``, host scalars otherwise.
+    assert int(iterations.numpy()[0] if isinstance(iterations, wp.array) else iterations) > 0
+    solution_np = np.linalg.solve(dense_np, second_np.T).T
+    assert np.allclose(solution_wp.numpy(), solution_np, rtol=1e-5, atol=1e-5)
+
+
 def test_solve_spd_warns_when_it_runs_out_of_iterations(device: str) -> None:
     """
     A conjugate gradient that stops on ``maxiter`` rather than on ``tol`` says so.

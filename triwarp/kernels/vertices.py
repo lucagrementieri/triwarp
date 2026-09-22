@@ -1,7 +1,8 @@
 import warp as wp
 
 from triwarp.kernels.array import OverloadTable
-from triwarp.kernels.triangles import triangle_cross
+from triwarp.kernels.scatter import atomic_add_vec3
+from triwarp.kernels.triangles import face_corner_angles, face_normals_and_area, triangle_cross
 
 
 @wp.func
@@ -117,6 +118,68 @@ def normalize_accumulated_rows(sums: wp.array2d[wp.Float], out_normals: wp.array
     out_normals[i] = wp.vec3(wp.float32(x), wp.float32(y), wp.float32(z))
 
 
+@wp.func
+def add_to_face_corners(
+    out_sums: wp.array2d[wp.Float],
+    faces: wp.array[wp.int32],
+    f: wp.int32,
+    v0: wp.vec3,
+    v1: wp.vec3,
+    v2: wp.vec3,
+) -> None:
+    # Accumulate one vector per corner of face ``f`` into the rows of its three vertices, corner 0
+    # first -- the order ``kernels.scatter.scatter_sum_vec`` / ``scatter_weighted_sum_vec`` add in,
+    # which is what keeps the fused kernels below byte-identical to the scatter they replace on the
+    # CPU device, where the atomics serialize.
+    base = f * 3
+    atomic_add_vec3(out_sums, faces[base], v0)
+    atomic_add_vec3(out_sums, faces[base + 1], v1)
+    atomic_add_vec3(out_sums, faces[base + 2], v2)
+
+
+@wp.kernel
+def scatter_area_weighted_normals(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_sums: wp.array2d[wp.Float]
+) -> None:
+    # ``vertex_normals(weighting="area")`` with nothing precomputed: the face normal scaled by its
+    # area, scattered onto the corners, with no ``(n_faces,)`` normal, area or product buffer in
+    # between -- the composition ``face_normals_and_areas``, ``wp.map(wp.mul)``, ``scatter_sum_vec``
+    # in one launch, since each of those reads only its own face.
+    f = wp.int32(wp.tid())
+    normal, area = face_normals_and_area(vertices, faces, f)
+    value = normal * area
+    add_to_face_corners(out_sums, faces, f, value, value, value)
+
+
+@wp.kernel
+def scatter_scaled_normals(
+    face_normals: wp.array[wp.vec3],
+    face_areas: wp.array[wp.float32],
+    faces: wp.array[wp.int32],
+    out_sums: wp.array2d[wp.Float],
+) -> None:
+    # The same scatter when the caller supplied either table: the product is formed here rather
+    # than by a ``wp.map(wp.mul)`` into a buffer only this kernel reads.
+    f = wp.int32(wp.tid())
+    value = face_normals[f] * face_areas[f]
+    add_to_face_corners(out_sums, faces, f, value, value, value)
+
+
+@wp.kernel
+def scatter_angle_weighted_normals(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_sums: wp.array2d[wp.Float]
+) -> None:
+    # ``vertex_normals(weighting="angle")`` with nothing precomputed: the unit face normal times
+    # each corner's interior angle -- the composition ``face_normals_and_areas``,
+    # ``triangles.angles``, ``scatter_weighted_sum_vec`` in one launch and no per-face table. The
+    # corner angles are ``triangles.face_corner_angles``, the ``angles`` kernel's own body, so the
+    # two cannot drift.
+    f = wp.int32(wp.tid())
+    normal, _area = face_normals_and_area(vertices, faces, f)
+    a0, a1, a2 = face_corner_angles(vertices, faces, f)
+    add_to_face_corners(out_sums, faces, f, normal * a0, normal * a1, normal * a2)
+
+
 # The accumulator precision ``vertices._accumulate_and_normalize`` allocates, and the only one
 # registered: float64, so that the order the scatter's atomics pick cannot reach the answer
 # (``kernels.scatter.atomic_add_vec3`` carries the measurement). Mirrors
@@ -125,14 +188,32 @@ def normalize_accumulated_rows(sums: wp.array2d[wp.Float], out_normals: wp.array
 _ACCUMULATOR_DTYPES = (wp.float64,)
 
 NORMALIZE_ACCUMULATED_ROWS: OverloadTable
+SCATTER_AREA_WEIGHTED_NORMALS: OverloadTable
+SCATTER_SCALED_NORMALS: OverloadTable
+SCATTER_ANGLE_WEIGHTED_NORMALS: OverloadTable
 
 
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
-    global NORMALIZE_ACCUMULATED_ROWS
+    global NORMALIZE_ACCUMULATED_ROWS, SCATTER_AREA_WEIGHTED_NORMALS
+    global SCATTER_SCALED_NORMALS, SCATTER_ANGLE_WEIGHTED_NORMALS
     NORMALIZE_ACCUMULATED_ROWS = OverloadTable(
         normalize_accumulated_rows,
         {d: [wp.array2d[d], wp.array[wp.vec3]] for d in _ACCUMULATOR_DTYPES},
+    )
+    geometry = [wp.array[wp.vec3], wp.array[wp.int32]]
+    SCATTER_AREA_WEIGHTED_NORMALS = OverloadTable(
+        scatter_area_weighted_normals, {d: [*geometry, wp.array2d[d]] for d in _ACCUMULATOR_DTYPES}
+    )
+    SCATTER_ANGLE_WEIGHTED_NORMALS = OverloadTable(
+        scatter_angle_weighted_normals, {d: [*geometry, wp.array2d[d]] for d in _ACCUMULATOR_DTYPES}
+    )
+    SCATTER_SCALED_NORMALS = OverloadTable(
+        scatter_scaled_normals,
+        {
+            d: [wp.array[wp.vec3], wp.array[wp.float32], wp.array[wp.int32], wp.array2d[d]]
+            for d in _ACCUMULATOR_DTYPES
+        },
     )
 
 

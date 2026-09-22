@@ -27,10 +27,13 @@ def sorted_run_start(sorted_values: wp.array[wp.Int], i: wp.int32) -> wp.bool:
 
 @wp.kernel
 def mark_group_starts(
-    sorted_values: wp.array[wp.Int], n: wp.int32, length: wp.int32, out_is_start: wp.array[wp.bool]
+    sorted_values: wp.array[wp.Int], n: wp.int32, length: wp.int32, out_flags: wp.array[wp.int32]
 ) -> None:
-    # Flag positions that start a run of exactly ``length`` equal values in the sorted buffer
-    # (which may be over-allocated radix-sort scratch; only the first ``n`` entries are data).
+    # Flag (``1``) positions that start a run of exactly ``length`` equal values in the sorted
+    # buffer (which may be over-allocated radix-sort scratch; only the first ``n`` entries are
+    # data). ``int32`` rather than ``wp.bool`` because the flags go straight into
+    # ``wp.utils.array_scan``, which has no bool overload -- the same reason
+    # ``remesh.mark_edge_pair_starts``, this rule specialised to ``length == 2``, emits ``int32``.
     tid = wp.int32(wp.tid())
     is_start = True
     if tid + length > n:
@@ -41,17 +44,24 @@ def mark_group_starts(
         is_start = False  # run shorter than ``length``
     elif tid + length < n and sorted_values[tid] == sorted_values[tid + length]:
         is_start = False  # run longer than ``length``
-    out_is_start[tid] = is_start
+    out_flags[tid] = wp.where(is_start, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
 def emit_groups(
-    starts: wp.array[wp.int32], indices: wp.array[wp.int32], out_groups: wp.array2d[wp.int32]
+    offsets: wp.array[wp.int32], indices: wp.array[wp.int32], out_groups: wp.array2d[wp.int32]
 ) -> None:
-    g = wp.int32(wp.tid())
-    start = starts[g]
+    # Launched over the ``n`` sorted positions with ``offsets`` the total-terminated exclusive scan
+    # of ``mark_group_starts``' flags: a position starts a group exactly where the scan steps, and
+    # the step's value is the group's row. Reading the flag back off the scan is what lets one
+    # launch do the compaction and the emit together, instead of a ``flatnonzero`` of the starts
+    # followed by a launch over them.
+    i = wp.int32(wp.tid())
+    g = offsets[i]
+    if offsets[i + 1] == g:
+        return
     for j in range(out_groups.shape[1]):
-        out_groups[g, j] = indices[start + j]
+        out_groups[g, j] = indices[i + j]
 
 
 HASH_MULT_U64 = wp.constant(wp.uint64(11400714819323198485))  # 0x9e3779b97f4a7c15
@@ -341,7 +351,7 @@ def _register_overloads() -> None:
     global MARK_GROUP_STARTS, HASH_INSERT, COMPACT_FROM_TABLE
     MARK_GROUP_STARTS = OverloadTable(
         mark_group_starts,
-        {d: [wp.array[d], wp.int32, wp.int32, wp.array[wp.bool]] for d in _KEY_DTYPES},
+        {d: [wp.array[d], wp.int32, wp.int32, wp.array[wp.int32]] for d in _KEY_DTYPES},
     )
     HASH_INSERT = OverloadTable(
         hash_insert,

@@ -2,10 +2,11 @@ from typing import NamedTuple
 
 import warp as wp
 
-from triwarp.constants import FLOAT32_INF_CONSTANT
+from triwarp.constants import FLOAT32_INF_CONSTANT, INT64_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.array import declare_map_signatures, map_probe, map_probe_single
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
 
 # Iterative-deepening k-nearest search. A scan at radius ``r`` enumerates every point within
 # Euclidean distance ``r``, so a row whose k-th distance is at most ``r`` is provably the exact
@@ -848,6 +849,56 @@ def query_weighted_nearest_neighbors(
 
     out_indices[tid] = best_index
     out_distances[tid] = best
+
+
+# The seed a block's running minimum starts from in ``nearest_key_argmin``: above every real key,
+# since ``pack_nearest_key`` is non-negative for any non-negative distance.
+_NO_KEY = wp.constant(wp.int64(INT64_MAX))
+
+
+@wp.kernel
+def nearest_key_argmin(distances: wp.array[wp.float32], out_result: wp.array[wp.int64]) -> None:
+    # The smallest ``pack_nearest_key(distances[i], i)`` over ``i``: which element carries the
+    # smallest distance, lowest index on a tie, with that distance's own float32 bits in the high
+    # half. ``out_result[0]`` must arrive seeded at ``_NO_KEY``; slot 1 belongs to
+    # ``nearest_key_partner``.
+    #
+    # The one kernel two "global argmin plus its partner" answers reduce through --
+    # ``neighbors.closest_pair`` over column 1 of a ``k=2`` self-query, and
+    # ``proximity.mesh_to_mesh_distance`` over its per-face squared distances. Each used to write a
+    # whole ``int64`` key array for ``reduce.min`` to read back; here the key is packed where it is
+    # compared and never stored, and the result stays on the device for ``nearest_key_partner``, so
+    # the pair costs one readback between them rather than two or three.
+    #
+    # ``distances`` may be a strided column view; it is only ever indexed. Launched
+    # ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``: lanes stride the block's own
+    # ``ITEMS_PER_BLOCK_1D`` chunk by ``wp.block_dim()``, so on the CPU device, where that reads 1,
+    # the single lane covers the chunk and the one-element tile holds its true minimum.
+    chunk, lane = wp.tid()
+    offset, remaining = tile_chunk(distances.shape[0], chunk, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+    best = _NO_KEY
+    for k in range(lane, count, wp.block_dim()):
+        i = offset + k
+        best = wp.min(best, kernel_array.pack_nearest_key(distances[i], i))
+    block_best = wp.tile_min(wp.tile(best))[0]
+    if lane == 0:
+        wp.atomic_min(out_result, 0, block_best)
+
+
+@wp.kernel
+def nearest_key_partner(
+    result: wp.array[wp.int64], partners: wp.array[wp.int32], out_result: wp.array[wp.int64]
+) -> None:
+    # ``out_result[1] = partners[winner]``, the winner being the low half of ``result[0]`` --
+    # ``nearest_key_argmin``'s answer. ``dim=1``. ``result`` and ``out_result`` are the *same*
+    # two-slot buffer at every call site, passed twice so the kernel reads slot 0 and writes slot 1
+    # of it: that is what lets the key and its partner come back in one readback. The single thread
+    # reads before it writes, and the two touch different slots.
+    winner = wp.int32(result[0] & wp.int64(0xFFFFFFFF))
+    out_result[1] = wp.int64(partners[winner])
 
 
 @wp.kernel

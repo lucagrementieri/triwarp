@@ -243,6 +243,21 @@ def loop_rim_metrics(
 
 
 @wp.kernel
+def finalize_rim_metrics(
+    max_edge_sq: wp.array[wp.float32],
+    newell_sums: wp.array[wp.vec3],
+    out_normals: wp.array[wp.vec3],
+    out_char_areas: wp.array[wp.float32],
+) -> None:
+    # The two per-loop results ``loop_rim_metrics`` accumulated, finished in one pass over the
+    # loops: the Newell sum normalized into the hole plane's unit normal, and the longest edge
+    # turned into the ``char_area`` scale.
+    ell = wp.int32(wp.tid())
+    out_normals[ell] = wp.normalize(newell_sums[ell])
+    out_char_areas[ell] = char_area_from_max(max_edge_sq[ell])
+
+
+@wp.kernel
 def init_dp_base(
     loop_sizes: wp.array[wp.int32],
     dp_offsets: wp.array[wp.int32],
@@ -721,12 +736,19 @@ def flag_bad_triangulations(
     dp_offsets: wp.array[wp.int32],
     dp: wp.array[wp.float32],
     out_retry: wp.array[wp.int32],
+    out_any_retry: wp.array[wp.int32],
 ) -> None:
     # Per-loop min-area retry mask: the whole-loop interval is dp[0, B - 1]. Testing it on device
     # replaces copying every loop's ``B x B`` table to the host to read one scalar out of it.
+    # ``out_any_retry[0]`` (arriving zeroed) is set by any loop that fails, so the caller's "does
+    # any loop need the fallback" test is one 4-byte read rather than a reduction over the mask.
+    # Every writer stores the same value, so the race is benign.
     ell = wp.int32(wp.tid())
     top = dp[dp_offsets[ell] + loop_sizes[ell] - 1]
-    out_retry[ell] = wp.where(top >= BAD_METRIC, wp.int32(1), wp.int32(0))
+    bad = top >= BAD_METRIC
+    out_retry[ell] = wp.where(bad, wp.int32(1), wp.int32(0))
+    if bad:
+        out_any_retry[0] = 1
 
 
 @wp.kernel
@@ -893,16 +915,16 @@ def global_argmin(
 @wp.kernel
 def rolled_edge_map(
     col_min: wp.array[wp.int32],
-    shift_a: wp.int32,
-    shift_b: wp.int32,
+    shift: wp.array[wp.int32],
     n_a: wp.int32,
     m_b: wp.int32,
     out_edge: wp.array[wp.int32],
 ) -> None:
     # Per-edge B vertex after rolling both loops so the global-min pair is first
-    # (``argmin(roll(roll(perimeters, -shift_a, 0), -shift_b, 1), axis=1)``).
+    # (``argmin(roll(roll(perimeters, -shift_a, 0), -shift_b, 1), axis=1)``). ``shift`` is
+    # ``global_argmin``'s ``(shift_a, shift_b)``, read here rather than passed through the host.
     i = wp.int32(wp.tid())
-    out_edge[i] = _wrap(col_min[_wrap(i + shift_a, n_a)] - shift_b, m_b)
+    out_edge[i] = _wrap(col_min[_wrap(i + shift[0], n_a)] - shift[1], m_b)
 
 
 @wp.kernel(enable_backward=False)
@@ -1436,13 +1458,15 @@ def directed_edge_opposites(
 @wp.kernel
 def reduce_closest_cross_label_pair(
     vertices: wp.array[wp.vec3],
-    members: wp.array[wp.int32],
+    members: wp.array2d[wp.int32],
     labels: wp.array[wp.int32],
     max_distance_sq: wp.float32,
     out_best: wp.array[wp.int64],
     out_partner: wp.array[wp.int32],
 ) -> None:
-    # The globally closest pair of ``members`` carrying **different** labels, reduced into one
+    # The globally closest pair of ``members`` carrying **different** labels, a member being the
+    # first column of each row of ``members`` (the tail of an oriented boundary edge, read in place
+    # rather than copied out of the strided column first), reduced into one
     # ``int64`` by ``pack_nearest_key`` -- "smallest distance, lowest index on a tie", so the answer
     # is deterministic whatever the thread order. Thread ``i`` finds its own nearest cross-label
     # partner and records it in ``out_partner[i]``, so the winning *pair* is recoverable from the
@@ -1456,20 +1480,55 @@ def reduce_closest_cross_label_pair(
     # need for that yet.
     i = wp.int32(wp.tid())
     n = members.shape[0]
-    position = vertices[members[i]]
+    position = vertices[members[i, 0]]
     label = labels[i]
     best_sq = FLOAT32_INF_CONSTANT
     best = wp.int32(-1)
     for j in range(n):
         if labels[j] == label:
             continue
-        distance_sq = wp.length_sq(vertices[members[j]] - position)
+        distance_sq = wp.length_sq(vertices[members[j, 0]] - position)
         if distance_sq < best_sq:
             best_sq = distance_sq
             best = j
     out_partner[i] = best
     if best >= 0 and best_sq <= max_distance_sq:
         wp.atomic_min(out_best, 0, pack_nearest_key(wp.sqrt(best_sq), i))
+
+
+@wp.kernel
+def edge_tail_labels(
+    edges: wp.array2d[wp.int32], vertex_labels: wp.array[wp.int32], out_labels: wp.array[wp.int32]
+) -> None:
+    # The label of each edge's tail vertex, read through the column in place -- a Python-scope
+    # gather would need the strided column cloned dense first, since it ignores an index's stride.
+    i = wp.int32(wp.tid())
+    out_labels[i] = vertex_labels[edges[i, 0]]
+
+
+@wp.kernel
+def closest_pair_rows(
+    best: wp.array[wp.int64],
+    partner: wp.array[wp.int32],
+    edges: wp.array2d[wp.int32],
+    seed: wp.int64,
+    out_rows: wp.array[wp.int32],
+) -> None:
+    # Decode ``reduce_closest_cross_label_pair``'s answer into the five integers the host needs:
+    # whether any pair was found, then the two edge rows it names -- the winning slot (the key's
+    # low half) and that thread's partner. One small buffer, so the host reads the whole answer in
+    # one transfer instead of the key, then the partner, then the rows.
+    key = best[0]
+    if key == seed:
+        out_rows[0] = 0
+        return
+    slot_a = wp.int32(wp.uint32(wp.uint64(key) & wp.uint64(4294967295)))
+    slot_b = partner[slot_a]
+    out_rows[0] = 1
+    out_rows[1] = edges[slot_a, 0]
+    out_rows[2] = edges[slot_a, 1]
+    out_rows[3] = edges[slot_b, 0]
+    out_rows[4] = edges[slot_b, 1]
 
 
 def _declare_map_kernels() -> None:
@@ -1483,8 +1542,6 @@ def _declare_map_kernels() -> None:
     dense, single = map_probe, map_probe_single
     declare_map_signatures(
         [
-            (char_area_from_max, (dense(wp.float32),), wp.float32),
-            (char_area_from_max, (single(wp.float32),), wp.float32),
             (plane_origin_from_extreme, (dense(wp.float32), wp.vec3(), wp.float32(1)), wp.vec3),
             (plane_origin_from_extreme, (single(wp.float32), wp.vec3(), wp.float32(1)), wp.vec3),
         ]

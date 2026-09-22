@@ -71,6 +71,8 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import bounds as kernel_bounds
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
+from triwarp.kernels import selection as kernel_selection
+from triwarp.kernels import smoothing as kernel_smoothing
 
 # Lattice resolution for ``fix_self_intersections(method="voxel")``, in samples across the mesh's
 # bounding-box diagonal. The same order as ``offset.offset_mesh``'s automatic floor, and the field
@@ -502,6 +504,7 @@ def resolve_duplicated_faces(
     )
 
     keep = wp.empty(num_unique, dtype=wp.int32, device=device)
+    keep_mask = wp.empty(num_unique, dtype=wp.bool, device=device)
     error_group = wp.full(1, num_unique, dtype=wp.int32, device=device)
     wp.launch(
         kernel_repair.resolve_duplicate_groups,
@@ -513,6 +516,7 @@ def resolve_duplicated_faces(
             first_positive,
             first_negative,
             keep,
+            keep_mask,
             error_group,
         ],
         device=device,
@@ -526,8 +530,6 @@ def resolve_duplicated_faces(
         )
 
     # Compact kept decisions in ascending group order (matches the reference emission order).
-    keep_mask = wp.empty(num_unique, dtype=wp.bool, device=device)
-    wp.map(kernel_array.greater_equal, keep, wp.int32(0), out=keep_mask)
     kept_slots = tw.array.flatnonzero(keep_mask)
     if int(kept_slots.shape[0]) == 0:
         empty = wp.empty(0, dtype=wp.int32, device=device)
@@ -633,7 +635,11 @@ def remove_non_manifold_faces(
         kept = tw.array.flatnonzero(keep)
         if int(kept.shape[0]) == n_faces:
             break  # already edge-manifold
-        vertices, faces = tw.selection.submesh_from_face_mask(vertices, faces, keep)
+        # The index form of ``submesh_from_face_mask``, handed the compaction the stopping test
+        # already paid for rather than redoing it from ``keep``.
+        vertices, faces = tw.selection.submesh_from_face_indices(
+            vertices, faces, kept, unique_indices=True
+        )
     return vertices, faces
 
 
@@ -736,12 +742,13 @@ def remove_small_components(
     keep = wp.empty(n_faces, dtype=wp.bool, device=device)
 
     if min_area is not None:
-        areas = tw.triangles.face_quality(vertices, faces, metric="area")
+        # Each face's area is summed into its component where it is computed, rather than written
+        # to a per-face buffer for a scatter pass to read back.
         statistic = wp.zeros(n_faces, dtype=wp.float32, device=device)
         wp.launch(
-            kernel_scatter.SCATTER_ADD[areas.dtype],
+            kernel_repair.scatter_face_area_by_group,
             dim=n_faces,
-            inputs=[areas, labels, statistic],
+            inputs=[vertices, faces, labels, statistic],
             device=device,
         )
         # Gather-then-compare at Python scope rather than a kernel: ``statistic[labels]`` is a
@@ -1010,21 +1017,25 @@ def collapse_small_triangles(
     current_vertices = vertices
     current_faces = faces
     max_iterations = int(faces.shape[0])  # bounded: each collapsing pass drops at least one face
+    # One small-face counter for the whole loop, zeroed per pass: the kernel that finds the small
+    # faces counts them, so the stopping test is one 4-byte read rather than a per-face flag buffer
+    # reduced on the device first.
+    n_small = wp.zeros(1, dtype=wp.int32, device=device)
     for _ in range(max_iterations):
         n_current = int(current_faces.shape[0]) // 3
         if n_current == 0:
             break
 
+        n_small.zero_()
         pairs = twt.empty_2d((n_current, 2), wp.int32, device=device)
-        flag = wp.empty(n_current, dtype=wp.int32, device=device)
         wp.launch(
             kernel_repair.small_triangle_collapse_edges,
             dim=n_current,
-            inputs=[current_vertices, current_faces, min_dbl_area, pairs, flag],
+            inputs=[current_vertices, current_faces, min_dbl_area, pairs, n_small],
             device=device,
         )
 
-        if int(tw.reduce.sum(flag)) == 0:
+        if int(read_scalar(n_small, 0)) == 0:
             break
 
         # Non-flagged faces emit a self-pair (i0, i0); these are self-loops that leave the
@@ -1294,7 +1305,6 @@ def remove_degree3_vertices(
     candidate = wp.empty(n_vertices, dtype=wp.bool, device=device)
     selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     counters = wp.zeros(2, dtype=wp.int32, device=device)
-    dropped_scratch = wp.zeros(n_faces0, dtype=wp.bool, device=device)
     keep_scratch = wp.empty(n_faces0, dtype=wp.bool, device=device)
     for _ in range(max_iter):
         n_faces = int(faces.shape[0]) // 3
@@ -1328,17 +1338,17 @@ def remove_degree3_vertices(
             break
 
         cursor = counters[1:]
-        dropped = dropped_scratch[:n_faces]
-        dropped.zero_()
+        # Every face starts kept and the emit pass clears the fans it replaces, so the kept-face
+        # mask comes straight out of that pass.
+        keep = keep_scratch[:n_faces]
+        keep.fill_(True)
         new_faces = twt.empty_2d((n_selected, 3), wp.int32, device=device)
         wp.launch(
             kernel_repair.emit_degree3_replacement,
             dim=n_vertices,
-            inputs=[faces, ring_offsets, ring_halfedges, selected, cursor, dropped, new_faces],
+            inputs=[faces, ring_offsets, ring_halfedges, selected, cursor, keep, new_faces],
             device=device,
         )
-        keep = keep_scratch[:n_faces]
-        wp.map(kernel_array.mask_not, dropped, out=keep)
         kept = tw.array.gather(faces.reshape((n_faces, 3)), tw.array.flatnonzero(keep))
         faces = tw.array.concatenate([kept.reshape(-1), new_faces.reshape(3 * n_selected)])
         removed += n_selected
@@ -1716,10 +1726,7 @@ def make_volume(
         return wp.clone(faces)
 
     out_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
-    flip = wp.full(n_faces, 1, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_repair.flip_faces_masked, dim=n_faces, inputs=[faces, flip, out_faces], device=device
-    )
+    wp.launch(kernel_repair.flip_all_faces, dim=n_faces, inputs=[faces, out_faces], device=device)
     return out_faces
 
 
@@ -1983,7 +1990,7 @@ def _dilate_face_mask(
     Face adjacency is not needed for this and is not built: a face ring is the faces incident on
     the selection's vertex ring, so the growth happens on the *vertex* mask -- where
     [`triwarp.selection.expand_vertex_mask`][triwarp.selection.expand_vertex_mask] already does
-    it -- and is mapped back with ``face_mode="any"``.
+    it -- and is mapped back by the any-corner rule.
 
     Parameters
     ----------
@@ -2008,23 +2015,27 @@ def _dilate_face_mask(
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
 
-    selected_corners = tw.array.gather(
-        faces.reshape((-1, 3)), tw.array.flatnonzero(face_mask)
-    ).reshape((-1,))
+    # Mask to mask on both ends, so nothing is compacted and nothing is read back: the selection's
+    # corners are marked by one pass over the faces, and the grown face mask is one lookup per
+    # corner into the grown vertex mask.
     vertex_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_scatter.mark_membership_mask,
-        dim=int(selected_corners.shape[0]),
-        inputs=[selected_corners, wp.int32(n_vertices), vertex_mask],
+        kernel_smoothing.mark_incident_vertices,
+        dim=n_faces,
+        inputs=[faces, face_mask, vertex_mask],
         device=device,
     )
     if hops > 0:
         vertex_mask = tw.selection.expand_vertex_mask(faces, vertex_mask, hops)
 
-    grown_faces = tw.selection.face_indices_from_vertex_indices(
-        faces, tw.array.flatnonzero(vertex_mask), face_mode="any", n_vertices=n_vertices
+    grown = wp.empty(n_faces, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_selection.face_mask_from_vertex_mask,
+        dim=n_faces,
+        inputs=[faces, vertex_mask, wp.bool(False), grown],
+        device=device,
     )
-    return tw.array.indices_to_mask(grown_faces, n_faces, device=device)
+    return grown
 
 
 def remove_tunnels(

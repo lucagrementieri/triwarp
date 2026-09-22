@@ -138,9 +138,9 @@ CG_CHECK_EVERY = 0
 # crossed, and that overshoot is a fixed number of launches whose *share* is set by how long the
 # solve is. Long solves therefore win a little and short ones lose a lot, and every summary
 # statistic put the unbatched loop ahead. A converged iteration here is a pure no-op --
-# ``cg_step_p`` and ``cg_step_x_r_z`` pin a converged column's ``beta`` / ``alpha`` to exactly zero
-# -- so the overshoot buys nothing at all, unlike the equivalent batching in a breadth-first level
-# loop, where an extra level still does useful work and a small batch is kept.
+# ``cg_step_p`` and ``cg_step_x_r_z_dot`` pin a converged column's ``beta`` / ``alpha`` to exactly
+# zero -- so the overshoot buys nothing at all, unlike the equivalent batching in a breadth-first
+# level loop, where an extra level still does useful work and a small batch is kept.
 
 # Cadence substituted for ``check_every=0`` on a device without conditional CUDA graphs, where Warp
 # cannot test the residual on device and would otherwise run every solve to ``maxiter``. Warp's own
@@ -1031,7 +1031,7 @@ class _BatchedCg:
     column with a real two-stage tree keeps the batching and drops that cost back down.
 
     Two fusions ride along and are free. The Jacobi apply is an elementwise multiply of the ``r``
-    that ``cg_step_x_r_z`` has just written, so it happens in a register rather than in its own
+    that ``cg_step_x_r_z_dot`` has just written, so it happens in a register rather than in its own
     launch; and the ``rz_old = rz_new`` copy folds into the ``p.Ap`` finalize, the one point in the
     iteration after the ``p`` update that last read ``rz_old`` and before the x/r update that reads
     it next.
@@ -1127,6 +1127,15 @@ class _BatchedCg:
         # ``_iteration``, which reads the flat buffers directly through ``csr_matvec``). Spans
         # ``n``, not ``stride``, so nothing writes the pad.
         self._r_blocks = self._column_views(self._r)
+        # The caller's right-hand-side rows, viewed once for the same reason: ``rhs`` is captured
+        # here and re-read on every call, so re-slicing it would be ``n_columns`` views a call.
+        self._rhs_rows = [rhs[column] for column in range(self._n_columns)]
+        # The device-side loop's recorded graph. Every launch in ``_iteration`` reads buffers this
+        # state owns and never rebinds, and ``_initialize`` resets the loop condition before every
+        # run, so one recording serves every call: re-recording it per call would repay the
+        # capture of every launch in the body, plus the graph instantiation, for an identical
+        # graph.
+        self._graph = None
 
     def _column_views(self, flat: wp.array[wp.float64]) -> list[wp.array[wp.float64]]:
         """Split a padded flat vector into its ``n_columns`` blocks of ``n`` live entries."""
@@ -1261,7 +1270,7 @@ class _BatchedCg:
         # ``r`` starts as ``b``, which also gives the tolerance its ``||b||`` without a buffer of
         # its own: the pad is zero, so the dot over the padded ``r`` is the dot over ``b``.
         for column in range(self._n_columns):
-            wp.copy(self._r_blocks[column], self._rhs[column])
+            wp.copy(self._r_blocks[column], self._rhs_rows[column])
         self._dot(self._r, self._r, self._r, 1, self._p_dot_ap)
         wp.launch(
             kernel_cg.cg_absolute_tolerance,
@@ -1333,27 +1342,29 @@ class _BatchedCg:
         if check_every == 0 and not self._device.is_cuda:
             check_every = CG_CHECK_EVERY_FALLBACK
         if check_every > 0:
-            self._run_with_host_checks(check_every)
-            return (
-                int(read_scalar(self._state, 0)),
-                math.sqrt(float(self._dots_rz.numpy().max())),
-                math.sqrt(float(self._atol_sq.numpy().max())),
-            )
-        condition = self._state[kernel_array.LOOP_CONDITION_VIEW]
-        # One iteration per conditional-graph test, not a batched run of them: see the note above
-        # ``CG_CHECK_EVERY`` for the sweep that removed the batching.
-        with wp.ScopedCapture(self._device) as capture:
-            wp.capture_while(condition, self._iteration)
-        wp.capture_launch(capture.graph)
+            return self._run_with_host_checks(check_every)
+        if self._graph is None:
+            condition = self._state[kernel_array.LOOP_CONDITION_VIEW]
+            # One iteration per conditional-graph test, not a batched run of them: see the note
+            # above ``CG_CHECK_EVERY`` for the sweep that removed the batching.
+            with wp.ScopedCapture(self._device) as capture:
+                wp.capture_while(condition, self._iteration)
+            self._graph = capture.graph
+        wp.capture_launch(self._graph)
         return self._state[0:1], self._dots_rz, self._atol_sq
 
-    def _run_with_host_checks(self, check_every: int) -> None:
+    def _run_with_host_checks(self, check_every: int) -> tuple[int, float, float]:
         """
         Drive the loop from the host: issue a block of iterations, then read the residual.
 
         The block is trimmed against ``maxiter`` so the cap is exact rather than rounded up to the
         next multiple of the cadence -- a caller that reads the returned iteration count against
         the cap it passed is how a non-convergence warning gets raised.
+
+        Returns ``warp.optim.linear.cg``'s three host scalars, formed from what the last check
+        already read: ``cg_step_p`` advances the device-side count once per issued iteration and
+        clamps it at ``maxiter``, which the trimmed blocks never exceed, so the count *is* the
+        number issued here, and the residual read after the final block is the final residual.
         """
         # ``_atol_sq`` is written once by ``_initialize`` and never touched again, so it is read
         # back on the first check only: the test was taking *two* readbacks per block where one is
@@ -1362,7 +1373,7 @@ class _BatchedCg:
         # launches just filled and a second one straight after it is nearly free, so hoisting it
         # above the loop would buy its own drain and lose on a single-block solve.
         done = 0
-        atol_sq_np = None
+        residual_np = atol_sq_np = None
         while done < self._maxiter:
             block = min(check_every, self._maxiter - done)
             for _ in range(block):
@@ -1372,7 +1383,11 @@ class _BatchedCg:
             if atol_sq_np is None:
                 atol_sq_np = self._atol_sq.numpy()
             if bool((residual_np <= atol_sq_np).all()):
-                return
+                break
+        if residual_np is None or atol_sq_np is None:
+            # ``maxiter == 0``: no block ran, so nothing has been read yet.
+            residual_np, atol_sq_np = self._dots_rz.numpy(), self._atol_sq.numpy()
+        return (done, math.sqrt(float(residual_np.max())), math.sqrt(float(atol_sq_np.max())))
 
 
 def _flat_column_views(

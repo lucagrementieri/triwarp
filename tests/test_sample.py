@@ -385,10 +385,11 @@ def test_find_local_maxima_flags_an_independent_set(device: str):
     offsets_wp = wp.array(offsets_np, dtype=wp.int32, device=device)
     alive_wp = wp.ones(5, dtype=wp.int32, device=device)
     is_max_wp = wp.zeros(5, dtype=wp.int32, device=device)
+    count_wp = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
         tw.kernels.sample.find_local_maxima,
         dim=5,
-        inputs=[weights_wp, alive_wp, indices_wp, offsets_wp, is_max_wp],
+        inputs=[weights_wp, alive_wp, indices_wp, offsets_wp, is_max_wp, count_wp],
         device=device,
     )
     is_max_np = is_max_wp.numpy()
@@ -396,6 +397,8 @@ def test_find_local_maxima_flags_an_independent_set(device: str):
     # Exactly one of the tied clique, and never the neighbourless point.
     assert int(is_max_np[:4].sum()) == 1
     assert int(is_max_np[4]) == 0
+    # The count the elimination loop reads back instead of reducing the mask agrees with it.
+    assert int(count_wp.numpy()[0]) == int(is_max_np.sum())
     # The general property, stated over the graph rather than over this fixture's shape.
     flagged = set(np.flatnonzero(is_max_np).tolist())
     for i in flagged:

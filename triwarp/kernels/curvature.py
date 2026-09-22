@@ -1,9 +1,10 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels.adjacency import unshared_projection, unshared_vertex
 from triwarp.kernels.linalg import solve_normal_equations
-from triwarp.kernels.predicates import unit_tangent
+from triwarp.kernels.predicates import segment_aabb, unit_tangent, vector_angle
 from triwarp.kernels.tangent_space import any_perpendicular
 
 # Custom fixed-size float64 types for the 5x5 quadric-fit normal equations: the rest of the
@@ -353,12 +354,50 @@ def line_ball_intersection_segment(
 
 
 @wp.kernel
+def face_pair_dihedrals(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_normals: wp.array[wp.vec3],
+    face_adjacency: wp.array2d[wp.int32],
+    face_adjacency_edges: wp.array2d[wp.int32],
+    out_signed_angles: wp.array[wp.float32],
+    out_lower: wp.array[wp.vec3],
+    out_upper: wp.array[wp.vec3],
+) -> None:
+    # Everything the mean-curvature measure needs per adjacent face pair, in one pass: the dihedral
+    # angle signed by convexity, and the shared edge's AABB for the segment BVH. Each is also a
+    # public per-pair table of its own, one launch apiece; every one of them is read here only at
+    # its own pair, so taking them together writes no intermediate table.
+    #
+    # Each quantity is the public one exactly, spelled with the same helpers: the angle is
+    # ``vector_angle`` of the two face normals (``adjacency.face_adjacency_angles``); convexity is
+    # ``unshared_projection`` against ``TOLERANCE_MERGE`` (``adjacency.face_adjacency_convex``);
+    # the bounds are ``segment_aabb`` (``edges.edge_aabb_bounds``).
+    #
+    # Folding the sign in is exact: ``accumulate_mean_curvature`` multiplies ``length * angle *
+    # sign``, and scaling by ``-1`` commutes with rounding, so the product is bit-identical.
+    k = wp.int32(wp.tid())
+    normal_a = face_normals[face_adjacency[k, 0]]
+    angle = vector_angle(normal_a, face_normals[face_adjacency[k, 1]])
+
+    e0 = face_adjacency_edges[k, 0]
+    e1 = face_adjacency_edges[k, 1]
+    base = face_adjacency[k, 1] * 3
+    other = unshared_vertex(faces[base], faces[base + 1], faces[base + 2], e0, e1)
+    convex = unshared_projection(vertices, normal_a, e0, other) < TOLERANCE_MERGE_CONSTANT
+    out_signed_angles[k] = wp.where(convex, angle, -angle)
+
+    lower, upper = segment_aabb(vertices[e0], vertices[e1])
+    out_lower[k] = lower
+    out_upper[k] = upper
+
+
+@wp.kernel
 def accumulate_mean_curvature(
     queries: wp.array[wp.vec3],
     vertices: wp.array[wp.vec3],
     face_adjacency_edges: wp.array2d[wp.int32],
-    angles: wp.array[wp.float32],
-    convex: wp.array[wp.bool],
+    signed_angles: wp.array[wp.float32],
     candidate_edge_indices: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     radius: wp.float32,
@@ -375,7 +414,7 @@ def accumulate_mean_curvature(
     center = queries[query_idx]
 
     length = line_ball_intersection_segment(start_point, end_point, center, radius)
-    angle = angles[edge_idx]
-    sign = wp.where(convex[edge_idx], wp.float32(1.0), wp.float32(-1.0))
+    # Positive across a convex edge, negative across a concave one; see ``face_pair_dihedrals``.
+    signed_angle = signed_angles[edge_idx]
 
-    wp.atomic_add(out_mean_curvature, query_idx, length * angle * sign * wp.float32(0.5))
+    wp.atomic_add(out_mean_curvature, query_idx, length * signed_angle * wp.float32(0.5))

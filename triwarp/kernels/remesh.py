@@ -8,7 +8,10 @@ from triwarp.kernels.array import (
     LOOP_CONDITION,
     LOOP_ROUND,
     binary_search_sorted_contains,
+    declare_map_signatures,
     lowbias32,
+    map_probe,
+    map_probe_single,
     pack_edge_key,
     to_vec2d,
     to_vec3,
@@ -102,11 +105,21 @@ def split_face_four(fv: wp.vec3i, mv: wp.vec3i) -> tuple[wp.vec3i, wp.vec3i, wp.
 
 @wp.kernel
 def subdivide_faces(
-    faces: wp.array[wp.int32], mid_idx: wp.array2d[wp.int32], out_faces: wp.array[wp.int32]
+    faces: wp.array[wp.int32],
+    corner_edge: wp.array[wp.int32],
+    vertex_offset: wp.int32,
+    out_faces: wp.array[wp.int32],
 ) -> None:
+    # Corner ``k``'s edge is ``corner_edge[3f + k]`` and every edge is split, so its new vertex is
+    # ``vertex_offset`` plus the edge id -- the shift is applied here rather than materialised as a
+    # ``3 * n_faces`` index buffer by a separate pass that this kernel would read straight back.
     f = wp.int32(wp.tid())
     fv = wp.vec3i(faces[f * 3 + 0], faces[f * 3 + 1], faces[f * 3 + 2])
-    mv = wp.vec3i(mid_idx[f, 0], mid_idx[f, 1], mid_idx[f, 2])
+    mv = wp.vec3i(
+        vertex_offset + corner_edge[f * 3 + 0],
+        vertex_offset + corner_edge[f * 3 + 1],
+        vertex_offset + corner_edge[f * 3 + 2],
+    )
     t0, t1, t2, t3 = split_face_four(fv, mv)
     base = f * 12
     out_faces[base + 0] = t0[0]
@@ -339,18 +352,42 @@ def hysteresis_bands(sizing: wp.float32) -> tuple[wp.float32, wp.float32]:
     return 4.0 / 5.0 * sizing, 4.0 / 3.0 * sizing
 
 
-@wp.kernel
-def build_midpoint_index(
-    long_mask: wp.array[wp.bool],
+@wp.func
+def split_corner_midpoints(
+    corner_edge: wp.array[wp.int32],
+    split_mask: wp.array[wp.bool],
     offsets: wp.array[wp.int32],
     vertex_offset: wp.int32,
-    out_midpoint_idx: wp.array[wp.int32],
+    f: wp.int32,
+) -> wp.vec3i:
+    # The new-vertex index on each of face ``f``'s three edges, ``-1`` where the edge is not split.
+    # Corner ``k`` spans the edge ``corner_edge[3f + k]``, and a split edge's new vertex is appended
+    # at ``vertex_offset`` plus its rank among the split edges, which is ``offsets[e]``.
+    #
+    # Read per corner rather than tabulated per edge and gathered: the table would be one launch
+    # over the edges plus a ``3 * n_faces`` gather, both only to hand ``emit_size_faces`` three
+    # values it can look up itself.
+    mv = wp.vec3i(-1, -1, -1)
+    for k in range(3):
+        e = corner_edge[f * 3 + k]
+        if split_mask[e]:
+            mv[k] = vertex_offset + offsets[e]
+    return mv
+
+
+@wp.kernel
+def split_face_child_counts(
+    corner_edge: wp.array[wp.int32], split_mask: wp.array[wp.bool], out_counts: wp.array[wp.int32]
 ) -> None:
-    e = wp.int32(wp.tid())
-    if long_mask[e]:
-        out_midpoint_idx[e] = vertex_offset + offsets[e]
-    else:
-        out_midpoint_idx[e] = wp.int32(-1)
+    # How many triangles face ``f`` becomes under ``emit_size_faces``' templates: one more than the
+    # number of its edges being split. Scanned, this is each face's first output row, so the emit
+    # pass writes the compact buffer directly rather than four fixed slots and a compaction.
+    f = wp.int32(wp.tid())
+    count = wp.int32(1)
+    for k in range(3):
+        if split_mask[corner_edge[f * 3 + k]]:
+            count += 1
+    out_counts[f] = count
 
 
 @wp.kernel
@@ -361,12 +398,9 @@ def fill_edge_midpoints(
     offsets: wp.array[wp.int32],
     out_mid: wp.array[wp.vec3],
 ) -> None:
-    # Shares its guard and its ``offsets[e]`` load with ``build_midpoint_index`` above, and the
-    # two launch at the same width -- **and the fusion is measured and declined.** The midpoint
-    # fill runs only on the branch where the caller supplied no ``split_positions``, where
-    # ``build_midpoint_index`` runs always, so one kernel would have to carry the write under a
-    # flag; and the pair is three launches of thirty-eight in ``subdivide_to_size``, about 1.5 %
-    # of that call and falling with the mesh. The duplicated guard is two instructions.
+    # Shares its guard and its ``offsets[e]`` load with ``split_corner_midpoints`` above, which is
+    # the same rule read from the face side: this writes the new vertex's position at its rank,
+    # that one names the index the rank gives it.
     e = wp.int32(wp.tid())
     if long_mask[e]:
         out_mid[offsets[e]] = edge_midpoint(vertices, unique_edges, e)
@@ -381,7 +415,7 @@ def fill_edge_mean_sizing(
     out_sizing: wp.array[wp.float32],
 ) -> None:
     # ``fill_edge_midpoints`` for the sizing field rather than the position: the value carried to a
-    # new midpoint is the endpoint mean ``mark_edges_over_sizing_field`` tested the edge with.
+    # new midpoint is the endpoint mean ``mark_long_edges`` tested the edge with.
     e = wp.int32(wp.tid())
     if split_mask[e]:
         out_sizing[offsets[e]] = wp.float32(0.5) * (
@@ -389,71 +423,74 @@ def fill_edge_mean_sizing(
         )
 
 
+@wp.func
+def unique_edge_length(
+    vertices: wp.array[wp.vec3], unique_edges: wp.array2d[wp.int32], e: wp.int32
+) -> wp.float32:
+    # Length of unique edge ``e``, in the subtraction order ``edges.edges_unique_length`` uses, so
+    # a threshold test on it sees the same ``float32`` value that function would have returned.
+    return wp.length(vertices[unique_edges[e, 1]] - vertices[unique_edges[e, 0]])
+
+
 @wp.kernel
-def mark_edges_over_sizing_field(
+def mark_long_edges(
+    vertices: wp.array[wp.vec3],
     unique_edges: wp.array2d[wp.int32],
-    lengths: wp.array[wp.float32],
+    max_edge: wp.float32,
     sizing: wp.array[wp.float32],
+    use_sizing: wp.bool,
     out_long: wp.array[wp.bool],
 ) -> None:
-    # The scalar ``length > max_edge`` test against a per-vertex sizing field. An edge's own target
-    # is the mean of its endpoints', which is the standard reading of a vertex-sampled sizing
-    # function and keeps the test symmetric in the edge's orientation.
+    # ``length > target`` per unique edge, with the length computed here rather than read from a
+    # separate length pass whose only consumer this is. The target is ``max_edge`` or, against a
+    # per-vertex sizing field, the mean of the endpoints' -- the standard reading of a
+    # vertex-sampled sizing function, and symmetric in the edge's orientation. One warp-uniform
+    # branch rather than two kernels, since the two differ by a parameter; ``sizing`` is not read
+    # (and may be a null array) when ``use_sizing`` is false.
     e = wp.int32(wp.tid())
-    target = wp.float32(0.5) * (sizing[unique_edges[e, 0]] + sizing[unique_edges[e, 1]])
-    out_long[e] = lengths[e] > target
-
-
-@wp.func
-def _write_tri(
-    out_faces: wp.array2d[wp.int32],
-    out_valid: wp.array[wp.bool],
-    out_slot_index: wp.array[wp.int32],
-    slot: wp.int32,
-    tri: wp.vec3i,
-    valid: wp.bool,
-    src: wp.int32,
-) -> None:
-    write_row_triple(out_faces, slot, tri[0], tri[1], tri[2])
-    out_valid[slot] = valid
-    out_slot_index[slot] = src
+    target = max_edge
+    if use_sizing:
+        target = wp.float32(0.5) * (sizing[unique_edges[e, 0]] + sizing[unique_edges[e, 1]])
+    out_long[e] = unique_edge_length(vertices, unique_edges, e) > target
 
 
 @wp.kernel
 def emit_size_faces(
     faces: wp.array[wp.int32],
-    face_mid: wp.array2d[wp.int32],
+    corner_edge: wp.array[wp.int32],
+    split_mask: wp.array[wp.bool],
+    offsets: wp.array[wp.int32],
+    vertex_offset: wp.int32,
     vertices: wp.array[wp.vec3],
     index_in: wp.array[wp.int32],
+    face_offsets: wp.array[wp.int32],
     out_faces: wp.array2d[wp.int32],
-    out_valid: wp.array[wp.bool],
-    out_slot_index: wp.array[wp.int32],
+    out_index: wp.array[wp.int32],
 ) -> None:
+    # Re-triangulate face ``f`` by how many of its edges are split, writing its children straight
+    # into rows ``face_offsets[f] ..`` of the compact output (``split_face_child_counts`` scanned).
+    # The children come out in template order ``t0, t1, ..``, which is the order the fixed-slot
+    # form's compaction kept them in, so the output is the same buffer either way.
     f = wp.int32(wp.tid())
     src = index_in[f]
 
     fv = wp.vec3i(faces[f * 3 + 0], faces[f * 3 + 1], faces[f * 3 + 2])
-    mv = wp.vec3i(face_mid[f, 0], face_mid[f, 1], face_mid[f, 2])
+    mv = split_corner_midpoints(corner_edge, split_mask, offsets, vertex_offset, f)
 
     s0 = wp.where(mv[0] >= 0, wp.int32(1), wp.int32(0))
     s1 = wp.where(mv[1] >= 0, wp.int32(1), wp.int32(0))
     s2 = wp.where(mv[2] >= 0, wp.int32(1), wp.int32(0))
     count = s0 + s1 + s2
 
-    # Four output triangle slots; unused slots are marked invalid.
+    # Up to four children; only the first ``count + 1`` are written.
     t0 = wp.vec3i(0, 0, 0)
     t1 = wp.vec3i(0, 0, 0)
     t2 = wp.vec3i(0, 0, 0)
     t3 = wp.vec3i(0, 0, 0)
-    n0 = False
-    n1 = False
-    n2 = False
-    n3 = False
 
     if count == 0:
         # No split edges: the face passes through unchanged.
         t0 = fv
-        n0 = True
     elif count == 1:
         # Rotate so the split edge is (a, b); fan its midpoint p to the
         # opposite corner c as [a, p, c], [p, b, c].
@@ -467,9 +504,7 @@ def emit_size_faces(
         c = fv[(j + 2) % 3]
         p = mv[j]
         t0 = wp.vec3i(a, p, c)
-        n0 = True
         t1 = wp.vec3i(p, b, c)
-        n1 = True
     elif count == 2:
         # Rotate so the unsplit edge is (c, a); emit corner triangle [p, b, q]
         # plus the quad (a, p, q, c) cut along its shorter diagonal.
@@ -485,7 +520,6 @@ def emit_size_faces(
         p = mv[j]
         q = mv[(j + 1) % 3]
         t0 = wp.vec3i(p, b, q)
-        n0 = True
         d_aq = wp.length_sq(vertices[a] - vertices[q])
         d_pc = wp.length_sq(vertices[p] - vertices[c])
         if d_aq <= d_pc:
@@ -494,21 +528,22 @@ def emit_size_faces(
         else:
             t1 = wp.vec3i(a, p, c)
             t2 = wp.vec3i(p, q, c)
-        n1 = True
-        n2 = True
     else:
         # Three split edges: the regular 1 -> 4 split (matches subdivide).
         t0, t1, t2, t3 = split_face_four(fv, mv)
-        n0 = True
-        n1 = True
-        n2 = True
-        n3 = True
 
-    base = f * 4
-    _write_tri(out_faces, out_valid, out_slot_index, base + 0, t0, n0, src)
-    _write_tri(out_faces, out_valid, out_slot_index, base + 1, t1, n1, src)
-    _write_tri(out_faces, out_valid, out_slot_index, base + 2, t2, n2, src)
-    _write_tri(out_faces, out_valid, out_slot_index, base + 3, t3, n3, src)
+    base = face_offsets[f]
+    write_row_triple(out_faces, base, t0[0], t0[1], t0[2])
+    out_index[base] = src
+    if count >= 1:
+        write_row_triple(out_faces, base + 1, t1[0], t1[1], t1[2])
+        out_index[base + 1] = src
+    if count >= 2:
+        write_row_triple(out_faces, base + 2, t2[0], t2[1], t2[2])
+        out_index[base + 2] = src
+    if count >= 3:
+        write_row_triple(out_faces, base + 3, t3[0], t3[1], t3[2])
+        out_index[base + 3] = src
 
 
 # ---------------------------------------------------------------------------
@@ -530,9 +565,17 @@ def mark_region_edges(
         out_edge_in_region[inverse[i]] = wp.bool(True)
 
 
-@wp.func
-def long_region_edge(length: wp.float32, max_edge: wp.float32, in_region: wp.bool) -> wp.bool:
-    return in_region and length > max_edge
+@wp.kernel
+def mark_long_region_edges(
+    vertices: wp.array[wp.vec3],
+    unique_edges: wp.array2d[wp.int32],
+    max_edge: wp.float32,
+    edge_in_region: wp.array[wp.bool],
+    out_long: wp.array[wp.bool],
+) -> None:
+    # ``mark_long_edges``' uniform test restricted to the edges ``mark_region_edges`` flagged.
+    e = wp.int32(wp.tid())
+    out_long[e] = edge_in_region[e] and unique_edge_length(vertices, unique_edges, e) > max_edge
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +628,7 @@ def mark_density_splits(
     out_split: wp.array[wp.int32],
 ) -> None:
     # Which region faces want a centroid split this pass, as 0/1 so the result scans directly into
-    # the two offset tables ``emit_density_splits`` needs. A face outside the region never splits,
+    # the new-vertex slots ``emit_density_splits`` needs. A face outside the region never splits,
     # which is what keeps the refinement inside the patch.
     f = wp.int32(wp.tid())
     if not region[f]:
@@ -606,7 +649,6 @@ def emit_density_splits(
     scale: wp.array[wp.float32],
     split: wp.array[wp.int32],
     split_offsets: wp.array[wp.int32],
-    face_offsets: wp.array[wp.int32],
     n_vertices: wp.int32,
     out_positions: wp.array[wp.vec3],
     out_scale: wp.array[wp.float32],
@@ -618,22 +660,25 @@ def emit_density_splits(
     # A centroid split is **per-triangle independent** -- the new vertex is interior to the triangle
     # and no edge is divided -- so unlike edge bisection it needs none of ``subdivide_to_size``'s
     # crack-free 1/2/3 templates and no agreement with the neighbours. That is the whole reason this
-    # criterion suits a parallel refinement: one scan for the new-vertex slots, one for the face
-    # slots, and one kernel.
+    # criterion suits a parallel refinement: one scan for the new-vertex slots, and one kernel.
+    #
+    # The face slots need no scan of their own: every face before ``f`` becomes one face plus two
+    # more if it split, so ``f``'s first output face is ``f + 2 * split_offsets[f]``.
     #
     # Child faces inherit their parent's region membership, matching
     # ``subdivide_region_to_size``, so a caller's patch mask survives the pass.
     f = wp.int32(wp.tid())
     i, j, k = corner_triple(faces, f)
-    base = face_offsets[f] * 3
+    slot = split_offsets[f]
+    first = f + wp.int32(2) * slot
+    base = first * 3
     if split[f] == wp.int32(0):
         out_faces[base + 0] = i
         out_faces[base + 1] = j
         out_faces[base + 2] = k
-        out_region[face_offsets[f]] = region[f]
+        out_region[first] = region[f]
         return
 
-    slot = split_offsets[f]
     center = n_vertices + slot
     out_positions[slot] = (vertices[i] + vertices[j] + vertices[k]) / wp.float32(3.0)
     out_scale[slot] = (scale[i] + scale[j] + scale[k]) / wp.float32(3.0)
@@ -647,14 +692,7 @@ def emit_density_splits(
     out_faces[base + 7] = i
     out_faces[base + 8] = center
     for child in range(3):
-        out_region[face_offsets[f] + child] = region[f]
-
-
-@wp.func
-def face_split_count(split: wp.int32) -> wp.int32:
-    """How many faces this one becomes: three when split, one when not."""
-    # The counts whose exclusive scan gives ``emit_density_splits`` its output face slots.
-    return wp.int32(1) + wp.int32(2) * split
+        out_region[first + child] = region[f]
 
 
 # ---------------------------------------------------------------------------
@@ -769,10 +807,10 @@ def _incircle_d(a: wp.vec2d, b: wp.vec2d, c: wp.vec2d, d: wp.vec2d) -> wp.float6
 def mark_edge_pair_starts(
     sorted_keys: wp.array[wp.uint64], n: wp.int32, out_starts: wp.array[wp.int32]
 ) -> None:
-    # ``grouping.mark_group_starts`` specialized to ``length=2`` and emitting ``int32`` rather than
-    # ``wp.bool``: the flip loop feeds this straight to ``warp.utils.array_scan``, which has no
-    # bool overload, so a bool flag would only buy an ``array_cast``. Flags the position that
-    # starts a run of *exactly* two equal keys, i.e. an edge shared by exactly two face corners.
+    # ``grouping.mark_group_starts`` specialized to ``length=2``. Both emit ``int32`` for the same
+    # reason: the flag feeds ``warp.utils.array_scan``, which has no bool overload. Flags the
+    # position that starts a run of *exactly* two equal keys, i.e. an edge shared by exactly two
+    # face corners.
     #
     # Differs from ``mark_unique_edge_starts`` below only in requiring the run to be exactly two:
     # that one takes every run whatever its length, because the decimation pass wants all unique
@@ -1308,7 +1346,6 @@ EDGE_KEY_PAD = wp.constant(wp.uint64(0xFFFFFFFFFFFFFFFF))
 @wp.kernel(enable_backward=False)
 def collapse_candidates(
     unique_edges: wp.array2d[wp.int32],
-    lengths: wp.array[wp.float32],
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     codes: wp.array[wp.int32],
@@ -1325,12 +1362,13 @@ def collapse_candidates(
 ) -> None:
     # ``low`` and ``high`` are per *vertex* rather than scalars so that one code path serves both
     # the uniform target and an adaptive sizing field; the uniform case fills them with a constant.
-    # An edge's own band is the mean of its endpoints', matching ``mark_edges_over_sizing_field``.
+    # An edge's own band is the mean of its endpoints', matching ``mark_long_edges``. The length is
+    # computed here: this is its only reader, and it reads it at its own edge.
     k = wp.int32(wp.tid())
     out_survivor[k] = -1
     u = unique_edges[k, 0]
     v = unique_edges[k, 1]
-    if lengths[k] >= wp.float32(0.5) * (low[u] + low[v]):
+    if unique_edge_length(vertices, unique_edges, k) >= wp.float32(0.5) * (low[u] + low[v]):
         return
     is_boundary = edge_face_count[k] == 1
 
@@ -1476,12 +1514,25 @@ def commit_collapses(
 
 
 @wp.kernel
-def faces_with_distinct_indices(faces: wp.array[wp.int32], out_mask: wp.array[wp.bool]) -> None:
-    # A face survives a vertex remap only if its three corners are still three distinct vertices.
-    # Every decimation here ends in one: an edge collapse merges two of them, vertex clustering
-    # sends two into the same cell.
+def remap_faces_with_distinct_mask(
+    faces: wp.array[wp.int32],
+    remap: wp.array[wp.int32],
+    out_faces: wp.array[wp.int32],
+    out_mask: wp.array[wp.bool],
+) -> None:
+    # Remap face ``f``'s corners through a vertex map, and flag whether they are still three
+    # distinct vertices -- a face survives a vertex remap only if they are. Every decimation here
+    # ends in one: an edge collapse merges two of them, vertex clustering sends two into the same
+    # cell.
+    #
+    # One pass for both halves: the test reads only this face's own three remapped corners, so a
+    # separate gather would write them to memory for this kernel to read straight back.
     f = wp.int32(wp.tid())
-    i0, i1, i2 = corner_triple(faces, f)
+    a, b, c = corner_triple(faces, f)
+    i0 = remap[a]
+    i1 = remap[b]
+    i2 = remap[c]
+    write_corner_triple(out_faces, f, i0, i1, i2)
     out_mask[f] = i0 != i1 and i1 != i2 and i0 != i2
 
 
@@ -1989,6 +2040,13 @@ def cluster_accumulate(
     v = wp.int32(wp.tid())
     wp.atomic_add(out_sum, labels[v], vertices[v])
     wp.atomic_add(out_count, labels[v], 1)
+
+
+@wp.func
+def mean_from_sum(total: wp.vec3, count: wp.int32) -> wp.vec3:
+    # A cluster's mean position from ``cluster_accumulate``'s sum and count, dividing by the count
+    # converted in place rather than by a separately materialised ``float32`` copy of the counts.
+    return total / wp.float32(count)
 
 
 @wp.kernel
@@ -2710,3 +2768,26 @@ def drop_locked_candidates(
         if locked[columns[i]] != 0:
             return
     out_survivor[k] = s
+
+
+def _declare_map_kernels() -> None:
+    """
+    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not two.
+
+    See ``kernels/array.py::declare_map_signatures`` for why this exists; only this module's *own*
+    forking ops belong here.
+
+    One op: ``mean_from_sum``, mapped in place over ``cluster_decimate``'s per-cluster sums and
+    counts. The length-1 row is not speculative -- a voxel size wider than the mesh leaves one
+    cluster, and the broadcast mask of a length-1 array is part of the cache key.
+    """
+    dense, single = map_probe, map_probe_single
+    declare_map_signatures(
+        [
+            (mean_from_sum, (dense(wp.vec3), dense(wp.int32)), wp.vec3),
+            (mean_from_sum, (single(wp.vec3), single(wp.int32)), wp.vec3),
+        ]
+    )
+
+
+_declare_map_kernels()

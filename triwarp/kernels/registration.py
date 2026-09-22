@@ -365,15 +365,15 @@ def mesh_correspondence_pass(
     points: wp.array[wp.vec3],
     query_max: wp.float32,
     normal_source: wp.array[wp.vec3],
-    max_distance: wp.float32,
     out_closest: wp.array[wp.vec3],
     out_distance: wp.array[wp.float32],
     out_face: wp.array[wp.int32],
     out_normals: wp.array[wp.vec3],
-    out_valid: wp.array[wp.bool],
 ) -> None:
     # One ICP iteration's whole correspondence step against a mesh target: the closest-point
-    # query, the target normal it points at, and whether it survives the distance gate.
+    # query and the target normal it points at. The distance gate is not reported: the only reader
+    # of a per-point valid mask was an "is anything left?" test, and the accumulation kernel's
+    # weight sum -- which it gates on the same ``residual_valid`` -- already answers that.
     #
     # The three ran as three launches at the same width, and the second and third read nothing
     # but what the first had just written at their own index -- so each paid a launch and a full
@@ -391,11 +391,10 @@ def mesh_correspondence_pass(
     # this against a run with the convergence break live: the two arms then stop at different
     # iterations and the ratio is fiction.
     tid = wp.int32(wp.tid())
-    distance, face = write_closest_point_query(
+    _distance, face = write_closest_point_query(
         mesh_id, points, query_max, tid, out_closest, out_distance, out_face
     )
     out_normals[tid] = correspondence_normal(normal_source, face)
-    out_valid[tid] = residual_valid(face, distance, max_distance)
 
 
 @wp.kernel
@@ -424,20 +423,23 @@ def mesh_correspondence_weight_pass(
 
 @wp.kernel
 def cloud_correspondence_pass(
+    target_vertices: wp.array[wp.vec3],
     normal_source: wp.array[wp.vec3],
     index: wp.array[wp.int32],
-    distance: wp.array[wp.float32],
-    max_distance: wp.float32,
+    out_closest: wp.array[wp.vec3],
     out_normals: wp.array[wp.vec3],
-    out_valid: wp.array[wp.bool],
 ) -> None:
     # The cloud-target tail of ``mesh_correspondence_pass``: the nearest-neighbour search is a
-    # ``neighbors.query_nearest`` call rather than a kernel here, so only the two passes that
-    # consume its answer fuse. Both read one correspondence at their own index.
+    # ``neighbors.query_nearest`` call rather than a kernel here, so only what consumes its answer
+    # fuses -- the matched point and its normal, both read at one correspondence's own index. The
+    # point was a Python-scope gather and a ``wp.copy`` of its own before.
+    #
+    # ``index`` is never ``-1`` here (the search has no radius cap and the cloud is non-empty); the
+    # clamp only keeps the read in range should that ever change.
     tid = wp.int32(wp.tid())
     i = index[tid]
+    out_closest[tid] = target_vertices[wp.max(i, wp.int32(0))]
     out_normals[tid] = correspondence_normal(normal_source, i)
-    out_valid[tid] = residual_valid(i, distance[tid], max_distance)
 
 
 @wp.func
@@ -671,9 +673,22 @@ def solve_point_to_plane(
     jtj: wp.array[wp.spatial_matrix],
     jtr: wp.array[wp.spatial_vector],
     damping: wp.float32,
-    out_matrix: wp.array[wp.mat44],
+    total: wp.array[wp.mat44],
+    out_step: wp.array[wp.mat44],
+    out_total: wp.array[wp.mat44],
+    out_next_jtj: wp.array[wp.spatial_matrix],
+    out_next_jtr: wp.array[wp.spatial_vector],
+    out_next_scalars: wp.array[wp.float32],
 ) -> None:
-    """Solve the linearized point-to-plane system and build the incremental transform."""
+    """
+    Solve the linearized point-to-plane system, build the step and compose it into the transform.
+
+    ``dim=1``, and it is also the iteration's bookkeeping, which is why it takes three buffers it
+    only zeroes: the loop ping-pongs two accumulator sets, and zeroing the *next* iteration's set
+    here costs three stores where three memsets on the host cost three API calls per iteration.
+    ``out_total = out_step * total`` into the other half of a second ping-pong is the running
+    transform the separate one-element ``wp.mul`` launch used to fold -- same product, same order.
+    """
     a = jtj[0]
     b = jtr[0]
 
@@ -692,4 +707,19 @@ def solve_point_to_plane(
     if angle > wp.float32(1e-12):
         rot = wp.quat_to_matrix(wp.quat_from_axis_angle(wp.normalize(omega), angle))
 
-    out_matrix[0] = make_affine44(rot, tvec)
+    step = make_affine44(rot, tvec)
+    out_step[0] = step
+    out_total[0] = wp.mul(step, total[0])
+
+    out_next_jtj[0] = wp.spatial_matrix(wp.float32(0.0))
+    # Longhand for the reason ``solve_spd6`` gives: ``wp.spatial_vector`` has no broadcast fill.
+    out_next_jtr[0] = wp.spatial_vector(
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+    )
+    for slot in range(ICP_SCALAR_ACC_SIZE):
+        out_next_scalars[slot] = wp.float32(0.0)

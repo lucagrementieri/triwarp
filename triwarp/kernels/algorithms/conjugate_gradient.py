@@ -149,8 +149,9 @@ def scaled_diagonal_apply(
     # ``out = factor * D^-1 * source``, over every column of one operator at once.
     #
     # Two callers, which is why this one kernel carries the two extra arguments rather than there
-    # being two. The conjugate gradient wants ``z = M^-1 r`` for the *initial* residual only (inside
-    # the iteration it is fused into ``cg_step_x_r_z``), at ``factor = 1`` and with no rows to skip.
+    # being two. The conjugate gradient wants ``z = M^-1 r`` for the *initial* residual only
+    # (inside the iteration it is fused into ``cg_step_x_r_z_dot``), at ``factor = 1`` and with no
+    # rows to skip.
     # The multigrid cycle wants the power iteration's step and the first Jacobi sweep from a zero
     # initial guess -- the sweep being a *write*, so the cycle never has to zero its working
     # vectors. It was written twice, a week apart, in two files, one of which plugs into the other.
@@ -211,34 +212,6 @@ def cg_advance_x_r(
 
 
 @wp.kernel
-def cg_step_x_r_z(
-    stride: wp.int32,
-    n: wp.int32,
-    rz_old: wp.array[wp.float64],
-    p_dot_ap: wp.array2d[wp.float64],
-    r_norm_sq: wp.array2d[wp.float64],
-    atol_sq: wp.array[wp.float64],
-    inv_diag: wp.array[wp.float64],
-    p: wp.array[wp.float64],
-    ap: wp.array[wp.float64],
-    out_x: wp.array[wp.float64],
-    out_r: wp.array[wp.float64],
-    out_z: wp.array[wp.float64],
-) -> None:
-    # ``x += alpha p``; ``r -= alpha Ap``; ``z = M^-1 r``, with the **Jacobi** apply fused in --
-    # ``inv_diag`` is padded to ``stride`` alongside the vectors. The only difference from
-    # ``cg_step_x_r`` below is that fusion, which is available exactly when the preconditioner is an
-    # elementwise multiply of the residual this pass has just written.
-    i = wp.int32(wp.tid())
-    c = i // stride
-    local = i % stride
-    residual = cg_advance_x_r(
-        i, c, local, n, rz_old, p_dot_ap, r_norm_sq, atol_sq, p, ap, out_x, out_r
-    )
-    out_z[i] = inv_diag[local] * residual
-
-
-@wp.kernel
 def cg_step_x_r_z_dot(
     stride: wp.int32,
     n: wp.int32,
@@ -254,7 +227,10 @@ def cg_step_x_r_z_dot(
     out_z: wp.array[wp.float64],
     out_partials: wp.array3d[wp.float64],
 ) -> None:
-    # ``cg_step_x_r_z`` with the **first stage** of the ``r.r`` / ``r.z`` reduction folded in: the
+    # ``x += alpha p``; ``r -= alpha Ap``; ``z = M^-1 r``, with the **Jacobi** apply fused in --
+    # ``inv_diag`` is padded to ``stride`` alongside the vectors, and the fusion is available
+    # exactly when the preconditioner is an elementwise multiply of the residual this pass has just
+    # written. The **first stage** of the ``r.r`` / ``r.z`` reduction is folded in too: the
     # block sums its own slice of the two dots straight into ``out_partials`` instead of a separate
     # ``cg_dot_partials`` launch reading back the ``r`` and ``z`` this kernel has just written.
     # That is CLAUDE.md section 14.10's producer-consumer fusion applied to a reduction's first
@@ -307,8 +283,8 @@ def cg_step_x_r(
 ) -> None:
     # The same x/r update with **no** preconditioner apply, for a preconditioner that is not an
     # elementwise multiply -- a multigrid V-cycle, which is its own sequence of launches and reads
-    # the ``r`` this pass leaves behind. One extra launch per iteration against ``cg_step_x_r_z``,
-    # and that is the whole cost of un-fusing.
+    # the ``r`` this pass leaves behind. One extra launch per iteration against
+    # ``cg_step_x_r_z_dot``, and that is the whole cost of un-fusing.
     i = wp.int32(wp.tid())
     c = i // stride
     local = i % stride

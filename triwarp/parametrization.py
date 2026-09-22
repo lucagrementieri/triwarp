@@ -599,19 +599,14 @@ def arap(
     )
 
     # Pre-loop buffers (no allocation inside the loop). ``sol`` (2, n_interior) holds the
-    # warm-started CG solution per column; seed it from ``uv_init`` interior values, then
-    # reconstruct the working ``out_uv`` with the constraints enforced for iteration 1.
-    sol = wp.zeros((2, n_interior), dtype=wp.float64, device=device)
+    # warm-started CG solution per column; one launch seeds it from ``uv_init``'s interior values
+    # and writes the working ``out_uv`` with the constraints enforced for iteration 1. Every row of
+    # ``sol`` is seeded, so it is allocated uninitialised.
+    sol = wp.empty((2, n_interior), dtype=wp.float64, device=device)
     wp.launch(
         kernel_parametrization.gather_interior_uv,
         dim=n_vertices,
-        inputs=[fixed_mask, interior_map, uv_init, sol],
-        device=device,
-    )
-    wp.launch(
-        kernel_parametrization.scatter_solution,
-        dim=n_vertices,
-        inputs=[fixed_mask, interior_map, sol, fixed_values_2d, out_uv],
+        inputs=[fixed_mask, interior_map, uv_init, fixed_values_2d, sol, out_uv],
         device=device,
     )
     rhs_rot_x = wp.zeros(n_vertices, dtype=wp.float64, device=device)
@@ -681,13 +676,14 @@ def _scatter_constraints(
         raise ValueError(
             f"indices and uv must have the same length, got {n_fixed} and {int(uv.shape[0])}."
         )
-    fixed_mask = tw.array.indices_to_mask(indices, n_vertices, device=device)
+    # One scatter marks the mask and writes the values, skipping an out-of-range index in both.
+    fixed_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     fixed_values = wp.zeros((2, n_vertices), dtype=wp.float64, device=device)
     if n_fixed > 0:
         wp.launch(
             kernel_parametrization.scatter_fixed_uv,
             dim=n_fixed,
-            inputs=[indices, uv, fixed_values],
+            inputs=[indices, uv, fixed_mask, fixed_values],
             device=device,
         )
     return fixed_mask, fixed_values

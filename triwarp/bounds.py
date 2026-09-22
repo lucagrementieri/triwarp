@@ -602,16 +602,18 @@ def oriented_bounding_box(
         n = int(points.shape[0])
 
     device = points.device
+    # The axes kernel also seeds each candidate's six extent slots, so ``corners`` is uninitialised
+    # until then and every slot is written before the extents kernel reads it.
     axes = wp.empty(rotations, dtype=wp.mat33, device=device)
+    corners = wp.empty(6 * rotations, dtype=wp.float32, device=device)
     wp.launch(
         kernel_bounds.oriented_box_candidate_axes,
         dim=rotations,
-        inputs=[rotations, axes],
+        inputs=[rotations, axes, corners],
         device=device,
     )
 
     n_slices = max(1, (n + ITEMS_PER_CANDIDATE_SLICE - 1) // ITEMS_PER_CANDIDATE_SLICE)
-    corners = wp.empty(6 * rotations, dtype=wp.float32, device=device)
     _score_extents_into(points, axes, n_slices, corners)
 
     loss = wp.empty(rotations, dtype=wp.float32, device=device)
@@ -708,7 +710,13 @@ def _refine_box(
         wp.launch(
             kernel_bounds.oriented_box_refine_axes,
             dim=total,
-            inputs=[chains, wp.float64(sigma / math.pi), wp.int32(_REFINE_CANDIDATES), axes],
+            inputs=[
+                chains,
+                wp.float64(sigma / math.pi),
+                wp.int32(_REFINE_CANDIDATES),
+                axes,
+                corners,
+            ],
             device=device,
         )
         _score_extents_into(points, axes, n_slices, corners)
@@ -735,9 +743,9 @@ def _score_extents_into(
     points: wp.array[wp.vec3], axes: twt.ArrayNd, n_slices: int, corners: wp.array[wp.float32]
 ) -> None:
     """Fill ``corners`` with the cloud's extent in every candidate frame, six packed slots each."""
-    # Seeded rather than allocated so the refinement can reuse one buffer across its rounds; the
-    # kernel only ever ``atomic_min``s into it, so every round must start from ``+inf`` again.
-    corners.fill_(math.inf)
+    # The kernel only ever ``atomic_min``s into ``corners``, so it must arrive holding ``+inf``:
+    # both axes kernels seed a candidate's slots as they write its frame, which is what lets the
+    # refinement reuse one buffer across its rounds.
     wp.launch(
         kernel_bounds.oriented_box_extents,
         dim=(int(axes.shape[0]), n_slices),

@@ -293,8 +293,10 @@ def connected_component_labels_from_edges(
     """
     Per-node connected-component labels from an undirected edge list.
 
-    Builds a CSR adjacency via [`edges_to_csr`][triwarp.graph.edges_to_csr] and delegates to
-    [`connected_component_labels`][triwarp.graph.connected_component_labels].
+    The same ECL-CC labelling as
+    [`connected_component_labels`][triwarp.graph.connected_component_labels], hooked straight off
+    the edge list rather than off a sparse adjacency matrix, so no matrix is built. Each label is
+    the smallest node id in its component, exactly as there.
 
     Parameters
     ----------
@@ -344,12 +346,28 @@ def connected_component_labels_from_edges(
     node_count = _validate_edge_list(edges, node_count, validate=validate)
 
     # With no edges every node is its own component, which ``arange`` gives directly -- the
-    # CSR build and traversal below would reach the same answer the long way.
+    # hook and flatten below would reach the same answer the long way.
     if int(edges.shape[0]) == 0:
         return arange(node_count, device=edges.device)
 
-    adjacency = edges_to_csr(node_count, edges)
-    return connected_component_labels(adjacency)
+    # One thread per edge over an identity forest, then the flatten. No adjacency matrix is built:
+    # the unions are per edge either way, so a CSR would only be walked back into the same edges.
+    device = edges.device
+    parents = arange(node_count, device=device)
+    wp.launch(
+        kernel_connected_components.ecl_hook_edges,
+        dim=int(edges.shape[0]),
+        inputs=[edges, parents],
+        device=device,
+    )
+    labels = wp.empty(node_count, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_connected_components.ecl_flatten,
+        dim=node_count,
+        inputs=[parents, labels],
+        device=device,
+    )
+    return labels
 
 
 def connected_component_parity_from_edges(
@@ -556,25 +574,20 @@ def successor_cycles(
             wp.empty(0, dtype=wp.int32, device=device),
         )
 
+    # The successor table and the distinct-endpoint mask come out of one pass over the edges. The
+    # distinct endpoints, ascending, are then the mask's ``flatnonzero`` rather than ``unique_1d``
+    # over the flattened pairs: both return the sorted distinct values, and the range check above
+    # has already guaranteed every endpoint indexes the mask, but this one is a zeroed buffer and a
+    # scan where that one is a hash table, a compaction, a radix sort and two host readbacks.
     next_node = wp.full(node_count, -1, dtype=wp.int32, device=device)
-    wp.launch(kernel_graph.scatter_successor, dim=m, inputs=[edges, next_node], device=device)
+    node_mask = wp.zeros(node_count, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_graph.scatter_successor, dim=m, inputs=[edges, next_node, node_mask], device=device
+    )
 
     # Already range-checked above, so the downstream call skips the second reduction and host sync.
     labels = connected_component_labels_from_edges(edges, node_count=node_count, validate=False)
 
-    # The distinct endpoints, ascending. A membership mask plus ``flatnonzero`` rather than
-    # ``unique_1d`` over the flattened pairs: both return the sorted distinct values, and the range
-    # check above has already guaranteed every endpoint indexes the mask, but this one is a zeroed
-    # buffer, a scatter and a scan where that one is a hash table, a compaction, a radix sort and
-    # two host readbacks. Measured faster at every size, flat in ``node_count``, with
-    # byte-identical output.
-    node_mask = wp.zeros(node_count, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_scatter.mark_membership_mask,
-        dim=2 * m,
-        inputs=[edges.flatten(), wp.int32(node_count), node_mask],
-        device=device,
-    )
     cycle_nodes = tw.array.flatnonzero(node_mask)
     n_nodes = int(cycle_nodes.shape[0])
 
@@ -636,14 +649,14 @@ def successor_cycles(
         steps, steps_next = steps_next, steps
 
     position = wp.empty(n_nodes, dtype=wp.int32, device=device)
+    node_labels = wp.empty(n_nodes, dtype=wp.int32, device=device)
     wp.launch(
         kernel_graph.finalize_rank_positions,
         dim=n_nodes,
-        inputs=[cycle_nodes, labels, label_count, steps, position],
+        inputs=[cycle_nodes, labels, label_count, steps, position, node_labels],
         device=device,
     )
 
-    node_labels = tw.array.gather(labels, cycle_nodes)
     unique_labels, cycle_index = tw.grouping.unique_1d(node_labels, return_inverse=True)
     n_cycles = int(unique_labels.shape[0])
 

@@ -18,11 +18,10 @@ See [`rasterize_attribute`][triwarp.texture.rasterize_attribute],
 
 from __future__ import annotations
 
-from typing import Literal, cast
+from typing import Literal
 
 import warp as wp
 
-import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import INT32_MAX
@@ -146,9 +145,7 @@ def rasterize_discrete_attribute(
     require_same_device(uv=uv, faces=faces, attribute=attribute)
     twt.ensure_ndim(attribute, 1, dtype=wp.int32)
     n_vertices = int(attribute.shape[0])
-    _check_rasterize_inputs(uv, n_vertices, resolution)
-    if n_vertices > 0 and tw.reduce.min(cast(twt.Array1dInt32, attribute)) < 0:
-        raise ValueError("Attribute values must be greater than or equal to 0")
+    _check_rasterize_inputs(uv, n_vertices, resolution, labels=attribute)
 
     device = uv.device
     labels_image = wp.full((resolution, resolution), -1, dtype=wp.int32, device=device)
@@ -166,7 +163,13 @@ def rasterize_discrete_attribute(
     return twt.as_array2d(labels_image, wp.int32)
 
 
-def _check_rasterize_inputs(uv: wp.array[wp.vec2], n_vertices: int, resolution: int) -> None:
+def _check_rasterize_inputs(
+    uv: wp.array[wp.vec2],
+    n_vertices: int,
+    resolution: int,
+    *,
+    labels: wp.array[wp.int32] | None = None,
+) -> None:
     """
     Validate the arguments both rasterizers share: resolution, row count and UV range.
 
@@ -178,18 +181,38 @@ def _check_rasterize_inputs(uv: wp.array[wp.vec2], n_vertices: int, resolution: 
         Row count of the attribute being rasterized.
     resolution
         Output image size in pixels.
+    labels
+        The discrete rasterizer's ``(n_vertices,)`` labels, checked non-negative in the same pass
+        and the same readback as the UV range; ``None`` for the continuous one.
 
     Raises
     ------
     ValueError
-        If ``resolution`` is not positive, ``uv`` and the attribute disagree on their row count, or
-        any finite UV lies outside ``[0, 1]``.
+        If ``resolution`` is not positive, ``uv`` and the attribute disagree on their row count,
+        any finite UV lies outside ``[0, 1]``, or any of ``labels`` is negative.
     """
     if resolution <= 0:
         raise ValueError("Resolution must be positive")
     if int(uv.shape[0]) != n_vertices:
         raise ValueError(f"uv and attribute row count mismatch: {int(uv.shape[0])} vs {n_vertices}")
-    _check_uv_in_range(uv)
+    if labels is None:
+        _check_uv_in_range(uv)
+        return
+    if n_vertices == 0:
+        return
+    flags = wp.zeros(2, dtype=wp.int32, device=uv.device)
+    wp.launch(
+        kernel_texture.check_uv_range_and_labels,
+        dim=n_vertices,
+        inputs=[uv, labels, flags],
+        device=uv.device,
+    )
+    # One readback of both flags: nothing can raise without bringing them to the host.
+    uv_flag, label_flag = (int(flag) for flag in flags.numpy())
+    if uv_flag != 0:
+        raise ValueError("UV coordinates must be in the range [0, 1]")
+    if label_flag != 0:
+        raise ValueError("Attribute values must be greater than or equal to 0")
 
 
 def _rasterize_owner(
@@ -343,15 +366,18 @@ def remap_discrete_attribute_from_uv(
     """
     require_same_device(uv=uv, class_image=class_image)
     twt.ensure_ndim(class_image, 2, dtype=wp.int32)
+    _check_uv_in_range(uv)
+
     device = uv.device
-    float_image = twt.as_array2d(tw.array.astype(class_image, wp.float32), wp.float32)
-
-    sampled = remap_attribute_from_uv(uv, float_image, order=0)
-
     n_vertices = int(uv.shape[0])
     out_labels = twt.empty_1d(n_vertices, wp.int32, device=device)
-    # ``sampled`` is ``(n_vertices, 1)`` and contiguous, so ``flatten()`` is a reshape view.
-    wp.map(kernel_texture.round_labels, sampled.flatten(), out=out_labels)
+    if n_vertices > 0:
+        wp.launch(
+            kernel_texture.sample_class_image,
+            dim=n_vertices,
+            inputs=[uv, class_image, out_labels],
+            device=device,
+        )
     return out_labels
 
 
@@ -368,7 +394,8 @@ def _check_uv_in_range(uv: wp.array[wp.vec2]) -> None:
     answer -- the same trade ``_device.require_same_device`` is argued from. If a caller ever
     samples in a loop, the shape to add is CLAUDE.md section 3.10's ``validate=False`` keyword
     **with** an in-repo caller passing it, not an unconditional removal; the rasterizers reach
-    this through ``_check_rasterize_inputs`` and pay a far smaller share, since their own work
+    this (or, for the discrete one, the same test fused with its label check) through
+    ``_check_rasterize_inputs`` and pay a far smaller share, since their own work
     scales with ``resolution ** 2``.
     """
     n_vertices = int(uv.shape[0])

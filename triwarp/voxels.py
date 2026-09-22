@@ -338,10 +338,12 @@ def voxel_down_sample(
     use atomics directly, since those are order-independent for floats.
     """
     grid = voxelize_points(points, voxel_size, origin=origin)
-    pooled = pool_by_voxel(grid, points, points, pooling=pooling)
+    # The pooling pass already probes every point's voxel row, which is the inverse; reuse it
+    # rather than probing the grid a second time.
+    pooled, slots = _pool_by_voxel(grid, points, points, pooling)
     if not return_inverse:
         return pooled
-    return pooled, _point_slots(grid, points)
+    return pooled, slots if slots is not None else _point_slots(grid, points)
 
 
 def pool_by_voxel(
@@ -392,6 +394,22 @@ def pool_by_voxel(
     [`cell_centers`][triwarp.voxels.cell_centers]
     """
     require_same_device(grid=grid, points=points, values=values)
+    return _pool_by_voxel(grid, points, values, pooling)[0]
+
+
+def _pool_by_voxel(
+    grid: wp.Volume,
+    points: wp.array[wp.vec3],
+    values: wp.array[wp.vec3],
+    pooling: Literal["mean", "min", "max", "sum"],
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32] | None]:
+    """
+    [`pool_by_voxel`][triwarp.voxels.pool_by_voxel], also returning each point's voxel row.
+
+    The rows are the probe the pooling runs on anyway, and
+    [`voxel_down_sample`][triwarp.voxels.voxel_down_sample]'s inverse is exactly them. ``None``
+    when nothing was probed (an empty grid or cloud).
+    """
     if pooling not in ("mean", "min", "max", "sum"):
         raise ValueError(f"pooling must be 'mean', 'sum', 'min' or 'max', got {pooling!r}")
     if int(points.shape[0]) != int(values.shape[0]):
@@ -404,9 +422,9 @@ def pool_by_voxel(
     n_points = int(points.shape[0])
     n_voxels = _voxel_count(grid)
     if n_voxels == 0:
-        return wp.empty(0, dtype=wp.vec3, device=device)
+        return wp.empty(0, dtype=wp.vec3, device=device), None
     if n_points == 0:
-        return wp.zeros(n_voxels, dtype=wp.vec3, device=device)
+        return wp.zeros(n_voxels, dtype=wp.vec3, device=device), None
 
     slots = _point_slots(grid, points)
     # One sentinel bucket past the last voxel collects the points that fall outside the grid.
@@ -425,20 +443,23 @@ def pool_by_voxel(
     if pooling in ("min", "max"):
         largest = pooling == "max"
         limit = -float("inf") if largest else float("inf")
-        pooled = wp.full(n_voxels, wp.vec3(limit, limit, limit), device=device)
+        # Seeded from ``counts``, which is already final: an empty voxel starts at the zero it must
+        # end at, since the atomic min/max below never touches its slot, and every other voxel at
+        # the +-inf the atomics reduce from. The mean/sum branch below needs no seed at all
+        # (``segment_reduce_vec3`` initializes its running sum to zero and its loop is a no-op over
+        # an empty segment).
+        pooled = wp.empty(n_voxels, dtype=wp.vec3, device=device)
+        wp.launch(
+            kernel_voxels.seed_extremum_voxels,
+            dim=n_voxels,
+            inputs=[counts, wp.vec3(limit, limit, limit), pooled],
+            device=device,
+        )
         wp.launch(
             kernel_voxels.pool_extremum_vec3,
             dim=n_points,
             inputs=[slots, values, largest, pooled],
             device=device,
-        )
-        # Only this branch needs it: an empty voxel's slot is seeded at +-inf and never touched by
-        # the atomic min/max above, so it has to be zeroed explicitly. The mean/sum branch below
-        # already writes every voxel (``segment_reduce_vec3`` initializes its running sum to zero
-        # and its loop is a no-op over an empty segment), so a second, unconditional launch there
-        # would rewrite a value that is already correct.
-        wp.launch(
-            kernel_voxels.zero_empty_voxels, dim=n_voxels, inputs=[counts, pooled], device=device
         )
     else:
         sorted_buckets, order = tw.array.sort_and_argsort(buckets)
@@ -451,7 +472,7 @@ def pool_by_voxel(
             inputs=[order, values, offsets, counts, pooling == "mean", pooled],
             device=device,
         )
-    return pooled
+    return pooled, slots
 
 
 def cells(grid: wp.Volume, *, order: Literal["grid", "sorted"] = "grid") -> twt.Array2dInt32:
@@ -1178,17 +1199,7 @@ def grid_points(
     if len(shape) != 3 or min(int(n) for n in shape) < 1:
         raise ValueError(f"shape must be three positive integers, got {shape!r}")
     dims = (int(shape[0]), int(shape[1]), int(shape[2]))
-    if bounds is None:
-        lower = wp.vec3(0.0, 0.0, 0.0)
-        step = wp.vec3(1.0, 1.0, 1.0)
-    else:
-        lower, upper = bounds
-        step = wp.vec3(
-            *(
-                (upper[axis] - lower[axis]) / float(dims[axis] - 1) if dims[axis] > 1 else 0.0
-                for axis in range(3)
-            )
-        )
+    lower, step = _lattice_step(dims, bounds)
     lattice = wp.empty(dims, dtype=wp.vec3, device=device)
     wp.launch(kernel_voxels.lattice_points, dim=dims, inputs=[lower, step, lattice], device=device)
     return lattice.reshape((dims[0] * dims[1] * dims[2],))
@@ -1429,10 +1440,13 @@ def revoxelize(
             "reciprocal cubed)"
         )
     # The lattice is the new cell *centres* -- the sample positions trimesh's ``is_filled`` tests.
+    # Each is probed against the old grid and written as a build candidate in the same pass, so
+    # neither the centre lattice nor its occupancy is stored.
     half = 0.5 * voxel_size
-    centers = grid_points(
-        shape,
-        bounds=(
+    dims = (int(shape[0]), int(shape[1]), int(shape[2]))
+    lower, step = _lattice_step(
+        dims,
+        (
             wp.vec3(
                 *(float(origin[axis]) + base_cell[axis] * voxel_size + half for axis in range(3))
             ),
@@ -1443,10 +1457,16 @@ def revoxelize(
                 )
             ),
         ),
+    )
+    candidates = twt.empty_2d((total, 3), wp.int32, device=grid.device)
+    mask = wp.empty(total, dtype=wp.int32, device=grid.device)
+    wp.launch(
+        kernel_voxels.resampled_cell_candidates,
+        dim=dims,
+        inputs=[grid.id, lower, step, wp.vec3i(*dims), wp.vec3i(*base_cell), candidates, mask],
         device=grid.device,
     )
-    occupancy = occupancy_at_points(grid, centers).reshape(shape)
-    return from_dense(twt.as_array3d(occupancy, wp.bool), voxel_size, origin, origin_cell=base_cell)
+    return _allocate_masked(candidates, mask, voxel_size, origin)
 
 
 def fill_cavities(grid: wp.Volume, *, max_cells: int = 1 << 28) -> wp.Volume:
@@ -1519,14 +1539,17 @@ def fill_cavities(grid: wp.Volume, *, max_cells: int = 1 << 28) -> wp.Volume:
         inputs=[occupancy, labels, outside],
         device=device,
     )
-    filled = twt.empty_3d(dims, wp.bool, device=device)
+    # The filled set goes straight to the builder as candidates plus a keep mask -- the pair
+    # ``from_dense`` would derive from a filled lattice -- so that lattice is never stored.
+    candidates = twt.empty_2d((n_nodes, 3), wp.int32, device=device)
+    mask = wp.empty(n_nodes, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_voxels.fill_enclosed_cells,
+        kernel_voxels.enclosed_cell_candidates,
         dim=dims,
-        inputs=[occupancy, labels, outside, filled],
+        inputs=[occupancy, labels, outside, wp.vec3i(*origin_cell), candidates, mask],
         device=device,
     )
-    return from_dense(filled, voxel_size, origin, origin_cell=origin_cell)
+    return _allocate_masked(candidates, mask, voxel_size, origin)
 
 
 def fill_orthographic(grid: wp.Volume, *, max_cells: int = 1 << 28) -> wp.Volume:
@@ -1576,24 +1599,16 @@ def fill_orthographic(grid: wp.Volume, *, max_cells: int = 1 << 28) -> wp.Volume
         grid, pad=0, max_cells=max_cells, caller="fill_orthographic"
     )
     dims = (int(occupancy.shape[0]), int(occupancy.shape[1]), int(occupancy.shape[2]))
+    # The first axis writes every cell of ``filled`` and the other two intersect into it in place.
     filled = twt.empty_3d(dims, wp.bool, device=device)
-    scratch = twt.empty_3d(dims, wp.bool, device=device)
     for axis in range(3):
         other = [dims[a] for a in range(3) if a != axis]
-        target = filled if axis == 0 else scratch
         wp.launch(
             kernel_voxels.fill_axis_span,
             dim=(other[0], other[1]),
-            inputs=[occupancy, wp.int32(axis), wp.int32(dims[axis]), target],
+            inputs=[occupancy, wp.int32(axis), wp.int32(dims[axis]), axis > 0, filled],
             device=device,
         )
-        if axis > 0:
-            wp.launch(
-                kernel_voxels.intersect_occupancy,
-                dim=dims,
-                inputs=[filled, scratch, filled],
-                device=device,
-            )
     return from_dense(filled, voxel_size, origin, origin_cell=origin_cell)
 
 
@@ -1993,13 +2008,7 @@ def from_dense(
         inputs=[occupancy, wp.vec3i(*(int(c) for c in origin_cell)), candidates, mask],
         device=device,
     )
-    return wp.Volume.allocate_by_voxels(
-        candidates,
-        voxel_size=voxel_size,
-        translation=_translation(origin, voxel_size),
-        point_mask=mask,
-        device=device,
-    )
+    return _allocate_masked(candidates, mask, voxel_size, origin)
 
 
 def to_field(
@@ -2279,15 +2288,17 @@ def _select_cells(
     # ``present`` rides into the kernel rather than inverting its answer afterwards: membership
     # and its complement are the same probe, so the difference costs a selector instead of a
     # second launch over a mask the first one just wrote.
-    mask = wp.empty(n_cells, dtype=wp.bool, device=rows.device)
+    #
+    # The flags go to the builder as its ``point_mask`` over the unfiltered rows, which is what the
+    # kept rows would have been compacted for: no scan, count readback or gathered copy.
+    flags = wp.empty(n_cells, dtype=wp.int32, device=rows.device)
     wp.launch(
-        kernel_voxels.cell_occupancy,
+        kernel_voxels.cell_occupancy_flags,
         dim=n_cells,
-        inputs=[b.id, rows, present, mask],
+        inputs=[b.id, rows, present, flags],
         device=rows.device,
     )
-    keep = tw.array.flatnonzero(mask)
-    return from_cells(twt.as_array2d(tw.array.gather(rows, keep), wp.int32), voxel_size, origin)
+    return _allocate_masked(rows, flags, voxel_size, origin)
 
 
 def _voxel_count(grid: wp.Volume) -> int:
@@ -2299,6 +2310,48 @@ def _translation(origin: wp.vec3, voxel_size: float) -> tuple[float, float, floa
     """NanoVDB centres voxels on integers, so the volume's translation is half a cell above."""
     half = 0.5 * voxel_size
     return (float(origin[0]) + half, float(origin[1]) + half, float(origin[2]) + half)
+
+
+def _lattice_step(
+    dims: tuple[int, int, int], bounds: tuple[wp.vec3, wp.vec3] | None
+) -> tuple[wp.vec3, wp.vec3]:
+    """
+    Node 0 and the node spacing of a ``dims`` lattice spanning ``bounds`` inclusively.
+
+    The ``(lower, step)`` pair ``kernels/array.lattice_position`` takes; shared by
+    [`grid_points`][triwarp.voxels.grid_points] and [`revoxelize`][triwarp.voxels.revoxelize],
+    whose resampling lattice is the same construction without the stored positions. A single-sample
+    axis has no spacing and steps by 0. ``bounds=None`` is index space.
+    """
+    if bounds is None:
+        return wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 1.0, 1.0)
+    lower, upper = bounds
+    step = wp.vec3(
+        *(
+            (upper[axis] - lower[axis]) / float(dims[axis] - 1) if dims[axis] > 1 else 0.0
+            for axis in range(3)
+        )
+    )
+    return lower, step
+
+
+def _allocate_masked(
+    candidates: twt.Array2dInt32, mask: wp.array[wp.int32], voxel_size: float, origin: wp.vec3
+) -> wp.Volume:
+    """
+    Build an index grid from the candidate cells whose ``mask`` flag is non-zero.
+
+    ``point_mask`` lets the builder skip the rejected rows in place, so a producer that already
+    knows which of its rows to keep never compacts them. ``candidates`` must be contiguous and
+    non-empty; an all-zero ``mask`` builds a legal empty grid.
+    """
+    return wp.Volume.allocate_by_voxels(
+        candidates,
+        voxel_size=voxel_size,
+        translation=_translation(origin, voxel_size),
+        point_mask=mask,
+        device=candidates.device,
+    )
 
 
 def _empty_grid(voxel_size: float, origin: wp.vec3, device: wp.DeviceLike) -> wp.Volume:
@@ -2433,13 +2486,7 @@ def _interior_flags(
 def _grid_from_flagged_cells(grid: wp.Volume, flags: wp.array[wp.int32]) -> wp.Volume:
     """Rebuild ``grid`` keeping only the voxels whose flag is non-zero."""
     voxel_size, origin = grid_transform(grid)
-    return wp.Volume.allocate_by_voxels(
-        cells(grid),
-        voxel_size=voxel_size,
-        translation=_translation(origin, voxel_size),
-        point_mask=flags,
-        device=grid.device,
-    )
+    return _allocate_masked(cells(grid), flags, voxel_size, origin)
 
 
 def _stencil(connectivity: int, device: wp.DeviceLike, *, include_self: bool) -> twt.Array2dInt32:

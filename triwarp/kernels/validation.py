@@ -1,5 +1,7 @@
 import warp as wp
 
+from triwarp.kernels.predicates import vector_angle
+
 
 @wp.kernel
 def edge_pair_winding_mask(
@@ -57,19 +59,31 @@ def edge_manifold(count: wp.int32, allow_boundary: wp.bool) -> wp.bool:
 
 @wp.kernel
 def face_edge_manifold_mask(
-    inverse: wp.array[wp.int32], edge_manifold: wp.array[wp.bool], out_mask: wp.array[wp.bool]
+    inverse: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+    allow_boundary: wp.bool,
+    out_mask: wp.array[wp.bool],
 ) -> None:
     """
     Per-face flag: True when all three of a face's undirected edges are edge-manifold.
 
     ``inverse`` maps each directed edge ``3 * f + k`` (row-major face order from
-    ``faces_to_edges``) to its unique-edge index; ``edge_manifold`` is the per-unique-edge flag.
+    ``faces_to_edges``) to its unique-edge index; ``counts`` is each unique edge's face-share count.
+
+    The per-edge flag is [`edge_manifold`][triwarp.kernels.validation.edge_manifold] of the gathered
+    count, evaluated here rather than mapped into a ``(n_unique,)`` bool table first: every entry of
+    that table was read only through this gather, so the map was a launch and an allocation that
+    moved no work.
     """
     f = wp.int32(wp.tid())
     u0 = inverse[3 * f]
     u1 = inverse[3 * f + 1]
     u2 = inverse[3 * f + 2]
-    out_mask[f] = edge_manifold[u0] and edge_manifold[u1] and edge_manifold[u2]
+    out_mask[f] = (
+        edge_manifold(counts[u0], allow_boundary)
+        and edge_manifold(counts[u1], allow_boundary)
+        and edge_manifold(counts[u2], allow_boundary)
+    )
 
 
 @wp.kernel
@@ -181,19 +195,24 @@ def verify_orientation(
 def accumulate_neighbor_normals(
     face_normals: wp.array[wp.vec3],
     face_adjacency: wp.array2d[wp.int32],
-    adjacency_angles: wp.array[wp.float32],
     out_neighbor_sum: wp.array[wp.vec3],
     out_max_angle: wp.array[wp.float32],
 ) -> None:
     # One pass over the adjacency pairs, scattering both per-face quantities the bad-face criteria
     # need: the sum of the neighbouring face normals (whose direction is the local consensus) and
     # the sharpest dihedral angle to any neighbour (which is what a fold looks like).
+    #
+    # The dihedral angle is ``adjacency.face_adjacency_angles``' -- ``vector_angle`` of the pair's
+    # two normals -- taken from the two normals this thread loads anyway, rather than read from a
+    # ``(m,)`` table a launch of its own would have written for this pass alone.
     k = wp.int32(wp.tid())
     f0 = face_adjacency[k, 0]
     f1 = face_adjacency[k, 1]
-    angle = adjacency_angles[k]
-    wp.atomic_add(out_neighbor_sum, f0, face_normals[f1])
-    wp.atomic_add(out_neighbor_sum, f1, face_normals[f0])
+    normal_0 = face_normals[f0]
+    normal_1 = face_normals[f1]
+    angle = vector_angle(normal_0, normal_1)
+    wp.atomic_add(out_neighbor_sum, f0, normal_1)
+    wp.atomic_add(out_neighbor_sum, f1, normal_0)
     wp.atomic_max(out_max_angle, f0, angle)
     wp.atomic_max(out_max_angle, f1, angle)
 
@@ -213,9 +232,18 @@ def face_defective_mask(
     # back onto its own ring. Each criterion is disabled by passing a cosine of -2 / a quality of
     # -1, which no real value can reach, so the three gates compose without a separate flag
     # argument.
+    #
+    # The same sentinels also say which tables exist: a disabled criterion's inputs are never read,
+    # so the wrapper passes ``None`` for them rather than allocating a table of constants (the two
+    # branches are warp-uniform). A disabled pair of angle criteria reaches ``False`` below exactly
+    # as their zeroed tables did: the zero consensus fails the normal test and ``cos(0)`` the fold.
     f = wp.int32(wp.tid())
-    if quality[f] < min_quality:
-        out_bad[f] = wp.bool(True)
+    if min_quality > -1.0:
+        if quality[f] < min_quality:
+            out_bad[f] = wp.bool(True)
+            return
+    if max_normal_cos <= -2.0 and max_fold_cos <= -2.0:
+        out_bad[f] = wp.bool(False)
         return
 
     # Direction of the sum of the neighbouring normals: the local consensus. ``wp.normalize`` of a

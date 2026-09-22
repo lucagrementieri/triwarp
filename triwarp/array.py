@@ -1181,20 +1181,23 @@ def flatnonzero(values: wp.array[wp.bool] | wp.array[wp.Scalar]) -> wp.array[wp.
     if n == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
 
-    flags = wp.empty(n, dtype=wp.int32, device=device)
+    # One buffer for the flags and their scan: the flags are written into it and scanned in place,
+    # which ``wp.utils.array_scan`` supports on both devices -- the host scan is a sequential loop
+    # that reads each element before overwriting it, and CUB's device scan accepts aliased input
+    # and output. The scatter then recovers each flag as the step between neighbouring scan values.
+    inclusive = wp.empty(n, dtype=wp.int32, device=device)
     if values.dtype == wp.bool:
         # A mask needs its own kernel: ``wp.Scalar`` does not instantiate for ``wp.bool``, so
         # ``nonzero_flag`` cannot serve one. For every other dtype the plain cast that kernel
         # replaces would copy the *values*, and the scan below would then sum them instead of
         # counting them.
-        wp.launch(kernel_array.bool_flags, dim=n, inputs=[values, flags], device=device)
+        wp.launch(kernel_array.bool_flags, dim=n, inputs=[values, inclusive], device=device)
     else:
-        wp.map(kernel_array.nonzero_flag, values, out=flags)
+        wp.map(kernel_array.nonzero_flag, values, out=inclusive)
 
     # Inclusive scan: the total is its last element, so one 4-byte tail read sizes the output
     # (the scatter kernel derives each exclusive position as inclusive[i] - 1).
-    inclusive = wp.empty(n, dtype=wp.int32, device=device)
-    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
+    wp.utils.array_scan(inclusive, out_array=inclusive, inclusive=True)
     n_out = int(read_scalar(inclusive))
 
     if n_out == 0:
@@ -1202,9 +1205,9 @@ def flatnonzero(values: wp.array[wp.bool] | wp.array[wp.Scalar]) -> wp.array[wp.
 
     out_indices = wp.empty(n_out, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_scatter.scatter_index_where,
+        kernel_scatter.scatter_index_where_scanned,
         dim=n,
-        inputs=[flags, inclusive, out_indices],
+        inputs=[inclusive, out_indices],
         device=device,
     )
     return out_indices
@@ -1266,8 +1269,10 @@ def astype(values: twt.ArrayNd, dtype: type) -> twt.ArrayNd:
     Element-wise dtype conversion, shape and rank preserved (``numpy.ndarray.astype``).
 
     The Python-scope counterpart of ``wp.cast``, which exists only inside a kernel. Allocates a
-    buffer of ``values``' shape on ``values``' device and fills it with
-    ``warp.utils.array_cast`` -- the pair this replaces at twenty-odd call sites.
+    buffer of ``values``' shape on ``values``' device and fills it with the conversion
+    ``warp.utils.array_cast`` performs -- the pair this replaces at twenty-odd call sites -- through
+    a concrete kernel for the conversions the package reaches most, and through
+    ``warp.utils.array_cast`` itself for any other.
 
     Parameters
     ----------
@@ -1304,12 +1309,19 @@ def astype(values: twt.ArrayNd, dtype: type) -> twt.ArrayNd:
         Reinterpret the *bits* rather than convert the value.
     """
     out = wp.empty(values.shape, dtype=dtype, device=values.device)
-    if int(values.ndim) == 1:
-        wp.utils.array_cast(values, out)
-    else:
+    source, target = values, out
+    if int(values.ndim) != 1:
         if not values.is_contiguous:
             raise ValueError("astype requires a contiguous array for rank-2 input")
-        wp.utils.array_cast(values.flatten(), out.flatten())
+        source, target = values.flatten(), out.flatten()
+    # The common conversions launch a concrete kernel; see ``kernels/array.ASTYPE`` for the census
+    # behind the table and why any other pair is left to ``wp.utils.array_cast``.
+    kernel = kernel_array.ASTYPE.get((values.dtype, dtype))
+    n = int(source.shape[0])
+    if kernel is None:
+        wp.utils.array_cast(source, target)
+    elif n > 0:
+        wp.launch(kernel, dim=n, inputs=[source, target], device=values.device)
     return out
 
 
@@ -1441,12 +1453,16 @@ def mask_to_compact_ranks(
     n = int(mask.shape[0])
     if n == 0:
         return wp.zeros(0, dtype=wp.int32, device=device), 0
-    flags = wp.empty(n, dtype=wp.int32, device=device)
+    # The flags are written straight into the tail of the ``n + 1`` offsets buffer and scanned
+    # there in place, so the separate flag buffer ``counts_to_offsets`` would take them from is
+    # never allocated.
+    buffer = wp.zeros(n + 1, dtype=wp.int32, device=device)
+    flags = twt.as_dense(buffer[1:])
     if invert:
         wp.map(kernel_array.complement_flag, mask, out=flags)
     else:
         wp.launch(kernel_array.bool_flags, dim=n, inputs=[mask, flags], device=device)
-    return counts_to_offsets(flags)
+    return _offsets_from_scan(buffer, flags, flags, include_total=False)
 
 
 def counts_to_offsets(
@@ -1508,7 +1524,27 @@ def counts_to_offsets(
     # The leading zero from ``wp.zeros`` is the first exclusive offset; the inclusive scan fills the
     # rest, so ``buffer[n]`` is the total and ``buffer[:n]`` the exclusive offsets.
     buffer = wp.zeros(n + 1, dtype=wp.int32, device=device)
-    wp.utils.array_scan(counts, out_array=buffer[1:], inclusive=True)
+    return _offsets_from_scan(buffer, counts, buffer[1:], include_total=include_total)
+
+
+def _offsets_from_scan(
+    buffer: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+    tail: wp.array[wp.int32],
+    *,
+    include_total: bool,
+) -> tuple[wp.array[wp.int32], int]:
+    """
+    Scan ``counts`` inclusively into ``tail`` (``buffer[1:]``) and read the total off the end.
+
+    The shared tail of [`counts_to_offsets`][triwarp.array.counts_to_offsets] and
+    [`mask_to_compact_ranks`][triwarp.array.mask_to_compact_ranks]. ``counts`` may *be* ``tail``:
+    ``wp.utils.array_scan`` scans in place on both devices (see
+    [`flatnonzero`][triwarp.array.flatnonzero]), which is what lets the mask form skip its own flag
+    buffer.
+    """
+    n = int(tail.shape[0])
+    wp.utils.array_scan(counts, out_array=tail, inclusive=True)
     return buffer if include_total else twt.as_dense(buffer[:n]), int(read_scalar(buffer))
 
 

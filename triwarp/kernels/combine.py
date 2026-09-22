@@ -3,6 +3,7 @@
 import warp as wp
 
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels.grouping import sorted_run_start
 
 
 @wp.kernel
@@ -17,3 +18,13 @@ def offset_packed_faces(
     i = wp.int32(wp.tid())
     piece = kernel_array.binary_search_index(piece_starts, i) - 1
     faces[i] = faces[i] + vertex_offsets[piece]
+
+
+@wp.kernel
+def label_run_starts(sorted_labels: wp.array[wp.int32], out_is_start: wp.array[wp.bool]) -> None:
+    # Segment boundaries of a label-sorted array: position 0, plus every label change. One launch
+    # over the whole buffer, where the adjacent-element map it replaces needed two shifted views,
+    # an output view and a separate write for position 0 -- and a guard for the single-element
+    # buffer, which ``sorted_run_start``'s own ``i == 0`` test makes unnecessary.
+    i = wp.int32(wp.tid())
+    out_is_start[i] = sorted_run_start(sorted_labels, i)

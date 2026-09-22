@@ -51,7 +51,7 @@ from triwarp.kernels import reduce as kernel_reduce
 
 # Point count from which [`polyline_downsample`][triwarp.polyline.polyline_downsample] stops
 # walking its greedy selection serially and pointer-doubles it instead -- **on the CUDA device
-# only**. The doubling costs ``2 ceil(log2(n + 1)) + 1`` launches, which pays off once the polyline
+# only**. The doubling costs ``ceil(log2(n + 1)) + 1`` launches, which pays off once the polyline
 # is long enough that a serial walk's linear cost exceeds it; the two masks are verified
 # **byte-identical** at every size.
 #
@@ -88,18 +88,7 @@ def is_closed(polyline: wp.array[wp.vec3]) -> bool:
     n = int(polyline.shape[0])
     if n < 2:
         return False
-    # One launch rather than ``allclose`` over two one-element slices: that spelling is a
-    # ``wp.map`` into a mask plus a whole reduction over it, which costs several times what cloning
-    # the entire polyline does, to compare six floats. See ``kernels/polyline.endpoints_coincide``.
-    flag = wp.empty(1, dtype=wp.int32, device=polyline.device)
-    wp.launch(
-        kernel_polyline.endpoints_coincide,
-        dim=1,
-        inputs=[polyline, wp.float32(ALLCLOSE_RTOL), wp.float32(ALLCLOSE_ATOL)],
-        outputs=[flag],
-        device=polyline.device,
-    )
-    return bool(int(read_scalar(flag, 0)) != 0)
+    return bool(int(read_scalar(_endpoints_coincide_flag(polyline), 0)) != 0)
 
 
 def polyline_open(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
@@ -278,20 +267,24 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
     ValueError
         If the polyline has fewer than three points.
     """
-    polyline = polyline_close(polyline)
     device = polyline.device
     n = int(polyline.shape[0])
-    # The closed polyline's last vertex duplicates its first, so it has n - 1 distinct vertices;
-    # a non-degenerate loop normal needs at least three of them.
-    if n < 4:
+    # A non-degenerate loop normal needs three distinct vertices, and a polyline whose last vertex
+    # duplicates its first has only ``n - 1`` of them.
+    if n < 3:
+        raise ValueError("polyline_normal requires at least three points")
+    # Whether the loop is already closed is decided on the device: the kernel reads the flag and
+    # sums over the closing edge by wrapping its index, so nothing is copied to close the loop and
+    # nothing is read back to decide whether to. Only a three-point input needs the answer on the
+    # host, to tell a triangle from a closed two-point loop.
+    is_loop = _endpoints_coincide_flag(polyline)
+    if n == 3 and int(read_scalar(is_loop, 0)) != 0:
         raise ValueError("polyline_normal requires at least three points")
     out_normal = wp.zeros(1, dtype=wp.vec3, device=device)
-    # The polyline is closed (last vertex duplicates the first), so summing cross(V_i, V_{i + 1})
-    # over the n - 1 consecutive pairs includes the wrap-around edge — full Newell's method.
     wp.launch_tiled(
         kernel_polyline.accumulate_newell_normal,
-        dim=kernel_reduce.blocks_1d(n - 1),
-        inputs=[polyline, out_normal],
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[polyline, is_loop, out_normal],
         block_dim=TILE_1D,
         device=device,
     )
@@ -599,23 +592,20 @@ def _greedy_downsample_doubling(
     device = cumulative.device
     n = int(cumulative.shape[0])
     successor = wp.empty(n, dtype=wp.int32, device=device)
+    # Also marks the first point kept, which the walk always does; the caller zeroed the rest.
     wp.launch(
         kernel_polyline.greedy_successors,
         dim=n,
-        inputs=[cumulative, wp.float32(step_size), successor],
+        inputs=[cumulative, wp.float32(step_size), successor, out_keep],
         device=device,
     )
-    out_keep[:1].fill_(True)  # the walk always keeps the first point; the caller zeroed the rest
     squared = wp.empty(n, dtype=wp.int32, device=device)
     for _ in range(max(1, math.ceil(math.log2(n + 1)))):
         wp.launch(
-            kernel_polyline.spread_reached,
+            kernel_polyline.double_greedy_orbit,
             dim=n,
-            inputs=[successor, out_keep, out_keep],
+            inputs=[successor, out_keep, squared, out_keep],
             device=device,
-        )
-        wp.launch(
-            kernel_polyline.square_successors, dim=n, inputs=[successor, squared], device=device
         )
         successor, squared = squared, successor
 
@@ -934,32 +924,44 @@ def polyline_angles(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.
     [`is_closed`][triwarp.polyline.is_closed]
         What decides the wrap-around when ``closed`` is left ``False``.
     """
-    if closed:
-        # One angle per *original* point: closing appends a duplicate of the first, whose angle is
-        # the first's, so the tail is dropped rather than returned twice.
-        n_original = int(polyline.shape[0])
-        return twt.as_dense(polyline_angles(polyline_close(polyline))[0:n_original])
     device = polyline.device
     n = int(polyline.shape[0])
     if n < 2:
         return wp.zeros(n, dtype=wp.float32, device=device)
 
-    n_segments = n - 1
-    raw = wp.empty(n_segments, dtype=wp.float32, device=device)
+    # One launch writes every angle in its final slot, reading the closure flag on the device: no
+    # readback decides the wrap-around, and ``closed=True`` reaches the closing segment by wrapping
+    # the index rather than through a ``polyline_close`` copy. See
+    # ``kernels/polyline.vertex_turning_angles``.
+    angles = wp.empty(n, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_polyline.cyclic_segment_angles, dim=n_segments, inputs=[polyline, raw], device=device
+        kernel_polyline.vertex_turning_angles,
+        dim=n,
+        inputs=[polyline, wp.int32(1 if closed else 0), _endpoints_coincide_flag(polyline)],
+        outputs=[angles],
+        device=device,
     )
-    if is_closed(polyline):
-        # ``cyclic_segment_angles`` writes ``raw[i]`` as the angle between segment ``i`` and its
-        # cyclic successor, which is the turning angle at vertex ``i + 1`` (mod ``n_segments``),
-        # not at vertex ``i``. So ``raw`` is the answer rotated one slot ahead of the vertex it
-        # belongs to; roll it back by one (last element first) to index it by vertex instead of by
-        # segment, then repeat the first (rolled) entry for the duplicated closing point. The open
-        # branch below already applies the equivalent shift by prepending a zero.
-        last = raw[n_segments - 1 : n_segments]
-        return tw.array.concatenate([last, raw[0 : n_segments - 1], last])
-    zero = wp.zeros(1, dtype=wp.float32, device=device)
-    return tw.array.concatenate([zero, raw[0 : n_segments - 1], zero])
+    return angles
+
+
+def _endpoints_coincide_flag(polyline: wp.array[wp.vec3]) -> wp.array[wp.int32]:
+    """
+    One-element device flag, ``1`` when the first and last points coincide.
+
+    Shared by [`is_closed`][triwarp.polyline.is_closed], which reads it back, and by the kernels
+    that take the closure decision on the device instead, so none of them pays the readback. One
+    launch rather than ``allclose`` over two one-element slices: that spelling is a ``wp.map`` into
+    a mask plus a whole reduction over it, to compare six floats. Needs at least two points.
+    """
+    flag = wp.empty(1, dtype=wp.int32, device=polyline.device)
+    wp.launch(
+        kernel_polyline.endpoints_coincide,
+        dim=1,
+        inputs=[polyline, wp.float32(ALLCLOSE_RTOL), wp.float32(ALLCLOSE_ATOL)],
+        outputs=[flag],
+        device=polyline.device,
+    )
+    return flag
 
 
 def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
@@ -1031,12 +1033,12 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     if n < 3:
         return twt.empty_2d((0, 3), wp.int32, device=device)
 
-    # The plane frame is built and consumed entirely on device: one accumulation pass, one
-    # single-thread finalize, one projection. The three host-scope reductions this replaces
-    # (``polyline_normal``, its internal ``polyline_close`` closure test, and
-    # ``polyline_centroid``) each ended in a readback because the next one consumed its result,
-    # and that prologue was flat in ``n`` -- the whole of this function's fixed cost at small
-    # loops. ``frame`` is ``[center, u, v]``.
+    # The plane frame is built and consumed entirely on device: one accumulation pass, then a
+    # projection whose threads each derive the frame from the accumulated sums. The three
+    # host-scope reductions this replaces (``polyline_normal``, its internal ``polyline_close``
+    # closure test, and ``polyline_centroid``) each ended in a readback because the next one
+    # consumed its result, and that prologue was flat in ``n`` -- the whole of this function's
+    # fixed cost at small loops.
     normal = wp.zeros(1, dtype=wp.vec3, device=device)
     weighted_midpoint = wp.zeros(1, dtype=wp.vec3, device=device)
     total_length = wp.zeros(1, dtype=wp.float32, device=device)
@@ -1047,39 +1049,34 @@ def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
         block_dim=TILE_1D,
         device=device,
     )
-    frame = wp.empty(3, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_polyline.finalize_loop_frame,
-        dim=1,
-        inputs=[normal, weighted_midpoint, total_length, frame],
-        device=device,
-    )
     points2d = wp.empty(n, dtype=wp.vec2, device=device)
     wp.launch(
         kernel_polyline.project_polyline_to_plane,
         dim=n,
-        inputs=[polyline, frame, points2d],
+        inputs=[polyline, normal, weighted_midpoint, total_length, points2d],
         device=device,
     )
 
-    # Orientation is fixed up on device (``orient_ccw`` reads the accumulated angle itself), so the
-    # reflex count below is the only readback before the convex fast path returns.
-    total = wp.zeros(1, dtype=wp.float32, device=device)
+    # ``[turning angle, reflex count, reflex count once mirrored]``, from one pass. Orientation is
+    # fixed up on device (``orient_ccw`` reads the accumulated angle itself), and the reflex count
+    # of the oriented loop is whichever of the two it leaves behind, so this one read is the only
+    # readback before the convex fast path returns.
+    turns = wp.zeros(3, dtype=wp.float32, device=device)
     wp.launch_tiled(
         kernel_polyline.accumulate_turning_angle,
         dim=kernel_reduce.blocks_1d(n),
-        inputs=[points2d, total],
+        inputs=[points2d, turns],
         block_dim=TILE_1D,
         device=device,
     )
-    wp.launch(kernel_polyline.orient_ccw, dim=n, inputs=[points2d, total], device=device)
+    wp.launch(kernel_polyline.orient_ccw, dim=n, inputs=[points2d, turns], device=device)
 
     out_faces = twt.empty_2d((n - 2, 3), wp.int32, device=device)
     out_count = wp.zeros(1, dtype=wp.int32, device=device)
 
-    reflex = wp.zeros(1, dtype=wp.int32, device=device)
-    wp.launch(kernel_polyline.count_reflex, dim=n, inputs=[points2d, reflex], device=device)
-    if int(read_scalar(reflex, 0)) == 0:
+    turning, reflex, reflex_mirrored = turns.numpy()
+    # The comparison ``orient_ccw`` makes, on the value it read.
+    if (reflex if turning >= 0.0 else reflex_mirrored) == 0.0:
         wp.launch(kernel_polyline.fan_triangulate, dim=n - 2, inputs=[out_faces], device=device)
         return twt.as_array2d(out_faces, wp.int32)
 

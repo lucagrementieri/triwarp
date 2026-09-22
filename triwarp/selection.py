@@ -12,6 +12,7 @@ from triwarp._device import require_same_device
 from triwarp.halfedge import halfedge_twins, require_matching_twins
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
+from triwarp.kernels import halfedge as kernel_halfedge
 from triwarp.kernels import selection as kernel_selection
 
 
@@ -96,13 +97,17 @@ def region_boundary_edges(
     if not oriented:
         return twt.as_array2d(tw.array.gather(unique_edges, ids), wp.int32)
 
-    oriented_edges = twt.empty_2d((int(ids.shape[0]), 2), wp.int32, device=device)
-    wp.launch(
-        kernel_selection.oriented_edges_from_halfedges,
-        dim=int(ids.shape[0]),
-        inputs=[faces, tw.array.gather(region_halfedge, ids), oriented_edges],
-        device=device,
-    )
+    n_ids = int(ids.shape[0])
+    oriented_edges = twt.empty_2d((n_ids, 2), wp.int32, device=device)
+    if n_ids > 0:
+        # Each selected edge's region halfedge read through ``ids`` in the kernel, rather than
+        # gathered into a buffer of its own first.
+        wp.launch(
+            kernel_halfedge.halfedge_vertex_pairs,
+            dim=n_ids,
+            inputs=[faces, region_halfedge, True, ids, oriented_edges],
+            device=device,
+        )
     return twt.as_array2d(oriented_edges, wp.int32)
 
 
@@ -185,10 +190,9 @@ def faces_left_of_contour(
     twt.ensure_edge_pairs(contour_edges, "contour_edges")
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
-    left = wp.zeros(n_faces, dtype=wp.bool, device=device)
     n_contour = int(contour_edges.shape[0])
     if n_faces == 0 or n_contour == 0:
-        return left
+        return wp.zeros(n_faces, dtype=wp.bool, device=device)
     if n_vertices is None:
         n_vertices = tw.array.index_bound(faces)
     if twins is None:
@@ -229,7 +233,9 @@ def faces_left_of_contour(
         inputs=[labels, seeds, label_seeded],
         device=device,
     )
-    # A label names a representative face, so the per-face answer is a gather of the per-label flag.
+    # A label names a representative face, so the per-face answer is a gather of the per-label flag,
+    # and it writes every entry.
+    left = wp.empty(n_faces, dtype=wp.bool, device=device)
     wp.copy(left, label_seeded[labels])
     return left
 
@@ -515,43 +521,29 @@ def submeshes_from_face_groups(
 
     unique_keys, inverse = tw.grouping.unique_1d(keys, return_inverse=True)
     n_slots = int(unique_keys.shape[0])
+    # One decode per unique slot answers everything its key is needed for: the slot's group, the
+    # group's vertex count (a histogram, so an empty group still gets a zero-length entry and no
+    # host synchronisation is needed to size it), and the source position it names.
     slot_groups = wp.empty(n_slots, dtype=wp.int32, device=device)
-    vertex_ids = wp.empty(n_slots, dtype=wp.int32, device=device)
-    wp.map(
-        kernel_selection.group_and_vertex_of_key,
-        unique_keys,
-        wp.int64(radix),
-        out=[slot_groups, vertex_ids],
-    )
-
-    # Group starts from a histogram plus an exclusive scan rather than ``flatnonzero`` on the run
-    # starts: no host synchronisation, and an empty group still gets a (zero-length) entry.
-    # Fusing the map above into the count below is declined: the count reads the map's output at
-    # its own slot, so it would fuse, but it is one launch on a path that already runs a sort and
-    # a scan, and both buffers the map writes are read again further down.
     group_counts = wp.zeros(k, dtype=wp.int32, device=device)
+    vertices_all = wp.empty(n_slots, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_selection.count_group_slots,
+        kernel_selection.decode_group_vertex_keys,
         dim=n_slots,
-        inputs=[slot_groups, group_counts],
+        inputs=[unique_keys, wp.int64(radix), vertices, slot_groups, group_counts, vertices_all],
         device=device,
     )
     vertex_offsets = wp.empty(k, dtype=wp.int32, device=device)
     wp.utils.array_scan(group_counts, out_array=vertex_offsets, inclusive=False)
 
-    local_of_slot = wp.empty(n_slots, dtype=wp.int32, device=device)
+    faces_all = wp.empty(n_corners, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_selection.local_vertex_index,
-        dim=n_slots,
-        inputs=[slot_groups, vertex_offsets, local_of_slot],
+        kernel_selection.local_corner_indices,
+        dim=n_corners,
+        inputs=[inverse, slot_groups, vertex_offsets, faces_all],
         device=device,
     )
-
-    return (
-        tw.array.gather(vertices, vertex_ids),
-        vertex_offsets,
-        tw.array.gather(local_of_slot, inverse),
-    )
+    return vertices_all, vertex_offsets, faces_all
 
 
 @overload
@@ -743,7 +735,7 @@ def delete_region_keep_boundary(
     # ``pack_edge_key`` rebuilds for each rim edge.
     boundary_keys = tw.array.sort_and_argsort(boundary_keys)[0]
 
-    is_input_rim = wp.empty(n_loops, dtype=wp.bool, device=device)
+    starts_and_rims = twt.empty_2d((2, n_loops), wp.int32, device=device)
     wp.launch(
         kernel_selection.loops_are_input_rims,
         dim=n_loops,
@@ -754,14 +746,19 @@ def delete_region_keep_boundary(
             vertex_index,
             boundary_keys,
             base,
-            is_input_rim,
+            starts_and_rims,
         ],
         device=device,
     )
-    # One readback, of one flag per loop, where the host form read every loop back separately.
-    keep_loop = is_input_rim.numpy()
-    loops = tw.array.split(flat_loops, loop_offsets)
-    kept = [loop for loop, rim in zip(loops, keep_loop, strict=True) if not rim]
+    # One readback, of each loop's start and verdict, which is all it takes to cut the surviving
+    # loops out of the packed buffer as views.
+    starts_np, rims_np = starts_and_rims.numpy()
+    stops_np = [*starts_np[1:].tolist(), int(flat_loops.shape[0])]
+    kept = [
+        twt.as_dense(flat_loops[int(start) : stop])
+        for start, stop, rim in zip(starts_np, stops_np, rims_np, strict=True)
+        if not rim
+    ]
     return kept_vertices, kept_faces, kept
 
 
@@ -946,31 +943,14 @@ def expand_vertex_mask(
     Notes
     -----
     Dilation is vertex-based: a vertex enters the mask when any 1-ring neighbour is in it.
-
-    The per-round ``wp.clone`` is not worth removing. The kernel only *sets* bits, so each round
-    must start from a copy of the previous mask; ping-ponging two preallocated buffers would keep
-    the copy and drop only the allocation, which is a small fraction of the round's cost.
     """
     require_same_device(faces=faces, mask=mask, unique_edges=unique_edges)
-    device = mask.device
     n = int(mask.shape[0])
     if hops <= 0 or n == 0:
         return wp.clone(mask)
     if unique_edges is None:
         unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
-    m = int(unique_edges.shape[0])
-    current = mask
-    for _ in range(hops):
-        nxt = wp.clone(current)
-        if m > 0:
-            wp.launch(
-                kernel_selection.dilate_vertex_mask,
-                dim=m,
-                inputs=[unique_edges, current, nxt],
-                device=device,
-            )
-        current = nxt
-    return current
+    return _dilate_vertex_mask(unique_edges, mask, hops, owned=False)
 
 
 def shrink_vertex_mask(
@@ -1024,10 +1004,45 @@ def shrink_vertex_mask(
         unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
     complement = wp.empty(n, dtype=wp.bool, device=device)
     wp.map(kernel_array.mask_not, mask, out=complement)
-    dilated = expand_vertex_mask(faces, complement, hops, unique_edges)
-    out = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_array.mask_not, dilated, out=out)
-    return out
+    # Both the complement and the dilation are this function's own buffers, so the dilation may
+    # recycle the first and the result is complemented in place.
+    dilated = _dilate_vertex_mask(unique_edges, complement, hops, owned=True)
+    wp.map(kernel_array.mask_not, dilated, out=dilated)
+    return dilated
+
+
+def _dilate_vertex_mask(
+    unique_edges: twt.Array2dInt32, mask: wp.array[wp.bool], hops: int, *, owned: bool
+) -> wp.array[wp.bool]:
+    """
+    Dilate ``mask`` by ``hops`` edge rounds into a buffer the caller did not pass in.
+
+    A round reads one mask and writes a copy of it, so two buffers alternate: every round after
+    the second refills the buffer the round before last read, rather than allocating a fresh one.
+    ``owned`` says the caller's ``mask`` is scratch this may overwrite, which makes it the first
+    spare. ``hops`` must be positive.
+    """
+    device = mask.device
+    m = int(unique_edges.shape[0])
+    current = mask
+    spare = None
+    for _ in range(hops):
+        if spare is None:
+            nxt = wp.clone(current)
+        else:
+            wp.copy(spare, current)
+            nxt = spare
+        if m > 0:
+            wp.launch(
+                kernel_selection.dilate_vertex_mask,
+                dim=m,
+                inputs=[unique_edges, current, nxt],
+                device=device,
+            )
+        spare = current if owned else None
+        owned = True
+        current = nxt
+    return current
 
 
 def face_indices_from_vertex_indices(

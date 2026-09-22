@@ -91,7 +91,8 @@ class _PackedLoops:
     ``flat_loops[starts[ell] : starts[ell] + sizes[ell]]``. ``loop_id`` inverts that mapping so a
     ``dim=total`` kernel can find its own loop without a search, and ``dp_offsets`` is the exclusive
     scan of ``sizes ** 2`` — where each loop's ``B x B`` dynamic-programming block begins in the
-    ragged tables. The four device arrays are uploaded once and shared by every stage of the fill.
+    ragged tables, and ``triangle_offsets`` where its fill triangles begin. The device tables are
+    uploaded once and shared by every stage of the fill.
     """
 
     def __init__(self, flat_loops: wp.array[wp.int32], sizes_np: np.ndarray) -> None:
@@ -109,16 +110,27 @@ class _PackedLoops:
         self.max_size = int(self.sizes_np.max())
         self.dp_total = int((self.sizes_np * self.sizes_np).sum())
 
-        self.starts = wp.array(self.starts_np.astype(np.int32), dtype=wp.int32, device=device)
-        self.sizes = wp.array(self.sizes_np.astype(np.int32), dtype=wp.int32, device=device)
-        self.dp_offsets = wp.array(
-            self.dp_offsets_np.astype(np.int32), dtype=wp.int32, device=device
-        )
-        self.loop_id = wp.array(
-            np.repeat(np.arange(self.n_loops, dtype=np.int32), self.sizes_np),
-            dtype=wp.int32,
-            device=device,
-        )
+        triangle_sizes_np = np.maximum(self.sizes_np - 2, 0)
+        triangle_offsets_np = np.concatenate([[0], np.cumsum(triangle_sizes_np)[:-1]])
+
+        # One upload for all five tables, each a view into it: the per-call cost of a
+        # ``wp.array`` construction is several times a slice's, and none of these is written.
+        tables_np = np.concatenate(
+            [
+                self.starts_np,
+                self.sizes_np,
+                self.dp_offsets_np,
+                triangle_offsets_np,
+                np.repeat(np.arange(self.n_loops, dtype=np.int64), self.sizes_np),
+            ]
+        ).astype(np.int32)
+        tables = wp.array(tables_np, dtype=wp.int32, device=device)
+        n = self.n_loops
+        self.starts = _table_view(tables, 0, n)
+        self.sizes = _table_view(tables, n, 2 * n)
+        self.dp_offsets = _table_view(tables, 2 * n, 3 * n)
+        self.triangle_offsets = _table_view(tables, 3 * n, 4 * n)
+        self.loop_id = _table_view(tables, 4 * n, 4 * n + self.total)
 
     def perimeters(self, vertices: wp.array[wp.vec3]) -> np.ndarray:
         """
@@ -135,10 +147,17 @@ class _PackedLoops:
             vertices, self.flat_loops, self.starts, self.sizes, loop_id=self.loop_id, validate=False
         ).numpy()
 
-    def loop_slice(self, index: int) -> slice:
-        """Host slice of ``flat_loops`` (and of any other length-``total`` buffer) for a loop."""
-        start = int(self.starts_np[index])
-        return slice(start, start + int(self.sizes_np[index]))
+
+def _table_view(tables: wp.array[wp.int32], start: int, stop: int) -> wp.array[wp.int32]:
+    """
+    Dense view of ``tables[start:stop]``, or an empty buffer when the range is empty.
+
+    Warp raises on a zero-length slice at the end of a buffer, which is where an empty ``loop_id``
+    lands when every packed loop is empty.
+    """
+    if stop > start:
+        return twt.as_dense(tables[start:stop])
+    return wp.empty(0, dtype=wp.int32, device=tables.device)
 
 
 def fill_fan(
@@ -612,7 +631,7 @@ def _fill_packed_loops(
     min_area_id = _METRIC_IDS["min_area"]
 
     loop_pos = tw.array.gather(vertices, loops.flat_loops)
-    plane_normals = wp.zeros(loops.n_loops, dtype=wp.vec3, device=device)
+    newell_sums = wp.zeros(loops.n_loops, dtype=wp.vec3, device=device)
     max_edge_sq = wp.zeros(loops.n_loops, dtype=wp.float32, device=device)
     wp.launch(
         kernel_holes.loop_rim_metrics,
@@ -624,13 +643,18 @@ def _fill_packed_loops(
             loops.sizes,
             vertices,
             max_edge_sq,
-            plane_normals,
+            newell_sums,
         ],
         device=device,
     )
-    wp.map(wp.normalize, plane_normals, out=plane_normals)
+    plane_normals = wp.empty(loops.n_loops, dtype=wp.vec3, device=device)
     char_areas = wp.empty(loops.n_loops, dtype=wp.float32, device=device)
-    wp.map(kernel_holes.char_area_from_max, max_edge_sq, out=char_areas)
+    wp.launch(
+        kernel_holes.finalize_rim_metrics,
+        dim=loops.n_loops,
+        inputs=[max_edge_sq, newell_sums, plane_normals, char_areas],
+        device=device,
+    )
 
     forbidden = (
         edge_table.forbidden_chords(loops)
@@ -663,19 +687,20 @@ def _fill_packed_loops(
         # as the re-run's active mask, so the fallback is one more batched pass rather than a branch
         # per loop. Loops the primary metric handled keep their ``prev`` rows.
         retry = twt.empty_1d(loops.n_loops, wp.int32, device=device)
+        any_retry = wp.zeros(1, dtype=wp.int32, device=device)
         wp.launch(
             kernel_holes.flag_bad_triangulations,
             dim=loops.n_loops,
-            inputs=[loops.sizes, loops.dp_offsets, dp, retry],
+            inputs=[loops.sizes, loops.dp_offsets, dp, retry, any_retry],
             device=device,
         )
         # ...but *whether* any loop failed is worth one host read, because a pass with an all-zero
         # mask is still a full ``max(B) - 1`` launch sweep in which every thread returns
         # immediately -- that is pure marshalling and buys nothing on its own. ``prev`` is read
         # back a few lines below regardless, so this adds no synchronisation point that was not
-        # there. The test itself is a device reduction rather than a full readback of the
-        # ``n_loops`` buffer, so it stays cheap even on a mesh with many loops.
-        if tw.reduce.max(retry) > 0:
+        # there. The flag kernel raises the test itself as it writes the mask, so it is one
+        # 4-byte read rather than a readback of the ``n_loops`` buffer or a reduction over it.
+        if read_scalar(any_retry, 0) > 0:
             _run_hole_dp(
                 loops,
                 loop_pos,
@@ -718,11 +743,7 @@ def _traceback_fill_faces(
     n_padded = int(triangle_sizes_np.sum())
     if n_padded == 0:
         return None
-    triangle_offsets = wp.array(
-        np.concatenate([[0], np.cumsum(triangle_sizes_np)[:-1]]).astype(np.int32),
-        dtype=wp.int32,
-        device=device,
-    )
+    triangle_offsets = loops.triangle_offsets
     counts = twt.empty_1d(loops.n_loops, wp.int32, device=device)
     padded = wp.empty(3 * n_padded, dtype=wp.int32, device=device)
     # The walk's pending intervals: one slot per packed rim vertex, which is exactly enough
@@ -1010,16 +1031,8 @@ def fill_small(
     if not small_np.any():
         return wp.clone(faces)
     if not small_np.all():
-        kept = zip(_unpack_loops(packed), small_np, strict=True)
-        packed = _pack_loops([loop for loop, keep in kept if keep])
+        packed = _compact_packed_loops(packed.flat_loops, packed.sizes_np, small_np)
     return _fill_packed_loops(vertices, faces, packed, "plane_normalized", True, True)
-
-
-def _unpack_loops(loops: _PackedLoops) -> list[wp.array[wp.int32]]:
-    """Per-loop **views** into the packed buffer, for the callers that still want a list."""
-    return [
-        twt.as_dense(loops.flat_loops[loops.loop_slice(index)]) for index in range(loops.n_loops)
-    ]
 
 
 @overload
@@ -2227,25 +2240,27 @@ def stitch_loops(
         device=device,
     )
 
-    shift = wp.empty(2, dtype=wp.int32, device=device)
+    # ``[edge_0 .. edge_{n-1}, shift_a, shift_b]`` in one buffer: the edge map reads the two
+    # shifts on the device, so the host reads the whole answer back once rather than the shifts
+    # first and the edge map after.
+    edge_and_shift = wp.empty(n + 2, dtype=wp.int32, device=device)
+    shift = edge_and_shift[n:]
     wp.launch(
         kernel_holes.global_argmin,
         dim=1,
         inputs=[col_min, val_min, wp.int32(n), shift],
         device=device,
     )
-    shift_np = shift.numpy()
-    shift_a = int(shift_np[0])
-    shift_b = int(shift_np[1])
-
-    edge_dev = wp.empty(n, dtype=wp.int32, device=device)
     wp.launch(
         kernel_holes.rolled_edge_map,
         dim=n,
-        inputs=[col_min, wp.int32(shift_a), wp.int32(shift_b), wp.int32(n), wp.int32(m), edge_dev],
+        inputs=[col_min, shift, wp.int32(n), wp.int32(m), edge_and_shift[:n]],
         device=device,
     )
-    edge = edge_dev.numpy()
+    edge_and_shift_np = edge_and_shift.numpy()
+    edge = edge_and_shift_np[:n]
+    shift_a = int(edge_and_shift_np[n])
+    shift_b = int(edge_and_shift_np[n + 1])
 
     row_roll = shift_a
     col_roll = shift_b
@@ -3125,10 +3140,11 @@ def _closest_cross_component_edges(
     boundary-vertex list, and that is what makes the answer an *edge* pair with no search: row ``i``
     of that table is already a boundary edge wound the way its face winds it, i.e. exactly what
     [`bridge_edges`][triwarp.holes.bridge_edges] takes, so the winning slots name their own edges.
-    The column is materialized with ``wp.clone`` because a column view is strided and Warp's
-    Python-scope gather silently ignores an index array's stride.
+    The kernels read that column in place rather than through a Python-scope gather, which would
+    need it cloned dense first because a column view is strided and the gather silently ignores an
+    index array's stride.
 
-    Only three scalars come back: the packed winner key and the two rows it names. The boundary
+    One small buffer comes back: whether a pair was found, and the two rows it names. The boundary
     table itself never leaves the device, and is handed back alongside the pair so the caller can
     give it to [`bridge_edges`][triwarp.holes.bridge_edges] rather than have it rebuilt to check a
     pair that came out of it.
@@ -3148,33 +3164,34 @@ def _closest_cross_component_edges(
         inputs=[faces, face_labels, vertex_labels],
         device=device,
     )
-    members = wp.clone(twt.as_array2d(boundary, wp.int32)[:, 0])
-    labels = tw.array.gather(vertex_labels, members)
+    labels = wp.empty(n_boundary, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_holes.edge_tail_labels,
+        dim=n_boundary,
+        inputs=[boundary, vertex_labels, labels],
+        device=device,
+    )
 
-    best = wp.array([wp.int64(_NEAREST_KEY_SEED)], dtype=wp.int64, device=device)
+    best = wp.full(1, _NEAREST_KEY_SEED, dtype=wp.int64, device=device)
     partner = wp.empty(n_boundary, dtype=wp.int32, device=device)
     wp.launch(
         kernel_holes.reduce_closest_cross_label_pair,
         dim=n_boundary,
-        inputs=[vertices, members, labels, max_distance_sq, best, partner],
+        inputs=[vertices, boundary, labels, max_distance_sq, best, partner],
         device=device,
     )
-    key = int(read_scalar(best, 0))
-    if key == _NEAREST_KEY_SEED:
-        return None
-
-    # The packed key's low half is the winning slot; its partner is what that thread found.
-    slot_a = key & 0xFFFFFFFF
-    slot_b = int(read_scalar(partner, slot_a))
-    rows_np = tw.array.gather(
-        boundary,
-        wp.array(np.array([slot_a, slot_b], dtype=np.int32), dtype=wp.int32, device=device),
-    ).numpy()
-    return (
-        (int(rows_np[0, 0]), int(rows_np[0, 1])),
-        (int(rows_np[1, 0]), int(rows_np[1, 1])),
-        boundary,
+    # The winner decoded on the device into ``[found, a0, a1, b0, b1]``: one readback.
+    rows = wp.empty(5, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_holes.closest_pair_rows,
+        dim=1,
+        inputs=[best, partner, boundary, wp.int64(_NEAREST_KEY_SEED), rows],
+        device=device,
     )
+    found, a0, a1, b0, b1 = (int(value) for value in rows.numpy())
+    if not found:
+        return None
+    return ((a0, a1), (b0, b1), boundary)
 
 
 def _check_bridge_edges(
@@ -3358,17 +3375,20 @@ def _hole_loops(
         return None
     if keep_np.all():
         return _PackedLoops(flat_loops, sizes_np)
+    return _compact_packed_loops(flat_loops, sizes_np, keep_np)
 
-    # Compaction is one gather over the dropped loops' slots, not one copy per surviving loop. The
-    # starts are scanned here rather than beside the sizes above because this is the only branch
-    # that reads them, and a mesh whose rims are all fillable is the common one.
-    starts_np = np.concatenate([[0], np.cumsum(sizes_np)[:-1]])
-    keep_index_np = np.concatenate(
-        [
-            np.arange(start, start + size)
-            for start, size in zip(starts_np[keep_np], sizes_np[keep_np], strict=True)
-        ]
-    )
+
+def _compact_packed_loops(
+    flat_loops: wp.array[wp.int32], sizes_np: np.ndarray, keep_np: np.ndarray
+) -> _PackedLoops:
+    """
+    Repack only the loops ``keep_np`` selects, as one gather over their slots.
+
+    Not one copy per surviving loop, and not a split into per-loop views followed by a re-pack of
+    them: both of those cost a host call per loop, where this is one upload and one gather whatever
+    the loop count.
+    """
+    keep_index_np = np.flatnonzero(np.repeat(keep_np, sizes_np))
     keep_index_wp = wp.array(
         keep_index_np.astype(np.int32), dtype=wp.int32, device=flat_loops.device
     )

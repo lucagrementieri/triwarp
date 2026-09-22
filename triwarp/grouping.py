@@ -64,27 +64,25 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     indices_buffer = sort_pair_indices(n, -1, device)
     wp.utils.radix_sort_pairs(values_buffer, indices_buffer, count=n)
 
-    # Scan + scatter compaction: mark run starts, compact them with flatnonzero, then emit one
-    # right-sized row per group (deterministic ascending-value order, no atomic counter and no
-    # (n, length) over-allocation).
-    is_start = wp.empty(n, dtype=wp.bool, device=device)
+    # Scan compaction: flag run starts, scan the flags, then emit one right-sized row per group
+    # (deterministic ascending-value order, no atomic counter and no (n, length) over-allocation).
+    # The emit reads each flag back as a step in the scan, so it compacts and writes in one launch.
+    flags = wp.empty(n, dtype=wp.int32, device=device)
     wp.launch(
         kernel_grouping.MARK_GROUP_STARTS[values_buffer.dtype],
         dim=n,
-        inputs=[values_buffer, wp.int32(n), wp.int32(length), is_start],
+        inputs=[values_buffer, wp.int32(n), wp.int32(length), flags],
         device=device,
     )
-    starts = tw.array.flatnonzero(is_start)
-    n_groups = int(starts.shape[0])
-    if n_groups == 0:
-        return twt.as_array2d(twt.empty_2d((0, length), wp.int32, device=device), wp.int32)
+    offsets, n_groups = tw.array.counts_to_offsets(flags, include_total=True)
     groups = twt.empty_2d((n_groups, length), wp.int32, device=device)
-    wp.launch(
-        kernel_grouping.emit_groups,
-        dim=n_groups,
-        inputs=[starts, indices_buffer, groups],
-        device=device,
-    )
+    if n_groups > 0:
+        wp.launch(
+            kernel_grouping.emit_groups,
+            dim=n,
+            inputs=[offsets, indices_buffer, groups],
+            device=device,
+        )
     return twt.as_array2d(groups, wp.int32)
 
 
@@ -213,9 +211,17 @@ def unique_1d(
 
     # ``_unique_hash`` only ever *reads* the integer key array, so when the input already is one of
     # the two key dtypes the bit reinterpretation is the identity and the buffer can be shared --
-    # skipping a full-length copy and its allocation. Every other dtype still needs the real
-    # conversion.
-    data_int = data if data.dtype in (wp.int32, wp.int64) else bitcast_to_int(data, n)
+    # skipping a full-length copy and its allocation. A four- or eight-byte dtype (the ``uint64``
+    # row keys every ``edges_unique`` call packs, ``float32``, ...) is the same bits under another
+    # name, so it is shared too, through a zero-copy ``view``: ``bitcast_to_int`` would produce
+    # byte-identical keys in a fresh buffer. Only a narrower dtype needs the real conversion.
+    key_bytes = wp.types.type_size_in_bytes(data.dtype)
+    if data.dtype in (wp.int32, wp.int64):
+        data_int = data
+    elif key_bytes in (4, 8):
+        data_int = data.view(wp.int32 if key_bytes == 4 else wp.int64)
+    else:
+        data_int = bitcast_to_int(data, n)
     return _unique_hash(data, data_int, data.dtype, n, mask, return_inverse, return_counts)
 
 
@@ -291,8 +297,10 @@ def _unique_hash(
     wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
 
     if sort_dtype == original_dtype:
-        unique_values = wp.empty(n_unique, dtype=original_dtype, device=device)
-        wp.copy(unique_values, keys_buf, count=n_unique)
+        # The sorted prefix of the sort's own scratch, handed back as a view rather than copied out:
+        # nothing else holds that buffer, so the view is the answer's sole owner, and a copy would
+        # be an allocation and a full pass to move bytes already where the caller wants them.
+        unique_values = twt.as_dense(keys_buf[:n_unique])
     else:
         # A dtype narrower than 32 bits was widened to be sortable; narrow it back.
         unique_values = bitcast_from_int(
@@ -308,9 +316,8 @@ def _unique_hash(
     unique_inverse = None
     if return_inverse:
         if sort_dtype == original_dtype:
-            # ``unique_values`` is already this exact buffer -- the same ``keys_buf`` prefix, copied
-            # out under the caller's dtype, which the sort dtype *is* on this branch. Allocating and
-            # copying it a second time produced two byte-identical arrays; the common key dtypes
+            # ``unique_values`` is already this exact buffer -- the same ``keys_buf`` prefix, under
+            # the caller's dtype, which the sort dtype *is* on this branch. The common key dtypes
             # here (the ``uint64`` edge and row keys every ``edges_unique`` call packs) all take it.
             sorted_dense = unique_values
         else:
@@ -653,6 +660,10 @@ def hash_rows(
         n = int(data.shape[0])
         if int(data.shape[1]) != 3:
             raise ValueError("float32 hash_rows currently requires width 3")
+        if data.is_contiguous:
+            # The ``(n, 3)`` rows *are* ``wp.vec3`` values in memory, so a zero-copy view reads
+            # them as such; the copy below is only for a strided table, which a view cannot retype.
+            return hash_vector_rows(data.view(wp.vec3))
         vec = wp.empty(n, dtype=wp.vec3, device=data.device)
         wp.utils.array_cast(data, vec)
         return hash_vector_rows(vec)

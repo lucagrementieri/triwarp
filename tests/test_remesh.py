@@ -596,7 +596,7 @@ def test_collapse_pass_commits_a_useful_fraction_on_a_structured_patch(device: s
     target = 2.0 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
     low, high = tw.remesh._length_bands(None, target, n_vertices, device)
 
-    out_vertices, out_faces = tw.remesh._collapse_pass(
+    out_vertices, out_faces, _incidence = tw.remesh._collapse_pass(
         vertices_wp, faces_wp, low, high, wp.float32(math.radians(30.0))
     )
     removed = n_vertices - int(out_vertices.shape[0])
@@ -654,7 +654,7 @@ def test_collapse_pass_vetoes_a_collapse_that_would_fold_a_face(device: str) -> 
     n_vertices = int(vertices_wp.shape[0])
     target = 2.0 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
     low, high = tw.remesh._length_bands(None, target, n_vertices, device)
-    out_vertices, out_faces = tw.remesh._collapse_pass(
+    out_vertices, out_faces, _incidence = tw.remesh._collapse_pass(
         vertices_wp, faces_wp, low, high, wp.float32(math.radians(30.0))
     )
 

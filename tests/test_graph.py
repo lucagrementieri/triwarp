@@ -268,6 +268,45 @@ def test_connected_component_labels_matches_igl(device: str, node_count: int, n_
     assert same_partition(labels_wp.numpy(), np.asarray(labels_igl).ravel())
 
 
+@pytest.mark.parametrize("shape", ["random", "path", "star", "loops_and_duplicates"])
+def test_connected_component_labels_edge_list_matches_csr(device: str, shape: str) -> None:
+    """
+    Triwarp against triwarp: the edge-list entry point returns the CSR one's labels exactly.
+
+    ``connected_component_labels_from_edges`` hooks straight off the edge list rather than building
+    the adjacency matrix ``connected_component_labels`` walks, so the two no longer share a code
+    path. Both label a component by its smallest node id, so the claim is equality of the label
+    arrays, not merely of the partition. The CSR entry point carries the oracles (pymeshlab and
+    meshlib, below); the edge-list one carries scipy and igl, above. The four shapes are a
+    fragmented random graph, a path (diameter equal to its node count), a star whose hub is the
+    *largest* id (every union lands on one root), and a graph with self-loops and repeated edges.
+    """
+    rng = np.random.default_rng(11)
+    node_count = 512
+    if shape == "random":
+        edges_np = rng.integers(0, node_count, size=(300, 2), dtype=np.int32)
+    elif shape == "path":
+        order = rng.permutation(node_count).astype(np.int32)
+        edges_np = np.stack([order[:-1], order[1:]], axis=1)
+    elif shape == "star":
+        leaves = np.arange(node_count - 1, dtype=np.int32)
+        edges_np = np.stack([np.full_like(leaves, node_count - 1), leaves], axis=1)
+    else:
+        base = rng.integers(0, node_count, size=(200, 2), dtype=np.int32)
+        loops = np.repeat(rng.integers(0, node_count, size=(40, 1), dtype=np.int32), 2, axis=1)
+        edges_np = np.concatenate([base, base[:50, ::-1], loops])
+    edges_wp = wp.array(np.ascontiguousarray(edges_np), dtype=wp.int32, device=device)
+
+    labels_edges = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=node_count)
+    labels_csr = tw.graph.connected_component_labels(tw.graph.edges_to_csr(node_count, edges_wp))
+
+    assert np.array_equal(labels_edges.numpy(), labels_csr.numpy())
+    # The smallest-id convention, checked directly rather than through the other entry point.
+    labels_np = labels_edges.numpy()
+    assert np.array_equal(labels_np[labels_np], labels_np)
+    assert np.all(labels_np <= np.arange(node_count))
+
+
 @pytest.mark.parametrize("face_ratio", [0.0, 0.1, 0.5])
 @pytest.mark.parity("connected_component_labels", "pymeshlab")
 def test_connected_component_labels_matches_pymeshlab(

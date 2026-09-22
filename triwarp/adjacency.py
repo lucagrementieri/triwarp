@@ -30,7 +30,6 @@ import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT
 from triwarp.kernels import adjacency as kernel_adjacency
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import scatter as kernel_scatter
 
 
@@ -125,33 +124,36 @@ def face_adjacency(
             return empty_array, twt.empty_2d((0, 2), wp.int32, device=device)
         return empty_array
 
-    if return_edges and edges_sorted is None:
-        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     edge_groups = _edge_groups(faces, edges_sorted, n_vertices)
 
     # Edge ``e`` belongs to face ``e // 3``, so the owning faces need no ``edges_face`` table, no
-    # gather through it, and no row sort — one kernel does the division and orders the pair.
+    # gather through it, and no row sort — one kernel does the division and orders the pair. With
+    # ``return_edges`` the same kernel writes each pair's shared edge too: from the caller's
+    # ``edges_sorted`` rows when given, and otherwise straight off ``faces``, so no edge table is
+    # built just to be gathered from.
     n_pairs = int(edge_groups.shape[0])
     adjacency = twt.empty_2d((n_pairs, 2), wp.int32, device=device)
-    if n_pairs > 0:
-        wp.launch(
-            kernel_adjacency.edge_pairs_to_face_pairs,
-            dim=n_pairs,
-            inputs=[edge_groups, adjacency],
-            device=device,
-        )
-    if return_edges:
-        assert edges_sorted is not None
+    if not return_edges:
         if n_pairs > 0:
-            # ``edge_groups[:, 0]`` is a strided column view; Warp's fancy indexing reads the
-            # underlying flat buffer and ignores the stride, so materialize a contiguous index
-            # first. (Slicing an empty first axis also raises, hence the guard.)
-            first_edge_index = wp.clone(edge_groups[:, 0])
-            adjacency_edges = tw.array.gather(edges_sorted, first_edge_index)
+            wp.launch(
+                kernel_adjacency.edge_pairs_to_face_pairs,
+                dim=n_pairs,
+                inputs=[edge_groups, adjacency],
+                device=device,
+            )
+        return twt.as_array2d(adjacency, wp.int32)
+    adjacency_edges = twt.empty_2d((n_pairs, 2), wp.int32, device=device)
+    if n_pairs > 0:
+        if edges_sorted is None:
+            kernel, sources = (
+                kernel_adjacency.edge_pairs_to_face_pairs_and_edges,
+                [faces, edge_groups],
+            )
         else:
-            adjacency_edges = twt.empty_2d((0, 2), wp.int32, device=device)
-        return twt.as_array2d(adjacency, wp.int32), twt.as_array2d(adjacency_edges, wp.int32)
-    return twt.as_array2d(adjacency, wp.int32)
+            kernel = kernel_adjacency.edge_pairs_to_face_pairs_and_table_edges
+            sources = [edge_groups, edges_sorted]
+        wp.launch(kernel, dim=n_pairs, inputs=[*sources, adjacency, adjacency_edges], device=device)
+    return twt.as_array2d(adjacency, wp.int32), twt.as_array2d(adjacency_edges, wp.int32)
 
 
 def require_paired_adjacency(
@@ -320,7 +322,10 @@ def vertex_face_adjacency(
     # this function never needs it (it is 3 * n_faces, known on the host). Converting for
     # symmetry would add a device synchronization where there is currently none.
     wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
-    cursor = wp.zeros(row_count, dtype=wp.int32, device=device)
+    # The counts are spent once scanned, so their buffer becomes the scatter's per-row cursor:
+    # re-zeroing it in stream order is a memset where a second zeroed buffer was an allocation too.
+    cursor = counts
+    cursor.zero_()
     wp.launch(
         kernel_adjacency.scatter_vertex_faces,
         dim=n_faces,
@@ -577,54 +582,17 @@ def face_adjacency_projections(
         face_adjacency_unshared=face_adjacency_unshared,
         face_normals=face_normals,
     )
-    device = faces.device
-    n_faces = int(faces.shape[0]) // 3
-    # The pairing check runs *before* the empty-mesh guard, so a caller who passed only one half
-    # of the pair is told about it whatever the mesh is, and the four wrappers that take this pair
-    # agree about that. The *resolve* stays below the guard, because on an empty mesh it would
-    # allocate two empty tables nothing reads.
-    require_paired_adjacency(face_adjacency, face_adjacency_edges)
-    if n_faces == 0:
-        return wp.empty(0, dtype=wp.float32, device=device)
-
-    if face_adjacency is None:
-        # ``tw.adjacency.`` rather than a bare call: the parameter shadows the module-level
-        # ``face_adjacency`` it derives from.
-        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(
-            faces, return_edges=True, n_vertices=int(vertices.shape[0])
-        )
-    assert face_adjacency_edges is not None
-    m = int(face_adjacency.shape[0])
-    if m == 0:
-        return wp.empty(0, dtype=wp.float32, device=device)
-
-    if face_adjacency_unshared is None:
-        face_adjacency_unshared = tw.adjacency.face_adjacency_unshared(
-            faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
-        )
-    elif int(face_adjacency_unshared.shape[0]) != m:
-        # A caller-supplied table is otherwise trusted as-is; the kernel below indexes it at every
-        # row up to ``m``, so a shorter table is an out-of-bounds read rather than a wrong answer.
-        raise ValueError(
-            "face_adjacency_unshared row count must match face_adjacency, got "
-            f"{face_adjacency_unshared.shape[0]} and {m}."
-        )
-    if face_normals is None:
-        face_normals, _ = tw.triangles.face_normals_and_areas(vertices, faces)
-
-    out_projections = wp.empty(m, dtype=wp.float32, device=device)
+    tables = _projection_tables(
+        vertices, faces, face_adjacency, face_adjacency_edges, face_adjacency_unshared, face_normals
+    )
+    if tables is None:
+        return wp.empty(0, dtype=wp.float32, device=faces.device)
+    out_projections = wp.empty(int(tables[1].shape[0]), dtype=wp.float32, device=faces.device)
     wp.launch(
         kernel_adjacency.face_adjacency_projections,
-        dim=m,
-        inputs=[
-            vertices,
-            face_normals,
-            face_adjacency,
-            face_adjacency_edges,
-            face_adjacency_unshared,
-            out_projections,
-        ],
-        device=device,
+        dim=out_projections.shape[0],
+        inputs=[vertices, *tables, out_projections],
+        device=faces.device,
     )
     return out_projections
 
@@ -674,9 +642,7 @@ def face_adjacency_convex(
     ------
     ValueError
         If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided, or if a
-        supplied ``face_adjacency_unshared`` has a different row count from ``face_adjacency``
-        (raised by [`face_adjacency_projections`][triwarp.adjacency.face_adjacency_projections],
-        which this function delegates to).
+        supplied ``face_adjacency_unshared`` has a different row count from ``face_adjacency``.
     RuntimeError
         If ``vertices``, ``faces``, ``face_adjacency``, ``face_adjacency_edges``,
         ``face_adjacency_unshared`` and ``face_normals`` are not all on one device.
@@ -694,12 +660,48 @@ def face_adjacency_convex(
         face_adjacency_unshared=face_adjacency_unshared,
         face_normals=face_normals,
     )
-    device = faces.device
-    n_faces = int(faces.shape[0]) // 3
-    require_paired_adjacency(face_adjacency, face_adjacency_edges)
-    if n_faces == 0:
-        return wp.empty(0, dtype=wp.bool, device=device)
+    tables = _projection_tables(
+        vertices, faces, face_adjacency, face_adjacency_edges, face_adjacency_unshared, face_normals
+    )
+    if tables is None:
+        return wp.empty(0, dtype=wp.bool, device=faces.device)
+    # The projection and its threshold in one launch rather than the projections array plus a
+    # ``wp.map`` comparison over it; the shared ``adjacency_projection`` keeps the two answers
+    # row-for-row consistent.
+    out_convex = wp.empty(int(tables[1].shape[0]), dtype=wp.bool, device=faces.device)
+    wp.launch(
+        kernel_adjacency.face_adjacency_convex,
+        dim=out_convex.shape[0],
+        inputs=[vertices, *tables, TOLERANCE_MERGE_CONSTANT, out_convex],
+        device=faces.device,
+    )
+    return out_convex
 
+
+def _projection_tables(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_adjacency: twt.Array2dInt32 | None,
+    face_adjacency_edges: twt.Array2dInt32 | None,
+    face_adjacency_unshared: twt.Array2dInt32 | None,
+    face_normals: wp.array[wp.vec3] | None,
+) -> tuple[wp.array[wp.vec3], twt.Array2dInt32, twt.Array2dInt32, twt.Array2dInt32] | None:
+    """
+    Resolve the four per-row tables a projection reads, or ``None`` when there is no row.
+
+    The shared front of [`face_adjacency_projections`][triwarp.adjacency.face_adjacency_projections]
+    and [`face_adjacency_convex`][triwarp.adjacency.face_adjacency_convex], which launch different
+    kernels over the same ``(face_normals, face_adjacency, face_adjacency_edges,
+    face_adjacency_unshared)`` -- returned in that order, the kernels' own.
+
+    The pairing check runs *before* the empty-mesh guard, so a caller who passed only one half of
+    the pair is told about it whatever the mesh is, and the four wrappers that take this pair agree
+    about that. The *resolve* stays below the guard, because on an empty mesh it would allocate two
+    empty tables nothing reads.
+    """
+    require_paired_adjacency(face_adjacency, face_adjacency_edges)
+    if int(faces.shape[0]) // 3 == 0:
+        return None
     if face_adjacency is None:
         # ``tw.adjacency.`` rather than a bare call: the parameter shadows the module-level
         # ``face_adjacency`` it derives from.
@@ -707,22 +709,24 @@ def face_adjacency_convex(
             faces, return_edges=True, n_vertices=int(vertices.shape[0])
         )
     assert face_adjacency_edges is not None
-
     m = int(face_adjacency.shape[0])
     if m == 0:
-        return wp.empty(0, dtype=wp.bool, device=device)
+        return None
 
-    projections = face_adjacency_projections(
-        vertices,
-        faces,
-        face_adjacency=face_adjacency,
-        face_adjacency_edges=face_adjacency_edges,
-        face_adjacency_unshared=face_adjacency_unshared,
-        face_normals=face_normals,
-    )
-    out_convex = wp.empty(m, dtype=wp.bool, device=device)
-    wp.map(kernel_array.less, projections, TOLERANCE_MERGE_CONSTANT, out=out_convex)
-    return out_convex
+    if face_adjacency_unshared is None:
+        face_adjacency_unshared = tw.adjacency.face_adjacency_unshared(
+            faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
+        )
+    elif int(face_adjacency_unshared.shape[0]) != m:
+        # A caller-supplied table is otherwise trusted as-is; the kernel indexes it at every row up
+        # to ``m``, so a shorter table is an out-of-bounds read rather than a wrong answer.
+        raise ValueError(
+            "face_adjacency_unshared row count must match face_adjacency, got "
+            f"{face_adjacency_unshared.shape[0]} and {m}."
+        )
+    if face_normals is None:
+        face_normals, _ = tw.triangles.face_normals_and_areas(vertices, faces)
+    return face_normals, face_adjacency, face_adjacency_edges, face_adjacency_unshared
 
 
 def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:

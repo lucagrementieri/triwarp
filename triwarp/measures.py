@@ -318,12 +318,14 @@ def euler_characteristic(faces: wp.array[wp.int32]) -> int:
     if n_faces == 0:
         return 0
 
-    n_referenced = int(tw.grouping.unique_1d(faces).shape[0])
-    # The bound is taken here, so ``edges_unique`` re-checking it would reduce the same indices
-    # twice; ``require_non_negative`` keeps the half of that check a derived bound cannot give,
-    # and costs nothing -- both ends come out of the one reduction.
-    unique_edges, _ = tw.edges.edges_unique(
-        faces, n_vertices=tw.array.index_bound(faces, require_non_negative=True), validate=False
-    )
+    # The bound is taken once, here, so ``edges_unique`` re-checking it would reduce the same
+    # indices twice; ``require_non_negative`` keeps the half of that check a derived bound cannot
+    # give, and costs nothing -- both ends come out of the one reduction.
+    n_vertices = tw.array.index_bound(faces, require_non_negative=True)
+    # The referenced-vertex count is a membership mask's popcount rather than the length of
+    # ``unique_1d(faces)``: the indices are bounded by ``n_vertices``, so the mask is the same set
+    # without the hash table, compaction and sort, and the count is one read instead of two.
+    n_referenced = tw.reduce.sum(tw.array.indices_to_mask(faces, n_vertices))
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
     n_edges = int(unique_edges.shape[0])
     return n_referenced - n_edges + n_faces

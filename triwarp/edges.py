@@ -22,6 +22,7 @@ import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.array import arange_repeat
 from triwarp.constants import INDEX_RADIX_PAIR
+from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import edges as kernel_edges
 
 
@@ -109,8 +110,8 @@ def edges_unique(
         When ``None``, built from ``faces``.
     n_vertices
         Total number of vertices (used as the hash base, and as the radix the unique rows are
-        unpacked with). When ``None`` and ``validate`` is ``True`` it is inferred from
-        ``edges_sorted`` with a device-host sync -- the same reduction that runs the range check.
+        unpacked with). When ``None`` and ``validate`` is ``True`` it is inferred from the edge
+        indices with a device-host sync -- the same reduction that runs the range check.
         When ``None`` and ``validate`` is ``False`` the keys pack against
         [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR] instead, which bounds
         every ``int32`` index with no reduction at all and leaves the row order unchanged.
@@ -135,8 +136,9 @@ def edges_unique(
     TypeError
         If ``edges_sorted`` is given and is not a rank-2 ``wp.int32`` array.
     ValueError
-        If ``edges_sorted`` is given and does not have exactly two columns, or if ``validate`` is
-        ``True`` and an edge index is negative or reaches ``n_vertices``.
+        If ``edges_sorted`` is given and does not have exactly two columns, if ``n_vertices`` is
+        not positive, or if ``validate`` is ``True`` and an edge index is negative or reaches
+        ``n_vertices``.
     RuntimeError
         If ``faces`` and ``edges_sorted`` are not all on one device.
 
@@ -157,7 +159,12 @@ def edges_unique(
         return empty_edges, empty_inv
 
     if edges_sorted is None:
-        edges_sorted = faces_to_edges(faces, sorted=True)
+        # The keys are built straight off ``faces``: ``face_edge_keys`` packs each corner's sorted
+        # pair exactly as ``hash_indices_rows`` packs the corresponding ``faces_to_edges`` row, so
+        # the ``(3 * n_faces, 2)`` table is never written or read back, and any range check reduces
+        # the ``3 * n_faces`` face buffer -- the same values, half the entries.
+        keys, radix = _face_edge_keys(faces, n_faces, n_vertices, validate)
+        return _unique_edges_from_keys(keys, radix, device)
 
     if n_vertices is None:
         if validate:
@@ -174,6 +181,51 @@ def edges_unique(
             n_vertices = INDEX_RADIX_PAIR
 
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=validate)
+    return _unique_edges_from_keys(keys, n_vertices, device)
+
+
+def _face_edge_keys(
+    faces: wp.array[wp.int32], n_faces: int, n_vertices: int | None, validate: bool
+) -> tuple[wp.array[wp.uint64], int]:
+    """
+    Packed sorted-pair key of every corner edge, plus the radix they were packed against.
+
+    The ``edges_sorted is None`` half of [`edges_unique`][triwarp.edges.edges_unique], resolving
+    ``n_vertices`` and ``validate`` exactly as the composed ``faces_to_edges`` +
+    ``hash_indices_rows`` path does: an inferred bound checks the negative half, a supplied one is
+    checked against, and ``validate=False`` with no bound packs against ``INDEX_RADIX_PAIR``. The
+    reduction reads only the ``3 * n_faces`` indices a face actually owns, which is the set the
+    edge rows would have held.
+    """
+    if n_vertices is not None and n_vertices <= 0:
+        raise ValueError(f"n_vertices must be positive, got {n_vertices}")
+    if validate:
+        owned = faces if int(faces.shape[0]) == 3 * n_faces else twt.as_dense(faces[: 3 * n_faces])
+        low, high = tw.reduce.minmax(owned)
+        if low < 0:
+            raise ValueError(f"edge indices must be non-negative, got a minimum of {low}")
+        if n_vertices is None:
+            n_vertices = int(high) + 1
+        elif high >= n_vertices:
+            raise ValueError(
+                f"edge indices must be less than n_vertices {n_vertices}, got a maximum of {high}"
+            )
+    elif n_vertices is None:
+        n_vertices = INDEX_RADIX_PAIR
+    keys = wp.empty(3 * n_faces, dtype=wp.uint64, device=faces.device)
+    wp.launch(
+        kernel_adjacency.face_edge_keys,
+        dim=n_faces,
+        inputs=[faces, wp.uint64(n_vertices), keys],
+        device=faces.device,
+    )
+    return keys, n_vertices
+
+
+def _unique_edges_from_keys(
+    keys: wp.array[wp.uint64], n_vertices: int, device: wp.DeviceLike
+) -> tuple[twt.Array2dInt32, wp.array[wp.int32]]:
+    """Deduplicate packed edge keys into ``(unique_edges, inverse)``, unpacked by ``n_vertices``."""
     unique_keys, inverse = tw.grouping.unique_1d(keys, return_inverse=True)
 
     # The deduplicated rows are recovered from the keys, not by gathering the corner that first

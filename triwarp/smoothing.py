@@ -65,12 +65,16 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import smoothing as kernel_smoothing
+from triwarp.kernels import triangles as kernel_triangles
 from triwarp.triangles import face_normals_and_areas
 from triwarp.vertices import mean_vertex_normals
 
 # Fraction of the way to the level set each ``smooth_region_boundary`` pass moves. A full step
 # overshoots, because the field is rebuilt from the moved positions and the level set moves too.
 _ISOLINE_DAMPING = wp.float32(0.75)
+
+# The common apex of the tetrahedra whose signed volumes sum to the enclosed volume.
+_ORIGIN_D = wp.vec3d(0.0, 0.0, 0.0)
 
 
 def filter_laplacian(
@@ -150,9 +154,13 @@ def filter_laplacian(
         # fixed point rather than the mesh's current (already-moved) centre of mass.
         _, center_f32, _ = tw.measures.moments(vertices, faces)
         center_ini = wp.vec3d(float(center_f32[0]), float(center_f32[1]), float(center_f32[2]))
+        # The per-face volumes and their sum are rewritten by every pass, so both buffers are
+        # allocated once here rather than once per pass.
+        constraint = _VolumeScratch.for_faces(faces, device)
     else:
         vol_ini = 0.0
         center_ini = wp.vec3d(0.0, 0.0, 0.0)
+        constraint = None
 
     if implicit_time_integration:
         system = _build_implicit_system(operator, lamb, n, device)
@@ -183,16 +191,16 @@ def filter_laplacian(
                 solution_rows[2],
                 out=positions,
             )
-            if volume_constraint:
-                _apply_volume_constraint(positions, faces, vol_ini, center_ini)
+            if constraint is not None:
+                _apply_volume_constraint(positions, faces, vol_ini, center_ini, constraint)
     else:
         nxt = wp.empty(n, dtype=wp.vec3d, device=device)
         coeff = wp.float64(lamb)
         for _ in range(iterations):
             _diffuse_pass(operator, positions, coeff, nxt)
             positions, nxt = nxt, positions
-            if volume_constraint:
-                _apply_volume_constraint(positions, faces, vol_ini, center_ini)
+            if constraint is not None:
+                _apply_volume_constraint(positions, faces, vol_ini, center_ini, constraint)
 
     return _as_vec3(positions)
 
@@ -230,7 +238,11 @@ def _build_implicit_system(
 
 
 def _apply_volume_constraint(
-    positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], vol_ini: float, center: wp.vec3d
+    positions: wp.array[wp.vec3d],
+    faces: wp.array[wp.int32],
+    vol_ini: float,
+    center: wp.vec3d,
+    scratch: _VolumeScratch,
 ) -> None:
     """
     Rescale about ``center`` so the signed volume returns to ``vol_ini``.
@@ -251,12 +263,11 @@ def _apply_volume_constraint(
     # host sync per smoothing pass -- a full pipeline drain for a cube root of two numbers -- and
     # the pass count is the whole point of this loop. ``rescale_to_volume`` forms the ratio itself
     # and applies the same two skip conditions.
-    volume_current = wp.zeros(1, dtype=wp.float64, device=positions.device)
-    _accumulate_signed_volume(positions, faces, volume_current)
+    scratch.accumulate(positions, faces)
     wp.launch(
         kernel_smoothing.rescale_to_volume,
         dim=int(positions.shape[0]),
-        inputs=[wp.float64(vol_ini), volume_current, center, positions],
+        inputs=[wp.float64(vol_ini), scratch.volume, center, positions],
         device=positions.device,
     )
 
@@ -1249,11 +1260,10 @@ def filter_mut_dif_laplacian(
     constraint = None
     if volume_constraint:
         probe = wp.empty(n, dtype=wp.vec3d, device=device)
-        vol_ini, vol_cur, vol_probe, slope = (
-            wp.zeros(1, dtype=wp.float64, device=device) for _ in range(4)
-        )
-        _accumulate_signed_volume(positions, faces, vol_ini)
-        constraint = (probe, vol_ini, vol_cur, vol_probe, slope)
+        scratch = _VolumeScratch.for_faces(faces, device)
+        vol_ini, vol_probe, slope = (wp.zeros(1, dtype=wp.float64, device=device) for _ in range(3))
+        scratch.accumulate(positions, faces, vol_ini)
+        constraint = (probe, scratch, vol_ini, vol_probe, slope)
     inv_n = wp.float64(1.0 / n)
     n_blocks = kernel_reduce.blocks_1d(n)
     for index in range(iterations):
@@ -1283,8 +1293,9 @@ def filter_mut_dif_laplacian(
         )
         positions, nxt = nxt, positions
         if constraint is not None:
-            probe, vol_ini, vol_cur, vol_probe, slope = constraint
-            _accumulate_signed_volume(positions, faces, vol_cur)
+            probe, scratch, vol_ini, vol_probe, slope = constraint
+            vol_cur = scratch.volume
+            scratch.accumulate(positions, faces)
             if index == 0:
                 wp.map(
                     kernel_smoothing.add_scaled_normal,
@@ -1293,7 +1304,7 @@ def filter_mut_dif_laplacian(
                     wp.float64(eps),
                     out=probe,
                 )
-                _accumulate_signed_volume(probe, faces, vol_probe)
+                scratch.accumulate(probe, faces, vol_probe)
                 wp.launch(
                     kernel_smoothing.mut_dif_volume_slope,
                     dim=1,
@@ -1311,23 +1322,53 @@ def filter_mut_dif_laplacian(
     return _as_vec3(positions)
 
 
-def _accumulate_signed_volume(
-    positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], out_volume: wp.array[wp.float64]
-) -> None:
+class _VolumeScratch(NamedTuple):
     """
-    Sum the mesh's per-face signed tetrahedron volumes into the caller's length-1 ``out_volume``.
+    Device buffers for a signed-volume sum repeated over one fixed face buffer.
 
-    The device-resident half of [`measures.volume`][triwarp.measures.volume], shared by the two
-    volume constraints in this module so that neither reads a volume back to do arithmetic on it.
-    ``out_volume`` is the caller's because the iterative constraint hoists it out of its pass loop.
-
-    ``wp.utils.array_sum`` writes nothing at all for an empty face buffer, so ``out_volume`` is
-    zeroed first rather than left holding whatever it held: zero is the honest volume of a mesh
-    with no faces, and it is what both consumers read as "no correction".
+    Shared by the two volume constraints in this module so that neither reads a volume back to do
+    arithmetic on it, and neither allocates per smoothing pass: ``face_volumes`` holds one signed
+    tetrahedron volume per face and ``volume`` their length-1 sum, both rewritten by every call.
     """
-    out_volume.zero_()
-    if int(faces.shape[0]) > 0:
-        wp.utils.array_sum(tw.triangles.face_signed_volumes(positions, faces), out=out_volume)
+
+    face_volumes: wp.array[wp.float64]
+    volume: wp.array[wp.float64]
+
+    @classmethod
+    def for_faces(cls, faces: wp.array[wp.int32], device: wp.DeviceLike) -> _VolumeScratch:
+        """Allocate the scratch for ``faces``' face count."""
+        n_faces = int(faces.shape[0]) // 3
+        return cls(
+            wp.empty(n_faces, dtype=wp.float64, device=device),
+            wp.empty(1, dtype=wp.float64, device=device),
+        )
+
+    def accumulate(
+        self,
+        positions: wp.array[wp.vec3d],
+        faces: wp.array[wp.int32],
+        out_volume: wp.array[wp.float64] | None = None,
+    ) -> None:
+        """
+        Sum the mesh's signed tetrahedron volumes into ``out_volume`` (``self.volume`` if omitted).
+
+        The device-resident half of [`measures.volume`][triwarp.measures.volume], summed by
+        ``wp.utils.array_sum``, which overwrites its output. An empty face buffer launches nothing
+        and zeroes the output instead: zero is the honest volume of a mesh with no faces, and it is
+        what both consumers read as "no correction".
+        """
+        out = self.volume if out_volume is None else out_volume
+        n_faces = int(self.face_volumes.shape[0])
+        if n_faces == 0:
+            out.zero_()
+            return
+        wp.launch(
+            kernel_triangles.FACE_SIGNED_VOLUMES[wp.vec3d],
+            dim=n_faces,
+            inputs=[positions, faces, _ORIGIN_D, self.face_volumes],
+            device=positions.device,
+        )
+        wp.utils.array_sum(self.face_volumes, out=out)
 
 
 def _diffuse_pass(
@@ -1417,13 +1458,11 @@ def filter_implicit_fairing(
         return wp.clone(vertices)
 
     positions = _as_vec3d(vertices)
-    components = _component_columns(n, device)
     rhs = _component_columns(n, device)
     solutions = _component_columns(n, device)
-    # All three column lists are viewed once. The buffers are allocated here and never rebound --
-    # only the *operator* is rebuilt each pass, which is what the note in the loop is about -- so
-    # re-slicing them per pass was half a dozen views an iteration, buying nothing.
-    component_rows = [components[column] for column in range(3)]
+    # Both column lists are viewed once. The buffers are allocated here and never rebound -- only
+    # the *operator* is rebuilt each pass, which is what the note in the loop is about -- so
+    # re-slicing them per pass would be half a dozen views an iteration, buying nothing.
     rhs_rows = [rhs[column] for column in range(3)]
     solution_rows = [solutions[column] for column in range(3)]
 
@@ -1444,20 +1483,22 @@ def filter_implicit_fairing(
 
         mass = laplacian.mass_matrix_entries(current, faces, dtype=wp.float64)
 
-        # Right-hand side b = M V, formed before ``bsr_axpy`` mutates the mass matrix.
-        wp.map(kernel_smoothing.extract_components, positions, out=component_rows)
-        for column in range(3):
-            wp.map(wp.mul, mass, component_rows[column], out=rhs_rows[column])
-
         # A = M - lamb L (SPD: L has a negative diagonal, so subtracting it adds to the diagonal).
         system = wps.bsr_axpy(x=stiffness, y=wps.bsr_diag(diag=mass), alpha=-float(lamb), beta=1.0)
 
         if dirichlet is None:
-            # Seed CG with the current positions, not with ``b = M V``: an unreferenced vertex has
-            # an all-zero row and a zero right-hand side, so CG never writes its entry and it would
-            # keep whatever the seed left there. One batched solve advances all three columns
-            # together; the operator is rebuilt every pass, so there is no state to hoist.
-            wp.copy(solutions, components)
+            # Right-hand side b = M V and the CG seed in one pass. The seed is the current
+            # positions, not ``b = M V``: an unreferenced vertex has an all-zero row and a zero
+            # right-hand side, so CG never writes its entry and it would keep whatever the seed
+            # left there. One batched solve advances all three columns together; the operator is
+            # rebuilt every pass, so there is no state to hoist. The Dirichlet branch below forms
+            # its own right-hand side over the free rows, so it takes neither.
+            wp.map(
+                kernel_smoothing.seed_and_mass_weight_components,
+                positions,
+                mass,
+                out=[*solution_rows, *rhs_rows],
+            )
             twl.solve_spd_columns(system, rhs, solutions, tol=twl.CG_TOLERANCE, maxiter=10 * n)
             wp.map(
                 kernel_smoothing.combine_components,
@@ -2545,27 +2586,31 @@ def filter_two_step(
 
     # The topology is fixed, so the adjacency is built once for every pass of both halves.
     adjacency = tw.adjacency.face_adjacency(faces, n_vertices=n)
-    delta = wp.empty(n, dtype=wp.vec3, device=device)
-    counts = wp.empty(n, dtype=wp.float32, device=device)
-    # Hoisted out of the doubly-nested pass loop, where it would otherwise run
-    # ``iterations * fit_iterations`` times.
-    fit_step = wp.map(
-        kernel_smoothing.apply_fit_step, out, delta, counts, out=out, return_kernel=True
+    # Zeroed once: ``apply_fit_step_and_reset`` leaves every slot zero behind it, so each fit
+    # iteration's scatter starts from an empty accumulator without a clear of its own. The
+    # incident-face count is fixed by the topology, so it is taken once rather than per iteration.
+    delta = wp.zeros(n, dtype=wp.vec3, device=device)
+    counts = wp.zeros(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_scatter.count_occurrences, dim=3 * n_faces, inputs=[faces, counts], device=device
     )
     for _ in range(iterations):
         normals = filter_normals(
             out, faces, iterations=normal_iterations, threshold=threshold, face_adjacency=adjacency
         )
         for _fit in range(fit_iterations):
-            delta.zero_()
-            counts.zero_()
             wp.launch(
                 kernel_smoothing.fit_vertices_to_normals,
                 dim=n_faces,
-                inputs=[out, faces, normals, delta, counts],
+                inputs=[out, faces, normals, delta],
                 device=device,
             )
-            wp.launch(fit_step, dim=n, inputs=[out, delta, counts], outputs=[out], device=device)
+            wp.launch(
+                kernel_smoothing.apply_fit_step_and_reset,
+                dim=n,
+                inputs=[counts, out, delta],
+                device=device,
+            )
     return out
 
 

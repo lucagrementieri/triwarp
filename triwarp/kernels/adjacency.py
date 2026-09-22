@@ -36,18 +36,72 @@ def face_edge_keys(
     write_face_edge_keys(faces, wp.tid(), base, out_keys)
 
 
-@wp.kernel
-def edge_pairs_to_face_pairs(
-    edge_groups: wp.array2d[wp.int32], out_adjacency: wp.array2d[wp.int32]
+@wp.func
+def edge_endpoints(faces: wp.array[wp.int32], edge_index: wp.int32) -> tuple[wp.int32, wp.int32]:
+    # The sorted endpoints of edge ``3f + c``, recovered from the edge index alone. Corner ``c`` of
+    # face ``f`` spans ``(v[c], v[(c + 1) % 3])``, matching ``kernels/edges.py:faces_to_edges``, so
+    # this reproduces exactly the row ``faces_to_edges(sorted=True)`` would have written there.
+    face_base = (edge_index // 3) * 3
+    corner = edge_index % 3
+    a = faces[face_base + corner]
+    b = faces[face_base + (corner + 1) % 3]
+    return wp.min(a, b), wp.max(a, b)
+
+
+@wp.func
+def write_face_pair(
+    edge_groups: wp.array2d[wp.int32], row: wp.int32, out_adjacency: wp.array2d[wp.int32]
 ) -> None:
     # Two edge indices sharing a key -> the ascending pair of faces owning them. Replaces a gather
     # through a materialized ``edges_face`` table plus an in-place row sort: the owning face of
     # edge ``e`` is just ``e // 3``, and ordering two values needs no sort kernel.
+    f0 = edge_groups[row, 0] // 3
+    f1 = edge_groups[row, 1] // 3
+    out_adjacency[row, 0] = wp.min(f0, f1)
+    out_adjacency[row, 1] = wp.max(f0, f1)
+
+
+@wp.kernel
+def edge_pairs_to_face_pairs(
+    edge_groups: wp.array2d[wp.int32], out_adjacency: wp.array2d[wp.int32]
+) -> None:
+    write_face_pair(edge_groups, wp.int32(wp.tid()), out_adjacency)
+
+
+@wp.kernel
+def edge_pairs_to_face_pairs_and_edges(
+    faces: wp.array[wp.int32],
+    edge_groups: wp.array2d[wp.int32],
+    out_adjacency: wp.array2d[wp.int32],
+    out_edges: wp.array2d[wp.int32],
+) -> None:
+    # ``edge_pairs_to_face_pairs`` plus the shared edge of each pair, which is the first grouped
+    # edge's sorted endpoints -- recovered from its index through ``edge_endpoints``, so no
+    # ``(3 * n_faces, 2)`` edge table has to exist to gather it from. Differs from
+    # ``edge_pairs_to_face_pairs_and_table_edges`` only in where that row is read: the faces here,
+    # a caller's precomputed table there.
     tid = wp.int32(wp.tid())
-    f0 = edge_groups[tid, 0] // 3
-    f1 = edge_groups[tid, 1] // 3
-    out_adjacency[tid, 0] = wp.min(f0, f1)
-    out_adjacency[tid, 1] = wp.max(f0, f1)
+    write_face_pair(edge_groups, tid, out_adjacency)
+    a, b = edge_endpoints(faces, edge_groups[tid, 0])
+    out_edges[tid, 0] = a
+    out_edges[tid, 1] = b
+
+
+@wp.kernel
+def edge_pairs_to_face_pairs_and_table_edges(
+    edge_groups: wp.array2d[wp.int32],
+    edges_sorted: wp.array2d[wp.int32],
+    out_adjacency: wp.array2d[wp.int32],
+    out_edges: wp.array2d[wp.int32],
+) -> None:
+    # The same two answers as ``edge_pairs_to_face_pairs_and_edges`` with the shared edge read from
+    # a caller-supplied ``edges_sorted`` row -- in one launch rather than the pair kernel plus a
+    # ``wp.clone`` of the strided ``edge_groups[:, 0]`` column and a gather through it.
+    tid = wp.int32(wp.tid())
+    write_face_pair(edge_groups, tid, out_adjacency)
+    first = edge_groups[tid, 0]
+    out_edges[tid, 0] = edges_sorted[first, 0]
+    out_edges[tid, 1] = edges_sorted[first, 1]
 
 
 @wp.func
@@ -86,18 +140,6 @@ def face_adjacency_unshared(
     e1 = face_adjacency_edges[tid, 1]
     out_unshared[tid, 0] = unshared_vertex(faces[f0 + 0], faces[f0 + 1], faces[f0 + 2], e0, e1)
     out_unshared[tid, 1] = unshared_vertex(faces[f1 + 0], faces[f1 + 1], faces[f1 + 2], e0, e1)
-
-
-@wp.func
-def edge_endpoints(faces: wp.array[wp.int32], edge_index: wp.int32) -> tuple[wp.int32, wp.int32]:
-    # The sorted endpoints of edge ``3f + c``, recovered from the edge index alone. Corner ``c`` of
-    # face ``f`` spans ``(v[c], v[(c + 1) % 3])``, matching ``kernels/edges.py:faces_to_edges``, so
-    # this reproduces exactly the row ``faces_to_edges(sorted=True)`` would have written there.
-    face_base = (edge_index // 3) * 3
-    corner = edge_index % 3
-    a = faces[face_base + corner]
-    b = faces[face_base + (corner + 1) % 3]
-    return wp.min(a, b), wp.max(a, b)
 
 
 @wp.func
@@ -167,6 +209,43 @@ def scatter_vertex_faces(
         out_vertex_faces[offsets[v] + wp.atomic_add(cursor, v, 1)] = f
 
 
+@wp.func
+def unshared_projection(
+    vertices: wp.array[wp.vec3], normal: wp.vec3, origin: wp.int32, other: wp.int32
+) -> wp.float32:
+    # Signed distance of a face pair's second unshared vertex ``other`` above the first face's
+    # plane, measured from the shared edge's first endpoint ``origin``: the convexity rule
+    # ``face_adjacency_convex`` thresholds and ``curvature.face_pair_dihedrals`` signs its angle by.
+    #
+    # ``unshared_vertex`` returns -1 for a degenerate second face (it does not have exactly one
+    # vertex off the shared edge), and that sentinel is not a valid index into ``vertices`` --
+    # reading it would be the out-of-bounds access CLAUDE.md's memory-safety rule forbids. There is
+    # no meaningful projection for a degenerate face, so it reports as never locally convex
+    # (+inf is never < TOLERANCE_MERGE) rather than being read as an arbitrary finite value.
+    if other < wp.int32(0):
+        return FLOAT32_INF_CONSTANT
+    return wp.dot(vertices[other] - vertices[origin], normal)
+
+
+@wp.func
+def adjacency_projection(
+    vertices: wp.array[wp.vec3],
+    face_normals: wp.array[wp.vec3],
+    face_adjacency: wp.array2d[wp.int32],
+    face_adjacency_edges: wp.array2d[wp.int32],
+    face_adjacency_unshared: wp.array2d[wp.int32],
+    row: wp.int32,
+) -> wp.float32:
+    # ``unshared_projection`` for adjacency row ``row``, read from the precomputed tables: the
+    # quantity ``face_adjacency_projections`` returns and ``face_adjacency_convex`` thresholds.
+    return unshared_projection(
+        vertices,
+        face_normals[face_adjacency[row, 0]],
+        face_adjacency_edges[row, 0],
+        face_adjacency_unshared[row, 1],
+    )
+
+
 @wp.kernel
 def face_adjacency_projections(
     vertices: wp.array[wp.vec3],
@@ -177,16 +256,25 @@ def face_adjacency_projections(
     out_projections: wp.array[wp.float32],
 ) -> None:
     tid = wp.int32(wp.tid())
-    vid_other = face_adjacency_unshared[tid, 1]
-    # ``face_adjacency_unshared`` writes -1 for a degenerate second face (it does not have exactly
-    # one vertex off the shared edge), and that sentinel is not a valid index into ``vertices`` --
-    # reading it would be the out-of-bounds access CLAUDE.md's memory-safety rule forbids. There is
-    # no meaningful projection for a degenerate face, so it reports as never locally convex
-    # (+inf is never < TOLERANCE_MERGE) rather than being read as an arbitrary finite value.
-    if vid_other < wp.int32(0):
-        out_projections[tid] = FLOAT32_INF_CONSTANT
-        return
-    normal = face_normals[face_adjacency[tid, 0]]
-    origin = vertices[face_adjacency_edges[tid, 0]]
-    vector_other = vertices[vid_other] - origin
-    out_projections[tid] = wp.dot(vector_other, normal)
+    out_projections[tid] = adjacency_projection(
+        vertices, face_normals, face_adjacency, face_adjacency_edges, face_adjacency_unshared, tid
+    )
+
+
+@wp.kernel
+def face_adjacency_convex(
+    vertices: wp.array[wp.vec3],
+    face_normals: wp.array[wp.vec3],
+    face_adjacency: wp.array2d[wp.int32],
+    face_adjacency_edges: wp.array2d[wp.int32],
+    face_adjacency_unshared: wp.array2d[wp.int32],
+    tolerance: wp.float32,
+    out_convex: wp.array[wp.bool],
+) -> None:
+    # The projection and its ``< tolerance`` threshold in one launch, where the wrapper used to
+    # write the ``(m,)`` projections and ``wp.map`` a comparison over them.
+    tid = wp.int32(wp.tid())
+    projection = adjacency_projection(
+        vertices, face_normals, face_adjacency, face_adjacency_edges, face_adjacency_unshared, tid
+    )
+    out_convex[tid] = projection < tolerance

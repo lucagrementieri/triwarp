@@ -36,7 +36,8 @@ the round count is the whole difference.
 vetoes a candidate on a single property of the points in a neighbouring cell -- an acceptance for
 the covering sweep, a smaller priority for the selection sweep -- so a per-cell summary of that
 property decides the whole cell without loading a point from it. Two summaries are rebuilt per
-round, at a cost of two fills and one atomic pass over the work list; they remove work whose outcome
+round, at a cost of two fills and one atomic pass over the work list (after the first round that
+pass rides on the previous round's compaction); they remove work whose outcome
 was already determined, so the accepted set is identical by construction rather than by tolerance,
 and together they are worth roughly 2x.
 
@@ -113,15 +114,18 @@ def grid_cell_key(coord: wp.vec3i, grid_w: wp.int32) -> wp.int64:
 
 
 @wp.kernel
-def init_point_cells(
-    grid_coords: wp.array[wp.vec3i],
-    grid_w: wp.int32,
+def sorted_point_cells(
+    sorted_keys: wp.array[wp.int64],
     unique_keys: wp.array[wp.int64],
     out_point_cell: wp.array[wp.int32],
 ) -> None:
-    # Compacted cell index of every pool point (its cell is occupied by construction).
-    i = wp.int32(wp.tid())
-    out_point_cell[i] = lookup_cell(unique_keys, grid_cell_key(grid_coords[i], grid_w))
+    # Compacted cell index of every pool point (its cell is occupied by construction), written
+    # straight into the cell-sorted index space the dart loop runs in. Reading the *sorted* key
+    # rather than recomputing the point's key from its grid coordinate is what makes the per-point
+    # table and the permutation through ``bucket`` one pass: ``sorted_keys[s]`` already is the key
+    # of pool point ``bucket[s]``.
+    s = wp.int32(wp.tid())
+    out_point_cell[s] = lookup_cell(unique_keys, sorted_keys[s])
 
 
 @wp.kernel
@@ -155,6 +159,20 @@ def dart_cell_neighbors(
     )
 
 
+@wp.func
+def summarize_min_priority(
+    priority: wp.array[wp.uint32],
+    point_cell: wp.array[wp.int32],
+    i: wp.int32,
+    out_cell_min_priority: wp.array[wp.uint32],
+) -> None:
+    # Fold one alive point into its cell's minimum-priority summary. Shared by the first round's
+    # summary pass and by ``dart_compact_alive``, which builds every later round's summary over the
+    # survivors it is compacting; ``wp.atomic_min`` is order-independent, so the two builders give
+    # the same summary for the same alive set.
+    wp.atomic_min(out_cell_min_priority, point_cell[i], priority[i])
+
+
 @wp.kernel
 def dart_cell_min_priority(
     priority: wp.array[wp.uint32],
@@ -171,9 +189,11 @@ def dart_cell_min_priority(
     # an *earlier* round out, and that is safe: such a point covered its own ``r``-ball in the round
     # it was accepted, so no point still alive now is within ``r`` of it and none of them could have
     # been vetoed by it anyway.
+    #
+    # Launched for the first round only: every later round's summary is folded into the previous
+    # round's compaction, which already visits exactly the survivors.
     t = wp.int32(wp.tid())
-    i = alive[t]
-    wp.atomic_min(out_cell_min_priority, point_cell[i], priority[i])
+    summarize_min_priority(priority, point_cell, alive[t], out_cell_min_priority)
 
 
 @wp.kernel
@@ -241,6 +261,7 @@ def dart_cover_neighbors(
     cell_accepted: wp.array[wp.bool],
     rr: wp.float32,
     out_state: wp.array[wp.int32],
+    out_flag: wp.array[wp.int32],
 ) -> None:
     # Retire every still-alive point within ``r`` of a point this round accepted. This is what makes
     # the result maximal — a survivor is a point no accepted point covers, so the loop cannot stop
@@ -248,9 +269,18 @@ def dart_cover_neighbors(
     #
     # As above, only the thread's own slot is written, and a slot going ``ALIVE -> COVERED`` cannot
     # change another thread's ``== ACCEPTED`` test.
+    #
+    # ``out_flag`` is the round's 0/1 survivor flag over the *work list*, in the dtype
+    # ``wp.utils.array_scan`` wants: this thread is the last writer of its point's state in the
+    # round, so the flag can be written at each exit rather than by a separate pass re-reading the
+    # state afterwards. The caller scans it **inclusively**, so the last entry is the survivor count
+    # and no second read is needed to recover it -- the same one-tail-read shape
+    # ``array.flatnonzero`` uses, and for the same reason: a host readback costs about as much as
+    # the whole rest of a round.
     t = wp.int32(wp.tid())
     i = alive[t]
     if out_state[i] != DART_ALIVE:
+        out_flag[t] = 0
         return
     p = pool_points[i]
     row = point_cell[i]
@@ -270,19 +300,9 @@ def dart_cover_neighbors(
                 continue
             if wp.length_sq(pool_points[k] - p) < rr:
                 out_state[i] = DART_COVERED
+                out_flag[t] = 0
                 return
-
-
-@wp.kernel
-def dart_alive_flags(
-    alive: wp.array[wp.int32], state: wp.array[wp.int32], out_flag: wp.array[wp.int32]
-) -> None:
-    # 0/1 survivor flags over the *work list*, in the dtype ``wp.utils.array_scan`` wants. The
-    # caller scans them **inclusively**, so the last entry is the survivor count and no second
-    # read is needed to recover it -- the same one-tail-read shape ``array.flatnonzero`` uses, and
-    # for the same reason: a host readback costs about as much as the whole rest of a round.
-    t = wp.int32(wp.tid())
-    out_flag[t] = wp.where(state[alive[t]] == DART_ALIVE, wp.int32(1), wp.int32(0))
+    out_flag[t] = 1
 
 
 @wp.kernel
@@ -290,14 +310,34 @@ def dart_compact_alive(
     alive: wp.array[wp.int32],
     state: wp.array[wp.int32],
     positions: wp.array[wp.int32],
+    priority: wp.array[wp.uint32],
+    point_cell: wp.array[wp.int32],
     out_next: wp.array[wp.int32],
+    out_cell_min_priority: wp.array[wp.uint32],
 ) -> None:
     # Next round's work list, from this round's: survivors keep their relative order, so the loop
     # walks a shrinking prefix instead of the whole pool. ``positions`` is the **inclusive** scan of
     # the survivor flags, so a survivor's slot is ``positions[t] - 1``; the caller reads the same
     # array's last entry as the round's survivor count, which is what makes one readback do the
     # work of two.
+    #
+    # The survivors are exactly the next round's alive set, so this is also where that round's
+    # per-cell priority summary is built (the caller refills it to ``DART_NO_PRIORITY`` first):
+    # one pass over this round's list instead of a second launch over the next one's.
     t = wp.int32(wp.tid())
     i = alive[t]
     if state[i] == DART_ALIVE:
         out_next[positions[t] - 1] = i
+        summarize_min_priority(priority, point_cell, i, out_cell_min_priority)
+
+
+@wp.kernel
+def dart_accepted_pool_mask(
+    state: wp.array[wp.int32], bucket: wp.array[wp.int32], out_mask: wp.array[wp.bool]
+) -> None:
+    # The accepted set as a pool-order mask, from the cell-sorted ``state``: ``bucket`` maps a
+    # sorted position back to its pool index, so the scatter *is* the inverse permutation and no
+    # inverse table or gather is built. The caller allocates ``out_mask`` zeroed.
+    s = wp.int32(wp.tid())
+    if state[s] == DART_ACCEPTED:
+        out_mask[bucket[s]] = True

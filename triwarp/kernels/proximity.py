@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, TOLERANCE_MERGE_CONSTANT, TWO_PI
 from triwarp.kernels import triangles as kernel_triangles
-from triwarp.kernels.array import lift_vec2, pack_nearest_key, tile_argmin
+from triwarp.kernels.array import lift_vec2, tile_argmin
 from triwarp.kernels.neighbors import MAX_SEARCH_ATTEMPTS, complete_radius, deepen_radius
 from triwarp.kernels.predicates import (
     barycentric_2d,
@@ -432,11 +432,23 @@ def face_to_mesh_distance_tiled(
 
 
 @wp.kernel
-def face_distance_keys(distance_sq: wp.array[wp.float32], out_keys: wp.array[wp.int64]) -> None:
-    # One sortable ``(distance, face)`` key per query face, so a single integer ``min`` over them is
-    # an argmin: which face carries the smallest distance, lowest index on a tie.
-    f = wp.int32(wp.tid())
-    out_keys[f] = pack_nearest_key(distance_sq[f], f)
+def normals_at_closest_faces(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    max_dist: wp.float32,
+    face_normals: wp.array[wp.vec3],
+    out_normals: wp.array[wp.vec3],
+) -> None:
+    # The normal of the face closest to each point, gathered in the same thread that found the face.
+    # A miss reads face 0, which is the wrapper's documented convention and keeps the read in range.
+    #
+    # Only the face index is wanted, so this stops at the query -- no ``mesh_eval_position`` and no
+    # distance -- where the three-launch form it replaces ran the full ``closest_point_on_mesh``
+    # kernel into three buffers, a ``wp.map`` clamping the index into a fourth and a gather into the
+    # result.
+    tid = wp.int32(wp.tid())
+    query = wp.mesh_query_point_no_sign(mesh_id, points[tid], max_dist)
+    out_normals[tid] = face_normals[wp.where(query.result, query.face, wp.int32(0))]
 
 
 @wp.func

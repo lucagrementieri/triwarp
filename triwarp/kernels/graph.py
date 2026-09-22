@@ -114,9 +114,21 @@ def shortest_path_envelope_pass(
 
 
 @wp.kernel
-def scatter_successor(directed_edges: wp.array2d[wp.int32], out_next: wp.array[wp.int32]) -> None:
+def scatter_successor(
+    directed_edges: wp.array2d[wp.int32],
+    out_next: wp.array[wp.int32],
+    out_node_mask: wp.array[wp.bool],
+) -> None:
+    # The successor table and the endpoint membership mask in one pass over the edges: both are
+    # per-edge scatters of the same two endpoints. The mask needs no range test of its own
+    # (``scatter.mark_membership_mask`` carries one) because ``out_next`` is indexed by the same
+    # raw endpoint unguarded -- the wrapper's range check before this launch is what both rely on.
     tid = wp.int32(wp.tid())
-    out_next[directed_edges[tid, 0]] = directed_edges[tid, 1]
+    a = directed_edges[tid, 0]
+    b = directed_edges[tid, 1]
+    out_next[a] = b
+    out_node_mask[a] = wp.bool(True)
+    out_node_mask[b] = wp.bool(True)
 
 
 @wp.kernel
@@ -201,13 +213,19 @@ def finalize_rank_positions(
     label_count: wp.array[wp.int32],
     steps: wp.array[wp.int32],
     out_position: wp.array[wp.int32],
+    out_node_labels: wp.array[wp.int32],
 ) -> None:
     # position = (cycle_length - hops to start) mod cycle_length; the positive modulo keeps
     # malformed chains (steps beyond cycle_length when in-edges collide) in range.
+    #
+    # ``out_node_labels`` is the gather ``labels[cycle_nodes]`` the wrapper groups the cycles by,
+    # written here because this thread has already loaded the label to find the cycle length.
     tid = wp.int32(wp.tid())
     v = cycle_nodes[tid]
-    cycle_length = label_count[labels[v]]
+    label = labels[v]
+    cycle_length = label_count[label]
     out_position[tid] = kernel_array.wrap_index(cycle_length - steps[v], cycle_length)
+    out_node_labels[tid] = label
 
 
 @wp.kernel

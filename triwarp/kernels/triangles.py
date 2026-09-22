@@ -272,12 +272,18 @@ def face_normals_and_areas(
     out_areas[f] = area
 
 
-@wp.kernel
-def angles(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_angles: wp.array2d[wp.float32]
-) -> None:
-    f = wp.int32(wp.tid())
-    edges = triangle_edges(vertices, faces, f)
+@wp.func
+def face_corner_angles(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_index: wp.int32
+) -> tuple[wp.float32, wp.float32, wp.float32]:
+    """
+    Interior angles at the three corners of face ``face_index``; all zero for a degenerate face.
+
+    The body of the ``angles`` kernel, named so a kernel that weights by corner angle can take them
+    in registers rather than through an ``(n_faces, 3)`` table -- ``vertices.vertex_normals``'
+    ``"angle"`` path is the one that does.
+    """
+    edges = triangle_edges(vertices, faces, face_index)
 
     # ``vector_angle`` is atan2(|a x b|, a . b) and is scale-free, so the edges go in unnormalized
     # (three ``wp.normalize`` calls fewer) -- and a sliver, whose angles sit near 0 and pi, is
@@ -296,19 +302,25 @@ def angles(
     # there each angle is derived independently (so the three sum to pi only up to round-off) and a
     # sliver reads 0 or pi through the acos clamp, where this one takes the third angle as
     # ``PI - a0 - a1`` and zeroes all three of a degenerate face.
-    out_angles[f, 0] = vector_angle(edges[0], edges[1])
-    out_angles[f, 1] = vector_angle(-edges[0], edges[2])
-    out_angles[f, 2] = PI - out_angles[f, 0] - out_angles[f, 1]
+    a0 = vector_angle(edges[0], edges[1])
+    a1 = vector_angle(-edges[0], edges[2])
+    a2 = PI - a0 - a1
+    if (
+        (a0 < TOLERANCE_MERGE_CONSTANT)
+        or (a1 < TOLERANCE_MERGE_CONSTANT)
+        or (a2 < TOLERANCE_MERGE_CONSTANT)
+    ):
+        return wp.float32(0.0), wp.float32(0.0), wp.float32(0.0)
+    return a0, a1, a2
 
-    degen = (
-        (out_angles[f][0] < TOLERANCE_MERGE_CONSTANT)
-        or (out_angles[f][1] < TOLERANCE_MERGE_CONSTANT)
-        or (out_angles[f][2] < TOLERANCE_MERGE_CONSTANT)
-    )
-    if degen:
-        out_angles[f, 0] = 0.0
-        out_angles[f, 1] = 0.0
-        out_angles[f, 2] = 0.0
+
+@wp.kernel
+def angles(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_angles: wp.array2d[wp.float32]
+) -> None:
+    f = wp.int32(wp.tid())
+    a0, a1, a2 = face_corner_angles(vertices, faces, f)
+    write_row_triple(out_angles, f, a0, a1, a2)
 
 
 @wp.func

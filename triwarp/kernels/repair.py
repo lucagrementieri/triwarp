@@ -9,7 +9,14 @@ from triwarp.kernels.array import (
 )
 from triwarp.kernels.halfedge import halfedge_destination, halfedge_next
 from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_normal
-from triwarp.kernels.triangles import corner_triple, triangle_cross, write_corner_triple
+from triwarp.kernels.triangles import (
+    QUALITY_AREA,
+    corner_triple,
+    face_vertices,
+    triangle_cross,
+    triangle_quality,
+    write_corner_triple,
+)
 
 
 @wp.func
@@ -66,23 +73,28 @@ def resolve_duplicate_groups(
     first_positive: wp.array[wp.int32],
     first_negative: wp.array[wp.int32],
     out_keep: wp.array[wp.int32],
+    out_keep_mask: wp.array[wp.bool],
     out_error_group: wp.array[wp.int32],
 ) -> None:
     # Keep-decision per duplicate group (igl::resolve_duplicated_faces): singletons stay; a net
     # +1/-1 orientation keeps the first member of the majority sign; a cancelling group drops;
     # anything else is non-orientable (the smallest offending group index is reported).
+    #
+    # ``out_keep_mask`` is ``out_keep >= 0``, written by the thread that decided it so the caller
+    # can compact the kept groups without a second pass re-reading ``out_keep`` for the sign.
     ui = wp.int32(wp.tid())
     count = signed_count[ui]
+    keep = wp.int32(-1)
     if member_count[ui] == 1:
-        out_keep[ui] = first_member[ui]
+        keep = first_member[ui]
     elif count == 1:
-        out_keep[ui] = first_positive[ui]
+        keep = first_positive[ui]
     elif count == -1:
-        out_keep[ui] = first_negative[ui]
-    else:
-        out_keep[ui] = wp.int32(-1)
-        if count != 0:
-            wp.atomic_min(out_error_group, 0, ui)
+        keep = first_negative[ui]
+    elif count != 0:
+        wp.atomic_min(out_error_group, 0, ui)
+    out_keep[ui] = keep
+    out_keep_mask[ui] = keep >= 0
 
 
 @wp.kernel
@@ -125,9 +137,12 @@ def small_triangle_collapse_edges(
     faces: wp.array[wp.int32],
     min_dbl_area: wp.float32,
     out_pairs: wp.array2d[wp.int32],
-    out_flag: wp.array[wp.int32],
+    out_count: wp.array[wp.int32],
 ) -> None:
-    """Flag faces with double-area below ``min_dbl_area`` and emit their shortest edge (libigl)."""
+    """Emit the shortest edge of each face with double-area below ``min_dbl_area`` (libigl)."""
+    # ``out_count`` is how many faces were small, which is all the caller's loop reads: one
+    # *conditional* atomic per small face -- contention scales with the (rare) hits, not with the
+    # launch -- in place of a per-face flag buffer the caller would reduce and read back.
     f = wp.int32(wp.tid())
     i0, i1, i2 = corner_triple(faces, f)
     dbl_area = wp.length(triangle_cross(vertices, faces, f))
@@ -143,11 +158,10 @@ def small_triangle_collapse_edges(
         update_argmin_pair(best, a, b, wp.length_sq(v0 - v2), i2, i0)
         out_pairs[f, 0] = a
         out_pairs[f, 1] = b
-        out_flag[f] = wp.int32(1)
+        wp.atomic_add(out_count, 0, 1)
     else:
         out_pairs[f, 0] = i0
         out_pairs[f, 1] = i0
-        out_flag[f] = wp.int32(0)
 
 
 @wp.kernel
@@ -181,6 +195,30 @@ def flip_faces_masked(
     """Copy ``faces`` to ``out_faces``, reversing winding (swap corners 1,2) where ``flip > 0``."""
     f = wp.int32(wp.tid())
     write_face_winding(faces, f, flip[f] > wp.int32(0), out_faces)
+
+
+@wp.kernel
+def flip_all_faces(faces: wp.array[wp.int32], out_faces: wp.array[wp.int32]) -> None:
+    """Copy ``faces`` to ``out_faces`` with every winding reversed (corners 1 and 2 swapped)."""
+    # ``flip_faces_masked``' convention with the mask constant, so the whole-mesh flip needs no
+    # all-ones flag buffer allocated only to be read back as ``True`` at every face.
+    f = wp.int32(wp.tid())
+    write_face_winding(faces, f, True, out_faces)
+
+
+@wp.kernel
+def scatter_face_area_by_group(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    groups: wp.array[wp.int32],
+    out_group_area: wp.array[wp.float32],
+) -> None:
+    # Each face's area added into its group's slot. The area is ``triangle_quality``'s, so it is the
+    # value ``triangles.face_quality(metric="area")`` would have stored for this face -- computed
+    # where it is summed rather than written to a per-face buffer for this pass to read back.
+    f = wp.int32(wp.tid())
+    v0, v1, v2 = face_vertices(vertices, faces, f)
+    wp.atomic_add(out_group_area, groups[f], triangle_quality(v0, v1, v2, QUALITY_AREA))
 
 
 @wp.kernel
@@ -326,19 +364,22 @@ def emit_degree3_replacement(
     ring_halfedges: wp.array[wp.int32],
     selected: wp.array[wp.bool],
     cursor: wp.array[wp.int32],
-    out_dropped: wp.array[wp.bool],
+    out_keep: wp.array[wp.bool],
     out_new_faces: wp.array2d[wp.int32],
 ) -> None:
     # The three faces around a selected vertex become one: its link is a triangle already, since the
     # ring is counter-clockwise and has exactly three entries. Winding follows the ring, so the
     # replacement points the same way the fan did.
+    #
+    # ``out_keep`` arrives all ``True`` and each fan face is cleared here, so it is the kept-face
+    # mask itself rather than a dropped-face mask the caller would have to negate in a second pass.
     v = wp.int32(wp.tid())
     if not selected[v]:
         return
     begin = ring_offsets[v]
     slot = wp.atomic_add(cursor, 0, 1)
     for k in range(3):
-        out_dropped[ring_halfedges[begin + k] // 3] = True
+        out_keep[ring_halfedges[begin + k] // 3] = False
         out_new_faces[slot, k] = halfedge_destination(faces, ring_halfedges[begin + k])
 
 

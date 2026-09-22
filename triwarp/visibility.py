@@ -42,7 +42,6 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.bounds import enclosing_diagonal
-from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import visibility as kernel_visibility
 from triwarp.proximity import ITEMS_PER_QUERY_SLICE, normals_at_closest_faces
 
@@ -607,11 +606,8 @@ def max_tangent_sphere(
 
     # All per-iteration buffers are preallocated once and ping-ponged (the step kernel writes
     # every lane, passing converged state through). The convergence count is checked every
-    # iteration on purpose: an extra iteration runs a full BVH closest-point pass, far more
-    # expensive than the 8-byte readback the check costs.
-    n_pts_wp = wp.empty(m, dtype=wp.vec3, device=device)
-    n_dists_wp = wp.empty(m, dtype=wp.float32, device=device)
-    n_face_wp = wp.empty(m, dtype=wp.int32, device=device)
+    # iteration on purpose: an extra iteration runs a BVH closest-point query for every point still
+    # shrinking, far more expensive than the 8-byte readback the check costs.
     new_radii = wp.empty(m, dtype=wp.float32, device=device)
     new_centers = wp.empty(m, dtype=wp.vec3, device=device)
     new_nc = wp.empty(m, dtype=wp.bool, device=device)
@@ -621,21 +617,15 @@ def max_tangent_sphere(
             break
 
         wp.launch(
-            kernel_proximity.closest_point_on_mesh,
-            dim=m,
-            inputs=[mesh.id, centers, wp.float32(max_t), n_pts_wp, n_dists_wp, n_face_wp],
-            device=device,
-        )
-        wp.launch(
             kernel_visibility.step_sphere_shrink,
             dim=m,
             inputs=[
+                mesh.id,
                 points,
                 ray_dirs,
-                n_pts_wp,
-                n_dists_wp,
                 centers,
                 radii,
+                wp.float32(max_t),
                 convergence_threshold,
                 not_converged,
                 new_radii,

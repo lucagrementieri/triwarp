@@ -3342,6 +3342,14 @@ Consequence: the shared argmin/argmax/swap helpers in `kernels/array.py` are con
   have to be disabled in every module using `triangle_cross`. **So write degeneracy tests with
   scale-aware inputs** — scale vertices to ~1e-2 so genuine altitudes stay far above `1e-8` while the
   FMA residual stays far below it — and never assume CPU/GPU bit-agreement on zero-area faces.
+- **The same contraction makes `-orient2d(p)` and `orient2d(mirror_y(p))` different predicates
+  on CUDA.** Algebraically they are one value; under `fuse_fp` the two expressions contract
+  differently, and a near-collinear vertex flips its convex/reflex verdict. Found folding
+  `polyline_triangulate`'s reflex count for the y-mirrored loop into the turning-angle pass: the
+  negated form pushed a 20 000-point convex ring off the fan path on CUDA only. The kernel
+  evaluates the mirrored loop explicitly (`kernels/polyline.mirror_y`). **Never substitute an
+  algebraic identity inside a sign test that feeds a branch** — it is bit-exact on CPU and not on
+  CUDA, so a CPU byte-identity gate will not see it.
 - **`wp.mesh_query_point_no_sign` + `wp.mesh_eval_position` is not an exact closest-point query** —
   it disagrees with an independent float64 oracle by up to ~2e-5 absolute, always reporting the
   *smaller* distance, and is a fixed point (re-querying from its own answer doesn't converge closer).
@@ -4253,6 +4261,10 @@ serial loop there is no GPU win being paid for.
       large-`n` NumPy oracle is unavailable (a float64 sequential `cumsum` against Warp's float32
       tree scan differs by the same order as the gaps between decisions), so exactness is pinned
       triwarp-against-triwarp and the large-`n` test is invariants only.
+    - **The crossover is stale.** `_DOWNSAMPLE_DOUBLING_FROM` was measured when a doubling
+      round cost two launches; `double_greedy_orbit` now fuses them into one (34 -> 19 launches
+      at n = 20 000), so the doubled walk is cheaper at every size and the real crossover is
+      lower than 8 192. Re-probe with a clock before trusting the constant.
 
 ### 14.8 Solvers: the cycle is launch-bound
 
@@ -5254,6 +5266,14 @@ through its module, and nothing calls `wp.load_module` / `wp.force_load` at impo
       never reached the captured loop at all, their launch count identical at every value, so half
       the set was structurally unable to respond to the knob. **Read the launch count beside the
       ratio**: a cell whose launch count does not move under a knob is not evidence about it.
+- **SHIPPED — `_BatchedCg` records its `capture_while` graph once per solver object and replays
+  it.** It had re-recorded and re-instantiated the graph on every `solve`, which is the
+  "record, replay once" row of §14.3 paid once per call. Legal because every buffer the graph
+  touches is owned by the solver and never rebound, and `_initialize` resets the loop condition
+  before each replay. **1.77x on `filter_laplacian(implicit_time_integration=True)` at ten passes
+  and 1.15x on `arap`**, iteration counts identical. The guard is
+  `test_spd_column_solver_reads_a_rewritten_rhs_on_every_call`: the older reuse test re-solved the
+  *same* right-hand side, which a stale replay passes.
 - **REMOVED — block conjugate gradient over two columns (`_BlockCg2`).** On well-conditioned systems
   a wash to +3 %; on ill-conditioned ones its iteration count goes *up* by 2.14x, because the two
   columns' search directions go nearly parallel and the shared subspace stops buying anything. A
@@ -5536,3 +5556,58 @@ recording. Accept it deliberately, with launches, allocations and readbacks held
   whatever the mesh — which is `triwarp.boundary`'s own floor and is recorded as closed (§16.5).
   `fill_fan[holes_many]` is 2.2 ms of which 2.1 is that call, so a filler row at the small end is
   measuring `boundary`, not `holes`.
+
+### 16.13 The whole-`kernels/` sweep (2026-09-22)
+
+Eight reviewers, one per disjoint group of kernel modules and their wrappers, working in the live
+tree at once. What made that workable, and worth reusing: **file ownership was disjoint** (a
+change needing another group's file was reported, not made); **evidence was counts only**
+(launches, allocations, copies, readbacks, from a monkeypatch census at two sizes), because eight
+processes sharing the GPU make any clock a fiction (§15.6); and **each byte-identity gate ran on
+an overlay** — the baseline worktree with only that reviewer's files laid over it — because the
+live tree's counts mixed every reviewer's savings. The clock came last, on a quiet box, one A/B
+over 69 public calls in alternating processes, reading the `min` of three runs per arm.
+
+**Result: no call regressed, and the ratio tracks how host-bound the call was, exactly as §16.1
+predicts.** 2-3.8x where a whole pipeline collapsed (`connected_component_labels_from_edges`
+3.09x, `vertex_normals` 2.84x, `polyline_angles(closed=True)` 3.77x,
+`remap_discrete_attribute_from_uv` 2.59x, `uv_seam_vertex_mask` 2.21x,
+`face_defective_mask` 2.17x); 1.2-1.6x across the mid-level surface (`split_batched`,
+`subdivide_to_size`, `split_edges`, `face_adjacency_convex`, `boundary_loops_batched`,
+`fill_min_weight`, `cluster_decimate`, `filter_laplacian`); and **flat (1.00-1.02x) on every
+device-bound call** — chamfer, Hausdorff, `max_tangent_sphere`, `normals_at_closest_faces`,
+`mesh_to_mesh_distance` — even where their launch counts fell by a third. That is not a failed
+optimisation; it is §15.2's share rule. `isotropic_remesh` 1.17x and `fix_self_intersections`
+1.12x are the large-call cases where the removed work was a real share.
+
+Findings that generalise past this pass:
+
+- **An edge-parallel union-find replaces a CSR build whenever the answer is "smallest id per
+  component".** `ecl_hook_edges` hooks the larger root under the smaller, so every label is the
+  component's minimum node id whatever order the unions ran in, and the labels equal the CSR
+  path's exactly. It drops `bsr_from_triplets` and its radix sort from every caller
+  (`face_connected_component_labels` 1.65x, `boundary_loops_batched`, `vertex_manifold_mask`,
+  `successor_cycles`).
+- **`array_cast` is generic, so `astype` pays generic dispatch on every call.** A census of
+  `array_cast` over the suite put four dtype pairs at 97.9 % of calls; `kernel_array.ASTYPE`
+  launches concrete kernels for those and falls back for the rest (1.56x on the call).
+- **A derivation already paid for is often recomputed one call later.** `metrics` reduced the
+  same array for the forward maximum and again for `"max"` Chamfer; `triangulate_point_cloud`
+  sorted and hashed the same rows twice; `isotropic_remesh` built an edge grouping its next stage
+  rebuilt; `voxel_down_sample` probed point slots pooling had just probed. Grep a wrapper for two
+  calls fed the same arguments before looking for anything cleverer.
+- **Three call-site conversions the shared-library changes enabled**: `mask_to_compact_ranks`
+  now scans in place, so `counts_to_offsets(astype(mask, wp.int32))` is strictly worse and was
+  converted at every site; `unique_1d` returns its values as a prefix view of the sort scratch,
+  so a returned array keeps a buffer twice its length alive — a deliberate trade of memory for a
+  copy; and `read_scalar` copies with `src_offset=` from a contiguous rank-1 source, which is safe
+  because the destination is still pageable (§12.1's race needs a pinned one).
+- **Declined as noise, with the reason at each site**: fusing the multigrid V-cycle's matvec into
+  its Jacobi sweep (inside a captured loop, §14.10), graph-capturing ball pivoting's 8-wave batch
+  (needs a device/wall split first — likely device-bound), and every ICP-loop fusion beyond the
+  per-iteration memsets (the loop reads a scalar back each iteration, so the clock stays flat).
+- **Open, needing an allowlist entry in `tests/api_conventions.py` rather than more code**: a
+  Poisson-disk deletion fusion (built, verified, reverted — one map per round), clearing
+  `candidate[e]` in `homology`'s `forest_link` instead of a separate `in_forest` mask, and zeroing
+  `arap`'s rotation right-hand sides in the kernel that reads them.
+

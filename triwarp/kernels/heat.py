@@ -86,15 +86,15 @@ def unit_gradient_divergence(
     normals: wp.array[wp.vec3],
     areas: wp.array[wp.float32],
     values: wp.array[wp.float64],
-    sign: wp.float64,
     cot_entries: wp.array2d[wp.float32],
     out_div: wp.array[wp.float64],
 ) -> None:
-    # The field's unit gradient direction times an explicit sign, integrated by the same thread
-    # that forms it. For a distance field the direction is radial: ``sign = -1`` is
-    # ``X = -grad(u)/|grad(u)|``, the direction the heat solve's Poisson stage integrates back into
-    # a distance, and ``sign = +1`` is the direction *away* from the source, which is what
-    # ``scatter_unit_gradient_to_vertices`` scatters for the log map's angle.
+    # The field's unit gradient direction, integrated by the same thread that forms it. For a
+    # distance field the direction is radial, *away* from the source -- the opposite of the
+    # ``X = -grad(u)/|grad(u)|`` the heat method integrates back into a distance. That is what
+    # ``heat_geodesic`` wants all the same: its Poisson right-hand side is ``-div(X)``, and since
+    # the divergence is linear in the field and a sign flip is exact in every product and sum
+    # below, integrating the opposite direction accumulates that negation directly.
     #
     # The gradient is deliberately *not* merged into ``triangles.face_gradients`` behind a
     # ``normalize`` flag: the arithmetic is already shared -- ``face_unit_gradient`` is
@@ -103,7 +103,7 @@ def unit_gradient_divergence(
     # mode). The two also return different quantities: a gradient carries the field's rate of
     # change, this carries only a direction.
     f = wp.int32(wp.tid())
-    x = sign * face_unit_gradient(vertices, faces, normals, areas, values, f)
+    x = face_unit_gradient(vertices, faces, normals, areas, values, f)
     accumulate_face_divergence(vertices, faces, cot_entries, f, x, out_div)
 
 
@@ -353,14 +353,14 @@ def scatter_unit_gradient_to_vertices(
     normals: wp.array[wp.vec3],
     areas: wp.array[wp.float32],
     values: wp.array[wp.float64],
-    sign: wp.float64,
     out_vertex_field: wp.array[wp.vec3],
 ) -> None:
-    # The log map's radial direction -- the unit gradient of the distance field -- formed and
-    # scattered onto vertices by the same thread. The scatter is a plain area-weighted add: the
-    # weights are the same for all three corners, so no normalization is needed before projecting.
+    # The log map's radial direction -- the unit gradient of the distance field, pointing away from
+    # the source -- formed and scattered onto vertices by the same thread. The scatter is a plain
+    # area-weighted add: the weights are the same for all three corners, so no normalization is
+    # needed before projecting.
     f = wp.int32(wp.tid())
-    x = sign * face_unit_gradient(vertices, faces, normals, areas, values, f)
+    x = face_unit_gradient(vertices, faces, normals, areas, values, f)
     area = areas[f]
     value = wp.vec3(wp.float32(x[0]) * area, wp.float32(x[1]) * area, wp.float32(x[2]) * area)
     add_corner_triple(out_vertex_field, faces, f, value, value, value)

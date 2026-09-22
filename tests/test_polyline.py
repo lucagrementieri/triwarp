@@ -439,9 +439,10 @@ def test_polyline_angles_closed_is_indexed_by_vertex_not_by_segment(device: str)
     """
     A hand-computed right triangle pins the per-vertex indexing, independent of ``_angles_np``.
 
-    ``cyclic_segment_angles`` writes the angle between segment ``i`` and its cyclic successor,
-    which is the turning angle at vertex ``i + 1``, not vertex ``i`` -- an off-by-one rotation that
-    a fuzz comparison against a reference sharing the same convention would not catch. The
+    The turning angle at vertex ``i`` is the angle between segment ``i - 1`` and segment ``i``,
+    and the angle between segment ``i`` and its cyclic successor belongs to vertex ``i + 1`` -- an
+    off-by-one rotation that a fuzz comparison against a reference sharing the same convention
+    would not catch. The
     triangle's three turning angles (90 degrees at the right-angle corner, 135 degrees at the other
     two, i.e. 180 minus each interior angle) are distinct enough that a rotated result cannot pass
     by coincidence.

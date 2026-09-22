@@ -731,7 +731,7 @@ def test_edges_unique_unvalidated_matches_the_validated_answer(device: str) -> N
     broken_np = faces_np.copy()
     broken_np[0] = n_vertices + 5
     broken_wp = wp.array(broken_np, dtype=wp.int32, device=device)
-    with pytest.raises(ValueError, match="must be less than max_index"):
+    with pytest.raises(ValueError, match="must be less than n_vertices"):
         _ = tw.edges.edges_unique(broken_wp, n_vertices=n_vertices)
 
     # And the inferred-bound path checks the half it can: a negative index.

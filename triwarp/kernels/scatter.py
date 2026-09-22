@@ -288,6 +288,25 @@ def scatter_index_where(
 
 
 @wp.kernel
+def scatter_index_where_scanned(
+    inclusive: wp.array[wp.int32], out_scattered: wp.array[wp.int32]
+) -> None:
+    # ``scatter_index_where`` for a caller that scanned its 0/1 flags *in place*, so only the
+    # inclusive scan survives: position ``i`` was selected exactly when the scan steps there, and
+    # it lands at the step's own value minus one. One flag buffer fewer than the two-array form --
+    # ``array.flatnonzero`` allocates one ``(n,)`` ``int32`` instead of two -- for one neighbouring,
+    # coalesced read per thread.
+    i = wp.int32(wp.tid())
+    position = inclusive[i]
+    # A branch, not ``wp.where``: that evaluates both arms, and ``inclusive[-1]`` is out of bounds.
+    before = wp.int32(0)
+    if i > 0:
+        before = inclusive[i - 1]
+    if position != before:
+        out_scattered[position - 1] = i
+
+
+@wp.kernel
 def scatter_edge_incidence(
     inverse: wp.array[wp.int32],
     out_edge_face_count: wp.array[wp.int32],

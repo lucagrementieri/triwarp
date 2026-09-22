@@ -87,7 +87,7 @@ def mean_vertex_normals(
     require_same_device(faces=faces, face_normals=face_normals)
     _require_face_rows(int(faces.shape[0]) // 3, face_normals=face_normals)
     return _accumulate_and_normalize(
-        n_vertices, faces, kernel_scatter.SCATTER_SUM_VEC, face_normals
+        n_vertices, faces, kernel_scatter.SCATTER_SUM_VEC, [face_normals, faces.reshape((-1, 3))]
     )
 
 
@@ -141,7 +141,10 @@ def weighted_vertex_normals(
         int(faces.shape[0]) // 3, face_normals=face_normals, face_weights=face_weights
     )
     return _accumulate_and_normalize(
-        n_vertices, faces, kernel_scatter.SCATTER_WEIGHTED_SUM_VEC, face_normals, face_weights
+        n_vertices,
+        faces,
+        kernel_scatter.SCATTER_WEIGHTED_SUM_VEC,
+        [face_normals, faces.reshape((-1, 3)), face_weights],
     )
 
 
@@ -149,15 +152,15 @@ def _accumulate_and_normalize(
     n_vertices: int,
     faces: wp.array[wp.int32],
     scatter_table: kernel_array.OverloadTable,
-    values: wp.array[wp.vec3],
-    *extra: twt.ArrayNd,
+    inputs: list[twt.ArrayNd],
 ) -> wp.array[wp.vec3]:
     """
     Scatter per-face vectors onto their corners and unit-normalize the sums.
 
-    The shared body of the module's two primitives: the scatter kernel decides whether each face
-    contributes its vector once or scaled by a per-corner weight, and the other three public
-    functions reach this through one of them.
+    The shared body of every normal in the module: the scatter kernel decides what each face
+    contributes to each of its corners -- a supplied vector once or scaled by a per-corner weight,
+    or, for ``vertex_normals``' derived paths, a weighted normal it computes from the geometry
+    itself so that no per-face table is written just to be read back once.
 
     Accumulation is ``float64`` in an ``(n_vertices, 3)`` buffer even though both the input and the
     answer are ``float32``, which is what makes the result reproducible run to run on a CUDA device
@@ -174,14 +177,12 @@ def _accumulate_and_normalize(
     faces
         Flat ``wp.int32`` triangle index buffer; reshaped to ``(f, 3)`` for the scatter.
     scatter_table
-        ``kernels.scatter`` overload table whose kernel takes ``(values, faces2d, *extra,
-        out_sums)`` -- the face table is the *second* argument in that family, not the last input.
-        Both of them are generic over the accumulator's precision, so the table is keyed by it.
-    values
-        ``(f,)`` per-face vectors to accumulate.
-    extra
-        Any further per-face arrays the kernel takes between the face table and the output, such as
-        ``scatter_weighted_sum_vec``'s per-corner weights.
+        Overload table of a kernel launched one thread per face that takes ``(*inputs,
+        out_sums)`` -- a ``kernels.scatter`` accumulator or one of ``kernels.vertices``' fused
+        ones. All of them are generic over the accumulator's precision, so the table is keyed by
+        it.
+    inputs
+        The kernel's arguments before the accumulator, in its own order.
 
     Returns
     -------
@@ -190,19 +191,15 @@ def _accumulate_and_normalize(
 
     Notes
     -----
-    The launch ``dim`` is taken from ``faces``, not from ``values``: every array here is indexed by
-    the face, and ``faces`` is the only one of them whose length also bounds the *gather* the
-    scatter kernel does. Callers guarantee the rest agree by calling ``_require_face_rows`` first.
+    The launch ``dim`` is taken from ``faces``, not from any per-face input: every array here is
+    indexed by the face, and ``faces`` is the only one of them whose length also bounds the
+    *gather* the scatter kernel does. Callers guarantee the rest agree by calling
+    ``_require_face_rows`` first.
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     sums = wp.zeros((n_vertices, 3), dtype=_ACCUMULATOR_DTYPE, device=device)
-    wp.launch(
-        scatter_table[_ACCUMULATOR_DTYPE],
-        dim=n_faces,
-        inputs=[values, faces.reshape((-1, 3)), *extra, sums],
-        device=device,
-    )
+    wp.launch(scatter_table[_ACCUMULATOR_DTYPE], dim=n_faces, inputs=[*inputs, sums], device=device)
     vec_normals = wp.empty(n_vertices, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_vertices.NORMALIZE_ACCUMULATED_ROWS[_ACCUMULATOR_DTYPE],
@@ -332,6 +329,12 @@ def vertex_normals(
         return weighted_vertex_normals(n_vertices, faces, face_normals, corner_weights)
 
     if weighting == "angle":
+        if face_normals is None and face_weights is None:
+            # Nothing supplied: one kernel derives each face's normal and corner angles in
+            # registers and scatters their products, so neither per-face table is written.
+            return _accumulate_and_normalize(
+                n_vertices, faces, kernel_vertices.SCATTER_ANGLE_WEIGHTED_NORMALS, [vertices, faces]
+            )
         if face_normals is None:
             face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
         angles = tw.triangles.face_angles(vertices, faces) if face_weights is None else face_weights
@@ -339,8 +342,14 @@ def vertex_normals(
             n_vertices, faces, face_normals, twt.as_array2d(angles, wp.float32)
         )
 
-    # "area": scale each face normal by its area once, then accumulate with unit weights -- the
+    # "area": each face contributes its normal scaled by its area to all three corners -- the
     # weight is per *face* here rather than per corner, so this is the cheaper of the two paths.
+    # With nothing supplied one kernel derives and scatters the product in registers; otherwise
+    # the missing table is derived and the product is still formed inside the scatter.
+    if face_normals is None and face_weights is None:
+        return _accumulate_and_normalize(
+            n_vertices, faces, kernel_vertices.SCATTER_AREA_WEIGHTED_NORMALS, [vertices, faces]
+        )
     if face_normals is None or face_weights is None:
         computed_normals, computed_areas = tw.triangles.face_normals_and_areas(vertices, faces)
         if face_normals is None:
@@ -348,9 +357,12 @@ def vertex_normals(
         if face_weights is None:
             face_weights = computed_areas
     _require_face_rows(n_faces, face_normals=face_normals, face_weights=face_weights)
-    scaled_normals = wp.empty(n_faces, dtype=wp.vec3, device=device)
-    wp.map(wp.mul, face_normals, face_weights, out=scaled_normals)
-    return mean_vertex_normals(n_vertices, faces, scaled_normals)
+    return _accumulate_and_normalize(
+        n_vertices,
+        faces,
+        kernel_vertices.SCATTER_SCALED_NORMALS,
+        [face_normals, face_weights, faces],
+    )
 
 
 def vertex_defects(

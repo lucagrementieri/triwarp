@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import Literal, cast, overload
+from typing import Literal, NamedTuple, cast, overload
 
+import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -50,9 +51,20 @@ _DiffReduction = Literal["mean", "sum"]
 # Per-point squared-distance result when ``point_reduction is None``.
 _UnreducedChamfer = twt.Array1dFloat32 | tuple[twt.Array1dFloat32, twt.Array1dFloat32]
 
-# Forward/backward per-element distances from one of the three geometry dispatches; ``None`` in the
-# second slot is the single-directional case.
-_DistancePair = tuple[wp.array[wp.float32], wp.array[wp.float32] | None]
+
+class _Distances(NamedTuple):
+    """
+    Forward/backward per-element distances from one of the three geometry dispatches.
+
+    ``backward`` is ``None`` in the single-directional case. ``forward_max`` is the forward array's
+    maximum when the dispatch already read it back to seed the backward search, so a ``"max"``
+    reduction or a Hausdorff distance reuses that value instead of reducing the same array again;
+    ``None`` when nothing has read it.
+    """
+
+    forward: wp.array[wp.float32]
+    backward: wp.array[wp.float32] | None
+    forward_max: float | None
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +143,7 @@ def chamfer_points_to_points(
     distances = _distances_points_to_points(x, y, single_directional)
     if distances is None:
         return _empty_chamfer(point_reduction, single_directional, x.device)
-    return _chamfer(*distances, point_reduction, single_directional)
+    return _chamfer(distances, point_reduction, single_directional)
 
 
 @overload
@@ -210,7 +222,7 @@ def chamfer_points_to_mesh(
     distances = _distances_points_to_mesh(points, vertices, faces, single_directional)
     if distances is None:
         return _empty_chamfer(point_reduction, single_directional, points.device)
-    return _chamfer(*distances, point_reduction, single_directional)
+    return _chamfer(distances, point_reduction, single_directional)
 
 
 @overload
@@ -292,7 +304,7 @@ def chamfer_mesh_to_mesh(
     )
     if distances is None:
         return _empty_chamfer(point_reduction, single_directional, vertices_a.device)
-    return _chamfer(*distances, point_reduction, single_directional)
+    return _chamfer(distances, point_reduction, single_directional)
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +405,7 @@ def chamfer_points_to_points_loss(
     terms = [lambda: _launch_nn_term(x, y, nearest_xy, _reduction_scale(point_reduction, n), loss)]
     if not single_directional:
         nearest_yx = tw.neighbors.query_nearest(
-            x, y, k=1, initial_radius=_backward_radius(dist_xy)
+            x, y, k=1, initial_radius=_backward_radius(_forward_max(dist_xy))
         )[0]
         terms.append(
             lambda: _launch_nn_term(y, x, nearest_yx, _reduction_scale(point_reduction, m), loss)
@@ -474,7 +486,7 @@ def chamfer_points_to_mesh_loss(
     ]
     if not single_directional:
         nearest_vp = tw.neighbors.query_nearest(
-            points, vertices, k=1, initial_radius=_backward_radius(dist_forward)
+            points, vertices, k=1, initial_radius=_backward_radius(_forward_max(dist_forward))
         )[0]
         terms.append(
             lambda: _launch_nn_term(
@@ -550,14 +562,19 @@ def chamfer_mesh_to_mesh_loss(
         return loss
 
     # Non-differentiable closest-face assignment for each direction (outside the tape).
-    face_id_ab = tw.proximity.closest_point_on_mesh(vertices_b, faces_b, vertices_a)[2]
+    max_dist = _mesh_pair_search_radius(vertices_a, vertices_b, single_directional)
+    face_id_ab = tw.proximity.closest_point_on_mesh(
+        vertices_b, faces_b, vertices_a, max_dist=max_dist
+    )[2]
     terms = [
         lambda: _launch_surface_term(
             vertices_a, vertices_b, faces_b, face_id_ab, _reduction_scale(point_reduction, va), loss
         )
     ]
     if not single_directional:
-        face_id_ba = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[2]
+        face_id_ba = tw.proximity.closest_point_on_mesh(
+            vertices_a, faces_a, vertices_b, max_dist=max_dist
+        )[2]
         terms.append(
             lambda: _launch_surface_term(
                 vertices_b,
@@ -617,7 +634,7 @@ def hausdorff_points_to_points(
     distances = _distances_points_to_points(x, y, single_directional)
     if distances is None:
         return 0.0
-    return _hausdorff(*distances, single_directional)
+    return _hausdorff(distances, single_directional)
 
 
 def hausdorff_points_to_mesh(
@@ -664,7 +681,7 @@ def hausdorff_points_to_mesh(
     distances = _distances_points_to_mesh(points, vertices, faces, single_directional)
     if distances is None:
         return 0.0
-    return _hausdorff(*distances, single_directional)
+    return _hausdorff(distances, single_directional)
 
 
 def hausdorff_mesh_to_mesh(
@@ -715,7 +732,7 @@ def hausdorff_mesh_to_mesh(
     )
     if distances is None:
         return 0.0
-    return _hausdorff(*distances, single_directional)
+    return _hausdorff(distances, single_directional)
 
 
 # ---------------------------------------------------------------------------
@@ -735,28 +752,28 @@ def _validate_point_reduction(point_reduction: _PointReduction | None) -> None:
 
 
 def _chamfer(
-    d_forward: wp.array[wp.float32],
-    d_backward: wp.array[wp.float32] | None,
-    point_reduction: _PointReduction | None,
-    single_directional: bool,
+    distances: _Distances, point_reduction: _PointReduction | None, single_directional: bool
 ) -> float | _UnreducedChamfer:
     """
     Combine forward/backward Euclidean distances into a Chamfer value.
 
-    Distances are squared element-wise (pytorch3d convention) before reduction.
+    Distances are squared element-wise (pytorch3d convention) before reduction. A reduced value
+    never materializes the squared array -- see
+    [`_reduce_squared`][triwarp.metrics._reduce_squared].
     """
-    sq_forward = _square(d_forward)
     if point_reduction is None:
+        sq_forward = _square(distances.forward)
         if single_directional:
             return sq_forward
-        return sq_forward, _square(cast(wp.array[wp.float32], d_backward))
+        return sq_forward, _square(cast(wp.array[wp.float32], distances.backward))
 
-    reduced_forward = _reduce(sq_forward, point_reduction)
+    reduced_forward = _reduce_squared(distances.forward, point_reduction, distances.forward_max)
     if single_directional:
         return reduced_forward
 
-    sq_backward = _square(cast(wp.array[wp.float32], d_backward))
-    reduced_backward = _reduce(sq_backward, point_reduction)
+    reduced_backward = _reduce_squared(
+        cast(wp.array[wp.float32], distances.backward), point_reduction, None
+    )
     if point_reduction == "max":
         return max(reduced_forward, reduced_backward)
     return reduced_forward + reduced_backward
@@ -770,29 +787,40 @@ def _square(distances: wp.array[wp.float32]) -> twt.Array1dFloat32:
     return squared
 
 
-def _reduce(distances: twt.Array1dFloat32, point_reduction: _PointReduction) -> float:
-    if point_reduction == "mean":
-        return tw.reduce.mean(distances)
-    if point_reduction == "sum":
-        return tw.reduce.sum(distances)
-    return tw.reduce.max(distances)
-
-
-def _hausdorff(
-    d_forward: wp.array[wp.float32],
-    d_backward: wp.array[wp.float32] | None,
-    single_directional: bool,
+def _reduce_squared(
+    distances: wp.array[wp.float32], point_reduction: _PointReduction, known_max: float | None
 ) -> float:
+    """
+    Reduce the element-wise squares of non-empty ``distances`` without building them.
+
+    ``"sum"`` and ``"mean"`` are [`weighted_sum`][triwarp.reduce.weighted_sum] of the distances by
+    themselves. ``"max"`` squares the largest distance -- ``known_max`` when the caller already
+    holds it -- in ``float32``, which is exact rather than approximate: rounding is monotone, so
+    the largest rounded square is the rounded square of the largest distance.
+    """
+    distances_1d = cast(twt.Array1dFloat32, distances)
+    if point_reduction == "max":
+        largest = np.float32(known_max if known_max is not None else tw.reduce.max(distances_1d))
+        return float(largest * largest)
+    total = tw.reduce.weighted_sum(distances_1d, distances_1d)
+    if point_reduction == "mean":
+        return total / float(int(distances.shape[0]))
+    return total
+
+
+def _hausdorff(distances: _Distances, single_directional: bool) -> float:
     """
     Directed (or symmetric) Hausdorff distance from Euclidean distances.
 
     ``max(d)`` over Euclidean per-element distances equals ``sqrt(max(d**2))``,
     so this matches libigl's ``sqrt(max(dba, dab))`` without squaring.
     """
-    directed_forward = tw.reduce.max(cast(twt.Array1dFloat32, d_forward))
+    directed_forward = distances.forward_max
+    if directed_forward is None:
+        directed_forward = tw.reduce.max(cast(twt.Array1dFloat32, distances.forward))
     if single_directional:
         return directed_forward
-    directed_backward = tw.reduce.max(cast(twt.Array1dFloat32, d_backward))
+    directed_backward = tw.reduce.max(cast(twt.Array1dFloat32, distances.backward))
     return max(directed_forward, directed_backward)
 
 
@@ -816,17 +844,18 @@ def _empty_chamfer(
 
 def _distances_points_to_points(
     x: wp.array[wp.vec3], y: wp.array[wp.vec3], single_directional: bool
-) -> _DistancePair | None:
+) -> _Distances | None:
     """Nearest-neighbour distances between two clouds, both directions unless directed."""
     if int(x.shape[0]) == 0 or int(y.shape[0]) == 0:
         return None
-    d_forward = tw.neighbors.query_nearest(y, x, k=1)[1]
-    d_backward = None
-    if not single_directional:
-        d_backward = tw.neighbors.query_nearest(
-            x, y, k=1, initial_radius=_backward_radius(d_forward)
-        )[1]
-    return cast(_DistancePair, (d_forward, d_backward))
+    d_forward = cast(wp.array[wp.float32], tw.neighbors.query_nearest(y, x, k=1)[1])
+    if single_directional:
+        return _Distances(d_forward, None, None)
+    forward_max = _forward_max(d_forward)
+    d_backward = tw.neighbors.query_nearest(
+        x, y, k=1, initial_radius=_backward_radius(forward_max)
+    )[1]
+    return _Distances(d_forward, cast(wp.array[wp.float32], d_backward), forward_max)
 
 
 def _distances_points_to_mesh(
@@ -834,24 +863,37 @@ def _distances_points_to_mesh(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     single_directional: bool,
-) -> _DistancePair | None:
+) -> _Distances | None:
     """Point-to-surface distances forward, cloud nearest-neighbour distances back."""
     if int(points.shape[0]) == 0 or int(vertices.shape[0]) == 0 or int(faces.shape[0]) == 0:
         return None
     d_forward = tw.proximity.closest_point_on_mesh(vertices, faces, points)[1]
-    d_backward = None
-    if not single_directional:
-        # The forward half is point-to-*surface*, so it is a lower bound on the point-to-vertex
-        # answer this search wants -- still the right scale to seed it with.
-        d_backward = tw.neighbors.query_nearest(
-            points, vertices, k=1, initial_radius=_backward_radius(d_forward)
-        )[1]
-    return cast(_DistancePair, (d_forward, d_backward))
+    if single_directional:
+        return _Distances(d_forward, None, None)
+    # The forward half is point-to-*surface*, so it is a lower bound on the point-to-vertex answer
+    # this search wants -- still the right scale to seed it with.
+    forward_max = _forward_max(d_forward)
+    d_backward = tw.neighbors.query_nearest(
+        points, vertices, k=1, initial_radius=_backward_radius(forward_max)
+    )[1]
+    return _Distances(d_forward, cast(wp.array[wp.float32], d_backward), forward_max)
 
 
-def _backward_radius(d_forward: twt.Array1dFloat32) -> float | None:
+def _forward_max(d_forward: wp.array[wp.float32]) -> float:
     """
-    Seed the backward search's radius from the forward search's answer distances.
+    Read the forward answer's largest distance back, once.
+
+    It seeds the backward search (see [`_backward_radius`][triwarp.metrics._backward_radius]) and
+    is carried in [`_Distances`][triwarp.metrics._Distances], so a ``"max"`` Chamfer reduction or
+    a Hausdorff distance over the same pair takes it from there rather than reducing the array a
+    second time.
+    """
+    return tw.reduce.max(cast(twt.Array1dFloat32, d_forward))
+
+
+def _backward_radius(forward_max: float) -> float | None:
+    """
+    Seed the backward search's radius from the forward search's largest answer distance.
 
     [`query_nearest`][triwarp.neighbors.query_nearest] defaults its ``initial_radius`` to
     [`knn_initial_radius`][triwarp.neighbors.knn_initial_radius], which inverts the *target
@@ -871,12 +913,9 @@ def _backward_radius(d_forward: twt.Array1dFloat32) -> float | None:
     -------
     float | None
         The radius, or ``None`` to keep the default when the forward answer carries no finite
-        distance to learn from (an empty pair, or every slot unfilled under a ``max_radius``).
+        distance to learn from (every slot unfilled under a ``max_radius``).
     """
-    if int(d_forward.shape[0]) == 0:
-        return None
-    radius = tw.reduce.max(d_forward)
-    return radius if math.isfinite(radius) and radius > 0.0 else None
+    return forward_max if math.isfinite(forward_max) and forward_max > 0.0 else None
 
 
 def _distances_mesh_to_mesh(
@@ -885,7 +924,7 @@ def _distances_mesh_to_mesh(
     vertices_b: wp.array[wp.vec3],
     faces_b: wp.array[wp.int32],
     single_directional: bool,
-) -> _DistancePair | None:
+) -> _Distances | None:
     """
     Each mesh's vertices to the other's surface. Vertex-sampled, not a true surface metric.
 
@@ -903,11 +942,33 @@ def _distances_mesh_to_mesh(
         or int(faces_b.shape[0]) == 0
     ):
         return None
-    d_forward = tw.proximity.closest_point_on_mesh(vertices_b, faces_b, vertices_a)[1]
+    max_dist = _mesh_pair_search_radius(vertices_a, vertices_b, single_directional)
+    d_forward = tw.proximity.closest_point_on_mesh(
+        vertices_b, faces_b, vertices_a, max_dist=max_dist
+    )[1]
     d_backward = None
     if not single_directional:
-        d_backward = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[1]
-    return d_forward, d_backward
+        d_backward = tw.proximity.closest_point_on_mesh(
+            vertices_a, faces_a, vertices_b, max_dist=max_dist
+        )[1]
+    return _Distances(d_forward, d_backward, None)
+
+
+def _mesh_pair_search_radius(
+    vertices_a: wp.array[wp.vec3], vertices_b: wp.array[wp.vec3], single_directional: bool
+) -> float | None:
+    """
+    One search radius for both directions of a mesh-to-mesh query, or ``None`` for one direction.
+
+    [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]'s default ``max_dist`` is
+    the diagonal of the box enclosing the mesh and the queries -- and for the two directions of one
+    pair that is the same box, since the union of ``A`` and ``B`` does not depend on which is the
+    mesh. Computing it once here gives both calls the identical value the default would have and
+    saves the second reduction and its readback; a single direction leaves the default in place.
+    """
+    if single_directional:
+        return None
+    return tw.bounds.enclosing_diagonal(vertices_b, vertices_a)
 
 
 def _validate_diff_reduction(point_reduction: _DiffReduction) -> None:

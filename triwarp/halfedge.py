@@ -21,7 +21,6 @@ import triwarp as tw
 from triwarp._device import read_scalar, require_same_device
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import halfedge as kernel_halfedge
-from triwarp.kernels import scatter as kernel_scatter
 
 
 def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> wp.array[wp.int32]:
@@ -274,15 +273,20 @@ def vertex_one_rings(
 
     offsets = wp.zeros(n_vertices + 1, dtype=wp.int32, device=device)
     ring_halfedges = wp.full(n_halfedges, -1, dtype=wp.int32, device=device)
-    is_boundary = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     if n_halfedges == 0 or n_vertices == 0:
-        return ring_halfedges, offsets, is_boundary
+        return ring_halfedges, offsets, wp.zeros(n_vertices, dtype=wp.bool, device=device)
 
-    # Every face contributes exactly one outgoing halfedge per corner, so a vertex's ring size is
-    # how often it appears in the flat face buffer -- no walk needed to size the CSR.
+    # One pass over the halfedges sizes the CSR and picks every vertex's two start candidates (row
+    # 0 over all outgoing halfedges, row 1 over the boundary ones): every face contributes exactly
+    # one outgoing halfedge per corner, so a vertex's ring size is how often it appears in the
+    # flat face buffer -- no walk needed.
     counts = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    candidate_starts = wp.full((2, n_vertices), INT32_MAX, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_scatter.count_occurrences, dim=n_halfedges, inputs=[faces, counts], device=device
+        kernel_halfedge.ring_degrees_and_starts,
+        dim=n_halfedges,
+        inputs=[faces, twins, counts, candidate_starts],
+        device=device,
     )
     # Inclusive scan into offsets[1:] leaves the leading zero in place, giving the usual CSR bounds.
     # Deliberately NOT tw.array.counts_to_offsets: that helper always reads the total back, and
@@ -290,29 +294,14 @@ def vertex_one_rings(
     # would add a device synchronization where there is currently none.
     wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
 
-    interior_start = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
-    boundary_start = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_halfedge.ring_start_halfedges,
-        dim=n_halfedges,
-        inputs=[faces, twins, interior_start, boundary_start],
-        device=device,
-    )
-    starts = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    # One map, two outputs: the start and the boundary flag are the same comparison on the same
-    # buffer, so a second pass would only re-read it to re-decide what the first already knew.
-    wp.map(
-        kernel_halfedge.ring_start_and_boundary,
-        boundary_start,
-        interior_start,
-        out=[starts, is_boundary],
-    )
-
+    # The walk resolves each vertex's start and boundary flag from the candidates itself, and
+    # writes the flag for every vertex, so ``is_boundary`` needs no initial value.
+    is_boundary = wp.empty(n_vertices, dtype=wp.bool, device=device)
     incomplete = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
         kernel_halfedge.write_one_rings,
         dim=n_vertices,
-        inputs=[starts, twins, offsets, ring_halfedges, incomplete],
+        inputs=[candidate_starts, twins, offsets, ring_halfedges, is_boundary, incomplete],
         device=device,
     )
     n_incomplete = int(read_scalar(incomplete, 0))

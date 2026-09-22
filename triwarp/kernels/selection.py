@@ -35,28 +35,42 @@ def pack_group_vertex_keys(
     out_keys[corner] = wp.int64(group) * radix + wp.int64(faces[face * 3 + corner % 3])
 
 
-@wp.func
-def group_and_vertex_of_key(key: wp.int64, radix: wp.int64) -> tuple[wp.int32, wp.int32]:
-    """``(group, vertex)`` packed into ``key`` by [`pack_group_vertex_keys`][], one divmod."""
-    return wp.int32(key // radix), wp.int32(key % radix)
+@wp.kernel
+def decode_group_vertex_keys(
+    unique_keys: wp.array[wp.int64],
+    radix: wp.int64,
+    vertices: wp.array[wp.vec3],
+    out_slot_groups: wp.array[wp.int32],
+    out_group_counts: wp.array[wp.int32],
+    out_vertices: wp.array[wp.vec3],
+) -> None:
+    # One thread per sorted unique ``(group, vertex)`` slot: record the slot's group, count it
+    # into that group's histogram (the group's vertex count), and gather the source position it
+    # names -- the three things the slot's key is needed for, read off one decode. The vertex id
+    # itself is never stored, since the position gather is its only consumer.
+    slot = wp.int32(wp.tid())
+    key = unique_keys[slot]
+    # The inverse of ``pack_group_vertex_keys``: one divmod.
+    group = wp.int32(key // radix)
+    vertex = wp.int32(key % radix)
+    out_slot_groups[slot] = group
+    wp.atomic_add(out_group_counts, group, wp.int32(1))
+    out_vertices[slot] = vertices[vertex]
 
 
 @wp.kernel
-def count_group_slots(slot_groups: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
-    # Vertices per group, as a histogram over the sorted unique slots.
-    wp.atomic_add(out_counts, slot_groups[wp.int32(wp.tid())], wp.int32(1))
-
-
-@wp.kernel
-def local_vertex_index(
+def local_corner_indices(
+    inverse: wp.array[wp.int32],
     slot_groups: wp.array[wp.int32],
     vertex_offsets: wp.array[wp.int32],
-    out_local: wp.array[wp.int32],
+    out_faces: wp.array[wp.int32],
 ) -> None:
-    # Rank of each global slot within its own group: the compacted, zero-based vertex index the
-    # group's faces must refer to. A real kernel because the thread index *is* the datum.
-    slot = wp.int32(wp.tid())
-    out_local[slot] = slot - vertex_offsets[slot_groups[slot]]
+    # The compacted, zero-based vertex index each selected corner refers to: its slot's rank within
+    # its own group. Resolved per corner through ``inverse`` rather than tabulated per slot and
+    # gathered, since the corner is the only reader of a slot's rank.
+    corner = wp.int32(wp.tid())
+    slot = inverse[corner]
+    out_faces[corner] = slot - vertex_offsets[slot_groups[slot]]
 
 
 @wp.kernel
@@ -100,18 +114,6 @@ def dilate_vertex_mask(
         out_mask[b] = wp.bool(True)
     if in_mask[b]:
         out_mask[a] = wp.bool(True)
-
-
-@wp.kernel
-def oriented_edges_from_halfedges(
-    faces: wp.array[wp.int32], halfedges: wp.array[wp.int32], out_edges: wp.array2d[wp.int32]
-) -> None:
-    # A halfedge read as a directed vertex pair, which puts its own face on the left.
-    i = wp.int32(wp.tid())
-    # Bound to locals first: Warp cannot assign a multi-return straight into array elements.
-    tail, tip = halfedge_endpoints(faces, halfedges[i])
-    out_edges[i, 0] = tail
-    out_edges[i, 1] = tip
 
 
 @wp.kernel
@@ -231,7 +233,7 @@ def loops_are_input_rims(
     to_input: wp.array[wp.int32],
     input_boundary_keys: wp.array[wp.uint64],
     base: wp.uint64,
-    out_is_input_rim: wp.array[wp.bool],
+    out_starts_and_rims: wp.array2d[wp.int32],
 ) -> None:
     # Per loop: was *every* one of its edges already a boundary edge of the input mesh? A loop for
     # which that holds is the input's own rim surfacing in the submesh rather than a rim the
@@ -261,4 +263,7 @@ def loops_are_input_rims(
         if not binary_search_sorted_contains(input_boundary_keys, pack_edge_key(a, b, base)):
             is_rim = wp.int32(0)
             break
-    out_is_input_rim[ell] = is_rim != 0
+    # Row 0 carries the loop's start and row 1 the verdict, so the caller reads back the one
+    # buffer it needs to cut the surviving loops out of ``flat_loops``, in one transfer.
+    out_starts_and_rims[0, ell] = start
+    out_starts_and_rims[1, ell] = is_rim

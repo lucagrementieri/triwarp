@@ -45,8 +45,9 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
+from triwarp.constants import INT64_MAX, TILE_1D
 from triwarp.kernels import neighbors as kernel_neighbors
-from triwarp.kernels import points as kernel_points
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 
 # An axis counts towards a point cloud's effective dimension when its extent is at least this
@@ -773,10 +774,13 @@ def _ball_with_offsets(
         device=device,
     )
 
-    if return_sorted:
-        wp.utils.segmented_sort_pairs(
-            neighbor_distances_flat, neighbor_indices_flat, total_neighbors, segment_bounds
-        )
+    if not return_sorted:
+        # Sized exactly, so the buffers are the answer as they stand.
+        return neighbor_indices_flat, neighbor_distances_flat, offsets
+    wp.utils.segmented_sort_pairs(
+        neighbor_distances_flat, neighbor_indices_flat, total_neighbors, segment_bounds
+    )
+    # The sort needs a second half of scratch; copying the sorted half out lets it go.
     return (
         wp.clone(neighbor_indices_flat[:total_neighbors]),
         wp.clone(neighbor_distances_flat[:total_neighbors]),
@@ -1423,9 +1427,9 @@ def closest_pair(points: wp.array[wp.vec3]) -> tuple[int, int, float]:
     wins and an equal distance defers to the smaller index. Exact duplicates therefore report the
     first duplicated point at distance ``0.0``.
 
-    Two host readbacks, both unavoidable and both single-element: the reduction's result, and
-    ``index_b`` from the query table. Everything up to them stays on the device, so this does not
-    move the ``(n, 2)`` table across the bus.
+    One host readback, of two elements: the reduction's result and ``index_b`` from the query
+    table. Everything up to it stays on the device, so this does not move the ``(n, 2)`` table
+    across the bus.
 
     See Also
     --------
@@ -1438,19 +1442,28 @@ def closest_pair(points: wp.array[wp.vec3]) -> tuple[int, int, float]:
     if n < 2:
         raise ValueError("closest_pair needs at least two points")
 
+    device = points.device
     indices, distances = query_nearest(points, points, k=2, backend="bvh")
-    keys = twt.empty_1d(n, wp.int64, device=points.device)
-    wp.launch(
-        kernel_points.nearest_pair_keys, dim=n, inputs=[distances, keys], device=points.device
+    # Column 1 of the table, as strided views -- column 0 is each point itself. The two kernels only
+    # index them, so neither needs a dense copy.
+    result = wp.full(2, INT64_MAX, dtype=wp.int64, device=device)
+    wp.launch_tiled(
+        kernel_neighbors.nearest_key_argmin,
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[distances[:, 1], result],
+        block_dim=TILE_1D,
+        device=device,
     )
-
-    key = int(cast(int, tw.reduce.min(keys)))
-    index_a = key & 0xFFFFFFFF
-    # The high half is the distance's own float32 bits, so it decodes on the host for free rather
-    # than costing a third readback.
+    wp.launch(
+        kernel_neighbors.nearest_key_partner,
+        dim=1,
+        inputs=[result, indices[:, 1], result],
+        device=device,
+    )
+    key, index_b = (int(value) for value in result.numpy())
+    # The key's high half is the distance's own float32 bits, so it decodes on the host for free.
     distance = float(np.array([key >> 32], dtype=np.uint32).view(np.float32)[0])
-    index_b = int(read_scalar(indices.flatten(), 2 * index_a + 1))
-    return index_a, index_b, distance
+    return key & 0xFFFFFFFF, index_b, distance
 
 
 def geodesic_ball(
