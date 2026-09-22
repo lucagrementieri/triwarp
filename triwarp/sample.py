@@ -408,11 +408,10 @@ def sample_surface_poisson_disk(
             deleted_mask = _top_maxima_by_weight(is_max, weights, excess)
             n_max = excess
 
-        wp.map(kernel_sample.apply_deletions, deleted_mask, alive, out=alive)
         wp.launch(
-            kernel_sample.subtract_deleted_contributions,
+            kernel_sample.apply_deletions,
             dim=init_count,
-            inputs=[deleted_mask, nbr_idx, nbr_dists, offsets, alive, r_max, r_min, alpha, weights],
+            inputs=[deleted_mask, nbr_idx, nbr_dists, offsets, r_max, r_min, alpha, alive, weights],
             device=device,
         )
         alive_count -= n_max

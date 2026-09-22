@@ -5606,8 +5606,16 @@ Findings that generalise past this pass:
   its Jacobi sweep (inside a captured loop, §14.10), graph-capturing ball pivoting's 8-wave batch
   (needs a device/wall split first — likely device-bound), and every ICP-loop fusion beyond the
   per-iteration memsets (the loop reads a scalar back each iteration, so the clock stays flat).
-- **Open, needing an allowlist entry in `tests/api_conventions.py` rather than more code**: a
-  Poisson-disk deletion fusion (built, verified, reverted — one map per round), clearing
-  `candidate[e]` in `homology`'s `forest_link` instead of a separate `in_forest` mask, and zeroing
-  `arap`'s rotation right-hand sides in the kernel that reads them.
+- **The three fusions that needed an allowlist entry rather than more code, resolved.** A kernel
+  that clears state it has just read is the same launch as one that does not, so what blocks it is
+  check 13's `out_` rule, and the entry is the whole cost. Two shipped, byte-identical on CPU:
+  `sample.apply_deletions` now clears `alive` in the pass that subtracts the deleted points'
+  contributions (one `wp.map` per elimination round; **1.27-1.30x** on
+  `sample_surface_poisson_disk`), and `homology.forest_link` clears `candidate[e]` for an accepted
+  edge instead of writing an `in_forest` mask the wrapper then subtracted (one allocation and one
+  map; **1.03-1.04x**). Both are races only on paper: each thread writes its own slot, and every
+  reader of a written slot is already excluded by a second test. **`arap`'s rotation right-hand
+  sides stay zeroed by the wrapper** -- the two memsets are ~0.15 % of an iteration the CG solve
+  dominates, which does not pay for turning two read-only inputs into in-place state (written at
+  `kernels/parametrization.arap_interior_rhs`).
 

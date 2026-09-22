@@ -263,6 +263,11 @@ def arap_interior_rhs(
     # compact free index) plus the scattered rotation RHS at the original vertex index; boundary
     # rows carry no unknown and are skipped. ``rhs_const`` / ``out_b`` are (2, n_interior) (rows
     # u, v); ``rhs_rot_*`` are (n_vertices,).
+    #
+    # Zeroing ``rhs_rot_*`` here after reading them, in place of the wrapper's two ``zero_`` per
+    # iteration, is legal (the scatter that fills them runs before, and each slot is read only by
+    # its own thread) and declined: the two memsets are ~0.15 % of an ARAP iteration, which the CG
+    # solve dominates, against turning two read-only inputs into in-place state.
     i = wp.int32(wp.tid())
     ri = free_row(fixed_mask, free_map, i)
     if ri < 0:

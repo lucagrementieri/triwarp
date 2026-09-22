@@ -158,8 +158,7 @@ def homology_generators(
             f"{n_reached} of {n_referenced} referenced vertices."
         )
 
-    in_dual_tree = _dual_spanning_forest(candidate, edge_faces, n_faces)
-    wp.map(kernel_array.mask_and_not, candidate, in_dual_tree, out=candidate)
+    _remove_dual_spanning_forest(candidate, edge_faces, n_faces)
     generator_edge_ids = tw.array.flatnonzero(candidate)
     if int(generator_edge_ids.shape[0]) == 0:
         return []
@@ -220,11 +219,14 @@ def _primal_spanning_tree(
     return parents, distances
 
 
-def _dual_spanning_forest(
+def _remove_dual_spanning_forest(
     candidate: wp.array[wp.bool], edge_faces: twt.Array2dInt32, n_faces: int
-) -> wp.array[wp.bool]:
+) -> None:
     """
-    Spanning forest of the dual graph over the ``candidate`` edges, as a per-edge mask.
+    Clear from ``candidate``, in place, a spanning forest of the dual graph over its edges.
+
+    What is left set is exactly the generator edges: interior, in neither the primal tree nor the
+    dual forest.
 
     Boruvka: each round hands every component its lowest-indexed incident candidate edge, accepts
     those edges and unions the components, so the component count at least halves per round and the
@@ -239,9 +241,8 @@ def _dual_spanning_forest(
     """
     device = candidate.device
     n_candidates = int(candidate.shape[0])
-    in_forest = wp.zeros(n_candidates, dtype=wp.bool, device=device)
     if n_candidates == 0 or n_faces == 0:
-        return in_forest
+        return
     labels = tw.array.arange(n_faces, device=device)
     roots = wp.empty(n_faces, dtype=wp.int32, device=device)
     proposal = wp.empty(n_faces, dtype=wp.int32, device=device)
@@ -268,13 +269,12 @@ def _dual_spanning_forest(
         wp.launch(
             kernel_homology.forest_link,
             dim=n_candidates,
-            inputs=[candidate, edge_faces, roots, proposal, labels, in_forest, state],
+            inputs=[candidate, edge_faces, roots, proposal, labels, state],
             device=device,
         )
         wp.launch(kernel_array.loop_advance, dim=1, inputs=[max_rounds, state], device=device)
 
     run_device_loop(device, state[kernel_array.LOOP_CONDITION_VIEW], round_of_boruvka)
-    return in_forest
 
 
 def _trace_generator_loops(

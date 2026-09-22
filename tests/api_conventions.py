@@ -373,6 +373,9 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # down.
     ("graph", "scatter_neighbor_lists"): frozenset({"cursor"}),
     ("homology", "bfs_push_level"): frozenset({"state"}),
+    # Boruvka's accepted edges leave the candidate set in place: what the caller reads afterwards
+    # is the candidates the dual forest did not take, so ``candidate`` is input and result at once.
+    ("homology", "forest_link"): frozenset({"candidate"}),
     ("holes", "fill_dp_span"): frozenset({"tables"}),
     ("holes", "fill_dp_span_tiled"): frozenset({"tables"}),
     ("polyline", "orient_ccw"): frozenset({"points2d"}),
@@ -480,7 +483,9 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # ``ear_loop_continue`` case in the same module. Neither is an input and neither is the answer
     # -- that is ``out_keep``.
     ("polyline", "rdp_split_spans"): frozenset({"span_lo", "span_hi", "state"}),
-    ("sample", "subtract_deleted_contributions"): frozenset({"weights"}),
+    # The Poisson-disk elimination round's carried state: the deletions clear ``alive`` and take
+    # their contributions off ``weights`` in the same pass, both rewritten in place every round.
+    ("sample", "apply_deletions"): frozenset({"alive", "weights"}),
     # The min-weight fill's traceback walks each rim's predecessor table with an explicit stack of
     # pending intervals -- caller-allocated because the walk is one thread over a ``B``-deep
     # problem, so it cannot be a kernel local. Neither an input nor the answer, which is

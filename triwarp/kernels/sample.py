@@ -176,35 +176,35 @@ def find_local_maxima(
         wp.atomic_add(out_count, 0, 1)
 
 
-@wp.func
-def apply_deletions(deleted_mask: wp.int32, alive: wp.int32) -> wp.int32:
-    # Clear the alive flag where a sample was deleted, leaving it otherwise. Mapped in place over
-    # ``alive``, so it must return the untouched value rather than skip the write.
-    if deleted_mask == 1:
-        return wp.int32(0)
-    return alive
-
-
 @wp.kernel
-def subtract_deleted_contributions(
+def apply_deletions(
     deleted_mask: wp.array[wp.int32],
     nbr_indices: wp.array[wp.int32],
     nbr_dists: wp.array[wp.float32],
     offsets: wp.array[wp.int32],
-    alive: wp.array[wp.int32],
     r_max: wp.float32,
     r_min: wp.float32,
     alpha: wp.float32,
+    alive: wp.array[wp.int32],
     weights: wp.array[wp.float32],
 ) -> None:
+    # Delete this round's flagged points and take their contributions off the survivors' weights,
+    # in one pass. ``alive`` and ``weights`` are in-place state carried across rounds.
+    #
+    # A deleted thread clears its own ``alive`` slot while its neighbours may be reading it. That
+    # is benign because the skip below tests ``deleted_mask[j]`` as well: a neighbour this round
+    # deletes is skipped whether or not its ``alive`` write has landed, and a survivor's slot is
+    # not written this round at all. So the predicate -- and the set of contributions subtracted --
+    # is exactly that of clearing every deleted slot first and subtracting after.
     i = wp.int32(wp.tid())
     if deleted_mask[i] == 0:
         return
+    alive[i] = 0
     start = offsets[i]
     end = offsets[i + 1]
     for k in range(start, end):
         j = nbr_indices[k]
-        if j == i or alive[j] == 0:
+        if j == i or alive[j] == 0 or deleted_mask[j] != 0:
             continue
         contribution = _poisson_edge_weight(nbr_dists[k], r_max, r_min, alpha)
         wp.atomic_add(weights, j, -contribution)

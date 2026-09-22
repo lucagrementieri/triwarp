@@ -286,12 +286,16 @@ def forest_link(
     roots: wp.array[wp.int32],
     proposal: wp.array[wp.int32],
     labels: wp.array[wp.int32],
-    out_in_forest: wp.array[wp.bool],
     out_state: wp.array[wp.int32],
 ) -> None:
     # Accept the edge either side chose and union the two components. Both endpoints may name the
     # same edge, and one edge may be the choice of two components at once; either way the union runs
     # once per accepted edge and the second attempt finds the roots already equal.
+    #
+    # An accepted edge leaves ``candidate`` rather than being marked in a mask of its own, because
+    # what the caller wants is the candidates *not* in the forest. Clearing it changes no later
+    # round: the thread reads only its own entry, and from the next round on the edge's two faces
+    # share a root, so ``boruvka_cross_edge`` rejects it whether or not the bit is still set.
     #
     # ``LOOP_PROGRESS`` is raised by a plain store rather than counted with ``wp.atomic_add``:
     # nothing reads the merge *count*, only whether the round merged anything, and a round that
@@ -307,7 +311,7 @@ def forest_link(
         return
     if proposal[root_a] != e and proposal[root_b] != e:
         return
-    out_in_forest[e] = True
+    candidate[e] = False
     out_state[LOOP_PROGRESS] = 1
     ecl_hook_edge(labels, root_a, root_b)
 
