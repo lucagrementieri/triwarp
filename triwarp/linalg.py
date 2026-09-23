@@ -1847,7 +1847,6 @@ class _MultigridLevel:
         "inverse_diagonal",
         "matvec_dim",
         "n",
-        "omega",
         "operator",
         "prolong_dim",
         "prolongator",
@@ -1863,8 +1862,8 @@ class _MultigridLevel:
         self.n = int(operator.nrow)
         self.prolongator = None
         self.restrictor = None
+        # ``omega D^-1``, the smoother's damping folded in (``_multigrid_damped_diagonal``).
         self.inverse_diagonal = None
-        self.omega = 0.0
 
 
 def _multigrid_hierarchy(
@@ -1894,12 +1893,11 @@ def _multigrid_hierarchy(
             break
         diagonal = wp.empty(level.n, dtype=wp.float64, device=operator.device)
         wp.map(kernel_array.inverse_or_one, diag, out=diagonal)
-        level.inverse_diagonal = diagonal
-        level.omega = _MULTIGRID_JACOBI_FACTOR / _multigrid_spectral_radius(
-            operator, diagonal, seed
-        )
+        # ``omega D^-1``, the damping already folded in, so the smoother and the prolongator read
+        # one scaled diagonal and no level reads its spectral radius back to the host.
+        level.inverse_diagonal = _multigrid_damped_diagonal(operator, diagonal, seed)
         level.prolongator = _multigrid_prolongator(
-            operator, label, n_aggregates, diagonal, level.omega
+            operator, label, n_aggregates, level.inverse_diagonal
         )
         level.restrictor = wps.bsr_transposed(level.prolongator)
         operator = _multigrid_prune(
@@ -1991,15 +1989,17 @@ def _multigrid_aggregate(
     return label, n_aggregates
 
 
-def _multigrid_spectral_radius(
+def _multigrid_damped_diagonal(
     matrix: wps.BsrMatrix[wp.float64], inverse_diagonal: wp.array[wp.float64], seed: int
-) -> float:
+) -> wp.array[wp.float64]:
     """
-    Spectral radius of ``D^-1 A`` by unnormalized power iteration, for the damping factor.
+    ``omega D^-1``, with ``omega = 4/3 / rho`` and ``rho`` the spectral radius of ``D^-1 A``.
 
-    Normalizing every step would cost a host readback per step; leaving the iterate to grow and
-    taking the geometric mean of the growth over all the steps costs **one**, because the start
-    vector is a sign vector whose squared norm is exactly ``n``. ``rho`` is around 3 here, so eight
+    ``rho`` comes from an unnormalized power iteration. Normalizing every step would cost a host
+    readback per step; leaving the iterate to grow and taking the geometric mean of the growth over
+    all the steps costs none at all, because the start vector is a sign vector whose squared norm is
+    exactly ``n`` and the growth is folded into the diagonal on the device
+    (``kernels/algorithms/multigrid.damped_inverse_diagonal``). ``rho`` is around 3 here, so eight
     steps grow the vector by about ``3 ** 8`` and ``float64`` has room to spare. The estimate
     approaches ``rho`` from below, which is the safe side: it makes the damping *smaller* than the
     stability limit rather than larger.
@@ -2007,15 +2007,13 @@ def _multigrid_spectral_radius(
     Everything about the arithmetic here is chosen against the launch count, because the hierarchy
     build is launch-bound. A step is one fused ``power_step`` launch rather than a ``bsr_mv`` plus
     an elementwise scale, and the two buffers are ping-ponged rather than updated in place, which is
-    what allows the single kernel. What is left is mostly the single remaining host sync.
+    what allows the single kernel.
     """
     device = matrix.device
     n = int(matrix.nrow)
     x = wp.empty(n, dtype=wp.float64, device=device)
     y = wp.empty(n, dtype=wp.float64, device=device)
     wp.launch(kernel_mg.random_signs, dim=n, inputs=[wp.int32(seed), x], device=device)
-    # Exact: every entry of a sign vector is +-1, so its squared norm is exactly n.
-    start = float(n)
     for _ in range(_MULTIGRID_POWER_STEPS):
         wp.launch(
             kernel_mg.power_step,
@@ -2024,22 +2022,35 @@ def _multigrid_spectral_radius(
             device=device,
         )
         x, y = y, x
-    # The one readback, and the whole point of the loop: how much the iterate grew over ``K`` steps
-    # of ``D^-1 A`` is ``rho ** K`` to the accuracy this needs.
-    end = float(wp.utils.array_inner(x, x))
-    if not (start > 0.0 and end > 0.0 and math.isfinite(end)):
-        return 1.0
-    return math.sqrt(end / start) ** (1.0 / _MULTIGRID_POWER_STEPS)
+    # How much the iterate grew over ``K`` steps of ``D^-1 A`` is ``rho ** K`` to the accuracy this
+    # needs, and it stays on the device. The start is exact: every entry of a sign vector is +-1,
+    # so its squared norm is exactly n.
+    growth = wp.empty(1, dtype=wp.float64, device=device)
+    wp.utils.array_inner(x, x, out=growth)
+    damped = wp.empty(n, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_mg.damped_inverse_diagonal,
+        dim=n,
+        inputs=[
+            growth,
+            wp.float64(n),
+            wp.float64(1.0 / _MULTIGRID_POWER_STEPS),
+            wp.float64(_MULTIGRID_JACOBI_FACTOR),
+            inverse_diagonal,
+        ],
+        outputs=[damped],
+        device=device,
+    )
+    return damped
 
 
 def _multigrid_prolongator(
     matrix: wps.BsrMatrix[wp.float64],
     label: wp.array[wp.int32],
     n_aggregates: int,
-    inverse_diagonal: wp.array[wp.float64],
-    omega: float,
+    damped_inverse_diagonal: wp.array[wp.float64],
 ) -> wps.BsrMatrix[wp.float64]:
-    """Smoothed prolongator ``(I - omega D^-1 A) P0`` for the piecewise-constant ``P0``."""
+    """Smoothed prolongator ``(I - omega D^-1 A) P0``, given ``omega D^-1``, for ``P0``."""
     device = matrix.device
     n = int(matrix.nrow)
     sizes = wp.zeros(n_aggregates, dtype=wp.int32, device=device)
@@ -2063,7 +2074,7 @@ def _multigrid_prolongator(
     wp.launch(
         kernel_mg.scale_rows,
         dim=n,
-        inputs=[smoothed.offsets, inverse_diagonal, wp.float64(-omega), smoothed.values],
+        inputs=[smoothed.offsets, damped_inverse_diagonal, wp.float64(-1.0), smoothed.values],
         device=device,
     )
     return _multigrid_prune(wps.bsr_axpy(smoothed, tentative, alpha=1.0, beta=1.0))
@@ -2234,7 +2245,7 @@ class _MultigridCycle:
                     wp.int32(level.n),
                     wp.int32(level.stride),
                     level.inverse_diagonal,
-                    wp.float64(level.omega),
+                    wp.float64(1.0),  # the damping is in the diagonal already
                     level.b,
                     level.ax,
                     level.x,
@@ -2267,7 +2278,7 @@ class _MultigridCycle:
                 wp.int32(level.n),
                 wp.int32(level.stride),
                 level.inverse_diagonal,
-                wp.float64(level.omega),
+                wp.float64(1.0),  # the damping is in the diagonal already
                 level.b,
                 level.x,
             ],

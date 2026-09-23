@@ -5725,7 +5725,20 @@ atomic-cursor order, not the change.
   boundary of the surface with each pinch vertex split once per fan: every boundary edge exactly
   once, in winding, and a loop can pass a pinch vertex twice where two holes touch. The unit test
   grows its regions over shared edges and asserts they are simple, and the pinched deletion is its
-  own test. That removes the blocker on the deleted-face rule; it was not re-landed. **Kept:** the
+  own test. That removed the blocker, and **the deleted-face rule is now in** (1.15-1.17x,
+  byte-identical). A runtime guard -- count each loop edge's kept faces with the `_EdgeTable`
+  probe, and report any loop with an edge not held exactly once as new -- was built, bit, and
+  measured **flat** (0.97-1.04x): the probe and its sort cost what the mesh-sized table did. It is
+  also provably redundant, so the guarantee lives in a test instead. Twins are true opposites or
+  `-1` even unvalidated, so every sector-walk successor starts where its predecessor ends; and a
+  rotation enters a face only through the twin of its incoming halfedge, which a boundary
+  halfedge lacks, so no two rotations merge and `successor_cycles` never gets colliding input.
+  Every consecutive pair any walk returns is therefore a boundary edge on *any* mesh. What a mesh
+  that is not edge-manifold can do is **lose** a loop -- a rotation meeting a three-faced edge
+  dead-ends -- and a missing loop defeats every classifier equally.
+  `test_boundary_loops_never_invent_an_edge` pins that (three fin orientations at a pinch, both
+  devices; all six fail under the old vertex walk). **General lesson: when a runtime check costs
+  the win it protects and a proof covers it, move the check to a test.** **Kept:** the
   empty-deletion early exit, read off the kept face count with no readback -- 2.51 -> 0.42 ms, since
   it skips the loop extraction too. **`holes._EdgeTable`'s inversion is in**: sort the rim's own
   keys and let one face pass probe them, in place of a radix sort of every mesh edge and two
@@ -5737,7 +5750,31 @@ atomic-cursor order, not the change.
   (`n_faces - 3 n_selected`): 1.18x on `dragon`. `face_self_intersecting_mask` runs its narrow
   phase inside the marking kernel (one launch and one per-pair buffer fewer; within noise on a
   BVH-bound call, byte-identical).
-  **Not done:** `_mean_positive_finite` (only the untimed auto-radius path, and a fused sum-and-count
-  changes the summation precision), `heat_geodesic`'s timestep (CG-bound rows), the multigrid
-  spectral-radius pre-scale (it was tied to the `L_ff` hierarchy, which did not ship).
+- **Three items first recorded as "not done", re-evaluated and done.** The recorded reasons did not
+  hold: the precision objection ignored that `tw.reduce.sum` already commits its tile partials
+  with `wp.atomic_add` (order-dependent on CUDA), "CG-bound rows" is §15.2's share argument about
+  what a benchmark can *see* rather than whether work is removed, and the spectral-radius item was
+  never tied to the `L_ff` hierarchy -- the smoothed-aggregation hierarchy still serves `harmonic`
+  at `k >= 2`, `"auto"` and `"multigrid"`.
+    - **`heat_operators`' timestep** reads the mean unique-edge length off the Laplacian's strict
+      upper triangle (one entry per edge, twelve triplets per face, nothing pruned) instead of
+      re-sorting every edge with `edges_unique`: `heat_operators` **1.06-1.21x**,
+      `vector_heat_operators` 1.06-1.07x, `heat_geodesic` 1.02-1.03x. `t` moves by ~1e-7 relative
+      (float64 accumulation instead of float32), and a zero-length self-edge of a degenerate face
+      no longer enters the mean. **The scalar and vector solvers read the same kernel off two
+      operators with one sparsity, so their `t` is bit-identical** -- the agreement `log_map`
+      depends on holds by construction rather than by calling one helper twice. A test that
+      pinned `t` to `mean_unique_edge_length` at 1e-12 now recovers `t` from the system and
+      checks the convention against trimesh's unique edges at 1e-6.
+    - **`reconstruction._mean_positive_finite`** folds sum and count in one pass into one
+      `float64` pair: one launch and one readback where it took two maps, two reductions and two
+      readbacks. The spacing moves ~1e-7 relative; `ball_pivoting`'s auto radius was already
+      documented nondeterministic (§16.3).
+    - **The multigrid damping** is folded into the inverse diagonal on the device
+      (`kernels/algorithms/multigrid.damped_inverse_diagonal`), so no level reads its spectral
+      radius back. Every consumer's arithmetic is unchanged -- `(omega * inv) * r` and `(-1) *
+      (omega * inv)` are the products it formed -- and the hierarchy is **byte-identical on CPU**,
+      where the device `pow` is the host's C `pow`; on CUDA the device `pow` moves `omega` in its
+      last bit (a 1.3e-12 change in one level's cycle output). Flat on the clock (0.99-1.01x): the
+      removed sync was queued behind the aggregation's own count readback.
 

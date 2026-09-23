@@ -37,7 +37,7 @@ live in [`triwarp.laplacian`][triwarp.laplacian], tangent frames in
 from __future__ import annotations
 
 import itertools
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import warp as wp
@@ -49,10 +49,11 @@ import triwarp.linalg as twl
 import triwarp.reduce as twr
 import triwarp.typing as twt
 from triwarp._device import require_same_device
-from triwarp.edges import mean_unique_edge_length
+from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import heat as kernel_heat
 from triwarp.kernels import predicates as kernel_predicates
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.laplacian import (
     connection_laplacian,
@@ -203,11 +204,6 @@ def heat_operators(
             "cot_entries and use_robust are mutually exclusive: use_robust rebuilds the "
             "half-cotangent table from mollified edge lengths."
         )
-    if t is None:
-        # The unique-edge average, which is what ``igl::heat_geodesics`` uses for its timestep.
-        h = mean_unique_edge_length(vertices, faces, validate=False)
-        t = h * h
-
     # Per-face half-cotangent weights (float32, O(1) and safe) reused for both the Laplacian and
     # the divergence. The cotangent stiffness follows the igl convention (negative diagonal, so
     # ``-L`` is positive semi-definite) but is assembled here in float64.
@@ -222,6 +218,11 @@ def heat_operators(
     # ``cotmatrix`` casts the shared float32 half-cotangent weights to float64 and assembles the
     # operator natively in a single build, avoiding a recast rebuild (see cotmatrix's kernel note).
     laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
+    if t is None:
+        # The unique-edge average, which is what ``igl::heat_geodesics`` uses for its timestep --
+        # read off the Laplacian's own sparsity, which already holds the unique edges.
+        h = _mean_edge_length(vertices, laplacian)
+        t = h * h
 
     # The divergence kernel this bundle feeds (``kernels/heat.py::unit_gradient_divergence``) is
     # hardcoded ``wp.array2d[wp.float32]`` -- ``cotmatrix`` above accepts either precision because
@@ -767,15 +768,17 @@ def vector_heat_operators(
     require_same_device(vertices=vertices, faces=faces, frames=frames)
     device = vertices.device
     n_vertices = int(vertices.shape[0])
+    connection = connection_laplacian(vertices, faces)
     if t is None:
         # Shares the scalar solver's timestep convention -- the unique-edge mean, matching
         # ``igl::heat_geodesics``. The two solvers must agree: ``log_map``'s radius is asserted to
         # *be* the ``heat_geodesic`` distance, so giving them different diffusion times would split
-        # a quantity that is supposed to be one number.
-        h = tw.edges.mean_unique_edge_length(vertices, faces, validate=False)
+        # a quantity that is supposed to be one number. They do by construction: both read the
+        # mean off their operator's sparsity, and the connection Laplacian's is the cotangent
+        # Laplacian's, twelve triplets per face and nothing pruned.
+        h = _mean_edge_length(vertices, connection)
         t = h * h
 
-    connection = connection_laplacian(vertices, faces)
     mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
     mass_blocks = wp.empty(n_vertices, dtype=wp.mat22d, device=device)
     wp.map(kernel_heat.block_mass, mass, out=mass_blocks)
@@ -789,6 +792,31 @@ def vector_heat_operators(
         frames = vertex_tangent_frames(vertices, faces)
     preconditioner = wpl.preconditioner(vector_system, "diag")
     return vector_system, scalar_operators, frames, preconditioner
+
+
+def _mean_edge_length(vertices: wp.array[wp.vec3], operator: wps.BsrMatrix[Any]) -> float:
+    """
+    Mean unique-edge length, read off an operator with one entry per edge.
+
+    The strict upper triangle of the heat method's Laplacians is the mesh's unique edge set, so the
+    timestep costs one launch and one readback over an operator that already exists, where
+    [`mean_unique_edge_length`][triwarp.edges.mean_unique_edge_length] would re-sort every edge of
+    the mesh to recover the same set. ``0`` for a mesh with no edges, as that function returns.
+    """
+    device = vertices.device
+    n_rows = int(operator.nrow)
+    if n_rows == 0:
+        return 0.0
+    sum_and_count = wp.zeros(2, dtype=wp.float64, device=device)
+    wp.launch_tiled(
+        kernel_heat.upper_edge_length_sum_and_count,
+        dim=[kernel_reduce.blocks_1d(n_rows)],
+        inputs=[operator.offsets, operator.columns, vertices, sum_and_count],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    total, count = (float(x) for x in sum_and_count.numpy())
+    return total / count if count > 0.0 else 0.0
 
 
 def extend_scalar(

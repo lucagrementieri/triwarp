@@ -643,16 +643,6 @@ def is_positive_finite(value: wp.Float) -> wp.bool:
 
 
 @wp.func
-def value_if_positive_finite(value: wp.Float) -> wp.Float:
-    # The masked half of a "mean over the positive finite entries" reduction: the excluded entries
-    # contribute an exact zero to the sum, so one plain reduction over this and one over the
-    # companion mask give the numerator and the denominator without a compaction pass.
-    if value > type(value)(0) and wp.isfinite(value):
-        return value
-    return type(value)(0)
-
-
-@wp.func
 def is_close_scalar(a: wp.Float, b: wp.Float, rtol: wp.Float, atol: wp.Float) -> wp.bool:
     # Generic over the caller's float precision, so ``allclose`` works on float16/32/64 from one
     # definition. The tolerances must arrive at that same precision -- see the wrapper.

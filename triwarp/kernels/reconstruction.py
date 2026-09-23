@@ -12,6 +12,7 @@ import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
 from triwarp.kernels.array import (
+    is_positive_finite,
     lattice_position,
     ravel_index,
     trilinear_cell,
@@ -27,6 +28,7 @@ from triwarp.kernels.predicates import (
     triangle_aspect_ratio,
     vector_angle,
 )
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
 
 # Compile-time upper bound on the per-point fan size (neighbours kept for one center).
 # Per-thread scratch arrays are sized to this; the runtime ``max_neighbours`` must not exceed it.
@@ -41,6 +43,38 @@ NORMAL_FILTER_DOT = wp.constant(wp.float32(-0.3))
 # --------------------------------------------------------------------------------------
 # Lexicographic incremental triangulation (the Delaunay seed)
 # --------------------------------------------------------------------------------------
+
+
+@wp.kernel
+def positive_finite_sum_and_count(
+    values: wp.array[wp.float32], out_sum_and_count: wp.array[wp.float64]
+) -> None:
+    # Numerator and denominator of "the mean over the strictly positive finite entries" in one
+    # pass, into one two-slot buffer the caller reads once. A neighbour-distance table carries a
+    # zero per self-match and an ``inf`` per unfilled slot, and neither belongs in a spacing.
+    #
+    # ``reduce``'s mask-shaped block fold (``_reduce_bool_1d_tiled``): the lanes stride the block's
+    # chunk by ``wp.block_dim()``, which is what keeps it right on the CPU device, and fold their
+    # registers with one tile sum per quantity. Both accumulate in ``float64``, where a count is
+    # exact at any cloud size.
+    i, t = wp.tid()
+    n = values.shape[0]
+    base, remaining = tile_chunk(n, i, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+    total = wp.float64(0.0)
+    count = wp.float64(0.0)
+    for k in range(t, remaining, wp.block_dim()):
+        value = values[base + k]
+        if is_positive_finite(value):
+            total += wp.float64(value)
+            count += wp.float64(1.0)
+    block_total = wp.tile_sum(wp.tile(total))[0]
+    block_count = wp.tile_sum(wp.tile(count))[0]
+    if t == 0:
+        wp.atomic_add(out_sum_and_count, 0, block_total)
+        wp.atomic_add(out_sum_and_count, 1, block_count)
 
 
 @wp.kernel(enable_backward=False)

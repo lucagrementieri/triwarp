@@ -35,8 +35,9 @@ import warp.optim.linear as wpl
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
-from triwarp.kernels import array as kernel_array
+from triwarp.constants import TILE_1D
 from triwarp.kernels import reconstruction as kernel_reconstruction
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import remesh as kernel_remesh
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
@@ -1461,21 +1462,25 @@ def _mean_positive_finite(values: wp.array[wp.float32]) -> float | None:
     The spacing estimator both auto-guessing call sites in this module share: a neighbour-distance
     table carries a zero per self-match and an ``inf`` per unfilled slot, and neither belongs in a
     mean spacing. Reduces on the device rather than reading the whole table back, since the buffer
-    scales with the cloud.
+    scales with the cloud, and folds the sum and the count in one pass into one buffer, so the
+    answer costs one launch and one readback.
     """
     device = values.device
     n = int(values.shape[0])
     if n == 0:
         return None
-
-    counted = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_array.is_positive_finite, values, out=counted)
-    count = int(tw.reduce.sum(counted))
-    if count == 0:
+    sum_and_count = wp.zeros(2, dtype=wp.float64, device=device)
+    wp.launch_tiled(
+        kernel_reconstruction.positive_finite_sum_and_count,
+        dim=[kernel_reduce.blocks_1d(n)],
+        inputs=[values, sum_and_count],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    total, count = (float(x) for x in sum_and_count.numpy())
+    if count == 0.0:
         return None
-    kept = wp.empty(n, dtype=wp.float32, device=device)
-    wp.map(kernel_array.value_if_positive_finite, values, out=kept)
-    return float(tw.reduce.sum(kept)) / float(count)
+    return total / count
 
 
 # Floor on the launch width of the grid-strided wave kernels, for clouds too small to fill the

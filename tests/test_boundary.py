@@ -579,6 +579,58 @@ def test_boundary_loops_walk_a_pinched_rim_edge_by_edge(device: str) -> None:
     assert Counter(map(tuple, walked_np.tolist())) == Counter(map(tuple, boundary_np.tolist()))
 
 
+@pytest.mark.parametrize(
+    "extra_faces",
+    [[[1, 0, 5], [0, 1, 6]], [[0, 1, 6], [0, 1, 7]], [[1, 0, 7], [1, 0, 5]]],
+    ids=["fin_opposed", "fin_aligned", "fin_reversed"],
+)
+def test_boundary_loops_never_invent_an_edge(device: str, extra_faces: list[list[int]]) -> None:
+    """
+    Class B, against trimesh's boundary edges: on any input, every loop pair is a boundary edge.
+
+    The guarantee ``selection.delete_region_keep_boundary`` rests on, pinned where it can fail: a
+    bowtie pinched at vertex 0 whose pinch fan carries a *three-faced* edge ``(0, 1)``, so the
+    pinch walk's rotation meets an edge with no twin. What such a mesh may do is lose a loop -- the
+    rotation dead-ends there and that chain never closes -- so the assert is one-sided: no pair
+    that is not a boundary edge, no boundary edge twice. Three fin orientations cover a twin table
+    with the three-faced edge wound each way. The positive half is
+    ``test_boundary_loops_walk_a_pinched_rim_edge_by_edge``.
+    """
+    vertices_np = np.array(
+        [
+            [0, 0, 0],
+            [1, 0, 0],
+            [1, 1, 0],
+            [-1, 0, 0],
+            [-1, -1, 0],
+            [0.5, -1, 0],
+            [0.5, 0, 1],
+            [0.5, 0, -1],
+        ],
+        dtype=np.float64,
+    )
+    faces_np = np.array([[0, 1, 2], [0, 3, 4], *extra_faces])
+    mesh_tm = tm.Trimesh(vertices_np, faces_np, process=False)
+    # Non-vacuity: vertex 0 is a pinch, and edge (0, 1) is shared by three faces.
+    assert Counter(map(tuple, mesh_tm.edges_sorted.tolist()))[(0, 1)] == 3
+    boundary_np = mesh_tm.edges_sorted[
+        tm_grouping.group_rows(mesh_tm.edges_sorted, require_count=1)
+    ]
+    boundary = set(map(tuple, boundary_np.tolist()))
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+
+    pairs = [
+        tuple(sorted((int(a), int(b))))
+        for loop_np in (loop_wp.numpy() for loop_wp in loops_wp)
+        for a, b in zip(loop_np, np.roll(loop_np, -1), strict=True)
+    ]
+    assert pairs  # the untouched triangle's rim is still traced
+    assert set(pairs) <= boundary
+    assert len(pairs) == len(set(pairs))
+
+
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_boundary_loop(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """

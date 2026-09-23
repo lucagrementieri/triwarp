@@ -226,12 +226,33 @@ def mark_labels_of_seeds(
 
 
 @wp.kernel
+def deleted_face_edge_keys(
+    faces: wp.array[wp.int32],
+    face_mask: wp.array[wp.bool],
+    inclusive_ranks: wp.array[wp.int32],
+    base: wp.uint64,
+    out_keys: wp.array[wp.uint64],
+) -> None:
+    # The undirected edge keys of the *masked* faces only, three per face at the face's compact
+    # rank (``inclusive_ranks[f] - 1``, an inclusive scan of the mask), so the deleted region's edge
+    # table costs three keys per deleted face rather than per mesh face.
+    f = wp.int32(wp.tid())
+    if not face_mask[f]:
+        return
+    a, b, c = corner_triple(faces, f)
+    slot = 3 * (inclusive_ranks[f] - 1)
+    out_keys[slot] = pack_edge_key(a, b, base)
+    out_keys[slot + 1] = pack_edge_key(b, c, base)
+    out_keys[slot + 2] = pack_edge_key(c, a, base)
+
+
+@wp.kernel
 def loops_are_input_rims(
     flat_loops: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],
     loop_sizes: wp.array[wp.int32],
     to_input: wp.array[wp.int32],
-    input_boundary_keys: wp.array[wp.uint64],
+    deleted_edge_keys: wp.array[wp.uint64],
     base: wp.uint64,
     out_starts_and_rims: wp.array2d[wp.int32],
 ) -> None:
@@ -239,17 +260,24 @@ def loops_are_input_rims(
     # which that holds is the input's own rim surfacing in the submesh rather than a rim the
     # deletion opened, which is what ``delete_region_keep_boundary`` filters on.
     #
-    # ``to_input`` maps a submesh vertex back to its input index, because the submesh renumbered
-    # them and ``input_boundary_keys`` is a sorted table in input indices.
+    # Answered from the *deletion*, not from the input's boundary, so nothing here is mesh-sized:
+    # a loop edge the submesh holds in exactly one kept face had ``1 + (deleted faces containing
+    # it)`` faces in the input, so it was an input boundary edge exactly when no deleted face
+    # contains it -- one search in ``deleted_edge_keys``, the sorted edge table of the deleted
+    # faces in input indices (``to_input`` maps a submesh vertex back).
     #
-    # The region-sized equivalent -- a kept rim edge was an input boundary edge exactly when no
-    # *deleted* face contains it, so only the deleted faces' ``3k`` edges need sorting -- is exact
-    # on a simple rim and was measured 1.09-1.12x, and it is **not** taken. It was blocked by a
-    # *pinched* deletion (a region whose rim meets itself at a vertex), where ``boundary_loops``
-    # walked the rim by vertex and returned fake ``(0, 0)`` edges that match no deleted face, so the
-    # inverted test read a new rim as the input's and dropped it. The walk is now by halfedge
-    # sector and exact there, which removes that blocker; what remains is an edge-non-manifold
-    # input, whose loops are bounded but unspecified and where this rule still fails safe.
+    # That premise -- every consecutive loop pair is a boundary edge of the submesh -- is what
+    # ``boundary_loops_batched`` guarantees on *any* input, which is what makes this safe without a
+    # check. Its vertex and seam walks run only on a 2-regular rim. Its pinch walk follows
+    # ``next_boundary_halfedge``, whose every successor starts where its predecessor ends (twins
+    # are true opposites or ``-1``, even unvalidated), and no rotation can enter another boundary
+    # halfedge's face (a face is entered through the twin of its incoming halfedge, which a
+    # boundary halfedge lacks), so two rotations never merge and ``successor_cycles`` never sees
+    # the colliding input that would leave slots at ``0``. What a mesh that is not edge-manifold
+    # *can* do is make a loop go missing -- a rotation stopping at a three-faced edge dead-ends
+    # -- and a missing loop defeats any classifier equally. ``tests/test_boundary.py`` pins the
+    # guarantee on pinched and non-manifold rims. A kept-face count per loop edge would make it
+    # checked here too, and measured as costly as the mesh-sized table this replaces.
     #
     # One thread per *loop*, walking its own rim, rather than one per rim vertex with a segment
     # label: boundary loops are few and short, which is the regime
@@ -257,11 +285,6 @@ def loops_are_input_rims(
     # and it needs no owner array, no total-terminated offsets and no scan to build them. The
     # early exit is what makes it cheap in the common case, since a loop the deletion opened
     # usually fails on one of its first edges.
-    #
-    # Measured against the host form, same loops: 1.58x on the whole public call at 46 rims and
-    # 3.08x at 217 -- the win grows with the rim count, because what it removes is a readback per
-    # rim. Flat on the CPU device, where ``wp.array.numpy()`` is a zero-copy view and the host
-    # form was never paying for the transfers.
     ell = wp.int32(wp.tid())
     start = loop_starts[ell]
     size = loop_sizes[ell]
@@ -269,7 +292,7 @@ def loops_are_input_rims(
     for k in range(size):
         a = to_input[flat_loops[start + k]]
         b = to_input[flat_loops[start + (k + 1) % size]]
-        if not binary_search_sorted_contains(input_boundary_keys, pack_edge_key(a, b, base)):
+        if binary_search_sorted_contains(deleted_edge_keys, pack_edge_key(a, b, base)):
             is_rim = wp.int32(0)
             break
     # Row 0 carries the loop's start and row 1 the verdict, so the caller reads back the one

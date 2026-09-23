@@ -80,6 +80,13 @@ def test_heat_operators_are_the_matrices_its_docstring_names(
     the areas to 7.8e-09 (triwarp's float32 vertex buffer against trimesh's float64). On an open
     mesh the ``M - t L`` residual is 5.6e-17 rather than zero -- ``bsr_axpy`` accumulates in a
     different order than the numpy expression -- so that one comparison carries a tolerance.
+
+    ``t`` is checked in two halves. The system must be ``M - t L`` for *one* ``t`` to 1e-12, so
+    ``t`` is read back off an off-diagonal entry rather than recomputed; and that ``t`` must be the
+    squared mean of trimesh's unique edge lengths, which is the convention, to 1e-6 -- the float32
+    vertex buffer puts the two a few 1e-7 apart. Recomputing ``t`` with
+    [`mean_unique_edge_length`][triwarp.edges.mean_unique_edge_length] instead would pin one
+    summation order rather than the definition.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = int(mesh_tm.vertices.shape[0])
@@ -107,16 +114,15 @@ def test_heat_operators_are_the_matrices_its_docstring_names(
     mass_np = np.diag(
         tw.laplacian.mass_matrix_entries(vertices_wp, faces_wp, dtype=wp.float64).numpy()
     )
-    diffusion_time = float(tw.edges.mean_unique_edge_length(vertices_wp, faces_wp)) ** 2
+    heat_np = bsr_to_dense(heat_system, n_vertices)
+    row, column = np.argwhere(np.triu(laplacian_np, k=1) != 0.0)[0]
+    diffusion_time = float(-heat_np[row, column] / laplacian_np[row, column])
+    unique_length_np = mesh_tm.edges_unique_length.mean()
+    assert np.isclose(diffusion_time, unique_length_np**2, rtol=1e-6, atol=0.0)
 
     assert np.array_equal(laplacian_np, cotmatrix_np)
     assert np.array_equal(bsr_to_dense(poisson_system, n_vertices), -laplacian_np)
-    assert np.allclose(
-        bsr_to_dense(heat_system, n_vertices),
-        mass_np - diffusion_time * laplacian_np,
-        rtol=1e-12,
-        atol=1e-15,
-    )
+    assert np.allclose(heat_np, mass_np - diffusion_time * laplacian_np, rtol=1e-12, atol=1e-15)
     assert cot_entries_wp.shape == (n_faces, 3)
     assert np.allclose(face_normals_wp.numpy(), mesh_tm.face_normals, rtol=1e-5, atol=1e-5)
     assert np.allclose(face_areas_wp.numpy(), mesh_tm.area_faces, rtol=1e-5, atol=1e-5)

@@ -676,11 +676,14 @@ def delete_region_keep_boundary(
     extends that rim rather than opening a new one, and the extended loop has to be reported --
     otherwise a caller filling only the new loops would leave the extension open.
 
-    The loop classification is host-side, over the loops themselves rather than over the mesh: a
-    boundary loop is short next to the surface it bounds, and the edge sets involved are already
-    materialized by [`triwarp.boundary.boundary_loops`][triwarp.boundary.boundary_loops]. The call's
-    cost is dominated by the loop trace and the submesh extraction, so anything spent optimizing
-    this function further belongs in
+    The test is answered from the deletion rather than from the input's boundary: a loop edge the
+    survivor holds in exactly one face was an input boundary edge exactly when no deleted face
+    contains it, so the classification sorts only the deleted faces' edges, never the mesh's. That
+    holds for every loop [`triwarp.boundary.boundary_loops`][triwarp.boundary.boundary_loops] can
+    return, since each of its consecutive pairs is a boundary edge on any input. On a mesh that is
+    not edge-manifold a rim can be missing from that trace altogether, and then it is not reported
+    either. The call's cost is dominated by the loop trace and the submesh extraction, so anything
+    spent optimizing this function further belongs in
     [`triwarp.boundary.boundary_loops`][triwarp.boundary.boundary_loops] rather than here.
 
     See Also
@@ -717,27 +720,30 @@ def delete_region_keep_boundary(
     if n_loops == 0:
         return kept_vertices, kept_faces, []
 
-    # Classify every loop at once on the device. The input's own boundary edges become a sorted
-    # key table, each loop's edges are packed the same way and searched in it, and a loop whose
-    # every edge is present is the input's rim rather than one the deletion opened. Computed only
-    # when there is something to classify: on a closed input this pass answers nothing.
+    # Classify every loop at once on the device, from the deletion rather than from the input's
+    # boundary, so no table here is mesh-sized: the deleted faces' edges are sorted, and each loop
+    # edge is searched in them (see ``loops_are_input_rims`` for why that agrees with the
+    # input-boundary test on every loop the trace can return).
     #
     # Done on the host this was a readback per loop plus a Python membership test per rim edge, so
-    # its cost grew with the *loop count* as much as with the mesh -- and both tables it needed
-    # (the boundary edges and the submesh-to-input vertex map) crossed the bus whole to build a
-    # ``set`` and an index array the device could search in place.
-    input_boundary = tw.boundary.boundary_edges(vertices, faces)
-    base = wp.uint64(int(vertices.shape[0]))
-    boundary_keys = wp.empty(int(input_boundary.shape[0]), dtype=wp.uint64, device=device)
+    # its cost grew with the *loop count* as much as with the mesh.
+    n_kept = int(kept_faces.shape[0]) // 3
+    # The deleted count is the face count's complement, so the region's ranks need no readback.
+    deleted_flags = wp.empty(n_faces, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_grouping.pack_directed_index_keys,
-        dim=int(input_boundary.shape[0]),
-        inputs=[input_boundary, base, boundary_keys],
+        kernel_array.bool_flags, dim=n_faces, inputs=[face_mask, deleted_flags], device=device
+    )
+    deleted_ranks = wp.empty(n_faces, dtype=wp.int32, device=device)
+    wp.utils.array_scan(deleted_flags, out_array=deleted_ranks, inclusive=True)
+    base = wp.uint64(int(vertices.shape[0]))
+    deleted_keys = wp.empty(3 * (n_faces - n_kept), dtype=wp.uint64, device=device)
+    wp.launch(
+        kernel_selection.deleted_face_edge_keys,
+        dim=n_faces,
+        inputs=[faces, face_mask, deleted_ranks, base, deleted_keys],
         device=device,
     )
-    # ``boundary_edges`` rows are min-first, so the directed packing above is the undirected key
-    # ``pack_edge_key`` rebuilds for each rim edge.
-    boundary_keys = tw.array.sort_and_argsort(boundary_keys)[0]
+    deleted_keys = tw.array.sort_and_argsort(deleted_keys)[0]
 
     starts_and_rims = twt.empty_2d((2, n_loops), wp.int32, device=device)
     wp.launch(
@@ -748,7 +754,7 @@ def delete_region_keep_boundary(
             loop_offsets,
             loop_sizes,
             vertex_index,
-            boundary_keys,
+            deleted_keys,
             base,
             starts_and_rims,
         ],

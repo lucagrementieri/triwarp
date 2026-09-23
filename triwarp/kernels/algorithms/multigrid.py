@@ -333,6 +333,33 @@ def chebyshev_step(
 
 
 @wp.kernel
+def damped_inverse_diagonal(
+    growth: wp.array[wp.float64],
+    start: wp.float64,
+    exponent: wp.float64,
+    factor: wp.float64,
+    inverse_diagonal: wp.array[wp.float64],
+    out_scaled: wp.array[wp.float64],
+) -> None:
+    # ``omega D^-1`` for a level's smoother and prolongator, with ``omega = factor / rho`` formed
+    # on the device from the power iteration's growth rather than read back to the host.
+    # ``rho = sqrt(growth / start) ** exponent``, ``exponent`` being one over the step count, and
+    # ``rho = 1`` when the growth is not a positive finite number (an operator the iteration cannot
+    # measure), which is the host form's guard verbatim. Every thread forms the same two scalars;
+    # that is cheaper than a ``dim=1`` launch and a second buffer.
+    #
+    # Pre-scaling changes no consumer's arithmetic: ``jacobi_sweep`` and ``scaled_diagonal_apply``
+    # form ``factor * inv[row] * r`` left to right, so ``1 * (omega * inv[row]) * r`` is the same
+    # product, and the prolongator's ``(-omega) * inv[row]`` is ``(-1) * (omega * inv[row])``.
+    i = wp.int32(wp.tid())
+    end = growth[0]
+    rho = wp.float64(1.0)
+    if start > wp.float64(0.0) and end > wp.float64(0.0) and wp.isfinite(end):
+        rho = wp.pow(wp.sqrt(end / start), exponent)
+    out_scaled[i] = (factor / rho) * inverse_diagonal[i]
+
+
+@wp.kernel
 def power_step(
     inv_diag: wp.array[wp.float64],
     offsets: wp.array[wp.int32],

@@ -19,8 +19,47 @@ from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import to_vec2, to_vec2d
 from triwarp.kernels.linalg import free_row
 from triwarp.kernels.predicates import normalize_or_zero, unit_tangent, world_to_tangent
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
 from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import corner_triple, face_unit_gradient, face_vertices_vec3d
+
+
+@wp.kernel
+def upper_edge_length_sum_and_count(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    vertices: wp.array[wp.vec3],
+    out_sum_and_count: wp.array[wp.float64],
+) -> None:
+    # Sum and count of the edge lengths over an operator's *strict upper triangle*, which for the
+    # heat method's Laplacians -- one entry per edge, twelve triplets per face, nothing pruned -- is
+    # exactly the mesh's unique edge set. The timestep ``h ** 2`` needs only their mean, and the
+    # operator already exists, so the edge set comes free where ``edges_unique`` would re-sort
+    # every edge of the mesh to recover it. Reads the sparsity only, so the scalar and the
+    # vector solver get the identical number from their two different operators.
+    #
+    # ``reduce``'s mask-shaped block fold over *rows*: lanes stride the block's rows by
+    # ``wp.block_dim()`` (right on the CPU device too), and one tile sum per quantity commits.
+    i, t = wp.tid()
+    n = offsets.shape[0] - 1
+    base, remaining = tile_chunk(n, i, ITEMS_PER_BLOCK_1D)
+    if remaining <= 0:
+        return
+    remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
+    total = wp.float64(0.0)
+    count = wp.float64(0.0)
+    for k in range(t, remaining, wp.block_dim()):
+        row = base + k
+        for entry in range(offsets[row], offsets[row + 1]):
+            column = columns[entry]
+            if column > row:
+                total += wp.float64(wp.length(vertices[column] - vertices[row]))
+                count += wp.float64(1.0)
+    block_total = wp.tile_sum(wp.tile(total))[0]
+    block_count = wp.tile_sum(wp.tile(count))[0]
+    if t == 0:
+        wp.atomic_add(out_sum_and_count, 0, block_total)
+        wp.atomic_add(out_sum_and_count, 1, block_count)
 
 
 @wp.func
