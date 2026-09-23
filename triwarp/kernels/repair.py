@@ -7,7 +7,7 @@ from triwarp.kernels.array import (
     pack_ranked_key,
     update_argmin_pair,
 )
-from triwarp.kernels.halfedge import halfedge_destination, halfedge_next
+from triwarp.kernels.halfedge import halfedge_destination, halfedge_next, next_boundary_halfedge
 from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_normal
 from triwarp.kernels.triangles import (
     QUALITY_AREA,
@@ -399,30 +399,6 @@ def compact_kept_faces(
     row = inclusive_ranks[f] - 1
     for k in range(3):
         out_faces[3 * row + k] = faces[3 * f + k]
-
-
-@wp.func
-def next_boundary_halfedge(
-    faces: wp.array[wp.int32], twins: wp.array[wp.int32], h: wp.int32
-) -> wp.int32:
-    # The boundary halfedge following ``h`` around the rim, or -1 if the fan does not close.
-    #
-    # Rotate around ``h``'s tip through the faces on ``h``'s own side until an outgoing halfedge
-    # with no twin turns up. That sector is what makes this well defined where a per-*vertex* table
-    # is not: a bowtie rim vertex -- two rim loops pinched at one point, edge-manifold and
-    # consistently wound, so nothing upstream rejects it -- has two outgoing boundary halfedges,
-    # and this picks the one bounding the same sector as ``h`` rather than whichever won a race.
-    # The map is a bijection on boundary halfedges for the same reason, which is what lets the
-    # caller invert it by scatter without an atomic.
-    #
-    # The bound is the face count because a fan cannot be longer than the mesh; it is never
-    # approached, and it is here so a malformed twin table cannot spin forever.
-    g = halfedge_next(h)
-    for _ in range(faces.shape[0] // 3):
-        if twins[g] < 0:
-            return g
-        g = halfedge_next(twins[g])
-    return -1
 
 
 @wp.kernel

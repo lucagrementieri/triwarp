@@ -195,9 +195,12 @@ def boundary_loops(
 
     Notes
     -----
-    Assumes a **manifold** boundary: each boundary vertex lies on exactly two boundary edges. A
-    vertex shared by more than one loop (a non-manifold pinch point) keeps only one outgoing
-    successor edge, last write wins.
+    A vertex where the rim meets itself (a non-manifold **pinch** point, as deleting two faces that
+    share only a corner leaves) is walked by halfedge sector rather than by vertex: the loops are
+    the boundary of the surface with that vertex split once per fan, so every boundary edge
+    appears exactly once and every consecutive pair is a real boundary edge -- but a loop can pass
+    through a pinch vertex more than once, where two holes touch there. That needs an
+    edge-manifold mesh; on one that is not, the loops are bounded but unspecified.
 
     Orientability is *not* assumed. On a non-orientable surface the winding cannot orient the
     boundary globally -- at the seam two boundary edges leave the same vertex -- so the loops are
@@ -298,7 +301,10 @@ def boundary_loops_batched(
 
     directed = _directed_edge_rows(faces, edges, rows)
 
-    if _needs_unoriented_boundary_walk(directed, n_vertices):
+    has_seam, has_pinch = _boundary_defects(directed, n_vertices)
+    if has_pinch:
+        return _pinched_boundary_cycles(faces, rows, n_vertices)
+    if has_seam:
         return _unoriented_boundary_cycles(
             twt.as_array2d(tw.array.gather(edges_sorted, rows), wp.int32), n_vertices
         )
@@ -332,29 +338,29 @@ def _directed_edge_rows(
     return directed
 
 
-def _needs_unoriented_boundary_walk(directed: twt.Array2dInt32, n_vertices: int) -> bool:
+def _boundary_defects(directed: twt.Array2dInt32, n_vertices: int) -> tuple[bool, bool]:
     """
-    Whether the directed boundary edges fail to be a successor graph *and* an undirected walk fixes.
+    Whether the directed boundary edges have an orientation seam, and whether they have a pinch.
 
-    They are one on every orientable surface, which is what lets
+    They have neither on an orientable surface with a manifold boundary, which is what lets
     [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched] hand them straight to
-    [`successor_cycles`][triwarp.graph.successor_cycles]. Two different defects break that, and
-    they need different answers, so this returns ``True`` for only one of them:
+    [`successor_cycles`][triwarp.graph.successor_cycles]. The two defects break that differently
+    and each has its own walk:
 
     - **A non-orientable seam.** The winding cannot be made consistent globally, so at the seam two
       boundary edges leave the same vertex and ``succ[tail] = head`` drops one silently. On the
       Moebius fixture, exactly one vertex of 78 has out-degree 2, and the walk that follows returns
       78 entries over only 40 distinct vertices. The boundary is still 2-regular, so
       [`_unoriented_boundary_cycles`][triwarp.boundary._unoriented_boundary_cycles] recovers it
-      exactly -- this is the case worth taking.
+      exactly.
     - **A pinch point**, where two loops meet at one vertex, which then has four boundary
-      incidences. No 2-regular walk exists, so the undirected fallback has nothing better to offer
-      -- it would have to drop neighbours too, just at a different place. The documented last-write-
-      wins behaviour stands, and this returns ``False``.
+      incidences -- and, on a consistently wound surface, two out-edges as well, so a pinch raises
+      *both* flags. No walk over vertices exists at all, but one over halfedges does:
+      [`_pinched_boundary_cycles`][triwarp.boundary._pinched_boundary_cycles].
 
     Conflating them is easy: an icosphere with every seventh face removed has pinch points but no
-    orientability problem, and a gate reading only out-degree would incorrectly send it down the
-    undirected fallback.
+    orientability problem, and a gate reading only out-degree would send it down the undirected
+    walk, which has nothing to offer a vertex of degree four.
 
     One 8-byte host readback, and one pass over the boundary edges. Neither flag needs a pass over
     the *vertices*: only a boundary vertex ever has a non-zero degree, and the thread that pushes
@@ -369,8 +375,44 @@ def _needs_unoriented_boundary_walk(directed: twt.Array2dInt32, n_vertices: int)
         inputs=[directed, degrees, flags],
         device=device,
     )
-    has_seam, has_pinch = (int(flag) for flag in flags.numpy())
-    return bool(has_seam and not has_pinch)
+    has_seam, has_pinch = (bool(flag) for flag in flags.numpy())
+    return has_seam, has_pinch
+
+
+def _pinched_boundary_cycles(
+    faces: wp.array[wp.int32], boundary_halfedges: wp.array[wp.int32], n_vertices: int
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Boundary cycles of a rim that meets itself at a vertex: walk the boundary *halfedges* instead.
+
+    At a pinch the vertex successor table has two writers and no answer, which is why the vertex
+    walk came back with slots left at ``0``. A boundary halfedge has exactly one successor -- the
+    next boundary halfedge around its tip within its own sector
+    (``kernels/halfedge.next_boundary_halfedge``) -- so the halfedges form a true successor graph
+    and [`successor_cycles`][triwarp.graph.successor_cycles] walks it unchanged. Each cycle is then
+    read back as the origin vertex of each halfedge, which keeps the face winding's direction.
+
+    So the cycles are the boundary of the surface with each pinch vertex split once per fan: every
+    boundary edge appears exactly once, and a cycle can pass through a pinch vertex twice where two
+    holes touch there (one fan hands the walk from the first rim to the second, the other hands it
+    back). Only this branch builds a twin table (``validate=False``: a mesh
+    this function accepts need not be edge-manifold, and on one that is not, the walk is still
+    bounded and in range, just not meaningful).
+    """
+    device = faces.device
+    twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices, validate=False)
+    n_boundary = int(boundary_halfedges.shape[0])
+    successors = twt.empty_2d((n_boundary, 2), wp.int32, device=device)
+    wp.launch(
+        kernel_boundary.boundary_halfedge_successors,
+        dim=n_boundary,
+        inputs=[faces, twins, boundary_halfedges, successors],
+        device=device,
+    )
+    flat_halfedges, offsets, sizes = tw.graph.successor_cycles(
+        successors, int(faces.shape[0]) // 3 * 3, validate=False
+    )
+    return tw.array.gather(faces, flat_halfedges), offsets, sizes
 
 
 def _unoriented_boundary_cycles(

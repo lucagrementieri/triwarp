@@ -1692,9 +1692,9 @@ than hand-rolling a degenerate mesh.
   way from `icosphere(2)` reports **17** boundary loops in MeshLib and gains vertices in pymeshfix
   where the surface has one rim; after `merge_vertices()` it loads unchanged and reports **1**. Use
   the `tests/conftest.py` fixtures (`hemisphere` calls `merge_vertices()` for exactly this reason)
-  and **assert the hole count** before comparing a per-hole answer. The same duplication makes
-  `boundary_loops`' documented "last write wins" device-dependent, which once read as total
-  harmonic/tutte/arap disagreement.
+  and **assert the hole count** before comparing a per-hole answer. The same duplication once made
+  `boundary_loops`' pinch handling ("last write wins") device-dependent, which read as total
+  harmonic/tutte/arap disagreement; pinched rims are now walked by halfedge sector (§16.14).
 
 ### 7.4 The parity gate: a benchmarked reference must be a tested reference
 
@@ -5717,10 +5717,15 @@ atomic-cursor order, not the change.
   ranks leave slots at `0`: the loop comes back with `(0, 0)` edges, on both devices, at HEAD. Those
   fake edges match no deleted face, so the inverted rule reads the new rim as the input's and drops
   it (the CPU pass caught it); the existing rule fails safe by reporting it. **The unit test's
-  "interior" region is itself pinched** -- the first six faces off the rim are not contiguous, 14
-  hole edges over 10 vertices -- so it has been passing on a garbage loop. The rule becomes exact
-  once pinched rims are walked per *halfedge sector* (`repair.next_boundary_halfedge` already does)
-  rather than per vertex; that is a `boundary_loops` fix and was not made here. **Kept:** the
+  "interior" region was itself pinched** -- the first six faces off the rim are not contiguous, 14
+  hole edges over 10 vertices -- so it had been passing on a garbage loop.
+  **Fixed since:** `boundary_loops_batched` now walks a pinched rim as a successor graph over
+  boundary *halfedges* (`kernels/halfedge.next_boundary_halfedge`, moved there from `repair`),
+  gated on the degree flag it already read, so the common path is unchanged. The loops are the
+  boundary of the surface with each pinch vertex split once per fan: every boundary edge exactly
+  once, in winding, and a loop can pass a pinch vertex twice where two holes touch. The unit test
+  grows its regions over shared edges and asserts they are simple, and the pinched deletion is its
+  own test. That removes the blocker on the deleted-face rule; it was not re-landed. **Kept:** the
   empty-deletion early exit, read off the kept face count with no readback -- 2.51 -> 0.42 ms, since
   it skips the loop extraction too. **`holes._EdgeTable`'s inversion is in**: sort the rim's own
   keys and let one face pass probe them, in place of a radix sort of every mesh edge and two

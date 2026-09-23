@@ -539,9 +539,11 @@ def test_fillable_loop_mask_pinch_matches_meshlib(device: str) -> None:
 
     The fixture is the smallest mesh with a pinched rim -- two triangles meeting at one vertex and
     nowhere else -- because on a clean mesh both answers are empty and the comparison would be
-    vacuous. Measured: MeshLib marks vertex 0 alone, and triwarp's single loop
-    ``[0, 0, 0, 1, 2]`` comes back ``False``; the clean control comes back ``True`` with an empty
-    marked set, which is what rules out a mask that is simply always ``False``.
+    vacuous. Measured: MeshLib marks vertex 0 alone, and triwarp's two loops ``[0, 1, 2]`` and
+    ``[0, 3, 4]`` both come back ``False``, since each passes through the marked vertex; the clean
+    control comes back ``True`` with an empty marked set, which is what rules out a mask that is
+    simply always ``False``. (The vertex walk used to return one garbage loop ``[0, 0, 0, 1, 2]``
+    here; the halfedge walk returns the two rims the triangles actually have.)
     """
     pinched_np = np.array(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
@@ -550,13 +552,13 @@ def test_fillable_loop_mask_pinch_matches_meshlib(device: str) -> None:
     clean_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]])
     clean_faces_np = np.array([0, 1, 2], dtype=np.int32)
 
-    for vertices_np, faces_np, expected in (
-        (pinched_np, pinched_faces_np, False),
-        (clean_np, clean_faces_np, True),
+    for vertices_np, faces_np, expected, n_loops in (
+        (pinched_np, pinched_faces_np, False, 2),
+        (clean_np, clean_faces_np, True, 1),
     ):
         vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
         loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
-        assert len(loops_wp) == 1  # non-vacuity: there is a rim to judge
+        assert len(loops_wp) == n_loops  # non-vacuity: there is a rim to judge
         fillable_np = tw.holes.fillable_loop_mask(vertices_wp, faces_wp, loops_wp).numpy()
 
         mesh_ml = numpy_to_meshlib(vertices_np, faces_np.reshape(-1, 3))
@@ -564,9 +566,9 @@ def test_fillable_loop_mask_pinch_matches_meshlib(device: str) -> None:
             mm.findRepeatedVertsOnHoleBd(mesh_ml.topology), len(vertices_np)
         )
         assert repeated_np.any() == (not expected)
-        loop_np = loops_wp[0].numpy()
-        assert bool(fillable_np[0]) is expected
-        assert (not repeated_np[loop_np].any()) is expected
+        for fillable, loop_wp in zip(fillable_np, loops_wp, strict=True):
+            assert bool(fillable) is expected
+            assert (not repeated_np[loop_wp.numpy()].any()) is expected
 
 
 def test_fillable_loop_mask_chord_is_conservative(device: str) -> None:
@@ -1246,13 +1248,27 @@ def test_fill_min_weight_rejects_unknown_metric(hemisphere: tuple[tm.Trimesh, wp
 
 
 def _two_holes_of_different_size(device: str):
-    """Cut a wide cap and a two-face pinhole into an icosphere, reporting both perimeters."""
+    """
+    Cut a wide cap and a two-face pinhole into an icosphere, reporting both perimeters.
+
+    The pinhole is two faces sharing an *edge*, so its rim is a simple 4-gon, and the cap is a
+    16-gon. The south polar region is widened sixfold in ``x`` and ``y`` so the 4-gon's perimeter
+    (about 3.6) exceeds the 16-gon's (2.41) -- the inversion the threshold tests turn on. An
+    earlier version took the two lowest faces, which share only a corner: the rim was pinched, and
+    its apparent 5-vertex, long-perimeter loop was the vertex walk's garbage (fake jumps to vertex
+    0), not a hole the mesh has.
+    """
     sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
     centers_np = sphere_tm.triangles_center
     keep_np = np.ones(sphere_tm.faces.shape[0], dtype=bool)
     keep_np[np.argsort(-centers_np[:, 2])[:20]] = False
-    keep_np[np.argsort(centers_np[:, 2])[:2]] = False
-    holed_tm = tm.Trimesh(sphere_tm.vertices, sphere_tm.faces[keep_np], process=False)
+    bottom = int(np.argmin(centers_np[:, 2]))
+    adjacency_np = sphere_tm.face_adjacency
+    pair_np = adjacency_np[(adjacency_np == bottom).any(axis=1)][0]
+    keep_np[pair_np] = False
+    vertices_np = sphere_tm.vertices.copy()
+    vertices_np[vertices_np[:, 2] < -0.8, :2] *= 6.0
+    holed_tm = tm.Trimesh(vertices_np, sphere_tm.faces[keep_np], process=False)
     holed_tm.remove_unreferenced_vertices()
     vertices_wp, faces_wp = numpy_to_warp(holed_tm.vertices, holed_tm.faces, device)
     loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
@@ -1269,8 +1285,8 @@ def test_fill_small_fills_exactly_the_loops_under_the_threshold(device: str) -> 
 
     A fan triangulation of an ``n``-gon is ``n - 2`` triangles, so the count is an exact oracle for
     *which* loops were filled rather than just that something was. The fixture carries a 16-vertex
-    loop of perimeter 2.41 and a 5-vertex one of perimeter 3.16 -- the shorter perimeter belongs to
-    the loop with *more* vertices, so a threshold between them cannot be satisfied by a
+    loop of perimeter 2.41 and a 4-vertex one of perimeter about 3.6 -- the shorter perimeter
+    belongs to the loop with *more* vertices, so a threshold between them cannot be satisfied by a
     vertex-count rule by accident.
     """
     vertices_wp, faces_wp, loop_sizes, perimeters = _two_holes_of_different_size(device)
@@ -1304,12 +1320,13 @@ def _two_rims_of_different_edge_count(device: str):
     """
     Cut two well-separated caps of different size out of an icosphere, reporting the rim sizes.
 
-    Distinct from [`_two_holes_of_different_size`] in one respect that matters for a reference
-    comparison: both rims here are ordinary manifold loops, so pymeshfix's connectivity-repairing
-    loader leaves the mesh **untouched** (639 v / 1 250 f in and out, 2 boundaries). The pinhole in
-    the other fixture is two faces meeting at a vertex, which that loader cuts -- it comes back with
-    one extra vertex and the 5-edge rim has become a 6-edge one, so every count shifts by a
-    triangle and the comparison would read as a threshold disagreement.
+    Distinct from [`_two_holes_of_different_size`] in what a reference comparison needs: both rims
+    are ordinary manifold loops over an *undeformed* sphere, so pymeshfix's connectivity-repairing
+    loader leaves the mesh **untouched** (639 v / 1 250 f in and out, 2 boundaries), and nothing
+    about the geometry was arranged to invert an ordering. The other fixture widens its south pole
+    to make a 4-gon outlast a 16-gon in perimeter, which is what the threshold tests need and a
+    count comparison does not. (Its pinhole was once two faces meeting only at a vertex -- a pinched
+    rim that loader cuts, shifting every count by a triangle -- which is how this one came to be.)
     """
     sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
     centers_np = sphere_tm.triangles_center
@@ -1397,19 +1414,19 @@ def test_fill_small_thresholds_select_opposite_loops(device: str) -> None:
     reference comparison can show because no reference implements both.
 
     The fixture is the one whose orderings are **inverted**: a 16-vertex rim of perimeter 2.406
-    beside a 5-vertex rim of perimeter 3.150, so "the small loop" is the 16-gon by length and the
-    5-gon by count. A threshold in the middle of each range therefore fills a *different* loop
-    depending on which unit it is in, and the added-triangle counts (14 against 3) tell them apart.
+    beside a 4-vertex rim of perimeter about 3.6, so "the small loop" is the 16-gon by length and
+    the 4-gon by count. A threshold in the middle of each range therefore fills a *different* loop
+    depending on which unit it is in, and the added-triangle counts (14 against 2) tell them apart.
     """
     vertices_wp, faces_wp, loop_sizes, perimeters = _two_holes_of_different_size(device)
     n_faces = int(faces_wp.shape[0]) // 3
     by_size = dict(zip(loop_sizes, perimeters, strict=True))
-    assert by_size[16] < by_size[5]  # the inversion this test turns on
+    assert by_size[16] < by_size[4]  # the inversion this test turns on
 
-    by_edges_wp = tw.holes.fill_small(vertices_wp, faces_wp, max_edges=(5 + 16) // 2)
+    by_edges_wp = tw.holes.fill_small(vertices_wp, faces_wp, max_edges=(4 + 16) // 2)
     by_length_wp = tw.holes.fill_small(vertices_wp, faces_wp, sum(perimeters) / 2.0)
 
-    assert int(by_edges_wp.shape[0]) // 3 - n_faces == 5 - 2
+    assert int(by_edges_wp.shape[0]) // 3 - n_faces == 4 - 2
     assert int(by_length_wp.shape[0]) // 3 - n_faces == 16 - 2
 
 

@@ -918,6 +918,11 @@ def test_delete_region_keep_boundary_reports_only_new_rims(
     rather than nothing -- deleting a face on an existing rim grows that rim, and a caller filling
     only "new" loops would otherwise leave the extension open. That is the "every edge was already a
     boundary edge" rule the docstring states, and the case that rules out the naive "any edge".
+
+    Both regions are grown face by face over shared edges, so each opens one *simple* rim; the
+    loops are asserted simple to keep it that way. An earlier version took the first faces in index
+    order, which were not contiguous: the interior region's rim was pinched, and the test passed on
+    a loop the vertex walk had left full of ``(0, 0)`` edges. The pinched case is the next test.
     """
     mesh_tm, mesh_wp = hemisphere
     n_faces = mesh_tm.faces.shape[0]
@@ -927,24 +932,95 @@ def test_delete_region_keep_boundary_reports_only_new_rims(
 
     faces_np = mesh_tm.faces
     touches_rim_np = np.isin(faces_np, rim_vertices_np).any(axis=1)
+    rim_distance_np = KDTree(mesh_tm.vertices[rim_vertices_np]).query(mesh_tm.triangles_center)[0]
 
     # A region away from the rim: one new loop, and the original rim is not reported.
-    interior_np = np.zeros(n_faces, dtype=bool)
-    interior_np[np.flatnonzero(~touches_rim_np)[:6]] = True
+    interior_np = _grown_region(mesh_tm, int(np.argmax(rim_distance_np)), 6, ~touches_rim_np)
     _kept_vertices_wp, kept_faces_wp, interior_loops = tw.selection.delete_region_keep_boundary(
         mesh_wp.points, mesh_wp.indices, wp.array(interior_np, dtype=wp.bool, device=device)
     )
     assert int(kept_faces_wp.shape[0]) // 3 == n_faces - int(interior_np.sum())
     assert len(interior_loops) == 1
+    interior_loop_np = interior_loops[0].numpy()
+    assert np.unique(interior_loop_np).size == interior_loop_np.size  # a simple rim
+    assert np.isin(interior_loop_np, faces_np[interior_np]).all()  # and the region's own
 
     # A region on the rim: the loop it grows is reported, not skipped.
-    edge_np = np.zeros(n_faces, dtype=bool)
-    edge_np[np.flatnonzero(touches_rim_np)[:4]] = True
+    on_rim_np = np.flatnonzero(np.isin(faces_np, rim_vertices_np).sum(axis=1) >= 2)
+    edge_np = _grown_region(mesh_tm, int(on_rim_np[0]), 4, np.ones(n_faces, dtype=bool))
     _edge_vertices_wp, _edge_faces_wp, edge_loops = tw.selection.delete_region_keep_boundary(
         mesh_wp.points, mesh_wp.indices, wp.array(edge_np, dtype=wp.bool, device=device)
     )
     assert len(edge_loops) == 1
-    assert int(edge_loops[0].shape[0]) > rim_vertices_np.size  # the rim grew rather than vanished
+    edge_loop_np = edge_loops[0].numpy()
+    assert np.unique(edge_loop_np).size == edge_loop_np.size
+    assert edge_loop_np.size > rim_vertices_np.size  # the rim grew rather than vanished
+
+
+def test_delete_region_keep_boundary_reports_a_pinched_rim(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: two deleted faces that share only a corner open a rim that is new.
+
+    The deletion's rim meets itself at the shared vertex, so it is not a set of simple loops through
+    the vertices. The loops come back walked by halfedge sector, every rim edge once, and all of
+    them are new: nothing reported may be an input rim edge, and every edge of both deleted faces
+    must be reported. This is the case the vertex walk used to answer with fake ``(0, 0)`` edges.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    n_faces = mesh_tm.faces.shape[0]
+    device = mesh_wp.points.device
+    rim_vertices_np = tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices).numpy()
+    faces_np = mesh_tm.faces
+    interior_faces_np = np.flatnonzero(~np.isin(faces_np, rim_vertices_np).any(axis=1))
+    # Two faces meeting at exactly one vertex and no edge: their rims meet at that vertex.
+    edge_neighbours = {frozenset(pair) for pair in mesh_tm.face_adjacency.tolist()}
+    first = int(interior_faces_np[0])
+    second = next(
+        int(f)
+        for f in interior_faces_np
+        if np.intersect1d(faces_np[f], faces_np[first]).size == 1
+        and frozenset((first, int(f))) not in edge_neighbours
+    )
+    pinched_np = np.zeros(n_faces, dtype=bool)
+    pinched_np[[first, second]] = True
+
+    _kept_vertices_wp, _kept_faces_wp, loops = tw.selection.delete_region_keep_boundary(
+        mesh_wp.points, mesh_wp.indices, wp.array(pinched_np, dtype=wp.bool, device=device)
+    )
+    reported_np = np.concatenate(
+        [
+            np.sort(np.stack([loop_np, np.roll(loop_np, -1)], axis=1), axis=1)
+            for loop_np in (loop_wp.numpy() for loop_wp in loops)
+        ]
+    )
+    deleted_edges_np = np.sort(
+        np.concatenate([faces_np[pinched_np][:, [a, b]] for a, b in ((0, 1), (1, 2), (2, 0))]),
+        axis=1,
+    )
+    assert np.array_equal(lexsort_rows(reported_np), lexsort_rows(deleted_edges_np))
+
+
+def _grown_region(
+    mesh_tm: tm.Trimesh, seed_face: int, size: int, allowed_np: np.ndarray
+) -> np.ndarray:
+    """Face mask of ``size`` faces grown breadth-first from ``seed_face`` over shared edges."""
+    neighbours: dict[int, list[int]] = {}
+    for a, b in mesh_tm.face_adjacency.tolist():
+        neighbours.setdefault(a, []).append(b)
+        neighbours.setdefault(b, []).append(a)
+    region, frontier = [seed_face], [seed_face]
+    while frontier and len(region) < size:
+        face = frontier.pop(0)
+        for other in neighbours.get(face, []):
+            if allowed_np[other] and other not in region and len(region) < size:
+                region.append(other)
+                frontier.append(other)
+    assert len(region) == size  # non-vacuity: the region really has the size the test assumes
+    mask_np = np.zeros(mesh_tm.faces.shape[0], dtype=bool)
+    mask_np[region] = True
+    return mask_np
 
 
 def _vertex_selection(mesh_tm: tm.Trimesh, seed: int, fraction: int) -> np.ndarray:

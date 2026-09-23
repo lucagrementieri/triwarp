@@ -22,6 +22,7 @@ from tests.comparisons import (
 )
 from tests.conftest import OPEN_MESHES
 from tests.conversions import (
+    numpy_to_warp,
     points_to_warp,
     pyvista_edges_to_indices,
     trimesh_to_meshlib,
@@ -514,10 +515,14 @@ def test_boundary_loops_copy_detaches_from_packed_buffer(
 
 
 def test_boundary_loops_non_manifold_terminates(device: str) -> None:
-    # A "bowtie" (two triangles sharing a single pinch vertex) has a vertex-non-manifold boundary:
-    # the boundary successor chain is not one simple cycle, so vertex 2 gets two outgoing edges and
-    # only one survives (last write wins). boundary_loops must still terminate -- the successor walk
-    # in ``rank_loop_positions`` is bounded -- rather than spin forever on the device (regression).
+    """
+    Not a library comparison: a bowtie's two rims, each its own loop, from face winding alone.
+
+    Two triangles sharing only vertex 2 give that vertex two outgoing boundary edges, so a walk
+    over *vertices* has two successors for it and no answer -- it used to keep one (last write
+    wins) and return a loop missing edges. Walked by halfedge sector, each triangle's rim closes on
+    its own, in the triangle's own winding. Also the original regression: it must terminate.
+    """
     vertices_wp = wp.array(
         np.array(
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0], [2.0, 2.0, 0.0]],
@@ -530,8 +535,48 @@ def test_boundary_loops_non_manifold_terminates(device: str) -> None:
 
     loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
 
-    # Completes without hanging; the boundary vertices are distributed across the returned loops.
-    assert sum(int(loop.shape[0]) for loop in loops_wp) >= 1
+    def rotated_to_minimum(loop_np: np.ndarray) -> tuple[int, ...]:
+        return tuple(int(v) for v in np.roll(loop_np, -int(np.argmin(loop_np))))
+
+    assert sorted(rotated_to_minimum(loop_wp.numpy()) for loop_wp in loops_wp) == [
+        (0, 1, 2),
+        (2, 3, 4),
+    ]
+
+
+def test_boundary_loops_walk_a_pinched_rim_edge_by_edge(device: str) -> None:
+    """
+    Class B, against trimesh's boundary edges: each appears in exactly one loop, once, in winding.
+
+    Two holes opened in an icosphere that share a vertex, the construction
+    ``test_boundary_loop_sizes_refuses_a_pinched_rim`` uses -- reachable from ordinary face
+    deletion. At the shared vertex the rim has two outgoing edges, and walking it by vertex left
+    successor slots at ``0``: loops with fake ``(0, 0)`` edges, on both devices. The named
+    transform is from consecutive loop pairs to directed edges; the claim is that they are exactly
+    the oriented boundary edges, which ``trimesh`` reads off the faces with no loop walk at all.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    centers_np = sphere_tm.triangles_center
+    keep_np = np.ones(sphere_tm.faces.shape[0], dtype=bool)
+    keep_np[np.argsort(-centers_np[:, 2])[:6]] = False
+    keep_np[np.argsort(centers_np[:, 2])[:2]] = False
+    faces_np = sphere_tm.faces[keep_np]
+    holed_tm = tm.Trimesh(sphere_tm.vertices, faces_np, process=False)
+    # Non-vacuity: the rim really is pinched -- more boundary edges touch some vertex than two.
+    boundary_np = holed_tm.edges[tm_grouping.group_rows(holed_tm.edges_sorted, require_count=1)]
+    assert np.bincount(boundary_np.ravel()).max() > 2
+    vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, faces_np, device)
+
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+
+    walked_np = np.concatenate(
+        [
+            np.stack([loop_np, np.roll(loop_np, -1)], axis=1)
+            for loop_np in (loop_wp.numpy() for loop_wp in loops_wp)
+        ]
+    )
+    assert (walked_np[:, 0] != walked_np[:, 1]).all()  # no fake self-edge
+    assert Counter(map(tuple, walked_np.tolist())) == Counter(map(tuple, boundary_np.tolist()))
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)

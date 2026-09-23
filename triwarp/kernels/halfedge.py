@@ -39,6 +39,30 @@ def halfedge_prev(h: wp.int32) -> wp.int32:
 
 
 @wp.func
+def next_boundary_halfedge(
+    faces: wp.array[wp.int32], twins: wp.array[wp.int32], h: wp.int32
+) -> wp.int32:
+    # The boundary halfedge following ``h`` around the rim, or -1 if the fan does not close.
+    #
+    # Rotate around ``h``'s tip through the faces on ``h``'s own side until an outgoing halfedge
+    # with no twin turns up. That sector is what makes this well defined where a per-*vertex* table
+    # is not: a bowtie rim vertex -- two rim loops pinched at one point, edge-manifold and
+    # consistently wound, so nothing upstream rejects it -- has two outgoing boundary halfedges,
+    # and this picks the one bounding the same sector as ``h`` rather than whichever won a race.
+    # The map is a bijection on boundary halfedges for the same reason, which is what lets
+    # ``repair`` invert it by scatter without an atomic and ``boundary`` walk its cycles as loops.
+    #
+    # The bound is the face count because a fan cannot be longer than the mesh; it is never
+    # approached, and it is here so a malformed twin table cannot spin forever.
+    g = halfedge_next(h)
+    for _ in range(faces.shape[0] // 3):
+        if twins[g] < 0:
+            return g
+        g = halfedge_next(twins[g])
+    return -1
+
+
+@wp.func
 def halfedge_destination(faces: wp.array[wp.int32], h: wp.int32) -> wp.int32:
     # Halfedge ``3*f + k`` ends at the next corner of its face; ``faces[h]`` is its origin.
     k = h % wp.int32(3)

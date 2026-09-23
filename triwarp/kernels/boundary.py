@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import loop_rim_edge, pack_ranked_key
+from triwarp.kernels.halfedge import next_boundary_halfedge
 
 
 @wp.kernel
@@ -82,6 +83,25 @@ def build_dart_successors(
 
 
 @wp.kernel
+def boundary_halfedge_successors(
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    boundary_halfedges: wp.array[wp.int32],
+    out_edges: wp.array2d[wp.int32],
+) -> None:
+    # The boundary as a successor graph over *halfedges*: row ``(h, next)`` for each boundary
+    # halfedge, where ``next`` is the boundary halfedge leaving ``h``'s tip in ``h``'s own sector.
+    # Over vertices a pinch point has two successors; over halfedges every node has exactly one,
+    # which is what ``successor_cycles`` needs. A fan that does not close (a malformed twin
+    # table) maps to a self-loop, so the graph stays in range and the walk stays bounded.
+    i = wp.int32(wp.tid())
+    h = boundary_halfedges[i]
+    following = next_boundary_halfedge(faces, twins, h)
+    out_edges[i, 0] = h
+    out_edges[i, 1] = wp.where(following >= 0, following, h)
+
+
+@wp.kernel
 def count_boundary_degrees(
     directed_edges: wp.array2d[wp.int32],
     out_degrees: wp.array2d[wp.int32],
@@ -90,8 +110,9 @@ def count_boundary_degrees(
     # Column 0: how many boundary edges *leave* each vertex. Column 1: how many touch it at all.
     # One out-edge and two incidences is the well-behaved case. Two out-edges is the seam of a
     # non-orientable surface, where ``succ[tail] = head`` silently drops an edge. Four incidences
-    # is a pinch point, where two loops meet and no 2-regular walk exists at all -- the two are
-    # different defects and only the first one has a better answer available.
+    # is a pinch point, where two loops meet and no 2-regular walk over vertices exists at all --
+    # the two are different defects with different walks: the seam's is undirected, the pinch's is
+    # over halfedges (``boundary_halfedge_successors``).
     #
     # The two defect bits are stamped here rather than by a second pass over the degree table:
     # ``wp.atomic_add`` returns the value the slot held *before* the increment, so the thread that
