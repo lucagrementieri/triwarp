@@ -1572,7 +1572,8 @@ def test_quadric_decimate_padding_never_reaches_the_output(
     passes = 0
     while buffers.run_pass() and passes < 50:
         passes += 1
-        n_faces, n_vertices, n_edges = (int(x) for x in buffers.state.numpy())
+        # ``[faces, vertices, edges, commits]``: the last slot is the pass's collapse count.
+        n_faces, n_vertices, n_edges = (int(x) for x in buffers.state.numpy()[:3])
         live_faces = buffers.faces.numpy()[: 3 * n_faces].reshape(-1, 3)
         assert n_edges <= buffers.n_edges, "the edge capacity bound was violated"
         assert live_faces.max() < n_vertices, "a face still points at the dummy vertex"

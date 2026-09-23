@@ -25,6 +25,10 @@ from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
 MAX_SEARCH_ATTEMPTS = wp.constant(wp.int32(16))
 RADIUS_GROWTH = wp.constant(wp.float32(2.0))
 
+# Index a grid k-NN row carries when its search was handed to ``nearest_point_via_mesh`` rather
+# than finished by a linear scan. Distinct from ``-1``, which is an answer: no point in range.
+DEFERRED_ROW = wp.constant(wp.int32(-2))
+
 # Candidate-row sizes the register-resident k-NN kernels are generated for. The row is held in a
 # ``wp.types.vector(length=K)`` value type, i.e. in registers, so ``K`` must be a compile-time
 # constant and one kernel exists per bucket. A query takes the smallest bucket that fits its ``k``,
@@ -666,9 +670,14 @@ def query_hashgrid_nearest_neighbors(
     widest: wp.float32,
     min_bound: wp.vec3,
     max_bound: wp.vec3,
+    defer: wp.int32,
+    out_deferred: wp.array[wp.int32],
     out_indices: wp.array2d[wp.int32],
     out_distances: wp.array2d[wp.float32],
 ) -> None:
+    # ``defer`` is the register-row twin's switch (see there); this global-row form serves only
+    # ``k`` above the largest bucket, where no caller defers, so it takes the arguments and ignores
+    # them.
     tid = wp.int32(wp.tid())
     q = queries[tid]
     out_indices_row = out_indices[tid]
@@ -706,6 +715,8 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
         widest: wp.float32,
         min_bound: wp.vec3,
         max_bound: wp.vec3,
+        defer: wp.int32,
+        out_deferred: wp.array[wp.int32],
         out_indices: wp.array2d[wp.int32],
         out_distances: wp.array2d[wp.float32],
     ) -> None:
@@ -749,6 +760,16 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
                 break
             r = deepen_radius(worst, r, r_hard)
 
+        if certified == 0 and defer != 0:
+            # Hand the row to ``nearest_point_via_mesh`` instead of scanning: a query this far
+            # from the cloud is the grid's worst case and a closest-point descent's ordinary one.
+            # Marked ``DEFERRED_ROW`` rather than ``-1``, which already means "nothing within
+            # ``max_radius``", and counted so the caller can skip the second pass when none was.
+            row_reset(row_distances, row_indices)
+            row_write(row_distances, row_indices, tid, k, out_indices, out_distances)
+            out_indices[tid, 0] = DEFERRED_ROW
+            wp.atomic_add(out_deferred, 0, 1)
+            return
         if certified == 0:
             # Exact fallback once the radius outgrows the cell width or the attempt budget runs
             # out — the register twin of ``knn_linear_scan``.
@@ -790,6 +811,43 @@ def hashgrid_nearest_kernel(k: int) -> wp.Kernel:
         if k <= row_size:
             return _HASHGRID_NEAREST_ROW_KERNELS[row_size]
     return query_hashgrid_nearest_neighbors
+
+
+@wp.kernel
+def point_triangle_indices(out_indices: wp.array[wp.int32]) -> None:
+    # Corner ``c`` of triangle ``i`` is point ``i``: every triangle collapsed onto one point, so a
+    # ``wp.Mesh`` over them is a point cloud whose closest-face query is a nearest-point query.
+    c = wp.int32(wp.tid())
+    out_indices[c] = c // 3
+
+
+@wp.kernel
+def nearest_point_via_mesh(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    max_radius: wp.float32,
+    out_indices: wp.array2d[wp.int32],
+    out_distances: wp.array2d[wp.float32],
+) -> None:
+    # The ``k = 1`` rows the grid deferred, answered by the mesh BVH's best-first closest-point
+    # descent over the collapsed triangles ``point_triangle_indices`` builds. Its cost follows the
+    # tree's depth rather than the distance to the answer, which is exactly what the grid's does
+    # not. The closest point of a triangle whose three corners coincide is that corner, exactly,
+    # and the distance is recomputed here with the grid's own ``wp.length`` so a row answers the
+    # same whichever pass decided it.
+    tid = wp.int32(wp.tid())
+    if out_indices[tid, 0] != DEFERRED_ROW:
+        return
+    q = queries[tid]
+    out_indices[tid, 0] = -1
+    out_distances[tid, 0] = wp.inf
+    hit = wp.mesh_query_point_no_sign(mesh_id, q, max_radius)
+    if hit.result:
+        d = wp.length(points[hit.face] - q)
+        if d <= max_radius:
+            out_indices[tid, 0] = hit.face
+            out_distances[tid, 0] = d
 
 
 @wp.kernel

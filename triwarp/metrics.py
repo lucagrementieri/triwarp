@@ -400,13 +400,11 @@ def chamfer_points_to_points_loss(
         return loss
 
     # Non-differentiable nearest-neighbor indices (computed outside the tape). The backward search
-    # is seeded from the forward one's own distances -- see `_backward_radius`.
+    # is seeded from the forward one's own distances -- see `_backward_nearest`.
     nearest_xy, dist_xy = tw.neighbors.query_nearest(y, x, k=1)
     terms = [lambda: _launch_nn_term(x, y, nearest_xy, _reduction_scale(point_reduction, n), loss)]
     if not single_directional:
-        nearest_yx = tw.neighbors.query_nearest(
-            x, y, k=1, initial_radius=_backward_radius(_forward_max(dist_xy))
-        )[0]
+        nearest_yx = _backward_nearest(x, y, _forward_max(dist_xy))[0]
         terms.append(
             lambda: _launch_nn_term(y, x, nearest_yx, _reduction_scale(point_reduction, m), loss)
         )
@@ -477,7 +475,7 @@ def chamfer_points_to_mesh_loss(
         return loss
 
     # Non-differentiable closest-face and nearest-neighbor assignment (outside the tape). The
-    # backward search is seeded from the forward one's own distances -- see `_backward_radius`.
+    # backward search is seeded from the forward one's own distances -- see `_backward_nearest`.
     _, dist_forward, face_id = tw.proximity.closest_point_on_mesh(vertices, faces, points)
     terms = [
         lambda: _launch_surface_term(
@@ -485,9 +483,7 @@ def chamfer_points_to_mesh_loss(
         )
     ]
     if not single_directional:
-        nearest_vp = tw.neighbors.query_nearest(
-            points, vertices, k=1, initial_radius=_backward_radius(_forward_max(dist_forward))
-        )[0]
+        nearest_vp = _backward_nearest(points, vertices, _forward_max(dist_forward))[0]
         terms.append(
             lambda: _launch_nn_term(
                 vertices, points, nearest_vp, _reduction_scale(point_reduction, v), loss
@@ -839,7 +835,7 @@ def _empty_chamfer(
 # input. ``None`` means degenerate, leaving that choice to the caller.
 #
 # Two of the three run a *second* nearest-neighbour search back over the same pair, and that
-# backward search is seeded from the forward one's own answer -- see ``_backward_radius``.
+# backward search is seeded from the forward one's own answer -- see ``_backward_nearest``.
 
 
 def _distances_points_to_points(
@@ -852,9 +848,7 @@ def _distances_points_to_points(
     if single_directional:
         return _Distances(d_forward, None, None)
     forward_max = _forward_max(d_forward)
-    d_backward = tw.neighbors.query_nearest(
-        x, y, k=1, initial_radius=_backward_radius(forward_max)
-    )[1]
+    d_backward = _backward_nearest(x, y, forward_max)[1]
     return _Distances(d_forward, cast(wp.array[wp.float32], d_backward), forward_max)
 
 
@@ -873,9 +867,7 @@ def _distances_points_to_mesh(
     # The forward half is point-to-*surface*, so it is a lower bound on the point-to-vertex answer
     # this search wants -- still the right scale to seed it with.
     forward_max = _forward_max(d_forward)
-    d_backward = tw.neighbors.query_nearest(
-        points, vertices, k=1, initial_radius=_backward_radius(forward_max)
-    )[1]
+    d_backward = _backward_nearest(points, vertices, forward_max)[1]
     return _Distances(d_forward, cast(wp.array[wp.float32], d_backward), forward_max)
 
 
@@ -883,7 +875,7 @@ def _forward_max(d_forward: wp.array[wp.float32]) -> float:
     """
     Read the forward answer's largest distance back, once.
 
-    It seeds the backward search (see [`_backward_radius`][triwarp.metrics._backward_radius]) and
+    It seeds the backward search (see ``_backward_nearest``) and
     is carried in [`_Distances`][triwarp.metrics._Distances], so a ``"max"`` Chamfer reduction or
     a Hausdorff distance over the same pair takes it from there rather than reducing the array a
     second time.
@@ -891,31 +883,31 @@ def _forward_max(d_forward: wp.array[wp.float32]) -> float:
     return tw.reduce.max(cast(twt.Array1dFloat32, d_forward))
 
 
-def _backward_radius(forward_max: float) -> float | None:
+def _backward_nearest(
+    points: wp.array[wp.vec3], queries: wp.array[wp.vec3], forward_max: float
+) -> tuple[twt.ArrayNd, twt.ArrayNd]:
     """
-    Seed the backward search's radius from the forward search's largest answer distance.
+    Run the backward half's ``k = 1`` search, its radius seeded from the forward half's answer.
 
     [`query_nearest`][triwarp.neighbors.query_nearest] defaults its ``initial_radius`` to
     [`knn_initial_radius`][triwarp.neighbors.knn_initial_radius], which inverts the *target
-    cloud's* density -- and under ``"hashgrid"`` that number also fixes the cell width. For two
-    clouds sampled from the same surface the density is the right scale, which is why the default
-    is what it is. For two clouds that are **displaced** it is not: the answer sits at the
-    displacement rather than at the density scale, so the search can widen into an exact scan of
-    the whole cloud.
+    cloud's* density -- and under ``"hashgrid"`` that number also fixes the cell width. Both
+    directions of a pair share one distance scale, so the forward half's largest distance is a
+    better start whenever it is the *smaller* of the two: for clouds a fraction of a spacing
+    apart it saves every row a deepening round. It is capped at the density estimate, because
+    past it the seed only buys coarser cells: a row the walk cannot certify is handed to a
+    closest-point query whatever the cell width, and a wide cell makes every certified row scan
+    more of the cloud. Either way the answer is unchanged -- this only sets where the search
+    ladder *starts*, and every row still certifies itself.
 
-    Both directions of a pair share one distance scale, so the forward half already holds the
-    estimate the backward search needs -- the answer is unchanged either way, since this only sets
-    where the search ladder *starts* and every row still certifies itself. ``max`` rather than a
-    mean or a median because overshooting the radius only costs a coarser grid, while
-    undershooting costs a full extra deepening round per row.
-
-    Returns
-    -------
-    float | None
-        The radius, or ``None`` to keep the default when the forward answer carries no finite
-        distance to learn from (every slot unfilled under a ``max_radius``).
+    The seed falls back to the default when the forward answer carries no finite distance to learn
+    from (every slot unfilled under a ``max_radius``).
     """
-    return forward_max if math.isfinite(forward_max) and forward_max > 0.0 else None
+    bounds = tw.bounds.aabb(points)
+    radius = None
+    if math.isfinite(forward_max) and forward_max > 0.0:
+        radius = min(forward_max, tw.neighbors.knn_initial_radius(points, 1, bounds=bounds))
+    return tw.neighbors.query_nearest(points, queries, k=1, initial_radius=radius, bounds=bounds)
 
 
 def _distances_mesh_to_mesh(

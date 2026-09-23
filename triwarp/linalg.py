@@ -44,7 +44,11 @@ a Jacobi-sweep approximation, an exact apply parallelized by graph coloring (who
 access and extra launches eat most of its iteration win), and natural-ordering level sets (whose
 level count swings wildly with the input's vertex numbering) are all worse than Jacobi in practice.
 Chebyshev as a single-level preconditioner is also worse; Chebyshev as the V-cycle's *smoother* is a
-separate question -- see ``_MULTIGRID_SWEEPS`` -- and neither decline covers the other.
+separate question -- see ``_MULTIGRID_SWEEPS`` -- and neither decline covers the other. Neither
+covers a *squared* operator either: there the polynomial is not in the operator itself but in its
+second-order square root, and
+[`squared_laplacian_preconditioner`][triwarp.linalg.squared_laplacian_preconditioner] is the one
+place a Chebyshev polynomial is the right tool.
 
 Two further obstacles are specific to this repository. Obtuse triangles give negative cotangent
 weights, so ``-L`` is often not the M-matrix IC(0) existence requires; and both
@@ -519,7 +523,7 @@ def solve_spd_columns(
     tol: float = CG_TOLERANCE,
     maxiter: int | None = None,
     check_every: int = CG_CHECK_EVERY,
-    preconditioner: str = "diag",
+    preconditioner: str | SquaredLaplacianPreconditioner = "diag",
 ) -> tuple[int, float, float]:
     """
 
@@ -574,7 +578,10 @@ def solve_spd_columns(
         solve dominates the call, so ``"auto"`` is the setting for a caller whose systems vary --
         it cannot regress a solve that was already short, though it can forgo a small win on a
         small ill-conditioned system that the size floor declines. See that function's Notes, and
-        both constants.
+        both constants. For normal equations whose square block is a scaled Laplacian, pass the
+        operator
+        [`squared_laplacian_preconditioner`][triwarp.linalg.squared_laplacian_preconditioner]
+        builds instead of a name.
 
     Returns
     -------
@@ -759,7 +766,7 @@ def _cg_columns(
     tol: float,
     maxiter: int | None,
     check_every: int,
-    preconditioner: str,
+    preconditioner: str | SquaredLaplacianPreconditioner,
     run: Literal[True],
     caller: str,
 ) -> tuple[int, float, float]: ...
@@ -772,7 +779,7 @@ def _cg_columns(
     tol: float,
     maxiter: int | None,
     check_every: int,
-    preconditioner: str,
+    preconditioner: str | SquaredLaplacianPreconditioner,
     run: Literal[False],
     caller: str,
 ) -> wpl.LinearSolverState | _BatchedCg: ...
@@ -784,7 +791,7 @@ def _cg_columns(
     tol: float,
     maxiter: int | None,
     check_every: int,
-    preconditioner: str,
+    preconditioner: str | SquaredLaplacianPreconditioner,
     run: bool,
     caller: str,
 ) -> tuple[int, float, float] | wpl.LinearSolverState | _BatchedCg:
@@ -814,6 +821,19 @@ def _cg_columns(
             check_every=check_every,
             caller=caller,
         )
+    # A squared-Laplacian preconditioner is an ``apply`` over this module's padded column blocks,
+    # which only ``_BatchedCg`` drives -- so it takes that path at any column count.
+    if isinstance(preconditioner, SquaredLaplacianPreconditioner):
+        state = _BatchedCg(
+            matrix,
+            rhs,
+            solution,
+            tol=tol,
+            maxiter=iteration_cap,
+            check_every=_supported_check_every(check_every),
+            preconditioner=preconditioner,
+        )
+        return cast("tuple[int, float, float]", state()) if run else state
     # Validated rather than left to fall through. Every branch below tests for one name and treats
     # anything else as ``"diag"``, so without this an unrecognised string -- ``"jacobi"``,
     # ``"amg"``, a capitalised ``"Multigrid"`` -- runs a Jacobi solve silently, bit-identically to
@@ -1057,7 +1077,7 @@ class _BatchedCg:
         tol: float,
         maxiter: int,
         check_every: int,
-        preconditioner: str = "diag",
+        preconditioner: str | SquaredLaplacianPreconditioner = "diag",
     ) -> None:
         device = matrix.device
         self._device = device
@@ -1113,7 +1133,9 @@ class _BatchedCg:
         # hierarchy is batched over the columns at *this* solver's pitch, so the cycle's elementwise
         # passes stay one launch each rather than one per column.
         self._cycle = None
-        if preconditioner == "multigrid":
+        if isinstance(preconditioner, SquaredLaplacianPreconditioner):
+            self._cycle = preconditioner.bind(self._n_columns, self._stride)
+        elif preconditioner == "multigrid":
             hierarchy = _multigrid_hierarchy(matrix, 0)
             if hierarchy is not None:
                 self._cycle = _MultigridCycle(
@@ -1577,6 +1599,183 @@ def multigrid_preconditioner(
 
     total = n_columns * n
     return wpl.LinearOperator((total, total), base.dtype, base.device, matvec)
+
+
+def squared_laplacian_preconditioner(
+    laplacian: wps.BsrMatrix[wp.float64], weight_sums: wp.array[wp.float64]
+) -> SquaredLaplacianPreconditioner:
+    """
+    Preconditioner for normal equations ``(MᵀM) x = Mᵀ b`` whose square block is ``D⁻¹ L``.
+
+    A least-squares umbrella system (``smoothing.smooth_region``'s) is a *squared*, fourth-order
+    operator: its condition number is roughly the square of the Laplacian's, so Jacobi needs
+    several times the iterations a Laplacian solve takes on the same unknowns, and smoothed
+    aggregation -- built for second-order operators -- recovers only part of that. The standard
+    remedy for a biharmonic-type system is to precondition it with the square of a second-order
+    one. When the free rows of ``M`` form the square block ``M_ff = D⁻¹ L`` for a symmetric
+    positive-definite ``L`` and a positive diagonal ``D``, ``M_ffᵀ M_ff`` is spectrally close to
+    ``MᵀM`` -- the rows ``M`` adds beyond ``M_ff`` are one ring of the boundary -- so its inverse
+    ``M_ff⁻¹ M_ff⁻ᵀ`` preconditions ``MᵀM`` well.
+
+    It is applied as ``B Bᵀ``, with ``B`` a fixed Chebyshev polynomial in ``M_ff`` that
+    approximates its inverse over ``[a, b]``. ``b`` is ``M_ff``'s Gershgorin bound -- ``2`` when
+    every weight is non-negative, more when some are negative, as clamped cotangent weights can
+    be -- which keeps the polynomial positive on every eigenvalue, so ``B`` is nonsingular and
+    ``B Bᵀ`` symmetric positive-definite -- what conjugate gradient needs -- whatever ``a`` is.
+    ``a`` only sets how well the low-frequency end is resolved; it is taken as
+    [`SQUARED_LAPLACIAN_INTERVAL`][triwarp.linalg.SQUARED_LAPLACIAN_INTERVAL] over the unknown
+    count, the rate at which a disc-like region's smallest eigenvalue falls. The setup is two
+    copies of the matrix and one reduction for ``b``: a polynomial needs no hierarchy.
+
+    Parameters
+    ----------
+    laplacian
+        ``(n, n)`` symmetric positive-definite ``L``, ``float64``. An empty row is allowed and
+        is left at zero, as it is in the system: an unknown no equation touches.
+    weight_sums
+        Length-``n`` diagonal of ``D``, positive. ``M_ff = D⁻¹ L``; give ``1`` for an empty row.
+
+    Returns
+    -------
+    SquaredLaplacianPreconditioner
+        Hand to [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] as ``preconditioner=``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``laplacian`` and ``weight_sums`` are not all on one device.
+
+    See Also
+    --------
+    [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
+    [`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner]
+    """
+    require_same_device(laplacian=laplacian.values, weight_sums=weight_sums)
+    return SquaredLaplacianPreconditioner(laplacian, weight_sums)
+
+
+# Degree of ``squared_laplacian_preconditioner``'s Chebyshev polynomial: ``degree - 1`` sparse
+# steps, one launch each, per factor, and two factors per apply. The cost that matters is the total
+# step count, iterations times launches per iteration, and 12 keeps it near its minimum from hole
+# patches of a thousand unknowns up to regions of ten thousand.
+SQUARED_LAPLACIAN_DEGREE = 12
+
+# The polynomial's interval starts at ``SQUARED_LAPLACIAN_INTERVAL / n`` for ``n`` unknowns, capped
+# at ``SQUARED_LAPLACIAN_INTERVAL_CAP`` so a tiny system still has an interval. The best lower end
+# falls as ``1 / n``, like a disc-like region's smallest eigenvalue, and the iteration count is
+# flat to within a few percent over a factor of three either side of it.
+SQUARED_LAPLACIAN_INTERVAL = 40.0
+SQUARED_LAPLACIAN_INTERVAL_CAP = 0.5
+
+
+class SquaredLaplacianPreconditioner:
+    """
+    The preconditioner a normal-equations solve is handed.
+
+    Built by [`squared_laplacian_preconditioner`][triwarp.linalg.squared_laplacian_preconditioner].
+
+    Holds the square block ``M_ff = D⁻¹ L``, its transpose and the polynomial's coefficients, and
+    binds a set of working vectors to the column layout of each solve that uses it.
+    """
+
+    def __init__(
+        self, laplacian: wps.BsrMatrix[wp.float64], weight_sums: wp.array[wp.float64]
+    ) -> None:
+        """Build ``M_ff`` and its transpose from ``L`` and ``D``, and fix the interval."""
+        self._n = int(laplacian.nrow)
+        self._device = laplacian.values.device
+        inverse_sums = wp.empty(self._n, dtype=wp.float64, device=self._device)
+        wp.map(kernel_array.inverse_or_one, weight_sums, out=inverse_sums)
+        self._factor = wps.bsr_copy(laplacian)
+        wp.launch(
+            kernel_mg.scale_rows,
+            dim=self._n,
+            inputs=[self._factor.offsets, inverse_sums, wp.float64(1.0), self._factor.values],
+            device=self._device,
+        )
+        self._factor_t = wps.bsr_transposed(self._factor)
+        # The upper end is ``M_ff``'s Gershgorin bound, ``1 + max_i sum_j |L_ij| / L_ii``, read off
+        # ``L`` directly and never below 2. It is exactly 2 when every weight is non-negative and
+        # exceeds it when a clamped cotangent weight is negative, as on a regular grid's near-right
+        # triangles -- and a Chebyshev polynomial grows without bound past the end of its interval,
+        # so an eigenvalue beyond a fixed 2 would be amplified rather than inverted.
+        lower = min(SQUARED_LAPLACIAN_INTERVAL / max(self._n, 1), SQUARED_LAPLACIAN_INTERVAL_CAP)
+        upper = 1.0 + max(_offdiagonal_dominance(laplacian), 1.0)
+        # The semi-iteration's scalars depend on the interval alone, so they are host constants:
+        # ``(scale, momentum, step)`` per launch.
+        theta, delta = 0.5 * (upper + lower), 0.5 * (upper - lower)
+        sigma = theta / delta
+        rho = 1.0 / sigma
+        self._steps: list[tuple[float, float, float]] = []
+        for index in range(SQUARED_LAPLACIAN_DEGREE - 1):
+            rho_next = 1.0 / (2.0 * sigma - rho)
+            scale = 1.0 / theta if index == 0 else 1.0
+            self._steps.append((scale, rho_next * rho, 2.0 * rho_next / delta))
+            rho = rho_next
+
+    def bind(self, n_columns: int, stride: int) -> _SquaredLaplacianApply:
+        """Working vectors for ``n_columns`` blocks at column pitch ``stride``."""
+        return _SquaredLaplacianApply(self, n_columns, stride)
+
+
+class _SquaredLaplacianApply:
+    """``z = B Bᵀ r`` over the padded column blocks of one conjugate-gradient state."""
+
+    def __init__(self, owner: SquaredLaplacianPreconditioner, n_columns: int, stride: int) -> None:
+        self._owner = owner
+        self._n = owner._n
+        self._stride = stride
+        self._device = owner._device
+        self._dim = n_columns * self._n
+        # Zeroed: every step writes the ``n`` live rows of a column and nothing in the pad, and the
+        # first step of each factor reads ``zero`` as the iterate before the first.
+        dofs = n_columns * stride
+        self._middle = wp.zeros(dofs, dtype=wp.float64, device=self._device)
+        self._zero = wp.zeros(dofs, dtype=wp.float64, device=self._device)
+        self._spare = [wp.zeros(dofs, dtype=wp.float64, device=self._device) for _ in range(3)]
+
+    def apply(self, source: wp.array[wp.float64], destination: wp.array[wp.float64]) -> None:
+        """``destination = B Bᵀ source``: ``Bᵀ`` first, then ``B``."""
+        self._polynomial(self._owner._factor_t, source, self._middle)
+        self._polynomial(self._owner._factor, self._middle, destination)
+
+    def _polynomial(
+        self,
+        factor: wps.BsrMatrix[wp.float64],
+        source: wp.array[wp.float64],
+        destination: wp.array[wp.float64],
+    ) -> None:
+        """``destination = p(factor) source``, one launch per Chebyshev step."""
+        steps = self._owner._steps
+        # Three rotating iterates: a step reads the current and the previous one and writes a
+        # third, so none of the three may be ``source`` or ``destination`` until the last write.
+        previous, current = self._zero, source
+        free = list(self._spare)
+        for index, (scale, momentum, step) in enumerate(steps):
+            target = destination if index == len(steps) - 1 else free.pop()
+            wp.launch(
+                kernel_mg.chebyshev_step,
+                dim=self._dim,
+                inputs=[
+                    wp.int32(self._n),
+                    wp.int32(self._stride),
+                    wp.float64(scale),
+                    wp.float64(momentum),
+                    wp.float64(step),
+                    factor.offsets,
+                    factor.columns,
+                    factor.values,
+                    source,
+                    current,
+                    previous,
+                ],
+                outputs=[target],
+                device=self._device,
+            )
+            # The buffer two steps back is free again; ``source`` and ``zero`` never are.
+            if previous is not self._zero and previous is not source:
+                free.append(previous)
+            previous, current = current, target
 
 
 # ---------------------------------------------------------------------------

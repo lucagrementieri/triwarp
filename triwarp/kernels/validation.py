@@ -43,6 +43,8 @@ def mark_intersecting_faces(
     pairs: wp.array2d[wp.int32], valid: wp.array[wp.bool], out_mask: wp.array[wp.bool]
 ) -> None:
     """Flag both faces of each intersecting candidate pair (idempotent ``True`` writes)."""
+    # Folding the narrow phase in here, so the mask path needs no per-pair verdict buffer, is
+    # exact and measured flat: one launch and one allocation of a call dominated by the BVH query.
     p = wp.int32(wp.tid())
     if valid[p]:
         out_mask[pairs[p, 0]] = True

@@ -89,6 +89,24 @@ def ecl_hook(
 
 
 @wp.kernel
+def ecl_init_parent_edges(edges: wp.array2d[wp.int32], parents: wp.array[wp.int32]) -> None:
+    # Edge-parallel counterpart of ``ecl_init_parent``, run over an identity ``parents`` before
+    # ``ecl_hook_edges``: point each node at its smallest smaller neighbour. Like the CSR pre-hook
+    # it changes no root -- every write points a node at a smaller node it shares an edge with --
+    # and like it, it is load-bearing for the *cost*, not the answer. From a bare identity forest
+    # the CAS hooks race on two shapes: a long cycle with sequential ids, where concurrent unions
+    # grow parent chains as long as the cycle and every find walks them, and a hub vertex, where
+    # every incident edge's CAS retries against the same root. One ``atomic_min`` per edge removes
+    # both before a single CAS runs (``boundary_loops`` on two 65 536-edge rims, 16x; a
+    # 40 960-spoke fan, 12x), for one extra launch on an ordinary mesh.
+    e = wp.int32(wp.tid())
+    a = edges[e, 0]
+    b = edges[e, 1]
+    if a != b:
+        wp.atomic_min(parents, wp.max(a, b), wp.min(a, b))
+
+
+@wp.kernel
 def ecl_hook_edges(edges: wp.array2d[wp.int32], parents: wp.array[wp.int32]) -> None:
     # Edge-parallel hook over an ``(m, 2)`` edge list, from an identity ``parents``: the plain
     # variant's counterpart of ``ecl_hook_parity``, and the reason ``graph``'s edge-list entry point
@@ -99,8 +117,9 @@ def ecl_hook_edges(edges: wp.array2d[wp.int32], parents: wp.array[wp.int32]) -> 
     #
     # The answer is the CSR path's exactly, not merely the same partition: every union points the
     # larger root at the smaller, so each tree's root is its smallest node and ``ecl_flatten``
-    # labels every component by its minimum node id whichever order the unions ran in. The CSR
-    # path's ``ecl_init_parent`` pre-hook is only a head start on those unions and changes no root.
+    # labels every component by its minimum node id whichever order the unions ran in. The
+    # ``ecl_init_parent_edges`` pre-hook changes no root either, but it is not optional: it is what
+    # keeps this launch cheap on long sequential cycles and on hub vertices (see there).
     #
     # Unlike ``ecl_hook``, there is no per-row owner to serialize on, so a hub vertex costs one
     # thread per incident edge rather than one thread walking them all.

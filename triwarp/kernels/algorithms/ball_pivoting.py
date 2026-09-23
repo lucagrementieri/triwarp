@@ -77,6 +77,10 @@ from triwarp.kernels.predicates import dihedral_angle, triangle_normal
 
 # Per-thread neighbour scratch for the seed search (Open3D re-scans the KNN result twice).
 MAX_SEED_NEIGHBORS = 64
+# ``seed_triangles``' per-point cache: a neighbour index is the orphan the point last deferred to,
+# ``SEED_UNKNOWN`` nothing yet, and ``SEED_EXHAUSTED`` a point that can never seed (see there).
+SEED_UNKNOWN = wp.constant(wp.int32(-1))
+SEED_EXHAUSTED = wp.constant(wp.int32(-2))
 # Relative slack on the empty-ball test: absorbs float32 round-off so the three defining points
 # (exactly on the ball in exact arithmetic) do not spuriously read as "inside".
 BALL_EPS = wp.constant(wp.float32(1e-4))
@@ -306,6 +310,7 @@ def seed_triangles(
     normals: wp.array[wp.vec3],
     point_used: wp.array[wp.bool],
     seed_failed: wp.array[wp.bool],
+    seed_blocker: wp.array[wp.int32],
     grid_id: wp.uint64,
     radius: wp.float32,
     clustering: wp.float32,
@@ -321,6 +326,28 @@ def seed_triangles(
     p = wp.int32(wp.tid())
     if point_used[p]:
         return
+    # The deferral below, remembered: ``seed_blocker[p]`` is the neighbour this point last yielded
+    # to, and while it is still an orphan that has not given up, the walk would yield to it again
+    # and the answer is unchanged, so two loads replace a hash-grid walk. Exact, not approximate:
+    # the walk yields at the *first* qualifying neighbour in the grid's order, the grid is built
+    # once per run so that order is fixed, and both flags only ever move a neighbour *out* of
+    # qualifying -- so no neighbour ahead of the blocker can start to qualify, and the ones ahead of
+    # it that stop being orphans only bring it forward, never past the ``MAX_SEED_NEIGHBORS`` break.
+    #
+    # ``SEED_EXHAUSTED`` is the other thing worth remembering: a point whose failed attempt *saw its
+    # whole neighbourhood*. Whether an attempt succeeds depends on the stored neighbours alone --
+    # ``ball_is_empty`` and ``is_compatible`` are geometry, and never read ``point_used`` -- and a
+    # later walk stores the same neighbours minus the ones used since, so every later attempt
+    # tries a subset of the pairs that already failed and fails again. Such a point returns here
+    # for the rest of the run. A walk cut short by the ``MAX_SEED_NEIGHBORS`` break is not
+    # remembered: once stored neighbours are used, the next walk reaches past the break and can
+    # store a neighbour the failed one never tried.
+    blocker = seed_blocker[p]
+    if blocker == SEED_EXHAUSTED:
+        return
+    if blocker >= 0:
+        if not point_used[blocker] and not seed_failed[blocker]:
+            return
 
     # Gather the local orphan neighbourhood into scratch so it can be scanned as a double loop.
     # A point yields to any lower-index orphan it *sees* that has not already given up
@@ -351,13 +378,16 @@ def seed_triangles(
     # goes false -> true), so a point that exhausted its candidates cannot succeed with a subset.
     nbr = wp.zeros(shape=MAX_SEED_NEIGHBORS, dtype=wp.int32)
     count = wp.int32(0)
+    truncated = wp.bool(False)
     query = wp.hash_grid_query(grid_id, points[p], 2.0 * radius)
     j = wp.int32(-1)
     while wp.hash_grid_query_next(query, j):
         if count >= MAX_SEED_NEIGHBORS:
+            truncated = wp.bool(True)
             break
         if j != p and not point_used[j]:
             if j < p and not seed_failed[j]:
+                seed_blocker[p] = j
                 return  # a lower-index, still-viable orphan neighbour will seed this instead
             nbr[count] = j
             count += 1
@@ -390,6 +420,8 @@ def seed_triangles(
     if not seed_failed[p]:
         seed_failed[p] = True
         wp.atomic_add(counters, CNT_SEED_FAILED, 1)
+    if not truncated:
+        seed_blocker[p] = SEED_EXHAUSTED
 
 
 @wp.func

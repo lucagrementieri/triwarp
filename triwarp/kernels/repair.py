@@ -383,6 +383,24 @@ def emit_degree3_replacement(
         out_new_faces[slot, k] = halfedge_destination(faces, ring_halfedges[begin + k])
 
 
+@wp.kernel
+def compact_kept_faces(
+    faces: wp.array[wp.int32],
+    keep: wp.array[wp.bool],
+    inclusive_ranks: wp.array[wp.int32],
+    out_faces: wp.array[wp.int32],
+) -> None:
+    # Face ``f`` of the kept set to row ``inclusive_ranks[f] - 1`` of ``out_faces``, keeping their
+    # order -- ``flatnonzero`` plus a row gather in one pass, with the row count the caller already
+    # knows instead of one read back from the scan's tail.
+    f = wp.int32(wp.tid())
+    if not keep[f]:
+        return
+    row = inclusive_ranks[f] - 1
+    for k in range(3):
+        out_faces[3 * row + k] = faces[3 * f + k]
+
+
 @wp.func
 def next_boundary_halfedge(
     faces: wp.array[wp.int32], twins: wp.array[wp.int32], h: wp.int32

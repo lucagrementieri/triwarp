@@ -178,6 +178,44 @@ def test_vertex_one_rings_rejects_a_pinched_vertex(device: str) -> None:
         tw.halfedge.vertex_one_rings(faces_wp, twins=twins, n_vertices=5)
 
 
+@pytest.mark.parametrize("mesh_name", MESHES)
+def test_validate_false_skips_only_the_check(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    """
+    Triwarp against triwarp: ``validate=False`` changes whether the mesh is checked, not the answer.
+
+    The validated path carries the oracle -- the involution test above and the trimesh ring tests
+    below. On a valid mesh both builders must return byte-identical tables either way, and the
+    unvalidated calls must take no host readback, since skipping one is their whole purpose.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp, n_vertices = mesh_wp.indices, len(mesh_tm.vertices)
+    twins_wp = tw.halfedge.halfedge_twins(faces_wp, n_vertices=n_vertices)
+    rings_wp = tw.halfedge.vertex_one_rings(faces_wp, n_vertices=n_vertices)
+    readbacks = []
+    original = wp.array.numpy
+
+    def counting_numpy(self: wp.array) -> np.ndarray:
+        readbacks.append(self.shape)
+        return original(self)
+
+    wp.array.numpy = counting_numpy
+    try:
+        unchecked_twins_wp = tw.halfedge.halfedge_twins(
+            faces_wp, n_vertices=n_vertices, validate=False
+        )
+        unchecked_rings_wp = tw.halfedge.vertex_one_rings(
+            faces_wp, n_vertices=n_vertices, validate=False
+        )
+    finally:
+        wp.array.numpy = original
+    assert readbacks == []
+    assert np.array_equal(unchecked_twins_wp.numpy(), twins_wp.numpy())
+    for unchecked_wp, checked_wp in zip(unchecked_rings_wp, rings_wp, strict=True):
+        assert np.array_equal(unchecked_wp.numpy(), checked_wp.numpy())
+
+
 def test_halfedge_twins_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     assert tw.halfedge.halfedge_twins(faces_wp, n_vertices=0).shape == (0,)

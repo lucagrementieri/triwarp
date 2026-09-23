@@ -4167,6 +4167,14 @@ captured wrapper chain also pays for its Python once, so the wrapper chains stay
 removed their cost. §12.6 has what blocks a capture; §15.10 has why a captured function cannot be
 attributed with `wp.timing_begin`.
 
+**A `wp.capture_while` body may not allocate, and `wp.utils.array_scan` does** (CUB scratch, per
+call): recording one raises `Conditional body graph contains an unsupported operation (memory
+allocation)`, where the same scan in a *plain* `ScopedCapture` is legal. Probed in isolation:
+`fill_`, `zero_` and `radix_sort_pairs` record into a conditional body, `array_scan` does not. So a
+loop whose round contains a scan -- the flip rounds' regroup, `quadric_decimate`'s pass -- is
+recorded as a plain graph and replayed from the host, keeping its one 4-byte termination read per
+round; that is still the manufactured-repetition win above (§16.14: 1.48x on a 50-round flip call).
+
 **`wp.capture_while` is slower than a batched host loop** where the per-iteration conditional-graph
 overhead exceeds the sync it removes (ball pivoting batches 8 waves per readback). Nesting one
 inside a capture is fine.
@@ -5588,6 +5596,14 @@ Findings that generalise past this pass:
   path's exactly. It drops `bsr_from_triplets` and its radix sort from every caller
   (`face_connected_component_labels` 1.65x, `boundary_loops_batched`, `vertex_manifold_mask`,
   `successor_cycles`).
+  **Shipped without its pre-hook, it regressed the two fixtures built to break it (§16.14).**
+  From a bare identity forest the CAS hooks race: `rim_long`'s sequential-id cycles grow parent
+  chains as long as the cycle and `fan_hub`'s 40 960 spokes retry against one root, taking
+  `boundary_loops[rim_long]` 3.6 -> 26.4 ms and `is_vertex_manifold[fan_hub]` 2.0 -> 9.1. One
+  `wp.atomic_min(parents, max(a, b), min(a, b))` per edge first (`ecl_init_parent_edges`) changes
+  no root and fixes both: **1.6 / 0.73 ms**, past the CSR path's own figures, for one extra launch
+  (~0.02-0.04 ms) on an ordinary mesh. "Changes no root" was true of the answer and false of the
+  cost -- §9's fixture-pair rule, a fourth time.
 - **`array_cast` is generic, so `astype` pays generic dispatch on every call.** A census of
   `array_cast` over the suite put four dtype pairs at 97.9 % of calls; `kernel_array.ASTYPE`
   launches concrete kernels for those and falls back for the rest (1.56x on the call).
@@ -5618,4 +5634,98 @@ Findings that generalise past this pass:
   sides stay zeroed by the wrapper** -- the two memsets are ~0.15 % of an iteration the CG solve
   dominates, which does not pay for turning two read-only inputs into in-place state (written at
   `kernels/parametrization.arap_interior_rhs`).
+
+### 16.14 Benchmark round 14 (2026-09-23)
+
+Items from `plans/benchmark-round-11.md` (round 14), each measured back to back against a detached
+baseline carrying every *other* item, with byte-identity gated on the CPU oracle (§7.2). CUDA
+differences that also appear baseline-against-baseline -- `quadric_decimate`, `ball_pivoting` on
+`bunny`, `remove_degree3_vertices`' replacement-face order -- are the pre-existing float-atomic and
+atomic-cursor order, not the change.
+
+- **`remove_tunnels` cut a separating family (correctness).** Vertex-disjoint non-trivial loops can
+  still be *dependent*: on `handles_64` 23 disjoint shortened generators bound a piece of the slab,
+  and cutting all 23 split it in two (chi -126 -> -78 where 23 cuts claim -80). The basis changed
+  in `2d848b9` and the selection had never checked independence -- "a basis is not unique and the
+  invariants cover it" was true of the basis and false of the subfamily. Fix: label the faces of the
+  cut mesh; every component after the first is a dependent loop, and a longest-first spanning
+  forest over the component graph (components as nodes, loops as edges) leaves exactly those uncut.
+  22 removed, invariant holds. **None of `_handles`' smaller variants (3-10 holes a side, three edge
+  lengths) produces a dependent family**, so the unit test carries the genus-64 slab itself.
+- **The largest cluster was a preconditioner, not launches.** `smooth_region` solves normal
+  equations `MᵀM` -- squared, fourth order -- and the free rows of `M` are `M_ff = D⁻¹ L`. The
+  *exact* `M_ff⁻¹ M_ff⁻ᵀ` converges in 21-30 iterations on every system probed (against Jacobi's
+  421-5 000 and the `MᵀM` V-cycle's 153-313), so the one ring of rim rows `M` adds does not spoil
+  the spectral equivalence. Approximating `M_ff⁻¹` is the whole design question, and three were
+  built:
+    - **A V-cycle on `L_ff`**: 77 / 126 iterations, but its hierarchy setup is **13-14 ms**, half of
+      `bunny_decimated`'s call before one iteration -- §16.8's setup-is-the-blocker again.
+    - **A Neumann series**: needs no setup and is weak, because `D⁻¹L`'s spectrum reaches 2, where
+      `(1 - λ)ᵏ` does not decay.
+    - **A Chebyshev polynomial on `[a, b]`, shipped** (`linalg.squared_laplacian_preconditioner`,
+      degree 12, `a = 40 / n`): one launch per step in the three-term `x` recurrence, no setup.
+      `smooth_region[bunny]` 69.5 -> 17.0 ms (4.1x), `[bunny_decimated]` 2.4x, `saddle` /
+      `saddle_graded` regions 4.1-4.5x, `fill_smooth[rim_short]` 1.52x; positions within float32
+      rounding. The best lower end falls as `1/n` (0.04 at 1 000 unknowns, 0.005 at 9 000).
+  **The upper end must be the Gershgorin bound, not 2.** Clamped cotangent weights go negative on a
+  regular grid's near-right triangles, which puts `M_ff`'s spectrum at 2.18, and a Chebyshev
+  polynomial fitted to `[a, 2]` explodes past its interval: the uniform `saddle` took **2 824**
+  iterations (3x slower than before) while its graded twin improved. With `b = 1 + max_i Σ|L_ij| /
+  L_ii` (the existing `offdiagonal_dominance_rows`) it is 153. §9's pair rule caught it; the unit
+  test's negative-weight arm reads 340 against 37 under the mutation.
+- **A `k = 1` query far from its cloud is a closest-point query.** Warp exposes no node-by-node
+  traversal (§12.2), but it does not need to: a `wp.Mesh` whose triangles each collapse onto one
+  point (`(i, i, i)`) answers `mesh_query_point_no_sign` with the nearest *point*, exactly -- the
+  closest point of a collapsed triangle is its corner, and distances matched the grid's bit for
+  bit. It is the BVH's pruned descent, so its cost does not grow with the displacement: 187 ms ->
+  4.2 on `dragon` shifted 5 % of its diagonal. **It loses on queries on the cloud** (0.74 -> 1.76
+  ms on `dragon`, the tree build), so it ships as a *deferral* inside the grid kernel at `k = 1`:
+  a row that would take the linear scan is marked `DEFERRED_ROW` and counted, and one 4-byte read
+  decides whether to build the tree for them. `chamfer_points_to_points[dragon oneway]` 186 -> 6.9
+  ms (27x), `[bunny oneway]` 2.9x -- the 1.51x loss to pytorch3d-cuda becomes a win. Three facts
+  that decided the shape:
+    - `bvh_constructor="lbvh"` is the only viable one: `sah` / `median` build it 30x slower.
+    - **Bringing the deferral radius in is a trade, not a win**: at 0.25-0.5 of the scan cutover it
+      halves displaced rows' walk, and it defers the odd outlier of an *on-surface* query set,
+      whose one row then pays for the whole tree (`bunny` on-surface 0.35 -> 0.50 ms). Kept at the
+      cutover.
+    - **§16.6's backward seed is now capped at the target's density estimate.** Seeding the
+      backward search at the forward half's largest distance saved deepening rounds when the
+      pair is a fraction of a spacing apart, and at 5 % displacement it made cells so wide that
+      certified rows scanned thousands of points (59.9 ms against the default's 7.6). `min(seed,
+      knn_initial_radius)` is best of both at every cell swept: `chamfer[dragon symm]` 245 ->
+      15.8 ms, `hausdorff[dragon]` 239 -> 15.6.
+- **`ball_pivoting`'s seed kernel re-proved the same failures every wave.** 21 of its 28.6 ms were
+  waves 90-133 at a flat 0.54 ms each: already-failed orphans re-walking and re-testing every pair.
+  An attempt's outcome depends only on the stored neighbour list (`ball_is_empty` never reads
+  `point_used`), so a point whose failed walk saw its *whole* neighbourhood can never succeed and
+  returns at once (`SEED_EXHAUSTED`); a truncated walk is not remembered, since used neighbours let
+  the next walk past the break. The deferral cache the plan proposed first was sound and bought
+  nothing -- few threads take that return. `seed_triangles` 28.6 -> 12.7 ms, `[bunny_decimated]`
+  1.49x, byte-identical on CPU.
+- **Flip rounds replay as a plain graph** (see §14.3): 13.1 -> 8.9 ms on a 50-round call; the
+  interior-edge count cannot change after round 0 (every candidate kernel opens with the
+  duplicate-edge guard), so later regroups skip its readback. `quadric_decimate`'s two readbacks
+  per pass became one (a fourth `state` slot): 1.02-1.03x, as expected for a read queued behind
+  work the first already drained.
+- **Region-sized versions of region questions: both declined.** A kept rim edge was an input
+  boundary edge exactly when no *deleted* face contains it (its input count is `1 + deleted faces
+  containing it`), so `delete_region_keep_boundary` could sort `3k` region keys instead of grouping
+  every mesh edge: 1.09-1.12x, identical on simple rims -- and **wrong on a pinched deletion**. There
+  `boundary_loops` returns loops whose vertex order is unspecified and device-dependent (§7.3), a
+  loop's fake edges such as `(0, 0)` match no deleted face, and the inverted rule reads the new rim
+  as the input's and drops it (CPU only, which is how the full CPU pass caught it); the existing rule
+  fails safe by reporting it. **The unit test's "interior" region is itself pinched** -- the first
+  six faces off the rim are not contiguous, 14 hole edges over 10 vertices -- so it passes on a
+  garbage loop at HEAD too, on both devices. `holes._EdgeTable`'s inversion (sort the rim's keys,
+  one face pass probes them) is exact and **flat** -- the whole-mesh sort is a few launches of a
+  launch-bound call. Both written at their sites.
+- **Small items.** `refine_and_smooth_region` derives the free ranks and unique edges once for its
+  two solves (~0.5-1 ms of a hole-chain call). `remove_degree3_vertices` validates topology on pass
+  0 only (`halfedge_twins` / `vertex_one_rings` gained `validate=`) and knows its kept count
+  (`n_faces - 3 n_selected`): 1.18x on `dragon`. **Declined, measured flat:** fusing
+  `face_self_intersecting_mask`'s narrow phase into its marking (one launch of a BVH-bound call).
+  **Not done:** `_mean_positive_finite` (only the untimed auto-radius path, and a fused sum-and-count
+  changes the summation precision), `heat_geodesic`'s timestep (CG-bound rows), the multigrid
+  spectral-radius pre-scale (it was tied to the `L_ff` hierarchy, which did not ship).
 

@@ -769,12 +769,17 @@ def _flip_interior_edges(
         return 0
     topology = _FlipTopology(faces, n_vertices)
     key_base = wp.uint64(n_vertices)
-    count = wp.zeros(1, dtype=wp.int32, device=device)
-    total = 0
-    for _ in range(max_iter):
-        m = topology.rebuild()
-        if m == 0:
-            break
+    # The one readback of the row count. A committed flip trades one two-face edge for a new one
+    # (the duplicate-edge guard every candidate kernel opens with rejects a flip whose new edge
+    # already exists, and the claim table stops two flips creating the same one) and leaves the
+    # quad's four sides alone, so the interior-edge count is fixed from here on and every later
+    # rebuild regroups the same number of rows.
+    m = topology.rebuild()
+    if m == 0:
+        return 0
+
+    def flip_round(progress: wp.array[wp.int32]) -> None:
+        """Mark, claim and commit one independent set of flips, then regroup for the next round."""
         launch_candidates(
             topology.adjacency,
             topology.adjacency_edges,
@@ -784,7 +789,6 @@ def _flip_interior_edges(
             topology.flip,
             topology.quad,
         )
-
         # Independent-set selection: a flip commits only if it wins both incident faces and the
         # hashed slot of its new edge (prevents two disjoint flips creating the same edge).
         #
@@ -792,14 +796,12 @@ def _flip_interior_edges(
         # passes the index-locality test -- ``claim_flips`` reads ``flip[k]``, ``quad[k, *]`` and
         # ``adjacency[k, *]`` at its own thread, and the two ``fill_`` calls touch buffers the
         # candidate kernel never reads, so they would simply move ahead of a fused launch. What
-        # it is not is worth it. A pass is seven launches, and ``flip_to_delaunay`` converges in
-        # one or two passes on an ordinary mesh rather than running its iteration cap, so this
-        # launch is 2 % of the call at 1 280 faces and less at 20 480 -- a share that falls as
-        # the mesh grows. Against that, every one of the four candidate kernels decides
-        # ``out_flip`` at two or three separate exits (``objective_flip_candidates`` at three),
-        # so each would have to be restructured around a single exit for the claim to hang off,
-        # in predicate code where a mistake silently changes which edges flip. The claim/commit
-        # pair below is not fusible at all (a commit must see every claim).
+        # it is not is worth it: every one of the four candidate kernels decides ``out_flip`` at
+        # two or three separate exits (``objective_flip_candidates`` at three), so each would
+        # have to be restructured around a single exit for the claim to hang off, in predicate
+        # code where a mistake silently changes which edges flip -- for one launch of a round's
+        # dozen. The claim/commit pair below is not fusible at all (a commit must see every
+        # claim).
         topology.face_claim.fill_(INT32_MAX)
         topology.edge_claim.fill_(INT32_MAX)
         wp.launch(
@@ -816,7 +818,6 @@ def _flip_interior_edges(
             ],
             device=device,
         )
-        count.zero_()
         wp.launch(
             kernel_remesh.commit_flips,
             dim=m,
@@ -829,10 +830,33 @@ def _flip_interior_edges(
                 wp.int32(topology.edge_claim_mask),
                 key_base,
                 faces,
-                count,
+                progress,
             ],
             device=device,
         )
+        # Regrouped at the end of the round rather than the start, so the recorded body is one
+        # round and the host rebuild above serves the first; the last round's regroup is spare.
+        topology.rebuild(read_count=False)
+
+    count = wp.zeros(1, dtype=wp.int32, device=device)
+    graph = None
+    if wp.get_device(device).is_cuda:
+        # Every round is the same launch sequence over the same buffers -- only the face buffer's
+        # contents change -- so it is recorded once and replayed, and a round costs one graph
+        # launch rather than a dozen launches' worth of Python. Replayed from the host rather than
+        # under ``wp.capture_while``, which would also drop the per-round count read: the regroup's
+        # ``wp.utils.array_scan`` allocates scratch, and a conditional graph's body may not.
+        with wp.ScopedCapture(device) as capture:
+            count.zero_()
+            flip_round(count)
+        graph = capture.graph
+    total = 0
+    for _ in range(max_iter):
+        if graph is None:
+            count.zero_()
+            flip_round(count)
+        else:
+            wp.capture_launch(graph)
         n = int(read_scalar(count, 0))
         total += n
         if n == 0:
@@ -914,12 +938,14 @@ class _FlipTopology:
         self._rows = -1
         self._allocate_rows(0)
 
-    def rebuild(self) -> int:
+    def rebuild(self, *, read_count: bool = True) -> int:
         """
         Regroup the mutated face buffer into interior-edge rows, and return how many there are.
 
         Every public attribute is rewritten; the returned row count is also the launch dimension
-        for the candidate, claim and commit kernels.
+        for the candidate, claim and commit kernels. ``read_count=False`` skips the one readback,
+        for a regroup of a face buffer whose row count is already known (a flip round's), which is
+        also what lets the regroup be recorded into a graph; it returns the known count.
 
         **It is launch-bound, not data-bound, and that is why the region flip pass does not scope
         it to the region.** The cost is dominated by the fixed launches' own marshalling rather than
@@ -952,13 +978,19 @@ class _FlipTopology:
         # Inclusive, so the row count is one 4-byte tail read and the emit kernel's row is
         # ``ranks[i] - 1`` -- the contract ``array.flatnonzero`` uses for the same reason.
         wp.utils.array_scan(self._starts, out_array=self._ranks, inclusive=True)
-        m = int(read_scalar(self._ranks_tail, 0))
-        if m == 0:
-            return 0
-        if m != self._rows:
-            # Not expected to trigger after the first pass: the duplicate-edge guard in
-            # ``_resolve_flip_quad_guarded`` is what keeps the exactly-two-corner edge count fixed.
-            self._allocate_rows(m)
+        if read_count:
+            m = int(read_scalar(self._ranks_tail, 0))
+            if m == 0:
+                return 0
+            if m != self._rows:
+                self._allocate_rows(m)
+        else:
+            m = self._rows
+            # The invariant the skipped read rests on, checked where Warp's debug mode is already
+            # paying for bounds checks -- and not while the regroup is being recorded, where a
+            # readback is an error: a regroup whose row count moved would index past the tables.
+            if wp.config.mode == "debug" and not wp.get_device(self._device).is_capturing:
+                assert int(read_scalar(self._ranks_tail, 0)) == m, "interior-edge count changed"
         wp.launch(
             kernel_remesh.emit_flip_topology,
             dim=n,
@@ -1419,8 +1451,12 @@ class _DecimationBuffers:
         self.faces = wp.empty(self.n_corners, dtype=wp.int32, device=device)
         wp.copy(self.faces, faces, count=self.n_corners)
         # Allocated holding its seed rather than zeroed and then assigned: the zeroing is
-        # discarded and the assign is a second upload of the same twelve bytes.
-        self.state = wp.array([self.n_faces, self.n_vertices, 0], dtype=wp.int32, device=device)
+        # discarded and the assign is a second upload of the same bytes. ``[faces, vertices,
+        # edges, commits]``: the last slot is the pass's collapse count, which the pass kernels
+        # reach through the ``_count`` view, so the one readback a pass ends with answers both
+        # "did it commit anything" and the next pass's size test.
+        self.state = wp.array([self.n_faces, self.n_vertices, 0, 0], dtype=wp.int32, device=device)
+        self._host_state = None
 
         n = self.n_corners
         self._keys = wp.empty(2 * n, dtype=wp.uint64, device=device)
@@ -1443,7 +1479,7 @@ class _DecimationBuffers:
         self._csr_values = wp.ones(2 * self.n_edges, dtype=wp.float32, device=device)
         self._half = wp.empty(1, dtype=wp.int32, device=device)
         self._surplus = wp.empty(1, dtype=wp.int32, device=device)
-        self._count = wp.zeros(1, dtype=wp.int32, device=device)
+        self._count = self.state[3:4]
 
         # Provenance, only when a caller asked for it: one entry per *input* vertex composed pass by
         # pass (``compose_vertex_index``), and a column beside the face buffer compacted with it
@@ -1473,14 +1509,14 @@ class _DecimationBuffers:
         The first pass is issued -- it is the one that measures the true edge count, which the
         allocation could only bound structurally at ``3 * n_faces`` -- and the second is captured
         at that narrower width and replayed by every pass after it. The one host readback per pass
-        is here rather than in the pass body, and covers both the "target reached" and the
-        "nothing legal left to collapse" exits.
+        is here rather than in the pass body, taken after it, and covers the "nothing legal left
+        to collapse" exit of this pass and the "target reached" exit of the next.
 
         Without a conditional-graph device there is nothing to replay, so the width is re-tightened
         every pass instead and the pass is issued: that keeps the CPU path tracking the live mesh
         rather than paying the pass-0 width forever.
         """
-        counts = self.state.numpy()
+        counts = self._host_state if self._host_state is not None else self.state.numpy()
         if int(counts[0]) <= self._target or int(counts[1]) == 0:
             return False
         if self._graph is not None:
@@ -1495,7 +1531,8 @@ class _DecimationBuffers:
             else:
                 self._issue_pass()
         self._passes += 1
-        return int(read_scalar(self._count, 0)) != 0
+        self._host_state = self.state.numpy()
+        return int(self._host_state[3]) != 0
 
     def _tighten_edges(self, edges: int) -> None:
         """
@@ -1520,7 +1557,7 @@ class _DecimationBuffers:
 
     def result(self) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
         """Copy the live prefixes out of the fixed buffers, which is the only place a size leaks."""
-        counts = self.state.numpy()
+        counts = self._host_state if self._host_state is not None else self.state.numpy()
         n_faces, n_vertices = int(counts[0]), int(counts[1])
         vertices = wp.empty(n_vertices, dtype=wp.vec3, device=self._device)
         faces = wp.empty(3 * n_faces, dtype=wp.int32, device=self._device)

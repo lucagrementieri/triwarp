@@ -961,6 +961,8 @@ def test_knn_sorted_insert_rejects_nan_instead_of_writing_past_its_row(device: s
             wp.float32(1.0),
             wp.vec3(0.0, 0.0, 0.0),
             wp.vec3(0.1, 0.1, 0.1),
+            wp.int32(0),  # no deferral: this global-row kernel serves k above every bucket
+            wp.zeros(1, dtype=wp.int32, device=device),
             indices_wp,
             distances_wp,
         ],
@@ -1087,6 +1089,55 @@ def test_query_nearest_clustered(device: str, backend: Literal["bvh", "hashgrid"
         query_distances_np, query_indices_np = KDTree(points).query(queries, k=k)
         assert np.array_equal(indices_wp.numpy(), np.asarray(query_indices_np))
         assert np.allclose(distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-4)
+
+
+def test_query_nearest_defers_far_rows_to_a_closest_point_query(device: str) -> None:
+    """
+    Class A, against ``scipy.spatial.KDTree``: a ``k = 1`` row the grid gives up on is still exact.
+
+    The hash-grid backend hands a row it cannot certify within its widest walk to a closest-point
+    query over the cloud, which builds a ``wp.Mesh``. Counting those builds is what makes the
+    comparison non-vacuous: the displaced queries must reach the second pass and the on-cloud ones
+    must not, or the test is checking the grid twice. ``max_radius`` is honoured on the deferred
+    rows too -- a row whose nearest point is out of range comes back unfilled.
+    """
+    rng = np.random.default_rng(12)
+    points_np = rng.random((4000, 3), dtype=np.float32)
+    far_np = np.ascontiguousarray(points_np[:500] + 5.0, dtype=np.float32)
+    near_np = np.ascontiguousarray(points_np[:500] + 1e-4, dtype=np.float32)
+    points_wp = points_to_warp(points_np, device)
+    builds = []
+    original = wp.Mesh.__init__
+
+    def counting_init(self: wp.Mesh, *args: object, **kwargs: object) -> None:
+        builds.append(1)
+        original(self, *args, **kwargs)
+
+    wp.Mesh.__init__ = counting_init
+    try:
+        for queries_np, expect_deferral in ((far_np, True), (near_np, False)):
+            builds.clear()
+            indices_wp, distances_wp = tw.neighbors.query_nearest(
+                points_wp, points_to_warp(queries_np, device), k=1, backend="hashgrid"
+            )
+            assert bool(builds) == expect_deferral
+            distances_np, indices_np = KDTree(points_np).query(queries_np, k=1)
+            assert np.array_equal(indices_wp.numpy(), indices_np)
+            assert np.allclose(distances_wp.numpy(), distances_np, rtol=1e-5, atol=1e-5)
+        builds.clear()
+        cap = float(np.median(KDTree(points_np).query(far_np, k=1)[0]))
+        indices_wp, distances_wp = tw.neighbors.query_nearest(
+            points_wp, points_to_warp(far_np, device), k=1, backend="hashgrid", max_radius=cap
+        )
+        assert builds
+    finally:
+        wp.Mesh.__init__ = original
+    distances_np, indices_np = KDTree(points_np).query(far_np, k=1, distance_upper_bound=cap)
+    in_range = np.isfinite(distances_np)
+    assert 0 < in_range.sum() < len(far_np)  # non-vacuity: both kinds of row occur
+    assert np.array_equal(indices_wp.numpy()[in_range], indices_np[in_range])
+    assert (indices_wp.numpy()[~in_range] == -1).all()
+    assert np.isinf(distances_wp.numpy()[~in_range]).all()
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])

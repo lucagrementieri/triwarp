@@ -350,10 +350,16 @@ def connected_component_labels_from_edges(
     if int(edges.shape[0]) == 0:
         return arange(node_count, device=edges.device)
 
-    # One thread per edge over an identity forest, then the flatten. No adjacency matrix is built:
-    # the unions are per edge either way, so a CSR would only be walked back into the same edges.
+    # A pre-hook and a hook, one thread per edge each, then the flatten. No adjacency matrix is
+    # built: the unions are per edge either way, so a CSR would only be walked back into the edges.
     device = edges.device
     parents = arange(node_count, device=device)
+    wp.launch(
+        kernel_connected_components.ecl_init_parent_edges,
+        dim=int(edges.shape[0]),
+        inputs=[edges, parents],
+        device=device,
+    )
     wp.launch(
         kernel_connected_components.ecl_hook_edges,
         dim=int(edges.shape[0]),

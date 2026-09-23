@@ -2,11 +2,13 @@
 Smoothed-aggregation algebraic multigrid: the setup passes and the V-cycle.
 
 **Why a hierarchy at all.** Jacobi-preconditioned conjugate gradient's iteration count grows with
-the mesh, roughly in proportion to the unknown count on the least-squares operator
-``smoothing.smooth_region`` builds. A multigrid V-cycle attacks the low-frequency error the smoother
-cannot see, so the count stops growing; the whole item is whether one cycle costs less than the
-iterations it removes, which is a *launch* question on this hardware and not an arithmetic one. See
-``triwarp.linalg`` for the gate.
+the mesh, roughly in proportion to the unknown count on an ill-conditioned operator. A multigrid
+V-cycle attacks the low-frequency error the smoother cannot see, so the count stops growing; the
+whole item is whether one cycle costs less than the iterations it removes, which is a *launch*
+question on this hardware and not an arithmetic one. See ``triwarp.linalg`` for the gate. The
+least-squares operator ``smoothing.smooth_region`` builds was this hierarchy's first customer and
+is no longer one: a *squared* operator is better served by the square of a second-order
+preconditioner (``linalg.squared_laplacian_preconditioner``) than by aggregating the square itself.
 
 **Aggregation is the only part that is not a library call**, and it is a parallel maximal
 independent set, which this package already runs twice on device (``sample.dart_select_minima``'s
@@ -293,6 +295,41 @@ def csr_matvec(
         out_y[slot] += total
     else:
         out_y[slot] = total
+
+
+@wp.kernel
+def chebyshev_step(
+    n_rows: wp.int32,
+    stride: wp.int32,
+    scale: wp.float64,
+    momentum: wp.float64,
+    step: wp.float64,
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    source: wp.array[wp.float64],
+    x: wp.array[wp.float64],
+    x_previous: wp.array[wp.float64],
+    out_x: wp.array[wp.float64],
+) -> None:
+    # One step of the Chebyshev semi-iteration for ``A x = source``, every column at once, in its
+    # three-term form: ``x' = s x + momentum (s x - x_previous) + step (source - s A x)``. With
+    # ``s = 1`` that is the textbook recurrence; the first step passes ``x = source``,
+    # ``s = 1 / theta`` and a zero ``x_previous``, which is the same recurrence started from the
+    # iterate ``source / theta`` and saves the launch that would form it. Written in ``x`` rather
+    # than in the correction so that the one mat-vec and both updates are a single launch, which is
+    # what a step costs at these sizes. ``out_x`` must alias neither ``x`` (the row dot reads it at
+    # other rows) nor ``x_previous``. Shares ``csr_row_dot`` with ``csr_matvec``.
+    t = wp.int32(wp.tid())
+    column = t // n_rows
+    row = t % n_rows
+    base = column * stride
+    slot = base + row
+    ax = csr_row_dot(row, base, offsets, columns, values, x)
+    current = scale * x[slot]
+    out_x[slot] = (
+        current + momentum * (current - x_previous[slot]) + step * (source[slot] - scale * ax)
+    )
 
 
 @wp.kernel

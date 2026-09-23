@@ -921,7 +921,9 @@ def query_nearest(
         ``"hashgrid"`` (the default) is the faster broad phase when the query scale matches the
         cloud's density, because ``initial_radius`` sets the cell width: the walk visits
         ``(2 ceil(r / cell) + 1) ** 3`` cells, so a radius **f** times too large costs ``f ** 3``,
-        and the search falls back to an exact linear scan once ``r`` outgrows a few cells. That also
+        and the search falls back to an exact linear scan once ``r`` outgrows a few cells -- or, at
+        ``k == 1``, to a closest-point query over a tree of the cloud, whose cost does not grow
+        with how far the query is from it. That also
         makes it sensitive to a cloud whose density is not uniform, and to queries drawn from a
         different distribution than the points, since the cell width was sized for the data rather
         than for where the queries land.
@@ -1035,46 +1037,93 @@ def query_nearest(
     if initial_radius is None:
         initial_radius = knn_initial_radius(points, k, bounds=bounds)
 
-    if kind == "bvh":
-        bvh = resolved if resolved is not None else bvh_from_points(points, leaf_size)
-        kernel = kernel_neighbors.bvh_nearest_kernel(k)
-        accel_id = bvh.id
-        # The BVH follows an unbounded radius, so it needs no linear-scan cutover argument.
-        widest: list[wp.float32] = []
-    else:
-        if resolved is None:
-            cell_size = _knn_cell_size(initial_radius, min_bound, max_bound, grid_bins)
-            grid = hashgrid_from_points(points, cell_size, grid_bins)
-        else:
-            grid = resolved
-            cell_size = float(getattr(grid, "cell_width", initial_radius))
-        kernel = kernel_neighbors.hashgrid_nearest_kernel(k)
-        accel_id = grid.id
-        widest = [wp.float32(_knn_widest_grid_radius(cell_size, n))]
-
     # ``wp.empty``, not ``wp.full``: every row is written in full by the kernel, so pre-filling
     # here would be two wasted launches.
     neighbor_indices = twt.empty_2d((m, k), wp.int32, device=device)
     neighbor_distances = twt.empty_2d((m, k), wp.float32, device=device)
+    search = [points, queries]
+    shared = [wp.int32(k), wp.float32(max_radius), wp.float32(initial_radius)]
+    outputs = [neighbor_indices, neighbor_distances]
+    if kind == "bvh":
+        bvh = resolved if resolved is not None else bvh_from_points(points, leaf_size)
+        # The BVH follows an unbounded radius, so it needs no linear-scan cutover argument.
+        wp.launch(
+            kernel_neighbors.bvh_nearest_kernel(k),
+            dim=m,
+            inputs=[*search, bvh.id, *shared, min_bound, max_bound, *outputs],
+            device=device,
+        )
+        return _shape_nearest(neighbor_indices, neighbor_distances, k, single_query)
+
+    if resolved is None:
+        cell_size = _knn_cell_size(initial_radius, min_bound, max_bound, grid_bins)
+        grid = hashgrid_from_points(points, cell_size, grid_bins)
+    else:
+        grid = resolved
+        cell_size = float(getattr(grid, "cell_width", initial_radius))
+    # At ``k == 1`` a row the cell walk cannot certify is *deferred* rather than finished by a
+    # linear scan over the whole cloud: that scan is what a query far from the cloud costs the
+    # grid, and a closest-point descent answers the same row in time that does not grow with the
+    # distance. So the walk stays the fast path for queries on or near the cloud, and only the rows
+    # it gives up on pay for the tree. The walk gives up at the same radius it hands over to the
+    # scan at: bringing that in shortens a displaced row's walk, but it also defers the odd outlier
+    # of an on-surface query set, and one deferred row pays for the whole tree.
+    deferred = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
-        kernel,
+        kernel_neighbors.hashgrid_nearest_kernel(k),
         dim=m,
         inputs=[
-            points,
-            queries,
-            accel_id,
-            wp.int32(k),
-            wp.float32(max_radius),
-            wp.float32(initial_radius),
-            *widest,
+            *search,
+            grid.id,
+            *shared,
+            wp.float32(_knn_widest_grid_radius(cell_size, n)),
             min_bound,
             max_bound,
-            neighbor_indices,
-            neighbor_distances,
+            wp.int32(1 if k == 1 else 0),
+            deferred,
+            *outputs,
         ],
         device=device,
     )
+    if k == 1:
+        _finish_deferred_nearest(
+            points, queries, max_radius, deferred, neighbor_indices, neighbor_distances
+        )
     return _shape_nearest(neighbor_indices, neighbor_distances, k, single_query)
+
+
+def _finish_deferred_nearest(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    max_radius: float,
+    deferred: wp.array[wp.int32],
+    neighbor_indices: twt.Array2dInt32,
+    neighbor_distances: twt.Array2dFloat32,
+) -> None:
+    """
+    Answer the ``k = 1`` rows the grid deferred, by a closest-point query over the cloud.
+
+    One four-byte readback decides whether there are any, since the tree it takes is a build over
+    the whole cloud: queries on the cloud defer nothing and pay only that read. The tree is a
+    ``wp.Mesh`` whose triangles each collapse onto one point, so its closest-face query is a
+    nearest-point query with the mesh BVH's pruned descent.
+    """
+    # The one sync the k = 1 path adds, and it decides whether a whole-cloud build is needed.
+    if int(read_scalar(deferred, 0)) == 0:
+        return
+    device = points.device
+    n = int(points.shape[0])
+    corners = wp.empty(3 * n, dtype=wp.int32, device=device)
+    wp.launch(kernel_neighbors.point_triangle_indices, dim=3 * n, inputs=[corners], device=device)
+    # ``lbvh``: the other constructors build this tree several times slower, for no faster query.
+    mesh = wp.Mesh(points=points, indices=corners, bvh_constructor="lbvh")
+    wp.launch(
+        kernel_neighbors.nearest_point_via_mesh,
+        dim=int(queries.shape[0]),
+        inputs=[mesh.id, points, queries, wp.float32(max_radius)],
+        outputs=[neighbor_indices, neighbor_distances],
+        device=device,
+    )
 
 
 def _knn_cell_size(

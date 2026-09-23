@@ -23,7 +23,9 @@ from triwarp.constants import INT32_MAX
 from triwarp.kernels import halfedge as kernel_halfedge
 
 
-def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> wp.array[wp.int32]:
+def halfedge_twins(
+    faces: wp.array[wp.int32], n_vertices: int | None = None, *, validate: bool = True
+) -> wp.array[wp.int32]:
     """
     Opposite halfedge of every halfedge, or ``-1`` on a boundary.
 
@@ -56,6 +58,11 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
         rather than a requirement: when ``None`` the keys pack against
         [`constants.INDEX_RADIX_PAIR`][triwarp.constants.INDEX_RADIX_PAIR], which bounds every
         ``int32`` index without a reduction and orders the keys the same way.
+    validate
+        When ``True`` (the default), reject the two meshes below. ``False`` skips the check and
+        the synchronization it costs, for a caller that knows ``faces`` is edge-manifold and
+        consistently wound -- one that built it from a buffer already validated here by an
+        operation that preserves both; on a mesh that is neither the table is garbage.
 
     Returns
     -------
@@ -69,7 +76,8 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
         "the" opposite halfedge is not defined), or if both halfedges of an edge traverse it in the
         *same* direction, which is what an inconsistently wound or non-orientable mesh looks like
         from here and which leaves the "opposite directions" guarantee above with nothing to mean.
-        Detecting either needs one 8-byte readback, so this function always synchronizes once.
+        Detecting either needs one 8-byte readback, so under ``validate`` this function
+        synchronizes once.
 
     See Also
     --------
@@ -101,6 +109,8 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
         inputs=[faces, sorted_keys, order, twins, defect_counts],
         device=device,
     )
+    if not validate:
+        return twins
     n_nonmanifold, n_misoriented = (int(count) for count in defect_counts.numpy())
     if n_nonmanifold > 0:
         raise ValueError(
@@ -205,6 +215,8 @@ def vertex_one_rings(
     faces: wp.array[wp.int32],
     twins: wp.array[wp.int32] | None = None,
     n_vertices: int | None = None,
+    *,
+    validate: bool = True,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.bool]]:
     """
     Outgoing halfedges of every vertex in counter-clockwise order, as a CSR buffer.
@@ -234,6 +246,11 @@ def vertex_one_rings(
     n_vertices
         Total vertex count (the number of CSR rows). When ``None`` it is inferred with
         [`array.index_bound`][triwarp.array.index_bound], which costs a host readback.
+    validate
+        When ``True`` (the default), reject a pinched vertex, and forward the same choice to
+        [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when ``twins`` is computed here.
+        ``False`` skips both checks and their synchronizations, for a caller that knows ``faces``
+        is manifold and consistently wound.
 
     Returns
     -------
@@ -250,8 +267,9 @@ def vertex_one_rings(
         If ``twins`` is given and is not a twin table for ``faces``
         ([`require_matching_twins`][triwarp.halfedge.require_matching_twins] states what that
         means), or if a vertex's rotation closes before its whole fan is covered — a pinched,
-        vertex-non-manifold vertex where two fans meet at a single index. Detecting the latter
-        needs one 4-byte readback, so this function always synchronizes once.
+        vertex-non-manifold vertex where two fans meet at a single index, under ``validate``.
+        Detecting the latter needs one 4-byte readback, so under ``validate`` this function
+        synchronizes once.
     RuntimeError
         If ``faces`` and ``twins`` are not all on one device.
 
@@ -269,7 +287,7 @@ def vertex_one_rings(
     if n_vertices is None:
         n_vertices = tw.array.index_bound(faces)
     if twins is None:
-        twins = halfedge_twins(faces, n_vertices=n_vertices)
+        twins = halfedge_twins(faces, n_vertices=n_vertices, validate=validate)
 
     offsets = wp.zeros(n_vertices + 1, dtype=wp.int32, device=device)
     ring_halfedges = wp.full(n_halfedges, -1, dtype=wp.int32, device=device)
@@ -304,6 +322,8 @@ def vertex_one_rings(
         inputs=[candidate_starts, twins, offsets, ring_halfedges, is_boundary, incomplete],
         device=device,
     )
+    if not validate:
+        return ring_halfedges, offsets, is_boundary
     n_incomplete = int(read_scalar(incomplete, 0))
     if n_incomplete > 0:
         raise ValueError(

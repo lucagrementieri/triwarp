@@ -710,17 +710,14 @@ def test_smooth_region(bench_case: BenchCase) -> None:
     agree to 1e-4. It mutates the mesh in place and returns nothing, so its mesh is rebuilt inside
     the timed callable and the row carries the build.
 
-    **Both rows reach a multigrid V-cycle**, which is the thing to know before reading a change in
-    either. ``smooth_region`` asks for ``preconditioner="auto"``, and ``"auto"`` gates on the
-    assembled operator's off-diagonal dominance crossed with a size floor: both systems clear the
-    dominance threshold outright, so each builds a hierarchy and neither runs a Jacobi probe, worth
-    roughly 2x on both rows. See ``linalg.CG_MULTIGRID_DOMINANCE`` for the systems behind the
-    threshold.
-
-    **This pair is not the asymmetry check it once was.** Sweeping ``linalg._MULTIGRID_THETA`` now
-    moves both rows, and a row that stops moving means the *gate* changed rather than the
-    coarsening. ``linalg.CG_PROBE_ITERATIONS`` describes the probe a system the gate declines falls
-    through to.
+    **No row here builds a multigrid hierarchy**, which is the thing to know before reading a
+    change in either. ``smooth_region``'s normal equations are preconditioned by
+    ``linalg.squared_laplacian_preconditioner`` -- a Chebyshev polynomial in the free rows' square
+    block ``D^-1 L``, applied as ``B B^T`` -- which cut the iteration count 2.5-6x against the
+    V-cycle on ``M^T M`` that ``preconditioner="auto"`` built, with no setup to pay. So
+    ``linalg._MULTIGRID_THETA`` and ``CG_MULTIGRID_DOMINANCE`` no longer move these rows; the
+    polynomial's degree and interval (``SQUARED_LAPLACIAN_DEGREE``, ``SQUARED_LAPLACIAN_INTERVAL``)
+    do.
     """
     skip_larger_than(
         bench_case,

@@ -16,6 +16,7 @@ from meshlib import mrmeshpy as mm
 from pymeshfix import _meshfix
 
 import triwarp as tw
+from benchmarks.meshes import BUILDERS
 from tests.comparisons import (
     assert_unordered_rows_equal,
     canonical_winding,
@@ -39,6 +40,7 @@ from tests.conversions import (
     trimesh_to_pymeshfix,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
+    trimesh_to_warp,
     warp_to_meshlib,
     warp_to_pymeshfix,
     warp_to_trimesh,
@@ -3193,6 +3195,23 @@ def _genus(faces_wp: wp.array[wp.int32]) -> int:
     return (2 - tw.measures.euler_characteristic(faces_wp)) // 2
 
 
+@pytest.fixture
+def handles_64(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """
+    Build the benchmark's genus-64 slab: the one input whose disjoint short loops are *dependent*.
+
+    Local rather than shared because nothing else in ``tests/`` needs a genus this high. It is the
+    fixture for the independence half of ``remove_tunnels``: a vertex-disjoint family of 23 of its
+    shortened generators together bounds a piece of the slab, so cutting all 23 splits the surface
+    in two -- measured, before the component check, chi -126 -> -78 against the -80 that 23 cuts
+    claim. None of the smaller ``_handles`` variants probed (3 to 10 holes a side, at three edge
+    lengths) produces a dependent family, so the size is load-bearing.
+    """
+    vertices_np, faces_np = BUILDERS["handles_64"]()
+    mesh = tm.Trimesh(vertices_np, faces_np, process=False)
+    return mesh, trimesh_to_warp(mesh, device)
+
+
 @pytest.mark.parity(
     "remove_tunnels",
     "trimesh",
@@ -3206,7 +3225,7 @@ def _genus(faces_wp: wp.array[wp.int32]) -> int:
     "are the two post-conditions that stop a shattering cut. All three are timed in their own "
     "groups.",
 )
-@pytest.mark.parametrize("mesh_name", ["torus", "genus_two"])
+@pytest.mark.parametrize("mesh_name", ["torus", "genus_two", "handles_64"])
 def test_remove_tunnels_drops_the_genus_by_the_count_it_reports(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -3232,7 +3251,10 @@ def test_remove_tunnels_drops_the_genus_by_the_count_it_reports(
     Three more properties come with it -- the result stays connected, closed and edge-manifold --
     and together they exclude the failure this function's shape invites: a cut along loops that
     cross, which shatters the surface into pieces while every individual step still looks correct
-    (measured, before the disjointness rule: four spheres from a genus-2 union, and chi 8).
+    (measured, before the disjointness rule: four spheres from a genus-2 union, and chi 8). And
+    disjointness alone is not enough: on ``handles_64`` a disjoint family is *dependent*, splitting
+    the slab in two while chi still rises, which is what the component assert catches and why the
+    parametrization carries a genus-64 input.
 
     Open3D's ``is_watertight`` is **not** among them, and the reason is a measured convention rather
     than a defect on either side. It is the composition ``is_edge_manifold && is_vertex_manifold &&

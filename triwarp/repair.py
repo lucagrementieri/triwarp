@@ -1306,12 +1306,18 @@ def remove_degree3_vertices(
     selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     counters = wp.zeros(2, dtype=wp.int32, device=device)
     keep_scratch = wp.empty(n_faces0, dtype=wp.bool, device=device)
-    for _ in range(max_iter):
+    keep_flags = wp.empty(n_faces0, dtype=wp.int32, device=device)
+    keep_ranks = wp.empty(n_faces0, dtype=wp.int32, device=device)
+    for pass_index in range(max_iter):
         n_faces = int(faces.shape[0]) // 3
         if n_faces == 0:
             break
+        # The topology checks run on the input only. Replacing an interior degree-3 fan by the one
+        # triangle over its rim keeps every rim edge at two faces with the same orientation and
+        # leaves each rim vertex one fan, so a pass cannot make a valid mesh invalid -- and a later
+        # pass paying both checks' readbacks would only re-prove it.
         ring_halfedges, ring_offsets, is_boundary = tw.halfedge.vertex_one_rings(
-            faces, n_vertices=n_vertices
+            faces, n_vertices=n_vertices, validate=pass_index == 0
         )
         wp.map(
             kernel_repair.is_interior_degree3,
@@ -1339,18 +1345,37 @@ def remove_degree3_vertices(
 
         cursor = counters[1:]
         # Every face starts kept and the emit pass clears the fans it replaces, so the kept-face
-        # mask comes straight out of that pass.
+        # mask comes straight out of that pass. The fans are disjoint and each is three faces, so
+        # the kept count is known without reading it back, and the kept faces and the new ones are
+        # written into one buffer: kept first, in order, then the replacements.
+        n_kept = n_faces - 3 * n_selected
         keep = keep_scratch[:n_faces]
         keep.fill_(True)
-        new_faces = twt.empty_2d((n_selected, 3), wp.int32, device=device)
+        out_faces = wp.empty(3 * (n_kept + n_selected), dtype=wp.int32, device=device)
         wp.launch(
             kernel_repair.emit_degree3_replacement,
             dim=n_vertices,
-            inputs=[faces, ring_offsets, ring_halfedges, selected, cursor, keep, new_faces],
+            inputs=[
+                faces,
+                ring_offsets,
+                ring_halfedges,
+                selected,
+                cursor,
+                keep,
+                out_faces[3 * n_kept :].reshape((n_selected, 3)),
+            ],
             device=device,
         )
-        kept = tw.array.gather(faces.reshape((n_faces, 3)), tw.array.flatnonzero(keep))
-        faces = tw.array.concatenate([kept.reshape(-1), new_faces.reshape(3 * n_selected)])
+        flags, ranks = keep_flags[:n_faces], keep_ranks[:n_faces]
+        wp.launch(kernel_array.bool_flags, dim=n_faces, inputs=[keep, flags], device=device)
+        wp.utils.array_scan(flags, out_array=ranks, inclusive=True)
+        wp.launch(
+            kernel_repair.compact_kept_faces,
+            dim=n_faces,
+            inputs=[faces, keep, ranks, out_faces],
+            device=device,
+        )
+        faces = out_faces
         removed += n_selected
     if removed == 0:
         return (vertices, faces, 0) if return_count else (vertices, faces)
@@ -2068,9 +2093,12 @@ def remove_tunnels(
         The loops kept are pairwise **vertex-disjoint**, shortest first. Cutting along two loops
         that cross is not the same operation as cutting along each in turn -- the shared vertex is
         split by both cuts at once -- and without the restriction the genus can stop dropping one
-        per loop, or the surface can shatter into extra pieces. The cost is that one call removes at
-        most one tunnel per disjoint family, so a mesh whose basis loops all overlap needs to be run
-        again. Call it in a loop until ``removed`` is ``0``.
+        per loop, or the surface can shatter into extra pieces. Disjoint loops can still be
+        **dependent**, together bounding a piece of the surface that cutting along all of them
+        would split off, so the longest loop of any such family is left uncut and the result stays
+        one connected surface. The cost is that one call removes at most one tunnel per disjoint
+        family, so a mesh whose basis loops all overlap needs to be run again. Call it in a loop
+        until ``removed`` is ``0``.
 
     Parameters
     ----------
@@ -2131,7 +2159,6 @@ def remove_tunnels(
     require_same_device(vertices=vertices, faces=faces)
     if max_length < 0.0:
         raise ValueError(f"max_length must be non-negative, got {max_length}")
-    device = faces.device
     loops = tw.homology.homology_generators(vertices, faces)
     if not loops:
         return vertices, faces, 0
@@ -2146,12 +2173,15 @@ def remove_tunnels(
     if not selected:
         return vertices, faces, 0
 
-    cut_edges = wp.array(
-        np.concatenate([_cycle_edges(loop) for loop in selected]), dtype=wp.int32, device=device
-    )
-    cut_vertices, cut_faces = tw.seams.cut_along_edges(
-        vertices, faces, twt.as_array2d(cut_edges, wp.int32)
-    )
+    cut_vertices, cut_faces = _cut_along_loops(vertices, faces, selected)
+    # Disjoint is not independent: a family of disjoint non-trivial loops can still bound a piece
+    # of the surface between them, and cutting along all of it splits that piece off instead of
+    # dropping the genus by one per loop. The face labels of the cut mesh say which: every
+    # component after the first is one loop too many.
+    labels_np = tw.adjacency.face_connected_component_labels(cut_faces).numpy()
+    if int(np.unique(labels_np).shape[0]) > 1:
+        selected = _independent_loops(faces, selected, labels_np)
+        cut_vertices, cut_faces = _cut_along_loops(vertices, faces, selected)
     return (
         cast("wp.array[wp.vec3]", cut_vertices),
         tw.holes.fill_min_weight(cut_vertices, cut_faces, metric=metric),
@@ -2177,6 +2207,51 @@ def _disjoint_loops(loops: list[wp.array[wp.int32]]) -> list[wp.array[wp.int32]]
         claimed |= loop_indices
         kept.append(loop)
     return kept
+
+
+def _cut_along_loops(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], loops: list[wp.array[wp.int32]]
+) -> tuple[wp.array[wp.vec3] | wp.array[wp.vec3d], wp.array[wp.int32]]:
+    """Cut the mesh along the edges of a family of closed vertex-index cycles."""
+    cut_edges = wp.array(
+        np.concatenate([_cycle_edges(loop) for loop in loops]), dtype=wp.int32, device=faces.device
+    )
+    return tw.seams.cut_along_edges(vertices, faces, twt.as_array2d(cut_edges, wp.int32))
+
+
+def _independent_loops(
+    faces: wp.array[wp.int32], loops: list[wp.array[wp.int32]], labels_np: np.ndarray
+) -> list[wp.array[wp.int32]]:
+    """
+    Drop the fewest loops from a disjoint family so that cutting along the rest stays connected.
+
+    ``labels_np`` are the face component labels after cutting along every loop in ``loops``. Each
+    loop joins the component on its left to the one on its right, so the loops are the edges of a
+    graph over those components, and leaving a loop uncut merges its two sides back together. The
+    cut surface is connected exactly when the uncut loops span that graph, so a spanning forest
+    built longest-first (Kruskal) leaves the longest loops uncut and keeps cutting the shortest --
+    the ones most likely to be tunnels. A loop whose two sides already share a component is always
+    kept. ``loops`` arrive shortest first, and the kept ones keep that order.
+    """
+    faces_np = faces.numpy().reshape(-1, 3)
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    uncut: set[int] = set()
+    for index in range(len(loops) - 1, -1, -1):
+        a, b = (int(v) for v in loops[index].numpy()[:2])
+        # The two faces across the loop's first edge: one on each side of the cut.
+        sides = np.flatnonzero((faces_np == a).any(axis=1) & (faces_np == b).any(axis=1))
+        left, right = find(int(labels_np[sides[0]])), find(int(labels_np[sides[1]]))
+        if left != right:
+            parent[left] = right
+            uncut.add(index)
+    return [loop for index, loop in enumerate(loops) if index not in uncut]
 
 
 def _cycle_length(vertices: wp.array[wp.vec3], loop: wp.array[wp.int32]) -> float:

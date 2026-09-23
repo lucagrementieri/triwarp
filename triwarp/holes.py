@@ -333,6 +333,11 @@ class _EdgeTable:
     with a binary search over ``sorted_keys`` yields its occurrence count (adjacent-face count)
     and, via ``sorted_rows`` -> ``thirds``, the opposite vertex of the single adjacent face. A
     ``(n_vertices,)`` slot scratch supports the forbidden-chord mask of every loop at once.
+
+    The table is mesh-sized for a rim-sized question, and inverting it -- sort the rim's own edge
+    keys and let one pass over the faces probe them -- is exact and was measured flat on the hole
+    chains: the whole-mesh sort is a few launches of an already launch-bound call. Not worth the
+    second pair of kernels.
     """
 
     def __init__(

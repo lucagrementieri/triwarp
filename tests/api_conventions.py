@@ -433,7 +433,10 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ("algorithms.ball_pivoting", "end_wave"): frozenset({"counters"}),
     # ``seed_failed`` is persistent per-point state, carried across every seeding wave for the
     # run's whole lifetime -- the ``point_used`` case one level up, not a fresh per-call answer.
-    ("algorithms.ball_pivoting", "seed_triangles"): frozenset({"counters", "seed_failed"}),
+    # ``seed_blocker`` is the same kind: the orphan each point last deferred to, a per-run cache.
+    ("algorithms.ball_pivoting", "seed_triangles"): frozenset(
+        {"counters", "seed_failed", "seed_blocker"}
+    ),
     # ``edges`` is the open-addressing edge table (``BpaEdgeTable``): persistent state carried
     # across every wave, mutated in place by the pivot and commit kernels and read by both. It is
     # the ``front_out`` case one level up -- neither an input nor the answer -- so it keeps the name
@@ -466,6 +469,9 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # the prolongation smoother's ``-w D^-1 (A P0)`` is a row scaling of a product that has just
     # been built and is not needed unscaled.
     ("algorithms.multigrid", "scale_rows"): frozenset({"values"}),
+    # ``parents`` is the union-find forest, pre-hooked in place from the identity the caller built
+    # and then handed to ``ecl_hook_edges`` -- the same buffer before and after, not an answer.
+    ("algorithms.connected_components", "ecl_init_parent_edges"): frozenset({"parents"}),
     ("polyline", "clip_selected"): frozenset({"active", "left", "right"}),
     # ``state`` is the ``wp.capture_while`` loop's own [rounds run, condition] pair, read and
     # incremented across launches -- the ``rdp_begin_round`` / ``rdp_split_spans`` case below,

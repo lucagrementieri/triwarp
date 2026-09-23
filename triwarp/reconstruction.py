@@ -1309,6 +1309,10 @@ class _BpaState:
         # seeding can never succeed later (its candidate set only shrinks), which is what makes
         # never resetting this safe.
         self.seed_failed = wp.zeros(self.n, dtype=wp.bool, device=self.device)
+        # The orphan each point last deferred to, or whether it can ever seed; see the same kernel.
+        self.seed_blocker = wp.full(
+            self.n, int(kernel_bpa.SEED_UNKNOWN), dtype=wp.int32, device=self.device
+        )
         self.boundary_degree = wp.zeros(self.n, dtype=wp.int32, device=self.device)
         # ``uint64`` because the per-wave vertex claim is a ``wp.atomic_min`` over a *packed vertex
         # pair* rather than over a proposal index — see ``kernel_bpa.proposal_key``, which is what
@@ -1545,6 +1549,7 @@ def _bpa_wave(state: _BpaState, max_waves: int) -> None:
             state.normals,
             state.point_used,
             state.seed_failed,
+            state.seed_blocker,
             state.grid.id,
             state.radius,
             state.clustering,

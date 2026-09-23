@@ -146,6 +146,9 @@ def laplacian_ls_triplets(
     out_rows: wp.array[wp.int32],
     out_cols: wp.array[wp.int32],
     out_vals: wp.array[wp.float64],
+    out_square_rows: wp.array[wp.int32],
+    out_square_vals: wp.array[wp.float64],
+    out_weight_sums: wp.array[wp.float64],
     out_rhs_x: wp.array[wp.float64],
     out_rhs_y: wp.array[wp.float64],
     out_rhs_z: wp.array[wp.float64],
@@ -156,6 +159,15 @@ def laplacian_ls_triplets(
     #
     # Two partitions at once, both read through ``selected_row``: ``row_mask`` / ``row_map`` says
     # which vertices carry a row, ``free_mask`` / ``free_map`` which carry an unknown.
+    #
+    # The *free* rows of M, taken alone, are the square block ``M_ff = D^-1 L_ff`` of the Dirichlet
+    # umbrella system, and they are what preconditions the normal equations (see
+    # ``linalg.squared_laplacian_preconditioner``). They are the same entries in the same slots, so
+    # rather than a second emission this writes, beside M's row index, the free row's own index
+    # into ``out_square_rows`` and the symmetric ``L_ff`` value into ``out_square_vals`` -- the
+    # umbrella coefficient times ``sumW``, i.e. ``-w_vd`` off the diagonal and ``sumW`` on it --
+    # plus ``sumW`` itself into ``out_weight_sums``. A fixed ring row writes none of the three, so
+    # its slots keep the caller's out-of-range padding.
     v = wp.int32(wp.tid())
     r = selected_row(row_mask, row_map, v)
     if r < 0:
@@ -181,12 +193,18 @@ def laplacian_ls_triplets(
             out_rows[slot] = r
             out_cols[slot] = cj
             out_vals[slot] = coeff
+            if free_column >= 0:
+                out_square_rows[slot] = free_column
+                out_square_vals[slot] = -values[k]
         else:
             rhs -= coeff * to_vec3d(points[j])
     if free_column >= 0:
         out_rows[base] = r
         out_cols[base] = free_column
         out_vals[base] = wp.float64(1.0)
+        out_square_rows[base] = free_column
+        out_square_vals[base] = sum_w
+        out_weight_sums[free_column] = sum_w
     out_rhs_x[r] = rhs[0]
     out_rhs_y[r] = rhs[1]
     out_rhs_z[r] = rhs[2]

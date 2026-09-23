@@ -784,6 +784,133 @@ def test_multigrid_preconditioner_falls_back_when_the_operator_does_not_coarsen(
     assert np.allclose(solution_wp.numpy(), rhs_np / diagonal_np, rtol=1e-8, atol=1e-10)
 
 
+def _normal_equations_system(
+    device: str, *, negative: bool, k: int = 28, n_rhs: int = 3, seed: int = 13
+) -> tuple:
+    """
+    Build ``smoothing.smooth_region``'s least-squares umbrella system on a ``k x k`` grid graph.
+
+    Rows are the free vertices (the grid's interior below its top two rows) plus their first fixed
+    ring; a row is ``p_v - sum_d w_vd p_d / sum_d w_vd`` with the fixed terms moved to the right, so
+    the free rows alone are ``D^-1 L`` for ``L`` the free block of the weighted graph Laplacian.
+    ``negative`` gives one diagonal of every grid square a weight of ``-0.2``, the shape a clamped
+    cotangent weight takes on a near-right triangle, which pushes ``D^-1 L``'s spectrum past 2.
+
+    Returns the assembled ``M^T M``, the right-hand side, ``L``, the weight sums, and the dense
+    forms of the operator and the right-hand side for a reference solve.
+    """
+    index = np.arange(k * k).reshape(k, k)
+    edges, weights = [], []
+    for a, b, w in (
+        (index[:-1, :], index[1:, :], 1.0),
+        (index[:, :-1], index[:, 1:], 1.0),
+        (index[:-1, :-1], index[1:, 1:], -0.2 if negative else 0.5),
+    ):
+        edges.append(np.stack([a.ravel(), b.ravel()], axis=1))
+        weights.append(np.full(a.size, w))
+    edges_np, weights_np = np.concatenate(edges), np.concatenate(weights)
+    n_nodes = k * k
+    w_np = sp.coo_matrix(
+        (np.concatenate([weights_np] * 2), (edges_np.ravel("F"), edges_np[:, ::-1].ravel("F"))),
+        shape=(n_nodes, n_nodes),
+    ).tocsr()
+    sums_np = np.asarray(w_np.sum(axis=1)).ravel()
+    free_np = np.zeros((k, k), dtype=bool)
+    free_np[2:, :] = True
+    free_np = free_np.ravel()
+    ring_np = ~free_np & (np.asarray(w_np[:, free_np].astype(bool).sum(axis=1)).ravel() > 0)
+    free_index = np.flatnonzero(free_np)
+    rank = np.full(n_nodes, -1)
+    rank[free_index] = np.arange(free_index.size)
+    rows_np = np.flatnonzero(free_np | ring_np)
+    umbrella = sp.identity(n_nodes, format="csr") - sp.diags(1.0 / sums_np) @ w_np
+    m_np = umbrella[rows_np][:, free_index].toarray()
+    positions_np = np.random.default_rng(seed).standard_normal((n_nodes, n_rhs))
+    positions_np[free_np] = 0.0
+    b_np = -(umbrella[rows_np] @ positions_np)
+    system_np, rhs_np = m_np.T @ m_np, (m_np.T @ b_np).T
+    laplacian_np = (sp.diags(sums_np) - w_np)[free_index][:, free_index].tocoo()
+
+    def upload(matrix_np: sp.coo_matrix) -> wps.BsrMatrix:
+        return wps.bsr_from_triplets(
+            matrix_np.shape[0],
+            matrix_np.shape[1],
+            wp.array(matrix_np.row.astype(np.int32), dtype=wp.int32, device=device),
+            wp.array(matrix_np.col.astype(np.int32), dtype=wp.int32, device=device),
+            wp.array(np.ascontiguousarray(matrix_np.data), dtype=wp.float64, device=device),
+        )
+
+    rhs_wp = wp.array(np.ascontiguousarray(rhs_np), dtype=wp.float64, device=device)
+    sums_wp = wp.array(np.ascontiguousarray(sums_np[free_index]), dtype=wp.float64, device=device)
+    return (
+        upload(sp.coo_matrix(system_np)),
+        twt.as_array2d(rhs_wp, wp.float64),
+        upload(laplacian_np),
+        sums_wp,
+        system_np,
+        rhs_np,
+    )
+
+
+@pytest.mark.parametrize("negative", [False, True], ids=["positive_weights", "negative_weights"])
+@pytest.mark.parametrize("n_columns", [1, 3])
+def test_squared_laplacian_preconditioner_solves_the_same_system(
+    device: str, negative: bool, n_columns: int
+) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``: the preconditioner changes the path, not the answer.
+
+    Parametrized over the weight sign because a negative weight is what takes ``D^-1 L``'s spectrum
+    past 2, the end of a fixed Chebyshev interval, and over the column count because this
+    preconditioner routes a single column through the batched solver too.
+    """
+    system_wp, rhs_wp, laplacian_wp, sums_wp, system_np, rhs_np = _normal_equations_system(
+        device, negative=negative, n_rhs=n_columns
+    )
+    reference_np = np.linalg.solve(system_np, rhs_np.T).T
+    assert np.ptp(reference_np) > 1e-3  # non-vacuity: a zero solve would pass trivially
+    solution_wp = wp.zeros_like(rhs_wp)
+    tw.linalg.solve_spd_columns(
+        system_wp,
+        rhs_wp,
+        twt.as_array2d(solution_wp, wp.float64),
+        preconditioner=tw.linalg.squared_laplacian_preconditioner(laplacian_wp, sums_wp),
+    )
+    assert np.allclose(solution_wp.numpy(), reference_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("negative", [False, True], ids=["positive_weights", "negative_weights"])
+def test_squared_laplacian_preconditioner_needs_far_fewer_iterations(
+    device: str, negative: bool
+) -> None:
+    """
+    Not a library comparison: the reason the preconditioner exists, stated as an assertion.
+
+    triwarp against triwarp; the Jacobi arm carries the oracle through the test above. Measured
+    19x and 27x fewer iterations than Jacobi. The negative-weight arm is the one that matters: with
+    the polynomial's interval ending at a fixed 2 rather than at the operator's Gershgorin bound it
+    still converges -- the preconditioner stays positive definite -- but in 340 iterations against
+    37, a third of Jacobi's count rather than a twenty-seventh, so only a count catches it.
+    """
+    system_wp, rhs_wp, laplacian_wp, sums_wp, _system_np, _rhs_np = _normal_equations_system(
+        device, negative=negative
+    )
+    counts = {}
+    for name, preconditioner in (
+        ("diag", "diag"),
+        ("squared", tw.linalg.squared_laplacian_preconditioner(laplacian_wp, sums_wp)),
+    ):
+        solution_wp = wp.zeros_like(rhs_wp)
+        counts[name] = tw.linalg.solve_spd_columns(
+            system_wp,
+            rhs_wp,
+            twt.as_array2d(solution_wp, wp.float64),
+            check_every=1,
+            preconditioner=preconditioner,
+        )[0]
+    assert counts["squared"] * 8 < counts["diag"], counts
+
+
 @pytest.mark.parametrize("n_columns", [1, 3])
 def test_replicated_operator_applies_the_base_to_each_block(device: str, n_columns: int) -> None:
     """
