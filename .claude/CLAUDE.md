@@ -5708,23 +5708,30 @@ atomic-cursor order, not the change.
   duplicate-edge guard), so later regroups skip its readback. `quadric_decimate`'s two readbacks
   per pass became one (a fourth `state` slot): 1.02-1.03x, as expected for a read queued behind
   work the first already drained.
-- **Region-sized versions of region questions: both declined.** A kept rim edge was an input
-  boundary edge exactly when no *deleted* face contains it (its input count is `1 + deleted faces
-  containing it`), so `delete_region_keep_boundary` could sort `3k` region keys instead of grouping
-  every mesh edge: 1.09-1.12x, identical on simple rims -- and **wrong on a pinched deletion**. There
-  `boundary_loops` returns loops whose vertex order is unspecified and device-dependent (§7.3), a
-  loop's fake edges such as `(0, 0)` match no deleted face, and the inverted rule reads the new rim
-  as the input's and drops it (CPU only, which is how the full CPU pass caught it); the existing rule
-  fails safe by reporting it. **The unit test's "interior" region is itself pinched** -- the first
-  six faces off the rim are not contiguous, 14 hole edges over 10 vertices -- so it passes on a
-  garbage loop at HEAD too, on both devices. `holes._EdgeTable`'s inversion (sort the rim's keys,
-  one face pass probes them) is exact and **flat** -- the whole-mesh sort is a few launches of a
-  launch-bound call. Both written at their sites.
+- **Region-sized versions of region questions.** A kept rim edge was an input boundary edge
+  exactly when no *deleted* face contains it (its input count is `1 + deleted faces containing
+  it`), so `delete_region_keep_boundary` could sort `3k` region keys instead of grouping every mesh
+  edge: 1.09-1.12x, identical on simple rims -- and **wrong on a pinched deletion, so not taken**.
+  A pinched rim is not a successor graph (the pinch vertex has two outgoing boundary edges), and
+  `boundary_loops_batched` hands it to `graph.successor_cycles` anyway, whose Notes say colliding
+  ranks leave slots at `0`: the loop comes back with `(0, 0)` edges, on both devices, at HEAD. Those
+  fake edges match no deleted face, so the inverted rule reads the new rim as the input's and drops
+  it (the CPU pass caught it); the existing rule fails safe by reporting it. **The unit test's
+  "interior" region is itself pinched** -- the first six faces off the rim are not contiguous, 14
+  hole edges over 10 vertices -- so it has been passing on a garbage loop. The rule becomes exact
+  once pinched rims are walked per *halfedge sector* (`repair.next_boundary_halfedge` already does)
+  rather than per vertex; that is a `boundary_loops` fix and was not made here. **Kept:** the
+  empty-deletion early exit, read off the kept face count with no readback -- 2.51 -> 0.42 ms, since
+  it skips the loop extraction too. **`holes._EdgeTable`'s inversion is in**: sort the rim's own
+  keys and let one face pass probe them, in place of a radix sort of every mesh edge and two
+  clones. Exact, and within noise on the hole chains (interleaved, never slower) -- the removed
+  work is mesh-sized traffic on a launch-bound call, so it ships for the work it removes.
 - **Small items.** `refine_and_smooth_region` derives the free ranks and unique edges once for its
   two solves (~0.5-1 ms of a hole-chain call). `remove_degree3_vertices` validates topology on pass
   0 only (`halfedge_twins` / `vertex_one_rings` gained `validate=`) and knows its kept count
-  (`n_faces - 3 n_selected`): 1.18x on `dragon`. **Declined, measured flat:** fusing
-  `face_self_intersecting_mask`'s narrow phase into its marking (one launch of a BVH-bound call).
+  (`n_faces - 3 n_selected`): 1.18x on `dragon`. `face_self_intersecting_mask` runs its narrow
+  phase inside the marking kernel (one launch and one per-pair buffer fewer; within noise on a
+  BVH-bound call, byte-identical).
   **Not done:** `_mean_positive_finite` (only the untimed auto-radius path, and a fused sum-and-count
   changes the summation precision), `heat_geodesic`'s timestep (CG-bound rows), the multigrid
   spectral-radius pre-scale (it was tied to the `L_ff` hierarchy, which did not ship).

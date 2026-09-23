@@ -405,10 +405,17 @@ def is_self_intersecting(mesh: wp.Mesh, *, max_triangle_collisions: int = 32) ->
     -----
     Equivalent to ``open3d.geometry.TriangleMesh.is_self_intersecting``.
     """
-    found = _intersecting_pairs(mesh, mesh.points, mesh.indices, max_triangle_collisions)
-    if found is None:
+    vertices, faces = mesh.points, mesh.indices
+    pairs = _candidate_pairs(mesh, vertices, faces, max_triangle_collisions)
+    if pairs is None:
         return False
-    _pairs, valid = found
+    valid = wp.empty(int(pairs.shape[0]), dtype=wp.bool, device=vertices.device)
+    wp.launch(
+        kernel_intersections.filter_intersecting_pairs,
+        dim=int(pairs.shape[0]),
+        inputs=[vertices, faces, vertices, faces, pairs, valid],
+        device=vertices.device,
+    )
     return bool(tw.reduce.any(valid))
 
 
@@ -484,30 +491,31 @@ def face_self_intersecting_mask(
         require_nonempty_mesh(faces, "face_self_intersecting_mask")
         mesh = wp.Mesh(points=vertices, indices=faces)
 
-    found = _intersecting_pairs(mesh, vertices, faces, max_triangle_collisions)
-    if found is None:
+    pairs = _candidate_pairs(mesh, vertices, faces, max_triangle_collisions)
+    if pairs is None:
         return mask
-    pairs, valid = found
     wp.launch(
-        kernel_validation.mark_intersecting_faces,
+        kernel_validation.mark_intersecting_pairs,
         dim=int(pairs.shape[0]),
-        inputs=[pairs, valid, mask],
+        inputs=[vertices, faces, pairs, mask],
         device=device,
     )
     return mask
 
 
-def _intersecting_pairs(
+def _candidate_pairs(
     mesh: wp.Mesh,
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     max_triangle_collisions: int,
-) -> tuple[twt.Array2dInt32, wp.array[wp.bool]] | None:
+) -> twt.Array2dInt32 | None:
     """
-    Candidate face pairs and their triangle-triangle verdicts, shared by the predicate and the mask.
+    Broad-phase candidate face pairs, shared by the predicate and the mask.
 
-    Broad phase queries each triangle's AABB against ``mesh``'s BVH; narrow phase runs Moller's
-    interval test on every candidate pair, skipping pairs that share a vertex.
+    Queries each triangle's AABB against ``mesh``'s BVH. The narrow phase -- Moller's interval test
+    on every candidate pair, skipping pairs that share a vertex
+    (``kernels/intersection.candidate_pair_intersects``) -- is each caller's own, since the
+    predicate wants a verdict per pair and the mask only the faces.
 
     Parameters
     ----------
@@ -520,8 +528,9 @@ def _intersecting_pairs(
 
     Returns
     -------
-    tuple[twt.Array2dInt32, wp.array[wp.bool]] | None
-        ``(pairs, valid)``, or ``None`` when the broad phase found no candidate at all.
+    twt.Array2dInt32 | None
+        ``(n_pairs, 2)`` query and target faces, or ``None`` when the broad phase found no
+        candidate at all.
 
     Raises
     ------
@@ -557,14 +566,7 @@ def _intersecting_pairs(
         device=device,
     )
 
-    valid = wp.empty(n_pairs, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_intersections.filter_intersecting_pairs,
-        dim=n_pairs,
-        inputs=[vertices, faces, vertices, faces, pairs, valid],
-        device=device,
-    )
-    return pairs, valid
+    return pairs
 
 
 def is_winding_consistent(faces: wp.array[wp.int32]) -> bool:

@@ -752,44 +752,73 @@ def flag_bad_triangulations(
 
 
 @wp.kernel
-def edge_third_vertex(faces: wp.array[wp.int32], out_third: wp.array[wp.int32]) -> None:
-    # Third vertex per faces_to_edges row: edge ``k`` of face ``f`` is ``(v_k, v_{k+1})``, so the
-    # third corner is ``v_{k+2}`` -- which under the ``h = 3f + k`` numbering both buffers already
-    # use is the origin of the *previous* halfedge, hence ``halfedge_prev`` rather than a second
-    # spelling of the same face-local cycle.
-    r = wp.int32(wp.tid())
-    out_third[r] = faces[halfedge_prev(r)]
-
-
-@wp.kernel
-def rim_opposite_from_table(
+def rim_edge_keys(
     flat_loops: wp.array[wp.int32],
     loop_id: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],
     loop_sizes: wp.array[wp.int32],
-    vertices: wp.array[wp.vec3],
-    sorted_keys: wp.array[wp.uint64],
-    sorted_rows: wp.array[wp.int32],
-    thirds: wp.array[wp.int32],
-    max_index: wp.uint64,
-    out_positions: wp.array[wp.vec3],
-    out_valid: wp.array[wp.int32],
+    base: wp.uint64,
+    out_keys: wp.array[wp.uint64],
 ) -> None:
-    # Per rim edge (loop[i], loop[i+1]) of every loop at once: probe the sorted packed-edge table;
-    # a single hit means exactly one adjacent existing face, whose third vertex blends the fill
-    # dihedral metrics into the surface (host dict semantics of the former _rim_opposite).
+    # The undirected key of rim edge ``(loop[t], loop[t + 1])`` of every loop at once, keyed on
+    # slot ``t``: the table ``probe_rim_edges`` searches.
     t = wp.int32(wp.tid())
     u = flat_loops[t]
     v = flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, t)]
-    lo_v = wp.min(u, v)
-    hi_v = wp.max(u, v)
-    key = wp.uint64(wp.uint32(lo_v)) + wp.uint64(wp.uint32(hi_v)) * max_index
-    lo_idx = kernel_array.binary_search_index_left(sorted_keys, key)
-    hi_idx = kernel_array.binary_search_index(sorted_keys, key)
+    out_keys[t] = kernel_array.pack_edge_key(u, v, base)
+
+
+@wp.kernel
+def probe_rim_edges(
+    faces: wp.array[wp.int32],
+    sorted_rim_keys: wp.array[wp.uint64],
+    rim_slots: wp.array[wp.int32],
+    base: wp.uint64,
+    out_counts: wp.array[wp.int32],
+    out_thirds: wp.array[wp.int32],
+) -> None:
+    # One thread per face: count, for every rim edge, the faces containing it, and record the
+    # vertex opposite it. The rim is the small side of the question, so the rim's keys are the
+    # sorted table and each face probes it with its own three edges -- where probing a sorted table
+    # of every mesh edge with the rim's cost a radix sort over the whole mesh. A rim edge whose
+    # count comes out 1 has exactly one adjacent face, and ``out_thirds`` then holds that face's
+    # third vertex; where it is higher the written vertex is some face's and is never read.
+    #
+    # A key can occur at more than one rim slot (a loop that walks one edge twice), so every
+    # matching slot is visited rather than the first.
+    f = wp.int32(wp.tid())
+    n = sorted_rim_keys.shape[0]
+    for k in range(3):
+        # Halfedge ``h = 3f + k`` runs ``v_k -> v_{k+1}``; the third corner is the origin of the
+        # previous halfedge, which is ``halfedge_prev`` rather than a second spelling of the cycle.
+        h = 3 * f + k
+        a = faces[h]
+        b = faces[3 * f + (k + 1) % 3]
+        third = faces[halfedge_prev(h)]
+        key = kernel_array.pack_edge_key(a, b, base)
+        index = kernel_array.binary_search_index_left(sorted_rim_keys, key)
+        while index < n and sorted_rim_keys[index] == key:
+            slot = rim_slots[index]
+            wp.atomic_add(out_counts, slot, 1)
+            out_thirds[slot] = third
+            index += 1
+
+
+@wp.kernel
+def rim_opposite_positions(
+    vertices: wp.array[wp.vec3],
+    counts: wp.array[wp.int32],
+    thirds: wp.array[wp.int32],
+    out_positions: wp.array[wp.vec3],
+    out_valid: wp.array[wp.int32],
+) -> None:
+    # Per rim edge: a single adjacent face means its third vertex blends the fill dihedral metrics
+    # into the surface; none, or several, and the edge has no one opposite vertex.
+    t = wp.int32(wp.tid())
     out_positions[t] = wp.vec3(0.0, 0.0, 0.0)
     out_valid[t] = wp.int32(0)
-    if hi_idx - lo_idx == 1:
-        out_positions[t] = vertices[thirds[sorted_rows[lo_idx]]]
+    if counts[t] == 1:
+        out_positions[t] = vertices[thirds[t]]
         out_valid[t] = wp.int32(1)
 
 
@@ -1164,7 +1193,7 @@ def stitch_dp_cell(
             if out_came[i, j - 1] != CAME_NONE:
                 c_op = stitch_prev_apex(a_pos, b_pos, out_came, n_a, n_b, i, j - 1)
                 w = w + stitch_edge_metric(a_cur, b_prev, c_op, b_cur)
-            # ``rim_opposite_from_table`` keys slot k on the rim edge (loop[k], loop[k + 1]), so
+            # ``rim_edge_keys`` keys slot k on the rim edge (loop[k], loop[k + 1]), so
             # the edge (b[j - 1], b[j]) introduced by this step is slot j - 1, not j -- the same
             # convention the A branch uses above.
             if tables.b_opp_valid[(j - 1) % n_b] != 0:

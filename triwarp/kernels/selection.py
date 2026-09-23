@@ -245,10 +245,13 @@ def loops_are_input_rims(
     # The region-sized equivalent -- a kept rim edge was an input boundary edge exactly when no
     # *deleted* face contains it, so only the deleted faces' ``3k`` edges need sorting -- is exact
     # on a simple rim and was measured 1.09-1.12x, and it is **not** taken. On a *pinched* deletion
-    # (a region whose rim meets itself at a vertex) ``boundary_loops`` returns loops whose vertex
-    # order is unspecified and differs by device, and their fake edges match no deleted face, so
-    # the inverted test reads a new rim as the input's and drops it, where this one reports it.
+    # (a region whose rim meets itself at a vertex) the rim is not a successor graph, and
+    # ``boundary_loops_batched`` walks it with ``graph.successor_cycles`` anyway, which leaves the
+    # colliding slots at ``0``: the loop's fake ``(0, 0)`` edges match no deleted face, so the
+    # inverted test reads a new rim as the input's and drops it, where this one reports it.
     # ``test_delete_region_keep_boundary_reports_only_new_rims``' interior region is such a case.
+    # Walking pinched rims per halfedge sector (``repair.next_boundary_halfedge``) would make it
+    # exact.
     #
     # One thread per *loop*, walking its own rim, rather than one per rim vertex with a segment
     # label: boundary loops are few and short, which is the regime

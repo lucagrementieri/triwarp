@@ -705,6 +705,10 @@ def delete_region_keep_boundary(
     )
     if int(kept_faces.shape[0]) == 0:
         return kept_vertices, kept_faces, []
+    # Nothing deleted opens no rim: every loop the submesh has is the input's own. The face count
+    # says so without a readback, and it skips the loop extraction as well as the classification.
+    if int(kept_faces.shape[0]) == 3 * n_faces:
+        return kept_vertices, kept_faces, []
 
     flat_loops, loop_offsets, loop_sizes = tw.boundary.boundary_loops_batched(
         kept_vertices, kept_faces

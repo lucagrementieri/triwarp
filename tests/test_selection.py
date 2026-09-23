@@ -885,6 +885,27 @@ def test_delete_region_keep_boundary_matches_meshlib(icosphere: tuple[tm.Trimesh
     assert kept_boundary_np.shape[0] == sum(int(loop.shape[0]) for loop in new_loops)
 
 
+def test_delete_region_keep_boundary_with_nothing_deleted_reports_no_rim(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: an empty deletion opens no rim, whatever rims the input has.
+
+    The hemisphere arrives with one, which is what makes the empty answer a claim rather than a
+    tautology -- its rim is a loop of the survivor, and it must not be reported as new.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    device = mesh_wp.points.device
+    assert tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices).shape[0] > 0
+    nothing = wp.zeros(mesh_tm.faces.shape[0], dtype=wp.bool, device=device)
+    kept_vertices_wp, kept_faces_wp, loops = tw.selection.delete_region_keep_boundary(
+        mesh_wp.points, mesh_wp.indices, nothing
+    )
+    assert loops == []
+    assert np.array_equal(kept_faces_wp.numpy(), mesh_wp.indices.numpy())
+    assert int(kept_vertices_wp.shape[0]) == int(mesh_wp.points.shape[0])
+
+
 def test_delete_region_keep_boundary_reports_only_new_rims(
     hemisphere: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:

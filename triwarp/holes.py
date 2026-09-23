@@ -327,64 +327,50 @@ _BAD_TRIANGULATION_METRIC = 1e10  # kernel ``BAD_METRIC``; a forced-bad triangul
 
 class _EdgeTable:
     """
-    Device edge->third-vertex table for the pre-DP hole-fill stage.
+    Device rim-edge lookups for the pre-DP hole-fill stage.
 
-    Built once per fill call from the (unsorted) packed sorted-edge keys: probing a rim edge
-    with a binary search over ``sorted_keys`` yields its occurrence count (adjacent-face count)
-    and, via ``sorted_rows`` -> ``thirds``, the opposite vertex of the single adjacent face. A
-    ``(n_vertices,)`` slot scratch supports the forbidden-chord mask of every loop at once.
-
-    The table is mesh-sized for a rim-sized question, and inverting it -- sort the rim's own edge
-    keys and let one pass over the faces probe them -- is exact and was measured flat on the hole
-    chains: the whole-mesh sort is a few launches of an already launch-bound call. Not worth the
-    second pair of kernels.
+    ``rim_opposite`` finds, per rim edge, its adjacent-face
+    count and the opposite vertex of the single adjacent face; a ``(n_vertices,)`` slot scratch
+    supports the forbidden-chord mask of every loop at once. Both answers are rim-sized, so neither
+    builds a table of the mesh's edges: the one sort is of the rim's own keys.
     """
 
     def __init__(
         self, vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32
     ) -> None:
         device = faces.device
-        n_rows = int(edges_sorted.shape[0])
         n_vertices = tw.array.index_bound(edges_sorted, require_non_negative=True)
         self.vertices = vertices
+        self.faces = faces
         self.edges_sorted = edges_sorted
-        self.max_index = wp.uint64(n_vertices)
+        self.base = wp.uint64(n_vertices)
         self.n_vertices = n_vertices
         self.device = device
 
-        self.thirds = wp.empty(n_rows, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_holes.edge_third_vertex, dim=n_rows, inputs=[faces, self.thirds], device=device
-        )
-
-        # The bound came from these same rows above, negatives included, so re-reducing
-        # them here would only repeat a check that has already run.
-        keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
-        sorted_keys, sorted_rows = tw.array.sort_and_argsort(keys)
-        # Cloned: the views alias scratch that must not be shared with a later sort.
-        self.sorted_keys = wp.clone(sorted_keys)
-        self.sorted_rows = wp.clone(sorted_rows)
-
     def rim_opposite(self, loops: _PackedLoops) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-        """Opposite-vertex position + validity per rim edge, for every loop in one launch."""
+        """Opposite-vertex position + validity per rim edge, for every loop in one pass."""
+        keys = wp.empty(loops.total, dtype=wp.uint64, device=self.device)
+        wp.launch(
+            kernel_holes.rim_edge_keys,
+            dim=loops.total,
+            inputs=[loops.flat_loops, loops.loop_id, loops.starts, loops.sizes, self.base, keys],
+            device=self.device,
+        )
+        sorted_keys, slots = tw.array.sort_and_argsort(keys)
+        counts = wp.zeros(loops.total, dtype=wp.int32, device=self.device)
+        thirds = wp.empty(loops.total, dtype=wp.int32, device=self.device)
+        wp.launch(
+            kernel_holes.probe_rim_edges,
+            dim=int(self.faces.shape[0]) // 3,
+            inputs=[self.faces, sorted_keys, slots, self.base, counts, thirds],
+            device=self.device,
+        )
         positions = wp.empty(loops.total, dtype=wp.vec3, device=self.device)
         valid = wp.empty(loops.total, dtype=wp.int32, device=self.device)
         wp.launch(
-            kernel_holes.rim_opposite_from_table,
+            kernel_holes.rim_opposite_positions,
             dim=loops.total,
-            inputs=[
-                loops.flat_loops,
-                loops.loop_id,
-                loops.starts,
-                loops.sizes,
-                self.vertices,
-                self.sorted_keys,
-                self.sorted_rows,
-                self.thirds,
-                self.max_index,
-                positions,
-                valid,
-            ],
+            inputs=[self.vertices, counts, thirds, positions, valid],
             device=self.device,
         )
         return positions, valid

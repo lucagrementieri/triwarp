@@ -1,5 +1,6 @@
 import warp as wp
 
+from triwarp.kernels.intersection import candidate_pair_intersects
 from triwarp.kernels.predicates import vector_angle
 
 
@@ -39,16 +40,21 @@ def edge_forward_in_face(
 
 
 @wp.kernel
-def mark_intersecting_faces(
-    pairs: wp.array2d[wp.int32], valid: wp.array[wp.bool], out_mask: wp.array[wp.bool]
+def mark_intersecting_pairs(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    pairs: wp.array2d[wp.int32],
+    out_mask: wp.array[wp.bool],
 ) -> None:
-    """Flag both faces of each intersecting candidate pair (idempotent ``True`` writes)."""
-    # Folding the narrow phase in here, so the mask path needs no per-pair verdict buffer, is
-    # exact and measured flat: one launch and one allocation of a call dominated by the BVH query.
+    """Flag both faces of each candidate pair that intersects (idempotent ``True`` writes)."""
+    # The narrow phase and the marking in one pass: the mask needs no per-pair verdict buffer,
+    # which only the boolean predicate reads.
     p = wp.int32(wp.tid())
-    if valid[p]:
-        out_mask[pairs[p, 0]] = True
-        out_mask[pairs[p, 1]] = True
+    a = pairs[p, 0]
+    b = pairs[p, 1]
+    if candidate_pair_intersects(vertices, faces, vertices, faces, a, b):
+        out_mask[a] = True
+        out_mask[b] = True
 
 
 @wp.func

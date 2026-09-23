@@ -355,6 +355,26 @@ def expand_query_target_pairs(
         i = i + 1
 
 
+@wp.func
+def candidate_pair_intersects(
+    query_vertices: wp.array[wp.vec3],
+    query_faces: wp.array[wp.int32],
+    target_vertices: wp.array[wp.vec3],
+    target_faces: wp.array[wp.int32],
+    query_face: wp.int32,
+    target_face: wp.int32,
+) -> wp.bool:
+    # The narrow phase of one broad-phase candidate: two faces that share a vertex are adjacent,
+    # not intersecting, and every other pair is decided by the triangle-triangle test. Shared by
+    # the verdict-per-pair kernel below and ``validation.mark_intersecting_pairs``, which marks
+    # faces straight from it.
+    qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, query_face)
+    ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, target_face)
+    if triangles_share_vertex(qa, qb, qc, ta, tb, tc):
+        return False
+    return triangles_intersect(qa, qb, qc, ta, tb, tc)
+
+
 @wp.kernel
 def filter_intersecting_pairs(
     query_vertices: wp.array[wp.vec3],
@@ -365,12 +385,9 @@ def filter_intersecting_pairs(
     out_valid: wp.array[wp.bool],
 ) -> None:
     tid = wp.int32(wp.tid())
-    qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, pairs[tid, 0])
-    ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, pairs[tid, 1])
-    if triangles_share_vertex(qa, qb, qc, ta, tb, tc):
-        out_valid[tid] = False
-        return
-    out_valid[tid] = triangles_intersect(qa, qb, qc, ta, tb, tc)
+    out_valid[tid] = candidate_pair_intersects(
+        query_vertices, query_faces, target_vertices, target_faces, pairs[tid, 0], pairs[tid, 1]
+    )
 
 
 @wp.kernel
