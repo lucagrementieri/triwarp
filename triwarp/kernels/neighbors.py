@@ -391,6 +391,20 @@ def deepen_radius(worst: wp.float32, r: wp.float32, r_hard: wp.float32) -> wp.fl
     return wp.min(r * RADIUS_GROWTH, r_hard)
 
 
+@wp.func
+def next_search_radius(worst: wp.float32, r: wp.float32, r_hard: wp.float32) -> wp.float32:
+    # The iterative-deepening decision every exact search in this package makes after a scan at
+    # radius ``r``, one definition because it is a *rule*, not arithmetic: the row is final when
+    # everything outside the ball is farther than ``worst`` (certified) or when ``r`` already
+    # reached ``r_hard`` (the scan was complete); otherwise deepen. ``-1`` says final -- a real
+    # radius is never negative -- and each caller maps it onto its own ``break`` / ``return``.
+    if worst <= r:
+        return wp.float32(-1.0)
+    if r >= r_hard:
+        return wp.float32(-1.0)
+    return deepen_radius(worst, r, r_hard)
+
+
 @wp.kernel
 def query_bvh_nearest_neighbors(
     points: wp.array[wp.vec3],
@@ -425,11 +439,9 @@ def query_bvh_nearest_neighbors(
         worst = knn_bvh_scan(
             points, bvh_id, q, k, max_radius, r, out_indices_row, out_distances_row
         )
-        if worst <= r:
-            break  # every point outside the ball is farther than the k-th best: certified exact
-        if r >= r_hard:
-            break  # the scan was already complete, so the row is final
-        r = deepen_radius(worst, r, r_hard)
+        r = next_search_radius(worst, r, r_hard)
+        if r < 0.0:
+            break  # certified exact, or the scan was already complete
 
 
 # ---------------------------------------------------------------------------------------------
@@ -578,11 +590,9 @@ def _bvh_nearest_row_kernel(row_size: int, name: str):
                             carry_distance = held_distance
                             carry_index = held_index
             worst = row_kth(row_distances, k)
-            if worst <= r:
-                break  # every point outside the ball is farther than the k-th best: exact
-            if r >= r_hard:
-                break  # the scan was already complete, so the row is final
-            r = deepen_radius(worst, r, r_hard)
+            r = next_search_radius(worst, r, r_hard)
+            if r < 0.0:
+                break  # certified exact, or the scan was already complete
 
         row_write(row_distances, row_indices, tid, k, out_indices, out_distances)
 
@@ -630,8 +640,8 @@ def knn_hashgrid_scan(
     # point), while the BVH path forces a final complete attempt instead. A merged kernel would
     # carry a parameter that is ignored on one path and a fallback branch that belongs to the
     # other. What the two genuinely share is already shared: ``knn_reset_row``,
-    # ``knn_sorted_insert``, ``complete_radius`` and ``deepen_radius``; what is left is three lines
-    # of traversal each, plus each one's own certification policy.
+    # ``knn_sorted_insert``, ``complete_radius`` and ``next_search_radius``; what is left is three
+    # lines of traversal each, plus each one's own certification policy.
     knn_reset_row(k, out_indices_row, out_distances_row)
     query = wp.hash_grid_query(grid_id, q, r)
     point_index = wp.int32(-1)
@@ -693,11 +703,9 @@ def query_hashgrid_nearest_neighbors(
         worst = knn_hashgrid_scan(
             points, grid_id, q, k, max_radius, r, out_indices_row, out_distances_row
         )
-        if worst <= r:
-            return  # certified exact
-        if r >= r_hard:
-            return  # the scan was already complete
-        r = deepen_radius(worst, r, r_hard)
+        r = next_search_radius(worst, r, r_hard)
+        if r < 0.0:
+            return  # certified exact, or the scan was already complete
     knn_linear_scan(points, q, k, max_radius, out_indices_row, out_distances_row)
 
 
@@ -752,13 +760,10 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
                             carry_distance = held_distance
                             carry_index = held_index
             worst = row_kth(row_distances, k)
-            if worst <= r:
-                certified = 1  # certified exact
+            r = next_search_radius(worst, r, r_hard)
+            if r < 0.0:
+                certified = 1  # certified exact, or the scan was already complete
                 break
-            if r >= r_hard:
-                certified = 1  # the scan was already complete
-                break
-            r = deepen_radius(worst, r, r_hard)
 
         if certified == 0 and defer != 0:
             # Hand the row to ``nearest_point_via_mesh`` instead of scanning: a query this far
@@ -899,11 +904,9 @@ def query_weighted_nearest_neighbors(
             if score < best:
                 best = score
                 best_index = point_index
-        if best + max_weight <= r:
-            break  # every site outside the ball scores worse than this: certified exact
-        if r >= r_hard:
-            break  # the scan was already complete, so the answer is final
-        r = deepen_radius(best + max_weight, r, r_hard)
+        r = next_search_radius(best + max_weight, r, r_hard)
+        if r < 0.0:
+            break  # certified exact, or the scan was already complete
 
     out_indices[tid] = best_index
     out_distances[tid] = best

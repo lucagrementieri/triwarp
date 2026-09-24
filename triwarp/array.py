@@ -1053,14 +1053,25 @@ def isin(
         # ``_ISIN_MASK_SIZE_FACTOR`` test here would spend the readback to reach the same branch.
         return _reshaped(_isin_lookup_mask(elements_flat, test_elements, max_index, 0), elements)
 
-    lo_elements, hi_elements = tw.reduce.minmax(elements_flat)
-    # ``test_elements`` is ``wp.array[wp.Int]``, whose dtype is a TypeVar rather than a concrete
-    # integer type, so it matches no overload; ``elements_flat`` needs no cast because ``ArrayNd``
-    # is already dtype-agnostic. The annotation is kept as ``wp.Int`` -- it documents the integer
-    # constraint that makes this reduction meaningful.
-    lo_test, hi_test = tw.reduce.minmax(cast(twt.ArrayNdInt, test_elements))
-    offset = min(int(lo_elements), int(lo_test))
-    span = max(int(hi_elements), int(hi_test)) - offset + 1
+    # One ``(min, max)`` accumulator over both inputs: the tiled minmax kernel folds into what the
+    # buffer already holds, so launching it once per input yields the joint bounds for a single
+    # readback, where two ``reduce.minmax`` calls allocate and read back once each.
+    reduce_dtype = elements_flat.dtype
+    bounds = wp.array(
+        [twt.dtype_max(reduce_dtype), twt.dtype_min(reduce_dtype)],
+        dtype=reduce_dtype,
+        device=device,
+    )
+    for values in (elements_flat, test_elements):
+        wp.launch_tiled(
+            kernel_reduce.MINMAX1D_TILED[reduce_dtype],
+            dim=[kernel_reduce.blocks_1d(int(values.shape[0]))],
+            inputs=[values, bounds],
+            block_dim=TILE_1D,
+            device=device,
+        )
+    offset, high = (int(bound) for bound in bounds.numpy())
+    span = high - offset + 1
     if span <= _ISIN_MASK_SIZE_FACTOR * k:
         out_flat = _isin_lookup_mask(elements_flat, test_elements, span, offset)
     else:
@@ -1083,8 +1094,9 @@ def _isin_lookup_mask(
     # negative test values as out of range, so they read back as absent. A caller-supplied
     # ``max_index`` anchors at zero precisely because it asserts the values are non-negative.
     #
-    # The element side is one guarded launch rather than a shift plus a Python-scope gather --
-    # see ``kernels/array.py::isin_lookup_mask`` for what that buys and why the guard is required.
+    # Each side is one guarded launch that shifts and then marks or reads -- see
+    # ``kernels/array.py::isin_mark_table`` / ``isin_lookup_mask`` for what that buys and why the
+    # guard is required.
     #
     # ``last`` is the largest value the table holds, and both sides are shifted through it so that
     # ``shifted_index`` range-tests before it narrows to int32. Computing it here in Python
@@ -1095,14 +1107,11 @@ def _isin_lookup_mask(
     dtype = elements_flat.dtype
     anchor = dtype(offset)
     last = dtype(offset + span - 1)
-    test_slots = wp.empty(int(test_elements.shape[0]), dtype=wp.int32, device=device)
-    wp.map(kernel_array.shifted_index, test_elements, anchor, last, out=test_slots)
-
     membership_wp = wp.zeros(span, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_scatter.mark_membership_mask,
-        dim=int(test_slots.shape[0]),
-        inputs=[test_slots, wp.int32(span), membership_wp],
+        kernel_array.ISIN_MARK_TABLE[dtype],
+        dim=int(test_elements.shape[0]),
+        inputs=[test_elements, anchor, last, membership_wp],
         device=device,
     )
     out_mask = wp.empty(int(elements_flat.shape[0]), dtype=wp.bool, device=device)

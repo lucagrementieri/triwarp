@@ -6,6 +6,7 @@ import math
 from collections.abc import Callable
 from typing import Literal, NamedTuple, cast, overload
 
+import numpy as np
 import warp as wp
 
 import triwarp.typing as twt
@@ -138,7 +139,9 @@ def minmax(
     [`aabb`][triwarp.bounds.aabb] host-latency-bound and nothing more.
 
     With ``axis=0`` or ``axis=1`` on a rank-2 input, reduces along that axis to a
-    pair of 1D ``wp.array`` buffers (min, max) of the same dtype.
+    pair of 1D ``wp.array`` buffers (min, max) of the same dtype. The two are rows 0 and 1 of
+    one contiguous ``(2, k)`` buffer, so the max starts exactly ``k`` elements after the min
+    and a caller that needs both on the host can read the pair back as one copy.
 
     Parameters
     ----------
@@ -756,10 +759,12 @@ def _launch_axis_scalar(
         # thread per output, direct write, no init fill, avoids that.
         serial = (spec.axis_rows_serial if axis == 1 else spec.axis_cols_serial)[array.dtype]
         if spec.dual_axis:
-            out_min = twt.empty_1d(n_out, array.dtype, device=array.device)
-            out_max = twt.empty_1d(n_out, array.dtype, device=array.device)
+            # One ``(2, n_out)`` buffer rather than two: every slot is written, and the pair
+            # stays adjacent so a caller reading both can do it in one copy.
+            packed = twt.empty_2d((2, n_out), array.dtype, device=array.device)
+            out_min, out_max = packed[0], packed[1]
             wp.launch(serial, dim=n_out, inputs=[array, out_min, out_max], device=array.device)
-            return out_min, out_max
+            return cast(twt.Array1dScalar, out_min), cast(twt.Array1dScalar, out_max)
         out = twt.empty_1d(n_out, array.dtype, device=array.device)
         wp.launch(serial, dim=n_out, inputs=[array, out], device=array.device)
         return out
@@ -767,8 +772,13 @@ def _launch_axis_scalar(
     tiled = (spec.axis_rows_tiled if axis == 1 else spec.axis_cols_tiled)[array.dtype]
     n_tiles = (reduced + TILE_1D - 1) // TILE_1D
     if spec.dual_axis:
-        out_min = wp.full(n_out, twt.dtype_max(array.dtype), dtype=array.dtype, device=array.device)
-        out_max = wp.full(n_out, twt.dtype_min(array.dtype), dtype=array.dtype, device=array.device)
+        # Both seeds in one allocation, uploaded together: row 0 accumulates the minimum from
+        # the dtype's largest value, row 1 the maximum from its smallest.
+        seeds = np.empty((2, n_out), dtype=wp.dtype_to_numpy(array.dtype))
+        seeds[0] = twt.dtype_max(array.dtype)
+        seeds[1] = twt.dtype_min(array.dtype)
+        packed = wp.array(seeds, dtype=array.dtype, device=array.device)
+        out_min, out_max = packed[0], packed[1]
         wp.launch_tiled(
             tiled,
             dim=[n_out, n_tiles],

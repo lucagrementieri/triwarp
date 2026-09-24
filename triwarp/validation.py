@@ -495,9 +495,9 @@ def face_self_intersecting_mask(
     if pairs is None:
         return mask
     wp.launch(
-        kernel_validation.mark_intersecting_pairs,
+        kernel_intersections.mark_intersecting_pair_masks,
         dim=int(pairs.shape[0]),
-        inputs=[vertices, faces, pairs, mask],
+        inputs=[vertices, faces, vertices, faces, pairs, mask, mask],
         device=device,
     )
     return mask

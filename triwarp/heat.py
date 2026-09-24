@@ -615,13 +615,12 @@ def _solve_poisson_zero_set(
     operator_uu, rhs = twl.assemble_interior_system(
         operator, fixed_mask, free_map, twt.as_array2d(zeros, wp.float64), n_free
     )
-    # Flip sign with the operator: the Poisson right-hand side is -div for the -L convention.
-    negated = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.map(wp.neg, divergence, out=negated)
+    # Flip sign with the operator: the Poisson right-hand side is -div for the -L convention; the
+    # compaction negates as it goes.
     wp.launch(
-        kernel_heat.scatter_free_rhs,
+        kernel_heat.scatter_negated_free_rhs,
         dim=n_vertices,
-        inputs=[fixed_mask, free_map, negated, rhs],
+        inputs=[fixed_mask, free_map, divergence, rhs],
         device=device,
     )
 
@@ -652,11 +651,11 @@ def _solve_poisson_shifted(
     gradient handles while the right-hand side is consistent; the shift afterwards picks that
     constant, and putting the curve at zero is the choice that makes the result a distance.
     """
-    negated = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.map(wp.neg, divergence, out=negated)
+    # In place: ``divergence`` is this call's own scratch, read by nothing after the solve.
+    wp.map(wp.neg, divergence, out=divergence)
 
     field = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    twl.solve_spd(operator, negated, field, tol=_CG_TOLERANCE, preconditioner=preconditioner)
+    twl.solve_spd(operator, divergence, field, tol=_CG_TOLERANCE, preconditioner=preconditioner)
     offset = tw.reduce.mean(tw.array.gather(field, curve_vertices))
     wp.map(wp.sub, field, wp.float64(offset), out=field)
     return field
@@ -1005,12 +1004,14 @@ def transport_tangent_vectors(
         operators = vector_heat_operators(vertices, faces, t)
     vector_system, scalar, _, vector_preconditioner = operators
 
+    # Widened once: the seed and the per-source magnitudes both read the float64 vectors.
+    vectors_d = _as_vec2d(vectors)
     direction = _diffuse_from_sources(
-        vector_system, sources, vectors, n_vertices, device, preconditioner=vector_preconditioner
+        vector_system, sources, vectors_d, n_vertices, device, preconditioner=vector_preconditioner
     )
 
     magnitudes = wp.empty(n_sources, dtype=wp.float64, device=device)
-    wp.map(wp.length, _as_vec2d(vectors), out=magnitudes)
+    wp.map(wp.length, vectors_d, out=magnitudes)
     extended = extend_scalar(vertices, faces, sources, magnitudes, operators=scalar)
 
     # Both questions below are asked relative to the field, because the field's length carries the
@@ -1116,7 +1117,7 @@ def log_map(
     # field the angle is measured against. Raw (unnormalized) magnitude, exactly like
     # ``transport_tangent_vectors``' own ``direction`` -- so the cut-locus test below has to floor
     # it relative to its own maximum for the same reason that function does (§ its docstring).
-    reference = wp.array([[1.0, 0.0]], dtype=wp.vec2, device=device)
+    reference = wp.array([[1.0, 0.0]], dtype=wp.vec2d, device=device)
     transported_raw = _diffuse_from_sources(
         vector_system, sources, reference, n_vertices, device, preconditioner=vector_preconditioner
     )
@@ -1209,7 +1210,7 @@ def tangent_to_world(
 def _diffuse_from_sources(
     system: wps.BsrMatrix[wp.float64],
     sources: wp.array[wp.int32],
-    vectors: wp.array[wp.vec2],
+    vectors: wp.array[wp.vec2d],
     n_vertices: int,
     device: wp.DeviceLike,
     *,
@@ -1220,7 +1221,7 @@ def _diffuse_from_sources(
     wp.launch(
         kernel_scatter.SCATTER_ADD[wp.vec2d],
         dim=int(sources.shape[0]),
-        inputs=[_as_vec2d(vectors), sources, field],
+        inputs=[vectors, sources, field],
         device=device,
     )
     return diffuse_tangent_field(system, field, preconditioner=preconditioner)

@@ -39,7 +39,6 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
 from triwarp.array import arange, flatnonzero, gather
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
 from triwarp.neighbors import query_ball_with_offsets
@@ -597,14 +596,24 @@ def _dart_throw_blue_noise(
     wp.map(kernel_blue_noise.grid_cell_key, grid_coords, wp.int32(grid_w), out=cell_keys)
 
     # Bucket the pool by cell: one radix sort gives both the per-cell membership lists and, through
-    # the unique run lengths, the sentinel-terminated bounds that index them.
-    # ``sort_and_argsort`` returns views into its own scratch; both outlive this frame, so clone.
-    sorted_keys_view, perm = tw.array.sort_and_argsort(cell_keys, fill_value=n_pool)
-    sorted_keys = wp.clone(sorted_keys_view)
-    bucket = wp.clone(perm)
-    unique_keys, counts = tw.grouping.unique_1d(sorted_keys, return_counts=True)
-    n_cells = int(unique_keys.shape[0])
-    cell_offsets, _ = tw.array.counts_to_offsets(counts, include_total=True)
+    # the run starts of the sorted keys, the sentinel-terminated bounds that index them.
+    # ``sort_and_argsort`` allocates its scratch per call, so its two views are this call's own and
+    # need no clone to stay valid for the rest of it.
+    sorted_keys, bucket = tw.array.sort_and_argsort(cell_keys, fill_value=n_pool)
+    is_start = wp.empty(n_pool, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_blue_noise.cell_run_starts, dim=n_pool, inputs=[sorted_keys, is_start], device=device
+    )
+    run_starts = flatnonzero(is_start)
+    n_cells = int(run_starts.shape[0])
+    unique_keys = wp.empty(n_cells, dtype=wp.int64, device=device)
+    cell_offsets = wp.empty(n_cells + 1, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_blue_noise.cell_table,
+        dim=n_cells + 1,
+        inputs=[sorted_keys, run_starts, n_pool, unique_keys, cell_offsets],
+        device=device,
+    )
 
     # **The whole dart loop runs in cell-sorted index space from here on.** ``bucket`` is already
     # the cell-order permutation, so permuting the payload through it once makes each cell's
@@ -631,17 +640,16 @@ def _dart_throw_blue_noise(
         device=device,
     )
 
-    # Drawn in *original* index space and then permuted, not drawn in sorted space: the priority a
+    # Keyed on the *original* pool index even though it is stored in sorted space: the priority a
     # point holds is what decides the packing, so it has to stay the same function of the seed and
     # the point rather than of where the sort happened to put it.
-    priority_unsorted = wp.empty(n_pool, dtype=wp.uint32, device=device)
+    priority = wp.empty(n_pool, dtype=wp.uint32, device=device)
     wp.launch(
-        kernel_array.random_priorities,
+        kernel_blue_noise.sorted_random_priorities,
         dim=n_pool,
-        inputs=[wp.int32(seed), priority_unsorted],
+        inputs=[wp.int32(seed), bucket, priority],
         device=device,
     )
-    priority = gather(priority_unsorted, bucket)
     state = wp.zeros(n_pool, dtype=wp.int32, device=device)
 
     # Per-cell summaries that let each round's two sweeps skip a shell cell whole; see the kernel

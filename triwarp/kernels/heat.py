@@ -19,7 +19,7 @@ from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import to_vec2, to_vec2d
 from triwarp.kernels.linalg import free_row
 from triwarp.kernels.predicates import normalize_or_zero, unit_tangent, world_to_tangent
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, commit_sum_and_count, tile_chunk
 from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import corner_triple, face_unit_gradient, face_vertices_vec3d
 
@@ -55,11 +55,7 @@ def upper_edge_length_sum_and_count(
             if column > row:
                 total += wp.float64(wp.length(vertices[column] - vertices[row]))
                 count += wp.float64(1.0)
-    block_total = wp.tile_sum(wp.tile(total))[0]
-    block_count = wp.tile_sum(wp.tile(count))[0]
-    if t == 0:
-        wp.atomic_add(out_sum_and_count, 0, block_total)
-        wp.atomic_add(out_sum_and_count, 1, block_count)
+    commit_sum_and_count(t, total, count, out_sum_and_count)
 
 
 @wp.func
@@ -226,14 +222,16 @@ def vertex_field_divergence(
 
 
 @wp.kernel
-def scatter_free_rhs(
+def scatter_negated_free_rhs(
     fixed_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],
     values: wp.array[wp.float64],
     out_rhs: wp.array2d[wp.float64],
 ) -> None:
-    # Compact a full-length right-hand side down to the unpinned degrees of freedom, in the layout
-    # ``linalg.solve_spd_columns`` expects (one row per right-hand side).
+    # Compact a full-length right-hand side, negated, down to the unpinned degrees of freedom, in
+    # the layout ``linalg.solve_spd_columns`` expects (one row per right-hand side). The negation is
+    # the Poisson sign convention (``-div`` for the ``-L`` operator) and is exact, so folding it in
+    # here is the ``wp.map(wp.neg, ...)`` pass the caller used to run into a buffer only this read.
     #
     # **Not factored with ``gather_free_solution`` below or with
     # ``smoothing.scatter_free_scalar``, deliberately, and the near-duplicate scan's 0.917 on the
@@ -259,7 +257,7 @@ def scatter_free_rhs(
     ri = free_row(fixed_mask, free_map, i)
     if ri < 0:
         return
-    out_rhs[0, ri] = values[i]
+    out_rhs[0, ri] = -values[i]
 
 
 @wp.kernel

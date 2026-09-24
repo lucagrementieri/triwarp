@@ -60,6 +60,7 @@ counts.
 import warp as wp
 
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels.grouping import sorted_run_start
 
 INVALID = wp.constant(wp.int32(-1))
 
@@ -114,6 +115,35 @@ def grid_cell_key(coord: wp.vec3i, grid_w: wp.int32) -> wp.int64:
 
 
 @wp.kernel
+def cell_run_starts(sorted_keys: wp.array[wp.int64], out_is_start: wp.array[wp.bool]) -> None:
+    # Where each occupied cell's run begins in the cell-sorted pool. The keys arrive sorted, so the
+    # distinct cells and their bounds are the run starts -- no hash table and no second sort, which
+    # is what ``unique_1d(return_counts=True)`` followed by a counts scan cost for the same answer.
+    s = wp.int32(wp.tid())
+    out_is_start[s] = sorted_run_start(sorted_keys, s)
+
+
+@wp.kernel
+def cell_table(
+    sorted_keys: wp.array[wp.int64],
+    run_starts: wp.array[wp.int32],
+    n_pool: wp.int32,
+    out_unique_keys: wp.array[wp.int64],
+    out_cell_offsets: wp.array[wp.int32],
+) -> None:
+    # The distinct cell keys and the sentinel-terminated cell bounds, in one pass over the
+    # ``n_cells + 1`` run starts: slot ``n_cells`` is the terminator and owns no key.
+    c = wp.int32(wp.tid())
+    n_cells = run_starts.shape[0]
+    if c < n_cells:
+        start = run_starts[c]
+        out_unique_keys[c] = sorted_keys[start]
+        out_cell_offsets[c] = start
+    else:
+        out_cell_offsets[c] = n_pool
+
+
+@wp.kernel
 def sorted_point_cells(
     sorted_keys: wp.array[wp.int64],
     unique_keys: wp.array[wp.int64],
@@ -157,6 +187,17 @@ def dart_cell_neighbors(
     out_cell_neighbors[c, s] = lookup_cell(
         unique_keys, cell_key(w64, wp.int64(cx), wp.int64(cy), wp.int64(cz))
     )
+
+
+@wp.kernel
+def sorted_random_priorities(
+    seed: wp.int32, bucket: wp.array[wp.int32], out_priority: wp.array[wp.uint32]
+) -> None:
+    # ``array.random_priorities`` drawn straight into cell-sorted space: the draw is keyed on the
+    # point's *pool* index ``bucket[s]``, so each point holds exactly the priority the unsorted draw
+    # gave it and the gather through ``bucket`` that used to follow is gone.
+    s = wp.int32(wp.tid())
+    out_priority[s] = wp.randu(wp.rand_init(seed, bucket[s]))
 
 
 @wp.func

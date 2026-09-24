@@ -66,7 +66,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device, require_valid_faces
-from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces, unique_rows
+from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import bounds as kernel_bounds
 from triwarp.kernels import repair as kernel_repair
@@ -430,13 +430,11 @@ def duplicate_vertex_inverse(vertices: wp.array[wp.vec3], epsilon: float) -> wp.
     if n == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
 
-    if epsilon > 0.0:
-        row_keys = hash_vector_rows(vertices, epsilon=epsilon)
-        _, inverse = unique_1d(row_keys, return_inverse=True)
-    else:
-        rows = twt.empty_2d((n, 3), wp.float32, device=device)
-        wp.utils.array_cast(vertices, rows)
-        _, inverse = unique_rows(rows, return_inverse=True)
+    # One key per vertex and one ``unique_1d`` over it, at either tolerance: ``hash_vector_rows``
+    # quantizes at ``epsilon > 0`` and packs the relative float buckets at ``0`` -- the same key
+    # ``unique_rows`` would hash the vertices to, without the representative gather it would then
+    # compute and this discards.
+    _, inverse = unique_1d(hash_vector_rows(vertices, epsilon=epsilon), return_inverse=True)
     return inverse
 
 
@@ -1306,7 +1304,7 @@ def remove_degree3_vertices(
     selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     counters = wp.zeros(2, dtype=wp.int32, device=device)
     keep_scratch = wp.empty(n_faces0, dtype=wp.bool, device=device)
-    keep_flags = wp.empty(n_faces0, dtype=wp.int32, device=device)
+    # The kept-face flags, scanned in place into their inclusive ranks.
     keep_ranks = wp.empty(n_faces0, dtype=wp.int32, device=device)
     for pass_index in range(max_iter):
         n_faces = int(faces.shape[0]) // 3
@@ -1366,9 +1364,9 @@ def remove_degree3_vertices(
             ],
             device=device,
         )
-        flags, ranks = keep_flags[:n_faces], keep_ranks[:n_faces]
-        wp.launch(kernel_array.bool_flags, dim=n_faces, inputs=[keep, flags], device=device)
-        wp.utils.array_scan(flags, out_array=ranks, inclusive=True)
+        ranks = keep_ranks[:n_faces]
+        wp.launch(kernel_array.bool_flags, dim=n_faces, inputs=[keep, ranks], device=device)
+        wp.utils.array_scan(ranks, out_array=ranks, inclusive=True)
         wp.launch(
             kernel_repair.compact_kept_faces,
             dim=n_faces,

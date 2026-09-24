@@ -709,9 +709,10 @@ def outlier_probability(
     # one readback, because the normalizer is a scalar every point divides by and Warp cannot pass
     # a device scalar as a uniform argument.
     normalizer = scale * math.sqrt(wp.utils.array_inner(plof, plof) / n)
-    out_probability = wp.zeros(n, dtype=wp.float32, device=device)
     if normalizer <= 0.0:
-        return out_probability  # a cloud with no spread: every plof is zero
+        # A cloud with no spread: every plof is zero.
+        return wp.zeros(n, dtype=wp.float32, device=device)
+    out_probability = wp.empty(n, dtype=wp.float32, device=device)
     wp.map(
         kernel_points.outlier_probability,
         plof,
@@ -1372,7 +1373,9 @@ def convex_superset_mask(
         kernel_points.shell_bounds, dim=1, inputs=[shell_vertices, centroid, radius], device=device
     )
 
-    planes = wp.zeros((n_tetra, 4), dtype=wp.vec4, device=device)
+    # `wp.empty`: a flat tetrahedron writes no planes, and `mark_hull_superset` reads a row
+    # only where `valid` is set.
+    planes = wp.empty((n_tetra, 4), dtype=wp.vec4, device=device)
     valid = wp.empty(n_tetra, dtype=wp.bool, device=device)
     wp.launch(
         kernel_points.tetrahedron_planes,

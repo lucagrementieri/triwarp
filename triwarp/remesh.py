@@ -2934,22 +2934,30 @@ def subdivide_to_size(
         # re-sampled: a midpoint's target is the mean of the endpoints it splits, which is the same
         # value the edge was tested against, so a run of passes cannot drift the field. Computed
         # before the split because it reads the pre-split edge rows.
+        # The ranks are taken once here and shared by the sizing extension and the split.
+        offsets, n_split = tw.array.mask_to_compact_ranks(long_mask)
         next_sizing = (
-            None if sizing is None else _extend_sizing_field(sizing, unique_edges, long_mask)
+            None
+            if sizing is None
+            else _extend_sizing_field(sizing, unique_edges, long_mask, offsets, n_split)
         )
 
         # ``index`` rides through the split rather than being gathered afterwards, and the "did
         # anything split" test reads the resulting face count rather than reducing the mask: a face
         # count strictly grows when a mask is non-empty and is unchanged when it is empty, so this
         # is exact and costs nothing.
-        new_vertices, new_faces, new_index = split_edges(
+        new_vertices, new_faces, new_index = _split_ranked_edges(
             current_vertices,
             current_faces,
             long_mask,
-            unique_edges=unique_edges,
-            inverse=inverse,
-            index=index,
-            return_index=True,
+            offsets,
+            n_split,
+            unique_edges,
+            inverse,
+            index,
+            index,
+            None,
+            True,
         )
         # Every edge is short enough: we are done.
         if int(new_faces.shape[0]) == int(current_faces.shape[0]):
@@ -2977,7 +2985,11 @@ def subdivide_to_size(
 
 
 def _extend_sizing_field(
-    sizing: wp.array[wp.float32], unique_edges: twt.Array2dInt32, split_mask: wp.array[wp.bool]
+    sizing: wp.array[wp.float32],
+    unique_edges: twt.Array2dInt32,
+    split_mask: wp.array[wp.bool],
+    offsets: wp.array[wp.int32],
+    n_split: int,
 ) -> wp.array[wp.float32]:
     """
     Append one sizing value per edge about to be split: the mean of the edge's two endpoints.
@@ -2987,7 +2999,6 @@ def _extend_sizing_field(
     the size that justified inserting it and repeated passes converge instead of drifting.
     """
     device = sizing.device
-    offsets, n_split = tw.array.mask_to_compact_ranks(split_mask)
     if n_split == 0:
         return sizing
     # Sized for its final use: the current field copied into the prefix and the new values written
@@ -3118,10 +3129,10 @@ def subdivide_region_to_size(
             device=device,
         )
 
-        # Only the *count* is wanted here -- for the stopping test, the budget and the running
-        # total. ``split_edges`` derives the per-edge vertex slots from ``long_mask`` itself.
-        # ``reduce.sum`` counts a ``wp.bool`` mask directly, which is faster than widening it.
-        n_long = int(tw.reduce.sum(long_mask))
+        # The count drives the stopping test, the budget and the running total. The ranks are the
+        # split's own and their scan total is the count, so the split below reuses them rather than
+        # scanning the mask a second time; a budget-trimmed mask re-ranks.
+        offsets, n_long = tw.array.mask_to_compact_ranks(long_mask)
 
         if n_long == 0:
             break
@@ -3143,20 +3154,24 @@ def subdivide_region_to_size(
                     current_vertices, current_faces, unique_edges=unique_edges
                 )
                 long_mask = _keep_longest_edges(long_mask, lengths, remaining, m, device)
-                n_long = remaining
+                offsets, n_long = tw.array.mask_to_compact_ranks(long_mask)
 
         # The crack-free split itself is [`split_edges`][triwarp.remesh.split_edges], which is
         # exactly what this loop contributes nothing new to: all this function decides is *which*
         # edges (long, and inside the region) and what rides along (``region_flags``, carried
         # through ``index`` so the grown region comes back resolved onto the new faces).
-        current_vertices, current_faces, region_flags = split_edges(
+        current_vertices, current_faces, region_flags = _split_ranked_edges(
             current_vertices,
             current_faces,
             long_mask,
-            unique_edges=unique_edges,
-            inverse=inverse,
-            index=region_flags,
-            return_index=True,
+            offsets,
+            n_long,
+            unique_edges,
+            inverse,
+            region_flags,
+            region_flags,
+            None,
+            True,
         )
         splits_done += n_long
 
@@ -3598,15 +3613,58 @@ def split_edges(
     # The exclusive scan both counts the split edges and assigns each one its new vertex slot, which
     # is the indexing ``split_positions`` is documented against.
     offsets, n_split = tw.array.mask_to_compact_ranks(split_mask)
+    new_vertices, new_faces, new_index = _split_ranked_edges(
+        vertices,
+        faces,
+        split_mask,
+        offsets,
+        n_split,
+        edges,
+        corner_edge,
+        carried,
+        index,
+        split_positions,
+        return_index,
+    )
+    if return_index:
+        return new_vertices, new_faces, new_index
+    return new_vertices, new_faces
+
+
+def _split_ranked_edges(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    split_mask: wp.array[wp.bool],
+    offsets: wp.array[wp.int32],
+    n_split: int,
+    edges: twt.Array2dInt32,
+    corner_edge: wp.array[wp.int32],
+    carried: wp.array[wp.int32],
+    index: wp.array[wp.int32] | None,
+    split_positions: wp.array[wp.vec3] | None,
+    return_index: bool,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Split the ranked edges: the body of [`split_edges`][triwarp.remesh.split_edges] past its scan.
+
+    ``offsets`` / ``n_split`` are ``mask_to_compact_ranks(split_mask)``; the two refinement loops
+    already hold them for their own bookkeeping, so they hand them in rather than have the scan and
+    its count readback run twice per pass. ``carried`` is the provenance to thread through
+    (``index`` or a fresh ``arange``); the no-split path copies it when it is the caller's ``index``
+    and ``return_index`` asks for it back. The provenance is always the third element;
+    ``split_edges`` drops it when not asked.
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    n_edges = int(edges.shape[0])
     if n_split == 0 or n_faces == 0:
-        if return_index:
-            # ``carried`` is still the caller's own ``index`` buffer when one was supplied, so it
-            # is copied for the same reason ``vertices`` and ``faces`` are: every return of this
-            # function is independently owned on the no-split path exactly as on the splitting one.
-            # When ``index`` was ``None`` the ``arange`` above already allocated it here.
-            owned = wp.clone(carried) if carried is index else carried
-            return wp.clone(vertices), wp.clone(faces), owned
-        return wp.clone(vertices), wp.clone(faces)
+        # ``carried`` is still the caller's own ``index`` buffer when one was supplied, so it is
+        # copied for the same reason ``vertices`` and ``faces`` are: every return is independently
+        # owned on the no-split path exactly as on the splitting one. When ``index`` was ``None``
+        # the ``arange`` already allocated it fresh.
+        owned = wp.clone(carried) if return_index and carried is index else carried
+        return wp.clone(vertices), wp.clone(faces), owned
 
     # One buffer sized for its final use: the originals in the prefix and the new vertices written
     # straight into the tail, so the face emission below resolves every index against it.
@@ -3660,10 +3718,7 @@ def split_edges(
         device=device,
     )
 
-    new_faces = out_faces.reshape(-1)
-    if return_index:
-        return new_vertices, new_faces, out_index
-    return new_vertices, new_faces
+    return new_vertices, out_faces.reshape(-1), out_index
 
 
 def _flip_region_faces(

@@ -15,6 +15,7 @@ angles into a polar coordinate system on the tangent plane.
 
 from __future__ import annotations
 
+import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -85,45 +86,10 @@ def halfedge_twins(
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
     [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
     """
-    device = faces.device
-    n_halfedges = int(faces.shape[0]) // 3 * 3
-    twins = wp.full(n_halfedges, -1, dtype=wp.int32, device=device)
-    if n_halfedges == 0:
-        return twins
-
-    # Edge rows are built from face indices, so they are non-negative and below the vertex count by
-    # construction: the range check would only add a readback. And ``n_vertices`` is the packing
-    # radix and nothing else -- no buffer here is sized by it -- so when the caller does not supply
-    # one the pair radix serves instead of inferring the tight bound, which would be a device
-    # reduction plus a host readback for a fifth of this call.
-    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
-    sorted_keys, order = tw.array.sort_and_argsort(keys)
-
-    # Slot 0 counts edge-non-manifold edges, slot 1 edges whose two halfedges run the same way;
-    # one buffer so the two rejections cost one readback between them rather than two.
-    defect_counts = wp.zeros(2, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_halfedge.pair_sorted_halfedges,
-        dim=n_halfedges,
-        inputs=[faces, sorted_keys, order, twins, defect_counts],
-        device=device,
-    )
-    if not validate:
-        return twins
-    n_nonmanifold, n_misoriented = (int(count) for count in defect_counts.numpy())
-    if n_nonmanifold > 0:
-        raise ValueError(
-            f"halfedge_twins requires an edge-manifold mesh: {n_nonmanifold} edge(s) are shared by "
-            f"three or more faces."
-        )
-    if n_misoriented > 0:
-        raise ValueError(
-            f"halfedge_twins requires a consistently wound mesh: {n_misoriented} edge(s) are "
-            f"traversed in the same direction by both of their halfedges, so those two halfedges "
-            f"are not opposites of each other. Run make_winding_consistent first; a non-orientable "
-            f"surface has no consistent winding and no halfedge twin table at all."
-        )
+    defect_counts = wp.zeros(2, dtype=wp.int32, device=faces.device)
+    twins = _pair_halfedges(faces, n_vertices, defect_counts)
+    if validate and twins.shape[0] > 0:
+        _raise_twin_defects(defect_counts.numpy())
     return twins
 
 
@@ -286,12 +252,19 @@ def vertex_one_rings(
 
     if n_vertices is None:
         n_vertices = tw.array.index_bound(faces)
+    # Slots 0-1 are the twin table's two rejections when this call derives it, slot 2 the pinch
+    # count below: one buffer, so a validated call reads all three back once rather than once for
+    # the twins and again for the rings. The twin rejections are still raised first.
+    defect_counts = wp.zeros(3, dtype=wp.int32, device=device)
+    check_twins = twins is None and validate
     if twins is None:
-        twins = halfedge_twins(faces, n_vertices=n_vertices, validate=validate)
+        twins = _pair_halfedges(faces, n_vertices, defect_counts[0:2])
 
     offsets = wp.zeros(n_vertices + 1, dtype=wp.int32, device=device)
     ring_halfedges = wp.full(n_halfedges, -1, dtype=wp.int32, device=device)
     if n_halfedges == 0 or n_vertices == 0:
+        if check_twins and n_halfedges > 0:
+            _raise_twin_defects(defect_counts.numpy())
         return ring_halfedges, offsets, wp.zeros(n_vertices, dtype=wp.bool, device=device)
 
     # One pass over the halfedges sizes the CSR and picks every vertex's two start candidates (row
@@ -315,7 +288,7 @@ def vertex_one_rings(
     # The walk resolves each vertex's start and boundary flag from the candidates itself, and
     # writes the flag for every vertex, so ``is_boundary`` needs no initial value.
     is_boundary = wp.empty(n_vertices, dtype=wp.bool, device=device)
-    incomplete = wp.zeros(1, dtype=wp.int32, device=device)
+    incomplete = defect_counts[2:3]
     wp.launch(
         kernel_halfedge.write_one_rings,
         dim=n_vertices,
@@ -324,10 +297,66 @@ def vertex_one_rings(
     )
     if not validate:
         return ring_halfedges, offsets, is_boundary
-    n_incomplete = int(read_scalar(incomplete, 0))
+    counts_np = defect_counts.numpy()
+    if check_twins:
+        _raise_twin_defects(counts_np)
+    n_incomplete = int(counts_np[2])
     if n_incomplete > 0:
         raise ValueError(
             f"vertex_one_rings requires a vertex-manifold mesh: {n_incomplete} vertex/vertices "
             f"have more than one fan of faces (a pinch point)."
         )
     return ring_halfedges, offsets, is_boundary
+
+
+def _pair_halfedges(
+    faces: wp.array[wp.int32], n_vertices: int | None, defect_counts: wp.array[wp.int32]
+) -> wp.array[wp.int32]:
+    """
+    Build the twin table, counting its two rejections into ``defect_counts`` without reading them.
+
+    ``defect_counts`` is a caller-owned, zeroed two-slot buffer, so a caller that validates more
+    than the twins (``vertex_one_rings``) can pack its own counter beside them and read all of them
+    back at once.
+    """
+    device = faces.device
+    n_halfedges = int(faces.shape[0]) // 3 * 3
+    twins = wp.full(n_halfedges, -1, dtype=wp.int32, device=device)
+    if n_halfedges == 0:
+        return twins
+
+    # Edge rows are built from face indices, so they are non-negative and below the vertex count by
+    # construction: the range check would only add a readback. And ``n_vertices`` is the packing
+    # radix and nothing else -- no buffer here is sized by it -- so when the caller does not supply
+    # one the pair radix serves instead of inferring the tight bound, which would be a device
+    # reduction plus a host readback for a fifth of this call.
+    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
+    sorted_keys, order = tw.array.sort_and_argsort(keys)
+
+    # Slot 0 counts edge-non-manifold edges, slot 1 edges whose two halfedges run the same way;
+    # one buffer so the two rejections cost one readback between them rather than two.
+    wp.launch(
+        kernel_halfedge.pair_sorted_halfedges,
+        dim=n_halfedges,
+        inputs=[faces, sorted_keys, order, twins, defect_counts],
+        device=device,
+    )
+    return twins
+
+
+def _raise_twin_defects(defect_counts: np.ndarray) -> None:
+    """Raise ``halfedge_twins``' two rejections from its read-back defect counts."""
+    n_nonmanifold, n_misoriented = (int(count) for count in defect_counts[:2])
+    if n_nonmanifold > 0:
+        raise ValueError(
+            f"halfedge_twins requires an edge-manifold mesh: {n_nonmanifold} edge(s) are shared by "
+            f"three or more faces."
+        )
+    if n_misoriented > 0:
+        raise ValueError(
+            f"halfedge_twins requires a consistently wound mesh: {n_misoriented} edge(s) are "
+            f"traversed in the same direction by both of their halfedges, so those two halfedges "
+            f"are not opposites of each other. Run make_winding_consistent first; a non-orientable "
+            f"surface has no consistent winding and no halfedge twin table at all."
+        )

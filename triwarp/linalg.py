@@ -1684,13 +1684,11 @@ class SquaredLaplacianPreconditioner:
         """Build ``M_ff`` and its transpose from ``L`` and ``D``, and fix the interval."""
         self._n = int(laplacian.nrow)
         self._device = laplacian.values.device
-        inverse_sums = wp.empty(self._n, dtype=wp.float64, device=self._device)
-        wp.map(kernel_array.inverse_or_one, weight_sums, out=inverse_sums)
         self._factor = wps.bsr_copy(laplacian)
         wp.launch(
             kernel_mg.scale_rows,
             dim=self._n,
-            inputs=[self._factor.offsets, inverse_sums, wp.float64(1.0), self._factor.values],
+            inputs=[self._factor.offsets, weight_sums, wp.float64(1.0), 1, self._factor.values],
             device=self._device,
         )
         self._factor_t = wps.bsr_transposed(self._factor)
@@ -2074,7 +2072,7 @@ def _multigrid_prolongator(
     wp.launch(
         kernel_mg.scale_rows,
         dim=n,
-        inputs=[smoothed.offsets, damped_inverse_diagonal, wp.float64(-1.0), smoothed.values],
+        inputs=[smoothed.offsets, damped_inverse_diagonal, wp.float64(-1.0), 0, smoothed.values],
         device=device,
     )
     return _multigrid_prune(wps.bsr_axpy(smoothed, tentative, alpha=1.0, beta=1.0))

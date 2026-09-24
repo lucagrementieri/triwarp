@@ -74,10 +74,12 @@ def symmetric_weight_triplets(
     out_cols: wp.array[wp.int32],
     out_vals: wp.array[wp.float64],
 ) -> None:
+    # The cotangent clamp is applied here rather than by a separate map over ``weights``: it is
+    # the identity on the unit weights, so one kernel serves both ``edge_weights`` modes.
     i = wp.int32(wp.tid())
     a = unique_edges[i, 0]
     b = unique_edges[i, 1]
-    w = wp.float64(weights[i])
+    w = wp.float64(clamp_cotan(weights[i]))
     out_rows[2 * i] = a
     out_cols[2 * i] = b
     out_vals[2 * i] = w

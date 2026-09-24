@@ -729,12 +729,12 @@ def delete_region_keep_boundary(
     # its cost grew with the *loop count* as much as with the mesh.
     n_kept = int(kept_faces.shape[0]) // 3
     # The deleted count is the face count's complement, so the region's ranks need no readback.
-    deleted_flags = wp.empty(n_faces, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_array.bool_flags, dim=n_faces, inputs=[face_mask, deleted_flags], device=device
-    )
+    # The flags are scanned in place, so they and the ranks are one buffer.
     deleted_ranks = wp.empty(n_faces, dtype=wp.int32, device=device)
-    wp.utils.array_scan(deleted_flags, out_array=deleted_ranks, inclusive=True)
+    wp.launch(
+        kernel_array.bool_flags, dim=n_faces, inputs=[face_mask, deleted_ranks], device=device
+    )
+    wp.utils.array_scan(deleted_ranks, out_array=deleted_ranks, inclusive=True)
     base = wp.uint64(int(vertices.shape[0]))
     deleted_keys = wp.empty(3 * (n_faces - n_kept), dtype=wp.uint64, device=device)
     wp.launch(

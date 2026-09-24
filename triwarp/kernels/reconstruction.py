@@ -28,7 +28,7 @@ from triwarp.kernels.predicates import (
     triangle_aspect_ratio,
     vector_angle,
 )
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, commit_sum_and_count, tile_chunk
 
 # Compile-time upper bound on the per-point fan size (neighbours kept for one center).
 # Per-thread scratch arrays are sized to this; the runtime ``max_neighbours`` must not exceed it.
@@ -70,11 +70,7 @@ def positive_finite_sum_and_count(
         if is_positive_finite(value):
             total += wp.float64(value)
             count += wp.float64(1.0)
-    block_total = wp.tile_sum(wp.tile(total))[0]
-    block_count = wp.tile_sum(wp.tile(count))[0]
-    if t == 0:
-        wp.atomic_add(out_sum_and_count, 0, block_total)
-        wp.atomic_add(out_sum_and_count, 1, block_count)
+    commit_sum_and_count(t, total, count, out_sum_and_count)
 
 
 @wp.kernel(enable_backward=False)

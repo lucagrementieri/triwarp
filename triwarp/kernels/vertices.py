@@ -37,53 +37,6 @@ def max_corner_inverse_edge_length_sq(
     return wp.float32(0.0)
 
 
-@wp.func
-def write_max_corner_weights(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    f: wp.int32,
-    scale: wp.float32,
-    out_weights: wp.array2d[wp.float32],
-) -> None:
-    # The MWSELR per-corner weight, times a caller-supplied scale. The scale is the face's cross
-    # product magnitude when the caller supplied *unit* face normals (the sine the weight divides
-    # out is then not already present in the normal) and 1 when the normals are the raw crosses.
-    base = f * wp.int32(3)
-    for c in range(3):
-        i0 = faces[base + c]
-        i1 = faces[base + (c + 1) % 3]
-        i2 = faces[base + (c + 2) % 3]
-        out_weights[f, c] = scale * max_corner_inverse_edge_length_sq(vertices, i0, i1, i2)
-
-
-@wp.kernel
-def max_vertex_normal_weights(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_weights: wp.array2d[wp.float32]
-) -> None:
-    # The supplied-unit-normals path. Deriving the normals instead goes through
-    # ``face_crosses_and_weights`` below, which forms the cross product once for both answers.
-    f = wp.int32(wp.tid())
-    write_max_corner_weights(
-        vertices, faces, f, wp.length(triangle_cross(vertices, faces, f)), out_weights
-    )
-
-
-@wp.kernel
-def face_crosses_and_weights(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    out_cross: wp.array[wp.vec3],
-    out_weights: wp.array2d[wp.float32],
-) -> None:
-    # ``face_crosses`` fused with the weight pass that followed it. Beyond the launch, the two
-    # shared ``triangle_cross``; and because the derived normals are the raw crosses rather than
-    # unit vectors, the weight needs no cross-magnitude scale at all, so the fused form computes
-    # the cross exactly once and never takes its length.
-    f = wp.int32(wp.tid())
-    out_cross[f] = triangle_cross(vertices, faces, f)
-    write_max_corner_weights(vertices, faces, f, wp.float32(1.0), out_weights)
-
-
 @wp.kernel
 def normalize_accumulated_rows(sums: wp.array2d[wp.Float], out_normals: wp.array[wp.vec3]) -> None:
     """
@@ -180,6 +133,57 @@ def scatter_angle_weighted_normals(
     add_to_face_corners(out_sums, faces, f, normal * a0, normal * a1, normal * a2)
 
 
+@wp.func
+def add_max_corner_normals(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    f: wp.int32,
+    normal: wp.vec3,
+    scale: wp.float32,
+    out_sums: wp.array2d[wp.Float],
+) -> None:
+    # ``vertex_normals(weighting="mwselr")``'s per-corner scatter: the face normal times the MWSELR
+    # corner weight times a caller-supplied scale, added corner 0 first. The scale is the face's
+    # cross product magnitude when the normal is *unit* (the sine the weight divides out is then
+    # not already in the normal) and 1 when the normal is the raw cross. Forming ``scale * weight``
+    # in float32 before the product is what the ``(n_faces, 3)`` weight table this replaced stored,
+    # so the sum is byte-identical to ``scatter_weighted_sum_vec`` over that table.
+    base = f * wp.int32(3)
+    for c in range(3):
+        i0 = faces[base + c]
+        i1 = faces[base + (c + 1) % 3]
+        i2 = faces[base + (c + 2) % 3]
+        weight = scale * max_corner_inverse_edge_length_sq(vertices, i0, i1, i2)
+        atomic_add_vec3(out_sums, i0, normal * weight)
+
+
+@wp.kernel
+def scatter_max_weighted_normals(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_sums: wp.array2d[wp.Float]
+) -> None:
+    # Nothing supplied: the raw cross product is the normal, so no scale is needed and neither a
+    # normal nor a weight table is written.
+    f = wp.int32(wp.tid())
+    add_max_corner_normals(
+        vertices, faces, f, triangle_cross(vertices, faces, f), wp.float32(1.0), out_sums
+    )
+
+
+@wp.kernel
+def scatter_max_weighted_unit_normals(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_normals: wp.array[wp.vec3],
+    out_sums: wp.array2d[wp.Float],
+) -> None:
+    # Caller-supplied unit normals; differs from ``scatter_max_weighted_normals`` only in taking
+    # the normal from the table and restoring the cross-product magnitude as the scale.
+    f = wp.int32(wp.tid())
+    add_max_corner_normals(
+        vertices, faces, f, face_normals[f], wp.length(triangle_cross(vertices, faces, f)), out_sums
+    )
+
+
 # The accumulator precision ``vertices._accumulate_and_normalize`` allocates, and the only one
 # registered: float64, so that the order the scatter's atomics pick cannot reach the answer
 # (``kernels.scatter.atomic_add_vec3`` carries the measurement). Mirrors
@@ -191,12 +195,15 @@ NORMALIZE_ACCUMULATED_ROWS: OverloadTable
 SCATTER_AREA_WEIGHTED_NORMALS: OverloadTable
 SCATTER_SCALED_NORMALS: OverloadTable
 SCATTER_ANGLE_WEIGHTED_NORMALS: OverloadTable
+SCATTER_MAX_WEIGHTED_NORMALS: OverloadTable
+SCATTER_MAX_WEIGHTED_UNIT_NORMALS: OverloadTable
 
 
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
     global NORMALIZE_ACCUMULATED_ROWS, SCATTER_AREA_WEIGHTED_NORMALS
     global SCATTER_SCALED_NORMALS, SCATTER_ANGLE_WEIGHTED_NORMALS
+    global SCATTER_MAX_WEIGHTED_NORMALS, SCATTER_MAX_WEIGHTED_UNIT_NORMALS
     NORMALIZE_ACCUMULATED_ROWS = OverloadTable(
         normalize_accumulated_rows,
         {d: [wp.array2d[d], wp.array[wp.vec3]] for d in _ACCUMULATOR_DTYPES},
@@ -207,6 +214,13 @@ def _register_overloads() -> None:
     )
     SCATTER_ANGLE_WEIGHTED_NORMALS = OverloadTable(
         scatter_angle_weighted_normals, {d: [*geometry, wp.array2d[d]] for d in _ACCUMULATOR_DTYPES}
+    )
+    SCATTER_MAX_WEIGHTED_NORMALS = OverloadTable(
+        scatter_max_weighted_normals, {d: [*geometry, wp.array2d[d]] for d in _ACCUMULATOR_DTYPES}
+    )
+    SCATTER_MAX_WEIGHTED_UNIT_NORMALS = OverloadTable(
+        scatter_max_weighted_unit_normals,
+        {d: [*geometry, wp.array[wp.vec3], wp.array2d[d]] for d in _ACCUMULATOR_DTYPES},
     )
     SCATTER_SCALED_NORMALS = OverloadTable(
         scatter_scaled_normals,

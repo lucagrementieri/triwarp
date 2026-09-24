@@ -172,6 +172,19 @@ def scatter_face_thirds(
     add_corner_triple(out_mass, faces, f, third, third, third)
 
 
+@wp.func
+def add_value_and_count(
+    vertex: wp.int32,
+    value: wp.float32,
+    out_sum: wp.array[wp.float32],
+    out_valence: wp.array[wp.float32],
+) -> None:
+    # One contribution to a per-vertex mean: the value into the sum, one into the valence. Shared
+    # by the face-valued and edge-valued averaging scatters below.
+    wp.atomic_add(out_sum, vertex, value)
+    wp.atomic_add(out_valence, vertex, wp.float32(1.0))
+
+
 @wp.kernel
 def scatter_face_values_sum_and_valence(
     faces: wp.array[wp.int32],
@@ -182,9 +195,7 @@ def scatter_face_values_sum_and_valence(
     f = wp.int32(wp.tid())
     value = face_values[f]
     for j in range(3):
-        vertex_index = faces[f * 3 + j]
-        wp.atomic_add(out_sum, vertex_index, value)
-        wp.atomic_add(out_valence, vertex_index, wp.float32(1.0))
+        add_value_and_count(faces[f * 3 + j], value, out_sum, out_valence)
 
 
 @wp.func
@@ -200,10 +211,8 @@ def accumulate_endpoint_value(
     # and differ only in where they find the endpoints and the value: one walks the *half*-edges of
     # each face (the ``igl::orient_halfedges`` convention, skipping the negatively oriented copy so
     # an interior edge is counted once), the other walks the unique-edge list directly.
-    wp.atomic_add(out_sum, vi, value)
-    wp.atomic_add(out_sum, vj, value)
-    wp.atomic_add(out_valence, vi, wp.float32(1.0))
-    wp.atomic_add(out_valence, vj, wp.float32(1.0))
+    add_value_and_count(vi, value, out_sum, out_valence)
+    add_value_and_count(vj, value, out_sum, out_valence)
 
 
 @wp.kernel

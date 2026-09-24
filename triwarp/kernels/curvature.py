@@ -6,6 +6,7 @@ from triwarp.kernels.adjacency import unshared_projection, unshared_vertex
 from triwarp.kernels.linalg import solve_normal_equations
 from triwarp.kernels.predicates import segment_aabb, unit_tangent, vector_angle
 from triwarp.kernels.tangent_space import any_perpendicular
+from triwarp.kernels.triangles import face_normals_and_area
 
 # Custom fixed-size float64 types for the 5x5 quadric-fit normal equations: the rest of the
 # kernel runs in float32, but the least-squares solve is done in float64 for conditioning.
@@ -357,7 +358,6 @@ def line_ball_intersection_segment(
 def face_pair_dihedrals(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    face_normals: wp.array[wp.vec3],
     face_adjacency: wp.array2d[wp.int32],
     face_adjacency_edges: wp.array2d[wp.int32],
     out_signed_angles: wp.array[wp.float32],
@@ -376,9 +376,15 @@ def face_pair_dihedrals(
     #
     # Folding the sign in is exact: ``accumulate_mean_curvature`` multiplies ``length * angle *
     # sign``, and scaling by ``-1`` commutes with rounding, so the product is bit-identical.
+    #
+    # The two face normals are derived here rather than read from a ``(n_faces,)`` table: with
+    # ``face_normals_and_area`` -- the body of ``triangles.face_normals_and_areas`` -- they are that
+    # table's entries bit for bit, and the wrapper then launches no normal pass and allocates no
+    # normal or (unused) area table.
     k = wp.int32(wp.tid())
-    normal_a = face_normals[face_adjacency[k, 0]]
-    angle = vector_angle(normal_a, face_normals[face_adjacency[k, 1]])
+    normal_a, _area_a = face_normals_and_area(vertices, faces, face_adjacency[k, 0])
+    normal_b, _area_b = face_normals_and_area(vertices, faces, face_adjacency[k, 1])
+    angle = vector_angle(normal_a, normal_b)
 
     e0 = face_adjacency_edges[k, 0]
     e1 = face_adjacency_edges[k, 1]

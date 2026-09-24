@@ -861,12 +861,7 @@ def _declare_map_kernels() -> None:
     here (the shared builtins are declared there).
     """
     dense = map_probe
-    declare_map_signatures(
-        [
-            (angle_defect, (dense(wp.float32),), wp.float32),
-            (angle_defect, (dense(wp.float64),), wp.float64),
-        ]
-    )
+    declare_map_signatures([(angle_defect, (dense(wp.float32),), wp.float32)])
 
 
 _declare_map_kernels()

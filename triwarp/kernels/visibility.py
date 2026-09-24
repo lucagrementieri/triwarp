@@ -182,13 +182,48 @@ def shape_diameter(
 
 
 @wp.func
-def init_sphere_radii_finite(distance: wp.float32) -> tuple[wp.float32, wp.bool, wp.bool]:
+def ray_direction(normal: wp.vec3, sign: wp.float32) -> wp.vec3:
+    # The unit ray direction ``sign * normalize(normal)``: one map where a normalize and a
+    # negation were two, and scaling by ``+-1`` is exact, so the directions are unchanged.
+    return sign * wp.normalize(normal)
+
+
+@wp.func
+def sphere_center(point: wp.vec3, normal: wp.vec3, radius: wp.float32) -> wp.vec3:
+    if wp.isinf(radius) or wp.isnan(radius):
+        return wp.vec3(wp.nan, wp.nan, wp.nan)
+    return point + normal * radius
+
+
+@wp.func
+def tangent_sphere_radius(
+    point: wp.vec3, normal: wp.vec3, touch: wp.vec3
+) -> tuple[wp.float32, wp.bool]:
+    # Radius of the sphere tangent at ``point`` (centre along ``normal``) that passes through
+    # ``touch``, and whether it exists: the shared rule of the support seed and the shrink step,
+    # which reject a vanishing denominator identically and differ only in what they keep instead.
+    diff = touch - point
+    denom = wp.float32(2.0) * wp.dot(diff, normal)
+    if wp.abs(denom) < TOLERANCE_PLANAR_CONSTANT:
+        return wp.float32(0.0), False
+    return wp.length_sq(diff) / denom, True
+
+
+@wp.func
+def init_sphere_radii_finite(
+    distance: wp.float32, point: wp.vec3, direction: wp.vec3
+) -> tuple[wp.float32, wp.bool, wp.bool, wp.vec3]:
     # Finite longest-ray hits initialise directly; escaped rays (inf distance) are deferred to
     # the tiled support-point passes below. Their slots default to the "no valid support"
-    # outcome so an empty support subset needs no fix-up.
+    # outcome so an empty support subset needs no fix-up. The initial centre is written here, at
+    # the radius just chosen, and the support pass rewrites it for the slots it resolves -- so no
+    # separate ``sphere_center`` map over the whole array is needed.
+    radius = wp.float32(wp.inf)
+    finite = wp.bool(False)
     if not wp.isinf(distance):
-        return distance * wp.float32(0.5), True, False
-    return wp.inf, False, True
+        radius = distance * wp.float32(0.5)
+        finite = True
+    return radius, finite, not finite, sphere_center(point, direction, radius)
 
 
 @wp.func
@@ -257,48 +292,40 @@ def init_sphere_radii_support(
     packed_support: wp.array[wp.uint64],
     out_radii: wp.array[wp.float32],
     out_not_converged: wp.array[wp.bool],
+    out_centers: wp.array[wp.vec3],
 ) -> None:
     # Tail pass over the deferred subset: decode the support point and derive the
     # tangent-sphere radius, scattering it back into the full arrays.
     q = wp.int32(wp.tid())
     tid = support_indices[q]
     packed = packed_support[q]
+    p = points[tid]
+    n = normals[tid]
     if packed == wp.uint64(0):
         out_radii[tid] = wp.inf
         out_not_converged[tid] = False
+        out_centers[tid] = sphere_center(p, n, wp.inf)
         return
 
-    p = points[tid]
-    n = normals[tid]
     best = wp.int32(~wp.uint32(packed & wp.uint64(0xFFFFFFFF)))
     max_proj = wp.dot(mesh_vertices[best], n) - wp.dot(p, n)
 
     if max_proj < TOLERANCE_PLANAR_CONSTANT:
         out_radii[tid] = wp.inf
         out_not_converged[tid] = False
+        out_centers[tid] = sphere_center(p, n, wp.inf)
         return
 
-    diff = mesh_vertices[best] - p
-    denom = wp.float32(2.0) * wp.dot(diff, n)
     # `denom` is algebraically `2 * max_proj` (both are `2 * dot(mesh_vertices[best] - p, n)`), so
     # this guard looks redundant against the one above -- it is not, on float32: the two are
     # computed by differently-associated expressions (`dot(a, n) - dot(b, n)` above,
     # `dot(a - b, n)` here), so they can disagree by a rounding error the `max_proj` check already
     # cleared. Keep both; do not "simplify" by reusing `max_proj` in place of `denom`.
-    if wp.abs(denom) < TOLERANCE_PLANAR_CONSTANT:
-        out_radii[tid] = wp.inf
-        out_not_converged[tid] = False
-        return
-
-    out_radii[tid] = wp.length_sq(diff) / denom
-    out_not_converged[tid] = True
-
-
-@wp.func
-def sphere_center(point: wp.vec3, normal: wp.vec3, radius: wp.float32) -> wp.vec3:
-    if wp.isinf(radius) or wp.isnan(radius):
-        return wp.vec3(wp.nan, wp.nan, wp.nan)
-    return point + normal * radius
+    radius, found = tangent_sphere_radius(p, n, mesh_vertices[best])
+    radius = wp.where(found, radius, wp.float32(wp.inf))
+    out_radii[tid] = radius
+    out_not_converged[tid] = found
+    out_centers[tid] = sphere_center(p, n, radius)
 
 
 @wp.kernel
@@ -311,9 +338,11 @@ def step_sphere_shrink(
     max_t: wp.float32,
     convergence_threshold: wp.float32,
     not_converged: wp.array[wp.bool],
+    round_slot: wp.int32,
     out_radii: wp.array[wp.float32],
     out_centers: wp.array[wp.vec3],
     out_not_converged: wp.array[wp.bool],
+    out_n_not_converged: wp.array[wp.int32],
 ) -> None:
     # Every lane writes all three outputs (converged lanes pass their state through), so the
     # wrapper can ping-pong two preallocated buffer sets instead of cloning per iteration, and
@@ -344,15 +373,18 @@ def step_sphere_shrink(
         out_not_converged[tid] = False
         return
 
-    diff = nearest - p
-    denom = wp.float32(2.0) * wp.dot(diff, normals[tid])
-    if wp.abs(denom) < TOLERANCE_PLANAR_CONSTANT:
+    new_r, found = tangent_sphere_radius(p, normals[tid], nearest)
+    if not found:
         out_radii[tid] = old_radii[tid]
         out_centers[tid] = center
         out_not_converged[tid] = False
         return
 
-    new_r = wp.length_sq(diff) / denom
     out_radii[tid] = new_r
     out_centers[tid] = p + normals[tid] * new_r
-    out_not_converged[tid] = old_radii[tid] - new_r >= convergence_threshold
+    still_shrinking = old_radii[tid] - new_r >= convergence_threshold
+    out_not_converged[tid] = still_shrinking
+    # The next round's convergence count, taken by the kernel that decides it rather than by a
+    # reduction launch over ``out_not_converged`` in the wrapper's loop.
+    if still_shrinking:
+        wp.atomic_add(out_n_not_converged, round_slot, wp.int32(1))

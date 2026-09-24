@@ -615,14 +615,13 @@ def successor_cycles(
     # appeared in the input. Excluding a chain's nodes here keeps that collision scoped to the
     # malformed input the Notes above already describe (an in-degree collision), rather than
     # firing on an ordinary chain.
-    keep_mask = wp.empty(n_nodes, dtype=wp.int32, device=device)
     wp.launch(
         kernel_graph.chain_node_mask,
         dim=n_nodes,
-        inputs=[cycle_nodes, labels, is_chain, keep_mask],
+        inputs=[cycle_nodes, labels, is_chain, node_mask],
         device=device,
     )
-    cycle_nodes = tw.array.gather(cycle_nodes, tw.array.flatnonzero(keep_mask))
+    cycle_nodes = tw.array.flatnonzero(node_mask)
     n_nodes = int(cycle_nodes.shape[0])
     if n_nodes == 0:
         return (
@@ -655,18 +654,24 @@ def successor_cycles(
         steps, steps_next = steps_next, steps
 
     position = wp.empty(n_nodes, dtype=wp.int32, device=device)
-    node_labels = wp.empty(n_nodes, dtype=wp.int32, device=device)
+    label_mask = wp.zeros(node_count, dtype=wp.bool, device=device)
     wp.launch(
         kernel_graph.finalize_rank_positions,
         dim=n_nodes,
-        inputs=[cycle_nodes, labels, label_count, steps, position, node_labels],
+        inputs=[cycle_nodes, labels, label_count, steps, position, label_mask],
         device=device,
     )
 
-    unique_labels, cycle_index = tw.grouping.unique_1d(node_labels, return_inverse=True)
-    n_cycles = int(unique_labels.shape[0])
-
-    cycle_sizes = tw.array.gather(label_count, unique_labels)
+    # The cycles are grouped by label, and a label is a node index, so the mask's compact ranks
+    # number them in ascending label order -- the order ``unique_1d`` over the labels gave.
+    label_ranks, n_cycles = tw.array.mask_to_compact_ranks(label_mask)
+    cycle_sizes = wp.empty(n_cycles, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_graph.compact_cycle_sizes,
+        dim=node_count,
+        inputs=[label_mask, label_ranks, label_count, cycle_sizes],
+        device=device,
+    )
     offsets = wp.empty(n_cycles, dtype=wp.int32, device=device)
     wp.utils.array_scan(cycle_sizes, out_array=offsets, inclusive=False)
 
@@ -676,7 +681,7 @@ def successor_cycles(
     wp.launch(
         kernel_graph.scatter_cycle_slot,
         dim=n_nodes,
-        inputs=[cycle_nodes, cycle_index, position, offsets, flat_cycles],
+        inputs=[cycle_nodes, labels, label_ranks, position, offsets, flat_cycles],
         device=device,
     )
 

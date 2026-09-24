@@ -40,6 +40,8 @@ strength test's ``sqrt(|A_ii|)`` is ``array.sqrt_abs`` over the same diagonal.
 
 import warp as wp
 
+from triwarp.kernels.array import inverse_or_one
+
 # Node states for the distance-2 maximal independent set. The encoding is ordered rather than
 # arbitrary: a root must win any maximum (it vetoes every node in its two-hop ball) and an excluded
 # node must lose to every undecided one (it can no longer veto anything).
@@ -232,13 +234,17 @@ def scale_rows(
     offsets: wp.array[wp.int32],
     row_scale: wp.array[wp.float64],
     factor: wp.float64,
+    invert: wp.int32,
     values: wp.array[wp.float64],
 ) -> None:
     # Row-scale a matrix in place: the prolongation smoother needs ``-w D^-1 (A P0)``, and scaling
     # the product's values is one pass where ``bsr_mm`` against a diagonal matrix would be another
-    # sparse product. ``values`` is both the input and the result.
+    # sparse product. ``values`` is both the input and the result. A nonzero ``invert`` (warp
+    # uniform) scales by ``inverse_or_one(row_scale[i])`` instead, so a caller holding ``D`` rather
+    # than ``D^-1`` (``linalg.squared_laplacian_preconditioner``) needs no map and no buffer first.
     i = wp.int32(wp.tid())
-    scale = factor * row_scale[i]
+    raw = row_scale[i]
+    scale = factor * wp.where(invert != 0, inverse_or_one(raw), raw)
     for k in range(offsets[i], offsets[i + 1]):
         values[k] = values[k] * scale
 

@@ -1262,3 +1262,28 @@ def test_require_same_device_flags_a_mismatch_and_ignores_none(device: str) -> N
         tw._device.require_same_device(a=a_wp, c=c_wp)
     with pytest.raises(RuntimeError, match=r"'loops\[0\]' is on .+ while 'loops\[1\]' is on"):
         tw._device.require_same_device(loops=[a_wp, c_wp])
+
+
+@pytest.mark.parametrize("sizes", [(3, 0, 5, 1), (4,), (0, 0, 2)])
+def test_segment_owner_labels_total_matches_terminated(device, sizes):
+    """
+    Not a library comparison: pins the unterminated kernel to ``numpy.repeat`` of the labels.
+
+    ``segment_owner_labels_total`` takes the exclusive scan without its terminator plus the total
+    as a scalar; the answer must be the same owner array the terminated kernel writes, including
+    empty segments and an empty trailing segment.
+    """
+    from triwarp.kernels import array as kernel_array
+
+    sizes_np = np.asarray(sizes, dtype=np.int32)
+    total = int(sizes_np.sum())
+    offsets_np = np.concatenate([[0], np.cumsum(sizes_np)[:-1]]).astype(np.int32)
+    offsets_wp = wp.array(offsets_np, dtype=wp.int32, device=device)
+    owner_wp = wp.full(total, -1, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_array.segment_owner_labels_total,
+        dim=len(sizes),
+        inputs=[offsets_wp, wp.int32(total), owner_wp],
+        device=device,
+    )
+    assert np.array_equal(owner_wp.numpy(), np.repeat(np.arange(len(sizes)), sizes_np))

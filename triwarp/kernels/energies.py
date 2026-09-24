@@ -1,8 +1,9 @@
 import warp as wp
 
-from triwarp.kernels.array import OverloadTable, declare_map_signatures, map_probe, to_vec3d
+from triwarp.kernels.array import OverloadTable, to_vec3d
 from triwarp.kernels.halfedge import halfedge_endpoints
 from triwarp.kernels.predicates import (
+    angle_defect,
     corner_cosines_from_l2,
     squared_edge_lengths,
     triangle_double_area,
@@ -32,12 +33,20 @@ def squared_deviation(value: wp.Float, target: wp.Float) -> wp.Float:
 def reciprocal_scaled_or_zero(value: wp.Float, numerator: wp.Float) -> wp.Float:
     # ``numerator / value``, with the ``reciprocal_or_zero`` convention above for a non-positive
     # denominator: a vertex whose lumped area is zero contributes nothing rather than an infinity.
-    # Reached at two ``wp.map`` signatures -- a float32 array against a float32 scalar
-    # (``laplacian_smoothing_loss``) and a float64 array against a float64 array
-    # (``curved_hessian_energy``'s ``kappa / angle_sums``) -- both declared below.
+    # Reached through ``wp.map`` by ``laplacian_smoothing_loss`` (a float32 array against a float32
+    # scalar) and inlined by ``scaled_angle_defect`` below.
     if value > type(value)(0.0):
         return numerator / value
     return type(value)(0.0)
+
+
+@wp.func
+def scaled_angle_defect(angle_sum: wp.float64) -> wp.float64:
+    # ``angle_defect / angle_sum``, zeroed for a non-positive angle sum --
+    # igl::cr_vector_curvature_correction's kappa scaling. One map where the defect and its
+    # scaling took two and an intermediate buffer; ``curved_hessian_energy`` zeroes the boundary
+    # afterwards, which gives the same zero the defect-then-scale order did.
+    return reciprocal_scaled_or_zero(angle_sum, angle_defect(angle_sum))
 
 
 @wp.func
@@ -272,12 +281,19 @@ def zero_at_indices(indices: wp.array[wp.int32], out_values: wp.array[wp.Float])
 
 @wp.kernel
 def hessian_energy_counts(
-    vf_offsets: wp.array[wp.int32], inv_mass: wp.array[wp.float64], out_counts: wp.array[wp.int32]
+    vf_offsets: wp.array[wp.int32],
+    mass: wp.array[wp.float64],
+    out_inverse_mass: wp.array[wp.float64],
+    out_counts: wp.array[wp.int32],
 ) -> None:
     # Vertex ``k`` couples every ordered pair of its incident faces, 3 x 3 corners each; a killed
-    # degree of freedom (boundary vertex) emits nothing.
+    # degree of freedom (boundary vertex, zeroed mass) emits nothing. The mass inversion rides in
+    # the same launch: the gate reads the inverse it has just written, which is the value
+    # ``hessian_energy_triplets`` gates on.
     k = wp.int32(wp.tid())
-    if inv_mass[k] > wp.float64(0.0):
+    inverse = reciprocal_or_zero(mass[k])
+    out_inverse_mass[k] = inverse
+    if inverse > wp.float64(0.0):
         degree = vf_offsets[k + 1] - vf_offsets[k]
         out_counts[k] = 9 * degree * degree
     else:
@@ -699,27 +715,6 @@ def vector_area_triplets(
     out_rows[base + 3] = j + n_vertices
     out_cols[base + 3] = i
     out_vals[base + 3] = q
-
-
-def _declare_map_kernels() -> None:
-    """
-    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not two.
-
-    See ``kernels/array.py::declare_map_signatures`` for why this exists and what forks a
-    ``wp.map`` module. ``reciprocal_scaled_or_zero`` is reached at two signatures:
-    ``laplacian_smoothing_loss``'s float32 array against a float32 scalar, and
-    ``curved_hessian_energy``'s float64 array against a float64 array.
-    """
-    dense = map_probe
-    declare_map_signatures(
-        [
-            (reciprocal_scaled_or_zero, (dense(wp.float32), wp.float32(1)), wp.float32),
-            (reciprocal_scaled_or_zero, (dense(wp.float64), dense(wp.float64)), wp.float64),
-        ]
-    )
-
-
-_declare_map_kernels()
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in

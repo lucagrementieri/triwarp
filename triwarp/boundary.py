@@ -871,26 +871,20 @@ def _loop_owner_labels(
     The list form builds the same labels on the host with ``numpy.repeat``, because it already has
     the sizes there; the packed form does not, and reading them back to reuse that path would cost
     a synchronization this saves. So the two forms build ``loop_id`` differently on purpose, and
-    each is the cheaper one for the inputs it has. ``segment_owner_labels`` wants
-    *total-terminated* offsets and ``boundary_loops_batched`` does not return them, but the total
-    is ``flat_loops.shape[0]`` -- known on the host -- so the terminator comes from the allocation
-    rather than from a readback.
+    each is the cheaper one for the inputs it has. ``boundary_loops_batched`` returns unterminated
+    offsets, and the total is ``flat_loops.shape[0]`` -- known on the host -- so it is passed as a
+    scalar to ``segment_owner_labels_total`` rather than appended to a copy of the offsets.
     """
     n_loops = int(loop_sizes.shape[0])
     device = flat_loops.device
     loop_id = wp.empty(int(flat_loops.shape[0]), dtype=wp.int32, device=device)
     if n_loops == 0:
         return loop_id
-    # There is no Python-scope scalar *write* to pair with ``_device.read_scalar``, and there cannot
-    # usefully be one: ``arr[k] = v`` raises ``TypeError`` on a ``wp.array`` (both devices,
-    # Warp 1.17) and the slice spelling ``arr[k : k + 1].fill_(v)`` is already the primitive such a
-    # helper would wrap. What the site actually wanted was not to write the terminator separately:
-    # allocating the buffer *holding* it makes the copy below overwrite the head and leaves the
-    # last slot correct, so the slice view and its fill both go away.
-    terminated = wp.full(n_loops + 1, int(flat_loops.shape[0]), dtype=wp.int32, device=device)
-    wp.copy(terminated[:n_loops], offsets)
     wp.launch(
-        kernel_array.segment_owner_labels, dim=n_loops, inputs=[terminated, loop_id], device=device
+        kernel_array.segment_owner_labels_total,
+        dim=n_loops,
+        inputs=[offsets, wp.int32(int(flat_loops.shape[0])), loop_id],
+        device=device,
     )
     return loop_id
 

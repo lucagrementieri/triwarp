@@ -66,6 +66,7 @@ from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import smoothing as kernel_smoothing
 from triwarp.kernels import triangles as kernel_triangles
+from triwarp.kernels.algorithms import multigrid as kernel_mg
 from triwarp.triangles import face_normals_and_areas
 from triwarp.vertices import mean_vertex_normals
 
@@ -2012,9 +2013,9 @@ def _solve_region_smooth(
     square_rows = wp.full(size, n_free, dtype=wp.int32, device=device)
     square_vals = wp.zeros(size, dtype=wp.float64, device=device)
     weight_sums = wp.full(n_free, 1.0, dtype=wp.float64, device=device)
-    rhs_x = wp.zeros(n_rows, dtype=wp.float64, device=device)
-    rhs_y = wp.zeros(n_rows, dtype=wp.float64, device=device)
-    rhs_z = wp.zeros(n_rows, dtype=wp.float64, device=device)
+    # One ``(3, n_rows)`` right-hand side, so ``M^T b`` below is one batched mat-vec. Every row has
+    # exactly one vertex, which writes all three of its components, so nothing needs zeroing.
+    rhs = wp.empty((3, n_rows), dtype=wp.float64, device=device)
     wp.launch(
         kernel_smoothing.laplacian_ls_triplets,
         dim=n,
@@ -2033,9 +2034,9 @@ def _solve_region_smooth(
             square_rows,
             square_vals,
             weight_sums,
-            rhs_x,
-            rhs_y,
-            rhs_z,
+            rhs[0],
+            rhs[1],
+            rhs[2],
         ],
         device=device,
     )
@@ -2059,10 +2060,28 @@ def _solve_region_smooth(
     m_matrix = wps.bsr_from_triplets(n_rows, n_free, rows, cols, vals, prune_numerical_zeros=False)
     mt_matrix = wps.bsr_transposed(m_matrix)
     system = wps.bsr_mm(mt_matrix, m_matrix)
-    # A^T b straight into the rows of one contiguous buffer, so the three columns batch.
-    atb = wp.zeros((3, n_free), dtype=wp.float64, device=device)
-    for column, component in enumerate((rhs_x, rhs_y, rhs_z)):
-        wps.bsr_mv(mt_matrix, component, atb[column], alpha=1.0, beta=0.0)
+    # A^T b straight into the rows of one contiguous buffer, so the three columns batch -- and are
+    # formed by one launch over all three rather than a ``bsr_mv`` per column. The kernel reads the
+    # row bounds off ``offsets`` alone, so ``mt_matrix``'s stale ``nnz`` is never consulted, and it
+    # writes every slot, so the buffer needs no zeroing.
+    atb = wp.empty((3, n_free), dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_mg.csr_matvec,
+        dim=3 * n_free,
+        inputs=[
+            wp.int32(n_free),
+            wp.int32(n_rows),
+            wp.int32(n_free),
+            wp.int32(0),
+            wp.float64(1.0),
+            mt_matrix.offsets,
+            mt_matrix.columns,
+            mt_matrix.values,
+            rhs.flatten(),
+        ],
+        outputs=[atb.flatten()],
+        device=device,
+    )
     sol = _free_positions(vertices, free_mask, free_map, n_free)
     # The normal equations here are the worst-conditioned system this package solves: squared,
     # fourth order, so neither Jacobi nor a hierarchy built on ``M^T M`` itself gets near the
@@ -2129,17 +2148,16 @@ def _edge_weight_matrix(
     n = int(vertices.shape[0])
     unique_edges, inverse = region.unique_edges, region.inverse
     m = int(unique_edges.shape[0])
-    weights = wp.zeros(m, dtype=wp.float32, device=device)
     if edge_weights == "unit":
-        weights.fill_(1.0)
+        weights = wp.full(m, 1.0, dtype=wp.float32, device=device)
     elif edge_weights == "cotan":
+        weights = wp.zeros(m, dtype=wp.float32, device=device)
         wp.launch(
             kernel_smoothing.edge_cotan_add,
             dim=int(faces.shape[0]) // 3,
             inputs=[vertices, faces, inverse, weights],
             device=device,
         )
-        wp.map(kernel_smoothing.clamp_cotan, weights, out=weights)
     else:
         raise ValueError(f"edge_weights must be 'unit' or 'cotan', got {edge_weights!r}")
     rows, cols, vals = tw.array.triplet_buffers(2 * m, wp.float64, device)

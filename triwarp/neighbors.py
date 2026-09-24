@@ -1613,20 +1613,34 @@ def geodesic_ball(
     queue_pool = wp.empty(
         (chunk, kernel_bfs._PER_SOURCE_MAX_NEIGHBORS), dtype=wp.int32, device=device
     )
-    visited_pool = wp.empty(
-        (chunk, kernel_bfs._VISITED_HASH_CAPACITY), dtype=wp.int32, device=device
+    visited_pool = wp.full(
+        (chunk, kernel_bfs._VISITED_HASH_CAPACITY), -1, dtype=wp.int32, device=device
     )
     ext_dist_pool = twt.empty_2d((chunk, kernel_bfs._EXTRAS_CAPACITY), wp.float32, device=device)
     ext_idx_pool = twt.empty_2d((chunk, kernel_bfs._EXTRAS_CAPACITY), wp.int32, device=device)
 
     overflow = wp.zeros(1, dtype=wp.int32, device=device)
     counts = wp.empty(n, dtype=wp.int32, device=device)
-    local_offsets = wp.empty(chunk, dtype=wp.int32, device=device)
-    chunk_total_buf = wp.empty(1, dtype=wp.int32, device=device)
+    # CSR row bounds in the length-``n + 1`` form. The leading zero from ``wp.zeros`` is the first
+    # exclusive offset and the inclusive scan fills the rest, so ``offsets[n]`` holds the total --
+    # ``array.counts_to_offsets``' convention, open-coded here because that helper reads the total
+    # back to the host and no caller here wants it. The terminator belongs at this producer rather
+    # than in each consumer's kernel: both of them read ``offsets[i + 1]`` as the row end.
+    offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
+    single_chunk = n <= chunk
+    # With one chunk the global scan *is* the chunk's: its prefix is the exclusive offsets and its
+    # terminator the total, so no chunk-local scan or total buffer is needed.
+    chunk_total_buf: wp.array[wp.int32] | None = None
+    if single_chunk:
+        local_offsets = twt.as_dense(offsets[:n])
+    else:
+        local_offsets = wp.empty(chunk, dtype=wp.int32, device=device)
+        chunk_total_buf = wp.empty(1, dtype=wp.int32, device=device)
     chunk_flats: list[wp.array[wp.int32]] = []
     for start in range(0, n, chunk):
         m = min(chunk, n - start)
-        visited_pool.fill_(-1)
+        if start > 0:
+            visited_pool.fill_(-1)
         wp.launch(
             kernel_neighbors.query_geodesic_ball_collect,
             dim=m,
@@ -1649,11 +1663,20 @@ def geodesic_ball(
         # Gather this chunk's queue rows before the next chunk reuses the pools: chunk-local
         # exclusive scan of counts, one 4-byte readback for the chunk total, then a coalesced
         # 2D copy into the chunk's flat buffer.
-        wp.utils.array_scan(counts[start : start + m], out_array=local_offsets[:m], inclusive=False)
-        wp.map(
-            wp.add, local_offsets[m - 1 : m], counts[start + m - 1 : start + m], out=chunk_total_buf
-        )
-        chunk_total = int(read_scalar(chunk_total_buf, 0))
+        if chunk_total_buf is None:
+            wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
+            chunk_total = int(read_scalar(offsets, n))
+        else:
+            wp.utils.array_scan(
+                counts[start : start + m], out_array=local_offsets[:m], inclusive=False
+            )
+            wp.map(
+                wp.add,
+                local_offsets[m - 1 : m],
+                counts[start + m - 1 : start + m],
+                out=chunk_total_buf,
+            )
+            chunk_total = int(read_scalar(chunk_total_buf, 0))
         flat_chunk = wp.empty(chunk_total, dtype=wp.int32, device=device)
         if chunk_total > 0:
             wp.launch(
@@ -1672,17 +1695,11 @@ def geodesic_ball(
             stacklevel=2,
         )
 
-    # CSR row bounds in the length-``n + 1`` form. The leading zero from ``wp.zeros`` is the first
-    # exclusive offset and the inclusive scan fills the rest, so ``offsets[n]`` holds the total --
-    # ``array.counts_to_offsets``' convention, open-coded here because that helper reads the total
-    # back to the host and no caller here wants it. The terminator belongs at this producer rather
-    # than in each consumer's kernel: both of them read ``offsets[i + 1]`` as the row end.
-    offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
-    wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
-
-    if len(chunk_flats) == 1:
+    if single_chunk:
         # Single chunk (n <= chunk): the chunk buffer already is the global CSR neighbor buffer.
         return chunk_flats[0], offsets, reference_neighbors
+
+    wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
 
     # Chunk order equals ascending source order, so concatenation lines up with the global scan.
     # Same per-segment ``wp.copy`` loop either way -- that is the packing floor -- one call for it.

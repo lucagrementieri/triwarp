@@ -315,11 +315,18 @@ def closest_point_on_edges(
             device=device,
         )
         bvh = tw.neighbors.bvh_from_bounds(lower, upper)
-    if max_dist is None:
-        max_dist = tw.bounds.enclosing_diagonal(vertices, queries)
     # The scene box bounds each query's *complete* search radius, so a query outside the geometry
     # still terminates exactly rather than growing to ``max_dist``.
     min_bound, max_bound = tw.bounds.aabb(vertices)
+    if max_dist is None:
+        # ``enclosing_diagonal(vertices, queries)`` from the scene box already in hand plus the
+        # queries' own box: one reduction of ``vertices`` rather than two. The union and the norm
+        # are taken in float32 NumPy, exactly as ``enclosing_diagonal`` takes them, so the radius
+        # is the same float.
+        query_lower, query_upper = tw.bounds.aabb(queries)
+        union_lower = np.minimum(np.array(min_bound, np.float32), np.array(query_lower, np.float32))
+        union_upper = np.maximum(np.array(max_bound, np.float32), np.array(query_upper, np.float32))
+        max_dist = float(np.linalg.norm(union_upper - union_lower))
 
     out_closest = wp.empty(m, dtype=wp.vec3, device=device)
     out_distance = wp.empty(m, dtype=wp.float32, device=device)

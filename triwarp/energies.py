@@ -53,7 +53,6 @@ import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
 from triwarp.edges import edges_unique, edges_unique_length
 from triwarp.kernels import energies as kernel_energies
-from triwarp.kernels import predicates as kernel_predicates
 from triwarp.laplacian import cotmatrix, cotmatrix_entries, mass_matrix_entries
 
 
@@ -487,18 +486,20 @@ def hessian_energy(
         inputs=[vertices, faces, gradients, areas, mass],
         device=device,
     )
-    inverse_mass = _interior_inverse(vertices, faces, mass)
+    # The mass diagonal is defined only at interior vertices; the count kernel below inverts it.
+    _zero_at_boundary(vertices, faces, mass)
 
     vf_indices, vf_offsets = (
         vertex_faces
         if vertex_faces is not None
         else tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
     )
+    inverse_mass = wp.empty(n_vertices, dtype=wp.float64, device=device)
     counts = wp.empty(n_vertices, dtype=wp.int32, device=device)
     wp.launch(
         kernel_energies.hessian_energy_counts,
         dim=n_vertices,
-        inputs=[vf_offsets, inverse_mass, counts],
+        inputs=[vf_offsets, mass, inverse_mass, counts],
         device=device,
     )
     # Host readback: only the device knows the scan total, and it sizes the triplet buffers.
@@ -526,17 +527,6 @@ def hessian_energy(
     return wps.bsr_from_triplets(
         n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
     )
-
-
-def _interior_inverse(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], mass: wp.array[wp.float64]
-) -> wp.array[wp.float64]:
-    """Invert a mass diagonal, first zeroing (in place) its boundary degrees of freedom."""
-    device = mass.device
-    _zero_at_boundary(vertices, faces, mass)
-    inverse_mass = wp.empty(int(mass.shape[0]), dtype=wp.float64, device=device)
-    wp.map(kernel_energies.reciprocal_or_zero, mass, out=inverse_mass)
-    return inverse_mass
 
 
 def curved_hessian_energy(
@@ -618,15 +608,12 @@ def curved_hessian_energy(
         inputs=[vertices, faces, angles, angle_sums],
         device=device,
     )
-    # Angle defect, zeroed on the boundary (curvature is only corrected at interior vertices),
-    # weighted by the actual angle sum -- igl::cr_vector_curvature_correction's kappa scaling.
-    kappa = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.map(kernel_predicates.angle_defect, angle_sums, out=kappa)
-    _zero_at_boundary(vertices, faces, kappa)
+    # ``angle_defect / angle_sum``, zeroed on the boundary (curvature is only corrected at interior
+    # vertices) and for a non-positive angle sum -- igl::cr_vector_curvature_correction's kappa
+    # scaling.
     scaled_kappa = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    # ``kappa / angle_sums``, zeroed instead of dividing by a non-positive angle sum --
-    # ``reciprocal_scaled_or_zero(value, numerator)`` takes the denominator first.
-    wp.map(kernel_energies.reciprocal_scaled_or_zero, angle_sums, kappa, out=scaled_kappa)
+    wp.map(kernel_energies.scaled_angle_defect, angle_sums, out=scaled_kappa)
+    _zero_at_boundary(vertices, faces, scaled_kappa)
 
     mass = _cr_mass_diagonal(vertices, faces, inverse, n_edges, wp.float64)
     inverse_mass = wp.empty(n_edges, dtype=wp.float64, device=device)

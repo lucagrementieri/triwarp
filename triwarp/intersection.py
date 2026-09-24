@@ -535,6 +535,60 @@ def _colliding_face_pairs(
     ValueError
         If ``max_triangle_collisions`` is less than 1.
     """
+    candidates = _candidate_face_pairs(
+        vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, caller
+    )
+    if candidates is None:
+        return None
+    pairs, query_vertices, query_faces, target_vertices, target_faces, swapped = candidates
+    device = pairs.device
+    n_pairs = int(pairs.shape[0])
+    valid = wp.empty(n_pairs, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_intersections.filter_intersecting_pairs,
+        dim=n_pairs,
+        inputs=[query_vertices, query_faces, target_vertices, target_faces, pairs, valid],
+        device=device,
+    )
+
+    hit_pair_indices = tw.array.flatnonzero(valid)
+    if int(hit_pair_indices.shape[0]) == 0:
+        return None
+    hit_pairs = twt.as_array2d(tw.array.gather(pairs, hit_pair_indices), wp.int32)
+    return hit_pairs, query_vertices, query_faces, target_vertices, target_faces, swapped
+
+
+def _candidate_face_pairs(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    max_triangle_collisions: int,
+    caller: str,
+) -> (
+    tuple[
+        twt.Array2dInt32,
+        wp.array[wp.vec3],
+        wp.array[wp.int32],
+        wp.array[wp.vec3],
+        wp.array[wp.int32],
+        bool,
+    ]
+    | None
+):
+    """
+    Broad phase alone for two meshes: every candidate ``(query, target)`` pair, or ``None``.
+
+    The first half of ``_colliding_face_pairs``, with the same return layout and the same
+    query/target rule, but unfiltered.
+    [`collision_masks`][triwarp.intersection.collision_masks] takes it directly and runs the narrow
+    phase in the kernel that marks its masks, so it never compacts the survivors into a pair list.
+
+    Raises
+    ------
+    ValueError
+        If ``max_triangle_collisions`` is less than 1.
+    """
     # Before the empty-mesh early return, not after: the three public callers all document this
     # unconditionally ("Raises: ValueError if max_triangle_collisions is less than 1"), and an empty
     # mesh plus an invalid cap must not silently return `None` instead.
@@ -582,20 +636,7 @@ def _colliding_face_pairs(
         inputs=[offsets, hit_counts, target_indices, pairs],
         device=device,
     )
-
-    valid = wp.empty(n_pairs, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_intersections.filter_intersecting_pairs,
-        dim=n_pairs,
-        inputs=[query_vertices, query_faces, target_vertices, target_faces, pairs, valid],
-        device=device,
-    )
-
-    hit_pair_indices = tw.array.flatnonzero(valid)
-    if int(hit_pair_indices.shape[0]) == 0:
-        return None
-    hit_pairs = twt.as_array2d(tw.array.gather(pairs, hit_pair_indices), wp.int32)
-    return hit_pairs, query_vertices, query_faces, target_vertices, target_faces, swapped
+    return pairs, query_vertices, query_faces, target_vertices, target_faces, swapped
 
 
 def mesh_collision_pairs(
@@ -736,17 +777,31 @@ def collision_masks(
     mask_a = wp.zeros(n_faces_a, dtype=wp.bool, device=device)
     mask_b = wp.zeros(n_faces_b, dtype=wp.bool, device=device)
 
-    pairs = mesh_collision_pairs(
-        vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions=max_triangle_collisions
+    # The narrow phase runs inside the marking kernel, over the unfiltered candidates: the masks
+    # need no compacted pair list, so the verdict buffer, its compaction and readback, the gather
+    # and the column swap ``mesh_collision_pairs`` pays for are all skipped. The candidate columns
+    # are ``(query, target)``, so ``swapped`` only decides which mask is which.
+    candidates = _candidate_face_pairs(
+        vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, "mesh_collision_pairs"
     )
-    n_pairs = int(pairs.shape[0])
-    if n_pairs > 0:
-        wp.launch(
-            kernel_intersections.mark_pair_masks,
-            dim=n_pairs,
-            inputs=[pairs, mask_a, mask_b],
-            device=device,
-        )
+    if candidates is None:
+        return mask_a, mask_b
+    pairs, query_vertices, query_faces, target_vertices, target_faces, swapped = candidates
+    mask_query, mask_target = (mask_b, mask_a) if swapped else (mask_a, mask_b)
+    wp.launch(
+        kernel_intersections.mark_intersecting_pair_masks,
+        dim=int(pairs.shape[0]),
+        inputs=[
+            query_vertices,
+            query_faces,
+            target_vertices,
+            target_faces,
+            pairs,
+            mask_query,
+            mask_target,
+        ],
+        device=device,
+    )
     return mask_a, mask_b
 
 

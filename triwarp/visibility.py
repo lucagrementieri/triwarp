@@ -40,7 +40,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_same_device
+from triwarp._device import read_scalar, require_same_device
 from triwarp.bounds import enclosing_diagonal
 from triwarp.kernels import visibility as kernel_visibility
 from triwarp.proximity import ITEMS_PER_QUERY_SLICE, normals_at_closest_faces
@@ -527,9 +527,11 @@ def max_tangent_sphere(
     # `step_sphere_shrink`'s own convergence test expects. One `wp.map` fixes it for the whole
     # iterative loop; `normals_at_closest_faces`'s own output is already unit, so this is a no-op
     # there, but cheap enough not to special-case.
-    unit_normals = wp.empty(m, dtype=wp.vec3, device=device)
-    wp.map(wp.normalize, normals, out=unit_normals)
-    normals = unit_normals
+    # The sign for ``inwards`` rides in the same map (``ray_direction``), which is exact.
+    ray_dirs = wp.empty(m, dtype=wp.vec3, device=device)
+    wp.map(
+        kernel_visibility.ray_direction, normals, wp.float32(-1.0 if inwards else 1.0), out=ray_dirs
+    )
 
     # One reduction of ``mesh.points``, not two: ``max_t`` needs the box enclosing the mesh *and*
     # the queries, while the convergence threshold is a fraction of the mesh's own diagonal. Taking
@@ -546,21 +548,19 @@ def max_tangent_sphere(
     max_t = math.dist(union_lower, union_upper)
     mesh_diagonal = math.dist(mesh_lower, mesh_upper)
 
-    ray_dirs = normals
-    if inwards:
-        ray_dirs = wp.empty(m, dtype=wp.vec3, device=device)
-        wp.map(wp.neg, normals, out=ray_dirs)
-
     distances = tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
 
     n_verts = int(mesh.points.shape[0])
     radii = wp.empty(m, dtype=wp.float32, device=device)
     not_converged = wp.empty(m, dtype=wp.bool, device=device)
     needs_support = wp.empty(m, dtype=wp.bool, device=device)
+    centers = wp.empty(m, dtype=wp.vec3, device=device)
     wp.map(
         kernel_visibility.init_sphere_radii_finite,
         distances,
-        out=[radii, not_converged, needs_support],
+        points,
+        ray_dirs,
+        out=[radii, not_converged, needs_support, centers],
     )
     # Escaped rays (typically exterior/reach queries) need the support point of the vertex
     # cloud in the ray direction. Compact them first — interior queries usually leave the
@@ -595,12 +595,10 @@ def max_tangent_sphere(
                 packed_support,
                 radii,
                 not_converged,
+                centers,
             ],
             device=device,
         )
-
-    centers = wp.empty(m, dtype=wp.vec3, device=device)
-    wp.map(kernel_visibility.sphere_center, points, ray_dirs, radii, out=centers)
 
     convergence_threshold = wp.float32(threshold * mesh_diagonal)
 
@@ -611,9 +609,16 @@ def max_tangent_sphere(
     new_radii = wp.empty(m, dtype=wp.float32, device=device)
     new_centers = wp.empty(m, dtype=wp.vec3, device=device)
     new_nc = wp.empty(m, dtype=wp.bool, device=device)
+    # Slot ``r`` is the not-converged count after round ``r - 1``, accumulated by the step kernel
+    # itself, so each round's test is one 4-byte read with no reduction launch in front of it.
+    # Slot 0 is the seed's count, the one reduction the loop still needs.
+    n_not_converged = wp.zeros(max_iter + 1, dtype=wp.int32, device=device)
+    n_active = tw.reduce.sum(not_converged)
 
-    for _ in range(max_iter):
-        if tw.reduce.sum(not_converged) == 0:
+    for round_index in range(max_iter):
+        if round_index > 0:
+            n_active = int(read_scalar(n_not_converged, round_index))
+        if n_active == 0:
             break
 
         wp.launch(
@@ -628,9 +633,11 @@ def max_tangent_sphere(
                 wp.float32(max_t),
                 convergence_threshold,
                 not_converged,
+                wp.int32(round_index + 1),
                 new_radii,
                 new_centers,
                 new_nc,
+                n_not_converged,
             ],
             device=device,
         )

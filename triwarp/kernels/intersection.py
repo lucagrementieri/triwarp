@@ -366,8 +366,8 @@ def candidate_pair_intersects(
 ) -> wp.bool:
     # The narrow phase of one broad-phase candidate: two faces that share a vertex are adjacent,
     # not intersecting, and every other pair is decided by the triangle-triangle test. Shared by
-    # the verdict-per-pair kernel below and ``validation.mark_intersecting_pairs``, which marks
-    # faces straight from it.
+    # the verdict-per-pair kernel below and ``mark_intersecting_pair_masks``, which marks faces
+    # straight from it.
     qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, query_face)
     ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, target_face)
     if triangles_share_vertex(qa, qb, qc, ta, tb, tc):
@@ -401,16 +401,28 @@ def swap_pair_columns(pairs: wp.array2d[wp.int32], out_pairs: wp.array2d[wp.int3
 
 
 @wp.kernel
-def mark_pair_masks(
-    pairs: wp.array2d[wp.int32], out_mask_a: wp.array[wp.bool], out_mask_b: wp.array[wp.bool]
+def mark_intersecting_pair_masks(
+    query_vertices: wp.array[wp.vec3],
+    query_faces: wp.array[wp.int32],
+    target_vertices: wp.array[wp.vec3],
+    target_faces: wp.array[wp.int32],
+    pairs: wp.array2d[wp.int32],
+    out_mask_query: wp.array[wp.bool],
+    out_mask_target: wp.array[wp.bool],
 ) -> None:
-    # One mask per mesh from the pair list. Written as a kernel rather than two
+    # The narrow phase and the marking in one pass over the broad-phase candidates: flag both faces
+    # of each candidate pair that intersects (idempotent ``True`` writes), so a mask needs no
+    # per-pair verdict buffer and no compaction. Written as a kernel rather than two
     # ``scatter.mark_membership_mask`` calls over ``pairs[:, k]`` because such a column is a
     # *strided* view, and Warp's Python-scope gather reads an index buffer as if contiguous
-    # (CLAUDE.md section 3.4) -- it would silently mark the wrong faces.
-    i = wp.int32(wp.tid())
-    out_mask_a[pairs[i, 0]] = True
-    out_mask_b[pairs[i, 1]] = True
+    # (CLAUDE.md section 3.4). A single mesh's self-intersection mask passes the same mesh and the
+    # same mask for both sides.
+    p = wp.int32(wp.tid())
+    a = pairs[p, 0]
+    b = pairs[p, 1]
+    if candidate_pair_intersects(query_vertices, query_faces, target_vertices, target_faces, a, b):
+        out_mask_query[a] = True
+        out_mask_target[b] = True
 
 
 # Launched over ``filter_intersecting_pairs``'s survivors, so ``triangle_intersection_segment``

@@ -156,11 +156,15 @@ def chain_node_mask(
     cycle_nodes: wp.array[wp.int32],
     labels: wp.array[wp.int32],
     is_chain: wp.array[wp.int32],
-    out_keep: wp.array[wp.int32],
+    out_node_mask: wp.array[wp.bool],
 ) -> None:
+    # Clear the node-space endpoint mask at every node of a chain component. The mask is True
+    # exactly at ``cycle_nodes`` beforehand, so its ``flatnonzero`` afterwards is the kept nodes in
+    # ascending order -- the same list a keep flag per ``cycle_nodes`` entry plus a gather through
+    # its ``flatnonzero`` produced, without the flag buffer or the gather.
     tid = wp.int32(wp.tid())
     v = cycle_nodes[tid]
-    out_keep[tid] = wp.where(is_chain[labels[v]] != 0, wp.int32(0), wp.int32(1))
+    out_node_mask[v] = is_chain[labels[v]] == 0
 
 
 @wp.kernel
@@ -213,28 +217,47 @@ def finalize_rank_positions(
     label_count: wp.array[wp.int32],
     steps: wp.array[wp.int32],
     out_position: wp.array[wp.int32],
-    out_node_labels: wp.array[wp.int32],
+    out_label_mask: wp.array[wp.bool],
 ) -> None:
     # position = (cycle_length - hops to start) mod cycle_length; the positive modulo keeps
     # malformed chains (steps beyond cycle_length when in-edges collide) in range.
     #
-    # ``out_node_labels`` is the gather ``labels[cycle_nodes]`` the wrapper groups the cycles by,
-    # written here because this thread has already loaded the label to find the cycle length.
+    # ``out_label_mask`` marks every label that owns a cycle, written here because this thread has
+    # already loaded the label to find the cycle length. Labels are node indices, so the mask's
+    # compact ranks are the sorted distinct labels' inverse -- what ``unique_1d`` with
+    # ``return_inverse=True`` over the per-node labels returned, without its hash table, radix
+    # sort and second readback.
     tid = wp.int32(wp.tid())
     v = cycle_nodes[tid]
     label = labels[v]
     cycle_length = label_count[label]
     out_position[tid] = kernel_array.wrap_index(cycle_length - steps[v], cycle_length)
-    out_node_labels[tid] = label
+    out_label_mask[label] = True
+
+
+@wp.kernel
+def compact_cycle_sizes(
+    label_mask: wp.array[wp.bool],
+    label_ranks: wp.array[wp.int32],
+    label_count: wp.array[wp.int32],
+    out_sizes: wp.array[wp.int32],
+) -> None:
+    # Each cycle's length, at its compact rank: the gather ``label_count[unique_labels]`` without
+    # materialising ``unique_labels``.
+    label = wp.int32(wp.tid())
+    if label_mask[label]:
+        out_sizes[label_ranks[label]] = label_count[label]
 
 
 @wp.kernel
 def scatter_cycle_slot(
     cycle_nodes: wp.array[wp.int32],
-    cycle_index: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    label_ranks: wp.array[wp.int32],
     position: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     out_cycles: wp.array[wp.int32],
 ) -> None:
     tid = wp.int32(wp.tid())
-    out_cycles[offsets[cycle_index[tid]] + position[tid]] = cycle_nodes[tid]
+    v = cycle_nodes[tid]
+    out_cycles[offsets[label_ranks[labels[v]]] + position[tid]] = v

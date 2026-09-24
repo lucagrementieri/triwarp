@@ -381,6 +381,16 @@ def arange_repeat(repeats: wp.Int, out_indices: wp.array[wp.Int]) -> None:
     out_indices[i] = i // repeats
 
 
+@wp.func
+def label_segment_span(
+    segment: wp.int32, start: wp.int32, stop: wp.int32, out_owner: wp.array[wp.int32]
+) -> None:
+    # Write ``segment`` over its own packed span ``[start, stop)``: the body both owner-label
+    # kernels below share.
+    for slot in range(start, stop):
+        out_owner[slot] = segment
+
+
 @wp.kernel
 def segment_owner_labels(offsets: wp.array[wp.int32], out_owner: wp.array[wp.int32]) -> None:
     # For every element of a packed ragged array, which segment it belongs to -- the ragged
@@ -397,8 +407,25 @@ def segment_owner_labels(offsets: wp.array[wp.int32], out_owner: wp.array[wp.int
     # readback of the offsets. Where the segments are few but enormous, the per-element form would
     # win instead -- nothing in the tree is in that regime.
     segment = wp.int32(wp.tid())
-    for slot in range(offsets[segment], offsets[segment + 1]):
-        out_owner[slot] = segment
+    label_segment_span(segment, offsets[segment], offsets[segment + 1], out_owner)
+
+
+@wp.kernel
+def segment_owner_labels_total(
+    offsets: wp.array[wp.int32], total: wp.int32, out_owner: wp.array[wp.int32]
+) -> None:
+    # ``segment_owner_labels`` for *unterminated* offsets -- the exclusive scan without the total
+    # appended -- with the total passed as a scalar. The last segment ends at ``total`` instead of
+    # at a terminator slot, which saves a caller that knows the total on the host the
+    # ``wp.full`` + ``wp.copy`` it would otherwise spend building a terminated copy. The two kernels
+    # differ only in where the last segment's end is read from; the span write is shared.
+    segment = wp.int32(wp.tid())
+    # An ``if`` rather than ``wp.where``: ``wp.where`` evaluates both arms, and the terminated arm
+    # would read ``offsets[n]`` one past the end on the last segment.
+    stop = total
+    if segment + 1 < offsets.shape[0]:
+        stop = offsets[segment + 1]
+    label_segment_span(segment, offsets[segment], stop, out_owner)
 
 
 @wp.kernel
@@ -501,6 +528,23 @@ def shifted_index(value: wp.Scalar, offset: wp.Scalar, last: wp.Scalar) -> wp.in
     if value < offset or value > last:
         return wp.int32(-1)
     return wp.int32(value - offset)
+
+
+@wp.kernel
+def isin_mark_table(
+    test_elements: wp.array[wp.Scalar],
+    anchor: wp.Scalar,
+    last: wp.Scalar,
+    out_membership: wp.array[wp.bool],
+) -> None:
+    # The test side of ``array.isin``'s direct-index strategy: shift into the table anchored at
+    # ``anchor`` and mark the slot, in one launch. It replaces ``wp.map(shifted_index, ...)`` into
+    # a ``(k,)`` int32 slot buffer followed by ``scatter.mark_membership_mask`` over it -- one
+    # launch and one allocation fewer, the same slots written. ``isin_lookup_mask`` below is the
+    # element side and reads the table this writes; both shift through ``shifted_index``.
+    slot = shifted_index(test_elements[wp.int32(wp.tid())], anchor, last)
+    if slot >= 0 and slot < out_membership.shape[0]:
+        out_membership[slot] = True
 
 
 @wp.kernel
@@ -853,6 +897,7 @@ ARANGE: OverloadTable
 ARANGE_AFFINE: OverloadTable
 ARANGE_REPEAT: OverloadTable
 SORT_PAIR_INDICES: OverloadTable
+ISIN_MARK_TABLE: OverloadTable
 ISIN_LOOKUP_MASK: OverloadTable
 ISIN_LOOKUP_SORTED: OverloadTable
 MAP_SORTED_INVERSE: OverloadTable
@@ -862,12 +907,20 @@ SORT_ROWS_INSERTION: OverloadTable
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
     global ARANGE, ARANGE_AFFINE, ARANGE_REPEAT, SORT_PAIR_INDICES
-    global ISIN_LOOKUP_MASK, ISIN_LOOKUP_SORTED, MAP_SORTED_INVERSE, SORT_ROWS_INSERTION
+    global \
+        ISIN_MARK_TABLE, \
+        ISIN_LOOKUP_MASK, \
+        ISIN_LOOKUP_SORTED, \
+        MAP_SORTED_INVERSE, \
+        SORT_ROWS_INSERTION
     ARANGE = OverloadTable(arange, {d: [wp.array[d]] for d in _INDEX_DTYPES})
     ARANGE_AFFINE = OverloadTable(arange_affine, {d: [d, d, wp.array[d]] for d in _INDEX_DTYPES})
     ARANGE_REPEAT = OverloadTable(arange_repeat, {d: [d, wp.array[d]] for d in _INDEX_DTYPES})
     SORT_PAIR_INDICES = OverloadTable(
         sort_pair_indices, {d: [d, d, wp.array[d]] for d in _INDEX_DTYPES}
+    )
+    ISIN_MARK_TABLE = OverloadTable(
+        isin_mark_table, {d: [wp.array[d], d, d, wp.array[wp.bool]] for d in _KEY_DTYPES}
     )
     ISIN_LOOKUP_MASK = OverloadTable(
         isin_lookup_mask,
@@ -1044,15 +1097,6 @@ def _declare_map_kernels() -> None:
             (nonzero_flag, (dense(wp.float32),), wp.int32),
             (nonzero_flag, (dense(wp.int32),), wp.int32),
             (nonzero_flag, (dense(wp.int8),), wp.int32),
-            # One row per dtype in ``kernels/array._KEY_DTYPES``, which is the set
-            # ``array.isin`` -- ``shifted_index``'s only caller -- can reach after it widens
-            # sub-32-bit dtypes. A dtype missing here forks the module on first use, which is
-            # exactly the cost CLAUDE.md section 3.5 exists to remove and which check 23 cannot
-            # see, because the table's *existence* is all it asserts.
-            (shifted_index, (dense(wp.int32), wp.int32(1), wp.int32(1)), wp.int32),
-            (shifted_index, (dense(wp.int64), wp.int64(1), wp.int64(1)), wp.int32),
-            (shifted_index, (dense(wp.uint32), wp.uint32(1), wp.uint32(1)), wp.int32),
-            (shifted_index, (dense(wp.uint64), wp.uint64(1), wp.uint64(1)), wp.int32),
         ]
     )
 

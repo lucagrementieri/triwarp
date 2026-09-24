@@ -244,8 +244,10 @@ def cut_along_edges(
         inputs=[faces, corner_index, vertices, out_vertices],
         device=device,
     )
-    # ``corner_index`` *is* the new face buffer: corner ``h`` of the flat layout is entry ``h``.
-    return out_vertices, wp.clone(corner_index)
+    # ``corner_index`` *is* the new face buffer: corner ``h`` of the flat layout is entry ``h``. It
+    # is ``unique_1d``'s own freshly allocated inverse -- not a view of shared scratch, unlike the
+    # unique values -- so it is returned as it is rather than cloned.
+    return out_vertices, corner_index
 
 
 def uv_seam_edges(

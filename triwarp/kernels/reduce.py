@@ -43,6 +43,22 @@ def tile_chunk(n: wp.int32, chunk: wp.int32, width: wp.int32) -> tuple[wp.int32,
 ITEMS_PER_BLOCK_1D = wp.constant(TILE_1D * TILES_PER_BLOCK_1D)
 
 
+@wp.func
+def commit_sum_and_count(
+    lane: wp.int32, total: wp.float64, count: wp.float64, out_sum_and_count: wp.array[wp.float64]
+):
+    # The commit of a fused "mean over the entries that qualify" block fold: each lane's register
+    # sum and count, folded by one block-collective tile sum apiece, then added by lane 0 into the
+    # two-slot buffer the caller reads once. Both tile sums run on every lane (they are barriers);
+    # only the atomics are guarded. Shared by ``heat.upper_edge_length_sum_and_count`` and
+    # ``reconstruction.positive_finite_sum_and_count``, which differ only in what qualifies.
+    block_total = wp.tile_sum(wp.tile(total))[0]
+    block_count = wp.tile_sum(wp.tile(count))[0]
+    if lane == 0:
+        wp.atomic_add(out_sum_and_count, 0, block_total)
+        wp.atomic_add(out_sum_and_count, 1, block_count)
+
+
 def blocks_1d(n: int) -> int:
     """
     Launch width for the 1-D global reduction kernels in this module.

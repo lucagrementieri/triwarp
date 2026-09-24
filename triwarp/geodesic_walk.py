@@ -602,20 +602,28 @@ def shorten_loop(
     # nothing" -- a rewrite can shift which loop positions land on even/odd parity, so a single
     # unchanged sweep says nothing about whether the *other* parity would still find something.
     consecutive_unchanged = 0
+    position_loop = counts = arc_slot = arc_step = None
     for sweep in range(max_iter):
         n_positions = int(packed.shape[0])
         if n_positions == 0:
             break
-        position_loop = wp.empty(n_positions, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_array.segment_owner_labels,
-            dim=n_loops,
-            inputs=[loop_offsets, position_loop],
-            device=device,
-        )
-        counts = wp.empty(n_positions, dtype=wp.int32, device=device)
-        arc_slot = wp.empty(n_positions, dtype=wp.int32, device=device)
-        arc_step = wp.empty(n_positions, dtype=wp.int32, device=device)
+        if consecutive_unchanged == 0:
+            # An unchanged sweep leaves `packed` and `loop_offsets` as they were, so the owner
+            # labels and the per-position scratch carry over; rebuild them only after a rewrite.
+            position_loop = wp.empty(n_positions, dtype=wp.int32, device=device)
+            wp.launch(
+                kernel_array.segment_owner_labels,
+                dim=n_loops,
+                inputs=[loop_offsets, position_loop],
+                device=device,
+            )
+            counts = wp.empty(n_positions, dtype=wp.int32, device=device)
+            arc_slot = wp.empty(n_positions, dtype=wp.int32, device=device)
+            arc_step = wp.empty(n_positions, dtype=wp.int32, device=device)
+        assert position_loop is not None
+        assert counts is not None
+        assert arc_slot is not None
+        assert arc_step is not None
         changed.zero_()
         wp.launch(
             kernel_geodesic_walk.shorten_loop_counts,

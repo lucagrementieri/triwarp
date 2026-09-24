@@ -128,11 +128,12 @@ def principal_curvature(
         vertices, faces, scaled_radius
     )
 
-    # Fit quadric and extract principal curvature per vertex
-    pd1 = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
-    pd2 = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
-    pv1 = wp.zeros(n_vertices, dtype=wp.float32, device=device)
-    pv2 = wp.zeros(n_vertices, dtype=wp.float32, device=device)
+    # Fit quadric and extract principal curvature per vertex. ``wp.empty``: every exit of the
+    # kernel -- the three declines included, through ``_write_no_curvature`` -- writes all four.
+    pd1 = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    pd2 = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    pv1 = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    pv2 = wp.empty(n_vertices, dtype=wp.float32, device=device)
 
     wp.launch(
         kernel_curvature.fit_principal_curvature,
@@ -299,7 +300,6 @@ def discrete_mean_curvature(
 
     # Per adjacent pair: the dihedral angle signed by convexity, and the shared edge's bounds for
     # the BVH -- one launch over the pairs, reading one set of face normals.
-    face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
     signed_angles = wp.empty(m, dtype=wp.float32, device=device)
     edge_lower = wp.empty(m, dtype=wp.vec3, device=device)
     edge_upper = wp.empty(m, dtype=wp.vec3, device=device)
@@ -309,7 +309,6 @@ def discrete_mean_curvature(
         inputs=[
             vertices,
             faces,
-            face_normals,
             face_adjacency,
             face_adjacency_edges,
             signed_angles,
