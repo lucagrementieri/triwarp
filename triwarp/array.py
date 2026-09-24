@@ -1417,12 +1417,7 @@ def indices_to_mask(
     mask = wp.zeros(n, dtype=wp.bool, device=device)
     k = int(indices.shape[0])
     if k > 0:
-        wp.launch(
-            kernel_scatter.mark_membership_mask,
-            dim=k,
-            inputs=[indices, wp.int32(n), mask],
-            device=device,
-        )
+        wp.launch(kernel_scatter.mark_membership_mask, dim=k, inputs=[indices, mask], device=device)
     return mask
 
 

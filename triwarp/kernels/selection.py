@@ -1,5 +1,6 @@
 import warp as wp
 
+from triwarp.kernels.adjacency import write_face_edge_keys
 from triwarp.kernels.array import (
     binary_search_index,
     binary_search_sorted_contains,
@@ -8,6 +9,7 @@ from triwarp.kernels.array import (
     pack_edge_key,
 )
 from triwarp.kernels.halfedge import halfedge_endpoints
+from triwarp.kernels.scatter import mark_corners
 from triwarp.kernels.triangles import corner_triple
 
 
@@ -96,9 +98,7 @@ def mark_submesh_faces_and_vertices(
     n_faces = face_mask.shape[0]
     a, b, c = corner_triple(faces, f)
     out_flags[f] = 1
-    out_flags[n_faces + a] = 1
-    out_flags[n_faces + b] = 1
-    out_flags[n_faces + c] = 1
+    mark_corners(out_flags, n_faces, a, b, c, wp.int32(1))
 
 
 @wp.kernel
@@ -191,9 +191,22 @@ def dilate_vertex_mask(
     f = wp.int32(wp.tid())
     a, b, c = corner_triple(faces, f)
     if in_mask[a] or in_mask[b] or in_mask[c]:
-        out_mask[a] = wp.bool(True)
-        out_mask[b] = wp.bool(True)
-        out_mask[c] = wp.bool(True)
+        mark_corners(out_mask, 0, a, b, c, wp.bool(True))
+
+
+@wp.kernel
+def mark_incident_vertices(
+    faces: wp.array[wp.int32], face_mask: wp.array[wp.bool], out_mask: wp.array[wp.bool]
+) -> None:
+    # Mark every corner of every selected face: the inverse direction of
+    # ``face_mask_from_vertex_mask``. Concurrent writes all store ``True``, so the race is benign
+    # and no atomic is needed. ``dilate_vertex_mask`` above is this composed with an any-corner
+    # ``face_mask_from_vertex_mask`` in one pass, for a caller that does not keep the face mask.
+    f = wp.int32(wp.tid())
+    if not face_mask[f]:
+        return
+    a, b, c = corner_triple(faces, f)
+    mark_corners(out_mask, 0, a, b, c, wp.bool(True))
 
 
 @wp.kernel
@@ -321,11 +334,7 @@ def deleted_face_edge_keys(
     f = wp.int32(wp.tid())
     if not face_mask[f]:
         return
-    a, b, c = corner_triple(faces, f)
-    slot = 3 * (f - kept_ranks[f])
-    out_keys[slot] = pack_edge_key(a, b, base)
-    out_keys[slot + 1] = pack_edge_key(b, c, base)
-    out_keys[slot + 2] = pack_edge_key(c, a, base)
+    write_face_edge_keys(faces, f, 3 * (f - kept_ranks[f]), base, out_keys)
 
 
 @wp.kernel

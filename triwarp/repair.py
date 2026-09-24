@@ -76,7 +76,6 @@ from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import selection as kernel_selection
-from triwarp.kernels import smoothing as kernel_smoothing
 
 # Lattice resolution for ``fix_self_intersections(method="voxel")``, in samples across the mesh's
 # bounding-box diagonal. The same order as ``offset.offset_mesh``'s automatic floor, and the field
@@ -2149,7 +2148,7 @@ def _dilate_face_mask(
     vertex_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     grown = wp.empty(n_faces, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_smoothing.mark_incident_vertices,
+        kernel_selection.mark_incident_vertices,
         dim=n_faces,
         inputs=[faces, face_mask, vertex_mask],
         device=device,
@@ -2162,7 +2161,7 @@ def _dilate_face_mask(
             device=device,
         )
         wp.launch(
-            kernel_smoothing.mark_incident_vertices,
+            kernel_selection.mark_incident_vertices,
             dim=n_faces,
             inputs=[faces, grown, vertex_mask],
             device=device,
@@ -2376,7 +2375,7 @@ def _cut_face_labels(
     adjacency, shared = tw.adjacency.face_adjacency(faces, return_edges=True)
     cut_edges = np.concatenate([_cycle_edges(loop) for loop in loops]).astype(np.uint64)
     barrier_keys = wp.array(
-        np.sort(cut_edges[:, 0] * np.uint64(INDEX_RADIX_PAIR) + cut_edges[:, 1]),
+        np.sort(cut_edges[:, 0] + cut_edges[:, 1] * np.uint64(INDEX_RADIX_PAIR)),
         dtype=wp.uint64,
         device=device,
     )

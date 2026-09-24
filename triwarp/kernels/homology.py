@@ -71,7 +71,7 @@ import warp as wp
 from triwarp.constants import INT32_MAX, TILE_1D
 from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_representative
 from triwarp.kernels.array import LOOP_PROGRESS, LOOP_ROUND
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
+from triwarp.kernels.reduce import block_chunk_1d, tile_chunk
 
 # One past the largest edge index any proposal can hold, so ``wp.atomic_min`` starts empty. The
 # candidate count is bounded by the unique-edge count, which is well inside int32.
@@ -139,10 +139,9 @@ def count_reached_and_referenced(
     # vertices form one component. Unreferenced vertices are deliberately not counted: they carry no
     # edges, so they cannot change the generator count.
     chunk, lane = wp.tid()
-    offset, remaining = tile_chunk(distances.shape[0], chunk, ITEMS_PER_BLOCK_1D)
-    if remaining <= 0:
+    offset, n_rows = block_chunk_1d(distances.shape[0], chunk)
+    if n_rows <= 0:
         return
-    n_rows = wp.min(remaining, ITEMS_PER_BLOCK_1D)
 
     reached = wp.int32(0)
     referenced = wp.int32(0)

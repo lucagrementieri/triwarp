@@ -153,6 +153,17 @@ def atomic_min_packed_box(
 
 
 @wp.func
+def scanned_count(inclusive: wp.array[wp.int32], i: wp.int32) -> tuple[wp.int32, wp.int32]:
+    # Exclusive offset and own count of entry ``i``, recovered from the in-place inclusive scan of
+    # the counts that overwrote them. A branch, not ``wp.where``: that evaluates both arms, and
+    # ``inclusive[-1]`` is out of bounds.
+    start = wp.int32(0)
+    if i > 0:
+        start = inclusive[i - 1]
+    return start, inclusive[i] - start
+
+
+@wp.func
 def loop_next_slot(
     loop_id: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],
@@ -171,6 +182,21 @@ def loop_next_slot(
 
 
 @wp.func
+def loop_rim_edge_vertices(
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    slot: wp.int32,
+) -> tuple[wp.int32, wp.int32]:
+    # The two vertex ids of the rim edge leaving packed slot ``slot`` -- the far one found through
+    # ``loop_next_slot`` above, so it wraps inside its own loop rather than into the next one's.
+    # ``holes.loop_rim_metrics`` and ``holes.rim_edge_keys`` read the ids to key the edge;
+    # ``loop_rim_edge`` below reads per-vertex values at them.
+    return (flat_loops[slot], flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, slot)])
+
+
+@wp.func
 def loop_rim_edge(
     flat_loops: wp.array[wp.int32],
     loop_id: wp.array[wp.int32],
@@ -180,19 +206,14 @@ def loop_rim_edge(
     slot: wp.int32,
 ) -> tuple[wp.int32, Any, Any]:
     # The rim edge leaving packed slot ``slot``: which loop owns it, and the two per-vertex values
-    # at its ends -- the far one found through ``loop_next_slot`` above, so it wraps inside its own
-    # loop rather than into the next one's.
+    # at its ends (``loop_rim_edge_vertices``).
     #
     # The per-segment prologue of the segmented loop reductions ``boundary.loop_perimeters`` and
-    # ``boundary.loop_directed_areas``, which differ only in what they fold the edge into.
-    # ``holes.loop_rim_metrics`` needs the vertex ids as well, to key the edge, and reads them
-    # through ``holes.rim_edge_vertices`` instead. Generic over the value dtype the way
-    # ``triangles.face_vertices`` is, so a float64 rim reduction needs no second spelling.
-    return (
-        loop_id[slot],
-        values[flat_loops[slot]],
-        values[flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, slot)]],
-    )
+    # ``boundary.loop_directed_areas``, which differ only in what they fold the edge into. Generic
+    # over the value dtype the way ``triangles.face_vertices`` is, so a float64 rim reduction needs
+    # no second spelling.
+    u, v = loop_rim_edge_vertices(flat_loops, loop_id, loop_starts, loop_sizes, slot)
+    return loop_id[slot], values[u], values[v]
 
 
 @wp.func
@@ -381,51 +402,39 @@ def arange_repeat(repeats: wp.Int, out_indices: wp.array[wp.Int]) -> None:
     out_indices[i] = i // repeats
 
 
-@wp.func
-def label_segment_span(
-    segment: wp.int32, start: wp.int32, stop: wp.int32, out_owner: wp.array[wp.int32]
-) -> None:
-    # Write ``segment`` over its own packed span ``[start, stop)``: the body both owner-label
-    # kernels below share.
-    for slot in range(start, stop):
-        out_owner[slot] = segment
-
-
 @wp.kernel
-def segment_owner_labels(offsets: wp.array[wp.int32], out_owner: wp.array[wp.int32]) -> None:
-    # For every element of a packed ragged array, which segment it belongs to -- the ragged
-    # counterpart of ``arange_repeat``, whose segments are all one width. ``offsets`` is the
-    # exclusive scan of the segment sizes with the total appended, so this is launched over the
-    # *segment* count and each thread writes its own label across its own span.
-    #
-    # One thread per segment rather than one per element (a binary search into ``offsets``) is the
-    # right shape for the two callers here for opposite reasons, and both are worth knowing before
-    # reaching for it. ``linalg`` expands CSR row offsets back to one row index per entry so a
-    # pruned pattern can be rebuilt through ``bsr_from_triplets``: the rows are many and short, and
-    # the alternative costs a search per non-zero. ``geodesic_walk`` labels each packed loop
-    # position with its loop: the loops are few and short, so this beats a search *and* needs no
-    # readback of the offsets. Where the segments are few but enormous, the per-element form would
-    # win instead -- nothing in the tree is in that regime.
-    segment = wp.int32(wp.tid())
-    label_segment_span(segment, offsets[segment], offsets[segment + 1], out_owner)
-
-
-@wp.kernel
-def segment_owner_labels_total(
+def segment_owner_labels(
     offsets: wp.array[wp.int32], total: wp.int32, out_owner: wp.array[wp.int32]
 ) -> None:
-    # ``segment_owner_labels`` for *unterminated* offsets -- the exclusive scan without the total
-    # appended -- with the total passed as a scalar. The last segment ends at ``total`` instead of
-    # at a terminator slot, which saves a caller that knows the total on the host the
-    # ``wp.full`` + ``wp.copy`` it would otherwise spend building a terminated copy. The two kernels
-    # differ only in where the last segment's end is read from; the span write is shared.
+    # For every element of a packed ragged array, which segment it belongs to -- the ragged
+    # counterpart of ``arange_repeat``, whose segments are all one width. ``offsets`` is the
+    # exclusive scan of the segment sizes, with or without the total appended: the last segment
+    # ends at ``offsets[n]`` when the terminator is there and at the scalar ``total`` when it is
+    # not, which saves a caller holding the total on the host the ``wp.full`` + ``wp.copy`` of a
+    # terminated copy. Launched over the *segment* count; each thread writes its own label across
+    # its own span.
+    #
+    # One thread per segment rather than one per element (a binary search into ``offsets``) is the
+    # right shape for the callers here: ``geodesic_walk`` labels each packed loop position with its
+    # loop and ``boundary`` each rim slot with its rim -- the segments are few and short, so this
+    # beats a search *and* needs no readback of the offsets. Where the segments are few but
+    # enormous, the per-element form would win instead -- nothing in the tree is in that regime.
     segment = wp.int32(wp.tid())
     # An ``if`` rather than ``wp.where``: ``wp.where`` evaluates both arms, and the terminated arm
-    # would read ``offsets[n]`` one past the end on the last segment.
+    # would read ``offsets[n]`` one past the end of an unterminated buffer on the last segment.
     stop = total
     if segment + 1 < offsets.shape[0]:
         stop = offsets[segment + 1]
-    label_segment_span(segment, offsets[segment], stop, out_owner)
+    for slot in range(offsets[segment], stop):
+        out_owner[slot] = segment
+
+
+@wp.func
+def element_priority(seed: wp.int32, index: wp.int32) -> wp.uint32:
+    # Element ``index``'s draw of the priority order ``random_priorities`` below writes. Named so a
+    # kernel drawing into another index space (``blue_noise.sorted_random_priorities``) gives each
+    # element exactly the priority the plain draw would.
+    return wp.randu(wp.rand_init(seed, index))
 
 
 @wp.kernel
@@ -436,7 +445,7 @@ def random_priorities(seed: wp.int32, out_priority: wp.array[wp.uint32]) -> None
     # makes the loop a deterministic function of ``seed`` alone. Drawing per round would make the
     # answer depend on how many rounds the input happened to need.
     i = wp.int32(wp.tid())
-    out_priority[i] = wp.randu(wp.rand_init(seed, i))
+    out_priority[i] = element_priority(seed, i)
 
 
 @wp.kernel
@@ -509,6 +518,15 @@ def masked_at(mask: wp.array[wp.bool], index: wp.int32) -> wp.bool:
 
 
 @wp.func
+def mark_at(out_mask: wp.array[wp.bool], index: wp.int32) -> None:
+    # The write side of ``masked_at``: set the mask at ``index``, dropping an index outside it
+    # rather than writing off the end of the buffer -- which on the CPU device is host-heap
+    # corruption (CLAUDE.md section 12.1). Every writer stores ``True``, so racing threads agree.
+    if index >= 0 and index < out_mask.shape[0]:
+        out_mask[index] = True
+
+
+@wp.func
 def shifted_index(value: wp.Scalar, offset: wp.Scalar, last: wp.Scalar) -> wp.int32:
     # Position of ``value`` in a table anchored at ``offset`` and holding values up to ``last``
     # inclusive, or ``-1`` for a value outside ``[offset, last]``.
@@ -542,9 +560,7 @@ def isin_mark_table(
     # a ``(k,)`` int32 slot buffer followed by ``scatter.mark_membership_mask`` over it -- one
     # launch and one allocation fewer, the same slots written. ``isin_lookup_mask`` below is the
     # element side and reads the table this writes; both shift through ``shifted_index``.
-    slot = shifted_index(test_elements[wp.int32(wp.tid())], anchor, last)
-    if slot >= 0 and slot < out_membership.shape[0]:
-        out_membership[slot] = True
+    mark_at(out_membership, shifted_index(test_elements[wp.int32(wp.tid())], anchor, last))
 
 
 @wp.kernel
@@ -669,16 +685,6 @@ def less(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
 @wp.func
 def less_equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
     return a <= b
-
-
-@wp.func
-def equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
-    return a == b
-
-
-@wp.func
-def not_equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
-    return a != b
 
 
 @wp.func
@@ -1140,6 +1146,13 @@ def pack_directed_key(a: wp.int32, b: wp.int32, base: wp.uint64) -> wp.uint64:
 def pack_edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
     """Key of undirected edge (u, v); matches ``pack_indices`` for a sorted 2-index row."""
     return pack_directed_key(wp.min(u, v), wp.max(u, v), base)
+
+
+@wp.func
+def pack_triangle_key(a: wp.int32, b: wp.int32, c: wp.int32, base: wp.uint64) -> wp.uint64:
+    """Key of unoriented triangle ``(a, b, c)``: ``pack_indices`` of its sorted 3-index row."""
+    s0, s1, s2 = sort3(a, b, c)
+    return pack_directed_key(s0, s1, base) + wp.uint64(wp.uint32(s2)) * base * base
 
 
 @wp.func

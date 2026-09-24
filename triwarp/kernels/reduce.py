@@ -44,6 +44,17 @@ ITEMS_PER_BLOCK_1D = wp.constant(TILE_1D * TILES_PER_BLOCK_1D)
 
 
 @wp.func
+def block_chunk_1d(n: wp.int32, block: wp.int32) -> tuple[wp.int32, wp.int32]:
+    # ``tile_chunk`` at the ``ITEMS_PER_BLOCK_1D`` fold width, **clamped to the block's own
+    # share**: ``(offset, count)`` of the elements block ``block`` owns, ``count <= 0`` past the
+    # end. The clamp is the part a loop bounded by the count cannot omit -- ``tile_chunk``'s
+    # ``remaining`` runs to the end of the array, so without it block 0 walks everything, which a
+    # sum gets wrong loudly and a min/max/any/all silently.
+    offset, remaining = tile_chunk(n, block, ITEMS_PER_BLOCK_1D)
+    return offset, wp.min(remaining, ITEMS_PER_BLOCK_1D)
+
+
+@wp.func
 def commit_sum_and_count(
     lane: wp.int32, total: wp.float64, count: wp.float64, out_sum_and_count: wp.array[wp.float64]
 ):
@@ -596,14 +607,9 @@ def _reduce_bool_1d_tiled(tile_reduce, atomic, scalar, identity, name):
     def _k(values: wp.array[wp.bool], out_result: wp.array[wp.int32]) -> None:
         i, t = wp.tid()
         n = values.shape[0]
-        base, remaining = tile_chunk(n, i, ITEMS_PER_BLOCK_1D)
+        base, remaining = block_chunk_1d(n, i)
         if remaining <= 0:
             return
-        # ``tile_chunk`` reports what is left from ``base`` to the end of the array, not this
-        # block's share of it -- clamping is the caller's job, and the tile-load factory above does
-        # it implicitly through its fixed ``TILES_PER_BLOCK_1D`` loop. This loop is bounded by
-        # ``remaining``, so it has to clamp explicitly or block 0 walks the whole array.
-        remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
         acc = wp.int32(identity)
         for k in range(t, remaining, wp.block_dim()):
             acc = scalar(acc, wp.where(values[base + k], wp.int32(1), wp.int32(0)))
@@ -1033,12 +1039,9 @@ def _allclose_1d_tiled(name, dtype, predicate, tolerance_dtype):
         out_flag: wp.array[wp.int32],
     ) -> None:
         i, lane = wp.tid()
-        offset, remaining = tile_chunk(a.shape[0], i, ITEMS_PER_BLOCK_1D)
+        offset, remaining = block_chunk_1d(a.shape[0], i)
         if remaining <= 0:
             return
-        # ``tile_chunk`` reports what is left to the end of the array, not this block's share --
-        # see its own docstring, and ``kernels/reduce._reduce_bool_1d_tiled`` for the same clamp.
-        remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
         close = wp.int32(1)
         for k in range(lane, remaining, wp.block_dim()):
             slot = offset + k

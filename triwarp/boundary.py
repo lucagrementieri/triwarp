@@ -873,7 +873,7 @@ def _loop_owner_labels(
     a synchronization this saves. So the two forms build ``loop_id`` differently on purpose, and
     each is the cheaper one for the inputs it has. ``boundary_loops_batched`` returns unterminated
     offsets, and the total is ``flat_loops.shape[0]`` -- known on the host -- so it is passed as a
-    scalar to ``segment_owner_labels_total`` rather than appended to a copy of the offsets.
+    scalar to ``segment_owner_labels`` rather than appended to a copy of the offsets.
     """
     n_loops = int(loop_sizes.shape[0])
     device = flat_loops.device
@@ -881,7 +881,7 @@ def _loop_owner_labels(
     if n_loops == 0:
         return loop_id
     wp.launch(
-        kernel_array.segment_owner_labels_total,
+        kernel_array.segment_owner_labels,
         dim=n_loops,
         inputs=[offsets, wp.int32(int(flat_loops.shape[0])), loop_id],
         device=device,
@@ -906,11 +906,10 @@ def _pack_loop_segments(
     # ``shape`` -- so it is the sanctioned kind and not a readback: nothing crosses the bus except
     # the two uploads at the end, and there is no device buffer to reduce.
     #
-    # Building ``loop_id`` on the device instead (``kernels/array.py``'s ``segment_owner_labels``)
-    # is not worth it here: that kernel wants total-terminated offsets, and the extra allocation
-    # and copy to produce them outweighs the launch it would save, so the ``numpy.repeat`` stays.
-    # This is also why the packed form takes ``loop_id`` as a keyword: the two forms build it from
-    # different inputs and each is the cheaper one for what it holds.
+    # The sizes are already on the host, so ``numpy.repeat`` builds ``loop_id`` here where the
+    # packed form, which has only device offsets, launches ``kernels/array.py``'s
+    # ``segment_owner_labels``. This is also why the packed form takes ``loop_id`` as a keyword:
+    # the two forms build it from different inputs and each is the cheaper one for what it holds.
     device = vertices.device
     loops = list(loops)
     for loop in loops:

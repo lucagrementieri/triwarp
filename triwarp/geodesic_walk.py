@@ -614,7 +614,7 @@ def shorten_loop(
             wp.launch(
                 kernel_array.segment_owner_labels,
                 dim=n_loops,
-                inputs=[loop_offsets, position_loop],
+                inputs=[loop_offsets, wp.int32(n_positions), position_loop],
                 device=device,
             )
             counts = wp.empty(n_positions, dtype=wp.int32, device=device)
@@ -722,7 +722,7 @@ def _compact_repeats(
     wp.launch(
         kernel_array.segment_owner_labels,
         dim=n_loops,
-        inputs=[loop_offsets, position_loop],
+        inputs=[loop_offsets, wp.int32(n_positions), position_loop],
         device=device,
     )
     counts = wp.empty(n_positions, dtype=wp.int32, device=device)

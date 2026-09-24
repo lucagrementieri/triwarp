@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.kernels.predicates import normalize_or_zero
 from triwarp.kernels.proximity import write_closest_point_query
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, block_chunk_1d
 from triwarp.kernels.transform import transform_point_mat44
 
 # ---------------------------------------------------------------------------
@@ -34,7 +34,7 @@ PROCRUSTES_ACC_SIZE = 26
 # Point-to-plane accumulator's two scalars, in one buffer for the same reason the moments above
 # share one: ``icp_point_to_plane`` reads both back every iteration, ``accumulate_point_to_plane``
 # writes both, and one buffer is one host sync instead of two.
-ICP_COST = wp.constant(0)  # sum robust_loss(r); see ``robust_loss``
+ICP_COST = wp.constant(0)  # sum robust_loss(r); see ``robust_weight_and_loss``
 ICP_WEIGHT_SUM = wp.constant(1)  # sum w
 ICP_SCALAR_ACC_SIZE = 2
 
@@ -52,6 +52,17 @@ def procrustes_shifts(
         shift_a = a[0]
         shift_b = b[0]
     return shift_a, shift_b
+
+
+@wp.func
+def sample_weight(weights: wp.array[wp.float32], i: wp.int32) -> wp.float32:
+    # Sample ``i``'s weight, a zero-length ``weights`` meaning uniform -- which is what ``icp``
+    # passes: the alternative is a ``wp.full(n, 1.0)`` allocation *and* fill on every iteration,
+    # for a value the kernel can just assume.
+    w = wp.float32(1.0)
+    if weights.shape[0] > 0:
+        w = weights[i]
+    return w
 
 
 @wp.func
@@ -107,15 +118,11 @@ def accumulate_procrustes_moments(
     # one-element tiles hold its true totals. The CPU clock is flat and the accuracy win holds
     # there too.
     #
-    # A zero-length ``weights`` means uniform weights, which is what ``icp`` passes: the
-    # alternative is a ``wp.full(n, 1.0)`` allocation *and* fill on every iteration, for a value
-    # the kernel can just assume.
+    # A zero-length ``weights`` means uniform weights (``sample_weight``).
     chunk, lane = wp.tid()
-    offset, remaining = tile_chunk(a.shape[0], chunk, ITEMS_PER_BLOCK_1D)
-    if remaining <= 0:
+    offset, count = block_chunk_1d(a.shape[0], chunk)
+    if count <= 0:
         return
-    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
-    uniform = weights.shape[0] == 0
     shift_a, shift_b = procrustes_shifts(a, b, use_translation)
 
     w_sum = wp.float32(0.0)
@@ -130,9 +137,7 @@ def accumulate_procrustes_moments(
 
     for k in range(lane, count, wp.block_dim()):
         index = offset + k
-        w = wp.float32(1.0)
-        if not uniform:
-            w = weights[index]
+        w = sample_weight(weights, index)
         av = a[index] - shift_a
         bv = b[index] - shift_b
         w_sum += w
@@ -284,8 +289,7 @@ def transform_and_accumulate_cost(
 ) -> None:
     # Apply the fitted transform to ``a``, publish the moved points, and reduce the weighted mean
     # squared residual against ``b`` into the packed accumulator's cost slot -- one pass, one
-    # launch. A zero-length ``weights`` means uniform, which is what ``icp`` passes: the alternative
-    # is a ``wp.full(n, 1.0)`` allocation *and* fill every iteration for a value the kernel assumes.
+    # launch. A zero-length ``weights`` means uniform (``sample_weight``).
     #
     # The reduction is the lane-strided single-slot form of CLAUDE.md section 13.2, striding by
     # ``wp.block_dim()`` so it needs no ``prefers_tiled_reduction`` branch.
@@ -299,19 +303,16 @@ def transform_and_accumulate_cost(
     # ``apply_transform_mat44`` keeps its three other callers; the shared arithmetic is its own
     # ``transform_point_mat44`` helper, called here rather than copied.
     chunk, lane = wp.tid()
-    offset, remaining = tile_chunk(a.shape[0], chunk, ITEMS_PER_BLOCK_1D)
-    if remaining <= 0:
+    offset, count = block_chunk_1d(a.shape[0], chunk)
+    if count <= 0:
         return
-    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     transform = matrix[0]
     local = wp.float32(0.0)
     for k in range(lane, count, wp.block_dim()):
         i = offset + k
         moved = transform_point_mat44(a[i], transform)
         out_transformed[i] = moved
-        w = wp.float32(1.0)
-        if weights.shape[0] > 0:
-            w = weights[i]
+        w = sample_weight(weights, i)
         local += w * wp.length_sq(b[i] - moved)
     total = wp.tile_sum(wp.tile(local))[0]
     if lane == 0:
@@ -461,38 +462,19 @@ def abs_deviation(value: wp.float32, center: wp.float32) -> wp.float32:
 
 
 @wp.func
-def robust_weight(residual: wp.float32, scale: wp.float32, kind: wp.int32) -> wp.float32:
+def robust_weight_and_loss(
+    residual: wp.float32, scale: wp.float32, kind: wp.int32
+) -> tuple[wp.float32, wp.float32]:
     """
-    IRLS weight for a residual under an M-estimator loss.
+    IRLS weight of a residual under an M-estimator, and its term of the objective.
 
     ``kind``: 0 = none (unit weight), 1 = Huber (``k = scale``),
-    2 = Tukey biweight (``c = scale``). A non-positive ``scale`` yields unit weight.
-    """
-    if kind == wp.int32(0) or scale <= wp.float32(0.0):
-        return wp.float32(1.0)
-    r = wp.abs(residual)
-    if kind == wp.int32(1):
-        # Huber
-        if r <= scale:
-            return wp.float32(1.0)
-        return scale / r
-    # Tukey biweight
-    if r >= scale:
-        return wp.float32(0.0)
-    u = r / scale
-    t = wp.float32(1.0) - u * u
-    return t * t
+    2 = Tukey biweight (``c = scale``). A non-positive ``scale`` yields unit weight. One dispatch
+    for both halves, so the weight a residual is fitted with and the loss the loop stops on
+    cannot disagree about which estimator is in force.
 
-
-@wp.func
-def robust_loss(
-    residual: wp.float32, weight: wp.float32, scale: wp.float32, kind: wp.int32
-) -> wp.float32:
-    """
-    One residual's term of the objective ``icp_point_to_plane`` reports and stops on.
-
-    ``weight * residual^2`` for no kernel and for Huber, where it grows with ``|residual|`` like
-    the loss itself, and twice the Tukey biweight loss ``rho`` for Tukey:
+    The loss is ``weight * residual^2`` for no kernel and for Huber, where it grows with
+    ``|residual|`` like the loss itself, and twice the Tukey biweight loss ``rho`` for Tukey:
     ``c^2 / 3 * (1 - (1 - u^2)^3)`` with ``u = |r| / c``, saturating at ``c^2 / 3`` once
     ``|r| >= c``. The factor two makes every kind read ``r^2`` for a small residual.
 
@@ -505,15 +487,23 @@ def robust_loss(
     vanishing, so it falls as the fit improves. Measured on a 5-degree start with ``c`` at 1 % of
     the bounding-box diagonal: the weighted sum rose for five iterations and the loop stopped after
     two, 4.8 degrees from the answer; the loss falls monotonically and the loop runs to it.
-
-    None and Huber keep ``weight * residual^2`` bit for bit -- the same product in the same order
-    ``point_to_plane_tile`` always accumulated -- since neither redescends.
     """
-    if kind == wp.int32(2) and scale > wp.float32(0.0):
-        u = wp.min(wp.abs(residual) / scale, wp.float32(1.0))
-        t = wp.float32(1.0) - u * u
-        return scale * scale / wp.float32(3.0) * (wp.float32(1.0) - t * t * t)
-    return weight * residual * residual
+    if kind == wp.int32(0) or scale <= wp.float32(0.0):
+        return wp.float32(1.0), residual * residual
+    r = wp.abs(residual)
+    if kind == wp.int32(1):
+        # Huber
+        w = wp.float32(1.0)
+        if r > scale:
+            w = scale / r
+        return w, w * residual * residual
+    # Tukey biweight: ``t * t * t`` is ``w * t``, the same product in the same order.
+    if r >= scale:
+        return wp.float32(0.0), scale * scale / wp.float32(3.0)
+    u = r / scale
+    t = wp.float32(1.0) - u * u
+    w = t * t
+    return w, scale * scale / wp.float32(3.0) * (wp.float32(1.0) - w * t)
 
 
 @wp.func
@@ -564,12 +554,12 @@ def point_to_plane_tile(
         nrm = normalize_or_zero(normals[idx], wp.float32(0.0))
         x = source[idx]
         r = point_to_plane_residual(x, target[idx], nrm)
-        w = robust_weight(r, robust_scale, robust_kind)
+        w, loss = robust_weight_and_loss(r, robust_scale, robust_kind)
         # Jacobian of the point-to-plane residual: [x x n ; n]
         j = wp.spatial_vector(wp.cross(x, nrm), nrm)
         jtj += w * wp.outer(j, j)
         jtr += (w * r) * j
-        cost += robust_loss(r, w, robust_scale, robust_kind)
+        cost += loss
         weight_sum += w
     return jtj, jtr, cost, weight_sum
 
@@ -603,7 +593,7 @@ def accumulate_point_to_plane(
     # The tree is the *more* accurate arm on every component, which matters here because ``out_jtj``
     # is the matrix ``solve_point_to_plane`` factorizes.
     i, lane = wp.tid()
-    offset, remaining = tile_chunk(source.shape[0], i, ITEMS_PER_BLOCK_1D)
+    offset, remaining = block_chunk_1d(source.shape[0], i)
     if remaining <= 0:
         return
 

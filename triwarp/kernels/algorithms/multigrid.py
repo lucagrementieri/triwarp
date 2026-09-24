@@ -159,7 +159,7 @@ def mis_root_flag(state: wp.int32) -> wp.int32:
     # selection normally settles well inside the cap and the two readings then coincide.
     #
     # A ``@wp.func`` rather than a kernel because the wrapper maps it (CLAUDE.md section 3.5). It
-    # returns the flag directly rather than composing ``array.not_equal`` with an
+    # returns the flag directly rather than composing an inequality map with an
     # ``array_cast(bool -> int32)``, which would be two device passes and a second buffer.
     return wp.where(state != MG_EXCLUDED, wp.int32(1), wp.int32(0))
 

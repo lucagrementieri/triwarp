@@ -60,6 +60,7 @@ counts.
 import warp as wp
 
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels.array import element_priority
 from triwarp.kernels.grouping import sorted_run_start
 
 INVALID = wp.constant(wp.int32(-1))
@@ -197,7 +198,7 @@ def sorted_random_priorities(
     # point's *pool* index ``bucket[s]``, so each point holds exactly the priority the unsorted draw
     # gave it and the gather through ``bucket`` that used to follow is gone.
     s = wp.int32(wp.tid())
-    out_priority[s] = wp.randu(wp.rand_init(seed, bucket[s]))
+    out_priority[s] = element_priority(seed, bucket[s])
 
 
 @wp.func

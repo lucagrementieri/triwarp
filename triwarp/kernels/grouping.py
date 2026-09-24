@@ -15,11 +15,11 @@ def scatter_first_occurrence(inverse: wp.array[wp.int32], out_first: wp.array[wp
 @wp.func
 def sorted_run_start(sorted_values: wp.array[wp.Int], i: wp.int32) -> wp.bool:
     # Does position ``i`` begin a run of equal values? The one test every run-length grouping in
-    # the package shares, and each of its three callers adds a different condition on top:
-    # ``mark_group_starts`` requires the run to be exactly ``length`` long, ``remesh``'s
-    # ``mark_edge_pair_starts`` specialises that to two, and its ``mark_unique_edge_starts`` wants
-    # every run whatever its length. Bounding the *data* is the caller's job too -- the buffer is
-    # usually over-allocated radix-sort scratch.
+    # the package shares, and its callers add their own conditions on top: ``mark_group_starts``
+    # requires the run to be exactly ``length`` long, ``remesh``'s ``mark_edge_pair_starts``
+    # specialises that to two, and the plain run-start markers want every run whatever its length.
+    # Bounding the *data* is the caller's job too -- the buffer is usually over-allocated
+    # radix-sort scratch.
     if i == 0:
         return True
     return sorted_values[i] != sorted_values[i - 1]

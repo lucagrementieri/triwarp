@@ -6,6 +6,7 @@ from triwarp.kernels.array import (
     declare_map_signatures,
     map_probe,
     map_probe_single,
+    pack_edge_key,
     pack_ranked_key,
     update_argmin_pair,
 )
@@ -382,7 +383,7 @@ def becomes_interior_degree3(
     for slot in range(begin, end):
         if selected[halfedge_destination(faces, ring_halfedges[slot])]:
             n_selected += 1
-    return end - begin - n_selected == 3
+    return is_interior_degree3(begin + n_selected, end, False)
 
 
 @wp.kernel
@@ -596,13 +597,13 @@ def sever_barrier_pairs(
 ) -> None:
     # The face pairs with every pair across a barrier edge turned into a self-loop, so a labelling
     # over them sees the barrier as cut: a self-loop joins nothing, and the pair keeps its row, so
-    # no compaction is needed. A pair is across a barrier when its shared edge's ascending
-    # ``(a, b)``, packed as ``a * INDEX_RADIX_PAIR + b``, is in the sorted ``barrier_keys`` -- a
+    # no compaction is needed. A pair is across a barrier when its shared edge's
+    # ``array.pack_edge_key`` at ``INDEX_RADIX_PAIR`` is in the sorted ``barrier_keys`` -- a
     # few hundred loop edges, searched here rather than hashed and matched in a pass of their own.
     # Written to a new buffer rather than in place, with the mask beside it, so the caller keeps the
     # faces across each barrier edge.
     k = wp.int32(wp.tid())
-    key = wp.uint64(shared[k, 0]) * wp.uint64(INDEX_RADIX_PAIR) + wp.uint64(shared[k, 1])
+    key = pack_edge_key(shared[k, 0], shared[k, 1], wp.uint64(INDEX_RADIX_PAIR))
     cut = binary_search_sorted_contains(barrier_keys, key)
     f0 = adjacency[k, 0]
     out_pairs[k, 0] = f0

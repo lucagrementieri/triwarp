@@ -65,6 +65,7 @@ from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import scatter as kernel_scatter
+from triwarp.kernels import selection as kernel_selection
 from triwarp.kernels import smoothing as kernel_smoothing
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.algorithms import multigrid as kernel_mg
@@ -2433,7 +2434,7 @@ def _incident_vertex_mask(
     """Mark the vertices touched by at least one selected face."""
     mask = wp.zeros(n_vertices, dtype=wp.bool, device=faces.device)
     wp.launch(
-        kernel_smoothing.mark_incident_vertices,
+        kernel_selection.mark_incident_vertices,
         dim=int(faces.shape[0]) // 3,
         inputs=[faces, region, mask],
         device=faces.device,

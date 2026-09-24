@@ -10,7 +10,7 @@ from triwarp.kernels.array import (
     unpack_ranked_index,
 )
 from triwarp.kernels.predicates import point_plane_dot, triangle_normal
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, outer_sum_chunk, tile_chunk
+from triwarp.kernels.reduce import block_chunk_1d, outer_sum_chunk
 
 
 @wp.func
@@ -52,11 +52,9 @@ def accumulate_counted_mean(
     # An empty row contributes zero to both sums, which is what lets the cloud mean be a plain
     # reduction: ``neighbor_distance_moments`` writes a zero mean for a row it counted nothing in.
     chunk, lane = wp.tid()
-    offset, remaining = tile_chunk(count.shape[0], chunk, ITEMS_PER_BLOCK_1D)
-    if remaining <= 0:
+    offset, n_rows = block_chunk_1d(count.shape[0], chunk)
+    if n_rows <= 0:
         return
-    # ``tile_chunk`` reports what is left to the end of the array, not this block's share of it.
-    n_rows = wp.min(remaining, ITEMS_PER_BLOCK_1D)
 
     counted = wp.float64(0.0)
     total = wp.float64(0.0)
@@ -103,7 +101,7 @@ def centered_covariance(
     # reads 1 on CPU. ``measures.centroid_tiled`` needs a device pair because *its* lanes partition
     # the outer work at a constant stride; this is the other form.
     chunk, lane = wp.tid()
-    offset, remaining = tile_chunk(points.shape[0], chunk, ITEMS_PER_BLOCK_1D)
+    offset, remaining = block_chunk_1d(points.shape[0], chunk)
     if remaining <= 0:
         return
 

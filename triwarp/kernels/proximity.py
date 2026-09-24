@@ -3,7 +3,12 @@ import warp as wp
 from triwarp.constants import FLOAT32_INF_CONSTANT, TOLERANCE_MERGE_CONSTANT, TWO_PI
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.array import lift_vec2, tile_argmin
-from triwarp.kernels.neighbors import MAX_SEARCH_ATTEMPTS, complete_radius, next_search_radius
+from triwarp.kernels.neighbors import (
+    MAX_SEARCH_ATTEMPTS,
+    attempt_radius,
+    next_search_radius,
+    search_radius_bounds,
+)
 from triwarp.kernels.predicates import (
     barycentric_2d,
     closest_point_on_segment,
@@ -110,10 +115,11 @@ def closest_point_on_edges(
     # the same broad phase through a heavier object. What 1.17 did buy this kernel is the sphere
     # query on the BVH it already has, below.
     #
-    # Iterative deepening, sharing ``complete_radius`` / ``next_search_radius`` with the k-NN
-    # kernels next door: a scan of the **ball** of radius ``r`` about ``q`` enumerates every edge
-    # whose *closest point* is within ``r`` -- that point is then inside the ball, so the edge's
-    # AABB contains it and therefore overlaps the ball -- which is what makes ``best <= r`` a proof
+    # Iterative deepening, sharing ``search_radius_bounds`` / ``attempt_radius`` /
+    # ``next_search_radius`` with the k-NN kernels next door: a scan of the **ball** of radius
+    # ``r`` about ``q`` enumerates every edge whose *closest point* is within ``r`` -- that point is
+    # then inside the ball, so the edge's AABB contains it and therefore overlaps the ball -- which
+    # is what makes ``best <= r`` a proof
     # of exactness rather than a heuristic. The enumeration was the bounding cube until Warp 1.17
     # supplied ``wp.bvh_query_sphere``; the proof above is the same either way, and the ball is 6/pi
     # ~ 1.91x less volume to walk. Unlike the point BVH next door this still needs its narrow phase,
@@ -122,14 +128,12 @@ def closest_point_on_edges(
     tid = wp.int32(wp.tid())
     q = queries[tid]
 
-    r_hard = wp.min(max_dist, complete_radius(q, min_bound, max_bound))
-    r = wp.min(initial_radius, r_hard)
+    r_hard, r = search_radius_bounds(q, min_bound, max_bound, max_dist, initial_radius)
     best_distance = FLOAT32_INF_CONSTANT
     best_edge = wp.int32(-1)
     best_point = q
     for attempt in range(MAX_SEARCH_ATTEMPTS):
-        if attempt == MAX_SEARCH_ATTEMPTS - 1:
-            r = r_hard  # forced-complete final attempt: exact whatever the growth did
+        r = attempt_radius(attempt, r, r_hard)
         query = wp.bvh_query_sphere(bvh_id, q, r)
         edge_index = wp.int32(0)
         while wp.bvh_query_next(query, edge_index):

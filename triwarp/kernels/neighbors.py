@@ -6,7 +6,7 @@ from triwarp.constants import FLOAT32_INF_CONSTANT, INT64_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.array import declare_map_signatures, map_probe, map_probe_single
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
+from triwarp.kernels.reduce import block_chunk_1d
 
 # Iterative-deepening k-nearest search. A scan at radius ``r`` enumerates every point within
 # Euclidean distance ``r``, so a row whose k-th distance is at most ``r`` is provably the exact
@@ -382,16 +382,6 @@ def knn_bvh_scan(
 
 
 @wp.func
-def deepen_radius(worst: wp.float32, r: wp.float32, r_hard: wp.float32) -> wp.float32:
-    # Next search radius after an uncertified scan, shared by all four k-NN kernels. A full row
-    # (finite ``worst``) reaching past the cube certifies at exactly ``worst``, so jump there; an
-    # unfilled row has no bound to jump to and grows geometrically instead.
-    if worst < FLOAT32_INF_CONSTANT:
-        return wp.min(worst, r_hard)
-    return wp.min(r * RADIUS_GROWTH, r_hard)
-
-
-@wp.func
 def next_search_radius(worst: wp.float32, r: wp.float32, r_hard: wp.float32) -> wp.float32:
     # The iterative-deepening decision every exact search in this package makes after a scan at
     # radius ``r``, one definition because it is a *rule*, not arithmetic: the row is final when
@@ -402,7 +392,35 @@ def next_search_radius(worst: wp.float32, r: wp.float32, r_hard: wp.float32) -> 
         return wp.float32(-1.0)
     if r >= r_hard:
         return wp.float32(-1.0)
-    return deepen_radius(worst, r, r_hard)
+    # Deepen. A full row (finite ``worst``) reaching past the ball certifies at exactly ``worst``,
+    # so jump there; an unfilled row has no bound to jump to and grows geometrically instead.
+    if worst < FLOAT32_INF_CONSTANT:
+        return wp.min(worst, r_hard)
+    return wp.min(r * RADIUS_GROWTH, r_hard)
+
+
+@wp.func
+def search_radius_bounds(
+    q: wp.vec3,
+    min_bound: wp.vec3,
+    max_bound: wp.vec3,
+    max_radius: wp.float32,
+    initial_radius: wp.float32,
+) -> tuple[wp.float32, wp.float32]:
+    # The iterative deepening's two starting radii about query ``q``: the hard cap ``r_hard`` --
+    # the caller's ``max_radius`` or the radius at which a scan is provably complete, whichever is
+    # smaller -- and the first attempt's radius, the caller's seed held under that cap. A search
+    # with no caller cap passes ``FLOAT32_INF_CONSTANT``.
+    r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
+    return r_hard, wp.min(initial_radius, r_hard)
+
+
+@wp.func
+def attempt_radius(attempt: wp.int32, r: wp.float32, r_hard: wp.float32) -> wp.float32:
+    # The radius attempt ``attempt`` of a BVH deepening scans at: ``r``, except that the last of
+    # ``MAX_SEARCH_ATTEMPTS`` is forced complete, exact whatever the growth did. The hash-grid
+    # searches have no such attempt -- they fall back to the linear scan instead.
+    return wp.where(attempt == MAX_SEARCH_ATTEMPTS - 1, r_hard, r)
 
 
 @wp.kernel
@@ -423,8 +441,7 @@ def query_bvh_nearest_neighbors(
     out_indices_row = out_indices[tid]
     out_distances_row = out_distances[tid]
 
-    r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
-    r = wp.min(initial_radius, r_hard)
+    r_hard, r = search_radius_bounds(q, min_bound, max_bound, max_radius, initial_radius)
     # This kernel used to carry a note saying it may hold exactly one ``wp.bvh_query_*`` call site,
     # because ``bvh_query`` declares a large ``__shared__`` stack and a second textual call site
     # would double it and fail to compile. **That was never true of the plain query.** In
@@ -434,8 +451,7 @@ def query_bvh_nearest_neighbors(
     # block_dim=256 on Warp 1.17 with zero local memory. The single call site here is just what the
     # loop needs, not a constraint -- so a future edit needing a second one may add it.
     for attempt in range(MAX_SEARCH_ATTEMPTS):
-        if attempt == MAX_SEARCH_ATTEMPTS - 1:
-            r = r_hard  # forced-complete final attempt: exact whatever the growth did
+        r = attempt_radius(attempt, r, r_hard)
         worst = knn_bvh_scan(
             points, bvh_id, q, k, max_radius, r, out_indices_row, out_distances_row
         )
@@ -553,8 +569,7 @@ def _bvh_nearest_row_kernel(row_size: int, name: str):
         row_indices = vec_indices()
         row_distances = vec_distances()
 
-        r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
-        r = wp.min(initial_radius, r_hard)
+        r_hard, r = search_radius_bounds(q, min_bound, max_bound, max_radius, initial_radius)
         # The ball enumeration and its certificate are ``knn_bvh_scan``'s, which this factory
         # cannot call because the row lives in registers rather than in the output arrays; the
         # traversal is the only part duplicated, and the reason it is duplicated is the row type.
@@ -569,8 +584,7 @@ def _bvh_nearest_row_kernel(row_size: int, name: str):
         # more per node than a slab test, and at the bucket where row-insertion traffic and
         # traversal cost balance, the ~1.91x candidate saving stops covering it.
         for attempt in range(MAX_SEARCH_ATTEMPTS):
-            if attempt == MAX_SEARCH_ATTEMPTS - 1:
-                r = r_hard  # forced-complete final attempt: exact whatever the growth did
+            r = attempt_radius(attempt, r, r_hard)
             row_reset(row_distances, row_indices)
             query = wp.bvh_query_sphere(bvh_id, q, r)
             point_index = wp.int32(0)
@@ -693,8 +707,7 @@ def query_hashgrid_nearest_neighbors(
     out_indices_row = out_indices[tid]
     out_distances_row = out_distances[tid]
 
-    r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
-    r = wp.min(initial_radius, r_hard)
+    r_hard, r = search_radius_bounds(q, min_bound, max_bound, max_radius, initial_radius)
     for _attempt in range(MAX_SEARCH_ATTEMPTS):
         if not r <= widest:
             # Past ``widest`` a cell walk costs more than touching every point (and a NaN query
@@ -733,8 +746,7 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
         row_indices = vec_indices()
         row_distances = vec_distances()
 
-        r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
-        r = wp.min(initial_radius, r_hard)
+        r_hard, r = search_radius_bounds(q, min_bound, max_bound, max_radius, initial_radius)
         certified = wp.int32(0)
         for _attempt in range(MAX_SEARCH_ATTEMPTS):
             if not r <= widest:
@@ -890,13 +902,11 @@ def query_weighted_nearest_neighbors(
     tid = wp.int32(wp.tid())
     q = queries[tid]
 
-    r_hard = complete_radius(q, min_bound, max_bound)
-    r = wp.min(initial_radius, r_hard)
+    r_hard, r = search_radius_bounds(q, min_bound, max_bound, FLOAT32_INF_CONSTANT, initial_radius)
     best = FLOAT32_INF_CONSTANT
     best_index = wp.int32(-1)
     for attempt in range(MAX_SEARCH_ATTEMPTS):
-        if attempt == MAX_SEARCH_ATTEMPTS - 1:
-            r = r_hard  # forced-complete final attempt: exact whatever the growth did
+        r = attempt_radius(attempt, r, r_hard)
         query = wp.bvh_query_sphere(bvh_id, q, r)
         point_index = wp.int32(0)
         while wp.bvh_query_next(query, point_index):
@@ -936,10 +946,9 @@ def nearest_key_argmin(distances: wp.array[wp.float32], out_result: wp.array[wp.
     # ``ITEMS_PER_BLOCK_1D`` chunk by ``wp.block_dim()``, so on the CPU device, where that reads 1,
     # the single lane covers the chunk and the one-element tile holds its true minimum.
     chunk, lane = wp.tid()
-    offset, remaining = tile_chunk(distances.shape[0], chunk, ITEMS_PER_BLOCK_1D)
-    if remaining <= 0:
+    offset, count = block_chunk_1d(distances.shape[0], chunk)
+    if count <= 0:
         return
-    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     best = _NO_KEY
     for k in range(lane, count, wp.block_dim()):
         i = offset + k

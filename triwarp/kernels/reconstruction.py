@@ -14,8 +14,9 @@ from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
 from triwarp.kernels.array import (
     is_positive_finite,
     lattice_position,
+    pack_triangle_key,
     ravel_index,
-    sort3,
+    scanned_count,
     trilinear_cell,
     trilinear_corner,
     trilinear_weight,
@@ -30,7 +31,7 @@ from triwarp.kernels.predicates import (
     triangle_aspect_ratio,
     vector_angle,
 )
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, commit_sum_and_count, tile_chunk
+from triwarp.kernels.reduce import block_chunk_1d, commit_sum_and_count
 
 # Compile-time upper bound on the per-point fan size (neighbours kept for one center).
 # Per-thread scratch arrays are sized to this; the runtime ``max_neighbours`` must not exceed it.
@@ -61,10 +62,9 @@ def positive_finite_sum_and_count(
     # exact at any cloud size.
     i, t = wp.tid()
     n = values.shape[0]
-    base, remaining = tile_chunk(n, i, ITEMS_PER_BLOCK_1D)
+    base, remaining = block_chunk_1d(n, i)
     if remaining <= 0:
         return
-    remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     total = wp.float64(0.0)
     count = wp.float64(0.0)
     for k in range(t, remaining, wp.block_dim()):
@@ -573,16 +573,6 @@ def build_local_triangulations(
     out_counts[v] = slot
 
 
-@wp.func
-def scanned_count(inclusive: wp.array[wp.int32], i: wp.int32) -> tuple[wp.int32, wp.int32]:
-    # Exclusive offset and own count of entry ``i``, recovered from the in-place inclusive scan of
-    # the counts that overwrote them.
-    start = wp.int32(0)
-    if i > 0:
-        start = inclusive[i - 1]
-    return start, inclusive[i] - start
-
-
 @wp.kernel
 def candidate_triangle_keys(
     tris: wp.array3d[wp.int32],
@@ -592,19 +582,15 @@ def candidate_triangle_keys(
     out_slots: wp.array[wp.int32],
 ) -> None:
     # Launched over ``(n, k)``: fan slot ``(v, j)`` below point ``v``'s count writes, at its packed
-    # position, the unoriented key of its triangle -- the three indices sorted and packed in the
-    # mixed radix ``grouping.hash_indices_rows`` uses, so keys order and collide exactly as that
-    # function's would -- and its flat slot ``v * k + j`` as the sort payload. Slots ascend within
+    # position, the unoriented key of its triangle (``array.pack_triangle_key``, the mixed radix
+    # ``grouping.hash_indices_rows`` uses, so keys order and collide exactly as that function's
+    # would) -- and its flat slot ``v * k + j`` as the sort payload. Slots ascend within
     # the packed order, so a stable sort keeps the lowest slot first in every run of equal keys.
     v, j = wp.tid()
     start, count = scanned_count(inclusive_counts, v)
     if j >= count:
         return
-    s0, s1, s2 = sort3(tris[v, j, 0], tris[v, j, 1], tris[v, j, 2])
-    key = wp.uint64(wp.uint32(s0))
-    key = key + wp.uint64(wp.uint32(s1)) * radix
-    key = key + wp.uint64(wp.uint32(s2)) * radix * radix
-    out_keys[start + j] = key
+    out_keys[start + j] = pack_triangle_key(tris[v, j, 0], tris[v, j, 1], tris[v, j, 2], radix)
     out_slots[start + j] = v * tris.shape[1] + j
 
 

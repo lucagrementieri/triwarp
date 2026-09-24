@@ -7,6 +7,7 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import (
     declare_map_signatures,
     loop_next_slot,
+    loop_rim_edge_vertices,
     map_probe,
     map_probe_single,
     pack_nearest_key,
@@ -220,20 +221,6 @@ def char_area_from_max(max_edge_sq: wp.float32) -> wp.float32:
     return 1.0
 
 
-@wp.func
-def rim_edge_vertices(
-    flat_loops: wp.array[wp.int32],
-    loop_id: wp.array[wp.int32],
-    loop_starts: wp.array[wp.int32],
-    loop_sizes: wp.array[wp.int32],
-    slot: wp.int32,
-) -> tuple[wp.int32, wp.int32]:
-    # The two vertex ids of the rim edge leaving packed slot ``slot``, the far one wrapping inside
-    # its own loop. ``loop_rim_edge`` is the same edge read as positions; the two kernels below that
-    # need the ids as well -- to key the edge -- read them here.
-    return (flat_loops[slot], flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, slot)])
-
-
 @wp.kernel
 def loop_rim_metrics(
     flat_loops: wp.array[wp.int32],
@@ -258,7 +245,7 @@ def loop_rim_metrics(
     # edge's undirected key, which is ``rim_edge_keys``' output for the rim-opposite probe.
     t = wp.int32(wp.tid())
     ell = loop_id[t]
-    u, v = rim_edge_vertices(flat_loops, loop_id, loop_starts, loop_sizes, t)
+    u, v = loop_rim_edge_vertices(flat_loops, loop_id, loop_starts, loop_sizes, t)
     a = vertices[u]
     c = vertices[v]
     out_loop_pos[t] = a
@@ -804,7 +791,7 @@ def rim_edge_keys(
     # slot ``t``: the table ``probe_rim_edges`` searches. The fill computes the same keys inside
     # ``loop_rim_metrics``; this is the stand-alone form for a caller with no rim metrics to take.
     t = wp.int32(wp.tid())
-    u, v = rim_edge_vertices(flat_loops, loop_id, loop_starts, loop_sizes, t)
+    u, v = loop_rim_edge_vertices(flat_loops, loop_id, loop_starts, loop_sizes, t)
     out_keys[t] = kernel_array.pack_edge_key(u, v, base)
 
 

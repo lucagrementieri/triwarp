@@ -3,7 +3,7 @@ from typing import Any
 import warp as wp
 
 from triwarp.constants import INT32_MAX_CONSTANT, TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.adjacency import edge_endpoints, edge_pair_topology, write_face_edge_keys
+from triwarp.kernels.adjacency import edge_pair_topology, write_edge_row, write_face_edge_keys
 from triwarp.kernels.array import (
     LOOP_CONDITION,
     LOOP_ROUND,
@@ -27,7 +27,14 @@ from triwarp.kernels.predicates import (
     triangle_normal,
     vector_angle,
 )
-from triwarp.kernels.scatter import add_corner_triple, lock_two_rings
+from triwarp.kernels.scatter import (
+    add_corner_triple,
+    lock_two_rings,
+    mark_corners,
+    record_edge_incidence,
+    stamp_two_rings,
+    two_rings_hold,
+)
 from triwarp.kernels.triangles import (
     corner_triple,
     face_normal,
@@ -886,16 +893,15 @@ def emit_sorted_unique_edges(
 ) -> None:
     # ``edges.edges_unique``'s two returns from a sort of every corner's edge key: ``ranks`` is the
     # inclusive scan of ``mark_sorted_run_starts``, so ``ranks[i] - 1`` is the ascending-key unique
-    # index ``grouping.unique_1d`` assigns the key at sorted position ``i``. ``emit_unique_edges``
-    # below is the decimation pass's form, which differs only in its padded corners and capacity.
+    # index ``grouping.unique_1d`` assigns the key at sorted position ``i``. ``emit_pass_edges``
+    # below is the decimation pass's form: live corners and a capacity bound, a chunked exclusive
+    # scan in place of the inclusive one, and the incidence and adjacency slots in the same launch.
     i = wp.int32(wp.tid())
     corner = order[i]
     e = ranks[i] - 1
     out_inverse[corner] = e
     if starts[i] != 0:
-        a, b = edge_endpoints(faces, corner)
-        out_unique_edges[e, 0] = a
-        out_unique_edges[e, 1] = b
+        write_edge_row(faces, corner, e, out_unique_edges)
 
 
 @wp.func
@@ -1374,6 +1380,25 @@ def move_flips_normal(
     return False
 
 
+@wp.func
+def collapse_folds_a_face(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    vertex_face_offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    s: wp.int32,
+    r: wp.int32,
+    p: wp.vec3,
+) -> wp.bool:
+    # The fold veto of an edge collapse welding ``r`` onto ``s`` at ``p``: both endpoints move to
+    # ``p``, so both directions of ``move_flips_normal`` are tested, unconditionally -- even under a
+    # pinned placement, where ``s`` stays put and its half is a no-op. One decision rule for both
+    # decimators, ``collapse_candidates`` and ``quadric_collapse_candidates``.
+    return move_flips_normal(
+        vertices, faces, vertex_face_offsets, vertex_faces, r, s, p
+    ) or move_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, s, r, p)
+
+
 # ---------------------------------------------------------------------------
 # Readback-free decimation pass (see ``remesh._DecimationBuffers``)
 #
@@ -1458,45 +1483,18 @@ def collapse_candidates(
             if w != r and wp.length(p - vertices[w]) > high[w]:
                 return
 
-    # The fold veto, last because every test above rejects more cheaply. Spelled exactly as
-    # ``quadric_collapse_candidates`` spells it -- both directions, unconditionally -- because this
-    # is a *decision rule* shared by two decimators (AGENTS.md section 2.4).
+    # The fold veto (``collapse_folds_a_face``), last because every test above rejects more
+    # cheaply.
     #
     # Nothing else here notices a collapse that inverts an incident face: the link condition is
     # topological and the band walks above bound *lengths*. It is effectively free, because
     # rejecting a collapse early removes more downstream work than the vertex-face CSR costs.
-    if move_flips_normal(
-        vertices, faces, vertex_face_offsets, vertex_faces, r, s, p
-    ) or move_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, s, r, p):
+    if collapse_folds_a_face(vertices, faces, vertex_face_offsets, vertex_faces, s, r, p):
         return
 
     out_survivor[k] = s
     out_removed[k] = r
     out_pos[k] = p
-
-
-@wp.func
-def wins_key_everywhere(
-    offsets: wp.array[wp.int32],
-    columns: wp.array[wp.int32],
-    locks: wp.array[wp.int64],
-    s: wp.int32,
-    r: wp.int32,
-    key: wp.int64,
-) -> wp.bool:
-    # Does ``key`` win at every vertex of the two closed 1-rings? The read half of
-    # ``scatter.lock_two_rings``, and the same table: ``locks`` is a minimum over candidates
-    # *including this one*, so the test is equality rather than ``<=``. Equality is a sound win test
-    # only because ``scramble_index`` is injective.
-    if locks[s] != key or locks[r] != key:
-        return False
-    for i in range(offsets[s], offsets[s + 1]):
-        if locks[columns[i]] != key:
-            return False
-    for i in range(offsets[r], offsets[r + 1]):
-        if locks[columns[i]] != key:
-            return False
-    return True
 
 
 @wp.func
@@ -1510,12 +1508,13 @@ def scramble_index(index: wp.int32) -> wp.int64:
     # are. The high half is ``array.lowbias32`` with the top bit cleared, so the key stays
     # non-negative and ``INT64_MAX`` remains usable as the unclaimed sentinel.
     #
-    # **Injective**, which is why the key is 64 bits and not the natural 32: ``wins_key_everywhere``
-    # tests equality against a neighbourhood minimum, so two candidates sharing a key both win and
-    # both commit -- overlapping 1-rings, a corrupted mesh rather than a worse one. A masked
-    # ``lowbias32`` is exactly 2-to-1, so the index goes in the low half, which disturbs nothing but
-    # a tie: that now goes to the lower index instead of to both. It is also what lets both collapse
-    # paths run **one** lock pass rather than following it with a second, raw-index one.
+    # **Injective**, which is why the key is 64 bits and not the natural 32: the win test
+    # (``scatter.two_rings_hold``) is equality against a neighbourhood minimum, so two candidates
+    # sharing a key both win and both commit -- overlapping 1-rings, a corrupted mesh rather than a
+    # worse one. A masked ``lowbias32`` is exactly 2-to-1, so the index goes in the low half, which
+    # disturbs nothing but a tie: that now goes to the lower index instead of to both. It is also
+    # what lets both collapse paths run **one** lock pass rather than following it with a second,
+    # raw-index one.
     hashed = wp.int64(lowbias32(wp.uint32(index)) & wp.uint32(0x7FFFFFFF))
     return (hashed << wp.int64(32)) | wp.int64(index)
 
@@ -1530,7 +1529,7 @@ def claim_collapse_key(
 ) -> None:
     # The winning (smallest scrambled) key over the closed 1-rings of both endpoints. The quadric
     # pass makes the same claim inside ``drop_locked_and_claim``, and both read the answer the same
-    # way (``wins_key_everywhere``).
+    # way (``scatter.two_rings_hold``).
     #
     # The key is ``scramble_index(k)`` and not ``k`` for the reason that function records: a min-key
     # lock over a *spatially monotone* key field has essentially one local minimum, so it commits a
@@ -1562,7 +1561,7 @@ def commit_collapses(
     if s < 0:
         return
     r = removed[k]
-    if not wins_key_everywhere(offsets, columns, claim, s, r, scramble_index(k)):
+    if not two_rings_hold(offsets, columns, claim, s, r, scramble_index(k)):
         return
     out_remap[r] = s
     out_positions[s] = pos[k]
@@ -2167,9 +2166,7 @@ def cluster_remap_faces(
     write_corner_triple(out_faces, f, i0, i1, i2)
     out_distinct[f] = distinct
     if distinct:
-        out_referenced[i0] = 1
-        out_referenced[i1] = 1
-        out_referenced[i2] = 1
+        mark_corners(out_referenced, 0, i0, i1, i2, wp.int32(1))
 
 
 @wp.kernel
@@ -2491,7 +2488,7 @@ def begin_decimation_pass(
             out_keys[c + 1] = EDGE_KEY_PAD
             out_keys[c + 2] = EDGE_KEY_PAD
         else:
-            write_face_edge_keys(faces, t, base, out_keys)
+            write_face_edge_keys(faces, t, c, base, out_keys)
         out_order[c + 0] = c + 0
         out_order[c + 1] = c + 1
         out_order[c + 2] = c + 2
@@ -2661,12 +2658,8 @@ def emit_pass_edges(
     run_starts = scanned_prefix(start_prefix, start_chunk_offsets, i) + starts[i]
     e = wp.min(run_starts - 1, edge_capacity)
     if starts[i] != 0 and e < edge_capacity:
-        a, b = edge_endpoints(faces, corner)
-        out_unique_edges[e, 0] = a
-        out_unique_edges[e, 1] = b
-    slot = wp.atomic_add(out_edge_face_count, e, 1)
-    if slot < 2:
-        out_edge_faces[e, slot] = corner // 3
+        write_edge_row(faces, corner, e, out_unique_edges)
+    record_edge_incidence(e, corner, out_edge_face_count, out_edge_faces)
     out_corner_slots[corner] = wp.atomic_add(
         out_adjacency_counts, vertex_capacity + faces[corner], 1
     )
@@ -2806,9 +2799,7 @@ def quadric_collapse_candidates(
         optimum = to_vec3d(vertices[s])
     target = to_vec3(optimum)
 
-    if move_flips_normal(
-        vertices, faces, vertex_face_offsets, vertex_faces, r, s, target
-    ) or move_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, s, r, target):
+    if collapse_folds_a_face(vertices, faces, vertex_face_offsets, vertex_faces, s, r, target):
         return
 
     cost = wp.float32(quadric_error(quadric, optimum))
@@ -2860,15 +2851,8 @@ def unlocked_candidate(
     s = candidates[k]
     if s < 0:
         return -1
-    r = removed[k]
-    if locked[s] != 0 or locked[r] != 0:
+    if not two_rings_hold(offsets, columns, locked, s, removed[k], wp.int32(0)):
         return -1
-    for i in range(offsets[s], offsets[s + 1]):
-        if locked[columns[i]] != 0:
-            return -1
-    for i in range(offsets[r], offsets[r + 1]):
-        if locked[columns[i]] != 0:
-            return -1
     return s
 
 
@@ -2922,7 +2906,7 @@ def mark_collapse_winners(
     s = survivor[k]
     if s < 0:
         return
-    if not wins_key_everywhere(offsets, columns, min_key, s, removed[k], scramble_index(k)):
+    if not two_rings_hold(offsets, columns, min_key, s, removed[k], scramble_index(k)):
         out_survivor[k] = -1
         return
     p = rank[k]
@@ -3019,12 +3003,7 @@ def commit_budgeted_collapses(
     out_remap[r] = s
     out_positions[s] = target_pos[k]
     wp.atomic_add(out_count, 0, 1)
-    out_locked[s] = 1
-    out_locked[r] = 1
-    for i in range(offsets[s], offsets[s + 1]):
-        out_locked[columns[i]] = 1
-    for i in range(offsets[r], offsets[r + 1]):
-        out_locked[columns[i]] = 1
+    stamp_two_rings(offsets, columns, s, r, 1, out_locked)
 
 
 @wp.kernel
@@ -3063,9 +3042,7 @@ def remap_and_mark_faces(
     n_faces = faces.shape[0] // 3
     out_flags[f] = wp.where(distinct, wp.int32(1), wp.int32(0))
     if distinct:
-        out_flags[n_faces + i0] = 1
-        out_flags[n_faces + i1] = 1
-        out_flags[n_faces + i2] = 1
+        mark_corners(out_flags, n_faces, i0, i1, i2, wp.int32(1))
 
 
 @wp.func

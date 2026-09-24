@@ -1151,9 +1151,15 @@ class _BatchedCg:
                 self._cycle = _MultigridCycle(
                     *hierarchy, n_columns=self._n_columns, stride=self._stride
                 )
-        # 1 in the pad, so the fused Jacobi apply there is a no-op on an already-zero residual.
-        self._inv_diag = wp.full(self._stride, 1.0, dtype=wp.float64, device=device)
-        wp.map(kernel_array.inverse_or_one, wps.bsr_get_diag(matrix), out=self._inv_diag[: self._n])
+        # The Jacobi inverse diagonal, built only where the Jacobi apply reads it: every other
+        # preconditioner owns its own scaling. 1 in the pad, so the fused Jacobi apply there is a
+        # no-op on an already-zero residual.
+        self._inv_diag = None
+        if self._cycle is None:
+            self._inv_diag = wp.full(self._stride, 1.0, dtype=wp.float64, device=device)
+            wp.map(
+                kernel_array.inverse_or_one, wps.bsr_get_diag(matrix), out=self._inv_diag[: self._n]
+            )
         # Per-column view of ``r``, built once: ``_initialize`` still seeds and residual-corrects
         # it one column at a time (a one-time cost, unlike the per-iteration matvec in
         # ``_iteration``, which reads the flat buffers directly through ``csr_matvec``). Spans

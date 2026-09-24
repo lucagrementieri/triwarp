@@ -432,8 +432,8 @@ def mark_intersecting_pair_masks(
 # count rather than a falling share, and that figure *bounds* the saving rather than being it,
 # since the segment extraction's ordering and division are unique to it; the broad-phase AABB query
 # kernels are the overwhelming majority of the same call. And ``filter_intersecting_pairs`` backs
-# two call sites that never need a segment at all (``mesh_collision_pairs``,
-# ``validation.face_self_intersecting_mask``), so a single fused kernel would need a
+# call sites that never need a segment at all (``mesh_collision_pairs``,
+# ``validation.is_self_intersecting``), so a single fused kernel would need a
 # caller-selected tail rather than a clean merge.
 @wp.kernel
 def triangle_pair_segments(
@@ -633,8 +633,8 @@ def scatter_slice_class(
     n_faces: wp.int32,
     out_indices: wp.array[wp.int32],
 ) -> None:
-    # ``scatter.scatter_index_where`` over the blocked flag buffer, except that the value written is
-    # the *face* index rather than the flag index, so each block comes out addressing faces.
+    # A flag-driven compaction over the blocked flag buffer that writes the *face* index rather
+    # than the flag index, so each block comes out addressing faces.
     t = wp.int32(wp.tid())
     if flags[t] != 0:
         out_indices[inclusive[t] - 1] = t % n_faces

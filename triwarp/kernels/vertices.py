@@ -2,7 +2,12 @@ import warp as wp
 
 from triwarp.kernels.array import OverloadTable
 from triwarp.kernels.scatter import atomic_add_vec3
-from triwarp.kernels.triangles import face_corner_angles, face_normals_and_area, triangle_cross
+from triwarp.kernels.triangles import (
+    corner_triple,
+    face_corner_angles,
+    face_normals_and_area,
+    triangle_cross,
+)
 
 
 @wp.func
@@ -148,13 +153,11 @@ def add_max_corner_normals(
     # not already in the normal) and 1 when the normal is the raw cross. Forming ``scale * weight``
     # in float32 before the product is what the ``(n_faces, 3)`` weight table this replaced stored,
     # so the sum is byte-identical to ``scatter_weighted_sum_vec`` over that table.
-    base = f * wp.int32(3)
-    for c in range(3):
-        i0 = faces[base + c]
-        i1 = faces[base + (c + 1) % 3]
-        i2 = faces[base + (c + 2) % 3]
-        weight = scale * max_corner_inverse_edge_length_sq(vertices, i0, i1, i2)
-        atomic_add_vec3(out_sums, i0, normal * weight)
+    a, b, c = corner_triple(faces, f)
+    w0 = scale * max_corner_inverse_edge_length_sq(vertices, a, b, c)
+    w1 = scale * max_corner_inverse_edge_length_sq(vertices, b, c, a)
+    w2 = scale * max_corner_inverse_edge_length_sq(vertices, c, a, b)
+    add_to_face_corners(out_sums, faces, f, normal * w0, normal * w1, normal * w2)
 
 
 @wp.kernel

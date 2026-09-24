@@ -301,28 +301,22 @@ def init_sphere_radii_support(
     packed = packed_support[q]
     p = points[tid]
     n = normals[tid]
-    if packed == wp.uint64(0):
-        out_radii[tid] = wp.inf
-        out_not_converged[tid] = False
-        out_centers[tid] = sphere_center(p, n, wp.inf)
-        return
-
-    best = wp.int32(~wp.uint32(packed & wp.uint64(0xFFFFFFFF)))
-    max_proj = wp.dot(mesh_vertices[best], n) - wp.dot(p, n)
-
-    if max_proj < TOLERANCE_PLANAR_CONSTANT:
-        out_radii[tid] = wp.inf
-        out_not_converged[tid] = False
-        out_centers[tid] = sphere_center(p, n, wp.inf)
-        return
-
-    # `denom` is algebraically `2 * max_proj` (both are `2 * dot(mesh_vertices[best] - p, n)`), so
-    # this guard looks redundant against the one above -- it is not, on float32: the two are
-    # computed by differently-associated expressions (`dot(a, n) - dot(b, n)` above,
-    # `dot(a - b, n)` here), so they can disagree by a rounding error the `max_proj` check already
-    # cleared. Keep both; do not "simplify" by reusing `max_proj` in place of `denom`.
-    radius, found = tangent_sphere_radius(p, n, mesh_vertices[best])
-    radius = wp.where(found, radius, wp.float32(wp.inf))
+    # No support point, or one not above the tangent plane: no finite sphere, and nothing to
+    # shrink.
+    radius = wp.float32(wp.inf)
+    found = wp.bool(False)
+    if packed != wp.uint64(0):
+        best = wp.int32(~wp.uint32(packed & wp.uint64(0xFFFFFFFF)))
+        max_proj = wp.dot(mesh_vertices[best], n) - wp.dot(p, n)
+        # `denom` is algebraically `2 * max_proj` (both are `2 * dot(mesh_vertices[best] - p, n)`),
+        # so ``tangent_sphere_radius``'s own guard looks redundant against this one -- it is not,
+        # on float32: the two are computed by differently-associated expressions
+        # (`dot(a, n) - dot(b, n)` here, `dot(a - b, n)` there), so they can disagree by a rounding
+        # error this check already cleared. Keep both; do not "simplify" by reusing `max_proj` in
+        # place of `denom`.
+        if not (max_proj < TOLERANCE_PLANAR_CONSTANT):
+            radius, found = tangent_sphere_radius(p, n, mesh_vertices[best])
+            radius = wp.where(found, radius, wp.float32(wp.inf))
     out_radii[tid] = radius
     out_not_converged[tid] = found
     out_centers[tid] = sphere_center(p, n, radius)
@@ -355,34 +349,25 @@ def step_sphere_shrink(
     # converged no longer pays a BVH query whose answer it would ignore. The query and its miss
     # convention are ``proximity.closest_point_query``'s, so the values are the ones the separate
     # pass wrote.
+    #
+    # A lane that stops -- already converged, touching the surface, or with no tangent sphere --
+    # passes its radius and centre through unchanged; one publication serves every outcome.
     tid = wp.int32(wp.tid())
     p = points[tid]
+    radius = old_radii[tid]
     center = centers[tid]
-    if not not_converged[tid]:
-        out_radii[tid] = old_radii[tid]
-        out_centers[tid] = center
-        out_not_converged[tid] = False
-        return
-
-    nearest, nearest_distance, _face = closest_point_query(mesh_id, center, max_t)
-    dist_to_start = wp.length(center - p)
-
-    if wp.abs(nearest_distance - dist_to_start) < TOLERANCE_PLANAR_CONSTANT:
-        out_radii[tid] = old_radii[tid]
-        out_centers[tid] = center
-        out_not_converged[tid] = False
-        return
-
-    new_r, found = tangent_sphere_radius(p, normals[tid], nearest)
-    if not found:
-        out_radii[tid] = old_radii[tid]
-        out_centers[tid] = center
-        out_not_converged[tid] = False
-        return
-
-    out_radii[tid] = new_r
-    out_centers[tid] = p + normals[tid] * new_r
-    still_shrinking = old_radii[tid] - new_r >= convergence_threshold
+    still_shrinking = wp.bool(False)
+    if not_converged[tid]:
+        nearest, nearest_distance, _face = closest_point_query(mesh_id, center, max_t)
+        dist_to_start = wp.length(center - p)
+        if not (wp.abs(nearest_distance - dist_to_start) < TOLERANCE_PLANAR_CONSTANT):
+            new_r, found = tangent_sphere_radius(p, normals[tid], nearest)
+            if found:
+                still_shrinking = radius - new_r >= convergence_threshold
+                radius = new_r
+                center = sphere_center(p, normals[tid], new_r)
+    out_radii[tid] = radius
+    out_centers[tid] = center
     out_not_converged[tid] = still_shrinking
     # The next round's convergence count, taken by the kernel that decides it rather than by a
     # reduction launch over ``out_not_converged`` in the wrapper's loop.

@@ -6,6 +6,7 @@ from triwarp.kernels.array import (
     OverloadTable,
     binary_search_sorted_contains,
     cross2,
+    mark_at,
     pack_edge_key,
 )
 from triwarp.kernels.halfedge import halfedge_next, halfedge_prev
@@ -278,11 +279,8 @@ def mark_uv_seam_vertices(
         faces, twins, face_texcoords, has_face_texcoords, texcoords, match_uv, tolerance_sq, h
     )
     if kind == UV_EDGE_SEAM or (include_boundary and kind == UV_EDGE_BOUNDARY):
-        n = out_mask.shape[0]
-        for endpoint in range(2):
-            v = faces[wp.where(endpoint == 0, h, halfedge_next(h))]
-            if v >= 0 and v < n:
-                out_mask[v] = True
+        mark_at(out_mask, faces[h])
+        mark_at(out_mask, faces[halfedge_next(h)])
 
 
 @wp.kernel

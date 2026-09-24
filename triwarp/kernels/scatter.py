@@ -6,6 +6,8 @@ from triwarp.kernels.array import (
     OverloadTable,
     atomic_min_packed_box,
     binary_search_index,
+    mark_at,
+    scanned_count,
     trilinear_cell,
     trilinear_corner,
     trilinear_weight,
@@ -253,6 +255,19 @@ def scatter_unique_edges_sum_and_valence(
 
 
 @wp.func
+def mark_corners(
+    out_marks: wp.array[Any], offset: wp.int32, a: wp.int32, b: wp.int32, c: wp.int32, value: Any
+) -> None:
+    # Store ``value`` at ``offset`` plus each of a face's three corner vertices: the "vertex named
+    # by a kept face" marks every submesh compaction and mask dilation writes. Plain stores, so
+    # only for a value every racing writer agrees on; ``offset`` places the vertex half of a joint
+    # ``[faces | vertices]`` flag buffer.
+    out_marks[offset + a] = value
+    out_marks[offset + b] = value
+    out_marks[offset + c] = value
+
+
+@wp.func
 def lock_two_rings(
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
@@ -278,6 +293,49 @@ def lock_two_rings(
         wp.atomic_min(out_claim, columns[i], key)
 
 
+@wp.func
+def two_rings_hold(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    table: wp.array[Any],
+    s: wp.int32,
+    r: wp.int32,
+    value: Any,
+) -> wp.bool:
+    # Does every vertex of the two closed 1-rings of ``s`` and ``r`` hold ``value`` in ``table``?
+    # The read half of ``lock_two_rings`` (a candidate won its claim where the minimum is its own
+    # key) and of ``stamp_two_rings`` (a neighbourhood is untouched where no mark is set).
+    if table[s] != value or table[r] != value:
+        return False
+    for i in range(offsets[s], offsets[s + 1]):
+        if table[columns[i]] != value:
+            return False
+    for i in range(offsets[r], offsets[r + 1]):
+        if table[columns[i]] != value:
+            return False
+    return True
+
+
+@wp.func
+def stamp_two_rings(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    s: wp.int32,
+    r: wp.int32,
+    value: wp.int32,
+    out_marks: wp.array[wp.int32],
+) -> None:
+    # Store ``value`` into every vertex of the two closed 1-rings of ``s`` and ``r``: plain stores
+    # rather than ``lock_two_rings``' atomic minimum, so it is only for a value every racing writer
+    # agrees on.
+    out_marks[s] = value
+    out_marks[r] = value
+    for i in range(offsets[s], offsets[s + 1]):
+        out_marks[columns[i]] = value
+    for i in range(offsets[r], offsets[r + 1]):
+        out_marks[columns[i]] = value
+
+
 @wp.kernel
 def scatter_index(index: wp.array[wp.int32], out_scattered: wp.array[wp.int32]) -> None:
     tid = wp.int32(wp.tid())
@@ -285,34 +343,33 @@ def scatter_index(index: wp.array[wp.int32], out_scattered: wp.array[wp.int32]) 
 
 
 @wp.kernel
-def scatter_index_where(
-    flags: wp.array[wp.int32], inclusive: wp.array[wp.int32], out_scattered: wp.array[wp.int32]
-) -> None:
-    # ``flags`` is the 0/1 selection array and ``inclusive`` its inclusive prefix sum, so a set
-    # position lands at ``inclusive[i] - 1`` (its exclusive-scan value). Reading the flags rather
-    # than the original mask is what lets ``flatnonzero`` take non-boolean input from one kernel.
-    i = wp.int32(wp.tid())
-    if flags[i] != wp.int32(0):
-        out_scattered[inclusive[i] - 1] = i
-
-
-@wp.kernel
 def scatter_index_where_scanned(
     inclusive: wp.array[wp.int32], out_scattered: wp.array[wp.int32]
 ) -> None:
-    # ``scatter_index_where`` for a caller that scanned its 0/1 flags *in place*, so only the
-    # inclusive scan survives: position ``i`` was selected exactly when the scan steps there, and
-    # it lands at the step's own value minus one. One flag buffer fewer than the two-array form --
-    # ``array.flatnonzero`` allocates one ``(n,)`` ``int32`` instead of two -- for one neighbouring,
-    # coalesced read per thread.
+    # Scatter the index of every selected position to its compact slot, for a caller that scanned
+    # its 0/1 flags *in place*, so only the inclusive scan survives: position ``i`` was selected
+    # exactly when the scan steps there (``array.scanned_count``), and it lands at the exclusive
+    # value. One flag buffer fewer than keeping the flags beside their scan -- ``array.flatnonzero``
+    # allocates one ``(n,)`` ``int32`` instead of two -- for one neighbouring, coalesced read per
+    # thread.
     i = wp.int32(wp.tid())
-    position = inclusive[i]
-    # A branch, not ``wp.where``: that evaluates both arms, and ``inclusive[-1]`` is out of bounds.
-    before = wp.int32(0)
-    if i > 0:
-        before = inclusive[i - 1]
-    if position != before:
-        out_scattered[position - 1] = i
+    start, count = scanned_count(inclusive, i)
+    if count != 0:
+        out_scattered[start] = i
+
+
+@wp.func
+def record_edge_incidence(
+    e: wp.int32,
+    corner: wp.int32,
+    out_edge_face_count: wp.array[wp.int32],
+    out_edge_faces: wp.array2d[wp.int32],
+) -> None:
+    # Count corner ``corner``'s face onto unique edge ``e`` and record it in the edge's first two
+    # face slots; the count doubles as the write cursor (``scatter_edge_incidence`` below).
+    slot = wp.atomic_add(out_edge_face_count, e, 1)
+    if slot < 2:
+        out_edge_faces[e, slot] = corner // 3
 
 
 @wp.kernel
@@ -337,10 +394,7 @@ def scatter_edge_incidence(
     # it, because ``homology.homology_generators`` groups the same rows for the same reason -- one
     # grouping answering "how many faces meet along this edge, and which" for the whole package.
     c = wp.int32(wp.tid())
-    e = inverse[c]
-    slot = wp.atomic_add(out_edge_face_count, e, 1)
-    if slot < 2:
-        out_edge_faces[e, slot] = c // 3
+    record_edge_incidence(inverse[c], c, out_edge_face_count, out_edge_faces)
 
 
 @wp.kernel
@@ -381,14 +435,9 @@ def scatter_face_labels_to_vertices(
 
 
 @wp.kernel
-def mark_membership_mask(
-    indices: wp.array[wp.int32], n: wp.int32, out_mask: wp.array[wp.bool]
-) -> None:
-    # Mark out_mask[indices[tid]] = True, skipping out-of-range indices (negative or >= n).
-    tid = wp.int32(wp.tid())
-    index = indices[tid]
-    if index >= wp.int32(0) and index < n:
-        out_mask[index] = wp.bool(True)
+def mark_membership_mask(indices: wp.array[wp.int32], out_mask: wp.array[wp.bool]) -> None:
+    # Mark ``out_mask[indices[tid]] = True``, skipping out-of-range indices (``array.mark_at``).
+    mark_at(out_mask, indices[wp.int32(wp.tid())])
 
 
 @wp.kernel(enable_backward=False)

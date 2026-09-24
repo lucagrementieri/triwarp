@@ -1178,21 +1178,6 @@ def free_in_mixed_component(
     return free and component_size != free_in_component
 
 
-@wp.kernel
-def mark_incident_vertices(
-    faces: wp.array[wp.int32], face_mask: wp.array[wp.bool], out_mask: wp.array[wp.bool]
-) -> None:
-    # Mark every corner of every selected face. Concurrent writes all store ``True``, so the race is
-    # benign and no atomic is needed.
-    face = wp.int32(wp.tid())
-    if not face_mask[face]:
-        return
-    first, second, third = corner_triple(faces, face)
-    out_mask[first] = True
-    out_mask[second] = True
-    out_mask[third] = True
-
-
 @wp.func
 def region_side_value(inside: wp.bool) -> wp.float64:
     # The field the rim curve is the zero set of: -1 on the region, +1 outside it. Any two values of

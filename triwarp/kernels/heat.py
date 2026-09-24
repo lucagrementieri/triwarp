@@ -19,7 +19,7 @@ from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import to_vec2, to_vec2d
 from triwarp.kernels.linalg import free_row
 from triwarp.kernels.predicates import normalize_or_zero, unit_tangent, world_to_tangent
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, commit_sum_and_count, tile_chunk
+from triwarp.kernels.reduce import block_chunk_1d, commit_sum_and_count
 from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import corner_triple, face_unit_gradient, face_vertices_vec3d
 
@@ -42,10 +42,9 @@ def upper_edge_length_sum_and_count(
     # ``wp.block_dim()`` (right on the CPU device too), and one tile sum per quantity commits.
     i, t = wp.tid()
     n = offsets.shape[0] - 1
-    base, remaining = tile_chunk(n, i, ITEMS_PER_BLOCK_1D)
+    base, remaining = block_chunk_1d(n, i)
     if remaining <= 0:
         return
-    remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     total = wp.float64(0.0)
     count = wp.float64(0.0)
     for k in range(t, remaining, wp.block_dim()):

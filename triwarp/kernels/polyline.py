@@ -20,7 +20,7 @@ from triwarp.kernels.predicates import (
     project_out_normal,
     vector_angle,
 )
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, tile_chunk
+from triwarp.kernels.reduce import block_chunk_1d
 
 
 @wp.func
@@ -86,10 +86,9 @@ def accumulate_newell_normal(
     chunk, lane = wp.tid()
     n = polyline.shape[0]
     n_pairs = n - is_loop[0]
-    offset, remaining = tile_chunk(n_pairs, chunk, ITEMS_PER_BLOCK_1D)
-    if remaining <= 0:
+    offset, count = block_chunk_1d(n_pairs, chunk)
+    if count <= 0:
         return
-    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     local = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
     for k in range(lane, count, wp.block_dim()):
         i = offset + k
@@ -710,10 +709,9 @@ def accumulate_loop_frame(
     # unconditional atomics per element and so three times the contention.
     chunk, lane = wp.tid()
     n = polyline.shape[0]
-    offset, remaining = tile_chunk(n, chunk, ITEMS_PER_BLOCK_1D)
-    if remaining <= 0:
+    offset, count = block_chunk_1d(n, chunk)
+    if count <= 0:
         return
-    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     normal = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
     weighted = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
     length_total = wp.float32(0.0)
@@ -783,10 +781,9 @@ def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_sums: wp.array[wp.
     # of non-negative whole numbers is zero only when every term is.
     chunk, lane = wp.tid()
     n = points2d.shape[0]
-    offset, remaining = tile_chunk(n, chunk, ITEMS_PER_BLOCK_1D)
-    if remaining <= 0:
+    offset, count = block_chunk_1d(n, chunk)
+    if count <= 0:
         return
-    count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     local = wp.float32(0.0)
     reflex = wp.float32(0.0)
     reflex_mirrored = wp.float32(0.0)
@@ -1038,12 +1035,9 @@ def polyline_total_length(
     # ``wp.copy`` for one extra segment, and it dominated the closed form once the reduction itself
     # was fused.
     i, lane = wp.tid()
-    offset, remaining = tile_chunk(n_segments, i, ITEMS_PER_BLOCK_1D)
+    offset, remaining = block_chunk_1d(n_segments, i)
     if remaining <= 0:
         return
-    # ``tile_chunk`` reports what is left to the end of the array, not this block's share of it --
-    # see its own docstring, and ``kernels/reduce._reduce_bool_1d_tiled`` for the same clamp.
-    remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     n_points = points.shape[0]
     total = wp.float32(0.0)
     for k in range(lane, remaining, wp.block_dim()):
@@ -1093,10 +1087,9 @@ def polyline_weighted_midpoint_sums(
     # one readback. The same lane-strided shape and the same closed-polyline index wrap as
     # ``polyline_total_length``; see it for both, including why the last bits of the sums move.
     i, lane = wp.tid()
-    offset, remaining = tile_chunk(n_segments, i, ITEMS_PER_BLOCK_1D)
+    offset, remaining = block_chunk_1d(n_segments, i)
     if remaining <= 0:
         return
-    remaining = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     n_points = points.shape[0]
     weighted = wp.vec3(0.0, 0.0, 0.0)
     total = wp.float32(0.0)

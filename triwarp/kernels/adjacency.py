@@ -8,10 +8,15 @@ from triwarp.kernels.triangles import corner_triple
 
 @wp.func
 def write_face_edge_keys(
-    faces: wp.array[wp.int32], f: wp.int32, base: wp.uint64, out_keys: wp.array[wp.uint64]
+    faces: wp.array[wp.int32],
+    f: wp.int32,
+    slot: wp.int32,
+    base: wp.uint64,
+    out_keys: wp.array[wp.uint64],
 ) -> None:
-    # The three undirected edge keys of face ``f``, written at ``3f .. 3f + 2``. Edge ``3f + k``
-    # belongs to face ``f``, which is what lets ``edge_pairs_to_face_pairs`` and
+    # The three undirected edge keys of face ``f``, in corner order, at ``slot .. slot + 2``.
+    # Every caller here but ``selection.deleted_face_edge_keys`` passes ``slot = 3f``: edge
+    # ``3f + k`` then belongs to face ``f``, which is what lets ``edge_pairs_to_face_pairs`` and
     # ``edge_endpoints`` recover everything else from an edge index alone.
     #
     # ``pack_edge_key`` is byte-identical to what ``pack_indices`` produces for the sorted edge row
@@ -21,9 +26,9 @@ def write_face_edge_keys(
     i0 = faces[c + 0]
     i1 = faces[c + 1]
     i2 = faces[c + 2]
-    out_keys[c + 0] = pack_edge_key(i0, i1, base)
-    out_keys[c + 1] = pack_edge_key(i1, i2, base)
-    out_keys[c + 2] = pack_edge_key(i2, i0, base)
+    out_keys[slot + 0] = pack_edge_key(i0, i1, base)
+    out_keys[slot + 1] = pack_edge_key(i1, i2, base)
+    out_keys[slot + 2] = pack_edge_key(i2, i0, base)
 
 
 @wp.kernel
@@ -33,7 +38,8 @@ def face_edge_keys(
     # One launch in place of ``faces_to_edges`` + ``pack_indices``, so the intermediate
     # ``(3F, 2)`` edge rows are never materialized. ``remesh.begin_decimation_pass`` writes the same
     # keys over a fixed-capacity buffer, differing only in a sentinel key past the live faces.
-    write_face_edge_keys(faces, wp.tid(), base, out_keys)
+    f = wp.int32(wp.tid())
+    write_face_edge_keys(faces, f, 3 * f, base, out_keys)
 
 
 @wp.func
@@ -46,6 +52,18 @@ def edge_endpoints(faces: wp.array[wp.int32], edge_index: wp.int32) -> tuple[wp.
     a = faces[face_base + corner]
     b = faces[face_base + (corner + 1) % 3]
     return wp.min(a, b), wp.max(a, b)
+
+
+@wp.func
+def write_edge_row(
+    faces: wp.array[wp.int32], edge_index: wp.int32, row: wp.int32, out_edges: wp.array2d[wp.int32]
+) -> None:
+    # Write edge ``edge_index``'s sorted endpoints (``edge_endpoints``) as row ``row`` of an
+    # ``(m, 2)`` edge table: how every kernel emitting a unique-edge row from a representative
+    # corner fills it, with no ``(3 * n_faces, 2)`` table to gather from.
+    a, b = edge_endpoints(faces, edge_index)
+    out_edges[row, 0] = a
+    out_edges[row, 1] = b
 
 
 @wp.func
@@ -82,9 +100,7 @@ def edge_pairs_to_face_pairs_and_edges(
     # a caller's precomputed table there.
     tid = wp.int32(wp.tid())
     write_face_pair(edge_groups, tid, out_adjacency)
-    a, b = edge_endpoints(faces, edge_groups[tid, 0])
-    out_edges[tid, 0] = a
-    out_edges[tid, 1] = b
+    write_edge_row(faces, edge_groups[tid, 0], tid, out_edges)
 
 
 @wp.kernel

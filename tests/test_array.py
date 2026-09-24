@@ -1265,13 +1265,13 @@ def test_require_same_device_flags_a_mismatch_and_ignores_none(device: str) -> N
 
 
 @pytest.mark.parametrize("sizes", [(3, 0, 5, 1), (4,), (0, 0, 2)])
-def test_segment_owner_labels_total_matches_terminated(device, sizes):
+def test_segment_owner_labels_unterminated_matches_repeat(device, sizes):
     """
-    Not a library comparison: pins the unterminated kernel to ``numpy.repeat`` of the labels.
+    Not a library comparison: pins the unterminated form to ``numpy.repeat`` of the labels.
 
-    ``segment_owner_labels_total`` takes the exclusive scan without its terminator plus the total
-    as a scalar; the answer must be the same owner array the terminated kernel writes, including
-    empty segments and an empty trailing segment.
+    ``segment_owner_labels`` takes the exclusive scan without its terminator plus the total as a
+    scalar; the answer must be the same owner array the terminated form writes, including empty
+    segments and an empty trailing segment.
     """
     from triwarp.kernels import array as kernel_array
 
@@ -1281,7 +1281,7 @@ def test_segment_owner_labels_total_matches_terminated(device, sizes):
     offsets_wp = wp.array(offsets_np, dtype=wp.int32, device=device)
     owner_wp = wp.full(total, -1, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_array.segment_owner_labels_total,
+        kernel_array.segment_owner_labels,
         dim=len(sizes),
         inputs=[offsets_wp, wp.int32(total), owner_wp],
         device=device,
