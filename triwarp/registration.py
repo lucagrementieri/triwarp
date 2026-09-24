@@ -640,9 +640,10 @@ def icp_point_to_plane(
         ``"huber"``, i.e. ``r^2`` within ``k`` and ``k |r|`` beyond it; and for ``"tukey"`` twice
         the biweight loss, ``c^2 / 3 * (1 - (1 - (r / c)^2)^3)`` within ``c`` and ``c^2 / 3``
         beyond it, so a correspondence the kernel rejects still counts at the saturated value. It
-        is evaluated at the pose the final step was solved *from*: ``matrix`` includes that step
-        and ``cost`` does not. ``math.inf`` when no iteration ran, or none found a correspondence
-        carrying weight.
+        is the objective of the returned ``matrix`` itself, over correspondences found at that
+        pose -- one more correspondence pass after the last step, so it is also defined with
+        ``max_iterations=0``, where it scores the initial transform. ``math.inf`` when no
+        correspondence at that pose carries weight.
 
     Raises
     ------
@@ -790,6 +791,7 @@ def icp_point_to_plane(
     assert normal_source is not None
     parity = 0
     step_pending = False
+    weightless = False
     for iteration in range(max_iterations):
         jtj, jtr, scalar_acc = accumulators[parity]
         next_jtj, next_jtr, next_scalars = accumulators[parity ^ 1]
@@ -880,6 +882,7 @@ def icp_point_to_plane(
         else:
             scalars = scalar_acc.numpy()
         if float(scalars[kernel_registration.ICP_WEIGHT_SUM]) <= 0.0:
+            weightless = True
             break
         cost = float(scalars[kernel_registration.ICP_COST])
 
@@ -919,15 +922,76 @@ def icp_point_to_plane(
             break
         old_cost = cost
 
-    if step_pending:
+    # ``cost`` is the objective of the transform returned, not of the pose the last step was solved
+    # from: one more correspondence pass at the returned pose, and one more accumulation over it.
+    # Where the loop stopped because nothing carried weight, the correspondences it just found are
+    # already the returned pose's, and with no inlier there is no objective to report.
+    if weightless:
+        return total, current, math.inf
+    jtj, jtr, scalar_acc = accumulators[parity]
+    if mesh is not None:
+        # Against a mesh this pass is also where the last step is applied, as inside the loop; with
+        # no step pending (no iteration ran) it re-derives the seed from ``a`` bit for bit.
+        source, source_step, moved = (
+            (current, step, updated) if step_pending else (a, total, current)
+        )
         wp.launch(
-            kernel_transform.apply_transform_mat44,
+            kernel_registration.mesh_correspondence_pass,
             dim=n,
-            inputs=[current, step, updated],
+            inputs=[
+                mesh.id,
+                source,
+                source_step,
+                wp.float32(query_max),
+                normal_source,
+                moved,
+                closest,
+                distance,
+                triangle_id,
+                normals,
+            ],
             device=device,
         )
-        current = updated
-    return total, current, cost
+        current = moved
+    else:
+        assert target_index is not None
+        assert nearest_rows is not None
+        _nearest_into(target_vertices, current, target_index, nearest_rows)
+        wp.launch(
+            kernel_registration.cloud_correspondence_pass,
+            dim=n,
+            inputs=[target_vertices, normal_source, triangle_id, closest, normals],
+            device=device,
+        )
+    if kind != 0 and scale_value is None:
+        scale_value = _robust_scale_from_residuals(
+            current, closest, normals, distance, triangle_id, max_d, kind
+        )
+    # This accumulator set is zero: the last solve cleared it for the iteration that did not run,
+    # or, with no iteration run, it is the zero-initialized first set.
+    wp.launch_tiled(
+        kernel_registration.accumulate_point_to_plane,
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[
+            current,
+            closest,
+            normals,
+            distance,
+            triangle_id,
+            wp.float32(max_d),
+            wp.int32(kind),
+            wp.float32(scale_value if scale_value is not None else 0.0),
+            jtj,
+            jtr,
+            scalar_acc,
+        ],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    scalars = scalar_acc.numpy()
+    if float(scalars[kernel_registration.ICP_WEIGHT_SUM]) <= 0.0:
+        return total, current, math.inf
+    return total, current, float(scalars[kernel_registration.ICP_COST])
 
 
 def _nearest_into(

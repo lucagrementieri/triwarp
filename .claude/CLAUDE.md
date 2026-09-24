@@ -5992,7 +5992,13 @@ change. Probes are in `plans/benchmark-round-15-data/probes/`.
       re-enter it. It now tests the biweight loss `2 rho`, monotone in `|r|`; converges to 0.01
       degrees, and `none` / `huber` / MAD-scale Tukey poses are bit-identical.
       `test_icp_point_to_plane_tukey_converges_from_outside_its_kernel` fails on the old loop.
-      Documented, not changed: the returned `cost` is at the pose the last step was solved from.
+      **And `cost` now scores the returned transform**: it had been the objective at the pose the
+      last step was solved *from*, one step behind `matrix` -- at one iteration the *starting*
+      pose's error, 130x the returned pose's, and `inf` at `max_iterations=0`. One more
+      correspondence pass and accumulation after the loop (merged with the pending step for a mesh
+      target) fixes it, at 0.92-0.98x on the benchmark rows; `matrix` and `transformed` are
+      bit-identical. `icp` (point-to-point) keeps its fit-residual `cost`, which is already the
+      returned matrix's and is what trimesh's parity pins.
     - **`query_nearest(out=)` declined at 0.97x**: the two `(m, 1)` views a rank-1 `out` needs per
       call plus the checks cost more than the allocation they replace. `registration` launches the
       k=1 kernel directly, guarded by an equality test.

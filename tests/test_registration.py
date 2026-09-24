@@ -1047,6 +1047,46 @@ def test_icp_point_to_plane_mesh(half_torus: tuple[tm.Trimesh, wp.Mesh], device:
     assert _rms(transformed_wp.numpy(), vertices_np) < 1e-3
 
 
+@pytest.mark.parametrize("max_iterations", [0, 1, 3, 30])
+def test_icp_point_to_plane_cost_is_the_returned_poses_objective(
+    half_torus: tuple[tm.Trimesh, wp.Mesh], device: str, max_iterations: int
+) -> None:
+    """
+    Class A, against trimesh's closest point: ``cost`` scores the transform actually returned.
+
+    The oracle re-derives the point-to-plane objective from scratch at ``transformed``: trimesh's
+    closest point on the target and that triangle's normal, ``sum (n . (p - q))^2``. An earlier
+    ``cost`` was measured at the pose the last step was solved *from*, so it lagged ``matrix`` by
+    one step -- at one iteration it reported the starting pose's error, some 100x the returned
+    pose's -- and was ``inf`` at ``max_iterations=0``. The 1- and 3-iteration arms are the ones
+    that tell the two apart, the converged arm the one where they nearly coincide. Mutation probe:
+    restoring the lagging cost fails the 0-, 1- and 3-iteration arms, by ``inf``, 177x and 1e6x.
+
+    ``rtol=1e-2`` rather than ``1e-5``: a closest point on a shared edge ties two triangles, whose
+    normals give different residuals, and the two sides break the tie independently; at the far
+    starting pose that is 0.12 % of the sum.
+    """
+    mesh_tm, mesh_wp = half_torus
+    vertices_np, faces_np = _mesh_vertices_faces(mesh_tm)
+    rotation_np, translation_np = _rigid_transform(0.1, [0.2, 0.6, 0.3], [0.03, -0.02, 0.04])
+    source_np = (vertices_np @ rotation_np.T + translation_np).astype(np.float32)
+    source_wp = points_to_warp(source_np, mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=mesh_wp.device)
+
+    _, transformed_wp, cost_tw = tw.registration.icp_point_to_plane(
+        source_wp, vertices_wp, faces_wp, max_iterations=max_iterations, threshold=-np.inf
+    )
+
+    target_tm = tm.Trimesh(vertices_np, faces_np.reshape(-1, 3), process=False)
+    points_np = transformed_wp.numpy().astype(np.float64)
+    closest_np, _distance, triangle_np = tm.proximity.closest_point(target_tm, points_np)
+    residual_np = np.einsum("ij,ij->i", target_tm.face_normals[triangle_np], points_np - closest_np)
+    cost_tm = float(np.sum(residual_np**2))
+    assert cost_tm > 0.0  # non-vacuity: a zero objective would match any zero cost
+    assert np.isclose(cost_tw, cost_tm, rtol=1e-2, atol=1e-9), (cost_tw, cost_tm)
+
+
 def test_icp_point_to_plane_robust_outliers(
     half_torus: tuple[tm.Trimesh, wp.Mesh], device: str
 ) -> None:
