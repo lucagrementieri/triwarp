@@ -708,6 +708,56 @@ def test_icp_point_to_plane_matches_open3d(
     assert _rms(moved_o3d, target_np) < 1e-4
 
 
+@pytest.mark.parity("icp_point_to_plane_cloud", "open3d")
+@pytest.mark.parametrize("max_iterations", [0, 1, 3, 30])
+def test_icp_point_to_plane_cost_matches_open3d_evaluation(
+    device: str, max_iterations: int, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Class B (``cost == rmse^2 * n``): ``cost`` is Open3D's own evaluation of the returned pose.
+
+    ``registration_icp`` returns the evaluation of its final transformation over correspondences
+    searched again at that pose, and scores the initial transformation when no iteration runs.
+    Both halves come straight from Open3D here: ``evaluate_registration`` re-searches the
+    correspondences at triwarp's returned ``matrix``, and the point-to-plane estimator's
+    ``compute_rmse`` scores them as ``sqrt(mean((n . (p - q))^2))``. So ``cost`` -- ``sum r^2`` for
+    ``"none"`` -- must equal ``rmse^2`` times the correspondence count, the named transform.
+
+    The 0-, 1- and 3-iteration arms are what bind it: a ``cost`` taken one step before the returned
+    pose fails them by ``inf``, 75x and 15x (mutation probe), and the converged arm is where the two
+    conventions meet.
+    """
+    mesh_tm, _mesh_tm_wp = icosphere
+    target_np = np.asarray(mesh_tm.vertices, dtype=np.float32)
+    normals_np = np.asarray(mesh_tm.vertex_normals, dtype=np.float32)
+    rotation_np, translation_np = _rigid_transform(0.08, [0.1, 0.9, 0.2], [0.02, -0.01, 0.015])
+    source_np = (target_np @ rotation_np.T + translation_np).astype(np.float32)
+
+    _matrix_wp, transformed_wp, cost_wp = tw.registration.icp_point_to_plane(
+        points_to_warp(source_np, device),
+        points_to_warp(target_np, device),
+        target_normals=points_to_warp(normals_np, device),
+        max_iterations=max_iterations,
+        threshold=-np.inf,
+    )
+
+    # Open3D is handed the returned points themselves rather than re-applying ``matrix`` in
+    # float64 to the source: the two are the same pose to float32 rounding, which at the
+    # 3-iteration arm is 4e-4 of the objective, and
+    # ``test_icp_point_to_plane_mesh_transformed_is_matrix_image`` already pins that they agree.
+    moved_o3d = points_to_open3d(transformed_wp.numpy())
+    target_o3d = points_to_open3d(target_np, normals_np)
+    evaluation_o3d = o3d.pipelines.registration.evaluate_registration(moved_o3d, target_o3d, 1e9)
+    correspondences_o3d = evaluation_o3d.correspondence_set
+    assert len(correspondences_o3d) == source_np.shape[0]  # every point corresponds at 1e9
+    rmse_o3d = o3d.pipelines.registration.TransformationEstimationPointToPlane().compute_rmse(
+        moved_o3d, target_o3d, correspondences_o3d
+    )
+    cost_o3d = rmse_o3d**2 * len(correspondences_o3d)
+    assert cost_o3d > 0.0  # non-vacuity: a zero objective would match any zero cost
+    assert np.isclose(cost_wp, cost_o3d, rtol=1e-4, atol=1e-9), (cost_wp, cost_o3d)
+
+
 @pytest.mark.parity("icp_point_to_plane_cloud", "meshlib")
 def test_icp_point_to_plane_matches_meshlib(
     device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]

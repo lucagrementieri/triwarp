@@ -5997,8 +5997,17 @@ change. Probes are in `plans/benchmark-round-15-data/probes/`.
       pose's error, 130x the returned pose's, and `inf` at `max_iterations=0`. One more
       correspondence pass and accumulation after the loop (merged with the pending step for a mesh
       target) fixes it, at 0.92-0.98x on the benchmark rows; `matrix` and `transformed` are
-      bit-identical. `icp` (point-to-point) keeps its fit-residual `cost`, which is already the
-      returned matrix's and is what trimesh's parity pins.
+      bit-identical. **This is Open3D's convention**, read from `RegistrationICP`: it returns
+      `GetRegistrationResultAndCorrespondences` at the final transformation, i.e. correspondences
+      searched again at the returned pose, and at `max_iteration=0` it scores the initial one.
+      `test_icp_point_to_plane_cost_matches_open3d_evaluation` pins it with Open3D's own
+      `evaluate_registration` + point-to-plane `compute_rmse` (`cost == rmse^2 * n`); the lagging
+      cost fails its 0/1/3-iteration arms. Open3D's *reported* quantity differs (a point-to-point
+      `inlier_rmse` plus `fitness`, whatever the estimator), which is why the test scores through
+      the estimator rather than reading `inlier_rmse`. `icp` (point-to-point) keeps trimesh's
+      convention -- the fit residual of the returned matrix against the correspondences it was
+      fitted to -- which its trimesh parity pins. **Both are "the returned pose"; they differ in
+      which correspondences, and each follows its reference. Neither is a bug to align.**
     - **`query_nearest(out=)` declined at 0.97x**: the two `(m, 1)` views a rank-1 `out` needs per
       call plus the checks cost more than the allocation they replace. `registration` launches the
       k=1 kernel directly, guarded by an equality test.
