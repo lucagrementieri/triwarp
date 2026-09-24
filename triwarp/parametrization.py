@@ -401,13 +401,14 @@ def _solve_fixed_boundary(
     # hierarchy worth building. Routed through ``"auto"`` rather than forced, so the gate's own
     # size floor can still decline a system too small to repay the setup cost; the switch is on
     # ``k`` rather than on the gate alone because a plain (``k == 1``) Laplacian's rows nearly sum
-    # to zero and wants iterations, not levels.
+    # to zero and wants iterations, not levels -- and with only the boundary pinned they are many,
+    # which is the long solve the polynomial preconditioner is for.
     sol, free_map, _ = twl.min_quad_with_fixed(
         q,
         fixed_mask,
         twt.as_array2d(fixed_values, wp.float64),
         tol=_CG_TOLERANCE,
-        preconditioner="auto" if k >= 2 else "diag",
+        preconditioner="auto" if k >= 2 else "chebyshev",
     )
 
     out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
@@ -622,6 +623,7 @@ def arap(
         twt.as_array2d(sol, wp.float64),
         tol=tolerance,
         maxiter=10 * n_interior,
+        preconditioner="chebyshev",
     )
 
     for _ in range(max_iterations):
@@ -787,8 +789,14 @@ def lscm(
             device=device,
         )
 
+    # Two pinned vertices leave a system as long to solve as it is large: the polynomial
+    # preconditioner's case.
     sol, free_map, _ = twl.min_quad_with_fixed(
-        q, fixed_mask, twt.as_array2d(fixed_values, wp.float64), tol=_CG_TOLERANCE
+        q,
+        fixed_mask,
+        twt.as_array2d(fixed_values, wp.float64),
+        tol=_CG_TOLERANCE,
+        preconditioner="chebyshev",
     )
 
     out_uv = wp.empty(n, dtype=wp.vec2, device=device)

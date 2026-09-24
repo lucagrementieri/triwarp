@@ -559,6 +559,43 @@ def combine_components(x: wp.float64, y: wp.float64, z: wp.float64) -> wp.vec3d:
 
 
 @wp.kernel
+def operator_row_abs_sums(
+    offsets: wp.array[wp.int32], values: wp.array[wp.float32], out_sums: wp.array[wp.float64]
+) -> None:
+    # ``sum_j |L_ij|`` per row, the infinity norm the fixed-point iteration below contracts by. An
+    # empty row reads 1: ``operator_row`` applies it as the identity.
+    i = wp.int32(wp.tid())
+    start = offsets[i]
+    end = offsets[i + 1]
+    total = wp.float64(0.0)
+    for k in range(start, end):
+        total += wp.abs(wp.float64(values[k]))
+    out_sums[i] = wp.where(end == start, wp.float64(1.0), total)
+
+
+@wp.kernel
+def implicit_laplacian_step(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    lamb: wp.float64,
+    rhs: wp.array[wp.vec3d],
+    x: wp.array[wp.vec3d],
+    out_x: wp.array[wp.vec3d],
+) -> None:
+    # One step of the fixed-point iteration for the backward-Euler system
+    # ``((1 + lamb) I - lamb L) x = rhs``: ``x' = (rhs + lamb L x) / (1 + lamb)``. It contracts by
+    # ``lamb ||L||_inf / (1 + lamb)`` whatever ``L``'s symmetry, which conjugate gradient needs.
+    # Each thread reads ``rhs`` at its own row only, so ``out_x`` may alias ``rhs`` -- the last
+    # step writes the answer over it -- but never ``x``, which the row sum reads at other rows.
+    # Shares ``operator_row`` with the explicit step, empty-row convention included.
+    i = wp.int32(wp.tid())
+    out_x[i] = (rhs[i] + lamb * operator_row(offsets, columns, values, x, i)) / (
+        wp.float64(1.0) + lamb
+    )
+
+
+@wp.kernel
 def implicit_laplacian_triplets(
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],

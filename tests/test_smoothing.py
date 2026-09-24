@@ -174,6 +174,39 @@ def test_filter_laplacian_implicit(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> N
     assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus"])
+@pytest.mark.parametrize("lamb", [0.5, 5.0, 50.0])
+def test_filter_laplacian_implicit_on_open_meshes(
+    request: pytest.FixtureRequest, mesh_name: str, lamb: float
+) -> None:
+    """
+    Class A: the implicit filter against trimesh, on closed *and* open meshes, at every ``lamb``.
+
+    The uniform operator is built from directed ``mesh.edges`` (trimesh's own convention), so on a
+    mesh with a boundary the backward-Euler system is not symmetric. A conjugate-gradient solve of
+    it -- what this used to be -- matched trimesh on the closed icosahedron the older test above
+    uses and returned vertices ~1e4 off on ``hemisphere`` at ``lamb = 5``; the open arms are the
+    point. ``lamb = 50`` pushes the fixed-point step count past its cap, so it exercises the
+    BiCGSTAB fallback.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    smoothed_wp = tw.smoothing.filter_laplacian(
+        mesh_wp.points,
+        mesh_wp.indices,
+        lamb=lamb,
+        iterations=3,
+        implicit_time_integration=True,
+        volume_constraint=False,
+    )
+    mesh_ref = mesh_tm.copy()
+    tms.filter_laplacian(
+        mesh_ref, lamb=lamb, iterations=3, implicit_time_integration=True, volume_constraint=False
+    )
+    # Non-vacuity: the filter must actually move the mesh.
+    assert np.abs(mesh_ref.vertices - mesh_tm.vertices).max() > 1e-3
+    assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-4, atol=1e-4)
+
+
 def test_filter_laplacian_pluggable_operator(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = half_torus
     operator = tw.laplacian.laplacian(mesh_wp.points, mesh_wp.indices, equal_weight=False)

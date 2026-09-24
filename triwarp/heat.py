@@ -155,7 +155,9 @@ def heat_operators(
     poisson_system : warp.sparse.BsrMatrix
         ``-L``, the positive-semi-definite Poisson operator.
     poisson_preconditioner : ``warp.optim.linear.LinearOperator``
-        Jacobi preconditioner for ``poisson_system``.
+        Jacobi-Chebyshev polynomial preconditioner for ``poisson_system``
+        ([`chebyshev_preconditioner`][triwarp.linalg.chebyshev_preconditioner]), built on its first
+        apply.
     cot_entries : twt.Array2dFloat32
         ``(n_faces, 3)`` per-face half-cotangent weights, reused by the divergence. Always
         ``float32`` regardless of the ``cot_entries`` precision passed in or built internally.
@@ -166,16 +168,19 @@ def heat_operators(
 
     Notes
     -----
-    The Poisson operator and both Jacobi preconditioners are here because they satisfy this
+    The Poisson operator and both preconditioners are here because they satisfy this
     function's own contract — they depend on the mesh alone — so
     [`heat_geodesic`][triwarp.heat.heat_geodesic] need not rebuild all three on every call, which
     is unnecessary work whenever the mesh is unchanged across several solves. It is *only* those
     three — the solver **state** is deliberately not cached, because a ``warp.optim.linear`` state
     captures its right-hand-side and solution buffers at construction, which would make these
     operators stateful and unsafe to share between two concurrent solves. The remaining lever for
-    repeated calls is conditioning — a preconditioner stronger than Jacobi on a cotangent operator —
-    the same conclusion the constrained-solve family reaches in
-    [`harmonic`][triwarp.parametrization.harmonic].
+    repeated calls is conditioning. The Poisson solve is the long one -- ``-L`` is the
+    ill-conditioned operator here, where the heat system's mass term keeps it close to diagonal --
+    so it takes the polynomial preconditioner and the heat system keeps Jacobi, which a
+    well-conditioned solve of a few tens of iterations cannot beat. The polynomial holds working
+    vectors of its own, so two solves against one ``poisson_preconditioner`` must run on one
+    stream, as every caller here does.
 
     !!! note
         ``solve_spd`` **warm-starts from whatever the solution buffer already holds**, so reusing
@@ -249,15 +254,15 @@ def heat_operators(
         "wps.BsrMatrix[wp.float64]",
         wps.bsr_axpy(x=laplacian, y=mass_diag, alpha=-float(t), beta=1.0),
     )
-    # Poisson operator ``-L`` and the two Jacobi preconditioners: mesh-only, so they belong here
-    # rather than in every solve. See Notes.
+    # Poisson operator ``-L`` and the two preconditioners: mesh-only, so they belong here rather
+    # than in every solve. See Notes.
     poisson_system = cast("wps.BsrMatrix[wp.float64]", wps.bsr_axpy(x=laplacian, alpha=-1.0))
     return (
         heat_system,
         wpl.preconditioner(heat_system, "diag"),
         laplacian,
         poisson_system,
-        wpl.preconditioner(poisson_system, "diag"),
+        twl.chebyshev_preconditioner(poisson_system),
         # Narrowed to float32 by the block above, whichever precision it arrived in.
         cast(twt.Array2dFloat32, cot_entries),
         normals,
@@ -625,7 +630,15 @@ def _solve_poisson_zero_set(
     )
 
     solution = wp.zeros((1, n_free), dtype=wp.float64, device=device)
-    twl.solve_spd_columns(operator_uu, rhs, twt.as_array2d(solution, wp.float64), tol=_CG_TOLERANCE)
+    # The same Poisson operator as the unpinned solve, less the curve's rows, so the same
+    # polynomial preconditioner; see ``heat_operators``' Notes.
+    twl.solve_spd_columns(
+        operator_uu,
+        rhs,
+        twt.as_array2d(solution, wp.float64),
+        tol=_CG_TOLERANCE,
+        preconditioner="chebyshev",
+    )
     field = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
         kernel_heat.gather_free_solution,

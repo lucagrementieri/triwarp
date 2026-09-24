@@ -43,12 +43,17 @@ available, but Warp has no sparse triangular solve, and no parallel substitute k
 a Jacobi-sweep approximation, an exact apply parallelized by graph coloring (whose uncoalesced
 access and extra launches eat most of its iteration win), and natural-ordering level sets (whose
 level count swings wildly with the input's vertex numbering) are all worse than Jacobi in practice.
-Chebyshev as a single-level preconditioner is also worse; Chebyshev as the V-cycle's *smoother* is a
-separate question -- see ``_MULTIGRID_SWEEPS`` -- and neither decline covers the other. Neither
-covers a *squared* operator either: there the polynomial is not in the operator itself but in its
-second-order square root, and
-[`squared_laplacian_preconditioner`][triwarp.linalg.squared_laplacian_preconditioner] is the one
-place a Chebyshev polynomial is the right tool.
+
+**The exception is a polynomial**, because the ``sqrt(k)`` argument counts mat-vecs and a solve here
+is bound by *launches*: an iteration is half a dozen launches and two reductions, while one step of
+a Chebyshev polynomial in ``D⁻¹ A`` is a single fused mat-vec launch.
+[`chebyshev_preconditioner`][triwarp.linalg.chebyshev_preconditioner] trades the iterations for
+those steps and wins several-fold on long, ill-conditioned Laplacian solves -- the Poisson half of
+the heat method, a graded patch -- while a short, well-conditioned one (a heat system, whose mass
+term keeps it near diagonal) is faster under plain Jacobi. So it is an opt-in, taken where a caller
+knows its solve is long. Chebyshev as the V-cycle's *smoother* is a separate question -- see
+``_MULTIGRID_SWEEPS`` -- and so is a *squared* operator, where the polynomial is in its second-order
+square root: [`squared_laplacian_preconditioner`][triwarp.linalg.squared_laplacian_preconditioner].
 
 Two further obstacles are specific to this repository. Obtuse triangles give negative cotangent
 weights, so ``-L`` is often not the M-matrix IC(0) existence requires; and both
@@ -567,7 +572,10 @@ def solve_spd_columns(
         on device; see Notes for the tradeoff and the warning above for what it does to the return
         type.
     preconditioner
-        ``"diag"`` (the default) for the Jacobi preconditioner, ``"multigrid"`` for the
+        ``"diag"`` (the default) for the Jacobi preconditioner, ``"chebyshev"`` for the
+        Jacobi-Chebyshev polynomial [`chebyshev_preconditioner`]
+        [triwarp.linalg.chebyshev_preconditioner] applies -- the choice for a long solve of a
+        symmetric Laplacian-like system, and a loss on a short one -- ``"multigrid"`` for the
         smoothed-aggregation V-cycle [`multigrid_preconditioner`]
         [triwarp.linalg.multigrid_preconditioner] builds, or ``"auto"`` to let the operator decide.
         ``"auto"`` first tests the assembled system against
@@ -594,7 +602,7 @@ def solve_spd_columns(
     Raises
     ------
     ValueError
-        If ``preconditioner`` is not one of the three names above. It is rejected rather than
+        If ``preconditioner`` is not one of the four names above. It is rejected rather than
         treated as ``"diag"``, so a misspelling cannot turn into a silently slower solve.
     RuntimeError
         If ``rhs`` and ``solution`` are not all on one device.
@@ -632,9 +640,9 @@ def solve_spd_columns(
       saves is cheap, while the extra iterations it can cause are real work -- the smaller the
       solve, the worse the trade.
 
-    The *preconditioner* is not a knob worth turning beyond ``"diag"`` / ``"multigrid"`` /
-    ``"auto"``: IC(0) and Chebyshev both come out a wash or a loss against Jacobi. See "Why Jacobi"
-    in the [`triwarp.linalg`][triwarp.linalg] module documentation. The *per-iteration* cost of
+    The *preconditioner* is not a knob worth turning beyond these four: IC(0) comes out a wash or a
+    loss against Jacobi, and ``"chebyshev"`` wins only where the solve is long. See "Why Jacobi" in
+    the [`triwarp.linalg`][triwarp.linalg] module documentation. The *per-iteration* cost of
     batching was a separate lever and has been taken: with more than one column this runs triwarp's
     own conjugate gradient rather than ``warp.optim.linear``'s, because Warp's reduction degrades on
     precisely the batched input the worst-case stopping rule needs -- see "Whose conjugate gradient"
@@ -703,7 +711,7 @@ def spd_column_solver(
         [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] for the tradeoff and for what the
         default ``0`` does to the values each call returns.
     preconditioner
-        ``"diag"`` or ``"multigrid"``, as in
+        ``"diag"``, ``"chebyshev"`` or ``"multigrid"``, as in
         [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]. Built once here and reused by every
         call against this state, which is the shape the V-cycle's setup cost wants. ``"auto"`` is
         **not** accepted: it decides on the first solve -- from that system's operator, and from
@@ -725,7 +733,7 @@ def spd_column_solver(
     Raises
     ------
     ValueError
-        If ``preconditioner`` is ``"auto"``, for the reason above, or is not one of the two names
+        If ``preconditioner`` is ``"auto"``, for the reason above, or is not one of the three names
         this accepts.
     RuntimeError
         If ``rhs`` and ``solution`` are not all on one device.
@@ -821,9 +829,9 @@ def _cg_columns(
             check_every=check_every,
             caller=caller,
         )
-    # A squared-Laplacian preconditioner is an ``apply`` over this module's padded column blocks,
-    # which only ``_BatchedCg`` drives -- so it takes that path at any column count.
-    if isinstance(preconditioner, SquaredLaplacianPreconditioner):
+    # A polynomial preconditioner is an ``apply`` over this module's padded column blocks, which
+    # only ``_BatchedCg`` drives -- so it takes that path at any column count.
+    if isinstance(preconditioner, SquaredLaplacianPreconditioner) or preconditioner == "chebyshev":
         state = _BatchedCg(
             matrix,
             rhs,
@@ -840,8 +848,8 @@ def _cg_columns(
     # ``"diag"`` and with nothing but the clock to tell the caller.
     if preconditioner not in ("diag", "multigrid"):
         raise ValueError(
-            f'{caller}: unknown preconditioner {preconditioner!r}, expected "diag", "multigrid" '
-            'or "auto".'
+            f'{caller}: unknown preconditioner {preconditioner!r}, expected "diag", "chebyshev", '
+            '"multigrid" or "auto".'
         )
     if n_columns > 1:
         # ``_BatchedCg`` exists only for this branch; a single column already reaches
@@ -995,8 +1003,8 @@ def _offdiagonal_dominance(matrix: wps.BsrMatrix[wp.float64]) -> float:
 
     One launch and one max-reduction, so the whole thing is cheap relative to the solve it is
     deciding about, essentially independent of the operator's size. The only host readback is the
-    reduced scalar. Rows with a non-positive diagonal contribute 0 rather than an infinity -- see
-    the kernel.
+    reduced scalar. The diagonal is taken in magnitude, so either sign convention reads the same,
+    and a row with a zero diagonal contributes 0 rather than an infinity -- see the kernel.
     """
     n_rows = int(matrix.nrow)
     device = matrix.values.device
@@ -1135,6 +1143,8 @@ class _BatchedCg:
         self._cycle = None
         if isinstance(preconditioner, SquaredLaplacianPreconditioner):
             self._cycle = preconditioner.bind(self._n_columns, self._stride)
+        elif preconditioner == "chebyshev":
+            self._cycle = _JacobiChebyshev(matrix).bind(self._n_columns, self._stride)
         elif preconditioner == "multigrid":
             hierarchy = _multigrid_hierarchy(matrix, 0)
             if hierarchy is not None:
@@ -1601,6 +1611,89 @@ def multigrid_preconditioner(
     return wpl.LinearOperator((total, total), base.dtype, base.device, matvec)
 
 
+def chebyshev_preconditioner(
+    matrix: wps.BsrMatrix[wp.float64], n_columns: int = 1
+) -> wpl.LinearOperator:
+    """
+    Jacobi-Chebyshev polynomial preconditioner for a second-order symmetric definite operator.
+
+    Applies ``z = p(D⁻¹ A) D⁻¹ r``, with ``D`` the diagonal of ``A`` and ``p`` the fixed
+    degree-[`CHEBYSHEV_DEGREE`][triwarp.linalg.CHEBYSHEV_DEGREE] Chebyshev polynomial that
+    approximates ``1 / x`` over an interval covering ``D⁻¹ A``'s spectrum -- the Chebyshev
+    semi-iteration on the Jacobi-scaled system, run a fixed number of steps from zero. That is
+    ``D^-1/2 p(D^-1/2 A D^-1/2) D^-1/2``, symmetric, and definite with the sign of ``A`` whenever
+    ``p`` is positive on the spectrum, which the interval guarantees: its upper end is ``D⁻¹ A``'s
+    Gershgorin bound and its lower end,
+    [`CHEBYSHEV_INTERVAL`][triwarp.linalg.CHEBYSHEV_INTERVAL] over the unknown count, only sets how
+    well the low end is resolved -- ``p`` stays positive below it.
+
+    A conjugate-gradient solve on this hardware is bound by its launches rather than its flops, and
+    each step of the polynomial is one fused mat-vec launch, where each iteration it removes is
+    half a dozen launches and two reductions. So the iteration count falls several-fold and the
+    solve with it, on well- and ill-conditioned Laplacian systems alike. It needs no setup beyond
+    one copy of the matrix and one reduction for the bound: unlike
+    [`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner] there is no hierarchy.
+
+    The setup -- one copy of the matrix and the bound's reduction, which reads one scalar back --
+    runs at the operator's **first apply**, so building one that is never applied is free. That
+    first apply therefore cannot sit inside a CUDA graph capture; ``warp.optim.linear.cg`` makes it
+    before its own captured loop.
+
+    !!! warning "The operator must be symmetric"
+        ``p(D⁻¹ A) D⁻¹`` is symmetric only when ``A`` is, and conjugate gradient needs a symmetric
+        preconditioner. Jacobi is symmetric whatever ``A`` is, which is why a mildly asymmetric
+        system -- a row-normalized Laplacian's boundary rows -- still converges under it; do not
+        hand such a system to this.
+
+    Parameters
+    ----------
+    matrix
+        ``(n, n)`` symmetric positive- or negative-(semi-)definite operator, ``float64``, whose
+        diagonal carries its sign -- a cotangent Laplacian in either convention, a mass-plus-
+        stiffness heat system. An empty row is allowed: the unknown no equation touches stays at
+        zero.
+    n_columns
+        Number of independent right-hand-side columns the operator will be applied to.
+
+    Returns
+    -------
+    ``warp.optim.linear.LinearOperator``
+        The preconditioner, of shape ``(n_columns * n, n_columns * n)`` over ``n_columns``
+        contiguous blocks, as [`replicated_operator`][triwarp.linalg.replicated_operator] lays
+        them out.
+
+    Raises
+    ------
+    ValueError
+        If the returned operator's ``matvec`` is called with ``alpha != 1`` or ``beta != 0``. A
+        preconditioner apply is always ``z = M x``.
+
+    See Also
+    --------
+    [`solve_spd`][triwarp.linalg.solve_spd]
+    [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
+    [`squared_laplacian_preconditioner`][triwarp.linalg.squared_laplacian_preconditioner]
+    """
+    n = int(matrix.nrow)
+    # Built on the first apply rather than here, so an operator handed out and never applied costs
+    # nothing: the bound's reduction reads a scalar back, which would drain whatever the caller
+    # has queued.
+    cycle: list[_JacobiChebyshevApply] = []
+
+    def matvec(x: twt.ArrayNd, y: twt.ArrayNd, z: twt.ArrayNd, alpha: float, beta: float) -> None:
+        if alpha != 1.0 or beta != 0.0:
+            raise ValueError(
+                "chebyshev_preconditioner's operator only implements z = M x "
+                f"(got alpha={alpha}, beta={beta})"
+            )
+        if not cycle:
+            cycle.append(_JacobiChebyshev(matrix).bind(n_columns, n))
+        cycle[0].apply(x, z)
+
+    total = n_columns * n
+    return wpl.LinearOperator((total, total), wp.float64, matrix.values.device, matvec)
+
+
 def squared_laplacian_preconditioner(
     laplacian: wps.BsrMatrix[wp.float64], weight_sums: wp.array[wp.float64]
 ) -> SquaredLaplacianPreconditioner:
@@ -1667,6 +1760,14 @@ SQUARED_LAPLACIAN_DEGREE = 12
 SQUARED_LAPLACIAN_INTERVAL = 40.0
 SQUARED_LAPLACIAN_INTERVAL_CAP = 0.5
 
+# Degree and interval of ``chebyshev_preconditioner``'s polynomial: ``degree - 1`` fused mat-vec
+# launches per apply, and a lower end of ``CHEBYSHEV_INTERVAL / n`` under the same cap. Both sit
+# where the solve's total launch count is flat, from a few thousand unknowns to twenty thousand and
+# across the uniform and graded members of the saddle pair; a lower end several times smaller
+# costs up to twice the iterations, a larger one is flat.
+CHEBYSHEV_DEGREE = 12
+CHEBYSHEV_INTERVAL = 80.0
+
 
 class SquaredLaplacianPreconditioner:
     """
@@ -1699,57 +1800,60 @@ class SquaredLaplacianPreconditioner:
         # so an eigenvalue beyond a fixed 2 would be amplified rather than inverted.
         lower = min(SQUARED_LAPLACIAN_INTERVAL / max(self._n, 1), SQUARED_LAPLACIAN_INTERVAL_CAP)
         upper = 1.0 + max(_offdiagonal_dominance(laplacian), 1.0)
-        # The semi-iteration's scalars depend on the interval alone, so they are host constants:
-        # ``(scale, momentum, step)`` per launch.
-        theta, delta = 0.5 * (upper + lower), 0.5 * (upper - lower)
-        sigma = theta / delta
-        rho = 1.0 / sigma
-        self._steps: list[tuple[float, float, float]] = []
-        for index in range(SQUARED_LAPLACIAN_DEGREE - 1):
-            rho_next = 1.0 / (2.0 * sigma - rho)
-            scale = 1.0 / theta if index == 0 else 1.0
-            self._steps.append((scale, rho_next * rho, 2.0 * rho_next / delta))
-            rho = rho_next
+        self._steps = _chebyshev_steps(lower, upper, SQUARED_LAPLACIAN_DEGREE)
 
     def bind(self, n_columns: int, stride: int) -> _SquaredLaplacianApply:
         """Working vectors for ``n_columns`` blocks at column pitch ``stride``."""
         return _SquaredLaplacianApply(self, n_columns, stride)
 
 
-class _SquaredLaplacianApply:
-    """``z = B Bᵀ r`` over the padded column blocks of one conjugate-gradient state."""
+class _ChebyshevApply:
+    """
+    Working vectors for Chebyshev polynomials over the padded column blocks of one CG state.
 
-    def __init__(self, owner: SquaredLaplacianPreconditioner, n_columns: int, stride: int) -> None:
-        self._owner = owner
-        self._n = owner._n
+    Shared by both polynomial preconditioners, which differ only in what they wrap the polynomial
+    in: [`SquaredLaplacianPreconditioner`][triwarp.linalg.SquaredLaplacianPreconditioner] applies
+    two factors, ``B Bᵀ``, and ``_JacobiChebyshev`` one, after a Jacobi scaling.
+    """
+
+    def __init__(
+        self,
+        n: int,
+        n_columns: int,
+        stride: int,
+        steps: list[tuple[float, float, float, float]],
+        device: wp.DeviceLike,
+    ) -> None:
+        self._n = n
         self._stride = stride
-        self._device = owner._device
-        self._dim = n_columns * self._n
-        # Zeroed: every step writes the ``n`` live rows of a column and nothing in the pad, and the
-        # first step of each factor reads ``zero`` as the iterate before the first.
-        dofs = n_columns * stride
-        self._middle = wp.zeros(dofs, dtype=wp.float64, device=self._device)
-        self._zero = wp.zeros(dofs, dtype=wp.float64, device=self._device)
-        self._spare = [wp.zeros(dofs, dtype=wp.float64, device=self._device) for _ in range(3)]
-
-    def apply(self, source: wp.array[wp.float64], destination: wp.array[wp.float64]) -> None:
-        """``destination = B Bᵀ source``: ``Bᵀ`` first, then ``B``."""
-        self._polynomial(self._owner._factor_t, source, self._middle)
-        self._polynomial(self._owner._factor, self._middle, destination)
+        self._steps = steps
+        self._device = device
+        self._dim = n_columns * n
+        # Zeroed: every step writes the ``n`` live rows of a column and nothing in the pad, which
+        # the conjugate-gradient state reduces over.
+        self._dofs = n_columns * stride
+        self._spare = [wp.zeros(self._dofs, dtype=wp.float64, device=device) for _ in range(3)]
 
     def _polynomial(
         self,
         factor: wps.BsrMatrix[wp.float64],
         source: wp.array[wp.float64],
         destination: wp.array[wp.float64],
+        row_scale: wp.array[wp.float64] | None = None,
     ) -> None:
-        """``destination = p(factor) source``, one launch per Chebyshev step."""
-        steps = self._owner._steps
+        """
+        ``destination = p(factor) source``, one launch per Chebyshev step.
+
+        With ``row_scale``, ``p(diag(row_scale) factor) source`` instead, scaled inside each step.
+        """
+        steps = self._steps
         # Three rotating iterates: a step reads the current and the previous one and writes a
         # third, so none of the three may be ``source`` or ``destination`` until the last write.
-        previous, current = self._zero, source
+        # The first two steps read ``source`` in the place of the iterates no launch writes; see
+        # ``chebyshev_step``.
+        previous, current = source, source
         free = list(self._spare)
-        for index, (scale, momentum, step) in enumerate(steps):
+        for index, (scale, previous_scale, momentum, step) in enumerate(steps):
             target = destination if index == len(steps) - 1 else free.pop()
             wp.launch(
                 kernel_mg.chebyshev_step,
@@ -1758,11 +1862,14 @@ class _SquaredLaplacianApply:
                     wp.int32(self._n),
                     wp.int32(self._stride),
                     wp.float64(scale),
+                    wp.float64(previous_scale),
                     wp.float64(momentum),
                     wp.float64(step),
                     factor.offsets,
                     factor.columns,
                     factor.values,
+                    wp.int32(0 if row_scale is None else 1),
+                    row_scale,
                     source,
                     current,
                     previous,
@@ -1770,10 +1877,108 @@ class _SquaredLaplacianApply:
                 outputs=[target],
                 device=self._device,
             )
-            # The buffer two steps back is free again; ``source`` and ``zero`` never are.
-            if previous is not self._zero and previous is not source:
+            # The buffer two steps back is free again; ``source`` never is.
+            if previous is not source:
                 free.append(previous)
             previous, current = current, target
+
+
+class _SquaredLaplacianApply(_ChebyshevApply):
+    """``z = B Bᵀ r`` over the padded column blocks of one conjugate-gradient state."""
+
+    def __init__(self, owner: SquaredLaplacianPreconditioner, n_columns: int, stride: int) -> None:
+        super().__init__(owner._n, n_columns, stride, owner._steps, owner._device)
+        self._owner = owner
+        self._middle = wp.zeros(self._dofs, dtype=wp.float64, device=self._device)
+
+    def apply(self, source: wp.array[wp.float64], destination: wp.array[wp.float64]) -> None:
+        """``destination = B Bᵀ source``: ``Bᵀ`` first, then ``B``."""
+        self._polynomial(self._owner._factor_t, source, self._middle)
+        self._polynomial(self._owner._factor, self._middle, destination)
+
+
+class _JacobiChebyshev:
+    """``A``, ``D⁻¹`` and the polynomial's steps in ``D⁻¹ A``, for one operator."""
+
+    def __init__(self, matrix: wps.BsrMatrix[wp.float64]) -> None:
+        self._n = int(matrix.nrow)
+        self._device = matrix.values.device
+        # ``A`` itself, not a row-scaled copy: each step scales its row's product by ``D⁻¹``, which
+        # is the same arithmetic without the copy -- and ``bsr_copy`` is most of what a setup would
+        # otherwise cost.
+        self._matrix = matrix
+        self._inverse_diagonal = wp.empty(self._n, dtype=wp.float64, device=self._device)
+        wp.map(kernel_array.inverse_or_one, wps.bsr_get_diag(matrix), out=self._inverse_diagonal)
+        # Gershgorin's discs for ``D⁻¹ A`` are centred on 1 with radius ``r_i = sum_j |A_ij| /
+        # |A_ii|``, whatever the diagonal's sign. ``1 + max r`` bounds the spectrum from above, and
+        # a polynomial fitted short of it changes sign past its end, as a clamped negative
+        # cotangent weight takes a regular grid's spectrum past 2. A diagonally dominant operator
+        # (a heat system's mass-plus-stiffness) also has ``1 - max r`` as a lower bound, which is
+        # far tighter than the ``1 / n`` scale a Laplacian's smallest eigenvalue falls at.
+        # The radius is floored so that a diagonal operator still has an interval to fit.
+        dominance = max(_offdiagonal_dominance(matrix), 1e-3)
+        lower = max(
+            min(CHEBYSHEV_INTERVAL / max(self._n, 1), SQUARED_LAPLACIAN_INTERVAL_CAP),
+            1.0 - dominance,
+        )
+        upper = 1.0 + dominance
+        self._steps = _chebyshev_steps(lower, upper, CHEBYSHEV_DEGREE)
+
+    def bind(self, n_columns: int, stride: int) -> _JacobiChebyshevApply:
+        """Working vectors for ``n_columns`` blocks at column pitch ``stride``."""
+        return _JacobiChebyshevApply(self, n_columns, stride)
+
+
+class _JacobiChebyshevApply(_ChebyshevApply):
+    """``z = p(D⁻¹ A) D⁻¹ r`` over the padded column blocks of one conjugate-gradient state."""
+
+    def __init__(self, owner: _JacobiChebyshev, n_columns: int, stride: int) -> None:
+        super().__init__(owner._n, n_columns, stride, owner._steps, owner._device)
+        self._owner = owner
+        self._scaled = wp.zeros(self._dofs, dtype=wp.float64, device=self._device)
+
+    def apply(self, source: wp.array[wp.float64], destination: wp.array[wp.float64]) -> None:
+        """``destination = p(D⁻¹ A) D⁻¹ source``: the Jacobi scaling, then the polynomial."""
+        wp.launch(
+            kernel_cg.scaled_diagonal_apply,
+            dim=self._dofs,
+            inputs=[
+                wp.int32(self._n),
+                wp.int32(self._stride),
+                self._owner._inverse_diagonal,
+                wp.float64(1.0),
+                source,
+                self._scaled,
+            ],
+            device=self._device,
+        )
+        self._polynomial(
+            self._owner._matrix, self._scaled, destination, row_scale=self._owner._inverse_diagonal
+        )
+
+
+def _chebyshev_steps(
+    lower: float, upper: float, degree: int
+) -> list[tuple[float, float, float, float]]:
+    """
+    ``(scale, previous_scale, momentum, step)`` for each launch of a degree-``degree`` polynomial.
+
+    The Chebyshev semi-iteration on ``[lower, upper]`` started from zero, whose ``degree``-th
+    iterate is ``p(A) source`` for the polynomial approximating ``1 / x`` there. The scalars depend
+    on the interval alone, so they are host constants; the first iterate, ``source / theta``, is
+    folded into the first two launches' scales rather than written (see ``chebyshev_step``).
+    """
+    theta, delta = 0.5 * (upper + lower), 0.5 * (upper - lower)
+    sigma = theta / delta
+    rho = 1.0 / sigma
+    steps: list[tuple[float, float, float, float]] = []
+    for index in range(degree - 1):
+        rho_next = 1.0 / (2.0 * sigma - rho)
+        scale = 1.0 / theta if index == 0 else 1.0
+        previous_scale = (0.0, 1.0 / theta)[index] if index < 2 else 1.0
+        steps.append((scale, previous_scale, rho_next * rho, 2.0 * rho_next / delta))
+        rho = rho_next
+    return steps
 
 
 # ---------------------------------------------------------------------------

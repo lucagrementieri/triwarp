@@ -53,6 +53,7 @@ import math
 from typing import Literal, NamedTuple
 
 import warp as wp
+import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
@@ -76,6 +77,10 @@ _ISOLINE_DAMPING = wp.float32(0.75)
 
 # The common apex of the tetrahedra whose signed volumes sum to the enclosed volume.
 _ORIGIN_D = wp.vec3d(0.0, 0.0, 0.0)
+
+# The fixed-point path's step cap, above which a pass solves the assembled system instead: a large
+# ``lamb`` pulls the contraction factor towards 1, and the step count grows as ``1 / (1 - q)``.
+_IMPLICIT_FIXED_POINT_MAX_STEPS = 400
 
 
 def filter_laplacian(
@@ -107,8 +112,13 @@ def filter_laplacian(
     iterations
         Number of smoothing passes.
     implicit_time_integration
-        If ``True`` solve ``((1 + lamb) I - lamb L) V' = V`` each pass via conjugate gradient.
-        If ``False`` apply the explicit step ``V' = V + lamb (L V - V)``.
+        If ``True`` solve ``((1 + lamb) I - lamb L) V' = V`` each pass. The system is strictly
+        diagonally dominant for a row-stochastic ``L``, so it is solved by a fixed-point iteration
+        whose step count follows from ``lamb`` and ``L``'s row sums -- ``L`` is not symmetric on a
+        mesh with a boundary, so a symmetric Krylov method does not apply -- falling back to
+        BiCGSTAB when that count is large or ``L`` is not a contraction. If ``False`` apply the
+        explicit step ``V' = V + lamb (L V - V)``. An unreferenced vertex, whose row of ``L`` is
+        empty, stays where it is on both paths.
     volume_constraint
         If ``True`` rescale the mesh after each pass to preserve its initial volume, counteracting
         Laplacian shrinkage.
@@ -163,28 +173,53 @@ def filter_laplacian(
         center_ini = wp.vec3d(0.0, 0.0, 0.0)
         constraint = None
 
-    if implicit_time_integration:
+    steps = _implicit_fixed_point_steps(operator, lamb) if implicit_time_integration else None
+    if steps is not None:
+        # ``(1 + lamb) I - lamb L`` is strictly diagonally dominant for a row-stochastic ``L``, so
+        # the fixed-point iteration converges at a rate known in advance, symmetric or not -- and
+        # the uniform operator is *not* symmetric on a mesh with a boundary, which conjugate
+        # gradient needs. So each pass is a fixed number of fused launches with no reduction and
+        # no convergence test, the same launch sequence every pass: issued once, then recorded and
+        # replayed where the device has graphs.
+        scratch = [wp.empty(n, dtype=wp.vec3d, device=device) for _ in range(2)]
+        coeff = wp.float64(lamb)
+        graph = None
+        for index in range(iterations):
+            if graph is not None:
+                wp.capture_launch(graph)
+            elif index > 0 and wp.get_device(device).is_cuda:
+                with wp.ScopedCapture(device) as capture:
+                    _implicit_fixed_point_pass(operator, coeff, steps, positions, scratch)
+                graph = capture.graph
+                wp.capture_launch(graph)
+            else:
+                _implicit_fixed_point_pass(operator, coeff, steps, positions, scratch)
+            if constraint is not None:
+                _apply_volume_constraint(positions, faces, vol_ini, center_ini, constraint)
+    elif implicit_time_integration:
+        # The fixed-point step count past its cap, or an operator that is not a contraction: solve
+        # the assembled system instead, with a Krylov method that does not need it symmetric --
+        # conjugate gradient on this system diverges on a mesh with a boundary at a large ``lamb``.
         system = _build_implicit_system(operator, lamb, n, device)
+        preconditioner = wpl.preconditioner(system, "diag")
         components = _component_columns(n, device)
         solutions = _component_columns(n, device)
-        # The operator is fixed for the whole flow -- only the right-hand side moves -- so the
-        # batched solver state is built once outside the loop and re-reads both buffers on every
-        # call, which is the shape its own docstring asks for.
-        solver = twl.spd_column_solver(
-            system, components, solutions, tol=twl.CG_TOLERANCE, maxiter=10 * n
-        )
-        # Both column lists are viewed once: ``components`` / ``solutions`` are allocated above and
-        # never rebound, so re-slicing them inside the pass loop is a few microseconds of
-        # ``wp.array.__getitem__`` per view per pass and nothing else.
         component_rows = [components[column] for column in range(3)]
         solution_rows = [solutions[column] for column in range(3)]
         for _ in range(iterations):
             wp.map(kernel_smoothing.extract_components, positions, out=component_rows)
-            # Seed each column with its own right-hand side, which here *is* the current position
-            # component. Only a volume-constrained pass makes the two differ, since the rescale
-            # moves the positions after the previous solve wrote them.
+            # Seeded with the right-hand side, which is the current position component.
             wp.copy(solutions, components)
-            solver()
+            for column in range(3):
+                wpl.bicgstab(
+                    system,
+                    component_rows[column],
+                    solution_rows[column],
+                    tol=twl.CG_TOLERANCE,
+                    atol=0.0,
+                    maxiter=10 * n,
+                    M=preconditioner,
+                )
             wp.map(
                 kernel_smoothing.combine_components,
                 solution_rows[0],
@@ -204,6 +239,54 @@ def filter_laplacian(
                 _apply_volume_constraint(positions, faces, vol_ini, center_ini, constraint)
 
     return _as_vec3(positions)
+
+
+def _implicit_fixed_point_steps(operator: wps.BsrMatrix[wp.float32], lamb: float) -> int | None:
+    """
+    Count the steps of ``x' = (b + lamb L x) / (1 + lamb)`` bounding the error at the tolerance.
+
+    The iteration contracts by ``q = lamb ||L||_inf / (1 + lamb)`` in the infinity norm, and
+    ``||x*||_inf <= ||b||_inf`` for a row-stochastic ``L``, so from ``x_0 = b`` the error after
+    ``k`` steps is at most ``2 q^k ||b||_inf``. ``None`` when ``L`` is not a contraction at this
+    ``lamb`` (a caller-supplied operator whose rows sum past 1) or the count passes the cap.
+    """
+    n_rows = int(operator.nrow)
+    sums = twt.empty_1d(n_rows, wp.float64, device=operator.values.device)
+    wp.launch(
+        kernel_smoothing.operator_row_abs_sums,
+        dim=n_rows,
+        inputs=[operator.offsets, operator.values, sums],
+        device=operator.values.device,
+    )
+    contraction = lamb * float(tw.reduce.max(sums)) / (1.0 + lamb)
+    if contraction <= 0.0:
+        # ``lamb == 0``: the system is the identity and two steps reproduce ``b`` exactly.
+        return 2
+    if contraction >= 1.0:
+        return None
+    steps = math.ceil(math.log(0.5 * twl.CG_TOLERANCE) / math.log(contraction))
+    # At least two, so the last step never reads the buffer it writes.
+    return max(steps, 2) if steps <= _IMPLICIT_FIXED_POINT_MAX_STEPS else None
+
+
+def _implicit_fixed_point_pass(
+    operator: wps.BsrMatrix[wp.float32],
+    coeff: wp.float64,
+    steps: int,
+    positions: wp.array[wp.vec3d],
+    scratch: list[wp.array[wp.vec3d]],
+) -> None:
+    """One backward-Euler pass in place: ``steps`` fixed-point steps from ``positions`` itself."""
+    for step in range(steps):
+        source = positions if step == 0 else scratch[(step - 1) % 2]
+        target = positions if step == steps - 1 else scratch[step % 2]
+        wp.launch(
+            kernel_smoothing.implicit_laplacian_step,
+            dim=int(positions.shape[0]),
+            inputs=[operator.offsets, operator.columns, operator.values, coeff, positions, source],
+            outputs=[target],
+            device=positions.device,
+        )
 
 
 def _build_implicit_system(
@@ -1500,7 +1583,16 @@ def filter_implicit_fairing(
                 mass,
                 out=[*solution_rows, *rhs_rows],
             )
-            twl.solve_spd_columns(system, rhs, solutions, tol=twl.CG_TOLERANCE, maxiter=10 * n)
+            # ``M - lamb L`` over the whole mesh, a solve long enough for the polynomial
+            # preconditioner; the Dirichlet branch below is the same system less the pinned rows.
+            twl.solve_spd_columns(
+                system,
+                rhs,
+                solutions,
+                tol=twl.CG_TOLERANCE,
+                maxiter=10 * n,
+                preconditioner="chebyshev",
+            )
             wp.map(
                 kernel_smoothing.combine_components,
                 solution_rows[0],
@@ -1538,6 +1630,7 @@ def filter_implicit_fairing(
             solution_2d,
             tol=twl.CG_TOLERANCE,
             maxiter=10 * dirichlet.n_free,
+            preconditioner="chebyshev",
         )
         wp.launch(
             kernel_smoothing.scatter_free_positions,

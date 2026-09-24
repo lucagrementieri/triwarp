@@ -911,6 +911,134 @@ def test_squared_laplacian_preconditioner_needs_far_fewer_iterations(
     assert counts["squared"] * 8 < counts["diag"], counts
 
 
+def _chebyshev_reference(dense_np: np.ndarray, rhs_np: np.ndarray) -> np.ndarray:
+    """
+    ``p(D^-1 A) D^-1 rhs`` in closed form, for the interval ``chebyshev_preconditioner`` picks.
+
+    The semi-iteration's degree-``d`` iterate from zero is ``x_d = p(D^-1 A) D^-1 b`` with
+    ``1 - lambda p(lambda) = T_d((theta - lambda) / delta) / T_d(theta / delta)``. Evaluated here on
+    the eigendecomposition of the symmetric ``D^-1/2 A D^-1/2``, which shares ``D^-1 A``'s spectrum,
+    so nothing of the three-term recurrence is reused.
+    """
+    diagonal = np.diag(dense_np)
+    n = diagonal.size
+    radius = max(
+        float(np.max((np.abs(dense_np).sum(axis=1) - np.abs(diagonal)) / np.abs(diagonal))), 1e-3
+    )
+    lower = max(
+        min(tw.linalg.CHEBYSHEV_INTERVAL / n, tw.linalg.SQUARED_LAPLACIAN_INTERVAL_CAP),
+        1.0 - radius,
+    )
+    upper = 1.0 + radius
+    theta, delta = 0.5 * (upper + lower), 0.5 * (upper - lower)
+    degree = tw.linalg.CHEBYSHEV_DEGREE
+    root = 1.0 / np.sqrt(np.abs(diagonal))
+    sign = np.sign(diagonal[0])
+    eigenvalues, vectors = np.linalg.eigh(sign * root[:, None] * dense_np * root[None, :])
+    chebyshev = np.polynomial.chebyshev.Chebyshev.basis(degree)
+    residual = chebyshev((theta - eigenvalues) / delta) / chebyshev(theta / delta)
+    polynomial = (1.0 - residual) / eigenvalues
+    # ``D^-1/2 p(S) D^-1/2`` with the diagonal's sign restored.
+    return (
+        sign
+        * root[:, None]
+        * (vectors @ (polynomial[:, None] * (vectors.T @ (root[:, None] * rhs_np.T))))
+    )
+
+
+@pytest.mark.parametrize("negative", [False, True], ids=["positive_weights", "negative_weights"])
+def test_chebyshev_preconditioner_applies_the_chebyshev_polynomial(
+    device: str, negative: bool
+) -> None:
+    """
+    Not a library comparison: no reference builds this preconditioner, so the oracle is its formula.
+
+    The apply is checked against ``p(D^-1 A) D^-1`` evaluated in closed form on an eigenbasis
+    (``_chebyshev_reference``), which shares nothing with the three-term recurrence the kernel runs.
+    That is what catches a recurrence that computes *some* polynomial. A first version read the
+    semi-iteration's first iterate as ``source`` rather than ``source / theta``: put back, it fails
+    both arms here and passes every solve and iteration-count test in this file, because the wrong
+    polynomial still preconditions -- it only goes negative inside the interval once the Gershgorin
+    bound moves away from 2, which is when a solve stalls. The negative-weight arm is the one whose
+    bound exceeds 2. ``<r, M r> > 0`` is the definiteness conjugate gradient needs.
+    """
+    _system, _rhs, laplacian_wp, _sums, _system_np, _rhs_np = _normal_equations_system(
+        device, negative=negative
+    )
+    dense_np = bsr_to_dense(laplacian_wp, int(laplacian_wp.nrow))
+    n = dense_np.shape[0]
+    rhs_np = np.random.default_rng(11).standard_normal((1, n))
+    reference_np = _chebyshev_reference(dense_np, rhs_np).T
+    operator = tw.linalg.chebyshev_preconditioner(laplacian_wp)
+    source = wp.array(np.ascontiguousarray(rhs_np[0]), dtype=wp.float64, device=device)
+    applied = wp.zeros(n, dtype=wp.float64, device=device)
+    operator.matvec(source, applied, applied, 1.0, 0.0)
+    assert np.allclose(applied.numpy(), reference_np[0], rtol=1e-8, atol=1e-10)
+    assert np.ptp(reference_np) > 1e-3  # non-vacuity
+    # Symmetric, and definite with the operator's sign: <r, M r> > 0 for a positive diagonal.
+    assert float(rhs_np[0] @ applied.numpy()) > 0.0
+
+
+@pytest.mark.parametrize("negative", [False, True], ids=["positive_weights", "negative_weights"])
+@pytest.mark.parametrize("n_columns", [1, 3])
+def test_chebyshev_preconditioner_solves_the_same_system(
+    device: str, negative: bool, n_columns: int
+) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``: the preconditioner changes the path, not the answer.
+
+    Through both entry points -- the ``"chebyshev"`` name the column solvers take, which routes a
+    single column through the batched solver too, and the operator
+    [`chebyshev_preconditioner`][triwarp.linalg.chebyshev_preconditioner] returns for
+    ``solve_spd``.
+    """
+    _system, _rhs, laplacian_wp, _sums, _system_np, _rhs_np = _normal_equations_system(
+        device, negative=negative
+    )
+    dense_np = bsr_to_dense(laplacian_wp, int(laplacian_wp.nrow))
+    n = dense_np.shape[0]
+    rhs_np = np.random.default_rng(12).standard_normal((n_columns, n))
+    reference_np = np.linalg.solve(dense_np, rhs_np.T).T
+    rhs_wp = twt.as_array2d(
+        wp.array(np.ascontiguousarray(rhs_np), dtype=wp.float64, device=device), wp.float64
+    )
+    solution_wp = wp.zeros_like(rhs_wp)
+    tw.linalg.solve_spd_columns(
+        laplacian_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), preconditioner="chebyshev"
+    )
+    assert np.allclose(solution_wp.numpy(), reference_np, rtol=1e-5, atol=1e-5)
+    single = wp.zeros(n, dtype=wp.float64, device=device)
+    tw.linalg.solve_spd(
+        laplacian_wp,
+        twt.as_dense(rhs_wp[0]),
+        single,
+        preconditioner=tw.linalg.chebyshev_preconditioner(laplacian_wp),
+    )
+    assert np.allclose(single.numpy(), reference_np[0], rtol=1e-5, atol=1e-5)
+
+
+def test_chebyshev_preconditioner_needs_far_fewer_iterations(device: str) -> None:
+    """
+    Not a library comparison: the reason the preconditioner exists, stated as an assertion.
+
+    triwarp against triwarp; the Jacobi arm carries the oracle through the test above. Each
+    iteration costs ``CHEBYSHEV_DEGREE`` extra launches, so a preconditioner that did not cut the
+    count several-fold would be a loss on every system, and a solve test would not notice.
+    """
+    matrix_wp, rhs_wp, _dense_np, _rhs_np = _grid_laplacian_system(device)
+    counts = {}
+    for name in ("diag", "chebyshev"):
+        solution_wp = wp.zeros_like(rhs_wp)
+        counts[name] = tw.linalg.solve_spd_columns(
+            matrix_wp,
+            rhs_wp,
+            twt.as_array2d(solution_wp, wp.float64),
+            check_every=1,
+            preconditioner=name,
+        )[0]
+    assert counts["chebyshev"] * 4 < counts["diag"], counts
+
+
 @pytest.mark.parametrize("n_columns", [1, 3])
 def test_replicated_operator_applies_the_base_to_each_block(device: str, n_columns: int) -> None:
     """

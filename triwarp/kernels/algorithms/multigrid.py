@@ -308,33 +308,48 @@ def chebyshev_step(
     n_rows: wp.int32,
     stride: wp.int32,
     scale: wp.float64,
+    previous_scale: wp.float64,
     momentum: wp.float64,
     step: wp.float64,
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
     values: wp.array[wp.float64],
+    row_scaled: wp.int32,
+    row_scale: wp.array[wp.float64],
     source: wp.array[wp.float64],
     x: wp.array[wp.float64],
     x_previous: wp.array[wp.float64],
     out_x: wp.array[wp.float64],
 ) -> None:
+    # A nonzero ``row_scaled`` (warp uniform) iterates on ``diag(row_scale) A`` rather than on the
+    # matrix as stored, scaling each row's product after the dot: the Jacobi-scaled operator the
+    # polynomial preconditioner in ``linalg`` wants, with no scaled copy of ``A`` to build. Off,
+    # ``row_scale`` is never read and may be ``None``.
+    #
     # One step of the Chebyshev semi-iteration for ``A x = source``, every column at once, in its
-    # three-term form: ``x' = s x + momentum (s x - x_previous) + step (source - s A x)``. With
-    # ``s = 1`` that is the textbook recurrence; the first step passes ``x = source``,
-    # ``s = 1 / theta`` and a zero ``x_previous``, which is the same recurrence started from the
-    # iterate ``source / theta`` and saves the launch that would form it. Written in ``x`` rather
-    # than in the correction so that the one mat-vec and both updates are a single launch, which is
-    # what a step costs at these sizes. ``out_x`` must alias neither ``x`` (the row dot reads it at
-    # other rows) nor ``x_previous``. Shares ``csr_row_dot`` with ``csr_matvec``.
+    # three-term form: ``x' = s x + momentum (s x - s_prev x_previous) + step (source - s A x)``.
+    # With both scales ``1`` that is the textbook recurrence. The semi-iteration's first iterate is
+    # ``source / theta``, which no launch writes: the first step passes ``x = source`` with
+    # ``s = 1 / theta`` (and ``s_prev = 0``, the zero iterate before it), and the second passes
+    # ``x_previous = source`` with ``s_prev = 1 / theta``. Reading ``source`` there unscaled is
+    # a different polynomial -- still a polynomial, but one that can change sign inside the
+    # interval once ``theta`` is not close to 1. Written in ``x`` rather than in the correction so
+    # that the one mat-vec and both updates are a single launch, which is what a step costs at these
+    # sizes. ``out_x`` must alias neither ``x`` (the row dot reads it at other rows) nor
+    # ``x_previous``. Shares ``csr_row_dot`` with ``csr_matvec``.
     t = wp.int32(wp.tid())
     column = t // n_rows
     row = t % n_rows
     base = column * stride
     slot = base + row
     ax = csr_row_dot(row, base, offsets, columns, values, x)
+    if row_scaled != wp.int32(0):
+        ax = ax * row_scale[row]
     current = scale * x[slot]
     out_x[slot] = (
-        current + momentum * (current - x_previous[slot]) + step * (source[slot] - scale * ax)
+        current
+        + momentum * (current - previous_scale * x_previous[slot])
+        + step * (source[slot] - scale * ax)
     )
 
 
