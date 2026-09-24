@@ -1055,6 +1055,31 @@ def polyline_total_length(
 
 
 @wp.kernel
+def packed_closed_loop_lengths(
+    vertices: wp.array[wp.vec3],
+    loops: wp.array[wp.int32],
+    starts: wp.array[wp.int32],
+    sizes: wp.array[wp.int32],
+    out_lengths: wp.array[wp.float32],
+) -> None:
+    # ``polyline_total_length``'s closed form for many vertex-index loops at once, one block per
+    # loop: the same lane stride over the same segments in the same order and the same
+    # ``wp.tile_sum`` fold, so a loop of at most ``ITEMS_PER_BLOCK_1D`` segments -- one block there
+    # too, committed onto a zero -- gets the bit-identical length on either device. The two
+    # differ only in where a segment's points come from: gathered through the loop's indices
+    # here, a dense buffer there. Launched ``wp.launch_tiled(dim=n_loops, block_dim=TILE_1D)``.
+    loop, lane = wp.tid()
+    base = starts[loop]
+    n = sizes[loop]
+    total = wp.float32(0.0)
+    for k in range(lane, n, wp.block_dim()):
+        total += segment_length(vertices[loops[base + k]], vertices[loops[base + (k + 1) % n]])
+    length = wp.tile_sum(wp.tile(total))[0]
+    if lane == 0:
+        out_lengths[loop] = length
+
+
+@wp.kernel
 def polyline_weighted_midpoint_sums(
     points: wp.array[wp.vec3], n_segments: wp.int32, out_sums: wp.array[wp.float32]
 ) -> None:

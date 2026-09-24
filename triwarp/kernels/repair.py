@@ -1,6 +1,8 @@
 import warp as wp
 
+from triwarp.constants import INDEX_RADIX_PAIR
 from triwarp.kernels.array import (
+    binary_search_sorted_contains,
     declare_map_signatures,
     map_probe,
     map_probe_single,
@@ -357,15 +359,43 @@ def select_independent_degree3(
     wp.atomic_add(out_count, 0, 1)
 
 
+@wp.func
+def becomes_interior_degree3(
+    faces: wp.array[wp.int32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    is_boundary: wp.array[wp.bool],
+    selected: wp.array[wp.bool],
+    r: wp.int32,
+) -> wp.bool:
+    # Whether rim vertex ``r`` is an interior degree-3 vertex once this pass's fans are replaced.
+    # Each selected neighbour takes two of ``r``'s faces and gives back one, so its face count falls
+    # by exactly the number of selected vertices in its ring (the fans are disjoint, so no face is
+    # counted twice). Its boundary flag cannot change: the rim edges keep two faces each and the
+    # spokes, which were interior, disappear. So this is ``is_interior_degree3`` evaluated on the
+    # next pass's rings, read off this pass's.
+    if is_boundary[r]:
+        return False
+    begin = ring_offsets[r]
+    end = ring_offsets[r + 1]
+    n_selected = wp.int32(0)
+    for slot in range(begin, end):
+        if selected[halfedge_destination(faces, ring_halfedges[slot])]:
+            n_selected += 1
+    return end - begin - n_selected == 3
+
+
 @wp.kernel
 def emit_degree3_replacement(
     faces: wp.array[wp.int32],
     ring_offsets: wp.array[wp.int32],
     ring_halfedges: wp.array[wp.int32],
+    is_boundary: wp.array[wp.bool],
     selected: wp.array[wp.bool],
     cursor: wp.array[wp.int32],
     out_keep: wp.array[wp.bool],
     out_new_faces: wp.array2d[wp.int32],
+    out_next_candidates: wp.array[wp.int32],
 ) -> None:
     # The three faces around a selected vertex become one: its link is a triangle already, since the
     # ring is counter-clockwise and has exactly three entries. Winding follows the ring, so the
@@ -373,14 +403,24 @@ def emit_degree3_replacement(
     #
     # ``out_keep`` arrives all ``True`` and each fan face is cleared here, so it is the kept-face
     # mask itself rather than a dropped-face mask the caller would have to negate in a second pass.
+    #
+    # ``out_next_candidates`` counts the rim vertices this pass turns into candidates. Only a rim
+    # vertex's face count changes, so it is zero exactly when the next pass would find nothing, and
+    # the caller skips that pass instead of rebuilding the rings to learn it. A rim vertex shared by
+    # several fans is counted once per fan; only zero versus non-zero is read.
     v = wp.int32(wp.tid())
     if not selected[v]:
         return
     begin = ring_offsets[v]
     slot = wp.atomic_add(cursor, 0, 1)
     for k in range(3):
+        rim = halfedge_destination(faces, ring_halfedges[begin + k])
         out_keep[ring_halfedges[begin + k] // 3] = False
-        out_new_faces[slot, k] = halfedge_destination(faces, ring_halfedges[begin + k])
+        out_new_faces[slot, k] = rim
+        if becomes_interior_degree3(
+            faces, ring_offsets, ring_halfedges, is_boundary, selected, rim
+        ):
+            wp.atomic_add(out_next_candidates, 0, 1)
 
 
 @wp.kernel
@@ -544,6 +584,30 @@ def select_and_flatten_degree3(
     for slot in range(ring_offsets[vertex], ring_offsets[vertex + 1]):
         total += positions[halfedge_destination(faces, ring_halfedges[slot])]
     out_positions[vertex] = total / wp.float32(3.0)
+
+
+@wp.kernel
+def sever_barrier_pairs(
+    shared: wp.array2d[wp.int32],
+    barrier_keys: wp.array[wp.uint64],
+    adjacency: wp.array2d[wp.int32],
+    out_pairs: wp.array2d[wp.int32],
+    out_barrier: wp.array[wp.bool],
+) -> None:
+    # The face pairs with every pair across a barrier edge turned into a self-loop, so a labelling
+    # over them sees the barrier as cut: a self-loop joins nothing, and the pair keeps its row, so
+    # no compaction is needed. A pair is across a barrier when its shared edge's ascending
+    # ``(a, b)``, packed as ``a * INDEX_RADIX_PAIR + b``, is in the sorted ``barrier_keys`` -- a
+    # few hundred loop edges, searched here rather than hashed and matched in a pass of their own.
+    # Written to a new buffer rather than in place, with the mask beside it, so the caller keeps the
+    # faces across each barrier edge.
+    k = wp.int32(wp.tid())
+    key = wp.uint64(shared[k, 0]) * wp.uint64(INDEX_RADIX_PAIR) + wp.uint64(shared[k, 1])
+    cut = binary_search_sorted_contains(barrier_keys, key)
+    f0 = adjacency[k, 0]
+    out_pairs[k, 0] = f0
+    out_pairs[k, 1] = wp.where(cut, f0, adjacency[k, 1])
+    out_barrier[k] = cut
 
 
 def _declare_map_kernels() -> None:

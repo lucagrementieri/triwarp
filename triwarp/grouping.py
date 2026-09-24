@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Literal, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 import warp as wp
 
@@ -206,8 +206,7 @@ def unique_1d(
     if n > (1 << 30):
         raise ValueError(f"unique_1d requires length <= 2**30, got length {n}")
 
-    log2_capacity = max(3, math.ceil(math.log2(n) + 1))
-    mask = wp.int32((1 << log2_capacity) - 1)
+    mask = _hash_mask(n)
 
     # ``_unique_hash`` only ever *reads* the integer key array, so when the input already is one of
     # the two key dtypes the bit reinterpretation is the identity and the buffer can be shared --
@@ -238,24 +237,12 @@ def _unique_hash(
     | tuple[wp.array[Scalar], wp.array[wp.int32]]
     | tuple[wp.array[Scalar], wp.array[wp.int32], wp.array[wp.int32]]
 ):
-    # One slot past the table is reserved for the single key that collides with the empty-slot
-    # sentinel; see the comment on ``kernel_grouping.hash_insert``.
-    cap = int(mask) + 2
     key_dtype = data_int.dtype
     device = data_int.device
 
-    # Phase 1: parallel insert into open-addressing hash table (slot_key 0 = empty). ``occupied``
-    # is stamped by the insert itself rather than derived from ``slot_counts`` in a second pass --
-    # see the comment on ``hash_insert`` -- so it is zero-filled rather than ``wp.empty``.
-    slot_key = wp.zeros(cap, dtype=key_dtype, device=device)
-    slot_counts = wp.zeros(cap, dtype=wp.int32, device=device)
-    occupied = wp.zeros(cap, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_grouping.HASH_INSERT[key_dtype],
-        dim=n,
-        inputs=[data_int, slot_key, slot_counts, mask, occupied],
-        device=device,
-    )
+    # Phase 1: parallel insert into the open-addressing hash table.
+    slot_key, slot_counts, occupied = _hash_insert(data_int, n, mask)
+    cap = int(slot_key.shape[0])
 
     # Phase 2: prefix-scan the occupancy to get compact positions.
     scan_pos = wp.empty(cap, dtype=wp.int32, device=device)
@@ -336,6 +323,66 @@ def _unique_hash(
         )
 
     return _pack_unique_result(unique_values, inverse=unique_inverse, counts=unique_counts)
+
+
+def hashed_occurrence_counts(keys: wp.array[wp.uint64] | wp.array[wp.int64]) -> wp.array[wp.int32]:
+    """
+    Occurrence count of every distinct 64-bit key, in no particular order.
+
+    The counting half of [`unique_1d`][triwarp.grouping.unique_1d]'s hash table, handed back as
+    the table itself: one slot per table entry, holding how many keys landed in it, and zero for
+    an empty slot. That answers any question about the *multiset* of counts -- is every key
+    present exactly twice -- without the compaction, the sort and the host read of the distinct
+    count that sizing them needs.
+
+    Parameters
+    ----------
+    keys
+        1D ``wp.uint64`` or ``wp.int64`` keys, of length at most ``2**30``.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        The per-slot counts, somewhat over twice ``len(keys)`` long, on ``keys.device``. Their
+        nonzero entries are the counts of the distinct keys; which slot holds which key is
+        unspecified.
+
+    See Also
+    --------
+    [`unique_1d`][triwarp.grouping.unique_1d]
+    """
+    n = int(keys.shape[0])
+    return _hash_insert(keys.view(wp.int64), n, _hash_mask(n))[1]
+
+
+def _hash_mask(n: int) -> wp.int32:
+    """Size an open-addressing table for ``n`` keys, as a slot mask: at least twice ``n`` slots."""
+    return wp.int32((1 << max(3, math.ceil(math.log2(max(n, 1)) + 1))) - 1)
+
+
+def _hash_insert(
+    keys: wp.array[wp.int32] | wp.array[wp.int64], n: int, mask: wp.int32
+) -> tuple[wp.array[Any], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Insert ``n`` keys into a fresh table; return its ``(slot_key, slot_counts, occupied)``.
+
+    One slot past the ``mask + 1`` table is reserved for the single key that collides with the
+    empty-slot sentinel; see the comment on ``kernel_grouping.hash_insert``. ``occupied`` is stamped
+    by the insert itself rather than derived from ``slot_counts`` in a second pass, so it is
+    zero-filled rather than ``wp.empty``.
+    """
+    cap = int(mask) + 2
+    device = keys.device
+    slot_key = wp.zeros(cap, dtype=keys.dtype, device=device)
+    slot_counts = wp.zeros(cap, dtype=wp.int32, device=device)
+    occupied = wp.zeros(cap, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_grouping.HASH_INSERT[keys.dtype],
+        dim=n,
+        inputs=[keys, slot_key, slot_counts, mask, occupied],
+        device=device,
+    )
+    return slot_key, slot_counts, occupied
 
 
 @overload

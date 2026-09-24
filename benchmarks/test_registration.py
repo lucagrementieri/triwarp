@@ -44,6 +44,14 @@ and open3d with ``relative_fitness=relative_rmse=0`` — otherwise a library tha
 three iterations would look fast for the wrong reason. ``max_correspondence_distance`` is set to the
 bbox diagonal so open3d rejects nothing, matching triwarp's ``max_distance=None`` default.
 
+The ``scale`` fixtures are spheres, and a sphere's point-to-plane cost does not change under a
+rotation about its centre, so only the translation has anything to converge to: it reaches the
+float32 floor of the fit (around ``1e-6`` of the diagonal) by the third to fifth iteration, while
+each step's rotation stays damping-limited noise to the end. Of the ten pinned iterations the last
+five to seven therefore run at a noise plateau. That is what these rows time -- a fixed schedule --
+and it makes them unable to rank a stopping rule: a rule keyed on the step size would never fire
+on the rotation here, and the cost-change rule fires on noise.
+
 What is inside the timed callable
 ---------------------------------
 Everything the public function does, including the spatial index build: triwarp's ``wp.Mesh`` BVH

@@ -12,6 +12,7 @@ import triwarp.typing as twt
 from triwarp._device import read_scalar, require_nonempty_mesh, require_same_device
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import neighbors as kernel_neighbors
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import registration as kernel_registration
@@ -659,7 +660,6 @@ def icp_point_to_plane(
         return _identity_mat44(device), wp.clone(a), math.inf
 
     initial_matrix, current = _seed_transform(a, initial, device)
-    transformed = wp.clone(current)
     cost = math.inf
 
     mesh, query_max, target_index = _resolve_icp_target(
@@ -682,9 +682,21 @@ def icp_point_to_plane(
     # a caller-provided initial transform. The per-iteration cost read stays: it is the
     # stopping criterion (a 4-byte transfer).
     closest = wp.empty(n, dtype=wp.vec3, device=device)
-    distance_mesh = twt.empty_1d(n, wp.float32, device=device)
-    triangle_id_mesh = twt.empty_1d(n, wp.int32, device=device)
     normals = wp.empty(n, dtype=wp.vec3, device=device)
+    # The correspondence buffers, written in full every iteration. A mesh target's query writes
+    # them itself; a cloud target's nearest-vertex search writes the ``(n, 1)`` rows the k-NN
+    # kernel takes, read here through rank-1 views taken once.
+    if mesh is not None:
+        distance = twt.empty_1d(n, wp.float32, device=device)
+        triangle_id = twt.empty_1d(n, wp.int32, device=device)
+        nearest_rows = None
+    else:
+        nearest_rows = (
+            twt.empty_2d((n, 1), wp.int32, device=device),
+            twt.empty_2d((n, 1), wp.float32, device=device),
+        )
+        triangle_id = cast(twt.Array1dInt32, nearest_rows[0].reshape(-1))
+        distance = cast(twt.Array1dFloat32, nearest_rows[1].reshape(-1))
     # Two accumulator sets, ping-ponged: an iteration accumulates into one while its solve zeroes
     # the other for the next, so the loop issues no memset. Only the first set needs a zeroed start.
     # ``scalars`` holds both values the loop reads back -- written by the same launch, so one host
@@ -701,6 +713,16 @@ def icp_point_to_plane(
             wp.empty(kernel_registration.ICP_SCALAR_ACC_SIZE, dtype=wp.float32, device=device),
         ),
     )
+    # Where the two scalars land on the host. ``.numpy()`` on a device array allocates a fresh
+    # host array for every read; copying into one pageable buffer allocated here does not, and a
+    # pageable destination is what makes the copy return only once it has completed (see
+    # ``_device.read_scalar``, whose scratch is the same idea for a single element). On the host
+    # the accumulator's own ``.numpy()`` is already a zero-copy view, so it is read directly.
+    host_scalars = (
+        wp.empty(kernel_registration.ICP_SCALAR_ACC_SIZE, dtype=wp.float32, device="cpu")
+        if device is not None and device.is_cuda
+        else None
+    )
     step = wp.empty(1, dtype=wp.mat44, device=device)
     updated = wp.empty(n, dtype=wp.vec3, device=device)
     # The running transform ping-pongs too, since the solve composes into the buffer it does not
@@ -712,6 +734,10 @@ def icp_point_to_plane(
     # gather and the distance gate all read one source point's own correspondence, so the second
     # and third used to pay a launch and a round trip through global memory to re-read a face
     # index the first had in a register. See ``kernel_registration.mesh_correspondence_pass``.
+    # Against a mesh it also applies the previous iteration's step, so a mesh iteration is three
+    # launches rather than four: the step is applied at the head of the next iteration, and once
+    # after the loop when the last iteration's step is still pending. Iteration 0 applies the
+    # initial transform to ``a`` itself, which is the seed ``current`` already holds, bit for bit.
     #
     # Measure this kind of change with ``threshold=0.0``, or the reading is fiction: with the
     # convergence break live the two arms stop at *different* iterations, which inflated the
@@ -724,34 +750,41 @@ def icp_point_to_plane(
     # cloud it indexes the target's own per-vertex normals.
     normal_source = face_normals if mesh is not None else target_normals
     assert normal_source is not None
-
     parity = 0
+    step_pending = False
     for iteration in range(max_iterations):
         jtj, jtr, scalar_acc = accumulators[parity]
         next_jtj, next_jtr, next_scalars = accumulators[parity ^ 1]
         # --- correspondence + target normals ---
         if mesh is not None:
+            source, source_step, moved = (
+                (current, step, updated) if step_pending else (a, total, current)
+            )
             wp.launch(
                 kernel_registration.mesh_correspondence_pass,
                 dim=n,
                 inputs=[
                     mesh.id,
-                    current,
+                    source,
+                    source_step,
                     wp.float32(query_max),
                     normal_source,
+                    moved,
                     closest,
-                    distance_mesh,
-                    triangle_id_mesh,
+                    distance,
+                    triangle_id,
                     normals,
                 ],
                 device=device,
             )
-            distance, triangle_id = distance_mesh, triangle_id_mesh
+            current = moved
+            if step_pending:
+                updated = source
+                step_pending = False
         else:
             assert target_index is not None
-            triangle_id, distance = tw.neighbors.query_nearest(
-                target_vertices, current, 1, **target_index
-            )
+            assert nearest_rows is not None
+            _nearest_into(target_vertices, current, target_index, nearest_rows)
             wp.launch(
                 kernel_registration.cloud_correspondence_pass,
                 dim=n,
@@ -799,11 +832,15 @@ def icp_point_to_plane(
         # otherwise returned the identity transform with ``cost=0.0`` on a cloud still offset by
         # (1.0, 0.5, -0.3) from its target.
         #
-        # Both scalars in one readback -- ``.numpy()`` on the two-element buffer rather than two
-        # ``read_scalar`` calls, which is the one shape that helper does not cover (it returns a
-        # single element). ``cost`` is the *post-accumulate* cost the convergence test below needs
-        # and this launch is what wrote it.
-        scalars = scalar_acc.numpy()
+        # Both scalars in one readback of the two-element buffer rather than two ``read_scalar``
+        # calls, which is the one shape that helper does not cover (it returns a single element).
+        # ``cost`` is the *post-accumulate* cost the convergence test below needs and this launch
+        # is what wrote it.
+        if host_scalars is not None:
+            wp.copy(host_scalars, scalar_acc)
+            scalars = host_scalars.numpy()
+        else:
+            scalars = scalar_acc.numpy()
         if float(scalars[kernel_registration.ICP_WEIGHT_SUM]) <= 0.0:
             break
         cost = float(scalars[kernel_registration.ICP_COST])
@@ -826,23 +863,70 @@ def icp_point_to_plane(
             device=device,
         )
         total, spare_total = spare_total, total
+        parity ^= 1
 
-        # --- apply the incremental step ---
+        # --- apply the incremental step: now for a cloud, at the next correspondence for a mesh ---
+        if mesh is not None:
+            step_pending = True
+        else:
+            wp.launch(
+                kernel_transform.apply_transform_mat44,
+                dim=n,
+                inputs=[current, step, updated],
+                device=device,
+            )
+            current, updated = updated, current
+
+        if iteration > 0 and old_cost - cost < threshold:
+            break
+        old_cost = cost
+
+    if step_pending:
         wp.launch(
             kernel_transform.apply_transform_mat44,
             dim=n,
             inputs=[current, step, updated],
             device=device,
         )
-        current, updated = updated, current
-        transformed = current
-        parity ^= 1
+        current = updated
+    return total, current, cost
 
-        if iteration > 0 and old_cost - cost < threshold:
-            break
-        old_cost = cost
 
-    return total, transformed, cost
+def _nearest_into(
+    target_vertices: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    target_index: _TargetIndex,
+    out_rows: tuple[twt.Array2dInt32, twt.Array2dFloat32],
+) -> None:
+    """
+    Nearest target vertex of every query, written into caller-owned ``(m, 1)`` rows.
+
+    This is [`query_nearest`][triwarp.neighbors.query_nearest]'s ``k = 1`` BVH launch on the
+    hoisted ``target_index``, issued into buffers the ICP loop allocates once. Calling
+    ``query_nearest`` every iteration would repeat its device check, accelerator resolution,
+    argument validation and two output allocations for an identical launch -- several times the
+    launch's own host cost, in a loop the host paces. ``test_nearest_into_matches_query_nearest``
+    pins the two to each other.
+    """
+    bvh = target_index["accelerator"]
+    assert isinstance(bvh, wp.Bvh)
+    low, high = target_index["bounds"]
+    wp.launch(
+        kernel_neighbors.bvh_nearest_kernel(1),
+        dim=int(queries.shape[0]),
+        inputs=[
+            target_vertices,
+            queries,
+            bvh.id,
+            wp.int32(1),
+            wp.float32(math.inf),
+            wp.float32(target_index["initial_radius"]),
+            low,
+            high,
+            *out_rows,
+        ],
+        device=queries.device,
+    )
 
 
 def _robust_scale_from_residuals(

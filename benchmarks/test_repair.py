@@ -1039,8 +1039,16 @@ def test_remove_degree3_vertices(bench_case: BenchCase) -> None:
     which is worth saying because it reads like one. ``vertex_one_rings`` takes an optional
     ``twins=``, so the build *could* be lifted out of the loop -- except that each pass deletes
     faces, so the next pass's halfedge structure is over a different mesh and has to be rebuilt.
-    The only genuinely wasted build is the last pass's, which finds nothing, and knowing that in
-    advance is the question the pass exists to answer.
+    The last pass's build, which found nothing, was the one genuinely wasted one, and it is gone:
+    removing a fan changes only its rim vertices' face counts, so the emit kernel counts the rim
+    vertices it turns into candidates and a zero skips the confirming pass outright. That took
+    ``bunny`` from 2 passes to 1, ``dragon`` 3 to 2 and ``happy_buddha`` 4 to 3 (24 -> 16, 35 -> 27
+    and 46 -> 38 launches), byte-identical, for one 4-byte read per pass that removed something.
+
+    **The independent-set rewrite is declined, measured.** Every pass-0 candidate on all three scan
+    meshes is selected -- no two candidates are adjacent (9, 1 285 and 1 839 candidates, zero
+    candidate-candidate edges) -- so the selection is already the whole set and the later passes
+    remove vertices that the earlier ones *created*, which no pass-0 selection can see.
 
     Moving the vertex compaction out of the loop was tried and is **flat** at the pass counts a scan
     mesh reaches; it is kept because it is strictly less work, not because it showed up.

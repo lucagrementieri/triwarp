@@ -462,6 +462,36 @@ def test_is_vertex_manifold_bowtie(device: str) -> None:
     assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=True) is True
 
 
+@pytest.mark.parametrize(("spare", "expected"), [(None, True), ("interior", False)])
+@pytest.mark.parity("is_vertex_manifold", "igl")
+def test_is_vertex_manifold_unreferenced_vertices(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], spare: str | None, expected: bool
+) -> None:
+    """
+    Class B (reduce igl's per-vertex mask): an unreferenced vertex counts only below ``max(faces)``.
+
+    igl sizes its answer by ``F.max() + 1``, so a spare vertex renumbered into the middle of the
+    buffer is non-manifold and one past the end is invisible. The predicate never reads that bound
+    on the host -- it tests each unreferenced vertex against its successor -- so both arms are asked
+    again with ``n_vertices`` at the exact bound and past it, where the extra vertices are trailing
+    spares and must not move the answer.
+    """
+    mesh_tm, mesh_wp = icosphere_coarse
+    faces_np = np.asarray(mesh_tm.faces, dtype=np.int64)
+    n = int(mesh_tm.vertices.shape[0])
+    if spare == "interior":
+        faces_np = np.where(faces_np >= n // 2, faces_np + 1, faces_np)
+    n_bound = int(faces_np.max()) + 1
+    faces_wp = wp.array(faces_np.astype(np.int32).ravel(), dtype=wp.int32, device=mesh_wp.device)
+    manifold_igl = bool(igl.is_vertex_manifold(faces_np).all())
+    assert manifold_igl is expected
+    answers = {
+        tw.validation.is_vertex_manifold(faces_wp, n_vertices=n_vertices)
+        for n_vertices in (None, n_bound, n_bound + 7)
+    }
+    assert answers == {manifold_igl}
+
+
 @pytest.mark.parametrize("mesh_name", MESHES)
 @pytest.mark.parity("is_vertex_manifold", "open3d")
 def test_is_vertex_manifold_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:

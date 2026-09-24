@@ -1448,7 +1448,9 @@ def test_signed_distance_on_mesh_refuses_a_supplied_mesh_in_winding_mode(
     that looks like a right one. Refusing is the only safe response, and this pins it.
     """
     _mesh_tm, mesh_wp = icosahedron
-    points_wp = wp.empty(4, dtype=wp.vec3, device=mesh_wp.device)
+    # Zeroed rather than ``wp.empty``: the positions do not matter here, but uninitialized ones
+    # made a later host norm over the answer overflow, depending on what the allocator returned.
+    points_wp = wp.zeros(4, dtype=wp.vec3, device=mesh_wp.device)
     prebuilt_wp = wp.Mesh(points=wp.clone(mesh_wp.points), indices=wp.clone(mesh_wp.indices))
 
     with pytest.raises(ValueError, match="support_winding_number"):

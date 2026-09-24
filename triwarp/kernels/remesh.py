@@ -8,10 +8,7 @@ from triwarp.kernels.array import (
     LOOP_CONDITION,
     LOOP_ROUND,
     binary_search_sorted_contains,
-    declare_map_signatures,
     lowbias32,
-    map_probe,
-    map_probe_single,
     pack_edge_key,
     to_vec2d,
     to_vec3,
@@ -865,6 +862,42 @@ def emit_flip_topology(
         out_unshared[slot, 1] = unshared_0
 
 
+@wp.kernel
+def mark_sorted_run_starts(
+    sorted_keys: wp.array[wp.uint64], out_starts: wp.array[wp.int32]
+) -> None:
+    # The first position of every run of equal keys: ``mark_unique_edge_starts`` below over a
+    # buffer with no padded tail, for ``_FlipTopology.edges_unique``. ``int32`` for the scan.
+    i = wp.int32(wp.tid())
+    start = wp.int32(0)
+    if sorted_run_start(sorted_keys, i):
+        start = wp.int32(1)
+    out_starts[i] = start
+
+
+@wp.kernel
+def emit_sorted_unique_edges(
+    faces: wp.array[wp.int32],
+    order: wp.array[wp.int32],
+    starts: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    out_unique_edges: wp.array2d[wp.int32],
+    out_inverse: wp.array[wp.int32],
+) -> None:
+    # ``edges.edges_unique``'s two returns from a sort of every corner's edge key: ``ranks`` is the
+    # inclusive scan of ``mark_sorted_run_starts``, so ``ranks[i] - 1`` is the ascending-key unique
+    # index ``grouping.unique_1d`` assigns the key at sorted position ``i``. ``emit_unique_edges``
+    # below is the decimation pass's form, which differs only in its padded corners and capacity.
+    i = wp.int32(wp.tid())
+    corner = order[i]
+    e = ranks[i] - 1
+    out_inverse[corner] = e
+    if starts[i] != 0:
+        a, b = edge_endpoints(faces, corner)
+        out_unique_edges[e, 0] = a
+        out_unique_edges[e, 1] = b
+
+
 @wp.func
 def _resolve_flip_quad(
     faces: wp.array[wp.int32], f0: wp.int32, u: wp.int32, v: wp.int32, d0: wp.int32, d1: wp.int32
@@ -1513,6 +1546,20 @@ def commit_collapses(
     wp.atomic_add(out_count, 0, 1)
 
 
+@wp.func
+def remapped_corner_triple(
+    faces: wp.array[wp.int32], remap: wp.array[wp.int32], f: wp.int32
+) -> tuple[wp.int32, wp.int32, wp.int32, wp.bool]:
+    # Face ``f``'s corners through a vertex map, and whether they are still three distinct
+    # vertices -- a face survives a vertex remap only if they are. Every decimation here ends in
+    # one: an edge collapse merges two of them, vertex clustering sends two into the same cell.
+    a, b, c = corner_triple(faces, f)
+    i0 = remap[a]
+    i1 = remap[b]
+    i2 = remap[c]
+    return i0, i1, i2, i0 != i1 and i1 != i2 and i0 != i2
+
+
 @wp.kernel
 def remap_faces_with_distinct_mask(
     faces: wp.array[wp.int32],
@@ -1520,20 +1567,14 @@ def remap_faces_with_distinct_mask(
     out_faces: wp.array[wp.int32],
     out_mask: wp.array[wp.bool],
 ) -> None:
-    # Remap face ``f``'s corners through a vertex map, and flag whether they are still three
-    # distinct vertices -- a face survives a vertex remap only if they are. Every decimation here
-    # ends in one: an edge collapse merges two of them, vertex clustering sends two into the same
-    # cell.
-    #
-    # One pass for both halves: the test reads only this face's own three remapped corners, so a
-    # separate gather would write them to memory for this kernel to read straight back.
+    # One pass for both halves of ``remapped_corner_triple``: the test reads only this face's own
+    # three remapped corners, so a separate gather would write them to memory for this kernel to
+    # read straight back. ``cluster_remap_faces`` is the same pass plus the referenced-vertex marks
+    # vertex clustering needs.
     f = wp.int32(wp.tid())
-    a, b, c = corner_triple(faces, f)
-    i0 = remap[a]
-    i1 = remap[b]
-    i2 = remap[c]
+    i0, i1, i2, distinct = remapped_corner_triple(faces, remap, f)
     write_corner_triple(out_faces, f, i0, i1, i2)
-    out_mask[f] = i0 != i1 and i1 != i2 and i0 != i2
+    out_mask[f] = distinct
 
 
 @wp.kernel
@@ -2084,6 +2125,76 @@ def cluster_pick_closest(
         <= min_distance[labels[v]]
     ):
         wp.atomic_min(out_representative, labels[v], v)
+
+
+@wp.kernel
+def cluster_remap_faces(
+    faces: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    out_faces: wp.array[wp.int32],
+    out_distinct: wp.array[wp.bool],
+    out_referenced: wp.array[wp.int32],
+) -> None:
+    # ``remap_faces_with_distinct_mask`` plus a mark on every cluster a surviving face names, so
+    # the vertex compaction is an exclusive scan of ``out_referenced`` (caller-zeroed) rather than
+    # a face gather and a sort-based dedup of its corners. The marks are plain stores of one value,
+    # so racing threads agree.
+    f = wp.int32(wp.tid())
+    i0, i1, i2, distinct = remapped_corner_triple(faces, labels, f)
+    write_corner_triple(out_faces, f, i0, i1, i2)
+    out_distinct[f] = distinct
+    if distinct:
+        out_referenced[i0] = 1
+        out_referenced[i1] = 1
+        out_referenced[i2] = 1
+
+
+@wp.kernel
+def cluster_compact_surviving_faces(
+    remapped: wp.array[wp.int32],
+    surviving: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    out_faces: wp.array[wp.int32],
+) -> None:
+    # Renumber the ``k``-th surviving face (``remapped`` holds its cluster ids) onto the compacted
+    # vertices and write it densely at row
+    # ``k``: ``ranks`` is the exclusive scan of the referenced marks, so it is monotone in the
+    # cluster id, and the rows keep the input's face order -- what a face-mask ``submesh`` of the
+    # remapped faces returns.
+    k = wp.int32(wp.tid())
+    a, b, c = corner_triple(remapped, surviving[k])
+    out_faces[3 * k] = ranks[a]
+    out_faces[3 * k + 1] = ranks[b]
+    out_faces[3 * k + 2] = ranks[c]
+
+
+@wp.kernel
+def cluster_compact_means(
+    sums: wp.array[wp.vec3],
+    counts: wp.array[wp.int32],
+    referenced: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    out_vertices: wp.array[wp.vec3],
+) -> None:
+    # The mean of every referenced cluster, written straight into its compacted slot.
+    c = wp.int32(wp.tid())
+    if referenced[c] != 0:
+        out_vertices[ranks[c]] = mean_from_sum(sums[c], counts[c])
+
+
+@wp.kernel
+def cluster_compact_representatives(
+    vertices: wp.array[wp.vec3],
+    representative: wp.array[wp.int32],
+    referenced: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    out_vertices: wp.array[wp.vec3],
+) -> None:
+    # ``cluster_compact_means``' sibling for the closest-to-centre contraction: the representative
+    # vertex's own position, into the compacted slot.
+    c = wp.int32(wp.tid())
+    if referenced[c] != 0:
+        out_vertices[ranks[c]] = vertices[representative[c]]
 
 
 # Objective for ``objective_flip_candidates``. A warp-uniform kernel argument rather than a
@@ -2768,26 +2879,3 @@ def drop_locked_candidates(
         if locked[columns[i]] != 0:
             return
     out_survivor[k] = s
-
-
-def _declare_map_kernels() -> None:
-    """
-    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not two.
-
-    See ``kernels/array.py::declare_map_signatures`` for why this exists; only this module's *own*
-    forking ops belong here.
-
-    One op: ``mean_from_sum``, mapped in place over ``cluster_decimate``'s per-cluster sums and
-    counts. The length-1 row is not speculative -- a voxel size wider than the mesh leaves one
-    cluster, and the broadcast mask of a length-1 array is part of the cache key.
-    """
-    dense, single = map_probe, map_probe_single
-    declare_map_signatures(
-        [
-            (mean_from_sum, (dense(wp.vec3), dense(wp.int32)), wp.vec3),
-            (mean_from_sum, (single(wp.vec3), single(wp.int32)), wp.vec3),
-        ]
-    )
-
-
-_declare_map_kernels()

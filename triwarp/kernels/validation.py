@@ -1,5 +1,6 @@
 import warp as wp
 
+from triwarp.constants import INT32_MAX_CONSTANT
 from triwarp.kernels.predicates import vector_angle
 
 
@@ -44,6 +45,26 @@ def edge_manifold(count: wp.int32, allow_boundary: wp.bool) -> wp.bool:
     if allow_boundary:
         return count <= wp.int32(2)
     return count == wp.int32(2)
+
+
+@wp.kernel
+def edge_share_count_violation(
+    slot_counts: wp.array[wp.int32], allow_boundary: wp.bool, out_violation: wp.array[wp.int32]
+) -> None:
+    """
+    Raise ``out_violation[0]`` when an occupied hash-table slot holds a non-manifold share count.
+
+    ``slot_counts`` is a ``hash_insert`` occurrence table over the packed edge keys, so an empty
+    slot reads ``0`` and every occupied one is exactly one undirected edge's face-share count. The
+    predicate needs only whether *some* edge fails, so the table is read in place: no compaction,
+    no sort and no count of the unique edges. The store is unsynchronized because every writer
+    stores the same ``1``, and it fires only on a violating slot, so it contends with nothing on a
+    manifold mesh.
+    """
+    s = wp.int32(wp.tid())
+    count = slot_counts[s]
+    if count > 0 and not edge_manifold(count, allow_boundary):
+        out_violation[0] = 1
 
 
 @wp.kernel
@@ -131,6 +152,32 @@ def corner_vertex_check(
     v = faces[c]
     if labels[c] != min_label[v]:
         out_mask[v] = False
+
+
+@wp.kernel
+def vertex_manifold_violation(
+    min_label: wp.array[wp.int32], manifold: wp.array[wp.bool], out_violation: wp.array[wp.int32]
+) -> None:
+    """
+    Raise ``out_violation[0]`` when a vertex below the largest referenced index is not manifold.
+
+    The predicate is libigl's: every vertex in ``[0, max(faces)]`` must be referenced and manifold.
+    A vertex is referenced exactly when a corner lowered its ``min_label`` below the ``int32``
+    maximum it was seeded with. An unreferenced vertex lies below ``max(faces)`` exactly when some
+    unreferenced vertex is followed by a referenced one (walk up from it to the largest referenced
+    index), so the neighbour test answers the range question for any buffer length at or above
+    ``max(faces) + 1``, and the bound itself is never needed on the host.
+    """
+    v = wp.int32(wp.tid())
+    unreferenced = min_label[v] == INT32_MAX_CONSTANT
+    violation = wp.bool(False)
+    if unreferenced:
+        if v + 1 < min_label.shape[0]:
+            violation = min_label[v + 1] != INT32_MAX_CONSTANT
+    else:
+        violation = not manifold[v]
+    if violation:
+        out_violation[0] = 1
 
 
 @wp.kernel

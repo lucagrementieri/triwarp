@@ -86,6 +86,13 @@ class _EdgeIncidence(NamedTuple):
 # constant only bounds it.
 _QUADRIC_ROUNDS = 8
 
+# Rounds of ``_flip_interior_edges`` issued before the round is recorded and replayed. Recording
+# and instantiating a round costs more than issuing it, so a call whose first round finds nothing
+# to flip -- a mesh already at the fixpoint -- is cheapest never recording. One issued round is all
+# it takes to learn that, and a later threshold only moves the recording's cost around rather than
+# removing it: calls that flip at all run a handful of rounds, and the replays repay it.
+_FLIP_CAPTURE_FROM_ROUND = 1
+
 
 def isotropic_remesh(
     vertices: wp.array[wp.vec3],
@@ -743,7 +750,11 @@ def _reproject_pass(
 
 
 def _flip_interior_edges(
-    faces: wp.array[wp.int32], n_vertices: int, launch_candidates: _LaunchCandidates, max_iter: int
+    faces: wp.array[wp.int32],
+    n_vertices: int,
+    launch_candidates: _LaunchCandidates,
+    max_iter: int,
+    topology: _FlipTopology | None = None,
 ) -> int:
     """
     Repeatedly flip an independent set of interior edges until none is a candidate.
@@ -762,23 +773,30 @@ def _flip_interior_edges(
     The per-pass topology is built by ``_FlipTopology`` on fixed buffers rather than by composing
     the public wrappers, which avoids rebuilding structure that does not change shape between
     passes; see it for why.
+
+    A caller may pass its own ``topology`` over this very ``faces`` buffer (and ``n_vertices``).
+    Either way it is left describing the face buffer as this call leaves it -- no round that
+    flipped ends without its regroup -- so the caller can read the sorted edge keys afterwards
+    (``_FlipTopology.edges_unique``) or hand the same object to the next call on the same buffer,
+    which then skips its opening build.
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0 or max_iter <= 0:
         return 0
-    topology = _FlipTopology(faces, n_vertices)
+    if topology is None:
+        topology = _FlipTopology(faces, n_vertices)
     key_base = wp.uint64(n_vertices)
     # The one readback of the row count. A committed flip trades one two-face edge for a new one
     # (the duplicate-edge guard every candidate kernel opens with rejects a flip whose new edge
     # already exists, and the claim table stops two flips creating the same one) and leaves the
     # quad's four sides alone, so the interior-edge count is fixed from here on and every later
     # rebuild regroups the same number of rows.
-    m = topology.rebuild()
+    m = topology.rows if topology.built else topology.rebuild()
     if m == 0:
         return 0
 
-    def flip_round(progress: wp.array[wp.int32]) -> None:
+    def flip_round(progress: wp.array[wp.int32], *, regroup: bool = True) -> None:
         """Mark, claim and commit one independent set of flips, then regroup for the next round."""
         launch_candidates(
             topology.adjacency,
@@ -836,27 +854,42 @@ def _flip_interior_edges(
         )
         # Regrouped at the end of the round rather than the start, so the recorded body is one
         # round and the host rebuild above serves the first; the last round's regroup is spare.
-        topology.rebuild(read_count=False)
+        # An issued round leaves it to the caller, which regroups only if something flipped.
+        if regroup:
+            topology.rebuild(read_count=False)
 
     count = wp.zeros(1, dtype=wp.int32, device=device)
     graph = None
-    if wp.get_device(device).is_cuda:
-        # Every round is the same launch sequence over the same buffers -- only the face buffer's
-        # contents change -- so it is recorded once and replayed, and a round costs one graph
-        # launch rather than a dozen launches' worth of Python. Replayed from the host rather than
-        # under ``wp.capture_while``, which would also drop the per-round count read: the regroup's
-        # ``wp.utils.array_scan`` allocates scratch, and a conditional graph's body may not.
-        with wp.ScopedCapture(device) as capture:
-            count.zero_()
-            flip_round(count)
-        graph = capture.graph
+    capturable = wp.get_device(device).is_cuda
     total = 0
-    for _ in range(max_iter):
-        if graph is None:
-            count.zero_()
-            flip_round(count)
-        else:
+    for round_index in range(max_iter):
+        if graph is not None:
             wp.capture_launch(graph)
+        elif capturable and round_index >= _FLIP_CAPTURE_FROM_ROUND:
+            # Every round is the same launch sequence over the same buffers -- only the face
+            # buffer's contents change -- so a long call records one round and replays it, and a
+            # round costs one graph launch rather than a dozen launches' worth of Python. Replayed
+            # from the host rather than under ``wp.capture_while``, which would also drop the
+            # per-round count read: the regroup's ``wp.utils.array_scan`` allocates scratch, and a
+            # conditional graph's body may not.
+            with wp.ScopedCapture(device) as capture:
+                count.zero_()
+                flip_round(count)
+            graph = capture.graph
+            wp.capture_launch(graph)
+        else:
+            # An issued round reads its count before regrouping, so a round that flipped nothing --
+            # the common last round, and the only one a call at the fixpoint runs -- skips a regroup
+            # of a face buffer it did not change.
+            count.zero_()
+            flip_round(count, regroup=False)
+            n = int(read_scalar(count, 0))
+            if n != 0:
+                topology.rebuild(read_count=False)
+            total += n
+            if n == 0:
+                break
+            continue
         n = int(read_scalar(count, 0))
         total += n
         if n == 0:
@@ -937,6 +970,12 @@ class _FlipTopology:
         self.face_claim = wp.empty(self._n_faces, dtype=wp.int32, device=self._device)
         self._rows = -1
         self._allocate_rows(0)
+        self.built = False
+
+    @property
+    def rows(self) -> int:
+        """Interior-edge row count of the last build (``0`` before one)."""
+        return self._rows
 
     def rebuild(self, *, read_count: bool = True) -> int:
         """
@@ -969,6 +1008,7 @@ class _FlipTopology:
             device=self._device,
         )
         wp.utils.radix_sort_pairs(self._keys, self._order, count=n)
+        self.built = True
         wp.launch(
             kernel_remesh.mark_edge_pair_starts,
             dim=n,
@@ -981,6 +1021,7 @@ class _FlipTopology:
         if read_count:
             m = int(read_scalar(self._ranks_tail, 0))
             if m == 0:
+                self._rows = 0
                 return 0
             if m != self._rows:
                 self._allocate_rows(m)
@@ -1006,6 +1047,36 @@ class _FlipTopology:
             device=self._device,
         )
         return m
+
+    def edges_unique(self) -> tuple[twt.Array2dInt32, wp.array[wp.int32]]:
+        """
+        ``edges.edges_unique(faces, n_vertices=n_vertices)`` for the face buffer as last built.
+
+        The build already radix-sorted every corner's undirected edge key against the same radix
+        ``edges_unique`` packs with, so the unique edges are the runs of that sort: a run-start
+        mark, a scan and one emit give the identical ascending-key rows and corner map, without
+        re-hashing the whole mesh. Reuses the pair-start scratch, which only a build reads, so the
+        tables a later flip call starts from are untouched. Requires a build.
+        """
+        n = self._n_corners
+        wp.launch(
+            kernel_remesh.mark_sorted_run_starts,
+            dim=n,
+            inputs=[self._keys, self._starts],
+            device=self._device,
+        )
+        wp.utils.array_scan(self._starts, out_array=self._ranks, inclusive=True)
+        # The edge count sizes the returned table.
+        n_edges = int(read_scalar(self._ranks_tail, 0))
+        unique_edges = twt.empty_2d((n_edges, 2), wp.int32, device=self._device)
+        inverse = wp.empty(n, dtype=wp.int32, device=self._device)
+        wp.launch(
+            kernel_remesh.emit_sorted_unique_edges,
+            dim=n,
+            inputs=[self._faces, self._order, self._starts, self._ranks, unique_edges, inverse],
+            device=self._device,
+        )
+        return unique_edges, inverse
 
     def _allocate_rows(self, m: int) -> None:
         """(Re)allocate the ``m``-row tables and the hashed edge-claim table sized from them."""
@@ -1101,10 +1172,11 @@ def cluster_decimate(
     number of such cells — usually zero, and never in a way that changes the surface.
 
     The binning goes through [`triwarp.voxels.cell_indices`][triwarp.voxels.cell_indices], but the
-    *dedup* deliberately stays on [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows]
-    rather than moving onto a NanoVDB grid: a grid numbers its clusters leaf-major, so preserving
-    today's vertex order would need a restoring sort that gives back most of any gain, and it is not
-    worth changing the public output convention for what remains.
+    *dedup* deliberately stays on the packed cell keys
+    ([`triwarp.grouping.unique_1d`][triwarp.grouping.unique_1d]) rather than moving onto a NanoVDB
+    grid: a grid numbers its clusters leaf-major, so preserving today's vertex order would need a
+    restoring sort that gives back most of any gain, and it is not worth changing the public output
+    convention for what remains.
     """
     require_same_device(vertices=vertices, faces=faces)
     if contraction not in ("average", "closest"):
@@ -1122,30 +1194,51 @@ def cluster_decimate(
         vertices, voxel_size, caller="cluster_decimate"
     )
     cells = tw.voxels.cell_indices(vertices, voxel_size, origin=origin)
-    unique_cells, labels = tw.grouping.unique_rows(cells, return_inverse=True)
-    # The unique rows *are* the clusters, so their count is the answer -- a device reduction over
-    # ``labels`` plus its readback would re-derive a number ``unique_rows`` has already paid for.
-    n_clusters = int(unique_cells.shape[0])
-
-    cluster_vertices = _cluster_positions(
-        vertices, labels, n_clusters, origin, voxel_size, contraction
+    # The unique cell keys *are* the clusters, so their count is the answer. Only the keys and the
+    # inverse are wanted, so this is ``unique_rows`` without its representative-row gather.
+    cell_keys, labels = tw.grouping.unique_1d(
+        tw.grouping.hash_indices_rows(cells), return_inverse=True
     )
+    n_clusters = int(cell_keys.shape[0])
+
     remapped = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
-    keep_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
+    distinct = wp.empty(n_faces, dtype=wp.bool, device=device)
+    referenced = wp.zeros(n_clusters, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_remesh.remap_faces_with_distinct_mask,
+        kernel_remesh.cluster_remap_faces,
         dim=n_faces,
-        inputs=[faces, labels, remapped, keep_mask],
+        inputs=[faces, labels, remapped, distinct, referenced],
         device=device,
     )
-    kept_vertices, kept_faces = tw.selection.submesh_from_face_mask(
-        cluster_vertices, remapped, keep_mask
+    # The output keeps the clusters some surviving face names, in cluster order: an exclusive scan
+    # of their marks is each one's compacted index, and its total -- read back because it sizes
+    # the vertex buffer and the face-key radix -- is the output vertex count.
+    ranks, n_kept = tw.array.counts_to_offsets(referenced)
+    if n_kept == 0:
+        return (
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
+    kept_vertices = _cluster_positions(
+        vertices, labels, n_clusters, origin, voxel_size, contraction, referenced, ranks, n_kept
     )
     # Welding can map two distinct input faces onto the same triple, which would leave a duplicated
-    # face rather than a manifold one, so the dedup is part of the algorithm rather than polish. It
-    # needs no vertex compaction after it: a dropped duplicate names the same three vertices as the
-    # copy that is kept, so every vertex the face selection above left referenced still is.
-    return kept_vertices, tw.grouping.unique_faces(kept_faces)
+    # face rather than a manifold one, so the dedup is part of the algorithm rather than polish.
+    # It runs over the *surviving* faces only, compacted first: at a coarse voxel size nearly every
+    # face collapses, and a dedup over all of them -- padding the collapsed ones into a class of
+    # their own -- hashes and searches the whole input for an answer the size of the output. A
+    # dropped duplicate names the same three vertices as the copy that is kept, so the vertex
+    # compaction above stands.
+    surviving = tw.array.flatnonzero(distinct)
+    n_surviving = int(surviving.shape[0])
+    compacted = wp.empty(3 * n_surviving, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_remesh.cluster_compact_surviving_faces,
+        dim=n_surviving,
+        inputs=[remapped, surviving, ranks, compacted],
+        device=device,
+    )
+    return kept_vertices, tw.grouping.unique_faces(compacted)
 
 
 def _cluster_positions(
@@ -1155,20 +1248,33 @@ def _cluster_positions(
     origin: wp.vec3,
     voxel_size: float,
     contraction: Literal["average", "closest"],
+    referenced: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    n_kept: int,
 ) -> wp.array[wp.vec3]:
-    """One representative position per occupied cell, by cell mean or by nearest-to-centre."""
+    """
+    One representative position per referenced cell, by cell mean or by nearest-to-centre.
+
+    Written straight into the compacted slot ``ranks`` gives each cell ``referenced`` marks.
+    """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
+    out = wp.empty(n_kept, dtype=wp.vec3, device=device)
     if contraction == "average":
-        out = wp.zeros(n_clusters, dtype=wp.vec3, device=device)
+        sums = wp.zeros(n_clusters, dtype=wp.vec3, device=device)
         counts = wp.zeros(n_clusters, dtype=wp.int32, device=device)
         wp.launch(
             kernel_remesh.cluster_accumulate,
             dim=n_vertices,
-            inputs=[labels, vertices, out, counts],
+            inputs=[labels, vertices, sums, counts],
             device=device,
         )
-        wp.map(kernel_remesh.mean_from_sum, out, counts, out=out)
+        wp.launch(
+            kernel_remesh.cluster_compact_means,
+            dim=n_clusters,
+            inputs=[sums, counts, referenced, ranks, out],
+            device=device,
+        )
         return out
 
     min_distance = wp.full(n_clusters, float("inf"), dtype=wp.float32, device=device)
@@ -1185,7 +1291,13 @@ def _cluster_positions(
         inputs=[labels, vertices, origin, wp.float32(voxel_size), min_distance, representative],
         device=device,
     )
-    return tw.array.gather(vertices, representative)
+    wp.launch(
+        kernel_remesh.cluster_compact_representatives,
+        dim=n_clusters,
+        inputs=[vertices, representative, referenced, ranks, out],
+        device=device,
+    )
+    return out
 
 
 @overload
@@ -3104,14 +3216,20 @@ def subdivide_region_to_size(
     current_faces = faces
     region_flags = tw.array.astype(region, wp.int32)
     splits_done = 0
+    # The flip pass's working set over ``current_faces``, kept while that buffer lives: its edge
+    # sort already is the next pass's ``edges_unique``, and the closing flip pass starts from it.
+    topology: _FlipTopology | None = None
 
     for i in range(max_iter + 1):
         n_faces = int(current_faces.shape[0]) // 3
         n_vertices = int(current_vertices.shape[0])
 
-        unique_edges, inverse = tw.edges.edges_unique(
-            current_faces, n_vertices=n_vertices, validate=False
-        )
+        if topology is not None and topology.built:
+            unique_edges, inverse = topology.edges_unique()
+        else:
+            unique_edges, inverse = tw.edges.edges_unique(
+                current_faces, n_vertices=n_vertices, validate=False
+            )
         m = int(unique_edges.shape[0])
 
         edge_in_region = wp.zeros(m, dtype=wp.bool, device=device)
@@ -3175,9 +3293,17 @@ def subdivide_region_to_size(
         )
         splits_done += n_long
 
+        topology = None
         if delaunay:
+            topology = _FlipTopology(current_faces, int(current_vertices.shape[0]))
             _flip_region_faces(
-                current_vertices, current_faces, region_flags, max_angle_change, max_deviation, 8
+                current_vertices,
+                current_faces,
+                region_flags,
+                max_angle_change,
+                max_deviation,
+                8,
+                topology,
             )
 
     # Nothing in the region needed splitting, so ``current_*`` are still the caller's own buffers;
@@ -3190,7 +3316,13 @@ def subdivide_region_to_size(
 
     if delaunay:
         _flip_region_faces(
-            current_vertices, current_faces, region_flags, max_angle_change, max_deviation, 50
+            current_vertices,
+            current_faces,
+            region_flags,
+            max_angle_change,
+            max_deviation,
+            50,
+            topology,
         )
 
     new_region = tw.array.astype(region_flags, wp.bool)
@@ -3728,8 +3860,14 @@ def _flip_region_faces(
     max_angle_change: float | None,
     max_deviation: float | None,
     max_iter: int,
+    topology: _FlipTopology | None = None,
 ) -> int:
-    """Run the parallel Delone flip pass over the region, mutating ``faces`` in place."""
+    """
+    Run the parallel Delone flip pass over the region, mutating ``faces`` in place.
+
+    ``topology`` is handed through to ``_flip_interior_edges``, which leaves it describing
+    ``faces`` as the pass leaves it.
+    """
     device = faces.device
     n_vertices = int(vertices.shape[0])
     mac, mdsq, car = _flip_gates(max_angle_change, max_deviation)
@@ -3756,7 +3894,7 @@ def _flip_region_faces(
             device=device,
         )
 
-    return _flip_interior_edges(faces, n_vertices, launch, max_iter)
+    return _flip_interior_edges(faces, n_vertices, launch, max_iter, topology)
 
 
 def _flip_gates(

@@ -329,8 +329,8 @@ class _EdgeTable:
     """
     Device rim-edge lookups for the pre-DP hole-fill stage.
 
-    ``rim_opposite`` finds, per rim edge, its adjacent-face
-    count and the opposite vertex of the single adjacent face; a ``(n_vertices,)`` slot scratch
+    ``rim_opposite`` finds, per rim edge, the opposite vertex of its single adjacent face (and
+    that it has exactly one); a ``(n_vertices,)`` slot scratch
     supports the forbidden-chord mask of every loop at once. Both answers are rim-sized, so neither
     builds a table of the mesh's edges: the one sort is of the rim's own keys.
     """
@@ -339,6 +339,9 @@ class _EdgeTable:
         self, vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32
     ) -> None:
         device = faces.device
+        # Derived from the rows rather than taken from ``len(vertices)``, deliberately: the ``min``
+        # half of this reduction is the only negative-index guard between a malformed face buffer
+        # and the gathers below, which would otherwise read out of bounds instead of raising.
         n_vertices = tw.array.index_bound(edges_sorted, require_non_negative=True)
         self.vertices = vertices
         self.faces = faces
@@ -347,22 +350,37 @@ class _EdgeTable:
         self.n_vertices = n_vertices
         self.device = device
 
-    def rim_opposite(self, loops: _PackedLoops) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-        """Opposite-vertex position + validity per rim edge, for every loop in one pass."""
-        keys = wp.empty(loops.total, dtype=wp.uint64, device=self.device)
-        wp.launch(
-            kernel_holes.rim_edge_keys,
-            dim=loops.total,
-            inputs=[loops.flat_loops, loops.loop_id, loops.starts, loops.sizes, self.base, keys],
-            device=self.device,
-        )
+    def rim_opposite(
+        self, loops: _PackedLoops, keys: wp.array[wp.uint64] | None = None
+    ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+        """
+        Opposite-vertex position + validity per rim edge, for every loop in one pass.
+
+        ``keys`` are the rim edges' undirected keys under ``self.base``, for a caller whose own
+        pass over the rim already wrote them (the fill's ``loop_rim_metrics``); ``None`` keys them
+        here.
+        """
+        if keys is None:
+            keys = wp.empty(loops.total, dtype=wp.uint64, device=self.device)
+            wp.launch(
+                kernel_holes.rim_edge_keys,
+                dim=loops.total,
+                inputs=[
+                    loops.flat_loops,
+                    loops.loop_id,
+                    loops.starts,
+                    loops.sizes,
+                    self.base,
+                    keys,
+                ],
+                device=self.device,
+            )
         sorted_keys, slots = tw.array.sort_and_argsort(keys)
-        counts = wp.zeros(loops.total, dtype=wp.int32, device=self.device)
-        thirds = wp.empty(loops.total, dtype=wp.int32, device=self.device)
+        third = wp.full(loops.total, kernel_holes.RIM_NO_FACE, dtype=wp.int32, device=self.device)
         wp.launch(
             kernel_holes.probe_rim_edges,
             dim=int(self.faces.shape[0]) // 3,
-            inputs=[self.faces, sorted_keys, slots, self.base, counts, thirds],
+            inputs=[self.faces, sorted_keys, slots, self.base, third],
             device=self.device,
         )
         positions = wp.empty(loops.total, dtype=wp.vec3, device=self.device)
@@ -370,7 +388,7 @@ class _EdgeTable:
         wp.launch(
             kernel_holes.rim_opposite_positions,
             dim=loops.total,
-            inputs=[self.vertices, counts, thirds, positions, valid],
+            inputs=[self.vertices, third, positions, valid],
             device=self.device,
         )
         return positions, valid
@@ -603,8 +621,8 @@ def _fill_packed_loops(
     chord pass over the mesh, one ragged ``dp`` / ``prev`` pair, one launch per span rather than
     per (loop, span), a device-side min-area retry mask instead of a host branch per loop, and a
     one-thread-per-loop traceback that keeps the predecessor table on the device. What is left on
-    the host is two scalar reads: whether any loop needs the fallback metric, and how many fill
-    triangles there are to return.
+    the host is two scalar reads of one small state buffer: whether any loop needs the fallback
+    metric, and whether the traceback fell short of a full triangulation anywhere.
 
     ``edges_sorted`` lets a caller that already built the sorted edge rows hand them over.
     ``fill_min_weight`` does; ``fill_small`` and ``fill_smooth`` deliberately do **not**, and it is
@@ -621,9 +639,13 @@ def _fill_packed_loops(
     combine_id = _METRIC_COMBINE.get(metric, 0)
     min_area_id = _METRIC_IDS["min_area"]
 
-    loop_pos = tw.array.gather(vertices, loops.flat_loops)
-    newell_sums = wp.zeros(loops.n_loops, dtype=wp.vec3, device=device)
-    max_edge_sq = wp.zeros(loops.n_loops, dtype=wp.float32, device=device)
+    loop_pos = wp.empty(loops.total, dtype=wp.vec3, device=device)
+    rim_keys = wp.empty(loops.total, dtype=wp.uint64, device=device)
+    # Accumulated into, then finished in place: the finalize pass reads each loop's sum and writes
+    # that loop's slot, so the plane normals overwrite the Newell sums and the ``char_area`` scales
+    # overwrite the longest edges rather than taking two buffers of their own.
+    plane_normals = wp.zeros(loops.n_loops, dtype=wp.vec3, device=device)
+    char_areas = wp.zeros(loops.n_loops, dtype=wp.float32, device=device)
     wp.launch(
         kernel_holes.loop_rim_metrics,
         dim=loops.total,
@@ -633,17 +655,18 @@ def _fill_packed_loops(
             loops.starts,
             loops.sizes,
             vertices,
-            max_edge_sq,
-            newell_sums,
+            edge_table.base,
+            char_areas,
+            plane_normals,
+            loop_pos,
+            rim_keys,
         ],
         device=device,
     )
-    plane_normals = wp.empty(loops.n_loops, dtype=wp.vec3, device=device)
-    char_areas = wp.empty(loops.n_loops, dtype=wp.float32, device=device)
     wp.launch(
         kernel_holes.finalize_rim_metrics,
         dim=loops.n_loops,
-        inputs=[max_edge_sq, newell_sums, plane_normals, char_areas],
+        inputs=[char_areas, plane_normals, plane_normals, char_areas],
         device=device,
     )
 
@@ -652,11 +675,14 @@ def _fill_packed_loops(
         if resolve_multiple_edges
         else wp.zeros(loops.dp_total, dtype=wp.int32, device=device)
     )
-    rim_opp_pos, rim_opp_valid = edge_table.rim_opposite(loops)
+    rim_opp_pos, rim_opp_valid = edge_table.rim_opposite(loops, rim_keys)
 
     dp = wp.empty(loops.dp_total, dtype=wp.float32, device=device)
     prev = wp.empty(loops.dp_total, dtype=wp.int32, device=device)
-    all_loops = wp.ones(loops.n_loops, dtype=wp.int32, device=device)
+    # The retry flag and the traceback's shortfall, read back at two different points; see
+    # ``kernels/holes.py::FILL_STATE_SLOTS``.
+    state = wp.zeros(kernel_holes.FILL_STATE_SLOTS, dtype=wp.int32, device=device)
+    active = wp.ones(loops.n_loops, dtype=wp.int32, device=device)
     _run_hole_dp(
         loops,
         loop_pos,
@@ -665,7 +691,7 @@ def _fill_packed_loops(
         rim_opp_pos,
         rim_opp_valid,
         char_areas,
-        all_loops,
+        active,
         primary_id,
         combine_id,
         smooth_boundary,
@@ -676,13 +702,13 @@ def _fill_packed_loops(
     if primary_id != min_area_id:
         # *Which* loops the primary metric failed on is decided on device and fed straight back in
         # as the re-run's active mask, so the fallback is one more batched pass rather than a branch
-        # per loop. Loops the primary metric handled keep their ``prev`` rows.
-        retry = twt.empty_1d(loops.n_loops, wp.int32, device=device)
-        any_retry = wp.zeros(1, dtype=wp.int32, device=device)
+        # per loop. Loops the primary metric handled keep their ``prev`` rows. The mask overwrites
+        # the all-loops one in place: the first sweep has read it by the time the flag pass runs,
+        # and every slot is rewritten.
         wp.launch(
             kernel_holes.flag_bad_triangulations,
             dim=loops.n_loops,
-            inputs=[loops.sizes, loops.dp_offsets, dp, retry, any_retry],
+            inputs=[loops.sizes, loops.dp_offsets, dp, active, state],
             device=device,
         )
         # ...but *whether* any loop failed is worth one host read, because a pass with an all-zero
@@ -691,7 +717,7 @@ def _fill_packed_loops(
         # back a few lines below regardless, so this adds no synchronisation point that was not
         # there. The flag kernel raises the test itself as it writes the mask, so it is one
         # 4-byte read rather than a readback of the ``n_loops`` buffer or a reduction over it.
-        if read_scalar(any_retry, 0) > 0:
+        if read_scalar(state, kernel_holes.FILL_STATE_RETRY) > 0:
             _run_hole_dp(
                 loops,
                 loop_pos,
@@ -700,7 +726,7 @@ def _fill_packed_loops(
                 rim_opp_pos,
                 rim_opp_valid,
                 char_areas,
-                retry,
+                active,
                 min_area_id,
                 0,
                 smooth_boundary,
@@ -708,35 +734,40 @@ def _fill_packed_loops(
                 prev,
             )
 
-    fill_faces = _traceback_fill_faces(loops, prev)
-    if fill_faces is None:
-        return wp.clone(faces)
-    return tw.array.concatenate([faces, fill_faces])
+    return _traceback_fill_faces(faces, loops, prev, state)
 
 
 def _traceback_fill_faces(
-    loops: _PackedLoops, prev: wp.array[wp.int32]
-) -> wp.array[wp.int32] | None:
+    faces: wp.array[wp.int32],
+    loops: _PackedLoops,
+    prev: wp.array[wp.int32],
+    state: wp.array[wp.int32],
+) -> wp.array[wp.int32]:
     """
-    Walk every loop's DP predecessor table into one flat fill-face buffer, or ``None`` if empty.
+    Walk every loop's DP predecessor table into fill faces, returned appended to ``faces``.
 
     One thread per loop, so the ``O(B)`` walk each rim needs runs where its table already is
     instead of crossing the bus: the host form read the whole ``sum(B^2)`` predecessor table back
     to reach ``sum(B)`` of its entries, then built the triangles a Python tuple at a time.
 
-    Each loop writes into its own ``B - 2`` slots of a padded buffer and reports how many it
-    actually used, which is fewer exactly where an interval had no legal apex. The single readback
-    is the packed total, which sizes the return -- and it doubles as the test for whether any loop
-    fell short, so the compaction pass only runs when one did.
+    Each loop writes into its own ``B - 2`` slots of a padded block and reports how many it
+    actually used, which is fewer exactly where an interval had no legal apex. The padded block is
+    the tail of the returned buffer itself, with ``faces`` copied in front of it, so when no loop
+    falls short -- the usual case -- the walk has written the answer in place. The single readback
+    is the total shortfall the walk accumulated into ``state``; only where it is non-zero does a
+    scan place the compacted blocks and a second buffer receive them.
     """
     device = loops.device
     triangle_sizes_np = np.maximum(loops.sizes_np - 2, 0)
     n_padded = int(triangle_sizes_np.sum())
     if n_padded == 0:
-        return None
+        return wp.clone(faces)
+    n_face_indices = int(faces.shape[0])
+    filled = wp.empty(n_face_indices + 3 * n_padded, dtype=wp.int32, device=device)
+    wp.copy(filled, faces, count=n_face_indices)
+    padded = twt.as_dense(filled[n_face_indices:]).reshape((n_padded, 3))
     triangle_offsets = loops.triangle_offsets
     counts = twt.empty_1d(loops.n_loops, wp.int32, device=device)
-    padded = wp.empty(3 * n_padded, dtype=wp.int32, device=device)
     # The walk's pending intervals: one slot per packed rim vertex, which is exactly enough
     # (see ``traceback_fill_triangles``), and caller-allocated because a kernel local cannot be
     # sized by a runtime rim length.
@@ -753,18 +784,21 @@ def _traceback_fill_faces(
             prev,
             stack,
             counts,
-            padded.reshape((n_padded, 3)),
+            padded,
+            state,
         ],
         device=device,
     )
+    shortfall = int(read_scalar(state, kernel_holes.FILL_STATE_SHORTFALL))
+    if shortfall == 0:
+        return filled
+    n_triangles = n_padded - shortfall
+    if n_triangles == 0:
+        return wp.clone(faces)
     packed_ends = twt.empty_1d(loops.n_loops, wp.int32, device=device)
     wp.utils.array_scan(counts, packed_ends, inclusive=True)
-    n_triangles = int(read_scalar(packed_ends, index=-1))
-    if n_triangles == 0:
-        return None
-    if n_triangles == n_padded:
-        return padded
-    fill_faces = wp.empty(3 * n_triangles, dtype=wp.int32, device=device)
+    compacted = wp.empty(n_face_indices + 3 * n_triangles, dtype=wp.int32, device=device)
+    wp.copy(compacted, faces, count=n_face_indices)
     wp.launch(
         kernel_holes.compact_fill_triangles,
         dim=(loops.n_loops, int(triangle_sizes_np.max())),
@@ -772,12 +806,12 @@ def _traceback_fill_faces(
             counts,
             triangle_offsets,
             packed_ends,
-            padded.reshape((n_padded, 3)),
-            fill_faces.reshape((n_triangles, 3)),
+            padded,
+            twt.as_dense(compacted[n_face_indices:]).reshape((n_triangles, 3)),
         ],
         device=device,
     )
-    return fill_faces
+    return compacted
 
 
 def _run_hole_dp(

@@ -2655,6 +2655,41 @@ def test_fix_self_intersections_leaves_a_clean_mesh_alone(
         tw.repair.fix_self_intersections(vertices_wp, faces_wp, max_iter=0)
 
 
+@pytest.mark.parametrize("hops", [0, 1, 2, 3])
+def test_fix_self_intersections_dilation_matches_expand_vertex_mask(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], hops: int
+) -> None:
+    """
+    Triwarp against triwarp: the loop's face-ring dilation is ``expand_vertex_mask``'s.
+
+    ``fix_self_intersections`` grows its cut region by hopping through faces (any-corner lookup,
+    then mark the corners) instead of building a unique-edge table every pass. That is the same
+    dilation only because two vertices of a triangle mesh are one-ring neighbours exactly when they
+    share a face, and each hop must grow from the previous hop's complete mask. The reference path
+    is ``expand_vertex_mask`` followed by the same any-corner face rule, which is what the loop
+    called before; it carries its own oracle in ``tests/test_selection.py``. Non-vacuity: the
+    seed is a few faces, and every hop grows the answer.
+    """
+    _, mesh_wp = icosphere_coarse
+    faces_wp = mesh_wp.indices
+    n_vertices = int(mesh_wp.points.shape[0])
+    n_faces = int(faces_wp.shape[0]) // 3
+    seed_np = np.zeros(n_faces, dtype=bool)
+    seed_np[[0, 101, 222]] = True
+    seed_wp = wp.array(seed_np, dtype=wp.bool, device=faces_wp.device)
+
+    grown_wp = tw.repair._dilate_face_mask(faces_wp, seed_wp, hops, n_vertices)
+
+    faces_np = faces_wp.numpy().reshape(-1, 3)
+    vertex_seed_np = np.zeros(n_vertices, dtype=bool)
+    vertex_seed_np[faces_np[seed_np].ravel()] = True
+    vertex_seed_wp = wp.array(vertex_seed_np, dtype=wp.bool, device=faces_wp.device)
+    expanded_np = tw.selection.expand_vertex_mask(faces_wp, vertex_seed_wp, hops).numpy()
+    reference_np = expanded_np[faces_np].any(axis=1)
+    assert np.array_equal(grown_wp.numpy(), reference_np)
+    assert int(reference_np.sum()) > (int(seed_np.sum()) if hops == 0 else 3 * (hops + 1))
+
+
 def _ragged_grid(device: str) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
     """
     Build a flat grid with every third rim face removed, plus the intact grid for comparison.
@@ -3102,6 +3137,92 @@ def test_remove_degree3_vertices_is_idempotent_and_area_preserving(device: str) 
 
     with pytest.raises(ValueError, match="max_iter must be non-negative"):
         tw.repair.remove_degree3_vertices(vertices_wp, faces_wp, max_iter=-1)
+
+
+def _nested_face_splits(
+    mesh_tm: tm.Trimesh, face_indices: list[int], depth: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Split each listed face at its centroid, then split one child of that split, ``depth`` deep.
+
+    Only the innermost centroid of each chain is valence 3; removing it drops the one before it to
+    valence 3, so the chain is a cascade that needs ``depth`` removal passes and that no pass-0
+    selection can see. The splits are laid over the input's own faces, so removing every centroid
+    returns ``mesh_tm`` exactly.
+    """
+    vertices = [np.asarray(point, dtype=np.float64) for point in mesh_tm.vertices]
+    faces = mesh_tm.faces.tolist()
+    for face in face_indices:
+        target = face
+        for level in range(depth):
+            a, b, c = faces[target]
+            vertices.append((vertices[a] + vertices[b] + vertices[c]) / 3.0)
+            centre = len(vertices) - 1
+            faces[target] = [a, b, centre]
+            faces.append([b, c, centre])
+            faces.append([c, a, centre])
+            target = len(faces) - 1 - level % 2
+    return np.asarray(vertices), np.asarray(faces)
+
+
+@pytest.mark.parametrize("closed", [True, False], ids=["closed", "open"])
+def test_remove_degree3_vertices_runs_a_cascade_to_its_fixpoint(device: str, closed: bool) -> None:
+    """
+    Class A against ``findInnerVertsOfDegree``: a cascade leaves no interior valence-3 vertex.
+
+    The pass loop stops as soon as a pass creates no new candidate, which the emit kernel counts
+    from the rim vertices' face counts rather than by building the next pass's rings. A miscount
+    toward zero stops a cascade early and leaves a valence-3 vertex MeshLib still finds, so this
+    compares MeshLib's interior valence-3 mask of the *output* against the empty answer, and the
+    removed count against the number of splits -- the assert that fails first when the kernel's
+    count is mutated to undercount. The open arm splits faces touching the rim, so the count runs
+    over boundary vertices too.
+
+    Non-vacuity is asserted on the input: MeshLib finds exactly one valence-3 vertex per chain (the
+    innermost), and one pass short of the chain depth leaves some behind.
+    """
+    depth = 4
+    mesh_tm = tm.creation.icosphere(subdivisions=1)
+    if not closed:
+        mesh_tm = tm.Trimesh(
+            mesh_tm.vertices, mesh_tm.faces[mesh_tm.triangles_center[:, 2] < 0.5], process=False
+        )
+        mesh_tm.remove_unreferenced_vertices()
+    boundary_np = np.zeros(len(mesh_tm.vertices), dtype=bool)
+    edges_np, counts_np = np.unique(np.sort(mesh_tm.edges, axis=1), axis=0, return_counts=True)
+    boundary_np[edges_np[counts_np == 1].ravel()] = True
+    on_rim = np.flatnonzero(boundary_np[mesh_tm.faces].any(axis=1))
+    chains = [int(face) for face in (on_rim[::7] if not closed else range(0, 80, 9))]
+    vertices_np, faces_np = _nested_face_splits(mesh_tm, chains, depth)
+    n_splits = len(chains) * depth
+
+    input_ml = numpy_to_meshlib(vertices_np, faces_np)
+    input_degree3_ml = meshlib_bitset_to_numpy(
+        mm.findInnerVertsOfDegree(input_ml.topology, 3), len(vertices_np)
+    )
+    assert int(input_degree3_ml.sum()) == len(chains)  # non-vacuity: one per chain
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np.ravel().astype(np.int32), device)
+    _, _, short_removed = tw.repair.remove_degree3_vertices(
+        vertices_wp, faces_wp, max_iter=depth - 1, return_count=True
+    )
+    assert short_removed < n_splits  # non-vacuity: the cascade really needs every pass
+
+    out_vertices_wp, out_faces_wp, removed = tw.repair.remove_degree3_vertices(
+        vertices_wp, faces_wp, return_count=True
+    )
+    assert removed == n_splits
+    assert int(out_vertices_wp.shape[0]) == len(mesh_tm.vertices)
+    assert int(out_faces_wp.shape[0]) // 3 == len(mesh_tm.faces)
+    output_ml = warp_to_meshlib(out_vertices_wp, out_faces_wp)
+    output_degree3_ml = meshlib_bitset_to_numpy(
+        mm.findInnerVertsOfDegree(output_ml.topology, 3), int(out_vertices_wp.shape[0])
+    )
+    assert not output_degree3_ml.any()
+    _, _, again_removed = tw.repair.remove_degree3_vertices(
+        out_vertices_wp, out_faces_wp, return_count=True
+    )
+    assert again_removed == 0
 
 
 @pytest.mark.parity("flatten_degree3_vertices", "meshlib")

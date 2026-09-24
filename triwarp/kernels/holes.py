@@ -7,7 +7,6 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import (
     declare_map_signatures,
     loop_next_slot,
-    loop_rim_edge,
     map_probe,
     map_probe_single,
     pack_nearest_key,
@@ -221,6 +220,20 @@ def char_area_from_max(max_edge_sq: wp.float32) -> wp.float32:
     return 1.0
 
 
+@wp.func
+def rim_edge_vertices(
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    slot: wp.int32,
+) -> tuple[wp.int32, wp.int32]:
+    # The two vertex ids of the rim edge leaving packed slot ``slot``, the far one wrapping inside
+    # its own loop. ``loop_rim_edge`` is the same edge read as positions; the two kernels below that
+    # need the ids as well -- to key the edge -- read them here.
+    return (flat_loops[slot], flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, slot)])
+
+
 @wp.kernel
 def loop_rim_metrics(
     flat_loops: wp.array[wp.int32],
@@ -228,16 +241,28 @@ def loop_rim_metrics(
     loop_starts: wp.array[wp.int32],
     loop_sizes: wp.array[wp.int32],
     vertices: wp.array[wp.vec3],
+    base: wp.uint64,
     out_max_edge_sq: wp.array[wp.float32],
     out_normal: wp.array[wp.vec3],
+    out_loop_pos: wp.array[wp.vec3],
+    out_keys: wp.array[wp.uint64],
 ) -> None:
     # One thread per rim vertex of every loop at once. Each thread owns the rim edge leaving its
     # vertex and folds it into its loop's two per-loop scalars: the longest edge (segmented max,
     # the ``char_area`` scale) and the Newell normal sum (segmented sum, the hole plane). The
     # per-loop equivalents are ``tw.reduce.max`` over a gathered rim and
     # ``tw.polyline.polyline_normal``, each of which costs a host synchronization per loop.
+    #
+    # The same pass writes the two per-slot tables the fill reads next, since it has already
+    # loaded both: the rim vertex's position (the gather ``loop_pos`` would otherwise be) and the
+    # edge's undirected key, which is ``rim_edge_keys``' output for the rim-opposite probe.
     t = wp.int32(wp.tid())
-    ell, a, c = loop_rim_edge(flat_loops, loop_id, loop_starts, loop_sizes, vertices, t)
+    ell = loop_id[t]
+    u, v = rim_edge_vertices(flat_loops, loop_id, loop_starts, loop_sizes, t)
+    a = vertices[u]
+    c = vertices[v]
+    out_loop_pos[t] = a
+    out_keys[t] = kernel_array.pack_edge_key(u, v, base)
     wp.atomic_max(out_max_edge_sq, ell, wp.length_sq(c - a))
     wp.atomic_add(out_normal, ell, wp.cross(a, c))
 
@@ -284,6 +309,15 @@ def init_dp_base(
             out_dp[row + j] = 0.0
         else:
             out_dp[row + j] = BAD_METRIC
+
+
+# Slots of the min-weight fill's one ``wp.int32`` state buffer, which the host reads twice: whether
+# any loop needs the ``min_area`` retry (``flag_bad_triangulations``), and how many triangles the
+# traceback fell short of the padded ``B - 2`` per loop (``traceback_fill_triangles``). One
+# allocation serves both, since the second read is after the first.
+FILL_STATE_RETRY = wp.constant(0)
+FILL_STATE_SHORTFALL = wp.constant(1)
+FILL_STATE_SLOTS = 2
 
 
 # Lanes per block of ``fill_dp_span_tiled``: one block owns one interval and its lanes stride the
@@ -664,12 +698,16 @@ def traceback_fill_triangles(
     stack: wp.array[wp.vec2i],
     out_counts: wp.array[wp.int32],
     out_triangles: wp.array2d[wp.int32],
+    out_state: wp.array[wp.int32],
 ) -> None:
     # One thread per loop, walking its own predecessor table: interval ``(i, j)`` splits at apex
     # ``k = prev[i, j]`` into triangle ``(i, j, k)`` -- reversed rim winding, matching ``fan_faces``
     # -- and sub-intervals ``(i, k)``, ``(k, j)``. An apex of ``-1`` marks an interval no legal
     # triangulation covers (a forbidden chord, or a pinched rim), and is skipped, so a loop emits
-    # *at most* ``B - 2`` triangles and the caller compacts on ``out_counts``.
+    # *at most* ``B - 2`` triangles and the caller compacts on ``out_counts``. The triangles a loop
+    # falls short by are added to ``out_state[FILL_STATE_SHORTFALL]`` (arriving zeroed), so the
+    # caller's "is the padded buffer already the answer" test is one 4-byte read, and the scan
+    # that places the compacted blocks runs only when some loop did fall short.
     #
     # The walk is depth-first with ``(k, j)`` taken before ``(i, k)``, which is what fixes the
     # emitted order -- the same order for the same table on either device.
@@ -705,6 +743,8 @@ def traceback_fill_triangles(
                 stack[o + top] = wp.vec2i(k, j)
                 top += 1
     out_counts[ell] = n
+    if n < b - 2:
+        wp.atomic_add(out_state, FILL_STATE_SHORTFALL, b - 2 - n)
 
 
 @wp.kernel
@@ -736,19 +776,19 @@ def flag_bad_triangulations(
     dp_offsets: wp.array[wp.int32],
     dp: wp.array[wp.float32],
     out_retry: wp.array[wp.int32],
-    out_any_retry: wp.array[wp.int32],
+    out_state: wp.array[wp.int32],
 ) -> None:
     # Per-loop min-area retry mask: the whole-loop interval is dp[0, B - 1]. Testing it on device
     # replaces copying every loop's ``B x B`` table to the host to read one scalar out of it.
-    # ``out_any_retry[0]`` (arriving zeroed) is set by any loop that fails, so the caller's "does
-    # any loop need the fallback" test is one 4-byte read rather than a reduction over the mask.
-    # Every writer stores the same value, so the race is benign.
+    # ``out_state[FILL_STATE_RETRY]`` (arriving zeroed) is set by any loop that fails, so the
+    # caller's "does any loop need the fallback" test is one 4-byte read rather than a reduction
+    # over the mask. Every writer stores the same value, so the race is benign.
     ell = wp.int32(wp.tid())
     top = dp[dp_offsets[ell] + loop_sizes[ell] - 1]
     bad = top >= BAD_METRIC
     out_retry[ell] = wp.where(bad, wp.int32(1), wp.int32(0))
     if bad:
-        out_any_retry[0] = 1
+        out_state[FILL_STATE_RETRY] = 1
 
 
 @wp.kernel
@@ -761,11 +801,16 @@ def rim_edge_keys(
     out_keys: wp.array[wp.uint64],
 ) -> None:
     # The undirected key of rim edge ``(loop[t], loop[t + 1])`` of every loop at once, keyed on
-    # slot ``t``: the table ``probe_rim_edges`` searches.
+    # slot ``t``: the table ``probe_rim_edges`` searches. The fill computes the same keys inside
+    # ``loop_rim_metrics``; this is the stand-alone form for a caller with no rim metrics to take.
     t = wp.int32(wp.tid())
-    u = flat_loops[t]
-    v = flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, t)]
+    u, v = rim_edge_vertices(flat_loops, loop_id, loop_starts, loop_sizes, t)
     out_keys[t] = kernel_array.pack_edge_key(u, v, base)
+
+
+# ``probe_rim_edges``' two non-vertex answers: a rim edge no face contains, and one several do.
+RIM_NO_FACE = wp.constant(-1)
+RIM_MANY_FACES = wp.constant(-2)
 
 
 @wp.kernel
@@ -774,15 +819,18 @@ def probe_rim_edges(
     sorted_rim_keys: wp.array[wp.uint64],
     rim_slots: wp.array[wp.int32],
     base: wp.uint64,
-    out_counts: wp.array[wp.int32],
-    out_thirds: wp.array[wp.int32],
+    out_third: wp.array[wp.int32],
 ) -> None:
-    # One thread per face: count, for every rim edge, the faces containing it, and record the
-    # vertex opposite it. The rim is the small side of the question, so the rim's keys are the
-    # sorted table and each face probes it with its own three edges -- where probing a sorted table
-    # of every mesh edge with the rim's cost a radix sort over the whole mesh. A rim edge whose
-    # count comes out 1 has exactly one adjacent face, and ``out_thirds`` then holds that face's
-    # third vertex; where it is higher the written vertex is some face's and is never read.
+    # One thread per face: find, for every rim edge, the vertex opposite it in the faces containing
+    # it. The rim is the small side of the question, so the rim's keys are the sorted table and
+    # each face probes it with its own three edges -- where probing a sorted table of every mesh
+    # edge with the rim's cost a radix sort over the whole mesh.
+    #
+    # ``out_third`` arrives as ``RIM_NO_FACE`` and ends as the third vertex of the *single*
+    # adjacent face, or ``RIM_NO_FACE`` / ``RIM_MANY_FACES`` when there is none or more than one --
+    # a face count folded into the answer, so one buffer carries what a count and a vertex did.
+    # The first face claims the slot with a compare-and-swap, and any later one finds it taken and
+    # marks it; every such writer stores the same value, so the race is benign.
     #
     # A key can occur at more than one rim slot (a loop that walks one edge twice), so every
     # matching slot is visited rather than the first.
@@ -799,16 +847,15 @@ def probe_rim_edges(
         index = kernel_array.binary_search_index_left(sorted_rim_keys, key)
         while index < n and sorted_rim_keys[index] == key:
             slot = rim_slots[index]
-            wp.atomic_add(out_counts, slot, 1)
-            out_thirds[slot] = third
+            if wp.atomic_cas(out_third, slot, RIM_NO_FACE, third) != RIM_NO_FACE:
+                out_third[slot] = RIM_MANY_FACES
             index += 1
 
 
 @wp.kernel
 def rim_opposite_positions(
     vertices: wp.array[wp.vec3],
-    counts: wp.array[wp.int32],
-    thirds: wp.array[wp.int32],
+    third: wp.array[wp.int32],
     out_positions: wp.array[wp.vec3],
     out_valid: wp.array[wp.int32],
 ) -> None:
@@ -817,8 +864,8 @@ def rim_opposite_positions(
     t = wp.int32(wp.tid())
     out_positions[t] = wp.vec3(0.0, 0.0, 0.0)
     out_valid[t] = wp.int32(0)
-    if counts[t] == 1:
-        out_positions[t] = vertices[thirds[t]]
+    if third[t] >= 0:
+        out_positions[t] = vertices[third[t]]
         out_valid[t] = wp.int32(1)
 
 

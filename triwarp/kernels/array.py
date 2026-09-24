@@ -183,11 +183,11 @@ def loop_rim_edge(
     # at its ends -- the far one found through ``loop_next_slot`` above, so it wraps inside its own
     # loop rather than into the next one's.
     #
-    # The per-segment prologue of every segmented loop reduction: ``boundary.loop_perimeters``,
-    # ``boundary.loop_directed_areas`` and ``holes.loop_rim_metrics`` each opened with these same
-    # three statements and differ only in what they fold the edge into. Generic over the value
-    # dtype the way ``triangles.face_vertices`` is, so a float64 rim reduction needs no second
-    # spelling. The three kernels compile to byte-identical SASS with it, so it is free.
+    # The per-segment prologue of the segmented loop reductions ``boundary.loop_perimeters`` and
+    # ``boundary.loop_directed_areas``, which differ only in what they fold the edge into.
+    # ``holes.loop_rim_metrics`` needs the vertex ids as well, to key the edge, and reads them
+    # through ``holes.rim_edge_vertices`` instead. Generic over the value dtype the way
+    # ``triangles.face_vertices`` is, so a float64 rim reduction needs no second spelling.
     return (
         loop_id[slot],
         values[flat_loops[slot]],

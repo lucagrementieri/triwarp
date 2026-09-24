@@ -73,6 +73,83 @@ def local_corner_indices(
     out_faces[corner] = slot - vertex_offsets[slot_groups[slot]]
 
 
+# The mask-driven submesh extraction shares one ``(n_faces + n_vertices,)`` rank buffer: the kept
+# faces' 0/1 flags followed by their vertices' referenced flags, scanned inclusively as one array.
+# A kept face's compact slot is then ``ranks[f] - 1`` and a kept vertex's is
+# ``ranks[n_faces + v] - ranks[n_faces - 1] - 1``, so one scan orders both halves and the two
+# output sizes come out of one small readback. Both orders are ascending by input index, which is
+# what the index-driven path's sorted ``unique_1d`` produces.
+
+
+@wp.kernel
+def mark_submesh_faces_and_vertices(
+    faces: wp.array[wp.int32],
+    face_mask: wp.array[wp.bool],
+    keep_masked: wp.bool,
+    out_flags: wp.array[wp.int32],
+) -> None:
+    # ``out_flags`` arrives zeroed. A face is kept when its mask entry equals ``keep_masked``, so
+    # one kernel serves a selection and its complement.
+    f = wp.int32(wp.tid())
+    if face_mask[f] != keep_masked:
+        return
+    n_faces = face_mask.shape[0]
+    a, b, c = corner_triple(faces, f)
+    out_flags[f] = 1
+    out_flags[n_faces + a] = 1
+    out_flags[n_faces + b] = 1
+    out_flags[n_faces + c] = 1
+
+
+@wp.kernel
+def submesh_counts(
+    ranks: wp.array[wp.int32], n_faces: wp.int32, out_counts: wp.array[wp.int32]
+) -> None:
+    # The kept face count and the kept vertex count, side by side for a single readback.
+    face_total = ranks[n_faces - 1]
+    out_counts[0] = face_total
+    out_counts[1] = ranks[ranks.shape[0] - 1] - face_total
+
+
+@wp.kernel
+def compact_submesh_faces(
+    faces: wp.array[wp.int32],
+    face_mask: wp.array[wp.bool],
+    keep_masked: wp.bool,
+    ranks: wp.array[wp.int32],
+    out_faces: wp.array[wp.int32],
+) -> None:
+    f = wp.int32(wp.tid())
+    if face_mask[f] != keep_masked:
+        return
+    n_faces = face_mask.shape[0]
+    offset = ranks[n_faces - 1] + 1
+    a, b, c = corner_triple(faces, f)
+    slot = 3 * (ranks[f] - 1)
+    out_faces[slot] = ranks[n_faces + a] - offset
+    out_faces[slot + 1] = ranks[n_faces + b] - offset
+    out_faces[slot + 2] = ranks[n_faces + c] - offset
+
+
+@wp.kernel
+def compact_submesh_vertices(
+    vertices: wp.array[wp.vec3],
+    ranks: wp.array[wp.int32],
+    n_faces: wp.int32,
+    out_vertices: wp.array[wp.vec3],
+    out_vertex_index: wp.array[wp.int32],
+) -> None:
+    # A vertex is kept when its inclusive rank steps up; for vertex 0 the step is taken from the
+    # face half's total, which is exactly the vertex half's baseline.
+    v = wp.int32(wp.tid())
+    rank = ranks[n_faces + v]
+    if rank == ranks[n_faces + v - 1]:
+        return
+    slot = rank - ranks[n_faces - 1] - 1
+    out_vertices[slot] = vertices[v]
+    out_vertex_index[slot] = v
+
+
 @wp.kernel
 def face_mask_from_vertex_mask(
     faces: wp.array[wp.int32],
@@ -229,18 +306,20 @@ def mark_labels_of_seeds(
 def deleted_face_edge_keys(
     faces: wp.array[wp.int32],
     face_mask: wp.array[wp.bool],
-    inclusive_ranks: wp.array[wp.int32],
+    kept_ranks: wp.array[wp.int32],
     base: wp.uint64,
     out_keys: wp.array[wp.uint64],
 ) -> None:
     # The undirected edge keys of the *masked* faces only, three per face at the face's compact
-    # rank (``inclusive_ranks[f] - 1``, an inclusive scan of the mask), so the deleted region's edge
-    # table costs three keys per deleted face rather than per mesh face.
+    # rank among the masked faces, so the deleted region's edge table costs three keys per deleted
+    # face rather than per mesh face. ``kept_ranks`` is the inclusive scan of the *unmasked* faces
+    # (the submesh extraction's face half), so a masked face has ``f - kept_ranks[f]`` masked
+    # faces before it.
     f = wp.int32(wp.tid())
     if not face_mask[f]:
         return
     a, b, c = corner_triple(faces, f)
-    slot = 3 * (inclusive_ranks[f] - 1)
+    slot = 3 * (f - kept_ranks[f])
     out_keys[slot] = pack_edge_key(a, b, base)
     out_keys[slot + 1] = pack_edge_key(b, c, base)
     out_keys[slot + 2] = pack_edge_key(c, a, base)

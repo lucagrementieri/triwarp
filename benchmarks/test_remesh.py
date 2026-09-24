@@ -745,6 +745,17 @@ def test_flip_by_objective(bench_case: BenchCase, objective: str) -> None:
 # scans they were reading, every buffer was fixed at a bound the mesh cannot exceed, and one graph
 # is replayed for every pass. Several-fold on top, and it makes triwarp the fastest of the five on
 # every cell. See ``remesh._DecimationBuffers``.
+#
+# **What is left is the graph itself, not the loop around it** (``saddle_graded`` at 0.1, 44 passes,
+# measured on a shared box, min of 9 interleaved reps). The replays are ~84 % of the call; replaying
+# them back to back with no readback between is within 2 % of the real loop, and CUDA events around
+# each replay agree with that to 0.3 %, so the per-pass 4-byte readback bubble is ~2 % of the call
+# and moving the pass loop under ``wp.capture_while`` (which needs every allocation in
+# ``_issue_pass`` hoisted, since a conditional body may not allocate) is not worth building. A
+# replay takes ~1.5x the summed duration of its ~110 kernel, memset and memcpy nodes measured
+# uncaptured, so a third of it is inter-node gaps inside the graph: the lever now is fewer nodes
+# per pass (fusion inside ``_issue_pass`` and ``_run_collapse_rounds``). The remaining ~14 % is the
+# issued pass 0 and the recorded pass 1, which cost about the same as each other and ~3x a replay.
 _QUADRIC_RATIOS = [0.5, 0.1]
 
 

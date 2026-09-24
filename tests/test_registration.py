@@ -1095,6 +1095,83 @@ def test_icp_point_to_plane_cloud_with_normals(device: str) -> None:
     assert _rms(transformed_wp.numpy(), target_np) < 1e-2
 
 
+def test_nearest_into_matches_query_nearest(device: str) -> None:
+    """
+    Triwarp against triwarp: the ICP loop's hoisted nearest search against ``query_nearest``.
+
+    ``icp_point_to_plane`` issues ``query_nearest``'s ``k = 1`` BVH launch itself, into buffers it
+    allocates once, so the two must agree exactly; ``query_nearest`` carries the oracle in
+    ``tests/test_neighbors.py``. The queries sit both on and well off the cloud so the deepening
+    search takes more than its first radius on some rows.
+    """
+    rng = np.random.default_rng(21)
+    target_np = rng.standard_normal((400, 3)).astype(np.float32)
+    queries_np = np.concatenate(
+        [target_np[:150] + 0.01 * rng.standard_normal((150, 3)), 3.0 * rng.standard_normal((50, 3))]
+    ).astype(np.float32)
+    target_wp = points_to_warp(target_np, device)
+    queries_wp = points_to_warp(queries_np, device)
+
+    target_index = tw.registration._target_index(target_wp)
+    rows = (
+        wp.empty((200, 1), dtype=wp.int32, device=device),
+        wp.empty((200, 1), dtype=wp.float32, device=device),
+    )
+    tw.registration._nearest_into(target_wp, queries_wp, target_index, rows)
+    index_wp, distance_wp = tw.neighbors.query_nearest(target_wp, queries_wp, 1, **target_index)
+
+    assert np.array_equal(rows[0].numpy()[:, 0], index_wp.numpy())
+    assert np.array_equal(rows[1].numpy()[:, 0], distance_wp.numpy())
+    assert np.unique(index_wp.numpy()).shape[0] > 100
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"max_iterations": 0},
+        {"max_iterations": 1},
+        {"max_iterations": 2, "threshold": -np.inf},
+        {"max_iterations": 30},
+        {"max_iterations": 5, "max_distance": 1e-9},
+    ],
+    ids=["no_iteration", "one", "pinned", "converged", "all_rejected"],
+)
+def test_icp_point_to_plane_mesh_transformed_is_matrix_image(
+    half_torus: tuple[tm.Trimesh, wp.Mesh], device: str, options: dict
+) -> None:
+    """
+    Not a library comparison: the returned points are the source under the returned matrix.
+
+    Against a mesh the loop applies each step at the head of the next iteration and the last one
+    after the loop exits, so a step lost or applied twice at an exit -- no iteration, a pinned
+    count, a converged break, the zero-weight break -- shows up here as a transform the points do
+    not sit under. The initial transform is non-trivial so iteration 0's re-application of it is
+    covered too. Mutation probe: dropping the post-loop apply fails the one- and two-iteration
+    arms, and starting iteration 0 from the seed with the (unwritten) step buffer fails four of
+    five; a converged run's last step sits below this comparison's float32 floor, so that arm
+    alone cannot see a lost step -- which is also why losing it there would be harmless.
+    """
+    mesh_tm, mesh_wp = half_torus
+    vertices_np, faces_np = _mesh_vertices_faces(mesh_tm)
+    rotation_np, translation_np = _rigid_transform(0.1, [0.2, 0.6, 0.3], [0.03, -0.02, 0.04])
+    source_np = (vertices_np @ rotation_np.T + translation_np).astype(np.float32)
+    initial_np = np.eye(4, dtype=np.float32)
+    initial_np[:3, 3] = [0.01, 0.0, -0.02]
+
+    source_wp = points_to_warp(source_np, mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=mesh_wp.device)
+
+    matrix_wp, transformed_wp, _ = tw.registration.icp_point_to_plane(
+        source_wp, vertices_wp, faces_wp, initial=wp.mat44(*initial_np.ravel()), **options
+    )
+    matrix_np = matrix_wp.numpy()[0].astype(np.float64)
+    expected_np = source_np @ matrix_np[:3, :3].T + matrix_np[:3, 3]
+    assert np.allclose(transformed_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
+    if options.get("max_iterations", 0) >= 1 and "max_distance" not in options:
+        assert not np.allclose(matrix_np, initial_np, atol=1e-3)
+
+
 def test_icp_empty_source(device: str) -> None:
     target_wp = points_to_warp(np.random.default_rng(13).standard_normal((50, 3)), device)
     empty_wp = wp.zeros(0, dtype=wp.vec3, device=device)

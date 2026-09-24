@@ -1137,6 +1137,23 @@ def test_cluster_decimate_invalid(device: str) -> None:
         tw.remesh.cluster_decimate(vertices_wp, faces_wp, contraction="quadric")
 
 
+def test_cluster_decimate_collapses_to_nothing(device: str) -> None:
+    """
+    A cell wider than the mesh collapses every face, and the output is empty, not a lone vertex.
+
+    Not a library comparison: Open3D keeps the cluster as an unreferenced vertex (see the
+    ``cluster_decimate`` Notes), so no reference returns this answer. It is the one input where no
+    cluster is referenced and no face class survives the dedup.
+    """
+    for contraction in ("average", "closest"):
+        _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=2)
+        out_vertices_wp, out_faces_wp = tw.remesh.cluster_decimate(
+            vertices_wp, faces_wp, voxel_size=100.0, contraction=contraction
+        )
+        assert int(out_vertices_wp.shape[0]) == 0
+        assert int(out_faces_wp.shape[0]) == 0
+
+
 def test_cluster_decimate_empty(device: str) -> None:
     vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
@@ -1886,6 +1903,40 @@ def test_flip_topology_drops_non_manifold_edges_like_face_adjacency(device: str)
     assert np.array_equal(topology.adjacency.numpy(), adjacency_ref.numpy())
     # Edge (0, 1) carries three corners, so no row of the table mentions the pair it would form.
     assert not (topology.adjacency_edges.numpy() == [0, 1]).all(axis=1).any()
+
+
+@pytest.mark.parametrize("flip", [False, True])
+def test_flip_topology_edges_unique_matches_edges_unique(device: str, flip: bool) -> None:
+    """
+    Triwarp against triwarp: the flip pass's edge sort is ``edges_unique`` for the faces it leaves.
+
+    ``subdivide_region_to_size`` reads its next pass's unique edges off the topology the flip pass
+    left rather than calling [`edges_unique`][triwarp.edges.edges_unique] again, and the split
+    numbers its new vertices in that edge order, so the two must agree row for row and corner for
+    corner. ``edges_unique`` carries the oracle. The ``flip`` arm runs a Delone pass that rewrites
+    faces first -- a sheared grid, whose every quad has the better diagonal -- so the check covers
+    the regroup a flipping round leaves behind, not only the opening build.
+    """
+    vertices_np, faces_np = _sheared_grid(n=12)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    n_vertices = int(vertices_wp.shape[0])
+    topology = tw.remesh._FlipTopology(faces_wp, n_vertices)
+    if flip:
+        before_np = faces_wp.numpy().copy()
+        region_flags = wp.full(faces_np.shape[0], 1, dtype=wp.int32, device=device)
+        flips = tw.remesh._flip_region_faces(
+            vertices_wp, faces_wp, region_flags, None, None, 8, topology
+        )
+        assert flips > 0
+        assert not np.array_equal(faces_wp.numpy(), before_np)
+    else:
+        topology.rebuild()
+    assert topology.built
+
+    unique_edges_wp, inverse_wp = topology.edges_unique()
+    unique_edges_ref, inverse_ref = tw.edges.edges_unique(faces_wp, n_vertices=n_vertices)
+    assert np.array_equal(unique_edges_wp.numpy(), unique_edges_ref.numpy())
+    assert np.array_equal(inverse_wp.numpy(), inverse_ref.numpy())
 
 
 # ---------------------------------------------------------------------------

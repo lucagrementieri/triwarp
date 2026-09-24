@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from typing import cast
 
 import warp as wp
 
@@ -90,12 +89,29 @@ def is_edge_manifold(
         n_vertices = tw.array.index_bound(faces, require_non_negative=validate)
         validate = False
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=validate)
-    _, counts = tw.grouping.unique_1d(keys, return_counts=True)
+    return not _edge_share_count_violated(keys, allow_boundary_edges)
 
-    min_count, max_count = tw.reduce.minmax(cast(twt.Array1dInt32, counts))
-    if allow_boundary_edges:
-        return max_count <= 2
-    return min_count == 2 and max_count == 2
+
+def _edge_share_count_violated(keys: wp.array[wp.uint64], allow_boundary_edges: bool) -> bool:
+    """
+    Whether some packed edge key occurs a non-manifold number of times.
+
+    Counts the keys with [`hashed_occurrence_counts`][triwarp.grouping.hashed_occurrence_counts],
+    the table [`unique_1d`][triwarp.grouping.unique_1d] builds, and tests it in place: the answer
+    is order-free and needs no per-edge output, so the compaction, the sort and the host read of
+    the unique count that sizes them are skipped, leaving one readback for the verdict.
+    """
+    device = keys.device
+    slot_counts = tw.grouping.hashed_occurrence_counts(keys)
+    cap = int(slot_counts.shape[0])
+    violation = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_validation.edge_share_count_violation,
+        dim=cap,
+        inputs=[slot_counts, allow_boundary_edges, violation],
+        device=device,
+    )
+    return int(read_scalar(violation)) != 0
 
 
 def edge_manifold_mask(
@@ -184,6 +200,7 @@ def is_vertex_manifold(
     *,
     face_adjacency: twt.Array2dInt32 | None = None,
     face_adjacency_edges: twt.Array2dInt32 | None = None,
+    n_vertices: int | None = None,
 ) -> bool:
     """
     Whether every referenced vertex has a single edge-connected fan of faces.
@@ -208,6 +225,11 @@ def is_vertex_manifold(
     face_adjacency_edges
         Optional ``(m, 2)`` shared-edge vertex pairs aligned with ``face_adjacency``
         (``return_edges=True``). Must be given together with ``face_adjacency``.
+    n_vertices
+        Optional length of the vertex buffer ``faces`` indexes, which must be at least
+        ``max(faces) + 1`` and is not checked. It sizes the working tables only and does not change
+        the answer: vertices past ``max(faces)`` are still not considered. When ``None``,
+        ``max(faces) + 1`` is inferred with a device-host sync.
 
     Returns
     -------
@@ -247,13 +269,28 @@ def is_vertex_manifold(
     tw.adjacency.require_paired_adjacency(face_adjacency, face_adjacency_edges)
     if int(faces.shape[0]) // 3 == 0:
         return True
+    if n_vertices is None:
+        # The adjacency derived below trusts this bound, so it carries the range check it would
+        # otherwise have made itself.
+        n_vertices = tw.array.index_bound(faces, require_non_negative=face_adjacency is None)
     if face_adjacency is None:
-        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
+        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(
+            faces, return_edges=True, n_vertices=n_vertices
+        )
     assert face_adjacency_edges is not None
-    manifold = _vertex_manifold_flags(
-        faces, tw.array.index_bound(faces), face_adjacency, face_adjacency_edges
+    manifold, min_label = _vertex_manifold_flags(
+        faces, n_vertices, face_adjacency, face_adjacency_edges
     )
-    return bool(tw.reduce.all(manifold))
+    # One verdict over any table at least ``max(faces) + 1`` long, so a caller's vertex count
+    # serves as well as the bound and no reduction has to find the bound first.
+    violation = wp.zeros(1, dtype=wp.int32, device=faces.device)
+    wp.launch(
+        kernel_validation.vertex_manifold_violation,
+        dim=n_vertices,
+        inputs=[min_label, manifold, violation],
+        device=faces.device,
+    )
+    return int(read_scalar(violation)) == 0
 
 
 def vertex_manifold_mask(
@@ -297,7 +334,7 @@ def vertex_manifold_mask(
     adjacency, adjacency_edges = tw.adjacency.face_adjacency(
         faces, return_edges=True, n_vertices=n_vertices
     )
-    return _vertex_manifold_flags(faces, n_vertices, adjacency, adjacency_edges)
+    return _vertex_manifold_flags(faces, n_vertices, adjacency, adjacency_edges)[0]
 
 
 def _vertex_manifold_flags(
@@ -305,7 +342,7 @@ def _vertex_manifold_flags(
     n_vertices: int,
     face_adjacency: twt.Array2dInt32,
     face_adjacency_edges: twt.Array2dInt32,
-) -> wp.array[wp.bool]:
+) -> tuple[wp.array[wp.bool], wp.array[wp.int32]]:
     """
     Per-vertex manifold flags shared by the predicate and the mask.
 
@@ -330,8 +367,11 @@ def _vertex_manifold_flags(
 
     Returns
     -------
-    wp.array[wp.bool]
+    manifold : wp.array[wp.bool]
         Length ``n_vertices`` on ``faces.device``.
+    min_label : wp.array[wp.int32]
+        Length ``n_vertices``: each vertex's smallest corner-component label, ``INT32_MAX`` for a
+        vertex no corner references.
     """
     device = faces.device
     n_corners = int(faces.shape[0]) // 3 * 3
@@ -366,7 +406,7 @@ def _vertex_manifold_flags(
         inputs=[faces, labels, min_label, manifold],
         device=device,
     )
-    return manifold
+    return manifold, min_label
 
 
 def is_self_intersecting(mesh: wp.Mesh, *, max_triangle_collisions: int = 32) -> bool:
@@ -951,7 +991,7 @@ def is_watertight(
         faces, edges_sorted=edges_sorted, return_edges=True, n_vertices=n_vertices
     )
     if not is_vertex_manifold(
-        faces, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges
+        faces, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges, n_vertices=n_vertices
     ):
         return False
     if mesh is None:

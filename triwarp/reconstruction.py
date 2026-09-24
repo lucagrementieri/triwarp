@@ -39,7 +39,6 @@ from triwarp.constants import TILE_1D
 from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import remesh as kernel_remesh
-from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
 if TYPE_CHECKING:
@@ -268,7 +267,7 @@ def triangulate_point_cloud(
     n = int(points.shape[0])
     if n == 0:
         # Cloned, like every other exit from this module: the returned vertices are the function's
-        # own buffer on the populated path (`_assemble_faces`, `_clean_reconstruction`), so handing
+        # own buffer on the populated path (`_clean_reconstruction`), so handing
         # back the caller's array here would make the degenerate input the one case where mutating
         # the result mutates the input.
         return wp.clone(points), wp.empty(0, dtype=wp.int32, device=device)
@@ -282,9 +281,9 @@ def triangulate_point_cloud(
     if normals is None:
         normals = tw.points.estimate_normals(points, neighbor_idx)
 
-    # Per-point local fan triangulation.
+    # Per-point local fan triangulation: point ``v``'s fan fills ``out_tris[v, :count]``.
     out_tris = wp.empty((n, k, 3), dtype=wp.int32, device=device)
-    out_valid = wp.zeros((n, k), dtype=wp.bool, device=device)
+    fan_counts = wp.empty(n, dtype=wp.int32, device=device)
     wp.launch(
         kernel_reconstruction.build_local_triangulations,
         dim=n,
@@ -297,76 +296,76 @@ def triangulate_point_cloud(
             wp.float32(crit_angle),
             wp.float32(boundary_angle),
             out_tris,
-            out_valid,
+            fan_counts,
         ],
         device=device,
     )
-
-    # Compact the emitted candidate triangles.
-    kept = tw.array.flatnonzero(out_valid.reshape(-1))
-    if int(kept.shape[0]) == 0:
+    # Scanned in place: each fan's packed offset is its predecessor's inclusive total, and the last
+    # entry sizes the candidate buffers.
+    wp.utils.array_scan(fan_counts, out_array=fan_counts, inclusive=True)
+    # Readback: the candidate count sizes the sort buffers.
+    n_candidates = int(read_scalar(fan_counts))
+    if n_candidates == 0:
         return wp.clone(points), wp.empty(0, dtype=wp.int32, device=device)
-    candidates = twt.as_array2d(tw.array.gather(out_tris.reshape((n * k, 3)), kept), wp.int32)
 
-    # Repeated oriented triangles: t3 (3 reps) preferred, then t2 (2 reps). Both group the
-    # candidates by the same unoriented key -- the row's three indices sorted, then hashed -- so
-    # that key is built once for the pair.
-    sorted_keys = twt.empty_2d((int(candidates.shape[0]), 3), wp.int32, device=device)
-    wp.launch(
-        kernel_triangles.sort_face_indices,
-        dim=int(candidates.shape[0]),
-        inputs=[candidates, sorted_keys],
-        device=device,
-    )
-    # ``sorted_keys`` permutes each row of ``candidates``, whose entries this package produced as
-    # point indices below ``n``, so the hash's bound holds by construction.
-    row_keys = tw.grouping.hash_indices_rows(sorted_keys, n, validate=False)
-    t3 = _repeated_oriented_triangles(candidates, row_keys, 3)
-    t2 = _repeated_oriented_triangles(candidates, row_keys, 2)
-
-    return _assemble_faces(points, t3, t2, crit_hole_length)
+    faces = _repeated_oriented_triangles(out_tris, fan_counts, n_candidates, n)
+    if int(faces.shape[0]) == 0:
+        return wp.clone(points), faces
+    # Every face carries a distinct vertex set, so the duplicate-resolution stage has nothing to do.
+    # Orientation is not re-derived (``orient=False``): the fans are wound from the trusted normals,
+    # and ``make_normals_outward`` would rewind a whole inward-normal cloud's mesh outward, silently
+    # breaking that contract.
+    return _clean_reconstruction(points, faces, crit_hole_length, orient=False, deduplicate=False)
 
 
 def _repeated_oriented_triangles(
-    candidates: twt.Array2dInt32, row_keys: wp.array[wp.uint64], repetitions: int
-) -> twt.Array2dInt32:
+    tris: wp.array3d[wp.int32], inclusive_counts: wp.array[wp.int32], n_candidates: int, n: int
+) -> wp.array[wp.int32]:
     """
-    Keep one oriented representative per candidate triangle repeated exactly ``repetitions`` times.
+    Keep one oriented representative per candidate triangle two or three fans agree on.
 
-    Candidate triangles are grouped by their unoriented key -- ``row_keys``, one integer per row
-    of ``candidates`` identifying its vertex set; groups of the requested size contribute their
-    first oriented triangle. This is the trusted-normal case: the orientation is taken from the
-    candidates rather than propagated.
+    The candidates are the ``(n, k)`` fan slots below each point's count, which
+    ``inclusive_counts`` holds as an inclusive scan. Each is keyed by its vertex set -- the three
+    indices sorted and packed in radix ``n``, the point count -- and the keys are sorted stably
+    with their slot as payload. A run of two or three equal keys is a confirmed triangle, and its
+    first -- lowest -- slot supplies the winding: this is the trusted-normal case, where the
+    orientation is taken from the fans rather than propagated.
+
+    The faces come out in ascending key order, which is the order the duplicate-resolution stage
+    of [`_clean_reconstruction`][triwarp.reconstruction._clean_reconstruction] would emit them in:
+    no two carry the same vertex set, so that stage keeps every one and needs no pass.
     """
-    device = candidates.device
-    groups = tw.grouping.group(row_keys, repetitions)
-    if int(groups.shape[0]) == 0:
-        return twt.empty_2d((0, 3), wp.int32, device=device)
+    device = tris.device
+    # Double-width, as ``warp.utils.radix_sort_pairs`` wants: the upper halves are its scratch.
+    keys = wp.empty(2 * n_candidates, dtype=wp.uint64, device=device)
+    slots = wp.empty(2 * n_candidates, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_reconstruction.candidate_triangle_keys,
+        dim=(int(tris.shape[0]), int(tris.shape[1])),
+        inputs=[tris, inclusive_counts, wp.uint64(n), keys, slots],
+        device=device,
+    )
+    wp.utils.radix_sort_pairs(keys, slots, count=n_candidates)
 
-    return twt.as_array2d(tw.array.gather(candidates, wp.clone(groups[:, 0])), wp.int32)
-
-
-def _assemble_faces(
-    points: wp.array[wp.vec3], t3: twt.Array2dInt32, t2: twt.Array2dInt32, crit_hole_length: float
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """
-    Combine t3/t2 triangles into a clean mesh: dedup, drop degenerate/non-manifold, fill holes.
-
-    Triangle soup is assembled from the repeated oriented triangles (Stage 4), then handed to the
-    shared cleanup tail [`_clean_reconstruction`][triwarp.reconstruction._clean_reconstruction]
-    (Stage 5). Vertices are the referenced input points, compacted from index zero.
-
-    Orientation is **not** re-derived here (``orient=False``): the local fans are already wound
-    consistently from the trusted per-point normals, and re-deriving it would break that contract.
-    On an inward-normal icosphere cloud, ``make_normals_outward`` rewinds the whole mesh from its
-    signed volume (volume ``-4.15`` -> ``+4.15``, agreement with the input normals ``100%`` ->
-    ``0%``), so a caller passing inward normals would silently get an outward mesh.
-    """
-    parts = [f for f in (t3.reshape(-1), t2.reshape(-1)) if int(f.shape[0]) > 0]
-    if not parts:
-        return wp.clone(points), wp.empty(0, dtype=wp.int32, device=points.device)
-    faces = parts[0] if len(parts) == 1 else tw.array.concatenate(parts)
-    return _clean_reconstruction(points, faces, crit_hole_length, orient=False)
+    flags = wp.empty(n_candidates, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_reconstruction.repeated_triangle_flags,
+        dim=n_candidates,
+        inputs=[keys, wp.int32(n_candidates), flags],
+        device=device,
+    )
+    wp.utils.array_scan(flags, out_array=flags, inclusive=True)
+    # Readback: the confirmed-triangle count sizes the face buffer.
+    n_faces = int(read_scalar(flags))
+    faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+    if n_faces > 0:
+        wp.launch(
+            kernel_reconstruction.emit_repeated_triangles,
+            dim=n_candidates,
+            inputs=[flags, slots, tris.reshape((-1, 3)), faces],
+            device=device,
+        )
+    return faces
 
 
 def screened_poisson(
@@ -1639,6 +1638,7 @@ def _clean_reconstruction(
     crit_hole_length: float,
     *,
     orient: bool = True,
+    deduplicate: bool = True,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
     Shared reconstruction cleanup: dedup, drop degenerate/non-manifold, orient, fill small holes.
@@ -1648,12 +1648,15 @@ def _clean_reconstruction(
     since both hole filling and ``boundary_loops`` assume a manifold boundary. ``crit_hole_length``
     follows the public convention: ``0`` skips hole filling, a negative value means ``0.1 x`` the
     point-cloud bounding-box diagonal. ``orient=False`` keeps the incoming winding for callers
-    that already have a trusted orientation.
+    that already have a trusted orientation. ``deduplicate=False`` skips the duplicate-resolution
+    stage for a caller whose faces already carry pairwise distinct vertex sets *in ascending
+    unoriented-key order* -- the order that stage emits -- so the result is unchanged.
     """
     if int(faces.shape[0]) == 0:
         return wp.clone(points), faces
 
-    faces, _ = tw.repair.resolve_duplicated_faces(faces)
+    if deduplicate:
+        faces, _ = tw.repair.resolve_duplicated_faces(faces)
     vertices, faces = tw.repair.remove_degenerate_faces(points, faces)
     vertices, faces = tw.repair.remove_non_manifold_faces(vertices, faces)
 

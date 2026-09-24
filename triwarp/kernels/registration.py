@@ -363,17 +363,28 @@ def distance_threshold_weight(
 def mesh_correspondence_pass(
     mesh_id: wp.uint64,
     points: wp.array[wp.vec3],
+    step: wp.array[wp.mat44],
     query_max: wp.float32,
     normal_source: wp.array[wp.vec3],
+    out_points: wp.array[wp.vec3],
     out_closest: wp.array[wp.vec3],
     out_distance: wp.array[wp.float32],
     out_face: wp.array[wp.int32],
     out_normals: wp.array[wp.vec3],
 ) -> None:
-    # One ICP iteration's whole correspondence step against a mesh target: the closest-point
-    # query and the target normal it points at. The distance gate is not reported: the only reader
-    # of a per-point valid mask was an "is anything left?" test, and the accumulation kernel's
-    # weight sum -- which it gates on the same ``residual_valid`` -- already answers that.
+    # One ICP iteration's whole correspondence step against a mesh target: the previous
+    # iteration's rigid step applied to each source point, the closest-point query at the moved
+    # point, and the target normal it points at.
+    #
+    # The step is ``apply_transform_mat44``'s own ``transform_point_mat44`` on the same operands,
+    # so ``out_points`` holds the bits that kernel wrote when it ran as its own launch at the tail
+    # of the previous iteration; the loop now applies the last step once after it exits instead.
+    # The query re-reads ``out_points[tid]``, which this thread has just written, so
+    # ``write_closest_point_query``'s publication protocol stays the one shared definition.
+    #
+    # The distance gate is not reported: the only reader of a per-point valid mask was an "is
+    # anything left?" test, and the accumulation kernel's weight sum -- which it gates on the same
+    # ``residual_valid`` -- already answers that.
     #
     # The three ran as three launches at the same width, and the second and third read nothing
     # but what the first had just written at their own index -- so each paid a launch and a full
@@ -391,8 +402,9 @@ def mesh_correspondence_pass(
     # this against a run with the convergence break live: the two arms then stop at different
     # iterations and the ratio is fiction.
     tid = wp.int32(wp.tid())
+    out_points[tid] = transform_point_mat44(points[tid], step[0])
     _distance, face = write_closest_point_query(
-        mesh_id, points, query_max, tid, out_closest, out_distance, out_face
+        mesh_id, out_points, query_max, tid, out_closest, out_distance, out_face
     )
     out_normals[tid] = correspondence_normal(normal_source, face)
 

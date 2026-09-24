@@ -1197,6 +1197,45 @@ def test_fill_min_weight_leaves_a_hole_open_when_both_diagonals_are_forbidden(de
     assert result_loops[0].numpy().tolist() == [0, 1, 2, 3]
 
 
+@pytest.mark.parametrize("metric", ["plane_normalized", "min_area"])
+def test_fill_min_weight_compacts_around_a_blocked_hole(device: str, metric: str) -> None:
+    """
+    Not a library comparison: no reference forbids a chord and reports what it left open.
+
+    One blocked quad (the cross-cap patch of the test above) beside an icosahedron missing one
+    face. The traceback writes each rim's ``B - 2`` triangles into a padded block at the tail of
+    the returned buffer, and only a rim that falls short sends the call down the compaction path --
+    the only one that re-places the triangles. The fully blocked test above falls short by
+    *everything* and never reaches it, so this fixture is built to fall short by part: the quad's
+    two slots are empty and the triangle hole's one slot is not. The claim is that the output is
+    exactly the input faces followed by the one closing triangle, with the quad's rim still open.
+    """
+    quad_vertices = np.array(
+        [[1, 0, 0], [0, 1, 0], [-1, 0, 0], [0, -1, 0], [0.3, 0.1, 0.7], [-0.2, 0.2, -0.7]],
+        dtype=np.float64,
+    )
+    quad_faces = np.array(
+        [[0, 1, 5], [1, 2, 4], [2, 3, 5], [3, 0, 4], [0, 2, 4], [0, 2, 5], [1, 3, 4], [1, 3, 5]]
+    )
+    icosahedron = tm.creation.icosahedron()
+    offset = quad_vertices.shape[0]
+    vertices_np = np.vstack([quad_vertices, icosahedron.vertices + 5.0])
+    faces_np = np.vstack([quad_faces, icosahedron.faces[1:] + offset])
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    loops = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+    assert sorted(len(loop) for loop in loops) == [3, 4], "fixture must hold a quad and a triangle"
+
+    filled_np = tw.holes.fill_min_weight(vertices_wp, faces_wp, metric=metric).numpy()
+
+    n_orig = faces_np.size
+    assert np.array_equal(filled_np[:n_orig], faces_np.reshape(-1))
+    assert filled_np.shape[0] == n_orig + 3, "exactly the triangle hole's one face is appended"
+    assert set(filled_np[n_orig:].tolist()) == set((icosahedron.faces[0] + offset).tolist())
+    filled_wp = wp.array(filled_np, dtype=wp.int32, device=device)
+    remaining = tw.boundary.boundary_loops(vertices_wp, filled_wp)
+    assert [sorted(loop.numpy().tolist()) for loop in remaining] == [[0, 1, 2, 3]]
+
+
 def test_fill_min_weight_preserve_largest(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = half_torus
     loop_sizes = _loop_sizes(mesh_wp)

@@ -58,6 +58,7 @@ verb.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Literal, cast, overload
 
 import numpy as np
@@ -66,9 +67,12 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device, require_valid_faces
+from triwarp.constants import INDEX_RADIX_PAIR, TILE_1D
 from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import bounds as kernel_bounds
+from triwarp.kernels import polyline as kernel_polyline
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import selection as kernel_selection
@@ -1297,12 +1301,13 @@ def remove_degree3_vertices(
     # Scratch hoisted to the pass-0 size and sliced, rather than reallocated per pass: the vertex
     # count is constant across the loop (compaction is deferred to the end, below) and the face
     # count only ever shrinks, so one allocation each serves every pass. ``counters`` holds the
-    # selection size in slot 0 and the emit cursor in slot 1; both are zeroed per pass.
+    # selection size in slot 0, the emit cursor in slot 1 and the count of vertices the pass turns
+    # into candidates in slot 2; all three are zeroed per pass.
     n_vertices = int(vertices.shape[0])
     n_faces0 = int(faces.shape[0]) // 3
     candidate = wp.empty(n_vertices, dtype=wp.bool, device=device)
     selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
-    counters = wp.zeros(2, dtype=wp.int32, device=device)
+    counters = wp.zeros(3, dtype=wp.int32, device=device)
     keep_scratch = wp.empty(n_faces0, dtype=wp.bool, device=device)
     # The kept-face flags, scanned in place into their inclusive ranks.
     keep_ranks = wp.empty(n_faces0, dtype=wp.int32, device=device)
@@ -1332,16 +1337,17 @@ def remove_degree3_vertices(
             inputs=[faces, ring_offsets, ring_halfedges, candidate, selected, counters[:1]],
             device=device,
         )
-        # One readback per pass, and it is the loop's own termination test: the pass count is what
-        # bounds it, and there is no device-side way to stop a Python loop. The count comes
-        # straight off ``select_independent_degree3``'s own atomic rather than from a whole-array
-        # cast plus a reduction over ``selected`` -- the kernel that built the selection already
-        # knew its size.
+        # The selection size sizes the replacement buffer, and is the loop's termination test on a
+        # pass that finds nothing (only pass 0 can: every later pass runs because the previous one
+        # counted a new candidate, below, and the lowest-indexed candidate always wins). The count
+        # comes straight off ``select_independent_degree3``'s own atomic rather than from a
+        # whole-array cast plus a reduction over ``selected`` -- the kernel that built the selection
+        # already knew its size.
         n_selected = int(read_scalar(counters, 0))
         if n_selected == 0:
             break
 
-        cursor = counters[1:]
+        cursor = counters[1:2]
         # Every face starts kept and the emit pass clears the fans it replaces, so the kept-face
         # mask comes straight out of that pass. The fans are disjoint and each is three faces, so
         # the kept count is known without reading it back, and the kept faces and the new ones are
@@ -1357,10 +1363,12 @@ def remove_degree3_vertices(
                 faces,
                 ring_offsets,
                 ring_halfedges,
+                is_boundary,
                 selected,
                 cursor,
                 keep,
                 out_faces[3 * n_kept :].reshape((n_selected, 3)),
+                counters[2:],
             ],
             device=device,
         )
@@ -1375,6 +1383,12 @@ def remove_degree3_vertices(
         )
         faces = out_faces
         removed += n_selected
+        # Removing a fan changes only its rim vertices' face counts, so the emit pass already knows
+        # whether the next pass would find a candidate. Reading that here replaces the next pass's
+        # ring build, candidate map and selection whenever the answer is no -- which it always is on
+        # the last pass that removes anything.
+        if pass_index + 1 < max_iter and int(read_scalar(counters, 2)) == 0:
+            break
     if removed == 0:
         return (vertices, faces, 0) if return_count else (vertices, faces)
     # Compacted **once**, after the loop rather than inside it. A dead vertex has an empty ring and
@@ -1981,7 +1995,9 @@ def fix_self_intersections(
         )
         return tw.levelset.marching_cubes(field, 0.0, bounds=box)
 
-    current_vertices, current_faces = wp.clone(vertices), wp.clone(faces)
+    # The input buffers are only read until the first refill replaces them, so the copy a clean
+    # input is owed is taken at the end rather than paid on every call.
+    current_vertices, current_faces = vertices, faces
     for _ in range(max_iter):
         bad_mask = tw.validation.face_self_intersecting_mask(current_vertices, current_faces)
         # Two readbacks per pass, and each decides the loop. Deliberately *not* ``tw.reduce.any`` /
@@ -2001,6 +2017,8 @@ def fix_self_intersections(
         )
         if int(current_faces.shape[0]) == 0:
             break
+    if current_faces is faces:
+        return wp.clone(vertices), wp.clone(faces)
     return current_vertices, current_faces
 
 
@@ -2010,10 +2028,12 @@ def _dilate_face_mask(
     """
     Grow a face selection by ``hops`` rings, through the vertices it touches.
 
-    Face adjacency is not needed for this and is not built: a face ring is the faces incident on
-    the selection's vertex ring, so the growth happens on the *vertex* mask -- where
-    [`triwarp.selection.expand_vertex_mask`][triwarp.selection.expand_vertex_mask] already does
-    it -- and is mapped back by the any-corner rule.
+    No adjacency is needed for this and none is built: a face ring is the faces incident on the
+    selection's vertex ring, and on a triangle mesh two vertices are one-ring neighbours exactly
+    when they share a face. So one hop is the any-corner face mask of the vertex mask, whose
+    corners are then marked -- the dilation
+    [`triwarp.selection.expand_vertex_mask`][triwarp.selection.expand_vertex_mask] computes, reached
+    through the faces instead of through a unique-edge table the loop would rebuild every pass.
 
     Parameters
     ----------
@@ -2038,20 +2058,32 @@ def _dilate_face_mask(
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
 
-    # Mask to mask on both ends, so nothing is compacted and nothing is read back: the selection's
-    # corners are marked by one pass over the faces, and the grown face mask is one lookup per
-    # corner into the grown vertex mask.
+    # Mask to mask throughout, so nothing is compacted and nothing is read back: the selection's
+    # corners are marked by one pass over the faces, and each hop is an any-corner lookup into the
+    # vertex mask followed by marking the corners it selected. A hop's two launches read and write
+    # different buffers, so every hop grows from the previous hop's complete mask. ``grown`` is the
+    # hops' face scratch as well as the answer: the last lookup writes every face.
     vertex_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    grown = wp.empty(n_faces, dtype=wp.bool, device=device)
     wp.launch(
         kernel_smoothing.mark_incident_vertices,
         dim=n_faces,
         inputs=[faces, face_mask, vertex_mask],
         device=device,
     )
-    if hops > 0:
-        vertex_mask = tw.selection.expand_vertex_mask(faces, vertex_mask, hops)
-
-    grown = wp.empty(n_faces, dtype=wp.bool, device=device)
+    for _ in range(hops):
+        wp.launch(
+            kernel_selection.face_mask_from_vertex_mask,
+            dim=n_faces,
+            inputs=[faces, vertex_mask, wp.bool(False), grown],
+            device=device,
+        )
+        wp.launch(
+            kernel_smoothing.mark_incident_vertices,
+            dim=n_faces,
+            inputs=[faces, grown, vertex_mask],
+            device=device,
+        )
     wp.launch(
         kernel_selection.face_mask_from_vertex_mask,
         dim=n_faces,
@@ -2162,24 +2194,24 @@ def remove_tunnels(
         return vertices, faces, 0
 
     shortened, _sweeps = tw.geodesic_walk.shorten_loop(vertices, faces, loops, max_iter=max_iter)
-    # One readback per loop, and the loops are the only thing being measured: a basis has 2 * genus
-    # of them and each is a handful of indices, so this never scales with the mesh.
-    short = sorted(
-        ((_cycle_length(vertices, loop), loop) for loop in shortened), key=lambda pair: pair[0]
-    )
+    # A basis has 2 * genus loops of a handful of indices each, so everything after the measuring
+    # runs on the host, over one readback of them all.
+    lengths, loops_np = _measure_loops(vertices, shortened)
+    short = sorted(zip(lengths, loops_np, strict=True), key=lambda pair: pair[0])
     selected = _disjoint_loops([loop for length, loop in short if length <= max_length])
     if not selected:
         return vertices, faces, 0
 
-    cut_vertices, cut_faces = _cut_along_loops(vertices, faces, selected)
     # Disjoint is not independent: a family of disjoint non-trivial loops can still bound a piece
     # of the surface between them, and cutting along all of it splits that piece off instead of
-    # dropping the genus by one per loop. The face labels of the cut mesh say which: every
-    # component after the first is one loop too many.
-    labels_np = tw.adjacency.face_connected_component_labels(cut_faces).numpy()
+    # dropping the genus by one per loop. The face labels of the cut mesh say which -- every
+    # component after the first is one loop too many -- and they are read before cutting, so the
+    # mesh is cut once, along the family that survives.
+    labels, sides = _cut_face_labels(faces, selected)
+    labels_np = labels.numpy()
     if int(np.unique(labels_np).shape[0]) > 1:
-        selected = _independent_loops(faces, selected, labels_np)
-        cut_vertices, cut_faces = _cut_along_loops(vertices, faces, selected)
+        selected = _independent_loops(selected, labels_np, sides())
+    cut_vertices, cut_faces = _cut_along_loops(vertices, faces, selected)
     return (
         cast("wp.array[wp.vec3]", cut_vertices),
         tw.holes.fill_min_weight(cut_vertices, cut_faces, metric=metric),
@@ -2187,7 +2219,41 @@ def remove_tunnels(
     )
 
 
-def _disjoint_loops(loops: list[wp.array[wp.int32]]) -> list[wp.array[wp.int32]]:
+def _measure_loops(
+    vertices: wp.array[wp.vec3], loops: list[wp.array[wp.int32]]
+) -> tuple[list[float], list[np.ndarray]]:
+    """
+    Measure every loop's closed length, and read every loop's indices back, in one pass each.
+
+    The lengths are ``polyline_length(closed=True)`` of each loop's gathered positions, bit for
+    bit: ``kernels/polyline.packed_closed_loop_lengths`` folds each loop the way that function folds
+    a polyline of one block. The sort that follows keeps
+    equal lengths in basis order, and a regular fixture has many, so any other summation order
+    would change which loops are cut. A loop longer than one block is measured on its own.
+    """
+    device = vertices.device
+    packed, starts = tw.array.pack_1d_arrays(loops, copy=False)
+    sizes_np = np.asarray([int(loop.shape[0]) for loop in loops], dtype=np.int32)
+    lengths = wp.empty(len(loops), dtype=wp.float32, device=device)
+    wp.launch_tiled(
+        kernel_polyline.packed_closed_loop_lengths,
+        dim=len(loops),
+        inputs=[vertices, packed, starts, wp.array(sizes_np, dtype=wp.int32, device=device)],
+        outputs=[lengths],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    lengths_list = [float(length) for length in lengths.numpy()]
+    for index in np.flatnonzero(sizes_np > int(kernel_reduce.ITEMS_PER_BLOCK_1D)):
+        lengths_list[index] = _cycle_length(vertices, loops[index])
+    packed_np = packed.numpy()
+    ends = np.cumsum(sizes_np)
+    return lengths_list, [
+        packed_np[end - size : end] for end, size in zip(ends, sizes_np, strict=True)
+    ]
+
+
+def _disjoint_loops(loops: list[np.ndarray]) -> list[np.ndarray]:
     """
     Greedily keep the loops that share no vertex, taking them shortest first.
 
@@ -2197,9 +2263,9 @@ def _disjoint_loops(loops: list[wp.array[wp.int32]]) -> list[wp.array[wp.int32]]
     selection pairwise disjoint is what makes ``removed`` mean what it says.
     """
     claimed: set[int] = set()
-    kept: list[wp.array[wp.int32]] = []
+    kept: list[np.ndarray] = []
     for loop in loops:
-        loop_indices = {int(index) for index in loop.numpy()}
+        loop_indices = {int(index) for index in loop}
         if loop_indices & claimed:
             continue
         claimed |= loop_indices
@@ -2207,19 +2273,58 @@ def _disjoint_loops(loops: list[wp.array[wp.int32]]) -> list[wp.array[wp.int32]]
     return kept
 
 
-def _cut_along_loops(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], loops: list[wp.array[wp.int32]]
-) -> tuple[wp.array[wp.vec3] | wp.array[wp.vec3d], wp.array[wp.int32]]:
-    """Cut the mesh along the edges of a family of closed vertex-index cycles."""
-    cut_edges = wp.array(
-        np.concatenate([_cycle_edges(loop) for loop in loops]), dtype=wp.int32, device=faces.device
+def _cut_face_labels(
+    faces: wp.array[wp.int32], loops: list[np.ndarray]
+) -> tuple[wp.array[wp.int32], Callable[[], dict[tuple[int, int], tuple[int, int]]]]:
+    """
+    Label the faces as cutting along ``loops`` would leave them, without cutting.
+
+    Cutting along an edge separates exactly the two faces across it and leaves every other face
+    pair of an edge-manifold surface adjacent -- a pair across a non-loop edge at a loop vertex lies
+    on one side of the loop there -- so the cut mesh's face adjacency is the input's with the loop
+    edges' pairs removed. Severing those pairs in place of removing them keeps the face numbering,
+    which the cut preserves too, so these labels are the cut mesh's own.
+
+    Also returns a function reading back the severed pairs themselves, keyed by their ascending
+    edge: the two faces across each loop edge, which telling a loop's two sides apart needs. It is
+    a function because only a dependent family needs it, and it costs three readbacks.
+    """
+    device = faces.device
+    adjacency, shared = tw.adjacency.face_adjacency(faces, return_edges=True)
+    cut_edges = np.concatenate([_cycle_edges(loop) for loop in loops]).astype(np.uint64)
+    barrier_keys = wp.array(
+        np.sort(cut_edges[:, 0] * np.uint64(INDEX_RADIX_PAIR) + cut_edges[:, 1]),
+        dtype=wp.uint64,
+        device=device,
     )
-    return tw.seams.cut_along_edges(vertices, faces, twt.as_array2d(cut_edges, wp.int32))
+    n_pairs = int(adjacency.shape[0])
+    severed = twt.empty_2d((n_pairs, 2), wp.int32, device=device)
+    barrier = wp.empty(n_pairs, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_repair.sever_barrier_pairs,
+        dim=n_pairs,
+        inputs=[shared, barrier_keys, adjacency, severed, barrier],
+        device=device,
+    )
+    labels = tw.graph.connected_component_labels_from_edges(
+        severed, node_count=int(faces.shape[0]) // 3, validate=False
+    )
+
+    def sides() -> dict[tuple[int, int], tuple[int, int]]:
+        # A loop edge is one pair of a few hundred; the readbacks are of the mesh-sized buffers
+        # the table is picked out of.
+        rows = np.flatnonzero(barrier.numpy())
+        return {
+            (int(a), int(b)): (int(f0), int(f1))
+            for (a, b), (f0, f1) in zip(shared.numpy()[rows], adjacency.numpy()[rows], strict=True)
+        }
+
+    return labels, sides
 
 
 def _independent_loops(
-    faces: wp.array[wp.int32], loops: list[wp.array[wp.int32]], labels_np: np.ndarray
-) -> list[wp.array[wp.int32]]:
+    loops: list[np.ndarray], labels_np: np.ndarray, sides: dict[tuple[int, int], tuple[int, int]]
+) -> list[np.ndarray]:
     """
     Drop the fewest loops from a disjoint family so that cutting along the rest stays connected.
 
@@ -2229,9 +2334,9 @@ def _independent_loops(
     cut surface is connected exactly when the uncut loops span that graph, so a spanning forest
     built longest-first (Kruskal) leaves the longest loops uncut and keeps cutting the shortest --
     the ones most likely to be tunnels. A loop whose two sides already share a component is always
-    kept. ``loops`` arrive shortest first, and the kept ones keep that order.
+    kept. ``loops`` arrive shortest first, and the kept ones keep that order. ``sides`` maps each
+    loop edge to the two faces across it, as ``_cut_face_labels`` returns them.
     """
-    faces_np = faces.numpy().reshape(-1, 3)
     parent: dict[int, int] = {}
 
     def find(x: int) -> int:
@@ -2242,14 +2347,24 @@ def _independent_loops(
 
     uncut: set[int] = set()
     for index in range(len(loops) - 1, -1, -1):
-        a, b = (int(v) for v in loops[index].numpy()[:2])
+        a, b = (int(v) for v in loops[index][:2])
         # The two faces across the loop's first edge: one on each side of the cut.
-        sides = np.flatnonzero((faces_np == a).any(axis=1) & (faces_np == b).any(axis=1))
-        left, right = find(int(labels_np[sides[0]])), find(int(labels_np[sides[1]]))
+        face_a, face_b = sides[(min(a, b), max(a, b))]
+        left, right = find(int(labels_np[face_a])), find(int(labels_np[face_b]))
         if left != right:
             parent[left] = right
             uncut.add(index)
     return [loop for index, loop in enumerate(loops) if index not in uncut]
+
+
+def _cut_along_loops(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], loops: list[np.ndarray]
+) -> tuple[wp.array[wp.vec3] | wp.array[wp.vec3d], wp.array[wp.int32]]:
+    """Cut the mesh along the edges of a family of closed vertex-index cycles."""
+    cut_edges = wp.array(
+        np.concatenate([_cycle_edges(loop) for loop in loops]), dtype=wp.int32, device=faces.device
+    )
+    return tw.seams.cut_along_edges(vertices, faces, twt.as_array2d(cut_edges, wp.int32))
 
 
 def _cycle_length(vertices: wp.array[wp.vec3], loop: wp.array[wp.int32]) -> float:
@@ -2259,10 +2374,9 @@ def _cycle_length(vertices: wp.array[wp.vec3], loop: wp.array[wp.int32]) -> floa
     return tw.polyline.polyline_length(points, closed=True)
 
 
-def _cycle_edges(loop: wp.array[wp.int32]) -> np.ndarray:
+def _cycle_edges(loop: np.ndarray) -> np.ndarray:
     """Pack a closed cycle's edges as ascending ``(k, 2)`` rows, which is what a cut keys on."""
-    loop_np = loop.numpy()
-    return np.sort(np.stack([loop_np, np.roll(loop_np, -1)], axis=1), axis=1).astype(np.int32)
+    return np.sort(np.stack([loop, np.roll(loop, -1)], axis=1), axis=1).astype(np.int32)
 
 
 def flip_t_vertices(

@@ -436,7 +436,8 @@ def test_build_local_triangulations_two_neighbour_ring_no_duplicate(device: str)
         np.array([[1.0, 1.0, 0.0]], dtype=np.float32), dtype=wp.float32, device=device
     )
     out_tris_wp = wp.zeros((1, 3, 3), dtype=wp.int32, device=device)
-    out_valid_wp = wp.zeros((1, 3), dtype=wp.bool, device=device)
+    # Seeded off zero, so the assert below also shows the kernel wrote the count itself.
+    out_counts_wp = wp.full(1, -1, dtype=wp.int32, device=device)
     wp.launch(
         kernel_reconstruction.build_local_triangulations,
         dim=1,
@@ -449,13 +450,12 @@ def test_build_local_triangulations_two_neighbour_ring_no_duplicate(device: str)
             wp.float32(math.pi / 2.0),
             wp.float32(2.0 * math.pi - 0.01),
             out_tris_wp,
-            out_valid_wp,
+            out_counts_wp,
         ],
         device=device,
     )
-    valid_np = out_valid_wp.numpy()[0]
-    assert np.count_nonzero(valid_np) == 1
-    triangle = out_tris_wp.numpy()[0, np.flatnonzero(valid_np)[0]]
+    assert out_counts_wp.numpy()[0] == 1
+    triangle = out_tris_wp.numpy()[0, 0]
     assert set(triangle.tolist()) == {0, 1, 2}
 
 
@@ -484,7 +484,8 @@ def test_build_local_triangulations_two_gaps_emits_nothing(device: str):
     )
     neighbor_dist_wp = wp.array(np.ones((1, 6), dtype=np.float32), dtype=wp.float32, device=device)
     out_tris_wp = wp.zeros((1, 6, 3), dtype=wp.int32, device=device)
-    out_valid_wp = wp.zeros((1, 6), dtype=wp.bool, device=device)
+    # Seeded off zero: the early return this fan takes must still report its (empty) count.
+    out_counts_wp = wp.full(1, -1, dtype=wp.int32, device=device)
     wp.launch(
         kernel_reconstruction.build_local_triangulations,
         dim=1,
@@ -497,11 +498,11 @@ def test_build_local_triangulations_two_gaps_emits_nothing(device: str):
             wp.float32(math.pi / 2.0),
             wp.float32(0.9 * math.pi),
             out_tris_wp,
-            out_valid_wp,
+            out_counts_wp,
         ],
         device=device,
     )
-    assert not out_valid_wp.numpy().any()
+    assert out_counts_wp.numpy()[0] == 0
 
 
 def test_holes_seal_small_hole(device: str):

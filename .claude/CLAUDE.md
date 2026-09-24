@@ -1473,6 +1473,18 @@ uv run zensical serve                   # preview locally
   out of the search index by `search: exclude: true` front matter instead, emitted by
   `benchmarks/plot_comparison.py`. (`draft: true` was probed and is a no-op.) They are still
   *built*, as unlinked pages nothing references.
+- **A build that finishes in ~0.1 s and leaves `site/` empty is inotify exhaustion, and it exits
+  0.** Zensical adds an inotify watch for every file it reads, even under `build`, and silently
+  drops every file whose `inotify_add_watch` fails -- with `ENOSPC` once the per-user limit
+  (`fs.inotify.max_user_watches`, 65 536 here) is used up, which on this box an IDE's file
+  watchers do by themselves. `--strict` still says `No issues found` over a site with no pages, so
+  the gate reads green while checking nothing. Toy projects and the latest Zensical fail the same
+  way. Confirm with `strace -f -e inotify_add_watch zensical build`. The fix is raising the limit
+  (`sudo sysctl fs.inotify.max_user_watches=524288`) or closing watchers; without root, an
+  `LD_PRELOAD` shim whose `inotify_add_watch` returns a fake descriptor on `ENOSPC` restores a
+  full build, since a one-shot build never needs the events (the shim's source is in §16.15).
+  **And pass `--clean` after a docstring change**: `build` reuses `.cache/` and can re-emit a page
+  from the previous docstring in under a second, which `--strict` also passes.
 - **`literate-nav` and `section-index` are implemented natively**, so neither package is installed
   — the built site is byte-identical without them — and their `plugins:` entries are read as
   configuration rather than as a request to load a plugin. `mkdocs-gen-files` *is* installed, for
@@ -4276,7 +4288,9 @@ serial loop there is no GPU win being paid for.
 
 ### 14.8 Solvers: the cycle is launch-bound
 
-**Any smoother that buys iterations with launches loses on this machine.** A Chebyshev multigrid
+**Any smoother that buys iterations with launches loses on this machine** -- inside a V-cycle. A
+single-level polynomial *preconditioner* is the opposite trade and wins (§16.15): a CG iteration is
+half a dozen launches and two reductions, a polynomial step one fused mat-vec. A Chebyshev multigrid
 smoother was built and reverted: interleaved against damped Jacobi over five systems, Jacobi wins
 four of five, the one loss is 1.03x and the worst Chebyshev cell is a 2.07x regression. The same
 reasoning predicts the sweep-count table being flat.
@@ -5663,6 +5677,7 @@ atomic-cursor order, not the change.
     - **A Neumann series**: needs no setup and is weak, because `D⁻¹L`'s spectrum reaches 2, where
       `(1 - λ)ᵏ` does not decay.
     - **A Chebyshev polynomial on `[a, b]`, shipped** (`linalg.squared_laplacian_preconditioner`,
+      *with a recurrence bug found in §16.15 that its `theta ~ 1` hid*,
       degree 12, `a = 40 / n`): one launch per step in the three-term `x` recurrence, no setup.
       `smooth_region[bunny]` 69.5 -> 17.0 ms (4.1x), `[bunny_decimated]` 2.4x, `saddle` /
       `saddle_graded` regions 4.1-4.5x, `fill_smooth[rim_short]` 1.52x; positions within float32
@@ -5707,7 +5722,8 @@ atomic-cursor order, not the change.
   interior-edge count cannot change after round 0 (every candidate kernel opens with the
   duplicate-edge guard), so later regroups skip its readback. `quadric_decimate`'s two readbacks
   per pass became one (a fourth `state` slot): 1.02-1.03x, as expected for a read queued behind
-  work the first already drained.
+  work the first already drained. **Revised in §16.15**: round 0 is now issued and the graph
+  recorded from round 1, because a call whose first round flips nothing paid a whole recording.
 - **Region-sized versions of region questions.** A kept rim edge was an input boundary edge
   exactly when no *deleted* face contains it (its input count is `1 + deleted faces containing
   it`), so `delete_region_keep_boundary` could sort `3k` region keys instead of grouping every mesh
@@ -5777,4 +5793,188 @@ atomic-cursor order, not the change.
       where the device `pow` is the host's C `pow`; on CUDA the device `pow` moves `omega` in its
       last bit (a 1.3e-12 change in one level's cycle output). Flat on the clock (0.99-1.01x): the
       removed sync was queued behind the aggregation's own count readback.
+
+### 16.15 Benchmark round 15 (2026-09-24)
+
+Items from `plans/benchmark-round-11.md` (round 15), each timed against a detached `HEAD` worktree
+through `plans/baseshim.py`, byte-identity gated on the CPU oracle where the schedule was the
+change. Probes are in `plans/benchmark-round-15-data/probes/`.
+
+- **A single-level Jacobi-Chebyshev preconditioner wins on long Laplacian solves** --
+  `linalg.chebyshev_preconditioner` and `preconditioner="chebyshev"`, `z = p(D⁻¹A) D⁻¹ r` at degree
+  12, one fused launch per step. This refutes the "Chebyshev as a single-level preconditioner is
+  also worse" line `linalg`'s module docstring had carried: the `sqrt(k)` argument behind it counts
+  mat-vecs, and a solve here is bound by launches. Against `HEAD` (harness, min of 2): `lscm`
+  2.8-3.4x, `harmonic` k=1 1.4-1.5x and `harmonic_conditioning` 1.9x / 3.0x, `heat_geodesic`
+  1.4-1.9x on the medium/large spheres and 2.1x / 3.3x on the conditioning pair, the
+  `heat_signed_distance*` family 1.4-3.1x, `log_map` 1.8x / 2.8x, `filter_implicit_fairing`
+  1.5x / 2.5x, `arap` 1.8-2.7x on the saddles. Measured losses: `arap[hemisphere 10]` 0.83x and
+  `heat_geodesic[sphere_small]` 0.96x.
+    - **It is opt-in per call site, and must stay so.** Its fixed cost -- ~0.23 ms of setup plus
+      the extra launches recorded into the solve's graph -- is 0.5-0.9 ms, so any *short* solve
+      loses: `min_quad_with_fixed` at 50 % pinned 0.59-0.80x at every size from 576 to 17 689
+      unknowns, the heat system (`M - tL`, near-diagonal) 0.7-0.9x, near-converged repeated solves
+      (`spd_column_solver_amortized[x50]`) 0.56x, the hole-chain fixed-rim patches 0.84-0.91x. The
+      axis is the solve's *length*, not its size (`probes/crossover.py`): at 1 % pinned it wins from
+      576 unknowns up (1.3-2.1x). The column-solver defaults stay `"diag"`; the opt-ins are the heat
+      Poisson solves, `lscm`, `harmonic` at k=1, `arap` and both `filter_implicit_fairing` solves.
+    - **The first run made it the global default and took 40 minutes instead of 3.** The cause is
+      the next bullet; the lesson is that a new preconditioner is a per-caller decision, and that
+      an A/B over a suite needs a per-process timeout (`/tmp/ab.sh`'s `timeout 1200`).
+    - **It needs a symmetric operator, and `filter_laplacian`'s implicit system is not one.** Its
+      default operator is the row-normalized uniform Laplacian, asymmetric on boundary rows (0.5 on
+      the saddle). Jacobi is symmetric whatever `A` is, so CG gets through in 30 iterations; the
+      polynomial in `D⁻¹A` is not, and CG ran to its cap -- 100 s a call. With the tight interval
+      below it converged again (10 iterations), and on `saddle_graded` it took the call from 3.3 s
+      to 8 ms -- **416x** -- because Jacobi-CG crawls on that asymmetric system. That site is
+      deliberately *not* converted: CG on a non-symmetric system has no guarantee under either
+      preconditioner, and the right fix there is a symmetric operator, not a faster crawl. **Open
+      lead, unmeasured beyond that one row.**
+    - **`chebyshev_step` computed the wrong polynomial, in both preconditioners.** The
+      semi-iteration's first iterate is `source / theta`; the second step read `source` unscaled as
+      its previous iterate. That is still *a* polynomial, so the squared-Laplacian preconditioner
+      (`theta ~ 1`, since its interval is `[~0, ~2]`) preconditioned fine and every solve test
+      passed. At a Gershgorin bound of 2.2, `theta ~ 1.1`, and the polynomial went **negative
+      inside its interval** -- CG took 14 000 iterations where 46 converge. Fixed with a
+      `previous_scale` argument; `smooth_region` moved 1.04-1.06x. Caught by evaluating the
+      recurrence as a scalar polynomial on a grid of eigenvalues, and pinned by
+      `test_chebyshev_preconditioner_applies_the_chebyshev_polynomial`, a closed-form eigenbasis
+      oracle: put back, it fails both arms while every solve and count test stays green. **A
+      polynomial preconditioner's tests must check the polynomial, not the solve.**
+    - **Take the Gershgorin *lower* bound too.** Discs of `D⁻¹A` are centred on 1 with radius
+      `r = max_i sum_j |A_ij| / |A_ii|`, so a diagonally dominant operator (`r < 1`) has spectrum in
+      `[1 - r, 1 + r]`, far tighter than the `80 / n` lower end a Laplacian needs. `upper` is
+      `1 + r` rather than `1 + max(r, 1)`; `r` is floored at `1e-3` so a diagonal operator still has
+      an interval.
+    - **Scale the rows in the step, not in a copy.** `wps.bsr_copy` was 0.34 ms of a 0.57 ms
+      setup; `chebyshev_step`'s `row_scaled` flag multiplies each row's product by `D⁻¹` instead,
+      the same arithmetic. And `heat_operators` builds the Poisson polynomial on its **first
+      apply**, so `transport_tangent_vectors` / `extend_scalar`, which build the operators and never
+      run that solve, stopped paying for it (they had read 0.78-0.90x). `wpl.cg` makes its first
+      `M` apply before its captured loop, which is what makes the lazy build legal.
+    - **Degree and interval** (`CHEBYSHEV_DEGREE = 12`, `CHEBYSHEV_INTERVAL = 80`): the iteration
+      count is monotone in the degree once the recurrence is right, and 12 sits on the flat part of
+      wall time from 2.5k to 20k unknowns; a lower end at 5-20 / n costs up to 2x the iterations,
+      80-160 / n is flat.
+- **Flip rounds: record from round 1, not round 0 and not round 3.** R15-1's premise -- "a
+  one-round call pays a recording" -- holds only for a call whose first round flips *nothing*
+  (`flip_t_vertices[saddle]`, 1.25x issued). Recording plus instantiation costs more than an issued
+  round, so short calls prefer never recording; a first attempt at recording from round 3 (the
+  ski-rental break-even) put `isotropic_remesh`'s 2-4-round valence flips at the worst point, three
+  issues *and* a barely replayed recording: 0.89-0.92x. Swept on the real callers (`/tmp/flipk.py`,
+  interleaved, min of 9), round 0 against round 1 differ by 0.94-1.03x everywhere else, so
+  `_FLIP_CAPTURE_FROM_ROUND = 1`.
+- **`remove_tunnels`: the cost was a host scan, not the second cut.** R15-7 labelled the would-be
+  cut mesh from the face adjacency with the loop edges severed (`kernels/repair.sever_barrier_pairs`,
+  a binary search of the host-sorted loop keys in the same launch), so a dependent family is cut
+  once -- and that alone moved `handles_64` **1.01x**. A stage profile (`probes/tunnels.py`) put
+  57 % of the call in `_independent_loops`, which found each loop's two sides by a NumPy scan of
+  the whole face array per loop; the severed pairs *are* those faces, so it reads them from the
+  same launch. **`handles_64` 86 -> 36 ms, 2.39x**, `handles_1` 1.00x, byte-identical on CPU over
+  eight outputs. What remains: `_cycle_length`'s per-loop readback (30 % of what is left), which
+  stays because a host length would reorder the many exact ties a regular fixture has.
+- **The captured-run censuses were wrong by a factor that decides the item** (§15.10). Uncaptured
+  (`census_plugin.py` with `ATTRIB_NOCAPTURE=1`, which now also switches off the hole-DP and
+  flip-round plain graphs): `quadric_decimate[saddle_graded 0.1]` is 21.6 ms device of 43.8, not
+  "99 % host"; `fill_min_weight[rim_short]` 5.2 of 6.6, not 0.59. And what the rest *is* differs
+  again: timed directly, 42 replays of the recorded decimation pass take 36.7 ms back to back and
+  37.3 ms with the per-pass readback between them, so **`capture_while` could recover 0.7 ms (2 %)
+  and R15-2 is declined**. The gap is inside the graph: a replayed pass is ~0.88 ms on the device
+  against ~0.58 ms of its 109 nodes' own kernel time, ~3 us of gap per node. **A graph replay of
+  many small nodes is not free device time; the lever is fewer nodes (fusion), not fewer syncs.**
+- **Six-way count pass over the remaining host-bound rows** (agents with disjoint file ownership,
+  evidence counts only, CPU byte-identity against `HEAD` for every change; the clock came last):
+    - `triangulate_point_cloud`: the candidate grouping is one stable sort emitting runs of 2-3 in
+      key order, which *is* `resolve_duplicated_faces`' output order, so
+      `_clean_reconstruction(deduplicate=False)` skips that stage -- every face reaching it has a
+      distinct vertex set. bunny: allocs 178 -> 131, launches 131 -> 112, readbacks 28 -> 22.
+    - `cluster_decimate`: `unique_rows` whose scatter and gather fed only a `.shape[0]`, and a
+      `submesh` + `unique_faces` tail, replaced by a remap/compact chain: 23 -> 17 launches, 44 ->
+      33 allocs, 7 -> 5 readbacks, 13 -> 7 copies; 1.09-1.36x on every row including `lucy`.
+      **The first version of that chain was a 0.19x regression on `lucy` that the counts could not
+      show**: it deduplicated *every* face, padding the collapsed ones into a class of their own,
+      where the old tail deduplicated the survivors -- and at a coarse voxel size nearly all of
+      `lucy`'s 28 M faces collapse, so a hash and a search over the whole input replaced one over
+      the output. Launch, allocation and readback counts were all *lower*. **A count census prices
+      the host; it is blind to work that grows with the data, so a count-only change still needs a
+      clock at the largest mesh before it ships.** Now compact-then-`unique_faces`, which is also
+      exactly the old order.
+    - `subdivide_region_to_size`: R15-6's `_RegionTopology` rebuild did not exist; the per-pass
+      repeat was a whole-mesh `edges_unique` beside a `_FlipTopology` whose radix sort already
+      grouped the same keys. `_FlipTopology.edges_unique()` reads them off that sort, and an issued
+      flip round regroups only if it flipped: sphere_small 65 -> 43 launches, 105 -> 72 allocs.
+    - `fill_min_weight` and everything on its engine: the rim pass writes the rim positions and
+      keys it already loads, the traceback writes into the output's tail and reads one shortfall
+      scalar: 59 -> 52 allocs, 9 -> 8 readbacks, 16 -> 12 copies. **Not taken**: sizing
+      `_EdgeTable` from `len(vertices)` -- §16.4's deliberate negative-index guard, re-found as a
+      "redundant" reduction and reverted.
+    - `is_watertight` 7 -> 5 readbacks (an order-free share count on `unique_1d`'s own hash table,
+      now `grouping.hashed_occurrence_counts`, instead of compact-sort-reduce; `is_vertex_manifold`
+      gained `n_vertices=`), `delete_region_keep_boundary` 8 -> 7 (one-scan `submesh`).
+    - `remove_degree3_vertices`: the MIS rewrite (R15-A3) is declined -- the input's degree-3
+      candidates share no edge on any benchmark mesh, so pass 0 already takes them all, and later
+      passes remove vertices earlier removals *created*. What was waste was the final pass that
+      finds nothing: the replacement kernel now counts the rim vertices it turns into candidates,
+      and a zero stops the loop (bunny 24 -> 16 launches, 35 -> 24 allocs).
+    - `fix_self_intersections(local)`: the per-round dilation is two face-mask hops rather than an
+      `edges_unique` rebuild (-10 allocs, -1 readback a round). Stage profile: 18.6 of 23.8 ms is
+      `refine_and_smooth_region`, of which `_solve_region_smooth` 8.1 ms (the CG 4.5) and
+      `subdivide_region_to_size` 6.7. **The single-use captured CG there is not waste**: forcing
+      the host-check path at that site is 1.7-2.2x *slower* at every cadence.
+    - ICP point-to-plane (R15-A2): 2-9 iterations at the default threshold, and the benchmark pins
+      10. A twist-norm stop cannot be shown on sphere fixtures, whose rotation is a free gauge, and
+      would change a public contract; declined. Per-iteration allocations went to zero instead
+      (cloud 47 -> 17 per call). Open, unfixed: with Tukey the cost-decrease test stops after 2
+      iterations because a redescending kernel's weighted cost *rises* as points enter it, and the
+      returned `cost` is the pre-step cost.
+- **`remove_tunnels` was a split->pack round trip plus per-loop readbacks.** `shorten_loop` returns
+  ~128 views that `remove_tunnels` measured one gather and one readback at a time and then read
+  back again, loop by loop, in four helpers. `kernels/polyline.packed_closed_loop_lengths` measures
+  every loop in one launch **bit-identically to `polyline_length`** -- one block per loop, the same
+  lane stride and `wp.tile_sum` fold, which for a loop of at most `ITEMS_PER_BLOCK_1D` segments is
+  exactly that function's single block -- and one readback of the packed loops feeds every host
+  step. Exactness is the whole constraint: the sort keeps equal lengths in basis order and the
+  regular `handles_64` has many, so any other summation order changes which loops are cut.
+  `handles_64` 86 -> 23 ms by probe, byte-identical on both devices over eight outputs.
+- **Refuted on reading, before building**: `quadric_decimate`'s pass allocates dozens of buffers,
+  not only `array_scan`'s scratch, so an allocation-free scan alone could not have opened
+  `capture_while` to it anyway. **R15-8**: every in-tree `split` consumer is a public function whose
+  documented return *is* the list, and each has a packed sibling (`boundary_loops_batched`,
+  `query_ball_with_offsets`, `split_batched`); nothing internal iterates a split form except
+  `remove_tunnels` (above) and the stitch family (§16.12, deliberate). **R15-A4** stays declined
+  (§16.8): only a direct factorization matches potpourri3d's amortized row.
+- **`filter_laplacian(implicit_time_integration=True)` was wrong on every open mesh at larger
+  `lamb`, and CG was the cause.** The uniform operator is built from directed `mesh.edges`
+  (trimesh's own convention, `laplacian_calculation(equal_weight=True)`), so on a mesh with a
+  boundary `(1 + lamb) I - lamb L` is **not symmetric** -- 1 056 asymmetric entries on `saddle`,
+  768 on `hemisphere`. CG on it matched trimesh at `lamb = 0.5` by luck and returned vertices
+  **1.3e4 off on `hemisphere` and 1.3e7 off on `saddle_small` at `lamb = 5`**, and took 3.3 s a
+  call on `saddle_graded`; the parity test ran on the closed icosahedron only. Now a fixed-point
+  iteration `x' = (b + lamb L x) / (1 + lamb)`: strictly diagonally dominant, so it contracts by
+  `q = lamb ||L||_inf / (1 + lamb)` whatever the symmetry, the step count bounding the error at
+  `CG_TOLERANCE` is known before the first launch (22 at `lamb = 0.5`), each step is one fused
+  `vec3d` launch with no reduction and no readback, and a pass is recorded once and replayed.
+  Matches trimesh to 1e-7 closed and open at `lamb = 0.5` and `5`; past 400 steps (`lamb` above
+  ~16) or for an operator that is not a contraction it solves the assembled system with
+  `wpl.bicgstab` instead (4e-6 at `lamb = 50`). `test_filter_laplacian_implicit_on_open_meshes`
+  covers both arms on `hemisphere` / `half_torus`. **Behaviour change**: an unreferenced vertex
+  used to shrink by `1 / (1 + lamb)` per implicit pass (its row of the assembled system was the
+  diagonal alone); it now stays put, as `operator_row` already made it on the explicit path.
+- **The inotify shim** (see §6), compiled with `gcc -shared -fPIC -o fakewatch.so fakewatch.c -ldl`
+  and run as `LD_PRELOAD=./fakewatch.so zensical build --strict`:
+
+  ```c
+  #define _GNU_SOURCE
+  #include <dlfcn.h>
+  #include <errno.h>
+  #include <stdint.h>
+  static int next_fake = 1 << 28;
+  int inotify_add_watch(int fd, const char *path, uint32_t mask) {
+      static int (*real)(int, const char *, uint32_t) = 0;
+      if (!real) real = dlsym(RTLD_NEXT, "inotify_add_watch");
+      int wd = real(fd, path, mask);
+      if (wd < 0 && errno == ENOSPC) { errno = 0; return next_fake++; }
+      return wd;
+  }
+  ```
 

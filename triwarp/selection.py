@@ -612,12 +612,12 @@ def submesh_from_face_mask(
         raise ValueError(
             f"face_mask must have one entry per face, got {face_mask.shape[0]} for {n_faces}"
         )
-    face_indices = tw.array.flatnonzero(face_mask)
+    sub_vertices, sub_faces, vertex_index, _ = _submesh_from_mask(
+        vertices, faces, face_mask, keep_masked=True
+    )
     if return_index:
-        return submesh_from_face_indices(
-            vertices, faces, face_indices, unique_indices=True, return_index=True
-        )
-    return submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True)
+        return sub_vertices, sub_faces, vertex_index
+    return sub_vertices, sub_faces
 
 
 def delete_region_keep_boundary(
@@ -701,10 +701,8 @@ def delete_region_keep_boundary(
             f"face_mask must have one entry per face, got {face_mask.shape[0]} for {n_faces}"
         )
 
-    keep_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
-    wp.map(kernel_array.mask_not, face_mask, out=keep_mask)
-    kept_vertices, kept_faces, vertex_index = submesh_from_face_mask(
-        vertices, faces, keep_mask, return_index=True
+    kept_vertices, kept_faces, vertex_index, kept_ranks = _submesh_from_mask(
+        vertices, faces, face_mask, keep_masked=False
     )
     if int(kept_faces.shape[0]) == 0:
         return kept_vertices, kept_faces, []
@@ -728,22 +726,23 @@ def delete_region_keep_boundary(
     # Done on the host this was a readback per loop plus a Python membership test per rim edge, so
     # its cost grew with the *loop count* as much as with the mesh.
     n_kept = int(kept_faces.shape[0]) // 3
-    # The deleted count is the face count's complement, so the region's ranks need no readback.
-    # The flags are scanned in place, so they and the ranks are one buffer.
-    deleted_ranks = wp.empty(n_faces, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_array.bool_flags, dim=n_faces, inputs=[face_mask, deleted_ranks], device=device
-    )
-    wp.utils.array_scan(deleted_ranks, out_array=deleted_ranks, inclusive=True)
+    # The deleted count is the face count's complement, and a deleted face's rank among the
+    # deleted ones follows from the extraction's kept-face ranks, so the region needs neither a
+    # readback nor a scan of its own.
     base = wp.uint64(int(vertices.shape[0]))
-    deleted_keys = wp.empty(3 * (n_faces - n_kept), dtype=wp.uint64, device=device)
+    n_deleted_keys = 3 * (n_faces - n_kept)
+    # The keys are written into the leading half of the radix sort's double-width scratch, and the
+    # payload is never read, so neither is seeded: only the sorted keys are wanted.
+    key_buffer = wp.empty(2 * n_deleted_keys, dtype=wp.uint64, device=device)
     wp.launch(
         kernel_selection.deleted_face_edge_keys,
         dim=n_faces,
-        inputs=[faces, face_mask, deleted_ranks, base, deleted_keys],
+        inputs=[faces, face_mask, kept_ranks, base, key_buffer],
         device=device,
     )
-    deleted_keys = tw.array.sort_and_argsort(deleted_keys)[0]
+    payload = wp.empty(2 * n_deleted_keys, dtype=wp.int32, device=device)
+    wp.utils.radix_sort_pairs(key_buffer, payload, count=n_deleted_keys)
+    deleted_keys = twt.as_dense(key_buffer[:n_deleted_keys])
 
     starts_and_rims = twt.empty_2d((2, n_loops), wp.int32, device=device)
     wp.launch(
@@ -770,6 +769,63 @@ def delete_region_keep_boundary(
         if not rim
     ]
     return kept_vertices, kept_faces, kept
+
+
+def _submesh_from_mask(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_mask: wp.array[wp.bool],
+    *,
+    keep_masked: bool,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Extract the faces whose mask entry equals ``keep_masked``, reindexed from zero.
+
+    Returns ``(sub_vertices, sub_faces, vertex_index, ranks)``, the first three as
+    [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices] returns them, and
+    ``ranks`` the ``(n_faces + n_vertices,)`` inclusive scan whose leading ``n_faces`` entries rank
+    the kept faces. One scan orders the kept faces and the vertices they reference, and a single
+    two-value readback sizes both outputs.
+    """
+    device = vertices.device
+    n_faces = int(face_mask.shape[0])
+    n_vertices = int(vertices.shape[0])
+    if n_faces == 0:
+        empty_index = wp.empty(0, dtype=wp.int32, device=device)
+        return wp.empty(0, dtype=wp.vec3, device=device), empty_index, empty_index, empty_index
+
+    ranks = wp.zeros(n_faces + n_vertices, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_selection.mark_submesh_faces_and_vertices,
+        dim=n_faces,
+        inputs=[faces, face_mask, keep_masked, ranks],
+        device=device,
+    )
+    wp.utils.array_scan(ranks, out_array=ranks, inclusive=True)
+    counts = wp.empty(2, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_selection.submesh_counts, dim=1, inputs=[ranks, n_faces, counts], device=device
+    )
+    # One readback sizes both outputs.
+    n_kept_faces, n_kept_vertices = (int(count) for count in counts.numpy())
+
+    sub_vertices = wp.empty(n_kept_vertices, dtype=wp.vec3, device=device)
+    sub_faces = wp.empty(3 * n_kept_faces, dtype=wp.int32, device=device)
+    vertex_index = wp.empty(n_kept_vertices, dtype=wp.int32, device=device)
+    if n_kept_faces > 0:
+        wp.launch(
+            kernel_selection.compact_submesh_faces,
+            dim=n_faces,
+            inputs=[faces, face_mask, keep_masked, ranks, sub_faces],
+            device=device,
+        )
+        wp.launch(
+            kernel_selection.compact_submesh_vertices,
+            dim=n_vertices,
+            inputs=[vertices, ranks, n_faces, sub_vertices, vertex_index],
+            device=device,
+        )
+    return sub_vertices, sub_faces, vertex_index, ranks
 
 
 def submesh_from_vertex_indices(

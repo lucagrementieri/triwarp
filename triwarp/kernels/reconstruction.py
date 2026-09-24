@@ -15,11 +15,13 @@ from triwarp.kernels.array import (
     is_positive_finite,
     lattice_position,
     ravel_index,
+    sort3,
     trilinear_cell,
     trilinear_corner,
     trilinear_weight,
     update_argmax,
 )
+from triwarp.kernels.grouping import sorted_run_start
 from triwarp.kernels.predicates import (
     delone_metrics,
     is_unfold_quadrangle_convex,
@@ -392,11 +394,15 @@ def build_local_triangulations(
     crit_angle: wp.float32,
     boundary_angle: wp.float32,
     out_tris: wp.array3d[wp.int32],
-    out_valid: wp.array2d[wp.bool],
+    out_counts: wp.array[wp.int32],
 ) -> None:
+    # Point ``v``'s fan fills ``out_tris[v, 0 : out_counts[v]]`` contiguously, so the emitted
+    # candidates are addressed by a scan of ``n`` counts rather than a compaction of an ``(n, k)``
+    # mask. The count is written before any early return, so every point reports one.
     v = wp.int32(wp.tid())
     k = neighbor_idx.shape[1]
     cap = out_tris.shape[1]
+    out_counts[v] = wp.int32(0)
 
     a = points[v]
     n_center = normals[v]
@@ -418,7 +424,7 @@ def build_local_triangulations(
     # --- gather + filter neighbours ---
     # A constructor call -- wp.int32(...) / wp.float32(...) -- declares a mutable Warp dynamic
     # variable; a bare literal is a compile-time constant that freezes the enclosing loop
-    # (out_valid stays all-False -> no faces). The constructor is what matters, not which spelling
+    # (the fan count stays zero -> no faces). The constructor is what matters, not which spelling
     # of it: the older int()/float() forms are the same builtins under a different name.
     m = wp.int32(0)
     for i in range(k):
@@ -563,8 +569,81 @@ def build_local_triangulations(
             out_tris[v, slot, 0] = v
             out_tris[v, slot, 1] = bidx
             out_tris[v, slot, 2] = cidx
-            out_valid[v, slot] = True
             slot += 1
+    out_counts[v] = slot
+
+
+@wp.func
+def scanned_count(inclusive: wp.array[wp.int32], i: wp.int32) -> tuple[wp.int32, wp.int32]:
+    # Exclusive offset and own count of entry ``i``, recovered from the in-place inclusive scan of
+    # the counts that overwrote them.
+    start = wp.int32(0)
+    if i > 0:
+        start = inclusive[i - 1]
+    return start, inclusive[i] - start
+
+
+@wp.kernel
+def candidate_triangle_keys(
+    tris: wp.array3d[wp.int32],
+    inclusive_counts: wp.array[wp.int32],
+    radix: wp.uint64,
+    out_keys: wp.array[wp.uint64],
+    out_slots: wp.array[wp.int32],
+) -> None:
+    # Launched over ``(n, k)``: fan slot ``(v, j)`` below point ``v``'s count writes, at its packed
+    # position, the unoriented key of its triangle -- the three indices sorted and packed in the
+    # mixed radix ``grouping.hash_indices_rows`` uses, so keys order and collide exactly as that
+    # function's would -- and its flat slot ``v * k + j`` as the sort payload. Slots ascend within
+    # the packed order, so a stable sort keeps the lowest slot first in every run of equal keys.
+    v, j = wp.tid()
+    start, count = scanned_count(inclusive_counts, v)
+    if j >= count:
+        return
+    s0, s1, s2 = sort3(tris[v, j, 0], tris[v, j, 1], tris[v, j, 2])
+    key = wp.uint64(wp.uint32(s0))
+    key = key + wp.uint64(wp.uint32(s1)) * radix
+    key = key + wp.uint64(wp.uint32(s2)) * radix * radix
+    out_keys[start + j] = key
+    out_slots[start + j] = v * tris.shape[1] + j
+
+
+@wp.kernel
+def repeated_triangle_flags(
+    sorted_keys: wp.array[wp.uint64], n: wp.int32, out_flags: wp.array[wp.int32]
+) -> None:
+    # ``1`` at the start of a run of two or three equal keys: a triangle two or three fans agree
+    # on. ``grouping.mark_group_starts`` is the same test for one exact run length; this one
+    # accepts either length in one pass, because keeping both keeps them merged in key order.
+    # Nested rather than one ``and`` chain: each test reads an index only its guard makes valid.
+    i = wp.int32(wp.tid())
+    key = sorted_keys[i]
+    flag = wp.int32(0)
+    if sorted_run_start(sorted_keys, i) and i + 1 < n:
+        if sorted_keys[i + 1] == key:
+            flag = 1
+            if i + 3 < n:
+                if sorted_keys[i + 3] == key:
+                    flag = 0  # a run longer than three
+    out_flags[i] = flag
+
+
+@wp.kernel
+def emit_repeated_triangles(
+    inclusive_flags: wp.array[wp.int32],
+    sorted_slots: wp.array[wp.int32],
+    tris: wp.array2d[wp.int32],
+    out_faces: wp.array[wp.int32],
+) -> None:
+    # One face per flagged run, in key order, taken from the run's first -- lowest -- fan slot so
+    # its winding is that fan's. The flag is the step of the in-place inclusive scan.
+    i = wp.int32(wp.tid())
+    row, flag = scanned_count(inclusive_flags, i)
+    if flag == 0:
+        return
+    slot = sorted_slots[i]
+    for c in range(3):
+        out_faces[3 * row + c] = tris[slot, c]
 
 
 # ======================================================================================
