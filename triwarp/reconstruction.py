@@ -1657,8 +1657,9 @@ def _clean_reconstruction(
 
     if deduplicate:
         faces, _ = tw.repair.resolve_duplicated_faces(faces)
-    vertices, faces = tw.repair.remove_degenerate_faces(points, faces)
-    vertices, faces = tw.repair.remove_non_manifold_faces(vertices, faces)
+    # One vertex compaction for both filters, rather than one after each: the faces here are this
+    # package's own, so their indices are in range, which the combined filter requires.
+    vertices, faces = tw.repair.remove_degenerate_and_non_manifold_faces(points, faces)
 
     if int(faces.shape[0]) > 0:
         if orient:

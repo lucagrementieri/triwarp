@@ -1319,6 +1319,49 @@ def test_resolve_voxel_grid_empty_input_takes_a_unit_diagonal(device: str) -> No
     assert np.allclose(list(origin), -0.005, rtol=0, atol=1e-7)
 
 
+@pytest.mark.parametrize(
+    ("n_points", "voxel_size"), [(0, None), (1, None), (4000, None), (4000, 1e-3), (4000, 0.37)]
+)
+def test_resolve_voxel_grid_cell_bound_covers_every_cell(
+    device: str, n_points: int, voxel_size: float | None
+) -> None:
+    """
+    Not a library comparison: the bound is triwarp's own hash radix, which no reference exposes.
+
+    ``return_cell_bound`` hands a cell-row hash the ``max_index`` it would otherwise infer, so it
+    must exceed every coordinate ``cell_indices`` writes -- by at most the documented two, so it
+    stays a *tight* radix -- and packing against it with ``validate=False`` must group the cells
+    exactly as the inferring, validating hash does. The cloud is offset and anisotropic so the
+    three axes' extents differ, and a millimetre cell makes the counts large enough for float32
+    rounding in the cell kernel to matter.
+    """
+    rng = np.random.default_rng(5)
+    points_np = (rng.random((n_points, 3)) * [3.0, 1.0, 0.2] - [7.0, 0.5, 2.0]).astype(np.float32)
+    points_wp = points_to_warp(points_np, device)
+
+    size, origin, bound = tw.voxels.resolve_voxel_grid(
+        points_wp, voxel_size, return_cell_bound=True
+    )
+    assert (size, list(origin)) == (
+        tw.voxels.resolve_voxel_grid(points_wp, voxel_size)[0],
+        list(tw.voxels.resolve_voxel_grid(points_wp, voxel_size)[1]),
+    )
+    if n_points == 0:
+        assert bound >= 1
+        return
+    cells = tw.voxels.cell_indices(points_wp, size, origin=origin)
+    cells_np = cells.numpy()
+    assert cells_np.min() >= 0
+    assert cells_np.max() < bound <= cells_np.max() + 3
+
+    inferred = tw.grouping.unique_1d(tw.grouping.hash_indices_rows(cells), return_inverse=True)
+    bounded = tw.grouping.unique_1d(
+        tw.grouping.hash_indices_rows(cells, bound, validate=False), return_inverse=True
+    )
+    assert inferred[0].shape == bounded[0].shape
+    assert np.array_equal(inferred[1].numpy(), bounded[1].numpy())
+
+
 @pytest.mark.parametrize("n_points", [1, 5])
 def test_resolve_voxel_grid_zero_extent_input_takes_a_unit_diagonal(
     device: str, n_points: int

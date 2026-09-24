@@ -47,6 +47,7 @@ from tests.conversions import (
     trimesh_to_warp,
     warp_to_trimesh,
 )
+from triwarp.kernels import remesh as kernel_remesh
 
 
 def _max_edge_length(vertices_np: np.ndarray, faces_np: np.ndarray) -> float:
@@ -1602,6 +1603,93 @@ def test_quadric_decimate_padding_never_reaches_the_output(
     out_vertices_wp, out_faces_wp, _face_source_wp = buffers.result()
     assert int(out_faces_wp.shape[0]) // 3 <= len(mesh_tm.faces) // 8
     assert out_faces_wp.numpy().max() < int(out_vertices_wp.shape[0])
+
+
+@wp.kernel
+def _probe_winner_budget_rank(
+    cost: wp.array[wp.float32],
+    rank: wp.array[wp.int32],
+    winners: wp.array[wp.int32],
+    words: wp.array[wp.uint32],
+    prefix: wp.array[wp.int32],
+    chunk_offsets: wp.array[wp.int32],
+    out_position: wp.array[wp.int32],
+) -> None:
+    i = wp.int32(wp.tid())
+    k = winners[i]
+    out_position[i] = kernel_remesh.winner_budget_rank(
+        cost[k], rank[k], k, cost.shape[0], words, prefix, chunk_offsets
+    )
+
+
+@pytest.mark.parametrize("unrepresentable", [False, True])
+def test_winner_budget_rank_matches_the_round_sort_it_replaces(
+    device: str, unrepresentable: bool
+) -> None:
+    """
+    Not a library comparison: the oracle is the stable sort the decimation round used to run.
+
+    A collapse round keeps the ``budget`` cheapest of its winners, and it used to rank them with a
+    stable radix sort of ``winner ? cost : +inf`` over the edge index. It now reads the rank off a
+    word scan of two winner bitmasks (``kernels/remesh.winner_budget_rank``), which agrees with that
+    sort only through an argument about the pass's own cost ranking -- and the argument has a
+    separate branch for a winner whose cost is +inf or a NaN, which the round sort files among the
+    non-winners. No decimation on a finite mesh reaches that branch, so this drives the function
+    directly, against NumPy's stable ``argsort`` of the same keys, with costs tied in blocks so the
+    index tie-break is exercised too. ``m`` spans several ``SCAN_CHUNK`` s of words, so the chunk
+    offsets carry.
+
+    **Bug class excluded:** a rank off by the non-winners the round sort interleaves, a word or bit
+    off by one in the bitmask read, and a chunk offset dropped at a chunk boundary.
+    """
+    rng = np.random.default_rng(7)
+    m = 70_000
+    cost_np = rng.integers(0, 500, m).astype(np.float32) / np.float32(8.0)
+    if unrepresentable:
+        cost_np[rng.choice(m, 900, replace=False)] = np.inf
+        cost_np[rng.choice(m, 300, replace=False)] = np.nan
+    winner_np = rng.random(m) < 0.3
+    assert winner_np.sum() > 1000
+    if unrepresentable:
+        assert (winner_np & np.isinf(cost_np)).any()
+        assert (winner_np & np.isnan(cost_np)).any()
+
+    # The pass's ranking: the same stable radix sort ``quadric_collapse_candidates`` feeds.
+    keys_wp = wp.array(np.concatenate([cost_np, np.zeros(m, np.float32)]), device=device)
+    order_wp = wp.array(np.concatenate([np.arange(m), np.zeros(m)]).astype(np.int32), device=device)
+    wp.utils.radix_sort_pairs(keys_wp, order_wp, count=m)
+    rank_np = np.empty(m, dtype=np.int32)
+    rank_np[order_wp.numpy()[:m]] = np.arange(m, dtype=np.int32)
+
+    half = -(-m // 32)
+    bits_np = np.zeros(64 * half, dtype=bool)
+    bits_np[rank_np[winner_np]] = True
+    bits_np[32 * half + np.flatnonzero(winner_np)] = True
+    words_np = np.packbits(bits_np.reshape(-1, 32)[:, ::-1], axis=1).view(">u4").ravel()
+    words_wp = wp.array(words_np.astype(np.uint32), dtype=wp.uint32, device=device)
+    scan = tw.remesh._ExclusiveScan(2 * half, wp.get_device(device))
+    scan.launch(words_wp, words=True)
+
+    winners_np = np.flatnonzero(winner_np).astype(np.int32)
+    position_wp = wp.empty(len(winners_np), dtype=wp.int32, device=device)
+    wp.launch(
+        _probe_winner_budget_rank,
+        dim=len(winners_np),
+        inputs=[
+            wp.array(cost_np, device=device),
+            wp.array(rank_np, device=device),
+            wp.array(winners_np, device=device),
+            words_wp,
+            scan.prefix,
+            scan.chunk_offsets,
+            position_wp,
+        ],
+        device=device,
+    )
+    round_keys_np = np.where(winner_np, cost_np, np.float32(np.inf))
+    expected_np = np.empty(m, dtype=np.int64)
+    expected_np[np.argsort(round_keys_np, kind="stable")] = np.arange(m)
+    assert np.array_equal(position_wp.numpy(), expected_np[winners_np])
 
 
 @pytest.mark.parametrize("target_ratio", [0.5, 0.1])

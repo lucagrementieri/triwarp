@@ -626,23 +626,106 @@ def remove_non_manifold_faces(
     See Also
     --------
     [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
+    [`remove_degenerate_and_non_manifold_faces`][triwarp.repair.remove_degenerate_and_non_manifold_faces]
     [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]
     """
     require_same_device(vertices=vertices, faces=faces)
+    # The radix of the edge keys; any bound above every index groups the edges identically, so the
+    # one taken from the input serves every pass over a subset of its faces.
+    n_vertices = tw.array.index_bound(faces, require_non_negative=True)
+    survivors, keep = _edge_manifold_survivors(faces, None, n_vertices, max_iter)
+    if keep is None:
+        return vertices, faces
+    return tw.selection.submesh_from_face_mask(vertices, survivors, keep)
+
+
+def remove_degenerate_and_non_manifold_faces(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_iter: int = 3
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Drop degenerate faces, then faces on a non-manifold edge, compacting the vertices once.
+
+    The same answer as [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
+    followed by [`remove_non_manifold_faces`][triwarp.repair.remove_non_manifold_faces], byte for
+    byte. The manifold test reads only face indices and every compaction preserves the order of
+    both the faces and the vertices, so the passes run over the input's own vertex numbering and
+    the referenced vertices are compacted once, at the end, instead of after every pass.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer, every index in
+        ``[0, n_vertices)``.
+    max_iter
+        Maximum number of non-manifold removal passes.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Vertices still referenced by a surviving face, compacted from index zero.
+    new_faces : wp.array[wp.int32]
+        Flat buffer of the surviving faces, remapped into ``new_vertices``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``vertices`` and ``faces`` are not all on one device.
+
+    See Also
+    --------
+    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
+    [`remove_non_manifold_faces`][triwarp.repair.remove_non_manifold_faces]
+    """
+    require_same_device(vertices=vertices, faces=faces)
+    if int(faces.shape[0]) == 0:
+        return wp.clone(vertices), wp.clone(faces)
+    keep = tw.triangles.face_nondegenerate_mask(vertices, faces)
+    survivors, keep = _edge_manifold_survivors(faces, keep, int(vertices.shape[0]), max_iter)
+    assert keep is not None
+    return tw.selection.submesh_from_face_mask(vertices, survivors, keep)
+
+
+def _edge_manifold_survivors(
+    faces: wp.array[wp.int32], keep: wp.array[wp.bool] | None, n_vertices: int, max_iter: int
+) -> tuple[wp.array[wp.int32], wp.array[wp.bool] | None]:
+    """
+    Run up to ``max_iter`` edge-manifold removal passes over ``faces[keep]``, in index space.
+
+    The surviving faces are always ``faces[keep]`` for the pair this returns (all of ``faces``
+    when ``keep`` is ``None``), with ``keep`` ``None`` only when it came in ``None`` and no pass
+    removed a face. Vertex indices are never remapped, so a caller compacts once with
+    [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]. A pass stops the loop
+    when it keeps every face or when no face is left. The pair returned is the last removing pass's
+    input and mask, so the final removal is never gathered out and the compaction reads the mask
+    that pass already wrote.
+
+    ``n_vertices`` is the edge-key radix: any bound above every index of ``faces``.
+    """
+    tested = faces
+    if keep is not None:
+        kept = tw.array.flatnonzero(keep)
+        # Readback: the kept count decides whether the prefilter dropped anything to gather out.
+        if int(kept.shape[0]) != int(faces.shape[0]) // 3:
+            tested = tw.array.gather(faces.reshape((-1, 3)), kept).reshape((-1,))
+    pending = None
     for _ in range(max_iter):
-        n_faces = int(faces.shape[0]) // 3
+        # The previous pass's removal is applied only once another pass is going to test it.
+        if pending is not None:
+            tested = tw.array.gather(tested.reshape((-1, 3)), pending).reshape((-1,))
+        n_faces = int(tested.shape[0]) // 3
         if n_faces == 0:
             break
-        keep = tw.validation.edge_manifold_mask(faces, allow_boundary_edges=True)
-        kept = tw.array.flatnonzero(keep)
-        if int(kept.shape[0]) == n_faces:
-            break  # already edge-manifold
-        # The index form of ``submesh_from_face_mask``, handed the compaction the stopping test
-        # already paid for rather than redoing it from ``keep``.
-        vertices, faces = tw.selection.submesh_from_face_indices(
-            vertices, faces, kept, unique_indices=True
+        manifold = tw.validation.edge_manifold_mask(
+            tested, allow_boundary_edges=True, n_vertices=n_vertices, validate=False
         )
-    return vertices, faces
+        pending = tw.array.flatnonzero(manifold)
+        # Readback: the kept count is the stopping test.
+        if int(pending.shape[0]) == n_faces:
+            break  # already edge-manifold
+        faces, keep = tested, manifold
+    return faces, keep
 
 
 def remove_small_components(
@@ -2031,9 +2114,9 @@ def _dilate_face_mask(
     No adjacency is needed for this and none is built: a face ring is the faces incident on the
     selection's vertex ring, and on a triangle mesh two vertices are one-ring neighbours exactly
     when they share a face. So one hop is the any-corner face mask of the vertex mask, whose
-    corners are then marked -- the dilation
-    [`triwarp.selection.expand_vertex_mask`][triwarp.selection.expand_vertex_mask] computes, reached
-    through the faces instead of through a unique-edge table the loop would rebuild every pass.
+    corners are then marked -- the same face-hop dilation
+    [`triwarp.selection.expand_vertex_mask`][triwarp.selection.expand_vertex_mask] runs, kept in
+    face form because the loop here wants the face mask of each ring, not the vertex mask.
 
     Parameters
     ----------

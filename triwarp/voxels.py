@@ -57,7 +57,7 @@ See Also
 from __future__ import annotations
 
 import math
-from typing import Literal, TypeVar, cast
+from typing import Literal, TypeVar, cast, overload
 
 import numpy as np
 import warp as wp
@@ -631,13 +631,32 @@ def grid_transform(grid: wp.Volume) -> tuple[float, wp.vec3]:
     return voxel_size, origin
 
 
+@overload
 def resolve_voxel_grid(
     points: wp.array[wp.vec3],
     voxel_size: float | None = None,
     origin: wp.vec3 | None = None,
     *,
     caller: str = "resolve_voxel_grid",
-) -> tuple[float, wp.vec3]:
+    return_cell_bound: Literal[False] = False,
+) -> tuple[float, wp.vec3]: ...
+@overload
+def resolve_voxel_grid(
+    points: wp.array[wp.vec3],
+    voxel_size: float | None = None,
+    origin: wp.vec3 | None = None,
+    *,
+    caller: str = "resolve_voxel_grid",
+    return_cell_bound: Literal[True],
+) -> tuple[float, wp.vec3, int]: ...
+def resolve_voxel_grid(
+    points: wp.array[wp.vec3],
+    voxel_size: float | None = None,
+    origin: wp.vec3 | None = None,
+    *,
+    caller: str = "resolve_voxel_grid",
+    return_cell_bound: bool = False,
+) -> tuple[float, wp.vec3] | tuple[float, wp.vec3, int]:
     """
     Voxel size and grid origin for a point set, filling in either default from its bounding box.
 
@@ -663,11 +682,23 @@ def resolve_voxel_grid(
         Lower corner of cell ``(0, 0, 0)``. ``None`` places it half a cell below the box.
     caller
         Name used in the error message, so a caller's own name appears rather than this one.
+    return_cell_bound
+        Also return an exclusive upper bound on every coordinate
+        [`cell_indices`][triwarp.voxels.cell_indices] gives a point of ``points`` on this grid, read
+        off the bounding box this already takes. It is the ``max_index`` a cell-row hash
+        ([`hash_indices_rows`][triwarp.grouping.hash_indices_rows]) would otherwise infer with a
+        reduction and a host readback. With a *derived* origin the coordinates are also
+        non-negative, so the two together make that hash's ``validate=False`` sound; a caller's
+        own ``origin`` above the box gives negative coordinates, which the bound says nothing
+        about. When both ``voxel_size`` and ``origin`` are given the box is taken for this alone.
 
     Returns
     -------
-    tuple[float, wp.vec3]
-        ``(voxel_size, origin)``, both resolved.
+    tuple[float, wp.vec3] or tuple[float, wp.vec3, int]
+        ``(voxel_size, origin)``, both resolved, followed by the cell bound when
+        ``return_cell_bound`` is ``True``. The bound may exceed the largest coordinate by up to
+        two, which covers the float32 rounding of the cell kernel; any larger radix packs cell rows
+        in the same order.
 
     Raises
     ------
@@ -696,7 +727,8 @@ def resolve_voxel_grid(
         [`adjacency.require_paired_adjacency`][triwarp.adjacency.require_paired_adjacency] is that
         rule on its own.
     """
-    if voxel_size is None or origin is None:
+    upper = wp.vec3(0.0, 0.0, 0.0)
+    if voxel_size is None or origin is None or return_cell_bound:
         if int(points.shape[0]) == 0:
             lower = wp.vec3(0.0, 0.0, 0.0)
             diagonal = 1.0
@@ -723,7 +755,17 @@ def resolve_voxel_grid(
             origin = wp.vec3(*(float(lower[axis]) - 0.5 * voxel_size for axis in range(3)))
     if voxel_size <= 0.0:
         raise ValueError(f"{caller} requires voxel_size > 0, got {voxel_size}")
-    return voxel_size, origin
+    if not return_cell_bound:
+        return voxel_size, origin
+    # The farthest cell along an axis is the one the box's upper corner falls in. The kernel
+    # floors a float32 product, which can land one cell past the float64 quotient here, so the
+    # bound carries one cell of slack on top of the exclusive ``+ 1``; an empty set has no cells
+    # and takes the smallest radix a hash accepts.
+    inverse = float(wp.float32(1.0 / voxel_size))
+    extent = max(
+        math.floor((float(upper[axis]) - float(origin[axis])) * inverse) for axis in range(3)
+    )
+    return voxel_size, origin, max(extent, 0) + 2
 
 
 def cell_indices(

@@ -279,8 +279,22 @@ def icp(
     # the Procrustes workspace — the fit is latency-bound, so its ~10 per-call allocations would
     # otherwise dominate an iteration that is already down to a handful of launches.
     closest = wp.empty(n, dtype=wp.vec3, device=device)
-    distance_mesh = twt.empty_1d(n, wp.float32, device=device)
-    triangle_id_mesh = twt.empty_1d(n, wp.int32, device=device)
+    # The correspondence's distance and index -- a face for a mesh target, a vertex for a cloud --
+    # written in full by either branch's query every iteration.
+    distance = twt.empty_1d(n, wp.float32, device=device)
+    triangle_id = twt.empty_1d(n, wp.int32, device=device)
+    # A cloud target's nearest search writes the ``(n, 1)`` rows its kernel takes, which are views
+    # of the two buffers above, and its matched points are a gather through the index buffer it
+    # rewrites -- all three views built once here and read afresh by every iteration.
+    nearest_rows = (
+        (
+            twt.as_array2d(triangle_id.reshape((n, 1)), wp.int32),
+            twt.as_array2d(distance.reshape((n, 1)), wp.float32),
+        )
+        if mesh is None
+        else None
+    )
+    matched = target_vertices[triangle_id] if mesh is None else None
     weights: wp.array[wp.float32] | None = (
         wp.empty(n, dtype=wp.float32, device=device) if max_distance is not None else None
     )
@@ -288,16 +302,19 @@ def icp(
     # The second ping-pong slot; see ``_ProcrustesWorkspace`` and the fit call below.
     workspace["spare_matrix"] = wp.empty(1, dtype=wp.mat44, device=device)
     workspace["spare_transformed"] = wp.empty(n, dtype=wp.vec3, device=device)
+    if max_distance is not None and device is not None and device.is_cuda:
+        workspace["host_acc"] = wp.empty(
+            kernel_registration.PROCRUSTES_ACC_SIZE, dtype=wp.float32, device="cpu"
+        )
 
     # Both ping-pong views built once: ``_slot`` assembles a dict, and doing that per iteration is
     # a percent or two of pure Python on the loop.
     slots = (_slot(workspace, 0), _slot(workspace, 1))
     parity = 0
     old_cost = math.inf
-    # Built on first use rather than here, for the reason in ``icp_point_to_plane``: a cached
-    # ``wp.map`` call re-resolves its op and signature every iteration, and its inputs come back
-    # from ``_correspondences``, whose mesh and cloud branches return different buffers. They are
-    # the same objects on every iteration, so one construction serves the loop.
+    # Built on first use rather than here: a cached ``wp.map`` call re-resolves its op and
+    # signature every iteration, and its inputs are the same two buffers on every iteration, so one
+    # construction serves the loop.
     threshold_weight: wp.Kernel | None = None
     # A mesh target gated by distance is the one configuration where the correspondence query and
     # the weight it feeds are the same pass: both read one source point's own hit, so the gate
@@ -317,23 +334,24 @@ def icp(
                     wp.float32(query_max),
                     wp.float32(max_distance),
                     closest,
-                    distance_mesh,
-                    triangle_id_mesh,
+                    distance,
+                    triangle_id,
                     weights,
                 ],
                 device=device,
             )
-            distance, triangle_id = distance_mesh, triangle_id_mesh
         else:
-            distance, triangle_id = _correspondences(
+            _correspondences(
                 mesh,
                 target_vertices,
                 target_index,
                 current,
                 query_max,
                 closest,
-                distance_mesh,
-                triangle_id_mesh,
+                distance,
+                triangle_id,
+                nearest_rows,
+                matched,
             )
             if max_distance is not None and weights is not None:
                 if threshold_weight is None:
@@ -409,6 +427,11 @@ class _ProcrustesWorkspace(TypedDict):
     # accumulator the fit itself filled -- needs somewhere else for the new one to land.
     spare_matrix: wp.array[wp.mat44] | None
     spare_transformed: wp.array[wp.vec3] | None
+    # Host landing buffer for the accumulator readback, also ``icp``'s alone: ``.numpy()`` on a
+    # device array allocates a host array per call, and a pageable buffer allocated once does not
+    # (the same idea as ``icp_point_to_plane``'s ``host_scalars``). ``None`` on the CPU device,
+    # where the accumulator's own ``.numpy()`` is a zero-copy view.
+    host_acc: wp.array[wp.float32] | None
     uniform_weights: wp.array[wp.float32]
 
 
@@ -422,6 +445,7 @@ def _procrustes_workspace(
         "transformed": wp.empty(n, dtype=wp.vec3, device=device) if return_cost else None,
         "spare_matrix": None,
         "spare_transformed": None,
+        "host_acc": None,
         "uniform_weights": _uniform_weights(device),
     }
 
@@ -525,7 +549,12 @@ def _procrustes_into(
     # ``read_scalar`` is better than this when only the cost is wanted, because ``.numpy()``
     # allocates a host array where ``read_scalar`` reuses a cached scratch. Hence the flag rather
     # than one spelling for both callers.
-    acc_np = acc.numpy()
+    host_acc = workspace["host_acc"]
+    if host_acc is not None:
+        wp.copy(host_acc, acc)
+        acc_np = host_acc.numpy()
+    else:
+        acc_np = acc.numpy()
     return (
         out_matrix,
         out_transformed,
@@ -583,7 +612,10 @@ def icp_point_to_plane(
     max_iterations
         Maximum number of ICP iterations.
     threshold
-        Stop when the cost decreases by less than this between iterations.
+        Stop after an iteration whose ``cost`` (see Returns) is less than ``threshold`` below the
+        previous iteration's; a rise stops it too. The first iteration is never tested, and
+        ``-inf`` runs all ``max_iterations``. For every kernel the tested quantity falls as the
+        fit improves, including Tukey's, whose weights redescend.
     max_distance
         Reject correspondences farther than this. No rejection when ``None``.
     robust_kernel
@@ -603,8 +635,14 @@ def icp_point_to_plane(
     transformed
         ``(n,)`` ``wp.vec3`` image of *a* under *matrix*.
     cost
-        Robust-weighted sum of squared point-to-plane residuals at the final
-        iteration.
+        The robust objective summed over the final iteration's in-range correspondences, with
+        ``r`` the point-to-plane residual: ``sum r^2`` for ``"none"``; ``sum w(r) r^2`` for
+        ``"huber"``, i.e. ``r^2`` within ``k`` and ``k |r|`` beyond it; and for ``"tukey"`` twice
+        the biweight loss, ``c^2 / 3 * (1 - (1 - (r / c)^2)^3)`` within ``c`` and ``c^2 / 3``
+        beyond it, so a correspondence the kernel rejects still counts at the saturated value. It
+        is evaluated at the pose the final step was solved *from*: ``matrix`` includes that step
+        and ``cost`` does not. ``math.inf`` when no iteration ran, or none found a correspondence
+        carrying weight.
 
     Raises
     ------
@@ -902,11 +940,16 @@ def _nearest_into(
     Nearest target vertex of every query, written into caller-owned ``(m, 1)`` rows.
 
     This is [`query_nearest`][triwarp.neighbors.query_nearest]'s ``k = 1`` BVH launch on the
-    hoisted ``target_index``, issued into buffers the ICP loop allocates once. Calling
+    hoisted ``target_index``, issued into buffers both ICP loops allocate once. Calling
     ``query_nearest`` every iteration would repeat its device check, accelerator resolution,
     argument validation and two output allocations for an identical launch -- several times the
     launch's own host cost, in a loop the host paces. ``test_nearest_into_matches_query_nearest``
     pins the two to each other.
+
+    An ``out=`` keyword on ``query_nearest`` would remove this coupling to the kernel's argument
+    list, and it does not pay: the result's ``k = 1`` shape is rank-1, so every call would build
+    two ``(m, 1)`` views of the caller's buffers on top of the device check and the shape guard --
+    about twice this launch's host cost, which reads as a 0.97x on a 20 000-point cloud call.
     """
     bvh = target_index["accelerator"]
     assert isinstance(bvh, wp.Bvh)
@@ -989,16 +1032,18 @@ def _correspondences(
     current: wp.array[wp.vec3],
     query_max: float,
     closest: wp.array[wp.vec3],
-    distance_mesh: twt.Array1dFloat32,
-    triangle_id_mesh: twt.Array1dInt32,
-) -> tuple[twt.Array1dFloat32, twt.Array1dInt32]:
+    distance: twt.Array1dFloat32,
+    correspondence: twt.Array1dInt32,
+    nearest_rows: tuple[twt.Array2dInt32, twt.Array2dFloat32] | None,
+    matched: wp.indexedarray[wp.vec3] | None,
+) -> None:
     """
-    Match every source position against the target, writing the matched point into ``closest``.
+    Match every source position against the target, into the caller's preallocated buffers.
 
-    Writes the matched point of every source position into ``closest``. A mesh target runs the BVH
-    closest-point kernel into the caller's preallocated buffers; a cloud target runs the k-NN query,
-    which returns its own, so the returned pair is the caller's buffers in the first case and fresh
-    views in the second -- the loop rebinds rather than assuming.
+    A mesh target runs the BVH closest-point kernel; a cloud target runs the ``k = 1`` nearest
+    search of [`_nearest_into`][triwarp.registration._nearest_into], whose index then gathers the
+    matched vertex. Either way every buffer is overwritten in
+    full and nothing is allocated, since the ICP loop calls this once per iteration.
 
     Parameters
     ----------
@@ -1007,44 +1052,37 @@ def _correspondences(
     target_vertices
         ``(m,)`` target positions.
     target_index
-        Precomputed k-NN state; required when ``mesh`` is ``None``.
+        Precomputed nearest-query state; required when ``mesh`` is ``None``.
     current
         ``(n,)`` transformed source positions to match.
     query_max
         Search radius for the mesh closest-point query.
     closest
-        ``(n,)`` output, written either way.
-    distance_mesh, triangle_id_mesh
-        Preallocated ``(n,)`` buffers the mesh branch writes into.
-
-    Returns
-    -------
-    tuple[wp.array[wp.float32], wp.array[wp.int32]]
-        ``(distance, correspondence_index)`` -- a face index for a mesh target, a vertex index for
-        a cloud one.
+        ``(n,)`` matched points, written either way.
+    distance, correspondence
+        ``(n,)`` distance to the match and its index -- a face index for a mesh target, a vertex
+        index for a cloud one.
+    nearest_rows
+        ``(n, 1)`` views of ``correspondence`` and ``distance``, the rows the cloud branch's
+        nearest search writes; required when ``mesh`` is ``None``.
+    matched
+        ``target_vertices[correspondence]``, the gather view the cloud branch copies into
+        ``closest``; required when ``mesh`` is ``None``.
     """
     if mesh is not None:
         wp.launch(
             kernel_proximity.closest_point_on_mesh,
             dim=int(current.shape[0]),
-            inputs=[
-                mesh.id,
-                current,
-                wp.float32(query_max),
-                closest,
-                distance_mesh,
-                triangle_id_mesh,
-            ],
+            inputs=[mesh.id, current, wp.float32(query_max), closest, distance, correspondence],
             device=current.device,
         )
-        return distance_mesh, triangle_id_mesh
+        return
 
     assert target_index is not None
-    index, distance = tw.neighbors.query_nearest(target_vertices, current, 1, **target_index)
-    # Not ``tw.array.gather``: ``closest`` is allocated once outside the ICP loop, and a gather
-    # would add one allocation per iteration.
-    wp.copy(closest, target_vertices[index])
-    return distance, index
+    assert nearest_rows is not None
+    assert matched is not None
+    _nearest_into(target_vertices, current, target_index, nearest_rows)
+    wp.copy(closest, matched)
 
 
 def _seed_transform(

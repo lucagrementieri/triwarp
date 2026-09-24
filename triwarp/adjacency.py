@@ -40,6 +40,7 @@ def face_adjacency(
     *,
     return_edges: Literal[False] = False,
     n_vertices: int | None = None,
+    edges_paired: bool = False,
 ) -> twt.Array2dInt32: ...
 @overload
 def face_adjacency(
@@ -48,6 +49,7 @@ def face_adjacency(
     *,
     return_edges: Literal[True],
     n_vertices: int | None = None,
+    edges_paired: bool = False,
 ) -> tuple[twt.Array2dInt32, twt.Array2dInt32]: ...
 def face_adjacency(
     faces: wp.array[wp.int32],
@@ -55,6 +57,7 @@ def face_adjacency(
     *,
     return_edges: bool = False,
     n_vertices: int | None = None,
+    edges_paired: bool = False,
 ) -> twt.Array2dInt32 | tuple[twt.Array2dInt32, twt.Array2dInt32]:
     """
     Face index pairs that share an undirected mesh edge.
@@ -84,6 +87,15 @@ def face_adjacency(
         host readback that serialises the device pipeline — worth passing from loops that call this
         once per pass. Must be greater than every index in ``faces``; see the warning on
         [`hash_indices_rows`][triwarp.grouping.hash_indices_rows].
+    edges_paired
+        Promise that every undirected edge is shared by exactly two faces -- what
+        [`is_edge_manifold`][triwarp.validation.is_edge_manifold] with
+        ``allow_boundary_edges=False`` establishes. The adjacency then has exactly
+        ``3 * n_faces / 2`` rows and they are consecutive in the sorted edge-key order, so the
+        run detection, its scan and the host read of the pair count are skipped. The answer is
+        byte-identical to the default path on such a mesh. The promise is **not checked** beyond
+        the face count's parity: on a mesh with a boundary or a non-manifold edge the rows are
+        still valid face indices but pair faces that need not share an edge.
 
     Returns
     -------
@@ -100,6 +112,8 @@ def face_adjacency(
     ------
     RuntimeError
         If ``faces`` and ``edges_sorted`` are not all on one device.
+    ValueError
+        If ``edges_paired`` is given for an odd face count, where no pairing exists.
 
     Notes
     -----
@@ -124,7 +138,9 @@ def face_adjacency(
             return empty_array, twt.empty_2d((0, 2), wp.int32, device=device)
         return empty_array
 
-    edge_groups = _edge_groups(faces, edges_sorted, n_vertices)
+    if edges_paired and n_faces % 2 != 0:
+        raise ValueError(f"edges_paired needs an even face count, got {n_faces} faces")
+    edge_groups = _edge_groups(faces, edges_sorted, n_vertices, edges_paired)
 
     # Edge ``e`` belongs to face ``e // 3``, so the owning faces need no ``edges_face`` table, no
     # gather through it, and no row sort — one kernel does the division and orders the pair. With
@@ -206,7 +222,10 @@ def require_paired_adjacency(
 
 
 def _edge_groups(
-    faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None, n_vertices: int | None
+    faces: wp.array[wp.int32],
+    edges_sorted: twt.Array2dInt32 | None,
+    n_vertices: int | None,
+    edges_paired: bool,
 ) -> twt.Array2dInt32:
     """
     Group the ``3 * n_faces`` undirected edges into the pairs that occur exactly twice.
@@ -223,20 +242,32 @@ def _edge_groups(
     the ``(3 * n_faces, 2)`` edge rows are never written or read back. Both spellings produce
     byte-identical keys, hence identical group order, so callers can mix the two paths and still
     get row-aligned results.
+
+    With ``edges_paired`` every key occurs exactly twice, so each run of the stable sort starts at
+    an even position and [`group`][triwarp.grouping.group]'s run detection would emit sorted slots
+    ``2k, 2k + 1`` as row ``k``: the sort's permutation, read two to a row, is that answer already.
     """
     if edges_sorted is not None:
-        return tw.grouping.group_int_rows(
-            edges_sorted, length=2, max_value=n_vertices, validate=n_vertices is None
+        if not edges_paired:
+            return tw.grouping.group_int_rows(
+                edges_sorted, length=2, max_value=n_vertices, validate=n_vertices is None
+            )
+        edge_keys = tw.grouping.hash_indices_rows(
+            edges_sorted, n_vertices, validate=n_vertices is None
         )
-    n_faces = int(faces.shape[0]) // 3
-    edge_keys = wp.empty(n_faces * 3, dtype=wp.uint64, device=faces.device)
-    wp.launch(
-        kernel_adjacency.face_edge_keys,
-        dim=n_faces,
-        inputs=[faces, wp.uint64(_hash_radix(faces, n_vertices)), edge_keys],
-        device=faces.device,
-    )
-    return twt.as_array2d(tw.grouping.group(edge_keys, 2), wp.int32)
+    else:
+        n_faces = int(faces.shape[0]) // 3
+        edge_keys = wp.empty(n_faces * 3, dtype=wp.uint64, device=faces.device)
+        wp.launch(
+            kernel_adjacency.face_edge_keys,
+            dim=n_faces,
+            inputs=[faces, wp.uint64(_hash_radix(faces, n_vertices)), edge_keys],
+            device=faces.device,
+        )
+        if not edges_paired:
+            return twt.as_array2d(tw.grouping.group(edge_keys, 2), wp.int32)
+    _, order = tw.array.sort_and_argsort(edge_keys)
+    return twt.as_array2d(order.reshape((int(edge_keys.shape[0]) // 2, 2)), wp.int32)
 
 
 def _hash_radix(faces: wp.array[wp.int32], n_vertices: int | None) -> int:
@@ -412,7 +443,9 @@ def face_adjacency_unshared(
     # alike, is what keeps the empty case to *one* allocation rather than building an empty
     # ``edge_groups`` only to size an empty output off it.
     if face_adjacency is None:
-        edge_groups = _edge_groups(faces, None, n_vertices) if int(faces.shape[0]) >= 3 else None
+        edge_groups = (
+            _edge_groups(faces, None, n_vertices, False) if int(faces.shape[0]) >= 3 else None
+        )
         m = 0 if edge_groups is None else int(edge_groups.shape[0])
         kernel, tables = kernel_adjacency.face_adjacency_unshared_from_edges, (edge_groups,)
     else:

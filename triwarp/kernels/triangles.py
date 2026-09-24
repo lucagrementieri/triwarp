@@ -121,10 +121,10 @@ def write_corner_triple(
     The write-side counterpart of [`corner_triple`][triwarp.kernels.triangles.corner_triple], and
     only for the sites that permute or relocate an existing triple -- an edge flip's two rewritten
     faces (``remesh.write_flipped_quad``), a compaction moving a survivor to a new row
-    (``remesh.compact_faces``, which is exactly where naming the row pays: it reads one row base and
-    writes another). Most triangle-emitting kernels in the tree instead synthesize a face from local
-    context (a fan, a cut, a bridge) rather than reorder one, and those stay as they are -- there is
-    no shared decision to extract from a one-off construction. No
+    (``remesh.compact_decimation_pass``, which is exactly where naming the row pays: it reads one
+    row base and writes another). Most triangle-emitting kernels in the tree instead synthesize a
+    face from local context (a fan, a cut, a bridge) rather than reorder one, and those stay as they
+    are -- there is no shared decision to extract from a one-off construction. No
     separate "reversed" sibling: a full ``np.fliplr``-style reversal is this same function called
     ``write_corner_triple(out, row, c, b, a)`` -- callers pass their own arguments in the order they
     want written, the way ``repair.reverse_face_winding`` does, rather than naming a second

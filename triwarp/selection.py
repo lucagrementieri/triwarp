@@ -968,10 +968,7 @@ def _face_mask_from_vertex_mask(
 
 
 def expand_vertex_mask(
-    faces: wp.array[wp.int32],
-    mask: wp.array[wp.bool],
-    hops: int,
-    unique_edges: twt.Array2dInt32 | None = None,
+    faces: wp.array[wp.int32], mask: wp.array[wp.bool], hops: int
 ) -> wp.array[wp.bool]:
     """
     Grow a vertex selection by ``hops`` one-ring layers.
@@ -988,9 +985,6 @@ def expand_vertex_mask(
         Length-``n_vertices`` ``wp.bool`` selection to dilate.
     hops
         Number of one-ring dilation rounds (``0`` returns a copy).
-    unique_edges
-        Optional precomputed ``(m, 2)`` unique edges (from
-        [`edges_unique`][triwarp.edges.edges_unique]); rebuilt when ``None``.
 
     Returns
     -------
@@ -1000,7 +994,7 @@ def expand_vertex_mask(
     Raises
     ------
     RuntimeError
-        If ``faces``, ``mask`` and ``unique_edges`` are not all on one device.
+        If ``faces`` and ``mask`` are not on one device.
 
     See Also
     --------
@@ -1008,22 +1002,20 @@ def expand_vertex_mask(
 
     Notes
     -----
-    Dilation is vertex-based: a vertex enters the mask when any 1-ring neighbour is in it.
+    Dilation is vertex-based: a vertex enters the mask when any 1-ring neighbour is in it. On a
+    triangle mesh two vertices are one-ring neighbours exactly when they share a face, so a round
+    marks the corners of every face with a selected corner and no edge table is built. Vertices no
+    face references are neither reached nor removed.
     """
-    require_same_device(faces=faces, mask=mask, unique_edges=unique_edges)
+    require_same_device(faces=faces, mask=mask)
     n = int(mask.shape[0])
     if hops <= 0 or n == 0:
         return wp.clone(mask)
-    if unique_edges is None:
-        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
-    return _dilate_vertex_mask(unique_edges, mask, hops, owned=False)
+    return _dilate_vertex_mask(faces, mask, hops, owned=False)
 
 
 def shrink_vertex_mask(
-    faces: wp.array[wp.int32],
-    mask: wp.array[wp.bool],
-    hops: int,
-    unique_edges: twt.Array2dInt32 | None = None,
+    faces: wp.array[wp.int32], mask: wp.array[wp.bool], hops: int
 ) -> wp.array[wp.bool]:
     """
     Erode a vertex selection by ``hops`` one-ring layers.
@@ -1039,8 +1031,6 @@ def shrink_vertex_mask(
         Length-``n_vertices`` ``wp.bool`` selection to erode.
     hops
         Number of one-ring erosion rounds.
-    unique_edges
-        Optional precomputed ``(m, 2)`` unique edges; rebuilt when ``None``.
 
     Returns
     -------
@@ -1050,7 +1040,7 @@ def shrink_vertex_mask(
     Raises
     ------
     RuntimeError
-        If ``faces``, ``mask`` and ``unique_edges`` are not all on one device.
+        If ``faces`` and ``mask`` are not on one device.
 
     See Also
     --------
@@ -1061,27 +1051,25 @@ def shrink_vertex_mask(
     Erosion here is vertex-based: a vertex survives when every 1-ring neighbour is also in the
     mask. MeshLab's Erode Selection is a *face*-based operation and gives a different answer.
     """
-    require_same_device(faces=faces, mask=mask, unique_edges=unique_edges)
+    require_same_device(faces=faces, mask=mask)
     device = mask.device
     n = int(mask.shape[0])
     if hops <= 0 or n == 0:
         return wp.clone(mask)
-    if unique_edges is None:
-        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
     complement = wp.empty(n, dtype=wp.bool, device=device)
     wp.map(kernel_array.mask_not, mask, out=complement)
     # Both the complement and the dilation are this function's own buffers, so the dilation may
     # recycle the first and the result is complemented in place.
-    dilated = _dilate_vertex_mask(unique_edges, complement, hops, owned=True)
+    dilated = _dilate_vertex_mask(faces, complement, hops, owned=True)
     wp.map(kernel_array.mask_not, dilated, out=dilated)
     return dilated
 
 
 def _dilate_vertex_mask(
-    unique_edges: twt.Array2dInt32, mask: wp.array[wp.bool], hops: int, *, owned: bool
+    faces: wp.array[wp.int32], mask: wp.array[wp.bool], hops: int, *, owned: bool
 ) -> wp.array[wp.bool]:
     """
-    Dilate ``mask`` by ``hops`` edge rounds into a buffer the caller did not pass in.
+    Dilate ``mask`` by ``hops`` one-ring rounds into a buffer the caller did not pass in.
 
     A round reads one mask and writes a copy of it, so two buffers alternate: every round after
     the second refills the buffer the round before last read, rather than allocating a fresh one.
@@ -1089,7 +1077,7 @@ def _dilate_vertex_mask(
     spare. ``hops`` must be positive.
     """
     device = mask.device
-    m = int(unique_edges.shape[0])
+    n_faces = int(faces.shape[0]) // 3
     current = mask
     spare = None
     for _ in range(hops):
@@ -1098,11 +1086,11 @@ def _dilate_vertex_mask(
         else:
             wp.copy(spare, current)
             nxt = spare
-        if m > 0:
+        if n_faces > 0:
             wp.launch(
                 kernel_selection.dilate_vertex_mask,
-                dim=m,
-                inputs=[unique_edges, current, nxt],
+                dim=n_faces,
+                inputs=[faces, current, nxt],
                 device=device,
             )
         spare = current if owned else None

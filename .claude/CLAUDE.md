@@ -5924,9 +5924,7 @@ change. Probes are in `plans/benchmark-round-15-data/probes/`.
     - ICP point-to-plane (R15-A2): 2-9 iterations at the default threshold, and the benchmark pins
       10. A twist-norm stop cannot be shown on sphere fixtures, whose rotation is a free gauge, and
       would change a public contract; declined. Per-iteration allocations went to zero instead
-      (cloud 47 -> 17 per call). Open, unfixed: with Tukey the cost-decrease test stops after 2
-      iterations because a redescending kernel's weighted cost *rises* as points enter it, and the
-      returned `cost` is the pre-step cost.
+      (cloud 47 -> 17 per call). The Tukey early stop is fixed in the second batch below.
 - **`remove_tunnels` was a split->pack round trip plus per-loop readbacks.** `shorten_loop` returns
   ~128 views that `remove_tunnels` measured one gather and one readback at a time and then read
   back again, loop by loop, in four helpers. `kernels/polyline.packed_closed_loop_lengths` measures
@@ -5977,4 +5975,35 @@ change. Probes are in `plans/benchmark-round-15-data/probes/`.
       return wd;
   }
   ```
+- **Second batch (same day, same method).**
+    - **`quadric_decimate` 2.0-4.2x** (lucy 0.1 5.9 s -> 1.4 s), byte-identical on CPU. The pass
+      graph went from ~306 nodes to ~87, but **the dominant saving was the six per-round radix
+      sorts, not the node gaps**: half of a replay's busy time. A winner's rank in the pass's cost
+      order is now read off two bitmasks (popcount plus a word scan), exact against the old stable
+      sort of `winner ? cost : +inf` including `inf`/`NaN` costs, and a round is 7 kernels. Every
+      scan in the pass is a private allocation-free chunked scan (`remesh._ExclusiveScan`), which
+      is what a `capture_while` body needs and `wp.utils.array_scan` is not -- a general
+      candidate for `kernels/array.py`, and the thing the flip rounds' plain-graph fallback waits
+      on. A pass is re-recorded at the live width once it has halved and freed 250 000 faces of
+      width (1.10-1.21x on the scan meshes, a loss on the small saddle, hence the gate).
+    - **Tukey ICP stopped after 2 iterations at 4.8 degrees of rotation error** with an explicit
+      `robust_scale` smaller than the starting residuals (how the benchmark and Open3D callers
+      pass one): the loop tested `sum w r^2`, which a redescending kernel makes *rise* while points
+      re-enter it. It now tests the biweight loss `2 rho`, monotone in `|r|`; converges to 0.01
+      degrees, and `none` / `huber` / MAD-scale Tukey poses are bit-identical.
+      `test_icp_point_to_plane_tukey_converges_from_outside_its_kernel` fails on the old loop.
+      Documented, not changed: the returned `cost` is at the pose the last step was solved from.
+    - **`query_nearest(out=)` declined at 0.97x**: the two `(m, 1)` views a rank-1 `out` needs per
+      call plus the checks cost more than the allocation they replace. `registration` launches the
+      k=1 kernel directly, guarded by an equality test.
+    - **Face-hop vertex morphology**: `expand_vertex_mask` / `shrink_vertex_mask` mark all three
+      corners of any face with a selected corner, 2.3-23x without an edge table and flat-or-faster
+      *with* one, so their public `unique_edges=` keyword was removed.
+    - `face_adjacency(edges_paired=True)`: every edge on exactly two faces makes the adjacency the
+      key sort's permutation read two to a row (`is_watertight` 5 -> 4 readbacks);
+      `resolve_voxel_grid(return_cell_bound=True)` lets `cluster_decimate` skip the cell hash's
+      validating reduction (1.09x); `repair.remove_degenerate_and_non_manifold_faces` filters in
+      the input's numbering and compacts once, which every `_clean_reconstruction` caller now uses
+      (1.28x on the cleanup); `refine_and_smooth_region` builds one `edges_unique` for the
+      boundary mask, both regions and `exclude_fully_selected_components`, where it built three.
 

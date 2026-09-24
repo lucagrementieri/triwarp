@@ -16,7 +16,7 @@ from triwarp.constants import INT32_MAX_CONSTANT
 # (``polyline.rdp_split_spans``, ``homology.forest_link``). **It must be seeded non-zero before the
 # loop starts**: ``wp.capture_while`` evaluates it *before* the first round, so a plain
 # ``wp.zeros`` state runs zero rounds. Seed with ``wp.array([0, 1])`` / ``assign([0, 1])``, or from
-# the same ``dim=1`` kernel that resets the rest of the pass (``remesh.reset_collapse_rounds``).
+# the kernel that resets the rest of the pass (``remesh.begin_decimation_pass``).
 #
 # Six loops share this, in two shapes. **Arm-at-the-front**: a round's first kernel clears the
 # condition and a later one raises it, so two slots are enough -- the level-synchronous
@@ -1146,8 +1146,9 @@ def pack_edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
 def unpack_edge_key(key: wp.uint64, base: wp.uint64) -> tuple[wp.int32, wp.int32]:
     """Endpoints ``(lo, hi)`` of a ``pack_edge_key`` key, min first as it was packed."""
     # Beside its inverse rather than at the one call site, because the packing is a *convention*
-    # shared by ``face_edge_keys``, ``pass_edge_keys`` and ``grouping.hash_indices_rows``: a caller
-    # that recovers the endpoints by open-coding the divmod is one that can drift from it silently.
+    # shared by ``face_edge_keys``, ``begin_decimation_pass`` and ``grouping.hash_indices_rows``: a
+    # caller that recovers the endpoints by open-coding the divmod is one that can drift from it
+    # silently.
     return wp.int32(key % base), wp.int32(key // base)
 
 

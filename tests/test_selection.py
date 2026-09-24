@@ -1242,6 +1242,48 @@ def test_shrink_vertex_mask(device: str):
     assert np.array_equal(shrunk, expected)
 
 
+@pytest.mark.parametrize("hops", [1, 2, 3])
+def test_vertex_morphology_on_an_irregular_mesh(device: str, hops: int) -> None:
+    """
+    Not a library comparison: a NumPy edge-list oracle, on the inputs a face-based round could miss.
+
+    A round marks the corners of every face with a selected corner, which is the edge-neighbour
+    dilation only because two vertices of a triangle mesh are one-ring neighbours exactly when they
+    share a face. This pins that on what the grid tests lack: a boundary, a non-manifold fin (three
+    faces on one edge), a degenerate face with a repeated corner, and two unreferenced vertices --
+    one selected, which must stay selected and spread nowhere, and one not, which nothing reaches.
+    The seed is random and several vertices wide, and both outcomes of every vertex occur.
+    """
+    vertices_np, faces_np = _grid_mesh(6)
+    n_grid = len(vertices_np)
+    fin, loose_on, loose_off = n_grid, n_grid + 1, n_grid + 2
+    extra = [7, 8, fin, 14, 14, 20]  # a third face on the interior edge (7, 8); a degenerate face
+    faces_np = np.concatenate([faces_np, np.array(extra, dtype=np.int32)])
+    n = n_grid + 3
+    rng = np.random.default_rng(11)
+    seed = np.zeros(n, dtype=bool)
+    seed[rng.choice(n_grid, size=4, replace=False)] = True
+    seed[loose_on] = True
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    seed_wp = wp.array(seed, dtype=wp.bool, device=device)
+
+    expanded_np = tw.selection.expand_vertex_mask(faces_wp, seed_wp, hops).numpy()
+    expected_expand = _graph_distance(faces_np, n, seed) <= hops
+    assert expected_expand[loose_on]
+    assert not expected_expand[loose_off]
+    assert 0 < expected_expand.sum() < n
+    assert np.array_equal(expanded_np, expected_expand)
+
+    grown = ~seed
+    grown[[loose_on, loose_off]] = [True, False]
+    shrunk_np = tw.selection.shrink_vertex_mask(
+        faces_wp, wp.array(grown, dtype=wp.bool, device=device), hops
+    ).numpy()
+    expected_shrink = _graph_distance(faces_np, n, ~grown) > hops
+    assert 0 < expected_shrink.sum() < n
+    assert np.array_equal(shrunk_np, expected_shrink)
+
+
 @pytest.mark.parametrize("face_mode", ["all", "any"])
 def test_face_indices_from_vertex_indices(request: pytest.FixtureRequest, face_mode: str) -> None:
     """Class A: both ``face_mode`` branches equal the numpy predicate, face index for face index."""

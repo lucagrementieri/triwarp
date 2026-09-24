@@ -31,8 +31,8 @@ def face_edge_keys(
     faces: wp.array[wp.int32], base: wp.uint64, out_keys: wp.array[wp.uint64]
 ) -> None:
     # One launch in place of ``faces_to_edges`` + ``pack_indices``, so the intermediate
-    # ``(3F, 2)`` edge rows are never materialized. ``remesh.pass_edge_keys`` is the same kernel
-    # over a fixed-capacity buffer, differing only in writing a sentinel key past the live faces.
+    # ``(3F, 2)`` edge rows are never materialized. ``remesh.begin_decimation_pass`` writes the same
+    # keys over a fixed-capacity buffer, differing only in a sentinel key past the live faces.
     write_face_edge_keys(faces, wp.tid(), base, out_keys)
 
 

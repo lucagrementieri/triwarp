@@ -987,8 +987,14 @@ def is_watertight(
         validate=False,
     ):
         return False
+    # The edge test just established that every edge has exactly two faces, which is the
+    # precondition ``edges_paired`` names: the pairs are then read straight off the key sort.
     adjacency, adjacency_edges = tw.adjacency.face_adjacency(
-        faces, edges_sorted=edges_sorted, return_edges=True, n_vertices=n_vertices
+        faces,
+        edges_sorted=edges_sorted,
+        return_edges=True,
+        n_vertices=n_vertices,
+        edges_paired=True,
     )
     if not is_vertex_manifold(
         faces, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges, n_vertices=n_vertices

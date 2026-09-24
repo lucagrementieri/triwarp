@@ -1588,6 +1588,112 @@ def test_remove_non_manifold_faces_leaves_an_edge_manifold_mesh_alone(
 
 
 # --------------------------------------------------------------------------------------
+# remove_degenerate_and_non_manifold_faces
+# --------------------------------------------------------------------------------------
+
+
+def _icosahedron_with_a_degenerate_and_a_non_manifold_face_np() -> tuple[np.ndarray, np.ndarray]:
+    """
+    Glue a repeated-index face onto one icosahedron edge and a real face onto another.
+
+    The degenerate face ``(a, b, b)`` carries edge ``(a, b)``, so it makes that edge 3-incident
+    unless it is dropped *before* the manifold test -- the ordering the combined function must
+    keep. The real extra face makes a second edge genuinely non-manifold. A trailing unreferenced
+    vertex rides along so the compaction has something to drop.
+    """
+    mesh_tm = tm.creation.icosahedron()
+    n = mesh_tm.vertices.shape[0]
+    vertices_np = np.vstack((mesh_tm.vertices, [[3.0, 3.0, 3.0], [9.0, 9.0, 9.0]]))
+    a, b = mesh_tm.faces[0][:2]
+    c, d = mesh_tm.faces[7][1:]
+    extra_np = [[a, b, b], [c, d, n]]
+    faces_np = np.vstack((mesh_tm.faces[:5], extra_np[:1], mesh_tm.faces[5:], extra_np[1:]))
+    return vertices_np.astype(np.float32), faces_np.astype(np.int32)
+
+
+@pytest.mark.parametrize("max_iter", [1, 3])
+def test_remove_degenerate_and_non_manifold_faces_matches_trimesh_and_a_numpy_oracle(
+    device: str, max_iter: int
+) -> None:
+    """
+    Class A: trimesh picks the degenerate faces, the numpy oracle the non-manifold ones.
+
+    The reference is the two-stage rule written out with no intermediate compaction: trimesh's
+    ``nondegenerate_faces`` filters the input, and ``_remove_non_manifold_faces_np`` runs the
+    manifold passes on what is left and compacts once. The fixture is chosen so both stages bite
+    and so their order matters: 22 faces in, one degenerate (on an edge it would otherwise make
+    non-manifold) and one genuinely non-manifold, 18 out -- where dropping the degenerate face
+    *after* the manifold test would also delete the two real faces on its edge.
+    """
+    vertices_np, faces_np = _icosahedron_with_a_degenerate_and_a_non_manifold_face_np()
+    mesh_tm = tm.Trimesh(vertices_np.astype(np.float64), faces_np, process=False)
+    nondegenerate_tm = mesh_tm.nondegenerate_faces(height=_MERGE_TOL)
+    assert int((~nondegenerate_tm).sum()) == 1
+    expected_vertices_np, expected_faces_np = _remove_non_manifold_faces_np(
+        vertices_np, faces_np[nondegenerate_tm], max_iter=max_iter
+    )
+    assert expected_faces_np.shape[0] == 18
+    assert expected_vertices_np.shape[0] < vertices_np.shape[0]
+
+    new_vertices_wp, new_faces_wp = tw.repair.remove_degenerate_and_non_manifold_faces(
+        *numpy_to_warp(vertices_np, faces_np, device), max_iter=max_iter
+    )
+
+    assert np.array_equal(new_faces_wp.numpy().reshape(-1, 3), expected_faces_np)
+    assert np.allclose(new_vertices_wp.numpy(), expected_vertices_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "mesh_kind",
+    ["three_faces_on_one_edge", "cascading", "icosahedron_plus_a_face", "degenerate_and_nm"],
+)
+@pytest.mark.parametrize("max_iter", [1, 2, 3])
+def test_remove_degenerate_and_non_manifold_faces_equals_the_two_calls(
+    device: str, mesh_kind: str, max_iter: int
+) -> None:
+    """
+    Triwarp against triwarp: the one-compaction path is byte-identical to the two public calls.
+
+    The two-call sequence carries the oracle (the numpy and trimesh comparisons above and in the
+    ``remove_non_manifold_faces`` / ``remove_degenerate_faces`` tests); this pins the combined
+    entry point to it exactly -- vertex bytes and face indices -- on every input shape the
+    stopping rule distinguishes: everything removed, a second pass needed, one pass enough, and
+    a degenerate face whose removal decides the manifold test.
+    """
+    builders = {
+        "three_faces_on_one_edge": _three_faces_on_one_edge_np,
+        "cascading": _cascading_non_manifold_np,
+        "icosahedron_plus_a_face": _icosahedron_plus_a_face_on_an_existing_edge_np,
+        "degenerate_and_nm": _icosahedron_with_a_degenerate_and_a_non_manifold_face_np,
+    }
+    vertices_wp, faces_wp = numpy_to_warp(*builders[mesh_kind](), device)
+
+    staged_vertices_wp, staged_faces_wp = tw.repair.remove_non_manifold_faces(
+        *tw.repair.remove_degenerate_faces(vertices_wp, faces_wp), max_iter=max_iter
+    )
+    new_vertices_wp, new_faces_wp = tw.repair.remove_degenerate_and_non_manifold_faces(
+        vertices_wp, faces_wp, max_iter=max_iter
+    )
+
+    assert new_vertices_wp.numpy().tobytes() == staged_vertices_wp.numpy().tobytes()
+    assert np.array_equal(new_faces_wp.numpy(), staged_faces_wp.numpy())
+
+
+def test_remove_degenerate_and_non_manifold_faces_empty(device: str) -> None:
+    """Not a library comparison: a face-less input comes back as copies, vertices kept."""
+    vertices_wp = wp.array(np.eye(3, dtype=np.float32), dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+
+    new_vertices_wp, new_faces_wp = tw.repair.remove_degenerate_and_non_manifold_faces(
+        vertices_wp, faces_wp
+    )
+
+    assert new_faces_wp.shape[0] == 0
+    assert np.array_equal(new_vertices_wp.numpy(), np.eye(3, dtype=np.float32))
+    assert new_vertices_wp.ptr != vertices_wp.ptr
+
+
+# --------------------------------------------------------------------------------------
 # remove_small_components
 # --------------------------------------------------------------------------------------
 

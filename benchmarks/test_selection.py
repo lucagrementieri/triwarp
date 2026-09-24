@@ -4,7 +4,7 @@ Benchmarks for ``triwarp.selection``: submesh extraction and vertex-selection mo
 Two axes, and neither is the face count:
 
 * **hops**, for the morphology pair. ``expand_vertex_mask`` / ``shrink_vertex_mask`` run a host loop
-  of one full edge pass per hop, so their cost is ``hops x |E|`` -- completely independent of how
+  of one full face pass per hop, so their cost is ``hops x |F|`` -- completely independent of how
   many vertices are actually selected. That makes them the cleanest pure-iteration-count group in
   the suite: the slope between 1 and 8 hops should be exactly 8, and anything else means the pass
   is not doing constant work per hop.
@@ -32,7 +32,7 @@ Two differences to read the rows against, neither of them correctable:
 - **It is face morphology, not vertex morphology.** MeshLab dilates the selected *face* set (via
   VCGlib's loose vertex-from-face / face-from-vertex pair), so seeding it needs
   ``compute_selection_by_condition_per_face`` and a vertex selection handed to it is simply cleared.
-  triwarp grows a vertex mask over the unique-edge table. Same operation class, same asymptotic work
+  triwarp grows a vertex mask through the faces' corners. Same operation class, same asymptotic work
   -- one full pass over the elements per hop -- on a different element type.
 - **One filter call is one hop**, so the reference is a host loop of ``hops`` calls, which is
   structurally what ``expand_vertex_mask``'s own per-hop launch loop does.
@@ -131,7 +131,7 @@ def _seeded_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
 @pytest.mark.parametrize("hops", _HOPS)
 def test_expand_vertex_mask(bench_case: BenchCase, hops: int) -> None:
     """
-    One full edge pass per hop, regardless of selection size: the slope should be exactly 8.
+    One full face pass per hop, regardless of selection size: the slope should be exactly 8.
 
     meshlib's ``expand`` takes the hop count itself and dilates a ``VertBitSet`` over the *same*
     vertex neighbourhood, agreeing element for element (``tests/test_selection.py``), so unlike the
@@ -152,10 +152,7 @@ def test_expand_vertex_mask(bench_case: BenchCase, hops: int) -> None:
         return
     if bench_case.kind == "triwarp":
         faces, mask = bench_case.faces_wp, _seed_mask(bench_case)
-        edges = _unique_edges(bench_case)
-        grown = bench_case.run(
-            lambda: tw.selection.expand_vertex_mask(faces, mask, hops, unique_edges=edges)
-        )
+        grown = bench_case.run(lambda: tw.selection.expand_vertex_mask(faces, mask, hops))
         assert grown.shape == mask.shape
     else:  # one Dilate Selection call per hop, on the face set
         meshset_pml = _seeded_meshset_pml(bench_case)
@@ -207,14 +204,9 @@ def test_shrink_vertex_mask(bench_case: BenchCase, hops: int) -> None:
         return
     if bench_case.kind == "triwarp":
         faces = bench_case.faces_wp
-        edges = _unique_edges(bench_case)
         # Grow first so there is something left to erode after 8 hops.
-        mask = tw.selection.expand_vertex_mask(
-            faces, _seed_mask(bench_case), max(_HOPS), unique_edges=edges
-        )
-        shrunk = bench_case.run(
-            lambda: tw.selection.shrink_vertex_mask(faces, mask, hops, unique_edges=edges)
-        )
+        mask = tw.selection.expand_vertex_mask(faces, _seed_mask(bench_case), max(_HOPS))
+        shrunk = bench_case.run(lambda: tw.selection.shrink_vertex_mask(faces, mask, hops))
         assert shrunk.shape == mask.shape
     else:  # dilate well past the erosion depth first, so there is something left to erode
         meshset_pml = _seeded_meshset_pml(bench_case)

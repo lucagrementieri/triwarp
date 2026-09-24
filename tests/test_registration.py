@@ -1077,6 +1077,61 @@ def test_icp_point_to_plane_robust_outliers(
     assert rms_tukey < rms_none
 
 
+@pytest.mark.parametrize("target", ["cloud", "mesh"])
+@pytest.mark.parametrize("scale", [0.02, 0.05])
+def test_icp_point_to_plane_tukey_converges_from_outside_its_kernel(
+    half_torus: tuple[tm.Trimesh, wp.Mesh], device: str, scale: float, target: str
+) -> None:
+    """
+    Class C (a fit error against the exact answer): Tukey ICP from a start mostly outside ``c``.
+
+    The source is the target under a known rigid motion, so a converged fit maps every source point
+    onto its own target vertex, and Open3D's ``TukeyLoss(k=c)`` at its default convergence criteria
+    lands there too. ``c`` is below most of the starting residuals (asserted), which is the regime
+    an explicit ``robust_scale`` normally puts the fit in: a biweight gives those correspondences
+    zero weight, so ``sum w r^2`` *rises* for several iterations while the pose improves. Stopping
+    on that sum -- what ``icp_point_to_plane`` did -- ended the fit after two iterations, at RMS
+    ``6.9e-2`` / ``5.1e-3`` (cloud / mesh, ``c = 0.02``) and ``2.6e-4`` / ``4.3e-4``
+    (``c = 0.05``), against the ``1e-5`` bound here; the Tukey loss it stops on now falls
+    monotonically and the fit reaches ``4e-7`` to ``1.8e-6``, a 5.5x margin under the bound. The
+    mutation probe is restoring ``weight * r^2`` for Tukey in ``robust_loss``: all four cases fail.
+    """
+    mesh_tm, mesh_wp = half_torus
+    vertices_np, faces_np = _mesh_vertices_faces(mesh_tm)
+    normals_np = np.asarray(mesh_tm.vertex_normals, dtype=np.float32)
+    rotation_np, translation_np = _rigid_transform(0.08, [0.1, 0.5, 0.3], [0.02, -0.01, 0.03])
+    source_np = (vertices_np @ rotation_np.T + translation_np).astype(np.float32)
+    initial_residual = np.abs(((source_np - vertices_np) * normals_np).sum(axis=1))
+    assert (initial_residual >= scale).mean() > 0.5
+
+    device_wp = mesh_wp.device
+    _, transformed_wp, cost_wp = tw.registration.icp_point_to_plane(
+        points_to_warp(source_np, device_wp),
+        points_to_warp(vertices_np, device_wp),
+        wp.array(faces_np, dtype=wp.int32, device=device_wp) if target == "mesh" else None,
+        target_normals=points_to_warp(normals_np, device_wp) if target == "cloud" else None,
+        robust_kernel="tukey",
+        robust_scale=scale,
+    )
+
+    result_o3d = o3d.pipelines.registration.registration_icp(
+        points_to_open3d(source_np),
+        points_to_open3d(vertices_np, normals_np),
+        1e9,
+        np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(
+            o3d.pipelines.registration.TukeyLoss(k=scale)
+        ),
+    )
+    matrix_o3d = np.asarray(result_o3d.transformation)
+    moved_o3d = source_np @ matrix_o3d[:3, :3].T + matrix_o3d[:3, 3]
+
+    assert _rms(moved_o3d, vertices_np) < 1e-5
+    assert _rms(transformed_wp.numpy(), vertices_np) < 1e-5
+    # Converged means every correspondence is back inside the kernel, contributing ~r^2.
+    assert cost_wp < 1e-8
+
+
 def test_icp_point_to_plane_cloud_with_normals(device: str) -> None:
     rng = np.random.default_rng(12)
     target_np = rng.standard_normal((300, 3)).astype(np.float32)
@@ -1099,8 +1154,8 @@ def test_nearest_into_matches_query_nearest(device: str) -> None:
     """
     Triwarp against triwarp: the ICP loop's hoisted nearest search against ``query_nearest``.
 
-    ``icp_point_to_plane`` issues ``query_nearest``'s ``k = 1`` BVH launch itself, into buffers it
-    allocates once, so the two must agree exactly; ``query_nearest`` carries the oracle in
+    Both ICP loops issue ``query_nearest``'s ``k = 1`` BVH launch themselves, into buffers they
+    allocate once, so the two must agree exactly; ``query_nearest`` carries the oracle in
     ``tests/test_neighbors.py``. The queries sit both on and well off the cloud so the deepening
     search takes more than its first radius on some rows.
     """

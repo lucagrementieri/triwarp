@@ -1931,12 +1931,15 @@ def refine_and_smooth_region(
     # Warp rejects a zero-length slice, and subdivision may have added no vertices at all.
     if n > n_vertices_before:
         new_verts[n_vertices_before:].fill_(True)
-    bd_mask = _boundary_verts_mask(vertices, faces)
+    # One edge grouping serves the boundary mask and both regions' topology: the solves move
+    # vertices, never connectivity.
+    edges = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
+    bd_mask = _boundary_verts_mask(n, edges, device)
     free = wp.empty(n, dtype=wp.bool, device=device)
     wp.map(kernel_array.mask_and_not, new_verts, bd_mask, out=free)
 
     # Both solves run over one region of one connectivity, so it is derived once for the pair.
-    region = _region_topology(vertices, faces, free)
+    region = _region_topology(vertices, faces, free, edges)
     if region is not None:
         vertices = _solve_region_fixed_rim(vertices, faces, free, region, 0.0)
         if smooth_boundary:
@@ -1948,14 +1951,16 @@ def refine_and_smooth_region(
         incident = tw.array.indices_to_mask(endpoints, n, device=device)
         incident = tw.selection.expand_vertex_mask(faces, incident, 5)
         incident = tw.selection.shrink_vertex_mask(faces, incident, 2)
-        incident = tw.selection.exclude_fully_selected_components(faces, incident, n)
+        incident = tw.selection.exclude_fully_selected_components(
+            faces, incident, n, unique_edges=edges[0]
+        )
         # A one-byte-per-vertex device reduction is cheap enough here to prefer over a host
         # readback.
         if tw.reduce.any(incident):
             # ``bd_mask`` is still this mesh's: the solves above moved vertices, not connectivity.
             free2 = wp.empty(n, dtype=wp.bool, device=device)
             wp.map(kernel_array.mask_and_not, incident, bd_mask, out=free2)
-            region = _region_topology(vertices, faces, free2)
+            region = _region_topology(vertices, faces, free2, edges)
             if region is not None:
                 vertices = _solve_region_fixed_rim(vertices, faces, free2, region, 0.0)
                 vertices = _solve_region_smooth(vertices, faces, free2, region, edge_weights)
@@ -1964,13 +1969,31 @@ def refine_and_smooth_region(
 
 
 def _boundary_verts_mask(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+    n_vertices: int, edges: tuple[twt.Array2dInt32, wp.array[wp.int32]], device: wp.DeviceLike
 ) -> wp.array[wp.bool]:
-    """Length-``n_vertices`` mask of mesh-boundary vertices."""
-    # A scatter of the boundary edges' endpoints: a mask needs no deduplicated index list, so
-    # ``boundary_vertex_indices``' sort would be paid for nothing.
-    edges = tw.boundary.boundary_edges(vertices, faces)
-    return tw.array.indices_to_mask(edges.flatten(), int(vertices.shape[0]), device=faces.device)
+    """
+    Length-``n_vertices`` mask of mesh-boundary vertices, from an ``edges_unique`` grouping.
+
+    A boundary edge is a unique edge one face uses, so the mask is its endpoints: the use counts
+    are a histogram of the grouping's ``inverse``, and no second edge grouping is built.
+    """
+    unique_edges, inverse = edges
+    counts = wp.zeros(int(unique_edges.shape[0]), dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_scatter.count_occurrences,
+        dim=int(inverse.shape[0]),
+        inputs=[inverse, counts],
+        device=device,
+    )
+    mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_smoothing.mark_single_use_edge_vertices,
+        dim=int(unique_edges.shape[0]),
+        inputs=[counts, unique_edges],
+        outputs=[mask],
+        device=device,
+    )
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -1996,16 +2019,25 @@ class _RegionTopology(NamedTuple):
 
 
 def _region_topology(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], free_mask: wp.array[wp.bool]
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    free_mask: wp.array[wp.bool],
+    edges: tuple[twt.Array2dInt32, wp.array[wp.int32]] | None = None,
 ) -> _RegionTopology | None:
-    """Derive the region both solves share, or ``None`` when there is nothing to solve."""
+    """
+    Derive the region both solves share, or ``None`` when there is nothing to solve.
+
+    ``edges`` is the connectivity's ``edges_unique`` grouping when the caller already has it.
+    """
     n = int(vertices.shape[0])
     if int(faces.shape[0]) == 0 or n == 0:
         return None
     free_map, n_free = tw.array.mask_to_compact_ranks(free_mask)
     if n_free == 0:
         return None
-    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n, validate=False)
+    unique_edges, inverse = (
+        edges if edges is not None else tw.edges.edges_unique(faces, n_vertices=n, validate=False)
+    )
     return _RegionTopology(free_map, n_free, unique_edges, inverse)
 
 

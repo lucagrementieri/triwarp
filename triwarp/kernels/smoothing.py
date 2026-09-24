@@ -559,6 +559,20 @@ def combine_components(x: wp.float64, y: wp.float64, z: wp.float64) -> wp.vec3d:
 
 
 @wp.kernel
+def mark_single_use_edge_vertices(
+    counts: wp.array[wp.int32], unique_edges: wp.array2d[wp.int32], out_mask: wp.array[wp.bool]
+) -> None:
+    # Mark both endpoints of every unique edge used by exactly one face -- a boundary edge, on
+    # ``boundary.boundary_edges``' own definition -- given the per-edge use counts. Two edges
+    # sharing an endpoint write the same ``True``, so the race is benign. ``out_mask`` starts
+    # zeroed.
+    e = wp.int32(wp.tid())
+    if counts[e] == 1:
+        out_mask[unique_edges[e, 0]] = True
+        out_mask[unique_edges[e, 1]] = True
+
+
+@wp.kernel
 def operator_row_abs_sums(
     offsets: wp.array[wp.int32], values: wp.array[wp.float32], out_sums: wp.array[wp.float64]
 ) -> None:

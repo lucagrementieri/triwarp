@@ -34,7 +34,7 @@ PROCRUSTES_ACC_SIZE = 26
 # Point-to-plane accumulator's two scalars, in one buffer for the same reason the moments above
 # share one: ``icp_point_to_plane`` reads both back every iteration, ``accumulate_point_to_plane``
 # writes both, and one buffer is one host sync instead of two.
-ICP_COST = wp.constant(0)  # sum w r^2
+ICP_COST = wp.constant(0)  # sum robust_loss(r); see ``robust_loss``
 ICP_WEIGHT_SUM = wp.constant(1)  # sum w
 ICP_SCALAR_ACC_SIZE = 2
 
@@ -485,6 +485,38 @@ def robust_weight(residual: wp.float32, scale: wp.float32, kind: wp.int32) -> wp
 
 
 @wp.func
+def robust_loss(
+    residual: wp.float32, weight: wp.float32, scale: wp.float32, kind: wp.int32
+) -> wp.float32:
+    """
+    One residual's term of the objective ``icp_point_to_plane`` reports and stops on.
+
+    ``weight * residual^2`` for no kernel and for Huber, where it grows with ``|residual|`` like
+    the loss itself, and twice the Tukey biweight loss ``rho`` for Tukey:
+    ``c^2 / 3 * (1 - (1 - u^2)^3)`` with ``u = |r| / c``, saturating at ``c^2 / 3`` once
+    ``|r| >= c``. The factor two makes every kind read ``r^2`` for a small residual.
+
+    **Tukey cannot use ``weight * residual^2``**, because the biweight redescends: a residual beyond
+    ``c`` carries zero weight, so its term is zero, and as the fit pulls it inside the kernel the
+    term *rises*. Registering from a start whose residuals mostly exceed ``c`` -- an explicit
+    ``robust_scale`` below the initial misalignment, which is the normal way to pass one -- makes
+    that sum climb for several iterations while the pose improves, and a decrease test reads the
+    first climb as convergence. ``rho`` is nondecreasing in ``|r|`` and saturates rather than
+    vanishing, so it falls as the fit improves. Measured on a 5-degree start with ``c`` at 1 % of
+    the bounding-box diagonal: the weighted sum rose for five iterations and the loop stopped after
+    two, 4.8 degrees from the answer; the loss falls monotonically and the loop runs to it.
+
+    None and Huber keep ``weight * residual^2`` bit for bit -- the same product in the same order
+    ``point_to_plane_tile`` always accumulated -- since neither redescends.
+    """
+    if kind == wp.int32(2) and scale > wp.float32(0.0):
+        u = wp.min(wp.abs(residual) / scale, wp.float32(1.0))
+        t = wp.float32(1.0) - u * u
+        return scale * scale / wp.float32(3.0) * (wp.float32(1.0) - t * t * t)
+    return weight * residual * residual
+
+
+@wp.func
 def point_to_plane_tile(
     source: wp.array[wp.vec3],
     target: wp.array[wp.vec3],
@@ -537,7 +569,7 @@ def point_to_plane_tile(
         j = wp.spatial_vector(wp.cross(x, nrm), nrm)
         jtj += w * wp.outer(j, j)
         jtr += (w * r) * j
-        cost += w * r * r
+        cost += robust_loss(r, w, robust_scale, robust_kind)
         weight_sum += w
     return jtj, jtr, cost, weight_sum
 
