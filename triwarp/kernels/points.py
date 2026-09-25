@@ -10,7 +10,13 @@ from triwarp.kernels.array import (
     unpack_ranked_index,
 )
 from triwarp.kernels.predicates import point_plane_dot, triangle_normal
-from triwarp.kernels.reduce import block_chunk_1d, outer_sum_chunk
+from triwarp.kernels.reduce import (
+    block_chunk_1d,
+    block_max,
+    block_sum,
+    commit_sum_and_count,
+    outer_sum_chunk,
+)
 
 
 @wp.func
@@ -63,12 +69,9 @@ def accumulate_counted_mean(
             counted = counted + wp.float64(1.0)
             total = total + wp.float64(mean_distance[offset + k])
 
-    # Block-collective, so both run outside the ``lane == 0`` guard.
-    counted_sum = wp.tile_sum(wp.tile(counted))[0]
-    total_sum = wp.tile_sum(wp.tile(total))[0]
-    if lane == 0:
-        wp.atomic_add(out_totals, 0, counted_sum)
-        wp.atomic_add(out_totals, 1, total_sum)
+    # ``reduce.commit_sum_and_count``'s two-slot commit, with the count in the *sum* slot: this
+    # buffer's order is ``(count, total)``.
+    commit_sum_and_count(lane, counted, total, out_totals)
 
 
 @wp.kernel
@@ -107,13 +110,8 @@ def centered_covariance(
 
     m = outer_sum_chunk(points, center[0], offset, remaining, lane, wp.block_dim())
 
-    # Block-collective, so all nine run outside the ``lane == 0`` guard. The default constructor,
-    # not an explicit zero-fill: every one of the nine entries is unconditionally overwritten by
-    # the loop below before ``total`` is ever read.
-    total = wp.mat33()
-    for r in range(3):
-        for c in range(3):
-            total[r, c] = wp.tile_sum(wp.tile(m[r, c]))[0]
+    # Block-collective, so it runs outside the ``lane == 0`` guard.
+    total = block_sum(m)
 
     if lane == 0:
         wp.atomic_add(out_cov, 0, total)
@@ -449,7 +447,7 @@ def farthest_point_sample_block(
             distance_sq = wp.min(min_distance_sq[i], wp.length_sq(points[i] - chosen))
             min_distance_sq[i] = distance_sq
             best = wp.max(best, pack_farthest_key(distance_sq, i))
-        chosen_index = unpack_ranked_index(wp.tile_max(wp.tile(best))[0])
+        chosen_index = unpack_ranked_index(block_max(best))
         if t == 0:
             out_selected[step] = chosen_index
 

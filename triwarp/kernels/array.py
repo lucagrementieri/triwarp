@@ -266,27 +266,6 @@ def update_argmin_pair(
 
 
 @wp.func
-def tile_argmin(value: wp.Float, index: wp.int32) -> tuple[wp.Float, wp.int32]:
-    # The block-cooperative counterpart of ``update_argmin``: given one candidate per lane, the
-    # smallest value over the block and the **lowest index among the lanes attaining it**. Every
-    # lane holds the same pair afterwards, so any lane may store it.
-    #
-    # The two-stage form is what makes the winner independent of *which* lane saw it, and that is
-    # the whole reason this is one function rather than three: a block reduction hands back a value
-    # and not the lane that held it, so recovering the index is a second reduction with a tie-break
-    # -- a *decision rule*, which diverges silently where duplicated arithmetic only reads badly.
-    # Three sites need it: the hole-filling DP's apex choice, ball pivoting's pivot search and
-    # ``proximity``'s straggler faces.
-    #
-    # No ``wp.ref``, so unlike ``update_argmin`` this imposes no ``enable_backward=False`` on its
-    # callers. Correct on the CPU device too, where ``wp.launch_tiled`` runs one lane per block and
-    # both tiles hold that lane's own pair.
-    block_value = wp.tile_min(wp.tile(value))[0]
-    attained = wp.where(value == block_value, index, INT32_MAX_CONSTANT)
-    return block_value, wp.tile_min(wp.tile(attained))[0]
-
-
-@wp.func
 def cross2(a: Any, b: Any) -> wp.Float:
     # 2D cross product (signed parallelogram area). Generic so float32 and float64 call sites share
     # one definition.

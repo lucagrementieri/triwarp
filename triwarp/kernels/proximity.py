@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, TOLERANCE_MERGE_CONSTANT, TWO_PI
 from triwarp.kernels import triangles as kernel_triangles
-from triwarp.kernels.array import lift_vec2, tile_argmin
+from triwarp.kernels.array import lift_vec2
 from triwarp.kernels.neighbors import (
     MAX_SEARCH_ATTEMPTS,
     attempt_radius,
@@ -16,6 +16,7 @@ from triwarp.kernels.predicates import (
     triangle_aabb,
     triangle_triangle_distance_sq,
 )
+from triwarp.kernels.reduce import block_argmin
 
 # ``face_to_mesh_distance`` / ``_tiled`` publish each thread's own best distance into
 # ``global_best_sq`` so other threads can prune against it (see the wrapper's seeding comment for
@@ -405,9 +406,9 @@ def face_to_mesh_distance_tiled(
                 global_best_sq,
             )
     # The witness must not depend on which lane happened to see it, which is what
-    # ``tile_argmin``'s second stage is for. When no lane found a candidate every lane still holds
+    # ``block_argmin``'s second stage is for. When no lane found a candidate every lane still holds
     # ``(inf, -1)``, so it returns -1 and no fixup is needed here.
-    block_best, block_witness = tile_argmin(best, witness)
+    block_best, block_witness = block_argmin(best, witness)
     # **``<``, not an overwrite, and that is a correctness fix rather than a tidy-up.** What the
     # grid pass left in ``out_distance_sq[f]`` is a *partial* answer -- the best over its first
     # ``candidate_cap`` candidates -- but it is a real distance between two real triangles, so the

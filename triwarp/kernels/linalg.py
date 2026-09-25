@@ -31,6 +31,8 @@ import warp as wp
 # ``kernels/reduce.py`` reaches into ``warp._src`` on the same terms.
 from warp._src.fem.linalg import householder_qr_decomposition, solve_triangular
 
+from triwarp.kernels.array import OverloadTable, inverse_or_one
+
 
 @wp.func
 def solve_normal_equations(matrix: Any, rhs: Any) -> tuple[Any, wp.bool]:
@@ -204,6 +206,36 @@ def interior_system_csr(
             slot += 1
 
 
+@wp.func
+def csr_row_diagonal(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.Float],
+    i: wp.int32,
+) -> tuple[wp.Float, wp.Float]:
+    # Row ``i`` of a CSR operator split into its diagonal entry (0 where the row has none) and
+    # ``sum_{j != i} |A_ij|``: what a Jacobi scaling and a Gershgorin disc both read off a row, so a
+    # launch that wants both walks the row once.
+    diagonal = values.dtype(0.0)
+    off_sum = values.dtype(0.0)
+    for e in range(offsets[i], offsets[i + 1]):
+        if columns[e] == i:
+            diagonal += values[e]
+        else:
+            off_sum += wp.abs(values[e])
+    return diagonal, off_sum
+
+
+@wp.func
+def dominance_ratio(diagonal: wp.float64, off_sum: wp.float64) -> wp.float64:
+    # A row's Gershgorin ratio ``sum_{j != i} |A_ij| / |A_ii|``, 0 for a zero diagonal -- see
+    # ``offdiagonal_dominance_rows`` for why both halves of that are load-bearing.
+    magnitude = wp.abs(diagonal)
+    if magnitude == wp.float64(0.0):
+        return wp.float64(0.0)
+    return off_sum / magnitude
+
+
 @wp.kernel
 def offdiagonal_dominance_rows(
     offsets: wp.array[wp.int32],
@@ -227,20 +259,41 @@ def offdiagonal_dominance_rows(
     # that reads like a well-conditioned operator and silently declines the gate. Caught on
     # ``min_quad_with_fixed`` driven with a raw ``cotmatrix``.
     i = wp.int32(wp.tid())
-    start = offsets[i]
-    end = offsets[i + 1]
-    diagonal = wp.float64(0.0)
-    off_sum = wp.float64(0.0)
-    for e in range(start, end):
-        if columns[e] == i:
-            diagonal += values[e]
-        else:
-            off_sum += wp.abs(values[e])
-    magnitude = wp.abs(diagonal)
-    if magnitude == wp.float64(0.0):
-        out_ratio[i] = wp.float64(0.0)
-        return
-    out_ratio[i] = off_sum / magnitude
+    diagonal, off_sum = csr_row_diagonal(offsets, columns, values, i)
+    out_ratio[i] = dominance_ratio(diagonal, off_sum)
+
+
+@wp.kernel
+def jacobi_dominance_rows(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    out_inverse_diagonal: wp.array[wp.float64],
+    out_ratio: wp.array[wp.float64],
+) -> None:
+    # ``offdiagonal_dominance_rows`` and the Jacobi inverse diagonal (``array.inverse_or_one``) from
+    # one walk of each row: the Jacobi-Chebyshev preconditioner wants the scaling and the
+    # Gershgorin interval of one operator, which ``wps.bsr_get_diag``, a map and a second row walk
+    # otherwise took three launches and a buffer to produce.
+    i = wp.int32(wp.tid())
+    diagonal, off_sum = csr_row_diagonal(offsets, columns, values, i)
+    out_inverse_diagonal[i] = inverse_or_one(diagonal)
+    out_ratio[i] = dominance_ratio(diagonal, off_sum)
+
+
+@wp.kernel
+def jacobi_inverse_diagonal(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.Float],
+    out_inverse_diagonal: wp.array[wp.Float],
+) -> None:
+    # The Jacobi inverse diagonal of a scalar CSR operator in one launch, where
+    # ``wps.bsr_get_diag`` followed by a ``wp.map`` of ``array.inverse_or_one`` is two and an
+    # intermediate buffer. The row's off-diagonal sum is dead code here and compiles away.
+    i = wp.int32(wp.tid())
+    diagonal, _off_sum = csr_row_diagonal(offsets, columns, values, i)
+    out_inverse_diagonal[i] = inverse_or_one(diagonal)
 
 
 @wp.kernel
@@ -292,3 +345,18 @@ def expand_block_csr_2x2(
                 out_values[row_start + 2 * e + b] = block[a, b]
     if i == offsets.shape[0] - 2:
         out_offsets[2 * i + 2] = 4 * offsets[i + 1]
+
+
+def _register_overloads() -> None:
+    """Instantiate ``jacobi_inverse_diagonal`` at the precisions ``_BatchedCg`` solves in."""
+    global JACOBI_INVERSE_DIAGONAL
+    JACOBI_INVERSE_DIAGONAL = OverloadTable(
+        jacobi_inverse_diagonal,
+        {
+            d: [wp.array[wp.int32], wp.array[wp.int32], wp.array[d], wp.array[d]]
+            for d in (wp.float32, wp.float64)
+        },
+    )
+
+
+_register_overloads()

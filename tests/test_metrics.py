@@ -1111,3 +1111,68 @@ def test_point_triangle_sq_dist_grad_is_finite_on_degenerate_faces(
             backward = (base - value(minus_np)) / step
             low, high = min(forward, backward), max(forward, backward)
             assert low - 2e-3 <= gradient_np[vertex, axis] <= high + 2e-3
+
+
+def _sliced_term_gradients(device: str, term: str, n_slices: int) -> tuple[float, list[np.ndarray]]:
+    """Loss and input gradients of one sliced chamfer term, launched at ``n_slices`` threads."""
+    rng = np.random.default_rng(31)
+    points_np = rng.normal(size=(5, 3)).astype(np.float32)
+    targets_np = rng.normal(size=(12, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device, requires_grad=True)
+    targets_wp = wp.array(targets_np, dtype=wp.vec3, device=device, requires_grad=True)
+    loss_wp = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+        if term == "nn":
+            nearest_wp = wp.array(
+                _nn_indices_np(points_np, targets_np).astype(np.int32), device=device
+            )
+            wp.launch(
+                kernel_metrics.chamfer_nn_term_sliced,
+                dim=n_slices,
+                inputs=[points_wp, targets_wp, nearest_wp, wp.float32(0.5), n_slices],
+                outputs=[loss_wp],
+                device=device,
+            )
+        else:
+            faces_wp = wp.array(np.arange(12, dtype=np.int32), device=device)
+            face_id_wp = wp.array(np.array([0, 1, 2, 3, -1], dtype=np.int32), device=device)
+            wp.launch(
+                kernel_metrics.chamfer_surface_term_sliced,
+                dim=n_slices,
+                inputs=[points_wp, targets_wp, faces_wp, face_id_wp, wp.float32(0.5), n_slices],
+                outputs=[loss_wp],
+                device=device,
+            )
+    tape.backward(loss=loss_wp)
+    assert points_wp.grad is not None
+    assert targets_wp.grad is not None
+    return float(loss_wp.numpy()[0]), [points_wp.grad.numpy(), targets_wp.grad.numpy()]
+
+
+@pytest.mark.parametrize("term", ["nn", "surface"])
+def test_sliced_chamfer_terms_grad_with_more_slices_than_points(device: str, term: str) -> None:
+    """
+    Triwarp against triwarp: a sliced term launched with empty slices against one serial slice.
+
+    Five points over 45 slices leaves 40 threads with no element. Warp's backward pass reverses a
+    dynamic ``range`` through ``iter_reverse``, which turns such an empty range into one iteration
+    at its start, past the end of the points -- so without the kernels' empty-slice guard those
+    threads read out of bounds and added a gradient (11x the true one on the nn term). The single
+    slice has no empty thread and is the reference; the nn term's is also checked against its
+    closed form, which is what shows the reference itself is right. ``slice_count`` never launches
+    more slices than points, so no public call reaches this -- the guard is for any other caller.
+    """
+    loss_serial, grads_serial = _sliced_term_gradients(device, term, 1)
+    loss_wide, grads_wide = _sliced_term_gradients(device, term, 45)
+    assert loss_wide == pytest.approx(loss_serial, rel=1e-6)
+    for wide, serial in zip(grads_wide, grads_serial, strict=True):
+        assert np.abs(serial).max() > 0.0
+        np.testing.assert_allclose(wide, serial, rtol=1e-5, atol=1e-6)
+    if term == "nn":
+        rng = np.random.default_rng(31)
+        points_np = rng.normal(size=(5, 3)).astype(np.float64)
+        targets_np = rng.normal(size=(12, 3)).astype(np.float64)
+        nearest = _nn_indices_np(points_np, targets_np)
+        grad_points_np = points_np - targets_np[nearest]
+        np.testing.assert_allclose(grads_serial[0], grad_points_np, rtol=1e-5, atol=1e-5)

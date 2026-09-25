@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
-from triwarp.kernels.reduce import tile_chunk
+from triwarp.kernels.reduce import block_sum, tile_chunk
 from triwarp.kernels.triangles import face_area_weighted_centroid, face_vertices_vec3d
 
 
@@ -49,15 +49,10 @@ def centroid_tiled(
     area = wp.float32(0.0)
     if f < n_faces:
         contrib, area = face_area_weighted_centroid(vertices, faces, f)
-    sum_x = wp.tile_sum(wp.tile(contrib[0]))
-    sum_y = wp.tile_sum(wp.tile(contrib[1]))
-    sum_z = wp.tile_sum(wp.tile(contrib[2]))
-    area_sum = wp.tile_sum(wp.tile(area))
+    block = block_sum(wp.vec4(contrib[0], contrib[1], contrib[2], area))
     if t == 0:
-        wp.tile_atomic_add(out_totals, sum_x, (0,))
-        wp.tile_atomic_add(out_totals, sum_y, (1,))
-        wp.tile_atomic_add(out_totals, sum_z, (2,))
-        wp.tile_atomic_add(out_totals, area_sum, (3,))
+        for slot in range(4):
+            wp.atomic_add(out_totals, slot, block[slot])
 
 
 @wp.kernel
@@ -178,13 +173,15 @@ def moment_integrals(
             + c[1] * b[2],
         ) / wp.float64(120.0)
 
-    # Block-collective, so all ten run outside the ``lane == 0`` guard.
-    totals = wp.vector(length=10, dtype=wp.float64)
-    totals[0] = wp.tile_sum(wp.tile(volume))[0]
+    # All ten integrals in one block reduction, which is block-collective and so runs outside the
+    # ``lane == 0`` guard.
+    local = wp.vector(length=10, dtype=wp.float64)
+    local[0] = volume
     for j in range(3):
-        totals[1 + j] = wp.tile_sum(wp.tile(first[j]))[0]
-        totals[4 + j] = wp.tile_sum(wp.tile(squares[j]))[0]
-        totals[7 + j] = wp.tile_sum(wp.tile(products[j]))[0]
+        local[1 + j] = first[j]
+        local[4 + j] = squares[j]
+        local[7 + j] = products[j]
+    totals = block_sum(local)
 
     if lane == 0:
         for j in range(10):

@@ -17,6 +17,7 @@ reductions differ only by the ``scale`` passed from Python scope. Following the
 import warp as wp
 
 from triwarp.constants import TILE_1D
+from triwarp.kernels.reduce import block_sum
 from triwarp.kernels.triangles import face_vertices
 
 # Relative coplanarity tolerance for the triangle-interior test, matching
@@ -120,9 +121,9 @@ def chamfer_nn_term_tiled(
     if idx < x.shape[0]:
         diff = x[idx] - y[nearest[idx]]
         contrib = scale * wp.length_sq(diff)
-    total = wp.tile_sum(wp.tile(contrib))
+    total = block_sum(contrib)
     if t == 0:
-        wp.tile_atomic_add(out_loss, total, (0,))
+        wp.atomic_add(out_loss, 0, total)
 
 
 @wp.kernel
@@ -143,8 +144,17 @@ def chamfer_nn_term_sliced(
     correct on the CPU device where
     [`chamfer_nn_term_tiled`][triwarp.kernels.metrics.chamfer_nn_term_tiled] is not; it gives up
     the block shuffle-reduce and is measurably slower on CUDA, which is why both exist.
+
+    A slice that owns no element returns before its loop. On Warp 1.17 the backward pass of a
+    dynamic ``range(start, end, step)`` walks ``iter_reverse`` of it, which for an *empty* range
+    whose ``end - start - 1`` truncates to zero against ``step`` is not empty but one iteration at
+    ``start`` -- past the end of ``x`` -- so an empty slice read ``x`` and ``nearest`` out of bounds
+    and scattered a gradient through them. ``slice_count`` never launches more slices than points,
+    so no public call reached it; the guard makes the kernel safe under any slice count.
     """
     j = wp.int32(wp.tid())
+    if j >= x.shape[0]:
+        return
     total = wp.float32(0.0)
     for idx in range(j, x.shape[0], n_slices):
         diff = x[idx] - y[nearest[idx]]
@@ -178,9 +188,9 @@ def chamfer_surface_term_tiled(
         if f >= 0:
             a, b, c = face_vertices(vertices, faces, f)
             contrib = scale * point_triangle_sq_dist(points[idx], a, b, c)
-    total = wp.tile_sum(wp.tile(contrib))
+    total = block_sum(contrib)
     if t == 0:
-        wp.tile_atomic_add(out_loss, total, (0,))
+        wp.atomic_add(out_loss, 0, total)
 
 
 @wp.kernel
@@ -201,9 +211,11 @@ def chamfer_surface_term_sliced(
     with ``face_id[i] < 0`` (no face within the search radius) contribute nothing. Same lane-free
     sliced reduction as
     [`chamfer_nn_term_sliced`][triwarp.kernels.metrics.chamfer_nn_term_sliced], for the same
-    reason.
+    reason, and guarding an empty slice for the same reason too.
     """
     j = wp.int32(wp.tid())
+    if j >= points.shape[0]:
+        return
     total = wp.float32(0.0)
     for idx in range(j, points.shape[0], n_slices):
         f = face_id[idx]

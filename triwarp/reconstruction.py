@@ -723,16 +723,17 @@ def _poisson_solve_level(
         device=device,
     )
     rhs = wp.empty(n_nodes, dtype=wp.float32, device=device)
-    inv_diag = wp.empty(n_nodes, dtype=wp.float32, device=device)
+    smoother = wp.empty(n_nodes, dtype=wp.float32, device=device)
     wp.launch(
         kernel_reconstruction.poisson_level_setup,
         dim=(res, res, res),
-        inputs=[vx, vy, vz, weights, wp.float32(screen), res, rhs, inv_diag],
+        inputs=[vx, vy, vz, weights, wp.float32(screen), res, wp.float32(_MG_OMEGA)],
+        outputs=[rhs, smoother],
         device=device,
     )
 
     _solve_screened_poisson(
-        weights, screen, res, rhs, inv_diag, initial, solver_iterations, solver_tolerance, device
+        weights, screen, res, rhs, smoother, initial, solver_iterations, solver_tolerance, device
     )
     return initial
 
@@ -742,7 +743,7 @@ def _solve_screened_poisson(
     screen: float,
     res: int,
     rhs: wp.array[wp.float32],
-    inv_diag: wp.array[wp.float32],
+    smoother: wp.array[wp.float32],
     solution: wp.array[wp.float32],
     maxiter: int,
     tol: float,
@@ -764,14 +765,13 @@ def _solve_screened_poisson(
     tile = int(kernel_cg.CG_TILE)
     span, blocks, fold = kernel_cg.cg_layout(n, tw.linalg.CG_FOLD_MAX_BLOCKS)
     stride = blocks * span
-    pitch = ((blocks + tile - 1) // tile) * tile
     r = wp.empty(stride, dtype=wp.float32, device=device)
     u = wp.empty(stride, dtype=wp.float32, device=device)
     w = wp.empty(stride, dtype=wp.float32, device=device)
     p = wp.empty(stride, dtype=wp.float32, device=device)
     s = wp.empty(stride, dtype=wp.float32, device=device)
-    # Zeroed: the fold's last tile reads past ``blocks``.
-    partials = wp.zeros((3, 1, pitch), dtype=wp.float64, device=device)
+    # Every entry a fold reads, ``[0, blocks)``, is written by the partials launch before it.
+    partials = wp.empty((3, 1, blocks), dtype=wp.float64, device=device)
     coefficients = wp.empty((3, 1), dtype=wp.float64, device=device)
     dots = wp.empty((2, 1), dtype=wp.float64, device=device)
     scalars = wp.empty((5, 1), dtype=wp.float64, device=device)
@@ -781,12 +781,16 @@ def _solve_screened_poisson(
     iterations = wp.empty(1, dtype=wp.int32, device=device)
     state = wp.empty(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
     screen_f = wp.float32(screen)
-    multigrid = _PoissonMultigrid(weights, screen, res, inv_diag, device)
+    multigrid = _PoissonMultigrid(weights, screen, res, smoother, device)
+    # The V-cycle's first pre-smoothing sweep is pointwise, so the launches that produce the
+    # residual write it too -- this one and every round's ``cg_update``, whose Jacobi apply with
+    # ``smoother`` as the scaling is that sweep exactly.
+    start = multigrid.start
     wp.launch_tiled(
         kernel_reconstruction.poisson_cg_initial,
         dim=(blocks,),
-        inputs=[n, span, res, weights, screen_f, rhs, solution, inv_diag],
-        outputs=[r, u, p, s, partials],
+        inputs=[n, span, res, weights, screen_f, rhs, solution, smoother],
+        outputs=[r, u, p, s, start, partials],
         block_dim=tile,
         device=device,
     )
@@ -830,14 +834,15 @@ def _solve_screened_poisson(
                 maxiter,
                 1 if fold else 0,
                 blocks,
-                # No Jacobi apply: the V-cycle writes ``u`` after the update.
-                0,
+                # The "Jacobi apply" at ``smoother`` is the V-cycle's zero-start sweep, into its
+                # start vector; the V-cycle writes ``u`` after the update.
+                1,
                 partials,
                 coefficients,
                 gamma_old,
                 alpha_old,
                 atol_sq,
-                inv_diag,
+                smoother,
                 w,
                 p,
                 s,
@@ -845,7 +850,7 @@ def _solve_screened_poisson(
                 u,
                 state,
             ],
-            outputs=[solution, u, gamma_new, alpha_new, dots, iterations],
+            outputs=[solution, start, gamma_new, alpha_new, dots, iterations],
             block_dim=tile,
             device=device,
         )
@@ -873,21 +878,27 @@ def _solve_screened_poisson(
 # to three nodes a side makes the coarsest level 27 unknowns, which four sweeps all but solve.
 _MG_SWEEPS = 1
 _MG_OMEGA = 6.0 / 7.0
+# At least two: the coarsest level's first sweep is the zero-start one its restriction writes.
 _MG_COARSE_SWEEPS = 4
 _MG_COARSEST = 3
 
 
 class _GridLevel(NamedTuple):
-    """One level of ``_PoissonMultigrid``: its grid, operator and working vectors."""
+    """
+    One level of ``_PoissonMultigrid``: its grid, operator and working vectors.
+
+    ``b`` and ``x`` are ``None`` on the finest level, whose right-hand side and result are the
+    caller's vectors.
+    """
 
     res: int
     lap: wp.float32
     weights: wp.array[wp.float32]
-    inv_diag: wp.array[wp.float32]
-    b: wp.array[wp.float32]
-    x: wp.array[wp.float32]
-    tmp_a: wp.array[wp.float32]
-    tmp_b: wp.array[wp.float32]
+    smoother: wp.array[wp.float32]
+    b: wp.array[wp.float32] | None
+    x: wp.array[wp.float32] | None
+    start: wp.array[wp.float32]
+    tmp: wp.array[wp.float32]
     residual: wp.array[wp.float32]
 
 
@@ -899,9 +910,15 @@ class _PoissonMultigrid:
     operator ``2 ** l * L_l + screen * W_l`` (see the V-cycle note in ``kernels/reconstruction``),
     ``_MG_SWEEPS`` damped-Jacobi sweeps at ``_MG_OMEGA`` before and after each coarse-grid
     correction and ``_MG_COARSE_SWEEPS`` on the coarsest level. Every level is ``float32`` and
-    matrix-free. A cycle is five launches a level, and it keeps the iteration count near a dozen
-    whatever the resolution, where Jacobi's grows with it -- to the point that a 100-iteration cap
-    left the finer levels two orders of magnitude short of their tolerance.
+    matrix-free. It keeps the iteration count near a dozen whatever the resolution, where Jacobi's
+    grows with it -- to the point that a 100-iteration cap left the finer levels two orders of
+    magnitude short of their tolerance.
+
+    Every level's cycle starts from a zero guess, where the first sweep ``omega D^-1 b`` reads no
+    neighbour, so it is not a launch of its own: the launch that writes a level's right-hand side
+    writes that sweep into the level's ``start`` too (``poisson_mg_restrict`` on the coarse levels;
+    on the finest, the caller -- the conjugate gradient's initial-residual and update kernels --
+    into ``start`` before each ``apply``). A cycle is then four launches a level.
     """
 
     def __init__(
@@ -909,122 +926,121 @@ class _PoissonMultigrid:
         weights: wp.array[wp.float32],
         screen: float,
         res: int,
-        inv_diag: wp.array[wp.float32],
+        smoother: wp.array[wp.float32],
         device: wp.DeviceLike,
     ) -> None:
         self._device = device
         self._screen = wp.float32(screen)
-        self._omega = wp.float32(_MG_OMEGA)
-        # Level 0's ``b`` and ``x`` go unused: the caller's vectors are handed to ``apply``.
         self._levels: list[_GridLevel] = []
         lap = 1.0
-        w, inv = weights, inv_diag
+        w, smooth = weights, smoother
+        finest = True
         while True:
-            vectors = [wp.empty(res**3, dtype=wp.float32, device=device) for _ in range(5)]
-            self._levels.append(_GridLevel(res, wp.float32(lap), w, inv, *vectors))
+            n = res**3
+            owned = 3 if finest else 5
+            vectors = [wp.empty(n, dtype=wp.float32, device=device) for _ in range(owned)]
+            b, x = (None, None) if finest else (vectors.pop(), vectors.pop())
+            self._levels.append(_GridLevel(res, wp.float32(lap), w, smooth, b, x, *vectors))
+            finest = False
             if res <= _MG_COARSEST:
                 break
             res_c = (res - 1) // 2 + 1
-            w_c = wp.empty(res_c**3, dtype=wp.float32, device=device)
-            wp.launch(
-                kernel_reconstruction.poisson_mg_restrict,
-                dim=(res_c, res_c, res_c),
-                inputs=[w, res, res_c],
-                outputs=[w_c],
-                device=device,
-            )
             lap *= 2.0
-            inv_c = wp.empty(res_c**3, dtype=wp.float32, device=device)
+            w_c = wp.empty(res_c**3, dtype=wp.float32, device=device)
+            smooth_c = wp.empty(res_c**3, dtype=wp.float32, device=device)
             wp.launch(
-                kernel_reconstruction.poisson_mg_inverse_diagonal,
+                kernel_reconstruction.poisson_mg_coarsen,
                 dim=(res_c, res_c, res_c),
-                inputs=[res_c, wp.float32(lap), w_c, self._screen],
-                outputs=[inv_c],
+                inputs=[w, res, res_c, wp.float32(lap), self._screen, wp.float32(_MG_OMEGA)],
+                outputs=[w_c, smooth_c],
                 device=device,
             )
-            res, w, inv = res_c, w_c, inv_c
+            res, w, smooth = res_c, w_c, smooth_c
+
+    @property
+    def start(self) -> wp.array[wp.float32]:
+        """The finest level's zero-start sweep ``omega D^-1 b``, which ``apply``'s caller writes."""
+        return self._levels[0].start
 
     def _smooth(
         self,
         level: _GridLevel,
-        zero: bool,
         b: wp.array[wp.float32],
-        x: wp.array[wp.float32] | None,
+        x: wp.array[wp.float32],
         out: wp.array[wp.float32],
     ) -> None:
-        """One damped-Jacobi sweep at ``level``, from zero when ``zero``."""
+        """One damped-Jacobi sweep at ``level`` from ``x`` into ``out``."""
         res = level.res
         wp.launch(
             kernel_reconstruction.poisson_mg_smooth,
             dim=(res, res, res),
-            inputs=[
-                res,
-                level.lap,
-                level.weights,
-                self._screen,
-                self._omega,
-                1 if zero else 0,
-                level.inv_diag,
-                b,
-                x,
-            ],
+            inputs=[res, level.lap, level.weights, self._screen, level.smoother, b, x],
             outputs=[out],
             device=self._device,
         )
 
+    def _sweeps(
+        self,
+        level: _GridLevel,
+        b: wp.array[wp.float32],
+        x: wp.array[wp.float32],
+        count: int,
+        out: wp.array[wp.float32],
+    ) -> None:
+        """``count >= 1`` sweeps from ``x``, alternating with ``level.tmp``, the last in ``out``."""
+        cur = x
+        for sweep in range(count):
+            target = out if (count - 1 - sweep) % 2 == 0 else level.tmp
+            self._smooth(level, b, cur, target)
+            cur = target
+
     def _cycle(self, index: int, b: wp.array[wp.float32], out: wp.array[wp.float32]) -> None:
-        """``out = V_index(b)``: the V-cycle from ``index`` down, from a zero guess."""
+        """``out = V_index(b)`` from a zero guess, whose first sweep is already in ``start``."""
         level = self._levels[index]
-        res, lap, w = level.res, level.lap, level.weights
-        tmp_a, tmp_b, resid = level.tmp_a, level.tmp_b, level.residual
+        res = level.res
         if index == len(self._levels) - 1:
-            sweeps = _MG_COARSE_SWEEPS
-            cur = out if sweeps == 1 else tmp_a
-            self._smooth(level, True, b, None, cur)
-            for sweep in range(1, sweeps):
-                target = out if sweep == sweeps - 1 else (tmp_b if cur is tmp_a else tmp_a)
-                self._smooth(level, False, b, cur, target)
-                cur = target
+            self._sweeps(level, b, level.start, _MG_COARSE_SWEEPS - 1, out)
             return
-        # Pre-smoothing from zero, ``_MG_SWEEPS`` sweeps, ending in ``tmp_a``.
-        self._smooth(level, True, b, None, tmp_a)
-        cur = tmp_a
-        for _ in range(1, _MG_SWEEPS):
-            nxt = tmp_b if cur is tmp_a else tmp_a
-            self._smooth(level, False, b, cur, nxt)
+        # The pre-smoothing's remaining sweeps, ping-ponging between ``tmp`` and ``out`` (neither is
+        # read before the post-smoothing writes it).
+        cur = level.start
+        for sweep in range(1, _MG_SWEEPS):
+            nxt = level.tmp if sweep % 2 == 1 else out
+            self._smooth(level, b, cur, nxt)
             cur = nxt
         wp.launch(
             kernel_reconstruction.poisson_mg_residual,
             dim=(res, res, res),
-            inputs=[res, lap, w, self._screen, b, cur],
-            outputs=[resid],
+            inputs=[res, level.lap, level.weights, self._screen, b, cur],
+            outputs=[level.residual],
             device=self._device,
         )
         coarse = self._levels[index + 1]
+        assert coarse.b is not None
+        assert coarse.x is not None
         res_c = coarse.res
         wp.launch(
             kernel_reconstruction.poisson_mg_restrict,
             dim=(res_c, res_c, res_c),
-            inputs=[resid, res, res_c],
-            outputs=[coarse.b],
+            inputs=[level.residual, res, res_c, coarse.smoother],
+            outputs=[coarse.b, coarse.start],
             device=self._device,
         )
         self._cycle(index + 1, coarse.b, coarse.x)
+        # Corrected into whichever of ``tmp`` / ``out`` lets the post-smoothing's alternation end in
+        # ``out``; in place when ``cur`` is already that vector, which the kernel allows.
+        corrected = level.tmp if _MG_SWEEPS % 2 == 1 else out
         wp.launch(
             kernel_reconstruction.poisson_mg_prolong_add,
             dim=(res, res, res),
             inputs=[coarse.x, res_c, res, cur],
-            outputs=[cur],
+            outputs=[corrected],
             device=self._device,
         )
-        # Post-smoothing, the same count, the last sweep into ``out``.
-        for sweep in range(_MG_SWEEPS):
-            nxt = out if sweep == _MG_SWEEPS - 1 else (tmp_b if cur is tmp_a else tmp_a)
-            self._smooth(level, False, b, cur, nxt)
-            cur = nxt
+        self._sweeps(level, b, corrected, _MG_SWEEPS, out)
 
     def apply(self, source: wp.array[wp.float32], destination: wp.array[wp.float32]) -> None:
-        """``destination = M^-1 source`` by one V-cycle from zero."""
+        """``destination = M^-1 source`` by one V-cycle from zero; ``start`` must hold its sweep."""
         self._cycle(0, source, destination)
 
 

@@ -71,7 +71,7 @@ import warp as wp
 from triwarp.constants import INT32_MAX, TILE_1D
 from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_representative
 from triwarp.kernels.array import LOOP_PROGRESS, LOOP_ROUND
-from triwarp.kernels.reduce import block_chunk_1d, tile_chunk
+from triwarp.kernels.reduce import block_chunk_1d, block_sum, tile_chunk
 
 # One past the largest edge index any proposal can hold, so ``wp.atomic_min`` starts empty. The
 # candidate count is bounded by the unique-edge count, which is well inside int32.
@@ -152,12 +152,11 @@ def count_reached_and_referenced(
         if offsets[v + 1] > offsets[v]:
             referenced = referenced + 1
 
-    # Block-collective, so both run outside the ``lane == 0`` guard.
-    reached_total = wp.tile_sum(wp.tile(reached))[0]
-    referenced_total = wp.tile_sum(wp.tile(referenced))[0]
+    # Block-collective, so it runs outside the ``lane == 0`` guard.
+    totals = block_sum(wp.vec2i(reached, referenced))
     if lane == 0:
-        wp.atomic_add(out_counts, COUNT_REACHED, reached_total)
-        wp.atomic_add(out_counts, COUNT_REFERENCED, referenced_total)
+        wp.atomic_add(out_counts, COUNT_REACHED, totals[0])
+        wp.atomic_add(out_counts, COUNT_REFERENCED, totals[1])
 
 
 @wp.kernel
@@ -212,7 +211,7 @@ def dual_candidate_mask(
             interior = interior + 1
 
     # Block-collective, so it runs outside the ``lane == 0`` guard.
-    interior_total = wp.tile_sum(wp.tile(interior))[0]
+    interior_total = block_sum(interior)
     if lane == 0:
         wp.atomic_add(out_counts, COUNT_INTERIOR_EDGES, interior_total)
 

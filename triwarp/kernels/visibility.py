@@ -2,6 +2,7 @@ import warp as wp
 
 from triwarp.constants import TOLERANCE_PLANAR_CONSTANT
 from triwarp.kernels.proximity import closest_point_query
+from triwarp.kernels.reduce import block_sum
 from triwarp.kernels.tangent_space import any_perpendicular
 
 # Weighting of a ray inside the bundle. Passed as a warp-uniform kernel argument so both schemes
@@ -103,12 +104,9 @@ def obscurance(
             else:
                 total_blocked += weight
 
-    block_weight = wp.tile_sum(wp.tile(total_weight))[0]
-    block_blocked = wp.tile_sum(wp.tile(total_blocked))[0]
+    block = block_sum(wp.vec2(total_weight, total_blocked))
     if t == 0:
-        out_occlusion[i] = wp.where(
-            block_weight <= 0.0, wp.float32(0.0), block_blocked / block_weight
-        )
+        out_occlusion[i] = wp.where(block[0] <= 0.0, wp.float32(0.0), block[1] / block[0])
 
 
 @wp.kernel
@@ -154,10 +152,11 @@ def shape_diameter(
             total_sq += distance * distance
             hits += 1.0
         scratch[i, r] = distance
-    # The three reductions are also the barrier the second pass needs before reading ``scratch``.
-    total = wp.tile_sum(wp.tile(total))[0]
-    total_sq = wp.tile_sum(wp.tile(total_sq))[0]
-    hits = wp.tile_sum(wp.tile(hits))[0]
+    # One block reduction of the three sums, so every lane holds the same mean and deviation.
+    moments = block_sum(wp.vec3(total, total_sq, hits))
+    total = moments[0]
+    total_sq = moments[1]
+    hits = moments[2]
 
     if hits == 0.0:
         if t == 0:
@@ -174,8 +173,9 @@ def shape_diameter(
             weight = directions[r][2]  # cosine of the angle from the cone axis
             kept += weight
             weighted += weight * distance
-    kept = wp.tile_sum(wp.tile(kept))[0]
-    weighted = wp.tile_sum(wp.tile(weighted))[0]
+    trimmed = block_sum(wp.vec2(kept, weighted))
+    kept = trimmed[0]
+    weighted = trimmed[1]
     if t == 0:
         # ``kept <= 0``: every ray trimmed away (only possible at trim = 0), fall back to the mean.
         out_diameter[i] = wp.where(kept <= 0.0, mean, weighted / kept)

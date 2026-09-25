@@ -996,7 +996,7 @@ def test_oriented_bounding_box_chain_seeding_agrees_across_devices(seed_device: 
     ``oriented_box_seed_chains`` is the module's only ``wp.launch_tiled`` kernel, and the ``device``
     fixture returns ``cuda:0`` whenever CUDA is present, so without an explicit parametrize its CPU
     path is never executed. There ``wp.launch_tiled`` runs one lane per block and ``wp.block_dim()``
-    reads 1, so the lone lane walks the whole loss table and every ``tile_argmin`` folds a
+    reads 1, so the lone lane walks the whole loss table and every ``block_argmin`` folds a
     one-element tile -- which is correct precisely because the walk strides by ``wp.block_dim()``
     rather than by a constant.
 

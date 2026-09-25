@@ -24,9 +24,9 @@ from triwarp.kernels.predicates import (
     unit_tangent,
     world_to_tangent,
 )
-from triwarp.kernels.reduce import block_chunk_1d, commit_sum_and_count
+from triwarp.kernels.reduce import block_chunk_1d, block_max, block_sum, commit_sum_and_count
 from triwarp.kernels.scatter import add_corner_triple
-from triwarp.kernels.triangles import corner_triple, face_unit_gradient, face_vertices_vec3d
+from triwarp.kernels.triangles import face_unit_gradient, face_vertices_vec3d
 
 
 @wp.kernel
@@ -103,8 +103,8 @@ def heat_chunk_change(
             change = wp.max(change, wp.abs(u - previous[v]) / wp.abs(u))
             reached += wp.float64(1.0)
         previous[v] = u
-    block_change = wp.tile_max(wp.tile(change))[0]
-    block_reached = wp.tile_sum(wp.tile(reached))[0]
+    block_change = block_max(change)
+    block_reached = block_sum(reached)
     if t == 0:
         wp.atomic_max(out_stats, 0, block_change)
         wp.atomic_add(out_stats, 1, block_reached)
@@ -134,7 +134,6 @@ def accumulate_face_divergence(
     # because the per-face field is always written by the immediately preceding launch and read
     # only at the producing thread's own face -- so every caller below forms it in a register
     # instead of round-tripping an ``(n_faces,)`` ``wp.vec3d`` buffer through global memory.
-    i0, i1, i2 = corner_triple(faces, f)
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     c0 = wp.float64(cot_entries[f, 0])
     c1 = wp.float64(cot_entries[f, 1])
@@ -144,9 +143,7 @@ def accumulate_face_divergence(
     d1 = c0 * wp.dot(v2 - v1, x) + c2 * wp.dot(v0 - v1, x)
     d2 = c1 * wp.dot(v0 - v2, x) + c0 * wp.dot(v1 - v2, x)
 
-    wp.atomic_add(out_div, i0, d0)
-    wp.atomic_add(out_div, i1, d1)
-    wp.atomic_add(out_div, i2, d2)
+    add_corner_triple(out_div, faces, f, d0, d1, d2)
 
 
 @wp.kernel

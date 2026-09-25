@@ -1419,7 +1419,6 @@ class _BatchedCg:
         # ``span`` entries a block, ``blocks`` blocks a column, and whether the update folds the
         # dots' second stage itself rather than ``cg_coefficients`` doing it once: two launches a
         # round under Jacobi instead of three. See ``CG_FOLD_MAX_BLOCKS`` and ``cg_layout``.
-        tile = int(kernel_cg.CG_TILE)
         self._span, self._blocks, self._fold = kernel_cg.cg_layout(self._n, CG_FOLD_MAX_BLOCKS)
         # Whether a round forms ``A u`` with ``bsr_mv`` (see ``CG_HEAVY_ROW_ENTRIES``), decided on
         # the true entry count -- ``nnz`` is a capacity -- and only for a column too long to fold:
@@ -1431,9 +1430,6 @@ class _BatchedCg:
         self._mv_tile = _HEAVY_ROW_TILE if entries > _HEAVY_ROW_TILED_ENTRIES * self._n else -1
         self._stride = self._blocks * self._span
         self._dofs = self._n_columns * self._stride
-        # The partials are padded on the same argument, so ``cg_seed``'s last tile reads zeros
-        # rather than the next column's partials; see ``sum_padded_row``.
-        partial_pitch = ((self._blocks + tile - 1) // tile) * tile
 
         self._rhs = rhs
         self._solution = solution
@@ -1459,9 +1455,10 @@ class _BatchedCg:
         self._p = twt.as_dense(self._ps[: self._dofs])
         self._s = twt.as_dense(self._ps[self._dofs :])
         # First-stage partials of the three dots ``cg_matvec_dots`` reduces: ``r.u``, ``w.u``,
-        # ``r.r`` (and of ``||b||^2`` in row 0 at the start of a solve).
-        self._partials = wp.zeros(
-            (3, self._n_columns, partial_pitch), dtype=wp.float64, device=device
+        # ``r.r`` (and of ``||b||^2`` in row 0 at the start of a solve). ``wp.empty``: every entry a
+        # fold reads, ``[0, blocks)`` of each row, is written by the partials launch before it.
+        self._partials = wp.empty(
+            (3, self._n_columns, self._blocks), dtype=wp.float64, device=device
         )
         # ``(alpha, beta, stepping)`` per column, written by ``cg_coefficients`` on the unfolded
         # path only.
@@ -1516,7 +1513,13 @@ class _BatchedCg:
         self._scaled = self._u
         if self._cycle is None:
             self._inv_diag = wp.empty(self._n, dtype=dtype, device=device)
-            wp.map(kernel_array.inverse_or_one, wps.bsr_get_diag(matrix), out=self._inv_diag)
+            wp.launch(
+                kernel_linalg.JACOBI_INVERSE_DIAGONAL[dtype],
+                dim=self._n,
+                inputs=[matrix.offsets, matrix.columns, matrix.values],
+                outputs=[self._inv_diag],
+                device=device,
+            )
         elif isinstance(self._cycle, _JacobiChebyshevApply):
             self._inv_diag = self._cycle.inverse_diagonal
             self._scaled = self._cycle.scaled
@@ -2348,7 +2351,14 @@ class _JacobiChebyshev:
         # otherwise cost.
         self._matrix = matrix
         self._inverse_diagonal = wp.empty(self._n, dtype=wp.float64, device=self._device)
-        wp.map(kernel_array.inverse_or_one, wps.bsr_get_diag(matrix), out=self._inverse_diagonal)
+        ratios = twt.empty_1d(self._n, wp.float64, device=self._device)
+        wp.launch(
+            kernel_linalg.jacobi_dominance_rows,
+            dim=self._n,
+            inputs=[matrix.offsets, matrix.columns, matrix.values],
+            outputs=[self._inverse_diagonal, ratios],
+            device=self._device,
+        )
         # Gershgorin's discs for ``D⁻¹ A`` are centred on 1 with radius ``r_i = sum_j |A_ij| /
         # |A_ii|``, whatever the diagonal's sign. ``1 + max r`` bounds the spectrum from above, and
         # a polynomial fitted short of it changes sign past its end, as a clamped negative
@@ -2356,7 +2366,7 @@ class _JacobiChebyshev:
         # (a heat system's mass-plus-stiffness) also has ``1 - max r`` as a lower bound, which is
         # far tighter than the ``1 / n`` scale a Laplacian's smallest eigenvalue falls at.
         # The radius is floored so that a diagonal operator still has an interval to fit.
-        dominance = max(_offdiagonal_dominance(matrix), 1e-3)
+        dominance = max(float(tw.reduce.max(ratios)) if self._n > 0 else 0.0, 1e-3)
         lower = max(
             min(CHEBYSHEV_INTERVAL / max(self._n, 1), SQUARED_LAPLACIAN_INTERVAL_CAP),
             1.0 - dominance,

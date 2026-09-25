@@ -6,7 +6,7 @@ from triwarp.constants import FLOAT32_INF_CONSTANT, INT64_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.array import declare_map_signatures, map_probe, map_probe_single
-from triwarp.kernels.reduce import block_chunk_1d
+from triwarp.kernels.reduce import block_chunk_1d, block_min
 
 # Iterative-deepening k-nearest search. A scan at radius ``r`` enumerates every point within
 # Euclidean distance ``r``, so a row whose k-th distance is at most ``r`` is provably the exact
@@ -953,7 +953,7 @@ def nearest_key_argmin(distances: wp.array[wp.float32], out_result: wp.array[wp.
     for k in range(lane, count, wp.block_dim()):
         i = offset + k
         best = wp.min(best, kernel_array.pack_nearest_key(distances[i], i))
-    block_best = wp.tile_min(wp.tile(best))[0]
+    block_best = block_min(best)
     if lane == 0:
         wp.atomic_min(out_result, 0, block_best)
 

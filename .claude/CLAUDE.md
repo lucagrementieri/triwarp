@@ -3396,6 +3396,17 @@ Consequence: the shared argmin/argmax/swap helpers in `kernels/array.py` are con
   and an internal-only fix can't work.
 - **Diffused heat fields scale as 1/scale² with the mesh coordinates**, so an absolute tolerance
   applied to one is a silent wrong answer on a rescaled mesh.
+- **The backward pass of an *empty* dynamic `range` is not empty (Warp 1.17), so a differentiated
+  thread whose strided loop draws nothing must return before the loop.** The adjoint walks
+  `iter_reverse(range(start, end, step))` (`warp/native/range.h`), which sets
+  `start + int((end - start - 1) / step) * step` -- C++ truncation, so for `start >= end` with
+  `end - start - 1 > -step` it is one iteration at `start`, past the end of the array. The forward
+  is untouched, so the loss is right and only the gradient is wrong, by an out-of-bounds read and
+  scatter: 11x the true gradient on `metrics.chamfer_nn_term_sliced` at 1 point over 37 slices,
+  and a heap-corruption crash on the CPU device. Both sliced chamfer kernels now open with
+  `if j >= n: return`, pinned by `test_sliced_chamfer_terms_grad_with_more_slices_than_points`.
+  `slice_count` never launches more slices than elements, so no public call reached it; a probe or
+  a test choosing its own slice count did. Only `metrics` is taped, so no other kernel is exposed.
 
 ### 12.5 Kernel-scope cast semantics
 
@@ -3538,8 +3549,10 @@ Rules: §1.3, §1.5, §1.6.
   at *parse* time with an `AttributeError` naming the kernel. That matters because §1.5's check 17
   types an operand by declaration and only recognises an integer `wp.constant` in the typed form, so
   a constant that is also a tile shape can never be made visible to it — `algorithms/bfs.py`'s
-  `BFS_SCAN_BLOCK` converted (it is only an offset and an index) and `conjugate_gradient.py`'s
-  `CG_TILE` cannot, and says so at the site. A typed constant is also not usable in *host* arithmetic
+  `BFS_SCAN_BLOCK` converted (it is only an offset and an index). `conjugate_gradient.py`'s
+  `CG_TILE` was the standing counter-example until its one tile-shape use, a `tile_load`
+  accumulator in `cg_seed`'s fold, became a lane-strided `reduce.block_sum`; it is now a plain host
+  integer, since no kernel reads it. A typed constant is also not usable in *host* arithmetic
   (`(n + c - 1) // c` raises `unsupported operand type(s) for //`), so the wrapper reads `int(...)`.
 
 ### 12.7 `warp.sparse`
@@ -3702,7 +3715,7 @@ Status of every version-stamped workaround, last full re-probe against 1.16 with
 | `wp.ref[wp.Scalar]` generics | **still broken** — `WarpCodegenError` at kernel parse (§12.3) |
 | radix key dtypes | unchanged — int32/int64/uint32/uint64/float32/float64 only, 4- or 8-byte values. `segmented_sort_pairs` was NOT extended (int32/float32 keys only) |
 | no sparse triangular solve | unchanged |
-| generic `Any`-typed `@wp.func` wrappers around tile intrinsics | still fail (NVRTC "more than one instance of overloaded function"); the working route is the builtin-capture factory of §2.7 |
+| generic `Any`-typed `@wp.func` wrappers around tile intrinsics | **a wrapper over a *tile* argument** still fails (NVRTC "more than one instance of overloaded function"); the working route is the builtin-capture factory of §2.7. **A wrapper over a per-lane *value* works on Warp 1.17**: `reduce.block_sum` / `block_min` / `block_max` compile at `int32`/`int64`/`uint64`/`float32`/`float64`, `vec2i`, `vec3d`, `mat33`, `spatial_matrix` and a 25-wide vector in one module, on both devices |
 | `@wp.kernel(grid_stride=False)` | benchmarked as noise (±5 %, sign flips between runs) — not adopted |
 
 **Three things that make an upgrade's verification honest, all of which default to a *false pass*:**
@@ -4055,9 +4068,14 @@ is not "does this kernel have an outer dimension" but "does anything other than 
 one thread per element". A pure reduction takes the wide fold; a reduction fused onto a map does
 not.
 
-**Two more shape facts:** `wp.tile(vec3)` decomposes to a scalar tile, so tile-reduce a vec3 per
-component or pack it; and `wp.array.view(wp.float32)` on a vec3 array gives a zero-copy `(n, 3)` view
-for `reduce.minmax`.
+**Two more shape facts:** a plain `wp.tile(vec3)` decomposes to a scalar tile, but
+`wp.tile(v, preserve_type=True)` keeps the vector, and `wp.tile_sum` then reduces it componentwise
+in **one** tree -- bit-identical to one reduction per component, on both devices, for vectors,
+matrices and `wp.types.vector(length=N)`. So a block that folds several same-dtype quantities packs
+them into one vector and pays one barrier (`reduce.block_sum`); the per-component spelling the tree
+used to carry cost 25 barriers in `accumulate_procrustes_moments` and 44 in
+`accumulate_point_to_plane`, now one and three. And `wp.array.view(wp.float32)` on a vec3 array
+gives a zero-copy `(n, 3)` view for `reduce.minmax`.
 
 ### 13.3 Tuning constants are per-device
 
@@ -6296,6 +6314,35 @@ are `cgtrace_r16_{base,new}.txt` there.
   multiplicity and order of the unions, so the labels are identical without the sort. The rim mask
   0.93 -> < 0.2 ms, `smooth_region_boundary` **1.10-1.12x** (harness), byte-identical on CPU with
   `smooth_region` and `fix_self_intersections` unchanged.
+- **Round-16 kernel de-duplication pass.** The V-cycle's zero-start pre-smoothing sweep
+  `omega D^-1 b` reads no neighbour, so it now rides in whichever launch produced `b`
+  (`poisson_mg_restrict` on coarse levels; `poisson_cg_initial` and `cg_update`'s Jacobi apply
+  on the finest, with the stored scaling `omega / A_ii` folded at setup), weight restriction and
+  the coarse scaling are one `poisson_mg_coarsen` launch, and the finest level stops allocating
+  its unused `b` / `x`: a cycle is four launches a level instead of five, **`dense` 1.1x** at
+  depth 6-7 with 18-20 % fewer host launches, byte-identical on CPU (CUDA differs by the splat's
+  atomic order, 1 ulp, as baseline against itself). `prolong_grid` / `poisson_mg_prolong_add`
+  share `poisson_prolong_node`. `_BatchedCg`'s Jacobi diagonal is one CSR-row launch
+  (`JACOBI_INVERSE_DIAGONAL`) in place of `bsr_get_diag` plus a map, and `_JacobiChebyshev`
+  reads the diagonal and the Gershgorin ratio from one row walk (`jacobi_dominance_rows`):
+  `lscm` 1.07x, the rest flat, byte-identical on CPU.
+- **The block reductions are one helper family** (`reduce.block_sum` / `block_min` / `block_max`,
+  §13.2): 65 hand-written `wp.tile_*(wp.tile(x))[0]` sites across twelve kernel modules became
+  calls, with same-dtype quantities packed into one vector per block (7 reductions to 1 in
+  `accumulate_loop_frame`, 10 to 1 in the moment integrals). Byte-identical on CPU across 19
+  outputs; flat on the CUDA clock, since every caller is launch-bound. `array.tile_argmin` moved
+  to `reduce.block_argmin` (it is a block reduction, and `reduce` imports `array`, so it could not
+  call the family where it was). **`block_sum` is differentiable**: the two tiled chamfer kernels
+  now use it with a scalar `wp.atomic_add` in place of `tile_atomic_add`, and under `wp.Tape` the
+  loss is identical and the gradients match `HEAD`'s to its own run-to-run spread (4e-8-5e-7
+  relative, the gradient scatter's atomic order) and the analytic nn-term gradient exactly, at
+  1, 63, 64, 65, 1 000 and 100 003 points. The same probe found a Warp adjoint bug in the
+  *sliced* chamfer kernels, now fixed (§12.4). The last one-value-per-lane reductions spelled with
+  tile intrinsics went too: `_reduce_bool_1d_tiled` captures `block_sum` / `block_max` /
+  `block_min` rather than the builtins, and `cg_seed`'s `||b||^2` fold is lane-strided, so the
+  CG partials lose their zero-filled tile padding (`wp.empty` at `blocks` wide). What remains is
+  genuinely tile-shaped: the `tile_load` reduction factories, `remesh`'s chunked scans and the
+  cooperative BVH walk. `wp.tile_atomic_add` has no call site left.
 - **The final sweep's sub-0.93x cells were drift**: all in functions that reach no solve, and
   0.91-1.04x re-run as their own selection. Median over 280 triwarp cells in the seven modules,
   0.99x.

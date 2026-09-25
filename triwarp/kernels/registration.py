@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.kernels.predicates import normalize_or_zero
 from triwarp.kernels.proximity import write_closest_point_query
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, block_chunk_1d
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, block_chunk_1d, block_sum
 from triwarp.kernels.transform import transform_point_mat44
 
 # ---------------------------------------------------------------------------
@@ -28,6 +28,9 @@ ACC_COV = wp.constant(9)  # mat33, slots 9..17: sum_{w>0} outer(b - q, a - p), r
 ACC_MASK_A = wp.constant(18)  # vec3, slots 18..20: sum_{w>0} (a - p)
 ACC_MASK_B = wp.constant(21)  # vec3, slots 21..23: sum_{w>0} (b - q)
 ACC_MASK_N = wp.constant(24)  # count of w > 0
+# The moment slots, ``ACC_W_SUM`` through ``ACC_MASK_N``: what one block of
+# ``accumulate_procrustes_moments`` folds. A plain constant, since a vector length must be one.
+PROCRUSTES_MOMENT_SLOTS = wp.constant(25)
 ACC_COST = wp.constant(25)  # weighted mean squared residual
 PROCRUSTES_ACC_SIZE = 26
 
@@ -101,8 +104,8 @@ def accumulate_procrustes_moments(
     # shifted-moment identity in ``build_procrustes_matrix`` removes that dependency.
     #
     # Launched ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``: one block per
-    # ``ITEMS_PER_BLOCK_1D`` points, lanes striding that block's own chunk, and 25 ``wp.tile_sum``
-    # tree reductions committing **one** atomic set per block.
+    # ``ITEMS_PER_BLOCK_1D`` points, lanes striding that block's own chunk, and one packed
+    # 25-slot tree reduction committing **one** atomic set per block.
     #
     # **The 64-fold redundant lane arithmetic is not the cost, and never was**: all lanes read the
     # same ``a[offset + k]`` and the loads broadcast out of one cache line, so giving each lane
@@ -153,38 +156,26 @@ def accumulate_procrustes_moments(
             mask_b += bv
             mask_n += wp.float32(1.0)
 
-    # Every ``wp.tile_sum`` is block-collective, so all 25 run outside the ``lane == 0`` guard and
-    # only the commit is guarded. The default constructors, not an explicit zero-fill: every
-    # component of each is unconditionally overwritten by the loop below before it is ever read.
-    t_w_sum = wp.tile_sum(wp.tile(w_sum))[0]
-    t_a_sq = wp.tile_sum(wp.tile(a_sq))[0]
-    t_b_sq = wp.tile_sum(wp.tile(b_sq))[0]
-    t_mask_n = wp.tile_sum(wp.tile(mask_n))[0]
-    t_a_sum = wp.vec3()
-    t_b_sum = wp.vec3()
-    t_mask_a = wp.vec3()
-    t_mask_b = wp.vec3()
-    t_cov = wp.mat33()
+    # Packed into the accumulator's own slot layout and folded by **one** block reduction, which
+    # is block-collective, so it runs outside the ``lane == 0`` guard and only the commit is
+    # guarded. The default constructor, not a zero-fill: every slot is written just below.
+    packed = wp.vector(length=PROCRUSTES_MOMENT_SLOTS, dtype=wp.float32)
+    packed[ACC_W_SUM] = w_sum
+    packed[ACC_A_SQ] = a_sq
+    packed[ACC_B_SQ] = b_sq
+    packed[ACC_MASK_N] = mask_n
     for c in range(3):
-        t_a_sum[c] = wp.tile_sum(wp.tile(a_sum[c]))[0]
-        t_b_sum[c] = wp.tile_sum(wp.tile(b_sum[c]))[0]
-        t_mask_a[c] = wp.tile_sum(wp.tile(mask_a[c]))[0]
-        t_mask_b[c] = wp.tile_sum(wp.tile(mask_b[c]))[0]
+        packed[ACC_A_SUM + c] = a_sum[c]
+        packed[ACC_B_SUM + c] = b_sum[c]
+        packed[ACC_MASK_A + c] = mask_a[c]
+        packed[ACC_MASK_B + c] = mask_b[c]
         for r in range(3):
-            t_cov[c, r] = wp.tile_sum(wp.tile(cov[c, r]))[0]
+            packed[ACC_COV + c * 3 + r] = cov[c, r]
+    block = block_sum(packed)
 
     if lane == 0:
-        wp.atomic_add(out_acc, ACC_W_SUM, t_w_sum)
-        wp.atomic_add(out_acc, ACC_A_SQ, t_a_sq)
-        wp.atomic_add(out_acc, ACC_B_SQ, t_b_sq)
-        wp.atomic_add(out_acc, ACC_MASK_N, t_mask_n)
-        for c in range(3):
-            wp.atomic_add(out_acc, ACC_A_SUM + c, t_a_sum[c])
-            wp.atomic_add(out_acc, ACC_B_SUM + c, t_b_sum[c])
-            wp.atomic_add(out_acc, ACC_MASK_A + c, t_mask_a[c])
-            wp.atomic_add(out_acc, ACC_MASK_B + c, t_mask_b[c])
-            for r in range(3):
-                wp.atomic_add(out_acc, ACC_COV + c * 3 + r, t_cov[c, r])
+        for slot in range(PROCRUSTES_MOMENT_SLOTS):
+            wp.atomic_add(out_acc, slot, block[slot])
 
 
 @wp.func
@@ -314,7 +305,7 @@ def transform_and_accumulate_cost(
         out_transformed[i] = moved
         w = sample_weight(weights, i)
         local += w * wp.length_sq(b[i] - moved)
-    total = wp.tile_sum(wp.tile(local))[0]
+    total = block_sum(local)
     if lane == 0:
         wp.atomic_add(acc, ACC_COST, total / acc[ACC_W_SUM])
 
@@ -579,8 +570,9 @@ def accumulate_point_to_plane(
     out_scalars: wp.array[wp.float32],
 ) -> None:
     # Launched ``wp.launch_tiled(dim=blocks_1d(n), block_dim=TILE_1D)``: one block per
-    # ``ITEMS_PER_BLOCK_1D`` correspondences, lanes striding that block's own chunk, and 44
-    # ``wp.tile_sum`` tree reductions committing one atomic set per block.
+    # ``ITEMS_PER_BLOCK_1D`` correspondences, lanes striding that block's own chunk, and three
+    # block reductions (the normal matrix, the right-hand side, the two scalars) committing one
+    # atomic set per block.
     #
     # It was every lane walking a ``TILE_1D`` chunk with lane 0 publishing, which put one add per
     # block on each of 43 hot addresses (36 for the normal matrix, 6 for the right-hand side, 1 for
@@ -612,17 +604,12 @@ def accumulate_point_to_plane(
         wp.block_dim(),
     )
 
-    # Block-collective, so every lane runs all 44 and only the commit is guarded. The default
-    # constructors, not an explicit zero-fill: every component of each is unconditionally
-    # overwritten by the loop below before it is ever read.
-    total_cost = wp.tile_sum(wp.tile(tile_cost))[0]
-    total_weight_sum = wp.tile_sum(wp.tile(tile_weight_sum))[0]
-    total_jtj = wp.spatial_matrix()
-    total_jtr = wp.spatial_vector()
-    for r in range(6):
-        total_jtr[r] = wp.tile_sum(wp.tile(tile_jtr[r]))[0]
-        for c in range(6):
-            total_jtj[r, c] = wp.tile_sum(wp.tile(tile_jtj[r, c]))[0]
+    # Block-collective, so every lane runs all three and only the commit is guarded.
+    total_jtj = block_sum(tile_jtj)
+    total_jtr = block_sum(tile_jtr)
+    scalars = block_sum(wp.vec2(tile_cost, tile_weight_sum))
+    total_cost = scalars[0]
+    total_weight_sum = scalars[1]
 
     if lane == 0:
         wp.atomic_add(out_jtj, 0, total_jtj)

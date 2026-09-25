@@ -35,16 +35,13 @@ import warp as wp
 
 from triwarp.kernels.algorithms.multigrid import csr_row_dot
 from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND, OverloadTable
+from triwarp.kernels.reduce import block_sum
 
 # Lanes per block for both stages of the conjugate-gradient dot product. The partial stage gets one
 # block per ``CG_TILE`` entries *of each column*, which is what makes its grid grow with the system
-# instead of its serial depth; the finalize stage folds that column's partials with one more tile.
-# Deliberately a bare ``wp.constant(256)`` and not ``wp.constant(wp.int32(256))``: this constant
-# also serves as a ``wp.tile_load`` / ``wp.tile_zeros`` ``shape=``, and a tile shape must be a
-# plain integer -- the typed spelling fails to parse on Warp 1.17 with an ``AttributeError`` in
-# ``cg_seed``. The cost is that check 17 cannot type the ``//`` below from the constant's
-# declaration and has to take it on trust.
-CG_TILE = wp.constant(256)
+# instead of its serial depth; the finalize stage folds that column's partials with one more block.
+# A host-side launch shape only: no kernel reads it.
+CG_TILE = 256
 
 # Tiles a round's block spans once a column is too long to fold (see ``cg_layout``): the target
 # block count a long column is launched at. Every block pays one block-wide reduction and one
@@ -79,14 +76,14 @@ def cg_layout(n: int, fold_max_blocks: int) -> tuple[int, int, bool]:
 
 
 @wp.func
-def sum_padded_row(row: wp.array[wp.float64], n_blocks: wp.int32) -> wp.float64:
-    # Cooperative tile-fold sum of one padded row -- ``cg_seed``'s fold of ``||b||^2``. ``row``'s
-    # tail past ``n_blocks`` is zero-padded to a whole number of ``CG_TILE``-wide tiles by whichever
-    # partials kernel wrote it, so this needs no ragged branch.
-    acc = wp.tile_zeros(shape=CG_TILE, dtype=wp.float64)
-    for s in range((n_blocks + CG_TILE - 1) // CG_TILE):
-        acc += wp.tile_load(row, shape=CG_TILE, offset=s * CG_TILE, storage="register")
-    return wp.tile_sum(acc)[0]
+def sum_block_partials(row: wp.array[wp.float64], n_blocks: wp.int32, t: wp.int32) -> wp.float64:
+    # The block-wide sum of one row of first-stage partials -- ``cg_seed``'s fold of ``||b||^2``,
+    # ``cg_fold_column``'s shape for one quantity: the lanes stride the ``n_blocks`` live entries
+    # by ``wp.block_dim()`` (section 2.2) and ``block_sum`` folds them. Block-collective.
+    acc = wp.float64(0.0)
+    for k in range(t, n_blocks, wp.block_dim()):
+        acc += row[k]
+    return block_sum(acc)
 
 
 @wp.kernel
@@ -137,7 +134,7 @@ def cg_initial(
         out_p[i] = out_p.dtype(0.0)
         out_s[i] = out_s.dtype(0.0)
         acc += b * b
-    total = wp.tile_sum(wp.tile(acc))[0]
+    total = block_sum(acc)
     if t == 0:
         out_partials[0, c, blk] = total
 
@@ -163,7 +160,7 @@ def cg_seed(
     # round-loop state at ``[0, 1]`` with a zero count. A zero condition would run no rounds at
     # all, since ``wp.capture_while`` reads it first.
     c, t = wp.tid()
-    b_norm_sq = sum_padded_row(partials[0, c], n_blocks)
+    b_norm_sq = sum_block_partials(partials[0, c], n_blocks, t)
     if t == 0:
         out_atol_sq[c] = wp.max(tol_sq * b_norm_sq, atol_sq)
         out_gamma_new[c] = wp.float64(wp.inf)
@@ -302,7 +299,7 @@ def cg_matvec_dots(
             wi = csr_row_dot(local, c * stride, offsets, columns, values, u)
         out_w[i] = wi
         acc += cg_round_terms(r[i], u[i], wi)
-    total = cg_widen(wp.tile_sum(wp.tile(acc, preserve_type=True))[0])
+    total = cg_widen(block_sum(acc))
     cg_publish_round_dots(
         total,
         c,
@@ -341,7 +338,7 @@ def cg_round_dots(
     for k in range(t, span, wp.block_dim()):
         i = c * stride + blk * span + k
         acc += cg_round_terms(r[i], u[i], w[i])
-    total = cg_widen(wp.tile_sum(wp.tile(acc, preserve_type=True))[0])
+    total = cg_widen(block_sum(acc))
     cg_publish_round_dots(
         total,
         c,
@@ -368,7 +365,7 @@ def cg_fold_column(
     acc = wp.vec3d(0.0, 0.0, 0.0)
     for k in range(t, n_blocks, wp.block_dim()):
         acc += wp.vec3d(partials[0, c, k], partials[1, c, k], partials[2, c, k])
-    return wp.tile_sum(wp.tile(acc, preserve_type=True))[0]
+    return block_sum(acc)
 
 
 @wp.func

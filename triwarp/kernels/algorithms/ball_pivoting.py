@@ -71,9 +71,10 @@ when it merely lost the claim.
 import warp as wp
 
 from triwarp.constants import TWO_PI, UINT64_MAX_CONSTANT
-from triwarp.kernels.array import pack_edge_key, tile_argmin
+from triwarp.kernels.array import pack_edge_key
 from triwarp.kernels.grouping import hash_find, hash_find_or_insert
 from triwarp.kernels.predicates import dihedral_angle, triangle_normal
+from triwarp.kernels.reduce import block_argmin
 
 # Per-thread neighbour scratch for the seed search (Open3D re-scans the KNN result twice).
 MAX_SEED_NEIGHBORS = 64
@@ -682,9 +683,9 @@ def pivot_front_edges(
                         best = c
 
         # The winner must not depend on which lane happened to see it, which is what
-        # ``tile_argmin``'s second stage is for. When no lane found anything every lane still holds
+        # ``block_argmin``'s second stage is for. When no lane found anything every lane still holds
         # ``(TWO_PI, -1)``, so it returns -1.
-        _block_angle, block_best = tile_argmin(best_angle, best)
+        _block_angle, block_best = block_argmin(best_angle, best)
 
         edges.cand[slot] = block_best
         if block_best < 0:

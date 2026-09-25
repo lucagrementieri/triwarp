@@ -11,7 +11,6 @@ from triwarp.kernels.array import (
     map_probe,
     map_probe_single,
     pack_nearest_key,
-    tile_argmin,
     update_argmin,
 )
 from triwarp.kernels.array import wrap_index as _wrap
@@ -24,6 +23,7 @@ from triwarp.kernels.predicates import (
     triangle_aspect_ratio,
     triangle_double_area,
 )
+from triwarp.kernels.reduce import block_argmin, block_sum
 from triwarp.kernels.triangles import corner_triple
 
 # Big-but-finite penalty for a triangulation the metric rejects: lets the DP keep a bad
@@ -650,7 +650,7 @@ def fill_dp_span_tiled(tables: HoleFillTables, span_offset: wp.int32) -> None:
     for k in range(i + 1 + t, j, wp.block_dim()):
         val = apex_cost(tables, o, b, base, i, j, k, is_top, a_pos, c_pos, plane_normal, char_area)
         update_argmin(best_val, best_k, val, k)
-    block_val, block_k = tile_argmin(best_val, best_k)
+    block_val, block_k = block_argmin(best_val, best_k)
     if t == 0:
         tables.dp[base + i * b + j] = block_val
         # Every remaining apex required a forbidden sub-chord — see ``fill_dp_span``.
@@ -1329,7 +1329,7 @@ def stitch_dp_tile(
             di += wp.block_dim()
         # Block barrier: every lane must see this anti-diagonal's writes before reading them as
         # the next one's predecessors. The sum itself is discarded.
-        _ = wp.tile_sum(wp.tile(wp.float32(t)))[0]
+        _ = block_sum(wp.float32(t))
 
 
 @wp.kernel

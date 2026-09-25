@@ -1,5 +1,7 @@
 """Global reductions: tiled ``wp.tile_load`` reductions generated from a shared template."""
 
+from typing import Any
+
 import warp as wp
 
 # Tile-reduction builtins are resolved only inside kernel source text and are not
@@ -11,7 +13,7 @@ import warp as wp
 # it in a ``@wp.func`` instead would erase the dtype and produce ambiguous C++ overloads.
 from warp._src.context import builtin_functions as _warp_builtins
 
-from triwarp.constants import TILE_1D, TILE_2D, TILES_PER_BLOCK_1D
+from triwarp.constants import INT32_MAX_CONSTANT, TILE_1D, TILE_2D, TILES_PER_BLOCK_1D
 from triwarp.kernels.array import KernelTable, atomic_min_packed_box, is_close_scalar, is_close_vec3
 
 _tile_min = _warp_builtins["tile_min"]
@@ -54,20 +56,71 @@ def block_chunk_1d(n: wp.int32, block: wp.int32) -> tuple[wp.int32, wp.int32]:
     return offset, wp.min(remaining, ITEMS_PER_BLOCK_1D)
 
 
+# The three block-wide reductions of one value per lane, correct on **every** lane and a full
+# block barrier either side, so a caller runs them outside its ``lane == 0`` commit guard. On the
+# CPU device a block is one lane and each returns that lane's own value (CLAUDE.md section 2.2).
+#
+# ``block_sum`` passes ``preserve_type=True``: a plain ``wp.tile(v)`` of a vector decomposes it and
+# sums its components together, where this reduces a ``wp.vec3`` / ``wp.mat33`` /
+# ``wp.types.vector(length=N)`` componentwise in **one** tile reduction, bit-identical to one
+# ``wp.tile_sum`` per component (same tree, same order; verified on both devices). So several
+# same-dtype quantities a block folds are packed into one vector and pay one barrier, not one each.
+# Generic wrappers over a *value* are fine; the ambiguity the note above describes is the tile-
+# load factories', whose argument is a tile.
+
+
+@wp.func
+def block_sum(value: Any):
+    """Sum of ``value`` over the block's lanes, componentwise for a vector or matrix."""
+    return wp.tile_sum(wp.tile(value, preserve_type=True))[0]
+
+
+@wp.func
+def block_min(value: Any):
+    """Minimum of a scalar ``value`` over the block's lanes."""
+    return wp.tile_min(wp.tile(value))[0]
+
+
+@wp.func
+def block_max(value: Any):
+    """Maximum of a scalar ``value`` over the block's lanes."""
+    return wp.tile_max(wp.tile(value))[0]
+
+
+@wp.func
+def block_argmin(value: Any, index: wp.int32) -> tuple[Any, wp.int32]:
+    # The block-cooperative counterpart of ``update_argmin``: given one candidate per lane, the
+    # smallest value over the block and the **lowest index among the lanes attaining it**. Every
+    # lane holds the same pair afterwards, so any lane may store it.
+    #
+    # The two-stage form is what makes the winner independent of *which* lane saw it, and that is
+    # the whole reason this is one function rather than three: a block reduction hands back a value
+    # and not the lane that held it, so recovering the index is a second reduction with a tie-break
+    # -- a *decision rule*, which diverges silently where duplicated arithmetic only reads badly.
+    # Four sites need it: the hole-filling DP's apex choice, ball pivoting's pivot search,
+    # ``proximity``'s straggler faces and ``bounds``' oriented-box candidate sweep.
+    #
+    # No ``wp.ref``, so unlike ``update_argmin`` this imposes no ``enable_backward=False`` on its
+    # callers. Correct on the CPU device too, where ``wp.launch_tiled`` runs one lane per block and
+    # both tiles hold that lane's own pair.
+    block_value = block_min(value)
+    attained = wp.where(value == block_value, index, INT32_MAX_CONSTANT)
+    return block_value, block_min(attained)
+
+
 @wp.func
 def commit_sum_and_count(
     lane: wp.int32, total: wp.float64, count: wp.float64, out_sum_and_count: wp.array[wp.float64]
 ):
     # The commit of a fused "mean over the entries that qualify" block fold: each lane's register
-    # sum and count, folded by one block-collective tile sum apiece, then added by lane 0 into the
-    # two-slot buffer the caller reads once. Both tile sums run on every lane (they are barriers);
-    # only the atomics are guarded. Shared by ``heat.upper_edge_length_sum_and_count`` and
+    # sum and count, folded as one ``block_sum`` pair (a barrier, so every lane runs it), then added
+    # by lane 0 into the two-slot buffer the caller reads once. Shared by
+    # ``heat.upper_edge_length_sum_and_count``, ``points.accumulate_counted_mean`` and
     # ``reconstruction.positive_finite_sum_and_count``, which differ only in what qualifies.
-    block_total = wp.tile_sum(wp.tile(total))[0]
-    block_count = wp.tile_sum(wp.tile(count))[0]
+    block = block_sum(wp.vec2d(total, count))
     if lane == 0:
-        wp.atomic_add(out_sum_and_count, 0, block_total)
-        wp.atomic_add(out_sum_and_count, 1, block_count)
+        wp.atomic_add(out_sum_and_count, 0, block[0])
+        wp.atomic_add(out_sum_and_count, 1, block[1])
 
 
 def blocks_1d(n: int) -> int:
@@ -580,7 +633,7 @@ SUM_2D_COLS_SERIAL = KernelTable(
 # ---------------------------------------------------------------------------
 
 
-def _reduce_bool_1d_tiled(tile_reduce, atomic, scalar, identity, name):
+def _reduce_bool_1d_tiled(block_reduce, atomic, scalar, identity, name):
     """
     axis=None over a ``wp.bool`` mask, read as bytes instead of through an ``int32`` copy.
 
@@ -595,7 +648,8 @@ def _reduce_bool_1d_tiled(tile_reduce, atomic, scalar, identity, name):
     loaded as tiles: each lane strides by ``wp.block_dim()`` -- never by ``TILE_1D``, which is what
     keeps it correct on the CPU device, where ``wp.launch_tiled`` runs one lane per block and
     ``wp.block_dim()`` reads 1 (section 2.2) -- accumulates in a register, and the block folds the
-    per-lane values with a single ``wp.tile`` reduction. That is one tile reduction per block where
+    per-lane values with a single block reduction (``block_reduce``, one of ``block_sum`` /
+    ``block_max`` / ``block_min``). That is one tile reduction per block where
     the tile-load form runs ``TILES_PER_BLOCK_1D`` of them, and the strided reads are coalesced
     (consecutive lanes, consecutive bytes).
 
@@ -613,16 +667,16 @@ def _reduce_bool_1d_tiled(tile_reduce, atomic, scalar, identity, name):
         acc = wp.int32(identity)
         for k in range(t, remaining, wp.block_dim()):
             acc = scalar(acc, wp.where(values[base + k], wp.int32(1), wp.int32(0)))
-        block_result = tile_reduce(wp.tile(acc))[0]
+        block_result = block_reduce(acc)
         if t == 0:
             atomic(out_result, 0, block_result)
 
     return wp.kernel(_k, name=name)
 
 
-sum_bool_1d_tiled = _reduce_bool_1d_tiled(_tile_sum, wp.atomic_add, wp.add, 0, "sum_bool_1d_tiled")
-any_bool_1d_tiled = _reduce_bool_1d_tiled(_tile_max, wp.atomic_max, wp.max, 0, "any_bool_1d_tiled")
-all_bool_1d_tiled = _reduce_bool_1d_tiled(_tile_min, wp.atomic_min, wp.min, 1, "all_bool_1d_tiled")
+sum_bool_1d_tiled = _reduce_bool_1d_tiled(block_sum, wp.atomic_add, wp.add, 0, "sum_bool_1d_tiled")
+any_bool_1d_tiled = _reduce_bool_1d_tiled(block_max, wp.atomic_max, wp.max, 0, "any_bool_1d_tiled")
+all_bool_1d_tiled = _reduce_bool_1d_tiled(block_min, wp.atomic_min, wp.min, 1, "all_bool_1d_tiled")
 
 any_1d_tiled = _reduce_1d_tiled(_tile_max, wp.atomic_max, wp.max, "any_1d_tiled", wp.int32)
 any_2d_rows_tiled = _reduce_2d_axis_tiled(
@@ -1047,7 +1101,7 @@ def _allclose_1d_tiled(name, dtype, predicate, tolerance_dtype):
             slot = offset + k
             if not predicate(a[slot], b[slot], rtol, atol):
                 close = wp.int32(0)
-        block_close = wp.tile_min(wp.tile(close))[0]
+        block_close = block_min(close)
         if lane == 0:
             wp.atomic_min(out_flag, 0, block_close)
 

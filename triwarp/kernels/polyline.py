@@ -20,7 +20,7 @@ from triwarp.kernels.predicates import (
     project_out_normal,
     vector_angle,
 )
-from triwarp.kernels.reduce import block_chunk_1d
+from triwarp.kernels.reduce import block_chunk_1d, block_sum
 
 
 @wp.func
@@ -77,12 +77,11 @@ def accumulate_newell_normal(
     # what makes it correct on both devices, so there is no ``prefers_tiled_reduction`` branch.
     # Only an *unconditional* atomic belongs in this shape.
     #
-    # The ``wp.vec3`` accumulator is summed component-wise because ``wp.tile(wp.vec3)`` does not
-    # parse (Warp 1.17), the same reason ``measures.centroid_tiled`` takes three ``wp.tile_sum``
-    # calls. The four-statement prologue the four converted kernels share is not extractable:
-    # ``wp.tid()`` is kernel-only and the guard is an early ``return`` a ``@wp.func`` cannot perform
-    # for its caller. What *is* shared is ``reduce.ITEMS_PER_BLOCK_1D``, read by ``blocks_1d`` at
-    # the launch and by ``tile_chunk`` here.
+    # The ``wp.vec3`` accumulator is folded by one ``reduce.block_sum``, which reduces a vector
+    # componentwise in a single tile reduction. The four-statement prologue the four converted
+    # kernels share is not extractable: ``wp.tid()`` is kernel-only and the guard is an early
+    # ``return`` a ``@wp.func`` cannot perform for its caller. What *is* shared is
+    # ``reduce.ITEMS_PER_BLOCK_1D``, read by ``blocks_1d`` at the launch and by ``tile_chunk`` here.
     chunk, lane = wp.tid()
     n = polyline.shape[0]
     n_pairs = n - is_loop[0]
@@ -93,11 +92,9 @@ def accumulate_newell_normal(
     for k in range(lane, count, wp.block_dim()):
         i = offset + k
         local += wp.cross(polyline[i], polyline[wrap_index(i + 1, n)])
-    sum_x = wp.tile_sum(wp.tile(local[0]))[0]
-    sum_y = wp.tile_sum(wp.tile(local[1]))[0]
-    sum_z = wp.tile_sum(wp.tile(local[2]))[0]
+    block_normal = block_sum(local)
     if lane == 0:
-        wp.atomic_add(out_normal, 0, wp.vec3(sum_x, sum_y, sum_z))
+        wp.atomic_add(out_normal, 0, block_normal)
 
 
 @wp.kernel
@@ -723,17 +720,16 @@ def accumulate_loop_frame(
             midpoint, length = segment_midpoint_and_length(start, polyline[i + 1])
             weighted += midpoint * length
             length_total += length
-    normal_x = wp.tile_sum(wp.tile(normal[0]))[0]
-    normal_y = wp.tile_sum(wp.tile(normal[1]))[0]
-    normal_z = wp.tile_sum(wp.tile(normal[2]))[0]
-    weighted_x = wp.tile_sum(wp.tile(weighted[0]))[0]
-    weighted_y = wp.tile_sum(wp.tile(weighted[1]))[0]
-    weighted_z = wp.tile_sum(wp.tile(weighted[2]))[0]
-    total_length = wp.tile_sum(wp.tile(length_total))[0]
+    # All seven sums in one block reduction.
+    block = block_sum(
+        wp.vector(
+            normal[0], normal[1], normal[2], weighted[0], weighted[1], weighted[2], length_total
+        )
+    )
     if lane == 0:
-        wp.atomic_add(out_normal, 0, wp.vec3(normal_x, normal_y, normal_z))
-        wp.atomic_add(out_weighted_midpoint, 0, wp.vec3(weighted_x, weighted_y, weighted_z))
-        wp.atomic_add(out_length, 0, total_length)
+        wp.atomic_add(out_normal, 0, wp.vec3(block[0], block[1], block[2]))
+        wp.atomic_add(out_weighted_midpoint, 0, wp.vec3(block[3], block[4], block[5]))
+        wp.atomic_add(out_length, 0, block[6])
 
 
 @wp.kernel
@@ -800,13 +796,10 @@ def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_sums: wp.array[wp.
             reflex += wp.float32(1.0)
         if orient2d(mirror_y(current), mirror_y(nxt), mirror_y(after)) < 0:
             reflex_mirrored += wp.float32(1.0)
-    total = wp.tile_sum(wp.tile(local))[0]
-    total_reflex = wp.tile_sum(wp.tile(reflex))[0]
-    total_reflex_mirrored = wp.tile_sum(wp.tile(reflex_mirrored))[0]
+    block = block_sum(wp.vec3(local, reflex, reflex_mirrored))
     if lane == 0:
-        wp.atomic_add(out_sums, 0, total)
-        wp.atomic_add(out_sums, 1, total_reflex)
-        wp.atomic_add(out_sums, 2, total_reflex_mirrored)
+        for slot in range(3):
+            wp.atomic_add(out_sums, slot, block[slot])
 
 
 @wp.kernel
@@ -1043,7 +1036,7 @@ def polyline_total_length(
     for k in range(lane, remaining, wp.block_dim()):
         start = offset + k
         total += segment_length(points[start], points[(start + 1) % n_points])
-    block_total = wp.tile_sum(wp.tile(total))[0]
+    block_total = block_sum(total)
     if lane == 0:
         wp.atomic_add(out_total, 0, block_total)
 
@@ -1068,7 +1061,7 @@ def packed_closed_loop_lengths(
     total = wp.float32(0.0)
     for k in range(lane, n, wp.block_dim()):
         total += segment_length(vertices[loops[base + k]], vertices[loops[base + (k + 1) % n]])
-    length = wp.tile_sum(wp.tile(total))[0]
+    length = block_sum(total)
     if lane == 0:
         out_lengths[loop] = length
 
@@ -1100,16 +1093,11 @@ def polyline_weighted_midpoint_sums(
         )
         weighted += midpoint * length
         total += length
-    # Block-collective, so every lane runs all four and only the commit is guarded.
-    sum_x = wp.tile_sum(wp.tile(weighted[0]))[0]
-    sum_y = wp.tile_sum(wp.tile(weighted[1]))[0]
-    sum_z = wp.tile_sum(wp.tile(weighted[2]))[0]
-    sum_w = wp.tile_sum(wp.tile(total))[0]
+    # Block-collective, so every lane runs it and only the commit is guarded.
+    block = block_sum(wp.vec4(weighted[0], weighted[1], weighted[2], total))
     if lane == 0:
-        wp.atomic_add(out_sums, 0, sum_x)
-        wp.atomic_add(out_sums, 1, sum_y)
-        wp.atomic_add(out_sums, 2, sum_z)
-        wp.atomic_add(out_sums, 3, sum_w)
+        for slot in range(4):
+            wp.atomic_add(out_sums, slot, block[slot])
 
 
 @wp.kernel

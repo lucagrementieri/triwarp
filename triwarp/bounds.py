@@ -666,7 +666,7 @@ _REFINE_CANDIDATES = 128
 _REFINE_WINDOW = 32
 
 # The seeding walk is a single block, so this is its whole width -- and the walk is dominated by
-# the scan rather than by its per-round ``tile_argmin`` pair, so it wants a wide one: the sweep is
+# the scan rather than by its per-round ``block_argmin`` pair, so it wants a wide one: the sweep is
 # flat from here up, with the chains identical at every width. 256 rather than the 128 that ties
 # with it because it is Warp's default, so the module is not loaded a second time for a second
 # ``block_dim`` (section 2.5).

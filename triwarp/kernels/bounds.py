@@ -3,8 +3,9 @@ import math
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT
-from triwarp.kernels.array import atomic_min_packed_box, tile_argmin
+from triwarp.kernels.array import atomic_min_packed_box
 from triwarp.kernels.predicates import TWO_PI_F64
+from triwarp.kernels.reduce import block_argmin
 
 # Super-Fibonacci spiral constants [Alexa 2022]: the two irrational strides whose phase pair
 # equidistributes over SO(3). Held as reciprocals, and multiplied rather than divided by, so the
@@ -278,8 +279,8 @@ def oriented_box_seed_chains(
     is what keeps the refined answer from ever losing to the sampled one.
 
     Launched ``wp.launch_tiled(dim=1)``: one block, whose lanes stride the loss table by
-    ``wp.block_dim()`` and fold with [`tile_argmin`][triwarp.kernels.array.tile_argmin]. On the CPU
-    device that stride is 1, so the single lane walks the whole table and each fold is a
+    ``wp.block_dim()`` and fold with [`block_argmin`][triwarp.kernels.reduce.block_argmin]. On the
+    CPU device that stride is 1, so the single lane walks the whole table and each fold is a
     one-element tile holding its own answer.
 
     A single walk covers both halves of the rule. The shortfall fill -- take the leading candidates
@@ -302,7 +303,7 @@ def oriented_box_seed_chains(
 
     for _round in range(window):
         # The next candidate in ascending (loss, index) order. ``<`` rather than ``<=`` inside the
-        # lane so the lowest index wins there too; ``tile_argmin`` applies the same rule across
+        # lane so the lowest index wins there too; ``block_argmin`` applies the same rule across
         # lanes, and returns the ``-1`` seed when no lane found anything left to take.
         best_loss = wp.float32(FLOAT32_INF_CONSTANT)
         best_box = wp.int32(-1)
@@ -313,7 +314,7 @@ def oriented_box_seed_chains(
             ) and value < best_loss:
                 best_loss = value
                 best_box = box
-        taken_loss, taken_box = tile_argmin(best_loss, best_box)
+        taken_loss, taken_box = block_argmin(best_loss, best_box)
         if taken_box < 0:
             break
 
