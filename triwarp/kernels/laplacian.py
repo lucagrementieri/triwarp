@@ -45,6 +45,22 @@ def cot_entries_from_edge_lengths(
     return cot_entries_from_l2(l2_0, l2_1, l2_2, dbl_area)
 
 
+@wp.func
+def face_half_cotangents(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32
+) -> tuple[wp.float32, wp.float32, wp.float32]:
+    # Face ``f``'s three half-cotangent weights, column ``e`` for the edge opposite corner ``e``:
+    # one row of ``cotmatrix_entries``' table, for a kernel that needs a few faces' weights and not
+    # the whole mesh's (``smoothing.band_dirichlet_values``).
+    v0, v1, v2 = face_vertices(vertices, faces, f)
+    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
+    l0 = wp.sqrt(l2_0)
+    l1 = wp.sqrt(l2_1)
+    l2 = wp.sqrt(l2_2)
+    dbl_area = doublearea_from_lengths(l0, l1, l2)
+    return cot_entries_from_l2(l2_0, l2_1, l2_2, dbl_area)
+
+
 @wp.kernel
 def cotmatrix_entries(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_cot: wp.array2d[wp.Float]
@@ -52,13 +68,7 @@ def cotmatrix_entries(
     # ``out_cot`` is generic: the half-cotangent weights are computed in float32 (the vertex
     # precision) and cast to the requested output dtype (float32 or float64) at store time.
     f = wp.int32(wp.tid())
-    v0, v1, v2 = face_vertices(vertices, faces, f)
-    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
-    l0 = wp.sqrt(l2_0)
-    l1 = wp.sqrt(l2_1)
-    l2 = wp.sqrt(l2_2)
-    dbl_area = doublearea_from_lengths(l0, l1, l2)
-    c0, c1, c2 = cot_entries_from_l2(l2_0, l2_1, l2_2, dbl_area)
+    c0, c1, c2 = face_half_cotangents(vertices, faces, f)
     out_cot[f, 0] = type(out_cot[f, 0])(c0)
     out_cot[f, 1] = type(out_cot[f, 1])(c1)
     out_cot[f, 2] = type(out_cot[f, 2])(c2)

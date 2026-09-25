@@ -71,7 +71,7 @@ import warp as wp
 from triwarp.constants import INT32_MAX, TILE_1D
 from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_representative
 from triwarp.kernels.array import LOOP_PROGRESS, LOOP_ROUND
-from triwarp.kernels.reduce import block_chunk_1d, block_sum, tile_chunk
+from triwarp.kernels.reduce import block_chunk_1d, block_sum, commit_block_sum, tile_chunk
 
 # One past the largest edge index any proposal can hold, so ``wp.atomic_min`` starts empty. The
 # candidate count is bounded by the unique-edge count, which is well inside int32.
@@ -153,10 +153,8 @@ def count_reached_and_referenced(
             referenced = referenced + 1
 
     # Block-collective, so it runs outside the ``lane == 0`` guard.
-    totals = block_sum(wp.vec2i(reached, referenced))
-    if lane == 0:
-        wp.atomic_add(out_counts, COUNT_REACHED, totals[0])
-        wp.atomic_add(out_counts, COUNT_REFERENCED, totals[1])
+    # ``COUNT_REFERENCED`` is the slot after ``COUNT_REACHED``.
+    commit_block_sum(lane, wp.vec2i(reached, referenced), out_counts, COUNT_REACHED)
 
 
 @wp.kernel

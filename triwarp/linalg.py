@@ -674,15 +674,9 @@ def _solve_spd_batched(
         matrix, 1, tol=tol, maxiter=cap, check_every=_supported_check_every(0), preconditioner=kind
     )
     result = solver.solve(rhs, solution)
-    iterations, residual, tolerance = result
-    if check_every == 0 or not isinstance(iterations, wp.array):
+    if check_every == 0 or not isinstance(result[0], wp.array):
         return cast("tuple[int, float, float]", result)
-    # The first read drains the replay; the other two are then nearly free.
-    return (
-        int(iterations.numpy()[0]),
-        math.sqrt(float(residual.numpy().max())),
-        math.sqrt(float(tolerance.numpy().max())),
-    )
+    return solver.host_result()
 
 
 # ``_scalar_expansion``'s results, keyed weakly by the block operator they expand.
@@ -1342,14 +1336,18 @@ def _cg_one_block(
         factor_values, factor_t_values = preconditioner.narrowed()
         steps = preconditioner._steps
         narrow = wp.empty(kernel_cg.ONE_BLOCK_NARROW_SLOTS * total, dtype=wp.float32, device=device)
-    # One buffer for the working vectors and the two per-column results, which the kernel writes
-    # before anything reads them.
+    # One buffer for the working vectors and the three per-column results -- residual, threshold
+    # and round count -- which the kernel writes before anything reads them. The integer count is
+    # only needed as a device array, so a host caller allocates none and reads one buffer.
     scratch = wp.empty(
-        kernel_cg.ONE_BLOCK_SLOTS * total + 2 * n_columns, dtype=wp.float64, device=device
+        kernel_cg.ONE_BLOCK_SLOTS * total + 3 * n_columns, dtype=wp.float64, device=device
     )
     results = twt.as_dense(scratch[kernel_cg.ONE_BLOCK_SLOTS * total :])
-    residual, threshold = twt.as_dense(results[:n_columns]), twt.as_dense(results[n_columns:])
-    iterations = wp.zeros(1, dtype=wp.int32, device=device)
+    residual = twt.as_dense(results[:n_columns])
+    threshold = twt.as_dense(results[n_columns : 2 * n_columns])
+    steps_out = twt.as_dense(results[2 * n_columns :])
+    device_result = check_every == 0 and device.is_cuda
+    iterations = wp.zeros(1, dtype=wp.int32, device=device) if device_result else None
     wp.launch_tiled(
         kernel_cg.cg_one_block,
         dim=[n_columns],
@@ -1372,19 +1370,19 @@ def _cg_one_block(
             rhs,
             scratch,
             narrow,
+            wp.int32(1 if device_result else 0),
         ],
-        outputs=[solution, iterations, residual, threshold],
+        outputs=[solution, iterations, residual, threshold, steps_out],
         block_dim=_CG_ONE_BLOCK_WIDE if n >= CG_ONE_BLOCK_WIDE_FROM else _CG_ONE_BLOCK_NARROW,
         device=device,
     )
-    if check_every == 0 and device.is_cuda:
+    if device_result:
         return iterations, residual, threshold
-    # The first read drains the launch; the second is then nearly free.
     results_np = results.numpy()
     return (
-        int(iterations.numpy()[0]),
+        int(results_np[2 * n_columns :].max()),
         math.sqrt(float(results_np[:n_columns].max())),
-        math.sqrt(float(results_np[n_columns:].max())),
+        math.sqrt(float(results_np[n_columns : 2 * n_columns].max())),
     )
 
 
@@ -1516,14 +1514,41 @@ def _cg_residual_and_tolerance(result: tuple[Any, ...]) -> tuple[float, float]:
     ``check_every=0`` returns 1-element *device* arrays holding the **squared** residual norm and
     squared absolute tolerance, one entry per column, and a positive cadence returns their square
     roots as host scalars already reduced over the columns -- so the unwrapping differs and the
-    quantity does not. Two 8-byte readbacks in the device case, once per solve.
+    quantity does not. One readback in the device case when the two arrays are adjacent views of
+    one buffer -- both of this module's solvers lay them out so -- and two otherwise.
     """
     _iterations, residual, tolerance = result
     if not isinstance(residual, wp.array):
         return float(residual), float(tolerance)
-    residual_np, tolerance_np = residual.numpy(), tolerance.numpy()
+    residual_np, tolerance_np = _read_pair(residual, tolerance)
     worst = int(np.argmax(residual_np / np.maximum(tolerance_np, 1e-300)))
     return math.sqrt(float(residual_np[worst])), math.sqrt(float(tolerance_np[worst]))
+
+
+def _read_pair(first: wp.array[Any], second: wp.array[Any]) -> tuple[Any, Any]:
+    """
+    Read two same-length ``float64`` device arrays back, in one copy when they are adjacent.
+
+    The solvers here return a column's residual and threshold as neighbouring views of one buffer
+    (in either order), so the span covering both is one contiguous array and one readback.
+    """
+    n = int(first.shape[0])
+    itemsize = 8
+    if (
+        first.dtype == wp.float64
+        and second.dtype == wp.float64
+        and int(second.shape[0]) == n
+        and first.device == second.device
+        and first.is_contiguous
+        and second.is_contiguous
+        and abs(int(second.ptr) - int(first.ptr)) == n * itemsize
+    ):
+        low = min(int(first.ptr), int(second.ptr))
+        both = wp.array(ptr=low, shape=(2 * n,), dtype=wp.float64, device=first.device).numpy()
+        if int(first.ptr) == low:
+            return both[:n], both[n:]
+        return both[n:], both[:n]
+    return first.numpy(), second.numpy()
 
 
 class _AdaptiveCg:
@@ -1720,40 +1745,44 @@ class _BatchedCg:
                 f"{preconditioner!r}"
             )
         self._dtype = dtype
-        self._r = wp.zeros(self._dofs, dtype=dtype, device=device)
-        # ``u = M^-1 r``, and ``w = A u``.
-        self._u = wp.zeros(self._dofs, dtype=dtype, device=device)
-        self._w = wp.zeros(self._dofs, dtype=dtype, device=device)
-        # ``p`` and ``s = A p`` share one allocation, so the per-solve reset is one memset.
-        self._ps = wp.zeros(2 * self._dofs, dtype=dtype, device=device)
-        self._p = twt.as_dense(self._ps[: self._dofs])
-        self._s = twt.as_dense(self._ps[self._dofs :])
+        # ``r``, ``u = M^-1 r``, ``w = A u``, the search direction ``p`` and ``s = A p``, in one
+        # allocation: a view is a third of a ``wp.zeros``.
+        dofs = self._dofs
+        vectors = wp.zeros(5 * dofs, dtype=dtype, device=device)
+        self._r, self._u, self._w, self._p, self._s = (
+            twt.as_dense(vectors[k * dofs : (k + 1) * dofs]) for k in range(5)
+        )
         # First-stage partials of the three dots ``cg_matvec_dots`` reduces: ``r.u``, ``w.u``,
         # ``r.r`` (and of ``||b||^2`` in row 0 at the start of a solve). ``wp.empty``: every entry a
         # fold reads, ``[0, blocks)`` of each row, is written by the partials launch before it.
         self._partials = wp.empty(
             (3, self._n_columns, self._blocks), dtype=wp.float64, device=device
         )
-        # ``(alpha, beta, stepping)`` per column, written by ``cg_coefficients`` on the unfolded
-        # path only.
-        self._coefficients = wp.zeros((3, self._n_columns), dtype=wp.float64, device=device)
-        # ``(r.r, r.u)`` per column as of the last round, published by ``cg_update``; row 0 is the
-        # residual the solve returns and the host checks read. Viewed once: re-taking a slice costs
-        # a few microseconds of ``wp.array.__getitem__`` every time.
-        self._dots = wp.zeros((2, self._n_columns), dtype=wp.float64, device=device)
-        self._dots_rz = twt.as_dense(self._dots[0])
-        # The recurrence's scalars per column, double-buffered: ``cg_update`` reads the ``old`` row
-        # in every block and writes the ``new`` one, and ``cg_matvec_dots`` carries it across.
-        self._gamma_alpha = wp.zeros((4, self._n_columns), dtype=wp.float64, device=device)
+        # Every per-column ``float64`` scalar in one ``(10, n_columns)`` allocation, rows viewed
+        # once (re-taking a slice costs a few microseconds of ``wp.array.__getitem__`` each time):
+        #
+        # * row 0, each column's squared threshold (``cg_seed``);
+        # * rows 1-2, ``(r.r, r.u)`` as of the last round, published by ``cg_update`` -- row 1 is
+        #   the residual the solve returns, so rows 0-1 are the whole host result in one readback;
+        # * rows 3-5, ``(alpha, beta, stepping)``, written by ``cg_coefficients`` on the unfolded
+        #   path only;
+        # * rows 6-9, the recurrence's scalars, double-buffered: ``cg_update`` reads the ``old``
+        #   rows in every block and writes the ``new`` ones, and ``cg_matvec_dots`` carries them.
+        scalars = wp.zeros((10, self._n_columns), dtype=wp.float64, device=device)
+        self._residual_tolerance = twt.as_array2d(scalars[0:2], wp.float64)
+        self._atol_sq = twt.as_dense(scalars[0])
+        self._dots = twt.as_array2d(scalars[1:3], wp.float64)
+        self._dots_rz = twt.as_dense(scalars[1])
+        self._coefficients = twt.as_array2d(scalars[3:6], wp.float64)
         self._gamma_old, self._alpha_old, self._gamma_new, self._alpha_new = (
-            twt.as_dense(self._gamma_alpha[row]) for row in range(4)
+            twt.as_dense(scalars[row]) for row in range(6, 10)
         )
-        self._atol_sq = wp.zeros(self._n_columns, dtype=wp.float64, device=device)
-        # Rounds that took a step, which is the iteration count a solve reports.
-        self._iterations = wp.zeros(1, dtype=wp.int32, device=device)
-        # The round-loop state array (``kernels/array.py``'s ``LOOP_ROUND`` / ``LOOP_CONDITION``),
-        # seeded by ``cg_seed`` at the start of every solve.
-        self._state = wp.zeros(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
+        # The round-loop state (``kernels/array.py``'s ``LOOP_ROUND`` / ``LOOP_CONDITION``, seeded
+        # by ``cg_seed`` at the start of every solve) and, after it, the rounds that took a step --
+        # the iteration count a solve reports -- so the host cadence's condition read carries it.
+        self._ints = wp.zeros(kernel_array.LOOP_STATE_SIZE + 1, dtype=wp.int32, device=device)
+        self._state = twt.as_dense(self._ints[: kernel_array.LOOP_STATE_SIZE])
+        self._iterations = twt.as_dense(self._ints[kernel_array.LOOP_STATE_SIZE :])
         # The live rows of ``u`` and ``w`` per column, for ``bsr_mv`` on the heavy-row path.
         self._uw_columns = [
             (
@@ -1974,7 +2003,10 @@ class _BatchedCg:
     def _initialize(self) -> None:
         """Seed the residual from the caller's operands, then the tolerances and the recurrence."""
         tile = int(kernel_cg.CG_TILE)
-        jacobi = self._cycle is None
+        # Whenever the state holds a Jacobi inverse diagonal the initial scaling rides in the
+        # residual's launch, into ``_scaled`` -- ``u`` itself under Jacobi, the polynomial's input
+        # under Jacobi-Chebyshev -- exactly as ``cg_update`` does it every round.
+        jacobi = self._inv_diag is not None
         wp.launch_tiled(
             kernel_cg.CG_INITIAL[self._dtype, self._round_values.dtype],
             dim=(self._n_columns, self._blocks),
@@ -1988,9 +2020,9 @@ class _BatchedCg:
                 self._round_values,
                 self._rhs_flat,
                 self._solution_flat,
-                self._inv_diag if jacobi else None,
+                self._inv_diag,
             ],
-            outputs=[self._r, self._u, self._p, self._s, self._partials],
+            outputs=[self._r, self._scaled, self._p, self._s, self._partials],
             block_dim=tile,
             device=self._device,
         )
@@ -2013,7 +2045,9 @@ class _BatchedCg:
             block_dim=tile,
             device=self._device,
         )
-        if self._cycle is not None:
+        if isinstance(self._cycle, _JacobiChebyshevApply):
+            self._cycle.apply_scaled(self._u)
+        elif self._cycle is not None:
             self._cycle.apply(self._r, self._u)
         if self._settle is not None:
             self._settle_state.zero_()
@@ -2084,6 +2118,7 @@ class _BatchedCg:
             # The monitor's check is the cadence: it is what can stop the loop early.
             check_every = self._settle[0]
         done = 0
+        ints = None
         while done < self._maxiter:
             block = min(check_every, self._maxiter - done)
             for _ in range(block):
@@ -2091,13 +2126,28 @@ class _BatchedCg:
             done += block
             if self._settle is not None:
                 self._settle_check()
-            if not int(self._state.numpy()[int(kernel_array.LOOP_CONDITION)]):
+            # The condition and the iteration count share one buffer, so the last check's read
+            # is also the count's.
+            ints = self._ints.numpy()
+            if not int(ints[int(kernel_array.LOOP_CONDITION)]):
                 break
-        # The first read of a block drains the queue its launches filled; these follow it.
+        return self.host_result(ints)
+
+    def host_result(self, ints: Any = None) -> tuple[int, float, float]:
+        """
+        Read the last solve's ``(iterations, residual, tolerance)`` back as host scalars.
+
+        Two readbacks -- the integer state and the two scalar rows -- where reading the three
+        returned device arrays one at a time takes three; ``ints`` is a read of ``_ints`` the
+        caller already holds, which saves the first.
+        """
+        if ints is None:
+            ints = self._ints.numpy()
+        residual_tolerance = self._residual_tolerance.numpy()
         return (
-            int(self._iterations.numpy()[0]),
-            math.sqrt(float(self._dots_rz.numpy().max())),
-            math.sqrt(float(self._atol_sq.numpy().max())),
+            int(ints[kernel_array.LOOP_STATE_SIZE]),
+            math.sqrt(float(residual_tolerance[1].max())),
+            math.sqrt(float(residual_tolerance[0].max())),
         )
 
 

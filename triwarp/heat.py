@@ -51,7 +51,6 @@ from triwarp._device import require_same_device
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import heat as kernel_heat
-from triwarp.kernels import predicates as kernel_predicates
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.laplacian import (
@@ -432,7 +431,7 @@ def heat_geodesic(
     wp.launch(
         kernel_heat.shift_and_orient,
         dim=n_vertices,
-        inputs=[sums, wp.int32(n_sources), phi],
+        inputs=[sums, wp.int32(n_sources), wp.int32(1), phi],
         device=device,
     )
     return phi
@@ -600,19 +599,15 @@ def heat_signed_distance(
         device=device,
     )
 
-    # Stage 2: diffuse the tangent field, then keep only its direction. The floor below which a
-    # vector is treated as vanished has to be relative to the field's own maximum, not the fixed
-    # ``TOLERANCE_ZERO_CONSTANT`` -- this field carries the mesh's scale exactly like the vector
-    # heat method's direction field below, and an absolute floor zeroes most of it on a mesh not
-    # near unit scale (confirmed: 111 of 162 vertices at a 1e-6 scale, all resolved relative to the
-    # field's own maximum).
+    # Stage 2: diffuse the tangent field; only its direction is kept. No absolute floor may decide
+    # which vectors vanished -- this field carries the mesh's scale, and one zeroes most of it on a
+    # mesh not near unit scale (confirmed: 111 of 162 vertices at a 1e-6 scale).
     diffused = tw.heat.diffuse_tangent_field(
         vector_system, source, preconditioner=vector_preconditioner
     )
-    # Normalized without underflow and zero only where the field is exactly zero: it is converged
-    # per vertex (``_diffuse``), so its far field is a direction however small.
-    unit_field = wp.empty(n_vertices, dtype=wp.vec2d, device=device)
-    wp.map(kernel_predicates.stable_normalize, diffused, out=unit_field)
+    # The divergence kernel normalizes each corner without underflow, zero only where the field is
+    # exactly zero: it is converged per vertex (``_diffuse``), so its far field is a direction
+    # however small.
 
     # Stage 3: integrate the unit field back into a scalar with a Poisson solve. The cotangent
     # weights and face normals come from the same bundle, so the Poisson stage and the diffusion
@@ -621,16 +616,7 @@ def heat_signed_distance(
     wp.launch(
         kernel_heat.vertex_field_divergence,
         dim=n_faces,
-        inputs=[
-            vertices,
-            faces,
-            face_normals,
-            unit_field,
-            basis_x,
-            basis_y,
-            cot_entries,
-            divergence,
-        ],
+        inputs=[vertices, faces, face_normals, diffused, basis_x, basis_y, cot_entries, divergence],
         device=device,
     )
 
@@ -700,10 +686,9 @@ def _solve_poisson_zero_set(
     operator_uu, rhs = twl.assemble_interior_system(
         operator, fixed_mask, free_map, twt.as_array2d(zeros, wp.float64), n_free
     )
-    # Flip sign with the operator: the Poisson right-hand side is -div for the -L convention; the
-    # compaction negates as it goes.
+    # ``divergence`` is already the -div right-hand side the -L operator takes.
     wp.launch(
-        kernel_heat.scatter_negated_free_rhs,
+        kernel_heat.scatter_free_rhs,
         dim=n_vertices,
         inputs=[fixed_mask, free_map, divergence, rhs],
         device=device,
@@ -744,13 +729,27 @@ def _solve_poisson_shifted(
     gradient handles while the right-hand side is consistent; the shift afterwards picks that
     constant, and putting the curve at zero is the choice that makes the result a distance.
     """
-    # In place: ``divergence`` is this call's own scratch, read by nothing after the solve.
-    wp.map(wp.neg, divergence, out=divergence)
-
+    # ``divergence`` is already the -div right-hand side the -L operator takes.
     field = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     twl.solve_spd(operator, divergence, field, tol=_CG_TOLERANCE, preconditioner=preconditioner)
-    offset = tw.reduce.mean(tw.array.gather(field, curve_vertices))
-    wp.map(wp.sub, field, wp.float64(offset), out=field)
+    # ``heat_geodesic``'s device-side shift onto the sources, without its orientation: one launch
+    # sized to the curve for the mean, one to apply it, and nothing read back.
+    n_sources = int(curve_vertices.shape[0])
+    sums = wp.zeros(2, dtype=wp.float64, device=device)
+    wp.launch_tiled(
+        kernel_heat.source_and_global_sums,
+        dim=[kernel_reduce.blocks_1d(n_sources)],
+        inputs=[field, curve_vertices],
+        outputs=[sums],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    wp.launch(
+        kernel_heat.shift_and_orient,
+        dim=n_vertices,
+        inputs=[sums, wp.int32(n_sources), wp.int32(0), field],
+        device=device,
+    )
     return field
 
 
@@ -986,7 +985,12 @@ def extend_scalar(
 
     if operators is None:
         operators = heat_operators(vertices, faces, t)
-    return _extend(operators[0], sources, values, n_vertices, device)[0]
+    diffused_indicator, diffused_values = _extend(operators[0], sources, values, n_vertices, device)
+    # Converged per vertex, so only an exactly zero indicator -- a component no source reaches --
+    # has no value to extend (``divide_nonzero``).
+    extended = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    wp.map(kernel_heat.divide_nonzero, diffused_values, diffused_indicator, out=extended)
+    return extended
 
 
 def _extend(
@@ -996,7 +1000,12 @@ def _extend(
     n_vertices: int,
     device: wp.DeviceLike,
 ) -> tuple[wp.array[wp.float64], wp.array[wp.float64]]:
-    """``extend_scalar``'s body, also returning the diffused ``values`` it divides."""
+    """
+    ``extend_scalar``'s diffusion: the diffused source indicator and the diffused ``values``.
+
+    Their ratio is the extension; it is left to the caller so ``transport_tangent_vectors`` can
+    form it in the map that consumes it rather than in a pass and a buffer of its own.
+    """
     n_sources = int(sources.shape[0])
     # The indicator and the weighted values diffuse through the same operator, so they are one
     # batched two-column solve (``linalg.solve_spd_columns``) rather than two independent ones,
@@ -1012,13 +1021,7 @@ def _extend(
         wp.zeros((2, n_vertices), dtype=wp.float64, device=device), wp.float64
     )
     _diffuse(heat_system, rhs, diffused, None)
-    diffused_indicator, diffused_values = twt.as_dense(diffused[0]), twt.as_dense(diffused[1])
-
-    # Converged per vertex, so only an exactly zero indicator -- a component no source reaches --
-    # has no value to extend (``divide_nonzero``).
-    extended = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.map(kernel_heat.divide_nonzero, diffused_values, diffused_indicator, out=extended)
-    return extended, diffused_values
+    return twt.as_dense(diffused[0]), twt.as_dense(diffused[1])
 
 
 def transport_tangent_vectors(
@@ -1132,19 +1135,21 @@ def transport_tangent_vectors(
 
     magnitudes = wp.empty(n_sources, dtype=wp.float64, device=device)
     wp.map(wp.length, vectors_d, out=magnitudes)
-    extended, diffused_magnitudes = _extend(scalar[0], sources, magnitudes, n_vertices, device)
+    diffused_indicator, diffused_magnitudes = _extend(
+        scalar[0], sources, magnitudes, n_vertices, device
+    )
 
-    # One map for the whole tail: the rescale, the narrowing to the field's storage precision and
-    # the resolution test all read one vertex's own data, so running them apart costs two extra
-    # launches and a full round trip of the rescaled float64 field. Resolution is asked locally,
-    # against the diffused magnitudes at the same vertex -- see the kernel func.
+    # One map for the whole tail: the magnitude's extension, the rescale, the narrowing to the
+    # field's storage precision and the resolution test all read one vertex's own data, so running
+    # them apart costs extra launches and full round trips of float64 fields. Resolution is asked
+    # locally, against the diffused magnitudes at the same vertex -- see the kernel func.
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     resolved = wp.empty(n_vertices, dtype=wp.bool, device=device)
     wp.map(
         kernel_heat.transported_and_resolved,
         direction,
-        extended,
         diffused_magnitudes,
+        diffused_indicator,
         wp.float64(_RESOLVED_FRACTION),
         out=[transported, resolved],
     )
@@ -1227,15 +1232,11 @@ def log_map(
     sources = wp.array([source], dtype=wp.int32, device=device)
     # The source's own reference direction, transported outwards: this is the "which way was x?"
     # field the angle is measured against. Raw (unnormalized) magnitude, exactly like
-    # ``transport_tangent_vectors``' own ``direction`` -- so the cut-locus test below has to floor
-    # it relative to its own maximum for the same reason that function does (§ its docstring).
+    # ``transport_tangent_vectors``' own ``direction``; the kernel normalizes it without underflow.
     reference = wp.array([[1.0, 0.0]], dtype=wp.vec2d, device=device)
     transported_raw = _diffuse_from_sources(
         vector_system, sources, reference, n_vertices, device, preconditioner=vector_preconditioner
     )
-    # Normalized in ``float64`` before it is narrowed, which the far field needs to survive.
-    transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.map(kernel_heat.narrow_direction, transported_raw, out=transported)
 
     # Radial direction: the unit gradient of the distance field, averaged onto vertices and
     # expressed in each vertex's frame.
@@ -1249,14 +1250,13 @@ def log_map(
         inputs=[vertices, faces, normals, areas, distance, vertex_gradient],
         device=device,
     )
-    radial = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.map(kernel_heat.world_to_tangent_unit, vertex_gradient, basis_x, basis_y, out=radial)
-
+    # The kernel expresses the gradient in each vertex's frame and normalizes the transported
+    # reference in ``float64`` before narrowing it, which the far field needs to survive.
     logarithm = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.launch(
         kernel_heat.log_map_from_angles,
         dim=n_vertices,
-        inputs=[radial, transported, distance, logarithm],
+        inputs=[vertex_gradient, basis_x, basis_y, transported_raw, distance, logarithm],
         device=device,
     )
     return logarithm

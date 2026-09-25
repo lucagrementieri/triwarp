@@ -109,18 +109,28 @@ def block_argmin(value: Any, index: wp.int32) -> tuple[Any, wp.int32]:
 
 
 @wp.func
+def commit_block_sum(lane: wp.int32, local: Any, out: wp.array[Any], base: wp.int32):
+    # The commit of every packed block fold: each lane's register vector, folded by one
+    # ``block_sum`` (a barrier, so every lane runs it), then added component by component by lane 0
+    # into ``out[base:base + len(local)]`` -- one atomic per slot per block, the ``reduce`` fold's
+    # commit. ``wp.atomic_add`` reads trailing indices as array dimensions, not vector components,
+    # which is why the components are committed one at a time.
+    block = block_sum(local)
+    if lane == 0:
+        for slot in range(len(block)):
+            wp.atomic_add(out, base + slot, block[slot])
+
+
+@wp.func
 def commit_sum_and_count(
     lane: wp.int32, total: wp.float64, count: wp.float64, out_sum_and_count: wp.array[wp.float64]
 ):
     # The commit of a fused "mean over the entries that qualify" block fold: each lane's register
-    # sum and count, folded as one ``block_sum`` pair (a barrier, so every lane runs it), then added
-    # by lane 0 into the two-slot buffer the caller reads once. Shared by
-    # ``heat.upper_edge_length_sum_and_count``, ``points.accumulate_counted_mean`` and
-    # ``reconstruction.positive_finite_sum_and_count``, which differ only in what qualifies.
-    block = block_sum(wp.vec2d(total, count))
-    if lane == 0:
-        wp.atomic_add(out_sum_and_count, 0, block[0])
-        wp.atomic_add(out_sum_and_count, 1, block[1])
+    # sum and count, as one ``commit_block_sum`` pair into the two-slot buffer the caller reads
+    # once. Shared by ``heat.upper_edge_length_sum_and_count``, ``heat.source_and_global_sums``,
+    # ``points.accumulate_counted_mean`` and ``reconstruction.positive_finite_sum_and_count``, which
+    # differ only in what qualifies.
+    commit_block_sum(lane, wp.vec2d(total, count), out_sum_and_count, 0)
 
 
 def blocks_1d(n: int) -> int:

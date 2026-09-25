@@ -645,7 +645,13 @@ def _poisson_dense_solve(
     """Run the cascadic dense solve, returning the finest solution buffer and its resolution."""
     prev_solution: wp.array[wp.float32] | None = None
     prev_res = 0
-    for level in range(full_depth, depth + 1):
+    # Every level's iteration count, read back once after the whole cascade rather than after each
+    # level: a read between levels would stall the host until that level's solve drained, where
+    # without it the next level's splat, setup and graph recording are issued while it runs.
+    levels = range(full_depth, depth + 1)
+    counts = wp.empty(len(levels), dtype=wp.int32, device=device)
+    level_results: list[tuple[int, wp.array[wp.float64]]] = []
+    for k, level in enumerate(levels):
         res = (1 << level) + 1
         inv_cell = float(res - 1) / cube_size
         n_nodes = res * res * res
@@ -659,7 +665,7 @@ def _poisson_dense_solve(
                 inputs=[prev_solution, prev_res, res, initial],
                 device=device,
             )
-        prev_solution = _poisson_solve_level(
+        residual_tolerance = _poisson_solve_level(
             points,
             normals,
             cube_lower,
@@ -670,11 +676,28 @@ def _poisson_dense_solve(
             initial,
             solver_iterations,
             solver_tolerance,
+            twt.as_dense(counts[k : k + 1]),
             device,
         )
+        level_results.append((res, residual_tolerance))
+        prev_solution = initial
         prev_res = res
 
     assert prev_solution is not None
+    # One read of the counts, and one more only for a level that used its whole budget: a level
+    # that stops at ``solver_iterations`` above its tolerance says so, as ``linalg.solve_spd`` does.
+    for iterations, (res, residual_tolerance) in zip(counts.numpy(), level_results, strict=True):
+        if int(iterations) < solver_iterations:
+            continue
+        tolerance_sq, residual_sq = residual_tolerance.numpy()
+        residual, tolerance = math.sqrt(float(residual_sq)), math.sqrt(float(tolerance_sq))
+        if residual > tolerance:
+            warnings.warn(
+                f"screened_poisson: the {res}^3 level's conjugate gradient hit its "
+                f"{solver_iterations}-iteration cap with residual norm {residual:.3e} against "
+                f"tolerance {tolerance:.3e}; raise solver_iterations or solver_tolerance.",
+                stacklevel=2,
+            )
     return prev_solution, prev_res
 
 
@@ -689,22 +712,23 @@ def _poisson_solve_level(
     initial: wp.array[wp.float32],
     solver_iterations: int,
     solver_tolerance: float,
+    iterations: wp.array[wp.int32],
     device: wp.DeviceLike,
-) -> wp.array[wp.float32]:
+) -> wp.array[wp.float64]:
     """
     Solve one cascade level ``(L_N + screen * W) x = -div V`` matrix-free from ``initial``.
 
     Splats the oriented normals into the vector field ``V`` and density weight ``W`` on a
     ``res**3`` node grid, normalizes ``V``, builds the negative-divergence right-hand side, and runs
     a Jacobi-preconditioned conjugate gradient with the screened Laplacian applied as a
-    ``warp.optim.linear.LinearOperator``. Returns the ``res**3`` solution buffer (``initial`` is the
-    warm start and is returned in place).
+    ``warp.optim.linear.LinearOperator``. ``initial`` is the warm start and is solved in place;
+    ``iterations`` receives the round count, and the returned device pair is the squared threshold
+    and squared residual (``_solve_screened_poisson``) -- nothing is read back here.
     """
     n_nodes = res * res * res
-    vx = wp.zeros(n_nodes, dtype=wp.float32, device=device)
-    vy = wp.zeros(n_nodes, dtype=wp.float32, device=device)
-    vz = wp.zeros(n_nodes, dtype=wp.float32, device=device)
-    weights = wp.zeros(n_nodes, dtype=wp.float32, device=device)
+    # The splat's four accumulators in one zeroed allocation.
+    splat = wp.zeros(4 * n_nodes, dtype=wp.float32, device=device)
+    vx, vy, vz, weights = (twt.as_dense(splat[k * n_nodes : (k + 1) * n_nodes]) for k in range(4))
     wp.launch(
         kernel_reconstruction.splat_normals,
         dim=int(points.shape[0]),
@@ -732,10 +756,18 @@ def _poisson_solve_level(
         device=device,
     )
 
-    _solve_screened_poisson(
-        weights, screen, res, rhs, smoother, initial, solver_iterations, solver_tolerance, device
+    return _solve_screened_poisson(
+        weights,
+        screen,
+        res,
+        rhs,
+        smoother,
+        initial,
+        solver_iterations,
+        solver_tolerance,
+        iterations,
+        device,
     )
-    return initial
 
 
 def _solve_screened_poisson(
@@ -747,8 +779,9 @@ def _solve_screened_poisson(
     solution: wp.array[wp.float32],
     maxiter: int,
     tol: float,
+    iterations: wp.array[wp.int32],
     device: wp.DeviceLike,
-) -> None:
+) -> wp.array[wp.float64]:
     """
     Multigrid-preconditioned conjugate gradient on the grid's screened Laplacian, from ``solution``.
 
@@ -758,27 +791,29 @@ def _solve_screened_poisson(
     ``float32``: at ``2 ** 8 + 1`` nodes a side a round is bound by the bytes it moves, and doubling
     them would double it; the dots' fold across blocks and ``alpha`` and ``beta`` are ``float64``.
     The stopping rule is ``warp.optim.linear.cg``'s with ``atol = 0`` -- the relative residual
-    ``tol`` or ``maxiter`` rounds -- tested on device, so the loop is one recorded graph and no
-    readback until the end, where a level that ran out of iterations above its tolerance warns.
+    ``tol`` or ``maxiter`` rounds -- tested on device, so the loop is one recorded graph and nothing
+    is read back: the round count lands in ``iterations`` and the squared threshold and residual in
+    the returned length-2 array, for the caller to test once every level has been issued.
     """
     n = res * res * res
     tile = int(kernel_cg.CG_TILE)
     span, blocks, fold = kernel_cg.cg_layout(n, tw.linalg.CG_FOLD_MAX_BLOCKS)
     stride = blocks * span
-    r = wp.empty(stride, dtype=wp.float32, device=device)
-    u = wp.empty(stride, dtype=wp.float32, device=device)
-    w = wp.empty(stride, dtype=wp.float32, device=device)
-    p = wp.empty(stride, dtype=wp.float32, device=device)
-    s = wp.empty(stride, dtype=wp.float32, device=device)
+    # The five vectors in one allocation; every entry is written by ``poisson_cg_initial``.
+    vectors = wp.empty(5 * stride, dtype=wp.float32, device=device)
+    r, u, w, p, s = (twt.as_dense(vectors[k * stride : (k + 1) * stride]) for k in range(5))
     # Every entry a fold reads, ``[0, blocks)``, is written by the partials launch before it.
     partials = wp.empty((3, 1, blocks), dtype=wp.float64, device=device)
-    coefficients = wp.empty((3, 1), dtype=wp.float64, device=device)
-    dots = wp.empty((2, 1), dtype=wp.float64, device=device)
-    scalars = wp.empty((5, 1), dtype=wp.float64, device=device)
-    gamma_old, alpha_old, gamma_new, alpha_new, atol_sq = (
-        twt.as_dense(scalars[row, 0:1]) for row in range(5)
+    # The per-solve scalars in one allocation, the squared threshold and the dots' ``(r.r, gamma)``
+    # leading so the pair the caller tests is contiguous, then the coefficients and the
+    # recurrence's four scalars.
+    scalars = wp.empty((10, 1), dtype=wp.float64, device=device)
+    atol_sq = twt.as_dense(scalars[0, 0:1])
+    dots = twt.as_array2d(scalars[1:3], wp.float64)
+    coefficients = twt.as_array2d(scalars[3:6], wp.float64)
+    gamma_old, alpha_old, gamma_new, alpha_new = (
+        twt.as_dense(scalars[row, 0:1]) for row in range(6, 10)
     )
-    iterations = wp.empty(1, dtype=wp.int32, device=device)
     state = wp.empty(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
     screen_f = wp.float32(screen)
     multigrid = _PoissonMultigrid(weights, screen, res, smoother, device)
@@ -857,18 +892,7 @@ def _solve_screened_poisson(
         multigrid.apply(r, u)
 
     run_device_loop(device, state[kernel_array.LOOP_CONDITION_VIEW], round_)
-    # One read of the count, and two more only on a solve that used its whole budget: a level that
-    # stops at ``maxiter`` above its tolerance says so, as ``linalg.solve_spd`` does.
-    if int(iterations.numpy()[0]) >= maxiter:
-        residual = math.sqrt(float(dots.numpy()[0, 0]))
-        tolerance = math.sqrt(float(atol_sq.numpy()[0]))
-        if residual > tolerance:
-            warnings.warn(
-                f"screened_poisson: the {res}^3 level's conjugate gradient hit its {maxiter}-"
-                f"iteration cap with residual norm {residual:.3e} against tolerance "
-                f"{tolerance:.3e}; raise solver_iterations or solver_tolerance.",
-                stacklevel=4,
-            )
+    return twt.as_dense(scalars.flatten()[0:2])
 
 
 # Damped-Jacobi sweeps before and after each coarse-grid correction, the damping, the sweeps on the

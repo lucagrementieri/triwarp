@@ -20,7 +20,7 @@ from triwarp.kernels.predicates import (
     project_out_normal,
     vector_angle,
 )
-from triwarp.kernels.reduce import block_chunk_1d, block_sum
+from triwarp.kernels.reduce import block_chunk_1d, block_sum, commit_block_sum
 
 
 @wp.func
@@ -796,10 +796,7 @@ def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_sums: wp.array[wp.
             reflex += wp.float32(1.0)
         if orient2d(mirror_y(current), mirror_y(nxt), mirror_y(after)) < 0:
             reflex_mirrored += wp.float32(1.0)
-    block = block_sum(wp.vec3(local, reflex, reflex_mirrored))
-    if lane == 0:
-        for slot in range(3):
-            wp.atomic_add(out_sums, slot, block[slot])
+    commit_block_sum(lane, wp.vec3(local, reflex, reflex_mirrored), out_sums, 0)
 
 
 @wp.kernel
@@ -1094,10 +1091,7 @@ def polyline_weighted_midpoint_sums(
         weighted += midpoint * length
         total += length
     # Block-collective, so every lane runs it and only the commit is guarded.
-    block = block_sum(wp.vec4(weighted[0], weighted[1], weighted[2], total))
-    if lane == 0:
-        for slot in range(4):
-            wp.atomic_add(out_sums, slot, block[slot])
+    commit_block_sum(lane, wp.vec4(weighted[0], weighted[1], weighted[2], total), out_sums, 0)
 
 
 @wp.kernel

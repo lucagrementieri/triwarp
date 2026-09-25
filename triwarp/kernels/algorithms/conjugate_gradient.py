@@ -33,7 +33,7 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.kernels.algorithms.multigrid import csr_row_dot
+from triwarp.kernels.algorithms.multigrid import chebyshev_update, csr_row_dot
 from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND, OverloadTable, inverse_or_one
 from triwarp.kernels.linalg import csr_row_diagonal
 from triwarp.kernels.reduce import block_chunk_1d, block_max, block_sum
@@ -108,8 +108,10 @@ def cg_initial(
     # Everything a solve computes before its first round that is per entry, in one launch tiled
     # over ``(n_columns, stride / CG_TILE)`` at ``block_dim=CG_TILE``: the warm-started residual
     # ``r = b - A x`` from the caller's ``b`` and ``x`` (both at pitch ``n``, into the solver's own
-    # vectors at the padded pitch ``stride``), ``u = D^-1 r`` under Jacobi (``jacobi`` set; another
-    # preconditioner writes ``u`` in its own launches after this one), ``p = s = 0``, and the first
+    # vectors at the padded pitch ``stride``), ``D^-1 r`` into ``out_u`` with ``jacobi`` set --
+    # ``u`` under Jacobi, the Jacobi-Chebyshev polynomial's input under that polynomial, which then
+    # writes ``u``; another preconditioner writes ``u`` in its own launches after this one --
+    # ``p = s = 0``, and the first
     # stage of ``||b||^2`` into ``out_partials[0]``, which ``cg_seed`` folds into the tolerance. The
     # pad rows are written as zeros, which is what every reduction over them assumes. The lanes
     # stride by ``wp.block_dim()`` for the CPU device (section 2.2).
@@ -163,7 +165,7 @@ def cg_seed(
     c, t = wp.tid()
     b_norm_sq = sum_block_partials(partials[0, c], n_blocks, t)
     if t == 0:
-        out_atol_sq[c] = wp.max(tol_sq * b_norm_sq, atol_sq)
+        out_atol_sq[c] = cg_threshold(tol_sq, atol_sq, b_norm_sq)
         out_gamma_new[c] = wp.float64(wp.inf)
         out_alpha_new[c] = wp.float64(1.0)
         if c == 0:
@@ -254,6 +256,26 @@ def cg_round_terms(r: wp.Float, u: wp.Float, w: wp.Float) -> Any:
 def cg_widen(total: Any) -> wp.vec3d:
     # A block's ``(r.u, w.u, r.r)`` sum, widened for the ``float64`` fold across blocks.
     return wp.vec3d(wp.float64(total[0]), wp.float64(total[1]), wp.float64(total[2]))
+
+
+@wp.func
+def cg_advance(
+    u: wp.Float, w: wp.Float, p: wp.Float, s: wp.Float, r: wp.Float, alpha: wp.Float, beta: wp.Float
+) -> tuple[wp.Float, wp.Float, wp.Float]:
+    # One entry of a Chronopoulos-Gear update: ``p' = u + beta p``, ``s' = w + beta s`` (so
+    # ``s = A p`` by recurrence) and ``r' = r - alpha s'``, returned as ``(p', s', r')``; the
+    # caller adds ``alpha p'`` to its own ``x`` and applies its own preconditioner to ``r'``.
+    # Shared by ``cg_update`` and ``cg_one_block``, which differ only in where the vectors live.
+    pk = u + beta * p
+    sk = w + beta * s
+    return pk, sk, r - alpha * sk
+
+
+@wp.func
+def cg_threshold(tol_sq: wp.float64, atol_sq: wp.float64, b_norm_sq: wp.float64) -> wp.float64:
+    # A column's squared stopping threshold, ``max(atol, tol * ||b||)^2`` -- ``warp.optim.linear``'s
+    # convention, so the solvers here stop on the condition Warp's would.
+    return wp.max(tol_sq * b_norm_sq, atol_sq)
 
 
 @wp.kernel
@@ -425,6 +447,8 @@ def cg_close_round(
     n_columns: wp.int32,
     n_blocks: wp.int32,
     partials: wp.array3d[wp.float64],
+    gamma_old: wp.array[wp.float64],
+    alpha_old: wp.array[wp.float64],
     atol_sq: wp.array[wp.float64],
     round_index: wp.int32,
     maxiter: wp.int32,
@@ -436,13 +460,22 @@ def cg_close_round(
     # measures the residual this step produced. Every column's ``r.r`` is needed, and the other
     # columns' blocks publish theirs concurrently, so this block folds them itself; the fold is
     # block-collective, so the whole block runs the loop and only lane 0 writes. Column 0's step is
-    # the caller's own.
+    # the caller's own; every other column's is decided by the same ``cg_step_scalars`` its own
+    # blocks ran, so a column at its round-off floor -- which takes no step there -- does not
+    # count or keep the loop alive here either.
     stepped = wp.int32(0)
     if first_step[2] != wp.float64(0.0):
         stepped = 1
     for col in range(1, n_columns):
-        col_rr = cg_fold_column(col, t, n_blocks, partials)[2]
-        if col_rr > atol_sq[col] and round_index <= maxiter:
+        col_step = cg_step_scalars(
+            cg_fold_column(col, t, n_blocks, partials),
+            gamma_old[col],
+            alpha_old[col],
+            atol_sq[col],
+            round_index,
+            maxiter,
+        )
+        if col_step[2] != wp.float64(0.0):
             stepped = 1
     if t == 0:
         out_iterations[0] = out_iterations[0] + stepped
@@ -489,6 +522,8 @@ def cg_coefficients(
             n_columns,
             n_blocks,
             partials,
+            gamma_old,
+            alpha_old,
             atol_sq,
             round_index,
             maxiter,
@@ -576,14 +611,12 @@ def cg_update(
         for k in range(t, span, wp.block_dim()):
             local = blk * span + k
             i = c * stride + local
-            pk = u[i] + beta * p[i]
-            sk = w[i] + beta * s[i]
+            pk, sk, residual = cg_advance(u[i], w[i], p[i], s[i], r[i], alpha, beta)
             p[i] = pk
             s[i] = sk
             if local < n:
                 slot = c * n + local
                 out_x[slot] = out_x[slot] + alpha * pk
-            residual = r[i] - alpha * sk
             r[i] = residual
             if jacobi != 0 and local < n:
                 out_scaled[i] = inv_diag[local] * residual
@@ -597,6 +630,8 @@ def cg_update(
                 n_columns,
                 n_blocks,
                 partials,
+                gamma_old,
+                alpha_old,
                 atol_sq,
                 round_index,
                 maxiter,
@@ -647,12 +682,12 @@ def one_block_chebyshev(
     scratch: wp.array[wp.float64],
 ) -> None:
     # ``destination = p(A) source`` inside one block, one pass and one barrier per Chebyshev step:
-    # ``multigrid.chebyshev_step``'s arithmetic, in the same order, with its coefficients narrowed,
-    # over one column of the ``float32`` slots named by ``source`` and ``destination`` -- or, with
-    # ``widen_to`` at zero or above, the last step writes ``float64`` into that slot of ``scratch``
-    # instead. The iterates rotate through the three ``ONE_BLOCK_NARROW_T`` slots -- step ``k``
-    # writes slot ``k % 3``, and reads the two before it, or ``source`` for the first two, as
-    # ``chebyshev_step`` does -- so no step writes what it reads.
+    # ``multigrid.chebyshev_update``, as ``chebyshev_step`` applies it, with its coefficients
+    # narrowed, over one column of the ``float32`` slots named by ``source`` and ``destination``
+    # -- or, with ``widen_to`` at zero or above, the last step writes ``float64`` into that slot of
+    # ``scratch`` instead. The iterates rotate through the three ``ONE_BLOCK_NARROW_T`` slots --
+    # step ``k`` writes slot ``k % 3``, and reads the two before it, or ``source`` for the first
+    # two, as ``chebyshev_step`` does -- so no step writes what it reads.
     n_steps = steps.shape[0]
     source_base = source * total + column_base
     for k in range(n_steps):
@@ -676,11 +711,12 @@ def one_block_chebyshev(
         wide_base = widen_to * total + column_base
         for row in range(lane, n, wp.block_dim()):
             ax = csr_row_dot(row, current_base, offsets, columns, values, narrow)
-            now = coefficients[0] * narrow[current_base + row]
-            value = (
-                now
-                + coefficients[2] * (now - coefficients[1] * narrow[previous_base + row])
-                + coefficients[3] * (narrow[source_base + row] - coefficients[0] * ax)
+            value = chebyshev_update(
+                coefficients,
+                narrow[current_base + row],
+                narrow[previous_base + row],
+                narrow[source_base + row],
+                ax,
             )
             if last and widen_to >= 0:
                 scratch[wide_base + row] = wp.float64(value)
@@ -770,10 +806,12 @@ def cg_one_block(
     rhs: wp.array[wp.float64],
     scratch: wp.array[wp.float64],
     narrow: wp.array[wp.float32],
+    count_iterations: wp.int32,
     out_x: wp.array[wp.float64],
     out_iterations: wp.array[wp.int32],
     out_rr: wp.array[wp.float64],
     out_atol_sq: wp.array[wp.float64],
+    out_steps: wp.array[wp.float64],
 ) -> None:
     # A whole preconditioned conjugate-gradient solve in **one launch**, one block per column,
     # lanes striding the column's rows and block reductions for barriers: the launch a
@@ -786,9 +824,11 @@ def cg_one_block(
     # stops on its own. The whole column lives in one SM, so this is for small systems only --
     # ``linalg.CG_ONE_BLOCK_MAX_ROWS``.
     #
-    # ``out_x`` is the initial guess on entry, ``out_iterations`` (zeroed by the caller) the most
-    # rounds any column stepped, ``out_rr`` / ``out_atol_sq`` each column's last measured ``r.r``
-    # and its threshold -- the three values ``_BatchedCg`` returns. On the CPU device a block is
+    # ``out_x`` is the initial guess on entry, ``out_iterations`` (zeroed by the caller, and only
+    # written with ``count_iterations`` set) the most rounds any column stepped, ``out_rr`` /
+    # ``out_atol_sq`` each column's last measured ``r.r`` and its threshold -- the three values
+    # ``_BatchedCg`` returns -- and ``out_steps`` each column's own round count, so a host caller
+    # reads all three from one buffer and needs no integer one. On the CPU device a block is
     # one lane, which walks every row: the lane-free form that backend wants anyway.
     c, lane = wp.tid()
     total = n_columns * n
@@ -818,7 +858,7 @@ def cg_one_block(
         else:
             narrow[narrow_r_base + row] = wp.float32(residual)
         b_norm_sq += rhs[column_base + row] * rhs[column_base + row]
-    atol_sq = tol_sq * block_sum(b_norm_sq)
+    atol_sq = cg_threshold(tol_sq, zero, block_sum(b_norm_sq))
     one_block_precondition(
         polynomial,
         n,
@@ -855,12 +895,18 @@ def cg_one_block(
         alpha = step[0]
         beta = step[1]
         for row in range(lane, n, wp.block_dim()):
-            pk = scratch[u_base + row] + beta * scratch[p_base + row]
-            sk = scratch[w_base + row] + beta * scratch[s_base + row]
+            pk, sk, residual = cg_advance(
+                scratch[u_base + row],
+                scratch[w_base + row],
+                scratch[p_base + row],
+                scratch[s_base + row],
+                scratch[r_base + row],
+                alpha,
+                beta,
+            )
             scratch[p_base + row] = pk
             scratch[s_base + row] = sk
             out_x[column_base + row] = out_x[column_base + row] + alpha * pk
-            residual = scratch[r_base + row] - alpha * sk
             scratch[r_base + row] = residual
             if polynomial == 0:
                 scratch[u_base + row] = scratch[inv_base + row] * residual
@@ -891,7 +937,9 @@ def cg_one_block(
     if lane == 0:
         out_rr[c] = rr
         out_atol_sq[c] = atol_sq
-        wp.atomic_max(out_iterations, 0, stepped)
+        out_steps[c] = wp.float64(stepped)
+        if count_iterations != 0:
+            wp.atomic_max(out_iterations, 0, stepped)
 
 
 # Slots of a settle monitor's state (``linalg._BatchedCg``'s ``settle=``), one ``float64`` word

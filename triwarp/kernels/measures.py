@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
-from triwarp.kernels.reduce import block_sum, tile_chunk
+from triwarp.kernels.reduce import commit_block_sum, tile_chunk
 from triwarp.kernels.triangles import face_area_weighted_centroid, face_vertices_vec3d
 
 
@@ -49,10 +49,7 @@ def centroid_tiled(
     area = wp.float32(0.0)
     if f < n_faces:
         contrib, area = face_area_weighted_centroid(vertices, faces, f)
-    block = block_sum(wp.vec4(contrib[0], contrib[1], contrib[2], area))
-    if t == 0:
-        for slot in range(4):
-            wp.atomic_add(out_totals, slot, block[slot])
+    commit_block_sum(t, wp.vec4(contrib[0], contrib[1], contrib[2], area), out_totals, 0)
 
 
 @wp.kernel
@@ -181,8 +178,4 @@ def moment_integrals(
         local[1 + j] = first[j]
         local[4 + j] = squares[j]
         local[7 + j] = products[j]
-    totals = block_sum(local)
-
-    if lane == 0:
-        for j in range(10):
-            wp.atomic_add(out_totals, j, totals[j])
+    commit_block_sum(lane, local, out_totals, 0)

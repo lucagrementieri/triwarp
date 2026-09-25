@@ -26,7 +26,7 @@ from triwarp.kernels.predicates import (
     unit_tangent,
     world_to_tangent,
 )
-from triwarp.kernels.reduce import block_chunk_1d, block_sum, commit_sum_and_count
+from triwarp.kernels.reduce import block_chunk_1d, commit_sum_and_count
 from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import face_unit_gradient, face_vertices_vec3d
 
@@ -186,9 +186,11 @@ def source_and_global_sums(
 ) -> None:
     # ``(sum of phi over the sources, sum of phi over every vertex)`` into ``out_sums`` (zeroed by
     # the caller), for ``shift_and_orient``: both means the heat method's normalization needs, in
-    # one launch. The ``reduce`` block fold over whichever of the two ranges is the longer; a block
-    # past the end of the other contributes zero to it. ``sources`` may repeat a vertex, which is
-    # then counted as often as it appears, as a gathered mean counts it.
+    # one launch. The ``reduce`` block fold over whichever of the two ranges the launch covers; a
+    # block past the end of the other contributes zero to it, so a launch sized to the sources
+    # alone gives a correct first sum -- all ``shift_and_orient`` reads when it does not orient.
+    # ``sources`` may repeat a vertex, which is then counted as often as it appears, as a gathered
+    # mean counts it.
     i, t = wp.tid()
     base, remaining = block_chunk_1d(phi.shape[0], i)
     source_base, source_remaining = block_chunk_1d(sources.shape[0], i)
@@ -198,25 +200,23 @@ def source_and_global_sums(
         at_sources += phi[sources[source_base + k]]
     for k in range(t, remaining, wp.block_dim()):
         everywhere += phi[base + k]
-    block = block_sum(wp.vec2d(at_sources, everywhere))
-    if t == 0:
-        wp.atomic_add(out_sums, 0, block[0])
-        wp.atomic_add(out_sums, 1, block[1])
+    commit_sum_and_count(t, at_sources, everywhere, out_sums)
 
 
 @wp.kernel
 def shift_and_orient(
-    sums: wp.array[wp.float64], n_sources: wp.int32, phi: wp.array[wp.float64]
+    sums: wp.array[wp.float64], n_sources: wp.int32, orient: wp.int32, phi: wp.array[wp.float64]
 ) -> None:
-    # Shift ``phi`` so its mean over the sources is zero and orient it positive -- the
-    # ``igl::heat_geodesics_solve`` convention, which makes a single source's distance exactly
-    # zero -- from ``source_and_global_sums``' two sums, read on the device so the host never waits
-    # for them. The shifted field's mean is the global mean less the offset, so its sign needs no
-    # second pass. ``phi`` is updated in place.
+    # Shift ``phi`` so its mean over the sources is zero and, with ``orient`` set, orient it
+    # positive -- the ``igl::heat_geodesics_solve`` convention, which makes a single source's
+    # distance exactly zero -- from ``source_and_global_sums``' two sums, read on the device so the
+    # host never waits for them. The shifted field's mean is the global mean less the offset, so
+    # its sign needs no second pass. ``phi`` is updated in place. The signed method shifts its
+    # field onto its curve the same way and must not orient it: its sign is the answer.
     v = wp.int32(wp.tid())
     offset = sums[0] / wp.float64(n_sources)
     shifted = phi[v] - offset
-    if sums[1] / wp.float64(phi.shape[0]) - offset < wp.float64(0.0):
+    if orient != 0 and sums[1] / wp.float64(phi.shape[0]) - offset < wp.float64(0.0):
         shifted = offset - phi[v]
     phi[v] = shifted
 
@@ -278,34 +278,38 @@ def vertex_field_divergence(
     # register. Each corner's 2D components mean nothing outside its own frame, so they have to be
     # expanded to 3D *before* averaging.
     #
-    # ``field`` must already be normalized per vertex -- the caller floors the diffused field
-    # against its own maximum and passes the unit directions. That precondition is what makes the
-    # *absolute* ``TOLERANCE_ZERO_CONSTANT`` correct here, where everywhere else in this module a
-    # diffused field is compared against a relative floor (see ``scale_to_magnitude``): the sum of
-    # three unit vectors carries no coordinate scale, so the test only asks whether the three
-    # corners cancelled. Hand it a raw diffused field and it zeroes whole faces on any mesh away
-    # from unit scale.
+    # ``field`` is the raw diffused field; each corner is normalized here (``stable_normalize``,
+    # without underflow, zero only where the field is exactly zero), which is what makes the
+    # *absolute* ``TOLERANCE_ZERO_CONSTANT`` correct below, where a raw diffused field carries the
+    # mesh's scale and no absolute floor applies to it: the sum of three unit vectors carries no
+    # coordinate scale, so the test only asks whether the three corners cancelled. Normalizing per
+    # corner rather than in a pass of its own costs three normalizations a face instead of one a
+    # vertex, against a map launch and an ``(n_vertices,)`` buffer.
+    #
+    # Accumulates the **negated** divergence, the Poisson right-hand side for the ``-L`` operator,
+    # by integrating ``-X``: as in ``unit_gradient_divergence`` the divergence is linear in the
+    # field and a sign flip is exact, so this is the negated sum without a pass to negate it.
     f = wp.int32(wp.tid())
     total = wp.vec3(0.0, 0.0, 0.0)
     for k in range(3):
         v = faces[f * 3 + k]
-        total += tangent_to_world(to_vec2(field[v]), basis_x[v], basis_y[v])
+        total += tangent_to_world(to_vec2(stable_normalize(field[v])), basis_x[v], basis_y[v])
     tangential, _length = unit_tangent(total, normals[f], TOLERANCE_ZERO_CONSTANT)
-    x = wp.vec3d(wp.float64(tangential[0]), wp.float64(tangential[1]), wp.float64(tangential[2]))
+    x = -wp.vec3d(wp.float64(tangential[0]), wp.float64(tangential[1]), wp.float64(tangential[2]))
     accumulate_face_divergence(vertices, faces, cot_entries, f, x, out_div)
 
 
 @wp.kernel
-def scatter_negated_free_rhs(
+def scatter_free_rhs(
     fixed_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],
     values: wp.array[wp.float64],
     out_rhs: wp.array2d[wp.float64],
 ) -> None:
-    # Compact a full-length right-hand side, negated, down to the unpinned degrees of freedom, in
-    # the layout ``linalg.solve_spd_columns`` expects (one row per right-hand side). The negation is
-    # the Poisson sign convention (``-div`` for the ``-L`` operator) and is exact, so folding it in
-    # here is the ``wp.map(wp.neg, ...)`` pass the caller used to run into a buffer only this read.
+    # Compact a full-length right-hand side down to the unpinned degrees of freedom, in the layout
+    # ``linalg.solve_spd_columns`` expects (one row per right-hand side). ``values`` arrives
+    # already in the Poisson sign convention (``-div`` for the ``-L`` operator):
+    # ``vertex_field_divergence`` accumulates it negated.
     #
     # **Not factored with ``gather_free_solution`` below or with
     # ``smoothing.scatter_free_scalar``, deliberately, and the near-duplicate scan's 0.917 on the
@@ -331,7 +335,7 @@ def scatter_negated_free_rhs(
     ri = free_row(fixed_mask, free_map, i)
     if ri < 0:
         return
-    out_rhs[0, ri] = -values[i]
+    out_rhs[0, ri] = values[i]
 
 
 @wp.kernel
@@ -413,19 +417,21 @@ def narrow_direction(v: wp.vec2d) -> wp.vec2:
 @wp.func
 def transported_and_resolved(
     direction: wp.vec2d,
-    magnitude: wp.float64,
     diffused_magnitude: wp.float64,
+    diffused_indicator: wp.float64,
     resolved_fraction: wp.float64,
 ) -> tuple[wp.vec2, wp.bool]:
-    # The whole tail of ``transport_tangent_vectors`` in one pass: rescale the diffused direction
-    # to its extended magnitude, narrow it to the field's storage precision, and report whether
-    # this vertex's direction can be told from round-off.
+    # The whole tail of ``transport_tangent_vectors`` in one pass: extend the source magnitudes
+    # (``extend_scalar``'s ``divide_nonzero`` of the two diffused scalars), rescale the diffused
+    # direction to it, narrow it to the field's storage precision, and report whether this
+    # vertex's direction can be told from round-off.
     #
     # Resolution is asked **locally**: the diffused vector's length against the diffused
     # *magnitudes* at the same vertex (the same heat, applied to ``|v|``). The two are equal where
     # the copies arriving from the sources agree -- a vector's length is never more than the heat
     # of its magnitude -- and the ratio falls to round-off where they cancel, the cut locus. Against
     # the field's global maximum instead, as this once asked, every far vertex read as unresolved.
+    magnitude = divide_nonzero(diffused_magnitude, diffused_indicator)
     return (
         to_vec2(scale_to_magnitude(direction, magnitude)),
         stable_length(direction) > resolved_fraction * diffused_magnitude,
@@ -461,8 +467,10 @@ def world_to_tangent_unit(value: wp.vec3, basis_x: wp.vec3, basis_y: wp.vec3) ->
 
 @wp.kernel
 def log_map_from_angles(
-    radial: wp.array[wp.vec2],
-    transported: wp.array[wp.vec2],
+    vertex_gradient: wp.array[wp.vec3],
+    basis_x: wp.array[wp.vec3],
+    basis_y: wp.array[wp.vec3],
+    transported_raw: wp.array[wp.vec2d],
     distance: wp.array[wp.float64],
     out_log: wp.array[wp.vec2],
 ) -> None:
@@ -472,9 +480,13 @@ def log_map_from_angles(
     # ``radial`` points away from the source here. The angle between them is preserved by transport
     # along the connecting geodesic, so it *is* the angle at which that geodesic leaves the
     # source -- which with the distance gives the vertex's position in the source's tangent plane.
+    #
+    # Both directions are formed here from the raw fields, each read only at ``v``: the radial one
+    # from the scattered distance gradient (``world_to_tangent_unit``) and the reference one from
+    # the diffused field (``narrow_direction``), so neither is a map and a buffer of its own.
     v = wp.int32(wp.tid())
-    reference = transported[v]
-    outward = radial[v]
+    reference = narrow_direction(transported_raw[v])
+    outward = world_to_tangent_unit(vertex_gradient[v], basis_x[v], basis_y[v])
     r = wp.float32(distance[v])
     # Both are unit length or exactly zero: ``narrow_direction`` and ``world_to_tangent_unit``
     # normalized them before narrowing, so the test is only "was it zeroed".

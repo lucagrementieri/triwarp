@@ -2430,7 +2430,7 @@ def smooth_region_boundary(
                     offsets,
                     vf_indices,
                     faces,
-                    laplacian.cotmatrix_entries(positions, faces),
+                    positions,
                     field_2d,
                     system.offsets,
                     system.columns,

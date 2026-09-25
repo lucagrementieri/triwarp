@@ -830,7 +830,13 @@ def icp_point_to_plane(
         else:
             assert target_index is not None
             assert nearest_rows is not None
-            _nearest_into(target_vertices, current, target_index, nearest_rows)
+            # The previous iteration's step rides in this search, as it does in the mesh pass.
+            if step_pending:
+                _nearest_into(target_vertices, current, target_index, nearest_rows, step, updated)
+                current, updated = updated, current
+                step_pending = False
+            else:
+                _nearest_into(target_vertices, current, target_index, nearest_rows)
             if kind != 0 and scale_value is None:
                 # Only the robust scale's residual pass reads the gathered correspondences; the
                 # accumulation gathers its own (``accumulate_point_to_plane``'s ``gather``).
@@ -916,17 +922,8 @@ def icp_point_to_plane(
         total, spare_total = spare_total, total
         parity ^= 1
 
-        # --- apply the incremental step: now for a cloud, at the next correspondence for a mesh ---
-        if mesh is not None:
-            step_pending = True
-        else:
-            wp.launch(
-                kernel_transform.apply_transform_mat44,
-                dim=n,
-                inputs=[current, step, updated],
-                device=device,
-            )
-            current, updated = updated, current
+        # --- the incremental step is applied at the next correspondence search ---
+        step_pending = True
 
         if iteration > 0 and old_cost - cost < threshold:
             break
@@ -966,7 +963,11 @@ def icp_point_to_plane(
     else:
         assert target_index is not None
         assert nearest_rows is not None
-        _nearest_into(target_vertices, current, target_index, nearest_rows)
+        if step_pending:
+            _nearest_into(target_vertices, current, target_index, nearest_rows, step, updated)
+            current = updated
+        else:
+            _nearest_into(target_vertices, current, target_index, nearest_rows)
         if kind != 0 and scale_value is None:
             wp.launch(
                 kernel_registration.cloud_correspondence_pass,
@@ -1011,9 +1012,14 @@ def _nearest_into(
     queries: wp.array[wp.vec3],
     target_index: _TargetIndex,
     out_rows: tuple[twt.Array2dInt32, twt.Array2dFloat32],
+    step: wp.array[wp.mat44] | None = None,
+    out_moved: wp.array[wp.vec3] | None = None,
 ) -> None:
     """
     Nearest target vertex of every query, written into caller-owned ``(m, 1)`` rows.
+
+    With ``step`` the queries are first moved by ``step[0]`` and the moved points written into
+    ``out_moved``, in the same launch (``kernels/neighbors.query_bvh_nearest_after_step``).
 
     This is [`query_nearest`][triwarp.neighbors.query_nearest]'s ``k = 1`` BVH launch on the
     hoisted ``target_index``, issued into buffers both ICP loops allocate once. Calling
@@ -1030,20 +1036,20 @@ def _nearest_into(
     bvh = target_index["accelerator"]
     assert isinstance(bvh, wp.Bvh)
     low, high = target_index["bounds"]
+    bounds = [wp.float32(math.inf), wp.float32(target_index["initial_radius"]), low, high]
+    if step is not None:
+        wp.launch(
+            kernel_neighbors.query_bvh_nearest_after_step,
+            dim=int(queries.shape[0]),
+            inputs=[target_vertices, queries, step, bvh.id, *bounds],
+            outputs=[*out_rows, out_moved],
+            device=queries.device,
+        )
+        return
     wp.launch(
         kernel_neighbors.bvh_nearest_kernel(1),
         dim=int(queries.shape[0]),
-        inputs=[
-            target_vertices,
-            queries,
-            bvh.id,
-            wp.int32(1),
-            wp.float32(math.inf),
-            wp.float32(target_index["initial_radius"]),
-            low,
-            high,
-            *out_rows,
-        ],
+        inputs=[target_vertices, queries, bvh.id, wp.int32(1), *bounds, *out_rows],
         device=queries.device,
     )
 

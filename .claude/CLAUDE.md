@@ -6422,3 +6422,62 @@ worktree (`plans/baseshim.py`, interleaved, min of 2), byte-identity on the CPU 
     - **The one-block gate's per-row schedule has no other axis to sweep.** A warp per row needs
       warp shuffles, and Warp exposes only block-wide tile reductions; the block width, swept at
       128-1024 lanes, is the schedule.
+
+### 16.18 The round-16/17 kernel de-duplication pass (2026-09-25)
+
+Every kernel changed in `a1c0f29..1999468` read against the rest of `kernels/`, with the
+Python around it. Timed against a detached `1999468` worktree (probe, alternating processes, min of
+3 x 15 calls) and gated on the CPU oracle: **every probed output byte-identical on CPU**
+(`heat_geodesic`, both `heat_signed_distance` constraints, `log_map`, `transport_tangent_vectors`,
+a one-block `solve_spd`, cloud `icp`, `smooth_region_boundary`, `lscm`). CUDA 0.99-1.10x, the two
+cells under 1.0 inside run-to-run noise -- these calls are solve-bound, and what was removed is host
+work around the solves.
+
+- **Two copies of one decision rule disagreed, which is the finding worth having.** `cg_close_round`
+  decided "did column `c >= 1` step" with `r.r > atol and round <= maxiter`, while the column's own
+  blocks (`cg_step_scalars`) also refuse a step when `gamma` or the denominator is exactly zero --
+  the round-off floor a zero-tolerance heat solve reaches. Such a column counted as stepping and kept
+  the loop alive. It now calls `cg_step_scalars` (§2.4).
+- **Named runs**: `cg_advance` (the update, `cg_update` / `cg_one_block`), `cg_threshold`,
+  `multigrid.chebyshev_update` (`chebyshev_step` / `one_block_chebyshev`),
+  `reduce.commit_block_sum` (seven `block_sum` + per-slot `atomic_add` tails, `base` for
+  `homology`'s offset slots; `commit_sum_and_count` is now a call to it),
+  `laplacian.face_half_cotangents`, `registration.sample_point`.
+- **Readbacks.** `_BatchedCg` keeps its per-column scalars in one `(10, n_columns)` buffer with the
+  threshold and `r.r` adjacent and the iteration count beside the loop state, so a host result is
+  two reads instead of three and the host cadence's condition read carries the count
+  (`host_result`); `_cg_residual_and_tolerance` reads an adjacent pair in one copy (`_read_pair`);
+  `_cg_one_block` writes each column's round count into its float results, so a host caller
+  allocates no integer buffer and reads once (1.10x on a 600-row solve). The dense Poisson cascade no
+  longer reads each level's count before issuing the next -- one read of all levels' counts after
+  the cascade -- and allocates its splat and CG vectors as one buffer each (flat at depth 7).
+- **Launches and buffers.** `heat_signed_distance`: the unit-field map folded into
+  `vertex_field_divergence`, which also accumulates `-div` (no negate pass on either constraint),
+  and the `"none"` shift is `heat_geodesic`'s device-side one without orientation -- no gather, no
+  readback (1.06x). `log_map`: two maps folded into `log_map_from_angles` (1.04x).
+  `transport_tangent_vectors`: the extension's division folded into `transported_and_resolved`.
+  `_BatchedCg._initialize` under Jacobi-Chebyshev writes the polynomial's input from `cg_initial`, as
+  `cg_update` does every round. `smooth_region_boundary`'s later passes form the band faces'
+  cotangents in `band_dirichlet_values` instead of a whole-mesh table per pass (1.05x).
+- **`icp_point_to_plane` against a cloud applies its step inside the next nearest search**
+  (`neighbors.query_bvh_nearest_after_step`), as the mesh loop already did: one launch and one `n`
+  round trip fewer per iteration, **1.03-1.10x** at 20 fixed iterations, byte-identical on CPU. The
+  row kernels' deepening loop became one `wp.ref`-row `@wp.func` per bucket (`_bvh_row_search`),
+  which the plain kernel and the stepped one both call; `query_nearest` at `k` = 1, 8, 32 measured
+  flat. **Two optional arguments on the shared k-NN kernels were built first and measured 0.96-0.97x
+  on their other callers at 2 562 queries** -- two marshalled arguments on a launch-bound call -- so
+  the step is a variant of its own.
+- **`log_map` is not reproducible at the cut locus on CUDA, before or after.** One vertex of
+  `icosphere(5)` at radius ~pi differed by 3e-2 between the two builds and by 3e-3 between two runs
+  of the new one; the docstring already calls that angle arbitrary. Compare off the antipode.
+- **Declined.** Folding the Gershgorin max into the row kernels (`scaled_row_abs_sums`,
+  `jacobi_dominance_rows`): saves one launch and an `n` buffer per preconditioner build, but a
+  block-folded row walk gives each lane 16 rows where the row-per-thread kernel has one, which at
+  large `n` costs more than it saves. **Two launch removals in point-to-point `icp`, both built and
+  measured flat** (0.98-1.02x at 2 562 and 40 962 points, 20 fixed iterations), so both reverted:
+  reading a cloud target through the nearest index inside the Procrustes kernels instead of a
+  gather copy, and ping-ponging the accumulator so each fit's matrix launch zeroes the next fit's
+  instead of a memset. The loop is paced by its per-iteration readback, which is what a removed
+  launch hides behind. **Measure it at a fixed iteration count** (`threshold=-inf`): at
+  `threshold=0.0` the plateau's last-bit jitter stopped the arms after 12-20 iterations at random and
+  read as a 0.67x regression.

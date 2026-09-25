@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.kernels.predicates import normalize_or_zero
 from triwarp.kernels.proximity import write_closest_point_query
-from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, block_chunk_1d, block_sum
+from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, block_chunk_1d, block_sum, commit_block_sum
 from triwarp.kernels.transform import transform_point_mat44
 
 # ---------------------------------------------------------------------------
@@ -171,11 +171,7 @@ def accumulate_procrustes_moments(
         packed[ACC_MASK_B + c] = mask_b[c]
         for r in range(3):
             packed[ACC_COV + c * 3 + r] = cov[c, r]
-    block = block_sum(packed)
-
-    if lane == 0:
-        for slot in range(PROCRUSTES_MOMENT_SLOTS):
-            wp.atomic_add(out_acc, slot, block[slot])
+    commit_block_sum(lane, packed, out_acc, 0)
 
 
 @wp.func

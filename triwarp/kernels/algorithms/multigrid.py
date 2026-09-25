@@ -38,6 +38,8 @@ operators here rely on, since they carry empty rows for free vertices no equatio
 strength test's ``sqrt(|A_ii|)`` is ``array.sqrt_abs`` over the same diagonal.
 """
 
+from typing import Any
+
 import warp as wp
 
 from triwarp.kernels.array import inverse_or_one
@@ -310,6 +312,23 @@ def csr_matvec(
         out_y[slot] = total
 
 
+@wp.func
+def chebyshev_update(
+    coefficients: Any, x: wp.Float, x_previous: wp.Float, source: wp.Float, ax: wp.Float
+) -> Any:
+    # One entry of a Chebyshev semi-iteration step in its three-term form,
+    # ``x' = s x + momentum (s x - s_prev x_previous) + step (source - s A x)``, with
+    # ``coefficients = (s, s_prev, momentum, step)`` and ``ax`` the entry's ``(A x)``. Shared by
+    # ``chebyshev_step`` and ``conjugate_gradient.one_block_chebyshev``, which differ only in where
+    # the vectors live and in the precision (the latter's coefficients are narrowed).
+    current = coefficients[0] * x
+    return (
+        current
+        + coefficients[2] * (current - coefficients[1] * x_previous)
+        + coefficients[3] * (source - coefficients[0] * ax)
+    )
+
+
 @wp.kernel
 def chebyshev_step(
     n_rows: wp.int32,
@@ -350,19 +369,9 @@ def chebyshev_step(
     base = column * stride
     slot = base + row
     ax = csr_row_dot(row, base, offsets, columns, values, x)
-    coefficients = steps[index]
-    scale = coefficients[0]
-    previous_scale = coefficients[1]
-    momentum = coefficients[2]
-    step = coefficients[3]
     if row_scaled != wp.int32(0):
         ax = ax * row_scale[row]
-    current = scale * x[slot]
-    out_x[slot] = (
-        current
-        + momentum * (current - previous_scale * x_previous[slot])
-        + step * (source[slot] - scale * ax)
-    )
+    out_x[slot] = chebyshev_update(steps[index], x[slot], x_previous[slot], source[slot], ax)
 
 
 @wp.kernel

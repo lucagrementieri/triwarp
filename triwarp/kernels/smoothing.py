@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import to_vec3d
-from triwarp.kernels.laplacian import cot_entries_from_l2, operator_row
+from triwarp.kernels.laplacian import cot_entries_from_l2, face_half_cotangents, operator_row
 from triwarp.kernels.linalg import free_row, selected_row, solve_normal_equations
 from triwarp.kernels.predicates import (
     closest_point_on_segment,
@@ -1174,7 +1174,7 @@ def band_dirichlet_values(
     vf_offsets: wp.array[wp.int32],
     vf_indices: wp.array[wp.int32],
     faces: wp.array[wp.int32],
-    cot_entries: wp.array2d[wp.float32],
+    positions: wp.array[wp.vec3],
     field: wp.array2d[wp.float64],
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
@@ -1186,10 +1186,12 @@ def band_dirichlet_values(
     # into that extraction's *existing* pattern from the current half-cotangent table. The
     # connectivity -- and so the pattern and the free set -- is fixed across
     # ``smooth_region_boundary``'s passes while the weights move, so only the band's rows are
-    # recomputed instead of the whole mesh's matrix and its extraction. ``cot_entries[f, e]`` is the
-    # weight of the edge opposite corner ``e`` (``kernels/laplacian.cotmatrix_triplets``), cast to
-    # ``float64`` as ``cotmatrix`` casts it; the off-diagonal is ``-w``, the diagonal ``sum w``, and
-    # a pinned neighbour moves ``w * field_j`` to the right-hand side.
+    # recomputed instead of the whole mesh's matrix and its extraction. The weight of the edge
+    # opposite corner ``e`` is ``laplacian.face_half_cotangents``' column ``e`` for the current
+    # ``positions`` (``kernels/laplacian.cotmatrix_triplets``' convention), formed here for the
+    # band's own faces rather than read from a whole-mesh table, and cast to ``float64`` as
+    # ``cotmatrix`` casts it; the off-diagonal is ``-w``, the diagonal ``sum w``, and a pinned
+    # neighbour moves ``w * field_j`` to the right-hand side.
     ri = wp.int32(wp.tid())
     v = free_vertices[ri]
     start = offsets[ri]
@@ -1200,12 +1202,14 @@ def band_dirichlet_values(
     rhs = wp.float64(0.0)
     for k in range(vf_offsets[v], vf_offsets[v + 1]):
         f = vf_indices[k]
+        c0, c1, c2 = face_half_cotangents(positions, faces, f)
+        cot = wp.vec3(c0, c1, c2)
         for e in range(3):
             a = faces[f * 3 + (e + 1) % 3]
             b = faces[f * 3 + (e + 2) % 3]
             if a == v or b == v:
                 j = wp.where(a == v, b, a)
-                w = wp.float64(cot_entries[f, e])
+                w = wp.float64(cot[e])
                 diagonal += w
                 if fixed_mask[j]:
                     rhs += w * field[0, j]
