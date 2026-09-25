@@ -574,6 +574,69 @@ def test_distance_to_polyline(bench_case: BenchCase, n_queries: int) -> None:
     assert distance.shape[0] == n_queries
 
 
+# The ``closed=True`` rows. A boundary loop does not repeat its first vertex, so every one of these
+# takes the closing segment the flag adds -- the path that used to go through ``polyline_close``'s
+# closure readback and full-buffer copy. triwarp-only: what they price is the closure handling
+# around an algorithm the open rows above already compare against the references, so a reference
+# row here would re-time the same comparison with one more segment.
+
+
+@pytest.mark.benchmark(group="polyline_upsample_closed")
+@pytest.mark.benchaxis("polyline")
+@pytest.mark.benchlibs("triwarp")
+def test_upsample_closed_polyline(bench_case: BenchCase) -> None:
+    """``polyline_upsample(closed=True)`` at the open row's step: one more segment, as a ring."""
+    step = _UPSAMPLE_FRACTION * _segment_scale(bench_case)[0]
+    polyline = _polyline_wp(bench_case)
+    dense = bench_case.run(lambda: tw.polyline.polyline_upsample(polyline, step, closed=True))
+    assert dense.shape[0] >= int(polyline.shape[0])
+
+
+@pytest.mark.benchmark(group="polyline_downsample_closed")
+@pytest.mark.benchaxis("polyline")
+@pytest.mark.benchlibs("triwarp")
+def test_downsample_closed_polyline(bench_case: BenchCase) -> None:
+    """``polyline_downsample(closed=True)`` at the open row's step, the closing edge counted."""
+    step = _DOWNSAMPLE_FRACTION * _segment_scale(bench_case)[0]
+    polyline = _polyline_wp(bench_case)
+    sparse = bench_case.run(lambda: tw.polyline.polyline_downsample(polyline, step, closed=True))
+    assert sparse.shape[0] >= 2
+
+
+@pytest.mark.benchmark(group="polyline_resample_closed")
+@pytest.mark.benchaxis("polyline")
+@pytest.mark.benchlibs("triwarp")
+def test_resample_closed_polyline(bench_case: BenchCase) -> None:
+    """
+    ``polyline_resample(closed=True)`` to the input's own point count.
+
+    A cumulative arc length and one interpolation pass, with no data-dependent output size and so
+    no readback of its own.
+    """
+    polyline = _polyline_wp(bench_case)
+    n_points = int(polyline.shape[0])
+    ring = bench_case.run(lambda: tw.polyline.polyline_resample(polyline, n_points, closed=True))
+    assert ring.shape[0] == n_points
+
+
+@pytest.mark.benchmark(group="polyline_point_distance_closed")
+@pytest.mark.benchaxis("polyline")
+@pytest.mark.benchlibs("triwarp")
+def test_distance_to_closed_polyline(bench_case: BenchCase) -> None:
+    """
+    ``polyline_point_distance(closed=True)`` at the smaller query count.
+
+    That is where the closure handling is the largest share of the call; the larger count is the
+    open row's points x segments product again.
+    """
+    polyline = _polyline_wp(bench_case)
+    points = _query_points_wp(bench_case, _N_QUERIES[0])
+    distance = bench_case.run(
+        lambda: tw.polyline.polyline_point_distance(points, polyline, closed=True)
+    )
+    assert distance.shape[0] == _N_QUERIES[0]
+
+
 # Vertex counts for the triangulation group. A simple polygon of ``n`` vertices always yields
 # ``n - 2`` triangles, so the count is the only axis and it is swept directly rather than through a
 # mesh: neither library's ear clipping is driven by anything else.

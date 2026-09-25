@@ -6518,8 +6518,7 @@ shared by four concurrent reviewers (min over alternating processes); probes are
   `mesh.h`'s sliver cull `|n| / sum|e|^2 < 1e-6` reads NaN on a collapsed triangle, which compares
   false, so it is tested rather than culled** -- `test_mesh_from_points_answers_the_nearest_point`
   fails if a release changes that. `query_nearest_bvh_k1[dragon]` 2.22 -> 0.89 ms; Chamfer on the
-  shifted fixture 2.2-3.1x, but **a coincident dragon pair is 0.81-0.98x** (the tree build costs
-  more than the grid's walk).
+  shifted fixture 2.2-3.1x; a coincident dragon pair read 0.81-0.98x, fixed in §16.20.
 - **R18-6: point-to-plane ICP's pinned loop runs on the device** (`point_to_plane_round`, three
   launches a round under `_device.run_device_loop`, recorded once per call; iteration 0 on the host
   for the MAD scale). A cloud call 34 -> 10 launches, 12 -> 2 readbacks; 1.4-5.6x with R18-3. A call
@@ -6570,3 +6569,49 @@ shared by four concurrent reviewers (min over alternating processes); probes are
   - The ear loop's init and clip writes became `init_ring_slot` / `clip_ear`, which drops check 13's
     `init_ring` / `clip_selected` allowlist entries and `rdp_split_spans`' `span_lo` / `span_hi`
     (§4.5: the extraction wins over the syntactic check).
+
+### 16.20 Round 19: the round-18 leads (2026-09-25)
+
+Against a detached `8f39161` worktree (`/tmp/tw19base`); CPU byte-identity unless stated; clocks
+on a box shared by three reviewers. Probes are `plans/benchmark-round-19-data/probes/r19_*`.
+
+- **Point-to-point `icp` runs on the device**: five launches a round (the correspondence pass moves
+  each point by the kept transform in registers and searches cloud or mesh by a warp-uniform flag;
+  `point_to_point_round` keeps a fit only if it carried weight and runs the host's float64 stop
+  test). A pinned 10-iteration call 42 -> 13 launches, 10 -> 1 readbacks; 1.07-1.46x, but a
+  1-2-round call is 0.82x -- a recording (~70-85 us host plus ~19 us to launch) pays back after
+  about two replayed rounds of 30-55 us gap. REFUTED: issuing K host rounds before recording
+  (K = 2 won 4-8 % on 2-round calls and lost up to 37 % on weightless ones).
+- **Record while the device runs, then read, then launch** (`_device.record_device_loop`, which
+  `run_device_loop` is now a call of). Reading round 0's outcome before recording costs every gated
+  call 2-8 %; recording first hides the recording behind round 0 and makes the read free. The
+  weightless-at-seed ICP call went 0.83 -> 0.94x of `192406c`; the residual is the recording, which
+  only a read before it could skip. A weightless round writing an **identity step** lets the
+  closing pass report `inf` with no readback of its own (bit-identical except an exact `-0.0`).
+- **The MAD scale runs on the device without compaction**: `+inf` for excluded residuals, one radix
+  sort, a prefix search, medians exact against `reduce.median`; 3.1x on the helper, 1.10-1.28x on
+  the Tukey/Huber/MAD rows.
+- **`metrics` picks the backward search from the forward half's answer** on CUDA past 262 144
+  points: the seeded hash grid when the largest forward distance is at most half the density
+  radius and at least 75 % of backward queries are some point's forward answer, else the
+  collapsed-point mesh. Coincident dragon 1.12-1.32x of `192406c` (the round-18 loss is gone),
+  displaced pairs keep the round-18 win (2.0-3.0x) at 0.95-1.01x of `8f39161` -- the one readback
+  the choice costs. Two things that decide it: **a small forward maximum does not make a pair
+  coincident** (a cloud covering half its partner has one), and the hit fraction separates them
+  cleanly (>= 0.89 vs <= 0.5; one `atomic_exch` per point in the same launch); and the readback, not
+  the search, is the cost below ~250 k points, because it stops the backward half's issue from
+  overlapping the forward half. The grid's best seed is 0.1-0.3 of `knn_initial_radius`.
+- **`closed=True` wraps the index** in `polyline_upsample` / `smooth_upsample` / `downsample` /
+  `resample` / `point_distance`: no `polyline_close` copy, closure decided per thread; tables sized
+  for `n` segments with a zero-length closing slot when the input already repeats its first point
+  (`seam_repeats_first`), so every prefix is the `n - 1`-segment one bit for bit on both devices.
+  Closed paths 1.4-2.4x on CUDA; `polyline_resample(closed=True)` on an empty input now returns
+  empty (it raised). **Evaluate a per-thread predicate before a long loop, not after**: the same
+  closure test placed after `distance_to_segments`' 65 536-iteration loop cost 13 % device time
+  even when its branch was not taken. The `allclose` tolerances became kernel-scope constants
+  (`constants.ALLCLOSE_*_CONSTANT`), removing two launch arguments from every polyline closure
+  kernel -- which is what the per-thread test had cost the open paths (0.90-0.97x -> parity).
+- **Probe hygiene**: two reviewers overwrote a shared probe helper mid-run and one A/B silently
+  loaded the live tree in both arms. Give concurrent reviewers' probe helpers unique names, and
+  assert the *submodule's* `__file__` -- the lazy `__init__` means `triwarp.__file__` proves nothing
+  about which `triwarp.polyline` was imported.

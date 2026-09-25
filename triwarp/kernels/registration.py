@@ -1,8 +1,10 @@
 import warp as wp
 
-from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND, LOOP_STATE_SIZE
+from triwarp.constants import FLOAT32_INF_CONSTANT
+from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND, binary_search_index_left
+from triwarp.kernels.neighbors import mesh_nearest_point
 from triwarp.kernels.predicates import normalize_or_zero
-from triwarp.kernels.proximity import write_closest_point_query
+from triwarp.kernels.proximity import closest_point_query, write_closest_point_query
 from triwarp.kernels.reduce import ITEMS_PER_BLOCK_1D, block_chunk_1d, block_sum, commit_block_sum
 from triwarp.kernels.transform import transform_point_mat44
 
@@ -41,10 +43,6 @@ PROCRUSTES_ACC_SIZE = 26
 ICP_COST = wp.constant(0)  # sum robust_loss(r); see ``robust_weight_and_loss``
 ICP_WEIGHT_SUM = wp.constant(1)  # sum w
 ICP_SCALAR_ACC_SIZE = 2
-# ``icp_point_to_plane``'s device-loop state: the shared round and condition slots of
-# ``kernels/array.py``, and a third recording that the loop stopped because nothing carried weight.
-ICP_LOOP_WEIGHTLESS = wp.constant(wp.int32(LOOP_STATE_SIZE))
-ICP_LOOP_STATE_SIZE = LOOP_STATE_SIZE + 1
 
 
 @wp.func
@@ -281,7 +279,9 @@ def transform_and_accumulate_cost(
 ) -> None:
     # Apply the fitted transform to ``a``, publish the moved points, and reduce the weighted mean
     # squared residual against ``b`` into the packed accumulator's cost slot -- one pass, one
-    # launch. A zero-length ``weights`` means uniform (``sample_weight``).
+    # launch. A zero-length ``weights`` means uniform (``sample_weight``), and a zero-length
+    # ``out_transformed`` publishes nothing: ``icp``'s device loop wants only the cost of a fit it
+    # may yet reject, and moves the points once, after the loop, by the transform it kept.
     #
     # The reduction is the lane-strided single-slot form of CLAUDE.md section 13.2, striding by
     # ``wp.block_dim()`` so it needs no ``prefers_tiled_reduction`` branch.
@@ -299,11 +299,13 @@ def transform_and_accumulate_cost(
     if count <= 0:
         return
     transform = matrix[0]
+    publish = out_transformed.shape[0] > 0
     local = wp.float32(0.0)
     for k in range(lane, count, wp.block_dim()):
         i = offset + k
         moved = transform_point_mat44(a[i], transform)
-        out_transformed[i] = moved
+        if publish:
+            out_transformed[i] = moved
         w = sample_weight(weights, i)
         local += w * wp.length_sq(b[i] - moved)
     total = block_sum(local)
@@ -403,27 +405,87 @@ def mesh_correspondence_pass(
 
 
 @wp.kernel
-def mesh_correspondence_weight_pass(
+def point_to_point_correspondence_pass(
     mesh_id: wp.uint64,
-    points: wp.array[wp.vec3],
+    target_points: wp.array[wp.vec3],
+    source: wp.array[wp.vec3],
+    total: wp.array[wp.mat44],
+    cloud: wp.bool,
     query_max: wp.float32,
     max_distance: wp.float32,
     out_closest: wp.array[wp.vec3],
-    out_distance: wp.array[wp.float32],
-    out_face: wp.array[wp.int32],
     out_weights: wp.array[wp.float32],
 ) -> None:
-    # ``registration.icp``'s mesh-target correspondence step: the closest-point query and the
-    # binary distance gate its Procrustes fit weights by. The sibling of
-    # ``mesh_correspondence_pass``, which serves the point-to-plane loop and additionally gathers
-    # a target normal -- the two differ by that gather and by whether the gate is reported as a
-    # weight or as a mask, so they stay two kernels over the one shared
-    # ``write_closest_point_query``.
+    # ``registration.icp``'s whole correspondence step: the source point moved by the transform the
+    # loop has kept so far, its match on the target, and -- when ``out_weights`` is not zero-length
+    # -- the binary distance gate its Procrustes fit weights by.
+    #
+    # ``cloud`` selects the target, warp-uniformly: a point-cloud target's
+    # ``neighbors.mesh_from_points`` answers the nearest vertex (unbounded, so it always hits),
+    # whose position is the match; a mesh target's closest point on the surface within
+    # ``query_max``. Either way the match, the distance and the index stay in registers, where the
+    # host loop this replaced wrote all three and gathered the cloud's match in a copy of its own.
+    #
+    # The move is ``transform_point_mat44`` on the operands the host loop's fit applied when it
+    # published the points this search then read, so the query sees the same bits.
     tid = wp.int32(wp.tid())
-    distance, face = write_closest_point_query(
-        mesh_id, points, query_max, tid, out_closest, out_distance, out_face
-    )
-    out_weights[tid] = distance_threshold_weight(distance, face, max_distance)
+    q = transform_point_mat44(source[tid], total[0])
+    index = wp.int32(-1)
+    distance = wp.float32(0.0)
+    closest = q
+    if cloud:
+        index, distance = mesh_nearest_point(mesh_id, target_points, q, FLOAT32_INF_CONSTANT)
+        closest = target_points[wp.max(index, wp.int32(0))]
+    else:
+        closest, distance, index = closest_point_query(mesh_id, q, query_max)
+    out_closest[tid] = closest
+    if out_weights.shape[0] > 0:
+        out_weights[tid] = distance_threshold_weight(distance, index, max_distance)
+
+
+@wp.kernel
+def point_to_point_round(
+    threshold: wp.float64,
+    max_iterations: wp.int32,
+    fitted: wp.array[wp.mat44],
+    out_acc: wp.array[wp.float32],
+    out_total: wp.array[wp.mat44],
+    out_cost: wp.array[wp.float32],
+    out_state: wp.array[wp.int32],
+) -> None:
+    """
+    Close one ``icp`` iteration on the device and decide whether another runs.
+
+    ``dim=1``, the point-to-point sibling of ``point_to_plane_round``: the host loop's tail after
+    its fit, so the loop body is one fixed sequence ``_device.run_device_loop`` records once.
+
+    - **weightless** (the fit's weight sum is exactly zero -- every correspondence rejected by the
+      distance gate): the fit ``fitted`` is a matrix of NaN and is *not* kept, and the loop stops.
+      The host loop broke before rebinding its result, which is what this reproduces without a
+      ping-pong of the fit's buffers: the fit lands in ``fitted`` and only an accepted one is
+      copied into ``out_total``;
+    - otherwise ``fitted`` becomes ``out_total``, its cost ``out_cost[0]``, and the loop continues
+      while fewer than ``max_iterations`` have run and the cost fell by at least ``threshold``.
+
+    ``out_cost[0]`` doubles as the previous iteration's cost: seeded ``inf``, it is exactly the
+    host loop's ``old_cost`` whenever the test reads it, and the ``float64`` test of two ``float32``
+    values is the one the host formed from their Python floats. The accumulator is zeroed after it
+    is read, by this one thread, so no memset precedes the next round's fit.
+    """
+    w_sum = out_acc[ACC_W_SUM]
+    cost = out_acc[ACC_COST]
+    for slot in range(PROCRUSTES_ACC_SIZE):
+        out_acc[slot] = wp.float32(0.0)
+    if w_sum == wp.float32(0.0):
+        out_state[LOOP_CONDITION] = 0
+        return
+    converged = wp.float64(out_cost[0]) - wp.float64(cost) < threshold
+    out_total[0] = fitted[0]
+    out_cost[0] = cost
+    iteration = out_state[LOOP_ROUND] + 1
+    out_state[LOOP_ROUND] = iteration
+    keep_going = not converged and iteration < max_iterations
+    out_state[LOOP_CONDITION] = wp.where(keep_going, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
@@ -451,6 +513,84 @@ def cloud_correspondence_pass(
 def abs_deviation(value: wp.float32, center: wp.float32) -> wp.float32:
     """Absolute deviation ``|value - center|`` (median-absolute-deviation building block)."""
     return wp.abs(value - center)
+
+
+# --- The robust scale's median absolute deviation, on the device ------------------------------
+#
+# ``registration._robust_scale_from_residuals`` needs the median of the in-range point-to-plane
+# residuals and the median of their absolute deviations from it. Each median is a radix sort of a
+# ``2n`` key buffer whose first ``n`` keys these kernels write: an out-of-range correspondence
+# writes ``+inf``, which sorts last, so the in-range values are the sorted prefix and its length
+# is one search, where compacting them first took a scan, a count readback and a gather. The
+# medians are formed in ``float64`` exactly as the host formed them from the ``float32`` values it
+# read back -- the middle value, or the mean of the two middle values -- so the scale is the same
+# double; ``MAD_STATS`` is ``(center, then sigma; in-range count)``.
+MAD_STATS_VALUE = wp.constant(0)
+MAD_STATS_COUNT = wp.constant(1)
+MAD_STATS_SIZE = 2
+
+
+@wp.func
+def sorted_prefix_median(values: wp.array[wp.float32], count: wp.int32) -> wp.float64:
+    """Median of ``values[:count]``, sorted and non-empty, as ``numpy.median`` forms it."""
+    upper = wp.float64(values[count // 2])
+    if count % 2 == 1:
+        return upper
+    return (wp.float64(values[count // 2 - 1]) + upper) / wp.float64(2.0)
+
+
+@wp.kernel
+def robust_residual_keys(
+    current: wp.array[wp.vec3],
+    closest: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    triangle_id: wp.array[wp.int32],
+    distance: wp.array[wp.float32],
+    max_distance: wp.float32,
+    out_keys: wp.array[wp.float32],
+) -> None:
+    # Each correspondence's point-to-plane residual where it is in range, ``+inf`` where it is not.
+    i = wp.int32(wp.tid())
+    out_keys[i] = wp.where(
+        residual_valid(triangle_id[i], distance[i], max_distance),
+        point_to_plane_residual(current[i], closest[i], normals[i]),
+        FLOAT32_INF_CONSTANT,
+    )
+
+
+@wp.kernel
+def robust_residual_center(
+    sorted_residuals: wp.array[wp.float32], n: wp.int32, out_stats: wp.array[wp.float64]
+) -> None:
+    # ``dim=1``: the in-range count, and the median of the in-range residuals.
+    count = binary_search_index_left(sorted_residuals[:n], FLOAT32_INF_CONSTANT)
+    out_stats[MAD_STATS_COUNT] = wp.float64(count)
+    if count > 0:
+        out_stats[MAD_STATS_VALUE] = sorted_prefix_median(sorted_residuals, count)
+
+
+@wp.kernel
+def robust_deviation_keys(stats: wp.array[wp.float64], out_keys: wp.array[wp.float32]) -> None:
+    # In place over the sorted residuals, each thread reading and rewriting its own slot: each
+    # in-range residual's absolute deviation from the median, which ``abs_deviation`` takes as the
+    # ``float32`` the host used to marshal; ``+inf`` past the in-range prefix. The next sort is the
+    # only reader, which is why the buffer wears the ``out_`` prefix although it is also read.
+    i = wp.int32(wp.tid())
+    count = wp.int32(stats[MAD_STATS_COUNT])
+    out_keys[i] = wp.where(
+        i < count,
+        abs_deviation(out_keys[i], wp.float32(stats[MAD_STATS_VALUE])),
+        FLOAT32_INF_CONSTANT,
+    )
+
+
+@wp.kernel
+def robust_sigma(sorted_deviations: wp.array[wp.float32], out_stats: wp.array[wp.float64]) -> None:
+    # ``dim=1``: ``1.4826 * MAD``, the normal-consistent scale, over the value slot.
+    count = wp.int32(out_stats[MAD_STATS_COUNT])
+    if count > 0:
+        mad = sorted_prefix_median(sorted_deviations, count)
+        out_stats[MAD_STATS_VALUE] = wp.float64(1.4826) * mad
 
 
 @wp.func
@@ -725,8 +865,8 @@ def point_to_plane_round(
     composition into the running transform and the convergence test -- so that the loop body is a
     fixed sequence ``_device.run_device_loop`` can record once and replay, with no readback:
 
-    - **weightless**: no correspondence carried weight, so nothing is solved; ``out_state``
-      records it (``ICP_LOOP_WEIGHTLESS``) and stops the loop, and the host reports ``inf``;
+    - **weightless**: no correspondence carried weight, so nothing is solved; the step is set to
+      the identity and the loop stops, and the host reports ``inf``;
     - otherwise the damped system is solved, ``out_step`` written, ``out_total`` composed in place
       (``step * total``, the product and order the host ping-pong formed) and the accumulators
       zeroed for the next iteration -- after they are read, by this one thread, so no memset;
@@ -738,7 +878,11 @@ def point_to_plane_round(
     wear the prefix as ``kernels/array.loop_advance``'s ``out_state`` does.
     """
     if out_scalars[ICP_WEIGHT_SUM] <= wp.float32(0.0):
-        out_state[ICP_LOOP_WEIGHTLESS] = 1
+        # The step becomes the identity so the host's closing correspondence pass, which applies
+        # ``out_step`` like every other search, leaves the pose where the weightless search found
+        # it; its accumulation then sums zero weight again and the host reports ``inf``. That is
+        # what lets the host learn "weightless" from the one readback it takes anyway.
+        out_step[0] = wp.identity(n=4, dtype=wp.float32)
         out_state[LOOP_CONDITION] = 0
         return
     cost = wp.float64(out_scalars[ICP_COST])

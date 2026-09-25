@@ -16,13 +16,71 @@ reductions differ only by the ``scale`` passed from Python scope. Following the
 
 import warp as wp
 
-from triwarp.constants import TILE_1D
-from triwarp.kernels.reduce import block_sum
+from triwarp.constants import FLOAT32_INF_CONSTANT, TILE_1D
+from triwarp.kernels.array import atomic_min_packed_box
+from triwarp.kernels.reduce import block_sum, tile_chunk
 from triwarp.kernels.triangles import face_vertices
 
 # Relative coplanarity tolerance for the triangle-interior test, matching
 # warp.fem's ``project_on_tri_at_origin``.
 _TRI_DET_TOLERANCE = wp.constant(wp.float32(1.0e-6))
+
+
+@wp.func
+def mark_first_hit(hits: wp.array[wp.int32], target: wp.int32) -> wp.float32:
+    # ``1`` the first time ``target`` is marked and ``0`` after, so a sum over the markers counts
+    # the distinct targets whatever order the threads reach them in.
+    return wp.where(wp.atomic_exch(hits, target, 1) == 0, wp.float32(1.0), wp.float32(0.0))
+
+
+@wp.kernel(enable_backward=False)
+def pair_search_scale(
+    points: wp.array[wp.vec3],
+    distances: wp.array[wp.float32],
+    assignment: wp.array[wp.int32],
+    faces: wp.array[wp.int32],
+    per_face: wp.int32,
+    hits: wp.array[wp.int32],
+    out_scale: wp.array[wp.float32],
+) -> None:
+    # What the backward search of a cloud pair is chosen from, in one launch into one buffer, from
+    # the forward half's answer at each point of the cloud that search will run over (``points``):
+    # that cloud's bounding box, the largest forward distance, and how many of the backward
+    # *queries* are some point's forward answer -- ``assignment`` indexes them directly, or, when
+    # ``per_face`` is set, names a triangle whose three corners are the queries (the forward half
+    # of a point-to-mesh pair is point-to-surface; ``faces`` is ``None`` otherwise). ``hits`` is a
+    # zeroed mark per query.
+    #
+    # ``out_scale`` is ``reduce.minmax_vec3_chunked``'s packed box in slots 0-5, the *negated*
+    # largest distance in slot 6 (both reduced by ``atomic_min`` from an ``inf`` seed) and the hit
+    # count in slot 7 (``atomic_add`` from zero). Launched with ``reduce.chunks_1d``: one plain
+    # thread per ``TILE_1D`` points, as that kernel is, and runs on either device.
+    offset, remaining = tile_chunk(points.shape[0], wp.int32(wp.tid()), TILE_1D)
+    if remaining <= 0:
+        return
+    count = wp.min(remaining, TILE_1D)
+
+    lower = points[offset]
+    upper = points[offset]
+    largest = wp.float32(-FLOAT32_INF_CONSTANT)
+    first_hits = wp.float32(0.0)
+    for k in range(count):
+        i = offset + k
+        p = points[i]
+        lower = wp.min(lower, p)  # wp.min / wp.max on a vector are component-wise
+        upper = wp.max(upper, p)
+        largest = wp.max(largest, distances[i])
+        target = assignment[i]
+        if target >= 0:
+            if per_face != 0:
+                for corner in range(3):
+                    first_hits += mark_first_hit(hits, faces[target * 3 + corner])
+            else:
+                first_hits += mark_first_hit(hits, target)
+
+    atomic_min_packed_box(out_scale, wp.int32(0), lower, upper)
+    wp.atomic_min(out_scale, 6, -largest)
+    wp.atomic_add(out_scale, 7, first_hits)
 
 
 @wp.func

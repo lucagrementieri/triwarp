@@ -14,18 +14,13 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
-from triwarp.constants import TILE_1D
+from triwarp.constants import ALLCLOSE_ATOL, ALLCLOSE_RTOL, TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import scatter as kernel_scatter
 
 DType = TypeVar("DType")
 
-# Default tolerances of [`allclose`][triwarp.array.allclose], named because a second caller now
-# applies the same predicate to a pair of points (``polyline.is_closed``) and the two must not
-# drift: "close" has to mean one thing across the package.
-ALLCLOSE_RTOL = 1e-05
-ALLCLOSE_ATOL = 1e-08
 
 # Use a direct-index membership table when the value *span* (max - min + 1, over both inputs) is at
 # most this multiple of |test_elements|.

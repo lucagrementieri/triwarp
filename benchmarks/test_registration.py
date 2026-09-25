@@ -72,9 +72,9 @@ delta on a *fixed* mesh, not the absolute time. Two things the two targets do sa
   hoisted out of the loop. Its cost does not grow with how far the source sits off the target,
   which the radius-deepening BVH walk it replaced did: that walk was most of every iteration at
   these misalignments, and the swap alone is worth 1.1-4.4x on the point-to-point rows.
-* ``icp_point_to_plane`` runs its iterations after the first as one recorded device loop
-  (``_device.run_device_loop``), so its rows carry no per-iteration readback; ``icp`` still reads
-  its cost back every iteration for its ``procrustes`` fit.
+* Both ICPs run their iterations after the first as one recorded device loop (a conditional
+  CUDA graph), so no row carries a per-iteration readback: a pinned ``icp`` call reads back once,
+  for its cost.
 """
 
 from __future__ import annotations

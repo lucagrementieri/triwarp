@@ -808,15 +808,16 @@ def test_downsample_polyline_branches_agree(device: str) -> None:
         cumulative_wp = wp.array(cumulative_np, dtype=wp.float32, device=device)
         step = 1.0 if spacing == "exact" else float(4.0 * steps_np.mean())
 
-        serial_wp = wp.zeros(n, dtype=wp.bool, device=device)
+        # An open table: the polyline is read only for a ``closed=True`` seam, so none is passed.
+        serial_wp = wp.zeros(n, dtype=wp.int32, device=device)
         wp.launch(
             kernel_polyline.greedy_downsample_mask,
             dim=1,
-            inputs=[cumulative_wp, wp.float32(step), serial_wp],
+            inputs=[cumulative_wp, wp.float32(step), None, 0, serial_wp],
             device=device,
         )
-        doubling_wp = wp.zeros(n, dtype=wp.bool, device=device)
-        tw.polyline._greedy_downsample_doubling(cumulative_wp, step, doubling_wp)
+        doubling_wp = wp.zeros(n, dtype=wp.int32, device=device)
+        tw.polyline._greedy_downsample_doubling(cumulative_wp, step, None, False, doubling_wp)
 
         assert int(serial_wp.numpy().sum()) > 1, f"{spacing}: the walk kept only the first point"
         assert np.array_equal(serial_wp.numpy(), doubling_wp.numpy()), spacing
@@ -963,6 +964,18 @@ def test_resample_single_point_repeats(device: str) -> None:
     point_np = np.array([[1.0, 2.0, 3.0]])
     resampled_wp = tw.polyline.polyline_resample(points_to_warp(point_np, device), 5)
     assert np.allclose(resampled_wp.numpy(), np.repeat(point_np, 5, axis=0), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_resample_empty_polyline_is_returned_unchanged(device: str, closed: bool) -> None:
+    """
+    An empty polyline comes back empty, ``closed`` or not, as the docstring states.
+
+    Not a library comparison: an edge-case contract. ``closed=True`` used to slice ``num_points``
+    samples out of the empty result and raise Warp's zero-length-slice ``RuntimeError``.
+    """
+    empty_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    assert tw.polyline.polyline_resample(empty_wp, 5, closed=closed).shape == (0,)
 
 
 # --- radius (NumPy reference) ---
@@ -1565,17 +1578,31 @@ def test_simplify_matches_the_two_decimators(device: str, tolerance: float) -> N
     assert _max_deviation_np(pts_np, simplified_pv) <= tolerance
 
 
-def test_closed_keyword_equals_closing_the_polyline_explicitly(device: str) -> None:
+@pytest.mark.parametrize("ending", ["open", "repeated", "within_tolerance"])
+def test_closed_keyword_equals_closing_the_polyline_explicitly(device: str, ending: str) -> None:
     """
     ``closed=True`` is exactly the open computation on ``polyline_close(polyline)``.
 
-    The convention, asserted once for every function that carries the keyword rather than seven
-    times in seven near-identical tests. Three of the ten additionally drop the duplicated seam
-    point on the way out, so they are checked against the sliced form instead -- which is the whole
-    difference between the two groups and the thing most likely to drift.
+    Triwarp against triwarp: the convention, asserted once for every function that carries the
+    keyword rather than seven times in seven near-identical tests. Three of the ten additionally
+    drop the duplicated seam point on the way out, so they are checked against the sliced form
+    instead -- which is the whole difference between the two groups and the thing most likely to
+    drift.
+
+    ``ending`` is the part the kernels decide on the device: an open-ended input gains the
+    closing segment, while one whose last point already repeats the first -- exactly, or within
+    ``allclose``'s tolerance -- gains nothing, ``polyline_close`` returning it unchanged.
+    **Mutation probe:** making the kernels' closure test always add the segment fails both
+    repeated arms, at the ``polyline_upsample`` assert.
     """
     pts_np = _random_open_polyline(33, n=20)
+    if ending != "open":
+        seam_np = pts_np[:1] * (1.0 + (5e-6 if ending == "within_tolerance" else 0.0))
+        pts_np = np.concatenate([pts_np, seam_np])
     polyline_wp = points_to_warp(pts_np, device)
+    stored_np = polyline_wp.numpy()
+    assert tw.polyline.is_closed(polyline_wp) == (ending != "open")
+    assert np.array_equal(stored_np[0], stored_np[-1]) == (ending == "repeated")
     closed_wp = tw.polyline.polyline_close(polyline_wp)
     queries_wp = points_to_warp(_random_open_polyline(34, n=15), device)
     n_original = int(polyline_wp.shape[0])

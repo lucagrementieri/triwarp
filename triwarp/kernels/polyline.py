@@ -1,16 +1,15 @@
 import warp as wp
 
+from triwarp.constants import ALLCLOSE_ATOL_CONSTANT, ALLCLOSE_RTOL_CONSTANT
 from triwarp.kernels.array import (
     LOOP_CONDITION,
     LOOP_ROUND,
     binary_search_index,
     cross2,
-    declare_map_signatures,
     is_close_vec3,
     lift_vec2,
     lowbias32,
-    map_probe,
-    map_probe_single,
+    scanned_count,
     wrap_index,
 )
 from triwarp.kernels.predicates import (
@@ -61,20 +60,42 @@ def segment_midpoint_and_length(start: wp.vec3, end: wp.vec3) -> tuple[wp.vec3, 
 
 
 @wp.func
-def ring_closing_flag(
-    first: wp.vec3, last: wp.vec3, rtol: wp.float32, atol: wp.float32
-) -> wp.int32:
+def ring_closing_flag(first: wp.vec3, last: wp.vec3) -> wp.int32:
     # ``polyline.is_closed``'s predicate (``endpoints_coincide``'s, below), on the device: ``1``
     # when the last point repeats the first within ``allclose``'s tolerance. Every thread of a
     # kernel that needs the closure evaluates it on the same two points, so all of them agree, and
     # the decision costs neither a launch of its own nor a readback.
-    return wp.where(is_close_vec3(first, last, rtol, atol), wp.int32(1), wp.int32(0))
+    return wp.where(
+        is_close_vec3(first, last, ALLCLOSE_RTOL_CONSTANT, ALLCLOSE_ATOL_CONSTANT),
+        wp.int32(1),
+        wp.int32(0),
+    )
+
+
+@wp.func
+def closing_segment_flag(polyline: wp.array[wp.vec3], wrap_open: wp.int32) -> wp.int32:
+    # ``1`` when ``closed=True`` adds a segment: the caller asked for the loop (``wrap_open``) and
+    # the last point does not already repeat the first. That segment runs from ``polyline[n - 1]``
+    # back to ``polyline[0]`` and is reached by wrapping the index, which is what
+    # ``polyline_close``'s copy with the first point appended held at its slot ``n``. Evaluated per
+    # thread on the same two points (``ring_closing_flag``), so the closure costs no readback; and
+    # not at all on an open call, whose threads never load the endpoints for it.
+    if wrap_open == 0:
+        return wp.int32(0)
+    n = polyline.shape[0]
+    return wp.int32(1) - ring_closing_flag(polyline[0], polyline[n - 1])
+
+
+@wp.func
+def loop_point(k: wp.int32, n: wp.int32) -> wp.int32:
+    # Point index of entry ``k`` in ``[0, n]`` of a closed polyline's ``n + 1`` entries, the last
+    # being the first point again: what ``polyline_close``'s copy held at slot ``n``. A select
+    # rather than ``k % n``, which is an integer division per sample on the hot gathers.
+    return wp.where(k < n, k, wp.int32(0))
 
 
 @wp.kernel
-def accumulate_newell_normal(
-    polyline: wp.array[wp.vec3], rtol: wp.float32, atol: wp.float32, out_normal: wp.array[wp.vec3]
-) -> None:
+def accumulate_newell_normal(polyline: wp.array[wp.vec3], out_normal: wp.array[wp.vec3]) -> None:
     # Newell's method sums cross(V_i, V_{i + 1}) over the edges of a loop. Every thread evaluates
     # ``ring_closing_flag`` -- ``is_closed``'s predicate -- on the same two points, so the closure
     # costs neither a readback nor a launch of its own: a polyline whose last vertex duplicates
@@ -97,7 +118,7 @@ def accumulate_newell_normal(
     # ``reduce.ITEMS_PER_BLOCK_1D``, read by ``blocks_1d`` at the launch and by ``tile_chunk`` here.
     chunk, lane = wp.tid()
     n = polyline.shape[0]
-    n_pairs = n - ring_closing_flag(polyline[0], polyline[n - 1], rtol, atol)
+    n_pairs = n - ring_closing_flag(polyline[0], polyline[n - 1])
     offset, count = block_chunk_1d(n_pairs, chunk)
     if count <= 0:
         return
@@ -112,11 +133,7 @@ def accumulate_newell_normal(
 
 @wp.kernel
 def vertex_turning_angles(
-    polyline: wp.array[wp.vec3],
-    wrap_open: wp.int32,
-    rtol: wp.float32,
-    atol: wp.float32,
-    out_angles: wp.array[wp.float32],
+    polyline: wp.array[wp.vec3], wrap_open: wp.int32, out_angles: wp.array[wp.float32]
 ) -> None:
     # One angle per vertex, written in its final slot: the angle between the segment arriving at
     # vertex ``j`` and the one leaving it, with segment ``k`` running from ``polyline[k]`` to
@@ -132,7 +149,7 @@ def vertex_turning_angles(
     # same kernel would compute over a ``polyline_close`` copy, without making the copy.
     j = wp.int32(wp.tid())
     n = polyline.shape[0]
-    loop = ring_closing_flag(polyline[0], polyline[n - 1], rtol, atol) != 0
+    loop = ring_closing_flag(polyline[0], polyline[n - 1]) != 0
     n_segments = n - 1
     if wrap_open != 0 and not loop:
         n_segments = n
@@ -153,14 +170,23 @@ def vertex_turning_angles(
 
 @wp.kernel
 def distance_to_segments(
-    points: wp.array[wp.vec3], polyline: wp.array[wp.vec3], out_distances: wp.array[wp.float32]
+    points: wp.array[wp.vec3],
+    polyline: wp.array[wp.vec3],
+    wrap_open: wp.int32,
+    out_distances: wp.array[wp.float32],
 ) -> None:
+    # The closing segment ``closed=True`` adds is tested *after* the open ones rather than by
+    # wrapping the loop index, so the ``points x segments`` loop carries no modulo, and in the
+    # same order the ``polyline_close`` copy put it in -- last.
     tid = wp.int32(wp.tid())
     p = points[tid]
-    n_segments = polyline.shape[0] - 1
+    n = polyline.shape[0]
+    closes = closing_segment_flag(polyline, wrap_open)
     best = point_to_segment_distance(polyline[0], polyline[1], p)
-    for i in range(1, n_segments):
+    for i in range(1, n - 1):
         best = wp.min(best, point_to_segment_distance(polyline[i], polyline[i + 1], p))
+    if closes != 0:
+        best = wp.min(best, point_to_segment_distance(polyline[n - 1], polyline[0], p))
     out_distances[tid] = best
 
 
@@ -174,10 +200,22 @@ def distance_to_first_point(
 
 @wp.kernel
 def segment_step_counts(
-    polyline: wp.array[wp.vec3], step_size: wp.float32, out_steps: wp.array[wp.int32]
+    polyline: wp.array[wp.vec3],
+    step_size: wp.float32,
+    wrap_open: wp.int32,
+    out_steps: wp.array[wp.int32],
 ) -> None:
+    # Launched over ``n - 1`` segments, or ``n`` for ``closed=True``. Slot ``n - 1`` is then the
+    # closing segment when ``closing_segment_flag`` adds one, and a zero count when the input
+    # already repeats its first point: a segment with no samples, which the offsets search in
+    # ``segment_parameter`` never selects, so the output is the ``n - 1``-segment one. That is
+    # what lets the host size the launch without asking whether the ends coincide.
     i = wp.int32(wp.tid())
-    length = wp.length(segment_displacement(polyline, i))
+    n = polyline.shape[0]
+    if i == n - 1 and closing_segment_flag(polyline, wrap_open) == 0:
+        out_steps[i] = 0
+        return
+    length = wp.length(polyline[loop_point(i + 1, n)] - polyline[i])
     out_steps[i] = wp.max(wp.int32(wp.floor(length / step_size)), wp.int32(1))
 
 
@@ -201,9 +239,11 @@ def upsample_gather(
     steps: wp.array[wp.int32],
     out_points: wp.array[wp.vec3],
 ) -> None:
+    # ``loop_point`` reaches the closing segment's end, the first point (``segment_step_counts``).
     j = wp.int32(wp.tid())
     segment, weight = segment_parameter(offsets, steps, j)
-    out_points[j] = wp.lerp(polyline[segment], polyline[segment + 1], weight)
+    n = polyline.shape[0]
+    out_points[j] = wp.lerp(polyline[segment], polyline[loop_point(segment + 1, n)], weight)
 
 
 CURVATURE_EPS = wp.constant(wp.float32(1.0e-6))
@@ -310,18 +350,24 @@ def smooth_upsample_gather(
     closed: wp.int32,
     out_points: wp.array[wp.vec3],
 ) -> None:
+    # A loop is ``closed=True`` *or* an input whose last point already repeats its first -- the
+    # module's convention -- and which of the two decides the distinct-vertex count ``m``: the
+    # repeated point is one vertex, the appended closing segment (``segment_step_counts``) is not
+    # a new one. Both are evaluated per thread, so ``polyline_smooth_upsample`` asks the host
+    # nothing about the closure.
     j = wp.int32(wp.tid())
     segment, t = segment_parameter(offsets, steps, j)
     n = polyline.shape[0]
     po = polyline[segment]
-    pd = polyline[segment + 1]
+    pd = polyline[loop_point(segment + 1, n)]
+    repeated = ring_closing_flag(polyline[0], polyline[n - 1])
     # Locate the vertices bracketing this segment; interior segments fit a curvature arc, boundary
     # segments of an open polyline (missing a neighbour) stay linear.
     has_neighbours = 0
     prev_index = 0
     next_index = 0
-    if closed == 1:
-        m = n - 1  # distinct vertices: polyline[n - 1] duplicates polyline[0]
+    if closed == 1 or repeated == 1:
+        m = n - repeated  # distinct vertices: a repeated last point is the first one
         prev_index = (segment - 1 + m) % m
         next_index = (segment + 2) % m
         has_neighbours = 1
@@ -336,9 +382,42 @@ def smooth_upsample_gather(
     out_points[j] = arc_point(po, pd, no, nd, t)
 
 
+@wp.func
+def seam_repeats_first(polyline: wp.array[wp.vec3], wrap_open: wp.int32) -> wp.int32:
+    # ``1`` when a ``closed=True`` arc-length table (``arc_segment_lengths``) ends in the
+    # zero-length stand-in for a closing segment the input already had -- its last entry is then
+    # no point of the loop, and a walk or a search over the table stops one entry short.
+    return wrap_open - closing_segment_flag(polyline, wrap_open)
+
+
+@wp.kernel
+def arc_segment_lengths(
+    polyline: wp.array[wp.vec3], wrap_open: wp.int32, out_lengths: wp.array[wp.float32]
+) -> None:
+    # Segment lengths for an arc-length table, launched over ``n - 1`` segments or ``n`` for
+    # ``closed=True``. The closing slot ``n - 1`` holds the segment back to the first point when
+    # ``closing_segment_flag`` adds one and an exact ``0`` when the input already repeats it, so
+    # the scan's prefix is the ``n - 1``-segment table and its last entry duplicates the one
+    # before (``seam_repeats_first`` tells the consumers to ignore it). One kernel rather than a
+    # ``wp.map`` of ``segment_length`` over ``polyline[:-1]`` / ``polyline[1:]``: a map cannot wrap
+    # the index, and the same arithmetic without the map's host-side resolution.
+    i = wp.int32(wp.tid())
+    n = polyline.shape[0]
+    length = wp.float32(0.0)
+    if i < n - 1:
+        length = segment_length(polyline[i], polyline[i + 1])
+    elif closing_segment_flag(polyline, wrap_open) != 0:
+        length = segment_length(polyline[n - 1], polyline[0])
+    out_lengths[i] = length
+
+
 @wp.kernel
 def greedy_downsample_mask(
-    cumulative_lengths: wp.array[wp.float32], step_size: wp.float32, out_keep: wp.array[wp.bool]
+    cumulative_lengths: wp.array[wp.float32],
+    step_size: wp.float32,
+    polyline: wp.array[wp.vec3],
+    wrap_open: wp.int32,
+    out_keep: wp.array[wp.int32],
 ) -> None:
     # Single-thread greedy walk (dim == 1): the selection is sequential because each kept point
     # moves the reference the next one is measured from.
@@ -349,12 +428,16 @@ def greedy_downsample_mask(
     # launches the parallel form below costs; the crossover is on that constant. It was measured
     # when a doubling round took two launches rather than ``double_greedy_orbit``'s one, so it is
     # conservative until re-probed.
-    n = cumulative_lengths.shape[0]
-    out_keep[0] = True
+    #
+    # ``out_keep`` is ``0`` / ``1`` flags rather than a mask, so the caller scans it in place for
+    # the kept count and the compaction (``gather_kept_points``). ``polyline`` is read only for the
+    # closure (``seam_repeats_first``); an open call passes ``wrap_open = 0`` and may pass ``None``.
+    n = cumulative_lengths.shape[0] - seam_repeats_first(polyline, wrap_open)
+    out_keep[0] = 1
     last = cumulative_lengths[0]
     for i in range(1, n):
         if cumulative_lengths[i] - last >= step_size:
-            out_keep[i] = True
+            out_keep[i] = 1
             last = cumulative_lengths[i]
 
 
@@ -362,8 +445,10 @@ def greedy_downsample_mask(
 def greedy_successors(
     cumulative_lengths: wp.array[wp.float32],
     step_size: wp.float32,
+    polyline: wp.array[wp.vec3],
+    wrap_open: wp.int32,
     out_successor: wp.array[wp.int32],
-    out_keep: wp.array[wp.bool],
+    out_keep: wp.array[wp.int32],
 ) -> None:
     # The greedy walk's step function, for every point at once: ``out_successor[i]`` is the point
     # the walk would keep next *if* it had just kept ``i``, or ``n`` when the polyline ends first.
@@ -376,28 +461,35 @@ def greedy_successors(
     # ``cum[mid] - step`` are not the same test in float32, so searching on a shifted key would
     # move the accepted set at the boundary. It is monotone in ``mid`` because ``cum`` is
     # non-decreasing, which is what makes the search valid at all.
+    #
+    # The search stops at ``n_walk``, one short of the table when its last entry is a closed
+    # input's repeated first point (``seam_repeats_first``), and "no successor" is still the
+    # table length ``n`` -- the absorbing state ``double_greedy_orbit`` reads off the buffer size.
+    # So that entry is never reached, and every other successor is the one the table without it
+    # gives: the same search over the same prefix.
     i = wp.int32(wp.tid())
     n = cumulative_lengths.shape[0]
+    n_walk = n - seam_repeats_first(polyline, wrap_open)
     if i == 0:
-        out_keep[0] = True
+        out_keep[0] = 1
     base = cumulative_lengths[i]
     lo = i + 1
-    hi = n
+    hi = n_walk
     while lo < hi:
         mid = (lo + hi) // 2
         if cumulative_lengths[mid] - base >= step_size:
             hi = mid
         else:
             lo = mid + 1
-    out_successor[i] = lo
+    out_successor[i] = wp.where(lo >= n_walk, n, lo)
 
 
 @wp.kernel
 def double_greedy_orbit(
     successor: wp.array[wp.int32],
-    reached: wp.array[wp.bool],
+    reached: wp.array[wp.int32],
     out_squared: wp.array[wp.int32],
-    out_keep: wp.array[wp.bool],
+    out_keep: wp.array[wp.int32],
 ) -> None:
     # One pointer-doubling round, both halves in one launch. Given ``successor`` holding
     # ``succ^(2^k)`` and ``reached`` holding ``{succ^t(0) : t < 2^k}``:
@@ -406,7 +498,7 @@ def double_greedy_orbit(
     # ``t < 2^(k + 1)``. ``ceil(log2(n + 1))`` rounds therefore cover the whole orbit, whatever its
     # length -- the walk advances by at least ``step_size`` each time, so the orbit is at most ``n``
     # long. ``reached`` and ``out_keep`` are **the same buffer**, updated in place, and that is safe
-    # *and* deliberate. Every write is ``True``, so a lost update is impossible; a thread that
+    # *and* deliberate. Every write is ``1``, so a lost update is impossible; a thread that
     # happens to see a mark written this round propagates one extra hop, which can only mark
     # another point of the same orbit (``succ`` of an orbit point is one). So intermediate rounds
     # are nondeterministic in *which* extra points they mark and the final answer is not, because
@@ -424,14 +516,28 @@ def double_greedy_orbit(
     i = wp.int32(wp.tid())
     n = successor.shape[0]
     j = successor[i]
-    if reached[i] and j < n:
-        out_keep[j] = True
+    if reached[i] != 0 and j < n:
+        out_keep[j] = 1
     # ``wp.where`` evaluates both arms (it is not a short-circuiting ternary), so indexing
     # ``successor[j]`` directly is an out-of-bounds read once ``j`` has reached the absorbing
     # state ``n`` -- the read value is discarded either way, but it is a real OOB and aborts under
     # ``wp.config.mode = "debug"``. Clamp the index before the load rather than after.
     safe_j = wp.min(j, n - wp.int32(1))
     out_squared[i] = wp.where(j >= n, n, successor[safe_j])
+
+
+@wp.kernel
+def gather_kept_points(
+    inclusive: wp.array[wp.int32], polyline: wp.array[wp.vec3], out_points: wp.array[wp.vec3]
+) -> None:
+    # Compact the downsample's kept points from the in-place inclusive scan of its 0/1 flags, in
+    # one launch: ``array.flatnonzero`` then ``array.gather`` is a scatter of indices into their
+    # own buffer and a second pass through them. Entry ``n`` of a ``closed=True`` table is the
+    # closing segment's end, the first point, hence the wrap.
+    i = wp.int32(wp.tid())
+    start, count = scanned_count(inclusive, i)
+    if count != 0:
+        out_points[start] = polyline[loop_point(i, polyline.shape[0])]
 
 
 RDP_LINE_EPS = wp.constant(wp.float32(1.0e-7))  # libigl FLOAT_EPS: degenerate-segment threshold
@@ -731,27 +837,37 @@ def resample_interp(
     polyline: wp.array[wp.vec3],
     cumulative_lengths: wp.array[wp.float32],
     num_points: wp.int32,
+    wrap_open: wp.int32,
     out_points: wp.array[wp.vec3],
 ) -> None:
     # Linear interpolation at evenly spaced arc lengths, mimicking numpy.interp:
     # constant (clamped) extrapolation at the endpoints.
+    #
+    # ``num_points`` is the *spacing* count: ``closed=True`` launches ``num_points`` threads at a
+    # spacing of ``num_points + 1`` samples, so its seam sample is never computed rather than
+    # computed and sliced off. Table entry ``k`` is point ``loop_point(k, n)`` -- entry ``n`` of a
+    # closed table is the closing segment's end, the first point -- and a table ending in a
+    # repeated first point (``seam_repeats_first``) is read ``n_table`` long. The search runs over
+    # the whole table: its last entry then equals the one before, so every in-range answer is the
+    # shorter table's, and an out-of-range one lands on ``n_table``'s last point either way.
     j = wp.int32(wp.tid())
     n = polyline.shape[0]
-    total = cumulative_lengths[n - 1]
+    n_table = cumulative_lengths.shape[0] - seam_repeats_first(polyline, wrap_open)
+    total = cumulative_lengths[n_table - 1]
     x = wp.float32(0.0)
     if num_points > 1:
         x = wp.float32(j) / wp.float32(num_points - 1) * total
     hi = binary_search_index(cumulative_lengths, x)
     if hi == 0:
         out_points[j] = polyline[0]
-    elif hi >= n:
-        out_points[j] = polyline[n - 1]
+    elif hi >= n_table:
+        out_points[j] = polyline[loop_point(n_table - 1, n)]
     else:
         denominator = cumulative_lengths[hi] - cumulative_lengths[hi - 1]
         t = wp.float32(0.0)
         if denominator > 0.0:
             t = (x - cumulative_lengths[hi - 1]) / denominator
-        out_points[j] = wp.lerp(polyline[hi - 1], polyline[hi], t)
+        out_points[j] = wp.lerp(polyline[hi - 1], polyline[loop_point(hi, n)], t)
 
 
 @wp.func
@@ -778,9 +894,7 @@ RADIUS_FRAME_SIZE = 7
 
 
 @wp.kernel
-def accumulate_radius_frame(
-    polyline: wp.array[wp.vec3], rtol: wp.float32, atol: wp.float32, out_frame: wp.array[wp.float32]
-) -> None:
+def accumulate_radius_frame(polyline: wp.array[wp.vec3], out_frame: wp.array[wp.float32]) -> None:
     # ``polyline_radius``'s default plane in one pass: the length-weighted midpoint sums
     # ``polyline_centroid`` takes over the ``n - 1`` open segments, and Newell's sum
     # ``polyline_normal`` takes over the loop -- ``n - 1`` pairs when the last point repeats the
@@ -792,7 +906,7 @@ def accumulate_radius_frame(
     chunk, lane = wp.tid()
     n = polyline.shape[0]
     n_segments = n - 1
-    n_pairs = n - ring_closing_flag(polyline[0], polyline[n - 1], rtol, atol)
+    n_pairs = n - ring_closing_flag(polyline[0], polyline[n - 1])
     offset, count = block_chunk_1d(wp.max(n_segments, n_pairs), chunk)
     if count <= 0:
         return
@@ -924,9 +1038,7 @@ RING_SUMS_SIZE = 11
 
 
 @wp.kernel
-def accumulate_loop_frame(
-    polyline: wp.array[wp.vec3], rtol: wp.float32, atol: wp.float32, out_sums: wp.array[wp.float32]
-) -> None:
+def accumulate_loop_frame(polyline: wp.array[wp.vec3], out_sums: wp.array[wp.float32]) -> None:
     # Over the loop of ``n_ring`` distinct vertices: the input minus a repeated closing point, which
     # this kernel detects itself (``ring_closing_flag``) and publishes in ``RING_CLOSING`` for the
     # caller's one readback, so the ring length never costs a readback of its own.
@@ -941,7 +1053,7 @@ def accumulate_loop_frame(
     # no device branch is needed.
     chunk, lane = wp.tid()
     n = polyline.shape[0]
-    closing = ring_closing_flag(polyline[0], polyline[n - 1], rtol, atol)
+    closing = ring_closing_flag(polyline[0], polyline[n - 1])
     n_ring = n - closing
     if chunk == 0 and lane == 0:
         out_sums[RING_CLOSING] = wp.float32(closing)
@@ -1000,11 +1112,7 @@ def mirror_y(p: wp.vec2) -> wp.vec2:
 
 @wp.kernel
 def accumulate_turning_angle(
-    points2d: wp.array[wp.vec2],
-    detect_closing: wp.int32,
-    rtol: wp.float32,
-    atol: wp.float32,
-    out_sums: wp.array[wp.float32],
+    points2d: wp.array[wp.vec2], detect_closing: wp.int32, out_sums: wp.array[wp.float32]
 ) -> None:
     # Cyclic signed exterior angle at each vertex into ``out_sums[RING_TURNING]``; the sum's sign
     # gives the loop orientation. Lane-strided single-slot reduction -- see
@@ -1034,9 +1142,7 @@ def accumulate_turning_angle(
     closing = wp.int32(0)
     if detect_closing != 0:
         zero = wp.float32(0.0)
-        closing = ring_closing_flag(
-            lift_vec2(points2d[0], zero), lift_vec2(points2d[n - 1], zero), rtol, atol
-        )
+        closing = ring_closing_flag(lift_vec2(points2d[0], zero), lift_vec2(points2d[n - 1], zero))
         if chunk == 0 and lane == 0:
             out_sums[RING_CLOSING] = wp.float32(closing)
     else:
@@ -1332,32 +1438,6 @@ def ear_clip_block(
         rounds += 1
 
 
-def _declare_map_kernels() -> None:
-    """
-    Pre-declare this module's forking ``wp.map`` signatures so each builds one module, not three.
-
-    See ``kernels/array.py::declare_map_signatures`` for why this exists, how the table was
-    derived and what forks a ``wp.map`` module; only this module's *own* forking ops belong
-    here (the shared builtins are declared there).
-    """
-    # The one op here forks on the **length-1** axis alone: ``cumulative_arc_length`` maps it over
-    # the shifted pair ``polyline[:-1]`` / ``polyline[1:]``, so a two-point polyline hands it
-    # one-element views where every longer one hands it dense arrays. That is section 3's "the fork
-    # axis is not only the dtype", and a two-point polyline is an ordinary input rather than a
-    # corner. The per-segment ops the centroid and radius once mapped are now called inside their
-    # own reduction kernels, so they need no entry.
-    dense, single = map_probe, map_probe_single
-    declare_map_signatures(
-        [
-            (segment_length, (dense(wp.vec3), dense(wp.vec3)), wp.float32),
-            (segment_length, (single(wp.vec3), single(wp.vec3)), wp.float32),
-        ]
-    )
-
-
-_declare_map_kernels()
-
-
 @wp.kernel
 def polyline_total_length(
     points: wp.array[wp.vec3], n_segments: wp.int32, out_total: wp.array[wp.float32]
@@ -1458,9 +1538,7 @@ def polyline_weighted_midpoint_sums(
 
 
 @wp.kernel
-def endpoints_coincide(
-    polyline: wp.array[wp.vec3], rtol: wp.float32, atol: wp.float32, out_flag: wp.array[wp.int32]
-) -> None:
+def endpoints_coincide(polyline: wp.array[wp.vec3], out_flag: wp.array[wp.int32]) -> None:
     # Whether a polyline's first and last points coincide, as one thread and one flag.
     #
     # ``polyline.is_closed`` asked this through ``array.allclose`` over two one-element slices,
@@ -1473,5 +1551,7 @@ def endpoints_coincide(
     # ``@wp.func``, so the two cannot disagree about what "coincide" means.
     n = polyline.shape[0]
     out_flag[0] = wp.where(
-        is_close_vec3(polyline[0], polyline[n - 1], rtol, atol), wp.int32(1), wp.int32(0)
+        is_close_vec3(polyline[0], polyline[n - 1], ALLCLOSE_RTOL_CONSTANT, ALLCLOSE_ATOL_CONSTANT),
+        wp.int32(1),
+        wp.int32(0),
     )

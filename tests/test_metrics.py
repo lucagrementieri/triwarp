@@ -193,6 +193,108 @@ def test_chamfer_points_to_points_matches_pytorch3d(device: str) -> None:
     assert np.allclose(chamfer_wp, float(chamfer_p3d), rtol=1e-6, atol=0.0)
 
 
+def _pairing(icosphere, pairing: str) -> tuple[np.ndarray, np.ndarray]:
+    """``(x, y)`` for the three pairings that decide the backward cloud search."""
+    vertices_np = np.asarray(icosphere[0].vertices, dtype=np.float32)
+    rng = np.random.default_rng(31)
+    jittered_np = (vertices_np + rng.normal(scale=1e-4, size=vertices_np.shape)).astype(np.float32)
+    if pairing == "coincident":
+        return vertices_np, jittered_np
+    if pairing == "displaced":
+        return vertices_np, (jittered_np + 0.3).astype(np.float32)
+    # ``x`` covers half of ``y``: the forward answer is small and the backward one is not.
+    return vertices_np[vertices_np[:, 0] < 0.0], jittered_np
+
+
+# Which search the backward half takes on each pairing: the seeded hash grid (``backend`` left at
+# its default) when the forward answer is small against the cloud's spacing and covers nearly every
+# query, the closest-point descent (``"bvh"``) otherwise -- ``partial`` is the pairing whose small
+# forward answer the coverage test rejects. The forward half is the descent every time.
+_BACKWARD_BACKEND = {"coincident": None, "displaced": "bvh", "partial": "bvh"}
+
+
+@pytest.mark.parametrize("pairing", ["coincident", "displaced", "partial"])
+@pytest.mark.parametrize("size_gate", [False, True])
+def test_chamfer_points_to_points_matches_kdtree_on_either_backward_search(
+    device: str, icosphere, pairing: str, size_gate: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Class A: every per-point distance, both directions, against ``scipy.spatial.KDTree``.
+
+    The backward search is chosen from the forward answer, so each pairing is one arm of that
+    choice and the spy asserts the arm was taken -- a pairing that silently took the other search
+    would leave one of the two unexercised. The fixture is far below the cloud size the choice is
+    considered at, so ``size_gate=False`` lowers that threshold to reach it; with the threshold in
+    place every pairing takes the descent, and so does every pairing on the CPU, where the choice
+    is never made.
+    """
+    if not size_gate:
+        monkeypatch.setattr(tw.metrics, "_GRID_BACKWARD_MIN_POINTS", 0)
+    x_np, y_np = _pairing(icosphere, pairing)
+    distance_xy_np = KDTree(y_np).query(x_np)[0]
+    distance_yx_np = KDTree(x_np).query(y_np)[0]
+    assert np.ptp(distance_yx_np) > 1e-5  # not a constant answer (7.4)
+
+    backends: list[str | None] = []
+    query_nearest = tw.neighbors.query_nearest
+
+    def spy(*args, **kwargs):
+        backends.append(kwargs.get("backend"))
+        return query_nearest(*args, **kwargs)
+
+    monkeypatch.setattr(tw.neighbors, "query_nearest", spy)
+    forward_wp, backward_wp = tw.metrics.chamfer_points_to_points(
+        points_to_warp(x_np, device), points_to_warp(y_np, device), point_reduction=None
+    )
+    chooses = not size_gate and wp.get_device(device).is_cuda
+    assert backends == ["bvh", _BACKWARD_BACKEND[pairing] if chooses else "bvh"]
+    assert np.allclose(np.sqrt(forward_wp.numpy()), distance_xy_np, rtol=1e-5, atol=1e-6)
+    assert np.allclose(np.sqrt(backward_wp.numpy()), distance_yx_np, rtol=1e-5, atol=1e-6)
+
+    hausdorff_wp = tw.metrics.hausdorff_points_to_points(
+        points_to_warp(x_np, device), points_to_warp(y_np, device)
+    )
+    expected = max(distance_xy_np.max(), distance_yx_np.max())
+    assert np.isclose(hausdorff_wp, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("pairing", ["coincident", "displaced", "partial"])
+def test_chamfer_points_to_points_loss_grad_on_either_backward_search(
+    device: str, icosphere, pairing: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Class A: the loss and both gradients against the closed form over ``KDTree``'s assignment.
+
+    The differentiable form reads the backward search's *index*, so this is the check that the
+    grid arm hands the tape the same assignment the descent would -- on a jittered pair, where no
+    two candidates tie. The size threshold is lowered so the fixture reaches the choice.
+    """
+    monkeypatch.setattr(tw.metrics, "_GRID_BACKWARD_MIN_POINTS", 0)
+    x_np, y_np = (a.astype(np.float64) for a in _pairing(icosphere, pairing))
+    n, m = len(x_np), len(y_np)
+    nn_xy = KDTree(y_np).query(x_np)[1]
+    nn_yx = KDTree(x_np).query(y_np)[1]
+    loss_np = ((x_np - y_np[nn_xy]) ** 2).sum(-1).mean() + ((y_np - x_np[nn_yx]) ** 2).sum(
+        -1
+    ).mean()
+    grad_x_np = 2.0 / n * (x_np - y_np[nn_xy])
+    grad_y_np = 2.0 / m * (y_np - x_np[nn_yx])
+    np.add.at(grad_y_np, nn_xy, -2.0 / n * (x_np - y_np[nn_xy]))
+    np.add.at(grad_x_np, nn_yx, -2.0 / m * (y_np - x_np[nn_yx]))
+
+    x_wp = wp.array(x_np, dtype=wp.vec3, device=device, requires_grad=True)
+    y_wp = wp.array(y_np, dtype=wp.vec3, device=device, requires_grad=True)
+    tape = wp.Tape()
+    loss_wp = tw.metrics.chamfer_points_to_points_loss(x_wp, y_wp, tape=tape)
+    tape.backward(loss=loss_wp)
+
+    assert x_wp.grad is not None
+    assert y_wp.grad is not None
+    assert np.allclose(loss_wp.numpy()[0], loss_np, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
+    assert np.allclose(x_wp.grad.numpy(), grad_x_np, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
+    assert np.allclose(y_wp.grad.numpy(), grad_y_np, rtol=_GRAD_RTOL, atol=_GRAD_ATOL)
+
+
 # ---------------------------------------------------------------------------
 # Chamfer: mesh to mesh (vertex-to-surface)
 # ---------------------------------------------------------------------------

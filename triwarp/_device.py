@@ -107,6 +107,23 @@ def run_device_loop(
     --------
     [`prefers_tiled_reduction`][triwarp._device.prefers_tiled_reduction]
     """
+    record_device_loop(device, condition, body)()
+
+
+def record_device_loop(
+    device: wp.DeviceLike, condition: wp.array[wp.int32], body: Callable[[], None]
+) -> Callable[[], None]:
+    """
+    Record [`run_device_loop`][triwarp._device.run_device_loop]'s loop now; return what runs it.
+
+    The same two branches, split between recording and launching, so a caller can record while
+    the device is still busy with work already issued, then read that work's outcome and skip the
+    launch. Both ICP loops do this with their first round: recording first overlaps it, so the read
+    that decides whether the loop runs at all waits on nothing, where reading first leaves the
+    device idle for the recording (2-8 % on every gated call), and not reading at all records and
+    launches a loop of zero rounds after a weightless first round. On a device that cannot record,
+    the returned call is ``wp.capture_while``'s direct execution.
+    """
     resolved = wp.get_device(device)
     # ``wp.is_conditional_graph_supported`` is a *machine* query, so it answers ``True`` on a box
     # with a GPU even when this loop's arrays are on the CPU device; the ``is_cuda`` test is what
@@ -115,9 +132,9 @@ def run_device_loop(
     if resolved.is_cuda and wp.is_conditional_graph_supported():
         with wp.ScopedCapture(resolved) as capture:
             wp.capture_while(condition, body)
-        wp.capture_launch(capture.graph)
-        return
-    wp.capture_while(condition, body)
+        graph = capture.graph
+        return lambda: wp.capture_launch(graph)
+    return lambda: wp.capture_while(condition, body)
 
 
 def items_per_slice(device: wp.DeviceLike) -> int:

@@ -877,6 +877,106 @@ def test_icp_point_to_point_mesh(half_torus: tuple[tm.Trimesh, wp.Mesh], device:
     assert _rms(transformed_wp.numpy(), vertices_np) < 5e-2
 
 
+def _p2p_convergence_call(device: str) -> partial:
+    """Point-to-point ICP on a cloud whose cost falls smoothly over a dozen iterations."""
+    rng = np.random.default_rng(24)
+    target_np = rng.standard_normal((200, 3)).astype(np.float32)
+    rotation_np, translation_np = _rigid_transform(0.7, [0.0, 0.0, 1.0], [0.3, -0.2, 0.1])
+    source_np = target_np @ rotation_np.T + translation_np
+    source_np = (source_np + 0.05 * rng.standard_normal(source_np.shape)).astype(np.float32)
+    return partial(
+        tw.registration.icp,
+        points_to_warp(source_np, device),
+        points_to_warp(target_np, device),
+        None,
+        reflection=False,
+        scale=False,
+    )
+
+
+def test_icp_convergence_stop_matches_the_host_rule(device: str) -> None:
+    """
+    Not a library comparison: the device loop's convergence break against the host's rule.
+
+    The iterations after the first run as one recorded device loop whose ``dim=1`` round kernel
+    applies ``old_cost - cost < threshold`` itself. Iteration ``i`` keeps the fit whose cost a
+    call pinned to ``i + 1`` iterations returns, so the pinned costs ``c(1), c(2), ...`` give the
+    host's answer: the loop stops at the first ``k >= 2`` with ``c(k - 1) - c(k) < threshold`` and
+    returns the pinned ``k``-iteration result -- to the bit on the CPU device, where every
+    accumulation is serial. Non-vacuity: that stop lies strictly between the first iterations and
+    the cap, and the pinned costs keep falling past it. Mutation probe: scaling the kernel's
+    threshold by 0.1 or by 10 moves the stop and fails the matrix comparison.
+    """
+    call = _p2p_convergence_call(device)
+    threshold, cap = 2.5e-3, 30
+    pinned = [call(max_iterations=count, threshold=-np.inf) for count in range(cap + 1)]
+    costs = [result[2] for result in pinned]
+    stop = next(k for k in range(2, cap) if costs[k - 1] - costs[k] < threshold)
+    assert 3 < stop < cap - 5
+    assert costs[stop] - costs[stop + 3] > 0.0
+    matrix_wp, transformed_wp, cost = call(max_iterations=cap, threshold=threshold)
+    expected_matrix_wp, expected_transformed_wp, expected_cost = pinned[stop]
+    if wp.get_device(device).is_cuda:
+        assert np.allclose(matrix_wp.numpy(), expected_matrix_wp.numpy(), atol=1e-5)
+        assert np.isclose(cost, expected_cost, rtol=1e-4)
+    else:
+        assert np.array_equal(matrix_wp.numpy(), expected_matrix_wp.numpy())
+        assert np.array_equal(transformed_wp.numpy(), expected_transformed_wp.numpy())
+        assert cost == expected_cost
+
+
+@pytest.mark.parametrize("target", ["cloud", "mesh"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"max_iterations": 0},
+        {"max_iterations": 1},
+        {"max_iterations": 4, "threshold": -np.inf},
+        {"max_iterations": 30},
+        {"max_iterations": 4, "threshold": -np.inf, "max_distance": 0.5},
+    ],
+    ids=["no_iteration", "one", "pinned", "converged", "gated"],
+)
+def test_icp_transformed_is_matrix_image(
+    half_torus: tuple[tm.Trimesh, wp.Mesh], device: str, target: str, options: dict
+) -> None:
+    """
+    Not a library comparison: the returned points are the source under the returned matrix.
+
+    The loop never moves the source: each correspondence pass moves its own point by the kept
+    transform in registers, and ``transformed`` is written once after the loop. So a kept
+    transform the output was not moved by -- the seed image returned after a real fit, or a fit
+    kept that the output does not sit under -- shows up here. The initial transform is
+    non-trivial, and every arm but the first must have moved it. Mutation probe: dropping the
+    post-loop transform fails every arm that iterates.
+    """
+    mesh_tm, mesh_wp = half_torus
+    vertices_np, faces_np = _mesh_vertices_faces(mesh_tm)
+    rotation_np, translation_np = _rigid_transform(0.1, [0.2, 0.6, 0.3], [0.03, -0.02, 0.04])
+    source_np = (vertices_np @ rotation_np.T + translation_np).astype(np.float32)
+    initial_np = np.eye(4, dtype=np.float32)
+    initial_np[:3, 3] = [0.01, 0.0, -0.02]
+
+    source_wp = points_to_warp(source_np, mesh_wp.device)
+    vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
+    faces_wp = (
+        wp.array(faces_np, dtype=wp.int32, device=mesh_wp.device) if target == "mesh" else None
+    )
+
+    matrix_wp, transformed_wp, cost = tw.registration.icp(
+        source_wp, vertices_wp, faces_wp, initial=wp.mat44(*initial_np.ravel()), **options
+    )
+    matrix_np = matrix_wp.numpy()[0].astype(np.float64)
+    expected_np = source_np @ matrix_np[:3, :3].T + matrix_np[:3, 3]
+    assert np.allclose(transformed_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
+    if options["max_iterations"] == 0:
+        assert np.array_equal(matrix_np, initial_np)
+        assert cost == np.inf
+    else:
+        assert not np.allclose(matrix_np, initial_np, atol=1e-3)
+        assert np.isfinite(cost)
+
+
 @pytest.mark.parametrize("angle", [0.15, 0.30])
 @pytest.mark.parity("icp_mesh", "pymeshlab")
 def test_icp_mesh_matches_pymeshlab(device: str, angle: float) -> None:
@@ -1242,6 +1342,63 @@ def test_icp_point_to_plane_cloud_with_normals(device: str) -> None:
     assert _rms(transformed_wp.numpy(), target_np) < 1e-2
 
 
+def _host_prefix_median(values: np.ndarray) -> float:
+    """``reduce.median``'s answer for sorted ``float32`` values: the ``float64`` middle mean."""
+    count = values.shape[0]
+    if count % 2 == 1:
+        return float(values[count // 2])
+    return (float(values[count // 2 - 1]) + float(values[count // 2])) / 2.0
+
+
+@pytest.mark.parametrize("n_valid", [201, 200, 1])
+def test_robust_scale_matches_the_host_mad(device: str, n_valid: int) -> None:
+    """
+    Not a library comparison: the device MAD scale against the host arithmetic it replaced.
+
+    The robust scale is ``1.345 * 1.4826 * MAD`` of the in-range point-to-plane residuals, both
+    medians formed as ``reduce.median`` forms them -- the middle ``float32`` value, or the
+    ``float64`` mean of the two -- with the centre narrowed to ``float32`` for the deviations. The
+    residuals here are exact (points straight above their match along a unit ``z`` normal), and a
+    third of the correspondences are out of range by distance or by a missing match, so the
+    in-range prefix of the sorted keys is what is measured. Both parities and a single inlier are
+    covered, and the answer must be the same double. Mutation probe: taking the upper middle
+    value alone for an even count fails the even arm, and counting the prefix one short fails
+    both many-inlier arms (a lone inlier's scale is zero either way).
+    """
+    rng = np.random.default_rng(31)
+    n = n_valid + 100
+    closest_np = np.zeros((n, 3), dtype=np.float32)
+    closest_np[:, :2] = rng.standard_normal((n, 2))
+    residual_np = rng.standard_normal(n).astype(np.float32)
+    current_np = closest_np.copy()
+    current_np[:, 2] = residual_np
+    normals_np = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (n, 1))
+    order = rng.permutation(n)
+    valid = np.zeros(n, dtype=bool)
+    valid[order[:n_valid]] = True
+    distance_np = np.where(valid, 0.5, 2.0).astype(np.float32)
+    index_np = np.arange(n, dtype=np.int32)
+    index_np[order[n_valid : n_valid + 50]] = -1
+    distance_np[order[n_valid : n_valid + 50]] = 0.5
+
+    scale = tw.registration._robust_scale_from_residuals(
+        points_to_warp(current_np, device),
+        points_to_warp(closest_np, device),
+        points_to_warp(normals_np, device),
+        wp.array(distance_np, dtype=wp.float32, device=device),
+        wp.array(index_np, dtype=wp.int32, device=device),
+        1.0,
+        1,
+    )
+    kept = np.sort(residual_np[valid])
+    center = np.float32(_host_prefix_median(kept))
+    deviation = np.sort(np.abs(kept - center))
+    sigma = 1.4826 * _host_prefix_median(deviation)
+    assert sigma > 0.0 or n_valid == 1
+    expected = 1.345 * sigma if sigma > 0.0 else 0.0
+    assert scale == expected
+
+
 def test_nearest_into_matches_query_nearest(device: str) -> None:
     """
     Triwarp against triwarp: the ICP loop's hoisted nearest search against ``query_nearest``.
@@ -1297,8 +1454,9 @@ def test_nearest_into_matches_query_nearest(device: str) -> None:
         {"max_iterations": 2, "threshold": -np.inf},
         {"max_iterations": 30},
         {"max_iterations": 5, "max_distance": 1e-9},
+        {"max_iterations": 1, "max_distance": 1e-9},
     ],
-    ids=["no_iteration", "one", "pinned", "converged", "all_rejected"],
+    ids=["no_iteration", "one", "pinned", "converged", "all_rejected", "all_rejected_one"],
 )
 def test_icp_point_to_plane_mesh_transformed_is_matrix_image(
     half_torus: tuple[tm.Trimesh, wp.Mesh], device: str, options: dict
@@ -1313,7 +1471,9 @@ def test_icp_point_to_plane_mesh_transformed_is_matrix_image(
     covered too. Mutation probe: dropping the post-loop apply fails the one- and two-iteration
     arms, and starting iteration 0 from the seed with the (unwritten) step buffer fails four of
     five; a converged run's last step sits below this comparison's float32 floor, so that arm
-    alone cannot see a lost step -- which is also why losing it there would be harmless.
+    alone cannot see a lost step -- which is also why losing it there would be harmless. The
+    one-iteration zero-weight arm is the closing pass after a weightless round: that round must
+    leave an identity step for it to apply, and leaving the step buffer unwritten fails it.
     """
     mesh_tm, mesh_wp = half_torus
     vertices_np, faces_np = _mesh_vertices_faces(mesh_tm)
@@ -1326,7 +1486,7 @@ def test_icp_point_to_plane_mesh_transformed_is_matrix_image(
     vertices_wp = points_to_warp(vertices_np, mesh_wp.device)
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=mesh_wp.device)
 
-    matrix_wp, transformed_wp, _ = tw.registration.icp_point_to_plane(
+    matrix_wp, transformed_wp, cost = tw.registration.icp_point_to_plane(
         source_wp, vertices_wp, faces_wp, initial=wp.mat44(*initial_np.ravel()), **options
     )
     matrix_np = matrix_wp.numpy()[0].astype(np.float64)
@@ -1334,6 +1494,9 @@ def test_icp_point_to_plane_mesh_transformed_is_matrix_image(
     assert np.allclose(transformed_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
     if options.get("max_iterations", 0) >= 1 and "max_distance" not in options:
         assert not np.allclose(matrix_np, initial_np, atol=1e-3)
+    if "max_distance" in options:
+        assert np.array_equal(matrix_np, initial_np)
+        assert cost == np.inf
 
 
 def test_icp_empty_source(device: str) -> None:
@@ -1356,19 +1519,30 @@ def test_icp_point_to_plane_requires_normals(device: str) -> None:
         tw.registration.icp_point_to_plane(source_wp, target_wp, None)
 
 
-def test_icp_max_distance_all_rejected(device: str) -> None:
+@pytest.mark.parametrize("max_iterations", [1, 2, 10])
+def test_icp_max_distance_all_rejected(device: str, max_iterations: int) -> None:
+    """
+    Not a library comparison: a first fit with no weight is not kept, at every loop shape.
+
+    Every correspondence is beyond ``max_distance``, so the first fit divides by a zero weight sum
+    and is a matrix of NaN. One iteration decides that in the device round alone, and more read
+    the round counter after the recording and skip the replay; both must return the seed, its
+    image and ``inf``. Mutation probe: letting ``point_to_point_round`` keep a weightless fit fails
+    all three arms on the matrix.
+    """
     rng = np.random.default_rng(15)
     target_np = rng.standard_normal((100, 3)).astype(np.float32)
     source_np = (target_np + np.array([5.0, 5.0, 5.0], dtype=np.float32)).astype(np.float32)
     source_wp = points_to_warp(source_np, device)
     target_wp = points_to_warp(target_np, device)
 
-    # Every correspondence is beyond max_distance -> no fit, identity returned, no crash.
-    matrix_wp, _, _ = tw.registration.icp(
-        source_wp, target_wp, None, max_iterations=10, max_distance=1e-6
+    matrix_wp, transformed_wp, cost = tw.registration.icp(
+        source_wp, target_wp, None, max_iterations=max_iterations, max_distance=1e-6
     )
     assert np.isfinite(matrix_wp.numpy()).all()
     assert np.allclose(matrix_wp.numpy()[0], np.eye(4), atol=1e-6)
+    assert np.array_equal(transformed_wp.numpy(), source_np)
+    assert cost == np.inf
 
 
 def test_icp_point_to_plane_target_normals_length_mismatch(device: str) -> None:
@@ -1428,6 +1602,45 @@ def test_icp_point_to_plane_tukey_all_weights_zero(device: str) -> None:
     # zeroed accumulator would otherwise read as a perfect fit.
     assert np.allclose(matrix_wp.numpy()[0], np.eye(4), atol=1e-6)
     assert not np.isfinite(cost_tw)
+
+
+@pytest.mark.parametrize("max_iterations", [2, 10])
+def test_icp_point_to_plane_weightless_after_the_first_round(
+    device: str, max_iterations: int
+) -> None:
+    """
+    Not a library comparison: a stop for zero weight after a kept step returns that step's pose.
+
+    Random target normals make the first step overshoot until no correspondence survives the
+    distance gate (found by a random search; this fixture stops at the second round). The round
+    that finds no weight solves nothing and leaves an identity step, so the closing
+    correspondence pass -- which applies the step like every other search -- leaves the points
+    where the kept transform put them, and reports ``inf``. Non-vacuity: the kept transform moved.
+    Mutation probe: leaving the last real step in place applies it a second time and fails the
+    image comparison in both arms.
+    """
+    rng = np.random.default_rng(4)
+    target_np = rng.standard_normal((40, 3)).astype(np.float32)
+    normals_np = rng.standard_normal((40, 3))
+    normals_np /= np.linalg.norm(normals_np, axis=1, keepdims=True)
+    source_np = target_np + rng.uniform(0.02, 0.5) * rng.standard_normal((40, 3))
+    source_np = source_np.astype(np.float32)
+
+    matrix_wp, transformed_wp, cost = tw.registration.icp_point_to_plane(
+        points_to_warp(source_np, device),
+        points_to_warp(target_np, device),
+        None,
+        target_normals=points_to_warp(normals_np.astype(np.float32), device),
+        max_iterations=max_iterations,
+        threshold=-np.inf,
+        max_distance=0.1,
+    )
+    matrix_np = matrix_wp.numpy()[0].astype(np.float64)
+    assert cost == np.inf
+    assert np.isfinite(matrix_np).all()
+    assert not np.allclose(matrix_np, np.eye(4), atol=1e-3)
+    expected_np = source_np @ matrix_np[:3, :3].T + matrix_np[:3, 3]
+    assert np.allclose(transformed_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
 
 
 def test_icp_point_to_plane_convergence_stop_matches_the_host_rule(device: str) -> None:

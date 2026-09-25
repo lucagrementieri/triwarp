@@ -29,6 +29,7 @@ Two families of geometry are supported and can be mixed:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import Literal, NamedTuple, cast, overload
 
@@ -41,11 +42,24 @@ from triwarp._device import prefers_tiled_reduction, require_same_device, slice_
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import metrics as kernel_metrics
+from triwarp.kernels import reduce as kernel_reduce
 
 _PointReduction = Literal["mean", "sum", "max"]
 # Differentiable Chamfer losses support only additive point reductions ("max" has no
 # useful gradient here, and "None" is a per-point array rather than a scalar loss).
 _DiffReduction = Literal["mean", "sum"]
+
+# The backward cloud search of a pair takes a seeded hash grid when the searched cloud is on a CUDA
+# device and has at least ``_GRID_BACKWARD_MIN_POINTS`` points, the forward half's largest distance
+# is at most ``_GRID_BACKWARD_CEILING`` of its density radius and at least
+# ``_GRID_BACKWARD_MIN_HITS`` of the queries are some point's forward answer; the seed is held no
+# lower than ``_GRID_BACKWARD_FLOOR`` of the radius -- see ``_backward_nearest``.
+_GRID_BACKWARD_MIN_POINTS = 262_144
+_GRID_BACKWARD_CEILING = 0.5
+_GRID_BACKWARD_MIN_HITS = 0.75
+_GRID_BACKWARD_FLOOR = 0.1
+# ``pair_search_scale``'s seed: ``inf`` under the seven ``atomic_min`` slots, zero under the count.
+_SCALE_SEED = np.array([math.inf] * 7 + [0.0], dtype=np.float32)
 
 # Per-point squared-distance result when ``point_reduction is None``.
 _UnreducedChamfer = twt.Array1dFloat32 | tuple[twt.Array1dFloat32, twt.Array1dFloat32]
@@ -55,11 +69,15 @@ class _Distances(NamedTuple):
     """
     Forward/backward per-element distances from one of the three geometry dispatches.
 
-    ``backward`` is ``None`` in the single-directional case.
+    ``backward`` is ``None`` in the single-directional case. ``forward_max`` is the forward array's
+    maximum when the dispatch already read it back to choose the backward search, so a ``"max"``
+    reduction or a Hausdorff distance reuses that value instead of reducing the same array again;
+    ``None`` when nothing has read it.
     """
 
     forward: wp.array[wp.float32]
     backward: wp.array[wp.float32] | None
+    forward_max: float | None
 
 
 # ---------------------------------------------------------------------------
@@ -394,11 +412,12 @@ def chamfer_points_to_points_loss(
     if n == 0 or m == 0:
         return loss
 
-    # Non-differentiable nearest-neighbor indices (computed outside the tape); see `_nearest`.
-    nearest_xy = _nearest(y, x)[0]
+    # Non-differentiable nearest-neighbor indices (computed outside the tape). The backward search
+    # is chosen from the forward one's own distances -- see `_backward_nearest`.
+    nearest_xy, distance_xy = _nearest(y, x)
     terms = [lambda: _launch_nn_term(x, y, nearest_xy, _reduction_scale(point_reduction, n), loss)]
     if not single_directional:
-        nearest_yx = _nearest(x, y)[0]
+        nearest_yx = _backward_nearest(x, y, _flat(distance_xy), _flat_index(nearest_xy))[0][0]
         terms.append(
             lambda: _launch_nn_term(y, x, nearest_yx, _reduction_scale(point_reduction, m), loss)
         )
@@ -468,15 +487,16 @@ def chamfer_points_to_mesh_loss(
     if n == 0 or v == 0 or n_faces == 0:
         return loss
 
-    # Non-differentiable closest-face and nearest-neighbor assignment (outside the tape).
-    face_id = tw.proximity.closest_point_on_mesh(vertices, faces, points)[2]
+    # Non-differentiable closest-face and nearest-neighbor assignment (outside the tape). The
+    # backward search is chosen from the forward one's own distances -- see `_backward_nearest`.
+    _, distance_forward, face_id = tw.proximity.closest_point_on_mesh(vertices, faces, points)
     terms = [
         lambda: _launch_surface_term(
             points, vertices, faces, face_id, _reduction_scale(point_reduction, n), loss
         )
     ]
     if not single_directional:
-        nearest_vp = _nearest(points, vertices)[0]
+        nearest_vp = _backward_nearest(points, vertices, distance_forward, face_id, faces)[0][0]
         terms.append(
             lambda: _launch_nn_term(
                 vertices, points, nearest_vp, _reduction_scale(point_reduction, v), loss
@@ -756,12 +776,12 @@ def _chamfer(
             return sq_forward
         return sq_forward, _square(cast(wp.array[wp.float32], distances.backward))
 
-    reduced_forward = _reduce_squared(distances.forward, point_reduction)
+    reduced_forward = _reduce_squared(distances.forward, point_reduction, distances.forward_max)
     if single_directional:
         return reduced_forward
 
     reduced_backward = _reduce_squared(
-        cast(wp.array[wp.float32], distances.backward), point_reduction
+        cast(wp.array[wp.float32], distances.backward), point_reduction, None
     )
     if point_reduction == "max":
         return max(reduced_forward, reduced_backward)
@@ -776,18 +796,20 @@ def _square(distances: wp.array[wp.float32]) -> twt.Array1dFloat32:
     return squared
 
 
-def _reduce_squared(distances: wp.array[wp.float32], point_reduction: _PointReduction) -> float:
+def _reduce_squared(
+    distances: wp.array[wp.float32], point_reduction: _PointReduction, known_max: float | None
+) -> float:
     """
     Reduce the element-wise squares of non-empty ``distances`` without building them.
 
     ``"sum"`` and ``"mean"`` are [`weighted_sum`][triwarp.reduce.weighted_sum] of the distances by
-    themselves. ``"max"`` squares the largest distance in ``float32``, which is exact rather than
-    approximate: rounding is monotone, so the largest rounded square is the rounded square of the
-    largest distance.
+    themselves. ``"max"`` squares the largest distance -- ``known_max`` when the caller already
+    holds it -- in ``float32``, which is exact rather than approximate: rounding is monotone, so
+    the largest rounded square is the rounded square of the largest distance.
     """
     distances_1d = cast(twt.Array1dFloat32, distances)
     if point_reduction == "max":
-        largest = np.float32(tw.reduce.max(distances_1d))
+        largest = np.float32(known_max if known_max is not None else tw.reduce.max(distances_1d))
         return float(largest * largest)
     total = tw.reduce.weighted_sum(distances_1d, distances_1d)
     if point_reduction == "mean":
@@ -802,7 +824,9 @@ def _hausdorff(distances: _Distances, single_directional: bool) -> float:
     ``max(d)`` over Euclidean per-element distances equals ``sqrt(max(d**2))``,
     so this matches libigl's ``sqrt(max(dba, dab))`` without squaring.
     """
-    directed_forward = tw.reduce.max(cast(twt.Array1dFloat32, distances.forward))
+    directed_forward = distances.forward_max
+    if directed_forward is None:
+        directed_forward = tw.reduce.max(cast(twt.Array1dFloat32, distances.forward))
     if single_directional:
         return directed_forward
     directed_backward = tw.reduce.max(cast(twt.Array1dFloat32, distances.backward))
@@ -830,10 +854,12 @@ def _distances_points_to_points(
     """Nearest-neighbour distances between two clouds, both directions unless directed."""
     if int(x.shape[0]) == 0 or int(y.shape[0]) == 0:
         return None
-    d_forward = cast(wp.array[wp.float32], _nearest(y, x)[1])
+    nearest_forward, distance_forward = _nearest(y, x)
+    d_forward = _flat(distance_forward)
     if single_directional:
-        return _Distances(d_forward, None)
-    return _Distances(d_forward, cast(wp.array[wp.float32], _nearest(x, y)[1]))
+        return _Distances(d_forward, None, None)
+    (_, d_backward), forward_max = _backward_nearest(x, y, d_forward, _flat_index(nearest_forward))
+    return _Distances(d_forward, _flat(d_backward), forward_max)
 
 
 def _distances_points_to_mesh(
@@ -845,10 +871,13 @@ def _distances_points_to_mesh(
     """Point-to-surface distances forward, cloud nearest-neighbour distances back."""
     if int(points.shape[0]) == 0 or int(vertices.shape[0]) == 0 or int(faces.shape[0]) == 0:
         return None
-    d_forward = tw.proximity.closest_point_on_mesh(vertices, faces, points)[1]
+    _, d_forward, face_id = tw.proximity.closest_point_on_mesh(vertices, faces, points)
     if single_directional:
-        return _Distances(d_forward, None)
-    return _Distances(d_forward, cast(wp.array[wp.float32], _nearest(points, vertices)[1]))
+        return _Distances(d_forward, None, None)
+    # The forward half is point-to-*surface*, a lower bound on the point-to-vertex answer the
+    # backward search wants -- still the right scale to choose it by.
+    (_, d_backward), forward_max = _backward_nearest(points, vertices, d_forward, face_id, faces)
+    return _Distances(d_forward, _flat(d_backward), forward_max)
 
 
 def _nearest(
@@ -868,6 +897,91 @@ def _nearest(
     the tree costs more than the grid's walk.
     """
     return tw.neighbors.query_nearest(points, queries, k=1, backend="bvh")
+
+
+def _backward_nearest(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    forward_distances: wp.array[wp.float32],
+    forward_assignment: wp.array[wp.int32],
+    faces: wp.array[wp.int32] | None = None,
+) -> tuple[tuple[twt.ArrayNd, twt.ArrayNd], float | None]:
+    """
+    Run the backward half's ``k = 1`` search, choosing the search from the forward half's answer.
+
+    ``forward_distances`` and ``forward_assignment`` are the forward half's answer at each point
+    of ``points``: how far it lies from the other side, and which query (or, with ``faces``, which
+    triangle of queries) it found. When the largest distance is small against ``points``' own
+    spacing *and* nearly every query is some point's answer, the pair is coincident or nearly so,
+    and a hash grid seeded at that scale answers the backward rows from its first ring of cells --
+    without the tree build the closest-point descent needs, which on a large cloud is most of
+    that search's cost. Otherwise the descent (see [`_nearest`][triwarp.metrics._nearest]) is
+    kept: a grid walk grows with the distance to the answer and the descent's does not. The
+    second test is what catches a pair whose forward answer is small only because ``points``
+    covers part of ``queries``; the rows off the covered part are far. Both searches are exact,
+    so the distances are the same either way; which of two points at *exactly* the same distance
+    is reported is not specified by either search, and may differ between them.
+
+    Only a cloud of at least ``_GRID_BACKWARD_MIN_POINTS`` on a CUDA device is considered. The
+    choice costs a readback, which also holds the backward search's host-side issue back until
+    the forward one has finished, and below that size the descent's build is cheap enough that
+    this costs more than the grid saves; above it the readback is still paid, as a few percent,
+    by a pair that is not coincident. On the CPU the grid is not the faster search even on a
+    coincident pair.
+
+    The seed is the largest forward distance held no lower than a fraction of
+    [`knn_initial_radius`][triwarp.neighbors.knn_initial_radius]: under ``"hashgrid"`` it is also
+    the cell width, and a cell much wider than the answer makes every row scan more of the cloud.
+    A row the grid cannot certify within its widest walk is still answered by the descent, inside
+    [`query_nearest`][triwarp.neighbors.query_nearest], so a wrong choice costs time and never the
+    result.
+
+    Returns the search's ``(indices, distances)`` and the largest forward distance when the choice
+    read it back (a ``"max"`` reduction or a Hausdorff distance reuses it), else ``None``.
+    """
+    n = int(points.shape[0])
+    device = points.device
+    if not wp.get_device(device).is_cuda or n < _GRID_BACKWARD_MIN_POINTS:
+        return _nearest(points, queries), None
+    m = int(queries.shape[0])
+    scale = wp.array(_SCALE_SEED, dtype=wp.float32, device=device)
+    hits = wp.zeros(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_metrics.pair_search_scale,
+        dim=kernel_reduce.chunks_1d(n),
+        inputs=[points, forward_distances, forward_assignment, faces, int(faces is not None), hits],
+        outputs=[scale],
+        device=device,
+    )
+    # The one readback the choice costs: the box the grid needs, the forward maximum and the hit
+    # count, together.
+    values = scale.numpy()
+    # ``0.0 - x`` rather than ``-x``: a zero maximum is stored as ``-0.0``, and a distance reads
+    # ``0.0``.
+    forward_max = 0.0 - float(values[6])
+    # Slots 3..5 hold the *negated* upper corner, decoded as ``reduce.minmax`` decodes it.
+    bounds = (wp.vec3(*values[:3]), wp.vec3(*(-values[3:6])))
+    spacing = tw.neighbors.knn_initial_radius(points, 1, bounds=bounds)
+    coincident = (
+        math.isfinite(forward_max)
+        and forward_max <= _GRID_BACKWARD_CEILING * spacing
+        and float(values[7]) >= _GRID_BACKWARD_MIN_HITS * m
+    )
+    if coincident:
+        seed = max(forward_max, _GRID_BACKWARD_FLOOR * spacing)
+        found = tw.neighbors.query_nearest(points, queries, k=1, initial_radius=seed, bounds=bounds)
+        return found, forward_max
+    return _nearest(points, queries), forward_max
+
+
+def _flat(distances: twt.ArrayNd) -> wp.array[wp.float32]:
+    """Type a ``k = 1`` search's distances, which ``query_nearest`` returns rank-1."""
+    return cast(wp.array[wp.float32], distances)
+
+
+def _flat_index(indices: twt.ArrayNd) -> wp.array[wp.int32]:
+    """Type a ``k = 1`` search's indices, which ``query_nearest`` returns rank-1."""
+    return cast(wp.array[wp.int32], indices)
 
 
 def _distances_mesh_to_mesh(
@@ -903,7 +1017,7 @@ def _distances_mesh_to_mesh(
         d_backward = tw.proximity.closest_point_on_mesh(
             vertices_a, faces_a, vertices_b, max_dist=max_dist
         )[1]
-    return _Distances(d_forward, d_backward)
+    return _Distances(d_forward, d_backward, None)
 
 
 def _mesh_pair_search_radius(

@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import math
-from typing import Literal, TypedDict, cast, overload
+from typing import Any, Literal, TypedDict, cast, overload
 
 import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar, require_nonempty_mesh, require_same_device, run_device_loop
+from triwarp._device import (
+    read_scalar,
+    record_device_loop,
+    require_nonempty_mesh,
+    require_same_device,
+)
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import neighbors as kernel_neighbors
-from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import registration as kernel_registration
 from triwarp.kernels import transform as kernel_transform
@@ -115,8 +119,8 @@ def procrustes(
     -----
     Latency-bound at every size that matters: the fit is two kernel launches (four with
     ``return_cost``), one allocation for the packed moment accumulator and one readback, so the
-    cost is nearly flat in ``n``. Callers in a loop should use the workspace form — see
-    [`icp`][triwarp.registration.icp], which allocates once outside its iteration.
+    cost is nearly flat in ``n``. [`icp`][triwarp.registration.icp] runs the same fit inside a
+    device-side loop, with no readback per iteration.
 
     **The returned matrix is column-vector, which is the transpose of pytorch3d's.**
     ``pytorch3d.ops.corresponding_points_alignment`` solves the row-vector form ``s X R + T = Y``,
@@ -128,7 +132,7 @@ def procrustes(
     if int(b.shape[0]) != n:
         raise ValueError(f"a and b must have the same length, got {n} and {b.shape[0]}")
     # A zero-length weights array is the kernels' own "uniform weights" sentinel (see
-    # ``_uniform_weights``), not a caller mistake -- only a non-empty mismatch is a real error.
+    # ``_zero_length``), not a caller mistake -- only a non-empty mismatch is a real error.
     if weights is not None and int(weights.shape[0]) not in (0, n):
         raise ValueError(f"weights must have the same length as a, got {weights.shape[0]} and {n}")
 
@@ -161,6 +165,96 @@ def procrustes(
     if weighted and weight_sum == 0.0:
         raise ValueError("weights sum to zero: no point carries any weight")
     return matrix, transformed, cost
+
+
+class _ProcrustesWorkspace(TypedDict):
+    """Buffers a [`procrustes`][triwarp.registration.procrustes] fit writes into."""
+
+    acc: wp.array[wp.float32]
+    matrix: wp.array[wp.mat44]
+    transformed: wp.array[wp.vec3] | None
+    uniform_weights: wp.array[wp.float32]
+
+
+def _procrustes_workspace(
+    n: int, device: wp.DeviceLike, *, return_cost: bool
+) -> _ProcrustesWorkspace:
+    """Allocate the buffers one Procrustes fit needs."""
+    return {
+        "acc": wp.zeros(kernel_registration.PROCRUSTES_ACC_SIZE, dtype=wp.float32, device=device),
+        "matrix": wp.empty(1, dtype=wp.mat44, device=device),
+        "transformed": wp.empty(n, dtype=wp.vec3, device=device) if return_cost else None,
+        "uniform_weights": _zero_length(wp.float32, device),
+    }
+
+
+def _procrustes_into(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    weights: wp.array[wp.float32] | None,
+    reflection: bool,
+    translation: bool,
+    scale: bool,
+    return_cost: bool,
+    workspace: _ProcrustesWorkspace,
+    need_weight_sum: bool = False,
+) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float, float] | wp.array[wp.mat44]:
+    """Run one Procrustes fit into caller-owned buffers. See ``procrustes`` for the semantics."""
+    n = int(a.shape[0])
+    device = a.device
+    acc = workspace["acc"]
+    out_matrix = workspace["matrix"]
+    if weights is None:
+        weights = workspace["uniform_weights"]
+
+    wp.launch_tiled(
+        kernel_registration.accumulate_procrustes_moments,
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[a, b, weights, translation, acc],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    wp.launch(
+        kernel_registration.build_procrustes_matrix,
+        dim=1,
+        inputs=[a, b, acc, reflection, translation, scale, out_matrix],
+        device=device,
+    )
+
+    if not return_cost:
+        return out_matrix
+
+    out_transformed = workspace["transformed"]
+    assert out_transformed is not None
+    # One launch, not two: this both writes ``out_transformed`` and reduces the residual against
+    # it. See the kernel for why fusing became worth it only after the reduction was flattened.
+    wp.launch_tiled(
+        kernel_registration.transform_and_accumulate_cost,
+        dim=kernel_reduce.blocks_1d(n),
+        inputs=[a, b, weights, out_matrix, acc, out_transformed],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    # One readback for the whole accumulator; ICP's convergence test needs the cost on the host,
+    # and an extra device-side pass would cost more than the readback. ``ACC_W_SUM`` rides along in
+    # the same transfer: ``icp``'s "every correspondence was rejected" guard needs it, and reading
+    # it here rather than reducing the weight array separately is one host sync per iteration
+    # instead of two -- but only when ``need_weight_sum`` says a caller wants it.
+    cost_slot = int(kernel_registration.ACC_COST)
+    if not need_weight_sum:
+        return out_matrix, out_transformed, float(read_scalar(acc, cost_slot)), 0.0
+    # Both scalars in *one* transfer when the caller wants both. Two ``read_scalar`` calls measured
+    # worse than this even though the second read rides on a drained pipeline, and one
+    # ``read_scalar`` is better than this when only the cost is wanted, because ``.numpy()``
+    # allocates a host array where ``read_scalar`` reuses a cached scratch. Hence the flag rather
+    # than one spelling for both callers.
+    acc_np = acc.numpy()
+    return (
+        out_matrix,
+        out_transformed,
+        float(acc_np[cost_slot]),
+        float(acc_np[int(kernel_registration.ACC_W_SUM)]),
+    )
 
 
 _ROBUST_KINDS: dict[str, int] = {"none": 0, "huber": 1, "tukey": 2}
@@ -258,301 +352,122 @@ def icp(
     if n == 0 or int(target_vertices.shape[0]) == 0:
         return _identity_mat44(device), wp.clone(a), math.inf
 
-    initial_matrix, current = _seed_transform(a, initial, device)
-    total = initial_matrix
-    transformed = wp.clone(current)
-    cost = math.inf
-
+    # ``total`` is the transform kept so far, and ``_resolve_initial``'s own copy, so the loop may
+    # rewrite it in place. The source is never moved inside the loop: each correspondence pass
+    # moves its own point by ``total`` in registers, and ``transformed`` is written again after the
+    # loop by the transform it kept. The seed image sizes a mesh target's query radius and is the
+    # answer of a call that runs no iteration.
+    total = _resolve_initial(initial, device)
+    transformed = wp.empty(n, dtype=wp.vec3, device=device)
+    _apply_transform(a, total, transformed)
+    if max_iterations <= 0:
+        return total, transformed, math.inf
     mesh, query_max, target_index = _resolve_icp_target(
-        target_vertices, target_faces, current, max_distance, "icp"
+        target_vertices, target_faces, transformed, max_distance, "icp"
     )
+    search_mesh = mesh if mesh is not None else target_index
+    assert search_mesh is not None
 
-    # Correspondence and weight buffers are allocated once and refilled every iteration, and so is
-    # the Procrustes workspace — the fit is latency-bound, so its ~10 per-call allocations would
-    # otherwise dominate an iteration that is already down to a handful of launches.
+    # Every buffer is allocated once and rewritten in place by every round. The fit lands in
+    # ``fitted`` and is copied into ``total`` only once ``point_to_point_round`` has seen that it
+    # carried weight; ``state`` is the shared round / condition word; ``cost`` is the kept fit's
+    # cost and, seeded ``inf``, the "previous cost" the convergence test reads.
     closest = wp.empty(n, dtype=wp.vec3, device=device)
-    # The correspondence's distance and index -- a face for a mesh target, a vertex for a cloud --
-    # written in full by either branch's query every iteration.
-    distance = twt.empty_1d(n, wp.float32, device=device)
-    triangle_id = twt.empty_1d(n, wp.int32, device=device)
-    # A cloud target's nearest search writes the ``(n, 1)`` rows its kernel takes, which are views
-    # of the two buffers above, and its matched points are a gather through the index buffer it
-    # rewrites -- all three views built once here and read afresh by every iteration.
-    nearest_rows = (
-        (
-            twt.as_array2d(triangle_id.reshape((n, 1)), wp.int32),
-            twt.as_array2d(distance.reshape((n, 1)), wp.float32),
+    weights = (
+        wp.empty(n, dtype=wp.float32, device=device)
+        if max_distance is not None
+        else _zero_length(wp.float32, device)
+    )
+    acc = wp.zeros(kernel_registration.PROCRUSTES_ACC_SIZE, dtype=wp.float32, device=device)
+    fitted = wp.empty(1, dtype=wp.mat44, device=device)
+    cost = wp.full(1, math.inf, dtype=wp.float32, device=device)
+    state = wp.zeros(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
+
+    blocks = kernel_reduce.blocks_1d(n)
+    search_inputs = [
+        search_mesh.id,
+        target_vertices,
+        a,
+        total,
+        mesh is None,
+        wp.float32(query_max),
+        wp.float32(max_distance if max_distance is not None else 0.0),
+        closest,
+        weights,
+    ]
+    moment_inputs = [a, closest, weights, translation, acc]
+    matrix_inputs = [a, closest, acc, reflection, translation, scale, fitted]
+    cost_inputs = [a, closest, weights, fitted, acc, _zero_length(wp.vec3, device)]
+    round_inputs = [wp.float64(threshold), wp.int32(max_iterations), fitted]
+    round_outputs = [acc, total, cost, state]
+
+    def iterate() -> None:
+        wp.launch(
+            kernel_registration.point_to_point_correspondence_pass,
+            dim=n,
+            inputs=search_inputs,
+            device=device,
         )
-        if mesh is None
-        else None
-    )
-    matched = target_vertices[triangle_id] if mesh is None else None
-    weights: wp.array[wp.float32] | None = (
-        wp.empty(n, dtype=wp.float32, device=device) if max_distance is not None else None
-    )
-    workspace = _procrustes_workspace(n, device, return_cost=True)
-    # The second ping-pong slot; see ``_ProcrustesWorkspace`` and the fit call below.
-    workspace["spare_matrix"] = wp.empty(1, dtype=wp.mat44, device=device)
-    workspace["spare_transformed"] = wp.empty(n, dtype=wp.vec3, device=device)
-    if max_distance is not None and device is not None and device.is_cuda:
-        workspace["host_acc"] = wp.empty(
-            kernel_registration.PROCRUSTES_ACC_SIZE, dtype=wp.float32, device="cpu"
+        wp.launch_tiled(
+            kernel_registration.accumulate_procrustes_moments,
+            dim=blocks,
+            inputs=moment_inputs,
+            block_dim=TILE_1D,
+            device=device,
+        )
+        wp.launch(
+            kernel_registration.build_procrustes_matrix, dim=1, inputs=matrix_inputs, device=device
+        )
+        wp.launch_tiled(
+            kernel_registration.transform_and_accumulate_cost,
+            dim=blocks,
+            inputs=cost_inputs,
+            block_dim=TILE_1D,
+            device=device,
+        )
+        wp.launch(
+            kernel_registration.point_to_point_round,
+            dim=1,
+            inputs=round_inputs,
+            outputs=round_outputs,
+            device=device,
         )
 
-    # Both ping-pong views built once: ``_slot`` assembles a dict, and doing that per iteration is
-    # a percent or two of pure Python on the loop.
-    slots = (_slot(workspace, 0), _slot(workspace, 1))
-    parity = 0
-    old_cost = math.inf
-    # Built on first use rather than here: a cached ``wp.map`` call re-resolves its op and
-    # signature every iteration, and its inputs are the same two buffers on every iteration, so one
-    # construction serves the loop.
-    threshold_weight: wp.Kernel | None = None
-    # A mesh target gated by distance is the one configuration where the correspondence query and
-    # the weight it feeds are the same pass: both read one source point's own hit, so the gate
-    # rides in the query rather than paying a launch and a round trip to re-read a face index and
-    # a distance the query had in registers.
-    fused_mesh_weights = mesh is not None and max_distance is not None and weights is not None
-    for _ in range(max_iterations):
-        if fused_mesh_weights:
-            assert mesh is not None
-            assert weights is not None
-            wp.launch(
-                kernel_registration.mesh_correspondence_weight_pass,
-                dim=n,
-                inputs=[
-                    mesh.id,
-                    current,
-                    wp.float32(query_max),
-                    wp.float32(max_distance),
-                    closest,
-                    distance,
-                    triangle_id,
-                    weights,
-                ],
-                device=device,
-            )
-        else:
-            _correspondences(
-                mesh,
-                target_vertices,
-                target_index,
-                current,
-                query_max,
-                closest,
-                distance,
-                triangle_id,
-                nearest_rows,
-                matched,
-            )
-            if max_distance is not None and weights is not None:
-                if threshold_weight is None:
-                    # ``cast`` because Warp's stub does not narrow ``wp.map`` on ``return_kernel``:
-                    # it returns the output-array union whatever the flag says.
-                    threshold_weight = cast(
-                        wp.Kernel,
-                        wp.map(
-                            kernel_registration.distance_threshold_weight,
-                            distance,
-                            triangle_id,
-                            wp.float32(max_distance),
-                            out=weights,
-                            return_kernel=True,
-                        ),
-                    )
-                wp.launch(
-                    threshold_weight,
-                    dim=n,
-                    inputs=[distance, triangle_id, wp.float32(max_distance)],
-                    outputs=[weights],
-                    device=device,
-                )
-
-        # The fit runs *before* the "every correspondence was rejected" test, not after, because
-        # the test's own quantity is one of the moments the fit accumulates (``ACC_W_SUM``) and
-        # riding on its readback is one host sync per iteration instead of two. The cost of
-        # inverting the order is one wasted fit on the terminal iteration -- two launches against
-        # a launch, an allocation and a sync every iteration.
-        #
-        # **The answer is unchanged, and the ping-pong is what makes that true.** A fit writes the
-        # workspace's ``matrix`` and ``transformed`` in place, so running one more would otherwise
-        # overwrite the last *good* result with the degenerate one (an all-zero weight sum is the
-        # denominator of every centroid, so it fits a matrix of NaN). Alternating the slot leaves
-        # the previous fit's buffers untouched, and ``total`` / ``transformed`` / ``cost`` are only
-        # rebound once the fit is known to be sound, which is what breaking before the fit
-        # guarantees.
-        new_total, new_transformed, new_cost, weight_sum = cast(
-            tuple[wp.array[wp.mat44], wp.array[wp.vec3], float, float],
-            _procrustes_into(
-                a,
-                closest,
-                weights,
-                reflection,
-                translation,
-                scale,
-                True,
-                slots[parity],
-                max_distance is not None,
-            ),
-        )
-        if max_distance is not None and weight_sum == 0.0:
-            break
-        total, transformed, cost = new_total, new_transformed, new_cost
-        current = transformed
-        parity ^= 1
-        if old_cost - cost < threshold:
-            break
-        old_cost = cost
-
-    return total, transformed, cost
+    # Iteration 0 is issued from the host and seeds the condition; iterations 1.. are one recorded
+    # body replayed on the device, which a one-iteration call has no need to record. The recording
+    # is taken while round 0 runs and hides behind it. Round 0 can stop the loop only by being
+    # weightless (its test compares against an ``inf`` previous cost), which only a distance gate
+    # can make it -- uniform weights sum to ``n`` -- so only a gated call reads the round counter,
+    # which a weightless round does not advance, before launching what it recorded. The read comes
+    # after the recording, so it finds round 0 finished and waits on nothing.
+    iterate()
+    if max_iterations > 1:
+        replay = record_device_loop(device, state[kernel_array.LOOP_CONDITION_VIEW], iterate)
+        if max_distance is not None and int(read_scalar(state, int(kernel_array.LOOP_ROUND))) == 0:
+            # Weightless at the seed: ``total`` is the seed, and ``transformed`` its image.
+            return total, transformed, math.inf
+        replay()
+    _apply_transform(a, total, transformed)
+    # The kept fit's cost, ``inf`` if every fit was weightless: a pinned call's one readback.
+    return total, transformed, float(read_scalar(cost, 0))
 
 
-class _ProcrustesWorkspace(TypedDict):
-    """Buffers a [`procrustes`][triwarp.registration.procrustes] fit writes into."""
-
-    acc: wp.array[wp.float32]
-    matrix: wp.array[wp.mat44]
-    transformed: wp.array[wp.vec3] | None
-    # The second half of a ping-pong, allocated only by ``icp``. A fit writes ``matrix`` and
-    # ``transformed`` *in place*, so a caller that keeps the previous fit's answer while running
-    # one more -- which is what lets ``icp`` decide "was that fit degenerate?" from the
-    # accumulator the fit itself filled -- needs somewhere else for the new one to land.
-    spare_matrix: wp.array[wp.mat44] | None
-    spare_transformed: wp.array[wp.vec3] | None
-    # Host landing buffer for the accumulator readback, also ``icp``'s alone: ``.numpy()`` on a
-    # device array allocates a host array per call, and a pageable buffer allocated once does not
-    # (the same idea as ``icp_point_to_plane``'s ``host_scalars``). ``None`` on the CPU device,
-    # where the accumulator's own ``.numpy()`` is a zero-copy view.
-    host_acc: wp.array[wp.float32] | None
-    uniform_weights: wp.array[wp.float32]
+_ZERO_LENGTH: dict[tuple[str, type], wp.array[Any]] = {}
 
 
-def _procrustes_workspace(
-    n: int, device: wp.DeviceLike, *, return_cost: bool
-) -> _ProcrustesWorkspace:
-    """Allocate the buffers one Procrustes fit needs; reuse across iterations of a loop."""
-    return {
-        "acc": wp.empty(kernel_registration.PROCRUSTES_ACC_SIZE, dtype=wp.float32, device=device),
-        "matrix": wp.empty(1, dtype=wp.mat44, device=device),
-        "transformed": wp.empty(n, dtype=wp.vec3, device=device) if return_cost else None,
-        "spare_matrix": None,
-        "spare_transformed": None,
-        "host_acc": None,
-        "uniform_weights": _uniform_weights(device),
-    }
-
-
-_UNIFORM_WEIGHTS: dict[str, wp.array[wp.float32]] = {}
-
-
-def _uniform_weights(device: wp.DeviceLike) -> wp.array[wp.float32]:
+def _zero_length(dtype: type, device: wp.DeviceLike) -> wp.array[Any]:
     """
-    Return the kernels' "uniform weights" sentinel: a zero-length array, shared per device.
+    Return a zero-length array of ``dtype``, shared per device: the kernels' "not given" sentinel.
 
-    Length zero means "every weight is 1", so the common weightless call needs neither a
-    ``wp.full(n, 1.0)`` allocation nor its fill — and since the buffer carries no data, one
-    instance per device serves every caller.
+    A zero-length ``weights`` means "every weight is 1" (``sample_weight``), so the common
+    weightless call needs neither a ``wp.full(n, 1.0)`` allocation nor its fill, and a zero-length
+    ``out_transformed`` asks ``transform_and_accumulate_cost`` for the cost alone. The buffer
+    carries no data, so one instance per device and dtype serves every caller.
     """
-    key = str(device)
-    if key not in _UNIFORM_WEIGHTS:
-        _UNIFORM_WEIGHTS[key] = wp.empty(0, dtype=wp.float32, device=device)
-    return _UNIFORM_WEIGHTS[key]
-
-
-def _slot(workspace: _ProcrustesWorkspace, parity: int) -> _ProcrustesWorkspace:
-    """
-    One half of the ping-pong: the same workspace with its output buffers swapped on odd ``parity``.
-
-    A Procrustes fit writes ``matrix`` and ``transformed`` **in place**, so a caller that wants to
-    run one more fit while still holding the previous one's answer has to send the new one
-    somewhere else. Only ``icp`` does; every other caller leaves the spare slots ``None`` and gets
-    this workspace back unchanged. The accumulator is deliberately *shared* between the slots --
-    it is rewritten from scratch by every fit and read back before the next one starts.
-    """
-    if parity == 0 or workspace["spare_transformed"] is None:
-        return workspace
-    return {
-        **workspace,
-        "matrix": cast(wp.array[wp.mat44], workspace["spare_matrix"]),
-        "transformed": workspace["spare_transformed"],
-        "spare_matrix": workspace["matrix"],
-        "spare_transformed": workspace["transformed"],
-    }
-
-
-def _procrustes_into(
-    a: wp.array[wp.vec3],
-    b: wp.array[wp.vec3],
-    weights: wp.array[wp.float32] | None,
-    reflection: bool,
-    translation: bool,
-    scale: bool,
-    return_cost: bool,
-    workspace: _ProcrustesWorkspace,
-    need_weight_sum: bool = False,
-) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float, float] | wp.array[wp.mat44]:
-    """Run one Procrustes fit into caller-owned buffers. See ``procrustes`` for the semantics."""
-    n = int(a.shape[0])
-    device = a.device
-    acc = workspace["acc"]
-    out_matrix = workspace["matrix"]
-    if weights is None:
-        weights = workspace["uniform_weights"]
-
-    acc.zero_()
-    wp.launch_tiled(
-        kernel_registration.accumulate_procrustes_moments,
-        dim=kernel_reduce.blocks_1d(n),
-        inputs=[a, b, weights, translation, acc],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    wp.launch(
-        kernel_registration.build_procrustes_matrix,
-        dim=1,
-        inputs=[a, b, acc, reflection, translation, scale, out_matrix],
-        device=device,
-    )
-
-    if not return_cost:
-        return out_matrix
-
-    out_transformed = workspace["transformed"]
-    assert out_transformed is not None
-    # One launch, not two: this both writes ``out_transformed`` and reduces the residual against
-    # it. See the kernel for why fusing became worth it only after the reduction was flattened.
-    wp.launch_tiled(
-        kernel_registration.transform_and_accumulate_cost,
-        dim=kernel_reduce.blocks_1d(n),
-        inputs=[a, b, weights, out_matrix, acc, out_transformed],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    # One readback for the whole accumulator; ICP's convergence test needs the cost on the host,
-    # and an extra device-side pass would cost more than the readback. ``ACC_W_SUM`` rides along in
-    # the same transfer: ``icp``'s "every correspondence was rejected" guard needs it, and reading
-    # it here rather than reducing the weight array separately is one host sync per iteration
-    # instead of two -- but only when ``need_weight_sum`` says a caller wants it.
-    cost_slot = int(kernel_registration.ACC_COST)
-    if not need_weight_sum:
-        return out_matrix, out_transformed, float(read_scalar(acc, cost_slot)), 0.0
-    # Both scalars in *one* transfer when the caller wants both. Two ``read_scalar`` calls measured
-    # worse than this even though the second read rides on a drained pipeline, and one
-    # ``read_scalar`` is better than this when only the cost is wanted, because ``.numpy()``
-    # allocates a host array where ``read_scalar`` reuses a cached scratch. Hence the flag rather
-    # than one spelling for both callers.
-    host_acc = workspace["host_acc"]
-    if host_acc is not None:
-        wp.copy(host_acc, acc)
-        acc_np = host_acc.numpy()
-    else:
-        acc_np = acc.numpy()
-    return (
-        out_matrix,
-        out_transformed,
-        float(acc_np[cost_slot]),
-        float(acc_np[int(kernel_registration.ACC_W_SUM)]),
-    )
+    key = (str(device), dtype)
+    if key not in _ZERO_LENGTH:
+        _ZERO_LENGTH[key] = wp.empty(0, dtype=dtype, device=device)
+    return _ZERO_LENGTH[key]
 
 
 def icp_point_to_plane(
@@ -728,9 +643,9 @@ def icp_point_to_plane(
     scalar_acc = wp.zeros(kernel_registration.ICP_SCALAR_ACC_SIZE, dtype=wp.float32, device=device)
     step = wp.empty(1, dtype=wp.mat44, device=device)
     total = initial_matrix
-    # The loop's state: the shared round and condition slots, and whether it stopped weightless.
-    # ``old_cost`` is written by the first round before any round reads it.
-    state = wp.zeros(kernel_registration.ICP_LOOP_STATE_SIZE, dtype=wp.int32, device=device)
+    # The loop's state: the shared round and condition slots. ``old_cost`` is written by the first
+    # round before any round reads it.
+    state = wp.zeros(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
     old_cost = wp.empty(1, dtype=wp.float64, device=device)
 
     # The correspondence step is one launch, not three: the closest-point query, the target-normal
@@ -866,22 +781,30 @@ def icp_point_to_plane(
         # ``close_round`` seeded the condition; the body is a fixed three-launch sequence over
         # buffers it rewrites in place, so it records once per call. Recording costs about what
         # issuing a round does even when the condition is already clear, so a one-iteration call,
-        # which the host knows cannot run a second, skips it. A call whose first round stops it
-        # (weightless at the seed) still records and replays nothing: the price of not reading the
-        # condition back before the loop.
+        # which the host knows cannot run a second, skips it.
+        #
+        # A first round that was weightless -- the only way round 0 can stop the loop -- makes
+        # both the recording and the closing pass below pure cost, and only a distance gate or
+        # Tukey's redescending weights can zero every weight (``"none"`` and Huber weights are
+        # positive). So those two configurations read the round counter, which a weightless round
+        # does not advance, and return the seed's answer; the others never pay the read.
+        replay = None
         if max_iterations > 1:
-            run_device_loop(device, state[kernel_array.LOOP_CONDITION_VIEW], iterate)
-        # The one sync the loop takes: whether it stopped weightless. Where it did, the step of the
-        # last solve is already applied and the correspondences just found are the returned pose's,
-        # and with no inlier there is no objective to report.
-        if int(read_scalar(state, int(kernel_registration.ICP_LOOP_WEIGHTLESS))) != 0:
+            replay = record_device_loop(device, state[kernel_array.LOOP_CONDITION_VIEW], iterate)
+        if (max_distance is not None or kind == _ROBUST_KINDS["tukey"]) and int(
+            read_scalar(state, int(kernel_array.LOOP_ROUND))
+        ) == 0:
             return total, current, math.inf
+        if replay is not None:
+            replay()
         stepped = True
 
     # ``cost`` is the objective of the transform returned, not of the pose the last step was solved
     # from: one more correspondence pass at the returned pose -- which is also where the last step
     # is applied -- and one more accumulation over it, into the accumulators the last round zeroed.
-    # With no iteration run it scores the seed.
+    # With no iteration run it scores the seed. After a weightless stop the step is the identity
+    # (``point_to_plane_round``), so this pass finds the same correspondences, sums zero weight
+    # again and reports ``inf`` -- the stop costs no readback of its own.
     search(stepped)
     resolve_scale()
     accumulate()
@@ -945,7 +868,71 @@ def _robust_scale_from_residuals(
     max_distance: float,
     kind: int,
 ) -> float:
-    """Robust scale (Huber/Tukey) from the MAD of the current point-to-plane residuals."""
+    """
+    Robust scale (Huber/Tukey) from the MAD of the current point-to-plane residuals.
+
+    Both medians are taken on the device, over the sorted prefix of in-range residuals
+    (``kernel_registration.robust_residual_keys``), so the whole estimate is one readback of the
+    in-range count and ``1.4826 * MAD``. A zero MAD falls back to the standard deviation, on the
+    host path the medians used to take too, since its means must sum the in-range residuals in
+    their original order.
+    """
+    device = current.device
+    n = int(current.shape[0])
+    # Radix-sort buffers: keys and a payload the sort needs and nobody reads, both ``2n`` long.
+    keys = wp.empty(2 * n, dtype=wp.float32, device=device)
+    payload = wp.empty(2 * n, dtype=wp.int32, device=device)
+    stats = wp.empty(kernel_registration.MAD_STATS_SIZE, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_registration.robust_residual_keys,
+        dim=n,
+        inputs=[current, closest, normals, triangle_id, distance, wp.float32(max_distance)],
+        outputs=[keys],
+        device=device,
+    )
+    wp.utils.radix_sort_pairs(keys, payload, n)
+    wp.launch(
+        kernel_registration.robust_residual_center,
+        dim=1,
+        inputs=[keys, wp.int32(n)],
+        outputs=[stats],
+        device=device,
+    )
+    wp.launch(
+        kernel_registration.robust_deviation_keys,
+        dim=n,
+        inputs=[stats],
+        outputs=[keys],
+        device=device,
+    )
+    wp.utils.radix_sort_pairs(keys, payload, n)
+    wp.launch(
+        kernel_registration.robust_sigma, dim=1, inputs=[keys], outputs=[stats], device=device
+    )
+    # The estimate's one readback: the in-range count and the scale.
+    stats_np = stats.numpy()
+    if int(stats_np[kernel_registration.MAD_STATS_COUNT]) == 0:
+        return 0.0
+    sigma = float(stats_np[kernel_registration.MAD_STATS_VALUE])
+    if sigma <= 0.0:
+        sigma = _residual_standard_deviation(
+            current, closest, normals, distance, triangle_id, max_distance
+        )
+    if sigma <= 0.0:
+        return 0.0
+    # 95% asymptotic efficiency tuning constants.
+    return 1.345 * sigma if kind == 1 else 4.685 * sigma
+
+
+def _residual_standard_deviation(
+    current: wp.array[wp.vec3],
+    closest: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    distance: wp.array[wp.float32],
+    triangle_id: wp.array[wp.int32],
+    max_distance: float,
+) -> float:
+    """``sqrt(mean((r - mean(r))^2))`` over the in-range residuals, in their original order."""
     device = current.device
     n = int(current.shape[0])
     residual = wp.empty(n, dtype=wp.float32, device=device)
@@ -958,27 +945,13 @@ def _robust_scale_from_residuals(
         wp.float32(max_distance),
         out=valid,
     )
-    valid_indices = tw.array.flatnonzero(valid)
-    k = int(valid_indices.shape[0])
-    if k == 0:
-        return 0.0
-    kept = tw.array.gather(residual, valid_indices)
-    # Median and MAD on device (sort-based); only the scalar results cross to the host.
-    median = tw.reduce.median(cast(twt.Array1dFloat32, kept))
+    kept = tw.array.gather(residual, tw.array.flatnonzero(valid))
+    k = int(kept.shape[0])
+    mean = float(tw.reduce.mean(cast(twt.Array1dFloat32, kept)))
     deviation = wp.empty(k, dtype=wp.float32, device=device)
-    wp.map(kernel_registration.abs_deviation, kept, wp.float32(median), out=deviation)
-    mad = tw.reduce.median(cast(twt.Array1dFloat32, deviation))
-    sigma = float(1.4826 * mad)
-    if sigma <= 0.0:
-        # Standard-deviation fallback: sqrt(mean((r - mean)^2)).
-        mean = float(tw.reduce.mean(cast(twt.Array1dFloat32, kept)))
-        wp.map(kernel_registration.abs_deviation, kept, wp.float32(mean), out=deviation)
-        wp.map(kernel_array.square_scalar, deviation, out=deviation)
-        sigma = float(tw.reduce.mean(cast(twt.Array1dFloat32, deviation))) ** 0.5
-    if sigma <= 0.0:
-        return 0.0
-    # 95% asymptotic efficiency tuning constants.
-    return 1.345 * sigma if kind == 1 else 4.685 * sigma
+    wp.map(kernel_registration.abs_deviation, kept, wp.float32(mean), out=deviation)
+    wp.map(kernel_array.square_scalar, deviation, out=deviation)
+    return float(tw.reduce.mean(cast(twt.Array1dFloat32, deviation))) ** 0.5
 
 
 def _identity_mat44(device: wp.DeviceLike) -> wp.array[wp.mat44]:
@@ -987,67 +960,6 @@ def _identity_mat44(device: wp.DeviceLike) -> wp.array[wp.mat44]:
         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0
     )
     return wp.array([identity], dtype=wp.mat44, device=device)
-
-
-def _correspondences(
-    mesh: wp.Mesh | None,
-    target_vertices: wp.array[wp.vec3],
-    target_index: wp.Mesh | None,
-    current: wp.array[wp.vec3],
-    query_max: float,
-    closest: wp.array[wp.vec3],
-    distance: twt.Array1dFloat32,
-    correspondence: twt.Array1dInt32,
-    nearest_rows: tuple[twt.Array2dInt32, twt.Array2dFloat32] | None,
-    matched: wp.indexedarray[wp.vec3] | None,
-) -> None:
-    """
-    Match every source position against the target, into the caller's preallocated buffers.
-
-    A mesh target runs the BVH closest-point kernel; a cloud target runs the ``k = 1`` nearest
-    search of [`_nearest_into`][triwarp.registration._nearest_into], whose index then gathers the
-    matched vertex. Either way every buffer is overwritten in
-    full and nothing is allocated, since the ICP loop calls this once per iteration.
-
-    Parameters
-    ----------
-    mesh
-        Mesh target, or ``None`` for a cloud target.
-    target_vertices
-        ``(m,)`` target positions.
-    target_index
-        The target cloud's [`mesh_from_points`][triwarp.neighbors.mesh_from_points]; required
-        when ``mesh`` is ``None``.
-    current
-        ``(n,)`` transformed source positions to match.
-    query_max
-        Search radius for the mesh closest-point query.
-    closest
-        ``(n,)`` matched points, written either way.
-    distance, correspondence
-        ``(n,)`` distance to the match and its index -- a face index for a mesh target, a vertex
-        index for a cloud one.
-    nearest_rows
-        ``(n, 1)`` views of ``correspondence`` and ``distance``, the rows the cloud branch's
-        nearest search writes; required when ``mesh`` is ``None``.
-    matched
-        ``target_vertices[correspondence]``, the gather view the cloud branch copies into
-        ``closest``; required when ``mesh`` is ``None``.
-    """
-    if mesh is not None:
-        wp.launch(
-            kernel_proximity.closest_point_on_mesh,
-            dim=int(current.shape[0]),
-            inputs=[mesh.id, current, wp.float32(query_max), closest, distance, correspondence],
-            device=current.device,
-        )
-        return
-
-    assert target_index is not None
-    assert nearest_rows is not None
-    assert matched is not None
-    _nearest_into(target_vertices, current, target_index, nearest_rows)
-    wp.copy(closest, matched)
 
 
 def _seed_transform(
@@ -1073,13 +985,20 @@ def _seed_transform(
     """
     initial_matrix = _resolve_initial(initial, device)
     current = wp.empty(int(a.shape[0]), dtype=wp.vec3, device=device)
+    _apply_transform(a, initial_matrix, current)
+    return initial_matrix, current
+
+
+def _apply_transform(
+    points: wp.array[wp.vec3], matrix: wp.array[wp.mat44], out_points: wp.array[wp.vec3]
+) -> None:
+    """Write ``matrix[0]`` applied to every point of ``points`` into ``out_points``."""
     wp.launch(
         kernel_transform.apply_transform_mat44,
-        dim=int(a.shape[0]),
-        inputs=[a, initial_matrix, current],
-        device=device,
+        dim=int(points.shape[0]),
+        inputs=[points, matrix, out_points],
+        device=points.device,
     )
-    return initial_matrix, current
 
 
 def _resolve_initial(

@@ -30,9 +30,18 @@ TOLERANCE_ZERO = 1e-12
 # `kernels/laplacian.triangle_inequality_slack`.
 TOLERANCE_MOLLIFY = 1e-5
 
+# Default tolerances of [`allclose`][triwarp.array.allclose], shared with the per-thread closure
+# test of ``polyline``'s kernels ("the last point repeats the first"): "close" has to mean one thing
+# across the package. The kernel twins are read in kernel scope, so a closure test costs no launch
+# arguments.
+ALLCLOSE_RTOL = 1e-05
+ALLCLOSE_ATOL = 1e-08
+
 TOLERANCE_MERGE_CONSTANT = wp.float32(TOLERANCE_MERGE)
 TOLERANCE_PLANAR_CONSTANT = wp.float32(TOLERANCE_PLANAR)
 TOLERANCE_ZERO_CONSTANT = wp.float32(TOLERANCE_ZERO)
+ALLCLOSE_RTOL_CONSTANT = wp.float32(ALLCLOSE_RTOL)
+ALLCLOSE_ATOL_CONSTANT = wp.float32(ALLCLOSE_ATOL)
 TOLERANCE_ZERO_F64 = wp.float64(TOLERANCE_ZERO)
 """``TOLERANCE_ZERO`` at ``float64``, for the predicates that widen before deciding."""
 

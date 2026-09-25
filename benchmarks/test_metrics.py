@@ -202,6 +202,43 @@ def test_chamfer_points_to_points(bench_case: BenchCase, single_directional: boo
     assert chamfer > 0.0
 
 
+_jittered_wp_cache: dict[tuple[str, str], tuple] = {}
+
+
+def _jittered_clouds_wp(bench_case: BenchCase) -> tuple[wp.array[wp.vec3], wp.array[wp.vec3]]:
+    """Build a *coincident* pair: the vertices and a copy jittered by ``1e-4`` of the diagonal."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _jittered_wp_cache:
+        vertices = bench_case.vertices_np
+        diagonal = np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0))
+        jitter = np.random.default_rng(0).normal(scale=1e-4 * diagonal, size=vertices.shape)
+        _jittered_wp_cache[key] = tuple(
+            wp.array(
+                np.ascontiguousarray(c, dtype=np.float32), dtype=wp.vec3, device=bench_case.device
+            )
+            for c in (vertices, vertices + jitter)
+        )
+    return _jittered_wp_cache[key]
+
+
+@pytest.mark.benchmark(group="chamfer_points_to_points_coincident")
+@pytest.mark.benchlibs("triwarp")
+def test_chamfer_points_to_points_coincident(bench_case: BenchCase) -> None:
+    """
+    Symmetric point-cloud Chamfer on a coincident pair, the other end of the displacement axis.
+
+    The shifted ``chamfer_points_to_points`` rows put every answer several spacings away; here
+    every answer is a fraction of one, which is where a seeded hash grid answers the backward half
+    faster than the closest-point descent on a large cloud, and where ``metrics`` chooses it. The
+    choice reads the forward answer back, so the two rows together price what it wins and what it
+    costs.
+    """
+    skip_larger_than(bench_case, "dragon")
+    cloud_a, cloud_b = _jittered_clouds_wp(bench_case)
+    chamfer = bench_case.run(lambda: tw.metrics.chamfer_points_to_points(cloud_a, cloud_b))
+    assert chamfer > 0.0
+
+
 def _clouds_meshset_pml(bench_case: BenchCase) -> tuple[ml.MeshSet, int]:
     """
     Return the two clouds as face-less meshes 0 and 1 of one MeshSet, plus their point count.
