@@ -1718,8 +1718,8 @@ def fillable_loop_mask(
         # A vertex on two different rims is a pinch *between* loops, and a vertex a single rim
         # visits twice is a pinch *within* one: filling either leaves that vertex non-manifold,
         # and a clean loop sharing a pinched vertex is exactly as unfillable as the pinched one.
-        # Both read off the same per-vertex slot count, so the two disqualifications are one pass
-        # rather than a distinct-vertex test per loop and an owner tally over their unions.
+        # Both read off the same per-vertex slot count, and the pass that applies it also fills the
+        # vertex-indexed tables the chord test reads, with every unpinched vertex.
         counts = wp.zeros(n_vertices, dtype=wp.int32, device=device)
         wp.launch(
             kernel_holes.count_loop_vertices,
@@ -1727,35 +1727,21 @@ def fillable_loop_mask(
             inputs=[packed.flat_loops, packed.loop_id, wp.int32(n_vertices), counts, fillable],
             device=device,
         )
-        wp.launch(
-            kernel_holes.clear_shared_loops,
-            dim=packed.total,
-            inputs=[packed.flat_loops, packed.loop_id, counts, fillable],
-            device=device,
-        )
-        # Only a surviving loop is written into the vertex-indexed tables, which is what keeps
-        # them single-valued: it owns one slot per vertex and shares none, so the scatter has no
-        # collision to resolve and the answer does not depend on loop order.
         loop_of_vertex = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
         position = wp.zeros(n_vertices, dtype=wp.int32, device=device)
         wp.launch(
             kernel_holes.scatter_fillable_loop_slots,
             dim=packed.total,
-            inputs=[
-                packed.flat_loops,
-                packed.loop_id,
-                packed.starts,
-                fillable,
-                loop_of_vertex,
-                position,
-            ],
+            inputs=[packed.flat_loops, packed.loop_id, packed.starts, counts],
+            outputs=[fillable, loop_of_vertex, position],
             device=device,
         )
-        unique_edges, _inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
+        # Over the faces' corners, not the unique edges: the test is order-free and idempotent, so
+        # the sort that deduplicates the edges buys nothing (``clear_loops_with_chords``).
         wp.launch(
             kernel_holes.clear_loops_with_chords,
-            dim=int(unique_edges.shape[0]),
-            inputs=[unique_edges, loop_of_vertex, position, packed.sizes, fillable],
+            dim=int(faces.shape[0]) // 3,
+            inputs=[faces, loop_of_vertex, position, packed.sizes, fillable],
             device=device,
         )
     return fillable

@@ -507,9 +507,9 @@ def test_stitch_min_weight(bench_case: BenchCase) -> None:
 @pytest.mark.benchlibs("triwarp", "meshlib")
 def test_fillable_loop_mask(bench_case: BenchCase) -> None:
     """
-    Which rims a min-weight fill can close: one edge pass, plus one readback of the rims.
+    Which rims a min-weight fill can close: one face pass, plus one readback of the rims.
 
-    The chord test is a sweep over every unique edge, so the cost tracks the *mesh* rather than the
+    The chord test is a sweep over every face's edges, so the cost tracks the *mesh* rather than the
     boundary; the pinch test rides on one readback of the loops, which tracks the boundary. Read
     against ``fill_min_weight`` -- the point of the mask is that it is a small fraction of the fill
     it predicts, so a caller can afford to ask first.

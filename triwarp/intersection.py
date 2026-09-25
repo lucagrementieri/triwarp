@@ -255,11 +255,6 @@ def marching_triangles(
     if n_faces == 0:
         return [], []
 
-    # Subtract the isovalue once so the kernel only has to test signs; ``wp.map`` keeps the
-    # element-wise work out of the kernel and preserves the field's dtype.
-    shifted = wp.empty(int(values.shape[0]), dtype=values.dtype, device=device)
-    wp.map(wp.sub, values, values.dtype(isovalue), out=shifted)
-
     # The key base only has to exceed every vertex index the faces reference; ``vertices`` is the
     # buffer they index, so its length is the bound whenever the caller did not give one.
     key_base = int(n_vertices) if n_vertices is not None else int(vertices.shape[0])
@@ -267,9 +262,18 @@ def marching_triangles(
     segments = twt.empty_2d((n_faces, 2), wp.vec3, device=device)
     segment_edges = twt.empty_2d((n_faces, 2), wp.int64, device=device)
     wp.launch(
-        kernel_intersections.MARCHING_TRIANGLES_SEGMENTS[shifted.dtype],
+        kernel_intersections.MARCHING_TRIANGLES_SEGMENTS[values.dtype],
         dim=n_faces,
-        inputs=[vertices, faces, shifted, wp.int64(key_base), valid, segments, segment_edges],
+        inputs=[
+            vertices,
+            faces,
+            values,
+            values.dtype(isovalue),
+            wp.int64(key_base),
+            valid,
+            segments,
+            segment_edges,
+        ],
         device=device,
     )
 

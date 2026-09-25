@@ -6346,3 +6346,79 @@ are `cgtrace_r16_{base,new}.txt` there.
 - **The final sweep's sub-0.93x cells were drift**: all in functions that reach no solve, and
   0.91-1.04x re-run as their own selection. Median over 280 triwarp cells in the seven modules,
   0.99x.
+
+### 16.17 Benchmark round 17 (2026-09-25)
+
+Items from `plans/benchmark-round-11.md` (round 17), each timed against a detached `4871268`
+worktree (`plans/baseshim.py`, interleaved, min of 2), byte-identity on the CPU oracle.
+
+- **R17-1: the heat diffusions run one continuous solve with a device-side settle test**
+  (`linalg.solve_spd_settled`, `_BatchedCg(settle=...)`, kernels `cg_settle_change` /
+  `cg_settle_decide`). The recorded loop body is 16 rounds plus two launches that compare the
+  iterate with the one 16 rounds earlier and may clear the loop condition; nothing is read back.
+  Round counts equal `probes/diffuse_need.txt`'s W=16 column exactly (saddle 304, sphere_med 256,
+  sphere_small 112 / 96), and the graded saddle stops at reach + 192 = 336. Restarted 64-round
+  chunks never passed the settle test on the vector systems, so this is also an accuracy change:
+  outputs move by 1e-15 (spheres) to 4e-9 (bunny extension) relative, transport directions
+  bit-identical. With the two items below, the heat module is 1.11-2.16x: `heat_geodesic` 1.19-2.14x,
+  `transport_tangent_vectors` 1.37-1.80x, `extend_scalar` 1.24-1.36x, `log_map` 1.24-1.45x.
+    - **A batched body is right here and wrong for `CG_CHECK_EVERY`**: a round after the loop's own
+      stop takes no step, and the settle check needs a block of rounds anyway.
+- **R17-2: small solves run as one launch, one block per column** (`cg_one_block`, gated at
+  `CG_ONE_BLOCK_MAX_ROWS = 1024`, Jacobi or the squared-Laplacian polynomial). Measured against an
+  already-recorded `_BatchedCg` (its best case): 1.5-2.1x at 642 rows, a loss from ~1 200 rows at
+  one column and ~1 900 at three. Iteration counts identical on `fix_self_intersections`' two
+  region solves (52, 21).
+    - **The single block is `float64`-bound, not barrier-bound.** One SM of this GeForce part runs
+      `float64` at 1/64 of `float32`, and a 1 000-row mat-vec is ~13 000 double ops -- ~2.7 us of
+      one SM's FP64 pipe, which is what the per-pass time measured. So the squared-Laplacian
+      polynomial is applied **in `float32`** inside the one-block kernel (a preconditioner need only
+      be a fixed positive-definite map; the operator, residual and answer stay `float64`): that
+      solve 3.98 -> 2.16 ms (1.84x), against 3.17 ms with the polynomial in `float64`, iteration
+      count unchanged. The batched path keeps `float64` throughout.
+    - Harness: `fix_self_intersections[tangle_torus_small local]` 1.14x, `fill_smooth[refined]`
+      1.10-1.41x, `refill_region[refined]` 1.05-1.24x; `linalg`'s own rows (all above the gate)
+      flat.
+- **R17-3**: `fillable_loop_mask`'s chord test runs over face corners (idempotent and symmetric,
+  so no `edges_unique`), and the pinch test and table scatter are one launch. Byte-identical on
+  both devices, 208 of 407 dragon rims fillable. 2.34-3.22x (`dragon` 2.23 -> 0.69 ms).
+- **R17-4**: `heat_geodesic`'s normalization is two launches with no readback
+  (`source_and_global_sums`, `shift_and_orient`); `marching_triangles_segments` re-zeros at the
+  isovalue as it reads (one map and buffer fewer, byte-identical); `smooth_region_boundary` clones
+  the field once, writes its pins and side field in one multi-output map and its band in one
+  kernel (byte-identical; `smooth_region_boundary` 1.84-1.99x with the one-block band solves);
+  `marching_triangles` 1.05-1.11x; point-to-plane ICP against a cloud gathers correspondences inside the
+  accumulation (`gather`), dropping a launch per iteration (CPU byte-identical, flat on the clock: the per-iteration
+  readback dominates).
+- **`heat_operators` / `vector_heat_operators` write their systems over the Laplacian's own
+  pattern** (`shifted_system_values`, `linalg.bsr_with_values`): `cotmatrix` and
+  `connection_laplacian` keep every triplet, so every referenced vertex's row holds a diagonal
+  and `bsr_diag` + `bsr_axpy`'s pattern merge (plus a second `bsr_axpy` for `-L`) is one launch.
+  `heat_operators` 1.42 -> 0.81 ms on `sphere_small`, CPU byte-identical. **The three scalar
+  operators now share one pattern.**
+- **`jacobi_preconditioner` builds Warp's inverse diagonal on first apply**: every solve that
+  recognizes the tag reads the diagonal itself.
+- **Chebyshev intervals are fitted on the device** (`kernels/linalg.chebyshev_steps`,
+  `chebyshev_step` reads its coefficients from an array): building either polynomial preconditioner
+  no longer reads the Gershgorin bound back, which in `heat_geodesic` drained the whole queued
+  diffusion before the Poisson state could be recorded. On fresh operators: `heat_geodesic[full]`
+  1.26 -> 1.65x at `sphere_small`, `heat_signed_distance[band]` 1.07 -> 1.19x, against the same
+  build with the host fit. **Its price is a coefficient load per step**, 2-11 % on long polynomial
+  solves when the load sat before the row dot and ~0-3 % after it (`lscm[hemisphere]` 0.97x, the
+  one cell still below 1.0). Measured, not reasoned: read the coefficients after the mat-vec.
+- **R17-5: the settle solves read a `float32` copy of their operator** (`_BatchedCg`'s
+  `narrow_values`; `multigrid.csr_row_dot` now accumulates at `x`'s precision and widens a
+  narrower value as it reads it, an identity at one precision). Accuracy probed first, by rounding
+  the heat systems' values through `float32` in a `float64` solve -- the same arithmetic: distance
+  2.1-2.3e-8 of its range on `icosphere(5)` / `bunny`, transported angles 1.6-9.7e-5 degrees at
+  most, resolved masks identical, every far-field reference test green. **Speed is far below the
+  bytes model**: 1.06-1.08x at `sphere_large`, flat below it (the plan predicted 1.5-1.8x a round
+  from 71 MB of traffic; most of that working set sits in this card's 96 MB L2, so halving the value
+  bytes halves less than it looks). Harness: `vector_heat_scale[sphere_large]` 1.26 -> 1.33x,
+  `heat_geodesic[sphere_large amortized]` 1.23 -> 1.29x against `4871268`.
+    - **DECLINED -- a native `wp.mat22d` operator in place of the scalar expansion.** The mat-vec
+      alone, both with `float32` values: 0.97x at `sphere_med`, 1.10x at `sphere_large`, ~2 us of
+      a ~50 us round -- not a block conjugate gradient's worth of new kernels.
+    - **The one-block gate's per-row schedule has no other axis to sweep.** A warp per row needs
+      warp shuffles, and Warp exposes only block-wide tile reductions; the block width, swept at
+      128-1024 lanes, is the schedule.

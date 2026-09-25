@@ -13,10 +13,12 @@ transport, extension and log map. They share `face_unit_gradient`, `tangent_to_w
 ``float64`` convention, which is why they are one module rather than three.
 """
 
+from typing import Any
+
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.array import to_vec2, to_vec2d
+from triwarp.kernels.array import OverloadTable, to_vec2, to_vec2d
 from triwarp.kernels.linalg import free_row
 from triwarp.kernels.predicates import (
     stable_length,
@@ -24,7 +26,7 @@ from triwarp.kernels.predicates import (
     unit_tangent,
     world_to_tangent,
 )
-from triwarp.kernels.reduce import block_chunk_1d, block_max, block_sum, commit_sum_and_count
+from triwarp.kernels.reduce import block_chunk_1d, block_sum, commit_sum_and_count
 from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import face_unit_gradient, face_vertices_vec3d
 
@@ -62,6 +64,36 @@ def upper_edge_length_sum_and_count(
     commit_sum_and_count(t, total, count, out_sum_and_count)
 
 
+@wp.kernel
+def shifted_system_values(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[Any],
+    diagonal: wp.array[Any],
+    scale: wp.float64,
+    negate: wp.int32,
+    out_values: wp.array[Any],
+    out_negated: wp.array[Any],
+) -> None:
+    # One row of ``scale * A + diag(diagonal)``, written over ``A``'s own pattern -- the heat
+    # method's ``M - t L`` and ``M + t L_connection`` -- where ``warp.sparse.bsr_axpy`` against a
+    # ``bsr_diag`` would merge two patterns, sorting both, for a result whose pattern is ``A``'s:
+    # every vertex a face references has a diagonal entry (``cotmatrix`` and
+    # ``connection_laplacian`` keep every triplet), and one no face references has no mass. With
+    # ``negate`` set, ``-A`` rides along into ``out_negated`` in the same pass: the scalar method's
+    # Poisson operator; unset, ``out_negated`` is never touched and may be ``None``. Scalar
+    # ``float64`` or ``wp.mat22d`` blocks.
+    row = wp.int32(wp.tid())
+    for e in range(offsets[row], offsets[row + 1]):
+        value = values[e]
+        shifted = scale * value
+        if columns[e] == row:
+            shifted = shifted + diagonal[row]
+        out_values[e] = shifted
+        if negate != 0:
+            out_negated[e] = -value
+
+
 @wp.func
 def tangent_to_world(tangent: wp.vec2, basis_x: wp.vec3, basis_y: wp.vec3) -> wp.vec3:
     # A tangent vector's world-space direction, in the vertex's own (orthonormal) frame. The
@@ -77,37 +109,6 @@ def tangent_to_world(tangent: wp.vec2, basis_x: wp.vec3, basis_y: wp.vec3) -> wp
 # --------------------------------------------------------------------------------------
 # Scalar heat method: geodesic distance (Crane et al. 2013)
 # --------------------------------------------------------------------------------------
-
-
-@wp.kernel
-def heat_chunk_change(
-    solution: wp.array[wp.float64], previous: wp.array[wp.float64], out_stats: wp.array[wp.float64]
-) -> None:
-    # Whether a chunk of heat-solve rounds moved the field, **per vertex and relative to its own
-    # value**: ``out_stats[0]`` is the largest ``|u - u_prev| / |u|`` over the vertices the heat has
-    # reached, ``out_stats[1]`` the count of those vertices, and ``previous`` is advanced to ``u``
-    # for the next chunk. A global residual cannot say this: the heat falls by a near-constant
-    # factor per ring of vertices, so the far field sits hundreds of orders of magnitude below the
-    # source's and is noise long after the residual has converged (``heat._diffuse``). ``out_stats``
-    # is zeroed by the caller; both halves commit one atomic per block, the ``reduce`` block fold.
-    i, t = wp.tid()
-    base, remaining = block_chunk_1d(solution.shape[0], i)
-    if remaining <= 0:
-        return
-    change = wp.float64(0.0)
-    reached = wp.float64(0.0)
-    for k in range(t, remaining, wp.block_dim()):
-        v = base + k
-        u = solution[v]
-        if u != wp.float64(0.0):
-            change = wp.max(change, wp.abs(u - previous[v]) / wp.abs(u))
-            reached += wp.float64(1.0)
-        previous[v] = u
-    block_change = block_max(change)
-    block_reached = block_sum(reached)
-    if t == 0:
-        wp.atomic_max(out_stats, 0, block_change)
-        wp.atomic_add(out_stats, 1, block_reached)
 
 
 @wp.kernel
@@ -177,6 +178,47 @@ def unit_gradient_divergence(
 # --------------------------------------------------------------------------------------
 # Signed heat method: signed distance to oriented curves (Feng & Crane 2024)
 # --------------------------------------------------------------------------------------
+
+
+@wp.kernel
+def source_and_global_sums(
+    phi: wp.array[wp.float64], sources: wp.array[wp.int32], out_sums: wp.array[wp.float64]
+) -> None:
+    # ``(sum of phi over the sources, sum of phi over every vertex)`` into ``out_sums`` (zeroed by
+    # the caller), for ``shift_and_orient``: both means the heat method's normalization needs, in
+    # one launch. The ``reduce`` block fold over whichever of the two ranges is the longer; a block
+    # past the end of the other contributes zero to it. ``sources`` may repeat a vertex, which is
+    # then counted as often as it appears, as a gathered mean counts it.
+    i, t = wp.tid()
+    base, remaining = block_chunk_1d(phi.shape[0], i)
+    source_base, source_remaining = block_chunk_1d(sources.shape[0], i)
+    at_sources = wp.float64(0.0)
+    everywhere = wp.float64(0.0)
+    for k in range(t, source_remaining, wp.block_dim()):
+        at_sources += phi[sources[source_base + k]]
+    for k in range(t, remaining, wp.block_dim()):
+        everywhere += phi[base + k]
+    block = block_sum(wp.vec2d(at_sources, everywhere))
+    if t == 0:
+        wp.atomic_add(out_sums, 0, block[0])
+        wp.atomic_add(out_sums, 1, block[1])
+
+
+@wp.kernel
+def shift_and_orient(
+    sums: wp.array[wp.float64], n_sources: wp.int32, phi: wp.array[wp.float64]
+) -> None:
+    # Shift ``phi`` so its mean over the sources is zero and orient it positive -- the
+    # ``igl::heat_geodesics_solve`` convention, which makes a single source's distance exactly
+    # zero -- from ``source_and_global_sums``' two sums, read on the device so the host never waits
+    # for them. The shifted field's mean is the global mean less the offset, so its sign needs no
+    # second pass. ``phi`` is updated in place.
+    v = wp.int32(wp.tid())
+    offset = sums[0] / wp.float64(n_sources)
+    shifted = phi[v] - offset
+    if sums[1] / wp.float64(phi.shape[0]) - offset < wp.float64(0.0):
+        shifted = offset - phi[v]
+    phi[v] = shifted
 
 
 @wp.kernel
@@ -450,3 +492,32 @@ def log_map_from_angles(
         reference[0] * outward[0] + reference[1] * outward[1],
     )
     out_log[v] = wp.vec2(r * wp.cos(angle), r * wp.sin(angle))
+
+
+# Concrete overloads, registered at import (CLAUDE.md section 2.5): the scalar heat system and the
+# vector one's ``wp.mat22d`` blocks, keyed by the block dtype.
+SHIFTED_SYSTEM_VALUES: OverloadTable
+
+
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    global SHIFTED_SYSTEM_VALUES
+    SHIFTED_SYSTEM_VALUES = OverloadTable(
+        shifted_system_values,
+        {
+            d: [
+                wp.array[wp.int32],
+                wp.array[wp.int32],
+                wp.array[d],
+                wp.array[d],
+                wp.float64,
+                wp.int32,
+                wp.array[d],
+                wp.array[d],
+            ]
+            for d in (wp.float64, wp.mat22d)
+        },
+    )
+
+
+_register_overloads()

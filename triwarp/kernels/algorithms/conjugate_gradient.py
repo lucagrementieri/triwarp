@@ -34,8 +34,9 @@ from typing import Any
 import warp as wp
 
 from triwarp.kernels.algorithms.multigrid import csr_row_dot
-from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND, OverloadTable
-from triwarp.kernels.reduce import block_sum
+from triwarp.kernels.array import LOOP_CONDITION, LOOP_ROUND, OverloadTable, inverse_or_one
+from triwarp.kernels.linalg import csr_row_diagonal
+from triwarp.kernels.reduce import block_chunk_1d, block_max, block_sum
 
 # Lanes per block for both stages of the conjugate-gradient dot product. The partial stage gets one
 # block per ``CG_TILE`` entries *of each column*, which is what makes its grid grow with the system
@@ -604,10 +605,378 @@ def cg_update(
             )
 
 
+# Slots of ``cg_one_block``'s scratch, each ``n_columns * n`` entries: the residual, the
+# preconditioned residual ``u`` and ``w = A u``, the search direction ``p`` and ``s = A p``, and the
+# Jacobi inverse diagonal (only the first ``n`` entries are used). And of its ``float32`` scratch,
+# which only the squared-Laplacian polynomial uses: the residual narrowed, three rotating Chebyshev
+# iterates and the middle vector between the polynomial's two factors. A host-side layout only.
+ONE_BLOCK_R = 0
+ONE_BLOCK_U = 1
+ONE_BLOCK_W = 2
+ONE_BLOCK_P = 3
+ONE_BLOCK_S = 4
+ONE_BLOCK_INV = 5
+ONE_BLOCK_SLOTS = 6
+ONE_BLOCK_NARROW_R = 0
+ONE_BLOCK_NARROW_T = 1
+ONE_BLOCK_NARROW_MID = 4
+ONE_BLOCK_NARROW_SLOTS = 5
+
+
+@wp.func
+def block_barrier() -> None:
+    # A full block barrier: a block-wide reduction synchronizes before and after (``reduce``), and
+    # Warp spells no bare ``__syncthreads``. The sum itself is discarded.
+    _ = block_sum(wp.float64(0.0))
+
+
+@wp.func
+def one_block_chebyshev(
+    n: wp.int32,
+    column_base: wp.int32,
+    total: wp.int32,
+    source: wp.int32,
+    destination: wp.int32,
+    widen_to: wp.int32,
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    steps: wp.array[wp.vec4d],
+    lane: wp.int32,
+    narrow: wp.array[wp.float32],
+    scratch: wp.array[wp.float64],
+) -> None:
+    # ``destination = p(A) source`` inside one block, one pass and one barrier per Chebyshev step:
+    # ``multigrid.chebyshev_step``'s arithmetic, in the same order, with its coefficients narrowed,
+    # over one column of the ``float32`` slots named by ``source`` and ``destination`` -- or, with
+    # ``widen_to`` at zero or above, the last step writes ``float64`` into that slot of ``scratch``
+    # instead. The iterates rotate through the three ``ONE_BLOCK_NARROW_T`` slots -- step ``k``
+    # writes slot ``k % 3``, and reads the two before it, or ``source`` for the first two, as
+    # ``chebyshev_step`` does -- so no step writes what it reads.
+    n_steps = steps.shape[0]
+    source_base = source * total + column_base
+    for k in range(n_steps):
+        wide = steps[k]
+        coefficients = wp.vec4f(
+            wp.float32(wide[0]), wp.float32(wide[1]), wp.float32(wide[2]), wp.float32(wide[3])
+        )
+        current = source
+        if k > 0:
+            current = ONE_BLOCK_NARROW_T + (k - 1) % 3
+        previous = source
+        if k > 1:
+            previous = ONE_BLOCK_NARROW_T + (k - 2) % 3
+        target = ONE_BLOCK_NARROW_T + k % 3
+        last = k == n_steps - 1
+        if last:
+            target = destination
+        current_base = current * total + column_base
+        previous_base = previous * total + column_base
+        target_base = target * total + column_base
+        wide_base = widen_to * total + column_base
+        for row in range(lane, n, wp.block_dim()):
+            ax = csr_row_dot(row, current_base, offsets, columns, values, narrow)
+            now = coefficients[0] * narrow[current_base + row]
+            value = (
+                now
+                + coefficients[2] * (now - coefficients[1] * narrow[previous_base + row])
+                + coefficients[3] * (narrow[source_base + row] - coefficients[0] * ax)
+            )
+            if last and widen_to >= 0:
+                scratch[wide_base + row] = wp.float64(value)
+            else:
+                narrow[target_base + row] = value
+        block_barrier()
+
+
+@wp.func
+def one_block_precondition(
+    polynomial: wp.int32,
+    n: wp.int32,
+    column_base: wp.int32,
+    total: wp.int32,
+    factor_offsets: wp.array[wp.int32],
+    factor_columns: wp.array[wp.int32],
+    factor_values: wp.array[wp.float32],
+    transpose_offsets: wp.array[wp.int32],
+    transpose_columns: wp.array[wp.int32],
+    transpose_values: wp.array[wp.float32],
+    steps: wp.array[wp.vec4d],
+    lane: wp.int32,
+    narrow: wp.array[wp.float32],
+    scratch: wp.array[wp.float64],
+) -> None:
+    # ``u = B B^T r`` for a nonzero ``polynomial``, the squared-Laplacian preconditioner's two
+    # polynomials (``linalg._SquaredLaplacianApply``), ``B^T`` first, **applied in ``float32``**
+    # from the narrowed residual the update wrote. A preconditioner need only be a fixed positive
+    # definite map, not an exact one, and a block's ``float64`` rate is what bounds this kernel on
+    # a device whose ``float64`` throughput is a small fraction of its ``float32`` one: each of the
+    # polynomial's passes is a mat-vec, against one a round for the operator itself, which stays
+    # ``float64`` with everything else the answer depends on. Under Jacobi the update has written
+    # ``u`` in its own register and this only makes it visible to the whole block. Every path ends
+    # on a barrier, which the next round's mat-vec needs: it reads ``u`` at other rows.
+    if polynomial != 0:
+        one_block_chebyshev(
+            n,
+            column_base,
+            total,
+            ONE_BLOCK_NARROW_R,
+            ONE_BLOCK_NARROW_MID,
+            -1,
+            transpose_offsets,
+            transpose_columns,
+            transpose_values,
+            steps,
+            lane,
+            narrow,
+            scratch,
+        )
+        one_block_chebyshev(
+            n,
+            column_base,
+            total,
+            ONE_BLOCK_NARROW_MID,
+            ONE_BLOCK_NARROW_MID,
+            ONE_BLOCK_U,
+            factor_offsets,
+            factor_columns,
+            factor_values,
+            steps,
+            lane,
+            narrow,
+            scratch,
+        )
+    else:
+        block_barrier()
+
+
+@wp.kernel(enable_backward=False)
+def cg_one_block(
+    n: wp.int32,
+    n_columns: wp.int32,
+    maxiter: wp.int32,
+    tol_sq: wp.float64,
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    polynomial: wp.int32,
+    factor_offsets: wp.array[wp.int32],
+    factor_columns: wp.array[wp.int32],
+    factor_values: wp.array[wp.float32],
+    transpose_offsets: wp.array[wp.int32],
+    transpose_columns: wp.array[wp.int32],
+    transpose_values: wp.array[wp.float32],
+    steps: wp.array[wp.vec4d],
+    rhs: wp.array[wp.float64],
+    scratch: wp.array[wp.float64],
+    narrow: wp.array[wp.float32],
+    out_x: wp.array[wp.float64],
+    out_iterations: wp.array[wp.int32],
+    out_rr: wp.array[wp.float64],
+    out_atol_sq: wp.array[wp.float64],
+) -> None:
+    # A whole preconditioned conjugate-gradient solve in **one launch**, one block per column,
+    # lanes striding the column's rows and block reductions for barriers: the launch a
+    # ``_BatchedCg`` round spends per graph node becomes a block barrier (CLAUDE.md section
+    # 14.11's trade), and nothing is recorded. It is the Chronopoulos-Gear round ``cg_update``
+    # documents -- the mat-vec with all three dots, then the update -- at two barriers a round
+    # under Jacobi, and one more per Chebyshev step under the squared-Laplacian polynomial. The
+    # stopping rule is ``_BatchedCg``'s, column by column: a column steps while its ``r.r`` exceeds
+    # ``tol^2 ||b_c||^2`` and the round count is inside ``maxiter``, and every column's block
+    # stops on its own. The whole column lives in one SM, so this is for small systems only --
+    # ``linalg.CG_ONE_BLOCK_MAX_ROWS``.
+    #
+    # ``out_x`` is the initial guess on entry, ``out_iterations`` (zeroed by the caller) the most
+    # rounds any column stepped, ``out_rr`` / ``out_atol_sq`` each column's last measured ``r.r``
+    # and its threshold -- the three values ``_BatchedCg`` returns. On the CPU device a block is
+    # one lane, which walks every row: the lane-free form that backend wants anyway.
+    c, lane = wp.tid()
+    total = n_columns * n
+    column_base = c * n
+    r_base = ONE_BLOCK_R * total + column_base
+    u_base = ONE_BLOCK_U * total + column_base
+    w_base = ONE_BLOCK_W * total + column_base
+    p_base = ONE_BLOCK_P * total + column_base
+    s_base = ONE_BLOCK_S * total + column_base
+    inv_base = ONE_BLOCK_INV * total
+    narrow_r_base = ONE_BLOCK_NARROW_R * total + column_base
+    zero = wp.float64(0.0)
+
+    b_norm_sq = zero
+    for row in range(lane, n, wp.block_dim()):
+        residual = rhs[column_base + row] - csr_row_dot(
+            row, column_base, offsets, columns, values, out_x
+        )
+        scratch[r_base + row] = residual
+        scratch[p_base + row] = zero
+        scratch[s_base + row] = zero
+        if polynomial == 0:
+            diagonal, _off_sum = csr_row_diagonal(offsets, columns, values, row)
+            inverse = inverse_or_one(diagonal)
+            scratch[inv_base + row] = inverse
+            scratch[u_base + row] = inverse * residual
+        else:
+            narrow[narrow_r_base + row] = wp.float32(residual)
+        b_norm_sq += rhs[column_base + row] * rhs[column_base + row]
+    atol_sq = tol_sq * block_sum(b_norm_sq)
+    one_block_precondition(
+        polynomial,
+        n,
+        column_base,
+        total,
+        factor_offsets,
+        factor_columns,
+        factor_values,
+        transpose_offsets,
+        transpose_columns,
+        transpose_values,
+        steps,
+        lane,
+        narrow,
+        scratch,
+    )
+
+    gamma_old = wp.float64(wp.inf)
+    alpha_old = wp.float64(1.0)
+    stepped = wp.int32(0)
+    rr = zero
+    for round_index in range(maxiter + 1):
+        terms = wp.vec3d(0.0, 0.0, 0.0)
+        for row in range(lane, n, wp.block_dim()):
+            w = csr_row_dot(row, u_base, offsets, columns, values, scratch)
+            scratch[w_base + row] = w
+            terms += cg_round_terms(scratch[r_base + row], scratch[u_base + row], w)
+        dots = block_sum(terms)
+        rr = dots[2]
+        # ``cg_step_scalars``' test and scalars, with the round index counted from 1 as there.
+        step = cg_step_scalars(dots, gamma_old, alpha_old, atol_sq, round_index + 1, maxiter)
+        if step[2] == zero:
+            break
+        alpha = step[0]
+        beta = step[1]
+        for row in range(lane, n, wp.block_dim()):
+            pk = scratch[u_base + row] + beta * scratch[p_base + row]
+            sk = scratch[w_base + row] + beta * scratch[s_base + row]
+            scratch[p_base + row] = pk
+            scratch[s_base + row] = sk
+            out_x[column_base + row] = out_x[column_base + row] + alpha * pk
+            residual = scratch[r_base + row] - alpha * sk
+            scratch[r_base + row] = residual
+            if polynomial == 0:
+                scratch[u_base + row] = scratch[inv_base + row] * residual
+            else:
+                narrow[narrow_r_base + row] = wp.float32(residual)
+        gamma_old = dots[0]
+        alpha_old = alpha
+        stepped += 1
+        # The polynomial reads ``r`` at other rows, so it starts behind a barrier of its own.
+        if polynomial != 0:
+            block_barrier()
+        one_block_precondition(
+            polynomial,
+            n,
+            column_base,
+            total,
+            factor_offsets,
+            factor_columns,
+            factor_values,
+            transpose_offsets,
+            transpose_columns,
+            transpose_values,
+            steps,
+            lane,
+            narrow,
+            scratch,
+        )
+    if lane == 0:
+        out_rr[c] = rr
+        out_atol_sq[c] = atol_sq
+        wp.atomic_max(out_iterations, 0, stepped)
+
+
+# Slots of a settle monitor's state (``linalg._BatchedCg``'s ``settle=``), one ``float64`` word
+# each so the whole of it is reset by one memset: the check's largest relative change and reached
+# count (accumulated by ``cg_settle_change``, cleared by ``cg_settle_decide``), then the reached
+# count at the previous check plus one -- so a zeroed state never matches a real count and the
+# first check always reads as "newly reached" -- the check at which that count last changed, and
+# the checks so far.
+SETTLE_CHANGE = wp.constant(0)
+SETTLE_REACHED = wp.constant(1)
+SETTLE_PREVIOUS = wp.constant(2)
+SETTLE_REACH_CHECK = wp.constant(3)
+SETTLE_CHECKS = wp.constant(4)
+SETTLE_STATE_SIZE = 5
+
+
+@wp.kernel
+def cg_settle_change(
+    solution: wp.array[wp.float64], previous: wp.array[wp.float64], out_settle: wp.array[wp.float64]
+) -> None:
+    # Whether the rounds since the last check moved the field, **per entry and relative to its own
+    # value**: the largest ``|x - x_prev| / |x|`` over the entries that are non-zero, and the count
+    # of those entries, into ``out_settle``'s first two slots (zeroed by the previous
+    # ``cg_settle_decide``); ``previous`` is advanced to ``x`` for the next check. A residual cannot
+    # say this for the heat method's diffusions, whose far field sits hundreds of orders of
+    # magnitude below the source (``heat._diffuse``). Both halves commit one atomic per block, the
+    # ``reduce`` block fold.
+    i, t = wp.tid()
+    base, remaining = block_chunk_1d(solution.shape[0], i)
+    if remaining <= 0:
+        return
+    change = wp.float64(0.0)
+    reached = wp.float64(0.0)
+    for k in range(t, remaining, wp.block_dim()):
+        v = base + k
+        u = solution[v]
+        if u != wp.float64(0.0):
+            change = wp.max(change, wp.abs(u - previous[v]) / wp.abs(u))
+            reached += wp.float64(1.0)
+        previous[v] = u
+    block_change = block_max(change)
+    block_reached = block_sum(reached)
+    if t == 0:
+        wp.atomic_max(out_settle, SETTLE_CHANGE, block_change)
+        wp.atomic_add(out_settle, SETTLE_REACHED, block_reached)
+
+
+@wp.kernel
+def cg_settle_decide(
+    check_rounds: wp.int32,
+    change_tolerance: wp.float64,
+    settle_rounds: wp.int32,
+    settle: wp.array[wp.float64],
+    state: wp.array[wp.int32],
+) -> None:
+    # The settle monitor's verdict, one thread: stop the round loop once a check reaches no new
+    # entry *and* moved none by ``change_tolerance`` or more, or once ``settle_rounds`` rounds have
+    # passed since the reached count last changed -- the bound for an entry that never settles
+    # because it cancels toward zero. A check that reaches new entries never stops the loop. It
+    # only ever clears ``state``'s condition, so the solve's own cap still ends it, and it clears
+    # the two slots ``cg_settle_change`` accumulates into, for the next check.
+    checks = settle[SETTLE_CHECKS] + wp.float64(1.0)
+    settle[SETTLE_CHECKS] = checks
+    change = settle[SETTLE_CHANGE]
+    count = settle[SETTLE_REACHED] + wp.float64(1.0)
+    settle[SETTLE_CHANGE] = wp.float64(0.0)
+    settle[SETTLE_REACHED] = wp.float64(0.0)
+    if count != settle[SETTLE_PREVIOUS]:
+        settle[SETTLE_PREVIOUS] = count
+        settle[SETTLE_REACH_CHECK] = checks
+        return
+    idle = (checks - settle[SETTLE_REACH_CHECK]) * wp.float64(check_rounds)
+    if change < change_tolerance or idle >= wp.float64(settle_rounds):
+        state[LOOP_CONDITION] = 0
+
+
 # The storage precisions ``_BatchedCg`` solves in: ``float64`` for every mesh operator, ``float32``
 # for the ``warp.fem`` Poisson system ``reconstruction`` assembles. The matrix-free Poisson grid
 # reaches ``cg_update`` at ``float32`` too, through its own mat-vec.
 _CG_DTYPES = (wp.float32, wp.float64)
+
+# ``(vector, value)`` storage pairs for the two kernels that read the operator's values, keyed so:
+# the vectors' precision, and the values' -- the same, or ``float32`` values under ``float64``
+# vectors for the heat diffusions' narrowed operator (``linalg._BatchedCg``'s ``narrow_values``).
+_CG_STORAGE = ((wp.float32, wp.float32), (wp.float64, wp.float64), (wp.float64, wp.float32))
 
 
 def _register_overloads() -> None:
@@ -617,22 +986,22 @@ def _register_overloads() -> None:
     CG_INITIAL = OverloadTable(
         cg_initial,
         {
-            d: [wp.int32] * 4
-            + [wp.array[wp.int32], wp.array[wp.int32]]
-            + [wp.array[d]] * 8
+            (d, v): [wp.int32] * 4
+            + [wp.array[wp.int32], wp.array[wp.int32], wp.array[v]]
+            + [wp.array[d]] * 7
             + [wp.array3d[f64]]
-            for d in _CG_DTYPES
+            for d, v in _CG_STORAGE
         },
     )
     CG_MATVEC_DOTS = OverloadTable(
         cg_matvec_dots,
         {
-            d: [wp.int32] * 3
-            + [wp.array[wp.int32], wp.array[wp.int32]]
-            + [wp.array[d]] * 3
+            (d, v): [wp.int32] * 3
+            + [wp.array[wp.int32], wp.array[wp.int32], wp.array[v]]
+            + [wp.array[d]] * 2
             + [wp.array[f64]] * 2
             + [wp.array[d], wp.array3d[f64], wp.array[f64], wp.array[f64], wp.array[wp.int32]]
-            for d in _CG_DTYPES
+            for d, v in _CG_STORAGE
         },
     )
     CG_ROUND_DOTS = OverloadTable(

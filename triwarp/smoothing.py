@@ -2390,9 +2390,8 @@ def smooth_region_boundary(
     inside = _incident_vertex_mask(faces, region, n_vertices)
     free = _region_rim_vertices(faces, region, inside)
     fixed_mask = wp.empty(n_vertices, dtype=wp.bool, device=device)
-    wp.map(kernel_array.mask_not, free, out=fixed_mask)
     field = wp.empty((1, n_vertices), dtype=wp.float64, device=device)
-    wp.map(kernel_smoothing.region_side_value, inside, out=field[0])
+    wp.map(kernel_smoothing.band_pins, free, inside, out=[fixed_mask, field[0]])
 
     vf_indices, offsets = (
         vertex_faces
@@ -2416,7 +2415,9 @@ def smooth_region_boundary(
     free_vertices = tw.array.flatnonzero(free)
     solution = twt.as_array2d(wp.zeros((1, n_free), dtype=wp.float64, device=device), wp.float64)
     nxt = wp.empty(n_vertices, dtype=wp.vec3, device=device)
-    solved = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    # Every pass rewrites only the free entries, so the pinned ones keep the boundary values they
+    # start with: one copy of the field, not one per pass.
+    solved = wp.clone(field[0])
     for iteration in range(iterations):
         if iteration > 0:
             wp.launch(
@@ -2438,7 +2439,6 @@ def smooth_region_boundary(
                 device=device,
             )
         twl.solve_spd_columns(system, rhs, solution, tol=twl.CG_TOLERANCE)
-        wp.copy(solved, field[0])
         wp.launch(
             kernel_smoothing.scatter_free_scalar,
             dim=n_vertices,
@@ -2480,12 +2480,13 @@ def _region_rim_vertices(
     """
     device = faces.device
     n_vertices = int(inside.shape[0])
-    outside_region = wp.empty(int(region.shape[0]), dtype=wp.bool, device=device)
-    wp.map(kernel_array.mask_not, region, out=outside_region)
-    outside = _incident_vertex_mask(faces, outside_region, n_vertices)
-    free = wp.empty(n_vertices, dtype=wp.bool, device=device)
-    wp.map(kernel_array.mask_and, inside, outside, out=free)
-
+    free = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_smoothing.mark_band_vertices,
+        dim=int(region.shape[0]),
+        inputs=[faces, region, inside, free],
+        device=device,
+    )
     return tw.selection.exclude_fully_selected_components(faces, free, n_vertices)
 
 

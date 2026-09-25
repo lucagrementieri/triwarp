@@ -262,12 +262,15 @@ def csr_row_dot(
     # iteration's step below, which differ only in what they do with the result -- and the row bound
     # comes from ``offsets`` alone, so neither depends on the matrix's ``nnz`` field being fresh.
     #
-    # Generic over the storage precision, and accumulated at it: the conjugate-gradient mat-vec
-    # also runs on ``float32`` systems, whose rows ``warp.fem`` assembles a hundred entries long,
-    # where a ``float64`` accumulator measured well behind ``warp.sparse.bsr_mv``'s own.
-    total = values.dtype(0.0)
+    # Generic over the storage precision, and accumulated at ``x``'s: the conjugate-gradient
+    # mat-vec also runs on ``float32`` systems, whose rows ``warp.fem`` assembles a hundred entries
+    # long, where a ``float64`` accumulator measured well behind ``warp.sparse.bsr_mv``'s own. The
+    # values may be narrower than ``x`` -- the heat diffusions' ``float32`` copy of their operator
+    # (``linalg._BatchedCg``'s ``narrow_values``) -- and are widened as they are read; at one
+    # precision the cast is the identity and the arithmetic is unchanged.
+    total = x.dtype(0.0)
     for k in range(offsets[row], offsets[row + 1]):
-        total += values[k] * x[x_offset + columns[k]]
+        total += x.dtype(values[k]) * x[x_offset + columns[k]]
     return total
 
 
@@ -311,10 +314,8 @@ def csr_matvec(
 def chebyshev_step(
     n_rows: wp.int32,
     stride: wp.int32,
-    scale: wp.float64,
-    previous_scale: wp.float64,
-    momentum: wp.float64,
-    step: wp.float64,
+    steps: wp.array[wp.vec4d],
+    index: wp.int32,
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
     values: wp.array[wp.float64],
@@ -331,7 +332,9 @@ def chebyshev_step(
     # ``row_scale`` is never read and may be ``None``.
     #
     # One step of the Chebyshev semi-iteration for ``A x = source``, every column at once, in its
-    # three-term form: ``x' = s x + momentum (s x - s_prev x_previous) + step (source - s A x)``.
+    # three-term form: ``x' = s x + momentum (s x - s_prev x_previous) + step (source - s A x)``,
+    # with ``(s, s_prev, momentum, step)`` read from ``steps[index]``, which
+    # ``linalg.chebyshev_steps`` writes on the device.
     # With both scales ``1`` that is the textbook recurrence. The semi-iteration's first iterate is
     # ``source / theta``, which no launch writes: the first step passes ``x = source`` with
     # ``s = 1 / theta`` (and ``s_prev = 0``, the zero iterate before it), and the second passes
@@ -347,6 +350,11 @@ def chebyshev_step(
     base = column * stride
     slot = base + row
     ax = csr_row_dot(row, base, offsets, columns, values, x)
+    coefficients = steps[index]
+    scale = coefficients[0]
+    previous_scale = coefficients[1]
+    momentum = coefficients[2]
+    step = coefficients[3]
     if row_scaled != wp.int32(0):
         ax = ax * row_scale[row]
     current = scale * x[slot]

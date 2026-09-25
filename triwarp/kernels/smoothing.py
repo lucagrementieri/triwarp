@@ -1235,10 +1235,35 @@ def scatter_free_scalar(
 
 
 @wp.func
-def region_side_value(inside: wp.bool) -> wp.float64:
-    # The field the rim curve is the zero set of: -1 on the region, +1 outside it. Any two values of
-    # opposite sign would do; +-1 keeps the harmonic interpolant's scale comparable to nothing else,
-    # which is fine because only its zero set is read.
+def band_pins(free: wp.bool, inside: wp.bool) -> tuple[wp.bool, wp.float64]:
+    # A vertex's two inputs to the rim band's harmonic solve: whether it is pinned (every vertex
+    # off the band), and the field the rim curve is the zero set of -- -1 on the region, +1 outside
+    # it. Any two values of opposite sign would do; +-1 keeps the harmonic interpolant's scale
+    # comparable to nothing else, which is fine because only its zero set is read. One map writes
+    # both.
+    side = wp.float64(1.0)
     if inside:
-        return wp.float64(-1.0)
-    return wp.float64(1.0)
+        side = wp.float64(-1.0)
+    return not free, side
+
+
+@wp.kernel
+def mark_band_vertices(
+    faces: wp.array[wp.int32],
+    region: wp.array[wp.bool],
+    inside: wp.array[wp.bool],
+    out_band: wp.array[wp.bool],
+) -> None:
+    # The vertices touching both a selected and an unselected face: every corner of an unselected
+    # face that some selected face also touches (``inside``). Concurrent writes all store ``True``,
+    # so the race is benign; ``out_band`` arrives zeroed.
+    f = wp.int32(wp.tid())
+    if region[f]:
+        return
+    a, b, c = corner_triple(faces, f)
+    if inside[a]:
+        out_band[a] = True
+    if inside[b]:
+        out_band[b] = True
+    if inside[c]:
+        out_band[c] = True

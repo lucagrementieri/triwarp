@@ -1354,48 +1354,42 @@ def count_loop_vertices(
 
 
 @wp.kernel
-def clear_shared_loops(
-    flat_loops: wp.array[wp.int32],
-    loop_id: wp.array[wp.int32],
-    vertex_counts: wp.array[wp.int32],
-    out_fillable: wp.array[wp.bool],
-) -> None:
-    # One occurrence count answers both pinch tests at once. A vertex holding two packed slots is
-    # visited twice by one loop (that loop is pinched at it) or once by each of two loops (both
-    # are pinched there), and in either case every loop touching it is unfillable -- so
-    # "occupies more than one slot" is exactly the union of the two conditions, and no per-loop
-    # distinct-vertex pass is needed to separate them. Idempotent writes, so no atomics.
-    t = wp.int32(wp.tid())
-    v = flat_loops[t]
-    if v >= 0 and v < vertex_counts.shape[0] and vertex_counts[v] > 1:
-        out_fillable[loop_id[t]] = False
-
-
-@wp.kernel
 def scatter_fillable_loop_slots(
     flat_loops: wp.array[wp.int32],
     loop_id: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],
-    fillable: wp.array[wp.bool],
+    vertex_counts: wp.array[wp.int32],
+    out_fillable: wp.array[wp.bool],
     out_loop_of_vertex: wp.array[wp.int32],
     out_position_in_loop: wp.array[wp.int32],
 ) -> None:
-    # Which loop owns each mesh vertex and where along it, for the chord test below. Only a loop
-    # still marked fillable writes, which is what makes the two tables single-valued: such a loop
-    # holds one slot per vertex and shares none with another, so no two threads reach the same
-    # entry.
+    # The pinch test, then which loop owns each mesh vertex and where along it, for the chord test
+    # below. One occurrence count answers both pinch tests at once: a vertex holding two packed
+    # slots is visited twice by one loop (that loop is pinched at it) or once by each of two loops
+    # (both are pinched there), and in either case every loop touching it is unfillable -- so
+    # "occupies more than one slot" is exactly the union of the two conditions. Such a vertex is
+    # not written into the tables, and every other one is held by exactly one slot, which is what
+    # makes them single-valued with no collision to resolve. A loop the pinch test clears may
+    # still write its other vertices, and the chord test may then clear it again: every write to
+    # ``out_fillable`` is an idempotent ``False``, and a loop still fillable at the end had every
+    # vertex written. The range test repeats ``count_loop_vertices``', which has already cleared
+    # such a loop.
     t = wp.int32(wp.tid())
-    ell = loop_id[t]
-    if not fillable[ell]:
-        return
     v = flat_loops[t]
+    if v < 0 or v >= vertex_counts.shape[0]:
+        return
+    ell = loop_id[t]
+    if vertex_counts[v] > 1:
+        out_fillable[ell] = False
+        return
     out_loop_of_vertex[v] = ell
     out_position_in_loop[v] = t - loop_starts[ell]
 
 
-@wp.kernel
-def clear_loops_with_chords(
-    unique_edges: wp.array2d[wp.int32],
+@wp.func
+def clear_loop_if_chord(
+    a: wp.int32,
+    b: wp.int32,
     loop_of_vertex: wp.array[wp.int32],
     position_in_loop: wp.array[wp.int32],
     loop_sizes: wp.array[wp.int32],
@@ -1405,10 +1399,7 @@ def clear_loops_with_chords(
     # along it. A min-weight fill triangulates over the loop's own vertices, so it can propose that
     # chord as a fill edge -- and the mesh already has one, which makes the result non-manifold.
     # That is the hazard ``fill_min_weight(resolve_multiple_edges=True)`` works around after the
-    # fact; naming it per loop lets a caller decide before filling.
-    e = wp.int32(wp.tid())
-    a = unique_edges[e, 0]
-    b = unique_edges[e, 1]
+    # fact; naming it per loop lets a caller decide before filling. Symmetric in ``a`` and ``b``.
     loop = loop_of_vertex[a]
     if loop < 0 or loop_of_vertex[b] != loop:
         return
@@ -1418,6 +1409,25 @@ def clear_loops_with_chords(
         gap = -gap
     if gap != 1 and gap != size - 1:
         out_fillable[loop] = False
+
+
+@wp.kernel
+def clear_loops_with_chords(
+    faces: wp.array[wp.int32],
+    loop_of_vertex: wp.array[wp.int32],
+    position_in_loop: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    out_fillable: wp.array[wp.bool],
+) -> None:
+    # The chord test over every face's three edges rather than over the unique edges: the only
+    # write is an idempotent ``False`` and the test is symmetric in its two ends, so an edge seen
+    # from both of its faces, in either direction, gives the answer it gives once -- and no sort is
+    # needed to deduplicate them.
+    f = wp.int32(wp.tid())
+    a, b, c = corner_triple(faces, f)
+    clear_loop_if_chord(a, b, loop_of_vertex, position_in_loop, loop_sizes, out_fillable)
+    clear_loop_if_chord(b, c, loop_of_vertex, position_in_loop, loop_sizes, out_fillable)
+    clear_loop_if_chord(c, a, loop_of_vertex, position_in_loop, loop_sizes, out_fillable)
 
 
 @wp.kernel

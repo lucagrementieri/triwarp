@@ -46,7 +46,6 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.linalg as twl
-import triwarp.reduce as twr
 import triwarp.typing as twt
 from triwarp._device import require_same_device
 from triwarp.constants import TILE_1D
@@ -70,19 +69,20 @@ from triwarp.triangles import face_normals_and_areas
 # spelled three times when these were three modules.
 _CG_TOLERANCE = 1e-8
 
-# Rounds per chunk of a heat solve that must reach every vertex, and the per-vertex relative change
-# below which a chunk counts as converged (see ``_diffuse``). The change collapses by six or more
-# orders of magnitude in the chunk after the field settles -- measured on spheres, a hemisphere and
-# the two bunnies, from about 1 to 1e-7 or less -- so the threshold is not a tuning knob.
-_HEAT_CHUNK = 64
+# The heat solves' settle rule (``linalg.solve_spd_settled``, see ``_diffuse``): a check every
+# ``_HEAT_CHECK_ROUNDS`` rounds, the per-vertex relative change below which a check counts as
+# settled, and the rounds past the last newly reached vertex after which the solve stops anyway.
+# Probed on continuous Jacobi-CG against the converged field (1 024 rounds), on the scalar and
+# vector systems of spheres from 2.5 k to 164 k vertices, both bunnies and the uniform and graded
+# saddles: a 16-round check fires at or after the first round within ``1e-6`` of the converged
+# field on every one, where a 64-round check overshoots by up to 160 rounds. The change collapses
+# by six or more orders of magnitude once the field settles, so the tolerance is not a tuning knob.
+# The rounds a field needs past full reach do not grow with the mesh -- that is the heat system's
+# own conditioning, fixed by ``t = h ** 2`` -- and measured at 80-150, so 192 covers every one; the
+# graded saddle never settles (its cut-locus entries oscillate) and stops on that bound.
+_HEAT_CHECK_ROUNDS = 16
 _HEAT_CHANGE_TOLERANCE = 1e-6
-
-# A bound for the entries that never settle relative to themselves (see ``_diffuse``): the solve
-# stops this many chunks after it reached every vertex. The number of rounds a field needs past
-# full reach does not grow with the mesh -- it is the heat system's own conditioning, fixed by
-# ``t = h ** 2`` -- and measured at 80-150 on spheres from 2.5 k to 41 k vertices, a hemisphere and
-# both bunnies, so three chunks (192 rounds) covers every one.
-_HEAT_SETTLE_CHUNKS = 3
+_HEAT_SETTLE_ROUNDS = 192
 
 
 HeatOperators = tuple[
@@ -253,15 +253,30 @@ def heat_operators(
     normals, areas = face_normals_and_areas(vertices, faces)
     mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
 
-    # Heat system (M - t L). ``bsr_axpy`` overwrites the mass matrix in place (no longer needed).
-    mass_diag = wps.bsr_diag(diag=mass)
-    heat_system = cast(
-        "wps.BsrMatrix[wp.float64]",
-        wps.bsr_axpy(x=laplacian, y=mass_diag, alpha=-float(t), beta=1.0),
+    # Heat system (M - t L) and Poisson operator ``-L``, both over the Laplacian's own pattern
+    # (which stores every referenced vertex's diagonal) and written in one pass
+    # (``kernels/heat.shifted_system_values``), so all three operators share one pattern. The two
+    # preconditioners are mesh-only, so they belong here rather than in every solve. See Notes.
+    heat_values = wp.empty_like(laplacian.values)
+    poisson_values = wp.empty_like(laplacian.values)
+    wp.launch(
+        kernel_heat.SHIFTED_SYSTEM_VALUES[wp.float64],
+        dim=int(laplacian.nrow),
+        inputs=[
+            laplacian.offsets,
+            laplacian.columns,
+            laplacian.values,
+            mass,
+            wp.float64(-t),
+            wp.int32(1),
+        ],
+        outputs=[heat_values, poisson_values],
+        device=vertices.device,
     )
-    # Poisson operator ``-L`` and the two preconditioners: mesh-only, so they belong here rather
-    # than in every solve. See Notes.
-    poisson_system = cast("wps.BsrMatrix[wp.float64]", wps.bsr_axpy(x=laplacian, alpha=-1.0))
+    heat_system = cast("wps.BsrMatrix[wp.float64]", twl.bsr_with_values(laplacian, heat_values))
+    poisson_system = cast(
+        "wps.BsrMatrix[wp.float64]", twl.bsr_with_values(laplacian, poisson_values)
+    )
     return (
         heat_system,
         twl.jacobi_preconditioner(heat_system),
@@ -402,11 +417,24 @@ def heat_geodesic(
 
     # Shift so the field's mean over the sources is zero, and orient it positive -- the
     # ``igl::heat_geodesics_solve`` convention, which makes a single source's distance exactly
-    # zero. One gathered mean and one global mean, both reductions on the device.
-    offset = float(twr.mean(tw.array.gather(phi, sources)))
-    wp.map(wp.sub, phi, wp.float64(offset), out=phi)
-    if float(twr.mean(cast(twt.ArrayNdFloat64, phi))) < 0.0:
-        wp.map(wp.neg, phi, out=phi)
+    # zero. Both means from one reduction launch, applied by a second that reads them on the
+    # device, so nothing is read back.
+    n_sources = int(sources.shape[0])
+    sums = wp.zeros(2, dtype=wp.float64, device=device)
+    wp.launch_tiled(
+        kernel_heat.source_and_global_sums,
+        dim=[kernel_reduce.blocks_1d(max(n_vertices, n_sources))],
+        inputs=[phi, sources],
+        outputs=[sums],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    wp.launch(
+        kernel_heat.shift_and_orient,
+        dim=n_vertices,
+        inputs=[sums, wp.int32(n_sources), phi],
+        device=device,
+    )
     return phi
 
 
@@ -428,13 +456,17 @@ def _diffuse(
     residual-stopped solve left 92 % of the vertices without heat and put ``heat_geodesic`` up to
     2.3 off the great-circle distance.
 
-    So the solve runs in warm-restarted chunks of ``_HEAT_CHUNK`` rounds at a zero tolerance, and
-    after each chunk ``kernels/heat.heat_chunk_change`` measures, over every entry of ``solution``,
-    the largest relative change and the number of entries reached. It stops once no entry is newly
-    reached and none moved by more than ``_HEAT_CHANGE_TOLERANCE`` -- or, for an entry that never
-    settles because it cancels toward zero (a transported vector on the cut locus, whose value is
-    round-off relative to itself), ``_HEAT_SETTLE_CHUNKS`` chunks after the last vertex was
-    reached. One readback a chunk.
+    So the solve runs at a zero tolerance until every entry has settled relative to itself
+    ([`solve_spd_settled`][triwarp.linalg.solve_spd_settled]): one continuous iteration, checked on
+    the device every ``_HEAT_CHECK_ROUNDS`` rounds, stopping once no entry is newly reached and none
+    moved by ``_HEAT_CHANGE_TOLERANCE`` -- or, for an entry that never settles because it cancels
+    toward zero (a transported vector on the cut locus, whose value is round-off relative to
+    itself), ``_HEAT_SETTLE_ROUNDS`` rounds after the last vertex was reached. No readback.
+
+    **One iteration, not warm-restarted chunks.** Restarting conjugate gradient every 64 rounds
+    breaks conjugacy, and the vector solves then never passed the settle test at all -- every one
+    ended on the post-reach bound with the field still moving by O(1) relative in the entries that
+    cancel -- where the continuous iteration settles, exactly, well before it.
 
     Jacobi rather than the Jacobi-Chebyshev polynomial, although a polynomial round reaches a dozen
     rings where a Jacobi round reaches one: measured 1.3-1.8x faster on the sphere and **wrong** on
@@ -444,52 +476,15 @@ def _diffuse(
     ``system`` is a scalar operator with ``float64`` right-hand sides, a ``wp.mat22d`` one with
     ``wp.vec2d`` ones, or a scalar one with ``(n_columns, n)`` ones.
     """
-    device = rhs.device
-    flat = _as_flat_float64(solution)
-    n = int(flat.shape[0])
-    previous = wp.zeros(n, dtype=wp.float64, device=device)
-    stats = wp.zeros(2, dtype=wp.float64, device=device)
-    rows = int(solution.shape[-1]) if solution.ndim == 2 else int(solution.shape[0])
-    reached = -1.0
-    reach_chunks = 0
-    for chunk in range(1, max(2, (twl.CG_MAXITER_FACTOR * rows) // _HEAT_CHUNK) + 1):
-        if solution.ndim == 2:
-            twl.solve_spd_columns(
-                system, rhs, solution, tol=0.0, maxiter=_HEAT_CHUNK, check_every=0
-            )
-        else:
-            twl.solve_spd(
-                system,
-                rhs,
-                solution,
-                tol=0.0,
-                maxiter=_HEAT_CHUNK,
-                check_every=0,
-                preconditioner=preconditioner,
-            )
-        stats.zero_()
-        wp.launch_tiled(
-            kernel_heat.heat_chunk_change,
-            dim=[kernel_reduce.blocks_1d(n)],
-            inputs=[flat, previous],
-            outputs=[stats],
-            block_dim=TILE_1D,
-            device=device,
-        )
-        change, now_reached = (float(x) for x in stats.numpy())
-        if now_reached != reached:
-            reached, reach_chunks = now_reached, chunk
-            continue
-        settled = chunk - reach_chunks >= _HEAT_SETTLE_CHUNKS
-        if change < _HEAT_CHANGE_TOLERANCE or settled:
-            return
-
-
-def _as_flat_float64(values: wp.array[Any]) -> wp.array[wp.float64]:
-    """View a contiguous scalar, ``wp.vec2d`` or rank-2 ``float64`` array as flat ``float64``."""
-    if values.dtype == wp.vec2d:
-        return values.view(wp.float64).flatten()
-    return values.flatten()
+    twl.solve_spd_settled(
+        system,
+        rhs,
+        solution,
+        check_rounds=_HEAT_CHECK_ROUNDS,
+        change_tolerance=_HEAT_CHANGE_TOLERANCE,
+        settle_rounds=_HEAT_SETTLE_ROUNDS,
+        preconditioner=preconditioner,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -884,10 +879,24 @@ def vector_heat_operators(
     mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
     mass_blocks = wp.empty(n_vertices, dtype=wp.mat22d, device=device)
     wp.map(kernel_heat.block_mass, mass, out=mass_blocks)
-    vector_system = cast(
-        "wps.BsrMatrix[wp.mat22d]",
-        wps.bsr_axpy(x=connection, y=wps.bsr_diag(diag=mass_blocks), alpha=float(t), beta=1.0),
+    # ``M + t L_connection`` over the connection Laplacian's own pattern, as the scalar system is
+    # built over the cotangent one's (``heat_operators``).
+    vector_values = wp.empty_like(connection.values)
+    wp.launch(
+        kernel_heat.SHIFTED_SYSTEM_VALUES[wp.mat22d],
+        dim=int(connection.nrow),
+        inputs=[
+            connection.offsets,
+            connection.columns,
+            connection.values,
+            mass_blocks,
+            wp.float64(t),
+            wp.int32(0),
+        ],
+        outputs=[vector_values, None],
+        device=device,
     )
+    vector_system = cast("wps.BsrMatrix[wp.mat22d]", twl.bsr_with_values(connection, vector_values))
     if scalar_operators is None:
         scalar_operators = heat_operators(vertices, faces, t)
     if frames is None:
@@ -1336,14 +1345,20 @@ def diffuse_tangent_field(
     source
         ``(n_vertices,)`` ``wp.vec2d`` right-hand side, in each vertex's own tangent frame.
     preconditioner
-        Optional Jacobi preconditioner for ``system``, the fourth field of
-        [`vector_heat_operators`][triwarp.heat.vector_heat_operators]'s return. Built here when
-        ``None``, which is the cost passing it back through ``operators=`` skips.
+        ``None``, or the Jacobi preconditioner for ``system`` -- the fourth field of
+        [`vector_heat_operators`][triwarp.heat.vector_heat_operators]'s return. The solve is
+        Jacobi-preconditioned either way (see
+        [`solve_spd_settled`][triwarp.linalg.solve_spd_settled]).
 
     Returns
     -------
     wp.array[wp.vec2d]
         ``(n_vertices,)`` diffused field on ``source.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``preconditioner`` is neither ``None`` nor ``system``'s own Jacobi preconditioner.
 
     See Also
     --------

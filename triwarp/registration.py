@@ -789,6 +789,12 @@ def icp_point_to_plane(
     # cloud it indexes the target's own per-vertex normals.
     normal_source = face_normals if mesh is not None else target_normals
     assert normal_source is not None
+    # What the accumulation reads a correspondence's target and normal from: the per-correspondence
+    # buffers a mesh target's pass writes, or -- for a cloud -- the target's own vertices and
+    # normals at the nearest-neighbour index, which saves the cloud a gather launch per iteration.
+    gather = 0 if mesh is not None else 1
+    accumulate_target = closest if mesh is not None else target_vertices
+    accumulate_normals = normals if mesh is not None else normal_source
     parity = 0
     step_pending = False
     weightless = False
@@ -825,12 +831,15 @@ def icp_point_to_plane(
             assert target_index is not None
             assert nearest_rows is not None
             _nearest_into(target_vertices, current, target_index, nearest_rows)
-            wp.launch(
-                kernel_registration.cloud_correspondence_pass,
-                dim=n,
-                inputs=[target_vertices, normal_source, triangle_id, closest, normals],
-                device=device,
-            )
+            if kind != 0 and scale_value is None:
+                # Only the robust scale's residual pass reads the gathered correspondences; the
+                # accumulation gathers its own (``accumulate_point_to_plane``'s ``gather``).
+                wp.launch(
+                    kernel_registration.cloud_correspondence_pass,
+                    dim=n,
+                    inputs=[target_vertices, normal_source, triangle_id, closest, normals],
+                    device=device,
+                )
 
         # --- resolve robust scale on the first iteration ---
         if kind != 0 and scale_value is None:
@@ -844,13 +853,14 @@ def icp_point_to_plane(
             dim=kernel_reduce.blocks_1d(n),
             inputs=[
                 current,
-                closest,
-                normals,
+                accumulate_target,
+                accumulate_normals,
                 distance,
                 triangle_id,
                 wp.float32(max_d),
                 wp.int32(kind),
                 wp.float32(scale_value if scale_value is not None else 0.0),
+                wp.int32(gather),
                 jtj,
                 jtr,
                 scalar_acc,
@@ -957,12 +967,13 @@ def icp_point_to_plane(
         assert target_index is not None
         assert nearest_rows is not None
         _nearest_into(target_vertices, current, target_index, nearest_rows)
-        wp.launch(
-            kernel_registration.cloud_correspondence_pass,
-            dim=n,
-            inputs=[target_vertices, normal_source, triangle_id, closest, normals],
-            device=device,
-        )
+        if kind != 0 and scale_value is None:
+            wp.launch(
+                kernel_registration.cloud_correspondence_pass,
+                dim=n,
+                inputs=[target_vertices, normal_source, triangle_id, closest, normals],
+                device=device,
+            )
     if kind != 0 and scale_value is None:
         scale_value = _robust_scale_from_residuals(
             current, closest, normals, distance, triangle_id, max_d, kind
@@ -974,13 +985,14 @@ def icp_point_to_plane(
         dim=kernel_reduce.blocks_1d(n),
         inputs=[
             current,
-            closest,
-            normals,
+            accumulate_target,
+            accumulate_normals,
             distance,
             triangle_id,
             wp.float32(max_d),
             wp.int32(kind),
             wp.float32(scale_value if scale_value is not None else 0.0),
+            wp.int32(gather),
             jtj,
             jtr,
             scalar_acc,

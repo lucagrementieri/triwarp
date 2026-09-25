@@ -380,9 +380,18 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # and whose condition slot they write -- is the same kind of argument and deliberately absent:
     # the write happens in ``cg_close_round``, a ``@wp.func`` this scan cannot see into.
     ("algorithms.conjugate_gradient", "cg_update"): frozenset({"p", "s", "r"}),
-    # ``previous`` is the heat solve's snapshot of the field at the last chunk, compared against and
-    # then advanced to the current one: loop state carried across launches, not the answer.
-    ("heat", "heat_chunk_change"): frozenset({"previous"}),
+    # ``previous`` is a settle monitor's snapshot of the field at the last check, compared against
+    # and then advanced to the current one: loop state carried across launches, not the answer.
+    ("algorithms.conjugate_gradient", "cg_settle_change"): frozenset({"previous"}),
+    # A settle monitor's verdict reads and advances its own state word (the last reached count, the
+    # checks so far) and may clear the round loop's condition in ``state``, which the solve's own
+    # launches also read and write: both are the loop's persistent state, not the answer.
+    ("algorithms.conjugate_gradient", "cg_settle_decide"): frozenset({"settle", "state"}),
+    # A one-launch solve's working vectors -- the residual, the search direction and their
+    # images, the narrowed polynomial iterates -- are caller-allocated scratch, not the answer.
+    ("algorithms.conjugate_gradient", "cg_one_block"): frozenset({"scratch", "narrow"}),
+    # The heat method's normalization shifts and orients the distance field where it lies.
+    ("heat", "shift_and_orient"): frozenset({"phi"}),
     # Boruvka's accepted edges leave the candidate set in place: what the caller reads afterwards
     # is the candidates the dual forest did not take, so ``candidate`` is input and result at once.
     ("homology", "forest_link"): frozenset({"candidate"}),

@@ -264,9 +264,12 @@ def test_solve_spd_columns_matches_numpy(device: str) -> None:
     "is the strongest oracle available for it -- exact up to conditioning.",
 )
 @pytest.mark.parametrize("n", [1, 2, 255, 256, 257, 511, 512, 513])
-def test_solve_spd_columns_across_the_reduction_tile_boundary(device: str, n: int) -> None:
+@pytest.mark.parametrize("engine", ["one_block", "batched"])
+def test_solve_spd_columns_across_the_reduction_tile_boundary(
+    device: str, n: int, engine: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
-    Class A, against ``numpy.linalg.solve``.
+    Class A, against ``numpy.linalg.solve``, through both engines a system this small can take.
 
     The batched solver pads each column to a whole number of
     ``kernels.algorithms.conjugate_gradient.CG_TILE`` entries so its dot has no ragged block, and
@@ -274,8 +277,12 @@ def test_solve_spd_columns_across_the_reduction_tile_boundary(device: str, n: in
     of which writes the caller's *unpadded* buffer and so must skip them. How much padding there
     is, and therefore which of those three a mistake shows up in, is decided entirely by
     ``n mod CG_TILE``: a value that passes at 256 proves nothing about 257. These straddle the
-    boundary in both directions.
+    boundary in both directions. Every one of them is small enough for the one-block solve
+    (``linalg.CG_ONE_BLOCK_MAX_ROWS``), whose lanes stride the rows by the block width instead,
+    so the batched arm lowers the gate to reach the padded solver at all.
     """
+    if engine == "batched":
+        monkeypatch.setattr(tw.linalg, "CG_ONE_BLOCK_MAX_ROWS", 0)
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device, n=n)
     solution_wp = wp.zeros_like(rhs_wp)
     tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
@@ -529,15 +536,19 @@ def test_solve_spd_is_quiet_when_it_converges(device: str) -> None:
     assert np.allclose(solution.numpy(), np.full(n, 0.5))
 
 
-def test_solve_spd_keeps_one_state_per_operator(device: str) -> None:
+def test_solve_spd_keeps_one_state_per_operator(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     Class A, against ``numpy.linalg.solve``, for two right-hand sides solved against one operator.
 
     The second solve replays the state the first one built and recorded (``linalg._cached_solver``),
     so what has to hold is that a replayed state reads the *new* right-hand side and starts from
     the *new* initial guess -- a replay that reused the first call's would return the first answer,
-    which is why the two right-hand sides differ.
+    which is why the two right-hand sides differ. A system this small would take the one-block
+    solve, which keeps no state, so the gate is lowered to reach the cache.
     """
+    monkeypatch.setattr(tw.linalg, "CG_ONE_BLOCK_MAX_ROWS", 0)
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device, n_rhs=2)
     for column in range(2):
         solution_wp = wp.zeros(dense_np.shape[0], dtype=wp.float64, device=device)
@@ -548,13 +559,15 @@ def test_solve_spd_keeps_one_state_per_operator(device: str) -> None:
     assert len(tw.linalg._SOLVER_CACHE[matrix_wp]) == 1
 
 
-def test_solver_cache_keys_on_the_operator(device: str) -> None:
+def test_solver_cache_keys_on_the_operator(device: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Class A, against ``numpy.linalg.solve``: two operators of one shape do not share a state.
 
     A state records pointers into its operator's arrays, so one handed a second matrix of the same
-    shape would solve the first matrix's system and converge to a plausible wrong answer.
+    shape would solve the first matrix's system and converge to a plausible wrong answer. The
+    one-block gate is lowered so these small systems reach the cache.
     """
+    monkeypatch.setattr(tw.linalg, "CG_ONE_BLOCK_MAX_ROWS", 0)
     first_wp, rhs_wp, first_np, rhs_np = _spd_system(device, n_rhs=1, seed=3)
     second_wp, _rhs_wp, second_np, _rhs_np = _spd_system(device, n_rhs=1, seed=4)
     for matrix_wp, dense_np in ((first_wp, first_np), (second_wp, second_np)):
@@ -565,14 +578,18 @@ def test_solver_cache_keys_on_the_operator(device: str) -> None:
         )
 
 
-def test_solver_cache_does_not_outlive_its_operator(device: str) -> None:
+def test_solver_cache_does_not_outlive_its_operator(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     Not a library comparison: a lifetime is the claim, and no reference caches a solver.
 
     The cache is keyed weakly and its states hold the operator's arrays rather than the operator,
     so dropping the last reference to the matrix drops its state -- device buffers, preconditioner
     and recorded graph. A state that held the matrix itself would keep its own key alive for ever.
+    The one-block gate is lowered so this small system reaches the cache.
     """
+    monkeypatch.setattr(tw.linalg, "CG_ONE_BLOCK_MAX_ROWS", 0)
     matrix_wp, rhs_wp, _dense_np, _rhs_np = _spd_system(device, n_rhs=1)
     solution_wp = wp.zeros_like(rhs_wp)
     tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
@@ -612,6 +629,25 @@ def test_solve_spd_block_operator_matches_numpy(device: str) -> None:
     )
     expected_np = np.linalg.solve(dense_np, rhs_np.ravel()).reshape(n_blocks, 2)
     assert np.allclose(solution_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
+
+
+def test_jacobi_preconditioner_applies_the_inverse_diagonal(device: str) -> None:
+    """
+    Class A, against NumPy's inverse diagonal of the same dense operator.
+
+    The operator builds Warp's inverse diagonal on its first apply rather than when it is built,
+    because the solves that recognize it read the diagonal themselves; so applying it directly --
+    as a caller handing it to ``warp.optim.linear`` does -- is the one path that reaches the build.
+    Applied twice, so the second apply reuses the first one's diagonal.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device, n_rhs=1)
+    operator = tw.linalg.jacobi_preconditioner(matrix_wp)
+    x_wp = twt.as_dense(rhs_wp[0])
+    expected_np = rhs_np[0] / np.diag(dense_np)
+    for _ in range(2):
+        z_wp = wp.zeros_like(x_wp)
+        operator.matvec(x_wp, z_wp, z_wp, 1.0, 0.0)
+        assert np.allclose(z_wp.numpy(), expected_np, rtol=1e-12, atol=0.0)
 
 
 @pytest.mark.parametrize("preconditioner", ["diag", "chebyshev"])
@@ -1015,16 +1051,21 @@ def _normal_equations_system(
 
 @pytest.mark.parametrize("negative", [False, True], ids=["positive_weights", "negative_weights"])
 @pytest.mark.parametrize("n_columns", [1, 3])
+@pytest.mark.parametrize("engine", ["one_block", "batched"])
 def test_squared_laplacian_preconditioner_solves_the_same_system(
-    device: str, negative: bool, n_columns: int
+    device: str, negative: bool, n_columns: int, engine: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     Class A, against ``numpy.linalg.solve``: the preconditioner changes the path, not the answer.
 
     Parametrized over the weight sign because a negative weight is what takes ``D^-1 L``'s spectrum
-    past 2, the end of a fixed Chebyshev interval, and over the column count because this
-    preconditioner routes a single column through the batched solver too.
+    past 2, the end of a fixed Chebyshev interval, over the column count because this
+    preconditioner routes a single column through the batched solver too, and over the two engines
+    a system this small can take: the one-block solve applies the same polynomial in-block, and
+    lowering its gate reaches the batched one.
     """
+    if engine == "batched":
+        monkeypatch.setattr(tw.linalg, "CG_ONE_BLOCK_MAX_ROWS", 0)
     system_wp, rhs_wp, laplacian_wp, sums_wp, system_np, rhs_np = _normal_equations_system(
         device, negative=negative, n_rhs=n_columns
     )
@@ -1041,8 +1082,9 @@ def test_squared_laplacian_preconditioner_solves_the_same_system(
 
 
 @pytest.mark.parametrize("negative", [False, True], ids=["positive_weights", "negative_weights"])
+@pytest.mark.parametrize("engine", ["one_block", "batched"])
 def test_squared_laplacian_preconditioner_needs_far_fewer_iterations(
-    device: str, negative: bool
+    device: str, negative: bool, engine: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     Not a library comparison: the reason the preconditioner exists, stated as an assertion.
@@ -1051,8 +1093,11 @@ def test_squared_laplacian_preconditioner_needs_far_fewer_iterations(
     19x and 27x fewer iterations than Jacobi. The negative-weight arm is the one that matters: with
     the polynomial's interval ending at a fixed 2 rather than at the operator's Gershgorin bound it
     still converges -- the preconditioner stays positive definite -- but in 340 iterations against
-    37, a third of Jacobi's count rather than a twenty-seventh, so only a count catches it.
+    37, a third of Jacobi's count rather than a twenty-seventh, so only a count catches it. Run
+    through both engines, since the one-block solve applies the polynomial with code of its own.
     """
+    if engine == "batched":
+        monkeypatch.setattr(tw.linalg, "CG_ONE_BLOCK_MAX_ROWS", 0)
     system_wp, rhs_wp, laplacian_wp, sums_wp, _system_np, _rhs_np = _normal_equations_system(
         device, negative=negative
     )

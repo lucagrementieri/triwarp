@@ -132,8 +132,10 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar, require_same_device
+from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import linalg as kernel_linalg
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels.algorithms import conjugate_gradient as kernel_cg
 from triwarp.kernels.algorithms import multigrid as kernel_mg
 
@@ -194,6 +196,21 @@ CG_HEAVY_ROW_ENTRIES = 16
 # ``nnz`` *capacity* -- 4.5x the true count on the ``warp.fem`` system that motivated this.
 _HEAVY_ROW_TILED_ENTRIES = 64
 _HEAVY_ROW_TILE = 64
+
+# Rows per column up to which a solve under Jacobi or the squared-Laplacian polynomial runs as one
+# launch, one block per column (``kernels/algorithms/conjugate_gradient.cg_one_block``), instead of
+# a recorded ``_BatchedCg``: a round then costs block barriers rather than replayed graph nodes,
+# and a fresh system pays no recording. The whole column lives in one SM, so the round grows with
+# the column where a replayed round stays flat. Measured on Jacobi-preconditioned heat systems
+# against an already-recorded ``_BatchedCg`` (its best case), 30 and 150 rounds: 1.5-1.8x at 642
+# rows and one column, 1.8-2.1x at three, and a loss from ~1 200 rows at one column (0.85x at
+# 1 589) and ~1 900 at three. A fresh system's recording, which this skips, moves the crossover
+# up; 1 024 keeps every measured single-column case a win. ``CG_ONE_BLOCK_WIDE_FROM`` rows and up
+# take the wider block (512 against 256 lanes: 0.84 against 0.97 ms at 1 000 rows).
+CG_ONE_BLOCK_MAX_ROWS = 1024
+CG_ONE_BLOCK_WIDE_FROM = 768
+_CG_ONE_BLOCK_NARROW = 256
+_CG_ONE_BLOCK_WIDE = 512
 
 # Solver states kept per operator by ``_cached_solver``. One operator is normally solved under one
 # configuration; the bound is there so a long-lived operator solved under many cannot accumulate
@@ -641,6 +658,18 @@ def _solve_spd_batched(
         matrix = _scalar_expansion(matrix)
         rhs = _as_scalar_view(rhs)
         solution = _as_scalar_view(solution)
+    if _one_block_eligible(matrix, int(rhs.shape[0]), kind):
+        result = _cg_one_block(
+            matrix,
+            rhs,
+            solution,
+            1,
+            tol=tol,
+            maxiter=cap,
+            check_every=check_every,
+            preconditioner=kind,
+        )
+        return cast("tuple[int, float, float]", result)
     solver = _cached_solver(
         matrix, 1, tol=tol, maxiter=cap, check_every=_supported_check_every(0), preconditioner=kind
     )
@@ -734,7 +763,17 @@ def jacobi_preconditioner(matrix: wps.BsrMatrix[Any]) -> wpl.LinearOperator:
     [`chebyshev_preconditioner`][triwarp.linalg.chebyshev_preconditioner]
     [`solve_spd`][triwarp.linalg.solve_spd]
     """
-    operator = wpl.preconditioner(matrix, "diag")
+    # Built on the first apply rather than here: every solve that recognizes the tag reads the
+    # diagonal itself, so the inverse diagonal ``warp.optim.linear`` would extract -- a diagonal
+    # gather, an allocation and a launch -- is needed only by a caller applying the operator.
+    built: list[wpl.LinearOperator] = []
+
+    def matvec(x: twt.ArrayNd, y: twt.ArrayNd, z: twt.ArrayNd, alpha: float, beta: float) -> None:
+        if not built:
+            built.append(wpl.preconditioner(matrix, "diag"))
+        built[0].matvec(x, y, z, alpha, beta)
+
+    operator = wpl.LinearOperator(matrix.shape, matrix.scalar_type, matrix.device, matvec)
     _tag_preconditioner(operator, matrix, "diag")
     return operator
 
@@ -991,6 +1030,126 @@ def spd_column_solver(
     )
 
 
+def solve_spd_settled(
+    matrix: wps.BsrMatrix[Any],
+    rhs: twt.ArrayNd,
+    solution: twt.ArrayNd,
+    *,
+    check_rounds: int,
+    change_tolerance: float,
+    settle_rounds: int,
+    maxiter: int | None = None,
+    preconditioner: wpl.LinearOperator | None = None,
+) -> wp.array[wp.int32]:
+    """
+    Run Jacobi conjugate gradient until every entry of the solution has settled relative to itself.
+
+    A stopping rule for systems whose solution spans many orders of magnitude, where a residual
+    tolerance says nothing about the small entries: the heat method's diffusions, whose far field
+    sits hundreds of orders of magnitude below the source and is still zero, or noise, long after
+    the residual has converged. The solve runs at a zero residual tolerance, one continuous
+    iteration, and every ``check_rounds`` rounds compares the iterate with the one ``check_rounds``
+    earlier: it stops once no entry has newly become non-zero and none moved by
+    ``change_tolerance`` or more of its own value -- or ``settle_rounds`` rounds after the count of
+    non-zero entries last changed, the bound for an entry that never settles because it cancels
+    toward zero. Or at ``maxiter``.
+
+    The iteration reads a ``float64`` operator's values in ``float32``, widened as they are read
+    and accumulated in ``float64``: past a few tens of thousands of rows a round is bound by its
+    bytes and the values are its largest stream. The system solved therefore differs from
+    ``matrix`` by one rounding per stored entry, which on the heat method's operators is orders of
+    magnitude below the method's own discretization error. The residual, the iterate and every
+    reduction stay ``float64``.
+
+    The check is tested on the device, inside the solve's recorded loop, so nothing is read back.
+    As with [`solve_spd`][triwarp.linalg.solve_spd], the solver state is kept for ``matrix``'s
+    lifetime and a later solve against it replays the recorded loop.
+
+    Parameters
+    ----------
+    matrix
+        Symmetric positive-definite operator, scalar ``float64`` or ``wp.mat22d``-block.
+    rhs
+        Right-hand side: ``(n,)`` ``float64`` or ``wp.vec2d`` matching ``matrix``, or
+        ``(n_columns, n)`` ``float64`` columns against a scalar ``matrix``, solved together.
+    solution
+        Initial guess, overwritten with the result. Same shape and dtype as ``rhs``, contiguous.
+    check_rounds
+        Rounds between checks.
+    change_tolerance
+        Largest relative change per entry over ``check_rounds`` rounds that counts as settled.
+    settle_rounds
+        Rounds after the non-zero count last changed at which the solve stops regardless.
+    maxiter
+        Iteration cap. When ``None``, uses
+        [`CG_MAXITER_FACTOR`][triwarp.linalg.CG_MAXITER_FACTOR] times the number of rows.
+    preconditioner
+        ``None``, or the operator [`jacobi_preconditioner`][triwarp.linalg.jacobi_preconditioner]
+        built for ``matrix``: the solve is Jacobi-preconditioned either way.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        One-element device array holding the rounds that took a step. It belongs to the solver
+        state kept for ``matrix`` and is overwritten by the next solve against it.
+
+    Raises
+    ------
+    ValueError
+        If ``matrix`` and ``rhs`` are not one of the three pairings above, or ``preconditioner`` is
+        not ``None`` or ``matrix``'s own Jacobi preconditioner.
+    RuntimeError
+        If ``rhs`` and ``solution`` are not all on one device.
+
+    See Also
+    --------
+    [`solve_spd`][triwarp.linalg.solve_spd]
+    [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
+    """
+    require_same_device(rhs=rhs, solution=solution)
+    columns = rhs.ndim == 2
+    if columns:
+        if (
+            matrix.values.dtype != wp.float64
+            or rhs.dtype != wp.float64
+            or preconditioner is not None
+        ):
+            raise ValueError(
+                "solve_spd_settled solves (n_columns, n) float64 columns against a float64 matrix "
+                "with no preconditioner argument"
+            )
+        n_columns, n_rows = int(rhs.shape[0]), int(rhs.shape[1])
+        rhs_flat, solution_flat = rhs.flatten(), solution.flatten()
+    else:
+        dtype_ok = (matrix.values.dtype, rhs.dtype) in (
+            (wp.float64, wp.float64),
+            (wp.mat22d, wp.vec2d),
+        )
+        if not dtype_ok or _batched_preconditioner_kind(matrix, rhs, preconditioner) != "diag":
+            raise ValueError(
+                "solve_spd_settled solves a float64 or wp.mat22d system under its own Jacobi "
+                "preconditioner"
+            )
+        n_columns, n_rows = 1, int(rhs.shape[0])
+        rhs_flat, solution_flat = rhs, solution
+        if matrix.values.dtype == wp.mat22d:
+            # Solved as its scalar expansion, as ``solve_spd`` does (``_solve_spd_batched``).
+            matrix = _scalar_expansion(matrix)
+            rhs_flat, solution_flat = _as_scalar_view(rhs), _as_scalar_view(solution)
+    solver = _cached_solver(
+        matrix,
+        n_columns,
+        tol=0.0,
+        maxiter=CG_MAXITER_FACTOR * n_rows if maxiter is None else maxiter,
+        check_every=_supported_check_every(0),
+        preconditioner="diag",
+        settle=(int(check_rounds), float(change_tolerance), int(settle_rounds)),
+        narrow_values=True,
+    )
+    solver.solve(rhs_flat, solution_flat)
+    return solver._iterations
+
+
 @overload
 def _cg_columns(
     matrix: wps.BsrMatrix[wp.float64],
@@ -1095,6 +1254,17 @@ def _cg_columns(
     # other way by a factor of two. Do not reintroduce it without deflation and a measurement on
     # a graded mesh.
     supported = _supported_check_every(check_every)
+    if run and _one_block_eligible(matrix, n, preconditioner):
+        return _cg_one_block(
+            matrix,
+            rhs.flatten(),
+            solution.flatten(),
+            n_columns,
+            tol=tol,
+            maxiter=iteration_cap,
+            check_every=supported,
+            preconditioner=preconditioner,
+        )
     if not run:
         return _BatchedCg(
             matrix,
@@ -1127,6 +1297,95 @@ def _cg_columns(
         preconditioner=preconditioner,
     )
     return cast("tuple[int, float, float]", state.solve(rhs.flatten(), solution.flatten()))
+
+
+def _one_block_eligible(
+    matrix: wps.BsrMatrix[Any], n: int, preconditioner: str | SquaredLaplacianPreconditioner
+) -> bool:
+    """Whether a solve can run as ``_cg_one_block``: small, compact ``float64``, a fitting one."""
+    fitting = isinstance(preconditioner, SquaredLaplacianPreconditioner) or preconditioner == "diag"
+    return (
+        fitting
+        and 0 < n <= CG_ONE_BLOCK_MAX_ROWS
+        and matrix.values.dtype == wp.float64
+        and matrix.row_counts is None
+    )
+
+
+def _cg_one_block(
+    matrix: wps.BsrMatrix[wp.float64],
+    rhs: wp.array[wp.float64],
+    solution: wp.array[wp.float64],
+    n_columns: int,
+    *,
+    tol: float,
+    maxiter: int,
+    check_every: int,
+    preconditioner: str | SquaredLaplacianPreconditioner,
+) -> tuple[Any, Any, Any]:
+    """
+    Solve a small system in one launch, one block per column (``kernel_cg.cg_one_block``).
+
+    ``rhs`` and ``solution`` are the flat ``n_columns * n`` views of the caller's contiguous
+    buffers, and ``solution`` is the initial guess, overwritten. Returns ``_BatchedCg``'s three
+    values on the same terms: device arrays -- the round count and each column's squared residual
+    and threshold -- under a zero ``check_every`` on a CUDA device, host scalars otherwise.
+    """
+    device = matrix.device
+    n = int(matrix.nrow)
+    total = n_columns * n
+    polynomial = isinstance(preconditioner, SquaredLaplacianPreconditioner)
+    factor = factor_t = None
+    factor_values = factor_t_values = steps = narrow = None
+    if isinstance(preconditioner, SquaredLaplacianPreconditioner):
+        factor, factor_t = preconditioner._factor, preconditioner._factor_t
+        factor_values, factor_t_values = preconditioner.narrowed()
+        steps = preconditioner._steps
+        narrow = wp.empty(kernel_cg.ONE_BLOCK_NARROW_SLOTS * total, dtype=wp.float32, device=device)
+    # One buffer for the working vectors and the two per-column results, which the kernel writes
+    # before anything reads them.
+    scratch = wp.empty(
+        kernel_cg.ONE_BLOCK_SLOTS * total + 2 * n_columns, dtype=wp.float64, device=device
+    )
+    results = twt.as_dense(scratch[kernel_cg.ONE_BLOCK_SLOTS * total :])
+    residual, threshold = twt.as_dense(results[:n_columns]), twt.as_dense(results[n_columns:])
+    iterations = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch_tiled(
+        kernel_cg.cg_one_block,
+        dim=[n_columns],
+        inputs=[
+            wp.int32(n),
+            wp.int32(n_columns),
+            wp.int32(maxiter),
+            wp.float64(tol * tol),
+            matrix.offsets,
+            matrix.columns,
+            matrix.values,
+            wp.int32(1 if polynomial else 0),
+            None if factor is None else factor.offsets,
+            None if factor is None else factor.columns,
+            factor_values,
+            None if factor_t is None else factor_t.offsets,
+            None if factor_t is None else factor_t.columns,
+            factor_t_values,
+            steps,
+            rhs,
+            scratch,
+            narrow,
+        ],
+        outputs=[solution, iterations, residual, threshold],
+        block_dim=_CG_ONE_BLOCK_WIDE if n >= CG_ONE_BLOCK_WIDE_FROM else _CG_ONE_BLOCK_NARROW,
+        device=device,
+    )
+    if check_every == 0 and device.is_cuda:
+        return iterations, residual, threshold
+    # The first read drains the launch; the second is then nearly free.
+    results_np = results.numpy()
+    return (
+        int(iterations.numpy()[0]),
+        math.sqrt(float(results_np[:n_columns].max())),
+        math.sqrt(float(results_np[n_columns:].max())),
+    )
 
 
 def _cg_columns_auto(
@@ -1404,6 +1663,8 @@ class _BatchedCg:
         maxiter: int,
         check_every: int,
         preconditioner: str | SquaredLaplacianPreconditioner = "diag",
+        settle: tuple[int, float, int] | None = None,
+        narrow_values: bool = False,
     ) -> None:
         device = matrix.device
         self._device = device
@@ -1430,6 +1691,19 @@ class _BatchedCg:
         self._mv_tile = _HEAVY_ROW_TILE if entries > _HEAVY_ROW_TILED_ENTRIES * self._n else -1
         self._stride = self._blocks * self._span
         self._dofs = self._n_columns * self._stride
+        # The values the fused mat-vec reads: the operator's own, or -- ``narrow_values``, taken by
+        # the heat diffusions (``solve_spd_settled``) -- a ``float32`` copy of a ``float64``
+        # operator's, widened as each is read (``multigrid.csr_row_dot``). Past a few tens of
+        # thousands of rows a round is bound by its bytes, and the values are the largest stream;
+        # the operator it then solves differs by one rounding per entry, which moved the heat
+        # method's distance by 2e-8 of its range and its transported directions by 1e-4 degrees.
+        # A copy, so values rewritten in place after construction are not seen: the settle solves
+        # never rewrite theirs. The ``bsr_mv`` path of a heavy-row column and every
+        # preconditioner read the operator as stored.
+        self._round_values = matrix.values
+        if narrow_values and matrix.values.dtype == wp.float64 and not self._heavy:
+            self._round_values = wp.empty(matrix.values.shape, dtype=wp.float32, device=device)
+            wp.utils.array_cast(matrix.values, self._round_values)
 
         self._rhs = rhs
         self._solution = solution
@@ -1533,6 +1807,52 @@ class _BatchedCg:
         # graph.
         self._graph = None
 
+        # The settle monitor ``solve_spd_settled`` runs (``check_rounds``, ``change_tolerance``,
+        # ``settle_rounds``): every ``check_rounds`` rounds ``cg_settle_change`` compares the
+        # iterate with the one ``check_rounds`` earlier and ``cg_settle_decide`` may clear the
+        # loop condition -- two launches a check, inside the same recorded loop, so a solve that
+        # stops on it never reads back. ``_settle`` is reset by one memset per solve; ``previous``
+        # needs none, since the first check never stops (``SETTLE_PREVIOUS``).
+        self._settle = settle
+        if settle is not None:
+            self._settle_previous = wp.zeros(self._n_columns * self._n, dtype=dtype, device=device)
+            self._settle_state = wp.zeros(
+                kernel_cg.SETTLE_STATE_SIZE, dtype=wp.float64, device=device
+            )
+
+    def _settle_check(self) -> None:
+        """Issue the settle monitor's two launches, after a block of ``check_rounds`` rounds."""
+        assert self._settle is not None
+        check_rounds, change_tolerance, settle_rounds = self._settle
+        n = self._n_columns * self._n
+        wp.launch_tiled(
+            kernel_cg.cg_settle_change,
+            dim=[kernel_reduce.blocks_1d(n)],
+            inputs=[self._solution_flat, self._settle_previous],
+            outputs=[self._settle_state],
+            block_dim=TILE_1D,
+            device=self._device,
+        )
+        wp.launch(
+            kernel_cg.cg_settle_decide,
+            dim=1,
+            inputs=[
+                wp.int32(check_rounds),
+                wp.float64(change_tolerance),
+                wp.int32(settle_rounds),
+                self._settle_state,
+                self._state,
+            ],
+            device=self._device,
+        )
+
+    def _settle_block(self) -> None:
+        """Run the recorded loop body under a settle monitor: ``check_rounds`` rounds, a check."""
+        assert self._settle is not None
+        for _ in range(self._settle[0]):
+            self._iteration()
+        self._settle_check()
+
     def _iteration(self) -> None:
         """
         One Chronopoulos-Gear round, none of which reads back to the host.
@@ -1565,7 +1885,7 @@ class _BatchedCg:
             )
         else:
             wp.launch_tiled(
-                kernel_cg.CG_MATVEC_DOTS[self._dtype],
+                kernel_cg.CG_MATVEC_DOTS[self._dtype, self._round_values.dtype],
                 dim=grid,
                 inputs=[
                     wp.int32(self._n),
@@ -1573,7 +1893,7 @@ class _BatchedCg:
                     wp.int32(self._span),
                     self._matrix.offsets,
                     self._matrix.columns,
-                    self._matrix.values,
+                    self._round_values,
                     self._r,
                     self._u,
                     self._gamma_new,
@@ -1656,7 +1976,7 @@ class _BatchedCg:
         tile = int(kernel_cg.CG_TILE)
         jacobi = self._cycle is None
         wp.launch_tiled(
-            kernel_cg.CG_INITIAL[self._dtype],
+            kernel_cg.CG_INITIAL[self._dtype, self._round_values.dtype],
             dim=(self._n_columns, self._blocks),
             inputs=[
                 wp.int32(self._n),
@@ -1665,7 +1985,7 @@ class _BatchedCg:
                 wp.int32(1 if jacobi else 0),
                 self._matrix.offsets,
                 self._matrix.columns,
-                self._matrix.values,
+                self._round_values,
                 self._rhs_flat,
                 self._solution_flat,
                 self._inv_diag if jacobi else None,
@@ -1695,6 +2015,8 @@ class _BatchedCg:
         )
         if self._cycle is not None:
             self._cycle.apply(self._r, self._u)
+        if self._settle is not None:
+            self._settle_state.zero_()
 
     def __call__(self):
         """
@@ -1715,9 +2037,13 @@ class _BatchedCg:
         if self._graph is None:
             condition = self._state[kernel_array.LOOP_CONDITION_VIEW]
             # One iteration per conditional-graph test, not a batched run of them: see the note
-            # above ``CG_CHECK_EVERY`` for the sweep that removed the batching.
+            # above ``CG_CHECK_EVERY`` for the sweep that removed the batching. A settle monitor is
+            # the exception: its check needs a block of rounds between tests anyway, and a round
+            # after the loop's own stop takes no step (``cg_step_scalars``), so the block costs at
+            # most ``check_rounds - 1`` idle rounds at the very end.
+            body = self._iteration if self._settle is None else self._settle_block
             with wp.ScopedCapture(self._device) as capture:
-                wp.capture_while(condition, self._iteration)
+                wp.capture_while(condition, body)
             self._graph = capture.graph
         wp.capture_launch(self._graph)
         return self._iterations, self._dots_rz, self._atol_sq
@@ -1754,12 +2080,17 @@ class _BatchedCg:
         Returns ``warp.optim.linear.cg``'s three host scalars. The count is the rounds that took a
         step, and the residual is the one the last round measured.
         """
+        if self._settle is not None:
+            # The monitor's check is the cadence: it is what can stop the loop early.
+            check_every = self._settle[0]
         done = 0
         while done < self._maxiter:
             block = min(check_every, self._maxiter - done)
             for _ in range(block):
                 self._iteration()
             done += block
+            if self._settle is not None:
+                self._settle_check()
             if not int(self._state.numpy()[int(kernel_array.LOOP_CONDITION)]):
                 break
         # The first read of a block drains the queue its launches filled; these follow it.
@@ -1785,6 +2116,8 @@ def _cached_solver(
     maxiter: int,
     check_every: int,
     preconditioner: str,
+    settle: tuple[int, float, int] | None = None,
+    narrow_values: bool = False,
 ) -> _BatchedCg:
     """
     Return the ``_BatchedCg`` state for this operator and configuration, built on first use.
@@ -1811,6 +2144,8 @@ def _cached_solver(
         int(maxiter),
         int(check_every),
         preconditioner,
+        settle,
+        narrow_values,
         id(matrix.offsets),
         id(matrix.columns),
         id(matrix.values),
@@ -1828,6 +2163,8 @@ def _cached_solver(
             maxiter=maxiter,
             check_every=check_every,
             preconditioner=preconditioner,
+            settle=settle,
+            narrow_values=narrow_values,
         )
         while len(entries) >= _SOLVER_CACHE_ENTRIES:
             entries.pop(next(iter(entries)))
@@ -1838,15 +2175,7 @@ def _cached_solver(
 
 def _storage_alias(matrix: wps.BsrMatrix[Any]) -> wps.BsrMatrix[Any]:
     """Build a second ``BsrMatrix`` over ``matrix``'s arrays, holding them and not ``matrix``."""
-    alias = wps.bsr_zeros(
-        int(matrix.nrow), int(matrix.ncol), matrix.values.dtype, device=matrix.device
-    )
-    alias.offsets = matrix.offsets
-    alias.columns = matrix.columns
-    alias.values = matrix.values
-    alias.row_counts = matrix.row_counts
-    alias.notify_nnz_changed(nnz=int(matrix.nnz))
-    return alias
+    return bsr_with_values(matrix, matrix.values)
 
 
 def _tag_preconditioner(
@@ -1854,6 +2183,52 @@ def _tag_preconditioner(
 ) -> None:
     """Mark ``operator`` as this module's ``kind`` preconditioner for ``matrix`` (``solve_spd``)."""
     operator._triwarp_preconditioner = (kind, weakref.ref(matrix))
+
+
+def bsr_with_values(matrix: wps.BsrMatrix[Any], values: wp.array[Any]) -> wps.BsrMatrix[Any]:
+    """
+    Build a sparse matrix with ``matrix``'s sparsity pattern and the given block values.
+
+    The pattern is **shared**, not copied: the result holds ``matrix``'s ``offsets``, ``columns``
+    and ``row_counts`` arrays, and ``matrix`` itself is not referenced. It is how a system whose
+    pattern is known to equal an existing operator's -- a mass-plus-stiffness system over a
+    Laplacian that already stores every diagonal -- is built without merging two patterns.
+
+    Parameters
+    ----------
+    matrix
+        The operator whose pattern the result takes. Rewriting that pattern in place afterwards
+        rewrites the result's too.
+    values
+        One block per stored entry of ``matrix``, laid out as ``matrix.values`` is; its dtype is the
+        result's block type.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        ``matrix.nrow x matrix.ncol`` blocks, with ``matrix``'s stored entry count.
+
+    Raises
+    ------
+    ValueError
+        If ``values`` does not hold one block per stored entry of ``matrix``.
+
+    See Also
+    --------
+    [`replicated_operator`][triwarp.linalg.replicated_operator]
+    """
+    if values.shape[0] != matrix.values.shape[0]:
+        raise ValueError(
+            f"values must hold one block per stored entry ({matrix.values.shape[0]}), got "
+            f"{values.shape[0]}"
+        )
+    result = wps.bsr_zeros(int(matrix.nrow), int(matrix.ncol), values.dtype, device=matrix.device)
+    result.offsets = matrix.offsets
+    result.columns = matrix.columns
+    result.values = values
+    result.row_counts = matrix.row_counts
+    result.notify_nnz_changed(nnz=int(matrix.nnz))
+    return result
 
 
 def replicated_operator(
@@ -2232,6 +2607,9 @@ class SquaredLaplacianPreconditioner:
         # lower end scales with it, so the interval is the same *relative* one whatever ``D``'s
         # units: the polynomial in ``c M_ff`` is ``c`` times the one in ``M_ff``, and conjugate
         # gradient's iterates do not see a constant factor on the preconditioner.
+        # The bound, the interval and the steps stay on the device (``_device_chebyshev_steps``):
+        # the interval is ``[min(SQUARED_LAPLACIAN_INTERVAL / n, SQUARED_LAPLACIAN_INTERVAL_CAP) *
+        # upper / 2, upper]`` with ``upper = max(bound, 2)``.
         ratios = twt.empty_1d(self._n, wp.float64, device=self._device)
         wp.launch(
             kernel_linalg.scaled_row_abs_sums,
@@ -2239,15 +2617,33 @@ class SquaredLaplacianPreconditioner:
             inputs=[laplacian.offsets, laplacian.values, weight_sums, ratios],
             device=self._device,
         )
-        upper = max(float(tw.reduce.max(ratios)), 2.0) if self._n > 0 else 2.0
-        lower = min(
-            SQUARED_LAPLACIAN_INTERVAL / max(self._n, 1), SQUARED_LAPLACIAN_INTERVAL_CAP
-        ) * (upper / 2.0)
-        self._steps = _chebyshev_steps(lower, upper, SQUARED_LAPLACIAN_DEGREE)
+        self._steps = _device_chebyshev_steps(
+            ratios, SQUARED_LAPLACIAN_INTERVAL, SQUARED_LAPLACIAN_DEGREE, squared=True
+        )
+        self._narrowed: tuple[wp.array[wp.float32], wp.array[wp.float32]] | None = None
 
     def bind(self, n_columns: int, stride: int) -> _SquaredLaplacianApply:
         """Working vectors for ``n_columns`` blocks at column pitch ``stride``."""
         return _SquaredLaplacianApply(self, n_columns, stride)
+
+    def narrowed(self) -> tuple[wp.array[wp.float32], wp.array[wp.float32]]:
+        """
+        Return ``B``'s and ``Bᵀ``'s values in ``float32``, built once.
+
+        What ``_cg_one_block`` applies the polynomial with: see
+        ``kernels/algorithms/conjugate_gradient.one_block_precondition`` for why in ``float32``.
+        """
+        if self._narrowed is None:
+            factor = twt.empty_1d(
+                int(self._factor.values.shape[0]), wp.float32, device=self._device
+            )
+            factor_t = twt.empty_1d(
+                int(self._factor_t.values.shape[0]), wp.float32, device=self._device
+            )
+            wp.utils.array_cast(self._factor.values.flatten(), factor)
+            wp.utils.array_cast(self._factor_t.values.flatten(), factor_t)
+            self._narrowed = (factor, factor_t)
+        return cast("tuple[wp.array[wp.float32], wp.array[wp.float32]]", self._narrowed)
 
 
 class _ChebyshevApply:
@@ -2260,12 +2656,7 @@ class _ChebyshevApply:
     """
 
     def __init__(
-        self,
-        n: int,
-        n_columns: int,
-        stride: int,
-        steps: list[tuple[float, float, float, float]],
-        device: wp.DeviceLike,
+        self, n: int, n_columns: int, stride: int, steps: wp.array[wp.vec4d], device: wp.DeviceLike
     ) -> None:
         self._n = n
         self._stride = stride
@@ -2296,18 +2687,17 @@ class _ChebyshevApply:
         # ``chebyshev_step``.
         previous, current = source, source
         free = list(self._spare)
-        for index, (scale, previous_scale, momentum, step) in enumerate(steps):
-            target = destination if index == len(steps) - 1 else free.pop()
+        n_steps = int(steps.shape[0])
+        for index in range(n_steps):
+            target = destination if index == n_steps - 1 else free.pop()
             wp.launch(
                 kernel_mg.chebyshev_step,
                 dim=self._dim,
                 inputs=[
                     wp.int32(self._n),
                     wp.int32(self._stride),
-                    wp.float64(scale),
-                    wp.float64(previous_scale),
-                    wp.float64(momentum),
-                    wp.float64(step),
+                    steps,
+                    wp.int32(index),
                     factor.offsets,
                     factor.columns,
                     factor.values,
@@ -2366,13 +2756,12 @@ class _JacobiChebyshev:
         # (a heat system's mass-plus-stiffness) also has ``1 - max r`` as a lower bound, which is
         # far tighter than the ``1 / n`` scale a Laplacian's smallest eigenvalue falls at.
         # The radius is floored so that a diagonal operator still has an interval to fit.
-        dominance = max(float(tw.reduce.max(ratios)) if self._n > 0 else 0.0, 1e-3)
-        lower = max(
-            min(CHEBYSHEV_INTERVAL / max(self._n, 1), SQUARED_LAPLACIAN_INTERVAL_CAP),
-            1.0 - dominance,
+        # So the interval is ``[max(min(CHEBYSHEV_INTERVAL / n, SQUARED_LAPLACIAN_INTERVAL_CAP),
+        # 1 - r), 1 + r]`` with ``r = max(max_i r_i, 1e-3)``, computed on the device
+        # (``_device_chebyshev_steps``).
+        self._steps = _device_chebyshev_steps(
+            ratios, CHEBYSHEV_INTERVAL, CHEBYSHEV_DEGREE, squared=False
         )
-        upper = 1.0 + dominance
-        self._steps = _chebyshev_steps(lower, upper, CHEBYSHEV_DEGREE)
 
     def bind(self, n_columns: int, stride: int) -> _JacobiChebyshevApply:
         """Working vectors for ``n_columns`` blocks at column pitch ``stride``."""
@@ -2421,27 +2810,43 @@ class _JacobiChebyshevApply(_ChebyshevApply):
         self.apply_scaled(destination)
 
 
-def _chebyshev_steps(
-    lower: float, upper: float, degree: int
-) -> list[tuple[float, float, float, float]]:
+def _device_chebyshev_steps(
+    ratios: wp.array[wp.float64], interval: float, degree: int, *, squared: bool
+) -> wp.array[wp.vec4d]:
     """
-    ``(scale, previous_scale, momentum, step)`` for each launch of a degree-``degree`` polynomial.
+    Fit a degree-``degree`` Chebyshev semi-iteration's steps on the device.
 
-    The Chebyshev semi-iteration on ``[lower, upper]`` started from zero, whose ``degree``-th
-    iterate is ``p(A) source`` for the polynomial approximating ``1 / x`` there. The scalars depend
-    on the interval alone, so they are host constants; the first iterate, ``source / theta``, is
-    folded into the first two launches' scales rather than written (see ``chebyshev_step``).
+    ``ratios`` holds each row's Gershgorin quantity; its maximum is reduced into a device scalar and
+    ``kernels/linalg.chebyshev_steps`` fits the interval and writes one ``(scale, previous_scale,
+    momentum, step)`` per launch of the polynomial, so building a preconditioner reads nothing
+    back. ``squared`` picks the squared-Laplacian interval over the Jacobi-Chebyshev one; see
+    that kernel for both.
     """
-    theta, delta = 0.5 * (upper + lower), 0.5 * (upper - lower)
-    sigma = theta / delta
-    rho = 1.0 / sigma
-    steps: list[tuple[float, float, float, float]] = []
-    for index in range(degree - 1):
-        rho_next = 1.0 / (2.0 * sigma - rho)
-        scale = 1.0 / theta if index == 0 else 1.0
-        previous_scale = (0.0, 1.0 / theta)[index] if index < 2 else 1.0
-        steps.append((scale, previous_scale, rho_next * rho, 2.0 * rho_next / delta))
-        rho = rho_next
+    device = ratios.device
+    n = int(ratios.shape[0])
+    bound = wp.full(1, -math.inf, dtype=wp.float64, device=device)
+    if n > 0:
+        wp.launch_tiled(
+            kernel_reduce.MAX1D_TILED[wp.float64],
+            dim=[kernel_reduce.blocks_1d(n)],
+            inputs=[ratios, bound],
+            block_dim=TILE_1D,
+            device=device,
+        )
+    steps = wp.empty(degree - 1, dtype=wp.vec4d, device=device)
+    wp.launch(
+        kernel_linalg.chebyshev_steps,
+        dim=1,
+        inputs=[
+            bound,
+            wp.int32(n),
+            wp.int32(1 if squared else 0),
+            wp.float64(interval),
+            wp.float64(SQUARED_LAPLACIAN_INTERVAL_CAP),
+        ],
+        outputs=[steps],
+        device=device,
+    )
     return steps
 
 

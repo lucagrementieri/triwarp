@@ -507,6 +507,7 @@ def point_to_plane_tile(
     max_distance: wp.float32,
     robust_kind: wp.int32,
     robust_scale: wp.float32,
+    gather: wp.int32,
     offset: wp.int32,
     remaining: wp.int32,
     lane: wp.int32,
@@ -515,6 +516,14 @@ def point_to_plane_tile(
     # ``lane`` / ``stride`` rather than ``wp.block_dim()`` because this is a ``@wp.func``: the
     # caller is the kernel that knows its own launch shape, and passing the stride in keeps this
     # usable from a serial caller too.
+    #
+    # ``gather`` selects where a correspondence's target point and normal are read. Unset, they
+    # are ``target[idx]`` / ``normals[idx]``, one per correspondence, which is what a mesh target's
+    # correspondence pass writes. Set, ``target`` and ``normals`` are a cloud target's own vertices
+    # and per-vertex normals and are read at the nearest-neighbour index ``triangle_id[idx]`` --
+    # what ``cloud_correspondence_pass`` would have gathered into the per-correspondence buffers,
+    # read here directly so the gather is not a launch of its own. A valid correspondence has a
+    # non-negative index, so this is that pass's read exactly.
     count = wp.min(remaining, ITEMS_PER_BLOCK_1D)
     jtj = wp.spatial_matrix(wp.float32(0.0))
     jtr = wp.spatial_vector(
@@ -542,9 +551,12 @@ def point_to_plane_tile(
         # ``wp.normalize`` on that entry is ``0/0``, and one poisoned lane's NaN spreads to the
         # whole block through the ``wp.tile_sum`` commit below. Same guard, same zero tolerance,
         # as ``transform.transform_normal_mat33``'s identical hazard.
-        nrm = normalize_or_zero(normals[idx], wp.float32(0.0))
+        row = idx
+        if gather != 0:
+            row = triangle_id[idx]
+        nrm = normalize_or_zero(normals[row], wp.float32(0.0))
         x = source[idx]
-        r = point_to_plane_residual(x, target[idx], nrm)
+        r = point_to_plane_residual(x, target[row], nrm)
         w, loss = robust_weight_and_loss(r, robust_scale, robust_kind)
         # Jacobian of the point-to-plane residual: [x x n ; n]
         j = wp.spatial_vector(wp.cross(x, nrm), nrm)
@@ -565,6 +577,7 @@ def accumulate_point_to_plane(
     max_distance: wp.float32,
     robust_kind: wp.int32,
     robust_scale: wp.float32,
+    gather: wp.int32,
     out_jtj: wp.array[wp.spatial_matrix],
     out_jtr: wp.array[wp.spatial_vector],
     out_scalars: wp.array[wp.float32],
@@ -589,6 +602,7 @@ def accumulate_point_to_plane(
     if remaining <= 0:
         return
 
+    # ``gather``: see ``point_to_plane_tile``.
     tile_jtj, tile_jtr, tile_cost, tile_weight_sum = point_to_plane_tile(
         source,
         target,
@@ -598,6 +612,7 @@ def accumulate_point_to_plane(
         max_distance,
         robust_kind,
         robust_scale,
+        gather,
         offset,
         remaining,
         lane,

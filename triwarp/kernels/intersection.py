@@ -1066,19 +1066,21 @@ def marching_triangles_segments(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     values: wp.array[wp.Float],
+    isovalue: wp.Float,
     key_base: wp.int64,
     out_valid: wp.array[wp.bool],
     out_segments: wp.array2d[wp.vec3],
     out_edges: wp.array2d[wp.int64],
 ) -> None:
-    # One thread per face. ``values`` is the field with the isovalue already subtracted, and a value
-    # of exactly zero counts as positive, so every cut face has exactly one vertex alone in sign and
-    # yields exactly one segment: the two edges incident to that vertex are the crossed ones.
+    # One thread per face. Each value is re-zeroed at ``isovalue`` in the field's own precision as
+    # it is read, and a value of exactly zero counts as positive, so every cut face has exactly one
+    # vertex alone in sign and yields exactly one segment: the two edges incident to that vertex
+    # are the crossed ones.
     f = wp.int32(wp.tid())
     i0, i1, i2 = kernel_triangles.corner_triple(faces, f)
-    d0 = values[i0]
-    d1 = values[i1]
-    d2 = values[i2]
+    d0 = values[i0] - isovalue
+    d1 = values[i1] - isovalue
+    d2 = values[i2] - isovalue
 
     # A NaN field value (an unreachable vertex in a heat-distance field, say) must be rejected
     # before the sign test below, not after: ``NaN >= 0.0`` is ``False`` under IEEE-754, so it would
@@ -1107,16 +1109,19 @@ def marching_triangles_segments(
     next_index = (lone + wp.int32(1)) % wp.int32(3)
     prev_index = (lone + wp.int32(2)) % wp.int32(3)
 
-    vertex_lone = faces[f * 3 + lone]
-    vertex_next = faces[f * 3 + next_index]
-    vertex_prev = faces[f * 3 + prev_index]
-    value_lone = values[vertex_lone]
+    # The corners and their re-zeroed values, indexed by local corner: already in registers.
+    corners = wp.vec3i(i0, i1, i2)
+    shifted = wp.vector(d0, d1, d2)
+    vertex_lone = corners[lone]
+    vertex_next = corners[next_index]
+    vertex_prev = corners[prev_index]
+    value_lone = shifted[lone]
 
     point_next = crossing_point(
-        value_lone, values[vertex_next], vertices[vertex_lone], vertices[vertex_next]
+        value_lone, shifted[next_index], vertices[vertex_lone], vertices[vertex_next]
     )
     point_prev = crossing_point(
-        value_lone, values[vertex_prev], vertices[vertex_lone], vertices[vertex_prev]
+        value_lone, shifted[prev_index], vertices[vertex_lone], vertices[vertex_prev]
     )
     # Halfedge ``3f + k`` spans local corners ``k`` and ``k + 1``, so the edge from ``lone`` to the
     # next corner joins ``vertex_lone`` to ``vertex_next``, and the edge from the previous corner to
@@ -1176,6 +1181,7 @@ def _register_overloads() -> None:
                 wp.array[wp.vec3],
                 wp.array[wp.int32],
                 wp.array[d],
+                d,
                 wp.int64,
                 wp.array[wp.bool],
                 wp.array2d[wp.vec3],

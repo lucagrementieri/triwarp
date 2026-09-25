@@ -347,6 +347,53 @@ def expand_block_csr_2x2(
         out_offsets[2 * i + 2] = 4 * offsets[i + 1]
 
 
+@wp.kernel
+def chebyshev_steps(
+    bound: wp.array[wp.float64],
+    n: wp.int32,
+    squared: wp.int32,
+    interval: wp.float64,
+    cap: wp.float64,
+    out_steps: wp.array[wp.vec4d],
+) -> None:
+    # ``(scale, previous_scale, momentum, step)`` for each launch of a Chebyshev semi-iteration, one
+    # thread, from a Gershgorin bound left on the device -- so a preconditioner is built without
+    # reading its interval back, which would drain everything queued ahead of it. ``bound[0]`` is
+    # ``max_i sum_j |L_ij| / D_i`` for the squared-Laplacian polynomial (``squared`` set) and the
+    # largest off-diagonal ratio for the Jacobi-Chebyshev one; ``-inf`` for an empty operator.
+    # Every scalar is the host arithmetic ``linalg`` documents at each preconditioner, in the same
+    # order, and the steps are ``linalg._chebyshev_steps``': the degree is one more than the
+    # length of ``out_steps``, and the first iterate ``source / theta`` is folded into the first
+    # two steps' scales (see ``multigrid.chebyshev_step``).
+    relative = wp.min(interval / wp.float64(wp.max(n, 1)), cap)
+    lower = wp.float64(0.0)
+    upper = wp.float64(0.0)
+    if squared != 0:
+        upper = wp.max(bound[0], wp.float64(2.0))
+        lower = relative * (upper / wp.float64(2.0))
+    else:
+        dominance = wp.max(bound[0], wp.float64(1e-3))
+        lower = wp.max(relative, wp.float64(1.0) - dominance)
+        upper = wp.float64(1.0) + dominance
+    theta = wp.float64(0.5) * (upper + lower)
+    delta = wp.float64(0.5) * (upper - lower)
+    sigma = theta / delta
+    rho = wp.float64(1.0) / sigma
+    for index in range(out_steps.shape[0]):
+        rho_next = wp.float64(1.0) / (wp.float64(2.0) * sigma - rho)
+        scale = wp.float64(1.0)
+        previous_scale = wp.float64(1.0)
+        if index == 0:
+            scale = wp.float64(1.0) / theta
+            previous_scale = wp.float64(0.0)
+        elif index == 1:
+            previous_scale = wp.float64(1.0) / theta
+        out_steps[index] = wp.vec4d(
+            scale, previous_scale, rho_next * rho, wp.float64(2.0) * rho_next / delta
+        )
+        rho = rho_next
+
+
 def _register_overloads() -> None:
     """Instantiate ``jacobi_inverse_diagonal`` at the precisions ``_BatchedCg`` solves in."""
     global JACOBI_INVERSE_DIAGONAL
