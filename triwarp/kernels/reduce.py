@@ -148,7 +148,7 @@ def blocks_1d(n: int) -> int:
     ``registration.transform_and_accumulate_cost`` / ``accumulate_procrustes_moments`` /
     ``accumulate_point_to_plane``, ``points.centered_covariance``,
     ``polyline.accumulate_newell_normal`` / ``accumulate_turning_angle`` /
-    ``accumulate_loop_frame`` -- which own the same
+    ``accumulate_radius_frame`` / ``accumulate_loop_frame`` -- which own the same
     [`ITEMS_PER_BLOCK_1D`][triwarp.kernels.reduce.ITEMS_PER_BLOCK_1D] chunk per block but partition
     it across lanes with ``wp.block_dim()`` rather than loading tiles from it.
 

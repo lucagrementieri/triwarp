@@ -335,13 +335,14 @@ def test_query_nearest_bvh_k1(bench_case: BenchCase) -> None:
     ``-cuda`` row is the one GPU-against-GPU comparison in the module. It has no spatial structure
     on either device -- just the pairwise loop -- which makes it a *crossover* rather than a bar:
     pytorch3d wins at a small point count and loses by nearly two orders of magnitude at a large
-    one. Half of that swing is triwarp's own search-radius heuristic and not brute force scaling;
-    the ``LIBRARIES`` block in [`conftest.py`](conftest.py)
-    carries the sweep and the reading. Its ``dists`` are **squared**, which is the named transform
-    ``tests/test_neighbors.py::test_query_nearest_matches_pytorch3d`` applies; its indices are
-    exactly triwarp's. Absent from ``k64`` for the same reason meshlib is absent from ``k7``: there
-    is no ``query_nearest_hashgrid_k64`` group to pair with, so two BVH-only markers would read as
-    a different claim than the four here.
+    one. The ``LIBRARIES`` block in [`conftest.py`](conftest.py) carries a sweep of the radius
+    walk, half of whose swing is its search-radius heuristic; this row answers through a pruned
+    closest-point descent over [`mesh_from_points`][triwarp.neighbors.mesh_from_points] instead,
+    which has no radius, so that split does not describe it. Its ``dists`` are **squared**, which
+    is the named transform ``tests/test_neighbors.py::test_query_nearest_matches_pytorch3d``
+    applies; its indices are exactly triwarp's. Absent from ``k64`` for the same reason meshlib is
+    absent from ``k7``: there is no ``query_nearest_hashgrid_k64`` group to pair with, so two
+    BVH-only markers would read as a different claim than the four here.
     """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "meshlib":
