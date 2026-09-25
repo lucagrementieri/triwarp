@@ -6273,10 +6273,29 @@ are `cgtrace_r16_{base,new}.txt` there.
       within a few dozen rings and to ~1e-300 on the meshes above; igl's `float64` Cholesky resolves
       those values, and the normalized gradient only needs their *direction*, which `float64`
       carries to the antipode. The Poisson step has no such range problem, but it is one solve.
-- **Not reached by the cache**: `fix_self_intersections` / `refill_region` / `fill_smooth` stay
-  flat (0.97-1.02x), because their region solves hand `solve_spd_columns` a fresh
-  `SquaredLaplacianPreconditioner` per call, which is deliberately uncached (a caller-owned object
-  keyed by identity would never be hit again).
+- **Not reached by the cache, and the cache is not the lever there**: `fix_self_intersections` /
+  `refill_region` / `fill_smooth` stay flat (0.97-1.04x). Their region solves assemble a *new*
+  system every call (`bsr_mm` of the normal equations over a region that just changed), so no
+  per-operator state could be hit even if the `SquaredLaplacianPreconditioner` were keyed. And the
+  recording is not what they pay: split synchronized at `fix_self_intersections[tangle_torus_small
+  local]` (`plans/benchmark-round-17-data/probes/cg_anatomy.py`), the fixed-rim Jacobi solve is
+  0.17 ms recording + 1.18 ms for 52 rounds and the squared-Laplacian one 0.85 ms + 2.33 ms for 21,
+  of a 22 ms call -- iterations, with the polynomial's 682 tiny `chebyshev_step` launches 3.8 ms of
+  the call's 9.3 ms device time. **R16-6's attribution** of the other 6.3 ms,
+  `subdivide_region_to_size`: 4.1 ms is its three flip passes, 8 rounds each at ~0.24 ms a replayed
+  round -- device, not launch floor. Of a round, the 64-bit radix sort of every edge key is ~86 us
+  (68 us at 32-bit keys, which fit only below 65 536 vertices: ~1.5 % of the call, not taken) and
+  `delone_flip_candidates` ~59 us, its `float64` Delone predicate on a GeForce part's FP64 rate
+  (narrowing it changes which edges flip; not taken).
+- **`smooth_region_boundary`'s rim mask re-derived a shared rule, and paid a sort for it.**
+  `_region_rim_vertices` built a mesh-wide `edges_unique` only to label vertex components, then two
+  histograms, a `flatnonzero` readback and three gathers to drop fully-free components -- which is
+  `selection.exclude_fully_selected_components`' rule, now called instead (§2.4's duplicated
+  decision rule). And that function, handed no edges, labels over `faces_to_edges` rather than
+  `edges_unique`: the union-find labels each component by its smallest vertex id whatever the
+  multiplicity and order of the unions, so the labels are identical without the sort. The rim mask
+  0.93 -> < 0.2 ms, `smooth_region_boundary` **1.10-1.12x** (harness), byte-identical on CPU with
+  `smooth_region` and `fix_self_intersections` unchanged.
 - **The final sweep's sub-0.93x cells were drift**: all in functions that reach no solve, and
   0.91-1.04x re-run as their own selection. Median over 280 triwarp cells in the seven modules,
   0.99x.

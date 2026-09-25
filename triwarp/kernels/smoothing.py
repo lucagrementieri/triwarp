@@ -1235,15 +1235,6 @@ def scatter_free_scalar(
 
 
 @wp.func
-def free_in_mixed_component(
-    free: wp.bool, component_size: wp.int32, free_in_component: wp.int32
-) -> wp.bool:
-    # Drop a vertex from the free set when its whole connected component is free: the harmonic
-    # system over such a component has no boundary values to interpolate and is singular.
-    return free and component_size != free_in_component
-
-
-@wp.func
 def region_side_value(inside: wp.bool) -> wp.float64:
     # The field the rim curve is the zero set of: -1 on the region, +1 outside it. Any two values of
     # opposite sign would do; +-1 keeps the harmonic interpolant's scale comparable to nothing else,

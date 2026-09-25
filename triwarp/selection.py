@@ -262,7 +262,8 @@ def exclude_fully_selected_components(
     n_vertices
         Vertex count (component labels span ``0 .. n_vertices - 1``).
     unique_edges
-        Optional precomputed ``(m, 2)`` unique edges; rebuilt when ``None``.
+        Optional precomputed ``(m, 2)`` edges to label the components over; the faces' own
+        edges when ``None``, which give the same components.
 
     Returns
     -------
@@ -284,12 +285,14 @@ def exclude_fully_selected_components(
     device = mask.device
     if n_vertices == 0:
         return wp.clone(mask)
-    if unique_edges is None:
-        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
-    # ``validate=False``: ``edges_unique`` was given ``n_vertices`` as its packing radix, so every
-    # endpoint it returns is already below it.
+    # The labelling needs the edges, not their deduplication: every component is labelled by its
+    # smallest vertex id whatever order and multiplicity the unions arrive in, so the faces' own
+    # directed edges give the identical labels without the sort. ``validate=False``: the endpoints
+    # are the face buffer's indices, which this function trusts to be below ``n_vertices`` as the
+    # rest of its caller's pipeline does.
+    edges = tw.edges.faces_to_edges(faces) if unique_edges is None else unique_edges
     labels = tw.graph.connected_component_labels_from_edges(
-        unique_edges, node_count=n_vertices, validate=False
+        edges, node_count=n_vertices, validate=False
     )
     keep = wp.zeros(n_vertices, dtype=wp.int32, device=device)
     wp.launch(

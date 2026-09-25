@@ -1014,9 +1014,10 @@ def test_smooth_region_boundary(bench_case: BenchCase) -> None:
     this row should be much the cheaper of the two whenever the region is fat, and the gap closing
     would mean the band had stopped being thin.
 
-    The solve is rebuilt every pass rather than hoisted, and that is not an oversight: the cotangent
-    weights are a function of the positions the previous pass moved, so a hoisted operator would
-    solve last pass's problem.
+    The band's system is assembled once and its values rewritten each pass from the moved
+    positions: the sparsity is the topology and does not change, the cotangent weights do. Keeping
+    the one operator also keeps its conjugate-gradient state, so every pass after the first replays
+    a recorded loop.
 
     meshlib's ``smoothRegionBoundary`` additionally flips the band's interior edges before each
     solve, which this port does not do -- so its row carries connectivity work triwarp's does not,
@@ -1026,11 +1027,6 @@ def test_smooth_region_boundary(bench_case: BenchCase) -> None:
     The module's one **loss** against meshlib, and the reason is visible in the shape: triwarp is
     flat across the mesh pair while meshlib tracks the mesh, so the row is four conjugate-gradient
     solves and their fixed per-call cost rather than anything proportional.
-
-    **The flatness looks like ``filter_spikes``' hoistable operator rebuild and is not.** There the
-    rebuild is one *topology* operator built every pass; here the operator's sparsity pattern is the
-    topology and does not move, but its cotangent weights do, so the rebuild is neither hoistable
-    nor the cost -- it is well under a quarter of a pass, and the reduced solve is most of the rest.
 
     **What the row actually prices is the conjugate-gradient launch floor on a tiny system.** The
     free set is the band, a couple of percent of the mesh, so the reduced system is a few hundred

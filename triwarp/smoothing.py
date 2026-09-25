@@ -2486,35 +2486,7 @@ def _region_rim_vertices(
     free = wp.empty(n_vertices, dtype=wp.bool, device=device)
     wp.map(kernel_array.mask_and, inside, outside, out=free)
 
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices, validate=False)
-    # ``validate=False``: ``edges_unique`` packed these rows against ``n_vertices`` itself.
-    labels = tw.graph.connected_component_labels_from_edges(
-        unique_edges, n_vertices, validate=False
-    )
-    component_size = wp.zeros(n_vertices, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_scatter.count_occurrences,
-        dim=n_vertices,
-        inputs=[labels, component_size],
-        device=device,
-    )
-    free_labels = tw.array.gather(labels, tw.array.flatnonzero(free))
-    free_in_component = wp.zeros(n_vertices, dtype=wp.int32, device=device)
-    if int(free_labels.shape[0]) > 0:
-        wp.launch(
-            kernel_scatter.count_occurrences,
-            dim=int(free_labels.shape[0]),
-            inputs=[free_labels, free_in_component],
-            device=device,
-        )
-    wp.map(
-        kernel_smoothing.free_in_mixed_component,
-        free,
-        tw.array.gather(component_size, labels),
-        tw.array.gather(free_in_component, labels),
-        out=free,
-    )
-    return free
+    return tw.selection.exclude_fully_selected_components(faces, free, n_vertices)
 
 
 def filter_scalar_laplacian(
