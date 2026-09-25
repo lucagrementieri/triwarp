@@ -54,6 +54,23 @@ def fixed_uv(fixed_values: wp.array2d[wp.float64], i: wp.int32) -> wp.vec2:
 
 
 @wp.kernel
+def free_mass_roots(
+    fixed_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    mass: wp.array[wp.float64],
+    out_roots: wp.array[wp.float64],
+) -> None:
+    # ``sqrt(M_ii)`` at each free vertex's compact index: the diagonal ``D`` for which the k = 2
+    # operator ``L M^-1 L`` is the ``L D^-2 L`` a squared-Laplacian preconditioner inverts. A
+    # vertex no face refers to has zero mass and an empty row; 1 keeps ``D`` positive there.
+    i = wp.int32(wp.tid())
+    ri = free_row(fixed_mask, free_map, i)
+    if ri < 0:
+        return
+    out_roots[ri] = wp.where(mass[i] > wp.float64(0.0), wp.sqrt(mass[i]), wp.float64(1.0))
+
+
+@wp.kernel
 def scatter_solution(
     fixed_mask: wp.array[wp.bool],
     free_map: wp.array[wp.int32],

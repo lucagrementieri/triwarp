@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import unittest.mock
 import warnings
+import weakref
 
 import igl
 import numpy as np
@@ -525,6 +527,165 @@ def test_solve_spd_is_quiet_when_it_converges(device: str) -> None:
         warnings.simplefilter("error")  # any warning fails the test
         tw.linalg.solve_spd(matrix, rhs, solution, maxiter=10 * n)
     assert np.allclose(solution.numpy(), np.full(n, 0.5))
+
+
+def test_solve_spd_keeps_one_state_per_operator(device: str) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``, for two right-hand sides solved against one operator.
+
+    The second solve replays the state the first one built and recorded (``linalg._cached_solver``),
+    so what has to hold is that a replayed state reads the *new* right-hand side and starts from
+    the *new* initial guess -- a replay that reused the first call's would return the first answer,
+    which is why the two right-hand sides differ.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device, n_rhs=2)
+    for column in range(2):
+        solution_wp = wp.zeros(dense_np.shape[0], dtype=wp.float64, device=device)
+        tw.linalg.solve_spd(matrix_wp, twt.as_dense(rhs_wp[column]), solution_wp)
+        assert np.allclose(
+            solution_wp.numpy(), np.linalg.solve(dense_np, rhs_np[column]), rtol=1e-5, atol=1e-5
+        )
+    assert len(tw.linalg._SOLVER_CACHE[matrix_wp]) == 1
+
+
+def test_solver_cache_keys_on_the_operator(device: str) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``: two operators of one shape do not share a state.
+
+    A state records pointers into its operator's arrays, so one handed a second matrix of the same
+    shape would solve the first matrix's system and converge to a plausible wrong answer.
+    """
+    first_wp, rhs_wp, first_np, rhs_np = _spd_system(device, n_rhs=1, seed=3)
+    second_wp, _rhs_wp, second_np, _rhs_np = _spd_system(device, n_rhs=1, seed=4)
+    for matrix_wp, dense_np in ((first_wp, first_np), (second_wp, second_np)):
+        solution_wp = wp.zeros_like(rhs_wp)
+        tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
+        assert np.allclose(
+            solution_wp.numpy(), np.linalg.solve(dense_np, rhs_np.T).T, rtol=1e-5, atol=1e-5
+        )
+
+
+def test_solver_cache_does_not_outlive_its_operator(device: str) -> None:
+    """
+    Not a library comparison: a lifetime is the claim, and no reference caches a solver.
+
+    The cache is keyed weakly and its states hold the operator's arrays rather than the operator,
+    so dropping the last reference to the matrix drops its state -- device buffers, preconditioner
+    and recorded graph. A state that held the matrix itself would keep its own key alive for ever.
+    """
+    matrix_wp, rhs_wp, _dense_np, _rhs_np = _spd_system(device, n_rhs=1)
+    solution_wp = wp.zeros_like(rhs_wp)
+    tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
+    alive = weakref.ref(matrix_wp)
+    assert alive() in tw.linalg._SOLVER_CACHE
+    del matrix_wp
+    gc.collect()
+    assert alive() is None
+
+
+def test_solve_spd_block_operator_matches_numpy(device: str) -> None:
+    """
+    Class A, against ``numpy.linalg.solve`` of the same operator written out densely.
+
+    A ``wp.mat22d`` operator is solved as its scalar expansion over interleaved unknowns, through
+    the ``float64`` view of the ``wp.vec2d`` right-hand side; a wrong interleaving convention would
+    still converge, to the solution of a permuted system.
+    """
+    n_blocks = 40
+    rng = np.random.default_rng(17)
+    dense_np = rng.standard_normal((2 * n_blocks, 2 * n_blocks))
+    dense_np = dense_np @ dense_np.T + 2 * n_blocks * np.eye(2 * n_blocks)
+    blocks_np = dense_np.reshape(n_blocks, 2, n_blocks, 2).transpose(0, 2, 1, 3)
+    rows_np, cols_np = np.meshgrid(np.arange(n_blocks), np.arange(n_blocks), indexing="ij")
+    matrix_wp = wps.bsr_from_triplets(
+        n_blocks,
+        n_blocks,
+        wp.array(rows_np.ravel().astype(np.int32), dtype=wp.int32, device=device),
+        wp.array(cols_np.ravel().astype(np.int32), dtype=wp.int32, device=device),
+        wp.array(np.ascontiguousarray(blocks_np.reshape(-1, 2, 2)), dtype=wp.mat22d, device=device),
+    )
+    rhs_np = rng.standard_normal((n_blocks, 2))
+    rhs_wp = wp.array(np.ascontiguousarray(rhs_np), dtype=wp.vec2d, device=device)
+    solution_wp = wp.zeros(n_blocks, dtype=wp.vec2d, device=device)
+    tw.linalg.solve_spd(
+        matrix_wp, rhs_wp, solution_wp, preconditioner=tw.linalg.jacobi_preconditioner(matrix_wp)
+    )
+    expected_np = np.linalg.solve(dense_np, rhs_np.ravel()).reshape(n_blocks, 2)
+    assert np.allclose(solution_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("preconditioner", ["diag", "chebyshev"])
+def test_unfolded_iteration_matches_numpy(
+    device: str, preconditioner: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``, on the path a column of over 65 536 unknowns takes.
+
+    Past ``CG_FOLD_MAX_BLOCKS`` tiles a round launches a finalize between the mat-vec and the
+    update instead of every update block folding the partials itself. No fixture here is that
+    large, so the threshold is lowered to reach it.
+    """
+    monkeypatch.setattr(tw.linalg, "CG_FOLD_MAX_BLOCKS", 0)
+    matrix_wp, rhs_wp, dense_np, rhs_np = _grid_laplacian_system(device, n_rhs=2)
+    solution_wp = wp.zeros_like(rhs_wp)
+    tw.linalg.solve_spd_columns(
+        matrix_wp,
+        rhs_wp,
+        twt.as_array2d(solution_wp, wp.float64),
+        preconditioner=preconditioner,
+        check_every=5,
+    )
+    assert np.allclose(
+        solution_wp.numpy(), np.linalg.solve(dense_np, rhs_np.T).T, rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("heavy", [False, True])
+def test_solve_spd_float32_system_matches_numpy(
+    device: str, heavy: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``, for a ``float32`` operator solved in place.
+
+    A ``float32`` system keeps ``float32`` vectors and reduces its dots in ``float64``
+    (``reconstruction``'s ``warp.fem`` Poisson system is the caller). The ``heavy`` arm lowers the
+    thresholds so the round forms ``A u`` with ``warp.sparse.bsr_mv`` and reduces the dots in a
+    launch of their own -- the path for long rows on a long column, which no fixture here reaches.
+    The tolerance is ``float32``'s.
+    """
+    if heavy:
+        monkeypatch.setattr(tw.linalg, "CG_FOLD_MAX_BLOCKS", 0)
+        monkeypatch.setattr(tw.linalg, "CG_HEAVY_ROW_ENTRIES", 0)
+    matrix64_wp, _rhs, dense_np, _rhs_np = _grid_laplacian_system(device, n_rhs=1)
+    matrix_wp = wps.bsr_copy(matrix64_wp, scalar_type=wp.float32)
+    rhs_np = np.random.default_rng(31).standard_normal(dense_np.shape[0]).astype(np.float32)
+    rhs_wp = wp.array(rhs_np, dtype=wp.float32, device=device)
+    solution_wp = wp.zeros_like(rhs_wp)
+    tw.linalg.solve_spd(matrix_wp, rhs_wp, solution_wp, tol=1e-6)
+    expected_np = np.linalg.solve(dense_np, rhs_np.astype(np.float64))
+    assert np.allclose(solution_wp.numpy(), expected_np, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("shift", [1.0, 1e-4])
+def test_adaptive_preconditioner_escalates_only_past_its_probe(device: str, shift: float) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``, on both branches of ``preconditioner="adaptive"``.
+
+    A heavily shifted grid Laplacian converges inside the Jacobi probe and must never build the
+    polynomial; a barely shifted one does not, and must escalate and still reach the answer. The
+    iteration counts are the operators' own (tens against thousands of Jacobi rounds), so the
+    parametrization reaches each branch by construction; the asserts on ``_escalation`` say so.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _grid_laplacian_system(device, k=64, n_rhs=2, shift=shift)
+    solution_wp = wp.zeros_like(rhs_wp)
+    solver = tw.linalg.spd_column_solver(
+        matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), preconditioner="adaptive"
+    )
+    solver()
+    assert (solver._escalation is not None) == (shift < 1e-2)
+    assert np.allclose(
+        solution_wp.numpy(), np.linalg.solve(dense_np, rhs_np.T).T, rtol=1e-5, atol=1e-5
+    )
 
 
 # --- replicated_operator ------------------------------------------------------------------

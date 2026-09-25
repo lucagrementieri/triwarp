@@ -3212,18 +3212,12 @@ def subdivide_region_to_size(
             )
         m = int(unique_edges.shape[0])
 
-        edge_in_region = wp.zeros(m, dtype=wp.bool, device=device)
-        wp.launch(
-            kernel_remesh.mark_region_edges,
-            dim=3 * n_faces,
-            inputs=[region_flags, inverse, edge_in_region],
-            device=device,
-        )
-        long_mask = wp.empty(m, dtype=wp.bool, device=device)
+        long_mask = wp.zeros(m, dtype=wp.bool, device=device)
         wp.launch(
             kernel_remesh.mark_long_region_edges,
-            dim=m,
-            inputs=[current_vertices, unique_edges, max_edge_f, edge_in_region, long_mask],
+            dim=3 * n_faces,
+            inputs=[current_vertices, unique_edges, region_flags, inverse, max_edge_f],
+            outputs=[long_mask],
             device=device,
         )
 

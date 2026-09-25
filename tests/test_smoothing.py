@@ -1509,6 +1509,34 @@ def test_smooth_region_boundary_leaves_connectivity_and_the_rest_alone(device: s
         )
 
 
+def test_smooth_region_boundary_later_passes_match_a_rebuild(device: str) -> None:
+    """
+    Triwarp against triwarp: the in-place rewrite of the band's system against a full rebuild.
+
+    Every pass after the first rewrites the first pass's Dirichlet system from the new cotangents
+    (``kernels/smoothing.band_dirichlet_values``) rather than assembling a mesh-wide
+    ``-cotmatrix`` and extracting it again. A call of one pass takes only the assembling route, so
+    chaining single-pass calls is the rebuild, and the meshlib comparison above carries the oracle
+    for the rebuild. The two differ by the warm start and the solver tolerance, far under float32
+    rounding of the positions -- a wrong corner, sign or pinned term in the rewrite would not.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=4, radius=1.0)
+    vertices_np = np.asarray(mesh_tm.vertices)
+    faces_np = np.asarray(mesh_tm.faces)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np.ravel(), device)
+    centers_np = vertices_np[faces_np].mean(axis=1)
+    region_np = centers_np[:, 0] + 0.3 * np.sin(5.0 * centers_np[:, 1]) > 0.1
+    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+
+    rewritten_np = tw.smoothing.smooth_region_boundary(vertices_wp, faces_wp, region_wp, 3).numpy()
+    rebuilt_wp = vertices_wp
+    for _ in range(3):
+        rebuilt_wp = tw.smoothing.smooth_region_boundary(rebuilt_wp, faces_wp, region_wp, 1)
+    displacement_np = np.linalg.norm(rewritten_np - vertices_np, axis=1)
+    assert displacement_np.max() > 1e-2
+    assert np.allclose(rewritten_np, rebuilt_wp.numpy(), rtol=0.0, atol=1e-5)
+
+
 def test_project_to_zero_isoline_handles_an_exact_field_tie(device: str) -> None:
     """
     Regression: an exact field tie used to drop a triangle's candidate crossing outright.

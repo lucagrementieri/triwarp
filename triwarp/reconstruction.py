@@ -25,21 +25,23 @@ its consumers in [`triwarp.levelset`][triwarp.levelset], and ``screened_poisson`
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Literal, cast
+import warnings
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
 import numpy as np
 import numpy.typing as npt
 import warp as wp
-import warp.optim.linear as wpl
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import read_scalar, require_same_device
+from triwarp._device import read_scalar, require_same_device, run_device_loop
 from triwarp.constants import TILE_1D
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import remesh as kernel_remesh
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
+from triwarp.kernels.algorithms import conjugate_gradient as kernel_cg
 
 if TYPE_CHECKING:
     # Type-checking only: the adaptive-backend helpers import ``warp.fem`` lazily (inside the
@@ -377,7 +379,7 @@ def screened_poisson(
     scale: float = 1.1,
     point_weight: float = 4.0,
     solver_iterations: int = 100,
-    solver_tolerance: float = 1e-6,
+    solver_tolerance: float = 1e-5,
     confidence: bool = False,
     method: Literal["dense", "adaptive"] = "dense",
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
@@ -422,9 +424,14 @@ def screened_poisson(
         Screening weight ``alpha`` tying the iso-surface to the input samples. ``0`` recovers the
         unscreened Poisson reconstruction (a tiny epsilon is still added to keep the operator SPD).
     solver_iterations
-        Maximum conjugate-gradient iterations per cascade level.
+        Maximum conjugate-gradient iterations per cascade level. The default leaves room: the dense
+        grid's multigrid-preconditioned solve reaches the default tolerance in a dozen or so at any
+        depth, and the adaptive backend's Jacobi-preconditioned one in under a hundred.
     solver_tolerance
-        Relative residual tolerance for the conjugate-gradient solve.
+        Relative residual tolerance for the conjugate-gradient solve. A level that stops at
+        ``solver_iterations`` above it warns. The system is solved in ``float32``, whose rounding
+        bounds the relative residual either backend can actually reach at a few ``1e-6`` -- a
+        tolerance below that is never met and only spends the whole iteration budget.
     confidence
         When ``True``, weight each sample's splat by ``|normals[i]|`` (treating the normal magnitude
         as a per-sample confidence), matching PoissonRecon's ``confidence`` flag.
@@ -454,6 +461,12 @@ def screened_poisson(
         If ``points`` has fewer than 3 points, or the depth/scale parameters are out of range.
     RuntimeError
         If ``points`` and ``normals`` are not all on one device.
+
+    Warns
+    -----
+    UserWarning
+        When a level's conjugate-gradient solve stops at ``solver_iterations`` with its residual
+        still above ``solver_tolerance``: the surface is then extracted from an unconverged field.
 
     See Also
     --------
@@ -718,69 +731,301 @@ def _poisson_solve_level(
         device=device,
     )
 
-    operator = _screened_operator(weights, screen, res, n_nodes, device)
-    preconditioner = _diagonal_operator(inv_diag, n_nodes, device)
-    # atol=0.0, not omitted: warp.optim.linear.cg silently sets atol := tol when atol is left
-    # None, turning solver_tolerance into an absolute floor rather than a relative one -- a
-    # right-hand side smaller than it "converges" at the untouched initial guess in zero
-    # iterations (CLAUDE.md section 12.7).
-    wpl.cg(
-        operator,
-        rhs,
-        initial,
-        tol=solver_tolerance,
-        atol=0.0,
-        maxiter=solver_iterations,
-        M=preconditioner,
+    _solve_screened_poisson(
+        weights, screen, res, rhs, inv_diag, initial, solver_iterations, solver_tolerance, device
     )
     return initial
 
 
-def _screened_operator(
-    weights: wp.array[wp.float32], screen: float, res: int, n_nodes: int, device: wp.DeviceLike
-) -> wpl.LinearOperator:
-    """Matrix-free screened Laplacian ``A = L_N + screen * diag(W)`` as a ``LinearOperator``."""
+def _solve_screened_poisson(
+    weights: wp.array[wp.float32],
+    screen: float,
+    res: int,
+    rhs: wp.array[wp.float32],
+    inv_diag: wp.array[wp.float32],
+    solution: wp.array[wp.float32],
+    maxiter: int,
+    tol: float,
+    device: wp.DeviceLike,
+) -> None:
+    """
+    Multigrid-preconditioned conjugate gradient on the grid's screened Laplacian, from ``solution``.
 
-    def matvec(x, y, z, alpha, beta):
-        wp.launch(
-            kernel_reconstruction.screened_laplacian_matvec,
-            dim=(res, res, res),
-            inputs=[x, y, weights, wp.float32(screen), wp.float32(alpha), wp.float32(beta), res, z],
-            device=device,
-        )
-
-    return wpl.LinearOperator((n_nodes, n_nodes), wp.float32, wp.get_device(device), matvec)
-
-
-def _diagonal_operator(
-    inv_diag: wp.array[wp.float32], n_nodes: int, device: wp.DeviceLike
-) -> wpl.LinearOperator:
-    """Jacobi (inverse-diagonal) preconditioner as a ``LinearOperator``."""
-    # ``wpl.cg`` applies the preconditioner once per iteration, so the mapped kernel is derived
-    # once here and only relaunched inside the loop. ``return_kernel=True`` returns before
-    # mapping, so passing ``inv_diag`` for the x / y / out slots writes nothing -- it only
-    # supplies the dtype and length that ``x``, ``y`` and ``z`` will have.
-    precond = wp.map(
-        kernel_reconstruction.diagonal_precond_axpby,
-        inv_diag,
-        inv_diag,
-        inv_diag,
-        wp.float32(0.0),
-        wp.float32(0.0),
-        out=inv_diag,
-        return_kernel=True,
+    The Chronopoulos-Gear round ``linalg``'s own solver runs -- two launches, the mat-vec with its
+    three dots (``poisson_cg_matvec_dots``) and the shared update ``cg_update`` -- with the
+    stencil applied matrix-free, since a CSR of it would be seven entries a node. The vectors stay
+    ``float32``: at ``2 ** 8 + 1`` nodes a side a round is bound by the bytes it moves, and doubling
+    them would double it; the dots' fold across blocks and ``alpha`` and ``beta`` are ``float64``.
+    The stopping rule is ``warp.optim.linear.cg``'s with ``atol = 0`` -- the relative residual
+    ``tol`` or ``maxiter`` rounds -- tested on device, so the loop is one recorded graph and no
+    readback until the end, where a level that ran out of iterations above its tolerance warns.
+    """
+    n = res * res * res
+    tile = int(kernel_cg.CG_TILE)
+    span, blocks, fold = kernel_cg.cg_layout(n, tw.linalg.CG_FOLD_MAX_BLOCKS)
+    stride = blocks * span
+    pitch = ((blocks + tile - 1) // tile) * tile
+    r = wp.empty(stride, dtype=wp.float32, device=device)
+    u = wp.empty(stride, dtype=wp.float32, device=device)
+    w = wp.empty(stride, dtype=wp.float32, device=device)
+    p = wp.empty(stride, dtype=wp.float32, device=device)
+    s = wp.empty(stride, dtype=wp.float32, device=device)
+    # Zeroed: the fold's last tile reads past ``blocks``.
+    partials = wp.zeros((3, 1, pitch), dtype=wp.float64, device=device)
+    coefficients = wp.empty((3, 1), dtype=wp.float64, device=device)
+    dots = wp.empty((2, 1), dtype=wp.float64, device=device)
+    scalars = wp.empty((5, 1), dtype=wp.float64, device=device)
+    gamma_old, alpha_old, gamma_new, alpha_new, atol_sq = (
+        twt.as_dense(scalars[row, 0:1]) for row in range(5)
     )
+    iterations = wp.empty(1, dtype=wp.int32, device=device)
+    state = wp.empty(kernel_array.LOOP_STATE_SIZE, dtype=wp.int32, device=device)
+    screen_f = wp.float32(screen)
+    multigrid = _PoissonMultigrid(weights, screen, res, inv_diag, device)
+    wp.launch_tiled(
+        kernel_reconstruction.poisson_cg_initial,
+        dim=(blocks,),
+        inputs=[n, span, res, weights, screen_f, rhs, solution, inv_diag],
+        outputs=[r, u, p, s, partials],
+        block_dim=tile,
+        device=device,
+    )
+    wp.launch_tiled(
+        kernel_cg.cg_seed,
+        dim=(1,),
+        inputs=[wp.float64(tol * tol), wp.float64(0.0), blocks, partials],
+        outputs=[atol_sq, gamma_new, alpha_new, iterations, state],
+        block_dim=tile,
+        device=device,
+    )
+    multigrid.apply(r, u)
 
-    def matvec(x, y, z, alpha, beta):
-        wp.launch(
-            precond,
-            dim=n_nodes,
-            inputs=[x, y, inv_diag, wp.float32(alpha), wp.float32(beta)],
-            outputs=[z],
+    def round_() -> None:
+        wp.launch_tiled(
+            kernel_reconstruction.poisson_cg_matvec_dots,
+            dim=(blocks,),
+            inputs=[n, span, res, weights, screen_f, r, u, gamma_new, alpha_new],
+            outputs=[w, partials, gamma_old, alpha_old, state],
+            block_dim=tile,
             device=device,
         )
+        if not fold:
+            wp.launch_tiled(
+                kernel_cg.cg_coefficients,
+                dim=(1,),
+                inputs=[1, maxiter, blocks, partials, gamma_old, alpha_old, atol_sq, state],
+                outputs=[coefficients, gamma_new, alpha_new, dots, iterations],
+                block_dim=tile,
+                device=device,
+            )
+        wp.launch_tiled(
+            kernel_cg.CG_UPDATE[wp.float32],
+            # One tile a block: a pure stream unless it folds; see ``linalg._BatchedCg``.
+            dim=(1, stride // tile),
+            inputs=[
+                stride,
+                tile,
+                n,
+                1,
+                maxiter,
+                1 if fold else 0,
+                blocks,
+                # No Jacobi apply: the V-cycle writes ``u`` after the update.
+                0,
+                partials,
+                coefficients,
+                gamma_old,
+                alpha_old,
+                atol_sq,
+                inv_diag,
+                w,
+                p,
+                s,
+                r,
+                u,
+                state,
+            ],
+            outputs=[solution, u, gamma_new, alpha_new, dots, iterations],
+            block_dim=tile,
+            device=device,
+        )
+        multigrid.apply(r, u)
 
-    return wpl.LinearOperator((n_nodes, n_nodes), wp.float32, wp.get_device(device), matvec)
+    run_device_loop(device, state[kernel_array.LOOP_CONDITION_VIEW], round_)
+    # One read of the count, and two more only on a solve that used its whole budget: a level that
+    # stops at ``maxiter`` above its tolerance says so, as ``linalg.solve_spd`` does.
+    if int(iterations.numpy()[0]) >= maxiter:
+        residual = math.sqrt(float(dots.numpy()[0, 0]))
+        tolerance = math.sqrt(float(atol_sq.numpy()[0]))
+        if residual > tolerance:
+            warnings.warn(
+                f"screened_poisson: the {res}^3 level's conjugate gradient hit its {maxiter}-"
+                f"iteration cap with residual norm {residual:.3e} against tolerance "
+                f"{tolerance:.3e}; raise solver_iterations or solver_tolerance.",
+                stacklevel=4,
+            )
+
+
+# Damped-Jacobi sweeps before and after each coarse-grid correction, the damping, the sweeps on the
+# coarsest level and its size. Swept on ``bunny`` at depth 8 to ``tol = 1e-5``: one sweep a side at
+# ``6/7`` (the classical optimum for the 7-point stencil in 3-D) was fastest at every level; two
+# sweeps, ``2/3``, or eight coarsest sweeps all cost 5-15 % more for no fewer iterations. Coarsening
+# to three nodes a side makes the coarsest level 27 unknowns, which four sweeps all but solve.
+_MG_SWEEPS = 1
+_MG_OMEGA = 6.0 / 7.0
+_MG_COARSE_SWEEPS = 4
+_MG_COARSEST = 3
+
+
+class _GridLevel(NamedTuple):
+    """One level of ``_PoissonMultigrid``: its grid, operator and working vectors."""
+
+    res: int
+    lap: wp.float32
+    weights: wp.array[wp.float32]
+    inv_diag: wp.array[wp.float32]
+    b: wp.array[wp.float32]
+    x: wp.array[wp.float32]
+    tmp_a: wp.array[wp.float32]
+    tmp_b: wp.array[wp.float32]
+    residual: wp.array[wp.float32]
+
+
+class _PoissonMultigrid:
+    """
+    Geometric V-cycle on the dense grid's nested node grids, as a conjugate-gradient preconditioner.
+
+    Levels ``res, (res - 1) / 2 + 1, ...`` down to ``_MG_COARSEST`` nodes a side, level ``l``'s
+    operator ``2 ** l * L_l + screen * W_l`` (see the V-cycle note in ``kernels/reconstruction``),
+    ``_MG_SWEEPS`` damped-Jacobi sweeps at ``_MG_OMEGA`` before and after each coarse-grid
+    correction and ``_MG_COARSE_SWEEPS`` on the coarsest level. Every level is ``float32`` and
+    matrix-free. A cycle is five launches a level, and it keeps the iteration count near a dozen
+    whatever the resolution, where Jacobi's grows with it -- to the point that a 100-iteration cap
+    left the finer levels two orders of magnitude short of their tolerance.
+    """
+
+    def __init__(
+        self,
+        weights: wp.array[wp.float32],
+        screen: float,
+        res: int,
+        inv_diag: wp.array[wp.float32],
+        device: wp.DeviceLike,
+    ) -> None:
+        self._device = device
+        self._screen = wp.float32(screen)
+        self._omega = wp.float32(_MG_OMEGA)
+        # Level 0's ``b`` and ``x`` go unused: the caller's vectors are handed to ``apply``.
+        self._levels: list[_GridLevel] = []
+        lap = 1.0
+        w, inv = weights, inv_diag
+        while True:
+            vectors = [wp.empty(res**3, dtype=wp.float32, device=device) for _ in range(5)]
+            self._levels.append(_GridLevel(res, wp.float32(lap), w, inv, *vectors))
+            if res <= _MG_COARSEST:
+                break
+            res_c = (res - 1) // 2 + 1
+            w_c = wp.empty(res_c**3, dtype=wp.float32, device=device)
+            wp.launch(
+                kernel_reconstruction.poisson_mg_restrict,
+                dim=(res_c, res_c, res_c),
+                inputs=[w, res, res_c],
+                outputs=[w_c],
+                device=device,
+            )
+            lap *= 2.0
+            inv_c = wp.empty(res_c**3, dtype=wp.float32, device=device)
+            wp.launch(
+                kernel_reconstruction.poisson_mg_inverse_diagonal,
+                dim=(res_c, res_c, res_c),
+                inputs=[res_c, wp.float32(lap), w_c, self._screen],
+                outputs=[inv_c],
+                device=device,
+            )
+            res, w, inv = res_c, w_c, inv_c
+
+    def _smooth(
+        self,
+        level: _GridLevel,
+        zero: bool,
+        b: wp.array[wp.float32],
+        x: wp.array[wp.float32] | None,
+        out: wp.array[wp.float32],
+    ) -> None:
+        """One damped-Jacobi sweep at ``level``, from zero when ``zero``."""
+        res = level.res
+        wp.launch(
+            kernel_reconstruction.poisson_mg_smooth,
+            dim=(res, res, res),
+            inputs=[
+                res,
+                level.lap,
+                level.weights,
+                self._screen,
+                self._omega,
+                1 if zero else 0,
+                level.inv_diag,
+                b,
+                x,
+            ],
+            outputs=[out],
+            device=self._device,
+        )
+
+    def _cycle(self, index: int, b: wp.array[wp.float32], out: wp.array[wp.float32]) -> None:
+        """``out = V_index(b)``: the V-cycle from ``index`` down, from a zero guess."""
+        level = self._levels[index]
+        res, lap, w = level.res, level.lap, level.weights
+        tmp_a, tmp_b, resid = level.tmp_a, level.tmp_b, level.residual
+        if index == len(self._levels) - 1:
+            sweeps = _MG_COARSE_SWEEPS
+            cur = out if sweeps == 1 else tmp_a
+            self._smooth(level, True, b, None, cur)
+            for sweep in range(1, sweeps):
+                target = out if sweep == sweeps - 1 else (tmp_b if cur is tmp_a else tmp_a)
+                self._smooth(level, False, b, cur, target)
+                cur = target
+            return
+        # Pre-smoothing from zero, ``_MG_SWEEPS`` sweeps, ending in ``tmp_a``.
+        self._smooth(level, True, b, None, tmp_a)
+        cur = tmp_a
+        for _ in range(1, _MG_SWEEPS):
+            nxt = tmp_b if cur is tmp_a else tmp_a
+            self._smooth(level, False, b, cur, nxt)
+            cur = nxt
+        wp.launch(
+            kernel_reconstruction.poisson_mg_residual,
+            dim=(res, res, res),
+            inputs=[res, lap, w, self._screen, b, cur],
+            outputs=[resid],
+            device=self._device,
+        )
+        coarse = self._levels[index + 1]
+        res_c = coarse.res
+        wp.launch(
+            kernel_reconstruction.poisson_mg_restrict,
+            dim=(res_c, res_c, res_c),
+            inputs=[resid, res, res_c],
+            outputs=[coarse.b],
+            device=self._device,
+        )
+        self._cycle(index + 1, coarse.b, coarse.x)
+        wp.launch(
+            kernel_reconstruction.poisson_mg_prolong_add,
+            dim=(res, res, res),
+            inputs=[coarse.x, res_c, res, cur],
+            outputs=[cur],
+            device=self._device,
+        )
+        # Post-smoothing, the same count, the last sweep into ``out``.
+        for sweep in range(_MG_SWEEPS):
+            nxt = out if sweep == _MG_SWEEPS - 1 else (tmp_b if cur is tmp_a else tmp_a)
+            self._smooth(level, False, b, cur, nxt)
+            cur = nxt
+
+    def apply(self, source: wp.array[wp.float32], destination: wp.array[wp.float32]) -> None:
+        """``destination = M^-1 source`` by one V-cycle from zero."""
+        self._cycle(0, source, destination)
 
 
 def _screened_poisson_adaptive(
@@ -926,16 +1171,16 @@ def _screened_poisson_adaptive(
         )
 
         solution = wp.zeros_like(rhs)
-        # atol=0.0: see the identical comment at this function's other wpl.cg call, above
-        # (CLAUDE.md section 12.7).
-        wpl.cg(
+        # ``linalg``'s own conjugate gradient on the ``float32`` system as assembled, where Warp's
+        # records a new conditional graph per call. The default cadence, so that a solve which runs
+        # out of iterations above its tolerance warns, on either device.
+        tw.linalg.solve_spd(
             matrix,
             rhs,
             solution,
             tol=solver_tolerance,
-            atol=0.0,
             maxiter=solver_iterations,
-            M=wpl.preconditioner(matrix, "diag"),
+            name="screened_poisson",
         )
         field = space.make_field()
         field.dof_values = solution

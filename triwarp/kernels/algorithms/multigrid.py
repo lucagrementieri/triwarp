@@ -255,13 +255,17 @@ def csr_row_dot(
     x_offset: wp.int32,
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
-    values: wp.array[wp.float64],
-    x: wp.array[wp.float64],
-) -> wp.float64:
+    values: wp.array[wp.Float],
+    x: wp.array[wp.Float],
+) -> wp.Float:
     # One CSR row against one column of ``x``. Shared by the cycle's mat-vec and the power
     # iteration's step below, which differ only in what they do with the result -- and the row bound
     # comes from ``offsets`` alone, so neither depends on the matrix's ``nnz`` field being fresh.
-    total = wp.float64(0.0)
+    #
+    # Generic over the storage precision, and accumulated at it: the conjugate-gradient mat-vec
+    # also runs on ``float32`` systems, whose rows ``warp.fem`` assembles a hundred entries long,
+    # where a ``float64`` accumulator measured well behind ``warp.sparse.bsr_mv``'s own.
+    total = values.dtype(0.0)
     for k in range(offsets[row], offsets[row + 1]):
         total += values[k] * x[x_offset + columns[k]]
     return total

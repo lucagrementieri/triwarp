@@ -18,7 +18,12 @@ import warp as wp
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import to_vec2, to_vec2d
 from triwarp.kernels.linalg import free_row
-from triwarp.kernels.predicates import normalize_or_zero, unit_tangent, world_to_tangent
+from triwarp.kernels.predicates import (
+    stable_length,
+    stable_normalize,
+    unit_tangent,
+    world_to_tangent,
+)
 from triwarp.kernels.reduce import block_chunk_1d, commit_sum_and_count
 from triwarp.kernels.scatter import add_corner_triple
 from triwarp.kernels.triangles import corner_triple, face_unit_gradient, face_vertices_vec3d
@@ -72,6 +77,37 @@ def tangent_to_world(tangent: wp.vec2, basis_x: wp.vec3, basis_y: wp.vec3) -> wp
 # --------------------------------------------------------------------------------------
 # Scalar heat method: geodesic distance (Crane et al. 2013)
 # --------------------------------------------------------------------------------------
+
+
+@wp.kernel
+def heat_chunk_change(
+    solution: wp.array[wp.float64], previous: wp.array[wp.float64], out_stats: wp.array[wp.float64]
+) -> None:
+    # Whether a chunk of heat-solve rounds moved the field, **per vertex and relative to its own
+    # value**: ``out_stats[0]`` is the largest ``|u - u_prev| / |u|`` over the vertices the heat has
+    # reached, ``out_stats[1]`` the count of those vertices, and ``previous`` is advanced to ``u``
+    # for the next chunk. A global residual cannot say this: the heat falls by a near-constant
+    # factor per ring of vertices, so the far field sits hundreds of orders of magnitude below the
+    # source's and is noise long after the residual has converged (``heat._diffuse``). ``out_stats``
+    # is zeroed by the caller; both halves commit one atomic per block, the ``reduce`` block fold.
+    i, t = wp.tid()
+    base, remaining = block_chunk_1d(solution.shape[0], i)
+    if remaining <= 0:
+        return
+    change = wp.float64(0.0)
+    reached = wp.float64(0.0)
+    for k in range(t, remaining, wp.block_dim()):
+        v = base + k
+        u = solution[v]
+        if u != wp.float64(0.0):
+            change = wp.max(change, wp.abs(u - previous[v]) / wp.abs(u))
+            reached += wp.float64(1.0)
+        previous[v] = u
+    block_change = wp.tile_max(wp.tile(change))[0]
+    block_reached = wp.tile_sum(wp.tile(reached))[0]
+    if t == 0:
+        wp.atomic_max(out_stats, 0, block_change)
+        wp.atomic_add(out_stats, 1, block_reached)
 
 
 @wp.kernel
@@ -302,84 +338,59 @@ def seed_source_scalars(
 
 
 @wp.func
-def divide_positive(
-    numerator: wp.float64, denominator: wp.float64, floor: wp.float64
-) -> wp.float64:
-    # Away from every source the indicator decays to ~0; guard the ratio rather than emit inf.
-    # ``floor`` is a fraction of the indicator field's own maximum, never an absolute value -- see
-    # ``scale_to_magnitude`` below for why an absolute one is a silent wrong answer on a large mesh.
+def divide_nonzero(numerator: wp.float64, denominator: wp.float64) -> wp.float64:
+    # ``extend_scalar``'s ratio of the diffused values to the diffused indicator, zero only where
+    # the indicator is exactly zero -- a component no source reaches. Both fields are converged per
+    # vertex (``heat._diffuse``), so a small indicator is a real one; and it can be *negative*, as
+    # the heat system is not an M-matrix where obtuse triangles give positive off-diagonal entries,
+    # where the ratio is still the extension (geometry-central divides the same way).
     #
-    # Not folded into ``array.divide_if_positive`` despite the shared shape: that one's threshold is
-    # a fixed zero and its fallback is the unchanged numerator, where this one's threshold is the
-    # caller's own floor and its fallback is zero -- two differences, and a four-argument
-    # ``divide_or(numerator, denominator, floor, fallback)`` covering both would be a mode argument
-    # with one caller per mode (§14).
-    if denominator <= floor:
+    # Not ``array.divide_if_positive``: that one's fallback is the unchanged numerator.
+    if denominator == wp.float64(0.0):
         return wp.float64(0.0)
     return numerator / denominator
 
 
 @wp.func
-def scale_to_magnitude(direction: wp.vec2d, magnitude: wp.float64, floor: wp.float64) -> wp.vec2d:
+def scale_to_magnitude(direction: wp.vec2d, magnitude: wp.float64) -> wp.vec2d:
     # The vector heat method splits a transported vector into a direction (from the vector
     # diffusion) and a magnitude (from a scalar extension): short-time vector diffusion smears
-    # magnitudes but preserves directions well.
-    #
-    # ``floor`` is a fraction of the direction field's own maximum, never an absolute length. The
-    # diffused field carries the mesh's scale as ~1/scale^2 -- measured max |direction| of 6.24e-01
-    # at unit scale against 6.24e-13 at 1e6 -- so an absolute cutoff turns into "return zero
-    # everywhere" on a large mesh: 91 of 162 vertices came back at zero magnitude on an
-    # ``icosphere(2)`` scaled by 1e5. Relative, the same field is identical to every digit printed
-    # at both scales.
-    #
-    # The floor separates a vanished direction from a represented one. It does *not* separate signal
-    # from round-off and must not be raised in an attempt to: the smallest genuinely diffused value
-    # on ``half_torus`` is 8.0e-10 of the maximum, *below* the 8.7e-09 of round-off left at a point
-    # where the transported copies cancel exactly. The two populations overlap, so no magnitude cut
-    # tells them apart -- which is why ``transport_tangent_vectors`` *reports* resolution as a
-    # second mask (one ``array.greater`` at a higher floor) instead of acting on it here.
-    #
-    # That round-off is the float32 *transport angles*, not the solve and not the frames (which the
-    # connection Laplacian never reads). Three measurements: it does not move when the
-    # conjugate-gradient tolerance is tightened from 1e-8 to 1e-14; injecting angle noise moves it
-    # linearly, extrapolating back to ~2e-07 rad of effective error, which is float32 epsilon on an
-    # O(1) angle; and redoing the ring accumulation in float64 while still storing float32 leaves it
-    # at 9.9e-09, so it is the angles' storage precision rather than the accumulation order.
-    return magnitude * normalize_or_zero(direction, floor)
+    # magnitudes but preserves directions well. The direction is normalized without underflow
+    # (``stable_normalize``) and is zero only where the diffused field is exactly zero: it is
+    # converged per vertex (``heat._diffuse``), so its far field is a direction however small --
+    # ``1e-100`` of the maximum a few hundred rings out -- and a floor relative to the field's
+    # maximum, as this once took, discarded exactly that.
+    return magnitude * stable_normalize(direction)
 
 
 @wp.func
-def narrow_and_length(v: wp.vec2d) -> tuple[wp.vec2, wp.float64]:
-    # A tangent field narrowed to its storage precision, and the length of the *unnarrowed* entry.
-    # ``log_map`` wants both of one diffused reference field; they are one load apart, so asking
-    # for them separately costs a second pass over the field to measure what the first had in
-    # registers. The length is taken in float64 on purpose -- it feeds a relative floor against
-    # the field's own maximum, which is a float64 reduction.
-    return to_vec2(v), wp.length(v)
+def narrow_direction(v: wp.vec2d) -> wp.vec2:
+    # A diffused tangent field's direction, normalized in ``float64`` and only then narrowed to its
+    # storage precision: narrowing first would underflow the far field, whose raw values are far
+    # below ``float32``'s range. Zero where the field is exactly zero.
+    return to_vec2(stable_normalize(v))
 
 
 @wp.func
 def transported_and_resolved(
     direction: wp.vec2d,
     magnitude: wp.float64,
-    length: wp.float64,
-    floor: wp.float64,
-    resolved_floor: wp.float64,
+    diffused_magnitude: wp.float64,
+    resolved_fraction: wp.float64,
 ) -> tuple[wp.vec2, wp.bool]:
     # The whole tail of ``transport_tangent_vectors`` in one pass: rescale the diffused direction
     # to its extended magnitude, narrow it to the field's storage precision, and report whether
     # this vertex's direction can be told from round-off.
     #
-    # The two floors are deliberately different and both relative to the same field maximum --
-    # ``floor`` asks "did this vanish?" and must sit below every genuine value, ``resolved_floor``
-    # asks "can this be told from round-off?" and must sit above it -- so a vertex can be reported
-    # unresolved while still carrying a full-length vector, which is the cut-locus case. See
-    # ``scale_to_magnitude`` for why neither may be absolute.
-    #
-    # Fused because the float64 rescale, the narrowing and the comparison are three reads of one
-    # vertex's own data: run apart they cost two extra launches and a full round trip of the
-    # rescaled float64 field through global memory, purely to hand it to a cast.
-    return (to_vec2(scale_to_magnitude(direction, magnitude, floor)), length > resolved_floor)
+    # Resolution is asked **locally**: the diffused vector's length against the diffused
+    # *magnitudes* at the same vertex (the same heat, applied to ``|v|``). The two are equal where
+    # the copies arriving from the sources agree -- a vector's length is never more than the heat
+    # of its magnitude -- and the ratio falls to round-off where they cancel, the cut locus. Against
+    # the field's global maximum instead, as this once asked, every far vertex read as unresolved.
+    return (
+        to_vec2(scale_to_magnitude(direction, magnitude)),
+        stable_length(direction) > resolved_fraction * diffused_magnitude,
+    )
 
 
 @wp.kernel
@@ -403,19 +414,10 @@ def scatter_unit_gradient_to_vertices(
 
 
 @wp.func
-def world_to_tangent_unit(
-    value: wp.vec3, basis_x: wp.vec3, basis_y: wp.vec3, tolerance: wp.float32
-) -> wp.vec2:
+def world_to_tangent_unit(value: wp.vec3, basis_x: wp.vec3, basis_y: wp.vec3) -> wp.vec2:
     # Express a 3D vertex field in each vertex's tangent basis, normalized. Only the direction
-    # survives, which is all the log map's angle needs.
-    #
-    # ``tolerance`` must be relative to ``value``'s own field maximum, not a fixed constant:
-    # ``value`` is an area-weighted *sum* of unit vectors (see
-    # ``scatter_unit_gradient_to_vertices``), so its magnitude carries the mesh's coordinate scale
-    # squared and a fixed floor collapses the
-    # whole log map to angle zero on any mesh not near unit scale (confirmed: every one of 162
-    # vertices on a unit icosphere scaled by 1e-7).
-    return normalize_or_zero(world_to_tangent(value, basis_x, basis_y), tolerance)
+    # survives, which is all the log map's angle needs; zero only for an exactly zero projection.
+    return stable_normalize(world_to_tangent(value, basis_x, basis_y))
 
 
 @wp.kernel
@@ -423,7 +425,6 @@ def log_map_from_angles(
     radial: wp.array[wp.vec2],
     transported: wp.array[wp.vec2],
     distance: wp.array[wp.float64],
-    reference_tolerance: wp.float32,
     out_log: wp.array[wp.vec2],
 ) -> None:
     # Polar coordinates of each vertex as seen from the source.
@@ -436,13 +437,12 @@ def log_map_from_angles(
     reference = transported[v]
     outward = radial[v]
     r = wp.float32(distance[v])
-    # ``reference`` is the raw (unnormalized) diffused field -- the same quantity
-    # ``transport_tangent_vectors`` calls ``direction`` and floors relative to its own maximum, so
-    # this comparison must be too, for the identical reason ``world_to_tangent_unit`` above needs
-    # one. ``outward`` is different: ``world_to_tangent_unit`` already normalized it to unit length
-    # or exactly zero, so comparing it to the fixed ``TOLERANCE_ZERO_CONSTANT`` here is only asking
-    # "was it zeroed", not re-testing a raw physical magnitude.
-    if wp.length(reference) <= reference_tolerance or wp.length(outward) <= TOLERANCE_ZERO_CONSTANT:
+    # Both are unit length or exactly zero: ``narrow_direction`` and ``world_to_tangent_unit``
+    # normalized them before narrowing, so the test is only "was it zeroed".
+    if (
+        wp.length(reference) <= TOLERANCE_ZERO_CONSTANT
+        or wp.length(outward) <= TOLERANCE_ZERO_CONSTANT
+    ):
         # On the cut locus the transported directions arriving from either side cancel and there is
         # no angle to report -- the log map genuinely has none there. Keep the radius and use angle
         # zero, so the magnitude still means what it should.

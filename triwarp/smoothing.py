@@ -2400,17 +2400,44 @@ def smooth_region_boundary(
         else tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
     )
     positions = wp.clone(vertices)
+    free_map, n_free = twl.free_partition(fixed_mask)
+    if n_free == 0:
+        return positions
+    field_2d = twt.as_array2d(field, wp.float64)
+    # The first pass extracts the band's Dirichlet system from the mesh-wide ``-cotmatrix``, and
+    # every later one rewrites that same system's values and right-hand side from the new
+    # cotangents (``band_dirichlet_values``): the connectivity, the free set and so the pattern are
+    # the same every pass and only the weights move. Keeping one operator object also keeps one
+    # conjugate-gradient state across the passes, whose recorded loop every pass after the first
+    # replays; its Jacobi diagonal is the first pass's, which moves the rate by a little and the
+    # answer not at all. Each pass warm-starts from the previous pass's field.
+    operator = wps.bsr_scale(laplacian.cotmatrix(positions, faces, dtype=wp.float64), -1.0)
+    system, rhs = twl.assemble_interior_system(operator, fixed_mask, free_map, field_2d, n_free)
+    free_vertices = tw.array.flatnonzero(free)
+    solution = twt.as_array2d(wp.zeros((1, n_free), dtype=wp.float64, device=device), wp.float64)
     nxt = wp.empty(n_vertices, dtype=wp.vec3, device=device)
     solved = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    for _ in range(iterations):
-        # The cotangent weights depend on the positions, so the field is re-solved every pass; the
-        # pinned +-1 entries are the same each time and only the band's values change.
-        operator = wps.bsr_scale(laplacian.cotmatrix(positions, faces, dtype=wp.float64), -1.0)
-        solution, free_map, n_free = twl.min_quad_with_fixed(
-            operator, fixed_mask, twt.as_array2d(field, wp.float64)
-        )
-        if n_free == 0:
-            break
+    for iteration in range(iterations):
+        if iteration > 0:
+            wp.launch(
+                kernel_smoothing.band_dirichlet_values,
+                dim=n_free,
+                inputs=[
+                    free_vertices,
+                    fixed_mask,
+                    free_map,
+                    offsets,
+                    vf_indices,
+                    faces,
+                    laplacian.cotmatrix_entries(positions, faces),
+                    field_2d,
+                    system.offsets,
+                    system.columns,
+                ],
+                outputs=[system.values, rhs],
+                device=device,
+            )
+        twl.solve_spd_columns(system, rhs, solution, tol=twl.CG_TOLERANCE)
         wp.copy(solved, field[0])
         wp.launch(
             kernel_smoothing.scatter_free_scalar,

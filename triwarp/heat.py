@@ -70,15 +70,19 @@ from triwarp.triangles import face_normals_and_areas
 # spelled three times when these were three modules.
 _CG_TOLERANCE = 1e-8
 
-# A diffused tangent field is treated as having vanished below this fraction of its *own* maximum,
-# never below a fixed absolute floor. Every field this module normalizes this way -- the signed
-# heat method's diffused direction field, the vector heat method's transported direction and its
-# source indicator -- carries the mesh's scale as ~1/scale, so an absolute cutoff silently zeroes
-# most of the field on a mesh measured in millimetres, all of which is resolved when the cutoff is
-# taken relative to the field's own maximum. It is deliberately
-# far below the round-off floor (~1e-08 of the maximum): see ``kernels/heat.py`` for why nothing
-# here can separate noise from signal.
-_RELATIVE_ZERO = 1e-12
+# Rounds per chunk of a heat solve that must reach every vertex, and the per-vertex relative change
+# below which a chunk counts as converged (see ``_diffuse``). The change collapses by six or more
+# orders of magnitude in the chunk after the field settles -- measured on spheres, a hemisphere and
+# the two bunnies, from about 1 to 1e-7 or less -- so the threshold is not a tuning knob.
+_HEAT_CHUNK = 64
+_HEAT_CHANGE_TOLERANCE = 1e-6
+
+# A bound for the entries that never settle relative to themselves (see ``_diffuse``): the solve
+# stops this many chunks after it reached every vertex. The number of rounds a field needs past
+# full reach does not grow with the mesh -- it is the heat system's own conditioning, fixed by
+# ``t = h ** 2`` -- and measured at 80-150 on spheres from 2.5 k to 41 k vertices, a hemisphere and
+# both bunnies, so three chunks (192 rounds) covers every one.
+_HEAT_SETTLE_CHUNKS = 3
 
 
 HeatOperators = tuple[
@@ -171,11 +175,12 @@ def heat_operators(
     The Poisson operator and both preconditioners are here because they satisfy this
     function's own contract — they depend on the mesh alone — so
     [`heat_geodesic`][triwarp.heat.heat_geodesic] need not rebuild all three on every call, which
-    is unnecessary work whenever the mesh is unchanged across several solves. It is *only* those
-    three — the solver **state** is deliberately not cached, because a ``warp.optim.linear`` state
-    captures its right-hand-side and solution buffers at construction, which would make these
-    operators stateful and unsafe to share between two concurrent solves. The remaining lever for
-    repeated calls is conditioning. The Poisson solve is the long one -- ``-L`` is the
+    is unnecessary work whenever the mesh is unchanged across several solves. The solver
+    **state** is not in the tuple: [`solve_spd`][triwarp.linalg.solve_spd] keeps one per operator
+    itself, owning its own buffers, so passing these operators back also replays the solves'
+    recorded loops rather than recording them again -- and, as with the polynomial's vectors below,
+    two solves against one operator must run on one stream. The remaining lever for repeated calls
+    is conditioning. The Poisson solve is the long one -- ``-L`` is the
     ill-conditioned operator here, where the heat system's mass term keeps it close to diagonal --
     so it takes the polynomial preconditioner and the heat system keeps Jacobi, which a
     well-conditioned solve of a few tens of iterations cannot beat. The polynomial holds working
@@ -259,7 +264,7 @@ def heat_operators(
     poisson_system = cast("wps.BsrMatrix[wp.float64]", wps.bsr_axpy(x=laplacian, alpha=-1.0))
     return (
         heat_system,
-        wpl.preconditioner(heat_system, "diag"),
+        twl.jacobi_preconditioner(heat_system),
         laplacian,
         poisson_system,
         twl.chebyshev_preconditioner(poisson_system),
@@ -354,7 +359,14 @@ def heat_geodesic(
         areas,
     ) = operators
 
-    # Heat solve: (M - t L) u = u0, with u0 the source indicator.
+    # Heat solve: (M - t L) u = u0, with u0 the source indicator, run until every vertex's heat has
+    # converged relative to its own size (``_diffuse``) -- not to a residual tolerance, which the
+    # far field sits hundreds of orders of magnitude below. Neumann on a boundary, as
+    # geometry-central (``potpourri3d``) and MeshLab take it. ``igl::heat_geodesics_solve``
+    # averages it with the solution pinned to zero on the boundary instead, and against exact
+    # polyhedral geodesics (``igl.exact_geodesic``) that average is the less accurate of the two:
+    # equal on a hemisphere, and 1.15 % against 0.93 % mean error (4.9 % against 3.1 % worst) of
+    # the distance range on a half torus.
     u0 = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
         kernel_heat.seed_source_indicator,
@@ -364,7 +376,7 @@ def heat_geodesic(
     )
 
     heat = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    twl.solve_spd(heat_system, u0, heat, tol=_CG_TOLERANCE, preconditioner=heat_preconditioner)
+    _diffuse(heat_system, u0, heat, heat_preconditioner)
 
     # Integrated divergence b = div(X) of the unit field X = -grad(u)/|grad(u)|, then a Poisson
     # solve L phi = b, i.e. (-L) phi = -b with the positive semi-definite operator. One launch: the
@@ -388,16 +400,96 @@ def heat_geodesic(
         preconditioner=poisson_preconditioner,
     )
 
-    # Shift so the distance field is zero at the (nearest) source. For a correctly signed field
-    # the global minimum sits at the source set, so subtracting it yields a nonnegative field.
-    # A device reduction rather than ``phi.numpy().min()``: ``phi`` is float64, so a readback moves
-    # 8 B per vertex across the bus to produce one scalar, which dominates on a large mesh even
-    # though a host reduction wins on a small one.
-    # ``phi`` is handed back as ``wp.array[wp.float64]``, so it cannot be allocated through
-    # ``empty_1d`` (``NDim`` is invariant); the cast is what tells the overload set its dtype.
-    offset = float(twr.min(cast(twt.ArrayNdFloat64, phi)))
+    # Shift so the field's mean over the sources is zero, and orient it positive -- the
+    # ``igl::heat_geodesics_solve`` convention, which makes a single source's distance exactly
+    # zero. One gathered mean and one global mean, both reductions on the device.
+    offset = float(twr.mean(tw.array.gather(phi, sources)))
     wp.map(wp.sub, phi, wp.float64(offset), out=phi)
+    if float(twr.mean(cast(twt.ArrayNdFloat64, phi))) < 0.0:
+        wp.map(wp.neg, phi, out=phi)
     return phi
+
+
+def _diffuse(
+    system: wps.BsrMatrix[Any],
+    rhs: wp.array[Any],
+    solution: wp.array[Any],
+    preconditioner: wpl.LinearOperator | None,
+) -> None:
+    """
+    Solve a heat system until every vertex's value has converged relative to its own size.
+
+    The heat method's diffused sources fall by a near-constant factor per ring of vertices, so the
+    far field is hundreds of orders of magnitude below the peak -- ``float64`` holds it, and igl's
+    direct factorization resolves it -- and a conjugate gradient stopped on its residual leaves it
+    as noise: an iterate after ``k`` rounds is a degree-``k`` polynomial in the operator applied to
+    the sources, so it is exactly zero more than ``k`` rings away, and the residual converges long
+    before ``k`` reaches the far side of the mesh. Measured on a unit ``icosphere(5)``, the old
+    residual-stopped solve left 92 % of the vertices without heat and put ``heat_geodesic`` up to
+    2.3 off the great-circle distance.
+
+    So the solve runs in warm-restarted chunks of ``_HEAT_CHUNK`` rounds at a zero tolerance, and
+    after each chunk ``kernels/heat.heat_chunk_change`` measures, over every entry of ``solution``,
+    the largest relative change and the number of entries reached. It stops once no entry is newly
+    reached and none moved by more than ``_HEAT_CHANGE_TOLERANCE`` -- or, for an entry that never
+    settles because it cancels toward zero (a transported vector on the cut locus, whose value is
+    round-off relative to itself), ``_HEAT_SETTLE_CHUNKS`` chunks after the last vertex was
+    reached. One readback a chunk.
+
+    Jacobi rather than the Jacobi-Chebyshev polynomial, although a polynomial round reaches a dozen
+    rings where a Jacobi round reaches one: measured 1.3-1.8x faster on the sphere and **wrong** on
+    ``bunny`` -- the distance 0.9 of its range off igl's and the scalar extension divergent -- where
+    obtuse triangles make the heat system's off-diagonal entries positive.
+
+    ``system`` is a scalar operator with ``float64`` right-hand sides, a ``wp.mat22d`` one with
+    ``wp.vec2d`` ones, or a scalar one with ``(n_columns, n)`` ones.
+    """
+    device = rhs.device
+    flat = _as_flat_float64(solution)
+    n = int(flat.shape[0])
+    previous = wp.zeros(n, dtype=wp.float64, device=device)
+    stats = wp.zeros(2, dtype=wp.float64, device=device)
+    rows = int(solution.shape[-1]) if solution.ndim == 2 else int(solution.shape[0])
+    reached = -1.0
+    reach_chunks = 0
+    for chunk in range(1, max(2, (twl.CG_MAXITER_FACTOR * rows) // _HEAT_CHUNK) + 1):
+        if solution.ndim == 2:
+            twl.solve_spd_columns(
+                system, rhs, solution, tol=0.0, maxiter=_HEAT_CHUNK, check_every=0
+            )
+        else:
+            twl.solve_spd(
+                system,
+                rhs,
+                solution,
+                tol=0.0,
+                maxiter=_HEAT_CHUNK,
+                check_every=0,
+                preconditioner=preconditioner,
+            )
+        stats.zero_()
+        wp.launch_tiled(
+            kernel_heat.heat_chunk_change,
+            dim=[kernel_reduce.blocks_1d(n)],
+            inputs=[flat, previous],
+            outputs=[stats],
+            block_dim=TILE_1D,
+            device=device,
+        )
+        change, now_reached = (float(x) for x in stats.numpy())
+        if now_reached != reached:
+            reached, reach_chunks = now_reached, chunk
+            continue
+        settled = chunk - reach_chunks >= _HEAT_SETTLE_CHUNKS
+        if change < _HEAT_CHANGE_TOLERANCE or settled:
+            return
+
+
+def _as_flat_float64(values: wp.array[Any]) -> wp.array[wp.float64]:
+    """View a contiguous scalar, ``wp.vec2d`` or rank-2 ``float64`` array as flat ``float64``."""
+    if values.dtype == wp.vec2d:
+        return values.view(wp.float64).flatten()
+    return values.flatten()
 
 
 # --------------------------------------------------------------------------------------
@@ -522,17 +614,10 @@ def heat_signed_distance(
     diffused = tw.heat.diffuse_tangent_field(
         vector_system, source, preconditioner=vector_preconditioner
     )
-    diffused_lengths = twt.empty_1d(n_vertices, wp.float64, device=device)
-    wp.map(wp.length, diffused, out=diffused_lengths)
-    diffused_maximum = tw.reduce.max(diffused_lengths)
-
+    # Normalized without underflow and zero only where the field is exactly zero: it is converged
+    # per vertex (``_diffuse``), so its far field is a direction however small.
     unit_field = wp.empty(n_vertices, dtype=wp.vec2d, device=device)
-    wp.map(
-        kernel_predicates.normalize_or_zero,
-        diffused,
-        wp.float64(_RELATIVE_ZERO * diffused_maximum),
-        out=unit_field,
-    )
+    wp.map(kernel_predicates.stable_normalize, diffused, out=unit_field)
 
     # Stage 3: integrate the unit field back into a scalar with a Poisson solve. The cotangent
     # weights and face normals come from the same bundle, so the Poisson stage and the diffusion
@@ -678,12 +763,17 @@ def _solve_poisson_shifted(
 # The vector heat method: transport, scalar extension and the logarithmic map
 # --------------------------------------------------------------------------------------
 
-# Below this fraction of the direction field's maximum, a transported direction cannot be told from
-# the round-off the solve leaves where the transported copies cancel. It sits about a decade above
-# that floor, and the *only* thing it drives is the mask
+# Below this fraction of the diffused *magnitudes at the same vertex*, a transported direction
+# cannot be told from the round-off left where the transported copies cancel (the cut locus). The
+# ratio is 1 where the copies agree -- a vector's length never exceeds the heat of its magnitude --
+# so the test is local and scale-free, and a far vertex is resolved however small its field.
+# Round-off at an exact cancellation measured 1.4e-7 of the local magnitude (``cave_cube``'s
+# antipodal corner: the transport angles are ``float32``), genuine directions 0.36 and more, so the
+# threshold sits
+# three decades above the round-off. The *only* thing it drives is the mask
 # ``transport_tangent_vectors`` returns alongside its vectors -- no value is zeroed by it, so
 # flagging a marginal vertex costs the caller nothing.
-_RESOLVED_FRACTION = 1e-7
+_RESOLVED_FRACTION = 1e-4
 
 
 VectorHeatOperators = tuple[
@@ -802,7 +892,7 @@ def vector_heat_operators(
         scalar_operators = heat_operators(vertices, faces, t)
     if frames is None:
         frames = vertex_tangent_frames(vertices, faces)
-    preconditioner = wpl.preconditioner(vector_system, "diag")
+    preconditioner = twl.jacobi_preconditioner(vector_system)
     return vector_system, scalar_operators, frames, preconditioner
 
 
@@ -887,8 +977,18 @@ def extend_scalar(
 
     if operators is None:
         operators = heat_operators(vertices, faces, t)
-    heat_system = operators[0]
+    return _extend(operators[0], sources, values, n_vertices, device)[0]
 
+
+def _extend(
+    heat_system: wps.BsrMatrix[wp.float64],
+    sources: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    n_vertices: int,
+    device: wp.DeviceLike,
+) -> tuple[wp.array[wp.float64], wp.array[wp.float64]]:
+    """``extend_scalar``'s body, also returning the diffused ``values`` it divides."""
+    n_sources = int(sources.shape[0])
     # The indicator and the weighted values diffuse through the same operator, so they are one
     # batched two-column solve (``linalg.solve_spd_columns``) rather than two independent ones,
     # which shares the launches and converges on the worse-behaved of the two columns.
@@ -902,16 +1002,14 @@ def extend_scalar(
     diffused = twt.as_array2d(
         wp.zeros((2, n_vertices), dtype=wp.float64, device=device), wp.float64
     )
-    twl.solve_spd_columns(heat_system, rhs, diffused, tol=_CG_TOLERANCE)
+    _diffuse(heat_system, rhs, diffused, None)
     diffused_indicator, diffused_values = twt.as_dense(diffused[0]), twt.as_dense(diffused[1])
 
-    # The indicator decays away from the sources *and* carries the mesh's scale, so the "there is no
-    # source anywhere near here" cutoff is a fraction of its own maximum. One host readback, as in
-    # ``transport_tangent_vectors``.
-    floor = wp.float64(_RELATIVE_ZERO * tw.reduce.max(diffused_indicator))
+    # Converged per vertex, so only an exactly zero indicator -- a component no source reaches --
+    # has no value to extend (``divide_nonzero``).
     extended = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.map(kernel_heat.divide_positive, diffused_values, diffused_indicator, floor, out=extended)
-    return extended
+    wp.map(kernel_heat.divide_nonzero, diffused_values, diffused_indicator, out=extended)
+    return extended, diffused_values
 
 
 def transport_tangent_vectors(
@@ -1025,28 +1123,20 @@ def transport_tangent_vectors(
 
     magnitudes = wp.empty(n_sources, dtype=wp.float64, device=device)
     wp.map(wp.length, vectors_d, out=magnitudes)
-    extended = extend_scalar(vertices, faces, sources, magnitudes, operators=scalar)
-
-    # Both questions below are asked relative to the field, because the field's length carries the
-    # mesh's scale. One host readback here (``reduce.max`` returns a Python scalar) is negligible
-    # next to the three conjugate-gradient solves this function has already run.
-    lengths = twt.empty_1d(n_vertices, wp.float64, device=device)
-    wp.map(wp.length, direction, out=lengths)
-    maximum = tw.reduce.max(lengths)
+    extended, diffused_magnitudes = _extend(scalar[0], sources, magnitudes, n_vertices, device)
 
     # One map for the whole tail: the rescale, the narrowing to the field's storage precision and
     # the resolution test all read one vertex's own data, so running them apart costs two extra
-    # launches and a full round trip of the rescaled float64 field. Both floors are relative to
-    # the same maximum and mean different things -- see the kernel func.
+    # launches and a full round trip of the rescaled float64 field. Resolution is asked locally,
+    # against the diffused magnitudes at the same vertex -- see the kernel func.
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     resolved = wp.empty(n_vertices, dtype=wp.bool, device=device)
     wp.map(
         kernel_heat.transported_and_resolved,
         direction,
         extended,
-        lengths,
-        wp.float64(_RELATIVE_ZERO * maximum),
-        wp.float64(_RESOLVED_FRACTION * maximum),
+        diffused_magnitudes,
+        wp.float64(_RESOLVED_FRACTION),
         out=[transported, resolved],
     )
     return transported, resolved
@@ -1134,13 +1224,9 @@ def log_map(
     transported_raw = _diffuse_from_sources(
         vector_system, sources, reference, n_vertices, device, preconditioner=vector_preconditioner
     )
-    # One map over ``transported_raw``, two outputs: the narrowed vector and its length are two
-    # reads of the same entry, so a second pass would only re-read the field to measure what the
-    # first already had in registers.
+    # Normalized in ``float64`` before it is narrowed, which the far field needs to survive.
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    reference_lengths = twt.empty_1d(n_vertices, wp.float64, device=device)
-    wp.map(kernel_heat.narrow_and_length, transported_raw, out=[transported, reference_lengths])
-    reference_tolerance = wp.float32(_RELATIVE_ZERO * tw.reduce.max(reference_lengths))
+    wp.map(kernel_heat.narrow_direction, transported_raw, out=transported)
 
     # Radial direction: the unit gradient of the distance field, averaged onto vertices and
     # expressed in each vertex's frame.
@@ -1154,29 +1240,14 @@ def log_map(
         inputs=[vertices, faces, normals, areas, distance, vertex_gradient],
         device=device,
     )
-    # ``vertex_gradient`` is an area-weighted *sum* of unit vectors (see
-    # ``scatter_unit_gradient_to_vertices``), so its magnitude carries the mesh's coordinate scale
-    # squared and the floor below it has to be relative to its own maximum -- the same reasoning as
-    # ``reference_tolerance`` above, applied to a differently-scaled field.
-    gradient_lengths = twt.empty_1d(n_vertices, wp.float32, device=device)
-    wp.map(wp.length, vertex_gradient, out=gradient_lengths)
-    gradient_tolerance = wp.float32(_RELATIVE_ZERO * tw.reduce.max(gradient_lengths))
-
     radial = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.map(
-        kernel_heat.world_to_tangent_unit,
-        vertex_gradient,
-        basis_x,
-        basis_y,
-        gradient_tolerance,
-        out=radial,
-    )
+    wp.map(kernel_heat.world_to_tangent_unit, vertex_gradient, basis_x, basis_y, out=radial)
 
     logarithm = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.launch(
         kernel_heat.log_map_from_angles,
         dim=n_vertices,
-        inputs=[radial, transported, distance, reference_tolerance, logarithm],
+        inputs=[radial, transported, distance, logarithm],
         device=device,
     )
     return logarithm
@@ -1283,7 +1354,7 @@ def diffuse_tangent_field(
     diffused = wp.zeros(n_vertices, dtype=wp.vec2d, device=source.device)
     if n_vertices == 0:
         return diffused
-    twl.solve_spd(system, source, diffused, tol=_CG_TOLERANCE, preconditioner=preconditioner)
+    _diffuse(system, source, diffused, preconditioner)
     return diffused
 
 

@@ -11,6 +11,11 @@ triangle predicates, shared with ``kernels/predicates.py``.
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
+from triwarp.kernels.algorithms.conjugate_gradient import (
+    cg_publish_round_dots,
+    cg_round_terms,
+    cg_widen,
+)
 from triwarp.kernels.array import (
     is_positive_finite,
     lattice_position,
@@ -748,7 +753,7 @@ def normalized_field_component(
 def poisson_neighbor_degree(i: wp.int32, j: wp.int32, k: wp.int32, res: wp.int32) -> wp.float32:
     # Number of (i, j, k)'s up-to-6 axis-aligned grid neighbours that lie inside [0, res) -- the
     # diagonal degree of the homogeneous-Neumann 7-point Poisson stencil. Shared so
-    # ``screened_laplacian_matvec``'s operator and ``poisson_level_setup``'s Jacobi
+    # ``screened_laplacian_row``'s operator and ``poisson_level_setup``'s Jacobi
     # preconditioner can never disagree about which grid nodes are boundary nodes.
     deg = wp.float32(0.0)
     if i + 1 < res:
@@ -766,19 +771,45 @@ def poisson_neighbor_degree(i: wp.int32, j: wp.int32, k: wp.int32, res: wp.int32
     return deg
 
 
-@wp.kernel(enable_backward=False)
-def screened_laplacian_matvec(
-    x: wp.array[wp.float32],
-    y: wp.array[wp.float32],
+@wp.func
+def screened_laplacian_inverse_diagonal(
+    lap: wp.float32,
     weights: wp.array[wp.float32],
     screen: wp.float32,
-    alpha: wp.float32,
-    beta: wp.float32,
     res: wp.int32,
-    out_z: wp.array[wp.float32],
-) -> None:
-    # z = alpha * (A @ x) + beta * y, with A = L_N + screen * diag(W).
-    i, j, k = wp.tid()
+    i: wp.int32,
+    j: wp.int32,
+    k: wp.int32,
+) -> wp.float32:
+    # ``1 / A_ii`` for ``screened_laplacian_row``'s operator, 1 where the diagonal is not positive:
+    # the Jacobi scaling of the solve (``poisson_level_setup``, ``lap = 1``) and of every V-cycle
+    # level (``poisson_mg_inverse_diagonal``).
+    d = (
+        lap * poisson_neighbor_degree(i, j, k, res)
+        + screen * weights[poisson_grid_index(i, j, k, res)]
+    )
+    if d <= 0.0:
+        d = 1.0
+    return 1.0 / d
+
+
+@wp.func
+def screened_laplacian_row(
+    lap: wp.float32,
+    x: wp.array[wp.float32],
+    weights: wp.array[wp.float32],
+    screen: wp.float32,
+    res: wp.int32,
+    i: wp.int32,
+    j: wp.int32,
+    k: wp.int32,
+) -> wp.float32:
+    # Row ``(i, j, k)`` of ``A x`` for ``A = L_N + screen * diag(W)``, the homogeneous-Neumann
+    # 7-point stencil plus the screening term, with the stencil scaled by ``lap``: 1 on the grid the
+    # solve is posed on, ``2 ** level`` on the multigrid preconditioner's coarser grids (see
+    # ``poisson_mg_inverse_diagonal``). Shared by the solve's initial residual
+    # (``poisson_cg_initial``), its rounds' mat-vec (``poisson_cg_matvec_dots``) and the V-cycle's
+    # smoother and residual, so none of them can apply a different operator.
     idx = poisson_grid_index(i, j, k, res)
     xc = x[idx]
     deg = poisson_neighbor_degree(i, j, k, res)
@@ -797,8 +828,104 @@ def screened_laplacian_matvec(
         acc += x[poisson_grid_index(i, j, k + 1, res)]
     if k - 1 >= 0:
         acc += x[poisson_grid_index(i, j, k - 1, res)]
-    ax = (deg * xc - acc) + screen * weights[idx] * xc
-    out_z[idx] = alpha * ax + beta * y[idx]
+    return lap * (deg * xc - acc) + screen * weights[idx] * xc
+
+
+@wp.func
+def poisson_grid_coordinates(index: wp.int32, res: wp.int32) -> wp.vec3i:
+    # The inverse of ``poisson_grid_index``: row-major, ``k`` fastest.
+    return wp.vec3i(index // (res * res), (index // res) % res, index % res)
+
+
+@wp.kernel(enable_backward=False)
+def poisson_cg_initial(
+    n: wp.int32,
+    span: wp.int32,
+    res: wp.int32,
+    weights: wp.array[wp.float32],
+    screen: wp.float32,
+    rhs: wp.array[wp.float32],
+    x: wp.array[wp.float32],
+    inv_diag: wp.array[wp.float32],
+    out_r: wp.array[wp.float32],
+    out_u: wp.array[wp.float32],
+    out_p: wp.array[wp.float32],
+    out_s: wp.array[wp.float32],
+    out_partials: wp.array3d[wp.float64],
+) -> None:
+    # ``kernels/algorithms/conjugate_gradient.cg_initial`` with the screened Laplacian applied
+    # matrix-free: ``r = b - A x`` from the warm start, ``u = D^-1 r``, ``p = s = 0`` and the first
+    # stage of ``||b||^2`` in ``float64``, over one column padded to whole blocks of ``span``
+    # entries. The two differ only in how ``A x`` is formed; a CSR of this stencil would be seven
+    # entries a node, and at ``2 ** 8 + 1`` nodes a side that is more memory than the whole solve.
+    blk, t = wp.tid()
+    acc = wp.float64(0.0)
+    for kk in range(t, span, wp.block_dim()):
+        local = blk * span + kk
+        b = wp.float64(0.0)
+        r = wp.float64(0.0)
+        u = wp.float64(0.0)
+        if local < n:
+            g = poisson_grid_coordinates(local, res)
+            b = wp.float64(rhs[local])
+            r = b - wp.float64(
+                screened_laplacian_row(wp.float32(1.0), x, weights, screen, res, g[0], g[1], g[2])
+            )
+            u = wp.float64(inv_diag[local]) * r
+        out_r[local] = wp.float32(r)
+        out_u[local] = wp.float32(u)
+        out_p[local] = wp.float32(0.0)
+        out_s[local] = wp.float32(0.0)
+        acc += b * b
+    total = wp.tile_sum(wp.tile(acc))[0]
+    if t == 0:
+        out_partials[0, 0, blk] = total
+
+
+@wp.kernel(enable_backward=False)
+def poisson_cg_matvec_dots(
+    n: wp.int32,
+    span: wp.int32,
+    res: wp.int32,
+    weights: wp.array[wp.float32],
+    screen: wp.float32,
+    r: wp.array[wp.float32],
+    u: wp.array[wp.float32],
+    gamma_new: wp.array[wp.float64],
+    alpha_new: wp.array[wp.float64],
+    out_w: wp.array[wp.float32],
+    out_partials: wp.array3d[wp.float64],
+    out_gamma_old: wp.array[wp.float64],
+    out_alpha_old: wp.array[wp.float64],
+    out_state: wp.array[wp.int32],
+) -> None:
+    # ``conjugate_gradient.cg_matvec_dots`` with the screened Laplacian applied matrix-free, for
+    # the dense Poisson grid's one column: ``w = A u`` and the round's three dots
+    # (``cg_round_terms``), then the shared tail (``cg_publish_round_dots``). ``cg_update`` is
+    # shared outright, at its ``float32`` overload.
+    blk, t = wp.tid()
+    acc = wp.vec3(0.0, 0.0, 0.0)
+    for kk in range(t, span, wp.block_dim()):
+        local = blk * span + kk
+        w = wp.float32(0.0)
+        if local < n:
+            g = poisson_grid_coordinates(local, res)
+            w = screened_laplacian_row(wp.float32(1.0), u, weights, screen, res, g[0], g[1], g[2])
+        out_w[local] = w
+        acc += cg_round_terms(r[local], u[local], w)
+    total = cg_widen(wp.tile_sum(wp.tile(acc, preserve_type=True))[0])
+    cg_publish_round_dots(
+        total,
+        0,
+        blk,
+        t,
+        gamma_new,
+        alpha_new,
+        out_partials,
+        out_gamma_old,
+        out_alpha_old,
+        out_state,
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -853,21 +980,9 @@ def poisson_level_setup(
     centre = poisson_grid_index(i, j, k, res)
     out_b[centre] = -(dx + dy + dz)
 
-    deg = poisson_neighbor_degree(i, j, k, res)
-    d = deg + screen * weights[centre]
-    if d <= 0.0:
-        d = 1.0
-    out_inv_diag[centre] = 1.0 / d
-
-
-@wp.func
-def diagonal_precond_axpby(
-    x: wp.float32, y: wp.float32, inv_diag: wp.float32, alpha: wp.float32, beta: wp.float32
-) -> wp.float32:
-    # One element of ``z = alpha * M^-1 x + beta * y`` for the Jacobi preconditioner
-    # ``M = diag(d)``. Mapped (not a kernel) so the wrapper can hoist the launch out of the
-    # CG iteration; see ``reconstruction._diagonal_operator``.
-    return alpha * inv_diag * x + beta * y
+    out_inv_diag[centre] = screened_laplacian_inverse_diagonal(
+        wp.float32(1.0), weights, screen, res, i, j, k
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -881,6 +996,121 @@ def prolong_grid(
         coarse, res_c, wp.float32(i) * 0.5, wp.float32(j) * 0.5, wp.float32(k) * 0.5
     )
     out_fine[poisson_grid_index(i, j, k, res_f)] = val
+
+
+# ---------------------------------------------------------------------------
+# Geometric multigrid V-cycle for the dense grid's screened Poisson solve
+# ---------------------------------------------------------------------------
+#
+# The preconditioner ``reconstruction._PoissonMultigrid`` applies inside the conjugate gradient, on
+# the nested node grids ``res_{l+1} = (res_l - 1) / 2 + 1``. Level ``l``'s operator is
+# ``2 ** l * L_l + screen * W_l`` with ``W_{l+1} = P^T W_l``: the Galerkin product ``P^T A P`` of
+# the 7-point index-space Laplacian under trilinear ``P`` is a 27-point stencil whose action on
+# smooth modes tends to twice the coarse 7-point one (and ``P^T diag(W) P`` has row sums ``P^T W``),
+# so this is that product rediscretized -- spectrally within a factor of four of it, which is all a
+# preconditioner needs, and still matrix-free. Restriction is ``P^T`` and the smoother damped
+# Jacobi, the same number of sweeps before and after, which keeps the cycle symmetric.
+
+
+@wp.kernel(enable_backward=False)
+def poisson_mg_inverse_diagonal(
+    res: wp.int32,
+    lap: wp.float32,
+    weights: wp.array[wp.float32],
+    screen: wp.float32,
+    out_inv_diag: wp.array[wp.float32],
+) -> None:
+    # One V-cycle level's Jacobi scaling, ``1 / (lap * deg + screen * w)``.
+    i, j, k = wp.tid()
+    out_inv_diag[poisson_grid_index(i, j, k, res)] = screened_laplacian_inverse_diagonal(
+        lap, weights, screen, res, i, j, k
+    )
+
+
+@wp.kernel(enable_backward=False)
+def poisson_mg_restrict(
+    fine: wp.array[wp.float32], res_f: wp.int32, res_c: wp.int32, out_coarse: wp.array[wp.float32]
+) -> None:
+    # ``P^T fine``: the exact adjoint of ``prolong_grid``'s trilinear interpolation. Coarse node
+    # ``(I, J, K)`` sits on fine node ``2 (I, J, K)`` and gathers the ``3^3`` fine nodes around it
+    # at weight ``1`` per axis on the node itself and ``1/2`` either side, skipping those outside
+    # the grid -- exactly the fine nodes whose interpolation reads it.
+    ci, cj, ck = wp.tid()
+    acc = wp.float32(0.0)
+    for di in range(-1, 2):
+        fi = 2 * ci + di
+        if fi >= 0 and fi < res_f:
+            wi = wp.where(di == 0, wp.float32(1.0), wp.float32(0.5))
+            for dj in range(-1, 2):
+                fj = 2 * cj + dj
+                if fj >= 0 and fj < res_f:
+                    wij = wi * wp.where(dj == 0, wp.float32(1.0), wp.float32(0.5))
+                    for dk in range(-1, 2):
+                        fk = 2 * ck + dk
+                        if fk >= 0 and fk < res_f:
+                            wk = wp.where(dk == 0, wp.float32(1.0), wp.float32(0.5))
+                            acc += wij * wk * fine[poisson_grid_index(fi, fj, fk, res_f)]
+    out_coarse[poisson_grid_index(ci, cj, ck, res_c)] = acc
+
+
+@wp.kernel(enable_backward=False)
+def poisson_mg_prolong_add(
+    coarse: wp.array[wp.float32],
+    res_c: wp.int32,
+    res_f: wp.int32,
+    fine: wp.array[wp.float32],
+    out_fine: wp.array[wp.float32],
+) -> None:
+    # ``out = fine + P coarse``, the coarse-grid correction; ``prolong_grid``'s interpolation.
+    # ``out_fine`` may be ``fine`` itself: each thread reads and writes only its own node.
+    i, j, k = wp.tid()
+    idx = poisson_grid_index(i, j, k, res_f)
+    correction = poisson_sample_grid(
+        coarse, res_c, wp.float32(i) * 0.5, wp.float32(j) * 0.5, wp.float32(k) * 0.5
+    )
+    out_fine[idx] = fine[idx] + correction
+
+
+@wp.kernel(enable_backward=False)
+def poisson_mg_smooth(
+    res: wp.int32,
+    lap: wp.float32,
+    weights: wp.array[wp.float32],
+    screen: wp.float32,
+    omega: wp.float32,
+    zero_start: wp.int32,
+    inv_diag: wp.array[wp.float32],
+    b: wp.array[wp.float32],
+    x: wp.array[wp.float32],
+    out_x: wp.array[wp.float32],
+) -> None:
+    # One damped-Jacobi sweep ``out = x + omega D^-1 (b - A x)`` at one V-cycle level, out of place
+    # because a sweep reads every neighbour's previous value. From ``x = 0`` (``zero_start``) it is
+    # ``omega D^-1 b`` and reads no ``x``, which is how every level starts, so no level zeroes its
+    # working vector.
+    i, j, k = wp.tid()
+    idx = poisson_grid_index(i, j, k, res)
+    if zero_start != 0:
+        out_x[idx] = omega * inv_diag[idx] * b[idx]
+        return
+    ax = screened_laplacian_row(lap, x, weights, screen, res, i, j, k)
+    out_x[idx] = x[idx] + omega * inv_diag[idx] * (b[idx] - ax)
+
+
+@wp.kernel(enable_backward=False)
+def poisson_mg_residual(
+    res: wp.int32,
+    lap: wp.float32,
+    weights: wp.array[wp.float32],
+    screen: wp.float32,
+    b: wp.array[wp.float32],
+    x: wp.array[wp.float32],
+    out_r: wp.array[wp.float32],
+) -> None:
+    # ``b - A x`` at one V-cycle level, the residual the next level corrects.
+    i, j, k = wp.tid()
+    idx = poisson_grid_index(i, j, k, res)
+    out_r[idx] = b[idx] - screened_laplacian_row(lap, x, weights, screen, res, i, j, k)
 
 
 @wp.kernel(enable_backward=False)

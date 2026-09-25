@@ -1078,6 +1078,8 @@ def _declare_map_kernels() -> None:
             (greater_equal, (gathered(wp.int32), wp.int32(1)), wp.bool),
             (inverse_or_one, (dense(wp.float64),), wp.float64),
             (inverse_or_one, (single(wp.float64),), wp.float64),
+            # ``linalg._BatchedCg``'s Jacobi diagonal of a ``float32`` system (``reconstruction``).
+            (inverse_or_one, (dense(wp.float32),), wp.float32),
             (
                 is_close_scalar,
                 (dense(wp.float32), dense(wp.float32), wp.float32(1), wp.float32(1)),

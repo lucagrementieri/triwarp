@@ -46,6 +46,7 @@ from tests.conftest import MESHES
 from tests.conversions import (
     bsr_to_dense,
     meshlib_scalars_to_numpy,
+    numpy_to_warp,
     points_to_warp,
     points_to_warp_uv,
     trimesh_to_meshlib,
@@ -323,6 +324,33 @@ def test_heat_geodesic_multi_source_matches_igl(
     distance_wp = tw.heat.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp)
 
     assert np.allclose(distance_wp.numpy(), distance_igl, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("n_sources", [1, 3])
+def test_heat_geodesic_matches_igl_far_from_the_sources(device: str, n_sources: int) -> None:
+    """
+    Class A at 5e-3 of the distance range, on a mesh large enough to have a far field.
+
+    ``icosphere(5)`` (10 242 vertices, 96 rings from pole to pole) rather than a ``conftest``
+    fixture, because the defect this pins is invisible below about a dozen rings, which is every
+    fixture: a conjugate-gradient heat solve stopped on its residual is exactly zero more than its
+    iteration count away from the sources, and it used to stop after ~30 rounds -- leaving 92 % of
+    this sphere without heat and the distance up to 2.3 off, against igl's 0.019. Measured
+    agreement now 1e-4 (one source) and 1.3e-3 (three) of the range, igl factorizing where
+    triwarp iterates until every vertex has converged relative to itself.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=5)
+    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.array(mesh_tm.faces, dtype=np.int64)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np.ravel(), device)
+    n_vertices = len(vertices_np)
+    sources_np = np.array([0, n_vertices // 2, n_vertices // 3][:n_sources], dtype=np.int64)
+    distance_igl = _heat_geodesic_igl(vertices_np, faces_np, sources_np)
+    distance_wp = tw.heat.heat_geodesic(
+        vertices_wp, faces_wp, wp.array(sources_np.astype(np.int32), dtype=wp.int32, device=device)
+    ).numpy()
+    assert np.ptp(distance_igl) > 1.0
+    assert np.abs(distance_wp - distance_igl).max() < 5e-3 * np.ptp(distance_igl)
 
 
 def test_heat_geodesic_approximates_exact(device: str, icosahedron: tuple[object, wp.Mesh]) -> None:
@@ -1014,6 +1042,33 @@ def test_extend_scalar_matches_potpourri3d(
     assert extended_wp.numpy().max() <= values_np.max() + 1e-6
 
 
+def test_extend_scalar_matches_potpourri3d_far_from_the_sources(device: str) -> None:
+    """
+    Class A on ``icosphere(5)``: the extension has a value everywhere, not only near its sources.
+
+    The far-field counterpart of the comparison above, which runs on fixtures too small to have a
+    far field (see ``test_heat_geodesic_matches_igl_far_from_the_sources`` for why). The extension
+    used to return zero wherever the diffused indicator fell below ``1e-12`` of its maximum, which
+    on this sphere was most of it: mean error 1.39 on a source range of [1, 3]. Measured agreement
+    now below 1e-6.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=5)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, np.ravel(mesh_tm.faces), device)
+    sources_np = np.array([0, len(mesh_tm.vertices) // 2], dtype=np.int32)
+    values_np = np.array([1.0, 3.0])
+    extended_wp = tw.heat.extend_scalar(
+        vertices_wp,
+        faces_wp,
+        wp.array(sources_np, dtype=wp.int32, device=device),
+        wp.array(values_np, dtype=wp.float64, device=device),
+    ).numpy()
+    extended_pp = np.asarray(
+        _solver_pp(mesh_tm).extend_scalar(sources_np.tolist(), values_np.tolist())
+    )
+    assert np.ptp(extended_pp) > 1.9
+    assert np.abs(extended_wp - extended_pp).max() < 1e-3
+
+
 def test_extend_scalar_single_source_is_constant(
     icosahedron: tuple[object, wp.Mesh], device: str
 ) -> None:
@@ -1392,6 +1447,30 @@ def test_log_map_matches_potpourri3d(
     # bounding
     # diagonal on ``hemisphere`` (97 vertices) and 2.8% on ``half_torus`` (544).
     assert np.median(error) < 0.15 * scale
+
+
+def test_log_map_radius_matches_potpourri3d_far_from_the_sources(device: str) -> None:
+    """
+    Class B (a norm, which removes the tangent-plane gauge): the radius is the geodesic distance.
+
+    The far-field counterpart of the comparison above, on ``icosphere(5)`` (see
+    ``test_heat_geodesic_matches_igl_far_from_the_sources`` for why a ``conftest`` sphere has no
+    far field). Taking ``|log|`` on both sides removes the rotation between the two reference
+    directions. The exact great-circle distance is asserted alongside as an invariant: measured
+    0.021 against potpourri3d and 0.019 against the exact field (potpourri3d's own is 0.040), on
+    both devices; the bounds sit 3x above. Before the heat solve ran to full reach the radius was
+    2.30 off potpourri3d's and 2.34 off the exact field at worst, which fails both bounds.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=5)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, np.ravel(mesh_tm.faces), device)
+    radius_wp = np.linalg.norm(tw.heat.log_map(vertices_wp, faces_wp, 0).numpy(), axis=1)
+    radius_pp = np.linalg.norm(
+        np.asarray(_solver_pp(mesh_tm).compute_log_map(0, "VectorHeat")), axis=1
+    )
+    exact_np = np.arccos(np.clip(mesh_tm.vertices @ mesh_tm.vertices[0], -1.0, 1.0))
+    assert radius_pp.max() > 3.0
+    assert np.abs(radius_wp - radius_pp).max() < 0.065
+    assert np.abs(radius_wp - exact_np).max() < 0.06
 
 
 def test_log_map_is_zero_at_its_source(icosahedron: tuple[object, wp.Mesh], device: str) -> None:

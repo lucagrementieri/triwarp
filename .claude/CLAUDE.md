@@ -3577,6 +3577,15 @@ The `nnz`-is-a-capacity rule and its consequences are §3.7. Three further behav
   iteration cost. `linalg._BatchedCg` works around it with a real two-stage per-column tree
   (1.10-1.50x end to end, iteration counts unchanged); running one unbatched `cg` per column instead
   reaches the good reduction but duplicates every other kernel in the iteration and loses overall.
+- **`warp.optim.linear.cg` at `check_every=0` records, instantiates and launches a fresh
+  conditional graph on every call** (`_run_capturable_loop` opens a `wp.ScopedCapture` around its
+  `capture_while` each time), so every single-column `solve_spd` pays §14.3's "record, replay
+  once" row. Measured on a heat solve at 2 562 and 10 242 vertices, flat in the size: **2.07-2.10 ms**
+  through `wpl.cg`, **1.33-1.36 ms** through a fresh `_BatchedCg` (which records too), **0.61-0.63 ms**
+  replaying a persistent `_BatchedCg` (`plans/benchmark-round-16-data/probes/solve_reuse.py`). On
+  small and medium systems the graph costs more than the iterations; keep the solver object where
+  the operator is reused. **Addressed in round 16** (§16.16): no scalar or `wp.mat22d` solve in the tree
+  reaches `wpl.cg` any more, and a solve keeps one recorded state per operator.
 - **`warp.optim.linear.cg` silently resolves an omitted `atol` to `atol := tol`, turning a relative
   residual tolerance into an absolute floor of the same numeric value** — its convergence criterion
   is `max(atol, tol * ‖b‖)`. Once a right-hand side's norm falls below that floor, the solve returns
@@ -6022,3 +6031,252 @@ change. Probes are in `plans/benchmark-round-15-data/probes/`.
       (1.28x on the cleanup); `refine_and_smooth_region` builds one `edges_unique` for the
       boundary mask, both regions and `exclude_fully_selected_components`, where it built three.
 
+
+### 16.16 Benchmark round 16 (2026-09-24)
+
+Items from `plans/benchmark-round-11.md` (round 16), each timed against a detached `a1c0f29`
+worktree through `plans/baseshim.py` (harness, interleaved, min over 2-4 rounds), iteration counts
+from `cg_trace_plugin.py`, byte-identity on the CPU oracle where the schedule was the change.
+Probes are `plans/benchmark-round-16-data/probes/r16_*.py`; the iteration traces of both arms
+are `cgtrace_r16_{base,new}.txt` there.
+
+- **R16-1: every scalar `float64` solve runs `_BatchedCg`, and a solve keeps its state per
+  operator.** §12.7's per-call recording of `wpl.cg` was the largest single-solve cost: the
+  column solvers now take `_BatchedCg` at one column too, and `solve_spd` does whenever its
+  preconditioner is `None` or one `linalg` built *for that matrix* (`jacobi_preconditioner`, new
+  and public, and `chebyshev_preconditioner`, both tagged with a weakref to their matrix); any
+  other `LinearOperator` still goes to Warp. `_cached_solver` keeps one state per `(operator,
+  configuration)` in a `weakref.WeakKeyDictionary`, so a hoisted operator replays its recorded
+  loop. `heat_geodesic[amortized]` **2.0-3.1x**, `[full]` 1.2-1.5x, `transport_tangent_vectors
+  [amortized]` 1.2x (2.3-2.6x with the block path below), `solve_spd_columns[every]` 1.65x.
+    - **The state must not hold its own key.** A `_BatchedCg` holding the matrix keeps the weak
+      entry alive for ever, and so does a `_JacobiChebyshev` or a multigrid level. The cached
+      state is built over `_storage_alias(matrix)` -- a second `BsrMatrix` sharing the arrays --
+      which holds every pointer the graph recorded and not the key. The key carries the arrays'
+      identities, so a matrix whose storage is replaced gets a new state. `test_solver_cache_
+      does_not_outlive_its_operator` pins the lifetime with `gc.collect()`.
+    - **The graph writes `x` through a pointer taken at record time**, so a state that outlives
+      one call owns its solution buffer and copies in and out (`_BatchedCg.solve`); the right-hand
+      side is read outside the graph. Returned device arrays alias the state and are overwritten
+      by the next solve against the operator.
+    - **Values rewritten in place are not detected, and need not be for correctness**: the mat-vec
+      reads them live, so only the preconditioner goes stale. That is a rate change for Jacobi and
+      is used deliberately by `smooth_region_boundary` (below); a Chebyshev or multigrid state with
+      a stale interval is a definiteness risk, so no in-repo caller rewrites under one.
+    - **A `wp.mat22d` operator is solved as its scalar expansion** (`_scalar_expansion`, cached per
+      operator; `kernels/linalg.expand_block_csr_2x2`), with the `wp.vec2d` operands viewed as
+      `float64`. Exact, because Warp's blocked Jacobi (`_extract_inverse_diagonal_blocked`)
+      inverts each diagonal block's diagonal *coefficients*, which is scalar Jacobi on the
+      expansion. `transport_tangent_vectors[amortized]` **2.3-2.6x**, `log_map` 1.2-1.3x.
+- **R16-2: a round is two launches -- the Chronopoulos-Gear iteration.** Folding the dots'
+  second stage into the consumer blocks (the plan's "three nodes") took a round from **17 to 16
+  us**, because each fold is a block-wide `tile_sum` of ~0.4 us on the critical path and two
+  chained reductions stay two. Chronopoulos & Gear (1989) recover `alpha` from `r.u` and `w.u`
+  (`w = A u`) and carry `s = A p` by recurrence, so one launch does the mat-vec with *all three*
+  dots in one `wp.vec3d` reduction (`cg_matvec_dots`) and one does the update with the Jacobi apply
+  (`cg_update`). **13 us a round**, against a floor of ~4.3 us for a bare `capture_while` round
+  plus ~1 us per replayed node (probed: the conditional test is the largest single part).
+    - **`wp.tile(v, preserve_type=True)` reduces a `wp.vec2d` / `vec3d` in one pass**; plain
+      `wp.tile(v)` decomposes the vector (§13.2) and `tile_sum` then sums its components together.
+    - **Narrower blocks are worse, not better**: at `block_dim` 32 / 64 / 128 / 256 a round costs
+      25 / 17 / 13 / 13 us. Each lane then walks several rows serially, and the row walk -- not the
+      reduction -- is the latency.
+    - **Iteration counts equal standard CG's on 72 of 82 benchmark solves**, the rest within 1.8 %
+      either way (2 956 -> 3 009 on the graded saddle's 3 000-round solve, 386 -> 371 on `lscm`).
+      No stability loss was seen on any fixture.
+    - The stopping test comes first in `cg_update` (the triple describes the `r` the update starts
+      from), so the loop runs one detect-only round past convergence; the reported count is the
+      rounds that stepped. The recurrence scalars are double-buffered (`*_new` written by the
+      update, carried to `*_old` by the next mat-vec), because every block of the update reads them.
+    - Setup is two launches too (`cg_initial` -- `r = b - A x`, `u`, `p = s = 0` and `||b||^2`'s
+      partials -- then `cg_seed`), where it was `n_columns` copies, a norm, a finalize, a
+      tolerance, a mat-vec, a scaling, two copies and an H2D `assign`.
+    - Under the Jacobi-Chebyshev polynomial the update writes `D^-1 r` straight into the
+      polynomial's input, dropping its scaling launch: `lscm` / `heat_geodesic_conditioning` /
+      `log_map` 1.1-1.3x, `arap` 1.05-1.24x.
+- **R16-3: `preconditioner="adaptive"`** -- Jacobi under `CG_CHEBYSHEV_PROBE_ITERATIONS = 150`,
+  escalating warm-started to Chebyshev. `min_quad_with_fixed`'s default:
+  `[saddle_graded pin1pct]` **39.0 -> 14.6 ms (2.67x, now a win against igl's 26.7)**, pin50pct
+  flat. **Refuted for `arap`**: its warm-started steps are long, not short, so every step paid
+  the probe and a readback -- 0.37-0.63x. `arap` keeps `"chebyshev"` unconditionally, and its
+  known `hemisphere 10` loss is gone anyway (1.24x from R16-2).
+- **R16-4: `harmonic(k=2)` preconditioned as a squared Laplacian -- and a bug in that
+  preconditioner.** `L M^-1 L` is `L D^-2 L` with `D = sqrt(M)`, so
+  `squared_laplacian_preconditioner(L_ff, sqrt(M_f))` fits with no new mechanism
+  (`parametrization._solve_biharmonic`). It **diverged** at first: the interval's upper end was
+  `1 + max(dominance(L), 1)`, which is `D^-1 L`'s Gershgorin bound **only when `D = diag(L)`** --
+  true of `smooth_region`'s umbrella weights, false of any other positive `D`, which its docstring
+  allowed. The bound is now `max_i sum_j |L_ij| / D_i` (`kernels/linalg.scaled_row_abs_sums`) with
+  the lower end scaled with it; `smooth_region`'s counts move by 1-4 rounds. k=2: 179 / 381 / 265
+  multigrid rounds -> 52 / 160 / 224, **2.2-3.7x** (`saddle_small` 34 -> 9.3 ms against igl's
+  27.5).
+- **R16-5 / R16-1(c): `smooth_region_boundary` assembles the band, not the mesh.** The free set
+  and the pattern are fixed across passes, so the first pass extracts the band's Dirichlet system
+  and every later one rewrites its values and right-hand side from the new half-cotangents
+  (`kernels/smoothing.band_dirichlet_values`); keeping the operator object also keeps the solver
+  state, whose graph the later passes replay. **2.3-2.5x** on the harness rows (13.4 -> 5.3 ms on
+  `bunny`), positions within
+  9e-8 on CUDA and **bit-identical on CPU**; `test_smooth_region_boundary_later_passes_match_a_
+  rebuild` fails under a sign mutation of the pinned term.
+- **R16-6**: `subdivide_region_to_size`'s per-pass region-edge scatter and long-edge test are one
+  face-corner launch over a zeroed mask (`mark_long_region_edges`), one launch and one allocation
+  fewer a pass. The rest of its cost was not re-attributed this round.
+- **Order effects again**: `extend_scalar` read 0.91x inside the heat module's run and 1.08-1.10x
+  as its own selection -- the same shape as round 16's `laplacian_smoothing_loss` note. Re-run a
+  losing group alone before acting on it.
+- **`reconstruction`'s two solves no longer reach `wpl.cg` either -- and "it is `float32`" was
+  not a reason to leave them.** The CG kernels are generic over the vectors' *storage* precision
+  (`OverloadTable`s `CG_INITIAL` / `CG_MATVEC_DOTS` / `CG_ROUND_DOTS` / `CG_UPDATE` at `float32` and
+  `float64`); the cross-block dot folds, `alpha` and `beta` are always `float64`. Storage stays `float32` on
+  purpose: the dense grid's top level is 17 M nodes at depth 8 and 134 M at 9, bound by bytes, and
+  `float64` vectors would double them. The dense grid is matrix-free (a CSR of the 7-point stencil
+  is more memory than the solve), so it has its own mat-vec + dots and initial-residual kernels in
+  `kernels/reconstruction.py`, sharing `screened_laplacian_row`, `cg_round_terms`,
+  `cg_publish_round_dots` and `cg_update` with the CSR path, driven by `_device.run_device_loop`.
+  **`screened_poisson(method="dense")` 1.64-1.68x at depth 7 (19.4 -> 11.7 ms) and 1.30x at depth 9
+  (940 -> 722)**; per level 1.8 / 2.4 / 4.9 / 77 ms against Warp's 2.8 / 4.3 / 9.4 / 99. `method="adaptive"` is
+  flat (0.99-1.01x): its `warp.fem` matrix's mat-vec is the round, and it is now Warp's own.
+  Getting there took four measured corrections, each a trap for the next kernel of this shape:
+    - **Deriving a scalar from device values in every thread is `float64` division at scale.**
+      `cg_update` read `alpha` / `beta` off the fold and divided per thread; on this GeForce part
+      FP64 runs at a small fraction of FP32, and against the same kernel reading constants it was
+      **0.53 -> 1.0 ms** at 17 M entries. Past `CG_FOLD_MAX_BLOCKS` a `cg_coefficients` launch now
+      derives them once per column (it replaces the old finalize, so no launch is added).
+    - **The block count is the reduction's cost** (§2.2, §13.2 again): 66 000 one-tile blocks ran
+      the stencil mat-vec with its dots at 190 us a round; `cg_layout` spans a long column's blocks
+      over powers of two of tiles to land near `CG_TARGET_BLOCKS = 2048` (80 us). **But only the
+      reducing kernel wants it** -- the same span made the pure-stream update 1.4x slower, so the
+      update always launches one tile a block.
+    - **On L2-resident levels the element arithmetic is the cost, the reductions' included.** At
+      2.1 M nodes (8.6 MB a vector against 96 MB of L2) widening every entry to `float64` made the
+      level slower than Warp's (10.9 against 9.4 ms). The element updates run at the storage
+      precision -- what `wpl.cg` does -- and so do the in-block dot sums (`cg_round_terms`); only
+      the few thousand block partials are folded in `float64` (`cg_widen`) and the scalars derived
+      there. Per level on `bunny`, depth 8: 1.8 / 2.4 / 4.9 / 77 ms (`float64` in-block sums: 2.0 /
+      3.2 / 6.6 / 79). On `float64` storage every conversion is the identity, so the mesh solves
+      are unchanged bit for bit.
+    - **`float64` reductions buy no accuracy on a `float32` system; `float32` storage sets the
+      floor.** True relative residual `||b - Ax|| / ||b||`, recomputed in `float64` on the host,
+      identical to 3-4 digits between `float32` in-block sums, `float64` sums and Warp's all-
+      `float32` `cg`: at the shipped 100-iteration cap (4.2e-4 / 2.2e-3 / 2.9e-3 / 5.0e-3 by level,
+      every level at the cap) and with the cap lifted (8.90e-5 at `tol=1e-4`; at `tol=1e-6` all
+      three stall at the same 4.5e-6 / 9.3e-6 / 2.0e-5, the `float32` storage limit). Revisit only
+      for a `float32` system whose tolerance is below that floor.
+    - **A lane-per-row mat-vec fused with a block reduction loses from ~16 entries a row**: the
+      barrier holds every lane until the block's longest row finishes. 400 000-row sweep, fused
+      against `bsr_mv`'s lane-per-row kernel: 0.042 / 0.064 ms at 8 a row, tie at 16, 0.22 / 0.13
+      at 32, 0.82 / 0.64 at 128 (and `bsr_mv`'s 64-lane tiled kernel 0.31 there). So a long column
+      of rows over `CG_HEAVY_ROW_ENTRIES = 16` calls `bsr_mv` and reduces in `cg_round_dots`; a
+      *short* one keeps the fused launch even with heavy rows, because below the fold threshold a
+      round is launch-bound (`smooth_region`'s 20-a-row, three-column systems read 0.91-0.94x on
+      the split path). **Decide on the true count, never `nnz`**: the `warp.fem` system's `nnz` was
+      197 M against a true 44 M, and `bsr_mv`'s own tile heuristic reads that capacity.
+  `solve_spd(check_every=0)` also stopped warning on the CPU device, where the host-checked
+  fallback does have the scalars: the documented contract is that `check_every=0` never warns, and
+  its caller there runs a fixed budget on purpose.
+- **The capped screened-Poisson solve was the problem the warning reported; silencing the warning
+  was not the fix.** Every level of both backends stopped at `solver_iterations = 100` with the
+  default `solver_tolerance = 1e-6` unmet -- which `float32` storage cannot reach at all (true
+  residual floors of 4.8e-6 / 1.0e-5 / 2.2e-5 / 4.0e-5 at 33^3 / 65^3 / 129^3 / 257^3 under
+  Jacobi, 1.2e-6 on the `warp.fem` system). At the cap the dense fine levels were two orders of
+  magnitude short (5.0e-3 at 257^3), and the capped surface differed from the converged one by
+  **1.0e-3 of the bounding-box diagonal** on average -- the size of the reconstruction's own fit
+  error -- where converging Jacobi-CG needed 800 rounds. Fixed on three fronts:
+    - **A geometric multigrid V-cycle preconditions the dense solve** (`reconstruction.
+      _PoissonMultigrid`; kernels `poisson_mg_*`): the nested node grids, level `l`'s operator
+      `2 ** l * L_l + screen * (P^T)^l W` (the Galerkin product's 7-point rediscretization -- its
+      smooth-mode ratio to `P^T L P` tends to 2 in 3-D, measured 1.57 already at 9^3), restriction
+      `P^T`, one damped-Jacobi sweep at 6/7 a side, four on a 3^3 coarsest grid; `float32`,
+      matrix-free, symmetric. **13-16 iterations to `1e-5` at every level, whatever the
+      resolution**, true residual following (6.1e-6 at 257^3, *below* the Jacobi floor); the 257^3
+      level converged in 24 ms against 77 ms capped-and-unconverged and 471 ms for Jacobi to reach
+      even `1e-4`. `screened_poisson[dense-9]` **940 -> 208-246 ms (3.8-4.5x) and converged**;
+      `[dense-7]` 1.34-1.46x (a little below the capped `float32` run's 1.64x: the small levels
+      are launch-bound and a cycle is five launches a level). Sweeps of two, damping 2/3 or eight
+      coarsest sweeps each cost 5-15 % more for no fewer iterations.
+    - **`solver_tolerance` defaults to `1e-5`**, above both backends' `float32` floors (the
+      multigrid path floors near 2-6e-6); the adaptive backend then converges in 90 of its 100
+      iterations (it needed 106 for `1e-6`, which was exactly the CPU warning).
+    - **Non-convergence warns on both backends and both devices** (`Warns` section): the dense
+      path reads its iteration count once per level (and the residual only on a level that used
+      its whole budget), the adaptive path calls `solve_spd` at its default host-scalar cadence.
+      `test_poisson_dense_solve_converges_in_few_iterations` promotes warnings to errors at
+      `solver_iterations=30` and expects one at 2; swapping the V-cycle for Jacobi fails it on
+      every level.
+- **`float32` CG for the mesh solves: measured, and it is the tolerance, not the precision, that
+  moves the clock.** Jacobi-CG on `icosphere` heat (`M - tL`) and Poisson (`-L`) systems at equal
+  tolerance takes the *same* iteration count in either precision, and `float32` is 1.03-1.15x
+  faster up to 41 k unknowns (launch-bound) and 1.3-1.4x at 164 k -- while loosening `1e-10` to
+  `1e-5` alone saves 1.5-2x in either precision. The solution error then tracks the tolerance
+  (~1e-5 relative either way). What `float32` cannot do is the heat method, next.
+    - **So it is not a free swap, and it is not taken for the mesh solves.** `float32` storage
+      floors the relative residual near `1e-6` (§16.16 above), so it cannot run at the shipped
+      `1e-8` / `1e-10` at all, and the switch is really "loosen to `1e-6` and narrow": 100x the
+      solution error for the gain. Measured on 1 %-pinned cotangent Dirichlet systems (636 to
+      40 553 unknowns, `/tmp`-probe `f32probe.py`): Jacobi at `1e-6` is 1.10-1.17x faster in `float32`
+      than in `float64`, identical iteration counts and error -- but `float64` Jacobi-Chebyshev at
+      the *shipped* `1e-8` is faster than either (1.2-2.6 ms against 3.1 at 40 k) and 100x more
+      accurate, and the polynomial, the V-cycles and `_scalar_expansion` are `float64`-only. The
+      lever on these solves is the preconditioner, not the width.
+
+- **`heat_geodesic` was wrong far from its sources on any mesh past a dozen rings -- pre-existing
+  (identical at `a1c0f29`), now fixed, and the same defect sat under every heat-diffusion entry
+  point.** On a unit `icosphere(5)` from one source its worst error against the great-circle
+  distance was **2.34** (mean 0.81), where igl's heat method on the same mesh is 0.019. It is not
+  the tolerance's size: a CG iterate after `k` rounds is a degree-`k` polynomial in the operator
+  applied to the source indicator, so it is **exactly zero more than `k` rings away**, and the heat
+  solve (`M - tL`, well conditioned) met its residual tolerance at ~30 rounds whatever the mesh --
+  91.6 % of `icosphere(5)`'s vertices received no heat, so the normalized gradient there was noise.
+  The suite never saw it because every igl comparison ran on `icosphere(3)` or smaller.
+    - **The fix is a stopping rule, not a tolerance** (`heat._diffuse`): Jacobi-CG in chunks of 64
+      rounds at `tol=0`, one tiled launch a chunk (`kernels/heat.heat_chunk_change`) folding the
+      largest per-entry change relative to the entry and the count of non-zero entries, one 8-byte
+      readback; stop once the reached count stops growing *and* the change is under `1e-6`, or
+      three chunks past full reach -- the far field then needs 80-150 rounds past reach to settle,
+      and entries near `1e-300` never settle relative to themselves. `extend_scalar`,
+      `transport_tangent_vectors`, `log_map`, `heat_signed_distance` and `diffuse_tangent_field`
+      all go through it. A `cg_step_scalars` guard (step only when `r.z != 0` and `p.Ap != 0`)
+      keeps `tol=0` from reading `0/0` once a system is solved exactly; `!= 0` rather than `> 0`,
+      because a negative-definite `min_quad_with_fixed` system goes through the same kernel.
+    - **Against igl** (`test_heat_geodesic_matches_igl_far_from_the_sources`, `icosphere(5)`, one
+      and three sources, bound `5e-3` of the range): 0.01-0.13 % on the spheres; 0.8 % `bunny`,
+      1.1 % `bunny_decimated`, 2 % `hemisphere` from three sources -- the residue is igl's boundary
+      convention, next. `extend_scalar` against potpourri3d is 0.0000 on `icosphere(5)` (mean 2e-4
+      on `bunny`); `log_map`'s radius 0.8 % / 2.8 % (`icosphere(5)` / `bunny`) where it was 30 % /
+      26 %.
+    - **igl averages a Neumann and a Dirichlet heat solve on a boundary mesh; triwarp keeps Neumann
+      only, on the measurement.** Against `igl.exact_geodesic` on `half_torus`, Neumann is 0.93 %
+      mean / 3.1 % max and igl's average 1.15 % / 4.9 %; on `hemisphere` they tie. potpourri3d and
+      pymeshlab are Neumann too, and the averaged field broke the `half_torus` comparisons against
+      them (and read *below* the Euclidean distance), so it was built and reverted.
+    - **Three kernel-scope precision fixes the far field exposed**, all because a diffused value
+      near `1e-300` squares to zero: `predicates.stable_length` / `stable_normalize` divide by the
+      largest component first (used by `triangles.face_unit_gradient`, the transport and log-map
+      kernels); the transport `resolved` mask compares the diffused magnitude against the
+      *diffused indicator* at `_RESOLVED_FRACTION = 1e-4` rather than a global floor (the
+      `cave_cube` antipode sits at 1.4e-7 of its own indicator from round-off); and
+      `extend_scalar` divides only where the indicator is non-zero (`divide_nonzero`) -- obtuse
+      triangles make `bunny`'s indicator negative at two vertices, where the old division read 0.
+    - **Cost, against `a1c0f29`**: `heat_geodesic` 0.6-1.15x, `heat_signed_distance` 0.67-1.11x,
+      `log_map` 0.62-0.74x, `extend_scalar` 0.33-0.35x, `transport_tangent_vectors` 0.17-0.42x.
+      The losses are the solves that used to stop at ~30 rounds and were wrong; correctness is the
+      claim, and it is paid for in rounds.
+    - **REFUTED -- the Jacobi-Chebyshev polynomial in `_diffuse`.** A polynomial round reaches a
+      dozen rings where a Jacobi round reaches one, so it is 1.3-1.8x faster on the spheres
+      (`icosphere(6)` transport 12.5 against 20.5 ms) -- and **wrong on `bunny` at every chunk and
+      settle setting**: the distance 0.68-0.90 of its range off igl's and the scalar extension
+      divergent (errors up to 1e5). Obtuse triangles give the heat system positive off-diagonal
+      entries, and the polynomial's interval does not cover the far field's decay. Do not
+      re-propose it for the heat step.
+    - **Why `float32` is out for the heat method**: the implicit step decays by a near-constant
+      factor per ring, so the far field falls below `float32`'s range (~1e-38, 1e-45 subnormal)
+      within a few dozen rings and to ~1e-300 on the meshes above; igl's `float64` Cholesky resolves
+      those values, and the normalized gradient only needs their *direction*, which `float64`
+      carries to the antipode. The Poisson step has no such range problem, but it is one solve.
+- **Not reached by the cache**: `fix_self_intersections` / `refill_region` / `fill_smooth` stay
+  flat (0.97-1.02x), because their region solves hand `solve_spd_columns` a fresh
+  `SquaredLaplacianPreconditioner` per call, which is deliberately uncached (a caller-owned object
+  keyed by identity would never be hit again).
+- **The final sweep's sub-0.93x cells were drift**: all in functions that reach no solve, and
+  0.91-1.04x re-run as their own selection. Median over 280 triwarp cells in the seven modules,
+  0.99x.

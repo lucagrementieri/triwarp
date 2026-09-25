@@ -556,30 +556,25 @@ def emit_size_faces(
 
 
 @wp.kernel
-def mark_region_edges(
-    region_flags: wp.array[wp.int32],
-    inverse: wp.array[wp.int32],
-    out_edge_in_region: wp.array[wp.bool],
-) -> None:
-    # A unique edge is in/on the region boundary if at least one of its incident faces is in
-    # the region -- region-border edges included. Benign write race: every
-    # thread writing the same slot writes True.
-    i = wp.int32(wp.tid())
-    if region_flags[i // 3] != 0:
-        out_edge_in_region[inverse[i]] = wp.bool(True)
-
-
-@wp.kernel
 def mark_long_region_edges(
     vertices: wp.array[wp.vec3],
     unique_edges: wp.array2d[wp.int32],
+    region_flags: wp.array[wp.int32],
+    inverse: wp.array[wp.int32],
     max_edge: wp.float32,
-    edge_in_region: wp.array[wp.bool],
     out_long: wp.array[wp.bool],
 ) -> None:
-    # ``mark_long_edges``' uniform test restricted to the edges ``mark_region_edges`` flagged.
-    e = wp.int32(wp.tid())
-    out_long[e] = edge_in_region[e] and unique_edge_length(vertices, unique_edges, e) > max_edge
+    # ``mark_long_edges``' uniform test restricted to the edges with at least one incident face in
+    # the region -- region-border edges included. One thread per face corner, over a zeroed mask:
+    # the region test and the length test in one launch, where a per-edge pass would first need the
+    # region membership scattered into an edge mask of its own. An edge is tested once per region
+    # face holding it, at most twice on a manifold, and every write is the same ``True``, so the
+    # race is benign.
+    i = wp.int32(wp.tid())
+    if region_flags[i // 3] != 0:
+        e = inverse[i]
+        if unique_edge_length(vertices, unique_edges, e) > max_edge:
+            out_long[e] = wp.bool(True)
 
 
 # ---------------------------------------------------------------------------

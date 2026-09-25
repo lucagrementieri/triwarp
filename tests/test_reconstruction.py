@@ -12,6 +12,7 @@ characteristic, surface closeness -- rather than vertex-for-vertex.
 from __future__ import annotations
 
 import math
+import warnings
 
 import igl
 import numpy as np
@@ -667,6 +668,32 @@ def test_poisson_outward_orientation(device: str):
     )
     # Outward normals => positive enclosed volume.
     assert warp_to_trimesh(vertices_wp, faces_wp).volume > 0.0
+
+
+def test_poisson_dense_solve_converges_in_few_iterations(device: str) -> None:
+    """
+    Not a library comparison: no reference exposes its Poisson solver's iteration count.
+
+    The dense grid's conjugate gradient is preconditioned by a geometric V-cycle, whose point is an
+    iteration count that does not grow with the resolution: every level of the cascade must reach
+    the default tolerance inside 30 iterations, which Jacobi -- 100 to 800 per level on this kind of
+    input -- does not. A level that runs out warns, so promoting the warning to an error is the
+    assertion. The second call is the converse: a budget of two iterations cannot converge, and
+    has to say so rather than return a surface from an unconverged field silently.
+    """
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+    depth = _poisson_depth(device)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
+            points_wp, normals_wp, depth=depth, full_depth=4, solver_iterations=30
+        )
+    assert warp_to_trimesh(vertices_wp, faces_wp).volume > 0.0
+    with pytest.warns(UserWarning, match="iteration cap"):
+        tw.reconstruction.screened_poisson(
+            points_wp, normals_wp, depth=depth, full_depth=4, solver_iterations=2
+        )
 
 
 @pytest.mark.parity(

@@ -14,6 +14,7 @@ from triwarp.kernels.halfedge import halfedge_next, halfedge_prev
 from triwarp.kernels.predicates import (
     segment_coordinate,
     side_lengths,
+    stable_normalize,
     triangle_aabb,
     triangle_aspect_ratio,
     triangle_double_area,
@@ -636,9 +637,11 @@ def face_unit_gradient(
     values: wp.array[wp.float64],
     f: wp.int32,
 ) -> wp.vec3d:
-    # The direction of ``face_gradient``. ``normalize`` returns the zero vector for a zero-length
-    # gradient (Warp's ``kEps`` is 0), so a degenerate face and a constant field both give zero.
-    return wp.normalize(face_gradient(vertices, faces, normals, areas, values, f))
+    # The direction of ``face_gradient``, zero for a zero gradient (a degenerate face, a constant
+    # field). Scaled by its largest component before ``normalize``: far from a heat source the
+    # gradient is as small as ``1e-300``, whose squared length underflows ``float64`` and would
+    # read as zero -- ``igl::heat_geodesics_solve`` normalizes the same way, for the same reason.
+    return stable_normalize(face_gradient(vertices, faces, normals, areas, values, f))
 
 
 @wp.kernel

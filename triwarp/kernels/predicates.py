@@ -535,6 +535,31 @@ def normalize_or_zero(v: Any, tolerance: Any):
 
 
 @wp.func
+def stable_length(v: Any):
+    """
+    ``length(v)`` without underflow: the vector is scaled by its largest component first.
+
+    ``wp.length`` squares the components, so any vector shorter than about ``1e-154`` in
+    ``float64`` reads as zero. The heat method's far field is far smaller than that -- its
+    diffused values fall by a near-constant factor per ring of vertices -- and
+    ``igl::heat_geodesics_solve`` takes the same max-scaled norm for the same reason.
+    """
+    largest = wp.max(wp.abs(v))
+    if largest == type(largest)(0.0):
+        return largest
+    return largest * wp.length(v / largest)
+
+
+@wp.func
+def stable_normalize(v: Any):
+    """``normalize(v)`` without underflow (``stable_length``); zero for an exactly zero ``v``."""
+    largest = wp.max(wp.abs(v))
+    if largest == type(largest)(0.0):
+        return type(v)()
+    return wp.normalize(v / largest)
+
+
+@wp.func
 def angle_defect(angle_sum: wp.Float) -> wp.Float:
     """Angle defect at a vertex: a full turn minus the incident corner angles."""
     return type(angle_sum)(TWO_PI_F64) - angle_sum

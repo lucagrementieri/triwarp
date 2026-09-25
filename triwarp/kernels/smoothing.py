@@ -1154,6 +1154,71 @@ def project_to_zero_isoline(
     out_positions[vertex] = current + (best - current) * damping
 
 
+@wp.func
+def row_slot(
+    columns: wp.array[wp.int32], start: wp.int32, end: wp.int32, column: wp.int32
+) -> wp.int32:
+    # The slot of ``column`` in the sorted CSR row ``[start, end)``, or ``-1``. Linear: a mesh
+    # Laplacian row is the one-ring plus the diagonal, a handful of entries.
+    for e in range(start, end):
+        if columns[e] == column:
+            return e
+    return wp.int32(-1)
+
+
+@wp.kernel
+def band_dirichlet_values(
+    free_vertices: wp.array[wp.int32],
+    fixed_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    vf_offsets: wp.array[wp.int32],
+    vf_indices: wp.array[wp.int32],
+    faces: wp.array[wp.int32],
+    cot_entries: wp.array2d[wp.float32],
+    field: wp.array2d[wp.float64],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    out_values: wp.array[wp.float64],
+    out_rhs: wp.array2d[wp.float64],
+) -> None:
+    # One thread per free vertex: row ``ri`` of the Dirichlet system ``(-L)_uu x = (-L)_ub field``
+    # that ``linalg.assemble_interior_system`` extracts from a mesh-wide ``-cotmatrix``, written
+    # into that extraction's *existing* pattern from the current half-cotangent table. The
+    # connectivity -- and so the pattern and the free set -- is fixed across
+    # ``smooth_region_boundary``'s passes while the weights move, so only the band's rows are
+    # recomputed instead of the whole mesh's matrix and its extraction. ``cot_entries[f, e]`` is the
+    # weight of the edge opposite corner ``e`` (``kernels/laplacian.cotmatrix_triplets``), cast to
+    # ``float64`` as ``cotmatrix`` casts it; the off-diagonal is ``-w``, the diagonal ``sum w``, and
+    # a pinned neighbour moves ``w * field_j`` to the right-hand side.
+    ri = wp.int32(wp.tid())
+    v = free_vertices[ri]
+    start = offsets[ri]
+    end = offsets[ri + 1]
+    for e in range(start, end):
+        out_values[e] = wp.float64(0.0)
+    diagonal = wp.float64(0.0)
+    rhs = wp.float64(0.0)
+    for k in range(vf_offsets[v], vf_offsets[v + 1]):
+        f = vf_indices[k]
+        for e in range(3):
+            a = faces[f * 3 + (e + 1) % 3]
+            b = faces[f * 3 + (e + 2) % 3]
+            if a == v or b == v:
+                j = wp.where(a == v, b, a)
+                w = wp.float64(cot_entries[f, e])
+                diagonal += w
+                if fixed_mask[j]:
+                    rhs += w * field[0, j]
+                else:
+                    slot = row_slot(columns, start, end, free_map[j])
+                    if slot >= 0:
+                        out_values[slot] -= w
+    slot = row_slot(columns, start, end, ri)
+    if slot >= 0:
+        out_values[slot] += diagonal
+    out_rhs[0, ri] = rhs
+
+
 @wp.kernel
 def scatter_free_scalar(
     fixed_mask: wp.array[wp.bool],

@@ -260,10 +260,13 @@ def harmonic(
     Matches ``igl::harmonic``, ``k`` included.
 
     The interior system is solved iteratively (conjugate gradient) rather than by direct
-    factorization, with an automatic multigrid preconditioner
-    ([`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner]) engaged for ``k >= 2``,
-    since squaring the operator squares its condition number. For ``k == 1`` a simple Jacobi
-    preconditioner is used instead.
+    factorization. Squaring the operator squares its condition number, so each ``k`` gets its own
+    preconditioner: the Jacobi-Chebyshev polynomial
+    ([`chebyshev_preconditioner`][triwarp.linalg.chebyshev_preconditioner]) at ``k == 1``, the
+    square of that Laplacian's polynomial
+    ([`squared_laplacian_preconditioner`][triwarp.linalg.squared_laplacian_preconditioner]) at
+    ``k == 2``, and an automatic multigrid preconditioner
+    ([`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner]) above.
     """
     device, n_vertices = _validate_fixed_boundary_call(
         vertices, faces, boundary_indices, boundary_uv, k, "harmonic"
@@ -396,13 +399,16 @@ def _solve_fixed_boundary(
     fixed_mask, fixed_values = _scatter_constraints(
         n_vertices, boundary_indices, boundary_uv, device
     )
+    if k == 2:
+        return _solve_biharmonic(laplacian, mass_diag, q, fixed_mask, fixed_values, n_vertices)
 
-    # ``k >= 2`` squares the Laplacian's condition number, which is what makes a multigrid
-    # hierarchy worth building. Routed through ``"auto"`` rather than forced, so the gate's own
-    # size floor can still decline a system too small to repay the setup cost; the switch is on
-    # ``k`` rather than on the gate alone because a plain (``k == 1``) Laplacian's rows nearly sum
-    # to zero and wants iterations, not levels -- and with only the boundary pinned they are many,
-    # which is the long solve the polynomial preconditioner is for.
+    # ``k >= 3`` raises the Laplacian's condition number to the ``k``-th power, which is what
+    # makes a multigrid hierarchy worth building (``k == 2`` is the square of a Laplacian, handled
+    # above). Routed through ``"auto"`` rather than forced, so the gate's own size floor can still
+    # decline a system too small to repay the setup cost; the switch is on ``k`` rather than on the
+    # gate alone because a plain (``k == 1``) Laplacian's rows nearly sum to zero and wants
+    # iterations, not levels -- and with only the boundary pinned they are many, which is the long
+    # solve the polynomial preconditioner is for.
     sol, free_map, _ = twl.min_quad_with_fixed(
         q,
         fixed_mask,
@@ -416,6 +422,62 @@ def _solve_fixed_boundary(
         kernel_parametrization.scatter_solution,
         dim=n_vertices,
         inputs=[fixed_mask, free_map, sol, fixed_values, out_uv],
+        device=device,
+    )
+    return out_uv
+
+
+def _solve_biharmonic(
+    laplacian: wps.BsrMatrix[wp.float64],
+    mass_diag: wp.array[wp.float64] | None,
+    q: wps.BsrMatrix[wp.float64],
+    fixed_mask: wp.array[wp.bool],
+    fixed_values: wp.array[wp.float64],
+    n_vertices: int,
+) -> wp.array[wp.vec2]:
+    """
+    ``_solve_fixed_boundary`` at ``k == 2``, preconditioned as the square of a Laplacian.
+
+    ``Q = L M^-1 L`` is fourth order, and its free block is spectrally close to
+    ``L_ff D^-2 L_ff`` with ``D = sqrt(M_f)`` -- the terms it drops are the one ring of the pinned
+    boundary -- which is exactly the system
+    [`squared_laplacian_preconditioner`][triwarp.linalg.squared_laplacian_preconditioner] inverts
+    with a fixed polynomial: no hierarchy to set up, where the smoothed-aggregation V-cycle
+    ``"auto"`` would build costs a setup of its own and still runs a few hundred rounds.
+    """
+    device = fixed_mask.device
+    fixed_values_2d = twt.as_array2d(fixed_values, wp.float64)
+    free_map, n_free = twl.free_partition(fixed_mask)
+    sol = twt.as_array2d(wp.zeros((2, n_free), dtype=wp.float64, device=device), wp.float64)
+    if n_free > 0:
+        q_uu, rhs = twl.assemble_interior_system(q, fixed_mask, free_map, fixed_values_2d, n_free)
+        neg_l = wps.bsr_axpy(x=laplacian, alpha=-1.0)
+        no_values = twt.as_array2d(
+            wp.empty((0, n_vertices), dtype=wp.float64, device=device), wp.float64
+        )
+        l_ff, _ = twl.assemble_interior_system(neg_l, fixed_mask, free_map, no_values, n_free)
+        if mass_diag is None:
+            roots = wp.full(n_free, 1.0, dtype=wp.float64, device=device)
+        else:
+            roots = wp.empty(n_free, dtype=wp.float64, device=device)
+            wp.launch(
+                kernel_parametrization.free_mass_roots,
+                dim=n_vertices,
+                inputs=[fixed_mask, free_map, mass_diag, roots],
+                device=device,
+            )
+        twl.solve_spd_columns(
+            q_uu,
+            rhs,
+            sol,
+            tol=_CG_TOLERANCE,
+            preconditioner=twl.squared_laplacian_preconditioner(l_ff, roots),
+        )
+    out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
+    wp.launch(
+        kernel_parametrization.scatter_solution,
+        dim=n_vertices,
+        inputs=[fixed_mask, free_map, sol, fixed_values_2d, out_uv],
         device=device,
     )
     return out_uv

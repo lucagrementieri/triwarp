@@ -241,3 +241,54 @@ def offdiagonal_dominance_rows(
         out_ratio[i] = wp.float64(0.0)
         return
     out_ratio[i] = off_sum / magnitude
+
+
+@wp.kernel
+def scaled_row_abs_sums(
+    offsets: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    weight_sums: wp.array[wp.float64],
+    out_ratio: wp.array[wp.float64],
+) -> None:
+    # One thread per row of a CSR ``L``, writing ``sum_j |L_ij| / D_i``: the Gershgorin radius plus
+    # centre of row ``i`` of ``D^-1 L``, whose maximum bounds that operator's spectrum from above.
+    # ``linalg.SquaredLaplacianPreconditioner`` fits its polynomial to that bound. With ``D`` the
+    # diagonal of ``L`` it is ``1 + offdiagonal_dominance_rows``' ratio; with any other positive
+    # ``D`` -- ``sqrt(M)`` for the k = 2 harmonic operator ``L M^-1 L`` -- it is the bound that
+    # ratio is not, and an interval fitted short of the spectrum amplifies what it should invert.
+    i = wp.int32(wp.tid())
+    total = wp.float64(0.0)
+    for e in range(offsets[i], offsets[i + 1]):
+        total += wp.abs(values[e])
+    out_ratio[i] = total / weight_sums[i]
+
+
+@wp.kernel
+def expand_block_csr_2x2(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.mat22d],
+    out_offsets: wp.array[wp.int32],
+    out_columns: wp.array[wp.int32],
+    out_values: wp.array[wp.float64],
+) -> None:
+    # One thread per block row ``i`` of a compact ``wp.mat22d`` CSR, writing scalar rows ``2 i`` and
+    # ``2 i + 1`` of the same operator over interleaved unknowns (``2 j + b`` is component ``b`` of
+    # block unknown ``j``), the memory layout of a ``wp.vec2d`` array viewed as ``float64``.
+    # Each scalar row holds ``2 * count`` entries, so its start is a closed form of the block
+    # offsets and needs no scan; columns stay sorted because the block row's are. The last thread
+    # also writes the terminating offset.
+    i = wp.int32(wp.tid())
+    start = offsets[i]
+    count = offsets[i + 1] - start
+    for a in range(2):
+        row_start = 4 * start + a * 2 * count
+        out_offsets[2 * i + a] = row_start
+        for e in range(count):
+            block = values[start + e]
+            j = columns[start + e]
+            for b in range(2):
+                out_columns[row_start + 2 * e + b] = 2 * j + b
+                out_values[row_start + 2 * e + b] = block[a, b]
+    if i == offsets.shape[0] - 2:
+        out_offsets[2 * i + 2] = 4 * offsets[i + 1]
